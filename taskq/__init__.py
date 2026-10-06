@@ -220,7 +220,7 @@ TAKEN = ('has already been taken', 'Reference already exists')  # the lock's con
 class Github:
     """The store protocol on GitHub REST through `gh api`. An issue's `number` is `iid`, `body` is `description`,
     `open` is `opened`, labels come back as names, assignees as `{id, username}`; a PUT with add/remove labels
-    sends the full set (the labels last read in this process, else one GET). The lock is the ref
+    sends the full set built from a GET made right before it, never from a list read earlier in the process. The lock is the ref
     `refs/taskq/lock/<N>` on a blob holding the time: a second POST is 422 for any user (atomic between users,
     owner's rule 2026-10-06), it is no branch so no CI runs, and anyone may remove it — the claim names the
     holder. Issue lists come from GraphQL: the REST list lags a new issue by up to half a minute, GraphQL shows
@@ -403,7 +403,7 @@ class Github:
         if 'labels' in body:
             out['labels'] = body['labels'].split(',')
         if 'add_labels' in body or 'remove_labels' in body:
-            have = self.labels.get(iid) or self.issue(self.run('GET', f'issues/{iid}'))['labels']
+            have = self.issue(self.run('GET', f'issues/{iid}'))['labels']  # a list read is stale by now: another session may have moved it
             drop = body.get('remove_labels', '').split(',')
             out['labels'] = [name for name in have if name not in drop] + [name for name in body.get('add_labels', '').split(',') if name and name not in have]
         if 'assignee_ids' in body:
@@ -521,7 +521,7 @@ def parse(issue):
             'host': next((label[len(ON):] for label in labels if label.startswith(ON)), None),
             'assignees': [user['id'] for user in issue.get('assignees', [])], 'selftest': SELFTEST in labels,
             'priority': min([int(label[9:]) for label in labels if re.fullmatch(r'priority-\d', label)] or [9]),
-            'age': int(time.time() - stamp(issue['updated_at'])) // 60,
+            'age': int(time.time() - stamp(issue['updated_at'])) // 60, 'updated_at': issue['updated_at'],
             'text': BLOCK.sub('', issue['description']).strip()}
 
 
@@ -568,6 +568,20 @@ def task(iid, states=STATES):
     if found['state'] not in states:
         fail(f'#{iid} is {found["state"]}, not {" or ".join(states)}')
     return found
+
+
+def unchanged(item):
+    """Tick and board writes act on a read made before: a take, answer or hand edit since then wins. Rereads the
+    issue; None, with one printed line, when its state, claim or updated_at moved or a take holds the lock of a
+    ready or waiting task (later and ask keep their worker's lock); else the fresh task to write from."""
+    issue = api('GET', f'issues/{item["iid"]}')
+    fresh = parse(issue) if issue['state'] == 'opened' else None
+    why = ('it is no open task now' if not fresh else f'its state is {fresh["state"]} now' if fresh['state'] != item['state']
+           else 'its claim changed' if fresh['claim'] != item['claim'] else 'it changed' if fresh['updated_at'] != item['updated_at']
+           else 'a take holds its lock' if fresh['state'] in ('ready', 'waiting') and locks(item['iid']) else None)
+    if why:
+        print(f'Skipped #{item["iid"]}: {why} since this tick read it.')
+    return None if why else fresh
 
 
 def save(current, state=None, note_action=None, note_text='', close=False, add=(), remove=(), assignee_ids=None, **changes):
@@ -2019,7 +2033,7 @@ def board_moves(everything, selected):
     for item in everything:
         iid, state = item['iid'], item['state']
         target = cards.get(iid, state)
-        if iid not in selected or target == state:
+        if iid not in selected or target == state or not (item := unchanged(item)):
             continue
         action = BOARD_MOVES.get((state, target))
         if action == 'later':
@@ -2055,6 +2069,8 @@ def tick(args):
     selected = {item['iid'] for item in candidates}
     stalled = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and item['age'] > STALE_MINUTES]
     for item in stalled:
+        if not unchanged(item):
+            continue
         args.iid, args.action, args.text = item['iid'], 'release', f'no change on the issue for {item["age"]} minutes'
         requeue(args)
         print(f'Released stalled #{item["iid"]}.')
@@ -2076,12 +2092,12 @@ def tick(args):
         if item['iid'] not in selected:
             continue
         open_deps = sorted(set(item['deps']) & loaded[1])
-        if item['state'] == 'ready' and open_deps:
-            save(item, 'waiting', 'waiting', f'open dependencies {open_deps}')
-        elif item['state'] == 'waiting' and not open_deps:
-            save(item, 'ready', 'ready', 'dependencies closed')
-        else:
+        if (item['state'], bool(open_deps)) not in (('ready', True), ('waiting', False)) or not (item := unchanged(item)):
             continue
+        if item['state'] == 'ready':
+            save(item, 'waiting', 'waiting', f'open dependencies {open_deps}')
+        else:
+            save(item, 'ready', 'ready', 'dependencies closed')
         moved += 1
         print(f'Moved #{item["iid"]} {item["state"]} → {"ready" if item["state"] == "waiting" else "waiting"}.')
     everything, _, odd, problems, inbox = loaded = load() if moved else loaded
@@ -2193,13 +2209,15 @@ def tick(args):
         print('## Waiting for the owner\n\nNew questions. Do not answer these yourself. End your reply with this list, verbatim:\n')
         print(data('\n'.join(f'- #{item["iid"]} {item["title"]}: {text}' for item, text in fresh)))
         for item, _ in fresh:
-            note(item['iid'], 'shown')
+            if unchanged(item):
+                note(item['iid'], 'shown')
     if summary:
         print('## Still waiting for the owner (daily summary)\n\nEnd your reply with this list, verbatim:\n')
         print(data('\n'.join(f'- #{item["iid"]} {item["title"]}: {text.splitlines()[0] if text else "no note"}'
                           for item, text in summary)))
         for item, _ in summary:
-            note(item['iid'], 'shown')
+            if unchanged(item):
+                note(item['iid'], 'shown')
     if fresh or summary:
         print(f'\nThe owner answers with: `{TOOL} answer <N> --text "<answer>"`.')
     if codex_stopped:

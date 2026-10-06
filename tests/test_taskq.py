@@ -203,6 +203,29 @@ class Gitlab:
         return [note['body'] for note in self.notes.values() if note['iid'] == iid]
 
 
+def take_during_tick(case):
+    """A worker's take lands between the tick's load and its ready -> waiting move: the move is skipped."""
+    dep = case.add('--type', 'research', '--scope', 'a')
+    iid = case.add('--type', 'code', '--scope', 'b', '--deps', dep)
+    load, raced = q.load, []
+
+    def racing(*args, **kwargs):
+        found = load(*args, **kwargs)
+        if not raced:
+            raced.append(iid)
+            with patch.object(q, 'refusal', lambda *args, **kwargs: None):  # the take read before the dependency
+                case.do(CODEX, 'take', iid)
+        return found
+    with patch.object(q, 'load', racing):
+        output = case.do(CLAUDE, 'tick')
+    case.assertIn(f'Skipped #{iid}: its state is doing now since this tick read it.', output)
+    case.assertNotIn(f'Moved #{iid}', output)
+    case.assertEqual(case.state(iid), 'doing')
+    current = q.task(iid)
+    case.assertEqual(current['claim']['session'], 'codex-session')
+    return iid
+
+
 class Cycle(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.object(q, 'AREAS', ('maps', 'engine')))
@@ -479,6 +502,9 @@ class Cycle(unittest.TestCase):
         paths = self.do(CLAUDE, 'contract').split()
         self.assertEqual([Path(path).name for path in paths], ['taskq-manager.md', 'taskq.md'])
         self.assertTrue(all(Path(path).is_file() for path in paths))
+
+    def test_tick_skips_a_move_when_a_take_came_between(self):
+        take_during_tick(self)
 
     def test_tick_moves_ready_and_waiting_by_dependencies(self):
         dep = self.add('--type', 'research', '--scope', 'a')
@@ -1284,6 +1310,13 @@ class GithubCycle(unittest.TestCase):
 
     def state(self, number):
         return q.parse(q.api('GET', f'issues/{number}'))['state']
+
+    def test_tick_skips_a_move_when_a_take_came_between_and_labels_are_read_fresh(self):
+        number = take_during_tick(self)
+        self.assertEqual([name for name in self.names(number) if name.startswith('q-')], ['q-doing'])
+        self.github.issues[number]['labels'].append({'name': 'priority-1'})  # by hand, after every read of this process
+        q.api('PUT', f'issues/{number}', {'add_labels': 'area-maps'})
+        self.assertTrue({'q-doing', 'priority-1', 'area-maps'} <= set(self.names(number)))
 
     def test_full_cycle_on_github(self):
         self.do(CLAUDE, 'init')

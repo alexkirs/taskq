@@ -218,7 +218,9 @@ A second `init` changes nothing. The store puts a card in its column in the same
 `POST issues` adds the item (`addProjectV2ItemById`) and sets Status (`updateProjectV2ItemFieldValue`); a `PUT`
 that changes the `q-*` label sets Status; `close` archives the item (`archiveProjectV2Item`: the board shows open
 tasks only; the issue keeps its history). The project, the field and its option ids are looked up once per
-process. `tick` reads the items in one query (100 per page) and treats Status as the owner's intent (§ States).
+process. `tick` reads the cards in one query (100 open issues per page, each with its `projectItems`: the
+project's own `items` list stayed empty for minutes after adds, live 2026-10-06) and treats Status as the
+owner's intent (§ States).
 Without the token scope `project` (`gh auth refresh -h github.com -s project`) GraphQL refuses the lookup: there
 is no board, `init` names the command and makes the labels, every other command works as before.
 

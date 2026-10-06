@@ -980,9 +980,11 @@ class GithubRest:
             item['archived'] = True
             return {}
         names = {option['id']: option['name'] for option in board['options']}
-        nodes = [{'id': item['id'], 'isArchived': item['archived'], 'content': {'number': number},
-                  'fieldValueByName': {'name': names[item['option']]} if item['option'] in names else None} for number, item in board['items'].items()]
-        return {'node': {'items': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}}
+        nodes = [{'number': number, 'projectItems': {'nodes': [
+                     {'id': item['id'], 'project': {'id': board['id']}, 'fieldValueByName': {'name': names[item['option']]} if item['option'] in names else None}
+                     for item in [board['items'].get(number)] if item and not item['archived']]}}
+                 for number, issue in self.issues.items() if issue['state'] == 'open']
+        return {'repository': {'issues': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}}
 
     def column(self, number):
         """The Status of the issue's card on the one board; 'archived'; None: no card."""

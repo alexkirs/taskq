@@ -228,9 +228,12 @@ class Github:
     PROJECT = ('id title url field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } }')
     FIND = ('query($owner: String!, $name: String!, $board: String!) { repository(owner: $owner, name: $name) { id owner { id'
             ' ... on ProjectV2Owner { projectsV2(first: 20, query: $board) { nodes { %s } } } } } }' % PROJECT)
-    ITEMS = ('query($id: ID!, $after: String) { node(id: $id) { ... on ProjectV2 { items(first: 100, after: $after) {'
-             ' pageInfo { hasNextPage endCursor } nodes { id isArchived content { ... on Issue { number } }'
-             ' fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } } } }')
+    # Cards are read from the open issues' side: `ProjectV2.items` of a new project stayed empty for minutes while
+    # `Issue.projectItems` showed the cards at once (measured live 2026-10-06).
+    ITEMS = ('query($owner: String!, $name: String!, $after: String) { repository(owner: $owner, name: $name) {'
+             ' issues(states: OPEN, first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { number'
+             ' projectItems(first: 10, includeArchived: false) { nodes { id project { id }'
+             ' fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } } } } }')
 
     def __init__(self, repo, host=None):
         self.repo, self.host, self.labels, self.nodes = repo, host, {}, {}  # by issue number: label names last read, GraphQL id
@@ -327,14 +330,16 @@ class Github:
         return self.board or None
 
     def cards(self):
-        """Status by issue number of every item on the board that is not archived (None: no Status)."""
+        """Status by number of every open issue with a card on the board (None: the card has no Status)."""
         board, found, after = self.project(), {}, None
         while board:
-            page = self.graphql(self.ITEMS, id=board['id'], after=after)['node']['items']
-            for item in page['nodes']:
-                if (item['content'] or {}).get('number') and not item['isArchived']:
-                    self.items[item['content']['number']] = item['id']
-                    found[item['content']['number']] = (item['fieldValueByName'] or {}).get('name')
+            owner, name = self.repo.split('/')
+            page = self.graphql(self.ITEMS, owner=owner, name=name, after=after)['repository']['issues']
+            for issue in page['nodes']:
+                for item in issue['projectItems']['nodes']:
+                    if item['project']['id'] == board['id']:
+                        self.items[issue['number']] = item['id']
+                        found[issue['number']] = (item['fieldValueByName'] or {}).get('name')
             if not page['pageInfo']['hasNextPage']:
                 break
             after = page['pageInfo']['endCursor']

@@ -18,8 +18,16 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import taskq as q  # noqa: E402
 
+
+def configure(path=None, real=q.configure, local=Path(tempfile.mkdtemp()) / 'taskq.local.toml'):
+    """`configure` that never points at the person's own taskq.local.toml (and .gitignore) of this real checkout."""
+    real(path)
+    if q.ROOT == q.main_checkout(Path(__file__).parent):
+        q.LOCAL = local
+
+
+q.configure = configure
 q.configure(Path(__file__).resolve().parent / 'taskq.toml')
-q.LOCAL = Path(tempfile.mkdtemp()) / 'taskq.local.toml'  # never the person's own file in the real main checkout
 # `cleanup` stands on a project's worktree tools; its tests run where a folder of them is named.
 HELPERS = os.environ.get('TASKQ_CLEANUP_HELPERS')
 if HELPERS:

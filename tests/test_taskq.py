@@ -48,6 +48,11 @@ def permitted(root, **permissions):
         {'permissions': {'allow': list(q.WORKER_ALLOW), 'defaultMode': 'dontAsk', **permissions}}))
 
 
+def trust(path, root):
+    """Claude Code's config at `path` with folder trust accepted for `root`."""
+    Path(path).write_text(json.dumps({'projects': {os.path.realpath(root): {'hasTrustDialogAccepted': True}}}))
+
+
 class CodexServer:
     """Finite app-server responses; fail immediately on an unexpected request."""
     def __init__(self):
@@ -2075,6 +2080,28 @@ class Doctor(unittest.TestCase):
         q.LOCAL.write_text('[profile]\nmine = false\n')
         self.enterContext(patch.object(q, 'ROOT', q.LOCAL.parent))
         permitted(q.ROOT)
+        self.enterContext(patch.object(q, 'CLAUDE_CONFIG', q.ROOT / 'claude.json'))
+        trust(q.CLAUDE_CONFIG, q.ROOT)
+
+    def test_fresh_home_names_every_local_gap_with_runnable_commands(self):
+        """#59/#92: no profile, login, trust or permissions: all four at once, each fix a command that runs as printed."""
+        q.LOCAL.unlink()
+        q.CLAUDE_CONFIG.unlink()
+        (q.ROOT / '.claude/settings.local.json').write_text('{"permissions": {"allow": ["Bash(make *)"]}, "env": {"A": "1"}}')
+        self.status = 1
+        with patch.object(q, 'CODEX_SOCKET', q.ROOT / 'no-socket'), contextlib.redirect_stdout(io.StringIO()) as out:
+            with self.assertRaises(SystemExit):
+                q.main(['doctor', '--codex'])
+        out = out.getvalue()
+        for text in ('no personal profile', 'is not logged in', 'Claude folder trust not accepted', 'lacks Bash, Read',
+                     'no Codex app server socket', '\n    taskq profile init  (built-in defaults'):
+            self.assertIn(text, out)
+        self.assertNotIn('<', out)  # no placeholder left to fill in
+        self.assertFalse(q.LOCAL.exists() or q.CLAUDE_CONFIG.exists())  # doctor reads only
+        command = next(line.strip().split('  (')[0] for line in out.splitlines() if 'python3 -c' in line)
+        subprocess.run(command, shell=True, check=True)
+        settings = json.loads((q.ROOT / '.claude/settings.local.json').read_text())
+        self.assertEqual((doctor.permissions_missing(q.ROOT), settings['env'], settings['permissions']['allow'][0]), ([], {'A': '1'}, 'Bash(make *)'))
 
     def test_missing_permissions_or_mode_is_a_gap_and_nothing_is_written(self):
         """#71: the coordinator and its workers need the allow list and dontAsk; doctor names both, edits nothing."""
@@ -2085,7 +2112,7 @@ class Doctor(unittest.TestCase):
         code, out = self.doctor()
         self.assertEqual(code, 1)
         self.assertIn('settings.local.json lacks defaultMode: dontAsk: sessions of this checkout stop', out)
-        self.assertIn(f'cd {q.ROOT} && <the permissions command of taskq-manager.md § 1 «Permissions»>', out)
+        self.assertIn(f'cd {q.ROOT} && python3 -c ', out)
         self.assertEqual(path.read_text(), before)
         path.unlink()
         self.assertIn('lacks Bash, Read, Edit', self.doctor()[1])
@@ -2097,7 +2124,7 @@ class Doctor(unittest.TestCase):
         code, out = self.doctor()
         self.assertEqual(code, 1)
         self.assertIn(f'no personal profile {q.LOCAL}', out)
-        self.assertIn('taskq profile init [--filter', out)
+        self.assertIn('taskq profile init  (built-in defaults', out)
         self.assertFalse(q.LOCAL.exists())  # doctor reads only
         q.LOCAL.write_text('[profile]\nmine = "yes"\n')
         self.assertIn('[profile] mine: write true or false', self.doctor()[1])
@@ -2244,7 +2271,7 @@ class Setup(unittest.TestCase):
         return 0, out.getvalue()
 
     def trust_and_permissions(self):
-        (self.tmp / 'claude.json').write_text(json.dumps({'projects': {os.path.realpath(self.tmp): {'hasTrustDialogAccepted': True}}}))
+        trust(self.tmp / 'claude.json', self.tmp)
         permitted(self.tmp)
         (self.tmp / 'taskq.local.toml').write_text('[profile]\nmine = false\n')
 
@@ -2269,6 +2296,7 @@ class Setup(unittest.TestCase):
         code, out = self.fix()
         self.assertEqual(code, 1)
         self.assertIn(' && python3 bot.py setup\n    runtime bot: its app steps', out)
+        self.assertIn('not ready: 1 step(s) of the person pending: cd ', out)  # never `ready` while a step is open
 
     def test_gitlab_person_steps_printed_then_fixed_once(self):
         gitlab = Gitlab()
@@ -2289,7 +2317,9 @@ class Setup(unittest.TestCase):
         self.assertEqual(code, 1)  # trust and permissions are the person's
         self.assertEqual((self.tmp / 'taskq.toml').read_text().count('host = "gitlab.example.com"'), 1)
         self.assertIn('done: labels and board', out)
-        self.assertIn(' && claude\n    accept «Trust this folder»', out)
+        self.assertIn(' && claude\n    Claude folder trust not accepted', out)
+        self.assertIn('you: taskq profile init\n', out)
+        self.assertNotIn('ready:', out.replace('not ready:', ''))
         self.assertIn('settings.local.json lacks Bash, Read', out)
         self.assertIn('mcp__serena, defaultMode: dontAsk', out)
         self.assertFalse((self.tmp / '.claude').exists())  # permissions are printed, never written
@@ -2302,6 +2332,20 @@ class Setup(unittest.TestCase):
             self.assertIn(line, out)
         self.assertEqual(json.dumps([gitlab.labels, gitlab.boards]), before)
         self.assertNotIn('you:', out)
+
+    def test_requested_codex_without_its_socket_stays_pending(self):
+        """#92: `--fix --codex` with everything else ready names the app step and never ends with `ready`."""
+        self.enterContext(patch.object(q, 'api', Gitlab()))
+        self.enterContext(patch.object(q, 'CODEX_SOCKET', self.tmp / 'no-socket'))
+        self.origin = 'git@gitlab.example.com:group/project.git'
+        self.trust_and_permissions()
+        self.assertEqual(self.fix()[0], 0)
+        code, out = self.fix('--codex')
+        self.assertEqual(code, 1)
+        self.assertIn('you: open the Codex app and sign in', out)
+        self.assertIn('not ready: 1 gap(s)', out)
+        self.assertNotIn('\nready:', out)
+        self.assertIn('No workers or timer started', out)
 
     def test_github_without_project_scope_is_labels_only_until_refresh(self):
         github = GithubRest()

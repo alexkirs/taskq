@@ -146,8 +146,9 @@ available, request that session once; continue terminal steps under the same aut
 request confirmation for each covered step. No response means no authorization. New work outside
 that scope needs its own agreement.
 
-Commands per mode: mode A runs the read-only `cd <main checkout> && taskq doctor` and prints its
-gaps as the numbered steps; mode B runs `cd <main checkout> && taskq doctor --fix` (add `--codex` when
+Commands per mode: mode A runs the read-only `cd <main checkout> && taskq doctor` (`--codex` too when Codex
+workers were requested) and prints its gaps as the numbered steps: profile, CLI login, folder trust and
+permissions are named together, each with a command that runs as printed; mode B runs `cd <main checkout> && taskq doctor --fix` (add `--codex` when
 Codex workers were requested). `--fix` writes a minimal `taskq.toml` from `origin` when none exists,
 runs init for missing labels/board (init adds `/taskq.local.toml` and `/.worktrees/` to `.gitignore` once), reuses
 `codex_project` for the Codex app project, and prints `taskq profile init` as a `you:` line while the
@@ -285,7 +286,7 @@ Rules for <main checkout>/.claude/settings.local.json (outside git), so nothing 
   allow: CronCreate CronDelete CronList                                    the coordinator's tick timer (§ 2)
   allow: mcp__ccd_session_mgmt mcp__ccd_session mcp__scheduled-tasks mcp__serena   app sessions and tools
   defaultMode: dontAsk                                                     the allowed run silently, the rest is denied; no classifier
-Run once: ! <the permissions command above, with the resolved checkout>
+Run once: ! <the `python3 -c` line `taskq doctor` prints for this checkout: the command above in one line>
 ```
 
 What a permission layer can stop, where it hit, and the fix:

@@ -134,10 +134,11 @@ def write_config(github, where, host=None):
     print(f'wrote taskq.toml for {where}')
 
 
-def doctor(args):
+def doctor(args, pending=()):
     """Is this project ready for the queue? Prints each gap with the command that closes it, exit 1 while any is
-    open; prints one line and exits 0 when none is. Reads only: no config, label, board or credential changes
-    (manager onboarding: report, agree, then `init`). `--fix` is the manager's «do it for me»: `setup`."""
+    open or `pending` (the person's steps `setup` printed) is not empty; prints one line and exits 0 when none is.
+    Reads only: no config, label, board or credential changes (manager onboarding: report, agree, then `init`).
+    `--fix` is the manager's «do it for me»: `setup`."""
     if getattr(args, 'fix', False):
         return setup(args)
     gaps = []
@@ -163,8 +164,11 @@ def doctor(args):
         gap(f'origin is {origin[0]}/{origin[1]}, taskq.toml names {core.HOST or ""}{"/" * bool(core.HOST)}{core.PROJECT_PATH}',
             'run taskq from that project\'s checkout, or fix [github] repo / [gitlab] project and host in taskq.toml')
     if config:
-        for what, fix in personal_gaps() + tree_gaps():
+        for what, fix in personal_gaps() + tree_gaps() + permissions_gap(core.ROOT) + trust_gap(core.ROOT):
             gap(what, fix)
+        if getattr(args, 'codex', False) and not core.CODEX_SOCKET.exists():
+            gap(f'no Codex app server socket {core.CODEX_SOCKET}: Codex workers cannot start',
+                'open the Codex app and sign in  (the person does it)')
     if config or origin:
         cli = 'gh' if github else 'glab'
         status = probe([cli, 'auth', 'status', *(['--hostname', host] if host else [])])
@@ -173,7 +177,7 @@ def doctor(args):
         elif status:
             gap(f'`{cli}` is not logged in{f" to {host}" if host else ""}', f'{cli} auth login{f" --hostname {host}" if host else ""}  (the person runs it: OAuth in the browser)')
     if gaps or not config:
-        return report_gaps(gaps)
+        return report_gaps(gaps, pending)
     checks = (('write permission', lambda: write_access(github)), ('labels', queue_labels_missing),
               ('board', lambda: board_gaps(github, host)))
     for name, check in checks:
@@ -182,10 +186,8 @@ def doctor(args):
                 gap(what, fix)
         except SystemExit as error:
             gap(f'{name} could not be read: {str(error).removeprefix("taskq: ")}', 'fix the cause above, then `taskq doctor` again')
-    for what, fix in permissions_gap(core.ROOT):
-        gap(what, fix)
     gaps += runtime_gaps()
-    report_gaps(gaps)
+    report_gaps(gaps, pending)
 
 
 def personal_gaps():
@@ -195,13 +197,18 @@ def personal_gaps():
                  f'cd {core.LOCAL.parent} && git rm --cached -- {core.LOCAL.name}  (keeps the local file), then commit')]
     if not core.LOCAL.is_file():
         return [(f'no personal profile {core.LOCAL} (areas, own tasks or pool, Claude/Codex slots of this machine)',
-                 f'{core.TOOL} profile init [--filter "labels=area-<name>"] [--mine | --no-mine] [--limit claude=N,codex=M] '
-                 f'[--preferred-runtime claude|codex]  (confirm the preferences through onboarding first: taskq-manager.md § 1)')]
+                 f'{core.TOOL} profile init  ({PROFILE_CARD})')]
     try:
         core.personal()
     except SystemExit as error:
         return [(str(error).removeprefix('taskq: '), f'fix {core.LOCAL} by hand (keys: `{core.TOOL} contract`, § Project)')]
     return []
+
+
+# What `profile init` without flags writes, and the flags the person's confirmed card adds; taskq never guesses them.
+PROFILE_CARD = ('built-in defaults: all areas, own tasks and the pool, ' + ', '.join(f'{name} {count}' for name, count in core.default_limits().items())
+                + ' slots; confirm the profile card of taskq-manager.md § 1 first and add only its answers: --filter "labels=area-NAME", '
+                '--mine or --no-mine, --limit claude=N,codex=M, --preferred-runtime claude|codex')
 
 
 def ignore_local():
@@ -292,7 +299,10 @@ def board_gaps(github, host):
             * (list(board['options']) != list(core.STATES)))
 
 
-def report_gaps(gaps):
+def report_gaps(gaps, pending=()):
+    if not gaps and pending:
+        print(f'not ready: {len(pending)} step(s) of the person pending: ' + '; '.join(pending))
+        sys.exit(1)
     if not gaps:
         checked = [name for name, item in core.EXECUTORS.items() if item.get('doctor')]
         return print(f'ready: {core.PROJECT_PATH} — config, CLI login, write access, labels and board {core.BOARD}'
@@ -322,12 +332,30 @@ def permissions_missing(root):
             + [f'defaultMode: {PERMISSION_MODE}'] * (permissions.get('defaultMode') != PERMISSION_MODE))
 
 
+def permissions_command(root):
+    """One shell line that merges WORKER_ALLOW and dontAsk into the checkout's settings.local.json, keeping every
+    other entry; invalid JSON stops it unchanged. The command of taskq-manager.md § 1 «Permissions»."""
+    script = ('import json, pathlib; path = pathlib.Path(".claude/settings.local.json"); '
+              'data = json.loads(path.read_text()) if path.exists() else {}; '
+              'permissions = data.setdefault("permissions", {}); allow = permissions.setdefault("allow", []); '
+              f'allow.extend(item for item in {json.dumps(WORKER_ALLOW)} if item not in allow); '
+              f'permissions["defaultMode"] = "{PERMISSION_MODE}"; path.parent.mkdir(exist_ok=True); '
+              'path.write_text(json.dumps(data, indent=2) + "\\n")')
+    return f'cd {shlex.quote(str(root))} && python3 -c {shlex.quote(script)}'
+
+
 def permissions_gap(root):
     """The doctor line for missing permissions: what is missing, why, and the one command that closes it."""
     missing = permissions_missing(root)
     return [(f'{root}/.claude/settings.local.json lacks {", ".join(missing)}: sessions of this checkout stop on '
-             f'prompts or the auto-mode classifier', f'cd {root} && <the permissions command of taskq-manager.md § 1 '
-             f'«Permissions»>  (the person runs it once; taskq never edits permission settings)')] if missing else []
+             f'prompts or the auto-mode classifier', f'{permissions_command(root)}  (the person runs it once, '
+             f'after the rules of taskq-manager.md § 1 «Permissions»; taskq never edits permission settings)')] if missing else []
+
+
+def trust_gap(root):
+    """The doctor line while Claude Code's folder trust for `root` is not accepted."""
+    return [] if trusted(root) else [(f'Claude folder trust not accepted for {root}: worker sessions cannot start there',
+                                      f'cd {shlex.quote(str(root))} && claude  (the person accepts «Trust this folder» once, then quits)')]
 
 
 def trusted(root):
@@ -394,10 +422,10 @@ def setup(args):
         person(fix.split('  (')[0], what)
     if not permissions_missing(core.ROOT):
         print('ok: worker permissions')
+    for what, fix in trust_gap(core.ROOT):
+        person(fix.split('  (')[0], what + '; accept «Trust this folder» once, then quit')
     if trusted(core.ROOT):
         print('ok: Claude folder trust')
-    else:
-        person(f'cd {core.ROOT} && claude', 'accept «Trust this folder» once, then quit: worker sessions start in this checkout')
     if args.codex:
         if core.CODEX_SOCKET.exists():
             print(f'ok: Codex app project {core.codex_project(core.Codex(timeout=60))}')
@@ -406,15 +434,12 @@ def setup(args):
     if core.LOCAL.is_file():
         print(f'ok: personal profile {core.LOCAL}')
     else:
-        person(f'{core.TOOL} profile init <confirmed preferences>', 'the profile card of taskq-manager.md § 1 first: areas, own '
-               'tasks or pool, Claude/Codex slots; until then tick uses defaults (all areas, own tasks and the pool, 2/3)')
+        person(f'{core.TOOL} profile init', PROFILE_CARD)
     for name, item in core.EXECUTORS.items():
         if item.get('setup'):
             person(f'cd {core.ROOT} && {item["setup"]}', f'runtime {name}: its app steps (sign-in, bot, trigger) are the person\'s')
     print('No workers or timer started.' + (f' Pending for the person: {len(pending)} step(s) above.' if pending else ''))
-    doctor(argparse.Namespace())
-    if pending:
-        sys.exit(1)
+    doctor(argparse.Namespace(codex=args.codex), pending)
 
 
 def migrate(args):

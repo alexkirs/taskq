@@ -1903,10 +1903,10 @@ def claude_spawn(name, extra=None, prompt=None, remote_control=False):
 
 def claude_agents():
     """This machine's `claude --bg` sessions by session id, stopped ones too (no `pid`)."""
-    done = subprocess.run(['claude', 'agents', '--json', '--all'], cwd=ROOT, capture_output=True, text=True, timeout=60)
-    try:
+    try:  # a machine without the claude CLI (CI, a Codex-only machine) has none
+        done = subprocess.run(['claude', 'agents', '--json', '--all'], cwd=ROOT, capture_output=True, text=True, timeout=60)
         listed = json.loads(done.stdout) if not done.returncode else []
-    except ValueError:
+    except (OSError, subprocess.SubprocessError, ValueError):
         listed = []
     return {item['sessionId']: item for item in listed if item.get('kind') == 'background' and item.get('sessionId')}
 

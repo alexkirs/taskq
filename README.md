@@ -247,7 +247,7 @@ before this wrapper (`taskq_cli`) existed picks it up after one `pipx install --
 
 ```bash
 python3 -m unittest discover -s tests
-TASKQ_CLEANUP_HELPERS=<project>/scripts python3 -m unittest discover -s tests
+TASKQ_CLEANUP_HELPERS=<project>/scripts python3 -m unittest discover -s tests  # cleanup through a project's helpers
 ```
 
 License: [MIT](LICENSE).

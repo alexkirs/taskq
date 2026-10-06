@@ -578,7 +578,11 @@ read conversations). This run changes no local branches, trees or sessions. The 
 sections: "Remove", "Ask the owner", "Kept".
 
 1. `cleanup --apply` re-checks each "Remove" item before acting. Trees are removed by the project's
-   existing `[workspace] retire` command with deletion, then branches by `git branch -d`. To check
+   helpers when `[workspace] cleanup_helpers` names them (`workspace_gc.py retire --delete`), else by
+   the built-ins: a tree is finished when `git status` is clean, it is not locked, no process of this
+   user works in it (`lsof`; when `lsof` fails, the tree is a question) and every patch is in
+   `origin/main`; `git worktree remove` (no `--force`) removes it. Both `.worktrees/taskq-N` and the
+   older `../taskq-N` are found through `git worktree list`. Then branches go by `git branch -d`. To check
    deletion, Git uses `origin/main` as upstream only for the duration of the command; the branch
    configuration is not changed. A rebase is recognised via `git cherry`, but `-d` may refuse to
    delete a branch with different SHAs. Such a branch stays; there is no force and no ref rewriting.
@@ -607,8 +611,11 @@ sections: "Remove", "Ask the owner", "Kept".
    Cmd+Shift+A via `app_key` in the background does not work either, full control is needed.
    The tree of such a session stays until the next `cleanup --apply`.
 4. Claude background workers (`claude agents`, cwd the main checkout): a worker of closed tasks is
-   removed by `taskq retire <id>` (`--apply` does it); one with an open task or busy is kept; one
-   without a claim, older than `STALE_MINUTES`, is a question with a `taskq retire` option.
+   removed by `taskq retire <id>` (`--apply` does it), and so is a stopped or failed one (no `pid`)
+   without an open task, and an idle one without a claim started more than `STALE_MINUTES` ago
+   (retire keeps the transcript: `claude --resume <id>` opens it). One with an open task, busy, or
+   the calling session (the coordinator) is kept; an idle worker of a closed task not proven in
+   `origin/main` is a question with a `taskq retire` option.
    For Claude sessions in the app (imported workers, `taskq show`) the script prints
    `coordinator: archive_session local_<id>` for workers of closed tasks, found by claim, if the
    session exists in this machine's app and is not archived. Only the coordinator has this app tool:

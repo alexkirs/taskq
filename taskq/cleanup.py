@@ -1,5 +1,6 @@
 """`cleanup`: finished worktrees, branches and worker sessions, reported first, removed only when proven finished."""
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -50,21 +51,93 @@ def cleanup_codex(roots):
         codex.socket.close()
 
 
+def process_cwds():
+    """(pid, cwd) of this user's processes: `lsof` lists them on macOS and Linux. None when it cannot run."""
+    try:
+        done = subprocess.run(['lsof', '-a', '-d', 'cwd', '-u', str(os.getuid()), '-Fpn'], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found, pid = [], None
+    for line in done.stdout.splitlines():
+        if line.startswith('p'):
+            pid = int(line[1:])
+        elif line.startswith('n') and pid:
+            found.append((pid, line[1:]))
+    return found if found or not done.returncode else None
+
+
+class Builtin:
+    """The worktree tools `cleanup` uses when the project names no helpers: plain git, `lsof` and a size walk."""
+    GIB = 1024 ** 3
+
+    @staticmethod
+    def _git(root, *args):
+        return subprocess.run(['git', '-C', str(root), *args], capture_output=True, text=True, check=True).stdout
+
+    @classmethod
+    def worktrees(cls, root):
+        rows = []
+        for block in cls._git(root, 'worktree', 'list', '--porcelain').strip().split('\n\n'):
+            row = {}
+            for line in block.splitlines():
+                key, _, value = line.partition(' ')
+                row[key] = value or True
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _live(tree):
+        tree = Path(tree).resolve()
+        return {pid for pid, cwd in process_cwds() or () if Path(cwd) == tree or tree in Path(cwd).parents}
+
+    @classmethod
+    def inspect(cls, root, tree):
+        refusals = []
+        if not Path(tree).is_dir():
+            return {'refusals': ['the tree folder is missing (git worktree prune drops it)']}
+        if subprocess.run(['git', '-C', tree, 'status', '--porcelain', '--untracked-files=all'], capture_output=True, text=True).stdout.strip():
+            refusals.append('uncommitted or untracked files')
+        if any(row.get('locked') for row in cls.worktrees(root) if Path(row['worktree']).resolve() == Path(tree).resolve()):
+            refusals.append('the worktree is locked')
+        if process_cwds() is None:
+            refusals.append('processes not checked: lsof failed')
+        elif cls._live(tree):
+            refusals.append('processes work in it')
+        return {'refusals': refusals}
+
+    @staticmethod
+    def _measure(tree, seen):
+        total = 0
+        for folder, _, files in os.walk(tree):
+            for name in files:
+                with contextlib.suppress(OSError):
+                    total += os.lstat(os.path.join(folder, name)).st_size
+        return total, seen
+
+
+
+def retire_command(root, tree):
+    """Remove a finished tree: the helpers' retire, else `git worktree remove` (no --force: git refuses a dirty tree)."""
+    if core.HELPERS:
+        return [sys.executable, str(Path(root) / core.HELPERS / 'workspace_gc.py'), 'retire', str(tree), '--delete']
+    return ['git', '-C', str(root), 'worktree', 'remove', '--', str(tree)]
+
+
 def helpers(root):
-    """The project's worktree tools `cleanup` stands on (`workspace_gc`, `host_gentle`): [workspace] cleanup_helpers."""
+    """The project's worktree tools (`workspace_gc`, `host_gentle`) from [workspace] cleanup_helpers, else the built-ins."""
     if not core.HELPERS:
-        core.fail('cleanup needs [workspace] cleanup_helpers in taskq.toml: the folder with workspace_gc.py and host_gentle.py')
+        return Builtin
     folder = str(Path(root) / core.HELPERS)
     if folder not in sys.path:
         sys.path.insert(0, folder)
+    import host_gentle
     import workspace_gc
+    host_gentle.lower_priority()
     return workspace_gc
 
 
 def cleanup_plan(root):
     gc = helpers(root)
-    import host_gentle
-    host_gentle.lower_priority()
     rows = gc.worktrees(root)
     roots = {Path(row['worktree']).resolve() for row in rows}
     issues, app = cleanup_issues(), core.claude_sessions()
@@ -140,8 +213,7 @@ def cleanup_plan(root):
         elif not merged(branch or row['HEAD']):
             choices = branch_choices(branch) if branch else [('keep', 'true'), ('show diff', shlex.join(['git', 'diff', f'origin/main...{row["HEAD"]}', '--']))]
             if branch:
-                choices[-1] = ('delete', shlex.join([sys.executable, str(root / core.HELPERS / 'workspace_gc.py'), 'retire', str(tree), '--delete'])
-                               + ' && ' + choices[-1][1])
+                choices[-1] = ('delete', shlex.join(retire_command(root, tree)) + ' && ' + choices[-1][1])
             ask.append({'what': what, 'why': 'commits not proven in origin/main', 'choices': choices})
         else:
             remove.append({'kind': 'tree', 'what': what, 'path': str(tree), 'branch': branch,
@@ -219,7 +291,12 @@ def cleanup_plan(root):
             keep.append({'what': what, 'why': 'current session / open task / busy'})
         elif finished(identity):
             remove.append({'kind': 'claude-bg', 'what': what, 'thread': sid, 'why': 'worker of closed tasks, not busy'})
-        elif identity in workers or time.time() - agent.get('startedAt', 0) / 1000 > core.STALE_MINUTES * 60:
+        elif not agent.get('pid'):
+            # Retire keeps the transcript: a stopped or failed session of no open task can still be resumed by id.
+            remove.append({'kind': 'claude-bg', 'what': what, 'thread': sid, 'why': f'{agent.get("state") or "stopped"}, no open task'})
+        elif identity not in workers and time.time() - agent.get('startedAt', 0) / 1000 > core.STALE_MINUTES * 60:
+            remove.append({'kind': 'claude-bg', 'what': what, 'thread': sid, 'why': f'idle, no claim, started over {core.STALE_MINUTES} min ago'})
+        elif identity in workers:
             ask.append({'what': what, 'why': 'worker without a proven closed task (spawn without a claim, or the task is not finished)',
                         'choices': [('keep', 'true'), ('retire', shlex.join([core.TOOL, 'retire', sid]))]})
     return remove, ask, keep
@@ -260,8 +337,7 @@ def cleanup(args):
             continue
         if item['kind'] == 'tree':
             size = gc._measure(Path(item['path']), set())[0]
-            done = subprocess.run([sys.executable, str(root / core.HELPERS / 'workspace_gc.py'), 'retire', item['path'], '--delete'], cwd=root)
-            if done.returncode:
+            if subprocess.run(retire_command(root, item['path']), cwd=root).returncode:
                 print(f'Kept: retire refused {item["what"]}')
                 continue
             freed += size

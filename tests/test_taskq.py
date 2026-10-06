@@ -2519,12 +2519,10 @@ class Update(unittest.TestCase):
 GREEN = q.green  # the real one: Update patches q.green for every other test
 
 
-@unittest.skipUnless(HELPERS, 'TASKQ_CLEANUP_HELPERS names no folder with workspace_gc.py, host_tools.py, host_gentle.py')
 class Cleanup(unittest.TestCase):
-    """Real Git refs, patches and retire in disposable repositories; no live app mutations."""
+    """Real Git refs, patches and retire in disposable repositories; no live app mutations. The project's helpers
+    when TASKQ_CLEANUP_HELPERS names them, else the built-ins (git worktree remove, lsof)."""
     def setUp(self):
-        import host_tools
-        self.host = host_tools
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = (Path(directory.name) / 'repo').resolve()
@@ -2543,11 +2541,15 @@ class Cleanup(unittest.TestCase):
         self.git('push', '-q', '-u', 'origin', 'main')
         self.issues, self.app, self.threads, self.agents = {}, {}, {}, {}
         # Retire runs the existing script, not a replacement that merely deletes a directory.
-        scripts = self.root / 'scripts'
-        scripts.mkdir()
-        source = Path(HELPERS)
-        for name in ('workspace_gc.py', 'host_tools.py', 'host_gentle.py'):
-            shutil.copy2(source / name, scripts / name)
+        if HELPERS:
+            import host_tools
+            scripts = self.root / 'scripts'
+            scripts.mkdir()
+            for name in ('workspace_gc.py', 'host_tools.py', 'host_gentle.py'):
+                shutil.copy2(Path(HELPERS) / name, scripts / name)
+            self.holding = lambda path: patch.object(host_tools, 'live_paths', lambda: [(9876, 'worker', 'cwd', str(path))])
+        else:
+            self.holding = lambda path: patch.object(cleanup, 'process_cwds', lambda: [(9876, str(path))])
         self.before_cwd = Path.cwd()
         os.chdir(self.root)
         self.addCleanup(os.chdir, self.before_cwd)
@@ -2555,7 +2557,9 @@ class Cleanup(unittest.TestCase):
         for target, name, value in ((cleanup, 'cleanup_issues', lambda: self.issues), (q, 'claude_sessions', lambda: self.app),
                                     (q, 'claude_agents', lambda: self.agents),
                                     (cleanup, 'cleanup_codex', lambda roots: self.threads),
-                                    (host_tools, 'live_paths', lambda: [])):
+                                    (q, 'HELPERS', q.HELPERS if HELPERS else None),
+                                    *([(sys.modules['host_tools'], 'live_paths', lambda: [])] if HELPERS
+                                      else [(cleanup, 'process_cwds', lambda: [])])):
             patcher = patch.object(target, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -2610,7 +2614,7 @@ class Cleanup(unittest.TestCase):
         doing = self.tree('worktree-taskq-7')
         held = self.tree('worktree-held')
         self.issues[7] = {'closed': False, 'state': 'doing', 'claim': {'runtime': 'claude', 'session': 'live'}}
-        with patch.object(self.host, 'live_paths', lambda: [(9876, 'worker', 'cwd', str(held))]):
+        with self.holding(held):
             report = self.run_cleanup(True)
         ask = report.split('# Ask the owner')[1].split('# Kept')[0]
         self.assertIn(str(unmerged), ask)
@@ -2699,17 +2703,27 @@ class Cleanup(unittest.TestCase):
     def test_background_workers_of_closed_tasks_are_retired_others_asked_or_kept(self):
         self.issues[1] = {'closed': True, 'state': 'unknown', 'type': 'research', 'claim': {'runtime': 'claude', 'session': 'bg-done'}}
         self.issues[2] = {'closed': False, 'state': 'doing', 'type': 'research', 'claim': {'runtime': 'claude', 'session': 'bg-open'}}
+        self.issues[3] = {'closed': False, 'state': 'waiting', 'type': 'research', 'claim': {'runtime': 'claude', 'session': 'bg-asking'}}
+        self.issues[4] = {'closed': True, 'state': 'unknown', 'type': 'code', 'result': {'sha': 'bad-sha'},
+                          'claim': {'runtime': 'claude', 'session': 'bg-unproven'}}
         old = (time.time() - q.STALE_MINUTES * 60 - 60) * 1000
-        agent = lambda sid, **more: {'id': sid[:5], 'sessionId': sid, 'cwd': str(self.root), 'startedAt': old, 'status': 'idle', **more}
-        self.agents = {sid: agent(sid) for sid in ('bg-done', 'bg-open', 'bg-orphan')}
+        agent = lambda sid, **more: {'id': sid[:5], 'sessionId': sid, 'cwd': str(self.root), 'startedAt': old,
+                                     'pid': 1, 'status': 'idle', **more}
+        self.agents = {sid: agent(sid) for sid in ('bg-done', 'bg-open', 'bg-orphan', 'bg-unproven')}
         self.agents['bg-fresh'] = agent('bg-fresh', startedAt=time.time() * 1000)
-        self.agents['bg-elsewhere'] = agent('bg-elsewhere', cwd='/elsewhere')
+        self.agents['bg-busy'] = agent('bg-busy', status='busy')
+        self.agents['bg-elsewhere'] = agent('bg-elsewhere', cwd='/elsewhere', pid=None)
+        self.agents['claude-session'] = agent('claude-session')  # the calling session: the coordinator
+        for sid, state in (('bg-failed', 'failed'), ('bg-stopped', 'done'), ('bg-asking', 'blocked')):
+            self.agents[sid] = agent(sid, pid=None, status=None, state=state, startedAt=time.time() * 1000)
         retired = []
-        with patch.object(q, 'claude_stop', lambda sid, remove=False: retired.append((sid, remove))):
+        with patch.dict(os.environ, CLAUDE), patch.object(q, 'claude_stop', lambda sid, remove=False: retired.append((sid, remove))):
             report = self.run_cleanup(True)
-        self.assertEqual(retired, [('bg-done', True)])
-        self.assertIn('Claude background session bg-op', report.split('# Kept')[1])
-        self.assertIn('taskq retire bg-orphan', report.split('# Ask the owner')[1])
+        self.assertEqual(sorted(retired), [(sid, True) for sid in ('bg-done', 'bg-failed', 'bg-orphan', 'bg-stopped')])
+        kept, ask = report.split('# Kept')[1], report.split('# Ask the owner')[1].split('# Kept')[0]
+        for sid in ('bg-op', 'bg-as', 'bg-bu', 'claud'):
+            self.assertIn(f'Claude background session {sid}', kept)
+        self.assertIn('taskq retire bg-unproven', ask)
         for sid in ('bg-fresh', 'bg-elsewhere'):
             self.assertNotIn(sid, report)
 

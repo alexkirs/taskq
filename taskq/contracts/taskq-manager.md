@@ -569,7 +569,9 @@ archive = "run-grok archive {session}"           # optional
 ```
 
 Commands are split before the values are filled in: no value reaches a shell. The app then also
-works in `add --runtime`, `--limit grok=N` and `selftest --runtime grok`.
+works in `add --runtime`, `--limit grok=N`, `selftest --runtime grok`, `spawn --runtime grok` and
+`send --runtime grok <session> --text` (the tick prints both). Without a status API the tick nudges a
+worker once when its doing task is quiet for 30 minutes; at 120 minutes it is released as stalled.
 
 **Speed.** Each glab call costs about 1.05 s here (221 ms round trip to the GitLab host; the open
 issues page, 344 KB, 2.5 s), and `take` makes 8 of them. `quick` makes about 60 calls; under one

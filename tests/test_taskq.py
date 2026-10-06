@@ -1,4 +1,5 @@
 """Full queue cycles against an in-memory GitLab; sessions are environment identities, no network."""
+import argparse
 import contextlib
 import io
 import json
@@ -1389,6 +1390,13 @@ class Selftest(unittest.TestCase):
                              ['run-grok', 'send', 's 1', 'a; rm -rf /'])
             iid = self.add('--type', 'research', '--runtime', 'grok')
             self.assertIn(f'take {iid}', self.do({**CLAUDE, 'CLAUDE_CODE_SESSION_ID': '', 'GROK_SESSION_ID': 'g1'}, 'worker'))
+            # spawn and send of the coordinator run the table's commands, never a Claude session
+            q.EXECUTORS['grok'] = {**q.EXECUTORS['grok'], 'spawn': 'echo id-{name}', 'send': 'echo sent {session} {text}'}
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                q.spawn(argparse.Namespace(runtime='grok', name='T1 x'))
+                q.send(argparse.Namespace(runtime='grok', session='g1', text='go'))
+            self.assertEqual(out.getvalue().split('\n')[:2], ['id-T1 x', 'sent g1 go'])
 
 
 class Doctor(unittest.TestCase):

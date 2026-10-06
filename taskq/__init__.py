@@ -1745,8 +1745,25 @@ def spawn(args):
     worker prompt. Claude: a CLI background session (`claude_spawn`). Codex: `codex_spawn`."""
     if args.runtime == 'codex':
         return print(codex_spawn(args.name))
+    if args.runtime in EXECUTORS:
+        return print(executor_run(args.runtime, 'spawn', name=args.name))
     session = claude_spawn(args.name)
     print(f'{session}\nWatch it: `claude attach {session[:8]}` or `claude agents`; in the app: `{TOOL} show {session}`.')
+
+
+def executor_run(runtime, verb, **values):
+    """One `[runtimes.<name>]` command (`spawn`, `send`) from the main checkout; its last output line."""
+    done = subprocess.run(selftest_command(EXECUTORS[runtime][verb], **values), cwd=ROOT, capture_output=True, text=True, timeout=300)
+    if done.returncode:
+        fail(f'{runtime} {verb}: {last_line(done.stderr + done.stdout)}')
+    return last_line(done.stdout)
+
+
+def send(args):
+    """One turn to a worker of a `[runtimes.<name>]` app: the worker prompt, an answer, a nudge."""
+    if args.runtime not in EXECUTORS:
+        fail(f'{args.runtime} has its own command: Claude: SendMessage; Codex: `{TOOL} codex-send`')
+    print(executor_run(args.runtime, 'send', session=args.session, text=args.text))
 
 
 def claude_env(extra=None):
@@ -1999,6 +2016,15 @@ def tick(args):
             print(f'- #{item["iid"]}: `{TOOL} codex-send {item["claim"]["session"]} '
                   '--text "Continue the assigned task; hand in result or ask the owner through taskq."`')
         print()
+    # An app without a status API: silence on the issue is the only sign its turn ended without a hand-in.
+    quiet = [item for item in everything if item['state'] == 'doing' and (item['claim'] or {}).get('runtime') in EXECUTORS
+             and not item.get('result') and QUIET_MINUTES <= item['age'] < QUIET_MINUTES + 5]
+    if quiet:
+        print(f'## Quiet workers\n\nNo change on the issue for {QUIET_MINUTES} minutes. Nudge each (this tick only):\n')
+        for item in quiet:
+            print(f'- #{item["iid"]}: `{TOOL} send --runtime {item["claim"]["runtime"]} {item["claim"]["session"]} '
+                  '--text "Continue the assigned task; hand in result or ask the owner through taskq."`')
+        print()
     if odd:
         print('## Board mismatch\n\nThese issues are not in a state taskq can run. Fix each:\n')
         print(''.join(f'- {line}\n' for line in odd))
@@ -2024,7 +2050,9 @@ def tick(args):
               f'Runtime of each: ' + ', '.join(f'#{item["iid"]} {item["runtime"]}' for item in start) + '.\n'
               f'Claude worker: `{TOOL} spawn --name "T<N> <title>"` (a background session: the app window does not '
               f'change), then SendMessage to that name with the prompt and `notify_when_idle: true`. Codex worker: '
-              f'`{TOOL} spawn --runtime codex --name "T<N> <title>"`, then `{TOOL} codex-send <printed id> --text "<prompt>"`.\n')
+              f'`{TOOL} spawn --runtime codex --name "T<N> <title>"`, then `{TOOL} codex-send <printed id> --text "<prompt>"`.\n'
+              + ''.join(f'{name} worker: `{TOOL} spawn --runtime {name} --name "T<N> <title>"`, then '
+                        f'`{TOOL} send --runtime {name} <printed id> --text "<prompt>"`.\n' for name in EXECUTORS))
     live = [item for item in everything if item['state'] == 'doing' and (item['claim'] or {}).get('runtime') == 'claude'
             and item['claim'].get('session')]
     if live:
@@ -2345,6 +2373,7 @@ def cleanup(args):
 # --- selftest: the queue's own mechanisms, each row a fact read back from GitLab -------------------
 
 SELFTEST = 'selftest'  # label of a selftest task: only a profile whose filter names it sees one
+QUIET_MINUTES = 30  # a [runtimes] worker silent this long gets one nudge: the tick in the 5-minute window after it
 EXECUTORS = {}  # runtime -> [runtimes.<name>] of taskq.toml: env, spawn, send, archive command templates
 SELFTEST_GOAL = """This is a taskq selftest task: it checks the queue, not the project. Skip the project's startup
 reading and any workspace. Run only these commands from the main checkout, N being this task's number, then stop:
@@ -2573,7 +2602,8 @@ class Selftest:
                 item = parse(api('GET', f'issues/{iid}')) or {}
                 if item.get('state') == state:
                     return self.fact(iid, state, session if state in ('doing', 'ask') else None, action)
-                if process and process.poll() is not None:
+                # A `send` that exits 0 may only have queued the turn (a webhook): then wait the full time.
+                if process and process.poll() is not None and (process.returncode or runtime not in EXECUTORS):
                     ended = ended or time.time()
                     if time.time() - ended > 30:
                         raise SelftestError(f'#{iid} is {item.get("state")}, the worker turn ended: '
@@ -2785,6 +2815,7 @@ def main(argv=None):
     command('retire', retire, claude_session)
     thread = (('thread',), {})
     command('codex-send', codex_send, thread, text)
+    command('send', send, (('--runtime',), {'required': True, 'choices': tuple(RUNTIMES)}), (('session',), {}), text)
     command('codex-read', codex_read, thread,
             (('--limit',), {'type': int, 'choices': range(1, 21), 'default': 3, 'metavar': '1..20',
                            'help': 'recent turns (default 3), up to 100 latest events per turn'}))

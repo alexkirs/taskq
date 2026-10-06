@@ -388,7 +388,7 @@ class Github:
     @staticmethod
     def comment(item):
         return {'id': item['id'], 'body': item['body'], 'created_at': item['created_at'], 'system': False,
-                'author': {'id': item['user']['id'], 'username': item['user']['login']}}
+                'author': {'id': item['user']['id'], 'username': item['user']['login']}, 'author_association': item.get('author_association', '')}
 
     def body(self, body, iid=None):
         out = {key: body[key] for key in ('title',) if key in body}
@@ -579,12 +579,26 @@ def labels(add, remove):
     return {key: ','.join(names) for key, names in (('add_labels', add), ('remove_labels', remove)) if names}
 
 
-def comments(iid):
-    return pages(f'issues/{iid}/notes?sort=asc&activity_filter=only_comments')
+MEMBERS = None  # GitLab: ids of the project's members with Reporter or higher, read once per process
 
 
-def notes(iid):
-    return [item['body'] for item in comments(iid) if not item['body'].startswith(('**beat**', '**shown**'))]
+def collaborators(found):
+    """Only collaborators' comments: anyone may comment on a public issue, and a forged `**answer** · owner` would
+    reach a brief as the owner's word. GitHub marks each comment's author_association; GitLab needs the members."""
+    global MEMBERS
+    if any('author_association' not in item for item in found) and MEMBERS is None:
+        MEMBERS = {item['id'] for item in pages('members/all') if item['access_level'] >= 20}
+    return [item for item in found if (item['author_association'] in ('OWNER', 'MEMBER', 'COLLABORATOR')
+            if 'author_association' in item else (item.get('author') or {}).get('id') in MEMBERS)]
+
+
+def comments(iid, everyone=False):
+    found = pages(f'issues/{iid}/notes?sort=asc&activity_filter=only_comments')
+    return found if everyone else collaborators(found)
+
+
+def notes(found):
+    return [item['body'] for item in found if not item['body'].startswith(('**beat**', '**shown**'))]
 
 
 def link(iid, deps):
@@ -792,11 +806,14 @@ def set_runtime(args):
 def brief(current):
     claim, pushes = current['claim'], current['type'] in ('code', 'docs')
     kind = ('continue' if claim else 'new') if pushes else 'none'
+    found = comments(current['iid'], everyone=True)
+    kept = collaborators(found)
+    omitted = f'\n\n{len(found) - len(kept)} comments by non-collaborators omitted' if len(found) > len(kept) else ''
     return BRIEF.format(**{**current, 'tool': TOOL, 'rules': RULES, 'deliver': DELIVER[pushes],
                            'workspace': WORKSPACE[kind].format(iid=current['iid']),
                            'sha': ' --sha <pushed commit>' if pushes else '',
                            'scope': ', '.join(current['scope']) or 'none',
-                           'notes': '\n\n---\n\n'.join(notes(current['iid'])) or 'none'})
+                           'notes': ('\n\n---\n\n'.join(notes(kept)) or 'none') + omitted})
 
 
 def worker(args):
@@ -846,7 +863,7 @@ def take(args):
 def beat(args):
     """A new note moves `updated_at` (an edited one does not); the previous beat, if it is the newest, goes."""
     need_owner(task(args.iid, ('doing',)))
-    last = api('GET', f'issues/{args.iid}/notes?sort=desc&per_page=1&activity_filter=only_comments')
+    last = collaborators(api('GET', f'issues/{args.iid}/notes?sort=desc&per_page=1&activity_filter=only_comments'))
     note(args.iid, 'beat')
     if last and last[0]['body'].startswith('**beat**'):
         api('DELETE', f'issues/{args.iid}/notes/{last[0]["id"]}')
@@ -1847,7 +1864,7 @@ def question(iid):
     """The latest question of an `ask` task and when `tick` last showed it (None: not yet). The newest page
     is enough: while a task waits in ask, only `shown` notes follow its question."""
     shown = None
-    for item in api('GET', f'issues/{iid}/notes?sort=desc&per_page=100&activity_filter=only_comments'):
+    for item in collaborators(api('GET', f'issues/{iid}/notes?sort=desc&per_page=100&activity_filter=only_comments')):
         if item['body'].startswith('**shown**') and shown is None:
             shown = stamp(item['created_at'])
         elif item['body'].startswith('**ask**'):
@@ -2035,7 +2052,7 @@ def tick(args):
     agents = claude_agents() if any((item['claim'] or {}).get('runtime') == 'claude' and item['state'] in ('doing', 'review')
                                     for item in everything) else {}
     for item in review:
-        print(f'## Review #{item["iid"]}: {item["title"]}\n\n{item["text"]}\n\nHanded in:\n\n{notes(item["iid"])[-1]}\n\n'
+        print(f'## Review #{item["iid"]}: {item["title"]}\n\n{item["text"]}\n\nHanded in:\n\n{(notes(comments(item["iid"])) or ['none'])[-1]}\n\n'
               f'Check the result against the Acceptance above (for code and docs read the commit).\n'
               f'Accepted: `{TOOL} close {item["iid"]} --text "<what you checked>"`. '
               f'Not accepted: `{TOOL} reject {item["iid"]} --text "<what to fix>"`.\n')
@@ -2464,7 +2481,7 @@ class Selftest:
         with ThreadPoolExecutor(2) as pool:  # two reads at once: each glab call is ~1 s
             issue = pool.submit(api, 'GET', f'issues/{iid}')
             history = pool.submit(api, 'GET', f'issues/{iid}/notes?sort=desc&per_page=20&activity_filter=only_comments') if action else None
-            issue, history, wrong = issue.result(), history and history.result(), []
+            issue, history, wrong = issue.result(), history and collaborators(history.result()), []
         item = (parse(issue) if issue['state'] == 'opened' else None) or {}
         if closed and issue['state'] != 'closed':
             wrong.append(f'issue is {issue["state"]}')

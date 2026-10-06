@@ -487,7 +487,7 @@ def tick_pass(args, act=False):
     fresh = [(item, text) for item, text, shown in asked if shown is None]
     summary = [(item, text) for item, text, shown in asked if shown and time.time() - shown >= core.SUMMARY_SECONDS]
     codex_stopped = [item for item in everything if item['state'] in ('ask', 'later')
-                     and (item['claim'] or {}).get('runtime') == 'codex']
+                     and (item['claim'] or {}).get('runtime') == 'codex' and not core.codex_is_archived(item['claim']['session'])]
     # A card moved by hand on the board into a state its data does not support.
     odd = [f'{core.ref(issue)} labels {issue["labels"]}: give it exactly one state label' for issue in odd] + [
         f'{core.ref(item)} is doing without a worker: move it back to ready or `release {item["iid"]}`'

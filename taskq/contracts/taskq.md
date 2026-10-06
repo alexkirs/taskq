@@ -267,7 +267,9 @@ ready/waiting/later → ask (manager) → answer → ready
 - Exception: the owner answers in the worker's own session. `answer N` from the session whose
   `claim` is on the task moves `ask`→`doing` with the same `claim`, without `ready` and without a new `take`.
   Machine capacity is not checked: the slot was free only during the question; the worker never left the task.
-  The worker continues in the same session and delivers `result` itself. An `answer` from the manager,
+  The worker continues in the same session and delivers `result` itself. The same holds for `reject N` from
+  that session (the owner's change request reached the worker in review): `review`→`doing`, the result is
+  dropped, the claim stays, so no `tick` sees a `ready` task to start a second worker for (#127). An `answer` from the manager,
   the coordinator or the owner's shell (session does not match `claim`) still leads to `ready`. The `worker`
   brief and the `ask` output state this rule.
 - A worker on a `code` or `docs` task creates its own worktree (the brief prints the command, from the

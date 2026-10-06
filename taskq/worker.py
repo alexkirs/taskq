@@ -258,10 +258,11 @@ def requeue(args):
     release: drop a dead worker's claim. The next worker session continues with the full history."""
     current = core.task(args.iid, {'answer': ('ask', 'later'), 'reject': ('review',)}.get(args.action, core.STATES))
     claim = current['claim'] or {}
-    if args.action == 'answer' and claim.get('session') and {key: claim.get(key) for key in ('runtime', 'session')} == core.session():
-        # The owner answered in the worker's own session: it continues with its claim. Its doing place
-        # was free while the task waited in ask, so the limit is not checked: the worker never left.
-        core.save(current, 'doing', 'answer', args.text, waiting_for=None)
+    if args.action in ('answer', 'reject') and claim.get('session') and {key: claim.get(key) for key in ('runtime', 'session')} == core.session():
+        # The owner answered (or asked for a change in review: reject, #127) in the worker's own session: it
+        # continues with its claim, never through ready, where a tick would start a second worker. Its doing
+        # place was free while the task waited, so the limit is not checked: the worker never left.
+        core.save(current, 'doing', args.action, args.text, waiting_for=None, result=None)
         return print(f'#{args.iid} is doing again with your claim: continue in this session')
     # An empty claim marks a started task: it keeps its paths and its next worker continues.
     claim = current['claim'] and {'runtime': None, 'session': None}

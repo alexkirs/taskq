@@ -419,11 +419,28 @@ def codex_read(args):
         print('now: ' + ('; '.join(codex_item(item) for item in running) if running else 'active; no running tool recorded'))
 
 
+def codex_archived(metadata):
+    return '/archived_sessions/' in (metadata.get('path') or '')
+
+
+def codex_is_archived(thread):
+    """#127: True only when this machine's app server reads the thread as archived; unknown (no socket, another
+    machine's thread) is False, so the tick keeps listing it."""
+    try:
+        codex = Codex()
+        try:
+            return codex_archived(codex.call('thread/read', {'threadId': thread})['thread'])
+        finally:
+            codex.socket.close()
+    except (OSError, SystemExit, ValueError):
+        return False
+
+
 def codex_archive(args):
     """Archive an idle Codex thread (reversible: `thread/unarchive`) and take it out of the app's sidebar."""
     codex = Codex()
     metadata = codex.call('thread/read', {'threadId': args.thread})['thread']
-    if '/archived_sessions/' in (metadata.get('path') or ''):
+    if codex_archived(metadata):
         return print(f'already archived {args.thread}')
     turns = codex.call('thread/turns/list', {'threadId': args.thread, 'limit': 1, 'itemsView': 'notLoaded'})['data']
     if metadata['status']['type'] == 'active' or (turns and codex_app_running(metadata, turns[0])):

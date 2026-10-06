@@ -772,6 +772,21 @@ class Cycle(unittest.TestCase):
         self.assertEqual(self.state(iid), 'review')
         self.assertIn(f'#{iid}: take → ask +0m → answer +0m → take +0m → result', self.do(CLAUDE, 'report'))
 
+    def test_worker_rejects_its_own_review_and_continues_without_a_start(self):
+        # #127: the owner's change request reached the worker in review; its own reject keeps the claim, so
+        # no tick sees a ready task to start a second worker for.
+        iid = self.add('--type', 'research')
+        self.do(CLAUDE, 'take', iid)
+        self.do(CLAUDE, 'result', iid, '--text', 'v1', '--checks', 'none')
+        self.assertIn('is doing again', self.do(CLAUDE, 'reject', iid, '--text', 'change x'))
+        current = q.parse(self.gitlab.issues[iid])
+        self.assertEqual((current['state'], current['claim']['session'], current['result']), ('doing', 'claude-session', None))
+        self.assertNotIn('Start 1 worker', self.do(CODEX, 'tick'))
+        self.assertIn('is yours', self.do(CLAUDE, 'take', iid))
+        self.do(CLAUDE, 'result', iid, '--text', 'v2', '--checks', 'none')
+        self.do(COORDINATOR, 'reject', iid, '--text', 'again')  # a reject from elsewhere still requeues
+        self.assertEqual(self.state(iid), 'ready')
+
     def test_coordinator_answer_requeues_and_drops_the_session(self):
         iid = self.add('--type', 'research')
         self.do(CLAUDE, 'take', iid)
@@ -1545,6 +1560,8 @@ class Cycle(unittest.TestCase):
         output = self.do(CLAUDE, 'tick')
         self.assertIn('codex-archive codex-session', output)
         self.assertNotIn('Waiting for the owner', output)
+        self.codex.path = '/h/.codex/archived_sessions/rollout.jsonl'  # #127: archived, no longer listed
+        self.assertNotIn('codex-archive codex-session', self.do(CLAUDE, 'tick'))
 
     def test_tick_codex_unavailable_does_not_stop_other_coordinator_work(self):
         self.do(CODEX, 'take', self.add('--type', 'asset'))
@@ -2013,7 +2030,7 @@ class GithubCycle(unittest.TestCase):
         self.assertEqual(self.github.column(number), 'doing')
         self.do(CLAUDE, 'result', number, '--text', 'done', '--checks', 'none')
         self.assertEqual(self.github.column(number), 'review')
-        self.do(CLAUDE, 'reject', number, '--text', 'more')
+        self.do(COORDINATOR, 'reject', number, '--text', 'more')
         self.assertEqual(self.github.column(number), 'ready')
         self.do(CLAUDE, 'take', number)
         self.do(CLAUDE, 'result', number, '--text', 'done', '--checks', 'none')

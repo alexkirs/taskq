@@ -87,8 +87,10 @@ def cleanup_plan(root):
     owned = {}
     for iid, issue in issues.items():
         if not issue['closed']:
-            # A ready task with an old claim also keeps its continuation tree.
-            owned[f'worktree-taskq-{iid}'] = f'open task #{iid} ({issue["state"]})'
+            # A ready task with an old claim also keeps its continuation tree: `.worktrees/taskq-N` (branch `taskq-N`),
+            # `../taskq-N` from before 2026-10-07, or a Claude `.claude/worktrees/taskq-N` (branch `worktree-taskq-N`).
+            for name in (f'taskq-{iid}', f'worktree-taskq-{iid}'):
+                owned[name] = f'open task #{iid} ({issue["state"]})'
     for row in rows:
         branch = row.get('branch', '').removeprefix('refs/heads/')
         if any((thread.get('status') or {}).get('type') not in ('idle', 'notLoaded') or ('codex', sid) in mine
@@ -97,7 +99,7 @@ def cleanup_plan(root):
             owned[branch or row['worktree']] = 'current / active / unknown Codex session state'
     for identity in mine:
         for iid in workers.get(identity, ()):
-            protected.add(f'worktree-taskq-{iid}')
+            protected.update((f'taskq-{iid}', f'worktree-taskq-{iid}'))
     git = lambda *args: gc._git(root, *args)
 
     def merged(ref):

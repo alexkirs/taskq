@@ -849,7 +849,10 @@ class Cycle(unittest.TestCase):
         self.assertIn('exists', self.refused(CLAUDE, 'profile', 'init', '--no-mine'))
         self.do(CLAUDE, 'init')
         self.do(CLAUDE, 'init')
-        self.assertEqual(gitignore.read_text(), 'build/\n/taskq.local.toml\n')
+        self.assertEqual(gitignore.read_text(), 'build/\n/taskq.local.toml\n/.worktrees/\n')
+        gitignore.write_text('.worktrees/\n')  # an unanchored line already ignores the trees
+        self.do(CLAUDE, 'init')
+        self.assertEqual(gitignore.read_text(), '.worktrees/\n/taskq.local.toml\n')
         self.assertIn("mine=True", self.do(CLAUDE, 'tick'))
 
     def test_personal_codex_override_wins_over_the_shared_one(self):
@@ -1947,6 +1950,20 @@ class Doctor(unittest.TestCase):
         with patch.object(q, 'git', lambda *args, **kwargs: '' if args[0] == 'ls-files' else self.origin if args[:2] == ('remote', 'get-url') else None):
             self.assertIn('git rm --cached -- taskq.local.toml', self.doctor()[1])
 
+    def test_task_trees_outside_dot_worktrees_are_named_with_the_move_command(self):
+        self.enterContext(patch.object(q, 'api', Gitlab()))
+        old, new = q.ROOT.parent / 'taskq-3', q.ROOT / '.worktrees/taskq-5'
+        listed = ''.join(f'worktree {tree}\nHEAD abc\n\n' for tree in (q.ROOT, old, new, q.ROOT / '.claude/worktrees/x'))
+        self.enterContext(patch.object(q, 'git', lambda *args, **kwargs: listed if args[:2] == ('worktree', 'list')
+                                       else self.origin if args[:2] == ('remote', 'get-url') else None))
+        code, out = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertIn(f'task tree {old} is outside {q.ROOT / ".worktrees"}', out)
+        self.assertIn(f'cd {q.ROOT} && mkdir -p .worktrees && git worktree move {old} .worktrees/taskq-3', out)
+        self.assertNotIn('taskq-5', out)
+        self.assertNotIn('worktrees/x', out)
+        self.assertTrue(old.parent.exists() and not new.exists())  # doctor moves nothing
+
     def doctor(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             try:
@@ -2049,7 +2066,7 @@ class Doctor(unittest.TestCase):
 class Setup(unittest.TestCase):
     """`doctor --fix`: what a command can do is done once and `ok` on a rerun; the person's steps are printed, not run."""
     GLOBALS = ('PROJECT', 'PROJECT_PATH', 'HOST', 'STORE', 'BOARD', 'BOARDS', 'AREAS', 'ROOT', 'TICK_BEAT', 'WORKER', 'RULES',
-               'CODEX_PROJECT', 'CODEX_SECTION', 'RETIRE', 'HELPERS', 'LOCAL', 'SHARED')
+               'CODEX_PROJECT', 'CODEX_SECTION', 'WORKSPACE', 'RETIRE', 'HELPERS', 'LOCAL', 'SHARED')
 
     def setUp(self):
         for name in self.GLOBALS:  # `configure` sets them from the new taskq.toml
@@ -2074,6 +2091,19 @@ class Setup(unittest.TestCase):
         (self.tmp / 'claude.json').write_text(json.dumps({'projects': {os.path.realpath(self.tmp): {'hasTrustDialogAccepted': True}}}))
         permitted(self.tmp)
         (self.tmp / 'taskq.local.toml').write_text('[profile]\nmine = false\n')
+
+    def test_trees_default_to_dot_worktrees_inside_the_checkout(self):
+        (self.tmp / 'taskq.toml').write_text('[github]\nrepo = "owner/repo"\n[update]\nauto = false\n')
+        q.configure()
+        self.assertIn('git worktree add -b taskq-7 .worktrees/taskq-7 origin/main', q.WORKSPACE['new'].format(iid=7))
+        self.assertIn('.worktrees/taskq-7', q.WORKSPACE['continue'].format(iid=7))
+        self.assertIn('.worktrees/taskq-7', q.WORKSPACE['none'].format(iid=7))
+        self.assertEqual(q.RETIRE.format(iid=7), 'git worktree remove .worktrees/taskq-7')
+        # A project's own `new` without `retire`: its trees are elsewhere, so no default retire.
+        (self.tmp / 'taskq.toml').write_text('[github]\nrepo = "owner/repo"\n[update]\nauto = false\n[workspace]\nnew = "make tree {iid}"\n')
+        q.configure()
+        self.assertEqual((q.WORKSPACE['new'], q.RETIRE), ('make tree {iid}', None))
+        self.assertIn('.worktrees/taskq-{iid}', q.WORKSPACE['continue'])
 
     def test_a_runtime_setup_command_is_the_persons_step(self):
         self.enterContext(patch.object(q, 'api', Gitlab()))
@@ -2483,6 +2513,22 @@ class Cleanup(unittest.TestCase):
         for tree in (unmerged, dirty, doing, held):
             self.assertTrue(tree.exists())
         self.assertEqual((dirty / 'unknown').read_text(), 'do not delete')
+
+    def test_task_trees_in_dot_worktrees_and_next_to_the_checkout_are_both_known(self):
+        trees = {}
+        for iid, tree in ((7, self.root / '.worktrees/taskq-7'), (8, self.root.parent / 'taskq-8'),
+                          (9, self.root / '.worktrees/taskq-9'), (10, self.root.parent / 'taskq-10')):
+            tree.parent.mkdir(parents=True, exist_ok=True)
+            self.git('worktree', 'add', '-q', '-b', f'taskq-{iid}', str(tree))
+            trees[iid] = tree
+        self.issues.update({7: {'closed': False, 'state': 'doing'}, 8: {'closed': False, 'state': 'ready'},
+                            9: {'closed': True, 'state': 'closed'}, 10: {'closed': True, 'state': 'closed'}})
+        report = self.run_cleanup()
+        removed, kept = report.split('# Ask the owner')[0], report.split('# Kept')[1]
+        for iid in (7, 8):
+            self.assertIn(f'tree {trees[iid]} / taskq-{iid}: open task #{iid}', kept)
+        for iid in (9, 10):
+            self.assertIn(f'tree {trees[iid]} / taskq-{iid}', removed)
 
     def test_rebased_patch_is_finished_but_d_never_becomes_force(self):
         tree = self.tree('worktree-rebased', False)

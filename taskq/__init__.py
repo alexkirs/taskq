@@ -33,13 +33,16 @@ CODEX_PROJECT = CODEX_SECTION = None  # the Codex app's project and sidebar sect
 # committed). [profile] is the tick/worker profile, [codex] the app project override; read anew on every use.
 LOCAL, SHARED = None, {}  # its path; [profile] of taskq.toml: team defaults under the personal file
 PROFILE_DEFAULTS = {'filter': '', 'mine': False, 'preferred_runtime': None}
-WORKSPACE = {
-    'continue': 'this task was started before in worktree `taskq-{iid}` (`git worktree list` shows its path); continue there. If it is gone, create it: `git worktree add -b taskq-{iid} ../taskq-{iid} origin/main`.',
-    'new': 'from the main checkout run `git fetch origin && git worktree add -b taskq-{iid} ../taskq-{iid} origin/main` and work only there (`git worktree add` and `cd` in Bash, never the EnterWorktree tool: it prompts for a tree outside .claude/worktrees).',
-    'none': 'this task is expected to end in an answer, not a commit: work from the main checkout. If it turns out to need file changes, make a worktree `taskq-{iid}`, work there, push like a code task and name the commit in the result text.',
+# Task trees live inside the main checkout, in `.worktrees/` (gitignored by `init`): `taskq-N` of different projects
+# never meet in one parent folder. Trees made before 2026-10-07 sit next to the checkout (`../taskq-N`); `doctor` names them.
+TREES = '.worktrees'
+WORKSPACE = TREE_WORKSPACE = {
+    'continue': 'this task was started before in worktree `.worktrees/taskq-{iid}` of the main checkout (`git worktree list` shows its path); continue there. If it is gone, create it: `git fetch origin && git worktree add -b taskq-{iid} .worktrees/taskq-{iid} origin/main`.',
+    'new': 'from the main checkout run `git fetch origin && git worktree add -b taskq-{iid} .worktrees/taskq-{iid} origin/main` and work only there (`git worktree add` and `cd` in Bash, never the EnterWorktree tool: it prompts for a tree outside .claude/worktrees).',
+    'none': 'this task is expected to end in an answer, not a commit: work from the main checkout. If it turns out to need file changes, make the worktree `.worktrees/taskq-{iid}` as a code task would, work there, push like a code task and name the commit in the result text.',
 }
 RULES = ''  # project rules for workers, from [brief] rules: lines of step 6 of the brief
-RETIRE = None  # printed after `close` of a code task: how to remove its worktree
+RETIRE = TREE_RETIRE = 'git worktree remove .worktrees/taskq-{iid}'  # run after `close` of a code task: removes its worktree
 REPO = 'https://github.com/alexkirs/taskq'  # where every install takes its updates from
 # [update] of taskq.toml: tick checks REPO at most `every`. `ref`: `main` (a commit whose CI passed) or `stable` (the
 # tag the owner moves after review, signed by a key in allowed_signers). `auto` None: on when the project's
@@ -116,7 +119,7 @@ def main_checkout(start):
 def configure(path=None):
     """Load the project's taskq.toml: `path`, else the nearest one from the current directory up. Read only: a key it
     lacks takes its default in memory (a write would dirty the editable clone, and update stops on a dirty clone)."""
-    global RULES, HOST, HOSTS, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED
+    global RULES, HOST, HOSTS, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, WORKSPACE, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED
     import tomllib
     here = Path.cwd()
     path = Path(path) if path else next((folder / 'taskq.toml' for folder in (here, *here.parents)
@@ -139,8 +142,10 @@ def configure(path=None):
     AREAS = tuple(config.get('areas', {}).get('names', ()))
     HOSTS = dict(config.get('hosts', {}))
     CODEX_PROJECT, CODEX_SECTION = codex.get('project'), codex.get('section')
-    WORKSPACE.update({key: workspace[key] for key in WORKSPACE if key in workspace})
-    RETIRE, HELPERS = workspace.get('retire'), workspace.get('cleanup_helpers')
+    WORKSPACE = {key: workspace.get(key, text) for key, text in TREE_WORKSPACE.items()}
+    # A project's own `new` without `retire` makes its trees elsewhere: the default retire would miss them.
+    RETIRE = workspace.get('retire', None if 'new' in workspace else TREE_RETIRE)
+    HELPERS = workspace.get('cleanup_helpers')
     UPDATE.update(config.get('update', {}))
     seconds(UPDATE['every'])
     if UPDATE['ref'] not in ('main', 'stable'):
@@ -1078,7 +1083,7 @@ def doctor(args):
         gap(f'origin is {origin[0]}/{origin[1]}, taskq.toml names {HOST or ""}{"/" * bool(HOST)}{PROJECT_PATH}',
             'run taskq from that project\'s checkout, or fix [github] repo / [gitlab] project and host in taskq.toml')
     if config:
-        for what, fix in personal_gaps():
+        for what, fix in personal_gaps() + tree_gaps():
             gap(what, fix)
     if config or origin:
         cli = 'gh' if github else 'glab'
@@ -1120,14 +1125,27 @@ def personal_gaps():
 
 
 def ignore_local():
-    """Exactly one `/taskq.local.toml` line in the main checkout's .gitignore (`init`, `profile init`)."""
-    path, line = LOCAL.with_name('.gitignore'), '/' + LOCAL.name
-    text = path.read_text() if path.exists() else ''
-    if line not in text.splitlines():
-        path.write_text(text + ('\n' if text and not text.endswith('\n') else '') + line + '\n')
-        print(f'added {line} to {path}')
+    """Exactly one line each for `/taskq.local.toml` and the task trees `/.worktrees/` in the main checkout's .gitignore
+    (`init`, `profile init`); an unanchored line already there counts."""
+    path = LOCAL.with_name('.gitignore')
+    for line in ('/' + LOCAL.name, f'/{TREES}/'):
+        text = path.read_text() if path.exists() else ''
+        if not {line, line[1:]} & set(text.splitlines()):
+            path.write_text(text + ('\n' if text and not text.endswith('\n') else '') + line + '\n')
+            print(f'added {line} to {path}')
     if git('ls-files', '--error-unmatch', '--', LOCAL.name, cwd=LOCAL.parent) is not None:
         print(f'{LOCAL} is tracked by git: run `cd {LOCAL.parent} && git rm --cached -- {LOCAL.name}` (keeps the file), then commit')
+
+
+def tree_gaps():
+    """This project's task trees (`taskq-N`) outside `.worktrees/`, each with the command that moves it. Reads only:
+    a worker may still run in an old tree, so the person moves it."""
+    listed = git('worktree', 'list', '--porcelain', cwd=ROOT) or ''
+    trees = [Path(line[len('worktree '):]) for line in listed.splitlines() if line.startswith('worktree ')]
+    return [(f'task tree {tree} is outside {ROOT / TREES}',
+             f'cd {ROOT} && mkdir -p {TREES} && git worktree move {shlex.quote(str(tree))} {TREES}/{tree.name}  '
+             '(when no worker runs in it)')
+            for tree in trees if re.fullmatch(r'taskq-\d+', tree.name) and tree.parent.resolve() != (ROOT / TREES).resolve()]
 
 
 def profile_init(args):
@@ -1325,7 +1343,7 @@ def migrate(args):
     priority; the board with one list
     per state in STATES order; state labels taskq no longer has leave the board, and leave GitLab once no
     issue carries them; every open task gets its `relates_to` links. Claims, results and history stay. The personal
-    taskq.local.toml gets its .gitignore line."""
+    taskq.local.toml and the task trees `.worktrees/` get their .gitignore lines."""
     ignore_local()
     have = {label['name']: label for label in pages('labels')}
     for name in queue_labels():

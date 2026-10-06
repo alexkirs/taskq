@@ -149,7 +149,7 @@ that scope needs its own agreement.
 Commands per mode: mode A runs the read-only `cd <main checkout> && taskq doctor` and prints its
 gaps as the numbered steps; mode B runs `cd <main checkout> && taskq doctor --fix` (add `--codex` when
 Codex workers were requested). `--fix` writes a minimal `taskq.toml` from `origin` when none exists,
-runs init for missing labels/board (init adds `/taskq.local.toml` to `.gitignore` once), reuses
+runs init for missing labels/board (init adds `/taskq.local.toml` and `/.worktrees/` to `.gitignore` once), reuses
 `codex_project` for the Codex app project, and prints `taskq profile init` as a `you:` line while the
 personal file is missing (it never guesses preferences). It only reads folder trust (`~/.claude.json`) and the worker
 permissions file: each missing one, the CLI install and login, the GitHub `project` scope and write

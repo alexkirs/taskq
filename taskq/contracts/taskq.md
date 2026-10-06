@@ -52,8 +52,8 @@ It holds no secrets: the token belongs to `glab`.
 | `[gitlab] host` | GitLab host for `glab` (commands also work outside the project checkout) | `glab` picks it from the current directory's git remote |
 | `[areas] names` | Project work areas; `init` creates `area-*` labels | empty |
 | `[codex] project`, `section` | Override of the Codex app project for `spawn --runtime codex`, and its sidebar section; kept for compatibility below the personal `[codex]` until migrated | project: the app's project whose root is the main checkout (`project/list`), created by `project/create` when none is; no section |
-| `[workspace] new`, `continue`, `none` | Brief text about the workspace; `{iid}` is the task number | `git worktree add` next to the checkout |
-| `[workspace] retire` | What `close` runs from the main checkout to remove the task's tree (then `git branch -d taskq-<N>`) | nothing: the tree stays |
+| `[workspace] new`, `continue`, `none` | Brief text about the workspace; `{iid}` is the task number | `git worktree add -b taskq-<N> .worktrees/taskq-<N> origin/main` inside the main checkout (§ Task flow, «Where task trees live») |
+| `[workspace] retire` | What `close` runs from the main checkout to remove the task's tree (then `git branch -d taskq-<N>`) | `git worktree remove .worktrees/taskq-<N>`; nothing when the project sets its own `new` without `retire` |
 | `[workspace] cleanup_helpers` | Project folder with `workspace_gc.py`, `host_gentle.py`, `host_tools.py` for `cleanup` | none: `cleanup` refuses |
 | `[update] auto`, `every`, `ref` | `tick` updates taskq from REPO (github.com/alexkirs/taskq) at most `every` (`30m`, `24h`, `7d`); `taskq update` does it by hand. `ref = "main"`: the newest `main` commit whose CI check-runs passed; `ref = "stable"`: the `stable` tag, only when CI passed and the tag is signed by a key in the package's `allowed_signers` (README: Develop taskq). A refused update prints one line and nothing new runs; a clone whose new code does not start (`python3 -m taskq --version`) goes back. Missing keys take their defaults in memory; `taskq.toml` is never written | `auto`: `true` when the project's repository has REPO's owner, else `false`; `24h`; `main` |
 | `[profile]`, `[profile.limits]` | Team defaults for the tick/worker profile, below the personal file (§ Shared and personal configuration); never one person's choices | none |
@@ -152,8 +152,8 @@ through onboarding first. Invalid personal configuration or a tracked personal f
 a gap with a concrete repair instruction. Missing file does not block ordinary tick/worker:
 use existing defaults and show the gap; doctor still exits nonzero until it is resolved.
 
-`init` ensures exactly one `/taskq.local.toml` line in the main checkout's `.gitignore`,
-preserving existing content. Personal configuration is never committed. If already tracked,
+`init` ensures exactly one `/taskq.local.toml` line and one `/.worktrees/` line (an unanchored line
+already there counts) in the main checkout's `.gitignore`, preserving existing content. Personal configuration is never committed. If already tracked,
 report it and propose `git rm --cached -- taskq.local.toml` while retaining the local file;
 do not silently delete it. On another machine, copy person preferences by hand or answer
 the onboarding card again; reconfirm capacity, discover the local Codex project, and do not
@@ -263,6 +263,12 @@ ready/waiting/later → ask (manager) → answer → ready
 - A worker on a `code` or `docs` task creates its own worktree (the brief prints the command, from the
   project's `[workspace]`), commits, rebases on `origin/main` and pushes to `main` under the owner's
   standing permission. `close` checks that the result SHA is in `origin/main`.
+- Where task trees live: `.worktrees/taskq-<N>` inside the main checkout (gitignored by `init`), so trees of
+  different projects never share one parent folder and their `taskq-<N>` names never collide. Trees made before
+  2026-10-07 sit next to the checkout (`../taskq-<N>`): `doctor` names each such tree of this project with
+  `cd <main checkout> && mkdir -p .worktrees && git worktree move <tree> .worktrees/taskq-<N>` and never moves
+  it (a worker may still run there). `cleanup` finds trees in both places through `git worktree list`; an open
+  task keeps its `taskq-<N>` tree and branch wherever the tree is.
 - A task on taskq itself works only in a worktree of the editable clone (`.worktrees/taskq-<N>`, the
   command is in the brief from taskq's `[workspace]`), never in the clone's working tree: every session on the
   machine runs that tree, so it stays clean `main`. `tick` warns in one line when it is not.
@@ -397,6 +403,7 @@ local branches, trees or sessions. `cleanup --apply` executes only the "Remove" 
 proven finished, rechecking before each action.
 Running and current sessions are kept, sessions are only archived, and remote branches
 need a separate answer from the owner. Retire checks stay in `workspace_gc.py`.
+Task trees are found in `.worktrees/taskq-<N>` and in `../taskq-<N>` alike (§ Task flow, «Where task trees live»).
 Procedure for owner questions and Claude archiving:
 [taskq-manager](taskq-manager.md) § Cleaning up finished work.
 

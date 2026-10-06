@@ -138,7 +138,9 @@ Tell the manager your profile, confirm its card, then **“Arm the tick.”**
 Expected: the coordinator runs `taskq tick` (no flags) every 5 minutes.
 
 Your profile lives in `taskq.local.toml` of the main checkout: personal, never committed
-(`taskq init` adds it to `.gitignore`). `taskq profile init` writes it once:
+(`taskq init` adds it to `.gitignore`). Workers make their trees in `.worktrees/taskq-<N>` of the same
+checkout (also gitignored); `taskq doctor` names older `../taskq-<N>` trees with the command that moves them.
+`taskq profile init` writes the profile once:
 
 | Profile | `taskq profile init` arguments |
 |---|---|

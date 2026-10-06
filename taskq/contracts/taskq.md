@@ -47,6 +47,7 @@ It holds no secrets: the token belongs to `glab`.
 | `[gitlab] project` | GitLab project path (`group/project`) | one of `[gitlab] project`, `[github] repo` |
 | `[github] repo` | GitHub repository (`owner/repo`); `[github] host` for GitHub Enterprise | one of the two |
 | `[gitlab] board` | Board name | `taskq` |
+| `[github] board` | Title of the Projects v2 board linked to the repository | the repository name (`owner/repo` → `repo`) |
 | `[gitlab] host` | GitLab host for `glab` (commands also work outside the project checkout) | `glab` picks it from the current directory's git remote |
 | `[areas] names` | Project work areas; `init` creates `area-*` labels | empty |
 | `[codex] project`, `section` | Override of the Codex app project for `spawn --runtime codex`, and its sidebar section | project: the app's project whose root is the main checkout (`project/list`), created by `project/create` when none is; no section |
@@ -80,7 +81,7 @@ moves the card back by `deps` and prints `Moved #N …`. `tick` lists everything
 mismatch": `doing` without a worker, `review` without a result, an issue with a block but without exactly
 one state label (including one moved to Open).
 
-**Board on GitHub (2026-10-06):** a Projects v2 project named `[github] board`, a view taskq keeps in step with
+**Board on GitHub (2026-10-06):** the Projects v2 project linked to the repository and titled `[github] board` (default: the repository name), a view taskq keeps in step with
 the labels (§ GitHub). A card move does not change the label: `tick` executes `ready`/`waiting`→`later`
 (`later`), `later`→`ready`/`waiting` (`answer`) and `review`→`ready` (`reject`), each with the note «moved on the
 board»; `ready`↔`waiting` goes back silently; any other move goes back to the label's column and is listed under
@@ -211,8 +212,11 @@ just-created issue by up to half a minute (measured live 2026-10-06: 25–35 s, 
 through GraphQL (`repository.issues`, 100 per page, with `states`, `labels`, `filterBy`); single issues, comments,
 labels and refs stay REST.
 
-The board: `init` creates the Projects v2 project `[github] board` (default `taskq`) once — owner the repository
-owner, user or organization (`createProjectV2` with `ownerId` and `repositoryId`, which links it) — gives its
+The board: the Projects v2 project titled `[github] board` (default: the repository name) among the projects
+linked to the repository (`repository { projectsV2 }`). A project belongs to the owner, not the repository: an
+owner-level project of that title not linked to this repository is another queue's board and is ignored, so two
+repositories of one owner never share one. `init` creates it once when the repository has none — owner the
+repository owner, user or organization (`createProjectV2` with `ownerId` and `repositoryId`, which links it) — gives its
 single-select field Status the options STATES in order (`updateProjectV2Field` with new options: the project's
 Todo/In Progress/Done go), deletes the project's built-in workflows (`deleteProjectV2Workflow`; the API cannot
 disable them: «Auto-close issue» closes an issue whose card reaches the old Done option, others set Status on

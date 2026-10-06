@@ -44,20 +44,12 @@ gh auth login --hostname <host>
 gh auth refresh -h <host> -s project
 ```
 
-If config is missing, write `taskq.toml` first (`<repo>` is the repository name):
-
-```toml
-[github]
-repo = "<owner/repo>"
-host = "<host>"
-board = "<repo>-taskq"
-```
-
 ```bash
 taskq init --github <owner/repo> --host <host>
 ```
 
-Keep existing config. Use a dedicated board: init manages Status and disables built-in workflows.
+Keep existing config. The board is the Projects v2 project linked to the repository and named after it
+(`[github] board` overrides the name); init creates it once, manages Status and disables its built-in workflows.
 GitHub needs a pushed commit before claiming tasks. For an empty repository:
 
 ```bash

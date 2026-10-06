@@ -1,6 +1,7 @@
 # taskq: this project's own task queue on its GitHub issues (keys: `taskq contract`, README).
 [github]
 repo = "alexkirs/taskq"
+board = "taskq"  # the board from before the default became the repository name: https://github.com/users/alexkirs/projects/1
 
 # [codex]: none. The Codex app's project is found by the main checkout path (project/list), created when missing.
 

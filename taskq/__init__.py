@@ -123,12 +123,13 @@ def configure(path=None, write=True):
         fail(f'{path}: write exactly one of [gitlab] project = "group/project" or [github] repo = "owner/repo"')
     PROJECT_PATH, HOST = tracker.get('project') or tracker.get('repo'), tracker.get('host')
     if 'github' in config:
-        STORE, BOARDS = Github(PROJECT_PATH, HOST), False
+        BOARD = tracker.get('board') or PROJECT_PATH.split('/')[-1]  # boards belong to the owner: one per repository
+        STORE, BOARDS = Github(PROJECT_PATH, HOST, BOARD), False
     else:
+        BOARD = tracker.get('board', 'taskq')
         STORE, BOARDS = gitlab, True
         # `projects/:id` makes glab look the project up first: +1 s per request (measured 2026-10-06).
         PROJECT = 'projects/' + quote(PROJECT_PATH, safe='')
-    BOARD = tracker.get('board', BOARD)
     AREAS = tuple(config.get('areas', {}).get('names', ()))
     CODEX_PROJECT, CODEX_SECTION = codex.get('project'), codex.get('section')
     WORKSPACE.update({key: workspace[key] for key in WORKSPACE if key in workspace})
@@ -222,8 +223,8 @@ class Github:
     owner's rule 2026-10-06), it is no branch so no CI runs, and anyone may remove it — the claim names the
     holder. Issue lists come from GraphQL: the REST list lags a new issue by up to half a minute, GraphQL shows
     it at once (measured live 2026-10-06). Lists are read whole on page 1, later pages are empty. Dependencies
-    have no links here (`deps` in the block is the source of truth). The board is a Projects v2 project named
-    BOARD with Status options STATES: the store adds every new issue and sets Status in the same PUT that moves
+    have no links here (`deps` in the block is the source of truth). The board is the Projects v2 project linked to
+    the repository and titled [github] board (default: the repository name), with Status options STATES: the store adds every new issue and sets Status in the same PUT that moves
     the q-* label, archives the item on close, and answers `board` routes (`GET board`, `POST board` to create,
     `GET board/items`, `PUT board/items/N`). Without the token scope `project` there is no board, silently."""
     LIST = ('query($owner: String!, $name: String!, $states: [IssueState!], $labels: [String!], $filter: IssueFilters, $after: String) {'
@@ -231,9 +232,10 @@ class Github:
             ' orderBy: {field: CREATED_AT, direction: DESC}) { pageInfo { hasNextPage endCursor } nodes { number id title body state url'
             ' createdAt updatedAt labels(first: 100) { nodes { name } } assignees(first: 10) { nodes { databaseId login } }'
             ' milestone { number } comments { totalCount } } } } }')
-    PROJECT = ('id number title url repositories(first: 20) { nodes { nameWithOwner } } field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } }')
-    FIND = ('query($owner: String!, $name: String!, $board: String!) { repository(owner: $owner, name: $name) { id owner { id'
-            ' ... on ProjectV2Owner { projectsV2(first: 20, query: $board) { nodes { %s } } } } } }' % PROJECT)
+    PROJECT = ('id number title url field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } }')
+    # The repository's linked projects, not the owner's: an owner-level project of the same title is another queue's.
+    FIND = ('query($owner: String!, $name: String!, $board: String!) { repository(owner: $owner, name: $name) { id owner { id }'
+            ' projectsV2(first: 20, query: $board) { nodes { %s } } } }' % PROJECT)
     # Cards are read from the open issues' side: `ProjectV2.items` of a new project stayed empty for minutes while
     # `Issue.projectItems` showed the cards at once (measured live 2026-10-06).
     ITEMS = ('query($owner: String!, $name: String!, $after: String) { repository(owner: $owner, name: $name) {'
@@ -241,8 +243,9 @@ class Github:
              ' projectItems(first: 10, includeArchived: false) { nodes { id project { id }'
              ' fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } } } } }')
 
-    def __init__(self, repo, host=None):
-        self.repo, self.host, self.labels, self.nodes = repo, host, {}, {}  # by issue number: label names last read, GraphQL id
+    def __init__(self, repo, host=None, board=None):
+        self.repo, self.host, self.labels, self.nodes = repo, host, {}, {}
+        self.title = board or repo.split('/')[-1]  # the board's title: [github] board, else the repository name  # by issue number: label names last read, GraphQL id
         self.board, self.items = None, {}  # the project once looked up in this process (False: none); item ids by issue number
 
     def run(self, method, path, body=None):
@@ -294,22 +297,22 @@ class Github:
         return self.run('POST', 'graphql', {'query': query, 'variables': variables})['data']
 
     def project(self, create=False):
-        """The board: {id, url, field, options by name, number, linked}; None without one, False without the scope `project`.
+        """The board: the project titled `self.title` linked to the repository, {id, url, field, options by name, number}; None without one, False without the scope `project`.
         `create` makes it once, linked to the repository, with Status options exactly STATES."""
         if self.board is None or (create and not self.board):
             owner, name = self.repo.split('/')
             try:
-                repository = self.graphql(self.FIND, owner=owner, name=name, board=BOARD)['repository']
+                repository = self.graphql(self.FIND, owner=owner, name=name, board=self.title)['repository']
             except SystemExit as error:
                 if 'scope' not in str(error).lower():
                     raise
                 self.board = False
                 return False
-            found = next((item for item in repository['owner'].get('projectsV2', {}).get('nodes', []) if item['title'] == BOARD), None)
+            found = next((item for item in repository['projectsV2']['nodes'] if item['title'] == self.title), None)
             if not found and create:
                 found = self.graphql('mutation($owner: ID!, $title: String!, $repo: ID!) { createProjectV2(input: {ownerId: $owner,'
                                      ' title: $title, repositoryId: $repo}) { projectV2 { %s } } }' % self.PROJECT,
-                                     owner=repository['owner']['id'], title=BOARD, repo=repository['id'])['createProjectV2']['projectV2']
+                                     owner=repository['owner']['id'], title=self.title, repo=repository['id'])['createProjectV2']['projectV2']
             if found and create:
                 # The project's own workflows move cards and close issues (Status Done closes the issue, a closed or added
                 # item gets a Status): taskq alone writes Status. The API can only delete them (checked live 2026-10-06).
@@ -333,8 +336,7 @@ class Github:
                                                   project=found['id'], options=options)['createProjectV2Field']['projectV2Field']
             self.board = found and {'id': found['id'], 'url': found['url'], 'field': (found['field'] or {}).get('id'),
                                     'options': {option['name']: option['id'] for option in (found['field'] or {}).get('options', [])},
-                                    'number': found['number'], 'linked': self.repo.lower() in
-                                    [item['nameWithOwner'].lower() for item in found['repositories']['nodes']]}
+                                    'number': found['number']}
         return self.board  # False: the token lacks the scope `project`
 
     def cards(self):
@@ -1131,11 +1133,8 @@ def board_gaps(github, host):
         return [('the gh token lacks the scope `project`: no Projects v2 board', f'gh auth refresh -h {host or "github.com"} -s project  (the person confirms in the browser)')]
     if not board:
         return [(f'no Projects v2 board {BOARD}', 'taskq init')]
-    owner, name = PROJECT_PATH.split('/')
     return ([(f'board {BOARD} Status options are {list(board["options"])}, not {list(STATES)}', 'taskq init')]
-            * (list(board['options']) != list(STATES))
-            + [(f'board {BOARD} is not linked to {PROJECT_PATH}', f'gh project link {board["number"]} --owner {owner} --repo {name}')]
-            * (not board['linked']))
+            * (list(board['options']) != list(STATES)))
 
 
 def report_gaps(gaps):

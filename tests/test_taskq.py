@@ -976,21 +976,22 @@ class GithubRest:
         if query.startswith('mutation'):
             self.mutations.append(query.split('{', 1)[1].split('(', 1)[0].strip())
         shape = lambda board: {'id': board['id'], 'number': int(board['id'][7:]), 'title': board['title'], 'url': board['url'],
-                               'repositories': {'nodes': [{'nameWithOwner': name} for name in board['linked']]},
-                               'field': {'id': 'status', 'options': [dict(option) for option in board['options']]}}
-        if 'createProjectV2(' in query:
+                               'field': {'id': board['id'] + ':status', 'options': [dict(option) for option in board['options']]}}
+        if 'createProjectV2(' in query:  # the repository id is its owner/name here; `repositoryId` links it
             board = {'id': f'project{len(self.projects) + 1}', 'title': found['title'], 'url': f'project-url/{len(self.projects) + 1}',
-                     'repo': found['repo'], 'linked': ['owner/repo'], 'items': {}, 'workflows': ['Auto-close issue', 'Item added to project', 'Item closed'], 'options': [{'id': f'o{index}', 'name': name} for index, name in enumerate(('Todo', 'In Progress', 'Done'))]}
+                     'repo': found['repo'], 'linked': [found['repo']], 'items': {}, 'workflows': ['Auto-close issue', 'Item added to project', 'Item closed'], 'options': [{'id': f'o{index}', 'name': name} for index, name in enumerate(('Todo', 'In Progress', 'Done'))]}
             self.projects.append(board)
             return {'createProjectV2': {'projectV2': shape(board)}}
-        if 'projectsV2(' in query:
-            nodes = [shape(board) for board in self.projects if found['board'] in board['title']]
-            return {'repository': {'id': 'repo', 'owner': {'id': 'owner', 'projectsV2': {'nodes': nodes}}}}
-        board = self.projects[0]  # one board in these tests
+        if 'projectsV2(' in query:  # the repository's linked projects, matched by title like GitHub's `query`
+            repo = f'{found["owner"]}/{found["name"]}'
+            nodes = [shape(board) for board in self.projects if found['board'] in board['title'] and repo in board['linked']]
+            return {'repository': {'id': repo, 'owner': {'id': found['owner']}, 'projectsV2': {'nodes': nodes}}}
+        key = str(found.get('project') or found.get('field') or found.get('id') or '').split(':')[0]
+        board = next((board for board in self.projects if board['id'] == key), self.projects[0])
         if 'workflows(' in query:
-            return {'node': {'workflows': {'nodes': [{'id': name} for name in board['workflows']]}}}
+            return {'node': {'workflows': {'nodes': [{'id': f'{board["id"]}:{name}'} for name in board['workflows']]}}}
         if 'deleteProjectV2Workflow(' in query:
-            board['workflows'].remove(found['id'])
+            board['workflows'].remove(found['id'].split(':', 1)[1])
             return {}
         if 'updateProjectV2Field(' in query:
             board['options'] = [{'id': option.get('id') or f'o{len(board["options"]) + index}', 'name': option['name']}
@@ -1232,16 +1233,44 @@ class GithubCycle(unittest.TestCase):
             q.main(['init', '--github', 'owner/repo'])
             self.assertEqual(Path('taskq.toml').read_text().splitlines()[1:], ['[github]', 'repo = "owner/repo"'])
         self.assertIn('board project-url/1:', out.getvalue())
+        self.addCleanup(q.configure, Path(__file__).resolve().parent / 'taskq.toml')
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'taskq.toml'
+            for extra, board in (('', 'repo'), ('board = "taskq"\n', 'taskq')):  # no [github] board: the repository name
+                config.write_text('[github]\nrepo = "owner/repo"\n' + extra + '[update]\nauto = false\nevery = "24h"\n')
+                with contextlib.redirect_stdout(io.StringIO()):
+                    q.configure(config)
+                self.assertEqual((q.BOARD, q.STORE.title), (board, board))
 
     def test_init_makes_the_board_once_with_one_column_per_state(self):
         self.do(CLAUDE, 'init')
         calls, mutations = len(self.github.calls), len(self.github.mutations)
         self.assertIn('board project-url/1', self.do(CLAUDE, 'init'))
         self.assertEqual([(board['title'], board['repo'], [option['name'] for option in board['options']]) for board in self.github.projects],
-                         [('taskq', 'repo', list(q.STATES))])
+                         [('repo', 'owner/repo', list(q.STATES))])
         self.assertEqual(self.github.projects[0]['workflows'], [])  # Status Done would close the issue: taskq alone moves cards
         writes = [path for method, path in self.github.calls[calls:] if method != 'GET' and path != 'graphql']
         self.assertEqual((writes, self.github.mutations[mutations:]), ([], []))
+
+    def test_each_repository_of_one_owner_gets_its_own_linked_board(self):
+        boards = {}
+        for repo, board in (('owner/one', None), ('owner/two', None), ('owner/three', 'shared')):
+            store = q.Github(repo, board=board)
+            store.run = self.github
+            boards[repo] = store('POST', 'board')['url']
+        self.github.projects.append({'id': 'project9', 'title': 'four', 'url': 'project-url/9', 'repo': 'owner/x', 'linked': ['owner/x'],
+                                     'items': {}, 'workflows': [], 'options': []})  # an owner-level project not linked to owner/four
+        store = q.Github('owner/four')
+        store.run = self.github
+        boards['owner/four'] = store('POST', 'board')['url']
+        self.assertEqual([(board['title'], board['linked']) for board in self.github.projects],
+                         [('one', ['owner/one']), ('two', ['owner/two']), ('shared', ['owner/three']),
+                          ('four', ['owner/x']), ('four', ['owner/four'])])
+        self.assertEqual(len(set(boards.values())), 4)
+        mutations = len(self.github.mutations)
+        again = q.Github('owner/two')
+        again.run = self.github
+        self.assertEqual((again('POST', 'board')['url'], self.github.mutations[mutations:]), (boards['owner/two'], []))
 
     def test_without_the_project_scope_init_names_the_command_and_makes_labels(self):
         self.github.scope = False
@@ -1447,10 +1476,9 @@ class Doctor(unittest.TestCase):
             q.main(['init'])
         store.board = None
         self.assertEqual(self.doctor()[0], 0)
-        github.projects[0]['linked'], github.projects[0]['options'] = [], github.projects[0]['options'][:2]
+        github.projects[0]['options'] = github.projects[0]['options'][:2]
         store.board, mutations = None, len(github.mutations)
         code, out = self.doctor()
-        self.assertIn('gh project link 1 --owner owner --repo repo', out)
         self.assertIn("Status options are ['ready', 'waiting']", out)
         self.assertEqual(github.mutations[mutations:], [])
 

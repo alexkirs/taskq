@@ -136,7 +136,7 @@ Code/docs results require `--sha` of a commit pushed to `main`.
 
 Tell the manager your profile, confirm its card, then **“Arm the tick.”**
 Expected: the coordinator runs `taskq tick` (no flags) every 5 minutes.
-On macOS the coordinator runs `taskq tick --install-timer` instead: launchd runs `taskq tick --act` every 5 minutes, which starts, nudges and retires workers itself and wakes the coordinator only when something needs judgement (`--uninstall-timer` removes it).
+Optional on macOS, for a tick without an open app session: `taskq tick --install-timer` makes launchd run `taskq tick --act` every 5 minutes, which starts, nudges and retires workers itself and wakes the coordinator only when something needs judgement (`--uninstall-timer` removes it).
 
 Your profile lives in `taskq.local.toml` of the main checkout: personal, never committed
 (`taskq init` adds it to `.gitignore`). Workers make their trees in `.worktrees/taskq-<N>` of the same

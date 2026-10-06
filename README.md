@@ -1,13 +1,13 @@
 # taskq
 
-A task queue for AI coding sessions that lives in GitLab issues. Claude Code and Codex sessions use the
+A task queue for AI coding sessions that lives in GitLab or GitHub issues. Claude Code and Codex sessions use the
 same command, `taskq`, from any machine: a manager session files tasks, a coordinator session runs a
 5-minute tick that starts one worker session per task, and workers claim, report and hand in their work.
 Nothing is stored locally: the issue labels are the task state, one JSON block in the issue description
 holds the rest, and the issue notes are the history.
 
-Requirements: Python 3.11+ (standard library only) and [`glab`](https://gitlab.com/gitlab-org/cli) logged in
-to the GitLab that hosts your project (gitlab.com or self-managed).
+Requirements: Python 3.11+ (standard library only) and the host's CLI logged in: [`glab`](https://gitlab.com/gitlab-org/cli)
+for GitLab (gitlab.com or self-managed), [`gh`](https://cli.github.com) for GitHub.
 
 ## Install
 
@@ -38,8 +38,24 @@ git add taskq.toml && git commit -m "taskq: queue config"
 
 `taskq init` writes a minimal `taskq.toml` when there is none, then creates the labels (`q-*` states,
 `run-*` runtimes, types, `priority-*`, `problem`, configured `area-*`) and a board `taskq` with one column per state. Running
-it again changes nothing. Each person uses their own GitLab account. Automatic selection never takes
+it again changes nothing. Each person uses their own account. Automatic selection never takes
 another person's assigned task; unassigned tasks form the shared pool.
+
+On GitHub the queue is the repository's issues (`taskq init --github <owner>/<repo>`, `gh auth login` first):
+
+```toml
+[github]
+repo = "owner/repo"           # instead of [gitlab]
+host = "github.example.com"   # optional: GitHub Enterprise
+```
+
+- There is no board: a column is the issues list filtered by its `q-*` label, e.g.
+  `https://github.com/<owner>/<repo>/issues?q=is:open+label:q-ready`. `init` prints so.
+- The task lock is the ref `refs/taskq/lock/<N>` (not a branch: no CI runs, nothing in the UI). Creating
+  it twice is a 422 for any user, so the lock is atomic between people with their own accounts.
+- `--filter` is GitHub's list-issues query: `labels=area-maps`, `assignee=<login>`, `milestone=<number>`.
+- Dependencies are the `deps` field of the task block only; GitHub has no issue links.
+- `selftest` deletes its issues only when the token may (`deleteIssue` needs admin); otherwise it closes them.
 
 ## taskq.toml
 

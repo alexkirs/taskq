@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """taskq: the project task queue. Codex and Claude sessions use it the same way, from any machine.
 
-A task is a GitLab issue: labels are its state, runtime and type, one JSON block in the description
+A task is a GitLab or GitHub issue: labels are its state, runtime and type, one JSON block in the description
 is the rest of its data, the notes are its history. Nothing local stores task state.
 Everything specific to a project is its `taskq.toml`. Contracts: `taskq contract`.
 """
 import argparse
 import contextlib
-from datetime import datetime
+import base64
+from datetime import datetime, timezone
 import io
 import json
 import os
@@ -18,12 +19,14 @@ import socket
 import subprocess
 import sys
 import time
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlencode
 
 # Set from the project's taskq.toml by `configure`.
 PROJECT = PROJECT_PATH = ROOT = TICK_BEAT = HELPERS = None  # GitLab API prefix, `relates_to` target, main checkout
-HOST = None  # GitLab host for glab; None: glab's own choice (the git remote of the current directory)
+HOST = None  # GitLab or GitHub host for glab/gh; None: the CLI's own choice (the git remote of the current directory)
+STORE = None  # `gitlab` or a `Github`: what `api` speaks to (set by `configure`)
 BOARD = 'taskq'
+BOARDS = True  # GitLab has a board; GitHub has none (columns are the q-* label filters)
 AREAS = ()
 CODEX_PROJECT = CODEX_SECTION = None  # the Codex app's project and sidebar section for worker threads
 WORKSPACE = {
@@ -106,7 +109,7 @@ def main_checkout(start):
 
 def configure(path=None):
     """Load the project's taskq.toml: `path`, else the nearest one from the current directory up."""
-    global RULES, HOST, PROJECT, PROJECT_PATH, BOARD, AREAS, CODEX_PROJECT, CODEX_SECTION, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER
+    global RULES, HOST, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER
     import tomllib
     here = Path.cwd()
     path = Path(path) if path else next((folder / 'taskq.toml' for folder in (here, *here.parents)
@@ -114,11 +117,17 @@ def configure(path=None):
     if not path:
         fail('no taskq.toml in this directory or above it (README: «A new project»)')
     config = tomllib.loads(complete(path))
-    gitlab, codex, workspace = config['gitlab'], config.get('codex', {}), config.get('workspace', {})
-    PROJECT_PATH, HOST = gitlab['project'], gitlab.get('host')
-    # `projects/:id` makes glab look the project up first: +1 s per request (measured 2026-10-06).
-    PROJECT = 'projects/' + quote(PROJECT_PATH, safe='')
-    BOARD = gitlab.get('board', BOARD)
+    tracker, codex, workspace = config.get('gitlab') or config.get('github'), config.get('codex', {}), config.get('workspace', {})
+    if ('gitlab' in config) == ('github' in config):
+        fail(f'{path}: write exactly one of [gitlab] project = "group/project" or [github] repo = "owner/repo"')
+    PROJECT_PATH, HOST = tracker.get('project') or tracker.get('repo'), tracker.get('host')
+    if 'github' in config:
+        STORE, BOARDS = Github(PROJECT_PATH, HOST), False
+    else:
+        STORE, BOARDS = gitlab, True
+        # `projects/:id` makes glab look the project up first: +1 s per request (measured 2026-10-06).
+        PROJECT = 'projects/' + quote(PROJECT_PATH, safe='')
+    BOARD = tracker.get('board', BOARD)
     AREAS = tuple(config.get('areas', {}).get('names', ()))
     CODEX_PROJECT, CODEX_SECTION = codex.get('project'), codex.get('section')
     WORKSPACE.update({key: workspace[key] for key in WORKSPACE if key in workspace})
@@ -176,6 +185,13 @@ def who():
 
 
 def api(method, path, body=None):
+    """The store protocol: GitLab's REST shape for what taskq uses — issues (`iid`, `description`, label names,
+    `state` opened/closed, `assignees` with `id`), notes, labels, milestones, award emoji (the lock), label events,
+    links, boards. `gitlab` is that shape itself; `Github` speaks it on GitHub; the tests' fake speaks it in memory."""
+    return STORE(method, path, body)
+
+
+def gitlab(method, path, body=None):
     command = ['glab', 'api', '-X', method, path[1:] if path.startswith('/') else f'{PROJECT}/{path}'] + (['--hostname', HOST] if HOST else [])
     if body is not None:
         command += ['--input', '-', '-H', 'Content-Type: application/json']
@@ -187,6 +203,146 @@ def api(method, path, body=None):
     if done.returncode:
         fail(f'GitLab {method} {path} failed: {done.stderr.strip() or done.stdout.strip()}')
     return json.loads(done.stdout) if done.stdout.strip() else None
+
+
+TAKEN = ('has already been taken', 'Reference already exists')  # the lock's conflict answer: GitLab 404, GitHub 422
+
+
+class Github:
+    """The store protocol on GitHub REST through `gh api`. An issue's `number` is `iid`, `body` is `description`,
+    `open` is `opened`, labels come back as names, assignees as `{id, username}`; a PUT with add/remove labels
+    sends the full set (the labels last read in this process, else one GET). The lock is the ref
+    `refs/taskq/lock/<N>` on a blob holding the time: a second POST is 422 for any user (atomic between users,
+    owner's rule 2026-10-06), it is no branch so no CI runs, and anyone may remove it — the claim names the
+    holder. Lists are read whole on page 1 (pull requests dropped), later pages are empty. Dependencies have
+    no links here (`deps` in the block is the source of truth); there is no board."""
+    def __init__(self, repo, host=None):
+        self.repo, self.host, self.labels = repo, host, {}  # labels: issue number -> names last read
+
+    def run(self, method, path, body=None):
+        own = path.startswith(('user', 'graphql'))
+        command = ['gh', 'api', '-X', method, path if own else f'repos/{self.repo}/{path}'] + (['--hostname', self.host] if self.host else [])
+        if body is not None:
+            command += ['--input', '-']
+        started = time.time()
+        done = subprocess.run(command, input=json.dumps(body) if body is not None else None,
+                              capture_output=True, text=True, timeout=60)
+        if os.environ.get('TASKQ_TRACE'):
+            print(f'taskq trace: {method} {path[:90]} {time.time() - started:.2f} s', file=sys.stderr)
+        if done.returncode:
+            fail(f'GitHub {method} {path} failed: {done.stderr.strip() or done.stdout.strip()}')
+        return json.loads(done.stdout) if done.stdout.strip() else None
+
+    def all(self, path):
+        found, page = [], 1
+        while True:
+            batch = self.run('GET', f'{path}{"&" if "?" in path else "?"}per_page=100&page={page}')
+            found += batch
+            if len(batch) < 100:
+                return found
+            page += 1
+
+    def issue(self, item):
+        self.labels[item['number']] = [label['name'] for label in item['labels']]
+        return {'iid': item['number'], 'title': item['title'], 'description': item.get('body') or '',
+                'labels': self.labels[item['number']], 'state': 'opened' if item['state'] == 'open' else 'closed',
+                'assignees': [{'id': each['id'], 'username': each['login']} for each in item.get('assignees', [])],
+                'milestone_id': (item.get('milestone') or {}).get('number'), 'web_url': item['html_url'],
+                'created_at': item['created_at'], 'updated_at': item['updated_at'], 'comments': item.get('comments', 0)}
+
+    @staticmethod
+    def comment(item):
+        return {'id': item['id'], 'body': item['body'], 'created_at': item['created_at'], 'system': False,
+                'author': {'id': item['user']['id'], 'username': item['user']['login']}}
+
+    def body(self, body, iid=None):
+        out = {key: body[key] for key in ('title',) if key in body}
+        if 'description' in body:
+            out['body'] = body['description']
+        if 'labels' in body:
+            out['labels'] = body['labels'].split(',')
+        if 'add_labels' in body or 'remove_labels' in body:
+            have = self.labels.get(iid) or self.issue(self.run('GET', f'issues/{iid}'))['labels']
+            drop = body.get('remove_labels', '').split(',')
+            out['labels'] = [name for name in have if name not in drop] + [name for name in body.get('add_labels', '').split(',') if name and name not in have]
+        if 'assignee_ids' in body:
+            out['assignees'] = [self.run('GET', f'user/{uid}')['login'] for uid in body['assignee_ids']]
+        if 'milestone_id' in body:
+            out['milestone'] = body['milestone_id']
+        if body.get('state_event') == 'close':
+            out['state'] = 'closed'
+        return out
+
+    def __call__(self, method, path, body=None):
+        query = {key: value[0] for key, value in parse_qs(path.partition('?')[2]).items()}
+        later = int(query.get('page', 1)) > 1
+        if path == '/user':
+            return {'id': self.run('GET', 'user')['id']}
+        if path.startswith('milestones'):
+            return [{'id': item['number'], 'title': item['title']} for item in self.all('milestones?state=open')]
+        if path.startswith('labels'):
+            if method == 'DELETE':
+                return self.run('DELETE', 'labels/' + quote(path.split('/', 1)[1], safe=''))
+            if method == 'POST':
+                return self.run('POST', 'labels', {'name': body['name'], 'color': body['color'].lstrip('#')})
+            return [] if later else self.all('labels')
+        if path.startswith('boards'):
+            fail('GitHub has no board: the q-* labels are the columns')
+        if method == 'POST' and path == 'issues':
+            return self.issue(self.run('POST', 'issues', self.body(body)))
+        if method == 'GET' and path.startswith('issues?'):
+            if 'my_reaction_emoji' in query:  # every locked issue: the lock refs name them
+                numbers = [int(item['ref'].rsplit('/', 1)[1]) for item in self.run('GET', 'git/matching-refs/taskq/lock/')]
+                found = [self.issue(self.run('GET', f'issues/{number}')) for number in numbers]
+                return [item for item in found if query.get('state', 'opened') in ('all', item['state'])]
+            if later:
+                return []
+            params = {'state': {'opened': 'open'}.get(query.get('state', 'opened'), query.get('state', 'open'))}
+            params.update({key: query[key] for key in ('labels', 'assignee', 'milestone', 'creator') if key in query})
+            if 'updated_after' in query:
+                params['since'] = query['updated_after']
+            return [self.issue(item) for item in self.all('issues?' + urlencode(params)) if 'pull_request' not in item]
+        iid = int(re.match(r'issues/(\d+)', path)[1])
+        rest = path[len(f'issues/{iid}'):].partition('?')[0]
+        if rest == '/award_emoji':
+            if method == 'POST':
+                now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+                blob = self.run('POST', 'git/blobs', {'content': json.dumps({'created_at': now})})
+                self.run('POST', 'git/refs', {'ref': f'refs/taskq/lock/{iid}', 'sha': blob['sha']})
+                return {'id': iid, 'name': LOCK, 'user': {'id': 0}, 'created_at': now}
+            try:
+                ref = self.run('GET', f'git/ref/taskq/lock/{iid}')
+            except SystemExit as error:
+                if '404' in str(error):
+                    return []
+                raise
+            content = json.loads(base64.b64decode(self.run('GET', f'git/blobs/{ref["object"]["sha"]}')['content']))
+            return [{'id': iid, 'name': LOCK, 'user': {'id': self('GET', '/user')['id']}, 'created_at': content['created_at']}]
+        if rest.startswith('/award_emoji/') and method == 'DELETE':
+            return self.run('DELETE', f'git/refs/taskq/lock/{iid}')
+        if rest == '/resource_label_events':
+            return [] if later else [{'action': 'add', 'label': {'name': item['label']['name']}, 'created_at': item['created_at']}
+                                     for item in self.all(f'issues/{iid}/events') if item['event'] == 'labeled']
+        if rest == '/links':
+            return [] if method == 'GET' else None
+        if rest == '/notes':
+            if method == 'POST':
+                return self.comment(self.run('POST', f'issues/{iid}/comments', {'body': body['body']}))
+            if query.get('sort') == 'desc':  # GitHub lists comments oldest first only: read from the last page back
+                page, want, found = max(1, -(-self.run('GET', f'issues/{iid}')['comments'] // 100)), int(query.get('per_page', 100)), []
+                while page >= 1 and len(found) < want:
+                    found, page = self.run('GET', f'issues/{iid}/comments?per_page=100&page={page}') + found, page - 1
+                return [self.comment(item) for item in found[::-1][:want]]
+            return [] if later else [self.comment(item) for item in self.all(f'issues/{iid}/comments')]
+        if rest.startswith('/notes/') and method == 'DELETE':
+            return self.run('DELETE', f'issues/comments/{rest.rsplit("/", 1)[1]}')
+        if method == 'DELETE':
+            node = self.run('GET', f'issues/{iid}')['node_id']
+            return self.run('POST', 'graphql', {'query': 'mutation($id: ID!) { deleteIssue(input: {issueId: $id}) { clientMutationId } }',
+                                                'variables': {'id': node}})
+        if method == 'PUT':
+            return self.issue(self.run('PATCH', f'issues/{iid}', self.body(body, iid)))
+        return self.issue(self.run('GET', f'issues/{iid}'))
 
 
 def stamp(text):
@@ -295,7 +451,7 @@ def link(iid, deps):
 def milestone_id(title):
     found = [item for item in api('GET', 'milestones?state=active&per_page=100') if item['title'] == title]
     if not found:
-        fail(f'no active milestone {title!r}: create it in GitLab first')
+        fail(f'no active milestone {title!r}: create it in the tracker first')
     return found[0]['id']
 
 
@@ -356,7 +512,7 @@ def profile(args):
     print(f'Profile: filter={args.filter!r}; mine={args.mine}; limit=' +
           ','.join(f'{name}={count}' for name, count in args.limit.items()) + f'; candidates={len(candidates)}')
     if args.filter and not candidates:
-        print('Warning: nonempty filter returned 0 candidates; check the GitLab filter.')
+        print('Warning: nonempty filter returned 0 candidates; check the filter.')
     return loaded, candidates
 
 
@@ -389,7 +545,7 @@ def lock(iid):
             return False
         return True
     except SystemExit as error:
-        if 'has already been taken' in str(error):
+        if any(text in str(error) for text in TAKEN):
             return False
         raise
 
@@ -740,19 +896,21 @@ def migrate(args):
                  + [f'priority-{level}' for level in PRIORITIES] + ['area-' + name for name in AREAS]):
         if name not in have:
             have[name] = api('POST', 'labels', {'name': name, 'color': '#6699cc'})
-    board = next((board for board in api('GET', 'boards') if board['name'] == BOARD), None) or api('POST', 'boards', {'name': BOARD})
-    lists = {item['label']['name']: item for item in board['lists']}
-    for name, item in lists.items():
-        if name.startswith(PREFIX) and name[len(PREFIX):] not in STATES:
-            api('DELETE', f'boards/{board["id"]}/lists/{item["id"]}')
-    for state in STATES:
-        if PREFIX + state not in lists:
-            api('POST', f'boards/{board["id"]}/lists', {'label_id': have[PREFIX + state]['id']})
-    # GitLab shifts positions on every create and refuses a move to the current place: compare fresh positions.
-    for position, state in enumerate(STATES):
-        item = next(item for item in api('GET', f'boards/{board["id"]}/lists') if item['label']['name'] == PREFIX + state)
-        if item['position'] != position:
-            api('PUT', f'boards/{board["id"]}/lists/{item["id"]}', {'position': position})
+    board = None
+    if BOARDS:
+        board = next((board for board in api('GET', 'boards') if board['name'] == BOARD), None) or api('POST', 'boards', {'name': BOARD})
+        lists = {item['label']['name']: item for item in board['lists']}
+        for name, item in lists.items():
+            if name.startswith(PREFIX) and name[len(PREFIX):] not in STATES:
+                api('DELETE', f'boards/{board["id"]}/lists/{item["id"]}')
+        for state in STATES:
+            if PREFIX + state not in lists:
+                api('POST', f'boards/{board["id"]}/lists', {'label_id': have[PREFIX + state]['id']})
+        # GitLab shifts positions on every create and refuses a move to the current place: compare fresh positions.
+        for position, state in enumerate(STATES):
+            item = next(item for item in api('GET', f'boards/{board["id"]}/lists') if item['label']['name'] == PREFIX + state)
+            if item['position'] != position:
+                api('PUT', f'boards/{board["id"]}/lists/{item["id"]}', {'position': position})
     for name in have:
         if name.startswith(PREFIX) and name[len(PREFIX):] not in STATES:
             carriers = [issue['iid'] for issue in issues(f'state=all&labels={name}')]
@@ -763,7 +921,8 @@ def migrate(args):
     everything = load()[0]
     for item in everything:
         link(item['iid'], item['deps'])
-    print(f'board {board["id"]}: {", ".join(PREFIX + state for state in STATES)}; links checked on {len(everything)} tasks')
+    print((f'board {board["id"]}' if board else 'no board on GitHub, columns are the label filters') +
+          f': {", ".join(PREFIX + state for state in STATES)}; links checked on {len(everything)} tasks')
 
 
 # --- Codex app server (the desktop app's shared one); JSON-RPC over a WebSocket on a unix socket ---
@@ -1405,7 +1564,7 @@ def tick(args):
         print(''.join(f'- {line}\n' for line in odd))
     if problems:
         print('## Problems without a task\n\nRead each. Fix it now if small, else `add` a task for it; then close the '
-              'issue with what was done: `glab issue close <N>` after `glab issue note <N> -m "<what was done>"`.\n')
+              'issue with a note of what was done.\n')
         print(''.join(f'- #{issue["iid"]} {issue["title"]}\n' for issue in problems))
     agents = claude_agents() if any((item['claim'] or {}).get('runtime') == 'claude' and item['state'] in ('doing', 'review')
                                     for item in everything) else {}
@@ -1845,7 +2004,7 @@ class Selftest:
         if session is not None and (item.get('claim') or {}).get('session') != session:
             wrong.append(f'claim {(item.get("claim") or {}).get("session")}, expected {session}')
         if state == 'doing' and [each['id'] for each in issue['assignees']] != [self.uid]:
-            wrong.append(f'assignees {[each.get("username") for each in issue["assignees"]]}, expected the glab user')
+            wrong.append(f'assignees {[each.get("username") for each in issue["assignees"]]}, expected the CLI user')
         newest = ''
         if action:
             newest = next((each['body'] for each in history if not each['body'].startswith('**shown**')), '')
@@ -2193,7 +2352,8 @@ def main(argv=None):
     command('cleanup', cleanup, (('--apply',), {'action': 'store_true'}))
     for name in ('init', 'migrate'):
         command(name, migrate, (('--project',), {'help': 'GitLab project path: writes a minimal taskq.toml here if none'}),
-                (('--host',), {'help': 'GitLab host for that taskq.toml, e.g. gitlab.example.com'}))
+                (('--github',), {'help': 'GitHub repository owner/name: writes a minimal taskq.toml here if none'}),
+                (('--host',), {'help': 'host for that taskq.toml, e.g. gitlab.example.com'}))
     command('contract', contract)
     command('update', update, (('--verbose',), {'action': 'store_true', 'help': 'say why a check was skipped'}))
     command('report', report, (('--hours',), {'type': int, 'default': 24}))
@@ -2202,13 +2362,15 @@ def main(argv=None):
                               'help': 'quick: the worker identity (default: this session\'s app); full: apps to start (default: all)'}),
             (('--note',), {'type': int, 'help': 'also post the report as a note on this issue'}),
             (('--worker-env',), {'nargs': '+', 'default': [], 'metavar': 'KEY=VALUE',
-                                 'help': 'environment of the worker side, e.g. GITLAB_TOKEN=broken to see a failure named'}),
+                                 'help': 'environment of the worker side, e.g. GITLAB_TOKEN=broken or GH_TOKEN=broken to see a failure named'}),
             (('--wait',), {'type': int, 'default': 600, 'help': 'full: seconds a worker session may take per step'}))
     args = parser.parse_args(argv)
-    if getattr(args, 'project', None) and not Path('taskq.toml').exists():
+    where = getattr(args, 'project', None) or getattr(args, 'github', None)
+    if where and not Path('taskq.toml').exists():
+        section = '[gitlab]\nproject' if args.project else '[github]\nrepo'
         Path('taskq.toml').write_text(f'# taskq: this project\'s task queue; keys: `taskq contract`, README of taskq.\n'
-                                      f'[gitlab]\nproject = "{args.project}"\n' + (f'host = "{args.host}"\n' if args.host else ''))
-        print(f'wrote taskq.toml for {args.project}')
+                                      f'{section} = "{where}"\n' + (f'host = "{args.host}"\n' if args.host else ''))
+        print(f'wrote taskq.toml for {where}')
     if PROJECT is None and args.function not in (contract, update):
         configure()
     args.function(args)

@@ -7,7 +7,7 @@ canonical: true
 
 # taskq — the project task queue
 
-`taskq` is a Python package with a `taskq` command: a task queue on GitLab issues for Claude and Codex agent sessions.
+`taskq` is a Python package with a `taskq` command: a task queue on GitLab or GitHub issues for Claude and Codex agent sessions.
 
 It is the only task queue and the only orchestration mechanism. One tool, `taskq`, works the same
 from a Codex session and from a Claude session.
@@ -28,7 +28,7 @@ The previous DOT system (`dot_tick.py`, `dot_gitlab.py`, labels `flow-*`) was re
 | Other data | JSON block in the issue description: `scope`, `deps`, `claim`, `waiting_for` (reason for `later`), `result` — only what a label cannot express |
 | Goal and acceptance | Issue description text |
 | History | Issue notes: every taskq note starts with `**action** · app:session` (`take`, `beat`, `ask`, `shown`, `result`, `answer`, `reject`, `release`, `close`, `later`, `waiting`, `ready`, `deps`, `runtime`, `problem`) |
-| Task lock | Award emoji `lock` on the task's issue (§ Taking a task) |
+| Task lock | Award emoji `lock` on the task's issue; on GitHub the ref `refs/taskq/lock/<N>` (§ Taking a task) |
 | Problem without a task | Its own issue with label `problem`; `tick` names it, the coordinator closes it after review |
 
 There is no local state: any machine with `glab` sees and changes the queue the same way. There is no
@@ -44,7 +44,8 @@ It holds no secrets: the token belongs to `glab`.
 
 | Key | What | Default |
 |---|---|---|
-| `[gitlab] project` | GitLab project path (`group/project`) | required |
+| `[gitlab] project` | GitLab project path (`group/project`) | one of `[gitlab] project`, `[github] repo` |
+| `[github] repo` | GitHub repository (`owner/repo`); `[github] host` for GitHub Enterprise | one of the two |
 | `[gitlab] board` | Board name | `taskq` |
 | `[gitlab] host` | GitLab host for `glab` (commands also work outside the project checkout) | `glab` picks it from the current directory's git remote |
 | `[areas] names` | Project work areas; `init` creates `area-*` labels | empty |
@@ -183,6 +184,19 @@ An orphan lock comes from a `take` that failed between steps 2 and 3, or from a 
 `ask`/`review` to `ready`. `tick` finds these with one request (`issues?my_reaction_emoji=lock`) and
 removes a lock older than `LOCK_SECONDS` (120 s) from a task in `ready`/`waiting` or from an issue that is
 not a task ("Unlocked #N"). While the lock is younger, it may belong to a `take` in progress.
+
+**GitHub (2026-10-06).** The package speaks one store protocol — GitLab's REST shape for the few endpoints it uses
+(issues, notes, labels, milestones, award emoji, label events, links, boards) — and `Github` speaks it on GitHub
+REST through `gh api`; the tests' fake speaks it in memory. Differences that show: the lock is the ref
+`refs/taskq/lock/<N>` on a blob holding its time — a second `POST git/refs` is 422 «Reference already exists» for
+any user (checked live 2026-10-06), so the lock is atomic between people with their own accounts (the owner's rule
+in the amendment to csgo #241); it is no branch, so no CI runs; anyone may remove it, the claim names the holder.
+`tick` finds orphan locks through `git/matching-refs/taskq/lock/`. Labels move as the full set in one PATCH
+(the set last read in the process, else one GET). Comments have no `sort=desc`: the newest is read from the
+last page by the issue's comment count. There is no board (`init` says so; a column is the label filter in the
+issues list), no issue links (`deps` in the block is the source of truth), and `DELETE issues/N` is the GraphQL
+`deleteIssue` (admin; `selftest` closes instead when refused). `--filter` is GitHub's list-issues query
+(`labels=`, `assignee=<login>`, `milestone=<number>`). Pull requests are dropped from issue lists.
 
 **Multiple GitLab users.** Each person uses their own `glab` account. Reactions are unique per
 user, so `take` also reads all lock reactions after posting its own. The earliest reaction wins

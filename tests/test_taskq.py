@@ -934,6 +934,202 @@ class Cycle(unittest.TestCase):
         self.assertNotIn('## Codex idle', output)
 
 
+class GithubRest:
+    """GitHub's REST shapes for what `Github` asks: issues by `number` with label objects, comments, labels,
+    milestones, label events, blobs and refs (the lock), the user, and `deleteIssue` over GraphQL."""
+    def __init__(self):
+        self.issues, self.comments, self.labels, self.refs, self.blobs = {}, {}, {}, {}, {}
+        self.calls, self.clock = [], 0
+
+    def now(self):
+        self.clock = max(time.time(), self.clock + 0.001)
+        return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(self.clock)) + f'.{int(self.clock * 1000) % 1000:03d}Z'
+
+    def label(self, name):
+        return self.labels.get(name) or {'id': 0, 'name': name}
+
+    def page(self, items, query):
+        found = {key: value[0] for key, value in q.parse_qs(query).items()}
+        size, page = int(found.get('per_page', 30)), int(found.get('page', 1))
+        return items[(page - 1) * size:page * size]
+
+    def __call__(self, method, path, body=None):
+        self.calls.append((method, path))
+        route, _, query = path.partition('?')
+        if route == 'user':
+            return {'id': 1, 'login': 'alice'}
+        if route.startswith('user/'):
+            return {'id': int(route[5:]), 'login': {1: 'alice', 2: 'bob'}[int(route[5:])]}
+        if route == 'graphql':
+            number = next(number for number, issue in self.issues.items() if issue['node_id'] == body['variables']['id'])
+            del self.issues[number]
+            return {'data': {}}
+        if route == 'milestones':
+            return [{'number': 5, 'title': 'Maps'}]
+        if route == 'labels':
+            if method == 'POST':
+                assert not body['color'].startswith('#')
+                self.labels[body['name']] = {'id': len(self.labels) + 1, **body}
+                return self.labels[body['name']]
+            return self.page(list(self.labels.values()), query)
+        if route.startswith('labels/'):
+            del self.labels[q.parse_qs('x=' + route[7:])['x'][0]]
+            return None
+        if route == 'git/blobs':
+            sha = f'blob{len(self.blobs) + 1}'
+            self.blobs[sha] = body['content']
+            return {'sha': sha}
+        if route.startswith('git/blobs/'):
+            import base64
+            return {'content': base64.b64encode(self.blobs[route[10:]].encode()).decode()}
+        if route == 'git/refs':
+            if body['ref'] in self.refs:
+                q.fail('GitHub POST git/refs failed: {"message":"Reference already exists","status":"422"}')
+            self.refs[body['ref']] = body['sha']
+            return {'ref': body['ref'], 'object': {'sha': body['sha']}}
+        if route.startswith('git/ref/'):
+            ref = 'refs/' + route[8:]
+            if ref not in self.refs:
+                q.fail('GitHub GET failed: {"message":"Not Found","status":"404"}')
+            return {'ref': ref, 'object': {'sha': self.refs[ref]}}
+        if route.startswith('git/refs/'):
+            del self.refs['refs/' + route[9:]]
+            return None
+        if route.startswith('git/matching-refs/'):
+            prefix = 'refs/' + route[18:]
+            return [{'ref': ref} for ref in self.refs if ref.startswith(prefix)]
+        if route == 'issues' and method == 'POST':
+            number = len(self.issues) + 1
+            self.issues[number] = {'number': number, 'node_id': f'node{number}', 'state': 'open', 'title': body['title'],
+                                   'body': body['body'], 'labels': [self.label(name) for name in body.get('labels', [])],
+                                   'assignees': [{'id': {'alice': 1, 'bob': 2}[login], 'login': login} for login in body.get('assignees', [])],
+                                   'milestone': {'number': body['milestone']} if body.get('milestone') else None,
+                                   'html_url': f'url/{number}', 'comments': 0, 'created_at': self.now(), 'updated_at': self.now(),
+                                   'events': []}
+            return self.issues[number]
+        if route == 'issues':
+            found = {key: value[0] for key, value in q.parse_qs(query).items()}
+            items = [issue for issue in self.issues.values() if found.get('state', 'open') in ('all', issue['state'])
+                     and all(name in [label['name'] for label in issue['labels']] for name in found.get('labels', '').split(',') if name)
+                     and (not found.get('since') or issue['updated_at'] >= found['since'])]
+            return self.page(items, query)
+        if route.startswith('issues/comments/'):
+            del self.comments[int(route[16:])]
+            return None
+        number = int(re.match(r'issues/(\d+)', route)[1])
+        rest = route[len(f'issues/{number}'):]
+        issue = self.issues[number]
+        if rest == '/comments' and method == 'POST':
+            cid = max(self.comments, default=0) + 1
+            self.comments[cid] = {'id': cid, 'issue': number, 'body': body['body'], 'created_at': self.now(), 'user': {'id': 1, 'login': 'alice'}}
+            issue['updated_at'] = self.now()
+            return self.comments[cid]
+        if rest == '/comments':
+            return self.page([item for item in self.comments.values() if item['issue'] == number], query)
+        if rest == '/events':
+            return self.page(issue['events'], query)
+        if method == 'PATCH':
+            if 'labels' in body:
+                issue['events'] += [{'event': 'labeled', 'label': {'name': name}, 'created_at': self.now()}
+                                    for name in body['labels'] if name not in [label['name'] for label in issue['labels']]]
+                issue['labels'] = [self.label(name) for name in body['labels']]
+            if 'assignees' in body:
+                issue['assignees'] = [{'id': {'alice': 1, 'bob': 2}[login], 'login': login} for login in body['assignees']]
+            if 'milestone' in body:
+                issue['milestone'] = {'number': body['milestone']} if body['milestone'] else None
+            if 'body' in body:
+                issue['body'] = body['body']
+            if body.get('state') == 'closed':
+                issue['state'] = 'closed'
+            issue['updated_at'] = self.now()
+        issue['comments'] = sum(item['issue'] == number for item in self.comments.values())
+        return issue
+
+
+class GithubCycle(unittest.TestCase):
+    """The queue on GitHub: the same commands through `Github`, read back in GitHub's own shapes."""
+    def setUp(self):
+        self.enterContext(patch.object(q, 'AREAS', ('maps', 'engine')))
+        self.github = GithubRest()
+        store = q.Github('owner/repo')
+        store.run = self.github
+        self.enterContext(patch.object(q, 'api', store))
+        self.enterContext(patch.object(q, 'BOARDS', False))
+
+    def do(self, who, *argv):
+        with patch.dict(os.environ, who), contextlib.redirect_stdout(io.StringIO()) as out:
+            q.main([str(item) for item in argv])
+        return out.getvalue()
+
+    def add(self, *extra):
+        self.do(CLAUDE, 'add', '--title', 't', '--goal', 'g', '--acceptance', 'a', *extra)
+        return len(self.github.issues)
+
+    def names(self, number):
+        return [label['name'] for label in self.github.issues[number]['labels']]
+
+    def state(self, number):
+        return q.parse(q.api('GET', f'issues/{number}'))['state']
+
+    def test_full_cycle_on_github(self):
+        self.do(CLAUDE, 'init')
+        self.assertTrue({'q-ready', 'q-doing', 'run-claude', 'research', 'priority-1', 'area-maps'} <= set(self.github.labels))
+        number = self.add('--type', 'research', '--mine', '--milestone', 'Maps', '--area', 'maps')
+        issue = self.github.issues[number]
+        self.assertEqual(([each['login'] for each in issue['assignees']], issue['milestone']['number']), (['alice'], 5))
+        self.assertIn('Start 1 worker', self.do(CLAUDE, 'tick'))
+        self.assertIn(f'take {number}', self.do(CLAUDE, 'worker'))
+        self.do(CLAUDE, 'take', number)
+        self.assertEqual(self.state(number), 'doing')
+        self.assertIn('refs/taskq/lock/%d' % number, self.github.refs)
+        self.do(CLAUDE, 'beat', number)
+        self.do(CLAUDE, 'beat', number)
+        self.assertEqual(sum(item['body'].startswith('**beat**') for item in self.github.comments.values()), 1)
+        self.do(CLAUDE, 'ask', number, '--text', 'which one?')
+        self.assertIn('which one?', self.do(CLAUDE, 'tick'))
+        self.do(CLAUDE, 'answer', number, '--text', 'the first')
+        self.do(CLAUDE, 'take', number)
+        self.do(CLAUDE, 'result', number, '--text', 'done', '--checks', 'none')
+        self.assertIn(f'close {number}', self.do(CLAUDE, 'tick'))
+        self.do(CLAUDE, 'close', number, '--text', 'ok')
+        self.assertEqual(self.github.issues[number]['state'], 'closed')
+        self.assertFalse([name for name in self.names(number) if name.startswith('q-')])
+        self.assertEqual(self.github.refs, {})
+        self.assertIn(f'#{number}: take → ask', self.do(CLAUDE, 'report'))
+
+    def test_lock_is_a_ref_second_taker_loses_and_tick_heals_a_dead_lock(self):
+        number = self.add('--type', 'code')
+        self.assertTrue(q.lock(number))
+        self.assertFalse(q.lock(number))  # 422 Reference already exists
+        with patch.object(q, 'LOCK_SECONDS', -1):
+            self.assertIn(f'Unlocked #{number}', self.do(CLAUDE, 'tick'))
+        self.assertEqual(self.github.refs, {})
+        other = {'CLAUDE_CODE_SESSION_ID': 'other-machine', 'CODEX_THREAD_ID': ''}
+        self.do(other, 'take', number)
+        with self.assertRaises(SystemExit) as refused, contextlib.redirect_stdout(io.StringIO()):
+            with patch.dict(os.environ, CLAUDE):
+                q.main(['take', str(number)])
+        self.assertIn('cannot start', str(refused.exception))
+
+    def test_newest_comment_is_read_from_the_last_page(self):
+        number = self.add('--type', 'code')
+        self.do(CLAUDE, 'take', number)
+        for _ in range(105):
+            q.note(number, 'beat')
+        before = len(self.github.calls)
+        self.do(CLAUDE, 'beat', number)
+        paged = [path for method, path in self.github.calls[before:] if '/comments?' in path]
+        self.assertEqual(paged, [f'issues/{number}/comments?per_page=100&page=2'])  # the newest: one page, not 106 comments
+        self.assertEqual(sum(item['body'].startswith('**beat**') for item in self.github.comments.values()), 105)
+        self.assertEqual([item['body'] for item in q.api('GET', f'issues/{number}/notes?sort=desc&per_page=1')], ['**beat** · claude:claude-s'])
+
+    def test_init_writes_a_github_config(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp), contextlib.redirect_stdout(io.StringIO()) as out:
+            q.main(['init', '--github', 'owner/repo'])
+            self.assertEqual(Path('taskq.toml').read_text().splitlines()[1:], ['[github]', 'repo = "owner/repo"'])
+        self.assertIn('no board on GitHub', out.getvalue())
+
+
 class Selftest(unittest.TestCase):
     """`selftest --scope quick` against the fake GitLab; its worker processes run in this process."""
     do, add = Cycle.do, Cycle.add

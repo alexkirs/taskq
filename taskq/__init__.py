@@ -44,6 +44,9 @@ WORKSPACE = TREE_WORKSPACE = {
 RULES = ''  # project rules for workers, from [brief] rules: lines of step 6 of the brief
 RETIRE = TREE_RETIRE = 'git worktree remove .worktrees/taskq-{iid}'  # run after `close` of a code task: removes its worktree
 REPO = 'https://github.com/alexkirs/taskq'  # where every install takes its updates from
+# #111: docs/open.html on REPO's GitHub Pages turns its hash (codex:// or claude:// with a UUID) into a deep link, so the
+# owner's chat (http(s) links only) opens a Codex thread. [pages] base of taskq.toml: a fork's own Pages.
+PAGES = 'https://alexkirs.github.io/taskq/'
 # [update] of taskq.toml: tick checks REPO at most `every`. `ref`: `main` (a commit whose CI passed) or `stable` (the
 # tag the owner moves after review, signed by a key in allowed_signers). `auto` None: on when the project's
 # repository belongs to REPO's owner, off otherwise (nobody else runs REPO's main unasked).
@@ -90,7 +93,7 @@ def main_checkout(start):
 def configure(path=None):
     """Load the project's taskq.toml: `path`, else the nearest one from the current directory up. Read only: a key it
     lacks takes its default in memory (a write would dirty the editable clone, and update stops on a dirty clone)."""
-    global RULES, HOST, HOSTS, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, WORKSPACE, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED
+    global RULES, HOST, HOSTS, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, WORKSPACE, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED, PAGES
     import tomllib
     here = Path.cwd()
     path = Path(path) if path else next((folder / 'taskq.toml' for folder in (here, *here.parents)
@@ -127,6 +130,7 @@ def configure(path=None):
     ROOT = main_checkout(path.parent)
     LOCAL = ROOT / 'taskq.local.toml'
     SHARED = {'profile': config.get('profile', {})}
+    PAGES = config.get('pages', {}).get('base', PAGES)
     TICK_BEAT = ROOT / '.local' / 'taskq-tick-last'
     WORKER = f'Run `cd {ROOT} && {TOOL} worker` and follow the instructions it prints.'
     # A new worker app is one table: its session variable, and the commands `selftest` drives it with.

@@ -1493,7 +1493,7 @@ class Cycle(unittest.TestCase):
         self.do(CODEX, 'take', iid)
         output = self.do(CLAUDE, 'tick')
         self.assertIn('## Codex idle', output)
-        self.assertIn(f'| {link(iid)} t | doing | codex @mac-1 | `open -g codex://threads/codex-session` | idle, last event unknown', output)
+        self.assertIn(f'| {link(iid)} t | doing | codex @mac-1 | [session](https://alexkirs.github.io/taskq/open.html#codex://threads/codex-session) | idle, last event unknown', output)
         self.assertIn('codex-send codex-session', output)
         self.codex.status = 'active'
         self.assertNotIn('## Codex idle', self.do(CLAUDE, 'tick'))
@@ -2166,6 +2166,18 @@ class Selftest(unittest.TestCase):
         self.assertIn('No task can start now', self.do(CLAUDE, 'worker'))
         self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))
         self.assertIn(f'take {iid}', self.do(CLAUDE, 'worker', '--filter', 'labels=selftest'))
+
+    def test_codex_session_link_goes_through_pages_base(self):
+        claim = {'session': '0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b', 'runtime': 'codex'}
+        self.assertEqual(tick.session_link(claim),
+                         '[session](https://alexkirs.github.io/taskq/open.html#codex://threads/0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b)')
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'taskq.toml'
+            config.write_text(Path(q.__file__).resolve().parents[1].joinpath('tests/taskq.toml').read_text() +
+                              '\n[pages]\nbase = "https://fork.github.io/taskq"\n')
+            q.configure(config)
+            self.addCleanup(q.configure, Path(__file__).resolve().parent / 'taskq.toml')
+            self.assertIn('(https://fork.github.io/taskq/open.html#codex://', tick.session_link(claim))
 
     def test_a_configured_runtime_is_one_table(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(q.RUNTIMES), patch.dict(q.EXECUTORS):

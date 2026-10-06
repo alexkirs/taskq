@@ -429,8 +429,9 @@ free slot). The other runtime will not take the task. One at a time:
    session link is `https://claude.ai/code/session_…`, which opens the live session in a browser or the
    Claude app. Remote Control does not change the permission mode (the worker keeps `dontAsk`). No
    deep link opens an existing local session by id, so a worker without Remote Control (or on another
-   machine) shows `claude attach <id>` or its app id instead. Codex has no https form: the cell is
-   the command `open -g codex://threads/<id>` (the chat does not open `codex://` links).
+   machine) shows `claude attach <id>` or its app id instead. Codex has no https form and the chat does
+   not open `codex://` links: the cell links `https://alexkirs.github.io/taskq/open.html#codex://threads/<id>`,
+   a page that redirects to the app link (#111; `[pages] base` of taskq.toml for a fork's Pages).
    The URL comes from the job record `~/.claude/jobs/<short id>/state.json`, `bridgeSessionId`
    `cse_<id>` = `session_<id>` (not in `claude agents --json`; checked live 2026-10-07, CLI 2.1.291).
    A task itself, read only (state, claim, last notes, result): `taskq view <N>`; `taskq show`

@@ -228,12 +228,12 @@ def board_moves(everything, selected):
 
 def session_link(claim, agent=None):
     """#83: how the owner opens a worker session. Claude: its Remote Control https URL; without one the
-    terminal command (background) or the app's id. Codex has no https form: its app link as a command."""
+    terminal command (background) or the app's id. Codex has no https form: docs/open.html redirects to its app link (#111)."""
     session = claim['session']
     if claim.get('runtime') == 'claude':
         url = core.claude_url(session)
         return f'[session]({url})' if url else f'`claude attach {agent["id"]}`' if agent else f'app session `local_{session}`'
-    return f'`open -g codex://threads/{session}`' if claim.get('runtime') == 'codex' else f'`{session}`'
+    return f'[session]({core.PAGES.rstrip("/")}/open.html#codex://threads/{session})' if claim.get('runtime') == 'codex' else f'`{session}`'
 
 
 def liveness(item, agents):

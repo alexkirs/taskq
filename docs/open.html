@@ -1,0 +1,19 @@
+<!doctype html>
+<!-- taskq #111: the owner's chat opens only http(s) links. This page opens the app link in its hash:
+     open.html#codex://threads/<uuid>. The hash never reaches a server; only codex:// and claude:// with a UUID pass. -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<meta name="referrer" content="no-referrer">
+<title>taskq: open session</title>
+<p id="out">No session link in this address.</p>
+<script>
+  const target = decodeURIComponent(location.hash.slice(1));
+  const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+  if (new RegExp(`^(codex://threads/|claude://[a-z]+/)${uuid}$`, 'i').test(target)) {
+    const out = document.getElementById('out'), link = document.createElement('a');
+    link.href = link.textContent = target;
+    out.textContent = 'Opening the app. If nothing happens: ';
+    out.append(link);
+    location.href = target;
+  }
+</script>

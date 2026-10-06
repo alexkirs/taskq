@@ -217,7 +217,7 @@ adds each task's URL.
 
 A third worker app (e.g. a Grok bot) is one `[runtimes.<name>]` table in taskq.toml: `env`, `spawn`, `send`,
 optional `archive`, `doctor` and `setup` commands. `taskq doctor` runs its `doctor`, `doctor --fix` prints its
-`setup`; then `taskq selftest --scope full --runtime <name>`. Details: [manager contract](taskq/contracts/taskq-manager.md#checking-the-orchestration-selftest).
+`setup`; both skip a runtime whose profile limit is 0 on this machine (codex too). Then `taskq selftest --scope full --runtime <name>`. Details: [manager contract](taskq/contracts/taskq-manager.md#checking-the-orchestration-selftest).
 
 `taskq view N` prints a task read only: state, claim, last notes, result.
 

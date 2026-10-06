@@ -746,7 +746,8 @@ runtime's own variable wins; two of the built-in ones set at once stop with an e
 
 Onboarding one (the manager, on the owner's request):
 1. `taskq doctor`: runs each `doctor` command and lists its output as a gap while it exits nonzero;
-   `ready: … , runtime grokbot` when green.
+   `ready: … , runtime grokbot` when green. A machine with `grokbot = 0` in its profile limits never starts it:
+   doctor and `--fix` print `runtime grokbot: skipped, limit 0` and run no check or setup (same for `codex = 0`).
 2. `taskq doctor --fix`: prints the `setup` command as a `you:` step (sign-in, bot, trigger, the
    instruction to paste are the person's); run it, show its steps, wait for ‘done’, rerun doctor.
 3. `taskq selftest --scope full --runtime grokbot`: a real worker of the app through the queue.

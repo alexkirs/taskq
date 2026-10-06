@@ -2419,6 +2419,25 @@ class Doctor(unittest.TestCase):
         q.EXECUTORS['bot'] = {**red, 'doctor': "sh -c 'echo fine'"}
         self.assertEqual(self.doctor()[0], 0)
 
+    def test_a_runtime_with_limit_0_is_skipped(self):
+        """#147: a runtime this machine never starts (limit 0) is not a gap: no check, one skipped line."""
+        self.enterContext(patch.object(q, 'api', Gitlab()))
+        self.enterContext(patch.dict(q.EXECUTORS, {'bot': {'env': 'BOT_ID', 'doctor': 'false', 'setup': 'bot setup'}}))
+        self.enterContext(patch.dict(q.RUNTIMES, {'bot': 'BOT_ID'}))
+        with contextlib.redirect_stdout(io.StringIO()):
+            q.main(['init'])
+        self.enterContext(patch.object(q, 'CODEX_SOCKET', q.ROOT / 'no-socket'))
+        q.LOCAL.write_text('[profile]\nmine = false\n[profile.limits]\nbot = 0\ncodex = 0\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            q.main(['doctor', '--codex'])
+        self.assertEqual(out.getvalue().splitlines()[:2], ['runtime codex: skipped, limit 0', 'runtime bot: skipped, limit 0'])
+        self.assertNotIn('Codex app server socket', out.getvalue())
+        q.LOCAL.write_text('[profile]\nmine = false\n[profile.limits]\nbot = 1\n')
+        code, out = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertIn('runtime bot: `false` exit 1', out)
+        self.assertNotIn('skipped', out)
+
     def test_origin_of_another_project_is_named(self):
         self.enterContext(patch.object(q, 'api', Gitlab()))
         self.origin = 'https://gitlab.example.com/other/thing.git'
@@ -2521,6 +2540,12 @@ class Setup(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(' && python3 bot.py setup\n    runtime bot: its app steps', out)
         self.assertIn('not ready: 1 step(s) of the person pending: cd ', out)  # never `ready` while a step is open
+        self.enterContext(patch.dict(q.RUNTIMES, {'bot': 'BOT_ID'}))
+        (self.tmp / 'taskq.local.toml').write_text('[profile]\nmine = false\n[profile.limits]\nbot = 0\n')
+        code, out = self.fix()
+        self.assertEqual(code, 0)
+        self.assertNotIn('bot.py setup', out)
+        self.assertIn('runtime bot: skipped, limit 0', out)
 
     def test_gitlab_person_steps_printed_then_fixed_once(self):
         gitlab = Gitlab()

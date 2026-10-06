@@ -142,6 +142,8 @@ def doctor(args, pending=()):
     `--fix` is the manager's «do it for me»: `setup`."""
     if getattr(args, 'fix', False):
         return setup(args)
+    for name in idle():
+        print(f'runtime {name}: skipped, limit 0')
     gaps = []
     gap = lambda what, fix: gaps.append(f'- {what}\n    {fix}')
     origin = origin_of()
@@ -170,7 +172,7 @@ def doctor(args, pending=()):
         if probe(['claude', 'auth', 'status']):  # None: no claude CLI on this machine, nothing to check
             gap('`claude` is not logged in: background workers stop at «Not logged in»',
                 'claude auth login  (the person runs it in this shell, with the same `claude` the tick starts)')
-        if getattr(args, 'codex', False) and not core.CODEX_SOCKET.exists():
+        if getattr(args, 'codex', False) and 'codex' not in idle() and not core.CODEX_SOCKET.exists():
             gap(f'no Codex app server socket {core.CODEX_SOCKET}: Codex workers cannot start',
                 'open the Codex app and sign in  (the person does it)')
     if config or origin:
@@ -254,12 +256,22 @@ def profile_init(args):
     ignore_local()
 
 
+def idle():
+    """Runtimes this machine never starts (effective profile limit 0): doctor and `--fix` skip their checks and setup.
+    Claude is never idle here: its login, trust and permissions serve the coordinator too."""
+    try:
+        limits = core.resolve(argparse.Namespace(filter=None, mine=None, limit=None))[0]['limits']
+    except SystemExit:
+        return []  # a broken profile is personal_gaps' gap
+    return [name for name, count in limits.items() if not count and name != 'claude']
+
+
 def runtime_gaps():
     """Each [runtimes.<name>] `doctor` command, run from the main checkout: its own `- what / fix` lines as one gap
     while it exits nonzero. It runs without the session variables, like a worker of that app."""
     gaps = []
     for name, item in core.EXECUTORS.items():
-        if not item.get('doctor'):
+        if not item.get('doctor') or name in idle():
             continue
         try:
             done = subprocess.run(shlex.split(item['doctor']), cwd=core.ROOT, env=core.selftest_env(), capture_output=True, text=True, timeout=120)
@@ -315,7 +327,7 @@ def report_gaps(gaps, pending=()):
         print(f'not ready: {len(pending)} step(s) of the person pending: ' + '; '.join(pending))
         sys.exit(1)
     if not gaps:
-        checked = [name for name, item in core.EXECUTORS.items() if item.get('doctor')]
+        checked = [name for name, item in core.EXECUTORS.items() if item.get('doctor') and name not in idle()]
         return print(f'ready: {core.PROJECT_PATH} — config, CLI login, write access, labels and board {core.BOARD}'
                      + (f', runtime {", ".join(checked)}' if checked else ''))
     print(f'not ready: {len(gaps)} gap(s); each line is the command that closes it\n' + '\n'.join(gaps))
@@ -474,7 +486,7 @@ def setup(args):
         person(fix.split('  (')[0], what + '; accept «Trust this folder» once, then quit')
     if trusted(core.ROOT):
         print('ok: Claude folder trust')
-    if args.codex:
+    if args.codex and 'codex' not in idle():
         if core.CODEX_SOCKET.exists():
             print(f'ok: Codex app project {core.codex_project(core.Codex(timeout=60))}')
         else:
@@ -484,7 +496,7 @@ def setup(args):
     else:
         person(f'{core.TOOL} profile init', PROFILE_CARD)
     for name, item in core.EXECUTORS.items():
-        if item.get('setup'):
+        if item.get('setup') and name not in idle():
             person(f'cd {core.ROOT} && {item["setup"]}', f'runtime {name}: its app steps (sign-in, bot, trigger) are the person\'s')
     print('No workers or timer started.' + (f' Pending for the person: {len(pending)} step(s) above.' if pending else ''))
     doctor(argparse.Namespace(codex=args.codex), pending)

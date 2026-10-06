@@ -154,6 +154,9 @@ ready/waiting/later → ask (manager) → answer → ready
 - A worker on a `code` or `docs` task creates its own worktree (the brief prints the command, from the
   project's `[workspace]`), commits, rebases on `origin/main` and pushes to `main` under the owner's
   standing permission. `close` checks that the result SHA is in `origin/main`.
+- A task on taskq itself works only in a worktree of the editable clone (`.worktrees/taskq-<N>`, the
+  command is in the brief from taskq's `[workspace]`), never in the clone's working tree: every session on the
+  machine runs that tree, so it stays clean `main`. `tick` warns in one line when it is not.
 - Partial result: close the task, file the remainder as a new task.
 - A `doing` task whose issue has not changed for longer than `STALE_MINUTES` (`updated_at`; any note,
   including `beat`, updates it) is returned to the queue by `tick`.

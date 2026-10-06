@@ -10,10 +10,11 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 
 [project.scripts]
-taskq = "taskq:main"
+taskq = "taskq_cli:main"
 
 [tool.setuptools]
 packages = ["taskq"]
+py-modules = ["taskq_cli"]
 
 [tool.setuptools.package-data]
 taskq = ["contracts/*.md"]

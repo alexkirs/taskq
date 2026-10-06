@@ -1412,6 +1412,26 @@ class Update(unittest.TestCase):
         self.assertIn('commits main of', self.update()[1])
         self.assertEqual(q.version(), ahead)
 
+    def test_tick_warns_in_one_line_about_a_dirty_or_off_main_clone(self):
+        self.assertIsNone(q.clone_warning())
+        (self.clone / 'one').write_text('edited')
+        self.assertIn('has uncommitted changes', q.clone_warning())
+        self.git('checkout', '-q', '-b', 'side', cwd=self.clone)
+        warning = q.clone_warning()
+        self.assertIn('on side, not main and has uncommitted changes', warning)
+        self.assertNotIn('\n', warning)
+
+    def test_broken_package_is_one_line_not_a_traceback(self):
+        package = self.root / 'site' / 'taskq'
+        package.mkdir(parents=True)
+        (package / '__init__.py').write_text('selftest\n')
+        cli = Path(__file__).resolve().parents[1] / 'taskq_cli.py'
+        done = subprocess.run([sys.executable, '-c', 'import taskq_cli; taskq_cli.main()'], capture_output=True, text=True,
+                              env={**os.environ, 'PYTHONPATH': f'{package.parent}{os.pathsep}{cli.parent}'}, cwd=self.root)
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stderr, f"taskq is broken at {package.parent.resolve()}: NameError: name 'selftest' is not defined; "
+                                      f"run `git -C {package.parent.resolve()} status`\n")
+
     def test_no_network_is_silent_without_verbose(self):
         with patch.object(q, 'REPO', str(self.root / 'missing.git')), contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertIsNone(q.update(SimpleNamespace(verbose=False)))

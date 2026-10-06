@@ -973,6 +973,17 @@ def version():
     return (git('rev-parse', '--short=7', 'HEAD', cwd=where) if kind == 'clone' else (where or '')[:7]) or 'unknown'
 
 
+def clone_warning():
+    """One line when this install is a clone off clean `main`: every session on the machine runs its working tree."""
+    kind, where = install()
+    if kind != 'clone':
+        return None
+    branch, dirty = git('rev-parse', '--abbrev-ref', 'HEAD', cwd=where), git('status', '--porcelain', '--untracked-files=no', cwd=where)
+    faults = [f'on {branch or "an unknown branch"}, not main'] * (branch != 'main') + ['has uncommitted changes'] * bool(dirty)
+    if faults:
+        return f'Warning: the taskq clone {where} {" and ".join(faults)}; every session here runs it, edit in a worktree (README: Develop).'
+
+
 def update(args):
     """Bring this install to `main` of REPO: fast-forward of an editable clone, else a reinstall from Git.
     True when it updated. A clone with uncommitted changes or commits `main` lacks is left alone."""
@@ -1654,6 +1665,8 @@ def tick(args):
     """One pass of the coordinator: release dead claims itself, then print exactly what to do."""
     auto_update()
     print(f'taskq {version()}')
+    if warning := clone_warning():
+        print(warning)
     tick_beat()
     loaded, candidates = profile(args)
     selected = {item['iid'] for item in candidates}

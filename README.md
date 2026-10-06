@@ -155,7 +155,19 @@ Limits live only in the prompt; the global `[limit]` setting is retired.
 
 ## Develop
 
-Change the clone, run the tests, push to `main`; other machines take it within `[update] every`, or at once with `taskq update`.
+An editable install runs the clone's working tree: every `taskq` call on the machine, every tick and worker, runs
+whatever is in it right now. So the clone's own tree stays clean `main`, and every change happens in a worktree of it:
+
+```bash
+cd ~/Projects/taskq
+git fetch origin && git worktree add -b <branch> .worktrees/<branch> origin/main
+```
+
+Change the worktree, run the tests there, push to `main`; the clone and other machines take it within `[update] every`,
+or at once with `taskq update`. `taskq update` leaves a clone with uncommitted changes alone and says so; `tick` prints
+a one-line warning while the clone is dirty or off `main`. If the package cannot be imported at all, the command prints
+`taskq is broken at <path>: <error>; run git -C <path> status` instead of a traceback. An editable install made
+before this wrapper (`taskq_cli`) existed picks it up after one `pipx install --force -e ~/Projects/taskq`.
 
 ```bash
 python3 -m unittest discover -s tests

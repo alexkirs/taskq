@@ -255,7 +255,7 @@ Tool `CronCreate` (loaded via ToolSearch), `recurring: true`, `cron: "*/5 * * * 
 `prompt`:
 
 ```
-taskq tick. Run `cd <main checkout> && git pull -q --ff-only origin main; taskq tick <confirmed profile arguments>`
+taskq tick. Run `cd <main checkout> && taskq update; taskq tick <confirmed profile arguments>`
 and do the coordinator pass by taskq-manager.md § 3 (`taskq contract` prints its path). Reply in the owner's language,
 one or two lines when nothing changed.
 ```
@@ -278,8 +278,9 @@ research or asset result means reading its text against the Acceptance items; no
 1. Read the commit (`git show <sha> --stat`, then the diff) and check it against every Acceptance item.
 2. Run the task's focused tests yourself; for behaviour, check it in a fresh tree (the project's
    `[workspace] new` command makes the tree; after the check remove the tree and delete the branch).
-3. A push to `main` is the deploy. Close a code task after green CI on its commit:
-   `glab api "projects/:id/pipelines?ref=main&per_page=3"`.
+3. A push to `main` is the deploy. Close a code task only when CI on its sha is green on the project's host:
+   GitHub `gh api repos/<owner>/<repo>/commits/<sha>/check-runs --jq '.check_runs[] | [.name, .status, .conclusion]'`,
+   GitLab `glab api "projects/:id/pipelines?sha=<sha>"`.
 4. Accepted: `taskq close N --text "<what exactly was checked and what was not>"`, then the tree
    cleanup that `close` prints (the project's `[workspace] retire`); archive the worker session:
    Claude — `taskq retire <id>` as the Review section prints it (`claude stop` + `claude rm`: the

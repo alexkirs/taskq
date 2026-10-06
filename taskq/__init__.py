@@ -37,12 +37,14 @@ WORKSPACE = {
 }
 RULES = ''  # project rules for workers, from [brief] rules: lines of step 6 of the brief
 RETIRE = None  # printed after `close` of a code task: how to remove its worktree
-REPO = 'https://github.com/alexkirs/taskq'  # where every install takes `main` from
-UPDATE = {'auto': True, 'every': '24h'}  # [update] of taskq.toml: tick checks REPO at most this often
+REPO = 'https://github.com/alexkirs/taskq'  # where every install takes its updates from
+# [update] of taskq.toml: tick checks REPO at most `every`. `ref`: `main` (a commit whose CI passed) or `stable` (the
+# tag the owner moves after review, signed by a key in allowed_signers). `auto` None: on when the project's
+# repository belongs to REPO's owner, off otherwise (nobody else runs REPO's main unasked).
+UPDATE = {'auto': None, 'every': '24h', 'ref': 'main'}
+SIGNERS = Path(__file__).resolve().parent / 'allowed_signers'  # ssh keys allowed to sign the `stable` tag
 # A cache, not queue state: when this machine last asked REPO for its `main`.
 UPDATE_STAMP = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'taskq' / 'update-last'
-# Keys a taskq.toml gets, as TOML text, when it lacks them: a new version's fields reach old configs.
-DEFAULTS = {'update': {'auto': 'true', 'every': '"24h"'}}
 # waiting: open dependencies, moved only by `tick`; ask: a question for the owner (worker's or manager's);
 # later: deferred by the owner, nobody waits on anything. Board columns in this order.
 STATES = ('ready', 'waiting', 'doing', 'review', 'ask', 'later')
@@ -108,9 +110,9 @@ def main_checkout(start):
     return Path(done.stdout.strip()).parent if not done.returncode else Path(start).resolve()
 
 
-def configure(path=None, write=True):
-    """Load the project's taskq.toml: `path`, else the nearest one from the current directory up.
-    `write`: add the DEFAULTS keys it lacks to the file (`doctor` reads only)."""
+def configure(path=None):
+    """Load the project's taskq.toml: `path`, else the nearest one from the current directory up. Read only: a key it
+    lacks takes its default in memory (a write would dirty the editable clone, and update stops on a dirty clone)."""
     global RULES, HOST, HOSTS, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER
     import tomllib
     here = Path.cwd()
@@ -118,7 +120,7 @@ def configure(path=None, write=True):
                                          if (folder / 'taskq.toml').is_file()), None)
     if not path:
         fail('no taskq.toml in this directory or above it (README: «A new project»)')
-    config = tomllib.loads(complete(path, write))
+    config = read_toml(path)
     tracker, codex, workspace = config.get('gitlab') or config.get('github'), config.get('codex', {}), config.get('workspace', {})
     if ('gitlab' in config) == ('github' in config):
         fail(f'{path}: write exactly one of [gitlab] project = "group/project" or [github] repo = "owner/repo"')
@@ -138,6 +140,10 @@ def configure(path=None, write=True):
     RETIRE, HELPERS = workspace.get('retire'), workspace.get('cleanup_helpers')
     UPDATE.update(config.get('update', {}))
     seconds(UPDATE['every'])
+    if UPDATE['ref'] not in ('main', 'stable'):
+        fail(f'[update] ref = "{UPDATE["ref"]}": write "main" or "stable"')
+    if UPDATE['auto'] is None:
+        UPDATE['auto'] = PROJECT_PATH.split('/')[0].lower() == REPO.rstrip('/').split('/')[-2].lower()
     RULES = ''.join(f'   {line}\n' for line in config.get('brief', {}).get('rules', '').strip().splitlines())
     ROOT = main_checkout(path.parent)
     TICK_BEAT = ROOT / '.local' / 'taskq-tick-last'
@@ -147,27 +153,12 @@ def configure(path=None, write=True):
         RUNTIMES[name], EXECUTORS[name] = item['env'], item
 
 
-def complete(path, write=True):
-    """The text of `path` with every DEFAULTS key it lacked written into it; says what it added."""
+def read_toml(path):
     import tomllib
-    text = path.read_text()
     try:
-        config = tomllib.loads(text)
+        return tomllib.loads(path.read_text())
     except tomllib.TOMLDecodeError as error:
         fail(f'{path}: not valid TOML: {error}')
-    if not write:
-        return text
-    for section, keys in DEFAULTS.items():
-        lines = ''.join(f'{key} = {value}\n' for key, value in keys.items() if key not in config.get(section, {}))
-        if not lines:
-            continue
-        header = re.search(rf'^\[{section}\][^\n]*\n', text, re.M)
-        text = (text[:header.end()] + lines + text[header.end():] if header
-                else text.rstrip('\n') + f'\n\n[{section}]\n' + lines)
-        print(f'{path}: added to [{section}]: {lines.strip().replace(chr(10), "; ")}')
-    if text != path.read_text():
-        path.write_text(text)
-    return text
 
 
 def seconds(every):
@@ -1062,34 +1053,88 @@ def clone_warning():
         return f'Warning: the taskq clone {where} {" and ".join(faults)}; every session here runs it, edit in a worktree (README: Develop).'
 
 
+def green(sha):
+    """None when every check-run of REPO's commit `sha` passed (GitHub Actions), else why not."""
+    repo = '/'.join(REPO.rstrip('/').split('/')[-2:])
+    try:
+        done = subprocess.run(['gh', 'api', f'repos/{repo}/commits/{sha}/check-runs', '--jq', '.check_runs'],
+                              capture_output=True, text=True, timeout=60)
+        runs = json.loads(done.stdout) if not done.returncode else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        runs = None
+    if runs is None:
+        return 'its CI could not be read (gh api)'
+    if not runs:
+        return 'it has no CI run yet'
+    waiting = [run['name'] for run in runs if run['status'] != 'completed']
+    failed = [run['name'] for run in runs if run['status'] == 'completed' and run['conclusion'] not in ('success', 'skipped', 'neutral')]
+    return f'CI failed: {", ".join(failed)}' if failed else f'CI still running: {", ".join(waiting)}' if waiting else None
+
+
+def signed(where, sha):
+    """None when the `stable` tag fetched into `where` points at `sha` and carries a signature by a key in SIGNERS."""
+    if git('rev-parse', 'refs/tags/stable^{commit}', cwd=where) != sha:
+        return 'the stable tag moved during the update'
+    if git('-c', 'gpg.format=ssh', '-c', f'gpg.ssh.allowedSignersFile={SIGNERS}', 'verify-tag', 'refs/tags/stable', cwd=where) is None:
+        return f'the stable tag has no valid signature by a key in {SIGNERS}'
+
+
+def works(where):
+    """The new code at least starts: `python3 -m taskq --version` in a fresh process."""
+    try:
+        return not subprocess.run([sys.executable, '-m', 'taskq', '--version'], cwd=where, capture_output=True, timeout=60).returncode
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def update(args):
-    """Bring this install to `main` of REPO: fast-forward of an editable clone, else a reinstall from Git.
-    True when it updated. A clone with uncommitted changes or commits `main` lacks is left alone."""
+    """Bring this install to the `[update] ref` of REPO: fast-forward of an editable clone, else a reinstall from Git.
+    Only to a commit whose CI passed and, for `stable`, a tag signed by a key in SIGNERS. True when it updated.
+    A clone with uncommitted changes or commits the ref lacks is left alone; a clone that does not start after the
+    fast-forward goes back."""
     say = print if args.verbose else (lambda text: None)
     kind, where = install()
-    old, remote = version(), git('ls-remote', REPO, 'refs/heads/main')
+    ref = UPDATE['ref']
+    name = 'refs/heads/main' if ref == 'main' else 'refs/tags/stable'
+    old, remote = version(), git('ls-remote', REPO, name, name + '^{}')
     if not remote:
-        return say(f'update skipped: {REPO} did not answer')
-    new = remote.split()[0]
+        return say(f'update skipped: {REPO} did not answer (or has no {ref})')
+    new = remote.splitlines()[-1].split()[0]  # a tag's commit is the peeled `^{}` line, the last one
     if kind is None:
         return print(f'not updated: this taskq is not installed from Git; reinstall: pipx install --force git+{REPO}')
     if new == (git('rev-parse', 'HEAD', cwd=where) if kind == 'clone' else where):
         return print(f'up to date {old}')
+    if reason := green(new):
+        return print(f'not updated to {ref} {new[:7]}: {reason}')
+    if ref == 'stable':
+        # A clone checks the tag in itself; another install in a bare repository kept next to the update stamp.
+        store = where if kind == 'clone' else UPDATE_STAMP.parent / 'repo.git'
+        if kind != 'clone' and not store.exists():
+            store.parent.mkdir(parents=True, exist_ok=True)
+            git('init', '-q', '--bare', str(store))
+        if git('fetch', '-q', '--no-tags', REPO, '+refs/tags/stable:refs/tags/stable', cwd=store) is None:
+            return say(f'update skipped: fetch of stable from {REPO} failed')
+        if reason := signed(store, new):
+            return print(f'not updated to stable {new[:7]}: {reason}')
     if kind == 'clone':
         if git('status', '--porcelain', '--untracked-files=no', cwd=where):
             return print(f'not updated: {where} has uncommitted changes')
-        if git('fetch', '-q', REPO, 'main', cwd=where) is None:
+        if ref == 'main' and git('fetch', '-q', REPO, 'main', cwd=where) is None:
             return say(f'update skipped: fetch from {REPO} failed')
-        if git('merge-base', '--is-ancestor', 'HEAD', 'FETCH_HEAD', cwd=where) is None:
-            return print(f'not updated: {where} has commits main of {REPO} lacks')
-        if git('merge', '-q', '--ff-only', 'FETCH_HEAD', cwd=where) is None:
-            return print(f'not updated: fast-forward of {where} failed (`git -C {where} merge --ff-only FETCH_HEAD` says why)')
+        if git('merge-base', '--is-ancestor', 'HEAD', new, cwd=where) is None:
+            return print(f'not updated: {where} has commits {ref} of {REPO} lacks')
+        if git('merge', '-q', '--ff-only', new, cwd=where) is None:
+            return print(f'not updated: fast-forward of {where} failed (`git -C {where} merge --ff-only {new[:7]}` says why)')
+        if not works(where):
+            git('reset', '-q', '--hard', 'ORIG_HEAD', cwd=where)
+            return print(f'not updated: {new[:7]} does not start (`python3 -m taskq --version` failed); {where} is back at {old}')
     else:
         # pipx and uv tool by the receipt in their venv, pip otherwise; another installer reinstalls by hand.
+        # ponytail: no start check after a reinstall; the clone is where code changes first land.
         prefix = Path(sys.prefix)
         command = [*(['pipx', 'install', '--force'] if (prefix / 'pipx_metadata.json').exists()
                      else ['uv', 'tool', 'install', '--force'] if (prefix / 'uv-receipt.toml').exists()
-                     else [sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall']), f'git+{REPO}']
+                     else [sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall']), f'git+{REPO}@{new}']
         try:
             subprocess.run(command, check=True, capture_output=True, text=True, timeout=600)
         except (OSError, subprocess.SubprocessError) as error:
@@ -1156,7 +1201,7 @@ def doctor(args):
     config = PROJECT_PATH is not None
     if not config:
         try:
-            configure(write=False)
+            configure()
             config = True
         except SystemExit as error:
             if 'no taskq.toml' in str(error) and origin:
@@ -2851,9 +2896,11 @@ def selftest(args):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv == ['--version']:  # update's start check of new code
+        return print(f'taskq {version()}')
     if PROJECT is None:
         try:
-            configure(write=argv[:1] != ['doctor'])  # before the parser: [runtimes] in taskq.toml adds choices
+            configure()  # before the parser: [runtimes] in taskq.toml adds choices
         except SystemExit:
             pass  # no taskq.toml yet: `init --project` writes it, `contract` and `update` need none
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])

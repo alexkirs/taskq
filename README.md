@@ -200,8 +200,19 @@ cd ~/Projects/taskq
 git fetch origin && git worktree add -b <branch> .worktrees/<branch> origin/main
 ```
 
-Change the worktree, run the tests there, push to `main`; the clone and other machines take it within `[update] every`,
-or at once with `taskq update`. `taskq update` leaves a clone with uncommitted changes alone and says so; `tick` prints
+Change the worktree, run the tests there, push to `main`. CI (`.github/workflows/tests.yml`) runs the tests on every
+push; the clone and other machines take the commit once its CI passed, within `[update] every` or at once with
+`taskq update`. A commit that does not start (`python3 -m taskq --version`) is rolled back in the clone.
+
+`[update] ref = "stable"` in `taskq.toml` makes a machine follow the reviewed `stable` tag instead of `main`: workers
+keep pushing to `main`, and only the owner moves `stable` after review, signed with an SSH key listed in
+`taskq/allowed_signers` (`<email> namespaces="git" ssh-ed25519 AAAA…`, shipped in the package). An unsigned tag or one
+signed by another key is refused with one line. Moving it:
+
+```bash
+git config --global gpg.format ssh && git config --global user.signingkey ~/.ssh/id_ed25519.pub  # once
+git tag -s -f -m stable stable <sha> && git push -f origin stable
+``` `taskq update` leaves a clone with uncommitted changes alone and says so; `tick` prints
 a one-line warning while the clone is dirty or off `main`. If the package cannot be imported at all, the command prints
 `taskq is broken at <path>: <error>; run git -C <path> status` instead of a traceback. An editable install made
 before this wrapper (`taskq_cli`) existed picks it up after one `pipx install --force -e ~/Projects/taskq`.

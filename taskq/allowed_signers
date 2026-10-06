@@ -1,0 +1,3 @@
+# SSH keys allowed to sign the `stable` tag that `[update] ref = "stable"` follows (`git verify-tag`).
+# One line per key: <email> namespaces="git" <key type> <public key>. README: Develop taskq.
+# Empty: no stable tag passes, so `ref = "stable"` updates nothing until the owner adds a key.

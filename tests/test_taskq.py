@@ -1759,7 +1759,8 @@ class TickBeat(unittest.TestCase):
 
 
 class Update(unittest.TestCase):
-    """A real `main` in a bare repository stands in for GitHub; the install is a clone of it."""
+    """A real `main` in a bare repository stands in for GitHub; the install is a clone of it. CI passes and the new
+    code starts unless a test says otherwise."""
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -1771,6 +1772,9 @@ class Update(unittest.TestCase):
         self.git('clone', '-q', str(self.origin), str(self.clone))
         self.enterContext(patch.object(q, 'REPO', str(self.origin)))
         self.enterContext(patch.object(q, 'install', lambda: ('clone', self.clone)))
+        self.enterContext(patch.object(q, 'green', lambda sha: None))
+        self.enterContext(patch.object(q, 'works', lambda where: True))
+        self.enterContext(patch.dict(q.UPDATE, ref='main'))
 
     def git(self, *args, cwd=None):
         return subprocess.run(['git', *(['-C', str(cwd)] if cwd else []), '-c', 'user.name=t', '-c', 'user.email=t@t', *args],
@@ -1846,7 +1850,8 @@ class Update(unittest.TestCase):
         with patch.object(q, 'install', lambda: ('git', old)), patch.object(q.sys, 'prefix', str(self.root)), \
                 patch.object(q.subprocess, 'run', run), contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertTrue(q.update(SimpleNamespace(verbose=False)))
-        self.assertEqual(calls[-1], ['pipx', 'install', '--force', f'git+{self.origin}'])
+        self.assertEqual(calls[-1][:3], ['pipx', 'install', '--force'])
+        self.assertRegex(calls[-1][3], rf'^git\+{re.escape(str(self.origin))}@[0-9a-f]{{40}}$')
         self.assertIn(f'updated {old[:7]} → ', out.getvalue())
         (self.root / 'pipx_metadata.json').unlink()
         def broken(command, **options):
@@ -1882,18 +1887,73 @@ class Update(unittest.TestCase):
         self.assertEqual([q.seconds(every) for every in ('30m', '24h', '7d')], [1800, 86400, 604800])
         self.assertRaises(SystemExit, q.seconds, '1 day')
 
-    def test_missing_config_fields_are_written_and_named(self):
-        config = self.root / 'taskq.toml'
-        config.write_text('[gitlab]\nproject = "g/p"\n')
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            q.complete(config)
-        self.assertIn('added to [update]: auto = true; every = "24h"', out.getvalue())
-        config.write_text('[gitlab]\nproject = "g/p"\n\n[update]\nauto = false\n')
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            q.complete(config)
-            q.complete(config)
-        self.assertEqual(out.getvalue().count('added'), 1)
-        self.assertEqual(config.read_text(), '[gitlab]\nproject = "g/p"\n\n[update]\nevery = "24h"\nauto = false\n')
+    def test_config_is_read_not_written_and_auto_follows_ownership(self):
+        def load(repo, update=''):
+            config = self.root / 'taskq.toml'
+            config.write_text(f'[github]\nrepo = "{repo}"\n' + update)
+            with patch.dict(q.UPDATE, auto=None, every='24h', ref='main'), patch.object(q, 'REPO', 'https://github.com/alexkirs/taskq'):
+                q.configure(config)
+                found = dict(q.UPDATE)
+            self.assertEqual(config.read_text(), f'[github]\nrepo = "{repo}"\n' + update)  # the clone stays clean
+            return found
+        self.assertEqual(load('alexkirs/csgo'), {'auto': True, 'every': '24h', 'ref': 'main'})
+        self.assertFalse(load('someone/else')['auto'])
+        self.assertTrue(load('someone/else', '[update]\nauto = true\nref = "stable"\n')['auto'])
+        self.assertRaises(SystemExit, load, 'a/b', '[update]\nref = "dev"\n')
+
+    def test_red_ci_or_a_start_failure_leaves_the_clone_where_it_was(self):
+        old = q.version()
+        self.commit(self.work, 'two')
+        with patch.object(q, 'green', lambda sha: 'CI failed: tests'):
+            done, out = self.update()
+        self.assertIsNone(done)
+        self.assertRegex(out, r'^not updated to main [0-9a-f]{7}: CI failed: tests\n$')
+        with patch.object(q, 'works', lambda where: False):
+            done, out = self.update()
+        self.assertIsNone(done)
+        self.assertIn(f'does not start (`python3 -m taskq --version` failed); {self.clone} is back at {old}', out)
+        self.assertEqual(q.version(), old)
+
+    def test_green_reads_check_runs(self):
+        def runs(*items):
+            return lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(
+                [{'name': name, 'status': status, 'conclusion': conclusion} for name, status, conclusion in items]))
+        with patch.object(q.subprocess, 'run', runs(('tests', 'completed', 'success'), ('lint', 'completed', 'skipped'))):
+            self.assertIsNone(GREEN('abc'))
+        with patch.object(q.subprocess, 'run', runs(('tests', 'completed', 'failure'))):
+            self.assertEqual(GREEN('abc'), 'CI failed: tests')
+        with patch.object(q.subprocess, 'run', runs(('tests', 'in_progress', None))):
+            self.assertEqual(GREEN('abc'), 'CI still running: tests')
+        with patch.object(q.subprocess, 'run', runs()):
+            self.assertEqual(GREEN('abc'), 'it has no CI run yet')
+
+    def test_stable_needs_a_signed_tag_and_ignores_main(self):
+        old = q.version()
+        key = self.root / 'key'
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'owner', '-f', str(key)], check=True)
+        signers = self.root / 'allowed_signers'
+        signers.write_text('# none yet\n')
+        sign = ['-c', 'gpg.format=ssh', '-c', f'user.signingkey={key}']
+        two = self.commit(self.work, 'two')
+        self.git(*sign, 'tag', '-s', '-m', 'stable', 'stable', cwd=self.work)
+        self.git('push', '-q', 'origin', 'stable', cwd=self.work)
+        three = self.commit(self.work, 'three')  # main is ahead of stable
+        with patch.dict(q.UPDATE, ref='stable'), patch.object(q, 'SIGNERS', signers):
+            done, out = self.update()
+            self.assertIsNone(done)
+            self.assertEqual(out, f'not updated to stable {two}: the stable tag has no valid signature by a key in {signers}\n')
+            self.assertEqual(q.version(), old)
+            signers.write_text('owner namespaces="git" ' + (self.root / 'key.pub').read_text())
+            self.assertEqual(self.update(), (True, f'updated {old} → {two}\n'))
+            self.assertEqual(q.version(), two)  # not main's {three}
+            self.assertEqual(self.update(), (None, f'up to date {two}\n'))
+            self.git('tag', '-f', '-a', '-m', 'unsigned', 'stable', 'HEAD', cwd=self.work)
+            self.git('push', '-q', '-f', 'origin', 'stable', cwd=self.work)
+            self.assertIn(f'not updated to stable {three}: the stable tag has no valid signature', self.update()[1])
+            self.assertEqual(q.version(), two)
+
+
+GREEN = q.green  # the real one: Update patches q.green for every other test
 
 
 @unittest.skipUnless(HELPERS, 'TASKQ_CLEANUP_HELPERS names no folder with workspace_gc.py, host_tools.py, host_gentle.py')

@@ -79,6 +79,8 @@ normal dependency/runtime/scope checks. Limits never arbitrate between machines.
 
 - The session is an ordinary Claude desktop session (not a routine and not a scheduled run: the app
   forbids such a session to start other sessions and to receive messages).
+- Codex workers need the Codex app's server socket (`~/.codex/app-server-control`); without it the tick
+  says so in one line and starts Claude workers only.
 - The queue is readable: `cd <main checkout> && taskq list`. The main checkout is the `main` branch
   tree from `git worktree list`; all queue commands run from it.
 - Workers run without permission prompts thanks to `<main checkout>/.claude/settings.local.json`
@@ -489,7 +491,8 @@ prints every call with its time, and each selftest step.
 - **Codex.** The tick in Codex is an automation with the prompt `Run \`cd <main checkout> && taskq
   tick\` and follow the instructions it prints.` Visible Codex session (verified 2026-10-06):
   `taskq spawn --runtime codex --name "T<N> <words>"` through the app's shared server
-  (`~/.codex/app-server-control`, WebSocket) does `thread/start` in the `[codex] project` project
+  (`~/.codex/app-server-control`, WebSocket) does `thread/start` in the app's project whose root is the main checkout (`project/list`; created
+  when missing; an explicit `[codex] project` wins)
   (`ephemeral: false`, cwd — main checkout), sets the name, moves it to the `[codex] section`
   section, sends the first "ready" turn and the `thread-unarchived` message to the app's IPC
   (`~/.codex/ipc/ipc.sock`); prints the session id. The owner sees such a session in the sidebar

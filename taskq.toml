@@ -2,8 +2,7 @@
 [github]
 repo = "alexkirs/taskq"
 
-[codex]  # the Codex app's project `taskq` (project/list; created 2026-10-06 through project/create); no sidebar section
-project = "01a1119a-16f1-7982-9bb2-3f53ba316816"
+# [codex]: none. The Codex app's project is found by the main checkout path (project/list), created when missing.
 
 [areas]  # init creates these area-* labels
 names = ["queue", "tick", "runtimes", "selftest", "docs", "install"]

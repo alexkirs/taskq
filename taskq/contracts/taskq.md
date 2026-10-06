@@ -49,7 +49,7 @@ It holds no secrets: the token belongs to `glab`.
 | `[gitlab] board` | Board name | `taskq` |
 | `[gitlab] host` | GitLab host for `glab` (commands also work outside the project checkout) | `glab` picks it from the current directory's git remote |
 | `[areas] names` | Project work areas; `init` creates `area-*` labels | empty |
-| `[codex] project`, `section` | Codex app project and section for `spawn --runtime codex` | none: `spawn --runtime codex` refuses |
+| `[codex] project`, `section` | Override of the Codex app project for `spawn --runtime codex`, and its sidebar section | project: the app's project whose root is the main checkout (`project/list`), created by `project/create` when none is; no section |
 | `[workspace] new`, `continue`, `none` | Brief text about the workspace; `{iid}` is the task number | `git worktree add` next to the checkout |
 | `[workspace] retire` | What `close` prints to clean up the tree | nothing |
 | `[workspace] cleanup_helpers` | Project folder with `workspace_gc.py`, `host_gentle.py`, `host_tools.py` for `cleanup` | none: `cleanup` refuses |

@@ -31,7 +31,7 @@ class CodexServer:
     """Finite app-server responses; fail immediately on an unexpected request."""
     def __init__(self):
         self.status, self.turns, self.entries, self.calls = 'idle', [], {}, []
-        self.path = None
+        self.path, self.projects = None, []
         self.socket = SimpleNamespace(close=lambda: None)
 
     def call(self, method, params):
@@ -46,6 +46,10 @@ class CodexServer:
             return {'data': self.entries.get(params['turnId'], [])[:params['limit']]}
         if method == 'thread/start':
             return {'thread': {'id': 'spawned'}}
+        if method == 'project/list':
+            return {'data': self.projects}
+        if method == 'project/create':
+            return {'project': {'id': 'created', **params}}
         if method in ('thread/resume', 'turn/start', 'turn/steer', 'thread/name/set', 'thread/section/move',
                       'thread/unsubscribe'):
             return {}
@@ -816,6 +820,26 @@ class Cycle(unittest.TestCase):
         start = next(params for method, params in self.codex.calls if method == 'thread/start')
         self.assertEqual(start['sandbox'], 'danger-full-access')
         self.assertEqual(start['approvalPolicy'], 'never')
+
+    def test_codex_spawn_finds_the_app_project_by_the_checkout_path(self):
+        """#24: an id is per machine; the checkout path is shared. An explicit [codex] project still wins."""
+        def spawned_in():
+            self.codex.calls.clear()
+            with patch.object(q, 'codex_announce'):
+                self.do(CLAUDE, 'spawn', '--runtime', 'codex', '--name', 'probe')
+            return next(params for method, params in self.codex.calls if method == 'thread/start')['projectId']
+        self.assertEqual(spawned_in(), 'codex-project')
+        self.assertNotIn('project/list', [method for method, _ in self.codex.calls])
+        with patch.object(q, 'CODEX_PROJECT', None):
+            self.codex.projects = [{'id': 'other', 'roots': [{'path': '/elsewhere'}]},
+                                   {'id': 'mine', 'roots': [{'path': str(q.ROOT)}]}]
+            self.assertEqual(spawned_in(), 'mine')
+            self.codex.projects = [{'id': 'other', 'roots': [{'path': '/elsewhere'}]}]
+            self.assertEqual(spawned_in(), 'created')
+            create = next(params for method, params in self.codex.calls if method == 'project/create')
+            root = os.path.realpath(q.ROOT)
+            self.assertEqual((create['name'], create['roots']), (Path(root).name, [{'path': root}]))
+            self.assertTrue(create['idempotencyKey'])
 
     def run_recorded(self, outputs=None):
         """subprocess.run that records argv and answers from `outputs` by the first two words."""

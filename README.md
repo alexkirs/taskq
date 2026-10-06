@@ -68,6 +68,7 @@ git push -u origin HEAD
 Expected: `taskq.toml`, labels and a board with one column per state.
 GitLab prints its ID; GitHub prints its URL. `labels only`: obtain `project` scope; rerun init.
 Credentials stay in the host CLI.
+Codex workers need no `taskq.toml` key: the Codex app project is found by the checkout path, created if missing.
 
 ## Product Manager
 

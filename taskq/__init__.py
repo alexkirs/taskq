@@ -1248,13 +1248,26 @@ def codex_send_app(codex, thread, metadata, text):
         ipc.socket.close()
 
 
+def codex_project(codex):
+    """The app's project whose root is the main checkout, created when none is; `[codex] project` overrides it.
+    Found anew on every spawn: an id is per machine, the checkout path is what every machine shares."""
+    if CODEX_PROJECT:
+        return CODEX_PROJECT
+    root = os.path.realpath(ROOT)
+    for project in codex.call('project/list', {}).get('data', []):
+        if any(os.path.realpath(item['path']) == root for item in project.get('roots') or []):
+            return project['id']
+    import uuid
+    created = codex.call('project/create', {'idempotencyKey': str(uuid.uuid4()), 'name': Path(root).name,
+                                            'roots': [{'path': root}]})
+    return created.get('project', created)['id']
+
+
 def codex_spawn(name):
-    """A persistent thread of the app's project `CODEX_PROJECT` in section `CODEX_SECTION`, with one finished turn, announced
+    """A persistent thread of the app's project (`codex_project`) in section `CODEX_SECTION`, with one finished turn, announced
     to the app and released by the shared server, so the owner can write in it. It runs with `CODEX_ACCESS`."""
     codex = Codex(timeout=300)
-    if not CODEX_PROJECT:
-        fail('a Codex worker needs [codex] project in taskq.toml (the app\'s project id, `project/list`)')
-    thread = codex.call('thread/start', {'cwd': str(ROOT), 'projectId': CODEX_PROJECT,
+    thread = codex.call('thread/start', {'cwd': str(ROOT), 'projectId': codex_project(codex),
                                          'ephemeral': False, **CODEX_ACCESS})['thread']['id']
     codex.call('thread/name/set', {'threadId': thread, 'name': name})
     if CODEX_SECTION:
@@ -1667,6 +1680,8 @@ def tick(args):
     print(f'taskq {version()}')
     if warning := clone_warning():
         print(warning)
+    if not CODEX_SOCKET.exists():
+        print(f'Codex workers unavailable on this machine: no Codex app server socket {CODEX_SOCKET}.')
     tick_beat()
     loaded, candidates = profile(args)
     selected = {item['iid'] for item in candidates}

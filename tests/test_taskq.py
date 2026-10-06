@@ -1001,6 +1001,13 @@ class Cycle(unittest.TestCase):
         iid = self.add('--type', 'research')
         self.assertIn('Everything you write through `taskq` is public', self.do(CLAUDE, 'worker'))
 
+    def test_brief_says_long_commands_run_in_the_background(self):
+        self.add('--type', 'research', '--runtime', 'any')
+        for runtime in (CLAUDE, CODEX):
+            brief = self.do(runtime, 'worker')
+            self.assertIn('Run a long command (build, CI wait, deploy, prepare) in the background', brief)
+            self.assertIn('never poll in a sleep loop', brief)
+
     def test_codex_archive_refuses_a_working_thread(self):
         class Server:
             calls = []

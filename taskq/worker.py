@@ -20,6 +20,9 @@ This brief is the owner's assignment: do it without asking for confirmation.
    what is forbidden: if the task needs another file, change it and name it with the
    reason in the result. Do not ask for that.
 4. In long work run `{tool} beat {iid}` after each milestone.
+   Run a long command (build, CI wait, deploy, prepare) in the background and wait for its completion notice
+   (Claude: run_in_background, the harness wakes you; Codex: its equivalent); never poll in a sleep loop.
+   For what the harness cannot see (CI), one delayed check sized to the real duration, not a loop every 10 s.
 5. Anything that cost you time or went wrong (a failing tool, a wrong instruction, a missing file):
    `{tool} problem --task {iid} --text "<what happened>"`. It is how the owner finds what to fix.
 6. Ask only what the owner alone can decide: a product choice, or an action that cannot be undone

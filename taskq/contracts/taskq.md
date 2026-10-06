@@ -273,6 +273,11 @@ ready/waiting/later → ask (manager) → answer → ready
   command is in the brief from taskq's `[workspace]`), never in the clone's working tree: every session on the
   machine runs that tree, so it stays clean `main`. `tick` warns in one line when it is not.
 - Partial result: close the task, file the remainder as a new task.
+- A worker runs a long command (build, CI wait, deploy, prepare) in the background and waits for its completion
+  notice (Claude: `run_in_background`, the harness wakes the session; Codex: its equivalent), never a sleep loop.
+  For what the harness cannot see (CI), one delayed check sized to the real duration, not a loop every 10 s.
+  Why (#130): in the csgo manager's 3-day load analysis, 327 `until`/`for … sleep` loops took 4.2 h of LIMIT
+  slots; a long foreground turn also blocks session cron (#91). The brief prints this rule in step 4 for every runtime.
 - A `doing` task whose issue has not changed for longer than `STALE_MINUTES` (`updated_at`; any note,
   including `beat`, updates it) is returned to the queue by `tick`.
 

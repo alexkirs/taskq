@@ -196,12 +196,15 @@ An orphan reaction owned by another user must be cleared by that user; taskq doe
 Scheduling and creating sessions is an app action, not a script action.
 
 - **Claude desktop:** the coordinator is an ordinary session with a timer inside (`CronCreate`). A worker
-  is created by `taskq spawn`: the session is created from the command line and imported into
-  the app via the link `claude://resume?session=<id>`, where it is an ordinary visible session. Then
-  the coordinator sends it the worker prompt as a message. The link is undocumented and may
-  change with an app update. Worker sessions run without permission prompts:
-  `.claude/settings.local.json` in the main checkout sets `bypassPermissions` (owner decision,
-  2026-10-05; the file is not in git).
+  is created by `taskq spawn --name "T<N> <words>"`: a `claude --bg` background session of the CLI in
+  the main checkout (#270, 2026-10-06: the app window does not change). The coordinator sends it the
+  worker prompt with `SendMessage` and `notify_when_idle`. The owner watches it by Remote Control
+  (claude.ai/code, phone), `claude agents` / `claude attach`, or on request in the app:
+  `taskq show <id>` stops the background run and imports the session with the link
+  `claude://resume?session=<id>`, which is undocumented, may change with an app update and always
+  shows the session for a moment (~0.2 s). A finished worker: `taskq retire <id>`. Worker sessions
+  run without permission prompts: `.claude/settings.local.json` in the main checkout sets
+  `bypassPermissions` (owner decision, 2026-10-05; the file is not in git).
 - **Codex:** an automation with the prompt "Run `cd <main checkout> && taskq tick` and follow
   the instructions it prints". A Codex worker is created by `taskq spawn --runtime codex`; the prompt
   is sent by `taskq codex-send`, state is read by `taskq codex-read`, and after acceptance it is

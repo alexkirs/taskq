@@ -107,7 +107,9 @@ their `deps` (lines `Moved #N …`; never do this move by hand) and prints what 
    `glab api "projects/:id/pipelines?ref=main&per_page=3"`.
 4. Accepted: `taskq close N --text "<what exactly was checked and what was not>"`, then the tree
    cleanup that `close` prints (the project's `[workspace] retire`); archive the worker session:
-   Claude — `archive_session`, Codex — `taskq codex-archive <id>` (the command leaves a running
+   Claude — `taskq retire <id>` as the Review section prints it (`claude stop` + `claude rm`: the
+   background run ends, the transcript stays; a worker the app imported: `archive_session`), Codex —
+   `taskq codex-archive <id>` (the command leaves a running
    session alone; a session open in the Codex app is held by the app's own server — the command
    then says so: open it with `open -g codex://threads/<id>` and press Cmd+Shift+A in the window
    (Archive chat; via Computer Use — `app_key`). A session with live background work is not
@@ -118,29 +120,38 @@ their `deps` (lines `Moved #N …`; never do this move by hand) and prints what 
 **Starting workers (section Start).** The section names the runner for each task, respecting the
 separate limits (Claude and Codex each have their own slots; an `any` task is given a runner with a
 free slot). The other runtime will not take the task. One at a time:
-1. Claude: read `get_window_layout` and run
-   `taskq spawn --restore <session_id of the focused main_window pane>` — it prints `local_<id>`:
-   the session is created and imported into the app, and the owner's window stays on the previous
-   session (§ "Window focus on spawn"). If the window is not on the code tab or the pane is not a
-   session, run without `--restore`. Codex: `spawn --runtime codex --name "T<N> <words>"` — prints
-   the Codex session id (§ "Other machines").
-2. Send it the worker prompt: Claude — with the `mcp__ccd_session_mgmt__send_message` tool, Codex —
-   `taskq codex-send <id> --text "<prompt>"`:
+1. Claude: `taskq spawn --name "T<N> <words>"` — a `claude --bg` session in the main checkout,
+   idle, no app window change (§ "Window focus on spawn"); prints its session id. Codex:
+   `spawn --runtime codex --name "T<N> <words>"` — prints the Codex session id (§ "Other machines").
+2. Send it the worker prompt: Claude — `SendMessage` with `to` = the name from step 1 (as
+   `ListAgents` shows it) and `notify_when_idle: true`, so the end of its turn comes back to you;
+   Codex — `taskq codex-send <id> --text "<prompt>"`.
    Use the exact worker prompt printed by tick, including the confirmed profile arguments.
 3. Workers may be started back to back: `worker` may hand the same task to two concurrent workers,
    but `take` gives it to one, the other is refused and takes the next ([taskq](taskq.md) § Taking a task).
-4. Name the Claude session `T<N> <a few words>` with the `set_session_title` tool (Codex got its name in step 1).
+4. Tell the owner, in one line per worker, how to watch it: the tick's section "Claude worker
+   sessions" lists every doing Claude worker with `claude attach <id>` and `taskq show <id>`.
+   The owner watches by link: Remote Control in claude.ai/code and the phone app, `claude agents`
+   in a terminal, or on request in the desktop app (§ "Showing a worker in the app").
 
-**Window focus on spawn (2026-10-06).** Verified step by step, window before and after.
-- *Claude.* `claude -p … --session-id` does not touch the window, but the app does not know such a
-  session: `send_message` answers `session … not found`. The only import is the link
-  `claude://resume?session=<id>`; its handler, after `importCliSession`, always switches the main
-  pane to the new session (there is no flag; `-g` only keeps the app in the background).
-  `get_window_layout`: before — pane on the coordinator session, after — on the new one. So `spawn
-  --restore <id>` waits for the import record `~/Library/Application Support/Claude/
-  claude-code-sessions/*/*/local_<id>.json` (~1.2 s) and opens the previous session with the link
-  `claude://claude.ai/epitaxy/local_<id>`: the pane is back on it, the new session is in the list,
-  `send_message` is delivered. Remainder: for ~1 s the pane shows the new session.
+**Window focus on spawn (#270, 2026-10-06, app 2.19675.0, CLI 2.1.291).**
+- *Claude.* A worker is a `claude --bg` session (documented CLI: `claude agents`, `attach`, `logs`,
+  `stop`, `rm`). The app's log shows no `setFocusedSession` for it: no window change. It is not in
+  the app's session list; `ListAgents` shows it (`bg`), `SendMessage` reaches it live and
+  `notify_when_idle` reports the end of its turn; Remote Control turns on by itself. Works from a
+  `CronCreate` fire. Steering without SendMessage: `claude stop <id>`, then
+  `claude --bg --resume <session id> "<text>"` wakes the same id.
+- Importing into the app is only the link `claude://resume?session=<id>`; its handler, after
+  `importCliSession`, always switches the main pane to the session (no flag; `-g` only keeps the
+  app in the background). A session record written straight into `claude-code-sessions` is not
+  read until the app restarts; the app's own "CLI sessions in the sidebar" is compiled off.
+
+**Showing a worker in the app** (the owner asks «покажи сессию»): `taskq show <session id>`. It
+stops the background run first (the app does not refuse a live one and would be a second writer of
+the transcript: the worker's turn ends; continue it in the app with a message), imports it, and
+returns the pane to the calling session (`--restore <local_id>` names another) as soon as the
+app's log has the line `setFocusedSession: sessionId=local_<id>` (~0.2 s of the new session; the
+record file ~1.1 s is the fallback).
 - *Codex.* The spawn steps (thread/start, name, section, first turn, unsubscribe, broadcast
   `thread-unarchived`) do not switch the window: screenshot before and after shows the same session,
   the new one is in Recents/<project>. Only `open -g codex://threads/<id>` switches it (it also hands
@@ -311,11 +322,14 @@ sections: "Remove", "Ask the owner", "Kept".
    appears only on the owner's mouse hover: `app_click` on it via accessibility does nothing;
    Cmd+Shift+A via `app_key` in the background does not work either, full control is needed.
    The tree of such a session stays until the next `cleanup --apply`.
-4. For Claude the script prints `coordinator: archive_session local_<id>` for workers of closed
-   tasks, found by claim, if the session exists in this machine's app and is not archived. Only the
-   coordinator has this app tool: it checks that the worker finished and holds no background
-   command, then runs `archive_session` for each such id. A worker created by `spawn` that never
-   took a task is found by the app metadata: the session was imported from the CLI
+4. Claude background workers (`claude agents`, cwd the main checkout): a worker of closed tasks is
+   removed by `taskq retire <id>` (`--apply` does it); one with an open task or busy is kept; one
+   without a claim, older than `STALE_MINUTES`, is a question with a `taskq retire` option.
+   For Claude sessions in the app (imported workers, `taskq show`) the script prints
+   `coordinator: archive_session local_<id>` for workers of closed tasks, found by claim, if the
+   session exists in this machine's app and is not archived. Only the coordinator has this app tool:
+   it checks that the worker finished and holds no background command, then runs `archive_session`
+   for each such id. An imported session that never took a task is found by the app metadata: imported from the CLI
    (`adoptedFromOtherSurface`, `sessionId` = `local_<cliSessionId>`), cwd is the main checkout, not
    archived, no activity for longer than `STALE_MINUTES`, no claim. This is a question to the owner
    with an `archive_session` option. Codex spawn sessions are found in `thread/list` by the app's

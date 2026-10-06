@@ -198,7 +198,8 @@ class Cycle(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
-        for target, value in (('api', self.gitlab),
+        self.agents = {}  # `claude agents --json --all`, by session id
+        for target, value in (('api', self.gitlab), ('claude_agents', lambda: self.agents),
                               ('Codex', lambda **kwargs: self.codex), ('CodexIpc', lambda **kwargs: self.ipc)):
             patcher = patch.object(q, target, value)
             patcher.start()
@@ -816,24 +817,64 @@ class Cycle(unittest.TestCase):
         self.assertEqual(start['sandbox'], 'danger-full-access')
         self.assertEqual(start['approvalPolicy'], 'never')
 
-    def test_claude_spawn_restores_the_owner_pane_after_import(self):
-        """The app's resume link always shows the imported session; --restore shows the old one again."""
-        runs, records = [], Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, records)
+    def run_recorded(self, outputs=None):
+        """subprocess.run that records argv and answers from `outputs` by the first two words."""
+        runs = []
 
         def run(argv, **kwargs):
             runs.append(argv)
-            if argv[:2] == ['open', '-g'] and 'resume?session=' in argv[2]:
-                (records / 'a' / 'o').mkdir(parents=True, exist_ok=True)
-                (records / 'a' / 'o' / f'local_{argv[2].split("=")[1]}.json').write_text('{}')
-            return SimpleNamespace(returncode=0, stdout='ready', stderr='')
-        with patch.object(q.subprocess, 'run', run), patch.object(q, 'CLAUDE_APP_SESSIONS', records):
-            session = self.do(CLAUDE, 'spawn', '--restore', 'local_owner').strip()
-            opened = [argv[2] for argv in runs if argv[0] == 'open']
-            self.assertEqual(opened, [f'claude://resume?session={session[6:]}', 'claude://claude.ai/epitaxy/local_owner'])
-            runs.clear()
-            self.do(CLAUDE, 'spawn')
-            self.assertEqual(len([argv for argv in runs if argv[0] == 'open']), 1)  # without --restore: import only
+            return SimpleNamespace(returncode=0, stdout=(outputs or {}).get(' '.join(argv[:2]), ''), stderr='')
+        return runs, patch.object(q.subprocess, 'run', run)
+
+    def test_claude_spawn_is_a_background_session_without_the_app(self):
+        """#270: `claude --bg` changes no app window; the id comes from `claude agents`."""
+        self.agents = {'abcd1234-0000': {'id': 'abcd1234', 'sessionId': 'abcd1234-0000', 'pid': 1}}
+        runs, patched = self.run_recorded({'claude --bg': 'backgrounded · abcd1234 · T1 x (idle — send a prompt to start)'})
+        with patched:
+            printed = self.do(CLAUDE, 'spawn', '--name', 'T1 x')
+        self.assertEqual(printed.splitlines()[0], 'abcd1234-0000')
+        self.assertIn('claude attach abcd1234', printed)
+        self.assertEqual(runs, [['claude', '--bg', '--name', 'T1 x']])
+        self.agents = {}
+        with self.run_recorded({'claude --bg': 'backgrounded · ffff0000 · T1 x'})[1]:
+            self.assertIn('does not list the new session ffff0000', self.refused(CLAUDE, 'spawn'))
+
+    def test_show_stops_the_background_run_then_imports_and_restores_on_the_focus_line(self):
+        home = self.directory / 'home'
+        log = home / 'Library/Logs/Claude/main.log'
+        log.parent.mkdir(parents=True)
+        log.write_text('old line\n')
+        self.agents = {'s1': {'id': 's1short', 'sessionId': 's1', 'pid': 7}}
+        runs = []
+
+        def run(argv, **kwargs):
+            runs.append(argv)
+            if 'resume?session=s1' in argv[-1]:
+                with log.open('a') as out:
+                    out.write('[info] [CCD] LocalSessions.setFocusedSession: sessionId=local_s1\n')
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        with patch.object(q.subprocess, 'run', run), patch.object(q.Path, 'home', lambda: home), \
+                patch.object(q, 'CLAUDE_APP_SESSIONS', self.directory / 'none'):
+            started = time.time()
+            printed = self.do(CLAUDE, 'show', 'local_s1', '--restore', 'owner')
+        self.assertLess(time.time() - started, 5)  # the log line, not the 20 s timeout
+        self.assertEqual(runs, [['claude', 'stop', 's1short'], ['open', '-g', 'claude://resume?session=s1'],
+                                ['open', '-g', 'claude://claude.ai/epitaxy/local_owner']])
+        self.assertIn('stopped the background run s1short', printed)
+
+    def test_tick_lists_worker_sessions_and_retires_a_reviewed_background_worker(self):
+        iid = self.add('--type', 'research', '--runtime', 'claude')
+        self.do(CLAUDE, 'take', iid)
+        self.agents = {'claude-session': {'id': 'claudese', 'sessionId': 'claude-session', 'pid': 3}}
+        listed = self.do(COORDINATOR, 'tick').split('## Claude worker sessions')[1]
+        self.assertIn(f'#{iid} t: background, running: `claude attach claudese`', listed)
+        self.assertIn('show claude-session', listed)
+        self.do(CLAUDE, 'result', iid, '--checks', 'c', '--text', 'done')
+        self.assertIn('taskq retire claude-session', self.do(COORDINATOR, 'tick'))
+        runs, patched = self.run_recorded()
+        with patched:
+            self.assertIn('retired claude-session', self.do(COORDINATOR, 'retire', 'claude-session'))
+        self.assertEqual(runs, [['claude', 'stop', 'claudese'], ['claude', 'rm', 'claudese']])
 
     def test_codex_send_does_not_steer_a_completed_or_unknown_turn(self):
         self.codex.status = 'active'
@@ -1130,7 +1171,7 @@ class Cleanup(unittest.TestCase):
         self.git('init', '-q', '--bare', str(self.remote))
         self.git('remote', 'add', 'origin', str(self.remote))
         self.git('push', '-q', '-u', 'origin', 'main')
-        self.issues, self.app, self.threads = {}, {}, {}
+        self.issues, self.app, self.threads, self.agents = {}, {}, {}, {}
         # Retire runs the existing script, not a replacement that merely deletes a directory.
         scripts = self.root / 'scripts'
         scripts.mkdir()
@@ -1142,6 +1183,7 @@ class Cleanup(unittest.TestCase):
         self.addCleanup(os.chdir, self.before_cwd)
         # Explicit patches keep app and issue reads outside these disposable Git fixtures.
         for target, name, value in ((q, 'cleanup_issues', lambda: self.issues), (q, 'claude_sessions', lambda: self.app),
+                                    (q, 'claude_agents', lambda: self.agents),
                                     (q, 'cleanup_codex', lambda roots: self.threads),
                                     (host_tools, 'live_paths', lambda: [])):
             patcher = patch.object(target, name, value)
@@ -1267,6 +1309,23 @@ class Cleanup(unittest.TestCase):
         self.assertIn('Codex session unverified', report.split('# Ask the owner')[1])
         self.assertIn('codex-archive unknown', report)
         self.assertIn('Codex session codex-session', report.split('# Kept')[1])
+
+    def test_background_workers_of_closed_tasks_are_retired_others_asked_or_kept(self):
+        self.issues[1] = {'closed': True, 'state': 'unknown', 'type': 'research', 'claim': {'runtime': 'claude', 'session': 'bg-done'}}
+        self.issues[2] = {'closed': False, 'state': 'doing', 'type': 'research', 'claim': {'runtime': 'claude', 'session': 'bg-open'}}
+        old = (time.time() - q.STALE_MINUTES * 60 - 60) * 1000
+        agent = lambda sid, **more: {'id': sid[:5], 'sessionId': sid, 'cwd': str(self.root), 'startedAt': old, 'status': 'idle', **more}
+        self.agents = {sid: agent(sid) for sid in ('bg-done', 'bg-open', 'bg-orphan')}
+        self.agents['bg-fresh'] = agent('bg-fresh', startedAt=time.time() * 1000)
+        self.agents['bg-elsewhere'] = agent('bg-elsewhere', cwd='/elsewhere')
+        retired = []
+        with patch.object(q, 'claude_stop', lambda sid, remove=False: retired.append((sid, remove))):
+            report = self.run_cleanup(True)
+        self.assertEqual(retired, [('bg-done', True)])
+        self.assertIn('Claude background session bg-op', report.split('# Kept')[1])
+        self.assertIn('taskq retire bg-orphan', report.split('# Ask the owner')[1])
+        for sid in ('bg-fresh', 'bg-elsewhere'):
+            self.assertNotIn(sid, report)
 
     def test_new_activity_between_plan_and_apply_prevents_deletion(self):
         tree = self.tree('worktree-race')

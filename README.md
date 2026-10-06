@@ -97,8 +97,10 @@ add → ready ⇄ waiting → take → doing → result → review → close
 
 - **Manager** (the session the owner talks to): `taskq add`, `taskq list`, `taskq answer`, `taskq later`.
 - **Coordinator**: every 5 minutes runs `taskq tick` and follows what it prints: accept or
-  reject results, start workers (`taskq spawn` for a Claude desktop session, `taskq spawn --runtime codex`
-  plus `taskq codex-send` for the Codex app), pass questions to the owner.
+  reject results, start workers (`taskq spawn` for a Claude CLI background session, reached with
+  `SendMessage`; `taskq spawn --runtime codex` plus `taskq codex-send` for the Codex app), pass
+  questions to the owner. `taskq show <id>` opens a Claude worker in the desktop app on request;
+  `taskq retire <id>` ends a finished one.
 - **Worker**: its only prompt is ``Run `cd <main checkout> && taskq worker` and follow the instructions it
   prints.`` The brief names the task, the workspace, the history and the exact commands: `take`, `beat`,
   `problem`, `ask`, `result`.

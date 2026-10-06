@@ -1189,31 +1189,89 @@ def codex_archive(args):
 
 
 def spawn(args):
-    """Create a visible worker session in the main checkout and print its id; the coordinator then sends
-    it the worker prompt. Claude: a CLI session imported into the desktop app. Codex: `codex_spawn`."""
-    print(codex_spawn(args.name) if args.runtime == 'codex' else f'local_{claude_spawn(args.restore)}')
+    """Create a worker session in the main checkout and print its id; the coordinator then sends it the
+    worker prompt. Claude: a CLI background session (`claude_spawn`). Codex: `codex_spawn`."""
+    if args.runtime == 'codex':
+        return print(codex_spawn(args.name))
+    session = claude_spawn(args.name)
+    print(f'{session}\nWatch it: `claude attach {session[:8]}` or `claude agents`; in the app: `{TOOL} show {session}`.')
 
 
-def claude_spawn(restore=None, extra=None):
-    """The CLI session id of a new Claude worker the desktop app has imported; `extra`: its environment."""
-    import uuid
-    session, root = str(uuid.uuid4()), ROOT
-    env = {**{key: value for key, value in os.environ.items() if key not in RUNTIMES.values()}, **(extra or {})}
-    done = subprocess.run(['claude', '-p', 'Reply with the single word: ready', '--session-id', session],
-                          cwd=root, env=env, capture_output=True, text=True, timeout=300)
-    if done.returncode:
-        fail(f'claude could not create the session: {done.stderr.strip() or done.stdout.strip()}')
-    # 2026-10-06: the app's resume handler imports the session and then always navigates its main pane
-    # to it (no option to skip). -g only keeps the app in the background. With --restore the pane goes back
-    # to the session the owner had open as soon as the import has written the session's record.
-    subprocess.run(['open', '-g', f'claude://resume?session={session}'], check=True)
-    if restore:
-        end = time.time() + 20  # measured 1.2 s
-        while not any(CLAUDE_APP_SESSIONS.glob(f'*/*/local_{session}.json')) and time.time() < end:
-            time.sleep(0.05)
-        restore = restore if restore.startswith('local_') else f'local_{restore}'
-        subprocess.run(['open', '-g', f'claude://claude.ai/epitaxy/{restore}'], check=True)
+def claude_env(extra=None):
+    return {**{key: value for key, value in os.environ.items() if key not in RUNTIMES.values()}, **(extra or {})}
+
+
+def claude_spawn(name, extra=None, prompt=None):
+    """The CLI session id of a new Claude worker: a `claude --bg` session named `name` (idle without
+    `prompt`), which SendMessage reaches by that name. #270 (2026-10-06): no app window change at all."""
+    done = subprocess.run(['claude', '--bg', '--name', name, *([prompt] if prompt else [])], cwd=ROOT,
+                          env=claude_env(extra), capture_output=True, text=True, timeout=120)
+    short = re.search(r'backgrounded · (\w+)', done.stdout)
+    if done.returncode or not short:
+        fail(f'claude could not start the session: {done.stderr.strip() or done.stdout.strip()}')
+    session = next((sid for sid in claude_agents() if sid.startswith(short[1])), None)
+    if not session:
+        fail(f'claude agents does not list the new session {short[1]}')
     return session
+
+
+def claude_agents():
+    """This machine's `claude --bg` sessions by session id, stopped ones too (no `pid`)."""
+    done = subprocess.run(['claude', 'agents', '--json', '--all'], cwd=ROOT, capture_output=True, text=True, timeout=60)
+    try:
+        listed = json.loads(done.stdout) if not done.returncode else []
+    except ValueError:
+        listed = []
+    return {item['sessionId']: item for item in listed if item.get('kind') == 'background' and item.get('sessionId')}
+
+
+def claude_stop(session, remove=False):
+    """Stop a background session (its conversation stays: `claude --resume` and the app can open it);
+    `remove` also takes it out of `claude agents`. The CLI takes the short id, not the session id."""
+    agent = claude_agents().get(session)
+    for verb in ('stop', 'rm') if remove else ('stop',):
+        if agent and (verb == 'rm' or agent.get('pid')):
+            subprocess.run(['claude', verb, agent['id']], cwd=ROOT, check=True, capture_output=True, timeout=60)
+    return agent
+
+
+def show(args):
+    """Open a Claude session in the desktop app on the owner's request. A running background session is
+    stopped first: the app does not refuse it and would be a second writer of the same transcript."""
+    session = args.session.removeprefix('local_')
+    agent = claude_stop(session)
+    if agent and agent.get('pid'):
+        print(f'stopped the background run {agent["id"]}: its turn ends; continue it in the app')
+    claude_import(session, args.restore or driver_app_session())
+    print(f'local_{session}')
+
+
+def retire(args):
+    """Archive a finished Claude background worker: stopped and out of `claude agents`; the transcript stays."""
+    session = args.session.removeprefix('local_')
+    print(f'retired {session}' if claude_stop(session, remove=True) else f'{session} is not a background session here')
+
+
+def claude_import(session, restore=None):
+    """Import a CLI session into the desktop app. The resume link always shows it in the main pane (no
+    option to skip). With `restore` the pane goes back as soon as the app logs the focus change:
+    measured 2026-10-06 ~0.2 s of the new session instead of ~1.1 s waiting for its record file."""
+    log = Path.home() / 'Library/Logs/Claude/main.log'
+    start = log.stat().st_size if log.exists() else 0
+    subprocess.run(['open', '-g', f'claude://resume?session={session}'], check=True)
+    if not restore:
+        return
+    end, seen = time.time() + 20, ''
+    while time.time() < end and f'setFocusedSession: sessionId=local_{session}' not in seen:
+        if any(CLAUDE_APP_SESSIONS.glob(f'*/*/local_{session}.json')):
+            break  # the record is written ~1 s after the focus: fallback if the log line changes
+        if log.exists():
+            with log.open(errors='replace') as stream:
+                stream.seek(start)
+                seen = stream.read()
+        time.sleep(0.02)
+    restore = restore if restore.startswith('local_') else f'local_{restore}'
+    subprocess.run(['open', '-g', f'claude://claude.ai/epitaxy/{restore}'], check=True)
 
 
 def question(iid):
@@ -1349,6 +1407,8 @@ def tick(args):
         print('## Problems without a task\n\nRead each. Fix it now if small, else `add` a task for it; then close the '
               'issue with what was done: `glab issue close <N>` after `glab issue note <N> -m "<what was done>"`.\n')
         print(''.join(f'- #{issue["iid"]} {issue["title"]}\n' for issue in problems))
+    agents = claude_agents() if any((item['claim'] or {}).get('runtime') == 'claude' and item['state'] in ('doing', 'review')
+                                    for item in everything) else {}
     for item in review:
         print(f'## Review #{item["iid"]}: {item["title"]}\n\n{item["text"]}\n\nHanded in:\n\n{notes(item["iid"])[-1]}\n\n'
               f'Check the result against the Acceptance above (for code and docs read the commit).\n'
@@ -1356,20 +1416,25 @@ def tick(args):
               f'Not accepted: `{TOOL} reject {item["iid"]} --text "<what to fix>"`.\n')
         if (item['claim'] or {}).get('runtime') == 'codex':
             print(f'After close, archive its Codex session: `{TOOL} codex-archive {item["claim"]["session"]}`.\n')
+        elif (item['claim'] or {}).get('session') in agents:
+            print(f'After close, retire its Claude session: `{TOOL} retire {item["claim"]["session"]}`.\n')
     if start:
         print(f'## Start {len(start)} worker session(s)\n\n'
               f'Each worker is a new visible session of your own app that receives exactly this prompt:\n\n'
               f'    {worker_prompt(args)}\n\n'
               f'Runtime of each: ' + ', '.join(f'#{item["iid"]} {item["runtime"]}' for item in start) + '.\n'
-              f'Claude worker: `{TOOL} spawn --restore <session id of the focused pane from the window layout '
-              f'tool>` (keeps the owner\'s window where it was), then send the prompt to the printed `local_<id>` with the session '
-              f'message tool. Codex worker: `{TOOL} spawn --runtime codex --name "T<N> <title>"`, then '
-              f'`{TOOL} codex-send <printed id> --text "<prompt>"`.\n')
-    named = [item for item in everything if item['state'] == 'doing' and (item['claim'] or {}).get('runtime') == 'claude' and item['claim']['session']]
-    if named:
-        print('## Name the worker sessions\n\nSet each session title with the session title tool, if it differs:\n')
-        for item in named:
-            print(f'- `local_{item["claim"]["session"]}` → `T{item["iid"]} {item["title"][:48]}`')
+              f'Claude worker: `{TOOL} spawn --name "T<N> <title>"` (a background session: the app window does not '
+              f'change), then SendMessage to that name with the prompt and `notify_when_idle: true`. Codex worker: '
+              f'`{TOOL} spawn --runtime codex --name "T<N> <title>"`, then `{TOOL} codex-send <printed id> --text "<prompt>"`.\n')
+    live = [item for item in everything if item['state'] == 'doing' and (item['claim'] or {}).get('runtime') == 'claude'
+            and item['claim'].get('session')]
+    if live:
+        print('## Claude worker sessions\n\nTell the owner this list; the owner opens one when they want to watch it:\n')
+        for item in live:
+            session, agent = item['claim']['session'], agents.get(item['claim']['session'])
+            where = (f'background, {"running" if agent.get("pid") else "stopped"}: `claude attach {agent["id"]}`, '
+                     f'in the app: `{TOOL} show {session}`') if agent else f'app session `local_{session}`'
+            print(f'- #{item["iid"]} {item["title"][:48]}: {where}')
         print()
     if fresh:
         print('## Waiting for the owner\n\nNew questions. Do not answer these yourself. End your reply with this list, verbatim:\n')
@@ -1597,6 +1662,18 @@ def cleanup_plan(root):
         else:
             ask.append({'what': f'Claude session local_{sid}', 'why': 'worker without a proven closed task (spawn without a claim, or the task is not finished)',
                         'choices': [('keep', 'true'), ('archive', f'coordinator: archive_session local_{sid}')]})
+    # `claude --bg` workers of this checkout; `retire` stops them and drops them from `claude agents`.
+    for sid, agent in claude_agents().items():
+        identity, what = ('claude', sid), f'Claude background session {agent["id"]} ({agent.get("name")})'
+        if Path(agent.get('cwd') or '/').resolve() != root.resolve():
+            continue
+        if identity in mine or active_task(identity) or agent.get('status') == 'busy':
+            keep.append({'what': what, 'why': 'current session / open task / busy'})
+        elif finished(identity):
+            remove.append({'kind': 'claude-bg', 'what': what, 'thread': sid, 'why': 'worker of closed tasks, not busy'})
+        elif identity in workers or time.time() - agent.get('startedAt', 0) / 1000 > STALE_MINUTES * 60:
+            ask.append({'what': what, 'why': 'worker without a proven closed task (spawn without a claim, or the task is not finished)',
+                        'choices': [('keep', 'true'), ('retire', shlex.join([TOOL, 'retire', sid]))]})
     return remove, ask, keep
 
 
@@ -1657,7 +1734,10 @@ def cleanup(args):
                 if item.get('cwd'):
                     blocked_trees.add(Path(item['cwd']).resolve())
                 print(f'Kept: {item["what"]}: {error}')
-    print(f'\nRemoved: {len(removed)}; freed {freed} bytes of data ({freed / gc.GIB:.3f} GiB).')
+        elif item['kind'] == 'claude-bg':
+            claude_stop(item['thread'], remove=True)
+            removed.append(item['what'])
+    print(f'\nRemoved:{len(removed)}; freed {freed} bytes of data ({freed / gc.GIB:.3f} GiB).')
     for name in removed:
         print(f'- {name}')
     print('Physical free space may differ (APFS clones / WSL disk image).')
@@ -1878,8 +1958,12 @@ class Selftest:
                 with contextlib.redirect_stdout(io.StringIO()):
                     codex_send(argparse.Namespace(thread=session, text=prompt))
                 return
-            command = (['claude', '-p', prompt, '--resume', session] if runtime == 'claude'
-                       else selftest_command(EXECUTORS[runtime]['send'], session=session, text=prompt))
+            if runtime == 'claude':  # a background session between turns: wake it with the prompt, same id
+                claude_stop(session)
+                subprocess.run(['claude', '--bg', '--resume', session, prompt], cwd=ROOT, env=claude_env(self.extra),
+                               check=True, capture_output=True, timeout=120)
+                return
+            command = selftest_command(EXECUTORS[runtime]['send'], session=session, text=prompt)
             with log.open('a') as out:
                 process = subprocess.Popen(command, cwd=ROOT, env=selftest_env(extra=self.extra), stdout=out, stderr=subprocess.STDOUT)
 
@@ -1906,7 +1990,7 @@ class Selftest:
         def spawned():
             nonlocal session
             if runtime == 'claude':
-                session = claude_spawn(driver_app_session(), self.extra)
+                session = claude_spawn(name, self.extra)
             elif runtime == 'codex':
                 session = codex_spawn(name)
             else:
@@ -1940,7 +2024,7 @@ class Selftest:
             except subprocess.TimeoutExpired:
                 process.kill()
         self.chain()
-        if session and runtime != 'claude':  # a Claude session: only the app tool archives it; `no session left` names it
+        if session:
             self.step('retire the session', runtime, lambda: selftest_retire(runtime, session))
 
     def notes(self, iid, session, *actions):
@@ -2006,7 +2090,7 @@ class Selftest:
 
 
 def driver_app_session():
-    """The app session of the calling Claude session, to show again after a spawn; None from Codex or a shell."""
+    """The app session of the calling Claude session, to show again after an import; None from Codex or a shell."""
     sid = os.environ.get(RUNTIMES['claude'])
     return next((meta['sessionId'] for meta in claude_sessions().values() if meta.get('cliSessionId') == sid), None) if sid else None
 
@@ -2018,11 +2102,11 @@ def selftest_retire(runtime, session, check=False):
             codex_archive(argparse.Namespace(thread=session))
         return out.getvalue().strip()
     if runtime == 'claude':
-        meta = claude_sessions().get(session)
-        if meta and not meta.get('isArchived'):
-            raise SelftestError(f'Claude session local_{session} is not archived; only the app tool can: '
-                                f'`archive_session local_{session}`, then `{TOOL} selftest --scope check`')
-        return f'local_{session} ' + ('archived' if meta else 'not in this machine\'s app')
+        if not check:
+            claude_stop(session, remove=True)
+        if session in claude_agents():
+            raise SelftestError(f'background session {session} is still in `claude agents`: `{TOOL} retire {session}`')
+        return f'{session} retired'
     archive = EXECUTORS[runtime].get('archive')
     if check or not archive:
         return 'no archive command configured' if not archive else f'{session}: archived by the run'
@@ -2094,8 +2178,11 @@ def main(argv=None):
             (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}))
     command('tick', tick, *profile_flags)
     command('spawn', spawn, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),
-            (('--name',), {'default': 'taskq worker', 'help': 'Codex thread name'}),
-            (('--restore',), {'help': 'Claude: session to show again after the import (the focused pane)'}))
+            (('--name',), {'default': 'taskq worker', 'help': 'session name: "T<N> <words>"'}))
+    claude_session = (('session',), {'help': 'Claude session id (or local_<id>)'})
+    command('show', show, claude_session,
+            (('--restore',), {'help': 'app session to show again after the import (default: the calling session)'}))
+    command('retire', retire, claude_session)
     thread = (('thread',), {})
     command('codex-send', codex_send, thread, text)
     command('codex-read', codex_read, thread,

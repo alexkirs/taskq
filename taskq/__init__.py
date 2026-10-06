@@ -289,7 +289,14 @@ class Github:
         if path.startswith('boards'):
             fail('GitHub has no board: the q-* labels are the columns')
         if method == 'POST' and path == 'issues':
-            return self.issue(self.run('POST', 'issues', self.body(body)))
+            made = self.issue(self.run('POST', 'issues', self.body(body)))
+            # GitHub's issue list lags a new issue by a moment (seen live 2026-10-06): wait until it shows, so the
+            # next command (list, take, the selftest) sees it. ponytail: 5 s cap, then the caller sees the lag.
+            for _ in range(10):
+                if any(item['number'] == made['iid'] for item in self.run('GET', f'issues?state=all&since={made["created_at"]}&per_page=100')):
+                    break
+                time.sleep(0.5)
+            return made
         if method == 'GET' and path.startswith('issues?'):
             if 'my_reaction_emoji' in query:  # every locked issue: the lock refs name them
                 numbers = [int(item['ref'].rsplit('/', 1)[1]) for item in self.run('GET', 'git/matching-refs/taskq/lock/')]

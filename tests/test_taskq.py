@@ -2171,7 +2171,9 @@ class TickBeat(unittest.TestCase):
                 q.tick_beat()
         self.assertEqual(first.getvalue(), 'Last tick: none.\n')
         self.assertIn('another coordinator is armed', second.getvalue())
-        self.assertEqual(third.getvalue(), 'Last tick: 20 min ago.\n')
+        self.assertEqual(third.getvalue().splitlines()[0], 'Last tick: 20 min ago.')
+        self.assertIn('no tick for 20 min', third.getvalue())
+        self.assertNotIn('no tick', second.getvalue())
 
 
 

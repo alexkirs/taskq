@@ -2283,11 +2283,13 @@ def question(iid):
     return 'no question note', shown
 
 
-TICK_LIVE_MINUTES = 15  # a tick younger than this means another coordinator session is armed
+TICK_MINUTES = 5  # the coordinator timer's interval (manager contract § 2)
+TICK_LIVE_MINUTES = 3 * TICK_MINUTES  # a younger tick means another coordinator is armed; an older one, a stalled timer
 
 
 def tick_beat():
-    """Record this tick and report the previous one, so a second session does not arm a second tick."""
+    """Record this tick and report the previous one, so a second session does not arm a second tick and an armed
+    timer that stopped firing is named (#91: seen live 2026-10-07, a */5 job stayed in CronList ~36 min without a tick)."""
     before = TICK_BEAT.stat().st_mtime if TICK_BEAT.exists() else None
     TICK_BEAT.parent.mkdir(parents=True, exist_ok=True)
     TICK_BEAT.touch()
@@ -2296,6 +2298,9 @@ def tick_beat():
     minutes = int((time.time() - before) // 60)
     live = ' (another coordinator is armed: do not CronCreate a second tick)' if minutes < TICK_LIVE_MINUTES else ''
     print(f'Last tick: {minutes} min ago{live}.')
+    if minutes >= TICK_LIVE_MINUTES:
+        print(f'If a timer is armed: no tick for {minutes} min (expected every {TICK_MINUTES}): check CronList, '
+              'end a long turn or background loops in the coordinator session, re-arm (manager contract § 2).')
 
 
 def profile_arguments(args):

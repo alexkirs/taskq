@@ -330,6 +330,15 @@ that `taskq tick` prints them from `taskq.local.toml`, then replace the timer's 
 above (`CronDelete` the old one, `CronCreate` this one, in the same session; never two timers).
 Codex automations: edit the prompt to `taskq tick` without flags.
 
+**The coordinator session runs no long tasks**: every turn ends within minutes (no foreground loop,
+no waiting in the turn for a background job or a `Monitor` condition). A session timer fires only between
+turns (checked live 2026-10-07, CLI 2.1.291, `* * * * *` timer: an idle session and one holding a
+13-minute `run_in_background` loop each got all 10 fires on time; a session in a 5-minute foreground
+command got none, then one catch-up fire after the turn ended). While a turn runs, ticks are silently
+skipped. When ticks stop coming, `taskq tick` prints `If a timer is armed: no tick for N min` (N ≥ 3
+intervals): check `CronList`, end the long turn or background loops, re-arm. The fix that removes the
+dependency on the session's turns is a launchd timer (taskq #42).
+
 The timer lives inside the session: while the app is open and for at most 7 days. After an app
 restart the owner says "arm the tick" — repeat this step. An app routine does not fit the tick: its
 interval is at most hourly, and its session cannot start workers.

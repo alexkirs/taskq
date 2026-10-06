@@ -7,6 +7,7 @@ Everything specific to a project is its `taskq.toml`. Contracts: `taskq contract
 """
 import argparse
 import contextlib
+import hashlib
 from datetime import datetime, timezone
 import io
 import json
@@ -901,8 +902,7 @@ def report(args):
 
 def contract(args):
     """Where the contracts live: the queue (taskq.md) and the manager/coordinator session (taskq-manager.md)."""
-    folder = Path(__file__).resolve().parent / 'contracts'
-    print('\n'.join(str(path) for path in sorted(folder.glob('*.md'))))
+    print('\n'.join(str(path) for path in sorted(CONTRACTS.glob('*.md'))))
 
 
 def git(*args, cwd=None):
@@ -1621,6 +1621,39 @@ def tick_beat():
               'end a long turn or background loops in the coordinator session, re-arm (manager contract § 2).')
 
 
+CONTRACTS = Path(__file__).resolve().parent / 'contracts'
+TICK_PROMPT_VERSION = 2  # raise with every change of TICK_PROMPT: an older --prompt-version gets the re-arm line
+# The coordinator timer's prompt, word for word as in manager contract § 2 (a test keeps them equal).
+TICK_PROMPT = f"""taskq tick prompt v{TICK_PROMPT_VERSION}. Run `cd <main checkout> && taskq update; taskq tick --prompt-version {TICK_PROMPT_VERSION}`
+and do the coordinator pass by taskq-manager.md § 3 (`taskq contract` prints its path). Reply in the owner's language,
+one or two lines when nothing changed."""
+
+
+def contract_seen():
+    return TICK_BEAT.with_name('taskq-contract-seen')
+
+
+def contract_news(prompt_version):
+    """#110: a coordinator reads taskq-manager.md once when armed and its prompt stays as armed. Name a changed
+    contract once per checkout (its hash next to the tick stamp) and a prompt older than TICK_PROMPT."""
+    manager, seen = CONTRACTS / 'taskq-manager.md', contract_seen()
+    new = hashlib.sha256(manager.read_bytes()).hexdigest()[:7]
+    old, since = (seen.read_text().split() + ['', ''])[:2] if seen.exists() else ('', '')
+    if old != new:
+        seen.parent.mkdir(parents=True, exist_ok=True)
+        seen.write_text(f'{new} {version()}\n')
+        print(f'The coordinator contract changed since your last tick ({old or "none"}→{new}): re-read § 3 now '
+              f'({manager}, {CONTRACTS / "taskq.md"}).')
+        # ponytail: digest only for a clone install, whose version is a commit
+        if since and (log := git('log', '-3', '--format=  %h %s', f'{since}..HEAD', '--', str(manager), cwd=CONTRACTS)):
+            print(log)
+    if (prompt_version or 1) < TICK_PROMPT_VERSION:
+        prompt = TICK_PROMPT.replace('<main checkout>', str(ROOT))
+        print(f'Your tick prompt is outdated (v{prompt_version or 1}, current v{TICK_PROMPT_VERSION}): re-arm with this prompt '
+              '(CronDelete the old timer, CronCreate this one; manager contract § 2):\n\n'
+              + ''.join(f'    {line}\n' for line in prompt.splitlines()))
+
+
 def profile_arguments(args):
     """Only this invocation's explicit flags, false, empty and zero included: the rest each worker reads itself."""
     flags = ' --filter ' + shlex.quote(args.filter) if args.filter is not None else ''
@@ -1697,6 +1730,7 @@ def tick(args):
     if not CODEX_SOCKET.exists():
         print(f'Codex workers unavailable on this machine: no Codex app server socket {CODEX_SOCKET}.')
     tick_beat()
+    contract_news(args.prompt_version)
     loaded, candidates = profile(args)
     selected = {item['iid'] for item in candidates}
     stalled = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and item['age'] > STALE_MINUTES]
@@ -1948,7 +1982,8 @@ def main(argv=None):
     command('later', later, iid, text)
     command('edit', edit, iid, (('--deps',), {'nargs': '*', 'type': int}),
             (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}))
-    command('tick', tick, *profile_flags)
+    command('tick', tick, *profile_flags, (('--prompt-version',), {'type': int, 'metavar': 'N',
+            'help': "the timer prompt's version (manager contract § 2); older ones are told to re-arm"}))
     command('profile', profile_init, (('what',), {'choices': ('init',)}), *profile_flags,
             (('--preferred-runtime',), {'choices': tuple(RUNTIMES), 'help': 'tie-break for own tasks of any runtime'}))
     command('spawn', spawn, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),

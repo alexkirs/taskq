@@ -284,6 +284,7 @@ class Cycle(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
         self.agents = {}  # `claude agents --json --all`, by session id
+        self.enterContext(patch.object(q, 'TICK_BEAT', self.directory / 'beat'))  # not the real coordinator's
         self.enterContext(patch.object(q, 'CLAUDE_JOBS', self.directory / 'jobs'))
         for module, target, value in ((q, 'api', self.gitlab), (q, 'claude_agents', lambda: self.agents),
                                       (q, 'Codex', lambda **kwargs: self.codex), (codex, 'Codex', lambda **kwargs: self.codex),
@@ -1544,6 +1545,7 @@ class GithubCycle(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.enterContext(patch.object(q, 'CLAUDE_JOBS', Path(directory.name) / 'jobs'))
         self.enterContext(patch.object(q, 'claude_agents', dict))
+        self.enterContext(patch.object(q, 'TICK_BEAT', Path(directory.name) / 'beat'))
 
     def test_tick_links_tasks_sessions_and_commits(self):
         tick_links(self, GH, 'https://github.com/owner/x/commit/')
@@ -2240,6 +2242,26 @@ class TickBeat(unittest.TestCase):
         self.assertIn('no tick for 20 min', third.getvalue())
         self.assertNotIn('no tick', second.getvalue())
 
+
+    def test_changed_contract_and_outdated_prompt_are_named(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / 'beat'):
+            run = lambda: contextlib.redirect_stdout(io.StringIO())
+            with run() as first:
+                q.contract_news(q.TICK_PROMPT_VERSION)
+            with run() as second:
+                q.contract_news(q.TICK_PROMPT_VERSION)
+            q.contract_seen().write_text('0000000 unknown\n')
+            with run() as changed:
+                q.contract_news(None)
+        self.assertIn('contract changed since your last tick (none→', first.getvalue())
+        self.assertEqual(second.getvalue(), '')
+        self.assertIn('(0000000→', changed.getvalue())
+        self.assertEqual(changed.getvalue().count('re-read § 3'), 1)
+        self.assertIn('Your tick prompt is outdated (v1, current v2)', changed.getvalue())
+        self.assertIn(f'cd {q.ROOT} && taskq update; taskq tick --prompt-version {q.TICK_PROMPT_VERSION}', changed.getvalue())
+
+    def test_contract_holds_the_tick_prompt(self):
+        self.assertIn(q.TICK_PROMPT, (q.CONTRACTS / 'taskq-manager.md').read_text())
 
 
 class Update(unittest.TestCase):

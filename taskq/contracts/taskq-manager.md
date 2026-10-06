@@ -316,10 +316,16 @@ Tool `CronCreate` (loaded via ToolSearch), `recurring: true`, `cron: "*/5 * * * 
 `prompt`:
 
 ```
-taskq tick. Run `cd <main checkout> && taskq update; taskq tick`
+taskq tick prompt v2. Run `cd <main checkout> && taskq update; taskq tick --prompt-version 2`
 and do the coordinator pass by taskq-manager.md § 3 (`taskq contract` prints its path). Reply in the owner's language,
 one or two lines when nothing changed.
 ```
+
+`--prompt-version` is the prompt's version: tick cannot see the prompt, so a timer armed with an older
+one (or none: v1) gets `Your tick prompt is outdated … re-arm with this prompt` and the exact prompt;
+replace the timer with it (`CronDelete` the old one, `CronCreate` this one). After a change of this file the
+next tick of each checkout prints `The coordinator contract changed since your last tick (<old>→<new>): re-read
+§ 3 now (…)` once, with the contract's latest commits: re-read § 3 before the pass.
 
 The prompt has no profile flags: each tick rereads `taskq.local.toml`, so a profile change needs no
 new timer. Check the last-tick age first; do not arm a second coordinator on this machine.

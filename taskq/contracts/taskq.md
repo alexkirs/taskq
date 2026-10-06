@@ -196,9 +196,11 @@ in the amendment to csgo #241); it is no branch, so no CI runs; anyone may remov
 last page by the issue's comment count. There is no board (`init` says so; a column is the label filter in the
 issues list), no issue links (`deps` in the block is the source of truth), and `DELETE issues/N` is the GraphQL
 `deleteIssue` (admin; `selftest` closes instead when refused). `--filter` is GitHub's list-issues query
-(`labels=`, `assignee=<login>`, `milestone=<number>`). Pull requests are dropped from issue lists. GitHub's issue list lags a
-just-created issue by a moment (seen live 2026-10-06: a `take` right after `add` found no task, the selftest's
-`list` neither; a second later they did), so `add` waits until the list shows the new issue (up to 5 s).
+(`labels=`, `assignee=<login>`, `milestone=<number>`). Pull requests are dropped from issue lists. GitHub's REST issue list lags a
+just-created issue by up to half a minute (measured live 2026-10-06: 25–35 s, sometimes none; a `take` right after
+`add` found no task), while GraphQL shows it at once and reflects label changes at once — so issue lists are read
+through GraphQL (`repository.issues`, 100 per page, with `states`, `labels`, `filterBy`); single issues, comments,
+labels and refs stay REST.
 
 Live on alexkirs/taskq, 2026-10-06: `init` made the labels; the cycle add → tick → worker → take → beat ×2 (one
 note) → ask → tick shows the question → answer → take → result → tick shows the review → reject → take → release

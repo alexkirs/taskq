@@ -19,7 +19,7 @@ import socket
 import subprocess
 import sys
 import time
-from urllib.parse import parse_qs, quote, urlencode
+from urllib.parse import parse_qs, quote
 
 # Set from the project's taskq.toml by `configure`.
 PROJECT = PROJECT_PATH = ROOT = TICK_BEAT = HELPERS = None  # GitLab API prefix, `relates_to` target, main checkout
@@ -214,10 +214,17 @@ class Github:
     sends the full set (the labels last read in this process, else one GET). The lock is the ref
     `refs/taskq/lock/<N>` on a blob holding the time: a second POST is 422 for any user (atomic between users,
     owner's rule 2026-10-06), it is no branch so no CI runs, and anyone may remove it — the claim names the
-    holder. Lists are read whole on page 1 (pull requests dropped), later pages are empty. Dependencies have
-    no links here (`deps` in the block is the source of truth); there is no board."""
+    holder. Issue lists come from GraphQL: the REST list lags a new issue by up to half a minute, GraphQL shows
+    it at once (measured live 2026-10-06). Lists are read whole on page 1, later pages are empty. Dependencies
+    have no links here (`deps` in the block is the source of truth); there is no board."""
+    LIST = ('query($owner: String!, $name: String!, $states: [IssueState!], $labels: [String!], $filter: IssueFilters, $after: String) {'
+            ' repository(owner: $owner, name: $name) { issues(states: $states, labels: $labels, filterBy: $filter, first: 100, after: $after,'
+            ' orderBy: {field: CREATED_AT, direction: DESC}) { pageInfo { hasNextPage endCursor } nodes { number id title body state url'
+            ' createdAt updatedAt labels(first: 100) { nodes { name } } assignees(first: 10) { nodes { databaseId login } }'
+            ' milestone { number } comments { totalCount } } } } }')
+
     def __init__(self, repo, host=None):
-        self.repo, self.host, self.labels = repo, host, {}  # labels: issue number -> names last read
+        self.repo, self.host, self.labels, self.nodes = repo, host, {}, {}  # by issue number: label names last read, GraphQL id
 
     def run(self, method, path, body=None):
         own = path.startswith(('user', 'graphql'))
@@ -242,8 +249,30 @@ class Github:
                 return found
             page += 1
 
+    def node(self, item):
+        """A GraphQL issue node in the REST shape `issue` reads."""
+        return {'number': item['number'], 'node_id': item['id'], 'title': item['title'], 'body': item['body'],
+                'state': item['state'].lower(), 'html_url': item['url'], 'created_at': item['createdAt'], 'updated_at': item['updatedAt'],
+                'labels': item['labels']['nodes'], 'assignees': [{'id': each['databaseId'], 'login': each['login']} for each in item['assignees']['nodes']],
+                'milestone': item['milestone'], 'comments': item['comments']['totalCount']}
+
+    def listed(self, query):
+        """Every issue the GitLab-style `query` names, through GraphQL."""
+        states = {'opened': ['OPEN'], 'closed': ['CLOSED'], 'all': None}[query.get('state', 'opened')]
+        filters = {key: query[name] for name, key in (('assignee', 'assignee'), ('creator', 'createdBy'), ('milestone', 'milestoneNumber'), ('updated_after', 'since')) if name in query}
+        found, after = [], None
+        while True:
+            variables = {'owner': self.repo.split('/')[0], 'name': self.repo.split('/')[1], 'states': states,
+                         'labels': query['labels'].split(',') if query.get('labels') else None, 'filter': filters or None, 'after': after}
+            page = self.run('POST', 'graphql', {'query': self.LIST, 'variables': variables})['data']['repository']['issues']
+            found += [self.issue(self.node(item)) for item in page['nodes']]
+            if not page['pageInfo']['hasNextPage']:
+                return found
+            after = page['pageInfo']['endCursor']
+
     def issue(self, item):
         self.labels[item['number']] = [label['name'] for label in item['labels']]
+        self.nodes[item['number']] = item['node_id']
         return {'iid': item['number'], 'title': item['title'], 'description': item.get('body') or '',
                 'labels': self.labels[item['number']], 'state': 'opened' if item['state'] == 'open' else 'closed',
                 'assignees': [{'id': each['id'], 'username': each['login']} for each in item.get('assignees', [])],
@@ -289,26 +318,13 @@ class Github:
         if path.startswith('boards'):
             fail('GitHub has no board: the q-* labels are the columns')
         if method == 'POST' and path == 'issues':
-            made = self.issue(self.run('POST', 'issues', self.body(body)))
-            # GitHub's issue list lags a new issue by a moment (seen live 2026-10-06): wait until it shows, so the
-            # next command (list, take, the selftest) sees it. ponytail: 5 s cap, then the caller sees the lag.
-            for _ in range(10):  # newest first: page 1 is enough (`since=` is strict: it misses the same second)
-                if any(item['number'] == made['iid'] for item in self.run('GET', 'issues?state=open&per_page=100')):
-                    break
-                time.sleep(0.5)
-            return made
+            return self.issue(self.run('POST', 'issues', self.body(body)))
         if method == 'GET' and path.startswith('issues?'):
             if 'my_reaction_emoji' in query:  # every locked issue: the lock refs name them
                 numbers = [int(item['ref'].rsplit('/', 1)[1]) for item in self.run('GET', 'git/matching-refs/taskq/lock/')]
                 found = [self.issue(self.run('GET', f'issues/{number}')) for number in numbers]
                 return [item for item in found if query.get('state', 'opened') in ('all', item['state'])]
-            if later:
-                return []
-            params = {'state': {'opened': 'open'}.get(query.get('state', 'opened'), query.get('state', 'open'))}
-            params.update({key: query[key] for key in ('labels', 'assignee', 'milestone', 'creator') if key in query})
-            if 'updated_after' in query:
-                params['since'] = query['updated_after']
-            return [self.issue(item) for item in self.all('issues?' + urlencode(params)) if 'pull_request' not in item]
+            return [] if later else self.listed(query)
         iid = int(re.match(r'issues/(\d+)', path)[1])
         rest = path[len(f'issues/{iid}'):].partition('?')[0]
         if rest == '/award_emoji':
@@ -344,7 +360,7 @@ class Github:
         if rest.startswith('/notes/') and method == 'DELETE':
             return self.run('DELETE', f'issues/comments/{rest.rsplit("/", 1)[1]}')
         if method == 'DELETE':
-            node = self.run('GET', f'issues/{iid}')['node_id']
+            node = self.nodes.get(iid) or self.run('GET', f'issues/{iid}')['node_id']
             return self.run('POST', 'graphql', {'query': 'mutation($id: ID!) { deleteIssue(input: {issueId: $id}) { clientMutationId } }',
                                                 'variables': {'id': node}})
         if method == 'PUT':

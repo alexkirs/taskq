@@ -960,10 +960,21 @@ class GithubRest:
             return {'id': 1, 'login': 'alice'}
         if route.startswith('user/'):
             return {'id': int(route[5:]), 'login': {1: 'alice', 2: 'bob'}[int(route[5:])]}
-        if route == 'graphql':
+        if route == 'graphql' and 'deleteIssue' in body['query']:
             number = next(number for number, issue in self.issues.items() if issue['node_id'] == body['variables']['id'])
             del self.issues[number]
             return {'data': {}}
+        if route == 'graphql':
+            found = body['variables']
+            items = [issue for issue in self.issues.values() if not found['states'] or issue['state'].upper() in found['states']
+                     and all(name in [label['name'] for label in issue['labels']] for name in found['labels'] or [])
+                     and (not (found['filter'] or {}).get('since') or issue['updated_at'] >= found['filter']['since'])]
+            nodes = [{'number': i['number'], 'id': i['node_id'], 'title': i['title'], 'body': i['body'], 'state': i['state'].upper(),
+                      'url': i['html_url'], 'createdAt': i['created_at'], 'updatedAt': i['updated_at'], 'labels': {'nodes': i['labels']},
+                      'assignees': {'nodes': [{'databaseId': a['id'], 'login': a['login']} for a in i['assignees']]},
+                      'milestone': i['milestone'], 'comments': {'totalCount': sum(c['issue'] == i['number'] for c in self.comments.values())}}
+                     for i in items]
+            return {'data': {'repository': {'issues': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}}}
         if route == 'milestones':
             return [{'number': 5, 'title': 'Maps'}]
         if route == 'labels':

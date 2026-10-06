@@ -67,6 +67,82 @@ def tick_beat():
     if minutes >= TICK_LIVE_MINUTES:
         print(f'If a timer is armed: no tick for {minutes} min (expected every {TICK_MINUTES}): check CronList, '
               'end a long turn or background loops in the coordinator session, re-arm (manager contract § 2).')
+
+
+LEASE_MINUTES = 15  # a coordinator that missed this long of ticks hands the profile to the next machine that ticks
+LEASE_LABEL = 'taskq-coordinator'  # GitLab: the closed issue holding a profile's lease
+
+
+def lease_key(profile):
+    """#44: one coordinator per profile across machines. The profile is the queue part (filter, mine and whose),
+    not the machine's limits: machines with other limits still share the same tasks."""
+    return hashlib.sha256(json.dumps([profile['filter'], profile['mine'] and profile['uid']]).encode()).hexdigest()[:12]
+
+
+def lease_issue(key, create=False):
+    """GitLab has no free refs: a profile's lease is the description of a closed issue, its award emoji the lock."""
+    title = f'taskq coordinator {key}'
+    found = min((issue['iid'] for issue in core.issues(f'state=all&labels={LEASE_LABEL}') if issue['title'] == title), default=None)
+    if found or not create:
+        return found
+    found = core.api('POST', 'issues', {'title': title, 'description': 'null', 'labels': LEASE_LABEL})['iid']
+    core.api('PUT', f'issues/{found}', {'description': 'null', 'state_event': 'close'})
+    return found
+
+
+def lease(key):
+    """The coordinator lease of `key`: {node, since, at} (epoch seconds), or None."""
+    if not core.BOARDS:  # GitHub: the store's ref refs/taskq/coordinator/<key>
+        return core.api('GET', f'coordinator/{key}')
+    iid = lease_issue(key)
+    return iid and json.loads(core.api('GET', f'issues/{iid}')['description'] or 'null')
+
+
+def write_lease(key, held, mine):
+    """Renew our lease, or take one that is missing or expired. A take is atomic like the task lock: GitHub's
+    POST of the ref is 422 when another machine was faster; on GitLab the issue's lock guards a compare and write.
+    ponytail: on GitHub two machines taking the same expired lease at once may both delete and post; the one
+    whose ref stays is the holder from the next tick on."""
+    renew = held and held['node'] == mine['node'] and mine['since'] == held['since']
+    if not core.BOARDS:
+        if renew:
+            return core.api('PUT', f'coordinator/{key}', mine)
+        if held:
+            core.api('DELETE', f'coordinator/{key}')
+        try:
+            core.api('POST', f'coordinator/{key}', mine)
+        except SystemExit as error:
+            if not any(text in str(error) for text in core.TAKEN):
+                raise
+        return
+    iid = lease_issue(key, create=True)
+    if renew:
+        return core.api('PUT', f'issues/{iid}', {'description': json.dumps(mine)})
+    if core.lock(iid):
+        try:
+            if lease(key) == held:
+                core.api('PUT', f'issues/{iid}', {'description': json.dumps(mine)})
+        finally:
+            core.unlock(iid)
+    elif all(time.time() - core.stamp(item['created_at']) > core.LOCK_SECONDS for item in core.locks(iid)):
+        core.unlock(iid)  # a tick that died holding it: the next tick takes the lease
+
+
+def coordinator(profile):
+    """The lease after this tick: a machine holds it while it ticks at least every LEASE_MINUTES; a missing or
+    expired one goes to this machine. Prints who holds it."""
+    key, now = lease_key(profile), int(time.time())
+    held = lease(key)
+    fresh = bool(held) and now - held['at'] < LEASE_MINUTES * 60
+    if not fresh or held['node'] == core.node():
+        write_lease(key, held, {'node': core.node(), 'since': held['since'] if fresh else now, 'at': now})
+        held = lease(key)
+    if held:
+        mine = ' (this machine)' if held['node'] == core.node() else ''
+        print(f'coordinator: {core.where(held)[2:]}{mine} since {time.strftime("%Y-%m-%d %H:%M", time.localtime(held["since"]))}')
+    return held
+
+
 TICK_PROMPT_VERSION = 2  # raise with every change of TICK_PROMPT: an older --prompt-version gets the re-arm line
 # The coordinator timer's prompt, word for word as in manager contract § 2 (a test keeps them equal).
 TICK_PROMPT = f"""taskq tick prompt v{TICK_PROMPT_VERSION}. Run `cd <main checkout> && taskq update; taskq tick --prompt-version {TICK_PROMPT_VERSION}`
@@ -171,6 +247,38 @@ NUDGE = 'Continue the assigned task; hand in result or ask the owner through tas
 WAKE_PROMPT = ('taskq tick --act (the launchd timer) found what needs judgement; it already did the mechanical steps '
                '(spawn, retire, nudges). Do the coordinator pass by taskq-manager.md § 3 on the output below; do not run '
                '`taskq tick` again in this turn. Reply in the owner\'s language.\n\n')
+
+
+def starts(args, loaded, selected):
+    """The tasks to start on this machine now, each with its runtime, within this machine's free places."""
+    free, start = core.room(loaded[0], args.profile['limits']), []
+    preferred = args.profile['preferred_runtime']
+    for item in core.startable(loaded=loaded):
+        if item['iid'] not in selected:
+            continue
+        # The preferred runtime only breaks the tie for the user's own `any` task, and only while it has a free slot.
+        own = item.get('assignees') == [args.profile['uid']] and preferred and free.get(preferred, 0) > 0
+        who = item['runtime'] or (preferred if own else max(free, key=free.get))
+        if free[who] > 0:
+            free[who] -= 1
+            start.append({**item, 'runtime': who})
+    return start
+
+
+def launch(args, start, act, step):
+    """Start the workers: `act` spawns each itself (a step), else the commands for the coordinator."""
+    if start and act:
+        for item in start:
+            step(f'spawn a {item["runtime"]} worker for {core.ref(item)}', lambda item=item: core.spawn(argparse.Namespace(
+                runtime=item['runtime'], name=f'T{item["iid"]} {item["title"][:40]}', remote_control=True, text=worker_prompt(args))))
+    elif start:
+        # One command per worker: the session starts on the prompt, no second message (#41).
+        # An indented block, not inline code: the prompt itself holds backticks.
+        print(f'## Start {len(start)} worker session(s)\n\n' + ''.join(f'- {core.ref(item)} {item["title"]}: {item["runtime"]}\n' for item in start)
+              + '\nRun each command once; the worker starts on the brief at once:\n\n' + ''.join('    ' + shlex.join([core.TOOL, 'spawn', '--runtime', item['runtime'], '--name',
+                                             f'T{item["iid"]} {item["title"][:40]}', '--text', worker_prompt(args)]) + '\n'
+                        for item in start))
+
 
 
 def tick(args):
@@ -287,13 +395,24 @@ def tick_pass(args, act=False):
     contract_news(args.prompt_version)
     loaded, candidates = core.profile(args)
     selected = {item['iid'] for item in candidates}
-    stalled = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and core.age(item) > core.STALE_MINUTES]
+    # Only the lease holder starts workers, accepts reviews and shows questions; another machine releases its own work.
+    holder = (coordinator(args.profile) or {}).get('node') == core.node()
+    stalled = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and core.age(item) > core.STALE_MINUTES
+               and (holder or core.local_claim(item['claim'] or {}))]
     for item in stalled:
         if not core.unchanged(item):
             continue
         args.iid, args.action, args.text = item['iid'], 'release', f'no change on the issue for {core.age(item)} minutes'
         core.requeue(args)
         print(f'Released stalled {core.ref(item)}.')
+    if not holder:
+        # A task pinned to this machine (`host-<name>`) starts only here: the coordinator elsewhere cannot start it.
+        start = starts(args, core.load() if stalled else loaded, {item['iid'] for item in candidates if item.get('host') == core.machine()})
+        if not start:
+            return print('Another machine coordinates this profile: this tick released only its own stalled work. Say so and stop.')
+        print('Another machine coordinates this profile: start only the workers pinned to this machine.\n')
+        launch(args, start, act, step)
+        return failed
     loaded = core.load() if stalled else loaded
     # A lock on a task nobody holds: a take that died between the lock and the move, or a card moved by hand.
     held = {item['iid'] for item in loaded[0] if item['state'] not in ('ready', 'waiting')}
@@ -321,7 +440,6 @@ def tick_pass(args, act=False):
         moved += 1
         print(f'Moved {core.ref(item)} {item["state"]} → {"ready" if item["state"] == "waiting" else "waiting"}.')
     everything, _, odd, problems, inbox = loaded = core.load() if moved else loaded
-    inventory = everything
     everything = [item for item in everything if item['iid'] in selected]
     review = [item for item in everything if item['state'] == 'review' and item['result']]
     # A question reaches the owner once, when it is new; the ones already shown come back as a daily summary.
@@ -336,17 +454,7 @@ def tick_pass(args, act=False):
         for item in everything if item['state'] == 'doing' and not (item['claim'] or {}).get('session')] + [
         f'{core.ref(item)} is in review without a result: `reject {item["iid"]}` or close it by hand'
         for item in everything if item['state'] == 'review' and not item['result']] + misplaced
-    free, start = core.room(inventory, args.profile['limits']), []
-    preferred = args.profile['preferred_runtime']
-    for item in core.startable(loaded=loaded):
-        if item['iid'] not in selected:
-            continue
-        # The preferred runtime only breaks the tie for the user's own `any` task, and only while it has a free slot.
-        own = item.get('assignees') == [args.profile['uid']] and preferred and free.get(preferred, 0) > 0
-        who = item['runtime'] or (preferred if own else max(free, key=free.get))
-        if free[who] > 0:
-            free[who] -= 1
-            start.append({**item, 'runtime': who})
+    start = starts(args, loaded, selected)
     if not (review or fresh or summary or start or codex_stopped or odd or problems) and not any(item['state'] == 'doing' for item in everything):
         if act:
             retire_closed(log)
@@ -423,17 +531,7 @@ def tick_pass(args, act=False):
               f'Not accepted: `{core.TOOL} reject {item["iid"]} --text "<what to fix>"`.\n')
         if (item['claim'] or {}).get('runtime') == 'codex' and not core.local_claim(item['claim']):
             print(f'After close, archive its Codex session on its machine: `{core.TOOL} codex-archive {item["claim"]["session"]}`.\n')
-    if start and act:
-        for item in start:
-            step(f'spawn a {item["runtime"]} worker for {core.ref(item)}', lambda item=item: core.spawn(argparse.Namespace(
-                runtime=item['runtime'], name=f'T{item["iid"]} {item["title"][:40]}', remote_control=True, text=worker_prompt(args))))
-    elif start:
-        # One command per worker: the session starts on the prompt, no second message (#41).
-        # An indented block, not inline code: the prompt itself holds backticks.
-        print(f'## Start {len(start)} worker session(s)\n\n' + ''.join(f'- {core.ref(item)} {item["title"]}: {item["runtime"]}\n' for item in start)
-              + '\nRun each command once; the worker starts on the brief at once:\n\n' + ''.join('    ' + shlex.join([core.TOOL, 'spawn', '--runtime', item['runtime'], '--name',
-                                             f'T{item["iid"]} {item["title"][:40]}', '--text', worker_prompt(args)]) + '\n'
-                        for item in start))
+    launch(args, start, act, step)
     if fresh:
         print('## Waiting for the owner\n\nNew questions. Do not answer these yourself. End your reply with this list, verbatim:\n')
         print(core.data('\n'.join(f'- {core.ref(item)} {item["title"]}: {text}' for item, text in fresh)))

@@ -129,6 +129,42 @@ def tick_links(case, issues, commits):
     case.assertIn(f'{issues}{iid} t', case.do(COORDINATOR, 'list', '--links'))
 
 
+def coordinator_lease(case):
+    """#44: one coordinator per profile across machines. Mac ticks first and holds the lease; win only releases its
+    own stalled work and starts what is pinned to it; a lease not renewed for LEASE_MINUTES goes to the next tick."""
+    win = {'CLAUDE_CODE_SESSION_ID': 'win-session', 'CODEX_THREAD_ID': ''}
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.object(q, 'HOSTS', {'mac-1.local': 'mac', 'win-2.lan': 'win'}))
+        stack.enter_context(patch.dict(os.environ, {'TASKQ_HOST': ''}))
+        hostname = stack.enter_context(patch.object(q.socket, 'gethostname', return_value='mac-1.local'))
+        mac_task, win_task, free = (case.add('--type', 'code', '--runtime', 'claude', '--scope', name) for name in 'abd')
+        pinned = case.add('--type', 'code', '--runtime', 'claude', '--scope', 'c', '--host', 'win')
+        case.do(CLAUDE, 'take', mac_task)
+        hostname.return_value = 'win-2.lan'
+        case.do(win, 'take', win_task)
+        hostname.return_value = 'mac-1.local'
+        first = case.do(COORDINATOR, 'tick')
+        case.assertRegex(first, r'coordinator: mac \(this machine\) since \d{4}-\d\d-\d\d \d\d:\d\d')
+        case.assertIn(f"--name 'T{free} t'", first)
+        lease = tick.lease(tick.lease_key({'filter': '', 'mine': False, 'uid': 1}))
+        case.assertEqual(lease['node'], q.node('mac-1.local'))
+        hostname.return_value = 'win-2.lan'
+        with patch.object(q, 'STALE_MINUTES', -1):
+            second = case.do(win, 'tick')
+        case.assertIn('coordinator: mac since', second)
+        case.assertEqual((case.state(win_task), case.state(mac_task)), ('ready', 'doing'))  # its own stalled work only
+        case.assertIn(f"--name 'T{pinned} t'", second)  # pinned to win: only win can start it
+        case.assertNotIn(f"--name 'T{free} t'", second)
+        with patch.object(tick, 'LEASE_MINUTES', 0):  # mac stopped ticking: the lease expired
+            third = case.do(win, 'tick')
+        case.assertIn('coordinator: win (this machine) since', third)
+        hostname.return_value = 'mac-1.local'
+        case.assertIn('coordinator: win since', case.do(COORDINATOR, 'tick'))
+        hostname.return_value = 'win-2.lan'
+        case.do(win, 'tick')
+        case.assertEqual(tick.lease(tick.lease_key({'filter': '', 'mine': False, 'uid': 1}))['node'], q.node('win-2.lan'))
+
+
 class Gitlab:
     """Issues, labels and notes the way taskq uses them; note ids are the server order, times are real."""
     def __init__(self):
@@ -136,7 +172,7 @@ class Gitlab:
         self.milestones = [{'id': 5, 'title': 'Maps'}]
         self.awards, self.events = {}, {}  # award emoji by id; label events by issue
         self.uid = 1
-        self.clock = 0
+        self.clock = self.created = 0
         self.access = 30  # Developer
         self.members = {1: 30, 2: 30}  # access level by user id; others comment as outsiders
 
@@ -186,7 +222,7 @@ class Gitlab:
                 return item
             return self.boards[-1] if method == 'POST' else self.boards
         if method == 'POST' and path == 'issues':
-            iid = len(self.issues) + 1
+            iid = self.created = self.created + 1  # GitLab never reuses a deleted issue's iid
             self.issues[iid] = {'iid': iid, 'state': 'opened', 'web_url': f'{GL}{iid}', 'title': body['title'],
                                 'description': body['description'], 'labels': body['labels'].split(','),
                                 'assignees': [{'id': uid} for uid in body.get('assignee_ids', [])],
@@ -252,6 +288,10 @@ class Gitlab:
                 issue['state'] = 'closed'
         return issue
 
+    def tasks(self):
+        """Every issue but the closed ones holding a coordinator lease."""
+        return sorted(iid for iid, issue in self.issues.items() if tick.LEASE_LABEL not in issue['labels'])
+
     def said(self, iid):
         return [note['body'] for note in self.notes.values() if note['iid'] == iid]
 
@@ -314,7 +354,7 @@ class Cycle(unittest.TestCase):
 
     def add(self, *extra):
         self.do(CLAUDE, 'add', '--title', 't', '--goal', 'g', '--acceptance', 'a', *extra)
-        return len(self.gitlab.issues)
+        return self.gitlab.created
 
     def state(self, iid):
         return q.parse(self.gitlab.issues[iid])['state']
@@ -534,6 +574,11 @@ class Cycle(unittest.TestCase):
                 store.run('GET', 'issues/7')
             self.assertEqual(answers, [good])
 
+    def test_one_coordinator_per_profile_across_machines(self):
+        coordinator_lease(self)
+        self.assertEqual(len(self.gitlab.issues) - len(self.gitlab.tasks()), 1)  # the closed issue holding the lease
+        self.assertLessEqual(set(self.gitlab.locked()), set(self.gitlab.tasks()))  # its lock is held only while writing
+
     def test_award_on_a_deleted_issue_does_not_break_tick(self):
         iid = self.add('--type', 'research')
         self.assertTrue(q.lock(iid))
@@ -550,7 +595,7 @@ class Cycle(unittest.TestCase):
         self.do(CLAUDE, 'beat', iid)
         self.assertEqual([body.split(' ')[0] for body in self.gitlab.said(iid)], ['**take**', '**beat**', '**problem**', '**beat**'])
         self.assertIn('/issues/', self.do(CLAUDE, 'problem', '--text', 'glab hung\nfor a minute'))
-        problem = len(self.gitlab.issues)
+        problem = self.gitlab.created
         self.assertEqual(self.gitlab.issues[problem]['labels'], ['problem'])
         self.assertIn(f'{link(problem)} problem: glab hung', self.do(COORDINATOR, 'tick'))
         self.assertIn(f'#{problem}    problem  problem: glab hung', self.do(COORDINATOR, 'list'))
@@ -1413,7 +1458,7 @@ class Cycle(unittest.TestCase):
         code, idle = self.add('--type', 'code', '--runtime', 'claude'), self.add('--type', 'asset')
         output, status, log = act()
         self.assertEqual((output, status), ('', 0))
-        self.assertEqual(spawned, ['T1 t', 'T2 t'])
+        self.assertEqual(spawned, [f'T{code} t', f'T{idle} t'])
         self.assertIn('Done: spawn a claude worker for', log)
         self.do(CLAUDE, 'take', code)
         self.do(CODEX, 'take', idle)
@@ -1521,6 +1566,9 @@ class GithubRest:
     def label(self, name):
         return self.labels.get(name) or {'id': 0, 'name': name}
 
+    def locks(self):
+        return sorted(ref for ref in self.refs if ref.startswith('refs/taskq/lock/'))
+
     def page(self, items, query):
         found = {key: value[0] for key, value in q.parse_qs(query).items()}
         size, page = int(found.get('per_page', 30)), int(found.get('page', 1))
@@ -1582,6 +1630,9 @@ class GithubRest:
             if ref not in self.refs:
                 q.fail('GitHub GET failed: {"message":"Not Found","status":"404"}')
             return {'ref': ref, 'object': {'sha': self.refs[ref]}}
+        if route.startswith('git/refs/') and method == 'PATCH':
+            self.refs['refs/' + route[9:]] = body['sha']
+            return {'ref': 'refs/' + route[9:], 'object': {'sha': body['sha']}}
         if route.startswith('git/refs/'):
             del self.refs['refs/' + route[9:]]
             return None
@@ -1704,7 +1755,7 @@ class GithubCycle(unittest.TestCase):
         self.do(CLAUDE, 'close', number, '--text', 'ok')
         self.assertEqual(self.github.issues[number]['state'], 'closed')
         self.assertFalse([name for name in self.names(number) if name.startswith('q-')])
-        self.assertEqual(self.github.refs, {})
+        self.assertEqual(self.github.locks(), [])
         self.assertIn(f'#{number}: take → ask', self.do(CLAUDE, 'report'))
 
     def test_outsiders_issues_are_no_tasks_and_tick_names_them_in_the_inbox(self):
@@ -1743,7 +1794,7 @@ class GithubCycle(unittest.TestCase):
         self.assertFalse(q.lock(number))  # 422 Reference already exists
         with patch.object(q, 'LOCK_SECONDS', -1):
             self.assertIn(f'Unlocked {link(number, GH)}', self.do(CLAUDE, 'tick'))
-        self.assertEqual(self.github.refs, {})
+        self.assertEqual(self.github.locks(), [])
         other = {'CLAUDE_CODE_SESSION_ID': 'other-machine', 'CODEX_THREAD_ID': ''}
         self.do(other, 'take', number)
         with self.assertRaises(SystemExit) as refused, contextlib.redirect_stdout(io.StringIO()):
@@ -1751,13 +1802,17 @@ class GithubCycle(unittest.TestCase):
                 q.main(['take', str(number)])
         self.assertIn('cannot start', str(refused.exception))
 
+    def test_one_coordinator_per_profile_across_machines(self):
+        coordinator_lease(self)
+        self.assertEqual([ref for ref in self.github.refs if 'coordinator' in ref], ['refs/taskq/coordinator/' + tick.lease_key({'filter': '', 'mine': False, 'uid': 1})])
+
     def test_lock_ref_of_a_deleted_or_closed_issue_does_not_break_tick(self):
         deleted, closed = self.add('--type', 'code'), self.add('--type', 'code')
         self.assertTrue(q.lock(deleted) and q.lock(closed))
         q.api('DELETE', f'issues/{deleted}')
         self.github.issues[closed]['state'] = 'closed'  # closed by hand, its lock left
         self.do(COORDINATOR, 'tick')  # was: GitHub GET issues/1 failed: gh: This issue was deleted (HTTP 410)
-        self.assertEqual(sorted(self.github.refs), [f'refs/taskq/lock/{closed}'])  # the deleted issue's ref is removed
+        self.assertEqual(self.github.locks(), [f'refs/taskq/lock/{closed}'])  # the deleted issue's ref is removed
         self.do(COORDINATOR, 'tick')
 
     def test_newest_comment_is_read_from_the_last_page(self):
@@ -1926,7 +1981,7 @@ class Selftest(unittest.TestCase):
         for mechanism in ('| add |', '| take, claim, assignee |', '| ask |', '| tick: question |', '| answer |',
                           '| result |', '| tick: review |', '| close |', '| remove the selftest tasks |'):
             self.assertIn(mechanism, report)
-        self.assertEqual(sorted(self.gitlab.issues), [99])  # the selftest tasks are deleted
+        self.assertEqual(self.gitlab.tasks(), [99])  # the selftest tasks are deleted
         self.assertTrue(self.gitlab.said(99)[-1].startswith('**selftest** · claude:coordina'))
         self.assertFalse(self.gitlab.locked())
         self.assertFalse((self.directory / 'beat').exists())  # the real tick's last-run time is untouched
@@ -1954,7 +2009,7 @@ class Selftest(unittest.TestCase):
             self.record(4242, [live])
             report = self.do(COORDINATOR, 'selftest', '--scope', 'quick')  # check would refuse: a run is alive
         self.assertIn('13 of 13 ok', report)
-        self.assertEqual(sorted(self.gitlab.issues), [live])  # the live run's task is not a leftover
+        self.assertEqual(self.gitlab.tasks(), [live])  # the live run's task is not a leftover
         self.assertFalse(self.gitlab.locked())
         self.assertFalse(path.exists())
 

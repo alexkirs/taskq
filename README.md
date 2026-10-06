@@ -3,7 +3,11 @@
   <br><em>Agents working.</em>
 </p>
 
-A shared task queue for Claude Code and Codex.
+Your repository board is the task list; your usual AI apps do the work.
+Add taskq, then ask Codex or Claude to turn any request into tickets.
+A timer picks up tickets, runs as many workers as you choose, and tracks progress.
+Taskq collects stats and suggests improvements, with no extra worker apps required.
+You stay in control: tasks wait for your input and continue when you reply.
 
 1. **Set up (once per project)**<br>
    Tell your agent: "Install taskq from https://github.com/alexkirs/taskq and set it up."

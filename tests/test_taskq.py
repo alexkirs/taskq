@@ -1766,6 +1766,37 @@ class Selftest(unittest.TestCase):
         self.assertIn('the job w2 failed at once', str(caught.exception))
         self.assertEqual(runs, [['claude', '--bg', '--resume', 'w1-session', 'Run the brief']])
 
+    def test_full_waits_for_the_note_after_the_state_label(self):
+        """#73: save() moves the label first and posts the note a moment later; the step polls on until both are there."""
+        test = q.Selftest(argparse.Namespace(worker_env=[], wait=30))
+        pending, held, sends = [], [], [0]
+
+        def run(*argv):
+            test.worker('codex', 'w1-thread', *argv)
+
+        def late_result(iid):  # the poll sees label review while the newest note is still **beat**
+            run('result', iid, '--checks', 'selftest', '--text', 'selftest result')
+            held.append(self.gitlab.notes.pop(max(self.gitlab.notes)))
+
+        def send(args):  # the first turn takes, then beats and asks; every later turn ends in a late result
+            iid, sends[0] = max(test.created), sends[0] + 1
+            pending.extend([lambda: run('take', iid), lambda: (run('beat', iid), run('ask', iid, '--text', 'which?'))] if sends[0] == 1
+                           else [lambda: (run('take', iid), run('beat', iid), late_result(iid))])
+            pending.pop(0)()
+
+        def sleep(seconds):
+            if held:
+                note = held.pop()
+                self.gitlab.notes[note['id']] = note
+            elif pending:
+                pending.pop(0)()
+        with patch.object(q, 'codex_spawn', lambda name: 'w1-thread'), patch.object(q, 'codex_send', send), \
+                patch.object(q.time, 'sleep', sleep), patch.object(q, 'selftest_retire', lambda runtime, session: 'archived'):
+            test.full('codex')
+        rows = {row[0]: row for row in test.rows}
+        self.assertEqual([row[2] for row in test.rows], ['ok'] * len(test.rows), test.rows)
+        self.assertIn('note **result**', rows['answer, take again, result'][4])
+
     def test_a_selftest_task_is_only_for_a_profile_naming_it(self):
         iid = self.add('--type', 'research', '--label', 'selftest')
         self.assertIn('No task can start now', self.do(CLAUDE, 'worker'))

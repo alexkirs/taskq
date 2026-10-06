@@ -3029,11 +3029,14 @@ class Selftest:
 
         def until(state, action):
             """Poll GitLab until the worker moved the task; a turn that ended without moving it is a failure."""
-            end, ended = time.time() + self.args.wait, None
+            end, ended, wrong = time.time() + self.args.wait, None, None
             while time.time() < end:
                 item = parse(api('GET', f'issues/{iid}')) or {}
                 if item.get('state') == state:
-                    return self.fact(iid, state, session if state in ('doing', 'ask') else None, action)
+                    try:  # #73: save() moves the label before it posts the note: poll on until the note is there too
+                        return self.fact(iid, state, session if state in ('doing', 'ask') else None, action)
+                    except SelftestError as error:
+                        wrong = error
                 # A `send` that exits 0 may only have queued the turn (a webhook): then wait the full time.
                 if process and process.poll() is not None and (process.returncode or runtime not in EXECUTORS):
                     ended = ended or time.time()
@@ -3041,7 +3044,7 @@ class Selftest:
                         raise SelftestError(f'#{iid} is {item.get("state")}, the worker turn ended: '
                                             f'{last_line(log.read_text() if log.exists() else "")}')
                 time.sleep(5)
-            raise SelftestError(f'#{iid} not {state} after {self.args.wait} s')
+            raise wrong or SelftestError(f'#{iid} not {state} after {self.args.wait} s')
 
         def add():
             nonlocal iid

@@ -265,7 +265,8 @@ class Github:
             variables = {'owner': self.repo.split('/')[0], 'name': self.repo.split('/')[1], 'states': states,
                          'labels': query['labels'].split(',') if query.get('labels') else None, 'filter': filters or None, 'after': after}
             page = self.run('POST', 'graphql', {'query': self.LIST, 'variables': variables})['data']['repository']['issues']
-            found += [self.issue(self.node(item)) for item in page['nodes']]
+            wanted = set(variables['labels'] or ())  # GraphQL `labels` is any-of; GitLab's `labels=` is all-of
+            found += [self.issue(self.node(item)) for item in page['nodes'] if wanted <= {label['name'] for label in item['labels']['nodes']}]
             if not page['pageInfo']['hasNextPage']:
                 return found
             after = page['pageInfo']['endCursor']

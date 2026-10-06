@@ -966,8 +966,8 @@ class GithubRest:
             return {'data': {}}
         if route == 'graphql':
             found = body['variables']
-            items = [issue for issue in self.issues.values() if not found['states'] or issue['state'].upper() in found['states']
-                     and all(name in [label['name'] for label in issue['labels']] for name in found['labels'] or [])
+            items = [issue for issue in self.issues.values() if (not found['states'] or issue['state'].upper() in found['states'])
+                     and any(name in [label['name'] for label in issue['labels']] for name in found['labels'] or [None])
                      and (not (found['filter'] or {}).get('since') or issue['updated_at'] >= found['filter']['since'])]
             nodes = [{'number': i['number'], 'id': i['node_id'], 'title': i['title'], 'body': i['body'], 'state': i['state'].upper(),
                       'url': i['html_url'], 'createdAt': i['created_at'], 'updatedAt': i['updated_at'], 'labels': {'nodes': i['labels']},
@@ -1133,6 +1133,12 @@ class GithubCycle(unittest.TestCase):
         self.assertEqual(paged, [f'issues/{number}/comments?per_page=100&page=2'])  # the newest: one page, not 106 comments
         self.assertEqual(sum(item['body'].startswith('**beat**') for item in self.github.comments.values()), 105)
         self.assertEqual([item['body'] for item in q.api('GET', f'issues/{number}/notes?sort=desc&per_page=1')], ['**beat** · claude:claude-s'])
+
+    def test_label_filter_is_all_of_like_gitlab(self):
+        first, second = self.add('--type', 'research', '--area', 'maps'), self.add('--type', 'docs', '--area', 'engine')
+        self.github.issues[second]['labels'].append({'id': 0, 'name': 'extra'})
+        listed = [item['iid'] for item in q.api('GET', 'issues?state=opened&labels=area-engine,extra')]
+        self.assertEqual(listed, [second])  # GraphQL answers any-of ([first, second] here); the store keeps all-of
 
     def test_init_writes_a_github_config(self):
         with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp), contextlib.redirect_stdout(io.StringIO()) as out:

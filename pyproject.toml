@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taskq"
+version = "0"
+description = "One GitLab-issue task queue for Claude and Codex sessions, shared by all projects"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[project.scripts]
+taskq = "taskq:main"
+
+[tool.setuptools]
+packages = ["taskq"]
+
+[tool.setuptools.package-data]
+taskq = ["contracts/*.md"]

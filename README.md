@@ -25,13 +25,23 @@ Tell your agent: **“Install taskq from https://github.com/alexkirs/taskq in th
 
 ## Setup
 
-Agent: read the [manager onboarding](taskq/contracts/taskq-manager.md#1-first-use-and-check-the-place)
-first; inspect readiness and offer instructions or setup by the agent before making changes.
-Once installed, `taskq contract` locates both contracts. Resolve placeholders from
-`git remote get-url origin`; run the matching commands only under the chosen setup mode.
+Agent: the sentences above start the manager's onboarding
+([first use](taskq/contracts/taskq-manager.md#1-first-use-and-check-the-place)); do not run the
+reference commands below straight through.
+
+1. Check read-only: `git remote get-url origin`, `taskq --help` (if missing: `python3 --version`, `pipx --version`).
+   With taskq installed: `taskq contract`, read both contracts, then `taskq doctor`.
+2. Nothing missing: say so, show the profile card, stop.
+3. Otherwise ask once: “Setup needs: [missing items]. Choose ‘instructions’ for steps you run,
+   or ‘do it for me’ for setup I run. Neither starts workers or a timer.”
+   - **instructions**: print the missing steps, numbered, one command each; check each after the person's ‘done’.
+   - **do it for me**: ask once for setup authority (the contract's wording), then install what is missing
+     and run `taskq doctor --fix`. Its `you:` lines are the person's: show each command, wait for ‘done’, rerun.
+4. Setup never starts workers, arms a tick or runs `selftest`; it ends with the contract's summary line.
+
 Requirements: Python 3.11+, [pipx](https://pipx.pypa.io/stable/installation/),
 and [glab](https://gitlab.com/gitlab-org/cli) (GitLab) or [gh](https://cli.github.com) (GitHub).
-If login needs the person, report it and resume after login.
+Reference commands (placeholders from `git remote get-url origin`):
 
 ```bash
 # If taskq is not installed:

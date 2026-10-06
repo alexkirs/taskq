@@ -820,7 +820,10 @@ def main(argv=None):
         write_config(not args.project, where, args.host)
     if PROJECT is None and args.function not in (contract, update, doctor):
         configure()
-    args.function(args)
+    if args.function(args) and args.function is update:
+        # #93: like auto_update, go on as the new install; `--version` prints its version and cannot update again
+        sys.stdout.flush()
+        os.execv(sys.executable, [sys.executable, '-m', 'taskq', '--version'])
 
 
 if __name__ == '__main__':

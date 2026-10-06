@@ -2693,6 +2693,23 @@ class Update(unittest.TestCase):
         self.assertIn('-m pip install -q --force-reinstall git+', out.getvalue())
         self.assertIn('failed: ERROR: no network', out.getvalue())
 
+    def test_explicit_update_execs_the_new_install_once(self):
+        execs, outcome = [], [True]
+        def update(args):
+            print('update said its line')
+            return outcome[0]
+        with patch.object(q, 'update', update), patch.object(q.os, 'execv', lambda *command: execs.append(command)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            q.main(['update'])
+            self.assertEqual(execs, [(q.sys.executable, [q.sys.executable, '-m', 'taskq', '--version'])])
+            q.main(execs[0][1][3:])  # what the exec runs: prints the version, no second update or exec
+            self.assertEqual(len(execs), 1)
+            for outcome[0] in (None, False):  # refused, up to date, skipped
+                q.main(['update'])
+            self.assertEqual(len(execs), 1)
+        self.assertEqual(out.getvalue().count('update said its line'), 3)
+        self.assertIn(f'taskq {q.version()}', out.getvalue())
+
     def test_tick_checks_at_most_every_and_never_when_off(self):
         stamp, done = self.root / 'state' / 'update-last', []
         def update(args):

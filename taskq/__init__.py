@@ -6,7 +6,9 @@ is the rest of its data, the notes are its history. Nothing local stores task st
 Everything specific to a project is its `taskq.toml`. Contracts: `taskq contract`.
 """
 import argparse
+import contextlib
 from datetime import datetime
+import io
 import json
 import os
 from pathlib import Path
@@ -127,6 +129,9 @@ def configure(path=None):
     ROOT = main_checkout(path.parent)
     TICK_BEAT = ROOT / '.local' / 'taskq-tick-last'
     WORKER = f'Run `cd {ROOT} && {TOOL} worker` and follow the instructions it prints.'
+    # A new worker app is one table: its session variable, and the commands `selftest` drives it with.
+    for name, item in config.get('runtimes', {}).items():
+        RUNTIMES[name], EXECUTORS[name] = item['env'], item
 
 
 def complete(path):
@@ -174,8 +179,11 @@ def api(method, path, body=None):
     command = ['glab', 'api', '-X', method, path[1:] if path.startswith('/') else f'{PROJECT}/{path}'] + (['--hostname', HOST] if HOST else [])
     if body is not None:
         command += ['--input', '-', '-H', 'Content-Type: application/json']
+    started = time.time()
     done = subprocess.run(command, input=json.dumps(body) if body is not None else None,
                           capture_output=True, text=True, timeout=60)
+    if os.environ.get('TASKQ_TRACE'):
+        print(f'taskq trace: {method} {path[:90]} {time.time() - started:.2f} s', file=sys.stderr)
     if done.returncode:
         fail(f'GitLab {method} {path} failed: {done.stderr.strip() or done.stdout.strip()}')
     return json.loads(done.stdout) if done.stdout.strip() else None
@@ -201,7 +209,7 @@ def parse(issue):
     return {**json.loads(found.group(1)), 'iid': issue['iid'], 'title': issue['title'], 'state': states[0],
             'type': next((label for label in labels if label in TYPES), None),
             'runtime': next((label[len(RUN):] for label in labels if label.startswith(RUN)), None),
-            'assignees': [user['id'] for user in issue.get('assignees', [])],
+            'assignees': [user['id'] for user in issue.get('assignees', [])], 'selftest': SELFTEST in labels,
             'priority': min([int(label[9:]) for label in labels if re.fullmatch(r'priority-\d', label)] or [9]),
             'age': int(time.time() - stamp(issue['updated_at'])) // 60,
             'text': BLOCK.sub('', issue['description']).strip()}
@@ -300,13 +308,13 @@ def user():
 
 
 def limits(text):
-    found = {'claude': 2, 'codex': 3}
+    found = {name: {'claude': 2, 'codex': 3}.get(name, 1) for name in RUNTIMES}
     if not text:
         return found
     for pair in text.split(','):
-        match = re.fullmatch(r'(claude|codex)=(\d+)', pair)
-        if not match:
-            raise argparse.ArgumentTypeError('expected claude=N,codex=M with non-negative integers')
+        match = re.fullmatch(r'([\w-]+)=(\d+)', pair)
+        if not match or match[1] not in RUNTIMES:
+            raise argparse.ArgumentTypeError(f'expected runtime=N for runtimes {", ".join(RUNTIMES)}, N a non-negative integer')
         found[match[1]] = int(match[2])
     return found
 
@@ -341,6 +349,8 @@ def profile(args):
     # Filtering must not hide dependency or scope owners. Keep the unfiltered safety inventory.
     loaded = load()
     matching = load(args.filter)[0] if args.filter else loaded[0]
+    # Selftest tasks are only for a profile that names them: no real worker or tick takes one.
+    matching = [item for item in matching if not item['selftest'] or SELFTEST in args.filter]
     uid = user()
     candidates = [item for item in matching if eligible(item, uid, args.mine)]
     print(f'Profile: filter={args.filter!r}; mine={args.mine}; limit=' +
@@ -419,7 +429,7 @@ def add(args):
     runtime = DEFAULT_RUNTIME[args.type] if args.runtime is None else None if args.runtime == 'any' else args.runtime
     block = {'scope': args.scope, 'deps': args.deps, 'claim': None, 'waiting_for': None, 'result': None}
     text = f'## Goal\n\n{args.goal}\n\n## Acceptance\n\n{args.acceptance}'
-    labels = [f'area-{area}' for area in args.area] + [f'{PREFIX}ready', f'priority-{args.priority}', args.type] + ([RUN + runtime] if runtime else [])
+    labels = args.label + [f'area-{area}' for area in args.area] + [f'{PREFIX}ready', f'priority-{args.priority}', args.type] + ([RUN + runtime] if runtime else [])
     body = {'title': args.title, 'description': render(text, block), 'labels': ','.join(labels)}
     if args.mine:
         body['assignee_ids'] = [user()]
@@ -1181,11 +1191,14 @@ def codex_archive(args):
 def spawn(args):
     """Create a visible worker session in the main checkout and print its id; the coordinator then sends
     it the worker prompt. Claude: a CLI session imported into the desktop app. Codex: `codex_spawn`."""
-    if args.runtime == 'codex':
-        return print(codex_spawn(args.name))
+    print(codex_spawn(args.name) if args.runtime == 'codex' else f'local_{claude_spawn(args.restore)}')
+
+
+def claude_spawn(restore=None, extra=None):
+    """The CLI session id of a new Claude worker the desktop app has imported; `extra`: its environment."""
     import uuid
     session, root = str(uuid.uuid4()), ROOT
-    env = {key: value for key, value in os.environ.items() if key not in RUNTIMES.values()}
+    env = {**{key: value for key, value in os.environ.items() if key not in RUNTIMES.values()}, **(extra or {})}
     done = subprocess.run(['claude', '-p', 'Reply with the single word: ready', '--session-id', session],
                           cwd=root, env=env, capture_output=True, text=True, timeout=300)
     if done.returncode:
@@ -1194,13 +1207,13 @@ def spawn(args):
     # to it (no option to skip). -g only keeps the app in the background. With --restore the pane goes back
     # to the session the owner had open as soon as the import has written the session's record.
     subprocess.run(['open', '-g', f'claude://resume?session={session}'], check=True)
-    if args.restore:
+    if restore:
         end = time.time() + 20  # measured 1.2 s
         while not any(CLAUDE_APP_SESSIONS.glob(f'*/*/local_{session}.json')) and time.time() < end:
             time.sleep(0.05)
-        restore = args.restore if args.restore.startswith('local_') else f'local_{args.restore}'
+        restore = restore if restore.startswith('local_') else f'local_{restore}'
         subprocess.run(['open', '-g', f'claude://claude.ai/epitaxy/{restore}'], check=True)
-    print(f'local_{session}')
+    return session
 
 
 def question(iid):
@@ -1650,7 +1663,401 @@ def cleanup(args):
     print('Physical free space may differ (APFS clones / WSL disk image).')
 
 
+# --- selftest: the queue's own mechanisms, each row a fact read back from GitLab -------------------
+
+SELFTEST = 'selftest'  # label of a selftest task: only a profile whose filter names it sees one
+EXECUTORS = {}  # runtime -> [runtimes.<name>] of taskq.toml: env, spawn, send, archive command templates
+SELFTEST_GOAL = """This is a taskq selftest task: it checks the queue, not the project. Skip the project's startup
+reading and any workspace. Run only these commands from the main checkout, N being this task's number, then stop:
+
+1. `taskq beat N`
+2. If the History has no **answer** note: `taskq ask N --text "selftest question"` and stop.
+3. Otherwise: `taskq result N --checks "selftest" --text "selftest result"` and stop."""
+
+
+class SelftestError(Exception):
+    pass
+
+
+def selftest_run(calls, timeout=180):
+    """taskq commands as separate processes, all at once: [(env, argv)] -> [(exit code, output)]."""
+    started = [subprocess.Popen([sys.executable, '-m', 'taskq', *map(str, argv)], cwd=ROOT, env=env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE) for env, argv in calls]
+    outputs = [process.communicate(timeout=timeout) for process in started]
+    for _, errors in outputs:
+        sys.stderr.write(''.join(line for line in errors.splitlines(True) if line.startswith('taskq trace:')))
+    return [(process.returncode, errors + output) for process, (output, errors) in zip(started, outputs)]
+
+
+def selftest_env(runtime=None, session=None, extra=None):
+    """The owner's shell (no session) or a worker of `runtime`; `extra` only on the worker side."""
+    env = {key: value for key, value in os.environ.items() if key not in RUNTIMES.values()}
+    return {**env, **({RUNTIMES[runtime]: session} if runtime else {}), **(extra or {})}
+
+
+def selftest_command(template, **values):
+    """A [runtimes.<name>] command: split first, then fill, so no value reaches a shell."""
+    return [part.format(**values) for part in shlex.split(template)]
+
+
+def last_line(output):
+    """The line that says what happened: taskq's own error if there is one (stderr comes before buffered stdout)."""
+    lines = (output or '').strip().splitlines()
+    return codex_line(next((line for line in lines if line.startswith(('taskq:', 'Traceback'))), lines[-1] if lines else ''))
+
+
+class Selftest:
+    def __init__(self, args):
+        self.args, self.rows, self.failed, self.created = args, [], None, []
+        self.uid, self.stamp = user(), time.strftime('%Y%m%d%H%M%S')
+        self.extra = dict(item.split('=', 1) for item in args.worker_env)
+        self.record = ROOT / '.local' / SELFTEST / 'last.json'
+
+    def step(self, mechanism, runtime, function):
+        """One report row. After a failed step the rest of its chain is skipped: they would only repeat it."""
+        if self.failed:
+            return self.rows.append((mechanism, runtime, 'skipped', 0, f'after `{self.failed}` failed'))
+        start = time.time()
+        if os.environ.get('TASKQ_TRACE'):
+            print(f'taskq trace: step {mechanism} ({runtime})', file=sys.stderr)
+        try:
+            detail, verdict = function() or '', 'ok'
+        except (SelftestError, SystemExit, OSError, subprocess.SubprocessError, KeyError, TypeError, ValueError) as error:
+            detail, verdict, self.failed = codex_line(error), 'FAIL', mechanism
+        self.rows.append((mechanism, runtime, verdict, time.time() - start, detail))
+
+    def chain(self):
+        self.failed = None
+
+    def owner(self, *argv):
+        return self.call(selftest_env(), argv)
+
+    def worker(self, runtime, session, *argv):
+        return self.call(selftest_env(runtime, session, self.extra), argv)
+
+    def call(self, env, argv):
+        (code, output), = selftest_run([(env, argv)])
+        if code:
+            raise SelftestError(f'`taskq {argv[0]}` exit {code}: {last_line(output)}')
+        return output
+
+    def add(self, name, runtime):
+        output = self.owner('add', '--title', f'selftest {self.stamp} {name}', '--goal', SELFTEST_GOAL, '--acceptance',
+                            'The selftest reads every step back from GitLab.', '--type', 'research', '--runtime', runtime,
+                            '--scope', f'.local/{SELFTEST}/{self.stamp}-{name}', '--label', SELFTEST)
+        iid = int(re.search(r'^#(\d+) ', output, re.M)[1])
+        self.created.append(iid)
+        self.save()
+        return iid
+
+    def fact(self, iid, state=None, session=None, action=None, closed=False):
+        """What GitLab says about the task: the state label, the claim, the assignee, the newest note."""
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(2) as pool:  # two reads at once: each glab call is ~1 s
+            issue = pool.submit(api, 'GET', f'issues/{iid}')
+            history = pool.submit(api, 'GET', f'issues/{iid}/notes?sort=desc&per_page=20&activity_filter=only_comments') if action else None
+            issue, history, wrong = issue.result(), history and history.result(), []
+        item = (parse(issue) if issue['state'] == 'opened' else None) or {}
+        if closed and issue['state'] != 'closed':
+            wrong.append(f'issue is {issue["state"]}')
+        if state and item.get('state') != state:
+            wrong.append(f'state {item.get("state") or issue["state"]}, expected {state}')
+        if session is not None and (item.get('claim') or {}).get('session') != session:
+            wrong.append(f'claim {(item.get("claim") or {}).get("session")}, expected {session}')
+        if state == 'doing' and [each['id'] for each in issue['assignees']] != [self.uid]:
+            wrong.append(f'assignees {[each.get("username") for each in issue["assignees"]]}, expected the glab user')
+        newest = ''
+        if action:
+            newest = next((each['body'] for each in history if not each['body'].startswith('**shown**')), '')
+            if not newest.startswith(f'**{action}**'):
+                wrong.append(f'newest note {codex_line(newest)[:60]!r}, expected **{action}**')
+        if wrong:
+            raise SelftestError(f'#{iid}: ' + '; '.join(wrong))
+        return f'#{iid} ' + ('closed' if closed else state or '') + (f', note {newest.splitlines()[0]}' if newest else '')
+
+    def tick(self):
+        """A coordinator pass over selftest tasks only; it keeps the real tick's last-run time."""
+        before = TICK_BEAT.stat().st_mtime if TICK_BEAT.exists() else None
+        try:
+            return self.owner('tick', '--filter', f'labels={SELFTEST}')
+        finally:
+            if before is None:
+                TICK_BEAT.unlink(missing_ok=True)
+            else:
+                os.utime(TICK_BEAT, (before, before))
+
+    @staticmethod
+    def mismatch(text):
+        section = text.split('## Board mismatch', 1)[1].split('\n## ', 1)[0] if '## Board mismatch' in text else ''
+        return {line for line in section.splitlines() if line.startswith('- #')}
+
+    def save(self, **changes):
+        """`.local/selftest/last.json`: what this run created, so `--scope check` and a crashed run can clean up."""
+        self.record.parent.mkdir(parents=True, exist_ok=True)
+        data = json.loads(self.record.read_text()) if self.record.exists() else {}
+        data.update(changes, created=sorted(set(data.get('created', [])) | set(self.created)), stamp=self.stamp)
+        self.record.write_text(json.dumps(data, indent=1))
+
+    # --- quick: the queue commands as worker processes, no sessions --------------------------------
+
+    def quick(self, runtime):
+        worker, iid = f'{SELFTEST}-{self.stamp}-a', None
+
+        def add():
+            nonlocal iid
+            iid = self.add('quick', runtime)
+            return self.fact(iid, 'ready')
+
+        def listed():
+            if not re.search(rf'^#{iid}\s', self.owner('list'), re.M):
+                raise SelftestError(f'#{iid} is not in `taskq list`')
+            return f'#{iid} listed'
+
+        def by_worker(*argv, state, action, claim=True):
+            self.worker(runtime, worker, *argv)
+            return self.fact(iid, state, worker if claim else None, action)
+
+        def by_owner(action, state):
+            self.owner(action, iid, '--text', f'selftest {action}')
+            return self.fact(iid, state, None, action)
+
+        self.chain()
+        self.step('add', runtime, add)
+        self.step('list', runtime, listed)
+        self.step('take, claim, assignee', runtime, lambda: by_worker('take', iid, state='doing', action='take'))
+        self.step('beat', runtime, lambda: by_worker('beat', iid, state='doing', action='beat'))
+        self.step('ask', runtime, lambda: by_worker('ask', iid, '--text', 'selftest question', state='ask', action='ask'))
+        self.step('tick: question', runtime, lambda: self.shows(iid, '## Waiting for the owner', 'selftest question'))
+        self.step('answer', runtime, lambda: by_owner('answer', 'ready'))
+        self.step('take again', runtime, lambda: by_worker('take', iid, state='doing', action='take'))
+        self.step('result', runtime, lambda: by_worker('result', iid, '--checks', 'selftest', '--text', 'selftest result',
+                                                       state='review', action='result', claim=False))
+        self.step('tick: review', runtime, lambda: self.shows(iid, f'## Review #{iid}', 'selftest result'))
+        self.step('close', runtime, lambda: (self.owner('close', iid, '--text', 'selftest close'), self.fact(iid, closed=True, action='close'))[1])
+
+    def shows(self, iid, *needles):
+        text = self.tick()
+        missing = [needle for needle in needles if needle not in text]
+        if missing:
+            raise SelftestError(f'tick does not print {missing}')
+        if any(f'#{iid} ' in line for line in self.mismatch(text)):
+            raise SelftestError(f'tick names #{iid} under Board mismatch')
+        return f'tick prints {needles[0]}'
+
+    def unlocked(self, iid):
+        if locks(iid):
+            raise SelftestError(f'#{iid} keeps its lock after release')
+        return f'#{iid} ready, lock removed'
+
+    def race(self, runtime):
+        """Two worker processes take one task at the same moment: GitLab's lock lets exactly one through."""
+        iid = self.add('race', runtime)
+        sessions = [f'{SELFTEST}-{self.stamp}-{name}' for name in 'bc']
+        done = selftest_run([(selftest_env(runtime, session, self.extra), ('take', iid)) for session in sessions])
+        winners = [session for session, (code, _) in zip(sessions, done) if not code]
+        claim = ((parse(api('GET', f'issues/{iid}')) or {}).get('claim') or {}).get('session')
+        if len(winners) != 1 or claim != winners[0]:
+            raise SelftestError(f'winners {winners}, claim {claim}; outputs: ' + ' / '.join(last_line(output) for _, output in done))
+        loser = done[1 - sessions.index(winners[0])][1]
+        return f'#{iid}: worker {winners[0][-1]} holds it; the other: {last_line(loser)}'
+
+    # --- full: a real worker session of each app takes the task through its brief ------------------
+
+    def full(self, runtime):
+        iid, session, process = None, None, None
+        name = f'selftest {self.stamp} {runtime}'
+        log = ROOT / '.local' / SELFTEST / f'{self.stamp}-{runtime}.log'
+        prompt = (f'Run `cd {ROOT} && {TOOL} worker --filter labels={SELFTEST} --limit {runtime}=9` '
+                  'and follow the instructions it prints.')
+
+        def send():
+            nonlocal process
+            if process and process.poll() is None:
+                process.wait(timeout=self.args.wait)  # one turn at a time in a CLI session
+            if runtime == 'codex':
+                with contextlib.redirect_stdout(io.StringIO()):
+                    codex_send(argparse.Namespace(thread=session, text=prompt))
+                return
+            command = (['claude', '-p', prompt, '--resume', session] if runtime == 'claude'
+                       else selftest_command(EXECUTORS[runtime]['send'], session=session, text=prompt))
+            with log.open('a') as out:
+                process = subprocess.Popen(command, cwd=ROOT, env=selftest_env(extra=self.extra), stdout=out, stderr=subprocess.STDOUT)
+
+        def until(state, action):
+            """Poll GitLab until the worker moved the task; a turn that ended without moving it is a failure."""
+            end, ended = time.time() + self.args.wait, None
+            while time.time() < end:
+                item = parse(api('GET', f'issues/{iid}')) or {}
+                if item.get('state') == state:
+                    return self.fact(iid, state, session if state in ('doing', 'ask') else None, action)
+                if process and process.poll() is not None:
+                    ended = ended or time.time()
+                    if time.time() - ended > 30:
+                        raise SelftestError(f'#{iid} is {item.get("state")}, the worker turn ended: '
+                                            f'{last_line(log.read_text() if log.exists() else "")}')
+                time.sleep(5)
+            raise SelftestError(f'#{iid} not {state} after {self.args.wait} s')
+
+        def add():
+            nonlocal iid
+            iid = self.add(runtime, runtime)
+            return self.fact(iid, 'ready')
+
+        def spawned():
+            nonlocal session
+            if runtime == 'claude':
+                session = claude_spawn(driver_app_session(), self.extra)
+            elif runtime == 'codex':
+                session = codex_spawn(name)
+            else:
+                session = last_line(subprocess.run(selftest_command(EXECUTORS[runtime]['spawn'], name=name), cwd=ROOT, check=True,
+                                                   env=selftest_env(extra=self.extra), capture_output=True, text=True, timeout=300).stdout)
+            self.save(sessions={**json.loads(self.record.read_text()).get('sessions', {}), runtime: session})
+            return f'{runtime} session {session}'
+
+        def first():
+            send()
+            until('doing', None)
+            return until('ask', 'ask') + '; ' + self.notes(iid, session, 'take', 'beat')
+
+        def again(action):
+            self.owner(action, iid, '--text', f'selftest {action}')
+            unlocked = self.unlocked(iid) if action == 'release' else ''
+            send()
+            return '; '.join(filter(None, (unlocked, until('review', 'result'))))
+
+        self.chain()
+        self.step('add', runtime, add)
+        self.step('spawn', runtime, spawned)
+        self.step('take, claim, assignee, beat, ask by the worker', runtime, first)
+        self.step('answer, take again, result', runtime, lambda: again('answer'))
+        self.step('reject, take again, result', runtime, lambda: again('reject'))
+        self.step('release, take again, result', runtime, lambda: again('release'))
+        self.step('close', runtime, lambda: (self.owner('close', iid, '--text', 'selftest close'), self.fact(iid, closed=True, action='close'))[1])
+        if process:
+            try:
+                process.wait(timeout=self.args.wait)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        self.chain()
+        if session and runtime != 'claude':  # a Claude session: only the app tool archives it; `no session left` names it
+            self.step('retire the session', runtime, lambda: selftest_retire(runtime, session))
+
+    def notes(self, iid, session, *actions):
+        tag = f'{session[:8]}'
+        heads = [each['body'].split('\n')[0] for each in comments(iid)]
+        missing = [action for action in actions if not any(head.startswith(f'**{action}** · ') and tag in head for head in heads)]
+        if missing:
+            raise SelftestError(f'#{iid}: no note {missing} by session {tag}')
+        return ', '.join(f'{action} by {tag}' for action in actions)
+
+    # --- the traces: nothing of the selftest stays on the board, in Git or in the apps ------------
+
+    def clean(self):
+        data = json.loads(self.record.read_text()) if self.record.exists() else {}
+        created = data.get('created', [])
+
+        def issues_gone():
+            closed = []
+            for iid in created:
+                try:
+                    api('DELETE', f'issues/{iid}')
+                except SystemExit as error:
+                    if '404' in str(error):
+                        continue  # deleted by an earlier run
+                    if api('GET', f'issues/{iid}')['state'] == 'opened':
+                        api('PUT', f'issues/{iid}', {'state_event': 'close'})
+                    closed.append(iid)  # the token may not delete issues: closed instead
+            left = [issue['iid'] for issue in issues(f'state=opened&labels={SELFTEST}')]
+            if left:
+                raise SelftestError(f'open selftest issues remain: {left}')
+            return f'deleted {sorted(set(created) - set(closed))}' + (f', closed (no right to delete) {closed}' if closed else '')
+
+        def worktrees():
+            listed = subprocess.run(['git', '-C', str(ROOT), 'worktree', 'list', '--porcelain'], capture_output=True, text=True).stdout
+            left = [iid for iid in created if re.search(rf'^worktree .*taskq-{iid}$', listed, re.M)]
+            if left:
+                raise SelftestError(f'worktrees of selftest tasks remain: {left}')
+            return 'no taskq-<N> worktree of a selftest task'
+
+        def board():
+            ours = [line for line in self.mismatch(self.tick()) if any(f'#{iid} ' in line for iid in created)]
+            if ours:
+                raise SelftestError('tick Board mismatch: ' + '; '.join(ours))
+            return 'tick names no selftest task under Board mismatch'
+
+        for mechanism, runtime, function in (
+                ('remove the selftest tasks', '-', issues_gone), ('no worktree left', '-', worktrees),
+                *(('no session left', runtime, lambda runtime=runtime, session=session: selftest_retire(runtime, session, check=True))
+                  for runtime, session in data.get('sessions', {}).items()),
+                # quick: each of its ticks already checked that no selftest task is under Board mismatch.
+                *((('board as before', '-', board),) if self.args.scope != 'quick' else ())):
+            self.chain()
+            self.step(mechanism, runtime, function)
+
+    def report(self):
+        lines = ['| mechanism | runtime | result | seconds | detail |', '|---|---|---|---|---|']
+        lines += [f'| {mechanism} | {runtime} | {verdict} | {seconds:.0f} | {detail.replace("|", "/")} |'
+                  for mechanism, runtime, verdict, seconds, detail in self.rows]
+        failed, skipped = ([row for row in self.rows if row[2] == verdict] for verdict in ('FAIL', 'skipped'))
+        return '\n'.join(lines) + f'\n\n{len(self.rows) - len(failed) - len(skipped)} of {len(self.rows)} ok' + (
+            '; not working: ' + ', '.join(f'{row[0]} ({row[1]})' for row in failed) if failed else '') + (
+            f'; {len(skipped)} skipped after a failure' if skipped else '')
+
+
+def driver_app_session():
+    """The app session of the calling Claude session, to show again after a spawn; None from Codex or a shell."""
+    sid = os.environ.get(RUNTIMES['claude'])
+    return next((meta['sessionId'] for meta in claude_sessions().values() if meta.get('cliSessionId') == sid), None) if sid else None
+
+
+def selftest_retire(runtime, session, check=False):
+    """Archive a finished selftest worker session or, with `check`, prove it archived."""
+    if runtime == 'codex':
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            codex_archive(argparse.Namespace(thread=session))
+        return out.getvalue().strip()
+    if runtime == 'claude':
+        meta = claude_sessions().get(session)
+        if meta and not meta.get('isArchived'):
+            raise SelftestError(f'Claude session local_{session} is not archived; only the app tool can: '
+                                f'`archive_session local_{session}`, then `{TOOL} selftest --scope check`')
+        return f'local_{session} ' + ('archived' if meta else 'not in this machine\'s app')
+    archive = EXECUTORS[runtime].get('archive')
+    if check or not archive:
+        return 'no archive command configured' if not archive else f'{session}: archived by the run'
+    subprocess.run(selftest_command(archive, session=session), cwd=ROOT, check=True, capture_output=True, timeout=120)
+    return f'{session} archived'
+
+
+def selftest(args):
+    """The queue's mechanisms through the real queue. quick: the commands as worker processes; full: a
+    real worker session of each app; check: only that the traces of the last run are gone."""
+    test = Selftest(args)
+    if args.scope != 'check':
+        test.record.unlink(missing_ok=True)
+    if args.scope == 'quick':
+        test.quick((args.runtime or [(session() or {}).get('runtime') or 'claude'])[0])
+    elif args.scope == 'full':
+        test.chain()
+        test.step('parallel take, one winner', 'claude', lambda: test.race('claude'))
+        for runtime in args.runtime or RUNTIMES:
+            test.full(runtime)
+    test.clean()
+    text = test.report()
+    print(text)
+    if args.note:
+        note(args.note, 'selftest', f'`{TOOL} selftest --scope {args.scope}` from {who()}\n\n{text}')
+    if any(row[2] == 'FAIL' for row in test.rows):
+        sys.exit(1)
+
+
 def main(argv=None):
+    if PROJECT is None:
+        try:
+            configure()  # before the parser: [runtimes] in taskq.toml adds choices
+        except SystemExit:
+            pass  # no taskq.toml yet: `init --project` writes it, `contract` and `update` need none
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     sub = parser.add_subparsers(dest='action', required=True)
 
@@ -1667,7 +2074,8 @@ def main(argv=None):
             (('--priority',), {'type': int, 'choices': PRIORITIES, 'default': 2}),
             (('--milestone',), {'help': 'milestone title: the epic this task belongs to'}),
             (('--runtime',), {'choices': (*RUNTIMES, 'any'), 'help': 'only a session of this app may take it; default by type'}),
-            (('--mine',), {'action': 'store_true'}), (('--area',), {'nargs': '+', 'default': []}))
+            (('--mine',), {'action': 'store_true'}), (('--area',), {'nargs': '+', 'default': []}),
+            (('--label',), {'nargs': '+', 'default': [], 'help': argparse.SUPPRESS}))
     command('runtime', set_runtime, iid, (('runtime',), {'choices': (*RUNTIMES, 'any')}))
     command('list', listing)
     profile_flags = ((('--filter',), {'default': '', 'help': 'GitLab issues query string, passed unchanged'}),
@@ -1702,6 +2110,13 @@ def main(argv=None):
     command('contract', contract)
     command('update', update, (('--verbose',), {'action': 'store_true', 'help': 'say why a check was skipped'}))
     command('report', report, (('--hours',), {'type': int, 'default': 24}))
+    command('selftest', selftest, (('--scope',), {'choices': ('quick', 'full', 'check'), 'default': 'quick'}),
+            (('--runtime',), {'nargs': '+', 'choices': tuple(RUNTIMES),
+                              'help': 'quick: the worker identity (default: this session\'s app); full: apps to start (default: all)'}),
+            (('--note',), {'type': int, 'help': 'also post the report as a note on this issue'}),
+            (('--worker-env',), {'nargs': '+', 'default': [], 'metavar': 'KEY=VALUE',
+                                 'help': 'environment of the worker side, e.g. GITLAB_TOKEN=broken to see a failure named'}),
+            (('--wait',), {'type': int, 'default': 600, 'help': 'full: seconds a worker session may take per step'}))
     args = parser.parse_args(argv)
     if getattr(args, 'project', None) and not Path('taskq.toml').exists():
         Path('taskq.toml').write_text(f'# taskq: this project\'s task queue; keys: `taskq contract`, README of taskq.\n'

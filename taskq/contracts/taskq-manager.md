@@ -327,6 +327,76 @@ task closed earlier than `CLEANUP_DAYS` is no longer proven finished: its sessio
 owner", not "Remove". For closed code/docs tasks the result SHA is checked in `origin/main`. Trees of
 open tasks, including ready ones to be continued, are kept.
 
+## Checking the orchestration (selftest)
+
+The same procedure in a Claude and in a Codex session, for any worker app (owner's request,
+2026-10-06).
+
+**The owner says** «проверь свои инструменты оркестрации», «теперь ты оркестратор, проверь, работают
+ли у тебя механизмы», "check your orchestration tools".
+
+**The session offers** a scope in one message and waits for the choice:
+
+- **quick** — about 1.5 min, no sessions started: the queue commands run as separate worker
+  processes with a test identity of this session's app.
+- **full** — about 4–5 min per app (Claude measured 4.5 min on 2026-10-06), with a real worker session of each app (`--runtime claude codex …`;
+  default: every configured app). The offer names the apps.
+- Where the report goes: printed here, and a note on the issue the owner names (`--note <N>`), or
+  nowhere else.
+
+**It runs** from the main checkout:
+
+```
+taskq selftest --scope quick [--runtime <app>] [--note <N>]
+taskq selftest --scope full [--runtime claude codex …] [--note <N>]
+```
+
+`quick` checks, each against GitLab: `add` (a `research` task labelled `selftest`, scope under
+`.local/selftest/`), `list` sees it, `take` (state `doing`, claim of the worker, glab user as
+assignee, `take` note), `beat`, `ask`, the tick prints the question under "Waiting for the owner",
+`answer`, `take` again, `result`, the tick prints "Review #N", `close`, then the traces are removed.
+`full` first races two worker processes on one task (exactly one may hold it; GitLab's lock decides),
+then per app: `spawn` a session through the package's own path (`claude_spawn`, `codex_spawn`, or the
+app's configured command), sends it the worker prompt with `--filter labels=selftest`, and waits for
+the worker to `take`, `beat` and `ask`; then `answer` → the worker takes again and hands in a result;
+`reject` → again; `release` (lock removed) → again; `close`; the session is retired. At the end: the
+selftest issues are deleted (closed if the token may not delete), no `taskq-<N>` worktree of them
+exists, and the tick names no selftest task under "Board mismatch". A selftest tick keeps the real
+tick's last-run time. A selftest task is invisible to every profile whose `--filter` does not name
+`selftest`: no real worker or tick takes it.
+
+**The report** is a table `mechanism / runtime / result / seconds / detail`. Every row is read back
+from GitLab (state label, claim, assignee, the newest note and its author), not taken from what a
+worker says. After a failed row the rest of its chain is `skipped`; the exit code is 1. Show the
+table to the owner as printed, failed rows first in the reply.
+
+**A broken mechanism is named, not hidden.** `--worker-env KEY=VALUE` changes only the worker side:
+`taskq selftest --worker-env GITLAB_TOKEN=broken` reports `take … FAIL … 401 Unauthorized`
+(verified 2026-10-06). A Codex worker runs in the app's server, whose environment this cannot change.
+
+**A Claude worker session** is archived only by the app tool: after `full` the session runs
+`archive_session local_<id>` for the id the report names, then `taskq selftest --scope check`, which
+repeats only the trace checks (tasks, worktrees, sessions, board) of the last run
+(`.local/selftest/last.json`).
+
+**A new worker app** is one table in `taskq.toml`, no code change:
+
+```toml
+[runtimes.grok]
+env = "GROK_SESSION_ID"                          # its session id variable: claims and notes
+spawn = "run-grok spawn --name {name}"           # prints the session id as its last line
+send = "run-grok send {session} {text}"          # one turn; may return before the turn ends
+archive = "run-grok archive {session}"           # optional
+```
+
+Commands are split before the values are filled in: no value reaches a shell. The app then also
+works in `add --runtime`, `--limit grok=N` and `selftest --runtime grok`.
+
+**Speed.** Each glab call costs about 1.05 s here (221 ms round trip to the GitLab host; the open
+issues page, 344 KB, 2.5 s), and `take` makes 8 of them. `quick` makes about 60 calls; under one
+minute needs a persistent HTTP connection instead of one glab process per call. `TASKQ_TRACE=1`
+prints every call with its time, and each selftest step.
+
 ## 4. File a task
 
 `taskq add --title … --type code|docs|research|asset --goal … --acceptance …

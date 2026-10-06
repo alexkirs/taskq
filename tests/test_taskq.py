@@ -166,6 +166,9 @@ class Gitlab:
             if iid in self.issues:
                 self.issues[iid]['updated_at'] = self.now()
             return self.notes[number]
+        if method == 'DELETE':
+            del self.issues[iid]
+            return None
         issue = self.issues[iid]
         if method == 'PUT' and 'assignee_ids' in body:
             issue['assignees'] = [{'id': uid} for uid in body['assignee_ids']]
@@ -888,6 +891,74 @@ class Cycle(unittest.TestCase):
         self.assertIn('status unknown: socket unavailable', output)
         self.assertIn('Start 1 worker', output)
         self.assertNotIn('## Codex idle', output)
+
+
+class Selftest(unittest.TestCase):
+    """`selftest --scope quick` against the fake GitLab; its worker processes run in this process."""
+    do, add = Cycle.do, Cycle.add
+
+    def setUp(self):
+        Cycle.setUp(self)
+        for target, value in (('ROOT', self.directory), ('TICK_BEAT', self.directory / 'beat'), ('selftest_run', self.run_calls)):
+            patcher = patch.object(q, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_calls(self, calls, timeout=None):
+        found = []
+        for env, argv in calls:
+            with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()) as out:
+                try:
+                    if env.get('GITLAB_TOKEN') == 'broken':
+                        q.fail('GitLab GET issues failed: glab: 401 Unauthorized (HTTP 401)')
+                    q.main([str(item) for item in argv])
+                    code = 0
+                except SystemExit as error:
+                    code, out = (1 if error.code else 0), io.StringIO(out.getvalue() + str(error.code))
+            found.append((code, out.getvalue()))
+        return found
+
+    def test_quick_reads_every_step_back_and_leaves_no_task(self):
+        self.gitlab.issues[99] = {'iid': 99, 'state': 'opened', 'labels': [], 'description': '', 'title': 'owner',
+                                  'assignees': [], 'updated_at': self.gitlab.now()}  # the issue the owner names for the report
+        report = self.do(COORDINATOR, 'selftest', '--scope', 'quick', '--note', 99)
+        self.assertIn('13 of 13 ok', report)
+        for mechanism in ('| add |', '| take, claim, assignee |', '| ask |', '| tick: question |', '| answer |',
+                          '| result |', '| tick: review |', '| close |', '| remove the selftest tasks |'):
+            self.assertIn(mechanism, report)
+        self.assertEqual(sorted(self.gitlab.issues), [99])  # the selftest tasks are deleted
+        self.assertTrue(self.gitlab.said(99)[-1].startswith('**selftest** · claude:coordina'))
+        self.assertFalse(self.gitlab.locked())
+        self.assertFalse((self.directory / 'beat').exists())  # the real tick's last-run time is untouched
+
+    def test_broken_worker_token_is_named_not_ok(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()) as out, patch.dict(os.environ, COORDINATOR):
+            q.main(['selftest', '--worker-env', 'GITLAB_TOKEN=broken'])
+        self.assertIn('| take, claim, assignee | claude | FAIL |', out.getvalue())
+        self.assertIn('401 Unauthorized', out.getvalue())
+        self.assertIn('| beat | claude | skipped |', out.getvalue())
+        self.assertIn('| remove the selftest tasks | - | ok |', out.getvalue())
+
+    def test_a_selftest_task_is_only_for_a_profile_naming_it(self):
+        iid = self.add('--type', 'research', '--label', 'selftest')
+        self.assertIn('No task can start now', self.do(CLAUDE, 'worker'))
+        self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))
+        self.assertIn(f'take {iid}', self.do(CLAUDE, 'worker', '--filter', 'labels=selftest'))
+
+    def test_a_configured_runtime_is_one_table(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(q.RUNTIMES), patch.dict(q.EXECUTORS):
+            config = Path(tmp) / 'taskq.toml'
+            config.write_text(Path(q.__file__).resolve().parents[1].joinpath('tests/taskq.toml').read_text() +
+                              '\n[runtimes.grok]\nenv = "GROK_SESSION_ID"\nspawn = "run-grok spawn --name {name}"\n'
+                              'send = "run-grok send {session} {text}"\n')
+            q.configure(config)
+            self.addCleanup(q.configure, Path(__file__).resolve().parent / 'taskq.toml')
+            self.assertEqual(q.RUNTIMES['grok'], 'GROK_SESSION_ID')
+            self.assertEqual(q.limits('grok=4')['grok'], 4)
+            self.assertEqual(q.selftest_command(q.EXECUTORS['grok']['send'], session='s 1', text='a; rm -rf /'),
+                             ['run-grok', 'send', 's 1', 'a; rm -rf /'])
+            iid = self.add('--type', 'research', '--runtime', 'grok')
+            self.assertIn(f'take {iid}', self.do({**CLAUDE, 'CLAUDE_CODE_SESSION_ID': '', 'GROK_SESSION_ID': 'g1'}, 'worker'))
 
 
 class Host(unittest.TestCase):

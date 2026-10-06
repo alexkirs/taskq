@@ -391,11 +391,17 @@ def trust_gap(root):
              f'python3 -c {shlex.quote(script)}  (the person runs it once while no claude runs)')]
 
 
+def windows_claude_binary():
+    """True under WSL when `claude` is a Windows binary (e.g. the npm shim /mnt/c/nvm4w/nodejs/claude)."""
+    found = shutil.which('claude')
+    return bool(os.environ.get('WSL_DISTRO_NAME') and found and os.path.realpath(found).startswith('/mnt/'))
+
+
 def windows_claude():
-    """Under WSL with a Windows `claude` (e.g. the npm shim /mnt/c/nvm4w/nodejs/claude): (UNC prefix of this
+    """Under WSL with a Windows `claude` (`windows_claude_binary`): (UNC prefix of this
     distribution, the Windows ~/.claude.json). None elsewhere. That claude sees the checkout as //wsl.localhost/..."""
-    distro, found = os.environ.get('WSL_DISTRO_NAME'), shutil.which('claude')
-    if not distro or not found or not os.path.realpath(found).startswith('/mnt/'):
+    distro = os.environ.get('WSL_DISTRO_NAME')
+    if not windows_claude_binary():
         return None
     try:  # cmd.exe refuses a UNC working directory: run it from the Windows drive
         home = subprocess.run(['cmd.exe', '/c', 'echo %USERPROFILE%'], cwd='/mnt/c', capture_output=True, text=True, timeout=30).stdout.strip()

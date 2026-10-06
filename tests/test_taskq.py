@@ -2322,6 +2322,16 @@ class Doctor(unittest.TestCase):
             with patch.dict(os.environ, {'WSL_DISTRO_NAME': ''}), patch.object(doctor.shutil, 'which', lambda name: '/mnt/c/x/claude'):
                 self.assertIsNone(doctor.windows_claude())
 
+    def test_windows_claude_gets_the_session_id_through_wslenv(self):
+        """#148: wsl.exe children of a Windows claude see only WSLENV-listed variables; existing entries stay."""
+        def env(windows, wslenv):
+            with patch.object(q, 'windows_claude_binary', lambda: windows), patch.dict(os.environ, {'WSLENV': wslenv}):
+                return worker.claude_env().get('WSLENV')
+        self.assertEqual(env(True, ''), 'CLAUDE_CODE_SESSION_ID')
+        self.assertEqual(env(True, 'USERPROFILE/p'), 'USERPROFILE/p:CLAUDE_CODE_SESSION_ID')
+        self.assertEqual(env(True, 'CLAUDE_CODE_SESSION_ID/u:A'), 'CLAUDE_CODE_SESSION_ID/u:A')
+        self.assertEqual(env(False, 'A'), 'A')
+
     def test_claude_not_logged_in_is_a_gap(self):
         """#139: a `claude --bg` that is not logged in stops at «Not logged in»: the tick would spawn dead workers."""
         self.enterContext(patch.object(q, 'api', Gitlab()))

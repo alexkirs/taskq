@@ -403,7 +403,12 @@ def send(args):
 
 
 def claude_env(extra=None):
-    return {**{key: value for key, value in os.environ.items() if key not in core.RUNTIMES.values()}, **(extra or {})}
+    env = {**{key: value for key, value in os.environ.items() if key not in core.RUNTIMES.values()}, **(extra or {})}
+    # #148: a Windows claude under WSL runs its Bash tool through wsl.exe, which passes on only the variables WSLENV
+    # names: without CLAUDE_CODE_SESSION_ID there `taskq worker` has no session identity (csgo #316).
+    if core.windows_claude_binary() and 'CLAUDE_CODE_SESSION_ID' not in [item.split('/')[0] for item in env.get('WSLENV', '').split(':')]:
+        env['WSLENV'] = ':'.join(filter(None, [env.get('WSLENV'), 'CLAUDE_CODE_SESSION_ID']))
+    return env
 
 
 # #38 (2026-10-06, verified live): a worker needs only these tools and no MCP. settings.local.json stays as is

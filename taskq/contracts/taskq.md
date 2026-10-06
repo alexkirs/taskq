@@ -276,6 +276,8 @@ ready/waiting/later → ask (manager) → answer → ready
 - A task on taskq itself works only in a worktree of the editable clone (`.worktrees/taskq-<N>`, the
   command is in the brief from taskq's `[workspace]`), never in the clone's working tree: every session on the
   machine runs that tree, so it stays clean `main`. `tick` warns in one line when it is not.
+- Project tools may read `TASKQ_TASK`; empty means work outside a task. The brief's first command after `take`
+  is `export TASKQ_TASK=<N> TASKQ_RUNTIME=<runtime>` (load attribution, csgo: heavy runs recorded as `main`).
 - Partial result: close the task, file the remainder as a new task.
 - A worker runs a long command (build, CI wait, deploy, prepare) in the background and waits for its completion
   notice (Claude: `run_in_background`, the harness wakes the session; Codex: its equivalent), never a sleep loop.

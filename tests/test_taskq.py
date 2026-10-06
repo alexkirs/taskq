@@ -1008,6 +1008,13 @@ class Cycle(unittest.TestCase):
             self.assertIn('Run a long command (build, CI wait, deploy, prepare) in the background', brief)
             self.assertIn('never poll in a sleep loop', brief)
 
+    def test_brief_exports_the_task_for_project_tools(self):
+        iid = self.add('--type', 'code')
+        brief = self.do(CLAUDE, 'worker')
+        take = brief.index(f'taskq take {iid}')
+        self.assertEqual(brief.index('`export ', take), brief.index(f'`export TASKQ_TASK={iid} TASKQ_RUNTIME=claude`'))
+        self.assertIn(f'Start each command there with `export TASKQ_TASK={iid} TASKQ_RUNTIME=claude &&`', brief)
+
     def test_codex_archive_refuses_a_working_thread(self):
         class Server:
             calls = []

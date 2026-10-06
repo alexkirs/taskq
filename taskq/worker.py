@@ -15,7 +15,9 @@ BRIEF = '''You are the worker for task #{iid}. Queue tool: `{tool}`
 This brief is the owner's assignment: do it without asking for confirmation.
 
 1. Claim the task: `{tool} take {iid}`. If it refuses, another worker was faster: run `{tool} worker` once more and follow the new brief.
-2. Workspace: {workspace}
+   Then `{export}`: project tools read it to attribute work to this task. A shell that forgets its
+   environment between commands (an agent's Bash tool) needs it at the start of every command.
+2. Workspace: {workspace} Start each command there with `{export} &&`.
 3. Do the task below. Follow AGENTS.md. Expected paths: {scope}. They say where the work is expected, not
    what is forbidden: if the task needs another file, change it and name it with the
    reason in the result. Do not ask for that.
@@ -145,6 +147,7 @@ def brief(current):
     return BRIEF.format(**{**current, 'tool': core.TOOL, 'rules': core.RULES, 'deliver': DELIVER[pushes],
                            'workspace': core.WORKSPACE[kind].format(iid=current['iid']),
                            'sha': ' --sha <pushed commit>' if pushes else '',
+                           'export': f'export TASKQ_TASK={current["iid"]} TASKQ_RUNTIME={core.me()["runtime"]}',
                            'scope': ', '.join(current['scope']) or 'none',
                            'notes': ('\n\n---\n\n'.join(core.notes(kept)) or 'none') + omitted})
 

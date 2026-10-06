@@ -57,7 +57,7 @@ UPDATE_STAMP = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/st
 STATES = ('ready', 'waiting', 'doing', 'review', 'ask', 'later')
 SUMMARY_SECONDS = 24 * 3600  # questions already shown come back as one summary this often
 TYPES = ('code', 'docs', 'research', 'asset')  # the type label is the bare name
-STALE_MINUTES = 120  # a `doing` issue this long without any change goes back to the queue
+STALE_MINUTES = 120  # a `doing` task this long without a collaborator's note or label change goes back to the queue
 # The lock is this award emoji on the task's issue: GitLab lets one user award one name once (404 on the
 # second). Across users the earliest reaction wins. An old lock on an unheld task is a crash's.
 LOCK, LOCK_SECONDS = 'lock', 120
@@ -91,6 +91,7 @@ This brief is the owner's assignment: do it without asking for confirmation.
    the goal, do it, and record it with `problem`.
 7. {deliver}
    Then `{tool} result {iid}{sha} --checks "<commands you ran and their outcome>" --text "<summary>"` and stop.
+Everything you write through `{tool}` is public: no environment values, paths outside the repository, tokens.
 
 # {title}
 
@@ -230,7 +231,20 @@ def session():
 
 
 def me():
-    return {**(session() or fail('no session identity: set ' + ' or '.join(RUNTIMES.values()))), 'host': socket.gethostname()}
+    return {**(session() or fail('no session identity: set ' + ' or '.join(RUNTIMES.values()))), 'node': node()}
+
+
+def node(hostname=None):
+    """A machine in a claim: a short hash, not its hostname, because the claim is in a public issue body (#39)."""
+    return hashlib.sha256(f'{PROJECT_PATH}:{hostname or socket.gethostname()}'.encode()).hexdigest()[:12]
+
+
+def where(claim):
+    """` @name` of a claim's machine: this one and [hosts] are known by name, another by its hash."""
+    if claim.get('host'):  # a claim from before #39
+        return f' @{machine(claim["host"])}'
+    names = {**{node(host): name for host, name in HOSTS.items()}, node(): machine()}
+    return f' @{names.get(claim["node"], claim["node"][:6])}' if claim.get('node') else ''
 
 
 def machine(hostname=None):
@@ -317,7 +331,7 @@ def parse(issue):
             'host': next((label[len(ON):] for label in labels if label.startswith(ON)), None),
             'assignees': [user['id'] for user in issue.get('assignees', [])], 'selftest': SELFTEST in labels,
             'priority': min([int(label[9:]) for label in labels if re.fullmatch(r'priority-\d', label)] or [9]),
-            'age': int(time.time() - stamp(issue['updated_at'])) // 60, 'updated_at': issue['updated_at'],
+            'updated_at': issue['updated_at'],
             'web_url': issue.get('web_url'), 'text': BLOCK.sub('', issue['description']).strip()}
 
 
@@ -383,7 +397,8 @@ def unchanged(item):
     issue = api('GET', f'issues/{item["iid"]}')
     fresh = parse(issue) if issue['state'] == 'opened' else None
     why = ('it is no open task now' if not fresh else f'its state is {fresh["state"]} now' if fresh['state'] != item['state']
-           else 'its claim changed' if fresh['claim'] != item['claim'] else 'it changed' if fresh['updated_at'] != item['updated_at']
+           else 'its claim changed' if fresh['claim'] != item['claim']
+           else 'it changed' if (active(item['iid']) != item['active'] if 'active' in item else fresh['updated_at'] != item['updated_at'])
            else 'a take holds its lock' if fresh['state'] in ('ready', 'waiting') and locks(item['iid']) else None)
     if why:
         print(f'Skipped #{item["iid"]}: {why} since this tick read it.')
@@ -488,6 +503,8 @@ def limits(text):
 
 
 def local_claim(claim):
+    if claim.get('node'):
+        return claim['node'] == node()
     if claim.get('host'):
         return claim['host'] == socket.gethostname()
     # Upgrade existing claims from local app evidence, without editing someone else's task.
@@ -607,6 +624,22 @@ def unlock(iid):
         api('DELETE', f'issues/{iid}/award_emoji/{item["id"]}')
 
 
+def active(iid):
+    """When a collaborator last touched the task: its newest trusted note or label event. Not `updated_at`: an
+    outsider's comment moves it, and a dead worker's task would never stall (#39). An outsider flood of 100
+    comments hides the notes; the label events still count."""
+    trusted = collaborators(api('GET', f'issues/{iid}/notes?sort=desc&per_page=100&activity_filter=only_comments'))
+    return max([stamp(item['created_at']) for item in trusted[:1] + pages(f'issues/{iid}/resource_label_events')], default=0)
+
+
+def age(item):
+    """Minutes since `active`, read once per loaded task. ponytail: two reads per task asked, only list, show
+    and tick ask, and only for the tasks they print or release."""
+    if 'active' not in item:
+        item['active'] = active(item['iid'])
+    return int(time.time() - item['active']) // 60
+
+
 def doing_since(iid):
     """When the issue last entered doing, by GitLab's own clock: the newest `add q-doing` label event."""
     return max([stamp(event['created_at']) for event in pages(f'issues/{iid}/resource_label_events')
@@ -671,8 +704,7 @@ def listing(args):
         if item['state'] == 'ready':
             detail = refusal(item, everything, open_iids) or ('continue' if claim else '')
         elif item['state'] == 'doing':
-            detail = (f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]}' + (f' @{machine(claim["host"])}' if claim.get('host') else '')
-                      + f', last change {item["age"]} min ago')
+            detail = f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]}{where(claim)}, last change {age(item)} min ago'
         elif item['state'] == 'waiting':
             detail = f'open dependencies {sorted(set(item["deps"]) & open_iids)}'
         elif item['state'] == 'later':
@@ -1543,8 +1575,8 @@ def view(args):
     item = parse({**issue, 'labels': labels if closed else issue['labels']}) or fail(f'#{args.iid} is not a taskq task')
     claim = item['claim'] or {}
     print(f'#{item["iid"]} {item["title"]}\nstate: ' + ('closed' if closed else item['state'])
-          + f', p{item["priority"]}, runtime {item["runtime"] or "any"}, last change {item["age"]} min ago')
-    print('claim: ' + (f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]}' + (f' @{machine(claim["host"])}' if claim.get('host') else '') if claim else 'none'))
+          + f', p{item["priority"]}, runtime {item["runtime"] or "any"}, last change {age(item)} min ago')
+    print('claim: ' + (f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]}{where(claim)}' if claim else 'none'))
     found = notes(comments(item['iid']))
     for body in found[-args.notes:]:
         print('\n---\n' + body)
@@ -1739,11 +1771,11 @@ def tick(args):
     contract_news(args.prompt_version)
     loaded, candidates = profile(args)
     selected = {item['iid'] for item in candidates}
-    stalled = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and item['age'] > STALE_MINUTES]
+    stalled = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and age(item) > STALE_MINUTES]
     for item in stalled:
         if not unchanged(item):
             continue
-        args.iid, args.action, args.text = item['iid'], 'release', f'no change on the issue for {item["age"]} minutes'
+        args.iid, args.action, args.text = item['iid'], 'release', f'no change on the issue for {age(item)} minutes'
         requeue(args)
         print(f'Released stalled {ref(item)}.')
     loaded = load() if stalled else loaded
@@ -1806,11 +1838,10 @@ def tick(args):
     # #83: one table of every worker; the owner's chat opens only http(s) links.
     workers = [item for item in everything if item['state'] in ('doing', 'ask', 'review') and (item['claim'] or {}).get('session')]
     agents = claude_agents() if any(item['claim'].get('runtime') == 'claude' for item in workers) else {}
-    on = lambda item: f' @{machine(item["claim"]["host"])}' if item['claim'].get('host') else ''
     idle, rows = [], []
     for item in workers:
         session, runtime = item['claim']['session'], item['claim'].get('runtime')
-        agent, activity = agents.get(session), f'issue {item["age"]} min ago'
+        agent, activity = agents.get(session), f'issue {age(item)} min ago'
         if agent:
             activity = f'{"running" if agent.get("pid") else "stopped"}, {activity}'
         if runtime == 'codex' and item['state'] == 'doing':
@@ -1827,7 +1858,7 @@ def tick(args):
                     idle.append(item)
             except (OSError, SystemExit, ValueError) as error:
                 activity = f'status unknown: {codex_line(error)}'
-        rows.append(f'| {ref(item)} {item["title"][:40].replace("|", "/")} | {item["state"]} | {runtime}{on(item)} '
+        rows.append(f'| {ref(item)} {item["title"][:40].replace("|", "/")} | {item["state"]} | {runtime}{where(item["claim"])} '
                     f'| {session_link(item["claim"], agent)} | {activity} |')
     if rows:
         print('## Workers\n\nShow the owner this table as printed; every link opens in a browser:\n\n'
@@ -1840,7 +1871,7 @@ def tick(args):
         print()
     # An app without a status API: silence on the issue is the only sign its turn ended without a hand-in.
     quiet = [item for item in everything if item['state'] == 'doing' and (item['claim'] or {}).get('runtime') in EXECUTORS
-             and not item.get('result') and QUIET_MINUTES <= item['age'] < QUIET_MINUTES + 5]
+             and not item.get('result') and QUIET_MINUTES <= age(item) < QUIET_MINUTES + 5]
     if quiet:
         print(f'## Quiet workers\n\nNo change on the issue for {QUIET_MINUTES} minutes. Nudge each (this tick only):\n')
         for item in quiet:

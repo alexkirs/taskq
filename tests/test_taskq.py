@@ -762,7 +762,13 @@ class Cycle(unittest.TestCase):
             self.assertIn(f"--runtime claude --name 'T{win} t'", self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
             self.do({'CLAUDE_CODE_SESSION_ID': 'win-session', 'CODEX_THREAD_ID': ''}, 'take', win)
             self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
-        self.assertEqual(q.parse(self.gitlab.issues[win])['claim']['host'], 'DESKTOP-7.lan')
+        # #39: the public claim names the machine by a hash only; this machine and [hosts] still read it by name.
+        claim = q.parse(self.gitlab.issues[win])['claim']
+        self.assertEqual((claim['node'], 'host' in claim), (q.node('DESKTOP-7.lan'), False))
+        self.assertNotIn('DESKTOP', self.gitlab.issues[win]['description'])
+        with patch.object(q, 'HOSTS', {'DESKTOP-7.lan': 'win'}):
+            self.assertIn(f'#{win:<4} doing', self.do(CLAUDE, 'list'))
+            self.assertIn('@win, last change', self.do(CLAUDE, 'list'))
         with patch.dict(os.environ, {'TASKQ_HOST': 'win'}):
             self.assertEqual(q.machine(), 'win')
 
@@ -975,6 +981,22 @@ class Cycle(unittest.TestCase):
         self.assertEqual(self.gitlab.locked(), [])  # the release took the lock off
         self.assertIn('continue', self.do(CLAUDE, 'list'))
         self.do(CLAUDE, 'take', iid)
+
+    def test_outsider_comments_do_not_keep_a_dead_workers_task(self):
+        """#39: stall age comes from collaborators' notes and label events, not `updated_at` that anyone moves."""
+        iid = self.add('--type', 'research', '--runtime', 'any')
+        self.do(CODEX, 'take', iid)
+        old = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 3 * 3600))
+        for item in [*self.gitlab.notes.values(), *self.gitlab.events[iid]]:
+            item['created_at'] = old  # the worker died three hours ago
+        q.api('POST', f'issues/{iid}/notes', {'body': 'spam', 'author': 9})
+        self.assertIn('last change 180 min ago', self.do(CLAUDE, 'list'))
+        self.assertIn(f'Released stalled {link(iid)}', self.do(CLAUDE, 'tick'))
+        self.assertEqual(self.state(iid), 'ready')
+
+    def test_brief_says_taskq_text_is_public(self):
+        iid = self.add('--type', 'research')
+        self.assertIn('Everything you write through `taskq` is public', self.do(CLAUDE, 'worker'))
 
     def test_codex_archive_refuses_a_working_thread(self):
         class Server:

@@ -92,6 +92,34 @@ class AppIpc:
         raise AssertionError(f'unexpected IPC method: {method}')
 
 
+GL, GH = 'https://gitlab.example/g/p/-/issues/', 'https://github.com/owner/x/issues/'
+
+
+def link(iid, base=GL):
+    """#83: a task as tick prints it, clickable."""
+    return f'[#{iid}]({base}{iid})'
+
+
+def tick_links(case, issues, commits):
+    """#83: tick links every task, each worker session and the reviewed commit; `list --links` adds the URL."""
+    iid = case.add('--type', 'code', '--runtime', 'claude')
+    case.do(CLAUDE, 'take', iid)
+    row = case.do(COORDINATOR, 'tick').split('## Workers')[1]
+    case.assertIn(f'| {link(iid, issues)} t | doing | claude', row)
+    case.assertIn('| app session `local_claude-session` |', row)  # no Remote Control record on this machine
+    job = q.CLAUDE_JOBS / 'claude-s' / 'state.json'
+    job.parent.mkdir(parents=True)
+    job.write_text(json.dumps({'sessionId': 'claude-session', 'bridgeSessionId': 'cse_01Abc'}))
+    case.assertIn('| [session](https://claude.ai/code/session_01Abc) |', case.do(COORDINATOR, 'tick'))
+    case.do(CLAUDE, 'result', iid, '--sha', 'abc1234', '--text', 'x', '--checks', 'x')
+    review = case.do(COORDINATOR, 'tick')
+    case.assertIn(f'## Review {link(iid, issues)}: t', review)
+    case.assertIn(f'Commit: [abc1234]({commits}abc1234)', review)
+    case.assertIn(f'| {link(iid, issues)} t | review |', review)
+    case.assertNotIn(issues, case.do(COORDINATOR, 'list'))
+    case.assertIn(f'{issues}{iid} t', case.do(COORDINATOR, 'list', '--links'))
+
+
 class Gitlab:
     """Issues, labels and notes the way taskq uses them; note ids are the server order, times are real."""
     def __init__(self):
@@ -150,7 +178,7 @@ class Gitlab:
             return self.boards[-1] if method == 'POST' else self.boards
         if method == 'POST' and path == 'issues':
             iid = len(self.issues) + 1
-            self.issues[iid] = {'iid': iid, 'state': 'opened', 'web_url': f'url/{iid}', 'title': body['title'],
+            self.issues[iid] = {'iid': iid, 'state': 'opened', 'web_url': f'{GL}{iid}', 'title': body['title'],
                                 'description': body['description'], 'labels': body['labels'].split(','),
                                 'assignees': [{'id': uid} for uid in body.get('assignee_ids', [])],
                                 'milestone_id': body.get('milestone_id'), 'updated_at': self.now(), 'created_at': self.now(),
@@ -235,7 +263,7 @@ def take_during_tick(case):
     with patch.object(q, 'load', racing):
         output = case.do(CLAUDE, 'tick')
     case.assertIn(f'Skipped #{iid}: its state is doing now since this tick read it.', output)
-    case.assertNotIn(f'Moved #{iid}', output)
+    case.assertNotIn(f'Moved [#{iid}]', output)
     case.assertEqual(case.state(iid), 'doing')
     current = q.task(iid)
     case.assertEqual(current['claim']['session'], 'codex-session')
@@ -254,6 +282,7 @@ class Cycle(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
         self.agents = {}  # `claude agents --json --all`, by session id
+        self.enterContext(patch.object(q, 'CLAUDE_JOBS', self.directory / 'jobs'))
         for target, value in (('api', self.gitlab), ('claude_agents', lambda: self.agents),
                               ('Codex', lambda **kwargs: self.codex), ('CodexIpc', lambda **kwargs: self.ipc)):
             patcher = patch.object(q, target, value)
@@ -295,8 +324,8 @@ class Cycle(unittest.TestCase):
         self.assertNotIn(f'#{task} ', listed)
         self.assertNotIn(f'#{problem} ', listed)
         output = self.do(CLAUDE, 'tick')
-        self.assertIn(f'Inbox: 3 issues by non-collaborators (#{task}, #{odd}, #{problem})', output)
-        self.assertNotIn(f'#{odd} labels', output)
+        self.assertIn(f'Inbox: 3 issues by non-collaborators ({link(task)}, {link(odd)}, {link(problem)})', output)
+        self.assertNotIn(f'{link(odd)} labels', output)
         self.assertNotIn('Problems without a task', output)
 
     def test_only_collaborators_comments_reach_brief_review_questions_and_report(self):
@@ -448,7 +477,7 @@ class Cycle(unittest.TestCase):
         self.do(COORDINATOR, 'tick')
         self.assertEqual(self.gitlab.locked(), [iid])  # younger than LOCK_SECONDS: maybe a take in progress
         with patch.object(q, 'LOCK_SECONDS', -1):
-            self.assertIn(f'Unlocked #{iid}', self.do(COORDINATOR, 'tick'))
+            self.assertIn(f'Unlocked {link(iid)}', self.do(COORDINATOR, 'tick'))
         self.do(CLAUDE, 'take', iid)
         self.assertEqual(self.gitlab.locked(), [iid])
         self.do(COORDINATOR, 'release', iid, '--text', 'dead worker')
@@ -477,10 +506,10 @@ class Cycle(unittest.TestCase):
         self.do(CLAUDE, 'problem', '--task', iid, '--text', 'slow')
         self.do(CLAUDE, 'beat', iid)
         self.assertEqual([body.split(' ')[0] for body in self.gitlab.said(iid)], ['**take**', '**beat**', '**problem**', '**beat**'])
-        self.assertIn('url/', self.do(CLAUDE, 'problem', '--text', 'glab hung\nfor a minute'))
+        self.assertIn('/issues/', self.do(CLAUDE, 'problem', '--text', 'glab hung\nfor a minute'))
         problem = len(self.gitlab.issues)
         self.assertEqual(self.gitlab.issues[problem]['labels'], ['problem'])
-        self.assertIn(f'#{problem} problem: glab hung', self.do(COORDINATOR, 'tick'))
+        self.assertIn(f'{link(problem)} problem: glab hung', self.do(COORDINATOR, 'tick'))
         self.assertIn(f'#{problem}    problem  problem: glab hung', self.do(COORDINATOR, 'list'))
         self.assertIn('glab hung', self.do(COORDINATOR, 'report').split('# Problems')[1])
         self.gitlab.issues[problem]['state'] = 'closed'
@@ -534,21 +563,21 @@ class Cycle(unittest.TestCase):
         dep = self.add('--type', 'research', '--scope', 'a')
         iid = self.add('--type', 'code', '--scope', 'b', '--deps', dep)
         self.assertIn((iid, dep), self.gitlab.links)  # add links each dependency
-        self.assertIn(f'Moved #{iid} ready → waiting', self.do(CLAUDE, 'tick'))
+        self.assertIn(f'Moved {link(iid)} ready → waiting', self.do(CLAUDE, 'tick'))
         self.assertEqual(self.state(iid), 'waiting')
         self.assertIn(f'open dependencies [{dep}]', self.do(CLAUDE, 'list'))
         # A hand moving it back to ready while the dependency is open is undone by the next tick.
         self.gitlab('PUT', f'issues/{iid}', {'description': self.gitlab.issues[iid]['description'],
                                              'add_labels': 'q-ready', 'remove_labels': 'q-waiting'})
-        self.assertIn(f'Moved #{iid} ready → waiting', self.do(CLAUDE, 'tick'))
+        self.assertIn(f'Moved {link(iid)} ready → waiting', self.do(CLAUDE, 'tick'))
         self.gitlab.issues[dep]['state'] = 'closed'
-        self.assertIn(f'Moved #{iid} waiting → ready', self.do(CLAUDE, 'tick'))
+        self.assertIn(f'Moved {link(iid)} waiting → ready', self.do(CLAUDE, 'tick'))
         self.assertEqual(self.state(iid), 'ready')
         other = self.add('--type', 'code', '--scope', 'c')
         self.do(CLAUDE, 'edit', iid, '--deps', other, '--milestone', 'Maps')
         self.assertIn((iid, other), self.gitlab.links)
         self.assertEqual(self.gitlab.issues[iid]['milestone_id'], 5)
-        self.assertIn(f'Moved #{iid} ready → waiting', self.do(CLAUDE, 'tick'))
+        self.assertIn(f'Moved {link(iid)} ready → waiting', self.do(CLAUDE, 'tick'))
         self.assertIn("no active milestone 'None'", self.refused(CLAUDE, 'edit', iid, '--milestone', 'None'))
 
     def test_question_is_shown_once_then_in_the_daily_summary(self):
@@ -582,9 +611,9 @@ class Cycle(unittest.TestCase):
             self.gitlab('PUT', f'issues/{iid}', {'description': self.gitlab.issues[iid]['description'],
                                                  'add_labels': add, 'remove_labels': remove})
         output = self.do(CLAUDE, 'tick')
-        self.assertIn(f'#{doing} is doing without a worker', output)
-        self.assertIn(f'#{review} is in review without a result', output)
-        self.assertIn(f'#{off} labels', output)
+        self.assertIn(f'{link(doing)} is doing without a worker', output)
+        self.assertIn(f'{link(review)} is in review without a result', output)
+        self.assertIn(f'{link(off)} labels', output)
         self.assertIn('not a valid task', self.do(CLAUDE, 'list'))
 
     def test_code_brief_names_one_tree_and_the_prepare_table(self):
@@ -741,9 +770,9 @@ class Cycle(unittest.TestCase):
         self.do(CLAUDE, 'answer', mine, '--text', 'yes')
         self.do(CLAUDE, 'result', mine, '--sha', 'abc1234', '--text', 'done', '--checks', 'ok')
         self.gitlab.uid = 1
-        self.assertNotIn(f'## Review #{mine}', self.do(CLAUDE, 'tick'))
+        self.assertNotIn(f'## Review {link(mine)}', self.do(CLAUDE, 'tick'))
         self.gitlab.uid = 2
-        self.assertIn(f'## Review #{mine}', self.do(CLAUDE, 'tick', '--mine'))
+        self.assertIn(f'## Review {link(mine)}', self.do(CLAUDE, 'tick', '--mine'))
         typo = self.do(CLAUDE, 'tick', '--filter', 'labels=area-typo')
         self.assertIn('candidates=0', typo)
         self.assertIn('Warning:', typo)
@@ -892,7 +921,7 @@ class Cycle(unittest.TestCase):
         self.do(CODEX, 'take', iid)
         self.assertIn('last change 0 min ago', self.do(CLAUDE, 'list'))
         with patch.object(q, 'STALE_MINUTES', -1):
-            self.assertIn(f'Released stalled #{iid}', self.do(CLAUDE, 'tick'))
+            self.assertIn(f'Released stalled {link(iid)}', self.do(CLAUDE, 'tick'))
         self.assertEqual(self.state(iid), 'ready')
         self.assertEqual(self.gitlab.locked(), [])  # the release took the lock off
         self.assertIn('continue', self.do(CLAUDE, 'list'))
@@ -1125,17 +1154,17 @@ class Cycle(unittest.TestCase):
         runs, patched = self.run_recorded({'claude --bg': 'backgrounded · \x1b[36mabcd1234\x1b[39m · T1 x (idle — send a prompt to start)'})
         with patched:
             printed = self.do(CLAUDE, 'spawn', '--name', 'T1 x')
-            self.do(CLAUDE, 'spawn', '--name', 'T1 x', '--remote-control')
+            self.do(CLAUDE, 'spawn', '--name', 'T1 x', '--no-remote-control')
             self.do(CLAUDE, 'spawn', '--name', 'T1 x', '--text', 'Run the brief')
         self.assertEqual(printed.splitlines()[0], 'abcd1234-0000')
         self.assertIn('claude attach abcd1234', printed)
-        # csgo #303: the name says the machine; Remote Control is off unless asked for. #41: the prompt is last.
+        # csgo #303: the name says the machine. #83: Remote Control on unless turned off. #41: the prompt is last.
         # #51: only the 8 worker tools, no MCP. #71: dontAsk pinned, also in --settings (a --resume keeps only that).
         tools = ['--permission-mode', 'dontAsk', '--tools', 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch', '--strict-mcp-config', '--no-chrome']
         mode, off = '{"permissions": {"defaultMode": "dontAsk"}', ', "remoteControlAtStartup": false}'
-        self.assertEqual(runs, [['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', mode + off],
-                                ['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', mode + '}'],
-                                ['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', mode + off, 'Run the brief']])
+        self.assertEqual(runs, [['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', mode + '}'],
+                                ['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', mode + off],
+                                ['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', mode + '}', 'Run the brief']])
         self.agents = {}
         with self.run_recorded({'claude --bg': 'backgrounded · ffff0000 · T1 x'})[1]:
             self.assertIn('does not list the new session ffff0000', self.refused(CLAUDE, 'spawn'))
@@ -1175,13 +1204,15 @@ class Cycle(unittest.TestCase):
         self.assertIn('not opened in the app: it would run there without dontAsk', printed)
         self.assertIn('`claude attach s1short`', printed)
 
+    def test_tick_links_tasks_sessions_and_commits(self):
+        tick_links(self, GL, 'https://gitlab.example/g/p/-/commit/')
+
     def test_tick_lists_worker_sessions_and_retires_a_reviewed_background_worker(self):
         iid = self.add('--type', 'research', '--runtime', 'claude')
         self.do(CLAUDE, 'take', iid)
         self.agents = {'claude-session': {'id': 'claudese', 'sessionId': 'claude-session', 'pid': 3}}
-        listed = self.do(COORDINATOR, 'tick').split('## Claude worker sessions')[1]
-        self.assertIn(f'#{iid} @mac-1 t: background, running: `claude attach claudese`', listed)
-        self.assertIn('show claude-session', listed)
+        listed = self.do(COORDINATOR, 'tick').split('## Workers')[1]
+        self.assertIn(f'| {link(iid)} t | doing | claude @mac-1 | `claude attach claudese` | running, issue 0 min ago |', listed)
         self.do(CLAUDE, 'result', iid, '--checks', 'c', '--text', 'done')
         runs, patched = self.run_recorded()
         with patched:
@@ -1242,7 +1273,7 @@ class Cycle(unittest.TestCase):
         self.do(CODEX, 'take', iid)
         output = self.do(CLAUDE, 'tick')
         self.assertIn('## Codex idle', output)
-        self.assertIn('codex-session: idle; last event unknown', output)
+        self.assertIn(f'| {link(iid)} t | doing | codex @mac-1 | `open -g codex://threads/codex-session` | idle, last event unknown', output)
         self.assertIn('codex-send codex-session', output)
         self.codex.status = 'active'
         self.assertNotIn('## Codex idle', self.do(CLAUDE, 'tick'))
@@ -1417,7 +1448,7 @@ class GithubRest:
                                    'body': body['body'], 'labels': [self.label(name) for name in body.get('labels', [])],
                                    'assignees': [{'id': {'alice': 1, 'bob': 2}[login], 'login': login} for login in body.get('assignees', [])],
                                    'milestone': {'number': body['milestone']} if body.get('milestone') else None,
-                                   'html_url': f'url/{number}', 'comments': 0, 'created_at': self.now(), 'updated_at': self.now(),
+                                   'html_url': f'{GH}{number}', 'comments': 0, 'created_at': self.now(), 'updated_at': self.now(),
                                    'events': [], 'user': {'id': 1, 'login': 'alice'}, 'author_association': body.get('association', 'OWNER')}
             return self.issues[number]
         if route == 'issues':
@@ -1472,6 +1503,13 @@ class GithubCycle(unittest.TestCase):
         self.enterContext(patch.object(q, 'api', store))
         self.enterContext(patch.object(q, 'BOARDS', False))
         self.enterContext(patch.object(q, 'HOST', None))
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.enterContext(patch.object(q, 'CLAUDE_JOBS', Path(directory.name) / 'jobs'))
+        self.enterContext(patch.object(q, 'claude_agents', dict))
+
+    def test_tick_links_tasks_sessions_and_commits(self):
+        tick_links(self, GH, 'https://github.com/owner/x/commit/')
 
     def do(self, who, *argv):
         with patch.dict(os.environ, who), contextlib.redirect_stdout(io.StringIO()) as out:
@@ -1530,7 +1568,7 @@ class GithubCycle(unittest.TestCase):
         self.assertEqual(sorted(q.cleanup_issues()), [mine])
         self.assertEqual([item['iid'] for item in q.load()[0]], [mine])
         output = self.do(CLAUDE, 'tick')
-        self.assertIn(f'Inbox: 2 issues by non-collaborators (#{task}, #{problem})', output)
+        self.assertIn(f'Inbox: 2 issues by non-collaborators ({link(task, GH)}, {link(problem, GH)})', output)
         self.assertNotIn('Board mismatch', output)
         self.assertNotIn('Problems without a task', output)
 
@@ -1556,7 +1594,7 @@ class GithubCycle(unittest.TestCase):
         self.assertTrue(q.lock(number))
         self.assertFalse(q.lock(number))  # 422 Reference already exists
         with patch.object(q, 'LOCK_SECONDS', -1):
-            self.assertIn(f'Unlocked #{number}', self.do(CLAUDE, 'tick'))
+            self.assertIn(f'Unlocked {link(number, GH)}', self.do(CLAUDE, 'tick'))
         self.assertEqual(self.github.refs, {})
         other = {'CLAUDE_CODE_SESSION_ID': 'other-machine', 'CODEX_THREAD_ID': ''}
         self.do(other, 'take', number)
@@ -1677,10 +1715,10 @@ class GithubCycle(unittest.TestCase):
         out = self.do(CLAUDE, 'tick')
         self.assertIn('Board: project-url/1', out)
         self.assertEqual((self.state(deferred), self.state(restored), self.state(started)), ('later', 'ready', 'doing'))
-        self.assertIn(f'Board move of #{deferred} executed: ready → later', out)
+        self.assertIn(f'Board move of {link(deferred, GH)} executed: ready → later', out)
         self.assertTrue(any(item['body'] == '**later** · claude:claude-s\n\nmoved on the board' for item in self.github.comments.values()))
         self.assertIn(f'## Board mismatch', out)
-        self.assertIn(f'#{started} was moved on the board from doing to review: put back to doing', out)
+        self.assertIn(f'{link(started, GH)} was moved on the board from doing to review: put back to doing', out)
         self.assertEqual(self.github.column(started), 'doing')
         self.github.move(started, 'ready')
         self.assertIn(f'`taskq release {started}', self.do(CLAUDE, 'tick'))

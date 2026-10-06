@@ -180,8 +180,9 @@ Two machines each run their own tick and limits. A task for one machine only: `t
 "macbook-m2.local" = "mac"
 ```
 
-Worker sessions are named `T<N> … @mac`; spawned Claude workers have Remote Control off
-(`taskq spawn --remote-control` keeps it on).
+Worker sessions are named `T<N> … (mac)`; spawned Claude workers run with Remote Control, so `tick` links each
+one at `https://claude.ai/code/session_…` (`taskq spawn --no-remote-control` turns it off). `taskq list --links`
+adds each task's URL.
 
 A third worker app (e.g. a Grok bot) is one `[runtimes.<name>]` table in taskq.toml: `env`, `spawn`, `send`,
 optional `archive`, `doctor` and `setup` commands. `taskq doctor` runs its `doctor`, `doctor --fix` prints its

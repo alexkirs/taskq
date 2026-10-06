@@ -77,7 +77,7 @@ counts only on the machine that holds it. Tasks without a `host-*` label run on 
 takes them first. To send a task to Windows on purpose: `add --host win` (or the label `host-win`);
 the Mac's tick never starts it. Name the machines once in taskq.toml, `[hosts]` with
 `"<hostname>" = "<name>"`, or set `TASKQ_HOST` on that machine. Worker names end with ` (<name>)` (no `@`: SendMessage rejects it),
-`list` and the tick's "Claude worker sessions" show the machine of every doing worker.
+`list` and the tick's "Workers" table show the machine of every worker.
 
 ## 1. First use and check the place
 
@@ -378,21 +378,26 @@ free slot). The other runtime will not take the task. One at a time:
    shows it; Codex — `taskq codex-send <id> --text "<text>"`.
 3. Workers may be started back to back: `worker` may hand the same task to two concurrent workers,
    but `take` gives it to one, the other is refused and takes the next ([taskq](taskq.md) § Taking a task).
-4. Tell the owner, in one line per worker, how to watch it: the tick's section "Claude worker
-   sessions" lists every doing Claude worker with `claude attach <id>` and `taskq show <id>`.
+4. Show the owner the tick's "Workers" table as printed: one row per worker in doing, ask or review,
+   task link | state | runtime @machine | session link | last activity. Claude workers run with Remote
+   Control (#83, the owner's decision 2026-10-07; `taskq spawn --no-remote-control` turns it off): the
+   session link is `https://claude.ai/code/session_…`, which opens the live session in a browser or the
+   Claude app. Remote Control does not change the permission mode (the worker keeps `dontAsk`). No
+   deep link opens an existing local session by id, so a worker without Remote Control (or on another
+   machine) shows `claude attach <id>` or its app id instead. Codex has no https form: the cell is
+   the command `open -g codex://threads/<id>` (the chat does not open `codex://` links).
+   The URL comes from the job record `~/.claude/jobs/<short id>/state.json`, `bridgeSessionId`
+   `cse_<id>` = `session_<id>` (not in `claude agents --json`; checked live 2026-10-07, CLI 2.1.291).
    A task itself, read only (state, claim, last notes, result): `taskq view <N>`; `taskq show`
-   takes a Claude session id and imports it into the app.
-   The owner watches with `claude agents` / `claude attach` in a terminal of that machine, or on
-   request in the desktop app (§ "Showing a worker in the app"). Remote Control is off for spawned
-   workers (below); `taskq spawn --remote-control` keeps it on for a worker the owner wants on the phone.
+   takes a Claude session id and imports it into the app (§ "Showing a worker in the app").
 
 **Window focus on spawn (#270, 2026-10-06, app 2.19675.0, CLI 2.1.291).**
 - *Claude.* A worker is a `claude --bg` session (documented CLI: `claude agents`, `attach`, `logs`,
   `stop`, `rm`). The app's log shows no `setFocusedSession` for it: no window change. It is not in
   the app's session list; `ListAgents` shows it (`bg`), `SendMessage` reaches it live and
-  `notify_when_idle` reports the end of its turn. With the user setting `remoteControlAtStartup`
-  Remote Control turned on by itself, and the worker appeared in the owner's apps on other machines as if it
-  ran there; since csgo #303 spawn passes `--settings '{"remoteControlAtStartup": false}'` (checked live
+  `notify_when_idle` reports the end of its turn. With Remote Control on, the worker also appears in the
+  owner's apps on other machines (csgo #303): its name ends with ` (<machine>)`, so it does not look as if it
+  ran there. `--no-remote-control` passes `--settings '{"remoteControlAtStartup": false}'` (checked live
   2026-10-06, CLI 2.1.291: the default session shows `/rc connecting…`, the spawned one does not). Works from a
   `CronCreate` fire. Steering without SendMessage: `claude stop <id>`, then
   `claude --bg --resume <session id> "<text>"` wakes the same id.
@@ -459,8 +464,8 @@ via codex-send gets the explicit policy. `codex-read` shows the sandbox and appr
 last turn from its own `turn_context` record, including `network_access` if recorded; a missing
 record is shown as `unknown`, not replaced with the desired policy.
 
-**Silent worker.** The `Codex sessions` section prints the status and last-event age of each Codex
-doing task. `Codex idle` means idle or notLoaded while doing, with no result/ask:
+**Silent worker.** The "Workers" table prints, in "Last activity", the status and last-event age of each
+Codex doing task. `Codex idle` means idle or notLoaded while doing, with no result/ask:
 the worker stopped without submitting. Run the printed `codex-send`, ask it to continue the task and
 submit a result or send an ask. Do not start a second worker for the same doing task. If the status
 is active and a command is running, check its progress; event age alone does not prove a hang. No
@@ -543,7 +548,10 @@ record the exact refusal and do not work around it. Record the history-after-ope
 live-update-during-turn check separately; a completed reply does not prove a live subscription.
 
 **Reply to the owner.** When nothing changed — one or two lines. Do not write "no changes" without
-running the command.
+running the command. Every task, worker session and commit named in a reply is a link the owner clicks,
+copied from the tick output: `[#N](<issue URL>)`, the session link of the "Workers" table, the
+`Commit:` link of a review. Never a bare `#N`, session id or sha: the owner's chat opens only http(s) links.
+Show the "Workers" table and the board link (`Board:` line) once per pass.
 
 ## Cleaning up finished work
 

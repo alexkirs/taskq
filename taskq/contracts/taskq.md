@@ -359,8 +359,9 @@ Scheduling and creating sessions is an app action, not a script action.
 - **Claude desktop:** the coordinator is an ordinary session with a timer inside (`CronCreate`). A worker
   is created by `taskq spawn --name "T<N> <words>" --text "<worker prompt>"` as tick prints it: a `claude --bg`
   background session of the CLI in the main checkout that starts on the prompt (#270, 2026-10-06: the app
-  window does not change; #41: no SendMessage). The owner watches it by Remote Control
-  (claude.ai/code, phone), `claude agents` / `claude attach`, or on request in the app:
+  window does not change; #41: no SendMessage). Remote Control is on (#83; `--no-remote-control` turns it
+  off): the tick's "Workers" table links each worker's `https://claude.ai/code/session_…`. The owner watches
+  it there (browser, phone), `claude agents` / `claude attach`, or on request in the app:
   `taskq show <id>` stops the background run and imports the session with the link
   `claude://resume?session=<id>`, which is undocumented, may change with an app update and always
   shows the session for a moment (~0.2 s). A finished worker: `close` retires it on its machine; by hand `taskq retire <id>`. Worker sessions
@@ -373,7 +374,7 @@ Scheduling and creating sessions is an app action, not a script action.
   archives it by `taskq codex-archive` ([taskq-manager](taskq-manager.md) § Other machines).
   `codex-read <id> --limit N` shows the last N turns (default 3), events, the current
   operation and the actual sandbox of the last turn. `codex-send` prints `delivered` for a new
-  turn with an explicit policy or for a message steered into an active turn. Tick shows the status and event age
+  turn with an explicit policy or for a message steered into an active turn. Tick's "Workers" table shows the status and event age
   of `doing` Codex sessions and separately demands intervention when one stopped without result/ask.
   A Codex worker session is interactive: the owner writes to it in the app, and `codex-send` then
   delivers through the app ([taskq-manager](taskq-manager.md) § Shared Codex session).

@@ -583,7 +583,17 @@ def parse(issue):
             'assignees': [user['id'] for user in issue.get('assignees', [])], 'selftest': SELFTEST in labels,
             'priority': min([int(label[9:]) for label in labels if re.fullmatch(r'priority-\d', label)] or [9]),
             'age': int(time.time() - stamp(issue['updated_at'])) // 60, 'updated_at': issue['updated_at'],
-            'text': BLOCK.sub('', issue['description']).strip()}
+            'web_url': issue.get('web_url'), 'text': BLOCK.sub('', issue['description']).strip()}
+
+
+def ref(issue):
+    """#83: a task or issue as the owner clicks it, `[#N](url)`: tick's output and the coordinator's reply."""
+    return f'[#{issue["iid"]}]({issue["web_url"]})' if issue.get('web_url') else f'#{issue["iid"]}'
+
+
+def commit_url(issue, sha):
+    """The commit page next to the issue: GitHub `…/issues/N` → `…/commit/<sha>`, GitLab `…/-/issues/N` → `…/-/commit/<sha>`."""
+    return issue['web_url'].rsplit('/issues/', 1)[0] + f'/commit/{sha}'
 
 
 def render(text, block):
@@ -926,7 +936,8 @@ def listing(args):
             detail = f'open dependencies {sorted(set(item["deps"]) & open_iids)}'
         elif item['state'] == 'later':
             detail = item['waiting_for'] or ''
-        print(f'#{item["iid"]:<4} {item["state"]:<8} p{item["priority"]} {item["runtime"] or "any":<6} {item["title"]}' + (f'  [{detail}]' if detail else ''))
+        print(f'#{item["iid"]:<4} {item["state"]:<8} p{item["priority"]} {item["runtime"] or "any":<6} '
+              + (f'{item["web_url"]} ' if args.links else '') + item['title'] + (f'  [{detail}]' if detail else ''))
     for issue in odd:
         print(f'#{issue["iid"]:<4} ?        labels {issue["labels"]}: not a valid task, see `tick`')
     for issue in problems:
@@ -1651,6 +1662,7 @@ CODEX_SOCKET = Path.home() / '.codex/app-server-control/app-server-control.sock'
 CODEX_IPC = Path.home() / '.codex/ipc/ipc.sock'
 # The Claude app writes `<account>/<org>/local_<id>.json` here when it has imported a session.
 CLAUDE_APP_SESSIONS = Path.home() / 'Library/Application Support/Claude/claude-code-sessions'
+CLAUDE_JOBS = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude') / 'jobs'  # `claude --bg` job records
 # Design decision 2026-10-06: a Codex worker runs outside the sandbox and never asks. Inside it, git
 # could not write the main checkout's refs (`git worktree add`) and glab could not read its token.
 CODEX_TURN_POLICY = {'approvalPolicy': 'never', 'sandboxPolicy': {'type': 'dangerFullAccess'}}
@@ -2127,11 +2139,12 @@ def claude_env(extra=None):
 CLAUDE_WORKER_TOOLS = ['--permission-mode', PERMISSION_MODE, '--tools', 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch', '--strict-mcp-config', '--no-chrome']
 
 
-def claude_spawn(name, extra=None, prompt=None, remote_control=False):
+def claude_spawn(name, extra=None, prompt=None, remote_control=True):
     """The CLI session id of a new Claude worker: a `claude --bg` session named `name` (idle without
     `prompt`), which SendMessage reaches by that name. #270 (2026-10-06): no app window change at all.
-    Remote Control stays off unless asked: with the user's `remoteControlAtStartup` a worker would also appear in
-    the owner's apps on other machines and look as if it ran there (csgo #303; `/rc connecting…` gone, checked live)."""
+    #83 (owner's decision 2026-10-07): Remote Control on, so the worker has an https link (`claude_url`) and its
+    questions show in the app and web. It also shows in the owner's apps on other machines (csgo #303): the
+    name says the machine. Off: `remoteControlAtStartup: false` (`/rc connecting…` gone, checked live)."""
     # A `--resume` keeps only --name and --settings (#51): the mode goes into --settings as well.
     settings = {'permissions': {'defaultMode': PERMISSION_MODE}, **({} if remote_control else {'remoteControlAtStartup': False})}
     done = subprocess.run(['claude', '--bg', *CLAUDE_WORKER_TOOLS, '--name', name, '--settings', json.dumps(settings), *([prompt] if prompt else [])], cwd=ROOT,
@@ -2154,6 +2167,18 @@ def claude_agents():
     except (OSError, subprocess.SubprocessError, ValueError):
         listed = []
     return {item['sessionId']: item for item in listed if item.get('kind') == 'background' and item.get('sessionId')}
+
+
+def claude_url(session):
+    """The Remote Control URL of a background session, or None (Remote Control off, not this machine). Not in
+    `claude agents --json`: the job's `~/.claude/jobs/<short>/state.json` holds `bridgeSessionId` `cse_<id>`,
+    the same session the URL spells `session_<id>` (the CLI's own cse_→session_ shim; CLI 2.1.291, #83)."""
+    try:
+        job = json.loads((CLAUDE_JOBS / session[:8] / 'state.json').read_text())
+    except (OSError, ValueError):
+        return None
+    bridge = job.get('bridgeSessionId') if job.get('sessionId') == session else None
+    return bridge and 'https://claude.ai/code/session_' + bridge.removeprefix('cse_').removeprefix('session_')
 
 
 def claude_stop(session, remove=False):
@@ -2317,17 +2342,27 @@ def board_moves(everything, selected):
         else:
             api('PUT', f'board/items/{iid}', {'status': state})
             if target and {state, target} != {'ready', 'waiting'}:
-                misplaced.append(f'#{iid} was moved on the board from {state} to {target}: put back to {state}. Fix: {board_fix(state, target, iid)}')
+                misplaced.append(f'{ref(item)} was moved on the board from {state} to {target}: put back to {state}. Fix: {board_fix(state, target, iid)}')
             continue
         executed += 1
-        print(f'Board move of #{iid} executed: {state} → {target}.')
+        print(f'Board move of {ref(item)} executed: {state} → {target}.')
     return executed, misplaced
+
+
+def session_link(claim, agent=None):
+    """#83: how the owner opens a worker session. Claude: its Remote Control https URL; without one the
+    terminal command (background) or the app's id. Codex has no https form: its app link as a command."""
+    session = claim['session']
+    if claim.get('runtime') == 'claude':
+        url = claude_url(session)
+        return f'[session]({url})' if url else f'`claude attach {agent["id"]}`' if agent else f'app session `local_{session}`'
+    return f'`open -g codex://threads/{session}`' if claim.get('runtime') == 'codex' else f'`{session}`'
 
 
 def inbox_line(inbox):
     """Issues by non-collaborators, named so the manager sees them; taskq never acts on them. A collaborator makes
     one a task with `add` (a new task that links it)."""
-    return f'Inbox: {len(inbox)} issues by non-collaborators ({", ".join("#%d" % issue["iid"] for issue in sorted(inbox, key=lambda issue: issue["iid"]))})\n\n' if inbox else ''
+    return f'Inbox: {len(inbox)} issues by non-collaborators ({", ".join(map(ref, sorted(inbox, key=lambda issue: issue["iid"])))})\n\n' if inbox else ''
 
 
 def tick(args):
@@ -2347,14 +2382,14 @@ def tick(args):
             continue
         args.iid, args.action, args.text = item['iid'], 'release', f'no change on the issue for {item["age"]} minutes'
         requeue(args)
-        print(f'Released stalled #{item["iid"]}.')
+        print(f'Released stalled {ref(item)}.')
     loaded = load() if stalled else loaded
     # A lock on a task nobody holds: a take that died between the lock and the move, or a card moved by hand.
     held = {item['iid'] for item in loaded[0] if item['state'] not in ('ready', 'waiting')}
     for issue in issues(f'state=opened&my_reaction_emoji={LOCK}'):
         if issue['iid'] in selected and issue['iid'] not in held and all(time.time() - stamp(item['created_at']) > LOCK_SECONDS for item in locks(issue['iid'])):
             unlock(issue['iid'])
-            print(f'Unlocked #{issue["iid"]}: nobody holds it.')
+            print(f'Unlocked {ref(issue)}: nobody holds it.')
     misplaced = []
     if not BOARDS and api('GET', 'board'):
         print(f'Board: {api("GET", "board")["url"]}')
@@ -2373,7 +2408,7 @@ def tick(args):
         else:
             save(item, 'ready', 'ready', 'dependencies closed')
         moved += 1
-        print(f'Moved #{item["iid"]} {item["state"]} → {"ready" if item["state"] == "waiting" else "waiting"}.')
+        print(f'Moved {ref(item)} {item["state"]} → {"ready" if item["state"] == "waiting" else "waiting"}.')
     everything, _, odd, problems, inbox = loaded = load() if moved else loaded
     inventory = everything
     everything = [item for item in everything if item['iid'] in selected]
@@ -2385,10 +2420,10 @@ def tick(args):
     codex_stopped = [item for item in everything if item['state'] in ('ask', 'later')
                      and (item['claim'] or {}).get('runtime') == 'codex']
     # A card moved by hand on the board into a state its data does not support.
-    odd = [f'#{issue["iid"]} labels {issue["labels"]}: give it exactly one state label' for issue in odd] + [
-        f'#{item["iid"]} is doing without a worker: move it back to ready or `release {item["iid"]}`'
+    odd = [f'{ref(issue)} labels {issue["labels"]}: give it exactly one state label' for issue in odd] + [
+        f'{ref(item)} is doing without a worker: move it back to ready or `release {item["iid"]}`'
         for item in everything if item['state'] == 'doing' and not (item['claim'] or {}).get('session')] + [
-        f'#{item["iid"]} is in review without a result: `reject {item["iid"]}` or close it by hand'
+        f'{ref(item)} is in review without a result: `reject {item["iid"]}` or close it by hand'
         for item in everything if item['state'] == 'review' and not item['result']] + misplaced
     free, start = room(inventory, args.profile['limits']), []
     preferred = args.profile['preferred_runtime']
@@ -2405,13 +2440,17 @@ def tick(args):
         return print(inbox_line(inbox) + 'Nothing to do. Say so and stop.')
     print(f'You are the coordinator of the task queue for this one pass. Queue tool: `{TOOL}`\n')
     print(inbox_line(inbox), end='')
-    codex_doing = [item for item in everything if item['state'] == 'doing'
-                   and (item['claim'] or {}).get('runtime') == 'codex']
-    idle = []
-    if codex_doing:
-        print('## Codex sessions\n')
-        for item in codex_doing:
-            session = item['claim']['session']
+    # #83: one table of every worker; the owner's chat opens only http(s) links.
+    workers = [item for item in everything if item['state'] in ('doing', 'ask', 'review') and (item['claim'] or {}).get('session')]
+    agents = claude_agents() if any(item['claim'].get('runtime') == 'claude' for item in workers) else {}
+    on = lambda item: f' @{machine(item["claim"]["host"])}' if item['claim'].get('host') else ''
+    idle, rows = [], []
+    for item in workers:
+        session, runtime = item['claim']['session'], item['claim'].get('runtime')
+        agent, activity = agents.get(session), f'issue {item["age"]} min ago'
+        if agent:
+            activity = f'{"running" if agent.get("pid") else "stopped"}, {activity}'
+        if runtime == 'codex' and item['state'] == 'doing':
             try:
                 codex = Codex()
                 try:
@@ -2420,18 +2459,20 @@ def tick(args):
                     codex.socket.close()
                 # notLoaded with a running last turn: the app holds the session and works in it.
                 working = bool(turns) and turns[0].get('app', False)
-                print(f'- #{item["iid"]} {session}: {status["type"]}{" (turn running in the app)" if working else ""}; '
-                      f'last event {codex_age(last)}; `{TOOL} codex-read {session}`')
+                activity = f'{status["type"]}{" (turn running in the app)" if working else ""}, last event {codex_age(last)}'
                 if status['type'] in ('idle', 'notLoaded') and not working and not item.get('result'):
                     idle.append(item)
             except (OSError, SystemExit, ValueError) as error:
-                print(f'- #{item["iid"]} {session}: status unknown: {codex_line(error)}; '
-                      f'`{TOOL} codex-read {session}`')
-        print()
+                activity = f'status unknown: {codex_line(error)}'
+        rows.append(f'| {ref(item)} {item["title"][:40].replace("|", "/")} | {item["state"]} | {runtime}{on(item)} '
+                    f'| {session_link(item["claim"], agent)} | {activity} |')
+    if rows:
+        print('## Workers\n\nShow the owner this table as printed; every link opens in a browser:\n\n'
+              '| Task | State | Runtime | Session | Last activity |\n|---|---|---|---|---|\n' + '\n'.join(rows) + '\n')
     if idle:
         print('## Codex idle\n\nTask is doing without result/ask, but its session has stopped. Intervene now:\n')
         for item in idle:
-            print(f'- #{item["iid"]}: `{TOOL} codex-send {item["claim"]["session"]} '
+            print(f'- {ref(item)}: `{TOOL} codex-send {item["claim"]["session"]} '
                   '--text "Continue the assigned task; hand in result or ask the owner through taskq."`')
         print()
     # An app without a status API: silence on the issue is the only sign its turn ended without a hand-in.
@@ -2440,7 +2481,7 @@ def tick(args):
     if quiet:
         print(f'## Quiet workers\n\nNo change on the issue for {QUIET_MINUTES} minutes. Nudge each (this tick only):\n')
         for item in quiet:
-            print(f'- #{item["iid"]}: `{TOOL} send --runtime {item["claim"]["runtime"]} {item["claim"]["session"]} '
+            print(f'- {ref(item)}: `{TOOL} send --runtime {item["claim"]["runtime"]} {item["claim"]["session"]} '
                   '--text "Continue the assigned task; hand in result or ask the owner through taskq."`')
         print()
     if odd:
@@ -2449,12 +2490,11 @@ def tick(args):
     if problems:
         print('## Problems without a task\n\nRead each. Fix it now if small, else `add` a task for it; then close the '
               'issue with a note of what was done.\n')
-        print(data(''.join(f'- #{issue["iid"]} {issue["title"]}\n' for issue in problems).rstrip()))
-    agents = claude_agents() if any((item['claim'] or {}).get('runtime') == 'claude' and item['state'] in ('doing', 'review')
-                                    for item in everything) else {}
-    on = lambda item: f' @{machine(item["claim"]["host"])}' if item['claim'].get('host') else ''
+        print(data(''.join(f'- {ref(issue)} {issue["title"]}\n' for issue in problems).rstrip()))
     for item in review:
-        print(f'## Review #{item["iid"]}: {item["title"]}\n\n{item["text"]}\n\nHanded in:\n\n{data(handed_in(item))}\n'
+        sha = item['result'].get('sha')
+        print(f'## Review {ref(item)}: {item["title"]}\n\n{item["text"]}\n\nHanded in:\n\n{data(handed_in(item))}\n'
+              + (f'Commit: [{sha}]({commit_url(item, sha)})\n' if sha and item.get('web_url') else '') +
               f'Check the result against the Acceptance above (for code and docs read the commit).\n'
               f'Accepted: `{TOOL} close {item["iid"]} --text "<what you checked>"`. '
               f'Not accepted: `{TOOL} reject {item["iid"]} --text "<what to fix>"`.\n')
@@ -2463,29 +2503,19 @@ def tick(args):
     if start:
         # One command per worker: the session starts on the prompt, no second message (#41).
         # An indented block, not inline code: the prompt itself holds backticks.
-        print(f'## Start {len(start)} worker session(s)\n\nRun each command once; the worker starts on the brief at once:\n\n'
-              + ''.join('    ' + shlex.join([TOOL, 'spawn', '--runtime', item['runtime'], '--name',
+        print(f'## Start {len(start)} worker session(s)\n\n' + ''.join(f'- {ref(item)} {item["title"]}: {item["runtime"]}\n' for item in start)
+              + '\nRun each command once; the worker starts on the brief at once:\n\n' + ''.join('    ' + shlex.join([TOOL, 'spawn', '--runtime', item['runtime'], '--name',
                                              f'T{item["iid"]} {item["title"][:40]}', '--text', worker_prompt(args)]) + '\n'
                         for item in start))
-    live = [item for item in everything if item['state'] == 'doing' and (item['claim'] or {}).get('runtime') == 'claude'
-            and item['claim'].get('session')]
-    if live:
-        print('## Claude worker sessions\n\nTell the owner this list; the owner opens one when they want to watch it:\n')
-        for item in live:
-            session, agent = item['claim']['session'], agents.get(item['claim']['session'])
-            where = (f'background, {"running" if agent.get("pid") else "stopped"}: `claude attach {agent["id"]}`, '
-                     f'in the app: `{TOOL} show {session}`') if agent else f'app session `local_{session}`'
-            print(f'- #{item["iid"]}{on(item)} {item["title"][:48]}: {where}')
-        print()
     if fresh:
         print('## Waiting for the owner\n\nNew questions. Do not answer these yourself. End your reply with this list, verbatim:\n')
-        print(data('\n'.join(f'- #{item["iid"]} {item["title"]}: {text}' for item, text in fresh)))
+        print(data('\n'.join(f'- {ref(item)} {item["title"]}: {text}' for item, text in fresh)))
         for item, _ in fresh:
             if unchanged(item):
                 note(item['iid'], 'shown')
     if summary:
         print('## Still waiting for the owner (daily summary)\n\nEnd your reply with this list, verbatim:\n')
-        print(data('\n'.join(f'- #{item["iid"]} {item["title"]}: {text.splitlines()[0] if text else "no note"}'
+        print(data('\n'.join(f'- {ref(item)} {item["title"]}: {text.splitlines()[0] if text else "no note"}'
                           for item, text in summary)))
         for item, _ in summary:
             if unchanged(item):
@@ -2495,7 +2525,7 @@ def tick(args):
     if codex_stopped:
         print('\n## Archive stopped Codex workers\n\nTasks in ask or later continue in a new session after answer; archive when idle:\n')
         for item in codex_stopped:
-            print(f'- #{item["iid"]}: `{TOOL} codex-archive {item["claim"]["session"]}`')
+            print(f'- {ref(item)}: `{TOOL} codex-archive {item["claim"]["session"]}`')
 
 
 # --- cleanup: report first; only proven finished rows may be applied ---------------------------
@@ -2969,7 +2999,7 @@ class Selftest:
         self.step('take again', runtime, lambda: by_worker('take', iid, state='doing', action='take'))
         self.step('result', runtime, lambda: by_worker('result', iid, '--checks', 'selftest', '--text', 'selftest result',
                                                        state='review', action='result', claim=False))
-        self.step('tick: review', runtime, lambda: self.shows(iid, f'## Review #{iid}', 'selftest result'))
+        self.step('tick: review', runtime, lambda: self.shows(iid, f'## Review [#{iid}]', 'selftest result'))
         self.step('close', runtime, lambda: (self.owner('close', iid, '--text', 'selftest close'), self.fact(iid, closed=True, action='close'))[1])
 
     def shows(self, iid, *needles):
@@ -2977,7 +3007,7 @@ class Selftest:
         missing = [needle for needle in needles if needle not in text]
         if missing:
             raise SelftestError(f'tick does not print {missing}')
-        if any(f'#{iid} ' in line for line in self.mismatch(text)):
+        if any(re.search(rf'#{iid}\b', line) for line in self.mismatch(text)):
             raise SelftestError(f'tick names #{iid} under Board mismatch')
         return f'tick prints {needles[0]}'
 
@@ -3147,7 +3177,7 @@ class Selftest:
             return 'no taskq-<N> worktree of a selftest task'
 
         def board():
-            ours = [line for line in self.mismatch(self.tick()) if any(f'#{iid} ' in line for iid in created)]
+            ours = [line for line in self.mismatch(self.tick()) if any(re.search(rf'#{iid}\b', line) for iid in created)]
             if ours:
                 raise SelftestError('tick Board mismatch: ' + '; '.join(ours))
             return 'tick names no selftest task under Board mismatch'
@@ -3289,7 +3319,7 @@ def main(argv=None):
             (('--mine',), {'action': 'store_true'}), (('--area',), {'nargs': '+', 'default': []}),
             (('--label',), {'nargs': '+', 'default': [], 'help': argparse.SUPPRESS}))
     command('runtime', set_runtime, iid, (('runtime',), {'choices': (*RUNTIMES, 'any')}))
-    command('list', listing)
+    command('list', listing, (('--links',), {'action': 'store_true', 'help': 'also the URL of each task'}))
     # Absent flags stay None: the personal taskq.local.toml, then taskq.toml, then the defaults decide (`resolve`).
     profile_flags = ((('--filter',), {'help': 'GitLab issues query string, passed unchanged; \'\' means all areas'}),
                      (('--mine',), {'action': argparse.BooleanOptionalAction, 'help': 'only own assignments, or with --no-mine also the pool'}),
@@ -3310,7 +3340,8 @@ def main(argv=None):
             (('--preferred-runtime',), {'choices': tuple(RUNTIMES), 'help': 'tie-break for own tasks of any runtime'}))
     command('spawn', spawn, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),
             (('--name',), {'default': 'taskq worker', 'help': 'session name: "T<N> <words>"; " (<this machine>)" is added'}),
-            (('--remote-control',), {'action': 'store_true', 'help': 'Claude: keep Remote Control on (off by default)'}),
+            (('--remote-control',), {'action': argparse.BooleanOptionalAction, 'default': True,
+                                      'help': 'Claude: Remote Control, so tick links the session at claude.ai (default on)'}),
             (('--text',), {'help': 'the worker prompt the session starts on (tick prints it); idle without it'}))
     command('view', view, iid, (('--notes',), {'type': int, 'default': 3, 'help': 'last notes to print (default 3)'}))
     claude_session = (('session',), {'help': 'Claude session id (or local_<id>)'})

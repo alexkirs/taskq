@@ -60,6 +60,105 @@ It holds no secrets: the token belongs to `glab`.
 New project: `taskq init --project group/project` writes a minimal `taskq.toml` if none exists and
 creates the labels and the board (§ Schema and migration).
 
+### Shared and personal configuration: approved design (#32)
+
+This is an implementation handoff, not a description of shipped behavior. On 2026-10-06,
+the owner answered “yes to all three” through `ask`/`answer` on #32: use
+`taskq.local.toml` in the canonical main checkout, keep machine capacity local, and remove
+profile flags from the permanent coordinator prompt. The current CLI still reads only
+`taskq.toml` and profile arguments; the manager files the implementation task for Claude.
+
+| Setting | Owner | Today | Intended location |
+|---|---|---|---|
+| Tracker, host, repository/project, board | Project | `taskq.toml` | Shared file, unchanged |
+| Area names, workspace commands/helpers, brief rules, update policy | Project | `taskq.toml` | Shared file, unchanged |
+| Runtime adapter definitions | Project | `[runtimes]` in `taskq.toml` | Shared file, unchanged |
+| Selection filter, own assignments versus pool | Person | Tick prompt flags, copied into worker prompts | Personal `[profile]` |
+| Assignee identity | Person | Authenticated `gh`/`glab` user; issue assignee | CLI identity and tracker, never a configured username |
+| Preferred runtime for own `any` tasks | Person | No preference setting; runtime label and scheduler | Personal `[profile] preferred_runtime` |
+| Reply language | Person | Session/agent instructions | Existing instructions; no new language key in this change |
+| Claude/Codex capacity | Person on this machine | `--limit` in prompts; defaults Claude 2, Codex 3 | Personal `[profile.limits]`; CLI override for one invocation |
+| Running sessions and occupied slots | Session on this machine | Tracker claims with hostname and local legacy session evidence | Existing claims and detection; never config |
+| Codex app project/section | Person on this machine | Shared `[codex]` override or discovery by main-checkout path | Personal `[codex]`; discovery remains the default |
+| Claude worker permissions | Machine/user | `.claude/settings.local.json` | Same local permissions file, outside git |
+| Folder trust, app/CLI login and credentials | Machine/user | App/CLI secure state | Same native state; never either TOML file |
+
+The leaks are selection/capacity embedded in persistent prompts and app-specific Codex IDs
+allowed in the shared file. Move those values into the personal file; do not duplicate login,
+trust, permission or live session state there.
+
+Resolve the personal file as `<canonical main checkout>/taskq.local.toml`, using the existing
+`main_checkout` helper. All of that checkout's worktrees read the same file; a worktree-local
+copy does not override it. A checkout used by multiple people needs separate OS-user
+checkouts. No user registry, hostname map or automatic cloud synchronization is needed.
+
+```toml
+[profile]
+filter = "labels=area-maps" # empty means all areas
+mine = true                # false includes own assignments and the unassigned pool
+preferred_runtime = "codex" # optional: claude/codex/another configured runtime
+
+[profile.limits]
+claude = 1
+codex = 2
+
+[codex]
+# Optional local overrides; omit to discover/create by canonical checkout path.
+# project = "app-project-id"
+# section = "app-section-id"
+```
+
+Merge supported preference keys individually: explicit CLI flag > personal > shared >
+built-in default. Project-owned settings remain shared and are not personal overrides.
+Shared profile values may supply team defaults but must not contain one person's choices.
+Absent preferences preserve today's defaults: empty filter, `mine=false`, Claude 2/Codex 3
+(other configured runtimes 1), no preferred runtime, no Codex override. Limits are
+non-negative integers; zero disables that runtime. Reject invalid TOML/types/runtime names
+with the file/key and repair instruction; never silently broaden a malformed profile.
+
+Explicit false, empty filter and zero must override lower layers: add `--no-mine`, preserve
+`--filter ''`, and merge only runtime entries explicitly supplied in `--limit`. Distinguish
+absent arguments from argparse defaults. Preferred runtime is only a tie-break for the
+current user's `any` tasks when eligible capacity exists; it never overrides a task's
+`run-*` label, selects another person's work, reserves a slot, or prevents fallback to an
+eligible runtime. Unassigned tasks keep existing selection behavior.
+
+`tick` and `worker` reload the personal file on every invocation and print effective profile,
+candidate count and configuration source. Their unfiltered dependency/scope inventory and
+local-host capacity counting stay intact. The permanent CronCreate/automation prompt runs
+`taskq tick` without profile flags. Worker and retry prompts carry only explicit invocation
+overrides, including false/empty/zero; they do not freeze resolved personal defaults.
+Existing timers with profile flags must be inspected and migrated with coordinator authority:
+old flags otherwise continue winning. Do not create a second timer or start workers during
+profile setup. Until migration, print the overrides visibly in the profile card.
+
+Onboarding integrates with both modes in `taskq-manager.md` § 1. Missing personal file:
+show one short card asking areas/exclusions, only own assignments or pool, and this machine's
+Claude/Codex capacity; offer optional preferred runtime. Translate areas into the tracker
+filter without losing exclusions. After the person's confirmation, mode A supplies a
+concrete creation command for them to run; mode B writes it under agreed setup authority.
+Present file: print its effective card and ask “keep?”; keep preserves it, edits merge only
+confirmed preferences. Preserve unrelated existing keys. Saving a profile grants neither
+timer nor worker-launch authority. Do not persist the conversation, setup authority, secrets,
+trust decisions or permissions as profile answers.
+
+Add a non-interactive local command `taskq profile init` that writes confirmed CLI values
+and defaults when missing, refuses to overwrite an existing file, and changes no tracker,
+app permissions or timer. Doctor reads only: a missing personal file is a readiness gap
+with `taskq profile init` as the repair command and an instruction to confirm preferences
+through onboarding first. Invalid personal configuration or a tracked personal file is also
+a gap with a concrete repair instruction. Missing file does not block ordinary tick/worker:
+use existing defaults and show the gap; doctor still exits nonzero until it is resolved.
+
+`init` ensures exactly one `/taskq.local.toml` line in the main checkout's `.gitignore`,
+preserving existing content. Personal configuration is never committed. If already tracked,
+report it and propose `git rm --cached -- taskq.local.toml` while retaining the local file;
+do not silently delete it. On another machine, copy person preferences by hand or answer
+the onboarding card again; reconfirm capacity, discover the local Codex project, and do not
+blindly copy app IDs. Existing shared Codex overrides need an explicit migration: offer
+copying them into this person's local file, then remove shared IDs only with project-owner
+agreement; retain them as lower-priority compatibility values until migrated.
+
 ## States
 
 | Label | Meaning | Who sets and removes it |

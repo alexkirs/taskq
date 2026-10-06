@@ -30,6 +30,10 @@ BOARDS = True  # GitLab's board is a view over the q-* labels; GitHub's Projects
 AREAS = ()
 HOSTS = {}  # [hosts] of taskq.toml: hostname → short machine name (`mac`, `win`); the `host-<name>` label pins a task
 CODEX_PROJECT = CODEX_SECTION = None  # the Codex app's project and sidebar section for worker threads
+# The person's own settings: `taskq.local.toml` in the main checkout (all its worktrees read the same file, never
+# committed). [profile] is the tick/worker profile, [codex] the app project override; read anew on every use.
+LOCAL, SHARED = None, {}  # its path; [profile] of taskq.toml: team defaults under the personal file
+PROFILE_DEFAULTS = {'filter': '', 'mine': False, 'preferred_runtime': None}
 WORKSPACE = {
     'continue': 'this task was started before in worktree `taskq-{iid}` (`git worktree list` shows its path); continue there. If it is gone, create it: `git worktree add -b taskq-{iid} ../taskq-{iid} origin/main`.',
     'new': 'from the main checkout run `git fetch origin && git worktree add -b taskq-{iid} ../taskq-{iid} origin/main` and work only there.',
@@ -113,7 +117,7 @@ def main_checkout(start):
 def configure(path=None):
     """Load the project's taskq.toml: `path`, else the nearest one from the current directory up. Read only: a key it
     lacks takes its default in memory (a write would dirty the editable clone, and update stops on a dirty clone)."""
-    global RULES, HOST, HOSTS, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER
+    global RULES, HOST, HOSTS, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED
     import tomllib
     here = Path.cwd()
     path = Path(path) if path else next((folder / 'taskq.toml' for folder in (here, *here.parents)
@@ -146,11 +150,52 @@ def configure(path=None):
         UPDATE['auto'] = PROJECT_PATH.split('/')[0].lower() == REPO.rstrip('/').split('/')[-2].lower()
     RULES = ''.join(f'   {line}\n' for line in config.get('brief', {}).get('rules', '').strip().splitlines())
     ROOT = main_checkout(path.parent)
+    LOCAL = ROOT / 'taskq.local.toml'
+    SHARED = {'profile': config.get('profile', {})}
     TICK_BEAT = ROOT / '.local' / 'taskq-tick-last'
     WORKER = f'Run `cd {ROOT} && {TOOL} worker` and follow the instructions it prints.'
     # A new worker app is one table: its session variable, and the commands `selftest` drives it with.
     for name, item in config.get('runtimes', {}).items():
         RUNTIMES[name], EXECUTORS[name] = item['env'], item
+    SHARED = checked(SHARED, path)
+
+
+def checked(config, path):
+    """`config` ([profile], [profile.limits], [codex]) with its types and runtime names checked: a malformed profile
+    stops with the file and key, never silently broadens."""
+    where = lambda key: f'{path}: {key}'
+    profile, codex = config.get('profile', {}), config.get('codex', {})
+    unknown = [f'[{name}]' for name in config if name not in ('profile', 'codex')] + [
+        f'[profile] {key}' for key in profile if key not in (*PROFILE_DEFAULTS, 'limits')] + [
+        f'[codex] {key}' for key in codex if key not in ('project', 'section')]
+    if unknown:
+        fail(f'{where(unknown[0])}: unknown key; remove it (keys: `taskq contract`, § Project)')
+    for key, kind, text in (('filter', str, 'a string, e.g. "labels=area-maps" ("" means all areas)'),
+                            ('mine', bool, 'true or false'), ('preferred_runtime', str, 'a runtime name')):
+        if key in profile and not isinstance(profile[key], kind):
+            fail(f'{where("[profile] " + key)}: write {text}')
+    if profile.get('preferred_runtime', 'claude') not in RUNTIMES:
+        fail(f'{where("[profile] preferred_runtime")}: "{profile["preferred_runtime"]}" is not one of {", ".join(RUNTIMES)}')
+    limits = profile.get('limits', {})
+    if not isinstance(limits, dict):
+        fail(f'{where("[profile.limits]")}: write a table of runtime = N')
+    for name, count in limits.items():
+        if name not in RUNTIMES or isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            fail(f'{where("[profile.limits] " + name)}: write runtime = N for runtimes {", ".join(RUNTIMES)}, N a non-negative integer')
+    for key, value in codex.items():
+        if not isinstance(value, str):
+            fail(f'{where("[codex] " + key)}: write the app\'s id as a string')
+    return config
+
+
+def personal():
+    """The person's taskq.local.toml, checked; {} when there is none."""
+    return checked(read_toml(LOCAL), LOCAL) if LOCAL and LOCAL.is_file() else {}
+
+
+def codex_override(key):
+    """[codex] project/section: the personal file's, else taskq.toml's (kept until migrated), else None."""
+    return personal().get('codex', {}).get(key) or {'project': CODEX_PROJECT, 'section': CODEX_SECTION}[key]
 
 
 def read_toml(path):
@@ -671,10 +716,9 @@ def user():
 
 
 def limits(text):
-    found = {name: {'claude': 2, 'codex': 3}.get(name, 1) for name in RUNTIMES}
-    if not text:
-        return found
-    for pair in text.split(','):
+    """`--limit claude=1,codex=0`: only the entries it names; the others come from the lower layers (`resolve`)."""
+    found = {}
+    for pair in filter(None, text.split(',')):
         match = re.fullmatch(r'([\w-]+)=(\d+)', pair)
         if not match or match[1] not in RUNTIMES:
             raise argparse.ArgumentTypeError(f'expected runtime=N for runtimes {", ".join(RUNTIMES)}, N a non-negative integer')
@@ -708,17 +752,48 @@ def eligible(item, uid, mine=False):
     return assigned == [uid] or (not assigned and not mine)
 
 
+def default_limits():
+    return {name: {'claude': 2, 'codex': 3}.get(name, 1) for name in RUNTIMES}
+
+
+def resolve(args):
+    """The effective profile, each key from the first layer that has it: an explicit flag of this invocation, the
+    personal taskq.local.toml, [profile] of taskq.toml, the default. Returns it and {key: layer}."""
+    flags = {key: value for key, value in (('filter', args.filter), ('mine', args.mine), ('limits', args.limit)) if value is not None}
+    layers = (('flag', flags), (LOCAL.name, personal().get('profile', {})), ('taskq.toml', SHARED.get('profile', {})),
+              ('default', {**PROFILE_DEFAULTS, 'limits': default_limits()}))
+    found, source = {}, {}
+    for key in PROFILE_DEFAULTS:
+        source[key], found[key] = next((name, layer[key]) for name, layer in layers if key in layer)
+    found['limits'] = {}
+    for runtime in RUNTIMES:
+        source['limit.' + runtime], found['limits'][runtime] = next(
+            (name, layer['limits'][runtime]) for name, layer in layers if runtime in layer.get('limits', {}))
+    return found, source
+
+
 def profile(args):
+    """Load the queue and this invocation's candidates; print the effective profile and where each key came from.
+    Sets `args.profile` (the effective values and the user id) for `tick` and `worker`."""
+    found, source = resolve(args)
     # Filtering must not hide dependency or scope owners. Keep the unfiltered safety inventory.
     loaded = load()
-    matching = load(args.filter)[0] if args.filter else loaded[0]
+    matching = load(found['filter'])[0] if found['filter'] else loaded[0]
     # Selftest tasks are only for a profile that names them: no real worker or tick takes one.
-    matching = [item for item in matching if not item['selftest'] or SELFTEST in args.filter]
+    matching = [item for item in matching if not item['selftest'] or SELFTEST in found['filter']]
     uid = user()
-    candidates = [item for item in matching if eligible(item, uid, args.mine)]
-    print(f'Profile: host={machine()}; filter={args.filter!r}; mine={args.mine}; limit=' +
-          ','.join(f'{name}={count}' for name, count in args.limit.items()) + f'; candidates={len(candidates)}')
-    if args.filter and not candidates:
+    candidates = [item for item in matching if eligible(item, uid, found['mine'])]
+    args.profile = {**found, 'uid': uid}
+    print(f'Profile: host={machine()}; filter={found["filter"]!r}; mine={found["mine"]}; limit=' +
+          ','.join(f'{name}={count}' for name, count in found['limits'].items()) +
+          (f'; preferred_runtime={found["preferred_runtime"]}' if found['preferred_runtime'] else '') +
+          f'; candidates={len(candidates)}')
+    layers = {name: [] for name in ('flag', LOCAL.name, 'taskq.toml', 'default')}
+    for key, name in source.items():
+        layers[name].append(key)
+    print('Source: ' + '; '.join(f'{name}: {", ".join(keys)}' for name, keys in layers.items() if keys) +
+          ('' if LOCAL.is_file() else f'; no {LOCAL} (`{TOOL} doctor` names the command that writes it)'))
+    if found['filter'] and not candidates:
         print('Warning: nonempty filter returned 0 candidates; check the filter.')
     return loaded, candidates
 
@@ -869,7 +944,7 @@ def worker(args):
     """What a fresh worker session runs first: the brief of the first task that can start now."""
     loaded, candidates = profile(args)
     runtime = me()['runtime']
-    free = room(loaded[0], args.limit)
+    free = room(loaded[0], args.profile['limits'])
     found = [item for item in candidates if item['state'] == 'ready' and free[runtime] > 0
              and not refusal(item, loaded[0], loaded[1], runtime)]
     print(brief(found[0]).replace(f'{TOOL} worker`', f'{TOOL} worker{profile_arguments(args)}`')
@@ -1264,6 +1339,9 @@ def doctor(args):
     if config and origin and (origin[1].lower() != PROJECT_PATH.lower() or (HOST and origin[0] != HOST)):
         gap(f'origin is {origin[0]}/{origin[1]}, taskq.toml names {HOST or ""}{"/" * bool(HOST)}{PROJECT_PATH}',
             'run taskq from that project\'s checkout, or fix [github] repo / [gitlab] project and host in taskq.toml')
+    if config:
+        for what, fix in personal_gaps():
+            gap(what, fix)
     if config or origin:
         cli = 'gh' if github else 'glab'
         status = probe([cli, 'auth', 'status', *(['--hostname', host] if host else [])])
@@ -1282,6 +1360,48 @@ def doctor(args):
         except SystemExit as error:
             gap(f'{name} could not be read: {str(error).removeprefix("taskq: ")}', 'fix the cause above, then `taskq doctor` again')
     report_gaps(gaps)
+
+
+def personal_gaps():
+    """The personal taskq.local.toml: missing, invalid or committed. Reads only."""
+    if git('ls-files', '--error-unmatch', '--', LOCAL.name, cwd=LOCAL.parent) is not None:
+        return [(f'{LOCAL} is tracked by git: personal settings are never committed',
+                 f'cd {LOCAL.parent} && git rm --cached -- {LOCAL.name}  (keeps the local file), then commit')]
+    if not LOCAL.is_file():
+        return [(f'no personal profile {LOCAL} (areas, own tasks or pool, Claude/Codex slots of this machine)',
+                 f'{TOOL} profile init [--filter "labels=area-<name>"] [--mine | --no-mine] [--limit claude=N,codex=M] '
+                 f'[--preferred-runtime claude|codex]  (confirm the preferences through onboarding first: taskq-manager.md § 1)')]
+    try:
+        personal()
+    except SystemExit as error:
+        return [(str(error).removeprefix('taskq: '), f'fix {LOCAL} by hand (keys: `{TOOL} contract`, § Project)')]
+    return []
+
+
+def ignore_local():
+    """Exactly one `/taskq.local.toml` line in the main checkout's .gitignore (`init`, `profile init`)."""
+    path, line = LOCAL.with_name('.gitignore'), '/' + LOCAL.name
+    text = path.read_text() if path.exists() else ''
+    if line not in text.splitlines():
+        path.write_text(text + ('\n' if text and not text.endswith('\n') else '') + line + '\n')
+        print(f'added {line} to {path}')
+    if git('ls-files', '--error-unmatch', '--', LOCAL.name, cwd=LOCAL.parent) is not None:
+        print(f'{LOCAL} is tracked by git: run `cd {LOCAL.parent} && git rm --cached -- {LOCAL.name}` (keeps the file), then commit')
+
+
+def profile_init(args):
+    """`profile init`: write the person's confirmed profile to taskq.local.toml, built-in defaults for what no flag
+    names; an existing file is never overwritten. Changes nothing else: no tracker, permissions, timer or worker."""
+    if LOCAL.exists():
+        fail(f'{LOCAL} exists: edit it by hand; `profile init` never overwrites it')
+    mine = False if args.mine is None else args.mine
+    text = ('# taskq: this person\'s profile on this machine; never committed (keys: `taskq contract`, § Project).\n'
+            f'[profile]\nfilter = {json.dumps(args.filter or "")}\nmine = {str(mine).lower()}\n'
+            + (f'preferred_runtime = "{args.preferred_runtime}"\n' if args.preferred_runtime else '')
+            + '\n[profile.limits]\n' + ''.join(f'{name} = {count}\n' for name, count in {**default_limits(), **(args.limit or {})}.items()))
+    LOCAL.write_text(text)
+    print(f'wrote {LOCAL}')
+    ignore_local()
 
 
 def write_access(github):
@@ -1412,8 +1532,11 @@ def setup(args):
             print(f'ok: Codex app project {codex_project(Codex(timeout=60))}')
         else:
             person('open the Codex app and sign in', f'Codex workers need its server socket {CODEX_SOCKET}')
-    print('profile: taskq tick --limit claude=2,codex=3  (defaults: all areas, own tasks and the shared pool; '
-          'narrow with --filter "labels=area-<name>" --mine)')
+    if LOCAL.is_file():
+        print(f'ok: personal profile {LOCAL}')
+    else:
+        person(f'{TOOL} profile init <confirmed preferences>', 'the profile card of taskq-manager.md § 1 first: areas, own '
+               'tasks or pool, Claude/Codex slots; until then tick uses defaults (all areas, own tasks and the pool, 2/3)')
     print('No workers or timer started.' + (f' Pending for the person: {len(pending)} step(s) above.' if pending else ''))
     doctor(argparse.Namespace())
     if pending:
@@ -1424,7 +1547,9 @@ def migrate(args):
     """`init`: a new project, and once per schema change; idempotent. Labels for every state, runtime, type and
     priority; the board with one list
     per state in STATES order; state labels taskq no longer has leave the board, and leave GitLab once no
-    issue carries them; every open task gets its `relates_to` links. Claims, results and history stay."""
+    issue carries them; every open task gets its `relates_to` links. Claims, results and history stay. The personal
+    taskq.local.toml gets its .gitignore line."""
+    ignore_local()
     have = {label['name']: label for label in pages('labels')}
     for name in queue_labels():
         if name not in have:
@@ -1638,8 +1763,8 @@ def codex_send_app(codex, thread, metadata, text):
 def codex_project(codex):
     """The app's project whose root is the main checkout, created when none is; `[codex] project` overrides it.
     Found anew on every spawn: an id is per machine, the checkout path is what every machine shares."""
-    if CODEX_PROJECT:
-        return CODEX_PROJECT
+    if project := codex_override('project'):
+        return project
     root = os.path.realpath(ROOT)
     for project in codex.call('project/list', {}).get('data', []):
         if any(os.path.realpath(item['path']) == root for item in project.get('roots') or []):
@@ -1658,8 +1783,8 @@ def codex_spawn(name, prompt=None):
     thread = codex.call('thread/start', {'cwd': str(ROOT), 'projectId': codex_project(codex),
                                          'ephemeral': False, **CODEX_ACCESS})['thread']['id']
     codex.call('thread/name/set', {'threadId': thread, 'name': name})
-    if CODEX_SECTION:
-        codex.call('thread/section/move', {'threadId': thread, 'sectionId': CODEX_SECTION})
+    if section := codex_override('section'):
+        codex.call('thread/section/move', {'threadId': thread, 'sectionId': section})
     codex.call('turn/start', {'threadId': thread, **CODEX_TURN_POLICY,
                             'input': [{'type': 'text', 'text': prompt or 'Reply with the single word: ready'}]})
     if not prompt:
@@ -2043,8 +2168,11 @@ def tick_beat():
 
 
 def profile_arguments(args):
-    flags = (' --filter ' + shlex.quote(args.filter) if args.filter else '') + (' --mine' if args.mine else '')
-    flags += ' --limit ' + ','.join(f'{name}={count}' for name, count in args.limit.items())
+    """Only this invocation's explicit flags, false, empty and zero included: the rest each worker reads itself."""
+    flags = ' --filter ' + shlex.quote(args.filter) if args.filter is not None else ''
+    flags += {True: ' --mine', False: ' --no-mine', None: ''}[args.mine]
+    if args.limit:
+        flags += ' --limit ' + ','.join(f'{name}={count}' for name, count in args.limit.items())
     return flags
 
 
@@ -2156,11 +2284,14 @@ def tick(args):
         for item in everything if item['state'] == 'doing' and not (item['claim'] or {}).get('session')] + [
         f'#{item["iid"]} is in review without a result: `reject {item["iid"]}` or close it by hand'
         for item in everything if item['state'] == 'review' and not item['result']] + misplaced
-    free, start = room(inventory, args.limit), []
+    free, start = room(inventory, args.profile['limits']), []
+    preferred = args.profile['preferred_runtime']
     for item in startable(loaded=loaded):
         if item['iid'] not in selected:
             continue
-        who = item['runtime'] or max(free, key=free.get)
+        # The preferred runtime only breaks the tie for the user's own `any` task, and only while it has a free slot.
+        own = item.get('assignees') == [args.profile['uid']] and preferred and free.get(preferred, 0) > 0
+        who = item['runtime'] or (preferred if own else max(free, key=free.get))
         if free[who] > 0:
             free[who] -= 1
             start.append({**item, 'runtime': who})
@@ -2305,7 +2436,7 @@ def cleanup_codex(roots):
             response = codex.call('thread/list', {'archived': False, 'limit': 100, 'cursor': cursor})
             for thread in response['data']:
                 cwd = Path(thread.get('cwd') or '/').resolve()
-                if thread.get('projectId') == CODEX_PROJECT or cwd in roots:
+                if thread.get('projectId') == codex_override('project') or cwd in roots:
                     found[thread['id']] = thread
             cursor = response.get('nextCursor')
             if not cursor:
@@ -2670,7 +2801,7 @@ class Selftest:
         """A coordinator pass over selftest tasks only; it keeps the real tick's last-run time."""
         before = TICK_BEAT.stat().st_mtime if TICK_BEAT.exists() else None
         try:
-            return self.owner('tick', '--filter', f'labels={SELFTEST}')
+            return self.owner('tick', '--filter', f'labels={SELFTEST}', '--no-mine')  # selftest tasks are the pool's
         finally:
             if before is None:
                 TICK_BEAT.unlink(missing_ok=True)
@@ -2758,7 +2889,7 @@ class Selftest:
         iid, session, process = None, None, None
         name = f'selftest {self.stamp} {runtime}'
         log = ROOT / '.local' / SELFTEST / f'{self.stamp}-{runtime}.log'
-        prompt = (f'Run `cd {ROOT} && {TOOL} worker --filter labels={SELFTEST} --limit {runtime}=9` '
+        prompt = (f'Run `cd {ROOT} && {TOOL} worker --filter labels={SELFTEST} --no-mine --limit {runtime}=9` '
                   'and follow the instructions it prints.')
 
         def send():
@@ -2978,9 +3109,10 @@ def main(argv=None):
             (('--label',), {'nargs': '+', 'default': [], 'help': argparse.SUPPRESS}))
     command('runtime', set_runtime, iid, (('runtime',), {'choices': (*RUNTIMES, 'any')}))
     command('list', listing)
-    profile_flags = ((('--filter',), {'default': '', 'help': 'GitLab issues query string, passed unchanged'}),
-                     (('--mine',), {'action': 'store_true'}),
-                     (('--limit',), {'type': limits, 'default': limits(''), 'metavar': 'claude=N,codex=M'}))
+    # Absent flags stay None: the personal taskq.local.toml, then taskq.toml, then the defaults decide (`resolve`).
+    profile_flags = ((('--filter',), {'help': 'GitLab issues query string, passed unchanged; \'\' means all areas'}),
+                     (('--mine',), {'action': argparse.BooleanOptionalAction, 'help': 'only own assignments, or with --no-mine also the pool'}),
+                     (('--limit',), {'type': limits, 'metavar': 'claude=N,codex=M', 'help': 'slots on this machine; only the named runtimes'}))
     command('worker', worker, *profile_flags)
     command('take', take, iid)
     command('beat', beat, iid)
@@ -2993,6 +3125,8 @@ def main(argv=None):
     command('edit', edit, iid, (('--deps',), {'nargs': '*', 'type': int}),
             (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}))
     command('tick', tick, *profile_flags)
+    command('profile', profile_init, (('what',), {'choices': ('init',)}), *profile_flags,
+            (('--preferred-runtime',), {'choices': tuple(RUNTIMES), 'help': 'tie-break for own tasks of any runtime'}))
     command('spawn', spawn, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),
             (('--name',), {'default': 'taskq worker', 'help': 'session name: "T<N> <words>"; " (<this machine>)" is added'}),
             (('--remote-control',), {'action': 'store_true', 'help': 'Claude: keep Remote Control on (off by default)'}),

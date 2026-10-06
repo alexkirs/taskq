@@ -51,25 +51,25 @@ It holds no secrets: the token belongs to `glab`.
 | `[github] board` | Title of the Projects v2 board linked to the repository | the repository name (`owner/repo` → `repo`) |
 | `[gitlab] host` | GitLab host for `glab` (commands also work outside the project checkout) | `glab` picks it from the current directory's git remote |
 | `[areas] names` | Project work areas; `init` creates `area-*` labels | empty |
-| `[codex] project`, `section` | Override of the Codex app project for `spawn --runtime codex`, and its sidebar section | project: the app's project whose root is the main checkout (`project/list`), created by `project/create` when none is; no section |
+| `[codex] project`, `section` | Override of the Codex app project for `spawn --runtime codex`, and its sidebar section; kept for compatibility below the personal `[codex]` until migrated | project: the app's project whose root is the main checkout (`project/list`), created by `project/create` when none is; no section |
 | `[workspace] new`, `continue`, `none` | Brief text about the workspace; `{iid}` is the task number | `git worktree add` next to the checkout |
 | `[workspace] retire` | What `close` runs from the main checkout to remove the task's tree (then `git branch -d taskq-<N>`) | nothing: the tree stays |
 | `[workspace] cleanup_helpers` | Project folder with `workspace_gc.py`, `host_gentle.py`, `host_tools.py` for `cleanup` | none: `cleanup` refuses |
 | `[update] auto`, `every`, `ref` | `tick` updates taskq from REPO (github.com/alexkirs/taskq) at most `every` (`30m`, `24h`, `7d`); `taskq update` does it by hand. `ref = "main"`: the newest `main` commit whose CI check-runs passed; `ref = "stable"`: the `stable` tag, only when CI passed and the tag is signed by a key in the package's `allowed_signers` (README: Develop taskq). A refused update prints one line and nothing new runs; a clone whose new code does not start (`python3 -m taskq --version`) goes back. Missing keys take their defaults in memory; `taskq.toml` is never written | `auto`: `true` when the project's repository has REPO's owner, else `false`; `24h`; `main` |
+| `[profile]`, `[profile.limits]` | Team defaults for the tick/worker profile, below the personal file (§ Shared and personal configuration); never one person's choices | none |
 | `[brief] rules` | Project rules added to step 6 of every worker brief (budget, approvals, where the project's authorization is written) | nothing |
 
 New project: `taskq init --project group/project` writes a minimal `taskq.toml` if none exists and
 creates the labels and the board (§ Schema and migration).
 
-### Shared and personal configuration: approved design (#32)
+### Shared and personal configuration (#32, shipped by #48)
 
-This is an implementation handoff, not a description of shipped behavior. On 2026-10-06,
-the owner answered “yes to all three” through `ask`/`answer` on #32: use
+On 2026-10-06 the owner answered “yes to all three” through `ask`/`answer` on #32: use
 `taskq.local.toml` in the canonical main checkout, keep machine capacity local, and remove
-profile flags from the permanent coordinator prompt. The current CLI still reads only
-`taskq.toml` and profile arguments; the manager files the implementation task for Claude.
+profile flags from the permanent coordinator prompt. #48 implemented it as described below;
+the “Before” column is the state before #48.
 
-| Setting | Owner | Today | Intended location |
+| Setting | Owner | Before | Location |
 |---|---|---|---|
 | Tracker, host, repository/project, board | Project | `taskq.toml` | Shared file, unchanged |
 | Area names, workspace commands/helpers, brief rules, update policy | Project | `taskq.toml` | Shared file, unchanged |
@@ -143,7 +143,8 @@ confirmed preferences. Preserve unrelated existing keys. Saving a profile grants
 timer nor worker-launch authority. Do not persist the conversation, setup authority, secrets,
 trust decisions or permissions as profile answers.
 
-Add a non-interactive local command `taskq profile init` that writes confirmed CLI values
+The non-interactive local command `taskq profile init [--filter …] [--mine | --no-mine]
+[--limit claude=N,codex=M] [--preferred-runtime R]` writes confirmed CLI values
 and defaults when missing, refuses to overwrite an existing file, and changes no tracker,
 app permissions or timer. Doctor reads only: a missing personal file is a readiness gap
 with `taskq profile init` as the repair command and an instruction to confirm preferences
@@ -228,12 +229,16 @@ ready/waiting/later → ask (manager) → answer → ready
 - A task starts when dependencies are closed, its runtime matches the session and its scope does
   not overlap a started task. Manual `take N` checks these rules, takes any ready task regardless of
   its assignee, and assigns it to the authenticated `glab` user.
-- `tick` and `worker` accept a profile: `--filter "labels=area-maps"` (a GitLab issues query
-  string, sent unchanged), `--mine` (only assigned to the current user), and
-  `--limit claude=N,codex=M` (local machine slots, default 2 and 3; zero disables a runtime).
-  Without `--mine`, they consider the user's tasks and unassigned tasks, never another user's.
-  No profile file exists: arguments live in the tick prompt and are passed to each worker.
-  Every pass prints the profile and candidate count; a nonempty filter with no candidates warns.
+- `tick` and `worker` select by a profile: filter (`labels=area-maps`, a GitLab issues query
+  string, sent unchanged), mine (only assigned to the current user) and limits (local machine
+  slots, default Claude 2 and Codex 3; zero disables a runtime). Each key comes from
+  `taskq.local.toml`, reread on every run, below an explicit flag of that run (`--filter`, `--mine`
+  / `--no-mine`, `--limit claude=N,codex=M` with only the named runtimes) and above `[profile]` of
+  `taskq.toml` and the defaults (§ Shared and personal configuration).
+  Without mine, they consider the user's tasks and unassigned tasks, never another user's.
+  Every pass prints the effective profile, candidate count and the source of each key
+  (`Source: flag: …; taskq.local.toml: …; default: …`); a nonempty filter with no candidates warns.
+  The worker prompt carries only the run's explicit flags, never the resolved personal values.
 - Capacity counts `doing` claims on this machine, across areas. New claims record the hostname;
   pre-upgrade claims are recognized by local Claude import records or local Codex rollout files.
   Legacy detection reads only matching local filenames and does not need an app server.
@@ -362,7 +367,7 @@ Scheduling and creating sessions is an app action, not a script action.
   run without permission prompts: `.claude/settings.local.json` in the main checkout sets
   `bypassPermissions` (owner decision, 2026-10-05; the file is not in git).
 - **Codex:** an automation with the prompt "Run `cd <main checkout> && taskq tick` and follow
-  the instructions it prints". A Codex worker is created by `taskq spawn --runtime codex --text "<prompt>"`
+  the instructions it prints" (no profile flags: the profile is `taskq.local.toml`). A Codex worker is created by `taskq spawn --runtime codex --text "<prompt>"`
   (the prompt is the thread's first turn); later turns are sent by `taskq codex-send`, state is read by `taskq codex-read`, and after acceptance `close`
   archives it by `taskq codex-archive` ([taskq-manager](taskq-manager.md) § Other machines).
   `codex-read <id> --limit N` shows the last N turns (default 3), events, the current

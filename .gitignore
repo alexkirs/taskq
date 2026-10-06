@@ -3,3 +3,4 @@ __pycache__/
 build/
 .local/
 .worktrees/
+/taskq.local.toml

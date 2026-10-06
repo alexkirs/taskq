@@ -24,15 +24,20 @@ The session replies with the role it took and what is in the queue now.
 ## New person: one confirmation card, three steps
 
 1. Tell the session what you do, what you exclude, whether you want only your assignments,
-   and how many Claude/Codex sessions this machine can run. The session reads the project's
-   area labels and translates your words into CLI arguments. No profile file is written.
+   how many Claude/Codex sessions this machine can run and, optionally, which runtime you prefer
+   for your own tasks of any runtime. The session reads the project's area labels and translates
+   your words into a profile: `<main checkout>/taskq.local.toml` (personal, never committed;
+   `taskq doctor` names it while missing). A present file: show its effective card (`taskq tick`
+   prints the profile line and each key's source) and ask “keep?”; keep changes nothing, an edit
+   changes only the confirmed keys by hand and keeps the others.
 2. Check one card. Example for “maps, only my tasks; no engine; Claude 1, Codex 2”:
 
    ```text
    Areas: Maps (area-maps)
    Assignments: only mine; do not take the shared pool
    Local sessions: Claude 1 / Codex 2
-   Command: taskq tick --filter "labels=area-maps" --mine --limit claude=1,codex=2
+   Preferred runtime: none
+   Command: taskq profile init --filter "labels=area-maps" --mine --limit claude=1,codex=2
    Board: https://gitlab.example.com/group/project/-/boards/7?label_name[]=area-maps&assignee_username=me
    Engine exception: pool task with deps, or manual take; no automatic expansion.
    ```
@@ -43,25 +48,31 @@ The session replies with the role it took and what is in the queue now.
    the area pool and assignments; the CLI still excludes other people's assigned tasks locally.
    Preserve every exclusion. If an API filter cannot be represented by the board UI, say which
    part cannot be represented instead of claiming an identical board view.
-3. After “ok”, arm the existing 5-minute tick with those exact arguments in its prompt and in
-   the worker prompt it prints. A product-manager role alone does not authorize arming the tick.
-   Check the last-tick age first; do not arm a second coordinator on this machine.
+3. After “ok”: mode A gives the person the card's command to run; mode B runs it under the agreed
+   setup authority. `profile init` refuses to overwrite an existing file and changes nothing else.
+   Saving a profile grants neither timer nor worker-launch authority, and the file holds no
+   conversation, setup authority, secrets, trust or permissions. Arming the tick is § 2, a separate
+   agreement; a product-manager role alone does not authorize it.
 
-| What the person says | Profile or action |
+| What the person says | Profile (`profile init` flags) or action |
 |---|---|
-| I do everything | No filter, no `--mine`; own assignments plus shared pool |
+| I do everything | No filter, `--no-mine`; own assignments plus shared pool |
 | Only my tasks | `--mine`; shared pool is excluded |
 | Maps, except engine | `--filter "labels=area-maps"`; engine stays outside the profile |
-| My tasks plus unassigned maps | `--filter "labels=area-maps"`, without `--mine` |
+| My tasks plus unassigned maps | `--filter "labels=area-maps" --no-mine` |
+| Prefer Codex for my own tasks | `--preferred-runtime codex`: a tie-break for own `any` tasks while Codex has a free slot; never overrides `run-*`, never the pool |
 | Owner delegates a task | Set its GitLab assignee to the person; their tick sees it if it matches their filter |
 | A map needs an engine exception | Put an `area-engine` task in the pool with deps, or manually `take N` |
 | We are not doing this yet | `taskq later N --text "reason"`; excluded area stays outside the profile |
 
-Defaults need no setup: all areas, own assignments plus shared pool, local Claude 2 / Codex 3.
+Without the file tick and worker still run on the defaults (all areas, own assignments plus
+shared pool, local Claude 2 / Codex 3) and print where each value came from; doctor stays
+nonzero until the file exists. A flag on one `taskq tick` run overrides the file for that run only.
+On another machine answer the card again (capacity is per machine); never copy Codex app ids.
 `run-*` still states the app a task needs. Manual `take` assigns the current glab user and keeps
 normal dependency/runtime/scope checks. Limits never arbitrate between machines.
 
-**Two machines (csgo #303).** Each machine runs its own tick with its own `--limit`; a `doing` claim
+**Two machines (csgo #303).** Each machine runs its own tick with its own limits (its `taskq.local.toml`); a `doing` claim
 counts only on the machine that holds it. Tasks without a `host-*` label run on the machine whose worker
 takes them first. To send a task to Windows on purpose: `add --host win` (or the label `host-win`);
 the Mac's tick never starts it. Name the machines once in taskq.toml, `[hosts]` with
@@ -137,8 +148,9 @@ that scope needs its own agreement.
 Commands per mode: mode A runs the read-only `cd <main checkout> && taskq doctor` and prints its
 gaps as the numbered steps; mode B runs `cd <main checkout> && taskq doctor --fix` (add `--codex` when
 Codex workers were requested). `--fix` writes a minimal `taskq.toml` from `origin` when none exists,
-runs init for missing labels/board, reuses `codex_project` for the Codex app project, and prints the
-profile card's default command. It only reads folder trust (`~/.claude.json`) and the worker
+runs init for missing labels/board (init adds `/taskq.local.toml` to `.gitignore` once), reuses
+`codex_project` for the Codex app project, and prints `taskq profile init` as a `you:` line while the
+personal file is missing (it never guesses preferences). It only reads folder trust (`~/.claude.json`) and the worker
 permissions file: each missing one, the CLI install and login, the GitHub `project` scope and write
 access is a `you:` line with one command, never attempted. It stops at a missing CLI, login or write
 access; reruns print `ok:` for completed steps; exit 0 only when the closing `doctor` is ready and no
@@ -177,7 +189,7 @@ on Windows/Linux. If no supported installer is available, give one official inst
 | 4. Labels / board | `taskq init` for existing matching config | Doctor checks labels and board; report the actual board URL/ID. GitHub without `project` scope can run the queue with labels only; do not silently escalate scope or call full doctor green. |
 | 5. Folder trust | Open the main checkout in Claude; accept its folder trust prompt | Human-only consent; verify the app can access that checkout. Unavailable app/control access is reported as pending. |
 | 6. Worker permissions | Merge `<main checkout>/.claude/settings.local.json` using the allow list below; keep it outside git | Re-read valid JSON and the required entries; keep existing permissions. Do not enable bypass mode, launch a test worker or arm anything. |
-| 7. Profile card | Show the existing “New person” card above with defaults unless the person gives a narrower profile | Preserve exclusions; no profile file. Say “Check this profile card. Setup will stay idle.” Confirmation saves the session's profile, not timer authority. |
+| 7. Profile card | Show the “New person” card above (or the present file's card and “keep?”) | Preserve exclusions. Say “Check this profile card. Setup will stay idle.” After confirmation: mode A prints `taskq profile init …`, mode B runs it. Saving it is not timer authority. |
 
 If GitHub has no pushed commit, report the prerequisite before any worker can claim. Offer the
 resolved `git commit --allow-empty -m "Initialize repository"` and `git push -u origin HEAD`
@@ -192,7 +204,7 @@ Extras only on request, each with its requirement and exact message:
 
 Finish with exact wording, using actual results:
 
-> “Setup checked: [ready items]. Pending: [items or ‘none’]. Queue: [repository]. Board: [URL, ID or ‘deferred’]. Profile: [arguments]. No workers or timer started. Say ‘arm the tick’ when you want to start.”
+> “Setup checked: [ready items]. Pending: [items or ‘none’]. Queue: [repository]. Board: [URL, ID or ‘deferred’]. Profile: [taskq.local.toml card]. No workers or timer started. Say ‘arm the tick’ when you want to start.”
 
 Run `taskq list` after tracker readiness (including an explicitly accepted labels-only GitHub
 queue). Do not run selftest during minimum onboarding: it creates tasks; offer it only on request.
@@ -255,10 +267,19 @@ Tool `CronCreate` (loaded via ToolSearch), `recurring: true`, `cron: "*/5 * * * 
 `prompt`:
 
 ```
-taskq tick. Run `cd <main checkout> && taskq update; taskq tick <confirmed profile arguments>`
+taskq tick. Run `cd <main checkout> && taskq update; taskq tick`
 and do the coordinator pass by taskq-manager.md § 3 (`taskq contract` prints its path). Reply in the owner's language,
 one or two lines when nothing changed.
 ```
+
+The prompt has no profile flags: each tick rereads `taskq.local.toml`, so a profile change needs no
+new timer. Check the last-tick age first; do not arm a second coordinator on this machine.
+**Existing timers** armed before #48 carry `--filter`/`--mine`/`--limit` in their prompt, and those
+flags keep winning over the file (the tick's `Source: flag: …` line shows them). With coordinator
+authority: write the confirmed values with `taskq profile init` (mode A: the person runs it), check
+that `taskq tick` prints them from `taskq.local.toml`, then replace the timer's prompt with the one
+above (`CronDelete` the old one, `CronCreate` this one, in the same session; never two timers).
+Codex automations: edit the prompt to `taskq tick` without flags.
 
 The timer lives inside the session: while the app is open and for at most 7 days. After an app
 restart the owner says "arm the tick" — repeat this step. An app routine does not fit the tick: its
@@ -303,7 +324,7 @@ free slot). The other runtime will not take the task. One at a time:
    on the prompt at once; no SendMessage. Claude: a `claude --bg` session in the main checkout,
    no app window change (§ "Window focus on spawn"). Codex: the first turn of the new thread is the
    prompt (§ "Other machines"). spawn adds ` (<machine>)` to the name and prints the session id.
-   The prompt carries the confirmed profile arguments; edit only the profile, never the rest.
+   The prompt carries only the tick's explicit flags (usually none); never edit it.
 2. Later messages to a worker (an answer, a nudge): Claude — `SendMessage` to the name as `ListAgents`
    shows it; Codex — `taskq codex-send <id> --text "<text>"`.
 3. Workers may be started back to back: `worker` may hand the same task to two concurrent workers,

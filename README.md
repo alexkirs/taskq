@@ -134,12 +134,15 @@ Code/docs results require `--sha` of a commit pushed to `main`.
 
 ## Start workers
 
-Tell the manager your profile, then **“Arm the tick.”** Confirm its profile card.
-Expected: the coordinator follows tick instructions every 5 minutes.
+Tell the manager your profile, confirm its card, then **“Arm the tick.”**
+Expected: the coordinator runs `taskq tick` (no flags) every 5 minutes.
 
-| Profile | Arguments for both `tick` and `worker` |
+Your profile lives in `taskq.local.toml` of the main checkout: personal, never committed
+(`taskq init` adds it to `.gitignore`). `taskq profile init` writes it once:
+
+| Profile | `taskq profile init` arguments |
 |---|---|
-| All areas, your tasks plus shared pool | none |
+| All areas, your tasks plus shared pool | `--no-mine` |
 | Only your assigned tasks | `--mine` |
 | One area, your tasks plus its shared pool | `--filter "labels=area-maps"` |
 
@@ -152,12 +155,25 @@ names = ["maps"]
 Automatic selection excludes other people's assignments.
 
 ```bash
-taskq tick --filter "labels=area-maps" --mine --limit claude=1,codex=2
-taskq worker --filter "labels=area-maps" --mine --limit claude=1,codex=2
+taskq profile init --filter "labels=area-maps" --mine --limit claude=1,codex=2
+```
+
+```toml
+# taskq.local.toml
+[profile]
+filter = "labels=area-maps"
+mine = true
+preferred_runtime = "codex"  # optional: tie-break for your own tasks of any runtime
+
+[profile.limits]
+claude = 1
+codex = 2
 ```
 
 Expected: only your maps tasks; at most 1 Claude / 2 Codex workers on this machine.
-Defaults: Claude 2 / Codex 3. Profiles live in session prompts.
+Defaults: all areas, own tasks plus pool, Claude 2 / Codex 3. Every tick prints the profile and
+where each value came from. A flag (`--filter`, `--mine`/`--no-mine`, `--limit`) overrides the
+file for that one run.
 
 Two machines each run their own tick and limits. A task for one machine only: `taskq add … --host win`
 (label `host-win`). Name machines in taskq.toml or with `TASKQ_HOST=win`:

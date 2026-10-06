@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import taskq as q  # noqa: E402
 
 q.configure(Path(__file__).resolve().parent / 'taskq.toml')
+q.LOCAL = Path(tempfile.mkdtemp()) / 'taskq.local.toml'  # never the person's own file in the real main checkout
 # `cleanup` stands on a project's worktree tools; its tests run where a folder of them is named.
 HELPERS = os.environ.get('TASKQ_CLEANUP_HELPERS')
 if HELPERS:
@@ -725,6 +726,84 @@ class Cycle(unittest.TestCase):
         typo = self.do(CLAUDE, 'tick', '--filter', 'labels=area-typo')
         self.assertIn('candidates=0', typo)
         self.assertIn('Warning:', typo)
+
+    def personal(self, text):
+        q.LOCAL.write_text(text)
+        self.addCleanup(q.LOCAL.unlink, missing_ok=True)
+
+    def test_personal_profile_precedence_flag_over_local_over_shared_over_default(self):
+        maps = self.add('--type', 'code', '--area', 'maps')
+        self.add('--type', 'code', '--area', 'engine')
+        out = self.do(CLAUDE, 'tick')
+        self.assertIn("filter=''; mine=False; limit=claude=2,codex=3", out)
+        self.assertIn('Source: default: filter, mine, preferred_runtime, limit.claude, limit.codex; no ', out)
+        with patch.object(q, 'SHARED', {'profile': {'filter': 'labels=area-engine', 'limits': {'claude': 4}}}):
+            self.personal('[profile]\nfilter = "labels=area-maps"\nmine = true\n[profile.limits]\ncodex = 0\n')
+            out = self.do(CLAUDE, 'tick')
+            self.assertIn("filter='labels=area-maps'; mine=True; limit=claude=4,codex=0; candidates=0", out)
+            self.assertIn('Source: taskq.local.toml: filter, mine, limit.codex; taskq.toml: limit.claude; default: preferred_runtime\n', out)
+            # A flag wins for this run only; explicit false, empty and zero override the lower layers.
+            out = self.do(CLAUDE, 'tick', '--no-mine', '--filter', '', '--limit', 'claude=0')
+            self.assertIn("filter=''; mine=False; limit=claude=0,codex=0; candidates=2", out)
+            self.assertIn('flag: filter, mine, limit.claude', out)
+            self.assertNotIn('Start', out)
+            out = self.do(CLAUDE, 'tick', '--no-mine', '--limit', 'claude=1')
+            self.assertIn(f"--name 'T{maps} t'", out)
+            # The worker prompt carries only the explicit flags, never the resolved personal values.
+            self.assertIn("taskq worker --no-mine --limit claude=1` and follow", out.replace('\'"\'"\'', ''))
+            self.assertIn("mine=True", self.do(CLAUDE, 'tick'))
+
+    def test_worker_prompt_without_flags_has_none(self):
+        self.personal('[profile]\nmine = false\n[profile.limits]\nclaude = 1\n')
+        self.add('--type', 'code', '--mine')
+        self.assertIn('taskq worker` and follow', self.do(CLAUDE, 'tick'))
+        out = self.do(CLAUDE, 'tick', '--filter', '', '--mine')
+        self.assertIn("taskq worker --filter '' --mine` and follow", out.replace('\'"\'"\'', "'"))
+
+    def test_invalid_personal_profile_stops_with_file_and_key(self):
+        for text, error in (('[profile]\nmine = "yes"\n', '[profile] mine: write true or false'),
+                            ('[profile.limits]\nclaude = -1\n', '[profile.limits] claude: write runtime = N'),
+                            ('[profile.limits]\ngrok = 1\n', '[profile.limits] grok'),
+                            ('[profile]\npreferred_runtime = "grok"\n', 'is not one of claude, codex'),
+                            ('[profile]\nmines = true\n', '[profile] mines: unknown key'),
+                            ('[profile\n', 'not valid TOML')):
+            q.LOCAL.write_text(text)
+            self.assertIn(f'{q.LOCAL}: ', self.refused(CLAUDE, 'tick'))
+            self.assertIn(error, self.refused(CLAUDE, 'worker'))
+        q.LOCAL.unlink()
+
+    def test_preferred_runtime_breaks_the_tie_only_for_own_any_tasks(self):
+        self.personal('[profile]\npreferred_runtime = "claude"\n[profile.limits]\nclaude = 1\ncodex = 3\n')
+        pool = self.add('--type', 'code', '--runtime', 'any')
+        own = self.add('--type', 'code', '--runtime', 'any', '--mine')
+        out = self.do(CLAUDE, 'tick')
+        self.assertIn('preferred_runtime=claude', out)
+        self.assertIn(f"--runtime claude --name 'T{own} t'", out)
+        self.assertIn(f"--runtime codex --name 'T{pool} t'", out)  # the pool keeps the scheduler's choice
+        self.personal('[profile]\npreferred_runtime = "claude"\n[profile.limits]\nclaude = 0\n')
+        self.assertIn(f"--runtime codex --name 'T{own} t'", self.do(CLAUDE, 'tick'))  # no slot: falls back
+
+    def test_profile_init_writes_once_and_init_ignores_the_file_once(self):
+        gitignore = q.LOCAL.with_name('.gitignore')
+        gitignore.write_text('build/')
+        self.addCleanup(gitignore.unlink)
+        self.addCleanup(q.LOCAL.unlink, missing_ok=True)
+        out = self.do(CLAUDE, 'profile', 'init', '--filter', 'labels=area-maps', '--mine', '--limit', 'codex=0',
+                      '--preferred-runtime', 'claude')
+        self.assertIn(f'wrote {q.LOCAL}', out)
+        self.assertEqual(q.personal(), {'profile': {'filter': 'labels=area-maps', 'mine': True, 'preferred_runtime': 'claude',
+                                                    'limits': {'claude': 2, 'codex': 0}}})
+        self.assertIn('exists', self.refused(CLAUDE, 'profile', 'init', '--no-mine'))
+        self.do(CLAUDE, 'init')
+        self.do(CLAUDE, 'init')
+        self.assertEqual(gitignore.read_text(), 'build/\n/taskq.local.toml\n')
+        self.assertIn("mine=True", self.do(CLAUDE, 'tick'))
+
+    def test_personal_codex_override_wins_over_the_shared_one(self):
+        with patch.object(q, 'CODEX_PROJECT', 'shared-project'):
+            self.assertEqual(q.codex_project(None), 'shared-project')
+            self.personal('[codex]\nproject = "my-project"\n')
+            self.assertEqual(q.codex_project(None), 'my-project')
 
     def test_filter_keeps_dependency_and_scope_safety(self):
         engine = self.add('--type', 'code', '--area', 'engine', '--scope', 'shared')
@@ -1620,6 +1699,23 @@ class Doctor(unittest.TestCase):
         self.origin, self.status = 'git@gitlab.example.com:group/project.git', 0  # `glab auth status`: 0, 1 or None
         self.enterContext(patch.object(q, 'git', lambda *args, **kwargs: self.origin if args[:2] == ('remote', 'get-url') else None))
         self.enterContext(patch.object(q, 'probe', lambda command: self.status))
+        self.enterContext(patch.object(q, 'LOCAL', Path(self.enterContext(tempfile.TemporaryDirectory())) / 'taskq.local.toml'))
+        q.LOCAL.write_text('[profile]\nmine = false\n')
+
+    def test_personal_profile_missing_invalid_or_tracked_is_a_gap(self):
+        self.enterContext(patch.object(q, 'api', Gitlab()))
+        q.LOCAL.unlink()
+        code, out = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertIn(f'no personal profile {q.LOCAL}', out)
+        self.assertIn('taskq profile init [--filter', out)
+        self.assertFalse(q.LOCAL.exists())  # doctor reads only
+        q.LOCAL.write_text('[profile]\nmine = "yes"\n')
+        self.assertIn('[profile] mine: write true or false', self.doctor()[1])
+        q.LOCAL.write_text('[profile]\nmine = true\n')
+        self.assertNotIn('personal', self.doctor()[1])
+        with patch.object(q, 'git', lambda *args, **kwargs: '' if args[0] == 'ls-files' else self.origin if args[:2] == ('remote', 'get-url') else None):
+            self.assertIn('git rm --cached -- taskq.local.toml', self.doctor()[1])
 
     def doctor(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -1709,7 +1805,7 @@ class Doctor(unittest.TestCase):
 class Setup(unittest.TestCase):
     """`doctor --fix`: what a command can do is done once and `ok` on a rerun; the person's steps are printed, not run."""
     GLOBALS = ('PROJECT', 'PROJECT_PATH', 'HOST', 'STORE', 'BOARD', 'BOARDS', 'AREAS', 'ROOT', 'TICK_BEAT', 'WORKER', 'RULES',
-               'CODEX_PROJECT', 'CODEX_SECTION', 'RETIRE', 'HELPERS')
+               'CODEX_PROJECT', 'CODEX_SECTION', 'RETIRE', 'HELPERS', 'LOCAL', 'SHARED')
 
     def setUp(self):
         for name in self.GLOBALS:  # `configure` sets them from the new taskq.toml
@@ -1734,6 +1830,7 @@ class Setup(unittest.TestCase):
         (self.tmp / 'claude.json').write_text(json.dumps({'projects': {os.path.realpath(self.tmp): {'hasTrustDialogAccepted': True}}}))
         (self.tmp / '.claude').mkdir()
         (self.tmp / '.claude/settings.local.json').write_text(json.dumps({'permissions': {'allow': list(q.WORKER_ALLOW)}}))
+        (self.tmp / 'taskq.local.toml').write_text('[profile]\nmine = false\n')
 
     def test_gitlab_person_steps_printed_then_fixed_once(self):
         gitlab = Gitlab()

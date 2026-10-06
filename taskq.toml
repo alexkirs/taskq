@@ -1,0 +1,9 @@
+[github]
+repo = "alexkirs/taskq"
+
+[areas]
+names = ["queue", "tick", "runtimes", "selftest", "docs", "install"]
+
+[update]
+auto = false
+every = "24h"

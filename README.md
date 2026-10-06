@@ -1,20 +1,29 @@
-<p align="center">
-  <img src="docs/header.webp" alt="Relaxing while the agents work" width="720">
-  <br><em>Agents working.</em>
-</p>
-
 # taskq
 
 A shared task queue for Claude Code and Codex.
 
-Tell your agent: **“Install taskq in this project and set it up.”**
+Tell your agent: **“Install taskq from https://github.com/alexkirs/taskq in this project and set it up following the onboarding in its README and taskq contract.”**
+
+| Situation | What to say |
+|---|---|
+| Join a project with taskq.toml; run onboarding | “Join this taskq project and run onboarding.” |
+| Repeat onboarding; choose instructions or setup by the agent | “Run taskq onboarding.” |
+| Start coordination in this session | “Arm the tick.” |
+| Discuss the next work | “You are the Product Manager of taskq. What should we do next?” |
+| File work | “File a task for fixing login.” |
+| Read the queue | “You are the Product Manager of taskq. What is in the queue?” |
+| Check orchestration | “Check taskq orchestration.” |
+| Watch a worker | “Show worker session <session id>.” |
 
 <details>
 <summary>Setup, commands and reference</summary>
 
 ## Setup
 
-Agent: resolve placeholders from `git remote get-url origin`; run the matching commands.
+Agent: read the [manager onboarding](taskq/contracts/taskq-manager.md#1-first-use-and-check-the-place)
+first; inspect readiness and offer instructions or setup by the agent before making changes.
+Once installed, `taskq contract` locates both contracts. Resolve placeholders from
+`git remote get-url origin`; run the matching commands only under the chosen setup mode.
 Requirements: Python 3.11+, [pipx](https://pipx.pypa.io/stable/installation/),
 and [glab](https://gitlab.com/gitlab-org/cli) (GitLab) or [gh](https://cli.github.com) (GitHub).
 If login needs the person, report it and resume after login.

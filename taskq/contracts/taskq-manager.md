@@ -11,8 +11,8 @@ How to set up the session that runs the [taskq](taskq.md) queue: it files tasks 
 ticks every 5 minutes, starts workers in visible sessions, accepts results and relays questions to
 the owner. Two roles (owner's decision, 2026-10-06):
 
-- **Product manager** — the owner says the session is the taskq product manager (e.g. «Ты
-  продукт-менеджер taskq»). Step 1 and § 4: checks the place, reads the queue, files and discusses
+- **Product manager** — the owner says the session is the taskq product manager (e.g. “You are the Product Manager of taskq”,
+  «Ты продукт-менеджер taskq»). Step 1 and § 4: checks the place, reads the queue, files and discusses
   tasks. Does not arm the tick.
 - **Coordinator** — the owner says "arm the tick" or "you are the coordinator" (e.g. «включи тик»,
   «ты coordinator»). Steps 1–3: a tick every 5 minutes. Only one such session at a time: `taskq tick`
@@ -66,7 +66,14 @@ normal dependency/runtime/scope checks. Limits never arbitrate between machines.
 
 ### Readiness and mode choice
 
-The README instruction is: **Tell your agent: “Install taskq in this project and set it up.”**
+Entry phrases: “Install taskq from https://github.com/alexkirs/taskq in this project and set it up following the onboarding in its README and taskq contract.”
+(«Установи taskq из https://github.com/alexkirs/taskq в этом проекте и настрой по onboarding в README и taskq contract»),
+“Join this taskq project and run onboarding.” («Подключись к этому проекту taskq и запусти onboarding»),
+and “Run taskq onboarding.” («Запусти onboarding taskq», «настрой taskq») all start this procedure,
+including the mode A/B offer. Joining preserves the existing taskq.toml; it does not reinstall a
+working package. For a fresh agent, the source is https://github.com/alexkirs/taskq: read its README
+and setup reference; once installed, `taskq contract` locates both packaged contracts. An empty
+folder has no implied repository: identify the intended origin with the owner before init.
 The manager owns onboarding. Resolve the main checkout and its `origin` first; substitute actual
 paths, host and repository in every command shown to the person. Never use another project's
 `taskq.toml` found in a parent directory. If origin and config disagree, stop setup and identify
@@ -234,6 +241,9 @@ automated: package/CLI installation and the worker permissions file (printed as 
 
 ## 2. Arm the tick
 
+Entry phrase: “Arm the tick.” («Включи тик»). Check readiness and the profile card in § 1,
+then follow this procedure after profile confirmation; onboarding alone does not authorize it.
+
 Tool `CronCreate` (loaded via ToolSearch), `recurring: true`, `cron: "*/5 * * * *"`,
 `prompt`:
 
@@ -299,7 +309,8 @@ free slot). The other runtime will not take the task. One at a time:
   app in the background). A session record written straight into `claude-code-sessions` is not
   read until the app restarts; the app's own "CLI sessions in the sidebar" is compiled off.
 
-**Showing a worker in the app** (the owner asks «покажи сессию»): `taskq show <session id>`. It
+**Showing a worker in the app** (the owner asks “Show worker session <session id>.”,
+«покажи сессию воркера <session id>», «покажи сессию»): `taskq show <session id>`. It
 stops the background run first (the app does not refuse a live one and would be a second writer of
 the transcript: the worker's turn ends; continue it in the app with a message), imports it, and
 returns the pane to the calling session (`--restore <local_id>` names another) as soon as the
@@ -499,7 +510,8 @@ open tasks, including ready ones to be continued, are kept.
 The same procedure in a Claude and in a Codex session, for any worker app (owner's request,
 2026-10-06).
 
-**The owner says** «проверь свои инструменты оркестрации», «теперь ты оркестратор, проверь, работают
+**The owner says** “Check taskq orchestration.”, «проверь оркестрацию taskq»,
+«проверь свои инструменты оркестрации», «теперь ты оркестратор, проверь, работают
 ли у тебя механизмы», "check your orchestration tools".
 
 **The session offers** a scope in one message and waits for the choice:
@@ -565,6 +577,17 @@ minute needs a persistent HTTP connection instead of one glab process per call. 
 prints every call with its time, and each selftest step.
 
 ## 4. File a task
+
+Entry phrases: “File a task for fixing login.” (general form “File a task for …”; «Заведи задачу на …»,
+«какие задачи завести») starts task filing below. Read the queue first to avoid duplicates; resolve
+missing goal or acceptance with the owner instead of inventing product intent.
+
+“You are the Product Manager of taskq. What should we do next?” («Ты продукт-менеджер taskq.
+Что делать дальше?») starts § 1 readiness inspection, then `taskq list`: recommend the next work
+from priorities, dependencies, existing tasks and the owner's goal. Discuss proposals before filing.
+“You are the Product Manager of taskq. What is in the queue?” («Ты продукт-менеджер taskq.
+Что в очереди?»), or the role phrase alone, starts § 1 inspection and `taskq list`; summarize the
+actual queue and blockers. Neither question starts workers or arms the tick.
 
 `taskq add --title … --type code|docs|research|asset --goal … --acceptance …
 --scope <paths> --deps <numbers> --priority 1|2 --milestone "<epic>" [--runtime claude|codex|any]`

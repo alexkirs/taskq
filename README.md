@@ -243,3 +243,5 @@ TASKQ_CLEANUP_HELPERS=<project>/scripts python3 -m unittest discover -s tests
 License: [MIT](LICENSE).
 
 </details>
+
+If taskq saves you time, [buy me a coffee](https://alex.kirs.online/donate).

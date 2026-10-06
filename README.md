@@ -22,7 +22,7 @@ git clone https://github.com/alexkirs/taskq ~/Projects/taskq
 pipx install -e ~/Projects/taskq
 ```
 
-taskq updates itself once a day; `taskq update` updates by hand; `[update] auto = false` turns it off.
+taskq updates itself once a day; `taskq update` updates by hand (`--verbose` says why a check was skipped); `[update] auto = false` turns it off.
 The tick checks `main` of this repository at most every `[update] every`: an editable clone is fast-forwarded
 (left alone, with the reason, when it has uncommitted changes or commits `main` lacks), an install from Git is
 reinstalled, and the pass goes on as the new version. `tick` prints the version it runs. Versions are not pinned.

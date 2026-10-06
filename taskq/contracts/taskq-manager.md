@@ -257,6 +257,10 @@ automated: package/CLI installation and the worker permissions file (printed as 
 
   The project stays in `dontAsk` mode: everything in the list runs silently, the rest is denied.
   The app does not apply the project's "bypass permissions" mode to an imported session.
+- Claude workers get only `CLAUDE_WORKER_TOOLS` (Bash, Read, Edit, Write, Glob, Grep, WebFetch, WebSearch) and no
+  MCP servers: `spawn` passes `--tools … --strict-mcp-config --no-chrome` (#38), so the shared settings file above
+  still serves the coordinator in full. Reach a live worker with SendMessage: a stopped one woken by
+  `claude --bg --resume` gets the full tool set back (the CLI keeps only `--name` and `--settings`; #51).
 
 ## 2. Arm the tick
 

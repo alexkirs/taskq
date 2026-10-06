@@ -2092,13 +2092,21 @@ def claude_env(extra=None):
     return {**{key: value for key, value in os.environ.items() if key not in RUNTIMES.values()}, **(extra or {})}
 
 
+# #38 (2026-10-06, verified live): a worker needs only these tools and no MCP. settings.local.json stays as is
+# (the coordinator shares it), so every worker run is narrowed at its start. --strict-mcp-config leaves the
+# built-in claude-in-chrome server on: --no-chrome drops it (#51, seen live; EndConversation always stays).
+# `--tools` takes several values: keep a flag after it, never the prompt. A `--resume` cannot take them (see
+# Selftest.full), so only a spawned run is narrowed.
+CLAUDE_WORKER_TOOLS = ['--tools', 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch', '--strict-mcp-config', '--no-chrome']
+
+
 def claude_spawn(name, extra=None, prompt=None, remote_control=False):
     """The CLI session id of a new Claude worker: a `claude --bg` session named `name` (idle without
     `prompt`), which SendMessage reaches by that name. #270 (2026-10-06): no app window change at all.
     Remote Control stays off unless asked: with the user's `remoteControlAtStartup` a worker would also appear in
     the owner's apps on other machines and look as if it ran there (csgo #303; `/rc connecting…` gone, checked live)."""
     off = [] if remote_control else ['--settings', '{"remoteControlAtStartup": false}']
-    done = subprocess.run(['claude', '--bg', '--name', name, *off, *([prompt] if prompt else [])], cwd=ROOT,
+    done = subprocess.run(['claude', '--bg', *CLAUDE_WORKER_TOOLS, '--name', name, *off, *([prompt] if prompt else [])], cwd=ROOT,
                           env=claude_env(extra), capture_output=True, text=True, timeout=120)
     # FORCE_COLOR in the caller's environment colours the id (seen live 2026-10-06): strip ANSI before matching.
     short = re.search(r'backgrounded · (\w+)', re.sub(r'\x1b\[[0-9;]*m', '', done.stdout))
@@ -2932,14 +2940,17 @@ class Selftest:
     # --- full: a real worker session of each app takes the task through its brief ------------------
 
     def full(self, runtime):
-        iid, session, process = None, None, None
+        iid, session, process, fresh = None, None, None, False
         name = f'selftest {self.stamp} {runtime}'
         log = ROOT / '.local' / SELFTEST / f'{self.stamp}-{runtime}.log'
         prompt = (f'Run `cd {ROOT} && {TOOL} worker --filter labels={SELFTEST} --no-mine --limit {runtime}=9` '
                   'and follow the instructions it prints.')
 
         def send():
-            nonlocal process
+            nonlocal process, fresh
+            if fresh:  # spawn already started the first turn
+                fresh = False
+                return
             if process and process.poll() is None:
                 process.wait(timeout=self.args.wait)  # one turn at a time in a CLI session
             if runtime == 'codex':
@@ -2947,6 +2958,9 @@ class Selftest:
                     codex_send(argparse.Namespace(thread=session, text=prompt))
                 return
             if runtime == 'claude':  # a background session between turns: wake it with the prompt, same id
+                # No CLAUDE_WORKER_TOOLS here (#51, CLI 2.1.291): with any flag --resume starts a copy under a new id
+                # (it failed live); without, the session keeps only its saved --name and --settings, so a wake
+                # after a stop has the full tool set. Live workers are steered by SendMessage, not woken.
                 claude_stop(session)
                 subprocess.run(['claude', '--bg', '--resume', session, prompt], cwd=ROOT, env=claude_env(self.extra),
                                check=True, capture_output=True, timeout=120)
@@ -2977,9 +2991,9 @@ class Selftest:
             return self.fact(iid, 'ready')
 
         def spawned():
-            nonlocal session
-            if runtime == 'claude':
-                session = claude_spawn(name, self.extra)
+            nonlocal session, fresh
+            if runtime == 'claude':  # the first turn runs under CLAUDE_WORKER_TOOLS
+                session, fresh = claude_spawn(name, self.extra, prompt), True
             elif runtime == 'codex':
                 session = codex_spawn(name)
             else:

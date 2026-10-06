@@ -1096,9 +1096,11 @@ class Cycle(unittest.TestCase):
         self.assertEqual(printed.splitlines()[0], 'abcd1234-0000')
         self.assertIn('claude attach abcd1234', printed)
         # csgo #303: the name says the machine; Remote Control is off unless asked for. #41: the prompt is last.
-        self.assertEqual(runs, [['claude', '--bg', '--name', 'T1 x (mac-1)', '--settings', '{"remoteControlAtStartup": false}'],
-                                ['claude', '--bg', '--name', 'T1 x (mac-1)'],
-                                ['claude', '--bg', '--name', 'T1 x (mac-1)', '--settings', '{"remoteControlAtStartup": false}', 'Run the brief']])
+        # #51: only the 8 worker tools, no MCP.
+        tools = ['--tools', 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch', '--strict-mcp-config', '--no-chrome']
+        self.assertEqual(runs, [['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', '{"remoteControlAtStartup": false}'],
+                                ['claude', '--bg', *tools, '--name', 'T1 x (mac-1)'],
+                                ['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', '{"remoteControlAtStartup": false}', 'Run the brief']])
         self.agents = {}
         with self.run_recorded({'claude --bg': 'backgrounded · ffff0000 · T1 x'})[1]:
             self.assertIn('does not list the new session ffff0000', self.refused(CLAUDE, 'spawn'))

@@ -111,6 +111,10 @@ codex = 2
 [coordinator]
 # The Claude session the launchd tick timer wakes (manager contract § 2); `tick --install-timer` writes it.
 # session = "claude-session-id"
+
+[machine]
+# Free text every brief on this machine prints (#139): how this machine differs, e.g. Windows claude.cmd, checkout in WSL.
+# notes = "run git and tests via wsl.exe bash -lc; no Codex"
 ```
 
 Merge supported preference keys individually: explicit CLI flag > personal > shared >

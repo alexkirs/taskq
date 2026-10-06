@@ -839,7 +839,36 @@ class Cycle(unittest.TestCase):
             self.assertIn('3. Do the task below. Follow AGENTS.md. Expected paths', self.do(CLAUDE, 'worker'))
         self.assertIn(f'take {iid}', self.do(CLAUDE, 'worker'))
 
-    def test_list_names_the_scope_a_released_task_holds(self):
+    def test_brief_prints_this_machines_root_and_notes(self):
+        """#139: task text is repo-relative; the brief says where the checkout is here and what this machine needs."""
+        iid = self.add('--type', 'code')
+        local = self.directory / 'taskq.local.toml'
+        with patch.object(q, 'ROOT', self.directory), patch.object(q, 'LOCAL', local):
+            brief = self.do(CLAUDE, 'worker')
+            self.assertIn(f'This machine (mac-1): main checkout {self.directory}; paths in the task are relative to it.\n\n1. ', brief)
+            local.write_text('[machine]\nnotes = """Windows claude.cmd; checkout in WSL.\nNo Codex."""\n')
+            self.assertIn('relative to it.\n   Windows claude.cmd; checkout in WSL.\n   No Codex.\n\n1. ', self.do(CLAUDE, 'worker'))
+            local.write_text('[machine]\nnote = "x"\n')
+            self.assertIn('[machine] note: unknown key', self.refused(CLAUDE, 'worker'))
+        self.assertIn(f'take {iid}', self.do(CLAUDE, 'worker'))
+
+    def test_macos_only_calls_are_skipped_with_one_line_elsewhere(self):
+        """#139: no `open -g` and no launchd off macOS; the worker keeps running."""
+        self.agents = {'s1': {'id': 's1short', 'sessionId': 's1', 'pid': 7}}
+        runs = []
+        with patch.object(sys, 'platform', 'linux'), patch.object(q.subprocess, 'run', lambda argv, **kwargs: runs.append(argv)):
+            self.assertIn('skipped: opening in the desktop app is macOS only', self.do(CLAUDE, 'show', 'local_s1'))
+            self.assertIn('skipped: the launchd tick timer is macOS only', self.do(COORDINATOR, 'tick', '--install-timer'))
+        self.assertEqual(runs, [])
+
+    def test_add_warns_on_absolute_paths(self):
+        """#139: each machine maps repo-relative paths to its own checkout; /Users/... means nothing on win."""
+        for text, warned in (('see /Users/kirs/p/a.py', True), ('C:\\Users\\alexk', True), ('//wsl.localhost/Ubuntu/x', True),
+                             ('src/a.py and https://example.com/home/x', False)):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.add('--type', 'code', '--scope', text.split()[-1])
+            self.assertEqual('absolute path' in err.getvalue(), warned, text)
+
         held = self.add('--type', 'code', '--scope', 'a/x.py')
         self.do(CLAUDE, 'take', held)
         self.do(COORDINATOR, 'release', held, '--text', 'dead worker')
@@ -1390,6 +1419,7 @@ class Cycle(unittest.TestCase):
             self.assertIn('does not list the new session ffff0000', self.refused(CLAUDE, 'spawn'))
 
     def test_show_stops_the_background_run_then_imports_and_restores_on_the_focus_line(self):
+        self.enterContext(patch.object(sys, 'platform', 'darwin'))  # the macOS path, on any CI
         home = self.directory / 'home'
         log = home / 'Library/Logs/Claude/main.log'
         log.parent.mkdir(parents=True)
@@ -1415,6 +1445,7 @@ class Cycle(unittest.TestCase):
 
     def test_show_without_dontask_leaves_the_worker_running_and_names_attach(self):
         """#71: the app opens a session in the checkout's defaultMode, else its own (auto): its classifier stops taskq."""
+        self.enterContext(patch.object(sys, 'platform', 'darwin'))  # the macOS path, on any CI
         self.agents = {'s1': {'id': 's1short', 'sessionId': 's1', 'pid': 7}}
         permitted(self.directory, defaultMode='auto')
         runs, patched = self.run_recorded()
@@ -2252,7 +2283,38 @@ class Doctor(unittest.TestCase):
         settings = json.loads((q.ROOT / '.claude/settings.local.json').read_text())
         self.assertEqual((doctor.permissions_missing(q.ROOT), settings['env'], settings['permissions']['allow'][0]), ([], {'A': '1'}, 'Bash(make *)'))
 
-    def test_missing_permissions_or_mode_is_a_gap_and_nothing_is_written(self):
+    def test_windows_claude_under_wsl_reads_trust_under_the_unc_key(self):
+        """#139: WSL `claude` is the Windows shim; it keeps trust in the Windows ~/.claude.json under //wsl.localhost/<distro>/..."""
+        self.enterContext(patch.object(q, 'api', Gitlab()))
+        windows = q.ROOT / 'win.json'
+        self.enterContext(patch.object(doctor, 'windows_claude', lambda: ('//wsl.localhost/Ubuntu', windows)))
+        key = '//wsl.localhost/Ubuntu' + os.path.realpath(q.ROOT)
+        code, out = self.doctor()  # trust under the Linux path in the Linux config does not count
+        self.assertIn(f'Claude folder trust not accepted for {key} (the Windows claude sees', out)
+        windows.write_text('{"projects": {}}')
+        command = next(line.strip().split('  (')[0] for line in out.splitlines() if line.strip().startswith('python3 -c'))
+        subprocess.run(command, shell=True, check=True)
+        self.assertTrue(json.loads(windows.read_text())['projects'][key]['hasTrustDialogAccepted'])
+        self.assertNotIn('folder trust', self.doctor()[1])
+
+    def test_windows_claude_is_detected_only_under_wsl_with_a_mnt_binary(self):
+        def run(argv, **kwargs):
+            self.assertEqual(kwargs['cwd'], '/mnt/c')  # cmd.exe refuses a UNC working directory
+            return SimpleNamespace(stdout='C:\\Users\\alexk\r\n')
+        with patch.object(doctor.subprocess, 'run', run), patch.object(doctor.os.path, 'realpath', lambda path: path):
+            with patch.dict(os.environ, {'WSL_DISTRO_NAME': 'Ubuntu'}), patch.object(doctor.shutil, 'which', lambda name: '/mnt/c/nvm4w/nodejs/claude'):
+                self.assertEqual(doctor.windows_claude(), ('//wsl.localhost/Ubuntu', Path('/mnt/c/Users/alexk/.claude.json')))
+            with patch.dict(os.environ, {'WSL_DISTRO_NAME': 'Ubuntu'}), patch.object(doctor.shutil, 'which', lambda name: '/home/a/.local/bin/claude'):
+                self.assertIsNone(doctor.windows_claude())
+            with patch.dict(os.environ, {'WSL_DISTRO_NAME': ''}), patch.object(doctor.shutil, 'which', lambda name: '/mnt/c/x/claude'):
+                self.assertIsNone(doctor.windows_claude())
+
+    def test_claude_not_logged_in_is_a_gap(self):
+        """#139: a `claude --bg` that is not logged in stops at «Not logged in»: the tick would spawn dead workers."""
+        self.enterContext(patch.object(q, 'api', Gitlab()))
+        self.enterContext(patch.object(doctor, 'probe', lambda command: 1 if command[0] == 'claude' else self.status))
+        self.assertIn('`claude` is not logged in', self.doctor()[1])
+
         """#71: the coordinator and its workers need the allow list and dontAsk; doctor names both, edits nothing."""
         self.enterContext(patch.object(q, 'api', Gitlab()))
         path = q.ROOT / '.claude/settings.local.json'
@@ -2578,6 +2640,7 @@ class TickBeat(unittest.TestCase):
 
     def test_install_timer_writes_a_launchd_agent_and_records_the_coordinator(self):
         """#42: one command each way; the agent runs tick --act --wake from the main checkout every 5 min."""
+        self.enterContext(patch.object(sys, 'platform', 'darwin'))  # the macOS path, on any CI
         import plistlib
         runs = []
         with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / '.local/beat'), \

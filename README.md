@@ -195,6 +195,17 @@ Two machines each run their own tick and limits. A task for one machine only: `t
 "macbook-m2.local" = "mac"
 ```
 
+**Windows.** Keep the checkout, taskq, git and gh/glab in WSL; the Windows Claude Code (`claude.cmd`) runs the
+workers and sees the checkout as `//wsl.localhost/<distro>/…`: `taskq doctor` checks its folder trust and login under
+that path. The desktop app is optional (watch workers through Remote Control); macOS-only steps (app import, launchd
+timer) say so and are skipped. Tell workers what is special about a machine in its `taskq.local.toml`; every brief there
+prints it, with the checkout root (task text uses repository-relative paths, `add` warns on absolute ones):
+
+```toml
+[machine]
+notes = "Windows claude.cmd; checkout in WSL; run git and tests via wsl.exe bash -lc; no Codex"
+```
+
 Worker sessions are named `T<N> … (mac)`; spawned Claude workers run with Remote Control, so `tick` links each
 one at `https://claude.ai/code/session_…` (`taskq spawn --no-remote-control` turns it off). `taskq list --links`
 adds each task's URL.

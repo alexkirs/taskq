@@ -78,6 +78,11 @@ takes them first. To send a task to Windows on purpose: `add --host win` (or the
 the Mac's tick never starts it. Name the machines once in taskq.toml, `[hosts]` with
 `"<hostname>" = "<name>"`, or set `TASKQ_HOST` on that machine. Worker names end with ` (<name>)` (no `@`: SendMessage rejects it),
 `list` and the tick's "Workers" table show the machine of every worker.
+Task text, scope, briefs and results use repository-relative paths (`add` warns on an absolute one); each brief prints
+the checkout root of its machine and the free-text `[machine] notes` of that machine's `taskq.local.toml`, so the worker
+adapts to it. **Windows (#139):** checkout and taskq in WSL, the Windows Claude (`claude.cmd`) runs workers and sees the
+checkout as `//wsl.localhost/<distro>/…`; `doctor` checks trust under that key in the Windows `~/.claude.json` and whether
+`claude` is logged in. App import and the launchd timer are macOS only and say so elsewhere; the desktop app is optional.
 
 ## 1. First use and check the place
 

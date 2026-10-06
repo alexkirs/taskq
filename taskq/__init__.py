@@ -144,7 +144,8 @@ def checked(config, path):
     stops with the file and key, never silently broadens."""
     where = lambda key: f'{path}: {key}'
     profile, codex = config.get('profile', {}), config.get('codex', {})
-    unknown = [f'[{name}]' for name in config if name not in ('profile', 'codex', 'coordinator')] + [
+    unknown = [f'[{name}]' for name in config if name not in ('profile', 'codex', 'coordinator', 'machine')] + [
+        f'[machine] {key}' for key in config.get('machine', {}) if key != 'notes'] + [
         f'[profile] {key}' for key in profile if key not in (*PROFILE_DEFAULTS, 'limits')] + [
         f'[codex] {key}' for key in codex if key not in ('project', 'section')] + [
         f'[coordinator] {key}' for key in config.get('coordinator', {}) if key != 'session']
@@ -162,6 +163,8 @@ def checked(config, path):
     for name, count in limits.items():
         if name not in RUNTIMES or isinstance(count, bool) or not isinstance(count, int) or count < 0:
             fail(f'{where("[profile.limits] " + name)}: write runtime = N for runtimes {", ".join(RUNTIMES)}, N a non-negative integer')
+    if not isinstance(config.get('machine', {}).get('notes', ''), str):
+        fail(f'{where("[machine] notes")}: write this machine\'s notes for its workers as a string')
     if not isinstance(config.get('coordinator', {}).get('session', ''), str):
         fail(f'{where("[coordinator] session")}: write the coordinator\'s Claude session id as a string')
     for key, value in codex.items():

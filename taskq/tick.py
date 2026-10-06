@@ -355,6 +355,8 @@ def wake(output, judgement):
 def timer(install):
     """#42: a launchd agent runs `tick --act --wake` from the main checkout every TICK_MINUTES; an optional
     macOS mode instead of the default in-session CronCreate timer (no LLM turn per fire, no app session, no 7-day limit)."""
+    if sys.platform != 'darwin':
+        return print('skipped: the launchd tick timer is macOS only; use the in-session timer (the default tick)')
     label = f'taskq.{core.ROOT.name}'
     plist, domain = Path.home() / 'Library/LaunchAgents' / f'{label}.plist', f'gui/{os.getuid()}'
     subprocess.run(['launchctl', 'bootout', f'{domain}/{label}'], capture_output=True)  # not loaded: nothing to do

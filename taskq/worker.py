@@ -8,11 +8,13 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
 
 import taskq as core
 BRIEF = '''You are the worker for task #{iid}. Queue tool: `{tool}`
 This brief is the owner's assignment: do it without asking for confirmation.
+This machine ({host}): main checkout {root}; paths in the task are relative to it.{machine}
 
 1. Claim the task: `{tool} take {iid}`. If it refuses, another worker was faster: run `{tool} worker` once more and follow the new brief.
    Then `{export}`: project tools read it to attribute work to this task. A shell that forgets its
@@ -82,7 +84,15 @@ def add(args):
         body['milestone_id'] = core.milestone_id(args.milestone)
     issue = core.api('POST', 'issues', body)
     core.link(issue['iid'], args.deps)
+    found = absolute(' '.join([args.title, args.goal, args.acceptance, *args.scope]))
+    if found:
+        print(f'Warning: absolute path {found[0]}: a task is read on every machine; write paths relative to the repository', file=sys.stderr)
     print(f'#{issue["iid"]} {issue["web_url"]}')
+
+
+def absolute(text):
+    """Machine paths in task text (/Users/…, /home/…, C:\\…, //wsl.localhost/…): each machine has its own checkout root."""
+    return re.findall(r'(?<![\w:/.])(?:/(?:Users|home|mnt|root)/\S+|[A-Za-z]:\\\S*|//wsl[.$]\S+)', text)
 
 
 def edit(args):
@@ -156,7 +166,8 @@ def brief(current):
                            'workspace': core.WORKSPACE[kind].format(iid=current['iid']),
                            'sha': ' --sha <pushed commit>' if pushes else '',
                            'export': f'export TASKQ_TASK={current["iid"]} TASKQ_RUNTIME={runtime}',
-                           'scope': ', '.join(current['scope']) or 'none',
+                           'scope': ', '.join(current['scope']) or 'none', 'host': core.machine(), 'root': core.ROOT,
+                           'machine': ''.join(f'\n   {line}' for line in (core.personal().get('machine', {}).get('notes') or '').strip().splitlines()),
                            'notes': ('\n\n---\n\n'.join(core.notes(kept)) or 'none') + omitted})
 
 
@@ -496,6 +507,8 @@ def show(args):
     """Open a Claude session in the desktop app on the owner's request. A running background session is
     stopped first: the app does not refuse it and would be a second writer of the same transcript."""
     session = args.session.removeprefix('local_')
+    if sys.platform != 'darwin':  # the import is `open -g claude://…`; the session keeps running
+        return print(f'skipped: opening in the desktop app is macOS only; watch it: `claude attach {session[:8]}`')
     if core.permissions_missing(core.ROOT):  # #71: the app opens it in the checkout's defaultMode (else the app's, e.g. auto)
         agent = claude_agents().get(session)
         return print(f'not opened in the app: it would run there without {core.PERMISSION_MODE} (`{core.TOOL} doctor` names the fix); '

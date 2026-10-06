@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -59,7 +60,7 @@ def update(args):
         return say(f'update skipped: {core.REPO} did not answer (or has no {ref})')
     new = remote.splitlines()[-1].split()[0]  # a tag's commit is the peeled `^{}` line, the last one
     if kind is None:
-        return print(f'not updated: this taskq is not installed from Git; reinstall: pipx install --force git+{core.REPO}')
+        return print(f'not updated: this taskq is not installed from Git; reinstall: uv tool install --force git+{core.REPO}  (or pipx install --force …)')
     if new == (core.git('rev-parse', 'HEAD', cwd=where) if kind == 'clone' else where):
         return print(f'up to date {old}')
     if reason := green(new):
@@ -166,6 +167,9 @@ def doctor(args, pending=()):
     if config:
         for what, fix in personal_gaps() + tree_gaps() + permissions_gap(core.ROOT) + trust_gap(core.ROOT):
             gap(what, fix)
+        if probe(['claude', 'auth', 'status']):  # None: no claude CLI on this machine, nothing to check
+            gap('`claude` is not logged in: background workers stop at «Not logged in»',
+                'claude auth login  (the person runs it in this shell, with the same `claude` the tick starts)')
         if getattr(args, 'codex', False) and not core.CODEX_SOCKET.exists():
             gap(f'no Codex app server socket {core.CODEX_SOCKET}: Codex workers cannot start',
                 'open the Codex app and sign in  (the person does it)')
@@ -354,18 +358,52 @@ def permissions_gap(root):
 
 def trust_gap(root):
     """The doctor line while Claude Code's folder trust for `root` is not accepted."""
-    return [] if trusted(root) else [(f'Claude folder trust not accepted for {root}: worker sessions cannot start there',
-                                      f'cd {shlex.quote(str(root))} && claude  (the person accepts «Trust this folder» once, then quits)')]
+    if trusted(root):
+        return []
+    config, keys = trust_keys(root)
+    if config == core.CLAUDE_CONFIG:
+        return [(f'Claude folder trust not accepted for {root}: worker sessions cannot start there',
+                 f'cd {shlex.quote(str(root))} && claude  (the person accepts «Trust this folder» once, then quits)')]
+    # #139: a Windows claude under WSL keeps trust in the Windows home under the UNC path; set that key directly.
+    script = ('import json, pathlib; path = pathlib.Path(%r); data = json.loads(path.read_text()); '
+              'data.setdefault("projects", {}).setdefault(%r, {})["hasTrustDialogAccepted"] = True; '
+              'path.write_text(json.dumps(data, indent=2))') % (str(config), keys[0])
+    return [(f'Claude folder trust not accepted for {keys[0]} (the Windows claude sees {root} so): worker sessions cannot start there',
+             f'python3 -c {shlex.quote(script)}  (the person runs it once while no claude runs)')]
+
+
+def windows_claude():
+    """Under WSL with a Windows `claude` (e.g. the npm shim /mnt/c/nvm4w/nodejs/claude): (UNC prefix of this
+    distribution, the Windows ~/.claude.json). None elsewhere. That claude sees the checkout as //wsl.localhost/..."""
+    distro, found = os.environ.get('WSL_DISTRO_NAME'), shutil.which('claude')
+    if not distro or not found or not os.path.realpath(found).startswith('/mnt/'):
+        return None
+    try:  # cmd.exe refuses a UNC working directory: run it from the Windows drive
+        home = subprocess.run(['cmd.exe', '/c', 'echo %USERPROFILE%'], cwd='/mnt/c', capture_output=True, text=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not re.fullmatch(r'[A-Za-z]:\\.*', home):
+        return None
+    # ponytail: default automount root /mnt; a custom [automount] root in wsl.conf needs `wslpath`
+    return f'//wsl.localhost/{distro}', Path(f'/mnt/{home[0].lower()}{home[2:].replace(chr(92), "/")}/.claude.json')
+
+
+def trust_keys(root):
+    """The Claude config the `claude` of this machine reads, and its folder keys for `root` and each folder above."""
+    root = Path(os.path.realpath(root))
+    folders = [str(folder) for folder in (root, *root.parents)]
+    win = windows_claude()
+    return (win[1], [win[0] + folder.rstrip('/') for folder in folders]) if win else (core.CLAUDE_CONFIG, folders)
 
 
 def trusted(root):
     """Has Claude Code's folder trust been accepted for `root` or a folder above it?"""
+    config, keys = trust_keys(root)
     try:
-        projects = json.loads(core.CLAUDE_CONFIG.read_text()).get('projects', {})
+        projects = json.loads(config.read_text()).get('projects', {})
     except (OSError, json.JSONDecodeError):
         return False
-    root = Path(os.path.realpath(root))
-    return any(projects.get(str(folder), {}).get('hasTrustDialogAccepted') for folder in (root, *root.parents))
+    return any(projects.get(key, {}).get('hasTrustDialogAccepted') for key in keys)
 
 
 def setup(args):

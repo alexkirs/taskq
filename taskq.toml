@@ -1,9 +1,25 @@
+# taskq: this project's own task queue on its GitHub issues (keys: `taskq contract`, README).
 [github]
 repo = "alexkirs/taskq"
 
-[areas]
+[codex]  # the Codex app's project `taskq` (project/list; created 2026-10-06 through project/create); no sidebar section
+project = "01a1119a-16f1-7982-9bb2-3f53ba316816"
+
+[areas]  # init creates these area-* labels
 names = ["queue", "tick", "runtimes", "selftest", "docs", "install"]
 
+[workspace]  # {iid} is the task number. The clone is an editable install: every session on this machine runs its
+# working tree, so the tree stays clean `main` and all work happens in a worktree under .worktrees/ (csgo #272).
+new = "from the main checkout run `git fetch origin && git worktree add -b taskq-{iid} .worktrees/taskq-{iid} origin/main` and work only there; never edit the main checkout itself, it is the editable install every session on this machine runs."
+continue = "this task was started before in worktree `.worktrees/taskq-{iid}` of the main checkout (or `../taskq-{iid}` for tasks started on 2026-10-06; `git worktree list` shows it); continue there. If it is gone, create it: `git fetch origin && git worktree add -b taskq-{iid} .worktrees/taskq-{iid} origin/main`."
+none = "this task is expected to end in an answer, not a commit: work from the main checkout without editing it. If it turns out to need file changes, make the worktree `.worktrees/taskq-{iid}` as a code task would, work there, push like a code task and name the commit in the result text."
+retire = "git worktree remove .worktrees/taskq-{iid}"
+
 [update]
-auto = false
+auto = true
 every = "24h"
+
+[brief]
+rules = """
+Run `python3 -m unittest discover -s tests` in the worktree before `result`. A push to `main` is the deploy: every machine takes it with `taskq update`, so `main` is always green.
+"""

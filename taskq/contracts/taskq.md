@@ -196,7 +196,15 @@ in the amendment to csgo #241); it is no branch, so no CI runs; anyone may remov
 last page by the issue's comment count. There is no board (`init` says so; a column is the label filter in the
 issues list), no issue links (`deps` in the block is the source of truth), and `DELETE issues/N` is the GraphQL
 `deleteIssue` (admin; `selftest` closes instead when refused). `--filter` is GitHub's list-issues query
-(`labels=`, `assignee=<login>`, `milestone=<number>`). Pull requests are dropped from issue lists.
+(`labels=`, `assignee=<login>`, `milestone=<number>`). Pull requests are dropped from issue lists. GitHub's issue list lags a
+just-created issue by a moment (seen live 2026-10-06: a `take` right after `add` found no task; a second later it
+did), so a command straight after `add` may need a retry; the tick's minutes are enough.
+
+Live on alexkirs/taskq, 2026-10-06: `init` made the labels; the cycle add → tick → worker → take → beat ×2 (one
+note) → ask → tick shows the question → answer → take → result → tick shows the review → reject → take → release
+(ref gone) → take → result → close ran through with the ref `refs/taskq/lock/1` set while held and gone at the
+end; two `take` processes at once on one task: one «is yours», the other «another worker holds its lock»; the
+probe issues were deleted through the GraphQL path.
 
 **Multiple GitLab users.** Each person uses their own `glab` account. Reactions are unique per
 user, so `take` also reads all lock reactions after posting its own. The earliest reaction wins

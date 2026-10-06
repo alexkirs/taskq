@@ -225,8 +225,12 @@ cd ~/Projects/taskq
 git fetch origin && git worktree add -b <branch> .worktrees/<branch> origin/main
 ```
 
-Modules: `taskq/__init__.py` the core (config, store protocol, commands, tick), `store_github.py` the GitHub store,
-`codex.py` the Codex app server, `cleanup.py` the `cleanup` command, `selftest.py` the `selftest` command.
+Modules: `taskq/__init__.py` the core (config, store protocol, issue parse/save, the command line),
+`worker.py` the task commands (`add` … `take`, `beat`, `ask`, `result`, `answer`/`reject`/`release`, `close`) and worker
+sessions, `tick.py` the `tick` command (board moves, Workers table, beat stamp), `doctor.py` `doctor`, `init` and
+`update`, `store_github.py` the GitHub store, `codex.py` the Codex app server, `cleanup.py` the `cleanup` command,
+`selftest.py` the `selftest` command. Each module reaches the core as `core.<name>`; the core re-exports what it moved,
+so `taskq.<name>` still works, and a test patches a moved function in its own module where that module calls it.
 
 Change the worktree, run the tests there, push to `main`. CI (`.github/workflows/tests.yml`) runs the tests on every
 push; the clone and other machines take the commit once its CI passed, within `[update] every` or at once with

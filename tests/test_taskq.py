@@ -17,8 +17,10 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import taskq as q  # noqa: E402
-# The modules beside the core; `q.cleanup` and `q.selftest` are the commands, so the modules come from sys.modules.
-codex, cleanup, selftest = (sys.modules[f'taskq.{name}'] for name in ('codex', 'cleanup', 'selftest'))
+# The modules beside the core; `q.cleanup`, `q.selftest`, `q.doctor`, `q.tick` and `q.worker` are the commands, so the
+# modules come from sys.modules.
+codex, cleanup, selftest, doctor, tick, worker = (sys.modules[f'taskq.{name}'] for name in
+                                                  ('codex', 'cleanup', 'selftest', 'doctor', 'tick', 'worker'))
 
 
 def configure(path=None, real=q.configure, local=Path(tempfile.mkdtemp()) / 'taskq.local.toml'):
@@ -287,6 +289,7 @@ class Cycle(unittest.TestCase):
         self.enterContext(patch.object(q, 'TICK_BEAT', self.directory / 'beat'))  # not the real coordinator's
         self.enterContext(patch.object(q, 'CLAUDE_JOBS', self.directory / 'jobs'))
         for module, target, value in ((q, 'api', self.gitlab), (q, 'claude_agents', lambda: self.agents),
+                                      (worker, 'claude_agents', lambda: self.agents),
                                       (q, 'Codex', lambda **kwargs: self.codex), (codex, 'Codex', lambda **kwargs: self.codex),
                                       (codex, 'CodexIpc', lambda **kwargs: self.ipc)):
             patcher = patch.object(module, target, value)
@@ -1583,6 +1586,7 @@ class GithubCycle(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.enterContext(patch.object(q, 'CLAUDE_JOBS', Path(directory.name) / 'jobs'))
         self.enterContext(patch.object(q, 'claude_agents', dict))
+        self.enterContext(patch.object(worker, 'claude_agents', dict))
         self.enterContext(patch.object(q, 'TICK_BEAT', Path(directory.name) / 'beat'))
 
     def test_tick_links_tasks_sessions_and_commits(self):
@@ -1916,7 +1920,7 @@ class Selftest(unittest.TestCase):
         rows = {row[0]: row for row in test.rows}
         self.assertIn('not doing after 0 s', rows['take, claim, assignee, beat, ask by the worker'][4])  # no resume on turn one
         self.assertFalse(runs)
-        with patch.object(q.subprocess, 'run', run), patch.object(q, 'claude_stop', lambda session, remove=False: None):
+        with patch.object(q.subprocess, 'run', run), patch.object(worker, 'claude_stop', lambda session, remove=False: None):
             with self.assertRaises(SystemExit) as caught:
                 q.claude_wake('w1-session', 'Run the brief')
         self.assertIn('the job w2 failed at once', str(caught.exception))
@@ -2004,7 +2008,7 @@ class Doctor(unittest.TestCase):
     def setUp(self):
         self.origin, self.status = 'git@gitlab.example.com:group/project.git', 0  # `glab auth status`: 0, 1 or None
         self.enterContext(patch.object(q, 'git', lambda *args, **kwargs: self.origin if args[:2] == ('remote', 'get-url') else None))
-        self.enterContext(patch.object(q, 'probe', lambda command: self.status))
+        self.enterContext(patch.object(doctor, 'probe', lambda command: self.status))
         self.enterContext(patch.object(q, 'LOCAL', Path(self.enterContext(tempfile.TemporaryDirectory())) / 'taskq.local.toml'))
         q.LOCAL.write_text('[profile]\nmine = false\n')
         self.enterContext(patch.object(q, 'ROOT', q.LOCAL.parent))
@@ -2164,7 +2168,7 @@ class Setup(unittest.TestCase):
         q.PROJECT = q.PROJECT_PATH = None
         self.status, self.probes = 0, []
         self.enterContext(patch.object(q, 'git', lambda *args, **kwargs: self.origin if args[:2] == ('remote', 'get-url') else None))
-        self.enterContext(patch.object(q, 'probe', lambda command: self.probes.append(command) or self.status))
+        self.enterContext(patch.object(doctor, 'probe', lambda command: self.probes.append(command) or self.status))
         self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(contextlib.chdir(self.tmp))
         self.enterContext(patch.object(q, 'CLAUDE_CONFIG', self.tmp / 'claude.json'))
@@ -2335,8 +2339,8 @@ class Update(unittest.TestCase):
         self.git('clone', '-q', str(self.origin), str(self.clone))
         self.enterContext(patch.object(q, 'REPO', str(self.origin)))
         self.enterContext(patch.object(q, 'install', lambda: ('clone', self.clone)))
-        self.enterContext(patch.object(q, 'green', lambda sha: None))
-        self.enterContext(patch.object(q, 'works', lambda where: True))
+        self.enterContext(patch.object(doctor, 'green', lambda sha: None))
+        self.enterContext(patch.object(doctor, 'works', lambda where: True))
         self.enterContext(patch.dict(q.UPDATE, ref='main'))
 
     def git(self, *args, cwd=None):
@@ -2467,11 +2471,11 @@ class Update(unittest.TestCase):
     def test_red_ci_or_a_start_failure_leaves_the_clone_where_it_was(self):
         old = q.version()
         self.commit(self.work, 'two')
-        with patch.object(q, 'green', lambda sha: 'CI failed: tests'):
+        with patch.object(doctor, 'green', lambda sha: 'CI failed: tests'):
             done, out = self.update()
         self.assertIsNone(done)
         self.assertRegex(out, r'^not updated to main [0-9a-f]{7}: CI failed: tests\n$')
-        with patch.object(q, 'works', lambda where: False):
+        with patch.object(doctor, 'works', lambda where: False):
             done, out = self.update()
         self.assertIsNone(done)
         self.assertIn(f'does not start (`python3 -m taskq --version` failed); {self.clone} is back at {old}', out)
@@ -2556,6 +2560,7 @@ class Cleanup(unittest.TestCase):
         # Explicit patches keep app and issue reads outside these disposable Git fixtures.
         for target, name, value in ((cleanup, 'cleanup_issues', lambda: self.issues), (q, 'claude_sessions', lambda: self.app),
                                     (q, 'claude_agents', lambda: self.agents),
+                                      (worker, 'claude_agents', lambda: self.agents),
                                     (cleanup, 'cleanup_codex', lambda roots: self.threads),
                                     (q, 'HELPERS', q.HELPERS if HELPERS else None),
                                     *([(sys.modules['host_tools'], 'live_paths', lambda: [])] if HELPERS

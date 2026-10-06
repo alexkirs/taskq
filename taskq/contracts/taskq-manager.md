@@ -21,6 +21,20 @@ the owner. Two roles (owner's decision, 2026-10-06):
 
 The session replies with the role it took and what is in the queue now.
 
+### First-use onboarding
+
+When the owner says "you are the Product Manager of taskq", read both paths printed by
+`taskq contract`. Before changing anything, check the project remote, `taskq.toml`, the
+host CLI (`glab` or `gh`), authentication, repository write permissions, queue labels and board.
+If configuration is missing, derive the proposed repository and host from `origin`; do not
+run queue commands against a different project's configuration found in a parent directory.
+Report missing items and recovery commands together, propose setup, and wait for agreement.
+Then save agreed settings in `taskq.toml`, run `taskq init` and verify `taskq list` and the board.
+For GitHub, use a dedicated repository board and ensure the repository has a pushed commit
+before a worker claims a task; follow the README installation commands. Do not arm the tick
+or change worker permission settings as part of this onboarding. Readiness checks are manual
+until a read-only readiness command is available.
+
 ## New person: one confirmation card, three steps
 
 1. Tell the session what you do, what you exclude, whether you want only your assignments,

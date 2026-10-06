@@ -5,155 +5,164 @@
 
 # taskq
 
-A task queue for AI coding sessions that lives in GitLab or GitHub issues. Claude Code and Codex sessions use the
-same command, `taskq`, from any machine: a manager session files tasks, a coordinator session runs a
-5-minute tick that starts one worker session per task, and workers claim, report and hand in their work.
-Nothing is stored locally: the issue labels are the task state, one JSON block in the issue description
-holds the rest, and the issue notes are the history.
-
-Requirements: Python 3.11+ (standard library only) and the host's CLI logged in: [`glab`](https://gitlab.com/gitlab-org/cli)
-for GitLab (gitlab.com or self-managed), [`gh`](https://cli.github.com) for GitHub.
+A shared task queue for Claude Code and Codex.<br>
+Tasks live in GitLab or GitHub Issues.<br>
+A manager turns your requests into tasks; workers claim and complete them.<br>
+A tick starts workers, brings you questions and checks results.
 
 ## Install
 
+Tell your agent: **“Install taskq in this project.”**
+
+Agent: resolve placeholders from `git remote get-url origin`; run the matching commands.
+Requirements: Python 3.11+, [pipx](https://pipx.pypa.io/stable/installation/),
+and [glab](https://gitlab.com/gitlab-org/cli) (GitLab) or [gh](https://cli.github.com) (GitHub).
+If login needs the person, report it and resume after login.
+
 ```bash
+# If taskq is not installed:
 pipx install git+https://github.com/alexkirs/taskq
+taskq --help
 ```
 
-To work on taskq itself, install an editable clone instead (`uv tool install -e` works the same way):
+GitLab:
 
 ```bash
-git clone https://github.com/alexkirs/taskq ~/Projects/taskq
-pipx install -e ~/Projects/taskq
+glab auth status --hostname <host>
+# If not authenticated:
+glab auth login --hostname <host>
+taskq init --project <group/project> --host <host>
 ```
 
-taskq updates itself once a day; `taskq update` updates by hand (`--verbose` says why a check was skipped); `[update] auto = false` turns it off.
-The tick checks `main` of this repository at most every `[update] every`: an editable clone is fast-forwarded
-(left alone, with the reason, when it has uncommitted changes or commits `main` lacks), an install from Git is
-reinstalled, and the pass goes on as the new version. `tick` prints the version it runs. Versions are not pinned.
-
-## Set up a project
+GitHub:
 
 ```bash
-cd <your project checkout>
-glab auth login --hostname <gitlab host>
-taskq init --project <group>/<project> --host <gitlab host>
-git add taskq.toml && git commit -m "taskq: queue config"
+gh auth status --hostname <host>
+# If not authenticated:
+gh auth login --hostname <host>
+# If project scope is missing:
+gh auth refresh -h <host> -s project
 ```
 
-`taskq init` writes a minimal `taskq.toml` when there is none, then creates the labels (`q-*` states,
-`run-*` runtimes, types, `priority-*`, `problem`, configured `area-*`) and a board `taskq` with one column per state. Running
-it again changes nothing. Each person uses their own account. Automatic selection never takes
-another person's assigned task; unassigned tasks form the shared pool.
-
-On GitHub the queue is the repository's issues (`taskq init --github <owner>/<repo>`, `gh auth login` first):
+If config is missing, write `taskq.toml` first (`<repo>` is the repository name):
 
 ```toml
 [github]
-repo = "owner/repo"           # instead of [gitlab]
-host = "github.example.com"   # optional: GitHub Enterprise
+repo = "<owner/repo>"
+host = "<host>"
+board = "<repo>-taskq"
 ```
 
-- The board is a Projects v2 project `taskq` (`[github] board` renames it) owned by the repository owner and
-  linked to the repository, with the field Status: one column per state. `init` creates it once and prints its
-  URL; `tick` prints it too. It needs the token scope `project`: `gh auth refresh -h github.com -s project`.
-  Without it `init` names that command and makes the labels only; everything else works without a board.
-- The `q-*` label stays the task's state; the board follows it: `add` puts the card in `ready`, every state
-  change moves the card in the same command, `close` archives it. `init` deletes the project's own workflows
-  (they would close an issue whose card reaches a column and move cards on their own).
-- Moving a card is a request to the queue, executed by the next `tick` with the note «moved on the board»:
-  `ready`/`waiting` → `later` defers, `later` → `ready` restores, `review` → `ready` rejects. Any other move
-  (from `doing`, from `ask` — a question needs an answer) goes back to the label's column and is named under
-  «Board mismatch» with the command that does it.
-- The task lock is the ref `refs/taskq/lock/<N>` (not a branch: no CI runs, nothing in the UI). Creating
-  it twice is a 422 for any user, so the lock is atomic between people with their own accounts.
-- `--filter` is GitHub's list-issues query: `labels=area-maps`, `assignee=<login>`, `milestone=<number>`.
-- Dependencies are the `deps` field of the task block only; GitHub has no issue links.
-- `selftest` deletes its issues only when the token may (`deleteIssue` needs admin); otherwise it closes them.
+```bash
+taskq init --github <owner/repo> --host <host>
+```
 
-## taskq.toml
+Keep existing config. Use a dedicated board: init manages Status and disables built-in workflows.
+GitHub needs a pushed commit before claiming tasks. For an empty repository:
 
-All project-specific settings live here; `taskq` finds the file from the current directory upward, so
-commands work from the main checkout and from any worktree. It holds no secrets: the token stays with `glab`.
+```bash
+git commit --allow-empty -m "Initialize repository"
+git push -u origin HEAD
+```
+
+Expected: `taskq.toml`, labels and a board with one column per state.
+GitLab prints its ID; GitHub prints its URL. `labels only`: obtain `project` scope; rerun init.
+Credentials stay in the host CLI.
+
+## Product Manager
+
+Tell your agent: **“You are the Product Manager of taskq.”**
+
+Agent: run `taskq contract`; read both printed contracts.
+Check remote, config, CLI authentication, write permissions, labels and board.
+Report gaps; wait for setup agreement. Save settings in `taskq.toml`; run init, then `taskq list`.
+Expected: queue and board, or missing permission and recovery command.
+The manager role alone does not arm a tick.
+
+## Check it works
+
+```bash
+taskq list
+taskq selftest --scope quick
+```
+
+Expected: queue contents, then passing rows for
+`add → take → beat → ask → answer → result → close`. Quick starts no sessions.
+Test tasks are deleted (closed when deletion is not permitted).
+
+Tell the manager: **“Check full orchestration with Claude and Codex.”**
+
+```bash
+taskq selftest --scope full --runtime claude codex
+```
+
+Expected: workers test claims, questions, answers, rejection and release; report verifies stored state.
+Read the manager contract for runtime setup and cleanup.
+Failures exit 1; dependent checks are skipped.
+
+## Try one task
+
+```bash
+taskq add --title "Try taskq" --type research --runtime any \
+  --goal "Reply: taskq works. No file changes." \
+  --acceptance "The result says: taskq works."
+# Replace N with the task number printed by add:
+taskq take N
+taskq result N --checks "Reply matches acceptance" --text "taskq works."
+taskq close N --text "Checked the reply against acceptance."
+```
+
+Expected: `ready → doing → review → closed`; the board card disappears on close.
+Code/docs results require `--sha` of a commit pushed to `main`.
+
+## Start workers
+
+Tell the manager your profile, then **“Arm the tick.”** Confirm its profile card.
+Expected: the coordinator follows tick instructions every 5 minutes.
+
+| Profile | Arguments for both `tick` and `worker` |
+|---|---|
+| All areas, your tasks plus shared pool | none |
+| Only your assigned tasks | `--mine` |
+| One area, your tasks plus its shared pool | `--filter "labels=area-maps"` |
+
+For maps, save in `taskq.toml`; run init:
 
 ```toml
-[gitlab]
-project = "group/project"     # required
-host = "gitlab.example.com"   # optional: else glab picks the host from the git remote
-board = "taskq"
-
-[areas]                       # your project's work areas, labels created by init
-names = ["maps", "engine"]
-
-[codex]                       # needed only for `taskq spawn --runtime codex`
-project = "<Codex app project id>"
-section = "<Codex app sidebar section id>"
-
-[workspace]                   # worker brief texts; {iid} is the task number
-new = "from the main checkout run `git worktree add -b taskq-{iid} ../taskq-{iid} origin/main` and work only there."
-continue = "this task was started before in worktree `taskq-{iid}`; continue there."
-none = "this task ends in an answer, not a commit: work from the main checkout."
-retire = "git worktree remove ../taskq-{iid}"   # printed after `close`
-cleanup_helpers = "scripts"   # folder with workspace_gc.py, host_gentle.py, host_tools.py for `taskq cleanup`
-
-[update]                      # written with these defaults when missing
-auto = true                   # tick updates taskq from GitHub
-every = "24h"                 # at most this often (m, h, d)
-
-[brief]
-rules = """
-Project rules appended to every worker brief.
-"""
+[areas]
+names = ["maps"]
 ```
-
-## Task states
-
-| Label | Meaning |
-|---|---|
-| `q-ready` | Can start when its runtime has room and its scope is free |
-| `q-waiting` | Has an open dependency; only `tick` moves it between ready and waiting |
-| `q-doing` | A worker holds it |
-| `q-review` | Handed in, waiting for acceptance |
-| `q-ask` | A question for the owner |
-| `q-later` | Deferred by the owner |
-
-```
-add → ready ⇄ waiting → take → doing → result → review → close
-                         doing → ask → answer → ready (or doing, when answered in the worker's session)
-                                        review → reject → ready
-```
-
-## Use from sessions
-
-- **Manager** (the session the owner talks to): `taskq add`, `taskq list`, `taskq answer`, `taskq later`.
-- **Coordinator**: every 5 minutes runs `taskq tick` and follows what it prints: accept or
-  reject results, start workers (`taskq spawn` for a Claude CLI background session, reached with
-  `SendMessage`; `taskq spawn --runtime codex` plus `taskq codex-send` for the Codex app), pass
-  questions to the owner. `taskq show <id>` opens a Claude worker in the desktop app on request;
-  `taskq retire <id>` ends a finished one.
-- **Worker**: its only prompt is ``Run `cd <main checkout> && taskq worker` and follow the instructions it
-  prints.`` The brief names the task, the workspace, the history and the exact commands: `take`, `beat`,
-  `problem`, `ask`, `result`.
-
-`taskq contract` prints the paths of the full contracts: `taskq.md` (the queue) and `taskq-manager.md`
-(the manager and coordinator session). `taskq --help` lists every command.
-
-## Personal tick
-
-Tell the manager what you work on and what you exclude. It shows one confirmation card with the
-profile command, local session limits and the board link; after your “ok” it arms that profile.
+Automatic selection excludes other people's assignments.
 
 ```bash
 taskq tick --filter "labels=area-maps" --mine --limit claude=1,codex=2
 taskq worker --filter "labels=area-maps" --mine --limit claude=1,codex=2
-taskq add --title "…" --goal "…" --acceptance "…" --type code --area maps --mine
 ```
 
-No flags: your tasks plus the shared pool in every area, two Claude and three Codex sessions on
-this machine. `--mine` excludes the pool. Manual `take N` assigns any ready task to you.
-Limits live only in the prompt; the global `[limit]` setting is retired.
+Expected: only your maps tasks; at most 1 Claude / 2 Codex workers on this machine.
+Defaults: Claude 2 / Codex 3. Profiles live in session prompts.
 
-## Develop
+## Talk to the manager
+
+> **You:** Add a task to fix login; assign it to me.<br>
+> **Manager:** Records goal, acceptance, scope, runtime, assignee; returns the task link.<br>
+> **You:** Arm the tick for only my tasks.<br>
+> **Manager:** After your profile confirmation, starts the tick and workers.<br>
+> **Worker:** Asks which login behavior you want.<br>
+> **Manager:** Relays it; records your answer with `taskq answer N`.<br>
+> **Manager:** Checks commit and acceptance; closes or rejects with exact fixes.
+
+## Supported systems and reference
+
+GitLab Issues (including self-managed) and GitHub Issues (including Enterprise) work today.
+Other systems: on request. GitHub queues work without a board.
+
+- [Queue, configuration and states](taskq/contracts/taskq.md)
+- [Manager, tick and runtime setup](taskq/contracts/taskq-manager.md)
+- `taskq --help`: commands. `taskq update`: update now; automatic updates every 24 hours.
+
+<details>
+<summary>Develop taskq</summary>
 
 An editable install runs the clone's working tree: every `taskq` call on the machine, every tick and worker, runs
 whatever is in it right now. So the clone's own tree stays clean `main`, and every change happens in a worktree of it:
@@ -171,9 +180,9 @@ before this wrapper (`taskq_cli`) existed picks it up after one `pipx install --
 
 ```bash
 python3 -m unittest discover -s tests
-TASKQ_CLEANUP_HELPERS=<project>/scripts python3 -m unittest discover -s tests   # also the cleanup tests
+TASKQ_CLEANUP_HELPERS=<project>/scripts python3 -m unittest discover -s tests
 ```
 
-## License
+</details>
 
-MIT, see [LICENSE](LICENSE).
+License: [MIT](LICENSE).

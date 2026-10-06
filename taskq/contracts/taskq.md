@@ -80,6 +80,13 @@ moves the card back by `deps` and prints `Moved #N …`. `tick` lists everything
 mismatch": `doing` without a worker, `review` without a result, an issue with a block but without exactly
 one state label (including one moved to Open).
 
+**Board on GitHub (2026-10-06):** a Projects v2 project named `[github] board`, a view taskq keeps in step with
+the labels (§ GitHub). A card move does not change the label: `tick` executes `ready`/`waiting`→`later`
+(`later`), `later`→`ready`/`waiting` (`answer`) and `review`→`ready` (`reject`), each with the note «moved on the
+board»; `ready`↔`waiting` goes back silently; any other move goes back to the label's column and is listed under
+"Board mismatch" with the fix command (`ask`→`ready` is not an answer: `answer N --text`; `doing`→`ready` is
+`release N`).
+
 ## Epics and subtasks
 
 - An epic is a project milestone (GitLab 17.2.9-ee without a license has no Epics, blocks links, weight or
@@ -193,14 +200,27 @@ any user (checked live 2026-10-06), so the lock is atomic between people with th
 in the amendment to csgo #241); it is no branch, so no CI runs; anyone may remove it, the claim names the holder.
 `tick` finds orphan locks through `git/matching-refs/taskq/lock/`. Labels move as the full set in one PATCH
 (the set last read in the process, else one GET). Comments have no `sort=desc`: the newest is read from the
-last page by the issue's comment count. There is no board (`init` says so; a column is the label filter in the
-issues list), no issue links (`deps` in the block is the source of truth), and `DELETE issues/N` is the GraphQL
+last page by the issue's comment count. The board is a Projects v2 project (below), there are no issue links (`deps` in the block is the source of truth), and `DELETE issues/N` is the GraphQL
 `deleteIssue` (admin; `selftest` closes instead when refused). `--filter` is GitHub's list-issues query
 (`labels=`, `assignee=<login>`, `milestone=<number>`). Pull requests are dropped from issue lists. GitHub's REST issue list lags a
 just-created issue by up to half a minute (measured live 2026-10-06: 25–35 s, sometimes none; a `take` right after
 `add` found no task), while GraphQL shows it at once and reflects label changes at once — so issue lists are read
 through GraphQL (`repository.issues`, 100 per page, with `states`, `labels`, `filterBy`); single issues, comments,
 labels and refs stay REST.
+
+The board: `init` creates the Projects v2 project `[github] board` (default `taskq`) once — owner the repository
+owner, user or organization (`createProjectV2` with `ownerId` and `repositoryId`, which links it) — gives its
+single-select field Status the options STATES in order (`updateProjectV2Field` with new options: the project's
+Todo/In Progress/Done go), deletes the project's built-in workflows (`deleteProjectV2Workflow`; the API cannot
+disable them: «Auto-close issue» closes an issue whose card reaches the old Done option, others set Status on
+add, close and merge — taskq alone writes Status), adds every open task without a card and prints the URL.
+A second `init` changes nothing. The store puts a card in its column in the same request batch as the label:
+`POST issues` adds the item (`addProjectV2ItemById`) and sets Status (`updateProjectV2ItemFieldValue`); a `PUT`
+that changes the `q-*` label sets Status; `close` archives the item (`archiveProjectV2Item`: the board shows open
+tasks only; the issue keeps its history). The project, the field and its option ids are looked up once per
+process. `tick` reads the items in one query (100 per page) and treats Status as the owner's intent (§ States).
+Without the token scope `project` (`gh auth refresh -h github.com -s project`) GraphQL refuses the lookup: there
+is no board, `init` names the command and makes the labels, every other command works as before.
 
 Live on alexkirs/taskq, 2026-10-06: `init` made the labels; the cycle add → tick → worker → take → beat ×2 (one
 note) → ask → tick shows the question → answer → take → result → tick shows the review → reject → take → release

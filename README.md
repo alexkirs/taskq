@@ -54,8 +54,17 @@ repo = "owner/repo"           # instead of [gitlab]
 host = "github.example.com"   # optional: GitHub Enterprise
 ```
 
-- There is no board: a column is the issues list filtered by its `q-*` label, e.g.
-  `https://github.com/<owner>/<repo>/issues?q=is:open+label:q-ready`. `init` prints so.
+- The board is a Projects v2 project `taskq` (`[github] board` renames it) owned by the repository owner and
+  linked to the repository, with the field Status: one column per state. `init` creates it once and prints its
+  URL; `tick` prints it too. It needs the token scope `project`: `gh auth refresh -h github.com -s project`.
+  Without it `init` names that command and makes the labels only; everything else works without a board.
+- The `q-*` label stays the task's state; the board follows it: `add` puts the card in `ready`, every state
+  change moves the card in the same command, `close` archives it. `init` deletes the project's own workflows
+  (they would close an issue whose card reaches a column and move cards on their own).
+- Moving a card is a request to the queue, executed by the next `tick` with the note «moved on the board»:
+  `ready`/`waiting` → `later` defers, `later` → `ready` restores, `review` → `ready` rejects. Any other move
+  (from `doing`, from `ask` — a question needs an answer) goes back to the label's column and is named under
+  «Board mismatch» with the command that does it.
 - The task lock is the ref `refs/taskq/lock/<N>` (not a branch: no CI runs, nothing in the UI). Creating
   it twice is a 422 for any user, so the lock is atomic between people with their own accounts.
 - `--filter` is GitHub's list-issues query: `labels=area-maps`, `assignee=<login>`, `milestone=<number>`.

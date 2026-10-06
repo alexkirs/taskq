@@ -207,7 +207,7 @@ marks for more than 20 minutes — look at the session and send a message. After
 without issue changes the tick returns the task to the queue itself.
 
 **Board mismatches (section Board mismatch).** The owner may move cards on the project board (the
-`[gitlab] board` from taskq.toml). The tick lists moves the queue cannot execute, with a fix command;
+`[gitlab] board` or the GitHub Projects v2 board from taskq.toml). The tick lists moves the queue cannot execute, with a fix command (on GitHub it executes the allowed ones itself and puts the others back);
 fix it or ask the owner what was meant. For Codex in review the tick reminds to archive after
 acceptance; for ask and later — to archive the stopped worker, since after the answer the task
 continues in a new session. A manual `ready`↔`waiting` move is not an error; the tick moves it back

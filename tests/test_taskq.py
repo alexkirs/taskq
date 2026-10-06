@@ -936,10 +936,62 @@ class Cycle(unittest.TestCase):
 
 class GithubRest:
     """GitHub's REST shapes for what `Github` asks: issues by `number` with label objects, comments, labels,
-    milestones, label events, blobs and refs (the lock), the user, and `deleteIssue` over GraphQL."""
+    milestones, label events, blobs and refs (the lock), the user, `deleteIssue` and Projects v2 over GraphQL."""
     def __init__(self):
         self.issues, self.comments, self.labels, self.refs, self.blobs = {}, {}, {}, {}, {}
         self.calls, self.clock = [], 0
+        self.projects, self.scope, self.mutations = [], True, []  # the owner's Projects v2; False: the token lacks `project`
+
+    def project(self, query, found):
+        """Projects v2 GraphQL: lookup by title, create, Status options, items, card moves and archive."""
+        if not self.scope:
+            q.fail("GitHub POST graphql failed: GraphQL: Your token has not been granted the required scopes to execute this query. The 'projectsV2' field requires one of the following scopes: ['read:project']")
+        if query.startswith('mutation'):
+            self.mutations.append(query.split('{', 1)[1].split('(', 1)[0].strip())
+        shape = lambda board: {'id': board['id'], 'title': board['title'], 'url': board['url'],
+                               'field': {'id': 'status', 'options': [dict(option) for option in board['options']]}}
+        if 'createProjectV2(' in query:
+            board = {'id': f'project{len(self.projects) + 1}', 'title': found['title'], 'url': f'project-url/{len(self.projects) + 1}',
+                     'repo': found['repo'], 'items': {}, 'workflows': ['Auto-close issue', 'Item added to project', 'Item closed'], 'options': [{'id': f'o{index}', 'name': name} for index, name in enumerate(('Todo', 'In Progress', 'Done'))]}
+            self.projects.append(board)
+            return {'createProjectV2': {'projectV2': shape(board)}}
+        if 'projectsV2(' in query:
+            nodes = [shape(board) for board in self.projects if found['board'] in board['title']]
+            return {'repository': {'id': 'repo', 'owner': {'id': 'owner', 'projectsV2': {'nodes': nodes}}}}
+        board = self.projects[0]  # one board in these tests
+        if 'workflows(' in query:
+            return {'node': {'workflows': {'nodes': [{'id': name} for name in board['workflows']]}}}
+        if 'deleteProjectV2Workflow(' in query:
+            board['workflows'].remove(found['id'])
+            return {}
+        if 'updateProjectV2Field(' in query:
+            board['options'] = [{'id': option.get('id') or f'o{len(board["options"]) + index}', 'name': option['name']}
+                                for index, option in enumerate(found['options'])]
+            return {'updateProjectV2Field': {'projectV2Field': shape(board)['field']}}
+        if 'addProjectV2ItemById(' in query:
+            number = next(number for number, issue in self.issues.items() if issue['node_id'] == found['node'])
+            item = board['items'].setdefault(number, {'id': f'item{number}', 'option': None, 'archived': False})
+            return {'addProjectV2ItemById': {'item': {'id': item['id']}}}
+        item = next((item for item in board['items'].values() if item['id'] == found.get('item')), None)
+        if 'updateProjectV2ItemFieldValue(' in query:
+            item['option'] = found['option']
+            return {}
+        if 'archiveProjectV2Item(' in query:
+            item['archived'] = True
+            return {}
+        names = {option['id']: option['name'] for option in board['options']}
+        nodes = [{'id': item['id'], 'isArchived': item['archived'], 'content': {'number': number},
+                  'fieldValueByName': {'name': names[item['option']]} if item['option'] in names else None} for number, item in board['items'].items()]
+        return {'node': {'items': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}}
+
+    def column(self, number):
+        """The Status of the issue's card on the one board; 'archived'; None: no card."""
+        item = self.projects[0]['items'].get(number) if self.projects else None
+        return item and ('archived' if item['archived'] else {option['id']: option['name'] for option in self.projects[0]['options']}.get(item['option']))
+
+    def move(self, number, status):
+        """The owner drags the card to the column `status`."""
+        self.projects[0]['items'][number]['option'] = next(option['id'] for option in self.projects[0]['options'] if option['name'] == status)
 
     def now(self):
         self.clock = max(time.time(), self.clock + 0.001)
@@ -964,6 +1016,8 @@ class GithubRest:
             number = next(number for number, issue in self.issues.items() if issue['node_id'] == body['variables']['id'])
             del self.issues[number]
             return {'data': {}}
+        if route == 'graphql' and 'Project' in body['query']:
+            return {'data': self.project(body['query'], body['variables'])}
         if route == 'graphql':
             found = body['variables']
             items = [issue for issue in self.issues.values() if (not found['states'] or issue['state'].upper() in found['states'])
@@ -1066,6 +1120,7 @@ class GithubCycle(unittest.TestCase):
         store.run = self.github
         self.enterContext(patch.object(q, 'api', store))
         self.enterContext(patch.object(q, 'BOARDS', False))
+        self.enterContext(patch.object(q, 'HOST', None))
 
     def do(self, who, *argv):
         with patch.dict(os.environ, who), contextlib.redirect_stdout(io.StringIO()) as out:
@@ -1144,7 +1199,67 @@ class GithubCycle(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp), contextlib.redirect_stdout(io.StringIO()) as out:
             q.main(['init', '--github', 'owner/repo'])
             self.assertEqual(Path('taskq.toml').read_text().splitlines()[1:], ['[github]', 'repo = "owner/repo"'])
-        self.assertIn('no board on GitHub', out.getvalue())
+        self.assertIn('board project-url/1:', out.getvalue())
+
+    def test_init_makes_the_board_once_with_one_column_per_state(self):
+        self.do(CLAUDE, 'init')
+        calls, mutations = len(self.github.calls), len(self.github.mutations)
+        self.assertIn('board project-url/1', self.do(CLAUDE, 'init'))
+        self.assertEqual([(board['title'], board['repo'], [option['name'] for option in board['options']]) for board in self.github.projects],
+                         [('taskq', 'repo', list(q.STATES))])
+        self.assertEqual(self.github.projects[0]['workflows'], [])  # Status Done would close the issue: taskq alone moves cards
+        writes = [path for method, path in self.github.calls[calls:] if method != 'GET' and path != 'graphql']
+        self.assertEqual((writes, self.github.mutations[mutations:]), ([], []))
+
+    def test_without_the_project_scope_init_names_the_command_and_makes_labels(self):
+        self.github.scope = False
+        out = self.do(CLAUDE, 'init')
+        self.assertIn('gh auth refresh -h github.com -s project', out)
+        self.assertIn('q-later', self.github.labels)
+        number = self.add('--type', 'code')
+        self.do(CLAUDE, 'take', number)  # commands work as before, without a board
+        self.assertEqual(self.state(number), 'doing')
+
+    def test_every_state_change_moves_the_card_and_close_archives_it(self):
+        number = self.add('--type', 'research')
+        self.do(CLAUDE, 'init')  # a task from before the board gets its card
+        self.assertEqual(self.github.column(number), 'ready')
+        number = self.add('--type', 'research')
+        self.assertEqual(self.github.column(number), 'ready')
+        self.do(CLAUDE, 'take', number)
+        self.assertEqual(self.github.column(number), 'doing')
+        self.do(CLAUDE, 'ask', number, '--text', 'which?')
+        self.assertEqual(self.github.column(number), 'ask')
+        self.do(CLAUDE, 'answer', number, '--text', 'this')
+        self.assertEqual(self.github.column(number), 'doing')
+        self.do(CLAUDE, 'result', number, '--text', 'done', '--checks', 'none')
+        self.assertEqual(self.github.column(number), 'review')
+        self.do(CLAUDE, 'reject', number, '--text', 'more')
+        self.assertEqual(self.github.column(number), 'ready')
+        self.do(CLAUDE, 'take', number)
+        self.do(CLAUDE, 'result', number, '--text', 'done', '--checks', 'none')
+        self.do(CLAUDE, 'close', number, '--text', 'ok')
+        self.assertEqual(self.github.column(number), 'archived')
+
+    def test_owner_card_moves_are_executed_or_put_back(self):
+        self.do(CLAUDE, 'init')
+        deferred, restored, started = self.add('--type', 'research'), self.add('--type', 'research'), self.add('--type', 'research')
+        self.do(CLAUDE, 'later', restored, '--text', 'not now')
+        self.do(CLAUDE, 'take', started)
+        self.github.move(deferred, 'later')
+        self.github.move(restored, 'ready')
+        self.github.move(started, 'review')
+        out = self.do(CLAUDE, 'tick')
+        self.assertIn('Board: project-url/1', out)
+        self.assertEqual((self.state(deferred), self.state(restored), self.state(started)), ('later', 'ready', 'doing'))
+        self.assertIn(f'Board move of #{deferred} executed: ready → later', out)
+        self.assertTrue(any(item['body'] == '**later** · claude:claude-s\n\nmoved on the board' for item in self.github.comments.values()))
+        self.assertIn(f'## Board mismatch', out)
+        self.assertIn(f'#{started} was moved on the board from doing to review: put back to doing', out)
+        self.assertEqual(self.github.column(started), 'doing')
+        self.github.move(started, 'ready')
+        self.assertIn(f'`taskq release {started}', self.do(CLAUDE, 'tick'))
+        self.assertEqual(self.github.column(started), 'doing')
 
 
 class Selftest(unittest.TestCase):

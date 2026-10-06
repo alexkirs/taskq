@@ -266,6 +266,11 @@ def gitlab(method, path, body=None):
 TAKEN = ('has already been taken', 'Reference already exists')  # the lock's conflict answer: GitLab 404, GitHub 422
 
 
+def gone(error):
+    """The store's answer for a deleted or missing thing: 404, or GitHub's 410 «This issue was deleted»."""
+    return re.search(r'(HTTP |"status":"|\b)(404|410)( Not Found|\)|")', str(error))
+
+
 class Github:
     """The store protocol on GitHub REST through `gh api`. An issue's `number` is `iid`, `body` is `description`,
     `open` is `opened`, labels come back as names, assignees as `{id, username}`; a PUT with add/remove labels
@@ -494,7 +499,14 @@ class Github:
         if method == 'GET' and path.startswith('issues?'):
             if 'my_reaction_emoji' in query:  # every locked issue: the lock refs name them
                 numbers = [int(item['ref'].rsplit('/', 1)[1]) for item in self.run('GET', 'git/matching-refs/taskq/lock/')]
-                found = [self.issue(self.run('GET', f'issues/{number}')) for number in numbers]
+                found = []
+                for number in numbers:
+                    try:
+                        found.append(self.issue(self.run('GET', f'issues/{number}')))
+                    except SystemExit as error:
+                        if not gone(error):
+                            raise
+                        self.run('DELETE', f'git/refs/taskq/lock/{number}')  # its issue was deleted: the lock guards nothing
                 return [item for item in found if query.get('state', 'opened') in ('all', item['state'])]
             return [] if later else self.listed(query)
         iid = int(re.match(r'issues/(\d+)', path)[1])
@@ -508,7 +520,7 @@ class Github:
             try:
                 ref = self.run('GET', f'git/ref/taskq/lock/{iid}')
             except SystemExit as error:
-                if '404' in str(error):
+                if gone(error):
                     return []
                 raise
             content = json.loads(base64.b64decode(self.run('GET', f'git/blobs/{ref["object"]["sha"]}')['content']))
@@ -2787,7 +2799,16 @@ class Selftest:
         self.args, self.rows, self.failed, self.created = args, [], None, []
         self.uid, self.stamp = user(), time.strftime('%Y%m%d%H%M%S')
         self.extra = dict(item.split('=', 1) for item in args.worker_env)
-        self.record = ROOT / '.local' / SELFTEST / 'last.json'
+        self.record = ROOT / '.local' / SELFTEST / f'last-{self.stamp}.json'
+
+    def records(self):
+        """Every run's record but this one's, as (path, data, alive): a live run's tasks are not leftovers."""
+        found = []
+        for path in sorted(self.record.parent.glob('last*.json')):  # last.json: a record from before pids
+            if path != self.record:
+                data = json.loads(path.read_text())
+                found.append((path, data, alive(data.get('pid'))))
+        return found
 
     def step(self, mechanism, runtime, function):
         """One report row. After a failed step the rest of its chain is skipped: they would only repeat it."""
@@ -2868,10 +2889,10 @@ class Selftest:
         return {line for line in section.splitlines() if line.startswith('- #')}
 
     def save(self, **changes):
-        """`.local/selftest/last.json`: what this run created, so `--scope check` and a crashed run can clean up."""
+        """`.local/selftest/last-<stamp>.json`: what this run created and its pid, so `--scope check` and a crashed run can clean up."""
         self.record.parent.mkdir(parents=True, exist_ok=True)
         data = json.loads(self.record.read_text()) if self.record.exists() else {}
-        data.update(changes, created=sorted(set(data.get('created', [])) | set(self.created)), stamp=self.stamp)
+        data.update(changes, created=sorted(set(data.get('created', [])) | set(self.created)), stamp=self.stamp, pid=os.getpid())
         self.record.write_text(json.dumps(data, indent=1))
 
     # --- quick: the queue commands as worker processes, no sessions --------------------------------
@@ -3041,23 +3062,41 @@ class Selftest:
     # --- the traces: nothing of the selftest stays on the board, in Git or in the apps ------------
 
     def clean(self):
-        data = json.loads(self.record.read_text()) if self.record.exists() else {}
-        created = data.get('created', [])
+        """This run's traces and those of every finished or crashed run; a live run's are its own."""
+        others = self.records()
+        dead = [(path, data) for path, data, live in others if not live]
+        runs = [json.loads(self.record.read_text()) if self.record.exists() else {}] + [data for _, data in dead]
+        created = sorted({iid for data in runs for iid in data.get('created', [])})
+        busy = {iid for _, data, live in others if live for iid in data.get('created', [])}
+        sessions = [(runtime, session) for data in runs for runtime, session in data.get('sessions', {}).items()]
+
+        def held(iid):
+            try:
+                return locks(iid)
+            except SystemExit as error:  # GitLab: the issue is deleted, its awards with it
+                if gone(error):
+                    return []
+                raise
 
         def issues_gone():
             closed = []
             for iid in created:
+                if held(iid):
+                    unlock(iid)  # first: the GitHub lock ref outlives its issue
                 try:
                     api('DELETE', f'issues/{iid}')
                 except SystemExit as error:
-                    if '404' in str(error):
+                    if gone(error):
                         continue  # deleted by an earlier run
                     if api('GET', f'issues/{iid}')['state'] == 'opened':
                         api('PUT', f'issues/{iid}', {'state_event': 'close'})
                     closed.append(iid)  # the token may not delete issues: closed instead
-            left = [issue['iid'] for issue in issues(f'state=opened&labels={SELFTEST}')]
+            left = [issue['iid'] for issue in issues(f'state=opened&labels={SELFTEST}') if issue['iid'] not in busy]
             if left:
                 raise SelftestError(f'open selftest issues remain: {left}')
+            locked = [iid for iid in created if held(iid)]
+            if locked:
+                raise SelftestError(f'lock refs of selftest issues remain: {locked}')
             return f'deleted {sorted(set(created) - set(closed))}' + (f', closed (no right to delete) {closed}' if closed else '')
 
         def worktrees():
@@ -3076,11 +3115,14 @@ class Selftest:
         for mechanism, runtime, function in (
                 ('remove the selftest tasks', '-', issues_gone), ('no worktree left', '-', worktrees),
                 *(('no session left', runtime, lambda runtime=runtime, session=session: selftest_retire(runtime, session, check=True))
-                  for runtime, session in data.get('sessions', {}).items()),
+                  for runtime, session in sessions),
                 # quick: each of its ticks already checked that no selftest task is under Board mismatch.
                 *((('board as before', '-', board),) if self.args.scope != 'quick' else ())):
             self.chain()
             self.step(mechanism, runtime, function)
+        if not any(row[2] == 'FAIL' for row in self.rows):
+            for path, _ in dead:  # their traces are gone: this run's record now stands for them
+                path.unlink(missing_ok=True)
 
     def report(self):
         lines = ['| mechanism | runtime | result | seconds | detail |', '|---|---|---|---|---|']
@@ -3096,6 +3138,22 @@ def driver_app_session():
     """The app session of the calling Claude session, to show again after an import; None from Codex or a shell."""
     sid = os.environ.get(RUNTIMES['claude'])
     return next((meta['sessionId'] for meta in claude_sessions().values() if meta.get('cliSessionId') == sid), None) if sid else None
+
+
+def alive(pid):
+    """True while the process `pid` runs (not this one)."""
+    if not pid or pid == os.getpid():
+        return False
+    if os.name == 'nt':  # os.kill(pid, 0) terminates the process on Windows
+        listed = subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/NH'], capture_output=True, text=True).stdout
+        return str(pid) in listed.split()
+    try:
+        os.kill(pid, 0)  # ponytail: a reused pid reads as alive; the record's stamp names the run to check by hand
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def selftest_retire(runtime, session, check=False):
@@ -3121,8 +3179,9 @@ def selftest(args):
     """The queue's mechanisms through the real queue. quick: the commands as worker processes; full: a
     real worker session of each app; check: only that the traces of the last run are gone."""
     test = Selftest(args)
-    if args.scope != 'check':
-        test.record.unlink(missing_ok=True)
+    if args.scope == 'check' and (live := [(data.get('stamp'), data['pid']) for _, data, alive in test.records() if alive]):
+        fail(f'selftest check refused: the run {live[0][0]} is still alive (pid {live[0][1]}); its tasks are not leftovers. '
+             f'Wait for it or stop it (`kill {live[0][1]}`), then check again.')
     if args.scope == 'quick':
         test.quick((args.runtime or [(session() or {}).get('runtime') or 'claude'])[0])
     elif args.scope == 'full':

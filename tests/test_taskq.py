@@ -455,6 +455,12 @@ class Cycle(unittest.TestCase):
         self.do(COORDINATOR, 'close', iid, '--text', 'ok')
         self.assertEqual(self.gitlab.locked(), [])
 
+    def test_award_on_a_deleted_issue_does_not_break_tick(self):
+        iid = self.add('--type', 'research')
+        self.assertTrue(q.lock(iid))
+        q.api('DELETE', f'issues/{iid}')
+        self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))
+
     def test_beat_keeps_one_note_and_problem_without_task_is_an_issue(self):
         iid = self.add('--type', 'research')
         self.do(CLAUDE, 'take', iid)
@@ -1231,7 +1237,7 @@ class GithubRest:
     """GitHub's REST shapes for what `Github` asks: issues by `number` with label objects, comments, labels,
     milestones, label events, blobs and refs (the lock), the user, `deleteIssue` and Projects v2 over GraphQL."""
     def __init__(self):
-        self.issues, self.comments, self.labels, self.refs, self.blobs = {}, {}, {}, {}, {}
+        self.issues, self.comments, self.labels, self.refs, self.blobs, self.deleted = {}, {}, {}, {}, {}, set()
         self.calls, self.clock, self.push = [], 0, True
         self.projects, self.scope, self.mutations = [], True, []  # the owner's Projects v2; False: the token lacks `project`
 
@@ -1314,6 +1320,7 @@ class GithubRest:
         if route == 'graphql' and 'deleteIssue' in body['query']:
             number = next(number for number, issue in self.issues.items() if issue['node_id'] == body['variables']['id'])
             del self.issues[number]
+            self.deleted.add(number)
             return {'data': {}}
         if route == 'graphql' and 'Project' in body['query']:
             return {'data': self.project(body['query'], body['variables'])}
@@ -1383,6 +1390,8 @@ class GithubRest:
             return None
         number = int(re.match(r'issues/(\d+)', route)[1])
         rest = route[len(f'issues/{number}'):]
+        if number in self.deleted:
+            q.fail(f'GitHub {method} issues/{number} failed: gh: This issue was deleted (HTTP 410)')
         issue = self.issues[number]
         if rest == '/comments' and method == 'POST':
             cid = max(self.comments, default=0) + 1
@@ -1514,6 +1523,15 @@ class GithubCycle(unittest.TestCase):
             with patch.dict(os.environ, CLAUDE):
                 q.main(['take', str(number)])
         self.assertIn('cannot start', str(refused.exception))
+
+    def test_lock_ref_of_a_deleted_or_closed_issue_does_not_break_tick(self):
+        deleted, closed = self.add('--type', 'code'), self.add('--type', 'code')
+        self.assertTrue(q.lock(deleted) and q.lock(closed))
+        q.api('DELETE', f'issues/{deleted}')
+        self.github.issues[closed]['state'] = 'closed'  # closed by hand, its lock left
+        self.do(COORDINATOR, 'tick')  # was: GitHub GET issues/1 failed: gh: This issue was deleted (HTTP 410)
+        self.assertEqual(sorted(self.github.refs), [f'refs/taskq/lock/{closed}'])  # the deleted issue's ref is removed
+        self.do(COORDINATOR, 'tick')
 
     def test_newest_comment_is_read_from_the_last_page(self):
         number = self.add('--type', 'code')
@@ -1665,6 +1683,33 @@ class Selftest(unittest.TestCase):
         self.assertTrue(self.gitlab.said(99)[-1].startswith('**selftest** · claude:coordina'))
         self.assertFalse(self.gitlab.locked())
         self.assertFalse((self.directory / 'beat').exists())  # the real tick's last-run time is untouched
+
+    def record(self, pid, created):
+        path = self.directory / '.local' / 'selftest' / f'last-{pid}.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'stamp': str(pid), 'pid': pid, 'created': created}))
+        return path
+
+    def test_check_refuses_while_a_run_is_alive(self):
+        self.record(os.getppid(), [])  # the process that started these tests: alive
+        with self.assertRaises(SystemExit) as refused, patch.dict(os.environ, COORDINATOR):
+            q.main(['selftest', '--scope', 'check'])
+        self.assertIn(f'is still alive (pid {os.getppid()})', str(refused.exception))
+
+    def test_a_run_cleans_a_crashed_run_its_issues_and_locks(self):
+        iid = self.add('--type', 'research', '--label', 'selftest')
+        live = self.add('--type', 'research', '--label', 'selftest')
+        q.lock(iid)
+        dead = subprocess.Popen(['true'])
+        dead.wait()
+        path = self.record(dead.pid, [iid])
+        with patch.object(q, 'alive', lambda pid: pid != dead.pid):  # a quick run of another session is still going
+            self.record(4242, [live])
+            report = self.do(COORDINATOR, 'selftest', '--scope', 'quick')  # check would refuse: a run is alive
+        self.assertIn('13 of 13 ok', report)
+        self.assertEqual(sorted(self.gitlab.issues), [live])  # the live run's task is not a leftover
+        self.assertFalse(self.gitlab.locked())
+        self.assertFalse(path.exists())
 
     def test_broken_worker_token_is_named_not_ok(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()) as out, patch.dict(os.environ, COORDINATOR):

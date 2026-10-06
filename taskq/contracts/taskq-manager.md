@@ -611,8 +611,9 @@ table to the owner as printed, failed rows first in the reply.
 
 **A Claude worker session** is archived only by the app tool: after `full` the session runs
 `archive_session local_<id>` for the id the report names, then `taskq selftest --scope check`, which
-repeats only the trace checks (tasks, worktrees, sessions, board) of the last run
-(`.local/selftest/last.json`).
+repeats only the trace checks (tasks, lock refs, worktrees, sessions, board) of every finished run
+(`.local/selftest/last-<stamp>.json`, one per run with its pid). `check` refuses while a run's pid is alive:
+its tasks are not leftovers.
 
 **A configured runtime** (a third worker app) is one table in `taskq.toml`, no code change. Example:
 the Grok Bot «Taskq» of csgo (#243, first real task csgo #252 delivered in 21 min):

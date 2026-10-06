@@ -32,8 +32,9 @@ class Github:
     # Cards are read from the open issues' side: `ProjectV2.items` of a new project stayed empty for minutes while
     # `Issue.projectItems` showed the cards at once (measured live 2026-10-06).
     ITEMS = ('query($owner: String!, $name: String!, $after: String) { repository(owner: $owner, name: $name) {'
-             ' issues(states: OPEN, first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { number'
-             ' projectItems(first: 10, includeArchived: false) { nodes { id project { id }'
+             ' issues(states: OPEN, first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { number labels(first: 100) { nodes { name } }'
+             ' timelineItems(itemTypes: [LABELED_EVENT], last: 1) { nodes { ... on LabeledEvent { createdAt } } }'
+             ' projectItems(first: 10, includeArchived: false) { nodes { id updatedAt project { id }'
              ' fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } } } } }')
 
     def __init__(self, repo, host=None, board=None):
@@ -128,16 +129,30 @@ class Github:
         return self.board  # False: the token lacks the scope `project`
 
     def cards(self):
-        """Status by number of every open issue with a card on the board (None: the card has no Status)."""
+        """Status by number of every open issue with a card on the board (None: the card has no Status). A Status
+        unlike the label is the owner's intent only when the card changed after the issue's last label event;
+        otherwise a card sync failed after the label moved (#45): the card is put back to the label here."""
         board, found, after = self.project(), {}, None
         while board:
             owner, name = self.repo.split('/')
             page = self.graphql(self.ITEMS, owner=owner, name=name, after=after)['repository']['issues']
             for issue in page['nodes']:
-                for item in issue['projectItems']['nodes']:
-                    if item['project']['id'] == board['id']:
-                        self.items[issue['number']] = item['id']
-                        found[issue['number']] = (item['fieldValueByName'] or {}).get('name')
+                number, label = issue['number'], self.state(node['name'] for node in issue['labels']['nodes'])
+                item = next((item for item in issue['projectItems']['nodes'] if item['project']['id'] == board['id']), None)
+                if not item:
+                    if label:  # the card step of `add` failed: the task gets its card now
+                        print(f'Board card of #{number} added in {label}: it had none.')
+                        self.sync(number, label)
+                        found[number] = label
+                    continue
+                self.items[number] = item['id']
+                status = (item['fieldValueByName'] or {}).get('name')
+                labeled = max((event['createdAt'] for event in issue['timelineItems']['nodes']), default='')
+                if status and label and status != label and item['updatedAt'] <= labeled:
+                    print(f'Board card of #{number} put back to {label}: its last card sync failed.')
+                    self.sync(number, label)
+                    status = label
+                found[number] = status
             if not page['pageInfo']['hasNextPage']:
                 break
             after = page['pageInfo']['endCursor']
@@ -159,6 +174,13 @@ class Github:
         self.graphql('mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) { updateProjectV2ItemFieldValue(input: {'
                      ' projectId: $project, itemId: $item, fieldId: $field, value: {singleSelectOptionId: $option}}) { projectV2Item { id } } }',
                      project=board['id'], item=self.items[number], field=board['field'], option=board['options'][state])
+
+    def sync(self, number, state):
+        """`card` as best effort: the label is the queue's state, a failed card is put back by the next `cards`."""
+        try:
+            self.card(number, state)
+        except SystemExit as error:
+            print(f'Board card of #{number} not updated: {error}. The next tick puts it back.')
 
     @staticmethod
     def state(names):
@@ -224,7 +246,7 @@ class Github:
         if method == 'POST' and path == 'issues':
             created = self.issue(self.run('POST', 'issues', self.body(body)))
             if self.state(created['labels']):
-                self.card(created['iid'], self.state(created['labels']))
+                self.sync(created['iid'], self.state(created['labels']))
             return created
         if method == 'GET' and path.startswith('issues?'):
             if 'my_reaction_emoji' in query:  # every locked issue: the lock refs name them
@@ -282,8 +304,8 @@ class Github:
             before = self.state(self.labels.get(iid, ()))
             changed = self.issue(self.run('PATCH', f'issues/{iid}', patch))
             if changed['state'] == 'closed' and body.get('state_event') == 'close':
-                self.card(iid, None)
+                self.sync(iid, None)
             elif 'labels' in patch and self.state(changed['labels']) and self.state(changed['labels']) != before:
-                self.card(iid, self.state(changed['labels']))
+                self.sync(iid, self.state(changed['labels']))
             return changed
         return self.issue(self.run('GET', f'issues/{iid}'))

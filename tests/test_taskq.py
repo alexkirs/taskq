@@ -1383,11 +1383,14 @@ class GithubRest:
         self.issues, self.comments, self.labels, self.refs, self.blobs, self.deleted = {}, {}, {}, {}, {}, set()
         self.calls, self.clock, self.push = [], 0, True
         self.projects, self.scope, self.mutations = [], True, []  # the owner's Projects v2; False: the token lacks `project`
+        self.broken = False  # True: every card mutation fails like GitHub's 'Something went wrong'
 
     def project(self, query, found):
         """Projects v2 GraphQL: lookup by title, create, Status options, items, card moves and archive."""
         if not self.scope:
             q.fail("GitHub POST graphql failed: GraphQL: Your token has not been granted the required scopes to execute this query. The 'projectsV2' field requires one of the following scopes: ['read:project']")
+        if self.broken and 'ProjectV2Item' in query:
+            q.fail('GitHub POST graphql failed: GraphQL: Something went wrong while executing your query.')
         if query.startswith('mutation'):
             self.mutations.append(query.split('{', 1)[1].split('(', 1)[0].strip())
         shape = lambda board: {'id': board['id'], 'number': int(board['id'][7:]), 'title': board['title'], 'url': board['url'],
@@ -1414,18 +1417,19 @@ class GithubRest:
             return {'updateProjectV2Field': {'projectV2Field': shape(board)['field']}}
         if 'addProjectV2ItemById(' in query:
             number = next(number for number, issue in self.issues.items() if issue['node_id'] == found['node'])
-            item = board['items'].setdefault(number, {'id': f'item{number}', 'option': None, 'archived': False})
+            item = board['items'].setdefault(number, {'id': f'item{number}', 'option': None, 'archived': False, 'updated': self.now()})
             return {'addProjectV2ItemById': {'item': {'id': item['id']}}}
         item = next((item for item in board['items'].values() if item['id'] == found.get('item')), None)
         if 'updateProjectV2ItemFieldValue(' in query:
-            item['option'] = found['option']
+            item['option'], item['updated'] = found['option'], self.now()
             return {}
         if 'archiveProjectV2Item(' in query:
             item['archived'] = True
             return {}
         names = {option['id']: option['name'] for option in board['options']}
-        nodes = [{'number': number, 'projectItems': {'nodes': [
-                     {'id': item['id'], 'project': {'id': board['id']}, 'fieldValueByName': {'name': names[item['option']]} if item['option'] in names else None}
+        nodes = [{'number': number, 'labels': {'nodes': issue['labels']},
+                  'timelineItems': {'nodes': [{'createdAt': event['created_at']} for event in issue['events'][-1:]]}, 'projectItems': {'nodes': [
+                     {'id': item['id'], 'updatedAt': item['updated'], 'project': {'id': board['id']}, 'fieldValueByName': {'name': names[item['option']]} if item['option'] in names else None}
                      for item in [board['items'].get(number)] if item and not item['archived']]}}
                  for number, issue in self.issues.items() if issue['state'] == 'open']
         return {'repository': {'issues': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}}
@@ -1437,6 +1441,7 @@ class GithubRest:
 
     def move(self, number, status):
         """The owner drags the card to the column `status`."""
+        self.projects[0]['items'][number]['updated'] = self.now()
         self.projects[0]['items'][number]['option'] = next(option['id'] for option in self.projects[0]['options'] if option['name'] == status)
 
     def now(self):
@@ -1795,6 +1800,25 @@ class GithubCycle(unittest.TestCase):
         self.github.move(started, 'ready')
         self.assertIn(f'`taskq release {started}', self.do(CLAUDE, 'tick'))
         self.assertEqual(self.github.column(started), 'doing')
+
+    def test_a_failed_card_sync_is_repaired_not_executed(self):
+        self.do(CLAUDE, 'init')
+        number, moved = self.add('--type', 'research'), self.add('--type', 'research')
+        self.do(CLAUDE, 'later', number, '--text', 'not now')
+        self.do(CLAUDE, 'later', moved, '--text', 'not now')
+        self.github.broken = True
+        self.assertIn(f'Board card of #{number} not updated', self.do(CLAUDE, 'answer', number, '--text', 'go'))
+        self.assertEqual((self.state(number), self.github.column(number)), ('ready', 'later'))
+        created = self.add('--type', 'research')  # exits 0 with the issue: the card is best effort
+        self.github.broken = False
+        self.github.move(moved, 'ready')  # the owner's own move, after the label event
+        out = self.do(CLAUDE, 'tick')
+        self.assertIn(f'Board card of #{number} put back to ready', out)
+        self.assertNotIn(f'Board move of {link(number, GH)}', out)
+        self.assertEqual((self.state(number), self.github.column(number)), ('ready', 'ready'))
+        self.assertIn(f'Board move of {link(moved, GH)} executed: later → ready', out)
+        self.assertIn(f'Board card of #{created} added in ready', out)
+        self.assertEqual(self.github.column(created), 'ready')
 
 
 class Selftest(unittest.TestCase):

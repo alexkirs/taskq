@@ -341,7 +341,9 @@ that changes the `q-*` label sets Status; `close` archives the item (`archivePro
 tasks only; the issue keeps its history). The project, the field and its option ids are looked up once per
 process. `tick` reads the cards in one query (100 open issues per page, each with its `projectItems`: the
 project's own `items` list stayed empty for minutes after adds, live 2026-10-06) and treats Status as the
-owner's intent (§ States).
+owner's intent (§ States) only when the card changed after the issue's last `labeled` event. The card step is
+best effort: a failed one prints a line and the command still succeeds (the label is the queue's state). The
+next read of the cards puts a stale card back to its label and adds a missing card, one printed line each.
 Without the token scope `project` (`gh auth refresh -h github.com -s project`) GraphQL refuses the lookup: there
 is no board, `init` names the command and makes the labels, every other command works as before.
 

@@ -28,6 +28,9 @@ BOARD = 'taskq'
 BOARDS = True  # GitLab's board is a view over the q-* labels; GitHub's Projects v2 board is a copy `Github` keeps in step
 AREAS = ()
 HOSTS = {}  # [hosts] of taskq.toml: hostname → short machine name (`mac`, `win`); the `host-<name>` label pins a task
+# [coordinator] machine of taskq.toml (#145): the one machine whose tick spawns shared work, reviews and closes; None:
+# every tick coordinates (a single-machine project). The owner moves it by editing that line: no failover.
+COORDINATOR = None
 CODEX_PROJECT = CODEX_SECTION = None  # the Codex app's project and sidebar section for worker threads
 # The person's own settings: `taskq.local.toml` in the main checkout (all its worktrees read the same file, never
 # committed). [profile] is the tick/worker profile, [codex] the app project override; read anew on every use.
@@ -54,7 +57,7 @@ UPDATE = {'auto': None, 'every': '24h', 'ref': 'main'}
 SIGNERS = Path(__file__).resolve().parent / 'allowed_signers'  # ssh keys allowed to sign the `stable` tag
 # A cache, not queue state: when this machine last asked REPO for its `main`.
 UPDATE_STAMP = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'taskq' / 'update-last'
-# This machine in claims and the coordinator lease: a random id made once. Not the hostname: macOS changes it with
+# This machine in claims: a random id made once. Not the hostname: macOS changes it with
 # the network, and the local limits would stop counting this machine's sessions.
 MACHINE_ID = UPDATE_STAMP.parent / 'machine-id'
 # waiting: open dependencies, moved only by `tick`; ask: a question for the owner (worker's or manager's);
@@ -93,7 +96,7 @@ def main_checkout(start):
 def configure(path=None):
     """Load the project's taskq.toml: `path`, else the nearest one from the current directory up. Read only: a key it
     lacks takes its default in memory (a write would dirty the editable clone, and update stops on a dirty clone)."""
-    global RULES, HOST, HOSTS, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, WORKSPACE, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED, PAGES
+    global RULES, HOST, HOSTS, COORDINATOR, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, WORKSPACE, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED, PAGES
     import tomllib
     here = Path.cwd()
     path = Path(path) if path else next((folder / 'taskq.toml' for folder in (here, *here.parents)
@@ -115,6 +118,9 @@ def configure(path=None):
         PROJECT = 'projects/' + quote(PROJECT_PATH, safe='')
     AREAS = tuple(config.get('areas', {}).get('names', ()))
     HOSTS = dict(config.get('hosts', {}))
+    COORDINATOR = config.get('coordinator', {}).get('machine')
+    if COORDINATOR is not None and not isinstance(COORDINATOR, str):
+        fail(f'{path}: [coordinator] machine: write the coordinator\'s machine name from [hosts] as a string, e.g. "mac"')
     CODEX_PROJECT, CODEX_SECTION = codex.get('project'), codex.get('section')
     WORKSPACE = {key: workspace.get(key, text) for key, text in TREE_WORKSPACE.items()}
     # A project's own `new` without `retire` makes its trees elsewhere: the default retire would miss them.
@@ -214,7 +220,7 @@ def me():
 
 
 def here():
-    """This machine in a claim or lease: its node, and its name when the owner chose one ([hosts], TASKQ_HOST), so
+    """This machine in a claim: its node, and its name when the owner chose one ([hosts], TASKQ_HOST), so
     other machines can say it too. The hostname itself never: the claim is in a public issue body (#39)."""
     named = os.environ.get('TASKQ_HOST') or HOSTS.get(socket.gethostname())
     return {'node': node(), **({'name': named} if named else {})}
@@ -240,7 +246,7 @@ def node(identity=None):
 
 
 def local_node(found):
-    """True when `found` (a claim's or lease's node) is this machine's, also from before #46 under this hostname."""
+    """True when `found` (a claim's node) is this machine's, also from before #46 under this hostname."""
     return found in (node(), node(socket.gethostname()))
 
 

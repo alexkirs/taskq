@@ -187,12 +187,17 @@ where each value came from. A flag (`--filter`, `--mine`/`--no-mine`, `--limit`)
 file for that one run.
 
 Two machines each run their own tick and limits. A task for one machine only: `taskq add … --host win`
-(label `host-win`). Name machines in taskq.toml or with `TASKQ_HOST=win`:
+(label `host-win`). Name machines in taskq.toml or with `TASKQ_HOST=win`, and name the one coordinator: its tick
+starts shared work, reviews and closes; another machine's tick starts only its `host-*` tasks and says
+`coordinator is mac`. Without `[coordinator]` every tick coordinates. To move it, edit the line:
 
 ```toml
 [hosts]
 "DESKTOP-7" = "win"
 "macbook-m2.local" = "mac"
+
+[coordinator]
+machine = "mac"
 ```
 
 **Windows.** Keep the checkout, taskq, git and gh/glab in WSL; the Windows Claude Code (`claude.cmd`) runs the

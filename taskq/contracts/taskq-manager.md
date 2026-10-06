@@ -336,11 +336,10 @@ next tick of each checkout prints `The coordinator contract changed since your l
 
 The prompt has no profile flags: each tick rereads `taskq.local.toml`, so a profile change needs no
 new timer. Check the last-tick age first; do not arm a second coordinator on this machine.
-Across machines one tick per profile coordinates (#44): it holds a lease (GitHub: the ref
-`refs/taskq/coordinator/<profile hash>`; GitLab: a closed issue labeled `taskq-coordinator`), renewed
-by each of its ticks and free after 15 min without one. Every tick prints `coordinator: <machine> since
-<time>`; a tick on another machine releases only its own stalled work, starts only tasks pinned to its
-machine (`host-<name>`) and ends with `Another machine coordinates this profile`: say so and stop.
+Across machines only the machine named by `[coordinator] machine` of taskq.toml coordinates (#145; none set:
+every tick does, for a single-machine project). A tick on another machine releases only its own stalled work,
+starts only tasks pinned to its machine (`host-<name>`) and prints `coordinator is <name>`: say so and stop; it
+never reviews or closes. No failover: to move the coordinator, the owner edits that one line.
 **Existing timers** armed before #48 carry `--filter`/`--mine`/`--limit` in their prompt, and those
 flags keep winning over the file (the tick's `Source: flag: …` line shows them). With coordinator
 authority: write the confirmed values with `taskq profile init` (mode A: the person runs it), check

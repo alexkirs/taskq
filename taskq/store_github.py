@@ -241,22 +241,12 @@ class Github:
             return self.cards()
         if path.startswith('board/items/'):
             return self.card(int(path.rsplit('/', 1)[1]), body['status'])
-        if path.startswith('coordinator/'):  # #44: a profile's coordinator lease, the ref refs/taskq/coordinator/<key> on a blob
-            ref = 'taskq/' + path
-            if method == 'GET':
-                try:
-                    sha = self.run('GET', f'git/ref/{ref}')['object']['sha']
-                except SystemExit as error:
-                    if core.gone(error):
-                        return None
-                    raise
-                return json.loads(base64.b64decode(self.run('GET', f'git/blobs/{sha}')['content']))
+        if path == 'leases':  # #145: the refs refs/taskq/coordinator/<key> the #44 lease left; doctor --fix deletes them
+            refs = [item['ref'] for item in self.run('GET', 'git/matching-refs/taskq/coordinator/')]
             if method == 'DELETE':
-                return self.run('DELETE', f'git/refs/{ref}')
-            sha = self.run('POST', 'git/blobs', {'content': json.dumps(body)})['sha']
-            if method == 'POST':  # 422 when the ref exists: the take is atomic
-                return self.run('POST', 'git/refs', {'ref': f'refs/{ref}', 'sha': sha})
-            return self.run('PATCH', f'git/refs/{ref}', {'sha': sha, 'force': True})
+                for ref in refs:
+                    self.run('DELETE', 'git/' + ref)
+            return refs
         if path.startswith('boards'):
             core.fail('GitHub has no GitLab board: the Projects v2 board is `board`')
         if method == 'POST' and path == 'issues':

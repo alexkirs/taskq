@@ -146,40 +146,34 @@ def tick_links(case, issues, commits):
     case.assertIn(f'{issues}{iid} t', case.do(COORDINATOR, 'list', '--links'))
 
 
-def coordinator_lease(case):
-    """#44: one coordinator per profile across machines. Mac ticks first and holds the lease; win only releases its
-    own stalled work and starts what is pinned to it; a lease not renewed for LEASE_MINUTES goes to the next tick."""
+def fixed_coordinator(case):
+    """#145: [coordinator] machine names the one machine that coordinates. Win, not it, releases only its own stalled
+    work, starts only what is pinned to it and never reviews; mac coordinates as a tick without the setting does."""
     win = {'CLAUDE_CODE_SESSION_ID': 'win-session', 'CODEX_THREAD_ID': ''}
     with contextlib.ExitStack() as stack:
         stack.enter_context(patch.object(q, 'HOSTS', {'mac-1.local': 'mac', 'win-2.lan': 'win'}))
+        stack.enter_context(patch.object(q, 'COORDINATOR', 'mac'))
         stack.enter_context(patch.dict(os.environ, {'TASKQ_HOST': ''}))
         hostname = stack.enter_context(patch.object(q.socket, 'gethostname', return_value='mac-1.local'))
-        mac_task, win_task, free = (case.add('--type', 'code', '--runtime', 'claude', '--scope', name) for name in 'abd')
+        mac_task, win_task, free, done = (case.add('--type', 'code', '--runtime', 'claude', '--scope', name) for name in 'abde')
         pinned = case.add('--type', 'code', '--runtime', 'claude', '--scope', 'c', '--host', 'win')
         case.do(CLAUDE, 'take', mac_task)
+        case.do(CLAUDE, 'take', done)
+        case.do(CLAUDE, 'result', done, '--sha', 'abc1234', '--text', 'x', '--checks', 'x')
         hostname.return_value = 'win-2.lan'
         case.do(win, 'take', win_task)
-        hostname.return_value = 'mac-1.local'
-        first = case.do(COORDINATOR, 'tick')
-        case.assertRegex(first, r'coordinator: mac \(this machine\) since \d{4}-\d\d-\d\d \d\d:\d\d')
-        case.assertIn(f"--name 'T{free} t'", first)
-        lease = tick.lease(tick.lease_key({'filter': '', 'mine': False, 'uid': 1}))
-        case.assertEqual(lease['node'], node('mac-1.local'))
-        hostname.return_value = 'win-2.lan'
         with patch.object(q, 'STALE_MINUTES', -1):
             second = case.do(win, 'tick')
-        case.assertIn('coordinator: mac since', second)
+        case.assertIn('coordinator is mac', second)
         case.assertEqual((case.state(win_task), case.state(mac_task)), ('ready', 'doing'))  # its own stalled work only
         case.assertIn(f"--name 'T{pinned} t'", second)  # pinned to win: only win can start it
         case.assertNotIn(f"--name 'T{free} t'", second)
-        with patch.object(tick, 'LEASE_MINUTES', 0):  # mac stopped ticking: the lease expired
-            third = case.do(win, 'tick')
-        case.assertIn('coordinator: win (this machine) since', third)
+        case.assertNotIn('## Review', second)
         hostname.return_value = 'mac-1.local'
-        case.assertIn('coordinator: win since', case.do(COORDINATOR, 'tick'))
-        hostname.return_value = 'win-2.lan'
-        case.do(win, 'tick')
-        case.assertEqual(tick.lease(tick.lease_key({'filter': '', 'mine': False, 'uid': 1}))['node'], node('win-2.lan'))
+        first = case.do(COORDINATOR, 'tick')
+        case.assertNotIn('coordinator is mac', first)
+        case.assertIn(f"--name 'T{win_task} t'", first)  # shared work, released by win
+        case.assertIn(f'## Review [#{done}]', first)
 
 
 class Gitlab:
@@ -306,8 +300,7 @@ class Gitlab:
         return issue
 
     def tasks(self):
-        """Every issue but the closed ones holding a coordinator lease."""
-        return sorted(iid for iid, issue in self.issues.items() if tick.LEASE_LABEL not in issue['labels'])
+        return sorted(self.issues)
 
     def said(self, iid):
         return [note['body'] for note in self.notes.values() if note['iid'] == iid]
@@ -591,10 +584,8 @@ class Cycle(unittest.TestCase):
                 store.run('GET', 'issues/7')
             self.assertEqual(answers, [good])
 
-    def test_one_coordinator_per_profile_across_machines(self):
-        coordinator_lease(self)
-        self.assertEqual(len(self.gitlab.issues) - len(self.gitlab.tasks()), 1)  # the closed issue holding the lease
-        self.assertLessEqual(set(self.gitlab.locked()), set(self.gitlab.tasks()))  # its lock is held only while writing
+    def test_fixed_coordinator_machine(self):
+        fixed_coordinator(self)
 
     def test_award_on_a_deleted_issue_does_not_break_tick(self):
         iid = self.add('--type', 'research')
@@ -1932,9 +1923,14 @@ class GithubCycle(unittest.TestCase):
                 q.main(['take', str(number)])
         self.assertIn('cannot start', str(refused.exception))
 
-    def test_one_coordinator_per_profile_across_machines(self):
-        coordinator_lease(self)
-        self.assertEqual([ref for ref in self.github.refs if 'coordinator' in ref], ['refs/taskq/coordinator/' + tick.lease_key({'filter': '', 'mine': False, 'uid': 1})])
+    def test_fixed_coordinator_machine(self):
+        fixed_coordinator(self)
+
+    def test_doctor_names_and_fix_removes_a_leftover_lease_ref(self):
+        self.github.refs['refs/taskq/coordinator/abc'] = 'sha'  # left by the #44 lease
+        self.assertIn('leftover coordinator lease refs/taskq/coordinator/abc', doctor.lease_gaps()[0][0])
+        q.api('DELETE', 'leases')
+        self.assertEqual((self.github.refs, doctor.lease_gaps()), ({}, []))
 
     def test_lock_ref_of_a_deleted_or_closed_issue_does_not_break_tick(self):
         deleted, closed = self.add('--type', 'code'), self.add('--type', 'code')
@@ -2838,6 +2834,12 @@ class Update(unittest.TestCase):
         self.assertFalse(load('someone/else')['auto'])
         self.assertTrue(load('someone/else', '[update]\nauto = true\nref = "stable"\n')['auto'])
         self.assertRaises(SystemExit, load, 'a/b', '[update]\nref = "dev"\n')
+        with patch.object(q, 'COORDINATOR', None):  # #145
+            load('a/b', '[coordinator]\nmachine = "mac"\n')
+            self.assertEqual(q.COORDINATOR, 'mac')
+            load('a/b')
+            self.assertIsNone(q.COORDINATOR)
+            self.assertRaises(SystemExit, load, 'a/b', '[coordinator]\nmachine = 1\n')
 
     def test_red_ci_or_a_start_failure_leaves_the_clone_where_it_was(self):
         old = q.version()

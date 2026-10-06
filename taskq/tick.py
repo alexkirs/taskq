@@ -69,80 +69,6 @@ def tick_beat():
               'end a long turn or background loops in the coordinator session, re-arm (manager contract § 2).')
 
 
-LEASE_MINUTES = 15  # a coordinator that missed this long of ticks hands the profile to the next machine that ticks
-LEASE_LABEL = 'taskq-coordinator'  # GitLab: the closed issue holding a profile's lease
-
-
-def lease_key(profile):
-    """#44: one coordinator per profile across machines. The profile is the queue part (filter, mine and whose),
-    not the machine's limits: machines with other limits still share the same tasks."""
-    return hashlib.sha256(json.dumps([profile['filter'], profile['mine'] and profile['uid']]).encode()).hexdigest()[:12]
-
-
-def lease_issue(key, create=False):
-    """GitLab has no free refs: a profile's lease is the description of a closed issue, its award emoji the lock."""
-    title = f'taskq coordinator {key}'
-    found = min((issue['iid'] for issue in core.issues(f'state=all&labels={LEASE_LABEL}') if issue['title'] == title), default=None)
-    if found or not create:
-        return found
-    found = core.api('POST', 'issues', {'title': title, 'description': 'null', 'labels': LEASE_LABEL})['iid']
-    core.api('PUT', f'issues/{found}', {'description': 'null', 'state_event': 'close'})
-    return found
-
-
-def lease(key):
-    """The coordinator lease of `key`: {node, since, at} (epoch seconds), or None."""
-    if not core.BOARDS:  # GitHub: the store's ref refs/taskq/coordinator/<key>
-        return core.api('GET', f'coordinator/{key}')
-    iid = lease_issue(key)
-    return iid and json.loads(core.api('GET', f'issues/{iid}')['description'] or 'null')
-
-
-def write_lease(key, held, mine):
-    """Renew our lease, or take one that is missing or expired. A take is atomic like the task lock: GitHub's
-    POST of the ref is 422 when another machine was faster; on GitLab the issue's lock guards a compare and write.
-    ponytail: on GitHub two machines taking the same expired lease at once may both delete and post; the one
-    whose ref stays is the holder from the next tick on."""
-    renew = held and held['node'] == mine['node'] and mine['since'] == held['since']
-    if not core.BOARDS:
-        if renew:
-            return core.api('PUT', f'coordinator/{key}', mine)
-        if held:
-            core.api('DELETE', f'coordinator/{key}')
-        try:
-            core.api('POST', f'coordinator/{key}', mine)
-        except SystemExit as error:
-            if not any(text in str(error) for text in core.TAKEN):
-                raise
-        return
-    iid = lease_issue(key, create=True)
-    if renew:
-        return core.api('PUT', f'issues/{iid}', {'description': json.dumps(mine)})
-    if core.lock(iid):
-        try:
-            if lease(key) == held:
-                core.api('PUT', f'issues/{iid}', {'description': json.dumps(mine)})
-        finally:
-            core.unlock(iid)
-    elif all(time.time() - core.stamp(item['created_at']) > core.LOCK_SECONDS for item in core.locks(iid)):
-        core.unlock(iid)  # a tick that died holding it: the next tick takes the lease
-
-
-def coordinator(profile):
-    """The lease after this tick: a machine holds it while it ticks at least every LEASE_MINUTES; a missing or
-    expired one goes to this machine. Prints who holds it."""
-    key, now = lease_key(profile), int(time.time())
-    held = lease(key)
-    fresh = bool(held) and now - held['at'] < LEASE_MINUTES * 60
-    if not fresh or core.local_node(held['node']):
-        write_lease(key, held, {**core.here(), 'since': held['since'] if fresh else now, 'at': now})
-        held = lease(key)
-    if held:
-        mine = ' (this machine)' if core.local_node(held['node']) else ''
-        print(f'coordinator: {core.where(held)[2:]}{mine} since {time.strftime("%Y-%m-%d %H:%M", time.localtime(held["since"]))}')
-    return held
-
-
 TICK_PROMPT_VERSION = 2  # raise with every change of TICK_PROMPT: an older --prompt-version gets the re-arm line
 # The coordinator timer's prompt, word for word as in manager contract § 2 (a test keeps them equal).
 TICK_PROMPT = f"""taskq tick prompt v{TICK_PROMPT_VERSION}. Run `cd <main checkout> && taskq update; taskq tick --prompt-version {TICK_PROMPT_VERSION}`
@@ -426,8 +352,9 @@ def tick_pass(args, act=False):
     contract_news(args.prompt_version)
     loaded, candidates = core.profile(args)
     selected = {item['iid'] for item in candidates}
-    # Only the lease holder starts workers, accepts reviews and shows questions; another machine releases its own work.
-    holder = core.local_node((coordinator(args.profile) or {}).get('node'))
+    # #145: only the coordinator machine ([coordinator] machine of taskq.toml; none set: every machine) starts shared
+    # workers, accepts reviews and shows questions; another machine releases its own work and starts its host-* tasks.
+    holder = core.COORDINATOR in (None, core.machine())
     # #43: a session seen here decides at once: dead is released now, alive (busy or idle) never by age.
     doing = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and (item['claim'] or {}).get('session')]
     agents = core.claude_agents() if any(item['claim'].get('runtime') == 'claude' for item in loaded[0]
@@ -449,8 +376,8 @@ def tick_pass(args, act=False):
         # A task pinned to this machine (`host-<name>`) starts only here: the coordinator elsewhere cannot start it.
         start = starts(args, core.load() if stalled else loaded, {item['iid'] for item in candidates if item.get('host') == core.machine()})
         if not start:
-            return print('Another machine coordinates this profile: this tick released only its own stalled work. Say so and stop.')
-        print('Another machine coordinates this profile: start only the workers pinned to this machine.\n')
+            return print(f'coordinator is {core.COORDINATOR}: this tick released only its own stalled work. Say so and stop.')
+        print(f'coordinator is {core.COORDINATOR}: start only the workers pinned to this machine.\n')
         launch(args, start, act, step)
         return failed
     loaded = core.load() if stalled else loaded

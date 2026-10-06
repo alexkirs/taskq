@@ -183,7 +183,7 @@ def doctor(args, pending=()):
     if gaps or not config:
         return report_gaps(gaps, pending)
     checks = (('write permission', lambda: write_access(github)), ('labels', queue_labels_missing),
-              ('board', lambda: board_gaps(github, host)))
+              ('board', lambda: board_gaps(github, host)), ('lease', lease_gaps))
     for name, check in checks:
         try:
             for what, fix in check():
@@ -301,6 +301,13 @@ def board_gaps(github, host):
         return [(f'no Projects v2 board {core.BOARD}', 'taskq init')]
     return ([(f'board {core.BOARD} Status options are {list(board["options"])}, not {list(core.STATES)}', 'taskq init')]
             * (list(board['options']) != list(core.STATES)))
+
+
+def lease_gaps():
+    """#145: the coordinator is [coordinator] machine of taskq.toml; a ref of the old lease (#44) is only clutter."""
+    refs = [] if core.BOARDS else core.api('GET', 'leases')
+    return [(f'leftover coordinator lease {ref} (the coordinator is [coordinator] machine of taskq.toml now)',
+             f'{core.TOOL} doctor --fix  (deletes it)') for ref in refs]
 
 
 def report_gaps(gaps, pending=()):
@@ -454,6 +461,9 @@ def setup(args):
         print('done: labels' + ' and board' * (not scope))
     else:
         print('ok: labels' + ' and board' * (not scope))
+    if lease_gaps():
+        core.api('DELETE', 'leases')
+        print('done: removed the leftover coordinator lease')
     for fix in scope:
         person(fix, 'a GitHub board needs the token scope `project` (browser consent); until then the queue works with labels only')
     for what, fix in permissions_gap(core.ROOT):

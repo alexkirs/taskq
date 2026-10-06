@@ -2,11 +2,7 @@
 import base64
 from datetime import datetime, timezone
 import json
-import os
 import re
-import subprocess
-import sys
-import time
 from urllib.parse import parse_qs, quote
 
 import taskq as core
@@ -50,14 +46,7 @@ class Github:
         command = ['gh', 'api', '-X', method, path if own else f'repos/{self.repo}/{path}'] + (['--hostname', self.host] if self.host else [])
         if body is not None:
             command += ['--input', '-']
-        started = time.time()
-        done = subprocess.run(command, input=json.dumps(body) if body is not None else None,
-                              capture_output=True, text=True, timeout=60)
-        if os.environ.get('TASKQ_TRACE'):
-            print(f'taskq trace: {method} {path[:90]} {time.time() - started:.2f} s', file=sys.stderr)
-        if done.returncode:
-            core.fail(f'GitHub {method} {path} failed: {done.stderr.strip() or done.stdout.strip()}')
-        return json.loads(done.stdout) if done.stdout.strip() else None
+        return core.cli_api(command, body, f'GitHub {method} {path}')
 
     def all(self, path):
         found, page = [], 1

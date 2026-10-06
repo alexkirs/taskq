@@ -494,6 +494,37 @@ class Cycle(unittest.TestCase):
         self.do(COORDINATOR, 'close', iid, '--text', 'ok')
         self.assertEqual(self.gitlab.locked(), [])
 
+    def test_take_that_fails_after_its_lock_releases_it(self):
+        """#105: a save that raises after lock() leaves no lock behind; the error still shows."""
+        iid = self.add('--type', 'research', '--runtime', 'any')
+        with patch.object(q, 'save', lambda *args, **kwargs: q.fail('GitHub PATCH issues/1 failed: boom')):
+            self.assertIn('boom', self.refused(CLAUDE, 'take', iid))
+        self.assertEqual(self.gitlab.locked(), [])
+        self.do(CLAUDE, 'take', iid)
+        self.assertEqual(self.state(iid), 'doing')
+
+    def test_transient_store_failure_is_retried_once(self):
+        """#105: an empty JSON body or a 5xx is tried once more; a real refusal or a second hiccup fails."""
+        answers = []
+
+        def run(argv, **kwargs):
+            return answers.pop(0)
+        bad = SimpleNamespace(returncode=1, stdout='', stderr='unexpected end of JSON input')
+        good = SimpleNamespace(returncode=0, stdout='{"number": 7}', stderr='')
+        store = q.Github('owner/repo')
+        with patch.object(q.subprocess, 'run', run), patch.object(q.time, 'sleep', lambda seconds: None):
+            answers[:] = [bad, good]
+            self.assertEqual(store.run('PATCH', 'issues/7', {}), {'number': 7})
+            answers[:] = [SimpleNamespace(returncode=0, stdout='{"num', stderr=''), good]
+            self.assertEqual(q.gitlab('GET', 'issues/7'), {'number': 7})
+            answers[:] = [bad, bad]
+            with self.assertRaises(SystemExit):
+                store.run('PATCH', 'issues/7', {})
+            answers[:] = [SimpleNamespace(returncode=1, stdout='', stderr='gh: Not Found (HTTP 404)'), good]
+            with self.assertRaises(SystemExit):
+                store.run('GET', 'issues/7')
+            self.assertEqual(answers, [good])
+
     def test_award_on_a_deleted_issue_does_not_break_tick(self):
         iid = self.add('--type', 'research')
         self.assertTrue(q.lock(iid))

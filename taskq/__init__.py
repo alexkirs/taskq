@@ -253,18 +253,36 @@ def api(method, path, body=None):
     return STORE(method, path, body)
 
 
+# A store hiccup, not an answer: an empty or broken JSON body, a 5xx, GraphQL's generic failure (#105).
+TRANSIENT = re.compile(r'unexpected end of JSON input|invalid JSON|Something went wrong|HTTP 5\d\d'
+                       r'|\b5\d\d (Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout)')
+
+
+def cli_api(command, body, what):
+    """Run `gh api`/`glab api` and parse its JSON; a transient failure is tried once more.
+    ponytail: one retry after 1 s; a POST the store did apply before failing may land twice."""
+    for attempt in (1, 2):
+        started = time.time()
+        done = subprocess.run(command, input=json.dumps(body) if body is not None else None,
+                              capture_output=True, text=True, timeout=60)
+        if os.environ.get('TASKQ_TRACE'):
+            print(f'taskq trace: {what[:100]} {time.time() - started:.2f} s', file=sys.stderr)
+        message = done.stderr.strip() or done.stdout.strip()
+        if not done.returncode:
+            try:
+                return json.loads(done.stdout) if done.stdout.strip() else None
+            except ValueError as error:
+                message = f'invalid JSON: {error}'
+        if attempt == 2 or not TRANSIENT.search(message):
+            fail(f'{what} failed: {message}')
+        time.sleep(1)
+
+
 def gitlab(method, path, body=None):
     command = ['glab', 'api', '-X', method, path[1:] if path.startswith('/') else f'{PROJECT}/{path}'] + (['--hostname', HOST] if HOST else [])
     if body is not None:
         command += ['--input', '-', '-H', 'Content-Type: application/json']
-    started = time.time()
-    done = subprocess.run(command, input=json.dumps(body) if body is not None else None,
-                          capture_output=True, text=True, timeout=60)
-    if os.environ.get('TASKQ_TRACE'):
-        print(f'taskq trace: {method} {path[:90]} {time.time() - started:.2f} s', file=sys.stderr)
-    if done.returncode:
-        fail(f'GitLab {method} {path} failed: {done.stderr.strip() or done.stdout.strip()}')
-    return json.loads(done.stdout) if done.stdout.strip() else None
+    return cli_api(command, body, f'GitLab {method} {path}')
 
 
 TAKEN = ('has already been taken', 'Reference already exists')  # the lock's conflict answer: GitLab 404, GitHub 422
@@ -709,7 +727,13 @@ def take(args):
         fail(f'#{args.iid} cannot start: {reason}')
     if not lock(args.iid):
         fail(f'#{args.iid} cannot start: another worker holds its lock')
-    save(current, 'doing', claim=mine, result=None, waiting_for=None, assignee_ids=[user()])
+    try:
+        save(current, 'doing', claim=mine, result=None, waiting_for=None, assignee_ids=[user()])
+    except BaseException:
+        # A lock left behind refuses every later take of this task until tick clears it (#105).
+        with contextlib.suppress(Exception, SystemExit):
+            unlock(args.iid)
+        raise
     held = {**current, 'state': 'doing'}
     # A task without paths overlaps nothing: no second read.
     rivals = current['scope'] and [other for other in load()[0] if other['iid'] != args.iid and (other['claim'] or {}).get('session')

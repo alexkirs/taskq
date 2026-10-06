@@ -19,6 +19,6 @@ none = "this task is expected to end in an answer, not a commit: work from the m
 retire = "make worktree-retire NAME=taskq-{iid}"
 cleanup_helpers = "scripts"
 
-[update]
+[update]  # off: the tests never reach GitHub
 auto = false
 every = "24h"

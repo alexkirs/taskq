@@ -65,7 +65,7 @@ normal dependency/runtime/scope checks. Limits never arbitrate between machines.
 counts only on the machine that holds it. Tasks without a `host-*` label run on the machine whose worker
 takes them first. To send a task to Windows on purpose: `add --host win` (or the label `host-win`);
 the Mac's tick never starts it. Name the machines once in taskq.toml, `[hosts]` with
-`"<hostname>" = "<name>"`, or set `TASKQ_HOST` on that machine. Worker names end with ` @<name>`,
+`"<hostname>" = "<name>"`, or set `TASKQ_HOST` on that machine. Worker names end with ` (<name>)` (no `@`: SendMessage rejects it),
 `list` and the tick's "Claude worker sessions" show the machine of every doing worker.
 
 ## 1. First use and check the place
@@ -298,7 +298,7 @@ separate limits (Claude and Codex each have their own slots; an `any` task is gi
 free slot). The other runtime will not take the task. One at a time:
 1. Claude: `taskq spawn --name "T<N> <words>"` — a `claude --bg` session in the main checkout,
    idle, no app window change (§ "Window focus on spawn"); prints its session id. spawn adds
-   ` @<machine>` to the name; SendMessage uses the name as `ListAgents` shows it. Codex:
+   ` (<machine>)` to the name; SendMessage uses the name as `ListAgents` shows it. Codex:
    `spawn --runtime codex --name "T<N> <words>"` — prints the Codex session id (§ "Other machines").
 2. Send it the worker prompt: Claude — `SendMessage` with `to` = the name from step 1 (as
    `ListAgents` shows it) and `notify_when_idle: true`, so the end of its turn comes back to you;

@@ -973,8 +973,8 @@ class Cycle(unittest.TestCase):
         self.assertEqual(printed.splitlines()[0], 'abcd1234-0000')
         self.assertIn('claude attach abcd1234', printed)
         # csgo #303: the name says the machine; Remote Control is off unless asked for.
-        self.assertEqual(runs, [['claude', '--bg', '--name', 'T1 x @mac-1', '--settings', '{"remoteControlAtStartup": false}'],
-                                ['claude', '--bg', '--name', 'T1 x @mac-1']])
+        self.assertEqual(runs, [['claude', '--bg', '--name', 'T1 x (mac-1)', '--settings', '{"remoteControlAtStartup": false}'],
+                                ['claude', '--bg', '--name', 'T1 x (mac-1)']])
         self.agents = {}
         with self.run_recorded({'claude --bg': 'backgrounded · ffff0000 · T1 x'})[1]:
             self.assertIn('does not list the new session ffff0000', self.refused(CLAUDE, 'spawn'))
@@ -1540,7 +1540,7 @@ class Selftest(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 q.spawn(argparse.Namespace(runtime='grok', name='T1 x'))
                 q.send(argparse.Namespace(runtime='grok', session='g1', text='go'))
-            self.assertEqual(out.getvalue().split('\n')[:2], ['id-T1 x @mac-1', 'sent g1 go'])
+            self.assertEqual(out.getvalue().split('\n')[:2], ['id-T1 x (mac-1)', 'sent g1 go'])
 
 
 class Doctor(unittest.TestCase):

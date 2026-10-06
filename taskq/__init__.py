@@ -1854,8 +1854,9 @@ def codex_archive(args):
 def spawn(args):
     """Create a worker session in the main checkout and print its id; the coordinator then sends it the
     worker prompt. Claude: a CLI background session (`claude_spawn`). Codex: `codex_spawn`.
-    The name ends with ` @<machine>`: the owner sees where each worker runs."""
-    name = args.name if args.name.endswith(f' @{machine()}') else f'{args.name} @{machine()}'
+    The name ends with ` (<machine>)`: the owner sees where each worker runs. No `@`: SendMessage
+    rejects a name containing it as a name@team address."""
+    name = args.name if args.name.endswith(f' ({machine()})') else f'{args.name} ({machine()})'
     if args.runtime == 'codex':
         return print(codex_spawn(name))
     if args.runtime in EXECUTORS:
@@ -2940,7 +2941,7 @@ def main(argv=None):
             (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}))
     command('tick', tick, *profile_flags)
     command('spawn', spawn, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),
-            (('--name',), {'default': 'taskq worker', 'help': 'session name: "T<N> <words>"; " @<this machine>" is added'}),
+            (('--name',), {'default': 'taskq worker', 'help': 'session name: "T<N> <words>"; " (<this machine>)" is added'}),
             (('--remote-control',), {'action': 'store_true', 'help': 'Claude: keep Remote Control on (off by default)'}))
     claude_session = (('session',), {'help': 'Claude session id (or local_<id>)'})
     command('show', show, claude_session,

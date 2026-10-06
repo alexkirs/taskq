@@ -32,6 +32,23 @@ def configure(path=None, real=q.configure, local=Path(tempfile.mkdtemp()) / 'tas
 
 q.configure = configure
 q.configure(Path(__file__).resolve().parent / 'taskq.toml')
+
+
+REAL_MACHINE_ID = q.machine_id
+
+
+def machine_id(folder=Path(tempfile.mkdtemp())):
+    """Each patched hostname is a machine with its own id file; never the person's own machine id."""
+    with patch.object(q, 'MACHINE_ID', folder / q.socket.gethostname() / 'machine-id'):
+        return REAL_MACHINE_ID()
+
+
+def node(hostname):
+    with patch.object(q.socket, 'gethostname', return_value=hostname):
+        return q.node()
+
+
+q.machine_id = machine_id
 # `cleanup` stands on a project's worktree tools; its tests run where a folder of them is named.
 HELPERS = os.environ.get('TASKQ_CLEANUP_HELPERS')
 if HELPERS:
@@ -147,7 +164,7 @@ def coordinator_lease(case):
         case.assertRegex(first, r'coordinator: mac \(this machine\) since \d{4}-\d\d-\d\d \d\d:\d\d')
         case.assertIn(f"--name 'T{free} t'", first)
         lease = tick.lease(tick.lease_key({'filter': '', 'mine': False, 'uid': 1}))
-        case.assertEqual(lease['node'], q.node('mac-1.local'))
+        case.assertEqual(lease['node'], node('mac-1.local'))
         hostname.return_value = 'win-2.lan'
         with patch.object(q, 'STALE_MINUTES', -1):
             second = case.do(win, 'tick')
@@ -162,7 +179,7 @@ def coordinator_lease(case):
         case.assertIn('coordinator: win since', case.do(COORDINATOR, 'tick'))
         hostname.return_value = 'win-2.lan'
         case.do(win, 'tick')
-        case.assertEqual(tick.lease(tick.lease_key({'filter': '', 'mine': False, 'uid': 1}))['node'], q.node('win-2.lan'))
+        case.assertEqual(tick.lease(tick.lease_key({'filter': '', 'mine': False, 'uid': 1}))['node'], node('win-2.lan'))
 
 
 class Gitlab:
@@ -798,6 +815,39 @@ class Cycle(unittest.TestCase):
         self.assertIn('is yours', self.do(CLAUDE, 'take', second))
         self.assertEqual(self.refused(CLAUDE, 'worker', '--limit', 'claude=-1'), '2')
 
+    def test_limits_count_local_sessions_after_a_hostname_change(self):
+        """#46: macOS renames the machine with the network; its claims stay local by the machine id."""
+        with patch.object(q, 'machine_id', return_value='stable-id'):
+            self.do(CLAUDE, 'take', self.add('--type', 'code'))
+            self.add('--type', 'code')
+            with patch.object(q.socket, 'gethostname', return_value='mac-1-2.local'):
+                self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
+                self.assertIn('@mac-1-2, last change', self.do(CLAUDE, 'list'))
+
+    def test_machine_id_is_made_once(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(q, 'MACHINE_ID', Path(folder) / 'taskq' / 'machine-id'):
+            first = REAL_MACHINE_ID()
+            self.assertRegex(first, '^[0-9a-f]{32}$')
+            self.assertEqual(REAL_MACHINE_ID(), first)
+            self.assertEqual(os.listdir(Path(folder) / 'taskq'), ['machine-id'])
+
+    def test_brief_names_agents_md_only_when_the_checkout_has_it(self):
+        iid = self.add('--type', 'code')
+        with patch.object(q, 'ROOT', self.directory):
+            self.assertNotIn('AGENTS.md', self.do(CLAUDE, 'worker'))
+            (self.directory / 'AGENTS.md').write_text('rules')
+            self.assertIn('3. Do the task below. Follow AGENTS.md. Expected paths', self.do(CLAUDE, 'worker'))
+        self.assertIn(f'take {iid}', self.do(CLAUDE, 'worker'))
+
+    def test_list_names_the_scope_a_released_task_holds(self):
+        held = self.add('--type', 'code', '--scope', 'a/x.py')
+        self.do(CLAUDE, 'take', held)
+        self.do(COORDINATOR, 'release', held, '--text', 'dead worker')
+        waiting = self.add('--type', 'code', '--scope', 'a')
+        listed = self.do(CLAUDE, 'list')
+        self.assertIn(f'[continue; holds scope for #{waiting}]', listed)
+        self.assertIn(f'[scope overlaps #{held}]', listed)
+
     def test_host_label_pins_a_machine_and_each_machine_fills_its_own_limit(self):
         """csgo #303: `host-win` waits for a worker on win; a task without a host goes to whichever machine takes it."""
         win = self.add('--type', 'code', '--host', 'win')
@@ -817,7 +867,7 @@ class Cycle(unittest.TestCase):
             self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
         # #39: the public claim names the machine by a hash only; this machine and [hosts] still read it by name.
         claim = q.parse(self.gitlab.issues[win])['claim']
-        self.assertEqual((claim['node'], 'host' in claim), (q.node('DESKTOP-7.lan'), False))
+        self.assertEqual((claim['node'], 'host' in claim), (node('DESKTOP-7.lan'), False))
         self.assertNotIn('DESKTOP', self.gitlab.issues[win]['description'])
         with patch.object(q, 'HOSTS', {'DESKTOP-7.lan': 'win'}):
             self.assertIn(f'#{win:<4} doing', self.do(CLAUDE, 'list'))

@@ -134,11 +134,11 @@ def coordinator(profile):
     key, now = lease_key(profile), int(time.time())
     held = lease(key)
     fresh = bool(held) and now - held['at'] < LEASE_MINUTES * 60
-    if not fresh or held['node'] == core.node():
-        write_lease(key, held, {'node': core.node(), 'since': held['since'] if fresh else now, 'at': now})
+    if not fresh or core.local_node(held['node']):
+        write_lease(key, held, {**core.here(), 'since': held['since'] if fresh else now, 'at': now})
         held = lease(key)
     if held:
-        mine = ' (this machine)' if held['node'] == core.node() else ''
+        mine = ' (this machine)' if core.local_node(held['node']) else ''
         print(f'coordinator: {core.where(held)[2:]}{mine} since {time.strftime("%Y-%m-%d %H:%M", time.localtime(held["since"]))}')
     return held
 
@@ -425,7 +425,7 @@ def tick_pass(args, act=False):
     loaded, candidates = core.profile(args)
     selected = {item['iid'] for item in candidates}
     # Only the lease holder starts workers, accepts reviews and shows questions; another machine releases its own work.
-    holder = (coordinator(args.profile) or {}).get('node') == core.node()
+    holder = core.local_node((coordinator(args.profile) or {}).get('node'))
     # #43: a session seen here decides at once: dead is released now, alive (busy or idle) never by age.
     doing = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and (item['claim'] or {}).get('session')]
     agents = core.claude_agents() if any(item['claim'].get('runtime') == 'claude' for item in loaded[0]

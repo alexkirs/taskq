@@ -79,7 +79,7 @@ the “Before” column is the state before #48.
 | Preferred runtime for own `any` tasks | Person | No preference setting; runtime label and scheduler | Personal `[profile] preferred_runtime` |
 | Reply language | Person | Session/agent instructions | Existing instructions; no new language key in this change |
 | Claude/Codex capacity | Person on this machine | `--limit` in prompts; defaults Claude 2, Codex 3 | Personal `[profile.limits]`; CLI override for one invocation |
-| Running sessions and occupied slots | Session on this machine | Tracker claims with hostname and local legacy session evidence | Existing claims and detection; never config |
+| Running sessions and occupied slots | Session on this machine | Tracker claims with a hash of the machine id (`~/.local/state/taskq/machine-id`, made once) and local legacy evidence | Existing claims and detection; never config |
 | Codex app project/section | Person on this machine | Shared `[codex]` override or discovery by main-checkout path | Personal `[codex]`; discovery remains the default |
 | Claude worker permissions | Machine/user | `.claude/settings.local.json` | Same local permissions file, outside git |
 | Folder trust, app/CLI login and credentials | Machine/user | App/CLI secure state | Same native state; never either TOML file |
@@ -243,8 +243,10 @@ ready/waiting/later → ask (manager) → answer → ready
   Every pass prints the effective profile, candidate count and the source of each key
   (`Source: flag: …; taskq.local.toml: …; default: …`); a nonempty filter with no candidates warns.
   The worker prompt carries only the run's explicit flags, never the resolved personal values.
-- Capacity counts `doing` claims on this machine, across areas. New claims record the hostname;
-  pre-upgrade claims are recognized by local Claude import records or local Codex rollout files.
+- Capacity counts `doing` claims on this machine, across areas. New claims record a hash of the machine id
+  (`~/.local/state/taskq/machine-id`, made once: macOS changes the hostname with the network) and the machine's
+  name when `[hosts]` or `TASKQ_HOST` gives one; hostname-hash claims from before still count; pre-upgrade claims
+  are recognized by local Claude import records or local Codex rollout files.
   Legacy detection reads only matching local filenames and does not need an app server.
   Limits are local scheduling guidance, not a global admission gate or cross-machine
   arbitration. Manual `take` does not enforce them. So a tick on the Mac and a tick on Windows each run

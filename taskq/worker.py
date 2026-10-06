@@ -18,7 +18,7 @@ This brief is the owner's assignment: do it without asking for confirmation.
    Then `{export}`: project tools read it to attribute work to this task. A shell that forgets its
    environment between commands (an agent's Bash tool) needs it at the start of every command.
 2. Workspace: {workspace} Start each command there with `{export} &&`.
-3. Do the task below. Follow AGENTS.md. Expected paths: {scope}. They say where the work is expected, not
+3. Do the task below.{agents} Expected paths: {scope}. They say where the work is expected, not
    what is forbidden: if the task needs another file, change it and name it with the
    reason in the result. Do not ask for that.
 4. In long work run `{tool} beat {iid}` after each milestone.
@@ -120,6 +120,11 @@ def listing(args):
             detail = f'open dependencies {sorted(set(item["deps"]) & open_iids)}'
         elif item['state'] == 'later':
             detail = item['waiting_for'] or ''
+        # A claim without a session (released, answered) still holds the task's paths: name what waits on it.
+        held = claim and not claim.get('session') and [other['iid'] for other in everything if other['state'] == 'ready'
+                and core.refusal(other, everything, open_iids) == f'scope overlaps #{item["iid"]}']
+        if held:
+            detail = '; '.join(filter(None, (detail, f'holds scope for {", ".join(f"#{iid}" for iid in held)}')))
         print(f'#{item["iid"]:<4} {item["state"]:<8} p{item["priority"]} {item["runtime"] or "any":<6} '
               + (f'{item["web_url"]} ' if args.links else '') + item['title'] + (f'  [{detail}]' if detail else ''))
     for issue in odd:
@@ -147,6 +152,7 @@ def brief(current):
     # the brief also renders without a session (CI, a plain shell): the claim or the task's runtime stands in
     runtime = (core.session() or claim or {}).get('runtime') or current['runtime'] or 'unknown'
     return BRIEF.format(**{**current, 'tool': core.TOOL, 'rules': core.RULES, 'deliver': DELIVER[pushes],
+                           'agents': ' Follow AGENTS.md.' if (core.ROOT / 'AGENTS.md').is_file() else '',
                            'workspace': core.WORKSPACE[kind].format(iid=current['iid']),
                            'sha': ' --sha <pushed commit>' if pushes else '',
                            'export': f'export TASKQ_TASK={current["iid"]} TASKQ_RUNTIME={runtime}',

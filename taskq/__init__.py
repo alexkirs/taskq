@@ -6,6 +6,7 @@ is the rest of its data, the notes are its history. Nothing local stores task st
 Everything specific to a project is its `taskq.toml`. Contracts: `taskq contract`.
 """
 import argparse
+import contextlib
 import hashlib
 from datetime import datetime
 import json
@@ -50,6 +51,9 @@ UPDATE = {'auto': None, 'every': '24h', 'ref': 'main'}
 SIGNERS = Path(__file__).resolve().parent / 'allowed_signers'  # ssh keys allowed to sign the `stable` tag
 # A cache, not queue state: when this machine last asked REPO for its `main`.
 UPDATE_STAMP = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'taskq' / 'update-last'
+# This machine in claims and the coordinator lease: a random id made once. Not the hostname: macOS changes it with
+# the network, and the local limits would stop counting this machine's sessions.
+MACHINE_ID = UPDATE_STAMP.parent / 'machine-id'
 # waiting: open dependencies, moved only by `tick`; ask: a question for the owner (worker's or manager's);
 # later: deferred by the owner, nobody waits on anything. Board columns in this order.
 STATES = ('ready', 'waiting', 'doing', 'review', 'ask', 'later')
@@ -199,20 +203,48 @@ def session():
 
 
 def me():
-    return {**(session() or fail('no session identity: set ' + ' or '.join(RUNTIMES.values()))), 'node': node()}
+    return {**(session() or fail('no session identity: set ' + ' or '.join(RUNTIMES.values()))), **here()}
 
 
-def node(hostname=None):
-    """A machine in a claim: a short hash, not its hostname, because the claim is in a public issue body (#39)."""
-    return hashlib.sha256(f'{PROJECT_PATH}:{hostname or socket.gethostname()}'.encode()).hexdigest()[:12]
+def here():
+    """This machine in a claim or lease: its node, and its name when the owner chose one ([hosts], TASKQ_HOST), so
+    other machines can say it too. The hostname itself never: the claim is in a public issue body (#39)."""
+    named = os.environ.get('TASKQ_HOST') or HOSTS.get(socket.gethostname())
+    return {'node': node(), **({'name': named} if named else {})}
+
+
+def machine_id():
+    """MACHINE_ID, created on first use. A link publishes it whole: a parallel first use reads the same id."""
+    try:
+        return MACHINE_ID.read_text().strip()
+    except FileNotFoundError:
+        MACHINE_ID.parent.mkdir(parents=True, exist_ok=True)
+        draft = MACHINE_ID.with_name(f'machine-id.{os.getpid()}')
+        draft.write_text(os.urandom(16).hex() + '\n')
+        with contextlib.suppress(FileExistsError):
+            os.link(draft, MACHINE_ID)
+        draft.unlink()
+        return MACHINE_ID.read_text().strip()
+
+
+def node(identity=None):
+    """A machine in a claim: a short hash of its machine id (a hostname in claims from before #46)."""
+    return hashlib.sha256(f'{PROJECT_PATH}:{identity or machine_id()}'.encode()).hexdigest()[:12]
+
+
+def local_node(found):
+    """True when `found` (a claim's or lease's node) is this machine's, also from before #46 under this hostname."""
+    return found in (node(), node(socket.gethostname()))
 
 
 def where(claim):
-    """` @name` of a claim's machine: this one and [hosts] are known by name, another by its hash."""
+    """` @name` of a claim's machine: this one and named ones by name, another by its hash."""
     if claim.get('host'):  # a claim from before #39
         return f' @{machine(claim["host"])}'
-    names = {**{node(host): name for host, name in HOSTS.items()}, node(): machine()}
-    return f' @{names.get(claim["node"], claim["node"][:6])}' if claim.get('node') else ''
+    if not claim.get('node'):
+        return ''
+    names = {node(host): name for host, name in HOSTS.items()}  # claims from before #46
+    return f' @{machine() if local_node(claim["node"]) else claim.get("name") or names.get(claim["node"], claim["node"][:6])}'
 
 
 def machine(hostname=None):
@@ -472,7 +504,7 @@ def limits(text):
 
 def local_claim(claim):
     if claim.get('node'):
-        return claim['node'] == node()
+        return local_node(claim['node'])
     if claim.get('host'):
         return claim['host'] == socket.gethostname()
     # Upgrade existing claims from local app evidence, without editing someone else's task.

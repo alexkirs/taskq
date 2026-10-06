@@ -281,10 +281,12 @@ research or asset result means reading its text against the Acceptance items; no
 3. A push to `main` is the deploy. Close a code task only when CI on its sha is green on the project's host:
    GitHub `gh api repos/<owner>/<repo>/commits/<sha>/check-runs --jq '.check_runs[] | [.name, .status, .conclusion]'`,
    GitLab `glab api "projects/:id/pipelines?sha=<sha>"`.
-4. Accepted: `taskq close N --text "<what exactly was checked and what was not>"`, then the tree
-   cleanup that `close` prints (the project's `[workspace] retire`); archive the worker session:
-   Claude — `taskq retire <id>` as the Review section prints it (`claude stop` + `claude rm`: the
-   background run ends, the transcript stays; a worker the app imported: `archive_session`), Codex —
+4. Accepted: `taskq close N --text "<what exactly was checked and what was not>"`. For a claim of
+   this machine close also retires the worker session (Claude — `claude stop` + `claude rm`: the
+   background run ends, the transcript stays; Codex — `codex-archive`), removes the task's tree by
+   the project's `[workspace] retire` and deletes its merged branch `taskq-<N>`; one line per step.
+   Do by hand only a step whose line failed, or a claim of another machine (on that machine): Claude —
+   `taskq retire <id>` (a worker the app imported: `archive_session`), Codex —
    `taskq codex-archive <id>` (the command leaves a running
    session alone; a session open in the Codex app is held by the app's own server — the command
    then says so: open it with `open -g codex://threads/<id>` and press Cmd+Shift+A in the window
@@ -296,14 +298,14 @@ research or asset result means reading its text against the Acceptance items; no
 **Starting workers (section Start).** The section names the runner for each task, respecting the
 separate limits (Claude and Codex each have their own slots; an `any` task is given a runner with a
 free slot). The other runtime will not take the task. One at a time:
-1. Claude: `taskq spawn --name "T<N> <words>"` — a `claude --bg` session in the main checkout,
-   idle, no app window change (§ "Window focus on spawn"); prints its session id. spawn adds
-   ` (<machine>)` to the name; SendMessage uses the name as `ListAgents` shows it. Codex:
-   `spawn --runtime codex --name "T<N> <words>"` — prints the Codex session id (§ "Other machines").
-2. Send it the worker prompt: Claude — `SendMessage` with `to` = the name from step 1 (as
-   `ListAgents` shows it) and `notify_when_idle: true`, so the end of its turn comes back to you;
-   Codex — `taskq codex-send <id> --text "<prompt>"`.
-   Use the exact worker prompt printed by tick, including the confirmed profile arguments.
+1. Run the command the section prints for the task, as printed:
+   `taskq spawn --runtime <r> --name "T<N> <title>" --text "<worker prompt>"` (#41). The session starts
+   on the prompt at once; no SendMessage. Claude: a `claude --bg` session in the main checkout,
+   no app window change (§ "Window focus on spawn"). Codex: the first turn of the new thread is the
+   prompt (§ "Other machines"). spawn adds ` (<machine>)` to the name and prints the session id.
+   The prompt carries the confirmed profile arguments; edit only the profile, never the rest.
+2. Later messages to a worker (an answer, a nudge): Claude — `SendMessage` to the name as `ListAgents`
+   shows it; Codex — `taskq codex-send <id> --text "<text>"`.
 3. Workers may be started back to back: `worker` may hand the same task to two concurrent workers,
    but `take` gives it to one, the other is refused and takes the next ([taskq](taskq.md) § Taking a task).
 4. Tell the owner, in one line per worker, how to watch it: the tick's section "Claude worker

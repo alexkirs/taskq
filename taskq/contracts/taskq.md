@@ -53,7 +53,7 @@ It holds no secrets: the token belongs to `glab`.
 | `[areas] names` | Project work areas; `init` creates `area-*` labels | empty |
 | `[codex] project`, `section` | Override of the Codex app project for `spawn --runtime codex`, and its sidebar section | project: the app's project whose root is the main checkout (`project/list`), created by `project/create` when none is; no section |
 | `[workspace] new`, `continue`, `none` | Brief text about the workspace; `{iid}` is the task number | `git worktree add` next to the checkout |
-| `[workspace] retire` | What `close` prints to clean up the tree | nothing |
+| `[workspace] retire` | What `close` runs from the main checkout to remove the task's tree (then `git branch -d taskq-<N>`) | nothing: the tree stays |
 | `[workspace] cleanup_helpers` | Project folder with `workspace_gc.py`, `host_gentle.py`, `host_tools.py` for `cleanup` | none: `cleanup` refuses |
 | `[update] auto`, `every`, `ref` | `tick` updates taskq from REPO (github.com/alexkirs/taskq) at most `every` (`30m`, `24h`, `7d`); `taskq update` does it by hand. `ref = "main"`: the newest `main` commit whose CI check-runs passed; `ref = "stable"`: the `stable` tag, only when CI passed and the tag is signed by a key in the package's `allowed_signers` (README: Develop taskq). A refused update prints one line and nothing new runs; a clone whose new code does not start (`python3 -m taskq --version`) goes back. Missing keys take their defaults in memory; `taskq.toml` is never written | `auto`: `true` when the project's repository has REPO's owner, else `false`; `24h`; `main` |
 | `[brief] rules` | Project rules added to step 6 of every worker brief (budget, approvals, where the project's authorization is written) | nothing |
@@ -352,19 +352,19 @@ An orphan reaction owned by another user must be cleared by that user; taskq doe
 Scheduling and creating sessions is an app action, not a script action.
 
 - **Claude desktop:** the coordinator is an ordinary session with a timer inside (`CronCreate`). A worker
-  is created by `taskq spawn --name "T<N> <words>"`: a `claude --bg` background session of the CLI in
-  the main checkout (#270, 2026-10-06: the app window does not change). The coordinator sends it the
-  worker prompt with `SendMessage` and `notify_when_idle`. The owner watches it by Remote Control
+  is created by `taskq spawn --name "T<N> <words>" --text "<worker prompt>"` as tick prints it: a `claude --bg`
+  background session of the CLI in the main checkout that starts on the prompt (#270, 2026-10-06: the app
+  window does not change; #41: no SendMessage). The owner watches it by Remote Control
   (claude.ai/code, phone), `claude agents` / `claude attach`, or on request in the app:
   `taskq show <id>` stops the background run and imports the session with the link
   `claude://resume?session=<id>`, which is undocumented, may change with an app update and always
-  shows the session for a moment (~0.2 s). A finished worker: `taskq retire <id>`. Worker sessions
+  shows the session for a moment (~0.2 s). A finished worker: `close` retires it on its machine; by hand `taskq retire <id>`. Worker sessions
   run without permission prompts: `.claude/settings.local.json` in the main checkout sets
   `bypassPermissions` (owner decision, 2026-10-05; the file is not in git).
 - **Codex:** an automation with the prompt "Run `cd <main checkout> && taskq tick` and follow
-  the instructions it prints". A Codex worker is created by `taskq spawn --runtime codex`; the prompt
-  is sent by `taskq codex-send`, state is read by `taskq codex-read`, and after acceptance it is
-  archived by `taskq codex-archive` ([taskq-manager](taskq-manager.md) § Other machines).
+  the instructions it prints". A Codex worker is created by `taskq spawn --runtime codex --text "<prompt>"`
+  (the prompt is the thread's first turn); later turns are sent by `taskq codex-send`, state is read by `taskq codex-read`, and after acceptance `close`
+  archives it by `taskq codex-archive` ([taskq-manager](taskq-manager.md) § Other machines).
   `codex-read <id> --limit N` shows the last N turns (default 3), events, the current
   operation and the actual sandbox of the last turn. `codex-send` prints `delivered` for a new
   turn with an explicit policy or for a message steered into an active turn. Tick shows the status and event age
@@ -435,7 +435,7 @@ in full: history growth does not slow `tick`, `take`, `list` or `worker`.
 | Pagination `per_page=100` | — | Before: brief history (`notes`, ascending) and the `tick` question (`question`) were silently lost after 100 notes; same for `report`; `ask-summary` and the `spawn` log in the service issue dropped out after 100 new notes; labels in `migrate` after 100. After: `pages()` reads all pages; the question is read from the newest notes | — | — | ok |
 | Problems | With a task: 1 note; without a task: 1 new `problem` issue | By number of problems | Closed `problem` issues | The coordinator closes them after review (`tick` names open ones) | ok |
 | `report --hours H` | 1 + 1 per issue changed in H hours: one day = 194 requests, 4.3 MB; before 255 s, after 40 s (8 requests in parallel) | Linear in window activity, not in history | Nothing | — | ok |
-| Cleanup: trees, branches | local git | By number of trees | Trees, local and remote branches | `close` prints `worktree-retire`; `cleanup --apply` removes merged ones; remote ones are a question to the owner | ok |
+| Cleanup: trees, branches | local git | By number of trees | Trees, local and remote branches | `close` runs `[workspace] retire` and `git branch -d taskq-<N>`; `cleanup --apply` removes merged ones; remote ones are a question to the owner | ok |
 | Cleanup: issues for `cleanup` | Before `state=all`: 249 issues, 2.8 MB, 12.1 s; at 5000 it would be 50 pages ≈ 57 MB, ~4 min. After: open + closed in 30 days: 35 + 214 today | Bounded by 30 days of work | — | — | ok; a worker for a task older than 30 days is a question to the owner, not a deletion |
 | Cleanup: sessions | Before: the `spawn` log in the service issue (last 100 notes; 47 entries). After: Codex — `thread/list` of the app project (all 13 Codex log entries were found there); Claude — app metadata on this machine: 150 files, 0.13 s; 86 imported from the CLI, a superset of the 34 Claude log entries | Linear in sessions on the machine, local | Sessions | Codex — `codex-archive`; Claude — the coordinator's `archive_session`; archived sessions are no longer listed (before, every worker of a closed task was printed by every `cleanup`) | ok |
 | Labels and board | `migrate`: label pages (23 now) | Fixed set + `problem` | Labels of old states | `migrate` deletes them when no issue carries them | ok |

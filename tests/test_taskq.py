@@ -363,9 +363,11 @@ class Cycle(unittest.TestCase):
         self.do(CODEX, 'reject', iid, '--text', 'more')
         self.do(CODEX, 'take', iid)
         self.do(CODEX, 'result', iid, '--text', 'done again', '--checks', 'none')
-        self.assertIn('codex-archive codex-session', self.do(CLAUDE, 'tick'))
+        # A local claim: close archives the session itself, tick does not print it (#41).
+        self.assertNotIn('codex-archive codex-session', self.do(CLAUDE, 'tick'))
         self.do(CODEX, 'problem', '--task', iid, '--text', 'glab was slow')
-        self.do(CLAUDE, 'close', iid, '--text', 'ok')
+        with patch.object(q, 'codex_archive', lambda args: print(f'archived {args.thread}')):
+            self.assertIn('session: archived codex-session', self.do(CLAUDE, 'close', iid, '--text', 'ok'))
         report = self.do(CLAUDE, 'report')
         self.assertIn(f'#{iid}: take → ask +0m → answer', report)
         self.assertIn('glab was slow', report)
@@ -653,14 +655,14 @@ class Cycle(unittest.TestCase):
         self.assertIn('host is win', self.do(CLAUDE, 'list'))
         self.assertIn('host is win', self.refused(CLAUDE, 'take', win))
         self.assertIn(f'take {anyone}', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
-        self.assertIn(f'#{anyone} claude', self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
+        self.assertIn(f"--runtime claude --name 'T{anyone} t'", self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
         self.do(CLAUDE, 'take', anyone)
         self.assertIn('@mac-1, last change', self.do(CLAUDE, 'list'))
         with patch.object(q, 'HOSTS', {'DESKTOP-7.lan': 'win'}), \
                 patch.object(q.socket, 'gethostname', return_value='DESKTOP-7.lan'):
             self.assertIn('Profile: host=win', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
             # The Mac's doing task does not fill win's one place.
-            self.assertIn(f'#{win} claude', self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
+            self.assertIn(f"--runtime claude --name 'T{win} t'", self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
             self.do({'CLAUDE_CODE_SESSION_ID': 'win-session', 'CODEX_THREAD_ID': ''}, 'take', win)
             self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
         self.assertEqual(q.parse(self.gitlab.issues[win])['claim']['host'], 'DESKTOP-7.lan')
@@ -767,13 +769,13 @@ class Cycle(unittest.TestCase):
             self.do(CODEX, 'take', self.add('--type', 'asset'))
         claude = self.add('--type', 'code')
         self.assertIn(f'take {claude}', self.do(CLAUDE, 'worker'))
-        self.assertIn(f'#{claude} claude', self.do(CLAUDE, 'tick'))
+        self.assertIn(f"--runtime claude --name 'T{claude} t'", self.do(CLAUDE, 'tick'))
         self.do(CLAUDE, 'take', claude)
 
     def test_runtime_pins_who_may_take_a_task(self):
         pinned = self.add('--type', 'research', '--runtime', 'codex')
         self.assertIn('codex  t', self.do(CLAUDE, 'list'))
-        self.assertIn(f'#{pinned} codex', self.do(CLAUDE, 'tick'))
+        self.assertIn(f"--runtime codex --name 'T{pinned} t'", self.do(CLAUDE, 'tick'))
         self.assertIn('No task can start', self.do(CLAUDE, 'worker'))
         self.assertIn('runtime is codex', self.refused(CLAUDE, 'take', pinned))
         anyone = self.add('--type', 'research')
@@ -955,6 +957,13 @@ class Cycle(unittest.TestCase):
         params = next(params for method, params in self.codex.calls if method == 'turn/start')
         self.assertEqual([method for method, _ in self.codex.calls][-2:], ['wait_turn', 'thread/unsubscribe'])
         self.assertEqual(params['approvalPolicy'], 'never')
+        # #41: with the worker prompt the first turn is the prompt, left running like codex-send's
+        self.codex.calls.clear()
+        with patch.object(q, 'codex_announce'):
+            self.do(CLAUDE, 'spawn', '--runtime', 'codex', '--name', 'probe', '--text', 'Run the brief')
+        first = next(params for method, params in self.codex.calls if method == 'turn/start')
+        self.assertEqual(first['input'][0]['text'], 'Run the brief')
+        self.assertNotIn('wait_turn', [method for method, _ in self.codex.calls])
         self.assertEqual(params['sandboxPolicy'], {'type': 'dangerFullAccess'})
         start = next(params for method, params in self.codex.calls if method == 'thread/start')
         self.assertEqual(start['sandbox'], 'danger-full-access')
@@ -996,11 +1005,13 @@ class Cycle(unittest.TestCase):
         with patched:
             printed = self.do(CLAUDE, 'spawn', '--name', 'T1 x')
             self.do(CLAUDE, 'spawn', '--name', 'T1 x', '--remote-control')
+            self.do(CLAUDE, 'spawn', '--name', 'T1 x', '--text', 'Run the brief')
         self.assertEqual(printed.splitlines()[0], 'abcd1234-0000')
         self.assertIn('claude attach abcd1234', printed)
-        # csgo #303: the name says the machine; Remote Control is off unless asked for.
+        # csgo #303: the name says the machine; Remote Control is off unless asked for. #41: the prompt is last.
         self.assertEqual(runs, [['claude', '--bg', '--name', 'T1 x (mac-1)', '--settings', '{"remoteControlAtStartup": false}'],
-                                ['claude', '--bg', '--name', 'T1 x (mac-1)']])
+                                ['claude', '--bg', '--name', 'T1 x (mac-1)'],
+                                ['claude', '--bg', '--name', 'T1 x (mac-1)', '--settings', '{"remoteControlAtStartup": false}', 'Run the brief']])
         self.agents = {}
         with self.run_recorded({'claude --bg': 'backgrounded · ffff0000 · T1 x'})[1]:
             self.assertIn('does not list the new session ffff0000', self.refused(CLAUDE, 'spawn'))
@@ -1036,11 +1047,38 @@ class Cycle(unittest.TestCase):
         self.assertIn(f'#{iid} @mac-1 t: background, running: `claude attach claudese`', listed)
         self.assertIn('show claude-session', listed)
         self.do(CLAUDE, 'result', iid, '--checks', 'c', '--text', 'done')
-        self.assertIn('taskq retire claude-session', self.do(COORDINATOR, 'tick'))
         runs, patched = self.run_recorded()
         with patched:
             self.assertIn('retired claude-session', self.do(COORDINATOR, 'retire', 'claude-session'))
         self.assertEqual(runs, [['claude', 'stop', 'claudese'], ['claude', 'rm', 'claudese']])
+
+    def test_close_retires_a_local_session_tree_and_branch_one_line_each(self):
+        """#41: what the coordinator ran by hand after close; a failing step is one line, not a traceback."""
+        iid = self.add('--type', 'code', '--runtime', 'claude')
+        self.do(CLAUDE, 'take', iid)
+        self.do(CLAUDE, 'result', iid, '--sha', 'abc1234', '--text', 'x', '--checks', 'x')
+        self.agents = {'claude-session': {'id': 'claudese', 'sessionId': 'claude-session', 'pid': 3}}
+        runs = []
+
+        def run(argv, **kwargs):
+            runs.append(argv)
+            failed = argv == ['git', 'branch', '-d', f'taskq-{iid}']
+            return SimpleNamespace(returncode=int(failed), stdout='', stderr="error: the branch is not fully merged." if failed else '')
+        with patch.object(q.subprocess, 'run', run):
+            printed = self.do(COORDINATOR, 'close', iid, '--text', 'ok')
+        self.assertIn('session: retired claude-session', printed)
+        self.assertIn('worktree: done', printed)
+        self.assertIn(f'branch taskq-{iid}: failed: error: the branch is not fully merged.', printed)
+        self.assertIn(['claude', 'rm', 'claudese'], runs)
+        self.assertIn(f'make worktree-retire NAME=taskq-{iid}', runs)
+        # Another machine's claim: nothing stopped here, the line says where.
+        other = self.add('--type', 'research')
+        self.do(CLAUDE, 'take', other)
+        self.do(CLAUDE, 'result', other, '--text', 'x', '--checks', 'x')
+        runs.clear()
+        with patch.object(q.subprocess, 'run', run), patch.object(q.socket, 'gethostname', return_value='elsewhere'):
+            self.assertIn('is on another machine', self.do(COORDINATOR, 'close', other, '--text', 'ok'))
+        self.assertEqual(runs, [])
 
     def test_codex_send_does_not_steer_a_completed_or_unknown_turn(self):
         self.codex.status = 'active'
@@ -1571,7 +1609,7 @@ class Selftest(unittest.TestCase):
             q.EXECUTORS['grok'] = {**q.EXECUTORS['grok'], 'spawn': 'echo id-{name}', 'send': 'echo sent {session} {text}'}
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                q.spawn(argparse.Namespace(runtime='grok', name='T1 x'))
+                q.spawn(argparse.Namespace(runtime='grok', name='T1 x', text=None))
                 q.send(argparse.Namespace(runtime='grok', session='g1', text='go'))
             self.assertEqual(out.getvalue().split('\n')[:2], ['id-T1 x (mac-1)', 'sent g1 go'])
 

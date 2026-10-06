@@ -973,8 +973,43 @@ def close(args):
     if current['type'] in ('code', 'docs'):
         # Author, date and subject show whether the commit is this task's.
         subprocess.run(['git', 'log', '-1', '--format=%h %an %ad %s', sha], check=False)
-        if RETIRE:
-            print(f'Now retire its worktree from the main checkout: {RETIRE.format(iid=args.iid)}')
+    retire_local(current)
+
+
+def retire_local(current):
+    """After close, what the coordinator did by hand (#41): a local claim's session, then the task's tree by
+    [workspace] retire and its merged branch `taskq-<N>`. One printed line per step; a failure never stops close."""
+    claim, iid = current['claim'] or {}, current['iid']
+
+    def step(what, action):
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as said:  # codex_archive prints its own line
+                done = action()
+            print(f'{what}: {done or said.getvalue().strip()}')
+        except SystemExit as error:  # fail(): its message is the line, e.g. codex-archive's computer-use recipe
+            print(f'{what}: {str(error).removeprefix("taskq: ")}')
+        except Exception as error:  # noqa: BLE001 - one line, never a traceback after the task is closed
+            print(f'{what}: failed: {last_line(str(error)) or type(error).__name__}')
+
+    def run(argv, **kwargs):
+        done = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=120, **kwargs)
+        return 'done' if not done.returncode else f'failed: {last_line(done.stderr + done.stdout)}'
+
+    session = claim.get('session')
+    if session and local_claim(claim):
+        if claim.get('runtime') == 'claude':
+            step('session', lambda: f'retired {session}' if claude_stop(session, remove=True) else f'{session} is not a background session here')
+        elif claim.get('runtime') == 'codex':
+            step('session', lambda: codex_archive(argparse.Namespace(thread=session)))
+    elif session:
+        print(f'session: {claim.get("runtime")}:{session} is on another machine; retire it there')
+    if current['type'] not in ('code', 'docs'):
+        return
+    if RETIRE:
+        step('worktree', lambda: run(RETIRE.format(iid=iid), shell=True))
+    branch = f'taskq-{iid}'
+    if not subprocess.run(['git', 'rev-parse', '--verify', '-q', f'refs/heads/{branch}'], cwd=ROOT, capture_output=True).returncode:
+        step(f'branch {branch}', lambda: run(['git', 'branch', '-d', branch]))
 
 
 def problem(args):
@@ -1615,9 +1650,10 @@ def codex_project(codex):
     return created.get('project', created)['id']
 
 
-def codex_spawn(name):
-    """A persistent thread of the app's project (`codex_project`) in section `CODEX_SECTION`, with one finished turn, announced
-    to the app and released by the shared server, so the owner can write in it. It runs with `CODEX_ACCESS`."""
+def codex_spawn(name, prompt=None):
+    """A persistent thread of the app's project (`codex_project`) in section `CODEX_SECTION`, announced to the app and
+    released by the shared server, so the owner can write in it. It runs with `CODEX_ACCESS`. Its first turn is `prompt`,
+    left running as `codex-send` leaves it; without one, a finished 'ready' turn."""
     codex = Codex(timeout=300)
     thread = codex.call('thread/start', {'cwd': str(ROOT), 'projectId': codex_project(codex),
                                          'ephemeral': False, **CODEX_ACCESS})['thread']['id']
@@ -1625,8 +1661,9 @@ def codex_spawn(name):
     if CODEX_SECTION:
         codex.call('thread/section/move', {'threadId': thread, 'sectionId': CODEX_SECTION})
     codex.call('turn/start', {'threadId': thread, **CODEX_TURN_POLICY,
-                            'input': [{'type': 'text', 'text': 'Reply with the single word: ready'}]})
-    codex.wait_turn(thread, 280)
+                            'input': [{'type': 'text', 'text': prompt or 'Reply with the single word: ready'}]})
+    if not prompt:
+        codex.wait_turn(thread, 280)
     codex_release(codex, thread)
     codex_announce(thread)
     return thread
@@ -1866,16 +1903,19 @@ def codex_archive(args):
 
 
 def spawn(args):
-    """Create a worker session in the main checkout and print its id; the coordinator then sends it the
-    worker prompt. Claude: a CLI background session (`claude_spawn`). Codex: `codex_spawn`.
+    """Create a worker session in the main checkout that starts on `--text` (the worker prompt) and print its id.
+    Claude: a CLI background session (`claude_spawn`). Codex: `codex_spawn`. Without `--text` the session is idle.
     The name ends with ` (<machine>)`: the owner sees where each worker runs. No `@`: SendMessage
     rejects a name containing it as a name@team address."""
     name = args.name if args.name.endswith(f' ({machine()})') else f'{args.name} ({machine()})'
     if args.runtime == 'codex':
-        return print(codex_spawn(name))
+        return print(codex_spawn(name, args.text))
     if args.runtime in EXECUTORS:
-        return print(executor_run(args.runtime, 'spawn', name=name))
-    session = claude_spawn(name, remote_control=args.remote_control)
+        session = executor_run(args.runtime, 'spawn', name=name)
+        if args.text:
+            executor_run(args.runtime, 'send', session=session, text=args.text)
+        return print(session)
+    session = claude_spawn(name, prompt=args.text, remote_control=args.remote_control)
     print(f'{session}\nWatch it: `claude attach {session[:8]}` or `claude agents`; in the app: `{TOOL} show {session}`.')
 
 
@@ -2181,20 +2221,15 @@ def tick(args):
               f'Check the result against the Acceptance above (for code and docs read the commit).\n'
               f'Accepted: `{TOOL} close {item["iid"]} --text "<what you checked>"`. '
               f'Not accepted: `{TOOL} reject {item["iid"]} --text "<what to fix>"`.\n')
-        if (item['claim'] or {}).get('runtime') == 'codex':
-            print(f'After close, archive its Codex session: `{TOOL} codex-archive {item["claim"]["session"]}`.\n')
-        elif (item['claim'] or {}).get('session') in agents:
-            print(f'After close, retire its Claude session: `{TOOL} retire {item["claim"]["session"]}`.\n')
+        if (item['claim'] or {}).get('runtime') == 'codex' and not local_claim(item['claim']):
+            print(f'After close, archive its Codex session on its machine: `{TOOL} codex-archive {item["claim"]["session"]}`.\n')
     if start:
-        print(f'## Start {len(start)} worker session(s)\n\n'
-              f'Each worker is a new visible session of your own app that receives exactly this prompt:\n\n'
-              f'    {worker_prompt(args)}\n\n'
-              f'Runtime of each: ' + ', '.join(f'#{item["iid"]} {item["runtime"]}' for item in start) + '.\n'
-              f'Claude worker: `{TOOL} spawn --name "T<N> <title>"` (a background session: the app window does not '
-              f'change), then SendMessage to that name with the prompt and `notify_when_idle: true`. Codex worker: '
-              f'`{TOOL} spawn --runtime codex --name "T<N> <title>"`, then `{TOOL} codex-send <printed id> --text "<prompt>"`.\n'
-              + ''.join(f'{name} worker: `{TOOL} spawn --runtime {name} --name "T<N> <title>"`, then '
-                        f'`{TOOL} send --runtime {name} <printed id> --text "<prompt>"`.\n' for name in EXECUTORS))
+        # One command per worker: the session starts on the prompt, no second message (#41).
+        # An indented block, not inline code: the prompt itself holds backticks.
+        print(f'## Start {len(start)} worker session(s)\n\nRun each command once; the worker starts on the brief at once:\n\n'
+              + ''.join('    ' + shlex.join([TOOL, 'spawn', '--runtime', item['runtime'], '--name',
+                                             f'T{item["iid"]} {item["title"][:40]}', '--text', worker_prompt(args)]) + '\n'
+                        for item in start))
     live = [item for item in everything if item['state'] == 'doing' and (item['claim'] or {}).get('runtime') == 'claude'
             and item['claim'].get('session')]
     if live:
@@ -2960,7 +2995,8 @@ def main(argv=None):
     command('tick', tick, *profile_flags)
     command('spawn', spawn, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),
             (('--name',), {'default': 'taskq worker', 'help': 'session name: "T<N> <words>"; " (<this machine>)" is added'}),
-            (('--remote-control',), {'action': 'store_true', 'help': 'Claude: keep Remote Control on (off by default)'}))
+            (('--remote-control',), {'action': 'store_true', 'help': 'Claude: keep Remote Control on (off by default)'}),
+            (('--text',), {'help': 'the worker prompt the session starts on (tick prints it); idle without it'}))
     claude_session = (('session',), {'help': 'Claude session id (or local_<id>)'})
     command('show', show, claude_session,
             (('--restore',), {'help': 'app session to show again after the import (default: the calling session)'}))

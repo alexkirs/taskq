@@ -144,10 +144,12 @@ def brief(current):
     found = core.comments(current['iid'], everyone=True)
     kept = core.collaborators(found)
     omitted = f'\n\n{len(found) - len(kept)} comments by non-collaborators omitted' if len(found) > len(kept) else ''
+    # the brief also renders without a session (CI, a plain shell): the claim or the task's runtime stands in
+    runtime = (core.session() or claim or {}).get('runtime') or current['runtime'] or 'unknown'
     return BRIEF.format(**{**current, 'tool': core.TOOL, 'rules': core.RULES, 'deliver': DELIVER[pushes],
                            'workspace': core.WORKSPACE[kind].format(iid=current['iid']),
                            'sha': ' --sha <pushed commit>' if pushes else '',
-                           'export': f'export TASKQ_TASK={current["iid"]} TASKQ_RUNTIME={core.me()["runtime"]}',
+                           'export': f'export TASKQ_TASK={current["iid"]} TASKQ_RUNTIME={runtime}',
                            'scope': ', '.join(current['scope']) or 'none',
                            'notes': ('\n\n---\n\n'.join(core.notes(kept)) or 'none') + omitted})
 

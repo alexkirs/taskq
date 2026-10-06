@@ -75,8 +75,9 @@ Codex workers need no `taskq.toml` key: the Codex app project is found by the ch
 Tell your agent: **“You are the Product Manager of taskq.”**
 
 Agent: run `taskq contract`; read both printed contracts.
-Check remote, config, CLI authentication, write permissions, labels and board.
-Report gaps; wait for setup agreement. Save settings in `taskq.toml`; run init, then `taskq list`.
+Run `taskq doctor`: read-only; prints each gap (remote, config, CLI login, write permission, labels,
+board) with its recovery command; exit 0 only when ready. The agent walks you through each step and asks first.
+Report gaps; wait for setup agreement. Save settings in `taskq.toml`; run init, `taskq doctor`, then `taskq list`.
 Expected: queue and board, or missing permission and recovery command.
 The manager role alone does not arm a tick.
 

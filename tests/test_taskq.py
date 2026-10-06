@@ -83,6 +83,7 @@ class Gitlab:
         self.awards, self.events = {}, {}  # award emoji by id; label events by issue
         self.uid = 1
         self.clock = 0
+        self.access = 30  # Developer
 
     def now(self):
         """Real time, but strictly increasing by at least 1 ms: the order of GitLab's writes."""
@@ -95,6 +96,8 @@ class Gitlab:
     def __call__(self, method, path, body=None):
         if path == '/user':
             return {'id': self.uid}
+        if path == '/' + q.PROJECT:
+            return {'permissions': {'project_access': {'access_level': self.access}, 'group_access': None}}
         if path.startswith('milestones'):
             return self.milestones
         if path.startswith('labels'):
@@ -963,7 +966,7 @@ class GithubRest:
     milestones, label events, blobs and refs (the lock), the user, `deleteIssue` and Projects v2 over GraphQL."""
     def __init__(self):
         self.issues, self.comments, self.labels, self.refs, self.blobs = {}, {}, {}, {}, {}
-        self.calls, self.clock = [], 0
+        self.calls, self.clock, self.push = [], 0, True
         self.projects, self.scope, self.mutations = [], True, []  # the owner's Projects v2; False: the token lacks `project`
 
     def project(self, query, found):
@@ -972,11 +975,12 @@ class GithubRest:
             q.fail("GitHub POST graphql failed: GraphQL: Your token has not been granted the required scopes to execute this query. The 'projectsV2' field requires one of the following scopes: ['read:project']")
         if query.startswith('mutation'):
             self.mutations.append(query.split('{', 1)[1].split('(', 1)[0].strip())
-        shape = lambda board: {'id': board['id'], 'title': board['title'], 'url': board['url'],
+        shape = lambda board: {'id': board['id'], 'number': int(board['id'][7:]), 'title': board['title'], 'url': board['url'],
+                               'repositories': {'nodes': [{'nameWithOwner': name} for name in board['linked']]},
                                'field': {'id': 'status', 'options': [dict(option) for option in board['options']]}}
         if 'createProjectV2(' in query:
             board = {'id': f'project{len(self.projects) + 1}', 'title': found['title'], 'url': f'project-url/{len(self.projects) + 1}',
-                     'repo': found['repo'], 'items': {}, 'workflows': ['Auto-close issue', 'Item added to project', 'Item closed'], 'options': [{'id': f'o{index}', 'name': name} for index, name in enumerate(('Todo', 'In Progress', 'Done'))]}
+                     'repo': found['repo'], 'linked': ['owner/repo'], 'items': {}, 'workflows': ['Auto-close issue', 'Item added to project', 'Item closed'], 'options': [{'id': f'o{index}', 'name': name} for index, name in enumerate(('Todo', 'In Progress', 'Done'))]}
             self.projects.append(board)
             return {'createProjectV2': {'projectV2': shape(board)}}
         if 'projectsV2(' in query:
@@ -1036,6 +1040,8 @@ class GithubRest:
         route, _, query = path.partition('?')
         if route == 'user':
             return {'id': 1, 'login': 'alice'}
+        if route == 'repos/owner/repo':
+            return {'permissions': {'push': self.push}}
         if route.startswith('user/'):
             return {'id': int(route[5:]), 'login': {1: 'alice', 2: 'bob'}[int(route[5:])]}
         if route == 'graphql' and 'deleteIssue' in body['query']:
@@ -1354,6 +1360,99 @@ class Selftest(unittest.TestCase):
                              ['run-grok', 'send', 's 1', 'a; rm -rf /'])
             iid = self.add('--type', 'research', '--runtime', 'grok')
             self.assertIn(f'take {iid}', self.do({**CLAUDE, 'CLAUDE_CODE_SESSION_ID': '', 'GROK_SESSION_ID': 'g1'}, 'worker'))
+
+
+class Doctor(unittest.TestCase):
+    """`doctor`: every gap named with its command, exit 0 only when none, nothing written anywhere."""
+    def setUp(self):
+        self.origin, self.status = 'git@gitlab.example.com:group/project.git', 0  # `glab auth status`: 0, 1 or None
+        self.enterContext(patch.object(q, 'git', lambda *args, **kwargs: self.origin if args[:2] == ('remote', 'get-url') else None))
+        self.enterContext(patch.object(q, 'probe', lambda command: self.status))
+
+    def doctor(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            try:
+                q.main(['doctor'])
+            except SystemExit as exit:
+                return exit.code, out.getvalue()
+        return 0, out.getvalue()
+
+    def test_gitlab_gaps_then_init_then_ready_without_writes(self):
+        gitlab = Gitlab()
+        self.enterContext(patch.object(q, 'api', gitlab))
+        self.enterContext(patch.object(q, 'AREAS', ('maps',)))
+        self.status = None
+        code, out = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertIn('`glab` is not installed', out)
+        self.assertIn('brew install glab', out)
+        self.assertNotIn('labels', out)  # the tracker is not read before the CLI works
+        self.status = 1
+        self.assertIn('glab auth login --hostname gitlab.example.com', self.doctor()[1])
+        self.status, gitlab.access = 0, 20  # Reporter: reads, cannot write
+        before = json.dumps([gitlab.labels, gitlab.boards, gitlab.issues])
+        code, out = self.doctor()
+        self.assertEqual(json.dumps([gitlab.labels, gitlab.boards, gitlab.issues]), before)  # read only
+        self.assertEqual(code, 1)
+        for text in ('cannot write to group/project', 'labels missing: q-ready', 'area-maps', 'board taskq missing', 'taskq init'):
+            self.assertIn(text, out)
+        gitlab.access = 30
+        with contextlib.redirect_stdout(io.StringIO()):
+            q.main(['init'])
+        self.assertEqual(self.doctor(), (0, 'ready: group/project — config, CLI login, write access, labels and board taskq\n'))
+        gitlab.boards[0]['lists'].pop()
+        self.assertIn('columns are', self.doctor()[1])
+
+    def test_origin_of_another_project_is_named(self):
+        self.enterContext(patch.object(q, 'api', Gitlab()))
+        self.origin = 'https://gitlab.example.com/other/thing.git'
+        code, out = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertIn('origin is gitlab.example.com/other/thing, taskq.toml names gitlab.example.com/group/project', out)
+
+    def test_missing_or_broken_config_names_init_and_writes_nothing(self):
+        self.origin = 'https://github.com/owner/repo.git'
+        with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp), \
+                patch.object(q, 'PROJECT', None), patch.object(q, 'PROJECT_PATH', None):
+            code, out = self.doctor()
+            self.assertEqual(code, 1)
+            self.assertIn('taskq init --github owner/repo  (writes', out)
+            self.assertEqual(os.listdir(tmp), [])
+            Path('taskq.toml').write_text('[github]\nrepo = "owner/repo"\n[gitlab]\nproject = "g/p"\n')
+            code, out = self.doctor()
+            self.assertIn('write exactly one of', out)
+            Path('taskq.toml').write_text('[github\n')
+            self.assertIn('not valid TOML', self.doctor()[1])
+            self.assertEqual(os.listdir(tmp), ['taskq.toml'])
+
+    def test_github_scope_board_options_link_and_write_permission(self):
+        github = GithubRest()
+        store = q.Github('owner/repo')
+        store.run = github
+        self.enterContext(patch.object(q, 'api', store))
+        self.enterContext(patch.object(q, 'BOARDS', False))
+        self.enterContext(patch.object(q, 'HOST', None))
+        self.enterContext(patch.object(q, 'PROJECT_PATH', 'owner/repo'))
+        self.origin = 'git@github.com:owner/repo.git'
+        github.scope, github.push = False, False
+        code, out = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertIn('gh auth refresh -h github.com -s project', out)
+        self.assertIn('cannot write to owner/repo', out)
+        self.assertEqual([call for call in github.calls if call[0] != 'GET' and call[1] != 'graphql'], [])
+        github.scope, github.push = True, True
+        store.board = None
+        self.assertIn('no Projects v2 board taskq', self.doctor()[1])
+        with contextlib.redirect_stdout(io.StringIO()):
+            q.main(['init'])
+        store.board = None
+        self.assertEqual(self.doctor()[0], 0)
+        github.projects[0]['linked'], github.projects[0]['options'] = [], github.projects[0]['options'][:2]
+        store.board, mutations = None, len(github.mutations)
+        code, out = self.doctor()
+        self.assertIn('gh project link 1 --owner owner --repo repo', out)
+        self.assertIn("Status options are ['ready', 'waiting']", out)
+        self.assertEqual(github.mutations[mutations:], [])
 
 
 class Host(unittest.TestCase):

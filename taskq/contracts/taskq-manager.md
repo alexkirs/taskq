@@ -23,17 +23,31 @@ The session replies with the role it took and what is in the queue now.
 
 ### First-use onboarding
 
-When the owner says "you are the Product Manager of taskq", read both paths printed by
-`taskq contract`. Before changing anything, check the project remote, `taskq.toml`, the
-host CLI (`glab` or `gh`), authentication, repository write permissions, queue labels and board.
-If configuration is missing, derive the proposed repository and host from `origin`; do not
-run queue commands against a different project's configuration found in a parent directory.
-Report missing items and recovery commands together, propose setup, and wait for agreement.
-Then save agreed settings in `taskq.toml`, run `taskq init` and verify `taskq list` and the board.
-For GitHub, use a dedicated repository board and ensure the repository has a pushed commit
-before a worker claims a task; follow the README installation commands. Do not arm the tick
-or change worker permission settings as part of this onboarding. Readiness checks are manual
-until a read-only readiness command is available.
+Onboarding is driven by the manager session, not by a document (owner's decision, 2026-10-06).
+The person says "you are the Product Manager of taskq"; the manager reads both paths printed by
+`taskq contract`, runs `cd <main checkout> && taskq doctor` and walks the person through the chain
+step by step.
+
+- `taskq doctor` reads only: origin against the configured tracker, `taskq.toml` (present, valid,
+  exactly one tracker), `glab`/`gh` installed and logged in to the host, write permission on the
+  repository, every queue label (state, runtime, type, priority, `problem`, areas), the board and
+  its state columns; on GitHub the token scope `project`, the Projects v2 board, its Status options
+  and its link to the repository. It prints only the gaps, each with the command that closes it, and
+  exits 1 while any is open; `ready: …` and exit 0 when none is. It is re-run after every step.
+- Offer the minimum needed to start: package, CLI login under the person's own account,
+  `taskq.toml` from the repository (`taskq init --github|--project …` writes it when missing,
+  derived from `origin`), labels and board, Claude folder trust, the worker permissions file (§ 1),
+  the profile card. Nothing more unless the person asks for it (Codex workers, the GitHub board
+  scope, areas); then name what that needs.
+- Do each step yourself and ask permission before each one. Steps only a human can do (the Claude
+  trust prompt, an OAuth login, `gh auth refresh … -s project`) are printed as the exact command
+  and waited for.
+- Never run queue commands against another project's configuration found in a parent directory:
+  `doctor` names an origin that differs from `taskq.toml`.
+- After agreement: save the agreed settings in `taskq.toml`, run `taskq init`, then `taskq doctor`
+  (exit 0) and `taskq list`. For GitHub, use a dedicated repository board and ensure the
+  repository has a pushed commit before a worker claims a task. Do not arm the tick as part of
+  this onboarding.
 
 ## New person: one confirmation card, three steps
 

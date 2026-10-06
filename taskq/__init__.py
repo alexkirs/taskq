@@ -107,8 +107,9 @@ def main_checkout(start):
     return Path(done.stdout.strip()).parent if not done.returncode else Path(start).resolve()
 
 
-def configure(path=None):
-    """Load the project's taskq.toml: `path`, else the nearest one from the current directory up."""
+def configure(path=None, write=True):
+    """Load the project's taskq.toml: `path`, else the nearest one from the current directory up.
+    `write`: add the DEFAULTS keys it lacks to the file (`doctor` reads only)."""
     global RULES, HOST, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER
     import tomllib
     here = Path.cwd()
@@ -116,7 +117,7 @@ def configure(path=None):
                                          if (folder / 'taskq.toml').is_file()), None)
     if not path:
         fail('no taskq.toml in this directory or above it (README: «A new project»)')
-    config = tomllib.loads(complete(path))
+    config = tomllib.loads(complete(path, write))
     tracker, codex, workspace = config.get('gitlab') or config.get('github'), config.get('codex', {}), config.get('workspace', {})
     if ('gitlab' in config) == ('github' in config):
         fail(f'{path}: write exactly one of [gitlab] project = "group/project" or [github] repo = "owner/repo"')
@@ -143,11 +144,16 @@ def configure(path=None):
         RUNTIMES[name], EXECUTORS[name] = item['env'], item
 
 
-def complete(path):
+def complete(path, write=True):
     """The text of `path` with every DEFAULTS key it lacked written into it; says what it added."""
     import tomllib
     text = path.read_text()
-    config = tomllib.loads(text)
+    try:
+        config = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        fail(f'{path}: not valid TOML: {error}')
+    if not write:
+        return text
     for section, keys in DEFAULTS.items():
         lines = ''.join(f'{key} = {value}\n' for key, value in keys.items() if key not in config.get(section, {}))
         if not lines:
@@ -225,7 +231,7 @@ class Github:
             ' orderBy: {field: CREATED_AT, direction: DESC}) { pageInfo { hasNextPage endCursor } nodes { number id title body state url'
             ' createdAt updatedAt labels(first: 100) { nodes { name } } assignees(first: 10) { nodes { databaseId login } }'
             ' milestone { number } comments { totalCount } } } } }')
-    PROJECT = ('id title url field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } }')
+    PROJECT = ('id number title url repositories(first: 20) { nodes { nameWithOwner } } field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } }')
     FIND = ('query($owner: String!, $name: String!, $board: String!) { repository(owner: $owner, name: $name) { id owner { id'
             ' ... on ProjectV2Owner { projectsV2(first: 20, query: $board) { nodes { %s } } } } } }' % PROJECT)
     # Cards are read from the open issues' side: `ProjectV2.items` of a new project stayed empty for minutes while
@@ -240,7 +246,7 @@ class Github:
         self.board, self.items = None, {}  # the project once looked up in this process (False: none); item ids by issue number
 
     def run(self, method, path, body=None):
-        own = path.startswith(('user', 'graphql'))
+        own = path.startswith(('user', 'graphql', 'repos/'))
         command = ['gh', 'api', '-X', method, path if own else f'repos/{self.repo}/{path}'] + (['--hostname', self.host] if self.host else [])
         if body is not None:
             command += ['--input', '-']
@@ -288,7 +294,7 @@ class Github:
         return self.run('POST', 'graphql', {'query': query, 'variables': variables})['data']
 
     def project(self, create=False):
-        """The board: {id, url, field, options by name}; None without one (or without the scope `project`).
+        """The board: {id, url, field, options by name, number, linked}; None without one, False without the scope `project`.
         `create` makes it once, linked to the repository, with Status options exactly STATES."""
         if self.board is None or (create and not self.board):
             owner, name = self.repo.split('/')
@@ -298,7 +304,7 @@ class Github:
                 if 'scope' not in str(error).lower():
                     raise
                 self.board = False
-                return None
+                return False
             found = next((item for item in repository['owner'].get('projectsV2', {}).get('nodes', []) if item['title'] == BOARD), None)
             if not found and create:
                 found = self.graphql('mutation($owner: ID!, $title: String!, $repo: ID!) { createProjectV2(input: {ownerId: $owner,'
@@ -326,8 +332,10 @@ class Github:
                                                   ' id options { id name } } } } }',
                                                   project=found['id'], options=options)['createProjectV2Field']['projectV2Field']
             self.board = found and {'id': found['id'], 'url': found['url'], 'field': (found['field'] or {}).get('id'),
-                                    'options': {option['name']: option['id'] for option in (found['field'] or {}).get('options', [])}}
-        return self.board or None
+                                    'options': {option['name']: option['id'] for option in (found['field'] or {}).get('options', [])},
+                                    'number': found['number'], 'linked': self.repo.lower() in
+                                    [item['nameWithOwner'].lower() for item in found['repositories']['nodes']]}
+        return self.board  # False: the token lacks the scope `project`
 
     def cards(self):
         """Status by number of every open issue with a card on the board (None: the card has no Status)."""
@@ -403,6 +411,8 @@ class Github:
         later = int(query.get('page', 1)) > 1
         if path == '/user':
             return {'id': self.run('GET', 'user')['id']}
+        if path == 'repository':
+            return self.run('GET', f'repos/{self.repo}')
         if path.startswith('milestones'):
             return [{'id': item['number'], 'title': item['title']} for item in self.all('milestones?state=open')]
         if path.startswith('labels'):
@@ -1032,14 +1042,116 @@ def auto_update():
         os.execv(sys.executable, [sys.executable, '-m', 'taskq', *sys.argv[1:]])
 
 
+def queue_labels():
+    """Every label the queue uses: state, runtime, type, problem, priority, area."""
+    return ([PREFIX + state for state in STATES] + [RUN + runtime for runtime in RUNTIMES] + list(TYPES) + [PROBLEM]
+            + [f'priority-{level}' for level in PRIORITIES] + ['area-' + name for name in AREAS])
+
+
+def probe(command):
+    """The exit code of a read-only CLI check; None when the program is not installed."""
+    try:
+        return subprocess.run(command, capture_output=True, timeout=60).returncode
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return 1
+
+
+def doctor(args):
+    """Is this project ready for the queue? Prints each gap with the command that closes it, exit 1 while any is
+    open; prints one line and exits 0 when none is. Reads only: no config, label, board or credential changes
+    (manager onboarding: report, agree, then `init`)."""
+    gaps = []
+    gap = lambda what, fix: gaps.append(f'- {what}\n    {fix}')
+    found = re.match(r'(?:\w+://)?(?:[^@/]+@)?([^:/]+)(?::\d+)?[:/](.+?)(?:\.git)?/?$', git('remote', 'get-url', 'origin') or '')
+    origin = found and (found[1], found[2])
+    if not origin:
+        gap('no git remote `origin` in this checkout', 'git remote add origin <repository URL>')
+    config = PROJECT_PATH is not None
+    if not config:
+        try:
+            configure(write=False)
+            config = True
+        except SystemExit as error:
+            if 'no taskq.toml' in str(error) and origin:
+                kind = '--github' if 'gitlab' not in origin[0] else '--project'
+                host = '' if origin[0] == 'github.com' else f' --host {origin[0]}'
+                gap('no taskq.toml', f'taskq init {kind} {origin[1]}{host}  (writes taskq.toml, labels and board)')
+            else:
+                gap(str(error).removeprefix('taskq: '), 'fix taskq.toml (keys: `taskq contract`, README)')
+    github = not BOARDS if config else bool(origin) and 'gitlab' not in origin[0]
+    host = HOST or (origin[0] if origin else None)
+    if config and origin and (origin[1].lower() != PROJECT_PATH.lower() or (HOST and origin[0] != HOST)):
+        gap(f'origin is {origin[0]}/{origin[1]}, taskq.toml names {HOST or ""}{"/" * bool(HOST)}{PROJECT_PATH}',
+            'run taskq from that project\'s checkout, or fix [github] repo / [gitlab] project and host in taskq.toml')
+    if config or origin:
+        cli = 'gh' if github else 'glab'
+        status = probe([cli, 'auth', 'status', *(['--hostname', host] if host else [])])
+        if status is None:
+            gap(f'`{cli}` is not installed', f'brew install {cli}  (or the package manager of this machine)')
+        elif status:
+            gap(f'`{cli}` is not logged in{f" to {host}" if host else ""}', f'{cli} auth login{f" --hostname {host}" if host else ""}  (the person runs it: OAuth in the browser)')
+    if gaps or not config:
+        return report_gaps(gaps)
+    checks = (('write permission', lambda: write_access(github)), ('labels', queue_labels_missing),
+              ('board', lambda: board_gaps(github, host)))
+    for name, check in checks:
+        try:
+            for what, fix in check():
+                gap(what, fix)
+        except SystemExit as error:
+            gap(f'{name} could not be read: {str(error).removeprefix("taskq: ")}', 'fix the cause above, then `taskq doctor` again')
+    report_gaps(gaps)
+
+
+def write_access(github):
+    if github:
+        push = api('GET', 'repository')['permissions']['push']
+    else:  # Developer (30) or above may push and edit issues
+        push = max((level or {}).get('access_level', 0) for level in api('GET', '/' + PROJECT)['permissions'].values()) >= 30
+    return [] if push else [(f'this account cannot write to {PROJECT_PATH}',
+                             f'ask an owner of {PROJECT_PATH} for write access (GitLab: Developer or above)')]
+
+
+def queue_labels_missing():
+    have = {label['name'] for label in pages('labels')}
+    missing = [name for name in queue_labels() if name not in have]
+    return [(f'labels missing: {", ".join(missing)}', 'taskq init')] if missing else []
+
+
+def board_gaps(github, host):
+    if not github:
+        board = next((board for board in api('GET', 'boards') if board['name'] == BOARD), None)
+        columns = board and [item['label']['name'] for item in sorted(board['lists'], key=lambda item: item['position'])]
+        want = [PREFIX + state for state in STATES]
+        return [] if columns == want else [(f'board {BOARD} ' + ('missing' if board is None else f'columns are {columns}, not {want}'), 'taskq init')]
+    board = api('GET', 'board')
+    if board is False:
+        return [('the gh token lacks the scope `project`: no Projects v2 board', f'gh auth refresh -h {host or "github.com"} -s project  (the person confirms in the browser)')]
+    if not board:
+        return [(f'no Projects v2 board {BOARD}', 'taskq init')]
+    owner, name = PROJECT_PATH.split('/')
+    return ([(f'board {BOARD} Status options are {list(board["options"])}, not {list(STATES)}', 'taskq init')]
+            * (list(board['options']) != list(STATES))
+            + [(f'board {BOARD} is not linked to {PROJECT_PATH}', f'gh project link {board["number"]} --owner {owner} --repo {name}')]
+            * (not board['linked']))
+
+
+def report_gaps(gaps):
+    if not gaps:
+        return print(f'ready: {PROJECT_PATH} — config, CLI login, write access, labels and board {BOARD}')
+    print(f'not ready: {len(gaps)} gap(s); each line is the command that closes it\n' + '\n'.join(gaps))
+    sys.exit(1)
+
+
 def migrate(args):
     """`init`: a new project, and once per schema change; idempotent. Labels for every state, runtime, type and
     priority; the board with one list
     per state in STATES order; state labels taskq no longer has leave the board, and leave GitLab once no
     issue carries them; every open task gets its `relates_to` links. Claims, results and history stay."""
     have = {label['name']: label for label in pages('labels')}
-    for name in ([PREFIX + state for state in STATES] + [RUN + runtime for runtime in RUNTIMES] + list(TYPES) + [PROBLEM]
-                 + [f'priority-{level}' for level in PRIORITIES] + ['area-' + name for name in AREAS]):
+    for name in queue_labels():
         if name not in have:
             have[name] = api('POST', 'labels', {'name': name, 'color': '#6699cc'})
     board = cards = None
@@ -2509,9 +2621,10 @@ def selftest(args):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
     if PROJECT is None:
         try:
-            configure()  # before the parser: [runtimes] in taskq.toml adds choices
+            configure(write=argv[:1] != ['doctor'])  # before the parser: [runtimes] in taskq.toml adds choices
         except SystemExit:
             pass  # no taskq.toml yet: `init --project` writes it, `contract` and `update` need none
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
@@ -2568,6 +2681,7 @@ def main(argv=None):
                 (('--github',), {'help': 'GitHub repository owner/name: writes a minimal taskq.toml here if none'}),
                 (('--host',), {'help': 'host for that taskq.toml, e.g. gitlab.example.com'}))
     command('contract', contract)
+    command('doctor', doctor)
     command('update', update, (('--verbose',), {'action': 'store_true', 'help': 'say why a check was skipped'}))
     command('report', report, (('--hours',), {'type': int, 'default': 24}))
     command('selftest', selftest, (('--scope',), {'choices': ('quick', 'full', 'check'), 'default': 'quick'}),
@@ -2584,7 +2698,7 @@ def main(argv=None):
         Path('taskq.toml').write_text(f'# taskq: this project\'s task queue; keys: `taskq contract`, README of taskq.\n'
                                       f'{section} = "{where}"\n' + (f'host = "{args.host}"\n' if args.host else ''))
         print(f'wrote taskq.toml for {where}')
-    if PROJECT is None and args.function not in (contract, update):
+    if PROJECT is None and args.function not in (contract, update, doctor):
         configure()
     args.function(args)
 

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -21,8 +22,7 @@ from urllib.parse import quote
 PROJECT = PROJECT_PATH = ROOT = TICK_BEAT = HELPERS = None  # GitLab API prefix, `relates_to` target, main checkout
 HOST = None  # GitLab host for glab; None: glab's own choice (the git remote of the current directory)
 BOARD = 'taskq'
-# Tasks in `doing` at once per runtime; lower one (e.g. codex to 1) when the machine cannot keep up.
-LIMIT = {'claude': 2, 'codex': 3}
+AREAS = ()
 CODEX_PROJECT = CODEX_SECTION = None  # the Codex app's project and sidebar section for worker threads
 WORKSPACE = {
     'continue': 'this task was started before in worktree `taskq-{iid}` (`git worktree list` shows its path); continue there. If it is gone, create it: `git worktree add -b taskq-{iid} ../taskq-{iid} origin/main`.',
@@ -38,7 +38,7 @@ SUMMARY_SECONDS = 24 * 3600  # questions already shown come back as one summary 
 TYPES = ('code', 'docs', 'research', 'asset')  # the type label is the bare name
 STALE_MINUTES = 120  # a `doing` issue this long without any change goes back to the queue
 # The lock is this award emoji on the task's issue: GitLab lets one user award one name once (404 on the
-# second), and every session works as the same GitLab user. A lock this old on a task nobody holds is a crash's.
+# second). Across users the earliest reaction wins. An old lock on an unheld task is a crash's.
 LOCK, LOCK_SECONDS = 'lock', 120
 PROBLEM = 'problem'  # label of an issue for a problem without a task
 CLEANUP_DAYS = 30  # cleanup reads open issues and the ones closed this recently, not the whole history
@@ -98,7 +98,7 @@ def main_checkout(start):
 
 def configure(path=None):
     """Load the project's taskq.toml: `path`, else the nearest one from the current directory up."""
-    global RULES, HOST, PROJECT, PROJECT_PATH, BOARD, LIMIT, CODEX_PROJECT, CODEX_SECTION, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER
+    global RULES, HOST, PROJECT, PROJECT_PATH, BOARD, AREAS, CODEX_PROJECT, CODEX_SECTION, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER
     import tomllib
     here = Path.cwd()
     path = Path(path) if path else next((folder / 'taskq.toml' for folder in (here, *here.parents)
@@ -111,7 +111,7 @@ def configure(path=None):
     # `projects/:id` makes glab look the project up first: +1 s per request (measured 2026-10-06).
     PROJECT = 'projects/' + quote(PROJECT_PATH, safe='')
     BOARD = gitlab.get('board', BOARD)
-    LIMIT = dict(config.get('limit', LIMIT))
+    AREAS = tuple(config.get('areas', {}).get('names', ()))
     CODEX_PROJECT, CODEX_SECTION = codex.get('project'), codex.get('section')
     WORKSPACE.update({key: workspace[key] for key in WORKSPACE if key in workspace})
     RETIRE, HELPERS = workspace.get('retire'), workspace.get('cleanup_helpers')
@@ -128,7 +128,7 @@ def session():
 
 
 def me():
-    return session() or fail('no session identity: set ' + ' or '.join(RUNTIMES.values()))
+    return {**(session() or fail('no session identity: set ' + ' or '.join(RUNTIMES.values()))), 'host': socket.gethostname()}
 
 
 def who():
@@ -137,7 +137,7 @@ def who():
 
 
 def api(method, path, body=None):
-    command = ['glab', 'api', '-X', method, f'{PROJECT}/{path}'] + (['--hostname', HOST] if HOST else [])
+    command = ['glab', 'api', '-X', method, path[1:] if path.startswith('/') else f'{PROJECT}/{path}'] + (['--hostname', HOST] if HOST else [])
     if body is not None:
         command += ['--input', '-', '-H', 'Content-Type: application/json']
     done = subprocess.run(command, input=json.dumps(body) if body is not None else None,
@@ -167,6 +167,7 @@ def parse(issue):
     return {**json.loads(found.group(1)), 'iid': issue['iid'], 'title': issue['title'], 'state': states[0],
             'type': next((label for label in labels if label in TYPES), None),
             'runtime': next((label[len(RUN):] for label in labels if label.startswith(RUN)), None),
+            'assignees': [user['id'] for user in issue.get('assignees', [])],
             'priority': min([int(label[9:]) for label in labels if re.fullmatch(r'priority-\d', label)] or [9]),
             'age': int(time.time() - stamp(issue['updated_at'])) // 60,
             'text': BLOCK.sub('', issue['description']).strip()}
@@ -191,11 +192,11 @@ def issues(query='state=opened'):
     return pages(f'issues?{query}')
 
 
-def load():
+def load(query=''):
     """Every open task by priority, the numbers of all open issues (for dependencies), the open issues
     with a task block that are not valid tasks (a card moved off the board's state columns by hand),
     and the open problem issues."""
-    opened = issues()
+    opened = issues('state=opened' + ('&' + query if query else ''))
     found = sorted(filter(None, map(parse, opened)), key=lambda item: (item['priority'], item['iid']))
     odd = [issue for issue in opened if BLOCK.search(issue.get('description') or '') and not parse(issue)]
     problems = [issue for issue in opened if PROBLEM in issue['labels']]
@@ -212,7 +213,7 @@ def task(iid, states=STATES):
     return found
 
 
-def save(current, state=None, note_action=None, note_text='', close=False, add=(), remove=(), **changes):
+def save(current, state=None, note_action=None, note_text='', close=False, add=(), remove=(), assignee_ids=None, **changes):
     """One PUT moves the labels and the block together; the note is the readable history."""
     block = {key: current.get(key) for key in FIELDS}
     block.update(changes)
@@ -220,6 +221,8 @@ def save(current, state=None, note_action=None, note_text='', close=False, add=(
     if state and state != current['state']:
         add, remove = add + [PREFIX + state], remove + [PREFIX + current['state']]
     body = {'description': render(current['text'], block), **labels(add, remove)}
+    if assignee_ids is not None:
+        body['assignee_ids'] = assignee_ids
     if close:
         body.update(state_event='close', remove_labels=PREFIX + current['state'])
     api('PUT', f'issues/{current["iid"]}', body)
@@ -258,21 +261,65 @@ def overlap(left, right):
     return any(a == b or a.startswith(b + '/') or b.startswith(a + '/') for a in left for b in right)
 
 
-def room(everything):
-    """Free `doing` places per runtime; a doing task counts for the runtime that took it."""
-    taken = [(other['claim'] or {}).get('runtime') for other in everything if other['state'] == 'doing']
-    return {name: limit - taken.count(name) for name, limit in LIMIT.items()}
+def user():
+    return api('GET', '/user')['id']
+
+
+def limits(text):
+    found = {'claude': 2, 'codex': 3}
+    if not text:
+        return found
+    for pair in text.split(','):
+        match = re.fullmatch(r'(claude|codex)=(\d+)', pair)
+        if not match:
+            raise argparse.ArgumentTypeError('expected claude=N,codex=M with non-negative integers')
+        found[match[1]] = int(match[2])
+    return found
+
+
+def local_claim(claim):
+    if claim.get('host'):
+        return claim['host'] == socket.gethostname()
+    # Upgrade existing claims from local app evidence, without editing someone else's task.
+    sid = claim.get('session')
+    if not sid:
+        return False
+    if claim.get('runtime') == 'claude':
+        return any(CLAUDE_APP_SESSIONS.glob(f'*/*/local_{sid}.json'))
+    if claim.get('runtime') == 'codex':
+        root = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex'))
+        return any(any((root / folder).glob(f'**/*-{sid}.jsonl')) for folder in ('sessions', 'archived_sessions'))
+    return False
+
+
+def room(everything, capacity):
+    taken = [(item['claim'] or {}).get('runtime') for item in everything
+             if item['state'] == 'doing' and local_claim(item['claim'] or {})]
+    return {name: count - taken.count(name) for name, count in capacity.items()}
+
+
+def eligible(item, uid, mine=False):
+    assigned = item.get('assignees', [])
+    return assigned == [uid] or (not assigned and not mine)
+
+
+def profile(args):
+    # Filtering must not hide dependency or scope owners. Keep the unfiltered safety inventory.
+    loaded = load()
+    matching = load(args.filter)[0] if args.filter else loaded[0]
+    uid = user()
+    candidates = [item for item in matching if eligible(item, uid, args.mine)]
+    print(f'Profile: filter={args.filter!r}; mine={args.mine}; limit=' +
+          ','.join(f'{name}={count}' for name, count in args.limit.items()) + f'; candidates={len(candidates)}')
+    if args.filter and not candidates:
+        print('Warning: nonempty filter returned 0 candidates; check the GitLab filter.')
+    return loaded, candidates
 
 
 def refusal(candidate, everything, open_iids, runtime=None):
     """Why this ready task cannot start now (in a session of `runtime`, if named), or None. The only admission rule."""
     if runtime and candidate['runtime'] not in (None, runtime):
         return f'runtime is {candidate["runtime"]}'
-    free = room(everything)
-    # An `any` task listed without a session needs room at either runtime.
-    who = [candidate['runtime'] or runtime] if candidate['runtime'] or runtime else list(LIMIT)
-    if all(free[name] <= 0 for name in who):
-        return ', '.join(f'limit {LIMIT[name]} reached for {name}' for name in who)
     waiting = sorted(set(candidate['deps']) & open_iids)
     if waiting:
         return f'open dependencies {waiting}'
@@ -291,7 +338,11 @@ def startable(runtime=None, loaded=None):
 def lock(iid):
     """True: this call set the lock. False: it was already set (GitLab answers 404 «has already been taken»)."""
     try:
-        api('POST', f'issues/{iid}/award_emoji', {'name': LOCK})
+        award = api('POST', f'issues/{iid}/award_emoji', {'name': LOCK})
+        first = min(locks(iid), key=lambda item: (stamp(item['created_at']), item['id']))
+        if first['id'] != award['id']:
+            api('DELETE', f'issues/{iid}/award_emoji/{award["id"]}')
+            return False
         return True
     except SystemExit as error:
         if 'has already been taken' in str(error):
@@ -304,7 +355,10 @@ def locks(iid):
 
 
 def unlock(iid):
+    uid = user()
     for item in locks(iid):
+        if item['user']['id'] != uid:
+            continue
         api('DELETE', f'issues/{iid}/award_emoji/{item["id"]}')
 
 
@@ -325,11 +379,16 @@ def need_owner(current):
 def add(args):
     if not args.goal.strip() or not args.acceptance.strip():
         fail('a task needs a goal and an acceptance')
+    unknown = set(args.area) - set(AREAS)
+    if unknown:
+        fail(f'unknown areas {sorted(unknown)}; configure [areas] names and run init')
     runtime = DEFAULT_RUNTIME[args.type] if args.runtime is None else None if args.runtime == 'any' else args.runtime
     block = {'scope': args.scope, 'deps': args.deps, 'claim': None, 'waiting_for': None, 'result': None}
     text = f'## Goal\n\n{args.goal}\n\n## Acceptance\n\n{args.acceptance}'
-    labels = [f'{PREFIX}ready', f'priority-{args.priority}', args.type] + ([RUN + runtime] if runtime else [])
+    labels = [f'area-{area}' for area in args.area] + [f'{PREFIX}ready', f'priority-{args.priority}', args.type] + ([RUN + runtime] if runtime else [])
     body = {'title': args.title, 'description': render(text, block), 'labels': ','.join(labels)}
+    if args.mine:
+        body['assignee_ids'] = [user()]
     if args.milestone:
         body['milestone_id'] = milestone_id(args.milestone)
     issue = api('POST', 'issues', body)
@@ -395,13 +454,18 @@ def brief(current):
 
 def worker(args):
     """What a fresh worker session runs first: the brief of the first task that can start now."""
-    found = startable(me()['runtime'])
-    print(brief(found[0]) if found else 'No task can start now. Say so and stop.')
+    loaded, candidates = profile(args)
+    runtime = me()['runtime']
+    free = room(loaded[0], args.limit)
+    found = [item for item in candidates if item['state'] == 'ready' and free[runtime] > 0
+             and not refusal(item, loaded[0], loaded[1], runtime)]
+    print(brief(found[0]).replace(f'{TOOL} worker`', f'{TOOL} worker{profile_arguments(args)}`')
+          if found else 'No task can start now. Say so and stop.')
 
 
 def take(args):
-    """Check the admission rule, set the lock, move the task to doing. The lock decides one task; LIMIT and
-    scope are rules between tasks, so after the move the newer of two overlapping takes gives way."""
+    """Check the admission rule, set the lock, move the task to doing. The lock decides one task;
+    Scope is a rule between tasks, so after the move the newer of two overlapping takes gives way."""
     mine = me()
     everything, open_iids, *_ = load()
     current = next((item for item in everything if item['iid'] == args.iid), None) or fail(f'#{args.iid} is not an open taskq task')
@@ -414,7 +478,7 @@ def take(args):
         fail(f'#{args.iid} cannot start: {reason}')
     if not lock(args.iid):
         fail(f'#{args.iid} cannot start: another worker holds its lock')
-    save(current, 'doing', claim=mine, result=None, waiting_for=None)
+    save(current, 'doing', claim=mine, result=None, waiting_for=None, assignee_ids=[user()])
     held = {**current, 'state': 'doing'}
     # A task without paths overlaps nothing: no second read.
     rivals = current['scope'] and [other for other in load()[0] if other['iid'] != args.iid and (other['claim'] or {}).get('session')
@@ -424,7 +488,8 @@ def take(args):
         since = doing_since(args.iid)
         older = [other for other in rivals if (doing_since(other['iid']), other['iid']) < (since, args.iid)]
         if older:
-            save(held, 'ready', claim=current['claim'], result=current['result'], waiting_for=current['waiting_for'])
+            save(held, 'ready', claim=current['claim'], result=current['result'], waiting_for=current['waiting_for'],
+                 assignee_ids=current.get('assignees', []))
             unlock(args.iid)
             fail(f'#{args.iid} cannot start: scope overlaps #{older[0]["iid"]}')
     note(args.iid, 'take')
@@ -468,7 +533,7 @@ def requeue(args):
     release: drop a dead worker's claim. The next worker session continues with the full history."""
     current = task(args.iid, {'answer': ('ask', 'later'), 'reject': ('review',)}.get(args.action, STATES))
     claim = current['claim'] or {}
-    if args.action == 'answer' and claim.get('session') and claim == session():
+    if args.action == 'answer' and claim.get('session') and {key: claim.get(key) for key in ('runtime', 'session')} == session():
         # The owner answered in the worker's own session: it continues with its claim. Its doing place
         # was free while the task waited in ask, so the limit is not checked: the worker never left.
         save(current, 'doing', 'answer', args.text, waiting_for=None)
@@ -557,7 +622,7 @@ def migrate(args):
     issue carries them; every open task gets its `relates_to` links. Claims, results and history stay."""
     have = {label['name']: label for label in pages('labels')}
     for name in ([PREFIX + state for state in STATES] + [RUN + runtime for runtime in RUNTIMES] + list(TYPES) + [PROBLEM]
-                 + [f'priority-{level}' for level in PRIORITIES]):
+                 + [f'priority-{level}' for level in PRIORITIES] + ['area-' + name for name in AREAS]):
         if name not in have:
             have[name] = api('POST', 'labels', {'name': name, 'color': '#6699cc'})
     board = next((board for board in api('GET', 'boards') if board['name'] == BOARD), None) or api('POST', 'boards', {'name': BOARD})
@@ -1060,11 +1125,22 @@ def tick_beat():
     print(f'Last tick: {minutes} min ago{live}.')
 
 
+def profile_arguments(args):
+    flags = (' --filter ' + shlex.quote(args.filter) if args.filter else '') + (' --mine' if args.mine else '')
+    flags += ' --limit ' + ','.join(f'{name}={count}' for name, count in args.limit.items())
+    return flags
+
+
+def worker_prompt(args):
+    return WORKER.replace(f'{TOOL} worker`', f'{TOOL} worker{profile_arguments(args)}`')
+
+
 def tick(args):
     """One pass of the coordinator: release dead claims itself, then print exactly what to do."""
     tick_beat()
-    loaded = load()
-    stalled = [item for item in loaded[0] if item['state'] == 'doing' and item['age'] > STALE_MINUTES]
+    loaded, candidates = profile(args)
+    selected = {item['iid'] for item in candidates}
+    stalled = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and item['age'] > STALE_MINUTES]
     for item in stalled:
         args.iid, args.action, args.text = item['iid'], 'release', f'no change on the issue for {item["age"]} minutes'
         requeue(args)
@@ -1073,12 +1149,14 @@ def tick(args):
     # A lock on a task nobody holds: a take that died between the lock and the move, or a card moved by hand.
     held = {item['iid'] for item in loaded[0] if item['state'] not in ('ready', 'waiting')}
     for issue in issues(f'state=opened&my_reaction_emoji={LOCK}'):
-        if issue['iid'] not in held and all(time.time() - stamp(item['created_at']) > LOCK_SECONDS for item in locks(issue['iid'])):
+        if issue['iid'] in selected and issue['iid'] not in held and all(time.time() - stamp(item['created_at']) > LOCK_SECONDS for item in locks(issue['iid'])):
             unlock(issue['iid'])
             print(f'Unlocked #{issue["iid"]}: nobody holds it.')
     # Only tick moves ready<->waiting: a card a hand moved between them goes back here.
     moved = 0
     for item in loaded[0]:
+        if item['iid'] not in selected:
+            continue
         open_deps = sorted(set(item['deps']) & loaded[1])
         if item['state'] == 'ready' and open_deps:
             save(item, 'waiting', 'waiting', f'open dependencies {open_deps}')
@@ -1089,6 +1167,8 @@ def tick(args):
         moved += 1
         print(f'Moved #{item["iid"]} {item["state"]} → {"ready" if item["state"] == "waiting" else "waiting"}.')
     everything, _, odd, problems = loaded = load() if moved else loaded
+    inventory = everything
+    everything = [item for item in everything if item['iid'] in selected]
     review = [item for item in everything if item['state'] == 'review' and item['result']]
     # A question reaches the owner once, when it is new; the ones already shown come back as a daily summary.
     asked = [(item, *question(item['iid'])) for item in everything if item['state'] == 'ask']
@@ -1102,8 +1182,10 @@ def tick(args):
         for item in everything if item['state'] == 'doing' and not (item['claim'] or {}).get('session')] + [
         f'#{item["iid"]} is in review without a result: `reject {item["iid"]}` or close it by hand'
         for item in everything if item['state'] == 'review' and not item['result']]
-    free, start = room(everything), []
+    free, start = room(inventory, args.limit), []
     for item in startable(loaded=loaded):
+        if item['iid'] not in selected:
+            continue
         who = item['runtime'] or max(free, key=free.get)
         if free[who] > 0:
             free[who] -= 1
@@ -1157,7 +1239,7 @@ def tick(args):
     if start:
         print(f'## Start {len(start)} worker session(s)\n\n'
               f'Each worker is a new visible session of your own app that receives exactly this prompt:\n\n'
-              f'    {WORKER}\n\n'
+              f'    {worker_prompt(args)}\n\n'
               f'Runtime of each: ' + ', '.join(f'#{item["iid"]} {item["runtime"]}' for item in start) + '.\n'
               f'Claude worker: `{TOOL} spawn --restore <session id of the focused pane from the window layout '
               f'tool>` (keeps the owner\'s window where it was), then send the prompt to the printed `local_<id>` with the session '
@@ -1477,10 +1559,14 @@ def main(argv=None):
             (('--scope',), {'nargs': '*', 'default': []}), (('--deps',), {'nargs': '*', 'type': int, 'default': []}),
             (('--priority',), {'type': int, 'choices': PRIORITIES, 'default': 2}),
             (('--milestone',), {'help': 'milestone title: the epic this task belongs to'}),
-            (('--runtime',), {'choices': (*RUNTIMES, 'any'), 'help': 'only a session of this app may take it; default by type'}))
+            (('--runtime',), {'choices': (*RUNTIMES, 'any'), 'help': 'only a session of this app may take it; default by type'}),
+            (('--mine',), {'action': 'store_true'}), (('--area',), {'nargs': '+', 'default': []}))
     command('runtime', set_runtime, iid, (('runtime',), {'choices': (*RUNTIMES, 'any')}))
     command('list', listing)
-    command('worker', worker)
+    profile_flags = ((('--filter',), {'default': '', 'help': 'GitLab issues query string, passed unchanged'}),
+                     (('--mine',), {'action': 'store_true'}),
+                     (('--limit',), {'type': limits, 'default': limits(''), 'metavar': 'claude=N,codex=M'}))
+    command('worker', worker, *profile_flags)
     command('take', take, iid)
     command('beat', beat, iid)
     command('ask', ask, iid, text)
@@ -1491,7 +1577,7 @@ def main(argv=None):
     command('later', later, iid, text)
     command('edit', edit, iid, (('--deps',), {'nargs': '*', 'type': int}),
             (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}))
-    command('tick', tick)
+    command('tick', tick, *profile_flags)
     command('spawn', spawn, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),
             (('--name',), {'default': 'taskq worker', 'help': 'Codex thread name'}),
             (('--restore',), {'help': 'Claude: session to show again after the import (the focused pane)'}))

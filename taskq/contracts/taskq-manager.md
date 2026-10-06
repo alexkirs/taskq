@@ -21,6 +21,46 @@ the owner. Two roles (owner's decision, 2026-10-06):
 
 The session replies with the role it took and what is in the queue now.
 
+## New person: one confirmation card, three steps
+
+1. Tell the session what you do, what you exclude, whether you want only your assignments,
+   and how many Claude/Codex sessions this machine can run. The session reads the project's
+   area labels and translates your words into CLI arguments. No profile file is written.
+2. Check one card. Example for “maps, only my tasks; no engine; Claude 1, Codex 2”:
+
+   ```text
+   Areas: Maps (area-maps)
+   Assignments: only mine; do not take the shared pool
+   Local sessions: Claude 1 / Codex 2
+   Command: taskq tick --filter "labels=area-maps" --mine --limit claude=1,codex=2
+   Board: https://gitlab.example.com/group/project/-/boards/7?label_name[]=area-maps&assignee_username=me
+   Engine exception: pool task with deps, or manual take; no automatic expansion.
+   ```
+
+   The session resolves the actual board id and current glab username. The board link uses the
+   same label/assignee constraints (GitLab board URL parameters differ from API query parameters).
+   For `--mine`, use the actual username, not the literal `me`. Without `--mine`, the board shows
+   the area pool and assignments; the CLI still excludes other people's assigned tasks locally.
+   Preserve every exclusion. If an API filter cannot be represented by the board UI, say which
+   part cannot be represented instead of claiming an identical board view.
+3. After “ok”, arm the existing 5-minute tick with those exact arguments in its prompt and in
+   the worker prompt it prints. A product-manager role alone does not authorize arming the tick.
+   Check the last-tick age first; do not arm a second coordinator on this machine.
+
+| What the person says | Profile or action |
+|---|---|
+| I do everything | No filter, no `--mine`; own assignments plus shared pool |
+| Only my tasks | `--mine`; shared pool is excluded |
+| Maps, except engine | `--filter "labels=area-maps"`; engine stays outside the profile |
+| My tasks plus unassigned maps | `--filter "labels=area-maps"`, without `--mine` |
+| Owner delegates a task | Set its GitLab assignee to the person; their tick sees it if it matches their filter |
+| A map needs an engine exception | Put an `area-engine` task in the pool with deps, or manually `take N` |
+| We are not doing this yet | `taskq later N --text "reason"`; excluded area stays outside the profile |
+
+Defaults need no setup: all areas, own assignments plus shared pool, local Claude 2 / Codex 3.
+`run-*` still states the app a task needs. Manual `take` assigns the current glab user and keeps
+normal dependency/runtime/scope checks. Limits never arbitrate between machines.
+
 ## 1. Check the place
 
 - The session is an ordinary Claude desktop session (not a routine and not a scheduled run: the app
@@ -45,7 +85,7 @@ Tool `CronCreate` (loaded via ToolSearch), `recurring: true`, `cron: "*/5 * * * 
 `prompt`:
 
 ```
-taskq tick. Run `taskq update; cd <main checkout> && git pull -q --ff-only origin main; taskq tick`
+taskq tick. Run `taskq update; cd <main checkout> && git pull -q --ff-only origin main; taskq tick <confirmed profile arguments>`
 and do the coordinator pass by taskq-manager.md § 3 (`taskq contract` prints its path). Reply in the owner's language,
 one or two lines when nothing changed.
 ```
@@ -86,7 +126,7 @@ free slot). The other runtime will not take the task. One at a time:
    the Codex session id (§ "Other machines").
 2. Send it the worker prompt: Claude — with the `mcp__ccd_session_mgmt__send_message` tool, Codex —
    `taskq codex-send <id> --text "<prompt>"`:
-   `Run \`cd <main checkout> && taskq worker\` and follow the instructions it prints.`
+   Use the exact worker prompt printed by tick, including the confirmed profile arguments.
 3. Workers may be started back to back: `worker` may hand the same task to two concurrent workers,
    but `take` gives it to one, the other is refused and takes the next ([taskq](taskq.md) § Taking a task).
 4. Name the Claude session `T<N> <a few words>` with the `set_session_title` tool (Codex got its name in step 1).

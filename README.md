@@ -35,9 +35,9 @@ git add taskq.toml && git commit -m "taskq: queue config"
 ```
 
 `taskq init` writes a minimal `taskq.toml` when there is none, then creates the labels (`q-*` states,
-`run-*` runtimes, types, `priority-*`, `problem`) and a board `taskq` with one column per state. Running
-it again changes nothing. Every session and machine must use the same GitLab user: the task lock is an
-award emoji that GitLab lets one user set only once.
+`run-*` runtimes, types, `priority-*`, `problem`, configured `area-*`) and a board `taskq` with one column per state. Running
+it again changes nothing. Each person uses their own GitLab account. Automatic selection never takes
+another person's assigned task; unassigned tasks form the shared pool.
 
 ## taskq.toml
 
@@ -50,9 +50,8 @@ project = "group/project"     # required
 host = "gitlab.example.com"   # optional: else glab picks the host from the git remote
 board = "taskq"
 
-[limit]                       # tasks in `doing` at once per runtime
-claude = 2
-codex = 3
+[areas]                       # your project's work areas, labels created by init
+names = ["maps", "engine"]
 
 [codex]                       # needed only for `taskq spawn --runtime codex`
 project = "<Codex app project id>"
@@ -100,6 +99,21 @@ add → ready ⇄ waiting → take → doing → result → review → close
 
 `taskq contract` prints the paths of the full contracts: `taskq.md` (the queue) and `taskq-manager.md`
 (the manager and coordinator session). `taskq --help` lists every command.
+
+## Personal tick
+
+Tell the manager what you work on and what you exclude. It shows one confirmation card with the
+profile command, local session limits and the board link; after your “ok” it arms that profile.
+
+```bash
+taskq tick --filter "labels=area-maps" --mine --limit claude=1,codex=2
+taskq worker --filter "labels=area-maps" --mine --limit claude=1,codex=2
+taskq add --title "…" --goal "…" --acceptance "…" --type code --area maps --mine
+```
+
+No flags: your tasks plus the shared pool in every area, two Claude and three Codex sessions on
+this machine. `--mine` excludes the pool. Manual `take N` assigns any ready task to you.
+Limits live only in the prompt; the global `[limit]` setting is retired.
 
 ## Develop
 

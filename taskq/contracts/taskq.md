@@ -20,6 +20,8 @@ The previous DOT system (`dot_tick.py`, `dot_gitlab.py`, labels `flow-*`) was re
 | Task state | Issue label, exactly one (table in § States). A closed issue is done |
 | Epic | Project milestone, flat, no nesting; `add --milestone`, `edit N --milestone` |
 | Dependencies | `deps` in the block is the source of truth; each dependency also gets a GitLab `relates_to` link (clickable; set by `add` and `edit --deps`, `migrate` adds missing ones) |
+| Work area | Project-configured `area-*` labels; `add --area maps` |
+| Assignee | GitLab user: empty is the shared pool; `add --mine` assigns the author; `take` assigns the current glab user |
 | Runtime | Label `run-claude` or `run-codex`; without one, `any` |
 | Type | Label `code`, `docs`, `research` or `asset` |
 | Priority | Label `priority-1` or `priority-2` |
@@ -45,7 +47,7 @@ It holds no secrets: the token belongs to `glab`.
 | `[gitlab] project` | GitLab project path (`group/project`) | required |
 | `[gitlab] board` | Board name | `taskq` |
 | `[gitlab] host` | GitLab host for `glab` (commands also work outside the project checkout) | `glab` picks it from the current directory's git remote |
-| `[limit] claude`, `codex` | `doing` slots per runtime | 2 and 3 |
+| `[areas] names` | Project work areas; `init` creates `area-*` labels | empty |
 | `[codex] project`, `section` | Codex app project and section for `spawn --runtime codex` | none: `spawn --runtime codex` refuses |
 | `[workspace] new`, `continue`, `none` | Brief text about the workspace; `{iid}` is the task number | `git worktree add` next to the checkout |
 | `[workspace] retire` | What `close` prints to clean up the tree | nothing |
@@ -113,18 +115,30 @@ ready/waiting/later → ask (manager) → answer → ready
                                        review → reject → ready
 ```
 
-- A task starts if its dependencies are closed, its runtime has a free slot in `LIMIT`, and its
-  `scope` does not overlap the paths of a started task. This is one rule: `refusal` in the script.
-- `LIMIT` is a per-runtime dict, currently `{'claude': 2, 'codex': 3}` (owner decision,
-  2026-10-06). A `doing` task counts against whoever took it (`claim.runtime`). If the Mac cannot
-  keep up, the owner lowers one runtime, e.g. `'codex': 1`. An `any` task starts if the runtime of
-  the session taking it has a free slot; `tick` offers it to a runtime with a free slot and names
-  that runtime. A refusal names the runtime: `limit 2 reached for claude`.
+- A task starts when dependencies are closed, its runtime matches the session and its scope does
+  not overlap a started task. Manual `take N` checks these rules, takes any ready task regardless of
+  its assignee, and assigns it to the authenticated `glab` user.
+- `tick` and `worker` accept a profile: `--filter "labels=area-maps"` (a GitLab issues query
+  string, sent unchanged), `--mine` (only assigned to the current user), and
+  `--limit claude=N,codex=M` (local machine slots, default 2 and 3; zero disables a runtime).
+  Without `--mine`, they consider the user's tasks and unassigned tasks, never another user's.
+  No profile file exists: arguments live in the tick prompt and are passed to each worker.
+  Every pass prints the profile and candidate count; a nonempty filter with no candidates warns.
+- Capacity counts `doing` claims on this machine, across areas. New claims record the hostname;
+  pre-upgrade claims are recognized by local Claude import records or local Codex rollout files.
+  Legacy detection reads only matching local filenames and does not need an app server.
+  Limits are local scheduling guidance, not a global admission gate or cross-machine
+  arbitration. Manual `take` does not enforce them.
+- Filtered selection keeps a separate unfiltered safety inventory for dependencies and scope
+  conflicts. A dependency outside the profile still blocks its task. Profiles never expand
+  automatically: an exceptional area goes into the pool with deps, or is taken manually.
+- Ask and review are routed only to the assigned user's tick (and must match its area filter).
+  Unassigned tasks remain in the shared pool. The owner can see all states on the project board.
 - After `answer`, `reject` and `release` the task returns to `ready` together with its branch and
   worktree; `claim` is reset. The next worker from either app gets the full history and continues.
 - Exception: the owner answers in the worker's own session. `answer N` from the session whose
   `claim` is on the task moves `ask`→`doing` with the same `claim`, without `ready` and without a new `take`.
-  `LIMIT` is not checked: the slot was free only during the question; the worker never left the task.
+  Machine capacity is not checked: the slot was free only during the question; the worker never left the task.
   The worker continues in the same session and delivers `result` itself. An `answer` from the manager,
   the coordinator or the owner's shell (session does not match `claim`) still leads to `ready`. The `worker`
   brief and the `ask` output state this rule.
@@ -143,12 +157,12 @@ on one issue once: a second attempt gets 404 "Award Emoji Name has already been 
 
 `take N`:
 
-1. Reads the queue; the task must be `ready` and pass `refusal` (dependencies, `LIMIT`, `scope`,
+1. Reads the queue; the task must be `ready` and pass `refusal` (dependencies, `scope`,
    runtime). Otherwise it refuses with a reason.
 2. `POST award_emoji name=lock`. 404 means another worker took the task: refusal `another worker holds its lock`;
    the worker runs `worker` again and takes the next one.
 3. One `PUT`: `q-doing` and `claim`.
-4. `LIMIT` and `scope` are rules across tasks; the lock on one issue does not cover them. So after
+4. `scope` is a rule across tasks; the lock on one issue does not cover them. So after
    step 3, if the task has a `scope`, `take` rereads the queue. If a path overlaps another task
    with a `claim`, the one that entered `doing` later gives way: the time is the last
    `add q-doing` label event (`resource_label_events`, GitLab clock); on a tie, the higher number gives way.
@@ -162,21 +176,19 @@ The lock is held while a worker holds the task: in `doing`, `ask`, `review`, and
 is removed by `answer`/`reject`/`release` (a move to `ready`, including the tick returning a stuck `doing`,
 which is the same `release`) and by `close`. An `answer` in the worker's own session keeps the lock: the task
 is `doing` again for the same worker. `take` is idempotent: a task already in `doing` with this session's `claim`
-is accepted again without the lock and without checking `LIMIT` and `scope` ("#N is yours").
+is accepted again without the lock and without checking `scope` ("#N is yours").
 
 An orphan lock comes from a `take` that failed between steps 2 and 3, or from a card moved by hand from
 `ask`/`review` to `ready`. `tick` finds these with one request (`issues?my_reaction_emoji=lock`) and
 removes a lock older than `LOCK_SECONDS` (120 s) from a task in `ready`/`waiting` or from an issue that is
 not a task ("Unlocked #N"). While the lock is younger, it may belong to a `take` in progress.
 
-**Known property:** during a race of a few seconds the last `LIMIT` slot can go to two workers, so
-`LIMIT` is exceeded by one. Tick then starts no new workers for that runtime until a slot
-frees up.
-
-**Single-user rule.** All sessions and machines access GitLab as one user
-(the same GitLab user, `glab` token). The lock is that user's reaction; a second user would put
-their own `lock` reaction next to it without a 404, and two workers would take one task. A new machine
-uses the same GitLab user, not a separate bot.
+**Multiple GitLab users.** Each person uses their own `glab` account. Reactions are unique per
+user, so `take` also reads all lock reactions after posting its own. The earliest reaction wins
+(creation time, then reaction id); a losing user deletes only their own reaction and gets refused.
+`unlock` removes only the current user's reactions. This is optimistic ordering, not a GitLab
+transaction across reaction and issue updates; live concurrent verification is required per project.
+An orphan reaction owned by another user must be cleared by that user; taskq does not delete it.
 
 ## Scheduled runs
 
@@ -207,7 +219,7 @@ Scheduling and creating sessions is an app action, not a script action.
 - `taskq runtime N claude|codex|any` changes the runtime label of a task in `ready`, `waiting`, `ask`
   or `later` and writes a note to the issue; in `doing` and `review` it refuses.
 
-Two coordinators and two workers on different machines at the same time are safe: the lock decides who takes a task
+Workers on different machines share scope and lock checks: the lock decides who takes a task
 (§ Taking a task); the extra worker gets a refusal and "No task can start now".
 
 ## Cleanup
@@ -236,7 +248,7 @@ issue and does not know the session; notes give the same and more.
 
 ## Schema and migration
 
-`taskq init` (former name `migrate`) is one idempotent command: it creates state, runtime, type and priority labels,
+`taskq init` (former name `migrate`) is one idempotent command: it creates state, runtime, type, priority and project-configured area labels,
 the `taskq` board with one column per state in `STATES` order, removes board columns for states that
 no longer exist, deletes their label when no issue carries it (otherwise prints which issues still have it),
 and adds `relates_to` links by `deps` of open tasks. `claim`, `result` and history are unchanged.
@@ -245,16 +257,17 @@ umbrella" was split into `waiting`, `later`, `ask` and milestones per a layout a
 
 ## Long-term mechanism audit (2026-10-06)
 
-Measured on a live project on 2026-10-06: 249 issues total, 35 open, 214 closed in 30 days,
+Historical baseline before personal profiles (#257), measured on a live project on 2026-10-06: 249 issues total, 35 open, 214 closed in 30 days,
 192 changed in one day. One `glab api` request takes 1.2–1.5 s, almost all of it `glab` startup and network.
 The open-issue list is 448 KiB (≈13 KiB per issue: full descriptions; the API has no field selection).
-"Before" is the code before the audit, "after" is after. No regular path reads closed issues
-in full any more: history growth does not slow `tick`, `take`, `list` or `worker`.
+"Before" is the code before the audit, "after" is after. Profiles add a user lookup and, when filtered, a selection query beside the safety inventory;
+lock acquisition adds a cross-user reaction read. No regular path reads closed issues
+in full: history growth does not slow `tick`, `take`, `list` or `worker`.
 
 | Mechanism | GitLab requests now (measured) | How it grows | What accumulates | Who cleans up | Verdict |
 |---|---|---|---|---|---|
 | `take` | Before: 6 + `SETTLE` 1 s (claim, service-issue notes, queue, PUT, note, claim deletion). After: 5: queue ×2, lock, PUT, note; 899 KiB, 9.1 s. Without `scope`: 4. On a `scope` race +1 events request per task, the one giving way +3 | Request count is constant; volume is open issues: 100 open ≈ 1.3 MB per read, 1000 is 10 pages. Closed issues and notes do not matter | One `lock` reaction per task while held | `release`/`reject`/`answer`/`close`; a failed `take`'s lock — `tick` after 120 s | ok |
-| Allocation: `LIMIT`, `scope`, runtime, machines | 0: computed from the already-read queue | Linear in open tasks, in memory | Nothing | — | ok; `LIMIT` can be exceeded by one in a race (§ Taking a task) |
+| Allocation: local capacity, `scope`, runtime, machines | 0: computed from the already-read queue | Linear in open tasks, in memory | Nothing | — | ok; local capacity can be exceeded by one in a race (§ Taking a task) |
 | Listing: `list`, `worker` | 1 (queue): 448 KiB, 2.7 s; `worker` + history pages of the chosen task | Pages of 100 open issues | Nothing | — | ok |
 | `tick` | Before: 1 + 1 per task in `ask` + 1 (summary mark in the service issue). After: 2 (queue, locks in one `my_reaction_emoji=lock`): 464 KiB, 4.1 s. Plus per event: 1 per `ask`, history pages per `review`, 2 per ready↔waiting move, ~5 per stuck-task return, 2 per lock removal, a `shown` note | Constant + linear in tasks in `ask`/`review`; every coordinator machine does its own pass | `shown` note: once per new question and once a day while the question waits | The marks are the question's history; not read after the answer | ok |
 | Dependency waiting | 0 beyond `tick`: open numbers from the same queue; 2 per move | Linear in open tasks | One `waiting`/`ready` note per move | History | ok |

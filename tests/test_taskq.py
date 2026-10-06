@@ -77,6 +77,7 @@ class Gitlab:
         self.issues, self.notes, self.labels, self.boards, self.links = {}, {}, {}, [], set()
         self.milestones = [{'id': 5, 'title': 'Maps'}]
         self.awards, self.events = {}, {}  # award emoji by id; label events by issue
+        self.uid = 1
         self.clock = 0
 
     def now(self):
@@ -88,6 +89,8 @@ class Gitlab:
         return sorted(award['iid'] for award in self.awards.values() if award['name'] == q.LOCK)
 
     def __call__(self, method, path, body=None):
+        if path == '/user':
+            return {'id': self.uid}
         if path.startswith('milestones'):
             return self.milestones
         if path.startswith('labels'):
@@ -122,6 +125,7 @@ class Gitlab:
             iid = len(self.issues) + 1
             self.issues[iid] = {'iid': iid, 'state': 'opened', 'web_url': f'url/{iid}', 'title': body['title'],
                                 'description': body['description'], 'labels': body['labels'].split(','),
+                                'assignees': [{'id': uid} for uid in body.get('assignee_ids', [])],
                                 'milestone_id': body.get('milestone_id'), 'updated_at': self.now(), 'created_at': self.now()}
             return self.issues[iid]
         if method == 'GET' and path.startswith('issues?'):
@@ -134,10 +138,10 @@ class Gitlab:
         iid = int(re.match(r'issues/(\d+)', path).group(1))
         if '/award_emoji' in path:
             if method == 'POST':
-                if any(award['iid'] == iid and award['name'] == body['name'] for award in self.awards.values()):
+                if any(award['iid'] == iid and award['name'] == body['name'] and award['user']['id'] == self.uid for award in self.awards.values()):
                     q.fail(f'GitLab POST {path} failed: 404 Award Emoji Name has already been taken Not Found')
                 number = max(self.awards, default=0) + 1
-                self.awards[number] = {'id': number, 'iid': iid, 'name': body['name'], 'created_at': self.now()}
+                self.awards[number] = {'id': number, 'iid': iid, 'name': body['name'], 'user': {'id': self.uid}, 'created_at': self.now()}
                 return self.awards[number]
             if method == 'DELETE':
                 del self.awards[int(path.rsplit('/', 1)[1])]
@@ -163,9 +167,11 @@ class Gitlab:
                 self.issues[iid]['updated_at'] = self.now()
             return self.notes[number]
         issue = self.issues[iid]
+        if method == 'PUT' and 'assignee_ids' in body:
+            issue['assignees'] = [{'id': uid} for uid in body['assignee_ids']]
         if method == 'PUT' and 'milestone_id' in body:
             issue['milestone_id'] = body['milestone_id']
-        elif method == 'PUT':
+        elif method == 'PUT' and 'description' in body:
             issue['description'] = body['description']
             drop = body.get('remove_labels', '').split(',')
             issue['labels'] = [label for label in issue['labels'] if label not in drop]
@@ -183,6 +189,7 @@ class Gitlab:
 
 class Cycle(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(q, 'AREAS', ('maps', 'engine')))
         self.gitlab = Gitlab()
         self.codex, self.ipc = CodexServer(), AppIpc()
         directory = tempfile.TemporaryDirectory()
@@ -285,7 +292,6 @@ class Cycle(unittest.TestCase):
                 if self.state(iid) == 'doing':
                     self.do(COORDINATOR, 'release', iid, '--text', 'next case')
         # Known property: the last place in LIMIT may go to both for the seconds of a race.
-        self.enterContext(patch.dict(q.LIMIT, {'claude': 2}))
         self.do(COORDINATOR, 'release', same, '--text', 'free the place')
         third = {'CLAUDE_CODE_SESSION_ID': 'third-machine', 'CODEX_THREAD_ID': ''}
         self.do(third, 'take', same)
@@ -452,13 +458,11 @@ class Cycle(unittest.TestCase):
         self.assertIn('open dependencies', self.refused(CLAUDE, 'take', third))
         self.assertIn('No task can start', self.do(CODEX, 'worker'))
         self.assertIn('needs --sha', self.refused(CLAUDE, 'result', first, '--text', 'x', '--checks', 'x'))
-        with patch.dict(q.LIMIT, claude=1):
-            self.assertIn('limit 1 reached for claude', self.refused(CLAUDE, 'take', self.add('--type', 'research')))
+        self.assertIn('is yours', self.do(CLAUDE, 'take', self.add('--type', 'research')))
 
     def test_owner_answers_in_the_worker_session_at_a_full_limit(self):
         # The worker asked, the owner answered in the worker's own session while both claude
         # places were taken by others; the worker records the answer and hands in without the coordinator.
-        self.enterContext(patch.dict(q.LIMIT, {'claude': 2}))
         iid = self.add('--type', 'research')
         self.do(CLAUDE, 'take', iid)
         asked = self.do(CLAUDE, 'ask', iid, '--text', 'publish?')
@@ -505,24 +509,111 @@ class Cycle(unittest.TestCase):
         self.do(CODEX, 'take', asset)
         self.assertIn('is doing', self.refused(CLAUDE, 'runtime', asset, 'claude'))
 
-    def test_limit_counts_per_runtime(self):
-        # The test fixes its own limits: the live LIMIT is tuned to what the host can run.
-        self.enterContext(patch.dict(q.LIMIT, {'claude': 2, 'codex': 2}))
-        for _ in range(2):
-            self.do(CLAUDE, 'take', self.add('--type', 'code'))
-        claude, codex = self.add('--type', 'code'), self.add('--type', 'asset')
-        self.assertIn('limit 2 reached for claude', self.refused(CLAUDE, 'take', claude))
-        self.assertIn('limit 2 reached for claude', self.do(CLAUDE, 'list'))
-        anyone = self.add('--type', 'research', '--runtime', 'any')
-        tick = self.do(CLAUDE, 'tick')
-        self.assertIn(f'#{codex} codex, #{anyone} codex', tick)
-        self.assertNotIn(f'#{claude} ', tick.split('Runtime of each')[1])
-        self.assertIn('limit 2 reached for claude', self.refused(CLAUDE, 'take', anyone))
-        self.do(CODEX, 'take', codex)
-        self.do(CODEX, 'take', anyone)
-        self.assertIn('limit 2 reached for codex', self.refused(CODEX, 'take', self.add('--type', 'asset')))
-        self.add('--type', 'research', '--runtime', 'any')
-        self.assertIn('limit 2 reached for claude, limit 2 reached for codex', self.do(CLAUDE, 'list'))
+    def test_profile_limits_are_local_and_manual_take_ignores_them(self):
+        first = self.add('--type', 'code')
+        self.do(CLAUDE, 'take', first)
+        second = self.add('--type', 'code')
+        self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
+        self.assertNotIn('Start 1 worker', self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
+        with patch.object(q.socket, 'gethostname', return_value='another-machine'):
+            self.assertIn(f'take {second}', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
+        self.assertIn('is yours', self.do(CLAUDE, 'take', second))
+        self.assertEqual(self.refused(CLAUDE, 'worker', '--limit', 'claude=-1'), '2')
+
+    def test_legacy_codex_locality_uses_files_without_app_server(self):
+        root = self.directory / 'sessions' / '2026' / '10' / '06'
+        root.mkdir(parents=True)
+        (root / 'rollout-2026-10-06-local-thread.jsonl').write_text('')
+        with patch.dict(os.environ, {'CODEX_HOME': str(self.directory)}):
+            self.assertTrue(q.local_claim({'runtime': 'codex', 'session': 'local-thread'}))
+            self.assertFalse(q.local_claim({'runtime': 'codex', 'session': 'remote-thread'}))
+
+    def test_worker_retry_preserves_profile_arguments(self):
+        self.add('--type', 'code', '--mine', '--area', 'maps')
+        text = self.do(CLAUDE, 'worker', '--filter', 'labels=area-maps', '--mine', '--limit', 'claude=1,codex=0')
+        self.assertIn('taskq worker --filter labels=area-maps --mine --limit claude=1,codex=0', text)
+
+    def test_legacy_local_claims_still_fill_machine_slots(self):
+        for sid in ('234', '240'):
+            iid = self.add('--type', 'code')
+            self.do(CLAUDE, 'take', iid)
+            issue = self.gitlab.issues[iid]
+            current = q.parse(issue)
+            block = {key: current.get(key) for key in q.FIELDS}
+            block['claim'] = {'runtime': 'claude', 'session': sid}
+            issue['description'] = q.render(current['text'], block)
+            folder = self.directory / 'account' / 'org'
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f'local_{sid}.json').write_text('{}')
+        self.add('--type', 'code')
+        with patch.object(q, 'CLAUDE_APP_SESSIONS', self.directory):
+            self.assertNotIn('Start 1 worker', self.do(CLAUDE, 'tick', '--limit', 'claude=2,codex=0'))
+            self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--limit', 'claude=2,codex=0'))
+        with patch.object(q, 'CLAUDE_APP_SESSIONS', self.directory / 'different-machine'):
+            self.assertIn('Start 1 worker', self.do(CLAUDE, 'tick', '--limit', 'claude=2,codex=0'))
+
+    def test_two_users_assignees_pool_manual_take_and_ask(self):
+        mine = self.add('--type', 'code', '--mine', '--area', 'maps')
+        pool = self.add('--type', 'code', '--area', 'maps')
+        self.gitlab.uid = 2
+        self.assertIn(f'take {pool}', self.do(CLAUDE, 'worker', '--filter', 'labels=area-maps'))
+        self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--mine'))
+        self.do(CLAUDE, 'take', pool)
+        self.assertEqual(self.gitlab.issues[pool]['assignees'], [{'id': 2}])
+        self.do(CLAUDE, 'take', mine)
+        self.assertEqual(self.gitlab.issues[mine]['assignees'], [{'id': 2}])
+        self.do(CLAUDE, 'ask', mine, '--text', 'Only second user sees this')
+        self.gitlab.uid = 1
+        self.assertNotIn('Only second user sees this', self.do(CLAUDE, 'tick'))
+        self.gitlab.uid = 2
+        self.assertIn('Only second user sees this', self.do(CLAUDE, 'tick', '--mine'))
+        self.do(CLAUDE, 'answer', mine, '--text', 'yes')
+        self.do(CLAUDE, 'result', mine, '--sha', 'abc123', '--text', 'done', '--checks', 'ok')
+        self.gitlab.uid = 1
+        self.assertNotIn(f'## Review #{mine}', self.do(CLAUDE, 'tick'))
+        self.gitlab.uid = 2
+        self.assertIn(f'## Review #{mine}', self.do(CLAUDE, 'tick', '--mine'))
+        typo = self.do(CLAUDE, 'tick', '--filter', 'labels=area-typo')
+        self.assertIn('candidates=0', typo)
+        self.assertIn('Warning:', typo)
+
+    def test_filter_keeps_dependency_and_scope_safety(self):
+        engine = self.add('--type', 'code', '--area', 'engine', '--scope', 'shared')
+        maps = self.add('--type', 'code', '--area', 'maps', '--deps', engine)
+        self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--filter', 'labels=area-maps'))
+        self.do(CLAUDE, 'take', engine)
+        self.add('--type', 'code', '--area', 'maps', '--scope', 'shared')
+        self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--filter', 'labels=area-maps'))
+
+    def test_two_users_race_one_task_only_first_wins(self):
+        iid = self.add('--type', 'code', '--runtime', 'any')
+        real, raced = self.gitlab, False
+        def interleaved(method, path, body=None):
+            nonlocal raced
+            if not raced and method == 'GET' and '/award_emoji?' in path:
+                raced = True
+                self.gitlab.uid = 2
+                try:
+                    self.assertIn('another worker holds its lock', self.refused(CODEX, 'take', iid))
+                finally:
+                    self.gitlab.uid = 1
+            return real(method, path, body)
+        with patch.object(q, 'api', interleaved):
+            self.assertIn('is yours', self.do(CLAUDE, 'take', iid))
+        self.assertEqual(self.gitlab.issues[iid]['assignees'], [{'id': 1}])
+        self.assertEqual(q.parse(self.gitlab.issues[iid])['claim']['session'], 'claude-session')
+        self.assertEqual(self.gitlab.locked(), [iid])
+
+    def test_cross_user_lock_first_reaction_wins(self):
+        iid = self.add('--type', 'code')
+        self.assertTrue(q.lock(iid))
+        self.gitlab.uid = 2
+        self.assertFalse(q.lock(iid))
+        q.unlock(iid)
+        self.assertEqual(self.gitlab.locked(), [iid])
+        self.gitlab.uid = 1
+        q.unlock(iid)
+        self.assertEqual(self.gitlab.locked(), [])
 
     def test_codex_doing_does_not_block_claude(self):
         for _ in range(2):

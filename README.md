@@ -5,20 +5,28 @@
 
 Your repository board is the task list; your usual AI apps do the work.
 Add taskq, then ask Codex or Claude to turn any request into tickets.
+
 A timer picks up tickets, runs as many workers as you choose, and tracks progress.
 Taskq collects stats and suggests improvements, with no extra worker apps required.
+
 You stay in control: tasks wait for your input and continue when you reply.
 
-1. **Set up (once per project)**<br>
+1. **⚙ Set up (once per project)**<br>
    Tell your agent: "Install taskq from https://github.com/alexkirs/taskq and set it up."
-2. **Start working (each day)**<br>
+
+2. **▶ Start working (each day)**<br>
    "You are the taskq manager. Arm the tick." - workers start on ready tasks
-3. **Talk to the manager**<br>
+
+3. **✎ Talk to the manager**<br>
    "File a task: fix the login redirect." - new task<br>
    "What is in the queue?" - status<br>
    "What should we do next?" - plan<br>
    "Show me the question from #12." - answer a worker<br>
    "Check taskq orchestration." - self-test
+
+**Mix agents, task by task.** Codex makes the visuals, Claude writes the code, another agent runs the tests - in whatever order your work needs.
+Choose each task's agent with `--runtime` (a `run-*` label); use `--deps` to chain tasks.
+Add any other agent through `[runtimes.<name>]`, for example a Grok bot.
 
 <details>
 <summary>Setup, commands and reference</summary>

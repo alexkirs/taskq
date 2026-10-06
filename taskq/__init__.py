@@ -36,7 +36,7 @@ LOCAL, SHARED = None, {}  # its path; [profile] of taskq.toml: team defaults und
 PROFILE_DEFAULTS = {'filter': '', 'mine': False, 'preferred_runtime': None}
 WORKSPACE = {
     'continue': 'this task was started before in worktree `taskq-{iid}` (`git worktree list` shows its path); continue there. If it is gone, create it: `git worktree add -b taskq-{iid} ../taskq-{iid} origin/main`.',
-    'new': 'from the main checkout run `git fetch origin && git worktree add -b taskq-{iid} ../taskq-{iid} origin/main` and work only there.',
+    'new': 'from the main checkout run `git fetch origin && git worktree add -b taskq-{iid} ../taskq-{iid} origin/main` and work only there (`git worktree add` and `cd` in Bash, never the EnterWorktree tool: it prompts for a tree outside .claude/worktrees).',
     'none': 'this task is expected to end in an answer, not a commit: work from the main checkout. If it turns out to need file changes, make a worktree `taskq-{iid}`, work there, push like a code task and name the commit in the result text.',
 }
 RULES = ''  # project rules for workers, from [brief] rules: lines of step 6 of the brief
@@ -1375,6 +1375,8 @@ def doctor(args):
                 gap(what, fix)
         except SystemExit as error:
             gap(f'{name} could not be read: {str(error).removeprefix("taskq: ")}', 'fix the cause above, then `taskq doctor` again')
+    for what, fix in permissions_gap(ROOT):
+        gap(what, fix)
     gaps += runtime_gaps()
     report_gaps(gaps)
 
@@ -1479,20 +1481,34 @@ def report_gaps(gaps):
     sys.exit(1)
 
 
-# What a worker session needs in `<main checkout>/.claude/settings.local.json` (manager contract § 1 merges it).
+# What worker and coordinator sessions need in `<main checkout>/.claude/settings.local.json` (manager contract § 1,
+# «Permissions»: the person merges it once). dontAsk runs the allow list silently and denies the rest: no prompt and no
+# auto-mode classifier. Without it the user's own defaultMode (e.g. `auto`) applies to every session of the checkout.
+PERMISSION_MODE = 'dontAsk'
 WORKER_ALLOW = ('Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Agent', 'Skill',
-                'ToolSearch', 'SendMessage', 'mcp__ccd_session_mgmt', 'mcp__ccd_session', 'mcp__scheduled-tasks', 'mcp__serena')
+                'ToolSearch', 'SendMessage', 'ListAgents', 'CronCreate', 'CronDelete', 'CronList', 'mcp__ccd_session_mgmt',
+                'mcp__ccd_session', 'mcp__scheduled-tasks', 'mcp__serena')  # Cron*, ListAgents: the coordinator's (§ 2, § 3)
 CLAUDE_CONFIG = Path.home() / '.claude.json'  # Claude Code keeps folder trust here, per project path
 
 
 def permissions_missing(root):
-    """WORKER_ALLOW entries the checkout's settings.local.json lacks (all of them without the file); reads only."""
+    """WORKER_ALLOW entries and `defaultMode: dontAsk` the checkout's settings.local.json lacks (all of them without
+    the file); reads only."""
     path = Path(root) / '.claude' / 'settings.local.json'
     try:
-        allow = json.loads(path.read_text()).get('permissions', {}).get('allow', []) if path.exists() else []
+        permissions = json.loads(path.read_text()).get('permissions', {}) if path.exists() else {}
     except json.JSONDecodeError as error:
         fail(f'{path} is not valid JSON ({error}): fix it by hand, taskq does not overwrite it')
-    return [item for item in WORKER_ALLOW if item not in allow]
+    return ([item for item in WORKER_ALLOW if item not in permissions.get('allow', [])]
+            + [f'defaultMode: {PERMISSION_MODE}'] * (permissions.get('defaultMode') != PERMISSION_MODE))
+
+
+def permissions_gap(root):
+    """The doctor line for missing permissions: what is missing, why, and the one command that closes it."""
+    missing = permissions_missing(root)
+    return [(f'{root}/.claude/settings.local.json lacks {", ".join(missing)}: sessions of this checkout stop on '
+             f'prompts or the auto-mode classifier', f'cd {root} && <the permissions command of taskq-manager.md § 1 '
+             f'«Permissions»>  (the person runs it once; taskq never edits permission settings)')] if missing else []
 
 
 def trusted(root):
@@ -1555,11 +1571,9 @@ def setup(args):
         print('ok: labels' + ' and board' * (not scope))
     for fix in scope:
         person(fix, 'a GitHub board needs the token scope `project` (browser consent); until then the queue works with labels only')
-    missing = permissions_missing(ROOT)
-    if missing:
-        person(f'cd {ROOT} && <the permissions command of taskq-manager.md § 1 «Runtime prerequisites»>',
-               f'workers run without prompts only with these in .claude/settings.local.json: {", ".join(missing)}')
-    else:
+    for what, fix in permissions_gap(ROOT):
+        person(fix.split('  (')[0], what)
+    if not permissions_missing(ROOT):
         print('ok: worker permissions')
     if trusted(ROOT):
         print('ok: Claude folder trust')
@@ -2109,7 +2123,8 @@ def claude_env(extra=None):
 # built-in claude-in-chrome server on: --no-chrome drops it (#51, seen live; EndConversation always stays).
 # `--tools` takes several values: keep a flag after it, never the prompt. A `--resume` cannot take them (see
 # Selftest.full), so only a spawned run is narrowed.
-CLAUDE_WORKER_TOOLS = ['--tools', 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch', '--strict-mcp-config', '--no-chrome']
+# #71: the mode is pinned too, else the user's defaultMode (`auto`) applies and its classifier stops `taskq` commands.
+CLAUDE_WORKER_TOOLS = ['--permission-mode', PERMISSION_MODE, '--tools', 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch', '--strict-mcp-config', '--no-chrome']
 
 
 def claude_spawn(name, extra=None, prompt=None, remote_control=False):
@@ -2117,8 +2132,9 @@ def claude_spawn(name, extra=None, prompt=None, remote_control=False):
     `prompt`), which SendMessage reaches by that name. #270 (2026-10-06): no app window change at all.
     Remote Control stays off unless asked: with the user's `remoteControlAtStartup` a worker would also appear in
     the owner's apps on other machines and look as if it ran there (csgo #303; `/rc connecting…` gone, checked live)."""
-    off = [] if remote_control else ['--settings', '{"remoteControlAtStartup": false}']
-    done = subprocess.run(['claude', '--bg', *CLAUDE_WORKER_TOOLS, '--name', name, *off, *([prompt] if prompt else [])], cwd=ROOT,
+    # A `--resume` keeps only --name and --settings (#51): the mode goes into --settings as well.
+    settings = {'permissions': {'defaultMode': PERMISSION_MODE}, **({} if remote_control else {'remoteControlAtStartup': False})}
+    done = subprocess.run(['claude', '--bg', *CLAUDE_WORKER_TOOLS, '--name', name, '--settings', json.dumps(settings), *([prompt] if prompt else [])], cwd=ROOT,
                           env=claude_env(extra), capture_output=True, text=True, timeout=120)
     # FORCE_COLOR in the caller's environment colours the id (seen live 2026-10-06): strip ANSI before matching.
     short = re.search(r'backgrounded · (\w+)', re.sub(r'\x1b\[[0-9;]*m', '', done.stdout))
@@ -2171,6 +2187,10 @@ def show(args):
     """Open a Claude session in the desktop app on the owner's request. A running background session is
     stopped first: the app does not refuse it and would be a second writer of the same transcript."""
     session = args.session.removeprefix('local_')
+    if permissions_missing(ROOT):  # #71: the app opens it in the checkout's defaultMode (else the app's, e.g. auto)
+        agent = claude_agents().get(session)
+        return print(f'not opened in the app: it would run there without {PERMISSION_MODE} (`{TOOL} doctor` names the fix); '
+                     f'watch it read-only: `claude attach {agent["id"] if agent else session[:8]}`')
     agent = claude_stop(session)
     if agent and agent.get('pid'):
         print(f'stopped the background run {agent["id"]}: its turn ends; continue it in the app')

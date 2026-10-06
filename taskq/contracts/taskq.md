@@ -364,8 +364,9 @@ Scheduling and creating sessions is an app action, not a script action.
   `taskq show <id>` stops the background run and imports the session with the link
   `claude://resume?session=<id>`, which is undocumented, may change with an app update and always
   shows the session for a moment (~0.2 s). A finished worker: `close` retires it on its machine; by hand `taskq retire <id>`. Worker sessions
-  run without permission prompts: `.claude/settings.local.json` in the main checkout sets
-  `bypassPermissions` (owner decision, 2026-10-05; the file is not in git).
+  run without permission prompts: `.claude/settings.local.json` in the main checkout holds the allow list and
+  `defaultMode: dontAsk` (the file is not in git), and spawn pins `--permission-mode dontAsk` (#71;
+  [taskq-manager](taskq-manager.md) § 1 «Permissions»).
 - **Codex:** an automation with the prompt "Run `cd <main checkout> && taskq tick` and follow
   the instructions it prints" (no profile flags: the profile is `taskq.local.toml`). A Codex worker is created by `taskq spawn --runtime codex --text "<prompt>"`
   (the prompt is the thread's first turn); later turns are sent by `taskq codex-send`, state is read by `taskq codex-read`, and after acceptance `close`

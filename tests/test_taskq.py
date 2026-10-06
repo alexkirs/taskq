@@ -37,6 +37,13 @@ CODEX = {'CLAUDE_CODE_SESSION_ID': '', 'CODEX_THREAD_ID': 'codex-session'}
 COORDINATOR = {'CLAUDE_CODE_SESSION_ID': 'coordinator-session', 'CODEX_THREAD_ID': ''}
 
 
+def permitted(root, **permissions):
+    """`root`/.claude/settings.local.json as the § 1 permissions command writes it; `permissions` overrides keys."""
+    (Path(root) / '.claude').mkdir(exist_ok=True)
+    (Path(root) / '.claude/settings.local.json').write_text(json.dumps(
+        {'permissions': {'allow': list(q.WORKER_ALLOW), 'defaultMode': 'dontAsk', **permissions}}))
+
+
 class CodexServer:
     """Finite app-server responses; fail immediately on an unexpected request."""
     def __init__(self):
@@ -1102,11 +1109,12 @@ class Cycle(unittest.TestCase):
         self.assertEqual(printed.splitlines()[0], 'abcd1234-0000')
         self.assertIn('claude attach abcd1234', printed)
         # csgo #303: the name says the machine; Remote Control is off unless asked for. #41: the prompt is last.
-        # #51: only the 8 worker tools, no MCP.
-        tools = ['--tools', 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch', '--strict-mcp-config', '--no-chrome']
-        self.assertEqual(runs, [['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', '{"remoteControlAtStartup": false}'],
-                                ['claude', '--bg', *tools, '--name', 'T1 x (mac-1)'],
-                                ['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', '{"remoteControlAtStartup": false}', 'Run the brief']])
+        # #51: only the 8 worker tools, no MCP. #71: dontAsk pinned, also in --settings (a --resume keeps only that).
+        tools = ['--permission-mode', 'dontAsk', '--tools', 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch', '--strict-mcp-config', '--no-chrome']
+        mode, off = '{"permissions": {"defaultMode": "dontAsk"}', ', "remoteControlAtStartup": false}'
+        self.assertEqual(runs, [['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', mode + off],
+                                ['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', mode + '}'],
+                                ['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', mode + off, 'Run the brief']])
         self.agents = {}
         with self.run_recorded({'claude --bg': 'backgrounded · ffff0000 · T1 x'})[1]:
             self.assertIn('does not list the new session ffff0000', self.refused(CLAUDE, 'spawn'))
@@ -1125,14 +1133,26 @@ class Cycle(unittest.TestCase):
                 with log.open('a') as out:
                     out.write('[info] [CCD] LocalSessions.setFocusedSession: sessionId=local_s1\n')
             return SimpleNamespace(returncode=0, stdout='', stderr='')
+        permitted(self.directory)
         with patch.object(q.subprocess, 'run', run), patch.object(q.Path, 'home', lambda: home), \
-                patch.object(q, 'CLAUDE_APP_SESSIONS', self.directory / 'none'):
+                patch.object(q, 'CLAUDE_APP_SESSIONS', self.directory / 'none'), patch.object(q, 'ROOT', self.directory):
             started = time.time()
             printed = self.do(CLAUDE, 'show', 'local_s1', '--restore', 'owner')
         self.assertLess(time.time() - started, 5)  # the log line, not the 20 s timeout
         self.assertEqual(runs, [['claude', 'stop', 's1short'], ['open', '-g', 'claude://resume?session=s1'],
                                 ['open', '-g', 'claude://claude.ai/epitaxy/local_owner']])
         self.assertIn('stopped the background run s1short', printed)
+
+    def test_show_without_dontask_leaves_the_worker_running_and_names_attach(self):
+        """#71: the app opens a session in the checkout's defaultMode, else its own (auto): its classifier stops taskq."""
+        self.agents = {'s1': {'id': 's1short', 'sessionId': 's1', 'pid': 7}}
+        permitted(self.directory, defaultMode='auto')
+        runs, patched = self.run_recorded()
+        with patched, patch.object(q, 'ROOT', self.directory):
+            printed = self.do(CLAUDE, 'show', 'local_s1')
+        self.assertEqual(runs, [])  # neither stopped nor imported
+        self.assertIn('not opened in the app: it would run there without dontAsk', printed)
+        self.assertIn('`claude attach s1short`', printed)
 
     def test_tick_lists_worker_sessions_and_retires_a_reviewed_background_worker(self):
         iid = self.add('--type', 'research', '--runtime', 'claude')
@@ -1773,6 +1793,23 @@ class Doctor(unittest.TestCase):
         self.enterContext(patch.object(q, 'probe', lambda command: self.status))
         self.enterContext(patch.object(q, 'LOCAL', Path(self.enterContext(tempfile.TemporaryDirectory())) / 'taskq.local.toml'))
         q.LOCAL.write_text('[profile]\nmine = false\n')
+        self.enterContext(patch.object(q, 'ROOT', q.LOCAL.parent))
+        permitted(q.ROOT)
+
+    def test_missing_permissions_or_mode_is_a_gap_and_nothing_is_written(self):
+        """#71: the coordinator and its workers need the allow list and dontAsk; doctor names both, edits nothing."""
+        self.enterContext(patch.object(q, 'api', Gitlab()))
+        path = q.ROOT / '.claude/settings.local.json'
+        permitted(q.ROOT, defaultMode='auto')
+        before = path.read_text()
+        code, out = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertIn('settings.local.json lacks defaultMode: dontAsk: sessions of this checkout stop', out)
+        self.assertIn(f'cd {q.ROOT} && <the permissions command of taskq-manager.md § 1 «Permissions»>', out)
+        self.assertEqual(path.read_text(), before)
+        path.unlink()
+        self.assertIn('lacks Bash, Read, Edit', self.doctor()[1])
+        self.assertFalse(path.exists())
 
     def test_personal_profile_missing_invalid_or_tracked_is_a_gap(self):
         self.enterContext(patch.object(q, 'api', Gitlab()))
@@ -1914,8 +1951,7 @@ class Setup(unittest.TestCase):
 
     def trust_and_permissions(self):
         (self.tmp / 'claude.json').write_text(json.dumps({'projects': {os.path.realpath(self.tmp): {'hasTrustDialogAccepted': True}}}))
-        (self.tmp / '.claude').mkdir()
-        (self.tmp / '.claude/settings.local.json').write_text(json.dumps({'permissions': {'allow': list(q.WORKER_ALLOW)}}))
+        permitted(self.tmp)
         (self.tmp / 'taskq.local.toml').write_text('[profile]\nmine = false\n')
 
     def test_a_runtime_setup_command_is_the_persons_step(self):
@@ -1947,7 +1983,8 @@ class Setup(unittest.TestCase):
         self.assertEqual((self.tmp / 'taskq.toml').read_text().count('host = "gitlab.example.com"'), 1)
         self.assertIn('done: labels and board', out)
         self.assertIn(' && claude\n    accept «Trust this folder»', out)
-        self.assertIn('settings.local.json: Bash, Read', out)
+        self.assertIn('settings.local.json lacks Bash, Read', out)
+        self.assertIn('mcp__serena, defaultMode: dontAsk', out)
         self.assertFalse((self.tmp / '.claude').exists())  # permissions are printed, never written
         self.assertIn('No workers or timer started', out)
         self.trust_and_permissions()

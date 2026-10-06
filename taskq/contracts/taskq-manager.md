@@ -139,7 +139,7 @@ exception below; keep it in the final report.
 Ask once, after resolving gaps and tools. Exact authority request (omit optional Codex work unless
 requested; substitute the actual package manager and tools):
 
-> “I’ll install missing packages, use your host CLI login, write taskq.toml, run init for labels and a board, merge the worker permissions file, and prepare your profile card. If you requested Codex workers, I’ll also create its app project. I need terminal and file access; app setup needs a computer-control session. You’ll handle login and trust prompts. I won’t start workers or arm a timer. Confirm this setup authority.”
+> “I’ll install missing packages, use your host CLI login, write taskq.toml, run init for labels and a board, show the permissions rules for you to apply once, and prepare your profile card. If you requested Codex workers, I’ll also create its app project. I need terminal and file access; app setup needs a computer-control session. You’ll handle login and trust prompts. I won’t start workers or arm a timer. Confirm this setup authority.”
 
 Name the actual checkout, host and repository with the request. If computer-control access is not
 available, request that session once; continue terminal steps under the same authority. Do not
@@ -155,8 +155,8 @@ personal file is missing (it never guesses preferences). It only reads folder tr
 permissions file: each missing one, the CLI install and login, the GitHub `project` scope and write
 access is a `you:` line with one command, never attempted. It stops at a missing CLI, login or write
 access; reruns print `ok:` for completed steps; exit 0 only when the closing `doctor` is ready and no
-`you:` line remains. Mode B merges the permissions file with the § 1 command under the same
-authority; the package does not write it.
+`you:` line remains. The permissions file is the person's step in both modes (#28, #71): the session
+cannot write it under the auto-mode classifier (Self-Modification), and the package never writes it.
 
 After confirmation, perform every automatable missing step, re-run doctor and local checks after
 each, and say:
@@ -189,7 +189,7 @@ on Windows/Linux. If no supported installer is available, give one official inst
 | 3. Config | `taskq init --github <owner/repo> --host <host>` or `taskq init --project <group/project> --host <host>` when config is absent; merge agreed settings into existing `taskq.toml` | Init combines config creation and labels/board; do not pretend these are separate package commands. Verify config matches origin and has exactly one tracker; no secrets in config. |
 | 4. Labels / board | `taskq init` for existing matching config | Doctor checks labels and board; report the actual board URL/ID. GitHub without `project` scope can run the queue with labels only; do not silently escalate scope or call full doctor green. |
 | 5. Folder trust | Open the main checkout in Claude; accept its folder trust prompt | Human-only consent; verify the app can access that checkout. Unavailable app/control access is reported as pending. |
-| 6. Worker permissions | Merge `<main checkout>/.claude/settings.local.json` using the allow list below; keep it outside git | Re-read valid JSON and the required entries; keep existing permissions. Do not enable bypass mode, launch a test worker or arm anything. |
+| 6. Permissions | Show the person the rules of «Permissions» below and why; after their one confirmation the person runs the permissions command once (both modes) | `taskq doctor` names no permissions gap. Keep existing permissions. Do not enable bypass mode, launch a test worker or arm anything. |
 | 7. Profile card | Show the “New person” card above (or the present file's card and “keep?”) | Preserve exclusions. Say “Check this profile card. Setup will stay idle.” After confirmation: mode A prints `taskq profile init …`, mode B runs it. Saving it is not timer authority. |
 
 If GitHub has no pushed commit, report the prerequisite before any worker can claim. Offer the
@@ -224,7 +224,7 @@ automated: package/CLI installation and the worker permissions file (printed as 
 - [ ] Report changed/already-ready/pending items, repository and board, confirmed profile and whether any existing timer is active. Confirm no worker/timer was started by setup. Keep defaults and exclusions in the existing session profile card, not a new persisted profile format.
 - [ ] Provide one runnable check covering apply reruns/preserved config and permissions, human-step pause/resume, mismatch rejection and no worker/timer creation; run `python3 -m unittest discover -s tests`. Keep manual native UI checks explicit where trust/app state cannot be probed.
 
-### Runtime prerequisites and worker permissions
+### Runtime prerequisites and permissions
 
 - The session is an ordinary Claude desktop session (not a routine and not a scheduled run: the app
   forbids such a session to start other sessions and to receive messages).
@@ -232,9 +232,9 @@ automated: package/CLI installation and the worker permissions file (printed as 
   says so in one line and starts Claude workers only.
 - The queue is readable: `cd <main checkout> && taskq list`. The main checkout is the `main` branch
   tree from `git worktree list`; all queue commands run from it.
-- Workers run without permission prompts thanks to `<main checkout>/.claude/settings.local.json`
-  (outside git). After setup authority, run this from the main checkout to create or merge it.
-  Mode A prints this command with the resolved checkout first; mode B runs it. Invalid existing
+- Workers and the coordinator run without permission prompts thanks to `<main checkout>/.claude/settings.local.json`
+  (outside git); «Permissions» below says why each rule is there. The person runs this once from the main
+  checkout to create or merge it (in the session prompt as `! <command>`, or in a terminal). Invalid existing
   JSON is an error, never a reason to overwrite the file:
 
   ```bash
@@ -247,7 +247,7 @@ automated: package/CLI installation and the worker permissions file (printed as 
   allow = permissions.setdefault('allow', [])
   required = ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'NotebookEdit',
               'WebFetch', 'WebSearch', 'Agent', 'Skill', 'ToolSearch', 'SendMessage',
-              'mcp__ccd_session_mgmt', 'mcp__ccd_session', 'mcp__scheduled-tasks', 'mcp__serena']
+              'ListAgents', 'CronCreate', 'CronDelete', 'CronList', 'mcp__ccd_session_mgmt', 'mcp__ccd_session', 'mcp__scheduled-tasks', 'mcp__serena']
   allow.extend(item for item in required if item not in allow)
   permissions['defaultMode'] = 'dontAsk'
   path.parent.mkdir(parents=True, exist_ok=True)
@@ -258,10 +258,51 @@ automated: package/CLI installation and the worker permissions file (printed as 
 
   The project stays in `dontAsk` mode: everything in the list runs silently, the rest is denied.
   The app does not apply the project's "bypass permissions" mode to an imported session.
+- Claude workers also pin the mode at spawn: `--permission-mode dontAsk`, and `defaultMode: dontAsk` in
+  `--settings`, which a `--resume` keeps (#71). Without the file's `defaultMode` the user's own
+  (`~/.claude/settings.json`, e.g. `auto`) wins for every other session of the checkout.
 - Claude workers get only `CLAUDE_WORKER_TOOLS` (Bash, Read, Edit, Write, Glob, Grep, WebFetch, WebSearch) and no
   MCP servers: `spawn` passes `--tools … --strict-mcp-config --no-chrome` (#38), so the shared settings file above
   still serves the coordinator in full. Reach a live worker with SendMessage: a stopped one woken by
   `claude --bg --resume` gets the full tool set back (the CLI keeps only `--name` and `--settings`; #51).
+
+### Permissions
+
+Policy (#71): every session of the checkout, coordinator and workers, runs in `dontAsk` with the allow list
+above. `dontAsk` runs an allowed tool silently and denies the rest; it never asks and never consults the
+auto-mode classifier. `auto` (the app's mode, often the user's `defaultMode`) sends every action to the
+classifier, which stops queue work as «Create Unsafe Agents», «Self-Modification» or «Credential
+Exploration». `bypassPermissions` also works for a coordinator the owner opened that way, but the app
+never applies it to an imported session. `taskq doctor` names a missing rule or mode with this fix; taskq
+never edits permission settings itself.
+
+The onboarding step «permissions» (§ 1, order 6) shows the person exactly this, once:
+
+```text
+Rules for <main checkout>/.claude/settings.local.json (outside git), so nothing asks again:
+  allow: Bash Read Edit Write Glob Grep NotebookEdit WebFetch WebSearch    work and queue commands (taskq, git, claude --bg)
+  allow: Agent Skill ToolSearch SendMessage ListAgents                     reach and steer workers
+  allow: CronCreate CronDelete CronList                                    the coordinator's tick timer (§ 2)
+  allow: mcp__ccd_session_mgmt mcp__ccd_session mcp__scheduled-tasks mcp__serena   app sessions and tools
+  defaultMode: dontAsk                                                     the allowed run silently, the rest is denied; no classifier
+Run once: ! <the permissions command above, with the resolved checkout>
+```
+
+What a permission layer can stop, where it hit, and the fix:
+
+| Action (who) | Layer | Hit | Fix |
+|---|---|---|---|
+| `taskq worker`/`take` in a worker opened in the app (worker) | app mode `auto`, classifier «Create Unsafe Agents» | csgo T454, 2026-10-06 | `defaultMode: dontAsk` in the file; `taskq show` refuses without it and names `claude attach` |
+| Any action of a spawned worker (worker) | user `defaultMode: auto` in `~/.claude/settings.json` | #71's own worker: reading transcripts denied as «Credential Exploration» | spawn pins `--permission-mode dontAsk` (+ `--settings`, kept by a resume) |
+| Writing `.claude/settings.local.json` (worker, coordinator) | classifier «Self-Modification» | #28; the coordinator's first minute of this project | the person runs the permissions command once (onboarding «permissions») |
+| A Codex thread under a sandbox (worker) | classifier «Create Unsafe Agents», even with the owner's recorded yes | #52 | `taskq spawn --runtime codex` from the coordinator in `dontAsk` (`Bash` allowed) |
+| `claude --bg …` / `taskq spawn` (coordinator) | classifier «Create Unsafe Agents» in `auto` | csgo coordinator | `Bash` allowed + `dontAsk` |
+| SendMessage to a bg worker (coordinator) | cross-session message held for approval | this queue, all permission classes | `SendMessage` and `ListAgents` allowed + `dontAsk`; fallback `claude stop`, `claude --bg --resume <id> "<text>"` |
+| `CronCreate` (coordinator) | not in the allow list: denied in `dontAsk` | — (added with #71) | `CronCreate`, `CronDelete`, `CronList` allowed |
+| EnterWorktree outside `.claude/worktrees` (worker) | permission-root relocation prompt | #68, until the owner answered by `claude attach` | workers lack the tool (`CLAUDE_WORKER_TOOLS`); the brief says `git worktree add` and `cd` in Bash |
+| Writing under `~/.claude` (worker) | protected path: denied in `dontAsk` despite `Write`/`Bash` allowed | #71 live probe | workers write only in the checkout and its worktrees |
+| A tool outside `CLAUDE_WORKER_TOOLS` or an MCP server (worker) | not offered at all | by design (#38, #51) | none needed |
+| First session in a new checkout (all) | folder trust dialog | onboarding | the person: `cd <main checkout> && claude`, accept once (doctor `--fix` checks `~/.claude.json`) |
 
 ## 2. Arm the tick
 

@@ -10,7 +10,7 @@ names = ["queue", "tick", "runtimes", "selftest", "docs", "install"]
 
 [workspace]  # {iid} is the task number. The clone is an editable install: every session on this machine runs its
 # working tree, so the tree stays clean `main` and all work happens in a worktree under .worktrees/ (csgo #272).
-new = "from the main checkout run `git fetch origin && git worktree add -b taskq-{iid} .worktrees/taskq-{iid} origin/main` and work only there; never edit the main checkout itself, it is the editable install every session on this machine runs."
+new = "from the main checkout run `git fetch origin && git worktree add -b taskq-{iid} .worktrees/taskq-{iid} origin/main` and work only there (`git worktree add` and `cd` in Bash, never the EnterWorktree tool: it prompts for a tree outside .claude/worktrees); never edit the main checkout itself, it is the editable install every session on this machine runs."
 continue = "this task was started before in worktree `.worktrees/taskq-{iid}` of the main checkout (or `../taskq-{iid}` for tasks started on 2026-10-06; `git worktree list` shows it); continue there. If it is gone, create it: `git fetch origin && git worktree add -b taskq-{iid} .worktrees/taskq-{iid} origin/main`."
 none = "this task is expected to end in an answer, not a commit: work from the main checkout without editing it. If it turns out to need file changes, make the worktree `.worktrees/taskq-{iid}` as a code task would, work there, push like a code task and name the commit in the result text."
 retire = "git worktree remove .worktrees/taskq-{iid}"

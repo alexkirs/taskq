@@ -11,8 +11,8 @@ How to set up the session that runs the [taskq](taskq.md) queue: it files tasks 
 ticks every 5 minutes, starts workers in visible sessions, accepts results and relays questions to
 the owner. Two roles (owner's decision, 2026-10-06):
 
-- **Product manager** — the owner says the session is the taskq product manager (e.g. “You are the Product Manager of taskq”,
-  «Ты продукт-менеджер taskq»). Step 1 and § 4: checks the place, reads the queue, files and discusses
+- **Product manager** — the owner says the session is the taskq product manager (e.g. “You are the taskq manager.”, “You are the Product Manager of taskq”,
+  «Ты менеджер taskq», «Ты продукт-менеджер taskq»). Step 1 and § 4: checks the place, reads the queue, files and discusses
   tasks. Does not arm the tick.
 - **Coordinator** — the owner says "arm the tick" or "you are the coordinator" (e.g. «включи тик»,
   «ты coordinator»). Steps 1–3: a tick every 5 minutes. Only one such session at a time: `taskq tick`
@@ -84,7 +84,8 @@ the Mac's tick never starts it. Name the machines once in taskq.toml, `[hosts]` 
 
 ### Readiness and mode choice
 
-Entry phrases: “Install taskq from https://github.com/alexkirs/taskq in this project and set it up following the onboarding in its README and taskq contract.”
+Entry phrases: “Install taskq from https://github.com/alexkirs/taskq and set it up.”
+(«Установи taskq из https://github.com/alexkirs/taskq и настрой его»), “Install taskq from https://github.com/alexkirs/taskq in this project and set it up following the onboarding in its README and taskq contract.”
 («Установи taskq из https://github.com/alexkirs/taskq в этом проекте и настрой по onboarding в README и taskq contract»),
 “Join this taskq project and run onboarding.” («Подключись к этому проекту taskq и запусти onboarding»),
 and “Run taskq onboarding.” («Запусти onboarding taskq», «настрой taskq») all start this procedure,
@@ -264,7 +265,10 @@ automated: package/CLI installation and the worker permissions file (printed as 
 
 ## 2. Arm the tick
 
-Entry phrase: “Arm the tick.” («Включи тик»). Check readiness and the profile card in § 1,
+Entry phrases: “You are the taskq manager. Arm the tick.” («Ты менеджер taskq. Включи тик»),
+or “Arm the tick.” («Включи тик»). The combined phrase takes both the product-manager and
+coordinator roles; it is one request to read the queue and arm coordination, not onboarding alone.
+Check readiness and the profile card in § 1,
 then follow this procedure after profile confirmation; onboarding alone does not authorize it.
 
 Tool `CronCreate` (loaded via ToolSearch), `recurring: true`, `cron: "*/5 * * * *"`,
@@ -369,6 +373,11 @@ record file ~1.1 s is the fallback).
   the session to the app's own server). It is needed only to archive a session the app holds; after
   that, return the window to the session open before, with the same link and its id.
   Do not open worker sessions with this link without need.
+
+Entry phrase: “Show me the question from #N.” («Покажи вопрос из #N», «Покажи вопрос по задаче #N»).
+Run `taskq view N` read-only; relay the latest pending question verbatim and wait for the owner's
+answer. If there is no pending question, say so. Record an answer with `taskq answer N` as below;
+showing a question alone does not answer it, start workers or arm the tick.
 
 **Questions to the owner (sections Waiting for the owner and Still waiting for the owner).** These
 are `q-ask` tasks (the board's `q-ask` column): a question from a worker or the manager. The tick
@@ -642,16 +651,19 @@ prints every call with its time, and each selftest step.
 
 ## 4. File a task
 
-Entry phrases: “File a task for fixing login.” (general form “File a task for …”; «Заведи задачу на …»,
+Entry phrases: “File a task: fix the login redirect.” («Заведи задачу: исправить редирект при входе»),
+“File a task for fixing login.” (general forms “File a task: …”, “File a task for …”; «Заведи задачу на …»,
 «какие задачи завести») starts task filing below. Read the queue first to avoid duplicates; resolve
 missing goal or acceptance with the owner instead of inventing product intent.
 
-“You are the Product Manager of taskq. What should we do next?” («Ты продукт-менеджер taskq.
-Что делать дальше?») starts § 1 readiness inspection, then `taskq list`: recommend the next work
+“What should we do next?” («Что делать дальше?») starts `taskq list`: recommend the next work
 from priorities, dependencies, existing tasks and the owner's goal. Discuss proposals before filing.
-“You are the Product Manager of taskq. What is in the queue?” («Ты продукт-менеджер taskq.
-Что в очереди?»), or the role phrase alone, starts § 1 inspection and `taskq list`; summarize the
-actual queue and blockers. Neither question starts workers or arms the tick.
+“What is in the queue?” («Что в очереди?») starts `taskq list`; summarize the actual queue and
+blockers. Recognize both questions on their own in an established manager session, as well as
+prefixed by “You are the taskq manager.” («Ты менеджер taskq») or the older “You are the Product
+Manager of taskq.” («Ты продукт-менеджер taskq»). On first use, do the § 1 read-only readiness
+inspection and list the queue even if setup has gaps; report those separately. The role phrase
+alone also reads the queue. Neither question starts workers or arms the tick.
 
 `taskq add --title … --type code|docs|research|asset --goal … --acceptance …
 --scope <paths> --deps <numbers> --priority 1|2 --milestone "<epic>" [--runtime claude|codex|any]`

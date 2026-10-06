@@ -3,22 +3,18 @@
   <br><em>Agents working.</em>
 </p>
 
-# taskq
-
 A shared task queue for Claude Code and Codex.
 
-Tell your agent: **“Install taskq from https://github.com/alexkirs/taskq in this project and set it up following the onboarding in its README and taskq contract.”**
-
-| Situation | What to say |
-|---|---|
-| Join a project with taskq.toml; run onboarding | “Join this taskq project and run onboarding.” |
-| Repeat onboarding; choose instructions or setup by the agent | “Run taskq onboarding.” |
-| Start coordination in this session | “Arm the tick.” |
-| Discuss the next work | “You are the Product Manager of taskq. What should we do next?” |
-| File work | “File a task for fixing login.” |
-| Read the queue | “You are the Product Manager of taskq. What is in the queue?” |
-| Check orchestration | “Check taskq orchestration.” |
-| Watch a worker | “Show worker session <session id>.” |
+1. **Set up (once per project)**<br>
+   Tell your agent: "Install taskq from https://github.com/alexkirs/taskq and set it up."
+2. **Start working (each day)**<br>
+   "You are the taskq manager. Arm the tick." - workers start on ready tasks
+3. **Talk to the manager**<br>
+   "File a task: fix the login redirect." - new task<br>
+   "What is in the queue?" - status<br>
+   "What should we do next?" - plan<br>
+   "Show me the question from #12." - answer a worker<br>
+   "Check taskq orchestration." - self-test
 
 <details>
 <summary>Setup, commands and reference</summary>

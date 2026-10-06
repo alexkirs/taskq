@@ -2166,6 +2166,26 @@ def claude_stop(session, remove=False):
     return agent
 
 
+def claude_wake(session, prompt, extra=None):
+    """One more turn of a background session: `claude --bg --resume <session> <prompt>`. The CLI exits 0 even when
+    the new job fails at once (#72: an idle session without a transcript is 'source session … not found'), so the
+    job's state in `claude agents` decides. A job alive after 15 s is left to the caller's own wait."""
+    agents = claude_agents()
+    before, names = set(agents), {prompt, (agents.get(session) or {}).get('name')}
+    claude_stop(session)
+    subprocess.run(['claude', '--bg', '--resume', session, prompt], cwd=ROOT, env=claude_env(extra),
+                   check=True, capture_output=True, timeout=120)
+    end = time.time() + 15
+    while True:
+        # ponytail: a new job is matched by name (the CLI names a failed one by the prompt), not by the printed id
+        jobs = [agent for sid, agent in claude_agents().items() if sid not in before and agent.get('name') in names]
+        if failed := next((agent for agent in jobs if agent.get('state') == 'failed'), None):
+            fail(f'claude --resume {session[:8]}: the job {failed["id"]} failed at once (state failed in `claude agents`)')
+        if time.time() > end:
+            return
+        time.sleep(2)
+
+
 def view(args):
     """A task as the queue sees it, read only: state, claim, the last notes, the result."""
     issue = api('GET', f'issues/{args.iid}')
@@ -3002,10 +3022,7 @@ class Selftest:
                 # No CLAUDE_WORKER_TOOLS here (#51, CLI 2.1.291): with any flag --resume starts a copy under a new id
                 # (it failed live); without, the session keeps only its saved --name and --settings, so a wake
                 # after a stop has the full tool set. Live workers are steered by SendMessage, not woken.
-                claude_stop(session)
-                subprocess.run(['claude', '--bg', '--resume', session, prompt], cwd=ROOT, env=claude_env(self.extra),
-                               check=True, capture_output=True, timeout=120)
-                return
+                return claude_wake(session, prompt, self.extra)
             command = selftest_command(EXECUTORS[runtime]['send'], session=session, text=prompt)
             with log.open('a') as out:
                 process = subprocess.Popen(command, cwd=ROOT, env=selftest_env(extra=self.extra), stdout=out, stderr=subprocess.STDOUT)

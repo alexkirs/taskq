@@ -1739,6 +1739,33 @@ class Selftest(unittest.TestCase):
         self.assertIn('| beat | claude | skipped |', out.getvalue())
         self.assertIn('| remove the selftest tasks | - | ok |', out.getvalue())
 
+    def test_full_claude_starts_the_worker_with_its_prompt_and_a_failed_resume_fails_at_once(self):
+        """#72: an idle spawn has no transcript, so `--resume` of it fails ('source session … not found', exit 0)."""
+        spawned, runs = [], []
+
+        def spawn(name, extra=None, prompt=None, remote_control=False):
+            spawned.append(prompt)
+            return 'w1-session'
+
+        def run(argv, **kwargs):  # a resume job fails at once under a new id, named by the prompt
+            runs.append(argv)
+            self.agents['w2-session'] = {'id': 'w2', 'sessionId': 'w2-session', 'name': argv[-1], 'state': 'failed'}
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        args = argparse.Namespace(worker_env=[], wait=0)
+        test = q.Selftest(args)
+        with patch.object(q, 'claude_spawn', spawn), patch.object(q.subprocess, 'run', run), \
+                patch.object(q, 'claude_stop', lambda session, remove=False: None), contextlib.redirect_stdout(io.StringIO()):
+            test.full('claude')
+        self.assertIn('worker --filter labels=selftest', spawned[0])
+        rows = {row[0]: row for row in test.rows}
+        self.assertIn('not doing after 0 s', rows['take, claim, assignee, beat, ask by the worker'][4])  # no resume on turn one
+        self.assertFalse(runs)
+        with patch.object(q.subprocess, 'run', run), patch.object(q, 'claude_stop', lambda session, remove=False: None):
+            with self.assertRaises(SystemExit) as caught:
+                q.claude_wake('w1-session', 'Run the brief')
+        self.assertIn('the job w2 failed at once', str(caught.exception))
+        self.assertEqual(runs, [['claude', '--bg', '--resume', 'w1-session', 'Run the brief']])
+
     def test_a_selftest_task_is_only_for_a_profile_naming_it(self):
         iid = self.add('--type', 'research', '--label', 'selftest')
         self.assertIn('No task can start now', self.do(CLAUDE, 'worker'))

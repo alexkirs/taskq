@@ -223,6 +223,9 @@ cd ~/Projects/taskq
 git fetch origin && git worktree add -b <branch> .worktrees/<branch> origin/main
 ```
 
+Modules: `taskq/__init__.py` the core (config, store protocol, commands, tick), `store_github.py` the GitHub store,
+`codex.py` the Codex app server, `cleanup.py` the `cleanup` command, `selftest.py` the `selftest` command.
+
 Change the worktree, run the tests there, push to `main`. CI (`.github/workflows/tests.yml`) runs the tests on every
 push; the clone and other machines take the commit once its CI passed, within `[update] every` or at once with
 `taskq update`. A commit that does not start (`python3 -m taskq --version`) is rolled back in the clone.

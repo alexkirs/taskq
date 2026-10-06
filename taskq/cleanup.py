@@ -1,0 +1,289 @@
+"""`cleanup`: finished worktrees, branches and worker sessions, reported first, removed only when proven finished."""
+import argparse
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import time
+
+import taskq as core
+
+
+# --- cleanup: report first; only proven finished rows may be applied ---------------------------
+
+def cleanup_issues():
+    """Live issues own task state and link workers to their tasks (closed issues before 2026-10-06 keep `type` in the block).
+    Open issues and those closed in the last CLEANUP_DAYS: a worker of an older task is no longer proven
+    finished, so its session is asked about, never removed."""
+    found = {}
+    after = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - core.CLEANUP_DAYS * 86400))
+    for issue in core.issues('state=opened') + core.issues(f'state=closed&updated_after={after}'):
+        block = core.BLOCK.search(issue.get('description') or '')
+        try:
+            block = block and json.loads(block.group(1))
+            if block:
+                found[issue['iid']] = {**block, 'closed': issue['state'] == 'closed',
+                                       'type': next((label for label in issue['labels'] if label in core.TYPES), block.get('type')),
+                                       'state': (core.parse(issue) or {}).get('state', 'unknown')}
+        except (ValueError, TypeError):  # a malformed block is no record: skip it
+            continue
+    return found
+
+
+def cleanup_codex(roots):
+    """Read only thread metadata, never conversations; include workers whose tree is already gone."""
+    codex, found = core.Codex(), {}
+    try:
+        cursor = None
+        while True:
+            response = codex.call('thread/list', {'archived': False, 'limit': 100, 'cursor': cursor})
+            for thread in response['data']:
+                cwd = Path(thread.get('cwd') or '/').resolve()
+                if thread.get('projectId') == core.codex_override('project') or cwd in roots:
+                    found[thread['id']] = thread
+            cursor = response.get('nextCursor')
+            if not cursor:
+                return found
+    finally:
+        codex.socket.close()
+
+
+def helpers(root):
+    """The project's worktree tools `cleanup` stands on (`workspace_gc`, `host_gentle`): [workspace] cleanup_helpers."""
+    if not core.HELPERS:
+        core.fail('cleanup needs [workspace] cleanup_helpers in taskq.toml: the folder with workspace_gc.py and host_gentle.py')
+    folder = str(Path(root) / core.HELPERS)
+    if folder not in sys.path:
+        sys.path.insert(0, folder)
+    import workspace_gc
+    return workspace_gc
+
+
+def cleanup_plan(root):
+    gc = helpers(root)
+    import host_gentle
+    host_gentle.lower_priority()
+    rows = gc.worktrees(root)
+    roots = {Path(row['worktree']).resolve() for row in rows}
+    issues, app = cleanup_issues(), core.claude_sessions()
+    mine = {(runtime, os.environ[variable]) for runtime, variable in core.RUNTIMES.items() if os.environ.get(variable)}
+    workers = {}
+    for iid, issue in issues.items():
+        claim = issue.get('claim') or {}
+        if claim.get('runtime') and claim.get('session'):
+            workers.setdefault((claim['runtime'], claim['session'].removeprefix('local_')), set()).add(iid)
+    remove, ask, keep = [], [], []
+    try:
+        threads = cleanup_codex(roots)
+        session_error = None
+    except (OSError, SystemExit, RuntimeError) as error:
+        threads, session_error = {}, str(error)
+        ask.append({'what': 'Codex inventory', 'why': session_error,
+                    'choices': [('keep', 'true'), ('check again', f'{core.TOOL} cleanup')]})
+    current = gc._git(root, 'branch', '--show-current').strip()
+    protected = {'main', current}
+    owned = {}
+    for iid, issue in issues.items():
+        if not issue['closed']:
+            # A ready task with an old claim also keeps its continuation tree.
+            owned[f'worktree-taskq-{iid}'] = f'open task #{iid} ({issue["state"]})'
+    for row in rows:
+        branch = row.get('branch', '').removeprefix('refs/heads/')
+        if any((thread.get('status') or {}).get('type') not in ('idle', 'notLoaded') or ('codex', sid) in mine
+               or any(iid not in issues or not issues[iid]['closed'] for iid in workers.get(('codex', sid), ()))
+               for sid, thread in threads.items() if Path(thread.get('cwd') or '/').resolve() == Path(row['worktree']).resolve()):
+            owned[branch or row['worktree']] = 'current / active / unknown Codex session state'
+    for identity in mine:
+        for iid in workers.get(identity, ()):
+            protected.add(f'worktree-taskq-{iid}')
+    git = lambda *args: gc._git(root, *args)
+
+    def merged(ref):
+        # cherry ignores merges; require their ancestry separately so merge-only work is never lost.
+        if git('rev-list', '--merges', f'origin/main..{ref}', '--').strip():
+            return False
+        return not any(line.startswith('+') for line in git('cherry', 'origin/main', ref).splitlines())
+
+    def branch_choices(branch, remote=False):
+        ref = f'origin/{branch}' if remote else branch
+        choices = [('keep', 'true'), ('show diff', shlex.join(['git', 'diff', f'origin/main...{ref}', '--']))]
+        if remote:
+            choices = [('delete on the server', shlex.join(['git', 'push', 'origin', '--delete', branch])), ('keep', 'true')]
+        else:
+            choices.append(('delete', shlex.join(['git', 'branch', '-d', '--', branch])))
+        return choices
+
+    checked = set()
+    for row in rows:
+        tree = Path(row['worktree'])
+        branch = row.get('branch', '').removeprefix('refs/heads/')
+        checked.add(branch)
+        what = f'tree {tree} / {branch or "detached HEAD"}'
+        task_branch = f'worktree-{tree.name}'
+        if tree.resolve() == root.resolve() or branch in protected or branch in owned or task_branch in owned or row['worktree'] in owned:
+            keep.append({'what': what, 'why': owned.get(branch) or owned.get(task_branch) or owned.get(row['worktree']) or 'main / current branch or tree of the calling session'})
+            continue
+        if session_error:
+            keep.append({'what': what, 'why': 'Codex session state not checked'})
+            continue
+        inspection = gc.inspect(root, str(tree))
+        if inspection['refusals']:
+            choices = [('keep', 'true'), ('show changes', shlex.join(['git', '-C', str(tree), 'status', '--short', '--untracked-files=all']))]
+            holders = gc._live(tree)
+            if holders:
+                choices.append(('show process', shlex.join(['ps', '-p', ','.join(map(str, sorted(holders))), '-o', 'pid,ppid,comm'])))
+            ask.append({'what': what, 'why': '; '.join(inspection['refusals']), 'choices': choices})
+        elif not merged(branch or row['HEAD']):
+            choices = branch_choices(branch) if branch else [('keep', 'true'), ('show diff', shlex.join(['git', 'diff', f'origin/main...{row["HEAD"]}', '--']))]
+            if branch:
+                choices[-1] = ('delete', shlex.join([sys.executable, str(root / core.HELPERS / 'workspace_gc.py'), 'retire', str(tree), '--delete'])
+                               + ' && ' + choices[-1][1])
+            ask.append({'what': what, 'why': 'commits not proven in origin/main', 'choices': choices})
+        else:
+            remove.append({'kind': 'tree', 'what': what, 'path': str(tree), 'branch': branch,
+                           'head': row['HEAD'], 'why': 'clean, no processes; every patch in origin/main'})
+    for branch in git('for-each-ref', '--format=%(refname:short)', 'refs/heads').splitlines():
+        if branch in checked:
+            continue
+        if branch in protected or branch in owned:
+            keep.append({'what': f'branch {branch}', 'why': owned.get(branch) or 'main / current branch'})
+        elif merged(branch):
+            remove.append({'kind': 'branch', 'what': f'branch {branch}', 'branch': branch,
+                           'head': git('rev-parse', branch).strip(), 'why': 'every patch in origin/main'})
+        else:
+            ask.append({'what': f'branch {branch}', 'why': 'has commits outside origin/main', 'choices': branch_choices(branch)})
+    for ref in git('for-each-ref', '--format=%(refname)', 'refs/remotes/origin').splitlines():
+        branch = ref.removeprefix('refs/remotes/origin/')
+        if branch not in ('main', 'HEAD') and merged(ref):
+            ask.append({'what': f'branch origin/{branch}', 'why': 'merged; deleting on the server needs an answer of the owner',
+                        'choices': branch_choices(branch, remote=True)})
+    finished_trees = {Path(item['path']).resolve() for item in remove if item['kind'] == 'tree'}
+
+    def finished(identity):
+        iids = workers.get(identity, set())
+        if not iids or not all(iid in issues and issues[iid]['closed'] for iid in iids):
+            return False
+        for iid in iids:
+            issue = issues[iid]
+            if issue.get('type') in ('code', 'docs'):
+                sha = (issue.get('result') or {}).get('sha')
+                if not sha or subprocess.run(['git', '-C', str(root), 'merge-base', '--is-ancestor', sha, 'origin/main'],
+                                             capture_output=True).returncode:
+                    return False
+        return True
+
+    def active_task(identity):
+        return any(iid not in issues or not issues[iid]['closed'] for iid in workers.get(identity, ()))
+
+    for sid, thread in threads.items():
+        identity = ('codex', sid)
+        status = (thread.get('status') or {}).get('type')
+        what = f'Codex session {sid}'
+        if identity in mine or status == 'active' or active_task(identity):
+            keep.append({'what': what, 'why': 'current session / active / open task'})
+        elif status in ('idle', 'notLoaded') and (finished(identity) or Path(thread.get('cwd') or '/').resolve() in finished_trees):
+            remove.append({'kind': 'codex', 'what': what, 'thread': sid, 'cwd': thread.get('cwd'), 'why': 'not active; task closed or tree finished'})
+        else:
+            ask.append({'what': what, 'why': f'no proven closed task, or state unknown ({status})',
+                        'choices': [('keep', 'true'), ('archive', shlex.join([core.TOOL, 'codex-archive', sid]))]})
+    # Only this machine's app archives its sessions; an archived one is done.
+    claude = {sid for runtime, sid in workers if runtime == 'claude' and sid in app and not app[sid].get('isArchived')}
+    # A spawned worker that never took a task: imported from the CLI in the main checkout, idle, with no claim.
+    unknown = {sid for sid, meta in app.items() if meta.get('adoptedFromOtherSurface') and not meta.get('isArchived')
+               and meta.get('sessionId') == f'local_{sid}' and Path(meta.get('cwd') or '/').resolve() == root.resolve()
+               and time.time() - meta.get('lastActivityAt', 0) / 1000 > core.STALE_MINUTES * 60} - {sid for _, sid in workers}
+    for sid in sorted(claude):
+        identity, what = ('claude', sid), f'Claude session local_{sid}'
+        if identity in mine or active_task(identity):
+            keep.append({'what': what, 'why': 'current session / open task'})
+        elif finished(identity):
+            remove.append({'kind': 'claude', 'what': what, 'thread': sid, 'why': 'worker of closed tasks; the coordinator checks liveness'})
+        else:
+            unknown.add(sid)
+    for sid in sorted(unknown):
+        if any(session == sid for _, session in mine):
+            keep.append({'what': f'session {sid}', 'why': 'current session'})
+        else:
+            ask.append({'what': f'Claude session local_{sid}', 'why': 'worker without a proven closed task (spawn without a claim, or the task is not finished)',
+                        'choices': [('keep', 'true'), ('archive', f'coordinator: archive_session local_{sid}')]})
+    # `claude --bg` workers of this checkout; `retire` stops them and drops them from `claude agents`.
+    for sid, agent in core.claude_agents().items():
+        identity, what = ('claude', sid), f'Claude background session {agent["id"]} ({agent.get("name")})'
+        if Path(agent.get('cwd') or '/').resolve() != root.resolve():
+            continue
+        if identity in mine or active_task(identity) or agent.get('status') == 'busy':
+            keep.append({'what': what, 'why': 'current session / open task / busy'})
+        elif finished(identity):
+            remove.append({'kind': 'claude-bg', 'what': what, 'thread': sid, 'why': 'worker of closed tasks, not busy'})
+        elif identity in workers or time.time() - agent.get('startedAt', 0) / 1000 > core.STALE_MINUTES * 60:
+            ask.append({'what': what, 'why': 'worker without a proven closed task (spawn without a claim, or the task is not finished)',
+                        'choices': [('keep', 'true'), ('retire', shlex.join([core.TOOL, 'retire', sid]))]})
+    return remove, ask, keep
+
+
+def cleanup(args):
+    root = core.main_checkout(Path.cwd())
+    gc = helpers(root)
+    if Path.cwd().resolve() != root.resolve() or gc._git(root, 'branch', '--show-current').strip() != 'main':
+        core.fail('cleanup runs only from the main checkout on branch main')
+    # Fetch updates tracking refs only; report never changes local branches, trees or sessions.
+    subprocess.run(['git', '-C', str(root), 'fetch', '-q', 'origin'], check=True)
+    remove, ask, keep = cleanup_plan(root)
+    for title, items in (('Remove', remove), ('Ask the owner', ask), ('Kept', keep)):
+        print(f'\n# {title}')
+        if not items:
+            print('(none)')
+        for item in items:
+            print(f'- {item["what"]}: {item["why"]}')
+            for label, command in item.get('choices', []):
+                print(f'  {label}: {command}')
+            if item.get('kind') == 'claude':
+                print(f'  coordinator: archive_session local_{item["thread"]}')
+    if not args.apply:
+        return
+    removed, freed, blocked_trees = [], 0, set()
+    # Archive by cwd while the finished tree still exists; otherwise its proof would disappear.
+    for item in sorted(remove, key=lambda item: item['kind'] != 'codex'):
+        if item['kind'] == 'claude':
+            continue  # only the coordinator's application tool can archive these
+        if item['kind'] == 'tree' and Path(item['path']).resolve() in blocked_trees:
+            print(f'Kept: the session of this tree is not archived: {item["what"]}')
+            continue
+        # Re-read live task/session/process/ref state before each act.
+        fresh, _, _ = cleanup_plan(root)
+        if item not in fresh:
+            print(f'Kept after the recheck: {item["what"]}')
+            continue
+        if item['kind'] == 'tree':
+            size = gc._measure(Path(item['path']), set())[0]
+            done = subprocess.run([sys.executable, str(root / core.HELPERS / 'workspace_gc.py'), 'retire', item['path'], '--delete'], cwd=root)
+            if done.returncode:
+                print(f'Kept: retire refused {item["what"]}')
+                continue
+            freed += size
+            removed.append(item['path'])
+        if item['kind'] in ('tree', 'branch') and item['branch']:
+            # -d can refuse a patch-equivalent rebased branch; do not force or rewrite its ref.
+            done = subprocess.run(['git', '-C', str(root), '-c', f'branch.{item["branch"]}.remote=origin',
+                                   '-c', f'branch.{item["branch"]}.merge=refs/heads/main', 'branch', '-d', '--', item['branch']], capture_output=True, text=True)
+            if done.returncode:
+                print(f'Kept branch {item["branch"]}: {done.stderr.strip()}')
+            else:
+                removed.append(item['branch'])
+        elif item['kind'] == 'codex':
+            try:
+                core.codex_archive(argparse.Namespace(thread=item['thread']))
+                removed.append(item['what'])
+            except (SystemExit, OSError) as error:
+                if item.get('cwd'):
+                    blocked_trees.add(Path(item['cwd']).resolve())
+                print(f'Kept: {item["what"]}: {error}')
+        elif item['kind'] == 'claude-bg':
+            core.claude_stop(item['thread'], remove=True)
+            removed.append(item['what'])
+    print(f'\nRemoved:{len(removed)}; freed {freed} bytes of data ({freed / gc.GIB:.3f} GiB).')
+    for name in removed:
+        print(f'- {name}')
+    print('Physical free space may differ (APFS clones / WSL disk image).')

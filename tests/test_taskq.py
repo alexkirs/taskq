@@ -17,6 +17,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import taskq as q  # noqa: E402
+# The modules beside the core; `q.cleanup` and `q.selftest` are the commands, so the modules come from sys.modules.
+codex, cleanup, selftest = (sys.modules[f'taskq.{name}'] for name in ('codex', 'cleanup', 'selftest'))
 
 
 def configure(path=None, real=q.configure, local=Path(tempfile.mkdtemp()) / 'taskq.local.toml'):
@@ -283,9 +285,10 @@ class Cycle(unittest.TestCase):
         self.directory = Path(directory.name)
         self.agents = {}  # `claude agents --json --all`, by session id
         self.enterContext(patch.object(q, 'CLAUDE_JOBS', self.directory / 'jobs'))
-        for target, value in (('api', self.gitlab), ('claude_agents', lambda: self.agents),
-                              ('Codex', lambda **kwargs: self.codex), ('CodexIpc', lambda **kwargs: self.ipc)):
-            patcher = patch.object(q, target, value)
+        for module, target, value in ((q, 'api', self.gitlab), (q, 'claude_agents', lambda: self.agents),
+                                      (q, 'Codex', lambda **kwargs: self.codex), (codex, 'Codex', lambda **kwargs: self.codex),
+                                      (codex, 'CodexIpc', lambda **kwargs: self.ipc)):
+            patcher = patch.object(module, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -318,7 +321,7 @@ class Cycle(unittest.TestCase):
                                                 'description': '<!-- taskq:start -->\n```json\n{bad\n```\n<!-- taskq:end -->'})['iid']
         self.gitlab.issues[broken]['state'] = 'closed'  # a malformed block: skipped, cleanup goes on
         mine = self.add('--type', 'research')
-        self.assertEqual(sorted(q.cleanup_issues()), [mine])
+        self.assertEqual(sorted(cleanup.cleanup_issues()), [mine])
         self.assertIn('not an open taskq task', self.refused(CLAUDE, 'take', task))
         listed = self.do(CLAUDE, 'list')
         self.assertNotIn(f'#{task} ', listed)
@@ -940,8 +943,8 @@ class Cycle(unittest.TestCase):
                     return {'data': [{'id': 'u1', 'status': 'interrupted'}]}
                 return {'thread': {'status': {'type': Server.status}, 'path': Server.path}}
         announced = []
-        with patch.object(q, 'Codex', Server), patch.object(q, 'codex_announce', lambda *a: announced.append(a)), \
-                patch.object(q, 'codex_app_running', lambda metadata, turn: Server.app_running):
+        with patch.object(codex, 'Codex', Server), patch.object(codex, 'codex_announce', lambda *a: announced.append(a)), \
+                patch.object(codex, 'codex_app_running', lambda metadata, turn: Server.app_running):
             self.assertIn('is working; not archived', self.refused(CLAUDE, 'codex-archive', 't1'))
             Server.status, Server.app_running = 'notLoaded', True
             self.assertIn('is working; not archived', self.refused(CLAUDE, 'codex-archive', 't1'))
@@ -968,15 +971,15 @@ class Cycle(unittest.TestCase):
                 if method == 'thread/turns/list':
                     return {'data': [{'id': 'u1', 'status': 'inProgress' if Server.status == 'active' else 'interrupted'}]}
                 return {'thread': {'status': {'type': Server.status}, 'path': '/s/rollout.jsonl'}}
-        with patch.object(q, 'Codex', Server), patch.object(q, 'codex_announce', lambda *a: None), \
-                patch.object(q, 'codex_app_running', lambda metadata, turn: False), patch.object(q.time, 'sleep', lambda s: None):
-            self.assertEqual(q.selftest_retire('codex', 't1'), 'archived t1')
+        with patch.object(q, 'Codex', Server), patch.object(codex, 'Codex', Server), patch.object(codex, 'codex_announce', lambda *a: None), \
+                patch.object(codex, 'codex_app_running', lambda metadata, turn: False), patch.object(q.time, 'sleep', lambda s: None):
+            self.assertEqual(selftest.selftest_retire('codex', 't1'), 'archived t1')
             self.assertIn(('turn/interrupt', {'threadId': 't1', 'turnId': 'u1'}), Server.calls)
             Server.status = 'active'
             with self.assertRaises(SystemExit):  # check proves, never interrupts
-                q.selftest_retire('codex', 't1', check=True)
-            with patch.object(q, 'codex_interrupt', lambda thread: None), self.assertRaises(SystemExit):
-                q.selftest_retire('codex', 't1', wait=-1)
+                selftest.selftest_retire('codex', 't1', check=True)
+            with patch.object(selftest, 'codex_interrupt', lambda thread: None), self.assertRaises(SystemExit):
+                selftest.selftest_retire('codex', 't1', wait=-1)
 
     def test_codex_read_turns_commands_and_current_operation(self):
         self.codex.status = 'active'
@@ -1044,11 +1047,11 @@ class Cycle(unittest.TestCase):
     def test_codex_live_tail_is_bounded_and_does_not_read_other_turns(self):
         import json
         path = self.directory / 'rollout.jsonl'
-        path.write_text('x' * q.CODEX_TAIL_BYTES + '\n' + json.dumps({
+        path.write_text('x' * codex.CODEX_TAIL_BYTES + '\n' + json.dumps({
             'type': 'response_item', 'timestamp': '1970-01-01T00:00:02Z',
             'payload': {'type': 'function_call', 'call_id': 'other', 'name': 'exec', 'arguments': 'other turn',
                         'internal_chat_message_metadata_passthrough': {'turn_id': 'other'}}}) + '\n')
-        entries, stamp = q.codex_live_entries(path, {'id': 'live', 'entries': []})
+        entries, stamp = codex.codex_live_entries(path, {'id': 'live', 'entries': []})
         self.assertEqual((entries, stamp), ([], None))
 
     def test_codex_send_active_steers_and_new_turns_pin_policy(self):
@@ -1074,7 +1077,7 @@ class Cycle(unittest.TestCase):
         self.assertEqual(self.codex.calls[-1][0], 'thread/unsubscribe')
         self.assertEqual([call[0] for call in self.ipc.calls], ['thread-owner-discovery'])
         self.codex.status = 'notLoaded'
-        with patch.object(q, 'CodexIpc', side_effect=FileNotFoundError('no app')):
+        with patch.object(codex, 'CodexIpc', side_effect=FileNotFoundError('no app')):
             self.assertIn('delivered to t1', self.do(CLAUDE, 'codex-send', 't1', '--text', 'app closed'))
 
     def app_rollout(self, *records):
@@ -1102,14 +1105,14 @@ class Cycle(unittest.TestCase):
         self.assertIn('new turn in the Codex app', self.do(CLAUDE, 'codex-send', 't1', '--text', 'again'))
 
     def test_codex_spawn_pins_first_turn_policy(self):
-        with patch.object(q, 'codex_announce'):
+        with patch.object(codex, 'codex_announce'):
             self.assertIn('spawned', self.do(CLAUDE, 'spawn', '--runtime', 'codex', '--name', 'probe'))
         params = next(params for method, params in self.codex.calls if method == 'turn/start')
         self.assertEqual([method for method, _ in self.codex.calls][-2:], ['wait_turn', 'thread/unsubscribe'])
         self.assertEqual(params['approvalPolicy'], 'never')
         # #41: with the worker prompt the first turn is the prompt, left running like codex-send's
         self.codex.calls.clear()
-        with patch.object(q, 'codex_announce'):
+        with patch.object(codex, 'codex_announce'):
             self.do(CLAUDE, 'spawn', '--runtime', 'codex', '--name', 'probe', '--text', 'Run the brief')
         first = next(params for method, params in self.codex.calls if method == 'turn/start')
         self.assertEqual(first['input'][0]['text'], 'Run the brief')
@@ -1123,7 +1126,7 @@ class Cycle(unittest.TestCase):
         """#24: an id is per machine; the checkout path is shared. An explicit [codex] project still wins."""
         def spawned_in():
             self.codex.calls.clear()
-            with patch.object(q, 'codex_announce'):
+            with patch.object(codex, 'codex_announce'):
                 self.do(CLAUDE, 'spawn', '--runtime', 'codex', '--name', 'probe')
             return next(params for method, params in self.codex.calls if method == 'thread/start')['projectId']
         self.assertEqual(spawned_in(), 'codex-project')
@@ -1262,7 +1265,7 @@ class Cycle(unittest.TestCase):
                                'sandbox_policy': sandbox, 'approval_policy': approval}}) + '\n'
         path.write_text(context('last', {'type': 'danger-full-access'}, 'never') +
                         context('last', {'type': 'workspace-write', 'network_access': False}, 'on-request') +
-                        'x' * (q.CODEX_TAIL_BYTES + 1) + '\n' +
+                        'x' * (codex.CODEX_TAIL_BYTES + 1) + '\n' +
                         context('other', {'type': 'danger-full-access'}, 'never'))
         output = self.do(CLAUDE, 'codex-read', 't1')
         self.assertIn('last turn sandbox: {"type": "workspace-write", "network_access": false}; approvalPolicy: on-request', output)
@@ -1565,7 +1568,7 @@ class GithubCycle(unittest.TestCase):
         task, problem = (self.github('POST', 'issues', {'title': 'x', 'body': claim, 'labels': labels, 'association': 'CONTRIBUTOR'})['number']
                          for labels in (['q-ready', 'code'], [q.PROBLEM]))
         mine = self.add('--type', 'research')
-        self.assertEqual(sorted(q.cleanup_issues()), [mine])
+        self.assertEqual(sorted(cleanup.cleanup_issues()), [mine])
         self.assertEqual([item['iid'] for item in q.load()[0]], [mine])
         output = self.do(CLAUDE, 'tick')
         self.assertIn(f'Inbox: 2 issues by non-collaborators ({link(task, GH)}, {link(problem, GH)})', output)
@@ -1731,8 +1734,9 @@ class Selftest(unittest.TestCase):
 
     def setUp(self):
         Cycle.setUp(self)
-        for target, value in (('ROOT', self.directory), ('TICK_BEAT', self.directory / 'beat'), ('selftest_run', self.run_calls)):
-            patcher = patch.object(q, target, value)
+        for module, target, value in ((q, 'ROOT', self.directory), (q, 'TICK_BEAT', self.directory / 'beat'),
+                                      (selftest, 'selftest_run', self.run_calls)):
+            patcher = patch.object(module, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -1782,7 +1786,7 @@ class Selftest(unittest.TestCase):
         dead = subprocess.Popen(['true'])
         dead.wait()
         path = self.record(dead.pid, [iid])
-        with patch.object(q, 'alive', lambda pid: pid != dead.pid):  # a quick run of another session is still going
+        with patch.object(selftest, 'alive', lambda pid: pid != dead.pid):  # a quick run of another session is still going
             self.record(4242, [live])
             report = self.do(COORDINATOR, 'selftest', '--scope', 'quick')  # check would refuse: a run is alive
         self.assertIn('13 of 13 ok', report)
@@ -1811,7 +1815,7 @@ class Selftest(unittest.TestCase):
             self.agents['w2-session'] = {'id': 'w2', 'sessionId': 'w2-session', 'name': argv[-1], 'state': 'failed'}
             return SimpleNamespace(returncode=0, stdout='', stderr='')
         args = argparse.Namespace(worker_env=[], wait=0)
-        test = q.Selftest(args)
+        test = selftest.Selftest(args)
         with patch.object(q, 'claude_spawn', spawn), patch.object(q.subprocess, 'run', run), \
                 patch.object(q, 'claude_stop', lambda session, remove=False: None), contextlib.redirect_stdout(io.StringIO()):
             test.full('claude')
@@ -1827,7 +1831,7 @@ class Selftest(unittest.TestCase):
 
     def test_full_waits_for_the_note_after_the_state_label(self):
         """#73: save() moves the label first and posts the note a moment later; the step polls on until both are there."""
-        test = q.Selftest(argparse.Namespace(worker_env=[], wait=30))
+        test = selftest.Selftest(argparse.Namespace(worker_env=[], wait=30))
         pending, held, sends = [], [], [0]
 
         def run(*argv):
@@ -1850,7 +1854,7 @@ class Selftest(unittest.TestCase):
             elif pending:
                 pending.pop(0)()
         with patch.object(q, 'codex_spawn', lambda name: 'w1-thread'), patch.object(q, 'codex_send', send), \
-                patch.object(q.time, 'sleep', sleep), patch.object(q, 'selftest_retire', lambda runtime, session, **_: 'archived'):
+                patch.object(q.time, 'sleep', sleep), patch.object(selftest, 'selftest_retire', lambda runtime, session, **_: 'archived'):
             test.full('codex')
         rows = {row[0]: row for row in test.rows}
         self.assertEqual([row[2] for row in test.rows], ['ok'] * len(test.rows), test.rows)
@@ -2408,9 +2412,9 @@ class Cleanup(unittest.TestCase):
         os.chdir(self.root)
         self.addCleanup(os.chdir, self.before_cwd)
         # Explicit patches keep app and issue reads outside these disposable Git fixtures.
-        for target, name, value in ((q, 'cleanup_issues', lambda: self.issues), (q, 'claude_sessions', lambda: self.app),
+        for target, name, value in ((cleanup, 'cleanup_issues', lambda: self.issues), (q, 'claude_sessions', lambda: self.app),
                                     (q, 'claude_agents', lambda: self.agents),
-                                    (q, 'cleanup_codex', lambda roots: self.threads),
+                                    (cleanup, 'cleanup_codex', lambda roots: self.threads),
                                     (host_tools, 'live_paths', lambda: [])):
             patcher = patch.object(target, name, value)
             patcher.start()
@@ -2489,7 +2493,7 @@ class Cleanup(unittest.TestCase):
         self.git('cherry-pick', old)
         self.git('push', '-q', 'origin', 'main')
         self.assertNotEqual(old, self.git('rev-parse', 'main'))
-        remove, _, _ = q.cleanup_plan(self.root)
+        remove, _, _ = cleanup.cleanup_plan(self.root)
         self.assertTrue(any(row.get('path') == str(tree) for row in remove))
         report = self.run_cleanup(True)
         self.assertFalse(tree.exists())
@@ -2555,13 +2559,13 @@ class Cleanup(unittest.TestCase):
 
     def test_new_activity_between_plan_and_apply_prevents_deletion(self):
         tree = self.tree('worktree-race')
-        original, calls = q.cleanup_plan, []
+        original, calls = cleanup.cleanup_plan, []
         def plan(root):
             calls.append(1)
             if len(calls) == 2:
                 (tree / 'changed').write_text('new work')
             return original(root)
-        with patch.object(q, 'cleanup_plan', plan):
+        with patch.object(cleanup, 'cleanup_plan', plan):
             self.assertIn('Kept after the recheck', self.run_cleanup(True))
         self.assertTrue(tree.exists())
         self.assertIn('worktree-race', self.git('branch'))
@@ -2592,7 +2596,7 @@ class Cleanup(unittest.TestCase):
 
     def test_unavailable_inventory_keeps_trees_and_unknown_status_keeps_tree(self):
         tree = self.tree('worktree-unknown')
-        with patch.object(q, 'cleanup_codex', side_effect=OSError('not connected')):
+        with patch.object(cleanup, 'cleanup_codex', side_effect=OSError('not connected')):
             report = self.run_cleanup(True)
         self.assertTrue(tree.exists())
         self.assertIn('Codex session state not checked', report)

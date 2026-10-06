@@ -642,13 +642,19 @@ def add(args):
 
 
 def edit(args):
-    """Change dependencies or the milestone (epic) of an open task; `tick` then moves it ready<->waiting."""
+    """Change dependencies, scope or the milestone (epic) of an open task; `tick` then moves it ready<->waiting
+    and weighs the new scope against the others."""
     current = task(args.iid)
     if args.milestone is not None:
         api('PUT', f'issues/{args.iid}', {'milestone_id': milestone_id(args.milestone) if args.milestone else None})
+    changes, notes = {}, []
     if args.deps is not None:
         link(args.iid, args.deps)
-        save(current, note_action='deps', note_text=f'{current["deps"]} → {args.deps}', deps=args.deps)
+        changes['deps'], notes = args.deps, notes + [f'deps {current["deps"]} → {args.deps}']
+    if args.scope is not None:
+        changes['scope'], notes = args.scope, notes + [f'scope {current["scope"]} → {args.scope}']
+    if changes:
+        save(current, note_action='edit', note_text='; '.join(notes), **changes)
     print(f'#{args.iid} edited')
 
 
@@ -1980,7 +1986,7 @@ def main(argv=None):
         command(name, requeue, iid, text)
     command('close', close, iid, text)
     command('later', later, iid, text)
-    command('edit', edit, iid, (('--deps',), {'nargs': '*', 'type': int}),
+    command('edit', edit, iid, (('--deps',), {'nargs': '*', 'type': int}), (('--scope',), {'nargs': '*'}),
             (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}))
     command('tick', tick, *profile_flags, (('--prompt-version',), {'type': int, 'metavar': 'N',
             'help': "the timer prompt's version (manager contract § 2); older ones are told to re-arm"}))

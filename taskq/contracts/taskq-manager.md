@@ -736,7 +736,9 @@ alone also reads the queue. Neither question starts workers or arms the tick.
 - **Epic** — a project milestone (flat). Every task gets `--milestone`; a new epic is a new GitLab
   milestone with a description, not an umbrella issue. To change the epic or dependencies:
   `taskq edit N --milestone "<epic>"`, `taskq edit N --deps <numbers>` (sets `relates_to` links;
-  the next tick moves the task between `ready` and `waiting` itself).
+  the next tick moves the task between `ready` and `waiting` itself), `taskq edit N --scope <paths>`
+  (replaces the scope with a note; name the modules the task really touches, the core only when it must,
+  so tasks without overlap run in parallel).
 - **One task — one worker session.** Do not create GitLab sub-tasks (Tasks): they are not visible on
   the board. Work larger than one session is several issues in one milestone linked by `--deps`; a
   checklist in the description is only for acceptance steps.

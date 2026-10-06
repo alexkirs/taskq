@@ -615,6 +615,17 @@ class Cycle(unittest.TestCase):
         self.assertIn(f'Moved {link(iid)} ready → waiting', self.do(CLAUDE, 'tick'))
         self.assertIn("no active milestone 'None'", self.refused(CLAUDE, 'edit', iid, '--milestone', 'None'))
 
+    def test_edit_scope_replaces_it_with_a_note_and_overlaps_follow(self):
+        first = self.add('--type', 'code', '--scope', 'taskq/__init__.py')
+        second = self.add('--type', 'code', '--scope', 'taskq/__init__.py')
+        self.do(CLAUDE, 'take', first)
+        self.assertIn(f'scope overlaps #{first}', self.do(CLAUDE, 'list'))
+        self.do(CLAUDE, 'edit', second, '--scope', 'taskq/codex.py', 'tests')
+        self.assertEqual(q.parse(self.gitlab.issues[second])['scope'], ['taskq/codex.py', 'tests'])
+        self.assertTrue(any("scope ['taskq/__init__.py'] → ['taskq/codex.py', 'tests']" in item['body']
+                            for item in self.gitlab.notes.values() if item['iid'] == second))
+        self.assertNotIn('scope overlaps', self.do(CLAUDE, 'list'))
+
     def test_question_is_shown_once_then_in_the_daily_summary(self):
         iid = self.add('--type', 'code', '--scope', 'a')
         self.do(CLAUDE, 'ask', iid, '--text', 'A or B?')  # the manager asks about a task not started

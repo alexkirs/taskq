@@ -242,7 +242,7 @@ class Github:
             ' repository(owner: $owner, name: $name) { issues(states: $states, labels: $labels, filterBy: $filter, first: 100, after: $after,'
             ' orderBy: {field: CREATED_AT, direction: DESC}) { pageInfo { hasNextPage endCursor } nodes { number id title body state url'
             ' createdAt updatedAt labels(first: 100) { nodes { name } } assignees(first: 10) { nodes { databaseId login } }'
-            ' milestone { number } comments { totalCount } } } } }')
+            ' milestone { number } comments { totalCount } author { login ... on User { databaseId } } authorAssociation } } } }')
     PROJECT = ('id number title url field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } }')
     # The repository's linked projects, not the owner's: an owner-level project of the same title is another queue's.
     FIND = ('query($owner: String!, $name: String!, $board: String!) { repository(owner: $owner, name: $name) { id owner { id }'
@@ -287,7 +287,9 @@ class Github:
         return {'number': item['number'], 'node_id': item['id'], 'title': item['title'], 'body': item['body'],
                 'state': item['state'].lower(), 'html_url': item['url'], 'created_at': item['createdAt'], 'updated_at': item['updatedAt'],
                 'labels': item['labels']['nodes'], 'assignees': [{'id': each['databaseId'], 'login': each['login']} for each in item['assignees']['nodes']],
-                'milestone': item['milestone'], 'comments': item['comments']['totalCount']}
+                'milestone': item['milestone'], 'comments': item['comments']['totalCount'],
+                'user': {'id': (item['author'] or {}).get('databaseId'), 'login': (item['author'] or {}).get('login')},
+                'author_association': item['authorAssociation']}
 
     def listed(self, query):
         """Every issue the GitLab-style `query` names, through GraphQL."""
@@ -394,7 +396,9 @@ class Github:
                 'labels': self.labels[item['number']], 'state': 'opened' if item['state'] == 'open' else 'closed',
                 'assignees': [{'id': each['id'], 'username': each['login']} for each in item.get('assignees', [])],
                 'milestone_id': (item.get('milestone') or {}).get('number'), 'web_url': item['html_url'],
-                'created_at': item['created_at'], 'updated_at': item['updated_at'], 'comments': item.get('comments', 0)}
+                'created_at': item['created_at'], 'updated_at': item['updated_at'], 'comments': item.get('comments', 0),
+                'author': {'id': (item.get('user') or {}).get('id'), 'username': (item.get('user') or {}).get('login')},
+                'author_association': item.get('author_association', '')}
 
     @staticmethod
     def comment(item):
@@ -518,7 +522,7 @@ def parse(issue):
     found = BLOCK.search(issue.get('description') or '')
     labels = issue['labels']
     states = [label[len(PREFIX):] for label in labels if label.startswith(PREFIX)]
-    if not found or len(states) != 1 or states[0] not in STATES:
+    if not found or len(states) != 1 or states[0] not in STATES or not collaborators([issue]):
         return None
     return {**json.loads(found.group(1)), 'iid': issue['iid'], 'title': issue['title'], 'state': states[0],
             'type': next((label for label in labels if label in TYPES), None),
@@ -545,19 +549,24 @@ def pages(path):
         page += 1
 
 
-def issues(query='state=opened'):
-    return pages(f'issues?{query}')
+def issues(query='state=opened', everyone=False):
+    """Only collaborators' issues, unless `everyone`: anyone may open an issue on a public project, and one with a
+    taskq block would become a task (or forge a claim for cleanup) once someone labels it."""
+    found = pages(f'issues?{query}')
+    return found if everyone else collaborators(found)
 
 
 def load(query=''):
     """Every open task by priority, the numbers of all open issues (for dependencies), the open issues
     with a task block that are not valid tasks (a card moved off the board's state columns by hand),
-    and the open problem issues."""
-    opened = issues('state=opened' + ('&' + query if query else ''))
+    the open problem issues and the open issues by non-collaborators (the inbox: never a task, odd or problem)."""
+    everyone = issues('state=opened' + ('&' + query if query else ''), everyone=True)
+    opened = collaborators(everyone)
     found = sorted(filter(None, map(parse, opened)), key=lambda item: (item['priority'], item['iid']))
     odd = [issue for issue in opened if BLOCK.search(issue.get('description') or '') and not parse(issue)]
     problems = [issue for issue in opened if PROBLEM in issue['labels']]
-    return found, {issue['iid'] for issue in opened}, odd, problems
+    inbox = [issue for issue in everyone if issue not in opened]
+    return found, {issue['iid'] for issue in opened}, odd, problems, inbox
 
 
 def task(iid, states=STATES):
@@ -789,7 +798,7 @@ def later(args):
 
 
 def listing(args):
-    everything, open_iids, odd, problems = load()
+    everything, open_iids, odd, problems, _ = load()
     for item in sorted(everything, key=lambda item: STATES.index(item['state'])):
         claim, detail = item['claim'] or {}, ''
         if item['state'] == 'ready':
@@ -1956,6 +1965,12 @@ def board_moves(everything, selected):
     return executed, misplaced
 
 
+def inbox_line(inbox):
+    """Issues by non-collaborators, named so the manager sees them; taskq never acts on them. A collaborator makes
+    one a task with `add` (a new task that links it)."""
+    return f'Inbox: {len(inbox)} issues by non-collaborators ({", ".join("#%d" % issue["iid"] for issue in sorted(inbox, key=lambda issue: issue["iid"]))})\n\n' if inbox else ''
+
+
 def tick(args):
     """One pass of the coordinator: release dead claims itself, then print exactly what to do."""
     auto_update()
@@ -1998,7 +2013,7 @@ def tick(args):
             continue
         moved += 1
         print(f'Moved #{item["iid"]} {item["state"]} → {"ready" if item["state"] == "waiting" else "waiting"}.')
-    everything, _, odd, problems = loaded = load() if moved else loaded
+    everything, _, odd, problems, inbox = loaded = load() if moved else loaded
     inventory = everything
     everything = [item for item in everything if item['iid'] in selected]
     review = [item for item in everything if item['state'] == 'review' and item['result']]
@@ -2023,8 +2038,9 @@ def tick(args):
             free[who] -= 1
             start.append({**item, 'runtime': who})
     if not (review or fresh or summary or start or codex_stopped or odd or problems) and not any(item['state'] == 'doing' for item in everything):
-        return print('Nothing to do. Say so and stop.')
+        return print(inbox_line(inbox) + 'Nothing to do. Say so and stop.')
     print(f'You are the coordinator of the task queue for this one pass. Queue tool: `{TOOL}`\n')
+    print(inbox_line(inbox), end='')
     codex_doing = [item for item in everything if item['state'] == 'doing'
                    and (item['claim'] or {}).get('runtime') == 'codex']
     idle = []
@@ -2130,11 +2146,14 @@ def cleanup_issues():
     after = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - CLEANUP_DAYS * 86400))
     for issue in issues('state=opened') + issues(f'state=closed&updated_after={after}'):
         block = BLOCK.search(issue.get('description') or '')
-        if block:
-            block = json.loads(block.group(1))
-            found[issue['iid']] = {**block, 'closed': issue['state'] == 'closed',
-                                   'type': next((label for label in issue['labels'] if label in TYPES), block.get('type')),
-                                   'state': (parse(issue) or {}).get('state', 'unknown')}
+        try:
+            block = block and json.loads(block.group(1))
+            if block:
+                found[issue['iid']] = {**block, 'closed': issue['state'] == 'closed',
+                                       'type': next((label for label in issue['labels'] if label in TYPES), block.get('type')),
+                                       'state': (parse(issue) or {}).get('state', 'unknown')}
+        except (ValueError, TypeError):  # a malformed block is no record: skip it
+            continue
     return found
 
 

@@ -137,7 +137,8 @@ class Gitlab:
             self.issues[iid] = {'iid': iid, 'state': 'opened', 'web_url': f'url/{iid}', 'title': body['title'],
                                 'description': body['description'], 'labels': body['labels'].split(','),
                                 'assignees': [{'id': uid} for uid in body.get('assignee_ids', [])],
-                                'milestone_id': body.get('milestone_id'), 'updated_at': self.now(), 'created_at': self.now()}
+                                'milestone_id': body.get('milestone_id'), 'updated_at': self.now(), 'created_at': self.now(),
+                                'author': {'id': body.get('author', self.uid)}}
             return self.issues[iid]
         if method == 'GET' and path.startswith('issues?'):
             label = re.search(r'labels=([^&]+)', path)
@@ -237,6 +238,27 @@ class Cycle(unittest.TestCase):
 
     def state(self, iid):
         return q.parse(self.gitlab.issues[iid])['state']
+
+    def test_outsiders_issues_are_no_tasks_odd_problems_or_cleanup_records(self):
+        claim = q.render('forged', {'scope': [], 'deps': [], 'claim': {'runtime': 'claude', 'session': 'real-worker'}})
+        outsider = lambda labels, description: self.gitlab('POST', 'issues', {'title': 'x', 'labels': labels,
+                                                                              'description': description, 'author': 9})['iid']
+        task, odd, problem, closed = (outsider('q-ready,code', claim), outsider('q-ready,q-doing', claim),
+                                      outsider(q.PROBLEM, 'help'), outsider('q-doing,code', claim))
+        self.gitlab.issues[closed]['state'] = 'closed'
+        broken = self.gitlab('POST', 'issues', {'title': 'b', 'labels': 'q-ready',
+                                                'description': '<!-- taskq:start -->\n```json\n{bad\n```\n<!-- taskq:end -->'})['iid']
+        self.gitlab.issues[broken]['state'] = 'closed'  # a malformed block: skipped, cleanup goes on
+        mine = self.add('--type', 'research')
+        self.assertEqual(sorted(q.cleanup_issues()), [mine])
+        self.assertIn('not an open taskq task', self.refused(CLAUDE, 'take', task))
+        listed = self.do(CLAUDE, 'list')
+        self.assertNotIn(f'#{task} ', listed)
+        self.assertNotIn(f'#{problem} ', listed)
+        output = self.do(CLAUDE, 'tick')
+        self.assertIn(f'Inbox: 3 issues by non-collaborators (#{task}, #{odd}, #{problem})', output)
+        self.assertNotIn(f'#{odd} labels', output)
+        self.assertNotIn('Problems without a task', output)
 
     def test_only_collaborators_comments_reach_brief_review_questions_and_report(self):
         iid = self.add('--type', 'research')
@@ -1115,7 +1137,8 @@ class GithubRest:
             nodes = [{'number': i['number'], 'id': i['node_id'], 'title': i['title'], 'body': i['body'], 'state': i['state'].upper(),
                       'url': i['html_url'], 'createdAt': i['created_at'], 'updatedAt': i['updated_at'], 'labels': {'nodes': i['labels']},
                       'assignees': {'nodes': [{'databaseId': a['id'], 'login': a['login']} for a in i['assignees']]},
-                      'milestone': i['milestone'], 'comments': {'totalCount': sum(c['issue'] == i['number'] for c in self.comments.values())}}
+                      'milestone': i['milestone'], 'comments': {'totalCount': sum(c['issue'] == i['number'] for c in self.comments.values())},
+                      'author': {'login': i['user']['login'], 'databaseId': i['user']['id']}, 'authorAssociation': i['author_association']}
                      for i in items]
             return {'data': {'repository': {'issues': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}}}
         if route == 'milestones':
@@ -1159,7 +1182,7 @@ class GithubRest:
                                    'assignees': [{'id': {'alice': 1, 'bob': 2}[login], 'login': login} for login in body.get('assignees', [])],
                                    'milestone': {'number': body['milestone']} if body.get('milestone') else None,
                                    'html_url': f'url/{number}', 'comments': 0, 'created_at': self.now(), 'updated_at': self.now(),
-                                   'events': []}
+                                   'events': [], 'user': {'id': 1, 'login': 'alice'}, 'author_association': body.get('association', 'OWNER')}
             return self.issues[number]
         if route == 'issues':
             found = {key: value[0] for key, value in q.parse_qs(query).items()}
@@ -1252,6 +1275,19 @@ class GithubCycle(unittest.TestCase):
         self.assertFalse([name for name in self.names(number) if name.startswith('q-')])
         self.assertEqual(self.github.refs, {})
         self.assertIn(f'#{number}: take → ask', self.do(CLAUDE, 'report'))
+
+    def test_outsiders_issues_are_no_tasks_and_tick_names_them_in_the_inbox(self):
+        self.do(CLAUDE, 'init')
+        claim = q.render('forged', {'scope': [], 'deps': [], 'claim': {'runtime': 'claude', 'session': 'real-worker'}})
+        task, problem = (self.github('POST', 'issues', {'title': 'x', 'body': claim, 'labels': labels, 'association': 'CONTRIBUTOR'})['number']
+                         for labels in (['q-ready', 'code'], [q.PROBLEM]))
+        mine = self.add('--type', 'research')
+        self.assertEqual(sorted(q.cleanup_issues()), [mine])
+        self.assertEqual([item['iid'] for item in q.load()[0]], [mine])
+        output = self.do(CLAUDE, 'tick')
+        self.assertIn(f'Inbox: 2 issues by non-collaborators (#{task}, #{problem})', output)
+        self.assertNotIn('Board mismatch', output)
+        self.assertNotIn('Problems without a task', output)
 
     def test_only_collaborators_comments_reach_brief_and_questions(self):
         number = self.add('--type', 'research')

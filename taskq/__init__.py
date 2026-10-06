@@ -3089,7 +3089,7 @@ class Selftest:
                 process.kill()
         self.chain()
         if session:
-            self.step('retire the session', runtime, lambda: selftest_retire(runtime, session))
+            self.step('retire the session', runtime, lambda: selftest_retire(runtime, session, wait=self.args.wait))
 
     def notes(self, iid, session, *actions):
         tag = f'{session[:8]}'
@@ -3196,12 +3196,34 @@ def alive(pid):
     return True
 
 
-def selftest_retire(runtime, session, check=False):
-    """Archive a finished selftest worker session or, with `check`, prove it archived."""
+def codex_interrupt(thread):
+    """Interrupt the turn the shared server runs in `thread`; a turn the app runs is left to end."""
+    codex = Codex()
+    if codex.call('thread/read', {'threadId': thread})['thread']['status']['type'] != 'active':
+        return
+    turns = codex.call('thread/turns/list', {'threadId': thread, 'limit': 1, 'itemsView': 'notLoaded'})['data']
+    if turns and turns[0]['status'] == 'inProgress':
+        codex.call('turn/interrupt', {'threadId': thread, 'turnId': turns[0]['id']})
+
+
+def selftest_retire(runtime, session, check=False, wait=600):
+    """Archive a finished selftest worker session or, with `check`, prove it archived. A Codex thread still
+    in a turn (a failed step leaves one running) is interrupted, and archived once the turn ends, up to `wait` s."""
     if runtime == 'codex':
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            codex_archive(argparse.Namespace(thread=session))
-        return out.getvalue().strip()
+        end = time.time() + wait
+        while True:
+            try:
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    codex_archive(argparse.Namespace(thread=session))
+                return out.getvalue().strip()
+            except SystemExit as error:
+                if check or 'is working' not in str(error) or time.time() > end:
+                    raise
+            try:
+                codex_interrupt(session)
+            except SystemExit:
+                pass  # the turn ended between the two reads; the next archive takes it
+            time.sleep(5)
     if runtime == 'claude':
         if not check:
             claude_stop(session, remove=True)

@@ -928,6 +928,27 @@ class Cycle(unittest.TestCase):
             self.assertIn('already archived t1', self.do(CLAUDE, 'codex-archive', 't1'))
         self.assertEqual(announced, [('t1', 'thread-archived', 2)])
 
+    def test_selftest_retire_interrupts_a_working_codex_thread_before_archive(self):
+        class Server:
+            calls, status = [], 'active'
+
+            def call(self, method, params):
+                self.calls.append((method, params))
+                if method == 'turn/interrupt':
+                    Server.status = 'idle'
+                if method == 'thread/turns/list':
+                    return {'data': [{'id': 'u1', 'status': 'inProgress' if Server.status == 'active' else 'interrupted'}]}
+                return {'thread': {'status': {'type': Server.status}, 'path': '/s/rollout.jsonl'}}
+        with patch.object(q, 'Codex', Server), patch.object(q, 'codex_announce', lambda *a: None), \
+                patch.object(q, 'codex_app_running', lambda metadata, turn: False), patch.object(q.time, 'sleep', lambda s: None):
+            self.assertEqual(q.selftest_retire('codex', 't1'), 'archived t1')
+            self.assertIn(('turn/interrupt', {'threadId': 't1', 'turnId': 'u1'}), Server.calls)
+            Server.status = 'active'
+            with self.assertRaises(SystemExit):  # check proves, never interrupts
+                q.selftest_retire('codex', 't1', check=True)
+            with patch.object(q, 'codex_interrupt', lambda thread: None), self.assertRaises(SystemExit):
+                q.selftest_retire('codex', 't1', wait=-1)
+
     def test_codex_read_turns_commands_and_current_operation(self):
         self.codex.status = 'active'
         self.codex.turns = [{'id': 'new', 'status': 'inProgress', 'startedAt': 20},
@@ -1791,7 +1812,7 @@ class Selftest(unittest.TestCase):
             elif pending:
                 pending.pop(0)()
         with patch.object(q, 'codex_spawn', lambda name: 'w1-thread'), patch.object(q, 'codex_send', send), \
-                patch.object(q.time, 'sleep', sleep), patch.object(q, 'selftest_retire', lambda runtime, session: 'archived'):
+                patch.object(q.time, 'sleep', sleep), patch.object(q, 'selftest_retire', lambda runtime, session, **_: 'archived'):
             test.full('codex')
         rows = {row[0]: row for row in test.rows}
         self.assertEqual([row[2] for row in test.rows], ['ok'] * len(test.rows), test.rows)

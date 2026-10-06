@@ -1026,7 +1026,7 @@ class Cycle(unittest.TestCase):
 
     def test_tick_releases_a_stalled_task(self):
         iid = self.add('--type', 'research', '--runtime', 'any')
-        self.do(CODEX, 'take', iid)
+        self.do(CLAUDE, 'take', iid)  # no session status here (not in `claude agents`): only age decides
         self.assertIn('last change 0 min ago', self.do(CLAUDE, 'list'))
         with patch.object(q, 'STALE_MINUTES', -1):
             self.assertIn(f'Released stalled {link(iid)}', self.do(CLAUDE, 'tick'))
@@ -1035,10 +1035,42 @@ class Cycle(unittest.TestCase):
         self.assertIn('continue', self.do(CLAUDE, 'list'))
         self.do(CLAUDE, 'take', iid)
 
+    def test_tick_releases_a_dead_worker_at_once_and_nudges_a_live_one(self):
+        """#43: a session seen on this machine decides before the stale age: dead is released on this tick,
+        alive is never released by age, an idle one is nudged (Claude idle mirrors Codex idle)."""
+        claude, codex = self.add('--type', 'research', '--runtime', 'claude'), self.add('--type', 'asset')
+        self.do(CLAUDE, 'take', claude)
+        self.do(CODEX, 'take', codex)
+        agent = {'id': 'claudese', 'sessionId': 'claude-session', 'pid': 3, 'status': 'busy'}
+        self.agents, self.codex.status = {'claude-session': agent}, 'active'
+        with patch.object(q, 'STALE_MINUTES', -1):
+            output = self.do(COORDINATOR, 'tick')
+        self.assertNotIn('Released', output)
+        self.assertNotIn('## Claude idle', output)
+        self.assertNotIn('## Codex idle', output)
+        agent['status'], self.codex.status = 'idle', 'idle'
+        with patch.object(q, 'STALE_MINUTES', -1):
+            output = self.do(COORDINATOR, 'tick')
+        self.assertNotIn('Released', output)
+        self.assertIn('## Claude idle', output)
+        self.assertIn(f'- {link(claude)}: `claude --bg --resume claude-session "{tick.NUDGE}"`', output)
+        self.assertIn('## Codex idle', output)
+        woken, sent = [], []
+        with patch.object(q, 'claude_wake', lambda session, prompt: woken.append((session, prompt))), \
+                patch.object(q, 'codex_send', lambda args: sent.append(args.thread)), contextlib.redirect_stderr(io.StringIO()):
+            self.do(COORDINATOR, 'tick', '--act')
+        self.assertEqual((woken, sent), ([('claude-session', tick.NUDGE)], ['codex-session']))
+        del agent['pid']
+        self.codex.status = 'systemError'
+        output = self.do(COORDINATOR, 'tick')
+        self.assertIn(f'Released dead {link(claude)}', output)
+        self.assertIn(f'Released dead {link(codex)}', output)
+        self.assertEqual((self.state(claude), self.state(codex)), ('ready', 'ready'))
+
     def test_outsider_comments_do_not_keep_a_dead_workers_task(self):
         """#39: stall age comes from collaborators' notes and label events, not `updated_at` that anyone moves."""
         iid = self.add('--type', 'research', '--runtime', 'any')
-        self.do(CODEX, 'take', iid)
+        self.do(CLAUDE, 'take', iid)
         old = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 3 * 3600))
         for item in [*self.gitlab.notes.values(), *self.gitlab.events[iid]]:
             item['created_at'] = old  # the worker died three hours ago

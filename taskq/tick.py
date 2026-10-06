@@ -236,6 +236,35 @@ def session_link(claim, agent=None):
     return f'`open -g codex://threads/{session}`' if claim.get('runtime') == 'codex' else f'`{session}`'
 
 
+def liveness(item, agents):
+    """#43: (state, activity) of a worker session as this machine sees it. state: 'busy'; 'idle' (alive, its turn
+    ended: nudge it); 'dead' (stopped: release a doing task now); None (no status here: another machine, no CLI,
+    or a Codex task not in doing). A listed Claude job without pid is dead; ponytail: an unlisted one is unknown,
+    since `claude agents` failing also lists nothing; the 120-minute stale release covers it."""
+    session, runtime = item['claim']['session'], item['claim'].get('runtime')
+    if runtime == 'claude':
+        agent = agents.get(session)
+        if not agent:
+            return None, f'issue {core.age(item)} min ago'
+        state = 'dead' if not agent.get('pid') else 'busy' if agent.get('status') == 'busy' else 'idle'
+        return state, f'{"running" if agent.get("pid") else "stopped"}, issue {core.age(item)} min ago'
+    if runtime != 'codex' or item['state'] != 'doing':
+        return None, f'issue {core.age(item)} min ago'
+    try:
+        codex = core.Codex()
+        try:
+            status, turns, last = core.codex_snapshot(codex, session, 1)
+        finally:
+            codex.socket.close()
+    except (OSError, SystemExit, ValueError) as error:
+        return None, f'status unknown: {core.codex_line(error)}'
+    # notLoaded with a running last turn: the app holds the session and works in it.
+    working = bool(turns) and turns[0].get('app', False)
+    state = ('busy' if working else 'idle' if status['type'] in ('idle', 'notLoaded')
+             else 'dead' if status['type'] == 'systemError' else 'busy')
+    return state, f'{status["type"]}{" (turn running in the app)" if working else ""}, last event {core.codex_age(last)}'
+
+
 def inbox_line(inbox):
     """Issues by non-collaborators, named so the manager sees them; taskq never acts on them. A collaborator makes
     one a task with `add` (a new task that links it)."""
@@ -397,14 +426,23 @@ def tick_pass(args, act=False):
     selected = {item['iid'] for item in candidates}
     # Only the lease holder starts workers, accepts reviews and shows questions; another machine releases its own work.
     holder = (coordinator(args.profile) or {}).get('node') == core.node()
-    stalled = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and core.age(item) > core.STALE_MINUTES
-               and (holder or core.local_claim(item['claim'] or {}))]
-    for item in stalled:
+    # #43: a session seen here decides at once: dead is released now, alive (busy or idle) never by age.
+    doing = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and (item['claim'] or {}).get('session')]
+    agents = core.claude_agents() if any(item['claim'].get('runtime') == 'claude' for item in loaded[0]
+                                         if item['iid'] in selected and (item['claim'] or {}).get('session')) else {}
+    alive = {item['iid']: liveness(item, agents) for item in doing}
+    dead = [item for item in doing if alive[item['iid']][0] == 'dead' and not item.get('result')]
+    stalled = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and alive.get(item['iid'], (None,))[0] is None
+               and core.age(item) > core.STALE_MINUTES and (holder or core.local_claim(item['claim'] or {}))]
+    for item in dead + stalled:
         if not core.unchanged(item):
             continue
-        args.iid, args.action, args.text = item['iid'], 'release', f'no change on the issue for {core.age(item)} minutes'
+        why = f'its {item["claim"]["runtime"]} session {item["claim"]["session"]} has stopped' if item in dead else \
+            f'no change on the issue for {core.age(item)} minutes'
+        args.iid, args.action, args.text = item['iid'], 'release', why
         core.requeue(args)
-        print(f'Released stalled {core.ref(item)}.')
+        print(f'Released {"dead" if item in dead else "stalled"} {core.ref(item)}.')
+    stalled = dead + stalled
     if not holder:
         # A task pinned to this machine (`host-<name>`) starts only here: the coordinator elsewhere cannot start it.
         start = starts(args, core.load() if stalled else loaded, {item['iid'] for item in candidates if item.get('host') == core.machine()})
@@ -466,29 +504,14 @@ def tick_pass(args, act=False):
     print(inbox_line(inbox), end='')
     # #83: one table of every worker; the owner's chat opens only http(s) links.
     workers = [item for item in everything if item['state'] in ('doing', 'ask', 'review') and (item['claim'] or {}).get('session')]
-    agents = core.claude_agents() if any(item['claim'].get('runtime') == 'claude' for item in workers) else {}
-    idle, rows = [], []
+    idle, claude_idle, rows = [], [], []
     for item in workers:
         session, runtime = item['claim']['session'], item['claim'].get('runtime')
-        agent, activity = agents.get(session), f'issue {core.age(item)} min ago'
-        if agent:
-            activity = f'{"running" if agent.get("pid") else "stopped"}, {activity}'
-        if runtime == 'codex' and item['state'] == 'doing':
-            try:
-                codex = core.Codex()
-                try:
-                    status, turns, last = core.codex_snapshot(codex, session, 1)
-                finally:
-                    codex.socket.close()
-                # notLoaded with a running last turn: the app holds the session and works in it.
-                working = bool(turns) and turns[0].get('app', False)
-                activity = f'{status["type"]}{" (turn running in the app)" if working else ""}, last event {core.codex_age(last)}'
-                if status['type'] in ('idle', 'notLoaded') and not working and not item.get('result'):
-                    idle.append(item)
-            except (OSError, SystemExit, ValueError) as error:
-                activity = f'status unknown: {core.codex_line(error)}'
+        state, activity = alive.get(item['iid']) or liveness(item, agents)
+        if state == 'idle' and item['state'] == 'doing' and not item.get('result'):
+            (claude_idle if runtime == 'claude' else idle).append(item)
         rows.append(f'| {core.ref(item)} {item["title"][:40].replace("|", "/")} | {item["state"]} | {runtime}{core.where(item["claim"])} '
-                    f'| {session_link(item["claim"], agent)} | {activity} |')
+                    f'| {session_link(item["claim"], agents.get(session))} | {activity} |')
     if rows:
         print('## Workers\n\nShow the owner this table as printed; every link opens in a browser:\n\n'
               '| Task | State | Runtime | Session | Last activity |\n|---|---|---|---|---|\n' + '\n'.join(rows) + '\n')
@@ -501,6 +524,14 @@ def tick_pass(args, act=False):
         for item in idle:
             print(f'- {core.ref(item)}: `{core.TOOL} codex-send {item["claim"]["session"]} '
                   f'--text "{NUDGE}"`')
+        print()
+    if claude_idle and act:
+        for item in claude_idle:
+            step(f'nudge idle Claude {core.ref(item)}', lambda item=item: core.claude_wake(item['claim']['session'], NUDGE))
+    elif claude_idle:
+        print('## Claude idle\n\nTask is doing without result/ask, but its session has ended its turn. Intervene now:\n')
+        for item in claude_idle:
+            print(f'- {core.ref(item)}: `claude --bg --resume {item["claim"]["session"]} "{NUDGE}"`')
         print()
     # An app without a status API: silence on the issue is the only sign its turn ended without a hand-in.
     quiet = [item for item in everything if item['state'] == 'doing' and (item['claim'] or {}).get('runtime') in core.EXECUTORS

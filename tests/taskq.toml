@@ -18,3 +18,7 @@ continue = "this task was started before in worktree `taskq-{iid}`; continue the
 none = "this task is expected to end in an answer, not a commit: work from the main checkout."
 retire = "make worktree-retire NAME=taskq-{iid}"
 cleanup_helpers = "scripts"
+
+[update]
+auto = false
+every = "24h"

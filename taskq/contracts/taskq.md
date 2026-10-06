@@ -52,6 +52,7 @@ It holds no secrets: the token belongs to `glab`.
 | `[workspace] new`, `continue`, `none` | Brief text about the workspace; `{iid}` is the task number | `git worktree add` next to the checkout |
 | `[workspace] retire` | What `close` prints to clean up the tree | nothing |
 | `[workspace] cleanup_helpers` | Project folder with `workspace_gc.py`, `host_gentle.py`, `host_tools.py` for `cleanup` | none: `cleanup` refuses |
+| `[update] auto`, `every` | `tick` updates taskq from `main` on GitHub at most this often (`30m`, `24h`, `7d`); `taskq update` does it by hand. Missing keys are written into `taskq.toml` with the defaults, and named | `true`, `24h` |
 | `[brief] rules` | Project rules added to step 6 of every worker brief (budget, approvals, where the project's authorization is written) | nothing |
 
 New project: `taskq init --project group/project` writes a minimal `taskq.toml` if none exists and

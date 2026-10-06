@@ -85,7 +85,7 @@ Tool `CronCreate` (loaded via ToolSearch), `recurring: true`, `cron: "*/5 * * * 
 `prompt`:
 
 ```
-taskq tick. Run `taskq update; cd <main checkout> && git pull -q --ff-only origin main; taskq tick <confirmed profile arguments>`
+taskq tick. Run `cd <main checkout> && git pull -q --ff-only origin main; taskq tick <confirmed profile arguments>`
 and do the coordinator pass by taskq-manager.md § 3 (`taskq contract` prints its path). Reply in the owner's language,
 one or two lines when nothing changed.
 ```

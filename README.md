@@ -22,8 +22,10 @@ git clone https://github.com/alexkirs/taskq ~/Projects/taskq
 pipx install -e ~/Projects/taskq
 ```
 
-`taskq update` runs `git pull` in the clone an editable install runs from; the coordinator's tick runs it
-on every pass, so a change pushed from one machine reaches the others. Versions are not pinned.
+taskq updates itself once a day; `taskq update` updates by hand; `[update] auto = false` turns it off.
+The tick checks `main` of this repository at most every `[update] every`: an editable clone is fast-forwarded
+(left alone, with the reason, when it has uncommitted changes or commits `main` lacks), an install from Git is
+reinstalled, and the pass goes on as the new version. `tick` prints the version it runs. Versions are not pinned.
 
 ## Set up a project
 
@@ -64,6 +66,10 @@ none = "this task ends in an answer, not a commit: work from the main checkout."
 retire = "git worktree remove ../taskq-{iid}"   # printed after `close`
 cleanup_helpers = "scripts"   # folder with workspace_gc.py, host_gentle.py, host_tools.py for `taskq cleanup`
 
+[update]                      # written with these defaults when missing
+auto = true                   # tick updates taskq from GitHub
+every = "24h"                 # at most this often (m, h, d)
+
 [brief]
 rules = """
 Project rules appended to every worker brief.
@@ -90,7 +96,7 @@ add → ready ⇄ waiting → take → doing → result → review → close
 ## Use from sessions
 
 - **Manager** (the session the owner talks to): `taskq add`, `taskq list`, `taskq answer`, `taskq later`.
-- **Coordinator**: every 5 minutes runs `taskq update; taskq tick` and follows what it prints: accept or
+- **Coordinator**: every 5 minutes runs `taskq tick` and follows what it prints: accept or
   reject results, start workers (`taskq spawn` for a Claude desktop session, `taskq spawn --runtime codex`
   plus `taskq codex-send` for the Codex app), pass questions to the owner.
 - **Worker**: its only prompt is ``Run `cd <main checkout> && taskq worker` and follow the instructions it
@@ -117,7 +123,7 @@ Limits live only in the prompt; the global `[limit]` setting is retired.
 
 ## Develop
 
-Change the clone, run the tests, push to `main`; other machines take it with `taskq update`.
+Change the clone, run the tests, push to `main`; other machines take it within `[update] every`, or at once with `taskq update`.
 
 ```bash
 python3 -m unittest discover -s tests

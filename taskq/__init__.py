@@ -31,6 +31,12 @@ WORKSPACE = {
 }
 RULES = ''  # project rules for workers, from [brief] rules: lines of step 6 of the brief
 RETIRE = None  # printed after `close` of a code task: how to remove its worktree
+REPO = 'https://github.com/alexkirs/taskq'  # where every install takes `main` from
+UPDATE = {'auto': True, 'every': '24h'}  # [update] of taskq.toml: tick checks REPO at most this often
+# A cache, not queue state: when this machine last asked REPO for its `main`.
+UPDATE_STAMP = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'taskq' / 'update-last'
+# Keys a taskq.toml gets, as TOML text, when it lacks them: a new version's fields reach old configs.
+DEFAULTS = {'update': {'auto': 'true', 'every': '"24h"'}}
 # waiting: open dependencies, moved only by `tick`; ask: a question for the owner (worker's or manager's);
 # later: deferred by the owner, nobody waits on anything. Board columns in this order.
 STATES = ('ready', 'waiting', 'doing', 'review', 'ask', 'later')
@@ -105,7 +111,7 @@ def configure(path=None):
                                          if (folder / 'taskq.toml').is_file()), None)
     if not path:
         fail('no taskq.toml in this directory or above it (README: «A new project»)')
-    config = tomllib.loads(path.read_text())
+    config = tomllib.loads(complete(path))
     gitlab, codex, workspace = config['gitlab'], config.get('codex', {}), config.get('workspace', {})
     PROJECT_PATH, HOST = gitlab['project'], gitlab.get('host')
     # `projects/:id` makes glab look the project up first: +1 s per request (measured 2026-10-06).
@@ -115,10 +121,38 @@ def configure(path=None):
     CODEX_PROJECT, CODEX_SECTION = codex.get('project'), codex.get('section')
     WORKSPACE.update({key: workspace[key] for key in WORKSPACE if key in workspace})
     RETIRE, HELPERS = workspace.get('retire'), workspace.get('cleanup_helpers')
+    UPDATE.update(config.get('update', {}))
+    seconds(UPDATE['every'])
     RULES = ''.join(f'   {line}\n' for line in config.get('brief', {}).get('rules', '').strip().splitlines())
     ROOT = main_checkout(path.parent)
     TICK_BEAT = ROOT / '.local' / 'taskq-tick-last'
     WORKER = f'Run `cd {ROOT} && {TOOL} worker` and follow the instructions it prints.'
+
+
+def complete(path):
+    """The text of `path` with every DEFAULTS key it lacked written into it; says what it added."""
+    import tomllib
+    text = path.read_text()
+    config = tomllib.loads(text)
+    for section, keys in DEFAULTS.items():
+        lines = ''.join(f'{key} = {value}\n' for key, value in keys.items() if key not in config.get(section, {}))
+        if not lines:
+            continue
+        header = re.search(rf'^\[{section}\][^\n]*\n', text, re.M)
+        text = (text[:header.end()] + lines + text[header.end():] if header
+                else text.rstrip('\n') + f'\n\n[{section}]\n' + lines)
+        print(f'{path}: added to [{section}]: {lines.strip().replace(chr(10), "; ")}')
+    if text != path.read_text():
+        path.write_text(text)
+    return text
+
+
+def seconds(every):
+    """`30m`, `24h`, `7d` in seconds."""
+    found = re.fullmatch(r'(\d+)([mhd])', str(every))
+    if not found:
+        fail(f'[update] every = "{every}": write a number and m, h or d, e.g. "24h"')
+    return int(found[1]) * {'m': 60, 'h': 3600, 'd': 86400}[found[2]]
 
 
 def session():
@@ -610,9 +644,75 @@ def contract(args):
     print('\n'.join(str(path) for path in sorted(folder.glob('*.md'))))
 
 
+def git(*args, cwd=None):
+    """Git's output, or None when it failed or took too long (no network)."""
+    try:
+        done = subprocess.run(['git', *(['-C', str(cwd)] if cwd else []), *args], capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return None
+    return None if done.returncode else done.stdout.strip()
+
+
+def install():
+    """('clone', folder) for an editable clone; ('git', commit) for an install from REPO; (None, None) otherwise."""
+    folder = Path(__file__).resolve().parents[1]
+    if (folder / '.git').exists():
+        return 'clone', folder
+    from importlib import metadata
+    try:
+        origin = json.loads(metadata.distribution('taskq').read_text('direct_url.json') or '{}')
+    except metadata.PackageNotFoundError:
+        origin = {}
+    commit = origin.get('vcs_info', {}).get('commit_id')
+    return ('git', commit) if commit else (None, None)
+
+
+def version():
+    kind, where = install()
+    return (git('rev-parse', '--short=7', 'HEAD', cwd=where) if kind == 'clone' else (where or '')[:7]) or 'unknown'
+
+
 def update(args):
-    """Pull the clone this command runs from (an editable install): one rule on every machine."""
-    subprocess.run(['git', '-C', str(Path(__file__).resolve().parents[1]), 'pull', '-q', '--ff-only'], check=True)
+    """Bring this install to `main` of REPO: fast-forward of an editable clone, else a reinstall from Git.
+    True when it updated. A clone with uncommitted changes or commits `main` lacks is left alone."""
+    say = print if args.verbose else (lambda text: None)
+    kind, where = install()
+    old, remote = version(), git('ls-remote', REPO, 'refs/heads/main')
+    if not remote:
+        return say(f'update skipped: {REPO} did not answer')
+    new = remote.split()[0]
+    if kind is None:
+        return print(f'not updated: this taskq is not installed from Git; reinstall: pipx install --force git+{REPO}')
+    if new == (git('rev-parse', 'HEAD', cwd=where) if kind == 'clone' else where):
+        return print(f'up to date {old}')
+    if kind == 'clone':
+        if git('status', '--porcelain', '--untracked-files=no', cwd=where):
+            return print(f'not updated: {where} has uncommitted changes')
+        if git('fetch', '-q', REPO, 'main', cwd=where) is None:
+            return say(f'update skipped: fetch from {REPO} failed')
+        if git('merge-base', '--is-ancestor', 'HEAD', 'FETCH_HEAD', cwd=where) is None:
+            return print(f'not updated: {where} has commits main of {REPO} lacks')
+        if git('merge', '-q', '--ff-only', 'FETCH_HEAD', cwd=where) is None:
+            return print(f'not updated: fast-forward of {where} failed (`git -C {where} merge --ff-only FETCH_HEAD` says why)')
+    else:
+        # ponytail: pipx and uv tool by their venv path, pip otherwise; another installer reinstalls by hand.
+        prefix = Path(sys.prefix).parts
+        command = (['pipx', 'install', '--force'] if 'pipx' in prefix else ['uv', 'tool', 'install', '--force'] if 'uv' in prefix
+                   else [sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall'])
+        subprocess.run([*command, f'git+{REPO}'], check=True, capture_output=True, timeout=600)
+    print(f'updated {old} → {new[:7]}')
+    return True
+
+
+def auto_update():
+    """[update] auto: at most once per `every`; a pass that updated goes on as the new version (exec)."""
+    if not UPDATE['auto'] or (UPDATE_STAMP.exists() and time.time() - UPDATE_STAMP.stat().st_mtime < seconds(UPDATE['every'])):
+        return
+    UPDATE_STAMP.parent.mkdir(parents=True, exist_ok=True)
+    UPDATE_STAMP.touch()
+    if update(argparse.Namespace(verbose=False)):
+        sys.stdout.flush()
+        os.execv(sys.executable, [sys.executable, '-m', 'taskq', *sys.argv[1:]])
 
 
 def migrate(args):
@@ -1137,6 +1237,8 @@ def worker_prompt(args):
 
 def tick(args):
     """One pass of the coordinator: release dead claims itself, then print exactly what to do."""
+    auto_update()
+    print(f'taskq {version()}')
     tick_beat()
     loaded, candidates = profile(args)
     selected = {item['iid'] for item in candidates}
@@ -1593,7 +1695,7 @@ def main(argv=None):
         command(name, migrate, (('--project',), {'help': 'GitLab project path: writes a minimal taskq.toml here if none'}),
                 (('--host',), {'help': 'GitLab host for that taskq.toml, e.g. gitlab.example.com'}))
     command('contract', contract)
-    command('update', update)
+    command('update', update, (('--verbose',), {'action': 'store_true', 'help': 'say why a check was skipped'}))
     command('report', report, (('--hours',), {'type': int, 'default': 24}))
     args = parser.parse_args(argv)
     if getattr(args, 'project', None) and not Path('taskq.toml').exists():

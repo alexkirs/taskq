@@ -918,6 +918,114 @@ class TickBeat(unittest.TestCase):
         self.assertEqual(third.getvalue(), 'Last tick: 20 min ago.\n')
 
 
+
+class Update(unittest.TestCase):
+    """A real `main` in a bare repository stands in for GitHub; the install is a clone of it."""
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.origin, self.work, self.clone = self.root / 'origin.git', self.root / 'work', self.root / 'clone'
+        self.git('init', '-q', '--bare', '-b', 'main', str(self.origin))
+        self.git('clone', '-q', str(self.origin), str(self.work))
+        self.commit(self.work, 'one')
+        self.git('clone', '-q', str(self.origin), str(self.clone))
+        self.enterContext(patch.object(q, 'REPO', str(self.origin)))
+        self.enterContext(patch.object(q, 'install', lambda: ('clone', self.clone)))
+
+    def git(self, *args, cwd=None):
+        return subprocess.run(['git', *(['-C', str(cwd)] if cwd else []), '-c', 'user.name=t', '-c', 'user.email=t@t', *args],
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self, where, name):
+        (where / name).write_text(name)
+        self.git('add', name, cwd=where)
+        self.git('commit', '-q', '-m', name, cwd=where)
+        self.git('push', '-q', 'origin', 'HEAD:main', cwd=where)
+        return self.git('rev-parse', '--short=7', 'HEAD', cwd=where)
+
+    def update(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            done = q.update(SimpleNamespace(verbose=True))
+        return done, out.getvalue()
+
+    def test_clone_fast_forwards_then_is_up_to_date(self):
+        old = q.version()
+        new = self.commit(self.work, 'two')
+        self.assertEqual(self.update(), (True, f'updated {old} → {new}\n'))
+        self.assertEqual(q.version(), new)
+        self.assertEqual(self.update(), (None, f'up to date {new}\n'))
+
+    def test_dirty_or_ahead_clone_is_left_alone(self):
+        self.commit(self.work, 'two')
+        (self.clone / 'one').write_text('edited')
+        before = q.version()
+        self.assertIn('uncommitted changes', self.update()[1])
+        self.git('checkout', '-q', 'one', cwd=self.clone)
+        (self.clone / 'mine').write_text('mine')
+        self.git('add', 'mine', cwd=self.clone)
+        self.git('commit', '-q', '-m', 'mine', cwd=self.clone)
+        ahead = q.version()
+        self.assertNotEqual(ahead, before)
+        self.assertIn('commits main of', self.update()[1])
+        self.assertEqual(q.version(), ahead)
+
+    def test_no_network_is_silent_without_verbose(self):
+        with patch.object(q, 'REPO', str(self.root / 'missing.git')), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIsNone(q.update(SimpleNamespace(verbose=False)))
+            self.assertEqual(out.getvalue(), '')
+            self.assertIn('did not answer', self.update()[1])
+
+    def test_install_from_git_reinstalls_with_its_installer(self):
+        old = self.git('rev-parse', 'HEAD', cwd=self.clone)
+        self.commit(self.work, 'two')
+        calls, real = [], subprocess.run
+        def run(command, **options):
+            calls.append(command)
+            return real(command, **options) if command[0] == 'git' else None
+        with patch.object(q, 'install', lambda: ('git', old)), patch.object(q.sys, 'prefix', '/home/u/.local/pipx/venvs/taskq'), \
+                patch.object(q.subprocess, 'run', run), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertTrue(q.update(SimpleNamespace(verbose=False)))
+        self.assertEqual(calls[-1], ['pipx', 'install', '--force', f'git+{self.origin}'])
+        self.assertIn(f'updated {old[:7]} → ', out.getvalue())
+
+    def test_tick_checks_at_most_every_and_never_when_off(self):
+        stamp, done = self.root / 'state' / 'update-last', []
+        def update(args):
+            done.append(1)
+            return len(done) == 3
+        with patch.object(q, 'UPDATE_STAMP', stamp), patch.object(q, 'update', update), \
+                patch.object(q.os, 'execv', lambda *command: done.append(command)), patch.dict(q.UPDATE, auto=True, every='24h'):
+            q.auto_update()
+            q.auto_update()
+            self.assertEqual(done, [1])
+            os.utime(stamp, (time.time() - 25 * 3600,) * 2)
+            q.auto_update()
+            self.assertEqual(done, [1, 1])
+            os.utime(stamp, (time.time() - 25 * 3600,) * 2)
+            q.auto_update()
+            self.assertEqual(done[3][1][1:3], ['-m', 'taskq'])
+            os.utime(stamp, (time.time() - 25 * 3600,) * 2)
+            q.UPDATE['auto'] = False
+            q.auto_update()
+            self.assertEqual(len(done), 4)
+        self.assertEqual([q.seconds(every) for every in ('30m', '24h', '7d')], [1800, 86400, 604800])
+        self.assertRaises(SystemExit, q.seconds, '1 day')
+
+    def test_missing_config_fields_are_written_and_named(self):
+        config = self.root / 'taskq.toml'
+        config.write_text('[gitlab]\nproject = "g/p"\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            q.complete(config)
+        self.assertIn('added to [update]: auto = true; every = "24h"', out.getvalue())
+        config.write_text('[gitlab]\nproject = "g/p"\n\n[update]\nauto = false\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            q.complete(config)
+            q.complete(config)
+        self.assertEqual(out.getvalue().count('added'), 1)
+        self.assertEqual(config.read_text(), '[gitlab]\nproject = "g/p"\n\n[update]\nevery = "24h"\nauto = false\n')
+
+
 @unittest.skipUnless(HELPERS, 'TASKQ_CLEANUP_HELPERS names no folder with workspace_gc.py, host_tools.py, host_gentle.py')
 class Cleanup(unittest.TestCase):
     """Real Git refs, patches and retire in disposable repositories; no live app mutations."""

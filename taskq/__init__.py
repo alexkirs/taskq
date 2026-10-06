@@ -215,9 +215,13 @@ def seconds(every):
 
 
 def session():
-    """This session's identity, or None for the owner's own shell."""
-    return next(({'runtime': runtime, 'session': os.environ[variable]} for runtime, variable in RUNTIMES.items()
-                 if os.environ.get(variable)), None)
+    """This session's identity, or None for the owner's own shell. A configured app started from a Claude or
+    Codex session inherits that session's variable: its own [runtimes] variable wins; two of a kind are an error."""
+    found = [runtime for runtime, variable in RUNTIMES.items() if os.environ.get(variable)]
+    found = [runtime for runtime in found if runtime in EXECUTORS] or found
+    if len(found) > 1:
+        fail('two session identities set: ' + ' and '.join(RUNTIMES[runtime] for runtime in found) + '; unset the inherited one')
+    return {'runtime': found[0], 'session': os.environ[RUNTIMES[found[0]]]} if found else None
 
 
 def me():
@@ -234,8 +238,8 @@ def machine(hostname=None):
 
 
 def who():
-    return next((f'{runtime}:{os.environ[variable][:8]}' for runtime, variable in RUNTIMES.items()
-                 if os.environ.get(variable)), 'owner')
+    current = session()
+    return f'{current["runtime"]}:{current["session"][:8]}' if current else 'owner'
 
 
 def api(method, path, body=None):
@@ -1359,6 +1363,7 @@ def doctor(args):
                 gap(what, fix)
         except SystemExit as error:
             gap(f'{name} could not be read: {str(error).removeprefix("taskq: ")}', 'fix the cause above, then `taskq doctor` again')
+    gaps += runtime_gaps()
     report_gaps(gaps)
 
 
@@ -1404,6 +1409,25 @@ def profile_init(args):
     ignore_local()
 
 
+def runtime_gaps():
+    """Each [runtimes.<name>] `doctor` command, run from the main checkout: its own `- what / fix` lines as one gap
+    while it exits nonzero. It runs without the session variables, like a worker of that app."""
+    gaps = []
+    for name, item in EXECUTORS.items():
+        if not item.get('doctor'):
+            continue
+        try:
+            done = subprocess.run(shlex.split(item['doctor']), cwd=ROOT, env=selftest_env(), capture_output=True, text=True, timeout=120)
+            code, output = done.returncode, done.stdout + done.stderr
+        except (OSError, subprocess.TimeoutExpired) as error:
+            code, output = 'not run', str(error)
+        if code:
+            fix = f'{item["setup"]}  (prints the steps)' if item.get('setup') else 'the lines above'
+            lines = ''.join(f'\n    {line}' for line in output.strip().splitlines())
+            gaps.append(f'- runtime {name}: `{item["doctor"]}` exit {code}{lines}\n    fix: {fix}')
+    return gaps
+
+
 def write_access(github):
     if github:
         push = api('GET', 'repository')['permissions']['push']
@@ -1436,7 +1460,9 @@ def board_gaps(github, host):
 
 def report_gaps(gaps):
     if not gaps:
-        return print(f'ready: {PROJECT_PATH} — config, CLI login, write access, labels and board {BOARD}')
+        checked = [name for name, item in EXECUTORS.items() if item.get('doctor')]
+        return print(f'ready: {PROJECT_PATH} — config, CLI login, write access, labels and board {BOARD}'
+                     + (f', runtime {", ".join(checked)}' if checked else ''))
     print(f'not ready: {len(gaps)} gap(s); each line is the command that closes it\n' + '\n'.join(gaps))
     sys.exit(1)
 
@@ -1537,6 +1563,9 @@ def setup(args):
     else:
         person(f'{TOOL} profile init <confirmed preferences>', 'the profile card of taskq-manager.md § 1 first: areas, own '
                'tasks or pool, Claude/Codex slots; until then tick uses defaults (all areas, own tasks and the pool, 2/3)')
+    for name, item in EXECUTORS.items():
+        if item.get('setup'):
+            person(f'cd {ROOT} && {item["setup"]}', f'runtime {name}: its app steps (sign-in, bot, trigger) are the person\'s')
     print('No workers or timer started.' + (f' Pending for the person: {len(pending)} step(s) above.' if pending else ''))
     doctor(argparse.Namespace())
     if pending:
@@ -2099,6 +2128,23 @@ def claude_stop(session, remove=False):
         if agent and (verb == 'rm' or agent.get('pid')):
             subprocess.run(['claude', verb, agent['id']], cwd=ROOT, check=True, capture_output=True, timeout=60)
     return agent
+
+
+def view(args):
+    """A task as the queue sees it, read only: state, claim, the last notes, the result."""
+    issue = api('GET', f'issues/{args.iid}')
+    closed = issue['state'] != 'opened'  # close drops the state label
+    labels = [label for label in issue['labels'] if not label.startswith(PREFIX)] + [PREFIX + STATES[0]] * closed
+    item = parse({**issue, 'labels': labels if closed else issue['labels']}) or fail(f'#{args.iid} is not a taskq task')
+    claim = item['claim'] or {}
+    print(f'#{item["iid"]} {item["title"]}\nstate: ' + ('closed' if closed else item['state'])
+          + f', p{item["priority"]}, runtime {item["runtime"] or "any"}, last change {item["age"]} min ago')
+    print('claim: ' + (f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]}' + (f' @{machine(claim["host"])}' if claim.get('host') else '') if claim else 'none'))
+    found = notes(comments(item['iid']))
+    for body in found[-args.notes:]:
+        print('\n---\n' + body)
+    if claim:
+        print('\n=== result ===\n' + handed_in(item))
 
 
 def show(args):
@@ -3131,6 +3177,7 @@ def main(argv=None):
             (('--name',), {'default': 'taskq worker', 'help': 'session name: "T<N> <words>"; " (<this machine>)" is added'}),
             (('--remote-control',), {'action': 'store_true', 'help': 'Claude: keep Remote Control on (off by default)'}),
             (('--text',), {'help': 'the worker prompt the session starts on (tick prints it); idle without it'}))
+    command('view', view, iid, (('--notes',), {'type': int, 'default': 3, 'help': 'last notes to print (default 3)'}))
     claude_session = (('session',), {'help': 'Claude session id (or local_<id>)'})
     command('show', show, claude_session,
             (('--restore',), {'help': 'app session to show again after the import (default: the calling session)'}))

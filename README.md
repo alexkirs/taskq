@@ -187,6 +187,12 @@ Two machines each run their own tick and limits. A task for one machine only: `t
 Worker sessions are named `T<N> … @mac`; spawned Claude workers have Remote Control off
 (`taskq spawn --remote-control` keeps it on).
 
+A third worker app (e.g. a Grok bot) is one `[runtimes.<name>]` table in taskq.toml: `env`, `spawn`, `send`,
+optional `archive`, `doctor` and `setup` commands. `taskq doctor` runs its `doctor`, `doctor --fix` prints its
+`setup`; then `taskq selftest --scope full --runtime <name>`. Details: [manager contract](taskq/contracts/taskq-manager.md#checking-the-orchestration-selftest).
+
+`taskq view N` prints a task read only: state, claim, last notes, result.
+
 ## Talk to the manager
 
 > **You:** Add a task to fix login; assign it to me.<br>

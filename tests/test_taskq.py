@@ -1691,7 +1691,11 @@ class Selftest(unittest.TestCase):
             self.assertEqual(q.selftest_command(q.EXECUTORS['grok']['send'], session='s 1', text='a; rm -rf /'),
                              ['run-grok', 'send', 's 1', 'a; rm -rf /'])
             iid = self.add('--type', 'research', '--runtime', 'grok')
-            self.assertIn(f'take {iid}', self.do({**CLAUDE, 'CLAUDE_CODE_SESSION_ID': '', 'GROK_SESSION_ID': 'g1'}, 'worker'))
+            # the app started from a Claude session inherits its variable: its own wins, never a silent claude
+            self.assertIn(f'take {iid}', self.do({**CLAUDE, 'GROK_SESSION_ID': 'g1'}, 'worker'))
+            with patch.dict(os.environ, {**CLAUDE, **CODEX, 'CLAUDE_CODE_SESSION_ID': 'c'}), self.assertRaises(SystemExit) as caught:
+                q.session()
+            self.assertIn('CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID', str(caught.exception))
             # spawn and send of the coordinator run the table's commands, never a Claude session
             q.EXECUTORS['grok'] = {**q.EXECUTORS['grok'], 'spawn': 'echo id-{name}', 'send': 'echo sent {session} {text}'}
             out = io.StringIO()
@@ -1699,6 +1703,19 @@ class Selftest(unittest.TestCase):
                 q.spawn(argparse.Namespace(runtime='grok', name='T1 x', text=None))
                 q.send(argparse.Namespace(runtime='grok', session='g1', text='go'))
             self.assertEqual(out.getvalue().split('\n')[:2], ['id-T1 x (mac-1)', 'sent g1 go'])
+
+
+    def test_view_prints_state_claim_notes_and_result_without_writing(self):
+        iid = self.add('--type', 'research')
+        self.do(CLAUDE, 'take', iid)
+        self.do(CLAUDE, 'result', iid, '--checks', 'c', '--text', 'done here')
+        before = json.dumps(self.gitlab.issues)
+        out = self.do(COORDINATOR, 'view', iid)
+        self.assertEqual(json.dumps(self.gitlab.issues), before)
+        for text in (f'#{iid} t', 'state: review', 'claim: claude:claude-s', '=== result ===\n**result** · claude:claude-s'):
+            self.assertIn(text, out)
+        self.do(COORDINATOR, 'close', iid, '--text', 'ok')
+        self.assertIn('state: closed', self.do(COORDINATOR, 'view', iid))
 
 
 class Doctor(unittest.TestCase):
@@ -1758,6 +1775,20 @@ class Doctor(unittest.TestCase):
         self.assertEqual(self.doctor(), (0, 'ready: group/project — config, CLI login, write access, labels and board taskq\n'))
         gitlab.boards[0]['lists'].pop()
         self.assertIn('columns are', self.doctor()[1])
+
+    def test_a_runtime_doctor_command_is_a_gap_while_it_fails(self):
+        gitlab = Gitlab()
+        self.enterContext(patch.object(q, 'api', gitlab))
+        with contextlib.redirect_stdout(io.StringIO()):
+            q.main(['init'])
+        red = {'env': 'BOT_ID', 'doctor': "sh -c 'echo \"- app not running / open it\"; exit 1'", 'setup': 'bot setup'}
+        self.enterContext(patch.dict(q.EXECUTORS, {'bot': red}))
+        code, out = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertIn("runtime bot: `sh -c 'echo \"- app not running / open it\"; exit 1'` exit 1\n    - app not running / open it\n"
+                      "    fix: bot setup  (prints the steps)", out)
+        q.EXECUTORS['bot'] = {**red, 'doctor': "sh -c 'echo fine'"}
+        self.assertEqual(self.doctor()[0], 0)
 
     def test_origin_of_another_project_is_named(self):
         self.enterContext(patch.object(q, 'api', Gitlab()))
@@ -1839,6 +1870,15 @@ class Setup(unittest.TestCase):
         (self.tmp / '.claude').mkdir()
         (self.tmp / '.claude/settings.local.json').write_text(json.dumps({'permissions': {'allow': list(q.WORKER_ALLOW)}}))
         (self.tmp / 'taskq.local.toml').write_text('[profile]\nmine = false\n')
+
+    def test_a_runtime_setup_command_is_the_persons_step(self):
+        self.enterContext(patch.object(q, 'api', Gitlab()))
+        self.enterContext(patch.dict(q.EXECUTORS, {'bot': {'env': 'BOT_ID', 'setup': 'python3 bot.py setup'}}))
+        self.origin = 'git@gitlab.example.com:group/project.git'
+        self.trust_and_permissions()
+        code, out = self.fix()
+        self.assertEqual(code, 1)
+        self.assertIn(' && python3 bot.py setup\n    runtime bot: its app steps', out)
 
     def test_gitlab_person_steps_printed_then_fixed_once(self):
         gitlab = Gitlab()

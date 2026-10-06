@@ -331,6 +331,8 @@ free slot). The other runtime will not take the task. One at a time:
    but `take` gives it to one, the other is refused and takes the next ([taskq](taskq.md) § Taking a task).
 4. Tell the owner, in one line per worker, how to watch it: the tick's section "Claude worker
    sessions" lists every doing Claude worker with `claude attach <id>` and `taskq show <id>`.
+   A task itself, read only (state, claim, last notes, result): `taskq view <N>`; `taskq show`
+   takes a Claude session id and imports it into the app.
    The owner watches with `claude agents` / `claude attach` in a terminal of that machine, or on
    request in the desktop app (§ "Showing a worker in the app"). Remote Control is off for spawned
    workers (below); `taskq spawn --remote-control` keeps it on for a worker the owner wants on the phone.
@@ -599,20 +601,35 @@ table to the owner as printed, failed rows first in the reply.
 repeats only the trace checks (tasks, worktrees, sessions, board) of the last run
 (`.local/selftest/last.json`).
 
-**A new worker app** is one table in `taskq.toml`, no code change:
+**A configured runtime** (a third worker app) is one table in `taskq.toml`, no code change. Example:
+the Grok Bot «Taskq» of csgo (#243, first real task csgo #252 delivered in 21 min):
 
 ```toml
-[runtimes.grok]
-env = "GROK_SESSION_ID"                          # its session id variable: claims and notes
-spawn = "run-grok spawn --name {name}"           # prints the session id as its last line
-send = "run-grok send {session} {text}"          # one turn; may return before the turn ends
-archive = "run-grok archive {session}"           # optional
+[runtimes.grokbot]
+env = "GROKBOT_SESSION"                                  # its session id variable: claims and notes
+spawn = "python3 scripts/grokbot.py spawn --name {name}" # prints the session id as its last line
+send = "python3 scripts/grokbot.py send {session} {text}" # one turn; may return before the turn ends
+archive = "python3 scripts/grokbot.py archive {session}" # optional: retire a finished session
+doctor = "python3 scripts/grokbot.py doctor"             # optional: readiness, `- what / fix` lines, exit 1 on a gap
+setup = "python3 scripts/grokbot.py setup"               # optional: prints the person's app steps
 ```
 
-Commands are split before the values are filled in: no value reaches a shell. The app then also
-works in `add --runtime`, `--limit grok=N`, `selftest --runtime grok`, `spawn --runtime grok` and
-`send --runtime grok <session> --text` (the tick prints both). Without a status API the tick nudges a
-worker once when its doing task is quiet for 30 minutes; at 120 minutes it is released as stalled.
+Commands run from the main checkout, split before the values are filled in: no value reaches a
+shell. The app then works everywhere a runtime name goes: `add --runtime grokbot`, `--limit
+grokbot=N` (default 1), `selftest --runtime grokbot`. The coordinator starts a worker with
+`taskq spawn --runtime grokbot --name "T<N> <words>"` and sends it the worker prompt, answers and
+nudges with `taskq send --runtime grokbot <session> --text "<text>"`; the tick prints both lines. A
+send that exits 0 is queued, not done. Without a status API the tick nudges a worker once when its
+doing task is quiet for 30 minutes; at 120 minutes without a change the task is released as stalled.
+An app started from a Claude or Codex session inherits that session's variable: the configured
+runtime's own variable wins; two of the built-in ones set at once stop with an error naming both.
+
+Onboarding one (the manager, on the owner's request):
+1. `taskq doctor`: runs each `doctor` command and lists its output as a gap while it exits nonzero;
+   `ready: … , runtime grokbot` when green.
+2. `taskq doctor --fix`: prints the `setup` command as a `you:` step (sign-in, bot, trigger, the
+   instruction to paste are the person's); run it, show its steps, wait for ‘done’, rerun doctor.
+3. `taskq selftest --scope full --runtime grokbot`: a real worker of the app through the queue.
 
 **Speed.** Each glab call costs about 1.05 s here (221 ms round trip to the GitLab host; the open
 issues page, 344 KB, 2.5 s), and `take` makes 8 of them. `quick` makes about 60 calls; under one

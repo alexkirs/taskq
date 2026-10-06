@@ -1,8 +1,14 @@
 """`tick`: the coordinator's pass over the queue, board moves, the Workers table, the beat stamp."""
 import argparse
+import contextlib
 import hashlib
+import io
+import json
 import os
+from pathlib import Path
+import plistlib
 import shlex
+import subprocess
 import sys
 import time
 
@@ -160,8 +166,117 @@ def inbox_line(inbox):
     return f'Inbox: {len(inbox)} issues by non-collaborators ({", ".join(map(core.ref, sorted(inbox, key=lambda issue: issue["iid"])))})\n\n' if inbox else ''
 
 
+NUDGE = 'Continue the assigned task; hand in result or ask the owner through taskq.'
+# #42: the launchd timer's turn of the coordinator session, before the tick's output.
+WAKE_PROMPT = ('taskq tick --act (the launchd timer) found what needs judgement; it already did the mechanical steps '
+               '(spawn, retire, nudges). Do the coordinator pass by taskq-manager.md § 3 on the output below; do not run '
+               '`taskq tick` again in this turn. Reply in the owner\'s language.\n\n')
+
+
 def tick(args):
-    """One pass of the coordinator: release dead claims itself, then print exactly what to do."""
+    if args.install_timer or args.uninstall_timer:
+        return timer(args.install_timer)
+    if args.act:
+        return act(args)
+    tick_pass(args)
+
+
+def act(args):
+    """#42 `tick --act`: the mechanical steps done here, stdout only for what needs judgement; exit 1 then.
+    `--wake` (the launchd timer) also gives that output to the coordinator session as one turn."""
+    with contextlib.redirect_stdout(io.StringIO()) as said:
+        judgement = tick_pass(args, act=True)
+    if not judgement:
+        return
+    print(said.getvalue(), end='')
+    if args.wake:
+        wake(said.getvalue(), judgement)
+    sys.stdout.flush()
+    sys.exit(1)
+
+
+def woken():
+    return core.TICK_BEAT.with_name('taskq-tick-woken')
+
+
+def wake(output, judgement):
+    """One turn of the coordinator ([coordinator] session of taskq.local.toml) per new set of items: a review
+    still open five minutes later wakes nobody again; a busy coordinator gets it on the next tick."""
+    session = core.personal().get('coordinator', {}).get('session')
+    if not session:
+        return print(f'\nNo coordinator to wake: no [coordinator] session in {core.LOCAL} (manager contract § 2).')
+    key = hashlib.sha256('\n'.join(judgement).encode()).hexdigest()[:12]
+    if woken().exists() and woken().read_text().strip() == key:
+        return print('\nThe coordinator was already woken for these items.')
+    if (core.claude_agents().get(session) or {}).get('status') == 'busy':
+        return print('\nThe coordinator is busy: the next tick wakes it.')
+    core.claude_wake(session, WAKE_PROMPT + output)
+    woken().write_text(key + '\n')
+    print(f'\nWoke the coordinator {session}.')
+
+
+def timer(install):
+    """#42: a launchd agent runs `tick --act --wake` from the main checkout every TICK_MINUTES; replaces the
+    in-session CronCreate timer (no LLM turn per fire, no app session, no 7-day limit)."""
+    label = f'taskq.{core.ROOT.name}'
+    plist, domain = Path.home() / 'Library/LaunchAgents' / f'{label}.plist', f'gui/{os.getuid()}'
+    subprocess.run(['launchctl', 'bootout', f'{domain}/{label}'], capture_output=True)  # not loaded: nothing to do
+    if not install:
+        plist.unlink(missing_ok=True)
+        return print(f'Removed the tick timer {label} ({plist}).')
+    session = core.personal().get('coordinator', {}).get('session')
+    if not session and (session := os.environ.get(core.RUNTIMES['claude'])):
+        # Run inside the coordinator session: it records itself as the session the timer wakes.
+        with core.LOCAL.open('a') as local:
+            local.write(f'\n[coordinator]\nsession = {json.dumps(session)}\n')
+    log = core.TICK_BEAT.with_name('taskq-tick.log')
+    log.parent.mkdir(parents=True, exist_ok=True)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    # The shell's PATH finds git, gh/glab and claude; no token goes into the file (they come from the keychain).
+    env = {key: os.environ[key] for key in ('PATH', 'TASKQ_HOST') if os.environ.get(key)}
+    plist.write_bytes(plistlib.dumps({
+        'Label': label, 'ProgramArguments': [sys.executable, '-m', 'taskq', 'tick', '--act', '--wake'],
+        'WorkingDirectory': str(core.ROOT), 'StartInterval': TICK_MINUTES * 60, 'RunAtLoad': True,
+        'EnvironmentVariables': env, 'StandardOutPath': str(log), 'StandardErrorPath': str(log)}))
+    subprocess.run(['launchctl', 'bootstrap', domain, str(plist)], check=True)
+    print(f'Installed the tick timer {label} ({plist}): `taskq tick --act --wake` every {TICK_MINUTES} min, log {log}.\n'
+          + (f'It wakes the coordinator session {session}.' if session else
+             f'No coordinator to wake: run this inside the coordinator session, or write [coordinator] session in {core.LOCAL}.')
+          + '\nDelete an in-session CronCreate tick timer: one coordinator timer per checkout.')
+
+
+def retire_closed(log):
+    """--act: a local Claude worker of a task closed in the last hour without this machine's `close` (closed on
+    the board or by hand) is retired as `close` would. ponytail: sessions only; trees and branches: `cleanup`."""
+    agents = core.claude_agents()
+    if not agents:
+        return
+    after = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 3600))
+    for issue in core.issues(f'state=closed&updated_after={after}'):
+        block = core.BLOCK.search(issue.get('description') or '')
+        try:
+            claim = (json.loads(block.group(1)) if block else {}).get('claim') or {}
+        except (ValueError, AttributeError):
+            continue
+        agent = agents.get(claim.get('session'))
+        if agent and agent.get('status') != 'busy' and claim.get('runtime') == 'claude' and core.local_claim(claim):
+            core.claude_stop(claim['session'], remove=True)
+            log(f'Retired {claim["session"]}: the worker of closed {core.ref(issue)}.')
+
+
+def tick_pass(args, act=False):
+    """One pass of the coordinator: release dead claims itself, then print exactly what to do. `act` (#42): also
+    spawn, retire and nudge here instead of printing those steps. Returns the items that need judgement."""
+    log = lambda line: print(line, file=sys.stderr)  # an act step: the timer's log, never the coordinator's turn
+    failed = []
+
+    def step(what, action):
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                action()
+            log(f'Done: {what}.')
+        except (SystemExit, OSError, ValueError, subprocess.SubprocessError) as error:
+            failed.append(f'{what}: {core.codex_line(str(error))}')
     auto_update()
     print(f'taskq {core.version()}')
     if warning := clone_warning():
@@ -233,7 +348,12 @@ def tick(args):
             free[who] -= 1
             start.append({**item, 'runtime': who})
     if not (review or fresh or summary or start or codex_stopped or odd or problems) and not any(item['state'] == 'doing' for item in everything):
-        return print(inbox_line(inbox) + 'Nothing to do. Say so and stop.')
+        if act:
+            retire_closed(log)
+        print(inbox_line(inbox) + 'Nothing to do. Say so and stop.')
+        return [f'inbox {issue["iid"]}' for issue in inbox]
+    if act:
+        retire_closed(log)
     print(f'You are the coordinator of the task queue for this one pass. Queue tool: `{core.TOOL}`\n')
     print(inbox_line(inbox), end='')
     # #83: one table of every worker; the owner's chat opens only http(s) links.
@@ -264,20 +384,28 @@ def tick(args):
     if rows:
         print('## Workers\n\nShow the owner this table as printed; every link opens in a browser:\n\n'
               '| Task | State | Runtime | Session | Last activity |\n|---|---|---|---|---|\n' + '\n'.join(rows) + '\n')
-    if idle:
+    if idle and act:
+        for item in idle:
+            step(f'nudge idle Codex {core.ref(item)}', lambda item=item: core.codex_send(
+                argparse.Namespace(thread=item['claim']['session'], text=NUDGE)))
+    elif idle:
         print('## Codex idle\n\nTask is doing without result/ask, but its session has stopped. Intervene now:\n')
         for item in idle:
             print(f'- {core.ref(item)}: `{core.TOOL} codex-send {item["claim"]["session"]} '
-                  '--text "Continue the assigned task; hand in result or ask the owner through taskq."`')
+                  f'--text "{NUDGE}"`')
         print()
     # An app without a status API: silence on the issue is the only sign its turn ended without a hand-in.
     quiet = [item for item in everything if item['state'] == 'doing' and (item['claim'] or {}).get('runtime') in core.EXECUTORS
              and not item.get('result') and core.QUIET_MINUTES <= core.age(item) < core.QUIET_MINUTES + 5]
-    if quiet:
+    if quiet and act:
+        for item in quiet:
+            step(f'nudge quiet {core.ref(item)}', lambda item=item: core.executor_run(
+                item['claim']['runtime'], 'send', session=item['claim']['session'], text=NUDGE))
+    elif quiet:
         print(f'## Quiet workers\n\nNo change on the issue for {core.QUIET_MINUTES} minutes. Nudge each (this tick only):\n')
         for item in quiet:
             print(f'- {core.ref(item)}: `{core.TOOL} send --runtime {item["claim"]["runtime"]} {item["claim"]["session"]} '
-                  '--text "Continue the assigned task; hand in result or ask the owner through taskq."`')
+                  f'--text "{NUDGE}"`')
         print()
     if odd:
         print('## Board mismatch\n\nThese issues are not in a state taskq can run. Fix each:\n')
@@ -295,7 +423,11 @@ def tick(args):
               f'Not accepted: `{core.TOOL} reject {item["iid"]} --text "<what to fix>"`.\n')
         if (item['claim'] or {}).get('runtime') == 'codex' and not core.local_claim(item['claim']):
             print(f'After close, archive its Codex session on its machine: `{core.TOOL} codex-archive {item["claim"]["session"]}`.\n')
-    if start:
+    if start and act:
+        for item in start:
+            step(f'spawn a {item["runtime"]} worker for {core.ref(item)}', lambda item=item: core.spawn(argparse.Namespace(
+                runtime=item['runtime'], name=f'T{item["iid"]} {item["title"][:40]}', remote_control=True, text=worker_prompt(args))))
+    elif start:
         # One command per worker: the session starts on the prompt, no second message (#41).
         # An indented block, not inline code: the prompt itself holds backticks.
         print(f'## Start {len(start)} worker session(s)\n\n' + ''.join(f'- {core.ref(item)} {item["title"]}: {item["runtime"]}\n' for item in start)
@@ -317,7 +449,16 @@ def tick(args):
                 core.note(item['iid'], 'shown')
     if fresh or summary:
         print(f'\nThe owner answers with: `{core.TOOL} answer <N> --text "<answer>"`.')
-    if codex_stopped:
+    if codex_stopped and act:
+        for item in codex_stopped:
+            step(f'archive stopped Codex {core.ref(item)}', lambda item=item: core.codex_archive(
+                argparse.Namespace(thread=item['claim']['session'])))
+    elif codex_stopped:
         print('\n## Archive stopped Codex workers\n\nTasks in ask or later continue in a new session after answer; archive when idle:\n')
         for item in codex_stopped:
             print(f'- {core.ref(item)}: `{core.TOOL} codex-archive {item["claim"]["session"]}`')
+    if failed:
+        print('\n## Steps that failed\n\nThe tick could not do these itself; do each by hand (§ 3) or tell the owner:\n')
+        print(core.data(''.join(f'- {line}\n' for line in failed).rstrip()))
+    return ([f'review {item["iid"]} {item["result"].get("sha")}' for item in review] + [f'ask {item["iid"]}' for item, _ in fresh + summary]
+            + odd + [f'problem {issue["iid"]}' for issue in problems] + [f'inbox {issue["iid"]}' for issue in inbox] + failed)

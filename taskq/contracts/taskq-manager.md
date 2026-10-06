@@ -312,6 +312,28 @@ coordinator roles; it is one request to read the queue and arm coordination, not
 Check readiness and the profile card in § 1,
 then follow this procedure after profile confirmation; onboarding alone does not authorize it.
 
+**The launchd timer (macOS, the default since #42).** Run from the coordinator session itself:
+`cd <main checkout> && taskq tick --install-timer`. It writes `~/Library/LaunchAgents/taskq.<checkout name>.plist`
+and loads it; launchd runs `taskq tick --act --wake` from the main checkout every 5 minutes, with the PATH of
+the shell that installed it (no token goes into the file), and logs to `.local/taskq-tick.log`. Run inside
+a Claude session, `--install-timer` records that session as `[coordinator] session = "<id>"` in
+`taskq.local.toml` (an existing entry stays; edit it by hand to move the coordinator).
+`taskq tick --uninstall-timer` removes the agent. Then delete any `CronCreate` tick timer: one timer per checkout.
+
+`taskq tick --act` does the mechanical steps itself: it spawns the workers of the Start section with
+the worker prompt, sends the fixed nudge to idle Codex and quiet workers, archives stopped Codex workers
+of ask/later tasks, and retires a local Claude worker of a task closed in the last hour without this
+machine's `close` (closed on the board or by hand). Those steps go to stderr (the log). Stdout gets the
+tick's output only when something needs judgement: a review, a question, a problem, a board mismatch,
+an inbox issue, or a mechanical step that failed (section `Steps that failed`); the exit code is then
+1, else 0 and silent. With `--wake` a nonzero pass resumes the coordinator session with that output as
+one turn (`claude --bg --resume <id> "<prompt + output>"`); the same set of items wakes it once, and a
+busy coordinator is woken by the next pass. The woken turn does § 3 on the given output and does not
+run `taskq tick` again (the steps are done; a second tick would spawn twice). The resumed session is a
+`claude --bg` job: a coordinator open in the app at the same time would get a second writer, so keep
+the app's coordinator window closed or use the fallback below.
+
+**Fallback: the in-session timer** (no launchd: not macOS, or the owner prefers an app session).
 Tool `CronCreate` (loaded via ToolSearch), `recurring: true`, `cron: "*/5 * * * *"`,
 `prompt`:
 
@@ -342,10 +364,10 @@ turns (checked live 2026-10-07, CLI 2.1.291, `* * * * *` timer: an idle session 
 13-minute `run_in_background` loop each got all 10 fires on time; a session in a 5-minute foreground
 command got none, then one catch-up fire after the turn ended). While a turn runs, ticks are silently
 skipped. When ticks stop coming, `taskq tick` prints `If a timer is armed: no tick for N min` (N ≥ 3
-intervals): check `CronList`, end the long turn or background loops, re-arm. The fix that removes the
-dependency on the session's turns is a launchd timer (taskq #42).
+intervals): check `CronList`, end the long turn or background loops, re-arm. The launchd timer above
+has none of these limits.
 
-The timer lives inside the session: while the app is open and for at most 7 days. After an app
+The in-session timer lives inside the session: while the app is open and for at most 7 days. After an app
 restart the owner says "arm the tick" — repeat this step. An app routine does not fit the tick: its
 interval is at most hourly, and its session cannot start workers.
 

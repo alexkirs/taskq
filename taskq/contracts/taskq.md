@@ -107,6 +107,10 @@ codex = 2
 # Optional local overrides; omit to discover/create by canonical checkout path.
 # project = "app-project-id"
 # section = "app-section-id"
+
+[coordinator]
+# The Claude session the launchd tick timer wakes (manager contract § 2); `tick --install-timer` writes it.
+# session = "claude-session-id"
 ```
 
 Merge supported preference keys individually: explicit CLI flag > personal > shared >

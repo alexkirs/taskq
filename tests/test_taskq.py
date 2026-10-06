@@ -1385,6 +1385,54 @@ class Cycle(unittest.TestCase):
         self.assertIn('Start 1 worker', output)
         self.assertNotIn('## Codex idle', output)
 
+    def test_tick_act_does_the_mechanical_steps_and_exits_1_only_for_judgement(self):
+        """#42: spawn, nudge and retire happen in --act; stdout and exit 1 only for review, ask, problems, mismatch, inbox."""
+        def act(*flags):
+            with contextlib.redirect_stderr(io.StringIO()) as log:
+                try:
+                    return self.do(COORDINATOR, 'tick', '--act', *flags), 0, log.getvalue()
+                except SystemExit as exit:
+                    return '', exit.code, log.getvalue()
+        spawned, sent, woken = [], [], []
+        self.enterContext(patch.object(q, 'spawn', lambda args: spawned.append(args.name)))
+        self.enterContext(patch.object(q, 'codex_send', lambda args: sent.append(args.thread)))
+        self.enterContext(patch.object(q, 'claude_wake', lambda session, prompt: woken.append((session, prompt))))
+        self.assertEqual(act(), ('', 0, ''))
+        code, idle = self.add('--type', 'code', '--runtime', 'claude'), self.add('--type', 'asset')
+        output, status, log = act()
+        self.assertEqual((output, status), ('', 0))
+        self.assertEqual(spawned, ['T1 t', 'T2 t'])
+        self.assertIn('Done: spawn a claude worker for', log)
+        self.do(CLAUDE, 'take', code)
+        self.do(CODEX, 'take', idle)
+        self.assertEqual(act()[:2], ('', 0))
+        self.assertEqual(sent, ['codex-session'])  # the fixed idle nudge, no coordinator turn
+        # A review needs judgement: printed, exit 1; --wake gives it to the coordinator once per set of items.
+        self.do(CLAUDE, 'result', code, '--sha', 'abc1234', '--text', 'x', '--checks', 'x')
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as exit, patch.dict(os.environ, COORDINATOR):
+                q.main(['tick', '--act'])
+        self.assertEqual(exit.exception.code, 1)
+        self.assertIn(f'## Review {link(code)}', out.getvalue())
+        q.LOCAL.write_text('[coordinator]\nsession = "coordinator-session"\n')
+        self.addCleanup(q.LOCAL.unlink, missing_ok=True)
+        for _ in range(2):
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit), patch.dict(os.environ, COORDINATOR):
+                    q.main(['tick', '--act', '--wake'])
+        self.assertEqual(len(woken), 1)
+        self.assertEqual(woken[0][0], 'coordinator-session')
+        self.assertIn(f'## Review {link(code)}', woken[0][1])
+        self.assertIn('already woken', out.getvalue())
+        # A worker of a task closed by hand: retired by the next --act.
+        self.agents = {'claude-session': {'id': 'claudese', 'sessionId': 'claude-session', 'pid': 3}}
+        self.gitlab.issues[code]['state'] = 'closed'
+        runs, patched = self.run_recorded()
+        with patched:
+            log = act()[2]
+        self.assertIn(['claude', 'rm', 'claudese'], runs)
+        self.assertIn('Retired claude-session', log)
+
 
 class GithubRest:
     """GitHub's REST shapes for what `Github` asks: issues by `number` with label objects, comments, labels,
@@ -2327,6 +2375,25 @@ class TickBeat(unittest.TestCase):
         self.assertEqual(changed.getvalue().count('re-read § 3'), 1)
         self.assertIn('Your tick prompt is outdated (v1, current v2)', changed.getvalue())
         self.assertIn(f'cd {q.ROOT} && taskq update; taskq tick --prompt-version {q.TICK_PROMPT_VERSION}', changed.getvalue())
+
+    def test_install_timer_writes_a_launchd_agent_and_records_the_coordinator(self):
+        """#42: one command each way; the agent runs tick --act --wake from the main checkout every 5 min."""
+        import plistlib
+        runs = []
+        with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / '.local/beat'), \
+                patch.object(q, 'LOCAL', Path(tmp) / 'taskq.local.toml'), patch.object(Path, 'home', return_value=Path(tmp)), \
+                patch.object(tick.subprocess, 'run', lambda argv, **kwargs: runs.append(argv)), \
+                patch.dict(os.environ, COORDINATOR), contextlib.redirect_stdout(io.StringIO()) as out:
+            q.main(['tick', '--install-timer'])
+            plist = Path(tmp) / f'Library/LaunchAgents/taskq.{q.ROOT.name}.plist'
+            agent = plistlib.loads(plist.read_bytes())
+            self.assertEqual(q.personal()['coordinator']['session'], 'coordinator-session')
+            q.main(['tick', '--uninstall-timer'])
+            self.assertFalse(plist.exists())
+        self.assertEqual(agent['ProgramArguments'][1:], ['-m', 'taskq', 'tick', '--act', '--wake'])
+        self.assertEqual((agent['StartInterval'], agent['WorkingDirectory']), (300, str(q.ROOT)))
+        self.assertEqual([argv[:2] for argv in runs], [['launchctl', 'bootout'], ['launchctl', 'bootstrap'], ['launchctl', 'bootout']])
+        self.assertIn('wakes the coordinator session coordinator-session', out.getvalue())
 
     def test_contract_holds_the_tick_prompt(self):
         self.assertIn(q.TICK_PROMPT, (q.CONTRACTS / 'taskq-manager.md').read_text())

@@ -136,9 +136,10 @@ def checked(config, path):
     stops with the file and key, never silently broadens."""
     where = lambda key: f'{path}: {key}'
     profile, codex = config.get('profile', {}), config.get('codex', {})
-    unknown = [f'[{name}]' for name in config if name not in ('profile', 'codex')] + [
+    unknown = [f'[{name}]' for name in config if name not in ('profile', 'codex', 'coordinator')] + [
         f'[profile] {key}' for key in profile if key not in (*PROFILE_DEFAULTS, 'limits')] + [
-        f'[codex] {key}' for key in codex if key not in ('project', 'section')]
+        f'[codex] {key}' for key in codex if key not in ('project', 'section')] + [
+        f'[coordinator] {key}' for key in config.get('coordinator', {}) if key != 'session']
     if unknown:
         fail(f'{where(unknown[0])}: unknown key; remove it (keys: `taskq contract`, § Project)')
     for key, kind, text in (('filter', str, 'a string, e.g. "labels=area-maps" ("" means all areas)'),
@@ -153,6 +154,8 @@ def checked(config, path):
     for name, count in limits.items():
         if name not in RUNTIMES or isinstance(count, bool) or not isinstance(count, int) or count < 0:
             fail(f'{where("[profile.limits] " + name)}: write runtime = N for runtimes {", ".join(RUNTIMES)}, N a non-negative integer')
+    if not isinstance(config.get('coordinator', {}).get('session', ''), str):
+        fail(f'{where("[coordinator] session")}: write the coordinator\'s Claude session id as a string')
     for key, value in codex.items():
         if not isinstance(value, str):
             fail(f'{where("[codex] " + key)}: write the app\'s id as a string')
@@ -736,7 +739,11 @@ def main(argv=None):
     command('edit', edit, iid, (('--deps',), {'nargs': '*', 'type': int}), (('--scope',), {'nargs': '*'}),
             (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}))
     command('tick', tick, *profile_flags, (('--prompt-version',), {'type': int, 'metavar': 'N',
-            'help': "the timer prompt's version (manager contract § 2); older ones are told to re-arm"}))
+            'help': "the timer prompt's version (manager contract § 2); older ones are told to re-arm"}),
+            (('--act',), {'action': 'store_true', 'help': 'spawn, retire and nudge here; print only what needs judgement, exit 1 then'}),
+            (('--wake',), {'action': 'store_true', 'help': 'with --act: give that output to the [coordinator] session (the launchd timer)'}),
+            (('--install-timer',), {'action': 'store_true', 'help': 'launchd: tick --act --wake every 5 min from the main checkout'}),
+            (('--uninstall-timer',), {'action': 'store_true', 'help': 'remove that launchd timer'}))
     command('profile', profile_init, (('what',), {'choices': ('init',)}), *profile_flags,
             (('--preferred-runtime',), {'choices': tuple(RUNTIMES), 'help': 'tie-break for own tasks of any runtime'}))
     command('spawn', spawn, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),

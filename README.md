@@ -68,7 +68,8 @@ Tell your agent: **“You are the Product Manager of taskq.”**
 
 Agent: run `taskq contract`; read both printed contracts. Follow the manager's
 [first-use script](taskq/contracts/taskq-manager.md#1-first-use-and-check-the-place):
-run the read-only `taskq doctor`, offer **instructions** or **do it for me**,
+run the read-only `taskq doctor`, offer **instructions** (its steps) or **do it for me**
+(`taskq doctor --fix` after one confirmation),
 and re-check each completed step. Setup does not arm the tick.
 
 ## Check it works

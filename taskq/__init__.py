@@ -1060,14 +1060,31 @@ def probe(command):
         return 1
 
 
+def origin_of():
+    """(host, path) of this checkout's `origin`, None without one."""
+    found = re.match(r'(?:\w+://)?(?:[^@/]+@)?([^:/]+)(?::\d+)?[:/](.+?)(?:\.git)?/?$', git('remote', 'get-url', 'origin') or '')
+    return found and (found[1], found[2])
+
+
+def write_config(github, where, host=None):
+    """A minimal taskq.toml in the current directory, when none is there (`init --project/--github`, `doctor --fix`)."""
+    if Path('taskq.toml').exists():
+        return
+    section = '[github]\nrepo' if github else '[gitlab]\nproject'
+    Path('taskq.toml').write_text(f'# taskq: this project\'s task queue; keys: `taskq contract`, README of taskq.\n'
+                                  f'{section} = "{where}"\n' + (f'host = "{host}"\n' if host else ''))
+    print(f'wrote taskq.toml for {where}')
+
+
 def doctor(args):
     """Is this project ready for the queue? Prints each gap with the command that closes it, exit 1 while any is
     open; prints one line and exits 0 when none is. Reads only: no config, label, board or credential changes
-    (manager onboarding: report, agree, then `init`)."""
+    (manager onboarding: report, agree, then `init`). `--fix` is the manager's «do it for me»: `setup`."""
+    if getattr(args, 'fix', False):
+        return setup(args)
     gaps = []
     gap = lambda what, fix: gaps.append(f'- {what}\n    {fix}')
-    found = re.match(r'(?:\w+://)?(?:[^@/]+@)?([^:/]+)(?::\d+)?[:/](.+?)(?:\.git)?/?$', git('remote', 'get-url', 'origin') or '')
-    origin = found and (found[1], found[2])
+    origin = origin_of()
     if not origin:
         gap('no git remote `origin` in this checkout', 'git remote add origin <repository URL>')
     config = PROJECT_PATH is not None
@@ -1142,6 +1159,105 @@ def report_gaps(gaps):
         return print(f'ready: {PROJECT_PATH} — config, CLI login, write access, labels and board {BOARD}')
     print(f'not ready: {len(gaps)} gap(s); each line is the command that closes it\n' + '\n'.join(gaps))
     sys.exit(1)
+
+
+# What a worker session needs in `<main checkout>/.claude/settings.local.json` (manager contract § 1 merges it).
+WORKER_ALLOW = ('Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Agent', 'Skill',
+                'ToolSearch', 'SendMessage', 'mcp__ccd_session_mgmt', 'mcp__ccd_session', 'mcp__scheduled-tasks', 'mcp__serena')
+CLAUDE_CONFIG = Path.home() / '.claude.json'  # Claude Code keeps folder trust here, per project path
+
+
+def permissions_missing(root):
+    """WORKER_ALLOW entries the checkout's settings.local.json lacks (all of them without the file); reads only."""
+    path = Path(root) / '.claude' / 'settings.local.json'
+    try:
+        allow = json.loads(path.read_text()).get('permissions', {}).get('allow', []) if path.exists() else []
+    except json.JSONDecodeError as error:
+        fail(f'{path} is not valid JSON ({error}): fix it by hand, taskq does not overwrite it')
+    return [item for item in WORKER_ALLOW if item not in allow]
+
+
+def trusted(root):
+    """Has Claude Code's folder trust been accepted for `root` or a folder above it?"""
+    try:
+        projects = json.loads(CLAUDE_CONFIG.read_text()).get('projects', {})
+    except (OSError, json.JSONDecodeError):
+        return False
+    root = Path(os.path.realpath(root))
+    return any(projects.get(str(folder), {}).get('hasTrustDialogAccepted') for folder in (root, *root.parents))
+
+
+def setup(args):
+    """`doctor --fix`, the manager's «do it for me»: each step a command can do is done (idempotent: a rerun says
+    `ok`); each step only the person can do (CLI install and login, OAuth scope, folder trust, worker permissions,
+    app sign-in) is printed as one command and not attempted. Never starts a worker or a timer, never reads or
+    writes credentials or host security settings. Ends with the read-only `doctor`: exit 0 only when ready."""
+    pending = []
+
+    def person(command, why):
+        pending.append(command)
+        print(f'you: {command}\n    {why}')
+
+    def stop():
+        print(f'stopped: the step above is the person\'s; then `taskq doctor --fix` again. No workers or timer started.')
+        sys.exit(1)
+    origin = origin_of()
+    if PROJECT_PATH is None:
+        if not origin:
+            person('git remote add origin <repository URL>', 'the queue lives in the tracker of this checkout\'s origin')
+            stop()
+        if not Path('taskq.toml').exists():
+            write_config('gitlab' not in origin[0], origin[1], None if origin[0] == 'github.com' else origin[0])
+        configure()  # a broken taskq.toml stops here with its error, unchanged
+    else:
+        print('ok: taskq.toml')
+    github = not BOARDS
+    host = HOST or (origin[0] if origin else None)
+    if origin and (origin[1].lower() != PROJECT_PATH.lower() or (HOST and origin[0] != HOST)):
+        fail(f'origin is {origin[0]}/{origin[1]}, taskq.toml names {HOST or ""}{"/" * bool(HOST)}{PROJECT_PATH}: '
+             'say which project is meant; nothing changed')
+    cli = 'gh' if github else 'glab'
+    status = probe([cli, 'auth', 'status', *(['--hostname', host] if host else [])])
+    if status is None:
+        person(f'brew install {cli}', f'`{cli}` is not installed (or the package manager of this machine)')
+        stop()
+    if status:
+        person(f'{cli} auth login{f" --hostname {host}" if host else ""}', 'the person logs in: OAuth in the browser')
+        stop()
+    print(f'ok: {cli} logged in')
+    if write_access(github):
+        person(f'ask an owner of {PROJECT_PATH} for write access', 'this account cannot write to the repository')
+        stop()
+    gaps = queue_labels_missing() + board_gaps(github, host)
+    scope = [fix.split('  (')[0] for what, fix in gaps if 'scope' in what]
+    if gaps and len(gaps) > len(scope):
+        migrate(args)
+        print('done: labels' + ' and board' * (not scope))
+    else:
+        print('ok: labels' + ' and board' * (not scope))
+    for fix in scope:
+        person(fix, 'a GitHub board needs the token scope `project` (browser consent); until then the queue works with labels only')
+    missing = permissions_missing(ROOT)
+    if missing:
+        person(f'cd {ROOT} && <the permissions command of taskq-manager.md § 1 «Runtime prerequisites»>',
+               f'workers run without prompts only with these in .claude/settings.local.json: {", ".join(missing)}')
+    else:
+        print('ok: worker permissions')
+    if trusted(ROOT):
+        print('ok: Claude folder trust')
+    else:
+        person(f'cd {ROOT} && claude', 'accept «Trust this folder» once, then quit: worker sessions start in this checkout')
+    if args.codex:
+        if CODEX_SOCKET.exists():
+            print(f'ok: Codex app project {codex_project(Codex(timeout=60))}')
+        else:
+            person('open the Codex app and sign in', f'Codex workers need its server socket {CODEX_SOCKET}')
+    print('profile: taskq tick --limit claude=2,codex=3  (defaults: all areas, own tasks and the shared pool; '
+          'narrow with --filter "labels=area-<name>" --mine)')
+    print('No workers or timer started.' + (f' Pending for the person: {len(pending)} step(s) above.' if pending else ''))
+    doctor(argparse.Namespace())
+    if pending:
+        sys.exit(1)
 
 
 def migrate(args):
@@ -2680,7 +2796,9 @@ def main(argv=None):
                 (('--github',), {'help': 'GitHub repository owner/name: writes a minimal taskq.toml here if none'}),
                 (('--host',), {'help': 'host for that taskq.toml, e.g. gitlab.example.com'}))
     command('contract', contract)
-    command('doctor', doctor)
+    command('doctor', doctor, (('--fix',), {'action': 'store_true', 'help': 'set up what a command can (taskq.toml, labels, board); '
+                                            'print each step only the person can do'}),
+            (('--codex',), {'action': 'store_true', 'help': 'with --fix: also the Codex app project of this checkout'}))
     command('update', update, (('--verbose',), {'action': 'store_true', 'help': 'say why a check was skipped'}))
     command('report', report, (('--hours',), {'type': int, 'default': 24}))
     command('selftest', selftest, (('--scope',), {'choices': ('quick', 'full', 'check'), 'default': 'quick'}),
@@ -2692,11 +2810,8 @@ def main(argv=None):
             (('--wait',), {'type': int, 'default': 600, 'help': 'full: seconds a worker session may take per step'}))
     args = parser.parse_args(argv)
     where = getattr(args, 'project', None) or getattr(args, 'github', None)
-    if where and not Path('taskq.toml').exists():
-        section = '[gitlab]\nproject' if args.project else '[github]\nrepo'
-        Path('taskq.toml').write_text(f'# taskq: this project\'s task queue; keys: `taskq contract`, README of taskq.\n'
-                                      f'{section} = "{where}"\n' + (f'host = "{args.host}"\n' if args.host else ''))
-        print(f'wrote taskq.toml for {where}')
+    if where:
+        write_config(not args.project, where, args.host)
     if PROJECT is None and args.function not in (contract, update, doctor):
         configure()
     args.function(args)

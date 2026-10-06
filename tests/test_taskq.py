@@ -1483,6 +1483,100 @@ class Doctor(unittest.TestCase):
         self.assertEqual(github.mutations[mutations:], [])
 
 
+class Setup(unittest.TestCase):
+    """`doctor --fix`: what a command can do is done once and `ok` on a rerun; the person's steps are printed, not run."""
+    GLOBALS = ('PROJECT', 'PROJECT_PATH', 'HOST', 'STORE', 'BOARD', 'BOARDS', 'AREAS', 'ROOT', 'TICK_BEAT', 'WORKER', 'RULES',
+               'CODEX_PROJECT', 'CODEX_SECTION', 'RETIRE', 'HELPERS')
+
+    def setUp(self):
+        for name in self.GLOBALS:  # `configure` sets them from the new taskq.toml
+            self.enterContext(patch.object(q, name, getattr(q, name)))
+        q.PROJECT = q.PROJECT_PATH = None
+        self.status, self.probes = 0, []
+        self.enterContext(patch.object(q, 'git', lambda *args, **kwargs: self.origin if args[:2] == ('remote', 'get-url') else None))
+        self.enterContext(patch.object(q, 'probe', lambda command: self.probes.append(command) or self.status))
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(contextlib.chdir(self.tmp))
+        self.enterContext(patch.object(q, 'CLAUDE_CONFIG', self.tmp / 'claude.json'))
+
+    def fix(self, *extra):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            try:
+                q.main(['doctor', '--fix', *extra])
+            except SystemExit as exit:
+                return exit.code, out.getvalue()
+        return 0, out.getvalue()
+
+    def trust_and_permissions(self):
+        (self.tmp / 'claude.json').write_text(json.dumps({'projects': {os.path.realpath(self.tmp): {'hasTrustDialogAccepted': True}}}))
+        (self.tmp / '.claude').mkdir()
+        (self.tmp / '.claude/settings.local.json').write_text(json.dumps({'permissions': {'allow': list(q.WORKER_ALLOW)}}))
+
+    def test_gitlab_person_steps_printed_then_fixed_once(self):
+        gitlab = Gitlab()
+        self.enterContext(patch.object(q, 'api', gitlab))
+        self.origin = 'git@gitlab.example.com:group/project.git'
+        self.status = None
+        code, out = self.fix()
+        self.assertEqual(code, 1)
+        self.assertIn('you: brew install glab', out)
+        self.assertIn('wrote taskq.toml for group/project', out)
+        self.assertEqual((os.listdir(self.tmp), gitlab.labels), (['taskq.toml'], {}))  # the tracker is not touched before the CLI works
+        self.status = 1
+        code, out = self.fix()
+        self.assertIn('you: glab auth login --hostname gitlab.example.com', out)
+        self.assertTrue(all(command[1:3] == ['auth', 'status'] for command in self.probes))  # login is never attempted
+        self.status = 0
+        code, out = self.fix()
+        self.assertEqual(code, 1)  # trust and permissions are the person's
+        self.assertEqual((self.tmp / 'taskq.toml').read_text().count('host = "gitlab.example.com"'), 1)
+        self.assertIn('done: labels and board', out)
+        self.assertIn(' && claude\n    accept «Trust this folder»', out)
+        self.assertIn('settings.local.json: Bash, Read', out)
+        self.assertFalse((self.tmp / '.claude').exists())  # permissions are printed, never written
+        self.assertIn('No workers or timer started', out)
+        self.trust_and_permissions()
+        before = json.dumps([gitlab.labels, gitlab.boards])
+        code, out = self.fix()
+        self.assertEqual(code, 0, out)
+        for line in ('ok: taskq.toml', 'ok: labels and board', 'ok: worker permissions', 'ok: Claude folder trust', 'ready: group/project'):
+            self.assertIn(line, out)
+        self.assertEqual(json.dumps([gitlab.labels, gitlab.boards]), before)
+        self.assertNotIn('you:', out)
+
+    def test_github_without_project_scope_is_labels_only_until_refresh(self):
+        github = GithubRest()
+        store = q.Github('owner/repo')
+        store.run = github
+        self.enterContext(patch.object(q, 'api', store))
+        self.origin = 'https://github.com/owner/repo.git'
+        self.trust_and_permissions()
+        github.scope = False
+        code, out = self.fix()
+        self.assertEqual(code, 1)
+        self.assertIn('wrote taskq.toml for owner/repo', out)
+        self.assertNotIn('host', (self.tmp / 'taskq.toml').read_text())
+        self.assertIn('done: labels\n', out)
+        self.assertIn('you: gh auth refresh -h github.com -s project', out)
+        self.assertIn('q-ready', github.labels)
+        github.scope, store.board = True, None
+        code, out = self.fix()
+        self.assertEqual(code, 0, out)
+        self.assertIn('done: labels and board', out)
+        store.board, mutations = None, len(github.mutations)
+        code, out = self.fix()
+        self.assertEqual((code, github.mutations[mutations:]), (0, []))
+        self.assertIn('ok: labels and board', out)
+
+    def test_origin_of_another_project_changes_nothing(self):
+        self.enterContext(patch.object(q, 'api', Gitlab()))
+        (self.tmp / 'taskq.toml').write_text('[gitlab]\nproject = "group/project"\nhost = "gitlab.example.com"\n')
+        self.origin = 'https://gitlab.example.com/other/thing.git'
+        code, out = self.fix()
+        self.assertIn('say which project is meant', str(code))
+        self.assertEqual(self.probes, [])
+
+
 class Host(unittest.TestCase):
     def test_glab_gets_the_configured_host_or_chooses_itself(self):
         calls = []

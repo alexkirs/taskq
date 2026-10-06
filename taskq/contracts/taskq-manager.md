@@ -118,8 +118,18 @@ requested; substitute the actual package manager and tools):
 Name the actual checkout, host and repository with the request. If computer-control access is not
 available, request that session once; continue terminal steps under the same authority. Do not
 request confirmation for each covered step. No response means no authorization. New work outside
-that scope needs its own agreement. Use existing package commands or manager tools; do not claim
-`doctor --fix` exists (it does not yet).
+that scope needs its own agreement.
+
+Commands per mode: mode A runs the read-only `cd <main checkout> && taskq doctor` and prints its
+gaps as the numbered steps; mode B runs `cd <main checkout> && taskq doctor --fix` (add `--codex` when
+Codex workers were requested). `--fix` writes a minimal `taskq.toml` from `origin` when none exists,
+runs init for missing labels/board, reuses `codex_project` for the Codex app project, and prints the
+profile card's default command. It only reads folder trust (`~/.claude.json`) and the worker
+permissions file: each missing one, the CLI install and login, the GitHub `project` scope and write
+access is a `you:` line with one command, never attempted. It stops at a missing CLI, login or write
+access; reruns print `ok:` for completed steps; exit 0 only when the closing `doctor` is ready and no
+`you:` line remains. Mode B merges the permissions file with the § 1 command under the same
+authority; the package does not write it.
 
 After confirmation, perform every automatable missing step, re-run doctor and local checks after
 each, and say:
@@ -163,7 +173,7 @@ commit during a readiness check.
 Extras only on request, each with its requirement and exact message:
 
 - **GitHub board scope:** “The queue works with labels only. A GitHub board needs Projects permission. To add it, run: `gh auth refresh -h <host> -s project`. Complete browser consent, then tell me ‘done’.” After consent, rerun init and doctor. Without the request, report the board deferred and doctor nonzero for that gap; label-only readiness is not full readiness.
-- **Codex workers:** “Codex workers need the Codex app signed in, its control socket, and a project for this checkout. I’ll prepare the project without starting a worker.” Verify `~/.codex/app-server-control`; find/create the project by the canonical main-checkout path using the existing project helper through the future setup entrypoint. Do not use `taskq spawn` as a project-creation workaround. A missing app or login goes through the human-only messages above.
+- **Codex workers:** “Codex workers need the Codex app signed in, its control socket, and a project for this checkout. I’ll prepare the project without starting a worker.” Verify `~/.codex/app-server-control`; find/create the project by the canonical main-checkout path through `taskq doctor --fix --codex`. Do not use `taskq spawn` as a project-creation workaround. A missing app or login goes through the human-only messages above.
 - **Areas:** “Which areas should this queue have?” Merge agreed names into `[areas] names`, run init, then doctor; use existing labels if sufficient. Creating areas does not broaden a confirmed worker profile.
 
 Finish with exact wording, using actual results:
@@ -176,8 +186,8 @@ Do not arm anything as part of onboarding.
 
 ### Code handoff: setup automation beyond #23
 
-This is the specification for the dependent Claude code task, not a claim of shipped commands.
-Expose `taskq doctor --fix` or one equivalent setup entrypoint; keep plain doctor read-only.
+The specification #28 implemented as `taskq doctor --fix`; plain doctor stays read-only. Not
+automated: package/CLI installation and the worker permissions file (printed as person steps).
 
 - [ ] Produce a plan from #23's gaps plus local readiness: package/CLI, canonical checkout and origin/config match, folder trust, permissions, optional Codex app/socket/project, and profile. Return each step's exact resolved command/action, automation or human-only status, prerequisites and expected check. Never treat hostname spelling as sufficient tracker detection on custom hosts; ambiguous GitHub/GitLab needs a choice.
 - [ ] Apply only the confirmed plan: install supported missing tools/package, merge config, reuse init for labels/board, merge worker permissions without overwriting unrelated settings, and reuse `codex_project` without creating a worker thread when Codex was requested. Preserve existing values; reruns skip completed work. Resolve package installation before the taskq entrypoint can run through a manager bootstrap plan.

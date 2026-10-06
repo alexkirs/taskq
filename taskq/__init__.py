@@ -292,8 +292,8 @@ class Github:
             made = self.issue(self.run('POST', 'issues', self.body(body)))
             # GitHub's issue list lags a new issue by a moment (seen live 2026-10-06): wait until it shows, so the
             # next command (list, take, the selftest) sees it. ponytail: 5 s cap, then the caller sees the lag.
-            for _ in range(10):
-                if any(item['number'] == made['iid'] for item in self.run('GET', f'issues?state=all&since={made["created_at"]}&per_page=100')):
+            for _ in range(10):  # newest first: page 1 is enough (`since=` is strict: it misses the same second)
+                if any(item['number'] == made['iid'] for item in self.run('GET', 'issues?state=open&per_page=100')):
                     break
                 time.sleep(0.5)
             return made

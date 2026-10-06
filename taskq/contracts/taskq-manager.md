@@ -61,6 +61,13 @@ Defaults need no setup: all areas, own assignments plus shared pool, local Claud
 `run-*` still states the app a task needs. Manual `take` assigns the current glab user and keeps
 normal dependency/runtime/scope checks. Limits never arbitrate between machines.
 
+**Two machines (csgo #303).** Each machine runs its own tick with its own `--limit`; a `doing` claim
+counts only on the machine that holds it. Tasks without a `host-*` label run on the machine whose worker
+takes them first. To send a task to Windows on purpose: `add --host win` (or the label `host-win`);
+the Mac's tick never starts it. Name the machines once in taskq.toml, `[hosts]` with
+`"<hostname>" = "<name>"`, or set `TASKQ_HOST` on that machine. Worker names end with ` @<name>`,
+`list` and the tick's "Claude worker sessions" show the machine of every doing worker.
+
 ## 1. First use and check the place
 
 
@@ -284,7 +291,8 @@ their `deps` (lines `Moved #N …`; never do this move by hand) and prints what 
 separate limits (Claude and Codex each have their own slots; an `any` task is given a runner with a
 free slot). The other runtime will not take the task. One at a time:
 1. Claude: `taskq spawn --name "T<N> <words>"` — a `claude --bg` session in the main checkout,
-   idle, no app window change (§ "Window focus on spawn"); prints its session id. Codex:
+   idle, no app window change (§ "Window focus on spawn"); prints its session id. spawn adds
+   ` @<machine>` to the name; SendMessage uses the name as `ListAgents` shows it. Codex:
    `spawn --runtime codex --name "T<N> <words>"` — prints the Codex session id (§ "Other machines").
 2. Send it the worker prompt: Claude — `SendMessage` with `to` = the name from step 1 (as
    `ListAgents` shows it) and `notify_when_idle: true`, so the end of its turn comes back to you;
@@ -294,14 +302,18 @@ free slot). The other runtime will not take the task. One at a time:
    but `take` gives it to one, the other is refused and takes the next ([taskq](taskq.md) § Taking a task).
 4. Tell the owner, in one line per worker, how to watch it: the tick's section "Claude worker
    sessions" lists every doing Claude worker with `claude attach <id>` and `taskq show <id>`.
-   The owner watches by link: Remote Control in claude.ai/code and the phone app, `claude agents`
-   in a terminal, or on request in the desktop app (§ "Showing a worker in the app").
+   The owner watches with `claude agents` / `claude attach` in a terminal of that machine, or on
+   request in the desktop app (§ "Showing a worker in the app"). Remote Control is off for spawned
+   workers (below); `taskq spawn --remote-control` keeps it on for a worker the owner wants on the phone.
 
 **Window focus on spawn (#270, 2026-10-06, app 2.19675.0, CLI 2.1.291).**
 - *Claude.* A worker is a `claude --bg` session (documented CLI: `claude agents`, `attach`, `logs`,
   `stop`, `rm`). The app's log shows no `setFocusedSession` for it: no window change. It is not in
   the app's session list; `ListAgents` shows it (`bg`), `SendMessage` reaches it live and
-  `notify_when_idle` reports the end of its turn; Remote Control turns on by itself. Works from a
+  `notify_when_idle` reports the end of its turn. With the user setting `remoteControlAtStartup`
+  Remote Control turned on by itself, and the worker appeared in the owner's apps on other machines as if it
+  ran there; since csgo #303 spawn passes `--settings '{"remoteControlAtStartup": false}'` (checked live
+  2026-10-06, CLI 2.1.291: the default session shows `/rc connecting…`, the spawned one does not). Works from a
   `CronCreate` fire. Steering without SendMessage: `claude stop <id>`, then
   `claude --bg --resume <session id> "<text>"` wakes the same id.
 - Importing into the app is only the link `claude://resume?session=<id>`; its handler, after

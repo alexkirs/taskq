@@ -206,6 +206,8 @@ class Cycle(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.object(q, 'AREAS', ('maps', 'engine')))
         self.enterContext(patch.object(q, 'MEMBERS', None))
+        self.enterContext(patch.object(q.socket, 'gethostname', return_value='mac-1.local'))
+        self.enterContext(patch.dict(os.environ, {'TASKQ_HOST': ''}))
         self.gitlab = Gitlab()
         self.codex, self.ipc = CodexServer(), AppIpc()
         directory = tempfile.TemporaryDirectory()
@@ -561,6 +563,27 @@ class Cycle(unittest.TestCase):
         self.assertIn('is yours', self.do(CLAUDE, 'take', second))
         self.assertEqual(self.refused(CLAUDE, 'worker', '--limit', 'claude=-1'), '2')
 
+    def test_host_label_pins_a_machine_and_each_machine_fills_its_own_limit(self):
+        """csgo #303: `host-win` waits for a worker on win; a task without a host goes to whichever machine takes it."""
+        win = self.add('--type', 'code', '--host', 'win')
+        anyone = self.add('--type', 'code')
+        self.assertIn('host is win', self.do(CLAUDE, 'list'))
+        self.assertIn('host is win', self.refused(CLAUDE, 'take', win))
+        self.assertIn(f'take {anyone}', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
+        self.assertIn(f'#{anyone} claude', self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
+        self.do(CLAUDE, 'take', anyone)
+        self.assertIn('@mac-1, last change', self.do(CLAUDE, 'list'))
+        with patch.object(q, 'HOSTS', {'DESKTOP-7.lan': 'win'}), \
+                patch.object(q.socket, 'gethostname', return_value='DESKTOP-7.lan'):
+            self.assertIn('Profile: host=win', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
+            # The Mac's doing task does not fill win's one place.
+            self.assertIn(f'#{win} claude', self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
+            self.do({'CLAUDE_CODE_SESSION_ID': 'win-session', 'CODEX_THREAD_ID': ''}, 'take', win)
+            self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
+        self.assertEqual(q.parse(self.gitlab.issues[win])['claim']['host'], 'DESKTOP-7.lan')
+        with patch.dict(os.environ, {'TASKQ_HOST': 'win'}):
+            self.assertEqual(q.machine(), 'win')
+
     def test_legacy_codex_locality_uses_files_without_app_server(self):
         root = self.directory / 'sessions' / '2026' / '10' / '06'
         root.mkdir(parents=True)
@@ -886,12 +909,15 @@ class Cycle(unittest.TestCase):
     def test_claude_spawn_is_a_background_session_without_the_app(self):
         """#270: `claude --bg` changes no app window; the id comes from `claude agents`."""
         self.agents = {'abcd1234-0000': {'id': 'abcd1234', 'sessionId': 'abcd1234-0000', 'pid': 1}}
-        runs, patched = self.run_recorded({'claude --bg': 'backgrounded · abcd1234 · T1 x (idle — send a prompt to start)'})
+        runs, patched = self.run_recorded({'claude --bg': 'backgrounded · \x1b[36mabcd1234\x1b[39m · T1 x (idle — send a prompt to start)'})
         with patched:
             printed = self.do(CLAUDE, 'spawn', '--name', 'T1 x')
+            self.do(CLAUDE, 'spawn', '--name', 'T1 x', '--remote-control')
         self.assertEqual(printed.splitlines()[0], 'abcd1234-0000')
         self.assertIn('claude attach abcd1234', printed)
-        self.assertEqual(runs, [['claude', '--bg', '--name', 'T1 x']])
+        # csgo #303: the name says the machine; Remote Control is off unless asked for.
+        self.assertEqual(runs, [['claude', '--bg', '--name', 'T1 x @mac-1', '--settings', '{"remoteControlAtStartup": false}'],
+                                ['claude', '--bg', '--name', 'T1 x @mac-1']])
         self.agents = {}
         with self.run_recorded({'claude --bg': 'backgrounded · ffff0000 · T1 x'})[1]:
             self.assertIn('does not list the new session ffff0000', self.refused(CLAUDE, 'spawn'))
@@ -924,7 +950,7 @@ class Cycle(unittest.TestCase):
         self.do(CLAUDE, 'take', iid)
         self.agents = {'claude-session': {'id': 'claudese', 'sessionId': 'claude-session', 'pid': 3}}
         listed = self.do(COORDINATOR, 'tick').split('## Claude worker sessions')[1]
-        self.assertIn(f'#{iid} t: background, running: `claude attach claudese`', listed)
+        self.assertIn(f'#{iid} @mac-1 t: background, running: `claude attach claudese`', listed)
         self.assertIn('show claude-session', listed)
         self.do(CLAUDE, 'result', iid, '--checks', 'c', '--text', 'done')
         self.assertIn('taskq retire claude-session', self.do(COORDINATOR, 'tick'))
@@ -1443,7 +1469,7 @@ class Selftest(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 q.spawn(argparse.Namespace(runtime='grok', name='T1 x'))
                 q.send(argparse.Namespace(runtime='grok', session='g1', text='go'))
-            self.assertEqual(out.getvalue().split('\n')[:2], ['id-T1 x', 'sent g1 go'])
+            self.assertEqual(out.getvalue().split('\n')[:2], ['id-T1 x @mac-1', 'sent g1 go'])
 
 
 class Doctor(unittest.TestCase):

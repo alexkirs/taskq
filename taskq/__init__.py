@@ -28,6 +28,7 @@ STORE = None  # `gitlab` or a `Github`: what `api` speaks to (set by `configure`
 BOARD = 'taskq'
 BOARDS = True  # GitLab's board is a view over the q-* labels; GitHub's Projects v2 board is a copy `Github` keeps in step
 AREAS = ()
+HOSTS = {}  # [hosts] of taskq.toml: hostname → short machine name (`mac`, `win`); the `host-<name>` label pins a task
 CODEX_PROJECT = CODEX_SECTION = None  # the Codex app's project and sidebar section for worker threads
 WORKSPACE = {
     'continue': 'this task was started before in worktree `taskq-{iid}` (`git worktree list` shows its path); continue there. If it is gone, create it: `git worktree add -b taskq-{iid} ../taskq-{iid} origin/main`.',
@@ -53,7 +54,7 @@ STALE_MINUTES = 120  # a `doing` issue this long without any change goes back to
 LOCK, LOCK_SECONDS = 'lock', 120
 PROBLEM = 'problem'  # label of an issue for a problem without a task
 CLEANUP_DAYS = 30  # cleanup reads open issues and the ones closed this recently, not the whole history
-PREFIX, RUN = 'q-', 'run-'
+PREFIX, RUN, ON = 'q-', 'run-', 'host-'
 PRIORITIES = (1, 2)
 BLOCK = re.compile(r'<!-- taskq:start -->\s*```json\n(.*?)\n```\s*<!-- taskq:end -->', re.S)
 FIELDS = ('scope', 'deps', 'claim', 'waiting_for', 'result')  # what labels cannot say
@@ -110,7 +111,7 @@ def main_checkout(start):
 def configure(path=None, write=True):
     """Load the project's taskq.toml: `path`, else the nearest one from the current directory up.
     `write`: add the DEFAULTS keys it lacks to the file (`doctor` reads only)."""
-    global RULES, HOST, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER
+    global RULES, HOST, HOSTS, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER
     import tomllib
     here = Path.cwd()
     path = Path(path) if path else next((folder / 'taskq.toml' for folder in (here, *here.parents)
@@ -131,6 +132,7 @@ def configure(path=None, write=True):
         # `projects/:id` makes glab look the project up first: +1 s per request (measured 2026-10-06).
         PROJECT = 'projects/' + quote(PROJECT_PATH, safe='')
     AREAS = tuple(config.get('areas', {}).get('names', ()))
+    HOSTS = dict(config.get('hosts', {}))
     CODEX_PROJECT, CODEX_SECTION = codex.get('project'), codex.get('section')
     WORKSPACE.update({key: workspace[key] for key in WORKSPACE if key in workspace})
     RETIRE, HELPERS = workspace.get('retire'), workspace.get('cleanup_helpers')
@@ -184,6 +186,15 @@ def session():
 
 def me():
     return {**(session() or fail('no session identity: set ' + ' or '.join(RUNTIMES.values()))), 'host': socket.gethostname()}
+
+
+def machine(hostname=None):
+    """The short name of a machine: `[hosts]` of taskq.toml, else the hostname up to the first dot. This machine's
+    name can also come from TASKQ_HOST. It is in worker session names, tick lines and the `host-<name>` label."""
+    if hostname is None and os.environ.get('TASKQ_HOST'):
+        return os.environ['TASKQ_HOST']
+    hostname = hostname or socket.gethostname()
+    return HOSTS.get(hostname) or hostname.split('.')[0].lower()
 
 
 def who():
@@ -512,6 +523,7 @@ def parse(issue):
     return {**json.loads(found.group(1)), 'iid': issue['iid'], 'title': issue['title'], 'state': states[0],
             'type': next((label for label in labels if label in TYPES), None),
             'runtime': next((label[len(RUN):] for label in labels if label.startswith(RUN)), None),
+            'host': next((label[len(ON):] for label in labels if label.startswith(ON)), None),
             'assignees': [user['id'] for user in issue.get('assignees', [])], 'selftest': SELFTEST in labels,
             'priority': min([int(label[9:]) for label in labels if re.fullmatch(r'priority-\d', label)] or [9]),
             'age': int(time.time() - stamp(issue['updated_at'])) // 60,
@@ -670,7 +682,7 @@ def profile(args):
     matching = [item for item in matching if not item['selftest'] or SELFTEST in args.filter]
     uid = user()
     candidates = [item for item in matching if eligible(item, uid, args.mine)]
-    print(f'Profile: filter={args.filter!r}; mine={args.mine}; limit=' +
+    print(f'Profile: host={machine()}; filter={args.filter!r}; mine={args.mine}; limit=' +
           ','.join(f'{name}={count}' for name, count in args.limit.items()) + f'; candidates={len(candidates)}')
     if args.filter and not candidates:
         print('Warning: nonempty filter returned 0 candidates; check the filter.')
@@ -681,6 +693,8 @@ def refusal(candidate, everything, open_iids, runtime=None):
     """Why this ready task cannot start now (in a session of `runtime`, if named), or None. The only admission rule."""
     if runtime and candidate['runtime'] not in (None, runtime):
         return f'runtime is {candidate["runtime"]}'
+    if candidate.get('host') not in (None, machine()):
+        return f'host is {candidate["host"]}'
     waiting = sorted(set(candidate['deps']) & open_iids)
     if waiting:
         return f'open dependencies {waiting}'
@@ -746,7 +760,7 @@ def add(args):
     runtime = DEFAULT_RUNTIME[args.type] if args.runtime is None else None if args.runtime == 'any' else args.runtime
     block = {'scope': args.scope, 'deps': args.deps, 'claim': None, 'waiting_for': None, 'result': None}
     text = f'## Goal\n\n{args.goal}\n\n## Acceptance\n\n{args.acceptance}'
-    labels = args.label + [f'area-{area}' for area in args.area] + [f'{PREFIX}ready', f'priority-{args.priority}', args.type] + ([RUN + runtime] if runtime else [])
+    labels = args.label + [f'area-{area}' for area in args.area] + [f'{PREFIX}ready', f'priority-{args.priority}', args.type] + ([RUN + runtime] if runtime else []) + ([ON + args.host] if args.host else [])
     body = {'title': args.title, 'description': render(text, block), 'labels': ','.join(labels)}
     if args.mine:
         body['assignee_ids'] = [user()]
@@ -781,7 +795,8 @@ def listing(args):
         if item['state'] == 'ready':
             detail = refusal(item, everything, open_iids) or ('continue' if claim else '')
         elif item['state'] == 'doing':
-            detail = f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]}, last change {item["age"]} min ago'
+            detail = (f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]}' + (f' @{machine(claim["host"])}' if claim.get('host') else '')
+                      + f', last change {item["age"]} min ago')
         elif item['state'] == 'waiting':
             detail = f'open dependencies {sorted(set(item["deps"]) & open_iids)}'
         elif item['state'] == 'later':
@@ -1759,12 +1774,14 @@ def codex_archive(args):
 
 def spawn(args):
     """Create a worker session in the main checkout and print its id; the coordinator then sends it the
-    worker prompt. Claude: a CLI background session (`claude_spawn`). Codex: `codex_spawn`."""
+    worker prompt. Claude: a CLI background session (`claude_spawn`). Codex: `codex_spawn`.
+    The name ends with ` @<machine>`: the owner sees where each worker runs."""
+    name = args.name if args.name.endswith(f' @{machine()}') else f'{args.name} @{machine()}'
     if args.runtime == 'codex':
-        return print(codex_spawn(args.name))
+        return print(codex_spawn(name))
     if args.runtime in EXECUTORS:
-        return print(executor_run(args.runtime, 'spawn', name=args.name))
-    session = claude_spawn(args.name)
+        return print(executor_run(args.runtime, 'spawn', name=name))
+    session = claude_spawn(name, remote_control=args.remote_control)
     print(f'{session}\nWatch it: `claude attach {session[:8]}` or `claude agents`; in the app: `{TOOL} show {session}`.')
 
 
@@ -1787,12 +1804,16 @@ def claude_env(extra=None):
     return {**{key: value for key, value in os.environ.items() if key not in RUNTIMES.values()}, **(extra or {})}
 
 
-def claude_spawn(name, extra=None, prompt=None):
+def claude_spawn(name, extra=None, prompt=None, remote_control=False):
     """The CLI session id of a new Claude worker: a `claude --bg` session named `name` (idle without
-    `prompt`), which SendMessage reaches by that name. #270 (2026-10-06): no app window change at all."""
-    done = subprocess.run(['claude', '--bg', '--name', name, *([prompt] if prompt else [])], cwd=ROOT,
+    `prompt`), which SendMessage reaches by that name. #270 (2026-10-06): no app window change at all.
+    Remote Control stays off unless asked: with the user's `remoteControlAtStartup` a worker would also appear in
+    the owner's apps on other machines and look as if it ran there (csgo #303; `/rc connecting…` gone, checked live)."""
+    off = [] if remote_control else ['--settings', '{"remoteControlAtStartup": false}']
+    done = subprocess.run(['claude', '--bg', '--name', name, *off, *([prompt] if prompt else [])], cwd=ROOT,
                           env=claude_env(extra), capture_output=True, text=True, timeout=120)
-    short = re.search(r'backgrounded · (\w+)', done.stdout)
+    # FORCE_COLOR in the caller's environment colours the id (seen live 2026-10-06): strip ANSI before matching.
+    short = re.search(r'backgrounded · (\w+)', re.sub(r'\x1b\[[0-9;]*m', '', done.stdout))
     if done.returncode or not short:
         fail(f'claude could not start the session: {done.stderr.strip() or done.stdout.strip()}')
     session = next((sid for sid in claude_agents() if sid.startswith(short[1])), None)
@@ -2051,6 +2072,7 @@ def tick(args):
         print(''.join(f'- #{issue["iid"]} {issue["title"]}\n' for issue in problems))
     agents = claude_agents() if any((item['claim'] or {}).get('runtime') == 'claude' and item['state'] in ('doing', 'review')
                                     for item in everything) else {}
+    on = lambda item: f' @{machine(item["claim"]["host"])}' if item['claim'].get('host') else ''
     for item in review:
         print(f'## Review #{item["iid"]}: {item["title"]}\n\n{item["text"]}\n\nHanded in:\n\n{(notes(comments(item["iid"])) or ['none'])[-1]}\n\n'
               f'Check the result against the Acceptance above (for code and docs read the commit).\n'
@@ -2078,7 +2100,7 @@ def tick(args):
             session, agent = item['claim']['session'], agents.get(item['claim']['session'])
             where = (f'background, {"running" if agent.get("pid") else "stopped"}: `claude attach {agent["id"]}`, '
                      f'in the app: `{TOOL} show {session}`') if agent else f'app session `local_{session}`'
-            print(f'- #{item["iid"]} {item["title"][:48]}: {where}')
+            print(f'- #{item["iid"]}{on(item)} {item["title"][:48]}: {where}')
         print()
     if fresh:
         print('## Waiting for the owner\n\nNew questions. Do not answer these yourself. End your reply with this list, verbatim:\n')
@@ -2805,6 +2827,7 @@ def main(argv=None):
             (('--priority',), {'type': int, 'choices': PRIORITIES, 'default': 2}),
             (('--milestone',), {'help': 'milestone title: the epic this task belongs to'}),
             (('--runtime',), {'choices': (*RUNTIMES, 'any'), 'help': 'only a session of this app may take it; default by type'}),
+            (('--host',), {'help': 'only a worker on this machine (its [hosts] name, e.g. win) may take it; default any'}),
             (('--mine',), {'action': 'store_true'}), (('--area',), {'nargs': '+', 'default': []}),
             (('--label',), {'nargs': '+', 'default': [], 'help': argparse.SUPPRESS}))
     command('runtime', set_runtime, iid, (('runtime',), {'choices': (*RUNTIMES, 'any')}))
@@ -2825,7 +2848,8 @@ def main(argv=None):
             (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}))
     command('tick', tick, *profile_flags)
     command('spawn', spawn, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),
-            (('--name',), {'default': 'taskq worker', 'help': 'session name: "T<N> <words>"'}))
+            (('--name',), {'default': 'taskq worker', 'help': 'session name: "T<N> <words>"; " @<this machine>" is added'}),
+            (('--remote-control',), {'action': 'store_true', 'help': 'Claude: keep Remote Control on (off by default)'}))
     claude_session = (('session',), {'help': 'Claude session id (or local_<id>)'})
     command('show', show, claude_session,
             (('--restore',), {'help': 'app session to show again after the import (default: the calling session)'}))

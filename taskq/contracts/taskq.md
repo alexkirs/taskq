@@ -23,6 +23,7 @@ The previous DOT system (`dot_tick.py`, `dot_gitlab.py`, labels `flow-*`) was re
 | Work area | Project-configured `area-*` labels; `add --area maps` |
 | Assignee | GitLab user: empty is the shared pool; `add --mine` assigns the author; `take` assigns the current glab user |
 | Runtime | Label `run-claude` or `run-codex`; without one, `any` |
+| Machine | Label `host-<name>` (`add --host win`): only a worker on that machine takes it; without one, the machine whose worker takes it first. A machine's name: `TASKQ_HOST`, else `[hosts]` of taskq.toml (`"DESKTOP-7" = "win"`), else the hostname up to the first dot |
 | Type | Label `code`, `docs`, `research` or `asset` |
 | Priority | Label `priority-1` or `priority-2` |
 | Other data | JSON block in the issue description: `scope`, `deps`, `claim`, `waiting_for` (reason for `later`), `result` — only what a label cannot express |
@@ -237,7 +238,10 @@ ready/waiting/later → ask (manager) → answer → ready
   pre-upgrade claims are recognized by local Claude import records or local Codex rollout files.
   Legacy detection reads only matching local filenames and does not need an app server.
   Limits are local scheduling guidance, not a global admission gate or cross-machine
-  arbitration. Manual `take` does not enforce them.
+  arbitration. Manual `take` does not enforce them. So a tick on the Mac and a tick on Windows each run
+  their own `--limit` at once (csgo #303); the profile line names the machine (`Profile: host=mac; …`).
+- A `host-<name>` task is refused on any other machine (`host is win`), by `worker`, `tick`, `list` and
+  manual `take` alike: sending work to another machine is a label, never a side effect of where a tick runs.
 - Filtered selection keeps a separate unfiltered safety inventory for dependencies and scope
   conflicts. A dependency outside the profile still blocks its task. Profiles never expand
   automatically: an exceptional area goes into the pool with deps, or is taken manually.

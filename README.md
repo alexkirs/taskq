@@ -159,6 +159,18 @@ taskq worker --filter "labels=area-maps" --mine --limit claude=1,codex=2
 Expected: only your maps tasks; at most 1 Claude / 2 Codex workers on this machine.
 Defaults: Claude 2 / Codex 3. Profiles live in session prompts.
 
+Two machines each run their own tick and limits. A task for one machine only: `taskq add … --host win`
+(label `host-win`). Name machines in taskq.toml or with `TASKQ_HOST=win`:
+
+```toml
+[hosts]
+"DESKTOP-7" = "win"
+"macbook-m2.local" = "mac"
+```
+
+Worker sessions are named `T<N> … @mac`; spawned Claude workers have Remote Control off
+(`taskq spawn --remote-control` keeps it on).
+
 ## Talk to the manager
 
 > **You:** Add a task to fix login; assign it to me.<br>

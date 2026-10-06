@@ -2044,7 +2044,7 @@ def selftest(args):
         for runtime in args.runtime or RUNTIMES:
             test.full(runtime)
     test.clean()
-    text = test.report()
+    text = f'taskq {version()}\n\n' + test.report()
     print(text)
     if args.note:
         note(args.note, 'selftest', f'`{TOOL} selftest --scope {args.scope}` from {who()}\n\n{text}')

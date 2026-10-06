@@ -967,7 +967,7 @@ class GithubRest:
         if route == 'graphql':
             found = body['variables']
             items = [issue for issue in self.issues.values() if (not found['states'] or issue['state'].upper() in found['states'])
-                     and any(name in [label['name'] for label in issue['labels']] for name in found['labels'] or [None])
+                     and (not found['labels'] or any(name in [label['name'] for label in issue['labels']] for name in found['labels']))
                      and (not (found['filter'] or {}).get('since') or issue['updated_at'] >= found['filter']['since'])]
             nodes = [{'number': i['number'], 'id': i['node_id'], 'title': i['title'], 'body': i['body'], 'state': i['state'].upper(),
                       'url': i['html_url'], 'createdAt': i['created_at'], 'updatedAt': i['updated_at'], 'labels': {'nodes': i['labels']},

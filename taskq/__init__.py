@@ -695,11 +695,16 @@ def update(args):
         if git('merge', '-q', '--ff-only', 'FETCH_HEAD', cwd=where) is None:
             return print(f'not updated: fast-forward of {where} failed (`git -C {where} merge --ff-only FETCH_HEAD` says why)')
     else:
-        # ponytail: pipx and uv tool by their venv path, pip otherwise; another installer reinstalls by hand.
-        prefix = Path(sys.prefix).parts
-        command = (['pipx', 'install', '--force'] if 'pipx' in prefix else ['uv', 'tool', 'install', '--force'] if 'uv' in prefix
-                   else [sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall'])
-        subprocess.run([*command, f'git+{REPO}'], check=True, capture_output=True, timeout=600)
+        # pipx and uv tool by the receipt in their venv, pip otherwise; another installer reinstalls by hand.
+        prefix = Path(sys.prefix)
+        command = [*(['pipx', 'install', '--force'] if (prefix / 'pipx_metadata.json').exists()
+                     else ['uv', 'tool', 'install', '--force'] if (prefix / 'uv-receipt.toml').exists()
+                     else [sys.executable, '-m', 'pip', 'install', '-q', '--force-reinstall']), f'git+{REPO}']
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.SubprocessError) as error:
+            reason = (getattr(error, 'stderr', None) or str(error)).strip().splitlines()
+            return print(f'not updated: `{shlex.join(command)}` failed: {reason[-1] if reason else error}')
     print(f'updated {old} → {new[:7]}')
     return True
 

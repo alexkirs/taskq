@@ -983,11 +983,22 @@ class Update(unittest.TestCase):
         def run(command, **options):
             calls.append(command)
             return real(command, **options) if command[0] == 'git' else None
-        with patch.object(q, 'install', lambda: ('git', old)), patch.object(q.sys, 'prefix', '/home/u/.local/pipx/venvs/taskq'), \
+        (self.root / 'pipx_metadata.json').write_text('{}')
+        with patch.object(q, 'install', lambda: ('git', old)), patch.object(q.sys, 'prefix', str(self.root)), \
                 patch.object(q.subprocess, 'run', run), contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertTrue(q.update(SimpleNamespace(verbose=False)))
         self.assertEqual(calls[-1], ['pipx', 'install', '--force', f'git+{self.origin}'])
         self.assertIn(f'updated {old[:7]} → ', out.getvalue())
+        (self.root / 'pipx_metadata.json').unlink()
+        def broken(command, **options):
+            if command[0] == 'git':
+                return real(command, **options)
+            raise subprocess.CalledProcessError(1, command, stderr='ERROR: no network\n')
+        with patch.object(q, 'install', lambda: ('git', old)), patch.object(q.sys, 'prefix', str(self.root)), \
+                patch.object(q.subprocess, 'run', broken), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIsNone(q.update(SimpleNamespace(verbose=False)))
+        self.assertIn('-m pip install -q --force-reinstall git+', out.getvalue())
+        self.assertIn('failed: ERROR: no network', out.getvalue())
 
     def test_tick_checks_at_most_every_and_never_when_off(self):
         stamp, done = self.root / 'state' / 'update-last', []

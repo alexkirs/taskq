@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="docs/header.webp" alt="Relaxing while the agents work" width="720">
+  <br><em>Agents working.</em>
+</p>
+
 # taskq
 
 A shared task queue for Claude Code and Codex.

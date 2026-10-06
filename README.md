@@ -1,18 +1,13 @@
-<p align="center">
-  <img src="docs/header.webp" alt="Relaxing while the agents work" width="720">
-  <br><em>Agents working.</em>
-</p>
-
 # taskq
 
-A shared task queue for Claude Code and Codex.<br>
-Tasks live in GitLab or GitHub Issues.<br>
-A manager turns your requests into tasks; workers claim and complete them.<br>
-A tick starts workers, brings you questions and checks results.
+A shared task queue for Claude Code and Codex.
 
-## Install
+Tell your agent: **“Install taskq in this project and set it up.”**
 
-Tell your agent: **“Install taskq in this project.”**
+<details>
+<summary>Setup, commands and reference</summary>
+
+## Setup
 
 Agent: resolve placeholders from `git remote get-url origin`; run the matching commands.
 Requirements: Python 3.11+, [pipx](https://pipx.pypa.io/stable/installation/),
@@ -66,12 +61,10 @@ Codex workers need no `taskq.toml` key: the Codex app project is found by the ch
 
 Tell your agent: **“You are the Product Manager of taskq.”**
 
-Agent: run `taskq contract`; read both printed contracts.
-Run `taskq doctor`: read-only; prints each gap (remote, config, CLI login, write permission, labels,
-board) with its recovery command; exit 0 only when ready. The agent walks you through each step and asks first.
-Report gaps; wait for setup agreement. Save settings in `taskq.toml`; run init, `taskq doctor`, then `taskq list`.
-Expected: queue and board, or missing permission and recovery command.
-The manager role alone does not arm a tick.
+Agent: run `taskq contract`; read both printed contracts. Follow the manager's
+[first-use script](taskq/contracts/taskq-manager.md#1-first-use-and-check-the-place):
+run the read-only `taskq doctor`, offer **instructions** or **do it for me**,
+and re-check each completed step. Setup does not arm the tick.
 
 ## Check it works
 
@@ -155,8 +148,7 @@ Other systems: on request. GitHub queues work without a board.
 - [Manager, tick and runtime setup](taskq/contracts/taskq-manager.md)
 - `taskq --help`: commands. `taskq update`: update now; automatic updates every 24 hours.
 
-<details>
-<summary>Develop taskq</summary>
+## Develop taskq
 
 An editable install runs the clone's working tree: every `taskq` call on the machine, every tick and worker, runs
 whatever is in it right now. So the clone's own tree stays clean `main`, and every change happens in a worktree of it:
@@ -177,6 +169,6 @@ python3 -m unittest discover -s tests
 TASKQ_CLEANUP_HELPERS=<project>/scripts python3 -m unittest discover -s tests
 ```
 
-</details>
-
 License: [MIT](LICENSE).
+
+</details>

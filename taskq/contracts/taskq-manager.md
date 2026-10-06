@@ -21,34 +21,6 @@ the owner. Two roles (owner's decision, 2026-10-06):
 
 The session replies with the role it took and what is in the queue now.
 
-### First-use onboarding
-
-Onboarding is driven by the manager session, not by a document (owner's decision, 2026-10-06).
-The person says "you are the Product Manager of taskq"; the manager reads both paths printed by
-`taskq contract`, runs `cd <main checkout> && taskq doctor` and walks the person through the chain
-step by step.
-
-- `taskq doctor` reads only: origin against the configured tracker, `taskq.toml` (present, valid,
-  exactly one tracker), `glab`/`gh` installed and logged in to the host, write permission on the
-  repository, every queue label (state, runtime, type, priority, `problem`, areas), the board and
-  its state columns; on GitHub the token scope `project`, the Projects v2 board, its Status options
-  and its link to the repository. It prints only the gaps, each with the command that closes it, and
-  exits 1 while any is open; `ready: …` and exit 0 when none is. It is re-run after every step.
-- Offer the minimum needed to start: package, CLI login under the person's own account,
-  `taskq.toml` from the repository (`taskq init --github|--project …` writes it when missing,
-  derived from `origin`), labels and board, Claude folder trust, the worker permissions file (§ 1),
-  the profile card. Nothing more unless the person asks for it (Codex workers, the GitHub board
-  scope, areas); then name what that needs.
-- Do each step yourself and ask permission before each one. Steps only a human can do (the Claude
-  trust prompt, an OAuth login, `gh auth refresh … -s project`) are printed as the exact command
-  and waited for.
-- Never run queue commands against another project's configuration found in a parent directory:
-  `doctor` names an origin that differs from `taskq.toml`.
-- After agreement: save the agreed settings in `taskq.toml`, run `taskq init`, then `taskq doctor`
-  (exit 0) and `taskq list`. For GitHub, use a dedicated repository board and ensure the
-  repository has a pushed commit before a worker claims a task. Do not arm the tick as part of
-  this onboarding.
-
 ## New person: one confirmation card, three steps
 
 1. Tell the session what you do, what you exclude, whether you want only your assignments,
@@ -89,7 +61,133 @@ Defaults need no setup: all areas, own assignments plus shared pool, local Claud
 `run-*` still states the app a task needs. Manual `take` assigns the current glab user and keeps
 normal dependency/runtime/scope checks. Limits never arbitrate between machines.
 
-## 1. Check the place
+## 1. First use and check the place
+
+
+### Readiness and mode choice
+
+The README instruction is: **Tell your agent: “Install taskq in this project and set it up.”**
+The manager owns onboarding. Resolve the main checkout and its `origin` first; substitute actual
+paths, host and repository in every command shown to the person. Never use another project's
+`taskq.toml` found in a parent directory. If origin and config disagree, stop setup and identify
+both repositories; do not run init until the intended project is clear. Preserve existing settings.
+
+If the package is present, read both contracts printed by `taskq contract`, then run
+`cd <main checkout> && taskq doctor` (the read-only readiness check from #23). If absent, inspect
+Python, pipx and the host CLI read-only first; install only after the mode's setup agreement, then
+read the contracts and run doctor. No login, config writes, init, worker launch or timer during
+this inspection. Doctor covers tracker readiness; folder trust, worker permissions, apps and
+profile need separate checks. Never claim doctor proves those.
+
+Exact mode offer (replace the bracketed gap summary):
+
+> “Setup needs: [missing items]. Choose ‘instructions’ for steps you run, or ‘do it for me’ for setup I run. Neither starts workers or a timer.”
+
+If no gaps remain, say “Setup is already ready. No changes needed. No workers or timer started.”
+Then show the profile card. An existing active timer is reported, never described as stopped.
+
+### Mode A: instructions
+
+Exact introduction:
+
+> “Run these numbered steps in order. After each step, tell me ‘done’; I’ll check it before you continue.”
+
+Print only missing steps, numbered in the minimum order below, with one executable command per
+step and its expected result. Split steps containing multiple commands. Print the worker permission
+file creation/merge as a concrete command with the § 1 permission list, preserving existing entries;
+never tell the person to guess JSON. For a human UI action, give one imperative action instead of
+inventing a shell command. After each ‘done’, re-run doctor where installed and the relevant local
+check, then say:
+
+> “Step [number] checked: [result]. Next: [next command or action].”
+
+If it failed, say:
+
+> “Step [number] is still missing: [gap]. Run: [recovery command]. Tell me ‘done’ when it finishes.”
+
+Do not advance past an unmet prerequisite. A board deliberately deferred on GitHub is the explicit
+exception below; keep it in the final report.
+
+### Mode B: do it for me
+
+Ask once, after resolving gaps and tools. Exact authority request (omit optional Codex work unless
+requested; substitute the actual package manager and tools):
+
+> “I’ll install missing packages, use your host CLI login, write taskq.toml, run init for labels and a board, merge the worker permissions file, and prepare your profile card. If you requested Codex workers, I’ll also create its app project. I need terminal and file access; app setup needs a computer-control session. You’ll handle login and trust prompts. I won’t start workers or arm a timer. Confirm this setup authority.”
+
+Name the actual checkout, host and repository with the request. If computer-control access is not
+available, request that session once; continue terminal steps under the same authority. Do not
+request confirmation for each covered step. No response means no authorization. New work outside
+that scope needs its own agreement. Use existing package commands or manager tools; do not claim
+`doctor --fix` exists (it does not yet).
+
+After confirmation, perform every automatable missing step, re-run doctor and local checks after
+each, and say:
+
+> “Done: [step]. Checked: [result]. Next: [step].”
+
+For human-only steps, show just the resolved command/action and wait:
+
+> “Run: [login command]. Complete the browser login yourself, then tell me ‘done’.”
+> “Open this project in Claude and choose ‘Trust this folder’. Tell me ‘done’.”
+> “Install [app] from [official download link] and open it. Tell me ‘done’.”
+
+An interactive login may be started in the provided terminal; only the person completes OAuth,
+MFA and account consent. Never request a token in chat. App installation may be automated where
+the platform permits it; installer consent, unavailable installers and app sign-in stay human-only.
+After ‘done’, verify the state, not just the acknowledgement. On failure:
+
+> “Setup stopped at [step]: [error]. Completed: [items]. Next: [one recovery command or action]. No workers or timer started.”
+
+### Minimum steps and optional extras
+
+Follow this order; skip already satisfied steps. Commands below are templates, never unresolved
+commands sent to the person. Resolve an installed native package manager; do not assume Homebrew
+on Windows/Linux. If no supported installer is available, give one official install action and wait.
+
+| Order | Setup / command | Check and boundary |
+|---|---|---|
+| 1. Package | Python 3.11+, pipx and the host CLI; on a Homebrew machine, missing tools only: `brew install python pipx gh` (GitHub) or `brew install python pipx glab` (GitLab). Then `pipx install git+https://github.com/alexkirs/taskq` | `python3 --version`, `pipx --version`, `taskq --help`; once installed, `taskq contract`, then `taskq doctor`. Existing installs are kept. |
+| 2. CLI login | `gh auth login --hostname <host>` or `glab auth login --hostname <host>` | Person completes browser/device login under their account; `gh auth status --hostname <host>` or `glab auth status --hostname <host>`, then doctor. If write access is missing, ask the repository owner for access; do not change roles yourself. |
+| 3. Config | `taskq init --github <owner/repo> --host <host>` or `taskq init --project <group/project> --host <host>` when config is absent; merge agreed settings into existing `taskq.toml` | Init combines config creation and labels/board; do not pretend these are separate package commands. Verify config matches origin and has exactly one tracker; no secrets in config. |
+| 4. Labels / board | `taskq init` for existing matching config | Doctor checks labels and board; report the actual board URL/ID. GitHub without `project` scope can run the queue with labels only; do not silently escalate scope or call full doctor green. |
+| 5. Folder trust | Open the main checkout in Claude; accept its folder trust prompt | Human-only consent; verify the app can access that checkout. Unavailable app/control access is reported as pending. |
+| 6. Worker permissions | Merge `<main checkout>/.claude/settings.local.json` using the allow list below; keep it outside git | Re-read valid JSON and the required entries; keep existing permissions. Do not enable bypass mode, launch a test worker or arm anything. |
+| 7. Profile card | Show the existing “New person” card above with defaults unless the person gives a narrower profile | Preserve exclusions; no profile file. Say “Check this profile card. Setup will stay idle.” Confirmation saves the session's profile, not timer authority. |
+
+If GitHub has no pushed commit, report the prerequisite before any worker can claim. Offer the
+resolved `git commit --allow-empty -m "Initialize repository"` and `git push -u origin HEAD`
+only for an empty repository, with explicit approval for that commit/push; never manufacture a
+commit during a readiness check.
+
+Extras only on request, each with its requirement and exact message:
+
+- **GitHub board scope:** “The queue works with labels only. A GitHub board needs Projects permission. To add it, run: `gh auth refresh -h <host> -s project`. Complete browser consent, then tell me ‘done’.” After consent, rerun init and doctor. Without the request, report the board deferred and doctor nonzero for that gap; label-only readiness is not full readiness.
+- **Codex workers:** “Codex workers need the Codex app signed in, its control socket, and a project for this checkout. I’ll prepare the project without starting a worker.” Verify `~/.codex/app-server-control`; find/create the project by the canonical main-checkout path using the existing project helper through the future setup entrypoint. Do not use `taskq spawn` as a project-creation workaround. A missing app or login goes through the human-only messages above.
+- **Areas:** “Which areas should this queue have?” Merge agreed names into `[areas] names`, run init, then doctor; use existing labels if sufficient. Creating areas does not broaden a confirmed worker profile.
+
+Finish with exact wording, using actual results:
+
+> “Setup checked: [ready items]. Pending: [items or ‘none’]. Queue: [repository]. Board: [URL, ID or ‘deferred’]. Profile: [arguments]. No workers or timer started. Say ‘arm the tick’ when you want to start.”
+
+Run `taskq list` after tracker readiness (including an explicitly accepted labels-only GitHub
+queue). Do not run selftest during minimum onboarding: it creates tasks; offer it only on request.
+Do not arm anything as part of onboarding.
+
+### Code handoff: setup automation beyond #23
+
+This is the specification for the dependent Claude code task, not a claim of shipped commands.
+Expose `taskq doctor --fix` or one equivalent setup entrypoint; keep plain doctor read-only.
+
+- [ ] Produce a plan from #23's gaps plus local readiness: package/CLI, canonical checkout and origin/config match, folder trust, permissions, optional Codex app/socket/project, and profile. Return each step's exact resolved command/action, automation or human-only status, prerequisites and expected check. Never treat hostname spelling as sufficient tracker detection on custom hosts; ambiguous GitHub/GitLab needs a choice.
+- [ ] Apply only the confirmed plan: install supported missing tools/package, merge config, reuse init for labels/board, merge worker permissions without overwriting unrelated settings, and reuse `codex_project` without creating a worker thread when Codex was requested. Preserve existing values; reruns skip completed work. Resolve package installation before the taskq entrypoint can run through a manager bootstrap plan.
+- [ ] Preserve #23's read-only boundary and project isolation: reject mismatched origin/config and parent-project config before mutation; no secret output, automatic scope escalation, role changes, workers, ticks, cron or selftest. Apply needs explicit setup authority; no per-step permission prompts for already authorized changes.
+- [ ] Return human-only OAuth/device/MFA, folder trust, app installation/sign-in/installer consent and unsupported-platform actions as one command or imperative action each; pause until completion, then verify before continuing. Never accept ‘done’ as proof by itself.
+- [ ] Re-check after every step; stop on failed prerequisites with completed items, exact error and one recovery action. Distinguish fully ready, labels-only with board deferred, and blocked. Keep doctor nonzero while its board gap remains; never suppress it to report full readiness.
+- [ ] Report changed/already-ready/pending items, repository and board, confirmed profile and whether any existing timer is active. Confirm no worker/timer was started by setup. Keep defaults and exclusions in the existing session profile card, not a new persisted profile format.
+- [ ] Provide one runnable check covering apply reruns/preserved config and permissions, human-step pause/resume, mismatch rejection and no worker/timer creation; run `python3 -m unittest discover -s tests`. Keep manual native UI checks explicit where trust/app state cannot be probed.
+
+### Runtime prerequisites and worker permissions
 
 - The session is an ordinary Claude desktop session (not a routine and not a scheduled run: the app
   forbids such a session to start other sessions and to receive messages).
@@ -98,12 +196,27 @@ normal dependency/runtime/scope checks. Limits never arbitrate between machines.
 - The queue is readable: `cd <main checkout> && taskq list`. The main checkout is the `main` branch
   tree from `git worktree list`; all queue commands run from it.
 - Workers run without permission prompts thanks to `<main checkout>/.claude/settings.local.json`
-  (outside git). If it is missing, create it:
+  (outside git). After setup authority, run this from the main checkout to create or merge it.
+  Mode A prints this command with the resolved checkout first; mode B runs it. Invalid existing
+  JSON is an error, never a reason to overwrite the file:
 
-  ```json
-  {"permissions": {"allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "NotebookEdit",
-    "WebFetch", "WebSearch", "Agent", "Skill", "ToolSearch", "SendMessage",
-    "mcp__ccd_session_mgmt", "mcp__ccd_session", "mcp__scheduled-tasks", "mcp__serena"]}}
+  ```bash
+  python3 - <<'PYTHON'
+  import json
+  from pathlib import Path
+  path = Path('.claude/settings.local.json')
+  data = json.loads(path.read_text()) if path.exists() else {}
+  permissions = data.setdefault('permissions', {})
+  allow = permissions.setdefault('allow', [])
+  required = ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'NotebookEdit',
+              'WebFetch', 'WebSearch', 'Agent', 'Skill', 'ToolSearch', 'SendMessage',
+              'mcp__ccd_session_mgmt', 'mcp__ccd_session', 'mcp__scheduled-tasks', 'mcp__serena']
+  allow.extend(item for item in required if item not in allow)
+  permissions['defaultMode'] = 'dontAsk'
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(json.dumps(data, indent=2) + '\n')
+  assert all(item in json.loads(path.read_text())['permissions']['allow'] for item in required)
+  PYTHON
   ```
 
   The project stays in `dontAsk` mode: everything in the list runs silently, the rest is denied.

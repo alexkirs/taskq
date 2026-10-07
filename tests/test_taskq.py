@@ -1094,7 +1094,8 @@ class Cycle(unittest.TestCase):
         for _ in range(6):
             self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))
         q.LOCAL.write_text('[idle]\nstop = 1\n')
-        with patch.object(tick, 'timer', lambda install: print('timer removed')), \
+        with patch.object(sys, 'platform', 'darwin'), \
+                patch.object(tick, 'timer', lambda install: print('timer removed')), \
                 patch.object(q, 'cleanup', lambda args: print('# Remove')), \
                 patch.dict(os.environ, COORDINATOR), contextlib.redirect_stdout(io.StringIO()) as out, \
                 contextlib.redirect_stderr(io.StringIO()) as log, self.assertRaises(SystemExit):
@@ -2969,6 +2970,50 @@ class Host(unittest.TestCase):
 
 
 class TickBeat(unittest.TestCase):
+    def test_linux_idle_stop_requests_external_timer_stop_and_cleans_once(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / 'beat'), \
+                patch.object(q, 'personal', return_value={'idle': {'stop': 1}}), \
+                patch.object(sys, 'platform', 'linux'), patch.object(tick, 'timer') as timer, \
+                patch.object(q, 'cleanup') as cleanup:
+            tick.idle_ticks().write_text('0\n')
+            failed = []
+            result = tick.idle_stop(True, lambda what, action: action(), failed)
+            self.assertIn('stop the external scheduler and ran `taskq cleanup --apply`', result)
+            self.assertFalse(tick.idle_ticks().exists())
+            timer.assert_not_called()
+            cleanup.assert_called_once_with(argparse.Namespace(apply=True))
+            self.assertEqual(failed, [])
+
+    def test_overlapping_ticks_skip_and_crashed_holder_releases_lock(self):
+        args = SimpleNamespace(install_timer=False, uninstall_timer=False, act=False)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / 'beat'), \
+                patch.object(tick, 'tick_pass') as run, patch.object(tick, 'act') as act:
+            lock = Path(tmp) / 'taskq-tick.lock'
+            child = subprocess.Popen([sys.executable, '-c',
+                "import fcntl, sys; f = open(sys.argv[1], 'a'); "
+                "fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); sys.stdin.read()", str(lock)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(child.stdout.readline().strip(), 'locked')
+                with contextlib.redirect_stderr(io.StringIO()) as output:
+                    q.tick(args)
+                    args.act = True
+                    q.tick(args)
+                run.assert_not_called()
+                act.assert_not_called()
+                self.assertEqual(output.getvalue().count('another tick pass is running'), 2)
+            finally:
+                child.kill()
+                child.wait(timeout=5)
+                child.stdin.close()
+                child.stdout.close()
+            self.assertTrue(lock.exists())
+            q.tick(args)
+            act.assert_called_once_with(args)
+            args.act = False
+            q.tick(args)
+            run.assert_called_once_with(args)
+
     def test_second_tick_within_live_window_is_told_not_to_arm(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / 'beat'):
             with contextlib.redirect_stdout(io.StringIO()) as first:

@@ -389,6 +389,41 @@ run `taskq tick` again (the steps are done; a second tick would spawn twice). Th
 `claude --bg` job: a coordinator open in the app at the same time would get a second writer, so keep
 the app's coordinator window closed or stay on the in-session timer.
 
+### External scheduler (Hermes, cron, systemd)
+
+After the owner authorizes a timer and worker launches, schedule one bounded pass every 5 minutes
+from the main checkout: `taskq tick --act`. Use this checkout's `taskq.local.toml` for the profile
+(filter, assignments, runtime limits and preferred runtime); a Codex-only host sets `claude = 0`.
+Run `taskq doctor` first and qualify the actual host's Codex CLI/server and tracker authentication.
+Real Hermes host qualification remains the reporter's responsibility; unit tests do not prove it.
+No Claude tools, `CronCreate`, launchd or `--wake` are required. Capture stdout, stderr and exit status.
+
+- Exit 0: mechanical pass completed without judgement, or an overlapping pass was skipped (stderr
+  says `Skipped: another tick pass is running.`). Do not start extra workers from the captured output.
+- Exit 1 with the pass report on stdout: judgement is needed. Process that report by § 3 without
+  running a second tick; relay reviews, questions and failures to the owner. `Steps that failed`
+  means a mechanical operation failed, not a successful quiet pass.
+- Exit 1 with an error on stderr and no pass report, or another nonzero status: command failure.
+  Report the error; do not interpret it as an empty queue. Exit 1 alone cannot distinguish judgement
+  from failure, so retain both output streams.
+
+Every CLI tick holds a nonblocking checkout-local OS lock through the pass. Timer/manual overlaps
+skip before spawning; the OS releases the lock on process exit or crash. The leftover lock file
+is harmless and must not be deleted to recover a crash.
+
+Honor `[idle] stop` (default 5 consecutive empty passes; 0 disables stopping). On `Idle N ticks`,
+disable the external timer through its own scheduler; the CLI cannot cancel a cron/systemd/Hermes
+job. `--act` already runs `taskq cleanup --apply` unless `[idle] cleanup = false`; do not run it
+again. Relay `Ask the owner` items and retain anything requiring app-only archival until an
+operator with that app handles it. No Claude app tool is needed to complete the CLI pass.
+Rearm only on the owner's request. A macOS external scheduler must also disable its own job:
+removing a launchd taskq timer does not cancel an external timer.
+
+Plain `taskq tick` is not read-only: it can auto-update, reconcile queue/board state, release dead
+claims and stale task locks, record tick/idle stamps, and archive finished Codex sessions. `--act`
+also launches, nudges, retires and performs idle cleanup. Use the captured report for judgement
+instead of running plain tick as a supposedly read-only follow-up.
+
 ## 3. One tick pass
 
 `taskq tick` itself returns stuck tasks to the queue, moves tasks between `ready` and `waiting` by

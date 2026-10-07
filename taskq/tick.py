@@ -1,6 +1,7 @@
 """`tick`: the coordinator's pass over the queue, board moves, the Workers table, the beat stamp."""
 import argparse
 import contextlib
+import fcntl
 import hashlib
 import io
 import json
@@ -242,9 +243,18 @@ def launch(args, start, act, step):
 def tick(args):
     if args.install_timer or args.uninstall_timer:
         return timer(args.install_timer)
-    if args.act:
-        return act(args)
-    tick_pass(args)
+    # Keep the inode: unlinking a flock file could let a third pass lock a different file.
+    lock = core.TICK_BEAT.with_name('taskq-tick.lock')
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open('a') as held:
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('Skipped: another tick pass is running.', file=sys.stderr)
+            return
+        if args.act:
+            return act(args)
+        tick_pass(args)
 
 
 def act(args):
@@ -331,13 +341,15 @@ def idle_stop(act, step, failed):
     if not act:
         return (f'Idle {count} ticks: stop the timer (CronDelete / --uninstall-timer), ' + f'run {cleanup}, ' * clean
                 + 'report to the owner; rearm with "arm the tick" (manager contract § 3).')
-    step('stop the tick timer', lambda: timer(False))
+    if sys.platform == 'darwin':
+        step('stop the tick timer', lambda: timer(False))
     if clean:
         try:
             core.cleanup(argparse.Namespace(apply=True))  # its Remove and Ask the owner sections go to the coordinator
         except (SystemExit, OSError, subprocess.SubprocessError) as error:
             failed.append(f'run {cleanup}: {core.codex_line(str(error))}')
-    return (f'\nIdle {count} ticks: the tick stopped its launchd timer' + f' and ran {cleanup}' * clean
+    stopped = 'the tick stopped its launchd timer' if sys.platform == 'darwin' else 'stop the external scheduler'
+    return (f'\nIdle {count} ticks: {stopped}' + f' and ran {cleanup}' * clean
             + '; report to the owner; rearm with "arm the tick" (manager contract § 3).')
 
 

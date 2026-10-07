@@ -375,7 +375,10 @@ removes the agent; then re-arm the in-session timer.
 `taskq tick --act` does the mechanical steps itself: it spawns the workers of the Start section with
 the worker prompt, sends the fixed nudge to idle Codex and quiet workers, archives stopped Codex workers
 of ask/later tasks, and retires a local Claude worker of a task closed in the last hour without this
-machine's `close` (closed on the board or by hand). Those steps go to stderr (the log). Stdout gets the
+machine's `close` (closed on the board or by hand). Every pass, with or without `--act`, also archives this
+machine's Codex thread of a task closed in the last day (`codex-archive` is reversible); one the Codex app holds is
+kept for a later pass, which archives it once the app lets go (#165, § Cleaning up finished work, item 3). Those
+steps go to stderr (the log). Stdout gets the
 tick's output only when something needs judgement: a review, a question, a problem, a board mismatch,
 an inbox issue, or a mechanical step that failed (section `Steps that failed`); the exit code is then
 1, else 0 and silent. With `--wake` a nonzero pass resumes the coordinator session with that output as
@@ -468,8 +471,8 @@ record file ~1.1 s is the fallback).
 - *Codex.* The spawn steps (thread/start, name, section, first turn, unsubscribe, broadcast
   `thread-unarchived`) do not switch the window: screenshot before and after shows the same session,
   the new one is in Recents/<project>. Only `open -g codex://threads/<id>` switches it (it also hands
-  the session to the app's own server). It is needed only to archive a session the app holds; after
-  that, return the window to the session open before, with the same link and its id.
+  the session to the app's own server). It is needed only to archive a session the app holds sooner than
+  the tick does; after that, return the window to the session open before, with the same link and its id.
   Do not open worker sessions with this link without need.
 
 Entry phrase: “Show me the question from #N.” («Покажи вопрос из #N», «Покажи вопрос по задаче #N»).
@@ -652,22 +655,25 @@ sections: "Remove", "Ask the owner", "Kept".
 3. Codex sessions from "Remove" are archived via `codex-archive`; active ones, a turn in the app,
    unknown state, an unclosed task and the current session are kept. An already archived session is
    confirmed by the command (`already archived`). Sessions are never deleted.
-   *Session open in the app.* Its lock is held by the app's own server (stdio, not reachable from
-   outside) for 3 h after leaving the window, or while there are more than 10 such sessions; the
-   shared server refuses with `active writer`. There is no IPC request to archive or unload:
-   broadcast `thread-archived` only hides the row, the lock stays. `osascript` has no assistive
-   access. So `codex-archive` (and `cleanup --apply`) prints a recipe, and the coordinator runs it
-   itself via Computer Use, without the owner: `request_access` `com.openai.codex`,
+   *Session open in the app.* Viewing a session in the app (Recents, or `open -g codex://threads/<id>`)
+   makes the app's own server (stdio, not reachable from outside) resume it and take its lock; spawn,
+   the `thread-unarchived` broadcast and codex-send to an unloaded session do not. The app's
+   inactive-thread unsubscriber lets it go 3 h after it leaves the window, or sooner while more than 10
+   such sessions are inactive (app 26.930, `CH=108e5`, `L3t=10`); until then the shared server refuses
+   with `active writer`. There is no IPC request or deep link to archive or unload. Do not broadcast
+   `thread-archived` to a session the app holds: the app drops it from the unsubscriber without
+   `thread/unsubscribe`, so it stays held until the app restarts (#165). So nobody has to act: `close`
+   tries once, every tick pass retries for a day after the task closed (`Kept … for a later pass` in
+   the log, then `Archived …`), and cleanup lists such a session under "Kept" (notLoaded on the shared
+   server, yet `~/.codex/thread-writer-locks/<id>.lock` exists) with its tree, and archives it on a
+   later `cleanup --apply` once the app let go. To archive sooner, the coordinator may run the
+   recipe `codex-archive` prints, via Computer Use: `request_access` `com.openai.codex`,
    `open -g codex://threads/<id>`, `request_full_control`, activate the app
    (`osascript -e 'tell application id "com.openai.codex" to activate'`), click the body of the open
    chat, Cmd+Shift+A (Archive chat) — verified 2026-10-06 on two sessions. Then a repeated
    `codex-archive <id>` confirms `already archived`. The "Archive chat" button in a Recents row
    appears only on the owner's mouse hover: `app_click` on it via accessibility does nothing;
    Cmd+Shift+A via `app_key` in the background does not work either, full control is needed.
-   The tree of such a session stays until the next `cleanup --apply`. The report finds such a
-   session before trying (notLoaded on the shared server, yet `~/.codex/thread-writer-locks/<id>.lock`
-   exists) and lists it under "Ask the owner" with this recipe as the `coordinator:` archive choice;
-   its tree is kept. Rechecked 2026-10-07 (#158): the app's IPC still has no archive or unload request.
 4. Claude background workers (`claude agents`, cwd the main checkout): a worker of closed tasks is
    removed by `taskq retire <id>` (`--apply` does it), and so is a stopped or failed one (no `pid`)
    without an open task, and an idle one without a claim started more than `STALE_MINUTES` ago

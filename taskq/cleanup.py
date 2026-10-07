@@ -259,8 +259,9 @@ def cleanup_plan(root):
         if identity in mine or status == 'active' or active_task(identity):
             keep.append({'what': what, 'why': 'current session / active / open task'})
         elif core.codex_app_held(sid, status):
-            ask.append({'what': what, 'why': 'held open by the Codex app; codex-archive cannot archive it until the app does',
-                        'choices': [('keep', 'true'), ('archive', f'coordinator: {core.codex_app_recipe(sid)}')]})
+            # #165: the app lets go 3 h after the thread leaves its window; the tick archives a closed task's then.
+            keep.append({'what': what, 'why': 'held open by the Codex app until 3 h after it leaves the window; '
+                         'the tick archives it then if its task is closed'})
         elif status in ('idle', 'notLoaded') and (finished(identity) or Path(thread.get('cwd') or '/').resolve() in finished_trees):
             remove.append({'kind': 'codex', 'what': what, 'thread': sid, 'cwd': thread.get('cwd'), 'why': 'not active; task closed or tree finished'})
         else:

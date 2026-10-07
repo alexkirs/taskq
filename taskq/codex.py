@@ -495,11 +495,14 @@ def codex_archive(args):
     except SystemExit as error:
         # 2026-10-06: a thread the app has opened stays loaded in the app's private app server (stdio, not
         # reachable) for 3 h after it leaves view, or until more than 10 such threads; no IPC request archives
-        # or releases it (`thread-archived` only hides the row), and osascript has no assistive access. The
-        # app's own context menu archives it; an agent does that with computer-use, not the owner.
+        # or releases it, and osascript has no assistive access. #165 (app 26.930): the tick retries, so it is
+        # archived without anyone once the app lets go; the computer-use recipe is only the sooner way.
         if 'active writer' in str(error):
-            core.fail(f'Codex thread {args.thread} is held open by the Codex app. {codex_app_recipe(args.thread)}')
+            core.fail(f'Codex thread {args.thread} is held open by the Codex app, which lets it go 3 h after it leaves '
+                      f'the window; the tick archives it then. Sooner: {codex_app_recipe(args.thread)}')
         raise
+    # Only after the archive: to an app still holding the thread, `thread-archived` drops it from the app's
+    # inactive-thread unsubscriber without an unsubscribe, so it stays held until the app restarts (#165).
     codex_announce(args.thread, 'thread-archived', 2)
     print(f'archived {args.thread}')
 

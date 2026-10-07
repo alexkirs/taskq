@@ -481,7 +481,20 @@ class Cycle(unittest.TestCase):
         self.assertIn('codex:codex-se', report)
         self.assertEqual(self.gitlab.issues[iid]['state'], 'closed')
         self.assertFalse([label for label in self.gitlab.issues[iid]['labels'] if label.startswith('q-')])
-        self.assertIn('Nothing to do', self.do(CLAUDE, 'tick'))
+        # #165: the app held the thread at close; every tick retries until the app lets go, then it is archived.
+        archived, held = [], [SystemExit('held open by the Codex app')]
+        def archive(args):
+            if held:
+                raise held.pop()
+            archived.append(args.thread)
+        with patch.object(q, 'codex_archive', archive), patch.object(q, 'CODEX_SOCKET', q.ROOT), \
+                contextlib.redirect_stderr(io.StringIO()) as log:
+            self.assertIn('Nothing to do', self.do(CLAUDE, 'tick'))
+            self.assertEqual(archived, [])
+            self.assertIn(f'Kept codex-session of closed {link(iid)} for a later pass: held open by the Codex app', log.getvalue())
+            self.do(CLAUDE, 'tick')
+        self.assertEqual(archived, ['codex-session'])
+        self.assertIn(f'Archived codex-session: the Codex worker of closed {link(iid)}.', log.getvalue())
 
     def race(self, first, second, at='lock'):
         """Two workers on two machines take at once: `second` runs its whole take while `first` stops right
@@ -3349,10 +3362,9 @@ class Cleanup(unittest.TestCase):
         with patch.object(sys.modules['taskq.codex'], 'CODEX_LOCKS', locks), \
                 patch.object(q, 'codex_archive', side_effect=AssertionError('not called')):
             report = self.run_cleanup(True)
-        ask = report.split('# Ask the owner')[1].split('# Kept')[0]
-        self.assertIn('Codex session held: held open by the Codex app', ask)
-        self.assertIn('coordinator: Archive it there with computer-use', ask)
-        self.assertIn('codex://threads/held', ask)
+        kept = report.split('# Kept')[1]
+        self.assertIn('Codex session held: held open by the Codex app until 3 h after it leaves the window', kept)
+        self.assertNotIn('held', report.split('# Ask the owner')[1].split('# Kept')[0])
         self.assertTrue(tree.exists())
 
     def test_unavailable_inventory_keeps_trees_and_unknown_status_keeps_tree(self):

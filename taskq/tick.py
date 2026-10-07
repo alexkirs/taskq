@@ -340,23 +340,48 @@ def idle_stop(act, step, failed):
             + '; report to the owner; rearm with "arm the tick" (manager contract § 3).')
 
 
-def retire_closed(log):
-    """--act: a local Claude worker of a task closed in the last hour without this machine's `close` (closed on
-    the board or by hand) is retired as `close` would. ponytail: sessions only; trees and branches: `cleanup`."""
-    agents = core.claude_agents()
-    if not agents:
-        return
-    after = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 3600))
+def closed_claims(runtime, seconds):
+    """(issue, claim) of tasks closed in the last `seconds` whose worker ran here in `runtime`."""
+    after = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - seconds))
     for issue in core.issues(f'state=closed&updated_after={after}'):
         block = core.BLOCK.search(issue.get('description') or '')
         try:
             claim = (json.loads(block.group(1)) if block else {}).get('claim') or {}
         except (ValueError, AttributeError):
             continue
-        agent = agents.get(claim.get('session'))
-        if agent and agent.get('status') != 'busy' and claim.get('runtime') == 'claude' and core.local_claim(claim):
+        if claim.get('runtime') == runtime and claim.get('session') and core.local_claim(claim):
+            yield issue, claim
+
+
+def retire_closed(log):
+    """--act: a local Claude worker of a task closed in the last hour without this machine's `close` (closed on
+    the board or by hand) is retired as `close` would. ponytail: sessions only; trees and branches: `cleanup`."""
+    agents = core.claude_agents()
+    if not agents:
+        return
+    for issue, claim in closed_claims('claude', 3600):
+        agent = agents.get(claim['session'])
+        if agent and agent.get('status') != 'busy':
             core.claude_stop(claim['session'], remove=True)
             log(f'Retired {claim["session"]}: the worker of closed {core.ref(issue)}.')
+
+
+def archive_closed_codex(log):
+    """#165: every pass archives this machine's Codex thread of a task closed in the last day. A thread the owner
+    viewed is held by the app's own server, which lets it go 3 h after it leaves the window; until then each
+    pass keeps it, and the first pass after archives it. Reversible (`thread/unarchive`), so no --act needed."""
+    if not core.CODEX_SOCKET.exists():
+        return
+    for issue, claim in closed_claims('codex', 86400):
+        session = claim['session']
+        if core.codex_is_archived(session):
+            continue
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                core.codex_archive(argparse.Namespace(thread=session))
+            log(f'Archived {session}: the Codex worker of closed {core.ref(issue)}.')
+        except (SystemExit, OSError) as error:
+            log(f'Kept {session} of closed {core.ref(issue)} for a later pass: {core.codex_line(str(error))[:120]}')
 
 
 def tick_pass(args, act=False):
@@ -453,9 +478,10 @@ def tick_pass(args, act=False):
         f'{core.ref(item)} is in review without a result: `reject {item["iid"]}` or close it by hand'
         for item in everything if item['state'] == 'review' and not item['result']] + misplaced
     start = starts(args, loaded, selected)
+    if act:
+        retire_closed(log)
+    archive_closed_codex(log)
     if not (review or fresh or summary or start or codex_stopped or odd or problems) and not any(item['state'] == 'doing' for item in everything):
-        if act:
-            retire_closed(log)
         # #153: an ask or review task waits for someone, so it is no idle pass.
         if any(item['state'] in ('ask', 'review') for item in everything):
             idle_ticks().unlink(missing_ok=True)
@@ -465,8 +491,6 @@ def tick_pass(args, act=False):
         print(inbox_line(inbox) + 'Nothing to do. Say so and stop.')
         return [f'inbox {issue["iid"]}' for issue in inbox]
     idle_ticks().unlink(missing_ok=True)
-    if act:
-        retire_closed(log)
     print(f'You are the coordinator of the task queue for this one pass. Queue tool: `{core.TOOL}`\n')
     print(inbox_line(inbox), end='')
     # #83: one table of every worker; the owner's chat opens only http(s) links.

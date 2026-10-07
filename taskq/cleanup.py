@@ -310,6 +310,15 @@ def cleanup(args):
     # Fetch updates tracking refs only; report never changes local branches, trees or sessions.
     subprocess.run(['git', '-C', str(root), 'fetch', '-q', 'origin'], check=True)
     remove, ask, keep = cleanup_plan(root)
+    if hasattr(args, 'output'):
+        args.output.update(plan={'remove': remove, 'ask': ask, 'keep': keep},
+                           sessions=[item['thread'] for item in remove if item.get('thread')],
+                           refusals=[{'what': item['what'], 'reason': item['why']} for item in ask + keep])
+        if ask:
+            args.output['outcome'] = 'judgement_needed'
+        if not args.apply:
+            for item in remove:
+                core.record(args, 'remove', status='proposed', **item)
     for title, items in (('Remove', remove), ('Ask the owner', ask), ('Kept', keep)):
         print(f'\n# {title}')
         if not items:
@@ -326,41 +335,57 @@ def cleanup(args):
     # Archive by cwd while the finished tree still exists; otherwise its proof would disappear.
     for item in sorted(remove, key=lambda item: item['kind'] != 'codex'):
         if item['kind'] == 'claude':
+            core.record(args, 'archive', status='refused', session=item['thread'], reason='requires coordinator application tool')
             continue  # only the coordinator's application tool can archive these
         if item['kind'] == 'tree' and Path(item['path']).resolve() in blocked_trees:
+            core.record(args, 'remove', status='refused', reason='session not archived', **item)
             print(f'Kept: the session of this tree is not archived: {item["what"]}')
             continue
         # Re-read live task/session/process/ref state before each act.
         fresh, _, _ = cleanup_plan(root)
         if item not in fresh:
+            core.record(args, 'remove', status='refused', reason='state changed on recheck', **item)
             print(f'Kept after the recheck: {item["what"]}')
             continue
         if item['kind'] == 'tree':
             size = gc._measure(Path(item['path']), set())[0]
-            if subprocess.run(retire_command(root, item['path']), cwd=root).returncode:
+            if subprocess.run(retire_command(root, item['path']), cwd=root, stdout=subprocess.DEVNULL if getattr(args, 'json', False) else None).returncode:
+                core.record(args, 'remove', status='refused', reason='retire refused', **item)
                 print(f'Kept: retire refused {item["what"]}')
                 continue
             freed += size
             removed.append(item['path'])
+            core.record(args, 'remove_tree', status='done', **item)
         if item['kind'] in ('tree', 'branch') and item['branch']:
             # -d can refuse a patch-equivalent rebased branch; do not force or rewrite its ref.
             done = subprocess.run(['git', '-C', str(root), '-c', f'branch.{item["branch"]}.remote=origin',
                                    '-c', f'branch.{item["branch"]}.merge=refs/heads/main', 'branch', '-d', '--', item['branch']], capture_output=True, text=True)
             if done.returncode:
+                core.record(args, 'delete_branch', status='refused', reason=done.stderr.strip(), **item)
                 print(f'Kept branch {item["branch"]}: {done.stderr.strip()}')
             else:
                 removed.append(item['branch'])
+                core.record(args, 'delete_branch', status='done', **item)
         elif item['kind'] == 'codex':
             try:
                 core.codex_archive(argparse.Namespace(thread=item['thread']))
                 removed.append(item['what'])
+                core.record(args, 'archive', status='done', session=item['thread'])
             except (SystemExit, OSError) as error:
                 if item.get('cwd'):
                     blocked_trees.add(Path(item['cwd']).resolve())
+                core.record(args, 'archive', status='refused', session=item['thread'], reason=str(error))
                 print(f'Kept: {item["what"]}: {error}')
         elif item['kind'] == 'claude-bg':
             core.claude_stop(item['thread'], remove=True)
             removed.append(item['what'])
+            core.record(args, 'retire', status='done', session=item['thread'])
+    if hasattr(args, 'output'):
+        args.output.update(removed=removed, freed_bytes=freed)
+        refusals = [event for event in args.output['actions'] if event.get('status') == 'refused']
+        args.output['refusals'].extend(refusals)
+        if refusals:
+            args.output['outcome'] = 'judgement_needed'
     print(f'\nRemoved:{len(removed)}; freed {freed} bytes of data ({freed / gc.GIB:.3f} GiB).')
     for name in removed:
         print(f'- {name}')

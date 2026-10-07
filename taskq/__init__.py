@@ -8,6 +8,7 @@ Everything specific to a project is its `taskq.toml`. Contracts: `taskq contract
 import argparse
 import contextlib
 import hashlib
+import io
 from datetime import datetime
 import json
 import os
@@ -770,6 +771,39 @@ from taskq.worker import (  # noqa: E402
     claude_sessions, driver_app_session)
 
 
+def record(args, action, **values):
+    """Structured events are collected only for --json; prose callers need no extra state."""
+    if hasattr(args, 'output'):
+        args.output['actions'].append({'action': action, **values})
+
+
+def json_command(args):
+    args.output = {'command': args.action, 'outcome': 'ok', 'actions': [], 'tasks': [],
+                   'sessions': [], 'refusals': []}
+    code = 0
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            if PROJECT is None:
+                configure()
+            args.function(args)
+        if any(event.get('status') == 'failed' for event in args.output['actions']):
+            args.output['outcome'], code = 'failure', 2
+    except SystemExit as error:
+        code = error.code if isinstance(error.code, int) else 2
+        if args.output['outcome'] != 'judgement_needed' or code != 1:
+            args.output['outcome'] = 'failure'
+            args.output['refusals'].append(str(error))
+            code = 2
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        args.output['outcome'] = 'failure'
+        args.output['refusals'].append(str(error))
+        code = 2
+    args.output['text'] = output.getvalue()
+    print(json.dumps(args.output))
+    if code:
+        raise SystemExit(code)
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv == ['--version']:  # update's start check of new code
@@ -787,6 +821,7 @@ def main(argv=None):
         item.set_defaults(function=function)
         for names, options in arguments:
             item.add_argument(*names, **options)
+    json_flag = (('--json',), {'action': 'store_true', 'help': 'structured JSON output'})
     iid = (('iid',), {'type': int})
     text = (('--text',), {'required': True})
     command('add', add, (('--title',), {'required': True}), (('--goal',), {'required': True}),
@@ -815,7 +850,7 @@ def main(argv=None):
     command('later', later, iid, text)
     command('edit', edit, iid, (('--deps',), {'nargs': '*', 'type': int}), (('--scope',), {'nargs': '*'}),
             (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}))
-    command('tick', tick, *profile_flags, (('--prompt-version',), {'type': int, 'metavar': 'N',
+    command('tick', tick, json_flag, *profile_flags, (('--prompt-version',), {'type': int, 'metavar': 'N',
             'help': "the timer prompt's version (manager contract § 2); older ones are told to re-arm"}),
             (('--act',), {'action': 'store_true', 'help': 'spawn, retire and nudge here; print only what needs judgement, exit 1 then'}),
             (('--wake',), {'action': 'store_true', 'help': 'with --act: give that output to the [coordinator] session (the launchd timer)'}),
@@ -843,7 +878,7 @@ def main(argv=None):
                            'help': 'recent turns (default 3), up to 100 latest events per turn'}))
     command('codex-archive', codex_archive, thread)
     command('problem', problem, text, (('--task',), {'type': int}))
-    command('cleanup', cleanup, (('--apply',), {'action': 'store_true'}))
+    command('cleanup', cleanup, json_flag, (('--apply',), {'action': 'store_true'}))
     for name in ('init', 'migrate'):
         command(name, migrate, (('--project',), {'help': 'GitLab project path: writes a minimal taskq.toml here if none'}),
                 (('--github',), {'help': 'GitHub repository owner/name: writes a minimal taskq.toml here if none'}),
@@ -853,7 +888,7 @@ def main(argv=None):
                                             'print each step only the person can do'}),
             (('--codex',), {'action': 'store_true', 'help': 'with --fix: also the Codex app project of this checkout'}))
     command('update', update, (('--verbose',), {'action': 'store_true', 'help': 'say why a check was skipped'}))
-    command('report', report, (('--hours',), {'type': int, 'default': 24}))
+    command('report', report, json_flag, (('--hours',), {'type': int, 'default': 24}))
     command('selftest', selftest, (('--scope',), {'choices': ('quick', 'full', 'check'), 'default': 'quick'}),
             (('--runtime',), {'nargs': '+', 'choices': tuple(RUNTIMES),
                               'help': 'quick: the worker identity (default: this session\'s app); full: apps to start (default: all)'}),
@@ -865,6 +900,8 @@ def main(argv=None):
     where = getattr(args, 'project', None) or getattr(args, 'github', None)
     if where:
         write_config(not args.project, where, args.host)
+    if getattr(args, 'json', False):
+        return json_command(args)
     if PROJECT is None and args.function not in (contract, update, doctor):
         configure()
     if args.function(args) and args.function is update:

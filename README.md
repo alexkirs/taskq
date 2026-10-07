@@ -147,6 +147,17 @@ Tell the manager your profile, confirm its card, then **“Arm the tick.”**
 Expected: the coordinator runs `taskq tick` (no flags) every 5 minutes.
 Optional on macOS, for a tick without an open app session: `taskq tick --install-timer` makes launchd run `taskq tick --act` every 5 minutes, which starts, nudges and retires workers itself and wakes the coordinator only when something needs judgement (`--uninstall-timer` removes it).
 
+For CLI automation, `tick`, `report` and `cleanup` accept `--json`. Stdout is one JSON object with
+`command`, `outcome` (`ok`, `judgement_needed`, `failure`), `actions`, `tasks`, `sessions`, `refusals`
+and the captured prose in `text`. Actions carry their status and available task/session identifiers;
+`report` actions are timestamped note events. Cleanup includes its `plan` (remove/ask/keep), and
+`--apply` includes actual removals and freed bytes. JSON does not make a command read-only:
+plain tick still updates, reconciles and archives; cleanup still fetches, and `--apply` removes eligible items.
+`tick --act --json` exits 1 for judgement and 2 for failure; other JSON commands retain exit 0 for a
+completed report/plan (including `judgement_needed`) and exit 2 for failure. Without `--json`, output
+and exit codes are unchanged.
+
+
 Your profile lives in `taskq.local.toml` of the main checkout: personal, never committed
 (`taskq init` adds it to `.gitignore`). Workers make their trees in `.worktrees/taskq-<N>` of the same
 checkout (also gitignored); `taskq doctor` names older `../taskq-<N>` trees with the command that moves them.

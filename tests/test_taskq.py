@@ -1744,6 +1744,51 @@ class Cycle(unittest.TestCase):
         self.assertIn('Start 1 worker', output)
         self.assertNotIn('## Codex idle', output)
 
+    def test_json_tick_report_and_failure_outcomes(self):
+        self.personal('[idle]\nstop = 0\n')
+        idle = json.loads(self.do(COORDINATOR, 'tick', '--json', '--act'))
+        self.assertEqual(idle['outcome'], 'ok')
+        with patch.object(tick.fcntl, 'flock', side_effect=BlockingIOError), contextlib.redirect_stderr(io.StringIO()):
+            overlap = json.loads(self.do(COORDINATOR, 'tick', '--json', '--act'))
+        self.assertEqual(overlap['refusals'], ['another tick pass is running'])
+        self.assertEqual(overlap['actions'][0]['status'], 'refused')
+        iid = self.add('--type', 'research')
+        proposed = json.loads(self.do(COORDINATOR, 'tick', '--json'))
+        self.assertEqual(proposed['tasks'][0]['id'], iid)
+        self.assertEqual(proposed['actions'][0]['status'], 'proposed')
+        with patch.object(q, 'spawn', side_effect=OSError('spawn unavailable')), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                q.main(['tick', '--act', '--json'])
+        self.assertEqual(caught.exception.code, 2)
+        failed = json.loads(out.getvalue())
+        self.assertEqual(failed['outcome'], 'failure')
+        self.assertEqual(failed['actions'][0]['task'], iid)
+        self.assertIn('spawn unavailable', failed['actions'][0]['reason'])
+        with patch.object(q, 'spawn', return_value='new-session'), contextlib.redirect_stderr(io.StringIO()):
+            spawned = json.loads(self.do(COORDINATOR, 'tick', '--act', '--json'))
+        self.assertEqual(spawned['outcome'], 'ok')
+        self.assertEqual(spawned['actions'][0]['session'], 'new-session')
+        self.do(CLAUDE, 'take', iid)
+        self.do(CLAUDE, 'ask', iid, '--text', 'Which option?')
+        with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as caught:
+            q.main(['tick', '--act', '--json'])
+        self.assertEqual(caught.exception.code, 1)
+        asked = json.loads(out.getvalue())
+        self.assertEqual(asked['outcome'], 'judgement_needed')
+        self.assertIn(f'ask {iid}', asked['refusals'])
+        self.assertIn('claude-session', asked['sessions'])
+        report = json.loads(self.do(CLAUDE, 'report', '--json'))
+        self.assertEqual(report['outcome'], 'ok')
+        self.assertIn(iid, report['tasks'])
+        self.assertEqual([event['action'] for event in report['actions']], ['take', 'ask', 'shown'])
+        self.assertIn('# Tasks', report['text'])
+        with patch.object(q, 'issues', side_effect=OSError('tracker unavailable')), \
+                contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as caught:
+            q.main(['report', '--json'])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(json.loads(out.getvalue())['refusals'], ['tracker unavailable'])
+
     def test_tick_act_does_the_mechanical_steps_and_exits_1_only_for_judgement(self):
         """#42: spawn, nudge and retire happen in --act; stdout and exit 1 only for review, ask, problems, mismatch, inbox."""
         def act(*flags):
@@ -3361,6 +3406,35 @@ class Cleanup(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             q.main(['cleanup'] + (['--apply'] if apply else []))
         return out.getvalue()
+
+    def test_json_cleanup_plan_apply_and_recheck_refusal(self):
+        tree = self.tree('worktree-json')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            q.main(['cleanup', '--json'])
+        plan = json.loads(out.getvalue())
+        self.assertEqual(plan['outcome'], 'ok')
+        self.assertEqual(plan['actions'][0]['status'], 'proposed')
+        self.assertEqual(plan['plan']['remove'][0]['path'], str(tree))
+        self.assertTrue(tree.exists())
+        original, calls = cleanup.cleanup_plan, []
+
+        def changed(root):
+            result = original(root)
+            calls.append(True)
+            return result if len(calls) == 1 else ([], [], [])
+        with patch.object(cleanup, 'cleanup_plan', changed), contextlib.redirect_stdout(io.StringIO()) as out:
+            q.main(['cleanup', '--json', '--apply'])
+        refused = json.loads(out.getvalue())
+        self.assertEqual(refused['outcome'], 'judgement_needed')
+        self.assertEqual(refused['refusals'][-1]['reason'], 'state changed on recheck')
+        self.assertTrue(tree.exists())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            q.main(['cleanup', '--json', '--apply'])
+        applied = json.loads(out.getvalue())
+        self.assertEqual(applied['outcome'], 'ok')
+        self.assertIn(str(tree), applied['removed'])
+        self.assertGreater(applied['freed_bytes'], 0)
+        self.assertFalse(tree.exists())
 
     def test_merged_clean_tree_is_reported_then_retired_and_branch_deleted(self):
         tree = self.tree('worktree-done')

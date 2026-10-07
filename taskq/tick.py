@@ -228,8 +228,10 @@ def launch(args, start, act, step):
         for item in start:
             step(f'spawn a {item["runtime"]} worker for {core.ref(item)}', lambda item=item: core.spawn(argparse.Namespace(
                 runtime=item['runtime'], name=f'T{item["iid"]} {item["title"][:40]}', remote_control=True, text=worker_prompt(args),
-                full_access=item['full_access'])))
+                full_access=item['full_access'])), item=item)
     elif start:
+        for item in start:
+            core.record(args, 'spawn', status='proposed', task=item['iid'], runtime=item['runtime'])
         # One command per worker: the session starts on the prompt, no second message (#41).
         # An indented block, not inline code: the prompt itself holds backticks.
         print(f'## Start {len(start)} worker session(s)\n\n' + ''.join(f'- {core.ref(item)} {item["title"]}: {item["runtime"]}\n' for item in start)
@@ -250,11 +252,18 @@ def tick(args):
         try:
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            core.record(args, 'tick', status='refused', reason='another tick pass is running')
+            if hasattr(args, 'output'):
+                args.output['refusals'].append('another tick pass is running')
             print('Skipped: another tick pass is running.', file=sys.stderr)
             return
         if args.act:
             return act(args)
-        tick_pass(args)
+        judgement = tick_pass(args)
+        if hasattr(args, 'output') and judgement:
+            args.output['outcome'] = 'judgement_needed'
+            args.output['refusals'] = judgement
+
 
 
 def act(args):
@@ -262,6 +271,9 @@ def act(args):
     `--wake` (the launchd timer) also gives that output to the coordinator session as one turn."""
     with contextlib.redirect_stdout(io.StringIO()) as said:
         judgement = tick_pass(args, act=True)
+    if hasattr(args, 'output') and judgement:
+        args.output['outcome'] = 'failure' if any(event.get('status') == 'failed' for event in args.output['actions']) else 'judgement_needed'
+        args.output['refusals'] = judgement
     if not judgement:
         return
     print(said.getvalue(), end='')
@@ -353,7 +365,7 @@ def idle_stop(act, step, failed):
             + '; report to the owner; rearm with "arm the tick" (manager contract § 3).')
 
 
-def retire_closed(log):
+def retire_closed(log, args=None):
     """--act: a local Claude worker of a task closed in the last hour without this machine's `close` (closed on
     the board or by hand) is retired as `close` would. ponytail: sessions only; trees and branches: `cleanup`."""
     agents = core.claude_agents()
@@ -369,10 +381,11 @@ def retire_closed(log):
         agent = agents.get(claim.get('session'))
         if agent and agent.get('status') != 'busy' and claim.get('runtime') == 'claude' and core.local_claim(claim):
             core.claude_stop(claim['session'], remove=True)
+            core.record(args, 'retire', status='done', task=issue['iid'], session=claim['session'])
             log(f'Retired {claim["session"]}: the worker of closed {core.ref(issue)}.')
 
 
-def archive_finished_codex(tasks, log):
+def archive_finished_codex(tasks, log, args=None):
     """#165: every pass archives this checkout's Codex worker threads (`T<N> …`, as spawn names them) that are no
     open task's claim: the task closed, or went ask -> answer -> ready and a new session continues it. A thread the
     owner viewed is held by the app, and codex-archive has the app archive it (#165). Reversible (`thread/unarchive`), so no --act needed."""
@@ -383,6 +396,7 @@ def archive_finished_codex(tasks, log):
     try:
         threads = cleanup_codex({root})
     except (OSError, SystemExit, ValueError) as error:
+        core.record(args, 'archive_inventory', status='refused', reason=str(error))
         return log(f'Codex threads not checked: {core.codex_line(str(error))[:120]}')
     for thread in threads.values():
         name, sid = thread.get('name') or '', thread['id']
@@ -394,8 +408,10 @@ def archive_finished_codex(tasks, log):
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 core.codex_archive(argparse.Namespace(thread=sid))
+            core.record(args, 'archive', status='done', session=sid)
             log(f'Archived {sid} ({name}): no open task holds it.')
         except (SystemExit, OSError) as error:
+            core.record(args, 'archive', status='refused', session=sid, reason=str(error))
             log(f'Kept {sid} ({name}) for a later pass: {core.codex_line(str(error))[:120]}')
 
 
@@ -405,13 +421,16 @@ def tick_pass(args, act=False):
     log = lambda line: print(line, file=sys.stderr)  # an act step: the timer's log, never the coordinator's turn
     failed = []
 
-    def step(what, action):
+    def step(what, action, item=None):
         try:
             with contextlib.redirect_stdout(sys.stderr):
-                action()
+                result = action()
+            core.record(args, what.split()[0], detail=what, status='done', task=(item or {}).get('iid'),
+                        session=result if isinstance(result, str) else ((item or {}).get('claim') or {}).get('session'))
             log(f'Done: {what}.')
         except (SystemExit, OSError, ValueError, subprocess.SubprocessError) as error:
             failed.append(f'{what}: {core.codex_line(str(error))}')
+            core.record(args, what.split()[0], detail=what, status='failed', reason=str(error), task=(item or {}).get('iid'))
     auto_update()
     print(f'taskq {core.version()}')
     if warning := clone_warning():
@@ -423,6 +442,10 @@ def tick_pass(args, act=False):
     contract_news(args.prompt_version)
     loaded, candidates = core.profile(args)
     selected = {item['iid'] for item in candidates}
+    if hasattr(args, 'output'):
+        args.output['profile'] = args.profile
+        args.output['tasks'] = [{'id': item['iid'], 'state': item['state'], 'claim': item['claim']} for item in candidates]
+        args.output['sessions'] = [item['claim']['session'] for item in candidates if (item['claim'] or {}).get('session')]
     # #145: only the coordinator machine ([coordinator] machine of taskq.toml; none set: every machine) starts shared
     # workers, accepts reviews and shows questions; another machine releases its own work and starts its host-* tasks.
     holder = core.COORDINATOR in (None, core.machine())
@@ -441,6 +464,7 @@ def tick_pass(args, act=False):
             f'no change on the issue for {core.age(item)} minutes'
         args.iid, args.action, args.text = item['iid'], 'release', why
         core.requeue(args)
+        core.record(args, 'release', task=item['iid'], reason=why)
         print(f'Released {"dead" if item in dead else "stalled"} {core.ref(item)}.')
     stalled = dead + stalled
     if not holder:
@@ -457,6 +481,7 @@ def tick_pass(args, act=False):
     for issue in core.issues(f'state=opened&my_reaction_emoji={core.LOCK}'):
         if issue['iid'] in selected and issue['iid'] not in held and all(time.time() - core.stamp(item['created_at']) > core.LOCK_SECONDS for item in core.locks(issue['iid'])):
             core.unlock(issue['iid'])
+            core.record(args, 'unlock', task=issue['iid'])
             print(f'Unlocked {core.ref(issue)}: nobody holds it.')
     misplaced = []
     if not core.BOARDS and core.api('GET', 'board'):
@@ -475,6 +500,7 @@ def tick_pass(args, act=False):
             core.save(item, 'waiting', 'waiting', f'open dependencies {open_deps}')
         else:
             core.save(item, 'ready', 'ready', 'dependencies closed')
+        core.record(args, 'move', task=item['iid'], state='ready' if item['state'] == 'waiting' else 'waiting')
         moved += 1
         print(f'Moved {core.ref(item)} {item["state"]} → {"ready" if item["state"] == "waiting" else "waiting"}.')
     everything, _, odd, problems, inbox = loaded = core.load() if moved else loaded
@@ -494,8 +520,8 @@ def tick_pass(args, act=False):
         for item in everything if item['state'] == 'review' and not item['result']] + misplaced
     start = starts(args, loaded, selected)
     if act:
-        retire_closed(log)
-    archive_finished_codex(loaded[0], log)
+        retire_closed(log, args)
+    archive_finished_codex(loaded[0], log, args)
     if not (review or fresh or summary or start or codex_stopped or odd or problems) and not any(item['state'] == 'doing' for item in everything):
         # #153: an ask or review task waits for someone, so it is no idle pass.
         if any(item['state'] in ('ask', 'review') for item in everything):
@@ -524,7 +550,7 @@ def tick_pass(args, act=False):
     if idle and act:
         for item in idle:
             step(f'nudge idle Codex {core.ref(item)}', lambda item=item: core.codex_send(
-                argparse.Namespace(thread=item['claim']['session'], text=NUDGE, full_access=item['full_access'])))
+                argparse.Namespace(thread=item['claim']['session'], text=NUDGE, full_access=item['full_access'])), item=item)
     elif idle:
         print('## Codex idle\n\nTask is doing without result/ask, but its session has stopped. Intervene now:\n')
         for item in idle:
@@ -533,7 +559,7 @@ def tick_pass(args, act=False):
         print()
     if claude_idle and act:
         for item in claude_idle:
-            step(f'nudge idle Claude {core.ref(item)}', lambda item=item: core.claude_wake(item['claim']['session'], NUDGE))
+            step(f'nudge idle Claude {core.ref(item)}', lambda item=item: core.claude_wake(item['claim']['session'], NUDGE), item=item)
     elif claude_idle:
         print('## Claude idle\n\nTask is doing without result/ask, but its session has ended its turn. Intervene now:\n')
         for item in claude_idle:
@@ -545,7 +571,7 @@ def tick_pass(args, act=False):
     if quiet and act:
         for item in quiet:
             step(f'nudge quiet {core.ref(item)}', lambda item=item: core.executor_run(
-                item['claim']['runtime'], 'send', session=item['claim']['session'], text=NUDGE))
+                item['claim']['runtime'], 'send', session=item['claim']['session'], text=NUDGE), item=item)
     elif quiet:
         print(f'## Quiet workers\n\nNo change on the issue for {core.QUIET_MINUTES} minutes. Nudge each (this tick only):\n')
         for item in quiet:
@@ -587,7 +613,7 @@ def tick_pass(args, act=False):
     if codex_stopped and act:
         for item in codex_stopped:
             step(f'archive stopped Codex {core.ref(item)}', lambda item=item: core.codex_archive(
-                argparse.Namespace(thread=item['claim']['session'])))
+                argparse.Namespace(thread=item['claim']['session'])), item=item)
     elif codex_stopped:
         print('\n## Archive stopped Codex workers\n\nTasks in ask or later continue in a new session after answer; archive when idle:\n')
         for item in codex_stopped:

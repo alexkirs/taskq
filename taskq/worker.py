@@ -373,6 +373,8 @@ def report(args):
                 found.append({'task': issue['iid'], 'at': core.stamp(item['created_at']), 'action': head[1],
                               'who': head[2], 'text': item['body'].split('\n\n', 1)[-1]})
     found.sort(key=lambda event: event['at'])
+    if hasattr(args, 'output'):
+        args.output.update(actions=found, tasks=sorted(tasks), sessions=sorted({event['who'] for event in found}))
     print(f'# Tasks, last {args.hours} h (minutes spent before each step)')
     for iid in sorted({event['task'] for event in found} & tasks):
         steps = [event for event in found if event['task'] == iid and event['action'] not in ('beat', 'shown')]
@@ -396,14 +398,18 @@ def spawn(args):
     rejects a name containing it as a name@team address."""
     name = args.name if args.name.endswith(f' ({core.machine()})') else f'{args.name} ({core.machine()})'
     if args.runtime == 'codex':
-        return print(core.codex_spawn(name, args.text, getattr(args, 'full_access', False)))
+        session = core.codex_spawn(name, args.text, getattr(args, 'full_access', False))
+        print(session)
+        return session
     if args.runtime in core.EXECUTORS:
         session = executor_run(args.runtime, 'spawn', name=name)
         if args.text:
             executor_run(args.runtime, 'send', session=session, text=args.text)
-        return print(session)
+        print(session)
+        return session
     session = claude_spawn(name, prompt=args.text, remote_control=args.remote_control)
     print(f'{session}\nWatch it: `claude attach {session[:8]}` or `claude agents`; in the app: `{core.TOOL} show {session}`.')
+    return session
 
 
 def executor_run(runtime, verb, **values):

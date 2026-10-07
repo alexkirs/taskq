@@ -171,6 +171,68 @@ class Reservation(unittest.TestCase):
         with patch.object(q, 'SHARED', {'profile': {'limits': {'claude': 9}}}):
             self.assertIn('state is later', self.changed_under_the_lock(iid, lambda: q.save(q.task(iid), 'later')))
 
+    def take_with_change(self, iid, change, hook='lock'):
+        """`change` lands between the take's first read and its lock (`hook`: the lock a plain take sets, or the
+        lock check of an adopting worker): the read under the lock refuses."""
+        real, changes = getattr(q, hook), [change]
+
+        def hooked(number):
+            found = real(number)
+            if changes and number == iid:
+                changes.pop()()
+            return found
+        with patch.object(q, hook, hooked):
+            return self.refused(WORKER, 'take', iid)
+
+    def test_take_checks_every_guard_again_under_the_lock(self):
+        """Review reproduction (P1): a take after a revoked assignment went to doing and wrote the old assignee back."""
+        own = self.add('--type', 'research', '--runtime', 'claude', '--mine')
+        self.assertIn('delegation needs an owner-verified policy', self.take_with_change(
+            own, lambda: q.api('PUT', f'issues/{own}', {'assignee_ids': [2]})))
+        self.assertEqual((self.state(own), self.gitlab.issues[own]['assignees'], self.gitlab.locked()), ('ready', [{'id': 2}], []))
+        dep, iid = self.add('--type', 'research'), self.add('--type', 'research', '--runtime', 'claude')
+        for why, change, undo in ((f'open dependencies [{dep}]', dict(deps=[dep]), dict(deps=[])),
+                                  ('runtime is codex', dict(add=[q.RUN + 'codex'], remove=[q.RUN + 'claude']), dict(add=[q.RUN + 'claude'], remove=[q.RUN + 'codex'])),
+                                  ('host is win', dict(add=[q.ON + 'win']), dict(remove=[q.ON + 'win']))):
+            with self.subTest(why):
+                self.assertIn(why, self.take_with_change(iid, lambda change=change: q.save(q.task(iid), **change)))
+                self.assertEqual((self.state(iid), self.gitlab.locked()), ('ready', []))
+                q.save(q.task(iid), **undo)
+        self.do(WORKER, 'take', iid)
+        self.assertEqual(self.gitlab.issues[iid]['assignees'], [{'id': 1}])  # an unassigned task becomes the taker's
+
+    def test_refused_adoption_keeps_the_attempt_and_its_lock(self):
+        self.launches()
+        for case, change, why in (
+                ('assignment revoked', lambda iid: q.api('PUT', f'issues/{iid}', {'assignee_ids': [2]}), 'delegation needs'),
+                ('dependency added', lambda iid: q.save(q.task(iid), deps=[self.add('--type', 'research')]), 'open dependencies'),
+                ('attempt replaced', lambda iid: q.save(q.task(iid), reservation={**q.task(iid)['reservation'], 'attempt': 'other'}),
+                 'its reservation changed')):
+            with self.subTest(case):
+                iid = self.add('--type', 'research', '--runtime', 'claude', '--mine')
+                self.spawn(iid)
+                self.assertIn(why, self.take_with_change(iid, lambda: change(iid), hook='locks'))
+                block = self.block(iid)
+                self.assertEqual((self.state(iid), 'reservation' in block, iid in self.gitlab.locked()), ('ready', True, True))
+                self.assertEqual(self.gitlab.issues[iid]['assignees'], [{'id': 2 if case == 'assignment revoked' else 1}])
+                q.save(q.task(iid), 'later', reservation=None)  # the coordinator settles it; the next case starts clean
+                q.unlock(iid)
+
+    def test_adopting_an_assigned_task_writes_no_assignee(self):
+        self.launches()
+        iid = self.add('--type', 'research', '--runtime', 'claude', '--mine')
+        self.spawn(iid)
+        api, puts = q.api, []
+
+        def recording(method, path, body=None):
+            if method == 'PUT':
+                puts.append(body)
+            return api(method, path, body)
+        with patch.object(q, 'api', recording):
+            self.do(WORKER, 'take', iid)
+        self.assertEqual(self.state(iid), 'doing')
+        self.assertFalse(any('assignee_ids' in body for body in puts))
+
     def test_a_reservation_that_fails_after_its_write_leaves_no_stale_state(self):
         self.launches()
         iid = self.add('--type', 'research', '--runtime', 'claude', '--scope', 'a')

@@ -191,52 +191,64 @@ def worker(args):
 
 
 def take(args):
-    """Check the admission rule, set the lock, move the task to doing. The lock decides one task;
-    Scope is a rule between tasks, so after the move the newer of two overlapping takes gives way."""
-    mine = core.me()
-    everything, open_iids, *_ = core.load()
-    current = next((item for item in everything if item['iid'] == args.iid), None) or core.fail(f'#{args.iid} is not an open taskq task')
+    """Check the admission rule, set the lock, check it again on a read under the lock, move the task to doing.
+    The lock decides one task; scope is a rule between tasks, so after the move the newer of two overlapping
+    takes gives way. #208: a reserved task goes only to the worker its coordinator launched, which adopts the
+    reservation's lock; a refused adoption leaves the reservation and its lock to their owner."""
+    mine, uid = core.me(), core.user()
+
+    def read():
+        everything, open_iids, *_ = core.load()
+        current = next((item for item in everything if item['iid'] == args.iid), None) or core.fail(f'#{args.iid} is not an open taskq task')
+        reserved = current['state'] == 'ready' and current.get('reservation')
+        return current, (f'state is {current["state"]}' if current['state'] != 'ready' else
+                         (core.refusal(current, everything, open_iids) if reserved and not adopts(current, mine) else None)
+                         or core.refusal({**current, 'reservation': None}, everything, open_iids, mine['runtime'])
+                         or core.sandbox_refusal(current, mine['runtime']) or delegation(current, uid))
+    current, reason = read()
     claim = current['claim'] or {}
     if current['state'] == 'doing' and (claim.get('runtime'), claim.get('session')) == (mine['runtime'], mine['session']):
         core.note(args.iid, 'take')  # a repeated take of its own task, e.g. after an answer in the session
         return print(f'#{args.iid} is yours')
-    # #208: a reserved task goes only to the worker its coordinator launched, which adopts the reservation's lock.
-    reserved = current['state'] == 'ready' and current.get('reservation')
-    if reserved and not adopts(current, mine):
-        core.fail(f'#{args.iid} cannot start: {core.refusal(current, everything, open_iids)}')
-    uid = core.user()
-    reason = f'state is {current["state"]}' if current['state'] != 'ready' else (
-        core.refusal({**current, 'reservation': None}, everything, open_iids, mine['runtime'])
-        or core.sandbox_refusal(current, mine['runtime']) or delegation(current, uid))
     if reason:
         core.fail(f'#{args.iid} cannot start: {reason}')
-    if not (reserved and core.locks(args.iid)) and not core.lock(args.iid):
+    attempt = (current.get('reservation') or {}).get('attempt')
+    locked = not (attempt and core.locks(args.iid))  # this take sets the lock, unless it adopts the reservation's
+    if locked and not core.lock(args.iid):
         core.fail(f'#{args.iid} cannot start: another worker holds its lock')
     try:
-        # The assignee stays; an unassigned task becomes the taker's, as before.
-        core.save(current, 'doing', claim=mine, result=None, waiting_for=None, reservation=None,
-                  assignee_ids=current.get('assignees') or [uid])
+        # An assignment, dependency, runtime, host or reservation changed between the first read and the lock refuses here.
+        fresh, reason = read()
+        if not reason and (fresh.get('reservation') or {}).get('attempt') != attempt:
+            reason = 'its reservation changed since this take read it'
+        if reason:
+            core.fail(f'#{args.iid} cannot start: {reason}')
+        # The assignee stays untouched; only an unassigned task becomes the taker's, as before.
+        assign = {} if fresh['assignees'] else {'assignee_ids': [uid]}
+        core.save(fresh, 'doing', claim=mine, result=None, waiting_for=None, reservation=None, **assign)
     except BaseException:
-        # A lock left behind refuses every later take of this task until tick clears it (#105).
-        with contextlib.suppress(Exception, SystemExit):
-            core.unlock(args.iid)
+        # A lock left behind refuses every later take of this task until tick clears it (#105). The lock of a
+        # reservation stays with it: it is its coordinator's to settle.
+        if locked:
+            with contextlib.suppress(Exception, SystemExit):
+                core.unlock(args.iid)
         raise
-    held = {**current, 'state': 'doing', 'reservation': None}
+    held = {**fresh, 'state': 'doing', 'reservation': None}
     # A task without paths overlaps nothing: no second read. A reserved rival is older than any take (#208).
-    rivals = current['scope'] and [other for other in core.load()[0] if other['iid'] != args.iid
-              and ((other['claim'] or {}).get('session') or other.get('reservation')) and core.overlap(current['scope'], other['scope'])]
+    rivals = fresh['scope'] and [other for other in core.load()[0] if other['iid'] != args.iid
+             and ((other['claim'] or {}).get('session') or other.get('reservation')) and core.overlap(fresh['scope'], other['scope'])]
     if rivals:
         # Each take moves its task before it reads, so the later of two sees the earlier; both order them alike.
         since = doing_since(args.iid)
         older = [other for other in rivals if (0 if other.get('reservation') else doing_since(other['iid']), other['iid']) < (since, args.iid)]
         if older:
-            core.save(held, 'ready', claim=current['claim'], result=current['result'], waiting_for=current['waiting_for'],
-                 assignee_ids=current.get('assignees', []))
+            core.save(held, 'ready', claim=fresh['claim'], result=fresh['result'], waiting_for=fresh['waiting_for'],
+                      **({'assignee_ids': []} if assign else {}))
             core.unlock(args.iid)
             core.fail(f'#{args.iid} cannot start: scope overlaps #{older[0]["iid"]}')
-    if reserved:
-        principal = current['reservation'].get('principal')
-        core.note(args.iid, 'take', f'Adopted reservation {current["reservation"].get("attempt")} of {current["reservation"].get("coordinator")}'
+    if attempt:
+        principal = fresh['reservation'].get('principal')
+        core.note(args.iid, 'take', f'Adopted reservation {attempt} of {fresh["reservation"].get("coordinator")}'
                   + (f'; execution principal {uid}, reserved by {principal}' if principal != uid else ''))
     else:
         core.note(args.iid, 'take')

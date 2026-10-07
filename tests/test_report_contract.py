@@ -1,4 +1,4 @@
-"""Mocked contract/adapter conformance; these tests do not qualify live PM transports."""
+"""Mocked schema/readback conformance; runtime labels do not qualify transport adapters."""
 import argparse
 import contextlib
 import copy
@@ -23,7 +23,7 @@ class ReportContractTests(unittest.TestCase):
         return {'contract': tick.report_contract(), 'repository': 'https://example.com/org/repo',
                 'profile': {'filter': '', 'mine': False, 'limits': {'codex': 1}},
                 'board': 'https://example.com/board/1', 'observed_at': now, 'outcome': 'ok',
-                'actions': [], 'refusals': [], 'source_status': 'available',
+                'actions': [], 'refusals': [], 'source_status': 'available', 'validation': [],
                 'workers': [{'task': '[#1](https://example.com/issues/1)', 'title': 'Work',
                              'state': 'doing', 'runtime': 'codex', 'machine': 'host',
                              'session': '[session](https://example.com/session/1)',
@@ -44,7 +44,7 @@ class ReportContractTests(unittest.TestCase):
                     self.assertEqual(error.code, 1)
             return json.loads(output.getvalue())
 
-    def test_common_fresh_and_existing_adapter_scenarios(self):
+    def test_common_fresh_and_existing_labeled_readback_scenarios(self):
         for runtime in ('claude', 'codex', 'dot'):
             for lifecycle in ('fresh', 'already-running'):
                 with self.subTest(runtime=runtime, lifecycle=lifecycle):
@@ -74,6 +74,42 @@ class ReportContractTests(unittest.TestCase):
                     with patch.object(tick, 'REPORT_VERSION', 2):
                         self.assertEqual(self.verify(payload, runtime)['status'], 'unknown')
                     self.assertEqual(self.verify(payload, runtime, rendered='Done')['status'], 'unknown')
+
+    def test_long_pass_does_not_refresh_source_observation(self):
+        report = self.payload()
+        observed = datetime.fromtimestamp(1000, timezone.utc).isoformat().replace('+00:00', 'Z')
+        report['observed_at'] = observed
+        report['workers'][0]['event_at'] = observed
+        args = argparse.Namespace()
+        emitted = datetime.fromtimestamp(1901, timezone.utc)
+        with patch.object(tick, 'datetime') as clock, patch.object(tick.time, 'time', return_value=1901), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            clock.now.return_value = emitted
+            tick.emit_report(args, report)
+        self.assertEqual(report['observed_at'], observed)
+        self.assertIn('invalid/stale observed_at; obtain a fresh tick', report['validation'])
+        self.assertIn(observed, output.getvalue())
+
+    def test_verifier_rejects_missing_validation_and_rendered_status(self):
+        report = self.payload()
+        missing = copy.deepcopy(report)
+        del missing['validation']
+        self.assertEqual(self.verify(missing, rendered=tick.render_report(report))['status'], 'unknown')
+        rendered = tick.render_report(report)
+        hidden_status = '\n'.join(line for line in rendered.splitlines() if not line.startswith('Source status:'))
+        self.assertEqual(self.verify(report, rendered=hidden_status)['status'], 'unknown')
+        hidden_validation = '\n'.join(line for line in rendered.splitlines() if not line.startswith('Validation:'))
+        self.assertEqual(self.verify(report, rendered=hidden_validation)['status'], 'unknown')
+
+    def test_verifier_rejects_hidden_or_invalid_validation(self):
+        report = self.payload()
+        rendered = tick.render_report(report)
+        report['validation'] = ['source-specific blocker']
+        self.assertEqual(self.verify(report, rendered=rendered)['status'], 'unknown')
+        self.assertEqual(self.verify(report)['status'], 'unknown')  # visible blockers cannot acknowledge success
+        for invalid in (None, 'no blockers', [None], [1], ['']):
+            report['validation'] = invalid
+            self.assertEqual(self.verify(report, rendered=rendered)['status'], 'unknown')
 
     def test_template_provenance_and_bootstrap(self):
         contract = tick.report_contract()

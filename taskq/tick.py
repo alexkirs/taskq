@@ -152,7 +152,8 @@ def render_report(report):
         lines.append('Workers: none' if report['source_status'] == 'available' else 'Workers: unknown (source unavailable)')
     lines += ['Actions: ' + json.dumps(report['actions'], sort_keys=True),
               'Refusals: ' + json.dumps(report['refusals']),
-              f'Source status: {report["source_status"]}; received/applied: unknown (verify supported-channel output).']
+              f'Source status: {report["source_status"]}; received/applied: unknown (verify supported-channel output).',
+              'Validation: ' + json.dumps(report['validation'])]
     return '\n'.join(lines)
 
 
@@ -168,9 +169,12 @@ def validate_report(report, now=None):
     """Validate data, never infer a session receipt from successful delivery."""
     errors = []
     required = ('contract', 'repository', 'profile', 'board', 'observed_at', 'outcome',
-                'actions', 'refusals', 'workers', 'source_status')
+                'actions', 'refusals', 'workers', 'source_status', 'validation')
     if not isinstance(report, dict) or any(key not in report for key in required):
         return ['missing report fields']
+    if (not isinstance(report['validation'], list)
+            or any(not isinstance(blocker, str) or not blocker for blocker in report['validation'])):
+        return ['invalid validation blockers']
     expected = report_contract()
     if not isinstance(report['contract'], dict) or any(report['contract'].get(key) != expected[key]
                                                       for key in ('version', 'sha256', 'source')):
@@ -231,7 +235,9 @@ def verify_report(args):
         for value in (report['board'], report['repository'], report['observed_at'],
                       str(report['contract']['version']), report['contract']['sha256'], report['contract']['source'],
                       report['outcome'], json.dumps(report['profile'], sort_keys=True),
-                      json.dumps(report['actions'], sort_keys=True), json.dumps(report['refusals'])):
+                      json.dumps(report['actions'], sort_keys=True), json.dumps(report['refusals']),
+                      f'Source status: {report["source_status"]}',
+                      'Validation: ' + json.dumps(report['validation'])):
             if value not in rendered:
                 errors.append('required report datum absent from channel readback')
         for row in report['workers']:
@@ -248,6 +254,8 @@ def verify_report(args):
                 errors.append(f'invalid {key}')
     if not errors and report_timestamp(evidence['received_at']) > report_timestamp(evidence['applied_at']):
         errors.append('applied_at precedes received_at')
+    if not errors:
+        errors.extend(report['validation'])
     result = {'status': 'applied' if not errors else 'unknown', 'errors': errors,
               'contract': report_contract(), 'source': evidence.get('source'),
               'runtime': evidence.get('runtime'), 'session': evidence.get('session'),
@@ -658,9 +666,9 @@ def new_report(args):
     host = core.HOST or ('github.com' if not core.BOARDS else None)
     repo = f'https://{host}/{core.PROJECT_PATH}' if host else 'unavailable'
     report = {'contract': contract, 'repository': repo, 'profile': {}, 'board': 'unavailable',
-              'observed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'outcome': 'unknown',
+              'observed_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'), 'outcome': 'unknown',
               'actions': args.output['actions'] if hasattr(args, 'output') else [],
-              'refusals': [], 'workers': [], 'source_status': 'unavailable'}
+              'refusals': [], 'workers': [], 'source_status': 'unavailable', 'validation': []}
     args.pm_report = report
     return report
 
@@ -687,7 +695,7 @@ def emit_report(args, report):
         if args.output['refusals']:
             report['refusals'] = args.output['refusals']
         args.output['report'] = report
-    report['observed_at'] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    # Preserve the snapshot's conservative pass-start timestamp through long work and emission.
     report['validation'] = validate_report(report)
     print(render_report(report))
     if report['validation']:

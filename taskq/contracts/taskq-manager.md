@@ -96,6 +96,10 @@ even a quiet or failed source pass. Prompt version is separate from schema versi
 Show the generated report once per pass, including empty workers, timestamps,
 unknown/unavailable values and actionable validation gaps. A table-free channel
 uses labeled lines retaining every field/link. Add judgment after the report.
+`observed_at` is the conservative pass-start snapshot timestamp, never the output
+time: a pass longer than 15 minutes remains stale until a new observation. Retain
+`Source status:` and `Validation:` in channel readback, including an explicit empty
+validation list. Missing/hidden validation or reported blockers cannot verify as applied.
 
 After update, compare the current payload version/hash to the session's last
 actually applied report and apply it on the next safe pass. Keep work, claims and
@@ -115,9 +119,9 @@ received/applied times. Without readback, status is `unknown/unqualified`, with 
 next action "obtain a supported-channel readback". Data gaps block dependent decisions
 only; do not erase truthful unknown values to pass validation.
 
-Qualification is separate: identical mocked scenarios cover fresh/already-running
-Claude, Codex and DOT adapters, omissions, stale/unavailable sources, mismatch,
-duplicate delivery and interrupted update. These are not live PM evidence. No
+Qualification is separate: identical mocked schema/readback scenarios use fresh/already-running
+Claude, Codex and DOT labels, omissions, stale/unavailable sources, mismatch,
+duplicate delivery and interrupted update. Runtime labels in fixtures are not transport adapters or live PM evidence. No
 Claude/DOT/live Codex hot-update qualification is asserted by unit tests. The
 reported owner symptom (format omitted until reminder) is intake evidence, not a
 universal measured reproducer. Compare actual channel output to the generated report

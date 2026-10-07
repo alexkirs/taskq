@@ -292,9 +292,18 @@ sessions, `tick.py` the `tick` command (board moves, Workers table, beat stamp),
 `selftest.py` the `selftest` command. Each module reaches the core as `core.<name>`; the core re-exports what it moved,
 so `taskq.<name>` still works, and a test patches a moved function in its own module where that module calls it.
 
-Change the worktree, run the tests there, push to `main`. CI (`.github/workflows/tests.yml`) runs the tests on every
-push; the clone and other machines take the commit once its CI passed, within `[update] every` or at once with
-`taskq update`. A commit that does not start (`python3 -m taskq --version`) is rolled back in the clone.
+Change the worktree, run the tests there, and submit through the project's publication/review flow.
+CI (`.github/workflows/tests.yml`) runs tests on every push to main or a `taskq-*` review branch,
+and every PR. The clone and other machines take the commit once its exact-SHA tests passed,
+within `[update] every` or at once with `taskq update`.
+
+Tests must be completed success from the repository's active `.github/workflows/tests.yml`
+push workflow and its GitHub Actions `tests` check. Missing, unreadable, pending, failed,
+skipped or neutral tests refuse an update. Latest reruns are checked by suite identity;
+unrelated same-name checks cannot satisfy tests. Only positively identified legacy or
+`.github/workflows/pages.yml` Pages checks are excluded; other checks keep their existing gate.
+Site failure/freshness is separate from CLI eligibility. A commit that does not start
+(`python3 -m taskq --version`) is rolled back in the clone.
 
 `[update] ref = "stable"` in `taskq.toml` makes a machine follow the reviewed `stable` tag instead of `main`: workers
 keep pushing to `main`, and only the owner moves `stable` after review, signed with an SSH key listed in

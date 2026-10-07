@@ -13,21 +13,75 @@ import taskq as core
 
 
 def green(sha):
-    """None when every check-run of REPO's commit `sha` passed (GitHub Actions), else why not."""
+    """Require exact-SHA trusted tests; identified Pages suites have separate site eligibility."""
     repo = '/'.join(core.REPO.rstrip('/').split('/')[-2:])
+
+    def read(endpoint, key=None):
+        command = ['gh', 'api', f'repos/{repo}/{endpoint}']
+        if key:
+            command += ['--paginate', '--slurp']
+        done = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        if done.returncode:
+            raise ValueError('unreadable CI')
+        data = json.loads(done.stdout)
+        if key and (not isinstance(data, list) or any(not isinstance(page[key], list) for page in data)):
+            raise ValueError('invalid CI pages')
+        return [item for page in data for item in page[key]] if key else data
+
     try:
-        done = subprocess.run(['gh', 'api', f'repos/{repo}/commits/{sha}/check-runs', '--jq', '.check_runs'],
-                              capture_output=True, text=True, timeout=60)
-        runs = json.loads(done.stdout) if not done.returncode else None
-    except (OSError, subprocess.SubprocessError, ValueError):
-        runs = None
-    if runs is None:
+        workflow = read('actions/workflows/tests.yml')
+        if workflow['path'] != '.github/workflows/tests.yml' or workflow['state'] != 'active':
+            return 'its required tests workflow is not active'
+        workflows = read(f'actions/runs?head_sha={sha}&per_page=100', 'workflow_runs')
+        checks = read(f'commits/{sha}/check-runs?filter=all&per_page=100', 'check_runs')
+        if not isinstance(workflows, list) or not isinstance(checks, list):
+            raise ValueError('invalid CI response')
+        # Suite identity, not a job name, distinguishes tests and Pages from unrelated checks.
+        trusted = [run for run in workflows if run['head_sha'] == sha
+                   and run['repository']['full_name'] == repo]
+        tests = [run for run in trusted if run['workflow_id'] == workflow['id']
+                 and run['path'] == workflow['path'] and run['event'] == 'push']
+        if not tests:
+            return 'it has no trusted exact-SHA tests run yet'
+        latest = max(tests, key=lambda run: run['id'])
+        if latest['status'] != 'completed':
+            return 'CI still running: tests'
+        if latest['conclusion'] != 'success':
+            return 'CI failed: tests'
+        pages = {run['check_suite_id'] for run in trusted
+                 if (run['path'], run['event']) in (
+                     ('dynamic/pages/pages-build-deployment', 'dynamic'),
+                     ('.github/workflows/pages.yml', 'push'),
+                     ('.github/workflows/pages.yml', 'workflow_dispatch'))}
+        test_suites = {run['check_suite_id'] for run in tests}
+        current = {}
+        for check in checks:
+            suite = check['check_suite']['id']
+            if check['head_sha'] != sha:
+                raise ValueError('wrong check SHA')
+            actions = check['app']['slug'] == 'github-actions' and check['app']['id'] == 15368
+            if actions and (suite in pages or (check['name'] == 'tests' and suite in test_suites
+                                               and suite != latest['check_suite_id'])):
+                continue
+            key = (suite, check['app']['id'], check['name'])
+            if key not in current or check['id'] > current[key]['id']:
+                current[key] = check
+        required = [check for check in current.values() if check['check_suite']['id'] == latest['check_suite_id']
+                    and check['name'] == 'tests' and check['app']['slug'] == 'github-actions'
+                    and check['app']['id'] == 15368]
+        if not required:
+            return 'it has no trusted exact-SHA tests check yet'
+        if any(check['status'] != 'completed' for check in required):
+            return 'CI still running: tests'
+        if any(check['conclusion'] != 'success' for check in required):
+            return 'CI failed: tests'
+        waiting = [check['name'] for check in current.values() if check['status'] != 'completed']
+        failed = [check['name'] for check in current.values() if check['status'] == 'completed'
+                  and check['conclusion'] not in ('success', 'skipped', 'neutral')]
+        return (f'CI failed: {", ".join(failed)}' if failed else
+                f'CI still running: {", ".join(waiting)}' if waiting else None)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
         return 'its CI could not be read (gh api)'
-    if not runs:
-        return 'it has no CI run yet'
-    waiting = [run['name'] for run in runs if run['status'] != 'completed']
-    failed = [run['name'] for run in runs if run['status'] == 'completed' and run['conclusion'] not in ('success', 'skipped', 'neutral')]
-    return f'CI failed: {", ".join(failed)}' if failed else f'CI still running: {", ".join(waiting)}' if waiting else None
 
 
 def signed(where, sha):

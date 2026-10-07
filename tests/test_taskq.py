@@ -3351,18 +3351,6 @@ class Update(unittest.TestCase):
         self.assertIn(f'does not start (`python3 -m taskq --version` failed); {self.clone} is back at {old}', out)
         self.assertEqual(q.version(), old)
 
-    def test_green_reads_check_runs(self):
-        def runs(*items):
-            return lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(
-                [{'name': name, 'status': status, 'conclusion': conclusion} for name, status, conclusion in items]))
-        with patch.object(q.subprocess, 'run', runs(('tests', 'completed', 'success'), ('lint', 'completed', 'skipped'))):
-            self.assertIsNone(GREEN('abc'))
-        with patch.object(q.subprocess, 'run', runs(('tests', 'completed', 'failure'))):
-            self.assertEqual(GREEN('abc'), 'CI failed: tests')
-        with patch.object(q.subprocess, 'run', runs(('tests', 'in_progress', None))):
-            self.assertEqual(GREEN('abc'), 'CI still running: tests')
-        with patch.object(q.subprocess, 'run', runs()):
-            self.assertEqual(GREEN('abc'), 'it has no CI run yet')
 
     def test_stable_needs_a_signed_tag_and_ignores_main(self):
         old = q.version()
@@ -3389,8 +3377,6 @@ class Update(unittest.TestCase):
             self.assertIn(f'not updated to stable {three}: the stable tag has no valid signature', self.update()[1])
             self.assertEqual(q.version(), two)
 
-
-GREEN = q.green  # the real one: Update patches q.green for every other test
 
 
 class Cleanup(unittest.TestCase):

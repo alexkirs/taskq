@@ -1,8 +1,8 @@
-# Every push to main runs the tests; `taskq update` takes only a commit whose check-runs passed.
+# Main, review candidates and PRs run tests; updates require trusted exact-SHA success.
 name: tests
 on:
   push:
-    branches: [main]
+    branches: [main, 'taskq-*']
   pull_request:
 jobs:
   tests:

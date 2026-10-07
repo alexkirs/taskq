@@ -104,6 +104,11 @@ class Gate(unittest.TestCase):
         self.checks[-1]['app']['id'] = 99
         self.assertIn('CI still running: deploy', self.gate())
 
+    def test_successful_pages_cannot_replace_missing_tests(self):
+        self.runs[0].update(path='.github/workflows/pages.yml', workflow_id=11)
+        self.checks = [self.check('build', 30)]
+        self.assertEqual(self.gate(), 'it has no trusted exact-SHA tests run yet')
+
     def test_trusted_pr_tests_also_require_success(self):
         self.runs.append(dict(self.runs[0], id=21, event='pull_request', check_suite_id=31))
         self.assertIsNotNone(self.gate())

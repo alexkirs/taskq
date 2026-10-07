@@ -134,6 +134,21 @@ class PermissionQualificationTests(unittest.TestCase):
             self.assertEqual(tick.liveness(item, {'s': {'pid': 1, 'status': 'idle', 'state': 'blocked'}})[0], 'busy')
             self.assertEqual(tick.liveness(item, {'s': {'pid': 1, 'status': 'idle', 'state': 'done'}})[0], 'idle')
 
+    def test_claude_without_pid_fails_closed_unless_terminal(self):
+        """Review of 796f90c7: blocked + idle + no pid was dead, so the tick released a claim waiting on the owner."""
+        item = {'claim': {'session': 's', 'runtime': 'claude'}, 'state': 'doing', 'updated': '2000-01-01T00:00:00Z'}
+        cases = [({'status': 'idle', 'state': 'blocked'}, 'busy'),  # waits on the owner: kept, never nudged
+                 ({'status': 'busy', 'state': 'blocked'}, 'busy'),
+                 ({'status': 'idle', 'state': 'working'}, None),  # non-terminal: unknown, stale release only
+                 ({'status': 'idle'}, None),  # no state at all: unknown
+                 ({'state': 'stopped'}, 'dead'), ({'state': 'done'}, 'dead'), ({'state': 'failed'}, 'dead')]
+        with patch.object(q, 'age', return_value=500):
+            for agent, state in cases:
+                with self.subTest(agent=agent):
+                    self.assertEqual(tick.liveness(item, {'s': agent})[0], state)
+            # unreachable: `claude agents` failed or lists the session nowhere
+            self.assertIsNone(tick.liveness(item, {})[0])
+
 
 if __name__ == '__main__':
     unittest.main()

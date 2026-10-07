@@ -15,6 +15,7 @@ import sys
 import time
 
 import taskq as core
+from taskq.worker import CLAUDE_ENDED
 
 
 def clone_warning():
@@ -167,15 +168,18 @@ def session_link(claim, agent=None):
 def liveness(item, agents):
     """#43: (state, activity) of a worker session as this machine sees it. state: 'busy'; 'idle' (alive, its turn
     ended: nudge it); 'dead' (stopped: release a doing task now); None (no status here: another machine, no CLI,
-    or a Codex task not in doing). A listed Claude job without pid is dead; ponytail: an unlisted one is unknown,
-    since `claude agents` failing also lists nothing; the 120-minute stale release covers it."""
+    or a Codex task not in doing). A listed Claude job without pid is dead only in a terminal state; ponytail: an
+    unlisted one is unknown, since `claude agents` failing also lists nothing; the 120-minute stale release covers it."""
     session, runtime = item['claim']['session'], item['claim'].get('runtime')
     if runtime == 'claude':
         agent = agents.get(session)
         if not agent:
             return None, f'issue {core.age(item)} min ago'
-        # #176: `blocked` waits on the owner (a decision or an approval): not idle, never nudged.
-        state = 'dead' if not agent.get('pid') else 'busy' if agent.get('status') == 'busy' or agent.get('state') == 'blocked' else 'idle'
+        # #176: `blocked` waits on the owner (a decision or an approval): busy with or without pid, never nudged or
+        # released. No pid is dead only with a terminal state; any other state is unknown (stale release only).
+        state = ('busy' if agent.get('state') == 'blocked' else
+                 ('dead' if agent.get('state') in CLAUDE_ENDED else None) if not agent.get('pid') else
+                 'busy' if agent.get('status') == 'busy' else 'idle')
         return state, f'{"running" if agent.get("pid") else "stopped"}, issue {core.age(item)} min ago'
     if runtime != 'codex' or item['state'] != 'doing':
         return None, f'issue {core.age(item)} min ago'

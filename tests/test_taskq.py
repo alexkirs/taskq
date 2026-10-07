@@ -1225,6 +1225,26 @@ class Cycle(unittest.TestCase):
         self.assertIn('continue', self.do(CLAUDE, 'list'))
         self.do(CLAUDE, 'take', iid)
 
+    def test_tick_keeps_a_blocked_claude_without_pid(self):
+        """#176: blocked waits on the owner: no release (dead or stale) and no nudge, even without pid; a
+        non-terminal state without pid is unknown, so only the stale age releases it, never as dead."""
+        claude = self.add('--type', 'research', '--runtime', 'claude')
+        self.do(CLAUDE, 'take', claude)
+        agent = {'id': 'claudese', 'sessionId': 'claude-session', 'status': 'idle', 'state': 'blocked'}
+        self.agents = {'claude-session': agent}
+        with patch.object(q, 'STALE_MINUTES', -1):
+            output = self.do(COORDINATOR, 'tick')
+        self.assertNotIn('Released', output)
+        self.assertNotIn('## Claude idle', output)
+        self.assertEqual(self.state(claude), 'doing')
+        agent['state'] = 'working'
+        output = self.do(COORDINATOR, 'tick')
+        self.assertNotIn('Released', output)  # unknown before the stale age: kept
+        with patch.object(q, 'STALE_MINUTES', -1):
+            output = self.do(COORDINATOR, 'tick')
+        self.assertIn(f'Released stalled {link(claude)}', output)
+        self.assertNotIn('Released dead', output)
+
     def test_tick_releases_a_dead_worker_at_once_and_nudges_a_live_one(self):
         """#43: a session seen on this machine decides before the stale age: dead is released on this tick,
         alive is never released by age, an idle one is nudged (Claude idle mirrors Codex idle)."""
@@ -1252,6 +1272,7 @@ class Cycle(unittest.TestCase):
             self.do(COORDINATOR, 'tick', '--act')
         self.assertEqual((woken, sent), ([('claude-session', tick.NUDGE)], ['codex-session']))
         del agent['pid']
+        agent['state'] = 'stopped'  # #176: no pid is dead only in a terminal CLI state
         self.codex.status = 'systemError'
         output = self.do(COORDINATOR, 'tick')
         self.assertIn(f'Released dead {link(claude)}', output)

@@ -515,7 +515,7 @@ def runtime_status(args):
             flags = job.get('respawnFlags') or []
             mode = flags[flags.index('--permission-mode') + 1] if '--permission-mode' in flags[:-1] else None
             # Positive terminal evidence only: no pid and a terminal CLI state. Busy is not proof of execution.
-            ended = not agent.get('pid') and agent.get('state') in ('done', 'failed', 'stopped')
+            ended = not agent.get('pid') and agent.get('state') in CLAUDE_ENDED
             observation.update(source='claude agents', session_link=core.claude_url(args.session),
                                status='terminal' if ended else 'unknown',
                                runtime_state={key: agent.get(key) for key in ('status', 'state')},
@@ -582,6 +582,9 @@ def claude_spawn(name, extra=None, prompt=None, remote_control=True):
     if not session:
         core.fail(f'claude agents does not list the new session {short[1]}')
     return session
+
+
+CLAUDE_ENDED = ('done', 'failed', 'stopped')  # `claude agents` states with no way back but a resume
 
 
 def claude_agents():

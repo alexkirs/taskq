@@ -48,15 +48,20 @@ reported as active or as "no approval pending".
 - unreachable: no app-server socket gives `None` liveness and `unknown` status with the exact error.
 - metadata time: Codex `updatedAt` is `metadata_updated_at`, never `event_at`.
 - launch policy: Codex requests `approvalPolicy: never` with `workspaceWrite`. Claude pins `dontAsk`. No bypass flag.
-- Claude: `blocked` is `busy` (no nudge). A terminal status needs no pid plus a terminal `state`. Missing pid or
-  status stays `unknown`.
+- Claude: `blocked` is `busy` with or without pid: no nudge, no dead or stale release. A terminal status needs
+  no pid plus a terminal `state` (`done`/`failed`/`stopped`). No pid with any other or a missing `state` is
+  `unknown`: only the 120-minute stale release applies. An unlisted session is `unknown` too.
+  `tests/test_taskq.py` `test_tick_keeps_a_blocked_claude_without_pid` checks this through a full tick.
 
 ## Changes in this delivery
 
 - `taskq/worker.py` `runtime_status`: adds `metadata_updated_at` and `effective_launch_policy`. Claude readback
   reports the CLI `status`/`state` and the `--permission-mode` from job `respawnFlags`.
-- `taskq/tick.py` `liveness`: a Claude job in `state: blocked` is `busy`, not `idle`. Before, a blocked job with a
-  live pid could be nudged.
+- `taskq/tick.py` `liveness`: a Claude job in `state: blocked` is `busy`, with or without pid. A job without pid
+  is `dead` only in a terminal `state`, else unknown. Before, a blocked job with a live pid could be nudged, and
+  one without pid was released as dead (review of `796f90c7`).
+- `tests/test_taskq.py`: the existing dead-worker fixture gets `state: stopped`, the shape the CLI lists; a new
+  tick-level control for a blocked Claude job without pid.
 
 ## Not qualified (live limitations)
 

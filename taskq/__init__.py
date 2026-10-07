@@ -74,6 +74,7 @@ STALE_MINUTES = 120  # a `doing` task this long without a collaborator's note or
 LOCK, LOCK_SECONDS = 'lock', 120
 PROBLEM = 'problem'  # label of an issue for a problem without a task
 PROTECTED_REFS = ()  # [workspace] protected_refs: local names or origin/name, also full Git refs
+CLEANUP = {}  # [cleanup] of taskq.toml as written; taskq.local.toml's [cleanup] replaces it (cleanup_schedule.settings)
 CLEANUP_DAYS = 30  # cleanup reads open issues and the ones closed this recently, not the whole history
 PREFIX, RUN, ON = 'q-', 'run-', 'host-'
 PRIORITIES = (1, 2)
@@ -100,7 +101,7 @@ def main_checkout(start):
 def configure(path=None):
     """Load the project's taskq.toml: `path`, else the nearest one from the current directory up. Read only: a key it
     lacks takes its default in memory (a write would dirty the editable clone, and update stops on a dirty clone)."""
-    global RULES, HOST, HOSTS, COORDINATOR, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, CODEX_WRITABLE, WORKSPACE, PUBLISH, RETIRE, HELPERS, PROTECTED_REFS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED, PAGES
+    global RULES, HOST, HOSTS, COORDINATOR, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, CODEX_WRITABLE, WORKSPACE, PUBLISH, RETIRE, HELPERS, PROTECTED_REFS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED, PAGES, CLEANUP
     import tomllib
     here = Path.cwd()
     path = Path(path) if path else next((folder / 'taskq.toml' for folder in (here, *here.parents)
@@ -138,6 +139,7 @@ def configure(path=None):
     PROTECTED_REFS = workspace.get('protected_refs', ())
     if not isinstance(PROTECTED_REFS, list | tuple) or not all(isinstance(ref, str) and ref for ref in PROTECTED_REFS):
         fail(f'{path}: [workspace] protected_refs: write a list of non-empty ref names')
+    CLEANUP = cleanup_settings(config.get('cleanup', {}), path)
     UPDATE.update(config.get('update', {}))
     seconds(UPDATE['every'])
     if UPDATE['ref'] not in ('main', 'stable'):
@@ -162,7 +164,7 @@ def checked(config, path):
     stops with the file and key, never silently broadens."""
     where = lambda key: f'{path}: {key}'
     profile, codex = config.get('profile', {}), config.get('codex', {})
-    unknown = [f'[{name}]' for name in config if name not in ('profile', 'codex', 'coordinator', 'machine', 'idle')] + [
+    unknown = [f'[{name}]' for name in config if name not in ('profile', 'codex', 'coordinator', 'machine', 'idle', 'cleanup')] + [
         f'[idle] {key}' for key in config.get('idle', {}) if key not in ('stop', 'cleanup')] + [
         f'[machine] {key}' for key in config.get('machine', {}) if key != 'notes'] + [
         f'[profile] {key}' for key in profile if key not in (*PROFILE_DEFAULTS, 'limits')] + [
@@ -189,12 +191,25 @@ def checked(config, path):
         fail(f'{where("[idle] stop")}: write the number of empty ticks before the idle stop, 0 = never')
     if not isinstance(config.get('idle', {}).get('cleanup', True), bool):
         fail(f'{where("[idle] cleanup")}: write true or false')
+    cleanup_settings(config.get('cleanup', {}), path)
     if not isinstance(config.get('coordinator', {}).get('session', ''), str):
         fail(f'{where("[coordinator] session")}: write the coordinator\'s Claude session id as a string')
     for key, value in codex.items():
         if not isinstance(value, str):
             fail(f'{where("[codex] " + key)}: write the app\'s id as a string')
     return config
+
+
+def cleanup_settings(table, path):
+    """[cleanup] as written, after #197 validation: an invalid table stops with the file, never falls back."""
+    from taskq.cleanup_schedule import validate
+    if not isinstance(table, dict):
+        fail(f'{path}: [cleanup]: write a table')
+    try:
+        validate(table)
+    except ValueError as error:
+        fail(f'{path}: [cleanup] {error}')
+    return table
 
 
 def personal():

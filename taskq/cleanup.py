@@ -319,14 +319,8 @@ def cleanup_plan(root):
     return remove, ask, keep
 
 
-def cleanup(args):
-    root = core.main_checkout(Path.cwd())
-    gc = helpers(root)
-    if Path.cwd().resolve() != root.resolve() or gc._git(root, 'branch', '--show-current').strip() != 'main':
-        core.fail('cleanup runs only from the main checkout on branch main')
-    # Fetch updates tracking refs only; report never changes local branches, trees or sessions.
-    subprocess.run(['git', '-C', str(root), 'fetch', '-q', 'origin'], check=True)
-    remove, ask, keep = cleanup_plan(root)
+def show(args, remove, ask, keep):
+    """Print the plan; with --json also put it in the output (report only proposes, never acts)."""
     if hasattr(args, 'output'):
         args.output.update(plan={'remove': remove, 'ask': ask, 'keep': keep},
                            sessions=[item['thread'] for item in remove if item.get('thread')],
@@ -346,57 +340,87 @@ def cleanup(args):
                 print(f'  {label}: {command}')
             if item.get('kind') == 'claude':
                 print(f'  coordinator: archive_session local_{item["thread"]}')
-    if not args.apply:
-        return
+
+
+def apply_removals(args, root, gc, remove):
+    """Act on the "Remove" items only, each after a fresh native recheck. Returns the #197 counts (by `what`) and
+    what was removed: a refusal keeps its target (state changed, git refused, application-only), an error is an
+    act that raised."""
+    counts = {'attempted': [], 'succeeded': [], 'refused': [], 'errors': []}
     removed, freed, blocked_trees = [], 0, set()
+
+    def refuse(item, reason, line, action='remove'):
+        core.record(args, action, status='refused', reason=reason, **item)
+        counts['refused'].append(item['what'])
+        print(line)
     # Archive by cwd while the finished tree still exists; otherwise its proof would disappear.
     for item in sorted(remove, key=lambda item: item['kind'] != 'codex'):
-        if item['kind'] == 'claude':
-            core.record(args, 'archive', status='refused', session=item['thread'], reason='requires coordinator application tool')
-            continue  # only the coordinator's application tool can archive these
-        if item['kind'] == 'tree' and Path(item['path']).resolve() in blocked_trees:
-            core.record(args, 'remove', status='refused', reason='session not archived', **item)
-            print(f'Kept: the session of this tree is not archived: {item["what"]}')
-            continue
-        # Re-read live task/session/process/ref state before each act.
-        fresh, _, _ = cleanup_plan(root)
-        if item not in fresh:
-            core.record(args, 'remove', status='refused', reason='state changed on recheck', **item)
-            print(f'Kept after the recheck: {item["what"]}')
-            continue
-        if item['kind'] == 'tree':
-            size = gc._measure(Path(item['path']), set())[0]
-            if subprocess.run(retire_command(root, item['path']), cwd=root, stdout=subprocess.DEVNULL if getattr(args, 'json', False) else None).returncode:
-                core.record(args, 'remove', status='refused', reason='retire refused', **item)
-                print(f'Kept: retire refused {item["what"]}')
+        counts['attempted'].append(item['what'])
+        try:
+            if item['kind'] == 'claude':
+                # Only the coordinator's application tool can archive these: a visible refusal, never a guess.
+                core.record(args, 'archive', status='refused', session=item['thread'], reason='requires coordinator application tool')
+                counts['refused'].append(item['what'])
                 continue
-            freed += size
-            removed.append(item['path'])
-            core.record(args, 'remove_tree', status='done', **item)
-        if item['kind'] in ('tree', 'branch') and item['branch']:
-            # -d can refuse a patch-equivalent rebased branch; do not force or rewrite its ref.
-            done = subprocess.run(['git', '-C', str(root), '-c', f'branch.{item["branch"]}.remote=origin',
-                                   '-c', f'branch.{item["branch"]}.merge=refs/heads/main', 'branch', '-d', '--', item['branch']], capture_output=True, text=True)
-            if done.returncode:
-                core.record(args, 'delete_branch', status='refused', reason=done.stderr.strip(), **item)
-                print(f'Kept branch {item["branch"]}: {done.stderr.strip()}')
-            else:
-                removed.append(item['branch'])
-                core.record(args, 'delete_branch', status='done', **item)
-        elif item['kind'] == 'codex':
-            try:
-                core.codex_archive(argparse.Namespace(thread=item['thread']))
+            if item['kind'] == 'tree' and Path(item['path']).resolve() in blocked_trees:
+                refuse(item, 'session not archived', f'Kept: the session of this tree is not archived: {item["what"]}')
+                continue
+            # Re-read live task/session/process/ref state before each act.
+            fresh, _, _ = cleanup_plan(root)
+            if item not in fresh:
+                refuse(item, 'state changed on recheck', f'Kept after the recheck: {item["what"]}')
+                continue
+            if item['kind'] == 'tree':
+                size = gc._measure(Path(item['path']), set())[0]
+                if subprocess.run(retire_command(root, item['path']), cwd=root, stdout=subprocess.DEVNULL if getattr(args, 'json', False) else None).returncode:
+                    refuse(item, 'retire refused', f'Kept: retire refused {item["what"]}')
+                    continue
+                freed += size
+                removed.append(item['path'])
+                core.record(args, 'remove_tree', status='done', **item)
+            if item['kind'] in ('tree', 'branch') and item['branch']:
+                # -d can refuse a patch-equivalent rebased branch; do not force or rewrite its ref.
+                done = subprocess.run(['git', '-C', str(root), '-c', f'branch.{item["branch"]}.remote=origin',
+                                       '-c', f'branch.{item["branch"]}.merge=refs/heads/main', 'branch', '-d', '--', item['branch']], capture_output=True, text=True)
+                if done.returncode:
+                    core.record(args, 'delete_branch', status='refused', reason=done.stderr.strip(), **item)
+                    print(f'Kept branch {item["branch"]}: {done.stderr.strip()}')
+                    if item['kind'] == 'branch':
+                        counts['refused'].append(item['what'])
+                        continue
+                else:
+                    removed.append(item['branch'])
+                    core.record(args, 'delete_branch', status='done', **item)
+            elif item['kind'] == 'codex':
+                try:
+                    core.codex_archive(argparse.Namespace(thread=item['thread']))
+                    removed.append(item['what'])
+                    core.record(args, 'archive', status='done', session=item['thread'])
+                except (SystemExit, OSError) as error:
+                    if item.get('cwd'):
+                        blocked_trees.add(Path(item['cwd']).resolve())
+                    core.record(args, 'archive', status='refused', session=item['thread'], reason=str(error))
+                    print(f'Kept: {item["what"]}: {error}')
+                    counts['errors'].append({'item': item['what'], 'error': str(error)})
+                    continue
+            elif item['kind'] == 'claude-bg':
+                core.claude_stop(item['thread'], remove=True)
                 removed.append(item['what'])
-                core.record(args, 'archive', status='done', session=item['thread'])
-            except (SystemExit, OSError) as error:
-                if item.get('cwd'):
-                    blocked_trees.add(Path(item['cwd']).resolve())
-                core.record(args, 'archive', status='refused', session=item['thread'], reason=str(error))
-                print(f'Kept: {item["what"]}: {error}')
-        elif item['kind'] == 'claude-bg':
-            core.claude_stop(item['thread'], remove=True)
-            removed.append(item['what'])
-            core.record(args, 'retire', status='done', session=item['thread'])
+                core.record(args, 'retire', status='done', session=item['thread'])
+            counts['succeeded'].append(item['what'])
+        except (SystemExit, OSError, ValueError, subprocess.SubprocessError) as error:
+            core.record(args, 'remove', status='refused', reason=f'error: {error}', **item)
+            print(f'Kept after an error: {item["what"]}: {error}')
+            counts['errors'].append({'item': item['what'], 'error': str(error)})
+    return counts, removed, freed
+
+
+def apply_plan(args, root, gc):
+    """One native application: fetch, a fresh plan, its Remove items acted on with rechecks, Ask left pending."""
+    subprocess.run(['git', '-C', str(root), 'fetch', '-q', 'origin'], check=True)
+    remove, ask, keep = cleanup_plan(root)
+    show(args, remove, ask, keep)
+    counts, removed, freed = apply_removals(args, root, gc, remove)
     if hasattr(args, 'output'):
         args.output.update(removed=removed, freed_bytes=freed)
         refusals = [event for event in args.output['actions'] if event.get('status') == 'refused']
@@ -407,3 +431,51 @@ def cleanup(args):
     for name in removed:
         print(f'- {name}')
     print('Physical free space may differ (APFS clones / WSL disk image).')
+    return {**counts, 'pending_asks': [item['what'] for item in ask]}
+
+
+def apply_scheduled(args, root, gc, trigger):
+    """#197: `cleanup --apply` (manual), the owner's tick (tick) and the idle stop (idle) apply only here, under one
+    lock and one state. Returns the schedule report, also recorded as a `cleanup` action."""
+    from taskq import cleanup_schedule as schedule
+    now = schedule.datetime.now(schedule.UTC)
+    report = schedule.run(schedule.settings(), schedule.state_path(), now, lambda: apply_plan(args, root, gc), trigger)
+    status = {'success': 'done', 'failed': 'failed'}.get(report['outcome'], report['outcome'])
+    core.record(args, 'cleanup', status=status, **report)
+    print(f'\nCleanup ({trigger}): {report["outcome"]}, {report["reason"]}; last success {report.get("last_success") or "none"}; '
+          f'next due {report.get("next_due_local") or report.get("next_due") or "none"} ({report["timezone"]}'
+          + (', the missing-setting fallback' if report['timezone_fallback'] else '') + ').')
+    return report
+
+
+def scheduled(args):
+    """The owner's tick: cleanup when due, from the main checkout on branch main only (as `cleanup` itself); the
+    plan goes to the tick's log, its events to the tick's report. Never raises: a refusal is a recorded action."""
+    # Events join the tick's own actions; the tick's JSON plan, refusals and outcome stay the tick's.
+    actions = (args.output if hasattr(args, 'output') else args.pm_report)['actions']
+    sub = argparse.Namespace(apply=True, trigger='tick', json=getattr(args, 'json', False), pm_report={'actions': actions})
+    root = core.main_checkout(Path.cwd())
+    try:
+        gc = helpers(root)
+        if Path.cwd().resolve() != root.resolve() or gc._git(root, 'branch', '--show-current').strip() != 'main':
+            return core.record(sub, 'cleanup', status='refused', trigger='tick',
+                               reason='scheduled cleanup runs only from the main checkout on branch main')
+        with contextlib.redirect_stdout(sys.stderr):
+            return apply_scheduled(sub, root, gc, 'tick')
+    except (SystemExit, OSError, ValueError, subprocess.SubprocessError) as error:
+        core.record(sub, 'cleanup', status='failed', trigger='tick', reason=str(error))
+
+
+def cleanup(args):
+    root = core.main_checkout(Path.cwd())
+    gc = helpers(root)
+    if Path.cwd().resolve() != root.resolve() or gc._git(root, 'branch', '--show-current').strip() != 'main':
+        core.fail('cleanup runs only from the main checkout on branch main')
+    if args.apply:
+        report = apply_scheduled(args, root, gc, getattr(args, 'trigger', 'manual'))
+        if hasattr(args, 'output'):
+            args.output['cleanup'] = report
+        return
+    # Fetch updates tracking refs only; report never changes local branches, trees or sessions.
+    subprocess.run(['git', '-C', str(root), 'fetch', '-q', 'origin'], check=True)
+    show(args, *cleanup_plan(root))

@@ -1,14 +1,15 @@
-"""#197 local pilot: when cleanup is due on an existing tick, and how one attempt is recorded.
+"""#197: when native cleanup is due on an existing tick, and how one attempt is recorded.
 
-Proposed fixture behavior, not an accepted production spec (docs/cleanup-schedule.md). Nothing here is wired
-into tick, worker, the CLI or live configuration: `run` takes the native plan and the per-item apply as callables,
-acts only on "Remove" items, leaves "Ask" items pending and never replays stored commands.
+Spec: https://github.com/alexkirs/taskq/wiki/Cleanup-schedule (docs/cleanup-schedule.md). `cleanup --apply`
+(manual), the owner's tick (scheduled) and the idle stop (idle) all apply through `run`: one lock, one state
+file in the checkout's `.local/`, a fresh native plan per attempt; stored commands are never replayed.
 """
 from datetime import datetime, timedelta, timezone
-import fcntl
+import errno
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -173,23 +174,60 @@ def save(path, state):
     os.replace(tmp, path)
 
 
-def run(cfg, state_path, now, plan, apply, trigger='tick', clock=lambda: datetime.now(UTC)):
+def settings():
+    """The resolved [cleanup]: the personal taskq.local.toml's table when it has one (it replaces the shared one
+    whole, so schedule keys never mix across files), else taskq.toml's, else the defaults. Both are validated
+    when read (`configure`, `checked`); nothing is written back."""
+    import taskq as core
+    local = core.personal()
+    raw, source = ((local['cleanup'], str(core.LOCAL)) if 'cleanup' in local
+                   else (core.CLEANUP, 'taskq.toml') if core.CLEANUP else ({}, 'default'))
+    return {**validate(raw), 'source': source}
+
+
+def state_path():
+    """Per checkout, beside the tick's beat and idle count in `<main checkout>/.local/`."""
+    import taskq as core
+    path = core.TICK_BEAT.with_name('taskq-cleanup.json')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def locked(handle):
+    """Non-blocking exclusive lock on an open file; False when another process holds it (as `tick` locks)."""
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as error:
+        if error.errno not in (errno.EACCES, errno.EAGAIN):
+            raise
+        return False
+
+
+def local_time(instant, cfg):
+    return instant.astimezone(cfg['zone']).isoformat() if instant else None
+
+
+def run(cfg, state_path, now, execute, trigger='tick', clock=lambda: datetime.now(UTC)):
     """One attempt under the shared cleanup lock; returns the report dict.
 
     `trigger`: 'tick' and 'idle' respect `enabled` and the schedule; 'manual' is the owner's explicit cleanup
     and runs regardless, but takes the same lock and records into the same state, so the next tick dedups.
-    `plan()` returns a fresh native plan: items {'section': 'Remove'|'Ask the owner'|'Kept', ...}.
-    `apply(item)` rechecks one Remove item at action time and returns True (removed) or False (refused);
-    an exception is an error. Ask items stay pending and nothing else is ever applied.
+    `execute()` builds a fresh native plan, applies only its Remove items with a recheck each, and returns
+    {'attempted', 'succeeded', 'refused', 'errors', 'pending_asks'}: lists. An exception from it is an error.
     `now` is the attempt start; `clock()` (aware) is read once the attempt ends, and last_success, retry_at
     and the next due count from that completion, so a long run is not due again the moment it ends."""
     aware(now)
     report = {'observed': stamp(now), 'trigger': trigger, 'timezone': cfg['timezone'],
-              'timezone_fallback': 'timezone' in cfg['defaulted']}
-    with open(f'{state_path}.lock', 'a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+              'timezone_fallback': 'timezone' in cfg['defaulted'], 'settings': cfg.get('source', 'default')}
+    with open(f'{state_path}.lock', 'a+b') as lock:
+        if not locked(lock):
             return {**report, 'outcome': 'busy', 'reason': 'another cleanup holds the lock'}
         # Recheck under the lock: a run that finished while we waited has already moved the state.
         state = load(state_path)
@@ -201,28 +239,20 @@ def run(cfg, state_path, now, plan, apply, trigger='tick', clock=lambda: datetim
             del state['running']
             save(state_path, state)
         if trigger == 'manual':
-            reason = 'manual'
+            reason, due_at = 'manual', None
         else:
-            due, reason, upcoming = check(cfg, state, now)
+            due, reason, due_at = check(cfg, state, now)
             if not due:
                 return {**report, 'outcome': 'skipped', 'reason': reason, 'last_success': state.get('last_success'),
-                        'next_due': stamp(upcoming)}
+                        'next_due': stamp(due_at), 'next_due_local': local_time(due_at, cfg)}
         state['running'] = {'started': stamp(now), 'trigger': trigger}
         save(state_path, state)
         counts = {'attempted': [], 'succeeded': [], 'refused': [], 'errors': [], 'pending_asks': []}
         try:
-            items = plan()
-        except Exception as error:
-            items, counts['errors'] = [], [{'item': 'plan', 'error': str(error)}]
-        for item in items:
-            if item.get('section') == 'Ask the owner':
-                counts['pending_asks'].append(item)
-            elif item.get('section') == 'Remove':
-                counts['attempted'].append(item)
-                try:
-                    counts['succeeded' if apply(item) else 'refused'].append(item)
-                except Exception as error:
-                    counts['errors'].append({'item': item, 'error': str(error)})
+            counts.update(execute())
+        except (OSError, ValueError, SystemExit, RuntimeError, subprocess.SubprocessError) as error:
+            # Anything else propagates and leaves `running`: the next attempt records it as interrupted.
+            counts['errors'] = counts['errors'] + [{'item': 'plan', 'error': str(error)}]
         outcome = ('success' if not counts['errors']
                    else 'partial' if counts['succeeded'] else 'failed')
         # A naive clock raises here and leaves `running`, so the next attempt records this one as interrupted.
@@ -236,5 +266,6 @@ def run(cfg, state_path, now, plan, apply, trigger='tick', clock=lambda: datetim
             state['retry_at'] = stamp(finished + BACKOFF)
         save(state_path, state)
         upcoming = check(cfg, state, finished)[2] if cfg['enabled'] else None
-        return {**report, 'finished': stamp(finished), 'outcome': outcome, 'reason': reason, **counts,
-                'last_success': state.get('last_success'), 'next_due': stamp(upcoming)}
+        return {**report, 'due_at': stamp(due_at), 'finished': stamp(finished), 'outcome': outcome, 'reason': reason,
+                **counts, 'last_success': state.get('last_success'), 'next_due': stamp(upcoming),
+                'next_due_local': local_time(upcoming, cfg)}

@@ -1,5 +1,6 @@
 """Full queue cycles against an in-memory GitLab; sessions are environment identities, no network."""
 import argparse
+from datetime import datetime, timedelta
 import contextlib
 import io
 import json
@@ -49,6 +50,10 @@ def node(hostname):
 
 
 q.machine_id = machine_id
+# #197: a fixture tick never applies cleanup to the checkout the tests run in (CI's or the person's main);
+# tests that exercise it call REAL_SCHEDULED in a disposable repository.
+REAL_SCHEDULED = cleanup.scheduled
+cleanup.scheduled = lambda args: None
 # `cleanup` stands on a project's worktree tools; its tests run where a folder of them is named.
 HELPERS = os.environ.get('TASKQ_CLEANUP_HELPERS')
 if HELPERS:
@@ -1070,6 +1075,15 @@ class Cycle(unittest.TestCase):
         self.assertIn('taskq worker` and follow', self.do(CLAUDE, 'tick'))
         out = self.do(CLAUDE, 'tick', '--filter', '', '--mine')
         self.assertIn("taskq worker --filter '' --mine` and follow", out.replace('\'"\'"\'', "'"))
+
+    def test_only_the_owner_tick_runs_scheduled_cleanup_once_per_pass(self):
+        with patch.object(cleanup, 'scheduled') as scheduled:
+            self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))
+            scheduled.assert_called_once()
+            scheduled.reset_mock()
+            with patch.object(q, 'COORDINATOR', 'another-machine'):
+                self.do(COORDINATOR, 'tick')
+            scheduled.assert_not_called()  # #145: another machine's tick releases its own work only
 
     def test_idle_stop_after_empty_ticks_reset_by_work_blocked_by_ask(self):
         idle = 'Idle 5 ticks: stop the timer (CronDelete / --uninstall-timer), run `taskq cleanup --apply`, report'
@@ -3067,7 +3081,7 @@ class TickBeat(unittest.TestCase):
             self.assertIn('stop the external scheduler and ran `taskq cleanup --apply`', result)
             self.assertFalse(tick.idle_ticks().exists())
             timer.assert_not_called()
-            cleanup.assert_called_once_with(argparse.Namespace(apply=True))
+            cleanup.assert_called_once_with(argparse.Namespace(apply=True, trigger='idle'))
             self.assertEqual(failed, [])
 
     def test_windows_tick_imports_and_locks_without_fcntl(self):
@@ -3436,6 +3450,8 @@ class Cleanup(unittest.TestCase):
         self.env = patch.dict(os.environ, CODEX)
         self.env.start()
         self.addCleanup(self.env.stop)
+        # #197 state and lock beside this fixture's tick beat, never the real checkout's .local/.
+        self.enterContext(patch.object(q, 'TICK_BEAT', self.root / '.local' / 'taskq-tick-last'))
 
     def git(self, *args, cwd=None):
         return subprocess.run(['git', '-C', str(cwd or self.root), *args], capture_output=True,
@@ -3731,6 +3747,126 @@ class Cleanup(unittest.TestCase):
         os.chdir(tree)
         with self.assertRaisesRegex(SystemExit, 'only from the main checkout'):
             self.run_cleanup(True)
+
+    # --- #197: native cleanup under the schedule's lock and state, on the owner's tick and the idle stop -------
+
+    def tick_cleanup(self):
+        """The owner tick's call (cleanup.scheduled, unguarded): its events, as they join the tick report."""
+        args = SimpleNamespace(pm_report={'actions': []})
+        with contextlib.redirect_stderr(io.StringIO()):
+            REAL_SCHEDULED(args)
+        return args.pm_report['actions']
+
+    def state(self):
+        return json.loads(q.TICK_BEAT.with_name('taskq-cleanup.json').read_text())
+
+    def local(self, text):
+        q.LOCAL.write_text(text)
+
+    def setup_local(self):
+        self.enterContext(patch.object(q, 'LOCAL', self.root / '.local' / 'taskq.local.toml'))
+        q.LOCAL.parent.mkdir(exist_ok=True)
+
+    def test_tick_applies_native_remove_once_then_dedups_manual_and_restart(self):
+        self.setup_local()
+        first = self.tree('worktree-taskq-120')
+        events = self.tick_cleanup()
+        report = next(event for event in events if event['action'] == 'cleanup')
+        self.assertEqual((report['status'], report['trigger'], report['reason']), ('done', 'tick', 'first run'))
+        self.assertFalse(first.exists())
+        self.assertIn(f'tree {first} / worktree-taskq-120', report['succeeded'])
+        self.assertIn('remove_tree', [event['action'] for event in events])
+        self.assertTrue(report['timezone_fallback'])
+        state = self.state()
+        self.assertEqual((state['last_outcome'], state['last_success']), ('success', report['finished']))
+        # Inside the hour: the next tick (a fresh process reading the same file) neither plans nor removes.
+        second = self.tree('worktree-taskq-121')
+        report, = self.tick_cleanup()
+        self.assertEqual((report['status'], report['reason']), ('skipped', 'not due'))
+        self.assertTrue(second.exists())
+        # The owner's manual run is not held by the schedule and moves the same state.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            q.main(['cleanup', '--json', '--apply'])
+        manual = json.loads(out.getvalue())['cleanup']
+        self.assertEqual((manual['trigger'], manual['outcome']), ('manual', 'success'))
+        self.assertFalse(second.exists())
+        self.assertEqual(self.state()['last_success'], manual['finished'])
+        self.assertEqual(self.tick_cleanup()[0]['reason'], 'not due')
+
+    def test_tick_keeps_unsafe_targets_ask_pending_and_application_refusal_visible(self):
+        self.setup_local()
+        unmerged = self.tree('worktree-taskq-122', False)
+        dirty = self.tree('worktree-taskq-123')
+        (dirty / 'unknown').write_text('keep')
+        doing = self.tree('worktree-taskq-8')
+        self.issues[8] = {'closed': False, 'state': 'doing', 'claim': {'runtime': 'claude', 'session': 'live'}}
+        self.issues[9] = {'closed': True, 'state': 'closed', 'type': 'research', 'claim': {'runtime': 'claude', 'session': 'done-worker'}}
+        self.app['done-worker'] = {'cwd': str(self.root)}
+        self.git('push', '-q', 'origin', 'HEAD:refs/heads/worktree-taskq-124')  # a merged remote task branch: Ask
+        events = self.tick_cleanup()
+        report = next(event for event in events if event['action'] == 'cleanup')
+        # Pending Ask and a refusal are a completed safe plan, reported apart.
+        self.assertEqual(report['status'], 'done')
+        self.assertEqual(report['attempted'], ['Claude session local_done-worker'])
+        self.assertEqual(report['refused'], ['Claude session local_done-worker'])
+        self.assertIn({'action': 'archive', 'status': 'refused', 'session': 'done-worker',
+                       'reason': 'requires coordinator application tool'}, events)
+        for tree in (unmerged, dirty):
+            self.assertIn(f'tree {tree} / {tree.name if tree.name.startswith("worktree-") else "worktree-" + tree.name}', report['pending_asks'])
+        self.assertIn('branch origin/worktree-taskq-124', report['pending_asks'])
+        self.assertIn('worktree-taskq-124', self.git('ls-remote', '--heads', 'origin'))
+        for tree in (unmerged, dirty, doing):
+            self.assertTrue(tree.exists())
+        self.assertEqual((dirty / 'unknown').read_text(), 'keep')
+
+    def test_disabled_settings_stop_tick_and_idle_but_not_manual(self):
+        self.setup_local()
+        self.local('[cleanup]\nenabled = false\n')
+        tree = self.tree('worktree-taskq-125')
+        report, = self.tick_cleanup()
+        self.assertEqual((report['status'], report['reason'], report['settings']), ('skipped', 'disabled', str(q.LOCAL)))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            q.cleanup(argparse.Namespace(apply=True, trigger='idle'))
+        self.assertIn('Cleanup (idle): skipped, disabled', out.getvalue())
+        self.assertTrue(tree.exists())
+        # The idle stop does not offer cleanup either; the owner's explicit run still applies.
+        with patch.object(q, 'TICK_BEAT', self.root / '.local' / 'beat'), patch.object(q, 'personal', return_value={'idle': {'stop': 1}, 'cleanup': {'enabled': False}}):
+            tick.idle_ticks().write_text('0\n')
+            self.assertNotIn('cleanup', tick.idle_stop(False, None, []))
+        self.run_cleanup(True)
+        self.assertFalse(tree.exists())
+
+    def test_failed_plan_keeps_last_success_and_backs_off_one_hour_from_completion(self):
+        self.setup_local()
+        self.tick_cleanup()
+        before = self.state()['last_success']
+        state = self.state()
+        state['last_success'] = '2000-01-01T00:00:00+00:00'  # long due
+        q.TICK_BEAT.with_name('taskq-cleanup.json').write_text(json.dumps(state))
+        self.git('remote', 'set-url', 'origin', str(self.root / 'missing.git'))  # the native fetch fails
+        report, = self.tick_cleanup()
+        self.assertEqual((report['status'], report['last_success']), ('failed', '2000-01-01T00:00:00+00:00'))
+        self.assertEqual(report['errors'][0]['item'], 'plan')
+        finished = datetime.fromisoformat(report['finished'])
+        self.assertEqual(report['next_due'], (finished + timedelta(hours=1)).isoformat())
+        self.assertEqual(self.tick_cleanup()[0]['reason'], 'backoff')
+        self.assertNotEqual(before, None)
+
+    def test_tick_from_a_task_tree_or_another_branch_refuses_visibly(self):
+        self.setup_local()
+        tree = self.tree('worktree-taskq-126')
+        os.chdir(tree)
+        report, = self.tick_cleanup()
+        self.assertEqual((report['status'], report['reason']), ('refused', 'scheduled cleanup runs only from the main checkout on branch main'))
+        self.assertTrue(tree.exists())
+
+    def test_invalid_cleanup_settings_stop_with_file_and_key(self):
+        self.setup_local()
+        self.local('[cleanup]\nschedule = "custom"\ninterval_minutes = 0\n')
+        with self.assertRaisesRegex(SystemExit, r'taskq.local.toml: \[cleanup\] interval_minutes must be a positive integer'):
+            q.personal()
+        self.local('[cleanup]\nschedule = "custom"\ninterval_minutes = 1\n')
+        self.assertEqual(q.personal()['cleanup']['interval_minutes'], 1)  # no 60-minute minimum
 
 
 if __name__ == '__main__':

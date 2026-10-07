@@ -589,7 +589,9 @@ def idle_stop(act, step, failed):
     """#153: count this empty pass; on the [idle] stop-th in a row (taskq.local.toml, default 5, 0 = never) the line
     that stops the timer, and the count starts over. `act` (launchd) stops its own timer and runs cleanup here."""
     idle = core.personal().get('idle', {})
-    stop, clean = idle.get('stop', 5), idle.get('cleanup', True)
+    from taskq.cleanup_schedule import settings
+    # #197: [cleanup] enabled = false stops idle cleanup as well; [idle] cleanup = false stays the idle-only opt-out.
+    stop, clean = idle.get('stop', 5), idle.get('cleanup', True) and settings()['enabled']
     count = int(idle_ticks().read_text()) + 1 if idle_ticks().exists() else 1
     if not stop or count < stop:
         idle_ticks().write_text(f'{count}\n')
@@ -603,7 +605,8 @@ def idle_stop(act, step, failed):
         step('stop the tick timer', lambda: timer(False))
     if clean:
         try:
-            core.cleanup(argparse.Namespace(apply=True))  # its Remove and Ask the owner sections go to the coordinator
+            # Under the #197 lock and state: skipped when the owner's tick already cleaned within the schedule.
+            core.cleanup(argparse.Namespace(apply=True, trigger='idle'))  # its Remove and Ask the owner sections go to the coordinator
         except (SystemExit, OSError, subprocess.SubprocessError) as error:
             failed.append(f'run {cleanup}: {core.codex_line(str(error))}')
     stopped = 'the tick stopped its launchd timer' if sys.platform == 'darwin' else 'stop the external scheduler'
@@ -833,6 +836,8 @@ def queue_pass(args, act=False):
     if act:
         retire_closed(log, args)
     archive_finished_codex(loaded[0], log, args)
+    # #197: the owner's tick (this machine coordinates) applies native cleanup when due; never a timer of its own.
+    sys.modules['taskq.cleanup'].scheduled(args)  # the module: `core.cleanup` is the command function
     if not (review or fresh or summary or start or codex_stopped or odd or problems) and not any(item['state'] == 'doing' for item in everything):
         # #153: an ask or review task waits for someone, so it is no idle pass.
         if any(item['state'] in ('ask', 'review') for item in everything):

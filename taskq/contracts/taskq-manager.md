@@ -457,8 +457,9 @@ is harmless and must not be deleted to recover a crash.
 
 Honor `[idle] stop` (default 5 consecutive empty passes; 0 disables stopping). On `Idle N ticks`,
 disable the external timer through its own scheduler; the CLI cannot cancel a cron/systemd/Hermes
-job. `--act` already runs `taskq cleanup --apply` unless `[idle] cleanup = false`; do not run it
-again. Relay `Ask the owner` items and retain anything requiring app-only archival until an
+job. `--act` already runs `taskq cleanup --apply` unless `[idle] cleanup = false` or
+`[cleanup] enabled = false`, and every owner tick applies due cleanup itself (#197, [taskq](taskq.md) § Cleanup);
+do not run it again. Relay `Ask the owner` items and retain anything requiring app-only archival until an
 operator with that app handles it. No Claude app tool is needed to complete the CLI pass.
 Rearm only on the owner's request. A macOS external scheduler must also disable its own job:
 removing a launchd taskq timer does not cancel an external timer.
@@ -725,7 +726,7 @@ live-update-during-turn check separately; a completed reply does not prove a liv
 **Idle stop (#153).** On the 5th empty pass in a row (no task to start, nothing in doing, review or ask;
 `[idle] stop` in `taskq.local.toml`) the tick prints `Idle N ticks: …` instead of `Nothing to do`. Then stop
 the timer (CronDelete, or `taskq tick --uninstall-timer` for launchd), run `taskq cleanup --apply` (unless
-`[idle] cleanup = false`; the line names only the steps that are on), show the owner its Remove section and any
+`[idle] cleanup = false` or `[cleanup] enabled = false`; the line names only the steps that are on), show the owner its Remove section and any
 Ask the owner items, and say how to rearm: "arm the tick" (§ 2). `tick --act` stops its launchd timer and runs
 cleanup itself and wakes the coordinator with the output, so only the report is left. A task in ask never counts
 as idle; any other pass starts the count over.

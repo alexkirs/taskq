@@ -1,5 +1,5 @@
-"""#197 local pilot: deterministic fixtures for the cleanup schedule. No tick, live cleanup, config or network;
-these are not a receipt of a real existing-tick cleanup."""
+"""#197: deterministic schedule fixtures (validation, due, DST, retry, dedup, lock). The native cleanup, tick
+and idle paths run in tests/test_taskq.py `Cleanup`; neither is a receipt of a real existing-tick cleanup."""
 from datetime import datetime, timedelta, timezone
 import fcntl
 import json
@@ -145,7 +145,21 @@ class Run(unittest.TestCase):
         self.dir.cleanup()
 
     def plan(self, *items):
-        return lambda: [dict(i) for i in items]
+        """A stand-in for the native `apply_plan`: Remove items go to `apply`, Ask items stay pending, the rest is
+        untouched. The real one runs in tests/test_taskq.py `Cleanup` against disposable repositories."""
+        def execute():
+            counts = {'attempted': [], 'succeeded': [], 'refused': [], 'errors': [], 'pending_asks': []}
+            for item in items:
+                if item['section'] == 'Ask the owner':
+                    counts['pending_asks'].append(item)
+                elif item['section'] == 'Remove':
+                    counts['attempted'].append(item)
+                    try:
+                        counts['succeeded' if self.apply(item) else 'refused'].append(item)
+                    except OSError as error:
+                        counts['errors'].append({'item': item, 'error': str(error)})
+            return counts
+        return execute
 
     def apply(self, item):
         self.applied.append(item['target'])
@@ -155,7 +169,7 @@ class Run(unittest.TestCase):
 
     def run_at(self, now, plan, trigger='tick', cfg=None, took=timedelta(0)):
         """An attempt started at `now` whose clock reads `now + took` when it ends."""
-        return cs.run(cfg or self.cfg, self.path, now, plan, self.apply, trigger, clock=lambda: now + took)
+        return cs.run(cfg or self.cfg, self.path, now, plan, trigger, clock=lambda: now + took)
 
     def test_only_remove_applied_ask_pending_success(self):
         report = self.run_at(T0, self.plan({'section': 'Remove', 'target': 'tree-1'},
@@ -235,7 +249,7 @@ class Run(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no timezone'):
             self.run_at(T0.replace(tzinfo=None), self.plan())
         with self.assertRaisesRegex(ValueError, 'no timezone'):
-            cs.run(self.cfg, self.path, T0, self.plan(), self.apply, clock=lambda: T0.replace(tzinfo=None))
+            cs.run(self.cfg, self.path, T0, self.plan(), clock=lambda: T0.replace(tzinfo=None))
         # The marker stays, so the next attempt records that one as interrupted.
         self.assertIn('running', json.loads(self.path.read_text()))
 

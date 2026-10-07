@@ -112,6 +112,7 @@ the “Before” column is the state before #48.
 | Running sessions and occupied slots | Session on this machine | Tracker claims with a hash of the machine id (`~/.local/state/taskq/machine-id`, made once) and local legacy evidence | Existing claims and detection; never config |
 | Idle stop (optional) | Person | None: the timer fired on an empty queue forever | Personal `[idle] stop = 5`: empty ticks in a row before the idle stop, 0 = never |
 | Cleanup on the idle stop (optional) | Person | None | Personal `[idle] cleanup = true`: run `cleanup --apply` on the idle stop |
+| Cleanup schedule (#197) | Team default, person override | `[cleanup]` of `taskq.toml` | Personal `[cleanup]` of `taskq.local.toml` replaces the shared table whole; missing: enabled hourly, `Etc/UTC` |
 | Codex app project/section | Person on this machine | Shared `[codex]` override or discovery by main-checkout path | Personal `[codex]`; discovery remains the default |
 | Claude worker permissions | Machine/user | `.claude/settings.local.json` | Same local permissions file, outside git |
 | Folder trust, app/CLI login and credentials | Machine/user | App/CLI secure state | Same native state; never either TOML file |
@@ -472,6 +473,23 @@ Only taskq-owned trees and branches are eligible: `taskq-<N>`, `worktree-taskq-<
 Task trees are found in `.worktrees/taskq-<N>` and in `../taskq-<N>` alike (§ Task flow, «Where task trees live»).
 Procedure for owner questions and Claude archiving:
 [taskq-manager](taskq-manager.md) § Cleaning up finished work.
+
+**On existing ticks (#197).** Accepted spec: [Wiki Cleanup-schedule](https://github.com/alexkirs/taskq/wiki/Cleanup-schedule/6642908fbd612b7a3d85df1e8ac64d46e63f9bd5);
+details: [docs/cleanup-schedule.md](../../docs/cleanup-schedule.md). `[cleanup]` takes `enabled` (default true),
+`schedule` (`hourly` default, `daily`/`weekly` with `at = "HH:MM"` and `weekday`, `custom` with exactly one of a
+positive `interval_minutes`, no minimum, or `weekdays` plus `at`) and an IANA `timezone` (default `Etc/UTC`,
+reported as the fallback). An invalid table stops every command with its file and key; nothing is written back.
+The owner's tick (the coordinator machine's pass, with or without `--act`) applies cleanup when due; there is
+no timer of its own, so no ticks means no cleanup. `cleanup --apply` (manual), the tick and the idle stop share
+one lock and one state file, `<main checkout>/.local/taskq-cleanup.json`: a manual run dedups the next ticks,
+an overlapping one reports `busy`. Each attempt fetches and builds a fresh native plan and acts only on its
+"Remove" items with the usual rechecks; Ask stays pending, Claude app sessions stay a visible refusal.
+Intervals count from the last successful completion; a failed or partial attempt keeps the last success and
+retries one hour after its completion; an interrupted one is replanned, never replayed. `enabled = false`
+stops tick and idle cleanup, not the owner's `cleanup --apply`. The tick report carries a `cleanup` action:
+trigger, reason, outcome, attempted/succeeded/refused/errors/pending asks, observed/due/finished, last success,
+next due (UTC and local) and timezone. Implemented and tested with fixtures; a live existing-tick receipt is a
+separate qualification, not claimed by the tests.
 
 ## History and report
 

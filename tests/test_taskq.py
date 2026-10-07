@@ -1846,6 +1846,9 @@ class Cycle(unittest.TestCase):
         self.assertIn(f'## Review {link(code)}', out.getvalue())
         q.LOCAL.write_text('[coordinator]\nsession = "coordinator-session"\n')
         self.addCleanup(q.LOCAL.unlink, missing_ok=True)
+        # #185: only a coordinator listed in `claude agents` and not busy is woken.
+        self.agents['coordinator-session'] = {'id': 'coordina', 'sessionId': 'coordinator-session', 'kind': 'background',
+                                              'cwd': str(q.ROOT), 'name': 'PM (mac-1)', 'state': 'done'}
         for _ in range(2):
             with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit), patch.dict(os.environ, COORDINATOR):

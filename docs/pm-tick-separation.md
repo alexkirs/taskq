@@ -2,8 +2,7 @@
 
 Bounded delivery against Wiki spec revision `6b9027b29bf43d18a24d2cc96ef98d314f396794`
 (§ Minimal critical path, #185). Scope: standalone macOS TaskQ, one checkout, fixtures plus read-only
-observations, and three narrow fixes in `taskq/tick.py` (`wake`, `starts`)
-approved on review. No timer was armed, no worker spawned, no configuration changed. Every live gate below
+observations, and narrow fixes in `taskq/tick.py` (`wake`, `starts`) approved on review. No timer was armed, no worker spawned, no configuration changed. Every live gate below
 stays `unknown`/unqualified until a real supported send and receive is shown.
 
 ## Separation with existing mechanisms
@@ -24,7 +23,7 @@ proven cause.
 
 ## What the fixtures show
 
-`python3 -m unittest discover -s tests -p test_pm_tick_separation.py` (16 tests). Inventory rows have the
+`python3 -m unittest discover -s tests -p test_pm_tick_separation.py` (21 tests). Inventory rows have the
 real `claude agents --json --all` shape (`id`, `cwd`, `kind`, `startedAt`, `sessionId`, `name`, `state`,
 plus `pid`/`status` while running).
 
@@ -34,14 +33,15 @@ plus `pid`/`status` while running).
 | TICK carries project identity | In-session: TICK_PROMPT names `cd <main checkout>`. launchd: `WorkingDirectory` is the main checkout. The wake turn starts with `Project <repo>, main checkout <path>.` | All three asserted. |
 | Delivery receipt is not a completed pass | `wake` writes the judgement key only after `claude_wake` returns. | A failed delivery writes no key and is retried. A delivered wake leaves only that key: the PM's completed pass is never read back (`unknown`). |
 | Duplicate/coalesced TICK, one pass per project | Non-blocking checkout lock; judgement-key dedup; busy PM skipped. | Three manual TICKs during a slow timer pass return in under 1 s, each `Skipped: another tick pass is running.`; `--json` reports the refusal with outcome `ok`. Same items wake once; new items wake again. |
-| PM stays responsive, also after a resume | A busy PM gets no turn. Busy means the recorded session busy, or a `working`/`blocked` job with the recorded session's name whose `cwd` is this checkout (`claude --bg --resume` runs under a new session id, #182). | Resumed PM busy or blocked under a new id: not woken. Same name in another checkout, a terminal job, an idle job, another name: woken, and always the recorded session (conversation identity). Unreachable inventory (empty list): delivery attempted, receipt only on success. |
-| Restart, interrupted sender/receiver | Lock file survives a killed holder; claims and take's lock decide. `starts` skips a ready task whose `T<N> ` Claude job of this checkout is alive (`working`, or `blocked` without pid). | A killed holder does not block the next pass. A taken task is not started again. A spawned, not yet taken worker (working or blocked) is not spawned again and no claim is invented. A terminal or stopped job, another checkout, another task number, or an unreachable inventory does not hold the start. |
+| PM stays responsive, also after a resume | Only a coordinator listed in `claude agents` is woken. Busy means state `working` or `blocked`, or `status: busy` (`status` is optional in the CLI's rows), for the recorded session or a job with its name whose `cwd` is this checkout (`claude --bg --resume` runs under a new session id, #182). | Resumed PM working (also without `status`) or blocked under a new id: not woken. Same name in another checkout, a terminal or idle job, another name: woken, always the recorded session (conversation identity). Recorded PM done/failed/stopped: woken. Unknown owner (empty or unreachable inventory, or the recorded session not listed): not woken, no receipt, `[coordinator]` unchanged, printed; the next tick tries again. |
+| Restart, interrupted sender/receiver | Lock file survives a killed holder; claims and take's lock decide. `starts` skips a ready task with a live `T<N> ` worker of this checkout: a Claude job `working`/`blocked` or running in a non-terminal state, or a Codex thread from the read-only `thread/list` (cleanup_codex) that is `active`, `idle` or `notLoaded`. | A killed holder does not block the next pass. A taken task is not started again. A spawned, not yet taken worker (Claude working/blocked; Codex active/idle/notLoaded) is not spawned again and no claim is invented. A terminal or stopped Claude job, a `systemError` or archived (unlisted) Codex thread, another checkout, another task number: the start proceeds. Unreachable Codex inventory: every task not pinned to Claude is held and named this pass; Claude-pinned tasks start. |
 | Stale observations, busy/failed projects | Existing tests: `TickBeat` (stale or second armed timer named), `test_tick_codex_unavailable_does_not_stop_other_coordinator_work`, #176 `test_permission_qualification.py`. | Consumed, not duplicated. |
 
-Limits of these fixes: a Codex worker spawned but not taken is not detected (a `thread/list` read; Claude is
-the default worker runtime). An interactive (non-background) PM session is not in the background inventory
-`claude_agents` reads, so its busy state is not seen. With an unreachable inventory busy is unknown and the
-wake is attempted, as before.
+Limits of these fixes: an interactive (non-background) PM session is not in the background inventory
+`claude_agents` reads, so it is never woken by `--wake` (unknown owner). A failing `claude agents` lists nothing,
+the same as a machine without Claude workers, so a Claude worker before its take is then not seen. Codex thread
+status alone does not tell a worker before its take from one whose turn ended without a take; the existing
+archive pass archives such an unclaimed thread after 10 minutes, which ends the hold.
 
 ## Live gates (unqualified)
 

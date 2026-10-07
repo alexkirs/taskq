@@ -37,7 +37,7 @@ class PermissionQualificationTests(unittest.TestCase):
     def wakes(self, keys):
         with tempfile.TemporaryDirectory() as directory, patch.object(tick, 'woken', return_value=Path(directory) / 'woken'), \
              patch.object(q, 'personal', return_value={'coordinator': {'session': 'pm'}}), \
-             patch.object(q, 'claude_agents', return_value={}), patch.object(q, 'claude_wake') as wake, \
+             patch.object(q, 'claude_agents', return_value={'pm': {'sessionId': 'pm', 'state': 'done'}}), patch.object(q, 'claude_wake') as wake, \
              contextlib.redirect_stdout(io.StringIO()):
             for key in keys:
                 tick.wake('permission', [key])

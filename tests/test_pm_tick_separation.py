@@ -58,8 +58,8 @@ class TimerOwner(unittest.TestCase):
     def test_explicit_handoff_moves_the_wake_target(self):
         self.install('pm-a')
         q.LOCAL.write_text(q.LOCAL.read_text().replace('"pm-a"', '"pm-b"'))  # the owner's handoff
-        with patch.object(q, 'claude_agents', return_value={}), patch.object(q, 'claude_wake') as wake, \
-             contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(q, 'claude_agents', return_value=job('pm-b', 'PM (mac)', state='done')), \
+             patch.object(q, 'claude_wake') as wake, contextlib.redirect_stdout(io.StringIO()):
             tick.wake('output', ['review 1 abc'])
         self.assertEqual(wake.call_args[0][0], 'pm-b')
 
@@ -73,7 +73,7 @@ class TimerOwner(unittest.TestCase):
 
     def test_wake_turn_names_the_project(self):
         with patch.object(q, 'personal', return_value={'coordinator': {'session': 'pm-a'}}), \
-             patch.object(q, 'claude_agents', return_value={}), patch.object(q, 'claude_wake') as wake, \
+             patch.object(q, 'claude_agents', return_value=job('pm-a', 'PM (mac)', state='done')), patch.object(q, 'claude_wake') as wake, \
              patch.object(tick, 'woken', return_value=self.tmp / 'woken'), contextlib.redirect_stdout(io.StringIO()):
             tick.wake('output', ['review 1 abc'])
         self.assertTrue(wake.call_args[0][1].startswith(f'Project {q.PROJECT_PATH}, main checkout {q.ROOT}. {tick.WAKE_PROMPT}'))
@@ -86,7 +86,7 @@ class Wake(unittest.TestCase):
         tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.object(tick, 'woken', return_value=tmp / 'woken'))
         self.enterContext(patch.object(q, 'personal', return_value={'coordinator': {'session': 'pm-a'}}))
-        self.agents = {}
+        self.agents = job('pm-a', 'PM (mac)', state='done')  # listed, its turn ended
         self.enterContext(patch.object(q, 'claude_agents', lambda: self.agents))
         self.send = self.enterContext(patch.object(q, 'claude_wake'))
 
@@ -96,11 +96,11 @@ class Wake(unittest.TestCase):
         return out.getvalue()
 
     def test_busy_pm_is_not_interrupted_and_gets_the_tick_later(self):
-        self.agents = {'pm-a': {'sessionId': 'pm-a', 'pid': 1, 'status': 'busy'}}  # the owner talks to the PM
+        self.agents = job('pm-a', 'PM (mac)')  # the owner talks to the PM
         self.assertIn('The coordinator is busy: the next tick wakes it.', self.wake(['review 1 abc']))
         self.send.assert_not_called()
         self.assertFalse(tick.woken().exists())  # not counted as delivered
-        self.agents['pm-a']['status'] = 'idle'
+        self.agents = job('pm-a', 'PM (mac)', state='done', pid=4242, status='idle')
         self.assertIn('Woke the coordinator pm-a.', self.wake(['review 1 abc']))
         self.send.assert_called_once()
 
@@ -150,10 +150,36 @@ class Wake(unittest.TestCase):
                     self.assertIn('Woke the coordinator pm-a.', self.wake(['review 1 abc']))
                     self.assertEqual(self.send.call_args[0][0], 'pm-a')  # the recorded conversation identity
 
-    def test_unreachable_inventory_falls_back_to_the_recorded_session(self):
-        """`claude agents` failing lists nothing: busy is then unknown; the delivery is attempted and only its
-        own failure (claude_wake raising) withholds the receipt."""
-        self.agents = {}
+    def test_working_without_status_is_busy(self):
+        """Review reproduction: `status` is optional in the CLI's rows; state working alone is busy."""
+        for rows in ({**job('pm-a', 'PM (mac)', state='done'), 'pm-b': {**job('pm-b', 'PM (mac)')['pm-b'], 'status': None}},
+                     {'pm-a': {key: value for key, value in job('pm-a', 'PM (mac)', pid=123)['pm-a'].items() if key != 'status'}}):
+            with self.subTest(rows=sorted(rows)):
+                self.agents = rows
+                self.assertIn('The coordinator is busy', self.wake(['review 1 abc']))
+        self.send.assert_not_called()
+        self.assertFalse(tick.woken().exists())
+
+    def test_terminal_or_idle_recorded_pm_is_woken(self):
+        for state in ('done', 'failed', 'stopped'):
+            with self.subTest(state):
+                tick.woken().unlink(missing_ok=True)
+                self.agents = job('pm-a', 'PM (mac)', state=state)
+                self.assertIn('Woke the coordinator pm-a.', self.wake(['review 1 abc']))
+        self.assertEqual(self.send.call_count, 3)
+
+    def test_unknown_owner_is_deferred_without_receipt(self):
+        """`claude agents` failing lists nothing; an owner not listed here is unknown too. A resume could run
+        beside a busy PM: no wake, no receipt, the recorded owner stays, the next tick tries again."""
+        for rows in ({}, job('pm-b', 'PM (mac)', state='done')):
+            with self.subTest(rows=sorted(rows)):
+                self.agents = rows
+                self.assertIn('The coordinator pm-a is not in `claude agents` here: its state is unknown, not woken',
+                              self.wake(['review 1 abc']))
+        self.send.assert_not_called()
+        self.assertFalse(tick.woken().exists())
+        self.assertEqual(q.personal()['coordinator']['session'], 'pm-a')
+        self.agents = job('pm-a', 'PM (mac)', state='done')
         self.assertIn('Woke the coordinator pm-a.', self.wake(['review 1 abc']))
 
 
@@ -245,6 +271,43 @@ class Restart(unittest.TestCase):
                 with self.subTest(case):
                     self.agents = rows
                     self.assertEqual(self.act(), [f'T{iid} t'])
+
+    def codex_thread(self, iid, status, cwd=None, name=None):
+        """A `thread/list` row as cleanup_codex reads it; young, so the archive pass leaves it."""
+        return {'id': f'thread-{status}', 'name': name or f'T{iid} t (mac-1)', 'cwd': str(cwd or q.ROOT),
+                'status': {'type': status}, 'updatedAt': time.time()}
+
+    def test_codex_worker_before_take_is_not_spawned_again(self):
+        self.enterContext(patch.object(q, 'CODEX_SOCKET', q.ROOT))  # an app server here
+        iid = self.add('--type', 'research', '--runtime', 'codex')
+        for status in ('active', 'idle', 'notLoaded'):
+            with self.subTest(status):
+                self.codex.listed = [self.codex_thread(iid, status)]
+                self.assertEqual(self.act(), [])
+                self.assertEqual(self.state(iid), 'ready')
+
+    def test_terminal_archived_other_project_or_task_codex_thread_does_not_hold_a_start(self):
+        self.enterContext(patch.object(q, 'CODEX_SOCKET', q.ROOT))
+        iid = self.add('--type', 'research', '--runtime', 'codex')
+        with tempfile.TemporaryDirectory() as other:
+            cases = {'terminal': [self.codex_thread(iid, 'systemError')],
+                     'archived (not listed)': [],
+                     'other project': [self.codex_thread(iid, 'active', cwd=other)],
+                     'other task': [self.codex_thread(iid, 'active', name=f'T{iid}0 t (mac-1)')]}
+            for case, listed in cases.items():
+                with self.subTest(case):
+                    self.codex.listed = listed
+                    self.assertEqual(self.act(), [f'T{iid} t'])
+
+    def test_unreachable_codex_inventory_holds_all_but_claude_pinned_tasks(self):
+        self.enterContext(patch.object(q, 'CODEX_SOCKET', q.ROOT))
+        codex, any_runtime = self.add('--type', 'research', '--runtime', 'codex'), self.add('--type', 'research', '--runtime', 'any')
+        claude = self.add('--type', 'research', '--runtime', 'claude')
+        with patch.object(q, 'Codex', side_effect=OSError('socket unavailable')):
+            self.assertEqual(self.act(), [f'T{claude} t'])
+            output = self.do(COORDINATOR, 'tick')
+        for iid in (codex, any_runtime):
+            self.assertIn(f'{base.link(iid)}: Codex threads unreadable, a worker may be running before its take; not started this pass.', output)
 
 
 if __name__ == '__main__':

@@ -66,7 +66,7 @@ class RuntimeObservationTests(unittest.TestCase):
         key = item['_runtime_observation']['notify_dedup']
         with tempfile.TemporaryDirectory() as directory, patch.object(tick, 'woken', return_value=Path(directory) / 'woken'), \
              patch.object(q, 'personal', return_value={'coordinator': {'session': 'pm'}}), \
-             patch.object(q, 'claude_agents', return_value={}), patch.object(q, 'claude_wake') as wake, \
+             patch.object(q, 'claude_agents', return_value={'pm': {'sessionId': 'pm', 'state': 'done'}}), patch.object(q, 'claude_wake') as wake, \
              contextlib.redirect_stdout(io.StringIO()):
             tick.wake('owner approval link', [key])
             tick.wake('owner approval link', [key])

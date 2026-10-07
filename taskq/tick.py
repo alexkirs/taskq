@@ -223,8 +223,29 @@ def local(agent):
 
 
 def alive(agent):
-    """Running or waiting on the owner (#176: blocked counts without pid); a terminal state or no pid is not."""
-    return agent.get('state') == 'blocked' or bool(agent.get('pid')) and agent.get('state') not in CLAUDE_ENDED
+    """Working or waiting on the owner (#176: blocked counts without pid; `status` is optional in the CLI's rows),
+    or running in a state that is not terminal. A terminal state, or no pid without such a state, is not."""
+    return agent.get('state') in ('working', 'blocked') or bool(agent.get('pid')) and agent.get('state') not in CLAUDE_ENDED
+
+
+def busy(agent):
+    return agent.get('state') in ('working', 'blocked') or agent.get('status') == 'busy'
+
+
+def codex_spawned():
+    """#185: iids of this checkout's live `T<N> ` Codex threads (active, idle or notLoaded: a worker before its take;
+    archived threads are not listed), from the read-only `thread/list` that cleanup and the archive pass read.
+    None: the inventory is unreachable, so no task can be shown to have no worker."""
+    if not core.CODEX_SOCKET.exists():
+        return set()  # no app server here: no Codex worker of this machine
+    from taskq.cleanup import cleanup_codex
+    root = core.ROOT.resolve()
+    try:
+        threads = cleanup_codex({root})
+    except (OSError, SystemExit, ValueError):
+        return None
+    return {int(name[1]) for thread in threads.values() if Path(thread.get('cwd') or '/').resolve() == root
+            and (thread.get('status') or {}).get('type') != 'systemError' and (name := re.match(r'T(\d+) ', thread.get('name') or ''))}
 
 
 def starts(args, loaded, selected):
@@ -233,12 +254,16 @@ def starts(args, loaded, selected):
     preferred = args.profile['preferred_runtime']
     ready = [item for item in core.startable(loaded=loaded) if item['iid'] in selected]
     # #185: a worker spawned by an earlier pass that has not taken its task yet (a manual TICK, a restart) is
-    # not spawned again. ponytail: Claude only; a Codex worker is a `thread/list` read, add it when one doubles.
+    # not spawned again. ponytail: `claude agents` failing lists nothing, like a machine without Claude workers.
     spawned = {int(name[1]) for agent in (core.claude_agents() if ready else {}).values()
                if local(agent) and alive(agent) and (name := re.match(r'T(\d+) ', agent.get('name') or ''))}
+    codex = codex_spawned() if ready else set()
     for item in ready:
-        if item['iid'] in spawned:
+        if item['iid'] in spawned | (codex or set()):
             print(f'{core.ref(item)}: its worker is already running here, not taken yet; not started again.')
+            continue
+        if codex is None and item['runtime'] != 'claude':  # only a task pinned to Claude cannot have a Codex worker
+            print(f'{core.ref(item)}: Codex threads unreadable, a worker may be running before its take; not started this pass.')
             continue
         # The preferred runtime only breaks the tie for the user's own `any` task, and only while it has a free slot.
         own = item.get('assignees') == [args.profile['uid']] and preferred and free.get(preferred, 0) > 0
@@ -332,11 +357,14 @@ def wake(output, judgement):
     if woken().exists() and woken().read_text().strip() == key:
         return print('\nThe coordinator was already woken for these items.')
     agents = core.claude_agents()
-    name = (agents.get(session) or {}).get('name')
+    if session not in agents:
+        # Unlisted (`claude agents` failed, or not a background session here): a resume could run beside a busy PM.
+        return print(f'\nThe coordinator {session} is not in `claude agents` here: its state is unknown, not woken; '
+                     'the next tick tries again.')
+    name = agents[session].get('name')
     # #185: `claude --bg --resume` goes on under a new session id with the same name (#182): a busy or blocked
     # job of that name in this checkout is the coordinator too. Another checkout's job of the same name is not.
-    if any(agent.get('status') == 'busy' or agent.get('state') == 'blocked' for sid, agent in agents.items()
-           if sid == session or name and agent.get('name') == name and local(agent)):
+    if any(busy(agent) for sid, agent in agents.items() if sid == session or name and agent.get('name') == name and local(agent)):
         return print('\nThe coordinator is busy: the next tick wakes it.')
     core.claude_wake(session, f'Project {core.PROJECT_PATH}, main checkout {core.ROOT}. ' + WAKE_PROMPT + output)
     woken().write_text(key + '\n')

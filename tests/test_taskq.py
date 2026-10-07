@@ -1819,8 +1819,9 @@ class GithubRest:
                  for number, issue in self.issues.items() if issue['state'] == 'open']
         cards = [{'id': item['id'], 'isArchived': False, 'content': {'number': number, 'state': self.issues[number]['state'].upper()}}
                  for number, item in board['items'].items() if not item['archived']]
-        return {'repository': {'issues': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}},
-                'board': {'items': {'nodes': cards}}}
+        start = int(found.get('cards') or 0)  # board items come 100 a page; the cursor is the offset
+        page = {'pageInfo': {'hasNextPage': start + 100 < len(cards), 'endCursor': str(start + 100)}, 'nodes': cards[start:start + 100]}
+        return {'repository': {'issues': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}, 'board': {'items': page}}
 
     def column(self, number):
         """The Status of the issue's card on the one board; 'archived'; None: no card."""
@@ -2217,6 +2218,29 @@ class GithubCycle(unittest.TestCase):
         self.assertIn(f'Board card of #{closed} archived: its issue is closed.', out)
         self.assertEqual((self.github.column(closed), self.github.column(kept)), ('archived', 'ready'))
         self.assertEqual(self.github.mutations, ['archiveProjectV2Item'])
+
+    def test_tick_archives_closed_cards_past_the_first_board_page(self):
+        self.do(CLAUDE, 'init')
+        closed = self.add('--type', 'research')
+        self.do(CLAUDE, 'tick')
+        board = self.github.projects[0]
+        for number in range(1000, 1100):  # 100 open issues ahead of the task's card: it lands on page two
+            self.github.issues[number] = {**self.github.issues[closed], 'number': number, 'labels': [], 'events': [], 'node_id': f'node{number}'}
+            board['items'][number] = {'id': f'item{number}', 'option': None, 'archived': False, 'updated': self.github.now()}
+        board['items'][closed] = board['items'].pop(closed)
+        self.github.mutations.clear()
+        self.do(CLAUDE, 'tick')
+        self.assertEqual(self.github.mutations, [])
+        self.github.issues[closed]['state'] = 'closed'
+        self.assertIn(f'Board card of #{closed} archived: its issue is closed.', self.do(CLAUDE, 'tick'))
+        self.assertEqual((self.github.column(closed), self.github.mutations), ('archived', ['archiveProjectV2Item']))
+        for number in range(1000, 1100):  # 101 closed cards: every one leaves the board
+            self.github.issues[number]['state'] = 'closed'
+        board['items'][closed]['archived'] = False
+        self.github.mutations.clear()
+        self.do(CLAUDE, 'tick')
+        self.assertEqual(len(self.github.mutations), 101)
+        self.assertTrue(all(item['archived'] for item in board['items'].values()))
 
     def test_a_failed_card_sync_is_repaired_not_executed(self):
         self.do(CLAUDE, 'init')

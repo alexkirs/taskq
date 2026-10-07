@@ -4,3 +4,4 @@ build/
 .local/
 .worktrees/
 /taskq.local.toml
+.claude/

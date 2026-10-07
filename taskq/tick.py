@@ -310,6 +310,34 @@ def timer(install):
           + '\nDelete an in-session CronCreate tick timer: one coordinator timer per checkout.')
 
 
+def idle_ticks():
+    return core.TICK_BEAT.with_name('taskq-tick-idle')
+
+
+def idle_stop(act, step, failed):
+    """#153: count this empty pass; on the [idle] stop-th in a row (taskq.local.toml, default 5, 0 = never) the line
+    that stops the timer, and the count starts over. `act` (launchd) stops its own timer and runs cleanup here."""
+    idle = core.personal().get('idle', {})
+    stop, clean = idle.get('stop', 5), idle.get('cleanup', True)
+    count = int(idle_ticks().read_text()) + 1 if idle_ticks().exists() else 1
+    if not stop or count < stop:
+        idle_ticks().write_text(f'{count}\n')
+        return None
+    idle_ticks().unlink()
+    cleanup = f'`{core.TOOL} cleanup --apply`'
+    if not act:
+        return (f'Idle {count} ticks: stop the timer (CronDelete / --uninstall-timer), ' + f'run {cleanup}, ' * clean
+                + 'report to the owner; rearm with "arm the tick" (manager contract § 3).')
+    step('stop the tick timer', lambda: timer(False))
+    if clean:
+        try:
+            core.cleanup(argparse.Namespace(apply=True))  # its Remove and Ask the owner sections go to the coordinator
+        except (SystemExit, OSError, subprocess.SubprocessError) as error:
+            failed.append(f'run {cleanup}: {core.codex_line(str(error))}')
+    return (f'\nIdle {count} ticks: the tick stopped its launchd timer' + f' and ran {cleanup}' * clean
+            + '; report to the owner; rearm with "arm the tick" (manager contract § 3).')
+
+
 def retire_closed(log):
     """--act: a local Claude worker of a task closed in the last hour without this machine's `close` (closed on
     the board or by hand) is retired as `close` would. ponytail: sessions only; trees and branches: `cleanup`."""
@@ -425,8 +453,15 @@ def tick_pass(args, act=False):
     if not (review or fresh or summary or start or codex_stopped or odd or problems) and not any(item['state'] == 'doing' for item in everything):
         if act:
             retire_closed(log)
+        # #153: an ask or review task waits for someone, so it is no idle pass.
+        if any(item['state'] in ('ask', 'review') for item in everything):
+            idle_ticks().unlink(missing_ok=True)
+        elif stop := idle_stop(act, step, failed):
+            print(inbox_line(inbox) + stop)
+            return ['idle stop'] + [f'inbox {issue["iid"]}' for issue in inbox] + failed
         print(inbox_line(inbox) + 'Nothing to do. Say so and stop.')
         return [f'inbox {issue["iid"]}' for issue in inbox]
+    idle_ticks().unlink(missing_ok=True)
     if act:
         retire_closed(log)
     print(f'You are the coordinator of the task queue for this one pass. Queue tool: `{core.TOOL}`\n')

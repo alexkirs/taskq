@@ -601,6 +601,14 @@ titles and clicks do not work. In the Codex UI it uses the app's available Compu
 record the exact refusal and do not work around it. Record the history-after-opening check and the
 live-update-during-turn check separately; a completed reply does not prove a live subscription.
 
+**Idle stop (#153).** On the 5th empty pass in a row (no task to start, nothing in doing, review or ask;
+`[idle] stop` in `taskq.local.toml`) the tick prints `Idle N ticks: …` instead of `Nothing to do`. Then stop
+the timer (CronDelete, or `taskq tick --uninstall-timer` for launchd), run `taskq cleanup --apply` (unless
+`[idle] cleanup = false`; the line names only the steps that are on), show the owner its Remove section and any
+Ask the owner items, and say how to rearm: "arm the tick" (§ 2). `tick --act` stops its launchd timer and runs
+cleanup itself and wakes the coordinator with the output, so only the report is left. A task in ask never counts
+as idle; any other pass starts the count over.
+
 **Reply to the owner.** When nothing changed — one or two lines. Do not write "no changes" without
 running the command. Every task, worker session and commit named in a reply is a link the owner clicks,
 copied from the tick output: `[#N](<issue URL>)`, the session link of the "Workers" table, the

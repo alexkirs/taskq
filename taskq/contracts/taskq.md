@@ -83,6 +83,8 @@ the “Before” column is the state before #48.
 | Reply language | Person | Session/agent instructions | Existing instructions; no new language key in this change |
 | Claude/Codex capacity | Person on this machine | `--limit` in prompts; defaults Claude 2, Codex 3 | Personal `[profile.limits]`; CLI override for one invocation |
 | Running sessions and occupied slots | Session on this machine | Tracker claims with a hash of the machine id (`~/.local/state/taskq/machine-id`, made once) and local legacy evidence | Existing claims and detection; never config |
+| Idle stop (optional) | Person | None: the timer fired on an empty queue forever | Personal `[idle] stop = 5`: empty ticks in a row before the idle stop, 0 = never |
+| Cleanup on the idle stop (optional) | Person | None | Personal `[idle] cleanup = true`: run `cleanup --apply` on the idle stop |
 | Codex app project/section | Person on this machine | Shared `[codex]` override or discovery by main-checkout path | Personal `[codex]`; discovery remains the default |
 | Claude worker permissions | Machine/user | `.claude/settings.local.json` | Same local permissions file, outside git |
 | Folder trust, app/CLI login and credentials | Machine/user | App/CLI secure state | Same native state; never either TOML file |

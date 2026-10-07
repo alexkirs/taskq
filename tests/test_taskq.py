@@ -1000,12 +1000,45 @@ class Cycle(unittest.TestCase):
         out = self.do(CLAUDE, 'tick', '--filter', '', '--mine')
         self.assertIn("taskq worker --filter '' --mine` and follow", out.replace('\'"\'"\'', "'"))
 
+    def test_idle_stop_after_empty_ticks_reset_by_work_blocked_by_ask(self):
+        idle = 'Idle 5 ticks: stop the timer (CronDelete / --uninstall-timer), run `taskq cleanup --apply`, report'
+        for _ in range(4):
+            self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))
+        self.assertIn(idle, self.do(COORDINATOR, 'tick'))
+        self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))  # the count starts over
+        iid = self.add('--type', 'research')
+        self.do(COORDINATOR, 'tick')  # work resets the count
+        self.do(CLAUDE, 'take', iid)
+        self.do(CLAUDE, 'ask', iid, '--text', 'A or B?')
+        for _ in range(6):
+            self.assertNotIn('Idle', self.do(COORDINATOR, 'tick'))
+        self.do(CLAUDE, 'answer', iid, '--text', 'A')
+        self.do(CLAUDE, 'result', iid, '--text', 'A', '--checks', 'none')
+        self.do(COORDINATOR, 'close', iid, '--text', 'ok')
+        self.personal('[idle]\nstop = 2\ncleanup = false\n')
+        self.do(COORDINATOR, 'tick')
+        out = self.do(COORDINATOR, 'tick')
+        self.assertIn('Idle 2 ticks: stop the timer (CronDelete / --uninstall-timer), report', out)
+        self.personal('[idle]\nstop = 0\n')
+        for _ in range(6):
+            self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))
+        q.LOCAL.write_text('[idle]\nstop = 1\n')
+        with patch.object(tick, 'timer', lambda install: print('timer removed')), \
+                patch.object(q, 'cleanup', lambda args: print('# Remove')), \
+                patch.dict(os.environ, COORDINATOR), contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as log, self.assertRaises(SystemExit):
+            q.main(['tick', '--act'])
+        self.assertIn('# Remove', out.getvalue())
+        self.assertIn('the tick stopped its launchd timer and ran `taskq cleanup --apply`', out.getvalue())
+        self.assertIn('Done: stop the tick timer', log.getvalue())
+
     def test_invalid_personal_profile_stops_with_file_and_key(self):
         for text, error in (('[profile]\nmine = "yes"\n', '[profile] mine: write true or false'),
                             ('[profile.limits]\nclaude = -1\n', '[profile.limits] claude: write runtime = N'),
                             ('[profile.limits]\ngrok = 1\n', '[profile.limits] grok'),
                             ('[profile]\npreferred_runtime = "grok"\n', 'is not one of claude, codex'),
                             ('[profile]\nmines = true\n', '[profile] mines: unknown key'),
+                            ('[idle]\nstop = -1\n', '[idle] stop: write the number'), ('[idle]\ncleanup = 1\n', '[idle] cleanup: write true'),
                             ('[profile\n', 'not valid TOML')):
             q.LOCAL.write_text(text)
             self.assertIn(f'{q.LOCAL}: ', self.refused(CLAUDE, 'tick'))

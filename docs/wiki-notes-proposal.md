@@ -1,7 +1,7 @@
 # Proposed edits to existing TaskQ Wiki pages
 
 Review candidate only; do not publish before independent PM review. Based on
-Wiki revision `6bcc8868cd2be0c635f17d180b1ff07dc554eaeb` (read 2026-10-08).
+Wiki revision `6bcc8868cd2be0c635f17d180b1ff07dc554eaeb` (read 2026-10-08, Asia/Bangkok, UTC+07:00).
 Keep the existing symptom/action bullets and page structure; no new Wiki section.
 These observed/proposed notes can be accepted now: related pending
 [#185](https://github.com/alexkirs/taskq/issues/185),

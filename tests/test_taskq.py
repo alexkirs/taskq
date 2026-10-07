@@ -1673,7 +1673,10 @@ class GithubRest:
                      {'id': item['id'], 'updatedAt': item['updated'], 'project': {'id': board['id']}, 'fieldValueByName': {'name': names[item['option']]} if item['option'] in names else None}
                      for item in [board['items'].get(number)] if item and not item['archived']]}}
                  for number, issue in self.issues.items() if issue['state'] == 'open']
-        return {'repository': {'issues': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}}
+        cards = [{'id': item['id'], 'isArchived': False, 'content': {'number': number, 'state': self.issues[number]['state'].upper()}}
+                 for number, item in board['items'].items() if not item['archived']]
+        return {'repository': {'issues': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}},
+                'board': {'items': {'nodes': cards}}}
 
     def column(self, number):
         """The Status of the issue's card on the one board; 'archived'; None: no card."""
@@ -2057,6 +2060,19 @@ class GithubCycle(unittest.TestCase):
         self.github.move(started, 'ready')
         self.assertIn(f'`taskq release {started}', self.do(CLAUDE, 'tick'))
         self.assertEqual(self.github.column(started), 'doing')
+
+    def test_tick_archives_the_card_of_an_issue_closed_by_hand(self):
+        self.do(CLAUDE, 'init')
+        closed, kept = self.add('--type', 'research'), self.add('--type', 'research')
+        self.do(CLAUDE, 'tick')
+        self.github.mutations.clear()
+        self.do(CLAUDE, 'tick')
+        self.assertEqual(self.github.mutations, [])  # nothing stale: no call beyond the board read
+        self.github.issues[closed]['state'] = 'closed'  # closed on GitHub, not by `close`
+        out = self.do(CLAUDE, 'tick')
+        self.assertIn(f'Board card of #{closed} archived: its issue is closed.', out)
+        self.assertEqual((self.github.column(closed), self.github.column(kept)), ('archived', 'ready'))
+        self.assertEqual(self.github.mutations, ['archiveProjectV2Item'])
 
     def test_a_failed_card_sync_is_repaired_not_executed(self):
         self.do(CLAUDE, 'init')

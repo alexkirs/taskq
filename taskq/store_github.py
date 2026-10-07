@@ -31,11 +31,14 @@ class Github:
             ' projectsV2(first: 20, query: $board) { nodes { %s } } } }' % PROJECT)
     # Cards are read from the open issues' side: `ProjectV2.items` of a new project stayed empty for minutes while
     # `Issue.projectItems` showed the cards at once (measured live 2026-10-06).
-    ITEMS = ('query($owner: String!, $name: String!, $after: String) { repository(owner: $owner, name: $name) {'
+    # `board` rides in the same query: the cards of issues closed outside `close` (#152). Its lag on a new project only
+    # delays an archive to a later tick.
+    ITEMS = ('query($owner: String!, $name: String!, $after: String, $project: ID!) { repository(owner: $owner, name: $name) {'
              ' issues(states: OPEN, first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { number labels(first: 100) { nodes { name } }'
              ' timelineItems(itemTypes: [LABELED_EVENT], last: 1) { nodes { ... on LabeledEvent { createdAt } } }'
              ' projectItems(first: 10, includeArchived: false) { nodes { id updatedAt project { id }'
-             ' fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } } } } }')
+             ' fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } } } }'
+             ' board: node(id: $project) { ... on ProjectV2 { items(first: 100) { nodes { id isArchived content { ... on Issue { number state } } } } } } }')
 
     def __init__(self, repo, host=None, board=None):
         self.repo, self.host, self.labels, self.nodes = repo, host, {}, {}
@@ -135,7 +138,14 @@ class Github:
         board, found, after = self.project(), {}, None
         while board:
             owner, name = self.repo.split('/')
-            page = self.graphql(self.ITEMS, owner=owner, name=name, after=after)['repository']['issues']
+            data = self.graphql(self.ITEMS, owner=owner, name=name, after=after, project=board['id'])
+            page = data['repository']['issues']
+            if after is None:  # ponytail: the first 100 cards only; read `items` pages if a board ever holds more
+                for item in data['board']['items']['nodes']:
+                    content = item['content'] or {}
+                    if content.get('state') == 'CLOSED' and not item['isArchived']:
+                        print(f'Board card of #{content["number"]} archived: its issue is closed.')
+                        self.archive(item['id'])
             for issue in page['nodes']:
                 number, label = issue['number'], self.state(node['name'] for node in issue['labels']['nodes'])
                 item = next((item for item in issue['projectItems']['nodes'] if item['project']['id'] == board['id']), None)
@@ -168,12 +178,15 @@ class Github:
             self.items[number] = self.graphql('mutation($project: ID!, $node: ID!) { addProjectV2ItemById(input: {projectId: $project,'
                                               ' contentId: $node}) { item { id } } }', project=board['id'], node=node)['addProjectV2ItemById']['item']['id']
         if state is None:
-            self.graphql('mutation($project: ID!, $item: ID!) { archiveProjectV2Item(input: {projectId: $project, itemId: $item}) {'
-                         ' item { id } } }', project=board['id'], item=self.items.pop(number))
+            self.archive(self.items.pop(number))
             return
         self.graphql('mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) { updateProjectV2ItemFieldValue(input: {'
                      ' projectId: $project, itemId: $item, fieldId: $field, value: {singleSelectOptionId: $option}}) { projectV2Item { id } } }',
                      project=board['id'], item=self.items[number], field=board['field'], option=board['options'][state])
+
+    def archive(self, item):
+        self.graphql('mutation($project: ID!, $item: ID!) { archiveProjectV2Item(input: {projectId: $project, itemId: $item}) {'
+                     ' item { id } } }', project=self.board['id'], item=item)
 
     def sync(self, number, state):
         """`card` as best effort: the label is the queue's state, a failed card is put back by the next `cards`."""

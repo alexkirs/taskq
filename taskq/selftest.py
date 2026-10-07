@@ -316,18 +316,10 @@ class Selftest:
         busy = {iid for _, data, live in others if live for iid in data.get('created', [])}
         sessions = [(runtime, session) for data in runs for runtime, session in data.get('sessions', {}).items()]
 
-        def held(iid):
-            try:
-                return core.locks(iid)
-            except SystemExit as error:  # GitLab: the issue is deleted, its awards with it
-                if core.gone(error):
-                    return []
-                raise
-
         def issues_gone():
             closed = []
             for iid in created:
-                if held(iid):
+                if core.locks(iid):
                     core.unlock(iid)  # first: the GitHub lock ref outlives its issue
                 try:
                     core.api('DELETE', f'issues/{iid}')
@@ -340,7 +332,7 @@ class Selftest:
             left = [issue['iid'] for issue in core.issues(f'state=opened&labels={core.SELFTEST}') if issue['iid'] not in busy]
             if left:
                 raise SelftestError(f'open selftest issues remain: {left}')
-            locked = [iid for iid in created if held(iid)]
+            locked = [iid for iid in created if core.locks(iid)]
             if locked:
                 raise SelftestError(f'lock refs of selftest issues remain: {locked}')
             return f'deleted {sorted(set(created) - set(closed))}' + (f', closed (no right to delete) {closed}' if closed else '')

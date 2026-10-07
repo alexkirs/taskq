@@ -313,7 +313,7 @@ def cli_api(command, body, what):
         if os.environ.get('TASKQ_TRACE'):
             print(f'taskq trace: {what[:100]} {time.time() - started:.2f} s', file=sys.stderr)
         message = done.stderr.strip() or done.stdout.strip()
-        if not done.returncode:
+        if not done.returncode and not re.search(r'\(HTTP [45]\d\d\)', done.stderr):
             try:
                 return json.loads(done.stdout) if done.stdout.strip() else None
             except ValueError as error:
@@ -652,7 +652,12 @@ def lock(iid):
 
 
 def locks(iid):
-    return [item for item in api('GET', f'issues/{iid}/award_emoji?per_page=100') if item['name'] == LOCK]
+    try:
+        return [item for item in api('GET', f'issues/{iid}/award_emoji?per_page=100') if item['name'] == LOCK]
+    except SystemExit as error:
+        if gone(error):  # a deleted GitLab issue has no awards
+            return []
+        raise
 
 
 def unlock(iid):

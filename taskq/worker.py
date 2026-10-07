@@ -513,7 +513,12 @@ def claude_wake(session, prompt, extra=None):
 
 def view(args):
     """A task as the queue sees it, read only: state, claim, the last notes, the result."""
-    issue = core.api('GET', f'issues/{args.iid}')
+    try:
+        issue = core.api('GET', f'issues/{args.iid}')
+    except SystemExit as error:
+        if core.gone(error):
+            core.fail(f'#{args.iid} not found')
+        raise
     closed = issue['state'] != 'opened'  # close drops the state label
     labels = [label for label in issue['labels'] if not label.startswith(core.PREFIX)] + [core.PREFIX + core.STATES[0]] * closed
     item = core.parse({**issue, 'labels': labels if closed else issue['labels']}) or core.fail(f'#{args.iid} is not a taskq task')

@@ -605,6 +605,37 @@ class Cycle(unittest.TestCase):
                 store.run('GET', 'issues/7')
             self.assertEqual(answers, [good])
 
+    def test_http_stderr_overrides_zero_exit_but_message_field_is_data(self):
+        for cli in ('glab', 'gh'):
+            command = [cli, 'api', '-X', 'GET', 'issues/7']
+            with self.subTest(cli=cli), patch.object(q.subprocess, 'run') as run, patch.object(q.time, 'sleep'):
+                run.return_value = SimpleNamespace(returncode=0, stdout='{"message":"domain data"}', stderr='')
+                self.assertEqual(q.cli_api(command, None, 'read'), {'message': 'domain data'})
+                for status in (404, 403, 500):
+                    run.reset_mock()
+                    run.return_value = SimpleNamespace(returncode=0, stdout='{"message":"error"}',
+                                                       stderr=f'{cli}: error (HTTP {status})')
+                    with self.assertRaises(SystemExit) as error:
+                        q.cli_api(command, None, 'read')
+                    self.assertEqual(bool(q.gone(error.exception)), status == 404)
+                    self.assertEqual(run.call_count, 2 if status == 500 else 1)
+
+    def test_deleted_gitlab_issue_has_no_locks_and_view_names_not_found(self):
+        with patch.object(q, 'api', q.gitlab), patch.object(q.subprocess, 'run') as run:
+            run.return_value = SimpleNamespace(returncode=0, stdout='', stderr='')
+            q.api('DELETE', 'issues/7')
+            run.return_value = SimpleNamespace(returncode=0, stdout='{"message":"404 Not found"}',
+                                               stderr='glab: 404 Not found (HTTP 404)')
+            self.assertEqual(q.locks(7), [])
+            with self.assertRaisesRegex(SystemExit, '#7 not found'):
+                worker.view(SimpleNamespace(iid=7, notes=5))
+            run.return_value = SimpleNamespace(returncode=0, stdout='{"message":"Forbidden"}',
+                                               stderr='glab: Forbidden (HTTP 403)')
+            with self.assertRaisesRegex(SystemExit, 'HTTP 403'):
+                q.locks(7)
+            with self.assertRaisesRegex(SystemExit, 'HTTP 403'):
+                worker.view(SimpleNamespace(iid=7, notes=5))
+
     def test_ambiguous_mutation_is_not_replayed(self):
         """#155: a POST the store applied before a 502 runs once and fails saying so; a GraphQL query is still retried."""
         calls = []
@@ -2327,6 +2358,33 @@ class Selftest(unittest.TestCase):
         self.assertEqual(self.gitlab.tasks(), [live])  # the live run's task is not a leftover
         self.assertFalse(self.gitlab.locked())
         self.assertFalse(path.exists())
+
+    def test_cleanup_repeatedly_handles_zero_exit_http_404(self):
+        record = self.record(0, [7])
+        check = selftest.Selftest.__new__(selftest.Selftest)
+        check.args = SimpleNamespace(scope='quick')
+        check.record, check.rows, check.failed = record, [], None
+        deleted = False
+
+        def run(command, **kwargs):
+            nonlocal deleted
+            if command[0] != 'glab':
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
+            method = command[command.index('-X') + 1]
+            if deleted:
+                return SimpleNamespace(returncode=0, stdout='{"message":"404 Not found"}',
+                                       stderr='glab: 404 Not found (HTTP 404)')
+            if method == 'DELETE':
+                deleted = True
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
+            return SimpleNamespace(returncode=0, stdout='[]', stderr='')
+
+        with patch.object(q, 'api', q.gitlab), patch.object(q, 'issues', return_value=[]), \
+                patch.object(q.subprocess, 'run', run):
+            for _ in range(2):
+                check.clean()
+                self.assertTrue(deleted)
+                self.assertTrue(all(row[2] == 'ok' for row in check.rows), check.rows)
 
     def test_broken_worker_token_is_named_not_ok(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()) as out, patch.dict(os.environ, COORDINATOR):

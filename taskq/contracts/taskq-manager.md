@@ -84,6 +84,51 @@ adapts to it. **Windows (#139):** checkout and taskq in WSL, the Windows Claude 
 checkout as `//wsl.localhost/<distro>/…`; `doctor` checks trust under that key in the Windows `~/.claude.json` and whether
 `claude` is logged in. App import and the launchd timer are macOS only and say so elsewhere; the desktop app is optional.
 
+## Versioned PM report delivery (#191)
+
+The accepted [Wiki specification](https://github.com/alexkirs/taskq/wiki/Home/05cf6aab1c6ed5fc9589b9e4673365cec34c58e6#versioned-pm-tick-report-contract-191)
+is pinned at revision `05cf6aab1c6ed5fc9589b9e4673365cec34c58e6`. The packaged
+`pm-report-v1.md` is the immutable v1 schema/template implementing that decision;
+`taskq contract --report` delivers its full template, version and SHA-256.
+At first use, run that command; external PM `preflight --json` also includes it.
+Every tick includes `report` in JSON and a generated Board/Workers report in prose,
+even a quiet or failed source pass. Prompt version is separate from schema version.
+Show the generated report once per pass, including empty workers, timestamps,
+unknown/unavailable values and actionable validation gaps. A table-free channel
+uses labeled lines retaining every field/link. Add judgment after the report.
+`observed_at` is the conservative pass-start snapshot timestamp, never the output
+time: a pass longer than 15 minutes remains stale until a new observation. Retain
+`Source status:` and `Validation:` in channel readback, including an explicit empty
+validation list. Missing/hidden validation or reported blockers cannot verify as applied.
+
+After update, compare the current payload version/hash to the session's last
+actually applied report and apply it on the next safe pass. Keep work, claims and
+ownership; a report mismatch never authorizes a replacement worker or second timer.
+A duplicated payload is a repeated report, not permission to repeat its actions.
+An interrupted update leaves the last application unconfirmed; retain execution
+and retry a safe tick. Unsupported versions block obsolete report publication,
+not current work: run the existing updater and obtain a supported current payload.
+Never reconstruct obsolete output from memory or infer application from a checkout
+marker, a send's exit code, or a conversation turn.
+
+For verifiable application, obtain the actual supported-channel readback described
+in `pm-report-v1.md` and run `taskq report-verify <readback.json>`. It verifies version,
+hash, fields, timestamps, freshness and rendered data; it does not authenticate
+transport or create receipts. Retain the source message/session link and actual
+received/applied times. Without readback, status is `unknown/unqualified`, with the
+next action "obtain a supported-channel readback". Data gaps block dependent decisions
+only; do not erase truthful unknown values to pass validation.
+
+Qualification is separate: identical mocked schema/readback scenarios use fresh/already-running
+Claude, Codex and DOT labels, omissions, stale/unavailable sources, mismatch,
+duplicate delivery and interrupted update. Runtime labels in fixtures are not transport adapters or live PM evidence. No
+Claude/DOT/live Codex hot-update qualification is asserted by unit tests. The
+reported owner symptom (format omitted until reminder) is intake evidence, not a
+universal measured reproducer. Compare actual channel output to the generated report
+and record omitted fields/links per session before claiming an improvement.
+[Hermes extension #179](https://github.com/alexkirs/taskq/issues/179) remains separately
+qualified; this scope changes no Hermes adapter, transport, global governance or timers.
+
 ## 1. First use and check the place
 
 
@@ -325,9 +370,9 @@ Tool `CronCreate` (loaded via ToolSearch), `recurring: true`, `cron: "*/5 * * * 
 `prompt`:
 
 ```
-taskq tick prompt v2. Run `cd <main checkout> && taskq update; taskq tick --prompt-version 2`
+taskq tick prompt v3. Run `cd <main checkout> && taskq update; taskq tick --prompt-version 3`
 and do the coordinator pass by taskq-manager.md § 3 (`taskq contract` prints its path). Reply in the owner's language,
-one or two lines when nothing changed.
+include the generated PM report even when nothing changed; apply its version/hash on this safe pass.
 ```
 
 `--prompt-version` is the prompt's version: tick cannot see the prompt, so a timer armed with an older
@@ -379,10 +424,9 @@ machine's `close` (closed on the board or by hand). Every pass, with or without 
 checkout's Codex worker threads (named `T<N> …` by spawn, idle or notLoaded, unchanged for 10 min) that no open
 task claims: the task closed, or went ask → answer → ready and a new session continues it (`codex-archive` is
 reversible); one the Codex app holds archives itself in the app (#165, § Cleaning up finished work, item 3). Those
-steps go to stderr (the log). Stdout gets the
-tick's output only when something needs judgement: a review, a question, a problem, a board mismatch,
-an inbox issue, or a mechanical step that failed (section `Steps that failed`); the exit code is then
-1, else 0 and silent. With `--wake` a nonzero pass resumes the coordinator session with that output as
+steps go to stderr (the log). Stdout carries the versioned report on every pass. A review,
+a question, a problem, a board mismatch, an inbox issue, or a failed mechanical step
+(section `Steps that failed`) makes the exit code 1; otherwise it is 0. With `--wake` a nonzero pass resumes the coordinator session with that output as
 one turn (`claude --bg --resume <id> "<prompt + output>"`); the same set of items wakes it once, and a
 busy coordinator is woken by the next pass. The woken turn does § 3 on the given output and does not
 run `taskq tick` again (the steps are done; a second tick would spawn twice). The resumed session is a
@@ -686,7 +730,7 @@ Ask the owner items, and say how to rearm: "arm the tick" (§ 2). `tick --act` s
 cleanup itself and wakes the coordinator with the output, so only the report is left. A task in ask never counts
 as idle; any other pass starts the count over.
 
-**Reply to the owner.** When nothing changed — one or two lines. Do not write "no changes" without
+**Reply to the owner.** Include the generated versioned report once on every pass, even when nothing changed. Add one or two lines of judgment when nothing changed. Do not write "no changes" without
 running the command. Every task, worker session and commit named in a reply is a link the owner clicks,
 copied from the tick output: `[#N](<issue URL>)`, the session link of the "Workers" table, the
 `Commit:` link of a review. Never a bare `#N`, session id or sha: the owner's chat opens only http(s) links.

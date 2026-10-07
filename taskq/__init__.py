@@ -695,7 +695,9 @@ def age(item):
 
 def contract(args):
     """Where the contracts live: the queue (taskq.md) and the manager/coordinator session (taskq-manager.md)."""
-    print('\n'.join(str(path) for path in sorted(CONTRACTS.glob('*.md'))))
+    print('\n'.join(str(path) for path in sorted(CONTRACTS.glob('taskq*.md'))))
+    if getattr(args, 'report', False):
+        report_bootstrap()
 
 
 def git(*args, cwd=None):
@@ -770,7 +772,7 @@ from taskq.doctor import (  # noqa: E402
     PERMISSION_MODE, WORKER_ALLOW, permissions_missing, permissions_gap, trusted, setup, migrate, windows_claude_binary)
 from taskq.tick import (  # noqa: E402
     clone_warning, auto_update, question, TICK_MINUTES, TICK_LIVE_MINUTES, tick_beat, TICK_PROMPT_VERSION, TICK_PROMPT,
-    contract_seen, contract_news, profile_arguments, worker_prompt, BOARD_MOVES, board_fix, board_moves, session_link,
+    report_bootstrap, verify_report, contract_seen, contract_news, profile_arguments, worker_prompt, BOARD_MOVES, board_fix, board_moves, session_link,
     inbox_line, tick)
 from taskq.worker import (  # noqa: E402
     BRIEF, DELIVER, need_owner, doing_since, add, edit, later, listing, set_runtime, brief, worker, take, beat, ask,
@@ -780,9 +782,11 @@ from taskq.worker import (  # noqa: E402
 
 
 def record(args, action, **values):
-    """Structured events are collected only for --json; prose callers need no extra state."""
+    """Collect structured events for JSON and for the generated tick report."""
     if hasattr(args, 'output'):
         args.output['actions'].append({'action': action, **values})
+    elif hasattr(args, 'pm_report'):
+        args.pm_report['actions'].append({'action': action, **values})
 
 
 def json_command(args):
@@ -861,9 +865,10 @@ def main(argv=None):
     command('later', later, iid, text)
     command('edit', edit, iid, (('--deps',), {'nargs': '*', 'type': int}), (('--scope',), {'nargs': '*'}),
             (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}))
+    command('report-verify', verify_report, (('file',), {'help': 'supported-channel report readback JSON; no transport or receipt writes'}))
     command('tick', tick, json_flag, *profile_flags, (('--prompt-version',), {'type': int, 'metavar': 'N',
             'help': "the timer prompt's version (manager contract § 2); older ones are told to re-arm"}),
-            (('--act',), {'action': 'store_true', 'help': 'spawn, retire and nudge here; print only what needs judgement, exit 1 then'}),
+            (('--act',), {'action': 'store_true', 'help': 'spawn, retire and nudge here; report every pass, exit 1 for judgement'}),
             (('--wake',), {'action': 'store_true', 'help': 'with --act: give that output to the [coordinator] session (the launchd timer)'}),
             (('--install-timer',), {'action': 'store_true', 'help': 'launchd: tick --act --wake every 5 min from the main checkout'}),
             (('--uninstall-timer',), {'action': 'store_true', 'help': 'remove that launchd timer'}))
@@ -894,7 +899,7 @@ def main(argv=None):
         command(name, migrate, (('--project',), {'help': 'GitLab project path: writes a minimal taskq.toml here if none'}),
                 (('--github',), {'help': 'GitHub repository owner/name: writes a minimal taskq.toml here if none'}),
                 (('--host',), {'help': 'host for that taskq.toml, e.g. gitlab.example.com'}))
-    command('contract', contract)
+    command('contract', contract, (('--report',), {'action': 'store_true', 'help': 'deliver the current PM report template/version/hash'}))
     command('doctor', doctor, (('--fix',), {'action': 'store_true', 'help': 'set up what a command can (taskq.toml, labels, board); '
                                             'print each step only the person can do'}),
             (('--codex',), {'action': 'store_true', 'help': 'with --fix: also the Codex app project of this checkout'}))

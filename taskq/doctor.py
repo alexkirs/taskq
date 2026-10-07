@@ -119,6 +119,34 @@ def probe(command):
         return 1
 
 
+def api_read(command):
+    """(exit code, stderr) of a read-only authorized API call; a missing program or a timeout is a failure too."""
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        return done.returncode, done.stderr
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return 1, str(error)
+
+
+# ponytail: known transport wordings of gh/glab and Go's net package; an unknown one stays a login gap, as before.
+NETWORK = re.compile(r'error connecting to|dial tcp|no such host|could not resolve|connection refused|network is unreachable|timed? ?out', re.I)
+
+
+def login_gap(cli, host):
+    """#177: `auth status` also fails without network (seen live: «token invalid» in a sandbox that denied
+    api.github.com). One supported authorized read, `<cli> api user`, tells a network denial from a real login gap.
+    (what, fix), or None when the read succeeds. Reads only: no login, no credential written."""
+    hostname = ['--hostname', host] if host else []
+    code, stderr = api_read([cli, 'api', 'user', *hostname])
+    if not code:
+        return None
+    if NETWORK.search(stderr):
+        return (f'`{cli}` cannot reach {host or "the API"}: network denied or offline, not a login gap',
+                f'{shlex.join([cli, "api", "user", *hostname])}  (rerun with network access; do not run auth login for this)')
+    return (f'`{cli}` is not logged in{f" to {host}" if host else ""}',
+            f'{cli} auth login{f" --hostname {host}" if host else ""}  (the person runs it: OAuth in the browser)')
+
+
 def origin_of():
     """(host, path) of this checkout's `origin`, None without one."""
     found = re.match(r'(?:\w+://)?(?:[^@/]+@)?([^:/]+)(?::\d+)?[:/](.+?)(?:\.git)?/?$', core.git('remote', 'get-url', 'origin') or '')
@@ -183,8 +211,8 @@ def doctor(args, pending=()):
         status = probe([cli, 'auth', 'status', *(['--hostname', host] if host else [])])
         if status is None:
             gap(f'`{cli}` is not installed', f'brew install {cli}  (or the package manager of this machine)')
-        elif status:
-            gap(f'`{cli}` is not logged in{f" to {host}" if host else ""}', f'{cli} auth login{f" --hostname {host}" if host else ""}  (the person runs it: OAuth in the browser)')
+        elif status and (found := login_gap(cli, host)):
+            gap(*found)
     if gaps or not config:
         return report_gaps(gaps, pending)
     checks = (('write permission', lambda: write_access(github)), ('labels', queue_labels_missing),
@@ -475,8 +503,8 @@ def setup(args):
     if status is None:
         person(f'brew install {cli}', f'`{cli}` is not installed (or the package manager of this machine)')
         stop()
-    if status:
-        person(f'{cli} auth login{f" --hostname {host}" if host else ""}', 'the person logs in: OAuth in the browser')
+    if status and (found := login_gap(cli, host)):
+        person(found[1].split('  (')[0], found[0])
         stop()
     print(f'ok: {cli} logged in')
     if write_access(github):

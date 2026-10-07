@@ -2588,6 +2588,7 @@ class Doctor(unittest.TestCase):
         self.origin, self.status = 'git@gitlab.example.com:group/project.git', 0  # `glab auth status`: 0, 1 or None
         self.enterContext(patch.object(q, 'git', lambda *args, **kwargs: self.origin if args[:2] == ('remote', 'get-url') else None))
         self.enterContext(patch.object(doctor, 'probe', lambda command: self.status))
+        self.enterContext(patch.object(doctor, 'api_read', lambda command: (1, 'HTTP 401: Bad credentials')))  # #177: a real login gap
         self.enterContext(patch.object(q, 'LOCAL', Path(self.enterContext(tempfile.TemporaryDirectory())) / 'taskq.local.toml'))
         q.LOCAL.write_text('[profile]\nmine = false\n')
         self.enterContext(patch.object(q, 'ROOT', q.LOCAL.parent))
@@ -2850,7 +2851,8 @@ class Setup(unittest.TestCase):
         self.status, self.probes = 0, []
         self.enterContext(patch.object(q, 'git', lambda *args, **kwargs: self.origin if args[:2] == ('remote', 'get-url') else None))
         self.enterContext(patch.object(doctor, 'probe', lambda command: self.probes.append(command) or self.status))
-        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.object(doctor, 'api_read', lambda command: (1, 'HTTP 401: Bad credentials')))  # #177: a real login gap
+        self.tmp =Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(contextlib.chdir(self.tmp))
         self.enterContext(patch.object(q, 'CLAUDE_CONFIG', self.tmp / 'claude.json'))
         self.enterContext(patch.dict(os.environ, {'WSL_DISTRO_NAME': ''}))  # #166: not the real Windows claude of a WSL host

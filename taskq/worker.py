@@ -470,7 +470,7 @@ def preflight(args):
     ready = code == 0 and stdout.strip() == str(root)
     acknowledgement = {'status': 'ready' if ready else 'unknown',
                        'observed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                       'cwd': str(root), 'exit_code': code,
+                       'cwd': str(root), 'host': core.machine(), 'exit_code': code,
                        'stdout': stdout, 'stderr': stderr, 'source': 'local subprocess',
                        'exact_blocker': None if ready else blocker or 'Local command did not acknowledge the expected cwd',
                        'runtime_capability': 'unknown', 'effective_launch_policy': 'unknown'}

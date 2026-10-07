@@ -452,6 +452,10 @@ def spawn(args):
 
 def preflight(args):
     """A real, read-only local command ACK for an external PM; no worker, claim or policy changes."""
+    from taskq.tick import report_contract
+    contract = report_contract()
+    if hasattr(args, 'output'):
+        args.output['report_contract'] = contract
     root = core.ROOT.resolve()
     blocker = None
     try:
@@ -474,6 +478,7 @@ def preflight(args):
                        'stdout': stdout, 'stderr': stderr, 'source': 'local subprocess',
                        'exact_blocker': None if ready else blocker or 'Local command did not acknowledge the expected cwd',
                        'runtime_capability': 'unknown', 'effective_launch_policy': 'unknown'}
+    acknowledgement['report_contract'] = contract
     core.record(args, 'local_command_ack', **acknowledgement)
     print(json.dumps(acknowledgement))
     if acknowledgement['status'] != 'ready':

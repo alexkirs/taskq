@@ -1,5 +1,6 @@
 """`tick`: the coordinator's pass over the queue, board moves, the Workers table, the beat stamp."""
 import argparse
+from datetime import datetime, timezone
 import contextlib
 import errno
 import hashlib
@@ -72,11 +73,11 @@ def tick_beat():
               'end a long turn or background loops in the coordinator session, re-arm (manager contract § 2).')
 
 
-TICK_PROMPT_VERSION = 2  # raise with every change of TICK_PROMPT: an older --prompt-version gets the re-arm line
+TICK_PROMPT_VERSION = 3  # raise with every change of TICK_PROMPT: an older --prompt-version gets the re-arm line
 # The coordinator timer's prompt, word for word as in manager contract § 2 (a test keeps them equal).
 TICK_PROMPT = f"""taskq tick prompt v{TICK_PROMPT_VERSION}. Run `cd <main checkout> && taskq update; taskq tick --prompt-version {TICK_PROMPT_VERSION}`
 and do the coordinator pass by taskq-manager.md § 3 (`taskq contract` prints its path). Reply in the owner's language,
-one or two lines when nothing changed."""
+include the generated PM report even when nothing changed; apply its version/hash on this safe pass."""
 
 
 def contract_seen():
@@ -102,6 +103,158 @@ def contract_news(prompt_version):
         print(f'Your tick prompt is outdated (v{prompt_version or 1}, current v{TICK_PROMPT_VERSION}): re-arm with this prompt '
               '(CronDelete the old timer, CronCreate this one; manager contract § 2):\n\n'
               + ''.join(f'    {line}\n' for line in prompt.splitlines()))
+
+
+REPORT_VERSION = 1
+REPORT_SHA256 = 'a97cc42337da74014530a25091802dc3567f65d644426db93d2bd50079b82ff1'
+REPORT_SOURCE = 'https://github.com/alexkirs/taskq/wiki/Home/05cf6aab1c6ed5fc9589b9e4673365cec34c58e6#versioned-pm-tick-report-contract-191'
+
+
+def report_contract():
+    template = (core.CONTRACTS / 'pm-report-v1.md').read_bytes()
+    if hashlib.sha256(template).hexdigest() != REPORT_SHA256:
+        raise ValueError('PM report template hash mismatch; restore/update the package before publishing a report')
+    return {'version': REPORT_VERSION, 'sha256': REPORT_SHA256,
+            'source': REPORT_SOURCE, 'template': template.decode()}
+
+
+def report_bootstrap():
+    contract = report_contract()
+    print(f'PM report contract v{contract["version"]} sha256:{contract["sha256"]}\nSource: {contract["source"]}\n'
+          + contract['template'] + '\nReceived/applied: unknown until a supported-channel report is verified; '
+          'checkout markers and sends are not receipts.')
+
+
+def report_row(item, agents):
+    claim = item['claim'] or {}
+    activity = item.get('_report_activity', 'unknown')
+    sha = (item.get('result') or {}).get('sha')
+    return {'task': core.ref(item), 'title': ' '.join(item['title'].replace('|', '/').split()), 'state': item['state'],
+            'runtime': claim.get('runtime') or 'unknown', 'machine': core.where(claim).strip().lstrip('@') or 'unknown',
+            'session': session_link(claim, agents.get(claim['session'])) if claim.get('session') else 'unavailable', 'last_activity': activity,
+            'event_at': item.get('updated_at') or 'unknown',
+            'commit': f'[{sha}]({core.commit_url(item, sha)})' if sha and item.get('web_url') else 'unavailable'}
+
+
+def render_report(report):
+    contract = report['contract']
+    lines = [f'PM report v{contract["version"]} sha256:{contract["sha256"]}',
+             f'Source: {contract["source"]}', f'Repository: {report["repository"]}',
+             'Profile: ' + json.dumps(report['profile'], sort_keys=True),
+             f'Observed: {report["observed_at"]}; outcome: {report["outcome"]}',
+             f'Board: {report["board"]}', '## Workers',
+             '| Task | State | Runtime | Session | Last activity | Event time | Commit |',
+             '|---|---|---|---|---|---|---|']
+    for row in report['workers']:
+        lines.append(f'| {row["task"]} {row["title"]} | {row["state"]} | {row["runtime"]} @{row["machine"]} '
+                     f'| {row["session"]} | {row["last_activity"]} | {row["event_at"]} | {row["commit"]} |')
+    if not report['workers']:
+        lines.append('Workers: none' if report['source_status'] == 'available' else 'Workers: unknown (source unavailable)')
+    lines += ['Actions: ' + json.dumps(report['actions'], sort_keys=True),
+              'Refusals: ' + json.dumps(report['refusals']),
+              f'Source status: {report["source_status"]}; received/applied: unknown (verify supported-channel output).']
+    return '\n'.join(lines)
+
+
+def report_timestamp(value):
+    try:
+        at = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return at.timestamp() if at.tzinfo is not None and at.utcoffset().total_seconds() == 0 else None
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def validate_report(report, now=None):
+    """Validate data, never infer a session receipt from successful delivery."""
+    errors = []
+    required = ('contract', 'repository', 'profile', 'board', 'observed_at', 'outcome',
+                'actions', 'refusals', 'workers', 'source_status')
+    if not isinstance(report, dict) or any(key not in report for key in required):
+        return ['missing report fields']
+    expected = report_contract()
+    if not isinstance(report['contract'], dict) or any(report['contract'].get(key) != expected[key]
+                                                      for key in ('version', 'sha256', 'source')):
+        errors.append('unsupported report contract; run taskq update and apply the next safe tick')
+    def url(value):
+        return isinstance(value, str) and bool(re.search(r'https?://[^\s)]+', value))
+    observed = report_timestamp(report['observed_at'])
+    now = time.time() if now is None else now
+    if observed is None or not 0 <= now - observed <= TICK_LIVE_MINUTES * 60:
+        errors.append('invalid/stale observed_at; obtain a fresh tick')
+    if report['outcome'] not in ('ok', 'judgement_needed', 'failure', 'unknown', 'refused'):
+        errors.append('invalid outcome')
+    profile = report['profile']
+    if (not url(report['repository']) or not isinstance(profile, dict)
+            or any(key not in profile for key in ('filter', 'mine', 'limits'))):
+        errors.append('invalid repository/profile identity')
+    if not url(report['board']):
+        errors.append('board unavailable; verify board source before board decisions')
+    if report['source_status'] != 'available':
+        errors.append('source unavailable; preserve current work and retry next safe tick')
+    if not all(isinstance(report[key], list) for key in ('workers', 'actions', 'refusals')):
+        return errors + ['invalid report lists']
+    for row in report['workers']:
+        fields = ('task', 'title', 'state', 'runtime', 'machine', 'session', 'last_activity', 'event_at', 'commit')
+        if not isinstance(row, dict) or any(not isinstance(row.get(key), str) or not row[key] for key in fields):
+            errors.append('missing worker fields')
+            continue
+        if row['state'] not in (*core.STATES, 'unknown'):
+            errors.append('invalid worker state')
+        if not url(row['task']):
+            errors.append('worker task link missing')
+        if not url(row['session']):
+            errors.append('worker session link unavailable; use the printed attach/app reference')
+        if row['commit'] != 'unavailable' and not url(row['commit']):
+            errors.append('worker commit link missing')
+        event = report_timestamp(row['event_at'])
+        if event is None or (observed is not None and event > observed):
+            errors.append('worker event time unknown/invalid')
+        # An old issue update is truthful activity, not a stale observation of current state.
+    return errors
+
+
+def verify_report(args):
+    """Read an actual channel readback supplied by the adapter; no receipt store or transport."""
+    evidence = json.loads(Path(args.file).read_text())
+    if not isinstance(evidence, dict):
+        raise SystemExit('channel readback must be an object')
+    report = evidence.get('report')
+    errors = validate_report(report)
+    for key in ('runtime', 'session', 'source', 'received_at', 'applied_at', 'rendered'):
+        if not isinstance(evidence.get(key), str) or not evidence[key] or evidence[key] in ('unknown', 'unavailable'):
+            errors.append(f'channel acknowledgement missing {key}')
+    if isinstance(evidence.get('source'), str) and not re.match(r'https?://', evidence['source']):
+        errors.append('channel source link unavailable')
+    if not errors:
+        rendered = evidence['rendered']
+        # A table-free channel may copy every datum as labeled lines.
+        for value in (report['board'], report['repository'], report['observed_at'],
+                      str(report['contract']['version']), report['contract']['sha256'], report['contract']['source'],
+                      report['outcome'], json.dumps(report['profile'], sort_keys=True),
+                      json.dumps(report['actions'], sort_keys=True), json.dumps(report['refusals'])):
+            if value not in rendered:
+                errors.append('required report datum absent from channel readback')
+        for row in report['workers']:
+            if any(value not in rendered for value in row.values()):
+                errors.append('worker datum absent from channel readback')
+        if not report['workers'] and 'Workers: none' not in rendered:
+            errors.append('empty workers not explicit')
+        for key in ('received_at', 'applied_at'):
+            try:
+                at = report_timestamp(evidence[key])
+                if at is None or not report_timestamp(report['observed_at']) <= at <= time.time():
+                    raise ValueError()
+            except (TypeError, ValueError):
+                errors.append(f'invalid {key}')
+    if not errors and report_timestamp(evidence['received_at']) > report_timestamp(evidence['applied_at']):
+        errors.append('applied_at precedes received_at')
+    result = {'status': 'applied' if not errors else 'unknown', 'errors': errors,
+              'contract': report_contract(), 'source': evidence.get('source'),
+              'runtime': evidence.get('runtime'), 'session': evidence.get('session'),
+              'qualification': 'caller-supplied channel readback; transport authenticity requires separate evidence'}
+    print(json.dumps(result))
+    if errors:
+        raise SystemExit(1)
 
 
 def profile_arguments(args):
@@ -328,6 +481,10 @@ def tick(args):
             core.record(args, 'tick', status='refused', reason='another tick pass is running')
             if hasattr(args, 'output'):
                 args.output['refusals'].append('another tick pass is running')
+            report = new_report(args)
+            report['outcome'] = 'refused'
+            report['refusals'] = ['another tick pass is running; do not repeat dispatch']
+            emit_report(args, report)
             print('Skipped: another tick pass is running.', file=sys.stderr)
             return
         if args.act:
@@ -340,16 +497,16 @@ def tick(args):
 
 
 def act(args):
-    """#42 `tick --act`: the mechanical steps done here, stdout only for what needs judgement; exit 1 then.
+    """#42 `tick --act`: mechanical steps and a report every pass; exit 1/wake only for judgement.
     `--wake` (the launchd timer) also gives that output to the coordinator session as one turn."""
     with contextlib.redirect_stdout(io.StringIO()) as said:
         judgement = tick_pass(args, act=True)
     if hasattr(args, 'output') and judgement:
         args.output['outcome'] = 'failure' if any(event.get('status') == 'failed' for event in args.output['actions']) else 'judgement_needed'
         args.output['refusals'] = judgement
+    print(said.getvalue(), end='')
     if not judgement:
         return
-    print(said.getvalue(), end='')
     if args.wake:
         wake(said.getvalue(), judgement)
     sys.stdout.flush()
@@ -496,7 +653,52 @@ def archive_finished_codex(tasks, log, args=None):
             log(f'Kept {sid} ({name}) for a later pass: {core.codex_line(str(error))[:120]}')
 
 
+def new_report(args):
+    contract = report_contract()
+    host = core.HOST or ('github.com' if not core.BOARDS else None)
+    repo = f'https://{host}/{core.PROJECT_PATH}' if host else 'unavailable'
+    report = {'contract': contract, 'repository': repo, 'profile': {}, 'board': 'unavailable',
+              'observed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'outcome': 'unknown',
+              'actions': args.output['actions'] if hasattr(args, 'output') else [],
+              'refusals': [], 'workers': [], 'source_status': 'unavailable'}
+    args.pm_report = report
+    return report
+
+
 def tick_pass(args, act=False):
+    report = new_report(args)
+    try:
+        judgement = queue_pass(args, act)
+        report['outcome'] = ('failure' if any(event.get('status') == 'failed' for event in report['actions'])
+                             else 'judgement_needed' if judgement else 'ok')
+        report['refusals'] = judgement or []
+        return judgement
+    except (SystemExit, OSError, ValueError, subprocess.SubprocessError):
+        report['outcome'] = 'failure'
+        report['source_status'] = 'unavailable'
+        raise
+    finally:
+        emit_report(args, report)
+
+
+def emit_report(args, report):
+    if hasattr(args, 'output'):
+        report['actions'] = args.output['actions']
+        if args.output['refusals']:
+            report['refusals'] = args.output['refusals']
+        args.output['report'] = report
+    report['observed_at'] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    report['validation'] = validate_report(report)
+    print(render_report(report))
+    if report['validation']:
+        print('Report blockers: ' + '; '.join(report['validation']))
+    print('Apply this version on this safe pass. Preserve claims/current work; do not repeat dispatch '
+          'on duplicate delivery. Return version/hash plus the rendered report through the supported channel; '
+          'taskq report-verify <readback.json> validates the acknowledgement. Unsupported contract: '
+          'block obsolete publication, keep execution, run taskq update and retry next safe tick.')
+
+
+def queue_pass(args, act=False):
     """One pass of the coordinator: release dead claims itself, then print exactly what to do. `act` (#42): also
     spawn, retire and nudge here instead of printing those steps. Returns the items that need judgement."""
     log = lambda line: print(line, file=sys.stderr)  # an act step: the timer's log, never the coordinator's turn
@@ -522,6 +724,22 @@ def tick_pass(args, act=False):
     tick_beat()
     contract_news(args.prompt_version)
     loaded, candidates = core.profile(args)
+    args.pm_report['profile'] = args.profile
+    if issue := next((item for item in candidates if item.get('web_url')), None):
+        args.pm_report['repository'] = re.split(r'/(?:-/)?issues/', issue['web_url'])[0]
+    args.pm_report['source_status'] = 'available'
+    board = None
+    try:
+        if core.BOARDS:
+            board = next((board for board in core.api('GET', 'boards') if board['name'] == core.BOARD), None)
+            if board and args.pm_report['repository'] != 'unavailable':
+                args.pm_report['board'] = f'{args.pm_report["repository"]}/-/boards/{board["id"]}'
+        else:
+            board = core.api('GET', 'board')
+            if board:
+                args.pm_report['board'] = board['url']
+    except (SystemExit, OSError, ValueError, subprocess.SubprocessError) as error:
+        core.record(args, 'report_source', status='unknown', reason=f'board unavailable: {error}')
     selected = {item['iid'] for item in candidates}
     if hasattr(args, 'output'):
         args.output['profile'] = args.profile
@@ -535,6 +753,11 @@ def tick_pass(args, act=False):
     agents = core.claude_agents() if any(item['claim'].get('runtime') == 'claude' for item in loaded[0]
                                          if item['iid'] in selected and (item['claim'] or {}).get('session')) else {}
     alive = {item['iid']: liveness(item, agents) for item in doing}
+    for item in candidates:
+        if item['state'] in ('doing', 'ask', 'review'):
+            item['_report_activity'] = alive.get(item['iid'], (None, f'issue {core.age(item)} min ago'))[1]
+    args.pm_report['workers'] = [report_row(item, agents) for item in candidates
+                                 if item['state'] in ('doing', 'ask', 'review')]
     dead = [item for item in doing if alive[item['iid']][0] == 'dead' and not item.get('result')]
     stalled = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and alive.get(item['iid'], (None,))[0] is None
                and core.age(item) > core.STALE_MINUTES and (holder or core.local_claim(item['claim'] or {}))]
@@ -565,8 +788,7 @@ def tick_pass(args, act=False):
             core.record(args, 'unlock', task=issue['iid'])
             print(f'Unlocked {core.ref(issue)}: nobody holds it.')
     misplaced = []
-    if not core.BOARDS and core.api('GET', 'board'):
-        print(f'Board: {core.api("GET", "board")["url"]}')
+    if not core.BOARDS and board:
         executed, misplaced = board_moves(loaded[0], selected)
         loaded = core.load() if executed else loaded
     # Only tick moves ready<->waiting: a card a hand moved between them goes back here.
@@ -617,17 +839,14 @@ def tick_pass(args, act=False):
     print(inbox_line(inbox), end='')
     # #83: one table of every worker; the owner's chat opens only http(s) links.
     workers = [item for item in everything if item['state'] in ('doing', 'ask', 'review') and (item['claim'] or {}).get('session')]
-    idle, claude_idle, rows = [], [], []
+    idle, claude_idle = [], []
     for item in workers:
         session, runtime = item['claim']['session'], item['claim'].get('runtime')
         state, activity = alive.get(item['iid']) or liveness(item, agents)
+        item['_report_activity'] = activity
         if state == 'idle' and item['state'] == 'doing' and not item.get('result'):
             (claude_idle if runtime == 'claude' else idle).append(item)
-        rows.append(f'| {core.ref(item)} {item["title"][:40].replace("|", "/")} | {item["state"]} | {runtime}{core.where(item["claim"])} '
-                    f'| {session_link(item["claim"], agents.get(session))} | {activity} |')
-    if rows:
-        print('## Workers\n\nShow the owner this table as printed; every link opens in a browser:\n\n'
-              '| Task | State | Runtime | Session | Last activity |\n|---|---|---|---|---|\n' + '\n'.join(rows) + '\n')
+    args.pm_report['workers'] = [report_row(item, agents) for item in everything if item['state'] in ('doing', 'ask', 'review')]
     permissions = [item['_runtime_observation'] for item in workers if item.get('_runtime_observation', {}).get('status') == 'waiting_permission']
     for item in workers:
         if observation := item.get('_runtime_observation'):

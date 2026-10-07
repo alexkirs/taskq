@@ -1815,7 +1815,7 @@ class Cycle(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())['refusals'], ['tracker unavailable'])
 
     def test_tick_act_does_the_mechanical_steps_and_exits_1_only_for_judgement(self):
-        """#42: spawn, nudge and retire happen in --act; stdout and exit 1 only for review, ask, problems, mismatch, inbox."""
+        """#42/#191: report every pass; exit 1/wake only for judgement; mechanical work stays once per pass."""
         def act(*flags):
             with contextlib.redirect_stderr(io.StringIO()) as log:
                 try:
@@ -1826,16 +1826,22 @@ class Cycle(unittest.TestCase):
         self.enterContext(patch.object(q, 'spawn', lambda args: spawned.append(args.name)))
         self.enterContext(patch.object(q, 'codex_send', lambda args: sent.append(args.thread)))
         self.enterContext(patch.object(q, 'claude_wake', lambda session, prompt: woken.append((session, prompt))))
-        self.assertEqual(act(), ('', 0, ''))
+        output, status, log = act()
+        self.assertEqual((status, log), (0, ''))
+        self.assertEqual(output.count('## Workers'), 1)
+        self.assertIn('Workers: none', output)
         code, idle = self.add('--type', 'code', '--runtime', 'claude'), self.add('--type', 'asset')
         output, status, log = act()
-        self.assertEqual((output, status), ('', 0))
+        self.assertEqual(status, 0)
+        self.assertEqual(output.count('## Workers'), 1)
         self.assertEqual(spawned, [f'T{code} t', f'T{idle} t'])
         self.assertIn('Done: spawn a claude worker for', log)
         self.do(CLAUDE, 'take', code)
         self.do(CODEX, 'take', idle)
         self.codex.turns = [{'id': 'finished', 'status': 'completed'}]
-        self.assertEqual(act()[:2], ('', 0))
+        output, status, _ = act()
+        self.assertEqual(status, 0)
+        self.assertEqual(output.count('## Workers'), 1)
         self.assertEqual(sent, ['codex-session'])  # the fixed idle nudge, no coordinator turn
         # A review needs judgement: printed, exit 1; --wake gives it to the coordinator once per set of items.
         self.do(CLAUDE, 'result', code, '--sha', 'abc1234', '--text', 'x', '--checks', 'x')
@@ -3148,7 +3154,7 @@ class TickBeat(unittest.TestCase):
         self.assertEqual(second.getvalue(), '')
         self.assertIn('(0000000→', changed.getvalue())
         self.assertEqual(changed.getvalue().count('re-read § 3'), 1)
-        self.assertIn('Your tick prompt is outdated (v1, current v2)', changed.getvalue())
+        self.assertIn(f'Your tick prompt is outdated (v1, current v{q.TICK_PROMPT_VERSION})', changed.getvalue())
         self.assertIn(f'cd {q.ROOT} && taskq update; taskq tick --prompt-version {q.TICK_PROMPT_VERSION}', changed.getvalue())
 
     def test_install_timer_writes_a_launchd_agent_and_records_the_coordinator(self):

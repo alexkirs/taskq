@@ -2,7 +2,8 @@
 
 Bounded delivery against Wiki spec revision `6b9027b29bf43d18a24d2cc96ef98d314f396794`
 (§ Minimal critical path, #185). Scope: standalone macOS TaskQ, one checkout, fixtures plus read-only
-observations. No timer was armed, no worker spawned, no configuration changed. Every live gate below
+observations, and three narrow fixes in `taskq/tick.py` (`wake`, `starts`)
+approved on review. No timer was armed, no worker spawned, no configuration changed. Every live gate below
 stays `unknown`/unqualified until a real supported send and receive is shown.
 
 ## Separation with existing mechanisms
@@ -23,33 +24,24 @@ proven cause.
 
 ## What the fixtures show
 
-`python3 -m unittest discover -s tests -p test_pm_tick_separation.py` (13 tests, 3 expected failures):
+`python3 -m unittest discover -s tests -p test_pm_tick_separation.py` (16 tests). Inventory rows have the
+real `claude agents --json --all` shape (`id`, `cwd`, `kind`, `startedAt`, `sessionId`, `name`, `state`,
+plus `pid`/`status` while running).
 
 | Acceptance | Existing mechanism | Fixture |
 |---|---|---|
 | One timer owner per project, explicit handoff | One launchd label per checkout (`taskq.<checkout name>`); each install boots out the old agent first. `[coordinator]` is written only when absent. | A second install from another session keeps the recorded owner and leaves one agent. Editing `[coordinator] session` moves the wake target. |
-| TICK carries project identity | In-session: TICK_PROMPT names `cd <main checkout>`. launchd: `WorkingDirectory` is the main checkout; the wake target comes from that checkout's local file. | Both asserted. The wake text itself names no project: Gap 3. |
+| TICK carries project identity | In-session: TICK_PROMPT names `cd <main checkout>`. launchd: `WorkingDirectory` is the main checkout. The wake turn starts with `Project <repo>, main checkout <path>.` | All three asserted. |
 | Delivery receipt is not a completed pass | `wake` writes the judgement key only after `claude_wake` returns. | A failed delivery writes no key and is retried. A delivered wake leaves only that key: the PM's completed pass is never read back (`unknown`). |
 | Duplicate/coalesced TICK, one pass per project | Non-blocking checkout lock; judgement-key dedup; busy PM skipped. | Three manual TICKs during a slow timer pass return in under 1 s, each `Skipped: another tick pass is running.`; `--json` reports the refusal with outcome `ok`. Same items wake once; new items wake again. |
-| PM stays responsive | A busy PM gets no turn; the key is not written. | Busy PM: no wake, next tick delivers. |
-| Restart, interrupted sender/receiver | Lock file survives a killed holder; claims and take's lock decide. | A killed holder does not block the next pass. A taken task is not started again. Spawn before take: Gap 2. |
+| PM stays responsive, also after a resume | A busy PM gets no turn. Busy means the recorded session busy, or a `working`/`blocked` job with the recorded session's name whose `cwd` is this checkout (`claude --bg --resume` runs under a new session id, #182). | Resumed PM busy or blocked under a new id: not woken. Same name in another checkout, a terminal job, an idle job, another name: woken, and always the recorded session (conversation identity). Unreachable inventory (empty list): delivery attempted, receipt only on success. |
+| Restart, interrupted sender/receiver | Lock file survives a killed holder; claims and take's lock decide. `starts` skips a ready task whose `T<N> ` Claude job of this checkout is alive (`working`, or `blocked` without pid). | A killed holder does not block the next pass. A taken task is not started again. A spawned, not yet taken worker (working or blocked) is not spawned again and no claim is invented. A terminal or stopped job, another checkout, another task number, or an unreachable inventory does not hold the start. |
 | Stale observations, busy/failed projects | Existing tests: `TickBeat` (stale or second armed timer named), `test_tick_codex_unavailable_does_not_stop_other_coordinator_work`, #176 `test_permission_qualification.py`. | Consumed, not duplicated. |
 
-## Gaps (scope extension requested, not implemented here)
-
-1. **Resumed PM under a new session id.** `claude --bg --resume` continues the conversation under a new
-   session id with the same name (#182 evidence; `claude agents` here also lists two `T177` jobs with
-   different session ids). `wake` checks busy only for the recorded id. A second wake therefore resumes
-   the old id beside the busy new one: two active PM turns. Minimal change in `taskq/tick.py` `wake`:
-   treat the PM as busy when any `claude agents` job with the recorded session's name is busy, and
-   keep the recorded id as the conversation identity.
-2. **Spawned but not yet taken.** A TICK between spawn and take (manual TICK after the timer, restart)
-   starts a second worker for the same task. take's lock keeps one claim; the second worker runs
-   `taskq worker` again and can take another task. Minimal change in `taskq/tick.py` `starts`: skip a
-   ready task whose `T<N> ` worker session is alive on this machine.
-3. **Wake text without project identity.** The wake turn names no checkout or repository; only its
-   target session binds it to the project. Payload identity is #191's report-contract scope; adding
-   the main checkout to `WAKE_PROMPT` is the one-line alternative.
+Limits of these fixes: a Codex worker spawned but not taken is not detected (a `thread/list` read; Claude is
+the default worker runtime). An interactive (non-background) PM session is not in the background inventory
+`claude_agents` reads, so its busy state is not seen. With an unreachable inventory busy is unknown and the
+wake is attempted, as before.
 
 ## Live gates (unqualified)
 

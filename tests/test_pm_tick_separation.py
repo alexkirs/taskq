@@ -1,7 +1,7 @@
 """#185 fixtures: the five-minute TICK runs apart from the interactive PM session. Existing mechanisms only:
 the launchd timer (`tick --install-timer`), the checkout's tick lock, `wake` into the [coordinator] session.
-No timer is armed, no worker spawned, no live session touched. `expectedFailure` marks a gap that needs a
-code change outside this task's scope (docs/pm-tick-separation.md, Gaps)."""
+No timer is armed, no worker spawned, no live session touched. The inventory rows have the shape of
+`claude agents --json --all` (CLI 2.1.x); live delivery stays unqualified (docs/pm-tick-separation.md)."""
 import contextlib
 import io
 import json
@@ -17,6 +17,13 @@ from unittest.mock import Mock, patch
 
 import test_taskq as base  # the in-memory GitLab cycle; run with `discover -s tests`
 from test_taskq import CLAUDE, COORDINATOR, q, tick
+
+
+def job(session, name, cwd=None, state='working', **extra):
+    """One background row of `claude agents --json --all`: a running job also has pid and status."""
+    running = {'pid': 4242, 'status': 'busy' if state == 'working' else 'idle'} if state not in ('done', 'failed', 'stopped', 'blocked') else {}
+    return {session: {'id': session[:8], 'cwd': str(cwd or q.ROOT), 'kind': 'background', 'startedAt': 1791398637752,
+                      'sessionId': session, 'name': name, 'state': state, **running, **extra}}
 
 
 class TimerOwner(unittest.TestCase):
@@ -64,10 +71,12 @@ class TimerOwner(unittest.TestCase):
         agent = plistlib.loads(next((self.tmp / 'Library/LaunchAgents').iterdir()).read_bytes())
         self.assertEqual((agent['WorkingDirectory'], agent['ProgramArguments'][1:]), (str(q.ROOT), ['-m', 'taskq', 'tick', '--act', '--wake']))
 
-    @unittest.expectedFailure
-    def test_gap_wake_turn_names_the_project(self):
-        """Gap 3: the wake turn's text names no checkout or repository; only its target session binds it."""
-        self.assertIn(str(q.ROOT), tick.WAKE_PROMPT)
+    def test_wake_turn_names_the_project(self):
+        with patch.object(q, 'personal', return_value={'coordinator': {'session': 'pm-a'}}), \
+             patch.object(q, 'claude_agents', return_value={}), patch.object(q, 'claude_wake') as wake, \
+             patch.object(tick, 'woken', return_value=self.tmp / 'woken'), contextlib.redirect_stdout(io.StringIO()):
+            tick.wake('output', ['review 1 abc'])
+        self.assertTrue(wake.call_args[0][1].startswith(f'Project {q.PROJECT_PATH}, main checkout {q.ROOT}. {tick.WAKE_PROMPT}'))
 
 
 class Wake(unittest.TestCase):
@@ -116,16 +125,36 @@ class Wake(unittest.TestCase):
         self.wake(['review 1 abc'])
         self.assertTrue(tick.woken().read_text().strip())
         self.assertEqual(self.send.call_args[0][0], 'pm-a')
-        self.assertTrue(self.send.call_args[0][1].startswith(tick.WAKE_PROMPT))
+        self.assertIn(tick.WAKE_PROMPT, self.send.call_args[0][1])
 
-    @unittest.expectedFailure
-    def test_gap_resumed_pm_is_busy_under_a_new_session_id(self):
-        """Gap 1 (#182 evidence): `claude --bg --resume` runs under a new session id with the same name. The
-        busy check reads only the recorded id, so a second wake resumes the old id beside the busy one."""
-        self.agents = {'pm-a': {'sessionId': 'pm-a', 'name': 'PM', 'state': 'done'},
-                       'pm-b': {'sessionId': 'pm-b', 'name': 'PM', 'pid': 2, 'status': 'busy'}}
-        self.wake(['review 1 abc', 'ask 2'])
-        self.send.assert_not_called()
+    def test_resumed_pm_busy_or_blocked_under_a_new_session_id_is_not_woken(self):
+        """#182 evidence: `claude --bg --resume` goes on under a new session id with the same name."""
+        for state in ('working', 'blocked'):
+            with self.subTest(state):
+                self.agents = {**job('pm-a', 'PM (mac)', state='done'), **job('pm-b', 'PM (mac)', state=state)}
+                self.assertIn('The coordinator is busy', self.wake(['review 1 abc']))
+                self.send.assert_not_called()
+
+    def test_same_name_in_another_project_terminal_or_idle_does_not_block(self):
+        """Names are a correlation, not proof: only a live job of this checkout counts."""
+        with tempfile.TemporaryDirectory() as other:
+            cases = {'other project': job('pm-b', 'PM (mac)', cwd=other),
+                     'terminal': job('pm-b', 'PM (mac)', state='failed'),
+                     'idle': job('pm-b', 'PM (mac)', state='done', pid=7, status='idle'),
+                     'other name': job('pm-b', 'T12 work (mac)')}
+            for case, row in cases.items():
+                with self.subTest(case):
+                    tick.woken().unlink(missing_ok=True)
+                    self.send.reset_mock()
+                    self.agents = {**job('pm-a', 'PM (mac)', state='done'), **row}
+                    self.assertIn('Woke the coordinator pm-a.', self.wake(['review 1 abc']))
+                    self.assertEqual(self.send.call_args[0][0], 'pm-a')  # the recorded conversation identity
+
+    def test_unreachable_inventory_falls_back_to_the_recorded_session(self):
+        """`claude agents` failing lists nothing: busy is then unknown; the delivery is attempted and only its
+        own failure (claude_wake raising) withholds the receipt."""
+        self.agents = {}
+        self.assertIn('Woke the coordinator pm-a.', self.wake(['review 1 abc']))
 
 
 @unittest.skipIf(os.name == 'nt', 'flock holder; Windows locking: test_taskq TickBeat')
@@ -193,13 +222,29 @@ class Restart(unittest.TestCase):
         self.assertEqual(self.act(), [])
         self.assertIn('cannot start: state is doing', base.Cycle.refused(self, COORDINATOR, 'take', iid))
 
-    @unittest.expectedFailure
-    def test_gap_spawned_not_yet_taken_is_spawned_again(self):
-        """Gap 2: a TICK between spawn and take (manual TICK, restart) spawns a second worker. take's lock
-        keeps one claim; the loser runs `worker` again and may take another task."""
+    def test_spawned_not_yet_taken_is_not_spawned_again(self):
+        """A TICK between spawn and take (manual TICK, restart) sees the live `T<N>` job of this checkout."""
         iid = self.add('--type', 'research', '--runtime', 'claude')
         self.assertEqual(self.act(), [f'T{iid} t'])
-        self.assertEqual(self.act(), [])
+        for state in ('working', 'blocked'):
+            with self.subTest(state):
+                self.agents = job('worker-1', f'T{iid} t (mac-1)', state=state)
+                self.assertEqual(self.act(), [])
+                self.assertEqual(self.state(iid), 'ready')  # no claim invented
+        self.assertIn('not started again', self.do(COORDINATOR, 'tick'))
+
+    def test_dead_other_project_or_other_task_worker_does_not_hold_a_start(self):
+        iid = self.add('--type', 'research', '--runtime', 'claude')
+        with tempfile.TemporaryDirectory() as other:
+            cases = {'terminal': job('w', f'T{iid} t (mac-1)', state='failed'),
+                     'stopped without pid': job('w', f'T{iid} t (mac-1)', state='stopped'),
+                     'other project': job('w', f'T{iid} t (mac-1)', cwd=other),
+                     'other task': job('w', f'T{iid}0 t (mac-1)'),
+                     'unreachable inventory': {}}
+            for case, rows in cases.items():
+                with self.subTest(case):
+                    self.agents = rows
+                    self.assertEqual(self.act(), [f'T{iid} t'])
 
 
 if __name__ == '__main__':

@@ -217,12 +217,28 @@ WAKE_PROMPT = ('taskq tick --act (the launchd timer) found what needs judgement;
                '`taskq tick` again in this turn. Reply in the owner\'s language.\n\n')
 
 
+def local(agent):
+    """A `claude agents` job of this checkout: names are only a correlation, the cwd binds it to the project."""
+    return bool(agent.get('cwd')) and Path(agent['cwd']).resolve() == core.ROOT.resolve()
+
+
+def alive(agent):
+    """Running or waiting on the owner (#176: blocked counts without pid); a terminal state or no pid is not."""
+    return agent.get('state') == 'blocked' or bool(agent.get('pid')) and agent.get('state') not in CLAUDE_ENDED
+
+
 def starts(args, loaded, selected):
     """The tasks to start on this machine now, each with its runtime, within this machine's free places."""
     free, start = core.room(loaded[0], args.profile['limits']), []
     preferred = args.profile['preferred_runtime']
-    for item in core.startable(loaded=loaded):
-        if item['iid'] not in selected:
+    ready = [item for item in core.startable(loaded=loaded) if item['iid'] in selected]
+    # #185: a worker spawned by an earlier pass that has not taken its task yet (a manual TICK, a restart) is
+    # not spawned again. ponytail: Claude only; a Codex worker is a `thread/list` read, add it when one doubles.
+    spawned = {int(name[1]) for agent in (core.claude_agents() if ready else {}).values()
+               if local(agent) and alive(agent) and (name := re.match(r'T(\d+) ', agent.get('name') or ''))}
+    for item in ready:
+        if item['iid'] in spawned:
+            print(f'{core.ref(item)}: its worker is already running here, not taken yet; not started again.')
             continue
         # The preferred runtime only breaks the tie for the user's own `any` task, and only while it has a free slot.
         own = item.get('assignees') == [args.profile['uid']] and preferred and free.get(preferred, 0) > 0
@@ -315,9 +331,14 @@ def wake(output, judgement):
     key = hashlib.sha256('\n'.join(judgement).encode()).hexdigest()[:12]
     if woken().exists() and woken().read_text().strip() == key:
         return print('\nThe coordinator was already woken for these items.')
-    if (core.claude_agents().get(session) or {}).get('status') == 'busy':
+    agents = core.claude_agents()
+    name = (agents.get(session) or {}).get('name')
+    # #185: `claude --bg --resume` goes on under a new session id with the same name (#182): a busy or blocked
+    # job of that name in this checkout is the coordinator too. Another checkout's job of the same name is not.
+    if any(agent.get('status') == 'busy' or agent.get('state') == 'blocked' for sid, agent in agents.items()
+           if sid == session or name and agent.get('name') == name and local(agent)):
         return print('\nThe coordinator is busy: the next tick wakes it.')
-    core.claude_wake(session, WAKE_PROMPT + output)
+    core.claude_wake(session, f'Project {core.PROJECT_PATH}, main checkout {core.ROOT}. ' + WAKE_PROMPT + output)
     woken().write_text(key + '\n')
     print(f'\nWoke the coordinator {session}.')
 

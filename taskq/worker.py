@@ -587,13 +587,18 @@ def claude_spawn(name, extra=None, prompt=None, remote_control=True):
 CLAUDE_ENDED = ('done', 'failed', 'stopped')  # `claude agents` states with no way back but a resume
 
 
-def claude_agents():
-    """This machine's `claude --bg` sessions by session id, stopped ones too (no `pid`)."""
-    try:  # a machine without the claude CLI (CI, a Codex-only machine) has none
+def claude_agents(strict=False):
+    """This machine's `claude --bg` sessions by session id, stopped ones too (no `pid`). `strict` (#185): None when
+    the CLI is there but its list could not be read, which is unknown, not an empty machine."""
+    try:
         done = subprocess.run(['claude', 'agents', '--json', '--all'], cwd=core.ROOT, capture_output=True, text=True, timeout=60)
-        listed = json.loads(done.stdout) if not done.returncode else []
-    except (OSError, subprocess.SubprocessError, ValueError):
+        listed = json.loads(done.stdout) if not done.returncode else None
+    except FileNotFoundError:  # a machine without the claude CLI (CI, a Codex-only machine) has none
         listed = []
+    except (OSError, subprocess.SubprocessError, ValueError):
+        listed = None
+    if not isinstance(listed, list):
+        return None if strict else {}
     return {item['sessionId']: item for item in listed if item.get('kind') == 'background' and item.get('sessionId')}
 
 

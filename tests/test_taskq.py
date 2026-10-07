@@ -349,8 +349,8 @@ class Cycle(unittest.TestCase):
         self.agents = {}  # `claude agents --json --all`, by session id
         self.enterContext(patch.object(q, 'TICK_BEAT', self.directory / 'beat'))  # not the real coordinator's
         self.enterContext(patch.object(q, 'CLAUDE_JOBS', self.directory / 'jobs'))
-        for module, target, value in ((q, 'api', self.gitlab), (q, 'claude_agents', lambda: self.agents),
-                                      (worker, 'claude_agents', lambda: self.agents),
+        for module, target, value in ((q, 'api', self.gitlab), (q, 'claude_agents', lambda **kwargs: self.agents),
+                                      (worker, 'claude_agents', lambda **kwargs: self.agents),
                                       (q, 'Codex', lambda **kwargs: self.codex), (codex, 'Codex', lambda **kwargs: self.codex),
                                       (codex, 'CodexIpc', lambda **kwargs: self.ipc)):
             patcher = patch.object(module, target, value)
@@ -2083,8 +2083,8 @@ class GithubCycle(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.enterContext(patch.object(q, 'CLAUDE_JOBS', Path(directory.name) / 'jobs'))
-        self.enterContext(patch.object(q, 'claude_agents', dict))
-        self.enterContext(patch.object(worker, 'claude_agents', dict))
+        self.enterContext(patch.object(q, 'claude_agents', lambda **kwargs: {}))
+        self.enterContext(patch.object(worker, 'claude_agents', lambda **kwargs: {}))
         self.enterContext(patch.object(q, 'TICK_BEAT', Path(directory.name) / 'beat'))
 
     def test_tick_links_tasks_sessions_and_commits(self):
@@ -3418,8 +3418,8 @@ class Cleanup(unittest.TestCase):
         self.addCleanup(os.chdir, self.before_cwd)
         # Explicit patches keep app and issue reads outside these disposable Git fixtures.
         for target, name, value in ((cleanup, 'cleanup_issues', lambda: self.issues), (q, 'claude_sessions', lambda: self.app),
-                                    (q, 'claude_agents', lambda: self.agents),
-                                      (worker, 'claude_agents', lambda: self.agents),
+                                    (q, 'claude_agents', lambda **kwargs: self.agents),
+                                      (worker, 'claude_agents', lambda **kwargs: self.agents),
                                     (cleanup, 'cleanup_codex', lambda roots: self.threads),
                                     (q, 'HELPERS', q.HELPERS if HELPERS else None),
                                     *([(sys.modules['host_tools'], 'live_paths', lambda: [])] if HELPERS

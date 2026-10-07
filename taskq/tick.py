@@ -232,20 +232,24 @@ def busy(agent):
     return agent.get('state') in ('working', 'blocked') or agent.get('status') == 'busy'
 
 
-def codex_spawned():
-    """#185: iids of this checkout's live `T<N> ` Codex threads (active, idle or notLoaded: a worker before its take;
-    archived threads are not listed), from the read-only `thread/list` that cleanup and the archive pass read.
-    None: the inventory is unreachable, so no task can be shown to have no worker."""
+def worker_iid(name):
+    found = re.match(r'T(\d+) ', name or '')  # spawn names a worker `T<N> <title>`
+    return found and int(found[1])
+
+
+def codex_workers():
+    """#185: (iid, thread id) of this checkout's live `T<N> ` Codex threads (active, idle or notLoaded; archived ones
+    are not listed), from the read-only `thread/list` that cleanup and the archive pass read. None: unreachable."""
     if not core.CODEX_SOCKET.exists():
-        return set()  # no app server here: no Codex worker of this machine
+        return []  # no app server here: no Codex worker of this machine
     from taskq.cleanup import cleanup_codex
     root = core.ROOT.resolve()
     try:
         threads = cleanup_codex({root})
     except (OSError, SystemExit, ValueError):
         return None
-    return {int(name[1]) for thread in threads.values() if Path(thread.get('cwd') or '/').resolve() == root
-            and (thread.get('status') or {}).get('type') != 'systemError' and (name := re.match(r'T(\d+) ', thread.get('name') or ''))}
+    return [(iid, sid) for sid, thread in threads.items() if Path(thread.get('cwd') or '/').resolve() == root
+            and (thread.get('status') or {}).get('type') != 'systemError' and (iid := worker_iid(thread.get('name')))]
 
 
 def starts(args, loaded, selected):
@@ -253,17 +257,24 @@ def starts(args, loaded, selected):
     free, start = core.room(loaded[0], args.profile['limits']), []
     preferred = args.profile['preferred_runtime']
     ready = [item for item in core.startable(loaded=loaded) if item['iid'] in selected]
-    # #185: a worker spawned by an earlier pass that has not taken its task yet (a manual TICK, a restart) is
-    # not spawned again. ponytail: `claude agents` failing lists nothing, like a machine without Claude workers.
-    spawned = {int(name[1]) for agent in (core.claude_agents() if ready else {}).values()
-               if local(agent) and alive(agent) and (name := re.match(r'T(\d+) ', agent.get('name') or ''))}
-    codex = codex_spawned() if ready else set()
+    # #185: a worker spawned by an earlier pass that has not taken its task yet (a manual TICK, a restart) is not
+    # spawned again, and holds its runtime's place like a claim. An unreadable inventory holds what it could hide.
+    agents, codex = (core.claude_agents(strict=True), codex_workers()) if ready else ({}, [])
+    live = ([('claude', iid, sid) for sid, agent in (agents or {}).items() if local(agent) and alive(agent) and (iid := worker_iid(agent.get('name')))]
+            + [('codex', iid, sid) for iid, sid in codex or []])
+    claimed = {(item['claim'] or {}).get('session') for item in loaded[0]}
+    for runtime, _, session in live:
+        if session not in claimed and runtime in free:  # a claimed one is counted by room (doing) already
+            free[runtime] -= 1
+    spawned = {iid for _, iid, _ in live}
+    unknown = {'claude': agents is None, 'codex': codex is None}
     for item in ready:
-        if item['iid'] in spawned | (codex or set()):
+        if item['iid'] in spawned:
             print(f'{core.ref(item)}: its worker is already running here, not taken yet; not started again.')
             continue
-        if codex is None and item['runtime'] != 'claude':  # only a task pinned to Claude cannot have a Codex worker
-            print(f'{core.ref(item)}: Codex threads unreadable, a worker may be running before its take; not started this pass.')
+        hidden = [name for name, gone in unknown.items() if gone and item['runtime'] in (None, name)]
+        if hidden:
+            print(f'{core.ref(item)}: {" and ".join(hidden)} workers unreadable, one may be running before its take; not started this pass.')
             continue
         # The preferred runtime only breaks the tie for the user's own `any` task, and only while it has a free slot.
         own = item.get('assignees') == [args.profile['uid']] and preferred and free.get(preferred, 0) > 0
@@ -353,7 +364,7 @@ def wake(output, judgement):
     session = core.personal().get('coordinator', {}).get('session')
     if not session:
         return print(f'\nNo coordinator to wake: no [coordinator] session in {core.LOCAL} (manager contract § 2).')
-    key = hashlib.sha256('\n'.join(judgement).encode()).hexdigest()[:12]
+    key = hashlib.sha256('\n'.join([session, *judgement]).encode()).hexdigest()[:12]  # #185: a handoff wakes the new owner
     if woken().exists() and woken().read_text().strip() == key:
         return print('\nThe coordinator was already woken for these items.')
     agents = core.claude_agents()

@@ -55,13 +55,17 @@ class TimerOwner(unittest.TestCase):
         self.assertIn('It wakes the coordinator session pm-a.', output)
         self.assertEqual(q.LOCAL.read_text().count('[coordinator]'), 1)
 
-    def test_explicit_handoff_moves_the_wake_target(self):
+    def test_explicit_handoff_moves_the_wake_target_and_its_receipt(self):
+        """The receipt names its owner: after PM a -> PM b the same unresolved items reach PM b once."""
         self.install('pm-a')
-        q.LOCAL.write_text(q.LOCAL.read_text().replace('"pm-a"', '"pm-b"'))  # the owner's handoff
-        with patch.object(q, 'claude_agents', return_value=job('pm-b', 'PM (mac)', state='done')), \
-             patch.object(q, 'claude_wake') as wake, contextlib.redirect_stdout(io.StringIO()):
+        rows = {**job('pm-a', 'PM a (mac)', state='done'), **job('pm-b', 'PM b (mac)', state='done')}
+        with patch.object(q, 'claude_agents', return_value=rows), patch.object(q, 'claude_wake') as wake, \
+             contextlib.redirect_stdout(io.StringIO()):
             tick.wake('output', ['review 1 abc'])
-        self.assertEqual(wake.call_args[0][0], 'pm-b')
+            q.LOCAL.write_text(q.LOCAL.read_text().replace('"pm-a"', '"pm-b"'))  # the owner's handoff
+            for _ in range(2):
+                tick.wake('output', ['review 1 abc'])
+        self.assertEqual([call.args[0] for call in wake.call_args_list], ['pm-a', 'pm-b'])
 
     def test_tick_identity_is_the_checkout(self):
         """In-session TICK: the prompt names the main checkout. launchd TICK: the agent runs in it and wakes the
@@ -87,7 +91,7 @@ class Wake(unittest.TestCase):
         self.enterContext(patch.object(tick, 'woken', return_value=tmp / 'woken'))
         self.enterContext(patch.object(q, 'personal', return_value={'coordinator': {'session': 'pm-a'}}))
         self.agents = job('pm-a', 'PM (mac)', state='done')  # listed, its turn ended
-        self.enterContext(patch.object(q, 'claude_agents', lambda: self.agents))
+        self.enterContext(patch.object(q, 'claude_agents', lambda **kwargs: self.agents))
         self.send = self.enterContext(patch.object(q, 'claude_wake'))
 
     def wake(self, judgement):
@@ -183,6 +187,28 @@ class Wake(unittest.TestCase):
         self.assertIn('Woke the coordinator pm-a.', self.wake(['review 1 abc']))
 
 
+class Inventory(unittest.TestCase):
+    """`claude agents` read strictly: no CLI is an empty machine; a failed or unreadable list is unknown (None)."""
+
+    def agents(self, run):
+        with patch.object(sys.modules['taskq.worker'].subprocess, 'run', run):
+            return sys.modules['taskq.worker'].claude_agents(strict=True), sys.modules['taskq.worker'].claude_agents()
+
+    def test_fault_is_unknown_only_when_strict(self):
+        from types import SimpleNamespace
+        row = [{'kind': 'background', 'sessionId': 's', 'state': 'done'}, {'kind': 'interactive', 'sessionId': 'i'}]
+        cases = {'no cli': (Mock(side_effect=FileNotFoundError(2, 'claude')), ({}, {})),
+                 'listed': (lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(row)), ({'s': row[0]},) * 2),
+                 'exit 1': (lambda *a, **k: SimpleNamespace(returncode=1, stdout=''), (None, {})),
+                 'bad json': (lambda *a, **k: SimpleNamespace(returncode=0, stdout='{'), (None, {})),
+                 'not a list': (lambda *a, **k: SimpleNamespace(returncode=0, stdout='{}'), (None, {})),
+                 'timeout': (Mock(side_effect=subprocess.TimeoutExpired('claude', 60)), (None, {})),
+                 'denied': (Mock(side_effect=PermissionError(13, 'denied')), (None, {}))}
+        for case, (run, expected) in cases.items():
+            with self.subTest(case):
+                self.assertEqual(self.agents(run), expected)
+
+
 @unittest.skipIf(os.name == 'nt', 'flock holder; Windows locking: test_taskq TickBeat')
 class Overlap(unittest.TestCase):
     """Timer plus manual TICK: one pass per checkout at a time; the second returns at once, it never waits."""
@@ -232,10 +258,10 @@ class Restart(unittest.TestCase):
     """A pass after a restart or a repeated TICK reads the queue again; a claim is never duplicated."""
     setUp, do, add, state = base.Cycle.setUp, base.Cycle.do, base.Cycle.add, base.Cycle.state
 
-    def act(self):
+    def act(self, *flags):
         with patch.object(q, 'spawn') as spawn, contextlib.redirect_stderr(io.StringIO()):
             try:
-                self.do(COORDINATOR, 'tick', '--act')
+                self.do(COORDINATOR, 'tick', '--act', *flags)
             except SystemExit:
                 pass  # exit 1: judgement needed
         return [call.args[0].name for call in spawn.call_args_list]
@@ -307,7 +333,38 @@ class Restart(unittest.TestCase):
             self.assertEqual(self.act(), [f'T{claude} t'])
             output = self.do(COORDINATOR, 'tick')
         for iid in (codex, any_runtime):
-            self.assertIn(f'{base.link(iid)}: Codex threads unreadable, a worker may be running before its take; not started this pass.', output)
+            self.assertIn(f'{base.link(iid)}: codex workers unreadable, one may be running before its take; not started this pass.', output)
+
+    def test_unreadable_claude_inventory_holds_all_but_codex_pinned_tasks(self):
+        """Review reproduction: `claude agents` failing read as empty admitted a duplicate. Strict: None is unknown."""
+        codex, any_runtime = self.add('--type', 'research', '--runtime', 'codex'), self.add('--type', 'research', '--runtime', 'any')
+        claude = self.add('--type', 'research', '--runtime', 'claude')
+        with patch.object(q, 'claude_agents', lambda strict=False: None if strict else {}):
+            self.assertEqual(self.act(), [f'T{codex} t'])
+            output = self.do(COORDINATOR, 'tick')
+        for iid in (claude, any_runtime):
+            self.assertIn(f'{base.link(iid)}: claude workers unreadable, one may be running before its take; not started this pass.', output)
+        self.agents = {}  # a readable, truly empty inventory admits
+        self.assertEqual(sorted(self.act()), sorted([f'T{codex} t', f'T{any_runtime} t', f'T{claude} t']))
+
+    def test_live_unclaimed_worker_holds_its_runtime_place(self):
+        """Review reproduction: Claude limit 1, a live T1 before its take, no claim: T2 was started."""
+        self.enterContext(patch.object(q, 'CODEX_SOCKET', q.ROOT))
+        first, second = (self.add('--type', 'research', '--runtime', runtime) for runtime in ('claude', 'claude'))
+        self.agents = job('worker-1', f'T{first} t (mac-1)')
+        self.assertEqual(self.act('--limit', 'claude=1,codex=1'), [])
+        self.assertEqual(self.act('--limit', 'claude=2,codex=1'), [f'T{second} t'])
+        third, fourth = (self.add('--type', 'research', '--runtime', 'codex') for _ in range(2))
+        self.agents, self.codex.listed = {}, [Restart.codex_thread(self, third, 'idle')]
+        self.assertEqual(self.act('--limit', 'claude=0,codex=1'), [])
+        self.assertEqual(self.act('--limit', 'claude=0,codex=2'), [f'T{fourth} t'])
+
+    def test_claimed_live_worker_is_counted_once(self):
+        claimed, other = (self.add('--type', 'research', '--runtime', 'claude') for _ in range(2))
+        self.do(CLAUDE, 'take', claimed)
+        self.agents = job('claude-session', f'T{claimed} t (mac-1)')  # its own spawned job holds the claim
+        self.assertEqual(self.act('--limit', 'claude=2,codex=0'), [f'T{other} t'])
+        self.assertEqual(self.act('--limit', 'claude=1,codex=0'), [])
 
 
 if __name__ == '__main__':

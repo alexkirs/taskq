@@ -411,7 +411,7 @@ Scheduling and creating sessions is an app action, not a script action.
   (the prompt is the thread's first turn); later turns are sent by `taskq codex-send`, state is read by `taskq codex-read`, and after acceptance `close`
   archives it by `taskq codex-archive` ([taskq-manager](taskq-manager.md) § Other machines); every tick pass archives a worker
   thread no open task claims (closed, or answered and continued by a new session); one the Codex app holds (the owner
-  viewed it) waits for a later pass, ≤3 h after it leaves the window (#165).
+  viewed it) is asked through the app to archive itself with its `codex_app` tool `set_thread_archived` (#165).
   `codex-read <id> --limit N` shows the last N turns (default 3), events, the current
   operation and the actual sandbox of the last turn. `codex-send` prints `delivered` for a new
   turn with an explicit policy or for a message steered into an active turn. Tick's "Workers" table shows the status and event age

@@ -378,8 +378,7 @@ of ask/later tasks, and retires a local Claude worker of a task closed in the la
 machine's `close` (closed on the board or by hand). Every pass, with or without `--act`, also archives this
 checkout's Codex worker threads (named `T<N> …` by spawn, idle or notLoaded, unchanged for 10 min) that no open
 task claims: the task closed, or went ask → answer → ready and a new session continues it (`codex-archive` is
-reversible). One the Codex app holds is kept for a later pass, which archives it once the app lets go (#165,
-§ Cleaning up finished work, item 3). Those
+reversible); one the Codex app holds archives itself in the app (#165, § Cleaning up finished work, item 3). Those
 steps go to stderr (the log). Stdout gets the
 tick's output only when something needs judgement: a review, a question, a problem, a board mismatch,
 an inbox issue, or a mechanical step that failed (section `Steps that failed`); the exit code is then
@@ -473,8 +472,8 @@ record file ~1.1 s is the fallback).
 - *Codex.* The spawn steps (thread/start, name, section, first turn, unsubscribe, broadcast
   `thread-unarchived`) do not switch the window: screenshot before and after shows the same session,
   the new one is in Recents/<project>. Only `open -g codex://threads/<id>` switches it (it also hands
-  the session to the app's own server). It is needed only to archive a session the app holds sooner than
-  the tick does; after that, return the window to the session open before, with the same link and its id.
+  the session to the app's own server). It is needed only for the recipe that archives a session the app
+  holds when no app window owns it; after that, return the window to the session open before, with the same link and its id.
   Do not open worker sessions with this link without need.
 
 Entry phrase: “Show me the question from #N.” («Покажи вопрос из #N», «Покажи вопрос по задаче #N»).
@@ -658,26 +657,23 @@ sections: "Remove", "Ask the owner", "Kept".
    unknown state, an unclosed task and the current session are kept. An already archived session is
    confirmed by the command (`already archived`). Sessions are never deleted.
    *Session open in the app.* Viewing a session in the app (Recents, or `open -g codex://threads/<id>`)
-   makes the app's own server (stdio, not reachable from outside) resume it and take its lock; spawn,
-   the `thread-unarchived` broadcast and codex-send to an unloaded session do not. The app's
-   inactive-thread unsubscriber lets it go 3 h after it leaves the window, or sooner while more than 10
-   such sessions are inactive (app 26.930, `CH=108e5`, `L3t=10`); until then the shared server refuses
-   with `active writer`. There is no IPC request or deep link to archive or unload. Do not broadcast
-   `thread-archived` to a session the app holds: the app drops it from the unsubscriber without
-   `thread/unsubscribe`, so it stays held until the app restarts (#165). The owner views a worker most
-   often to read its question in ask; after the answer the claim moves on and nothing pointed at the old
-   thread, so such threads piled up. Now nobody has to act: `close` tries once, and every tick pass
-   archives each worker thread no open task claims, keeping a held one (`Kept … for a later pass` in the
-   log, then `Archived …`). Cleanup lists such a session under "Kept" (notLoaded on the shared
-   server, yet `~/.codex/thread-writer-locks/<id>.lock` exists) with its tree, and archives it on a
-   later `cleanup --apply` once the app let go. To archive sooner, the coordinator may run the
-   recipe `codex-archive` prints, via Computer Use: `request_access` `com.openai.codex`,
-   `open -g codex://threads/<id>`, `request_full_control`, activate the app
-   (`osascript -e 'tell application id "com.openai.codex" to activate'`), click the body of the open
-   chat, Cmd+Shift+A (Archive chat) — verified 2026-10-06 on two sessions. Then a repeated
-   `codex-archive <id>` confirms `already archived`. The "Archive chat" button in a Recents row
-   appears only on the owner's mouse hover: `app_click` on it via accessibility does nothing;
-   Cmd+Shift+A via `app_key` in the background does not work either, full control is needed.
+   makes the app's own server (stdio, not reachable from outside) resume it and take its lock for 3 h after
+   it leaves the window; spawn, the `thread-unarchived` broadcast and codex-send to an unloaded session do
+   not. The shared server then refuses `thread/archive` with `active writer`. The app gives every thread it
+   loads its `codex_app` MCP tools, among them `set_thread_archived`, which archives through the app's own
+   path, lock included. So `codex-archive` (and `close`, the tick, `cleanup --apply`) sends the held thread
+   one read-only turn through the app window (`thread-follower-start-turn`, as `codex-send`) asking it to
+   call `set_thread_archived` on itself, and waits up to 120 s until the shared server reads it archived:
+   `archived <id> (by the Codex app)`. The archive interrupts that very turn. Verified 2026-10-07 (#165,
+   app 26.930) on nine held csgo threads, among them the seven of #158. A manager thread (DOT6) is not
+   needed and could not be used: it lives on the app's `durable` host, the shared server does not load it
+   and the app's IPC finds no window owning it. Do not broadcast `thread-archived` to a session the app
+   holds: the app drops it from its unsubscriber without `thread/unsubscribe`, so it stays held until the
+   app restarts. Only when no app window owns the session does `codex-archive` print the Computer Use
+   recipe: `request_access` `com.openai.codex`, `open -g codex://threads/<id>`, `request_full_control`,
+   activate the app (`osascript -e 'tell application id "com.openai.codex" to activate'`), click the body
+   of the open chat, Cmd+Shift+A (Archive chat) — verified 2026-10-06 on two sessions. Then a repeated
+   `codex-archive <id>` confirms `already archived`.
 4. Claude background workers (`claude agents`, cwd the main checkout): a worker of closed tasks is
    removed by `taskq retire <id>` (`--apply` does it), and so is a stopped or failed one (no `pid`)
    without an open task, and an idle one without a claim started more than `STALE_MINUTES` ago

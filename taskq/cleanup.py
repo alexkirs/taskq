@@ -167,7 +167,6 @@ def cleanup_plan(root):
     for row in rows:
         branch = row.get('branch', '').removeprefix('refs/heads/')
         if any((thread.get('status') or {}).get('type') not in ('idle', 'notLoaded') or ('codex', sid) in mine
-               or core.codex_app_held(sid, (thread.get('status') or {}).get('type'))
                or any(iid not in issues or not issues[iid]['closed'] for iid in workers.get(('codex', sid), ()))
                for sid, thread in threads.items() if Path(thread.get('cwd') or '/').resolve() == Path(row['worktree']).resolve()):
             owned[branch or row['worktree']] = 'current / active / unknown Codex session state'
@@ -258,10 +257,6 @@ def cleanup_plan(root):
         what = f'Codex session {sid}'
         if identity in mine or status == 'active' or active_task(identity):
             keep.append({'what': what, 'why': 'current session / active / open task'})
-        elif core.codex_app_held(sid, status):
-            # #165: the app lets go 3 h after the thread leaves its window; the tick archives a closed task's then.
-            keep.append({'what': what, 'why': 'held open by the Codex app until 3 h after it leaves the window; '
-                         'the tick archives it then if its task is closed'})
         elif status in ('idle', 'notLoaded') and (finished(identity) or Path(thread.get('cwd') or '/').resolve() in finished_trees):
             remove.append({'kind': 'codex', 'what': what, 'thread': sid, 'cwd': thread.get('cwd'), 'why': 'not active; task closed or tree finished'})
         else:

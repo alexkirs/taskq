@@ -74,7 +74,7 @@ class CodexServer:
     """Finite app-server responses; fail immediately on an unexpected request."""
     def __init__(self):
         self.status, self.turns, self.entries, self.calls = 'idle', [], {}, []
-        self.path, self.projects, self.listed = None, [], []
+        self.path, self.projects, self.listed, self.writer = None, [], [], None
         self.socket = SimpleNamespace(close=lambda: None)
 
     def call(self, method, params):
@@ -93,6 +93,10 @@ class CodexServer:
             return {'data': self.projects}
         if method == 'thread/list':
             return {'data': self.listed}
+        if method == 'thread/archive':
+            if self.writer:
+                q.fail(f"Codex thread/archive: thread {params['threadId']} already has an active writer")
+            return {}
         if method == 'project/create':
             return {'project': {'id': 'created', **params}}
         if method in ('thread/resume', 'turn/start', 'turn/steer', 'thread/name/set', 'thread/section/move',
@@ -1229,6 +1233,23 @@ class Cycle(unittest.TestCase):
             self.do(COORDINATOR, 'tick', '--act')
         self.assertEqual(archived, ['answered', 'held'])
         self.assertIn('Archived held (T9 x (mac)): no open task holds it.', log.getvalue())
+
+    def test_codex_archive_of_a_thread_the_app_holds_asks_the_thread_to_archive_itself_in_the_app(self):
+        """#165: the shared server refuses (the app holds the writer lock); a read-only turn through the app window
+        asks the thread to call its codex_app tool set_thread_archived; done once the server reads it archived."""
+        self.codex.status, self.codex.writer, self.ipc.owner = 'notLoaded', 'app', 'window'
+        reads = iter([False, True])
+        with patch.object(codex, 'codex_is_archived', lambda thread: next(reads)), patch.object(codex.time, 'sleep', lambda s: None):
+            self.assertIn('archived t1 (by the Codex app)', self.do(CLAUDE, 'codex-archive', 't1'))
+        method, params, version, target = self.ipc.calls[-1]
+        self.assertEqual((method, version, target), ('thread-follower-start-turn', 2, 'window'))
+        request = params['turnStart']['request']
+        self.assertEqual(request['sandboxPolicy'], {'type': 'readOnly'})
+        self.assertIn('set_thread_archived with threadId t1 and archived true', request['input'][0]['text'])
+        # No app window owns it: the computer-use recipe, no turn sent.
+        self.ipc.owner, self.ipc.calls = None, []
+        self.assertIn('no app window owns it', self.refused(CLAUDE, 'codex-archive', 't1'))
+        self.assertEqual([call[0] for call in self.ipc.calls], ['thread-owner-discovery'])
 
     def test_outsider_comments_do_not_keep_a_dead_workers_task(self):
         """#39: stall age comes from collaborators' notes and label events, not `updated_at` that anyone moves."""
@@ -3368,21 +3389,6 @@ class Cleanup(unittest.TestCase):
         self.assertIn('the session of this tree is not archived', report)
         self.assertTrue(tree.exists())
         self.assertIn('worktree-writer', self.git('branch'))
-
-    def test_app_held_session_names_the_app_step_and_keeps_its_tree(self):
-        tree = self.tree('worktree-held')
-        self.issues[1] = {'closed': True, 'state': 'unknown', 'type': 'research', 'claim': {'runtime': 'codex', 'session': 'held'}}
-        self.threads['held'] = {'id': 'held', 'cwd': str(tree), 'status': {'type': 'notLoaded'}}
-        locks = Path(self.root) / 'locks'
-        locks.mkdir()
-        (locks / 'held.lock').touch()
-        with patch.object(sys.modules['taskq.codex'], 'CODEX_LOCKS', locks), \
-                patch.object(q, 'codex_archive', side_effect=AssertionError('not called')):
-            report = self.run_cleanup(True)
-        kept = report.split('# Kept')[1]
-        self.assertIn('Codex session held: held open by the Codex app until 3 h after it leaves the window', kept)
-        self.assertNotIn('held', report.split('# Ask the owner')[1].split('# Kept')[0])
-        self.assertTrue(tree.exists())
 
     def test_unavailable_inventory_keeps_trees_and_unknown_status_keeps_tree(self):
         tree = self.tree('worktree-unknown')

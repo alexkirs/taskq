@@ -363,8 +363,7 @@ def retire_closed(log):
 def archive_finished_codex(tasks, log):
     """#165: every pass archives this checkout's Codex worker threads (`T<N> …`, as spawn names them) that are no
     open task's claim: the task closed, or went ask -> answer -> ready and a new session continues it. A thread the
-    owner viewed is held by the app's own server until 3 h after it leaves the window; each pass keeps it and the
-    first pass after archives it. Reversible (`thread/unarchive`), so no --act needed."""
+    owner viewed is held by the app, and codex-archive has the app archive it (#165). Reversible (`thread/unarchive`), so no --act needed."""
     if not core.CODEX_SOCKET.exists():
         return
     from taskq.cleanup import cleanup_codex

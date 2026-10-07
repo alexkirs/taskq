@@ -741,7 +741,7 @@ def last_line(output):
 
 # The rest of the package; each module reaches the core as `core.<name>`.
 from taskq.store_github import Github  # noqa: E402
-from taskq.codex import (CODEX_HEADLESS, CODEX_SOCKET, Codex, codex_age, codex_app_held, codex_app_recipe, codex_archive, codex_is_archived, codex_line, codex_project, codex_read,  # noqa: E402
+from taskq.codex import (CODEX_HEADLESS, CODEX_SOCKET, Codex, codex_age, codex_app_recipe, codex_archive, codex_is_archived, codex_line, codex_project, codex_read,  # noqa: E402
                          codex_send, codex_snapshot, codex_spawn)
 from taskq.cleanup import cleanup  # noqa: E402
 from taskq.selftest import selftest  # noqa: E402

@@ -494,22 +494,48 @@ def codex_archive(args):
         codex.call('thread/archive', {'threadId': args.thread})
     except SystemExit as error:
         # 2026-10-06: a thread the app has opened stays loaded in the app's private app server (stdio, not
-        # reachable) for 3 h after it leaves view, or until more than 10 such threads; no IPC request archives
-        # or releases it, and osascript has no assistive access. #165 (app 26.930): the tick retries, so it is
-        # archived without anyone once the app lets go; the computer-use recipe is only the sooner way.
-        if 'active writer' in str(error):
-            core.fail(f'Codex thread {args.thread} is held open by the Codex app, which lets it go 3 h after it leaves '
-                      f'the window; the tick archives it then. Sooner: {codex_app_recipe(args.thread)}')
-        raise
+        # reachable) for 3 h after it leaves view. #165: the app gives each thread it loads its `codex_app` MCP
+        # tools; `set_thread_archived` there archives through the app's own path, lock included.
+        if 'active writer' not in str(error):
+            raise
+        return codex_archive_in_app(args.thread)
     # Only after the archive: to an app still holding the thread, `thread-archived` drops it from the app's
     # inactive-thread unsubscriber without an unsubscribe, so it stays held until the app restarts (#165).
     codex_announce(args.thread, 'thread-archived', 2)
     print(f'archived {args.thread}')
 
 
-def codex_app_held(thread, status):
-    """#158: the shared server reads it notLoaded, yet a writer lock exists: the app's private server holds it."""
-    return status == 'notLoaded' and (CODEX_LOCKS / f'{thread}.lock').exists()
+CODEX_ARCHIVE_PROMPT = ('Maintenance request from taskq, not a task: this worker\'s task is finished. Do exactly one '
+                        'thing: call the codex_app tool set_thread_archived with threadId {thread} and archived true '
+                        '(no hostId). Run no shell commands and change no files.')
+
+
+def codex_archive_in_app(thread, wait=120):
+    """#165: a thread the app holds archives itself: a read-only turn through the app (`thread-follower-start-turn`,
+    as codex_send_app) asks it to call its `codex_app` tool `set_thread_archived` (verified 2026-10-07 on held csgo
+    threads, app 26.930; the archive interrupts that very turn). Waits until the shared server reads it archived."""
+    try:
+        ipc = CodexIpc()
+    except OSError:
+        core.fail(f'Codex thread {thread} is held open by the Codex app, but its IPC is unreachable. {codex_app_recipe(thread)}')
+    try:
+        found = ipc.request('thread-owner-discovery', {'hostId': 'local', 'conversationId': thread}, 1)
+        if found['resultType'] != 'success':
+            core.fail(f'Codex thread {thread} is held open by the Codex app, but no app window owns it. {codex_app_recipe(thread)}')
+        text = CODEX_ARCHIVE_PROMPT.format(thread=thread)
+        reply = ipc.request('thread-follower-start-turn', {'conversationId': thread, 'turnStart': {'request': {
+            'threadId': thread, 'input': [{'type': 'text', 'text': text, 'text_elements': []}], 'approvalPolicy': 'never',
+            'sandboxPolicy': {'type': 'readOnly'}}, 'context': {}}}, 2, found['handledByClientId'])
+        if reply['resultType'] != 'success':
+            core.fail(f'Codex app refused the archive turn for {thread}: {reply.get("error")}')
+    finally:
+        ipc.socket.close()
+    end = time.time() + wait
+    while time.time() < end:
+        time.sleep(3)
+        if codex_is_archived(thread):
+            return print(f'archived {thread} (by the Codex app)')
+    core.fail(f'Codex thread {thread}: the app did not archive it in {wait} s. {codex_app_recipe(thread)}')
 
 
 def codex_app_recipe(thread):

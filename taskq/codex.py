@@ -29,10 +29,27 @@ CODEX_LOCKS = Path.home() / '.codex/thread-writer-locks'
 def codex_turn_policy(full_access=False):
     if full_access:
         return {'approvalPolicy': 'never', 'sandboxPolicy': {'type': 'dangerFullAccess'}}
-    roots = [core.ROOT / '.git', core.ROOT / '.worktrees', core.UPDATE_STAMP.parent,
-             *(root for root in core.codex_writable() if root.exists())]
+    # A missing root grants nothing, and on Linux one under the thread's cwd (.worktrees before the first
+    # tree) makes bwrap refuse every command (#164), so only existing roots are listed.
+    roots = [root for root in (core.ROOT / '.git', core.ROOT / '.worktrees', core.UPDATE_STAMP.parent,
+                               *core.codex_writable()) if root.exists()]
+    # #163: on Linux Codex mounts the gitdir of a root that is a linked worktree read-only after the writable
+    # roots (openai/codex#14338) unless that exact gitdir is a root too. Only a gitdir inside this .git, already
+    # writable, is added: no new access.
+    common = (core.ROOT / '.git').resolve()
+    roots += [gitdir for gitdir in map(worktree_gitdir, roots) if gitdir and common in gitdir.resolve().parents]
     return {'approvalPolicy': 'never', 'sandboxPolicy': {
         'type': 'workspaceWrite', 'networkAccess': True, 'writableRoots': [str(root) for root in roots]}}
+
+
+def worktree_gitdir(tree):
+    """The existing gitdir a linked worktree's `.git` file names, spelled as Codex resolves it; else None."""
+    try:
+        text = (tree / '.git').read_text().strip()
+    except OSError:  # no .git, or a directory
+        return None
+    gitdir = Path(os.path.normpath(tree / text.removeprefix('gitdir:').strip())) if text.startswith('gitdir:') else None
+    return gitdir if gitdir and gitdir.is_dir() else None
 
 
 # thread/start and thread/resume use the CLI spelling; turn/start carries the full policy.

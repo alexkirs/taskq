@@ -510,7 +510,12 @@ policy can persist into later turns. Every taskq `turn/start`, including the fir
 and codex-send, explicitly passes `approvalPolicy: never` and `sandboxPolicy: {type: workspaceWrite,
 networkAccess: true, writableRoots: [<main checkout>/.git, <main checkout>/.worktrees, <taskq state
 dir>, ...taskq.toml [codex] writable]}` from `codex_turn_policy()` (2026-10-07, #149: the #57 probe passed every worker step there;
-`.git` is a root because git writes the worktree's refs and objects into the main checkout's `.git`). The thread/start and resume settings are derived from the same policy in
+`.git` is a root because git writes the worktree's refs and objects into the main checkout's `.git`). Only existing
+roots are listed: on Linux a missing root under the thread's cwd makes bwrap refuse every command. A root that is a
+linked worktree of this checkout (an external task tree in `[codex] writable`) also lists its exact gitdir
+(`<main checkout>/.git/worktrees/<name>`): on Linux Codex otherwise mounts that gitdir read-only after the writable
+roots (openai/codex#14338), and git cannot write `index.lock` or `FETCH_HEAD` (#163). The gitdir is inside `.git`,
+already a root, so no access is added; a gitdir outside this `.git` is not listed (#164). The thread/start and resume settings are derived from the same policy in
 their protocol's format. Exception (owner decision 2026-10-07, #157): a task labelled `codex-full-access` gets
 `codex_turn_policy(full_access=True)`, `sandboxPolicy: {type: dangerFullAccess}`, and `danger-full-access` on
 thread/start and resume: workspace-write denies the Apple GPU and Codex has no GPU-only setting. Tick passes the label to

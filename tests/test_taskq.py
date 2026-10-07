@@ -1423,7 +1423,7 @@ class Cycle(unittest.TestCase):
             self.assertIn('spawned', self.do(CLAUDE, 'spawn', '--runtime', 'codex', '--name', 'probe'))
         self.assertEqual(params['sandboxPolicy'], {
             'type': 'workspaceWrite', 'networkAccess': True,
-            'writableRoots': [str(q.ROOT / '.git'), str(q.ROOT / '.worktrees'), str(q.UPDATE_STAMP.parent)]})
+            'writableRoots': [str(root) for root in (q.ROOT / '.git', q.ROOT / '.worktrees', q.UPDATE_STAMP.parent) if root.exists()]})
         start = next(params for method, params in self.codex.calls if method == 'thread/start')
         self.assertEqual(start['sandbox'], 'workspace-write')
         self.assertEqual(start['approvalPolicy'], 'never')
@@ -2659,6 +2659,12 @@ class Setup(unittest.TestCase):
         """#154: [codex] writable roots, relative to the main checkout or ~, join the turn policy; a missing one is skipped."""
         (self.tmp / 'taskq.toml').write_text('[github]\nrepo = "owner/repo"\n[update]\nauto = false\n')
         q.configure()
+        # #164: a missing root is never listed; bwrap refuses every command for one under the thread's cwd.
+        self.assertNotIn(str(q.ROOT / '.worktrees'), codex.codex_turn_policy()['sandboxPolicy']['writableRoots'])
+        (self.tmp / '.git').mkdir()
+        (self.tmp / '.worktrees').mkdir()
+        self.enterContext(patch.object(q, 'UPDATE_STAMP', self.tmp / 'state/update-last'))
+        q.UPDATE_STAMP.parent.mkdir()
         base = codex.codex_turn_policy()['sandboxPolicy']['writableRoots']
         self.assertEqual(len(base), 3)
         media = self.tmp.parent / f'{self.tmp.name}-media'
@@ -2675,6 +2681,27 @@ class Setup(unittest.TestCase):
         (self.tmp / 'taskq.toml').write_text('[github]\nrepo = "owner/repo"\n[codex]\nwritable = "../media"\n')
         with self.assertRaises(SystemExit):
             q.configure()
+
+    def test_a_linked_worktree_root_adds_its_gitdir_only_inside_this_git(self):
+        """#163: a root that is a linked worktree of this checkout lists its gitdir, so Linux Codex leaves it
+        writable; a worktree of another repository adds nothing: its gitdir is outside every root."""
+        run = lambda *args: subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@t', *args], check=True, capture_output=True)
+        other = self.tmp / 'other'
+        for repo in (self.tmp, other):
+            run('init', '-q', str(repo))
+            run('-C', str(repo), 'commit', '-q', '--allow-empty', '-m', 'init')
+        run('-C', str(self.tmp), 'worktree', 'add', '-q', '-b', 'taskq-1', str(self.tmp / 'trees/taskq-1'))
+        run('-C', str(other), 'worktree', 'add', '-q', '-b', 'taskq-2', str(self.tmp / 'trees/taskq-2'))
+        (self.tmp / 'taskq.toml').write_text('[github]\nrepo = "owner/repo"\n[update]\nauto = false\n'
+                                             '[codex]\nwritable = ["trees/taskq-1", "trees/taskq-2"]\n')
+        q.configure()
+        q.ROOT = self.tmp
+        roots = codex.codex_turn_policy()['sandboxPolicy']['writableRoots']
+        gitdir = codex.worktree_gitdir(self.tmp / 'trees/taskq-1')
+        self.assertEqual(gitdir.resolve(), (self.tmp / '.git/worktrees/taskq-1').resolve())
+        self.assertEqual(roots[-1], str(gitdir))
+        self.assertNotIn(str(codex.worktree_gitdir(self.tmp / 'trees/taskq-2')), roots)
+        self.assertIsNone(codex.worktree_gitdir(self.tmp))  # a .git directory is not a pointer
 
     def test_a_runtime_setup_command_is_the_persons_step(self):
         self.enterContext(patch.object(q, 'api', Gitlab()))

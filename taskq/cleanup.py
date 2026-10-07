@@ -440,7 +440,9 @@ def apply_scheduled(args, root, gc, trigger):
     from taskq import cleanup_schedule as schedule
     now = schedule.datetime.now(schedule.UTC)
     report = schedule.run(schedule.settings(), schedule.state_path(), now, lambda: apply_plan(args, root, gc), trigger)
-    status = {'success': 'done', 'failed': 'failed'}.get(report['outcome'], report['outcome'])
+    # partial is an execution error too: status `failed` is what json_command and tick_pass (#191) turn into
+    # `failure`; the action keeps outcome `partial`.
+    status = {'success': 'done', 'partial': 'failed', 'failed': 'failed'}.get(report['outcome'], report['outcome'])
     core.record(args, 'cleanup', status=status, **report)
     print(f'\nCleanup ({trigger}): {report["outcome"]}, {report["reason"]}; last success {report.get("last_success") or "none"}; '
           f'next due {report.get("next_due_local") or report.get("next_due") or "none"} ({report["timezone"]}'

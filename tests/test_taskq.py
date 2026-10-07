@@ -3852,6 +3852,30 @@ class Cleanup(unittest.TestCase):
         self.assertEqual(self.tick_cleanup()[0]['reason'], 'backoff')
         self.assertNotEqual(before, None)
 
+    def test_partial_cleanup_is_a_failure_in_manual_json_and_the_tick_envelope(self):
+        self.setup_local()
+        partial = {'observed': '2026-10-08T12:00:00+00:00', 'trigger': 'manual', 'timezone': 'Etc/UTC',
+                   'timezone_fallback': True, 'settings': 'default', 'outcome': 'partial', 'reason': 'manual',
+                   'attempted': ['a', 'b'], 'succeeded': ['a'], 'refused': [], 'errors': [{'item': 'b', 'error': 'x'}],
+                   'pending_asks': [], 'last_success': None, 'next_due': None, 'next_due_local': None}
+        schedule = sys.modules['taskq.cleanup_schedule']
+        with patch.object(schedule, 'run', return_value=partial), contextlib.redirect_stdout(io.StringIO()) as out, \
+                self.assertRaises(SystemExit) as caught:
+            q.main(['cleanup', '--json', '--apply'])
+        manual = json.loads(out.getvalue())
+        self.assertEqual((caught.exception.code, manual['outcome']), (2, 'failure'))
+        action = next(event for event in manual['actions'] if event['action'] == 'cleanup')
+        self.assertEqual((action['status'], action['outcome']), ('failed', 'partial'))
+        args = argparse.Namespace(output={'actions': [], 'refusals': []})
+        with patch.object(schedule, 'run', return_value={**partial, 'trigger': 'tick'}), \
+                patch.object(tick, 'queue_pass', lambda args, act=False: REAL_SCHEDULED(args) or []), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            tick.tick_pass(args)
+        report = args.output['report']
+        self.assertEqual(report['outcome'], 'failure')
+        self.assertEqual([(event['status'], event['outcome']) for event in report['actions'] if event['action'] == 'cleanup'],
+                         [('failed', 'partial')])
+
     def test_tick_from_a_task_tree_or_another_branch_refuses_visibly(self):
         self.setup_local()
         tree = self.tree('worktree-taskq-126')

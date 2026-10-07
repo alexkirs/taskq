@@ -93,4 +93,5 @@ contract, provenance and unknown evidence stay as they are. The action carries:
 - observed (start), due, finished, last success, next due in UTC and in the zone;
 - timezone, and whether it is the missing-setting fallback.
 
-A failed attempt marks the action `failed`, so the tick outcome is `failure`.
+A failed or partial attempt marks the action status `failed` (its outcome stays `partial` or `failed`),
+so the tick report and `cleanup --json` outcome is `failure`.

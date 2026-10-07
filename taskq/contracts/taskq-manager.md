@@ -656,7 +656,10 @@ sections: "Remove", "Ask the owner", "Kept".
    `codex-archive <id>` confirms `already archived`. The "Archive chat" button in a Recents row
    appears only on the owner's mouse hover: `app_click` on it via accessibility does nothing;
    Cmd+Shift+A via `app_key` in the background does not work either, full control is needed.
-   The tree of such a session stays until the next `cleanup --apply`.
+   The tree of such a session stays until the next `cleanup --apply`. The report finds such a
+   session before trying (notLoaded on the shared server, yet `~/.codex/thread-writer-locks/<id>.lock`
+   exists) and lists it under "Ask the owner" with this recipe as the `coordinator:` archive choice;
+   its tree is kept. Rechecked 2026-10-07 (#158): the app's IPC still has no archive or unload request.
 4. Claude background workers (`claude agents`, cwd the main checkout): a worker of closed tasks is
    removed by `taskq retire <id>` (`--apply` does it), and so is a stopped or failed one (no `pid`)
    without an open task, and an idle one without a claim started more than `STALE_MINUTES` ago

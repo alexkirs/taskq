@@ -3252,6 +3252,22 @@ class Cleanup(unittest.TestCase):
         self.assertTrue(tree.exists())
         self.assertIn('worktree-writer', self.git('branch'))
 
+    def test_app_held_session_names_the_app_step_and_keeps_its_tree(self):
+        tree = self.tree('worktree-held')
+        self.issues[1] = {'closed': True, 'state': 'unknown', 'type': 'research', 'claim': {'runtime': 'codex', 'session': 'held'}}
+        self.threads['held'] = {'id': 'held', 'cwd': str(tree), 'status': {'type': 'notLoaded'}}
+        locks = Path(self.root) / 'locks'
+        locks.mkdir()
+        (locks / 'held.lock').touch()
+        with patch.object(sys.modules['taskq.codex'], 'CODEX_LOCKS', locks), \
+                patch.object(q, 'codex_archive', side_effect=AssertionError('not called')):
+            report = self.run_cleanup(True)
+        ask = report.split('# Ask the owner')[1].split('# Kept')[0]
+        self.assertIn('Codex session held: held open by the Codex app', ask)
+        self.assertIn('coordinator: Archive it there with computer-use', ask)
+        self.assertIn('codex://threads/held', ask)
+        self.assertTrue(tree.exists())
+
     def test_unavailable_inventory_keeps_trees_and_unknown_status_keeps_tree(self):
         tree = self.tree('worktree-unknown')
         with patch.object(cleanup, 'cleanup_codex', side_effect=OSError('not connected')):

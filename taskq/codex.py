@@ -14,6 +14,8 @@ import taskq as core
 
 CODEX_SOCKET = Path.home() / '.codex/app-server-control/app-server-control.sock'
 CODEX_IPC = Path.home() / '.codex/ipc/ipc.sock'
+# A loaded thread's writer lock; the file goes away when its server releases the thread (#158).
+CODEX_LOCKS = Path.home() / '.codex/thread-writer-locks'
 # Design decision 2026-10-07 (#57 probe, #149): a Codex worker runs in workspace-write with network on
 # and never asks; every step of a worker passed there. The worktree lives in ROOT/.worktrees, but git
 # writes its refs, objects and worktree admin files into the main checkout's .git, so .git is a root.
@@ -461,10 +463,21 @@ def codex_archive(args):
         # or releases it (`thread-archived` only hides the row), and osascript has no assistive access. The
         # app's own context menu archives it; an agent does that with computer-use, not the owner.
         if 'active writer' in str(error):
-            core.fail(f'Codex thread {args.thread} is held open by the Codex app. Archive it there with computer-use '
-                 f'(com.openai.codex, full-screen control): `open -g codex://threads/{args.thread}`, activate the app, '
-                 f'click the chat body and press Cmd+Shift+A (Archive chat); then run codex-archive again to confirm and '
-                 f'open the session the window showed before the same way (the link switches the window)')
+            core.fail(f'Codex thread {args.thread} is held open by the Codex app. {codex_app_recipe(args.thread)}')
         raise
     codex_announce(args.thread, 'thread-archived', 2)
     print(f'archived {args.thread}')
+
+
+def codex_app_held(thread, status):
+    """#158: the shared server reads it notLoaded, yet a writer lock exists: the app's private server holds it."""
+    return status == 'notLoaded' and (CODEX_LOCKS / f'{thread}.lock').exists()
+
+
+def codex_app_recipe(thread):
+    # #158 (app 2026-10-07): the app's IPC still has no archive/unload request ("archive-thread" is only a
+    # menu shortcut), so the one step stays the app's own Archive chat.
+    return (f'Archive it there with computer-use (com.openai.codex, full-screen control): '
+            f'`open -g codex://threads/{thread}`, activate the app, click the chat body and press Cmd+Shift+A '
+            f'(Archive chat); then run codex-archive again to confirm and open the session the window showed '
+            f'before the same way (the link switches the window)')

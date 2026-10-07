@@ -453,13 +453,26 @@ def spawn(args):
 def preflight(args):
     """A real, read-only local command ACK for an external PM; no worker, claim or policy changes."""
     root = core.ROOT.resolve()
-    done = subprocess.run([sys.executable, '-c',
-                           'import os; print(os.getcwd())'], cwd=root,
-                          capture_output=True, text=True, timeout=30)
-    acknowledgement = {'status': 'ready' if done.returncode == 0 and done.stdout.strip() == str(root) else 'unknown',
+    blocker = None
+    try:
+        done = subprocess.run([sys.executable, '-c',
+                               'import os; print(os.getcwd())'], cwd=root,
+                              capture_output=True, text=True, timeout=30)
+        code, stdout, stderr = done.returncode, done.stdout, done.stderr
+    except subprocess.TimeoutExpired as error:
+        code, stdout, stderr = 124, error.stdout or '', error.stderr or ''
+        blocker = 'Local command timed out after 30 seconds'
+    except OSError as error:
+        code, stdout, stderr = 126, '', str(error)
+        blocker = f'Local command could not start: {error}'
+    # TimeoutExpired may retain bytes even with text=True.
+    stdout, stderr = (value.decode(errors='replace') if isinstance(value, bytes) else value for value in (stdout, stderr))
+    ready = code == 0 and stdout.strip() == str(root)
+    acknowledgement = {'status': 'ready' if ready else 'unknown',
                        'observed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                       'cwd': str(root), 'exit_code': done.returncode,
-                       'stdout': done.stdout, 'stderr': done.stderr, 'source': 'local subprocess',
+                       'cwd': str(root), 'exit_code': code,
+                       'stdout': stdout, 'stderr': stderr, 'source': 'local subprocess',
+                       'exact_blocker': None if ready else blocker or 'Local command did not acknowledge the expected cwd',
                        'runtime_capability': 'unknown', 'effective_launch_policy': 'unknown'}
     core.record(args, 'local_command_ack', **acknowledgement)
     print(json.dumps(acknowledgement))
@@ -494,8 +507,6 @@ def runtime_status(args):
             agent = core.claude_agents().get(args.session)
             observation.update(source='claude agents', session_link=core.claude_url(args.session),
                                exact_blocker='CLI status does not expose qualified pending approval events')
-            if agent and not agent.get('pid'):
-                observation.update(status='terminal', exact_blocker=None)
     except (OSError, SystemExit, ValueError) as error:
         observation['exact_blocker'] = f'Status unavailable: {core.codex_line(error)}'
     core.record(args, 'runtime_observation', **observation)

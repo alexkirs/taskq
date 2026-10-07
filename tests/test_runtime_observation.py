@@ -4,6 +4,7 @@ import contextlib
 import importlib
 import io
 import json
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -93,6 +94,38 @@ class RuntimeObservationTests(unittest.TestCase):
              patch.object(worker.subprocess, 'run', return_value=SimpleNamespace(returncode=1, stdout='', stderr='denied')), \
              contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
             worker.preflight(argparse.Namespace())
+
+    def test_claude_without_pid_or_status_is_unknown(self):
+        args = argparse.Namespace(runtime='claude', session='s', output={'actions': []})
+        with patch.object(q, 'claude_agents', return_value={'s': {'sessionId': 's'}}), \
+             patch.object(q, 'claude_url', return_value=None), contextlib.redirect_stdout(io.StringIO()):
+            worker.runtime_status(args)
+        self.assertEqual(args.output['actions'][0]['status'], 'unknown')
+
+    def test_preflight_timeout_and_oserror_return_failure_ack(self):
+        errors = [(subprocess.TimeoutExpired('probe', 30, output=b'partial output', stderr=b'partial error'),
+                   124, 'partial output', 'partial error'),
+                  (OSError('permission denied'), 126, '', 'permission denied')]
+        for error, code, stdout, stderr in errors:
+            args = argparse.Namespace(output={'actions': []})
+            with self.subTest(error=error), patch.object(q, 'ROOT', Path.cwd()), \
+                 patch.object(worker.subprocess, 'run', side_effect=error), \
+                 contextlib.redirect_stdout(io.StringIO()) as printed, self.assertRaises(SystemExit):
+                worker.preflight(args)
+            ack = json.loads(printed.getvalue())
+            self.assertEqual((ack['status'], ack['exit_code']), ('unknown', code))
+            self.assertEqual((ack['stdout'], ack['stderr']), (stdout, stderr))
+            self.assertTrue(ack['exact_blocker'])
+            self.assertEqual(args.output['actions'][0]['status'], 'unknown')
+            command = argparse.Namespace(action='preflight', function=worker.preflight)
+            with patch.object(q, 'ROOT', Path.cwd()), patch.object(q, 'PROJECT', 'test'), \
+                 patch.object(worker.subprocess, 'run', side_effect=error), \
+                 contextlib.redirect_stdout(io.StringIO()) as printed, self.assertRaises(SystemExit) as stopped:
+                q.json_command(command)
+            envelope = json.loads(printed.getvalue())
+            self.assertNotEqual(stopped.exception.code, 0)
+            self.assertEqual(envelope['outcome'], 'failure')
+            self.assertEqual(envelope['actions'][0]['exit_code'], code)
 
 
 if __name__ == '__main__':

@@ -515,7 +515,7 @@ their protocol's format. In the installed schema `thread/queue/add` does not acc
 so taskq does not use it for active-send. `turn/steer` does not start a new turn and does not change
 the sandbox of a running turn; a restricted turn stays restricted until it ends. The next new turn
 via codex-send gets the explicit policy. `codex-read` shows the sandbox and approvalPolicy of the
-last turn from its own `turn_context` record, including `network_access` if recorded; a missing
+last turn from its own `turn_context` record, including `network_access` and `writable_roots` if recorded; a missing
 record is shown as `unknown`, not replaced with the desired policy.
 
 **Silent worker.** The "Workers" table prints, in "Last activity", the status and last-event age of each

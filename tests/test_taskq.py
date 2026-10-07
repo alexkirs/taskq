@@ -1521,11 +1521,13 @@ class Cycle(unittest.TestCase):
             return json.dumps({'type': 'turn_context', 'payload': {'turn_id': turn,
                                'sandbox_policy': sandbox, 'approval_policy': approval}}) + '\n'
         path.write_text(context('last', {'type': 'danger-full-access'}, 'never') +
-                        context('last', {'type': 'workspace-write', 'network_access': False}, 'on-request') +
+                        context('last', {'type': 'workspace-write', 'writable_roots': ['/r/.git'], 'network_access': False,
+                                         'exclude_slash_tmp': False}, 'on-request') +
                         'x' * (codex.CODEX_TAIL_BYTES + 1) + '\n' +
                         context('other', {'type': 'danger-full-access'}, 'never'))
         output = self.do(CLAUDE, 'codex-read', 't1')
-        self.assertIn('last turn sandbox: {"type": "workspace-write", "network_access": false}; approvalPolicy: on-request', output)
+        self.assertIn('last turn sandbox: {"type": "workspace-write", "network_access": false, "writable_roots": ["/r/.git"]}; '
+                      'approvalPolicy: on-request', output)
         self.assertNotIn('last turn sandbox: {"type": "danger-full-access"}', output)
 
     def test_tick_codex_idle_requires_intervention_and_later_archive(self):

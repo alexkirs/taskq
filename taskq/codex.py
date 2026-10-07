@@ -408,7 +408,7 @@ def codex_read(args):
     print(f'last event: {codex_age(stamp)}')
     policy = (turns[0].get('policy') if turns else None) or {}
     sandbox = policy.get('sandbox') or {}
-    shown = {key: sandbox[key] for key in ('type', 'network_access') if key in sandbox}
+    shown = {key: sandbox[key] for key in ('type', 'network_access', 'writable_roots') if key in sandbox}
     print('last turn sandbox: ' + (json.dumps(shown, ensure_ascii=False) if shown else 'unknown (no turn_context)') +
           f'; approvalPolicy: {policy.get("approval") or "unknown"}')
     for turn in reversed(turns):

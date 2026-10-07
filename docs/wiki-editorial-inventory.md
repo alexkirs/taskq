@@ -1,88 +1,58 @@
 # Wiki editorial inventory (#205)
 
-Draft for user review. Read-only inventory; no Wiki, contract or template change. Bulk migration waits for review.
+Draft for root and user review. Nothing here is published. The proposed Wiki diff is in [samples](wiki-editorial-samples.md).
 
-Read on 2026-10-08: Wiki `d3cc01c131d9d85b565d7c88f81757c03caa6bbb`, repository `2609a3cc8a3a7f7f52620ee5395e30588da792ff`.
-Wiki revision links: `https://github.com/alexkirs/taskq/wiki/<Page>/<sha>`.
+Read on 2026-10-08:
 
-## Sources
+- Wiki `9ccb572258c14c0252ba74e2db6d1f288a5f12fb` (pages: Home, Required-settings, Known-issues, Cleanup-schedule, Atomic-reservation-before-worker-launch).
+- Repository `ec0cd349946f89081a701283742b0db735162e94` (`main`, after PR #199).
+- Gradus Caveman `62579538f05fb6b69a12449c1ebad9567d1fdecc`: `rules/core.md`, `rules/documentation.md`, `rules/notifications.md`, `examples/messages.md`.
 
-| Source | Version | Lines | Content |
-|---|---|---|---|
-| Wiki Home | `d3cc01c` | 1-4 | Entry and navigation. Keep. |
-| | | 6-13 | #195 specification. |
-| | | 15-23 | #191 specification. |
-| | | 25-34 | #186 critical path. |
-| | | 36-45 | #187 writing rule and help proposal. |
-| Wiki Required-settings | `d3cc01c` | 3-32 | #187 short start, scenario table, help outline. |
-| | | 34-44 | Claude and Codex settings. Keep. |
-| | | 46-48 | #188 PM mode notes under "Codex workers". |
-| | | 50-51 | `limit.*` notes. Keep. |
-| Wiki Known-issues | `1d9ce23` | 3-11, 13-16 | Symptom and action bullets. Keep. |
-| | | 12 | #159 Windows investigation log. |
-| `taskq/contracts/taskq-manager.md` | `2609a3c` | 689-694 | "Reply to the owner": links, Workers table, Board line. |
-| `taskq/contracts/taskq.md` | `2609a3c` | all | Worker contract. No writing rule. |
-| `taskq/worker.py` | `2609a3c` | 17-41 | Generated worker brief. No writing rule. |
-| `taskq/tick.py` | `2609a3c` | 75-80 | `TICK_PROMPT` v2: "Reply in the owner's language, one or two lines when nothing changed." |
-| `docs/wiki-sot-process-proposal.md` | `2609a3c` | 7, 30 | #189: Home links short spec pages; Required-settings holds settings only. |
-| `docs/pages-gate-qualification.md` | `2609a3c` | all | #195 qualification record. |
-| `docs/external-pm-tick.md` | `2609a3c` | all | External PM and TICK guide, #181 evidence. |
+Revision links use `https://github.com/alexkirs/taskq/wiki/<Page>/<sha>`. They stay readable after a page changes.
 
 ## Status check
 
-Checked with `gh issue view` on 2026-10-08.
+Checked with `gh issue view` and `gh pr view 199` on 2026-10-08.
 
-| Item | Wiki says | Actual | Action |
-|---|---|---|---|
-| #195 | "Accepted specification; implementation pending" (Home 8) | Closed 2026-10-07T19:53Z. Shipped `c5378c1`, `b54aff6`. | Mark implemented. Wiki is stale. |
-| #191 | Accepted, implementation pending | Open, `q-review`. No commit on `main`. | Keep "accepted, in review". |
-| #186 | Accepted, qualification pending | Open, `q-later`. | Keep "accepted, later". |
-| #187 | Proposed help command | Open, `q-later`. `taskq help` does not exist (exit 2 at `2609a3c`). | Keep "proposed". |
-| #185, #176, #177 | Pending qualification | Open, `q-review`. | Keep. |
+- #195: closed 2026-10-07; shipped `c5378c1`, `b54aff6`. Home still says "implementation pending": stale.
+- #191: open, `q-review`. Code merged to `main` by PR #199 (`ec0cd34`, 2026-10-07T21:50Z). `taskq preflight --json` pins its source to Home `05cf6aa`.
+- #186: open, `q-later`. Stage 1 page "Atomic reservation": accepted, implementation pending.
+- #197: open, `q-review`. Page "Cleanup schedule": accepted, integration pending.
+- #187: open, `q-later`. `taskq help` does not exist.
+- #176, #177, #185: open, `q-review`.
+- #198: open, `q-doing`. No #198 Wiki page exists at `9ccb572`.
+- #206: open, `q-later`. It owns Gradus style integration.
 
-## Duplicates and relocation
+## Findings and destinations
 
-Relocate first, then remove. Each removed block stays reachable by a Wiki revision link and its issue.
+Each removal keeps the text reachable by a revision link and the issue.
 
-| Block | Problem | Destination | Main page keeps |
-|---|---|---|---|
-| Home 6-13 (#195) | Stale status. Execution detail duplicates `docs/pages-gate-qualification.md`. | #195 and the qualification doc. Text at Home `18038ed`. | One status row. |
-| Home 15-23 (#191) | Full spec on the entry page. | Own Wiki page, or #191 issue. Text at Home `05cf6aa`. | One status row. |
-| Home 25-34 (#186) | Full spec on the entry page. | Own Wiki page, or #186 issue. Text at Home `6b9027b`. | One status row. |
-| Home 36-41 (rule) | Second writing rule. Differs from the #205 wording. | Single authority, see below. | One link. |
-| Home 42-45, Required-settings 3-32 (#187) | Onboarding proposal in the settings page. #187 owns it. | #187 issue. Text at Required-settings `d3cc01c`. | One link to #187. |
-| Required-settings 46, 48 | PM mode proposals under "Codex workers". Not a setting. | `docs/external-pm-tick.md`, #185, #186. | One line, status "proposed". |
-| Required-settings 47 | Confirmed preflight ACK requirement. Wrong heading. | Same page, new "PM" heading. | Short bullet. |
-| Known-issues 12 (#159) | Investigation log in a symptom list. | #159 issue. | Symptom, action, link. |
+- **Home 9-48** (four full specifications: #195, #191, #186, #187). Home must hold start and navigation only. Destination: draft Specifications index, one entry per specification. Each entry links the issue and the accepted revision.
+- **Home 4, 7** (#197 and #186 stage 1 links). Destination: Specifications index. Both pages stay unchanged.
+- **Home 41-43** (writing rule). Competes with Gradus Caveman. Destination: Home links Gradus. The old text stays at Home `d3cc01c`.
+- **Required-settings 3-32** (#187 short start, scenario table, help outline). Not a setting. Destination: #187 entry in the index, with links to Home and Required-settings `d3cc01c`.
+- **Required-settings 46, 48** (proposed PM modes under "Codex workers"). Not a setting. Destination: one line in the new PM section, links to #185, #186 and `docs/external-pm-tick.md`.
+- **Required-settings 47** (local-command ACK). Confirmed requirement under the wrong heading. Destination: new section "PM: local-command ACK before worker launch".
+- **Known-issues 12** (#159 investigation log in a symptom list). #159 is closed. Destination: #159 and Known-issues `1d9ce23`. The page keeps symptom and action.
 
-No other duplicate source found. The tick reply rule exists in manager contract § 3 and `TICK_PROMPT`; a test keeps `TICK_PROMPT` equal to § 2.
+Known-issues 3-11 and 13-16, Cleanup-schedule and Atomic-reservation: no change.
 
-## Single authority for the writing rule
+## Writing style authority
 
-Proposed text (from #205):
+- Authority: Gradus Caveman, pinned at `62579538f05fb6b69a12449c1ebad9567d1fdecc`. TaskQ links it; it does not copy or redefine it.
+- Persistent docs use `rules/documentation.md`: grammatical, plain English.
+- #206 owns integration into contracts, briefs and templates. This task changes none of them.
+- The earlier proposal of a "Writing" section in `taskq/contracts/taskq.md` is withdrawn.
 
-> Action -> command -> result. State the material blocker, risk or unknown when needed. Short sentences. Clear words. Normal spaces. No filler or repeated context. Terse Russian and English must remain understandable.
+## Repository sources (read-only, no change)
 
-Recommendation: the authority is a new short section "Writing" in `taskq/contracts/taskq.md`.
-Reason: workers and PMs both read it offline through `taskq contract`.
+- `taskq/contracts/taskq-manager.md` § 3 "Reply to the owner": links only, Workers table and Board line once per pass.
+- `taskq/tick.py` `TICK_PROMPT` v2: reply in the owner's language; one or two lines when nothing changed.
+- `taskq/worker.py` brief: no style rule.
+- Report schema v1 (`taskq preflight --json`, `report_contract.template`): required report and worker fields.
 
-Links, no copies:
+## Risks and unknowns
 
-- Wiki Home: one line linking the contract section.
-- `taskq-manager.md` § 3 "Reply to the owner": one line linking the section.
-- `worker.py` brief: one line naming the section.
-- `TICK_PROMPT`: no change. It already points to § 3.
-
-Decision for the user: #189 made the Wiki the normative source. This recommendation puts the rule in the packaged contract instead. Alternative: the Wiki holds it, and the contract links the Wiki. Then offline workers cannot read the rule.
-
-## Boundaries
-
-- #187: onboarding and two-level help. This task does not write help text.
-- #198: context hygiene.
-- One PM or separate TICK: later architecture. Not touched.
-- Old chat and issue messages stay as written.
-
-## Unknowns
-
-- Wiki has no link checker in CI. A link check runs manually at migration.
-- `contract_news` hashes only `taskq-manager.md` (`taskq/tick.py` 89-90). A running PM is not told about a `taskq.md` change.
+- The Wiki can change before publication. Recheck the base revision, then rebuild the diff if it moved.
+- The Specifications page must be published before Home links it. GitHub answers 200 for a missing Wiki page, so a link check does not catch this.
+- The Gradus link pins one revision. #206 decides whether to follow a newer revision.

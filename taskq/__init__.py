@@ -646,6 +646,8 @@ def refusal(candidate, everything, open_iids, runtime=None):
     if candidate.get('reservation'):
         found = candidate['reservation']
         return f'reserved by {found.get("coordinator")}{where(found)} for its {found.get("runtime")} worker'
+    if (candidate['claim'] or {}).get('session'):  # #208: a ready task naming a worker: whose it is is unknown
+        return f'its claim still names session {candidate["claim"]["session"]}; release it first'
     if runtime and candidate['runtime'] not in (None, runtime):
         return f'runtime is {candidate["runtime"]}'
     if candidate.get('host') not in (None, machine()):

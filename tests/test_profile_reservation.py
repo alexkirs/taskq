@@ -336,6 +336,80 @@ class Reservation(unittest.TestCase):
                     q.unlock(iid)
                     q.save(q.task(iid), 'later')
 
+    def test_only_the_reserving_principal_settles_and_only_with_its_launch_process_known(self):
+        foreign = self.reserved(dead_pid())
+        self.gitlab.uid = 2  # another user's coordinator on the same machine
+        output, spawns = self.tick()
+        self.assertIn('reserved by user 1: settled by that user', output)
+        self.assertEqual(('reservation' in self.block(foreign), foreign in self.gitlab.locked(), spawns), (True, True, []))
+        self.gitlab.uid = 1
+        q.save(q.task(foreign), 'later')
+        current = q.task(iid := self.reserved(dead_pid()))
+        q.save(current, reservation={key: value for key, value in current['reservation'].items() if key != 'pid'})
+        output, spawns = self.tick()
+        self.assertIn('its launching process is unknown', output)  # no proof the coordinator ended: unknown holds
+        self.assertEqual(('reservation' in self.block(iid), iid in self.gitlab.locked(), spawns), (True, True, []))
+
+    def test_release_acts_only_on_the_attempt_it_read(self):
+        iid = self.reserved(dead_pid())
+        user, replaced = q.user, []
+
+        def replacing():  # another principal's attempt lands after the release read the task
+            if not replaced:
+                replaced.append(1)
+                current = q.task(iid)
+                q.save(current, reservation={**current['reservation'], 'attempt': 'replacement', 'principal': 2})
+            return user()
+        with patch.object(q, 'user', replacing):
+            self.assertIn('its reservation changed since this release read it', self.refused(COORDINATOR, 'release', iid, '--text', 'x'))
+        self.assertEqual((self.block(iid)['reservation']['attempt'], iid in self.gitlab.locked()), ('replacement', True))
+        self.assertIn('only that user releases it', self.refused(COORDINATOR, 'release', iid, '--text', 'x'))
+        self.assertFalse(worker.release_reservation({**q.task(iid), 'reservation': {**q.task(iid)['reservation'], 'attempt': 'mine'}}, 'x'))
+        self.gitlab.uid = 1  # the exact attempt, read fresh, but of another principal
+        self.assertFalse(worker.release_reservation(q.task(iid), 'x'))
+        self.assertEqual((self.block(iid)['reservation']['attempt'], iid in self.gitlab.locked()), ('replacement', True))
+
+    def test_a_failed_launch_never_clears_a_replaced_attempt(self):
+        iid = self.add('--type', 'research', '--runtime', 'claude')
+
+        def replace_then_fail():
+            current = q.task(iid)
+            q.save(current, reservation={**current['reservation'], 'attempt': 'replacement', 'principal': 2})
+            q.fail('claude could not start the session: crashed')
+        self.launches(during=replace_then_fail)
+        self.agents = {}
+        with patch.object(q, 'claude_agents', lambda strict=False: {}):
+            self.refused(COORDINATOR, 'spawn', '--name', f'T{iid} t')
+        self.assertEqual((self.block(iid)['reservation']['attempt'], iid in self.gitlab.locked()), ('replacement', True))
+
+    def test_a_foreign_reservation_seen_under_the_lock_keeps_that_lock(self):
+        iid = self.add('--type', 'research', '--runtime', 'claude')
+        self.launches()
+        lock, done = q.lock, []
+
+        def foreign_write(number):
+            taken = lock(number)
+            if not done:
+                done.append(1)
+                q.save(q.task(iid), reservation={'attempt': 'foreign', 'runtime': 'claude', 'principal': 2, 'node': 'elsewhere'})
+            return taken
+        with patch.object(q, 'lock', foreign_write):
+            self.assertIn('reserved by', self.refused(COORDINATOR, 'spawn', '--name', f'T{iid} t'))
+        self.assertEqual((self.spawned, self.block(iid)['reservation']['attempt'], iid in self.gitlab.locked()), ([], 'foreign', True))
+
+    def test_a_ready_task_still_naming_a_worker_fails_closed(self):
+        iid = self.add('--type', 'research', '--runtime', 'claude')
+        q.save(q.task(iid), claim={'runtime': 'claude', 'session': 'foreign-live', 'node': q.node()})
+        self.launches()
+        self.assertIn('claim still names session foreign-live', self.refused(COORDINATOR, 'spawn', '--name', f'T{iid} t'))
+        self.assertIn('claim still names session foreign-live', self.refused(WORKER, 'take', iid))
+        self.assertEqual((self.spawned, self.block(iid)['claim']['session'], self.gitlab.locked()), ([], 'foreign-live', []))
+        self.do(COORDINATOR, 'release', iid, '--text', 'its worker is gone')  # the legacy placeholder {None, None}
+        self.assertEqual(self.block(iid)['claim'], {'runtime': None, 'session': None})
+        self.spawn(iid)
+        self.do(WORKER, 'take', iid)
+        self.assertEqual((self.spawned, self.block(iid)['claim']['session']), ([f'T{iid} t (mac-1)'], 'worker-1'))
+
     def test_another_machines_reservation_is_not_settled_here(self):
         with patch.object(q.socket, 'gethostname', return_value='win-2.lan'):
             iid = self.reserved(dead_pid())

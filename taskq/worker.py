@@ -298,8 +298,14 @@ def requeue(args):
         # place was free while the task waited, so the limit is not checked: the worker never left.
         core.save(current, 'doing', args.action, args.text, waiting_for=None, result=None)
         return print(f'#{args.iid} is doing again with your claim: continue in this session')
-    if (current.get('reservation') or {}).get('principal') not in (None, core.user()):
-        core.fail(f'#{args.iid} is reserved by user {current["reservation"]["principal"]}: only that user releases it')
+    if current.get('reservation'):
+        # #208: only the reserving user releases, and only the attempt it read: a fresh read under that check.
+        uid, found = core.user(), current['reservation']
+        current = core.task(args.iid)
+        if current.get('reservation') != found:
+            core.fail(f'#{args.iid}: its reservation changed since this release read it; read it again')
+        if found.get('principal') != uid:
+            core.fail(f'#{args.iid} is reserved by user {found.get("principal")}: only that user releases it')
     # An empty claim marks a started task: it keeps its paths and its next worker continues.
     claim = current['claim'] and {'runtime': None, 'session': None}
     if args.action == 'release' and (before := releases(args.iid)):
@@ -547,10 +553,14 @@ def reserve(iid, runtime, limits=None):
 
 
 def abandon(iid, attempt, why):
-    """Undo a reservation that failed before its launch: drop the attempt if the block holds it, then the lock.
-    A failing read or write keeps the lock, so a written attempt is never left without it (reconcile settles it)."""
+    """Undo a reservation that failed before its launch: drop the attempt if the block holds it, then this launch's
+    lock. A failing read or write keeps the lock, so a written attempt is never left without it (reconcile settles
+    it); another attempt found in the block keeps the lock too: it is not this launch's to undo."""
     current = core.task(iid)
-    if (current.get('reservation') or {}).get('attempt') == attempt['attempt']:
+    found = current.get('reservation')
+    if found and found != attempt:
+        return
+    if found:
         core.save(current, reservation=None, note_action='launch', note_text=f'Attempt {attempt["attempt"]} released: {why}')
     core.unlock(iid)
 
@@ -589,18 +599,22 @@ def failed_launch(iid, attempt, error):
         why = core.codex_line(str(error))
         # `claude --bg` answered but `claude agents` did not list it yet: a session may exist, so the outcome is unknown.
         if 'does not list the new session' not in str(error) and launched(iid, attempt['runtime']) == []:
-            release_reservation(core.task(iid), attempt, f'launch failed, no worker started: {why}')
+            release_reservation({**core.task(iid), 'reservation': attempt}, f'launch failed, no worker started: {why}')
         else:
             core.note(iid, 'launch', f'Attempt {attempt["attempt"]} outcome unknown: {why}. The reservation stays; '
                       f'release it with `{core.TOOL} release {iid}` once no worker of it runs.')
             print(f'#{iid}: launch outcome unknown, reservation kept: {why}', file=sys.stderr)
 
 
-def release_reservation(current, attempt, why):
-    """Drop exactly `attempt` and its lock; a reservation that changed meanwhile is someone else's to settle."""
-    if (current.get('reservation') or {}).get('attempt') != attempt['attempt'] or current['state'] != 'ready':
+def release_reservation(current, why):
+    """Drop exactly `current`'s reservation and its lock, on a fresh read: the same attempt of this principal on a
+    still ready task with the same claim. Anything else changed meanwhile is someone else's to settle.
+    ponytail: the tracker has no compare-and-set; the fresh read narrows the window to one round trip."""
+    found, fresh = current['reservation'], core.task(current['iid'])
+    if (fresh['state'] != 'ready' or fresh.get('reservation') != found or fresh['claim'] != current['claim']
+            or found.get('principal') != core.user()):
         return False
-    core.save(current, reservation=None, note_action='launch', note_text=f'Attempt {attempt["attempt"]} released: {why}')
+    core.save(fresh, reservation=None, note_action='launch', note_text=f'Attempt {found["attempt"]} released: {why}')
     core.unlock(current['iid'])
     return True
 
@@ -627,7 +641,11 @@ def reconcile(current, args=None):
     found, iid, release = current['reservation'], current['iid'], None
     if not core.local_node(found.get('node') or ''):
         why = f'reserved on another machine{core.where(found)}: settled there'
-    elif found.get('pid') and running(found['pid']):
+    elif found.get('principal') != core.user():
+        why = f'reserved by user {found.get("principal")}: settled by that user'
+    elif not found.get('pid'):
+        why = 'its launching process is unknown'
+    elif running(found['pid']):
         why = 'its launch is still running'
     elif session := launch_session(iid, found.get('attempt') or ''):
         state, _ = liveness({**current, 'state': 'doing', 'claim': {'runtime': found['runtime'], 'session': session}}, core.claude_agents())
@@ -637,7 +655,7 @@ def reconcile(current, args=None):
         sessions = launched(iid, found['runtime'])
         release = sessions == [] and 'its launch was interrupted: no worker of it runs'
         why = release or ('its launch outcome is unknown' if sessions is None else f'its worker {sessions[0]} has not taken it yet')
-    released = bool(release) and bool(fresh := core.unchanged(current)) and release_reservation(fresh, found, release)
+    released = bool(release) and release_reservation(current, release)
     core.record(args, 'reservation', status='released' if released else 'kept', task=iid, reason=why)
     print(f'{core.ref(current)}: reservation {found.get("attempt")} {"released" if released else "kept"}: {why}.')
     return released

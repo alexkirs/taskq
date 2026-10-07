@@ -75,6 +75,18 @@ class ReportContractTests(unittest.TestCase):
                         self.assertEqual(self.verify(payload, runtime)['status'], 'unknown')
                     self.assertEqual(self.verify(payload, runtime, rendered='Done')['status'], 'unknown')
 
+    def test_event_during_pass_is_valid_but_future_event_is_not(self):
+        report = self.payload()
+        now = datetime.now(timezone.utc).timestamp()
+        utc = lambda at: datetime.fromtimestamp(at, timezone.utc).isoformat().replace('+00:00', 'Z')
+        report['observed_at'] = utc(now - 30)
+        report['workers'][0]['event_at'] = utc(now - 10)
+        self.assertEqual(tick.validate_report(report, now=now), [])
+        self.assertEqual(self.verify(report)['status'], 'applied')
+        report['workers'][0]['event_at'] = utc(now + 60)
+        self.assertIn('worker event time unknown/invalid', tick.validate_report(report, now=now))
+        self.assertEqual(self.verify(report)['status'], 'unknown')
+
     def test_long_pass_does_not_refresh_source_observation(self):
         report = self.payload()
         observed = datetime.fromtimestamp(1000, timezone.utc).isoformat().replace('+00:00', 'Z')

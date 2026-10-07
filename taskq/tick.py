@@ -211,7 +211,7 @@ def validate_report(report, now=None):
         if row['commit'] != 'unavailable' and not url(row['commit']):
             errors.append('worker commit link missing')
         event = report_timestamp(row['event_at'])
-        if event is None or (observed is not None and event > observed):
+        if event is None or event > now:
             errors.append('worker event time unknown/invalid')
         # An old issue update is truthful activity, not a stale observation of current state.
     return errors

@@ -5,7 +5,13 @@ Draft for root and user review. Not published. Sources, status check and destina
 ## Proposed Wiki diff (frozen)
 
 - Base: Wiki `9ccb572258c14c0252ba74e2db6d1f288a5f12fb`.
-- Diff SHA-256: `cc61b5ff7a9ba23b37b09061bc0c1a0e98e218496b35d520ae7cc5db5f3c8591` (the text inside the four-backtick `diff` block below, ending with a newline).
+- Diff SHA-256: `4acd386c45851d9d14c305365a7bb6c48f7d60b9d5f87145760c4ff307c459f2`. Bytes hashed: every line between the opening `diff` fence and the closing four-backtick fence, each line ending with a newline, fence lines excluded. Reproduce:
+
+  ```
+  awk '/^````diff$/{f=1;next} /^````$/{f=0} f' docs/wiki-editorial-samples.md | shasum -a 256
+  ```
+
+- Blank context lines are empty, not a single space, so `git diff --check` stays clean. `git apply` accepts them; the diff applies cleanly to the base.
 - Pages: Home (five links), new Specifications index, Required-settings, Known-issues. Cleanup-schedule and Atomic-reservation-before-worker-launch are unchanged.
 - Draft only: the Specifications page does not exist. The Home link to it is part of this proposal, not a working link today.
 - Publication order: Specifications, then Required-settings and Known-issues, then Home.
@@ -20,7 +26,7 @@ index 7031739..4ea75cf 100644
 @@ -1,48 +1,7 @@
 -taskq: a task queue in GitHub or GitLab Issues, worked by Claude Code and Codex agents. Start with the [README](https://github.com/alexkirs/taskq#readme).
 +taskq: a task queue in GitHub or GitLab Issues, worked by Claude Code and Codex agents.
- 
+
 -- [Required settings](https://github.com/alexkirs/taskq/wiki/Required-settings): what Claude and Codex workers need on each machine.
 -- [Cleanup schedule](https://github.com/alexkirs/taskq/wiki/Cleanup-schedule): accepted #197 specification; integration pending.
 +- [README](https://github.com/alexkirs/taskq#readme): install and first steps.
@@ -90,7 +96,7 @@ index f3da7ec..fe56d2e 100644
 +++ b/Required-settings.md
 @@ -1,36 +1,5 @@
  What a machine needs before its workers start. `taskq doctor` checks each item it can and prints the fix.
- 
+
 -## Short start and help (#187)
 -
 -Use the [canonical writing rule](https://github.com/alexkirs/taskq/wiki/Home#documentation-style-and-two-level-help-187). Report only verified status. Example after checks:
@@ -123,16 +129,16 @@ index f3da7ec..fe56d2e 100644
 -Acceptance: a new user gets a useful short start and finds detailed help; examples use real commands; changed content versions propagate through #187/#191; minimal parser/example and generated-content drift checks. No setup, dispatch or timer is implied by reading help.
 -
  ## Claude Code workers
- 
+
  - **Login:** run `claude auth login` once, with the same `claude` the tick starts. [Authentication](https://code.claude.com/docs/en/authentication)
 @@ -43,9 +12,22 @@ Acceptance: a new user gets a useful short start and finds detailed help; exampl
  - **A signed-in Codex app server:** workers run on `~/.codex/app-server-control/app-server-control.sock`. The Codex desktop app starts it; without the app (headless Linux, a server) run `codex login --device-auth && codex app-server daemon start` (`codex app-server daemon bootstrap` keeps it across reboots) (#160). [Codex app](https://developers.openai.com/codex/app), [App server](https://developers.openai.com/codex/app-server)
  - **Sandbox and approval:** nothing to set. taskq starts every Codex turn with approval `never` and sandbox `workspace-write` with network on; writable: the checkout's `.git` and `.worktrees` and the taskq state dir (#149), plus any project paths in `taskq.toml` `[codex] writable = ["../media"]` (relative to the main checkout or `~/`; a missing path is skipped and `taskq doctor` warns, #154). [Sandboxing](https://developers.openai.com/codex/concepts/sandboxing), [Approvals and security](https://developers.openai.com/codex/agent-approvals-security)
- 
+
 -- **DOT PM with a separate local TICK sender (recommended, proposed).** Prefer DOT for interactive PM and a separate local sender every 5 minutes, with one timer owner per project and explicit handoff. Supported send/receive still needs qualification in [#185](https://github.com/alexkirs/taskq/issues/185); proposed transport is not already-working transport. A delivery receipt proves neither local execution nor a completed pass; follow the [external PM guide](https://github.com/alexkirs/taskq/blob/main/docs/external-pm-tick.md).
 -- **Actual local-execution ACK before worker launch (confirmed narrow evidence).** Have the selected executor run `taskq preflight --json` from the main checkout and return stdout, stderr, exit code and observation time. [#181 evidence](https://github.com/alexkirs/taskq/blob/main/docs/external-pm-tick.md#read-only-evidence-for-181) confirms local command execution only; runtime capability and effective launch policy remain unknown until separately qualified. Chat activity is not an ACK ([#177](https://github.com/alexkirs/taskq/issues/177)); a preflight ACK is not launch authority or a completed TICK pass.
 -- **One DOT PM for several projects (proposed, unqualified).** Choose only an explicit project set, with separate directories, queues, settings, claims and bounded passes; never automatically manage every folder. Use one aggregate report preserving project identity, stages, blockers and session links, so a failed project does not obscure another. [#186](https://github.com/alexkirs/taskq/issues/186) owns qualification; [#187](https://github.com/alexkirs/taskq/issues/187) owns later canonical hints/onboarding.
- 
+
  A machine that never runs Codex sets `limit.codex = 0` in `taskq.local.toml`; doctor then skips the Codex checks.
  A Codex-only machine sets `limit.claude = 0`; doctor then skips the Claude login, folder trust and permissions.
 +
@@ -201,39 +207,51 @@ CLI-only push e4e6fec (PR 202): tests run 37675786566 success. Pages run 3767578
 
 ### PM tick, English
 
+The generator prints the report block; the PM copies it unchanged and adds judgment lines below. Seven Workers columns, as in `render_report` (`taskq/tick.py`, `main` `ec0cd34`).
+
 ```text
-Report v1 <sha256 prefix> · source <Wiki revision link> · <repository URL> · profile <host>
-Observed <observed_at UTC> · outcome ok
+PM report v1 sha256:<sha256>
+Source: <Wiki revision link>
+Repository: <repository URL>
+Profile: {"host": "<host>"}
+Observed: <observed_at UTC>; outcome: ok
 Board: <board URL>
+## Workers
+| Task | State | Runtime | Session | Last activity | Event time | Commit |
+|---|---|---|---|---|---|---|
+| [#205](<issue URL>) <title> | review | claude @<machine> | [session](<session URL>) | <last activity> | <event_at UTC or unknown> | [<sha7>](<commit URL>) |
+Actions: []
+Refusals: []
+Source status: available; received/applied: unknown (verify supported-channel output).
+Validation: []
 
-| Task | State | Runtime | Session | Last activity |
-|---|---|---|---|---|
-| [#205 <title>](<issue URL>) | review | claude @<machine> | [session](<session URL>) | <last activity> |
-
-#205: event <event_at UTC or unknown> · commit [<sha7>](<commit URL>)
-Actions: none. Refusals: none. Source status: ok.
 Needs you: review #205.
 Unknown: #176 permission state; runtime-status unavailable. Held; no retry, no new worker.
 ```
 
 ### PM tick, Russian
 
+Same generated block, unchanged. Only the PM lines are in Russian.
+
 ```text
-Report v1 <sha256 prefix> · source <Wiki revision link> · <repository URL> · profile <host>
-Наблюдение <observed_at UTC> · outcome ok
+PM report v1 sha256:<sha256>
+Source: <Wiki revision link>
+Repository: <repository URL>
+Profile: {"host": "<host>"}
+Observed: <observed_at UTC>; outcome: ok
 Board: <board URL>
+## Workers
+| Task | State | Runtime | Session | Last activity | Event time | Commit |
+|---|---|---|---|---|---|---|
+| [#205](<issue URL>) <title> | review | claude @<machine> | [session](<session URL>) | <last activity> | <event_at UTC or unknown> | [<sha7>](<commit URL>) |
+Actions: []
+Refusals: []
+Source status: available; received/applied: unknown (verify supported-channel output).
+Validation: []
 
-| Task | State | Runtime | Session | Last activity |
-|---|---|---|---|---|
-| [#205 <title>](<issue URL>) | review | claude @<machine> | [session](<session URL>) | <last activity> |
-
-#205: событие <event_at UTC или unknown> · коммит [<sha7>](<commit URL>)
-Действия: нет. Отказы: нет. Источник: ok.
 Нужно от вас: ревью #205.
 Неизвестно: состояние разрешений #176; runtime-status недоступен. Ждём; без повтора и нового воркера.
 ```
-
-Field names, Board line and table columns stay as the generator prints them. The PM adds only the last lines.
 
 ### Blocker, English
 

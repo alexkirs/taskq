@@ -14,12 +14,18 @@ import taskq as core
 
 CODEX_SOCKET = Path.home() / '.codex/app-server-control/app-server-control.sock'
 CODEX_IPC = Path.home() / '.codex/ipc/ipc.sock'
-# Design decision 2026-10-06: a Codex worker runs outside the sandbox and never asks. Inside it, git
-# could not write the main checkout's refs (`git worktree add`) and glab could not read its token.
-CODEX_TURN_POLICY = {'approvalPolicy': 'never', 'sandboxPolicy': {'type': 'dangerFullAccess'}}
-# thread/start and thread/resume use the CLI spelling; turn/start uses the policy enum.
-CODEX_ACCESS = {'sandbox': {'dangerFullAccess': 'danger-full-access'}[CODEX_TURN_POLICY['sandboxPolicy']['type']],
-                'approvalPolicy': CODEX_TURN_POLICY['approvalPolicy']}
+# Design decision 2026-10-07 (#57 probe, #149): a Codex worker runs in workspace-write with network on
+# and never asks; every step of a worker passed there. The worktree lives in ROOT/.worktrees, but git
+# writes its refs, objects and worktree admin files into the main checkout's .git, so .git is a root.
+# The taskq state dir holds the machine id and update stamp.
+def codex_turn_policy():
+    roots = [core.ROOT / '.git', core.ROOT / '.worktrees', core.UPDATE_STAMP.parent]
+    return {'approvalPolicy': 'never', 'sandboxPolicy': {
+        'type': 'workspaceWrite', 'networkAccess': True, 'writableRoots': [str(root) for root in roots]}}
+
+
+# thread/start and thread/resume use the CLI spelling; turn/start carries the full policy.
+CODEX_ACCESS = {'sandbox': 'workspace-write', 'approvalPolicy': 'never'}
 
 
 class Codex:
@@ -170,7 +176,7 @@ def codex_send_app(codex, thread, metadata, text):
             if reply['resultType'] == 'success':
                 return 'steered the active turn in the Codex app'
         reply = ipc.request('thread-follower-start-turn', {'conversationId': thread, 'turnStart': {
-            'request': {'threadId': thread, 'input': item, **CODEX_TURN_POLICY}, 'context': {}}}, 2, owner)
+            'request': {'threadId': thread, 'input': item, **codex_turn_policy()}, 'context': {}}}, 2, owner)
         if reply['resultType'] != 'success':
             core.fail(f'Codex app refused the message for {thread}: {reply.get("error")}')
         return 'new turn in the Codex app'
@@ -203,7 +209,7 @@ def codex_spawn(name, prompt=None):
     codex.call('thread/name/set', {'threadId': thread, 'name': name})
     if section := core.codex_override('section'):
         codex.call('thread/section/move', {'threadId': thread, 'sectionId': section})
-    codex.call('turn/start', {'threadId': thread, **CODEX_TURN_POLICY,
+    codex.call('turn/start', {'threadId': thread, **codex_turn_policy(),
                             'input': [{'type': 'text', 'text': prompt or 'Reply with the single word: ready'}]})
     if not prompt:
         codex.wait_turn(thread, 280)
@@ -236,7 +242,7 @@ def codex_send(args):
                 core.fail(f'Codex thread {args.thread} is held by the Codex app, but no app window owns it; '
                      f'open it there (`open -g codex://threads/{args.thread}`) and send again')
             raise
-        codex.call('turn/start', {'threadId': args.thread, **CODEX_TURN_POLICY,
+        codex.call('turn/start', {'threadId': args.thread, **codex_turn_policy(),
                                 'input': [{'type': 'text', 'text': args.text}]})
         codex_release(codex, args.thread)
     print(f'delivered to {args.thread}' + (' (steered active turn)' if status == 'active' else ''))
@@ -303,7 +309,7 @@ def codex_live_entries(path, turn):
     return [entry for sid, entry in processes.items() if sid not in recorded] + list(calls.values()), last
 
 
-def codex_turn_policy(path, turn_id):
+def recorded_turn_policy(path, turn_id):
     """Report this turn's recorded policy, never its thread defaults or our desired policy."""
     policy = None
     if not path:
@@ -362,7 +368,7 @@ def codex_snapshot(codex, thread, limit=3, include_policy=False):
     stamps += [turn[key] for turn in turns for key in ('startedAt', 'completedAt') if turn.get(key) is not None]
     stamps += [turn['liveStamp'] for turn in turns if turn.get('liveStamp') is not None]
     if include_policy and turns:
-        turns[0]['policy'] = codex_turn_policy(metadata.get('path'), turns[0]['id'])
+        turns[0]['policy'] = recorded_turn_policy(metadata.get('path'), turns[0]['id'])
     return metadata['status'], turns, max(stamps, default=None)
 
 

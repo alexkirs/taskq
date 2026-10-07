@@ -1321,11 +1321,11 @@ class Cycle(unittest.TestCase):
         self.assertEqual([method for method, _ in self.codex.calls],
                          ['thread/read', 'thread/resume', 'turn/start', 'thread/unsubscribe'])
         self.assertEqual(self.codex.calls[-2][1]['approvalPolicy'], 'never')
-        self.assertEqual(self.codex.calls[-2][1]['sandboxPolicy'], {'type': 'dangerFullAccess'})
+        self.assertEqual(self.codex.calls[-2][1]['sandboxPolicy'], codex.codex_turn_policy()['sandboxPolicy'])
         self.codex.status = 'idle'
         self.codex.calls.clear()
         self.do(CLAUDE, 'codex-send', 't1', '--text', 'after a restricted turn')
-        self.assertEqual(self.codex.calls[-2][1]['sandboxPolicy'], {'type': 'dangerFullAccess'})
+        self.assertEqual(self.codex.calls[-2][1]['sandboxPolicy'], codex.codex_turn_policy()['sandboxPolicy'])
         self.assertEqual(self.codex.calls[-1][0], 'thread/unsubscribe')
         self.assertEqual([call[0] for call in self.ipc.calls], ['thread-owner-discovery'])
         self.codex.status = 'notLoaded'
@@ -1343,7 +1343,7 @@ class Cycle(unittest.TestCase):
         self.assertIn('new turn in the Codex app', self.do(CLAUDE, 'codex-send', 't1', '--text', 'next'))
         method, params, version, target = self.ipc.calls[-1]
         self.assertEqual((method, version, target), ('thread-follower-start-turn', 2, 'window'))
-        self.assertEqual(params['turnStart']['request']['sandboxPolicy'], {'type': 'dangerFullAccess'})
+        self.assertEqual(params['turnStart']['request']['sandboxPolicy'], codex.codex_turn_policy()['sandboxPolicy'])
         self.assertEqual(params['turnStart']['request']['approvalPolicy'], 'never')
         self.assertNotIn('thread/resume', [method for method, _ in self.codex.calls])
         # The shared server reads the app's running turn as interrupted; its rollout has no end for it yet.
@@ -1369,9 +1369,11 @@ class Cycle(unittest.TestCase):
         first = next(params for method, params in self.codex.calls if method == 'turn/start')
         self.assertEqual(first['input'][0]['text'], 'Run the brief')
         self.assertNotIn('wait_turn', [method for method, _ in self.codex.calls])
-        self.assertEqual(params['sandboxPolicy'], {'type': 'dangerFullAccess'})
+        self.assertEqual(params['sandboxPolicy'], {
+            'type': 'workspaceWrite', 'networkAccess': True,
+            'writableRoots': [str(q.ROOT / '.git'), str(q.ROOT / '.worktrees'), str(q.UPDATE_STAMP.parent)]})
         start = next(params for method, params in self.codex.calls if method == 'thread/start')
-        self.assertEqual(start['sandbox'], 'danger-full-access')
+        self.assertEqual(start['sandbox'], 'workspace-write')
         self.assertEqual(start['approvalPolicy'], 'never')
 
     def test_codex_spawn_finds_the_app_project_by_the_checkout_path(self):

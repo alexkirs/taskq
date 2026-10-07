@@ -505,8 +505,10 @@ worker sessions. The coordinator checked their `turn_context`: CLI queue started
 `workspace-write` and `network_access: false`, so Git could not write the main checkout's refs and
 `glab` could not get its token from the macOS keyring. Thread settings alone are not enough: a turn
 policy can persist into later turns. Every taskq `turn/start`, including the first ready in spawn
-and codex-send, explicitly passes `approvalPolicy: never`, `sandboxPolicy: {type: dangerFullAccess}`
-from `CODEX_TURN_POLICY`. The thread/start and resume settings are derived from the same policy in
+and codex-send, explicitly passes `approvalPolicy: never` and `sandboxPolicy: {type: workspaceWrite,
+networkAccess: true, writableRoots: [<main checkout>/.git, <main checkout>/.worktrees, <taskq state
+dir>]}` from `codex_turn_policy()` (2026-10-07, #149: the #57 probe passed every worker step there;
+`.git` is a root because git writes the worktree's refs and objects into the main checkout's `.git`). The thread/start and resume settings are derived from the same policy in
 their protocol's format. In the installed schema `thread/queue/add` does not accept a turn policy,
 so taskq does not use it for active-send. `turn/steer` does not start a new turn and does not change
 the sandbox of a running turn; a restricted turn stays restricted until it ends. The next new turn
@@ -568,8 +570,8 @@ the app, the coordinator reads and writes via taskq. This is the default mode, t
 - *The coordinator writes through the app.* For a session the shared server has not loaded,
   `codex-send` asks the app's IPC `thread-owner-discovery`. If there is an owner, the message goes as
   if from a second app window: `thread-follower-steer-turn` into the running turn or
-  `thread-follower-start-turn` with `CODEX_TURN_POLICY`. The app applies the policy from the request
-  (a probe with `readOnly` produced a `read-only` turn), so taskq passes full access explicitly.
+  `thread-follower-start-turn` with `codex_turn_policy()`. The app applies the policy from the request
+  (a probe with `readOnly` produced a `read-only` turn), so taskq passes its policy explicitly.
   No owner — the old path via the shared server.
 - *The coordinator reads.* `codex-read` and the tick read the session through the shared server from
   storage, without the lock. A turn running in the app is shown by the shared server as
@@ -844,8 +846,8 @@ alone also reads the queue. Neither question starts workers or arms the tick.
   (`~/.codex/ipc/ipc.sock`); prints the session id. The owner sees such a session in the sidebar
   in their project without searching. A separate section header in the sidebar and visibility of
   messages inside the session were not checked by the owner — accepted as is. Owner's decision
-  2026-10-06: the Codex worker runs outside the sandbox and without approvals; the only policy in
-  the taskq package is `CODEX_TURN_POLICY`. The thread-parameter format is produced by
+  2026-10-07 (#149): the Codex worker runs in workspace-write with network on and without approvals;
+  the only policy in the taskq package is `codex_turn_policy()`. The thread-parameter format is produced by
   `CODEX_ACCESS`. Sending messages, reading events and the turn sandbox, the CLI queue ban and
   intervening on idle are described in § 3 of this document; the coordinator follows those steps
   for both apps.

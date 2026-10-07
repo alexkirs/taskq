@@ -14,8 +14,10 @@ only local-command execution. Conversation activity, a chat acknowledgement or
 an execution item does not prove runtime capability or effective launch policy;
 those remain `unknown` until separately qualified. Preflight neither grants
 launch authority nor enforces a cross-host gate or proves later worker permissions.
-Record the actual launch route and policy separately; do not change settings to
-clear a blocker. The owner applies agreed scoped local settings.
+Record the actual launch route and policy separately. The agent performs
+explicitly authorized ordinary settings in the appropriate scope; do not assign
+that authorized setup to manual owner work. Security-sensitive expansions require
+the applicable confirmation. Never weaken safeguards or bypass denials.
 
 Read-only commands include `taskq preflight --json`, `taskq view 181 --notes 2`,
 `taskq worker` (selection and brief only), and
@@ -83,7 +85,11 @@ the exact blocker; never fabricate a result. Owner-only decisions go through
 
 Run `python3 -m unittest discover -s tests`. Commit on `taskq-181`, fetch and
 rebase onto `origin/main`, check the frozen candidate, and push only
-`HEAD:refs/heads/taskq-181` with `--force-with-lease`. Submit its exact full SHA:
+`HEAD:refs/heads/taskq-181`. Use a normal push for a new or fast-forward task branch.
+Use `--force-with-lease` only when actually needed after rebasing your own task
+branch and permitted by the contract: check the expected remote head first and
+pin the lease to that SHA (`--force-with-lease=refs/heads/taskq-181:<expected-SHA>`).
+Do not push other refs. Submit its exact full SHA:
 
 ```sh
 taskq result 181 --sha <pushed-full-SHA> --checks "<commands and outcomes>" --text "<summary>"

@@ -57,11 +57,25 @@ input set, not root CLI README/package/test files. Future generator changes must
 if they introduce dependencies outside those paths. Wiki is a separate Git repository and
 has no event in this workflow.
 
-The workflow compares the whole push range, or PR base to tested merge SHA, using Git rather
-than GitHub's capped path-filter list. Deletions and both sides of renames count. All commits
-in a multi-commit push are considered. Unknown/pre-migration/initial baselines and manual
-runs build fully. Unchanged inputs produce an explicit summary and skip build/deploy.
-Review branches and PRs may build artifacts but cannot deploy. Only main may deploy.
+The publication baseline is the SHA of the **newest `github-pages` deployment**, and only
+when its latest deployment status is `success`. It comes from public GitHub deployment/status
+metadata with two unauthenticated read-only requests; no token scope or workflow permission
+is added. Failed, pending, inactive, missing, malformed, rate-limited or unreadable metadata
+means unknown baseline and forces a full build. Private metadata also rebuilds conservatively.
+This deliberately rebuilds rather than searching older deployments after a failed latest attempt.
+
+The workflow compares that deployed SHA to the candidate's tested checkout using Git rather
+than GitHub's capped path-filter list. Deletions and both sides of renames count; all net input
+changes since deployment count, even across canceled/replaced workflow runs. Manual runs and
+unknown/pre-migration deployment SHAs build fully. A build can skip only when usable successful
+deployment metadata exists and its site inputs equal the candidate. The step logs the baseline
+SHA and reason as well as writing the summary. Review branches and PRs may build but cannot
+deploy; their unpublished site changes continue to build against the production baseline.
+
+Workflow concurrency can replace a pending run even with `cancel-in-progress: false`.
+For deployed/running A, pending site-change B and CLI-only C replacing B, compare A to C,
+never B to C. If B failed deployment, the newest deployment is unusable and C rebuilds fully.
+Only successful deployment, not successful build or previous push, advances the usable baseline.
 Read-only input/build jobs and deploy-only `pages: write`/`id-token: write` permissions preserve
 the minimum Pages permission boundary. No timer, profile, multiproject or user permission change.
 
@@ -73,7 +87,10 @@ qualification failure even when CLI eligibility succeeds.
 
 `tests/test_pages_inputs.py` uses real Git commits to cover CLI-only, manual, initial,
 unknown/pre-migration baseline, source/config/dependencies/workflow/detector changes, deletion,
-rename outside docs, multi-commit pushes and more than 300 changed files. `tests/test_open_bridge.py`
+rename outside docs, multi-commit pushes and more than 300 changed files. Additional real-Git
+controls reproduce A -> B changed, B -> C unchanged, A -> C changed; mocked deployment metadata
+proves pending replacement and failed-deploy recovery rebuild, successful published B permits
+a CLI-only C skip, and unusable metadata rebuilds fully. `tests/test_open_bridge.py`
 runs the unchanged JS in Node without navigating to an application: schemes, UUID shape,
 encoded hash, invalid links and fallback are checked. Node must be available for this receipt;
 a skipped bridge test is not qualification.
@@ -105,6 +122,15 @@ This is build compatibility evidence, not deployment freshness. The matching fai
 receipt is run [37667356335](https://github.com/alexkirs/taskq/actions/runs/37667356335),
 job 112949919577, permission denied at 2026-10-07T18:31:03Z on the first candidate.
 
+## Independent review correction
+
+The full 11-path review rejected `f6afd85cff469a001b9c162057480192d7fc8c67` with P1:
+its previous-push baseline could skip unpublished B when pending B was replaced by CLI-only C,
+and could miss recovery after B failed. Its branch skip receipt remains historical evidence
+of the old implementation, not an accepted publication guarantee. The corrected detector uses
+deployment metadata as described above. No queue-limit change or new state store is introduced.
+The independent CLI gate, existing URLs, failed-build receipts and rollback remain unchanged.
+
 ## Publication qualification still required
 
 Before closing qualification, collect an approved main CLI-only push and a site-input push
@@ -115,7 +141,8 @@ The initial manual full build must succeed. Candidate artifacts alone do not pro
 
 ## Rollback
 
-Revert the two staged implementation commits through the normal review flow to restore the
+Revert the #195 implementation commits, including the independent-review correction, through
+the normal review flow to restore the
 old CLI gate. For Pages, restore legacy publishing from main `/docs`, request a full build,
 and verify its successful deployment and existing URLs/session bridge. The source remains
 Jekyll-compatible. A settings rollback alone does not prove a working publication; record the

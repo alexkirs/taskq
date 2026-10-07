@@ -1,6 +1,9 @@
 """Real Git deletion, rename and multi-commit controls for conditional Pages."""
 import importlib.util
 import os
+import io
+import json
+from unittest.mock import patch
 from pathlib import Path
 import subprocess
 import tempfile
@@ -44,7 +47,7 @@ class PagesInputs(unittest.TestCase):
         self.write('README.md', 'changed cli')
         self.commit()
         self.assertEqual(self.reason(), 'site inputs unchanged')
-        self.assertEqual(self.reason('0' * 40), 'initial full build')
+        self.assertEqual(self.reason('0' * 40), 'unknown deployment baseline: full build')
         self.assertEqual(self.reason('f' * 40), 'unknown or pre-migration baseline: full build')
         self.assertEqual(inputs.publication_reason(self.base, self.base, 'workflow_dispatch'), 'manual full build')
 
@@ -74,6 +77,48 @@ class PagesInputs(unittest.TestCase):
             self.write(f'cli/{i}', 'cli')
         self.commit()
         self.assertEqual(self.reason(), 'site inputs changed')
+
+    def metadata(self, state, sha=None):
+        deployment = [{'id': 1, 'sha': sha or self.base, 'environment': 'github-pages'}]
+        responses = [io.BytesIO(json.dumps(data).encode()) for data in (deployment, [{'state': state}])]
+        return patch.object(inputs.urllib.request, 'urlopen', side_effect=responses)
+
+    def test_pending_replacement_compares_deployed_a_to_c(self):
+        deployed_a = self.base
+        self.write('docs/open.html', 'unpublished B')
+        pending_b = self.commit()
+        self.write('README.md', 'CLI-only C replaces pending B')
+        candidate_c = self.commit()
+        self.assertEqual(inputs.publication_reason(pending_b, candidate_c, 'push'), 'site inputs unchanged')
+        with self.metadata('success', deployed_a):
+            baseline = inputs.deployed_baseline('alexkirs/taskq')
+        self.assertEqual(baseline, deployed_a)
+        self.assertEqual(inputs.publication_reason(baseline, candidate_c, 'push'), 'site inputs changed')
+
+    def test_failed_or_pending_deployment_forces_recovery(self):
+        self.write('docs/open.html', 'B failed to deploy')
+        failed_b = self.commit()
+        self.write('README.md', 'CLI-only C')
+        candidate_c = self.commit()
+        for state in ('failure', 'error', 'pending', 'in_progress', 'queued', 'inactive'):
+            with self.subTest(state=state), self.metadata(state, failed_b):
+                baseline = inputs.deployed_baseline('alexkirs/taskq')
+            self.assertEqual(baseline, '')
+            self.assertEqual(inputs.publication_reason(baseline, candidate_c, 'push'),
+                             'unknown deployment baseline: full build')
+        with self.metadata('success', failed_b):
+            self.assertEqual(inputs.publication_reason(inputs.deployed_baseline('alexkirs/taskq'), candidate_c, 'push'),
+                             'site inputs unchanged')
+
+    def test_unreadable_missing_or_malformed_metadata_builds_fully(self):
+        for data in ([], {}, [{'id': 1, 'sha': 'bad', 'environment': 'github-pages'}]):
+            with patch.object(inputs.urllib.request, 'urlopen', return_value=io.BytesIO(json.dumps(data).encode())):
+                self.assertEqual(inputs.deployed_baseline('alexkirs/taskq'), '')
+        with patch.object(inputs.urllib.request, 'urlopen', side_effect=OSError):
+            self.assertEqual(inputs.deployed_baseline('alexkirs/taskq'), '')
+        with patch.object(inputs.urllib.request, 'urlopen') as read:
+            self.assertEqual(inputs.deployed_baseline('../bad'), '')
+            read.assert_not_called()
 
     def test_pre_migration_baseline_builds_fully(self):
         Path('.github/workflows/pages.yml').unlink()

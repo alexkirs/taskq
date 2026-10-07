@@ -418,6 +418,12 @@ Scheduling and creating sessions is an app action, not a script action.
   delivers through the app ([taskq-manager](taskq-manager.md) § Shared Codex session).
   Read boundaries, coordinator actions and the limits of live display of an external turn
   in the app are described in [taskq-manager](taskq-manager.md) § 3 One tick pass.
+  The socket `~/.codex/app-server-control/app-server-control.sock` belongs to the Codex CLI's app-server daemon;
+  the app only starts it. Headless (Linux without the app, #160): `codex login --device-auth && codex app-server daemon start`
+  (`codex app-server daemon bootstrap` keeps it across reboots) serves the same socket and protocol, so spawn, codex-send,
+  codex-read, codex-archive, the turn policy and the tick's liveness work unchanged; only the app's sidebar
+  announcement and app-window delivery are skipped (no app IPC). `doctor --codex` names that command when the
+  socket is missing; with `claude = 0` it checks no Claude login, folder trust or permissions.
 - A task with a `runtime` goes only to a session of that app; `any` goes to anyone. `add` without
   `--runtime` sets it by type (`DEFAULT_RUNTIME`): `asset` → `codex`; `code`, `docs`, `research` →
   `claude`. `--runtime any` leaves the task to anyone. Tasks created earlier without the field are `any`.

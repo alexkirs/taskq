@@ -206,7 +206,7 @@ commit during a readiness check.
 Extras only on request, each with its requirement and exact message:
 
 - **GitHub board scope:** “The queue works with labels only. A GitHub board needs Projects permission. To add it, run: `gh auth refresh -h <host> -s project`. Complete browser consent, then tell me ‘done’.” After consent, rerun init and doctor. Without the request, report the board deferred and doctor nonzero for that gap; label-only readiness is not full readiness.
-- **Codex workers:** “Codex workers need the Codex app signed in, its control socket, and a project for this checkout. I’ll prepare the project without starting a worker.” Verify `~/.codex/app-server-control`; find/create the project by the canonical main-checkout path through `taskq doctor --fix --codex`. Do not use `taskq spawn` as a project-creation workaround. A missing app or login goes through the human-only messages above.
+- **Codex workers:** “Codex workers need a signed-in Codex app server on its control socket, and a project for this checkout. I’ll prepare the project without starting a worker.” Verify `~/.codex/app-server-control`; the Codex app starts that server, and without the app (headless Linux, #160) the person runs `codex login --device-auth && codex app-server daemon start` (`daemon bootstrap` keeps it across reboots); find/create the project by the canonical main-checkout path through `taskq doctor --fix --codex`. Do not use `taskq spawn` as a project-creation workaround. A missing app or login goes through the human-only messages above.
 - **Areas:** “Which areas should this queue have?” Merge agreed names into `[areas] names`, run init, then doctor; use existing labels if sufficient. Creating areas does not broaden a confirmed worker profile.
 
 Finish with exact wording, using actual results:
@@ -234,8 +234,8 @@ automated: package/CLI installation and the worker permissions file (printed as 
 
 - The session is an ordinary Claude desktop session (not a routine and not a scheduled run: the app
   forbids such a session to start other sessions and to receive messages).
-- Codex workers need the Codex app's server socket (`~/.codex/app-server-control`); without it the tick
-  says so in one line and starts Claude workers only.
+- Codex workers need the Codex app server socket (`~/.codex/app-server-control`), served by the Codex app or,
+  headless, by `codex app-server daemon start`; without it the tick says so in one line and starts Claude workers only.
 - The queue is readable: `cd <main checkout> && taskq list`. The main checkout is the `main` branch
   tree from `git worktree list`; all queue commands run from it.
 - Workers and the coordinator run without permission prompts thanks to `<main checkout>/.claude/settings.local.json`
@@ -765,7 +765,8 @@ runtime's own variable wins; two of the built-in ones set at once stop with an e
 Onboarding one (the manager, on the owner's request):
 1. `taskq doctor`: runs each `doctor` command and lists its output as a gap while it exits nonzero;
    `ready: … , runtime grokbot` when green. A machine with `grokbot = 0` in its profile limits never starts it:
-   doctor and `--fix` print `runtime grokbot: skipped, limit 0` and run no check or setup (same for `codex = 0`).
+   doctor and `--fix` print `runtime grokbot: skipped, limit 0` and run no check or setup (same for `codex = 0`, and for
+   `claude = 0`: no Claude login, folder trust or permissions on a Codex-only machine, #160).
 2. `taskq doctor --fix`: prints the `setup` command as a `you:` step (sign-in, bot, trigger, the
    instruction to paste are the person's); run it, show its steps, wait for ‘done’, rerun doctor.
 3. `taskq selftest --scope full --runtime grokbot`: a real worker of the app through the queue.

@@ -1418,6 +1418,9 @@ class Cycle(unittest.TestCase):
         first = next(params for method, params in self.codex.calls if method == 'turn/start')
         self.assertEqual(first['input'][0]['text'], 'Run the brief')
         self.assertNotIn('wait_turn', [method for method, _ in self.codex.calls])
+        # #160: headless, no Codex app IPC: the spawn works, only the sidebar announcement is skipped
+        with patch.object(codex, 'CodexIpc', side_effect=FileNotFoundError('no app')):
+            self.assertIn('spawned', self.do(CLAUDE, 'spawn', '--runtime', 'codex', '--name', 'probe'))
         self.assertEqual(params['sandboxPolicy'], {
             'type': 'workspaceWrite', 'networkAccess': True,
             'writableRoots': [str(q.ROOT / '.git'), str(q.ROOT / '.worktrees'), str(q.UPDATE_STAMP.parent)]})
@@ -2379,7 +2382,7 @@ class Doctor(unittest.TestCase):
                 q.main(['doctor', '--codex'])
         out = out.getvalue()
         for text in ('no personal profile', 'is not logged in', 'Claude folder trust not accepted', 'lacks Bash, Read',
-                     'no Codex app server socket', '\n    taskq profile init  (built-in defaults'):
+                     'no Codex app server at', '\n    taskq profile init  (built-in defaults'):
             self.assertIn(text, out)
         self.assertNotIn('<', out)  # no placeholder left to fill in
         self.assertFalse(q.LOCAL.exists() or q.CLAUDE_CONFIG.exists())  # doctor reads only
@@ -2539,6 +2542,25 @@ class Doctor(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('runtime bot: `false` exit 1', out)
         self.assertNotIn('skipped', out)
+
+    def test_codex_only_profile_names_no_claude_step_and_the_headless_server(self):
+        """#160: claude=0 skips Claude login, trust and permissions; a missing socket names the CLI's daemon."""
+        self.enterContext(patch.object(q, 'api', Gitlab()))
+        with contextlib.redirect_stdout(io.StringIO()):
+            q.main(['init'])
+        q.CLAUDE_CONFIG.unlink()
+        (q.ROOT / '.claude/settings.local.json').unlink()
+        self.enterContext(patch.object(q, 'CODEX_SOCKET', q.ROOT / 'no-socket'))
+        q.LOCAL.write_text('[profile]\nmine = true\npreferred_runtime = "codex"\n[profile.limits]\nclaude = 0\ncodex = 1\n')
+        self.status = 1  # `claude auth status` would fail: never asked
+        with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit):
+            q.main(['doctor', '--codex'])
+        out = out.getvalue()
+        self.assertIn('runtime claude: skipped, limit 0', out)
+        for text in ('claude', 'Claude', 'settings.local.json'):
+            self.assertNotIn(text, out.replace('runtime claude: skipped', ''))
+        self.assertIn(f'no Codex app server at {q.ROOT / "no-socket"}: Codex workers cannot start (tracker and tick do not need it)', out)
+        self.assertIn('\n    codex login --device-auth && codex app-server daemon start  (the person runs it', out)
 
     def test_origin_of_another_project_is_named(self):
         self.enterContext(patch.object(q, 'api', Gitlab()))
@@ -2714,7 +2736,7 @@ class Setup(unittest.TestCase):
         self.assertEqual(self.fix()[0], 0)
         code, out = self.fix('--codex')
         self.assertEqual(code, 1)
-        self.assertIn('you: open the Codex app and sign in', out)
+        self.assertIn('you: codex login --device-auth && codex app-server daemon start\n', out)
         self.assertIn('not ready: 1 gap(s)', out)
         self.assertNotIn('\nready:', out)
         self.assertIn('No workers or timer started', out)

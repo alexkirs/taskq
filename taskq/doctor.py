@@ -167,14 +167,14 @@ def doctor(args, pending=()):
         gap(f'origin is {origin[0]}/{origin[1]}, taskq.toml names {core.HOST or ""}{"/" * bool(core.HOST)}{core.PROJECT_PATH}',
             'run taskq from that project\'s checkout, or fix [github] repo / [gitlab] project and host in taskq.toml')
     if config:
-        for what, fix in personal_gaps() + tree_gaps() + permissions_gap(core.ROOT) + trust_gap(core.ROOT):
+        claude = 'claude' not in idle()
+        for what, fix in personal_gaps() + tree_gaps() + (permissions_gap(core.ROOT) + trust_gap(core.ROOT) if claude else []):
             gap(what, fix)
-        if probe(['claude', 'auth', 'status']):  # None: no claude CLI on this machine, nothing to check
+        if claude and probe(['claude', 'auth', 'status']):  # None: no claude CLI on this machine, nothing to check
             gap('`claude` is not logged in: background workers stop at «Not logged in»',
                 'claude auth login  (the person runs it in this shell, with the same `claude` the tick starts)')
         if getattr(args, 'codex', False) and 'codex' not in idle() and not core.CODEX_SOCKET.exists():
-            gap(f'no Codex app server socket {core.CODEX_SOCKET}: Codex workers cannot start',
-                'open the Codex app and sign in  (the person does it)')
+            gap(codex_gap(), f'{core.CODEX_HEADLESS}  (the person runs it; the Codex app, when installed, starts the same server)')
         for root in core.codex_writable() if 'codex' not in idle() else ():
             if not root.exists():
                 print(f'warning: [codex] writable {root} does not exist: Codex workers run without it')
@@ -197,6 +197,12 @@ def doctor(args, pending=()):
             gap(f'{name} could not be read: {str(error).removeprefix("taskq: ")}', 'fix the cause above, then `taskq doctor` again')
     gaps += runtime_gaps()
     report_gaps(gaps, pending)
+
+
+# #160: the socket is Codex execution only; the tracker and the coordinator's tick work without it.
+def codex_gap():
+    return (f'no Codex app server at {core.CODEX_SOCKET}: Codex workers cannot start (tracker and tick do not need it); '
+            'headless, the Codex CLI\'s app-server daemon serves it')
 
 
 def personal_gaps():
@@ -261,12 +267,13 @@ def profile_init(args):
 
 def idle():
     """Runtimes this machine never starts (effective profile limit 0): doctor and `--fix` skip their checks and setup.
-    Claude is never idle here: its login, trust and permissions serve the coordinator too."""
+    Claude too (#160): a Codex-only machine's coordinator is not a Claude session, so its login, trust and
+    permissions are no gap there."""
     try:
         limits = core.resolve(argparse.Namespace(filter=None, mine=None, limit=None))[0]['limits']
     except SystemExit:
         return []  # a broken profile is personal_gaps' gap
-    return [name for name, count in limits.items() if not count and name != 'claude']
+    return [name for name, count in limits.items() if not count]
 
 
 def runtime_gaps():
@@ -487,19 +494,20 @@ def setup(args):
         print('done: removed the leftover coordinator lease')
     for fix in scope:
         person(fix, 'a GitHub board needs the token scope `project` (browser consent); until then the queue works with labels only')
-    for what, fix in permissions_gap(core.ROOT):
-        person(fix.split('  (')[0], what)
-    if not permissions_missing(core.ROOT):
-        print('ok: worker permissions')
-    for what, fix in trust_gap(core.ROOT):
-        person(fix.split('  (')[0], what + '; accept «Trust this folder» once, then quit')
-    if trusted(core.ROOT):
-        print('ok: Claude folder trust')
+    if 'claude' not in idle():
+        for what, fix in permissions_gap(core.ROOT):
+            person(fix.split('  (')[0], what)
+        if not permissions_missing(core.ROOT):
+            print('ok: worker permissions')
+        for what, fix in trust_gap(core.ROOT):
+            person(fix.split('  (')[0], what + '; accept «Trust this folder» once, then quit')
+        if trusted(core.ROOT):
+            print('ok: Claude folder trust')
     if args.codex and 'codex' not in idle():
         if core.CODEX_SOCKET.exists():
             print(f'ok: Codex app project {core.codex_project(core.Codex(timeout=60))}')
         else:
-            person('open the Codex app and sign in', f'Codex workers need its server socket {core.CODEX_SOCKET}')
+            person(core.CODEX_HEADLESS, codex_gap() + '; the Codex app, when installed, starts the same server')
     if core.LOCAL.is_file():
         print(f'ok: personal profile {core.LOCAL}')
     else:

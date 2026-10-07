@@ -12,7 +12,10 @@ import taskq as core
 
 # --- Codex app server (the desktop app's shared one); JSON-RPC over a WebSocket on a unix socket ---
 
+# The Codex CLI's app-server daemon owns this socket; the desktop app only starts that daemon. Headless (#160):
+# `codex app-server daemon start` (`bootstrap` keeps it across reboots) serves the same socket without the app.
 CODEX_SOCKET = Path.home() / '.codex/app-server-control/app-server-control.sock'
+CODEX_HEADLESS = 'codex login --device-auth && codex app-server daemon start'
 CODEX_IPC = Path.home() / '.codex/ipc/ipc.sock'
 # A loaded thread's writer lock; the file goes away when its server releases the thread (#158).
 CODEX_LOCKS = Path.home() / '.codex/thread-writer-locks'
@@ -153,8 +156,11 @@ class CodexIpc:
 
 def codex_announce(thread, method='thread-unarchived', version=1):
     """The way 'taskq probe 1' (2026-10-06) got into the app's sidebar: one `thread-unarchived` broadcast.
-    `thread-archived` (version 2 in the app's table) takes it out the same way."""
-    ipc = CodexIpc(timeout=10)
+    `thread-archived` (version 2 in the app's table) takes it out the same way. No app (headless, #160): no sidebar."""
+    try:
+        ipc = CodexIpc(timeout=10)
+    except OSError:
+        return
     try:
         ipc.broadcast(method, {'hostId': 'local', 'conversationId': thread}, version)
     finally:

@@ -377,7 +377,8 @@ def tick_pass(args, act=False):
     if warning := clone_warning():
         print(warning)
     if not core.CODEX_SOCKET.exists():
-        print(f'Codex workers unavailable on this machine: no Codex app server socket {core.CODEX_SOCKET}.')
+        print(f'Codex workers unavailable on this machine: no Codex app server socket {core.CODEX_SOCKET}; '
+              f'start it: `{core.CODEX_HEADLESS}`.')
     tick_beat()
     contract_news(args.prompt_version)
     loaded, candidates = core.profile(args)

@@ -20,7 +20,10 @@ timezone = "Etc/UTC"    # default fallback, reported as such; any IANA zone
 
 `validate()` reports every invalid or contradictory field in one error: unknown keys, a key the schedule
 does not take (`at` with hourly), custom with both or neither form, non-integer or non-positive
-`interval_minutes`, bad `HH:MM`, unknown weekday, non-IANA zone. Missing keys take the defaults and are
+`interval_minutes`, anything but a two-digit `HH:MM` string (`1:002`, `9:30`, `930` are refused), a
+non-string schedule or weekday, non-IANA zone, an interval too large to represent. A huge interval that
+is representable is allowed; if adding it to the last success passes the last representable date,
+`next_due` raises a visible `ValueError` instead of `OverflowError`. Missing keys take the defaults and are
 listed in `defaulted`, so an install without `[cleanup]` resolves to enabled hourly UTC; an explicit
 `enabled = false` or custom choice is kept as written. The draft's minimum of 60 minutes for
 `interval_minutes` is dropped by the owner's decision.
@@ -29,11 +32,13 @@ listed in `defaulted`, so an install without `[cleanup]` resolves to enabled hou
 
 - No successful run yet: due on the first tick.
 - Hourly and `interval_minutes`: last success plus the interval, counted in elapsed UTC time.
+- Last success is the attempt's completion, read from an injectable aware clock after the plan is
+  applied, not its start: a three-hour run with a five-minute interval is next due five minutes after it ends.
 - Daily, weekly and custom weekdays: the first occurrence of `at` on an allowed day in the zone, strictly
   after the last success. A repeated wall time (DST fall back) uses its first occurrence; a skipped one
   (spring forward) uses the first valid instant after it, the transition itself (02:30 → 03:00 EDT).
 - Downtime: one due instant in the past means one run; the next due is counted from that run. No catch-up.
-- A failed or partial attempt sets `retry_at` = attempt + 1 hour. Until then ticks report `backoff`
+- A failed or partial attempt sets `retry_at` = completion + 1 hour. Until then ticks report `backoff`
   instead of rerunning every tick; `last_success` does not move.
 
 ## One attempt (`run`)
@@ -55,7 +60,12 @@ The report carries observed time, trigger, reason (`first run`, `due`, `not due`
 `backoff`, `retry after backoff`, `manual`), outcome, attempted/succeeded/refused/errors/pending asks,
 last success, next due, timezone and whether it is the fallback.
 
-State is one JSON file (`last_success`, `last_attempt`, `last_outcome`, `retry_at`, `running`), written
+The report has `observed` (start) and `finished` (completion). A naive start or completion time is
+refused with `ValueError`; a naive completion leaves `running`, so the next attempt records it as
+interrupted. A clock stepped back is clamped to the start.
+
+State is one JSON file (`last_success`, `last_attempt` (start), `last_finished`, `last_outcome`,
+`retry_at`, `running`), written
 by atomic replace. Where it lives per checkout/profile is an integration decision, not made here.
 
 ## Not done in this stage

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import fcntl
 import json
 import os
+import re
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -35,21 +36,21 @@ def validate(raw):
     if not isinstance(cfg['enabled'], bool):
         errors.append('enabled must be true or false')
     schedule = cfg['schedule']
-    if schedule not in SCHEDULES:
+    if not isinstance(schedule, str) or schedule not in SCHEDULES:
         errors.append(f'schedule must be one of {", ".join(SCHEDULES)}, not {schedule!r}')
+        schedule = None
     try:
         cfg['zone'] = ZoneInfo(cfg['timezone'])
     except (ZoneInfoNotFoundError, ValueError, TypeError):
         errors.append(f'timezone {cfg["timezone"]!r} is not an IANA zone')
     extra = {'at', 'weekday', 'interval_minutes', 'weekdays'} & set(raw)
-    for k in sorted(extra - ALLOWED.get(schedule, extra)):
+    for k in sorted(extra - ALLOWED.get(schedule, extra)):  # unknown schedule: already refused above
         errors.append(f'{k} does not apply to schedule {schedule!r}')
     if 'at' in raw:
-        try:
-            hour, minute = (int(p) for p in str(raw['at']).split(':'))
-            assert len(str(raw['at'])) == 5 and 0 <= hour < 24 and 0 <= minute < 60
-            cfg['at'] = (hour, minute)
-        except (ValueError, AssertionError):
+        match = isinstance(raw['at'], str) and re.fullmatch(r'([01][0-9]|2[0-3]):([0-5][0-9])', raw['at'])
+        if match:
+            cfg['at'] = (int(match[1]), int(match[2]))
+        else:
             errors.append(f'at must be "HH:MM", not {raw["at"]!r}')
     if schedule in ('daily', 'weekly') and 'at' not in raw:
         errors.append(f'schedule {schedule!r} needs at = "HH:MM"')
@@ -68,11 +69,16 @@ def validate(raw):
             # Any positive whole number of minutes: the draft's 60-minute minimum is dropped on purpose.
             if type(interval) is not int or interval <= 0:
                 errors.append(f'interval_minutes must be a positive integer, not {interval!r}')
+            else:
+                try:
+                    cfg['interval'] = timedelta(minutes=interval)
+                except OverflowError:
+                    errors.append(f'interval_minutes {interval} is too large to represent')
             if 'at' in raw:
                 errors.append('at does not apply to custom interval_minutes')
         else:
-            if (not isinstance(days, list) or not days or len(set(days)) != len(days)
-                    or any(d not in WEEKDAYS for d in days)):
+            if (not isinstance(days, list) or not days or any(not isinstance(d, str) or d not in WEEKDAYS for d in days)
+                    or len(set(days)) != len(days)):
                 errors.append(f'weekdays must be a non-empty list of distinct {", ".join(WEEKDAYS)}')
             else:
                 cfg['days'] = {WEEKDAYS.index(d) for d in days}
@@ -80,8 +86,9 @@ def validate(raw):
                 errors.append('custom weekdays needs at = "HH:MM"')
     if errors:
         raise ValueError('; '.join(errors))
-    cfg['interval'] = (timedelta(hours=1) if schedule == 'hourly'
-                       else timedelta(minutes=raw['interval_minutes']) if 'interval_minutes' in raw else None)
+    if schedule == 'hourly':
+        cfg['interval'] = timedelta(hours=1)
+    cfg.setdefault('interval', None)
     return cfg
 
 
@@ -109,7 +116,10 @@ def next_due(cfg, last_success):
     if last_success is None:
         return None
     if cfg['interval']:
-        return last_success + cfg['interval']
+        try:
+            return last_success + cfg['interval']
+        except OverflowError:
+            raise ValueError(f'interval of {cfg["interval"]} after {stamp(last_success)} is past the last representable date')
     day = last_success.astimezone(cfg['zone']).date()
     for offset in range(15):
         candidate = day + timedelta(days=offset)
@@ -136,6 +146,12 @@ def check(cfg, state, now):
     return now >= due, 'due' if now >= due else 'not due', due
 
 
+def aware(instant):
+    if instant.utcoffset() is None:
+        raise ValueError(f'{instant!r} has no timezone')
+    return instant
+
+
 def parse(text):
     return datetime.fromisoformat(text) if text else None
 
@@ -157,14 +173,17 @@ def save(path, state):
     os.replace(tmp, path)
 
 
-def run(cfg, state_path, now, plan, apply, trigger='tick'):
+def run(cfg, state_path, now, plan, apply, trigger='tick', clock=lambda: datetime.now(UTC)):
     """One attempt under the shared cleanup lock; returns the report dict.
 
     `trigger`: 'tick' and 'idle' respect `enabled` and the schedule; 'manual' is the owner's explicit cleanup
     and runs regardless, but takes the same lock and records into the same state, so the next tick dedups.
     `plan()` returns a fresh native plan: items {'section': 'Remove'|'Ask the owner'|'Kept', ...}.
     `apply(item)` rechecks one Remove item at action time and returns True (removed) or False (refused);
-    an exception is an error. Ask items stay pending and nothing else is ever applied."""
+    an exception is an error. Ask items stay pending and nothing else is ever applied.
+    `now` is the attempt start; `clock()` (aware) is read once the attempt ends, and last_success, retry_at
+    and the next due count from that completion, so a long run is not due again the moment it ends."""
+    aware(now)
     report = {'observed': stamp(now), 'trigger': trigger, 'timezone': cfg['timezone'],
               'timezone_fallback': 'timezone' in cfg['defaulted']}
     with open(f'{state_path}.lock', 'a') as lock:
@@ -206,13 +225,16 @@ def run(cfg, state_path, now, plan, apply, trigger='tick'):
                     counts['errors'].append({'item': item, 'error': str(error)})
         outcome = ('success' if not counts['errors']
                    else 'partial' if counts['succeeded'] else 'failed')
+        # A naive clock raises here and leaves `running`, so the next attempt records this one as interrupted.
+        # max(): a clock stepped back never puts completion before the start.
+        finished = max(aware(clock()), now)
         del state['running']
-        state.update(last_attempt=stamp(now), last_outcome=outcome)
+        state.update(last_attempt=stamp(now), last_finished=stamp(finished), last_outcome=outcome)
         if outcome == 'success':
-            state.update(last_success=stamp(now), retry_at=None)
+            state.update(last_success=stamp(finished), retry_at=None)
         else:
-            state['retry_at'] = stamp(now + BACKOFF)
+            state['retry_at'] = stamp(finished + BACKOFF)
         save(state_path, state)
-        upcoming = check(cfg, state, now)[2] if cfg['enabled'] else None
-        return {**report, 'outcome': outcome, 'reason': reason, **counts,
+        upcoming = check(cfg, state, finished)[2] if cfg['enabled'] else None
+        return {**report, 'finished': stamp(finished), 'outcome': outcome, 'reason': reason, **counts,
                 'last_success': state.get('last_success'), 'next_due': stamp(upcoming)}

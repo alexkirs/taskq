@@ -55,6 +55,16 @@ class Validate(unittest.TestCase):
             'distinct': {'schedule': 'custom', 'weekdays': ['mon', 'mon'], 'at': '10:00'},
             'custom weekdays needs at': {'schedule': 'custom', 'weekdays': ['mon']},
             'unknown key': {'every': '1h'},
+            'not \'1:002\'': {'schedule': 'daily', 'at': '1:002'},
+            'not \'9:30\'': {'schedule': 'daily', 'at': '9:30'},
+            'not \' 09:30\'': {'schedule': 'daily', 'at': ' 09:30'},
+            'not 930': {'schedule': 'daily', 'at': 930},
+            r'not \[\]': {'schedule': []},
+            'not None': {'schedule': None},
+            'non-empty list': {'schedule': 'custom', 'weekdays': [[]], 'at': '10:00'},
+            'non-empty list of': {'schedule': 'custom', 'weekdays': 'mon', 'at': '10:00'},
+            'too large to represent': {'schedule': 'custom', 'interval_minutes': 10 ** 18},
+            'IANA zone': {'timezone': ['UTC']},
         }
         for message, raw in bad.items():
             with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, message):
@@ -65,6 +75,12 @@ class Validate(unittest.TestCase):
             cs.validate({'enabled': 1, 'timezone': 'Nope/Nope'})
         self.assertIn('enabled', str(caught.exception))
         self.assertIn('IANA', str(caught.exception))
+
+
+    def test_huge_but_representable_interval_is_allowed_and_overflow_is_visible(self):
+        cfg = cs.validate({'schedule': 'custom', 'interval_minutes': 10 ** 12})
+        with self.assertRaisesRegex(ValueError, 'past the last representable date'):
+            cs.next_due(cfg, T0)
 
 
 class Due(unittest.TestCase):
@@ -137,8 +153,9 @@ class Run(unittest.TestCase):
             raise OSError(item['raise'])
         return not item.get('refuse')
 
-    def run_at(self, now, plan, trigger='tick', cfg=None):
-        return cs.run(cfg or self.cfg, self.path, now, plan, self.apply, trigger)
+    def run_at(self, now, plan, trigger='tick', cfg=None, took=timedelta(0)):
+        """An attempt started at `now` whose clock reads `now + took` when it ends."""
+        return cs.run(cfg or self.cfg, self.path, now, plan, self.apply, trigger, clock=lambda: now + took)
 
     def test_only_remove_applied_ask_pending_success(self):
         report = self.run_at(T0, self.plan({'section': 'Remove', 'target': 'tree-1'},
@@ -189,6 +206,38 @@ class Run(unittest.TestCase):
         report = self.run_at(later + 2 * cs.BACKOFF, self.plan())
         self.assertEqual((report['outcome'], report['last_success']), ('success', cs.stamp(later + 2 * cs.BACKOFF)))
         self.assertIsNone(json.loads(self.path.read_text())['retry_at'])
+
+    def test_long_run_counts_from_completion_not_start(self):
+        cfg = cs.validate({'schedule': 'custom', 'interval_minutes': 5})
+        report = self.run_at(T0, self.plan({'section': 'Remove', 'target': 'slow'}), cfg=cfg, took=timedelta(hours=3))
+        end = T0 + timedelta(hours=3)
+        self.assertEqual((report['observed'], report['finished']), (cs.stamp(T0), cs.stamp(end)))
+        self.assertEqual((report['last_success'], report['next_due']), (cs.stamp(end), cs.stamp(end + timedelta(minutes=5))))
+        state = json.loads(self.path.read_text())
+        self.assertEqual((state['last_attempt'], state['last_finished']), (cs.stamp(T0), cs.stamp(end)))
+        # A tick right at the end is not due again; five minutes later it is.
+        self.assertEqual(self.run_at(end, self.plan(), cfg=cfg)['reason'], 'not due')
+        self.assertEqual(self.run_at(end + timedelta(minutes=5), self.plan(), cfg=cfg)['reason'], 'due')
+
+    def test_failed_and_partial_retry_counts_from_completion(self):
+        for target, took in (({'section': 'Remove', 'target': 'a', 'raise': 'x'}, timedelta(hours=2)),
+                             ({'section': 'Remove', 'target': 'b'}, timedelta(minutes=90))):
+            with self.subTest(took=took):
+                self.path.unlink(missing_ok=True)
+                items = [target, {'section': 'Remove', 'target': 'c', 'raise': 'y'}]
+                report = self.run_at(T0, self.plan(*items), took=took)
+                self.assertIn(report['outcome'], ('failed', 'partial'))
+                self.assertEqual(report['next_due'], cs.stamp(T0 + took + cs.BACKOFF))
+                self.assertEqual(self.run_at(T0 + took + timedelta(minutes=59), self.plan())['reason'], 'backoff')
+                self.assertEqual(self.run_at(T0 + took + cs.BACKOFF, self.plan())['reason'], 'retry after backoff')
+
+    def test_naive_times_are_refused(self):
+        with self.assertRaisesRegex(ValueError, 'no timezone'):
+            self.run_at(T0.replace(tzinfo=None), self.plan())
+        with self.assertRaisesRegex(ValueError, 'no timezone'):
+            cs.run(self.cfg, self.path, T0, self.plan(), self.apply, clock=lambda: T0.replace(tzinfo=None))
+        # The marker stays, so the next attempt records that one as interrupted.
+        self.assertIn('running', json.loads(self.path.read_text()))
 
     def test_overlap_second_run_is_busy(self):
         with open(f'{self.path}.lock', 'a') as held:

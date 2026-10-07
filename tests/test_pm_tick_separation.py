@@ -16,7 +16,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 import test_taskq as base  # the in-memory GitLab cycle; run with `discover -s tests`
-from test_taskq import CLAUDE, COORDINATOR, q, tick
+from test_taskq import CLAUDE, CODEX, COORDINATOR, q, tick
+
+REAL_AGENTS = base.worker.claude_agents  # Cycle patches it in setUp
 
 
 def job(session, name, cwd=None, state='working', **extra):
@@ -203,7 +205,13 @@ class Inventory(unittest.TestCase):
                  'bad json': (lambda *a, **k: SimpleNamespace(returncode=0, stdout='{'), (None, {})),
                  'not a list': (lambda *a, **k: SimpleNamespace(returncode=0, stdout='{}'), (None, {})),
                  'timeout': (Mock(side_effect=subprocess.TimeoutExpired('claude', 60)), (None, {})),
-                 'denied': (Mock(side_effect=PermissionError(13, 'denied')), (None, {}))}
+                 'denied': (Mock(side_effect=PermissionError(13, 'denied')), (None, {})),
+                 # Review reproduction: `[null]` raised AttributeError and ended the whole pass.
+                 'null row': (lambda *a, **k: SimpleNamespace(returncode=0, stdout='[null]'), (None, {})),
+                 'list row': (lambda *a, **k: SimpleNamespace(returncode=0, stdout='[[]]'), (None, {})),
+                 'number cwd': (lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps([{**row[0], 'cwd': 7}])), (None, {})),
+                 'text pid': (lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps([{**row[0], 'pid': '7'}])), (None, {})),
+                 'one bad row of two': (lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps([row[0], None])), (None, {}))}
         for case, (run, expected) in cases.items():
             with self.subTest(case):
                 self.assertEqual(self.agents(run), expected)
@@ -365,6 +373,42 @@ class Restart(unittest.TestCase):
         self.agents = job('claude-session', f'T{claimed} t (mac-1)')  # its own spawned job holds the claim
         self.assertEqual(self.act('--limit', 'claude=2,codex=0'), [f'T{other} t'])
         self.assertEqual(self.act('--limit', 'claude=1,codex=0'), [])
+
+    def held_by_claimed(self, *step):
+        """Review reproduction: room counts doing claims only; a claimed live worker in review or ask was not counted."""
+        claimed, other = (self.add('--type', 'research', '--runtime', 'claude') for _ in range(2))
+        self.do(CLAUDE, 'take', claimed)
+        self.do(CLAUDE, step[0], claimed, *step[1:])
+        self.agents = job('claude-session', f'T{claimed} t (mac-1)')
+        self.assertEqual(self.act('--limit', 'claude=1,codex=0'), [])
+        self.assertEqual(self.act('--limit', 'claude=2,codex=0'), [f'T{other} t'])
+        self.agents = job('claude-session', f'T{claimed} t (mac-1)', state='done')  # its turn ended: no place
+        self.assertEqual(self.act('--limit', 'claude=1,codex=0'), [f'T{other} t'])
+
+    def test_live_worker_of_a_review_task_holds_its_place(self):
+        self.held_by_claimed('result', '--text', 'x', '--checks', 'x')
+
+    def test_live_worker_of_an_ask_task_holds_its_place(self):
+        self.held_by_claimed('ask', '--text', 'q')
+
+    def test_codex_worker_of_a_review_task_holds_its_place(self):
+        self.enterContext(patch.object(q, 'CODEX_SOCKET', q.ROOT))
+        claimed, other = (self.add('--type', 'research', '--runtime', 'codex') for _ in range(2))
+        self.do(CODEX, 'take', claimed)
+        self.do(CODEX, 'result', claimed, '--text', 'x', '--checks', 'x')
+        self.codex.listed = [{**Restart.codex_thread(self, claimed, 'active'), 'id': 'codex-session'}]
+        self.assertEqual(self.act('--limit', 'claude=0,codex=1'), [])
+        self.assertEqual(self.act('--limit', 'claude=0,codex=2'), [f'T{other} t'])
+
+    def test_malformed_claude_inventory_holds_claude_starts_only(self):
+        """The real adapter on a `[null]` list: the pass goes on, Codex-pinned work starts, Claude and any wait."""
+        codex, claude = self.add('--type', 'research', '--runtime', 'codex'), self.add('--type', 'research', '--runtime', 'claude')
+        from types import SimpleNamespace
+        with patch.object(q, 'claude_agents', REAL_AGENTS), \
+             patch.object(base.worker.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stdout='[null]', stderr='')):
+            self.assertEqual(self.act(), [f'T{codex} t'])
+            output = self.do(COORDINATOR, 'tick')
+        self.assertIn(f'{base.link(claude)}: claude workers unreadable', output)
 
 
 if __name__ == '__main__':

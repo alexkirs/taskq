@@ -262,9 +262,11 @@ def starts(args, loaded, selected):
     agents, codex = (core.claude_agents(strict=True), codex_workers()) if ready else ({}, [])
     live = ([('claude', iid, sid) for sid, agent in (agents or {}).items() if local(agent) and alive(agent) and (iid := worker_iid(agent.get('name')))]
             + [('codex', iid, sid) for iid, sid in codex or []])
-    claimed = {(item['claim'] or {}).get('session') for item in loaded[0]}
+    # Exactly what room counted: a local claim of a doing task. A live worker of a review/ask task still holds a place.
+    counted = {((item['claim'] or {}).get('runtime'), (item['claim'] or {}).get('session')) for item in loaded[0]
+               if item['state'] == 'doing' and core.local_claim(item['claim'] or {})}
     for runtime, _, session in live:
-        if session not in claimed and runtime in free:  # a claimed one is counted by room (doing) already
+        if (runtime, session) not in counted and runtime in free:
             free[runtime] -= 1
     spawned = {iid for _, iid, _ in live}
     unknown = {'claude': agents is None, 'codex': codex is None}

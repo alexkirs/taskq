@@ -587,6 +587,9 @@ def claude_spawn(name, extra=None, prompt=None, remote_control=True):
 CLAUDE_ENDED = ('done', 'failed', 'stopped')  # `claude agents` states with no way back but a resume
 
 
+AGENT_TEXT = ('id', 'cwd', 'kind', 'sessionId', 'name', 'state', 'status')  # `claude agents --json` fields taskq reads
+
+
 def claude_agents(strict=False):
     """This machine's `claude --bg` sessions by session id, stopped ones too (no `pid`). `strict` (#185): None when
     the CLI is there but its list could not be read, which is unknown, not an empty machine."""
@@ -597,7 +600,9 @@ def claude_agents(strict=False):
         listed = []
     except (OSError, subprocess.SubprocessError, ValueError):
         listed = None
-    if not isinstance(listed, list):
+    # #185: a row of another shape (null, a list, a non-string field) makes the whole list unknown, never a crash.
+    if not isinstance(listed, list) or not all(isinstance(item, dict) and all(isinstance(item.get(key), (str, type(None))) for key in AGENT_TEXT)
+                                               and isinstance(item.get('pid'), (int, type(None))) for item in listed):
         return None if strict else {}
     return {item['sessionId']: item for item in listed if item.get('kind') == 'background' and item.get('sessionId')}
 

@@ -30,7 +30,9 @@ class Gate(unittest.TestCase):
             data = self.workflow if 'workflows/tests.yml' in endpoint else (
                 self.runs if 'actions/runs?' in endpoint else self.checks)
             if 'workflows/tests.yml' not in endpoint:
-                data = [{('workflow_runs' if 'actions/runs?' in endpoint else 'check_runs'): data}]
+                key = 'workflow_runs' if 'actions/runs?' in endpoint else 'check_runs'
+                data = ([{key: data[i:i + 100]} for i in range(0, len(data), 100)]
+                        if isinstance(data, list) else [{key: data}])
             return SimpleNamespace(returncode=0, stdout=json.dumps(data))
         with patch.object(doctor.core, 'REPO', 'https://github.com/alexkirs/taskq'), \
                 patch.object(doctor.subprocess, 'run', run):
@@ -43,6 +45,11 @@ class Gate(unittest.TestCase):
             self.assertIn('--slurp', command)
             self.assertIn(self.sha, command[2])
         self.assertIn('filter=all', self.commands[-1][2])
+
+    def test_failure_on_later_page_still_refuses(self):
+        self.checks.extend(self.check(f'lint-{i}', 99, identity=i + 2) for i in range(100))
+        self.checks.append(self.check('last-page', 99, conclusion='failure', identity=200))
+        self.assertEqual(self.gate(), 'CI failed: last-page')
 
     def test_required_tests_refuse_every_non_success(self):
         for conclusion in ('failure', 'cancelled', 'timed_out', 'skipped', 'neutral', None):

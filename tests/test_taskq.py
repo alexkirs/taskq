@@ -2420,6 +2420,7 @@ class Doctor(unittest.TestCase):
         self.enterContext(patch.object(q, 'ROOT', q.LOCAL.parent))
         permitted(q.ROOT)
         self.enterContext(patch.object(q, 'CLAUDE_CONFIG', q.ROOT / 'claude.json'))
+        self.enterContext(patch.dict(os.environ, {'WSL_DISTRO_NAME': ''}))  # #166: not the real Windows claude of a WSL host
         trust(q.CLAUDE_CONFIG, q.ROOT)
 
     def test_fresh_home_names_every_local_gap_with_runnable_commands(self):
@@ -2679,6 +2680,7 @@ class Setup(unittest.TestCase):
         self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(contextlib.chdir(self.tmp))
         self.enterContext(patch.object(q, 'CLAUDE_CONFIG', self.tmp / 'claude.json'))
+        self.enterContext(patch.dict(os.environ, {'WSL_DISTRO_NAME': ''}))  # #166: not the real Windows claude of a WSL host
 
     def fix(self, *extra):
         with contextlib.redirect_stdout(io.StringIO()) as out:

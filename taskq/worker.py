@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 import taskq as core
@@ -51,6 +52,10 @@ DELIVER = {
     True: 'Deliver: commit, `git fetch origin && git rebase origin/main`, run the checks, `git push origin HEAD:main` (never force).',
     False: 'Deliver: put the whole answer into `--text`.',
 }
+
+REVIEW_DELIVER = ('Deliver: commit on branch `taskq-{iid}`, `git fetch origin && git rebase origin/main`, '
+                 'run the checks, `git push --force-with-lease origin HEAD:refs/heads/taskq-{iid}`. '
+                 'Push only this branch; never push main. Hand in its exact full SHA; the manager publishes after review.')
 
 
 def doing_since(iid):
@@ -161,7 +166,7 @@ def brief(current):
     omitted = f'\n\n{len(found) - len(kept)} comments by non-collaborators omitted' if len(found) > len(kept) else ''
     # the brief also renders without a session (CI, a plain shell): the claim or the task's runtime stands in
     runtime = (core.session() or claim or {}).get('runtime') or current['runtime'] or 'unknown'
-    return BRIEF.format(**{**current, 'tool': core.TOOL, 'rules': core.RULES, 'deliver': DELIVER[pushes],
+    return BRIEF.format(**{**current, 'tool': core.TOOL, 'rules': core.RULES, 'deliver': REVIEW_DELIVER.format(iid=current['iid']) if pushes and core.PUBLISH == 'review' else DELIVER[pushes],
                            'agents': ' Follow AGENTS.md.' if (core.ROOT / 'AGENTS.md').is_file() else '',
                            'workspace': core.WORKSPACE[kind].format(iid=current['iid']),
                            'sha': ' --sha <pushed commit>' if pushes else '',
@@ -296,9 +301,12 @@ def close(args):
             sha = core.commit(current['result']['sha'])
         except argparse.ArgumentTypeError as error:
             core.fail(f'{error}; reject the task so the worker hands in the pushed commit')
-        subprocess.run(['git', 'fetch', '-q', 'origin', 'main'], check=True)
-        if subprocess.run(['git', 'merge-base', '--is-ancestor', sha, 'origin/main']).returncode:
-            core.fail(f'{sha} is not in origin/main; reject the task so the worker pushes it')
+        if core.PUBLISH == 'review':
+            publish_review(current, sha)
+        else:
+            subprocess.run(['git', 'fetch', '-q', 'origin', 'main'], check=True)
+            if subprocess.run(['git', 'merge-base', '--is-ancestor', sha, 'origin/main']).returncode:
+                core.fail(f'{sha} is not in origin/main; reject the task so the worker pushes it')
     core.save(current, close=True, note_action='close', note_text=args.text)
     core.unlock(args.iid)
     print(f'#{args.iid} closed')
@@ -306,6 +314,36 @@ def close(args):
         # Author, date and subject show whether the commit is this task's.
         subprocess.run(['git', 'log', '-1', '--format=%h %an %ad %s', sha], check=False)
     retire_local(current)
+
+
+def publish_review(current, sha):
+    """Publish exactly the reviewed branch head without touching the caller's working tree."""
+    branch = f'taskq-{current["iid"]}'
+
+    def git(*args):
+        return subprocess.run(['git', '-C', str(core.ROOT), *args], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    try:
+        git('fetch', '-q', 'origin', f'+refs/heads/main:refs/remotes/origin/main',
+            f'+refs/heads/{branch}:refs/remotes/origin/{branch}')
+        if sha != git('rev-parse', f'refs/remotes/origin/{branch}'):
+            raise ValueError('result SHA is not the task branch head')
+        # A detached worktree lets a coordinator run from any checkout, including a dirty one.
+        with tempfile.TemporaryDirectory(prefix='taskq-review-') as folder:
+            tree = str(Path(folder) / 'tree')
+            git('worktree', 'add', '-q', '--detach', tree, 'refs/remotes/origin/main')
+            try:
+                subprocess.run(['git', '-C', tree, 'merge', '--ff-only', sha], check=True,
+                               capture_output=True, text=True)
+                git('push', 'origin', f'{sha}:refs/heads/main')
+            finally:
+                git('worktree', 'remove', tree)
+    except (subprocess.CalledProcessError, ValueError) as error:
+        detail = core.last_line(error.stderr or error.stdout) if isinstance(error, subprocess.CalledProcessError) else str(error)
+        text = f'Publication refused: {detail}. Rebase on origin/main, push {branch}, and submit a new result for review.'
+        requeue(argparse.Namespace(iid=current['iid'], action='reject', text=text))
+        core.fail(text)
 
 
 def retire_local(current):

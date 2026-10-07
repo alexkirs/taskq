@@ -3518,6 +3518,18 @@ class Cleanup(unittest.TestCase):
         for iid in (9, 10):
             self.assertIn(f'tree {trees[iid]} / taskq-{iid}', removed)
 
+    def test_open_task_branches_without_trees_survive_cleanup(self):
+        for iid, state in enumerate(('ready', 'doing', 'review', 'ask', 'later'), 700):
+            self.git('branch', f'taskq-{iid}')
+            self.git('push', '-q', 'origin', f'taskq-{iid}')
+            self.issues[iid] = {'closed': False, 'state': state}
+        report = self.run_cleanup(True)
+        for iid in range(700, 705):
+            self.assertIn(f'branch taskq-{iid}: open task #{iid}', report)
+            self.assertIn(f'branch origin/taskq-{iid}: open task #{iid}', report)
+            self.git('rev-parse', '--verify', f'taskq-{iid}')
+            self.git('rev-parse', '--verify', f'refs/heads/taskq-{iid}', cwd=self.remote)
+
     def test_rebased_patch_is_finished_but_d_never_becomes_force(self):
         tree = self.tree('worktree-taskq-105', False)
         old = self.git('rev-parse', 'worktree-taskq-105')

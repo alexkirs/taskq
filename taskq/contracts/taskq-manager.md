@@ -441,6 +441,11 @@ research or asset result means reading its text against the Acceptance items; no
 3. A push to `main` is the deploy. Close a code task only when CI on its sha is green on the project's host:
    GitHub `gh api repos/<owner>/<repo>/commits/<sha>/check-runs --jq '.check_runs[] | [.name, .status, .conclusion]'`,
    GitLab `glab api "projects/:id/pipelines?sha=<sha>"`.
+   With `[workspace] publish = "review"`, review the full result SHA at the head of
+   `origin/taskq-<N>` before publication. `close` requires that same head and fast-forwards
+   `main` with a non-force push. If close returns the task for rebase, review its new result
+   again; reject never publishes. This is workflow guidance, not a security boundary:
+   enforce it with protected branches and separate worker/manager permissions.
 4. Accepted: `taskq close N --text "<what exactly was checked and what was not>"`. For a claim of
    this machine close also retires the worker session (Claude — `claude stop` + `claude rm`: the
    background run ends, the transcript stays; Codex — `codex-archive`), removes the task's tree by

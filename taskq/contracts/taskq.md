@@ -13,6 +13,28 @@ It is the only task queue and the only orchestration mechanism. One tool, `taskq
 from a Codex session and from a Claude session.
 The previous DOT system (`dot_tick.py`, `dot_gitlab.py`, labels `flow-*`) was removed on 2026-10-05.
 
+## Publication before or after review
+
+`[workspace] publish = "direct"` is the default: workers push to `main`, and `close`
+checks that the result SHA is in `origin/main`. Existing projects need no migration.
+Set `publish = "review"` in the shared `taskq.toml` to review before publication;
+`taskq.local.toml` cannot override this setting. Other values fail configuration.
+
+In review mode, code/docs workers commit on `taskq-<N>` and push only that branch,
+including after an answer or rejection. After rebasing, use `--force-with-lease` only
+for that task branch. Submit its full head SHA with `result`; `result` and `reject`
+leave `main` unchanged. The manager reviews that exact SHA, then `close` fetches the
+branch, requires its head to equal the result SHA, and uses `git merge --ff-only`
+in a temporary detached worktree followed by a non-force push to `main`.
+If the branch changed or publication cannot fast-forward, close refuses and returns
+the task to the worker to rebase and submit a new SHA for a new review. Open tasks
+keep their local and remote task branches during cleanup.
+
+For migration, finish existing direct-mode reviews before switching, update custom
+workspace/brief rules that tell workers to push `main`, and have active workers reload
+the brief. This is workflow guidance, not a security boundary: use protected branches
+and separate worker/manager permissions to enforce review before publication.
+
 ## Where things are stored
 
 | What | Where |
@@ -55,6 +77,7 @@ It holds no secrets: the token belongs to `glab`.
 | `[codex] project`, `section` | Override of the Codex app project for `spawn --runtime codex`, and its sidebar section; kept for compatibility below the personal `[codex]` until migrated | project: the app's project whose root is the main checkout (`project/list`), created by `project/create` when none is; no section |
 | `[codex] writable` | Extra writable roots of Codex worker turns, for project files outside the checkout (e.g. `["../csgo-media"]`): paths relative to the main checkout or `~/…`, resolved to absolute and added after the built-in roots by `codex_turn_policy()`; a missing path is skipped and `doctor` warns. A root that is a linked worktree of this checkout also adds its gitdir, so Codex on Linux lets git commit there (#163) | none: the main checkout's `.git`, `.worktrees` and the taskq state dir |
 | `[workspace] new`, `continue`, `none` | Brief text about the workspace; `{iid}` is the task number | `git worktree add -b taskq-<N> .worktrees/taskq-<N> origin/main` inside the main checkout (§ Task flow, «Where task trees live») |
+| `[workspace] publish` | `direct` or `review`; shared only, invalid values fail (§ Publication before or after review) | `direct` |
 | `[workspace] retire` | What `close` runs from the main checkout to remove the task's tree (then `git branch -d taskq-<N>`) | `git worktree remove .worktrees/taskq-<N>`; nothing when the project sets its own `new` without `retire` |
 | `[workspace] protected_refs` | Refs cleanup must keep, including in owner questions: local names (`"release"`), remote names (`"origin/release"`), or full Git refs | `[]`; main and the calling branch are always protected |
 | `[workspace] cleanup_helpers` | Project folder with `workspace_gc.py`, `host_gentle.py`, `host_tools.py` for `cleanup`, an optional override | none: built-ins (`git worktree remove`, `lsof`) |
@@ -286,7 +309,8 @@ ready/waiting/later → ask (manager) → answer → ready
   brief and the `ask` output state this rule.
 - A worker on a `code` or `docs` task creates its own worktree (the brief prints the command, from the
   project's `[workspace]`), commits, rebases on `origin/main` and pushes to `main` under the owner's
-  standing permission. `close` checks that the result SHA is in `origin/main`.
+  standing permission in default `direct` mode. `review` mode publishes only the task branch until
+  manager acceptance (§ Publication before or after review).
 - Where task trees live: `.worktrees/taskq-<N>` inside the main checkout (gitignored by `init`), so trees of
   different projects never share one parent folder and their `taskq-<N>` names never collide. Trees made before
   2026-10-07 sit next to the checkout (`../taskq-<N>`): `doctor` names each such tree of this project with

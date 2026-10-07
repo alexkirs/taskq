@@ -47,6 +47,7 @@ WORKSPACE = TREE_WORKSPACE = {
     'none': 'this task is expected to end in an answer, not a commit: work from the main checkout. If it turns out to need file changes, make the worktree `.worktrees/taskq-{iid}` as a code task would, work there, push like a code task and name the commit in the result text.',
 }
 RULES = ''  # project rules for workers, from [brief] rules: lines of step 6 of the brief
+PUBLISH = 'direct'  # [workspace] publish: direct publication or manager-reviewed branch
 RETIRE = TREE_RETIRE = 'git worktree remove .worktrees/taskq-{iid}'  # run after `close` of a code task: removes its worktree
 REPO = 'https://github.com/alexkirs/taskq'  # where every install takes its updates from
 # #111: docs/open.html on REPO's GitHub Pages turns its hash (codex:// or claude:// with a UUID) into a deep link, so the
@@ -99,7 +100,7 @@ def main_checkout(start):
 def configure(path=None):
     """Load the project's taskq.toml: `path`, else the nearest one from the current directory up. Read only: a key it
     lacks takes its default in memory (a write would dirty the editable clone, and update stops on a dirty clone)."""
-    global RULES, HOST, HOSTS, COORDINATOR, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, CODEX_WRITABLE, WORKSPACE, RETIRE, HELPERS, PROTECTED_REFS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED, PAGES
+    global RULES, HOST, HOSTS, COORDINATOR, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, CODEX_WRITABLE, WORKSPACE, PUBLISH, RETIRE, HELPERS, PROTECTED_REFS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED, PAGES
     import tomllib
     here = Path.cwd()
     path = Path(path) if path else next((folder / 'taskq.toml' for folder in (here, *here.parents)
@@ -127,6 +128,9 @@ def configure(path=None):
     CODEX_PROJECT, CODEX_SECTION, CODEX_WRITABLE = codex.get('project'), codex.get('section'), codex.get('writable', ())
     if not isinstance(CODEX_WRITABLE, list | tuple) or not all(isinstance(item, str) for item in CODEX_WRITABLE):
         fail(f'{path}: [codex] writable: write a list of paths, e.g. ["../media"] (relative to the main checkout, or ~/...)')
+    PUBLISH = workspace.get('publish', 'direct')
+    if PUBLISH not in ('direct', 'review'):
+        fail(f'{path}: [workspace] publish: write "direct" or "review"')
     WORKSPACE = {key: workspace.get(key, text) for key, text in TREE_WORKSPACE.items()}
     # A project's own `new` without `retire` makes its trees elsewhere: the default retire would miss them.
     RETIRE = workspace.get('retire', None if 'new' in workspace else TREE_RETIRE)

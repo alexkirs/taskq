@@ -243,6 +243,28 @@ optional `archive`, `doctor` and `setup` commands. `taskq doctor` runs its `doct
 > **Manager:** Relays it; records your answer with `taskq answer N`.<br>
 > **Manager:** Checks commit and acceptance; closes or rejects with exact fixes.
 
+## Publication before or after review
+
+`[workspace] publish = "direct"` is the default: workers push to `main`, and `close`
+checks that the result SHA is in `origin/main`. Existing projects need no migration.
+Set `publish = "review"` in the shared `taskq.toml` to review before publication;
+`taskq.local.toml` cannot override this setting. Other values fail configuration.
+
+In review mode, code/docs workers commit on `taskq-<N>` and push only that branch,
+including after an answer or rejection. After rebasing, use `--force-with-lease` only
+for that task branch. Submit its full head SHA with `result`; `result` and `reject`
+leave `main` unchanged. The manager reviews that exact SHA, then `close` fetches the
+branch, requires its head to equal the result SHA, and uses `git merge --ff-only`
+in a temporary detached worktree followed by a non-force push to `main`.
+If the branch changed or publication cannot fast-forward, close refuses and returns
+the task to the worker to rebase and submit a new SHA for a new review. Open tasks
+keep their local and remote task branches during cleanup.
+
+For migration, finish existing direct-mode reviews before switching, update custom
+workspace/brief rules that tell workers to push `main`, and have active workers reload
+the brief. This is workflow guidance, not a security boundary: use protected branches
+and separate worker/manager permissions to enforce review before publication.
+
 ## Supported systems and reference
 
 GitLab Issues (including self-managed) and GitHub Issues (including Enterprise) work today.

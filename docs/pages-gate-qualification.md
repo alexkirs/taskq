@@ -43,11 +43,11 @@ not a controlled before/after production savings measurement.
 
 ## Stage 2: publication inputs and migration
 
-The repository is currently configured for **legacy main /docs**. Editing a managed workflow
-or adding path filters cannot change that mechanism. After candidate review, the publisher
-must switch the Pages publishing source to GitHub Actions, preserving the `github-pages`
-environment and HTTPS, then perform a manual full main build. Do not change the source before
-the reviewed workflow is on main. `configure-pages` does not request automatic enablement.
+The repository initially used **legacy main /docs**. Editing a managed workflow or adding
+path filters could not change that mechanism. After candidate review and publication, the
+publisher switched the source to GitHub Actions, preserving the `github-pages` environment,
+HTTPS and the existing URL, then completed the manual full main build recorded below.
+`configure-pages` does not request automatic enablement.
 
 The candidate uses the official [Jekyll Pages action](https://github.com/actions/jekyll-build-pages)
 with `source: ./docs`, the same site root. Source, Jekyll configuration and site dependencies
@@ -131,7 +131,37 @@ of the old implementation, not an accepted publication guarantee. The corrected 
 deployment metadata as described above. No queue-limit change or new state store is introduced.
 The independent CLI gate, existing URLs, failed-build receipts and rollback remain unchanged.
 
-## Publication qualification still required
+## Production qualification (2026-10-07)
+
+The accepted `c5044da` candidate was rebased after #176/#177 to
+`c5378c150eb366947a81843ea0b43109434e01d9`. All four commits were equal in
+`git range-diff`: no semantic delta. Independent full suite: 226 PASS; focused gate,
+Pages-input and Node bridge checks: 21 PASS. [PR #196](https://github.com/alexkirs/taskq/pull/196)
+merged that exact SHA. Main tests [37674762808](https://github.com/alexkirs/taskq/actions/runs/37674762808)
+passed. The authorized Pages API change set only `build_type=workflow`; readback retained
+`https_enforced=true` and `https://alexkirs.github.io/taskq/`.
+
+| Actual production receipt | Result |
+|---|---|
+| Initial manual full build [37674768854](https://github.com/alexkirs/taskq/actions/runs/37674768854) | Inputs, build and deploy SUCCESS; exact `c5378c150eb366947a81843ea0b43109434e01d9`. Deployment `6918925421` became success at `2026-10-07T19:30:13Z`. |
+| HTTPS revision and content | `taskq-revision.txt` matched that deployed SHA. All eight existing/new documentation and bridge HTML URLs returned 200. `open.html` remained 933 bytes, SHA-256 `7c4ee5d6b6a98a0c6f19af05daff1d7b69c249fcd4d63af3eaf53e06c31b71b3`, identical to source and legacy. |
+| CLI-only [PR #202](https://github.com/alexkirs/taskq/pull/202) | Exact `e4e6feca7d993a730e9816c59a4b8af5e8a5fa6f`; only five test lines changed, proving successful Pages cannot substitute for missing mandatory tests. No application or site-input delta. Independent 227 full / 12 gate tests PASS; exact push/PR tests PASS. |
+| Actual main CLI-only runs | Tests [37675786566](https://github.com/alexkirs/taskq/actions/runs/37675786566) SUCCESS; Pages [37675786553](https://github.com/alexkirs/taskq/actions/runs/37675786553) input SUCCESS, build/deploy SKIPPED. Input job ran `19:36:42Z`–`19:36:46Z`; no deployment was created. |
+| Actual updater and deployed readback | `taskq update --verbose` updated `c5378c1` to `e4e6fec`; fresh CLI from the installed pipx interpreter, module path, editable `direct_url.json` and source Git SHA agree at `2026-10-07T19:44:34Z`; live exact-SHA gate passes. The HTTPS deployed revision correctly remained `c5378c150eb366947a81843ea0b43109434e01d9`. |
+
+Historical main CLI-only baseline `98556ce3e542ac055fab9da34678f8b509d46ce9`
+([legacy Pages 37611862867](https://github.com/alexkirs/taskq/actions/runs/37611862867))
+ran build `11:06:41Z`–`11:07:13Z` (32 seconds) and deploy `11:07:17Z`–`11:07:25Z`
+(8 seconds). The new actual CLI-only run skipped both jobs. This is an observed production
+before/after difference, not a controlled latency benchmark or a universal savings claim.
+The earlier 26–99 second estimate remains an estimate.
+
+This receipt-document change is the site-input production probe. After its reviewed main
+publication, verify tests plus build/deploy success, the new deployed revision and rendered
+receipt, existing URLs/bridge, and installed fresh CLI. Final readbacks belong in the issue
+receipt; the document cannot self-attest its own future deployment.
+
+## Completing qualification
 
 Before closing qualification, collect an approved main CLI-only push and a site-input push
 with immutable SHAs, exact tests/Pages workflow identities, timestamps, build/skipped reason,

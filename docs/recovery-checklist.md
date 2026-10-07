@@ -18,9 +18,14 @@ covers what to do when that path breaks. The
   a session or claim, never take over a live claim, never start a duplicate worker.
 - Do not read private databases, auth stores, runtime rollouts or hidden reasoning.
   Use only supported commands.
-- Any destructive recovery (release a claim, delete a lock or worktree, reset
-  or force-push a branch, archive a session) is an owner decision:
-  `taskq ask <iid> --text "..."`, then stop.
+- Guarded recovery that the owner or the process already authorizes (for
+  example a release, retire or archive that the contract allows and whose
+  guards pass on fresh evidence) needs no new ask. Any other destructive or
+  irreversible recovery, and any security-sensitive change, needs the
+  applicable confirmation: `taskq ask <iid> --text "..."`, then stop.
+- Never take over a live claim, never record a terminal state (done, dead,
+  idle) that fresh evidence does not show, and never delete a lock file to get
+  past it: deleting a lock is not recovery.
 
 ## Read-only diagnostics
 
@@ -71,15 +76,24 @@ Record the blocker verbatim, keep the worker as is, and report it.
 
 Read the exact stderr line before retrying:
 
-- **Network denial** (DNS or connection error, timeout, `Operation not permitted`
-  from a sandbox): the request never reached the server. Check the executor's
-  network and sandbox policy. Do not change credentials.
-- **Auth failure** (`401 Unauthorized`, `403 Forbidden`): the server answered
-  and refused. The token or its scope is wrong. This is owner work; do not read
-  or rotate credentials.
-- For a failed mutation (`take`, `result`, push, acting tick), read the real
-  tracker and git state (`taskq view`, `git ls-remote origin refs/heads/taskq-<iid>`)
-  before any retry. Never report a result that did not land.
+- **Confirmed pre-send denial** (DNS failure, connection refused, or
+  `Operation not permitted` from a sandbox before any connection): the request
+  did not leave this machine. Check the executor's network and sandbox policy.
+  Do not change credentials.
+- **Unknown outcome** (timeout, connection reset, interrupted command): the
+  request may or may not have reached the server. Treat a mutation as possibly
+  applied: reread and reconcile the real state before any retry. No blind retry.
+- **`401 Unauthorized`**: the server answered and did not accept the
+  credentials. Report it as owner work; do not read, guess or rotate credentials.
+- **`403 Forbidden`**: the server answered and refused, but the cause is not
+  proven. A wrong token or scope is one cause; repository policy, branch
+  protection, missing permission, rate or abuse limits are others. Record the
+  exact safe evidence (status, error body, non-secret headers such as rate-limit
+  headers) and report it. Do not guess the cause or change credentials.
+- For a failed or uncertain mutation (`take`, `result`, push, acting tick), read
+  the real tracker and git state (`taskq view`,
+  `git ls-remote origin refs/heads/taskq-<iid>`) before any retry. Never report
+  a result that did not land.
 - A tick exit 1 with only an error, or any other nonzero code, is failure, not an
   empty queue (see the tick guide).
 
@@ -90,7 +104,9 @@ Read the exact stderr line before retrying:
    not proof of death.
 3. Only the claiming session continues the task. If the owner resumes it, it
    keeps its claim; no new `take`.
-4. Releasing the claim or retiring the session is destructive: ask the owner.
+4. Release the claim or retire the session only when that action is already
+   authorized and its guards pass on fresh evidence; otherwise ask the owner.
+   Never take over the live claim or start a duplicate worker.
 
 ### Delivery conflict
 

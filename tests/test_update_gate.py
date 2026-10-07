@@ -89,11 +89,26 @@ class Gate(unittest.TestCase):
         self.assertIsNone(self.gate())
         pages['event'] = 'workflow_dispatch'
         self.assertIsNone(self.gate())
+        pages['event'] = 'pull_request'
+        self.assertIsNone(self.gate())
         pages['path'] = '.github/workflows/unrelated.yml'
         self.assertIn('CI failed: build', self.gate())
         pages['path'] = '.github/workflows/pages.yml'
         self.checks[-1]['app']['id'] = 99
         self.assertIn('CI still running: deploy', self.gate())
+
+    def test_trusted_pr_tests_also_require_success(self):
+        self.runs.append(dict(self.runs[0], id=21, event='pull_request', check_suite_id=31))
+        self.assertIsNotNone(self.gate())
+        check = self.check('tests', 31)
+        self.checks.append(check)
+        self.assertIsNone(self.gate())
+        for conclusion in ('skipped', 'neutral', 'failure'):
+            check['conclusion'] = conclusion
+            self.assertEqual(self.gate(), 'CI failed: tests')
+        check['conclusion'] = 'success'
+        self.runs[-1]['status'] = 'in_progress'
+        self.assertEqual(self.gate(), 'CI still running: tests')
 
     def test_unknown_checks_retain_existing_gate_even_same_name(self):
         other = self.check('tests', 99, conclusion='failure')

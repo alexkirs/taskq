@@ -302,7 +302,8 @@ push workflow and its GitHub Actions `tests` check. Missing, unreadable, pending
 skipped or neutral tests refuse an update. Latest reruns are checked by suite identity;
 unrelated same-name checks cannot satisfy tests. Only positively identified legacy or
 `.github/workflows/pages.yml` Pages checks are excluded; other checks keep their existing gate.
-Site failure/freshness is separate from CLI eligibility. A commit that does not start
+Site failure/freshness is separate from CLI eligibility; see
+[Pages qualification and migration](docs/pages-gate-qualification.md). A commit that does not start
 (`python3 -m taskq --version`) is rolled back in the clone.
 
 `[update] ref = "stable"` in `taskq.toml` makes a machine follow the reviewed `stable` tag instead of `main`: workers

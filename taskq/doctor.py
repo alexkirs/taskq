@@ -39,19 +39,22 @@ def green(sha):
         # Suite identity, not a job name, distinguishes tests and Pages from unrelated checks.
         trusted = [run for run in workflows if run['head_sha'] == sha
                    and run['repository']['full_name'] == repo]
-        tests = [run for run in trusted if run['workflow_id'] == workflow['id']
-                 and run['path'] == workflow['path'] and run['event'] == 'push']
+        test_runs = [run for run in trusted if run['workflow_id'] == workflow['id']
+                     and run['path'] == workflow['path'] and run['event'] in ('push', 'pull_request')]
+        tests = [run for run in test_runs if run['event'] == 'push']
         if not tests:
             return 'it has no trusted exact-SHA tests run yet'
         latest = max(tests, key=lambda run: run['id'])
-        if latest['status'] != 'completed':
+        mandatory = [latest, *[run for run in test_runs if run['event'] == 'pull_request']]
+        if any(run['status'] != 'completed' for run in mandatory):
             return 'CI still running: tests'
-        if latest['conclusion'] != 'success':
+        if any(run['conclusion'] != 'success' for run in mandatory):
             return 'CI failed: tests'
         pages = {run['check_suite_id'] for run in trusted
                  if (run['path'], run['event']) in (
                      ('dynamic/pages/pages-build-deployment', 'dynamic'),
                      ('.github/workflows/pages.yml', 'push'),
+                     ('.github/workflows/pages.yml', 'pull_request'),
                      ('.github/workflows/pages.yml', 'workflow_dispatch'))}
         test_suites = {run['check_suite_id'] for run in tests}
         current = {}
@@ -66,10 +69,11 @@ def green(sha):
             key = (suite, check['app']['id'], check['name'])
             if key not in current or check['id'] > current[key]['id']:
                 current[key] = check
-        required = [check for check in current.values() if check['check_suite']['id'] == latest['check_suite_id']
+        required_suites = {run['check_suite_id'] for run in mandatory}
+        required = [check for check in current.values() if check['check_suite']['id'] in required_suites
                     and check['name'] == 'tests' and check['app']['slug'] == 'github-actions'
                     and check['app']['id'] == 15368]
-        if not required:
+        if {check['check_suite']['id'] for check in required} != required_suites:
             return 'it has no trusted exact-SHA tests check yet'
         if any(check['status'] != 'completed' for check in required):
             return 'CI still running: tests'

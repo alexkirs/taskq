@@ -761,7 +761,7 @@ def last_line(output):
 # The rest of the package; each module reaches the core as `core.<name>`.
 from taskq.store_github import Github  # noqa: E402
 from taskq.codex import (CODEX_HEADLESS, CODEX_SOCKET, Codex, codex_age, codex_app_recipe, codex_archive, codex_is_archived, codex_line, codex_project, codex_read,  # noqa: E402
-                         codex_send, codex_snapshot, codex_spawn)
+                         codex_send, codex_snapshot, codex_spawn, codex_observation)
 from taskq.cleanup import cleanup  # noqa: E402
 from taskq.selftest import selftest  # noqa: E402
 from taskq.doctor import (  # noqa: E402
@@ -774,7 +774,7 @@ from taskq.tick import (  # noqa: E402
     inbox_line, tick)
 from taskq.worker import (  # noqa: E402
     BRIEF, DELIVER, need_owner, doing_since, add, edit, later, listing, set_runtime, brief, worker, take, beat, ask,
-    result, requeue, close, retire_local, spawn, executor_run, send, claude_env, CLAUDE_WORKER_TOOLS, claude_spawn,
+    result, requeue, close, retire_local, spawn, preflight, runtime_status, executor_run, send, claude_env, CLAUDE_WORKER_TOOLS, claude_spawn,
     claude_agents, claude_url, claude_stop, problem, report, claude_wake, view, show, retire, claude_import,
     claude_sessions, driver_app_session)
 
@@ -843,6 +843,9 @@ def main(argv=None):
             (('--label',), {'nargs': '+', 'default': [], 'help': argparse.SUPPRESS}))
     command('runtime', set_runtime, iid, (('runtime',), {'choices': (*RUNTIMES, 'any')}))
     command('list', listing, (('--links',), {'action': 'store_true', 'help': 'also the URL of each task'}))
+    command('preflight', preflight, json_flag)
+    command('runtime-status', runtime_status, json_flag,
+            (('--runtime',), {'required': True, 'choices': tuple(RUNTIMES)}), (('session',), {}))
     # Absent flags stay None: the personal taskq.local.toml, then taskq.toml, then the defaults decide (`resolve`).
     profile_flags = ((('--filter',), {'help': 'GitLab issues query string, passed unchanged; \'\' means all areas'}),
                      (('--mine',), {'action': argparse.BooleanOptionalAction, 'help': 'only own assignments, or with --no-mine also the pool'}),

@@ -571,8 +571,9 @@ last turn from its own `turn_context` record, including `network_access` and `wr
 record is shown as `unknown`, not replaced with the desired policy.
 
 **Silent worker.** The "Workers" table prints, in "Last activity", the status and last-event age of each
-Codex doing task. `Codex idle` means idle or notLoaded while doing, with no result/ask:
-the worker stopped without submitting. Run the printed `codex-send`, ask it to continue the task and
+Codex doing task. `Codex idle` requires idle or notLoaded with a terminal latest turn, with no result/ask:
+the worker stopped without submitting. Metadata alone is unknown and does not justify a nudge.
+Run the printed `codex-send`, ask it to continue the task and
 submit a result or send an ask. Do not start a second worker for the same doing task. If the status
 is active and a command is running, check its progress; event age alone does not prove a hang. No
 marks for more than 20 minutes — look at the session and send a message. After `STALE_MINUTES`
@@ -594,6 +595,30 @@ server-provided rollout. This reads existing history without resume; it is not a
 not change the worker. If the command started outside that tail or the rollout is unavailable, the
 current operation may be unknown. An unreachable server prints `status unknown`; it does not mean
 idle and does not block the rest of the coordinator's work.
+
+**Permission observations (#176).** `taskq runtime-status --runtime codex|claude <session> --json`
+reads supported runtime metadata without resume, private rollout or approval replies. Its observation
+distinguishes `waiting_permission`, `active`, `terminal`, and `unknown`, with `observed_at`, a session
+link when available, and the exact blocker. Empty activeFlags never proves no pending approval.
+Codex typed approval requests seen on the current connection and `waitingOnApproval` are positive
+evidence. Requests resolved elsewhere, requests predating connection, and Claude's pending approvals
+may be invisible: report `unknown`, not "no approvals". Event timestamps are separate from observation
+time. An execution item is execution evidence, not proof of permission visibility for every layer.
+The tick retains its existing rollout fallback and labels that mixed provenance; `runtime-status`
+uses supported app-server reads only. Unknown or still-active observations are held, not idle-nudged.
+The existing Workers report names permission waits and adds them to PM wake deduplication. A flag
+without a request ID cannot distinguish two successive unseen requests; do not promise exactly-once
+notification for that case. The owner approves in the linked UI. Keep the same worker, never accept
+on their behalf, nudge a permission wait, release it as idle, or spawn a replacement.
+
+**External PM bootstrap (#177).** Before any worker launch, ask the selected local executor to run
+`taskq preflight --json` through its supported command tool and return stdout, stderr and exit code.
+The ACK is an actual read-only subprocess in the resolved main checkout, not conversation activity.
+Its `ready` only proves local-command execution; runtime capability and effective launch policy
+remain `unknown` until separately qualified. Do not infer settings or change them to clear a blocker.
+The owner applies agreed scoped local settings. This preflight does not authorize a spawn, enforce
+a cross-host launch gate, or prove that a later worker received the same permissions. Record the
+actual launch route/policy separately; do not claim complete #176/#177 qualification from this ACK.
 
 **App and server turn (2026-10-06).** `thread-unarchived` via IPC refreshes the session list and
 metadata (`handleThreadUnarchived` in the installed app), but does not subscribe the window to item

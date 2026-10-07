@@ -182,6 +182,8 @@ def liveness(item, agents):
         codex = core.Codex()
         try:
             status, turns, last = core.codex_snapshot(codex, session, 1)
+            item['_runtime_observation'] = core.codex_observation(codex, session, status, turns, last)
+            item['_runtime_observation']['source'] = 'codex app-server with existing rollout fallback'
         finally:
             codex.socket.close()
     except (OSError, SystemExit, ValueError) as error:
@@ -190,7 +192,11 @@ def liveness(item, agents):
     working = bool(turns) and turns[0].get('app', False)
     state = ('busy' if working else 'idle' if status['type'] in ('idle', 'notLoaded')
              else 'dead' if status['type'] == 'systemError' else 'busy')
-    return state, f'{status["type"]}{" (turn running in the app)" if working else ""}, last event {core.codex_age(last)}'
+    observation = item['_runtime_observation']
+    if observation['status'] in ('waiting_permission', 'active', 'unknown') and state != 'dead':
+        state = 'busy'  # No positive terminal evidence: never nudge or release by age.
+    return state, (f'{status["type"]}{" (turn running in the app)" if working else ""}, last event {core.codex_age(last)}; '
+                   f'{observation["status"]}: {observation["exact_blocker"] or "typed runtime evidence"}')
 
 
 def inbox_line(inbox):
@@ -555,6 +561,14 @@ def tick_pass(args, act=False):
     if rows:
         print('## Workers\n\nShow the owner this table as printed; every link opens in a browser:\n\n'
               '| Task | State | Runtime | Session | Last activity |\n|---|---|---|---|---|\n' + '\n'.join(rows) + '\n')
+    permissions = [item['_runtime_observation'] for item in workers if item.get('_runtime_observation', {}).get('status') == 'waiting_permission']
+    for item in workers:
+        if observation := item.get('_runtime_observation'):
+            core.record(args, 'runtime_observation', task=item['iid'], **observation)
+    if permissions:
+        print('## Runtime permissions\n\nThe owner approves in the linked runtime UI. Keep the same worker; do not answer, nudge or spawn another.\n')
+        for observation in permissions:
+            print(f'- [{observation["session"]}]({observation["session_link"]}): {observation["exact_blocker"]}')
     if idle and act:
         for item in idle:
             step(f'nudge idle Codex {core.ref(item)}', lambda item=item: core.codex_send(
@@ -630,4 +644,5 @@ def tick_pass(args, act=False):
         print('\n## Steps that failed\n\nThe tick could not do these itself; do each by hand (§ 3) or tell the owner:\n')
         print(core.data(''.join(f'- {line}\n' for line in failed).rstrip()))
     return ([f'review {item["iid"]} {item["result"].get("sha")}' for item in review] + [f'ask {item["iid"]}' for item, _ in fresh + summary]
+            + [observation['notify_dedup'] for observation in permissions]
             + odd + [f'problem {issue["iid"]}' for issue in problems] + [f'inbox {issue["iid"]}' for issue in inbox] + failed)

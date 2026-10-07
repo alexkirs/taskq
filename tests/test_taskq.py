@@ -1357,6 +1357,7 @@ class Cycle(unittest.TestCase):
         self.assertIn('new turn in the Codex app', self.do(CLAUDE, 'codex-send', 't1', '--text', 'again'))
 
     def test_codex_spawn_pins_first_turn_policy(self):
+        self.assertTrue(all(os.path.isabs(root) for root in codex.codex_turn_policy()['sandboxPolicy']['writableRoots']))
         with patch.object(codex, 'codex_announce'):
             self.assertIn('spawned', self.do(CLAUDE, 'spawn', '--runtime', 'codex', '--name', 'probe'))
         params = next(params for method, params in self.codex.calls if method == 'turn/start')

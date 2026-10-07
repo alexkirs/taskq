@@ -1748,7 +1748,9 @@ class Cycle(unittest.TestCase):
         self.personal('[idle]\nstop = 0\n')
         idle = json.loads(self.do(COORDINATOR, 'tick', '--json', '--act'))
         self.assertEqual(idle['outcome'], 'ok')
-        with patch.object(tick.fcntl, 'flock', side_effect=BlockingIOError), contextlib.redirect_stderr(io.StringIO()):
+        import errno
+        lock_api = 'msvcrt.locking' if os.name == 'nt' else 'fcntl.flock'
+        with patch(lock_api, side_effect=OSError(errno.EACCES, 'held')), contextlib.redirect_stderr(io.StringIO()):
             overlap = json.loads(self.do(COORDINATOR, 'tick', '--json', '--act'))
         self.assertEqual(overlap['refusals'], ['another tick pass is running'])
         self.assertEqual(overlap['actions'][0]['status'], 'refused')
@@ -3029,14 +3031,38 @@ class TickBeat(unittest.TestCase):
             cleanup.assert_called_once_with(argparse.Namespace(apply=True))
             self.assertEqual(failed, [])
 
+    def test_windows_tick_imports_and_locks_without_fcntl(self):
+        import importlib
+        import errno
+        args = SimpleNamespace(install_timer=False, uninstall_timer=False, act=False)
+        windows = SimpleNamespace(LK_NBLCK=1, locking=unittest.mock.Mock())
+        with patch.dict(sys.modules, {'fcntl': None, 'msvcrt': windows}):
+            importlib.reload(tick)
+            with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / 'beat'), \
+                    patch.object(tick, 'os', SimpleNamespace(name='nt')), patch.object(tick, 'tick_pass') as run:
+                tick.tick(args)
+                windows.locking.assert_called_once_with(unittest.mock.ANY, windows.LK_NBLCK, 1)
+                run.assert_called_once_with(args)
+                run.reset_mock()
+                windows.locking.side_effect = OSError(errno.EACCES, 'held')
+                with contextlib.redirect_stderr(io.StringIO()) as output:
+                    tick.tick(args)
+                run.assert_not_called()
+                self.assertIn('another tick pass is running', output.getvalue())
+                windows.locking.side_effect = OSError(errno.EIO, 'disk error')
+                with self.assertRaises(OSError):
+                    tick.tick(args)
+
     def test_overlapping_ticks_skip_and_crashed_holder_releases_lock(self):
         args = SimpleNamespace(install_timer=False, uninstall_timer=False, act=False)
         with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / 'beat'), \
                 patch.object(tick, 'tick_pass') as run, patch.object(tick, 'act') as act:
             lock = Path(tmp) / 'taskq-tick.lock'
             child = subprocess.Popen([sys.executable, '-c',
-                "import fcntl, sys; f = open(sys.argv[1], 'a'); "
-                "fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); sys.stdin.read()", str(lock)],
+                "import os, sys; f = open(sys.argv[1], 'a+b'); "
+                "exec(\"import msvcrt; msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)\" if os.name == 'nt' "
+                "else \"import fcntl; fcntl.flock(f, fcntl.LOCK_EX)\"); "
+                "print('locked', flush=True); sys.stdin.read()", str(lock)],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             try:
                 self.assertEqual(child.stdout.readline().strip(), 'locked')

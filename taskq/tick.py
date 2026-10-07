@@ -1,7 +1,7 @@
 """`tick`: the coordinator's pass over the queue, board moves, the Workers table, the beat stamp."""
 import argparse
 import contextlib
-import fcntl
+import errno
 import hashlib
 import io
 import json
@@ -245,13 +245,21 @@ def launch(args, start, act, step):
 def tick(args):
     if args.install_timer or args.uninstall_timer:
         return timer(args.install_timer)
-    # Keep the inode: unlinking a flock file could let a third pass lock a different file.
+    # Keep the inode: unlinking the file could let a third pass lock a different file.
     lock = core.TICK_BEAT.with_name('taskq-tick.lock')
     lock.parent.mkdir(parents=True, exist_ok=True)
-    with lock.open('a') as held:
+    with lock.open('a+b') as held:
         try:
-            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            if os.name == 'nt':
+                import msvcrt
+                held.seek(0)
+                msvcrt.locking(held.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
             core.record(args, 'tick', status='refused', reason='another tick pass is running')
             if hasattr(args, 'output'):
                 args.output['refusals'].append('another tick pass is running')

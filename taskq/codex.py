@@ -1,6 +1,6 @@
 """The Codex app server: worker threads, their live state, archive."""
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -76,6 +76,7 @@ class Codex:
         if b' 101 ' not in head.split(b'\r\n')[0]:
             core.fail(f'Codex app server refused the connection: {head[:80]}')
         self.counter = 0
+        self.permission_requests = {}
         self.call('initialize', {'clientInfo': {'name': 'taskq', 'version': '1'}, 'capabilities': {'experimentalApi': True}})
         self.send({'method': 'initialized'})
 
@@ -115,18 +116,56 @@ class Codex:
         self.send({'id': self.counter, 'method': method, 'params': params})
         while True:
             value = self.receive()
+            self.observe(value)
             if value.get('id') == self.counter and 'method' not in value:
                 if 'error' in value:
                     core.fail(f'Codex {method}: {value["error"]}')
                 return value['result']
 
+    def observe(self, value):
+        """Keep supported approval metadata, never reply to or accept a server request."""
+        method, params = value.get('method'), value.get('params') or {}
+        key = (params.get('threadId'), value.get('id'))
+        if method in ('item/commandExecution/requestApproval', 'item/fileChange/requestApproval',
+                      'item/permissions/requestApproval') and key[0] and key[1] is not None:
+            self.permission_requests[key] = {
+                'request_id': key[1], 'turn_id': params.get('turnId'), 'item_id': params.get('itemId'),
+                'event_at': params['startedAtMs'] / 1000 if params.get('startedAtMs') is not None else None, 'method': method}
+        elif method == 'serverRequest/resolved':
+            self.permission_requests.pop((params.get('threadId'), params.get('requestId')), None)
+
     def wait_turn(self, thread, seconds):
         end = time.time() + seconds
         while time.time() < end:
             value = self.receive()
+            self.observe(value)
             if value.get('method') == 'turn/completed' and value['params'].get('threadId') == thread:
                 return
         core.fail(f'Codex thread {thread}: no turn/completed in {seconds} s')
+
+
+def codex_observation(codex, thread, status, turns, stamp):
+    """Unknown includes empty flags and unobserved approvals; active requires a running typed item."""
+    pending = [value for (session, _), value in getattr(codex, 'permission_requests', {}).items() if session == thread]
+    flags = status.get('activeFlags') or []
+    latest = turns[0] if turns else {}
+    running = [entry['item'] for entry in latest.get('entries', [])
+               if entry['item'].get('status') == 'inProgress' and
+               entry['item'].get('type') in ('commandExecution', 'mcpToolCall', 'dynamicToolCall', 'liveToolCall')]
+    waiting = bool(pending) or 'waitingOnApproval' in flags
+    terminal = status.get('type') != 'active' and latest.get('status') in ('completed', 'failed', 'interrupted')
+    state = ('waiting_permission' if waiting else 'terminal' if terminal else
+             'active' if latest.get('status') == 'inProgress' and running else 'unknown')
+    return {'runtime': 'codex', 'session': thread, 'status': state,
+            'observed_at': datetime.now(timezone.utc).isoformat(), 'event_at': stamp,
+            'session_link': f'{core.PAGES.rstrip("/")}/open.html#codex://threads/{thread}',
+            'exact_blocker': ('Owner approval required in runtime UI' if waiting else
+                              'Owner input required in runtime UI' if 'waitingOnUserInput' in flags else
+                              'No current execution or terminal evidence; approval visibility incomplete' if state == 'unknown' else None),
+            'source': 'codex app-server', 'permission_requests': pending,
+            'approval_visibility': 'pending' if waiting else 'unknown',
+            'notify_dedup': (f'permission codex {thread} ' + ','.join(sorted(str(item['request_id']) for item in pending))
+                             if pending else f'permission codex {thread} flag' if waiting else None)}
 
 
 class CodexIpc:

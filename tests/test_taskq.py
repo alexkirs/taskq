@@ -1239,6 +1239,7 @@ class Cycle(unittest.TestCase):
         self.assertNotIn('## Claude idle', output)
         self.assertNotIn('## Codex idle', output)
         agent['status'], self.codex.status = 'idle', 'idle'
+        self.codex.turns = [{'id': 'finished', 'status': 'completed'}]
         with patch.object(q, 'STALE_MINUTES', -1):
             output = self.do(COORDINATOR, 'tick')
         self.assertNotIn('Released', output)
@@ -1709,6 +1710,7 @@ class Cycle(unittest.TestCase):
     def test_tick_codex_idle_requires_intervention_and_later_archive(self):
         iid = self.add('--type', 'asset')
         self.do(CODEX, 'take', iid)
+        self.codex.turns = [{'id': 'finished', 'status': 'completed'}]
         output = self.do(CLAUDE, 'tick')
         self.assertIn('## Codex idle', output)
         self.assertIn(f'| {link(iid)} t | doing | codex @mac-1 | [session](https://alexkirs.github.io/taskq/open.html#codex://threads/codex-session) | idle, last event unknown', output)
@@ -1811,6 +1813,7 @@ class Cycle(unittest.TestCase):
         self.assertIn('Done: spawn a claude worker for', log)
         self.do(CLAUDE, 'take', code)
         self.do(CODEX, 'take', idle)
+        self.codex.turns = [{'id': 'finished', 'status': 'completed'}]
         self.assertEqual(act()[:2], ('', 0))
         self.assertEqual(sent, ['codex-session'])  # the fixed idle nudge, no coordinator turn
         # A review needs judgement: printed, exit 1; --wake gives it to the coordinator once per set of items.

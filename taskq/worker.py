@@ -450,6 +450,69 @@ def spawn(args):
     return session
 
 
+def preflight(args):
+    """A real, read-only local command ACK for an external PM; no worker, claim or policy changes."""
+    root = core.ROOT.resolve()
+    blocker = None
+    try:
+        done = subprocess.run([sys.executable, '-c',
+                               'import os; print(os.getcwd())'], cwd=root,
+                              capture_output=True, text=True, timeout=30)
+        code, stdout, stderr = done.returncode, done.stdout, done.stderr
+    except subprocess.TimeoutExpired as error:
+        code, stdout, stderr = 124, error.stdout or '', error.stderr or ''
+        blocker = 'Local command timed out after 30 seconds'
+    except OSError as error:
+        code, stdout, stderr = 126, '', str(error)
+        blocker = f'Local command could not start: {error}'
+    # TimeoutExpired may retain bytes even with text=True.
+    stdout, stderr = (value.decode(errors='replace') if isinstance(value, bytes) else value for value in (stdout, stderr))
+    ready = code == 0 and stdout.strip() == str(root)
+    acknowledgement = {'status': 'ready' if ready else 'unknown',
+                       'observed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                       'cwd': str(root), 'exit_code': code,
+                       'stdout': stdout, 'stderr': stderr, 'source': 'local subprocess',
+                       'exact_blocker': None if ready else blocker or 'Local command did not acknowledge the expected cwd',
+                       'runtime_capability': 'unknown', 'effective_launch_policy': 'unknown'}
+    core.record(args, 'local_command_ack', **acknowledgement)
+    print(json.dumps(acknowledgement))
+    if acknowledgement['status'] != 'ready':
+        core.fail('local command did not acknowledge the expected cwd; no worker started')
+
+
+def runtime_status(args):
+    """Read supported status only. No private rollout, resume, IPC, approval reply or worker creation."""
+    observation = {'runtime': args.runtime, 'session': args.session, 'status': 'unknown',
+                   'observed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'event_at': None,
+                   'session_link': None, 'exact_blocker': 'Runtime has no qualified status source',
+                   'source': 'unavailable', 'permission_requests': [], 'approval_visibility': 'unknown',
+                   'notify_dedup': None}
+    if args.runtime == 'codex':
+        observation['session_link'] = f'{core.PAGES.rstrip("/")}/open.html#codex://threads/{args.session}'
+    try:
+        if args.runtime == 'codex':
+            codex = core.Codex()
+            try:
+                metadata = codex.call('thread/read', {'threadId': args.session})['thread']
+                turns = codex.call('thread/turns/list', {'threadId': args.session, 'limit': 1, 'itemsView': 'notLoaded'})['data']
+                if turns:
+                    turns[0]['entries'] = codex.call('thread/items/list', {'threadId': args.session,
+                        'turnId': turns[0]['id'], 'limit': 100, 'sortDirection': 'desc'})['data']
+                stamps = [entry[key] / 1000 for turn in turns for entry in turn.get('entries', [])
+                          for key in ('startedAtMs', 'completedAtMs') if entry.get(key) is not None]
+                observation = core.codex_observation(codex, args.session, metadata['status'], turns, max(stamps, default=None))
+            finally:
+                codex.socket.close()
+        elif args.runtime == 'claude':
+            agent = core.claude_agents().get(args.session)
+            observation.update(source='claude agents', session_link=core.claude_url(args.session),
+                               exact_blocker='CLI status does not expose qualified pending approval events')
+    except (OSError, SystemExit, ValueError) as error:
+        observation['exact_blocker'] = f'Status unavailable: {core.codex_line(error)}'
+    core.record(args, 'runtime_observation', **observation)
+    print(json.dumps(observation))
+
+
 def executor_run(runtime, verb, **values):
     """One `[runtimes.<name>]` command (`spawn`, `send`) from the main checkout; its last output line."""
     done = subprocess.run(core.selftest_command(core.EXECUTORS[runtime][verb], **values), cwd=core.ROOT, capture_output=True, text=True, timeout=300)

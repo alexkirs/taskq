@@ -177,7 +177,7 @@ def worker(args):
     runtime = core.me()['runtime']
     free = core.room(loaded[0], args.profile['limits'])
     found = [item for item in candidates if item['state'] == 'ready' and free[runtime] > 0
-             and not core.refusal(item, loaded[0], loaded[1], runtime)]
+             and not core.refusal(item, loaded[0], loaded[1], runtime) and not core.sandbox_refusal(item, runtime)]
     print(brief(found[0]).replace(f'{core.TOOL} worker`', f'{core.TOOL} worker{core.profile_arguments(args)}`')
           if found else 'No task can start now. Say so and stop.')
 
@@ -192,7 +192,8 @@ def take(args):
     if current['state'] == 'doing' and (claim.get('runtime'), claim.get('session')) == (mine['runtime'], mine['session']):
         core.note(args.iid, 'take')  # a repeated take of its own task, e.g. after an answer in the session
         return print(f'#{args.iid} is yours')
-    reason = f'state is {current["state"]}' if current['state'] != 'ready' else core.refusal(current, everything, open_iids, mine['runtime'])
+    reason = f'state is {current["state"]}' if current['state'] != 'ready' else (
+        core.refusal(current, everything, open_iids, mine['runtime']) or core.sandbox_refusal(current, mine['runtime']))
     if reason:
         core.fail(f'#{args.iid} cannot start: {reason}')
     if not core.lock(args.iid):
@@ -395,7 +396,7 @@ def spawn(args):
     rejects a name containing it as a name@team address."""
     name = args.name if args.name.endswith(f' ({core.machine()})') else f'{args.name} ({core.machine()})'
     if args.runtime == 'codex':
-        return print(core.codex_spawn(name, args.text))
+        return print(core.codex_spawn(name, args.text, getattr(args, 'full_access', False)))
     if args.runtime in core.EXECUTORS:
         session = executor_run(args.runtime, 'spawn', name=name)
         if args.text:

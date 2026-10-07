@@ -225,13 +225,15 @@ def launch(args, start, act, step):
     if start and act:
         for item in start:
             step(f'spawn a {item["runtime"]} worker for {core.ref(item)}', lambda item=item: core.spawn(argparse.Namespace(
-                runtime=item['runtime'], name=f'T{item["iid"]} {item["title"][:40]}', remote_control=True, text=worker_prompt(args))))
+                runtime=item['runtime'], name=f'T{item["iid"]} {item["title"][:40]}', remote_control=True, text=worker_prompt(args),
+                full_access=item['full_access'])))
     elif start:
         # One command per worker: the session starts on the prompt, no second message (#41).
         # An indented block, not inline code: the prompt itself holds backticks.
         print(f'## Start {len(start)} worker session(s)\n\n' + ''.join(f'- {core.ref(item)} {item["title"]}: {item["runtime"]}\n' for item in start)
               + '\nRun each command once; the worker starts on the brief at once:\n\n' + ''.join('    ' + shlex.join([core.TOOL, 'spawn', '--runtime', item['runtime'], '--name',
-                                             f'T{item["iid"]} {item["title"][:40]}', '--text', worker_prompt(args)]) + '\n'
+                                             f'T{item["iid"]} {item["title"][:40]}', '--text', worker_prompt(args)]
+                                            + ['--codex-full-access'] * (item['full_access'] and item['runtime'] == 'codex')) + '\n'
                         for item in start))
 
 
@@ -482,7 +484,7 @@ def tick_pass(args, act=False):
     if idle and act:
         for item in idle:
             step(f'nudge idle Codex {core.ref(item)}', lambda item=item: core.codex_send(
-                argparse.Namespace(thread=item['claim']['session'], text=NUDGE)))
+                argparse.Namespace(thread=item['claim']['session'], text=NUDGE, full_access=item['full_access'])))
     elif idle:
         print('## Codex idle\n\nTask is doing without result/ask, but its session has stopped. Intervene now:\n')
         for item in idle:

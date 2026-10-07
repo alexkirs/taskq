@@ -1425,6 +1425,29 @@ class Cycle(unittest.TestCase):
         self.assertEqual(start['sandbox'], 'workspace-write')
         self.assertEqual(start['approvalPolicy'], 'never')
 
+    def test_codex_full_access_label(self):
+        """#157: workspace-write denies the GPU; a codex-full-access task runs its Codex turns with danger-full-access."""
+        iid = self.add('--type', 'code', '--runtime', 'codex')
+        self.gitlab.issues[iid]['labels'].append(q.FULL_ACCESS)
+        sandboxed = {**CODEX, 'CODEX_SANDBOX': 'seatbelt'}
+        self.assertIn('No task can start now', self.do(sandboxed, 'worker'))
+        self.assertIn(q.FULL_ACCESS, self.refused(sandboxed, 'take', iid))
+        self.assertIn(f'#{iid} is yours', self.do({**CODEX, 'CODEX_SANDBOX': ''}, 'take', iid))
+        full = {'type': 'dangerFullAccess'}
+        self.assertEqual(codex.codex_turn_policy(True)['sandboxPolicy'], full)
+        self.codex.status = 'notLoaded'
+        with patch.object(codex, 'CodexIpc', side_effect=FileNotFoundError('no app')):
+            self.do(CLAUDE, 'codex-send', 'codex-session', '--text', 'next')
+            self.assertEqual(self.codex.calls[-2][1]['sandboxPolicy'], full)
+            self.assertEqual(self.codex.calls[-3][1]['sandbox'], 'danger-full-access')
+            self.do(CLAUDE, 'codex-send', 'other', '--text', 'next')
+            self.assertEqual(self.codex.calls[-2][1]['sandboxPolicy'], codex.codex_turn_policy()['sandboxPolicy'])
+        self.codex.calls.clear()
+        with patch.object(codex, 'codex_announce'):
+            self.do(CLAUDE, 'spawn', '--runtime', 'codex', '--name', 'probe', '--text', 'go', '--codex-full-access')
+        calls = dict(self.codex.calls)
+        self.assertEqual((calls['thread/start']['sandbox'], calls['turn/start']['sandboxPolicy']), ('danger-full-access', full))
+
     def test_codex_spawn_finds_the_app_project_by_the_checkout_path(self):
         """#24: an id is per machine; the checkout path is shared. An explicit [codex] project still wins."""
         def spawned_in():

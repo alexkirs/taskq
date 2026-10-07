@@ -21,7 +21,11 @@ CODEX_LOCKS = Path.home() / '.codex/thread-writer-locks'
 # writes its refs, objects and worktree admin files into the main checkout's .git, so .git is a root.
 # The taskq state dir holds the machine id and update stamp. taskq.toml [codex] writable adds the project's
 # own roots outside the checkout (#154, csgo's media root); a missing one is skipped, doctor warns.
-def codex_turn_policy():
+# Owner decision 2026-10-07 (#157): workspace-write denies the Apple GPU (IOKit AGXDeviceUserClient) and Codex has
+# no GPU-only setting, so a task labelled FULL_ACCESS runs its Codex turns with danger-full-access instead.
+def codex_turn_policy(full_access=False):
+    if full_access:
+        return {'approvalPolicy': 'never', 'sandboxPolicy': {'type': 'dangerFullAccess'}}
     roots = [core.ROOT / '.git', core.ROOT / '.worktrees', core.UPDATE_STAMP.parent,
              *(root for root in core.codex_writable() if root.exists())]
     return {'approvalPolicy': 'never', 'sandboxPolicy': {
@@ -30,6 +34,10 @@ def codex_turn_policy():
 
 # thread/start and thread/resume use the CLI spelling; turn/start carries the full policy.
 CODEX_ACCESS = {'sandbox': 'workspace-write', 'approvalPolicy': 'never'}
+
+
+def codex_access(full_access=False):
+    return {**CODEX_ACCESS, 'sandbox': 'danger-full-access'} if full_access else CODEX_ACCESS
 
 
 class Codex:
@@ -160,7 +168,7 @@ def codex_release(codex, thread):
     codex.call('thread/unsubscribe', {'threadId': thread})
 
 
-def codex_send_app(codex, thread, metadata, text):
+def codex_send_app(codex, thread, metadata, text, full_access=False):
     """Deliver through the app when its window owns the thread, as a second app window would
     (`thread-follower-*`). None: the app does not own it. The app applies the request's policy."""
     try:
@@ -180,7 +188,7 @@ def codex_send_app(codex, thread, metadata, text):
             if reply['resultType'] == 'success':
                 return 'steered the active turn in the Codex app'
         reply = ipc.request('thread-follower-start-turn', {'conversationId': thread, 'turnStart': {
-            'request': {'threadId': thread, 'input': item, **codex_turn_policy()}, 'context': {}}}, 2, owner)
+            'request': {'threadId': thread, 'input': item, **codex_turn_policy(full_access)}, 'context': {}}}, 2, owner)
         if reply['resultType'] != 'success':
             core.fail(f'Codex app refused the message for {thread}: {reply.get("error")}')
         return 'new turn in the Codex app'
@@ -203,17 +211,17 @@ def codex_project(codex):
     return created.get('project', created)['id']
 
 
-def codex_spawn(name, prompt=None):
+def codex_spawn(name, prompt=None, full_access=False):
     """A persistent thread of the app's project (`codex_project`) in section `CODEX_SECTION`, announced to the app and
-    released by the shared server, so the owner can write in it. It runs with `CODEX_ACCESS`. Its first turn is `prompt`,
+    released by the shared server, so the owner can write in it. It runs with `codex_access(full_access)`. Its first turn is `prompt`,
     left running as `codex-send` leaves it; without one, a finished 'ready' turn."""
     codex = Codex(timeout=300)
     thread = codex.call('thread/start', {'cwd': str(core.ROOT), 'projectId': codex_project(codex),
-                                         'ephemeral': False, **CODEX_ACCESS})['thread']['id']
+                                         'ephemeral': False, **codex_access(full_access)})['thread']['id']
     codex.call('thread/name/set', {'threadId': thread, 'name': name})
     if section := core.codex_override('section'):
         codex.call('thread/section/move', {'threadId': thread, 'sectionId': section})
-    codex.call('turn/start', {'threadId': thread, **codex_turn_policy(),
+    codex.call('turn/start', {'threadId': thread, **codex_turn_policy(full_access),
                             'input': [{'type': 'text', 'text': prompt or 'Reply with the single word: ready'}]})
     if not prompt:
         codex.wait_turn(thread, 280)
@@ -224,11 +232,15 @@ def codex_spawn(name, prompt=None):
 
 def codex_send(args):
     """Pin every new turn's policy; deliver active input through steer without a new turn. A thread the
-    shared server has not loaded may be the app's: then the app delivers it."""
+    shared server has not loaded may be the app's: then the app delivers it. Full access: `args.full_access`, else
+    whether the thread is the claimed session of a FULL_ACCESS task."""
+    full = getattr(args, 'full_access', None)
+    if full is None:
+        full = any(item['full_access'] and (item['claim'] or {}).get('session') == args.thread for item in core.load()[0])
     codex = Codex()
     metadata = codex.call('thread/read', {'threadId': args.thread})['thread']
     status = metadata['status']['type']
-    route = codex_send_app(codex, args.thread, metadata, args.text) if status == 'notLoaded' else None
+    route = codex_send_app(codex, args.thread, metadata, args.text, full) if status == 'notLoaded' else None
     if route:
         return print(f'delivered to {args.thread} ({route})')
     if status == 'active':
@@ -240,13 +252,13 @@ def codex_send(args):
     else:
         try:
             # Also for a loaded idle thread: resume subscribes this connection, so the release below unloads it.
-            codex.call('thread/resume', {'threadId': args.thread, **CODEX_ACCESS})
+            codex.call('thread/resume', {'threadId': args.thread, **codex_access(full)})
         except SystemExit as error:
             if 'active writer' in str(error):
                 core.fail(f'Codex thread {args.thread} is held by the Codex app, but no app window owns it; '
                      f'open it there (`open -g codex://threads/{args.thread}`) and send again')
             raise
-        codex.call('turn/start', {'threadId': args.thread, **codex_turn_policy(),
+        codex.call('turn/start', {'threadId': args.thread, **codex_turn_policy(full),
                                 'input': [{'type': 'text', 'text': args.text}]})
         codex_release(codex, args.thread)
     print(f'delivered to {args.thread}' + (' (steered active turn)' if status == 'active' else ''))

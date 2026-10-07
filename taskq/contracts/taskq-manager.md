@@ -511,7 +511,10 @@ and codex-send, explicitly passes `approvalPolicy: never` and `sandboxPolicy: {t
 networkAccess: true, writableRoots: [<main checkout>/.git, <main checkout>/.worktrees, <taskq state
 dir>, ...taskq.toml [codex] writable]}` from `codex_turn_policy()` (2026-10-07, #149: the #57 probe passed every worker step there;
 `.git` is a root because git writes the worktree's refs and objects into the main checkout's `.git`). The thread/start and resume settings are derived from the same policy in
-their protocol's format. In the installed schema `thread/queue/add` does not accept a turn policy,
+their protocol's format. Exception (owner decision 2026-10-07, #157): a task labelled `codex-full-access` gets
+`codex_turn_policy(full_access=True)`, `sandboxPolicy: {type: dangerFullAccess}`, and `danger-full-access` on
+thread/start and resume: workspace-write denies the Apple GPU and Codex has no GPU-only setting. Tick passes the label to
+spawn and to the nudge; `codex-send` without it looks up whether the thread is the claimed session of such a task. In the installed schema `thread/queue/add` does not accept a turn policy,
 so taskq does not use it for active-send. `turn/steer` does not start a new turn and does not change
 the sandbox of a running turn; a restricted turn stays restricted until it ends. The next new turn
 via codex-send gets the explicit policy. `codex-read` shows the sandbox and approvalPolicy of the

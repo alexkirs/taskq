@@ -356,7 +356,7 @@ def parse(issue):
             'type': next((label for label in labels if label in TYPES), None),
             'runtime': next((label[len(RUN):] for label in labels if label.startswith(RUN)), None),
             'host': next((label[len(ON):] for label in labels if label.startswith(ON)), None),
-            'assignees': [user['id'] for user in issue.get('assignees', [])], 'selftest': SELFTEST in labels,
+            'assignees': [user['id'] for user in issue.get('assignees', [])], 'selftest': SELFTEST in labels, 'full_access': FULL_ACCESS in labels,
             'priority': min([int(label[9:]) for label in labels if re.fullmatch(r'priority-\d', label)] or [9]),
             'updated_at': issue['updated_at'],
             'web_url': issue.get('web_url'), 'text': BLOCK.sub('', issue['description']).strip()}
@@ -619,6 +619,13 @@ def refusal(candidate, everything, open_iids, runtime=None):
     return None
 
 
+def sandbox_refusal(candidate, runtime):
+    """A FULL_ACCESS task needs a Codex session spawned with full access; a sandboxed one has CODEX_SANDBOX set."""
+    if runtime == 'codex' and candidate.get('full_access') and os.environ.get('CODEX_SANDBOX'):
+        return f'{FULL_ACCESS} needs a Codex session with full access; this one is sandboxed'
+    return None
+
+
 def startable(runtime=None, loaded=None):
     everything, open_iids, *_ = loaded or load()
     return [item for item in everything if item['state'] == 'ready' and not refusal(item, everything, open_iids, runtime)]
@@ -710,6 +717,7 @@ CONTRACTS = Path(__file__).resolve().parent / 'contracts'
 # --- [runtimes] executors and the selftest label (selftest itself: taskq/selftest.py) ---------------
 
 SELFTEST = 'selftest'  # label of a selftest task: only a profile whose filter names it sees one
+FULL_ACCESS = 'codex-full-access'  # label: the task's Codex turns run with danger-full-access (#157)
 QUIET_MINUTES = 30  # a [runtimes] worker silent this long gets one nudge: the tick in the 5-minute window after it
 EXECUTORS = {}  # runtime -> [runtimes.<name>] of taskq.toml: env, spawn, send, archive command templates
 
@@ -809,7 +817,9 @@ def main(argv=None):
             (('--name',), {'default': 'taskq worker', 'help': 'session name: "T<N> <words>"; " (<this machine>)" is added'}),
             (('--remote-control',), {'action': argparse.BooleanOptionalAction, 'default': True,
                                       'help': 'Claude: Remote Control, so tick links the session at claude.ai (default on)'}),
-            (('--text',), {'help': 'the worker prompt the session starts on (tick prints it); idle without it'}))
+            (('--text',), {'help': 'the worker prompt the session starts on (tick prints it); idle without it'}),
+            (('--codex-full-access',), {'dest': 'full_access', 'action': 'store_true',
+                                        'help': f'Codex: danger-full-access instead of workspace-write (tick sets it for {FULL_ACCESS})'}))
     command('view', view, iid, (('--notes',), {'type': int, 'default': 3, 'help': 'last notes to print (default 3)'}))
     claude_session = (('session',), {'help': 'Claude session id (or local_<id>)'})
     command('show', show, claude_session,

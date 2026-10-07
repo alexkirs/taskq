@@ -222,7 +222,7 @@ class Selftest:
                 process.wait(timeout=self.args.wait)  # one turn at a time in a CLI session
             if runtime == 'codex':
                 with contextlib.redirect_stdout(io.StringIO()):
-                    core.codex_send(argparse.Namespace(thread=session, text=prompt))
+                    core.codex_send(argparse.Namespace(thread=session, text=prompt, full_access=False))
                 return
             if runtime == 'claude':  # a background session between turns: wake it with the prompt, same id
                 # No CLAUDE_WORKER_TOOLS here (#51, CLI 2.1.291): with any flag --resume starts a copy under a new id

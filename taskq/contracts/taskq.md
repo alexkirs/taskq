@@ -23,6 +23,7 @@ The previous DOT system (`dot_tick.py`, `dot_gitlab.py`, labels `flow-*`) was re
 | Work area | Project-configured `area-*` labels; `add --area maps` |
 | Assignee | GitLab user: empty is the shared pool; `add --mine` assigns the author; `take` assigns the current glab user |
 | Runtime | Label `run-claude` or `run-codex`; without one, `any` |
+| Codex full access | Label `codex-full-access` (owner's choice per task, #157): the task's Codex turns run with `danger-full-access` instead of workspace-write: no file, network or IOKit limits. Set it only for a task that needs the GPU (Blender, Metal). `tick` spawns its Codex worker with `spawn --codex-full-access`, `codex-send` keeps the policy for the session that claims it, and a sandboxed Codex session (`CODEX_SANDBOX` set) does not see or `take` it |
 | Machine | Label `host-<name>` (`add --host win`): only a worker on that machine takes it; without one, the machine whose worker takes it first. A machine's name: `TASKQ_HOST`, else `[hosts]` of taskq.toml (`"DESKTOP-7" = "win"`), else the hostname up to the first dot |
 | Type | Label `code`, `docs`, `research` or `asset` |
 | Priority | Label `priority-1` or `priority-2` |
@@ -62,7 +63,7 @@ It holds no secrets: the token belongs to `glab`.
 | `[coordinator] machine` | The one machine (its name, e.g. `"mac"`) whose tick coordinates: spawns shared work, shows reviews and questions, closes (#145). A tick on any other machine starts only its `host-<name>` tasks within its own limits, releases only its own stalled work, never reviews or closes, and prints `coordinator is <name>`. No failover: the owner moves it by editing this line. `doctor` names a ref left by the old lease (`refs/taskq/coordinator/*`), `doctor --fix` deletes it | none: every tick coordinates (a single-machine project) |
 | `[brief] rules` | Project rules added to step 6 of every worker brief (budget, approvals, where the project's authorization is written) | nothing |
 
-The Codex worker sandbox (workspace-write, Codex CLI 0.159) denies the GPU on macOS: `iokit-open-user-client AGXDeviceUserClient` and `IOSurfaceRootUserClient`, so `MTLCreateSystemDefaultDevice()` returns nil. Blender 5.2 then exits 139 at start (`supports_barycentric_whitelist` → `strstr(NULL)`), even `--background --factory-startup`; no `--gpu-backend` avoids it and Codex has no setting that allows only the GPU (#157). A task that needs Metal (Blender, a GPU browser) runs in a Claude worker (`run-claude`) or with full access.
+The Codex worker sandbox (workspace-write, Codex CLI 0.159) denies the GPU on macOS: `iokit-open-user-client AGXDeviceUserClient` and `IOSurfaceRootUserClient`, so `MTLCreateSystemDefaultDevice()` returns nil. Blender 5.2 then exits 139 at start (`supports_barycentric_whitelist` → `strstr(NULL)`), even `--background --factory-startup`; no `--gpu-backend` avoids it and Codex has no setting that allows only the GPU (#157). A task that needs Metal (Blender, a GPU browser) runs in a Claude worker (`run-claude`) or, by the owner's choice, in a Codex worker with the `codex-full-access` label (§ Data model). Risk of that label: the worker can write and delete anything the user can, outside the checkout too.
 
 New project: `taskq init --project group/project` writes a minimal `taskq.toml` if none exists and
 creates the labels and the board (§ Schema and migration).

@@ -1019,13 +1019,17 @@ class Cycle(unittest.TestCase):
             self.assertIn('Start 1 worker', self.do(CLAUDE, 'tick', '--limit', 'claude=2,codex=0'))
 
     def test_two_users_assignees_pool_manual_take_and_ask(self):
-        mine = self.add('--type', 'code', '--mine', '--area', 'maps')
+        first = self.add('--type', 'code', '--mine', '--area', 'maps')
         pool = self.add('--type', 'code', '--area', 'maps')
         self.gitlab.uid = 2
         self.assertIn(f'take {pool}', self.do(CLAUDE, 'worker', '--filter', 'labels=area-maps'))
         self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--mine'))
         self.do(CLAUDE, 'take', pool)
         self.assertEqual(self.gitlab.issues[pool]['assignees'], [{'id': 2}])
+        # #208: another user's task needs that owner's delegation, which taskq has no policy for: the assignee stays.
+        self.assertIn('delegation needs an owner-verified policy', self.refused({**CLAUDE, 'CLAUDE_CODE_SESSION_ID': 'other'}, 'take', first))
+        self.assertEqual((self.state(first), self.gitlab.issues[first]['assignees']), ('ready', [{'id': 1}]))
+        mine = self.add('--type', 'code', '--mine', '--area', 'maps')
         self.do(CLAUDE, 'take', mine)
         self.assertEqual(self.gitlab.issues[mine]['assignees'], [{'id': 2}])
         self.do(CLAUDE, 'ask', mine, '--text', 'Only second user sees this')
@@ -1623,18 +1627,18 @@ class Cycle(unittest.TestCase):
         self.agents = {'abcd1234-0000': {'id': 'abcd1234', 'sessionId': 'abcd1234-0000', 'pid': 1}}
         runs, patched = self.run_recorded({'claude --bg': 'backgrounded · \x1b[36mabcd1234\x1b[39m · T1 x (idle — send a prompt to start)'})
         with patched:
-            printed = self.do(CLAUDE, 'spawn', '--name', 'T1 x')
-            self.do(CLAUDE, 'spawn', '--name', 'T1 x', '--no-remote-control')
-            self.do(CLAUDE, 'spawn', '--name', 'T1 x', '--text', 'Run the brief')
+            printed = self.do(CLAUDE, 'spawn', '--name', 'probe x')
+            self.do(CLAUDE, 'spawn', '--name', 'probe x', '--no-remote-control')
+            self.do(CLAUDE, 'spawn', '--name', 'probe x', '--text', 'Run the brief')
         self.assertEqual(printed.splitlines()[0], 'abcd1234-0000')
         self.assertIn('claude attach abcd1234', printed)
         # csgo #303: the name says the machine. #83: Remote Control on unless turned off. #41: the prompt is last.
         # #51: only the 8 worker tools, no MCP. #71: dontAsk pinned, also in --settings (a --resume keeps only that).
         tools = ['--permission-mode', 'dontAsk', '--tools', 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch', '--strict-mcp-config', '--no-chrome']
         mode, off = '{"permissions": {"defaultMode": "dontAsk"}', ', "remoteControlAtStartup": false}'
-        self.assertEqual(runs, [['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', mode + '}'],
-                                ['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', mode + off],
-                                ['claude', '--bg', *tools, '--name', 'T1 x (mac-1)', '--settings', mode + '}', 'Run the brief']])
+        self.assertEqual(runs, [['claude', '--bg', *tools, '--name', 'probe x (mac-1)', '--settings', mode + '}'],
+                                ['claude', '--bg', *tools, '--name', 'probe x (mac-1)', '--settings', mode + off],
+                                ['claude', '--bg', *tools, '--name', 'probe x (mac-1)', '--settings', mode + '}', 'Run the brief']])
         self.agents = {}
         with self.run_recorded({'claude --bg': 'backgrounded · ffff0000 · T1 x'})[1]:
             self.assertIn('does not list the new session ffff0000', self.refused(CLAUDE, 'spawn'))

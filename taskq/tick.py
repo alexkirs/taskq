@@ -413,6 +413,18 @@ def codex_workers():
             and (thread.get('status') or {}).get('type') != 'systemError' and (iid := worker_iid(thread.get('name')))]
 
 
+def launched(iid, runtime):
+    """#208: session ids of this checkout's live `T<iid>` workers of `runtime`, the evidence a reservation is matched
+    and settled by; None when that inventory is unreadable or the runtime has none (a [runtimes] app)."""
+    if runtime == 'claude':
+        agents = core.claude_agents(strict=True)
+        return None if agents is None else [sid for sid, agent in agents.items() if local(agent) and alive(agent) and worker_iid(agent.get('name')) == iid]
+    if runtime == 'codex':
+        threads = codex_workers()
+        return None if threads is None else [sid for found, sid in threads if found == iid]
+    return None
+
+
 def starts(args, loaded, selected):
     """The tasks to start on this machine now, each with its runtime, within this machine's free places."""
     free, start = core.room(loaded[0], args.profile['limits']), []
@@ -426,8 +438,9 @@ def starts(args, loaded, selected):
     # Exactly what room counted: a local claim of a doing task. A live worker of a review/ask task still holds a place.
     counted = {((item['claim'] or {}).get('runtime'), (item['claim'] or {}).get('session')) for item in loaded[0]
                if item['state'] == 'doing' and core.local_claim(item['claim'] or {})}
-    for runtime, _, session in live:
-        if (runtime, session) not in counted and runtime in free:
+    reserved = {item['iid'] for item in loaded[0] if core.reserved_here(item)}  # #208: room counted its place
+    for runtime, iid, session in live:
+        if (runtime, session) not in counted and iid not in reserved and runtime in free:
             free[runtime] -= 1
     spawned = {iid for _, iid, _ in live}
     unknown = {'claude': agents is None, 'codex': codex is None}
@@ -454,7 +467,7 @@ def launch(args, start, act, step):
         for item in start:
             step(f'spawn a {item["runtime"]} worker for {core.ref(item)}', lambda item=item: core.spawn(argparse.Namespace(
                 runtime=item['runtime'], name=f'T{item["iid"]} {item["title"][:40]}', remote_control=True, text=worker_prompt(args),
-                full_access=item['full_access'])), item=item)
+                full_access=item['full_access'], limits=args.profile['limits'])), item=item)
     elif start:
         for item in start:
             core.record(args, 'spawn', status='proposed', task=item['iid'], runtime=item['runtime'])
@@ -781,7 +794,9 @@ def queue_pass(args, act=False):
         core.requeue(args)
         core.record(args, 'release', task=item['iid'], reason=why)
         print(f'Released {"dead" if item in dead else "stalled"} {core.ref(item)}.')
-    stalled = dead + stalled
+    # #208: reservations found again (restart, a launch that died) are settled by evidence on their machine, never by age.
+    released = [item for item in loaded[0] if item['state'] == 'ready' and item.get('reservation') and core.reconcile(item, args)]
+    stalled = dead + stalled + released
     if not holder:
         # A task pinned to this machine (`host-<name>`) starts only here: the coordinator elsewhere cannot start it.
         start = starts(args, core.load() if stalled else loaded, {item['iid'] for item in candidates if item.get('host') == core.machine()})
@@ -792,7 +807,7 @@ def queue_pass(args, act=False):
         return failed
     loaded = core.load() if stalled else loaded
     # A lock on a task nobody holds: a take that died between the lock and the move, or a card moved by hand.
-    held = {item['iid'] for item in loaded[0] if item['state'] not in ('ready', 'waiting')}
+    held = {item['iid'] for item in loaded[0] if item['state'] not in ('ready', 'waiting') or item.get('reservation')}  # #208: no TTL steal
     for issue in core.issues(f'state=opened&my_reaction_emoji={core.LOCK}'):
         if issue['iid'] in selected and issue['iid'] not in held and all(time.time() - core.stamp(item['created_at']) > core.LOCK_SECONDS for item in core.locks(issue['iid'])):
             core.unlock(issue['iid'])

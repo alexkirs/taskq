@@ -179,10 +179,13 @@ def brief(current):
 def worker(args):
     """What a fresh worker session runs first: the brief of the first task that can start now."""
     loaded, candidates = core.profile(args)
-    runtime = core.me()['runtime']
+    mine = core.me()
+    runtime = mine['runtime']
     free = core.room(loaded[0], args.profile['limits'])
-    found = [item for item in candidates if item['state'] == 'ready' and free[runtime] > 0
-             and not core.refusal(item, loaded[0], loaded[1], runtime) and not core.sandbox_refusal(item, runtime)]
+    # #208: the worker a coordinator launched for a reserved task gets that task; its place is already counted.
+    found = [item for item in loaded[0] if item['state'] == 'ready' and item.get('reservation') and adopts(item, mine)] or [
+        item for item in candidates if item['state'] == 'ready' and free[runtime] > 0
+        and not core.refusal(item, loaded[0], loaded[1], runtime) and not core.sandbox_refusal(item, runtime)]
     print(brief(found[0]).replace(f'{core.TOOL} worker`', f'{core.TOOL} worker{core.profile_arguments(args)}`')
           if found else 'No task can start now. Say so and stop.')
 
@@ -197,33 +200,46 @@ def take(args):
     if current['state'] == 'doing' and (claim.get('runtime'), claim.get('session')) == (mine['runtime'], mine['session']):
         core.note(args.iid, 'take')  # a repeated take of its own task, e.g. after an answer in the session
         return print(f'#{args.iid} is yours')
+    # #208: a reserved task goes only to the worker its coordinator launched, which adopts the reservation's lock.
+    reserved = current['state'] == 'ready' and current.get('reservation')
+    if reserved and not adopts(current, mine):
+        core.fail(f'#{args.iid} cannot start: {core.refusal(current, everything, open_iids)}')
+    uid = core.user()
     reason = f'state is {current["state"]}' if current['state'] != 'ready' else (
-        core.refusal(current, everything, open_iids, mine['runtime']) or core.sandbox_refusal(current, mine['runtime']))
+        core.refusal({**current, 'reservation': None}, everything, open_iids, mine['runtime'])
+        or core.sandbox_refusal(current, mine['runtime']) or delegation(current, uid))
     if reason:
         core.fail(f'#{args.iid} cannot start: {reason}')
-    if not core.lock(args.iid):
+    if not (reserved and core.locks(args.iid)) and not core.lock(args.iid):
         core.fail(f'#{args.iid} cannot start: another worker holds its lock')
     try:
-        core.save(current, 'doing', claim=mine, result=None, waiting_for=None, assignee_ids=[core.user()])
+        # The assignee stays; an unassigned task becomes the taker's, as before.
+        core.save(current, 'doing', claim=mine, result=None, waiting_for=None, reservation=None,
+                  assignee_ids=current.get('assignees') or [uid])
     except BaseException:
         # A lock left behind refuses every later take of this task until tick clears it (#105).
         with contextlib.suppress(Exception, SystemExit):
             core.unlock(args.iid)
         raise
-    held = {**current, 'state': 'doing'}
-    # A task without paths overlaps nothing: no second read.
-    rivals = current['scope'] and [other for other in core.load()[0] if other['iid'] != args.iid and (other['claim'] or {}).get('session')
-              and core.overlap(current['scope'], other['scope'])]
+    held = {**current, 'state': 'doing', 'reservation': None}
+    # A task without paths overlaps nothing: no second read. A reserved rival is older than any take (#208).
+    rivals = current['scope'] and [other for other in core.load()[0] if other['iid'] != args.iid
+              and ((other['claim'] or {}).get('session') or other.get('reservation')) and core.overlap(current['scope'], other['scope'])]
     if rivals:
         # Each take moves its task before it reads, so the later of two sees the earlier; both order them alike.
         since = doing_since(args.iid)
-        older = [other for other in rivals if (doing_since(other['iid']), other['iid']) < (since, args.iid)]
+        older = [other for other in rivals if (0 if other.get('reservation') else doing_since(other['iid']), other['iid']) < (since, args.iid)]
         if older:
             core.save(held, 'ready', claim=current['claim'], result=current['result'], waiting_for=current['waiting_for'],
                  assignee_ids=current.get('assignees', []))
             core.unlock(args.iid)
             core.fail(f'#{args.iid} cannot start: scope overlaps #{older[0]["iid"]}')
-    core.note(args.iid, 'take')
+    if reserved:
+        principal = current['reservation'].get('principal')
+        core.note(args.iid, 'take', f'Adopted reservation {current["reservation"].get("attempt")} of {current["reservation"].get("coordinator")}'
+                  + (f'; execution principal {uid}, reserved by {principal}' if principal != uid else ''))
+    else:
+        core.note(args.iid, 'take')
     print(f'#{args.iid} is yours')
 
 
@@ -270,15 +286,17 @@ def requeue(args):
         # place was free while the task waited, so the limit is not checked: the worker never left.
         core.save(current, 'doing', args.action, args.text, waiting_for=None, result=None)
         return print(f'#{args.iid} is doing again with your claim: continue in this session')
+    if (current.get('reservation') or {}).get('principal') not in (None, core.user()):
+        core.fail(f'#{args.iid} is reserved by user {current["reservation"]["principal"]}: only that user releases it')
     # An empty claim marks a started task: it keeps its paths and its next worker continues.
     claim = current['claim'] and {'runtime': None, 'session': None}
     if args.action == 'release' and (before := releases(args.iid)):
         # #157: a worker that fails the same way (Blender in a Codex sandbox) would take, crash and release on
         # every tick; the second release in a row without an owner's answer or reject goes to the owner instead.
-        core.save(current, 'ask', 'release', args.text, waiting_for=None, result=None, claim=claim)
+        core.save(current, 'ask', 'release', args.text, waiting_for=None, result=None, claim=claim, reservation=None)
         return core.note(args.iid, 'ask', f'Released {len(before) + 1} times in a row, the last because: {args.text}\n'
                          f'Earlier: {before[-1]}\nDecide how it can run (runtime, access, a fix first) and answer.')
-    core.save(current, 'ready', args.action, args.text, waiting_for=None, result=None, claim=claim)
+    core.save(current, 'ready', args.action, args.text, waiting_for=None, result=None, claim=claim, reservation=None)
     core.unlock(args.iid)
 
 
@@ -433,21 +451,171 @@ def spawn(args):
     """Create a worker session in the main checkout that starts on `--text` (the worker prompt) and print its id.
     Claude: a CLI background session (`claude_spawn`). Codex: `codex_spawn`. Without `--text` the session is idle.
     The name ends with ` (<machine>)`: the owner sees where each worker runs. No `@`: SendMessage
-    rejects a name containing it as a name@team address."""
+    rejects a name containing it as a name@team address. #208: a task's worker (`T<N> …`) starts only after
+    `reserve` won task N; a failed launch with no worker releases the reservation, an unknown one keeps it."""
+    from taskq.tick import worker_iid
     name = args.name if args.name.endswith(f' ({core.machine()})') else f'{args.name} ({core.machine()})'
-    if args.runtime == 'codex':
-        session = core.codex_spawn(name, args.text, getattr(args, 'full_access', False))
+    iid = worker_iid(args.name)
+    attempt = iid and reserve(iid, args.runtime, getattr(args, 'limits', None))
+    try:
+        if args.runtime == 'codex':
+            session = core.codex_spawn(name, args.text, getattr(args, 'full_access', False))
+        elif args.runtime in core.EXECUTORS:
+            session = executor_run(args.runtime, 'spawn', name=name)
+            if attempt:
+                launched_note(iid, attempt, session)  # before its first turn: no worker can take sooner
+            if args.text:
+                executor_run(args.runtime, 'send', session=session, text=args.text)
+        else:
+            session = claude_spawn(name, prompt=args.text, remote_control=args.remote_control)
+    except BaseException as error:
+        if attempt:
+            failed_launch(iid, attempt, error)
+        raise
+    if attempt and args.runtime not in core.EXECUTORS:
+        launched_note(iid, attempt, session)
+    if args.runtime in ('codex', *core.EXECUTORS):
         print(session)
-        return session
-    if args.runtime in core.EXECUTORS:
-        session = executor_run(args.runtime, 'spawn', name=name)
-        if args.text:
-            executor_run(args.runtime, 'send', session=session, text=args.text)
-        print(session)
-        return session
-    session = claude_spawn(name, prompt=args.text, remote_control=args.remote_control)
-    print(f'{session}\nWatch it: `claude attach {session[:8]}` or `claude agents`; in the app: `{core.TOOL} show {session}`.')
+    else:
+        print(f'{session}\nWatch it: `claude attach {session[:8]}` or `claude agents`; in the app: `{core.TOOL} show {session}`.')
     return session
+
+
+# --- #208: a launch reserves its task first ------------------------------------------------------
+
+def delegation(current, uid):
+    """A task assigned to someone else runs only under that owner's explicit delegation; taskq has no such policy yet."""
+    assigned = current.get('assignees') or []
+    return None if not assigned or uid in assigned else 'assigned to another user; delegation needs an owner-verified policy and none is configured'
+
+
+def reserve(iid, runtime, limits=None):
+    """Before a worker of task `iid` starts: check admission on a fresh read, take the task's tracker lock and
+    record the attempt in its block. The lock decides between coordinators of any machine, user or filter; the
+    loser starts nothing. The reservation names who reserved it, not a worker: none exists before the launch."""
+    uid = core.user()
+    everything, open_iids, *_ = core.load()
+    current = next((item for item in everything if item['iid'] == iid), None) or core.fail(f'#{iid} is not an open taskq task')
+    if current['state'] == 'ready' and current.get('reservation') and reconcile(current):
+        everything, open_iids, *_ = core.load()
+        current = next((item for item in everything if item['iid'] == iid), None) or core.fail(f'#{iid} is not an open taskq task')
+    limits = limits or core.resolve(argparse.Namespace(filter=None, mine=None, limit=None))[0]['limits']
+    why = (f'state is {current["state"]}' if current['state'] != 'ready' else
+           core.refusal(current, everything, open_iids, runtime) or delegation(current, uid)
+           or (f'no Codex app server on this machine ({core.CODEX_SOCKET})' if runtime == 'codex' and not core.CODEX_SOCKET.exists() else None)
+           or (f'no free {runtime} place on this machine' if core.room(everything, limits).get(runtime, 0) <= 0 else None))
+    if why:
+        core.fail(f'#{iid} not launched: {why}')
+    if not core.lock(iid):
+        core.fail(f'#{iid} not launched: another coordinator or worker holds its lock')
+    attempt = {'attempt': os.urandom(4).hex(), 'runtime': runtime, 'principal': uid, 'coordinator': core.who(), **core.here(),
+               'pid': os.getpid(), 'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+    try:
+        fresh = core.task(iid)
+        if fresh['state'] != 'ready' or fresh['claim'] != current['claim'] or fresh.get('reservation'):
+            core.fail(f'#{iid} not launched: it changed since this launch read it')
+        core.save(fresh, reservation=attempt, note_action='reserve',
+                  note_text=f'Attempt {attempt["attempt"]}: a {runtime} worker{core.where(attempt)}, principal {uid}')
+        # Overlapping tasks reserved at once: each reads after its own write, so the later sees the earlier and gives way.
+        rivals = fresh['scope'] and [other['iid'] for other in core.load()[0] if other['iid'] != iid and core.overlap(fresh['scope'], other['scope'])
+                                     and ((other['claim'] or {}).get('session') or other.get('reservation'))]
+        if rivals:
+            core.save({**fresh, 'reservation': attempt}, reservation=None, note_action='launch',
+                      note_text=f'Attempt {attempt["attempt"]} released: scope overlaps #{rivals[0]}')
+            core.fail(f'#{iid} not launched: scope overlaps #{rivals[0]}')
+    except BaseException:
+        with contextlib.suppress(Exception, SystemExit):
+            core.unlock(iid)
+        raise
+    return attempt
+
+
+def launched_note(iid, attempt, session):
+    """The session a launch returned, as an append-only note: a block write here could undo the worker's take."""
+    core.note(iid, 'launch', f'Attempt {attempt["attempt"]} launched session {session}')
+
+
+def launch_session(iid, attempt):
+    """The session the coordinator's launch note binds to `attempt`, or None (no note yet, or it failed)."""
+    head = re.compile(rf'Attempt {re.escape(attempt)} launched session (\S+)$')
+    for body in reversed(core.notes(core.comments(iid))):
+        found = body.startswith('**launch**') and head.search(body)
+        if found:
+            return found[1]
+    return None
+
+
+def adopts(current, mine):
+    """Whether session `mine` is the worker launched for `current`'s reservation: same machine and runtime, and the
+    session the launch note names; before that note lands, a live `T<N>` worker of this checkout with that session."""
+    from taskq.tick import launched
+    found = current['reservation']
+    if found.get('runtime') != mine['runtime'] or not core.local_node(found.get('node') or ''):
+        return False
+    bound = launch_session(current['iid'], found.get('attempt') or '')
+    return bound == mine['session'] if bound else mine['session'] in (launched(current['iid'], found['runtime']) or [])
+
+
+def failed_launch(iid, attempt, error):
+    """A launch that raised: no worker of the task on this machine's readable inventory releases the reservation;
+    otherwise its outcome is unknown and the reservation stays, as a blocker for the coordinator."""
+    from taskq.tick import launched
+    with contextlib.suppress(Exception, SystemExit):
+        why = core.codex_line(str(error))
+        # `claude --bg` answered but `claude agents` did not list it yet: a session may exist, so the outcome is unknown.
+        if 'does not list the new session' not in str(error) and launched(iid, attempt['runtime']) == []:
+            release_reservation(core.task(iid), attempt, f'launch failed, no worker started: {why}')
+        else:
+            core.note(iid, 'launch', f'Attempt {attempt["attempt"]} outcome unknown: {why}. The reservation stays; '
+                      f'release it with `{core.TOOL} release {iid}` once no worker of it runs.')
+            print(f'#{iid}: launch outcome unknown, reservation kept: {why}', file=sys.stderr)
+
+
+def release_reservation(current, attempt, why):
+    """Drop exactly `attempt` and its lock; a reservation that changed meanwhile is someone else's to settle."""
+    if (current.get('reservation') or {}).get('attempt') != attempt['attempt'] or current['state'] != 'ready':
+        return False
+    core.save(current, reservation=None, note_action='launch', note_text=f'Attempt {attempt["attempt"]} released: {why}')
+    core.unlock(current['iid'])
+    return True
+
+
+def running(pid):
+    """Whether process `pid` of this machine still runs. ponytail: Windows has no harmless signal-0 probe, so
+    there a reservation waits for session evidence or an explicit release."""
+    if os.name == 'nt':
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def reconcile(current, args=None):
+    """A reservation found again (restart, next pass, a new launch): True when evidence released it. Only this
+    machine's reservation is settled here, and only by evidence: its launching process ended and its session
+    stopped, or no worker of the task is alive. Age alone never releases it; an unknown outcome keeps it."""
+    from taskq.tick import launched, liveness
+    found, iid, release = current['reservation'], current['iid'], None
+    if not core.local_node(found.get('node') or ''):
+        why = f'reserved on another machine{core.where(found)}: settled there'
+    elif found.get('pid') and running(found['pid']):
+        why = 'its launch is still running'
+    elif session := launch_session(iid, found.get('attempt') or ''):
+        state, _ = liveness({**current, 'state': 'doing', 'claim': {'runtime': found['runtime'], 'session': session}}, core.claude_agents())
+        release = state == 'dead' and f'its worker {session} stopped before taking the task'
+        why = release or f'its worker {session} is {state or "unknown here"}'
+    else:
+        sessions = launched(iid, found['runtime'])
+        release = sessions == [] and 'its launch was interrupted: no worker of it runs'
+        why = release or ('its launch outcome is unknown' if sessions is None else f'its worker {sessions[0]} has not taken it yet')
+    released = bool(release) and bool(fresh := core.unchanged(current)) and release_reservation(fresh, found, release)
+    core.record(args, 'reservation', status='released' if released else 'kept', task=iid, reason=why)
+    print(f'{core.ref(current)}: reservation {found.get("attempt")} {"released" if released else "kept"}: {why}.')
+    return released
 
 
 def preflight(args):

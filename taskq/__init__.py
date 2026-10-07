@@ -454,8 +454,9 @@ def unchanged(item):
     fresh = parse(issue) if issue['state'] == 'opened' else None
     why = ('it is no open task now' if not fresh else f'its state is {fresh["state"]} now' if fresh['state'] != item['state']
            else 'its claim changed' if fresh['claim'] != item['claim']
+           else 'its reservation changed' if fresh.get('reservation') != item.get('reservation')
            else 'it changed' if (active(item['iid']) != item['active'] if 'active' in item else fresh['updated_at'] != item['updated_at'])
-           else 'a take holds its lock' if fresh['state'] in ('ready', 'waiting') and locks(item['iid']) else None)
+           else 'a take holds its lock' if fresh['state'] in ('ready', 'waiting') and not fresh.get('reservation') and locks(item['iid']) else None)
     if why:
         print(f'Skipped #{item["iid"]}: {why} since this tick read it.')
     return None if why else fresh
@@ -463,8 +464,10 @@ def unchanged(item):
 
 def save(current, state=None, note_action=None, note_text='', close=False, add=(), remove=(), assignee_ids=None, **changes):
     """One PUT moves the labels and the block together; the note is the readable history."""
-    block = {key: current.get(key) for key in FIELDS}
+    block = {key: current.get(key) for key in (*FIELDS, 'reservation')}
     block.update(changes)
+    if block['reservation'] is None:
+        del block['reservation']  # #208: only a reserved task carries the key
     add, remove = list(add), list(remove)
     if state and state != current['state']:
         add, remove = add + [PREFIX + state], remove + [PREFIX + current['state']]
@@ -578,7 +581,13 @@ def local_claim(claim):
 def room(everything, capacity):
     taken = [(item['claim'] or {}).get('runtime') for item in everything
              if item['state'] == 'doing' and local_claim(item['claim'] or {})]
+    # #208: a launch reserved on this machine holds its place until its worker takes the task or it is released.
+    taken += [item['reservation'].get('runtime') for item in everything if reserved_here(item)]
     return {name: count - taken.count(name) for name, count in capacity.items()}
+
+
+def reserved_here(item):
+    return bool(item.get('reservation')) and local_node(item['reservation'].get('node') or '')
 
 
 def eligible(item, uid, mine=False):
@@ -634,6 +643,9 @@ def profile(args):
 
 def refusal(candidate, everything, open_iids, runtime=None):
     """Why this ready task cannot start now (in a session of `runtime`, if named), or None. The only admission rule."""
+    if candidate.get('reservation'):
+        found = candidate['reservation']
+        return f'reserved by {found.get("coordinator")}{where(found)} for its {found.get("runtime")} worker'
     if runtime and candidate['runtime'] not in (None, runtime):
         return f'runtime is {candidate["runtime"]}'
     if candidate.get('host') not in (None, machine()):
@@ -641,9 +653,9 @@ def refusal(candidate, everything, open_iids, runtime=None):
     waiting = sorted(set(candidate['deps']) & open_iids)
     if waiting:
         return f'open dependencies {waiting}'
-    # A started task keeps its paths through questions and review, until closed or released.
+    # A started task keeps its paths through questions and review, until closed or released; a reserved one too (#208).
     for other in everything:
-        if other['claim'] and other['iid'] != candidate['iid'] and overlap(candidate['scope'], other['scope']):
+        if (other['claim'] or other.get('reservation')) and other['iid'] != candidate['iid'] and overlap(candidate['scope'], other['scope']):
             return f'scope overlaps #{other["iid"]}'
     return None
 
@@ -791,7 +803,7 @@ from taskq.tick import (  # noqa: E402
     inbox_line, tick)
 from taskq.worker import (  # noqa: E402
     BRIEF, DELIVER, need_owner, doing_since, add, edit, later, listing, set_runtime, brief, worker, take, beat, ask,
-    result, requeue, close, retire_local, spawn, preflight, runtime_status, executor_run, send, claude_env, CLAUDE_WORKER_TOOLS, claude_spawn,
+    result, requeue, close, retire_local, spawn, reserve, reconcile, preflight, runtime_status, executor_run, send, claude_env, CLAUDE_WORKER_TOOLS, claude_spawn,
     claude_agents, claude_url, claude_stop, problem, report, claude_wake, view, show, retire, claude_import,
     claude_sessions, driver_app_session)
 

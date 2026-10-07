@@ -128,23 +128,32 @@ def api_read(command):
         return 1, str(error)
 
 
-# ponytail: known transport wordings of gh/glab and Go's net package; an unknown one stays a login gap, as before.
-NETWORK = re.compile(r'error connecting to|dial tcp|no such host|could not resolve|connection refused|network is unreachable|timed? ?out', re.I)
+# Only a positively established authentication failure means login; every other failure is named as what it is.
+# ponytail: known wordings of gh/glab and Go's net/tls packages; an unmatched one is `unknown`, never a login gap.
+AUTH = re.compile(r'HTTP 401|\b401 Unauthorized|Bad credentials|Requires authentication|not logged in|auth login', re.I)
+FAILURES = (('TLS/certificate failure', re.compile(r'x509|certificate|tls:? handshake', re.I)),
+            ('network denied or offline', re.compile(r'error connecting to|dial tcp|no such host|could not resolve'
+                                                     r'|connection refused|network is unreachable|timed? ?out', re.I)),
+            ('permission denied for this token (HTTP 403)', re.compile(r'HTTP 403|\b403 Forbidden|not accessible by integration', re.I)),
+            ('server error (HTTP 5xx)', re.compile(r'HTTP 5\d\d|\b5\d\d (Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout)')))
 
 
 def login_gap(cli, host):
     """#177: `auth status` also fails without network (seen live: «token invalid» in a sandbox that denied
-    api.github.com). One supported authorized read, `<cli> api user`, tells a network denial from a real login gap.
-    (what, fix), or None when the read succeeds. Reads only: no login, no credential written."""
+    api.github.com). One supported authorized read, `<cli> api user`, confirms it: only an authentication
+    failure (401) gives the owner's login step; network, TLS, 403, 5xx and an unrecognised or empty error are
+    reported as that blocker, not as a login gap. (what, fix), or None when the read succeeds. Reads only."""
     hostname = ['--hostname', host] if host else []
     code, stderr = api_read([cli, 'api', 'user', *hostname])
     if not code:
         return None
-    if NETWORK.search(stderr):
-        return (f'`{cli}` cannot reach {host or "the API"}: network denied or offline, not a login gap',
-                f'{shlex.join([cli, "api", "user", *hostname])}  (rerun with network access; do not run auth login for this)')
-    return (f'`{cli}` is not logged in{f" to {host}" if host else ""}',
-            f'{cli} auth login{f" --hostname {host}" if host else ""}  (the person runs it: OAuth in the browser)')
+    if AUTH.search(stderr):
+        return (f'`{cli}` is not logged in{f" to {host}" if host else ""}',
+                f'{cli} auth login{f" --hostname {host}" if host else ""}  (the person runs it: OAuth in the browser)')
+    kind = next((label for label, pattern in FAILURES if pattern.search(stderr)), 'unknown failure')
+    shown = core.last_line(stderr) or 'no error output'
+    return (f'`{cli} api user` failed: {kind}, not a proven login gap ({shown})',
+            f'{shlex.join([cli, "api", "user", *hostname])}  (rerun once the cause is fixed; do not run auth login for this)')
 
 
 def origin_of():

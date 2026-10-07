@@ -32,7 +32,7 @@ The ACK `cwd` is the resolved main checkout, not the worktree: preflight runs wh
 
 ## Fixture qualification
 
-`python3 -m unittest tests.test_bootstrap_qualification` (7 tests):
+`python3 -m unittest tests.test_bootstrap_qualification` (8 tests):
 
 - Real ACK: a real subprocess returns stdout, stderr, exit code, `observed_at`, cwd and host.
   `ready` leaves `runtime_capability` and `effective_launch_policy` as `unknown`.
@@ -41,9 +41,12 @@ The ACK `cwd` is the resolved main checkout, not the worktree: preflight runs wh
 - Failed bootstrap: after a failed ACK, there is no store call (so no claim), no spawn (Claude, Codex,
   executor), no wake, no `take` and no tick. The only action is `local_command_ack`.
 - Network versus login: if `gh auth status` fails, `doctor` runs one authorized read, `gh api user`.
-  A successful read gives no gap. A connect, DNS or timeout error is reported as a network denial, and
-  the fix is a rerun with network access, not `auth login`. An HTTP 401 is reported as a login gap, and
-  the fix is the owner step `gh auth login`. Nothing writes credentials.
+  A successful read gives no gap. Only a positively established authentication failure (HTTP 401,
+  «Bad credentials», «Requires authentication») is a login gap, with the owner step `gh auth login`.
+  Every other failure is named as that blocker, with the fix «rerun `gh api user` once the cause is
+  fixed», never `auth login`: network denial (connect, DNS, timeout), TLS/certificate failure,
+  HTTP 403 (for example «Resource not accessible by integration»), HTTP 5xx, and an unrecognised or
+  empty error (`unknown failure`). Nothing writes credentials.
 
 Fixes in scope: `taskq/doctor.py` adds `api_read`/`login_gap`, because `gh auth status` reported
 «token invalid» on a sandbox network denial. `taskq/worker.py` adds `host` to the ACK.

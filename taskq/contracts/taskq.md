@@ -62,6 +62,8 @@ It holds no secrets: the token belongs to `glab`.
 | `[coordinator] machine` | The one machine (its name, e.g. `"mac"`) whose tick coordinates: spawns shared work, shows reviews and questions, closes (#145). A tick on any other machine starts only its `host-<name>` tasks within its own limits, releases only its own stalled work, never reviews or closes, and prints `coordinator is <name>`. No failover: the owner moves it by editing this line. `doctor` names a ref left by the old lease (`refs/taskq/coordinator/*`), `doctor --fix` deletes it | none: every tick coordinates (a single-machine project) |
 | `[brief] rules` | Project rules added to step 6 of every worker brief (budget, approvals, where the project's authorization is written) | nothing |
 
+The Codex worker sandbox (workspace-write, Codex CLI 0.159) denies the GPU on macOS: `iokit-open-user-client AGXDeviceUserClient` and `IOSurfaceRootUserClient`, so `MTLCreateSystemDefaultDevice()` returns nil. Blender 5.2 then exits 139 at start (`supports_barycentric_whitelist` → `strstr(NULL)`), even `--background --factory-startup`; no `--gpu-backend` avoids it and Codex has no setting that allows only the GPU (#157). A task that needs Metal (Blender, a GPU browser) runs in a Claude worker (`run-claude`) or with full access.
+
 New project: `taskq init --project group/project` writes a minimal `taskq.toml` if none exists and
 creates the labels and the board (§ Schema and migration).
 
@@ -182,7 +184,7 @@ agreement; retain them as lower-priority compatibility values until migrated.
 | `q-waiting` | Waits for another task: `deps` has an open issue | Only `tick`: ready→waiting on an open dependency, waiting→ready when all are closed |
 | `q-doing` | A worker is on it | `take`; `answer` from the session whose `claim` is on the task |
 | `q-review` | Delivered, awaiting acceptance | `result` |
-| `q-ask` | Owner's move: a concrete question with options — from a worker (from `doing`) or from the manager (from `ready`, `waiting`, `later`) | `ask`; removed by `answer` |
+| `q-ask` | Owner's move: a concrete question with options — from a worker (from `doing`) or from the manager (from `ready`, `waiting`, `later`) | `ask`; the second `release` in a row (#157); removed by `answer` |
 | `q-later` | Deferred by the owner; nobody waits on it, reason in `waiting_for` | `later`; removed by `answer` or a manual move to `ready` |
 
 There are no other states. There are no umbrella tasks: an epic is a milestone (§ Epics and subtasks).
@@ -269,6 +271,9 @@ ready/waiting/later → ask (manager) → answer → ready
   Unassigned tasks remain in the shared pool. The owner can see all states on the project board.
 - After `answer`, `reject` and `release` the task returns to `ready` together with its branch and
   worktree; `claim` is reset. The next worker from either app gets the full history and continues.
+- Exception (#157): the second `release` in a row without an `answer` or `reject` between them (a worker
+  that fails the same way each time, by its own `release` or the tick's dead/stalled one) moves the task to
+  `ask` instead, with a question naming both reasons. The owner's `answer` returns it to `ready` and starts the count over.
 - Exception: the owner answers in the worker's own session. `answer N` from the session whose
   `claim` is on the task moves `ask`→`doing` with the same `claim`, without `ready` and without a new `take`.
   Machine capacity is not checked: the slot was free only during the question; the worker never left the task.

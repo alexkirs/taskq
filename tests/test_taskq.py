@@ -553,6 +553,21 @@ class Cycle(unittest.TestCase):
         self.do(COORDINATOR, 'close', iid, '--text', 'ok')
         self.assertEqual(self.gitlab.locked(), [])
 
+    def test_second_release_in_a_row_asks_the_owner(self):
+        """#157: take, crash, release on every tick is bounded: the second release without an answer goes to ask."""
+        iid = self.add('--type', 'research', '--runtime', 'any')
+        self.do(CODEX, 'take', iid)
+        self.do(COORDINATOR, 'release', iid, '--text', 'blender exit 139')
+        self.assertEqual(self.state(iid), 'ready')
+        self.do(CODEX, 'take', iid)
+        self.do(COORDINATOR, 'release', iid, '--text', 'blender exit 139 again')
+        self.assertEqual(self.state(iid), 'ask')
+        self.assertIn('Released 2 times in a row', q.question(iid)[0])
+        self.do(COORDINATOR, 'answer', iid, '--text', 'run it in claude')
+        self.do(CLAUDE, 'take', iid)
+        self.do(COORDINATOR, 'release', iid, '--text', 'one more')  # the answer started the count over
+        self.assertEqual(self.state(iid), 'ready')
+
     def test_take_that_fails_after_its_lock_releases_it(self):
         """#105: a save that raises after lock() leaves no lock behind; the error still shows."""
         iid = self.add('--type', 'research', '--runtime', 'any')

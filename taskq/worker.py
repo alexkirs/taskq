@@ -266,8 +266,26 @@ def requeue(args):
         return print(f'#{args.iid} is doing again with your claim: continue in this session')
     # An empty claim marks a started task: it keeps its paths and its next worker continues.
     claim = current['claim'] and {'runtime': None, 'session': None}
+    if args.action == 'release' and (before := releases(args.iid)):
+        # #157: a worker that fails the same way (Blender in a Codex sandbox) would take, crash and release on
+        # every tick; the second release in a row without an owner's answer or reject goes to the owner instead.
+        core.save(current, 'ask', 'release', args.text, waiting_for=None, result=None, claim=claim)
+        return core.note(args.iid, 'ask', f'Released {len(before) + 1} times in a row, the last because: {args.text}\n'
+                         f'Earlier: {before[-1]}\nDecide how it can run (runtime, access, a fix first) and answer.')
     core.save(current, 'ready', args.action, args.text, waiting_for=None, result=None, claim=claim)
     core.unlock(args.iid)
+
+
+def releases(iid):
+    """The texts of the `release` notes since the task's last `answer` or `reject` (the owner's word resets them)."""
+    found = []
+    for body in core.notes(core.comments(iid)):
+        head, _, text = body.partition('\n\n')
+        if head.startswith(('**answer**', '**reject**')):
+            found = []
+        elif head.startswith('**release**'):
+            found.append(text.splitlines()[0] if text else 'no reason')
+    return found
 
 
 def close(args):

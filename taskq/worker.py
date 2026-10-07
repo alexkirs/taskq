@@ -486,7 +486,7 @@ def runtime_status(args):
                    'observed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'event_at': None,
                    'session_link': None, 'exact_blocker': 'Runtime has no qualified status source',
                    'source': 'unavailable', 'permission_requests': [], 'approval_visibility': 'unknown',
-                   'notify_dedup': None}
+                   'notify_dedup': None, 'metadata_updated_at': None, 'effective_launch_policy': 'unknown'}
     if args.runtime == 'codex':
         observation['session_link'] = f'{core.PAGES.rstrip("/")}/open.html#codex://threads/{args.session}'
     try:
@@ -500,13 +500,31 @@ def runtime_status(args):
                         'turnId': turns[0]['id'], 'limit': 100, 'sortDirection': 'desc'})['data']
                 stamps = [entry[key] / 1000 for turn in turns for entry in turn.get('entries', [])
                           for key in ('startedAtMs', 'completedAtMs') if entry.get(key) is not None]
-                observation = core.codex_observation(codex, args.session, metadata['status'], turns, max(stamps, default=None))
+                observation = {**core.codex_observation(codex, args.session, metadata['status'], turns, max(stamps, default=None)),
+                               'metadata_updated_at': metadata.get('updatedAt'),  # thread recency, not an event time
+                               'effective_launch_policy': 'unknown'}  # thread/read has no policy; codex-read shows the rollout's
             finally:
                 codex.socket.close()
         elif args.runtime == 'claude':
-            agent = core.claude_agents().get(args.session)
+            agent = core.claude_agents().get(args.session) or {}
+            try:  # the job record claude_url reads too; respawnFlags are the flags the job was launched with
+                job = json.loads((core.CLAUDE_JOBS / args.session[:8] / 'state.json').read_text())
+            except (OSError, ValueError):
+                job = {}
+            job = job if job.get('sessionId') == args.session else {}
+            flags = job.get('respawnFlags') or []
+            mode = flags[flags.index('--permission-mode') + 1] if '--permission-mode' in flags[:-1] else None
+            # Positive terminal evidence only: no pid and a terminal CLI state. Busy is not proof of execution.
+            ended = not agent.get('pid') and agent.get('state') in ('done', 'failed', 'stopped')
             observation.update(source='claude agents', session_link=core.claude_url(args.session),
-                               exact_blocker='CLI status does not expose qualified pending approval events')
+                               status='terminal' if ended else 'unknown',
+                               runtime_state={key: agent.get(key) for key in ('status', 'state')},
+                               metadata_updated_at=job.get('updatedAt'),
+                               effective_launch_policy={'permission_mode': mode, 'source': 'claude job respawnFlags'}
+                               if mode else 'unknown',
+                               exact_blocker=None if ended else
+                               'dontAsk denies unlisted tools without a prompt; CLI exposes no approval events'
+                               if mode == 'dontAsk' else 'CLI status does not expose qualified pending approval events')
     except (OSError, SystemExit, ValueError) as error:
         observation['exact_blocker'] = f'Status unavailable: {core.codex_line(error)}'
     core.record(args, 'runtime_observation', **observation)

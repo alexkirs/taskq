@@ -174,7 +174,8 @@ def liveness(item, agents):
         agent = agents.get(session)
         if not agent:
             return None, f'issue {core.age(item)} min ago'
-        state = 'dead' if not agent.get('pid') else 'busy' if agent.get('status') == 'busy' else 'idle'
+        # #176: `blocked` waits on the owner (a decision or an approval): not idle, never nudged.
+        state = 'dead' if not agent.get('pid') else 'busy' if agent.get('status') == 'busy' or agent.get('state') == 'blocked' else 'idle'
         return state, f'{"running" if agent.get("pid") else "stopped"}, issue {core.age(item)} min ago'
     if runtime != 'codex' or item['state'] != 'doing':
         return None, f'issue {core.age(item)} min ago'

@@ -369,6 +369,56 @@ class Reservation(unittest.TestCase):
         self.assertFalse(worker.release_reservation(q.task(iid), 'x'))
         self.assertEqual((self.block(iid)['reservation']['attempt'], iid in self.gitlab.locked()), ('replacement', True))
 
+    def test_release_helper_reads_ownership_after_the_identity(self):
+        """Review reproduction (A): a replacement published while the helper asked who it is was cleared."""
+        iid = self.reserved(dead_pid())
+        read, user, replaced = q.task(iid), q.user, []
+
+        def replacing():
+            if not replaced:
+                replaced.append(1)
+                current = q.task(iid)
+                q.save(current, reservation={**current['reservation'], 'attempt': 'replacement', 'principal': 2})
+            return user()
+        with patch.object(q, 'user', replacing):
+            self.assertFalse(worker.release_reservation(read, 'its worker stopped'))
+        self.assertEqual((self.block(iid)['reservation']['attempt'], iid in self.gitlab.locked()), ('replacement', True))
+
+    def test_a_refused_take_keeps_a_lock_another_owner_needs(self):
+        """Review reproduction (B): a take refused under its own lock unlocked a foreign reservation's task."""
+        for case, change, why in (
+                ('foreign reservation', dict(reservation={'attempt': 'foreign', 'runtime': 'claude', 'principal': 2, 'node': 'elsewhere'}), 'reserved by'),
+                ('foreign worker claim', dict(claim={'runtime': 'claude', 'session': 'foreign-live'}), 'claim still names session foreign-live')):
+            with self.subTest(case):
+                iid = self.add('--type', 'research', '--runtime', 'claude')
+                self.assertIn(why, self.take_with_change(iid, lambda: q.save(q.task(iid), **change)))
+                block = self.block(iid)
+                self.assertEqual((self.state(iid), iid in self.gitlab.locked()), ('ready', True))
+                self.assertEqual({key: block.get(key) for key in change}, change)
+                q.save(q.task(iid), 'later')
+        iid = self.add('--type', 'research', '--runtime', 'claude')  # an unowned task after the refusal: the lock goes
+        self.take_with_change(iid, lambda: q.save(q.task(iid), 'later'))
+        self.assertNotIn(iid, self.gitlab.locked())
+
+    def test_a_take_whose_write_failed_keeps_its_lock_by_what_it_reads_back(self):
+        api = q.api
+        for case, unreadable in (('write applied, answer lost', False), ('task unreadable after the error', True)):
+            with self.subTest(case):
+                iid, failed = self.add('--type', 'research', '--runtime', 'claude'), []
+
+                def failing(method, path, body=None):
+                    if failed and unreadable and method == 'GET' and path == f'issues/{iid}':
+                        q.fail('GitLab GET failed: HTTP 502')
+                    done = api(method, path, body)
+                    if method == 'PUT' and path == f'issues/{iid}' and '"worker-1"' in (body or {}).get('description', '') and not failed:
+                        failed.append(1)
+                        q.fail('GitLab PUT failed: HTTP 502')
+                    return done
+                with patch.object(q, 'api', failing):
+                    self.assertIn('HTTP 502', self.refused(WORKER, 'take', iid))
+                self.assertEqual((self.state(iid), self.block(iid)['claim']['session'], iid in self.gitlab.locked()), ('doing', 'worker-1', True))
+                q.save(q.task(iid), 'later', claim=None)
+
     def test_a_failed_launch_never_clears_a_replaced_attempt(self):
         iid = self.add('--type', 'research', '--runtime', 'claude')
 
@@ -396,6 +446,21 @@ class Reservation(unittest.TestCase):
         with patch.object(q, 'lock', foreign_write):
             self.assertIn('reserved by', self.refused(COORDINATOR, 'spawn', '--name', f'T{iid} t'))
         self.assertEqual((self.spawned, self.block(iid)['reservation']['attempt'], iid in self.gitlab.locked()), ([], 'foreign', True))
+
+    def test_a_foreign_claim_seen_under_the_reservation_lock_keeps_that_lock(self):
+        iid = self.add('--type', 'research', '--runtime', 'claude')
+        self.launches()
+        lock, done = q.lock, []
+
+        def foreign_claim(number):
+            taken = lock(number)
+            if not done:
+                done.append(1)
+                q.save(q.task(iid), claim={'runtime': 'claude', 'session': 'foreign-live'})
+            return taken
+        with patch.object(q, 'lock', foreign_claim):
+            self.assertIn('claim still names session foreign-live', self.refused(COORDINATOR, 'spawn', '--name', f'T{iid} t'))
+        self.assertEqual((self.spawned, self.block(iid)['claim']['session'], iid in self.gitlab.locked()), ([], 'foreign-live', True))
 
     def test_a_ready_task_still_naming_a_worker_fails_closed(self):
         iid = self.add('--type', 'research', '--runtime', 'claude')

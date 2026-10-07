@@ -228,10 +228,11 @@ def take(args):
         core.save(fresh, 'doing', claim=mine, result=None, waiting_for=None, reservation=None, **assign)
     except BaseException:
         # A lock left behind refuses every later take of this task until tick clears it (#105). The lock of a
-        # reservation stays with it: it is its coordinator's to settle.
+        # reservation stays with it: it is its coordinator's to settle; so does one this take set, when the read
+        # back shows any owner (#208).
         if locked:
             with contextlib.suppress(Exception, SystemExit):
-                core.unlock(args.iid)
+                unlock_unowned(core.task(args.iid))
         raise
     held = {**fresh, 'state': 'doing', 'reservation': None}
     # A task without paths overlaps nothing: no second read. A reserved rival is older than any take (#208).
@@ -298,8 +299,9 @@ def requeue(args):
         # place was free while the task waited, so the limit is not checked: the worker never left.
         core.save(current, 'doing', args.action, args.text, waiting_for=None, result=None)
         return print(f'#{args.iid} is doing again with your claim: continue in this session')
+    before = args.action == 'release' and releases(args.iid)
     if current.get('reservation'):
-        # #208: only the reserving user releases, and only the attempt it read: a fresh read under that check.
+        # #208: only the reserving user releases, and only the attempt it read: the last read before the write.
         uid, found = core.user(), current['reservation']
         current = core.task(args.iid)
         if current.get('reservation') != found:
@@ -308,7 +310,7 @@ def requeue(args):
             core.fail(f'#{args.iid} is reserved by user {found.get("principal")}: only that user releases it')
     # An empty claim marks a started task: it keeps its paths and its next worker continues.
     claim = current['claim'] and {'runtime': None, 'session': None}
-    if args.action == 'release' and (before := releases(args.iid)):
+    if before:
         # #157: a worker that fails the same way (Blender in a Codex sandbox) would take, crash and release on
         # every tick; the second release in a row without an owner's answer or reject goes to the owner instead.
         core.save(current, 'ask', 'release', args.text, waiting_for=None, result=None, claim=claim, reservation=None)
@@ -562,7 +564,14 @@ def abandon(iid, attempt, why):
         return
     if found:
         core.save(current, reservation=None, note_action='launch', note_text=f'Attempt {attempt["attempt"]} released: {why}')
-    core.unlock(iid)
+    unlock_unowned({**current, 'reservation': None})
+
+
+def unlock_unowned(current):
+    """Undo a lock this command set, judged on a read made after its failure: only when no reservation or worker
+    session owns the task. An owner found there keeps the lock; a failed read (raised) keeps it too."""
+    if not current.get('reservation') and not (current['claim'] or {}).get('session'):
+        core.unlock(current['iid'])
 
 
 def launched_note(iid, attempt, session):
@@ -610,9 +619,10 @@ def release_reservation(current, why):
     """Drop exactly `current`'s reservation and its lock, on a fresh read: the same attempt of this principal on a
     still ready task with the same claim. Anything else changed meanwhile is someone else's to settle.
     ponytail: the tracker has no compare-and-set; the fresh read narrows the window to one round trip."""
+    uid = core.user()  # before the last read: nothing but the write itself follows the ownership check
     found, fresh = current['reservation'], core.task(current['iid'])
     if (fresh['state'] != 'ready' or fresh.get('reservation') != found or fresh['claim'] != current['claim']
-            or found.get('principal') != core.user()):
+            or found.get('principal') != uid):
         return False
     core.save(fresh, reservation=None, note_action='launch', note_text=f'Attempt {found["attempt"]} released: {why}')
     core.unlock(current['iid'])

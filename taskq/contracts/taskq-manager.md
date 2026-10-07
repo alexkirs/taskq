@@ -281,6 +281,8 @@ classifier, which stops queue work as «Create Unsafe Agents», «Self-Modificat
 Exploration». `bypassPermissions` also works for a coordinator the owner opened that way, but the app
 never applies it to an imported session. `taskq doctor` names a missing rule or mode with this fix; taskq
 never edits permission settings itself.
+Per-machine settings with doc links: wiki [Required settings](https://github.com/alexkirs/taskq/wiki/Required-settings);
+what doctor cannot fix: [Known issues](https://github.com/alexkirs/taskq/wiki/Known-issues).
 
 The onboarding step «permissions» (§ 1, order 6) shows the person exactly this, once:
 

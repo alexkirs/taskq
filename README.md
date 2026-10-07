@@ -238,6 +238,7 @@ Other systems: on request. GitHub queues work without a board.
 
 - [Queue, configuration and states](taskq/contracts/taskq.md)
 - [Manager, tick and runtime setup](taskq/contracts/taskq-manager.md)
+- Docs: https://github.com/alexkirs/taskq/wiki
 - `taskq --help`: commands. `taskq update`: update now; automatic updates every 24 hours.
 
 ## Develop taskq

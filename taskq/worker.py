@@ -489,21 +489,26 @@ def delegation(current, uid):
     return None if not assigned or uid in assigned else 'assigned to another user; delegation needs an owner-verified policy and none is configured'
 
 
-def reserve(iid, runtime, limits=None):
-    """Before a worker of task `iid` starts: check admission on a fresh read, take the task's tracker lock and
-    record the attempt in its block. The lock decides between coordinators of any machine, user or filter; the
-    loser starts nothing. The reservation names who reserved it, not a worker: none exists before the launch."""
-    uid = core.user()
+def admission(iid, runtime, uid, limits):
+    """Task `iid` on a fresh read of the whole queue, and why a worker of `runtime` cannot start for it (or None)."""
     everything, open_iids, *_ = core.load()
     current = next((item for item in everything if item['iid'] == iid), None) or core.fail(f'#{iid} is not an open taskq task')
-    if current['state'] == 'ready' and current.get('reservation') and reconcile(current):
-        everything, open_iids, *_ = core.load()
-        current = next((item for item in everything if item['iid'] == iid), None) or core.fail(f'#{iid} is not an open taskq task')
+    return current, (f'state is {current["state"]}' if current['state'] != 'ready' else
+                     core.refusal(current, everything, open_iids, runtime) or delegation(current, uid)
+                     or (f'no Codex app server on this machine ({core.CODEX_SOCKET})' if runtime == 'codex' and not core.CODEX_SOCKET.exists() else None)
+                     or (f'no free {runtime} place on this machine' if core.room(everything, limits).get(runtime, 0) <= 0 else None))
+
+
+def reserve(iid, runtime, limits=None):
+    """Before a worker of task `iid` starts: check admission, take the task's tracker lock, check every guard again
+    on a read made under the lock, then record the attempt in its block. The lock decides between coordinators of
+    any machine, user or filter; the loser starts nothing. The reservation names who reserved it, not a worker:
+    none exists before the launch."""
+    uid = core.user()
     limits = limits or core.resolve(argparse.Namespace(filter=None, mine=None, limit=None))[0]['limits']
-    why = (f'state is {current["state"]}' if current['state'] != 'ready' else
-           core.refusal(current, everything, open_iids, runtime) or delegation(current, uid)
-           or (f'no Codex app server on this machine ({core.CODEX_SOCKET})' if runtime == 'codex' and not core.CODEX_SOCKET.exists() else None)
-           or (f'no free {runtime} place on this machine' if core.room(everything, limits).get(runtime, 0) <= 0 else None))
+    current, why = admission(iid, runtime, uid, limits)
+    if current['state'] == 'ready' and current.get('reservation') and reconcile(current):
+        current, why = admission(iid, runtime, uid, limits)
     if why:
         core.fail(f'#{iid} not launched: {why}')
     if not core.lock(iid):
@@ -511,23 +516,31 @@ def reserve(iid, runtime, limits=None):
     attempt = {'attempt': os.urandom(4).hex(), 'runtime': runtime, 'principal': uid, 'coordinator': core.who(), **core.here(),
                'pid': os.getpid(), 'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
     try:
-        fresh = core.task(iid)
-        if fresh['state'] != 'ready' or fresh['claim'] != current['claim'] or fresh.get('reservation'):
-            core.fail(f'#{iid} not launched: it changed since this launch read it')
+        # What changed between the first read and the lock (an assignment, a dependency, a rival) refuses here.
+        fresh, why = admission(iid, runtime, uid, limits)
+        if why or fresh['claim'] != current['claim']:
+            core.fail(f'#{iid} not launched: {why or "its claim changed since this launch read it"}')
         core.save(fresh, reservation=attempt, note_action='reserve',
                   note_text=f'Attempt {attempt["attempt"]}: a {runtime} worker{core.where(attempt)}, principal {uid}')
         # Overlapping tasks reserved at once: each reads after its own write, so the later sees the earlier and gives way.
         rivals = fresh['scope'] and [other['iid'] for other in core.load()[0] if other['iid'] != iid and core.overlap(fresh['scope'], other['scope'])
                                      and ((other['claim'] or {}).get('session') or other.get('reservation'))]
         if rivals:
-            core.save({**fresh, 'reservation': attempt}, reservation=None, note_action='launch',
-                      note_text=f'Attempt {attempt["attempt"]} released: scope overlaps #{rivals[0]}')
             core.fail(f'#{iid} not launched: scope overlaps #{rivals[0]}')
-    except BaseException:
+    except BaseException as error:
         with contextlib.suppress(Exception, SystemExit):
-            core.unlock(iid)
+            abandon(iid, attempt, core.codex_line(str(error)))
         raise
     return attempt
+
+
+def abandon(iid, attempt, why):
+    """Undo a reservation that failed before its launch: drop the attempt if the block holds it, then the lock.
+    A failing read or write keeps the lock, so a written attempt is never left without it (reconcile settles it)."""
+    current = core.task(iid)
+    if (current.get('reservation') or {}).get('attempt') == attempt['attempt']:
+        core.save(current, reservation=None, note_action='launch', note_text=f'Attempt {attempt["attempt"]} released: {why}')
+    core.unlock(iid)
 
 
 def launched_note(iid, attempt, session):

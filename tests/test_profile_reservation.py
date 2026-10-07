@@ -131,6 +131,81 @@ class Reservation(unittest.TestCase):
         self.assertEqual(self.gitlab.locked(), [narrow])
         self.assertIn(f'scope overlaps #{narrow}', self.refused(COORDINATOR, 'spawn', '--name', f'T{wide} t'))
 
+    def changed_under_the_lock(self, iid, change):
+        """`change` lands between the launch's first read and its lock: the read under the lock refuses."""
+        lock, changes = q.lock, [change]
+
+        def locking(number):
+            taken = lock(number)
+            if changes and number == iid:
+                changes.pop()()
+            return taken
+        with patch.object(q, 'lock', locking):
+            refused = self.refused(COORDINATOR, 'spawn', '--name', f'T{iid} t')
+        self.assertEqual(self.spawned, [])
+        self.assertEqual((iid in self.gitlab.locked(), 'reservation' in self.block(iid)), (False, False))
+        return refused
+
+    def test_every_guard_is_checked_again_under_the_lock(self):
+        """Review reproduction (P1): an assignment revoked after the first read still launched a worker."""
+        self.launches()
+        own = self.add('--type', 'research', '--runtime', 'claude', '--mine')
+        self.assertIn('delegation needs an owner-verified policy', self.changed_under_the_lock(
+            own, lambda: q.api('PUT', f'issues/{own}', {'assignee_ids': [2]})))
+        self.assertEqual(self.gitlab.issues[own]['assignees'], [{'id': 2}])
+        dep, iid = self.add('--type', 'research'), self.add('--type', 'research', '--runtime', 'claude', '--scope', 'a')
+        self.assertIn(f'open dependencies [{dep}]', self.changed_under_the_lock(iid, lambda: q.save(q.task(iid), deps=[dep])))
+        q.save(q.task(iid), deps=[])
+        rival = self.add('--type', 'research', '--runtime', 'claude', '--scope', 'a/b')
+        self.assertIn(f'scope overlaps #{rival}', self.changed_under_the_lock(iid, lambda: self.do(CLAUDE, 'take', rival)))
+        q.save(q.task(iid), scope=['c'])
+        self.assertIn('host is win', self.changed_under_the_lock(iid, lambda: q.save(q.task(iid), add=[q.ON + 'win'])))
+        q.save(q.task(iid), remove=[q.ON + 'win'])
+        self.assertIn('runtime is codex', self.changed_under_the_lock(
+            iid, lambda: q.save(q.task(iid), add=[q.RUN + 'codex'], remove=[q.RUN + 'claude'])))
+        q.save(q.task(iid), add=[q.RUN + 'claude'], remove=[q.RUN + 'codex'])
+        with patch.object(q, 'SHARED', {'profile': {'limits': {'claude': 2}}}):  # the rival's claim holds one place
+            self.assertIn('no free claude place', self.changed_under_the_lock(
+                iid, lambda: self.do({**CLAUDE, 'CLAUDE_CODE_SESSION_ID': 'w2'}, 'take', self.add(
+                    '--type', 'research', '--runtime', 'claude'))))
+        with patch.object(q, 'SHARED', {'profile': {'limits': {'claude': 9}}}):
+            self.assertIn('state is later', self.changed_under_the_lock(iid, lambda: q.save(q.task(iid), 'later')))
+
+    def test_a_reservation_that_fails_after_its_write_leaves_no_stale_state(self):
+        self.launches()
+        iid = self.add('--type', 'research', '--runtime', 'claude', '--scope', 'a')
+        load, calls = q.load, []
+
+        def failing(*args, **kwargs):  # the rival read after the write fails
+            calls.append(1)
+            if len(calls) == 3:
+                q.fail('GitLab GET issues failed: HTTP 502')
+            return load(*args, **kwargs)
+        with patch.object(q, 'load', failing):
+            self.assertIn('HTTP 502', self.refused(COORDINATOR, 'spawn', '--name', f'T{iid} t'))
+        self.assertEqual((self.spawned, self.gitlab.locked(), 'reservation' in self.block(iid)), ([], [], False))
+        api = q.api
+
+        def applied_then_failed(method, path, body=None):  # the write landed, its answer was lost
+            done = api(method, path, body)
+            if method == 'PUT' and 'reservation' in (body or {}).get('description', '') and '"attempt"' in body['description']:
+                q.fail('GitLab PUT failed: HTTP 502')
+            return done
+        with patch.object(q, 'api', applied_then_failed):
+            self.refused(COORDINATOR, 'spawn', '--name', f'T{iid} t')
+        self.assertEqual((self.spawned, self.gitlab.locked(), 'reservation' in self.block(iid)), ([], [], False))
+
+        def unreadable(method, path, body=None):  # nothing settles it now: the written attempt keeps its lock
+            if method == 'GET' and path == f'issues/{iid}' and 'reservation' in self.block(iid):
+                q.fail('GitLab GET failed: HTTP 502')
+            done = api(method, path, body)
+            if method == 'PUT' and 'reservation' in (body or {}).get('description', ''):
+                q.fail('GitLab PUT failed: HTTP 502')
+            return done
+        with patch.object(q, 'api', unreadable):
+            self.refused(COORDINATOR, 'spawn', '--name', f'T{iid} t')
+        self.assertEqual((self.spawned, self.gitlab.locked(), 'reservation' in self.block(iid)), ([], [iid], True))
+
     def test_failed_launch_without_a_worker_releases_its_attempt(self):
         iid = self.add('--type', 'research', '--runtime', 'claude')
         self.launches(error='claude could not start the session: Not logged in')

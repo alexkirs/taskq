@@ -605,6 +605,25 @@ class Cycle(unittest.TestCase):
                 store.run('GET', 'issues/7')
             self.assertEqual(answers, [good])
 
+    def test_ambiguous_mutation_is_not_replayed(self):
+        """#155: a POST the store applied before a 502 runs once and fails saying so; a GraphQL query is still retried."""
+        calls = []
+        applied = SimpleNamespace(returncode=1, stdout='', stderr='gh: Bad Gateway (HTTP 502)')
+        good = SimpleNamespace(returncode=0, stdout='{"data": {}}', stderr='')
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return applied if len(calls) == 1 else good
+        with patch.object(q.subprocess, 'run', run), patch.object(q.time, 'sleep', lambda seconds: None):
+            for body in ({'title': 'one logical task'}, {'query': 'mutation { deleteIssue }'}):
+                calls.clear()
+                with self.assertRaisesRegex(SystemExit, 'may have applied'):
+                    q.cli_api(['gh', 'api', '-X', 'POST', 'issues'], body, 'repro POST')
+                self.assertEqual(len(calls), 1)
+            calls.clear()
+            self.assertEqual(q.cli_api(['gh', 'api', '-X', 'POST', 'graphql'], {'query': 'query { viewer }'}, 'read'), {'data': {}})
+            self.assertEqual(len(calls), 2)
+
     def test_fixed_coordinator_machine(self):
         fixed_coordinator(self)
 

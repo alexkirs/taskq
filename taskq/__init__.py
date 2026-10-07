@@ -301,9 +301,12 @@ TRANSIENT = re.compile(r'unexpected end of JSON input|invalid JSON|Something wen
 
 
 def cli_api(command, body, what):
-    """Run `gh api`/`glab api` and parse its JSON; a transient failure is tried once more.
-    ponytail: one retry after 1 s; a POST the store did apply before failing may land twice."""
-    for attempt in (1, 2):
+    """Run `gh api`/`glab api` and parse its JSON; a transient failure of a safe request is tried once more.
+    ponytail: one retry after 1 s. A POST other than a GraphQL query (a new issue, comment, lock) is never
+    replayed: the store may have applied it, a retry would land it twice (#155). It fails saying so; an orphan
+    lock goes with the tick's stale-lock sweep."""
+    safe = command[command.index('-X') + 1] != 'POST' or not str((body or {}).get('query', 'mutation')).lstrip().startswith('mutation')
+    for attempt in (1, 2) if safe else (2,):
         started = time.time()
         done = subprocess.run(command, input=json.dumps(body) if body is not None else None,
                               capture_output=True, text=True, timeout=60)
@@ -315,6 +318,8 @@ def cli_api(command, body, what):
                 return json.loads(done.stdout) if done.stdout.strip() else None
             except ValueError as error:
                 message = f'invalid JSON: {error}'
+        if not safe and TRANSIENT.search(message):
+            fail(f'{what} failed and may have applied, not retried: {message}')
         if attempt == 2 or not TRANSIENT.search(message):
             fail(f'{what} failed: {message}')
         time.sleep(1)

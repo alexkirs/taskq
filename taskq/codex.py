@@ -17,9 +17,11 @@ CODEX_IPC = Path.home() / '.codex/ipc/ipc.sock'
 # Design decision 2026-10-07 (#57 probe, #149): a Codex worker runs in workspace-write with network on
 # and never asks; every step of a worker passed there. The worktree lives in ROOT/.worktrees, but git
 # writes its refs, objects and worktree admin files into the main checkout's .git, so .git is a root.
-# The taskq state dir holds the machine id and update stamp.
+# The taskq state dir holds the machine id and update stamp. taskq.toml [codex] writable adds the project's
+# own roots outside the checkout (#154, csgo's media root); a missing one is skipped, doctor warns.
 def codex_turn_policy():
-    roots = [core.ROOT / '.git', core.ROOT / '.worktrees', core.UPDATE_STAMP.parent]
+    roots = [core.ROOT / '.git', core.ROOT / '.worktrees', core.UPDATE_STAMP.parent,
+             *(root for root in core.codex_writable() if root.exists())]
     return {'approvalPolicy': 'never', 'sandboxPolicy': {
         'type': 'workspaceWrite', 'networkAccess': True, 'writableRoots': [str(root) for root in roots]}}
 

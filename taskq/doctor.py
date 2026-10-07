@@ -175,6 +175,9 @@ def doctor(args, pending=()):
         if getattr(args, 'codex', False) and 'codex' not in idle() and not core.CODEX_SOCKET.exists():
             gap(f'no Codex app server socket {core.CODEX_SOCKET}: Codex workers cannot start',
                 'open the Codex app and sign in  (the person does it)')
+        for root in core.codex_writable() if 'codex' not in idle() else ():
+            if not root.exists():
+                print(f'warning: [codex] writable {root} does not exist: Codex workers run without it')
     if config or origin:
         cli = 'gh' if github else 'glab'
         status = probe([cli, 'auth', 'status', *(['--hostname', host] if host else [])])

@@ -2523,7 +2523,7 @@ class Doctor(unittest.TestCase):
 class Setup(unittest.TestCase):
     """`doctor --fix`: what a command can do is done once and `ok` on a rerun; the person's steps are printed, not run."""
     GLOBALS = ('PROJECT', 'PROJECT_PATH', 'HOST', 'STORE', 'BOARD', 'BOARDS', 'AREAS', 'ROOT', 'TICK_BEAT', 'WORKER', 'RULES',
-               'CODEX_PROJECT', 'CODEX_SECTION', 'WORKSPACE', 'RETIRE', 'HELPERS', 'LOCAL', 'SHARED')
+               'CODEX_PROJECT', 'CODEX_SECTION', 'CODEX_WRITABLE', 'WORKSPACE', 'RETIRE', 'HELPERS', 'LOCAL', 'SHARED')
 
     def setUp(self):
         for name in self.GLOBALS:  # `configure` sets them from the new taskq.toml
@@ -2561,6 +2561,27 @@ class Setup(unittest.TestCase):
         q.configure()
         self.assertEqual((q.WORKSPACE['new'], q.RETIRE), ('make tree {iid}', None))
         self.assertIn('.worktrees/taskq-{iid}', q.WORKSPACE['continue'])
+
+    def test_codex_writable_adds_existing_roots_and_doctor_warns_on_missing(self):
+        """#154: [codex] writable roots, relative to the main checkout or ~, join the turn policy; a missing one is skipped."""
+        (self.tmp / 'taskq.toml').write_text('[github]\nrepo = "owner/repo"\n[update]\nauto = false\n')
+        q.configure()
+        base = codex.codex_turn_policy()['sandboxPolicy']['writableRoots']
+        self.assertEqual(len(base), 3)
+        media = self.tmp.parent / f'{self.tmp.name}-media'
+        media.mkdir()
+        self.addCleanup(media.rmdir)
+        (self.tmp / 'taskq.toml').write_text('[github]\nrepo = "owner/repo"\n[update]\nauto = false\n'
+                                             f'[codex]\nwritable = ["../{media.name}", "~/no-such-taskq-root"]\n')
+        q.configure()
+        self.assertEqual(codex.codex_turn_policy()['sandboxPolicy']['writableRoots'], base + [str(media.resolve())])
+        self.origin, q.PROJECT_PATH = 'git@github.com:owner/repo.git', None
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.suppress(SystemExit):
+            q.main(['doctor'])
+        self.assertIn(f'warning: [codex] writable {Path.home() / "no-such-taskq-root"} does not exist', out.getvalue())
+        (self.tmp / 'taskq.toml').write_text('[github]\nrepo = "owner/repo"\n[codex]\nwritable = "../media"\n')
+        with self.assertRaises(SystemExit):
+            q.configure()
 
     def test_a_runtime_setup_command_is_the_persons_step(self):
         self.enterContext(patch.object(q, 'api', Gitlab()))

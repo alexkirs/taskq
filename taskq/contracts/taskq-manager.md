@@ -509,7 +509,7 @@ worker sessions. The coordinator checked their `turn_context`: CLI queue started
 policy can persist into later turns. Every taskq `turn/start`, including the first ready in spawn
 and codex-send, explicitly passes `approvalPolicy: never` and `sandboxPolicy: {type: workspaceWrite,
 networkAccess: true, writableRoots: [<main checkout>/.git, <main checkout>/.worktrees, <taskq state
-dir>]}` from `codex_turn_policy()` (2026-10-07, #149: the #57 probe passed every worker step there;
+dir>, ...taskq.toml [codex] writable]}` from `codex_turn_policy()` (2026-10-07, #149: the #57 probe passed every worker step there;
 `.git` is a root because git writes the worktree's refs and objects into the main checkout's `.git`). The thread/start and resume settings are derived from the same policy in
 their protocol's format. In the installed schema `thread/queue/add` does not accept a turn policy,
 so taskq does not use it for active-send. `turn/steer` does not start a new turn and does not change

@@ -32,6 +32,7 @@ HOSTS = {}  # [hosts] of taskq.toml: hostname → short machine name (`mac`, `wi
 # every tick coordinates (a single-machine project). The owner moves it by editing that line: no failover.
 COORDINATOR = None
 CODEX_PROJECT = CODEX_SECTION = None  # the Codex app's project and sidebar section for worker threads
+CODEX_WRITABLE = ()  # [codex] writable: extra sandbox roots of Codex turns, as written (#154)
 # The person's own settings: `taskq.local.toml` in the main checkout (all its worktrees read the same file, never
 # committed). [profile] is the tick/worker profile, [codex] the app project override; read anew on every use.
 LOCAL, SHARED = None, {}  # its path; [profile] of taskq.toml: team defaults under the personal file
@@ -96,7 +97,7 @@ def main_checkout(start):
 def configure(path=None):
     """Load the project's taskq.toml: `path`, else the nearest one from the current directory up. Read only: a key it
     lacks takes its default in memory (a write would dirty the editable clone, and update stops on a dirty clone)."""
-    global RULES, HOST, HOSTS, COORDINATOR, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, WORKSPACE, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED, PAGES
+    global RULES, HOST, HOSTS, COORDINATOR, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, CODEX_WRITABLE, WORKSPACE, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED, PAGES
     import tomllib
     here = Path.cwd()
     path = Path(path) if path else next((folder / 'taskq.toml' for folder in (here, *here.parents)
@@ -121,7 +122,9 @@ def configure(path=None):
     COORDINATOR = config.get('coordinator', {}).get('machine')
     if COORDINATOR is not None and not isinstance(COORDINATOR, str):
         fail(f'{path}: [coordinator] machine: write the coordinator\'s machine name from [hosts] as a string, e.g. "mac"')
-    CODEX_PROJECT, CODEX_SECTION = codex.get('project'), codex.get('section')
+    CODEX_PROJECT, CODEX_SECTION, CODEX_WRITABLE = codex.get('project'), codex.get('section'), codex.get('writable', ())
+    if not isinstance(CODEX_WRITABLE, list | tuple) or not all(isinstance(item, str) for item in CODEX_WRITABLE):
+        fail(f'{path}: [codex] writable: write a list of paths, e.g. ["../media"] (relative to the main checkout, or ~/...)')
     WORKSPACE = {key: workspace.get(key, text) for key, text in TREE_WORKSPACE.items()}
     # A project's own `new` without `retire` makes its trees elsewhere: the default retire would miss them.
     RETIRE = workspace.get('retire', None if 'new' in workspace else TREE_RETIRE)
@@ -187,6 +190,11 @@ def personal():
 def codex_override(key):
     """[codex] project/section: the personal file's, else taskq.toml's (kept until migrated), else None."""
     return personal().get('codex', {}).get(key) or {'project': CODEX_PROJECT, 'section': CODEX_SECTION}[key]
+
+
+def codex_writable():
+    """[codex] writable as absolute paths: relative ones from the main checkout, `~` expanded."""
+    return [(ROOT / Path(item).expanduser()).resolve() for item in CODEX_WRITABLE]
 
 
 def read_toml(path):

@@ -9,6 +9,7 @@ board = "taskq"  # the board from before the default became the repository name:
 names = ["queue", "tick", "runtimes", "selftest", "docs", "install"]
 
 [workspace]  # {iid} is the task number. The clone is an editable install: every session on this machine runs its
+publish = "review"
 # working tree, so the tree stays clean `main` and all work happens in a worktree under .worktrees/ (csgo #272).
 new = "from the main checkout run `git fetch origin && git worktree add -b taskq-{iid} .worktrees/taskq-{iid} origin/main` and work only there (`git worktree add` and `cd` in Bash, never the EnterWorktree tool: it prompts for a tree outside .claude/worktrees); never edit the main checkout itself, it is the editable install every session on this machine runs."
 continue = "this task was started before in worktree `.worktrees/taskq-{iid}` of the main checkout (or `../taskq-{iid}` for tasks started on 2026-10-06; `git worktree list` shows it); continue there. If it is gone, create it: `git fetch origin && git worktree add -b taskq-{iid} .worktrees/taskq-{iid} origin/main`."

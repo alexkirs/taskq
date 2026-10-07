@@ -2722,6 +2722,10 @@ class Doctor(unittest.TestCase):
         self.assertNotIn('labels', out)  # the tracker is not read before the CLI works
         self.status = 1
         self.assertIn('glab auth login --hostname gitlab.example.com', self.doctor()[1])
+        with patch.object(doctor, 'api_read', lambda command: (1, 'HTTP 403: Resource not accessible by integration')):
+            out = self.doctor()[1]  # #177: a failing auth status alone is not a login gap
+        self.assertIn('permission denied for this token (HTTP 403), not a proven login gap', out)
+        self.assertNotIn('glab auth login', out)
         self.status, gitlab.access = 0, 20  # Reporter: reads, cannot write
         before = json.dumps([gitlab.labels, gitlab.boards, gitlab.issues])
         code, out = self.doctor()

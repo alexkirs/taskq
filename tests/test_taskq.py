@@ -74,7 +74,7 @@ class CodexServer:
     """Finite app-server responses; fail immediately on an unexpected request."""
     def __init__(self):
         self.status, self.turns, self.entries, self.calls = 'idle', [], {}, []
-        self.path, self.projects = None, []
+        self.path, self.projects, self.listed = None, [], []
         self.socket = SimpleNamespace(close=lambda: None)
 
     def call(self, method, params):
@@ -91,6 +91,8 @@ class CodexServer:
             return {'thread': {'id': 'spawned'}}
         if method == 'project/list':
             return {'data': self.projects}
+        if method == 'thread/list':
+            return {'data': self.listed}
         if method == 'project/create':
             return {'project': {'id': 'created', **params}}
         if method in ('thread/resume', 'turn/start', 'turn/steer', 'thread/name/set', 'thread/section/move',
@@ -481,20 +483,7 @@ class Cycle(unittest.TestCase):
         self.assertIn('codex:codex-se', report)
         self.assertEqual(self.gitlab.issues[iid]['state'], 'closed')
         self.assertFalse([label for label in self.gitlab.issues[iid]['labels'] if label.startswith('q-')])
-        # #165: the app held the thread at close; every tick retries until the app lets go, then it is archived.
-        archived, held = [], [SystemExit('held open by the Codex app')]
-        def archive(args):
-            if held:
-                raise held.pop()
-            archived.append(args.thread)
-        with patch.object(q, 'codex_archive', archive), patch.object(q, 'CODEX_SOCKET', q.ROOT), \
-                contextlib.redirect_stderr(io.StringIO()) as log:
-            self.assertIn('Nothing to do', self.do(CLAUDE, 'tick'))
-            self.assertEqual(archived, [])
-            self.assertIn(f'Kept codex-session of closed {link(iid)} for a later pass: held open by the Codex app', log.getvalue())
-            self.do(CLAUDE, 'tick')
-        self.assertEqual(archived, ['codex-session'])
-        self.assertIn(f'Archived codex-session: the Codex worker of closed {link(iid)}.', log.getvalue())
+        self.assertIn('Nothing to do', self.do(CLAUDE, 'tick'))
 
     def race(self, first, second, at='lock'):
         """Two workers on two machines take at once: `second` runs its whole take while `first` stops right
@@ -1212,6 +1201,34 @@ class Cycle(unittest.TestCase):
         self.assertIn(f'Released dead {link(claude)}', output)
         self.assertIn(f'Released dead {link(codex)}', output)
         self.assertEqual((self.state(claude), self.state(codex)), ('ready', 'ready'))
+
+    def test_tick_archives_codex_workers_no_open_task_holds_and_retries_one_the_app_holds(self):
+        """#165: a worker thread of a closed task, or of one answered and continued by a new session, is archived by
+        every pass; one the app holds is kept and archived by a later pass. The open task's own worker, a busy or
+        young thread, another checkout's and the owner's own threads stay."""
+        iid = self.add('--type', 'asset')
+        self.do(CODEX, 'take', iid)
+        def thread(sid, name, status='notLoaded', age=3600, cwd=str(q.ROOT)):
+            return {'id': sid, 'name': name, 'cwd': cwd, 'status': {'type': status}, 'updatedAt': time.time() - age}
+        self.codex.listed = [thread('codex-session', f'T{iid} t (mac)'), thread('answered', f'T{iid} t (mac)'),
+                             thread('held', 'T9 x (mac)'), thread('young', 'T9 x', age=60), thread('busy', 'T9 x', 'active'),
+                             thread('elsewhere', 'T9 x', cwd='/elsewhere'), thread('mine', 'my chat')]
+        archived, held = [], {'held'}
+        def archive(args):
+            if args.thread in held:
+                held.discard(args.thread)
+                core_error = 'Codex thread held is held open by the Codex app, which lets it go 3 h after it leaves the window'
+                raise SystemExit(core_error)
+            archived.append(args.thread)
+            self.codex.listed = [item for item in self.codex.listed if item['id'] != args.thread]
+        with patch.object(q, 'codex_archive', archive), patch.object(q, 'CODEX_SOCKET', q.ROOT), \
+                contextlib.redirect_stderr(io.StringIO()) as log:
+            self.do(COORDINATOR, 'tick')
+            self.assertEqual(archived, ['answered'])
+            self.assertIn('Kept held (T9 x (mac)) for a later pass: Codex thread held is held open by the Codex app', log.getvalue())
+            self.do(COORDINATOR, 'tick', '--act')
+        self.assertEqual(archived, ['answered', 'held'])
+        self.assertIn('Archived held (T9 x (mac)): no open task holds it.', log.getvalue())
 
     def test_outsider_comments_do_not_keep_a_dead_workers_task(self):
         """#39: stall age comes from collaborators' notes and label events, not `updated_at` that anyone moves."""

@@ -376,8 +376,10 @@ removes the agent; then re-arm the in-session timer.
 the worker prompt, sends the fixed nudge to idle Codex and quiet workers, archives stopped Codex workers
 of ask/later tasks, and retires a local Claude worker of a task closed in the last hour without this
 machine's `close` (closed on the board or by hand). Every pass, with or without `--act`, also archives this
-machine's Codex thread of a task closed in the last day (`codex-archive` is reversible); one the Codex app holds is
-kept for a later pass, which archives it once the app lets go (#165, § Cleaning up finished work, item 3). Those
+checkout's Codex worker threads (named `T<N> …` by spawn, idle or notLoaded, unchanged for 10 min) that no open
+task claims: the task closed, or went ask → answer → ready and a new session continues it (`codex-archive` is
+reversible). One the Codex app holds is kept for a later pass, which archives it once the app lets go (#165,
+§ Cleaning up finished work, item 3). Those
 steps go to stderr (the log). Stdout gets the
 tick's output only when something needs judgement: a review, a question, a problem, a board mismatch,
 an inbox issue, or a mechanical step that failed (section `Steps that failed`); the exit code is then
@@ -662,9 +664,11 @@ sections: "Remove", "Ask the owner", "Kept".
    such sessions are inactive (app 26.930, `CH=108e5`, `L3t=10`); until then the shared server refuses
    with `active writer`. There is no IPC request or deep link to archive or unload. Do not broadcast
    `thread-archived` to a session the app holds: the app drops it from the unsubscriber without
-   `thread/unsubscribe`, so it stays held until the app restarts (#165). So nobody has to act: `close`
-   tries once, every tick pass retries for a day after the task closed (`Kept … for a later pass` in
-   the log, then `Archived …`), and cleanup lists such a session under "Kept" (notLoaded on the shared
+   `thread/unsubscribe`, so it stays held until the app restarts (#165). The owner views a worker most
+   often to read its question in ask; after the answer the claim moves on and nothing pointed at the old
+   thread, so such threads piled up. Now nobody has to act: `close` tries once, and every tick pass
+   archives each worker thread no open task claims, keeping a held one (`Kept … for a later pass` in the
+   log, then `Archived …`). Cleanup lists such a session under "Kept" (notLoaded on the shared
    server, yet `~/.codex/thread-writer-locks/<id>.lock` exists) with its tree, and archives it on a
    later `cleanup --apply` once the app let go. To archive sooner, the coordinator may run the
    recipe `codex-archive` prints, via Computer Use: `request_access` `com.openai.codex`,

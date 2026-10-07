@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shlex
 import subprocess
 import sys
@@ -340,48 +341,51 @@ def idle_stop(act, step, failed):
             + '; report to the owner; rearm with "arm the tick" (manager contract § 3).')
 
 
-def closed_claims(runtime, seconds):
-    """(issue, claim) of tasks closed in the last `seconds` whose worker ran here in `runtime`."""
-    after = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - seconds))
-    for issue in core.issues(f'state=closed&updated_after={after}'):
-        block = core.BLOCK.search(issue.get('description') or '')
-        try:
-            claim = (json.loads(block.group(1)) if block else {}).get('claim') or {}
-        except (ValueError, AttributeError):
-            continue
-        if claim.get('runtime') == runtime and claim.get('session') and core.local_claim(claim):
-            yield issue, claim
-
-
 def retire_closed(log):
     """--act: a local Claude worker of a task closed in the last hour without this machine's `close` (closed on
     the board or by hand) is retired as `close` would. ponytail: sessions only; trees and branches: `cleanup`."""
     agents = core.claude_agents()
     if not agents:
         return
-    for issue, claim in closed_claims('claude', 3600):
-        agent = agents.get(claim['session'])
-        if agent and agent.get('status') != 'busy':
+    after = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 3600))
+    for issue in core.issues(f'state=closed&updated_after={after}'):
+        block = core.BLOCK.search(issue.get('description') or '')
+        try:
+            claim = (json.loads(block.group(1)) if block else {}).get('claim') or {}
+        except (ValueError, AttributeError):
+            continue
+        agent = agents.get(claim.get('session'))
+        if agent and agent.get('status') != 'busy' and claim.get('runtime') == 'claude' and core.local_claim(claim):
             core.claude_stop(claim['session'], remove=True)
             log(f'Retired {claim["session"]}: the worker of closed {core.ref(issue)}.')
 
 
-def archive_closed_codex(log):
-    """#165: every pass archives this machine's Codex thread of a task closed in the last day. A thread the owner
-    viewed is held by the app's own server, which lets it go 3 h after it leaves the window; until then each
-    pass keeps it, and the first pass after archives it. Reversible (`thread/unarchive`), so no --act needed."""
+def archive_finished_codex(tasks, log):
+    """#165: every pass archives this checkout's Codex worker threads (`T<N> …`, as spawn names them) that are no
+    open task's claim: the task closed, or went ask -> answer -> ready and a new session continues it. A thread the
+    owner viewed is held by the app's own server until 3 h after it leaves the window; each pass keeps it and the
+    first pass after archives it. Reversible (`thread/unarchive`), so no --act needed."""
     if not core.CODEX_SOCKET.exists():
         return
-    for issue, claim in closed_claims('codex', 86400):
-        session = claim['session']
-        if core.codex_is_archived(session):
+    from taskq.cleanup import cleanup_codex
+    claimed, root = {(item['claim'] or {}).get('session') for item in tasks}, core.ROOT.resolve()
+    try:
+        threads = cleanup_codex({root})
+    except (OSError, SystemExit, ValueError) as error:
+        return log(f'Codex threads not checked: {core.codex_line(str(error))[:120]}')
+    for thread in threads.values():
+        name, sid = thread.get('name') or '', thread['id']
+        # 10 min: a worker spawned this pass may not have taken its task yet.
+        # cleanup_codex also lists the app project's threads; only this checkout's are its workers.
+        if (not re.match(r'T\d+ ', name) or Path(thread.get('cwd') or '/').resolve() != root or sid in claimed or (thread.get('status') or {}).get('type') not in ('idle', 'notLoaded')
+                or time.time() - (thread.get('updatedAt') or time.time()) < 600):
             continue
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                core.codex_archive(argparse.Namespace(thread=session))
-            log(f'Archived {session}: the Codex worker of closed {core.ref(issue)}.')
+                core.codex_archive(argparse.Namespace(thread=sid))
+            log(f'Archived {sid} ({name}): no open task holds it.')
         except (SystemExit, OSError) as error:
-            log(f'Kept {session} of closed {core.ref(issue)} for a later pass: {core.codex_line(str(error))[:120]}')
+            log(f'Kept {sid} ({name}) for a later pass: {core.codex_line(str(error))[:120]}')
 
 
 def tick_pass(args, act=False):
@@ -480,7 +484,7 @@ def tick_pass(args, act=False):
     start = starts(args, loaded, selected)
     if act:
         retire_closed(log)
-    archive_closed_codex(log)
+    archive_finished_codex(loaded[0], log)
     if not (review or fresh or summary or start or codex_stopped or odd or problems) and not any(item['state'] == 'doing' for item in everything):
         # #153: an ask or review task waits for someone, so it is no idle pass.
         if any(item['state'] in ('ask', 'review') for item in everything):

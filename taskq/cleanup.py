@@ -3,6 +3,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -156,7 +157,13 @@ def cleanup_plan(root):
         ask.append({'what': 'Codex inventory', 'why': session_error,
                     'choices': [('keep', 'true'), ('check again', f'{core.TOOL} cleanup')]})
     current = gc._git(root, 'branch', '--show-current').strip()
-    protected = {'main', current}
+    protected = {'main', current, 'origin/main', 'origin/HEAD'}
+    protected.update(ref.removeprefix('refs/heads/').removeprefix('refs/remotes/') for ref in core.PROTECTED_REFS)
+    task_name = lambda name: bool(re.fullmatch(r'(?:worktree-)?taskq-[0-9]+', name))
+    spawned_trees = {Path(meta['cwd']).resolve() for sid, meta in app.items()
+                     if meta.get('cwd') and meta.get('adoptedFromOtherSurface') and meta.get('sessionId') == f'local_{sid}'}
+    spawned_trees.update(Path(thread['cwd']).resolve() for sid, thread in threads.items()
+                         if thread.get('cwd') and ('codex', sid) in workers)
     owned = {}
     for iid, issue in issues.items():
         if not issue['closed']:
@@ -198,7 +205,11 @@ def cleanup_plan(root):
         what = f'tree {tree} / {branch or "detached HEAD"}'
         task_branch = f'worktree-{tree.name}'
         if tree.resolve() == root.resolve() or branch in protected or branch in owned or task_branch in owned or row['worktree'] in owned:
-            keep.append({'what': what, 'why': owned.get(branch) or owned.get(task_branch) or owned.get(row['worktree']) or 'main / current branch or tree of the calling session'})
+            keep.append({'what': what, 'why': owned.get(branch) or owned.get(task_branch) or owned.get(row['worktree']) or 'protected ref / main tree'})
+            continue
+        task_tree = task_name(branch) if branch else task_name(tree.name) or tree.resolve() in spawned_trees
+        if not task_tree:
+            keep.append({'what': what, 'why': 'ownership not proven: not a taskq worker tree'})
             continue
         if session_error:
             keep.append({'what': what, 'why': 'Codex session state not checked'})
@@ -222,7 +233,9 @@ def cleanup_plan(root):
         if branch in checked:
             continue
         if branch in protected or branch in owned:
-            keep.append({'what': f'branch {branch}', 'why': owned.get(branch) or 'main / current branch'})
+            keep.append({'what': f'branch {branch}', 'why': owned.get(branch) or 'protected ref'})
+        elif not task_name(branch):
+            keep.append({'what': f'branch {branch}', 'why': 'ownership not proven: not a taskq branch'})
         elif merged(branch):
             remove.append({'kind': 'branch', 'what': f'branch {branch}', 'branch': branch,
                            'head': git('rev-parse', branch).strip(), 'why': 'every patch in origin/main'})
@@ -230,7 +243,11 @@ def cleanup_plan(root):
             ask.append({'what': f'branch {branch}', 'why': 'has commits outside origin/main', 'choices': branch_choices(branch)})
     for ref in git('for-each-ref', '--format=%(refname)', 'refs/remotes/origin').splitlines():
         branch = ref.removeprefix('refs/remotes/origin/')
-        if branch not in ('main', 'HEAD') and merged(ref):
+        if f'origin/{branch}' in protected or branch in protected or branch in owned:
+            keep.append({'what': f'branch origin/{branch}', 'why': owned.get(branch) or 'protected ref'})
+        elif not task_name(branch):
+            keep.append({'what': f'branch origin/{branch}', 'why': 'ownership not proven: not a taskq branch'})
+        elif merged(ref):
             ask.append({'what': f'branch origin/{branch}', 'why': 'merged; deleting on the server needs an answer of the owner',
                         'choices': branch_choices(branch, remote=True)})
     finished_trees = {Path(item['path']).resolve() for item in remove if item['kind'] == 'tree'}

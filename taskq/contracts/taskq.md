@@ -56,6 +56,7 @@ It holds no secrets: the token belongs to `glab`.
 | `[codex] writable` | Extra writable roots of Codex worker turns, for project files outside the checkout (e.g. `["../csgo-media"]`): paths relative to the main checkout or `~/…`, resolved to absolute and added after the built-in roots by `codex_turn_policy()`; a missing path is skipped and `doctor` warns. A root that is a linked worktree of this checkout also adds its gitdir, so Codex on Linux lets git commit there (#163) | none: the main checkout's `.git`, `.worktrees` and the taskq state dir |
 | `[workspace] new`, `continue`, `none` | Brief text about the workspace; `{iid}` is the task number | `git worktree add -b taskq-<N> .worktrees/taskq-<N> origin/main` inside the main checkout (§ Task flow, «Where task trees live») |
 | `[workspace] retire` | What `close` runs from the main checkout to remove the task's tree (then `git branch -d taskq-<N>`) | `git worktree remove .worktrees/taskq-<N>`; nothing when the project sets its own `new` without `retire` |
+| `[workspace] protected_refs` | Refs cleanup must keep, including in owner questions: local names (`"release"`), remote names (`"origin/release"`), or full Git refs | `[]`; main and the calling branch are always protected |
 | `[workspace] cleanup_helpers` | Project folder with `workspace_gc.py`, `host_gentle.py`, `host_tools.py` for `cleanup`, an optional override | none: built-ins (`git worktree remove`, `lsof`) |
 | `[update] auto`, `every`, `ref` | `tick` updates taskq from REPO (github.com/alexkirs/taskq) at most `every` (`30m`, `24h`, `7d`); `taskq update` does it by hand. `ref = "main"`: the newest `main` commit whose CI check-runs passed; `ref = "stable"`: the `stable` tag, only when CI passed and the tag is signed by a key in the package's `allowed_signers` (README: Develop taskq). A refused update prints one line and nothing new runs; a clone whose new code does not start (`python3 -m taskq --version`) goes back. Missing keys take their defaults in memory; `taskq.toml` is never written | `auto`: `true` when the project's repository has REPO's owner, else `false`; `24h`; `main` |
 | `[profile]`, `[profile.limits]` | Team defaults for the tick/worker profile, below the personal file (§ Shared and personal configuration); never one person's choices | none |
@@ -443,6 +444,7 @@ local branches, trees or sessions. `cleanup --apply` executes only the "Remove" 
 proven finished, rechecking before each action.
 Running and current sessions are kept, sessions are only archived, and remote branches
 need a separate answer from the owner. Retire checks stay in `workspace_gc.py`.
+Only taskq-owned trees and branches are eligible: `taskq-<N>`, `worktree-taskq-<N>`, or trees identified by spawned worker metadata. Unknown ownership is kept. `[workspace] protected_refs` prevents local and remote deletion suggestions.
 Task trees are found in `.worktrees/taskq-<N>` and in `../taskq-<N>` alike (§ Task flow, «Where task trees live»).
 Procedure for owner questions and Claude archiving:
 [taskq-manager](taskq-manager.md) § Cleaning up finished work.

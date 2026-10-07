@@ -72,6 +72,7 @@ STALE_MINUTES = 120  # a `doing` task this long without a collaborator's note or
 # second). Across users the earliest reaction wins. An old lock on an unheld task is a crash's.
 LOCK, LOCK_SECONDS = 'lock', 120
 PROBLEM = 'problem'  # label of an issue for a problem without a task
+PROTECTED_REFS = ()  # [workspace] protected_refs: local names or origin/name, also full Git refs
 CLEANUP_DAYS = 30  # cleanup reads open issues and the ones closed this recently, not the whole history
 PREFIX, RUN, ON = 'q-', 'run-', 'host-'
 PRIORITIES = (1, 2)
@@ -98,7 +99,7 @@ def main_checkout(start):
 def configure(path=None):
     """Load the project's taskq.toml: `path`, else the nearest one from the current directory up. Read only: a key it
     lacks takes its default in memory (a write would dirty the editable clone, and update stops on a dirty clone)."""
-    global RULES, HOST, HOSTS, COORDINATOR, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, CODEX_WRITABLE, WORKSPACE, RETIRE, HELPERS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED, PAGES
+    global RULES, HOST, HOSTS, COORDINATOR, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, CODEX_WRITABLE, WORKSPACE, RETIRE, HELPERS, PROTECTED_REFS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED, PAGES
     import tomllib
     here = Path.cwd()
     path = Path(path) if path else next((folder / 'taskq.toml' for folder in (here, *here.parents)
@@ -130,6 +131,9 @@ def configure(path=None):
     # A project's own `new` without `retire` makes its trees elsewhere: the default retire would miss them.
     RETIRE = workspace.get('retire', None if 'new' in workspace else TREE_RETIRE)
     HELPERS = workspace.get('cleanup_helpers')
+    PROTECTED_REFS = workspace.get('protected_refs', ())
+    if not isinstance(PROTECTED_REFS, list | tuple) or not all(isinstance(ref, str) and ref for ref in PROTECTED_REFS):
+        fail(f'{path}: [workspace] protected_refs: write a list of non-empty ref names')
     UPDATE.update(config.get('update', {}))
     seconds(UPDATE['every'])
     if UPDATE['ref'] not in ('main', 'stable'):

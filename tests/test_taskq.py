@@ -3434,7 +3434,7 @@ class Cleanup(unittest.TestCase):
         return out.getvalue()
 
     def test_json_cleanup_plan_apply_and_recheck_refusal(self):
-        tree = self.tree('worktree-json')
+        tree = self.tree('worktree-taskq-100')
         with contextlib.redirect_stdout(io.StringIO()) as out:
             q.main(['cleanup', '--json'])
         plan = json.loads(out.getvalue())
@@ -3463,7 +3463,7 @@ class Cleanup(unittest.TestCase):
         self.assertFalse(tree.exists())
 
     def test_merged_clean_tree_is_reported_then_retired_and_branch_deleted(self):
-        tree = self.tree('worktree-done')
+        tree = self.tree('worktree-taskq-101')
         # origin/main is ahead of local main: -d must use the verified upstream without saving config.
         self.git('reset', '--hard', 'HEAD~1')
         before = (self.git('worktree', 'list', '--porcelain'), self.git('branch'),
@@ -3477,16 +3477,16 @@ class Cleanup(unittest.TestCase):
                                   (self.root / '.git/config').read_bytes()))
         self.assertIn('freed', self.run_cleanup(True))
         self.assertFalse(tree.exists())
-        self.assertNotIn('worktree-done', self.git('branch'))
+        self.assertNotIn('worktree-taskq-101', self.git('branch'))
         self.assertTrue((self.root / 'base').exists())
         self.assertEqual(before[-1], (self.root / '.git/config').read_bytes())
 
     def test_unmerged_dirty_open_task_and_process_are_not_touched(self):
-        unmerged = self.tree('worktree-unmerged', False)
-        dirty = self.tree('worktree-dirty')
+        unmerged = self.tree('worktree-taskq-102', False)
+        dirty = self.tree('worktree-taskq-103')
         (dirty / 'unknown').write_text('do not delete')
         doing = self.tree('worktree-taskq-7')
-        held = self.tree('worktree-held')
+        held = self.tree('worktree-taskq-104')
         self.issues[7] = {'closed': False, 'state': 'doing', 'claim': {'runtime': 'claude', 'session': 'live'}}
         with self.holding(held):
             report = self.run_cleanup(True)
@@ -3519,8 +3519,8 @@ class Cleanup(unittest.TestCase):
             self.assertIn(f'tree {trees[iid]} / taskq-{iid}', removed)
 
     def test_rebased_patch_is_finished_but_d_never_becomes_force(self):
-        tree = self.tree('worktree-rebased', False)
-        old = self.git('rev-parse', 'worktree-rebased')
+        tree = self.tree('worktree-taskq-105', False)
+        old = self.git('rev-parse', 'worktree-taskq-105')
         (self.root / 'other').write_text('other')
         self.git('add', 'other')
         self.git('commit', '-qm', 'other')
@@ -3531,18 +3531,21 @@ class Cleanup(unittest.TestCase):
         self.assertTrue(any(row.get('path') == str(tree) for row in remove))
         report = self.run_cleanup(True)
         self.assertFalse(tree.exists())
-        self.assertIn('Kept branch worktree-rebased', report)
-        self.assertIn('worktree-rebased', self.git('branch'))
+        self.assertIn('Kept branch worktree-taskq-105', report)
+        self.assertIn('worktree-taskq-105', self.git('branch'))
 
     def test_remote_merged_branch_only_asks_and_open_codex_keeps_its_tree(self):
-        tree = self.tree('worktree-active')
-        self.git('push', '-q', 'origin', 'worktree-active')
+        tree = self.tree('worktree-taskq-106')
+        self.git('push', '-q', 'origin', 'worktree-taskq-106')
         self.threads['live'] = {'id': 'live', 'cwd': str(tree), 'status': {'type': 'active'}}
         report = self.run_cleanup(True)
-        self.assertIn('delete on the server: git push origin --delete worktree-active', report)
+        self.assertNotIn('git push origin --delete worktree-taskq-106', report)
+        self.git('branch', 'taskq-900')
+        self.git('push', '-q', 'origin', 'taskq-900')
+        self.assertIn('git push origin --delete taskq-900', self.run_cleanup())
         self.assertIn('Codex session live', report.split('# Kept')[1])
         self.assertTrue(tree.exists())
-        self.assertIn('refs/heads/worktree-active', self.git('ls-remote', '--heads', 'origin'))
+        self.assertIn('refs/heads/worktree-taskq-106', self.git('ls-remote', '--heads', 'origin'))
 
     def test_sessions_use_live_closed_issues_and_current_is_kept(self):
         self.issues[1] = {'closed': True, 'state': 'unknown', 'type': 'code',
@@ -3602,7 +3605,7 @@ class Cleanup(unittest.TestCase):
             self.assertNotIn(sid, report)
 
     def test_new_activity_between_plan_and_apply_prevents_deletion(self):
-        tree = self.tree('worktree-race')
+        tree = self.tree('worktree-taskq-107')
         original, calls = cleanup.cleanup_plan, []
         def plan(root):
             calls.append(1)
@@ -3612,12 +3615,12 @@ class Cleanup(unittest.TestCase):
         with patch.object(cleanup, 'cleanup_plan', plan):
             self.assertIn('Kept after the recheck', self.run_cleanup(True))
         self.assertTrue(tree.exists())
-        self.assertIn('worktree-race', self.git('branch'))
+        self.assertIn('worktree-taskq-107', self.git('branch'))
 
     def test_detached_merged_tree_and_idle_session_by_cwd_are_removed(self):
-        tree = self.tree('worktree-detached')
+        tree = self.tree('worktree-taskq-108')
         self.git('checkout', '--detach', cwd=tree)
-        self.git('branch', '-d', 'worktree-detached')
+        self.git('branch', '-d', 'worktree-taskq-108')
         self.threads['by-cwd'] = {'id': 'by-cwd', 'cwd': str(tree), 'status': {'type': 'idle'}}
         archived = []
         def archive(args):
@@ -3629,17 +3632,17 @@ class Cleanup(unittest.TestCase):
         self.assertFalse(tree.exists())
 
     def test_archive_refusal_keeps_the_sessions_tree_and_branch(self):
-        tree = self.tree('worktree-writer')
+        tree = self.tree('worktree-taskq-109')
         self.threads['writer'] = {'id': 'writer', 'cwd': str(tree), 'status': {'type': 'notLoaded'}}
         with patch.object(q, 'codex_archive', side_effect=SystemExit('active writer')):
             report = self.run_cleanup(True)
         self.assertIn('active writer', report)
         self.assertIn('the session of this tree is not archived', report)
         self.assertTrue(tree.exists())
-        self.assertIn('worktree-writer', self.git('branch'))
+        self.assertIn('worktree-taskq-109', self.git('branch'))
 
     def test_unavailable_inventory_keeps_trees_and_unknown_status_keeps_tree(self):
-        tree = self.tree('worktree-unknown')
+        tree = self.tree('worktree-taskq-110')
         with patch.object(cleanup, 'cleanup_codex', side_effect=OSError('not connected')):
             report = self.run_cleanup(True)
         self.assertTrue(tree.exists())
@@ -3648,8 +3651,46 @@ class Cleanup(unittest.TestCase):
         self.run_cleanup(True)
         self.assertTrue(tree.exists())
 
+    def test_foreign_and_protected_refs_are_kept_on_repeated_cleanup(self):
+        foreign = self.tree('live')
+        protected = self.tree('taskq-801')
+        eligible = self.tree('taskq-802')
+        locked = self.tree('taskq-803')
+        self.git('worktree', 'lock', str(locked))
+        for branch in ('live', 'taskq-801', 'taskq-804'):
+            if branch == 'taskq-804':
+                self.git('branch', branch)
+            self.git('push', '-q', 'origin', branch)
+        config = self.root / 'taskq.toml'
+        config.write_text('[github]\nrepo = "owner/repo"\n[workspace]\n'
+                          'protected_refs = ["refs/heads/taskq-801", "refs/remotes/origin/taskq-804"]\n')
+        q.configure(config)
+        self.addCleanup(q.configure, Path(__file__).parent / 'taskq.toml')
+        for _ in range(2):
+            report = self.run_cleanup(True)
+            kept = report.split('# Kept')[1]
+            self.assertIn(str(foreign), kept)
+            self.assertIn(str(protected), kept)
+            self.assertIn('branch origin/live', kept)
+            self.assertIn('branch origin/taskq-804', kept)
+            for branch in ('live', 'taskq-801', 'taskq-804'):
+                self.assertNotIn(f'git push origin --delete {branch}', report)
+            for tree in (foreign, protected, locked):
+                self.assertTrue(tree.exists())
+            self.assertFalse(eligible.exists())
+        self.assertIn('refs/heads/taskq-804', self.git('ls-remote', '--heads', 'origin'))
+
+    def test_spawned_detached_worker_tree_is_eligible(self):
+        tree = self.tree('foreign-worker')
+        self.git('checkout', '--detach', cwd=tree)
+        self.app['spawned'] = {'cwd': str(tree), 'adoptedFromOtherSurface': True,
+                               'sessionId': 'local_spawned', 'isArchived': True}
+        self.run_cleanup(True)
+        self.assertFalse(tree.exists())
+        self.assertIn('foreign-worker', self.git('branch'))
+
     def test_cleanup_refuses_linked_checkout(self):
-        tree = self.tree('worktree-linked')
+        tree = self.tree('worktree-taskq-111')
         os.chdir(tree)
         with self.assertRaisesRegex(SystemExit, 'only from the main checkout'):
             self.run_cleanup(True)

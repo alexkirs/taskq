@@ -93,6 +93,7 @@ Expected: `taskq.toml`, labels and a board with one column per state.
 GitLab prints its ID; GitHub prints its URL. `labels only`: obtain `project` scope; rerun init.
 Credentials stay in the host CLI.
 Codex workers need no `taskq.toml` key: the Codex app project is found by the checkout path, created if missing.
+Without the Codex app (headless Linux): `codex login --device-auth && codex app-server daemon start` serves the same app server; `taskq doctor --codex` checks it.
 
 ## Product Manager
 

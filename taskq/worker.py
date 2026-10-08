@@ -391,10 +391,14 @@ def recover_closed(issue):
     session, runtime = current['claim'].get('session'), current['claim'].get('runtime')
     if runtime == 'claude':
         agents = claude_agents(strict=True)
-        if agents is None or session in agents:
+        agent = agents.get(session) if agents is not None else None
+        if not (isinstance(agent, dict) and agent.get('sessionId') == session and agent.get('kind') == 'background'
+                and agent.get('cwd') == str(core.ROOT) and agent.get('state') in CLAUDE_ENDED
+                and agent.get('status') != 'busy' and agent.get('pid') is None):
             return
-    elif runtime == 'codex' and not core.codex_is_archived(session):
-        return
+    elif runtime == 'codex':
+        if not core.codex_is_archived(session):
+            return
     else:
         return
     retire_local(current)

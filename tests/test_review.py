@@ -148,8 +148,11 @@ class Review(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'interrupted'):
                 self.do(COORDINATOR, 'close', iid, '--text', 'accepted')
         self.assertEqual(self.gitlab.issues[iid]['state'], 'closed')
+        session = q.parse({**self.gitlab.issues[iid], 'labels': [q.PREFIX + q.STATES[0]]})['claim']['session']
+        ended = {session: {'sessionId': session, 'kind': 'background', 'cwd': str(q.ROOT), 'state': 'done'}}
         with patch.object(worker, 'retire_local') as retire:
-            self.do(COORDINATOR, 'close', iid, '--text', 'restart')
+            with patch.object(worker, 'claude_agents', return_value=ended):
+                self.do(COORDINATOR, 'close', iid, '--text', 'restart')
         retire.assert_called_once()
 
     def test_missing_published_branch_keeps_review_evidence(self):

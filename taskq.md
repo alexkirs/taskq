@@ -245,5 +245,5 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 ## 10. Develop taskq itself
 
 Every session on a machine runs the clone's `taskq.py`: keep that clone on clean `main` and change taskq only in a
-worktree (`.worktrees/<branch>`). Tests: `python3 -m unittest discover -s tests`; CI runs them on every push.
+worktree (`.worktrees/<branch>`). Tests: `python3 -m unittest tests.test_single`; CI runs them on every push.
 Design: [docs/single-file.md](docs/single-file.md).

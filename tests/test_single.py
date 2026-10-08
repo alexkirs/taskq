@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location('taskq_single', ROOT / 'taskq.py')  # `import taskq` is the package
+spec = importlib.util.spec_from_file_location('taskq_single', ROOT / 'taskq.py')
 taskq = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(taskq)
 SESSION = '0123456789abcdef'

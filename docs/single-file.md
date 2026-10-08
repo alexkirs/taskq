@@ -112,23 +112,25 @@ tasks with no `host-*` label or with its own `host-<name>` label; any machine ca
 - Legacy compatibility shapes.
 - The Projects v2 mirror.
 - `codex.py`, the app-server client.
-- `docs/*.md` except `open.html` (and this design note until the rewrite lands).
+- `docs/*.md` except `open.html` and this design note.
 
 ## 8. File layout
 
 `taskq.py`, top to bottom:
 
-| Part | Lines | Holds |
-|---|---|---|
-| Config + task model | ~60 | read `taskq.json`; parse/render the JSON block; state labels |
-| Board | ~120 | the protocol, GitHub, GitLab, file loader |
-| Runtime | ~100 | the protocol, Claude, Codex, file loader |
-| Commands | ~200 | `add list take ask answer result close requeue later tick`, argparse |
+| Part | Planned | Final (#290) | Holds |
+|---|---|---|---|
+| Config + task model | ~60 | 62 | read `taskq.json`; parse/render the JSON block; state labels |
+| Board | ~120 | 111 | the protocol, GitHub, GitLab, file loader |
+| Runtime | ~100 | 119 | the protocol, Claude, Codex, file loader |
+| Commands | ~200 | 207 | `add list take ask answer result close requeue later tick`, argparse |
+| Total `taskq.py` | ~500 | 499 | |
 
 Beside it:
 
-- `taskq.md`, the contract, ~250 lines: what a worker and the manager do, in the commands below.
-- Tests, ~150 lines: an in-memory fake Board and fake Runtime; `tick` runs without network.
+- `taskq.md`, the contract: planned ~250 lines, final 249. What a worker and the manager do, in the commands below.
+- `tests/test_single.py`: planned ~150 lines, final 320. An in-memory fake Board and fake Runtime; `tick` runs
+  without network. CI runs `python3 -m unittest tests.test_single`.
 
 ### Commands
 
@@ -145,9 +147,11 @@ Beside it:
 | `later N` | park the task: label `q-later` |
 | `tick` | one pass of section 5 |
 
-## Current modules and where they land
+## Old modules and where they landed
 
-| Current module | Lines | Surviving behavior lands in | Dropped |
+All deleted in #290, with `pyproject.toml`, `taskq.toml` (now `taskq.json`) which also replaces the pipx install.
+
+| Old module | Lines | Surviving behavior lands in | Dropped |
 |---|---|---|---|
 | `taskq/__init__.py` | 906 | config + task model (`parse`, `render`, `data`, labels, `STATES`), argparse `main` | TOML config, profiles/preferences, machine identity beyond the host label, `selftest_env`, JSON output mode, GitLab-shaped API layer |
 | `taskq/store_github.py` | 148 | Board: GitHub implementation | GitLab-REST emulation over `gh api` |

@@ -68,7 +68,7 @@ is in the contract: **[taskq.md](taskq.md)**. Give it to any agent; it is all it
 ## Develop taskq
 
 Every session on the machine runs the clone's `taskq.py`: keep the clone on clean `main`, change taskq in a worktree
-(`git worktree add -b <branch> .worktrees/<branch> origin/main`), run `python3 -m unittest discover -s tests` there.
+(`git worktree add -b <branch> .worktrees/<branch> origin/main`), run `python3 -m unittest tests.test_single` there.
 Design: [docs/single-file.md](docs/single-file.md).
 
 License: [MIT](LICENSE).

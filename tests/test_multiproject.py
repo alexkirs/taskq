@@ -440,17 +440,36 @@ class Acting(unittest.TestCase):
 
     def test_archived_codex_claim_keeps_ownership_but_frees_only_proven_inactive_budget(self):
         archived = {'status': 'ok', 'L': {'claude': 0, 'codex': 0}, 'uncertain': [],
-                    'held': [(['codex'], 'session:191')], 'inactive': ['session:191'], 'reserved': []}
+                    'held': [(['codex'], 'session:191')], 'inactive': ['session:191'], 'protected': []}
         caps, live = {'claude': 8, 'codex': 4}, {'claude': set(), 'codex': {'session:a', 'session:b', 'session:c'}}
         found = multiproject.budget(caps, live, [archived], archived, {'codex': 4})
         self.assertEqual((archived['held'], found['codex']['occupancy'], found['codex']['F']),
                          ([(['codex'], 'session:191')], 3, 1))
-        # A resumed or live exact session wins over its archive readback; a reservation remains retained too.
+        # A resumed or live exact session wins over its archive readback; protected aliases remain retained too.
         live['codex'].add('session:191')
         self.assertEqual(multiproject.budget(caps, live, [archived], archived, {'codex': 4})['codex']['F'], 0)
         live['codex'].remove('session:191')
-        archived['reserved'] = ['session:191']
+        archived['protected'] = ['session:191']
         self.assertEqual(multiproject.budget(caps, live, [archived], archived, {'codex': 4})['codex']['F'], 0)
+        archived['protected'] = []
+        twin = {**archived, 'held': [(['codex'], 'session:191')]}
+        self.assertEqual(multiproject.budget(caps, live, [archived, twin], archived, {'codex': 4})['codex']['F'], 1)
+        twin['protected'] = ['session:191']
+        self.assertEqual(multiproject.budget(caps, live, [archived, twin], archived, {'codex': 4})['codex']['F'], 0)
+
+    def test_occupancy_keeps_mixed_state_same_session_ineligible(self):
+        items = [{'iid': 191, 'state': 'review', 'claim': {'runtime': 'codex', 'session': 'same'}, 'reservation': None},
+                 {'iid': 192, 'state': 'doing', 'claim': {'runtime': 'codex', 'session': 'same'}, 'reservation': None}]
+        with patch.multiple(multiproject, verify=lambda entry: [], locality=lambda owner: 'local',
+                            codex_archived_inactive=lambda session: session == 'same'), \
+                patch.multiple(core, user=lambda: 1, load=lambda: (items,), issues=lambda query: [],
+                               room=lambda everything, capacity: {'claude': 0, 'codex': -1}):
+            read = multiproject.occupancy({'principal': 1, 'host': 'example.test', 'repository': 'acme/test'})
+        self.assertEqual((read['held'], read['inactive'], read['protected'], read['L']['codex']),
+                         ([(['codex'], 'session:same'), (['codex'], 'session:same')], ['session:same'], ['session:same'], 1))
+        self.assertEqual(multiproject.checked_read(read)['status'], 'ok')
+        found = multiproject.budget({'claude': 2, 'codex': 6}, {'claude': set(), 'codex': set()}, [read], read, {'codex': 4})
+        self.assertEqual((found['codex']['occupancy'], found['codex']['F'], found['codex']['L'], found['codex']['limit']), (1, 5, 1, 4))
 
     def test_codex_archive_proof_requires_exact_archived_inactive_thread(self):
         case = self
@@ -1145,7 +1164,7 @@ class Acting(unittest.TestCase):
     def test_over_cap_refuses_before_native_pass_for_either_runtime_with_L(self):
         policy = self.catalog({**self.alpha, 'limits': {'claude': 2, 'codex': 2}}, caps={'claude': 2, 'codex': 2})
         for runtime in multiproject.CAPS:
-            read = {'status': 'ok', 'held': [([runtime], 'session:a')], 'inactive': [], 'reserved': [], 'uncertain': [],
+            read = {'status': 'ok', 'held': [([runtime], 'session:a')], 'inactive': [], 'protected': [], 'uncertain': [],
                     'L': {'claude': 0, 'codex': 0, runtime: 1}}
             live = ['a', 'b', 'c']
             rows = [{'sessionId': session, 'state': 'working'} for session in live] if runtime == 'claude' else []

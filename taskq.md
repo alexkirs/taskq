@@ -150,10 +150,23 @@ Rules:
 | `publish` | Worker pushes | `result --sha` | `close` |
 |---|---|---|---|
 | `direct` | `git push origin HEAD:main` | the pushed SHA | checks the SHA is on `origin/main`, closes |
-| `pr` | `git push --force-with-lease origin HEAD:refs/heads/taskq-<N>`, then once `gh pr create --base main --head taskq-<N>` / `glab mr create --target-branch main --source-branch taskq-<N>` | the PR head SHA | squash-merges the one open PR of `taskq-<N>` into `main` at exactly that SHA, deletes the branch, closes |
+| `pr` | `git push --force-with-lease origin HEAD:refs/heads/taskq-<N>`, then once `gh pr create --base main --head taskq-<N>` / `glab mr create --target-branch main --source-branch taskq-<N>` | the PR head SHA | squash-merges the one open PR of `taskq-<N>` into `main` once `tests` passes on its head, deletes the branch, closes |
 
 - `pr` mode: a PR that does not merge (conflict, failing checks) goes back to `ready` with the platform's message;
   a head that differs from the result SHA, or several PRs, refuses the close.
+- `pr` mode on GitHub (#308): `main` requires the `tests` check (`.github/workflows/tests.yml`), strict: the
+  branch must be up to date. `close` merges only a head with `tests` green. A PR behind `main` is updated
+  (`gh pr update-branch`), `tests` runs on the new head, and `close` merges at that new head. A conflict, a failed
+  `tests`, or no result within 10 min sends the task back to `ready`. Set the rule once (repo admin):
+
+  ```sh
+  echo '{"required_status_checks": {"strict": true, "checks": [{"context": "tests", "app_id": 15368}]},
+    "enforce_admins": false, "required_pull_request_reviews": null, "restrictions": null}' |
+    gh api -X PUT repos/OWNER/REPO/branches/main/protection --input -
+  ```
+
+  `app_id` 15368 is GitHub Actions. `enforce_admins: false` keeps the owner's direct pushes; `close` enforces the
+  gate itself. Check it: `gh api repos/OWNER/REPO/branches/main/protection --jq .required_status_checks`.
 - `pr` mode and no PR (an answer): `close` checks the SHA is on `origin/main`, as in `direct`.
 - Both modes, on the machine named in the claim: `close` removes a clean `.worktrees/taskq-<N>` (`git worktree remove`)
   and the local branch `taskq-<N>` (`git branch -D`). A worktree with uncommitted changes stays, with its branch, and

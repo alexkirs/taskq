@@ -23,7 +23,7 @@ def green(sha):
         if not runs:
             return 'it has no exact-SHA tests run yet'
         conclusions = [run['conclusion'] for run in runs]
-        return ('CI still running: tests' if None in conclusions else
+        return ('CI still running: tests' if not all(conclusions) else  # gh prints "" while a run is in progress
                 'CI failed: tests' if any(result != 'success' for result in conclusions) else None)
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         return 'its CI could not be read (gh api)'

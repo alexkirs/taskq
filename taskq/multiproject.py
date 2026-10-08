@@ -399,7 +399,7 @@ def claude_inventory(rows):
         return None
     found = set()
     for row in rows:
-        if row.get('state') in CLAUDE_ENDED and row.get('pid') is None:
+        if claude_executor_ended_row(row):
             continue
         session, pid = row.get('sessionId'), row.get('pid')
         if isinstance(session, str) and session:
@@ -411,14 +411,19 @@ def claude_inventory(rows):
     return found
 
 
+def claude_executor_ended_row(row):
+    """Whether one supported CLI row has no executor left. An omitted status is normal; an unknown present status holds."""
+    return (row.get('state') in CLAUDE_ENDED and row.get('pid') is None
+            and ('status' not in row or row['status'] == 'idle'))
+
+
 def claude_executor_ended(session, checkout, rows):
     """Fresh CLI proof that one exact background executor ended in this binding. This is not archive or ownership proof."""
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
         return False
     matches = [row for row in rows if row.get('sessionId') == session]
     if not (len(matches) == 1 and matches[0].get('kind') == 'background'
-            and matches[0].get('state') in CLAUDE_ENDED and isinstance(matches[0].get('status'), str)
-            and matches[0].get('status') not in ('working', 'blocked', 'busy') and matches[0].get('pid') is None
+            and claude_executor_ended_row(matches[0])
             and isinstance(matches[0].get('cwd'), str)):
         return False
     try:

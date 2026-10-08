@@ -458,16 +458,17 @@ class Acting(unittest.TestCase):
         self.assertEqual(multiproject.budget(caps, live, [archived, twin], archived, {'codex': 4})['codex']['F'], 0)
 
     def test_ended_claude_executor_frees_compute_only_with_exact_terminal_no_pid_binding_proof(self):
-        items = [{'iid': 198, 'state': 'review', 'claim': {'runtime': 'claude', 'session': '198'}, 'reservation': None},
-                 {'iid': 205, 'state': 'later', 'claim': {'runtime': 'claude', 'session': '205'}, 'reservation': None}]
-        rows = [{'kind': 'background', 'sessionId': '198', 'cwd': str(self.dir), 'state': 'done', 'status': 'idle'},
-                {'kind': 'background', 'sessionId': '205', 'cwd': str(self.dir), 'state': 'failed', 'status': 'idle'}]
+        one, two = 'aac1d605-82f4-4b65-804c-ea07b78674cd', '3b45fa67-ed29-40de-93ba-f41f13a1345c'
+        items = [{'iid': 198, 'state': 'review', 'claim': {'runtime': 'claude', 'session': one}, 'reservation': None},
+                 {'iid': 205, 'state': 'later', 'claim': {'runtime': 'claude', 'session': two}, 'reservation': None}]
+        rows = [{'id': 'aac1d605', 'kind': 'background', 'sessionId': one, 'cwd': str(self.dir), 'state': 'done'},
+                {'id': '3b45fa67', 'kind': 'background', 'sessionId': two, 'cwd': str(self.dir), 'state': 'failed'}]
         with patch.multiple(multiproject, verify=lambda entry: [], locality=lambda owner: 'local', claude_rows=lambda: rows), \
                 patch.multiple(core, user=lambda: 1, load=lambda: (items,), issues=lambda query: [],
                                room=lambda everything, capacity: {'claude': -2, 'codex': 0}):
             read = multiproject.occupancy({'principal': 1, 'host': 'example.test', 'repository': 'acme/test', 'checkout': str(self.dir)})
         self.assertEqual((read['held'], read['inactive'], read['protected'], read['L']['claude']),
-                         ([(['claude'], 'session:198'), (['claude'], 'session:205')], ['session:198', 'session:205'], [], 2))
+                         ([(['claude'], f'session:{one}'), (['claude'], f'session:{two}')], [f'session:{one}', f'session:{two}'], [], 2))
         found = multiproject.budget({'claude': 2, 'codex': 1}, {'claude': set(), 'codex': set()}, [read], read, {'claude': 2})
         self.assertEqual((found['claude']['occupancy'], found['claude']['F'], found['claude']['L']), (0, 2, 2))
 
@@ -491,18 +492,31 @@ class Acting(unittest.TestCase):
             self.assertEqual(multiproject.claude_inventory([row]), {'session:185'} if row.get('pid') else set())
 
     def test_ended_claude_executor_rejects_interactive_missing_malformed_or_contradictory_rows(self):
-        row = {'kind': 'background', 'sessionId': '198', 'cwd': str(self.dir), 'state': 'done', 'status': 'idle'}
+        row = {'id': 'aac1d605', 'kind': 'background', 'sessionId': '198', 'cwd': str(self.dir), 'state': 'done'}
         for state in ('done', 'failed', 'stopped'):
             with self.subTest(state=state):
                 self.assertTrue(multiproject.claude_executor_ended('198', self.dir, [{**row, 'state': state}]))
         for rows in (None, [{}], [{**row, 'kind': 'interactive'}], [{**row, 'cwd': '/wrong'}],
                      [{**row, 'state': 'working'}], [{**row, 'status': 'working'}], [{**row, 'status': 'blocked'}],
-                     [{**row, 'status': 'busy'}], [{**row, 'status': None}],
+                     [{**row, 'status': 'busy'}], [{**row, 'status': None}], [{**row, 'status': 1}], [{**row, 'status': 'unknown'}],
                      [{**row, 'pid': 1}], [{**row, 'sessionId': 'other'}], [row, {**row, 'state': 'working'}]):
             with self.subTest(rows=rows):
                 self.assertFalse(multiproject.claude_executor_ended('198', self.dir, rows))
         self.assertIsNone(multiproject.claude_inventory(None))
         self.assertIsNone(multiproject.claude_inventory([{}]))
+
+    def test_terminal_status_contradictions_hold_raw_inventory_and_budget(self):
+        session = '7b1c192f-23d7-4b03-94e2-ad05c2538a08'
+        row = {'id': '7b1c192f', 'kind': 'background', 'sessionId': session, 'cwd': str(self.dir), 'state': 'done'}
+        self.assertEqual(multiproject.claude_inventory([row]), set())
+        for status in ('working', 'blocked', 'busy', None, 1, 'unknown'):
+            with self.subTest(status=status):
+                inventory = multiproject.claude_inventory([{**row, 'status': status}])
+                self.assertEqual(inventory, {f'session:{session}'})
+                read = {'status': 'ok', 'L': {'claude': 0, 'codex': 0}, 'uncertain': [],
+                        'held': [(['claude'], f'session:{session}')], 'inactive': [f'session:{session}'], 'protected': []}
+                found = multiproject.budget({'claude': 1, 'codex': 1}, {'claude': inventory, 'codex': set()}, [read], read, {'claude': 1})
+                self.assertEqual((found['claude']['occupancy'], found['claude']['F']), (1, 0))
 
     def test_occupancy_keeps_mixed_state_same_session_ineligible(self):
         items = [{'iid': 191, 'state': 'review', 'claim': {'runtime': 'codex', 'session': 'same'}, 'reservation': None},

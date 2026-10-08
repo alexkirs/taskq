@@ -443,8 +443,9 @@ def merge(current, sha):
             time.sleep(CHECK_PAUSE)
         else:
             back(f'check tests did not finish on {head}')
-    _, out = cli(*(['glab', 'mr', 'merge', number, '--squash', '--remove-source-branch', '--sha', head, '--auto-merge=false', '--yes'] if lab
-                   else ['gh', 'pr', 'merge', number, '--squash', '--delete-branch', '--match-head-commit', head]))
+    keep = CONFIG.get('workspace') == 'external'  # #477: the host owns the branch; the repo's own policy may still delete it
+    _, out = cli(*(['glab', 'mr', 'merge', number, '--squash', *['--remove-source-branch'] * (not keep), '--sha', head, '--auto-merge=false', '--yes'] if lab
+                   else ['gh', 'pr', 'merge', number, '--squash', *['--delete-branch'] * (not keep), '--match-head-commit', head]))
     code, viewed = cli(*(['glab', 'mr', 'view', number, '--output', 'json'] if lab else ['gh', 'pr', 'view', number, '--json', 'state,mergeCommit']))
     pr = {} if code else json.loads(viewed)
     if str(pr.get('state')).lower() != 'merged':  # read back: a merge that reported an error may still have merged
@@ -453,7 +454,9 @@ def merge(current, sha):
 
 def cleanup(current):
     """The worker's .worktrees/taskq-<N> and branch taskq-<N>, on the claim's machine: removed when clean, else kept
-    with a note for the close comment. Never --force: that lost a worker's changes (#284)."""
+    with a note for the close comment. Never --force: that lost a worker's changes (#284). `"workspace": "external"`: never (#477)."""
+    if CONFIG.get('workspace') == 'external':
+        return 'kept: owned by host'
     branch = f'taskq-{current["iid"]}'
     tree = CONFIG['root'] / '.worktrees' / branch
     if (current['claim'] or {}).get('name') != machine() or not tree.is_dir():
@@ -518,6 +521,8 @@ def brief(item, runtime):
         else f'gh pr create --base main --head taskq-{n} --title "<title>" --body'
     push = f'`git push --force-with-lease origin HEAD:refs/heads/taskq-{n}`, open a pull request once (a push updates it):\n  `{create} "<summary>"`, ' \
         f'then `{tq} result {n} --sha <PR head full SHA>' if CONFIG['publish'] == 'pr' else f'`git push origin HEAD:main`, then\n  `{tq} result {n} --sha <pushed full SHA>'
+    workspace = f'take your workspace from the project instructions (AGENTS.md) or the path the manager gave, on branch taskq-{n};\nthe host owns it: never remove it' \
+        if CONFIG.get('workspace') == 'external' else f'from {root} run `git fetch origin && git worktree add -b taskq-{n} .worktrees/taskq-{n} origin/main`, work only there,\nnever in the main checkout'
     return f'''You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
 Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
 
@@ -525,8 +530,7 @@ Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_
 
 {history(n)}Expected paths: {", ".join(item["scope"] or []) or "none named"}. They say where the work is expected, not what is forbidden.
 
-Workspace: from {root} run `git fetch origin && git worktree add -b taskq-{n} .worktrees/taskq-{n} origin/main`, work only there,
-never in the main checkout; a branch taskq-{n} left by an earlier worker: continue it. A task that ends in an answer, not a commit,
+Workspace: {workspace}; a branch taskq-{n} left by an earlier worker: continue it. A task that ends in an answer, not a commit,
 needs no worktree. Commands:
 - A question only the owner can decide (a product choice, an action that cannot be undone): `{tq} ask {n} --text "<question>"`, then stop.
 - Cannot be done: `{tq} requeue {n} --text "<why>"`, then stop.

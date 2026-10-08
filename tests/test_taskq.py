@@ -2628,7 +2628,7 @@ class Doctor(unittest.TestCase):
         self.origin, self.status = 'git@gitlab.example.com:group/project.git', 0  # `glab auth status`: 0, 1 or None
         self.enterContext(patch.object(q, 'git', lambda *args, **kwargs: self.origin if args[:2] == ('remote', 'get-url') else None))
         self.enterContext(patch.object(doctor, 'probe', lambda command: self.status))
-        self.enterContext(patch.object(doctor, 'api_read', lambda command: (1, 'HTTP 401: Bad credentials')))  # #177: a real login gap
+        self.enterContext(patch.object(doctor, 'api_read', lambda command: (1, 'HTTP 401: Bad credentials')))
         self.enterContext(patch.object(q, 'LOCAL', Path(self.enterContext(tempfile.TemporaryDirectory())) / 'taskq.local.toml'))
         q.LOCAL.write_text('[profile]\nmine = false\n')
         self.enterContext(patch.object(q, 'ROOT', q.LOCAL.parent))
@@ -2761,10 +2761,10 @@ class Doctor(unittest.TestCase):
         self.assertIn('brew install glab', out)
         self.assertNotIn('labels', out)  # the tracker is not read before the CLI works
         self.status = 1
-        self.assertIn('glab auth login --hostname gitlab.example.com', self.doctor()[1])
+        self.assertIn('glab api user --hostname gitlab.example.com', self.doctor()[1])
         with patch.object(doctor, 'api_read', lambda command: (1, 'HTTP 403: Resource not accessible by integration')):
-            out = self.doctor()[1]  # #177: a failing auth status alone is not a login gap
-        self.assertIn('permission denied for this token (HTTP 403), not a proven login gap', out)
+            out = self.doctor()[1]
+        self.assertIn('HTTP 403: Resource not accessible by integration', out)
         self.assertNotIn('glab auth login', out)
         self.status, gitlab.access = 0, 20  # Reporter: reads, cannot write
         before = json.dumps([gitlab.labels, gitlab.boards, gitlab.issues])
@@ -2895,7 +2895,7 @@ class Setup(unittest.TestCase):
         self.status, self.probes = 0, []
         self.enterContext(patch.object(q, 'git', lambda *args, **kwargs: self.origin if args[:2] == ('remote', 'get-url') else None))
         self.enterContext(patch.object(doctor, 'probe', lambda command: self.probes.append(command) or self.status))
-        self.enterContext(patch.object(doctor, 'api_read', lambda command: (1, 'HTTP 401: Bad credentials')))  # #177: a real login gap
+        self.enterContext(patch.object(doctor, 'api_read', lambda command: (1, 'HTTP 401: Bad credentials')))
         self.tmp =Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(contextlib.chdir(self.tmp))
         self.enterContext(patch.object(q, 'CLAUDE_CONFIG', self.tmp / 'claude.json'))
@@ -3003,7 +3003,7 @@ class Setup(unittest.TestCase):
         self.assertEqual((os.listdir(self.tmp), gitlab.labels), (['taskq.toml'], {}))  # the tracker is not touched before the CLI works
         self.status = 1
         code, out = self.fix()
-        self.assertIn('you: glab auth login --hostname gitlab.example.com', out)
+        self.assertIn('you: glab api user --hostname gitlab.example.com', out)
         self.assertTrue(all(command[1:3] == ['auth', 'status'] for command in self.probes))  # login is never attempted
         self.status = 0
         code, out = self.fix()

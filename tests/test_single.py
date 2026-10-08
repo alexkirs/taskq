@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from time import monotonic, sleep  # the real clock: Wait patches time.time and time.sleep
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -494,15 +495,15 @@ link = lambda session: None
             env = {**taskq.worker_env(), 'TASKQ_HOST': 'mac'}
             add = lambda title: subprocess.run(['python3', str(ROOT / 'taskq.py'), 'add', title, '--goal', 'g', '--acceptance', 'a'],
                                                cwd=root, env=env, capture_output=True, text=True, timeout=30)
-            start = taskq.time.monotonic()
+            start = monotonic()
             done = add('one')
-            self.assertLess(taskq.time.monotonic() - start, 1.5)
+            self.assertLess(monotonic() - start, 1.5)
             self.assertEqual((done.returncode, done.stdout, done.stderr), (0, '#1 ready\n', ''))
             spawns = lambda: [c for c in json.loads((root / 'issues.json').read_text())['1']['comments'] if c.startswith('**spawn**')]
             for _ in range(100):
                 if spawns():
                     break
-                taskq.time.sleep(0.1)
+                sleep(0.1)
             child = int((root / 'spawned').read_text())
             self.assertEqual((child != os.getpid(), len(spawns())), (True, 1))  # spawned once, in the child
             for _ in range(100):  # the child holds the dispatch lock until it exits: a pass then would find it busy
@@ -510,7 +511,7 @@ link = lambda session: None
                     os.kill(child, 0)
                 except OSError:
                     break
-                taskq.time.sleep(0.1)
+                sleep(0.1)
             (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'runtimes': {'slow': 'slow.py'}, 'limits': {'slow': 2}}))
             done = add('boom')
             self.assertEqual(done.returncode, 0)
@@ -518,7 +519,7 @@ link = lambda session: None
             for _ in range(100):
                 if 'dispatch stopped' in log.read_text():
                     break
-                taskq.time.sleep(0.1)
+                sleep(0.1)
             self.assertIn('dispatch stopped: slow could not start the session', log.read_text())
 
     def test_claude_send_keeps_name_and_spawn_flags(self):

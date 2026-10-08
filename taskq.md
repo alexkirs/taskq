@@ -111,7 +111,8 @@ branch. Sessions are found by the claim in the block, names by the `T<N>` prefix
 Changed: "supervisor retires its worker; cleanup ends sessions without a task" → `close` does it; no cleanup command
 (#290, #302).
 Changed: no cleanup command → `taskq cleanup`, run by the owner on demand, never automatic: it removes only leftovers
-of tasks not open, never unmerged or uncommitted work, and never with `--force` (#476, § 4).
+of tasks not open, never unmerged or uncommitted work, and never with `--force` (#476, § 4). A session goes only by
+the id the board records, never by its name, never while it runs (#478).
 
 ### R12. Unverified means unknown
 
@@ -244,13 +245,14 @@ Runtime file: four module-level functions, two more optional.
 - `cleanup` (#476), on demand only, never run by a tick or an event. After `git fetch origin` it removes, for tasks
   not open: a clean `.worktrees/taskq-<N>` (`git worktree remove`); a local or `origin` branch `taskq-<N>` with nothing
   unmerged (an ancestor of `origin/main`, or a squash-merged one: merging it into `origin/main` changes no file;
-  needs git >= 2.38); taskq's own sessions of closed tasks through each runtime's `retire` (Claude: names `T<N> `
-  and the old `S<N> `); `.taskq/T<N>.pid` / `S<N>.pid` of dead processes; `.taskq/wait.json` entries of tasks not
-  open. It prints each removal, then `kept <what>: <why>` (open task, dirty, unmerged commits, its worktree is kept,
-  unknown), then `mess:` lines: `doing` tasks whose local session is gone, `pr`-mode `review` tasks with no open PR
+  needs git >= 2.38); a stopped session of a closed task found through each runtime's `retire` (Claude: names
+  `T<N> ` and the old `S<N> `) only when the task records its id (#478: the block's claim, the spawn note's link, or
+  the take note's `<runtime>:<id prefix>`); `.taskq/S<N>.pid` of dead processes; `.taskq/wait.json` entries of tasks
+  not open. A running session, or one matched by name only, is kept and reported. It prints each removal, then
+  `kept <what>: <why>` (open task, dirty, unmerged commits, its worktree is kept, running, name only, unknown), then `mess:` lines: `doing` tasks whose local session is gone, `pr`-mode `review` tasks with no open PR
   (an answer on `origin/main` is fine), open PRs and kept branches whose task is not open. A second run removes
-  nothing. Never `--force`, never unmerged work (R11). `workspace: external` (§ 2): no worktree or branch is touched.
-  Old Claude names `T<N> <title>` match the owner's own job named that way: run `--dry-run` first.
+  nothing. Never `--force`, never unmerged work (R11). `workspace: external` (§ 2): no worktree or branch is touched,
+  the report says `owned by host`.
 - No `beat` or `problem` command: a progress note or a problem is a plain issue comment
   (`gh issue comment N --body "..."` / `glab issue note N -m "..."`).
 

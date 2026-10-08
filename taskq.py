@@ -201,7 +201,8 @@ def make_board(config):
 # Four functions: spawn(name, prompt, cwd) -> session, send(session, text) -> session (a Claude resume may continue
 # under a new id), alive(session) -> True/False/None (running / gone / cannot tell), link(session) -> url or None.
 # Optional fifth: retire(gone, running=True) stops and removes this machine's `T<N>` sessions whose task gone(N) names:
-# close calls it for its task (#302, #360), the tick for closed tasks, stopped sessions only.
+# close calls it for its task (#302, #360), the tick for closed tasks, stopped sessions only. The built-ins call
+# gone(N, session, live): `taskq cleanup` removes only a session the board records (#478).
 
 def worker_env():  # a worker must not inherit the tick's session id, nor a spawning worker's task (#333)
     return {key: value for key, value in os.environ.items() if key not in (*SESSIONS.values(), 'TASKQ_TASK', 'TASKQ_RUNTIME')}
@@ -266,7 +267,7 @@ class Claude:
         claude = shutil.which('claude') or 'claude'
         for agent in (self.agents() or {}).values():
             n = re.match(self.names, agent.get('name') or '')  # worker_name: never the owner's own jobs
-            if not n or not gone(int(n[1])) or not agent.get('id') or self.running(agent) and not running:
+            if not n or not agent.get('id') or not gone(int(n[1]), agent.get('sessionId'), self.running(agent)) or self.running(agent) and not running:
                 continue
             if agent.get('pid'):
                 subprocess.run([claude, 'stop', agent['id']], capture_output=True, timeout=60)
@@ -349,7 +350,7 @@ class Codex:
         """Kill the turn's process, `codex archive` the thread, drop .taskq/T<N>.pid (#360)."""
         for path in (CONFIG['root'] / '.taskq').glob('T*.pid'):
             n, (pid, thread) = re.fullmatch(r'T(\d+)', path.stem), path.read_text().split()
-            if not n or not gone(int(n[1])) or pid_alive(int(pid)) and not running:
+            if not n or not gone(int(n[1]), thread, pid_alive(int(pid))) or pid_alive(int(pid)) and not running:
                 continue
             if pid_alive(int(pid)):
                 os.kill(int(pid), signal.SIGTERM)
@@ -525,7 +526,7 @@ def close_one(args):
     kept = cleanup(current)
     move(current, None, 'close', '\n\n'.join(filter(None, (args.text, kept))))
     BOARD.close(args.n)
-    retire(lambda n: n == args.n, f'#{args.n}: could not stop its sessions')
+    retire(lambda n, *_: n == args.n, f'#{args.n}: could not stop its sessions')
 
 def retire(gone, why, running=True):
     """Each runtime's retire, best effort: a session left behind never fails close or the tick."""
@@ -564,13 +565,23 @@ def cmd_cleanup(args):
     items = list(filter(None, map(parse, BOARD.list(None))))
     states = {item['iid']: 'open' for item in items}
 
+    issues = {}
+
     def state(n):  # open, closed, or unknown (no such issue, a board error)
         if n not in states:
             try:
-                states[n] = BOARD.get(n)['state']
+                issues[n] = BOARD.get(n)
+                states[n] = issues[n]['state']
             except (Exception, SystemExit):
                 states[n] = 'unknown'
         return states[n]
+
+    def recorded(runtime, n, session):  # #478: the block's claim, the spawn note's link, the take note's `<runtime>:<id[:8]>`
+        found = BLOCK.search(issues[n].get('body') or '')
+        claim = (json.loads(found.group(1)).get('claim') if found else None) or {}
+        notes = issues[n].get('comments') or []
+        return bool(session) and (claim.get('runtime') == runtime and claim.get('session') == session or any(
+            text.startswith('**spawn**') and session in text or text.startswith(f'**take** · {runtime}:{session[:8]}') for text in notes))
 
     def git(*argv):
         return subprocess.run([shutil.which('git') or fail('git not found'), '-C', str(root), *argv], capture_output=True, text=True, encoding='utf-8')
@@ -585,7 +596,7 @@ def cmd_cleanup(args):
     task_of = lambda name: int(re.fullmatch(r'taskq-(\d+)', name)[1])
     gone_trees = set()
     if CONFIG.get('workspace') == 'external':
-        kept.append('worktrees and branches: workspace is external (#477)')
+        kept.append('worktrees and branches: owned by host (workspace: external)')
     else:
         git('fetch', '-q', 'origin')
         dry or git('worktree', 'prune')
@@ -619,23 +630,28 @@ def cmd_cleanup(args):
             else:
                 kept.append(f'{what}: {"unknown" if whole is None else "unmerged commits"}')
                 mess.append(f'{what}: task #{n} is not open')
-    sessions = set()
 
-    def gone(n):  # records every taskq session of a closed task; --dry-run removes none
-        if state(n) == 'closed':
-            sessions.add(n)
+    def goner(name):  # #478: only a stopped session the board records for a closed task; a name alone is reported, never removed
+        def gone(n, session=None, live=None):
+            what = f'{name} session {session or "?"} of #{n}'
+            why = {'open': 'open task', 'unknown': 'unknown task'}.get(state(n)) or \
+                ('running' if live else 'liveness unknown' if live is None else None) or \
+                (None if recorded(name, n, session) else 'name only, not recorded on the board')
+            if why:
+                kept.append(f'{what}: {why}')
+                return False
+            removed.append(f'{verb} {what}')
             return not dry
-        return False
+        return gone
     for name, runtime in kinds.items():
         if isinstance(runtime, Claude):
             runtime.names = r'[TS](\d+) '  # old names too: `T<N> <title>`, the gone supervisor `S<N>`
         try:
-            getattr(runtime, 'retire', lambda *_: None)(gone)
+            getattr(runtime, 'retire', lambda *_: None)(goner(name), False)  # never a live worker
         except Exception as error:
             kept.append(f'{name} sessions: unknown ({error})')
-    removed += [f'{verb} sessions of #{n}' for n in sorted(sessions)]
     for path in sorted((root / '.taskq').glob('*.pid')):
-        n = re.fullmatch(r'[TS](\d+)', path.stem)
+        n = re.fullmatch(r'S(\d+)', path.stem)  # the gone supervisor's; a T<N>.pid is Codex's handle, its retire decides (#478)
         pid = (path.read_text().split() or ['0'])[0]
         if n and state(int(n[1])) == 'closed' and not (pid.isdigit() and pid_alive(int(pid))):
             dry or path.unlink()
@@ -788,7 +804,7 @@ def one_pass(args, table=True):
                 item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
         if held:  # #360: sessions of tasks no longer open (the list holds open tasks only)
             open_tasks = {item['iid'] for item in items}
-            retire(lambda n: n not in open_tasks, 'could not remove sessions of closed tasks', running=False)
+            retire(lambda n, *_: n not in open_tasks, 'could not remove sessions of closed tasks', running=False)
     if not table:
         return held
     print(f'{"Task":<6} {"State":<8} {"Runtime":<8} Session link')

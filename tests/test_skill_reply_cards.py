@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -29,9 +30,12 @@ class SkillReplyCards(unittest.TestCase):
         text = path.read_text()
         self.assertEqual(path.name, 'SKILL.md')
         self.assertTrue(text.startswith('---\nname: taskq\ndescription: '))
-        self.assertIn('](../principles.md)', text)
-        self.assertIn('docs/pm-intake.md', text)
-        self.assertTrue((path.parent / '../principles.md').is_file())
+        self.assertIn('[R2](../principles.md)', text)
+        self.assertNotIn('pm-intake', text)
+        links = [link for link in re.findall(r'\]\(([^)#]+)', text) if '://' not in link]
+        self.assertTrue(links)
+        for link in links:
+            self.assertTrue((path.parent / link).is_file(), link)
 
     def test_reply_is_stored_shown_and_checked(self):
         iid = self.add('--type', 'research', '--reply', 'telegram:-100123:7')

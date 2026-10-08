@@ -16,7 +16,7 @@ Coordinator, supervisor and worker follow the brief they are given and [taskq-ma
 
 ## PM steps
 
-Default intake: [docs/pm-intake.md](https://github.com/alexkirs/taskq/blob/main/docs/pm-intake.md). In short:
+These steps are the canonical PM intake. Rule: [R2](../principles.md) (dedup at intake, owner decides first); manager mechanics: [taskq-manager.md](../taskq-manager.md).
 
 1. **Collect.** Split the owner's messages into atomic requests, in the owner's words. Answer pure questions directly.
 2. **Read the board once.** `taskq list --json`; read bodies (`taskq view N --json`) only of candidate overlaps.

@@ -97,7 +97,7 @@ class Commands(Base):
         self.assertEqual((self.task(1)['state'], self.task(1)['result']), ('review', {'sha': 'a' * 40, 'checks': 'ok'}))
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
             self.assertEqual(self.run_cli('close', '1'), '#1 closed\n')
-        self.assertEqual(run.call_args.args[0][-4:], ['merge-base', '--is-ancestor', 'a' * 40, 'origin/main'])
+        self.assertIn(['merge-base', '--is-ancestor', 'a' * 40, 'origin/main'], [call.args[0][-4:] for call in run.call_args_list])
         issue = self.board.issues[1]
         self.assertEqual(issue['state'], 'closed')
         self.assertFalse([label for label in issue['labels'] if label.startswith('q-')])
@@ -201,10 +201,10 @@ class PullRequests(Base):
 
 
 class FakeRuntime:
-    """The four runtime functions over a dict: session -> alive."""
+    """The five runtime functions over a dict: session -> alive."""
 
     def __init__(self):
-        self.sessions, self.sent = {}, []
+        self.sessions, self.sent, self.stopped = {}, [], []
 
     def spawn(self, name, prompt, cwd):
         self.sessions[f's-{name}'] = True
@@ -220,6 +220,9 @@ class FakeRuntime:
 
     def link(self, session):
         return f'https://watch/{session}'
+
+    def stop(self, session):
+        self.stopped.append(session)
 
 
 class Tick(Base):
@@ -283,6 +286,19 @@ class Tick(Base):
         spawned, resumed = calls
         self.assertEqual(resumed, ['--resume', 's1', *spawned[:-1], 'continue'])
         self.assertEqual(resumed[2:4], ['--name', 'T7'])
+
+    def test_close_stops_only_a_local_worker(self):
+        for name in ('mac', 'win'):
+            self.add()
+            self.run_cli('tick')
+            n = len(self.board.issues)
+            claim = {**self.task(n)['claim'], 'name': name}
+            taskq.move(self.task(n), 'review', 'result', claim=claim, result={'sha': 'a' * 40})
+            with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+                self.run_cli('close', str(n))
+        self.assertEqual(self.fake.stopped, ['s-T1'])
+        self.assertNotIn('stop it there', self.board.issues[1]['comments'][-1])
+        self.assertEqual(self.board.issues[2]['comments'][-1], '**close** · claude:01234567\n\nsession s-T2 runs on win: stop it there')
 
     def test_codex_alive_from_pid_file(self):
         with tempfile.TemporaryDirectory() as folder:

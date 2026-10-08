@@ -53,7 +53,7 @@ updated_at, url}`; `get` adds `comments` (a list of strings, oldest first).
 | `comment(n, text)` | append one comment |
 | `close(n)` | close the issue |
 
-Runtime file: four module-level functions.
+Runtime file: four module-level functions, a fifth optional.
 
 | Function | Does |
 |---|---|
@@ -61,6 +61,7 @@ Runtime file: four module-level functions.
 | `send(session, text)` | deliver one message; returns the session id (it may change) |
 | `alive(session)` | `True` running, `False` gone, `None` cannot tell |
 | `link(session)` | a URL the owner opens to watch the session, or `None` |
+| `stop(session)` | optional: end the session's process; `close` calls it on the claim's machine |
 
 ## 3. Data model
 
@@ -105,7 +106,7 @@ Runtime file: four module-level functions.
 | `taskq result N --sha SHA [--checks C] [--text T]` | hand in: `doing` → `review` |
 | `taskq requeue N [--text T]` | drop claim and result: any state → `ready` |
 | `taskq later N [--text T]` | park: any state → `later` |
-| `taskq close N [--text T]` | accept a `review` task: publish check or merge (§ 6), close the issue |
+| `taskq close N [--text T]` | accept a `review` task: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment) |
 | `taskq tick` | one pass of the queue on this machine (§ 7) |
 
 - `--sha`: 7 to 40 lowercase hex digits; give the full SHA.
@@ -223,10 +224,10 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 
 ## 8. Runtimes
 
-| Runtime | spawn | send | alive | link |
-|---|---|---|---|---|
-| Claude | `claude --bg --name T<N>` in the project root; tools `Bash Read Edit Write Glob Grep WebFetch WebSearch`, no MCP, `--permission-mode dontAsk` | `claude stop`, then `claude --bg --resume <id> <text>` (a new id) | `claude agents --json --all` | Remote Control URL |
-| Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread>` in `.taskq/T<N>.pid` | `codex exec resume <id> <text>` | the pid is running | `open.html#codex://threads/<id>` |
+| Runtime | spawn | send | alive | link | stop |
+|---|---|---|---|---|---|
+| Claude | `claude --bg --name T<N>` in the project root; tools `Bash Read Edit Write Glob Grep WebFetch WebSearch`, no MCP, `--permission-mode dontAsk` | `claude stop`, then `claude --bg --resume <id> <text>` (a new id) | `claude agents --json --all` | Remote Control URL | `claude stop <job id>` |
+| Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread>` in `.taskq/T<N>.pid` | `codex exec resume <id> <text>` | the pid is running | `open.html#codex://threads/<id>` | none: a turn ends by itself |
 
 - A worker never inherits the tick's session id: `taskq.py` removes `CLAUDE_CODE_SESSION_ID` and
   `CODEX_THREAD_ID` from its environment.

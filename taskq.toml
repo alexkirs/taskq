@@ -22,7 +22,7 @@ every = "24h"
 
 [brief]
 rules = """
-Run `python3 -m unittest discover -s tests` in the worktree before `result`. A push to `main` is the deploy: every machine takes it with `taskq update`, so `main` is always green.
+Before `result`, run focused tests for the changed behavior. Also run `python3 -m unittest discover -s tests` for changes to shared TaskQ command, queue, runtime, publication, permission, cleanup, update, or test infrastructure behavior, or when focused evidence cannot cover the risk. For docs-only or planning changes, do not run behavior tests when they cannot verify the change. Exact-SHA CI must pass before publication. A push to `main` is the deploy: every machine takes it with `taskq update`, so `main` is always green.
 """
 
 [hosts]  # hostname → machine name in worker names, ticks and the `host-<name>` label; unmapped hosts keep their short name (the Mac is macbook-m2)

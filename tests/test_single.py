@@ -240,6 +240,7 @@ class PullRequests(Base):
         self.assertIn('`gh pr create --base main --head taskq-1 --title "<title>" --body "<summary>"`', prompt)
         self.assertIn('--sha <PR head full SHA>', prompt)
         self.assertIn('`git fetch origin && git rebase origin/main`, run the tests', prompt)  # #334: up to date before result
+        self.assertIn('taskq.md` first and do only what it allows (R13)', prompt)  # #505: spec first
         taskq.CONFIG['board'] = 'gitlab'
         self.assertIn('`glab mr create --yes --target-branch main --source-branch taskq-1', taskq.brief(item, 'claude'))
         taskq.CONFIG['publish'] = 'direct'
@@ -754,7 +755,7 @@ class Contract(Base):
         out = self.run_cli('pm')
         digest = taskq.contract()
         self.assertTrue(out.startswith(f'taskq pm contract {digest}\n'))
-        for part in ('### R6. Human report', '## 7. Manager', '### After each pass', '### Take requests', 'run_in_background'):
+        for part in ('### R6. Human report', '### R13. Spec first', '## 7. Manager', '### After each pass', '### Take requests', 'run_in_background'):
             self.assertIn(part, out)
         self.assertNotIn('## 8. Runtimes', out)
         self.assertEqual(json.loads((self.root / '.taskq' / 'pm.json').read_text()), {'contract': digest})
@@ -943,8 +944,9 @@ class Model(Base):
     def test_contract_keeps_principles(self):
         # #311: a rewrite of taskq.md must not drop a principle silently (change rule: amend, never overwrite)
         text = (ROOT / 'taskq.md').read_text()
-        self.assertEqual(re.findall(r'^### (R\d+)\. ', text, re.M), [f'R{n}' for n in range(1, 13)])
+        self.assertEqual(re.findall(r'^### (R\d+)\. ', text, re.M), [f'R{n}' for n in range(1, 14)])
         self.assertIn('\n### Change rule\n', text)
+        self.assertIn('\n## Product\n', text)  # #505: product decisions live here
 
 
 FILE_BOARD = '''import json, pathlib

@@ -919,6 +919,68 @@ class Acting(unittest.TestCase):
             multiproject.complete_record(run, {**actual, 'errors': ['é' * 600_000]}, *loaded, binding, '')
         self.assertIn('is empty', multiproject.recover(run, policy)['errors'][0])  # never partial output
 
+    def tree(self):
+        """Every path under the fixture's state folder with its inode, mode and bytes: any write shows."""
+        return {str(path.relative_to(self.dir)): (path.lstat().st_ino, path.lstat().st_mode,
+                                                  path.read_bytes() if path.is_file() and not path.is_symlink() else None)
+                for path in [self.dir / 'taskq', *(self.dir / 'taskq').rglob('*')] if os.path.lexists(path)}
+
+    def test_recovery_locks_the_existing_guard_read_only_and_never_recreates_missing_state(self):
+        policy = self.catalog(self.alpha, {**self.beta, 'limits': {'claude': 1}})
+        run = self.act([self.beta], policy)['projects'][0]['run_id']
+        native = len(self.calls('native'))
+        aside = self.dir / 'guard-aside'
+        refusals = []
+
+        def unknown(why):
+            before = self.tree()
+            found = multiproject.recover(run, policy)
+            self.assertEqual((found['status'], found['output'], found['received_applied']), ('unknown', None, 'unknown'), why)
+            self.assertEqual(self.tree(), before, why)  # no folder, file, inode, mode or byte changed
+            refusals.append(found['errors'][0])
+        self.guard.rename(aside)
+        unknown('missing guard')
+        self.assertFalse(os.path.lexists(self.guard))
+        self.guard.symlink_to(aside)
+        unknown('symlinked guard')
+        self.assertTrue(self.guard.is_symlink())
+        self.guard.unlink()
+        aside.rename(self.guard)
+        os.chmod(self.guard, 0o666)
+        unknown('guard writable by others')
+        os.chmod(self.guard, 0o600)
+        os.chmod(self.guard.parent, 0o775)
+        unknown('guard folder writable by the group')
+        os.chmod(self.guard.parent, 0o700)
+        real = os.getuid()
+        with patch.object(multiproject.os, 'getuid', lambda: real + 1):
+            unknown('another OS user')
+        self.assertIn('No such file', refusals[0])
+        self.assertIn('Too many levels of symbolic links', refusals[1])
+        self.assertIn('alone; refused', refusals[2])
+        state = self.dir / 'taskq'
+        state.rename(self.dir / 'state-aside')  # the guard's folder and every record gone
+        found = multiproject.recover(run, policy)
+        self.assertEqual((found['status'], found['output'], os.path.lexists(state)), ('unknown', None, False))
+        with self.assertRaises(FileNotFoundError):  # the read-only lock itself creates no folder either
+            multiproject.guard({'os_user': os.getuid()}, create=False)
+        self.assertFalse(os.path.lexists(state))
+        (self.dir / 'state-aside').rename(state)
+        # Recovery holds the guard through its fresh readback: a racing actor is refused, no native call.
+        reader, raced = multiproject.read_occupancy, []
+
+        def racing(binding, errors):
+            if not raced:
+                raced.append(self.act([self.alpha], policy)['projects'][0])
+            return reader(binding, errors)
+        with patch.object(multiproject, 'read_occupancy', racing):
+            found = multiproject.recover(run, policy)
+        self.assertEqual((found['status'], found['received_applied']), ('recovered', 'unknown'), found['errors'])
+        self.assertEqual(raced[0]['status'], 'refused')
+        self.assertIn('host guard held', raced[0]['errors'][0])
+        self.assertEqual(len(self.calls('native')), native)
+        self.assertEqual(multiproject.guard_free({'os_user': os.getuid()}), None)  # released at its end
+
     def test_record_limit_refuses_the_next_actor_before_native_mutation_and_deletes_nothing(self):
         policy = self.catalog(self.alpha, {**self.beta, 'limits': {'claude': 1}})
         self.records.mkdir(mode=0o700)

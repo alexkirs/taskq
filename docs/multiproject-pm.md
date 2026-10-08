@@ -176,11 +176,11 @@ Each actor gets one output record: `multiproject-output/<run-id>.json` beside th
 python -m taskq.multiproject --recover-actor-output RUN_ID --execution-policy POLICY --json
 ```
 
-Recovery is read only. It never calls the native pass, `tick`, `take`, `spawn`, `release` or enrollment, and never replays an action. Its statuses:
+Recovery is read only. It never calls the native pass, `tick`, `take`, `spawn`, `release` or enrollment, and never replays an action. It creates, changes and removes no folder or file, the guard included. It locks the existing guard file read only: no symlink, a regular file and folder of the policy's OS user alone. It holds that lock through the record check and the fresh readback, so no actor starts while it qualifies. A missing or invalid guard, folder or domain gives `unknown`; the guard is never recreated. Its statuses:
 
 | status | meaning |
 |---|---|
-| `pending` | the host guard is held: an actor still runs, its record is not final |
+| `pending` | the host guard is held: an actor (or another pass) still runs, its record is not final |
 | `unknown` | no exact completed record. The record is missing, empty (still running, crashed or cut off), a symlink, of another owner or mode, oversized, truncated or off-shape. Or one field fails the check below |
 | `refused` | the record matches, but the fresh read-only readback of every anchored binding is not known, or the inventory of a runtime the binding may start or holds is unreadable |
 | `recovered` | `output` is the actor's actual result, exactly as recorded |
@@ -191,7 +191,7 @@ A record qualifies only when every field passes. Any missing, extra, mistyped or
 - the policy and binding SHA-256 of the anchored catalog, an `act = true` binding with its repository; the OS user (an integer, this process's and the policy's); the machine;
 - `actor` exactly `{pid}`, a positive integer; diagnostics a string of at most 64 KiB stored;
 - `result` exactly its keys, a known status, string errors, at most 1 MiB stored;
-- the guard: its path, device, inode, pid (the actor's) and OS-user domain equal the guard file's stable identity now. No guard is valid only for a refusal before admission, with no budget, readback or native output;
+- the guard: its path, device, inode, pid (the actor's) and OS-user domain equal the stable identity of the guard file recovery holds locked. No guard is valid only for a refusal before admission, with no budget, readback or native output;
 - `refused`: nothing native; `blocked` and `failed`: a native outcome; `ok` and `judgement_needed`: a native outcome and a complete v1 report that `validate_report` passes as of `completed_at`. A success without its report is never recovered.
 
 The policy must equal the accepted anchor. Guard release or a fresh readback alone never makes output `recovered`: only the exact completed record does. `received_applied` is always `unknown`. Output that was lost before this change, such as a wrapper timeout with no record, stays unknown. Nothing is rerun to rebuild it.

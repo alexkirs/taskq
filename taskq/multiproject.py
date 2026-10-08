@@ -335,21 +335,27 @@ def guard_path():
     return core.UPDATE_STAMP.parent / 'multiproject-acting.lock'
 
 
-def guard(policy):
+class GuardHeld(SystemExit):
+    """Another process holds the host guard."""
+
+
+def guard(policy, create=True):
     """Lock the host guard for this process: (fd, stat). The fd is close-on-exec and never passed on, so a spawned
     worker holds nothing; the OS frees the lock when this process ends, a crash included; the file is never deleted
-    or replaced. Outside the catalog's one verified OS-user domain, or without flock, refused: nothing is widened."""
+    or replaced. Outside the catalog's one verified OS-user domain, or without flock, refused: nothing is widened.
+    `create=False`, read only: lock the existing guard only, through no symlink; no folder or file is created."""
     if os.name != 'posix':
         raise SystemExit('host guard: only POSIX flock is qualified; this platform is refused')
     import fcntl
     uid, path = os.getuid(), guard_path()
     if uid != policy['os_user']:
         raise SystemExit(f"host guard: OS user {uid} is outside the catalog's verified domain {policy['os_user']}; refused, no permission changed")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    folder = path.parent.stat()
-    if folder.st_uid != uid or folder.st_mode & 0o022:
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    folder = path.parent.stat() if create else os.lstat(path.parent)
+    if not stat.S_ISDIR(folder.st_mode) or folder.st_uid != uid or folder.st_mode & 0o022:
         raise SystemExit(f"host guard: {path.parent} is not OS user {uid}'s alone; refused, no permission changed")
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    fd = os.open(path, (os.O_RDWR | os.O_CREAT if create else os.O_RDONLY) | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
         held = os.fstat(fd)
         if not stat.S_ISREG(held.st_mode) or held.st_uid != uid or held.st_mode & 0o022:
@@ -357,7 +363,7 @@ def guard(policy):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise SystemExit('host guard held: an acting pass of this host is running') from None
+            raise GuardHeld('host guard held: an acting pass of this host is running') from None
         found = os.stat(path, follow_symlinks=False)
         if (found.st_dev, found.st_ino) != (held.st_dev, held.st_ino):
             raise SystemExit(f'host guard: {path} was replaced; refused')
@@ -992,9 +998,9 @@ def guard_domain(policy):
     return f'OS user {policy["os_user"]} only; no host-global capacity is claimed'
 
 
-def qualified(record, run, policy, catalog):
+def qualified(record, run, policy, catalog, held):
     """(binding, output) of a completed record whose every field matches exactly: schema, types, ranges, bounds,
-    run, policy, binding, domain, actor and the guard's full stable identity. SystemExit naming the first mismatch:
+    run, policy, binding, domain, actor and the full stable identity of the guard `held` locked now. SystemExit naming the first mismatch:
     its output stays unknown. `ok` and `judgement_needed` need a native outcome and a v1 report valid as of
     completion; no guard only for a refusal before admission, with nothing native."""
     def need(ok, what):
@@ -1026,7 +1032,6 @@ def qualified(record, run, policy, catalog):
         need(status == 'refused' and all(result[key] is None for key in ('budget', 'catalog', 'native', 'report')),
              'guard: only a refusal before admission has none')
     else:
-        held = os.stat(guard_path(), follow_symlinks=False)
         need(isinstance(guarded, dict) and whole(guarded.get('device')) and whole(guarded.get('inode'), 1) and guarded == {
             'path': str(guard_path()), 'device': held.st_dev, 'inode': held.st_ino, 'pid': actor['pid'], 'domain': guard_domain(policy)}, 'guard')
     if status == 'refused':
@@ -1043,32 +1048,46 @@ def qualified(record, run, policy, catalog):
 def recover(run, policy_path):
     """`--recover-actor-output`: the actual output of one actor run, read only. Pending while the guard is held;
     unknown without its exact completed record; refused while fresh catalog ownership or a needed inventory is
-    unknown. It never runs a native pass, tick, take, spawn, release or enrollment, and never infers a receipt."""
+    unknown. It never runs a native pass, tick, take, spawn, release or enrollment, and never infers a receipt.
+    It locks the existing guard read only, and holds it through every check: no actor starts while it qualifies,
+    and a missing or invalid guard is unknown, never recreated."""
     result = {'run_id': run, 'status': 'unknown', 'errors': [], 'record': None, 'completed_at': None, 'output': None,
               'received_applied': 'unknown'}
     try:
-        result['record'] = str(record_path(run))
         policy, catalog = load_policy(policy_path)
         anchored(policy, catalog)
-        if held := guard_free(policy):  # an actor still runs: its record is not final yet
-            return {**result, 'status': 'pending', 'errors': [held]}
-        record = read_record(run)
         try:
-            binding, output = qualified(record, run, policy, catalog)
-        except (KeyError, TypeError, AttributeError, ValueError, OSError) as error:
-            raise SystemExit(f'record does not match its schema ({type(error).__name__}: {error}): output unknown') from None
-        reads = [checked_read(read_occupancy(other, errors)) for other, errors in catalog]
-        own = next(read for (other, _), read in zip(catalog, reads) if other is binding)
-        errors = [f'{project_result(other, errors)["repository"]}: {read["status"]} ({"; ".join(read.get("errors", []))})'
-                  for (other, errors), read in zip(catalog, reads) if read['status'] != 'ok']
-        inventory = {'claude': lambda: claude_inventory(claude_rows()), 'codex': lambda: codex_inventory(codex_threads())}
-        errors += [f'{runtime} inventory unknown' for runtime in CAPS
-                   if (binding['limits'].get(runtime, 0) or (own.get('L') or {}).get(runtime, 0)) and inventory[runtime]() is None]
-        if errors:
-            return {**result, 'status': 'refused', 'errors': ['fresh readback unknown, recovery not qualified: ' + ', '.join(errors)]}
-        return {**result, 'status': 'recovered', 'completed_at': record['completed_at'], 'output': output}
+            fd, held = guard(policy, create=False)
+        except GuardHeld as error:  # an actor still runs: its record is not final yet
+            return {**result, 'status': 'pending', 'errors': [str(error)]}
+        except OSError as error:
+            raise SystemExit(f'host guard: {error}; nothing created') from None
+        try:
+            return qualify(result, run, policy, catalog, held)
+        finally:
+            os.close(fd)
     except (SystemExit, OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         return {**result, 'errors': [str(error)]}
+
+
+def qualify(result, run, policy, catalog, held):
+    """`recover` under its read-only guard lock: the record, then the fresh readback."""
+    result['record'] = str(record_path(run))
+    record = read_record(run)
+    try:
+        binding, output = qualified(record, run, policy, catalog, held)
+    except (KeyError, TypeError, AttributeError, ValueError, OSError) as error:
+        raise SystemExit(f'record does not match its schema ({type(error).__name__}: {error}): output unknown') from None
+    reads = [checked_read(read_occupancy(other, errors)) for other, errors in catalog]
+    own = next(read for (other, _), read in zip(catalog, reads) if other is binding)
+    errors = [f'{project_result(other, errors)["repository"]}: {read["status"]} ({"; ".join(read.get("errors", []))})'
+              for (other, errors), read in zip(catalog, reads) if read['status'] != 'ok']
+    inventory = {'claude': lambda: claude_inventory(claude_rows()), 'codex': lambda: codex_inventory(codex_threads())}
+    errors += [f'{runtime} inventory unknown' for runtime in CAPS
+               if (binding['limits'].get(runtime, 0) or (own.get('L') or {}).get(runtime, 0)) and inventory[runtime]() is None]
+    if errors:
+        return {**result, 'status': 'refused', 'errors': ['fresh readback unknown, recovery not qualified: ' + ', '.join(errors)]}
+    return {**result, 'status': 'recovered', 'completed_at': record['completed_at'], 'output': output}
 
 
 def act(manifest, policy_path, actor=None):

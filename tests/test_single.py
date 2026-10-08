@@ -169,16 +169,34 @@ class PullRequests(Base):
         self.run_cli('take', '1')
         self.run_cli('result', '1', '--sha', 'a' * 40)
         self.calls, self.prs, self.merged = [], [{'number': 7, 'headRefOid': 'a' * 40, 'baseRefName': 'main'}], True
+        self.made = {'parents': [{'sha': 'a' * 40}, {'sha': 'e' * 40}], 'committer': {'login': 'web-flow'}, 'commit': {'verification': {'verified': True}}}
+        self.behind, self.updated, self.checks = 0, True, {'a' * 40: [[('completed', 'success')]], 'd' * 40: [[('completed', 'success')]]}
 
     def cli(self, command, **_):
         self.calls.append(command[1:])
+        if command[1] == 'api':  # the 'tests' gate (#308): compare, the PR head, check runs per SHA
+            path, head = command[4], 'd' * 40 if ['pr', 'update-branch', '7', '-R', 'o/r'] in self.calls and self.updated else 'a' * 40
+            out = {'behind_by': self.behind * path.endswith('...' + 'a' * 40)} if '/compare/' in path else {'head': {'sha': head}} if '/pulls/' in path \
+                else self.made if path.endswith('/commits/' + 'd' * 40) else \
+                {'check_runs': [{'status': status, 'conclusion': conclusion} for status, conclusion in self.poll(path.split('/')[4])]}
+            return subprocess.CompletedProcess(command, 0, json.dumps(out), '')
+        if command[2] == 'update-branch':
+            return subprocess.CompletedProcess(command, int(not self.updated), '', 'merge conflict')
         verb = command[2]
         out = {'list': json.dumps(self.prs), 'view': json.dumps({'state': 'MERGED' if self.merged else 'OPEN', 'mergeCommit': {'oid': 'c' * 40}})}
         return subprocess.CompletedProcess(command, int(verb == 'merge' and not self.merged), out.get(verb, ''), 'Pull request is not mergeable')
 
+    def poll(self, sha):  # one poll of the check runs on sha: the polls in order, the last one repeats
+        polls = self.checks[sha]
+        return polls.pop(0) if len(polls) > 1 else polls[0]
+
     def close(self):
-        with mock.patch.object(taskq.subprocess, 'run', side_effect=self.cli), mock.patch.object(taskq.shutil, 'which', side_effect=lambda name: name):
+        with mock.patch.object(taskq.subprocess, 'run', side_effect=self.cli), mock.patch.object(taskq.shutil, 'which', side_effect=lambda name: name), \
+                mock.patch.object(taskq.time, 'sleep'):
             return self.run_cli('close', '1')
+
+    def merges(self):
+        return [call for call in self.calls if call[:2] == ['pr', 'merge']]
 
     def test_brief(self):
         item = self.task(1)
@@ -193,7 +211,8 @@ class PullRequests(Base):
 
     def test_close_merges(self):
         self.assertEqual(self.close(), '#1 closed\n')
-        self.assertEqual(self.calls[1], ['pr', 'merge', '7', '--squash', '--delete-branch', '--match-head-commit', 'a' * 40, '-R', 'o/r'])
+        self.assertEqual(self.merges(), [['pr', 'merge', '7', '--squash', '--delete-branch', '--match-head-commit', 'a' * 40, '-R', 'o/r']])
+        self.assertIn(['api', '-X', 'GET', f'repos/o/r/commits/{"a" * 40}/check-runs?check_name=tests'], self.calls)
         self.assertEqual(self.board.issues[1]['state'], 'closed')
         self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\nmerged {"c" * 40}')
 
@@ -204,6 +223,42 @@ class PullRequests(Base):
                 self.close()
             self.prs[0].update(headRefOid='a' * 40, baseRefName='main')
         self.assertEqual((self.task(1)['state'], [call[1] for call in self.calls]), ('review', ['list', 'list']))
+
+    def test_waits_for_tests(self):
+        self.checks['a' * 40] = [[], [('queued', None)], [('completed', 'success'), ('in_progress', None)], [('completed', 'success')]]
+        self.close()
+        self.assertEqual((len(self.merges()), self.board.issues[1]['state']), (1, 'closed'))
+        self.assertEqual(sum('check-runs' in call[3] for call in self.calls if call[0] == 'api'), 4)
+
+    def test_failed_tests_requeue(self):
+        self.checks['a' * 40] = [[('completed', 'failure')]]
+        with self.assertRaisesRegex(SystemExit, f'PR 7 check tests failed on {"a" * 40}'):
+            self.close()
+        self.assertEqual((self.task(1)['state'], self.merges()), ('ready', []))
+
+    def test_out_of_date_is_updated_then_merged_at_new_head(self):
+        self.behind = 2
+        self.close()
+        self.assertEqual(self.merges()[0][-3:], ['d' * 40, '-R', 'o/r'])
+        self.assertIn(['api', '-X', 'GET', f'repos/o/r/commits/{"d" * 40}/check-runs?check_name=tests'], self.calls)
+
+    def test_out_of_date_new_head_fails_tests(self):
+        self.behind, self.checks['d' * 40] = 1, [[('completed', 'failure')]]
+        with self.assertRaisesRegex(SystemExit, 'check tests failed'):
+            self.close()
+        self.assertEqual((self.task(1)['state'], self.merges()), ('ready', []))
+
+    def test_out_of_date_new_head_must_be_githubs_update(self):
+        self.behind, self.made['parents'][0]['sha'] = 1, 'f' * 40  # a push between the update and the read
+        with self.assertRaisesRegex(SystemExit, f'new head {"d" * 40} is not the update of {"a" * 40} with main'):
+            self.close()
+        self.assertEqual((self.task(1)['state'], self.merges()), ('ready', []))
+
+    def test_out_of_date_conflict_requeues(self):
+        self.behind, self.updated = 1, False
+        with self.assertRaisesRegex(SystemExit, 'PR 7 did not update: merge conflict'):
+            self.close()
+        self.assertEqual((self.task(1)['state'], self.merges()), ('ready', []))
 
     def test_refusal_requeues(self):
         self.merged = False

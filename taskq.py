@@ -14,6 +14,7 @@ PREFIX, RUN, ON = 'q-', 'run-', 'host-'
 BLOCK = re.compile(r'<!-- taskq:start -->\s*```json\n(.*?)\n```\s*<!-- taskq:end -->', re.S)
 SESSIONS = {'claude': 'CLAUDE_CODE_SESSION_ID', 'codex': 'CODEX_THREAD_ID'}
 CONFIG, BOARD = {}, None  # set by main, or by a test
+CHECK_POLLS, CHECK_PAUSE = 60, 10  # pr-mode close waits up to 10 min for the 'tests' check
 
 def fail(message):
     sys.exit(f'taskq: {message}')
@@ -370,6 +371,7 @@ def commit(sha):
 
 def merge(current, sha):
     """pr mode: squash-merge the one open PR/MR of branch taskq-<N> into main at the result SHA: the merge commit, None with no PR.
+    GitHub (#308): a PR behind main is updated first; it merges only once the 'tests' check passes on the head it merges.
     A PR that does not merge (conflict, failing checks) goes back to the worker: requeue with the platform's message."""
     lab, host, branch = CONFIG['board'] == 'gitlab', CONFIG.get('host'), f'taskq-{current["iid"]}'
     where = ['-R', (f'https://{host}/' if lab else f'{host}/') * bool(host) + CONFIG['repo']]  # gh takes HOST/OWNER/REPO, glab a URL
@@ -383,13 +385,41 @@ def merge(current, sha):
     if found != [(found and found[0][0], sha, 'main')]:  # exactly one, into main, at the full result SHA
         return found and fail(f'{branch}: open PRs (number, head, base) {found} do not match the result {sha} into main')
     number, head, _ = found[0]
+
+    def back(why):
+        move(current, 'ready', 'requeue', f'close: PR {number} {why}', claim=None, result=None)
+        fail(f'#{current["iid"]}: PR {number} {why}')
+    if not lab:  # #308: main requires a strict 'tests' check; merge only a head that is up to date and green
+        api = lambda path: run_api('gh', host, 'GET', f'repos/{CONFIG["repo"]}/{path}')
+        if api(f'compare/main...{head}')['behind_by']:
+            code, out = cli('gh', 'pr', 'update-branch', number)
+            code and back(f'did not update: {out}')
+            for _ in range(CHECK_POLLS):  # the update is async: wait for the new head
+                if (head := api(f'pulls/{number}')['head']['sha']) != sha:
+                    break
+                time.sleep(CHECK_PAUSE)
+            else:
+                back('did not update: head unchanged')
+            made = api(f'commits/{head}')  # pin: GitHub's merge of the result and main, nothing pushed in between
+            parents = [parent['sha'] for parent in made['parents']]
+            if not (len(parents) == 2 and parents[0] == sha and (made['committer'] or {}).get('login') == 'web-flow'
+                    and made['commit']['verification']['verified'] and api(f'compare/{parents[1]}...main')['behind_by'] == 0):
+                back(f'new head {head} is not the update of {sha} with main')
+        for _ in range(CHECK_POLLS):  # ponytail: fixed poll; tests.yml takes 8-13 s
+            runs = api(f'commits/{head}/check-runs?check_name=tests')['check_runs']
+            if runs and all(run['status'] == 'completed' for run in runs):
+                if any(run['conclusion'] != 'success' for run in runs):
+                    back(f'check tests failed on {head}')
+                break
+            time.sleep(CHECK_PAUSE)
+        else:
+            back(f'check tests did not finish on {head}')
     _, out = cli(*(['glab', 'mr', 'merge', number, '--squash', '--remove-source-branch', '--sha', head, '--auto-merge=false', '--yes'] if lab
                    else ['gh', 'pr', 'merge', number, '--squash', '--delete-branch', '--match-head-commit', head]))
     code, viewed = cli(*(['glab', 'mr', 'view', number, '--output', 'json'] if lab else ['gh', 'pr', 'view', number, '--json', 'state,mergeCommit']))
     pr = {} if code else json.loads(viewed)
     if str(pr.get('state')).lower() != 'merged':  # read back: a merge that reported an error may still have merged
-        move(current, 'ready', 'requeue', f'close: PR {number} did not merge: {out}', claim=None, result=None)
-        fail(f'#{current["iid"]}: PR {number} did not merge: {out}')
+        back(f'did not merge: {out}')
     return pr.get('merge_commit_sha') or pr.get('squash_commit_sha') or pr['mergeCommit']['oid']
 
 def cleanup(current):

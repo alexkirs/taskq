@@ -297,7 +297,8 @@ class Codex:
 
     def exec(self, name, arguments, cwd):
         # Network on: a worker pushes and calls the board. `"codex": [...]` in taskq.json replaces these options.
-        options = CONFIG.get('codex', ['-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true'])
+        options = CONFIG.get('codex', ['-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true',
+                                       '--add-dir', str(CONFIG['root'] / '.git')])  # git fetch/commit write the main .git
         log, detach = self.folder() / f'{name.split()[0]}.log', {'creationflags': 0x208} if os.name == 'nt' else {'start_new_session': True}
         with open(log, 'ab') as out:  # detached: the worker outlives the tick
             process = subprocess.Popen([shutil.which('codex') or fail('codex not found'), 'exec', '--json', *options, *arguments],

@@ -210,6 +210,7 @@ class Claude:
     # #38, #51, #71: a worker gets only these tools, no MCP, no Chrome, and a pinned mode (else `auto` stops `taskq`).
     # `--tools` takes several values: a flag must follow it, never the prompt.
     TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'WebFetch', 'WebSearch']
+    names = r'T(\d+) [A-Z]{3} '  # worker_name; `taskq cleanup` widens it to the old `T<N> ` / `S<N> ` names
 
     def agents(self):
         """This machine's `claude --bg` sessions by session id, stopped ones too; None when the list cannot be read."""
@@ -264,7 +265,7 @@ class Claude:
         """`claude stop` + `claude rm`: duplicate spawns and resumes leave several jobs per task, and a stopped job stays listed (#360)."""
         claude = shutil.which('claude') or 'claude'
         for agent in (self.agents() or {}).values():
-            n = re.match(r'T(\d+) [A-Z]{3} ', agent.get('name') or '')  # worker_name: never the owner's own jobs
+            n = re.match(self.names, agent.get('name') or '')  # worker_name: never the owner's own jobs
             if not n or not gone(int(n[1])) or not agent.get('id') or self.running(agent) and not running:
                 continue
             if agent.get('pid'):
@@ -533,6 +534,134 @@ def retire(gone, why, running=True):
             getattr(runtime, 'retire', lambda *_: None)(gone, running)
         except Exception as error:
             print(f'{why}: {error}', file=sys.stderr)
+
+def open_prs():
+    """{branch: PR/MR number} of the open PRs of the repo, None when they cannot be read (a board file, no CLI)."""
+    lab, host = CONFIG['board'] == 'gitlab', CONFIG.get('host')
+    if CONFIG['board'] not in ('github', 'gitlab') or not shutil.which('glab' if lab else 'gh'):
+        return None
+    command = ['glab', 'mr', 'list', '--output', 'json', '-R', f'https://{host}/{CONFIG["repo"]}' if host else CONFIG['repo']] if lab else \
+        ['gh', 'pr', 'list', '--state', 'open', '--limit', '500', '--json', 'number,headRefName', '-R', f'{host}/{CONFIG["repo"]}' if host else CONFIG['repo']]
+    done = subprocess.run([shutil.which(command[0]), *command[1:]], capture_output=True, text=True, encoding='utf-8')
+    return None if done.returncode else {pr.get('source_branch', pr.get('headRefName')): pr.get('iid', pr.get('number')) for pr in json.loads(done.stdout)}
+
+def merged(git, ref):
+    """True: `ref` holds nothing origin/main lacks (an ancestor, or a squash-merged PR: merging it changes no file).
+    False: unmerged work. None: cannot tell (no origin/main, git older than 2.38)."""
+    if not git('merge-base', '--is-ancestor', ref, 'origin/main').returncode:
+        return True
+    tree, main = git('merge-tree', '--write-tree', 'origin/main', ref), git('rev-parse', 'origin/main^{tree}')
+    if tree.returncode > 1 or main.returncode:
+        return None
+    return not tree.returncode and tree.stdout.split()[:1] == [main.stdout.strip()]
+
+def cmd_cleanup(args):
+    """#476: on demand only. Remove this machine's leftovers of tasks not open: clean worktrees, branches with nothing
+    unmerged, taskq's own sessions, stale .taskq handles; print what was kept and why, then the queue mess.
+    Never --force; never unmerged work (R11). `workspace: external` (#477): worktrees and branches are not touched."""
+    root, dry, here, kinds = CONFIG['root'], args.dry_run, machine(), runtimes()
+    verb, removed, kept, mess = 'would remove' if args.dry_run else 'removed', [], [], []
+    items = list(filter(None, map(parse, BOARD.list(None))))
+    states = {item['iid']: 'open' for item in items}
+
+    def state(n):  # open, closed, or unknown (no such issue, a board error)
+        if n not in states:
+            try:
+                states[n] = BOARD.get(n)['state']
+            except (Exception, SystemExit):
+                states[n] = 'unknown'
+        return states[n]
+
+    def git(*argv):
+        return subprocess.run([shutil.which('git') or fail('git not found'), '-C', str(root), *argv], capture_output=True, text=True, encoding='utf-8')
+
+    def act(what, *command):  # one removal: done (or only printed with --dry-run), else kept with git's reason
+        done = None if dry else git(*command)
+        if done and done.returncode:
+            kept.append(f'{what}: {last_line(done.stderr + done.stdout)}')
+            return False
+        removed.append(f'{verb} {what}')
+        return True
+    task_of = lambda name: int(re.fullmatch(r'taskq-(\d+)', name)[1])
+    gone_trees = set()
+    if CONFIG.get('workspace') == 'external':
+        kept.append('worktrees and branches: workspace is external (#477)')
+    else:
+        git('fetch', '-q', 'origin')
+        dry or git('worktree', 'prune')
+        for tree in sorted((root / '.worktrees').glob('taskq-*'), key=lambda path: path.name):
+            if not re.fullmatch(r'taskq-\d+', tree.name) or not tree.is_dir():
+                continue
+            n, what = task_of(tree.name), f'worktree .worktrees/{tree.name}'
+            status = git('-C', str(tree), 'status', '--porcelain')
+            why = {'open': 'open task', 'unknown': 'unknown task'}.get(state(n)) or \
+                ('unknown' if status.returncode else 'dirty' if status.stdout.strip() else None)
+            if why:
+                kept.append(f'{what}: {why}')
+            elif act(what, 'worktree', 'remove', str(tree)):
+                gone_trees.add(tree.name)
+        listed = git('for-each-ref', '--format=%(refname)', 'refs/heads/taskq-*', 'refs/remotes/origin/taskq-*').stdout.split()
+        for ref in listed:
+            name = ref.rsplit('/', 1)[1]
+            if not re.fullmatch(r'taskq-\d+', name):
+                continue
+            local, n = ref.startswith('refs/heads/'), task_of(name)
+            what = f'branch {name}' if local else f'remote branch origin/{name}'
+            if state(n) == 'open':
+                kept.append(f'{what}: open task')
+                continue
+            if local and (root / '.worktrees' / name).is_dir() and name not in gone_trees:
+                kept.append(f'{what}: its worktree is kept')
+                continue
+            whole = merged(git, ref)
+            if whole:
+                act(what, *(['branch', '-D', name] if local else ['push', '-q', 'origin', '--delete', name]))
+            else:
+                kept.append(f'{what}: {"unknown" if whole is None else "unmerged commits"}')
+                mess.append(f'{what}: task #{n} is not open')
+    sessions = set()
+
+    def gone(n):  # records every taskq session of a closed task; --dry-run removes none
+        if state(n) == 'closed':
+            sessions.add(n)
+            return not dry
+        return False
+    for name, runtime in kinds.items():
+        if isinstance(runtime, Claude):
+            runtime.names = r'[TS](\d+) '  # old names too: `T<N> <title>`, the gone supervisor `S<N>`
+        try:
+            getattr(runtime, 'retire', lambda *_: None)(gone)
+        except Exception as error:
+            kept.append(f'{name} sessions: unknown ({error})')
+    removed += [f'{verb} sessions of #{n}' for n in sorted(sessions)]
+    for path in sorted((root / '.taskq').glob('*.pid')):
+        n = re.fullmatch(r'[TS](\d+)', path.stem)
+        pid = (path.read_text().split() or ['0'])[0]
+        if n and state(int(n[1])) == 'closed' and not (pid.isdigit() and pid_alive(int(pid))):
+            dry or path.unlink()
+            removed.append(f'{verb} .taskq/{path.name}')
+    wait = root / '.taskq' / 'wait.json'
+    seen = json.loads(wait.read_text('utf-8')) if wait.is_file() else {}
+    stale = [n for n in seen if not n.isdigit() or state(int(n)) != 'open']
+    if stale:
+        dry or wait.write_text(json.dumps({n: value for n, value in seen.items() if n not in stale}), 'utf-8')
+        removed.append(f'{verb} .taskq/wait.json entries {" ".join(f"#{n}" for n in stale)}')
+    prs = open_prs()
+    for item in items:
+        claim, n, sha = item['claim'] or {}, item['iid'], (item['result'] or {}).get('sha') or ''
+        if item['state'] == 'doing' and claim.get('name') == here and claim.get('runtime') in kinds \
+                and kinds[claim['runtime']].alive(claim['session']) is False:
+            mess.append(f'#{n} doing: session {claim["session"]} is gone')
+        if item['state'] == 'review' and CONFIG['publish'] == 'pr' and prs is not None and f'taskq-{n}' not in prs and not (
+                re.fullmatch('[0-9a-f]{7,40}', sha) and not git('merge-base', '--is-ancestor', sha, 'origin/main').returncode):  # an answer is on main
+            mess.append(f'#{n} review: no open PR')
+    for branch, number in sorted((prs or {}).items(), key=lambda pair: str(pair[0])):
+        found = re.fullmatch(r'taskq-(\d+)', branch or '')
+        if found and state(int(found[1])) != 'open':
+            mess.append(f'PR {number} ({branch}): task #{found[1]} is not open')
+    if prs is None:
+        mess.append('open PRs: unknown (no gh/glab or a board file)')
+    print('\n'.join([*removed, *(f'kept {line}' for line in kept), *(f'mess: {line}' for line in mess)]) or 'nothing to clean')
 
 def history(n):
     """The review notes a new worker must read: every requeue and answer since the last close, with the result they answer."""
@@ -806,6 +935,7 @@ def main(argv=None):
     command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}), n=False)
     command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}), n=False)
     command('pm', cmd_pm, n=False)
+    command('cleanup', cmd_cleanup, (('--dry-run',), {'action': 'store_true'}), n=False)
     args = parser.parse_args(argv)
     if BOARD is None:
         CONFIG = load_config()

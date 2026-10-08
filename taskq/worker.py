@@ -621,7 +621,7 @@ def publish_review(current, sha):
                     git('push', '-f', 'origin', f'{head}:refs/heads/{branch}')  # the branch stays the published commits
                     print(f'Rebased {sha[:7]} onto main as {head[:7]} (main moved since review).')
             finally:
-                git('worktree', 'remove', tree)
+                git('worktree', 'remove', '--force', tree)  # a failed rebase leaves it dirty
     except (subprocess.CalledProcessError, ValueError) as error:
         detail = core.last_line(error.stderr or error.stdout) if isinstance(error, subprocess.CalledProcessError) else str(error)
         core.fail(f'Publication refused: {detail}. Keep this review result and resolve the remote state before retrying close.')

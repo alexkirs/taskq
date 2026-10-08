@@ -361,7 +361,7 @@ class FakeRuntime:
 
     def retire(self, gone, running=True):
         for session, alive in list(self.sessions.items()):
-            if gone(int(session.removeprefix('s-T'))) and (running or not alive):
+            if gone(int(session.removeprefix('s-T')), session, alive) and (running or not alive):
                 self.stopped.append(session)
                 del self.sessions[session]
 
@@ -605,10 +605,10 @@ class Tick(Base):
             'c': {'id': 'jc', 'name': 'T6 CLD other (mac)', 'state': 'stopped'},
             'd': {'id': 'jd', 'name': 'T5 notes', 'state': 'stopped'}}  # the owner's own job
         with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:])):
-            claude.retire(lambda n: n == 5)
+            claude.retire(lambda n, *_: n == 5)
             self.assertEqual(calls, [['stop', 'ja'], ['rm', 'ja'], ['rm', 'jb']])
             calls.clear()
-            claude.retire(lambda n: n != 6, running=False)
+            claude.retire(lambda n, *_: n != 6, running=False)
             self.assertEqual(calls, [['rm', 'jb']])
 
     def test_codex_retire_archives_the_task_threads(self):
@@ -619,7 +619,7 @@ class Tick(Base):
                 (Path(folder) / '.taskq' / f'T{n}.pid').write_text(f'999999999 thread-{n}')
             calls = []
             with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:])):
-                taskq.Codex().retire(lambda n: n == 3)
+                taskq.Codex().retire(lambda n, *_: n == 3)
             self.assertEqual(calls, [['archive', 'thread-3']])
             self.assertEqual([path.name for path in (Path(folder) / '.taskq').iterdir()], ['T4.pid'])
 
@@ -769,7 +769,8 @@ class Cleanup(Base):
         self.git('push', '-q', 'origin', 'main')
         for n in (2, 3, 4, 5):
             self.board.issues[n]['state'] = 'closed'
-        self.fake.sessions.update({'s-T1': False, 's-T2': True})  # #1's worker died; #2's still runs
+        self.fake.sessions.update({'s-T1': False, 's-T2': True, 's-T3': False, 's-T4': False})  # #1's worker died; #2's still runs
+        self.board.issues[3]['comments'].append('**spawn** · fake:tick\n\nhttps://watch/s-T3')  # #478: recorded; s-T4: a name only
         (self.root / '.taskq' / 'S2.pid').write_text('999999999 old')
         (self.root / '.taskq' / 'wait.json').write_text('{"1": "doing", "2": "review"}')
 
@@ -791,15 +792,17 @@ class Cleanup(Base):
         self.assertEqual(out, [
             'removed worktree .worktrees/taskq-2',
             'removed branch taskq-2', 'removed branch taskq-5', 'removed remote branch origin/taskq-2',
-            'removed sessions of #2', 'removed .taskq/S2.pid', 'removed .taskq/wait.json entries #2',
+            'removed fake session s-T3 of #3', 'removed .taskq/S2.pid', 'removed .taskq/wait.json entries #2',
             'kept worktree .worktrees/taskq-1: open task', 'kept worktree .worktrees/taskq-3: dirty',
             'kept branch taskq-1: open task', 'kept branch taskq-3: its worktree is kept',
             'kept branch taskq-4: unmerged commits', 'kept remote branch origin/taskq-4: unmerged commits',
+            'kept fake session s-T1 of #1: open task', 'kept fake session s-T2 of #2: running',
+            'kept fake session s-T4 of #4: name only, not recorded on the board',
             'mess: branch taskq-4: task #4 is not open', 'mess: remote branch origin/taskq-4: task #4 is not open',
             'mess: #1 doing: session s-T1 is gone', 'mess: PR 12 (taskq-9): task #9 is not open'])
         self.assertEqual(self.state(), (['taskq-1', 'taskq-3'], [
             'refs/heads/main', 'refs/heads/taskq-1', 'refs/heads/taskq-3', 'refs/heads/taskq-4',
-            'refs/remotes/origin/main', 'refs/remotes/origin/taskq-4'], ['s-T1'], [], '{"1": "doing"}'))
+            'refs/remotes/origin/main', 'refs/remotes/origin/taskq-4'], ['s-T1', 's-T2', 's-T4'], [], '{"1": "doing"}'))
         after = self.state()
         self.assertEqual(self.cleanup(), out[7:])  # a second run removes nothing, keeps and reports the same
         self.assertEqual(self.state(), after)
@@ -807,20 +810,21 @@ class Cleanup(Base):
     def test_external_workspace_touches_no_worktree_or_branch(self):
         taskq.CONFIG['workspace'] = 'external'  # #477
         trees, refs = self.state()[:2]
-        self.assertIn('kept worktrees and branches: workspace is external (#477)', self.cleanup())
+        self.assertIn('kept worktrees and branches: owned by host (workspace: external)', self.cleanup())
         self.assertEqual(self.state()[:2], (trees, refs))
 
     def test_old_session_names_and_review_without_pr(self):
         claude = taskq.Claude()
-        claude.agents = lambda: {'a': {'id': 'ja', 'name': 'S2 supervisor', 'state': 'stopped'},
-                                 'b': {'id': 'jb', 'name': 'T3 old title', 'state': 'stopped'}}
+        claude.agents = lambda: {'a': {'id': 'ja', 'sessionId': 'a', 'name': 'S2 supervisor', 'state': 'stopped'},
+                                 'b': {'id': 'jb', 'sessionId': 'b1234567x', 'name': 'T3 old title', 'state': 'stopped'}}
+        self.board.issues[3]['comments'].append('**take** · claude:b1234567')
         taskq.CONFIG['publish'] = 'pr'
         with contextlib.redirect_stdout(io.StringIO()):
             taskq.move(self.task(1), 'review', 'result', result={'sha': 'f' * 40})
         with mock.patch.object(taskq, 'runtimes', return_value={'claude': claude}):
             out = self.cleanup('--dry-run')
-        self.assertIn('would remove sessions of #2', out)
-        self.assertIn('would remove sessions of #3', out)
+        self.assertIn('kept claude session a of #2: name only, not recorded on the board', out)
+        self.assertIn('would remove claude session b1234567x of #3', out)
         self.assertNotIn('mess: #1 review: no open PR', out)  # taskq-1 has PR 11
         taskq.open_prs.return_value = {}
         with mock.patch.object(taskq, 'runtimes', return_value={}):

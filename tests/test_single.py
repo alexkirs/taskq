@@ -45,7 +45,7 @@ class FakeBoard:
         self.issues[n]['state'] = 'closed'
 
 
-class Commands(unittest.TestCase):
+class Base(unittest.TestCase):
     def setUp(self):
         self.board = taskq.BOARD = FakeBoard()
         taskq.CONFIG = {'board': 'github', 'publish': 'direct', 'root': ROOT, 'hosts': {}}
@@ -65,6 +65,9 @@ class Commands(unittest.TestCase):
     def add(self, title='T', *extra):
         return self.run_cli('add', title, '--goal', 'g', '--acceptance', 'a', '--scope', 'x.py', *extra)
 
+
+
+class Commands(Base):
     def test_add_ready_or_waiting(self):
         self.assertEqual(self.add('one', '--runtime', 'claude', '--priority', '1'), '#1 ready\n')
         self.assertEqual(self.add('two', '--deps', '1'), '#2 waiting\n')
@@ -133,6 +136,92 @@ class Commands(unittest.TestCase):
         os.environ.pop('CLAUDE_CODE_SESSION_ID')
         with self.assertRaisesRegex(SystemExit, 'agent session'):
             self.run_cli('take', '1')
+
+
+class FakeRuntime:
+    """The four runtime functions over a dict: session -> alive."""
+
+    def __init__(self):
+        self.sessions, self.sent = {}, []
+
+    def spawn(self, name, prompt, cwd):
+        self.sessions[f's-{name}'] = True
+        self.prompt = prompt
+        return f's-{name}'
+
+    def send(self, session, text):
+        self.sent.append((session, text))
+        return session
+
+    def alive(self, session):
+        return self.sessions.get(session)
+
+    def link(self, session):
+        return f'https://watch/{session}'
+
+
+class Tick(Base):
+    def setUp(self):
+        super().setUp()
+        self.fake = FakeRuntime()
+        taskq.CONFIG.update(limits={'fake': 1}, repo='o/r')
+        patcher = mock.patch.object(taskq, 'runtimes', return_value={'fake': self.fake})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_spawn_one_per_free_slot(self):
+        self.add('one')
+        self.add('two')
+        self.add('elsewhere', '--host', 'win', '--priority', '1')
+        out = self.run_cli('tick')
+        self.assertEqual((self.task(1)['state'], self.task(1)['claim']), ('doing', {'runtime': 'fake', 'session': 's-T1', 'name': 'mac'}))
+        self.assertEqual((self.task(2)['state'], self.task(3)['state']), ('ready', 'ready'))
+        self.assertIn('task #1: one', self.fake.prompt)
+        self.assertIn('**spawn** · claude:01234567\n\nhttps://watch/s-T1', self.board.issues[1]['comments'])
+        self.assertIn('#1     doing    fake     https://watch/s-T1', out)
+        self.assertTrue(out.endswith('Board: https://github.com/o/r/issues\n'))
+        self.fake.sessions['s-T1'] = False  # the worker died: requeued, and the free slot runs it again first
+        self.run_cli('tick')
+        self.assertEqual([text.split(' ·')[0] for text in self.board.issues[1]['comments']], ['**add**', '**spawn**', '**requeue**', '**spawn**'])
+        self.assertIn('session s-T1 is gone', self.board.issues[1]['comments'][2])
+        self.assertEqual((self.task(1)['state'], self.task(2)['state']), ('doing', 'ready'))
+
+    def test_nudge_only_a_silent_worker(self):
+        self.add()
+        self.run_cli('tick')
+        self.board.issues[1]['updated_at'] = taskq.datetime.now(taskq.timezone.utc).isoformat()
+        self.run_cli('tick')
+        self.assertEqual(self.fake.sent, [])
+        self.board.issues[1]['updated_at'] = '2026-01-01T00:00:00Z'
+        self.run_cli('tick')
+        self.assertEqual(self.fake.sent, [('s-T1', 'continue: read your issue')])
+        self.assertTrue(self.board.issues[1]['comments'][-1].startswith('**nudge**'))
+        self.fake.sessions['s-T1'] = None  # cannot tell: left alone
+        self.run_cli('tick')
+        self.assertEqual((self.task(1)['state'], len(self.fake.sent)), ('doing', 1))
+
+    def test_waiting_becomes_ready_and_runs(self):
+        self.add('one')
+        self.add('two', '--deps', '1')
+        self.run_cli('later', '1')
+        self.board.issues[1]['state'] = 'closed'
+        self.run_cli('tick')
+        self.assertEqual(self.task(2)['state'], 'doing')
+        self.assertIn('**ready** · claude:01234567\n\ndependencies closed', self.board.issues[2]['comments'])
+        taskq.CONFIG['limits'] = {'fake': 0}
+        self.add('three')
+        self.assertNotIn('spawn', self.run_cli('tick'))
+
+    def test_codex_alive_from_pid_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            taskq.CONFIG['root'] = Path(folder)
+            codex = taskq.Codex()
+            (codex.folder() / 'T1.pid').write_text(f'{os.getpid()} thread-1')
+            dead = subprocess.Popen(['python3', '-c', ''])
+            dead.wait()
+            (codex.folder() / 'T2.pid').write_text(f'{dead.pid} thread-2')
+            self.assertEqual([codex.alive(s) for s in ('thread-1', 'thread-2', 'thread-3')], [True, False, None])
+            self.assertTrue(codex.link('thread-1').endswith('/open.html#codex://threads/thread-1'))
 
 
 class Model(unittest.TestCase):

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
-import argparse, importlib.util, json, os, re, shutil, socket, subprocess, sys
+import argparse, importlib.util, json, os, re, shutil, socket, subprocess, sys, time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -163,16 +164,144 @@ class GitLab(GitHub):
         self.api('PUT', f'issues/{n}', {'state_event': 'close'})
 
 
+def load_file(path, root=None):
+    """A board or runtime file (relative to the project root): its module-level functions are the protocol."""
+    spec = importlib.util.spec_from_file_location(f'taskq_{Path(path).stem}', (root or CONFIG['root']) / path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def make_board(config):
-    """`board`: github, gitlab, or a .py file (relative to the project root) with the six functions at module level."""
+    """`board`: github, gitlab, or a .py file with the six functions at module level."""
     kind = config['board']
     if kind.endswith('.py'):
-        spec = importlib.util.spec_from_file_location('taskq_board', config['root'] / kind)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+        return load_file(kind, config['root'])
     return {'github': GitHub, 'gitlab': GitLab}.get(kind, lambda *_: fail(f'unknown board {kind!r}'))(
         config['repo'], config.get('host'))
+
+
+# --- runtime --------------------------------------------------------------------------------
+# Four functions: spawn(name, prompt, cwd) -> session, send(session, text) -> session (a Claude resume may continue
+# under a new id), alive(session) -> True/False/None (running / gone / cannot tell), link(session) -> url or None.
+
+def worker_env():  # a worker must not inherit the tick's session id
+    return {key: value for key, value in os.environ.items() if key not in SESSIONS.values()}
+
+
+class Claude:
+    # #38, #51, #71: a worker gets only these tools, no MCP, no Chrome, and a pinned mode (else `auto` stops `taskq`).
+    # `--tools` takes several values: a flag must follow it, never the prompt.
+    TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'WebFetch', 'WebSearch']
+
+    def agents(self):
+        """This machine's `claude --bg` sessions by session id, stopped ones too; None when the list cannot be read."""
+        try:
+            done = subprocess.run([shutil.which('claude') or 'claude', 'agents', '--json', '--all'], capture_output=True, text=True, encoding='utf-8', timeout=60)
+            listed = json.loads(done.stdout) if not done.returncode else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        return {item['sessionId']: item for item in listed if isinstance(item, dict) and item.get('kind') == 'background'
+                and item.get('sessionId')} if isinstance(listed, list) else None
+
+    def start(self, arguments, cwd):
+        """`claude --bg ...`; it prints `backgrounded · <short id>`, `claude agents` gives the full one."""
+        done = subprocess.run([shutil.which('claude') or fail('claude not found'), '--bg', *arguments], cwd=cwd, env=worker_env(),
+                              capture_output=True, text=True, encoding='utf-8', timeout=120)
+        short = re.search(r'backgrounded · (\w+)', re.sub(r'\x1b\[[0-9;]*m', '', done.stdout))  # FORCE_COLOR colours it
+        if done.returncode or not short:
+            fail(f'claude could not start the session: {done.stderr.strip() or done.stdout.strip()}')
+        return next((sid for sid in self.agents() or {} if sid.startswith(short[1])), None) or fail(f'claude agents lacks {short[1]}')
+
+    def spawn(self, name, prompt, cwd):
+        mode = CONFIG.get('permission_mode', 'dontAsk')
+        settings = {'permissions': {'defaultMode': mode, 'allow': self.TOOLS}}  # dontAsk denies what is not allowed
+        return self.start(['--name', name, '--permission-mode', mode, '--tools', ','.join(self.TOOLS), '--strict-mcp-config',
+                           '--no-chrome', '--settings', json.dumps(settings), prompt], cwd)
+
+    def send(self, session, text):
+        """Stop the session, then resume it with the text. #284: a stopped session resumes under a new id."""
+        agent = (self.agents() or {}).get(session) or {}
+        if agent.get('pid'):
+            subprocess.run([shutil.which('claude') or 'claude', 'stop', agent['id']], capture_output=True, timeout=60)
+        return self.start(['--resume', session, text], agent.get('cwd') or CONFIG['root'])
+
+    def alive(self, session):
+        agent = (self.agents() or {}).get(session)
+        return None if agent is None else bool(agent.get('pid')) and agent.get('state') not in ('done', 'failed', 'stopped')
+
+    def link(self, session):
+        """The Remote Control URL: ~/.claude/jobs/<short>/state.json holds `bridgeSessionId` cse_<id> (#83)."""
+        try:
+            job = json.loads((Path.home() / '.claude' / 'jobs' / session[:8] / 'state.json').read_text('utf-8'))
+        except (OSError, ValueError):
+            return None
+        bridge = job.get('bridgeSessionId') if job.get('sessionId') == session else None
+        return bridge and 'https://claude.ai/code/session_' + re.sub('^(cse_|session_)', '', bridge)
+
+
+def pid_alive(pid):
+    if os.name != 'nt':
+        try:
+            os.kill(pid, 0)
+        except OSError as error:
+            return isinstance(error, PermissionError)  # someone else's process
+        return True
+    import ctypes  # Windows: os.kill(pid, 0) would terminate the process
+    handle, code = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid), ctypes.c_ulong()  # QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+    ctypes.windll.kernel32.CloseHandle(handle)
+    return code.value == 259  # STILL_ACTIVE
+
+
+class Codex:
+    """`codex exec`, headless: one process per turn, its JSONL in .taskq/<name>.log, `<pid> <thread>` in .taskq/<name>.pid."""
+
+    def folder(self):
+        (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
+        return CONFIG['root'] / '.taskq'
+
+    def exec(self, name, arguments, cwd):
+        # Network on: a worker pushes and calls the board. `"codex": [...]` in taskq.json replaces these options.
+        options = CONFIG.get('codex', ['-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true'])
+        log, detach = self.folder() / f'{name}.log', {'creationflags': 0x208} if os.name == 'nt' else {'start_new_session': True}
+        with open(log, 'ab') as out:  # detached: the worker outlives the tick
+            process = subprocess.Popen([shutil.which('codex') or fail('codex not found'), 'exec', '--json', *options, *arguments],
+                                       cwd=cwd, env=worker_env(), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
+        return process, log
+
+    def spawn(self, name, prompt, cwd):
+        process, log = self.exec(name, ['-C', str(cwd), prompt], cwd)
+        for _ in range(600):  # the first JSONL line, thread.started, carries the thread id
+            found = re.search(r'"thread_id":\s*"([\w-]+)"', log.read_text('utf-8', 'replace'))
+            if found or process.poll() is not None:
+                break
+            time.sleep(0.1)
+        found or fail(f'codex exec gave no thread id: see {log}')
+        (log.with_suffix('.pid')).write_text(f'{process.pid} {found[1]}')
+        return found[1]
+
+    def pid_file(self, session):
+        return next((path for path in self.folder().glob('*.pid') if path.read_text().split()[1:] == [session]), None)
+
+    def send(self, session, text):
+        process, log = self.exec(getattr(self.pid_file(session), 'stem', session), ['resume', session, text], CONFIG['root'])
+        log.with_suffix('.pid').write_text(f'{process.pid} {session}')
+        return session
+
+    def alive(self, session):
+        path = self.pid_file(session)
+        return None if path is None else pid_alive(int(path.read_text().split()[0]))
+
+    def link(self, session):
+        return f'{CONFIG.get("pages", "https://alexkirs.github.io/taskq/").rstrip("/")}/open.html#codex://threads/{session}'
+
+
+def runtimes():
+    """claude, codex, and each `"runtimes": {"name": "runtimes/name.py"}` file of taskq.json."""
+    return {'claude': Claude(), 'codex': Codex(), **{name: load_file(path) for name, path in CONFIG.get('runtimes', {}).items()}}
 
 
 # --- commands -------------------------------------------------------------------------------
@@ -258,6 +387,79 @@ def cmd_close(args):
     BOARD.close(args.n)
 
 
+def brief(item, runtime):
+    """The worker's prompt: the task, its workspace, the taskq commands it uses."""
+    n, root, tq = item['iid'], CONFIG['root'], f'python3 {Path(__file__).resolve()}'
+    return f'''You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
+Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
+
+{item["text"]}
+
+Expected paths: {", ".join(item["scope"] or []) or "none named"}. They say where the work is expected, not what is forbidden.
+
+Workspace: from {root} run `git fetch origin && git worktree add -b taskq-{n} .worktrees/taskq-{n} origin/main`, work only there,
+never in the main checkout. A task that ends in an answer, not a commit, needs no worktree. Commands:
+- A question only the owner can decide (a product choice, an action that cannot be undone): `{tq} ask {n} --text "<question>"`, then stop.
+- Cannot be done: `{tq} requeue {n} --text "<why>"`, then stop.
+- Deliver: commit, `git fetch origin && git rebase origin/main`, run the tests, `git push origin HEAD:main`, then
+  `{tq} result {n} --sha <pushed full SHA> --checks "<commands and outcome>" --text "<summary>"`, then stop.
+  An answer with no commit: the result names the current origin/main SHA and the text holds the answer.
+Everything written through taskq is public: no secrets, tokens or paths outside the repository.'''
+
+
+def age(item):
+    """Minutes since the issue last changed: a comment changes it too."""
+    changed = datetime.fromisoformat((item['updated_at'] or '').replace('Z', '+00:00'))
+    return (datetime.now(timezone.utc) - changed).total_seconds() / 60
+
+
+def cmd_tick(args):
+    """One pass: requeue dead workers, nudge silent ones, free waiting tasks, spawn ready ones, print the table."""
+    here, kinds = machine(), runtimes()
+    limits = CONFIG.get('limits') or {name: 1 for name in kinds}
+    items = sorted(filter(None, map(parse, BOARD.list(None))), key=lambda item: (item['priority'], item['iid']))
+    busy = {}
+    for item in items:
+        claim = item['claim'] or {}
+        if item['state'] == 'waiting' and not open_deps(item['deps']):
+            move(item, 'ready', 'ready', 'dependencies closed')
+            item['state'] = 'ready'
+        if item['state'] != 'doing' or claim.get('name') != here or claim.get('runtime') not in kinds:
+            continue  # another machine's, or a session no runtime here can see
+        runtime = kinds[claim['runtime']]
+        state = runtime.alive(claim['session'])
+        if state is False:
+            move(item, 'ready', 'requeue', f'session {claim["session"]} is gone', claim=None, result=None)
+            item.update(state='ready', claim=None)
+            continue
+        if state and age(item) >= 120:
+            claim = {**claim, 'session': runtime.send(claim['session'], 'continue: read your issue')}
+            move(item, 'doing', 'nudge', claim=claim)
+            item['claim'] = claim
+        busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
+    for item in items:
+        if item['state'] != 'ready' or item['host'] not in (None, here) or open_deps(item['deps']):
+            continue
+        names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
+        free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 1)), None)
+        if free:  # the tick claims it: the next tick sees the slot taken, the worker needs no `take`
+            session = kinds[free].spawn(f'T{item["iid"]}', brief(item, free), CONFIG['root'])
+            item['claim'] = {'runtime': free, 'session': session, 'name': here}
+            move(item, 'doing', 'spawn', kinds[free].link(session) or '', claim=item['claim'], result=None)
+            item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
+    print(f'{"Task":<6} {"State":<8} {"Runtime":<8} Session link')
+    for item in items:
+        claim = item['claim'] or {}
+        runtime = claim.get('runtime') or item['runtime']
+        url = kinds[runtime].link(claim['session']) if claim.get('session') and claim.get('name') == here and runtime in kinds else ''
+        print(f'#{item["iid"]:<5} {item["state"]:<8} {runtime:<8} {url or claim.get("session") or ""}')
+    host, repo = CONFIG.get('host'), CONFIG.get('repo')
+    url = CONFIG.get('board_url') or {'github': f'https://{host or "github.com"}/{repo}/issues',
+                                      'gitlab': f'https://{host or "gitlab.com"}/{repo}/-/issues'}.get(CONFIG['board'])
+    if url:  # a board file names its page in `board_url`
+        print(f'Board: {url}')
+
+
 def main(argv=None):
     global CONFIG, BOARD
     parser = argparse.ArgumentParser(prog='taskq')
@@ -285,6 +487,7 @@ def main(argv=None):
     command('requeue', cmd_move, text=True)
     command('later', cmd_move, text=True)
     command('close', cmd_close, text=True)
+    command('tick', cmd_tick, n=False)
     args = parser.parse_args(argv)
     if BOARD is None:
         CONFIG = load_config()

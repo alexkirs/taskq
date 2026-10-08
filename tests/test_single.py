@@ -435,6 +435,31 @@ class Tick(Base):
         self.add('three')
         self.assertNotIn('spawn', self.run_cli('tick'))
 
+    def test_assignee_starts_only_matching_tasks(self):
+        # #480: "assignee" set: tick starts, and tick/wait/list show, only tasks assigned to it; unassigned ones are skipped
+        self.board.user = lambda: 'alice'
+        taskq.CONFIG.update(assignee='me', limits={'fake': 3})
+        for title, people in (('nobody', []), ('other', ['bob']), ('mine', ['alice'])):
+            self.add(title)  # its event pass sees no assignee yet: starts nothing
+            self.board.issues[len(self.board.issues)]['assignees'] = people
+        out = self.run_cli('tick')
+        self.assertEqual([self.task(n)['state'] for n in (1, 2, 3)], ['ready', 'ready', 'doing'])
+        self.assertNotIn('#1 ', out)
+        self.assertEqual([line[:2] for line in self.run_cli('list').splitlines()], ['#3'])
+        self.run_cli('later', '1')
+        self.run_cli('result', '3', '--sha', 'a' * 40)
+        self.board.update(2, labels=['q-review'])
+        self.assertEqual(self.run_cli('wait', '--window', '0'), 'review #3\n')
+        taskq.CONFIG['assignee'] = 'bob'
+        self.run_cli('requeue', '3')
+        self.board.update(2, labels=['q-ready'])
+        self.run_cli('tick')
+        self.assertEqual([self.task(n)['state'] for n in (2, 3)], ['doing', 'ready'])
+        del taskq.CONFIG['assignee']  # unset: every task, as before
+        self.run_cli('requeue', '1')
+        self.run_cli('tick')
+        self.assertEqual([self.task(n)['state'] for n in (1, 2, 3)], ['doing', 'doing', 'doing'])
+
     def test_worker_name_has_task_launcher_title_machine(self):
         self.add()
         with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex'}):

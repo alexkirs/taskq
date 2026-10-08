@@ -63,7 +63,15 @@ def parse(issue):
             'runtime': next((label[len(RUN):] for label in labels if label.startswith(RUN)), 'any'),
             'host': next((label[len(ON):] for label in labels if label.startswith(ON)), None),
             'priority': min([int(label[9:]) for label in labels if re.fullmatch(r'priority-\d', label)] or [9]),
-            'updated_at': issue.get('updated_at'), 'url': issue.get('url'), 'text': BLOCK.sub('', issue['body']).strip()}
+            'updated_at': issue.get('updated_at'), 'url': issue.get('url'), 'text': BLOCK.sub('', issue['body']).strip(),
+            'assignees': issue.get('assignees') or []}
+
+def mine(item):
+    """#480: `"assignee"` in taskq.json, "me" (the board's user) or a login: only its tasks run here; unset: every task."""
+    wanted = CONFIG.get('assignee')
+    if wanted == 'me':
+        wanted = CONFIG['me'] = CONFIG.get('me') or BOARD.user()  # one board call per process
+    return not wanted or wanted in item['assignees']
 
 def block(text, fields):
     """The description: the task's text, then its JSON block. Keys the model does not know are kept as they are."""
@@ -72,7 +80,8 @@ def block(text, fields):
 
 # --- board ----------------------------------------------------------------------------------
 # Six functions: list(state), get(n), add(title, body, labels), update(n, labels=None, body=None), comment(n, text),
-# close(n). An issue is {iid, title, body, labels, state: open|closed, updated_at, url} and from get also comments.
+# close(n). An issue is {iid, title, body, labels, state: open|closed, updated_at, url, assignees} and from get also comments.
+# Optional seventh: user() -> the login "assignee": "me" stands for.
 
 def run_api(tool, host, method, path, body=None):
     command = [shutil.which(tool) or fail(f'{tool} not found'), 'api', '-X', method, path]
@@ -105,7 +114,11 @@ class GitHub:
     def issue(self, item):
         # An untrusted author's description is read as empty: never a task.
         return {'iid': item['number'], 'title': item['title'], 'body': self.trusted(item) and item.get('body') or '', 'url': item['html_url'],
-                'labels': [label['name'] for label in item['labels']], 'state': item['state'], 'updated_at': item['updated_at']}
+                'labels': [label['name'] for label in item['labels']], 'state': item['state'], 'updated_at': item['updated_at'],
+                'assignees': [user['login'] for user in item.get('assignees') or []]}
+
+    def user(self):
+        return run_api('gh', self.host, 'GET', 'user')['login']
 
     def list(self, state):
         query = 'issues?state=open' + (f'&labels={PREFIX}{state}' if state else '')
@@ -142,7 +155,10 @@ class GitLab(GitHub):
     def issue(self, item):
         return {'iid': item['iid'], 'title': item['title'], 'body': self.trusted(item) and item.get('description') or '', 'url': item['web_url'],
                 'labels': item['labels'], 'state': 'open' if item['state'] == 'opened' else 'closed',
-                'updated_at': item['updated_at']}
+                'updated_at': item['updated_at'], 'assignees': [user['username'] for user in item.get('assignees') or []]}
+
+    def user(self):
+        return run_api('glab', self.host, 'GET', 'user')['username']
 
     def list(self, state):
         query = 'issues?state=opened' + (f'&labels={PREFIX}{state}' if state else '')
@@ -383,7 +399,7 @@ def cmd_add(args):
     print(f'#{n} {state}')
 
 def cmd_list(args):
-    found = [item for item in map(parse, BOARD.list(args.state)) if item]
+    found = [item for item in map(parse, BOARD.list(args.state)) if item and mine(item)]
     for item in sorted(found, key=lambda item: (STATES.index(item['state']), item['priority'], item['iid'])):
         claim = item['claim'] or {}
         detail = {'ready': 'continue' if claim else '', 'later': item['raw'].get('waiting_for') or '',
@@ -619,7 +635,7 @@ def one_pass(args, table=True):
                 item['claim'] = claim
             busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
         for item in ready:
-            if item['state'] != 'ready' or item['host'] not in (None, here) or open_deps(item['deps']):
+            if item['state'] != 'ready' or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']):
                 continue
             names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
             free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 1)), None)
@@ -636,7 +652,7 @@ def one_pass(args, table=True):
     if not table:
         return held
     print(f'{"Task":<6} {"State":<8} {"Runtime":<8} Session link')
-    for item in items:
+    for item in filter(mine, items):
         claim = item['claim'] or {}
         runtime = claim.get('runtime') or item['runtime']
         url = kinds[runtime].link(claim['session']) if claim.get('session') and claim.get('name') == here and runtime in kinds else ''
@@ -679,7 +695,7 @@ def cmd_wait(args):
     end = time.time() + args.window * 60
     while True:
         now = {}
-        for item in filter(None, map(parse, BOARD.list(None))):
+        for item in filter(mine, filter(None, map(parse, BOARD.list(None)))):
             claim, state = item['claim'] or {}, item['state']
             if state == 'doing' and claim.get('name') == here and claim.get('runtime') in kinds \
                     and kinds[claim['runtime']].alive(claim['session']) is False:  # ponytail: one alive call per local worker per poll

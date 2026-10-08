@@ -154,9 +154,11 @@ application or completion.
 | `codex` | Options of `codex exec`, replacing the default; with `workspace: external` add `--add-dir` for the worktree and its git dir (the project instructions name them) | `-s workspace-write`, network on, `--add-dir <root>/.git` |
 | `pages` | Base URL of `open.html`, the Codex link page | `https://alexkirs.github.io/taskq/` |
 | `board_url` | Board link a board file prints in the tick | GitHub/GitLab issues page |
+| `assignee` | `"me"` (the board's logged-in user) or a login: `tick` starts, and `tick`/`wait`/`list` show, only tasks assigned to it; unassigned tasks are skipped (#480) | unset: every task |
 
 Board file: six module-level functions. An issue is a dict `{iid, title, body, labels, state: open|closed,
-updated_at, url}`; `get` adds `comments` (a list of strings, oldest first).
+updated_at, url}`, optionally `assignees` (logins); `get` adds `comments` (a list of strings, oldest first).
+With `"assignee": "me"` the file also needs `user()`: the current login.
 
 | Function | Does |
 |---|---|

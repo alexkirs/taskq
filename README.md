@@ -50,6 +50,7 @@ At the project root, commit a `taskq.json`:
 GitLab: `"board": "gitlab", "repo": "group/project"`, plus `"host"` when self-managed.
 `publish`: `direct` (workers push `main`) or `pr` (workers open a PR; `close` merges it).
 Add `.taskq/` and `.worktrees/` to `.gitignore`. Check with `taskq list`.
+Claude workers: run `claude` once in the project root and accept the folder trust prompt.
 
 ## Run
 

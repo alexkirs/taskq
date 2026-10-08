@@ -10,7 +10,8 @@ checkout: it reads the nearest `taskq.json` from the current directory up; that 
 1. python3 >= 3.9; `gh` (GitHub) or `glab` (GitLab) installed and logged in: `gh auth status` / `glab auth status`.
 2. `git clone https://github.com/alexkirs/taskq` anywhere; `taskq.py` is the only file it needs. Update: `git pull`.
 3. At the project root write `taskq.json` (fields: § 2) and commit it. Labels are created by the first `add`.
-4. Check: `taskq list` prints the queue (empty is fine) and no error.
+4. Check: `taskq list` prints the queue (empty is fine) and no error. Claude workers: run `claude` once in the
+   project root and accept the folder trust prompt (only the owner can); else every spawn fails `Workspace not trusted`.
 5. Another board or runtime: copy the GitHub class or the Claude class of `taskq.py` into `boards/<name>.py` or
    `runtimes/<name>.py` as module-level functions (§ 2), and name the file in `taskq.json`.
 
@@ -107,7 +108,9 @@ Runtime file: four module-level functions.
 | `taskq tick` | one pass of the queue on this machine (§ 7) |
 
 - `--sha`: 7 to 40 lowercase hex digits; give the full SHA.
-- `--runtime` default `any`; `--type` default `code`; `--priority` default 2.
+- `--runtime` default `any`; `--type` default `code`; `--priority` default 2. `--host` takes a machine name (§ 2 `hosts`).
+- `--acceptance` is required; for a `research` task it names what the answer must say.
+- `add` prints `#<N> <state>`; every state change prints the new state.
 - A command refuses a task in the wrong state and says which state it is in.
 - No `beat` or `problem` command: a progress note or a problem is a plain issue comment
   (`gh issue comment N --body "..."` / `glab issue note N -m "..."`).
@@ -151,7 +154,7 @@ Rules:
   a head that differs from the result SHA, or several PRs, refuses the close.
 - `pr` mode and no PR (an answer): `close` checks the SHA is on `origin/main`, as in `direct`.
 - `main` is always green: in `direct` mode the worker runs the tests before the push.
-- Review mode is workflow, not a security boundary: use protected branches for that.
+- `pr` mode is workflow, not a security boundary: use protected branches for that.
 
 ## 7. Manager
 
@@ -161,6 +164,8 @@ results and closes. It does no task work itself and never answers a worker's que
 ### Arm the tick
 
 - Claude: `/loop 5m python3 <taskq clone>/taskq.py tick`, from the project root.
+- Headless or no agent: any scheduler (cron, Windows Task Scheduler) that runs `taskq tick` in the project root
+  every 5 minutes; nobody reads the table then, so check `taskq list` yourself.
 - Codex: an automation every 5 minutes with the prompt "Run `python3 <taskq clone>/taskq.py tick` in
   `<project root>` and follow the table it prints."
 - One tick sender per machine. Any machine may tick; each starts only tasks with no `host-*` label or its own.
@@ -174,6 +179,9 @@ results and closes. It does no task work itself and never answers a worker's que
    `limits`) → `spawn(T<N>, brief, root)`, claim, `q-doing`, comment `spawn` with the session link.
 4. `ask`, `review`, `later`: nothing; they wait for the manager.
 5. Print the table `Task | State | Runtime | Session link`, then `Board: <url>`.
+
+A failure (a spawn that cannot start, a board error) stops the pass with `taskq: <error>` and exit 1, no table;
+the tasks it did not reach wait for the next pass. Fix the cause or tell the owner.
 
 ### After each pass
 

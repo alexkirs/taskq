@@ -358,6 +358,25 @@ class Tick(Base):
         self.assertIn('session s-T1 is gone', self.board.issues[1]['comments'][2])
         self.assertEqual((self.task(1)['state'], self.task(2)['state']), ('doing', 'ready'))
 
+    def test_two_passes_at_once_spawn_one_worker(self):
+        # #357 (R2): a tick runs while an event pass spawns; it finds the lock held and starts nothing
+        taskq.CONFIG['limits'] = {'fake': 2}
+        spawn, err = self.fake.spawn, io.StringIO()
+
+        def overlapping(*spawn_args):
+            with contextlib.redirect_stderr(err):
+                self.run_cli('tick')
+            return spawn(*spawn_args)
+        self.fake.spawn = overlapping
+        self.add('one')  # the add's pass spawns #1, and the tick runs at that moment
+        self.assertEqual(self.fake.names, ['T1 CLD one (mac)'])
+        self.assertIn('another pass is running', err.getvalue())
+        self.fake.spawn = spawn
+        stale = [dict(self.board.issues[1], labels=['q-ready'])]  # a list from before the spawn: the re-read sees #1 taken
+        with mock.patch.object(self.board, 'list', return_value=stale):
+            self.run_cli('tick')
+        self.assertEqual(self.fake.names, ['T1 CLD one (mac)'])
+
     def test_nudge_only_a_silent_worker(self):
         self.add()
         self.run_cli('tick')

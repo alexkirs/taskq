@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
-import argparse, importlib.util, json, os, re, shutil, socket, subprocess, sys, time
+import argparse, contextlib, importlib.util, json, os, re, shutil, socket, subprocess, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -504,43 +504,66 @@ def age(item):
     changed = datetime.fromisoformat((item['updated_at'] or '').replace('Z', '+00:00'))
     return (datetime.now(timezone.utc) - changed).total_seconds() / 60
 
+@contextlib.contextmanager
+def dispatch_lock():
+    """Yield True while this process holds .taskq/dispatch.lock, False when another does. Local exclusion, not task state."""
+    folder = CONFIG['root'] / '.taskq'
+    folder.mkdir(exist_ok=True)
+    with open(folder / 'dispatch.lock', 'a+') as handle:
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True  # closing the file (or the process exiting) releases the lock
+
 def cmd_tick(args, table=True):
     """One pass: requeue dead workers, nudge silent ones, free waiting tasks, spawn ready ones, print the table."""
     here, kinds = machine(), runtimes()
     limits = CONFIG.get('limits') or {name: 1 for name in kinds}
-    items = sorted(filter(None, map(parse, BOARD.list(None))), key=lambda item: (item['priority'], item['iid']))
-    busy = {}
-    for item in items:
-        claim = item['claim'] or {}
-        if item['state'] == 'waiting' and not open_deps(item['deps']):
-            move(item, 'ready', 'ready', 'dependencies closed')
-            item['state'] = 'ready'
-        if item['state'] != 'doing' or claim.get('name') != here or claim.get('runtime') not in kinds:
-            continue  # another machine's, or a session no runtime here can see
-        runtime = kinds[claim['runtime']]
-        state = runtime.alive(claim['session'])
-        if state is False:
-            move(item, 'ready', 'requeue', f'session {claim["session"]} is gone', claim=None, result=None)
-            item.update(state='ready', claim=None)
-            continue
-        last = (BOARD.get(item['iid'])['comments'] or [''])[-1] if state else ''
-        answer = last.partition('\n\n')[2] if last.startswith('**answer**') else None  # #307: an answer wakes the worker at once
-        if answer is not None or state and age(item) >= 120:
-            text = f'The owner answered your question:\n\n{answer}' if answer is not None else 'continue: read your issue'
-            claim = {**claim, 'session': runtime.send(claim['session'], text)}
-            move(item, 'doing', 'nudge', claim=claim)  # the nudge comment is now the last note: one send per answer
-            item['claim'] = claim
-        busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
-    for item in items:
-        if item['state'] != 'ready' or item['host'] not in (None, here) or open_deps(item['deps']):
-            continue
-        names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
-        free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 1)), None)
-        if free:  # the tick claims it: the next tick sees the slot taken, the worker needs no `take`
-            session = kinds[free].spawn(worker_name(item), brief(item, free), CONFIG['root'])
-            item['claim'] = {'runtime': free, 'session': session, 'name': here}
-            move(item, 'doing', 'spawn', kinds[free].link(session) or '', claim=item['claim'], result=None)
-            item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
+    with dispatch_lock() as held:  # #357 (R2): one pass at a time per checkout; the list is read under the lock
+        items = sorted(filter(None, map(parse, BOARD.list(None))), key=lambda item: (item['priority'], item['iid']))
+        if not held:  # another pass runs here now and starts what is ready
+            print('taskq: another pass is running; this one only prints the table', file=sys.stderr)
+        busy, ready = {}, items if held else []
+        for item in ready:
+            claim = item['claim'] or {}
+            if item['state'] == 'waiting' and not open_deps(item['deps']):
+                move(item, 'ready', 'ready', 'dependencies closed')
+                item['state'] = 'ready'
+            if item['state'] != 'doing' or claim.get('name') != here or claim.get('runtime') not in kinds:
+                continue  # another machine's, or a session no runtime here can see
+            runtime = kinds[claim['runtime']]
+            state = runtime.alive(claim['session'])
+            if state is False:
+                move(item, 'ready', 'requeue', f'session {claim["session"]} is gone', claim=None, result=None)
+                item.update(state='ready', claim=None)
+                continue
+            last = (BOARD.get(item['iid'])['comments'] or [''])[-1] if state else ''
+            answer = last.partition('\n\n')[2] if last.startswith('**answer**') else None  # #307: an answer wakes the worker at once
+            if answer is not None or state and age(item) >= 120:
+                text = f'The owner answered your question:\n\n{answer}' if answer is not None else 'continue: read your issue'
+                claim = {**claim, 'session': runtime.send(claim['session'], text)}
+                move(item, 'doing', 'nudge', claim=claim)  # the nudge comment is now the last note: one send per answer
+                item['claim'] = claim
+            busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
+        for item in ready:
+            if item['state'] != 'ready' or item['host'] not in (None, here) or open_deps(item['deps']):
+                continue
+            names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
+            free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 1)), None)
+            fresh = free and parse(BOARD.get(item['iid']))  # #357: the board may have moved since the list
+            if fresh and fresh['state'] == 'ready':  # the tick claims it: the next tick sees the slot taken, the worker needs no `take`
+                item.update(fresh)
+                session = kinds[free].spawn(worker_name(item), brief(item, free), CONFIG['root'])
+                item['claim'] = {'runtime': free, 'session': session, 'name': here}
+                move(item, 'doing', 'spawn', kinds[free].link(session) or '', claim=item['claim'], result=None)
+                item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
     if not table:
         return
     print(f'{"Task":<6} {"State":<8} {"Runtime":<8} Session link')

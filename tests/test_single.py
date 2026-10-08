@@ -605,7 +605,7 @@ class Contract(Base):
         out = self.run_cli('pm')
         digest = taskq.contract()
         self.assertTrue(out.startswith(f'taskq pm contract {digest}\n'))
-        for part in ('### R6. Human report', '## 7. Manager', '### After each pass', 'run_in_background'):
+        for part in ('### R6. Human report', '## 7. Manager', '### After each pass', '### Take requests', 'run_in_background'):
             self.assertIn(part, out)
         self.assertNotIn('## 8. Runtimes', out)
         self.assertEqual(json.loads((self.root / '.taskq' / 'pm.json').read_text()), {'contract': digest})

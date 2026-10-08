@@ -195,7 +195,7 @@ results and closes. It does no task work itself and never answers a worker's que
 2. `doing`, claimed on this machine: `alive` False → requeue (`session ... is gone`); alive and the issue unchanged
    for 120 minutes → `send(session, 'continue: read your issue')`, comment `nudge`.
 3. `ready`, deps closed, host matches, a free slot for its runtime (`run-*` label, else the first free in
-   `limits`) → `spawn(T<N>, brief, root)`, claim, `q-doing`, comment `spawn` (with the session link when the runtime has one yet).
+   `limits`) → `spawn(T<N> <ORCH> <title> (<machine>), brief, root)` (ORCH: CLD, CDX, DOT, HRM, GRK of the launcher, UNK from a shell), claim, `q-doing`, comment `spawn` (with the session link when the runtime has one yet).
 4. `ask`, `review`, `later`: nothing; they wait for the manager.
 5. Print the table `Task | State | Runtime | Session link` by priority, then number; then `Board: <url>`.
    Another machine's claim shows its bare session id: only that machine can link it.
@@ -242,7 +242,7 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 
 | Runtime | spawn | send | alive | link | stop |
 |---|---|---|---|---|---|
-| Claude | `claude --bg --name T<N>` in the project root; tools `Bash Read Edit Write Glob Grep WebFetch WebSearch`, no MCP, `--permission-mode dontAsk` | `claude stop`, then `claude --bg --resume <id> <text>` (a new id) | `claude agents --json --all` | Remote Control URL | `claude stop <job id>` |
+| Claude | `claude --bg --name "T<N> <ORCH> <title> (<machine>)"` in the project root; tools `Bash Read Edit Write Glob Grep WebFetch WebSearch`, no MCP, `--permission-mode dontAsk` | `claude stop`, then `claude --bg --resume <id> <text>` (a new id) | `claude agents --json --all` | Remote Control URL | `claude stop <job id>` |
 | Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread>` in `.taskq/T<N>.pid` | `codex exec resume <id> <text>` | the pid is running | `open.html#codex://threads/<id>` | none: a turn ends by itself |
 
 - A worker never inherits the tick's session id: `taskq.py` removes `CLAUDE_CODE_SESSION_ID` and

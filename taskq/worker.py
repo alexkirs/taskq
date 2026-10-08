@@ -610,9 +610,16 @@ def publish_review(current, sha):
             tree = str(Path(folder) / 'tree')
             git('worktree', 'add', '-q', '--detach', tree, 'refs/remotes/origin/main')
             try:
-                subprocess.run(['git', '-C', tree, 'merge', '--ff-only', sha], check=True,
-                               capture_output=True, text=True)
-                git('push', 'origin', f'{sha}:refs/heads/main')
+                # main moved since review: replay the reviewed commits on it (no conflict = same change), no round trip
+                if subprocess.run(['git', '-C', tree, 'merge', '--ff-only', sha], capture_output=True).returncode:
+                    subprocess.run(['git', '-C', tree, 'checkout', '-q', '--detach', sha], check=True, capture_output=True, text=True)
+                    subprocess.run(['git', '-C', tree, 'rebase', '-q', 'refs/remotes/origin/main'], check=True,
+                                   capture_output=True, text=True)
+                head = subprocess.run(['git', '-C', tree, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+                git('push', 'origin', f'{head}:refs/heads/main')
+                if head != sha:
+                    git('push', '-f', 'origin', f'{head}:refs/heads/{branch}')  # the branch stays the published commits
+                    print(f'Rebased {sha[:7]} onto main as {head[:7]} (main moved since review).')
             finally:
                 git('worktree', 'remove', tree)
     except (subprocess.CalledProcessError, ValueError) as error:

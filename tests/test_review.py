@@ -92,26 +92,31 @@ class Review(unittest.TestCase):
         self.assertEqual(q.task(iid)['result'], before['result'])
         self.assertEqual(q.task(iid)['claim'], before['claim'])
 
-    def test_two_candidates_require_rebase_and_new_review(self):
+    def test_close_rebases_a_clean_candidate_onto_moved_main(self):
         first, _, one = self.candidate()
+        second, _, two = self.candidate()
+        self.do(COORDINATOR, 'close', first, '--text', 'reviewed')
+        self.do(COORDINATOR, 'close', second, '--text', 'reviewed')  # main moved: replayed, no reject round trip
+        head = self.main_head()
+        self.assertNotIn(head, (one, two))
+        self.assertEqual(self.git('rev-parse', f'{head}~1', cwd=self.remote), one)
+        self.assertEqual(self.git('show', f'{head}:change-{first}', cwd=self.remote), 'change')
+        self.assertEqual(self.git('show', f'{head}:change-{second}', cwd=self.remote), 'change')
+
+    def test_conflicting_candidate_is_refused(self):
+        first, tree_one, one = self.candidate()
         second, tree, two = self.candidate()
+        (tree / f'change-{first}').write_text('other')
+        self.git('add', '.', cwd=tree)
+        self.git('commit', '-qm', 'conflict', cwd=tree)
+        self.git('push', '-q', 'origin', f'taskq-{second}', cwd=tree)
+        new = self.git('rev-parse', 'HEAD', cwd=tree)
+        self.do(COORDINATOR, 'reject', second, '--text', 'x')
+        self.do(CLAUDE, 'take', second)
+        self.do(CLAUDE, 'result', second, '--sha', new, '--checks', 'passed', '--text', 'r')
         self.do(COORDINATOR, 'close', first, '--text', 'reviewed')
         self.assertIn('Publication refused', self.refused(COORDINATOR, 'close', second, '--text', 'reviewed'))
         self.assertEqual(self.main_head(), one)
-        self.assertEqual(q.task(second)['result']['sha'], two)
-        self.do(COORDINATOR, 'reject', second, '--text', 'rebase requested')
-        self.git('fetch', '-q', 'origin')
-        self.git('rebase', 'origin/main', cwd=tree)
-        self.git('push', '-q', '--force-with-lease', 'origin', f'taskq-{second}', cwd=tree)
-        new = self.git('rev-parse', 'HEAD', cwd=tree)
-        self.assertNotEqual(new, two)
-        self.do(CLAUDE, 'take', second)
-        self.do(CLAUDE, 'result', second, '--sha', new, '--checks', 'passed', '--text', 'rebased')
-        self.assertEqual(self.main_head(), one)
-        self.do(COORDINATOR, 'close', second, '--text', 'new SHA reviewed')
-        self.assertEqual(self.main_head(), new)
-        self.assertEqual(self.git('show', f'{new}:change-{first}'), 'change')
-        self.assertEqual(self.git('show', f'{new}:change-{second}'), 'change')
 
     def test_main_moves_between_fetch_and_push(self):
         iid, _, sha = self.candidate()

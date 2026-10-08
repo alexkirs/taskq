@@ -12,6 +12,8 @@ from test_taskq import q, worker
 from taskq.runtimes.claude import Adapter
 
 FORK = {'CLAUDE_CODE_SESSION_ID': 'supervisor-2', 'CODEX_THREAD_ID': ''}
+WORKER_FORK = {'CLAUDE_CODE_SESSION_ID': 'worker-2', 'CODEX_THREAD_ID': ''}
+STRANGER = {'CLAUDE_CODE_SESSION_ID': 'stranger', 'CODEX_THREAD_ID': ''}
 
 
 def transcripts(root, **sessions):
@@ -86,6 +88,31 @@ class SupervisorWake(unittest.TestCase):
         self.assertEqual(self.block(iid)['supervisor'], {'runtime': 'claude', 'session': 'supervisor-2'})
         self.do(FORK, 'reject', iid, '--text', 'fix it')
         self.assertEqual(self.state(iid), 'ready')
+
+    def test_worker_fork_takes_after_reject_and_hands_in(self):
+        """#291: the supervisor resumes its rejected worker; `--bg --resume` forks worker-2, which takes and hands in."""
+        iid = self.review()
+        self.do(layer.SUPERVISOR, 'reject', iid, '--text', 'fix it')
+        transcripts(self.directory, **{'worker-1': ['a', 'b'], 'worker-2': ['a', 'b', 'c'], 'stranger': ['x']})
+        self.assertIn('only the worker it launched', self.refused(STRANGER, 'take', iid))
+        self.do(WORKER_FORK, 'take', iid)
+        self.assertEqual(self.block(iid)['claim']['session'], 'worker-2')
+        self.do(WORKER_FORK, 'result', iid, '--checks', 'c', '--text', 'fixed')
+        self.assertEqual(self.state(iid), 'review')
+
+    def test_worker_fork_takes_over_a_doing_claim(self):
+        """#291: a worker resumed while doing keeps its claim under the new id; another session does not."""
+        iid = self.add()
+        self.claude('supervisor-1', 'worker-1')
+        self.act()
+        self.do(layer.SUPERVISOR, 'spawn', '--name', f'T{iid} t', '--text', 'go')
+        self.do(layer.WORKER, 'take', iid)
+        transcripts(self.directory, **{'worker-1': ['a'], 'worker-2': ['a', 'b'], 'stranger': ['x']})
+        self.assertIn('not claimed by this session', self.refused(STRANGER, 'result', iid, '--checks', 'c', '--text', 'x'))
+        self.do(WORKER_FORK, 'take', iid)
+        self.assertEqual(self.block(iid)['claim']['session'], 'worker-2')
+        self.do(WORKER_FORK, 'result', iid, '--checks', 'c', '--text', 'done')
+        self.assertEqual(self.state(iid), 'review')
 
     def test_brief_forbids_renaming_and_helper_sessions(self):
         iid = self.add()

@@ -102,9 +102,21 @@ def doing_since(iid):
 
 
 def need_owner(current):
-    mine, claim = core.me(), current['claim'] or {}
-    if (claim.get('runtime'), claim.get('session')) != (mine['runtime'], mine['session']):
+    if not holds(current, core.me()):
         core.fail(f'#{current["iid"]} is not claimed by this session')
+
+
+def holds(current, mine):
+    """Whether session `mine` holds the claim. #291: a Claude worker resumed under a new session id (its transcript
+    copies the claim session's messages) takes the claim over, as a woken supervisor does (#284)."""
+    claim = current['claim'] or {}
+    if (claim.get('runtime'), claim.get('session')) == (mine['runtime'], mine['session']):
+        return True
+    if not (claim.get('runtime') == mine['runtime'] == 'claude' and claim.get('session') and forked(claim['session'], mine['session'])):
+        return False
+    core.save(current, claim=mine, note_action='edit', note_text=f'claim {identity(claim)} → {identity(mine)} (resumed)')
+    current['claim'] = mine
+    return True
 
 
 # --- commands: anyone -----------------------------------------------------------------------
@@ -207,7 +219,8 @@ def supervision(current, mine):
     if (mine['runtime'], mine['session']) == (found['runtime'], found['session']):
         return 'its supervisor does not take it'
     bound = supervised_worker(current['iid'], found)
-    return None if bound == mine['session'] or not bound and mine['session'] in (launched(current['iid'], mine['runtime']) or []) else \
+    # #291: a Claude resume of that worker under a new session id is that worker
+    return None if bound == mine['session'] or bound and mine['runtime'] == 'claude' and forked(bound, mine['session']) or not bound and mine['session'] in (launched(current['iid'], mine['runtime']) or []) else \
         f'supervised by {core.short(found)}: only the worker it launched takes it'
 
 
@@ -366,8 +379,7 @@ def take(args):
     mine, uid = core.me(), core.user()
     everything, open_iids, *_ = core.load()
     current = next((item for item in everything if item['iid'] == args.iid), None) or core.fail(f'#{args.iid} is not an open taskq task')
-    claim = current['claim'] or {}
-    if current['state'] == 'doing' and (claim.get('runtime'), claim.get('session')) == (mine['runtime'], mine['session']):
+    if current['state'] == 'doing' and holds(current, mine):
         core.note(args.iid, 'take')  # a repeated take of its own task, e.g. after an answer in the session
         return print(f'#{args.iid} is yours')
     reason = (f'state is {current["state"]}' if current['state'] != 'ready' else

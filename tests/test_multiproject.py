@@ -427,10 +427,10 @@ class Acting(unittest.TestCase):
                                                        {'id': 'd', 'name': 'T5 y', 'status': {'type': 'systemError'}}]), {'session:a', 'session:c'})
         caps = {'claude': 8, 'codex': 4}
         own = {'status': 'ok', 'L': {'claude': 1, 'codex': 0},
-               'held': [(['claude'], 'session:s1'), (['claude'], 'reservation:r'), (['claude', 'codex'], 'lock:l')]}
+               'held': [(['claude'], 'session:s1'), (['claude'], 'reservation:r'), (['claude', 'codex'], 'reservation:l')]}
         seven = {f'session:s{n}' for n in range(1, 8)}
         found = multiproject.budget(caps, {'claude': seven, 'codex': None}, [own], own, {'claude': 3, 'codex': 2})
-        # s1 is one exact session; the reservation without one and the ownerless lock stay separate: 9 > 8, F clamps at 0.
+        # s1 is one exact session; the reservations without one stay separate: 9 > 8, F clamps at 0.
         self.assertEqual((found['claude']['occupancy'], found['claude']['F'], found['claude']['limit']), (9, 0, 1))
         self.assertEqual((found['codex']['known'], found['codex']['limit']), (False, 0))
         small = multiproject.budget(caps, {'claude': {'session:s1'}, 'codex': set()}, [own], own, {'claude': 3, 'codex': 2})
@@ -465,6 +465,57 @@ class Acting(unittest.TestCase):
         self.assertEqual((found['status'], found['errors']), ('blocked', ['worker session link unavailable; use the printed attach/app reference']))
         self.assertEqual(len(self.calls('native')), 1)
 
+    def edit(self, name, iid=None, lock=False, **block):
+        """Change one fixture tracker in place: a task's block fields, or an own lock award on task `iid`."""
+        store = self.store(name)
+        if block:
+            store.issues[iid]['description'] = core.render('goal', {**self.block(name, iid), **block})
+        if lock:
+            store.awards[99] = {'id': 99, 'iid': iid, 'name': core.LOCK, 'user': {'id': store.uid}, 'created_at': store.now()}
+        (self.dir / f'acme_{name}.pickle').write_bytes(pickle.dumps(store))
+
+    def test_unproven_ownership_in_any_binding_refuses_before_native_pass_even_with_L(self):
+        mine = {'claim': {'runtime': 'claude', 'session': 'bg-1', 'node': self.node('alpha2')}}
+        self.alpha = self.project('alpha2', 33, tasks=[(1,), (2, 'doing', 'claude', mine)])
+        policy = self.catalog(self.alpha, self.beta)
+        clean = (self.dir / 'acme_beta.pickle').read_bytes()
+        here = {'node': self.node('beta'), 'attempt': 'a77', 'coordinator': 'claude:coordina'}
+        for change, why in (({'iid': 1, 'state': None, 'claim': {'runtime': 'mystery', 'session': 'm-1', 'node': self.node('beta')}},
+                              "same-host claim of runtime 'mystery'"),
+                            ({'iid': 1, 'lock': True}, 'tracker lock without a claim or reservation'),
+                            ({'iid': 1, 'reservation': {**here, 'runtime': 'claude', 'principal': 1}}, "pid None: its owner or launch is unproven"),
+                            ({'iid': 1, 'reservation': {**here, 'runtime': 'claude', 'principal': 2, 'pid': 7}}, 'principal 2'),
+                            ({'iid': 1, 'reservation': {**here, 'runtime': 'mystery', 'principal': 1, 'pid': 7}}, "runtime 'mystery'")):
+            (self.dir / 'acme_beta.pickle').write_bytes(clean)
+            if change.pop('state', 1) is None:
+                store = self.store('beta')
+                store.issues[1]['labels'] = ['q-doing', 'code', 'run-claude']
+                (self.dir / 'acme_beta.pickle').write_bytes(pickle.dumps(store))
+            self.edit('beta', **change)
+            before = self.store('beta').issues[1]['description']
+            found = self.act([self.alpha], policy)['projects'][0]
+            self.assertEqual(found['status'], 'refused', why)
+            self.assertIn('beta: uncertain', found['errors'][0])
+            self.assertIn(why, found['errors'][0])
+            self.assertEqual((self.calls('native'), self.mutations('alpha2'), self.mutations('beta')), ([], [], []))
+            self.assertEqual(self.store('beta').issues[1]['description'], before)  # read back, never released
+        (self.dir / 'acme_beta.pickle').write_bytes(clean)
+        self.assertEqual(self.act([self.alpha], policy)['projects'][0]['status'], 'blocked')  # known again: the pass runs
+        self.assertEqual(len(self.calls('native')), 1)
+
+    def test_malformed_readback_is_unknown_and_refuses_before_native_pass(self):
+        policy = self.catalog(self.alpha)
+        for read in ({'status': 'ok', 'held': [(['mystery'], 'lock:unknown-owner')], 'L': {'claude': 1, 'codex': 0}},
+                     {'status': 'ok', 'held': [], 'L': {'claude': 1}},  # no uncertainty signal at all
+                     {'status': 'ok', 'held': [(['claude'], 'claim:x')], 'L': {'claude': 1}, 'uncertain': []},
+                     {'status': 'ok', 'held': [], 'L': {'claude': -1}, 'uncertain': []}, {'status': 'weird'}):
+            with patch.multiple(multiproject, verify=lambda entry: [], workflow=lambda binding, machine: [], update_due=lambda: [],
+                                read_occupancy=lambda binding, errors: read, claude_rows=lambda: [], codex_threads=lambda: []), \
+                    patch.object(multiproject, 'native_pass') as native:
+                found = multiproject.act_project({'entry': self.alpha, 'policy': str(policy)})
+            self.assertEqual((found['status'], native.call_count), ('refused', 0), read)
+            self.assertIn('occupancy readback malformed', found['errors'][0])
+
     def test_enrollment_is_explicit_runs_no_tick_and_only_table_order_may_change(self):
         policy = self.catalog(self.alpha, self.beta, enroll=False)
         result = self.act([self.alpha, self.beta], policy)  # never enrolled on a first --act
@@ -487,7 +538,7 @@ class Acting(unittest.TestCase):
         self.assertIn('differs from accepted generation 1', result['projects'][0]['errors'][0])
         self.assertEqual(len(self.calls('native')), 1)
         for n, (binding, top, why) in enumerate((({**self.alpha, 'principal': 5}, {}, 'the catalog binds 5'),
-                                                 (self.alpha, {'machine': 'other-host'}, "the catalog binds 'other-host'"),
+                                                 (self.alpha, {'machine': 'other-host'}, "not 501 on 'other-host'".replace('501', str(os.getuid()))),
                                                  ({**self.alpha, 'ready': True}, {}, 'ready: unknown key; readiness and effects come from'),
                                                  ({**self.alpha, 'effects': ['queue']}, {}, "['cleanup', 'idle_stop'] the catalog did not select"))):
             bad = self.catalog(binding, enroll=False, file=f'bad-{n}.toml', **top)
@@ -509,6 +560,13 @@ class Acting(unittest.TestCase):
             self.assertIn('https://gitlab.example/acme/alpha: still owns reservation:', ' '.join(refused['errors']))
             self.assertEqual(self.anchor.read_bytes(), before)
         self.assertIn('differs from accepted generation 1', self.act([self.beta], self.catalog(self.beta, enroll=False))['projects'][0]['errors'][0])
+        (self.dir / 'acme_alpha.pickle').write_bytes(pickle.dumps(store))
+        self.edit('alpha', iid=2, lock=True)  # the former principal's lock with no claim or reservation
+        refused = multiproject.accept(self.catalog({**self.alpha, 'principal': 2}, self.beta, enroll=False), CHECK)
+        self.assertIn('alpha: ownership unknown: https://gitlab.example/acme/alpha#2: tracker lock without a claim or reservation', ' '.join(refused['errors']))
+        self.assertEqual(self.anchor.read_bytes(), before)
+        store = self.store('alpha')
+        store.awards.clear()
         store.issues[1]['description'] = core.render('goal', {**self.block('alpha', 1), 'reservation': None})
         (self.dir / 'acme_alpha.pickle').write_bytes(pickle.dumps(store))
         self.agents(LIVE + [{'id': 'a', 'kind': 'background', 'sessionId': 'in-alpha', 'cwd': self.alpha['checkout'], 'name': 'T1 x', 'state': 'working', 'pid': 9}])
@@ -521,6 +579,17 @@ class Acting(unittest.TestCase):
         (self.dir / 'beta-moved').rename(self.dir / 'beta')
         self.assertEqual(self.anchor.read_bytes(), before)
         self.assertEqual(self.mutations('alpha'), [])  # nothing released, stolen or settled by the adapter
+        review = {'runtime': 'claude', 'session': 'owned-review', 'node': self.node('alpha')}  # its worker is in no inventory
+        store = self.store('alpha')
+        store.issues[2]['labels'] = ['q-review', 'code', 'run-claude']
+        store.issues[2]['description'] = core.render('goal', {**self.block('alpha', 2), 'claim': review})
+        (self.dir / 'acme_alpha.pickle').write_bytes(pickle.dumps(store))
+        refused = multiproject.accept(self.catalog(self.beta, enroll=False), CHECK)
+        self.assertIn('https://gitlab.example/acme/alpha: still owns session:owned-review', refused['errors'])
+        self.assertEqual((self.anchor.read_bytes(), self.calls('native')), (before, []))
+        store.issues[2]['labels'] = ['q-ready', 'code', 'run-claude']
+        store.issues[2]['description'] = core.render('goal', {**self.block('alpha', 2), 'claim': None})
+        (self.dir / 'acme_alpha.pickle').write_bytes(pickle.dumps(store))
         replaced = multiproject.accept(self.catalog(self.beta, enroll=False), CHECK)
         self.assertEqual((replaced['status'], replaced['generation']), ('replaced', 2))
         self.assertEqual(self.calls('native'), [])
@@ -535,11 +604,32 @@ class Acting(unittest.TestCase):
             self.assertIn(why, self.act([self.alpha], policy)['projects'][0]['errors'][0])
             self.assertIn(why, multiproject.accept(policy, CHECK)['errors'][0])
             self.assertEqual(self.anchor.read_bytes(), broken)
+        def resigned(change):
+            anchor = json.loads(good)
+            change(anchor)
+            anchor['sha256'] = multiproject.digest(anchor['catalog'])
+            return json.dumps(anchor).encode()
+        for broken in (resigned(lambda anchor: anchor['catalog']['policy'].update(extra=1)),
+                       resigned(lambda anchor: anchor['catalog']['project'][0]['limits'].update(claude=9)),
+                       resigned(lambda anchor: anchor['catalog']['project'][0].pop('effects')),
+                       resigned(lambda anchor: anchor['catalog']['project'][0].update(host='GitLab.Example')),  # not canonical
+                       resigned(lambda anchor: anchor.update(generation=True)), resigned(lambda anchor: anchor.update(receipt='applied'))):
+            self.anchor.write_bytes(broken)
+            self.assertIn('malformed', self.act([self.alpha], policy)['projects'][0]['errors'][0])
+            self.assertIn('malformed', multiproject.accept(policy, CHECK)['errors'][0])
+            self.assertEqual(self.anchor.read_bytes(), broken)
+        elsewhere = resigned(lambda anchor: anchor['catalog']['policy'].update(machine='a-different-host'))
+        self.anchor.write_bytes(elsewhere)
+        for found in (self.act([self.alpha], policy)['projects'][0], multiproject.accept(policy, CHECK),
+                      multiproject.accept(self.catalog({**self.alpha, 'limits': {'claude': 1}}, enroll=False, file='replace.toml'), CHECK)):
+            self.assertIn("belongs to OS user", found['errors'][0])
+            self.assertIn("on 'a-different-host'", found['errors'][0])
+        self.assertEqual(self.anchor.read_bytes(), elsewhere)
         foreign = json.loads(good)
         foreign['catalog']['policy']['os_user'] = os.getuid() + 1
         foreign['sha256'] = multiproject.digest(foreign['catalog'])
         self.anchor.write_text(json.dumps(foreign))
-        self.assertIn('OS-user domain', self.act([self.alpha], policy)['projects'][0]['errors'][0])
+        self.assertIn(f'belongs to OS user {os.getuid() + 1}', self.act([self.alpha], policy)['projects'][0]['errors'][0])
         self.anchor.unlink()
         (self.dir / 'elsewhere.json').write_bytes(good)
         self.anchor.symlink_to(self.dir / 'elsewhere.json')

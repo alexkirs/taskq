@@ -281,7 +281,13 @@ def binding_errors(entry):
 
 def load_policy(path):
     """(policy, [(binding, errors)]): the owner's reviewed execution catalog. A wrong shape refuses all acting."""
-    policy = tomllib.loads(Path(path).read_text())
+    return parse_policy(tomllib.loads(Path(path).read_text()), path)
+
+
+def parse_policy(policy, path):
+    """`load_policy` of a parsed table: the policy file's, or an anchor's catalog, which must pass the same checks."""
+    if not isinstance(policy, dict):
+        raise SystemExit(f'{path}: not a table')
     problems = [f'{key}: unknown key; {NOT_EVIDENCE}' for key in sorted(set(policy) - {'version', 'machine', 'os_user', 'caps', 'project'})]
     if policy.get('version') != MANIFEST_VERSION:
         problems.append(f'version = {MANIFEST_VERSION} required')
@@ -429,28 +435,52 @@ def codex_inventory(threads):
 
 def occupancy(entry):
     """One catalog binding's same-host ownership, read only, from #208's evidence: `L`, exactly what native `room`
-    subtracts, and each local claim, reservation and ownerless lock as (runtimes it may hold, identity)."""
+    subtracts; each proven claim (any state) and reservation as (runtimes, identity); everything unproven as uncertain."""
     if blockers := verify(entry):
         return {'status': 'refused', 'errors': blockers}
     if (uid := core.user()) != entry['principal']:
         return {'status': 'refused', 'errors': [f'the tracker principal is {uid}, the catalog binds {entry["principal"]}']}
     everything, where = core.load()[0], repository_url(entry)
-    may = lambda runtime: [runtime] if runtime else list(CAPS)  # noqa: E731 - unknown runtime: every one
-    held = []
+    held, uncertain = [], []  # known grants (runtimes, identity); ownership without proof, which refuses acting
     for item in everything:
-        claim, found = item['claim'] or {}, item.get('reservation') or {}
-        if item['state'] == 'doing' and core.local_claim(claim):
-            held.append((may(claim.get('runtime')), f'session:{claim["session"]}' if claim.get('session') else f'claim:{where}#{item["iid"]}'))
+        claim, found, task = item['claim'] or {}, item.get('reservation') or {}, f'{where}#{item["iid"]}'
+        # Any state: a review, ask or later claim still names its worker; an empty inventory never settles it.
+        if claim and core.local_claim(claim):
+            if claim.get('runtime') in CAPS and isinstance(claim.get('session'), str) and claim['session']:
+                held.append(([claim['runtime']], f'session:{claim["session"]}'))
+            else:
+                uncertain.append(f'{task}: same-host claim of runtime {claim.get("runtime")!r}, session {claim.get("session")!r}')
         if core.reserved_here(item):
             session = worker.launch_session(item['iid'], found.get('attempt') or '')
-            held.append((may(found.get('runtime')), f'session:{session}' if session else f'reservation:{where}#{item["iid"]}:{found.get("attempt")}'))
+            if found.get('runtime') not in CAPS or found.get('principal') != entry['principal'] or not (session or found.get('pid')):
+                uncertain.append(f'{task}: reservation {found.get("attempt")!r} of runtime {found.get("runtime")!r}, principal '
+                                 f'{found.get("principal")!r}, pid {found.get("pid")!r}: its owner or launch is unproven')
+            else:  # a launch with its session, or with its launching process that native reconcile can settle
+                held.append(([found['runtime']], f'session:{session}' if session else f'reservation:{task}:{found.get("attempt")}'))
     owned = {item['iid'] for item in everything if (item['claim'] or {}).get('session') or item.get('reservation')}
-    runtimes = {item['iid']: item['runtime'] for item in everything}
     for issue in core.issues(f'state=opened&my_reaction_emoji={core.LOCK}'):
         if issue['iid'] not in owned:  # a take or launch between its lock and its write, or one that died there
-            held.append((may(runtimes.get(issue['iid'])), f'lock:{where}#{issue["iid"]}'))
+            uncertain.append(f'{where}#{issue["iid"]}: tracker lock without a claim or reservation')
     taken = core.room(everything, dict.fromkeys(core.RUNTIMES, 0))
-    return {'status': 'ok', 'L': {runtime: -count for runtime, count in taken.items()}, 'held': held}
+    return {'status': 'ok', 'L': {runtime: -count for runtime, count in taken.items()}, 'held': held, 'uncertain': uncertain}
+
+
+def checked_read(found):
+    """A readback as admission may use it. Off-shape is unknown; listed uncertainty is `uncertain`: both refuse."""
+    try:
+        if found['status'] in ('refused', 'failed') and all(isinstance(error, str) for error in found['errors']):
+            return found
+        valid = (found['status'] == 'ok' and set(found) == {'status', 'L', 'held', 'uncertain'}
+                 and all(isinstance(runtime, str) and type(count) is int and count >= 0 for runtime, count in found['L'].items())
+                 and all(len(pair) == 2 and isinstance(pair[0], list) and pair[0] and all(runtime in CAPS for runtime in pair[0])
+                         and isinstance(pair[1], str) and pair[1].startswith(('session:', 'reservation:')) for pair in found['held'])
+                 and isinstance(found['held'], list) and isinstance(found['uncertain'], list)
+                 and all(isinstance(reason, str) for reason in found['uncertain']))
+    except (KeyError, TypeError, AttributeError):
+        valid = False
+    if not valid:
+        return {'status': 'failed', 'errors': ['occupancy readback malformed: ownership unknown']}
+    return {**found, 'status': 'uncertain', 'errors': found['uncertain']} if found['uncertain'] else found
 
 
 def read_occupancy(binding, errors):
@@ -540,9 +570,13 @@ def digest(snapshot):
     return hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
-def read_anchor():
-    """The accepted anchor, or None when there is none. Unreadable, malformed, a symlink, another owner, domain or
-    version: SystemExit, and the file stays as it is; never reset."""
+ANCHOR_KEYS = {'version', 'generation', 'sha256', 'catalog', 'accepted_at', 'accepted_by', 'note'}
+
+
+def read_anchor(machine):
+    """The accepted anchor of this OS user on `machine` (the policy's host, which every binding check verifies
+    against its project), or None when there is none. Unreadable, a symlink, another owner or mode, another version,
+    a catalog off the enrollment schema, another OS user or machine: SystemExit, the file left as it is; never reset."""
     path = anchor_path()
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -560,12 +594,20 @@ def read_anchor():
         os.close(fd)
     try:
         anchor = json.loads(text)
-        valid = (anchor['version'] == ANCHOR_VERSION and type(anchor['generation']) is int and anchor['generation'] >= 1
-                 and anchor['sha256'] == digest(anchor['catalog']) and anchor['catalog']['policy']['os_user'] == os.getuid())
-    except (ValueError, KeyError, TypeError, IndexError):
+        catalog = anchor['catalog']
+        valid = (set(anchor) == ANCHOR_KEYS and anchor['version'] == ANCHOR_VERSION and type(anchor['generation']) is int
+                 and anchor['generation'] >= 1 and all(isinstance(anchor[key], str) for key in ('sha256', 'accepted_at', 'accepted_by', 'note'))
+                 and anchor['sha256'] == digest(catalog) and set(catalog) == {'policy', 'project'} and isinstance(catalog['policy'], dict)
+                 # Its catalog must be exactly what enrollment derives from such a policy: every shape, type and range.
+                 and canonical(*parse_policy({**catalog['policy'], 'project': json.loads(json.dumps(catalog['project']))}, path)) == catalog)
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError, SystemExit):
         valid = False
     if not valid:
-        raise SystemExit(f'execution anchor {path} is malformed or of another version or OS-user domain; refused, left as it is')
+        raise SystemExit(f'execution anchor {path} is malformed or of another version; refused, left as it is')
+    domain = (catalog['policy']['os_user'], catalog['policy']['machine'])
+    if domain != (os.getuid(), machine):
+        raise SystemExit(f'execution anchor {path} belongs to OS user {domain[0]} on {domain[1]!r}, not {os.getuid()} on {machine!r}; '
+                         'refused, left as it is')
     return anchor
 
 
@@ -593,7 +635,7 @@ def write_anchor(anchor):
 
 def anchored(policy, catalog):
     """The anchor whose catalog equals this policy file exactly (table order aside); SystemExit otherwise."""
-    anchor = read_anchor()
+    anchor = read_anchor(policy['machine'])
     if anchor is None:
         raise SystemExit('no accepted execution catalog: the owner enrolls it with --accept-execution-policy first')
     if anchor['sha256'] != digest(canonical(policy, catalog)):
@@ -615,7 +657,7 @@ def settled(anchor):
     old = anchor['catalog']['project']
     blockers = []
     for binding in old:
-        read = read_occupancy(binding, [])
+        read = checked_read(read_occupancy(binding, []))
         where = repository_url(binding)
         if read['status'] != 'ok':
             blockers.append(f'{where}: ownership unknown: ' + '; '.join(read.get('errors', [])))
@@ -646,7 +688,7 @@ def accept(policy_path, check=None):
     except (SystemExit, OSError, ValueError) as error:
         return {**result, 'errors': [str(error)]}
     try:
-        anchor = read_anchor()
+        anchor = read_anchor(policy['machine'])
         if anchor and anchor['sha256'] == digest(snapshot):
             return {**result, 'status': 'unchanged', 'generation': anchor['generation'], 'sha256': anchor['sha256']}
         for binding, _ in catalog:
@@ -706,13 +748,13 @@ def act_project(spec):
         anchored(policy, catalog)
         if blockers := verify(binding) or workflow(binding, policy['machine']) or update_due():
             return {**result, 'errors': blockers}
-        reads = [read_occupancy(other, errors) for other, errors in catalog]
+        reads = [checked_read(read_occupancy(other, errors)) for other, errors in catalog]
         own = next(read for (other, _), read in zip(catalog, reads) if other is binding)
         result['catalog'] = [{'repository': project_result(other, errors)['repository'], 'status': read['status'],
                               'errors': read.get('errors', [])} for (other, errors), read in zip(catalog, reads)]
         # Unknown ownership or an unreadable inventory the project touches refuses before native_pass: its zero
         # limits would still let the pass release, move and reconcile.
-        if unread := [f'{found["repository"]}: {found["status"]}' for found in result['catalog'] if found['status'] != 'ok']:
+        if unread := [f'{found["repository"]}: {found["status"]} ({"; ".join(found["errors"])})' for found in result['catalog'] if found['status'] != 'ok']:
             return {**result, 'errors': ['catalog ownership unknown, nothing run: ' + ', '.join(unread)]}
         view = entry.get('view', {})
         limits = {runtime: min(count, view.get('limits', {}).get(runtime, count)) for runtime, count in binding['limits'].items()}

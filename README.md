@@ -4,20 +4,23 @@
 </p>
 
 Your repository board is the task list; your usual AI apps do the work.
-Add taskq, then ask Claude or Codex to turn any request into tasks.
+Add taskq, then ask Codex or Claude to turn any request into tickets.
 
-Board events wake the manager (`taskq wait`); it starts as many workers as you choose and shows each one's session link.
-You stay in control: a worker's question waits for your answer, and nothing is accepted until it is reviewed.
+The manager picks up tickets, runs as many workers as you choose, and tracks progress.
+No extra worker apps required.
+
+You stay in control: tasks wait for your input and continue when you reply.
 
 1. **⚙ Set up (once per project)**<br>
-   Tell your agent: "Install taskq from https://github.com/alexkirs/taskq and set it up for this project."
+   Tell your agent: "Install taskq from https://github.com/alexkirs/taskq and set it up."
 
 2. **▶ Start working (each day)**<br>
-   "Run `taskq pm`, then `taskq arm tick`." - your agent becomes the manager; workers start on ready tasks
+   "Run taskq pm, then arm the tick." - workers start on ready tasks
 
 3. **✎ Talk to the manager**<br>
    "File a task: fix the login redirect." - new task<br>
    "What is in the queue?" - status<br>
+   "What should we do next?" - plan<br>
    "Show me the question from #12." - answer a worker<br>
    "Review #12." - accept or send back
 

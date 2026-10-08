@@ -330,6 +330,21 @@ class Tick(Base):
         self.assertIn('session s-T1 is gone', self.board.issues[1]['comments'][2])
         self.assertEqual((self.task(1)['state'], self.task(2)['state']), ('doing', 'ready'))
 
+    def test_second_quick_death_asks(self):
+        # #393: a worker that dies at once is respawned once, then the owner is asked with the last log line
+        self.fake.tail = lambda session: 'error: unsupported model'
+        self.add()
+        for _ in range(3):
+            self.run_cli('tick')
+            self.fake.sessions['s-T1'] = False
+        self.run_cli('tick')
+        self.assertEqual(self.task(1)['state'], 'ask')
+        self.assertEqual(len(self.fake.names), 2)  # no third spawn
+        self.assertIn('Last log line: error: unsupported model', self.board.issues[1]['comments'][-1])
+        self.run_cli('answer', '1', '--text', 'fixed')  # an answer resets the count: the next death requeues
+        self.run_cli('tick')
+        self.assertEqual((self.task(1)['state'], len(self.fake.names)), ('doing', 3))
+
     def test_two_passes_at_once_spawn_one_worker(self):
         # #357 (R2): a tick runs while an event pass spawns; it finds the lock held and starts nothing
         taskq.CONFIG['limits'] = {'fake': 2}

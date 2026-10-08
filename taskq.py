@@ -255,6 +255,12 @@ class Claude:
                 subprocess.run([claude, 'stop', agent['id']], capture_output=True, timeout=60)
             subprocess.run([claude, 'rm', agent['id']], capture_output=True, timeout=60)
 
+    def tail(self, session):
+        """The last line of `claude logs`, for an ask (#393)."""
+        job = ((self.agents() or {}).get(session) or {}).get('id') or session
+        done = subprocess.run([shutil.which('claude') or 'claude', 'logs', job], capture_output=True, text=True, encoding='utf-8', timeout=60)
+        return last_line(re.sub(r'\x1b\[[0-9;]*m', '', done.stdout + done.stderr))
+
     def link(self, session):
         """The Remote Control URL: ~/.claude/jobs/<short>/state.json holds `bridgeSessionId` cse_<id> (#83)."""
         try:
@@ -263,6 +269,9 @@ class Claude:
             return None
         bridge = job.get('bridgeSessionId') if job.get('sessionId') == session else None
         return bridge and 'https://claude.ai/code/session_' + re.sub('^(cse_|session_)', '', bridge)
+
+def last_line(text):
+    return next((line.strip() for line in reversed(text.splitlines()) if line.strip()), '')
 
 def pid_alive(pid):
     if os.name != 'nt':
@@ -328,6 +337,10 @@ class Codex:
                 os.kill(int(pid), signal.SIGTERM)
             subprocess.run([shutil.which('codex') or 'codex', 'archive', thread], capture_output=True, timeout=60)
             path.unlink()
+
+    def tail(self, session):
+        path = self.pid_file(session)
+        return last_line(path.with_suffix('.log').read_text('utf-8', 'replace')) if path else ''
 
     def link(self, session):
         return f'{CONFIG.get("pages", "https://alexkirs.github.io/taskq/").rstrip("/")}/open.html#codex://threads/{session}'
@@ -538,6 +551,15 @@ def dispatch_lock():
             return
         yield True  # closing the file (or the process exiting) releases the lock
 
+def quick_deaths(n):
+    """'requeue ... is gone' notes since the last result or answer."""
+    count = 0
+    for text in reversed(BOARD.get(n)['comments'] or []):
+        if text.startswith(('**result**', '**answer**')):
+            break
+        count += text.startswith('**requeue**') and ' is gone' in text
+    return count
+
 def cmd_tick(args, table=True):
     """One pass: requeue dead workers, nudge silent ones, free waiting tasks, spawn ready ones, print the table."""
     here, kinds = machine(), runtimes()
@@ -557,7 +579,16 @@ def cmd_tick(args, table=True):
             runtime = kinds[claim['runtime']]
             state = runtime.alive(claim['session'])
             if state is False:
-                move(item, 'ready', 'requeue', f'session {claim["session"]} is gone', claim=None, result=None)
+                gone = f'session {claim["session"]} is gone'
+                if quick_deaths(item['iid']):  # #393: the second death in a row with no result or answer asks, not respawns
+                    try:
+                        tail = getattr(runtime, 'tail', lambda _: '')(claim['session'])
+                    except Exception as error:  # best effort: the ask goes out without the line
+                        tail = f'no log: {error}'
+                    move(item, 'ask', 'ask', f'{gone} again, the worker dies at once: fix the runtime, then answer.\n\nLast log line: {tail or "none"}')
+                    item['state'] = 'ask'
+                    continue
+                move(item, 'ready', 'requeue', gone, claim=None, result=None)
                 item.update(state='ready', claim=None)
                 continue
             last = (BOARD.get(item['iid'])['comments'] or [''])[-1] if state else ''

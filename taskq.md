@@ -157,7 +157,7 @@ updated_at, url}`; `get` adds `comments` (a list of strings, oldest first).
 | `comment(n, text)` | append one comment |
 | `close(n)` | close the issue |
 
-Runtime file: four module-level functions, a fifth optional.
+Runtime file: four module-level functions, two more optional.
 
 | Function | Does |
 |---|---|
@@ -166,6 +166,7 @@ Runtime file: four module-level functions, a fifth optional.
 | `alive(session)` | `True` running, `False` gone, `None` cannot tell |
 | `link(session)` | a URL the owner opens to watch the session, or `None` |
 | `retire(gone, running=True)` | optional: stop and remove this machine's `T<N>` sessions with `gone(N)` true; `close` calls it for its task, the tick for tasks no longer open with `running=False` |
+| `tail(session)` | optional: the session's last log line, for the ask after a second quick death (§ 7) |
 
 ## 3. Data model
 
@@ -300,7 +301,9 @@ results and closes. It does no task work itself and never answers a worker's que
 ### One tick pass
 
 1. `waiting` with every dep closed → `ready`.
-2. `doing`, claimed on this machine: `alive` False → requeue (`session ... is gone`); alive and the issue unchanged
+2. `doing`, claimed on this machine: `alive` False → requeue (`session ... is gone`); the second such requeue since
+   the last `result` or `answer` → `ask` instead, with the last log line (`tail`; Codex: `.taskq/T<N>.log`, Claude:
+   `claude logs`), and no new spawn (#393). Alive and the issue unchanged
    for 120 minutes → `send(session, 'continue: read your issue')`, comment `nudge`. Alive and the last comment an
    `answer` → `send` the answer text at once, comment `nudge` (one send per answer).
 3. `ready`, deps closed, host matches, a free slot for its runtime (`run-*` label, else the first free in

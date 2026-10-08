@@ -2010,7 +2010,7 @@ class GithubRest:
                       'milestone': i['milestone'], 'comments': {'totalCount': sum(c['issue'] == i['number'] for c in self.comments.values())},
                       'author': {'login': i['user']['login'], 'databaseId': i['user']['id']}, 'authorAssociation': i['author_association']}
                      for i in items]
-            return {'data': {'repository': {'issues': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}}}
+            return {'data': {'viewer': {'databaseId': 1}, 'repository': {'issues': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}}}
         if route == 'milestones':
             return [{'number': 5, 'title': 'Maps'}]
         if route == 'labels':
@@ -2264,6 +2264,13 @@ class GithubCycle(unittest.TestCase):
         self.github.issues[second]['labels'].append({'id': 0, 'name': 'extra'})
         listed = [item['iid'] for item in q.api('GET', 'issues?state=opened&labels=area-engine,extra')]
         self.assertEqual(listed, [second])  # GraphQL answers any-of ([first, second] here); the store keeps all-of
+
+    def test_list_caches_viewer_for_profile_without_a_second_http_call(self):
+        store = q.Github('owner/repo')
+        store.run = self.github
+        store('GET', 'issues?state=opened')
+        self.assertEqual(store('GET', '/user'), {'id': 1})
+        self.assertEqual(self.github.calls, [('POST', 'graphql')])
 
     def test_init_writes_a_github_config(self):
         with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp), contextlib.redirect_stdout(io.StringIO()) as out:

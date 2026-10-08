@@ -21,6 +21,7 @@ class Github:
     the q-* label, archives the item on close, and answers `board` routes (`GET board`, `POST board` to create,
     `GET board/items`, `PUT board/items/N`). Without the token scope `project` there is no board, silently."""
     LIST = ('query($owner: String!, $name: String!, $states: [IssueState!], $labels: [String!], $filter: IssueFilters, $after: String) {'
+            ' viewer { databaseId }'
             ' repository(owner: $owner, name: $name) { issues(states: $states, labels: $labels, filterBy: $filter, first: 100, after: $after,'
             ' orderBy: {field: CREATED_AT, direction: DESC}) { pageInfo { hasNextPage endCursor } nodes { number id title body state url'
             ' createdAt updatedAt labels(first: 100) { nodes { name } } assignees(first: 10) { nodes { databaseId login } }'
@@ -42,7 +43,7 @@ class Github:
              ' %s }' % BOARD)
 
     def __init__(self, repo, host=None, board=None):
-        self.repo, self.host, self.labels, self.nodes = repo, host, {}, {}
+        self.repo, self.host, self.labels, self.nodes, self.viewer = repo, host, {}, {}, None
         self.title = board or repo.split('/')[-1]  # the board's title: [github] board, else the repository name  # by issue number: label names last read, GraphQL id
         self.board, self.items = None, {}  # the project once looked up in this process (False: none); item ids by issue number
 
@@ -79,7 +80,9 @@ class Github:
         while True:
             variables = {'owner': self.repo.split('/')[0], 'name': self.repo.split('/')[1], 'states': states,
                          'labels': query['labels'].split(',') if query.get('labels') else None, 'filter': filters or None, 'after': after}
-            page = self.run('POST', 'graphql', {'query': self.LIST, 'variables': variables})['data']['repository']['issues']
+            data = self.run('POST', 'graphql', {'query': self.LIST, 'variables': variables})['data']
+            self.viewer = (data.get('viewer') or {}).get('databaseId') or self.viewer
+            page = data['repository']['issues']
             wanted = set(variables['labels'] or ())  # GraphQL `labels` is any-of; GitLab's `labels=` is all-of
             found += [self.issue(self.node(item)) for item in page['nodes'] if wanted <= {label['name'] for label in item['labels']['nodes']}]
             if not page['pageInfo']['hasNextPage']:
@@ -242,7 +245,7 @@ class Github:
         query = {key: value[0] for key, value in parse_qs(path.partition('?')[2]).items()}
         later = int(query.get('page', 1)) > 1
         if path == '/user':
-            return {'id': self.run('GET', 'user')['id']}
+            return {'id': self.viewer} if self.viewer is not None else {'id': self.run('GET', 'user')['id']}
         if path == 'repository':
             return self.run('GET', f'repos/{self.repo}')
         if path.startswith('milestones'):

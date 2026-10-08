@@ -75,17 +75,23 @@ Changed: `taskq problem` → `requeue --text` or a plain issue comment (#290).
 (§ 7). A row is `| [#N](<issue url>) | <state> | <runtime> | [<session[:8]>](<link>) |`; the link is https only
 (#488): Claude `https://claude.ai/code/session_<id>`, Codex `<pages>/open.html#codex://threads/<id>` (opens on the
 Mac with Codex). A session with no link on this machine shows `<session[:8]> on <machine>`; a task with no session
-leaves the cell empty. The manager replies with it as printed, then the owner's open questions. No raw JSON to humans.
+leaves the cell empty. Then a `Decisions` block (§ 7): one line per task waiting on the owner. The manager
+replies with both as printed. No raw JSON to humans.
 Changed: a space-padded `Session link` column → the markdown table with `[#N](issue)` and session links (#489).
 Changed: a heading per project and owner questions inside the tick output → one project per tick, questions added by
 the manager (#290). The reply route (`--reply`) and the `cards` format of #274 are not in `taskq.py`.
 Open: bring back the reply route and cards, yes or no (#274).
+Changed: the manager adds the owner's open questions → `tick` prints them as the `Decisions` block; the owner answers
+all in one line, `taskq answer 43.1 44.2` (#490).
 
 ### R7. Style
 
 Every role and message is short and states unknowns honestly, per
 [gradus-public/caveman](https://gitlab.ufobe.com/gradus-public/caveman/-/tree/62579538f05fb6b69a12449c1ebad9567d1fdecc)
 pinned at `6257953`. taskq links the style; it does not redefine it.
+A question to the owner is one line: what was done, its results (links, images, video), numbered options, one
+recommended (§ 5 rule 5, § 7 After each pass).
+Changed: free-text questions → decision cards with option codes `N.K` (#490).
 
 ### R8. The contract is the SoT and matches code
 
@@ -160,6 +166,7 @@ application or completion.
 | `codex` | Options of `codex exec`, replacing the default; with `workspace: external` add `--add-dir` for the worktree and its git dir (the project instructions name them) | `-s workspace-write`, network on, `--add-dir <root>/.git` |
 | `pages` | Base URL of `open.html`, the Codex link page | `https://alexkirs.github.io/taskq/` |
 | `board_url` | Board link a board file prints in the tick | GitHub/GitLab issues page |
+| `inline_media` | `false`: the `Decisions` block prints image links as plain links, not `![](url)` (where the surface does not render them) | `true` |
 | `assignee` | `"me"` (the board's logged-in user) or a login: `tick` starts, and `tick`/`wait`/`list` show, only tasks assigned to it; unassigned tasks are skipped (#480) | unset: every task |
 
 Board file: six module-level functions. An issue is a dict `{iid, title, body, labels, state: open|closed,
@@ -207,8 +214,11 @@ Runtime file: four module-level functions, two more optional.
 
 ```json
 {"scope": ["paths expected to change"], "deps": [12], "claim": {"runtime": "claude", "session": "<id>", "name": "mac"},
- "result": {"sha": "<full sha>", "checks": "<commands and outcome>"}}
+ "result": {"sha": "<full sha>", "checks": "<commands and outcome>"},
+ "decision": {"summary": "<first line of the ask/result text>", "links": ["<url>"], "options": ["<A>", "<B>"], "recommend": 1}}
 ```
+
+- `decision` (#490): set by `ask` and `result` from `--option`, `--recommend`, `--link`; cleared by `answer` and `requeue`.
 
 - History: every command posts one comment `**<action>** · <runtime>:<session 8>` (or `owner`), then its text.
   An agent session (the manager too) is named by its own session; a plain shell is `owner`.
@@ -224,9 +234,10 @@ Runtime file: four module-level functions, two more optional.
 | `taskq add "<title>" --goal G --acceptance A [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 1\|2] [--host H]` | new task: `q-ready`, or `q-waiting` with open deps |
 | `taskq list [state]` | open tasks by state, priority, number |
 | `taskq take N` | claim a ready task for this session (needs `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`) |
-| `taskq ask N --text Q` | worker asks the owner: `doing` → `ask` |
+| `taskq ask N --text Q [--option O ..] [--recommend K] [--link URL ..]` | worker asks the owner: `doing` → `ask`; the options make the decision card (§ 7) |
 | `taskq answer N --text A` | the owner's answer: `ask` → `doing` |
-| `taskq result N --sha SHA [--checks C] [--text T]` | hand in: `doing` → `review` |
+| `taskq answer N.K [M.K ...]` | pick option K of each task's card, all checked first (#490): an `ask` → `doing` with the option's text; a `review` → `close` when the option starts with `close`, else → `doing` with the option's text. Codes may be one quoted string: `'43.1 44.2'` |
+| `taskq result N --sha SHA [--checks C] [--text T] [--option O ..] [--recommend K] [--link URL ..]` | hand in: `doing` → `review`; options: the owner must choose (§ 7) |
 | `taskq requeue N [--text T]` | drop claim and result: any state → `ready` |
 | `taskq later N [--text T]` | park: any state → `later` |
 | `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
@@ -279,7 +290,10 @@ Rules:
 4. Expected paths (`scope`) say where the work is expected, not what is forbidden. Another file: change it and
    name it with the reason in the result.
 5. A question only the owner can decide (a product choice, an action that cannot be undone):
-   `taskq ask N --text "<question with options>"`, then stop. Everything else: decide, do it, and say so in the result.
+   `taskq ask N --text "<what was done; the question>" --option "<A>" --option "<B>" --recommend K [--link URL]`,
+   then stop. Everything else: decide, do it, and say so in the result. A result that leaves the owner a choice
+   (keep A or switch to B) takes the same options; an option starting `close` accepts the result as is. `--link`:
+   each result the owner should see (PR, page, image, video); `--recommend` defaults to 1.
 6. Cannot be done: `taskq requeue N --text "<why>"`, then stop.
 7. Before `result`: commit on `taskq-<N>`, `git fetch origin && git rebase origin/main`, run the focused tests of
    the changed behavior (and the full suite when the change is shared), and name each command and its outcome in
@@ -370,6 +384,9 @@ No fixed interval (#407): the manager is woken only when it has work.
 4. `ask`, `review`, `later`: nothing; they wait for the manager.
 5. Print the R6 markdown table `| Task | State | Runtime | Session |` by priority, then number; then `Board: <url>`.
    Another machine's claim shows its bare session id: only that machine can link it.
+6. Print the `Decisions` block (#490): one line per `ask`, and per `review` with options:
+   `[#N](url) <state>: <what was done> · <links> · N.1 <option> (recommended) · N.2 <option>`. An image link prints as
+   `![N](url)` (`inline_media`, § 2); a video or page stays a link.
 
 The event pass of R4 is steps 1–3 run by `taskq tick --quiet`, the detached child of `add`, `answer`, `result`, `requeue` or `close`, no table. A worker's
 `result` spawns the next worker on its own machine, named by its own runtime (R3). Run from `.worktrees/taskq-<N>`,
@@ -380,10 +397,12 @@ the tasks it did not reach wait for the next pass. Fix the cause or tell the own
 
 ### After each pass
 
-Reply to the owner with the table as printed (links, not bare ids), then one or two lines on what needs them:
+Reply to the owner with the table and the `Decisions` block as printed (links, not bare ids), then one or two lines
+on what else needs them. The owner answers the block in one line, `43.1 44.2`: run `taskq answer 43.1 44.2` verbatim.
+Changed: the manager relayed each `ask` comment verbatim → the `Decisions` block carries every pending choice (#490).
 
-- `ask`: read the question (the last `ask` comment), relay it verbatim. Record the owner's reply:
-  `taskq answer N --text "<verbatim answer>"`. The task goes back to `doing`; a finished worker is requeued by
+- `ask`: a card with no options: read the question (the last `ask` comment), relay it verbatim. Record the owner's
+  reply: `taskq answer N --text "<verbatim answer>"`. The task goes back to `doing`; a finished worker is requeued by
   the next tick and a new worker continues branch `taskq-<N>`; a live one gets it from the next tick.
 - `review`: check the result.
   1. `git show <sha> --stat`, then the diff, against every Acceptance item (`pr` mode: the PR diff).

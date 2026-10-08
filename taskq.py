@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
-import argparse, contextlib, importlib.util, json, os, re, shutil, signal, socket, subprocess, sys, time
+import argparse, contextlib, hashlib, importlib.util, json, os, re, shutil, signal, socket, subprocess, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -680,6 +680,36 @@ def cmd_wait(args):
         time.sleep(args.every)
 
 SENDERS = {'claude': 'SendMessage', 'codex': 'its thread send'}
+CLONE = Path(__file__).resolve().parent  # the taskq clone: its taskq.md is the manager contract (#430)
+
+def contract():
+    """The short hash of the clone's taskq.md, None without one."""
+    path = CLONE / 'taskq.md'
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12] if path.is_file() else None
+
+def refresh():
+    """#430, before tick and wait: `git pull --ff-only` a clean clone, then tell a manager whose contract is stale to re-read it."""
+    if (CLONE / '.git').exists():
+        git = [shutil.which('git') or 'git', '-C', str(CLONE)]
+        status = subprocess.run([*git, 'status', '--porcelain', '--untracked-files=no'], capture_output=True, text=True, encoding='utf-8')
+        if not status.returncode and not status.stdout.strip():
+            pulled = subprocess.run([*git, 'pull', '--ff-only', '-q'], capture_output=True, text=True, encoding='utf-8')
+            if pulled.returncode:
+                print(f'taskq: git pull --ff-only failed: {last_line(pulled.stderr + pulled.stdout)}', file=sys.stderr)
+    path = CONFIG['root'] / '.taskq' / 'pm.json'
+    known = json.loads(path.read_text('utf-8')).get('contract') if path.is_file() else None
+    if contract() and known and known != contract():  # no pm.json: this session never took the role
+        print('The manager contract changed: run taskq pm and follow it from now on.')
+
+def cmd_pm(args):
+    """The manager role: Principles and § 7 of taskq.md, then how to tick this session; the hash goes to .taskq/pm.json."""
+    text, digest = (CLONE / 'taskq.md').read_text('utf-8'), contract()
+    sections = re.findall(r'^## (?:Principles|7\. Manager)\b.*?(?=^## )', text, re.M | re.S)
+    (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
+    (CONFIG['root'] / '.taskq' / 'pm.json').write_text(json.dumps({'contract': digest}), 'utf-8')
+    print(f'taskq pm contract {digest}\nYou are the taskq manager of {CONFIG["root"]}. Follow this role from now on; '
+          f'`taskq` is `python3 {Path(__file__).resolve()}`.\n\n' + '\n'.join(sections))
+    cmd_arm(argparse.Namespace(target=None))
 
 def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
@@ -726,10 +756,13 @@ def main(argv=None):
     command('tick', lambda args: (event_pass if args.quiet else cmd_tick)(args), (('--quiet',), {'action': 'store_true'}), n=False)
     command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}), n=False)
     command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}), n=False)
+    command('pm', cmd_pm, n=False)
     args = parser.parse_args(argv)
     if BOARD is None:
         CONFIG = load_config()
         BOARD = make_board(CONFIG)
+    if args.command == 'wait' or args.command == 'tick' and not args.quiet:
+        refresh()
     args.function(args)
     if args.command in EVENTS:
         dispatch()

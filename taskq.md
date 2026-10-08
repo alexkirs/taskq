@@ -219,6 +219,7 @@ Runtime file: four module-level functions, two more optional.
 | `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
 | `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4) |
 | `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed; print `review #N`, `ask #N`, `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7) |
+| `taskq pm` | print the manager role (Principles, § 7, how to tick this session) under a first line `taskq pm contract <hash>`; record the hash of the clone's `taskq.md` in `.taskq/pm.json` (§ 7) |
 | `taskq arm tick [<manager>]` | print the prompt for a tick-sender session of this runtime; without `<manager>`: how this session ticks itself (a background `taskq wait` that wakes it) (§ 7) |
 
 - `--sha`: 7 to 40 lowercase hex digits; give the full SHA.
@@ -295,6 +296,11 @@ Rules:
 
 The manager is the agent session the owner talks to. It files tasks, runs the tick, relays questions, reviews
 results and closes. It does no task work itself and never answers a worker's question for the owner.
+
+The manager starts with `taskq pm` in the project root and follows what it prints. `taskq tick` and `taskq wait`
+first run `git pull --ff-only` in the taskq clone when it is clean (one line on failure), then compare the hash of its
+`taskq.md` with `.taskq/pm.json` (a runtime handle, R1). A different hash prints first: `The manager contract changed:
+run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#430).
 
 ### Arm the tick
 
@@ -394,5 +400,5 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 ## 10. Develop taskq itself
 
 Every session on a machine runs the clone's `taskq.py`: keep that clone on clean `main` and change taskq only in a
-worktree (`.worktrees/<branch>`). Tests: `python3 -m unittest tests.test_single`; CI runs them on every push.
+worktree (`.worktrees/<branch>`); `tick` and `wait` pull a clean clone (§ 7). Tests: `python3 -m unittest tests.test_single`; CI runs them on every push.
 Design: [docs/single-file.md](docs/single-file.md).

@@ -55,6 +55,7 @@ Claude workers: run `claude` once in the project root and accept the folder trus
 ## Run
 
 ```bash
+taskq pm            # in your agent session: it takes the manager role
 taskq add "Try taskq" --type research --goal "Reply: taskq works. No file changes." --acceptance "The result says: taskq works."
 taskq tick          # starts a worker; then wake the manager per event: taskq arm tick "<manager>"
 taskq list          # the worker hands in: review

@@ -75,7 +75,7 @@ python -m taskq.multiproject --accept-execution-policy POLICY --json   # the own
 python -m taskq.multiproject --manifest FILE --act --execution-policy POLICY --json
 ```
 
-The manifest stays the view: which projects to visit in this invocation, and their `filter`, `mine` and `limits`. A view confers nothing. Acting authority comes only from the execution policy, a second TOML file the owner writes, has reviewed and enrolls. The adapter never writes a profile, the policy file, a configuration or a permission. Its only write is the enrollment's small anchor ([§ Enrollment](#enrollment-and-the-catalog-anchor)).
+The manifest stays the view: which projects to visit in this invocation, and their `filter`, `mine` and `limits`. A view confers nothing. Acting authority comes only from the execution policy, a second TOML file the owner writes, has reviewed and enrolls. The adapter never writes a profile, the policy file, a configuration or a permission. Its only writes are the enrollment's small anchor ([§ Enrollment](#enrollment-and-the-catalog-anchor)) and one output record per actor ([§ Actor output records](#actor-output-records)).
 
 ### Execution policy
 
@@ -160,7 +160,32 @@ The guard is one file: `multiproject-acting.lock` in the OS user's taskq state f
 
 The actor is never killed. At its `timeout` the wrapper reports it `unknown`, leaves it running with its guard, and admits nothing more in this invocation. An actor that ends without a result (crash, lost output) is also `unknown` and stops admission. A refusal or a known native failure lets the next project run.
 
-A restarted wrapper first meets the same guard: while an actor runs, nothing is admitted. After release, the next actor reads everything back fresh (step 3) and releases nothing in that readback. Ownership the tracker and runtimes show is the only durable record. Tracker claims, reservations and locks survive a wrapper restart and a view change. An orphan reservation of a crashed launch holds its place until native reconcile settles it. There is no receipt file. Guard release or a successful readback never means a report was received or applied.
+A restarted wrapper first meets the same guard: while an actor runs, nothing is admitted. After release, the next actor reads everything back fresh (step 3) and releases nothing in that readback. Ownership the tracker and runtimes show is the only durable record of ownership. Tracker claims, reservations and locks survive a wrapper restart and a view change. An orphan reservation of a crashed launch holds its place until native reconcile settles it. There is no receipt file. Guard release or a successful readback never means a report was received or applied.
+
+Every acting result names its run id and the exact recovery command (`run_id`, `recovery`). An actor that outlives its wrapper still writes its actual output to its record (§ Actor output records).
+
+### Actor output records
+
+Each actor gets one output record: `multiproject-output/<run-id>.json` beside the guard. The record holds that run's actual output, and nothing else. It is not a job, a queue, a receipt or a transport.
+
+1. **Allocation.** Before the actor starts, the wrapper creates the empty record: a fresh 32-hex run id, the file created exclusively with mode 0600. The folder must be a real folder (no symlink) of the OS user alone (0700). Otherwise nothing starts. The actor refuses before its guard when its record is not that allocated empty file.
+2. **Completion.** The actor writes its result once, while it still holds the guard. The write is a draft in the same folder, fsync, rename, fsync of the folder. The record holds the run id, the SHA-256 of the canonical catalog and of its binding, the OS user, the machine, the repository, the actor pid, its time, the result exactly as the actor printed it (guard, budget, catalog readback, native outcome and the v1 report) and at most 64 KiB of diagnostics. A result above 1 MiB, or any failed write, leaves the record empty.
+3. **Retention.** At most 32 files in the folder, of any kind, counted after allocation; two racing wrappers both refuse rather than pass the limit. At the limit, the next actor is refused before it starts, so no native mutation happens. Nothing is evicted, cleaned up or migrated, and recovery deletes nothing. The operator recovers each record, then removes resolved ones by hand. The folder's file names are the run ids, so a run stays recoverable even when its wrapper died before printing.
+
+```
+python -m taskq.multiproject --recover-actor-output RUN_ID --execution-policy POLICY --json
+```
+
+Recovery is read only. It never calls the native pass, `tick`, `take`, `spawn`, `release` or enrollment, and never replays an action. Its statuses:
+
+| status | meaning |
+|---|---|
+| `pending` | the host guard is held: an actor still runs, its record is not final |
+| `unknown` | no exact completed record. The record is missing, empty (still running, crashed or cut off), a symlink, of another owner or mode, oversized, truncated or off-shape. Or it does not match the run id, the anchored policy, a binding of it, the OS user, the machine or its actor and guard (pid, path, inode) |
+| `refused` | the record matches, but the fresh read-only readback of every anchored binding is not known, or the inventory of a runtime the binding may start or holds is unreadable |
+| `recovered` | `output` is the actor's actual result, the report revalidated as of `completed_at` |
+
+The policy must equal the accepted anchor. Guard release or a fresh readback alone never makes output `recovered`: only the exact completed record does. `received_applied` is always `unknown`. Output that was lost before this change, such as a wrapper timeout with no record, stays unknown. Nothing is rerun to rebuild it.
 
 ### Results
 
@@ -172,6 +197,6 @@ Removing a view entry only stops admission; the anchored binding and its ownersh
 
 ## Not here
 
-The manifest and execution policy are the only inputs, and the enrollment anchor is the only state: there is no database, job, queue, scheduler, replay, polling or receipt store. Removing a manifest entry stops future reads and admission and leaves the tracker's claims and ownership as they are. Single-project `tick` is unchanged.
+The manifest and execution policy are the only inputs. The enrollment anchor and the bounded actor output records are the only state: there is no database, job, queue, scheduler, replay, polling or receipt store. Removing a manifest entry stops future reads and admission and leaves the tracker's claims and ownership as they are. Single-project `tick` is unchanged.
 
 There is no timer, extra PM or live project activation. Parent #186 still depends on #185, #176 and #177, and live project selection is still open. Fixture tests prove behavior against fakes only: on-disk in-memory trackers, a file `claude agents` list and logged fake launches. They do not qualify live transport, approval, runtime launch or multiproject readiness. Present authorization covers this implementation and its isolated fixtures only: no real enrollment and no live acting pass.

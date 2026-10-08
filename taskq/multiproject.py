@@ -2,6 +2,7 @@
 subprocess per project printing an existing #191 v1 report; the parent revalidates and aggregates them. It never
 runs tick (even plain tick mutates), update, take, spawn, release, cleanup, board reconciliation or a timer, and
 writes nothing. `--act --execution-policy FILE`, stage 3: one guarded native `tick --act` per admitted project.
+`--recover-actor-output RUN_ID --execution-policy FILE` reads one actor's recorded actual output, read only (#217).
 `python -m taskq.multiproject --manifest FILE [--act --execution-policy FILE] --json`; docs/multiproject-pm.md
 is the specification of both files."""
 import argparse
@@ -578,12 +579,15 @@ def canonical(policy, catalog):
     """The catalog's effective fields in one order: only table and list order is ignored. A refused binding has none."""
     if refused := [f'{project_result(binding, errors)["repository"]}: {"; ".join(errors)}' for binding, errors in catalog if errors]:
         raise SystemExit('execution catalog binding refused: ' + ' | '.join(refused))
-    bindings = [{**{key: binding[key] for key in ('provider', 'repository_id', 'repository', 'board', 'principal', 'act')},
-                 'host': binding['host'].lower(), 'checkout': str(Path(binding['checkout']).expanduser().resolve()),
-                 'timeout': binding.get('timeout', ACT_TIMEOUT), 'limits': {runtime: binding['limits'].get(runtime, 0) for runtime in CAPS},
-                 'effects': sorted(set(binding['effects']))} for binding, _ in catalog]
     return {'policy': {key: policy[key] for key in ('version', 'machine', 'os_user', 'caps')},
-            'project': sorted(bindings, key=lambda binding: json.dumps(binding, sort_keys=True))}
+            'project': sorted((canonical_binding(binding) for binding, _ in catalog), key=lambda binding: json.dumps(binding, sort_keys=True))}
+
+
+def canonical_binding(binding):
+    return {**{key: binding[key] for key in ('provider', 'repository_id', 'repository', 'board', 'principal', 'act')},
+            'host': binding['host'].lower(), 'checkout': str(Path(binding['checkout']).expanduser().resolve()),
+            'timeout': binding.get('timeout', ACT_TIMEOUT), 'limits': {runtime: binding['limits'].get(runtime, 0) for runtime in CAPS},
+            'effects': sorted(set(binding['effects']))}
 
 
 def digest(snapshot):
@@ -633,16 +637,18 @@ def read_anchor(machine):
 
 
 def write_anchor(anchor):
-    """Replace the anchor atomically: a draft in the same folder, fsync, rename, fsync of the folder."""
-    path = anchor_path()
+    write_atomic(anchor_path(), json.dumps(anchor, sort_keys=True, indent=1).encode())
+
+
+def write_atomic(path, data):
+    """Replace `path` atomically: a draft in the same folder, fsync, rename, fsync of the folder."""
     draft = path.with_name(f'.{path.name}.{os.getpid()}')
     fd = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
-        try:
-            os.write(fd, json.dumps(anchor, sort_keys=True, indent=1).encode())
+        with os.fdopen(fd, 'wb') as out:  # a whole write: os.write may stop short
+            out.write(data)
+            out.flush()
             os.fsync(fd)
-        finally:
-            os.close(fd)
         os.replace(draft, path)
     except BaseException:
         draft.unlink(missing_ok=True)
@@ -764,20 +770,32 @@ def native_pass(view, limits):
     return code, out.getvalue()
 
 
-def act_project(spec):
+def act_project(spec, record=lambda found, policy, catalog, binding: None):
     """One admitted project in this one process: the host guard first, held without a gap through final admission,
     the complete-catalog readback and the native pass, released at this process's end (a dead wrapper does not end
-    it; a crash does, and leaves the inode). Status `unknown` once the native pass may have run unread."""
+    it; a crash does, and leaves the inode). Status `unknown` once the native pass may have run unread. `record`
+    gets the result while the guard is still held: the actor's output record is complete before the guard frees."""
     entry = spec['entry']
     result = {'status': 'refused', 'errors': [], 'guard': None, 'budget': None, 'catalog': None, 'native': None, 'report': None}
+    policy = catalog = binding = None
     try:
         policy, catalog = load_policy(spec['policy'])
         binding = binding_for(entry, catalog)
         fd, held = guard(policy)
     except (SystemExit, OSError, ValueError) as error:
-        return {**result, 'errors': [str(error)]}
+        record(found := {**result, 'errors': [str(error)]}, policy, catalog, binding)
+        return found
     result['guard'] = {'path': str(guard_path()), 'device': held.st_dev, 'inode': held.st_ino, 'pid': os.getpid(),
                        'domain': f'OS user {policy["os_user"]} only; no host-global capacity is claimed'}
+    try:
+        record(found := admitted(entry, policy, catalog, binding, result), policy, catalog, binding)
+        return found
+    finally:
+        os.close(fd)
+
+
+def admitted(entry, policy, catalog, binding, result):
+    """`act_project` under the held guard: final admission, readback, budget and the native pass."""
     try:
         anchored(policy, catalog)
         if blockers := verify(binding) or workflow(binding, policy['machine']) or update_due():
@@ -812,8 +830,6 @@ def act_project(spec):
         return result
     except (Exception, SystemExit) as error:  # noqa: BLE001 - before the native pass a refusal, after it unknown
         return {**result, 'errors': result['errors'] + [f'{type(error).__name__}: {error}']}
-    finally:
-        os.close(fd)
 
 
 def run_actor(command, cwd, timeout):
@@ -829,30 +845,179 @@ def run_actor(command, cwd, timeout):
 
 
 ACT_STATUS = ('ok', 'judgement_needed', 'blocked', 'failed', 'refused', 'unknown')
+ACT_KEYS = ('status', 'errors', 'guard', 'budget', 'catalog', 'native', 'report')
+
+
+def checked_result(found, at=None):
+    """An actor result as the wrapper may use it, its report revalidated as of `at` (default now); None: no result."""
+    if not isinstance(found, dict) or found.get('status') not in ACT_STATUS:
+        return None
+    found['errors'] = list(found.get('errors') or [])
+    if found.get('report') is not None and found['status'] in ('ok', 'judgement_needed'):
+        if problems := [problem for problem in tick.validate_report(found['report'], at) if problem not in found['errors']]:
+            found.update(status='blocked', errors=problems + found['errors'])
+    return {key: found.get(key) for key in ACT_KEYS}
 
 
 def acting(binding, entry, policy_path, actor):
-    """One actor for one admitted entry; its JSON or an explicit unknown, never empty success."""
+    """One actor for one admitted entry; its JSON or an explicit unknown, never empty success. Its output record is
+    allocated first: at the record limit, or without a protected record folder, nothing starts."""
     timeout = binding.get('timeout', ACT_TIMEOUT)
     try:
-        code, out, err = run_actor(actor + [json.dumps({'entry': entry, 'policy': str(Path(policy_path).resolve())})],
+        run = allocate_record()
+    except (SystemExit, OSError) as error:
+        return {'status': 'refused', 'errors': [f'actor output record: {error}; nothing run']}
+    recovery = {'run_id': run, 'recovery': f'python -m taskq.multiproject --recover-actor-output {run} --execution-policy '
+                                          f'{Path(policy_path).resolve()} --json'}
+    try:
+        code, out, err = run_actor(actor + [json.dumps({'entry': entry, 'policy': str(Path(policy_path).resolve()), 'run': run})],
                                    Path(entry['checkout']).expanduser(), timeout)
     except OSError as error:
-        return {'status': 'failed', 'errors': [f'actor did not start: {error}']}
+        return {'status': 'failed', 'errors': [f'actor did not start: {error}'], **recovery}
     if code is None:
-        return {'status': 'unknown', 'errors': [f'actor still running after {timeout} s: kept with its host guard; outcome unknown']}
+        return {'status': 'unknown', 'errors': [f'actor still running after {timeout} s: kept with its host guard; outcome unknown; '
+                                                f'its actual output is recoverable with run {run} once it ends'], **recovery}
     try:
-        found = json.loads(out) if len(out) <= MAX_OUTPUT else None
+        found = checked_result(json.loads(out) if len(out) <= MAX_OUTPUT else None)
     except ValueError:
         found = None
-    if not isinstance(found, dict) or found.get('status') not in ACT_STATUS:
+    if found is None:
         tail = core.codex_line(err.decode(errors='replace')[-300:]) if err else 'no output'
-        return {'status': 'unknown', 'errors': [f'actor exit {code} without a result ({tail}); its effects are unknown']}
-    found['errors'] = list(found.get('errors') or [])
-    if found.get('report') is not None and found['status'] in ('ok', 'judgement_needed'):
-        if problems := [problem for problem in tick.validate_report(found['report']) if problem not in found['errors']]:
-            found.update(status='blocked', errors=problems + found['errors'])
-    return {key: found.get(key) for key in ('status', 'errors', 'guard', 'budget', 'catalog', 'native', 'report')}
+        return {'status': 'unknown', 'errors': [f'actor exit {code} without a result ({tail}); its effects are unknown'], **recovery}
+    return {**found, **recovery}
+
+
+# --- actor output records (#217): one bounded record of one actor's actual output, never a receipt ---------
+
+MAX_RECORDS = 32  # files in the record folder, any kind; at the limit the next actor is refused, nothing evicted
+MAX_LOG = 64 << 10  # bytes of an actor's diagnostics in its record
+RECORD_KEYS = {'version', 'run_id', 'completed_at', 'policy_sha256', 'binding_sha256', 'os_user', 'machine', 'repository',
+               'actor', 'result', 'log'}
+RUN_ID = re.compile(r'[0-9a-f]{32}')
+
+
+def record_folder(create=False):
+    """The protected record folder beside the guard: a real folder of this OS user alone; SystemExit otherwise."""
+    folder = core.UPDATE_STAMP.parent / 'multiproject-output'
+    if create:
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    found = os.lstat(folder)
+    if not stat.S_ISDIR(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
+        raise SystemExit(f'{folder} is not a folder of OS user {os.getuid()} alone; refused, left as it is')
+    return folder
+
+
+def record_path(run, create=False):
+    if not isinstance(run, str) or not RUN_ID.fullmatch(run):
+        raise SystemExit(f'{run!r} is not a run id')
+    return record_folder(create) / f'{run}.json'
+
+
+def allocate_record():
+    """A fresh run id with its empty record, created exclusively 0600; counted after creation, so two racing wrappers
+    both refuse rather than pass the limit. Only its own just-created empty file is ever removed."""
+    import uuid
+    run = uuid.uuid4().hex
+    path = record_path(run, create=True)
+    os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
+    if (count := len(os.listdir(path.parent))) > MAX_RECORDS:
+        path.unlink()
+        raise SystemExit(f'{count - 1} records at the limit {MAX_RECORDS}; recover them and remove resolved ones by hand '
+                         '(docs/multiproject-pm.md § Actor output records)')
+    return run
+
+
+def empty_record(run):
+    """The path of `run`'s allocated record that no actor has completed yet; SystemExit otherwise."""
+    path = record_path(run)
+    found = os.lstat(path)
+    if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077 or found.st_size:
+        raise SystemExit(f'actor output record {path} is not an allocated empty record; refused, nothing run')
+    return path
+
+
+def complete_record(run, found, policy, catalog, binding, log):
+    """The actor's atomic completion write of its actual output; a result over MAX_OUTPUT leaves the record empty."""
+    record = {'version': 1, 'run_id': run, 'completed_at': now(), 'os_user': os.getuid(), 'actor': {'pid': os.getpid()},
+              'policy_sha256': digest(canonical(policy, catalog)) if policy else None,
+              'binding_sha256': digest(canonical_binding(binding)) if binding else None,
+              'machine': policy and policy['machine'], 'repository': binding and repository_url(binding),
+              'result': {key: found[key] for key in ACT_KEYS}, 'log': log.encode()[-MAX_LOG:].decode(errors='ignore')}
+    if len(json.dumps(record['result'])) > MAX_OUTPUT:
+        raise SystemExit('actual output above 1 MiB: the record stays incomplete')
+    write_atomic(empty_record(run), json.dumps(record, sort_keys=True).encode())
+
+
+def read_record(run):
+    """`run`'s completed record, or SystemExit why its output is unavailable: missing, empty (pending or crashed),
+    a symlink, another owner or mode, oversized, truncated or off-shape. Read only."""
+    path = record_path(run)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as error:
+        raise SystemExit(f'record {path}: {error}') from None
+    try:
+        found = os.fstat(fd)
+        if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
+            raise SystemExit(f'record {path} is not a file of OS user {os.getuid()} alone')
+        with os.fdopen(os.dup(fd), 'rb') as handle:
+            text = handle.read(MAX_OUTPUT + MAX_LOG + 4096 + 1)
+    finally:
+        os.close(fd)
+    if not text:
+        raise SystemExit(f'record {path} is empty: its actor has not completed it (still running, crashed or cut off)')
+    if len(text) > MAX_OUTPUT + MAX_LOG + 4096:
+        raise SystemExit(f'record {path} is oversized')
+    try:
+        record = json.loads(text)
+        valid = isinstance(record, dict) and set(record) == RECORD_KEYS and record['version'] == 1 and isinstance(record['log'], str)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise SystemExit(f'record {path} is truncated or malformed')
+    return record
+
+
+def recover(run, policy_path):
+    """`--recover-actor-output`: the actual output of one actor run, read only. Pending while the guard is held;
+    unknown without its exact completed record; refused while fresh catalog ownership or a needed inventory is
+    unknown. It never runs a native pass, tick, take, spawn, release or enrollment, and never infers a receipt."""
+    result = {'run_id': run, 'status': 'unknown', 'errors': [], 'record': None, 'completed_at': None, 'output': None,
+              'received_applied': 'unknown'}
+    try:
+        result['record'] = str(record_path(run))
+        policy, catalog = load_policy(policy_path)
+        anchored(policy, catalog)
+        if held := guard_free(policy):  # an actor still runs: its record is not final yet
+            return {**result, 'status': 'pending', 'errors': [held]}
+        record = read_record(run)
+        bindings = {digest(canonical_binding(binding)): binding for binding, _ in catalog}
+        binding = bindings.get(record['binding_sha256'])
+        mismatch = [what for what, ok in (
+            ('run id', record['run_id'] == run), ('policy', record['policy_sha256'] == digest(canonical(policy, catalog))),
+            ('binding', binding is not None and record['repository'] == repository_url(binding)),
+            ('OS user', record['os_user'] == os.getuid() == policy['os_user']), ('machine', record['machine'] == policy['machine']))
+            if not ok]
+        output = checked_result(record['result'], tick.report_timestamp(record['completed_at']))
+        guarded = output and output['guard']
+        if output is None or set(record['result']) != set(ACT_KEYS) or guarded and (
+                guarded.get('path') != str(guard_path()) or guarded.get('inode') != guard_path().stat().st_ino
+                or guarded.get('pid') != (record['actor'] or {}).get('pid')):
+            mismatch.append('actor and guard provenance')
+        if mismatch:
+            return {**result, 'errors': [f'record {result["record"]} does not match its {", ".join(mismatch)}: output unknown']}
+        reads = [checked_read(read_occupancy(other, errors)) for other, errors in catalog]
+        own = next(read for (other, _), read in zip(catalog, reads) if other is binding)
+        errors = [f'{project_result(other, errors)["repository"]}: {read["status"]} ({"; ".join(read.get("errors", []))})'
+                  for (other, errors), read in zip(catalog, reads) if read['status'] != 'ok']
+        inventory = {'claude': lambda: claude_inventory(claude_rows()), 'codex': lambda: codex_inventory(codex_threads())}
+        errors += [f'{runtime} inventory unknown' for runtime in CAPS
+                   if (binding['limits'].get(runtime, 0) or (own.get('L') or {}).get(runtime, 0)) and inventory[runtime]() is None]
+        if errors:
+            return {**result, 'status': 'refused', 'errors': ['fresh readback unknown, recovery not qualified: ' + ', '.join(errors)]}
+        return {**result, 'status': 'recovered', 'completed_at': record['completed_at'], 'output': output}
+    except (SystemExit, OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        return {**result, 'errors': [str(error)]}
 
 
 def act(manifest, policy_path, actor=None):
@@ -899,6 +1064,8 @@ def render(result):
         lines += ['', f'# {project["repository"]} ({project["provider"]} id {project["repository_id"]}, '
                       f'board {project["board"]}): {project["status"]}']
         lines += [f'Blocker: {error}' for error in project['errors']]
+        if project.get('recovery'):
+            lines.append(f'Actual output record: {project["recovery"]}')
         if project.get('budget'):
             lines.append('Limits: ' + ', '.join(
                 f'{runtime}={found["limit"]} (L {found["L"]} + F {found["F"]}, occupancy {found["occupancy"]}/{found["cap"]}'
@@ -918,6 +1085,7 @@ def main(argv=None, reader=READER):
     parser.add_argument('--act', action='store_true', help='one guarded native `tick --act` per admitted project')
     parser.add_argument('--execution-policy', metavar='FILE', help='the accepted execution catalog that --act requires')
     parser.add_argument('--accept-execution-policy', metavar='FILE', help='enroll or replace the accepted execution catalog; no tick')
+    parser.add_argument('--recover-actor-output', metavar='RUN_ID', help="read one actor run's recorded actual output; read only")
     parser.add_argument('--enroll-check', metavar='SPEC', help=argparse.SUPPRESS)  # one candidate binding's checks, JSON
     parser.add_argument('--observe', metavar='ENTRY', help=argparse.SUPPRESS)  # the reader: one verified entry, JSON
     parser.add_argument('--occupancy', metavar='BINDING', help=argparse.SUPPRESS)  # one binding's ownership, JSON
@@ -938,10 +1106,31 @@ def main(argv=None, reader=READER):
         return
     if args.actor:
         # Its output is one JSON line at the end; a dead wrapper's broken pipe can then cut nothing but that line.
+        # The same result goes first to its output record, which outlives the wrapper (§ Actor output records).
+        spec = json.loads(args.actor)
+
+        def record(found, *loaded):
+            with contextlib.suppress(SystemExit, OSError, ValueError, TypeError):  # unwritten: the record stays empty, unknown
+                complete_record(spec['run'], found, *loaded, said.getvalue())
         with contextlib.redirect_stdout(io.StringIO()) as said, contextlib.redirect_stderr(said):
-            found = act_project(json.loads(args.actor))
+            try:
+                empty_record(spec.get('run'))
+            except (SystemExit, OSError) as error:
+                found = {key: None for key in ACT_KEYS} | {'status': 'refused', 'errors': [str(error)]}
+            else:
+                found = act_project(spec, record)
         with contextlib.suppress(OSError):
             print(json.dumps({**found, 'log': said.getvalue()[-2000:]}), flush=True)
+        return
+    if args.recover_actor_output:
+        if not args.execution_policy or args.manifest or args.act:
+            parser.error('--recover-actor-output takes --execution-policy alone')
+        with contextlib.redirect_stdout(sys.stderr):
+            found = recover(args.recover_actor_output, args.execution_policy)
+        print(json.dumps(found) if args.json else f'{found["status"]}: run {found["run_id"]}; received/applied: unknown'
+              + ''.join(f'\nBlocker: {error}' for error in found['errors']))
+        if found['status'] != 'recovered':
+            raise SystemExit(1)
         return
     if not args.manifest:
         parser.error('--manifest is required')

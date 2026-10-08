@@ -315,6 +315,7 @@ class Acting(unittest.TestCase):
                                          claude_rows=lambda: json.loads((self.dir / 'agents.json').read_text())))
         self.enterContext(patch.object(core, 'CODEX_SOCKET', self.dir / 'no-codex.sock'))  # never the host's runtimes
         self.guard, self.anchor = multiproject.guard_path(), multiproject.anchor_path()
+        self.records = self.dir / 'taskq' / 'multiproject-output'
         self.agents(LIVE)
         self.alpha = self.project('alpha', 11, tasks=[(1,), (2,)])
         self.beta = self.project('beta', 22, tasks=[(1,)])
@@ -754,6 +755,12 @@ class Acting(unittest.TestCase):
         self.assertFalse(descendant['inherited'])
         self.assertIn('Attempt', '\n'.join(note['body'] for note in self.store('held').notes.values()))
         self.assertTrue(any(row['sessionId'].startswith('w-held') for row in json.loads((self.dir / 'agents.json').read_text())))
+        # The dead wrapper printed nothing; the record folder names the run, and its actual output survives.
+        [record] = os.listdir(self.records)
+        found = multiproject.recover(record.removesuffix('.json'), self.dir / 'policy.toml')
+        self.assertEqual((found['status'], found['output']['status']), ('recovered', 'ok'), found)
+        self.assertEqual(found['output']['guard']['inode'], self.guard.stat().st_ino)  # the one continuous guard
+        self.assertEqual(len(self.calls('native')), 1)
 
     def test_crash_frees_the_lock_keeps_the_inode_and_restart_counts_the_orphan_without_releasing_it(self):
         crash = self.project('crash', 91, tasks=[(1,)], spawn={'crash': True})
@@ -764,9 +771,112 @@ class Acting(unittest.TestCase):
         self.assertIn('actor exit 9 without a result', result['projects'][0]['errors'][0])
         self.assertEqual((multiproject.guard_free({'os_user': os.getuid()}), self.guard.stat().st_ino), (None, inode))
         orphan, written = self.block('crash', 1)['reservation'], self.mutations('crash')
+        lost = multiproject.recover(result['projects'][0]['run_id'], policy)  # the crash left its record empty
+        self.assertEqual((lost['status'], lost['output'], lost['received_applied']), ('unknown', None, 'unknown'))
+        self.assertIn('is empty: its actor has not completed it', lost['errors'][0])
         again = self.act([self.beta], policy)['projects'][0]
         self.assertEqual((again['status'], self.limits(again)['claude']), ('ok', (7, True, 1, 0, 1)))  # the orphan holds a place
         self.assertEqual((self.block('crash', 1)['reservation'], self.mutations('crash')), (orphan, written))  # read back, not released
+
+    def test_late_actor_output_is_recovered_after_wrapper_timeout_and_a_restart_while_it_runs_acts_on_nothing(self):
+        slow = self.project('slow', 71, tasks=[(1,)], spawn={'sleep': 8})
+        policy = self.catalog({**slow, 'timeout': 3, 'limits': {'claude': 1}}, self.beta)
+        result = self.act([slow, self.beta], policy)
+        late = result['projects'][0]
+        self.assertEqual((late['status'], result['received_applied']), ('unknown', 'unknown'))
+        self.assertIn(f'recoverable with run {late["run_id"]}', late['errors'][0])
+        self.assertIn(f'--recover-actor-output {late["run_id"]} --execution-policy {policy}', late['recovery'])
+        self.assertIn('Actual output record: python -m taskq.multiproject --recover-actor-output', multiproject.render(result))
+        self.wait(lambda: self.calls('spawn'))
+        for _ in range(2):  # a restarted wrapper or operator while the actor runs: pending, nothing started or replayed
+            pending = multiproject.recover(late['run_id'], policy)
+            self.assertEqual((pending['status'], pending['output'], pending['received_applied']), ('pending', None, 'unknown'))
+            self.assertIn('host guard held', pending['errors'][0])
+        self.assertEqual((len(self.calls('native')), len(self.calls('spawn'))), (1, 1))
+        self.wait(lambda: multiproject.guard_free({'os_user': os.getuid()}) is None)
+        path = self.records / f'{late["run_id"]}.json'
+        self.assertEqual((path.stat().st_mode & 0o777, self.records.stat().st_mode & 0o777), (0o600, 0o700))
+        written = path.read_bytes()
+        for _ in range(2):  # across restarts: the same actual output, read only
+            found = multiproject.recover(late['run_id'], policy)
+            self.assertEqual((found['status'], found['errors'], found['received_applied']), ('recovered', [], 'unknown'), found)
+            output = found['output']
+            self.assertEqual((output['status'], output['native']['outcome']), ('ok', 'ok'))
+            self.assertEqual(tick.validate_report(output['report'], tick.report_timestamp(found['completed_at'])), [])
+            self.assertEqual((output['guard']['inode'], output['guard']['pid']), (self.guard.stat().st_ino, json.loads(written)['actor']['pid']))
+        self.assertEqual((len(self.calls('native')), len(self.calls('spawn')), path.read_bytes()), (1, 1, written))
+        self.assertEqual([row for row in self.calls('api') if row[0] == 'occupancy' and row[3] != 'GET'], [])
+        done = subprocess.run(ACT + ['wrapper', '--recover-actor-output', late['run_id'], '--execution-policy', str(policy), '--json'],
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual((done.returncode, json.loads(done.stdout)['status']), (0, 'recovered'), done.stderr)
+        self.assertEqual(len(self.calls('native')), 1)
+        self.assertTrue(path.exists())  # never deleted by recovery
+
+    def test_mismatched_or_damaged_records_stay_unknown_and_unknown_readback_refuses_recovery(self):
+        policy = self.catalog(self.alpha, {**self.beta, 'limits': {'claude': 1}})
+        run = self.act([self.beta], policy)['projects'][0]['run_id']
+        path = self.records / f'{run}.json'
+        good = path.read_bytes()
+        self.assertEqual(multiproject.recover(run, policy)['status'], 'recovered')
+
+        def changed(**fields):
+            return json.dumps({**json.loads(good), **fields}).encode()
+        record = json.loads(good)
+        guard = record['result']['guard']
+        other = '0' * 32
+        for broken, why in ((changed(policy_sha256='0' * 64), 'policy'), (changed(binding_sha256='0' * 64), 'binding'),
+                            (changed(run_id=other), 'run id'), (changed(os_user=os.getuid() + 1), 'OS user'),
+                            (changed(machine='a-different-host'), 'machine'), (changed(actor={'pid': 1}), 'provenance'),
+                            (changed(result={**record['result'], 'guard': {**guard, 'inode': guard['inode'] + 1}}), 'provenance'),
+                            (changed(result={**record['result'], 'status': 'applied'}), 'provenance'),
+                            (changed(receipt='applied'), 'malformed'), (good[:len(good) // 2], 'truncated'),
+                            (b'', 'is empty'), (b' ' * (multiproject.MAX_OUTPUT + multiproject.MAX_LOG + 5000), 'oversized')):
+            path.write_bytes(broken)
+            found = multiproject.recover(run, policy)
+            self.assertEqual((found['status'], found['output'], found['received_applied']), ('unknown', None, 'unknown'), why)
+            self.assertIn(why, found['errors'][0])
+            self.assertEqual(path.read_bytes(), broken)  # left as it is
+        path.write_bytes(good)
+        os.chmod(path, 0o644)
+        self.assertIn('alone', multiproject.recover(run, policy)['errors'][0])
+        os.chmod(path, 0o600)
+        path.rename(self.dir / 'elsewhere.json')
+        path.symlink_to(self.dir / 'elsewhere.json')
+        self.assertEqual(multiproject.recover(run, policy)['status'], 'unknown')
+        path.unlink()
+        self.assertIn('No such file', multiproject.recover(run, policy)['errors'][0])
+        (self.dir / 'elsewhere.json').rename(path)
+        self.assertIn('is not a run id', multiproject.recover('../anchor', policy)['errors'][0])
+        os.chmod(self.records, 0o755)
+        self.assertIn('alone; refused', multiproject.recover(run, policy)['errors'][0])
+        os.chmod(self.records, 0o700)
+        changed_policy = self.catalog(self.alpha, {**self.beta, 'limits': {'claude': 2}}, enroll=False, file='changed.toml')
+        self.assertIn('differs from accepted generation 1', multiproject.recover(run, changed_policy)['errors'][0])
+        # Fresh readback: unknown catalog ownership or a needed inventory refuses qualification; nothing is inferred.
+        (self.dir / 'alpha').rename(self.dir / 'alpha-moved')
+        found = multiproject.recover(run, policy)
+        self.assertEqual((found['status'], found['output'], found['received_applied']), ('refused', None, 'unknown'))
+        self.assertIn('recovery not qualified: https://gitlab.example/acme/alpha: failed', found['errors'][0])
+        (self.dir / 'alpha-moved').rename(self.dir / 'alpha')
+        self.agents('not json')
+        self.assertIn('claude inventory unknown', multiproject.recover(run, policy)['errors'][0])
+        self.agents(LIVE)
+        self.assertEqual(multiproject.recover(run, policy)['status'], 'recovered')
+        self.assertEqual(len(self.calls('native')), 1)
+
+    def test_record_limit_refuses_the_next_actor_before_native_mutation_and_deletes_nothing(self):
+        policy = self.catalog(self.alpha, {**self.beta, 'limits': {'claude': 1}})
+        self.records.mkdir(mode=0o700)
+        for n in range(multiproject.MAX_RECORDS - 1):  # unresolved records of earlier runs, empty or not
+            (self.records / f'{n:032x}.json').write_bytes(b'' if n % 2 else b'{}')
+        before = sorted(os.listdir(self.records))
+        result = self.act([self.alpha, self.beta], policy)
+        self.assertEqual([project['status'] for project in result['projects']], ['ok', 'refused'], result)
+        self.assertIn(f'32 records at the limit {multiproject.MAX_RECORDS}; recover them', result['projects'][1]['errors'][0])
+        self.assertEqual(len(self.calls('native')), 1)
+        self.assertEqual(len(os.listdir(self.records)), multiproject.MAX_RECORDS)
+        self.assertTrue(set(before) <= set(os.listdir(self.records)))  # nothing evicted
+        self.assertEqual(self.mutations('beta'), [])
 
     def test_differing_principals_and_enrollment_contend_on_one_host_inode(self):
         first = self.project('first', 101, tasks=[(1,)], spawn={'sleep': 4})

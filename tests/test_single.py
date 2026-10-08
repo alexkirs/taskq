@@ -145,7 +145,7 @@ class PullRequests(Base):
         self.add()
         self.run_cli('take', '1')
         self.run_cli('result', '1', '--sha', 'a' * 40)
-        self.calls, self.prs, self.merged = [], [{'number': 7, 'headRefOid': 'a' * 40}], True
+        self.calls, self.prs, self.merged = [], [{'number': 7, 'headRefOid': 'a' * 40, 'baseRefName': 'main'}], True
 
     def cli(self, command, **_):
         self.calls.append(command[1:])
@@ -175,10 +175,12 @@ class PullRequests(Base):
         self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\nmerged {"c" * 40}')
 
     def test_head_is_not_the_result(self):
-        self.prs[0]['headRefOid'] = 'b' * 40
-        with self.assertRaisesRegex(SystemExit, 'do not match the result'):
-            self.close()
-        self.assertEqual((self.task(1)['state'], len(self.calls)), ('review', 1))
+        for change in ({'headRefOid': 'b' * 40}, {'baseRefName': 'release'}):
+            self.prs[0].update(change)
+            with self.assertRaisesRegex(SystemExit, 'do not match the result'):
+                self.close()
+            self.prs[0].update(headRefOid='a' * 40, baseRefName='main')
+        self.assertEqual((self.task(1)['state'], [call[1] for call in self.calls]), ('review', ['list', 'list']))
 
     def test_refusal_requeues(self):
         self.merged = False
@@ -189,7 +191,7 @@ class PullRequests(Base):
 
     def test_gitlab_and_review_mode(self):
         taskq.CONFIG.update(board='gitlab', host='git.example')
-        self.prs = [{'iid': 7, 'sha': 'a' * 40}]
+        self.prs = [{'iid': 7, 'sha': 'a' * 40, 'target_branch': 'main'}]
         self.close()
         self.assertEqual(self.calls[1][-3:], ['--yes', '-R', 'https://git.example/o/r'])
         with tempfile.TemporaryDirectory() as folder:

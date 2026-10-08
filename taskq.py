@@ -352,7 +352,7 @@ def commit(sha):
     return sha if re.fullmatch('[0-9a-f]{7,40}', sha) else fail(f'{sha!r} is not a commit: 7 to 40 lowercase hex digits')
 
 def merge(current, sha):
-    """pr mode: squash-merge the one open PR/MR of branch taskq-<N> when its head is the result: the merge commit, None with no PR.
+    """pr mode: squash-merge the one open PR/MR of branch taskq-<N> into main at the result SHA: the merge commit, None with no PR.
     A PR that does not merge (conflict, failing checks) goes back to the worker: requeue with the platform's message."""
     lab, host, branch = CONFIG['board'] == 'gitlab', CONFIG.get('host'), f'taskq-{current["iid"]}'
     where = ['-R', (f'https://{host}/' if lab else f'{host}/') * bool(host) + CONFIG['repo']]  # gh takes HOST/OWNER/REPO, glab a URL
@@ -360,11 +360,12 @@ def merge(current, sha):
     def cli(*command):
         done = subprocess.run([shutil.which(command[0]) or fail(f'{command[0]} not found'), *command[1:], *where], capture_output=True, text=True, encoding='utf-8')
         return done.returncode, (done.stderr.strip() or done.stdout.strip()) if done.returncode else done.stdout
-    code, out = cli(*(['glab', 'mr', 'list', '--source-branch', branch, '--output', 'json'] if lab else ['gh', 'pr', 'list', '--head', branch, '--json', 'number,headRefOid']))
-    found = code and fail(out) or [(str(pr.get('iid', pr.get('number'))), pr.get('sha', pr.get('headRefOid'))) for pr in json.loads(out)]
-    if len(found) != 1 or not found[0][1].startswith(sha):
-        return found and fail(f'{branch}: open PRs (number, head) {found} do not match the result {sha}')
-    number, head = found[0]
+    code, out = cli(*(['glab', 'mr', 'list', '--source-branch', branch, '--output', 'json'] if lab else ['gh', 'pr', 'list', '--head', branch, '--json', 'number,headRefOid,baseRefName']))
+    found = code and fail(out) or [(str(pr.get('iid', pr.get('number'))), pr.get('sha', pr.get('headRefOid')), pr.get('target_branch', pr.get('baseRefName')))
+                                   for pr in json.loads(out)]
+    if found != [(found and found[0][0], sha, 'main')]:  # exactly one, into main, at the full result SHA
+        return found and fail(f'{branch}: open PRs (number, head, base) {found} do not match the result {sha} into main')
+    number, head, _ = found[0]
     _, out = cli(*(['glab', 'mr', 'merge', number, '--squash', '--remove-source-branch', '--sha', head, '--auto-merge=false', '--yes'] if lab
                    else ['gh', 'pr', 'merge', number, '--squash', '--delete-branch', '--match-head-commit', head]))
     code, viewed = cli(*(['glab', 'mr', 'view', number, '--output', 'json'] if lab else ['gh', 'pr', 'view', number, '--json', 'state,mergeCommit']))
@@ -377,8 +378,7 @@ def merge(current, sha):
 def cmd_close(args):
     current = task(args.n, 'review')
     sha = commit((current['result'] or {}).get('sha') or '')
-    merged = CONFIG['publish'] == 'pr' and merge(current, sha)
-    if merged:
+    if CONFIG['publish'] == 'pr' and (merged := merge(current, sha)):
         args.text = f'merged {merged}' + (f'\n\n{args.text}' if args.text else '')
     else:  # direct mode, or a pr-mode task with no PR (an answer): the result must be on main
         git = [shutil.which('git') or fail('git not found'), '-C', str(CONFIG['root'])]

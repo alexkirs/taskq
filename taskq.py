@@ -705,9 +705,9 @@ def refresh():
         status = subprocess.run([*git, 'status', '--porcelain', '--untracked-files=no'], capture_output=True, text=True, encoding='utf-8')
         if not status.returncode and not status.stdout.strip():
             # fetch into origin/main, then fast-forward from that ref: FETCH_HEAD is shared with concurrent fetches of task branches
-            pulled = subprocess.run([*git, 'fetch', '-q', 'origin', 'main:refs/remotes/origin/main'], capture_output=True, text=True, encoding='utf-8')
-            if not pulled.returncode:
-                pulled = subprocess.run([*git, 'merge', '--ff-only', '-q', 'origin/main'], capture_output=True, text=True, encoding='utf-8')
+            pulled = subprocess.run([*git, 'fetch', '-q', 'origin'], capture_output=True, text=True, encoding='utf-8')
+            if not pulled.returncode:  # the clone's own upstream, whatever its default branch is called
+                pulled = subprocess.run([*git, 'merge', '--ff-only', '-q', '@{upstream}'], capture_output=True, text=True, encoding='utf-8')
             if pulled.returncode:
                 print(f'taskq: git pull --ff-only failed: {last_line(pulled.stderr + pulled.stdout)}', file=sys.stderr)
     path = CONFIG['root'] / '.taskq' / 'pm.json'

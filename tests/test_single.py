@@ -464,6 +464,35 @@ class Tick(Base):
         self.assertEqual(self.fake.sent, [('s-T1', 'The owner answered your question:\n\nthe first')])
         self.assertEqual(self.task(1)['state'], 'doing')
 
+    def test_decisions_block_and_answer_by_codes(self):
+        # #490: cards for an ask and a review with options; one line of codes answers both
+        for title in ('one', 'two', 'three'):
+            self.add(title)
+        taskq.CONFIG['limits'] = {'fake': 3}
+        self.run_cli('tick')
+        self.run_cli('ask', '1', '--text', 'Built A and B.\nWhich one?', '--option', 'keep A', '--option', 'keep B',
+                     '--recommend', '2', '--link', 'https://x/shot.png', '--link', 'https://x/demo.mp4')
+        self.run_cli('result', '2', '--sha', 'a' * 40, '--text', 'Done X', '--option', 'close as is', '--option', 'also do Y')
+        self.run_cli('result', '3', '--sha', 'a' * 40, '--text', 'plain')  # no options: no card
+        out = self.run_cli('tick').split('Decisions (answer: taskq answer N.K ...):\n')[1]
+        self.assertEqual(out.splitlines(), [
+            '[#1](https://board/1) ask: Built A and B. · ![1](https://x/shot.png) · https://x/demo.mp4 · 1.1 keep A · 1.2 keep B (recommended)',
+            '[#2](https://board/2) review: Done X · 2.1 close as is (recommended) · 2.2 also do Y'])
+        taskq.CONFIG['inline_media'] = False
+        self.assertIn(' · https://x/shot.png · ', self.run_cli('tick'))
+        for bad, message in (('1.3', 'no option 3'), ('3.1', 'no option 1'), ('1.x', 'codes like'), ('9', 'codes like')):
+            with self.assertRaisesRegex(SystemExit, message):
+                self.run_cli('answer', '1.2', bad)
+        self.assertEqual(self.task(1)['state'], 'ask')  # a bad code moves nothing
+        with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')):
+            self.run_cli('answer', '1.2, 2.1')
+        self.assertEqual((self.task(1)['state'], self.task(1)['raw']['decision'], self.board.issues[2]['state']), ('doing', None, 'closed'))
+        self.assertEqual(self.board.issues[2]['comments'][-1], '**close** · claude:01234567\n\n2.1: close as is')
+        self.assertEqual(self.fake.sent[-1], ('s-T1', 'The owner answered your question:\n\n1.2: keep B'))
+        self.assertNotIn('Decisions', self.run_cli('tick'))
+        with self.assertRaisesRegex(SystemExit, 'pick 1 to 1'):
+            self.run_cli('ask', '1', '--text', 'q', '--option', 'a', '--recommend', '2')
+
     def test_waiting_becomes_ready_and_runs(self):
         self.add('one')
         self.add('two', '--deps', '1')

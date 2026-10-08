@@ -417,15 +417,49 @@ def cmd_take(args):
         fail(f'#{args.n} has open dependencies')
     move(current, 'doing', 'take', claim={**mine, 'name': machine()}, result=None)
 
+def decision(args):
+    """#490: the decision card of an ask or result: what was done (the text's first line), results, options, one recommended."""
+    if not args.option and args.recommend != 1:
+        fail('--recommend needs --option')
+    if args.option and not 1 <= args.recommend <= len(args.option):
+        fail(f'--recommend {args.recommend}: pick 1 to {len(args.option)}')
+    return {'summary': args.text.strip().split('\n')[0][:120], 'links': args.link, 'options': args.option, 'recommend': args.recommend}
+
 # Moves with no other check: command -> (states it takes from, state it goes to, block changes).
-MOVES = {'ask': (('doing',), 'ask', lambda args: {}), 'answer': (('ask',), 'doing', lambda args: {}),
-         'requeue': (STATES, 'ready', lambda args: {'claim': None, 'result': None}),
+MOVES = {'ask': (('doing',), 'ask', lambda args: {'decision': decision(args)}), 'answer': (('ask',), 'doing', lambda args: {'decision': None}),
+         'requeue': (STATES, 'ready', lambda args: {'claim': None, 'result': None, 'decision': None}),
          'later': (STATES, 'later', lambda args: {'waiting_for': args.text or None}),
-         'result': (('doing',), 'review', lambda args: {'result': {'sha': args.sha, 'checks': args.checks}})}
+         'result': (('doing',), 'review', lambda args: {'result': {'sha': args.sha, 'checks': args.checks}, 'decision': decision(args)})}
 
 def cmd_move(args):
     sources, state, fields = MOVES[args.command]
     move(task(args.n, *sources), state, args.command, args.text, **fields(args))
+
+def codes(words):
+    """'43.1 44.2' (spaces or commas) -> [(43, 1), (44, 2)]."""
+    found = [re.fullmatch(r'(\d+)\.(\d+)', word) for word in re.split(r'[\s,]+', ' '.join(words).strip())]
+    return [(int(code[1]), int(code[2])) for code in found] if all(found) else fail(f'{" ".join(words)!r}: answer N --text A, or codes like 43.1 44.2')
+
+def cmd_answer(args):
+    """`answer N --text A`, or `answer 43.1 44.2` (#490): each code picks an option of the task's card. An ask goes back to
+    `doing` with the option's text; a review: an option starting `close` closes it, another goes back to the worker.
+    Every code is checked before any task moves."""
+    if args.text:
+        if len(args.n) != 1 or not args.n[0].isdigit():
+            fail('answer N --text A: one task number')
+        cmd_move(argparse.Namespace(**{**vars(args), 'n': int(args.n[0])}))
+        return [int(args.n[0])]
+    picks = []
+    for n, k in codes(args.n):
+        current = task(n, 'ask', 'review')
+        options = (current['raw'].get('decision') or {}).get('options') or []
+        picks.append((current, k, 0 < k <= len(options) and options[k - 1] or fail(f'#{n} has no option {k}')))
+    for current, k, text in picks:
+        if current['state'] == 'review' and text.lower().startswith('close'):
+            close_one(argparse.Namespace(n=current['iid'], text=f'{current["iid"]}.{k}: {text}'))
+        else:
+            move(current, 'doing', 'answer', f'{current["iid"]}.{k}: {text}', decision=None)
+    return [current['iid'] for current, _, _ in picks]
 
 def commit(sha):
     """A result's commit: hex only, so it never reaches git as an option."""
@@ -702,7 +736,9 @@ Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_
 
 Workspace: {workspace}; a branch taskq-{n} left by an earlier worker: continue it. A task that ends in an answer, not a commit,
 needs no worktree. Commands:
-- A question only the owner can decide (a product choice, an action that cannot be undone): `{tq} ask {n} --text "<question>"`, then stop.
+- A question only the owner can decide (a product choice, an action that cannot be undone): `{tq} ask {n} --text "<what was done; the question>"
+  --option "<A>" --option "<B>" --recommend <K> [--link <url of a result, image or video>]`, then stop. A result that leaves the owner a choice
+  takes the same --option/--recommend/--link; an option starting `close` accepts the result.
 - Cannot be done: `{tq} requeue {n} --text "<why>"`, then stop.
 - Deliver: commit on branch taskq-{n}, `git fetch origin && git rebase origin/main`, run the tests, {push} --checks "<commands and outcome>" --text "<summary>"`, then stop.
   An answer with no commit: the result names the current origin/main SHA and the text holds the answer.
@@ -823,7 +859,25 @@ def one_pass(args, table=True):
     url = CONFIG.get('board_url') or {'github': f'https://{host or "github.com"}/{repo}/issues',
                                       'gitlab': f'https://{host or "gitlab.com"}/{repo}/-/issues'}.get(CONFIG['board'])
     url and print(f'Board: {url}')  # a board file names its page in `board_url`
+    cards = decisions(filter(mine, items))
+    cards and print('\n'.join(['', 'Decisions (answer: taskq answer N.K ...):', *cards]))
     return held
+
+MEDIA = re.compile(r'\.(png|jpe?g|gif|webp|svg)(\?.*)?$', re.I)
+
+def decisions(items):
+    """#490: one line per task waiting on the owner: an ask, or a review with options. Images inline unless `inline_media` is false."""
+    lines = []
+    for item in items:
+        card = item['raw'].get('decision') or {}
+        if not (item['state'] == 'ask' or item['state'] == 'review' and card.get('options')):
+            continue
+        n, inline = item['iid'], CONFIG.get('inline_media', True)
+        links = [f'![{n}]({link})' if inline and MEDIA.search(link) else link for link in card.get('links') or []]
+        options = [f'{n}.{k} {text}' + ' (recommended)' * (k == card.get('recommend')) for k, text in enumerate(card.get('options') or [], 1)]
+        head = f'[#{n}]({item["url"]})' if item.get('url') else f'#{n}'
+        lines.append(' · '.join(filter(None, [f'{head} {item["state"]}: {card.get("summary") or item["title"]}', *links, *options])))
+    return lines
 
 EVENTS = ('add', 'answer', 'result', 'requeue', 'close')  # R4 (#333): each starts one pass after its move
 
@@ -946,9 +1000,11 @@ def main(argv=None):
             (('--priority',), {'type': int, 'choices': (1, 2), 'default': 2}), (('--host',), {}), n=False)
     command('list', cmd_list, (('state',), {'nargs': '?', 'choices': STATES}), n=False)
     command('take', cmd_take)
-    command('ask', cmd_move, text='required')
-    command('answer', cmd_move, text='required')
-    command('result', cmd_move, (('--sha',), {'required': True, 'type': commit}), (('--checks',), {'default': ''}), text=True)
+    card = ((('--option',), {'action': 'append', 'default': []}), (('--recommend',), {'type': int, 'default': 1}),
+            (('--link',), {'action': 'append', 'default': []}))  # #490: the decision card
+    command('ask', cmd_move, *card, text='required')
+    command('answer', cmd_answer, (('n',), {'nargs': '+'}), n=False, text=True)
+    command('result', cmd_move, (('--sha',), {'required': True, 'type': commit}), (('--checks',), {'default': ''}), *card, text=True)
     command('requeue', cmd_move, text=True)
     command('later', cmd_move, text=True)
     command('close', cmd_close, (('n',), {'nargs': '+', 'type': int}), n=False, text=True)
@@ -966,7 +1022,7 @@ def main(argv=None):
         refresh()
     done = args.function(args)
     if args.command in EVENTS:
-        dispatch(args.command, done if args.command == 'add' else args.n)
+        dispatch(args.command, done if args.command in ('add', 'answer') else args.n)
 
 if __name__ == '__main__':
     main()

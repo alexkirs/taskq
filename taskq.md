@@ -87,7 +87,7 @@ pinned at `6257953`. taskq links the style; it does not redefine it.
 This file is the whole contract (with [docs/single-file.md](docs/single-file.md) for design). Briefs and docs link
 here; they never copy it. A change of behavior updates this file in the same deliverable.
 Changed: "the Wiki is the SoT; principles.md is its packaged copy" → `taskq.md` at the root is the SoT (#289, #290).
-Open: delete the Wiki pages or mark them stale.
+Changed: Open "delete the Wiki pages or mark them stale" → the Wiki is a stub linking here (#452).
 
 ### R9. No silent changes to model, effort or permissions
 
@@ -121,6 +121,8 @@ application or completion.
 3. At the project root write `taskq.json` (fields: § 2) and commit it. Labels are created by the first `add`.
 4. Check: `taskq list` prints the queue (empty is fine) and no error. Claude workers: run `claude` once in the
    project root and accept the folder trust prompt (only the owner can); else every spawn fails `Workspace not trusted`.
+   Log in once with the same `claude` the tick starts: `claude auth login`. Codex workers: `codex login` once; they
+   use your Codex model and config.
 5. Another board or runtime: copy the GitHub class or the Claude class of `taskq.py` into `boards/<name>.py` or
    `runtimes/<name>.py` as module-level functions (§ 2), and name the file in `taskq.json`.
 
@@ -387,12 +389,19 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
   `CODEX_THREAD_ID` from its environment.
 - A session that carries both ids (a Claude session started from Codex): set `TASKQ_RUNTIME` to the right one.
 - Add `.taskq/` and `.worktrees/` to the project's `.gitignore`.
+- Claude: the Remote Control link needs a claude.ai subscription login; without it the worker has no link.
+- Claude: `claude --bg --resume <short id>` starts a copy, not the same session; resume by the full id.
+- A process started with `nohup` or `disown` in a worker's shell dies when the tool call ends (#130); use the
+  tool's background mode (Claude: `run_in_background`).
+- Codex on macOS: the `workspace-write` sandbox denies the GPU, so Metal apps (Blender) exit 139 (#157). Run such a
+  task with `--runtime claude`.
 
 ## 9. Windows
 
 - Run `py -3 <clone>\taskq.py` or `python <clone>\taskq.py`; a PowerShell function is the alias:
   `function taskq { python C:\src\taskq\taskq.py @args }` in `$PROFILE`.
 - `gh`, `glab`, `claude` (`claude.cmd`), `codex` and `git` are found on `PATH`; no bash is needed by taskq.
+  `claude.ps1` blocked by the execution policy: use `claude.cmd` (#139).
 - Every command in this file runs in PowerShell as written, except `export`: use `$env:NAME=value;`.
 - Codex workers start detached (`DETACHED_PROCESS`); their pid check uses the Windows API.
 - Name the machine in `hosts` (`"DESKTOP-7": "win"`) or with `TASKQ_HOST=win`; a task for it only: `--host win`.

@@ -6,14 +6,14 @@
 Your repository board is the task list; your usual AI apps do the work.
 Add taskq, then ask Claude or Codex to turn any request into tasks.
 
-A timer picks up tasks, runs as many workers as you choose, and shows each one's session link.
+Board events wake the manager (`taskq wait`); it starts as many workers as you choose and shows each one's session link.
 You stay in control: a worker's question waits for your answer, and nothing is accepted until it is reviewed.
 
 1. **⚙ Set up (once per project)**<br>
    Tell your agent: "Install taskq from https://github.com/alexkirs/taskq and set it up for this project."
 
 2. **▶ Start working (each day)**<br>
-   "You are the taskq manager. Arm the tick." - workers start on ready tasks
+   "Run `taskq pm`, then `taskq arm tick`." - your agent becomes the manager; workers start on ready tasks
 
 3. **✎ Talk to the manager**<br>
    "File a task: fix the login redirect." - new task<br>
@@ -27,7 +27,8 @@ Choose each task's agent with `--runtime` (a `run-*` label); use `--deps` to cha
 ## Install
 
 Requirements: python3 >= 3.9, git, and [gh](https://cli.github.com) (GitHub) or [glab](https://gitlab.com/gitlab-org/cli)
-(GitLab), logged in. taskq is one file, stdlib only.
+(GitLab), logged in. taskq is one file, stdlib only. Workers need the `claude` and/or `codex` CLI, logged in
+(`claude auth login`; `codex login` once); Codex workers use your Codex model and config.
 
 ```bash
 git clone https://github.com/alexkirs/taskq ~/taskq
@@ -37,18 +38,21 @@ ln -s ~/taskq/taskq.py ~/.local/bin/taskq     # or: alias taskq='python3 ~/taskq
 Windows (PowerShell): `git clone https://github.com/alexkirs/taskq C:\src\taskq`, then add
 `function taskq { python C:\src\taskq\taskq.py @args }` to `$PROFILE`.
 
-Update: `git pull` in the clone.
+Update: `git pull` in the clone; `taskq tick` and `taskq wait` pull it themselves, so keep it on clean `main`.
 
 ## Set up a project
 
 At the project root, commit a `taskq.json`:
 
 ```json
-{"board": "github", "repo": "owner/repo", "publish": "direct", "limits": {"claude": 2, "codex": 1}}
+{"board": "github", "repo": "owner/repo", "publish": "direct", "limits": {"claude": 2, "codex": 1},
+ "hosts": {"macbook-m2.local": "mac"}}
 ```
 
 GitLab: `"board": "gitlab", "repo": "group/project"`, plus `"host"` when self-managed.
-`publish`: `direct` (workers push `main`) or `pr` (workers open a PR; `close` merges it).
+`publish`: `direct` (workers push `main`) or `pr` (workers open a PR; `close` merges it once `tests` is green on the PR head;
+`main` protection requires `tests`, not strict: [taskq.md § 6](taskq.md#6-publication)).
+`hosts`: hostname to machine name, used in worker names and `--host`.
 Add `.taskq/` and `.worktrees/` to `.gitignore`. Check with `taskq list`.
 Claude workers: run `claude` once in the project root and accept the folder trust prompt.
 
@@ -57,12 +61,15 @@ Claude workers: run `claude` once in the project root and accept the folder trus
 ```bash
 taskq pm            # in your agent session: it takes the manager role
 taskq add "Try taskq" --type research --goal "Reply: taskq works. No file changes." --acceptance "The result says: taskq works."
-taskq tick          # starts a worker; then wake the manager per event: taskq arm tick "<manager>"
+                    # add starts a worker at once
+taskq arm tick      # board events (review, ask, gone) wake the manager
+taskq tick          # a manual pass: start ready tasks, print the table
 taskq list          # the worker hands in: review
 taskq close N --text "Checked the reply."
 ```
 
-Commands: `add list take ask answer result requeue later close tick`.
+Commands: `add list take ask answer result requeue later close tick wait arm pm`.
+Workers are named `T<N> <ORCH> <title> (<machine>)`: task, launcher (CLD, CDX, ...), title, machine.
 Everything else - states, the worker's rules, the manager's routine, other boards and runtimes, Windows -
 is in the contract: **[taskq.md](taskq.md)**. Give it to any agent; it is all it needs.
 

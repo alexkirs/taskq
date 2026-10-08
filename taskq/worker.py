@@ -814,7 +814,8 @@ def claude_wake(session, prompt, extra=None):
     before, names = set(agents), {prompt, (agents.get(session) or {}).get('name')}
     claude_stop(session)
     no_live_in_tests('claude --bg --resume')
-    subprocess.run(['claude', '--bg', '--resume', session, prompt], cwd=core.ROOT, env=claude_env(extra),
+    name = (agents.get(session) or {}).get('name')  # without --name the CLI retitles the resumed job from the prompt
+    subprocess.run(['claude', '--bg', '--resume', session, *(['--name', name] if name else []), prompt], cwd=core.ROOT, env=claude_env(extra),
                    check=True, capture_output=True, timeout=120)
     end = time.time() + 15
     while True:

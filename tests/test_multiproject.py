@@ -822,15 +822,38 @@ class Acting(unittest.TestCase):
         def changed(**fields):
             return json.dumps({**json.loads(good), **fields}).encode()
         record = json.loads(good)
-        guard = record['result']['guard']
-        other = '0' * 32
-        for broken, why in ((changed(policy_sha256='0' * 64), 'policy'), (changed(binding_sha256='0' * 64), 'binding'),
-                            (changed(run_id=other), 'run id'), (changed(os_user=os.getuid() + 1), 'OS user'),
-                            (changed(machine='a-different-host'), 'machine'), (changed(actor={'pid': 1}), 'provenance'),
-                            (changed(result={**record['result'], 'guard': {**guard, 'inode': guard['inode'] + 1}}), 'provenance'),
-                            (changed(result={**record['result'], 'status': 'applied'}), 'provenance'),
-                            (changed(receipt='applied'), 'malformed'), (good[:len(good) // 2], 'truncated'),
-                            (b'', 'is empty'), (b' ' * (multiproject.MAX_OUTPUT + multiproject.MAX_LOG + 5000), 'oversized')):
+        guard, actual = record['result']['guard'], record['result']
+
+        def result(**fields):
+            return changed(result={**actual, **fields})
+        dropped = {key: value for key, value in record.items() if key != 'log'}
+        cases = [  # the reviewer's four probes first: each recovered `ok` before
+            (changed(actor={}, result={**actual, 'guard': None}), 'actor pid'), (changed(completed_at='not-a-timestamp'), 'completion time'),
+            (result(report=None), 'v1 report'), (result(guard={**guard, 'device': -1}), 'guard'),
+            (changed(version=True), 'version'), (changed(version='1'), 'version'), (changed(version=2), 'version'),
+            (changed(completed_at='2999-01-01T00:00:00Z'), 'completion time'), (changed(completed_at=None), 'completion time'),
+            (changed(policy_sha256='0' * 64), 'policy'), (changed(policy_sha256=None), 'policy'), (changed(binding_sha256='0' * 64), 'binding'),
+            (changed(repository='https://gitlab.example/acme/alpha'), 'binding'), (changed(run_id='0' * 32), 'run id'),
+            (changed(os_user=os.getuid() + 1), 'OS user'), (changed(os_user=float(os.getuid())), 'OS user'),
+            (changed(machine='a-different-host'), 'machine'), (changed(actor={'pid': 0}), 'actor pid'), (changed(actor={'pid': True}), 'actor pid'),
+            (changed(actor={'pid': guard['pid'], 'ppid': 1}), 'actor pid'), (changed(actor={'pid': guard['pid'] + 1}), 'guard'),
+            (changed(actor=None), 'actor pid'), (changed(log=None), 'diagnostics'), (changed(log='x' * (multiproject.MAX_LOG + 1)), 'diagnostics'),
+            (result(guard={**guard, 'inode': guard['inode'] + 1}), 'guard'), (result(guard={**guard, 'device': guard['device'] + 1}), 'guard'),
+            (result(guard={**guard, 'path': str(self.dir / 'other.lock')}), 'guard'), (result(guard={**guard, 'domain': 'OS user 0 only'}), 'guard'),
+            (result(guard={**guard, 'inode': float(guard['inode'])}), 'guard'), (result(guard={**guard, 'extra': 1}), 'guard'),
+            (result(guard=None), 'guard: only a refusal'), (result(status='refused', guard=None), 'guard: only a refusal'),
+            (result(status='refused'), 'refusal: it ran nothing native'), (result(status='applied'), 'result schema'),
+            (result(errors=[1]), 'result schema'), (result(errors='none'), 'result schema'), (result(budget=[]), 'result schema'),
+            (changed(result={key: value for key, value in actual.items() if key != 'budget'}), 'result schema'),
+            (changed(result={**actual, 'received_applied': 'applied'}), 'result schema'),
+            (result(errors=['x' * multiproject.MAX_OUTPUT]), 'result schema'), (result(native=None), 'native outcome'),
+            (result(native={**actual['native'], 'outcome': 'applied'}), 'native outcome'), (result(native={'outcome': 'ok'}), 'native outcome'),
+            (result(status='judgement_needed', report=None), 'v1 report'),
+            (result(report={**actual['report'], 'observed_at': '2000-01-01T00:00:00Z'}), 'v1 report'),  # stale at its completion
+            (result(report={'outcome': 'ok'}), 'v1 report'), (result(report='ok'), 'v1 report'), (changed(result=None), 'result schema'),
+            (json.dumps(dropped).encode(), 'malformed'), (changed(receipt='applied'), 'malformed'), (b'[]', 'malformed'),
+            (good[:len(good) // 2], 'truncated'), (b'', 'is empty'), (b' ' * (multiproject.MAX_RECORD + 1), 'oversized')]
+        for broken, why in cases:
             path.write_bytes(broken)
             found = multiproject.recover(run, policy)
             self.assertEqual((found['status'], found['output'], found['received_applied']), ('unknown', None, 'unknown'), why)
@@ -863,6 +886,38 @@ class Acting(unittest.TestCase):
         self.agents(LIVE)
         self.assertEqual(multiproject.recover(run, policy)['status'], 'recovered')
         self.assertEqual(len(self.calls('native')), 1)
+
+    def test_a_refusal_before_admission_recovers_as_refused_and_bounds_count_stored_bytes(self):
+        policy = self.catalog(self.alpha, {**self.beta, 'limits': {'claude': 1}})
+        run = multiproject.allocate_record()
+        fd, _ = multiproject.guard({'os_user': os.getuid()})  # the actor meets a held guard: refused before admission
+        try:
+            subprocess.run(ACTOR + [json.dumps({'entry': self.beta, 'policy': str(policy), 'run': run})], cwd=self.beta['checkout'],
+                           capture_output=True, timeout=120, check=True)
+        finally:
+            os.close(fd)
+        found = multiproject.recover(run, policy)
+        self.assertEqual((found['status'], found['output']['status'], found['output']['guard'], found['output']['native']),
+                         ('recovered', 'refused', None, None), found)
+        self.assertIn('host guard held', found['output']['errors'][0])
+        self.assertEqual((self.calls('native'), self.calls('spawn')), ([], []))
+        # Escaping never inflates a bounded output or diagnostics: both are counted as stored, UTF-8.
+        actual = json.loads((self.records / f'{self.act([self.beta], policy)["projects"][0]["run_id"]}.json').read_text())['result']
+        actual['guard']['pid'] = os.getpid()  # this process completes the record below
+        loaded = multiproject.load_policy(policy)
+        binding = multiproject.binding_for(self.beta, loaded[1])
+        wide = {**actual, 'errors': ['é' * 400_000]}  # 0.8 MB stored, 2.4 MB if escaped
+        run = multiproject.allocate_record()
+        multiproject.complete_record(run, wide, *loaded, binding, '😀\x01' * 40_000 + 'newest')
+        stored = json.loads((self.records / f'{run}.json').read_text())
+        self.assertLessEqual(multiproject.size(stored['log']), multiproject.MAX_LOG)
+        self.assertTrue(stored['log'].endswith('newest'))
+        found = multiproject.recover(run, policy)
+        self.assertEqual((found['status'], found['output']['errors']), ('recovered', wide['errors']), found['errors'])
+        run = multiproject.allocate_record()
+        with self.assertRaisesRegex(SystemExit, 'above 1 MiB'):
+            multiproject.complete_record(run, {**actual, 'errors': ['é' * 600_000]}, *loaded, binding, '')
+        self.assertIn('is empty', multiproject.recover(run, policy)['errors'][0])  # never partial output
 
     def test_record_limit_refuses_the_next_actor_before_native_mutation_and_deletes_nothing(self):
         policy = self.catalog(self.alpha, {**self.beta, 'limits': {'claude': 1}})

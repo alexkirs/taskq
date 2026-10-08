@@ -786,7 +786,7 @@ def act_project(spec, record=lambda found, policy, catalog, binding: None):
         record(found := {**result, 'errors': [str(error)]}, policy, catalog, binding)
         return found
     result['guard'] = {'path': str(guard_path()), 'device': held.st_dev, 'inode': held.st_ino, 'pid': os.getpid(),
-                       'domain': f'OS user {policy["os_user"]} only; no host-global capacity is claimed'}
+                       'domain': guard_domain(policy)}
     try:
         record(found := admitted(entry, policy, catalog, binding, result), policy, catalog, binding)
         return found
@@ -848,13 +848,13 @@ ACT_STATUS = ('ok', 'judgement_needed', 'blocked', 'failed', 'refused', 'unknown
 ACT_KEYS = ('status', 'errors', 'guard', 'budget', 'catalog', 'native', 'report')
 
 
-def checked_result(found, at=None):
-    """An actor result as the wrapper may use it, its report revalidated as of `at` (default now); None: no result."""
+def checked_result(found):
+    """An actor result as the wrapper may use it, its report revalidated now; None: no result."""
     if not isinstance(found, dict) or found.get('status') not in ACT_STATUS:
         return None
     found['errors'] = list(found.get('errors') or [])
     if found.get('report') is not None and found['status'] in ('ok', 'judgement_needed'):
-        if problems := [problem for problem in tick.validate_report(found['report'], at) if problem not in found['errors']]:
+        if problems := [problem for problem in tick.validate_report(found['report']) if problem not in found['errors']]:
             found.update(status='blocked', errors=problems + found['errors'])
     return {key: found.get(key) for key in ACT_KEYS}
 
@@ -936,21 +936,32 @@ def empty_record(run):
     return path
 
 
+def size(value):
+    """Bytes of `value` as its record stores it: UTF-8, so escaping never inflates a bounded output or diagnostics."""
+    return len(json.dumps(value, sort_keys=True, ensure_ascii=False).encode())
+
+
 def complete_record(run, found, policy, catalog, binding, log):
-    """The actor's atomic completion write of its actual output; a result over MAX_OUTPUT leaves the record empty."""
+    """The actor's atomic completion write of its actual output; a result over MAX_OUTPUT leaves the record empty.
+    Diagnostics keep their newest part that fits MAX_LOG as stored."""
+    while size(log) > MAX_LOG:
+        log = log[-(len(log) * 3 // 4):]
     record = {'version': 1, 'run_id': run, 'completed_at': now(), 'os_user': os.getuid(), 'actor': {'pid': os.getpid()},
               'policy_sha256': digest(canonical(policy, catalog)) if policy else None,
               'binding_sha256': digest(canonical_binding(binding)) if binding else None,
               'machine': policy and policy['machine'], 'repository': binding and repository_url(binding),
-              'result': {key: found[key] for key in ACT_KEYS}, 'log': log.encode()[-MAX_LOG:].decode(errors='ignore')}
-    if len(json.dumps(record['result'])) > MAX_OUTPUT:
+              'result': {key: found[key] for key in ACT_KEYS}, 'log': log}
+    if size(record['result']) > MAX_OUTPUT:
         raise SystemExit('actual output above 1 MiB: the record stays incomplete')
-    write_atomic(empty_record(run), json.dumps(record, sort_keys=True).encode())
+    write_atomic(empty_record(run), json.dumps(record, sort_keys=True, ensure_ascii=False).encode())
+
+
+MAX_RECORD = MAX_OUTPUT + MAX_LOG + 4096  # result, diagnostics and the small provenance fields
 
 
 def read_record(run):
     """`run`'s completed record, or SystemExit why its output is unavailable: missing, empty (pending or crashed),
-    a symlink, another owner or mode, oversized, truncated or off-shape. Read only."""
+    a symlink, another owner or mode, oversized, truncated or not a table of exactly its keys. Read only."""
     path = record_path(run)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -961,21 +972,72 @@ def read_record(run):
         if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
             raise SystemExit(f'record {path} is not a file of OS user {os.getuid()} alone')
         with os.fdopen(os.dup(fd), 'rb') as handle:
-            text = handle.read(MAX_OUTPUT + MAX_LOG + 4096 + 1)
+            text = handle.read(MAX_RECORD + 1)
     finally:
         os.close(fd)
     if not text:
         raise SystemExit(f'record {path} is empty: its actor has not completed it (still running, crashed or cut off)')
-    if len(text) > MAX_OUTPUT + MAX_LOG + 4096:
+    if len(text) > MAX_RECORD:
         raise SystemExit(f'record {path} is oversized')
     try:
         record = json.loads(text)
-        valid = isinstance(record, dict) and set(record) == RECORD_KEYS and record['version'] == 1 and isinstance(record['log'], str)
     except ValueError:
-        valid = False
-    if not valid:
+        record = None
+    if not isinstance(record, dict) or set(record) != RECORD_KEYS:
         raise SystemExit(f'record {path} is truncated or malformed')
     return record
+
+
+def guard_domain(policy):
+    return f'OS user {policy["os_user"]} only; no host-global capacity is claimed'
+
+
+def qualified(record, run, policy, catalog):
+    """(binding, output) of a completed record whose every field matches exactly: schema, types, ranges, bounds,
+    run, policy, binding, domain, actor and the guard's full stable identity. SystemExit naming the first mismatch:
+    its output stays unknown. `ok` and `judgement_needed` need a native outcome and a v1 report valid as of
+    completion; no guard only for a refusal before admission, with nothing native."""
+    def need(ok, what):
+        if not ok:
+            raise SystemExit(f'record does not match its {what}: output unknown')
+
+    def whole(value, low=0):
+        return type(value) is int and value >= low
+    need(type(record['version']) is int and record['version'] == 1, 'version')
+    need(record['run_id'] == run, 'run id')
+    at = tick.report_timestamp(record['completed_at']) if isinstance(record['completed_at'], str) else None
+    need(at is not None and at <= time.time() + 60, 'completion time')
+    need(isinstance(record['policy_sha256'], str) and record['policy_sha256'] == digest(canonical(policy, catalog)), 'policy')
+    found = record['binding_sha256']
+    binding = next((binding for binding, _ in catalog if isinstance(found, str) and digest(canonical_binding(binding)) == found), None)
+    need(binding is not None and binding['act'] and record['repository'] == repository_url(binding), 'binding')
+    need(whole(record['os_user']) and record['os_user'] == os.getuid() == policy['os_user'], 'OS user')
+    need(isinstance(record['machine'], str) and record['machine'] == policy['machine'], 'machine')
+    actor = record['actor']
+    need(isinstance(actor, dict) and set(actor) == {'pid'} and whole(actor['pid'], 1), 'actor pid')
+    need(isinstance(record['log'], str) and size(record['log']) <= MAX_LOG, 'diagnostics bound')
+    result = record['result']
+    need(isinstance(result, dict) and set(result) == set(ACT_KEYS) and result['status'] in ACT_STATUS
+         and isinstance(result['errors'], list) and all(isinstance(error, str) for error in result['errors'])
+         and isinstance(result['budget'], (dict, type(None))) and isinstance(result['catalog'], (list, type(None)))
+         and size(result) <= MAX_OUTPUT, 'result schema')
+    status, guarded, native, report = (result[key] for key in ('status', 'guard', 'native', 'report'))
+    if guarded is None:
+        need(status == 'refused' and all(result[key] is None for key in ('budget', 'catalog', 'native', 'report')),
+             'guard: only a refusal before admission has none')
+    else:
+        held = os.stat(guard_path(), follow_symlinks=False)
+        need(isinstance(guarded, dict) and whole(guarded.get('device')) and whole(guarded.get('inode'), 1) and guarded == {
+            'path': str(guard_path()), 'device': held.st_dev, 'inode': held.st_ino, 'pid': actor['pid'], 'domain': guard_domain(policy)}, 'guard')
+    if status == 'refused':
+        need(native is None and report is None, 'refusal: it ran nothing native')
+    if status in ('ok', 'judgement_needed', 'blocked', 'failed'):
+        need(isinstance(native, dict) and set(native) == {'outcome', 'actions', 'refusals'}
+             and native['outcome'] in ('ok', 'judgement_needed', 'failure', 'unknown', 'refused')
+             and isinstance(native['actions'], list) and isinstance(native['refusals'], list), 'native outcome')
+    if status in ('ok', 'judgement_needed'):
+        need(report is not None and tick.validate_report(report, at) == [], 'v1 report')
+    return binding, result
 
 
 def recover(run, policy_path):
@@ -991,21 +1053,10 @@ def recover(run, policy_path):
         if held := guard_free(policy):  # an actor still runs: its record is not final yet
             return {**result, 'status': 'pending', 'errors': [held]}
         record = read_record(run)
-        bindings = {digest(canonical_binding(binding)): binding for binding, _ in catalog}
-        binding = bindings.get(record['binding_sha256'])
-        mismatch = [what for what, ok in (
-            ('run id', record['run_id'] == run), ('policy', record['policy_sha256'] == digest(canonical(policy, catalog))),
-            ('binding', binding is not None and record['repository'] == repository_url(binding)),
-            ('OS user', record['os_user'] == os.getuid() == policy['os_user']), ('machine', record['machine'] == policy['machine']))
-            if not ok]
-        output = checked_result(record['result'], tick.report_timestamp(record['completed_at']))
-        guarded = output and output['guard']
-        if output is None or set(record['result']) != set(ACT_KEYS) or guarded and (
-                guarded.get('path') != str(guard_path()) or guarded.get('inode') != guard_path().stat().st_ino
-                or guarded.get('pid') != (record['actor'] or {}).get('pid')):
-            mismatch.append('actor and guard provenance')
-        if mismatch:
-            return {**result, 'errors': [f'record {result["record"]} does not match its {", ".join(mismatch)}: output unknown']}
+        try:
+            binding, output = qualified(record, run, policy, catalog)
+        except (KeyError, TypeError, AttributeError, ValueError, OSError) as error:
+            raise SystemExit(f'record does not match its schema ({type(error).__name__}: {error}): output unknown') from None
         reads = [checked_read(read_occupancy(other, errors)) for other, errors in catalog]
         own = next(read for (other, _), read in zip(catalog, reads) if other is binding)
         errors = [f'{project_result(other, errors)["repository"]}: {read["status"]} ({"; ".join(read.get("errors", []))})'

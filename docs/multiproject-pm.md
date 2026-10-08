@@ -169,7 +169,7 @@ Every acting result names its run id and the exact recovery command (`run_id`, `
 Each actor gets one output record: `multiproject-output/<run-id>.json` beside the guard. The record holds that run's actual output, and nothing else. It is not a job, a queue, a receipt or a transport.
 
 1. **Allocation.** Before the actor starts, the wrapper creates the empty record: a fresh 32-hex run id, the file created exclusively with mode 0600. The folder must be a real folder (no symlink) of the OS user alone (0700). Otherwise nothing starts. The actor refuses before its guard when its record is not that allocated empty file.
-2. **Completion.** The actor writes its result once, while it still holds the guard. The write is a draft in the same folder, fsync, rename, fsync of the folder. The record holds the run id, the SHA-256 of the canonical catalog and of its binding, the OS user, the machine, the repository, the actor pid, its time, the result exactly as the actor printed it (guard, budget, catalog readback, native outcome and the v1 report) and at most 64 KiB of diagnostics. A result above 1 MiB, or any failed write, leaves the record empty.
+2. **Completion.** The actor writes its result once, while it still holds the guard. The write is a draft in the same folder, fsync, rename, fsync of the folder. The record holds the run id, the SHA-256 of the canonical catalog and of its binding, the OS user, the machine, the repository, the actor pid, its time, the result exactly as the actor printed it (guard, budget, catalog readback, native outcome and the v1 report) and its newest diagnostics. The record is stored as UTF-8 JSON, and bounds count stored bytes: the result at most 1 MiB, the diagnostics at most 64 KiB, so escaping never makes a bounded record unreadable. A result above 1 MiB, or any failed write, leaves the record empty, never partial.
 3. **Retention.** At most 32 files in the folder, of any kind, counted after allocation; two racing wrappers both refuse rather than pass the limit. At the limit, the next actor is refused before it starts, so no native mutation happens. Nothing is evicted, cleaned up or migrated, and recovery deletes nothing. The operator recovers each record, then removes resolved ones by hand. The folder's file names are the run ids, so a run stays recoverable even when its wrapper died before printing.
 
 ```
@@ -181,9 +181,18 @@ Recovery is read only. It never calls the native pass, `tick`, `take`, `spawn`, 
 | status | meaning |
 |---|---|
 | `pending` | the host guard is held: an actor still runs, its record is not final |
-| `unknown` | no exact completed record. The record is missing, empty (still running, crashed or cut off), a symlink, of another owner or mode, oversized, truncated or off-shape. Or it does not match the run id, the anchored policy, a binding of it, the OS user, the machine or its actor and guard (pid, path, inode) |
+| `unknown` | no exact completed record. The record is missing, empty (still running, crashed or cut off), a symlink, of another owner or mode, oversized, truncated or off-shape. Or one field fails the check below |
 | `refused` | the record matches, but the fresh read-only readback of every anchored binding is not known, or the inventory of a runtime the binding may start or holds is unreadable |
-| `recovered` | `output` is the actor's actual result, the report revalidated as of `completed_at` |
+| `recovered` | `output` is the actor's actual result, exactly as recorded |
+
+A record qualifies only when every field passes. Any missing, extra, mistyped or out-of-range field makes the output `unknown`:
+
+- exactly its keys; `version` the integer 1; the run id; `completed_at` a valid UTC time, not in the future;
+- the policy and binding SHA-256 of the anchored catalog, an `act = true` binding with its repository; the OS user (an integer, this process's and the policy's); the machine;
+- `actor` exactly `{pid}`, a positive integer; diagnostics a string of at most 64 KiB stored;
+- `result` exactly its keys, a known status, string errors, at most 1 MiB stored;
+- the guard: its path, device, inode, pid (the actor's) and OS-user domain equal the guard file's stable identity now. No guard is valid only for a refusal before admission, with no budget, readback or native output;
+- `refused`: nothing native; `blocked` and `failed`: a native outcome; `ok` and `judgement_needed`: a native outcome and a complete v1 report that `validate_report` passes as of `completed_at`. A success without its report is never recovered.
 
 The policy must equal the accepted anchor. Guard release or a fresh readback alone never makes output `recovered`: only the exact completed record does. `received_applied` is always `unknown`. Output that was lost before this change, such as a wrapper timeout with no record, stays unknown. Nothing is rerun to rebuild it.
 

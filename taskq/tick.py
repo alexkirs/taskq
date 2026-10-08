@@ -92,6 +92,17 @@ def report_row(item, agents, activity):
     return f'| {core.ref(item)} {title} | {item["state"]} ({activity}) | {runtime}{core.where(claim)}{f", by {orch}" if orch else ""} | {" · ".join(links) or "unavailable"} |'
 
 
+def blocker(item):
+    """#270: the newest note of a ready task's supervisor when it is a `problem` (it could not launch the worker):
+    the row shows it as the blocker. None: not such a task, or its supervisor wrote something after."""
+    found = item.get('supervisor')
+    if item['state'] != 'ready' or not found:
+        return None
+    head = f'· {core.short(found)}\n\n'
+    body = next((body for body in reversed(core.notes(core.comments(item['iid']))) if head in body), '')
+    return 'blocked: ' + ' '.join(body.split('\n\n', 1)[-1].replace('|', '/').split())[:120] if body.startswith('**problem**') else None
+
+
 def report(board, rows):
     """R6: the project heading, the Board link and one table Task | Status | Runtime | Session."""
     print(f'## {core.PROJECT_PATH}\n\nBoard: {board}\n\n| Task | Status | Runtime | Session |\n|---|---|---|---|')
@@ -465,7 +476,7 @@ def queue_pass(args):
     board = board_link(candidates)
     everything = [item for item in everything if item['iid'] in selected]
     # #83: one table of every worker and supervisor (R6); the owner's chat opens only http(s) links.
-    report(board, [report_row(item, agents, (alive.get(item['iid']) or (None, f'issue {core.age(item)} min ago'))[1])
+    report(board, [report_row(item, agents, blocker(item) or (alive.get(item['iid']) or (None, f'issue {core.age(item)} min ago'))[1])
                                     for item in everything if listed(item)])
     # #243 (R3): a supervised task's review is its supervisor's, never the coordinator's: the tick wakes that session.
     review = [item for item in everything if item['state'] == 'review' and item['result'] and not item.get('supervisor')]

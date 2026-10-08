@@ -16,6 +16,7 @@ spec = importlib.util.spec_from_file_location('taskq_single', ROOT / 'taskq.py')
 taskq = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(taskq)
 SESSION = '0123456789abcdef'
+REAL_RUN, REAL_POPEN = subprocess.run, subprocess.Popen  # Base fails any real process; the pull test needs git
 
 
 class FakeBoard:
@@ -68,6 +69,7 @@ class Base(unittest.TestCase):
                 mock.patch.object(taskq, 'runtimes', return_value={}),  # no real worker from an event's dispatch
                 mock.patch.object(taskq, 'start_pass', lambda *_, **__: taskq.main(['tick', '--quiet'])),  # the child's pass, in process
                 mock.patch.object(taskq, 'datetime', FixedNow),
+                mock.patch.object(taskq, 'CLONE', self.root),  # no .git, no taskq.md: tick and wait neither pull nor warn
                 mock.patch.object(taskq.subprocess, 'run', real), mock.patch.object(taskq.subprocess, 'Popen', real)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -576,6 +578,60 @@ class Wait(Tick):
         self.assertIn('manager session PM main', out)
         self.assertIn('taskq.py wait`', out)
         self.assertIn('with SendMessage', out)
+
+
+class Contract(Base):
+    """#430: `taskq pm` gives the manager role; tick and wait pull the clone and say when the contract changed."""
+
+    def git(self, folder, *argv):
+        REAL_RUN(['git', '-C', str(folder), '-c', 'user.name=t', '-c', 'user.email=t@t', *argv], check=True, capture_output=True)
+
+    def test_pm_prints_role_and_records_hash(self):
+        (self.root / 'taskq.md').write_text((ROOT / 'taskq.md').read_text())
+        out = self.run_cli('pm')
+        digest = taskq.contract()
+        self.assertTrue(out.startswith(f'taskq pm contract {digest}\n'))
+        for part in ('### R6. Human report', '## 7. Manager', '### After each pass', 'run_in_background'):
+            self.assertIn(part, out)
+        self.assertNotIn('## 8. Runtimes', out)
+        self.assertEqual(json.loads((self.root / '.taskq' / 'pm.json').read_text()), {'contract': digest})
+
+    def test_changed_contract_until_pm(self):
+        line = 'The manager contract changed: run taskq pm and follow it from now on.'
+        (self.root / 'taskq.md').write_text('v1\n## Principles\nx\n## 7. Manager\ny\n## 8. Runtimes\n')
+        self.run_cli('pm')
+        self.assertNotIn(line, self.run_cli('tick'))
+        (self.root / 'taskq.md').write_text('v2\n## Principles\nx\n## 7. Manager\ny\n## 8. Runtimes\n')
+        with mock.patch.object(taskq.time, 'time', side_effect=[0, 1e9]):
+            self.assertEqual(self.run_cli('wait').splitlines(), [line, 'tick'])
+        self.assertEqual(self.run_cli('tick').splitlines()[0], line)  # first, once per run
+        self.run_cli('pm')
+        self.assertNotIn(line, self.run_cli('tick'))
+
+    def test_tick_pulls_a_clean_clone(self):
+        origin, writer, clone = self.root / 'origin.git', self.root / 'writer', self.root / 'clone'
+        with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN), \
+                mock.patch.object(taskq, 'CLONE', clone), \
+                mock.patch.dict(os.environ, {'PATH': os.defpath + os.pathsep + os.environ.get('PATH', '')}):
+            REAL_RUN(['git', 'init', '-q', '--bare', str(origin)], check=True)
+            REAL_RUN(['git', 'clone', '-q', str(origin), str(writer)], check=True, capture_output=True)
+            (writer / 'taskq.md').write_text('v1\n')
+            self.git(writer, 'add', '.')
+            self.git(writer, 'commit', '-qm', 'v1')
+            self.git(writer, 'push', '-q', 'origin', 'HEAD')
+            REAL_RUN(['git', 'clone', '-q', str(origin), str(clone)], check=True, capture_output=True)
+            self.run_cli('pm')
+            (writer / 'taskq.md').write_text('v2\n')
+            self.git(writer, 'commit', '-qam', 'v2')
+            self.git(writer, 'push', '-q', 'origin', 'HEAD')
+            self.assertIn('contract changed', self.run_cli('tick'))
+            self.assertEqual((clone / 'taskq.md').read_text(), 'v2\n')
+            (clone / 'taskq.md').write_text('local edit\n')  # a dirty clone is never pulled
+            (writer / 'taskq.md').write_text('v3\n')
+            self.git(writer, 'commit', '-qam', 'v3')
+            self.git(writer, 'push', '-q', 'origin', 'HEAD')
+            self.run_cli('tick')
+            self.assertEqual((clone / 'taskq.md').read_text(), 'local edit\n')
 
 
 class Model(Base):

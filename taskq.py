@@ -174,6 +174,7 @@ def make_board(config):
 # --- runtime --------------------------------------------------------------------------------
 # Four functions: spawn(name, prompt, cwd) -> session, send(session, text) -> session (a Claude resume may continue
 # under a new id), alive(session) -> True/False/None (running / gone / cannot tell), link(session) -> url or None.
+# Optional fifth: stop(session), which close calls on the claim's machine (#302).
 
 def worker_env():  # a worker must not inherit the tick's session id
     return {key: value for key, value in os.environ.items() if key not in SESSIONS.values()}
@@ -212,11 +213,16 @@ class Claude:
     def spawn(self, name, prompt, cwd):
         return self.start([*self.flags(name), prompt], cwd)
 
-    def send(self, session, text):
-        """Stop the session, then resume it with the text. #284: a stopped session resumes under a new id."""
+    def stop(self, session):
+        """`claude stop <job id>` when the session still has a process; its agent, or {} when not listed."""
         agent = (self.agents() or {}).get(session) or {}
         if agent.get('pid'):
             subprocess.run([shutil.which('claude') or 'claude', 'stop', agent['id']], capture_output=True, timeout=60)
+        return agent
+
+    def send(self, session, text):
+        """Stop the session, then resume it with the text. #284: a stopped session resumes under a new id."""
+        agent = self.stop(session)
         return self.start(['--resume', session, *self.flags(agent.get('name')), text], agent.get('cwd') or CONFIG['root'])
 
     def alive(self, session):
@@ -389,8 +395,17 @@ def cmd_close(args):
         subprocess.run([*git, 'fetch', 'origin'], capture_output=True)
         if subprocess.run([*git, 'merge-base', '--is-ancestor', sha, 'origin/main'], capture_output=True).returncode:
             fail(f'#{args.n}: result {sha} is not on origin/main')
+    claim = current['claim'] or {}
+    stop = getattr(runtimes().get(claim.get('runtime')), 'stop', None)
+    if stop and claim.get('name') != machine():
+        args.text = (f'{args.text}\n\n' if args.text else '') + f'session {claim.get("session")} runs on {claim.get("name")}: stop it there'
     move(current, None, 'close', args.text)
     BOARD.close(args.n)
+    if stop and claim.get('name') == machine():
+        try:  # best effort: a worker left running never fails close
+            stop(claim['session'])
+        except Exception as error:
+            print(f'#{args.n}: could not stop session {claim["session"]}: {error}', file=sys.stderr)
 
 def brief(item, runtime):
     """The worker's prompt: the task, its workspace, the taskq commands it uses."""

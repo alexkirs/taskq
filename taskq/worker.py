@@ -806,26 +806,31 @@ def running(pid):
 
 def reconcile(current, args=None):
     """A reservation found again (restart, next pass, a new launch): True when evidence released it. Only this
-    machine's reservation is settled here, and only by evidence: its launching process ended and its session
-    stopped, or no worker of the task is alive. Age alone never releases it; an unknown outcome keeps it."""
+    machine's reservation is settled here: its launching process ended and its session stopped, no worker of the
+    task is alive, or its status stayed unknown for one stale window."""
     from taskq.tick import launched, liveness
-    found, iid, release = current['reservation'], current['iid'], None
+    found, iid, release, unknown = current['reservation'], current['iid'], None, False
     if not core.local_node(found.get('node') or ''):
         why = f'reserved on another machine{core.where(found)}: settled there'
     elif found.get('principal') != core.user():
         why = f'reserved by user {found.get("principal")}: settled by that user'
     elif not found.get('pid'):
-        why = 'its launching process is unknown'
+        unknown, why = True, 'its launching process is unknown'
     elif running(found['pid']):
         why = 'its launch is still running'
     elif session := launch_session(iid, found.get('attempt') or ''):
         state, _ = liveness({**current, 'state': 'doing', 'claim': {'runtime': found['runtime'], 'session': session}}, core.claude_agents())
         release = state == 'dead' and f'its worker {session} stopped before taking the task'
+        unknown = state is None
         why = release or f'its worker {session} is {state or "unknown here"}'
     else:
         sessions = launched(iid, found['runtime'])
         release = sessions == [] and 'its launch was interrupted: no worker of it runs'
+        unknown = sessions is None
         why = release or ('its launch outcome is unknown' if sessions is None else f'its worker {sessions[0]} has not taken it yet')
+    if not release and unknown and core.age(current) > core.STALE_MINUTES:
+        release = f'its status stayed unknown for {core.age(current)} minutes'
+        why = release
     released = bool(release) and release_reservation(current, release)
     core.record(args, 'reservation', status='released' if released else 'kept', task=iid, reason=why)
     print(f'{core.ref(current)}: reservation {found.get("attempt")} {"released" if released else "kept"}: {why}.')

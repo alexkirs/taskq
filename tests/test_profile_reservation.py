@@ -309,7 +309,7 @@ class Reservation(unittest.TestCase):
                 output = self.do(COORDINATOR, 'tick', '--act')
         return output, [call.args[0].name for call in spawn.call_args_list]
 
-    def test_restart_settles_by_evidence_never_by_age(self):
+    def test_restart_settles_dead_now_and_unknown_after_one_stale_window(self):
         dead = dead_pid()
         with patch.object(q, 'LOCK_SECONDS', -1), patch.object(q, 'STALE_MINUTES', -1):
             running = self.reserved(os.getpid())  # its launch still runs
@@ -321,7 +321,7 @@ class Reservation(unittest.TestCase):
             for case, session, rows, kept in (
                     ('worker alive before its take', None, job('w', 'T{iid} t (mac-1)'), True),
                     ('pending approval', 'w', job('w', 'T{iid} t (mac-1)', state='blocked'), True),
-                    ('bound worker unknown here', 'w', {}, True),
+                    ('bound worker unknown here', 'w', {}, False),
                     ('bound worker stopped', 'w', job('w', 'T{iid} t (mac-1)', state='failed'), False),
                     ('interrupted, no worker', None, {}, False)):
                 with self.subTest(case):

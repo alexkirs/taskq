@@ -125,6 +125,15 @@ class Commands(Base):
             f'**{action}** · claude:01234567' for action in ('add', 'take', 'ask', 'answer', 'result', 'close')])
         self.assertEqual(issue['comments'][2], '**ask** · claude:01234567\n\nwhich?')
 
+    def test_close_failure_keeps_the_label(self):
+        self.add()
+        self.run_cli('take', '1')
+        self.run_cli('result', '1', '--sha', 'a' * 40)
+        with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), \
+                mock.patch.object(self.board, 'close', side_effect=RuntimeError('board down')), self.assertRaises(RuntimeError):
+            self.run_cli('close', '1')
+        self.assertEqual((self.board.issues[1]['state'], self.task(1)['state']), ('open', 'review'))  # #496: still on the board
+
     def test_close_refuses_commit_not_on_main(self):
         self.add()
         self.run_cli('take', '1')

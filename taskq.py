@@ -562,8 +562,8 @@ def close_one(args):
     if hasattr(runtimes().get(claim.get('runtime')), 'retire') and claim.get('name') not in (None, machine()):
         args.text = (f'{args.text}\n\n' if args.text else '') + f'session {claim.get("session")} runs on {claim.get("name")}: stop it there'
     kept = cleanup(current)
+    BOARD.close(args.n)  # first (#496): a failed close keeps the q-* label, the task stays on the board
     move(current, None, 'close', '\n\n'.join(filter(None, (args.text, kept))))
-    BOARD.close(args.n)
     retire(lambda n, *_: n == args.n, f'#{args.n}: could not stop its sessions')
 
 def retire(gone, why, running=True):

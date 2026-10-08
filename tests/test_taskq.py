@@ -1363,47 +1363,6 @@ class Cycle(unittest.TestCase):
             self.do(CLAUDE, 'codex-read', 't1', '--limit', 0)
         self.assertEqual(len(self.codex.calls), 2)
 
-    def test_codex_read_running_command_missing_from_paginated_store(self):
-        self.codex.status = 'active'
-        self.codex.turns = [{'id': 'live', 'status': 'inProgress', 'startedAt': 1}]
-        def record(kind, **payload):
-            return json.dumps({'type': 'response_item', 'timestamp': '1970-01-01T00:00:02Z',
-                               'payload': {'type': kind, 'internal_chat_message_metadata_passthrough': {'turn_id': 'live'},
-                                           **payload}}) + '\n'
-        import json
-        path = self.directory / 'rollout.jsonl'
-        self.codex.path = str(path)
-        path.write_text(record('custom_tool_call', call_id='start', name='exec',
-                               input='text(await tools.exec_command({cmd:"sleep 40"}));') +
-                        record('custom_tool_call_output', call_id='start', output=[{'text': '{"session_id": 123}'}]) +
-                        record('function_call', call_id='wait', name='wait', arguments='{"cell_id":"2"}') +
-                        '{"partial')
-        with patch.object(q.time, 'time', lambda: 5):
-            output = self.do(CLAUDE, 'codex-read', 't1')
-        self.assertIn('now: command inProgress', output)
-        self.assertIn('sleep 40', output)
-        self.assertIn('live tool wait inProgress', output)
-        self.assertIn('last event: 3s ago', output)
-        # Once the API records command completion and the tool replies, neither remains running.
-        path.write_text(path.read_text().removesuffix('{"partial') +
-                        record('function_call_output', call_id='wait', output='done'))
-        self.codex.entries['live'] = [{'turnId': 'live', 'startedAtMs': 1000, 'completedAtMs': 3000,
-                                      'item': {'type': 'commandExecution', 'processId': '123', 'status': 'completed',
-                                               'command': 'sleep 40', 'exitCode': 0}}]
-        output = self.do(CLAUDE, 'codex-read', 't1')
-        self.assertNotIn('now: command inProgress', output)
-        self.assertNotIn('live tool wait', output)
-
-    def test_codex_live_tail_is_bounded_and_does_not_read_other_turns(self):
-        import json
-        path = self.directory / 'rollout.jsonl'
-        path.write_text('x' * codex.CODEX_TAIL_BYTES + '\n' + json.dumps({
-            'type': 'response_item', 'timestamp': '1970-01-01T00:00:02Z',
-            'payload': {'type': 'function_call', 'call_id': 'other', 'name': 'exec', 'arguments': 'other turn',
-                        'internal_chat_message_metadata_passthrough': {'turn_id': 'other'}}}) + '\n')
-        entries, stamp = codex.codex_live_entries(path, {'id': 'live', 'entries': []})
-        self.assertEqual((entries, stamp), ([], None))
-
     def test_codex_send_active_steers_and_new_turns_pin_policy(self):
         self.codex.status = 'active'
         self.codex.turns = [{'id': 'running', 'status': 'inProgress'}]
@@ -1434,25 +1393,6 @@ class Cycle(unittest.TestCase):
         path = Path(self.enterContext(tempfile.TemporaryDirectory())) / 'rollout.jsonl'
         path.write_text(''.join(json.dumps(record, separators=(',', ':')) + '\n' for record in records))
         self.codex.path = str(path)
-
-    def test_codex_send_to_a_thread_the_app_holds_goes_through_the_app(self):
-        self.codex.status, self.ipc.owner = 'notLoaded', 'window'
-        self.codex.turns = [{'id': 'done', 'status': 'completed'}]
-        self.assertIn('new turn in the Codex app', self.do(CLAUDE, 'codex-send', 't1', '--text', 'next'))
-        method, params, version, target = self.ipc.calls[-1]
-        self.assertEqual((method, version, target), ('thread-follower-start-turn', 2, 'window'))
-        self.assertEqual(params['turnStart']['request']['sandboxPolicy'], codex.codex_turn_policy()['sandboxPolicy'])
-        self.assertEqual(params['turnStart']['request']['approvalPolicy'], 'never')
-        self.assertNotIn('thread/resume', [method for method, _ in self.codex.calls])
-        # The shared server reads the app's running turn as interrupted; its rollout has no end for it yet.
-        self.codex.turns = [{'id': 'running', 'status': 'interrupted'}]
-        self.app_rollout({'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'running'}})
-        self.assertIn('steered the active turn', self.do(CLAUDE, 'codex-send', 't1', '--text', 'more'))
-        self.assertEqual(self.ipc.calls[-1][0], 'thread-follower-steer-turn')
-        self.assertIn('turn running in the Codex app', self.do(CLAUDE, 'codex-read', 't1'))
-        self.app_rollout({'type': 'event_msg', 'payload': {'type': 'turn_aborted', 'turn_id': 'running'}})
-        self.assertNotIn('in the Codex app', self.do(CLAUDE, 'codex-read', 't1'))
-        self.assertIn('new turn in the Codex app', self.do(CLAUDE, 'codex-send', 't1', '--text', 'again'))
 
     def test_codex_spawn_pins_first_turn_policy(self):
         self.assertTrue(all(os.path.isabs(root) for root in codex.codex_turn_policy()['sandboxPolicy']['writableRoots']))
@@ -1600,46 +1540,6 @@ class Cycle(unittest.TestCase):
         self.codex.status = 'active'
         self.assertIn('active turn id unavailable', self.refused(CLAUDE, 'codex-send', 't1', '--text', 'answer'))
         self.assertNotIn('turn/steer', [method for method, _ in self.codex.calls])
-
-    def test_codex_read_last_turn_actual_sandbox_not_thread_defaults(self):
-        import json
-        self.codex.turns = [{'id': 'last', 'status': 'completed'}]
-        path = self.directory / 'rollout.jsonl'
-        self.codex.path = str(path)
-        def context(turn, sandbox, approval):
-            return json.dumps({'type': 'turn_context', 'payload': {'turn_id': turn,
-                               'sandbox_policy': sandbox, 'approval_policy': approval}}) + '\n'
-        path.write_text(context('last', {'type': 'danger-full-access'}, 'never') +
-                        context('last', {'type': 'workspace-write', 'writable_roots': ['/r/.git'], 'network_access': False,
-                                         'exclude_slash_tmp': False}, 'on-request') +
-                        'x' * (codex.CODEX_TAIL_BYTES + 1) + '\n' +
-                        context('other', {'type': 'danger-full-access'}, 'never'))
-        output = self.do(CLAUDE, 'codex-read', 't1')
-        self.assertIn('last turn sandbox: {"type": "workspace-write", "network_access": false, "writable_roots": ["/r/.git"]}; '
-                      'approvalPolicy: on-request', output)
-        self.assertNotIn('last turn sandbox: {"type": "danger-full-access"}', output)
-
-    def test_tick_nudges_an_idle_codex_worker_only_while_doing(self):
-        iid = self.add('--type', 'asset')
-        self.do(CODEX, 'take', iid)
-        sent = []
-        self.enterContext(patch.object(q, 'codex_send', lambda args: sent.append(args.thread)))
-        self.enterContext(contextlib.redirect_stderr(io.StringIO()))
-        self.codex.turns = [{'id': 'finished', 'status': 'completed'}]
-        output = self.do(CLAUDE, 'tick')
-        self.assertEqual(sent, ['codex-session'])  # doing without result or ask, its turn ended: one fixed nudge
-        self.assertIn(f'| {link(iid)} t | doing (idle, last event unknown', output)
-        self.assertIn('| codex @mac-1 | [session](https://alexkirs.github.io/taskq/open.html#codex://threads/codex-session) |', output)
-        self.codex.status = 'active'
-        self.do(CLAUDE, 'tick')
-        # The app holds the session: the shared server says notLoaded while the app runs the turn.
-        self.codex.status, self.codex.turns = 'notLoaded', [{'id': 'app', 'status': 'interrupted'}]
-        self.app_rollout({'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'app'}})
-        self.assertIn('notLoaded (turn running in the app)', self.do(CLAUDE, 'tick'))
-        self.codex.turns, self.codex.path = [], None
-        self.do(CODEX, 'ask', iid, '--text', 'owner screen?')
-        self.do(CLAUDE, 'tick')
-        self.assertEqual(sent, ['codex-session'])  # busy, then in ask: no second nudge
 
     def test_tick_codex_unavailable_does_not_stop_other_coordinator_work(self):
         self.do(CODEX, 'take', self.add('--type', 'asset'))

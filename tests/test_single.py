@@ -9,7 +9,6 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from time import monotonic, sleep  # the real clock: Wait patches time.time and time.sleep
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -48,19 +47,30 @@ class FakeBoard:
         self.issues[n]['state'] = 'closed'
 
 
+class FixedNow(taskq.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 10, 9, tzinfo=tz)  # the moment FakeBoard stamps: a task is 0 minutes old until a test says otherwise
+
+
 class Base(unittest.TestCase):
+    """Hermetic (#427): a temp root, only these environment variables, a fixed clock, no real process."""
+
     def setUp(self):
         self.board = taskq.BOARD = FakeBoard()
-        taskq.CONFIG = {'board': 'github', 'publish': 'direct', 'root': ROOT, 'hosts': {}}
-        patcher = mock.patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': SESSION, 'TASKQ_RUNTIME': 'claude', 'TASKQ_HOST': 'mac'})
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        patcher = mock.patch.object(taskq, 'runtimes', return_value={})  # no real worker from an event's dispatch
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        patcher = mock.patch.object(taskq, 'start_pass', lambda *_, **__: taskq.main(['tick', '--quiet']))  # the child's pass, in process
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        taskq.CONFIG = {'board': 'github', 'publish': 'direct', 'root': self.root, 'hosts': {}}
+        real = lambda *_, **__: self.fail('a test started a real process')  # a test fakes subprocess.run where it needs one
+        for patcher in (
+                mock.patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': SESSION, 'TASKQ_RUNTIME': 'claude', 'TASKQ_HOST': 'mac'}, clear=True),
+                mock.patch.object(taskq, 'runtimes', return_value={}),  # no real worker from an event's dispatch
+                mock.patch.object(taskq, 'start_pass', lambda *_, **__: taskq.main(['tick', '--quiet'])),  # the child's pass, in process
+                mock.patch.object(taskq, 'datetime', FixedNow),
+                mock.patch.object(taskq.subprocess, 'run', real), mock.patch.object(taskq.subprocess, 'Popen', real)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def run_cli(self, *argv):
         out = io.StringIO()
@@ -123,24 +133,21 @@ class Commands(Base):
         self.assertEqual(self.board.issues[1]['state'], 'open')
 
     def test_close_removes_clean_worktree_keeps_dirty(self):
-        real = subprocess.run
-        fake = lambda command, **kw: subprocess.CompletedProcess(command, 0) if {'fetch', 'merge-base'} & set(command) else real(command, **kw)
-        with tempfile.TemporaryDirectory() as folder:
-            root = taskq.CONFIG['root'] = Path(folder)
-            git = ['git', '-C', folder, '-c', 'user.name=t', '-c', 'user.email=t@t']
-            real([*git, 'init', '-q'], check=True)
-            real([*git, 'commit', '-q', '--allow-empty', '-m', 'init'], check=True)
-            for n in (1, 2):
-                self.add()
-                self.run_cli('take', str(n))
-                self.run_cli('result', str(n), '--sha', 'a' * 40)
-                real([*git, 'worktree', 'add', '-q', '-b', f'taskq-{n}', f'.worktrees/taskq-{n}'], check=True)
-            (root / '.worktrees' / 'taskq-2' / 'wip.txt').write_text('x')
-            with mock.patch.object(taskq.subprocess, 'run', side_effect=fake):
-                self.run_cli('close', '1')
-                self.run_cli('close', '2')
-            branches = real([*git, 'branch', '--list', 'taskq-*'], capture_output=True, text=True).stdout.split()
-            self.assertEqual((sorted(p.name for p in (root / '.worktrees').iterdir()), branches), (['taskq-2'], ['+', 'taskq-2']))
+        trees, calls = [self.root / '.worktrees' / f'taskq-{n}' for n in (1, 2)], []
+
+        def git(command, **_):  # git after `-C <root>`; taskq-2 has uncommitted changes
+            calls.append(command[3:])
+            return subprocess.CompletedProcess(command, 0, ' M wip.txt\n' if command[4:6] == [str(trees[1]), 'status'] else '', '')
+        for n, tree in enumerate(trees, 1):
+            tree.mkdir(parents=True)
+            self.add()
+            self.run_cli('take', str(n))
+            self.run_cli('result', str(n), '--sha', 'a' * 40)
+        with mock.patch.object(taskq.subprocess, 'run', side_effect=git):
+            self.run_cli('close', '1')
+            self.run_cli('close', '2')
+        self.assertEqual([call for call in calls if call[0] in ('worktree', 'branch')],
+                         [['worktree', 'remove', str(trees[0])], ['branch', '-D', 'taskq-1']])
         self.assertEqual(self.board.issues[1]['comments'][-1], '**close** · claude:01234567')
         self.assertEqual(self.board.issues[2]['comments'][-1],
                          '**close** · claude:01234567\n\nkept .worktrees/taskq-2 and branch taskq-2: uncommitted changes')
@@ -460,72 +467,15 @@ class Tick(Base):
         self.assertIn('dispatch stopped: claude could not start the session', err.getvalue())
 
     def test_event_returns_before_the_detached_spawn(self):
-        # #405 (R4): add starts a detached `tick --quiet`; a slow spawn and a failed one happen there, logged
-        board = """import json, pathlib
-FILE = pathlib.Path(__file__).with_name('issues.json')
-load = lambda: {int(n): issue for n, issue in json.loads(FILE.read_text()).items()} if FILE.exists() else {}
-save = lambda issues: FILE.write_text(json.dumps(issues))
-def list(state):
-    return [i for i in load().values() if i['state'] == 'open' and any(l.startswith('q-') for l in i['labels'])]
-def get(n):
-    return load()[n]
-def add(title, body, labels):
-    issues = load(); n = len(issues) + 1
-    issues[n] = {'iid': n, 'title': title, 'body': body, 'labels': labels, 'state': 'open', 'url': '', 'comments': [],
-                 'updated_at': '2026-10-09T00:00:00Z'}
-    save(issues); return n
-def update(n, labels=None, body=None):
-    issues = load(); issues[n].update({k: v for k, v in (('labels', labels), ('body', body)) if v is not None}); save(issues)
-def comment(n, text):
-    issues = load(); issues[n]['comments'].append(text); save(issues)
-def close(n):
-    issues = load(); issues[n]['state'] = 'closed'; save(issues)
-"""
-        runtime = """import os, pathlib, time
-def spawn(name, prompt, cwd):
-    time.sleep(2)
-    if 'boom' in name:
-        raise SystemExit('taskq: slow could not start the session')
-    pathlib.Path(cwd, 'spawned').write_text(str(os.getpid()))
-    return 's-' + name.split()[0]
-send = lambda session, text: session
-alive = lambda session: None
-link = lambda session: None
-"""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / 'board.py').write_text(board)
-            (root / 'slow.py').write_text(runtime)
-            (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'runtimes': {'slow': 'slow.py'}, 'limits': {'slow': 1}}))
-            env = {**taskq.worker_env(), 'TASKQ_HOST': 'mac'}
-            add = lambda title: subprocess.run(['python3', str(ROOT / 'taskq.py'), 'add', title, '--goal', 'g', '--acceptance', 'a'],
-                                               cwd=root, env=env, capture_output=True, text=True, timeout=30)
-            start = monotonic()
-            done = add('one')
-            self.assertLess(monotonic() - start, 1.5)
-            self.assertEqual((done.returncode, done.stdout, done.stderr), (0, '#1 ready\n', ''))
-            spawns = lambda: [c for c in json.loads((root / 'issues.json').read_text())['1']['comments'] if c.startswith('**spawn**')]
-            for _ in range(100):
-                if spawns():
-                    break
-                sleep(0.1)
-            child = int((root / 'spawned').read_text())
-            self.assertEqual((child != os.getpid(), len(spawns())), (True, 1))  # spawned once, in the child
-            for _ in range(100):  # the child holds the dispatch lock until it exits: a pass then would find it busy
-                try:
-                    os.kill(child, 0)
-                except OSError:
-                    break
-                sleep(0.1)
-            (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'runtimes': {'slow': 'slow.py'}, 'limits': {'slow': 2}}))
-            done = add('boom')
-            self.assertEqual(done.returncode, 0)
-            log = root / '.taskq' / 'dispatch.log'
-            for _ in range(100):
-                if 'dispatch stopped' in log.read_text():
-                    break
-                sleep(0.1)
-            self.assertIn('dispatch stopped: slow could not start the session', log.read_text())
+        # #405 (R4): add starts a detached `tick --quiet` with its output in .taskq/dispatch.log and returns; the spawn happens there
+        started = []
+        with mock.patch.object(taskq, 'start_pass', lambda command, **options: started.append((command, options))):
+            self.assertEqual(self.add(), '#1 ready\n')
+        [(command, options)] = started
+        self.assertEqual((command[1:], options['cwd'], options['stdout'].name, options['stdin']),
+                         ([str(ROOT / 'taskq.py'), 'tick', '--quiet'], self.root, str(self.root / '.taskq' / 'dispatch.log'), subprocess.DEVNULL))
+        self.assertTrue(options.get('start_new_session') or options.get('creationflags'))  # detached: it outlives the event
+        self.assertEqual((self.task(1)['state'], getattr(self.fake, 'names', [])), ('ready', []))  # nothing spawned in this process
 
     def test_claude_send_keeps_name_and_spawn_flags(self):
         claude, calls = taskq.Claude(), []
@@ -584,15 +534,11 @@ link = lambda session: None
             self.assertEqual([path.name for path in (Path(folder) / '.taskq').iterdir()], ['T4.pid'])
 
     def test_codex_alive_from_pid_file(self):
-        with tempfile.TemporaryDirectory() as folder:
-            taskq.CONFIG['root'] = Path(folder)
-            codex = taskq.Codex()
-            (codex.folder() / 'T1.pid').write_text(f'{os.getpid()} thread-1')
-            dead = subprocess.Popen(['python3', '-c', ''])
-            dead.wait()
-            (codex.folder() / 'T2.pid').write_text(f'{dead.pid} thread-2')
-            self.assertEqual([codex.alive(s) for s in ('thread-1', 'thread-2', 'thread-3')], [True, False, None])
-            self.assertTrue(codex.link('thread-1').endswith('/open.html#codex://threads/thread-1'))
+        codex = taskq.Codex()
+        (codex.folder() / 'T1.pid').write_text(f'{os.getpid()} thread-1')
+        (codex.folder() / 'T2.pid').write_text('999999999 thread-2')  # above any pid_max: no such process
+        self.assertEqual([codex.alive(s) for s in ('thread-1', 'thread-2', 'thread-3')], [True, False, None])
+        self.assertTrue(codex.link('thread-1').endswith('/open.html#codex://threads/thread-1'))
 
 
 class Wait(Tick):
@@ -600,9 +546,6 @@ class Wait(Tick):
 
     def setUp(self):
         super().setUp()
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        taskq.CONFIG['root'] = Path(folder.name)
         self.clock = [0.0]
         for name, fake in (('time', lambda: self.clock[0]), ('sleep', lambda s: self.clock.__setitem__(0, self.clock[0] + s))):
             patcher = mock.patch.object(taskq.time, name, fake)
@@ -635,7 +578,7 @@ class Wait(Tick):
         self.assertIn('with SendMessage', out)
 
 
-class Model(unittest.TestCase):
+class Model(Base):
     def test_block_keeps_unknown_keys(self):
         board = taskq.BOARD = FakeBoard()
         n = board.add('t', taskq.block('text', {'scope': [], 'deps': [], 'claim': None, 'result': None, 'supervisor': {'x': 1}}),

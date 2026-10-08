@@ -505,6 +505,11 @@ def retire(gone, why, running=True):
         except Exception as error:
             print(f'{why}: {error}', file=sys.stderr)
 
+def history(n):
+    """The review notes a new worker must read: every requeue and answer since the last close, with the result they answer."""
+    notes = [text for text in BOARD.get(n)['comments'] or [] if text.startswith(('**result**', '**requeue**', '**answer**', '**ask**'))]
+    return 'History of this task (read it first; a requeue says what to fix):\n\n' + '\n\n'.join(notes[-6:]) + '\n\n' if notes else ''
+
 def brief(item, runtime):
     """The worker's prompt: the task, its workspace, the taskq commands it uses."""
     n, root, tq = item['iid'], CONFIG['root'], f'python3 {Path(__file__).resolve()}'
@@ -517,7 +522,7 @@ Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_
 
 {item["text"]}
 
-Expected paths: {", ".join(item["scope"] or []) or "none named"}. They say where the work is expected, not what is forbidden.
+{history(n)}Expected paths: {", ".join(item["scope"] or []) or "none named"}. They say where the work is expected, not what is forbidden.
 
 Workspace: from {root} run `git fetch origin && git worktree add -b taskq-{n} .worktrees/taskq-{n} origin/main`, work only there,
 never in the main checkout; a branch taskq-{n} left by an earlier worker: continue it. A task that ends in an answer, not a commit,

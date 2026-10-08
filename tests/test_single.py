@@ -433,6 +433,11 @@ class Tick(Base):
         self.run_cli('tick')  # the safety net finds nothing left to do
         self.assertEqual(spawns(), [1, 2, 2, 3, 3])
 
+    def test_brief_carries_the_requeue_reason(self):
+        self.add()
+        self.run_cli('requeue', '1', '--text', 'fix test X')
+        self.assertIn('fix test X', taskq.brief(self.task(1), 'fake'))
+
     def test_no_event_pass_inside_a_codex_sandbox(self):
         with mock.patch.dict(os.environ, {'CODEX_SANDBOX': 'seatbelt'}):
             self.add()

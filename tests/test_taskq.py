@@ -2217,6 +2217,29 @@ class GithubCycle(unittest.TestCase):
                 q.main(['take', str(number)])
         self.assertIn('cannot start', str(refused.exception))
 
+    def test_every_claim_release_removes_its_lock_ref(self):
+        released = self.add('--type', 'research', '--runtime', 'any')
+        self.do(CODEX, 'take', released)
+        self.do(COORDINATOR, 'release', released, '--text', 'stopped')
+
+        rejected = self.add('--type', 'research', '--runtime', 'any')
+        self.do(CODEX, 'take', rejected)
+        self.do(CODEX, 'result', rejected, '--text', 'done', '--checks', 'none')
+        self.do(COORDINATOR, 'reject', rejected, '--text', 'again')
+
+        stale = self.add('--type', 'research', '--runtime', 'any')
+        self.do(CODEX, 'take', stale)
+        with patch.object(q, 'STALE_MINUTES', -1):
+            self.do(COORDINATOR, 'tick')
+
+        repeated = self.add('--type', 'research', '--runtime', 'any')
+        self.do(CODEX, 'take', repeated)
+        self.do(COORDINATOR, 'release', repeated, '--text', 'stopped')
+        self.do(CODEX, 'take', repeated)
+        self.do(COORDINATOR, 'release', repeated, '--text', 'stopped again')
+
+        self.assertEqual(self.github.locks(), [])
+
     def test_fixed_coordinator_machine(self):
         fixed_coordinator(self)
 

@@ -405,6 +405,7 @@ def requeue(args):
         # #157: a worker that fails the same way (Blender in a Codex sandbox) would take, crash and release on
         # every tick; the second release in a row without an owner's answer or reject goes to the owner instead.
         core.save(current, 'ask', 'release', args.text, waiting_for=None, result=None, claim=claim, reservation=None)
+        core.unlock(args.iid)
         return core.note(args.iid, 'ask', f'Released {len(before) + 1} times in a row, the last because: {args.text}\n'
                          f'Earlier: {before[-1]}\nDecide how it can run (runtime, access, a fix first) and answer.')
     core.save(current, 'ready', args.action, args.text, waiting_for=None, result=None, claim=claim, reservation=None)

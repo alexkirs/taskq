@@ -446,6 +446,20 @@ class Tick(Base):
         self.run_cli('tick')  # the safety net finds nothing left to do
         self.assertEqual(spawns(), [1, 2, 2, 3, 3])
 
+    def test_event_during_a_pass_is_not_lost(self):
+        self.add()
+        calls = []
+        real = taskq.one_pass
+        def first(args, table=True):
+            calls.append(table)
+            if len(calls) == 1:
+                (taskq.CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
+                (taskq.CONFIG['root'] / '.taskq' / 'dispatch.pending').touch()  # an event came while we held the lock
+            return real(args, table)
+        with mock.patch.object(taskq, 'one_pass', first):
+            taskq.cmd_tick(None, table=False)
+        self.assertEqual(len(calls), 2)
+
     def test_arm_tick_without_target_arms_this_session(self):
         out = self.run_cli('arm', 'tick')
         self.assertIn('background command', out)

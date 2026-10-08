@@ -566,13 +566,22 @@ def quick_deaths(n):
     return count
 
 def cmd_tick(args, table=True):
+    """One pass; a pass that found the lock busy left .taskq/dispatch.pending, so run once more after ours (no lost event)."""
+    pending = CONFIG['root'] / '.taskq' / 'dispatch.pending'
+    held = one_pass(args, table)
+    while held and pending.exists():  # only the lock holder reruns; a busy pass just leaves the mark
+        pending.unlink(missing_ok=True)
+        held = one_pass(args, False)
+
+def one_pass(args, table=True):
     """One pass: requeue dead workers, nudge silent ones, free waiting tasks, spawn ready ones, print the table."""
     here, kinds = machine(), runtimes()
     limits = CONFIG.get('limits') or {name: 1 for name in kinds}
     with dispatch_lock() as held:  # #357 (R2): one pass at a time per checkout; the list is read under the lock
         items = sorted(filter(None, map(parse, BOARD.list(None))), key=lambda item: (item['priority'], item['iid']))
-        if not held:  # another pass runs here now and starts what is ready
-            print('taskq: another pass is running; this one only prints the table', file=sys.stderr)
+        if not held:  # another pass runs here now: mark the event, that pass runs once more when it ends
+            (CONFIG['root'] / '.taskq' / 'dispatch.pending').touch()
+            print('taskq: another pass is running; it will run again for this event', file=sys.stderr)
         busy, ready = {}, items if held else []
         for item in ready:
             claim = item['claim'] or {}
@@ -620,7 +629,7 @@ def cmd_tick(args, table=True):
             open_tasks = {item['iid'] for item in items}
             retire(lambda n: n not in open_tasks, 'could not remove sessions of closed tasks', running=False)
     if not table:
-        return
+        return held
     print(f'{"Task":<6} {"State":<8} {"Runtime":<8} Session link')
     for item in items:
         claim = item['claim'] or {}
@@ -631,6 +640,7 @@ def cmd_tick(args, table=True):
     url = CONFIG.get('board_url') or {'github': f'https://{host or "github.com"}/{repo}/issues',
                                       'gitlab': f'https://{host or "gitlab.com"}/{repo}/-/issues'}.get(CONFIG['board'])
     url and print(f'Board: {url}')  # a board file names its page in `board_url`
+    return held
 
 EVENTS = ('add', 'answer', 'result', 'requeue', 'close')  # R4 (#333): each starts one pass after its move
 

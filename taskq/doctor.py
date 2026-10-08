@@ -360,6 +360,37 @@ def profile_init(args):
     ignore_local()
 
 
+def pref(args):
+    """Maintain the owner's free-form local preferences without touching profile keys."""
+    found = core.personal()
+    notes = found.get('prefs', {}).get('notes', [])
+    if args.what == 'list':
+        print('\n'.join(f'{number}. {note}' for number, note in enumerate(notes, 1)) or 'No preferences.')
+        return
+    if args.what == 'add':
+        if not args.value:
+            core.fail('pref add needs text')
+        notes.append(args.value)
+    else:
+        try:
+            number = int(args.value)
+        except (TypeError, ValueError):
+            core.fail(f'preference {args.value} does not exist')
+        if not 1 <= number <= len(notes):
+            core.fail(f'preference {number} does not exist')
+        del notes[number - 1]
+    text = core.LOCAL.read_text() if core.LOCAL.exists() else ''
+    section = re.compile(r'(?ms)^\[prefs\]\n.*?(?=^\[|\Z)')
+    replacement = '[prefs]\nnotes = ' + json.dumps(notes, ensure_ascii=False) + '\n'
+    if section.search(text):
+        text = section.sub(replacement, text)
+    else:
+        text += ('\n' if text and not text.endswith('\n\n') else '') + replacement
+    core.LOCAL.write_text(text)
+    ignore_local()
+    print(f'preferences: {len(notes)}')
+
+
 def idle():
     """Runtimes this machine never starts (effective profile limit 0): doctor and `--fix` skip their checks and setup.
     Claude too (#160): a Codex-only machine's coordinator is not a Claude session, so its login, trust and

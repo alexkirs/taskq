@@ -1089,6 +1089,18 @@ class Cycle(unittest.TestCase):
         self.assertIn(f'taskq supervise {iid}` and follow', self.do(CLAUDE, 'tick'))
         self.assertIn(f'taskq supervise {iid}` and follow', self.do(CLAUDE, 'tick', '--filter', '', '--mine'))
 
+    def test_preferences_are_local_and_in_briefs(self):
+        self.personal('[profile]\nmine = false\n[profile.limits]\nclaude = 1\ncodex = 0\n')
+        self.assertIn('preferences: 1', self.do(CLAUDE, 'pref', 'add', 'keep changes small'))
+        self.assertEqual(self.do(CLAUDE, 'pref', 'list').strip(), '1. keep changes small')
+        iid = self.add('--type', 'code', '--mine')
+        self.assertIn('- keep changes small', self.do(CLAUDE, 'worker'))
+        self.assertIn('- keep changes small', self.do(CLAUDE, 'tick'))
+        current = {**q.task(iid), 'supervisor': {'runtime': 'claude', 'session': 'supervisor'}}
+        self.assertIn('- keep changes small', worker.supervisor_brief(current))
+        self.assertIn('preferences: 0', self.do(CLAUDE, 'pref', 'rm', '1'))
+        self.assertIn('No preferences.', self.do(CLAUDE, 'pref', 'list'))
+
     def test_only_the_owner_tick_runs_scheduled_cleanup_once_per_pass(self):
         with patch.object(cleanup, 'scheduled') as scheduled:
             self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))

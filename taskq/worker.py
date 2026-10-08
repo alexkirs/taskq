@@ -40,6 +40,7 @@ This machine ({host}): main checkout {root}; paths in the task are relative to i
 7. {deliver}
    Then `{tool} result {iid}{sha} --checks "<commands you ran and their outcome>" --text "<summary>"` and stop.
 Everything you write through `{tool}` is public: no environment values, paths outside the repository, tokens.
+{preferences}
 
 # {title}
 
@@ -75,6 +76,7 @@ By the task's state (`{tool} view {iid}` reads it again):
 The tick wakes you when the task needs you; after close end your turn, the tick retires this session.
 What went wrong or needs the owner: `{tool} problem --task {iid} --text "<what>"`, then end your turn.
 Everything you write through `{tool}` is public: no environment values, paths outside the repository, tokens.
+{preferences}
 
 # {title}
 
@@ -288,6 +290,7 @@ def brief(current):
                            'export': f'export TASKQ_TASK={current["iid"]} TASKQ_RUNTIME={runtime}',
                            'scope': ', '.join(current['scope']) or 'none', 'host': core.machine(), 'root': core.ROOT,
                            'machine': ''.join(f'\n   {line}' for line in (core.personal().get('machine', {}).get('notes') or '').strip().splitlines()),
+                           'preferences': core.preferences_text(),
                            'notes': ('\n\n---\n\n'.join(core.notes(kept)) or 'none') + omitted})
 
 
@@ -304,6 +307,7 @@ def supervisor_brief(current):
     kept = core.collaborators(core.comments(iid, everyone=True))
     return SUPERVISOR_BRIEF.format(**{**current, 'tool': core.TOOL, 'host': core.machine(), 'root': core.ROOT, 'runtime': runtime,
                                       'spawn': spawn, 'worker': worker or 'none', 'resume': resume, 'publish': PUBLISH[core.PUBLISH],
+                                      'preferences': core.preferences_text(),
                                       'notes': '\n\n---\n\n'.join(core.notes(kept)) or 'none'})
 
 

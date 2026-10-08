@@ -174,6 +174,10 @@ Existing timers with profile flags must be inspected and migrated with coordinat
 old flags otherwise continue winning. Do not create a second timer or start workers during
 profile setup. Until migration, print the overrides visibly in the profile card.
 
+When the owner says `remember: <wish>`, run `taskq pref add "<wish>"`. Preferences are free-form
+strings in local `[prefs] notes`, appear verbatim in worker, supervisor and tick briefs, and are
+managed with `taskq pref list` and `taskq pref rm N`. They do not change task selection or policy.
+
 Onboarding integrates with both modes in `taskq-manager.md` § 1. Missing personal file:
 show one short card asking areas/exclusions, only own assignments or pool, and this machine's
 Claude/Codex capacity; offer optional preferred runtime. Translate areas into the tracker

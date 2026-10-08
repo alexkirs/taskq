@@ -164,10 +164,11 @@ def checked(config, path):
     stops with the file and key, never silently broadens."""
     where = lambda key: f'{path}: {key}'
     profile, codex = config.get('profile', {}), config.get('codex', {})
-    unknown = [f'[{name}]' for name in config if name not in ('profile', 'codex', 'coordinator', 'machine', 'idle', 'cleanup', 'projects')] + [
+    unknown = [f'[{name}]' for name in config if name not in ('profile', 'prefs', 'codex', 'coordinator', 'machine', 'idle', 'cleanup', 'projects')] + [
         f'[idle] {key}' for key in config.get('idle', {}) if key not in ('stop', 'cleanup')] + [
         f'[machine] {key}' for key in config.get('machine', {}) if key != 'notes'] + [
         f'[profile] {key}' for key in profile if key not in (*PROFILE_DEFAULTS, 'limits')] + [
+        f'[prefs] {key}' for key in config.get('prefs', {}) if key != 'notes'] + [
         f'[codex] {key}' for key in codex if key not in ('project', 'section')] + [
         f'[coordinator] {key}' for key in config.get('coordinator', {}) if key != 'session']
     if unknown:
@@ -178,6 +179,9 @@ def checked(config, path):
             fail(f'{where("[profile] " + key)}: write {text}')
     if profile.get('preferred_runtime', 'claude') not in RUNTIMES:
         fail(f'{where("[profile] preferred_runtime")}: "{profile["preferred_runtime"]}" is not one of {", ".join(RUNTIMES)}')
+    notes = config.get('prefs', {}).get('notes', [])
+    if not isinstance(notes, list) or not all(isinstance(note, str) for note in notes):
+        fail(f'{where("[prefs] notes")}: write a list of strings')
     limits = profile.get('limits', {})
     if not isinstance(limits, dict):
         fail(f'{where("[profile.limits]")}: write a table of runtime = N')
@@ -212,6 +216,16 @@ def cleanup_settings(table, path):
 def personal():
     """The person's taskq.local.toml, checked; {} when there is none."""
     return checked(read_toml(LOCAL), LOCAL) if LOCAL and LOCAL.is_file() else {}
+
+
+def preferences():
+    """The owner's free-form, local wishes, printed verbatim in task briefs."""
+    return personal().get('prefs', {}).get('notes', [])
+
+
+def preferences_text():
+    notes = preferences()
+    return '' if not notes else '\n\n# Owner preferences\n\n' + '\n'.join(f'- {note}' for note in notes)
 
 
 def codex_override(key):
@@ -645,6 +659,8 @@ def profile(args):
         layers[name].append(key)
     print('Source: ' + '; '.join(f'{name}: {", ".join(keys)}' for name, keys in layers.items() if keys) +
           ('' if LOCAL.is_file() else f'; no {LOCAL} (`{TOOL} doctor` names the command that writes it)'))
+    if notes := preferences():
+        print('Owner preferences:\n' + '\n'.join(f'- {note}' for note in notes))
     if found['filter'] and not candidates:
         print('Warning: nonempty filter returned 0 candidates; check the filter.')
     return loaded, candidates
@@ -807,7 +823,7 @@ from taskq.selftest import selftest  # noqa: E402
 from taskq.doctor import (  # noqa: E402
     green, signed, works, update, queue_labels, probe, origin_of, write_config, doctor, personal_gaps, ignore_local,
     tree_gaps, profile_init, runtime_gaps, write_access, queue_labels_missing, board_gaps, report_gaps,
-    PERMISSION_MODE, WORKER_ALLOW, permissions_missing, permissions_gap, trusted, setup, migrate, windows_claude_binary)
+    PERMISSION_MODE, WORKER_ALLOW, permissions_missing, permissions_gap, trusted, setup, migrate, windows_claude_binary, pref)
 from taskq.tick import (  # noqa: E402
     clone_warning, auto_update, question, TICK_MINUTES, TICK_LIVE_MINUTES, tick_beat, TICK_PROMPT_VERSION, TICK_PROMPT,
     report_bootstrap, verify_report, contract_seen, contract_news, profile_arguments, BOARD_MOVES, board_fix, board_moves, session_link,
@@ -924,6 +940,8 @@ def main(argv=None):
             (('--uninstall-timer',), {'action': 'store_true', 'help': 'remove that launchd timer'}))
     command('profile', profile_init, (('what',), {'choices': ('init',)}), *profile_flags,
             (('--preferred-runtime',), {'choices': tuple(RUNTIMES), 'help': 'tie-break for own tasks of any runtime'}))
+    pref_command = command('pref', pref, (('what',), {'choices': ('add', 'list', 'rm')}))
+    pref_command.add_argument('value', nargs='?')
     spawn_command = command('spawn', spawn, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),
             (('--name',), {'default': 'taskq worker', 'help': 'session name: "T<N> <words>"; " (<this machine>)" is added'}),
             (('--remote-control',), {'action': argparse.BooleanOptionalAction, 'default': True,

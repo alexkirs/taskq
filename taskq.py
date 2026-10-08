@@ -632,14 +632,27 @@ def cmd_tick(args, table=True):
                                       'gitlab': f'https://{host or "gitlab.com"}/{repo}/-/issues'}.get(CONFIG['board'])
     url and print(f'Board: {url}')  # a board file names its page in `board_url`
 
-EVENTS = ('add', 'answer', 'result', 'requeue', 'close')  # R4 (#333): each runs one pass after its move
+EVENTS = ('add', 'answer', 'result', 'requeue', 'close')  # R4 (#333): each starts one pass after its move
 
 def dispatch():
-    """The tick pass without the table, once, after an event. A failure never fails the event: the next tick retries."""
+    """R4 (#405): the event pass runs in a detached `tick --quiet` child, its output in .taskq/dispatch.log; the event returns at once."""
     if os.environ.get('CODEX_SANDBOX'):  # a sandboxed Codex worker can neither start codex nor see other sessions' pids:
         return  # its pass would requeue live tasks as gone and spawn workers that die at once (#269 run 4b)
     try:
-        cmd_tick(None, table=False)
+        (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
+        detach = {'creationflags': 0x208} if os.name == 'nt' else {'start_new_session': True}
+        with open(CONFIG['root'] / '.taskq' / 'dispatch.log', 'ab') as out:
+            start_pass([sys.executable, str(Path(__file__).resolve()), 'tick', '--quiet'], cwd=CONFIG['root'],
+                       stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
+    except Exception as error:  # never fails the event: the next tick retries
+        print(f'taskq: dispatch stopped: {error}; the next tick retries', file=sys.stderr)
+
+start_pass = subprocess.Popen  # tests run the child's pass in process
+
+def event_pass(args):
+    """`tick --quiet`: the tick pass without the table. A failure never fails the event: the next tick retries."""
+    try:
+        cmd_tick(args, table=False)
     except (SystemExit, Exception) as error:
         print(f'taskq: dispatch stopped: {str(error).removeprefix("taskq: ")}; the next tick retries', file=sys.stderr)
 
@@ -704,7 +717,7 @@ def main(argv=None):
     command('requeue', cmd_move, text=True)
     command('later', cmd_move, text=True)
     command('close', cmd_close, (('n',), {'nargs': '+', 'type': int}), n=False, text=True)
-    command('tick', cmd_tick, n=False)
+    command('tick', lambda args: (event_pass if args.quiet else cmd_tick)(args), (('--quiet',), {'action': 'store_true'}), n=False)
     command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}), n=False)
     command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {}), n=False)
     args = parser.parse_args(argv)

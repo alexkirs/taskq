@@ -274,6 +274,16 @@ class Tick(Base):
         self.add('three')
         self.assertNotIn('spawn', self.run_cli('tick'))
 
+    def test_claude_send_keeps_name_and_spawn_flags(self):
+        claude, calls = taskq.Claude(), []
+        claude.start = lambda arguments, cwd: calls.append(arguments) or 'new'
+        claude.agents = lambda: {'s1': {'name': 'T7', 'cwd': '/w'}}
+        claude.spawn('T7', 'brief', '/w')
+        claude.send('s1', 'continue')
+        spawned, resumed = calls
+        self.assertEqual(resumed, ['--resume', 's1', *spawned[:-1], 'continue'])
+        self.assertEqual(resumed[2:4], ['--name', 'T7'])
+
     def test_codex_alive_from_pid_file(self):
         with tempfile.TemporaryDirectory() as folder:
             taskq.CONFIG['root'] = Path(folder)

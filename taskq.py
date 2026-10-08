@@ -202,18 +202,22 @@ class Claude:
             fail(f'claude could not start the session: {done.stderr.strip() or done.stdout.strip()}')
         return next((sid for sid in self.agents() or {} if sid.startswith(short[1])), None) or fail(f'claude agents lacks {short[1]}')
 
-    def spawn(self, name, prompt, cwd):
+    def flags(self, name):
+        """What spawn and send both pass (#301): without --name a resume retitles the job from the prompt, without the rest it runs in the user's mode."""
         mode = CONFIG.get('permission_mode', 'dontAsk')
         settings = {'permissions': {'defaultMode': mode, 'allow': self.TOOLS}}  # dontAsk denies what is not allowed
-        return self.start(['--name', name, '--permission-mode', mode, '--tools', ','.join(self.TOOLS), '--strict-mcp-config',
-                           '--no-chrome', '--settings', json.dumps(settings), prompt], cwd)
+        return [*(['--name', name] if name else []), '--permission-mode', mode, '--tools', ','.join(self.TOOLS), '--strict-mcp-config',
+                '--no-chrome', '--settings', json.dumps(settings)]
+
+    def spawn(self, name, prompt, cwd):
+        return self.start([*self.flags(name), prompt], cwd)
 
     def send(self, session, text):
         """Stop the session, then resume it with the text. #284: a stopped session resumes under a new id."""
         agent = (self.agents() or {}).get(session) or {}
         if agent.get('pid'):
             subprocess.run([shutil.which('claude') or 'claude', 'stop', agent['id']], capture_output=True, timeout=60)
-        return self.start(['--resume', session, text], agent.get('cwd') or CONFIG['root'])
+        return self.start(['--resume', session, *self.flags(agent.get('name')), text], agent.get('cwd') or CONFIG['root'])
 
     def alive(self, session):
         agent = (self.agents() or {}).get(session)

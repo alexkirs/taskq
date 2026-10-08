@@ -413,7 +413,8 @@ def claude_inventory(rows):
 
 def claude_executor_ended_row(row):
     """Whether one supported CLI row has no executor left. An omitted status is normal; an unknown present status holds."""
-    return (row.get('state') in CLAUDE_ENDED and row.get('pid') is None
+    return (isinstance(row.get('sessionId'), str) and row['sessionId'] and row.get('kind') == 'background'
+            and isinstance(row.get('cwd'), str) and row['cwd'] and row.get('state') in CLAUDE_ENDED and row.get('pid') is None
             and ('status' not in row or row['status'] == 'idle'))
 
 

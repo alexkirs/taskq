@@ -518,6 +518,21 @@ class Acting(unittest.TestCase):
                 found = multiproject.budget({'claude': 1, 'codex': 1}, {'claude': inventory, 'codex': set()}, [read], read, {'claude': 1})
                 self.assertEqual((found['claude']['occupancy'], found['claude']['F']), (1, 0))
 
+    def test_terminal_inventory_excludes_only_identified_background_rows(self):
+        session = 'aac1d605-82f4-4b65-804c-ea07b78674cd'
+        row = {'id': 'aac1d605', 'kind': 'background', 'sessionId': session, 'cwd': str(self.dir), 'state': 'done'}
+        self.assertEqual(multiproject.claude_inventory([row]), set())
+        read = {'status': 'ok', 'L': {'claude': 0, 'codex': 0}, 'uncertain': [],
+                'held': [(['claude'], f'session:{session}')], 'inactive': [f'session:{session}'], 'protected': []}
+        for bad, expected in (({'sessionId': None}, None), ({'kind': 'interactive'}, {f'session:{session}'}),
+                              ({'kind': None}, {f'session:{session}'}), ({'cwd': None}, {f'session:{session}'}),
+                              ({'cwd': 1}, {f'session:{session}'})):
+            with self.subTest(bad=bad):
+                inventory = multiproject.claude_inventory([{**row, **bad}])
+                self.assertEqual(inventory, expected)
+                found = multiproject.budget({'claude': 1, 'codex': 1}, {'claude': inventory, 'codex': set()}, [read], read, {'claude': 1})
+                self.assertEqual((found['claude']['known'], found['claude']['F']), (expected is not None, 0))
+
     def test_occupancy_keeps_mixed_state_same_session_ineligible(self):
         items = [{'iid': 191, 'state': 'review', 'claim': {'runtime': 'codex', 'session': 'same'}, 'reservation': None},
                  {'iid': 192, 'state': 'doing', 'claim': {'runtime': 'codex', 'session': 'same'}, 'reservation': None}]

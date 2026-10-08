@@ -354,7 +354,8 @@ def apply_removals(args, root, gc, remove):
                     core.record(args, 'delete_branch', status='done', **item)
             elif item['kind'] == 'codex':
                 try:
-                    core.codex_archive(argparse.Namespace(thread=item['thread']))
+                    from taskq.runtimes import get
+                    get('codex').close(item['thread'])
                     removed.append(item['what'])
                     core.record(args, 'archive', status='done', session=item['thread'])
                 except (SystemExit, OSError) as error:
@@ -365,7 +366,8 @@ def apply_removals(args, root, gc, remove):
                     counts['errors'].append({'item': item['what'], 'error': str(error)})
                     continue
             elif item['kind'] == 'claude-bg':
-                core.claude_stop(item['thread'], remove=True)
+                from taskq.runtimes import get
+                get('claude').close(item['thread'])
                 removed.append(item['what'])
                 core.record(args, 'retire', status='done', session=item['thread'])
             counts['succeeded'].append(item['what'])

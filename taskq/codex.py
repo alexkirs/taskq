@@ -158,17 +158,13 @@ def codex_observation(codex, thread, status, turns, stamp):
     terminal = status.get('type') != 'active' and latest.get('status') in ('completed', 'failed', 'interrupted')
     state = ('waiting_permission' if waiting else 'terminal' if terminal else
              'active' if latest.get('status') == 'inProgress' and running else 'unknown')
-    # #223: `app` is set only when the app server said notLoaded/interrupted and the rollout tail said running: the
-    # tail decided. The observation names both sources and that conflict; status and blocker are as before.
-    conflict = bool(latest.get('app'))
     return {'runtime': 'codex', 'session': thread, 'status': state,
             'observed_at': datetime.now(timezone.utc).isoformat(), 'event_at': stamp,
             'session_link': f'{core.PAGES.rstrip("/")}/open.html#codex://threads/{thread}',
             'exact_blocker': ('Owner approval required in runtime UI' if waiting else
                               'Owner input required in runtime UI' if 'waitingOnUserInput' in flags else
                               'No current execution or terminal evidence; approval visibility incomplete' if state == 'unknown' else None),
-            'source': 'rollout tail over app metadata' if conflict else 'codex app-server', 'conflict': conflict,
-            'sources': latest.get('sources', {'app': f'{status.get("type")}/{latest.get("status")}', 'rollout': 'not consulted'}),
+            'source': 'codex app-server', 'conflict': False,
             'permission_requests': pending,
             'approval_visibility': 'pending' if waiting else 'unknown',
             'notify_dedup': (f'permission codex {thread} ' + ','.join(sorted(str(item['request_id']) for item in pending))
@@ -250,12 +246,6 @@ def codex_send_app(codex, thread, metadata, text, full_access=False):
             return None
         owner, item = found['handledByClientId'], [{'type': 'text', 'text': text, 'text_elements': []}]
         turns = codex.call('thread/turns/list', {'threadId': thread, 'limit': 1, 'itemsView': 'notLoaded'})['data']
-        if turns and codex_app_running(metadata, turns[0]):
-            cwd = metadata.get('cwd') or str(core.ROOT)
-            reply = ipc.request('thread-follower-steer-turn', {'conversationId': thread, 'input': item, 'restoreMessage':
-                                {'text': text, 'cwd': cwd, 'context': {'workspaceRoots': [cwd]}}}, 1, owner)
-            if reply['resultType'] == 'success':
-                return 'steered the active turn in the Codex app'
         reply = ipc.request('thread-follower-start-turn', {'conversationId': thread, 'turnStart': {
             'request': {'threadId': thread, 'input': item, **codex_turn_policy(full_access)}, 'context': {}}}, 2, owner)
         if reply['resultType'] != 'success':
@@ -336,135 +326,22 @@ def codex_send(args):
 
 # Bounded diagnostic output, independent of the number of items in a long worker turn.
 CODEX_ITEM_LIMIT = 100
-CODEX_TAIL_BYTES = 256 * 1024  # bounded live diagnostic, not a second session log
-
-
-def codex_live_entries(path, turn):
-    """The paginated store omits running exec commands. Read only this thread's bounded rollout tail."""
-    from datetime import datetime
-    if not path:
-        return [], None
-    try:
-        with open(path, 'rb') as handle:
-            handle.seek(0, 2)
-            offset = max(0, handle.tell() - CODEX_TAIL_BYTES)
-            handle.seek(offset)
-            lines = handle.read(CODEX_TAIL_BYTES).splitlines()
-        if offset:
-            lines = lines[1:]  # possibly partial first record
-    except OSError:
-        return [], None
-    calls, processes, last = {}, {}, None
-    recorded = {str(entry['item'].get('processId')) for entry in turn['entries']
-                if entry['item'].get('type') == 'commandExecution'}
-    for line in lines:
-        try:
-            record = json.loads(line)
-        except (ValueError, UnicodeDecodeError):
-            continue  # partial last write is normal while the thread works
-        payload = record.get('payload', {})
-        if record.get('type') != 'response_item':
-            continue
-        meta = payload.get('internal_chat_message_metadata_passthrough') or {}
-        if meta.get('turn_id') != turn['id']:
-            continue
-        kind, call = payload.get('type'), payload.get('call_id')
-        if kind not in ('custom_tool_call', 'function_call', 'custom_tool_call_output', 'function_call_output'):
-            continue
-        stamp = datetime.fromisoformat(record['timestamp'].replace('Z', '+00:00')).timestamp()
-        last = max(last or stamp, stamp)
-        if kind in ('custom_tool_call', 'function_call'):
-            calls[call] = {'turnId': turn['id'], 'startedAtMs': stamp * 1000,
-                           'item': {'type': 'liveToolCall', 'id': call, 'status': 'inProgress',
-                                    'tool': payload['name'], 'arguments': payload.get('input', payload.get('arguments', ''))}}
-        else:
-            entry = calls.pop(call, None)
-            output = payload.get('output')
-            blocks = output if isinstance(output, list) else [{'text': output}]
-            for block in blocks:
-                try:
-                    result = json.loads(block.get('text', ''))
-                except (ValueError, TypeError):
-                    continue
-                if isinstance(result, dict) and result.get('session_id') is not None and entry is not None:
-                    sid = str(result['session_id'])
-                    if sid not in processes and 'exec_command' in entry['item']['arguments']:
-                        processes[sid] = {**entry, 'item': {'type': 'commandExecution', 'status': 'inProgress',
-                                                          'command': entry['item']['arguments'], 'processId': sid}}
-            # A commandExecution completion in the API is authoritative; tool output alone may be a polling result.
-    return [entry for sid, entry in processes.items() if sid not in recorded] + list(calls.values()), last
-
-
-def recorded_turn_policy(path, turn_id):
-    """Report this turn's recorded policy, never its thread defaults or our desired policy."""
-    policy = None
-    if not path:
-        return policy
-    try:
-        with open(path, 'rb') as handle:
-            # ponytail: bounded-memory history scan; add a reverse seek if large rollouts make this costly.
-            while line := handle.readline(CODEX_TAIL_BYTES):
-                if b'"turn_context"' not in line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                payload = record.get('payload', {})
-                if record.get('type') == 'turn_context' and payload.get('turn_id') == turn_id:
-                    policy = {'sandbox': payload.get('sandbox_policy'), 'approval': payload.get('approval_policy')}
-    except OSError:
-        pass
-    return policy
-
-
-def codex_rollout(metadata, turn):
-    """#223: what the thread's own rollout tail says about a turn: `running` (no end record yet), `ended`
-    (`task_complete` or `turn_aborted`, always the turn's last record), or `unread` (no path, unreadable)."""
-    try:
-        with open(metadata.get('path') or '', 'rb') as handle:
-            handle.seek(max(0, handle.seek(0, 2) - CODEX_TAIL_BYTES))
-            tail = handle.read(CODEX_TAIL_BYTES)
-    except OSError:
-        return 'unread'
-    return 'ended' if any(f'"type":"{end}","turn_id":"{turn["id"]}"'.encode() in tail for end in ('task_complete', 'turn_aborted')) else 'running'
-
-
-def codex_app_running(metadata, turn):
-    """The shared server reads a turn the app is running from its rollout and calls it `interrupted`, since
-    the turn has no end yet. The end (`task_complete` or `turn_aborted`) is always the turn's last record."""
-    if metadata['status']['type'] != 'notLoaded' or turn['status'] not in ('interrupted', 'inProgress'):
-        return False
-    return codex_rollout(metadata, turn) == 'running'
 
 
 def codex_snapshot(codex, thread, limit=3, include_policy=False):
     """Read persisted item lifecycles, including in-progress commands, without resuming the worker."""
     metadata = codex.call('thread/read', {'threadId': thread})['thread']
     turns = codex.call('thread/turns/list', {'threadId': thread, 'limit': limit, 'itemsView': 'notLoaded'})['data']
-    if turns:
-        # #223: both sources are kept on the turn: what the app server said and what the rollout tail says.
-        turns[0]['sources'] = {'app': f'{metadata["status"]["type"]}/{turns[0]["status"]}',
-                               'rollout': codex_rollout(metadata, turns[0]) if metadata['status']['type'] == 'notLoaded' else 'not consulted'}
-        if codex_app_running(metadata, turns[0]):
-            turns[0].update(status='inProgress', app=True)
     for turn in turns:
         page = codex.call('thread/items/list', {'threadId': thread, 'turnId': turn['id'],
                                                'limit': CODEX_ITEM_LIMIT, 'sortDirection': 'desc'})
         turn['entries'] = list(reversed(page['data']))
         turn['olderItems'] = bool(page.get('nextCursor'))
-        if turn['status'] == 'inProgress':
-            live, last = codex_live_entries(metadata.get('path'), turn)
-            turn['entries'] += live
-            turn['liveStamp'] = last
         turn['entries'].sort(key=lambda entry: entry.get('startedAtMs') or 0)
     # updatedAt is thread metadata recency, not the last item event. Never substitute it silently.
     stamps = [entry[key] / 1000 for turn in turns for entry in turn['entries']
               for key in ('startedAtMs', 'completedAtMs') if entry.get(key) is not None]
     stamps += [turn[key] for turn in turns for key in ('startedAt', 'completedAt') if turn.get(key) is not None]
-    stamps += [turn['liveStamp'] for turn in turns if turn.get('liveStamp') is not None]
-    if include_policy and turns:
-        turns[0]['policy'] = recorded_turn_policy(metadata.get('path'), turns[0]['id'])
     return metadata['status'], turns, max(stamps, default=None)
 
 
@@ -498,17 +375,9 @@ def codex_read(args):
     """Print recent turns and timestamped events, with the active operation and event age."""
     codex = Codex()
     status, turns, stamp = codex_snapshot(codex, args.thread, args.limit, include_policy=True)
-    held = turns and turns[0].get('app')
     print(f'status: {status["type"]}' + (f' {status.get("activeFlags")}' if status['type'] == 'active' else '') +
-          (' (turn running in the Codex app, which holds the session)' if held else ''))
+          '')
     print(f'last event: {codex_age(stamp)}')
-    if turns:  # #223: which source said what; a conflict means the rollout tail decided over stale app metadata
-        print(f'sources: app {turns[0]["sources"]["app"]}, rollout {turns[0]["sources"]["rollout"]}' + ('; conflict: rollout tail over app metadata' if held else ''))
-    policy = (turns[0].get('policy') if turns else None) or {}
-    sandbox = policy.get('sandbox') or {}
-    shown = {key: sandbox[key] for key in ('type', 'network_access', 'writable_roots') if key in sandbox}
-    print('last turn sandbox: ' + (json.dumps(shown, ensure_ascii=False) if shown else 'unknown (no turn_context)') +
-          f'; approvalPolicy: {policy.get("approval") or "unknown"}')
     for turn in reversed(turns):
         print(f'turn {turn["id"]}: {turn["status"]}')
         if turn['olderItems']:
@@ -547,60 +416,15 @@ def codex_archive(args):
     if codex_archived(metadata):
         return print(f'already archived {args.thread}')
     turns = codex.call('thread/turns/list', {'threadId': args.thread, 'limit': 1, 'itemsView': 'notLoaded'})['data']
-    if metadata['status']['type'] == 'active' or (turns and codex_app_running(metadata, turns[0])):
+    if metadata['status']['type'] == 'active':
         core.fail(f'Codex thread {args.thread} is working; not archived')
     try:
         codex.call('thread/archive', {'threadId': args.thread})
     except SystemExit as error:
-        # 2026-10-06: a thread the app has opened stays loaded in the app's private app server (stdio, not
-        # reachable) for 3 h after it leaves view. #165: the app gives each thread it loads its `codex_app` MCP
-        # tools; `set_thread_archived` there archives through the app's own path, lock included.
         if 'active writer' not in str(error):
             raise
-        return codex_archive_in_app(args.thread)
+        core.fail(f'Codex thread {args.thread} is held by the Codex app: archive it there')
     # Only after the archive: to an app still holding the thread, `thread-archived` drops it from the app's
     # inactive-thread unsubscriber without an unsubscribe, so it stays held until the app restarts (#165).
     codex_announce(args.thread, 'thread-archived', 2)
     print(f'archived {args.thread}')
-
-
-CODEX_ARCHIVE_PROMPT = ('Maintenance request from taskq, not a task: this worker\'s task is finished. Do exactly one '
-                        'thing: call the codex_app tool set_thread_archived with threadId {thread} and archived true '
-                        '(no hostId). Run no shell commands and change no files.')
-
-
-def codex_archive_in_app(thread, wait=120):
-    """#165: a thread the app holds archives itself: a read-only turn through the app (`thread-follower-start-turn`,
-    as codex_send_app) asks it to call its `codex_app` tool `set_thread_archived` (verified 2026-10-07 on held csgo
-    threads, app 26.930; the archive interrupts that very turn). Waits until the shared server reads it archived."""
-    try:
-        ipc = CodexIpc()
-    except OSError:
-        core.fail(f'Codex thread {thread} is held open by the Codex app, but its IPC is unreachable. {codex_app_recipe(thread)}')
-    try:
-        found = ipc.request('thread-owner-discovery', {'hostId': 'local', 'conversationId': thread}, 1)
-        if found['resultType'] != 'success':
-            core.fail(f'Codex thread {thread} is held open by the Codex app, but no app window owns it. {codex_app_recipe(thread)}')
-        text = CODEX_ARCHIVE_PROMPT.format(thread=thread)
-        reply = ipc.request('thread-follower-start-turn', {'conversationId': thread, 'turnStart': {'request': {
-            'threadId': thread, 'input': [{'type': 'text', 'text': text, 'text_elements': []}], 'approvalPolicy': 'never',
-            'sandboxPolicy': {'type': 'readOnly'}}, 'context': {}}}, 2, found['handledByClientId'])
-        if reply['resultType'] != 'success':
-            core.fail(f'Codex app refused the archive turn for {thread}: {reply.get("error")}')
-    finally:
-        ipc.socket.close()
-    end = time.time() + wait
-    while time.time() < end:
-        time.sleep(3)
-        if codex_is_archived(thread):
-            return print(f'archived {thread} (by the Codex app)')
-    core.fail(f'Codex thread {thread}: the app did not archive it in {wait} s. {codex_app_recipe(thread)}')
-
-
-def codex_app_recipe(thread):
-    # #158 (app 2026-10-07): the app's IPC still has no archive/unload request ("archive-thread" is only a
-    # menu shortcut), so the one step stays the app's own Archive chat.
-    return (f'Archive it there with computer-use (com.openai.codex, full-screen control): '
-            f'`open -g codex://threads/{thread}`, activate the app, click the chat body and press Cmd+Shift+A '
-            f'(Archive chat); then run codex-archive again to confirm and open the session the window showed '
-            f'before the same way (the link switches the window)')

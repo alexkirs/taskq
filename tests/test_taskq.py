@@ -1255,23 +1255,6 @@ class Cycle(unittest.TestCase):
         self.assertEqual(archived, ['closed', 'held'])
         self.assertIn('Retired held: #9 is closed.', log.getvalue())
 
-    def test_codex_archive_of_a_thread_the_app_holds_asks_the_thread_to_archive_itself_in_the_app(self):
-        """#165: the shared server refuses (the app holds the writer lock); a read-only turn through the app window
-        asks the thread to call its codex_app tool set_thread_archived; done once the server reads it archived."""
-        self.codex.status, self.codex.writer, self.ipc.owner = 'notLoaded', 'app', 'window'
-        reads = iter([False, True])
-        with patch.object(codex, 'codex_is_archived', lambda thread: next(reads)), patch.object(codex.time, 'sleep', lambda s: None):
-            self.assertIn('archived t1 (by the Codex app)', self.do(CLAUDE, 'codex-archive', 't1'))
-        method, params, version, target = self.ipc.calls[-1]
-        self.assertEqual((method, version, target), ('thread-follower-start-turn', 2, 'window'))
-        request = params['turnStart']['request']
-        self.assertEqual(request['sandboxPolicy'], {'type': 'readOnly'})
-        self.assertIn('set_thread_archived with threadId t1 and archived true', request['input'][0]['text'])
-        # No app window owns it: the computer-use recipe, no turn sent.
-        self.ipc.owner, self.ipc.calls = None, []
-        self.assertIn('no app window owns it', self.refused(CLAUDE, 'codex-archive', 't1'))
-        self.assertEqual([call[0] for call in self.ipc.calls], ['thread-owner-discovery'])
-
     def test_outsider_comments_do_not_keep_a_dead_workers_task(self):
         """#39: stall age comes from collaborators' notes and label events, not `updated_at` that anyone moves."""
         iid = self.add('--type', 'research', '--runtime', 'any')
@@ -1305,7 +1288,7 @@ class Cycle(unittest.TestCase):
     def test_codex_archive_refuses_a_working_thread(self):
         class Server:
             calls = []
-            status, path, held, app_running = 'active', '/s/rollout.jsonl', False, False
+            status, path, held = 'active', '/s/rollout.jsonl', False
 
             def call(self, method, params):
                 self.calls.append(method)
@@ -1315,16 +1298,11 @@ class Cycle(unittest.TestCase):
                     return {'data': [{'id': 'u1', 'status': 'interrupted'}]}
                 return {'thread': {'status': {'type': Server.status}, 'path': Server.path}}
         announced = []
-        with patch.object(codex, 'Codex', Server), patch.object(codex, 'codex_announce', lambda *a: announced.append(a)), \
-                patch.object(codex, 'codex_app_running', lambda metadata, turn: Server.app_running):
+        with patch.object(codex, 'Codex', Server), patch.object(codex, 'codex_announce', lambda *a: announced.append(a)):
             self.assertIn('is working; not archived', self.refused(CLAUDE, 'codex-archive', 't1'))
-            Server.status, Server.app_running = 'notLoaded', True
-            self.assertIn('is working; not archived', self.refused(CLAUDE, 'codex-archive', 't1'))
-            self.assertNotIn('thread/archive', Server.calls)
-            Server.app_running, Server.held = False, True
+            Server.status, Server.held = 'notLoaded', True
             refusal = self.refused(CLAUDE, 'codex-archive', 't1')
-            self.assertIn('Cmd+Shift+A', refusal)
-            self.assertIn('codex://threads/t1', refusal)
+            self.assertIn('held by the Codex app: archive it there', refusal)
             Server.held = False
             self.assertIn('archived t1', self.do(CLAUDE, 'codex-archive', 't1'))
             self.assertEqual(Server.calls[-1], 'thread/archive')
@@ -1344,7 +1322,7 @@ class Cycle(unittest.TestCase):
                     return {'data': [{'id': 'u1', 'status': 'inProgress' if Server.status == 'active' else 'interrupted'}]}
                 return {'thread': {'status': {'type': Server.status}, 'path': '/s/rollout.jsonl'}}
         with patch.object(q, 'Codex', Server), patch.object(codex, 'Codex', Server), patch.object(codex, 'codex_announce', lambda *a: None), \
-                patch.object(codex, 'codex_app_running', lambda metadata, turn: False), patch.object(q.time, 'sleep', lambda s: None):
+                patch.object(q.time, 'sleep', lambda s: None):
             self.assertEqual(selftest.selftest_retire('codex', 't1'), 'archived t1')
             self.assertIn(('turn/interrupt', {'threadId': 't1', 'turnId': 'u1'}), Server.calls)
             Server.status = 'active'
@@ -2187,33 +2165,6 @@ class Selftest(unittest.TestCase):
             self.addCleanup(q.configure, Path(__file__).resolve().parent / 'taskq.toml')
             self.assertIn('(https://fork.github.io/taskq/open.html#codex://', tick.session_link(claim))
 
-    def test_a_configured_runtime_is_one_table(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(q.RUNTIMES), patch.dict(q.EXECUTORS):
-            config = Path(tmp) / 'taskq.toml'
-            config.write_text(Path(q.__file__).resolve().parents[1].joinpath('tests/taskq.toml').read_text() +
-                              '\n[runtimes.grok]\nenv = "GROK_SESSION_ID"\nspawn = "run-grok spawn --name {name}"\n'
-                              'send = "run-grok send {session} {text}"\n')
-            q.configure(config)
-            self.addCleanup(q.configure, Path(__file__).resolve().parent / 'taskq.toml')
-            self.assertEqual(q.RUNTIMES['grok'], 'GROK_SESSION_ID')
-            self.assertEqual(q.limits('grok=4')['grok'], 4)
-            self.assertEqual(q.selftest_command(q.EXECUTORS['grok']['send'], session='s 1', text='a; rm -rf /'),
-                             ['run-grok', 'send', 's 1', 'a; rm -rf /'])
-            iid = self.add('--type', 'research', '--runtime', 'grok')
-            # the app started from a Claude session inherits its variable: its own wins, never a silent claude
-            self.assertIn(f'take {iid}', self.do({**CLAUDE, 'GROK_SESSION_ID': 'g1'}, 'worker'))
-            with patch.dict(os.environ, {**CLAUDE, **CODEX, 'CLAUDE_CODE_SESSION_ID': 'c'}), self.assertRaises(SystemExit) as caught:
-                q.session()
-            self.assertIn('CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID', str(caught.exception))
-            # spawn and send of the coordinator run the table's commands, never a Claude session
-            q.EXECUTORS['grok'] = {**q.EXECUTORS['grok'], 'spawn': 'echo id-{name}', 'send': 'echo sent {session} {text}'}
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                q.spawn(argparse.Namespace(runtime='grok', name='T1 x', text=None))
-                q.send(argparse.Namespace(runtime='grok', session='g1', text='go'))
-            self.assertEqual(out.getvalue().split('\n')[:2], ['id-T1 x (mac-1)', 'sent g1 go'])
-
-
     def test_view_prints_state_claim_notes_and_result_without_writing(self):
         iid = self.add('--type', 'research')
         self.do(CLAUDE, 'take', iid)
@@ -2373,39 +2324,6 @@ class Doctor(unittest.TestCase):
         gitlab.boards[0]['lists'].pop()
         self.assertIn('columns are', self.doctor()[1])
 
-    def test_a_runtime_doctor_command_is_a_gap_while_it_fails(self):
-        gitlab = Gitlab()
-        self.enterContext(patch.object(q, 'api', gitlab))
-        with contextlib.redirect_stdout(io.StringIO()):
-            q.main(['init'])
-        red = {'env': 'BOT_ID', 'doctor': "sh -c 'echo \"- app not running / open it\"; exit 1'", 'setup': 'bot setup'}
-        self.enterContext(patch.dict(q.EXECUTORS, {'bot': red}))
-        code, out = self.doctor()
-        self.assertEqual(code, 1)
-        self.assertIn("runtime bot: `sh -c 'echo \"- app not running / open it\"; exit 1'` exit 1\n    - app not running / open it\n"
-                      "    fix: bot setup  (prints the steps)", out)
-        q.EXECUTORS['bot'] = {**red, 'doctor': "sh -c 'echo fine'"}
-        self.assertEqual(self.doctor()[0], 0)
-
-    def test_a_runtime_with_limit_0_is_skipped(self):
-        """#147: a runtime this machine never starts (limit 0) is not a gap: no check, one skipped line."""
-        self.enterContext(patch.object(q, 'api', Gitlab()))
-        self.enterContext(patch.dict(q.EXECUTORS, {'bot': {'env': 'BOT_ID', 'doctor': 'false', 'setup': 'bot setup'}}))
-        self.enterContext(patch.dict(q.RUNTIMES, {'bot': 'BOT_ID'}))
-        with contextlib.redirect_stdout(io.StringIO()):
-            q.main(['init'])
-        self.enterContext(patch.object(q, 'CODEX_SOCKET', q.ROOT / 'no-socket'))
-        q.LOCAL.write_text('[profile]\nmine = false\n[profile.limits]\nbot = 0\ncodex = 0\n')
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            q.main(['doctor', '--codex'])
-        self.assertEqual(out.getvalue().splitlines()[:2], ['runtime codex: skipped, limit 0', 'runtime bot: skipped, limit 0'])
-        self.assertNotIn('Codex app server socket', out.getvalue())
-        q.LOCAL.write_text('[profile]\nmine = false\n[profile.limits]\nbot = 1\n')
-        code, out = self.doctor()
-        self.assertEqual(code, 1)
-        self.assertIn('runtime bot: `false` exit 1', out)
-        self.assertNotIn('skipped', out)
-
     def test_codex_only_profile_names_no_claude_step_and_the_headless_server(self):
         """#160: claude=0 skips Claude login, trust and permissions; a missing socket names the CLI's daemon."""
         self.enterContext(patch.object(q, 'api', Gitlab()))
@@ -2560,21 +2478,6 @@ class Setup(unittest.TestCase):
         self.assertNotIn(str(codex.worktree_gitdir(self.tmp / 'trees/taskq-2')), roots)
         self.assertIsNone(codex.worktree_gitdir(self.tmp))  # a .git directory is not a pointer
 
-    def test_a_runtime_setup_command_is_the_persons_step(self):
-        self.enterContext(patch.object(q, 'api', Gitlab()))
-        self.enterContext(patch.dict(q.EXECUTORS, {'bot': {'env': 'BOT_ID', 'setup': 'python3 bot.py setup'}}))
-        self.origin = 'git@gitlab.example.com:group/project.git'
-        self.trust_and_permissions()
-        code, out = self.fix()
-        self.assertEqual(code, 1)
-        self.assertIn(' && python3 bot.py setup\n    runtime bot: its app steps', out)
-        self.assertIn('not ready: 1 step(s) of the person pending: cd ', out)  # never `ready` while a step is open
-        self.enterContext(patch.dict(q.RUNTIMES, {'bot': 'BOT_ID'}))
-        (self.tmp / 'taskq.local.toml').write_text('[profile]\nmine = false\n[profile.limits]\nbot = 0\n')
-        code, out = self.fix()
-        self.assertEqual(code, 0)
-        self.assertNotIn('bot.py setup', out)
-        self.assertIn('runtime bot: skipped, limit 0', out)
 
     def test_gitlab_person_steps_printed_then_fixed_once(self):
         gitlab = Gitlab()

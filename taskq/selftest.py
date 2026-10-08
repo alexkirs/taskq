@@ -223,9 +223,7 @@ class Selftest:
                 # (it failed live); without, the session keeps only its saved --name and --settings, so a wake
                 # after a stop has the full tool set. Live workers are steered by SendMessage, not woken.
                 return core.claude_wake(session, prompt, self.extra)
-            command = core.selftest_command(core.EXECUTORS[runtime]['send'], session=session, text=prompt)
-            with log.open('a') as out:
-                process = subprocess.Popen(command, cwd=core.ROOT, env=core.selftest_env(extra=self.extra), stdout=out, stderr=subprocess.STDOUT)
+            raise SelftestError(f'unsupported runtime {runtime}')
 
         def until(state, action):
             """Poll GitLab until the worker moved the task; a turn that ended without moving it is a failure."""
@@ -238,7 +236,7 @@ class Selftest:
                     except SelftestError as error:
                         wrong = error
                 # A `send` that exits 0 may only have queued the turn (a webhook): then wait the full time.
-                if process and process.poll() is not None and (process.returncode or runtime not in core.EXECUTORS):
+                if process and process.poll() is not None and process.returncode:
                     ended = ended or time.time()
                     if time.time() - ended > 30:
                         raise SelftestError(f'#{iid} is {item.get("state")}, the worker turn ended: '
@@ -258,8 +256,7 @@ class Selftest:
             elif runtime == 'codex':
                 session = core.codex_spawn(name)
             else:
-                session = core.last_line(subprocess.run(core.selftest_command(core.EXECUTORS[runtime]['spawn'], name=name), cwd=core.ROOT, check=True,
-                                                   env=core.selftest_env(extra=self.extra), capture_output=True, text=True, timeout=300).stdout)
+                raise SelftestError(f'unsupported runtime {runtime}')
             self.save(sessions={**json.loads(self.record.read_text()).get('sessions', {}), runtime: session})
             return f'{runtime} session {session}'
 
@@ -410,11 +407,7 @@ def selftest_retire(runtime, session, check=False, wait=600):
         if session in core.claude_agents():
             raise SelftestError(f'background session {session} is still in `claude agents`: `{core.TOOL} retire {session}`')
         return f'{session} retired'
-    archive = core.EXECUTORS[runtime].get('archive')
-    if check or not archive:
-        return 'no archive command configured' if not archive else f'{session}: archived by the run'
-    subprocess.run(core.selftest_command(archive, session=session), cwd=core.ROOT, check=True, capture_output=True, timeout=120)
-    return f'{session} archived'
+    raise SelftestError(f'unsupported runtime {runtime}')
 
 
 def selftest(args):

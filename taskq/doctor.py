@@ -192,7 +192,6 @@ def doctor(args, pending=()):
                 gap(what, fix)
         except SystemExit as error:
             gap(f'{name} could not be read: {str(error).removeprefix("taskq: ")}', 'fix the cause above, then `taskq doctor` again')
-    gaps += runtime_gaps()
     report_gaps(gaps, pending)
 
 
@@ -293,25 +292,6 @@ def idle():
     return [name for name, count in limits.items() if not count]
 
 
-def runtime_gaps():
-    """Each [runtimes.<name>] `doctor` command, run from the main checkout: its own `- what / fix` lines as one gap
-    while it exits nonzero. It runs without the session variables, like a worker of that app."""
-    gaps = []
-    for name, item in core.EXECUTORS.items():
-        if not item.get('doctor') or name in idle():
-            continue
-        try:
-            done = subprocess.run(shlex.split(item['doctor']), cwd=core.ROOT, env=core.selftest_env(), capture_output=True, text=True, timeout=120)
-            code, output = done.returncode, done.stdout + done.stderr
-        except (OSError, subprocess.TimeoutExpired) as error:
-            code, output = 'not run', str(error)
-        if code:
-            fix = f'{item["setup"]}  (prints the steps)' if item.get('setup') else 'the lines above'
-            lines = ''.join(f'\n    {line}' for line in output.strip().splitlines())
-            gaps.append(f'- runtime {name}: `{item["doctor"]}` exit {code}{lines}\n    fix: {fix}')
-    return gaps
-
-
 def write_access(github):
     if github:
         push = core.api('GET', 'repository')['permissions']['push']
@@ -342,9 +322,7 @@ def report_gaps(gaps, pending=()):
         print(f'not ready: {len(pending)} step(s) of the person pending: ' + '; '.join(pending))
         sys.exit(1)
     if not gaps:
-        checked = [name for name, item in core.EXECUTORS.items() if item.get('doctor') and name not in idle()]
-        return print(f'ready: {core.PROJECT_PATH} — config, CLI login, write access, labels and board {core.BOARD}'
-                     + (f', runtime {", ".join(checked)}' if checked else ''))
+        return print(f'ready: {core.PROJECT_PATH} — config, CLI login, write access, labels and board {core.BOARD}')
     print(f'not ready: {len(gaps)} gap(s); each line is the command that closes it\n' + '\n'.join(gaps))
     sys.exit(1)
 
@@ -510,9 +488,6 @@ def setup(args):
         print(f'ok: personal profile {core.LOCAL}')
     else:
         person(f'{core.TOOL} profile init', PROFILE_CARD)
-    for name, item in core.EXECUTORS.items():
-        if item.get('setup') and name not in idle():
-            person(f'cd {core.ROOT} && {item["setup"]}', f'runtime {name}: its app steps (sign-in, bot, trigger) are the person\'s')
     print('No workers or timer started.' + (f' Pending for the person: {len(pending)} step(s) above.' if pending else ''))
     doctor(argparse.Namespace(codex=args.codex), pending)
 

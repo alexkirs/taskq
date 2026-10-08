@@ -26,7 +26,6 @@ You stay in control: tasks wait for your input and continue when you reply.
 
 **Mix agents, task by task.** Codex makes the visuals, Claude writes the code, another agent runs the tests - in whatever order your work needs.
 Choose each task's agent with `--runtime` (a `run-*` label); use `--deps` to chain tasks.
-Add any other agent through `[runtimes.<name>]`, for example a Grok bot.
 
 <details>
 <summary>Setup, commands and reference</summary>
@@ -154,7 +153,7 @@ and 2 for failure; other JSON commands exit 0 for a completed report/plan and 2 
 
 Your profile lives in `taskq.local.toml` of the main checkout: personal, never committed
 (`taskq init` adds it to `.gitignore`). Workers make their trees in `.worktrees/taskq-<N>` of the same
-checkout (also gitignored); `taskq doctor` names older `../taskq-<N>` trees with the command that moves them.
+checkout (also gitignored).
 `taskq profile init` writes the profile once:
 
 | Profile | `taskq profile init` arguments |
@@ -208,8 +207,7 @@ machine = "mac"
 
 **Windows.** Keep the checkout, taskq, git and gh/glab in WSL; the Windows Claude Code (`claude.cmd`) runs the
 workers and sees the checkout as `//wsl.localhost/<distro>/…`: `taskq doctor` checks its folder trust and login under
-that path. The desktop app is optional (watch workers through Remote Control); macOS-only steps (app import, external scheduler
-timer) say so and are skipped. Tell workers what is special about a machine in its `taskq.local.toml`; every brief there
+that path. The desktop app is optional (watch workers through Remote Control); macOS-only steps say so and are skipped. Tell workers what is special about a machine in its `taskq.local.toml`; every brief there
 prints it, with the checkout root (task text uses repository-relative paths, `add` warns on absolute ones):
 
 ```toml
@@ -220,10 +218,6 @@ notes = "Windows claude.cmd; checkout in WSL; run git and tests via wsl.exe bash
 Worker sessions are named `T<N> … (mac)`, their supervisors `S<N> … (mac)`; spawned Claude sessions run with Remote Control, so `tick` links each
 one at `https://claude.ai/code/session_…` (`taskq spawn --no-remote-control` turns it off). `taskq list --links`
 adds each task's URL.
-
-A third worker app (e.g. a Grok bot) is one `[runtimes.<name>]` table in taskq.toml: `env`, `spawn`, `send`,
-optional `archive`, `doctor` and `setup` commands. `taskq doctor` runs its `doctor`, `doctor --fix` prints its
-`setup`; both skip a runtime whose profile limit is 0 on this machine (codex too). Then `taskq selftest --scope full --runtime <name>`. Details: [manager contract](taskq/contracts/taskq-manager.md#checking-the-orchestration-selftest).
 
 `taskq view N` prints a task read only: state, claim, last notes, result.
 
@@ -274,14 +268,10 @@ CI (`.github/workflows/tests.yml`) runs tests on every push to main or a `taskq-
 and every PR. The clone and other machines take the commit once its exact-SHA tests passed,
 within `[update] every` or at once with `taskq update`.
 
-Tests must be completed success from the repository's active `.github/workflows/tests.yml`
-push workflow and its GitHub Actions `tests` check. Missing, unreadable, pending, failed,
-skipped or neutral tests refuse an update. Latest reruns are checked by suite identity;
-unrelated same-name checks cannot satisfy tests. Only positively identified legacy or
-`.github/workflows/pages.yml` Pages checks are excluded; other checks keep their existing gate.
-Site failure/freshness is separate from CLI eligibility; see
-[Pages qualification and migration](docs/pages-gate-qualification.md). A commit that does not start
-(`python3 -m taskq --version`) is rolled back in the clone.
+An update needs every `tests.yml` run of the exact SHA completed with success
+(`gh run list --commit <sha> --workflow tests.yml`); none, running or failed refuses it. Pages
+(`.github/workflows/pages.yml`) deploys `docs/` on every push to `main` and does not gate updates.
+A commit that does not start (`python3 -m taskq --version`) is rolled back in the clone.
 
 `taskq update` follows only CI-green `main`. It leaves a clone with uncommitted changes alone and says so; `tick` prints
 a one-line warning while the clone is dirty or off `main`. If the package cannot be imported at all, the command prints

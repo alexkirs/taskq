@@ -1,31 +1,15 @@
 name: Pages
 on:
   push:
-    branches: [main, 'taskq-*']
-  pull_request:
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: pages-${{ github.ref }}
+  group: pages
   cancel-in-progress: false
 jobs:
-  inputs:
-    runs-on: ubuntu-latest
-    outputs:
-      publish: ${{ steps.inputs.outputs.publish }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - id: inputs
-        env:
-          AFTER: ${{ github.sha }}
-          EVENT: ${{ github.event_name }}
-        run: python3 .github/scripts/pages_inputs.py
   build:
-    needs: inputs
-    if: needs.inputs.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -44,7 +28,6 @@ jobs:
           path: ./_site
   deploy:
     needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       pages: write

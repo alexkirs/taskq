@@ -259,19 +259,21 @@ Rules:
 
 - `pr` mode: a PR that does not merge (conflict, failing checks) goes back to `ready` with the platform's message;
   a head that differs from the result SHA, or several PRs, refuses the close.
-- `pr` mode on GitHub (#308): `main` requires the `tests` check (`.github/workflows/tests.yml`), strict: the
-  branch must be up to date. `close` merges only a head with `tests` green. A PR behind `main` is updated
-  (`gh pr update-branch`), `tests` runs on the new head, and `close` merges at that new head. The new head must be GitHub's merge of the result SHA and `main` (`web-flow`, verified); a push in between sends the task back. A conflict, a failed
+- `pr` mode on GitHub (#359): `main` requires the `tests` check (`.github/workflows/tests.yml`) on the PR head only,
+  not strict: a PR behind `main` merges without an update. `close` merges only a head with `tests` green; GitHub
+  refuses a PR with conflicts. `tests.yml` runs again on `main` after each merge, as the alarm. A conflict, a failed
   `tests`, or no result within 10 min sends the task back to `ready`. Set the rule once (repo admin):
 
   ```sh
-  echo '{"required_status_checks": {"strict": true, "checks": [{"context": "tests", "app_id": 15368}]},
+  echo '{"required_status_checks": {"strict": false, "checks": [{"context": "tests", "app_id": 15368}]},
     "enforce_admins": false, "required_pull_request_reviews": null, "restrictions": null}' |
     gh api -X PUT repos/OWNER/REPO/branches/main/protection --input -
   ```
 
   `app_id` 15368 is GitHub Actions. `enforce_admins: false` keeps the owner's direct pushes; `close` enforces the
   gate itself. Check it: `gh api repos/OWNER/REPO/branches/main/protection --jq .required_status_checks`.
+  Changed: strict check, `close` updates a behind PR (`gh pr update-branch`) and merges the new head → `tests` on the
+  PR head only, no update (#308 → #359): the strict check made merges serial, about 41 s each (#269).
 - `pr` mode and no PR (an answer): `close` checks the SHA is on `origin/main`, as in `direct`.
 - Both modes, on the machine named in the claim: `close` removes a clean `.worktrees/taskq-<N>` (`git worktree remove`)
   and the local branch `taskq-<N>` (`git branch -D`). A worktree with uncommitted changes stays, with its branch, and

@@ -174,19 +174,13 @@ class PullRequests(Base):
         self.run_cli('result', '1', '--sha', 'a' * 40)
         self.calls, self.prs, self.merged = [], [{'number': 7, 'headRefOid': 'a' * 40, 'baseRefName': 'main'}], True
         self.branches = {}  # branch -> its PRs, for tasks other than #1
-        self.made = {'parents': [{'sha': 'a' * 40}, {'sha': 'e' * 40}], 'committer': {'login': 'web-flow'}, 'commit': {'verification': {'verified': True}}}
-        self.behind, self.updated, self.checks = 0, True, {'a' * 40: [[('completed', 'success')]], 'd' * 40: [[('completed', 'success')]]}
+        self.checks = {'a' * 40: [[('completed', 'success')]]}
 
     def cli(self, command, **_):
         self.calls.append(command[1:])
-        if command[1] == 'api':  # the 'tests' gate (#308): compare, the PR head, check runs per SHA
-            path, head = command[4], 'd' * 40 if ['pr', 'update-branch', '7', '-R', 'o/r'] in self.calls and self.updated else 'a' * 40
-            out = {'behind_by': self.behind * path.endswith('...' + 'a' * 40)} if '/compare/' in path else {'head': {'sha': head}} if '/pulls/' in path \
-                else self.made if path.endswith('/commits/' + 'd' * 40) else \
-                {'check_runs': [{'status': status, 'conclusion': conclusion} for status, conclusion in self.poll(path.split('/')[4])]}
+        if command[1] == 'api':  # the 'tests' gate (#308): check runs per SHA
+            out = {'check_runs': [{'status': status, 'conclusion': conclusion} for status, conclusion in self.poll(command[4].split('/')[4])]}
             return subprocess.CompletedProcess(command, 0, json.dumps(out), '')
-        if command[2] == 'update-branch':
-            return subprocess.CompletedProcess(command, int(not self.updated), '', 'merge conflict')
         verb = command[2]
         out = {'list': json.dumps(self.branches.get(command[4], self.prs)), 'view': json.dumps({'state': 'MERGED' if self.merged else 'OPEN', 'mergeCommit': {'oid': 'c' * 40}})}
         return subprocess.CompletedProcess(command, int(verb == 'merge' and not self.merged), out.get(verb, ''), 'Pull request is not mergeable')
@@ -222,18 +216,6 @@ class PullRequests(Base):
         self.assertEqual(self.board.issues[1]['state'], 'closed')
         self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\nmerged {"c" * 40}')
 
-    def test_close_batch_updates_only_the_behind(self):  # #334
-        for n, sha in ((2, 'b'), (3, 'f')):
-            self.add()
-            self.run_cli('take', str(n))
-            self.run_cli('result', str(n), '--sha', sha * 40)
-            self.branches[f'taskq-{n}'] = [{'number': n + 6, 'headRefOid': sha * 40, 'baseRefName': 'main'}]
-            self.checks[sha * 40] = [[('completed', 'success')]]
-        self.behind = 1  # only #1 (PR 7, head a...) is behind main
-        self.assertEqual(self.close('2', '3', '1'), '#2 closed\n#3 closed\n#1 closed\n')
-        self.assertEqual([call for call in self.calls if call[1] == 'update-branch'], [['pr', 'update-branch', '7', '-R', 'o/r']])
-        self.assertEqual([call[6] for call in self.merges()], ['b' * 40, 'f' * 40, 'd' * 40])
-
     def test_close_batch_goes_on_after_a_failure(self):
         self.add()
         self.run_cli('take', '2')
@@ -264,29 +246,16 @@ class PullRequests(Base):
             self.close()
         self.assertEqual((self.task(1)['state'], self.merges()), ('ready', []))
 
-    def test_out_of_date_is_updated_then_merged_at_new_head(self):
-        self.behind = 2
-        self.close()
-        self.assertEqual(self.merges()[0][-3:], ['d' * 40, '-R', 'o/r'])
-        self.assertIn(['api', '-X', 'GET', f'repos/o/r/commits/{"d" * 40}/check-runs?check_name=tests'], self.calls)
-
-    def test_out_of_date_new_head_fails_tests(self):
-        self.behind, self.checks['d' * 40] = 1, [[('completed', 'failure')]]
-        with self.assertRaisesRegex(SystemExit, 'check tests failed'):
-            self.close()
-        self.assertEqual((self.task(1)['state'], self.merges()), ('ready', []))
-
-    def test_out_of_date_new_head_must_be_githubs_update(self):
-        self.behind, self.made['parents'][0]['sha'] = 1, 'f' * 40  # a push between the update and the read
-        with self.assertRaisesRegex(SystemExit, f'new head {"d" * 40} is not the update of {"a" * 40} with main'):
-            self.close()
-        self.assertEqual((self.task(1)['state'], self.merges()), ('ready', []))
-
-    def test_out_of_date_conflict_requeues(self):
-        self.behind, self.updated = 1, False
-        with self.assertRaisesRegex(SystemExit, 'PR 7 did not update: merge conflict'):
-            self.close()
-        self.assertEqual((self.task(1)['state'], self.merges()), ('ready', []))
+    def test_behind_merges_without_update(self):  # #359: the fake has no update-branch; any call to it would fail the merge
+        for n, sha in ((2, 'b'), (3, 'f')):
+            self.add()
+            self.run_cli('take', str(n))
+            self.run_cli('result', str(n), '--sha', sha * 40)
+            self.branches[f'taskq-{n}'] = [{'number': n + 6, 'headRefOid': sha * 40, 'baseRefName': 'main'}]
+            self.checks[sha * 40] = [[('completed', 'success')]]
+        self.assertEqual(self.close('2', '3', '1'), '#2 closed\n#3 closed\n#1 closed\n')
+        self.assertEqual([call[6] for call in self.merges()], ['b' * 40, 'f' * 40, 'a' * 40])
+        self.assertFalse([call for call in self.calls if 'update-branch' in call or 'compare' in ' '.join(call)])
 
     def test_refusal_requeues(self):
         self.merged = False

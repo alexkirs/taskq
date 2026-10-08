@@ -65,6 +65,22 @@ class Roles(unittest.TestCase):
         self.assertIn("only the owner's shell", self.refused(SUPERVISOR, 'edit', iid, '--supervisor', 'claude:supervisor-1'))
         self.do(SUCCESSOR, 'edit', iid, '--supervisor', 'claude:supervisor-1')
 
+    def test_stale_handoff_during_link_is_refused(self):
+        """P1: the owner replaces the supervisor while its handoff is inside core.link; the handoff must not win."""
+        iid, real, raced = self.supervised(), q.link, []
+
+        def link(target, deps):
+            if not raced:
+                raced.append(1)
+                self.do(OWNER, 'edit', iid, '--supervisor', 'claude:supervisor-2')  # the owner's replacement lands first
+            return real(target, deps)
+        with patch.object(q, 'link', link):
+            self.assertIn('changed while editing', self.refused(SUPERVISOR, 'edit', iid, '--deps', '--supervisor', 'claude:supervisor-3'))
+        self.assertEqual(self.block(iid)['supervisor']['session'], 'supervisor-2')
+        self.assertNotIn('supervisor-3', '\n'.join(self.gitlab.said(iid)))
+        self.do(SUCCESSOR, 'edit', iid, '--deps', '--supervisor', 'claude:supervisor-3')  # the real supervisor still hands off
+        self.assertEqual(self.block(iid)['supervisor']['session'], 'supervisor-3')
+
     def test_supervisor_is_never_the_claim(self):
         iid = self.started()
         self.assertIn('cannot be the claim session', self.refused(OWNER, 'edit', iid, '--supervisor', 'claude:worker-1'))

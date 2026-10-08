@@ -112,9 +112,16 @@ def edit(args):
         changes['deps'], notes = args.deps, notes + [f'deps {current["deps"]} → {args.deps}']
     if args.scope is not None:
         changes['scope'], notes = args.scope, notes + [f'scope {current["scope"]} → {args.scope}']
-    if args.supervisor is not None and (found := supervisor_change(current, args.supervisor)) != current.get('supervisor'):
-        changes['supervisor'] = found
-        notes.append(f'supervisor {identity(current.get("supervisor"))} → {identity(found)}')
+    if args.supervisor is not None:
+        # #240 P1: the handoff is judged on a read taken after the link/milestone calls above. An owner who assigned
+        # or cleared the supervisor meanwhile is seen: a session's stale handoff is refused, never written over it.
+        fresh = core.task(args.iid)
+        if core.session() is not None and (fresh.get('supervisor'), fresh['claim']) != (current.get('supervisor'), current['claim']):
+            core.fail(f'#{args.iid}: its supervisor or claim changed while editing; read it again before a handoff')
+        current = fresh
+        if (found := supervisor_change(current, args.supervisor)) != current.get('supervisor'):
+            changes['supervisor'] = found
+            notes.append(f'supervisor {identity(current.get("supervisor"))} → {identity(found)}')
     if changes:
         core.save(current, note_action='edit', note_text='; '.join(notes), **changes)
     print(f'#{args.iid} edited')

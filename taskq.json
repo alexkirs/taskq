@@ -4,7 +4,7 @@
  "publish": "pr",
  "limits": {
   "claude": 4,
-  "codex": 4
+  "codex": 0
  },
  "hosts": {
   "macbook-m2.local": "mac",

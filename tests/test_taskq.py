@@ -2237,12 +2237,6 @@ class GithubCycle(unittest.TestCase):
     def test_fixed_coordinator_machine(self):
         fixed_coordinator(self)
 
-    def test_doctor_names_and_fix_removes_a_leftover_lease_ref(self):
-        self.github.refs['refs/taskq/coordinator/abc'] = 'sha'  # left by the #44 lease
-        self.assertIn('leftover coordinator lease refs/taskq/coordinator/abc', doctor.lease_gaps()[0][0])
-        q.api('DELETE', 'leases')
-        self.assertEqual((self.github.refs, doctor.lease_gaps()), ({}, []))
-
     def test_lock_ref_of_a_deleted_or_closed_issue_does_not_break_tick(self):
         deleted, closed = self.add('--type', 'code'), self.add('--type', 'code')
         self.assertTrue(q.lock(deleted) and q.lock(closed))

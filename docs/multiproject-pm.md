@@ -83,7 +83,7 @@ The manifest stays the view: which projects to visit in this invocation, and the
 version = 1
 machine = "macbook-m2"   # this host's taskq machine name (TASKQ_HOST, [hosts] or the hostname)
 os_user = 501            # the numeric OS user of the guard's domain (`id -u`)
-caps = { claude = 8, codex = 4 }  # optional; at most 8 and 4
+caps = { claude = 2, codex = 6 }  # optional; an omitted runtime keeps its default, claude 8 and codex 4
 
 [[project]]              # the complete approved catalog, one binding per project
 provider = "github"
@@ -94,10 +94,12 @@ board = "repo"
 checkout = "/abs/path/to/main/checkout"
 principal = 1640869      # the tracker user id this project's pass runs as (`gh api user --jq .id`)
 act = true               # false: catalog-only, never admitted; its ownership still counts
-limits = { claude = 1, codex = 0 }  # the project limit; a view's limits can only lower it
+limits = { claude = 1, codex = 0 }  # the project limit, 0 when omitted; a view's limits can only lower it
 effects = ["queue", "cleanup", "idle_stop"]
 timeout = 600            # optional; seconds for this project's actor, 1..600
 ```
+
+Caps and limits are explicit whole counts 0..64 of the runtimes `claude` and `codex`; a boolean, a non-integer, a negative count, another runtime or a count above 64 refuses the policy (caps) or the binding (limits). 64 is only a validation bound, never a capacity grant: the places an acting pass may use are the enrolled caps, minus fresh occupancy (§ Budget). Without `caps`, an anchor keeps the 8/4 default it always had; no environment variable or anchor migration changes it. The owner's target caps (for example 2/6) take effect only through an explicit enrollment.
 
 Identity fields are checked as in the manifest. A view entry is admitted only when a valid binding has the same provider, host, repository id, repository, board and checkout, and `act = true`. Any other key is refused: readiness and effects evidence never come from this file.
 
@@ -110,6 +112,7 @@ The policy file alone is not an approved catalog. `--accept-execution-policy POL
 1. Load the policy; every binding must be valid.
 2. Check every binding in its own read-only subprocess, with the checkout as cwd: identity as in observation, `machine` and `principal`; for `act = true` bindings also the effects and `taskq doctor`.
 3. For a replacement, read back every binding of the previous anchor (step 3 of § Per project). Each must show no known grant and no uncertainty: no same-host claim, reservation or ownerless lock. The Claude and Codex inventories of every runtime the old catalog allowed must be readable and show no live session in an old checkout. A missing old checkout, unknown, unavailable or foreign ownership, or a failed read keeps the old anchor unchanged. Nothing is released, stolen or discovered; the candidate file or an empty inventory never settles an omitted grant.
+   A caps-only replacement changes the aggregate caps and nothing else: version, machine, OS user and every binding's identity, checkout, principal, `act`, limits, effects and timeout are exactly the anchored ones. Its bindings stay, so their grants are not settled: the fresh readback of every anchored binding must be complete and known (no failure, off-shape read or uncertainty), and the inventory of every runtime whose cap changes must be readable. Known retained claims (review, ask, doing) and reservations stay as they are and keep counting in occupancy; nothing is released. Unknown ownership or an unreadable inventory keeps the old anchor. Any other change, together with a caps change or not, needs the full settlement above.
 4. Write `multiproject-execution.json` beside the guard: version, generation (1, then +1 per replacement), the SHA-256 of the canonical catalog, the canonical catalog itself and who accepted it. The write is a draft in the same folder, fsync, rename, fsync of the folder. An identical catalog leaves it `unchanged`.
 
 The canonical catalog is every effective field: machine, OS user, caps and each binding's identity (host lower-cased, checkout resolved, timeout defaulted), principal, `act`, limits (0 filled in) and effects. Only the order of tables and of effects is ignored.
@@ -140,6 +143,8 @@ For each runtime `r`:
 - F = max(0, cap[r] - occupancy).
 - L is exactly what native `core.room` subtracts for this project now: its same-host doing claims and reservations.
 - limit[r] = min(project limit[r], L + F). A runtime without a cap (a `[runtimes]` app) gets 0.
+
+Occupancy above a cap, after a caps-only lowering for example, gives F = 0: the project keeps its L, no new worker of that runtime is admitted, and nothing is stopped, restarted or released. A raised cap grants only cap - fresh occupancy, never more.
 
 An unreadable inventory, or an unidentified live row (no session id and no pid), makes F = 0 for its runtime; for a runtime the project may start or holds, step 4 refuses before that matters. The budget is recomputed for every project, after the previous project's actor ended.
 

@@ -246,7 +246,8 @@ def aggregate(manifest, reader=READER):
 
 # --- #186 stage 3: the guarded acting pass (docs/multiproject-pm.md § Acting) --------------------------
 
-CAPS = {'claude': 8, 'codex': 4}  # aggregate places of one host's verified OS-user domain
+CAPS = {'claude': 8, 'codex': 4}  # aggregate places of one host's verified OS-user domain when the policy names none
+MAX_COUNT = 64  # validation bound of an explicit cap or limit; never a capacity grant
 EFFECTS = ('queue', 'cleanup', 'idle_stop')  # what native `tick --act` does that a catalog binding may select
 IDENTITY = ('provider', 'host', 'repository_id', 'repository', 'board', 'checkout', 'timeout')
 BINDING = ('principal', 'act', 'limits', 'effects')
@@ -258,9 +259,9 @@ CHECK = [sys.executable, '-P', '-m', 'taskq.multiproject', '--enroll-check']
 ANCHOR_VERSION = 1
 
 
-def counts(value, caps):
-    return isinstance(value, dict) and set(value) <= set(caps) and all(
-        isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= caps[runtime] for runtime, count in value.items())
+def counts(value):
+    return isinstance(value, dict) and set(value) <= set(CAPS) and all(
+        isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= MAX_COUNT for count in value.values())
 
 
 def binding_errors(entry):
@@ -273,8 +274,8 @@ def binding_errors(entry):
         errors.append("principal: write the tracker user id this project's pass acts as")
     if not isinstance(entry.get('act'), bool):
         errors.append('act: write true (admitted) or false (catalog-only: its ownership still counts)')
-    if not counts(entry.get('limits'), CAPS):
-        errors.append('limits: write { claude = 0..8, codex = 0..4 }')
+    if not counts(entry.get('limits')):
+        errors.append(f'limits: write {{ claude = 0..{MAX_COUNT}, codex = 0..{MAX_COUNT} }}')
     if not isinstance(entry.get('effects'), list) or any(effect not in EFFECTS for effect in entry['effects']):
         errors.append(f'effects: write a list of {", ".join(EFFECTS)}')
     return errors
@@ -296,8 +297,8 @@ def parse_policy(policy, path):
         problems.append("machine: write this host's taskq machine name")
     if not isinstance(policy.get('os_user'), int) or isinstance(policy.get('os_user'), bool):
         problems.append("os_user: write the numeric OS user id of the guard's domain")
-    if not counts(policy.setdefault('caps', {}), CAPS):
-        problems.append('caps: at most claude = 8, codex = 4')
+    if not counts(policy.setdefault('caps', {})):
+        problems.append(f'caps: write {{ claude = 0..{MAX_COUNT}, codex = 0..{MAX_COUNT} }}; omitted ones are {CAPS}')
     entries = policy.get('project')
     if not isinstance(entries, list) or not entries or len(entries) > MAX_PROJECTS:
         problems.append(f'write 1..{MAX_PROJECTS} [[project]] bindings')
@@ -670,10 +671,18 @@ def binding_check(spec):
     return {'repository': repository_url(binding), 'errors': verify(binding) or workflow(binding, spec['machine'])}
 
 
-def settled(anchor):
+def caps_only(anchor, snapshot):
+    """Whether `snapshot` differs from the anchored catalog in its aggregate caps alone."""
+    old = anchor['catalog']
+    return old['project'] == snapshot['project'] and {**old['policy'], 'caps': None} == {**snapshot['policy'], 'caps': None}
+
+
+def settled(anchor, caps=None):
     """Blockers against replacing `anchor`: a fresh read-only readback of every anchored binding must show no
     same-host claim, reservation or ownerless lock, and every required runtime inventory must be readable and show
-    no live session in an anchored checkout. Unknown never settles; nothing is released."""
+    no live session in an anchored checkout. Unknown never settles; nothing is released. `caps`: a caps-only
+    replacement, whose bindings stay: their known grants remain and keep counting, so the readback must only be
+    complete and known, and the inventory of each runtime whose cap changes readable."""
     old = anchor['catalog']['project']
     blockers = []
     for binding in old:
@@ -681,8 +690,12 @@ def settled(anchor):
         where = repository_url(binding)
         if read['status'] != 'ok':
             blockers.append(f'{where}: ownership unknown: ' + '; '.join(read.get('errors', [])))
-        elif read['held']:
+        elif read['held'] and caps is None:
             blockers.append(f'{where}: still owns ' + ', '.join(identity for _, identity in read['held']))
+    if caps is not None:
+        changed = [runtime for runtime in CAPS if caps[runtime] != anchor['catalog']['policy']['caps'][runtime]]
+        read = {'claude': lambda: claude_inventory(claude_rows()), 'codex': lambda: codex_inventory(codex_threads())}
+        return blockers + [f'{runtime} inventory unknown: its cap change cannot be checked' for runtime in changed if read[runtime]() is None]
     checkouts = [Path(binding['checkout']) for binding in old]
     inside = lambda cwd: any(Path(cwd or '/').resolve().is_relative_to(checkout) for checkout in checkouts)  # noqa: E731
     rows, threads = claude_rows(), codex_threads()
@@ -699,7 +712,8 @@ def settled(anchor):
 
 def accept(policy_path, check=None):
     """`--accept-execution-policy`: the owner's explicit enrollment or replacement of the catalog anchor, all under
-    the host guard; no native tick or action. A replacement needs every previous binding settled first."""
+    the host guard; no native tick or action. A replacement needs every previous binding settled first; one that
+    changes the aggregate caps alone needs their ownership known, never released."""
     result = {'status': 'refused', 'errors': [], 'anchor': str(anchor_path()), 'generation': None, 'sha256': None, 'bindings': []}
     try:
         policy, catalog = load_policy(policy_path)
@@ -721,7 +735,7 @@ def accept(policy_path, check=None):
             result['bindings'].append(found)
         blockers = [f'{found["repository"]}: {error}' for found in result['bindings'] for error in found['errors']]
         if anchor:
-            blockers += settled(anchor)
+            blockers += settled(anchor, snapshot['policy']['caps'] if caps_only(anchor, snapshot) else None)
         if blockers:
             return {**result, 'errors': blockers}
         generation = anchor['generation'] + 1 if anchor else 1

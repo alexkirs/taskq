@@ -655,7 +655,7 @@ class Acting(unittest.TestCase):
             anchor['sha256'] = multiproject.digest(anchor['catalog'])
             return json.dumps(anchor).encode()
         for broken in (resigned(lambda anchor: anchor['catalog']['policy'].update(extra=1)),
-                       resigned(lambda anchor: anchor['catalog']['project'][0]['limits'].update(claude=9)),
+                       resigned(lambda anchor: anchor['catalog']['project'][0]['limits'].update(claude=65)),
                        resigned(lambda anchor: anchor['catalog']['project'][0].pop('effects')),
                        resigned(lambda anchor: anchor['catalog']['project'][0].update(host='GitLab.Example')),  # not canonical
                        resigned(lambda anchor: anchor.update(generation=True)), resigned(lambda anchor: anchor.update(receipt='applied'))):
@@ -687,7 +687,7 @@ class Acting(unittest.TestCase):
 
     def test_actor_identity_and_view_mismatch_refuse_before_any_mutation(self):
         policy = self.catalog(self.alpha, {**self.beta, 'act': False})
-        for top in ({'evidence': 'doctor ok'}, {'caps': {'claude': 9}}):
+        for top in ({'evidence': 'doctor ok'}, {'caps': {'claude': 65}}):
             with self.assertRaises(SystemExit):
                 multiproject.load_policy(self.catalog(self.alpha, enroll=False, file='bad.toml', **top))
         result = self.act([{**self.alpha, 'board': 'other-board'}, self.beta], policy)
@@ -821,6 +821,88 @@ class Acting(unittest.TestCase):
         self.assertEqual(alone['budget'], together['budget'])
         self.assertEqual(self.limits(alone)['claude'], (6, True, 2, 0, 1))
         self.assertEqual(alone['native']['actions'][0]['action'], together['native']['actions'][0]['action'])
+
+    def claim(self, name, iid, state, session):
+        """A retained same-host claim of `session` on task `iid`, its worker in no inventory."""
+        store = self.store(name)
+        store.issues[iid]['labels'] = [f'q-{state}', 'code', 'run-claude']
+        store.issues[iid]['description'] = core.render('goal', {**self.block(name, iid),
+                                                                'claim': {'runtime': 'claude', 'session': session, 'node': self.node(name)}})
+        (self.dir / f'acme_{name}.pickle').write_bytes(pickle.dumps(store))
+
+    def test_caps_and_limits_are_explicit_counts_up_to_the_validation_bound_and_default_to_8_and_4(self):
+        for caps in ({'claude': 2, 'codex': 6}, {'claude': 0, 'codex': 0}, {'claude': 64, 'codex': 64}, {'codex': 6}):
+            policy, _ = multiproject.load_policy(self.catalog({**self.alpha, 'limits': {'claude': 2, 'codex': 6}}, enroll=False, caps=caps))
+            self.assertEqual(policy['caps'], {**multiproject.CAPS, **caps})
+        for bad in ({'claude': -1}, {'claude': True}, {'codex': 1.5}, {'codex': '6'}, {'gemini': 1}, {'claude': 65}):
+            with self.assertRaisesRegex(SystemExit, 'caps: write', msg=bad):
+                multiproject.load_policy(self.catalog(self.alpha, enroll=False, file='bad.toml', caps=bad))
+            _, [(_, errors)] = multiproject.load_policy(self.catalog({**self.alpha, 'limits': bad}, enroll=False, file='bad.toml'))
+            self.assertIn('limits: write { claude = 0..64, codex = 0..64 }', errors, bad)
+        self.catalog(self.alpha)  # no caps: the anchor keeps the 8/4 default it always had
+        self.assertEqual(json.loads(self.anchor.read_text())['catalog']['policy']['caps'], {'claude': 8, 'codex': 4})
+
+    def test_caps_only_replacement_keeps_retained_claims_and_admits_no_room_above_a_lower_cap(self):
+        self.catalog(self.alpha, self.beta)
+        self.claim('alpha', 1, 'review', 'owned-review')
+        self.claim('alpha', 2, 'ask', 'owned-ask')
+        target = self.catalog(self.alpha, self.beta, enroll=False, file='target.toml', caps={'claude': 2, 'codex': 6})
+        self.assertIn('codex inventory unknown: its cap change cannot be checked', multiproject.accept(target, CHECK)['errors'])
+        with patch.object(multiproject, 'codex_threads', lambda: []):
+            found = multiproject.accept(target, CHECK)
+            self.assertEqual((found['status'], found['generation'], found['errors']), ('replaced', 2, []))
+            anchor = json.loads(self.anchor.read_text())
+            self.assertEqual((anchor['generation'], anchor['sha256'], anchor['catalog']['policy']['caps']),
+                             (2, multiproject.digest(anchor['catalog']), {'claude': 2, 'codex': 6}))
+            self.assertEqual(multiproject.accept(target, CHECK)['status'], 'unchanged')
+        self.assertEqual([self.block('alpha', iid)['claim']['session'] for iid in (1, 2)], ['owned-review', 'owned-ask'])
+        # Six live rows and two retained claims: occupancy 8 above the cap 2. Nobody new, nobody stopped or released.
+        result = self.act([self.beta, self.alpha], target)
+        for project in result['projects']:
+            self.assertEqual(self.limits(project)['claude'], (8, True, 0, 0, 0), project)
+        self.assertEqual([row[3] for row in self.calls('native')], [{'claude': 0, 'codex': 0}] * 2)
+        self.assertEqual((self.calls('spawn'), self.calls('stop')), ([], []))
+        self.assertEqual([self.block('alpha', iid)['claim']['session'] for iid in (1, 2)], ['owned-review', 'owned-ask'])
+        # An increase grants only what the fresh aggregate occupancy leaves: 10 - 8 = 2.
+        wide = self.catalog(self.alpha, self.beta, enroll=False, file='wide.toml', caps={'claude': 10, 'codex': 6})
+        self.assertEqual(multiproject.accept(wide, CHECK)['status'], 'replaced')  # codex unchanged: its inventory not needed
+        found = self.act([self.beta], wide)['projects'][0]
+        self.assertEqual((found['status'], self.limits(found)['claude']), ('ok', (8, True, 2, 0, 2)))
+
+    def test_caps_only_replacement_refuses_unknown_ownership_or_a_held_guard_and_keeps_the_anchor(self):
+        self.catalog(self.alpha, self.beta)
+        before = self.anchor.read_bytes()
+        lower = self.catalog(self.alpha, self.beta, enroll=False, file='lower.toml', caps={'claude': 2})
+        (self.dir / 'beta').rename(self.dir / 'beta-moved')
+        self.assertIn('https://gitlab.example/acme/beta: ownership unknown', ' '.join(multiproject.accept(lower, CHECK)['errors']))
+        (self.dir / 'beta-moved').rename(self.dir / 'beta')
+        self.edit('alpha', iid=2, lock=True)
+        self.assertIn('tracker lock without a claim or reservation', ' '.join(multiproject.accept(lower, CHECK)['errors']))
+        self.edit('alpha', iid=1, reservation={'attempt': 'a1', 'runtime': 'claude', 'principal': 1, 'node': 'xyz'})
+        self.assertIn('without a proven machine', ' '.join(multiproject.accept(lower, CHECK)['errors']))
+        self.assertEqual(self.anchor.read_bytes(), before)
+        fd, _ = multiproject.guard({'os_user': os.getuid()})  # an actor holding the host guard
+        try:
+            self.assertIn('host guard held', multiproject.accept(lower, CHECK)['errors'][0])
+        finally:
+            os.close(fd)
+        self.agents('not json')
+        self.assertIn('claude inventory unknown: its cap change cannot be checked', multiproject.accept(lower, CHECK)['errors'])
+        self.assertEqual((self.anchor.read_bytes(), self.calls('native'), self.mutations('alpha')), (before, [], []))
+
+    def test_caps_with_any_binding_change_still_needs_full_settlement_of_retained_grants(self):
+        self.catalog(self.alpha, self.beta)
+        before = self.anchor.read_bytes()
+        self.claim('alpha', 1, 'review', 'owned-review')
+        caps = {'caps': {'claude': 2, 'codex': 6}}
+        for n, bindings in enumerate(([self.beta], [{**self.alpha, 'principal': 2}, self.beta], [{**self.alpha, 'act': False}, self.beta],
+                                      [{**self.alpha, 'effects': ['queue', 'cleanup', 'idle_stop', 'queue']}, {**self.beta, 'limits': {'claude': 1}}],
+                                      [{**self.alpha, 'timeout': 60}, self.beta])):
+            with patch.object(multiproject, 'codex_threads', lambda: []):
+                refused = multiproject.accept(self.catalog(*bindings, enroll=False, file=f'changed-{n}.toml', **caps), CHECK)
+            self.assertIn('https://gitlab.example/acme/alpha: still owns session:owned-review', refused['errors'], bindings)
+            self.assertEqual(self.anchor.read_bytes(), before)
+        self.assertEqual((self.block('alpha', 1)['claim']['session'], self.mutations('alpha')), ('owned-review', []))
 
 
 def act_child():

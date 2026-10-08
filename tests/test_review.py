@@ -83,20 +83,23 @@ class Review(unittest.TestCase):
 
     def test_changed_branch_refuses_stale_review(self):
         iid, tree, _ = self.candidate()
+        before = q.task(iid)
         self.git('commit', '--allow-empty', '-qm', 'changed after review', cwd=tree)
         self.git('push', '-q', 'origin', f'taskq-{iid}')
         self.assertIn('not the task branch head', self.refused(COORDINATOR, 'close', iid, '--text', 'reviewed'))
         self.assertEqual(self.main_head(), self.base)
-        self.assertEqual(self.state(iid), 'ready')
-        self.assertIsNone(q.task(iid)['result'])
+        self.assertEqual(self.state(iid), 'review')
+        self.assertEqual(q.task(iid)['result'], before['result'])
+        self.assertEqual(q.task(iid)['claim'], before['claim'])
 
     def test_two_candidates_require_rebase_and_new_review(self):
         first, _, one = self.candidate()
         second, tree, two = self.candidate()
         self.do(COORDINATOR, 'close', first, '--text', 'reviewed')
-        self.assertIn('Rebase on origin/main', self.refused(COORDINATOR, 'close', second, '--text', 'reviewed'))
+        self.assertIn('Publication refused', self.refused(COORDINATOR, 'close', second, '--text', 'reviewed'))
         self.assertEqual(self.main_head(), one)
-        self.assertIsNone(q.task(second)['result'])
+        self.assertEqual(q.task(second)['result']['sha'], two)
+        self.do(COORDINATOR, 'reject', second, '--text', 'rebase requested')
         self.git('fetch', '-q', 'origin')
         self.git('rebase', 'origin/main', cwd=tree)
         self.git('push', '-q', '--force-with-lease', 'origin', f'taskq-{second}', cwd=tree)
@@ -125,8 +128,29 @@ class Review(unittest.TestCase):
         with patch.object(worker.subprocess, 'run', race):
             self.assertIn('Publication refused', self.refused(COORDINATOR, 'close', iid, '--text', 'reviewed'))
         self.assertEqual(self.main_head(), rival[0])
-        self.assertEqual(self.state(iid), 'ready')
-        self.assertIsNone(q.task(iid)['result'])
+        self.assertEqual(self.state(iid), 'review')
+        self.assertEqual(q.task(iid)['result']['sha'], sha)
+
+    def test_advanced_main_closes_without_republishing_and_closed_retry_is_safe(self):
+        iid, _, sha = self.candidate()
+        self.git('merge', '--ff-only', sha)
+        self.git('commit', '--allow-empty', '-qm', 'later main')
+        self.git('push', '-q', 'origin', 'main')
+        before = self.main_head()
+        self.do(COORDINATOR, 'close', iid, '--text', 'accepted')
+        self.assertEqual((self.main_head(), self.gitlab.issues[iid]['state']), (before, 'closed'))
+        self.do(COORDINATOR, 'close', iid, '--text', 'retry')
+        self.assertEqual(self.main_head(), before)
+
+    def test_missing_published_branch_keeps_review_evidence(self):
+        iid, _, sha = self.candidate()
+        self.git('merge', '--ff-only', sha)
+        self.git('push', '-q', 'origin', 'main')
+        self.git('push', '-q', 'origin', '--delete', f'taskq-{iid}')
+        before = q.task(iid)
+        self.refused(COORDINATOR, 'close', iid, '--text', 'accepted')
+        self.assertEqual(self.state(iid), 'review')
+        self.assertEqual((q.task(iid)['claim'], q.task(iid)['result']), (before['claim'], before['result']))
 
     def test_config_default_validation_and_local_override(self):
         for value in ('"typo"', 'true', '7', '[]'):

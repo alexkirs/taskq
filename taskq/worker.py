@@ -333,12 +333,19 @@ def releases(iid):
 
 
 def close(args):
+    issue = core.api('GET', f'issues/{args.iid}')
+    if issue['state'] != 'opened':
+        print(f'#{args.iid} already closed')
+        return
     current = core.task(args.iid, ('review',))
     if current['type'] in ('code', 'docs'):
         try:
             sha = core.commit(current['result']['sha'])
         except argparse.ArgumentTypeError as error:
             core.fail(f'{error}; reject the task so the worker hands in the pushed commit')
+        current = core.unchanged(current)
+        if not current:
+            return
         if core.PUBLISH == 'review':
             publish_review(current, sha)
         else:
@@ -386,9 +393,7 @@ def publish_review(current, sha):
                 git('worktree', 'remove', tree)
     except (subprocess.CalledProcessError, ValueError) as error:
         detail = core.last_line(error.stderr or error.stdout) if isinstance(error, subprocess.CalledProcessError) else str(error)
-        text = f'Publication refused: {detail}. Rebase on origin/main, push {branch}, and submit a new result for review.'
-        requeue(argparse.Namespace(iid=current['iid'], action='reject', text=text))
-        core.fail(text)
+        core.fail(f'Publication refused: {detail}. Keep this review result and resolve the remote state before retrying close.')
 
 
 def retire_local(current):

@@ -42,9 +42,11 @@ failed is a new revision with the old note id.
 The pending set of a pass is every `review` item with a result, every `ask` item (shown or not; the daily
 summary hides a question from the judgement lines, never from the set) and every `stuck` doing item.
 Each item is read once (`tick.pending`): the line and the note it names (`_note`) come from that same
-read, and that note is what the review section and the pending section print. A result note that lands
-after the read is a different line on the fresh compare, so the old text is never sent under the new
-revision; it is sent on the next pass, with its own line.
+read, and that note is what the review section and the pending section print. For a question the read
+is `question()`'s own page: the text in the fresh list and in the daily summary, the `shown` stamp and
+the line's ask note id are one note. A result or ask note that lands after the read is a different line
+on the fresh compare, so the old text is never sent under the new revision; it is sent on the next pass,
+with its own line.
 
 The wake key hashes the pending lines and the judgement lines that no pending line covers (permissions,
 board mismatch, problems, inbox, failed steps). A question leaving the judgement lines when shown is the

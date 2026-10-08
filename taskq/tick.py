@@ -42,31 +42,35 @@ def auto_update():
 
 
 def question(iid):
-    """The latest question of an `ask` task, when `tick` last showed it (None: not yet) and the question note's id
-    (#223: its revision). The newest page is enough: while a task waits in ask, only `shown` notes follow its question."""
-    shown = None
-    for item in core.collaborators(core.api('GET', f'issues/{iid}/notes?sort=desc&per_page=100&activity_filter=only_comments')):
+    """The latest question of an `ask` task, when `tick` last showed it (None: not yet) and the trusted notes it was
+    read from, newest first (#223: the pending line is made from that same read, so the text shown and the revision
+    named are one note). The newest page is enough: while a task waits in ask, only `shown` notes follow its question."""
+    shown, text = None, 'no question note'
+    notes = core.collaborators(core.api('GET', f'issues/{iid}/notes?sort=desc&per_page=100&activity_filter=only_comments'))
+    for item in notes:
         if item['body'].startswith('**shown**') and shown is None:
             shown = core.stamp(item['created_at'])
         elif item['body'].startswith('**ask**'):
-            return item['body'].split('\n\n', 1)[-1], shown, item['id']
-    return 'no question note', shown, None
+            text = item['body'].split('\n\n', 1)[-1]
+            break
+    return text, shown, notes
 
 
-def revision(item):
+def revision(item, notes=None):
     """#223: the revision of a pending item: `<kind> <note id>` of the newest trusted note that put it where it is (the
     claim session's `result` for review, anyone's `ask` as `question` reads it, the claim session's `result`, `ask` or
     `problem` for doing), then the result block itself (`sha` and `checks`). The block is always part of it: a PUT that
     landed with a new `checks` and the same SHA while its note failed is a new revision with the old note.
     The note's body is kept on the item (`_note`): what the coordinator reads is the note the revision names, from
-    the same read, never a second read that a newer note could have reached in between."""
+    the same read, never a second read that a newer note could have reached in between. `notes`: trusted notes already
+    read for this item, newest first (`question` passes its page), instead of a read of their own."""
     claim = item['claim'] or {}
     who = f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]}'
     heads = {'review': [f'**result** · {who}'], 'ask': ['**ask**'],
              'doing': [f'**{kind}** · {who}' for kind in ('result', 'ask', 'problem')]}.get(item['state'], [])
     block = json.dumps(item.get('result'), sort_keys=True)
     item['_note'] = 'none'
-    for note in reversed(core.comments(item['iid'])):
+    for note in (notes if notes is not None else reversed(core.comments(item['iid']))):
         head = note['body'].split('\n', 1)[0]
         if any(head.startswith(found) for found in heads):
             item['_note'] = note['body']
@@ -74,13 +78,13 @@ def revision(item):
     return f'block {block}'
 
 
-def pending(item):
+def pending(item, notes=None):
     """#223: the pending tuple of an item as one line: state, task, claim and revision, read once per item and kept
     (`_pending`) with the note it names. The wake key hashes these lines; the item is re-read against its line
     immediately before the send."""
     if '_pending' not in item:
         claim = item['claim'] or {}
-        item['_pending'] = f'{item["state"]} {item["iid"]} {claim.get("runtime")}:{claim.get("session")} {revision(item)}'
+        item['_pending'] = f'{item["state"]} {item["iid"]} {claim.get("runtime")}:{claim.get("session")} {revision(item, notes)}'
     return item['_pending']
 
 
@@ -904,6 +908,8 @@ def queue_pass(args, act=False):
     review = [item for item in everything if item['state'] == 'review' and item['result']]
     # A question reaches the owner once, when it is new; the ones already shown come back as a daily summary.
     asked = [(item, *question(item['iid'])) for item in everything if item['state'] == 'ask']
+    for item, _, _, notes in asked:
+        pending(item, notes)  # #223: the line names the question note that was read; the text below is that note's
     fresh = [(item, text) for item, text, shown, _ in asked if shown is None]
     summary = [(item, text) for item, text, shown, _ in asked if shown and time.time() - shown >= core.SUMMARY_SECONDS]
     codex_stopped = [item for item in everything if item['state'] in ('ask', 'later')

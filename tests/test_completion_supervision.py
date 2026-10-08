@@ -167,6 +167,50 @@ class Supervision(unittest.TestCase):
         self.assertIn('"checks": "new"', self.wakes()[-1]['pending'][0])
         self.assertNotIn('applied', json.dumps(self.report))
 
+    def test_question_text_and_revision_come_from_one_read_in_fresh_and_summary_paths(self):
+        """Residual P1 of the independent review: a trusted ask note landing after the question read (the second
+        release in a row writes one on an ask task) must not be sent as the old text under the new revision, in the
+        fresh path and in the daily summary path alike."""
+        asked = self.add('--type', 'asset', '--runtime', 'claude')
+        self.do(CLAUDE, 'take', asked)
+        self.do(CLAUDE, 'ask', asked, '--text', 'OLD QUESTION')
+        question, landed = tick.question, []
+
+        def racing(iid):
+            found = question(iid)
+            landed.append(self.gitlab('POST', f'issues/{iid}/notes', {'body': '**ask** · claude:claude-s\n\nNEW QUESTION'})['id'])
+            return found
+        with patch.object(tick, 'question', racing):
+            output = self.act()  # fresh path
+        self.assertIn('OLD QUESTION', output)
+        self.assertNotIn('NEW QUESTION', output)
+        self.assertIn(f' ask {landed[0] - 1} ', self.wakes()[-1]['pending'][0])
+        self.assertEqual((self.woken, self.wakes()[-1]['status']), ([], 'pending changed'))
+        output = self.act()
+        self.assertEqual(len(self.woken), 1)
+        self.assertIn('NEW QUESTION', self.woken[0][1])
+        self.assertNotIn('OLD QUESTION', self.woken[0][1])
+        self.assertIn(f' ask {landed[0]} ', self.wakes()[-1]['pending'][0])
+        # Daily summary path: the shown note is a day old; the next ask note lands after the summary's read.
+        for note in self.gitlab.notes.values():
+            if note['body'].startswith('**shown**'):
+                note['created_at'] = '2000-01-01T00:00:00.000Z'
+        key = tick.woken().read_text().split()[0]
+        tick.woken().write_text(f'{key}\n{time.time() - tick.TICK_LIVE_MINUTES * 60 - 1:.0f}\n')  # the re-wake is due
+        with patch.object(tick, 'question', racing):
+            output = self.act()
+        self.assertIn('daily summary', output)
+        self.assertIn('NEW QUESTION', output)
+        self.assertNotIn('NEWER', output)
+        self.assertIn(f' ask {landed[0]} ', self.wakes()[-1]['pending'][0])
+        self.assertEqual((len(self.woken), self.wakes()[-1]['status']), (1, 'pending changed'))
+        self.gitlab.notes[landed[1]]['body'] = '**ask** · claude:claude-s\n\nNEWER QUESTION'
+        output = self.act()  # the newest note is newer than every shown: fresh again, delivered under its own id
+        self.assertEqual(len(self.woken), 2)
+        self.assertIn('NEWER QUESTION', self.woken[-1][1])
+        self.assertIn(f' ask {landed[1]} ', self.wakes()[-1]['pending'][0])
+        self.assertNotIn('applied', json.dumps(self.report))
+
     def test_result_block_is_part_of_the_revision_and_delivery_is_rechecked(self):
         code = self.add('--type', 'code', '--runtime', 'claude')
         self.do(CLAUDE, 'take', code)

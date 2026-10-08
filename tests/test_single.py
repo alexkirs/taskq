@@ -57,6 +57,9 @@ class Base(unittest.TestCase):
         patcher = mock.patch.object(taskq, 'runtimes', return_value={})  # no real worker from an event's dispatch
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(taskq, 'start_pass', lambda *_, **__: taskq.main(['tick', '--quiet']))  # the child's pass, in process
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def run_cli(self, *argv):
         out = io.StringIO()
@@ -449,6 +452,74 @@ class Tick(Base):
         with contextlib.redirect_stderr(err):
             self.assertEqual(self.add(), '#1 ready\n')
         self.assertIn('dispatch stopped: claude could not start the session', err.getvalue())
+
+    def test_event_returns_before_the_detached_spawn(self):
+        # #405 (R4): add starts a detached `tick --quiet`; a slow spawn and a failed one happen there, logged
+        board = """import json, pathlib
+FILE = pathlib.Path(__file__).with_name('issues.json')
+load = lambda: {int(n): issue for n, issue in json.loads(FILE.read_text()).items()} if FILE.exists() else {}
+save = lambda issues: FILE.write_text(json.dumps(issues))
+def list(state):
+    return [i for i in load().values() if i['state'] == 'open' and any(l.startswith('q-') for l in i['labels'])]
+def get(n):
+    return load()[n]
+def add(title, body, labels):
+    issues = load(); n = len(issues) + 1
+    issues[n] = {'iid': n, 'title': title, 'body': body, 'labels': labels, 'state': 'open', 'url': '', 'comments': [],
+                 'updated_at': '2026-10-09T00:00:00Z'}
+    save(issues); return n
+def update(n, labels=None, body=None):
+    issues = load(); issues[n].update({k: v for k, v in (('labels', labels), ('body', body)) if v is not None}); save(issues)
+def comment(n, text):
+    issues = load(); issues[n]['comments'].append(text); save(issues)
+def close(n):
+    issues = load(); issues[n]['state'] = 'closed'; save(issues)
+"""
+        runtime = """import os, pathlib, time
+def spawn(name, prompt, cwd):
+    time.sleep(2)
+    if 'boom' in name:
+        raise SystemExit('taskq: slow could not start the session')
+    pathlib.Path(cwd, 'spawned').write_text(str(os.getpid()))
+    return 's-' + name.split()[0]
+send = lambda session, text: session
+alive = lambda session: None
+link = lambda session: None
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'board.py').write_text(board)
+            (root / 'slow.py').write_text(runtime)
+            (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'runtimes': {'slow': 'slow.py'}, 'limits': {'slow': 1}}))
+            env = {**taskq.worker_env(), 'TASKQ_HOST': 'mac'}
+            add = lambda title: subprocess.run(['python3', str(ROOT / 'taskq.py'), 'add', title, '--goal', 'g', '--acceptance', 'a'],
+                                               cwd=root, env=env, capture_output=True, text=True, timeout=30)
+            start = taskq.time.monotonic()
+            done = add('one')
+            self.assertLess(taskq.time.monotonic() - start, 1.5)
+            self.assertEqual((done.returncode, done.stdout, done.stderr), (0, '#1 ready\n', ''))
+            spawns = lambda: [c for c in json.loads((root / 'issues.json').read_text())['1']['comments'] if c.startswith('**spawn**')]
+            for _ in range(100):
+                if spawns():
+                    break
+                taskq.time.sleep(0.1)
+            child = int((root / 'spawned').read_text())
+            self.assertEqual((child != os.getpid(), len(spawns())), (True, 1))  # spawned once, in the child
+            for _ in range(100):  # the child holds the dispatch lock until it exits: a pass then would find it busy
+                try:
+                    os.kill(child, 0)
+                except OSError:
+                    break
+                taskq.time.sleep(0.1)
+            (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'runtimes': {'slow': 'slow.py'}, 'limits': {'slow': 2}}))
+            done = add('boom')
+            self.assertEqual(done.returncode, 0)
+            log = root / '.taskq' / 'dispatch.log'
+            for _ in range(100):
+                if 'dispatch stopped' in log.read_text():
+                    break
+                taskq.time.sleep(0.1)
+            self.assertIn('dispatch stopped: slow could not start the session', log.read_text())
 
     def test_claude_send_keeps_name_and_spawn_flags(self):
         claude, calls = taskq.Claude(), []

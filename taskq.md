@@ -48,16 +48,18 @@ Open: supervisor per runtime, yes or no (Claude; Codex). Until the owner decides
 ### R4. Tick is a message or a queue event
 
 A tick is one pass (§ 7), started by a message or by a queue event. A sender runs `taskq tick`; received means one
-pass, not received means nothing. `add`, `answer`, `result`, `requeue` and `close` run the same pass once, in the same
-process, after their move: the queue chains itself. The manager is woken only when it has work: a sender session
-loops `taskq wait`, which blocks until a task enters `review` or `ask`, a local worker is gone, or a safety window
-(10 min) passes, and sends its output to the manager, who then runs a pass. One sender per machine, armed with
-`taskq arm tick <manager>` (§ 7 Arm the tick). A pass starts only tasks with no `host-*` label or its own machine's.
+pass, not received means nothing. `add`, `answer`, `result`, `requeue` and `close` start the same pass once after their
+move, in a detached `taskq tick --quiet` child, and return at once: the queue chains itself. The child writes to
+`.taskq/dispatch.log`; a child that finds the dispatch lock busy exits. The manager is woken only when it has work: a
+sender session loops `taskq wait`, which blocks until a task enters `review` or `ask`, a local worker is gone, or a
+safety window (10 min) passes, and sends its output to the manager, who then runs a pass. One sender per machine, armed
+with `taskq arm tick <manager>` (§ 7 Arm the tick). A pass starts only tasks with no `host-*` label or its own machine's.
 Changed: "a tick on another machine never coordinates" → every machine's tick runs the same pass for its own claims
 and hosts; there is no coordinator machine (#290).
 Changed: "a tick is a message" → a tick is a message or a queue event; spawn no longer waits for the next sent tick (#333).
 Changed: a sender on a fixed interval (`/loop 5m taskq tick`) → a sender that loops `taskq wait` and messages the
 manager per event, `tick` after the safety window (#407).
+Changed: the event pass ran in the same process → in a detached child; an event no longer waits for spawns (#405).
 
 ### R5. Worker writes completion to the task
 
@@ -215,7 +217,7 @@ Runtime file: four module-level functions, two more optional.
 | `taskq requeue N [--text T]` | drop claim and result: any state → `ready` |
 | `taskq later N [--text T]` | park: any state → `later` |
 | `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
-| `taskq tick` | one pass of the queue on this machine (§ 7) |
+| `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4) |
 | `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed; print `review #N`, `ask #N`, `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7) |
 | `taskq arm tick <manager>` | print the prompt for a tick-sender session of this runtime (§ 7) |
 
@@ -223,8 +225,9 @@ Runtime file: four module-level functions, two more optional.
 - `--runtime` default `any`; `--type` default `code`; `--priority` default 2. `--host` takes a machine name (§ 2 `hosts`).
 - `--acceptance` is required; for a `research` task it names what the answer must say.
 - `add` prints `#<N> <state>`; every state change prints the new state.
-- `add`, `answer`, `result`, `requeue` and `close` then run one tick pass without the table (R4); its spawns print
-  their state too. A failed pass prints `taskq: dispatch stopped: <error>` to stderr and never fails the command.
+- `add`, `answer`, `result`, `requeue` and `close` then start one tick pass without the table in a detached child
+  (R4) and return at once. The pass's output and a failure (`taskq: dispatch stopped: <error>`) go to
+  `.taskq/dispatch.log` and never fail the command.
 - A command refuses a task in the wrong state and says which state it is in.
 - No `beat` or `problem` command: a progress note or a problem is a plain issue comment
   (`gh issue comment N --body "..."` / `glab issue note N -m "..."`).
@@ -325,7 +328,7 @@ No fixed interval (#407): the manager is woken only when it has work.
 5. Print the table `Task | State | Runtime | Session link` by priority, then number; then `Board: <url>`.
    Another machine's claim shows its bare session id: only that machine can link it.
 
-The event pass of R4 is steps 1–3 run by `add`, `answer`, `result`, `requeue` or `close`, no table. A worker's
+The event pass of R4 is steps 1–3 run by `taskq tick --quiet`, the detached child of `add`, `answer`, `result`, `requeue` or `close`, no table. A worker's
 `result` spawns the next worker on its own machine, named by its own runtime (R3). Run from `.worktrees/taskq-<N>`,
 taskq takes the checkout above it as the project root.
 

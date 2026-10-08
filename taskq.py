@@ -24,6 +24,8 @@ def load_config(start=None):
     here = Path(start or Path.cwd()).resolve()
     for folder in [here, *here.parents]:
         if (folder / 'taskq.json').is_file():
+            if folder.parent.name == '.worktrees' and (folder.parent.parent / 'taskq.json').is_file():
+                continue  # a worker's .worktrees/taskq-<N>: the root is the main checkout above it (#333)
             config = {'board': 'github', 'publish': 'direct', **json.loads((folder / 'taskq.json').read_text('utf-8')), 'root': folder}
             return config if config['publish'] in ('direct', 'pr') else fail(f'publish {config["publish"]!r}: use "direct" or "pr"')
     fail('no taskq.json in this directory or above')
@@ -184,8 +186,8 @@ def make_board(config):
 # under a new id), alive(session) -> True/False/None (running / gone / cannot tell), link(session) -> url or None.
 # Optional fifth: stop(session), which close calls on the claim's machine (#302).
 
-def worker_env():  # a worker must not inherit the tick's session id
-    return {key: value for key, value in os.environ.items() if key not in SESSIONS.values()}
+def worker_env():  # a worker must not inherit the tick's session id, nor a spawning worker's task (#333)
+    return {key: value for key, value in os.environ.items() if key not in (*SESSIONS.values(), 'TASKQ_TASK', 'TASKQ_RUNTIME')}
 
 class Claude:
     # #38, #51, #71: a worker gets only these tools, no MCP, no Chrome, and a pinned mode (else `auto` stops `taskq`).
@@ -489,7 +491,7 @@ def age(item):
     changed = datetime.fromisoformat((item['updated_at'] or '').replace('Z', '+00:00'))
     return (datetime.now(timezone.utc) - changed).total_seconds() / 60
 
-def cmd_tick(args):
+def cmd_tick(args, table=True):
     """One pass: requeue dead workers, nudge silent ones, free waiting tasks, spawn ready ones, print the table."""
     here, kinds = machine(), runtimes()
     limits = CONFIG.get('limits') or {name: 1 for name in kinds}
@@ -526,6 +528,8 @@ def cmd_tick(args):
             item['claim'] = {'runtime': free, 'session': session, 'name': here}
             move(item, 'doing', 'spawn', kinds[free].link(session) or '', claim=item['claim'], result=None)
             item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
+    if not table:
+        return
     print(f'{"Task":<6} {"State":<8} {"Runtime":<8} Session link')
     for item in items:
         claim = item['claim'] or {}
@@ -536,6 +540,15 @@ def cmd_tick(args):
     url = CONFIG.get('board_url') or {'github': f'https://{host or "github.com"}/{repo}/issues',
                                       'gitlab': f'https://{host or "gitlab.com"}/{repo}/-/issues'}.get(CONFIG['board'])
     url and print(f'Board: {url}')  # a board file names its page in `board_url`
+
+EVENTS = ('add', 'answer', 'result', 'requeue', 'close')  # R4 (#333): each runs one pass after its move
+
+def dispatch():
+    """The tick pass without the table, once, after an event. A failure never fails the event: the next tick retries."""
+    try:
+        cmd_tick(None, table=False)
+    except (SystemExit, Exception) as error:
+        print(f'taskq: dispatch stopped: {str(error).removeprefix("taskq: ")}; the next tick retries', file=sys.stderr)
 
 def main(argv=None):
     global CONFIG, BOARD
@@ -570,6 +583,8 @@ def main(argv=None):
         CONFIG = load_config()
         BOARD = make_board(CONFIG)
     args.function(args)
+    if args.command in EVENTS:
+        dispatch()
 
 if __name__ == '__main__':
     main()

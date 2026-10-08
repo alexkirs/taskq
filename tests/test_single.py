@@ -54,6 +54,9 @@ class Base(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': SESSION, 'TASKQ_RUNTIME': 'claude', 'TASKQ_HOST': 'mac'})
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(taskq, 'runtimes', return_value={})  # no real worker from an event's dispatch
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def run_cli(self, *argv):
         out = io.StringIO()
@@ -374,6 +377,39 @@ class Tick(Base):
             self.run_cli('tick')
         self.assertRegex(self.fake.names[0], r'^T1 (CLD|CDX) \S.* \(mac\)$')
 
+    def test_events_spawn_the_next_task_at_once(self):
+        # #333 (R4): add, result, close, requeue and answer each run the pass once; a full slot spawns nothing
+        spawns = lambda: [n for n in self.board.issues for text in self.board.issues[n]['comments'] if text.startswith('**spawn**')]
+        self.add('one')
+        self.add('two')
+        self.assertEqual(spawns(), [1])  # add: #1 into the free slot; #2 finds it full
+        self.run_cli('result', '1', '--sha', 'a' * 40)
+        self.assertEqual(spawns(), [1, 2])
+        self.add('three')
+        self.run_cli('requeue', '2')  # requeue frees the slot, #2 goes first again
+        self.assertEqual(spawns(), [1, 2, 2])
+        self.run_cli('ask', '2', '--text', 'which?')  # ask is no event: #3 waits for the tick or the next event
+        self.assertEqual(spawns(), [1, 2, 2])
+        self.run_cli('answer', '2', '--text', 'this')  # the live worker gets the answer, the slot stays full
+        self.assertEqual((spawns(), self.fake.sent), ([1, 2, 2], [('s-T2', 'The owner answered your question:\n\nthis')]))
+        with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+            self.run_cli('close', '1')  # #1 held no slot: nothing new
+            self.assertEqual(spawns(), [1, 2, 2])
+            self.run_cli('result', '2', '--sha', 'b' * 40)
+            self.assertEqual(spawns(), [1, 2, 2, 3])
+            self.fake.sessions['s-T3'] = False  # #3 died: close of #2 requeues and respawns it in the same pass
+            self.run_cli('close', '2')
+        self.assertEqual(spawns(), [1, 2, 2, 3, 3])
+        self.run_cli('tick')  # the safety net finds nothing left to do
+        self.assertEqual(spawns(), [1, 2, 2, 3, 3])
+
+    def test_event_survives_a_failed_dispatch(self):
+        self.fake.spawn = lambda *_: taskq.fail('claude could not start the session')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.add(), '#1 ready\n')
+        self.assertIn('dispatch stopped: claude could not start the session', err.getvalue())
+
     def test_claude_send_keeps_name_and_spawn_flags(self):
         claude, calls = taskq.Claude(), []
         claude.start = lambda arguments, cwd: calls.append(arguments) or 'new'
@@ -414,7 +450,8 @@ class Model(unittest.TestCase):
         board = taskq.BOARD = FakeBoard()
         n = board.add('t', taskq.block('text', {'scope': [], 'deps': [], 'claim': None, 'result': None, 'supervisor': {'x': 1}}),
                       ['q-later'])
-        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'none'}), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'none'}), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(taskq, 'runtimes', return_value={}):
             taskq.main(['requeue', str(n)])
         found = taskq.parse(board.get(n))
         self.assertEqual((found['raw']['supervisor'], found['text'], found['state']), ({'x': 1}, 'text', 'ready'))
@@ -436,6 +473,10 @@ class Model(unittest.TestCase):
             Path(folder, 'sub').mkdir()
             config = taskq.load_config(Path(folder, 'sub'))
             self.assertEqual((config['publish'], config['root']), ('direct', Path(folder).resolve()))
+            tree = Path(folder, '.worktrees', 'taskq-1')  # a worker's worktree has its own taskq.json: the root stays the checkout
+            tree.mkdir(parents=True)
+            Path(tree, 'taskq.json').write_text('{}')
+            self.assertEqual(taskq.load_config(tree)['root'], Path(folder).resolve())
             self.assertEqual(taskq.make_board(config).list(None), ['fake'])
 
     def test_contract_keeps_principles(self):

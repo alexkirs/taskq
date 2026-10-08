@@ -2115,6 +2115,7 @@ class GithubCycle(unittest.TestCase):
         self.enterContext(patch.object(q, 'claude_agents', lambda **kwargs: {}))
         self.enterContext(patch.object(worker, 'claude_agents', lambda **kwargs: {}))
         self.enterContext(patch.object(q, 'TICK_BEAT', Path(directory.name) / 'beat'))
+        self.enterContext(patch.object(q, 'CODEX_SOCKET', Path(directory.name) / 'no-codex.sock'))  # never the live app server
 
     def test_tick_links_tasks_sessions_and_commits(self):
         tick_links(self, GH, 'https://github.com/owner/x/commit/')

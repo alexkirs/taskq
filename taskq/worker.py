@@ -1074,6 +1074,7 @@ def claude_spawn(name, extra=None, prompt=None, remote_control=True):
     name says the machine. Off: `remoteControlAtStartup: false` (`/rc connecting…` gone, checked live)."""
     # A `--resume` keeps only --name and --settings (#51): the mode goes into --settings as well.
     settings = {'permissions': {'defaultMode': core.PERMISSION_MODE}, **({} if remote_control else {'remoteControlAtStartup': False})}
+    no_live_in_tests('claude --bg spawn')
     done = subprocess.run(['claude', '--bg', *CLAUDE_WORKER_TOOLS, '--name', name, '--settings', json.dumps(settings), *([prompt] if prompt else [])], cwd=core.ROOT,
                           env=claude_env(extra), capture_output=True, text=True, timeout=120)
     # FORCE_COLOR in the caller's environment colours the id (seen live 2026-10-06): strip ANSI before matching.
@@ -1127,6 +1128,7 @@ def claude_stop(session, remove=False):
     agent = claude_agents().get(session)
     for verb in ('stop', 'rm') if remove else ('stop',):
         if agent and (verb == 'rm' or agent.get('pid')):
+            no_live_in_tests(f'claude {verb}')
             subprocess.run(['claude', verb, agent['id']], cwd=core.ROOT, check=True, capture_output=True, timeout=60)
     return agent
 
@@ -1138,6 +1140,7 @@ def claude_wake(session, prompt, extra=None):
     agents = claude_agents()
     before, names = set(agents), {prompt, (agents.get(session) or {}).get('name')}
     claude_stop(session)
+    no_live_in_tests('claude --bg --resume')
     subprocess.run(['claude', '--bg', '--resume', session, prompt], cwd=core.ROOT, env=claude_env(extra),
                    check=True, capture_output=True, timeout=120)
     end = time.time() + 15
@@ -1238,3 +1241,10 @@ def driver_app_session():
     """The app session of the calling Claude session, to show again after an import; None from Codex or a shell."""
     sid = os.environ.get(core.RUNTIMES['claude'])
     return next((meta['sessionId'] for meta in claude_sessions().values() if meta.get('cliSessionId') == sid), None) if sid else None
+
+
+def no_live_in_tests(what):
+    """A unit test must never reach the real Claude/Codex runtime: leaked test sessions crowd the owner's apps and
+    archive or stop real sessions. Patched runners (mocks) pass; the real subprocess.run under unittest fails."""
+    if 'unittest' in sys.modules and subprocess.run.__module__ == 'subprocess':
+        raise ConnectionRefusedError(f'taskq test touched the live runtime: {what}')

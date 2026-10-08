@@ -393,7 +393,8 @@ def wake_supervisor(item):
     if found['runtime'] == 'claude':
         return core.claude_wake(found['session'], text)
     if found['runtime'] == 'codex':
-        return core.codex_send(argparse.Namespace(thread=found['session'], text=text, full_access=item['full_access']))
+        # a supervisor reaches the app server to drive its worker: workspace-write denies that socket
+        return core.codex_send(argparse.Namespace(thread=found['session'], text=text, full_access=True))
     return core.executor_run(found['runtime'], 'send', session=found['session'], text=text)
 
 
@@ -512,7 +513,7 @@ def supervisor_spawn(item):
     """#243 (R2, R3): the `spawn` arguments of a ready task's supervisor. Same command on every runtime: spawn names
     it `S<N> …`, writes it into the task's block and the session starts on `supervise N`; it launches the worker."""
     return argparse.Namespace(runtime=item['runtime'], name=f'S{item["iid"]} {item["title"][:40]}', remote_control=True,
-                              text=supervisor_prompt(item['iid']), full_access=item['full_access'])
+                              text=supervisor_prompt(item['iid']), full_access=item['full_access'] or item['runtime'] == 'codex')
 
 
 def launch(args, start, act, step):

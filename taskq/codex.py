@@ -62,6 +62,8 @@ def codex_access(full_access=False):
 
 class Codex:
     def __init__(self, timeout=60):
+        from taskq.worker import no_live_in_tests
+        no_live_in_tests('Codex app server')
         import base64
         import socket
         self.socket = socket.socket(socket.AF_UNIX)
@@ -303,7 +305,8 @@ def codex_send(args):
     whether the thread is the claimed session of a FULL_ACCESS task."""
     full = getattr(args, 'full_access', None)
     if full is None:
-        full = any(item['full_access'] and (item['claim'] or {}).get('session') == args.thread for item in core.load()[0])
+        full = any((item['full_access'] and (item['claim'] or {}).get('session') == args.thread)
+                   or (item.get('supervisor') or {}).get('session') == args.thread for item in core.load()[0])
     codex = Codex()
     metadata = codex.call('thread/read', {'threadId': args.thread})['thread']
     status = metadata['status']['type']

@@ -808,7 +808,10 @@ def one_pass(args, table=True):
         items = sorted(filter(None, map(parse, issues)), key=lambda item: (item['priority'], item['iid']))
         if not held:  # another pass runs here now: dispatch_lock marked the event, that pass runs once more when it ends
             print('taskq: another pass is running; it will run again for this event', file=sys.stderr)
-        busy, ready = {}, items if held else []
+        blind = bool(os.environ.get('CODEX_SANDBOX'))  # #502: a sandbox sees no other session alive: it would requeue live workers as gone
+        if blind:
+            print('taskq: inside a Codex sandbox: the pass only prints the table', file=sys.stderr)
+        busy, ready = {}, items if held and not blind else []
         for item in ready:
             claim = item['claim'] or {}
             if item['state'] == 'waiting' and not open_deps(item['deps']):
@@ -851,7 +854,7 @@ def one_pass(args, table=True):
                 item['claim'] = {'runtime': free, 'session': session, 'name': here}
                 move(item, 'doing', 'spawn', kinds[free].link(session) or '', claim=item['claim'], result=None)
                 item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
-        if held:  # #360: sessions of tasks no longer open (the list holds open tasks only)
+        if held and not blind:  # #360: sessions of tasks no longer open (the list holds open tasks only)
             open_tasks = {item['iid'] for item in items}
             retire(lambda n, *_: n not in open_tasks, 'could not remove sessions of closed tasks', running=False)
     if not table:
@@ -920,7 +923,7 @@ def cmd_wait(args):
         now = {}
         for item in filter(mine, filter(None, map(parse, BOARD.list(None)))):
             claim, state = item['claim'] or {}, item['state']
-            if state == 'doing' and claim.get('name') == here and claim.get('runtime') in kinds \
+            if state == 'doing' and not os.environ.get('CODEX_SANDBOX') and claim.get('name') == here and claim.get('runtime') in kinds \
                     and kinds[claim['runtime']].alive(claim['session']) is False:  # ponytail: one alive call per local worker per poll
                 state = 'gone'
             now[str(item['iid'])] = state

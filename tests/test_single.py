@@ -600,6 +600,16 @@ class Tick(Base):
             self.add()
         self.assertEqual(self.task(1)['state'], 'ready')
 
+    def test_codex_sandbox_never_calls_a_live_worker_gone(self):  # #502
+        self.add()
+        self.run_cli('tick')
+        self.fake.sessions['s-T1'] = False  # the sandbox cannot see the worker's process
+        with mock.patch.dict(os.environ, {'CODEX_SANDBOX': 'seatbelt'}), mock.patch.object(taskq.time, 'sleep'):
+            self.run_cli('tick')
+            self.assertNotIn('gone', self.run_cli('wait', '--window', '0'))
+        self.assertEqual(self.task(1)['state'], 'doing')
+        self.assertNotIn('**requeue**', ' '.join(self.board.issues[1]['comments']))
+
     def test_event_survives_a_failed_dispatch(self):
         self.fake.spawn = lambda *_: taskq.fail('claude could not start the session')
         err = io.StringIO()

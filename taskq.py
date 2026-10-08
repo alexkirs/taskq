@@ -684,6 +684,12 @@ SENDERS = {'claude': 'SendMessage', 'codex': 'its thread send'}
 def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
     runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
+    wait = f'python3 {Path(__file__).resolve()} wait'
+    if not args.target:  # no target: this session ticks itself (Claude: a background command wakes the session on exit)
+        return print(f'''Arm the tick in this session. Run `{wait}` as a background command (Claude Code: run_in_background).
+When it ends you are woken with its output (`review #N`, `ask #N`, `gone #N` or `tick`): run one pass (`taskq tick`),
+do § 7 After each pass for those tasks, then start `{wait}` in the background again. Keep exactly one wait running.
+A runtime that cannot wake a session when a background command ends (Codex): use `taskq arm tick "<manager>"` from a separate sender session.''')
     print(f'''You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
 Repeat forever, from {CONFIG["root"]}:
 1. Run `python3 {Path(__file__).resolve()} wait`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
@@ -719,7 +725,7 @@ def main(argv=None):
     command('close', cmd_close, (('n',), {'nargs': '+', 'type': int}), n=False, text=True)
     command('tick', lambda args: (event_pass if args.quiet else cmd_tick)(args), (('--quiet',), {'action': 'store_true'}), n=False)
     command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}), n=False)
-    command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {}), n=False)
+    command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}), n=False)
     args = parser.parse_args(argv)
     if BOARD is None:
         CONFIG = load_config()

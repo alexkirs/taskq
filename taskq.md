@@ -219,7 +219,7 @@ Runtime file: four module-level functions, two more optional.
 | `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
 | `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4) |
 | `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed; print `review #N`, `ask #N`, `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7) |
-| `taskq arm tick <manager>` | print the prompt for a tick-sender session of this runtime (§ 7) |
+| `taskq arm tick [<manager>]` | print the prompt for a tick-sender session of this runtime; without `<manager>`: how this session ticks itself (a background `taskq wait` that wakes it) (§ 7) |
 
 - `--sha`: 7 to 40 lowercase hex digits; give the full SHA.
 - `--runtime` default `any`; `--type` default `code`; `--priority` default 2. `--host` takes a machine name (§ 2 `hosts`).

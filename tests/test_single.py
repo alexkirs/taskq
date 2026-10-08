@@ -437,6 +437,11 @@ class Tick(Base):
         self.run_cli('tick')  # the safety net finds nothing left to do
         self.assertEqual(spawns(), [1, 2, 2, 3, 3])
 
+    def test_arm_tick_without_target_arms_this_session(self):
+        out = self.run_cli('arm', 'tick')
+        self.assertIn('background command', out)
+        self.assertIn('wait', out)
+
     def test_brief_carries_the_requeue_reason(self):
         self.add()
         self.run_cli('requeue', '1', '--text', 'fix test X')

@@ -399,7 +399,7 @@ def claude_inventory(rows):
         return None
     found = set()
     for row in rows:
-        if row.get('state') in CLAUDE_ENDED:
+        if row.get('state') in CLAUDE_ENDED and row.get('pid') is None:
             continue
         session, pid = row.get('sessionId'), row.get('pid')
         if isinstance(session, str) and session:
@@ -409,6 +409,22 @@ def claude_inventory(rows):
         else:
             return None
     return found
+
+
+def claude_executor_ended(session, checkout, rows):
+    """Fresh CLI proof that one exact background executor ended in this binding. This is not archive or ownership proof."""
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return False
+    matches = [row for row in rows if row.get('sessionId') == session]
+    if not (len(matches) == 1 and matches[0].get('kind') == 'background'
+            and matches[0].get('state') in CLAUDE_ENDED and isinstance(matches[0].get('status'), str)
+            and matches[0].get('status') != 'busy' and matches[0].get('pid') is None
+            and isinstance(matches[0].get('cwd'), str)):
+        return False
+    try:
+        return Path(matches[0]['cwd']).resolve() == Path(checkout).resolve()
+    except OSError:
+        return False
 
 
 def codex_threads():
@@ -480,6 +496,7 @@ def occupancy(entry):
         return {'status': 'refused', 'errors': [f'the tracker principal is {uid}, the catalog binds {entry["principal"]}']}
     everything, where = core.load()[0], repository_url(entry)
     held, inactive, protected, uncertain = [], [], set(), []  # inactive is budget-only; ownership always remains held
+    claude = {}
     for item in everything:
         claim, found, task = item['claim'] or {}, item.get('reservation') or {}, f'{where}#{item["iid"]}'
         # Any state: a review, ask, ready or later claim still names its worker; an empty inventory never settles it.
@@ -495,6 +512,8 @@ def occupancy(entry):
                 if (item['state'] in ('review', 'ask', 'later') and claim['runtime'] == 'codex'
                         and codex_archived_inactive(claim['session'])):
                     inactive.append(identity)
+                elif claim['runtime'] == 'claude':
+                    claude.setdefault(identity, []).append(item['state'])
                 else:
                     protected.add(identity)
             else:
@@ -510,6 +529,14 @@ def occupancy(entry):
             else:  # a launch with its session, or with its launching process that native reconcile can settle
                 identity = f'session:{session}' if session else f'reservation:{task}:{found.get("attempt")}'
                 held.append(([found['runtime']], identity))
+                protected.add(identity)
+    if claude:
+        rows = claude_rows()
+        for identity, states in claude.items():
+            session = identity.removeprefix('session:')
+            if all(state in ('review', 'ask', 'later') for state in states) and claude_executor_ended(session, entry['checkout'], rows):
+                inactive.append(identity)
+            else:
                 protected.add(identity)
     owned = {item['iid'] for item in everything if (item['claim'] or {}).get('session') or item.get('reservation')}
     for issue in core.issues(f'state=opened&my_reaction_emoji={core.LOCK}'):

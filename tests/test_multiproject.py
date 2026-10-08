@@ -399,13 +399,13 @@ class Acting(unittest.TestCase):
         result = self.act([self.alpha, self.beta], policy)
         alpha, beta = result['projects']
         self.assertEqual([alpha['status'], beta['status']], ['ok', 'ok'], result)
-        # Six live rows of any kind; F = 8 - 6 = 2 for alpha. Its two launches make beta's occupancy 8: F = 0.
-        self.assertEqual(self.limits(alpha), {'claude': (6, True, 2, 0, 2), 'codex': (0, False, 0, 0, 0)})
+        # Seven live rows of any kind, including terminal+PID; F = 8 - 7 = 1 for alpha. Its launch makes beta's occupancy 8: F = 0.
+        self.assertEqual(self.limits(alpha), {'claude': (7, True, 1, 0, 1), 'codex': (0, False, 0, 0, 0)})
         self.assertEqual(self.limits(beta), {'claude': (8, True, 0, 0, 0), 'codex': (0, False, 0, 0, 0)})
         spawned = self.calls('spawn')
-        self.assertEqual([(row[2], row[3]) for row in spawned], [('acme/alpha2', 'T1 Task 1 (fixture-host)'), ('acme/alpha2', 'T2 Task 2 (fixture-host)')])
+        self.assertEqual([(row[2], row[3]) for row in spawned], [('acme/alpha2', 'T1 Task 1 (fixture-host)')])
         self.assertEqual({row[4] for row in spawned}, {'held'})  # the host guard is held during the native mutation
-        self.assertEqual([row[3] for row in self.calls('native')], [{'claude': 2, 'codex': 0}, {'claude': 0, 'codex': 0}])
+        self.assertEqual([row[3] for row in self.calls('native')], [{'claude': 1, 'codex': 0}, {'claude': 0, 'codex': 0}])
         self.assertEqual(self.store('alpha2').issues[3]['assignees'], [{'id': 2}])
         self.assertEqual(self.block('alpha2', 4)['reservation'], foreign)
         self.assertNotIn('reservation', self.block('alpha2', 3))
@@ -416,11 +416,11 @@ class Acting(unittest.TestCase):
             self.assertEqual(project['received_applied'], 'unknown')
             self.assertEqual(project['guard']['inode'], self.guard.stat().st_ino)
         self.assertEqual(result['received_applied'], 'unknown')
-        self.assertIn('claude=2 (L 0 + F 2, occupancy 6/8', multiproject.render(result))
+        self.assertIn('claude=1 (L 0 + F 1, occupancy 7/8', multiproject.render(result))
 
     def test_budget_counts_exact_sessions_once_and_unknowns_hold_every_runtime(self):
         self.assertEqual(multiproject.claude_inventory(LIVE), {'session:owner-chat', 'session:bg-0', 'session:bg-1', 'session:bg-2',
-                                                               'session:bg-3', 'session:waiting-owner'})
+                                                               'session:bg-3', 'session:waiting-owner', 'session:finished'})
         self.assertEqual(multiproject.claude_inventory([{'kind': 'interactive', 'pid': 7}]), {'pid:7'})
         self.assertIsNone(multiproject.claude_inventory([{'kind': 'background', 'state': 'working'}]))  # unidentified live row
         self.assertIsNone(multiproject.claude_inventory({'rows': []}))
@@ -456,6 +456,48 @@ class Acting(unittest.TestCase):
         self.assertEqual(multiproject.budget(caps, live, [archived, twin], archived, {'codex': 4})['codex']['F'], 1)
         twin['protected'] = ['session:191']
         self.assertEqual(multiproject.budget(caps, live, [archived, twin], archived, {'codex': 4})['codex']['F'], 0)
+
+    def test_ended_claude_executor_frees_compute_only_with_exact_terminal_no_pid_binding_proof(self):
+        items = [{'iid': 198, 'state': 'review', 'claim': {'runtime': 'claude', 'session': '198'}, 'reservation': None},
+                 {'iid': 205, 'state': 'later', 'claim': {'runtime': 'claude', 'session': '205'}, 'reservation': None}]
+        rows = [{'kind': 'background', 'sessionId': '198', 'cwd': str(self.dir), 'state': 'done', 'status': 'idle'},
+                {'kind': 'background', 'sessionId': '205', 'cwd': str(self.dir), 'state': 'failed', 'status': 'idle'}]
+        with patch.multiple(multiproject, verify=lambda entry: [], locality=lambda owner: 'local', claude_rows=lambda: rows), \
+                patch.multiple(core, user=lambda: 1, load=lambda: (items,), issues=lambda query: [],
+                               room=lambda everything, capacity: {'claude': -2, 'codex': 0}):
+            read = multiproject.occupancy({'principal': 1, 'host': 'example.test', 'repository': 'acme/test', 'checkout': str(self.dir)})
+        self.assertEqual((read['held'], read['inactive'], read['protected'], read['L']['claude']),
+                         ([(['claude'], 'session:198'), (['claude'], 'session:205')], ['session:198', 'session:205'], [], 2))
+        found = multiproject.budget({'claude': 2, 'codex': 1}, {'claude': set(), 'codex': set()}, [read], read, {'claude': 2})
+        self.assertEqual((found['claude']['occupancy'], found['claude']['F'], found['claude']['L']), (0, 2, 2))
+
+    def test_ended_claude_executor_holds_for_pid_live_alias_or_bad_binding_proof(self):
+        item = {'iid': 185, 'state': 'review', 'claim': {'runtime': 'claude', 'session': '185'}, 'reservation': None}
+        base = {'kind': 'background', 'sessionId': '185', 'cwd': str(self.dir), 'state': 'done', 'status': 'idle'}
+        for row, state, reservation in (({**base, 'pid': 17629}, 'review', None),
+                                        ({**base, 'cwd': '/wrong'}, 'review', None),
+                                        (base, 'doing', None),
+                                        (base, 'review', {'attempt': 'x', 'runtime': 'claude', 'principal': 1, 'node': 'local', 'pid': 1})):
+            with self.subTest(row=row, state=state, reservation=reservation), \
+                    patch.multiple(multiproject, verify=lambda entry: [], locality=lambda owner: 'local', claude_rows=lambda: [row]), \
+                    patch.multiple(core, user=lambda: 1, load=lambda: ([{**item, 'state': state, 'reservation': reservation}],), issues=lambda query: [],
+                                   room=lambda everything, capacity: {'claude': -1, 'codex': 0}), \
+                    patch.object(worker, 'launch_session', return_value='185' if reservation else None):
+                read = multiproject.occupancy({'principal': 1, 'host': 'example.test', 'repository': 'acme/test', 'checkout': str(self.dir)})
+            self.assertEqual(read['inactive'], ['session:185'] if reservation else [])
+            self.assertIn('session:185', read['protected'])
+            found = multiproject.budget({'claude': 1, 'codex': 1}, {'claude': set(), 'codex': set()}, [read], read, {'claude': 1})
+            self.assertEqual(found['claude']['occupancy'], 1)
+            self.assertEqual(multiproject.claude_inventory([row]), {'session:185'} if row.get('pid') else set())
+
+    def test_ended_claude_executor_rejects_interactive_missing_malformed_or_contradictory_rows(self):
+        row = {'kind': 'background', 'sessionId': '198', 'cwd': str(self.dir), 'state': 'stopped', 'status': 'idle'}
+        self.assertTrue(multiproject.claude_executor_ended('198', self.dir, [row]))
+        for rows in (None, [{}], [{**row, 'kind': 'interactive'}], [{**row, 'cwd': '/wrong'}],
+                     [{**row, 'state': 'working'}], [{**row, 'status': 'busy'}], [{**row, 'status': None}],
+                     [{**row, 'pid': 1}], [{**row, 'sessionId': 'other'}], [row, {**row, 'state': 'working'}]):
+            with self.subTest(rows=rows):
+                self.assertFalse(multiproject.claude_executor_ended('198', self.dir, rows))
 
     def test_occupancy_keeps_mixed_state_same_session_ineligible(self):
         items = [{'iid': 191, 'state': 'review', 'claim': {'runtime': 'codex', 'session': 'same'}, 'reservation': None},
@@ -499,7 +541,7 @@ class Acting(unittest.TestCase):
                                                (3, 'doing', 'claude', claim('bg-0'))])
         policy = self.catalog({**gone, 'act': False}, self.beta)
         result = self.act([self.beta], policy)
-        self.assertEqual(self.limits(result['projects'][0])['claude'], (8, True, 0, 0, 0))  # 6 rows + s-1, s-2; bg-0 once
+        self.assertEqual(self.limits(result['projects'][0])['claude'], (9, True, 0, 0, 0))  # 7 rows + s-1, s-2; bg-0 once
         self.assertEqual([item['status'] for item in result['projects'][0]['catalog']], ['ok', 'ok'])
         self.assertEqual(self.mutations('gone'), [])
 
@@ -593,14 +635,14 @@ class Acting(unittest.TestCase):
         (app / 'local_unproven-host-session.json').write_text('{}')
         retain('review', claim=nameless)
         found = self.act([self.beta], policy)['projects'][0]
-        self.assertEqual((found['status'], found['budget']['claude']['occupancy']), ('ok', 7))
+        self.assertEqual((found['status'], found['budget']['claude']['occupancy']), ('ok', 8))
         refused = multiproject.accept(self.catalog(self.beta, enroll=False, file='candidate.toml'), CHECK)
         self.assertIn('https://gitlab.example/acme/alpha2: still owns session:unproven-host-session', refused['errors'])
         self.assertEqual(self.anchor.read_bytes(), before)
         # A well-formed node of another machine is that machine's to settle: excluded, not counted.
         retain('doing', claim={**nameless, 'node': '0' * 12})
         found = self.act([self.beta], policy)['projects'][0]
-        self.assertEqual((found['status'], found['budget']['claude']['occupancy'], found['catalog'][0]['L']), ('ok', 6, {'claude': 0, 'codex': 0}))
+        self.assertEqual((found['status'], found['budget']['claude']['occupancy'], found['catalog'][0]['L']), ('ok', 7, {'claude': 0, 'codex': 0}))
         replaced = multiproject.accept(self.catalog(self.beta, enroll=False, file='candidate.toml'), CHECK)
         self.assertEqual((replaced['status'], replaced['generation']), ('replaced', 2))
 
@@ -790,7 +832,7 @@ class Acting(unittest.TestCase):
         self.assertFalse(any(row[0] == 'actor' and 'beta' in json.dumps(row) for row in self.calls()))
         self.assertTrue(self.block('slow', 1)['reservation'])  # the kept actor finished its launch
         again = self.act([self.beta], policy)['projects'][0]
-        self.assertEqual((again['status'], self.limits(again)['claude']), ('ok', (7, True, 1, 0, 1)))  # slow's worker counts
+        self.assertEqual((again['status'], self.limits(again)['claude']), ('ok', (8, True, 0, 0, 0)))  # terminal+PID and slow's worker count
 
     def test_wrapper_death_keeps_the_actor_and_its_guard_and_descendants_inherit_nothing(self):
         held = self.project('held', 81, tasks=[(1,)], spawn={'descendant': True, 'sleep': 3})
@@ -830,7 +872,7 @@ class Acting(unittest.TestCase):
         self.assertEqual((lost['status'], lost['output'], lost['received_applied']), ('unknown', None, 'unknown'))
         self.assertIn('is empty: its actor has not completed it', lost['errors'][0])
         again = self.act([self.beta], policy)['projects'][0]
-        self.assertEqual((again['status'], self.limits(again)['claude']), ('ok', (7, True, 1, 0, 1)))  # the orphan holds a place
+        self.assertEqual((again['status'], self.limits(again)['claude']), ('ok', (8, True, 0, 0, 0)))  # terminal+PID and the orphan hold places
         self.assertEqual((self.block('crash', 1)['reservation'], self.mutations('crash')), (orphan, written))  # read back, not released
 
     def test_late_actor_output_is_recovered_after_wrapper_timeout_and_a_restart_while_it_runs_acts_on_nothing(self):
@@ -1070,7 +1112,7 @@ class Acting(unittest.TestCase):
         later = self.act([other], policy)['projects'][0]
         self.assertEqual(later['status'], 'ok', later)
         self.assertEqual(later['guard']['inode'], json.loads(out)['projects'][0]['guard']['inode'])
-        self.assertEqual([row[2] for row in self.calls('spawn')], ['acme/first', 'acme/other'])
+        self.assertEqual([row[2] for row in self.calls('spawn')], ['acme/first'])
         fd, _ = multiproject.guard({'os_user': os.getuid()})  # an enrollment holding the guard keeps every actor out
         try:
             self.assertIn('host guard held', self.act([self.beta], policy)['projects'][0]['errors'][0])
@@ -1101,7 +1143,7 @@ class Acting(unittest.TestCase):
         together = self.act([idle, self.beta], policy)['projects'][1]
         self.assertEqual((alone['status'], together['status']), ('ok', 'ok'))
         self.assertEqual(alone['budget'], together['budget'])
-        self.assertEqual(self.limits(alone)['claude'], (6, True, 2, 0, 1))
+        self.assertEqual(self.limits(alone)['claude'], (7, True, 1, 0, 1))
         self.assertEqual(alone['native']['actions'][0]['action'], together['native']['actions'][0]['action'])
 
     def claim(self, name, iid, state, session):
@@ -1138,7 +1180,7 @@ class Acting(unittest.TestCase):
                              (2, multiproject.digest(anchor['catalog']), {'claude': 2, 'codex': 6}))
             self.assertEqual(multiproject.accept(target, CHECK)['status'], 'unchanged')
         self.assertEqual([self.block('alpha', iid)['claim']['session'] for iid in (1, 2)], ['owned-review', 'bg-1'])
-        # Six live rows and the review claim: occupancy 7 above the cap 2 (and 0). Refused before the native pass:
+        # Seven live rows and the review claim: occupancy 8 above the cap 2 (and 0). Refused before the native pass:
         # nobody new, nobody stopped, nothing released, cleaned or written.
         zero = self.catalog(self.alpha, self.beta, enroll=False, file='zero.toml', caps={'claude': 0, 'codex': 6})
         for policy in (target, zero):
@@ -1147,17 +1189,17 @@ class Acting(unittest.TestCase):
             before = [self.anchor.read_bytes()] + [(self.dir / f'acme_{name}.pickle').read_bytes() for name in ('alpha', 'beta')]
             result = self.act([self.alpha, self.beta], policy)
             for project, L in zip(result['projects'], (1, 0)):
-                self.assertEqual((project['status'], self.limits(project)['claude'][:2], self.limits(project)['claude'][3]), ('refused', (7, True), L))
-                self.assertIn(f'claude occupancy 7 above cap {0 if policy is zero else 2}', project['errors'][0])
+                self.assertEqual((project['status'], self.limits(project)['claude'][:2], self.limits(project)['claude'][3]), ('refused', (8, True), L))
+                self.assertIn(f'claude occupancy 8 above cap {0 if policy is zero else 2}', project['errors'][0])
             self.assertEqual([self.anchor.read_bytes()] + [(self.dir / f'acme_{name}.pickle').read_bytes() for name in ('alpha', 'beta')], before)
             self.assertEqual([row[0:2] for row in self.calls() if row[1] in ('native', 'spawn', 'cleanup', 'stop', 'wake', 'timer')], [])
         self.assertEqual((self.mutations('alpha'), self.mutations('beta')), ([], []))
         # At the cap exactly the pass runs with no new room; a raised cap grants only cap - fresh occupancy.
-        for caps, room in (({'claude': 7, 'codex': 6}, 0), ({'claude': 10, 'codex': 6}, 2)):
+        for caps, room in (({'claude': 8, 'codex': 6}, 0), ({'claude': 11, 'codex': 6}, 2)):
             policy = self.catalog(self.alpha, self.beta, enroll=False, file=f'cap-{caps["claude"]}.toml', caps=caps)
             self.assertEqual(multiproject.accept(policy, CHECK)['status'], 'replaced')  # codex unchanged: its inventory not needed
             found = self.act([self.beta], policy)['projects'][0]
-            self.assertEqual((found['status'], self.limits(found)['claude']), ('ok', (7, True, caps['claude'] - 7, 0, room)))
+            self.assertEqual((found['status'], self.limits(found)['claude']), ('ok', (8, True, caps['claude'] - 8, 0, room)))
         self.assertEqual([row[3] for row in self.calls('native')], [{'claude': 0, 'codex': 0}, {'claude': 2, 'codex': 0}])
         self.assertEqual([self.block('alpha', iid)['claim']['session'] for iid in (1, 2)], ['owned-review', 'bg-1'])
 

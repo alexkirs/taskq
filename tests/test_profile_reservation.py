@@ -31,6 +31,7 @@ def dead_pid():
 
 
 class Reservation(unittest.TestCase):
+    real_launch = True  # the tick's real launch on mocked runtimes
     setUp, do, refused, add, state = base.Cycle.setUp, base.Cycle.do, base.Cycle.refused, base.Cycle.add, base.Cycle.state
 
     def launches(self, session='worker-1', during=None, error=None):

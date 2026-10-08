@@ -21,6 +21,7 @@ WORKER = {'CLAUDE_CODE_SESSION_ID': 'worker-1', 'CODEX_THREAD_ID': ''}
 
 
 class SupervisorLayer(unittest.TestCase):
+    real_launch = True  # the tick's real launch on mocked runtimes
     setUp, do, refused, state = base.Cycle.setUp, base.Cycle.do, base.Cycle.refused, base.Cycle.state
 
     def add(self, runtime='claude'):
@@ -147,13 +148,13 @@ class SupervisorLayer(unittest.TestCase):
                 item = {'iid': 1, 'title': 't', 'state': 'doing', 'web_url': 'https://h/g/p/-/issues/1', 'updated_at': 'x', 'result': None,
                         'claim': {'runtime': runtime, 'session': f'{runtime}-worker'},
                         'supervisor': {'runtime': runtime, 'session': f'{runtime}-supervisor'}}
-                rows.append(tick.report_row(item, {}))
-        self.assertEqual(list(rows[0]), list(rows[1]))
-        self.assertIn('https://claude.ai/code/session_claude-worker', rows[0]['session'])
-        self.assertIn('supervisor [session](https://claude.ai/code/session_claude-supervisor)', rows[0]['session'])
-        self.assertIn('open.html#codex://threads/codex-worker', rows[1]['session'])
-        self.assertIn('open.html#codex://threads/codex-supervisor', rows[1]['session'])
-        self.assertEqual({row['runtime'] for row in rows}, {'claude', 'codex'})
+                rows.append(tick.report_row(item, {}, 'busy').split(' | '))
+        self.assertEqual(len(rows[0]), len(rows[1]))
+        self.assertIn('https://claude.ai/code/session_claude-worker', rows[0][3])
+        self.assertIn('supervisor [session](https://claude.ai/code/session_claude-supervisor)', rows[0][3])
+        self.assertIn('open.html#codex://threads/codex-worker', rows[1][3])
+        self.assertIn('open.html#codex://threads/codex-supervisor', rows[1][3])
+        self.assertEqual((rows[0][2], rows[1][2]), ('claude', 'codex'))
 
 
 if __name__ == '__main__':

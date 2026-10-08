@@ -746,8 +746,6 @@ def age(item):
 def contract(args):
     """Where the contracts live: the queue (taskq.md) and the manager/coordinator session (taskq-manager.md)."""
     print('\n'.join(str(path) for path in sorted(CONTRACTS.glob('taskq*.md'))))
-    if getattr(args, 'report', False):
-        report_bootstrap()
 
 
 def git(*args, cwd=None):
@@ -821,8 +819,7 @@ from taskq.doctor import (  # noqa: E402
     tree_gaps, profile_init, runtime_gaps, write_access, queue_labels_missing, board_gaps, report_gaps,
     PERMISSION_MODE, WORKER_ALLOW, permissions_missing, permissions_gap, trusted, setup, migrate, windows_claude_binary, pref)
 from taskq.tick import (  # noqa: E402
-    clone_warning, auto_update, contract_news, question, report_bootstrap, verify_report, profile_arguments, BOARD_MOVES, board_fix, board_moves, session_link,
-    inbox_line, tick)
+    clone_warning, auto_update, contract_news, question, profile_arguments, session_link, inbox_line, tick)
 from taskq.worker import (  # noqa: E402
     BRIEF, DELIVER, need_owner, doing_since, add, edit, later, listing, set_runtime, brief, worker, supervise, take, beat, ask,
     result, requeue, close, retire_local, spawn, reserve, reconcile, preflight, runtime_status, executor_run, send, claude_env, CLAUDE_WORKER_TOOLS, claude_spawn,
@@ -831,16 +828,13 @@ from taskq.worker import (  # noqa: E402
 
 
 def record(args, action, **values):
-    """Collect structured events for JSON and for the generated tick report."""
+    """Collect structured events for JSON."""
     if hasattr(args, 'output'):
         args.output['actions'].append({'action': action, **values})
-    elif hasattr(args, 'pm_report'):
-        args.pm_report['actions'].append({'action': action, **values})
 
 
 def json_command(args):
-    args.output = {'command': args.action, 'outcome': 'ok', 'actions': [], 'tasks': [],
-                   'sessions': [], 'refusals': []}
+    args.output = {'outcome': 'ok', 'tasks': [], 'actions': [], 'refusals': []}
     code = 0
     try:
         with contextlib.redirect_stdout(io.StringIO()) as output:
@@ -926,9 +920,8 @@ def main(argv=None):
             (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}),
             (('--supervisor',), {'metavar': 'RUNTIME:SESSION', 'help': "#240: the one session that launches and steers this "
                                  "task's worker; owner's shell assigns or clears (''), the current supervisor hands off"}))
-    command('report-verify', verify_report, (('file',), {'help': 'supported-channel report readback JSON; no transport or receipt writes'}))
     command('tick', tick, json_flag, *profile_flags,
-            (('--act',), {'action': 'store_true', 'help': 'spawn, retire and nudge here; report every pass, exit 1 for judgement'}))
+            (('--act',), {'action': 'store_true', 'help': argparse.SUPPRESS}))  # ponytail: senders' old form; tick always acts
     command('profile', profile_init, (('what',), {'choices': ('init',)}), *profile_flags,
             (('--preferred-runtime',), {'choices': tuple(RUNTIMES), 'help': 'tie-break for own tasks of any runtime'}))
     pref_command = command('pref', pref, (('what',), {'choices': ('add', 'list', 'rm')}))
@@ -958,7 +951,7 @@ def main(argv=None):
         command(name, migrate, (('--project',), {'help': 'GitLab project path: writes a minimal taskq.toml here if none'}),
                 (('--github',), {'help': 'GitHub repository owner/name: writes a minimal taskq.toml here if none'}),
                 (('--host',), {'help': 'host for that taskq.toml, e.g. gitlab.example.com'}))
-    command('contract', contract, (('--report',), {'action': 'store_true', 'help': 'deliver the current PM report template/version/hash'}))
+    command('contract', contract)
     command('doctor', doctor, (('--fix',), {'action': 'store_true', 'help': 'set up what a command can (taskq.toml, labels, board); '
                                             'print each step only the person can do'}),
             (('--codex',), {'action': 'store_true', 'help': 'with --fix: also the Codex app project of this checkout'}))

@@ -427,8 +427,7 @@ def apply_plan(args, root, gc):
 
 def scheduled(args):
     """The owner's tick applies cleanup once per hour, using one simple mtime stamp."""
-    actions = (args.output if hasattr(args, 'output') else args.pm_report)['actions']
-    sub = argparse.Namespace(apply=True, json=getattr(args, 'json', False), pm_report={'actions': actions})
+    sub = argparse.Namespace(apply=True, json=getattr(args, 'json', False))
     root = core.main_checkout(Path.cwd())
     try:
         if Path.cwd().resolve() != root.resolve() or Builtin._git(root, 'branch', '--show-current').strip() != 'main':

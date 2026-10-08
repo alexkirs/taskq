@@ -23,10 +23,9 @@ if name == 'slow':
     time.sleep(30)
 if name == 'broken':
     sys.exit('taskq.toml: not valid TOML')
-row = {'task': f'[#1](https://github.com/acme/{name}/issues/1)', 'title': f'{name} task', 'state': 'doing',
-       'runtime': 'claude', 'machine': 'mac', 'session': '[s](https://claude.ai/code/s)'}
-print(json.dumps({'outcome': 'ok', 'refusals': [], 'act': '--act' in sys.argv,
-                  'report': {'board': f'https://github.com/users/acme/projects/{name}', 'workers': [row]}}))
+text = (f'## acme/{name}\\n\\nBoard: https://github.com/users/acme/projects/{name}\\n\\n| Task | Status | Runtime | Session |\\n'
+        f'|---|---|---|---|\\n| [#1](https://github.com/acme/{name}/issues/1) {name} task | doing (running) | claude @mac | [s](https://claude.ai/code/s) |\\n')
+print(json.dumps({'outcome': 'ok', 'text': text, 'tasks': []}))
 """
 
 
@@ -67,10 +66,10 @@ class MultiprojectTest(unittest.TestCase):
         code, said = self.main()
         self.assertEqual(code, 0)
         for name in ('alpha', 'beta'):
-            self.assertIn(f'## {name}\nBoard: https://github.com/users/acme/projects/{name}\n\n'
+            self.assertIn(f'## acme/{name}\n\nBoard: https://github.com/users/acme/projects/{name}\n\n'
                           '| Task | Status | Runtime | Session |', said)
-            self.assertIn(f'| [#1](https://github.com/acme/{name}/issues/1) {name} task | doing | claude @mac |', said)
-        self.assertTrue(all(found['report'] for found in json.loads(self.main('--json', '--act')[1])))
+            self.assertIn(f'| [#1](https://github.com/acme/{name}/issues/1) {name} task | doing (running) | claude @mac |', said)
+        self.assertTrue(all('| Task |' in found['text'] for found in json.loads(self.main('--json')[1])))
         with contextlib.redirect_stdout(io.StringIO()) as said, self.assertRaises(SystemExit) as done:
             core.main(['projects', '--json'])  # the documented command
         self.assertEqual((done.exception.code, len(json.loads(said.getvalue()))), (0, 2))
@@ -94,7 +93,7 @@ class MultiprojectTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('## broken\nError: tick exit 1: taskq.toml: not valid TOML', said)
         self.assertIn('## slow\nError: timeout after 2 s', said)
-        self.assertIn('| [#1](https://github.com/acme/alpha/issues/1) alpha task | doing |', said)
+        self.assertIn('| [#1](https://github.com/acme/alpha/issues/1) alpha task | doing (running) |', said)
 
 
 if __name__ == '__main__':

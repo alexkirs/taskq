@@ -32,11 +32,11 @@ A new rule gets the next R-number.
 
 Mechanics: [taskq.md § Four roles](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq.md#four-roles), [taskq-manager.md](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq-manager.md).
 
-**R4. Tick is a message.** A sender invokes `taskq tick --act`; received means one pass, not received means nothing. The owner configures one sender per project outside taskq. A tick on another machine starts only its own `host-*` tasks and never coordinates. Mechanics: [taskq-manager.md § 2](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq-manager.md#2-arm-the-tick).
+**R4. Tick is a message.** A sender invokes `taskq tick`; received means one pass, not received means nothing. The owner configures one sender per project outside taskq. A tick on another machine starts only its own `host-*` tasks and never coordinates. Mechanics: [taskq-manager.md § 2](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq-manager.md#2-arm-the-tick).
 
 **R5. Worker writes completion to the task.** Result SHA, checks, question or blocker go to the task through `taskq result`, `ask` or `problem`. Completion never depends on session UI, chat or transcript.
 
-**R6. Human report.** Per project: heading, Board link, one table Task | Status | Runtime | Session with clickable links, then the owner's open questions. Same table in Claude and Codex; links are built per runtime. No raw JSON to humans; JSON stays inside transport. Generated template: [pm-report-v1.md](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/pm-report-v1.md).
+**R6. Human report.** Per project: heading, Board link, one table Task | Status | Runtime | Session with clickable links, then the owner's open questions. Same table in Claude and Codex; links are built per runtime. No raw JSON to humans; JSON stays inside transport. `taskq tick` prints this report itself.
 
 **R7. Style.** Every role and message follows [gradus-public/caveman](https://gitlab.ufobe.com/gradus-public/caveman/-/tree/62579538f05fb6b69a12449c1ebad9567d1fdecc) pinned at `6257953`. Short. Unknowns stated honestly. TaskQ links the style; it does not redefine it.
 

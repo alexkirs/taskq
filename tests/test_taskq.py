@@ -53,6 +53,33 @@ q.machine_id = machine_id
 # A fixture tick never applies cleanup to the checkout the tests run in (CI's or the person's main).
 REAL_SCHEDULED = cleanup.scheduled
 cleanup.scheduled = lambda args: None
+REAL_LAUNCH = tick.launch
+
+
+def fixture_tick(case):
+    """A fixture tick acts (R4) but never starts a real session or cleans the real checkout: `case.launched` lists the
+    supervisors it would spawn, `case.woken` the turns it would send and its idle cleanup; a class with `real_launch` runs the real `launch` on mocked runtimes."""
+    case.launched, case.woken = [], []
+    case.enterContext(patch.object(tick, 'launch', lambda start, step: REAL_LAUNCH(start, step) if getattr(case, 'real_launch', False)
+                                   else case.launched.extend(f'S{item["iid"]} {item["runtime"]}' for item in start)))
+    case.enterContext(patch.object(q, 'claude_wake', lambda session, prompt, extra=None: case.woken.append((session, prompt))))
+    case.enterContext(patch.object(q, 'cleanup', lambda args: case.woken.append(('cleanup', args.apply))))  # never this checkout
+
+
+def started(case, who, *argv):
+    """The supervisors (`S<N> <runtime>`) one fixture tick starts."""
+    before = len(case.launched)
+    case.do(who, 'tick', *argv)
+    return case.launched[before:]
+
+
+def run_tick(argv):
+    """`q.main`; a tick's exit 1 (judgement) is its normal end here."""
+    try:
+        q.main(argv)
+    except SystemExit as error:
+        if argv[:1] != ['tick'] or error.code != 1:
+            raise
 # `cleanup` stands on a project's worktree tools; its tests run where a folder of them is named.
 HELPERS = os.environ.get('TASKQ_CLEANUP_HELPERS')
 if HELPERS:
@@ -140,8 +167,8 @@ def tick_links(case, issues, commits):
     """#83: tick links every task, each worker session and the reviewed commit; `list --links` adds the URL."""
     iid = case.add('--type', 'code', '--runtime', 'claude')
     case.do(CLAUDE, 'take', iid)
-    row = case.do(COORDINATOR, 'tick').split('## Workers')[1]
-    case.assertIn(f'| {link(iid, issues)} t | doing | claude', row)
+    row = case.do(COORDINATOR, 'tick').split('| Task | Status | Runtime | Session |')[1]
+    case.assertIn(f'| {link(iid, issues)} t | doing (issue 0 min ago) | claude', row)
     case.assertIn('| app session `local_claude-session` |', row)  # no Remote Control record on this machine
     job = q.CLAUDE_JOBS / 'claude-s' / 'state.json'
     job.parent.mkdir(parents=True)
@@ -151,7 +178,7 @@ def tick_links(case, issues, commits):
     review = case.do(COORDINATOR, 'tick')
     case.assertIn(f'## Review {link(iid, issues)}: t', review)
     case.assertIn(f'Commit: [abc1234]({commits}abc1234)', review)
-    case.assertIn(f'| {link(iid, issues)} t | review |', review)
+    case.assertIn(f'| {link(iid, issues)} t | review (', review)
     case.assertNotIn(issues, case.do(COORDINATOR, 'list'))
     case.assertIn(f'{issues}{iid} t', case.do(COORDINATOR, 'list', '--links'))
 
@@ -176,13 +203,12 @@ def fixed_coordinator(case):
             second = case.do(win, 'tick')
         case.assertIn('coordinator is mac', second)
         case.assertEqual((case.state(win_task), case.state(mac_task)), ('ready', 'doing'))  # its own stalled work only
-        case.assertIn(f"--name 'S{pinned} t'", second)  # pinned to win: only win can start it
-        case.assertNotIn(f"--name 'S{free} t'", second)
+        case.assertEqual(case.launched, [f'S{pinned} claude'])  # pinned to win: only win can start it
         case.assertNotIn('## Review', second)
         hostname.return_value = 'mac-1.local'
         first = case.do(COORDINATOR, 'tick')
         case.assertNotIn('coordinator is mac', first)
-        case.assertIn(f"--name 'S{win_task} t'", first)  # shared work, released by win
+        case.assertIn(f'S{win_task} claude', case.launched)  # shared work, released by win
         case.assertIn(f'## Review [#{done}]', first)
 
 
@@ -366,6 +392,7 @@ class Cycle(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
         self.agents = {}  # `claude agents --json --all`, by session id
+        fixture_tick(self)
         self.enterContext(patch.object(q, 'TICK_BEAT', self.directory / 'beat'))  # not the real coordinator's
         self.enterContext(patch.object(q, 'CLAUDE_JOBS', self.directory / 'jobs'))
         for module, target, value in ((q, 'api', self.gitlab), (q, 'claude_agents', lambda **kwargs: self.agents),
@@ -378,7 +405,7 @@ class Cycle(unittest.TestCase):
 
     def do(self, who, *argv):
         with patch.dict(os.environ, who), contextlib.redirect_stdout(io.StringIO()) as out:
-            q.main([str(item) for item in argv])
+            run_tick([str(item) for item in argv])
         return out.getvalue()
 
     def refused(self, who, *argv):
@@ -487,7 +514,7 @@ class Cycle(unittest.TestCase):
 
     def test_question_then_another_runtime_continues_and_tick_guides(self):
         iid = self.add('--type', 'research', '--runtime', 'any')
-        self.assertIn('Start 1 worker', self.do(CLAUDE, 'tick'))
+        self.assertEqual(len(started(self, CLAUDE)), 1)
         self.assertIn(f'take {iid}', self.do(CODEX, 'worker'))
         self.do(CODEX, 'take', iid)
         self.do(CODEX, 'ask', iid, '--text', 'which one?')
@@ -873,7 +900,7 @@ class Cycle(unittest.TestCase):
         self.assertIn('is doing again', self.do(CLAUDE, 'reject', iid, '--text', 'change x'))
         current = q.parse(self.gitlab.issues[iid])
         self.assertEqual((current['state'], current['claim']['session'], current['result']), ('doing', 'claude-session', None))
-        self.assertNotIn('Start 1 worker', self.do(CODEX, 'tick'))
+        self.assertEqual(started(self, CODEX), [])
         self.assertIn('is yours', self.do(CLAUDE, 'take', iid))
         self.do(CLAUDE, 'result', iid, '--text', 'v2', '--checks', 'none')
         self.do(COORDINATOR, 'reject', iid, '--text', 'again')  # a reject from elsewhere still requeues
@@ -916,7 +943,7 @@ class Cycle(unittest.TestCase):
         self.do(CLAUDE, 'take', first)
         second = self.add('--type', 'code')
         self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
-        self.assertNotIn('Start 1 worker', self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
+        self.assertEqual(started(self, CLAUDE, '--limit', 'claude=1,codex=0'), [])
         with patch.object(q.socket, 'gethostname', return_value='another-machine'):
             self.assertIn(f'take {second}', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
         self.assertIn('is yours', self.do(CLAUDE, 'take', second))
@@ -983,14 +1010,14 @@ class Cycle(unittest.TestCase):
         self.assertIn('host is win', self.do(CLAUDE, 'list'))
         self.assertIn('host is win', self.refused(CLAUDE, 'take', win))
         self.assertIn(f'take {anyone}', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
-        self.assertIn(f"--runtime claude --name 'S{anyone} t'", self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
+        self.assertEqual(started(self, CLAUDE, '--limit', 'claude=1,codex=0'), [f'S{anyone} claude'])
         self.do(CLAUDE, 'take', anyone)
         self.assertIn('@mac-1, last change', self.do(CLAUDE, 'list'))
         with patch.object(q, 'HOSTS', {'DESKTOP-7.lan': 'win'}), \
                 patch.object(q.socket, 'gethostname', return_value='DESKTOP-7.lan'):
             self.assertIn('Profile: host=win', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
             # The Mac's doing task does not fill win's one place.
-            self.assertIn(f"--runtime claude --name 'S{win} t'", self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
+            self.assertEqual(started(self, CLAUDE, '--limit', 'claude=1,codex=0'), [f'S{win} claude'])
             self.do({'CLAUDE_CODE_SESSION_ID': 'win-session', 'CODEX_THREAD_ID': ''}, 'take', win)
             self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
         # #39: the public claim names the machine by a hash only; this machine and [hosts] still read it by name.
@@ -1030,10 +1057,10 @@ class Cycle(unittest.TestCase):
             (folder / f'local_{sid}.json').write_text('{}')
         self.add('--type', 'code')
         with patch.object(q, 'CLAUDE_APP_SESSIONS', self.directory):
-            self.assertNotIn('Start 1 worker', self.do(CLAUDE, 'tick', '--limit', 'claude=2,codex=0'))
+            self.assertEqual(started(self, CLAUDE, '--limit', 'claude=2,codex=0'), [])
             self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--limit', 'claude=2,codex=0'))
         with patch.object(q, 'CLAUDE_APP_SESSIONS', self.directory / 'different-machine'):
-            self.assertIn('Start 1 worker', self.do(CLAUDE, 'tick', '--limit', 'claude=2,codex=0'))
+            self.assertEqual(len(started(self, CLAUDE, '--limit', 'claude=2,codex=0')), 1)
 
     def test_two_users_assignees_pool_manual_take_and_ask(self):
         first = self.add('--type', 'code', '--mine', '--area', 'maps')
@@ -1080,21 +1107,22 @@ class Cycle(unittest.TestCase):
             self.assertIn("filter='labels=area-maps'; mine=True; limit=claude=4,codex=0; candidates=0", out)
             self.assertIn('Source: taskq.local.toml: filter, mine, limit.codex; taskq.toml: limit.claude; default: preferred_runtime\n', out)
             # A flag wins for this run only; explicit false, empty and zero override the lower layers.
+            self.launched.clear()
             out = self.do(CLAUDE, 'tick', '--no-mine', '--filter', '', '--limit', 'claude=0')
             self.assertIn("filter=''; mine=False; limit=claude=0,codex=0; candidates=2", out)
             self.assertIn('flag: filter, mine, limit.claude', out)
-            self.assertNotIn('Start', out)
-            out = self.do(CLAUDE, 'tick', '--no-mine', '--limit', 'claude=1')
-            self.assertIn(f"--name 'S{maps} t'", out)
+            self.assertEqual(self.launched, [])
+            self.assertEqual(started(self, CLAUDE, '--no-mine', '--limit', 'claude=1'), [f'S{maps} claude'])
             # #243: the supervisor prompt names its task; the worker it launches adopts that reservation, whatever the profile.
-            self.assertIn(f"taskq supervise {maps}` and follow", out)
+            self.assertIn(f"taskq supervise {maps}` and follow", tick.supervisor_prompt(maps))
             self.assertIn("mine=True", self.do(CLAUDE, 'tick'))
 
     def test_worker_prompt_without_flags_has_none(self):
         self.personal('[profile]\nmine = false\n[profile.limits]\nclaude = 1\n')
         iid = self.add('--type', 'code', '--mine')
-        self.assertIn(f'taskq supervise {iid}` and follow', self.do(CLAUDE, 'tick'))
-        self.assertIn(f'taskq supervise {iid}` and follow', self.do(CLAUDE, 'tick', '--filter', '', '--mine'))
+        self.assertEqual(started(self, CLAUDE), [f'S{iid} claude'])
+        self.assertEqual(started(self, CLAUDE, '--filter', '', '--mine'), [f'S{iid} claude'])
+        self.assertNotIn('--', tick.supervisor_prompt(iid))  # the prompt carries no profile flags
 
     def test_preferences_are_local_and_in_briefs(self):
         self.personal('[profile]\nmine = false\n[profile.limits]\nclaude = 1\ncodex = 0\n')
@@ -1118,7 +1146,7 @@ class Cycle(unittest.TestCase):
             scheduled.assert_not_called()  # #145: another machine's tick releases its own work only
 
     def test_idle_stop_after_empty_ticks_reset_by_work_blocked_by_ask(self):
-        idle = 'Idle 5 ticks: run `taskq cleanup --apply`, report'
+        idle = 'Idle 5 ticks: ran `taskq cleanup --apply`; report'
         for _ in range(4):
             self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))
         self.assertIn(idle, self.do(COORDINATOR, 'tick'))
@@ -1135,7 +1163,8 @@ class Cycle(unittest.TestCase):
         self.personal('[idle]\nstop = 2\ncleanup = false\n')
         self.do(COORDINATOR, 'tick')
         out = self.do(COORDINATOR, 'tick')
-        self.assertIn('Idle 2 ticks: report', out)
+        self.assertIn('Idle 2 ticks:; report', out)
+        self.assertEqual(self.woken, [('cleanup', True)])  # only the first idle stop cleaned
         self.personal('[idle]\nstop = 0\n')
         for _ in range(6):
             self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))
@@ -1157,12 +1186,11 @@ class Cycle(unittest.TestCase):
         self.personal('[profile]\npreferred_runtime = "claude"\n[profile.limits]\nclaude = 1\ncodex = 3\n')
         pool = self.add('--type', 'code', '--runtime', 'any')
         own = self.add('--type', 'code', '--runtime', 'any', '--mine')
-        out = self.do(CLAUDE, 'tick')
-        self.assertIn('preferred_runtime=claude', out)
-        self.assertIn(f"--runtime claude --name 'S{own} t'", out)
-        self.assertIn(f"--runtime codex --name 'S{pool} t'", out)  # the pool keeps the scheduler's choice
+        self.assertIn('preferred_runtime=claude', self.do(CLAUDE, 'tick'))
+        self.assertIn(f'S{own} claude', self.launched)
+        self.assertIn(f'S{pool} codex', self.launched)  # the pool keeps the scheduler's choice
         self.personal('[profile]\npreferred_runtime = "claude"\n[profile.limits]\nclaude = 0\n')
-        self.assertIn(f"--runtime codex --name 'S{own} t'", self.do(CLAUDE, 'tick'))  # no slot: falls back
+        self.assertIn(f'S{own} codex', started(self, CLAUDE))  # no slot: falls back
 
     def test_profile_init_writes_once_and_init_ignores_the_file_once(self):
         gitignore = q.LOCAL.with_name('.gitignore')
@@ -1232,13 +1260,13 @@ class Cycle(unittest.TestCase):
             self.do(CODEX, 'take', self.add('--type', 'asset'))
         claude = self.add('--type', 'code')
         self.assertIn(f'take {claude}', self.do(CLAUDE, 'worker'))
-        self.assertIn(f"--runtime claude --name 'S{claude} t'", self.do(CLAUDE, 'tick'))
+        self.assertEqual(started(self, CLAUDE), [f'S{claude} claude'])
         self.do(CLAUDE, 'take', claude)
 
     def test_runtime_pins_who_may_take_a_task(self):
         pinned = self.add('--type', 'research', '--runtime', 'codex')
         self.assertIn('codex  t', self.do(CLAUDE, 'list'))
-        self.assertIn(f"--runtime codex --name 'S{pinned} t'", self.do(CLAUDE, 'tick'))
+        self.assertEqual(started(self, CLAUDE), [f'S{pinned} codex'])
         self.assertIn('No task can start', self.do(CLAUDE, 'worker'))
         self.assertIn('runtime is codex', self.refused(CLAUDE, 'take', pinned))
         anyone = self.add('--type', 'research')
@@ -1271,7 +1299,7 @@ class Cycle(unittest.TestCase):
         with patch.object(q, 'STALE_MINUTES', -1):
             output = self.do(COORDINATOR, 'tick')
         self.assertNotIn('Released', output)
-        self.assertNotIn('## Claude idle', output)
+        self.assertEqual(self.woken, [])  # no nudge
         self.assertEqual(self.state(claude), 'doing')
         agent['state'] = 'working'
         output = self.do(COORDINATOR, 'tick')
@@ -1289,24 +1317,18 @@ class Cycle(unittest.TestCase):
         self.do(CODEX, 'take', codex)
         agent = {'id': 'claudese', 'sessionId': 'claude-session', 'pid': 3, 'status': 'busy'}
         self.agents, self.codex.status = {'claude-session': agent}, 'active'
+        sent = []
+        self.enterContext(patch.object(q, 'codex_send', lambda args: sent.append(args.thread)))
         with patch.object(q, 'STALE_MINUTES', -1):
             output = self.do(COORDINATOR, 'tick')
         self.assertNotIn('Released', output)
-        self.assertNotIn('## Claude idle', output)
-        self.assertNotIn('## Codex idle', output)
+        self.assertEqual((self.woken, sent), ([], []))
         agent['status'], self.codex.status = 'idle', 'idle'
         self.codex.turns = [{'id': 'finished', 'status': 'completed'}]
-        with patch.object(q, 'STALE_MINUTES', -1):
+        with patch.object(q, 'STALE_MINUTES', -1), contextlib.redirect_stderr(io.StringIO()):
             output = self.do(COORDINATOR, 'tick')
         self.assertNotIn('Released', output)
-        self.assertIn('## Claude idle', output)
-        self.assertIn(f'- {link(claude)}: `claude --bg --resume claude-session "{tick.NUDGE}"`', output)
-        self.assertIn('## Codex idle', output)
-        woken, sent = [], []
-        with patch.object(q, 'claude_wake', lambda session, prompt: woken.append((session, prompt))), \
-                patch.object(q, 'codex_send', lambda args: sent.append(args.thread)), contextlib.redirect_stderr(io.StringIO()):
-            self.do(COORDINATOR, 'tick', '--act')
-        self.assertEqual((woken, sent), ([('claude-session', tick.NUDGE)], ['codex-session']))
+        self.assertEqual((self.woken, sent), ([('claude-session', tick.NUDGE)], ['codex-session']))
         del agent['pid']
         agent['state'] = 'stopped'  # #176: no pid is dead only in a terminal CLI state
         self.codex.status = 'systemError'
@@ -1315,33 +1337,36 @@ class Cycle(unittest.TestCase):
         self.assertIn(f'Released dead {link(codex)}', output)
         self.assertEqual((self.state(claude), self.state(codex)), ('ready', 'ready'))
 
-    def test_tick_archives_codex_workers_no_open_task_holds_and_retries_one_the_app_holds(self):
-        """#165: a worker thread of a closed task, or of one answered and continued by a new session, is archived by
-        every pass; one the app holds is kept and archived by a later pass. The open task's own worker, a busy or
-        young thread, another checkout's and the owner's own threads stay."""
+    def test_tick_retires_sessions_of_closed_tasks_and_retries_one_the_app_holds(self):
+        """R11, the one retire step: every pass stops or archives this checkout's idle `T<N>`/`S<N>` sessions whose task
+        N is closed; a thread the app holds is kept and archived by a later pass. An open task's sessions, a busy one,
+        another checkout's and the owner's own stay."""
         iid = self.add('--type', 'asset')
         self.do(CODEX, 'take', iid)
-        def thread(sid, name, status='notLoaded', age=3600, cwd=str(q.ROOT)):
-            return {'id': sid, 'name': name, 'cwd': cwd, 'status': {'type': status}, 'updatedAt': time.time() - age}
-        self.codex.listed = [thread('codex-session', f'T{iid} t (mac)'), thread('answered', f'T{iid} t (mac)'),
-                             thread('held', 'T9 x (mac)'), thread('young', 'T9 x', age=60), thread('busy', 'T9 x', 'active'),
+        def thread(sid, name, status='notLoaded', cwd=str(q.ROOT)):
+            return {'id': sid, 'name': name, 'cwd': cwd, 'status': {'type': status}, 'updatedAt': time.time()}
+        self.codex.listed = [thread('codex-session', f'T{iid} t (mac)'), thread('supervisor', f'S{iid} t (mac)'),
+                             thread('held', 'T9 x (mac)'), thread('closed', 'S9 x'), thread('busy', 'T9 x', 'active'),
                              thread('elsewhere', 'T9 x', cwd='/elsewhere'), thread('mine', 'my chat')]
-        archived, held = [], {'held'}
+        job = lambda name, **extra: {'id': name[:2], 'sessionId': name, 'name': name, 'cwd': str(q.ROOT), 'state': 'idle', **extra}
+        self.agents = {name: job(name) for name in (f'S{iid} t', 'S9 x', 'chat')}
+        self.agents['T9 y'] = job('T9 y', state='working')
+        archived, stopped, held = [], [], {'held'}
         def archive(args):
             if args.thread in held:
                 held.discard(args.thread)
-                core_error = 'Codex thread held is held open by the Codex app, which lets it go 3 h after it leaves the window'
-                raise SystemExit(core_error)
+                raise SystemExit('Codex thread held is held open by the Codex app, which lets it go 3 h after it leaves the window')
             archived.append(args.thread)
             self.codex.listed = [item for item in self.codex.listed if item['id'] != args.thread]
         with patch.object(q, 'codex_archive', archive), patch.object(q, 'CODEX_SOCKET', q.ROOT), \
+                patch.object(q, 'claude_stop', lambda session, remove=False: stopped.append((session, remove))), \
                 contextlib.redirect_stderr(io.StringIO()) as log:
             self.do(COORDINATOR, 'tick')
-            self.assertEqual(archived, ['answered'])
-            self.assertIn('Kept held (T9 x (mac)) for a later pass: Codex thread held is held open by the Codex app', log.getvalue())
-            self.do(COORDINATOR, 'tick', '--act')
-        self.assertEqual(archived, ['answered', 'held'])
-        self.assertIn('Archived held (T9 x (mac)): no open task holds it.', log.getvalue())
+            self.assertEqual((archived, stopped), (['closed'], [('S9 x', True)]))
+            self.assertIn('Kept held of closed #9 for a later pass: Codex thread held is held open by the Codex app', log.getvalue())
+            self.do(COORDINATOR, 'tick')
+        self.assertEqual(archived, ['closed', 'held'])
+        self.assertIn('Retired held: #9 is closed.', log.getvalue())
 
     def test_codex_archive_of_a_thread_the_app_holds_asks_the_thread_to_archive_itself_in_the_app(self):
         """#165: the shared server refuses (the app holds the writer lock); a read-only turn through the app window
@@ -1705,8 +1730,8 @@ class Cycle(unittest.TestCase):
         iid = self.add('--type', 'research', '--runtime', 'claude')
         self.do(CLAUDE, 'take', iid)
         self.agents = {'claude-session': {'id': 'claudese', 'sessionId': 'claude-session', 'pid': 3}}
-        listed = self.do(COORDINATOR, 'tick').split('## Workers')[1]
-        self.assertIn(f'| {link(iid)} t | doing | claude @mac-1 | `claude attach claudese` | running, issue 0 min ago |', listed)
+        listed = self.do(COORDINATOR, 'tick').split('| Task | Status | Runtime | Session |')[1]
+        self.assertIn(f'| {link(iid)} t | doing (running, issue 0 min ago) | claude @mac-1 | `claude attach claudese` |', listed)
         self.do(CLAUDE, 'result', iid, '--checks', 'c', '--text', 'done')
         runs, patched = self.run_recorded()
         with patched:
@@ -1764,81 +1789,64 @@ class Cycle(unittest.TestCase):
                       'approvalPolicy: on-request', output)
         self.assertNotIn('last turn sandbox: {"type": "danger-full-access"}', output)
 
-    def test_tick_codex_idle_requires_intervention_and_later_archive(self):
+    def test_tick_nudges_an_idle_codex_worker_only_while_doing(self):
         iid = self.add('--type', 'asset')
         self.do(CODEX, 'take', iid)
+        sent = []
+        self.enterContext(patch.object(q, 'codex_send', lambda args: sent.append(args.thread)))
+        self.enterContext(contextlib.redirect_stderr(io.StringIO()))
         self.codex.turns = [{'id': 'finished', 'status': 'completed'}]
         output = self.do(CLAUDE, 'tick')
-        self.assertIn('## Codex idle', output)
-        self.assertIn(f'| {link(iid)} t | doing | codex @mac-1 | [session](https://alexkirs.github.io/taskq/open.html#codex://threads/codex-session) | idle, last event unknown', output)
-        self.assertIn('codex-send codex-session', output)
+        self.assertEqual(sent, ['codex-session'])  # doing without result or ask, its turn ended: one fixed nudge
+        self.assertIn(f'| {link(iid)} t | doing (idle, last event unknown', output)
+        self.assertIn('| codex @mac-1 | [session](https://alexkirs.github.io/taskq/open.html#codex://threads/codex-session) |', output)
         self.codex.status = 'active'
-        self.assertNotIn('## Codex idle', self.do(CLAUDE, 'tick'))
+        self.do(CLAUDE, 'tick')
         # The app holds the session: the shared server says notLoaded while the app runs the turn.
         self.codex.status, self.codex.turns = 'notLoaded', [{'id': 'app', 'status': 'interrupted'}]
         self.app_rollout({'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'app'}})
-        output = self.do(CLAUDE, 'tick')
-        self.assertIn('notLoaded (turn running in the app)', output)
-        self.assertNotIn('## Codex idle', output)
+        self.assertIn('notLoaded (turn running in the app)', self.do(CLAUDE, 'tick'))
         self.codex.turns, self.codex.path = [], None
         self.do(CODEX, 'ask', iid, '--text', 'owner screen?')
-        output = self.do(CLAUDE, 'tick')
-        self.assertNotIn('## Codex idle', output)
-        self.assertIn('codex-archive codex-session', output)
-        # Deferred Codex tasks also get cleanup reminders, without forwarding a question to the owner.
-        current = q.parse(self.gitlab.issues[iid])
-        q.save(current, 'later', waiting_for='triage')
-        output = self.do(CLAUDE, 'tick')
-        self.assertIn('codex-archive codex-session', output)
-        self.assertNotIn('Waiting for the owner', output)
-        self.codex.path = '/h/.codex/archived_sessions/rollout.jsonl'  # #127: archived, no longer listed
-        self.assertNotIn('codex-archive codex-session', self.do(CLAUDE, 'tick'))
+        self.do(CLAUDE, 'tick')
+        self.assertEqual(sent, ['codex-session'])  # busy, then in ask: no second nudge
 
     def test_tick_codex_unavailable_does_not_stop_other_coordinator_work(self):
         self.do(CODEX, 'take', self.add('--type', 'asset'))
-        self.add('--type', 'code')
+        code = self.add('--type', 'code')
         with patch.object(q, 'Codex', side_effect=OSError('socket unavailable')):
             output = self.do(CLAUDE, 'tick')
         self.assertIn('status unknown: socket unavailable', output)
-        self.assertIn('Start 1 worker', output)
-        self.assertNotIn('## Codex idle', output)
+        self.assertEqual(self.launched, [f'S{code} claude'])
 
-    def test_json_tick_report_and_failure_outcomes(self):
+    def test_json_tick_outcomes(self):
         self.personal('[idle]\nstop = 0\n')
-        idle = json.loads(self.do(COORDINATOR, 'tick', '--json', '--act'))
+        idle = json.loads(self.do(COORDINATOR, 'tick', '--json'))
         self.assertEqual(idle['outcome'], 'ok')
+        self.assertIn('| Task | Status | Runtime | Session |', idle['text'])
         import errno
         lock_api = 'msvcrt.locking' if os.name == 'nt' else 'fcntl.flock'
         with patch(lock_api, side_effect=OSError(errno.EACCES, 'held')), contextlib.redirect_stderr(io.StringIO()):
-            overlap = json.loads(self.do(COORDINATOR, 'tick', '--json', '--act'))
-        self.assertEqual(overlap['refusals'], ['another tick pass is running'])
-        self.assertEqual(overlap['actions'][0]['status'], 'refused')
+            overlap = json.loads(self.do(COORDINATOR, 'tick', '--json', '--act'))  # --act: the senders' old form
+        self.assertEqual(overlap['outcome'], 'refused')
         iid = self.add('--type', 'research')
-        proposed = json.loads(self.do(COORDINATOR, 'tick', '--json'))
-        self.assertEqual(proposed['tasks'][0]['id'], iid)
-        self.assertEqual(proposed['actions'][0]['status'], 'proposed')
-        with patch.object(q, 'spawn', side_effect=OSError('spawn unavailable')), \
-                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as caught:
-                q.main(['tick', '--act', '--json'])
-        self.assertEqual(caught.exception.code, 2)
-        failed = json.loads(out.getvalue())
-        self.assertEqual(failed['outcome'], 'failure')
-        self.assertEqual(failed['actions'][0]['task'], iid)
-        self.assertIn('spawn unavailable', failed['actions'][0]['reason'])
+        self.enterContext(patch.object(tick, 'launch', REAL_LAUNCH))
+        with patch.object(q, 'spawn', side_effect=OSError('spawn unavailable')), contextlib.redirect_stderr(io.StringIO()):
+            failed = json.loads(self.do(COORDINATOR, 'tick', '--json'))
+        self.assertEqual((failed['outcome'], failed['tasks'][0]['id']), ('judgement_needed', iid))
+        self.assertIn(f'spawn a claude supervisor for {link(iid)}: spawn unavailable', failed['refusals'])
         with patch.object(q, 'spawn', return_value='new-session'), contextlib.redirect_stderr(io.StringIO()):
-            spawned = json.loads(self.do(COORDINATOR, 'tick', '--act', '--json'))
+            spawned = json.loads(self.do(COORDINATOR, 'tick', '--json'))
         self.assertEqual(spawned['outcome'], 'ok')
-        self.assertEqual(spawned['actions'][0]['session'], 'new-session')
         self.do(CLAUDE, 'take', iid)
         self.do(CLAUDE, 'ask', iid, '--text', 'Which option?')
         with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as caught:
-            q.main(['tick', '--act', '--json'])
+            q.main(['tick', '--json'])
         self.assertEqual(caught.exception.code, 1)
         asked = json.loads(out.getvalue())
         self.assertEqual(asked['outcome'], 'judgement_needed')
         self.assertIn(f'ask {iid}', asked['refusals'])
-        self.assertIn('claude-session', asked['sessions'])
+        self.assertIn('Which option?', asked['text'])
         report = json.loads(self.do(CLAUDE, 'report', '--json'))
         self.assertEqual(report['outcome'], 'ok')
         self.assertIn(iid, report['tasks'])
@@ -1850,26 +1858,28 @@ class Cycle(unittest.TestCase):
         self.assertEqual(caught.exception.code, 2)
         self.assertEqual(json.loads(out.getvalue())['refusals'], ['tracker unavailable'])
 
-    def test_tick_act_does_the_mechanical_steps_and_exits_1_only_for_judgement(self):
-        """#42/#191: report every pass; exit 1/wake only for judgement; mechanical work stays once per pass."""
-        def act(*flags):
-            with contextlib.redirect_stderr(io.StringIO()) as log:
+    def test_tick_does_the_mechanical_steps_and_exits_1_only_for_judgement(self):
+        """R4: one mode. The R6 report every pass; exit 1 only for judgement; mechanical work stays once per pass."""
+        def act():
+            with contextlib.redirect_stderr(io.StringIO()) as log, contextlib.redirect_stdout(io.StringIO()) as out:
                 try:
-                    return self.do(COORDINATOR, 'tick', '--act', *flags), 0, log.getvalue()
+                    with patch.dict(os.environ, COORDINATOR):
+                        q.main(['tick'])
+                    return out.getvalue(), 0, log.getvalue()
                 except SystemExit as exit:
-                    return '', exit.code, log.getvalue()
-        spawned, sent, woken = [], [], []
+                    return out.getvalue(), exit.code, log.getvalue()
+        spawned, sent = [], []
+        self.enterContext(patch.object(tick, 'launch', REAL_LAUNCH))
         self.enterContext(patch.object(q, 'spawn', lambda args: spawned.append(args.name)))
         self.enterContext(patch.object(q, 'codex_send', lambda args: sent.append(args.thread)))
-        self.enterContext(patch.object(q, 'claude_wake', lambda session, prompt: woken.append((session, prompt))))
         output, status, log = act()
         self.assertEqual((status, log), (0, ''))
-        self.assertEqual(output.count('## Workers'), 1)
-        self.assertIn('Workers: none', output)
+        self.assertEqual(output.count('| Task | Status | Runtime | Session |'), 1)
+        self.assertIn('Board: ', output)
+        self.assertIn('| none | | | |', output)
         code, idle = self.add('--type', 'code', '--runtime', 'claude'), self.add('--type', 'asset')
         output, status, log = act()
         self.assertEqual(status, 0)
-        self.assertEqual(output.count('## Workers'), 1)
         self.assertEqual(spawned, [f'S{code} t', f'S{idle} t'])  # #243: a supervisor per task
         self.assertIn('Done: spawn a claude supervisor for', log)
         self.do(CLAUDE, 'take', code)
@@ -1877,23 +1887,21 @@ class Cycle(unittest.TestCase):
         self.codex.turns = [{'id': 'finished', 'status': 'completed'}]
         output, status, _ = act()
         self.assertEqual(status, 0)
-        self.assertEqual(output.count('## Workers'), 1)
+        self.assertEqual(output.count('| Task | Status | Runtime | Session |'), 1)
         self.assertEqual(sent, ['codex-session'])  # the fixed idle nudge, no coordinator turn
         # A review needs judgement and exits 1.
         self.do(CLAUDE, 'result', code, '--sha', 'abc1234', '--text', 'x', '--checks', 'x')
-        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as exit, patch.dict(os.environ, COORDINATOR):
-                q.main(['tick', '--act'])
-        self.assertEqual(exit.exception.code, 1)
-        self.assertIn(f'## Review {link(code)}', out.getvalue())
-        # A worker of a task closed by hand: retired by the next --act.
-        self.agents = {'claude-session': {'id': 'claudese', 'sessionId': 'claude-session', 'pid': 3}}
+        output, status, _ = act()
+        self.assertEqual(status, 1)
+        self.assertIn(f'## Review {link(code)}', output)
+        # A supervisor of a task closed by hand: retired by the next pass (R11).
+        self.agents = {'s': {'id': 'claudese', 'sessionId': 's', 'name': f'S{code} t (mac-1)', 'cwd': str(q.ROOT), 'pid': 3, 'status': 'idle'}}
         self.gitlab.issues[code]['state'] = 'closed'
         runs, patched = self.run_recorded()
         with patched:
             log = act()[2]
         self.assertIn(['claude', 'rm', 'claudese'], runs)
-        self.assertIn('Retired claude-session', log)
+        self.assertIn(f'Retired s: #{code} is closed.', log)
 
 
 class GithubRest:
@@ -2116,13 +2124,14 @@ class GithubCycle(unittest.TestCase):
         self.enterContext(patch.object(worker, 'claude_agents', lambda **kwargs: {}))
         self.enterContext(patch.object(q, 'TICK_BEAT', Path(directory.name) / 'beat'))
         self.enterContext(patch.object(q, 'CODEX_SOCKET', Path(directory.name) / 'no-codex.sock'))  # never the live app server
+        fixture_tick(self)
 
     def test_tick_links_tasks_sessions_and_commits(self):
         tick_links(self, GH, 'https://github.com/owner/x/commit/')
 
     def do(self, who, *argv):
         with patch.dict(os.environ, who), contextlib.redirect_stdout(io.StringIO()) as out:
-            q.main([str(item) for item in argv])
+            run_tick([str(item) for item in argv])
         return out.getvalue()
 
     def add(self, *extra):
@@ -2148,7 +2157,7 @@ class GithubCycle(unittest.TestCase):
         number = self.add('--type', 'research', '--mine', '--milestone', 'Maps', '--area', 'maps')
         issue = self.github.issues[number]
         self.assertEqual(([each['login'] for each in issue['assignees']], issue['milestone']['number']), (['alice'], 5))
-        self.assertIn('Start 1 worker', self.do(CLAUDE, 'tick'))
+        self.assertEqual(started(self, CLAUDE), [f'S{number} claude'])
         self.assertIn(f'take {number}', self.do(CLAUDE, 'worker'))
         self.do(CLAUDE, 'take', number)
         self.assertEqual(self.state(number), 'doing')
@@ -2346,25 +2355,18 @@ class GithubCycle(unittest.TestCase):
         self.do(CLAUDE, 'close', number, '--text', 'ok')
         self.assertEqual(self.github.column(number), 'archived')
 
-    def test_owner_card_moves_are_executed_or_put_back(self):
+    def test_owner_card_moves_are_put_back(self):
+        """The board is a one-way copy of the labels: a card moved by hand goes back; owner moves are commands."""
         self.do(CLAUDE, 'init')
-        deferred, restored, started = self.add('--type', 'research'), self.add('--type', 'research'), self.add('--type', 'research')
-        self.do(CLAUDE, 'later', restored, '--text', 'not now')
-        self.do(CLAUDE, 'take', started)
+        deferred, taken = self.add('--type', 'research'), self.add('--type', 'research')
+        self.do(CLAUDE, 'take', taken)
         self.github.move(deferred, 'later')
-        self.github.move(restored, 'ready')
-        self.github.move(started, 'review')
+        self.github.move(taken, 'review')
         out = self.do(CLAUDE, 'tick')
         self.assertIn('Board: project-url/1', out)
-        self.assertEqual((self.state(deferred), self.state(restored), self.state(started)), ('later', 'ready', 'doing'))
-        self.assertIn(f'Board move of {link(deferred, GH)} executed: ready → later', out)
-        self.assertTrue(any(item['body'] == '**later** · claude:claude-s\n\nmoved on the board' for item in self.github.comments.values()))
-        self.assertIn(f'## Board mismatch', out)
-        self.assertIn(f'{link(started, GH)} was moved on the board from doing to review: put back to doing', out)
-        self.assertEqual(self.github.column(started), 'doing')
-        self.github.move(started, 'ready')
-        self.assertIn(f'`taskq release {started}', self.do(CLAUDE, 'tick'))
-        self.assertEqual(self.github.column(started), 'doing')
+        self.assertEqual((self.state(deferred), self.state(taken)), ('ready', 'doing'))
+        self.assertIn(f'Board card of {link(deferred, GH)} put back to ready', out)
+        self.assertEqual((self.github.column(deferred), self.github.column(taken)), ('ready', 'doing'))
 
     def test_tick_archives_the_card_of_an_issue_closed_by_hand(self):
         self.do(CLAUDE, 'init')
@@ -2417,7 +2419,7 @@ class GithubCycle(unittest.TestCase):
         self.assertIn(f'Board card of #{number} put back to ready', out)
         self.assertNotIn(f'Board move of {link(number, GH)}', out)
         self.assertEqual((self.state(number), self.github.column(number)), ('ready', 'ready'))
-        self.assertIn(f'Board move of {link(moved, GH)} executed: later → ready', out)
+        self.assertEqual((self.state(moved), self.github.column(moved)), ('later', 'later'))  # put back, not executed
         self.assertIn(f'Board card of #{created} added in ready', out)
         self.assertEqual(self.github.column(created), 'ready')
 
@@ -2546,7 +2548,7 @@ class Selftest(unittest.TestCase):
         self.assertFalse(runs)
         with patch.object(q.subprocess, 'run', run), patch.object(worker, 'claude_stop', lambda session, remove=False: None):
             with self.assertRaises(SystemExit) as caught:
-                q.claude_wake('w1-session', 'Run the brief')
+                worker.claude_wake('w1-session', 'Run the brief')  # q.claude_wake is the fixture's
         self.assertIn('the job w2 failed at once', str(caught.exception))
         self.assertEqual(runs, [['claude', '--bg', '--resume', 'w1-session', 'Run the brief']])
 
@@ -3110,21 +3112,21 @@ class TickBeat(unittest.TestCase):
                 patch.object(q, 'cleanup') as cleanup:
             tick.idle_ticks().write_text('0\n')
             failed = []
-            result = tick.idle_stop(True, lambda what, action: action(), failed)
+            result = tick.idle_stop(failed)
             self.assertIn('ran `taskq cleanup --apply`', result)
             self.assertFalse(tick.idle_ticks().exists())
-            cleanup.assert_called_once_with(argparse.Namespace(apply=True, trigger='idle'))
+            cleanup.assert_called_once_with(argparse.Namespace(apply=True))
             self.assertEqual(failed, [])
 
     def test_windows_tick_imports_and_locks_without_fcntl(self):
         import importlib
         import errno
-        args = SimpleNamespace(install_timer=False, uninstall_timer=False, act=False)
+        args = SimpleNamespace()
         windows = SimpleNamespace(LK_NBLCK=1, locking=unittest.mock.Mock())
         with patch.dict(sys.modules, {'fcntl': None, 'msvcrt': windows}):
             importlib.reload(tick)
             with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / 'beat'), \
-                    patch.object(tick, 'os', SimpleNamespace(name='nt')), patch.object(tick, 'tick_pass') as run:
+                    patch.object(tick, 'os', SimpleNamespace(name='nt')), patch.object(tick, 'queue_pass', return_value=[]) as run:
                 tick.tick(args)
                 windows.locking.assert_called_once_with(unittest.mock.ANY, windows.LK_NBLCK, 1)
                 run.assert_called_once_with(args)
@@ -3139,9 +3141,9 @@ class TickBeat(unittest.TestCase):
                     tick.tick(args)
 
     def test_overlapping_ticks_skip_and_crashed_holder_releases_lock(self):
-        args = SimpleNamespace(install_timer=False, uninstall_timer=False, act=False)
+        args = SimpleNamespace()
         with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / 'beat'), \
-                patch.object(tick, 'tick_pass') as run, patch.object(tick, 'act') as act:
+                patch.object(tick, 'queue_pass', return_value=[]) as run:
             lock = Path(tmp) / 'taskq-tick.lock'
             child = subprocess.Popen([sys.executable, '-c',
                 "import os, sys; f = open(sys.argv[1], 'a+b'); "
@@ -3153,20 +3155,14 @@ class TickBeat(unittest.TestCase):
                 self.assertEqual(child.stdout.readline().strip(), 'locked')
                 with contextlib.redirect_stderr(io.StringIO()) as output:
                     q.tick(args)
-                    args.act = True
-                    q.tick(args)
                 run.assert_not_called()
-                act.assert_not_called()
-                self.assertEqual(output.getvalue().count('another tick pass is running'), 2)
+                self.assertEqual(output.getvalue().count('another tick pass is running'), 1)
             finally:
                 child.kill()
                 child.wait(timeout=5)
                 child.stdin.close()
                 child.stdout.close()
             self.assertTrue(lock.exists())
-            q.tick(args)
-            act.assert_called_once_with(args)
-            args.act = False
             q.tick(args)
             run.assert_called_once_with(args)
 

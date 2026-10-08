@@ -1,11 +1,9 @@
-"""`tick`: the coordinator's pass over the queue, board moves, the Workers table, the beat stamp."""
+"""`tick`: the coordinator's pass over the queue, its mechanical steps and the R6 report."""
 import argparse
-from datetime import datetime, timezone
 import contextlib
 import errno
 import hashlib
 import io
-import json
 import os
 from pathlib import Path
 import re
@@ -54,9 +52,8 @@ def contract_news():
 
 
 def question(iid):
-    """The latest question of an `ask` task, when `tick` last showed it (None: not yet) and the trusted notes it was
-    read from, newest first (#223: the pending line is made from that same read, so the text shown and the revision
-    named are one note). The newest page is enough: while a task waits in ask, only `shown` notes follow its question."""
+    """The latest question of an `ask` task and when `tick` last showed it (None: not yet). The newest page is
+    enough: while a task waits in ask, only `shown` notes follow its question."""
     shown, text = None, 'no question note'
     notes = core.collaborators(core.api('GET', f'issues/{iid}/notes?sort=desc&per_page=100&activity_filter=only_comments'))
     for item in notes:
@@ -65,217 +62,37 @@ def question(iid):
         elif item['body'].startswith('**ask**'):
             text = item['body'].split('\n\n', 1)[-1]
             break
-    return text, shown, notes
+    return text, shown
 
 
-def revision(item, notes=None):
-    """#223: the revision of a pending item: `<kind> <note id>` of the newest trusted note that put it where it is (the
-    claim session's `result` for review, anyone's `ask` as `question` reads it, the claim session's `result`, `ask` or
-    `problem` for doing), then the result block itself (`sha` and `checks`). The block is always part of it: a PUT that
-    landed with a new `checks` and the same SHA while its note failed is a new revision with the old note.
-    The note's body is kept on the item (`_note`): what the coordinator reads is the note the revision names, from
-    the same read, never a second read that a newer note could have reached in between. `notes`: trusted notes already
-    read for this item, newest first (`question` passes its page), instead of a read of their own."""
+def handed_in(item, kinds):
+    """The newest trusted note of the claim session among `kinds`: what the worker handed in, or None."""
     claim = item['claim'] or {}
     who = f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]}'
-    heads = {'review': [f'**result** · {who}'], 'ask': ['**ask**'],
-             'doing': [f'**{kind}** · {who}' for kind in ('result', 'ask', 'problem')]}.get(item['state'], [])
-    block = json.dumps(item.get('result'), sort_keys=True)
-    item['_note'] = 'none'
-    for note in (notes if notes is not None else reversed(core.comments(item['iid']))):
-        head = note['body'].split('\n', 1)[0]
-        if any(head.startswith(found) for found in heads):
-            item['_note'] = note['body']
-            return f'{head[2:].split("**", 1)[0]} {note["id"]} {block}'
-    return f'block {block}'
-
-
-def pending(item, notes=None):
-    """#223: the pending tuple of an item as one line: state, task, claim and revision, read once per item and kept
-    (`_pending`) with the note it names. The wake key hashes these lines; the item is re-read against its line
-    immediately before the send."""
-    if '_pending' not in item:
-        claim = item['claim'] or {}
-        item['_pending'] = f'{item["state"]} {item["iid"]} {claim.get("runtime")}:{claim.get("session")} {revision(item, notes)}'
-    return item['_pending']
-
-
-def still_pending(item, line):
-    """A fresh read of the issue and its trusted notes gives the same pending line: state, claim, the note the
-    revision names and the result block unchanged; any later result, ask or problem note or block write is a new line.
-    A gone line means resolved or superseded, never that the coordinator received or applied the earlier wake."""
-    issue = core.api('GET', f'issues/{item["iid"]}')
-    fresh = core.parse(issue) if issue['state'] == 'opened' else None
-    return bool(fresh) and pending(fresh) == line
-
-
-REPORT_VERSION = 1
-REPORT_SHA256 = 'a97cc42337da74014530a25091802dc3567f65d644426db93d2bd50079b82ff1'
-REPORT_SOURCE = 'https://github.com/alexkirs/taskq/wiki/Home/05cf6aab1c6ed5fc9589b9e4673365cec34c58e6#versioned-pm-tick-report-contract-191'
-
-
-def report_contract():
-    template = (core.CONTRACTS / 'pm-report-v1.md').read_bytes()
-    if hashlib.sha256(template).hexdigest() != REPORT_SHA256:
-        raise ValueError('PM report template hash mismatch; restore/update the package before publishing a report')
-    return {'version': REPORT_VERSION, 'sha256': REPORT_SHA256,
-            'source': REPORT_SOURCE, 'template': template.decode()}
-
-
-def report_bootstrap():
-    contract = report_contract()
-    print(f'PM report contract v{contract["version"]} sha256:{contract["sha256"]}\nSource: {contract["source"]}\n'
-          + contract['template'] + '\nReceived/applied: unknown until a supported-channel report is verified; '
-          'checkout markers and sends are not receipts.')
+    return next((note['body'] for note in reversed(core.comments(item['iid']))
+                 if note['body'].startswith(tuple(f'**{kind}** · {who}' for kind in kinds))), None)
 
 
 def listed(item):
-    """A row of the Workers table: a task with a worker's state, or with a supervisor (#243: its slot is taken)."""
+    """A row of the R6 table: a task with a worker's state, or with a supervisor (#243: its slot is taken)."""
     return item['state'] in ('doing', 'ask', 'review') or bool(item.get('supervisor'))
 
 
-def report_row(item, agents):
-    """One Workers row; the same columns on every runtime, the session links built per runtime (`session_link`):
-    the worker's, then its supervisor's (#243)."""
+def report_row(item, agents, activity):
+    """One row of the R6 table: the same columns on every runtime, the session links built per runtime
+    (`session_link`): the worker's, then its supervisor's (#243)."""
     claim, found = item['claim'] or {}, item.get('supervisor') or {}
-    activity = item.get('_report_activity', 'unknown')
-    sha = (item.get('result') or {}).get('sha')
     links = ([session_link(claim, agents.get(claim['session']))] if claim.get('session') else []) + (
         ['supervisor ' + session_link(found, agents.get(found['session']))] if found else [])
-    return {'task': core.ref(item), 'title': ' '.join(item['title'].replace('|', '/').split()), 'state': item['state'],
-            'runtime': claim.get('runtime') or found.get('runtime') or 'unknown', 'machine': core.where(claim).strip().lstrip('@') or 'unknown',
-            'session': ' · '.join(links) or 'unavailable', 'last_activity': activity,
-            'event_at': item.get('updated_at') or 'unknown',
-            'commit': f'[{sha}]({core.commit_url(item, sha)})' if sha and item.get('web_url') else 'unavailable'}
+    runtime = claim.get('runtime') or found.get('runtime') or 'unknown'
+    title = ' '.join(item['title'].replace('|', '/').split())
+    return f'| {core.ref(item)} {title} | {item["state"]} ({activity}) | {runtime}{core.where(claim)} | {" · ".join(links) or "unavailable"} |'
 
 
-def render_report(report):
-    contract = report['contract']
-    lines = [f'PM report v{contract["version"]} sha256:{contract["sha256"]}',
-             f'Source: {contract["source"]}', f'Repository: {report["repository"]}',
-             'Profile: ' + json.dumps(report['profile'], sort_keys=True),
-             f'Observed: {report["observed_at"]}; outcome: {report["outcome"]}',
-             f'Board: {report["board"]}', '## Workers',
-             '| Task | State | Runtime | Session | Last activity | Event time | Commit |',
-             '|---|---|---|---|---|---|---|']
-    for row in report['workers']:
-        lines.append(f'| {row["task"]} {row["title"]} | {row["state"]} | {row["runtime"]} @{row["machine"]} '
-                     f'| {row["session"]} | {row["last_activity"]} | {row["event_at"]} | {row["commit"]} |')
-    if not report['workers']:
-        lines.append('Workers: none' if report['source_status'] == 'available' else 'Workers: unknown (source unavailable)')
-    lines += ['Actions: ' + json.dumps(report['actions'], sort_keys=True),
-              'Refusals: ' + json.dumps(report['refusals']),
-              f'Source status: {report["source_status"]}; received/applied: unknown (verify supported-channel output).',
-              'Validation: ' + json.dumps(report['validation'])]
-    return '\n'.join(lines)
-
-
-def report_timestamp(value):
-    try:
-        at = datetime.fromisoformat(value.replace('Z', '+00:00'))
-        return at.timestamp() if at.tzinfo is not None and at.utcoffset().total_seconds() == 0 else None
-    except (AttributeError, TypeError, ValueError, OverflowError):
-        return None
-
-
-def validate_report(report, now=None):
-    """Validate data, never infer a session receipt from successful delivery."""
-    errors = []
-    required = ('contract', 'repository', 'profile', 'board', 'observed_at', 'outcome',
-                'actions', 'refusals', 'workers', 'source_status', 'validation')
-    if not isinstance(report, dict) or any(key not in report for key in required):
-        return ['missing report fields']
-    if (not isinstance(report['validation'], list)
-            or any(not isinstance(blocker, str) or not blocker for blocker in report['validation'])):
-        return ['invalid validation blockers']
-    expected = report_contract()
-    if not isinstance(report['contract'], dict) or any(report['contract'].get(key) != expected[key]
-                                                      for key in ('version', 'sha256', 'source')):
-        errors.append('unsupported report contract; run taskq update and apply the next safe tick')
-    def url(value):
-        return isinstance(value, str) and bool(re.search(r'https?://[^\s)]+', value))
-    observed = report_timestamp(report['observed_at'])
-    now = time.time() if now is None else now
-    if observed is None or not 0 <= now - observed <= 15 * 60:
-        errors.append('invalid/stale observed_at; obtain a fresh tick')
-    if report['outcome'] not in ('ok', 'judgement_needed', 'failure', 'unknown', 'refused'):
-        errors.append('invalid outcome')
-    profile = report['profile']
-    if (not url(report['repository']) or not isinstance(profile, dict)
-            or any(key not in profile for key in ('filter', 'mine', 'limits'))):
-        errors.append('invalid repository/profile identity')
-    if not url(report['board']):
-        errors.append('board unavailable; verify board source before board decisions')
-    if report['source_status'] != 'available':
-        errors.append('source unavailable; preserve current work and retry next safe tick')
-    if not all(isinstance(report[key], list) for key in ('workers', 'actions', 'refusals')):
-        return errors + ['invalid report lists']
-    for row in report['workers']:
-        fields = ('task', 'title', 'state', 'runtime', 'machine', 'session', 'last_activity', 'event_at', 'commit')
-        if not isinstance(row, dict) or any(not isinstance(row.get(key), str) or not row[key] for key in fields):
-            errors.append('missing worker fields')
-            continue
-        if row['state'] not in (*core.STATES, 'unknown'):
-            errors.append('invalid worker state')
-        if not url(row['task']):
-            errors.append('worker task link missing')
-        if not url(row['session']):
-            errors.append('worker session link unavailable; use the printed attach/app reference')
-        if row['commit'] != 'unavailable' and not url(row['commit']):
-            errors.append('worker commit link missing')
-        event = report_timestamp(row['event_at'])
-        if event is None or event > now:
-            errors.append('worker event time unknown/invalid')
-        # An old issue update is truthful activity, not a stale observation of current state.
-    return errors
-
-
-def verify_report(args):
-    """Read an actual channel readback supplied by the adapter; no receipt store or transport."""
-    evidence = json.loads(Path(args.file).read_text())
-    if not isinstance(evidence, dict):
-        raise SystemExit('channel readback must be an object')
-    report = evidence.get('report')
-    errors = validate_report(report)
-    for key in ('runtime', 'session', 'source', 'received_at', 'applied_at', 'rendered'):
-        if not isinstance(evidence.get(key), str) or not evidence[key] or evidence[key] in ('unknown', 'unavailable'):
-            errors.append(f'channel acknowledgement missing {key}')
-    if isinstance(evidence.get('source'), str) and not re.match(r'https?://', evidence['source']):
-        errors.append('channel source link unavailable')
-    if not errors:
-        rendered = evidence['rendered']
-        # A table-free channel may copy every datum as labeled lines.
-        for value in (report['board'], report['repository'], report['observed_at'],
-                      str(report['contract']['version']), report['contract']['sha256'], report['contract']['source'],
-                      report['outcome'], json.dumps(report['profile'], sort_keys=True),
-                      json.dumps(report['actions'], sort_keys=True), json.dumps(report['refusals']),
-                      f'Source status: {report["source_status"]}',
-                      'Validation: ' + json.dumps(report['validation'])):
-            if value not in rendered:
-                errors.append('required report datum absent from channel readback')
-        for row in report['workers']:
-            if any(value not in rendered for value in row.values()):
-                errors.append('worker datum absent from channel readback')
-        if not report['workers'] and 'Workers: none' not in rendered:
-            errors.append('empty workers not explicit')
-        for key in ('received_at', 'applied_at'):
-            try:
-                at = report_timestamp(evidence[key])
-                if at is None or not report_timestamp(report['observed_at']) <= at <= time.time():
-                    raise ValueError()
-            except (TypeError, ValueError):
-                errors.append(f'invalid {key}')
-    if not errors and report_timestamp(evidence['received_at']) > report_timestamp(evidence['applied_at']):
-        errors.append('applied_at precedes received_at')
-    if not errors:
-        errors.extend(report['validation'])
-    result = {'status': 'applied' if not errors else 'unknown', 'errors': errors,
-              'contract': report_contract(), 'source': evidence.get('source'),
-              'runtime': evidence.get('runtime'), 'session': evidence.get('session'),
-              'qualification': 'caller-supplied channel readback; transport authenticity requires separate evidence'}
-    print(json.dumps(result))
-    if errors:
-        raise SystemExit(1)
+def report(board, rows):
+    """R6: the project heading, the Board link and one table Task | Status | Runtime | Session."""
+    print(f'## {core.PROJECT_PATH}\n\nBoard: {board}\n\n| Task | Status | Runtime | Session |\n|---|---|---|---|')
+    print('\n'.join(rows) or '| none | | | |', end='\n\n')
 
 
 def profile_arguments(args):
@@ -285,44 +102,6 @@ def profile_arguments(args):
     if args.limit:
         flags += ' --limit ' + ','.join(f'{name}={count}' for name, count in args.limit.items())
     return flags
-
-
-# The owner's card moves on GitHub's board the queue executes, by (label, Status): the command it runs.
-BOARD_MOVES = {('ready', 'later'): 'later', ('waiting', 'later'): 'later', ('later', 'ready'): 'answer',
-               ('later', 'waiting'): 'answer', ('review', 'ready'): 'reject'}
-
-
-def board_fix(state, target, iid):
-    if target == 'ready' and state in ('ask', 'doing'):
-        return f'`{core.TOOL} {"answer" if state == "ask" else "release"} {iid} --text "<why>"`'
-    if target == 'later' and state == 'ask' or target == 'ask' and state in ('ready', 'waiting', 'later'):
-        return f'`{core.TOOL} {target} {iid} --text "<why>"`'
-    return f'none: only a worker or `{core.TOOL} tick` moves a task from {state} to {target}'
-
-
-def board_moves(everything, selected):
-    """GitHub's board: Status is the owner's intent, the q-* label the queue's state. A move the queue can execute
-    is executed with a note; any other goes back to the label's column (a manual ready<->waiting silently, as
-    on GitLab) and is named. Returns how many moves ran and the lines for 'Board mismatch'."""
-    cards, executed, misplaced, text = core.api('GET', 'board/items'), 0, [], 'moved on the board'
-    for item in everything:
-        iid, state = item['iid'], item['state']
-        target = cards.get(iid, state)
-        if iid not in selected or target == state or not (item := core.unchanged(item)):
-            continue
-        action = BOARD_MOVES.get((state, target))
-        if action == 'later':
-            core.save(item, 'later', 'later', text, waiting_for=text)
-        elif action:
-            core.requeue(argparse.Namespace(iid=iid, action=action, text=text))
-        else:
-            core.api('PUT', f'board/items/{iid}', {'status': state})
-            if target and {state, target} != {'ready', 'waiting'}:
-                misplaced.append(f'{core.ref(item)} was moved on the board from {state} to {target}: put back to {state}. Fix: {board_fix(state, target, iid)}')
-            continue
-        executed += 1
-        print(f'Board move of {core.ref(item)} executed: {state} → {target}.')
-    return executed, misplaced
 
 
 def session_link(claim, agent=None):
@@ -516,28 +295,15 @@ def supervisor_spawn(item):
                               text=supervisor_prompt(item['iid']), full_access=item['full_access'] or item['runtime'] == 'codex')
 
 
-def launch(args, start, act, step):
-    """Start a slot per task: one supervisor session (#243), which launches the worker. `act` spawns each itself
-    (a step), else the commands for the coordinator."""
-    if start and act:
-        for item in start:
-            step(f'spawn a {item["runtime"]} supervisor for {core.ref(item)}', lambda item=item: core.spawn(supervisor_spawn(item)), item=item)
-    elif start:
-        for item in start:
-            core.record(args, 'spawn', status='proposed', task=item['iid'], runtime=item['runtime'])
-        # One command per supervisor: the session starts on the prompt, no second message (#41).
-        # An indented block, not inline code: the prompt itself holds backticks.
-        commands = [supervisor_spawn(item) for item in start]
-        print(f'## Start {len(start)} worker slot(s): one supervisor session each, which launches its worker\n\n'
-              + ''.join(f'- {core.ref(item)} {item["title"]}: {item["runtime"]}\n' for item in start)
-              + '\nRun each command once; the supervisor starts on its brief at once:\n\n'
-              + ''.join('    ' + shlex.join([core.TOOL, 'spawn', '--runtime', spawn.runtime, '--name', spawn.name, '--text', spawn.text]
-                                            + ['--codex-full-access'] * (spawn.full_access and spawn.runtime == 'codex')) + '\n'
-                        for spawn in commands))
-
+def launch(start, step):
+    """Start a slot per task: one supervisor session (#243), which launches the worker."""
+    for item in start:
+        step(f'spawn a {item["runtime"]} supervisor for {core.ref(item)}', lambda item=item: core.spawn(supervisor_spawn(item)))
 
 
 def tick(args):
+    """One pass (R4): the tick does the mechanical steps itself (spawn, nudge, wake, retire) and prints the R6
+    report and what needs judgement; exit 1 only for judgement."""
     # Keep the inode: unlinking the file could let a third pass lock a different file.
     lock = core.TICK_BEAT.with_name('taskq-tick.lock')
     lock.parent.mkdir(parents=True, exist_ok=True)
@@ -553,34 +319,15 @@ def tick(args):
         except OSError as error:
             if error.errno not in (errno.EACCES, errno.EAGAIN):
                 raise
-            core.record(args, 'tick', status='refused', reason='another tick pass is running')
             if hasattr(args, 'output'):
-                args.output['refusals'].append('another tick pass is running')
-            report = new_report(args)
-            report['outcome'] = 'refused'
-            report['refusals'] = ['another tick pass is running; do not repeat dispatch']
-            emit_report(args, report)
-            print('Skipped: another tick pass is running.', file=sys.stderr)
-            return
-        if args.act:
-            return act(args)
-        judgement = tick_pass(args)
-        if hasattr(args, 'output') and judgement:
-            args.output['outcome'] = 'judgement_needed'
-            args.output['refusals'] = judgement
-
-
-
-def act(args):
-    """`tick --act`: mechanical steps and a report every pass; exit 1 only for judgement."""
-    with contextlib.redirect_stdout(io.StringIO()) as said:
-        judgement = tick_pass(args, act=True)
-    if hasattr(args, 'output') and judgement:
-        args.output['outcome'] = 'failure' if any(event.get('status') == 'failed' for event in args.output['actions']) else 'judgement_needed'
-        args.output['refusals'] = judgement
-    print(said.getvalue(), end='')
+                args.output['outcome'] = 'refused'
+            return print('Skipped: another tick pass is running.', file=sys.stderr)
+        judgement = queue_pass(args)
     if not judgement:
         return
+    if hasattr(args, 'output'):
+        args.output['outcome'] = 'judgement_needed'
+        args.output['refusals'] = judgement
     sys.stdout.flush()
     sys.exit(1)
 
@@ -589,7 +336,7 @@ def idle_ticks():
     return core.TICK_BEAT.with_name('taskq-tick-idle')
 
 
-def idle_stop(act, step, failed):
+def idle_stop(failed):
     """Count empty passes and run configured cleanup on the stop-th one."""
     idle = core.personal().get('idle', {})
     stop, clean = idle.get('stop', 5), idle.get('cleanup', True) and core.CLEANUP.get('enabled', True)
@@ -599,135 +346,76 @@ def idle_stop(act, step, failed):
         return None
     idle_ticks().unlink()
     cleanup = f'`{core.TOOL} cleanup --apply`'
-    if not act:
-        return f'Idle {count} ticks: ' + f'run {cleanup}, ' * clean + 'report to the owner.'
     if clean:
         try:
-            # Under the #197 lock and state: skipped when the owner's tick already cleaned within the schedule.
-            core.cleanup(argparse.Namespace(apply=True, trigger='idle'))  # its Remove and Ask the owner sections go to the coordinator
+            core.cleanup(argparse.Namespace(apply=True))  # its Remove and Ask the owner sections go to the coordinator
         except (SystemExit, OSError, subprocess.SubprocessError) as error:
             failed.append(f'run {cleanup}: {core.codex_line(str(error))}')
     return f'\nIdle {count} ticks:' + f' ran {cleanup}' * clean + '; report to the owner.'
 
 
-def retire_closed(log, args=None):
-    """--act: a local Claude worker of a task closed in the last hour without this machine's `close` (closed on
-    the board or by hand) is retired as `close` would. ponytail: sessions only; trees and branches: `cleanup`."""
-    agents = core.claude_agents()
-    if not agents:
-        return
-    after = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 3600))
-    for issue in core.issues(f'state=closed&updated_after={after}'):
-        block = core.BLOCK.search(issue.get('description') or '')
+def retire(open_iids):
+    """R11, the one retire step: this checkout's `T<N>`/`S<N>` sessions (spawn names them) whose task N is closed,
+    once their turn has ended. Claude: stop and remove; Codex: archive (reversible). Trees and branches: `cleanup`.
+    A failure is the sender's log line, never judgement: the next pass tries again (an app-held Codex thread)."""
+    found = [(sid, iid, lambda sid=sid: core.claude_stop(sid, remove=True)) for sid, agent in core.claude_agents().items()
+             if (iid := session_iid(agent.get('name'))) and local(agent) and not busy(agent)]
+    if core.CODEX_SOCKET.exists():
+        from taskq.cleanup import cleanup_codex
+        root = core.ROOT.resolve()
         try:
-            found = json.loads(block.group(1)) if block else {}
-            claim, supervisor = found.get('claim') or {}, found.get('supervisor') or {}
-        except (ValueError, AttributeError):
-            continue
-        # #243 (R11): its supervisor too, once its turn (the close) has ended; a supervisor has no node: a local job is.
-        for role, who in (('worker', claim), ('supervisor', supervisor)):
-            agent = agents.get(who.get('session'))
-            if (agent and agent.get('status') != 'busy' and who.get('runtime') == 'claude'
-                    and (core.local_claim(who) if role == 'worker' else local(agent))):
-                core.claude_stop(who['session'], remove=True)
-                core.record(args, 'retire', status='done', task=issue['iid'], session=who['session'])
-                log(f'Retired {who["session"]}: the {role} of closed {core.ref(issue)}.')
-
-
-def archive_finished_codex(tasks, log, args=None):
-    """#165: every pass archives this checkout's Codex worker threads (`T<N> …`, as spawn names them) that are no
-    open task's claim: the task closed, or went ask -> answer -> ready and a new session continues it. A thread the
-    owner viewed is held by the app, and codex-archive has the app archive it (#165). Reversible (`thread/unarchive`), so no --act needed."""
-    if not core.CODEX_SOCKET.exists():
-        return
-    from taskq.cleanup import cleanup_codex
-    claimed, root = {(item['claim'] or {}).get('session') for item in tasks}, core.ROOT.resolve()
-    # #243: an open task's supervisor, and the worker of a supervised task (it continues after answer), are kept.
-    claimed |= {item['supervisor']['session'] for item in tasks if item.get('supervisor')}
-    supervised = {item['iid'] for item in tasks if item.get('supervisor')}
-    try:
-        threads = cleanup_codex({root})
-    except (OSError, SystemExit, ValueError) as error:
-        core.record(args, 'archive_inventory', status='refused', reason=str(error))
-        return log(f'Codex threads not checked: {core.codex_line(str(error))[:120]}')
-    for thread in threads.values():
-        name, sid = thread.get('name') or '', thread['id']
-        # 10 min: a worker spawned this pass may not have taken its task yet.
-        # cleanup_codex also lists the app project's threads; only this checkout's are its workers.
-        if (not session_iid(name) or worker_iid(name) in supervised or Path(thread.get('cwd') or '/').resolve() != root or sid in claimed or (thread.get('status') or {}).get('type') not in ('idle', 'notLoaded')
-                or time.time() - (thread.get('updatedAt') or time.time()) < 600):
+            threads = cleanup_codex({root})  # also lists the app project's threads: only this checkout's are its sessions
+        except (OSError, SystemExit, ValueError) as error:
+            threads = {}
+            print(f'Codex threads not checked: {core.codex_line(str(error))[:120]}', file=sys.stderr)
+        found += [(sid, iid, lambda sid=sid: core.codex_archive(argparse.Namespace(thread=sid))) for sid, thread in threads.items()
+                  if (iid := session_iid(thread.get('name'))) and Path(thread.get('cwd') or '/').resolve() == root
+                  and (thread.get('status') or {}).get('type') in ('idle', 'notLoaded')]
+    for sid, iid, stop in found:
+        if iid in open_iids:
             continue
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                core.codex_archive(argparse.Namespace(thread=sid))
-            core.record(args, 'archive', status='done', session=sid)
-            log(f'Archived {sid} ({name}): no open task holds it.')
-        except (SystemExit, OSError) as error:
-            core.record(args, 'archive', status='refused', session=sid, reason=str(error))
-            log(f'Kept {sid} ({name}) for a later pass: {core.codex_line(str(error))[:120]}')
+                stop()
+            print(f'Retired {sid}: #{iid} is closed.', file=sys.stderr)
+        except (SystemExit, OSError, subprocess.SubprocessError) as error:
+            print(f'Kept {sid} of closed #{iid} for a later pass: {core.codex_line(str(error))[:120]}', file=sys.stderr)
 
 
-def new_report(args):
-    contract = report_contract()
-    host = core.HOST or ('github.com' if not core.BOARDS else None)
-    repo = f'https://{host}/{core.PROJECT_PATH}' if host else 'unavailable'
-    report = {'contract': contract, 'repository': repo, 'profile': {}, 'board': 'unavailable',
-              'observed_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'), 'outcome': 'unknown',
-              'actions': args.output['actions'] if hasattr(args, 'output') else [],
-              'refusals': [], 'workers': [], 'source_status': 'unavailable', 'validation': []}
-    args.pm_report = report
-    return report
-
-
-def tick_pass(args, act=False):
-    report = new_report(args)
+def board_link(candidates):
+    """The Board link of the R6 report, or 'unavailable' when it cannot be read (R12)."""
     try:
-        judgement = queue_pass(args, act)
-        report['outcome'] = ('failure' if any(event.get('status') == 'failed' for event in report['actions'])
-                             else 'judgement_needed' if judgement else 'ok')
-        report['refusals'] = judgement or []
-        return judgement
+        if not core.BOARDS:
+            return (core.api('GET', 'board') or {}).get('url') or 'unavailable'
+        board = next((board for board in core.api('GET', 'boards') if board['name'] == core.BOARD), None)
+        issue = next((item for item in candidates if item.get('web_url')), None)
+        return f'{re.split(r"/(?:-/)?issues/", issue["web_url"])[0]}/-/boards/{board["id"]}' if board and issue else 'unavailable'
     except (SystemExit, OSError, ValueError, subprocess.SubprocessError):
-        report['outcome'] = 'failure'
-        report['source_status'] = 'unavailable'
-        raise
-    finally:
-        emit_report(args, report)
+        return 'unavailable'
 
 
-def emit_report(args, report):
-    if hasattr(args, 'output'):
-        report['actions'] = args.output['actions']
-        if args.output['refusals']:
-            report['refusals'] = args.output['refusals']
-        args.output['report'] = report
-    # Preserve the snapshot's conservative pass-start timestamp through long work and emission.
-    report['validation'] = validate_report(report)
-    print(render_report(report))
-    if report['validation']:
-        print('Report blockers: ' + '; '.join(report['validation']))
-    print('Apply this version on this safe pass. Preserve claims/current work; do not repeat dispatch '
-          'on duplicate delivery. Return version/hash plus the rendered report through the supported channel; '
-          'taskq report-verify <readback.json> validates the acknowledgement. Unsupported contract: '
-          'block obsolete publication, keep execution, run taskq update and retry next safe tick.')
+def board_sync(everything, selected):
+    """GitHub's board is a one-way copy of the q-* labels: every card goes back to its label's column (reading the
+    cards also archives closed ones). Owner moves go through `answer`, `later` and `reject`."""
+    cards = core.api('GET', 'board/items')
+    for item in everything:
+        if item['iid'] in selected and cards.get(item['iid'], item['state']) != item['state']:
+            core.api('PUT', f'board/items/{item["iid"]}', {'status': item['state']})
+            print(f'Board card of {core.ref(item)} put back to {item["state"]}: owner moves go through answer, later or reject.')
 
 
-def queue_pass(args, act=False):
-    """One pass of the coordinator: release dead claims itself, then print exactly what to do. `act` (#42): also
-    spawn, retire and nudge here instead of printing those steps. Returns the items that need judgement."""
-    log = lambda line: print(line, file=sys.stderr)  # an act step: the timer's log, never the coordinator's turn
+def queue_pass(args):
+    """One pass of the coordinator: release dead claims, spawn, nudge, wake and retire here (a step each), print the
+    R6 report and what needs judgement. Returns the judgement lines."""
     failed = []
 
-    def step(what, action, item=None):
+    def step(what, action):
         try:
             with contextlib.redirect_stdout(sys.stderr):
-                result = action()
-            core.record(args, what.split()[0], detail=what, status='done', task=(item or {}).get('iid'),
-                        session=result if isinstance(result, str) else ((item or {}).get('claim') or {}).get('session'))
-            log(f'Done: {what}.')
+                action()
+            print(f'Done: {what}.', file=sys.stderr)  # the sender's log, never the coordinator's turn
         except (SystemExit, OSError, ValueError, subprocess.SubprocessError) as error:
             failed.append(f'{what}: {core.codex_line(str(error))}')
-            core.record(args, what.split()[0], detail=what, status='failed', reason=str(error), task=(item or {}).get('iid'))
     auto_update()
     contract_news()
     print(f'taskq {core.version()}')
@@ -737,27 +425,9 @@ def queue_pass(args, act=False):
         print(f'Codex workers unavailable on this machine: no Codex app server socket {core.CODEX_SOCKET}; '
               f'start it: `{core.CODEX_HEADLESS}`.')
     loaded, candidates = core.profile(args)
-    args.pm_report['profile'] = args.profile
-    if issue := next((item for item in candidates if item.get('web_url')), None):
-        args.pm_report['repository'] = re.split(r'/(?:-/)?issues/', issue['web_url'])[0]
-    args.pm_report['source_status'] = 'available'
-    board = None
-    try:
-        if core.BOARDS:
-            board = next((board for board in core.api('GET', 'boards') if board['name'] == core.BOARD), None)
-            if board and args.pm_report['repository'] != 'unavailable':
-                args.pm_report['board'] = f'{args.pm_report["repository"]}/-/boards/{board["id"]}'
-        else:
-            board = core.api('GET', 'board')
-            if board:
-                args.pm_report['board'] = board['url']
-    except (SystemExit, OSError, ValueError, subprocess.SubprocessError) as error:
-        core.record(args, 'report_source', status='unknown', reason=f'board unavailable: {error}')
     selected = {item['iid'] for item in candidates}
     if hasattr(args, 'output'):
-        args.output['profile'] = args.profile
         args.output['tasks'] = [{'id': item['iid'], 'state': item['state'], 'claim': item['claim']} for item in candidates]
-        args.output['sessions'] = [item['claim']['session'] for item in candidates if (item['claim'] or {}).get('session')]
     # #145: only the coordinator machine ([coordinator] machine of taskq.toml; none set: every machine) starts shared
     # workers, accepts reviews and shows questions; another machine releases its own work and starts its host-* tasks.
     holder = core.COORDINATOR in (None, core.machine())
@@ -766,10 +436,6 @@ def queue_pass(args, act=False):
     agents = core.claude_agents() if any(found.get('runtime') == 'claude' for item in loaded[0] if item['iid'] in selected
                                          for found in ((item['claim'] or {}), item.get('supervisor') or {}) if found.get('session')) else {}
     alive = {item['iid']: liveness(item, agents) for item in doing}
-    for item in candidates:
-        if item['state'] in ('doing', 'ask', 'review'):
-            item['_report_activity'] = alive.get(item['iid'], (None, f'issue {core.age(item)} min ago'))[1]
-    args.pm_report['workers'] = [report_row(item, agents) for item in candidates if listed(item)]
     dead = [item for item in doing if alive[item['iid']][0] == 'dead' and not item.get('result')]
     stalled = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and alive.get(item['iid'], (None,))[0] is None
                and core.age(item) > core.STALE_MINUTES and (holder or core.local_claim(item['claim'] or {}))]
@@ -780,18 +446,18 @@ def queue_pass(args, act=False):
             f'no change on the issue for {core.age(item)} minutes'
         args.iid, args.action, args.text = item['iid'], 'release', why
         core.requeue(args)
-        core.record(args, 'release', task=item['iid'], reason=why)
         print(f'Released {"dead" if item in dead else "stalled"} {core.ref(item)}.')
     # #208: reservations found again (restart, a launch that died) are settled by evidence on their machine, never by age.
     released = [item for item in loaded[0] if item['state'] == 'ready' and item.get('reservation') and core.reconcile(item, args)]
     stalled = dead + stalled + released
+    retire(loaded[1])
     if not holder:
         # A task pinned to this machine (`host-<name>`) starts only here: the coordinator elsewhere cannot start it.
         start = starts(args, core.load() if stalled else loaded, {item['iid'] for item in candidates if item.get('host') == core.machine()})
         if not start:
             return print(f'coordinator is {core.COORDINATOR}: this tick released only its own stalled work. Say so and stop.')
-        print(f'coordinator is {core.COORDINATOR}: start only the workers pinned to this machine.\n')
-        launch(args, start, act, step)
+        print(f'coordinator is {core.COORDINATOR}: started only the workers pinned to this machine.\n')
+        launch(start, step)
         return failed
     loaded = core.load() if stalled else loaded
     # A lock on a task nobody holds: a take that died between the lock and the move, or a card moved by hand.
@@ -799,12 +465,7 @@ def queue_pass(args, act=False):
     for issue in core.issues(f'state=opened&my_reaction_emoji={core.LOCK}'):
         if issue['iid'] in selected and issue['iid'] not in held and all(time.time() - core.stamp(item['created_at']) > core.LOCK_SECONDS for item in core.locks(issue['iid'])):
             core.unlock(issue['iid'])
-            core.record(args, 'unlock', task=issue['iid'])
             print(f'Unlocked {core.ref(issue)}: nobody holds it.')
-    misplaced = []
-    if not core.BOARDS and board:
-        executed, misplaced = board_moves(loaded[0], selected)
-        loaded = core.load() if executed else loaded
     # Only tick moves ready<->waiting: a card a hand moved between them goes back here.
     moved = 0
     for item in loaded[0]:
@@ -817,47 +478,40 @@ def queue_pass(args, act=False):
             core.save(item, 'waiting', 'waiting', f'open dependencies {open_deps}')
         else:
             core.save(item, 'ready', 'ready', 'dependencies closed')
-        core.record(args, 'move', task=item['iid'], state='ready' if item['state'] == 'waiting' else 'waiting')
         moved += 1
         print(f'Moved {core.ref(item)} {item["state"]} → {"ready" if item["state"] == "waiting" else "waiting"}.')
     everything, _, odd, problems, inbox = loaded = core.load() if moved else loaded
+    if (board := board_link(candidates)) != 'unavailable' and not core.BOARDS:
+        board_sync(everything, selected)
     everything = [item for item in everything if item['iid'] in selected]
+    # #83: one table of every worker and supervisor (R6); the owner's chat opens only http(s) links.
+    report(board, [report_row(item, agents, (alive.get(item['iid']) or (None, f'issue {core.age(item)} min ago'))[1])
+                                    for item in everything if listed(item)])
     # #243 (R3): a supervised task's review is its supervisor's, never the coordinator's: the tick wakes that session.
     review = [item for item in everything if item['state'] == 'review' and item['result'] and not item.get('supervisor')]
     # A question reaches the owner once, when it is new; the ones already shown come back as a daily summary.
     asked = [(item, *question(item['iid'])) for item in everything if item['state'] == 'ask']
-    for item, _, _, notes in asked:
-        pending(item, notes)  # #223: the line names the question note that was read; the text below is that note's
-    fresh = [(item, text) for item, text, shown, _ in asked if shown is None]
-    summary = [(item, text) for item, text, shown, _ in asked if shown and time.time() - shown >= core.SUMMARY_SECONDS]
-    # #243 (R2): a supervised task's worker continues after answer; only an unsupervised one gets a new session.
-    codex_stopped = [item for item in everything if item['state'] in ('ask', 'later') and not item.get('supervisor')
-                     and (item['claim'] or {}).get('runtime') == 'codex' and not core.codex_is_archived(item['claim']['session'])]
+    fresh = [(item, text) for item, text, shown in asked if shown is None]
+    summary = [(item, text) for item, text, shown in asked if shown and time.time() - shown >= core.SUMMARY_SECONDS]
     # A card moved by hand on the board into a state its data does not support.
     odd = [f'{core.ref(issue)} labels {issue["labels"]}: give it exactly one state label' for issue in odd] + [
         f'{core.ref(item)} is doing without a worker: move it back to ready or `release {item["iid"]}`'
         for item in everything if item['state'] == 'doing' and not (item['claim'] or {}).get('session')] + [
         f'{core.ref(item)} is in review without a result: `reject {item["iid"]}` or close it by hand'
-        for item in everything if item['state'] == 'review' and not item['result']] + misplaced
+        for item in everything if item['state'] == 'review' and not item['result']]
     start = starts(args, loaded, selected)
-    if act:
-        retire_closed(log, args)
-    archive_finished_codex(loaded[0], log, args)
     # #197: the owner's tick (this machine coordinates) applies native cleanup when due; never a timer of its own.
     sys.modules['taskq.cleanup'].scheduled(args)  # the module: `core.cleanup` is the command function
-    # #223: one read per item gives its pending line and the note it names; what is printed below comes from that
-    # same read. A shown question is pending without a judgement line, so the lines are made before the idle return.
-    args.pending = [(item, pending(item)) for item in review + [item for item, *_ in asked]]
     # #243: a supervisor whose task needs it (a result to review; ready again after an answer or reject) and whose
     # turn has ended is woken with one fixed line; a busy or unknown one (another machine) is left alone.
     supervise = [item for item in everything if item.get('supervisor') and (item['state'] == 'review' and item['result']
                  or item['state'] == 'ready' and not item.get('reservation'))
                  and liveness({**item, 'state': 'doing', 'claim': item['supervisor']}, agents)[0] == 'idle']
-    if not (review or fresh or summary or start or codex_stopped or odd or problems or supervise) and not any(item['state'] == 'doing' for item in everything):
+    if not (review or fresh or summary or start or odd or problems or supervise) and not any(item['state'] == 'doing' for item in everything):
         # #153: an ask or review task waits for someone, so it is no idle pass.
         if any(item['state'] in ('ask', 'review') for item in everything):
             idle_ticks().unlink(missing_ok=True)
-        elif stop := idle_stop(act, step, failed):
+        elif stop := idle_stop(failed):
             print(inbox_line(inbox) + stop)
             return ['idle stop'] + [f'inbox {issue["iid"]}' for issue in inbox] + failed
         print(inbox_line(inbox) + 'Nothing to do. Say so and stop.')
@@ -865,78 +519,40 @@ def queue_pass(args, act=False):
     idle_ticks().unlink(missing_ok=True)
     print(f'You are the coordinator of the task queue for this one pass. Queue tool: `{core.TOOL}`\n')
     print(inbox_line(inbox), end='')
-    # #83: one table of every worker; the owner's chat opens only http(s) links.
     workers = [item for item in everything if item['state'] in ('doing', 'ask', 'review') and (item['claim'] or {}).get('session')]
-    idle, claude_idle, stuck = [], [], []
+    stuck = []
     for item in workers:
         session, runtime = item['claim']['session'], item['claim'].get('runtime')
-        state, activity = alive.get(item['iid']) or liveness(item, agents)
-        item['_report_activity'] = activity
-        found = pending(item) if item['state'] == 'doing' and not item.get('result') and state != 'busy' else ''
-        if found.split(' ')[3:4] == ['problem']:
+        state = (alive.get(item['iid']) or liveness(item, agents))[0]
+        if item['state'] != 'doing' or item.get('result') or state == 'busy':
+            continue
+        note = handed_in(item, ('result', 'ask', 'problem'))
+        if note and note.startswith('**problem**'):
             # #223: the worker ended its turn on a `problem` note, no result or ask: judgement, never a nudge or a
             # release; its claim stays. Unknown (another machine, no CLI) is listed too: a listing has no effect.
-            stuck.append(item)
-        elif state == 'idle' and item['state'] == 'doing' and not item.get('result'):
-            (claude_idle if runtime == 'claude' else idle).append(item)
-    args.pm_report['workers'] = [report_row(item, agents) for item in everything if listed(item)]
+            stuck.append((item, note))
+        elif state == 'idle' and runtime == 'claude':
+            step(f'nudge idle Claude {core.ref(item)}', lambda session=session: core.claude_wake(session, NUDGE))
+        elif state == 'idle':
+            step(f'nudge idle Codex {core.ref(item)}', lambda item=item: core.codex_send(
+                argparse.Namespace(thread=session, text=NUDGE, full_access=item['full_access'])))
+        elif runtime in core.EXECUTORS and core.QUIET_MINUTES <= core.age(item) < core.QUIET_MINUTES + 5:
+            # An app without a status API: silence on the issue is the only sign its turn ended without a hand-in.
+            step(f'nudge quiet {core.ref(item)}', lambda item=item: core.executor_run(runtime, 'send', session=session, text=NUDGE))
+    for item in supervise:
+        step(f'wake the supervisor of {core.ref(item)}', lambda item=item: wake_supervisor(item))
     permissions = [item['_runtime_observation'] for item in workers if item.get('_runtime_observation', {}).get('status') == 'waiting_permission']
-    for item in workers:
-        if observation := item.get('_runtime_observation'):
-            core.record(args, 'runtime_observation', task=item['iid'], **observation)
     if permissions:
         print('## Runtime permissions\n\nThe owner approves in the linked runtime UI. Keep the same worker; do not answer, nudge or spawn another.\n')
         for observation in permissions:
             print(f'- [{observation["session"]}]({observation["session_link"]}): {observation["exact_blocker"]}')
-    if idle and act:
-        for item in idle:
-            step(f'nudge idle Codex {core.ref(item)}', lambda item=item: core.codex_send(
-                argparse.Namespace(thread=item['claim']['session'], text=NUDGE, full_access=item['full_access'])), item=item)
-    elif idle:
-        print('## Codex idle\n\nTask is doing without result/ask, but its session has stopped. Intervene now:\n')
-        for item in idle:
-            print(f'- {core.ref(item)}: `{core.TOOL} codex-send {item["claim"]["session"]} '
-                  f'--text "{NUDGE}"`')
-        print()
-    if claude_idle and act:
-        for item in claude_idle:
-            step(f'nudge idle Claude {core.ref(item)}', lambda item=item: core.claude_wake(item['claim']['session'], NUDGE), item=item)
-    elif claude_idle:
-        print('## Claude idle\n\nTask is doing without result/ask, but its session has ended its turn. Intervene now:\n')
-        for item in claude_idle:
-            print(f'- {core.ref(item)}: `claude --bg --resume {item["claim"]["session"]} "{NUDGE}"`')
-        print()
-    if supervise and act:
-        for item in supervise:
-            step(f'wake the supervisor of {core.ref(item)}', lambda item=item: wake_supervisor(item), item=item)
-    elif supervise:
-        print('## Supervisors to wake\n\nTheir task needs them (a result to review, or ready again after an answer or reject). '
-              'Send each this line once; do not review or close these tasks yourself:\n')
-        for item in supervise:
-            found, text = item['supervisor'], SUPERVISE.format(iid=item['iid'])
-            print(f'- {core.ref(item)}: ' + (f'`claude --bg --resume {found["session"]} "{text}"`' if found['runtime'] == 'claude'
-                                             else f'`{core.TOOL} send --runtime {found["runtime"]} {found["session"]} --text "{text}"`'))
-        print()
-    # An app without a status API: silence on the issue is the only sign its turn ended without a hand-in.
-    quiet = [item for item in everything if item['state'] == 'doing' and (item['claim'] or {}).get('runtime') in core.EXECUTORS
-             and not item.get('result') and item not in stuck and core.QUIET_MINUTES <= core.age(item) < core.QUIET_MINUTES + 5]
-    if quiet and act:
-        for item in quiet:
-            step(f'nudge quiet {core.ref(item)}', lambda item=item: core.executor_run(
-                item['claim']['runtime'], 'send', session=item['claim']['session'], text=NUDGE), item=item)
-    elif quiet:
-        print(f'## Quiet workers\n\nNo change on the issue for {core.QUIET_MINUTES} minutes. Nudge each (this tick only):\n')
-        for item in quiet:
-            print(f'- {core.ref(item)}: `{core.TOOL} send --runtime {item["claim"]["runtime"]} {item["claim"]["session"]} '
-                  f'--text "{NUDGE}"`')
-        print()
     if stuck:
         print('## Worker problems\n\nTask is doing; its worker ended its turn on a problem note, no result or ask. Its claim stays: '
               'send the next step to that same session (Claude: `claude --bg --resume <session> "<next step>"`; Codex: '
               f'`{core.TOOL} codex-send <session> --text "<next step>"`), or `{core.TOOL} release <N>` only for a stopped session. '
               'Do not answer: the task is not in ask.\n')
-        for item in stuck:
-            print(f'- {core.ref(item)} {item["claim"]["runtime"]} {item["claim"]["session"]}:\n' + core.data(item['_note'].split('\n\n', 1)[-1]))
+        for item, note in stuck:
+            print(f'- {core.ref(item)} {item["claim"]["runtime"]} {item["claim"]["session"]}:\n' + core.data(note.split('\n\n', 1)[-1]))
     if odd:
         print('## Board mismatch\n\nThese issues are not in a state taskq can run. Fix each:\n')
         print(core.data(''.join(f'- {line}\n' for line in odd).rstrip()))
@@ -946,15 +562,17 @@ def queue_pass(args, act=False):
         print(core.data(''.join(f'- {core.ref(issue)} {issue["title"]}\n' for issue in problems).rstrip()))
     for item in review:
         sha = item['result'].get('sha')
-        # #223: the hand-in is the note the pending line names, from the same read: never a newer note under an old line.
-        print(f'## Review {core.ref(item)}: {item["title"]}\n\n{item["text"]}\n\nHanded in:\n\n{core.data(item["_note"])}\n'
+        print(f'## Review {core.ref(item)}: {item["title"]}\n\n{item["text"]}\n\nHanded in:\n\n{core.data(handed_in(item, ("result",)) or "none")}\n'
               + (f'Commit: [{sha}]({core.commit_url(item, sha)})\n' if sha and item.get('web_url') else '') +
               f'Check the result against the Acceptance above (for code and docs read the commit).\n'
               f'Accepted: `{core.TOOL} close {item["iid"]} --text "<what you checked>"`. '
               f'Not accepted: `{core.TOOL} reject {item["iid"]} --text "<what to fix>"`.\n')
         if (item['claim'] or {}).get('runtime') == 'codex' and not core.local_claim(item['claim']):
             print(f'After close, archive its Codex session on its machine: `{core.TOOL} codex-archive {item["claim"]["session"]}`.\n')
-    launch(args, start, act, step)
+    launch(start, step)
+    if failed:
+        print('\n## Steps that failed\n\nThe tick could not do these itself; do each by hand (§ 3) or tell the owner:\n')
+        print(core.data(''.join(f'- {line}\n' for line in failed).rstrip()))
     if fresh:
         print('## Waiting for the owner\n\nNew questions. Do not answer these yourself. End your reply with this list, verbatim:\n')
         print(core.data('\n'.join(f'- {core.ref(item)} {item["title"]}: {text}' for item, text in fresh)))
@@ -970,21 +588,6 @@ def queue_pass(args, act=False):
                 core.note(item['iid'], 'shown')
     if fresh or summary:
         print(f'\nThe owner answers with: `{core.TOOL} answer <N> --text "<answer>"`.')
-    if codex_stopped and act:
-        for item in codex_stopped:
-            step(f'archive stopped Codex {core.ref(item)}', lambda item=item: core.codex_archive(
-                argparse.Namespace(thread=item['claim']['session'])), item=item)
-    elif codex_stopped:
-        print('\n## Archive stopped Codex workers\n\nTasks in ask or later continue in a new session after answer; archive when idle:\n')
-        for item in codex_stopped:
-            print(f'- {core.ref(item)}: `{core.TOOL} codex-archive {item["claim"]["session"]}`')
-    if failed:
-        print('\n## Steps that failed\n\nThe tick could not do these itself; do each by hand (§ 3) or tell the owner:\n')
-        print(core.data(''.join(f'- {line}\n' for line in failed).rstrip()))
-    # #223: every unresolved review, question (shown or not) and worker problem is pending, with its revision; the
-    # judgement lines below stay the coordinator's list and the report's refusals.
-    args.pending += [(item, pending(item)) for item in stuck]
     return ([f'review {item["iid"]} {item["result"].get("sha")}' for item in review] + [f'ask {item["iid"]}' for item, _ in fresh + summary]
-            + [f'stuck {item["iid"]} {pending(item).split(" ")[4]}' for item in stuck]
-            + [observation['notify_dedup'] for observation in permissions]
+            + [f'stuck {item["iid"]}' for item, _ in stuck] + [observation['notify_dedup'] for observation in permissions]
             + odd + [f'problem {issue["iid"]}' for issue in problems] + [f'inbox {issue["iid"]}' for issue in inbox] + failed)

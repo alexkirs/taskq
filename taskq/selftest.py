@@ -113,10 +113,15 @@ class Selftest:
         return f'#{iid} ' + ('closed' if closed else state or '') + (f', note {newest.splitlines()[0]}' if newest else '')
 
     def tick(self):
-        """A coordinator pass over selftest tasks only; it keeps the real tick's last-run time."""
+        """A coordinator pass over selftest tasks only, with no slot to start one; it keeps the real tick's last-run time.
+        Exit 1 is the tick's judgement (a question or a review), not a failure."""
         before = core.TICK_BEAT.stat().st_mtime if core.TICK_BEAT.exists() else None
         try:
-            return self.owner('tick', '--filter', f'labels={core.SELFTEST}', '--no-mine')  # selftest tasks are the pool's
+            argv = ('tick', '--filter', f'labels={core.SELFTEST}', '--no-mine', '--limit', 'claude=0,codex=0')  # the pool's tasks
+            (code, output), = selftest_run([(core.selftest_env(), argv)])
+            if code not in (0, 1):
+                raise SelftestError(f'`taskq tick` exit {code}: {core.last_line(output)}')
+            return output
         finally:
             if before is None:
                 core.TICK_BEAT.unlink(missing_ok=True)

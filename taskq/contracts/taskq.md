@@ -249,7 +249,7 @@ a supervisor (#243); a task without a `supervisor` (one started before #243, or 
 the three legacy roles below (manager, coordinator, worker).
 
 - **Tick spawns supervisors** (#243): for each ready task without a supervisor, within a free slot, `tick`
-  (`--act` itself, else as a printed command) runs `taskq spawn --runtime R --name "S<N> <title>" --text
+  runs `taskq spawn --runtime R --name "S<N> <title>" --text
   "Run `cd <main checkout> && taskq supervise N` …"` — the same command on Claude and Codex. Spawn reserves
   the task like a worker launch (#208), starts the session, then in one write replaces the reservation with
   `supervisor` = that session (note `supervisor none → R:session (spawned by attempt …)`) and drops the lock.
@@ -263,7 +263,7 @@ the three legacy roles below (manager, coordinator, worker).
   are the owner's words, which the PM relays from its session. `take` accepts only the worker adopting the
   supervisor's reservation, or the worker of the supervisor's newest `launch` note (the same worker after a
   queue answer). The tick wakes an idle supervisor whose task is in review, or ready again without a
-  reservation, with one fixed line (`--act`; else a printed command), and the PM's Review section leaves
+  reservation, with one fixed line, and the PM's Review section leaves
   supervised tasks out. After `close` the tick retires the supervisor (Claude: `claude stop` + `rm` of a
   local, not busy job; Codex: the `S<N>` thread is archived once no open task names it).
 - **Capacity**: one slot of a runtime holds a task's supervisor and its worker together. `tick` counts a task

@@ -23,21 +23,22 @@ Each path must be a main checkout with a `taskq.toml`. A new phrase from the own
 ## The pass
 
 ```
-taskq projects [--act] [--json] [--timeout SECONDS]
+taskq projects [--json] [--timeout SECONDS]
 ```
 
-For each listed project, in list order, it runs the ordinary `taskq tick [--act] --json` with that checkout as its working directory, so the project's own `taskq.toml` and `taskq.local.toml` decide its board, filter and its own limit ([§ Limits](#limits)). Each tick has a timeout (300 s by default). A project whose tick fails, times out or prints no report is shown with the error, and the next project runs.
+For each listed project, in list order, it runs the ordinary `taskq tick --json` with that checkout as its working directory, so the project's own `taskq.toml` and `taskq.local.toml` decide its board, filter and its own limit ([§ Limits](#limits)). Each tick has a timeout (300 s by default). A project whose tick fails, times out or prints no report is shown with the error, and the next project runs.
 
-The output is one section per project:
+The output is each project's R6 report as its tick printed it:
 
 ```
-## taskq
+## acme/taskq
+
 Board: https://github.com/users/acme/projects/3
 
 | Task | Status | Runtime | Session |
 |---|---|---|---|
-| [#246](https://github.com/acme/taskq/issues/246) Multi-project PM | doing | claude @mac | [session](https://claude.ai/code/...) |
-- what the tick needs judgement on, one line each
+| [#246](https://github.com/acme/taskq/issues/246) Multi-project PM | doing (running) | claude @mac | [session](https://claude.ai/code/...) |
+then what the tick needs judgement on and the owner's open questions
 
 ## csgo
 Error: timeout after 300 s

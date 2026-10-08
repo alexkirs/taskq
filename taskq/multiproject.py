@@ -1,4 +1,4 @@
-"""`taskq projects`: the ordinary `taskq tick [--act] --json` in each checkout of the owner's list ([projects] of
+"""`taskq projects`: the ordinary `taskq tick --json` in each checkout of the owner's list ([projects] of
 taskq.local.toml), each with a timeout and a share of this machine's limits; one R6 report per project (R10).
 Specification: docs/multiproject-pm.md."""
 import argparse
@@ -61,7 +61,7 @@ def held(roots):
             + Counter(runtime for runtime, where, _ in slots if where == root) for root in roots}
 
 
-def run(name, checkout, act, timeout, cap, others):
+def run(name, checkout, timeout, cap, others):
     """One project's tick, `--limit` its own limit within the cap less the other projects' live workers: its JSON
     output, or {'error': ...}. Files, not pipes: a worker the tick launched may hold an inherited pipe open."""
     try:
@@ -72,7 +72,7 @@ def run(name, checkout, act, timeout, cap, others):
     limit = ','.join(f'{key}={min(own[key], max(0, count - others[key]))}' for key, count in cap.items())
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         try:
-            done = subprocess.run(TICK + ['--json', '--limit', limit] + (['--act'] if act else []), cwd=checkout,
+            done = subprocess.run(TICK + ['--json', '--limit', limit], cwd=checkout,
                                   stdout=out, stderr=err, stdin=subprocess.DEVNULL, timeout=timeout)
         except (subprocess.TimeoutExpired, OSError) as error:
             slow = isinstance(error, subprocess.TimeoutExpired)
@@ -80,30 +80,23 @@ def run(name, checkout, act, timeout, cap, others):
         text, said = (found.seek(0) or found.read().decode(errors='replace') for found in (out, err))
     try:
         found = json.loads(text.strip().splitlines()[-1])
-        if 'report' not in found:  # the tick stopped before its pass
-            return {'project': name, 'error': f'tick {found["outcome"]}: ' + '; '.join(found['refusals'])}
-        return {'project': name, 'outcome': found['outcome'], 'report': found['report'], 'refusals': found['refusals']}
+        if found['outcome'] == 'refused':  # the tick stopped before its pass
+            return {'project': name, 'error': 'tick refused: another tick pass is running'}
+        return {'project': name, 'outcome': found['outcome'], 'text': found['text']}
     except (IndexError, KeyError, TypeError, ValueError):
         last = (said.strip() or text.strip() or 'no output').splitlines()[-1]
         return {'project': name, 'error': f'tick exit {done.returncode}: {last}'}
 
 
 def render(result):
-    """One project's R6 report: heading, Board link, Task | Status | Runtime | Session, then what needs judgement."""
-    lines = [f'## {result["project"]}']
-    if 'error' in result:
-        return '\n'.join(lines + [f'Error: {result["error"]}'])
-    report = result['report']
-    lines += [f'Board: {report["board"]}', '', '| Task | Status | Runtime | Session |', '|---|---|---|---|']
-    lines += [f'| {row["task"]} {row["title"]} | {row["state"]} | {row["runtime"]} @{row["machine"]} | {row["session"]} |'
-              for row in report['workers']] or ['| none | | | |']
-    return '\n'.join(lines + [f'- {line}' for line in result['refusals']])
+    """One project's R6 report as its tick printed it, or the project's heading and its error."""
+    return f'## {result["project"]}\nError: {result["error"]}' if 'error' in result else result['text'].strip()
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='taskq projects', description=__doc__.split('\n')[0])
     parser.add_argument('--set', nargs='+', metavar='NAME=PATH', help="write the owner's list, replacing the old one")
-    parser.add_argument('--act', action='store_true', help='run tick --act in each project')
+    parser.add_argument('--act', action='store_true', help=argparse.SUPPRESS)  # ponytail: senders' old form; tick always acts
     parser.add_argument('--json', action='store_true', help='one JSON list of the projects\' results')
     parser.add_argument('--timeout', type=int, default=TIMEOUT, help=f'seconds per project (default {TIMEOUT})')
     args = parser.parse_args(argv)
@@ -115,6 +108,6 @@ def main(argv=None):
     for name, path in listed.items():  # the sessions again for each: the last tick may have started some
         live = held([Path(path).resolve() for path in listed.values()])
         others = sum((found for root, found in live.items() if root != Path(path).resolve()), Counter())
-        results.append(run(name, path, args.act, args.timeout, cap, others))
+        results.append(run(name, path, args.timeout, cap, others))
     print(json.dumps(results) if args.json else '\n\n'.join(map(render, results)))
     return 1 if any('error' in result or result['outcome'] == 'failure' for result in results) else 0

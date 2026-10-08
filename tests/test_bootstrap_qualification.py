@@ -67,12 +67,12 @@ class LocalAck(unittest.TestCase):
         tick = importlib.import_module('taskq.tick')
         launches = [self.enterContext(patch.object(module, name)) for module, name in
                     ((worker, 'spawn'), (worker, 'claude_spawn'), (worker, 'executor_run'), (worker, 'claude_wake'), (worker, 'take'),
-                     (q, 'codex_spawn'), (q, 'claude_spawn'), (tick, 'tick'), (tick, 'tick_pass'))]
+                     (q, 'codex_spawn'), (q, 'claude_spawn'), (tick, 'tick'), (tick, 'queue_pass'))]
         with patch.object(q, 'api', store), patch.object(q, 'STORE', store):
             _, code, envelope = preflight(lambda *a, **k: SimpleNamespace(returncode=1, stdout='', stderr='denied'))
         self.assertNotEqual(code, 0)
         self.assertEqual([action['action'] for action in envelope['actions']], ['local_command_ack'])
-        self.assertEqual((envelope['tasks'], envelope['sessions']), ([], []))
+        self.assertEqual(envelope['tasks'], [])
         for mock in [store, *launches]:
             mock.assert_not_called()
 

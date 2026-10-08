@@ -143,17 +143,15 @@ Code/docs results require `--sha` of a commit pushed to `main`.
 
 ## Start workers
 
-Configure one sender for the project to run `taskq tick --act`.
+Configure one sender for the project to run `taskq tick`. Each pass does the mechanical steps itself
+(spawn, nudge, wake, retire) and prints the R6 report: heading, Board link, one table Task | Status |
+Runtime | Session, then what needs judgement and the owner's open questions. It exits 1 for judgement.
 
 For CLI automation, `tick`, `report` and `cleanup` accept `--json`. Stdout is one JSON object with
-`command`, `outcome` (`ok`, `judgement_needed`, `failure`), `actions`, `tasks`, `sessions`, `refusals`
-and the captured prose in `text`. Actions carry their status and available task/session identifiers;
-`report` actions are timestamped note events. Cleanup includes its `plan` (remove/ask/keep), and
-`--apply` includes actual removals and freed bytes. JSON does not make a command read-only:
-plain tick still updates, reconciles and archives; cleanup still fetches, and `--apply` removes eligible items.
-`tick --act --json` exits 1 for judgement and 2 for failure; other JSON commands retain exit 0 for a
-completed report/plan (including `judgement_needed`) and exit 2 for failure. Without `--json`, output
-and exit codes are unchanged.
+`outcome` (`ok`, `judgement_needed`, `failure`), `tasks` and the captured prose in `text`; `report` and
+`cleanup` also carry `actions` and `refusals`, and cleanup its `plan` (remove/ask/keep) and, with `--apply`,
+actual removals and freed bytes. JSON does not make a command read-only. `tick --json` exits 1 for judgement
+and 2 for failure; other JSON commands exit 0 for a completed report/plan and 2 for failure.
 
 
 Your profile lives in `taskq.local.toml` of the main checkout: personal, never committed
@@ -268,7 +266,7 @@ git fetch origin && git worktree add -b <branch> .worktrees/<branch> origin/main
 
 Modules: `taskq/__init__.py` the core (config, store protocol, issue parse/save, the command line),
 `worker.py` the task commands (`add` … `take`, `beat`, `ask`, `result`, `answer`/`reject`/`release`, `close`) and worker
-sessions, `tick.py` the `tick` command (board moves, Workers table, beat stamp), `doctor.py` `doctor`, `init` and
+sessions, `tick.py` the `tick` command (its steps and the R6 report), `doctor.py` `doctor`, `init` and
 `update`, `store_github.py` the GitHub store, `codex.py` the Codex app server, `cleanup.py` the `cleanup` command,
 `selftest.py` the `selftest` command. Each module reaches the core as `core.<name>`; the core re-exports what it moved,
 so `taskq.<name>` still works, and a test patches a moved function in its own module where that module calls it.

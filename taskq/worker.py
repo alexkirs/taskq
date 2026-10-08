@@ -345,6 +345,10 @@ def close(args):
             subprocess.run(['git', 'fetch', '-q', 'origin', 'main'], check=True)
             if subprocess.run(['git', 'merge-base', '--is-ancestor', sha, 'origin/main']).returncode:
                 core.fail(f'{sha} is not in origin/main; reject the task so the worker pushes it')
+    # Publication can succeed before an interrupted close records it. Do not close or retire a later claim/result.
+    current = core.unchanged(current)
+    if not current:
+        return
     core.save(current, close=True, note_action='close', note_text=args.text)
     core.unlock(args.iid)
     print(f'#{args.iid} closed')
@@ -367,6 +371,9 @@ def publish_review(current, sha):
             f'+refs/heads/{branch}:refs/remotes/origin/{branch}')
         if sha != git('rev-parse', f'refs/remotes/origin/{branch}'):
             raise ValueError('result SHA is not the task branch head')
+        if not subprocess.run(['git', '-C', str(core.ROOT), 'merge-base', '--is-ancestor', sha,
+                               'refs/remotes/origin/main']).returncode:
+            return
         # A detached worktree lets a coordinator run from any checkout, including a dirty one.
         with tempfile.TemporaryDirectory(prefix='taskq-review-') as folder:
             tree = str(Path(folder) / 'tree')

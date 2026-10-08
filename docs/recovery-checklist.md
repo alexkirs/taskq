@@ -114,6 +114,15 @@ Project `publish=review`: push only `taskq-<iid>`, submit the exact SHA with
 `taskq result`, and wait for PM review. If a brief or policy demands a push to
 main before acceptance, `taskq ask` and stop.
 
+### Interrupted close after review publication
+
+1. Re-read the task and the remote refs. The submitted SHA must still be the
+   exact `taskq-<iid>` head.
+2. If that SHA is already an ancestor of fresh `origin/main`, close records the
+   accepted result without pushing an older SHA again.
+3. Before close or retirement, re-read the same review claim and result. If
+   either changed, stop. Do not retire that worker, tree, or branch.
+
 ## Evidence for #182
 
 Observed 2026-10-07 UTC from the main checkout by the Claude worker holding

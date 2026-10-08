@@ -460,6 +460,17 @@ class Cycle(unittest.TestCase):
             self.do(COORDINATOR, 'close', iid, '--text', 'ok')
         self.assertIn(['git', 'log', '-1', '--format=%h %an %ad %s', 'abc1234'], runs)
 
+    def test_close_does_not_retire_resources_after_the_review_changed(self):
+        iid = self.add('--type', 'code')
+        self.do(CLAUDE, 'take', iid)
+        self.do(CLAUDE, 'result', iid, '--sha', 'abc1234', '--text', 'x', '--checks', 'x')
+        runs, patched = self.run_recorded()
+        with patched, patch.object(q, 'unchanged', return_value=None), patch.object(worker, 'retire_local') as retire:
+            self.do(COORDINATOR, 'close', iid, '--text', 'ok')
+        self.assertEqual(self.state(iid), 'review')
+        retire.assert_not_called()
+        self.assertNotIn(['git', 'branch', '-d', f'taskq-{iid}'], runs)
+
     def test_question_then_another_runtime_continues_and_tick_guides(self):
         iid = self.add('--type', 'research', '--runtime', 'any')
         self.assertIn('Start 1 worker', self.do(CLAUDE, 'tick'))

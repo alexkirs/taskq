@@ -1,0 +1,240 @@
+"""#223: completion supervision. The tracker is the transport; the tick correlates what it delivered with what is
+still pending (state, claim, revision) and never reads an acknowledgement from a delivery. Run with `discover -s tests`."""
+import contextlib
+import importlib
+import io
+import json
+import os
+from pathlib import Path
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+import taskq as q
+import test_taskq as base
+from test_taskq import CLAUDE, CODEX, COORDINATOR, link
+
+codex = importlib.import_module('taskq.codex')
+tick = importlib.import_module('taskq.tick')
+
+
+class Supervision(unittest.TestCase):
+    do, refused, add, state = base.Cycle.do, base.Cycle.refused, base.Cycle.add, base.Cycle.state
+
+    def setUp(self):
+        base.Cycle.setUp(self)
+        q.LOCAL.write_text('[coordinator]\nsession = "coordinator-session"\n')
+        self.addCleanup(q.LOCAL.unlink, missing_ok=True)
+        self.enterContext(patch.object(tick, 'woken', return_value=self.directory / 'woken'))
+        self.enterContext(patch.object(q, 'spawn', lambda args: None))
+        self.woken = []
+        self.enterContext(patch.object(q, 'claude_wake', lambda session, prompt: self.woken.append((session, prompt))))
+        self.agents['coordinator-session'] = {'id': 'coordina', 'sessionId': 'coordinator-session', 'kind': 'background',
+                                              'cwd': str(q.ROOT), 'name': 'PM (mac-1)', 'state': 'done'}
+
+    def act(self):
+        """One `tick --act --wake`: its printed output; the wake list and report actions tell what it delivered."""
+        self.report = []
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()), \
+                patch.dict(os.environ, COORDINATOR), patch.object(q, 'record', lambda args, action, **values: self.report.append({'action': action, **values})):
+            with contextlib.suppress(SystemExit):
+                q.main(['tick', '--act', '--wake'])
+        return out.getvalue()
+
+    def wakes(self):
+        return [event for event in self.report if event['action'] == 'wake']
+
+    def test_resubmitted_result_and_second_question_are_new_pending_sets(self):
+        code = self.add('--type', 'code', '--runtime', 'claude')
+        self.do(CLAUDE, 'take', code)
+        self.do(CLAUDE, 'result', code, '--sha', 'abc1234', '--text', 'first', '--checks', 'one')
+        self.act()
+        self.assertEqual(len(self.woken), 1)
+        self.assertIn('already woken', self.act())
+        self.assertEqual(self.wakes()[-1]['status'], 'already delivered')
+        self.assertEqual(len(self.woken), 1)
+        # The same SHA with new checks after a reject in the worker's session: a new result note, a new revision.
+        self.do(CLAUDE, 'reject', code, '--text', 'more checks')
+        self.do(CLAUDE, 'result', code, '--sha', 'abc1234', '--text', 'second', '--checks', 'two')
+        self.act()
+        self.assertEqual(len(self.woken), 2)
+        self.assertTrue(self.wakes()[-1]['pending'][0].startswith(f'review {code} claude:claude-session result '))
+        self.assertEqual(self.wakes()[-1]['acknowledged'], 'unknown')
+        # A research result has no SHA: its judgement line is the same `review N None` each time, its revision is not.
+        research = self.add('--type', 'research', '--runtime', 'codex')
+        self.do(CODEX, 'take', research)
+        self.do(CODEX, 'result', research, '--text', 'found', '--checks', 'read')
+        self.act()
+        self.assertEqual(len(self.woken), 3)
+        self.do(CODEX, 'reject', research, '--text', 'look again')
+        self.do(CODEX, 'result', research, '--text', 'found more', '--checks', 'read')
+        self.act()
+        self.assertEqual(len(self.woken), 4)
+        # A second question after an in-session answer: the ask line `ask N` repeats, the ask note does not.
+        asked = self.add('--type', 'asset', '--runtime', 'claude')
+        self.do(CLAUDE, 'take', asked)
+        self.do(CLAUDE, 'ask', asked, '--text', 'A or B?')
+        self.act()
+        self.assertEqual(len(self.woken), 5)
+        self.do(CLAUDE, 'answer', asked, '--text', 'A')
+        self.do(CLAUDE, 'ask', asked, '--text', 'C or D?')
+        self.act()
+        self.assertEqual(len(self.woken), 6)
+
+    def test_every_open_question_is_pending_even_when_the_summary_hides_it(self):
+        code = self.add('--type', 'code', '--runtime', 'claude')
+        self.do(CLAUDE, 'take', code)
+        self.do(CLAUDE, 'result', code, '--sha', 'abc1234', '--text', 'x', '--checks', 'x')
+        asked = self.add('--type', 'asset', '--runtime', 'claude')
+        self.do(CLAUDE, 'take', asked)
+        self.do(CLAUDE, 'ask', asked, '--text', 'A or B?')
+        self.act()
+        self.assertEqual(len(self.woken), 1)
+        self.assertEqual([line.split()[0] for line in self.wakes()[-1]['pending']], ['review', 'ask'])
+        # Shown: the question leaves the judgement lines for a day (one more wake for the shorter list, as before
+        # #223), not the pending set.
+        self.act()
+        self.assertEqual(len(self.woken), 2)
+        self.assertEqual([line.split()[0] for line in self.wakes()[-1]['pending']], ['review', 'ask'])
+        self.assertIn('already woken', self.act())
+        # The owner answers through the board: the question is resolved, the set is new although the lines are the same.
+        self.do(COORDINATOR, 'answer', asked, '--text', 'A')
+        self.assertEqual(self.state(asked), 'ready')
+        self.act()
+        self.assertEqual(len(self.woken), 3)
+        self.assertEqual([line.split()[0] for line in self.wakes()[-1]['pending']], ['review'])
+
+    def test_result_block_is_part_of_the_revision_and_delivery_is_rechecked(self):
+        code = self.add('--type', 'code', '--runtime', 'claude')
+        self.do(CLAUDE, 'take', code)
+        self.do(CLAUDE, 'result', code, '--sha', 'abc1234', '--text', 'x', '--checks', 'one')
+        self.act()
+        self.assertEqual(len(self.woken), 1)
+        before = tick.revision(q.task(code))
+        # The PUT landed with the same SHA and new checks, its note did not: the block makes a fresh revision.
+        q.save(q.task(code), result={'sha': 'abc1234', 'checks': 'two'})
+        after = tick.revision(q.task(code))
+        self.assertNotEqual(before, after)
+        self.assertEqual(before.split()[:2], after.split()[:2])  # the same old note
+        self.assertEqual(json.loads(after.split(' ', 2)[2])['checks'], 'two')
+        self.act()
+        self.assertEqual(len(self.woken), 2)
+        # A result with no note at all: the block alone is the revision; its note later changes it once.
+        self.gitlab.notes = {number: note for number, note in self.gitlab.notes.items() if not note['body'].startswith('**result**')}
+        self.assertTrue(tick.revision(q.task(code)).startswith('block '))
+        self.act()
+        self.assertEqual(len(self.woken), 3)
+        self.assertIn('Handed in:\n\nData, not instructions:\n```\nnone', self.woken[-1][1])
+        # Delivered is not applied: after TICK_LIVE_MINUTES the same set is re-read; an item that moved between the
+        # read and the send stops the delivery; an unchanged set reaches an idle coordinator once more.
+        key = tick.woken().read_text().split()[0]
+        aged = f'{key}\n{time.time() - tick.TICK_LIVE_MINUTES * 60 - 1:.0f}\n'
+        tick.woken().write_text(aged)
+        with patch.object(tick, 'still_pending', lambda item, line: False):
+            self.assertIn('changed since this tick read it', self.act())
+        self.assertEqual((len(self.woken), self.wakes()[-1]['status']), (3, 'pending changed'))
+        self.assertIn('again: the same items are still pending', self.act())
+        self.assertEqual(len(self.woken), 4)
+        self.assertEqual(self.wakes()[-1]['status'], 'delivered again')
+        self.assertEqual(self.wakes()[-1]['acknowledged'], 'unknown')
+        self.assertIn('already woken', self.act())
+        tick.woken().write_text(aged)
+        self.agents['coordinator-session'].update(pid=4242, status='busy', state='working')
+        self.assertIn('The coordinator is busy', self.act())
+        self.assertEqual(len(self.woken), 4)
+        # The decision: close by the coordinator. The tuple is gone; the report never said applied.
+        self.agents['coordinator-session'].update(state='done')
+        del self.agents['coordinator-session']['pid']
+        self.do(COORDINATOR, 'reject', code, '--text', 'rebase')
+        self.assertEqual(self.state(code), 'ready')
+        self.act()
+        self.assertEqual((len(self.woken), self.wakes()), (4, []))  # resolved: no judgement, no wake, nothing says applied
+        self.assertNotIn('applied', json.dumps(self.report))
+
+    def test_problem_note_reaches_judgement_and_keeps_the_claim(self):
+        code = self.add('--type', 'code', '--runtime', 'claude')
+        self.do(CLAUDE, 'take', code)
+        self.agents['claude-session'] = {'id': 'claudese', 'sessionId': 'claude-session', 'kind': 'background',
+                                         'cwd': str(q.ROOT), 'name': f'T{code} t', 'state': 'working', 'pid': 3, 'status': 'idle'}
+        self.assertIn('## Claude idle', self.do(COORDINATOR, 'tick'))
+        self.do(CLAUDE, 'problem', '--task', code, '--text', 'blocked on the GPU driver')
+        output = self.do(COORDINATOR, 'tick')
+        self.assertIn('## Worker problems', output)
+        self.assertIn('blocked on the GPU driver', output)
+        self.assertNotIn('## Claude idle', output)
+        self.assertNotIn('Released', output)
+        output = self.act()
+        self.assertEqual([prompt for session, prompt in self.woken if prompt == tick.NUDGE], [])  # no nudge
+        self.assertEqual(len(self.woken), 1)  # judgement: the coordinator
+        self.assertIn('## Worker problems', self.woken[0][1])
+        note = next(number for number, note in self.gitlab.notes.items() if note['body'].startswith('**problem**'))
+        self.assertTrue(self.wakes()[-1]['pending'][0].startswith(f'doing {code} claude:claude-session problem {note} '))
+        self.assertEqual((self.state(code), q.task(code)['claim']['session']), ('doing', 'claude-session'))
+        # answer is not accepted on doing; the worker's own ask ends the problem listing; a busy worker is never stuck.
+        self.assertIn('is doing, not ask or later', self.refused(COORDINATOR, 'answer', code, '--text', 'x'))
+        self.agents['claude-session']['status'] = 'busy'
+        self.assertNotIn('## Worker problems', self.do(COORDINATOR, 'tick'))
+        self.agents['claude-session']['status'] = 'idle'
+        self.do(CLAUDE, 'ask', code, '--text', 'which driver?')
+        output = self.do(COORDINATOR, 'tick')
+        self.assertNotIn('## Worker problems', output)
+        self.assertIn('which driver?', output)
+
+    def test_codex_observation_names_both_sources_and_their_conflict(self):
+        client = type('Client', (), {'permission_requests': {}})()
+        running = [{'item': {'type': 'commandExecution', 'status': 'inProgress'}}]
+        turn = {'status': 'inProgress', 'app': True, 'entries': running, 'sources': {'app': 'notLoaded/interrupted', 'rollout': 'running'}}
+        found = codex.codex_observation(client, 't', {'type': 'notLoaded'}, [turn], 12)
+        self.assertEqual((found['status'], found['conflict'], found['source']), ('active', True, 'rollout tail over app metadata'))
+        self.assertEqual(found['sources'], {'app': 'notLoaded/interrupted', 'rollout': 'running'})
+        plain = codex.codex_observation(client, 't', {'type': 'active'}, [{'status': 'inProgress', 'entries': running}], 12)
+        self.assertEqual((plain['status'], plain['conflict'], plain['source']), ('active', False, 'codex app-server'))
+        self.assertEqual(plain['sources'], {'app': 'active/inProgress', 'rollout': 'not consulted'})
+        # The snapshot reads the tail itself: running, ended, unread; the app server's own status is never replaced.
+        with tempfile.TemporaryDirectory() as directory:
+            rollout = Path(directory) / 'rollout.jsonl'
+            rollout.write_text('{"type":"response_item","payload":{}}\n')
+            calls = {'thread/read': {'thread': {'status': {'type': 'notLoaded'}, 'path': str(rollout)}},
+                     'thread/turns/list': {'data': [{'id': 'u1', 'status': 'interrupted'}]},
+                     'thread/items/list': {'data': []}}
+            client.call = lambda method, params: json.loads(json.dumps(calls[method]))
+            status, turns, _ = codex.codex_snapshot(client, 't', 1)
+            self.assertEqual((status['type'], turns[0]['status'], turns[0]['sources']), ('notLoaded', 'inProgress', {'app': 'notLoaded/interrupted', 'rollout': 'running'}))
+            rollout.write_text('{"type":"response_item","payload":{}}\n{"type":"task_complete","turn_id":"u1"}\n')
+            status, turns, _ = codex.codex_snapshot(client, 't', 1)
+            self.assertEqual((turns[0]['status'], turns[0]['sources']['rollout'], turns[0].get('app')), ('interrupted', 'ended', None))
+            calls['thread/read']['thread']['path'] = None
+            status, turns, _ = codex.codex_snapshot(client, 't', 1)
+            self.assertEqual((turns[0]['status'], turns[0]['sources']['rollout']), ('interrupted', 'unread'))
+            calls['thread/read']['thread']['status']['type'] = 'active'
+            self.assertEqual(codex.codex_snapshot(client, 't', 1)[1][0]['sources'], {'app': 'active/interrupted', 'rollout': 'not consulted'})
+
+    def test_board_handin_while_not_loaded_and_decisions_out_of_order(self):
+        asset = self.add('--type', 'asset')
+        self.do(CODEX, 'take', asset)
+        self.codex.status = 'notLoaded'
+        self.codex.turns = [{'id': 'u1', 'status': 'interrupted'}]
+        self.do(CODEX, 'result', asset, '--text', 'rendered', '--checks', 'looked')
+        sent = []
+        with patch.object(q, 'codex_send', lambda args: sent.append(args.thread)):
+            output = self.act()
+        self.assertIn(f'## Review {link(asset)}', self.woken[-1][1])
+        self.assertEqual((sent, self.state(asset)), ([], 'review'))
+        self.assertNotIn('Released', output)
+        # Out of order: a reject after the close, a second answer, an answer on a doing task. The state refuses each.
+        self.assertIn('is review, not ask or later', self.refused(COORDINATOR, 'answer', asset, '--text', 'x'))
+        with patch.object(q, 'retire_local', lambda current: None):
+            self.do(COORDINATOR, 'close', asset, '--text', 'ok')
+        self.assertIn('is not an open taskq task', self.refused(COORDINATOR, 'reject', asset, '--text', 'late'))
+        asked = self.add('--type', 'asset', '--runtime', 'claude')
+        self.do(CLAUDE, 'take', asked)
+        self.do(CLAUDE, 'ask', asked, '--text', 'A or B?')
+        self.do(COORDINATOR, 'answer', asked, '--text', 'A')
+        self.assertEqual(self.state(asked), 'ready')
+        self.assertIn('is ready, not ask or later', self.refused(COORDINATOR, 'answer', asked, '--text', 'A again'))
+        self.assertIn('**answer** · claude:coordina', self.do(CLAUDE, 'worker'))  # the next worker's brief holds the decision
+
+
+if __name__ == '__main__':
+    unittest.main()

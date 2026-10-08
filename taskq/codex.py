@@ -156,13 +156,18 @@ def codex_observation(codex, thread, status, turns, stamp):
     terminal = status.get('type') != 'active' and latest.get('status') in ('completed', 'failed', 'interrupted')
     state = ('waiting_permission' if waiting else 'terminal' if terminal else
              'active' if latest.get('status') == 'inProgress' and running else 'unknown')
+    # #223: `app` is set only when the app server said notLoaded/interrupted and the rollout tail said running: the
+    # tail decided. The observation names both sources and that conflict; status and blocker are as before.
+    conflict = bool(latest.get('app'))
     return {'runtime': 'codex', 'session': thread, 'status': state,
             'observed_at': datetime.now(timezone.utc).isoformat(), 'event_at': stamp,
             'session_link': f'{core.PAGES.rstrip("/")}/open.html#codex://threads/{thread}',
             'exact_blocker': ('Owner approval required in runtime UI' if waiting else
                               'Owner input required in runtime UI' if 'waitingOnUserInput' in flags else
                               'No current execution or terminal evidence; approval visibility incomplete' if state == 'unknown' else None),
-            'source': 'codex app-server', 'permission_requests': pending,
+            'source': 'rollout tail over app metadata' if conflict else 'codex app-server', 'conflict': conflict,
+            'sources': latest.get('sources', {'app': f'{status.get("type")}/{latest.get("status")}', 'rollout': 'not consulted'}),
+            'permission_requests': pending,
             'approval_visibility': 'pending' if waiting else 'unknown',
             'notify_dedup': (f'permission codex {thread} ' + ','.join(sorted(str(item['request_id']) for item in pending))
                              if pending else f'permission codex {thread} flag' if waiting else None)}
@@ -410,26 +415,36 @@ def recorded_turn_policy(path, turn_id):
     return policy
 
 
-def codex_app_running(metadata, turn):
-    """The shared server reads a turn the app is running from its rollout and calls it `interrupted`, since
-    the turn has no end yet. The end (`task_complete` or `turn_aborted`) is always the turn's last record."""
-    if metadata['status']['type'] != 'notLoaded' or turn['status'] not in ('interrupted', 'inProgress'):
-        return False
+def codex_rollout(metadata, turn):
+    """#223: what the thread's own rollout tail says about a turn: `running` (no end record yet), `ended`
+    (`task_complete` or `turn_aborted`, always the turn's last record), or `unread` (no path, unreadable)."""
     try:
         with open(metadata.get('path') or '', 'rb') as handle:
             handle.seek(max(0, handle.seek(0, 2) - CODEX_TAIL_BYTES))
             tail = handle.read(CODEX_TAIL_BYTES)
     except OSError:
+        return 'unread'
+    return 'ended' if any(f'"type":"{end}","turn_id":"{turn["id"]}"'.encode() in tail for end in ('task_complete', 'turn_aborted')) else 'running'
+
+
+def codex_app_running(metadata, turn):
+    """The shared server reads a turn the app is running from its rollout and calls it `interrupted`, since
+    the turn has no end yet. The end (`task_complete` or `turn_aborted`) is always the turn's last record."""
+    if metadata['status']['type'] != 'notLoaded' or turn['status'] not in ('interrupted', 'inProgress'):
         return False
-    return not any(f'"type":"{end}","turn_id":"{turn["id"]}"'.encode() in tail for end in ('task_complete', 'turn_aborted'))
+    return codex_rollout(metadata, turn) == 'running'
 
 
 def codex_snapshot(codex, thread, limit=3, include_policy=False):
     """Read persisted item lifecycles, including in-progress commands, without resuming the worker."""
     metadata = codex.call('thread/read', {'threadId': thread})['thread']
     turns = codex.call('thread/turns/list', {'threadId': thread, 'limit': limit, 'itemsView': 'notLoaded'})['data']
-    if turns and codex_app_running(metadata, turns[0]):
-        turns[0].update(status='inProgress', app=True)
+    if turns:
+        # #223: both sources are kept on the turn: what the app server said and what the rollout tail says.
+        turns[0]['sources'] = {'app': f'{metadata["status"]["type"]}/{turns[0]["status"]}',
+                               'rollout': codex_rollout(metadata, turns[0]) if metadata['status']['type'] == 'notLoaded' else 'not consulted'}
+        if codex_app_running(metadata, turns[0]):
+            turns[0].update(status='inProgress', app=True)
     for turn in turns:
         page = codex.call('thread/items/list', {'threadId': thread, 'turnId': turn['id'],
                                                'limit': CODEX_ITEM_LIMIT, 'sortDirection': 'desc'})
@@ -484,6 +499,8 @@ def codex_read(args):
     print(f'status: {status["type"]}' + (f' {status.get("activeFlags")}' if status['type'] == 'active' else '') +
           (' (turn running in the Codex app, which holds the session)' if held else ''))
     print(f'last event: {codex_age(stamp)}')
+    if turns:  # #223: which source said what; a conflict means the rollout tail decided over stale app metadata
+        print(f'sources: app {turns[0]["sources"]["app"]}, rollout {turns[0]["sources"]["rollout"]}' + ('; conflict: rollout tail over app metadata' if held else ''))
     policy = (turns[0].get('policy') if turns else None) or {}
     sandbox = policy.get('sandbox') or {}
     shown = {key: sandbox[key] for key in ('type', 'network_access', 'writable_roots') if key in sandbox}

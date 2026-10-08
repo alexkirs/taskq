@@ -97,8 +97,9 @@ project root the owner listed (#290).
 
 ### R11. Retire a worker only after accepted review
 
-A worker session ends only when its result is accepted: `close` stops it on the claim's machine and removes its clean
-worktree and branch (§ 6; #300, #302). A rejected result is `requeue` with the fixes; the next worker continues the
+A worker session ends only when its result is accepted: `close` stops and removes every `T<N>` session on
+its machine (`retire`; duplicates and resumes leave several, #360) and removes the clean worktree and branch on the claim's
+machine (§ 6; #300, #302). Each tick removes the stopped `T<N>` sessions of tasks no longer open. A rejected result is `requeue` with the fixes; the next worker continues the
 branch. Sessions are found by the claim in the block, names by the `T<N>` prefix.
 Changed: "supervisor retires its worker; cleanup ends sessions without a task" → `close` does it; no cleanup command
 (#290, #302).
@@ -164,7 +165,7 @@ Runtime file: four module-level functions, a fifth optional.
 | `send(session, text)` | deliver one message; returns the session id (it may change) |
 | `alive(session)` | `True` running, `False` gone, `None` cannot tell |
 | `link(session)` | a URL the owner opens to watch the session, or `None` |
-| `stop(session)` | optional: end the session's process; `close` calls it on the claim's machine |
+| `retire(gone, running=True)` | optional: stop and remove this machine's `T<N>` sessions with `gone(N)` true; `close` calls it for its task, the tick for tasks no longer open with `running=False` |
 
 ## 3. Data model
 
@@ -352,10 +353,10 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 
 ## 8. Runtimes
 
-| Runtime | spawn | send | alive | link | stop |
+| Runtime | spawn | send | alive | link | retire |
 |---|---|---|---|---|---|
-| Claude | `claude --bg --name "T<N> <ORCH> <title> (<machine>)"` in the project root; tools `Bash Read Edit Write Glob Grep WebFetch WebSearch`, no MCP, `--permission-mode dontAsk` | `claude stop`, then `claude --bg --resume <id> <text>` (a new id) | `claude agents --json --all` | Remote Control URL | `claude stop <job id>` |
-| Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread>` in `.taskq/T<N>.pid` | `codex exec resume <id> <text>` | the pid is running | `open.html#codex://threads/<id>` | none: a turn ends by itself |
+| Claude | `claude --bg --name "T<N> <ORCH> <title> (<machine>)"` in the project root; tools `Bash Read Edit Write Glob Grep WebFetch WebSearch`, no MCP, `--permission-mode dontAsk` | `claude stop`, then `claude --bg --resume <id> <text>` (a new id) | `claude agents --json --all` | Remote Control URL | `claude stop <job id>` when running, then `claude rm <job id>` |
+| Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread>` in `.taskq/T<N>.pid` | `codex exec resume <id> <text>` | the pid is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` |
 
 - A worker never inherits the tick's session id: `taskq.py` removes `CLAUDE_CODE_SESSION_ID` and
   `CODEX_THREAD_ID` from its environment.

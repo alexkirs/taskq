@@ -297,8 +297,11 @@ class FakeRuntime:
     def link(self, session):
         return f'https://watch/{session}'
 
-    def stop(self, session):
-        self.stopped.append(session)
+    def retire(self, gone, running=True):
+        for session, alive in list(self.sessions.items()):
+            if gone(int(session.removeprefix('s-T'))) and (running or not alive):
+                self.stopped.append(session)
+                del self.sessions[session]
 
 
 class Tick(Base):
@@ -441,9 +444,42 @@ class Tick(Base):
             taskq.move(self.task(n), 'review', 'result', claim=claim, result={'sha': 'a' * 40})
             with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
                 self.run_cli('close', str(n))
-        self.assertEqual(self.fake.stopped, ['s-T1'])
+        self.assertEqual(self.fake.stopped, ['s-T1', 's-T2'])  # the fake lists both here; on a real machine only its own
         self.assertNotIn('stop it there', self.board.issues[1]['comments'][-1])
         self.assertEqual(self.board.issues[2]['comments'][-1], '**close** · claude:01234567\n\nsession s-T2 runs on win: stop it there')
+
+    def test_tick_removes_stopped_sessions_of_closed_tasks(self):
+        self.add()
+        self.fake.sessions.update({'s-T8': True, 's-T9': False})  # tasks 8 and 9 are not open
+        self.run_cli('tick')
+        self.assertEqual(self.fake.stopped, ['s-T9'])
+        self.assertEqual(set(self.fake.sessions), {'s-T1', 's-T8'})
+
+    def test_claude_retire_stops_and_removes_every_session_of_the_task(self):
+        claude, calls = taskq.Claude(), []
+        claude.agents = lambda: {
+            'a': {'id': 'ja', 'name': 'T5 CLD fix (mac)', 'pid': 1, 'state': 'working'},
+            'b': {'id': 'jb', 'name': 'T5 CLD fix (mac)', 'state': 'stopped'},
+            'c': {'id': 'jc', 'name': 'T6 CLD other (mac)', 'state': 'stopped'},
+            'd': {'id': 'jd', 'name': 'T5 notes', 'state': 'stopped'}}  # the owner's own job
+        with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:])):
+            claude.retire(lambda n: n == 5)
+            self.assertEqual(calls, [['stop', 'ja'], ['rm', 'ja'], ['rm', 'jb']])
+            calls.clear()
+            claude.retire(lambda n: n != 6, running=False)
+            self.assertEqual(calls, [['rm', 'jb']])
+
+    def test_codex_retire_archives_the_task_threads(self):
+        with tempfile.TemporaryDirectory() as folder:
+            taskq.CONFIG['root'] = Path(folder)
+            (Path(folder) / '.taskq').mkdir()
+            for n in (3, 4):
+                (Path(folder) / '.taskq' / f'T{n}.pid').write_text(f'999999999 thread-{n}')
+            calls = []
+            with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:])):
+                taskq.Codex().retire(lambda n: n == 3)
+            self.assertEqual(calls, [['archive', 'thread-3']])
+            self.assertEqual([path.name for path in (Path(folder) / '.taskq').iterdir()], ['T4.pid'])
 
     def test_codex_alive_from_pid_file(self):
         with tempfile.TemporaryDirectory() as folder:

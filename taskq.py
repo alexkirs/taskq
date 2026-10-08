@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
-import argparse, contextlib, importlib.util, json, os, re, shutil, socket, subprocess, sys, time
+import argparse, contextlib, importlib.util, json, os, re, shutil, signal, socket, subprocess, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -184,7 +184,8 @@ def make_board(config):
 # --- runtime --------------------------------------------------------------------------------
 # Four functions: spawn(name, prompt, cwd) -> session, send(session, text) -> session (a Claude resume may continue
 # under a new id), alive(session) -> True/False/None (running / gone / cannot tell), link(session) -> url or None.
-# Optional fifth: stop(session), which close calls on the claim's machine (#302).
+# Optional fifth: retire(gone, running=True) stops and removes this machine's `T<N>` sessions whose task gone(N) names:
+# close calls it for its task (#302, #360), the tick for closed tasks, stopped sessions only.
 
 def worker_env():  # a worker must not inherit the tick's session id, nor a spawning worker's task (#333)
     return {key: value for key, value in os.environ.items() if key not in (*SESSIONS.values(), 'TASKQ_TASK', 'TASKQ_RUNTIME')}
@@ -235,9 +236,24 @@ class Claude:
         agent = self.stop(session)
         return self.start(['--resume', session, *self.flags(agent.get('name')), text], agent.get('cwd') or CONFIG['root'])
 
+    @staticmethod
+    def running(agent):
+        return bool(agent.get('pid')) and agent.get('state') not in ('done', 'failed', 'stopped')
+
     def alive(self, session):
         agent = (self.agents() or {}).get(session)
-        return None if agent is None else bool(agent.get('pid')) and agent.get('state') not in ('done', 'failed', 'stopped')
+        return None if agent is None else self.running(agent)
+
+    def retire(self, gone, running=True):
+        """`claude stop` + `claude rm`: duplicate spawns and resumes leave several jobs per task, and a stopped job stays listed (#360)."""
+        claude = shutil.which('claude') or 'claude'
+        for agent in (self.agents() or {}).values():
+            n = re.match(r'T(\d+) [A-Z]{3} ', agent.get('name') or '')  # worker_name: never the owner's own jobs
+            if not n or not gone(int(n[1])) or not agent.get('id') or self.running(agent) and not running:
+                continue
+            if agent.get('pid'):
+                subprocess.run([claude, 'stop', agent['id']], capture_output=True, timeout=60)
+            subprocess.run([claude, 'rm', agent['id']], capture_output=True, timeout=60)
 
     def link(self, session):
         """The Remote Control URL: ~/.claude/jobs/<short>/state.json holds `bridgeSessionId` cse_<id> (#83)."""
@@ -301,6 +317,17 @@ class Codex:
     def alive(self, session):
         path = self.pid_file(session)
         return None if path is None else pid_alive(int(path.read_text().split()[0]))
+
+    def retire(self, gone, running=True):
+        """Kill the turn's process, `codex archive` the thread, drop .taskq/T<N>.pid (#360)."""
+        for path in (CONFIG['root'] / '.taskq').glob('T*.pid'):
+            n, (pid, thread) = re.fullmatch(r'T(\d+)', path.stem), path.read_text().split()
+            if not n or not gone(int(n[1])) or pid_alive(int(pid)) and not running:
+                continue
+            if pid_alive(int(pid)):
+                os.kill(int(pid), signal.SIGTERM)
+            subprocess.run([shutil.which('codex') or 'codex', 'archive', thread], capture_output=True, timeout=60)
+            path.unlink()
 
     def link(self, session):
         return f'{CONFIG.get("pages", "https://alexkirs.github.io/taskq/").rstrip("/")}/open.html#codex://threads/{session}'
@@ -450,17 +477,20 @@ def close_one(args):
         if subprocess.run([*git, 'merge-base', '--is-ancestor', sha, 'origin/main'], capture_output=True).returncode:
             fail(f'#{args.n}: result {sha} is not on origin/main')
     claim = current['claim'] or {}
-    stop = getattr(runtimes().get(claim.get('runtime')), 'stop', None)
-    if stop and claim.get('name') != machine():
+    if hasattr(runtimes().get(claim.get('runtime')), 'retire') and claim.get('name') not in (None, machine()):
         args.text = (f'{args.text}\n\n' if args.text else '') + f'session {claim.get("session")} runs on {claim.get("name")}: stop it there'
     kept = cleanup(current)
     move(current, None, 'close', '\n\n'.join(filter(None, (args.text, kept))))
     BOARD.close(args.n)
-    if stop and claim.get('name') == machine():
-        try:  # best effort: a worker left running never fails close
-            stop(claim['session'])
+    retire(lambda n: n == args.n, f'#{args.n}: could not stop its sessions')
+
+def retire(gone, why, running=True):
+    """Each runtime's retire, best effort: a session left behind never fails close or the tick."""
+    for runtime in runtimes().values():
+        try:
+            getattr(runtime, 'retire', lambda *_: None)(gone, running)
         except Exception as error:
-            print(f'#{args.n}: could not stop session {claim["session"]}: {error}', file=sys.stderr)
+            print(f'{why}: {error}', file=sys.stderr)
 
 def brief(item, runtime):
     """The worker's prompt: the task, its workspace, the taskq commands it uses."""
@@ -550,6 +580,9 @@ def cmd_tick(args, table=True):
                 item['claim'] = {'runtime': free, 'session': session, 'name': here}
                 move(item, 'doing', 'spawn', kinds[free].link(session) or '', claim=item['claim'], result=None)
                 item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
+        if held:  # #360: sessions of tasks no longer open (the list holds open tasks only)
+            open_tasks = {item['iid'] for item in items}
+            retire(lambda n: n not in open_tasks, 'could not remove sessions of closed tasks', running=False)
     if not table:
         return
     print(f'{"Task":<6} {"State":<8} {"Runtime":<8} Session link')

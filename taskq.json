@@ -2,6 +2,12 @@
  "board": "github",
  "repo": "alexkirs/taskq",
  "publish": "pr",
- "limits": {"claude": 4, "codex": 0},
- "hosts": {"macbook-m2.local": "mac", "DESKTOP": "win"}
+ "limits": {
+  "claude": 4,
+  "codex": 4
+ },
+ "hosts": {
+  "macbook-m2.local": "mac",
+  "DESKTOP": "win"
+ }
 }

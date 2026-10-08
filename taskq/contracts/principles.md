@@ -44,7 +44,7 @@ Mechanics: [taskq.md § Four roles](https://github.com/alexkirs/taskq/blob/main/
 
 **R9. No silent changes to model, effort or permissions.** Any change is named to the owner first; taskq never edits permission settings itself.
 
-**R10. Multi-project only by explicit list.** A session manages several projects only from an owner-written list. Folders are never auto-discovered. Mechanics: [docs/multiproject-pm.md](https://github.com/alexkirs/taskq/blob/main/docs/multiproject-pm.md).
+**R10. Multi-project only by explicit list.** A session manages several projects only from an owner-written list. Folders are never auto-discovered. Mechanics: the list is `[projects]` of the PM's `taskq.local.toml`; `taskq projects` runs one ordinary tick per listed checkout ([docs/multiproject-pm.md](https://github.com/alexkirs/taskq/blob/main/docs/multiproject-pm.md)).
 
 **R11. Retire a task's sessions only after accepted review.** A worker or supervisor session of a task ends only after its result is accepted. Sessions without any task are cleanup's: [taskq-manager.md § Cleaning up finished work](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq-manager.md#cleaning-up-finished-work).
 

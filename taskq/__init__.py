@@ -164,7 +164,7 @@ def checked(config, path):
     stops with the file and key, never silently broadens."""
     where = lambda key: f'{path}: {key}'
     profile, codex = config.get('profile', {}), config.get('codex', {})
-    unknown = [f'[{name}]' for name in config if name not in ('profile', 'codex', 'coordinator', 'machine', 'idle', 'cleanup')] + [
+    unknown = [f'[{name}]' for name in config if name not in ('profile', 'codex', 'coordinator', 'machine', 'idle', 'cleanup', 'projects')] + [
         f'[idle] {key}' for key in config.get('idle', {}) if key not in ('stop', 'cleanup')] + [
         f'[machine] {key}' for key in config.get('machine', {}) if key != 'notes'] + [
         f'[profile] {key}' for key in profile if key not in (*PROFILE_DEFAULTS, 'limits')] + [
@@ -861,6 +861,9 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv == ['--version']:  # update's start check of new code
         return print(f'taskq {version()}')
+    if argv[:1] == ['projects']:  # R10: one ordinary tick per listed project (docs/multiproject-pm.md)
+        from taskq.multiproject import main as projects
+        sys.exit(projects(argv[1:]))
     if PROJECT is None:
         try:
             configure()  # before the parser: [runtimes] in taskq.toml adds choices

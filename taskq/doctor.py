@@ -475,8 +475,8 @@ def report_gaps(gaps, pending=()):
 # auto-mode classifier. Without it the user's own defaultMode (e.g. `auto`) applies to every session of the checkout.
 PERMISSION_MODE = 'dontAsk'
 WORKER_ALLOW = ('Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Agent', 'Skill',
-                'ToolSearch', 'SendMessage', 'ListAgents', 'CronCreate', 'CronDelete', 'CronList', 'mcp__ccd_session_mgmt',
-                'mcp__ccd_session', 'mcp__scheduled-tasks', 'mcp__serena')  # Cron*, ListAgents: the coordinator's (§ 2, § 3)
+                'ToolSearch', 'SendMessage', 'ListAgents', 'mcp__ccd_session_mgmt', 'mcp__ccd_session',
+                'mcp__scheduled-tasks', 'mcp__serena')
 
 
 def permissions_missing(root):

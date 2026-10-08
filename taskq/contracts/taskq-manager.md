@@ -14,7 +14,7 @@ How to set up the session that runs the [taskq](taskq.md) queue. Principles, rol
   «Ты менеджер taskq», «Ты продукт-менеджер taskq». Step 1 and § 4. Does not arm the tick.
 - **Coordinator** (R3 queue tick) — "arm the tick" or "you are the coordinator" («включи тик»,
   «ты coordinator»). Steps 1–3. One per project (R4): `taskq tick` prints `Last tick: N min ago`; under
-  15 minutes means another session holds the tick — do not make a second `CronCreate`, tell the owner.
+  15 minutes means another session holds the tick — do not make a second `external sender`, tell the owner.
 
 The session replies with the role it took and what is in the queue now.
 
@@ -79,7 +79,7 @@ Task text, scope, briefs and results use repository-relative paths (`add` warns 
 the checkout root of its machine and the free-text `[machine] notes` of that machine's `taskq.local.toml`, so the worker
 adapts to it. **Windows (#139):** checkout and taskq in WSL, the Windows Claude (`claude.cmd`) runs workers and sees the
 checkout as `//wsl.localhost/<distro>/…`; `doctor` checks trust under that key in the Windows `~/.claude.json` and whether
-`claude` is logged in. App import and the launchd timer are macOS only and say so elsewhere; the desktop app is optional.
+`claude` is logged in. App import and the external scheduler timer are macOS only and say so elsewhere; the desktop app is optional.
 
 ## Versioned PM report delivery (#191)
 
@@ -295,7 +295,7 @@ automated: package/CLI installation and the worker permissions file (printed as 
   allow = permissions.setdefault('allow', [])
   required = ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'NotebookEdit',
               'WebFetch', 'WebSearch', 'Agent', 'Skill', 'ToolSearch', 'SendMessage',
-              'ListAgents', 'CronCreate', 'CronDelete', 'CronList', 'mcp__ccd_session_mgmt', 'mcp__ccd_session', 'mcp__scheduled-tasks', 'mcp__serena']
+              'ListAgents', 'external sender', 'external sender removal', 'sender status', 'mcp__ccd_session_mgmt', 'mcp__ccd_session', 'mcp__scheduled-tasks', 'mcp__serena']
   allow.extend(item for item in required if item not in allow)
   permissions['defaultMode'] = 'dontAsk'
   path.parent.mkdir(parents=True, exist_ok=True)
@@ -332,7 +332,7 @@ The onboarding step «permissions» (§ 1, order 6) shows the person exactly thi
 Rules for <main checkout>/.claude/settings.local.json (outside git), so nothing asks again:
   allow: Bash Read Edit Write Glob Grep NotebookEdit WebFetch WebSearch    work and queue commands (taskq, git, claude --bg)
   allow: Agent Skill ToolSearch SendMessage ListAgents                     reach and steer workers
-  allow: CronCreate CronDelete CronList                                    the coordinator's tick timer (§ 2)
+  allow: external sender external sender removal sender status                                    the coordinator's tick timer (§ 2)
   allow: mcp__ccd_session_mgmt mcp__ccd_session mcp__scheduled-tasks mcp__serena   app sessions and tools
   defaultMode: dontAsk                                                     the allowed run silently, the rest is denied; no classifier
 Run once: ! <the `python3 -c` line `taskq doctor` prints for this checkout: the command above in one line>
@@ -348,7 +348,7 @@ What a permission layer can stop, where it hit, and the fix:
 | A Codex thread under a sandbox (worker) | classifier «Create Unsafe Agents», even with the owner's recorded yes | #52 | `taskq spawn --runtime codex` from the coordinator in `dontAsk` (`Bash` allowed) |
 | `claude --bg …` / `taskq spawn` (coordinator) | classifier «Create Unsafe Agents» in `auto` | csgo coordinator | `Bash` allowed + `dontAsk` |
 | SendMessage to a bg worker (coordinator) | cross-session message held for approval | this queue, all permission classes | `SendMessage` and `ListAgents` allowed + `dontAsk`; fallback `claude stop`, `claude --bg --resume <id> "<text>"` |
-| `CronCreate` (coordinator) | not in the allow list: denied in `dontAsk` | — (added with #71) | `CronCreate`, `CronDelete`, `CronList` allowed |
+| `external sender` (coordinator) | not in the allow list: denied in `dontAsk` | — (added with #71) | `external sender`, `external sender removal`, `sender status` allowed |
 | EnterWorktree outside `.claude/worktrees` (worker) | permission-root relocation prompt | #68, until the owner answered by `claude attach` | workers lack the tool (`CLAUDE_WORKER_TOOLS`); the brief says `git worktree add` and `cd` in Bash |
 | Writing under `~/.claude` (worker) | protected path: denied in `dontAsk` despite `Write`/`Bash` allowed | #71 live probe | workers write only in the checkout and its worktrees |
 | A tool outside `CLAUDE_WORKER_TOOLS` or an MCP server (worker) | not offered at all | by design (#38, #51) | none needed |
@@ -356,116 +356,16 @@ What a permission layer can stop, where it hit, and the fix:
 
 ## 2. Arm the tick
 
-Entry phrases: “You are the taskq manager. Arm the tick.” («Ты менеджер taskq. Включи тик»),
-or “Arm the tick.” («Включи тик»). The combined phrase takes both the product-manager and
-coordinator roles; it is one request to read the queue and arm coordination, not onboarding alone.
-Check readiness and the profile card in § 1,
-then follow this procedure after profile confirmation; onboarding alone does not authorize it.
+A tick is a message. The owner configures the sender outside taskq.
 
-**The in-session timer (the default).**
-Tool `CronCreate` (loaded via ToolSearch), `recurring: true`, `cron: "*/5 * * * *"`,
-`prompt`:
+The sender runs exactly:
 
-```
-taskq tick prompt v3. Run `cd <main checkout> && taskq update; taskq tick --prompt-version 3`
-and do the coordinator pass by taskq-manager.md § 3 (`taskq contract` prints its path). Reply in the owner's language,
-include the generated PM report even when nothing changed; apply its version/hash on this safe pass.
+```bash
+taskq tick --act
 ```
 
-`--prompt-version` is the prompt's version: tick cannot see the prompt, so a timer armed with an older
-one (or none: v1) gets `Your tick prompt is outdated … re-arm with this prompt` and the exact prompt;
-replace the timer with it (`CronDelete` the old one, `CronCreate` this one). After a change of this file the
-next tick of each checkout prints `The coordinator contract changed since your last tick (<old>→<new>): re-read
-§ 3 now (…)` once, with the contract's latest commits: re-read § 3 before the pass.
-
-The prompt has no profile flags: each tick rereads `taskq.local.toml`, so a profile change needs no
-new timer. Check the last-tick age first; do not arm a second coordinator on this machine.
-Across machines only the machine named by `[coordinator] machine` of taskq.toml coordinates (#145; none set:
-every tick does, for a single-machine project). A tick on another machine releases only its own stalled work,
-starts only tasks pinned to its machine (`host-<name>`) and prints `coordinator is <name>`: say so and stop; it
-never reviews or closes. No failover: to move the coordinator, the owner edits that one line.
-**Existing timers** armed before #48 carry `--filter`/`--mine`/`--limit` in their prompt, and those
-flags keep winning over the file (the tick's `Source: flag: …` line shows them). With coordinator
-authority: write the confirmed values with `taskq profile init` (mode A: the person runs it), check
-that `taskq tick` prints them from `taskq.local.toml`, then replace the timer's prompt with the one
-above (`CronDelete` the old one, `CronCreate` this one, in the same session; never two timers).
-Codex automations: edit the prompt to `taskq tick` without flags.
-
-**The coordinator session runs no long tasks**: every turn ends within minutes (no foreground loop,
-no waiting in the turn for a background job or a `Monitor` condition). A session timer fires only between
-turns (checked live 2026-10-07, CLI 2.1.291, `* * * * *` timer: an idle session and one holding a
-13-minute `run_in_background` loop each got all 10 fires on time; a session in a 5-minute foreground
-command got none, then one catch-up fire after the turn ended). While a turn runs, ticks are silently
-skipped. When ticks stop coming, `taskq tick` prints `If a timer is armed: no tick for N min` (N ≥ 3
-intervals): check `CronList`, end the long turn or background loops, re-arm. The launchd timer below
-has none of these limits.
-
-The in-session timer lives inside the session: while the app is open and for at most 7 days. After an app
-restart the owner says "arm the tick" — repeat this step. An app routine does not fit the tick: its
-interval is at most hourly, and its session cannot start workers.
-
-**Option: the launchd timer (macOS).** For a tick without an open app session (no 7-day limit, no LLM turn
-per quiet fire). The owner chooses it; doctor and onboarding do not offer it. Run from the coordinator session itself:
-`cd <main checkout> && taskq tick --install-timer`. It writes `~/Library/LaunchAgents/taskq.<checkout name>.plist`
-and loads it; launchd runs `taskq tick --act --wake` from the main checkout every 5 minutes, with the PATH of
-the shell that installed it (no token goes into the file), and logs to `.local/taskq-tick.log`. Run inside
-a Claude session, `--install-timer` records that session as `[coordinator] session = "<id>"` in
-`taskq.local.toml` (an existing entry stays; edit it by hand to move the coordinator).
-With the agent installed, delete the `CronCreate` tick timer: one timer per checkout. `taskq tick --uninstall-timer`
-removes the agent; then re-arm the in-session timer.
-
-`taskq tick --act` does the mechanical steps itself: it spawns the supervisors of the Start section (#243),
-wakes an idle supervisor whose task is in review or ready again, sends the fixed nudge to idle Codex and quiet
-workers, archives stopped Codex workers of unsupervised ask/later tasks, and retires a local Claude worker and
-supervisor of a task closed in the last hour (closed by its supervisor, on the board or by hand). Every pass, with or without `--act`, also archives this
-checkout's Codex worker and supervisor threads (named `T<N> …` / `S<N> …` by spawn, idle or notLoaded, unchanged
-for 10 min) that no open task claims or names as supervisor (a supervised task keeps its worker's thread): the task
-closed, or an unsupervised task went ask → answer → ready and a new session continues it (`codex-archive` is
-reversible); one the Codex app holds archives itself in the app (#165, § Cleaning up finished work, item 3). Those
-steps go to stderr (the log). Stdout carries the versioned report on every pass. A review,
-a question, a problem, a board mismatch, an inbox issue, or a failed mechanical step
-(section `Steps that failed`) makes the exit code 1; otherwise it is 0. With `--wake` a nonzero pass resumes the coordinator session with that output as
-one turn (`claude --bg --resume <id> "<prompt + output>"`); the same set of items wakes it once, and a
-busy coordinator is woken by the next pass. The woken turn does § 3 on the given output and does not
-run `taskq tick` again (the steps are done; a second tick would spawn twice). The resumed session is a
-`claude --bg` job: a coordinator open in the app at the same time would get a second writer, so keep
-the app's coordinator window closed or stay on the in-session timer.
-
-### External scheduler (Hermes, cron, systemd)
-
-After the owner authorizes a timer and worker launches, schedule one bounded pass every 5 minutes
-from the main checkout: `taskq tick --act`. Use this checkout's `taskq.local.toml` for the profile
-(filter, assignments, runtime limits and preferred runtime); a Codex-only host sets `claude = 0`.
-Run `taskq doctor` first and qualify the actual host's Codex CLI/server and tracker authentication.
-Real Hermes host qualification remains the reporter's responsibility; unit tests do not prove it.
-No Claude tools, `CronCreate`, launchd or `--wake` are required. Capture stdout, stderr and exit status.
-
-- Exit 0: mechanical pass completed without judgement, or an overlapping pass was skipped (stderr
-  says `Skipped: another tick pass is running.`). Do not start extra workers from the captured output.
-- Exit 1 with the pass report on stdout: judgement is needed. Process that report by § 3 without
-  running a second tick; relay reviews, questions and failures to the owner. `Steps that failed`
-  means a mechanical operation failed, not a successful quiet pass.
-- Exit 1 with an error on stderr and no pass report, or another nonzero status: command failure.
-  Report the error; do not interpret it as an empty queue. Exit 1 alone cannot distinguish judgement
-  from failure, so retain both output streams.
-
-Every CLI tick holds a nonblocking checkout-local OS lock through the pass. Timer/manual overlaps
-skip before spawning; the OS releases the lock on process exit or crash. The leftover lock file
-is harmless and must not be deleted to recover a crash.
-
-Honor `[idle] stop` (default 5 consecutive empty passes; 0 disables stopping). On `Idle N ticks`,
-disable the external timer through its own scheduler; the CLI cannot cancel a cron/systemd/Hermes
-job. `--act` already runs `taskq cleanup --apply` unless `[idle] cleanup = false` or
-`[cleanup] enabled = false`, and every owner tick applies due cleanup itself (#197, [taskq](taskq.md) § Cleanup);
-do not run it again. Relay `Ask the owner` items and retain anything requiring app-only archival until an
-operator with that app handles it. No Claude app tool is needed to complete the CLI pass.
-Rearm only on the owner's request. A macOS external scheduler must also disable its own job:
-removing a launchd taskq timer does not cancel an external timer.
-
-Plain `taskq tick` is not read-only: it can auto-update, reconcile queue/board state, release dead
-claims and stale task locks, record tick/idle stamps, and archive finished Codex sessions. `--act`
-also launches, nudges, retires and performs idle cleanup. Use the captured report for judgement
-instead of running plain tick as a supposedly read-only follow-up.
+Received means one pass. Not received means nothing. `taskq` creates, changes and monitors no sender.
+Keep one sender per project. The checkout-local lock skips overlapping passes.
 
 ## 3. One tick pass
 
@@ -545,7 +445,7 @@ The PM starts no worker itself and does no task work (#243, [R2–R3](principles
   owner's apps on other machines (csgo #303): its name ends with ` (<machine>)`, so it does not look as if it
   ran there. `--no-remote-control` passes `--settings '{"remoteControlAtStartup": false}'` (checked live
   2026-10-06, CLI 2.1.291: the default session shows `/rc connecting…`, the spawned one does not). Works from a
-  `CronCreate` fire. Steering without SendMessage: `claude stop <id>`, then
+  `external sender` fire. Steering without SendMessage: `claude stop <id>`, then
   `claude --bg --resume <session id> "<text>"` wakes the same id.
 - Importing into the app is only the link `claude://resume?session=<id>`; its handler, after
   `importCliSession`, always switches the main pane to the session (no flag; `-g` only keeps the
@@ -730,9 +630,9 @@ live-update-during-turn check separately; a completed reply does not prove a liv
 
 **Idle stop (#153).** On the 5th empty pass in a row (no task to start, nothing in doing, review or ask;
 `[idle] stop` in `taskq.local.toml`) the tick prints `Idle N ticks: …` instead of `Nothing to do`. Then stop
-the timer (CronDelete, or `taskq tick --uninstall-timer` for launchd), run `taskq cleanup --apply` (unless
+the timer (external sender removal, or `taskq tick sender removal` for external scheduler), run `taskq cleanup --apply` (unless
 `[idle] cleanup = false` or `[cleanup] enabled = false`; the line names only the steps that are on), show the owner its Remove section and any
-Ask the owner items, and say how to rearm: "arm the tick" (§ 2). `tick --act` stops its launchd timer and runs
+Ask the owner items, and say how to configure the sender again: "arm the tick" (§ 2). `tick --act` stops its external scheduler timer and runs
 cleanup itself and wakes the coordinator with the output, so only the report is left. A task in ask never counts
 as idle; any other pass starts the count over.
 

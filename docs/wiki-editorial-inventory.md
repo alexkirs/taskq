@@ -47,7 +47,7 @@ Known-issues 3-11 and 13-16, Cleanup-schedule and Atomic-reservation: no change.
 ## Repository sources (read-only, no change)
 
 - `taskq/contracts/taskq-manager.md` § 3 "Reply to the owner": links only, Workers table and Board line once per pass.
-- `taskq/tick.py` `TICK_PROMPT` v2: reply in the owner's language; one or two lines when nothing changed.
+- `taskq/tick.py` `the former prompt` v2: reply in the owner's language; one or two lines when nothing changed.
 - `taskq/worker.py` brief: no style rule.
 - Report schema v1 (`taskq preflight --json`, `report_contract.template`): required report and worker fields.
 

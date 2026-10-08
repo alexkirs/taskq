@@ -32,7 +32,7 @@ A new rule gets the next R-number.
 
 Mechanics: [taskq.md § Four roles](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq.md#four-roles), [taskq-manager.md](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq-manager.md).
 
-**R4. One tick sender per project.** Exactly one coordinating timer per project; moving it is an explicit handoff. A tick on another machine starts only its own `host-*` tasks and never coordinates. Mechanics: [taskq-manager.md § 2](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq-manager.md#2-arm-the-tick).
+**R4. Tick is a message.** A sender invokes `taskq tick --act`; received means one pass, not received means nothing. The owner configures one sender per project outside taskq. A tick on another machine starts only its own `host-*` tasks and never coordinates. Mechanics: [taskq-manager.md § 2](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq-manager.md#2-arm-the-tick).
 
 **R5. Worker writes completion to the task.** Result SHA, checks, question or blocker go to the task through `taskq result`, `ask` or `problem`. Completion never depends on session UI, chat or transcript.
 

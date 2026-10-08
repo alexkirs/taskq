@@ -70,8 +70,8 @@ error, or another nonzero code, is failure, not an empty queue. For `--json`, re
 the structured outcome, actions, refusals and report text. Never start duplicate
 workers from captured output. The checkout-local OS lock protects overlapping
 passes; do not delete its leftover file. External schedulers need neither Claude
-tools nor `--wake`. Honor the contract's idle-stop handling through the external
-scheduler; rearm only on owner request.
+tools nor the removed wake flag. Honor the contract's idle-stop handling through the external
+scheduler; configure the sender again only on owner request.
 
 ## Claim, candidate and publication
 

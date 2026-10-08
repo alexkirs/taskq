@@ -115,15 +115,9 @@ class Selftest:
     def tick(self):
         """A coordinator pass over selftest tasks only; it keeps the real tick's last-run time."""
         before = core.TICK_BEAT.stat().st_mtime if core.TICK_BEAT.exists() else None
-        seen = core.contract_seen().read_text() if core.contract_seen().exists() else None  # the coordinator's, #110
         try:
-            return self.owner('tick', '--filter', f'labels={core.SELFTEST}', '--no-mine', '--prompt-version',
-                              str(core.TICK_PROMPT_VERSION))  # selftest tasks are the pool's
+            return self.owner('tick', '--filter', f'labels={core.SELFTEST}', '--no-mine')  # selftest tasks are the pool's
         finally:
-            if seen is None:
-                core.contract_seen().unlink(missing_ok=True)
-            else:
-                core.contract_seen().write_text(seen)
             if before is None:
                 core.TICK_BEAT.unlink(missing_ok=True)
             else:

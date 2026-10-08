@@ -944,14 +944,6 @@ class Cycle(unittest.TestCase):
             self.assertIn('[machine] note: unknown key', self.refused(CLAUDE, 'worker'))
         self.assertIn(f'take {iid}', self.do(CLAUDE, 'worker'))
 
-    def test_macos_only_calls_are_skipped_with_one_line_elsewhere(self):
-        """#139: no `open -g` and no launchd off macOS; the worker keeps running."""
-        self.agents = {'s1': {'id': 's1short', 'sessionId': 's1', 'pid': 7}}
-        runs = []
-        with patch.object(sys, 'platform', 'linux'), patch.object(q.subprocess, 'run', lambda argv, **kwargs: runs.append(argv)):
-            self.assertIn('skipped: opening in the desktop app is macOS only', self.do(CLAUDE, 'show', 'local_s1'))
-            self.assertIn('skipped: the launchd tick timer is macOS only', self.do(COORDINATOR, 'tick', '--install-timer'))
-        self.assertEqual(runs, [])
 
     def test_add_warns_on_absolute_paths(self):
         """#139: each machine maps repo-relative paths to its own checkout; /Users/... means nothing on win."""
@@ -1111,7 +1103,7 @@ class Cycle(unittest.TestCase):
             scheduled.assert_not_called()  # #145: another machine's tick releases its own work only
 
     def test_idle_stop_after_empty_ticks_reset_by_work_blocked_by_ask(self):
-        idle = 'Idle 5 ticks: stop the timer (CronDelete / --uninstall-timer), run `taskq cleanup --apply`, report'
+        idle = 'Idle 5 ticks: run `taskq cleanup --apply`, report'
         for _ in range(4):
             self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))
         self.assertIn(idle, self.do(COORDINATOR, 'tick'))
@@ -1128,20 +1120,10 @@ class Cycle(unittest.TestCase):
         self.personal('[idle]\nstop = 2\ncleanup = false\n')
         self.do(COORDINATOR, 'tick')
         out = self.do(COORDINATOR, 'tick')
-        self.assertIn('Idle 2 ticks: stop the timer (CronDelete / --uninstall-timer), report', out)
+        self.assertIn('Idle 2 ticks: report', out)
         self.personal('[idle]\nstop = 0\n')
         for _ in range(6):
             self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))
-        q.LOCAL.write_text('[idle]\nstop = 1\n')
-        with patch.object(sys, 'platform', 'darwin'), \
-                patch.object(tick, 'timer', lambda install: print('timer removed')), \
-                patch.object(q, 'cleanup', lambda args: print('# Remove')), \
-                patch.dict(os.environ, COORDINATOR), contextlib.redirect_stdout(io.StringIO()) as out, \
-                contextlib.redirect_stderr(io.StringIO()) as log, self.assertRaises(SystemExit):
-            q.main(['tick', '--act'])
-        self.assertIn('# Remove', out.getvalue())
-        self.assertIn('the tick stopped its launchd timer and ran `taskq cleanup --apply`', out.getvalue())
-        self.assertIn('Done: stop the tick timer', log.getvalue())
 
     def test_invalid_personal_profile_stops_with_file_and_key(self):
         for text, error in (('[profile]\nmine = "yes"\n', '[profile] mine: write true or false'),
@@ -1882,26 +1864,13 @@ class Cycle(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(output.count('## Workers'), 1)
         self.assertEqual(sent, ['codex-session'])  # the fixed idle nudge, no coordinator turn
-        # A review needs judgement: printed, exit 1; --wake gives it to the coordinator once per set of items.
+        # A review needs judgement and exits 1.
         self.do(CLAUDE, 'result', code, '--sha', 'abc1234', '--text', 'x', '--checks', 'x')
         with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as exit, patch.dict(os.environ, COORDINATOR):
                 q.main(['tick', '--act'])
         self.assertEqual(exit.exception.code, 1)
         self.assertIn(f'## Review {link(code)}', out.getvalue())
-        q.LOCAL.write_text('[coordinator]\nsession = "coordinator-session"\n')
-        self.addCleanup(q.LOCAL.unlink, missing_ok=True)
-        # #185: only a coordinator listed in `claude agents` and not busy is woken.
-        self.agents['coordinator-session'] = {'id': 'coordina', 'sessionId': 'coordinator-session', 'kind': 'background',
-                                              'cwd': str(q.ROOT), 'name': 'PM (mac-1)', 'state': 'done'}
-        for _ in range(2):
-            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit), patch.dict(os.environ, COORDINATOR):
-                    q.main(['tick', '--act', '--wake'])
-        self.assertEqual(len(woken), 1)
-        self.assertEqual(woken[0][0], 'coordinator-session')
-        self.assertIn(f'## Review {link(code)}', woken[0][1])
-        self.assertIn('already woken', out.getvalue())
         # A worker of a task closed by hand: retired by the next --act.
         self.agents = {'claude-session': {'id': 'claudese', 'sessionId': 'claude-session', 'pid': 3}}
         self.gitlab.issues[code]['state'] = 'closed'
@@ -3118,17 +3087,15 @@ class Host(unittest.TestCase):
 
 
 class TickBeat(unittest.TestCase):
-    def test_linux_idle_stop_requests_external_timer_stop_and_cleans_once(self):
+    def test_idle_stop_cleans_once(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / 'beat'), \
                 patch.object(q, 'personal', return_value={'idle': {'stop': 1}}), \
-                patch.object(sys, 'platform', 'linux'), patch.object(tick, 'timer') as timer, \
                 patch.object(q, 'cleanup') as cleanup:
             tick.idle_ticks().write_text('0\n')
             failed = []
             result = tick.idle_stop(True, lambda what, action: action(), failed)
-            self.assertIn('stop the external scheduler and ran `taskq cleanup --apply`', result)
+            self.assertIn('ran `taskq cleanup --apply`', result)
             self.assertFalse(tick.idle_ticks().exists())
-            timer.assert_not_called()
             cleanup.assert_called_once_with(argparse.Namespace(apply=True, trigger='idle'))
             self.assertEqual(failed, [])
 
@@ -3186,66 +3153,10 @@ class TickBeat(unittest.TestCase):
             q.tick(args)
             run.assert_called_once_with(args)
 
-    def test_second_tick_within_live_window_is_told_not_to_arm(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / 'beat'):
-            with contextlib.redirect_stdout(io.StringIO()) as first:
-                q.tick_beat()
-            with contextlib.redirect_stdout(io.StringIO()) as second:
-                q.tick_beat()
-            os.utime(q.TICK_BEAT, (time.time() - 20 * 60,) * 2)
-            with contextlib.redirect_stdout(io.StringIO()) as third:
-                q.tick_beat()
-        self.assertEqual(first.getvalue(), 'Last tick: none.\n')
-        self.assertIn('another coordinator is armed', second.getvalue())
-        self.assertEqual(third.getvalue().splitlines()[0], 'Last tick: 20 min ago.')
-        self.assertIn('no tick for 20 min', third.getvalue())
-        self.assertNotIn('no tick', second.getvalue())
 
 
-    def test_changed_contract_and_outdated_prompt_are_named(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / 'beat'):
-            run = lambda: contextlib.redirect_stdout(io.StringIO())
-            with run() as first:
-                q.contract_news(q.TICK_PROMPT_VERSION)
-            with run() as second:
-                q.contract_news(q.TICK_PROMPT_VERSION)
-            q.contract_seen().write_text('0000000 unknown\n')
-            with run() as changed:
-                q.contract_news(None)
-        self.assertIn('contract changed since your last tick (none→', first.getvalue())
-        self.assertEqual(second.getvalue(), '')
-        self.assertIn('(0000000→', changed.getvalue())
-        self.assertEqual(changed.getvalue().count('re-read § 3'), 1)
-        self.assertIn(f'Your tick prompt is outdated (v1, current v{q.TICK_PROMPT_VERSION})', changed.getvalue())
-        self.assertIn(f'cd {q.ROOT} && taskq update; taskq tick --prompt-version {q.TICK_PROMPT_VERSION}', changed.getvalue())
-
-    def test_install_timer_writes_a_launchd_agent_and_records_the_coordinator(self):
-        """#42: one command each way; the agent runs tick --act --wake from the main checkout every 5 min."""
-        self.enterContext(patch.object(sys, 'platform', 'darwin'))  # the macOS path, on any CI
-        import plistlib
-        runs = []
-        with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / '.local/beat'), \
-                patch.object(q, 'LOCAL', Path(tmp) / 'taskq.local.toml'), patch.object(Path, 'home', return_value=Path(tmp)), \
-                patch.object(tick.subprocess, 'run', lambda argv, **kwargs: runs.append(argv)), \
-                patch.dict(os.environ, COORDINATOR), contextlib.redirect_stdout(io.StringIO()) as out:
-            q.main(['tick', '--install-timer'])
-            plist = Path(tmp) / f'Library/LaunchAgents/taskq.{q.ROOT.name}.plist'
-            agent = plistlib.loads(plist.read_bytes())
-            self.assertEqual(q.personal()['coordinator']['session'], 'coordinator-session')
-            q.main(['tick', '--uninstall-timer'])
-            self.assertFalse(plist.exists())
-        self.assertEqual(agent['ProgramArguments'][1:], ['-m', 'taskq', 'tick', '--act', '--wake'])
-        self.assertEqual((agent['StartInterval'], agent['WorkingDirectory']), (300, str(q.ROOT)))
-        self.assertEqual([argv[:2] for argv in runs], [['launchctl', 'bootout'], ['launchctl', 'bootstrap'], ['launchctl', 'bootout']])
-        self.assertIn('wakes the coordinator session coordinator-session', out.getvalue())
-
-    def test_contract_holds_the_tick_prompt(self):
-        self.assertIn(q.TICK_PROMPT, (q.CONTRACTS / 'taskq-manager.md').read_text())
 
 
-class Update(unittest.TestCase):
-    """A real `main` in a bare repository stands in for GitHub; the install is a clone of it. CI passes and the new
-    code starts unless a test says otherwise."""
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

@@ -143,9 +143,7 @@ Code/docs results require `--sha` of a commit pushed to `main`.
 
 ## Start workers
 
-Tell the manager your profile, confirm its card, then **“Arm the tick.”**
-Expected: the coordinator runs `taskq tick` (no flags) every 5 minutes.
-Optional on macOS, for a tick without an open app session: `taskq tick --install-timer` makes launchd run `taskq tick --act` every 5 minutes, which starts a supervisor session per ready task (it launches, reviews and closes its worker), nudges and retires sessions itself and wakes the coordinator only when something needs judgement (`--uninstall-timer` removes it).
+Configure one sender for the project to run `taskq tick --act`.
 
 For CLI automation, `tick`, `report` and `cleanup` accept `--json`. Stdout is one JSON object with
 `command`, `outcome` (`ok`, `judgement_needed`, `failure`), `actions`, `tasks`, `sessions`, `refusals`
@@ -214,7 +212,7 @@ machine = "mac"
 
 **Windows.** Keep the checkout, taskq, git and gh/glab in WSL; the Windows Claude Code (`claude.cmd`) runs the
 workers and sees the checkout as `//wsl.localhost/<distro>/…`: `taskq doctor` checks its folder trust and login under
-that path. The desktop app is optional (watch workers through Remote Control); macOS-only steps (app import, launchd
+that path. The desktop app is optional (watch workers through Remote Control); macOS-only steps (app import, external scheduler
 timer) say so and are skipped. Tell workers what is special about a machine in its `taskq.local.toml`; every brief there
 prints it, with the checkout root (task text uses repository-relative paths, `add` warns on absolute ones):
 

@@ -142,8 +142,6 @@ codex = 2
 # section = "app-section-id"
 
 [coordinator]
-# The Claude session the launchd tick timer wakes (manager contract § 2); `tick --install-timer` writes it.
-# session = "claude-session-id"
 
 [machine]
 # Free text every brief on this machine prints (#139): how this machine differs, e.g. Windows claude.cmd, checkout in WSL.
@@ -167,7 +165,7 @@ eligible runtime. Unassigned tasks keep existing selection behavior.
 
 `tick` and `worker` reload the personal file on every invocation and print effective profile,
 candidate count and configuration source. Their unfiltered dependency/scope inventory and
-local-host capacity counting stay intact. The permanent CronCreate/automation prompt runs
+local-host capacity counting stay intact. The permanent external sender/automation prompt runs
 `taskq tick` without profile flags. Worker and retry prompts carry only explicit invocation
 overrides, including false/empty/zero; they do not freeze resolved personal defaults.
 Existing timers with profile flags must be inspected and migrated with coordinator authority:
@@ -472,7 +470,7 @@ An orphan reaction owned by another user must be cleared by that user; taskq doe
 
 Scheduling and creating sessions is an app action, not a script action.
 
-- **Claude desktop:** the coordinator is an ordinary session with a timer inside (`CronCreate`). A worker
+- **Claude desktop:** the coordinator is an ordinary session with a timer inside (`external sender`). A worker
   is created by `taskq spawn --name "T<N> <words>" --text "<worker prompt>"` as tick prints it: a `claude --bg`
   background session of the CLI in the main checkout that starts on the prompt (#270, 2026-10-06: the app
   window does not change; #41: no SendMessage). Remote Control is on (#83; `--no-remote-control` turns it

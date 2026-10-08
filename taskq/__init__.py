@@ -825,8 +825,7 @@ from taskq.doctor import (  # noqa: E402
     tree_gaps, profile_init, runtime_gaps, write_access, queue_labels_missing, board_gaps, report_gaps,
     PERMISSION_MODE, WORKER_ALLOW, permissions_missing, permissions_gap, trusted, setup, migrate, windows_claude_binary, pref)
 from taskq.tick import (  # noqa: E402
-    clone_warning, auto_update, question, TICK_MINUTES, TICK_LIVE_MINUTES, tick_beat, TICK_PROMPT_VERSION, TICK_PROMPT,
-    report_bootstrap, verify_report, contract_seen, contract_news, profile_arguments, BOARD_MOVES, board_fix, board_moves, session_link,
+    clone_warning, auto_update, question, report_bootstrap, verify_report, profile_arguments, BOARD_MOVES, board_fix, board_moves, session_link,
     inbox_line, tick)
 from taskq.worker import (  # noqa: E402
     BRIEF, DELIVER, need_owner, doing_since, add, edit, later, listing, set_runtime, brief, worker, supervise, take, beat, ask,
@@ -932,12 +931,8 @@ def main(argv=None):
             (('--supervisor',), {'metavar': 'RUNTIME:SESSION', 'help': "#240: the one session that launches and steers this "
                                  "task's worker; owner's shell assigns or clears (''), the current supervisor hands off"}))
     command('report-verify', verify_report, (('file',), {'help': 'supported-channel report readback JSON; no transport or receipt writes'}))
-    command('tick', tick, json_flag, *profile_flags, (('--prompt-version',), {'type': int, 'metavar': 'N',
-            'help': "the timer prompt's version (manager contract § 2); older ones are told to re-arm"}),
-            (('--act',), {'action': 'store_true', 'help': 'spawn, retire and nudge here; report every pass, exit 1 for judgement'}),
-            (('--wake',), {'action': 'store_true', 'help': 'with --act: give that output to the [coordinator] session (the launchd timer)'}),
-            (('--install-timer',), {'action': 'store_true', 'help': 'launchd: tick --act --wake every 5 min from the main checkout'}),
-            (('--uninstall-timer',), {'action': 'store_true', 'help': 'remove that launchd timer'}))
+    command('tick', tick, json_flag, *profile_flags,
+            (('--act',), {'action': 'store_true', 'help': 'spawn, retire and nudge here; report every pass, exit 1 for judgement'}))
     command('profile', profile_init, (('what',), {'choices': ('init',)}), *profile_flags,
             (('--preferred-runtime',), {'choices': tuple(RUNTIMES), 'help': 'tie-break for own tasks of any runtime'}))
     pref_command = command('pref', pref, (('what',), {'choices': ('add', 'list', 'rm')}))

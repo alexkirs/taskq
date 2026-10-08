@@ -6,7 +6,12 @@ import unittest
 from unittest.mock import patch
 
 import test_taskq as base  # the in-memory GitLab cycle; run with `discover -s tests`
-from test_pm_tick_separation import job
+
+def job(session, name, cwd=None, state='working', **extra):
+    running = {'pid': 4242, 'status': 'busy' if state == 'working' else 'idle'} if state not in ('done', 'failed', 'stopped', 'blocked') else {}
+    return {session: {'id': session[:8], 'cwd': str(cwd or q.ROOT), 'kind': 'background', 'startedAt': 1791398637752,
+                      'sessionId': session, 'name': name, 'state': state, **running, **extra}}
+
 from test_taskq import COORDINATOR, q, tick, worker
 
 OWNER = {'CLAUDE_CODE_SESSION_ID': '', 'CODEX_THREAD_ID': ''}  # the owner's own shell: no session identity

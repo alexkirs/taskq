@@ -8,7 +8,6 @@ import io
 import json
 import os
 from pathlib import Path
-import plistlib
 import re
 import shlex
 import subprocess
@@ -95,58 +94,6 @@ def still_pending(item, line):
     issue = core.api('GET', f'issues/{item["iid"]}')
     fresh = core.parse(issue) if issue['state'] == 'opened' else None
     return bool(fresh) and pending(fresh) == line
-
-
-TICK_MINUTES = 5  # the coordinator timer's interval (manager contract § 2)
-TICK_LIVE_MINUTES = 3 * TICK_MINUTES  # a younger tick means another coordinator is armed; an older one, a stalled timer
-
-
-def tick_beat():
-    """Record this tick and report the previous one, so a second session does not arm a second tick and an armed
-    timer that stopped firing is named (#91: seen live 2026-10-07, a */5 job stayed in CronList ~36 min without a tick)."""
-    before = core.TICK_BEAT.stat().st_mtime if core.TICK_BEAT.exists() else None
-    core.TICK_BEAT.parent.mkdir(parents=True, exist_ok=True)
-    core.TICK_BEAT.touch()
-    if before is None:
-        return print('Last tick: none.')
-    minutes = int((time.time() - before) // 60)
-    live = ' (another coordinator is armed: do not CronCreate a second tick)' if minutes < TICK_LIVE_MINUTES else ''
-    print(f'Last tick: {minutes} min ago{live}.')
-    if minutes >= TICK_LIVE_MINUTES:
-        print(f'If a timer is armed: no tick for {minutes} min (expected every {TICK_MINUTES}): check CronList, '
-              'end a long turn or background loops in the coordinator session, re-arm (manager contract § 2).')
-
-
-TICK_PROMPT_VERSION = 3  # raise with every change of TICK_PROMPT: an older --prompt-version gets the re-arm line
-# The coordinator timer's prompt, word for word as in manager contract § 2 (a test keeps them equal).
-TICK_PROMPT = f"""taskq tick prompt v{TICK_PROMPT_VERSION}. Run `cd <main checkout> && taskq update; taskq tick --prompt-version {TICK_PROMPT_VERSION}`
-and do the coordinator pass by taskq-manager.md § 3 (`taskq contract` prints its path). Reply in the owner's language,
-include the generated PM report even when nothing changed; apply its version/hash on this safe pass."""
-
-
-def contract_seen():
-    return core.TICK_BEAT.with_name('taskq-contract-seen')
-
-
-def contract_news(prompt_version):
-    """#110: a coordinator reads taskq-manager.md once when armed and its prompt stays as armed. Name a changed
-    contract once per checkout (its hash next to the tick stamp) and a prompt older than TICK_PROMPT."""
-    manager, seen = core.CONTRACTS / 'taskq-manager.md', contract_seen()
-    new = hashlib.sha256(manager.read_bytes()).hexdigest()[:7]
-    old, since = (seen.read_text().split() + ['', ''])[:2] if seen.exists() else ('', '')
-    if old != new:
-        seen.parent.mkdir(parents=True, exist_ok=True)
-        seen.write_text(f'{new} {core.version()}\n')
-        print(f'The coordinator contract changed since your last tick ({old or "none"}→{new}): re-read § 3 now '
-              f'({manager}, {core.CONTRACTS / "taskq.md"}).')
-        # ponytail: digest only for a clone install, whose version is a commit
-        if since and (log := core.git('log', '-3', '--format=  %h %s', f'{since}..HEAD', '--', str(manager), cwd=core.CONTRACTS)):
-            print(log)
-    if (prompt_version or 1) < TICK_PROMPT_VERSION:
-        prompt = TICK_PROMPT.replace('<main checkout>', str(core.ROOT))
-        print(f'Your tick prompt is outdated (v{prompt_version or 1}, current v{TICK_PROMPT_VERSION}): re-arm with this prompt '
-              '(CronDelete the old timer, CronCreate this one; manager contract § 2):\n\n'
-              + ''.join(f'    {line}\n' for line in prompt.splitlines()))
 
 
 REPORT_VERSION = 1
@@ -236,7 +183,7 @@ def validate_report(report, now=None):
         return isinstance(value, str) and bool(re.search(r'https?://[^\s)]+', value))
     observed = report_timestamp(report['observed_at'])
     now = time.time() if now is None else now
-    if observed is None or not 0 <= now - observed <= TICK_LIVE_MINUTES * 60:
+    if observed is None or not 0 <= now - observed <= 15 * 60:
         errors.append('invalid/stale observed_at; obtain a fresh tick')
     if report['outcome'] not in ('ok', 'judgement_needed', 'failure', 'unknown', 'refused'):
         errors.append('invalid outcome')
@@ -437,11 +384,6 @@ def wake_supervisor(item):
     return core.executor_run(found['runtime'], 'send', session=found['session'], text=text)
 
 
-# #42: the launchd timer's turn of the coordinator session, before the tick's output.
-WAKE_PROMPT = ('taskq tick --act (the launchd timer) found what needs judgement; it already did the mechanical steps '
-               '(spawn, retire, nudges). Do the coordinator pass by taskq-manager.md § 3 on the output below; do not run '
-               '`taskq tick` again in this turn. Reply in the owner\'s language.\n\n')
-
 
 def local(agent):
     """A `claude agents` job of this checkout: names are only a correlation, the cwd binds it to the project."""
@@ -582,8 +524,6 @@ def launch(args, start, act, step):
 
 
 def tick(args):
-    if args.install_timer or args.uninstall_timer:
-        return timer(args.install_timer)
     # Keep the inode: unlinking the file could let a third pass lock a different file.
     lock = core.TICK_BEAT.with_name('taskq-tick.lock')
     lock.parent.mkdir(parents=True, exist_ok=True)
@@ -618,106 +558,17 @@ def tick(args):
 
 
 def act(args):
-    """#42 `tick --act`: mechanical steps and a report every pass; exit 1/wake only for judgement.
-    `--wake` (the launchd timer) also gives that output to the coordinator session as one turn."""
+    """`tick --act`: mechanical steps and a report every pass; exit 1 only for judgement."""
     with contextlib.redirect_stdout(io.StringIO()) as said:
         judgement = tick_pass(args, act=True)
     if hasattr(args, 'output') and judgement:
         args.output['outcome'] = 'failure' if any(event.get('status') == 'failed' for event in args.output['actions']) else 'judgement_needed'
         args.output['refusals'] = judgement
     print(said.getvalue(), end='')
-    pending_set = getattr(args, 'pending', ())
-    if args.wake and (judgement or pending_set):
-        # #223: a shown question has no judgement line for a day, but it is pending: the bounded re-wake covers it.
-        # Delivery is a fact; receipt and application are not read from it. The pending lines name what was sent.
-        status = wake(said.getvalue(), judgement, pending_set)
-        core.record(args, 'wake', status=status, acknowledged='unknown', pending=[line for _, line in pending_set])
     if not judgement:
         return
     sys.stdout.flush()
     sys.exit(1)
-
-
-def woken():
-    return core.TICK_BEAT.with_name('taskq-tick-woken')
-
-
-def wake(output, judgement, pending=()):
-    """One turn of the coordinator ([coordinator] session of taskq.local.toml) per new set of items: a review
-    still open five minutes later wakes nobody again; a busy coordinator gets it on the next tick. #223: the key
-    holds each item's pending line (state, claim, revision), so a resubmitted result or a second question is a new
-    set; every item is re-read against its line immediately before the send; the same set is sent once more after
-    TICK_LIVE_MINUTES to an idle coordinator (delivered is not applied), and nothing here reads an acknowledgement."""
-    session = core.personal().get('coordinator', {}).get('session')
-    if not session:
-        print(f'\nNo coordinator to wake: no [coordinator] session in {core.LOCAL} (manager contract § 2).')
-        return 'no coordinator'
-    # #185: a handoff wakes the new owner. #223: a review, ask or stuck line of an item with a pending line is covered
-    # by that finer line; a question leaving the list when shown is the same set, not a new one.
-    covered = {str(item['iid']) for item, _ in pending}
-    rest = [line for line in judgement if not (line.split()[0] in ('review', 'ask', 'stuck') and line.split()[1] in covered)]
-    key = hashlib.sha256('\n'.join([session, *rest, *(line for _, line in pending)]).encode()).hexdigest()[:12]
-    sent = woken().read_text().split() if woken().exists() else []
-    again = bool(sent) and sent[0] == key
-    if again and time.time() - float(sent[1] if len(sent) > 1 else 0) < TICK_LIVE_MINUTES * 60:
-        print('\nThe coordinator was already woken for these items.')
-        return 'already delivered'
-    agents = core.claude_agents()
-    if session not in agents:
-        # Unlisted (`claude agents` failed, or not a background session here): a resume could run beside a busy PM.
-        print(f'\nThe coordinator {session} is not in `claude agents` here: its state is unknown, not woken; '
-              'the next tick tries again.')
-        return 'coordinator unknown'
-    name = agents[session].get('name')
-    # #185: `claude --bg --resume` goes on under a new session id with the same name (#182): a busy or blocked
-    # job of that name in this checkout is the coordinator too. Another checkout's job of the same name is not.
-    if any(busy(agent) for sid, agent in agents.items() if sid == session or name and agent.get('name') == name and local(agent)):
-        print('\nThe coordinator is busy: the next tick wakes it.')
-        return 'coordinator busy'
-    if moved := [item['iid'] for item, line in pending if not still_pending(item, line)]:
-        print(f'\nNot woken: {", ".join(f"#{iid}" for iid in moved)} changed since this tick read it; the next tick reads again.')
-        return 'pending changed'
-    if again or not judgement:
-        # A re-delivery, or a set with no judgement line (questions already shown): the pending items and their
-        # notes, from the same read the lines were made of, so the turn has what it decides on.
-        output += '\n## Pending, acknowledgement unknown\n\n' + ''.join(
-            f'- {line}\n{core.data(item.get("_note", "none"))}' for item, line in pending)
-    core.claude_wake(session, f'Project {core.PROJECT_PATH}, main checkout {core.ROOT}. ' + WAKE_PROMPT + output)
-    woken().write_text(f'{key}\n{time.time():.0f}\n')
-    print(f'\nWoke the coordinator {session}' + (' again: the same items are still pending; acknowledgement unknown.' if again else '.'))
-    return 'delivered again' if again else 'delivered'
-
-
-def timer(install):
-    """#42: a launchd agent runs `tick --act --wake` from the main checkout every TICK_MINUTES; an optional
-    macOS mode instead of the default in-session CronCreate timer (no LLM turn per fire, no app session, no 7-day limit)."""
-    if sys.platform != 'darwin':
-        return print('skipped: the launchd tick timer is macOS only; use the in-session timer (the default tick)')
-    label = f'taskq.{core.ROOT.name}'
-    plist, domain = Path.home() / 'Library/LaunchAgents' / f'{label}.plist', f'gui/{os.getuid()}'
-    subprocess.run(['launchctl', 'bootout', f'{domain}/{label}'], capture_output=True)  # not loaded: nothing to do
-    if not install:
-        plist.unlink(missing_ok=True)
-        return print(f'Removed the tick timer {label} ({plist}).')
-    session = core.personal().get('coordinator', {}).get('session')
-    if not session and (session := os.environ.get(core.RUNTIMES['claude'])):
-        # Run inside the coordinator session: it records itself as the session the timer wakes.
-        with core.LOCAL.open('a') as local:
-            local.write(f'\n[coordinator]\nsession = {json.dumps(session)}\n')
-    log = core.TICK_BEAT.with_name('taskq-tick.log')
-    log.parent.mkdir(parents=True, exist_ok=True)
-    plist.parent.mkdir(parents=True, exist_ok=True)
-    # The shell's PATH finds git, gh/glab and claude; no token goes into the file (they come from the keychain).
-    env = {key: os.environ[key] for key in ('PATH', 'TASKQ_HOST') if os.environ.get(key)}
-    plist.write_bytes(plistlib.dumps({
-        'Label': label, 'ProgramArguments': [sys.executable, '-m', 'taskq', 'tick', '--act', '--wake'],
-        'WorkingDirectory': str(core.ROOT), 'StartInterval': TICK_MINUTES * 60, 'RunAtLoad': True,
-        'EnvironmentVariables': env, 'StandardOutPath': str(log), 'StandardErrorPath': str(log)}))
-    subprocess.run(['launchctl', 'bootstrap', domain, str(plist)], check=True)
-    print(f'Installed the tick timer {label} ({plist}): `taskq tick --act --wake` every {TICK_MINUTES} min, log {log}.\n'
-          + (f'It wakes the coordinator session {session}.' if session else
-             f'No coordinator to wake: run this inside the coordinator session, or write [coordinator] session in {core.LOCAL}.')
-          + '\nDelete an in-session CronCreate tick timer: one coordinator timer per checkout.')
 
 
 def idle_ticks():
@@ -725,8 +576,7 @@ def idle_ticks():
 
 
 def idle_stop(act, step, failed):
-    """#153: count this empty pass; on the [idle] stop-th in a row (taskq.local.toml, default 5, 0 = never) the line
-    that stops the timer, and the count starts over. `act` (launchd) stops its own timer and runs cleanup here."""
+    """Count empty passes and run configured cleanup on the stop-th one."""
     idle = core.personal().get('idle', {})
     stop, clean = idle.get('stop', 5), idle.get('cleanup', True) and core.CLEANUP.get('enabled', True)
     count = int(idle_ticks().read_text()) + 1 if idle_ticks().exists() else 1
@@ -736,19 +586,14 @@ def idle_stop(act, step, failed):
     idle_ticks().unlink()
     cleanup = f'`{core.TOOL} cleanup --apply`'
     if not act:
-        return (f'Idle {count} ticks: stop the timer (CronDelete / --uninstall-timer), ' + f'run {cleanup}, ' * clean
-                + 'report to the owner; rearm with "arm the tick" (manager contract § 3).')
-    if sys.platform == 'darwin':
-        step('stop the tick timer', lambda: timer(False))
+        return f'Idle {count} ticks: ' + f'run {cleanup}, ' * clean + 'report to the owner.'
     if clean:
         try:
             # Under the #197 lock and state: skipped when the owner's tick already cleaned within the schedule.
             core.cleanup(argparse.Namespace(apply=True, trigger='idle'))  # its Remove and Ask the owner sections go to the coordinator
         except (SystemExit, OSError, subprocess.SubprocessError) as error:
             failed.append(f'run {cleanup}: {core.codex_line(str(error))}')
-    stopped = 'the tick stopped its launchd timer' if sys.platform == 'darwin' else 'stop the external scheduler'
-    return (f'\nIdle {count} ticks: {stopped}' + f' and ran {cleanup}' * clean
-            + '; report to the owner; rearm with "arm the tick" (manager contract § 3).')
+    return f'\nIdle {count} ticks:' + f' ran {cleanup}' * clean + '; report to the owner.'
 
 
 def retire_closed(log, args=None):
@@ -876,8 +721,6 @@ def queue_pass(args, act=False):
     if not core.CODEX_SOCKET.exists():
         print(f'Codex workers unavailable on this machine: no Codex app server socket {core.CODEX_SOCKET}; '
               f'start it: `{core.CODEX_HEADLESS}`.')
-    tick_beat()
-    contract_news(args.prompt_version)
     loaded, candidates = core.profile(args)
     args.pm_report['profile'] = args.profile
     if issue := next((item for item in candidates if item.get('web_url')), None):

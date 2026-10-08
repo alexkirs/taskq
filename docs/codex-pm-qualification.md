@@ -43,7 +43,7 @@ leave a live selftest task.
 | Authoritative task state | Board metadata, trusted notes and labels | Same | Same |
 | Worker result/question discovery | Existing board/tick read | Existing board/tick read | Existing board/tick read when the session runs it |
 | Result while worker UI is unavailable | Board route; session is diagnostic | Board route; session is diagnostic | Board route; session is diagnostic |
-| PM wake/continuation | No qualified route | `tick --act --wake` resumes configured Claude coordinator | Unsupported: `--wake` targets only configured Claude coordinator |
+| PM wake/continuation | No qualified route | No built-in continuation route | Sender delivery is configured outside taskq |
 | Native message to worker | Route-specific/unknown | Claude send path | `taskq codex-send`; receipt is delivery, not application |
 | PM apply receipt | No inferred receipt | Decision note/state transition; delivery alone is `unknown` | Same board evidence when a Codex PM runs the decision |
 | Real worker fixture | Unqualified here | Spawn blocked in this run | Spawn blocked in this run |

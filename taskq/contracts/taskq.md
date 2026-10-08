@@ -12,6 +12,7 @@ canonical: true
 It is the only task queue and the only orchestration mechanism. One tool, `taskq`, works the same
 from a Codex session and from a Claude session.
 The previous DOT system (`dot_tick.py`, `dot_gitlab.py`, labels `flow-*`) was removed on 2026-10-05.
+Principles R1–R12 and the change rule: [principles.md](principles.md). This file adds mechanics only.
 
 ## Publication before or after review
 
@@ -56,9 +57,8 @@ and separate worker/manager permissions to enforce review before publication.
 | Task lock | Award emoji `lock` on the task's issue; on GitHub the ref `refs/taskq/lock/<N>` (§ Taking a task) |
 | Problem without a task | Its own issue with label `problem`; `tick` names it, the coordinator closes it after review |
 
-There is no local state: any machine with `glab` sees and changes the queue the same way. There is no
-other log, mirror, service issue or second queue (the former service issue with claims and the `spawn`
-log was closed on 2026-10-06). Scoped labels (`key::value`) on GitLab 17.2.9-ee (tested) without a
+The board is the only state ([R1](principles.md)): any machine with `glab` sees and changes the queue the same way
+(the former service issue with claims and the `spawn` log was closed on 2026-10-06). Scoped labels (`key::value`) on GitLab 17.2.9-ee (tested) without a
 license are not mutually exclusive (checked 2026-10-06), so states are plain `q-*` labels.
 
 ## Project: taskq.toml
@@ -236,15 +236,14 @@ board»; `ready`↔`waiting` goes back silently; any other move goes back to the
 - An epic is a project milestone (GitLab 17.2.9-ee without a license has no Epics, blocks links, weight or
   swimlanes). Flat, no nesting. The epic description is the milestone description. Every open task
   has a milestone.
-- GitLab subtasks (Tasks) are not used: they are not visible on the board. One task = one worker session = one
-  issue. If it is bigger, split it into several issues in one milestone and link them with `deps`. A checklist
-  in the description is fine for acceptance steps.
+- One task per issue, split by [R2](principles.md). GitLab subtasks (Tasks) are not used: they are not visible on
+  the board. Split work goes into one milestone, linked with `deps`. A checklist in the description is fine for
+  acceptance steps.
 
 ## Four roles
 
-A role is what a session is doing right now. A task without a `supervisor` keeps the three roles below
-unchanged (legacy). A supervised task adds the fourth (#240): one canonical task, one supervisor, one worker,
-one session.
+Roles are defined by [R2–R3](principles.md); this section is their mechanics. A task without a `supervisor`
+keeps the three legacy roles below (manager, coordinator, worker); a supervised task adds the fourth (#240).
 
 - **Supervisor** — the session named in the task's block `supervisor`. Only it launches the task's worker
   (`spawn`; `reserve` refuses any other session, `tick` names the task instead of starting it), and only it
@@ -263,12 +262,10 @@ one session.
 - **Migration**: a taskq older than #240 drops `supervisor` when it writes the task. Update every machine
   (`taskq update`) before the first assignment.
 
-- **Manager** — the session the owner talks to. Creates tasks (`add`), relays the owner's
-  answers (`answer`), shows the queue (`list`).
-- **Coordinator** — the session running `tick`. The command itself returns stuck tasks
-  to the queue and prints exact instructions: what to check and close, how many workers to start,
-  which questions to relay to the owner.
-- **Worker** — an ordinary visible app session, one per task. Its only prompt:
+- **Manager** (R3 root PM): `add`, `answer`, `list`.
+- **Coordinator** (R3 queue tick): runs `tick`, which returns stuck tasks to the queue and prints what to
+  check and close, how many workers to start and which questions to relay.
+- **Worker** (R3): one per task. Its only prompt:
   "Run `cd <main checkout> && taskq worker` and follow the instructions it prints".
   The command hands out the task, workspace, history and exact delivery commands.
 

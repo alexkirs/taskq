@@ -7,17 +7,14 @@ canonical: true
 
 # taskq — manager and coordinator session (Claude desktop)
 
-How to set up the session that runs the [taskq](taskq.md) queue: it files tasks from the owner's words,
-ticks every 5 minutes, starts workers in visible sessions, accepts results and relays questions to
-the owner. Two roles (owner's decision, 2026-10-06):
+How to set up the session that runs the [taskq](taskq.md) queue. Principles, roles and report format:
+[principles.md](principles.md) (R1–R12); this file adds the procedures. Entry phrases per role:
 
-- **Product manager** — the owner says the session is the taskq product manager (e.g. “You are the taskq manager.”, “You are the Product Manager of taskq”,
-  «Ты менеджер taskq», «Ты продукт-менеджер taskq»). Step 1 and § 4: checks the place, reads the queue, files and discusses
-  tasks. Does not arm the tick.
-- **Coordinator** — the owner says "arm the tick" or "you are the coordinator" (e.g. «включи тик»,
-  «ты coordinator»). Steps 1–3: a tick every 5 minutes. Only one such session at a time: `taskq tick`
-  prints `Last tick: N min ago`; if that is under 15 minutes, another session holds the tick — do not
-  make a second `CronCreate`, tell the owner.
+- **Product manager** (R3 root PM) — “You are the taskq manager.”, “You are the Product Manager of taskq”,
+  «Ты менеджер taskq», «Ты продукт-менеджер taskq». Step 1 and § 4. Does not arm the tick.
+- **Coordinator** (R3 queue tick) — "arm the tick" or "you are the coordinator" («включи тик»,
+  «ты coordinator»). Steps 1–3. One per project (R4): `taskq tick` prints `Last tick: N min ago`; under
+  15 minutes means another session holds the tick — do not make a second `CronCreate`, tell the owner.
 
 The session replies with the role it took and what is in the queue now.
 
@@ -731,11 +728,10 @@ Ask the owner items, and say how to rearm: "arm the tick" (§ 2). `tick --act` s
 cleanup itself and wakes the coordinator with the output, so only the report is left. A task in ask never counts
 as idle; any other pass starts the count over.
 
-**Reply to the owner.** Include the generated versioned report once on every pass, even when nothing changed. Add one or two lines of judgment when nothing changed. Do not write "no changes" without
-running the command. Every task, worker session and commit named in a reply is a link the owner clicks,
-copied from the tick output: `[#N](<issue URL>)`, the session link of the "Workers" table, the
-`Commit:` link of a review. Never a bare `#N`, session id or sha: the owner's chat opens only http(s) links.
-Show the "Workers" table and the board link (`Board:` line) once per pass.
+**Reply to the owner.** Format and links: [R6](principles.md); style: R7. Include the generated report once
+on every pass, even when nothing changed, plus one or two lines of judgment. Do not write "no changes" without
+running the command (R12). Links come from the tick output: `[#N](<issue URL>)`, the "Workers" session link,
+the review's `Commit:` link.
 
 ## Cleaning up finished work
 
@@ -922,9 +918,8 @@ alone also reads the queue. Neither question starts workers or arms the tick.
   the next tick moves the task between `ready` and `waiting` itself), `taskq edit N --scope <paths>`
   (replaces the scope with a note; name the modules the task really touches, the core only when it must,
   so tasks without overlap run in parallel).
-- **One task — one worker session.** Do not create GitLab sub-tasks (Tasks): they are not visible on
-  the board. Work larger than one session is several issues in one milestone linked by `--deps`; a
-  checklist in the description is only for acceptance steps.
+- **One task — one worker session** ([R2](principles.md)): split mechanics in [taskq § Epics and
+  subtasks](taskq.md#epics-and-subtasks). Duplicates at intake: propose merge or separate, the owner decides.
 - **Waiting on an owner decision** — do not hold a task without a question. Either
   `taskq ask N --text "<question with options>"` (the manager asks about an unstarted task; column
   `q-ask`), or `taskq later N --text "<why deferred>"`, or propose closing it to the owner.
@@ -970,7 +965,7 @@ alone also reads the queue. Neither question starts workers or arms the tick.
 - Removes other trees and data only within the bounds of `cleanup --apply` above; anything else
   needs the owner's answer. Packages are not removed by this mechanism.
 - Does not change security settings of other machines; another Claude session takes such a decision
-  only from the owner directly.
+  only from the owner directly. Model, effort and permissions never change silently ([R9](principles.md)).
 
 ## Other machines
 

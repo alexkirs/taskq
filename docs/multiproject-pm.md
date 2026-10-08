@@ -13,7 +13,7 @@ Prints one aggregate: per project its status, blockers and the project's existin
 
 ## Manifest
 
-A TOML file the user writes on each machine. It lists only the projects chosen for observation. Folders are never auto-discovered.
+A TOML file the user writes on each machine. It lists only the projects chosen for observation ([R10](../taskq/contracts/principles.md)).
 
 ```toml
 version = 1

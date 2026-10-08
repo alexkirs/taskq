@@ -1,9 +1,9 @@
 # Session message contract
 
 Status: proposed by #232. This is a readable envelope for existing TaskQ
-routes, not a queue, scheduler, receipt database, or new protocol. It reuses
-the #191 receive/applied distinction, the #205 concise RU/EN rule, and links
-completion supervision (#223) and runtime qualification (#224).
+routes; no new state or protocol ([R1](../taskq/contracts/principles.md)), style
+by R7, unverified stays unknown (R12). It reuses the #191 receive/applied
+distinction and links completion supervision (#223) and runtime qualification (#224).
 
 ## Write, deliver, render
 

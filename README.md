@@ -56,7 +56,7 @@ Claude workers: run `claude` once in the project root and accept the folder trus
 
 ```bash
 taskq add "Try taskq" --type research --goal "Reply: taskq works. No file changes." --acceptance "The result says: taskq works."
-taskq tick          # starts a worker; the manager runs it every 5 minutes: /loop 5m taskq tick
+taskq tick          # starts a worker; then wake the manager per event: taskq arm tick "<manager>"
 taskq list          # the worker hands in: review
 taskq close N --text "Checked the reply."
 ```

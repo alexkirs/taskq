@@ -638,6 +638,40 @@ def dispatch():
     except (SystemExit, Exception) as error:
         print(f'taskq: dispatch stopped: {str(error).removeprefix("taskq: ")}; the next tick retries', file=sys.stderr)
 
+def cmd_wait(args):
+    """Block until the manager is needed: print 'review #N', 'ask #N', 'gone #N', or 'tick' after the window (#407).
+    .taskq/wait.json keeps the states last reported, so an event is printed once."""
+    path, kinds, here = CONFIG['root'] / '.taskq' / 'wait.json', runtimes(), machine()
+    seen = json.loads(path.read_text('utf-8')) if path.is_file() else {}
+    end = time.time() + args.window * 60
+    while True:
+        now = {}
+        for item in filter(None, map(parse, BOARD.list(None))):
+            claim, state = item['claim'] or {}, item['state']
+            if state == 'doing' and claim.get('name') == here and claim.get('runtime') in kinds \
+                    and kinds[claim['runtime']].alive(claim['session']) is False:  # ponytail: one alive call per local worker per poll
+                state = 'gone'
+            now[str(item['iid'])] = state
+        events = [f'{state} #{n}' for n, state in now.items() if state in ('review', 'ask', 'gone') and seen.get(n) != state]
+        if events or time.time() >= end:
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps(now), 'utf-8')
+            print('\n'.join(events) or 'tick')
+            return
+        seen = now  # a task that leaves review and comes back while we wait is a new event
+        time.sleep(args.every)
+
+SENDERS = {'claude': 'SendMessage', 'codex': 'its thread send'}
+
+def cmd_arm(args):
+    """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
+    runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
+    print(f'''You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
+Repeat forever, from {CONFIG["root"]}:
+1. Run `python3 {Path(__file__).resolve()} wait`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
+2. Send its output, verbatim, to {args.target} with {SENDERS.get(runtime, "your messaging tool")}.
+3. Go back to 1 at once. A failed run or send: say so to {args.target} once, then go on.''')
+
 def main(argv=None):
     global CONFIG, BOARD
     parser = argparse.ArgumentParser(prog='taskq')
@@ -666,6 +700,8 @@ def main(argv=None):
     command('later', cmd_move, text=True)
     command('close', cmd_close, (('n',), {'nargs': '+', 'type': int}), n=False, text=True)
     command('tick', cmd_tick, n=False)
+    command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}), n=False)
+    command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {}), n=False)
     args = parser.parse_args(argv)
     if BOARD is None:
         CONFIG = load_config()

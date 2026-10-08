@@ -49,12 +49,15 @@ Open: supervisor per runtime, yes or no (Claude; Codex). Until the owner decides
 
 A tick is one pass (§ 7), started by a message or by a queue event. A sender runs `taskq tick`; received means one
 pass, not received means nothing. `add`, `answer`, `result`, `requeue` and `close` run the same pass once, in the same
-process, after their move: the queue chains itself. The sent tick is the safety net for lost events (dead sessions,
-stalls) and can run rarely. The owner configures one sender per machine outside taskq (§ 7 Arm the tick). A pass
-starts only tasks with no `host-*` label or its own machine's.
+process, after their move: the queue chains itself. The manager is woken only when it has work: a sender session
+loops `taskq wait`, which blocks until a task enters `review` or `ask`, a local worker is gone, or a safety window
+(10 min) passes, and sends its output to the manager, who then runs a pass. One sender per machine, armed with
+`taskq arm tick <manager>` (§ 7 Arm the tick). A pass starts only tasks with no `host-*` label or its own machine's.
 Changed: "a tick on another machine never coordinates" → every machine's tick runs the same pass for its own claims
 and hosts; there is no coordinator machine (#290).
 Changed: "a tick is a message" → a tick is a message or a queue event; spawn no longer waits for the next sent tick (#333).
+Changed: a sender on a fixed interval (`/loop 5m taskq tick`) → a sender that loops `taskq wait` and messages the
+manager per event, `tick` after the safety window (#407).
 
 ### R5. Worker writes completion to the task
 
@@ -213,6 +216,8 @@ Runtime file: four module-level functions, two more optional.
 | `taskq later N [--text T]` | park: any state → `later` |
 | `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
 | `taskq tick` | one pass of the queue on this machine (§ 7) |
+| `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed; print `review #N`, `ask #N`, `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7) |
+| `taskq arm tick <manager>` | print the prompt for a tick-sender session of this runtime (§ 7) |
 
 - `--sha`: 7 to 40 lowercase hex digits; give the full SHA.
 - `--runtime` default `any`; `--type` default `code`; `--priority` default 2. `--host` takes a machine name (§ 2 `hosts`).
@@ -290,12 +295,20 @@ results and closes. It does no task work itself and never answers a worker's que
 
 ### Arm the tick
 
-- Claude: `/loop 5m python3 <taskq clone>/taskq.py tick`, from the project root.
-- Headless agent: run `taskq tick`, wait (`python3 -c "import time; time.sleep(300)"`), repeat.
+No fixed interval (#407): the manager is woken only when it has work.
+
+1. In the project root run `taskq arm tick "<manager>"` (its session name, id or link). It prints the prompt for
+   this runtime: loop { `taskq wait`; send its output to `<manager>` (Claude: `SendMessage`; Codex: its thread
+   send) }.
+2. Start a separate sender session on that prompt. It does no task work.
+3. `taskq wait` lists the board every 25 s and returns at once with one line per new event: `review #N`, `ask #N`,
+   `gone #N` (a worker claimed on this machine whose session `alive` says gone), or `tick` when nothing happened for
+   10 min. `.taskq/wait.json` keeps the states last reported, so an event is printed once (a runtime handle, R1).
+4. The manager treats any message from the sender as a tick: one pass (`taskq tick`), then § After each pass. A
+   stalled worker (120 min silent) is nudged by the pass the `tick` line starts.
+
 - No agent: any scheduler (cron, Windows Task Scheduler) that runs `taskq tick` in the project root
   every 5 minutes; nobody reads the table then, so check `taskq list` yourself.
-- Codex: an automation every 5 minutes with the prompt "Run `python3 <taskq clone>/taskq.py tick` in
-  `<project root>` and follow the table it prints."
 - One tick sender per machine. Any machine may tick; each starts only tasks with no `host-*` label or its own.
 
 ### One tick pass

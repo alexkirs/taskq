@@ -173,6 +173,7 @@ class PullRequests(Base):
         self.run_cli('take', '1')
         self.run_cli('result', '1', '--sha', 'a' * 40)
         self.calls, self.prs, self.merged = [], [{'number': 7, 'headRefOid': 'a' * 40, 'baseRefName': 'main'}], True
+        self.branches = {}  # branch -> its PRs, for tasks other than #1
         self.made = {'parents': [{'sha': 'a' * 40}, {'sha': 'e' * 40}], 'committer': {'login': 'web-flow'}, 'commit': {'verification': {'verified': True}}}
         self.behind, self.updated, self.checks = 0, True, {'a' * 40: [[('completed', 'success')]], 'd' * 40: [[('completed', 'success')]]}
 
@@ -187,17 +188,17 @@ class PullRequests(Base):
         if command[2] == 'update-branch':
             return subprocess.CompletedProcess(command, int(not self.updated), '', 'merge conflict')
         verb = command[2]
-        out = {'list': json.dumps(self.prs), 'view': json.dumps({'state': 'MERGED' if self.merged else 'OPEN', 'mergeCommit': {'oid': 'c' * 40}})}
+        out = {'list': json.dumps(self.branches.get(command[4], self.prs)), 'view': json.dumps({'state': 'MERGED' if self.merged else 'OPEN', 'mergeCommit': {'oid': 'c' * 40}})}
         return subprocess.CompletedProcess(command, int(verb == 'merge' and not self.merged), out.get(verb, ''), 'Pull request is not mergeable')
 
     def poll(self, sha):  # one poll of the check runs on sha: the polls in order, the last one repeats
         polls = self.checks[sha]
         return polls.pop(0) if len(polls) > 1 else polls[0]
 
-    def close(self):
+    def close(self, *numbers):
         with mock.patch.object(taskq.subprocess, 'run', side_effect=self.cli), mock.patch.object(taskq.shutil, 'which', side_effect=lambda name: name), \
                 mock.patch.object(taskq.time, 'sleep'):
-            return self.run_cli('close', '1')
+            return self.run_cli('close', *(numbers or ['1']))
 
     def merges(self):
         return [call for call in self.calls if call[:2] == ['pr', 'merge']]
@@ -208,6 +209,7 @@ class PullRequests(Base):
         self.assertIn('`git push --force-with-lease origin HEAD:refs/heads/taskq-1`', prompt)
         self.assertIn('`gh pr create --base main --head taskq-1 --title "<title>" --body "<summary>"`', prompt)
         self.assertIn('--sha <PR head full SHA>', prompt)
+        self.assertIn('`git fetch origin && git rebase origin/main`, run the tests', prompt)  # #334: up to date before result
         taskq.CONFIG['board'] = 'gitlab'
         self.assertIn('`glab mr create --yes --target-branch main --source-branch taskq-1', taskq.brief(item, 'claude'))
         taskq.CONFIG['publish'] = 'direct'
@@ -219,6 +221,28 @@ class PullRequests(Base):
         self.assertIn(['api', '-X', 'GET', f'repos/o/r/commits/{"a" * 40}/check-runs?check_name=tests'], self.calls)
         self.assertEqual(self.board.issues[1]['state'], 'closed')
         self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\nmerged {"c" * 40}')
+
+    def test_close_batch_updates_only_the_behind(self):  # #334
+        for n, sha in ((2, 'b'), (3, 'f')):
+            self.add()
+            self.run_cli('take', str(n))
+            self.run_cli('result', str(n), '--sha', sha * 40)
+            self.branches[f'taskq-{n}'] = [{'number': n + 6, 'headRefOid': sha * 40, 'baseRefName': 'main'}]
+            self.checks[sha * 40] = [[('completed', 'success')]]
+        self.behind = 1  # only #1 (PR 7, head a...) is behind main
+        self.assertEqual(self.close('2', '3', '1'), '#2 closed\n#3 closed\n#1 closed\n')
+        self.assertEqual([call for call in self.calls if call[1] == 'update-branch'], [['pr', 'update-branch', '7', '-R', 'o/r']])
+        self.assertEqual([call[6] for call in self.merges()], ['b' * 40, 'f' * 40, 'd' * 40])
+
+    def test_close_batch_goes_on_after_a_failure(self):
+        self.add()
+        self.run_cli('take', '2')
+        self.run_cli('result', '2', '--sha', 'b' * 40)
+        self.branches['taskq-2'], self.checks['b' * 40] = [{'number': 8, 'headRefOid': 'b' * 40, 'baseRefName': 'main'}], [[('completed', 'success')]]
+        self.checks['a' * 40] = [[('completed', 'failure')]]
+        with self.assertRaisesRegex(SystemExit, 'not closed: #1$'):
+            self.close('1', '2')
+        self.assertEqual((self.task(1)['state'], self.board.issues[2]['state']), ('ready', 'closed'))
 
     def test_head_is_not_the_result(self):
         for change in ({'headRefOid': 'b' * 40}, {'baseRefName': 'release'}):

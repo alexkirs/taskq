@@ -441,6 +441,19 @@ def cleanup(current):
     return ''
 
 def cmd_close(args):
+    """close N [M ...]: in order; each PR is updated only if behind (#334). A failed task does not stop the rest."""
+    failed = []
+    for n in args.n:
+        try:
+            close_one(argparse.Namespace(n=n, text=args.text))
+        except SystemExit as error:
+            if len(args.n) == 1:
+                raise
+            failed.append(n)
+            print(error, file=sys.stderr)
+    failed and fail(f'not closed: {" ".join(f"#{n}" for n in failed)}')
+
+def close_one(args):
     current = task(args.n, 'review')
     sha = commit((current['result'] or {}).get('sha') or '')
     if CONFIG['publish'] == 'pr' and (merged := merge(current, sha)):
@@ -576,7 +589,7 @@ def main(argv=None):
     command('result', cmd_move, (('--sha',), {'required': True, 'type': commit}), (('--checks',), {'default': ''}), text=True)
     command('requeue', cmd_move, text=True)
     command('later', cmd_move, text=True)
-    command('close', cmd_close, text=True)
+    command('close', cmd_close, (('n',), {'nargs': '+', 'type': int}), n=False, text=True)
     command('tick', cmd_tick, n=False)
     args = parser.parse_args(argv)
     if BOARD is None:

@@ -418,7 +418,7 @@ def claude_executor_ended(session, checkout, rows):
     matches = [row for row in rows if row.get('sessionId') == session]
     if not (len(matches) == 1 and matches[0].get('kind') == 'background'
             and matches[0].get('state') in CLAUDE_ENDED and isinstance(matches[0].get('status'), str)
-            and matches[0].get('status') != 'busy' and matches[0].get('pid') is None
+            and matches[0].get('status') not in ('working', 'blocked', 'busy') and matches[0].get('pid') is None
             and isinstance(matches[0].get('cwd'), str)):
         return False
     try:

@@ -491,13 +491,18 @@ class Acting(unittest.TestCase):
             self.assertEqual(multiproject.claude_inventory([row]), {'session:185'} if row.get('pid') else set())
 
     def test_ended_claude_executor_rejects_interactive_missing_malformed_or_contradictory_rows(self):
-        row = {'kind': 'background', 'sessionId': '198', 'cwd': str(self.dir), 'state': 'stopped', 'status': 'idle'}
-        self.assertTrue(multiproject.claude_executor_ended('198', self.dir, [row]))
+        row = {'kind': 'background', 'sessionId': '198', 'cwd': str(self.dir), 'state': 'done', 'status': 'idle'}
+        for state in ('done', 'failed', 'stopped'):
+            with self.subTest(state=state):
+                self.assertTrue(multiproject.claude_executor_ended('198', self.dir, [{**row, 'state': state}]))
         for rows in (None, [{}], [{**row, 'kind': 'interactive'}], [{**row, 'cwd': '/wrong'}],
-                     [{**row, 'state': 'working'}], [{**row, 'status': 'busy'}], [{**row, 'status': None}],
+                     [{**row, 'state': 'working'}], [{**row, 'status': 'working'}], [{**row, 'status': 'blocked'}],
+                     [{**row, 'status': 'busy'}], [{**row, 'status': None}],
                      [{**row, 'pid': 1}], [{**row, 'sessionId': 'other'}], [row, {**row, 'state': 'working'}]):
             with self.subTest(rows=rows):
                 self.assertFalse(multiproject.claude_executor_ended('198', self.dir, rows))
+        self.assertIsNone(multiproject.claude_inventory(None))
+        self.assertIsNone(multiproject.claude_inventory([{}]))
 
     def test_occupancy_keeps_mixed_state_same_session_ineligible(self):
         items = [{'iid': 191, 'state': 'review', 'claim': {'runtime': 'codex', 'session': 'same'}, 'reservation': None},

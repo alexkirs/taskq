@@ -193,7 +193,8 @@ results and closes. It does no task work itself and never answers a worker's que
 
 1. `waiting` with every dep closed → `ready`.
 2. `doing`, claimed on this machine: `alive` False → requeue (`session ... is gone`); alive and the issue unchanged
-   for 120 minutes → `send(session, 'continue: read your issue')`, comment `nudge`.
+   for 120 minutes → `send(session, 'continue: read your issue')`, comment `nudge`. Alive and the last comment an
+   `answer` → `send` the answer text at once, comment `nudge` (one send per answer).
 3. `ready`, deps closed, host matches, a free slot for its runtime (`run-*` label, else the first free in
    `limits`) → `spawn(T<N> <ORCH> <title> (<machine>), brief, root)` (ORCH: CLD, CDX, DOT, HRM, GRK of the launcher, UNK from a shell), claim, `q-doing`, comment `spawn` (with the session link when the runtime has one yet).
 4. `ask`, `review`, `later`: nothing; they wait for the manager.
@@ -209,7 +210,7 @@ Reply to the owner with the table as printed (links, not bare ids), then one or 
 
 - `ask`: read the question (the last `ask` comment), relay it verbatim. Record the owner's reply:
   `taskq answer N --text "<verbatim answer>"`. The task goes back to `doing`; a finished worker is requeued by
-  the next tick and a new worker continues branch `taskq-<N>`; a live one reads it on its next nudge.
+  the next tick and a new worker continues branch `taskq-<N>`; a live one gets it from the next tick.
 - `review`: check the result.
   1. `git show <sha> --stat`, then the diff, against every Acceptance item (`pr` mode: the PR diff).
   2. A commit: CI on that exact SHA is green (an answer on `origin/main` needs no CI check): `gh run list --commit <sha>` / `glab api "projects/:id/pipelines?sha=<sha>"`, where the project

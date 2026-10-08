@@ -508,9 +508,12 @@ def cmd_tick(args):
             move(item, 'ready', 'requeue', f'session {claim["session"]} is gone', claim=None, result=None)
             item.update(state='ready', claim=None)
             continue
-        if state and age(item) >= 120:
-            claim = {**claim, 'session': runtime.send(claim['session'], 'continue: read your issue')}
-            move(item, 'doing', 'nudge', claim=claim)
+        last = (BOARD.get(item['iid'])['comments'] or [''])[-1] if state else ''
+        answer = last.partition('\n\n')[2] if last.startswith('**answer**') else None  # #307: an answer wakes the worker at once
+        if answer is not None or state and age(item) >= 120:
+            text = f'The owner answered your question:\n\n{answer}' if answer is not None else 'continue: read your issue'
+            claim = {**claim, 'session': runtime.send(claim['session'], text)}
+            move(item, 'doing', 'nudge', claim=claim)  # the nudge comment is now the last note: one send per answer
             item['claim'] = claim
         busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
     for item in items:

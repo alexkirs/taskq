@@ -433,6 +433,11 @@ class Tick(Base):
         self.run_cli('tick')  # the safety net finds nothing left to do
         self.assertEqual(spawns(), [1, 2, 2, 3, 3])
 
+    def test_no_event_pass_inside_a_codex_sandbox(self):
+        with mock.patch.dict(os.environ, {'CODEX_SANDBOX': 'seatbelt'}):
+            self.add()
+        self.assertEqual(self.task(1)['state'], 'ready')
+
     def test_event_survives_a_failed_dispatch(self):
         self.fake.spawn = lambda *_: taskq.fail('claude could not start the session')
         err = io.StringIO()

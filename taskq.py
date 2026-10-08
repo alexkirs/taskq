@@ -631,6 +631,8 @@ EVENTS = ('add', 'answer', 'result', 'requeue', 'close')  # R4 (#333): each runs
 
 def dispatch():
     """The tick pass without the table, once, after an event. A failure never fails the event: the next tick retries."""
+    if os.environ.get('CODEX_SANDBOX'):  # a sandboxed Codex worker can neither start codex nor see other sessions' pids:
+        return  # its pass would requeue live tasks as gone and spawn workers that die at once (#269 run 4b)
     try:
         cmd_tick(None, table=False)
     except (SystemExit, Exception) as error:

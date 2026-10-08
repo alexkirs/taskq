@@ -209,7 +209,7 @@ Runtime file: four module-level functions, a fifth optional.
 | `taskq result N --sha SHA [--checks C] [--text T]` | hand in: `doing` → `review` |
 | `taskq requeue N [--text T]` | drop claim and result: any state → `ready` |
 | `taskq later N [--text T]` | park: any state → `later` |
-| `taskq close N [--text T]` | accept a `review` task: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment) |
+| `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
 | `taskq tick` | one pass of the queue on this machine (§ 7) |
 
 - `--sha`: 7 to 40 lowercase hex digits; give the full SHA.

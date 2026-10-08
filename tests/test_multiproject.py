@@ -842,10 +842,10 @@ class Acting(unittest.TestCase):
         self.catalog(self.alpha)  # no caps: the anchor keeps the 8/4 default it always had
         self.assertEqual(json.loads(self.anchor.read_text())['catalog']['policy']['caps'], {'claude': 8, 'codex': 4})
 
-    def test_caps_only_replacement_keeps_retained_claims_and_admits_no_room_above_a_lower_cap(self):
+    def test_caps_only_replacement_keeps_retained_claims_and_over_cap_refuses_before_native_pass(self):
         self.catalog(self.alpha, self.beta)
         self.claim('alpha', 1, 'review', 'owned-review')
-        self.claim('alpha', 2, 'ask', 'owned-ask')
+        self.claim('alpha', 2, 'doing', 'bg-1')  # a live worker of alpha: L = 1
         target = self.catalog(self.alpha, self.beta, enroll=False, file='target.toml', caps={'claude': 2, 'codex': 6})
         self.assertIn('codex inventory unknown: its cap change cannot be checked', multiproject.accept(target, CHECK)['errors'])
         with patch.object(multiproject, 'codex_threads', lambda: []):
@@ -855,19 +855,44 @@ class Acting(unittest.TestCase):
             self.assertEqual((anchor['generation'], anchor['sha256'], anchor['catalog']['policy']['caps']),
                              (2, multiproject.digest(anchor['catalog']), {'claude': 2, 'codex': 6}))
             self.assertEqual(multiproject.accept(target, CHECK)['status'], 'unchanged')
-        self.assertEqual([self.block('alpha', iid)['claim']['session'] for iid in (1, 2)], ['owned-review', 'owned-ask'])
-        # Six live rows and two retained claims: occupancy 8 above the cap 2. Nobody new, nobody stopped or released.
-        result = self.act([self.beta, self.alpha], target)
-        for project in result['projects']:
-            self.assertEqual(self.limits(project)['claude'], (8, True, 0, 0, 0), project)
-        self.assertEqual([row[3] for row in self.calls('native')], [{'claude': 0, 'codex': 0}] * 2)
-        self.assertEqual((self.calls('spawn'), self.calls('stop')), ([], []))
-        self.assertEqual([self.block('alpha', iid)['claim']['session'] for iid in (1, 2)], ['owned-review', 'owned-ask'])
-        # An increase grants only what the fresh aggregate occupancy leaves: 10 - 8 = 2.
-        wide = self.catalog(self.alpha, self.beta, enroll=False, file='wide.toml', caps={'claude': 10, 'codex': 6})
-        self.assertEqual(multiproject.accept(wide, CHECK)['status'], 'replaced')  # codex unchanged: its inventory not needed
-        found = self.act([self.beta], wide)['projects'][0]
-        self.assertEqual((found['status'], self.limits(found)['claude']), ('ok', (8, True, 2, 0, 2)))
+        self.assertEqual([self.block('alpha', iid)['claim']['session'] for iid in (1, 2)], ['owned-review', 'bg-1'])
+        # Six live rows and the review claim: occupancy 7 above the cap 2 (and 0). Refused before the native pass:
+        # nobody new, nobody stopped, nothing released, cleaned or written.
+        zero = self.catalog(self.alpha, self.beta, enroll=False, file='zero.toml', caps={'claude': 0, 'codex': 6})
+        for policy in (target, zero):
+            if policy is zero:
+                self.assertEqual(multiproject.accept(zero, CHECK)['status'], 'replaced')
+            before = [self.anchor.read_bytes()] + [(self.dir / f'acme_{name}.pickle').read_bytes() for name in ('alpha', 'beta')]
+            result = self.act([self.alpha, self.beta], policy)
+            for project, L in zip(result['projects'], (1, 0)):
+                self.assertEqual((project['status'], self.limits(project)['claude'][:2], self.limits(project)['claude'][3]), ('refused', (7, True), L))
+                self.assertIn(f'claude occupancy 7 above cap {0 if policy is zero else 2}', project['errors'][0])
+            self.assertEqual([self.anchor.read_bytes()] + [(self.dir / f'acme_{name}.pickle').read_bytes() for name in ('alpha', 'beta')], before)
+            self.assertEqual([row[0:2] for row in self.calls() if row[1] in ('native', 'spawn', 'cleanup', 'stop', 'wake', 'timer')], [])
+        self.assertEqual((self.mutations('alpha'), self.mutations('beta')), ([], []))
+        # At the cap exactly the pass runs with no new room; a raised cap grants only cap - fresh occupancy.
+        for caps, room in (({'claude': 7, 'codex': 6}, 0), ({'claude': 10, 'codex': 6}, 2)):
+            policy = self.catalog(self.alpha, self.beta, enroll=False, file=f'cap-{caps["claude"]}.toml', caps=caps)
+            self.assertEqual(multiproject.accept(policy, CHECK)['status'], 'replaced')  # codex unchanged: its inventory not needed
+            found = self.act([self.beta], policy)['projects'][0]
+            self.assertEqual((found['status'], self.limits(found)['claude']), ('ok', (7, True, caps['claude'] - 7, 0, room)))
+        self.assertEqual([row[3] for row in self.calls('native')], [{'claude': 0, 'codex': 0}, {'claude': 2, 'codex': 0}])
+        self.assertEqual([self.block('alpha', iid)['claim']['session'] for iid in (1, 2)], ['owned-review', 'bg-1'])
+
+    def test_over_cap_refuses_before_native_pass_for_either_runtime_with_L(self):
+        policy = self.catalog({**self.alpha, 'limits': {'claude': 2, 'codex': 2}}, caps={'claude': 2, 'codex': 2})
+        for runtime in multiproject.CAPS:
+            read = {'status': 'ok', 'held': [([runtime], 'session:a')], 'uncertain': [], 'L': {'claude': 0, 'codex': 0, runtime: 1}}
+            live = ['a', 'b', 'c']
+            rows = [{'sessionId': session, 'state': 'working'} for session in live] if runtime == 'claude' else []
+            threads = [{'id': session, 'status': {'type': 'active'}} for session in live] if runtime == 'codex' else []
+            with patch.multiple(multiproject, verify=lambda entry: [], workflow=lambda binding, machine: [], update_due=lambda: [],
+                                read_occupancy=lambda binding, errors: read, claude_rows=lambda: rows, codex_threads=lambda: threads), \
+                    patch.object(multiproject, 'native_pass') as native:
+                found = multiproject.act_project({'entry': self.alpha, 'policy': str(policy)})
+            self.assertEqual((found['status'], native.call_count), ('refused', 0), runtime)
+            self.assertEqual((found['budget'][runtime]['occupancy'], found['budget'][runtime]['L'], found['budget'][runtime]['F']), (3, 1, 0))
+            self.assertIn(f'{runtime} occupancy 3 above cap 2', found['errors'][0])
 
     def test_caps_only_replacement_refuses_unknown_ownership_or_a_held_guard_and_keeps_the_anchor(self):
         self.catalog(self.alpha, self.beta)

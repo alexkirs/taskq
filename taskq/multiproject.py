@@ -796,6 +796,11 @@ def act_project(spec):
         result['budget'] = budget(policy['caps'], inventory, reads, own, limits)
         if unknown := [runtime for runtime in CAPS if inventory[runtime] is None and (limits.get(runtime, 0) or own['L'].get(runtime, 0))]:
             return {**result, 'errors': [f'{" and ".join(unknown)} inventory unknown for a runtime this project holds or may start; nothing run']}
+        # Above a (lowered) cap the pass would still release, reconcile and clean up: occupancy it may change or free.
+        # Workers and claims stay; nothing is stopped or released to fit the cap. At the cap exactly, the pass runs with L.
+        if over := [f'{runtime} occupancy {found["occupancy"]} above cap {found["cap"]}' for runtime, found in result['budget'].items()
+                    if found['known'] and found['occupancy'] > found['cap'] and (limits.get(runtime, 0) or own['L'].get(runtime, 0))]:
+            return {**result, 'errors': [f'{", ".join(over)} for a runtime this project holds or may start; workers kept, nothing run']}
         result['status'] = 'unknown'  # from here a native mutation may happen
         code, out = native_pass(view, {runtime: result['budget'].get(runtime, {}).get('limit', 0) for runtime in core.RUNTIMES})
         native = json.loads(out.strip().splitlines()[-1])

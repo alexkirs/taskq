@@ -71,9 +71,12 @@ Changed: `taskq problem` → `requeue --text` or a plain issue comment (#290).
 
 ### R6. Human report
 
-`taskq tick` prints the report itself: one table `Task | State | Runtime | Session link` with clickable links, then
-`Board: <url>` (§ 7). The manager replies with it as printed, links not bare ids, then the owner's open questions.
-Same table on every runtime; links are built per runtime. No raw JSON to humans.
+`taskq tick` prints the report itself: one markdown table `| Task | State | Runtime | Session |`, then `Board: <url>`
+(§ 7). A row is `| [#N](<issue url>) | <state> | <runtime> | [<session[:8]>](<link>) |`; the link is https only
+(#488): Claude `https://claude.ai/code/session_<id>`, Codex `<pages>/open.html#codex://threads/<id>` (opens on the
+Mac with Codex). A session with no link on this machine shows `<session[:8]> on <machine>`; a task with no session
+leaves the cell empty. The manager replies with it as printed, then the owner's open questions. No raw JSON to humans.
+Changed: a space-padded `Session link` column → the markdown table with `[#N](issue)` and session links (#489).
 Changed: a heading per project and owner questions inside the tick output → one project per tick, questions added by
 the manager (#290). The reply route (`--reply`) and the `cards` format of #274 are not in `taskq.py`.
 Open: bring back the reply route and cards, yes or no (#274).
@@ -365,7 +368,7 @@ No fixed interval (#407): the manager is woken only when it has work.
 3. `ready`, deps closed, host matches, a free slot for its runtime (`run-*` label, else the first free in
    `limits`) → `spawn(T<N> <ORCH> <title> (<machine>), brief, root)` (ORCH: CLD, CDX, DOT, HRM, GRK of the launcher, UNK from a shell), claim, `q-doing`, comment `spawn` (with the session link when the runtime has one yet).
 4. `ask`, `review`, `later`: nothing; they wait for the manager.
-5. Print the table `Task | State | Runtime | Session link` by priority, then number; then `Board: <url>`.
+5. Print the R6 markdown table `| Task | State | Runtime | Session |` by priority, then number; then `Board: <url>`.
    Another machine's claim shows its bare session id: only that machine can link it.
 
 The event pass of R4 is steps 1–3 run by `taskq tick --quiet`, the detached child of `add`, `answer`, `result`, `requeue` or `close`, no table. A worker's

@@ -749,6 +749,15 @@ def cmd_tick(args, table=True):
         pending.unlink(missing_ok=True)
         held = one_pass(args, False)
 
+def row(item, kinds, here):
+    """R6 (#489): one markdown row, `[#N](issue)` and `[<session[:8]>](link)`; a session with no link here stays plain text."""
+    claim = item['claim'] or {}
+    runtime, session = claim.get('runtime') or item['runtime'], claim.get('session') or ''
+    url = session and claim.get('name') == here and runtime in kinds and kinds[runtime].link(session)
+    task = f'[#{item["iid"]}]({item["url"]})' if item.get('url') else f'#{item["iid"]}'
+    cell = f'[{session[:8]}]({url})' if url else session and f'{session[:8]} on {claim.get("name")}'
+    return f'| {task} | {item["state"]} | {runtime} | {cell} |'
+
 def one_pass(args, table=True):
     """One pass: requeue dead workers, nudge silent ones, free waiting tasks, spawn ready ones, print the table."""
     here, kinds = machine(), runtimes()
@@ -807,12 +816,9 @@ def one_pass(args, table=True):
             retire(lambda n, *_: n not in open_tasks, 'could not remove sessions of closed tasks', running=False)
     if not table:
         return held
-    print(f'{"Task":<6} {"State":<8} {"Runtime":<8} Session link')
+    print('| Task | State | Runtime | Session |\n|---|---|---|---|')
     for item in filter(mine, items):
-        claim = item['claim'] or {}
-        runtime = claim.get('runtime') or item['runtime']
-        url = kinds[runtime].link(claim['session']) if claim.get('session') and claim.get('name') == here and runtime in kinds else ''
-        print(f'#{item["iid"]:<5} {item["state"]:<8} {runtime:<8} {url or claim.get("session") or ""}')
+        print(row(item, kinds, here))
     host, repo = CONFIG.get('host'), CONFIG.get('repo')
     url = CONFIG.get('board_url') or {'github': f'https://{host or "github.com"}/{repo}/issues',
                                       'gitlab': f'https://{host or "gitlab.com"}/{repo}/-/issues'}.get(CONFIG['board'])

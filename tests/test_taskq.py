@@ -177,13 +177,13 @@ def fixed_coordinator(case):
             second = case.do(win, 'tick')
         case.assertIn('coordinator is mac', second)
         case.assertEqual((case.state(win_task), case.state(mac_task)), ('ready', 'doing'))  # its own stalled work only
-        case.assertIn(f"--name 'T{pinned} t'", second)  # pinned to win: only win can start it
-        case.assertNotIn(f"--name 'T{free} t'", second)
+        case.assertIn(f"--name 'S{pinned} t'", second)  # pinned to win: only win can start it
+        case.assertNotIn(f"--name 'S{free} t'", second)
         case.assertNotIn('## Review', second)
         hostname.return_value = 'mac-1.local'
         first = case.do(COORDINATOR, 'tick')
         case.assertNotIn('coordinator is mac', first)
-        case.assertIn(f"--name 'T{win_task} t'", first)  # shared work, released by win
+        case.assertIn(f"--name 'S{win_task} t'", first)  # shared work, released by win
         case.assertIn(f'## Review [#{done}]', first)
 
 
@@ -977,14 +977,14 @@ class Cycle(unittest.TestCase):
         self.assertIn('host is win', self.do(CLAUDE, 'list'))
         self.assertIn('host is win', self.refused(CLAUDE, 'take', win))
         self.assertIn(f'take {anyone}', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
-        self.assertIn(f"--runtime claude --name 'T{anyone} t'", self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
+        self.assertIn(f"--runtime claude --name 'S{anyone} t'", self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
         self.do(CLAUDE, 'take', anyone)
         self.assertIn('@mac-1, last change', self.do(CLAUDE, 'list'))
         with patch.object(q, 'HOSTS', {'DESKTOP-7.lan': 'win'}), \
                 patch.object(q.socket, 'gethostname', return_value='DESKTOP-7.lan'):
             self.assertIn('Profile: host=win', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
             # The Mac's doing task does not fill win's one place.
-            self.assertIn(f"--runtime claude --name 'T{win} t'", self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
+            self.assertIn(f"--runtime claude --name 'S{win} t'", self.do(CLAUDE, 'tick', '--limit', 'claude=1,codex=0'))
             self.do({'CLAUDE_CODE_SESSION_ID': 'win-session', 'CODEX_THREAD_ID': ''}, 'take', win)
             self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--limit', 'claude=1,codex=0'))
         # #39: the public claim names the machine by a hash only; this machine and [hosts] still read it by name.
@@ -1079,17 +1079,16 @@ class Cycle(unittest.TestCase):
             self.assertIn('flag: filter, mine, limit.claude', out)
             self.assertNotIn('Start', out)
             out = self.do(CLAUDE, 'tick', '--no-mine', '--limit', 'claude=1')
-            self.assertIn(f"--name 'T{maps} t'", out)
-            # The worker prompt carries only the explicit flags, never the resolved personal values.
-            self.assertIn("taskq worker --no-mine --limit claude=1` and follow", out.replace('\'"\'"\'', ''))
+            self.assertIn(f"--name 'S{maps} t'", out)
+            # #243: the supervisor prompt names its task; the worker it launches adopts that reservation, whatever the profile.
+            self.assertIn(f"taskq supervise {maps}` and follow", out)
             self.assertIn("mine=True", self.do(CLAUDE, 'tick'))
 
     def test_worker_prompt_without_flags_has_none(self):
         self.personal('[profile]\nmine = false\n[profile.limits]\nclaude = 1\n')
-        self.add('--type', 'code', '--mine')
-        self.assertIn('taskq worker` and follow', self.do(CLAUDE, 'tick'))
-        out = self.do(CLAUDE, 'tick', '--filter', '', '--mine')
-        self.assertIn("taskq worker --filter '' --mine` and follow", out.replace('\'"\'"\'', "'"))
+        iid = self.add('--type', 'code', '--mine')
+        self.assertIn(f'taskq supervise {iid}` and follow', self.do(CLAUDE, 'tick'))
+        self.assertIn(f'taskq supervise {iid}` and follow', self.do(CLAUDE, 'tick', '--filter', '', '--mine'))
 
     def test_only_the_owner_tick_runs_scheduled_cleanup_once_per_pass(self):
         with patch.object(cleanup, 'scheduled') as scheduled:
@@ -1152,10 +1151,10 @@ class Cycle(unittest.TestCase):
         own = self.add('--type', 'code', '--runtime', 'any', '--mine')
         out = self.do(CLAUDE, 'tick')
         self.assertIn('preferred_runtime=claude', out)
-        self.assertIn(f"--runtime claude --name 'T{own} t'", out)
-        self.assertIn(f"--runtime codex --name 'T{pool} t'", out)  # the pool keeps the scheduler's choice
+        self.assertIn(f"--runtime claude --name 'S{own} t'", out)
+        self.assertIn(f"--runtime codex --name 'S{pool} t'", out)  # the pool keeps the scheduler's choice
         self.personal('[profile]\npreferred_runtime = "claude"\n[profile.limits]\nclaude = 0\n')
-        self.assertIn(f"--runtime codex --name 'T{own} t'", self.do(CLAUDE, 'tick'))  # no slot: falls back
+        self.assertIn(f"--runtime codex --name 'S{own} t'", self.do(CLAUDE, 'tick'))  # no slot: falls back
 
     def test_profile_init_writes_once_and_init_ignores_the_file_once(self):
         gitignore = q.LOCAL.with_name('.gitignore')
@@ -1225,13 +1224,13 @@ class Cycle(unittest.TestCase):
             self.do(CODEX, 'take', self.add('--type', 'asset'))
         claude = self.add('--type', 'code')
         self.assertIn(f'take {claude}', self.do(CLAUDE, 'worker'))
-        self.assertIn(f"--runtime claude --name 'T{claude} t'", self.do(CLAUDE, 'tick'))
+        self.assertIn(f"--runtime claude --name 'S{claude} t'", self.do(CLAUDE, 'tick'))
         self.do(CLAUDE, 'take', claude)
 
     def test_runtime_pins_who_may_take_a_task(self):
         pinned = self.add('--type', 'research', '--runtime', 'codex')
         self.assertIn('codex  t', self.do(CLAUDE, 'list'))
-        self.assertIn(f"--runtime codex --name 'T{pinned} t'", self.do(CLAUDE, 'tick'))
+        self.assertIn(f"--runtime codex --name 'S{pinned} t'", self.do(CLAUDE, 'tick'))
         self.assertIn('No task can start', self.do(CLAUDE, 'worker'))
         self.assertIn('runtime is codex', self.refused(CLAUDE, 'take', pinned))
         anyone = self.add('--type', 'research')
@@ -1863,8 +1862,8 @@ class Cycle(unittest.TestCase):
         output, status, log = act()
         self.assertEqual(status, 0)
         self.assertEqual(output.count('## Workers'), 1)
-        self.assertEqual(spawned, [f'T{code} t', f'T{idle} t'])
-        self.assertIn('Done: spawn a claude worker for', log)
+        self.assertEqual(spawned, [f'S{code} t', f'S{idle} t'])  # #243: a supervisor per task
+        self.assertIn('Done: spawn a claude supervisor for', log)
         self.do(CLAUDE, 'take', code)
         self.do(CODEX, 'take', idle)
         self.codex.turns = [{'id': 'finished', 'status': 'completed'}]

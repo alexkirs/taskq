@@ -403,7 +403,7 @@ class Acting(unittest.TestCase):
         self.assertEqual(self.limits(alpha), {'claude': (7, True, 1, 0, 1), 'codex': (0, False, 0, 0, 0)})
         self.assertEqual(self.limits(beta), {'claude': (8, True, 0, 0, 0), 'codex': (0, False, 0, 0, 0)})
         spawned = self.calls('spawn')
-        self.assertEqual([(row[2], row[3]) for row in spawned], [('acme/alpha2', 'T1 Task 1 (fixture-host)')])
+        self.assertEqual([(row[2], row[3]) for row in spawned], [('acme/alpha2', 'S1 Task 1 (fixture-host)')])  # #243: the task's supervisor
         self.assertEqual({row[4] for row in spawned}, {'held'})  # the host guard is held during the native mutation
         self.assertEqual([row[3] for row in self.calls('native')], [{'claude': 1, 'codex': 0}, {'claude': 0, 'codex': 0}])
         self.assertEqual(self.store('alpha2').issues[3]['assignees'], [{'id': 2}])
@@ -864,7 +864,7 @@ class Acting(unittest.TestCase):
         self.wait(lambda: multiproject.guard_free({'os_user': os.getuid()}) is None)
         self.assertEqual(self.guard.stat().st_ino, inode)
         self.assertFalse(any(row[0] == 'actor' and 'beta' in json.dumps(row) for row in self.calls()))
-        self.assertTrue(self.block('slow', 1)['reservation'])  # the kept actor finished its launch
+        self.assertTrue(self.block('slow', 1)['supervisor'])  # the kept actor finished its launch (#243: a supervisor)
         again = self.act([self.beta], policy)['projects'][0]
         self.assertEqual((again['status'], self.limits(again)['claude']), ('ok', (8, True, 0, 0, 0)))  # terminal+PID and slow's worker count
 

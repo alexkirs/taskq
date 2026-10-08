@@ -242,16 +242,31 @@ board»; `ready`↔`waiting` goes back silently; any other move goes back to the
 
 ## Four roles
 
-Roles are defined by [R2–R3](principles.md); this section is their mechanics. A task without a `supervisor`
-keeps the three legacy roles below (manager, coordinator, worker); a supervised task adds the fourth (#240).
+Roles are defined by [R2–R3](principles.md); this section is their mechanics. The tick gives every ready task
+a supervisor (#243); a task without a `supervisor` (one started before #243, or a worker started by hand) keeps
+the three legacy roles below (manager, coordinator, worker).
 
-- **Supervisor** — the session named in the task's block `supervisor`. Only it launches the task's worker
-  (`spawn`; `reserve` refuses any other session, `tick` names the task instead of starting it), and only it
-  or the owner decides from outside the worker (`answer`, `reject`, `later`, `release`). It never takes or
-  `close`s its own task: the coordinator's publication lane closes after review. `take` accepts only the worker
-  adopting the supervisor's reservation, or the worker of the supervisor's newest `launch` note (the same
-  worker after a queue answer). Global capacity of supervisor sessions (Claude 2, Codex 6) is the central's
-  accounting; `tick` prints a count, not an admission rule.
+- **Tick spawns supervisors** (#243): for each ready task without a supervisor, within a free slot, `tick`
+  (`--act` itself, else as a printed command) runs `taskq spawn --runtime R --name "S<N> <title>" --text
+  "Run `cd <main checkout> && taskq supervise N` …"` — the same command on Claude and Codex. Spawn reserves
+  the task like a worker launch (#208), starts the session, then in one write replaces the reservation with
+  `supervisor` = that session (note `supervisor none → R:session (spawned by attempt …)`) and drops the lock.
+  The PM session starts no worker and holds no task.
+- **Supervisor** — the session named in the task's block `supervisor`. `taskq supervise N` (and `taskq worker`
+  run by it) prints its brief: launch the worker once (`spawn --name "T<N> …"`; `reserve` refuses any other
+  session, `tick` names the task instead of starting it); after an `answer` or `reject` resume that same worker
+  (Claude `claude --bg --resume`, Codex `codex-send`), never a second one; in `review`, check the exact SHA,
+  then `close` (it publishes per `[workspace] publish` and retires the worker) or `reject`. It never takes its
+  own task. Only it or the owner's shell rejects, releases or closes a supervised task; `answer` and `later`
+  are the owner's words, which the PM relays from its session. `take` accepts only the worker adopting the
+  supervisor's reservation, or the worker of the supervisor's newest `launch` note (the same worker after a
+  queue answer). The tick wakes an idle supervisor whose task is in review, or ready again without a
+  reservation, with one fixed line (`--act`; else a printed command), and the PM's Review section leaves
+  supervised tasks out. After `close` the tick retires the supervisor (Claude: `claude stop` + `rm` of a
+  local, not busy job; Codex: the `S<N>` thread is archived once no open task names it).
+- **Capacity**: one slot of a runtime holds a task's supervisor and its worker together. `tick` counts a task
+  once per slot: its local doing claim, its reservation here, or a live `T<N>`/`S<N>` session of this
+  checkout. The worker runs on its supervisor's runtime.
 - **Assignment and handoff**: `taskq edit N --supervisor RUNTIME:SESSION` from the owner's shell (no session
   identity) assigns, changes or clears (`''`); the current supervisor may only name its successor. The `edit`
   note records it; `view` prints the supervisor and whether it has acted since (a `reserve`, `answer`, `reject`
@@ -262,9 +277,10 @@ keeps the three legacy roles below (manager, coordinator, worker); a supervised 
 - **Migration**: a taskq older than #240 drops `supervisor` when it writes the task. Update every machine
   (`taskq update`) before the first assignment.
 
-- **Manager** (R3 root PM): `add`, `answer`, `list`.
-- **Coordinator** (R3 queue tick): runs `tick`, which returns stuck tasks to the queue and prints what to
-  check and close, how many workers to start and which questions to relay.
+- **Manager** (R3 root PM): `add`, `answer`, `later`, `list`; never closes a supervised task.
+- **Coordinator** (R3 queue tick): runs `tick`, which returns stuck tasks to the queue and prints which
+  supervisors to start or wake, which questions to relay, and what to check and close only for a legacy task
+  without a supervisor.
 - **Worker** (R3): one per task. Its only prompt:
   "Run `cd <main checkout> && taskq worker` and follow the instructions it prints".
   The command hands out the task, workspace, history and exact delivery commands.

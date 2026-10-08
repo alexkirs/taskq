@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,39 @@ DELIVER = {
     True: 'Deliver: commit, `git fetch origin && git rebase origin/main`, run the checks, `git push origin HEAD:main` (never force).',
     False: 'Deliver: put the whole answer into `--text`.',
 }
+
+# #243 (principles R2, R3, R11): the brief of a task's supervisor session, which the tick spawns per ready task.
+SUPERVISOR_BRIEF = '''You are the supervisor of task #{iid}, now {state}. Queue tool: `{tool}`
+This brief is the owner's assignment: do it without asking for confirmation. You drive one worker session for this
+task, review its result, publish it and retire the worker. Never take the task or do its work yourself.
+This machine ({host}): main checkout {root}. Its worker runs on {runtime}: you and it hold one slot together.
+Start each shell command with `export TASKQ_TASK={iid} TASKQ_RUNTIME={runtime} &&`.
+
+By the task's state (`{tool} view {iid}` reads it again):
+- ready, no worker launched yet: start it, once, with this command; then end your turn:
+      {spawn}
+- ready again after an answer, a reject or a release (worker {worker}): send that same worker the newest answer or reject text
+  and tell it to run `{tool} take {iid}` and continue: {resume}
+  Never spawn a second worker. A worker still busy (`claude agents`, `{tool} codex-read <id>`) needs nothing: end your turn.
+- doing or ask: the worker works or waits for the owner (the PM relays the answer); end your turn.
+- review: check the exact result SHA against the Acceptance below: read the commit (`git show <sha>`), run the
+  task's focused tests in a fresh tree, check that CI on that SHA is green (taskq-manager.md § 3 Acceptance).
+  Accepted: `{tool} close {iid} --text "<what you checked>"`: {publish}; close also retires the worker.
+  Not accepted: `{tool} reject {iid} --text "<exact fixes>"`, then send the fixes to the same worker as above.
+The tick wakes you when the task needs you; after close end your turn, the tick retires this session.
+What went wrong or needs the owner: `{tool} problem --task {iid} --text "<what>"`, then end your turn.
+Everything you write through `{tool}` is public: no environment values, paths outside the repository, tokens.
+
+# {title}
+
+{text}
+
+# History (oldest first)
+
+{notes}
+'''
+PUBLISH = {'direct': 'the worker pushed to main; close checks the SHA is in origin/main',
+           'review': 'close fast-forwards main to that reviewed branch head (no force)'}
 
 REVIEW_DELIVER = ('Deliver: commit on branch `taskq-{iid}`, `git fetch origin && git rebase origin/main`, '
                  'run the checks, `git push --force-with-lease origin HEAD:refs/heads/taskq-{iid}`. '
@@ -201,7 +235,6 @@ def acknowledged(iid, found):
 def later(args):
     """The owner defers a task; nobody waits on anything. Back with `answer` or by hand to ready."""
     current = core.task(args.iid, ('ready', 'waiting', 'ask'))
-    outsider(current)
     core.save(current, 'later', 'later', args.text, waiting_for=args.text)
 
 
@@ -258,11 +291,50 @@ def brief(current):
                            'notes': ('\n\n---\n\n'.join(core.notes(kept)) or 'none') + omitted})
 
 
+def supervisor_brief(current):
+    """#243: what `supervise` prints: the supervisor's steps for `current`, with its worker's spawn and resume commands."""
+    found, iid = current['supervisor'], current['iid']
+    runtime, worker = found['runtime'], supervised_worker(iid, found)
+    spawn = shlex.join([core.TOOL, 'spawn', '--runtime', runtime, '--name', f'T{iid} {current["title"][:40]}', '--text', core.WORKER]
+                       + ['--codex-full-access'] * (current['full_access'] and runtime == 'codex'))
+    text = f'<that text>. Then run {core.TOOL} take {iid} and continue.'
+    resume = ('none launched yet' if not worker else f'`claude --bg --resume {worker} "{text}"`' if runtime == 'claude'
+              else f'`{core.TOOL} codex-send {worker} --text "{text}"`' if runtime == 'codex'
+              else f'`{core.TOOL} send --runtime {runtime} {worker} --text "{text}"`')
+    kept = core.collaborators(core.comments(iid, everyone=True))
+    return SUPERVISOR_BRIEF.format(**{**current, 'tool': core.TOOL, 'host': core.machine(), 'root': core.ROOT, 'runtime': runtime,
+                                      'spawn': spawn, 'worker': worker or 'none', 'resume': resume, 'publish': PUBLISH[core.PUBLISH],
+                                      'notes': '\n\n---\n\n'.join(core.notes(kept)) or 'none'})
+
+
+def supervise(args):
+    """#243: the first command of a supervisor session the tick spawned (`S<N> …`), and of each wake: its brief.
+    spawn writes the session into the block right after it starts, so a block without a supervisor is waited for."""
+    mine = core.me()
+    for _ in range(SUPERVISE_WAIT):
+        issue = core.api('GET', f'issues/{args.iid}')
+        if issue['state'] != 'opened':
+            return print(f'#{args.iid} is closed: nothing to supervise. End your turn; the tick retires this session.')
+        current = core.task(args.iid)
+        if current.get('supervisor'):
+            break
+        time.sleep(5)
+    if not core.is_caller(current.get('supervisor')):
+        core.fail(f'#{args.iid} is supervised by {core.short(current.get("supervisor"))}, not by {core.short(mine)}: end your turn')
+    print(supervisor_brief(current))
+
+
+SUPERVISE_WAIT = 6  # reads, 5 s apart: spawn's block write lands seconds after the session starts
+
+
 def worker(args):
     """What a fresh worker session runs first: the brief of the first task that can start now."""
     loaded, candidates = core.profile(args)
     mine = core.me()
     runtime = mine['runtime']
+    # #243: a supervisor that runs `worker` gets its own supervisor brief, never work of its own.
+    if own := [item for item in loaded[0] if core.is_caller(item.get('supervisor'))]:
+        return print(supervisor_brief(own[0]))
     # #240: a session that holds a doing claim here continues that task; it never selects fresh work.
     own = [item for item in loaded[0] if item['state'] == 'doing' and core.local_claim(item['claim'] or {})
            and ((item['claim'] or {}).get('runtime'), (item['claim'] or {}).get('session')) == (runtime, mine['session'])]
@@ -388,8 +460,10 @@ def requeue(args):
         # place was free while the task waited, so the limit is not checked: the worker never left.
         core.save(current, 'doing', args.action, args.text, waiting_for=None, result=None)
         return print(f'#{args.iid} is doing again with your claim: continue in this session')
-    if getattr(args, 'function', None) is requeue:
-        outsider(current)  # the tick's dead/stalled release (its own command) keeps its evidence path
+    if getattr(args, 'function', None) is requeue and args.action != 'answer':
+        # The tick's dead/stalled release (its own command) keeps its evidence path. #243: an answer is the owner's
+        # word, which the PM relays from its own session (R3: it moves tasks); the supervisor then resumes the worker.
+        outsider(current)
     before = args.action == 'release' and releases(args.iid)
     if current.get('reservation'):
         # #208: only the reserving user releases, and only the attempt it read: the last read before the write.
@@ -431,8 +505,7 @@ def close(args):
         print(f'#{args.iid} already closed')
         return
     current = core.task(args.iid, ('review',))
-    if core.is_caller(current.get('supervisor')):
-        core.fail(f'#{args.iid}: its supervisor does not close it; the publication lane closes after review')
+    outsider(current)  # #243 (R3): a supervised task's review, publication and close are its supervisor's
     if current['type'] in ('code', 'docs'):
         try:
             sha = core.commit(current['result']['sha'])
@@ -631,33 +704,66 @@ def spawn(args):
     Claude: a CLI background session (`claude_spawn`). Codex: `codex_spawn`. Without `--text` the session is idle.
     The name ends with ` (<machine>)`: the owner sees where each worker runs. No `@`: SendMessage
     rejects a name containing it as a name@team address. #208: a task's worker (`T<N> …`) starts only after
-    `reserve` won task N; a failed launch with no worker releases the reservation, an unknown one keeps it."""
-    from taskq.tick import worker_iid
+    `reserve` won task N; a failed launch with no worker releases the reservation, an unknown one keeps it.
+    #243: so does its supervisor (`S<N> …`), which then replaces the reservation in the block (`assign`)."""
+    from taskq.tick import worker_iid, supervisor_iid
     name = args.name if args.name.endswith(f' ({core.machine()})') else f'{args.name} ({core.machine()})'
-    iid = worker_iid(args.name)
-    attempt = iid and reserve(iid, args.runtime, getattr(args, 'limits', None))
+    iid, supervised = worker_iid(args.name), supervisor_iid(args.name)
+    if supervised:
+        unsupervised(core.task(supervised))  # #243: a supervisor (`S<N> …`) only for a ready task without one
+    # #243: a supervisor's launch reserves its task like a worker's (#208): the lock decides between dispatchers.
+    task = iid or supervised
+    attempt = task and reserve(task, args.runtime, getattr(args, 'limits', None), 'supervisor' if supervised else 'worker')
     try:
         if args.runtime == 'codex':
             session = core.codex_spawn(name, args.text, getattr(args, 'full_access', False))
         elif args.runtime in core.EXECUTORS:
             session = executor_run(args.runtime, 'spawn', name=name)
             if attempt:
-                launched_note(iid, attempt, session)  # before its first turn: no worker can take sooner
+                launched_note(task, attempt, session)  # before its first turn: no worker can take sooner
             if args.text:
                 executor_run(args.runtime, 'send', session=session, text=args.text)
         else:
             session = claude_spawn(name, prompt=args.text, remote_control=args.remote_control)
     except BaseException as error:
         if attempt:
-            failed_launch(iid, attempt, error)
+            failed_launch(task, attempt, error)
         raise
     if attempt and args.runtime not in core.EXECUTORS:
-        launched_note(iid, attempt, session)
+        launched_note(task, attempt, session)
+    if supervised:
+        assign(supervised, attempt, session)
     if args.runtime in ('codex', *core.EXECUTORS):
         print(session)
     else:
         print(f'{session}\nWatch it: `claude attach {session[:8]}` or `claude agents`; in the app: `{core.TOOL} show {session}`.')
     return session
+
+
+def unsupervised(current):
+    """#243: refuse a supervisor spawn for a task that is not ready or already has one."""
+    if current['state'] != 'ready' or current.get('supervisor'):
+        core.fail(f'#{current["iid"]} gets no new supervisor: it is {current["state"]}'
+                  + (f', supervised by {core.short(current["supervisor"])}' if current.get('supervisor') else ''))
+
+
+def assign(iid, attempt, session):
+    """#243: the supervisor session spawn just started replaces its launch's reservation in one write, on a fresh
+    read: the dispatcher's own assignment, the one `edit --supervisor` exception (cooperative authority, like
+    claims). Then the lock goes: the supervisor reserves again for its worker. A task whose reservation changed
+    meanwhile keeps it, and the new session is retired."""
+    current, runtime = core.task(iid), attempt['runtime']
+    if current['state'] != 'ready' or current.get('supervisor') or current.get('reservation') != attempt:
+        with contextlib.suppress(Exception, SystemExit):
+            if runtime == 'claude':
+                claude_stop(session, remove=True)
+            elif runtime == 'codex':
+                core.codex_archive(argparse.Namespace(thread=session))
+        core.fail(f'#{iid}: its reservation {attempt["attempt"]} changed while its supervisor started; that session was retired')
+    found = {'runtime': runtime, 'session': session}
+    core.save(current, supervisor=found, reservation=None, note_action='edit',
+              note_text=f'supervisor none → {identity(found)} (spawned by attempt {attempt["attempt"]})')
+    core.unlock(iid)
 
 
 # --- #208: a launch reserves its task first ------------------------------------------------------
@@ -680,7 +786,7 @@ def admission(iid, runtime, uid, limits):
                      or (f'no free {runtime} place on this machine' if core.room(everything, limits).get(runtime, 0) <= 0 else None))
 
 
-def reserve(iid, runtime, limits=None):
+def reserve(iid, runtime, limits=None, role='worker'):
     """Before a worker of task `iid` starts: check admission, take the task's tracker lock, check every guard again
     on a read made under the lock, then record the attempt in its block. The lock decides between coordinators of
     any machine, user or filter; the loser starts nothing. The reservation names who reserved it, not a worker:
@@ -702,7 +808,7 @@ def reserve(iid, runtime, limits=None):
         if why or fresh['claim'] != current['claim']:
             core.fail(f'#{iid} not launched: {why or "its claim changed since this launch read it"}')
         core.save(fresh, reservation=attempt, note_action='reserve',
-                  note_text=f'Attempt {attempt["attempt"]}: a {runtime} worker{core.where(attempt)}, principal {uid}')
+                  note_text=f'Attempt {attempt["attempt"]}: a {runtime} {role}{core.where(attempt)}, principal {uid}')
         # Overlapping tasks reserved at once: each reads after its own write, so the later sees the earlier and gives way.
         rivals = fresh['scope'] and [other['iid'] for other in core.load()[0] if other['iid'] != iid and core.overlap(fresh['scope'], other['scope'])
                                      and ((other['claim'] or {}).get('session') or other.get('reservation'))]

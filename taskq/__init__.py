@@ -813,10 +813,10 @@ from taskq.doctor import (  # noqa: E402
     PERMISSION_MODE, WORKER_ALLOW, permissions_missing, permissions_gap, trusted, setup, migrate, windows_claude_binary)
 from taskq.tick import (  # noqa: E402
     clone_warning, auto_update, question, TICK_MINUTES, TICK_LIVE_MINUTES, tick_beat, TICK_PROMPT_VERSION, TICK_PROMPT,
-    report_bootstrap, verify_report, contract_seen, contract_news, profile_arguments, worker_prompt, BOARD_MOVES, board_fix, board_moves, session_link,
+    report_bootstrap, verify_report, contract_seen, contract_news, profile_arguments, BOARD_MOVES, board_fix, board_moves, session_link,
     inbox_line, tick)
 from taskq.worker import (  # noqa: E402
-    BRIEF, DELIVER, need_owner, doing_since, add, edit, later, listing, set_runtime, brief, worker, take, beat, ask,
+    BRIEF, DELIVER, need_owner, doing_since, add, edit, later, listing, set_runtime, brief, worker, supervise, take, beat, ask,
     result, requeue, close, retire_local, spawn, reserve, reconcile, preflight, runtime_status, executor_run, send, claude_env, CLAUDE_WORKER_TOOLS, claude_spawn,
     claude_agents, claude_url, claude_stop, problem, report, claude_wake, view, show, retire, claude_import,
     claude_sessions, driver_app_session)
@@ -902,6 +902,7 @@ def main(argv=None):
                      (('--mine',), {'action': argparse.BooleanOptionalAction, 'help': 'only own assignments, or with --no-mine also the pool'}),
                      (('--limit',), {'type': limits, 'metavar': 'claude=N,codex=M', 'help': 'slots on this machine; only the named runtimes'}))
     command('worker', worker, *profile_flags)
+    command('supervise', supervise, iid)  # #243: the brief of the task's supervisor session
     command('take', take, iid)
     command('beat', beat, iid)
     text_input(command('ask', ask, iid))

@@ -169,13 +169,22 @@ def report_bootstrap():
           'checkout markers and sends are not receipts.')
 
 
+def listed(item):
+    """A row of the Workers table: a task with a worker's state, or with a supervisor (#243: its slot is taken)."""
+    return item['state'] in ('doing', 'ask', 'review') or bool(item.get('supervisor'))
+
+
 def report_row(item, agents):
-    claim = item['claim'] or {}
+    """One Workers row; the same columns on every runtime, the session links built per runtime (`session_link`):
+    the worker's, then its supervisor's (#243)."""
+    claim, found = item['claim'] or {}, item.get('supervisor') or {}
     activity = item.get('_report_activity', 'unknown')
     sha = (item.get('result') or {}).get('sha')
+    links = ([session_link(claim, agents.get(claim['session']))] if claim.get('session') else []) + (
+        ['supervisor ' + session_link(found, agents.get(found['session']))] if found else [])
     return {'task': core.ref(item), 'title': ' '.join(item['title'].replace('|', '/').split()), 'state': item['state'],
-            'runtime': claim.get('runtime') or 'unknown', 'machine': core.where(claim).strip().lstrip('@') or 'unknown',
-            'session': session_link(claim, agents.get(claim['session'])) if claim.get('session') else 'unavailable', 'last_activity': activity,
+            'runtime': claim.get('runtime') or found.get('runtime') or 'unknown', 'machine': core.where(claim).strip().lstrip('@') or 'unknown',
+            'session': ' · '.join(links) or 'unavailable', 'last_activity': activity,
             'event_at': item.get('updated_at') or 'unknown',
             'commit': f'[{sha}]({core.commit_url(item, sha)})' if sha and item.get('web_url') else 'unavailable'}
 
@@ -318,10 +327,6 @@ def profile_arguments(args):
     return flags
 
 
-def worker_prompt(args):
-    return core.WORKER.replace(f'{core.TOOL} worker`', f'{core.TOOL} worker{profile_arguments(args)}`')
-
-
 # The owner's card moves on GitHub's board the queue executes, by (label, Status): the command it runs.
 BOARD_MOVES = {('ready', 'later'): 'later', ('waiting', 'later'): 'later', ('later', 'ready'): 'answer',
                ('later', 'waiting'): 'answer', ('review', 'ready'): 'reject'}
@@ -419,6 +424,19 @@ def inbox_line(inbox):
 # #240: a resumed worker continues its own claim; `taskq worker` gives such a session its own task's brief.
 NUDGE = ('Continue the task you claimed (taskq worker prints its brief); do not take another task; '
          'hand in result or ask the owner through taskq.')
+# #243: the line that wakes a task's supervisor; no backticks: it goes inside a double-quoted shell argument.
+SUPERVISE = 'Continue as the supervisor of task #{iid}: run taskq supervise {iid} and do what it prints for its state.'
+
+
+def wake_supervisor(item):
+    found, text = item['supervisor'], SUPERVISE.format(iid=item['iid'])
+    if found['runtime'] == 'claude':
+        return core.claude_wake(found['session'], text)
+    if found['runtime'] == 'codex':
+        return core.codex_send(argparse.Namespace(thread=found['session'], text=text, full_access=item['full_access']))
+    return core.executor_run(found['runtime'], 'send', session=found['session'], text=text)
+
+
 # #42: the launchd timer's turn of the coordinator session, before the tick's output.
 WAKE_PROMPT = ('taskq tick --act (the launchd timer) found what needs judgement; it already did the mechanical steps '
                '(spawn, retire, nudges). Do the coordinator pass by taskq-manager.md § 3 on the output below; do not run '
@@ -445,9 +463,20 @@ def worker_iid(name):
     return found and int(found[1])
 
 
-def codex_workers():
+def supervisor_iid(name):
+    found = re.match(r'S(\d+) ', name or '')  # #243: the tick names a task's supervisor `S<N> <title>`
+    return found and int(found[1])
+
+
+def session_iid(name):
+    """#243: the task of a worker or supervisor session: one slot holds both."""
+    return worker_iid(name) or supervisor_iid(name)
+
+
+def codex_workers(match=worker_iid):
     """#185: (iid, thread id) of this checkout's live `T<N> ` Codex threads (active, idle or notLoaded; archived ones
-    are not listed), from the read-only `thread/list` that cleanup and the archive pass read. None: unreachable."""
+    are not listed), from the read-only `thread/list` that cleanup and the archive pass read. None: unreachable.
+    `match` session_iid: supervisors' `S<N> ` threads too."""
     if not core.CODEX_SOCKET.exists():
         return []  # no app server here: no Codex worker of this machine
     from taskq.cleanup import cleanup_codex
@@ -457,7 +486,7 @@ def codex_workers():
     except (OSError, SystemExit, ValueError):
         return None
     return [(iid, sid) for sid, thread in threads.items() if Path(thread.get('cwd') or '/').resolve() == root
-            and (thread.get('status') or {}).get('type') != 'systemError' and (iid := worker_iid(thread.get('name')))]
+            and (thread.get('status') or {}).get('type') != 'systemError' and (iid := match(thread.get('name')))]
 
 
 def launched(iid, runtime):
@@ -477,7 +506,7 @@ def starts(args, loaded, selected):
     free, start = core.room(loaded[0], args.profile['limits']), []
     preferred = args.profile['preferred_runtime']
     ready = [item for item in core.startable(loaded=loaded) if item['iid'] in selected]
-    # #240: a supervised task's worker is launched by its supervisor only; this tick names it and starts nothing.
+    # #240, #243: a supervised task's worker is launched by its supervisor only; this tick starts supervisors.
     for item in ready:
         if item.get('supervisor'):
             print(f'{core.ref(item)}: supervised by {core.short(item["supervisor"])}; that session launches its worker, not this tick.')
@@ -487,24 +516,24 @@ def starts(args, loaded, selected):
     if supervisors:
         runtimes = [runtime for runtime, _ in supervisors]
         print('Supervisors on open tasks: ' + ', '.join(f'{name} {runtimes.count(name)}' for name in sorted(set(runtimes)))
-              + ' (from task metadata; their place in the global caps is the central\'s accounting, not counted or enforced here).')
+              + ' (from task metadata; a live supervisor of this machine and its worker hold one slot together).')
     # #185: a worker spawned by an earlier pass that has not taken its task yet (a manual TICK, a restart) is not
     # spawned again, and holds its runtime's place like a claim. An unreadable inventory holds what it could hide.
-    agents, codex = (core.claude_agents(strict=True), codex_workers()) if ready else ({}, [])
-    live = ([('claude', iid, sid) for sid, agent in (agents or {}).items() if local(agent) and alive(agent) and (iid := worker_iid(agent.get('name')))]
+    # #243: the same for a supervisor (`S<N>`): a task's live supervisor and worker hold one slot together.
+    agents, codex = (core.claude_agents(strict=True), codex_workers(session_iid)) if ready else ({}, [])
+    live = ([('claude', iid, sid) for sid, agent in (agents or {}).items() if local(agent) and alive(agent) and (iid := session_iid(agent.get('name')))]
             + [('codex', iid, sid) for iid, sid in codex or []])
-    # Exactly what room counted: a local claim of a doing task. A live worker of a review/ask task still holds a place.
-    counted = {((item['claim'] or {}).get('runtime'), (item['claim'] or {}).get('session')) for item in loaded[0]
-               if item['state'] == 'doing' and core.local_claim(item['claim'] or {})}
+    # Exactly what room counted: a local claim of a doing task. A live session of a ready/review/ask task still holds a place.
+    counted = {item['iid'] for item in loaded[0] if item['state'] == 'doing' and core.local_claim(item['claim'] or {})}
     reserved = {item['iid'] for item in loaded[0] if core.reserved_here(item)}  # #208: room counted its place
-    for runtime, iid, session in live:
-        if (runtime, session) not in counted and iid not in reserved and runtime in free:
+    for iid, runtime in {iid: runtime for runtime, iid, _ in live}.items():
+        if iid not in counted | reserved and runtime in free:
             free[runtime] -= 1
     spawned = {iid for _, iid, _ in live}
     unknown = {'claude': agents is None, 'codex': codex is None}
     for item in ready:
         if item['iid'] in spawned:
-            print(f'{core.ref(item)}: its worker is already running here, not taken yet; not started again.')
+            print(f'{core.ref(item)}: its supervisor or worker is already running here; not started again.')
             continue
         hidden = [name for name, gone in unknown.items() if gone and item['runtime'] in (None, name)]
         if hidden:
@@ -519,23 +548,36 @@ def starts(args, loaded, selected):
     return start
 
 
+def supervisor_prompt(iid):
+    """#243: the first turn of task `iid`'s supervisor session; `supervise` prints its brief."""
+    return core.WORKER.replace(f'{core.TOOL} worker`', f'{core.TOOL} supervise {iid}`')
+
+
+def supervisor_spawn(item):
+    """#243 (R2, R3): the `spawn` arguments of a ready task's supervisor. Same command on every runtime: spawn names
+    it `S<N> …`, writes it into the task's block and the session starts on `supervise N`; it launches the worker."""
+    return argparse.Namespace(runtime=item['runtime'], name=f'S{item["iid"]} {item["title"][:40]}', remote_control=True,
+                              text=supervisor_prompt(item['iid']), full_access=item['full_access'])
+
+
 def launch(args, start, act, step):
-    """Start the workers: `act` spawns each itself (a step), else the commands for the coordinator."""
+    """Start a slot per task: one supervisor session (#243), which launches the worker. `act` spawns each itself
+    (a step), else the commands for the coordinator."""
     if start and act:
         for item in start:
-            step(f'spawn a {item["runtime"]} worker for {core.ref(item)}', lambda item=item: core.spawn(argparse.Namespace(
-                runtime=item['runtime'], name=f'T{item["iid"]} {item["title"][:40]}', remote_control=True, text=worker_prompt(args),
-                full_access=item['full_access'], limits=args.profile['limits'])), item=item)
+            step(f'spawn a {item["runtime"]} supervisor for {core.ref(item)}', lambda item=item: core.spawn(supervisor_spawn(item)), item=item)
     elif start:
         for item in start:
             core.record(args, 'spawn', status='proposed', task=item['iid'], runtime=item['runtime'])
-        # One command per worker: the session starts on the prompt, no second message (#41).
+        # One command per supervisor: the session starts on the prompt, no second message (#41).
         # An indented block, not inline code: the prompt itself holds backticks.
-        print(f'## Start {len(start)} worker session(s)\n\n' + ''.join(f'- {core.ref(item)} {item["title"]}: {item["runtime"]}\n' for item in start)
-              + '\nRun each command once; the worker starts on the brief at once:\n\n' + ''.join('    ' + shlex.join([core.TOOL, 'spawn', '--runtime', item['runtime'], '--name',
-                                             f'T{item["iid"]} {item["title"][:40]}', '--text', worker_prompt(args)]
-                                            + ['--codex-full-access'] * (item['full_access'] and item['runtime'] == 'codex')) + '\n'
-                        for item in start))
+        commands = [supervisor_spawn(item) for item in start]
+        print(f'## Start {len(start)} worker slot(s): one supervisor session each, which launches its worker\n\n'
+              + ''.join(f'- {core.ref(item)} {item["title"]}: {item["runtime"]}\n' for item in start)
+              + '\nRun each command once; the supervisor starts on its brief at once:\n\n'
+              + ''.join('    ' + shlex.join([core.TOOL, 'spawn', '--runtime', spawn.runtime, '--name', spawn.name, '--text', spawn.text]
+                                            + ['--codex-full-access'] * (spawn.full_access and spawn.runtime == 'codex')) + '\n'
+                        for spawn in commands))
 
 
 
@@ -721,14 +763,18 @@ def retire_closed(log, args=None):
     for issue in core.issues(f'state=closed&updated_after={after}'):
         block = core.BLOCK.search(issue.get('description') or '')
         try:
-            claim = (json.loads(block.group(1)) if block else {}).get('claim') or {}
+            found = json.loads(block.group(1)) if block else {}
+            claim, supervisor = found.get('claim') or {}, found.get('supervisor') or {}
         except (ValueError, AttributeError):
             continue
-        agent = agents.get(claim.get('session'))
-        if agent and agent.get('status') != 'busy' and claim.get('runtime') == 'claude' and core.local_claim(claim):
-            core.claude_stop(claim['session'], remove=True)
-            core.record(args, 'retire', status='done', task=issue['iid'], session=claim['session'])
-            log(f'Retired {claim["session"]}: the worker of closed {core.ref(issue)}.')
+        # #243 (R11): its supervisor too, once its turn (the close) has ended; a supervisor has no node: a local job is.
+        for role, who in (('worker', claim), ('supervisor', supervisor)):
+            agent = agents.get(who.get('session'))
+            if (agent and agent.get('status') != 'busy' and who.get('runtime') == 'claude'
+                    and (core.local_claim(who) if role == 'worker' else local(agent))):
+                core.claude_stop(who['session'], remove=True)
+                core.record(args, 'retire', status='done', task=issue['iid'], session=who['session'])
+                log(f'Retired {who["session"]}: the {role} of closed {core.ref(issue)}.')
 
 
 def archive_finished_codex(tasks, log, args=None):
@@ -739,6 +785,9 @@ def archive_finished_codex(tasks, log, args=None):
         return
     from taskq.cleanup import cleanup_codex
     claimed, root = {(item['claim'] or {}).get('session') for item in tasks}, core.ROOT.resolve()
+    # #243: an open task's supervisor, and the worker of a supervised task (it continues after answer), are kept.
+    claimed |= {item['supervisor']['session'] for item in tasks if item.get('supervisor')}
+    supervised = {item['iid'] for item in tasks if item.get('supervisor')}
     try:
         threads = cleanup_codex({root})
     except (OSError, SystemExit, ValueError) as error:
@@ -748,7 +797,7 @@ def archive_finished_codex(tasks, log, args=None):
         name, sid = thread.get('name') or '', thread['id']
         # 10 min: a worker spawned this pass may not have taken its task yet.
         # cleanup_codex also lists the app project's threads; only this checkout's are its workers.
-        if (not re.match(r'T\d+ ', name) or Path(thread.get('cwd') or '/').resolve() != root or sid in claimed or (thread.get('status') or {}).get('type') not in ('idle', 'notLoaded')
+        if (not session_iid(name) or worker_iid(name) in supervised or Path(thread.get('cwd') or '/').resolve() != root or sid in claimed or (thread.get('status') or {}).get('type') not in ('idle', 'notLoaded')
                 or time.time() - (thread.get('updatedAt') or time.time()) < 600):
             continue
         try:
@@ -858,14 +907,13 @@ def queue_pass(args, act=False):
     holder = core.COORDINATOR in (None, core.machine())
     # #43: a session seen here decides at once: dead is released now, alive (busy or idle) never by age.
     doing = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and (item['claim'] or {}).get('session')]
-    agents = core.claude_agents() if any(item['claim'].get('runtime') == 'claude' for item in loaded[0]
-                                         if item['iid'] in selected and (item['claim'] or {}).get('session')) else {}
+    agents = core.claude_agents() if any(found.get('runtime') == 'claude' for item in loaded[0] if item['iid'] in selected
+                                         for found in ((item['claim'] or {}), item.get('supervisor') or {}) if found.get('session')) else {}
     alive = {item['iid']: liveness(item, agents) for item in doing}
     for item in candidates:
         if item['state'] in ('doing', 'ask', 'review'):
             item['_report_activity'] = alive.get(item['iid'], (None, f'issue {core.age(item)} min ago'))[1]
-    args.pm_report['workers'] = [report_row(item, agents) for item in candidates
-                                 if item['state'] in ('doing', 'ask', 'review')]
+    args.pm_report['workers'] = [report_row(item, agents) for item in candidates if listed(item)]
     dead = [item for item in doing if alive[item['iid']][0] == 'dead' and not item.get('result')]
     stalled = [item for item in loaded[0] if item['iid'] in selected and item['state'] == 'doing' and alive.get(item['iid'], (None,))[0] is None
                and core.age(item) > core.STALE_MINUTES and (holder or core.local_claim(item['claim'] or {}))]
@@ -918,14 +966,16 @@ def queue_pass(args, act=False):
         print(f'Moved {core.ref(item)} {item["state"]} → {"ready" if item["state"] == "waiting" else "waiting"}.')
     everything, _, odd, problems, inbox = loaded = core.load() if moved else loaded
     everything = [item for item in everything if item['iid'] in selected]
-    review = [item for item in everything if item['state'] == 'review' and item['result']]
+    # #243 (R3): a supervised task's review is its supervisor's, never the coordinator's: the tick wakes that session.
+    review = [item for item in everything if item['state'] == 'review' and item['result'] and not item.get('supervisor')]
     # A question reaches the owner once, when it is new; the ones already shown come back as a daily summary.
     asked = [(item, *question(item['iid'])) for item in everything if item['state'] == 'ask']
     for item, _, _, notes in asked:
         pending(item, notes)  # #223: the line names the question note that was read; the text below is that note's
     fresh = [(item, text) for item, text, shown, _ in asked if shown is None]
     summary = [(item, text) for item, text, shown, _ in asked if shown and time.time() - shown >= core.SUMMARY_SECONDS]
-    codex_stopped = [item for item in everything if item['state'] in ('ask', 'later')
+    # #243 (R2): a supervised task's worker continues after answer; only an unsupervised one gets a new session.
+    codex_stopped = [item for item in everything if item['state'] in ('ask', 'later') and not item.get('supervisor')
                      and (item['claim'] or {}).get('runtime') == 'codex' and not core.codex_is_archived(item['claim']['session'])]
     # A card moved by hand on the board into a state its data does not support.
     odd = [f'{core.ref(issue)} labels {issue["labels"]}: give it exactly one state label' for issue in odd] + [
@@ -942,7 +992,12 @@ def queue_pass(args, act=False):
     # #223: one read per item gives its pending line and the note it names; what is printed below comes from that
     # same read. A shown question is pending without a judgement line, so the lines are made before the idle return.
     args.pending = [(item, pending(item)) for item in review + [item for item, *_ in asked]]
-    if not (review or fresh or summary or start or codex_stopped or odd or problems) and not any(item['state'] == 'doing' for item in everything):
+    # #243: a supervisor whose task needs it (a result to review; ready again after an answer or reject) and whose
+    # turn has ended is woken with one fixed line; a busy or unknown one (another machine) is left alone.
+    supervise = [item for item in everything if item.get('supervisor') and (item['state'] == 'review' and item['result']
+                 or item['state'] == 'ready' and not item.get('reservation'))
+                 and liveness({**item, 'state': 'doing', 'claim': item['supervisor']}, agents)[0] == 'idle']
+    if not (review or fresh or summary or start or codex_stopped or odd or problems or supervise) and not any(item['state'] == 'doing' for item in everything):
         # #153: an ask or review task waits for someone, so it is no idle pass.
         if any(item['state'] in ('ask', 'review') for item in everything):
             idle_ticks().unlink(missing_ok=True)
@@ -968,7 +1023,7 @@ def queue_pass(args, act=False):
             stuck.append(item)
         elif state == 'idle' and item['state'] == 'doing' and not item.get('result'):
             (claude_idle if runtime == 'claude' else idle).append(item)
-    args.pm_report['workers'] = [report_row(item, agents) for item in everything if item['state'] in ('doing', 'ask', 'review')]
+    args.pm_report['workers'] = [report_row(item, agents) for item in everything if listed(item)]
     permissions = [item['_runtime_observation'] for item in workers if item.get('_runtime_observation', {}).get('status') == 'waiting_permission']
     for item in workers:
         if observation := item.get('_runtime_observation'):
@@ -994,6 +1049,17 @@ def queue_pass(args, act=False):
         print('## Claude idle\n\nTask is doing without result/ask, but its session has ended its turn. Intervene now:\n')
         for item in claude_idle:
             print(f'- {core.ref(item)}: `claude --bg --resume {item["claim"]["session"]} "{NUDGE}"`')
+        print()
+    if supervise and act:
+        for item in supervise:
+            step(f'wake the supervisor of {core.ref(item)}', lambda item=item: wake_supervisor(item), item=item)
+    elif supervise:
+        print('## Supervisors to wake\n\nTheir task needs them (a result to review, or ready again after an answer or reject). '
+              'Send each this line once; do not review or close these tasks yourself:\n')
+        for item in supervise:
+            found, text = item['supervisor'], SUPERVISE.format(iid=item['iid'])
+            print(f'- {core.ref(item)}: ' + (f'`claude --bg --resume {found["session"]} "{text}"`' if found['runtime'] == 'claude'
+                                             else f'`{core.TOOL} send --runtime {found["runtime"]} {found["session"]} --text "{text}"`'))
         print()
     # An app without a status API: silence on the issue is the only sign its turn ended without a hand-in.
     quiet = [item for item in everything if item['state'] == 'doing' and (item['claim'] or {}).get('runtime') in core.EXECUTORS

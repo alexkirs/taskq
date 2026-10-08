@@ -276,16 +276,16 @@ class Restart(unittest.TestCase):
 
     def test_taken_task_is_not_started_again(self):
         iid = self.add('--type', 'research', '--runtime', 'claude')
-        self.assertEqual(self.act(), [f'T{iid} t'])
+        self.assertEqual(self.act(), [f'S{iid} t'])
         self.do(CLAUDE, 'take', iid)
         self.agents = {'claude-session': {'id': 'claudese', 'sessionId': 'claude-session', 'pid': 1, 'status': 'busy'}}
         self.assertEqual(self.act(), [])
         self.assertIn('cannot start: state is doing', base.Cycle.refused(self, COORDINATOR, 'take', iid))
 
     def test_spawned_not_yet_taken_is_not_spawned_again(self):
-        """A TICK between spawn and take (manual TICK, restart) sees the live `T<N>` job of this checkout."""
+        """A TICK between spawn and take (manual TICK, restart) sees the live `T<N>` job of this checkout; #243: tick spawns `S<N>`."""
         iid = self.add('--type', 'research', '--runtime', 'claude')
-        self.assertEqual(self.act(), [f'T{iid} t'])
+        self.assertEqual(self.act(), [f'S{iid} t'])
         for state in ('working', 'blocked'):
             with self.subTest(state):
                 self.agents = job('worker-1', f'T{iid} t (mac-1)', state=state)
@@ -304,7 +304,7 @@ class Restart(unittest.TestCase):
             for case, rows in cases.items():
                 with self.subTest(case):
                     self.agents = rows
-                    self.assertEqual(self.act(), [f'T{iid} t'])
+                    self.assertEqual(self.act(), [f'S{iid} t'])
 
     def codex_thread(self, iid, status, cwd=None, name=None):
         """A `thread/list` row as cleanup_codex reads it; young, so the archive pass leaves it."""
@@ -331,14 +331,14 @@ class Restart(unittest.TestCase):
             for case, listed in cases.items():
                 with self.subTest(case):
                     self.codex.listed = listed
-                    self.assertEqual(self.act(), [f'T{iid} t'])
+                    self.assertEqual(self.act(), [f'S{iid} t'])
 
     def test_unreachable_codex_inventory_holds_all_but_claude_pinned_tasks(self):
         self.enterContext(patch.object(q, 'CODEX_SOCKET', q.ROOT))
         codex, any_runtime = self.add('--type', 'research', '--runtime', 'codex'), self.add('--type', 'research', '--runtime', 'any')
         claude = self.add('--type', 'research', '--runtime', 'claude')
         with patch.object(q, 'Codex', side_effect=OSError('socket unavailable')):
-            self.assertEqual(self.act(), [f'T{claude} t'])
+            self.assertEqual(self.act(), [f'S{claude} t'])
             output = self.do(COORDINATOR, 'tick')
         for iid in (codex, any_runtime):
             self.assertIn(f'{base.link(iid)}: codex workers unreadable, one may be running before its take; not started this pass.', output)
@@ -348,12 +348,12 @@ class Restart(unittest.TestCase):
         codex, any_runtime = self.add('--type', 'research', '--runtime', 'codex'), self.add('--type', 'research', '--runtime', 'any')
         claude = self.add('--type', 'research', '--runtime', 'claude')
         with patch.object(q, 'claude_agents', lambda strict=False: None if strict else {}):
-            self.assertEqual(self.act(), [f'T{codex} t'])
+            self.assertEqual(self.act(), [f'S{codex} t'])
             output = self.do(COORDINATOR, 'tick')
         for iid in (claude, any_runtime):
             self.assertIn(f'{base.link(iid)}: claude workers unreadable, one may be running before its take; not started this pass.', output)
         self.agents = {}  # a readable, truly empty inventory admits
-        self.assertEqual(sorted(self.act()), sorted([f'T{codex} t', f'T{any_runtime} t', f'T{claude} t']))
+        self.assertEqual(sorted(self.act()), sorted([f'S{codex} t', f'S{any_runtime} t', f'S{claude} t']))
 
     def test_live_unclaimed_worker_holds_its_runtime_place(self):
         """Review reproduction: Claude limit 1, a live T1 before its take, no claim: T2 was started."""
@@ -361,17 +361,17 @@ class Restart(unittest.TestCase):
         first, second = (self.add('--type', 'research', '--runtime', runtime) for runtime in ('claude', 'claude'))
         self.agents = job('worker-1', f'T{first} t (mac-1)')
         self.assertEqual(self.act('--limit', 'claude=1,codex=1'), [])
-        self.assertEqual(self.act('--limit', 'claude=2,codex=1'), [f'T{second} t'])
+        self.assertEqual(self.act('--limit', 'claude=2,codex=1'), [f'S{second} t'])
         third, fourth = (self.add('--type', 'research', '--runtime', 'codex') for _ in range(2))
         self.agents, self.codex.listed = {}, [Restart.codex_thread(self, third, 'idle')]
         self.assertEqual(self.act('--limit', 'claude=0,codex=1'), [])
-        self.assertEqual(self.act('--limit', 'claude=0,codex=2'), [f'T{fourth} t'])
+        self.assertEqual(self.act('--limit', 'claude=0,codex=2'), [f'S{fourth} t'])
 
     def test_claimed_live_worker_is_counted_once(self):
         claimed, other = (self.add('--type', 'research', '--runtime', 'claude') for _ in range(2))
         self.do(CLAUDE, 'take', claimed)
         self.agents = job('claude-session', f'T{claimed} t (mac-1)')  # its own spawned job holds the claim
-        self.assertEqual(self.act('--limit', 'claude=2,codex=0'), [f'T{other} t'])
+        self.assertEqual(self.act('--limit', 'claude=2,codex=0'), [f'S{other} t'])
         self.assertEqual(self.act('--limit', 'claude=1,codex=0'), [])
 
     def held_by_claimed(self, *step):
@@ -381,9 +381,9 @@ class Restart(unittest.TestCase):
         self.do(CLAUDE, step[0], claimed, *step[1:])
         self.agents = job('claude-session', f'T{claimed} t (mac-1)')
         self.assertEqual(self.act('--limit', 'claude=1,codex=0'), [])
-        self.assertEqual(self.act('--limit', 'claude=2,codex=0'), [f'T{other} t'])
+        self.assertEqual(self.act('--limit', 'claude=2,codex=0'), [f'S{other} t'])
         self.agents = job('claude-session', f'T{claimed} t (mac-1)', state='done')  # its turn ended: no place
-        self.assertEqual(self.act('--limit', 'claude=1,codex=0'), [f'T{other} t'])
+        self.assertEqual(self.act('--limit', 'claude=1,codex=0'), [f'S{other} t'])
 
     def test_live_worker_of_a_review_task_holds_its_place(self):
         self.held_by_claimed('result', '--text', 'x', '--checks', 'x')
@@ -398,7 +398,7 @@ class Restart(unittest.TestCase):
         self.do(CODEX, 'result', claimed, '--text', 'x', '--checks', 'x')
         self.codex.listed = [{**Restart.codex_thread(self, claimed, 'active'), 'id': 'codex-session'}]
         self.assertEqual(self.act('--limit', 'claude=0,codex=1'), [])
-        self.assertEqual(self.act('--limit', 'claude=0,codex=2'), [f'T{other} t'])
+        self.assertEqual(self.act('--limit', 'claude=0,codex=2'), [f'S{other} t'])
 
     def test_malformed_claude_inventory_holds_claude_starts_only(self):
         """The real adapter on a `[null]` list: the pass goes on, Codex-pinned work starts, Claude and any wait."""
@@ -406,7 +406,7 @@ class Restart(unittest.TestCase):
         from types import SimpleNamespace
         with patch.object(q, 'claude_agents', REAL_AGENTS), \
              patch.object(base.worker.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stdout='[null]', stderr='')):
-            self.assertEqual(self.act(), [f'T{codex} t'])
+            self.assertEqual(self.act(), [f'S{codex} t'])
             output = self.do(COORDINATOR, 'tick')
         self.assertIn(f'{base.link(claude)}: claude workers unreadable', output)
 

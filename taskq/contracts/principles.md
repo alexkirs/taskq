@@ -26,8 +26,8 @@ A new rule gets the next R-number.
 
 **R3. Roles.**
 - *Root PM*: talks to the owner; files, triages and moves tasks. Never merges, never closes after review.
-- *Queue tick* (coordinator): dispatches per-task supervisor sessions within free slots; reconciles board and sessions.
-- *Supervisor*: drives its one worker, reviews its result, merges or opens a PR per the project's `[workspace] publish`, writes the outcome to the board, retires the worker (R11).
+- *Queue tick* (coordinator): dispatches one supervisor session per ready task within free slots (one slot holds a task's supervisor and its worker), the same on Claude and Codex; wakes a supervisor its task needs; reconciles board and sessions.
+- *Supervisor*: launches its one worker, reviews its result, publishes it per the project's `[workspace] publish` (`direct`: the worker pushed `main`, `close` verifies it; `review`: `close` fast-forwards `main` to the reviewed branch), writes the outcome to the board with `close` or `reject`, retires the worker (R11).
 - *Worker*: does the task and writes its result to the board (R5).
 
 Mechanics: [taskq.md § Four roles](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq.md#four-roles), [taskq-manager.md](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq-manager.md).
@@ -52,10 +52,4 @@ Mechanics: [taskq.md § Four roles](https://github.com/alexkirs/taskq/blob/main/
 
 ## Known gaps between rules and code
 
-Code is unchanged by #242. These gaps are open; fixing one is a code task that cites its R-number.
-
-| Rule | Code today |
-|---|---|
-| R3 | `close` refuses the supervisor; the coordinator's publication lane closes supervised tasks (`taskq/worker.py`). |
-| R3 | The tick spawns workers directly for tasks without a `supervisor`. |
-| R2, R11 | A task without a `supervisor` gets a new worker session after `answer`, `reject` or `release` from the queue; the tick archives the old Codex thread. |
+None open. Closed by [#243](https://github.com/alexkirs/taskq/issues/243): the supervisor closes and publishes its task (R3); the tick spawns a supervisor, not a worker, for every ready task (R3); a supervised task's worker continues in the same session after `answer`, `reject` or `release` (R2, R11). A task started before #243 without a `supervisor` keeps the legacy path until it closes.

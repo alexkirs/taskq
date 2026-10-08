@@ -111,8 +111,8 @@ class Reservation(unittest.TestCase):
             self.do(COORDINATOR, 'tick', '--act', '--filter', 'labels=area-maps')
             with contextlib.suppress(SystemExit):
                 self.do({**COORDINATOR, 'CLAUDE_CODE_SESSION_ID': 'coordinator-b'}, 'tick', '--act', '--filter', 'labels=priority-1')
-        self.assertEqual(self.spawned, [f'T{iid} t (mac-1)'])
-        self.assertIn(f'reserved by claude:coordina @mac-1', self.do(COORDINATOR, 'list'))
+        self.assertEqual(self.spawned, [f'S{iid} t (mac-1)'])  # #243: one supervisor; it launches the worker
+        self.assertEqual(self.block(iid)['supervisor'], {'runtime': 'claude', 'session': 'worker-1'})
 
     def test_overlapping_scopes_reserved_at_once_do_not_both_launch(self):
         wide, narrow = self.add('--type', 'research', '--runtime', 'claude', '--scope', 'a'), self.add('--type', 'research', '--runtime', 'claude', '--scope', 'a/b')
@@ -330,7 +330,7 @@ class Reservation(unittest.TestCase):
                     output, spawns = self.tick()
                     self.assertEqual('reservation' in self.block(iid), kept, output)
                     self.assertEqual(iid in self.gitlab.locked(), kept)
-                    self.assertEqual(spawns, [] if kept else [f'T{iid} t'])  # released: the next start may launch it
+                    self.assertEqual(spawns, [] if kept else [f'S{iid} t'], output)  # released: the next start may launch it
                     if kept:
                         q.save(q.task(iid), reservation=None)
                     q.unlock(iid)

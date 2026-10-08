@@ -114,8 +114,7 @@ class Roles(unittest.TestCase):
         iid = self.started()
         self.do(WORKER, 'ask', iid, '--text', 'which?')
         self.assertEqual(self.block(iid)['supervisor']['session'], 'supervisor-1')  # an older-shaped write keeps it
-        self.assertIn('supervised by', self.refused(OTHER, 'answer', iid, '--text', 'x'))
-        self.do(SUPERVISOR, 'answer', iid, '--text', 'this one')
+        self.do(COORDINATOR, 'answer', iid, '--text', 'this one')  # #243: the PM relays the owner's answer
         self.assertEqual(self.state(iid), 'ready')
         self.assertIn('only the worker it launched', self.refused(OTHER, 'take', iid))
         self.do(WORKER, 'take', iid)
@@ -134,12 +133,17 @@ class Roles(unittest.TestCase):
         iid = self.started()
         self.do(WORKER, 'result', iid, '--checks', 'c', '--text', 'done')
         self.assertIn('supervised by', self.refused(COORDINATOR, 'reject', iid, '--text', 'x'))
-        self.assertIn('does not close it', self.refused(SUPERVISOR, 'close', iid, '--text', 'x'))
+        self.assertIn('supervised by', self.refused(COORDINATOR, 'close', iid, '--text', 'x'))  # #243 (R3): the PM never closes
         self.do(SUPERVISOR, 'reject', iid, '--text', 'fix')
         self.assertEqual(self.state(iid), 'ready')
-        other = self.supervised()
-        self.assertIn('supervised by', self.refused(COORDINATOR, 'later', other, '--text', 'x'))
         self.assertIn('supervised by', self.refused(COORDINATOR, 'release', iid, '--text', 'x'))
+        other = self.supervised()
+        self.do(COORDINATOR, 'later', other, '--text', 'x')  # #243: the PM moves tasks for the owner
+        self.assertEqual(self.state(other), 'later')
+        self.do(WORKER, 'take', iid)
+        self.do(WORKER, 'result', iid, '--checks', 'c', '--text', 'fixed')
+        self.do(SUPERVISOR, 'close', iid, '--text', 'checked')  # #243 (R3): the supervisor publishes and closes
+        self.assertEqual(self.gitlab.issues[iid]['state'], 'closed')
 
     def test_worker_with_a_claim_continues_its_own_task(self):
         iid = self.started()
@@ -156,7 +160,7 @@ class Roles(unittest.TestCase):
 
     def test_supervisor_count_is_information_deduplicated(self):
         self.started()
-        line = 'Supervisors on open tasks: claude 1 (from task metadata; their place in the global caps'
+        line = 'Supervisors on open tasks: claude 1 (from task metadata; a live supervisor of this machine and its worker'
         self.assertIn(line, self.do(COORDINATOR, 'tick'))
         held = self.add()
         self.do(OWNER, 'edit', held, '--supervisor', 'claude:worker-1')  # also a doing claim: counted there, not twice

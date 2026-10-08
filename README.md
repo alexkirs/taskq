@@ -145,7 +145,7 @@ Code/docs results require `--sha` of a commit pushed to `main`.
 
 Tell the manager your profile, confirm its card, then **“Arm the tick.”**
 Expected: the coordinator runs `taskq tick` (no flags) every 5 minutes.
-Optional on macOS, for a tick without an open app session: `taskq tick --install-timer` makes launchd run `taskq tick --act` every 5 minutes, which starts, nudges and retires workers itself and wakes the coordinator only when something needs judgement (`--uninstall-timer` removes it).
+Optional on macOS, for a tick without an open app session: `taskq tick --install-timer` makes launchd run `taskq tick --act` every 5 minutes, which starts a supervisor session per ready task (it launches, reviews and closes its worker), nudges and retires sessions itself and wakes the coordinator only when something needs judgement (`--uninstall-timer` removes it).
 
 For CLI automation, `tick`, `report` and `cleanup` accept `--json`. Stdout is one JSON object with
 `command`, `outcome` (`ok`, `judgement_needed`, `failure`), `actions`, `tasks`, `sessions`, `refusals`
@@ -223,7 +223,7 @@ prints it, with the checkout root (task text uses repository-relative paths, `ad
 notes = "Windows claude.cmd; checkout in WSL; run git and tests via wsl.exe bash -lc; no Codex"
 ```
 
-Worker sessions are named `T<N> … (mac)`; spawned Claude workers run with Remote Control, so `tick` links each
+Worker sessions are named `T<N> … (mac)`, their supervisors `S<N> … (mac)`; spawned Claude sessions run with Remote Control, so `tick` links each
 one at `https://claude.ai/code/session_…` (`taskq spawn --no-remote-control` turns it off). `taskq list --links`
 adds each task's URL.
 

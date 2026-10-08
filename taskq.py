@@ -385,6 +385,22 @@ def merge(current, sha):
         fail(f'#{current["iid"]}: PR {number} did not merge: {out}')
     return pr.get('merge_commit_sha') or pr.get('squash_commit_sha') or pr['mergeCommit']['oid']
 
+def cleanup(current):
+    """The worker's .worktrees/taskq-<N> and branch taskq-<N>, on the claim's machine: removed when clean, else kept
+    with a note for the close comment. Never --force: that lost a worker's changes (#284)."""
+    branch = f'taskq-{current["iid"]}'
+    tree = CONFIG['root'] / '.worktrees' / branch
+    if (current['claim'] or {}).get('name') != machine() or not tree.is_dir():
+        return ''
+    git = [shutil.which('git') or fail('git not found'), '-C', str(CONFIG['root'])]
+    status = subprocess.run([*git, '-C', str(tree), 'status', '--porcelain'], capture_output=True, text=True, encoding='utf-8')
+    removed = not status.returncode and not status.stdout.strip() and \
+        not subprocess.run([*git, 'worktree', 'remove', str(tree)], capture_output=True).returncode
+    if not removed:
+        return f'kept .worktrees/{branch} and branch {branch}: uncommitted changes'
+    subprocess.run([*git, 'branch', '-D', branch], capture_output=True)
+    return ''
+
 def cmd_close(args):
     current = task(args.n, 'review')
     sha = commit((current['result'] or {}).get('sha') or '')
@@ -399,7 +415,8 @@ def cmd_close(args):
     stop = getattr(runtimes().get(claim.get('runtime')), 'stop', None)
     if stop and claim.get('name') != machine():
         args.text = (f'{args.text}\n\n' if args.text else '') + f'session {claim.get("session")} runs on {claim.get("name")}: stop it there'
-    move(current, None, 'close', args.text)
+    kept = cleanup(current)
+    move(current, None, 'close', '\n\n'.join(filter(None, (args.text, kept))))
     BOARD.close(args.n)
     if stop and claim.get('name') == machine():
         try:  # best effort: a worker left running never fails close

@@ -295,23 +295,23 @@ def codex_spawn(name, prompt=None, full_access=False):
     return thread
 
 
-def thread_full_access(thread, name):
-    from taskq.tick import supervisor_iid, worker_iid
-    if supervisor_iid(name):
-        return True
-    iid = worker_iid(name)
-    return any(item['full_access'] and (item['iid'] == iid or (item['claim'] or {}).get('session') == thread)
+def thread_full_access(thread):
+    """#270: from the session ids taskq recorded, never the thread's name (anyone can rename it): an open task's
+    supervisor, or the claimed or launched (`launch` note) worker of a FULL_ACCESS task: a reject clears the claim."""
+    head = '\n\nsession '
+    return any((item.get('supervisor') or {}).get('session') == thread
+               or item['full_access'] and ((item['claim'] or {}).get('session') == thread or any(
+                   body.startswith('**launch** · ') and body.endswith(head + thread) for body in core.notes(core.comments(item['iid']))))
                for item in core.load()[0])
 
 
 def codex_send(args):
     """Pin every new turn's policy; deliver active input through steer without a new turn. A thread the
     shared server has not loaded may be the app's: then the app delivers it. Full access: `args.full_access`, else
-    decided by the thread itself (#270), not the claim a reject clears: a supervisor (`S<N> `, it drives the
-    app server, which workspace-write denies) or the `T<N> ` worker of a FULL_ACCESS task."""
+    `thread_full_access`: a supervisor drives the app server, which workspace-write denies."""
     codex = Codex()
     metadata = codex.call('thread/read', {'threadId': args.thread})['thread']
-    full = getattr(args, 'full_access', None) or thread_full_access(args.thread, metadata.get('name'))
+    full = getattr(args, 'full_access', None) or thread_full_access(args.thread)
     status = metadata['status']['type']
     route = codex_send_app(codex, args.thread, metadata, args.text, full) if status == 'notLoaded' else None
     if route:

@@ -55,11 +55,16 @@ class SupervisorAccess(unittest.TestCase):
         self.assertEqual(self.fake.policy(), FULL)
 
     def test_send_decides_by_the_thread_not_the_claim(self):
+        launches = {8: [{'body': '**launch** · codex:s8\n\nsession w2'}]}
+        self.enterContext(patch.object(q, 'comments', lambda iid, **_: launches.get(iid, [])))
         q.main(['codex-send', 's1', '--text', 'wake'])  # a supervisor, whatever the label
         self.assertEqual(self.fake.policy(), FULL)
         q.main(['codex-send', 'w2', '--text', 'resume'])  # FULL_ACCESS worker resumed after its claim was cleared
         self.assertEqual(self.fake.policy(), FULL)
         q.main(['codex-send', 'w1', '--text', 'resume'])  # a plain worker stays sandboxed
+        self.assertEqual(self.fake.policy()['type'], 'workspaceWrite')
+        self.fake.names['x1'] = 'S8 renamed'  # a name grants nothing
+        q.main(['codex-send', 'x1', '--text', 'spoof'])
         self.assertEqual(self.fake.policy()['type'], 'workspaceWrite')
 
     def test_a_supervisor_problem_is_the_rows_blocker(self):

@@ -26,7 +26,8 @@ Before `result`, run focused tests for the changed behavior. Also run `python3 -
 """
 
 [hosts]  # hostname → machine name in worker names, ticks and the `host-<name>` label; unmapped hosts keep their short name (the Mac is macbook-m2)
+"macbook-m2.local" = "mac"
 "DESKTOP" = "win"
 
 [coordinator]  # only the Mac's tick coordinates; the win tick starts only host-win tasks (#145)
-machine = "macbook-m2"
+machine = "mac"

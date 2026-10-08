@@ -253,6 +253,8 @@ ACT_TIMEOUT = 600  # seconds per actor, the default of a binding's `timeout`
 NOT_EVIDENCE = "readiness and effects come from the project's own workflow (doctor, its settings), never from this file"
 ACTOR = [sys.executable, '-P', '-m', 'taskq.multiproject', '--actor']
 OCCUPANCY = [sys.executable, '-P', '-m', 'taskq.multiproject', '--occupancy']
+CHECK = [sys.executable, '-P', '-m', 'taskq.multiproject', '--enroll-check']
+ANCHOR_VERSION = 1
 
 
 def counts(value, caps):
@@ -393,9 +395,8 @@ def claude_inventory(rows):
     return found
 
 
-def codex_inventory():
-    """Identities of the host's Codex threads that may hold a place: running ones and every `T<N>` worker thread
-    not in systemError (as #185 counts workers). None, unknown: no app server or a failed read."""
+def codex_threads():
+    """Every unarchived thread of the host's Codex app server; None, unknown: no app server or a failed read."""
     if not core.CODEX_SOCKET.exists():
         return None
     try:
@@ -408,14 +409,22 @@ def codex_inventory():
                     break
         finally:
             codex.socket.close()
-        found = set()
-        for thread in threads:
-            kind = (thread.get('status') or {}).get('type')
-            if kind not in ('idle', 'notLoaded', 'systemError') or kind != 'systemError' and tick.worker_iid(thread.get('name')):
-                found.add(f'session:{thread["id"]}')
-        return found
+        return [thread for thread in threads if isinstance(thread['id'], str)]
     except (OSError, SystemExit, ValueError, KeyError, TypeError, AttributeError):
         return None
+
+
+def codex_inventory(threads):
+    """Identities of the Codex threads that may hold a place: running ones and every `T<N>` worker thread not in
+    systemError (as #185 counts workers). None stays unknown."""
+    if threads is None:
+        return None
+    found = set()
+    for thread in threads:
+        kind = (thread.get('status') or {}).get('type')
+        if kind not in ('idle', 'notLoaded', 'systemError') or kind != 'systemError' and tick.worker_iid(thread.get('name')):
+            found.add(f'session:{thread["id"]}')
+    return found
 
 
 def occupancy(entry):
@@ -423,6 +432,8 @@ def occupancy(entry):
     subtracts, and each local claim, reservation and ownerless lock as (runtimes it may hold, identity)."""
     if blockers := verify(entry):
         return {'status': 'refused', 'errors': blockers}
+    if (uid := core.user()) != entry['principal']:
+        return {'status': 'refused', 'errors': [f'the tracker principal is {uid}, the catalog binds {entry["principal"]}']}
     everything, where = core.load()[0], repository_url(entry)
     may = lambda runtime: [runtime] if runtime else list(CAPS)  # noqa: E731 - unknown runtime: every one
     held = []
@@ -473,19 +484,18 @@ def budget(caps, inventory, reads, own, limits):
     return found
 
 
-def ready(binding, policy):
-    """Blockers from the project's own workflow, never from the catalog: host and principal bindings, `taskq doctor`
-    (the read-only readiness check), an auto-update its tick would exec into (that exec would end the guarded pass),
-    and native effects the project's settings turn on that the catalog did not select."""
+def workflow(binding, machine):
+    """Blockers from the project's own workflow, never from the catalog: host and principal bindings and, for an
+    acting binding, native effects its settings turn on that the catalog did not select and `taskq doctor` (local
+    preflight only: no UI approval, PM transport or live readiness)."""
     from taskq.cleanup_schedule import settings
     blockers = []
-    if core.machine() != policy['machine']:
-        blockers.append(f'this host is {core.machine()!r}, the catalog binds {policy["machine"]!r}')
+    if core.machine() != machine:
+        blockers.append(f'this host is {core.machine()!r}, the catalog binds {machine!r}')
     if (uid := core.user()) != binding['principal']:
         blockers.append(f'the tracker principal is {uid}, the catalog binds {binding["principal"]}; no delegation exists')
-    if core.UPDATE['auto'] and (not core.UPDATE_STAMP.exists()
-                                or time.time() - core.UPDATE_STAMP.stat().st_mtime >= core.seconds(core.UPDATE['every'])):
-        blockers.append('auto-update is due: run `taskq update` in the checkout first; its exec would end the guarded pass')
+    if not binding['act']:
+        return blockers
     needed = ['queue'] + ['cleanup'] * settings()['enabled'] + ['idle_stop'] * bool(core.personal().get('idle', {}).get('stop', 5))
     if missing := [effect for effect in needed if effect not in binding['effects']]:
         blockers.append(f'its settings turn on native effects {missing} the catalog did not select')
@@ -496,6 +506,170 @@ def ready(binding, policy):
             if error.code:
                 blockers.append('taskq doctor: ' + ' '.join(said.getvalue().split())[-300:])
     return blockers
+
+
+def update_due():
+    """An auto-update its tick would exec into: that exec would end the guarded pass."""
+    if core.UPDATE['auto'] and (not core.UPDATE_STAMP.exists()
+                                or time.time() - core.UPDATE_STAMP.stat().st_mtime >= core.seconds(core.UPDATE['every'])):
+        return ['auto-update is due: run `taskq update` in the checkout first; its exec would end the guarded pass']
+    return []
+
+
+# --- the accepted catalog anchor (Wiki 5e238093 correction A-D) ---------------------------------------
+# Owner execution-selection/version state only: never ownership, readiness or received/applied evidence.
+
+def anchor_path():
+    return core.UPDATE_STAMP.parent / 'multiproject-execution.json'
+
+
+def canonical(policy, catalog):
+    """The catalog's effective fields in one order: only table and list order is ignored. A refused binding has none."""
+    if refused := [f'{project_result(binding, errors)["repository"]}: {"; ".join(errors)}' for binding, errors in catalog if errors]:
+        raise SystemExit('execution catalog binding refused: ' + ' | '.join(refused))
+    bindings = [{**{key: binding[key] for key in ('provider', 'repository_id', 'repository', 'board', 'principal', 'act')},
+                 'host': binding['host'].lower(), 'checkout': str(Path(binding['checkout']).expanduser().resolve()),
+                 'timeout': binding.get('timeout', ACT_TIMEOUT), 'limits': {runtime: binding['limits'].get(runtime, 0) for runtime in CAPS},
+                 'effects': sorted(set(binding['effects']))} for binding, _ in catalog]
+    return {'policy': {key: policy[key] for key in ('version', 'machine', 'os_user', 'caps')},
+            'project': sorted(bindings, key=lambda binding: json.dumps(binding, sort_keys=True))}
+
+
+def digest(snapshot):
+    import hashlib
+    return hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def read_anchor():
+    """The accepted anchor, or None when there is none. Unreadable, malformed, a symlink, another owner, domain or
+    version: SystemExit, and the file stays as it is; never reset."""
+    path = anchor_path()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SystemExit(f'execution anchor {path}: {error}; refused, left as it is') from None
+    try:
+        found = os.fstat(fd)
+        if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o022:
+            raise SystemExit(f'execution anchor {path} is not a file of OS user {os.getuid()} alone; refused, left as it is')
+        with os.fdopen(os.dup(fd), 'rb') as handle:
+            text = handle.read(MAX_OUTPUT + 1)
+    finally:
+        os.close(fd)
+    try:
+        anchor = json.loads(text)
+        valid = (anchor['version'] == ANCHOR_VERSION and type(anchor['generation']) is int and anchor['generation'] >= 1
+                 and anchor['sha256'] == digest(anchor['catalog']) and anchor['catalog']['policy']['os_user'] == os.getuid())
+    except (ValueError, KeyError, TypeError, IndexError):
+        valid = False
+    if not valid:
+        raise SystemExit(f'execution anchor {path} is malformed or of another version or OS-user domain; refused, left as it is')
+    return anchor
+
+
+def write_anchor(anchor):
+    """Replace the anchor atomically: a draft in the same folder, fsync, rename, fsync of the folder."""
+    path = anchor_path()
+    draft = path.with_name(f'.{path.name}.{os.getpid()}')
+    fd = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            os.write(fd, json.dumps(anchor, sort_keys=True, indent=1).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(draft, path)
+    except BaseException:
+        draft.unlink(missing_ok=True)
+        raise
+    folder = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(folder)
+    finally:
+        os.close(folder)
+
+
+def anchored(policy, catalog):
+    """The anchor whose catalog equals this policy file exactly (table order aside); SystemExit otherwise."""
+    anchor = read_anchor()
+    if anchor is None:
+        raise SystemExit('no accepted execution catalog: the owner enrolls it with --accept-execution-policy first')
+    if anchor['sha256'] != digest(canonical(policy, catalog)):
+        raise SystemExit(f'the execution policy differs from accepted generation {anchor["generation"]}; '
+                         'a change takes an explicit --accept-execution-policy replacement')
+    return anchor
+
+
+def binding_check(spec):
+    """One binding of a candidate catalog, in its checkout: identity, then its workflow (no tick, no action)."""
+    binding = spec['binding']
+    return {'repository': repository_url(binding), 'errors': verify(binding) or workflow(binding, spec['machine'])}
+
+
+def settled(anchor):
+    """Blockers against replacing `anchor`: a fresh read-only readback of every anchored binding must show no
+    same-host claim, reservation or ownerless lock, and every required runtime inventory must be readable and show
+    no live session in an anchored checkout. Unknown never settles; nothing is released."""
+    old = anchor['catalog']['project']
+    blockers = []
+    for binding in old:
+        read = read_occupancy(binding, [])
+        where = repository_url(binding)
+        if read['status'] != 'ok':
+            blockers.append(f'{where}: ownership unknown: ' + '; '.join(read.get('errors', [])))
+        elif read['held']:
+            blockers.append(f'{where}: still owns ' + ', '.join(identity for _, identity in read['held']))
+    checkouts = [Path(binding['checkout']) for binding in old]
+    inside = lambda cwd: any(Path(cwd or '/').resolve().is_relative_to(checkout) for checkout in checkouts)  # noqa: E731
+    rows, threads = claude_rows(), codex_threads()
+    for runtime, found, live in (('claude', rows if claude_inventory(rows) is not None else None,
+                                  lambda row: row.get('state') not in CLAUDE_ENDED and inside(row.get('cwd'))),
+                                 ('codex', threads, lambda thread: codex_inventory([thread]) and inside(thread.get('cwd')))):
+        if found is None:
+            if any(binding['limits'][runtime] for binding in old):
+                blockers.append(f'{runtime} inventory unknown: anchored grants cannot be settled')
+        elif sessions := [item.get('sessionId') or item.get('id') for item in found if live(item)]:
+            blockers.append(f'{runtime} sessions still run in anchored checkouts: {", ".join(map(str, sessions))}')
+    return blockers
+
+
+def accept(policy_path, check=None):
+    """`--accept-execution-policy`: the owner's explicit enrollment or replacement of the catalog anchor, all under
+    the host guard; no native tick or action. A replacement needs every previous binding settled first."""
+    result = {'status': 'refused', 'errors': [], 'anchor': str(anchor_path()), 'generation': None, 'sha256': None, 'bindings': []}
+    try:
+        policy, catalog = load_policy(policy_path)
+        snapshot = canonical(policy, catalog)
+        fd, _ = guard(policy)
+    except (SystemExit, OSError, ValueError) as error:
+        return {**result, 'errors': [str(error)]}
+    try:
+        anchor = read_anchor()
+        if anchor and anchor['sha256'] == digest(snapshot):
+            return {**result, 'status': 'unchanged', 'generation': anchor['generation'], 'sha256': anchor['sha256']}
+        for binding, _ in catalog:
+            try:
+                code, out, err = run_bounded((check or CHECK) + [json.dumps({'binding': binding, 'machine': policy['machine']})],
+                                             Path(binding['checkout']).expanduser(), binding.get('timeout', TIMEOUT))
+                found = json.loads(out) if code == 0 else {'repository': repository_url(binding), 'errors': [f'check exit {code}']}
+            except (OSError, ValueError) as error:
+                found = {'repository': repository_url(binding), 'errors': [f'check: {error}']}
+            result['bindings'].append(found)
+        blockers = [f'{found["repository"]}: {error}' for found in result['bindings'] for error in found['errors']]
+        if anchor:
+            blockers += settled(anchor)
+        if blockers:
+            return {**result, 'errors': blockers}
+        generation = anchor['generation'] + 1 if anchor else 1
+        write_anchor({'version': ANCHOR_VERSION, 'generation': generation, 'sha256': digest(snapshot), 'catalog': snapshot,
+                      'accepted_at': now(), 'accepted_by': core.who(), 'note': 'execution selection only; no ownership, readiness or receipt'})
+        return {**result, 'status': 'replaced' if anchor else 'enrolled', 'generation': generation, 'sha256': digest(snapshot)}
+    except (SystemExit, OSError, ValueError) as error:
+        return {**result, 'errors': [str(error)]}
+    finally:
+        os.close(fd)
 
 
 def native_pass(view, limits):
@@ -529,17 +703,23 @@ def act_project(spec):
     result['guard'] = {'path': str(guard_path()), 'device': held.st_dev, 'inode': held.st_ino, 'pid': os.getpid(),
                        'domain': f'OS user {policy["os_user"]} only; no host-global capacity is claimed'}
     try:
-        if blockers := verify(binding) or ready(binding, policy):
+        anchored(policy, catalog)
+        if blockers := verify(binding) or workflow(binding, policy['machine']) or update_due():
             return {**result, 'errors': blockers}
         reads = [read_occupancy(other, errors) for other, errors in catalog]
         own = next(read for (other, _), read in zip(catalog, reads) if other is binding)
         result['catalog'] = [{'repository': project_result(other, errors)['repository'], 'status': read['status'],
                               'errors': read.get('errors', [])} for (other, errors), read in zip(catalog, reads)]
-        if own['status'] != 'ok':
-            return {**result, 'errors': ['own binding readback: ' + '; '.join(own.get('errors', []))]}
+        # Unknown ownership or an unreadable inventory the project touches refuses before native_pass: its zero
+        # limits would still let the pass release, move and reconcile.
+        if unread := [f'{found["repository"]}: {found["status"]}' for found in result['catalog'] if found['status'] != 'ok']:
+            return {**result, 'errors': ['catalog ownership unknown, nothing run: ' + ', '.join(unread)]}
         view = entry.get('view', {})
         limits = {runtime: min(count, view.get('limits', {}).get(runtime, count)) for runtime, count in binding['limits'].items()}
-        result['budget'] = budget(policy['caps'], {'claude': claude_inventory(claude_rows()), 'codex': codex_inventory()}, reads, own, limits)
+        inventory = {'claude': claude_inventory(claude_rows()), 'codex': codex_inventory(codex_threads())}
+        result['budget'] = budget(policy['caps'], inventory, reads, own, limits)
+        if unknown := [runtime for runtime in CAPS if inventory[runtime] is None and (limits.get(runtime, 0) or own['L'].get(runtime, 0))]:
+            return {**result, 'errors': [f'{" and ".join(unknown)} inventory unknown for a runtime this project holds or may start; nothing run']}
         result['status'] = 'unknown'  # from here a native mutation may happen
         code, out = native_pass(view, {runtime: result['budget'].get(runtime, {}).get('limit', 0) for runtime in core.RUNTIMES})
         native = json.loads(out.strip().splitlines()[-1])
@@ -599,10 +779,16 @@ def act(manifest, policy_path, actor=None):
     run; an unknown outcome or a held guard admits nothing more in this invocation."""
     contract = tick.report_contract()
     policy, catalog = load_policy(policy_path)
-    projects, stop = [], None
+    projects, stop, refused = [], None, None
+    try:
+        anchored(policy, catalog)
+    except SystemExit as error:  # no actor starts: the whole invocation is refused
+        refused = str(error)
     for entry, errors in load_manifest(manifest):
         result = project_result(entry, errors)
-        if not errors and stop:
+        if not errors and refused:
+            result['errors'] = [refused]
+        elif not errors and stop:
             result.update(status='not_admitted', errors=[stop])
         elif not errors:
             try:
@@ -649,15 +835,26 @@ def main(argv=None, reader=READER):
     parser.add_argument('--manifest', help='the explicit project manifest (docs/multiproject-pm.md)')
     parser.add_argument('--json', action='store_true', help='print the aggregate as JSON')
     parser.add_argument('--act', action='store_true', help='one guarded native `tick --act` per admitted project')
-    parser.add_argument('--execution-policy', metavar='FILE', help='the reviewed execution catalog that --act requires')
+    parser.add_argument('--execution-policy', metavar='FILE', help='the accepted execution catalog that --act requires')
+    parser.add_argument('--accept-execution-policy', metavar='FILE', help='enroll or replace the accepted execution catalog; no tick')
+    parser.add_argument('--enroll-check', metavar='SPEC', help=argparse.SUPPRESS)  # one candidate binding's checks, JSON
     parser.add_argument('--observe', metavar='ENTRY', help=argparse.SUPPRESS)  # the reader: one verified entry, JSON
     parser.add_argument('--occupancy', metavar='BINDING', help=argparse.SUPPRESS)  # one binding's ownership, JSON
     parser.add_argument('--actor', metavar='SPEC', help=argparse.SUPPRESS)  # one admitted project's acting pass, JSON
     args = parser.parse_args(argv)
-    if args.observe or args.occupancy:
+    if args.observe or args.occupancy or args.enroll_check:
         with contextlib.redirect_stdout(sys.stderr):  # stdout carries only the result
-            found = observe(json.loads(args.observe)) if args.observe else occupancy(json.loads(args.occupancy))
+            found = (observe(json.loads(args.observe)) if args.observe else occupancy(json.loads(args.occupancy)) if args.occupancy
+                     else binding_check(json.loads(args.enroll_check)))
         return print(json.dumps(found))
+    if args.accept_execution_policy:
+        with contextlib.redirect_stdout(sys.stderr):
+            found = accept(args.accept_execution_policy)
+        print(json.dumps(found) if args.json else f'{found["status"]}: generation {found["generation"]} of {found["anchor"]}'
+              + ''.join(f'\nBlocker: {error}' for error in found['errors']))
+        if found['status'] == 'refused':
+            raise SystemExit(1)
+        return
     if args.actor:
         # Its output is one JSON line at the end; a dead wrapper's broken pipe can then cut nothing but that line.
         with contextlib.redirect_stdout(io.StringIO()) as said, contextlib.redirect_stderr(said):

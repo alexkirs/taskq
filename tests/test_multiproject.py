@@ -27,6 +27,7 @@ tick, worker = sys.modules['taskq.tick'], sys.modules['taskq.worker']
 CHILD = [sys.executable, str(Path(__file__).resolve()), '--child']
 ACT = [sys.executable, str(Path(__file__).resolve()), '--act-child']
 ACTOR = ACT + ['actor', '--actor']
+CHECK = ACT + ['check', '--enroll-check']
 # A separate process asks the host guard: `held` while an actor owns it.
 PROBE = ('import fcntl, os, sys\nfd = os.open(sys.argv[1], os.O_RDWR)\ntry:\n    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n'
          '    print("free")\nexcept BlockingIOError:\n    print("held")')
@@ -308,7 +309,11 @@ class Acting(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {'XDG_STATE_HOME': str(self.dir), 'TASKQ_FIXTURE': str(self.dir), 'TASKQ_HOST': 'fixture-host',
                                                   'CLAUDE_CODE_SESSION_ID': 'coordinator', 'CODEX_THREAD_ID': ''}))
         self.enterContext(patch.object(core, 'UPDATE_STAMP', self.dir / 'taskq' / 'update-last'))
-        self.guard = multiproject.guard_path()
+        # In-process enrollment reads back through the fixture's subprocesses, never a real tracker.
+        self.enterContext(patch.multiple(multiproject, OCCUPANCY=ACT + ['occupancy', '--occupancy'], CHECK=CHECK, ACTOR=ACTOR,
+                                         claude_rows=lambda: json.loads((self.dir / 'agents.json').read_text())))
+        self.enterContext(patch.object(core, 'CODEX_SOCKET', self.dir / 'no-codex.sock'))  # never the host's runtimes
+        self.guard, self.anchor = multiproject.guard_path(), multiproject.anchor_path()
         self.agents(LIVE)
         self.alpha = self.project('alpha', 11, tasks=[(1,), (2,)])
         self.beta = self.project('beta', 22, tasks=[(1,)])
@@ -350,11 +355,15 @@ class Acting(unittest.TestCase):
     def block(self, name, iid):
         return json.loads(core.BLOCK.search(self.store(name).issues[iid]['description'])[1])
 
-    def catalog(self, *entries, file='policy.toml', **top):
+    def catalog(self, *entries, file='policy.toml', enroll=True, **top):
+        """The execution policy file; `enroll`: the owner's explicit initial enrollment of it, which must succeed."""
         bindings = [{'principal': 1, 'act': True, 'limits': {'claude': 2, 'codex': 0}, 'effects': list(multiproject.EFFECTS),
                      'timeout': 120, **entry} for entry in entries]
         path = self.dir / file
         path.write_text(toml({'version': 1, 'machine': 'fixture-host', 'os_user': os.getuid(), **top}, bindings))
+        if enroll:
+            found = multiproject.accept(path, CHECK)
+            self.assertEqual((found['status'], found['errors']), ('enrolled', []))
         return path
 
     def act(self, view, policy):
@@ -384,7 +393,7 @@ class Acting(unittest.TestCase):
     def test_one_aggregate_budget_over_two_projects_reaches_native_launch_admission(self):
         foreign = {'attempt': 'f00d', 'runtime': 'claude', 'principal': 2, 'coordinator': 'claude:other', 'node': '0' * 12, 'pid': 1}
         self.alpha = self.project('alpha2', 33, tasks=[(1,), (2,), (3, 'ready', 'claude', {}, (2,)), (4, 'ready', 'claude', {'reservation': foreign})])
-        policy = self.catalog({**self.alpha}, {**self.beta, 'limits': {'claude': 1, 'codex': 2}})
+        policy = self.catalog({**self.alpha}, {**self.beta, 'limits': {'claude': 1}})
         result = self.act([self.alpha, self.beta], policy)
         alpha, beta = result['projects']
         self.assertEqual([alpha['status'], beta['status']], ['ok', 'ok'], result)
@@ -394,10 +403,11 @@ class Acting(unittest.TestCase):
         spawned = self.calls('spawn')
         self.assertEqual([(row[2], row[3]) for row in spawned], [('acme/alpha2', 'T1 Task 1 (fixture-host)'), ('acme/alpha2', 'T2 Task 2 (fixture-host)')])
         self.assertEqual({row[4] for row in spawned}, {'held'})  # the host guard is held during the native mutation
+        self.assertEqual([row[3] for row in self.calls('native')], [{'claude': 2, 'codex': 0}, {'claude': 0, 'codex': 0}])
         self.assertEqual(self.store('alpha2').issues[3]['assignees'], [{'id': 2}])
         self.assertEqual(self.block('alpha2', 4)['reservation'], foreign)
         self.assertNotIn('reservation', self.block('alpha2', 3))
-        self.assertEqual([row for row in self.calls('api') if row[0] == 'occupancy' and row[3] != 'GET'], [])
+        self.assertEqual([row for row in self.calls('api') if row[0] in ('occupancy', 'check') and row[3] != 'GET'], [])
         self.assertEqual(self.mutations('beta'), [])
         for project in (alpha, beta):
             self.assertEqual(tick.validate_report(project['report']), [])
@@ -412,6 +422,9 @@ class Acting(unittest.TestCase):
         self.assertEqual(multiproject.claude_inventory([{'kind': 'interactive', 'pid': 7}]), {'pid:7'})
         self.assertIsNone(multiproject.claude_inventory([{'kind': 'background', 'state': 'working'}]))  # unidentified live row
         self.assertIsNone(multiproject.claude_inventory({'rows': []}))
+        self.assertEqual(multiproject.codex_inventory([{'id': 'a', 'status': {'type': 'active'}}, {'id': 'b', 'status': {'type': 'idle'}},
+                                                       {'id': 'c', 'name': 'T4 x', 'status': {'type': 'notLoaded'}},
+                                                       {'id': 'd', 'name': 'T5 y', 'status': {'type': 'systemError'}}]), {'session:a', 'session:c'})
         caps = {'claude': 8, 'codex': 4}
         own = {'status': 'ok', 'L': {'claude': 1, 'codex': 0},
                'held': [(['claude'], 'session:s1'), (['claude'], 'reservation:r'), (['claude', 'codex'], 'lock:l')]}
@@ -422,55 +435,150 @@ class Acting(unittest.TestCase):
         self.assertEqual((found['codex']['known'], found['codex']['limit']), (False, 0))
         small = multiproject.budget(caps, {'claude': {'session:s1'}, 'codex': set()}, [own], own, {'claude': 3, 'codex': 2})
         self.assertEqual((small['claude']['F'], small['claude']['limit'], small['codex']['F'], small['codex']['limit']), (5, 3, 3, 2))
-        unread = multiproject.budget(caps, {'claude': set(), 'codex': set()}, [own, {'status': 'failed'}], own, {'claude': 3, 'codex': 2})
-        self.assertEqual({runtime: (item['F'], item['limit']) for runtime, item in unread.items()}, {'claude': (0, 1), 'codex': (0, 0)})
 
-    def test_removed_view_ownership_and_a_missing_binding_hold_the_budget(self):
+    def test_removed_view_reads_the_old_anchored_binding(self):
         claim = lambda session: {'claim': {'runtime': 'claude', 'session': session, 'node': self.node('gone')}}  # noqa: E731
         gone = self.project('gone', 44, tasks=[(1, 'doing', 'claude', claim('s-1')), (2, 'doing', 'claude', claim('s-2')),
                                                (3, 'doing', 'claude', claim('bg-0'))])
-        result = self.act([self.beta], self.catalog({**gone, 'act': False}, self.beta))
+        policy = self.catalog({**gone, 'act': False}, self.beta)
+        result = self.act([self.beta], policy)
         self.assertEqual(self.limits(result['projects'][0])['claude'], (8, True, 0, 0, 0))  # 6 rows + s-1, s-2; bg-0 once
+        self.assertEqual([item['status'] for item in result['projects'][0]['catalog']], ['ok', 'ok'])
         self.assertEqual(self.mutations('gone'), [])
-        missing = {**self.project('missing', 55), 'checkout': str(self.dir / 'nowhere')}
-        result = self.act([self.alpha], self.catalog(self.alpha, missing))
-        self.assertEqual(self.limits(result['projects'][0])['claude'], (6, False, 0, 0, 0))
-        self.assertEqual([item['status'] for item in result['projects'][0]['catalog']], ['ok', 'failed'])
-        self.assertFalse(any(row[2] == 'acme/alpha' for row in self.calls('spawn')))
 
-    def test_policy_identity_and_principal_mismatch_refuse_before_any_mutation(self):
-        twin = {**self.beta, 'board': 'other-board'}
-        policy = self.catalog({**self.alpha, 'ready': True}, self.beta)
-        result = self.act([self.alpha, twin], policy)
-        self.assertIn('ready: unknown key; readiness and effects come from', result['projects'][0]['errors'][0])
-        self.assertIn('no valid execution catalog binding', result['projects'][1]['errors'][0])
-        self.assertEqual(self.calls(), [])  # no actor started
+    def test_unknown_catalog_or_runtime_refuses_before_native_pass_even_with_L(self):
+        mine = {'claim': {'runtime': 'claude', 'session': 'bg-1', 'node': self.node('alpha2')}}
+        self.alpha = self.project('alpha2', 33, tasks=[(1,), (2, 'doing', 'claude', mine)])
+        policy = self.catalog(self.alpha, self.beta)
+        self.agents('not json')  # the Claude inventory this project holds (L = 1) is unknown
+        found = self.act([self.alpha], policy)['projects'][0]
+        self.assertEqual((found['status'], found['budget']['claude']['L']), ('refused', 1))
+        self.assertIn('claude inventory unknown', found['errors'][0])
+        self.agents(LIVE)
+        (self.dir / 'beta').rename(self.dir / 'beta-moved')  # an anchored binding's checkout is gone: ownership unknown
+        found = self.act([self.alpha], policy)['projects'][0]
+        self.assertEqual(found['status'], 'refused')
+        self.assertIn('catalog ownership unknown, nothing run', found['errors'][0])
+        self.assertEqual((self.calls('native'), self.calls('spawn'), self.mutations('alpha2')), ([], [], []))
+        (self.dir / 'beta-moved').rename(self.dir / 'beta')
+        found = self.act([self.alpha], policy)['projects'][0]  # known again: the native pass runs (its doing row has no https link)
+        self.assertEqual((found['status'], found['errors']), ('blocked', ['worker session link unavailable; use the printed attach/app reference']))
+        self.assertEqual(len(self.calls('native')), 1)
+
+    def test_enrollment_is_explicit_runs_no_tick_and_only_table_order_may_change(self):
+        policy = self.catalog(self.alpha, self.beta, enroll=False)
+        result = self.act([self.alpha, self.beta], policy)  # never enrolled on a first --act
+        self.assertEqual([project['status'] for project in result['projects']], ['refused', 'refused'])
+        self.assertIn('no accepted execution catalog', result['projects'][0]['errors'][0])
+        self.assertEqual((self.calls(), self.anchor.exists()), ([], False))
+        found = multiproject.accept(policy, CHECK)
+        self.assertEqual((found['status'], found['generation'], found['errors']), ('enrolled', 1, []))
+        self.assertEqual({row[0] for row in self.calls()}, {'check'})  # identity and workflow checks only
+        self.assertEqual([row for row in self.calls('api') if row[3] != 'GET'], [])
+        self.assertEqual((self.calls('native'), self.calls('spawn')), ([], []))
+        self.assertEqual(self.anchor.stat().st_mode & 0o777, 0o600)
+        anchor = json.loads(self.anchor.read_text())
+        self.assertEqual((anchor['generation'], anchor['catalog']['policy']['os_user']), (1, os.getuid()))
+        self.assertEqual(multiproject.accept(policy, CHECK)['status'], 'unchanged')
+        reordered = self.catalog(self.beta, {**self.alpha, 'effects': list(reversed(multiproject.EFFECTS))}, enroll=False)
+        self.assertEqual(self.act([self.beta], reordered)['projects'][0]['status'], 'ok')
+        changed = self.catalog(self.alpha, {**self.beta, 'limits': {'claude': 1}}, enroll=False)
+        result = self.act([self.beta], changed)
+        self.assertIn('differs from accepted generation 1', result['projects'][0]['errors'][0])
+        self.assertEqual(len(self.calls('native')), 1)
+        for n, (binding, top, why) in enumerate((({**self.alpha, 'principal': 5}, {}, 'the catalog binds 5'),
+                                                 (self.alpha, {'machine': 'other-host'}, "the catalog binds 'other-host'"),
+                                                 ({**self.alpha, 'ready': True}, {}, 'ready: unknown key; readiness and effects come from'),
+                                                 ({**self.alpha, 'effects': ['queue']}, {}, "['cleanup', 'idle_stop'] the catalog did not select"))):
+            bad = self.catalog(binding, enroll=False, file=f'bad-{n}.toml', **top)
+            refused = multiproject.accept(bad, CHECK)
+            self.assertEqual(refused['status'], 'refused')
+            self.assertIn(why, ' '.join(refused['errors']))
+        self.assertEqual(json.loads(self.anchor.read_text()), anchor)
+
+    def test_replacement_needs_every_old_binding_settled_and_keeps_the_anchor_otherwise(self):
+        old = self.catalog(self.alpha, self.beta, file='old.toml')
+        before = self.anchor.read_bytes()
+        hidden = {'attempt': 'h1dd', 'runtime': 'claude', 'principal': 1, 'coordinator': 'claude:coordina', 'node': self.node('alpha'), 'pid': 1}
+        store = self.store('alpha')
+        store.issues[1]['description'] = core.render('goal', {**self.block('alpha', 1), 'reservation': hidden})
+        (self.dir / 'acme_alpha.pickle').write_bytes(pickle.dumps(store))
+        for candidate in (self.catalog(self.beta, enroll=False), self.catalog({**self.alpha, 'principal': 2}, self.beta, enroll=False)):
+            refused = multiproject.accept(candidate, CHECK)
+            self.assertEqual(refused['status'], 'refused')
+            self.assertIn('https://gitlab.example/acme/alpha: still owns reservation:', ' '.join(refused['errors']))
+            self.assertEqual(self.anchor.read_bytes(), before)
+        self.assertIn('differs from accepted generation 1', self.act([self.beta], self.catalog(self.beta, enroll=False))['projects'][0]['errors'][0])
+        store.issues[1]['description'] = core.render('goal', {**self.block('alpha', 1), 'reservation': None})
+        (self.dir / 'acme_alpha.pickle').write_bytes(pickle.dumps(store))
+        self.agents(LIVE + [{'id': 'a', 'kind': 'background', 'sessionId': 'in-alpha', 'cwd': self.alpha['checkout'], 'name': 'T1 x', 'state': 'working', 'pid': 9}])
+        refused = multiproject.accept(self.catalog(self.beta, enroll=False), CHECK)
+        self.assertIn('claude sessions still run in anchored checkouts: in-alpha', refused['errors'])
+        self.agents(LIVE)
+        (self.dir / 'beta').rename(self.dir / 'beta-moved')
+        refused = multiproject.accept(self.catalog({**self.alpha, 'limits': {'claude': 1}}, enroll=False), CHECK)
+        self.assertIn('https://gitlab.example/acme/beta: ownership unknown', ' '.join(refused['errors']))
+        (self.dir / 'beta-moved').rename(self.dir / 'beta')
+        self.assertEqual(self.anchor.read_bytes(), before)
+        self.assertEqual(self.mutations('alpha'), [])  # nothing released, stolen or settled by the adapter
+        replaced = multiproject.accept(self.catalog(self.beta, enroll=False), CHECK)
+        self.assertEqual((replaced['status'], replaced['generation']), ('replaced', 2))
+        self.assertEqual(self.calls('native'), [])
+        self.assertIn('differs from accepted generation 2', self.act([self.beta], old)['projects'][0]['errors'][0])
+
+    def test_corrupt_lost_or_foreign_anchor_refuses_and_is_never_reset(self):
+        policy = self.catalog(self.alpha)
+        good = self.anchor.read_bytes()
+        for broken, why in ((b'{"version": 1', 'malformed'), (json.dumps({**json.loads(good), 'version': 2}).encode(), 'malformed'),
+                            (json.dumps({**json.loads(good), 'sha256': '0' * 64}).encode(), 'malformed')):
+            self.anchor.write_bytes(broken)
+            self.assertIn(why, self.act([self.alpha], policy)['projects'][0]['errors'][0])
+            self.assertIn(why, multiproject.accept(policy, CHECK)['errors'][0])
+            self.assertEqual(self.anchor.read_bytes(), broken)
+        foreign = json.loads(good)
+        foreign['catalog']['policy']['os_user'] = os.getuid() + 1
+        foreign['sha256'] = multiproject.digest(foreign['catalog'])
+        self.anchor.write_text(json.dumps(foreign))
+        self.assertIn('OS-user domain', self.act([self.alpha], policy)['projects'][0]['errors'][0])
+        self.anchor.unlink()
+        (self.dir / 'elsewhere.json').write_bytes(good)
+        self.anchor.symlink_to(self.dir / 'elsewhere.json')
+        self.assertIn('refused, left as it is', self.act([self.alpha], policy)['projects'][0]['errors'][0])
+        self.assertTrue(self.anchor.is_symlink())
+        self.anchor.unlink()  # state loss: no anchor, no acting until the owner enrolls again
+        self.assertIn('no accepted execution catalog', self.act([self.alpha], policy)['projects'][0]['errors'][0])
+        self.assertIn('outside the catalog', multiproject.accept(self.catalog(self.alpha, os_user=os.getuid() + 1, enroll=False), CHECK)['errors'][0])
+        self.assertEqual((self.calls('native'), self.anchor.exists()), ([], False))
+
+    def test_actor_identity_and_view_mismatch_refuse_before_any_mutation(self):
+        policy = self.catalog(self.alpha, {**self.beta, 'act': False})
         for top in ({'evidence': 'doctor ok'}, {'caps': {'claude': 9}}):
             with self.assertRaises(SystemExit):
-                multiproject.load_policy(self.catalog(self.alpha, **top))
-        result = self.act([self.alpha, self.beta], self.catalog({**self.alpha, 'principal': 5}, {**self.beta, 'act': False}))
-        self.assertEqual([project['status'] for project in result['projects']], ['refused', 'refused'])
-        self.assertIn('the tracker principal is 1, the catalog binds 5; no delegation exists', result['projects'][0]['errors'])
+                multiproject.load_policy(self.catalog(self.alpha, enroll=False, file='bad.toml', **top))
+        result = self.act([{**self.alpha, 'board': 'other-board'}, self.beta], policy)
+        self.assertIn('no valid execution catalog binding', result['projects'][0]['errors'][0])
         self.assertIn('catalog-only binding', result['projects'][1]['errors'][0])
-        result = self.act([self.alpha], self.catalog(self.alpha, machine='other-host'))
-        self.assertIn("this host is 'fixture-host', the catalog binds 'other-host'", result['projects'][0]['errors'])
-        self.assertEqual((self.mutations('alpha'), self.calls('spawn')), ([], []))
+        store = self.store('alpha')
+        store.uid = 3  # the tracker now authenticates someone else
+        (self.dir / 'acme_alpha.pickle').write_bytes(pickle.dumps(store))
+        found = self.act([self.alpha], policy)['projects'][0]
+        self.assertIn('the tracker principal is 3, the catalog binds 1; no delegation exists', found['errors'])
+        self.assertEqual((self.mutations('alpha'), self.calls('native')), ([], []))
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             multiproject.main(['--manifest', str(self.dir / 'manifest.toml'), '--act'])
 
-    def test_effects_and_readiness_come_from_the_workflow_and_a_failure_does_not_stop_the_next(self):
-        narrow = self.project('narrow', 61, tasks=[(1,)])
-        unready = self.project('unready', 62, tasks=[(1,)], doctor='`claude` is not logged in')
+    def test_actor_rechecks_the_workflow_and_a_failure_does_not_stop_the_next(self):
+        late = self.project('late', 62, tasks=[(1,)])
         stale = self.project('stale', 63, tasks=[(1,)], update=True)
         broken = self.project('broken', 64, tasks=[(1,)], lock_fails=True)
-        policy = self.catalog({**narrow, 'effects': ['queue']}, unready, stale, broken, self.beta)
-        result = self.act([narrow, unready, stale, broken, self.beta], policy)
-        self.assertEqual([project['status'] for project in result['projects']], ['refused', 'refused', 'refused', 'failed', 'ok'])
-        self.assertIn("its settings turn on native effects ['cleanup', 'idle_stop'] the catalog did not select", result['projects'][0]['errors'])
-        self.assertIn('`claude` is not logged in', result['projects'][1]['errors'][0])
-        self.assertIn('auto-update is due', result['projects'][2]['errors'][0])
-        self.assertEqual(result['projects'][3]['native']['outcome'], 'failure')
-        for name in ('narrow', 'unready', 'stale'):
+        policy = self.catalog(late, stale, broken, self.beta)
+        (self.dir / 'late' / 'fixture.json').write_text(json.dumps({'doctor': '`claude` is not logged in'}))  # after enrollment
+        result = self.act([late, stale, broken, self.beta], policy)
+        self.assertEqual([project['status'] for project in result['projects']], ['refused', 'refused', 'failed', 'ok'])
+        self.assertIn('`claude` is not logged in', result['projects'][0]['errors'][0])
+        self.assertIn('auto-update is due', result['projects'][1]['errors'][0])
+        self.assertEqual(result['projects'][2]['native']['outcome'], 'failure')
+        for name in ('late', 'stale'):
             self.assertEqual(self.mutations(name), [])
         self.assertNotIn('reservation', self.block('broken', 1))
         self.assertEqual([row[2] for row in self.calls('spawn')], ['acme/beta'])
@@ -479,7 +587,6 @@ class Acting(unittest.TestCase):
     def test_timeout_keeps_actor_and_guard_and_admits_nothing_more_then_restart_reads_back(self):
         slow = self.project('slow', 71, tasks=[(1,)], spawn={'sleep': 8})
         policy = self.catalog({**slow, 'timeout': 3, 'limits': {'claude': 1}}, self.beta)
-        multiproject.guard_free({'os_user': os.getuid()})
         inode = self.guard.stat().st_ino
         result = self.act([slow, self.beta], policy)
         self.assertEqual([project['status'] for project in result['projects']], ['unknown', 'not_admitted'])
@@ -516,7 +623,6 @@ class Acting(unittest.TestCase):
     def test_crash_frees_the_lock_keeps_the_inode_and_restart_counts_the_orphan_without_releasing_it(self):
         crash = self.project('crash', 91, tasks=[(1,)], spawn={'crash': True})
         policy = self.catalog({**crash, 'limits': {'claude': 1}}, self.beta)
-        multiproject.guard_free({'os_user': os.getuid()})
         inode = self.guard.stat().st_ino
         result = self.act([crash, self.beta], policy)
         self.assertEqual([project['status'] for project in result['projects']], ['unknown', 'not_admitted'])
@@ -527,24 +633,32 @@ class Acting(unittest.TestCase):
         self.assertEqual((again['status'], self.limits(again)['claude']), ('ok', (7, True, 1, 0, 1)))  # the orphan holds a place
         self.assertEqual((self.block('crash', 1)['reservation'], self.mutations('crash')), (orphan, written))  # read back, not released
 
-    def test_differing_principals_contend_on_one_host_inode(self):
+    def test_differing_principals_and_enrollment_contend_on_one_host_inode(self):
         first = self.project('first', 101, tasks=[(1,)], spawn={'sleep': 4})
         other = self.project('other', 102, uid=2, tasks=[(1,)])
+        policy = self.catalog({**first, 'limits': {'claude': 1}}, {**other, 'principal': 2}, self.beta)
+        before = self.anchor.read_bytes()
         manifest = self.dir / 'first.toml'
         manifest.write_text(toml({'version': 1}, [first]))
-        wrapper = subprocess.Popen(ACT + ['wrapper', '--manifest', str(manifest), '--act', '--execution-policy',
-                                          str(self.catalog({**first, 'limits': {'claude': 1}}, file='first-policy.toml')), '--json'],
+        wrapper = subprocess.Popen(ACT + ['wrapper', '--manifest', str(manifest), '--act', '--execution-policy', str(policy), '--json'],
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.wait(lambda: self.calls('spawn'))
-        policy = self.catalog({**other, 'principal': 2}, file='other-policy.toml')
-        refused = self.act([other, self.beta], self.catalog({**other, 'principal': 2}, self.beta, file='other-policy.toml'))
+        refused = self.act([other, self.beta], policy)
         self.assertEqual([project['status'] for project in refused['projects']], ['refused', 'not_admitted'])
         self.assertIn('host guard held', refused['projects'][0]['errors'][0])
+        racing = multiproject.accept(self.catalog({**first, 'limits': {'claude': 1}}, {**other, 'principal': 2}, enroll=False, file='next.toml'), CHECK)
+        self.assertIn('host guard held', racing['errors'][0])
+        self.assertEqual(self.anchor.read_bytes(), before)
         out, _ = wrapper.communicate(timeout=60)
         later = self.act([other], policy)['projects'][0]
         self.assertEqual(later['status'], 'ok', later)
         self.assertEqual(later['guard']['inode'], json.loads(out)['projects'][0]['guard']['inode'])
         self.assertEqual([row[2] for row in self.calls('spawn')], ['acme/first', 'acme/other'])
+        fd, _ = multiproject.guard({'os_user': os.getuid()})  # an enrollment holding the guard keeps every actor out
+        try:
+            self.assertIn('host guard held', self.act([self.beta], policy)['projects'][0]['errors'][0])
+        finally:
+            os.close(fd)
 
     def test_unsupported_guard_domain_is_refused_without_permission_changes(self):
         with self.assertRaisesRegex(SystemExit, 'outside the catalog'):
@@ -556,8 +670,8 @@ class Acting(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, 'alone; refused, no permission changed'):
             multiproject.guard({'os_user': os.getuid()})
         self.assertEqual((self.guard.stat().st_mode & 0o777, self.guard.stat().st_ino), (0o666, inode))
-        result = self.act([self.alpha, self.beta], self.catalog(self.alpha, self.beta, os_user=os.getuid() + 1))
-        self.assertEqual([project['status'] for project in result['projects']], ['refused', 'not_admitted'])
+        result = self.act([self.alpha, self.beta], self.catalog(self.alpha, self.beta, os_user=os.getuid() + 1, enroll=False))
+        self.assertEqual([project['status'] for project in result['projects']], ['refused', 'refused'])
         self.assertEqual(self.calls(), [])
 
     def test_one_entry_view_acts_like_the_same_project_in_a_larger_view(self):
@@ -604,7 +718,10 @@ def act_child():
         return found
 
     def rows():
-        return json.loads(agents.read_text())
+        try:
+            return json.loads(agents.read_text())
+        except ValueError:
+            return None
 
     def doctor(args):
         if settings().get('doctor'):
@@ -628,12 +745,19 @@ def act_child():
                                                'name': name, 'state': 'working', 'status': 'busy', 'pid': os.getpid()}]))
         return session
     core.api, multiproject.claude_rows, core.doctor, worker.claude_spawn = api, rows, doctor, spawn
-    core.claude_agents = lambda strict=False: {row['sessionId']: row for row in rows() if row.get('kind') == 'background'}
+    core.claude_agents = lambda strict=False: (None if strict else {}) if rows() is None else {
+        row['sessionId']: row for row in rows() if row.get('kind') == 'background'}
+    native = multiproject.native_pass
+
+    def logged(view, limits):
+        write('native', core.PROJECT_PATH, limits)
+        return native(view, limits)
+    multiproject.native_pass = logged
     sys.modules['taskq.cleanup'].scheduled = lambda args: write('cleanup')
     tick.timer = lambda install: write('timer', install)
     core.claude_stop = lambda session, remove=False: write('stop', session)
     core.claude_wake = lambda session, prompt, extra=None: write('wake', session)
-    multiproject.ACTOR, multiproject.OCCUPANCY = ACTOR, ACT + ['occupancy', '--occupancy']
+    multiproject.ACTOR, multiproject.OCCUPANCY, multiproject.CHECK = ACTOR, ACT + ['occupancy', '--occupancy'], CHECK
     write('start', os.getpid())
     multiproject.main(sys.argv[3:])
 

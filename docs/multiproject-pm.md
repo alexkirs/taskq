@@ -1,8 +1,9 @@
 # Multiproject observation and acting pass (#186, stages 2 and 3)
 
 Specifications: observation, [accepted Wiki 9ffd02dd](https://github.com/alexkirs/taskq/wiki/Multiproject-read-only-preparation/9ffd02dd07dbff81da333089613642c883bbcf6f);
-acting, [accepted Wiki dcc97303](https://github.com/alexkirs/taskq/wiki/Multiproject-acting-pass/dcc973038f3138dd8f83dabbcc98adf2a72b775e).
-The default observes and never acts. Acting needs `--act` and a separately reviewed execution policy ([§ Acting](#acting-stage-3)).
+acting, [accepted Wiki 5e238093](https://github.com/alexkirs/taskq/wiki/Multiproject-acting-pass/5e238093a26fc49ac0166079f0ded55ab9fc67b4)
+(the dcc97303 specification with its accepted v1 correction: explicit catalog enrollment and fail-closed admission).
+The default observes and never acts. Acting needs `--act` and an execution policy the owner enrolled explicitly ([§ Acting](#acting-stage-3)).
 
 ```
 python -m taskq.multiproject --manifest FILE --json
@@ -70,10 +71,11 @@ The parent revalidates every report with `validate_report`, so stale or invalid 
 ## Acting (stage 3)
 
 ```
+python -m taskq.multiproject --accept-execution-policy POLICY --json   # the owner's explicit enrollment or replacement
 python -m taskq.multiproject --manifest FILE --act --execution-policy POLICY --json
 ```
 
-The manifest stays the view: which projects to visit in this invocation, and their `filter`, `mine` and `limits`. A view confers nothing. Acting authority comes only from the execution policy, a second TOML file the owner writes and has reviewed. The adapter only reads both files. It writes no profile, policy, configuration or permission.
+The manifest stays the view: which projects to visit in this invocation, and their `filter`, `mine` and `limits`. A view confers nothing. Acting authority comes only from the execution policy, a second TOML file the owner writes, has reviewed and enrolls. The adapter never writes a profile, the policy file, a configuration or a permission. Its only write is the enrollment's small anchor ([§ Enrollment](#enrollment-and-the-catalog-anchor)).
 
 ### Execution policy
 
@@ -101,14 +103,30 @@ Identity fields are checked as in the manifest. A view entry is admitted only wh
 
 `effects` only narrows. The actor reads which native effects the project's own settings turn on: `queue` always (releases, unlocks, board and ready/waiting moves, reservation reconcile, Codex archive, nudges, retire, launches); `cleanup` when its `[cleanup]` is enabled; `idle_stop` when `[idle] stop` is not 0 (on the idle stop `tick --act` removes its launchd timer and runs idle cleanup). An effect the settings turn on and the binding does not list refuses the project before the native pass.
 
+### Enrollment and the catalog anchor
+
+The policy file alone is not an approved catalog. `--accept-execution-policy POLICY` is the owner's explicit enrollment; the first `--act` never enrolls. It holds the host guard for its whole run and starts no native tick or action:
+
+1. Load the policy; every binding must be valid.
+2. Check every binding in its own read-only subprocess, with the checkout as cwd: identity as in observation, `machine` and `principal`; for `act = true` bindings also the effects and `taskq doctor`.
+3. For a replacement, read back every binding of the previous anchor (step 3 of § Per project). Each must show no same-host claim, reservation or ownerless lock. The Claude and Codex inventories of every runtime the old catalog allowed must be readable and show no live session in an old checkout. A missing old checkout, unknown, unavailable or foreign ownership, or a failed read keeps the old anchor unchanged. Nothing is released, stolen or discovered; the candidate file or an empty inventory never settles an omitted grant.
+4. Write `multiproject-execution.json` beside the guard: version, generation (1, then +1 per replacement), the SHA-256 of the canonical catalog, the canonical catalog itself and who accepted it. The write is a draft in the same folder, fsync, rename, fsync of the folder. An identical catalog leaves it `unchanged`.
+
+The canonical catalog is every effective field: machine, OS user, caps and each binding's identity (host lower-cased, checkout resolved, timeout defaulted), principal, `act`, limits (0 filled in) and effects. Only the order of tables and of effects is ignored.
+
+`--act` refuses the whole invocation, before any actor starts, unless the anchor is valid and its catalog equals the policy file's. A changed binding, principal, selection, limit or effect therefore needs a replacement enrollment. An anchor that is unreadable, malformed, a symlink, of another owner, mode, version or OS user refuses `--act` and enrollment alike; it is never reset. A lost anchor stops all acting until the owner enrolls again.
+
+The anchor records the owner's execution selection and its version, nothing else. It is not evidence of ownership, readiness, UI approval, PM transport or a received/applied report. Doctor proves a local preflight only. Tracker ACL and assignee rules still apply. Parent #186's dependencies #185, #176 and #177, the actual project selection and live authorization remain external release gates.
+
 ### Per project
 
 Each view entry gets at most one attempt, serially, in manifest order. The wrapper first checks the binding, then checks that no actor holds the host guard. Then it starts the actor: `python -P -m taskq.multiproject --actor`, a subprocess in its own session with the checkout as cwd. Everything below happens in that one process:
 
 1. Lock the host guard and hold it until the process ends.
-2. Check identity as in observation. Check the policy's `machine` against this host and `principal` against the tracker's authenticated user; there is no delegation. Run `taskq doctor` read-only; a gap refuses. Refuse when `[update] auto` is due: its exec would end the guarded pass, so run `taskq update` there first. Check the effects.
-3. Read back the complete catalog, act = false bindings included, one read-only subprocess per binding: its same-host doing claims, reservations (with the session of their launch note, if any) and own tracker locks that no claim or reservation owns. Read the host's runtimes: every row of `claude agents --json --all` of any kind without a terminal state, and the Codex app server's running threads and `T<N>` worker threads.
-4. Compute the budget below and run the existing `tick --act --json` in this process, under its own checkout lock, with `--limit` set to it for every runtime.
+2. Check that the anchor still equals the policy. Check identity as in observation. Check the policy's `machine` against this host and `principal` against the tracker's authenticated user; there is no delegation. Run `taskq doctor` read-only; a gap refuses. Refuse when `[update] auto` is due: its exec would end the guarded pass, so run `taskq update` there first. Check the effects.
+3. Read back the complete anchored catalog, act = false bindings and bindings removed from the view included, one read-only subprocess per binding: identity and principal, then its same-host doing claims, reservations (with the session of their launch note, if any) and own tracker locks that no claim or reservation owns. Read the host's runtimes: every row of `claude agents --json --all` of any kind without a terminal state, and the Codex app server's running threads and `T<N>` worker threads.
+4. Refuse, before the native pass, when any catalog binding's readback failed, or when the inventory of a runtime this project may start (project limit > 0) or already holds (L > 0) is unknown. Zero limits are no protection: the native pass would still release, move and reconcile.
+5. Compute the budget below and run the existing `tick --act --json` in this process, under its own checkout lock, with `--limit` set to it for every runtime.
 
 The actor never takes, spawns or releases by itself. Only the native pass does, through #208 `reserve`, which rechecks the whole queue and room under the tracker lock.
 
@@ -121,7 +139,7 @@ For each runtime `r`:
 - L is exactly what native `core.room` subtracts for this project now: its same-host doing claims and reservations.
 - limit[r] = min(project limit[r], L + F). A runtime without a cap (a `[runtimes]` app) gets 0.
 
-An unreadable inventory makes F = 0 for its runtime. An unidentified live row (no session id and no pid) does the same. An unread catalog binding (refused identity, missing checkout, tracker failure) makes F = 0 for every runtime. The budget is recomputed for every project, after the previous project's actor ended.
+An unreadable inventory, or an unidentified live row (no session id and no pid), makes F = 0 for its runtime; for a runtime the project may start or holds, step 4 refuses before that matters. The budget is recomputed for every project, after the previous project's actor ended.
 
 ### Host guard
 
@@ -139,14 +157,14 @@ A restarted wrapper first meets the same guard: while an actor runs, nothing is 
 
 ### Results
 
-Statuses are `ok`, `judgement_needed` (native exit 1 with a valid report), `blocked` (report validation failed), `failed` (known native failure), `refused` (before any mutation), `unknown` (timeout, crash, unreadable output) and `not_admitted`. Each actor result keeps its guard (path, inode, domain), the budget per runtime, the catalog readback, the native outcome/actions/refusals and the native v1 report, revalidated by the wrapper. `received_applied` stays `unknown`.
+Statuses are `ok`, `judgement_needed` (native exit 1 with a valid report), `blocked` (report validation failed), `failed` (known native failure), `refused` (before any mutation: no anchor or a different one, binding, workflow, unknown ownership or inventory), `unknown` (timeout, crash, unreadable output) and `not_admitted`. Enrollment statuses are `enrolled`, `replaced`, `unchanged` and `refused`. Each actor result keeps its guard (path, inode, domain), the budget per runtime, the catalog readback, the native outcome/actions/refusals and the native v1 report, revalidated by the wrapper. `received_applied` stays `unknown`.
 
 ### Removing bindings
 
-Removing a view entry only stops admission; the catalog binding and its ownership still count. To retire a binding, set `act = false`. Wait until its readback shows no same-host claims, reservations or locks, then delete it. A binding deleted before that is no longer read. Its live sessions still count through the host runtime inventory, but its tracker-only grants (reservations without a worker, own locks) do not. That is the one case this stage cannot detect without a receipt store, which it does not add.
+Removing a view entry only stops admission; the anchored binding and its ownership are still read and counted. Deleting a binding from the policy file, or changing its principal or any other field, makes the file differ from the anchor: `--act` refuses until a replacement enrollment succeeds, and that needs every previously anchored binding settled (§ Enrollment, step 3). A hidden reservation or lock of a deleted binding therefore keeps the old anchor and blocks acting; it is never dropped from the count.
 
 ## Not here
 
-The manifest and execution policy are the only inputs; there is no database, queue, scheduler or receipt store. Removing a manifest entry stops future reads and admission and leaves the tracker's claims and ownership as they are. Single-project `tick` is unchanged.
+The manifest and execution policy are the only inputs, and the enrollment anchor is the only state: there is no database, job, queue, scheduler, replay, polling or receipt store. Removing a manifest entry stops future reads and admission and leaves the tracker's claims and ownership as they are. Single-project `tick` is unchanged.
 
-There is no timer, extra PM or live project activation. Parent #186 still depends on #185, #176 and #177, and live project selection is still open. Fixture tests prove behavior against fakes only: on-disk in-memory trackers, a file `claude agents` list and logged fake launches. They do not qualify live transport, approval, runtime launch or multiproject readiness.
+There is no timer, extra PM or live project activation. Parent #186 still depends on #185, #176 and #177, and live project selection is still open. Fixture tests prove behavior against fakes only: on-disk in-memory trackers, a file `claude agents` list and logged fake launches. They do not qualify live transport, approval, runtime launch or multiproject readiness. Present authorization covers this implementation and its isolated fixtures only: no real enrollment and no live acting pass.

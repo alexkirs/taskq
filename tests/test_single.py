@@ -694,6 +694,111 @@ class Contract(Base):
             self.assertEqual((clone / 'taskq.md').read_text(), 'local edit\n')
 
 
+class Cleanup(Base):
+    """#476: `taskq cleanup` on a temp git repo with an origin; #1 open, #2-#5 closed."""
+
+    def git(self, *argv, folder=None):
+        return REAL_RUN(['git', '-C', str(folder or self.root), '-c', 'user.name=t', '-c', 'user.email=t@t', *argv],
+                        check=True, capture_output=True, text=True).stdout
+
+    def commit(self, folder, name):
+        Path(folder, name).write_text(f'{name}\n')
+        self.git('add', name, folder=folder)
+        self.git('commit', '-qm', name, folder=folder)
+
+    def setUp(self):
+        super().setUp()
+        self.fake = FakeRuntime()
+        taskq.CONFIG.update(limits={'fake': 1}, repo='o/r')
+        for patcher in (mock.patch.object(taskq, 'runtimes', return_value={'fake': self.fake}),
+                        mock.patch.object(taskq, 'open_prs', return_value={'taskq-1': 11, 'taskq-9': 12}),
+                        mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN),
+                        mock.patch.dict(os.environ, {'PATH': os.defpath})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        origin = tempfile.TemporaryDirectory()
+        self.addCleanup(origin.cleanup)
+        self.git('init', '-q', '--bare', origin.name)
+        self.git('init', '-q', '-b', 'main')
+        self.commit(self.root, 'a')
+        self.git('remote', 'add', 'origin', origin.name)
+        self.git('push', '-q', '-u', 'origin', 'main')
+        for n in range(1, 6):
+            self.add(f't{n}')  # the add's pass spawns #1 into the one slot
+        tree = lambda n: self.root / '.worktrees' / f'taskq-{n}'
+        for n in (1, 2, 3, 4, 5):
+            self.git('worktree', 'add', '-q', '-b', f'taskq-{n}', str(tree(n)), 'origin/main')
+        self.commit(tree(2), 'b')  # merged: main fast-forwards to it
+        self.git('push', '-q', 'origin', 'taskq-2')
+        self.commit(tree(4), 'd')  # unmerged, on origin too
+        self.git('push', '-q', 'origin', 'taskq-4')
+        self.commit(tree(5), 'e')  # squash-merged: main has the same change in its own commit
+        (tree(3) / 'notes').write_text('work')  # dirty
+        for n in (4, 5):
+            self.git('worktree', 'remove', str(tree(n)))
+        self.git('merge', '-q', '--ff-only', 'taskq-2')
+        self.commit(self.root, 'e')
+        self.git('push', '-q', 'origin', 'main')
+        for n in (2, 3, 4, 5):
+            self.board.issues[n]['state'] = 'closed'
+        self.fake.sessions.update({'s-T1': False, 's-T2': True})  # #1's worker died; #2's still runs
+        (self.root / '.taskq' / 'S2.pid').write_text('999999999 old')
+        (self.root / '.taskq' / 'wait.json').write_text('{"1": "doing", "2": "review"}')
+
+    def state(self):
+        return (sorted(path.name for path in (self.root / '.worktrees').iterdir()),
+                self.git('for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes/origin/main', 'refs/remotes/origin/taskq-*').split(),
+                sorted(self.fake.sessions), sorted(path.name for path in (self.root / '.taskq').glob('*.pid')),
+                (self.root / '.taskq' / 'wait.json').read_text())
+
+    def cleanup(self, *argv):
+        return self.run_cli('cleanup', *argv).splitlines()
+
+    def test_removes_leftovers_keeps_work(self):
+        before = self.state()
+        dry = self.cleanup('--dry-run')
+        self.assertEqual(self.state(), before)  # --dry-run changes nothing
+        out = self.cleanup()
+        self.assertEqual(dry, [line.replace('removed', 'would remove', 1) for line in out])
+        self.assertEqual(out, [
+            'removed worktree .worktrees/taskq-2',
+            'removed branch taskq-2', 'removed branch taskq-5', 'removed remote branch origin/taskq-2',
+            'removed sessions of #2', 'removed .taskq/S2.pid', 'removed .taskq/wait.json entries #2',
+            'kept worktree .worktrees/taskq-1: open task', 'kept worktree .worktrees/taskq-3: dirty',
+            'kept branch taskq-1: open task', 'kept branch taskq-3: its worktree is kept',
+            'kept branch taskq-4: unmerged commits', 'kept remote branch origin/taskq-4: unmerged commits',
+            'mess: branch taskq-4: task #4 is not open', 'mess: remote branch origin/taskq-4: task #4 is not open',
+            'mess: #1 doing: session s-T1 is gone', 'mess: PR 12 (taskq-9): task #9 is not open'])
+        self.assertEqual(self.state(), (['taskq-1', 'taskq-3'], [
+            'refs/heads/main', 'refs/heads/taskq-1', 'refs/heads/taskq-3', 'refs/heads/taskq-4',
+            'refs/remotes/origin/main', 'refs/remotes/origin/taskq-4'], ['s-T1'], [], '{"1": "doing"}'))
+        after = self.state()
+        self.assertEqual(self.cleanup(), out[7:])  # a second run removes nothing, keeps and reports the same
+        self.assertEqual(self.state(), after)
+
+    def test_external_workspace_touches_no_worktree_or_branch(self):
+        taskq.CONFIG['workspace'] = 'external'  # #477
+        trees, refs = self.state()[:2]
+        self.assertIn('kept worktrees and branches: workspace is external (#477)', self.cleanup())
+        self.assertEqual(self.state()[:2], (trees, refs))
+
+    def test_old_session_names_and_review_without_pr(self):
+        claude = taskq.Claude()
+        claude.agents = lambda: {'a': {'id': 'ja', 'name': 'S2 supervisor', 'state': 'stopped'},
+                                 'b': {'id': 'jb', 'name': 'T3 old title', 'state': 'stopped'}}
+        taskq.CONFIG['publish'] = 'pr'
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'review', 'result', result={'sha': 'f' * 40})
+        with mock.patch.object(taskq, 'runtimes', return_value={'claude': claude}):
+            out = self.cleanup('--dry-run')
+        self.assertIn('would remove sessions of #2', out)
+        self.assertIn('would remove sessions of #3', out)
+        self.assertNotIn('mess: #1 review: no open PR', out)  # taskq-1 has PR 11
+        taskq.open_prs.return_value = {}
+        with mock.patch.object(taskq, 'runtimes', return_value={}):
+            self.assertIn('mess: #1 review: no open PR', self.cleanup('--dry-run'))
+
+
 class Model(Base):
     def test_block_keeps_unknown_keys(self):
         board = taskq.BOARD = FakeBoard()

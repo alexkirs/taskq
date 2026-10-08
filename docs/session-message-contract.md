@@ -53,7 +53,7 @@ Example:
 | DOT ↔ Codex | `taskq codex-send THREAD --text TEXT` | Codex thread; `codex-read` is diagnostic only | unqualified |
 | DOT ↔ Claude | configured runtime executor | runtime-supported readback; generic `taskq send --runtime claude` refuses | unqualified |
 | worker ↔ PM board | `claim`, `result`, `ask`, `answer`, issue notes | `taskq view IID --notes N` | authoring reproduction below; live route qualification incomplete |
-| PM report | #191 readback JSON | `taskq report-verify FILE` | schema/fixture only unless supported live evidence is supplied |
+| PM report | `taskq tick` R6 report (heading, Board link, Task / Status / Runtime / Session table, open questions) | the PM's reply to the owner | no receipt; unread is unknown (R12) |
 
 For every genuine qualification, keep the correlated harmless probe ID,
 source text, destination text, rendered text, route/session identities,

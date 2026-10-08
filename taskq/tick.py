@@ -506,13 +506,11 @@ def queue_pass(args):
             # release; its claim stays. Unknown (another machine, no CLI) is listed too: a listing has no effect.
             stuck.append((item, note))
         elif state == 'idle' and runtime == 'claude':
-            step(f'nudge idle Claude {core.ref(item)}', lambda session=session: core.claude_wake(session, NUDGE))
+            from taskq.runtimes import get
+            step(f'nudge idle Claude {core.ref(item)}', lambda session=session: get('claude').send(session, NUDGE))
         elif state == 'idle':
-            step(f'nudge idle Codex {core.ref(item)}', lambda item=item: core.codex_send(
-                argparse.Namespace(thread=session, text=NUDGE, full_access=item['full_access'])))
-        elif runtime in core.EXECUTORS and core.QUIET_MINUTES <= core.age(item) < core.QUIET_MINUTES + 5:
-            # An app without a status API: silence on the issue is the only sign its turn ended without a hand-in.
-            step(f'nudge quiet {core.ref(item)}', lambda item=item: core.executor_run(runtime, 'send', session=session, text=NUDGE))
+            from taskq.runtimes import get
+            step(f'nudge idle Codex {core.ref(item)}', lambda item=item: get('codex', full_access=item['full_access']).send(session, NUDGE))
     for item in supervise:
         step(f'wake the supervisor of {core.ref(item)}', lambda item=item: wake_supervisor(item))
     permissions = [item['_runtime_observation'] for item in workers if item.get('_runtime_observation', {}).get('status') == 'waiting_permission']

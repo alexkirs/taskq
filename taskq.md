@@ -5,7 +5,7 @@ This file is the whole contract, for every agent (manager or worker) on every ru
 Below, `taskq` means `python3 <taskq clone>/taskq.py` (or the alias of the README). Run it from the project's
 checkout: it reads the nearest `taskq.json` from the current directory up; that folder is the project root.
 
-## Principles (R1–R12)
+## Principles (R1–R13)
 
 The canonical rules of taskq (owner decision 2026-10-08, #242; restored by #311 after the single-file cutover #290
 dropped `taskq/contracts/principles.md`). The sections below are their mechanics and never restate them.
@@ -127,6 +127,26 @@ the id the board records, never by its name, never while it runs (#478).
 
 Report only what a fresh read proved. A delivery, exit code, checkout marker or chat turn is not proof of receipt,
 application or completion.
+
+### R13. Spec first
+
+Decisions live in this file, product ones too (§ Product), never only in chat (#505). A change that alters a decision
+edits this file first, in the same deliverable; code, README and pages follow it. A task that conflicts with a
+recorded decision is an `ask` with options, not an edit. Only the owner accepts a change of a decision here.
+Every agent (Claude, Codex, DOT, Hermes, other) reads this file before work; `AGENTS.md` and `CLAUDE.md` point here.
+
+## Product
+
+Owner decisions on what taskq looks and sounds like, one line each (#505). Change one only per R13.
+
+- README first screen: the header picture, the tagline, the 3 steps; nothing else, Tight style (#505, #27, #78).
+- Header: `docs/header.webp` with the caption `Agents working.` stays at the top, verbatim (#16; lost twice: #27, #33).
+- Tagline: a few short lines of what taskq is, above the steps, no jargon (#106, owner's variant 2).
+- Steps: set up, start working, talk to the manager; phrases the owner tells the agent (#78, variant A; #27, #33).
+- Setup phrase names the source: "Install taskq from https://github.com/alexkirs/taskq and set it up…" (#33).
+- Formatting: a few unicode icons where they help scanning; no emoji clutter, no badges (#134).
+- Last README line: the donate sentence, `If taskq saves you time, [buy me a coffee](…).` (#99).
+- Tone of texts: minimum words, plain to anyone, no filler; R7 style (#17, #27, #205, #206).
 
 ## 1. Setup (once per project)
 
@@ -278,7 +298,9 @@ runs `taskq take N` first.
 
 Rules:
 
-1. Read the whole issue, comments included: an earlier worker, an answer or a requeue reason may be there.
+1. Read `taskq.md` first and do only what it allows (R13); a task that conflicts with a recorded decision is an
+   `ask` with options. Then read the whole issue, comments included: an earlier worker, an answer or a requeue
+   reason may be there.
 2. Start every shell command with `export TASKQ_TASK=<N> TASKQ_RUNTIME=<runtime> &&` (PowerShell:
    `$env:TASKQ_TASK=<N>; $env:TASKQ_RUNTIME=<runtime>;`).
 3. Workspace: from the project root run
@@ -405,7 +427,8 @@ Changed: the manager relayed each `ask` comment verbatim → the `Decisions` blo
   reply: `taskq answer N --text "<verbatim answer>"`. The task goes back to `doing`; a finished worker is requeued by
   the next tick and a new worker continues branch `taskq-<N>`; a live one gets it from the next tick.
 - `review`: check the result.
-  1. `git show <sha> --stat`, then the diff, against every Acceptance item (`pr` mode: the PR diff).
+  1. `git show <sha> --stat`, then the diff, against every Acceptance item and against `taskq.md` (R13: a diff
+     that breaks a recorded decision without editing it is not accepted) (`pr` mode: the PR diff).
   2. A commit: CI on that exact SHA is green (an answer on `origin/main` needs no CI check): `gh run list --commit <sha>` / `glab api "projects/:id/pipelines?sha=<sha>"`, where the project
      has CI.
   3. Accepted: `taskq close N --text "<what was checked, what was not>"`.
@@ -445,7 +468,7 @@ their source, and missing deps.
 
 Below it: `Searched: N open tasks, bodies of #a #b.` The owner answers in one message: `1 no, 2 yes priority 1`.
 
-Override: R1–R12 never yield. The owner's words in the session ("file it now, no card") win for that message or
+Override: R1–R13 never yield. The owner's words in the session ("file it now, no card") win for that message or
 session. taskq has no local preference store: a lasting change is an owner edit of this section.
 
 ### File a task

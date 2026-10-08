@@ -733,6 +733,7 @@ def brief(item, runtime):
         if CONFIG.get('workspace') == 'external' else f'from {root} run `git fetch origin && git worktree add -b taskq-{n} .worktrees/taskq-{n} origin/main`, work only there,\nnever in the main checkout'
     return f'''You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
 Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
+Read `{Path(__file__).resolve().with_name("taskq.md")}` first and do only what it allows (R13): a task that conflicts with a recorded decision is an ask with options, not an edit.
 
 {item["text"]}
 

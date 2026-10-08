@@ -394,14 +394,28 @@ def recover_closed(issue):
         agent = agents.get(session) if agents is not None else None
         if not (isinstance(agent, dict) and agent.get('sessionId') == session and agent.get('kind') == 'background'
                 and agent.get('cwd') == str(core.ROOT) and agent.get('state') in CLAUDE_ENDED
-                and agent.get('status') != 'busy' and agent.get('pid') is None):
+                and agent.get('status') in (None, 'idle') and agent.get('pid') is None):
             return
     elif runtime == 'codex':
         if not core.codex_is_archived(session):
             return
     else:
         return
-    retire_local(current)
+    fresh = core.api('GET', f'issues/{current["iid"]}')
+    if fresh['state'] == 'opened':
+        return
+    labels = [label for label in fresh['labels'] if not label.startswith(core.PREFIX)] + [core.PREFIX + core.STATES[0]]
+    fresh = core.parse({**fresh, 'labels': labels})
+    if not fresh or fresh['claim'] != current['claim'] or fresh['result'] != current['result'] or not core.local_claim(fresh['claim'] or {}):
+        return
+    latest = next((body.rsplit('`', 2)[1] for body in reversed(core.notes(core.comments(fresh['iid'])))
+                   if body.startswith('**close**') and '\n\nTaskQ receipt: `' in body), None)
+    try:
+        if json.loads(latest) != {'claim': fresh['claim'], 'result': fresh['result']}:
+            return
+    except (TypeError, ValueError):
+        return
+    retire_local(fresh)
 
 
 def publish_review(current, sha):

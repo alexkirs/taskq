@@ -169,13 +169,15 @@ class PullRequests(Base):
         self.run_cli('take', '1')
         self.run_cli('result', '1', '--sha', 'a' * 40)
         self.calls, self.prs, self.merged = [], [{'number': 7, 'headRefOid': 'a' * 40, 'baseRefName': 'main'}], True
+        self.made = {'parents': [{'sha': 'a' * 40}, {'sha': 'e' * 40}], 'committer': {'login': 'web-flow'}, 'commit': {'verification': {'verified': True}}}
         self.behind, self.updated, self.checks = 0, True, {'a' * 40: [[('completed', 'success')]], 'd' * 40: [[('completed', 'success')]]}
 
     def cli(self, command, **_):
         self.calls.append(command[1:])
         if command[1] == 'api':  # the 'tests' gate (#308): compare, the PR head, check runs per SHA
             path, head = command[4], 'd' * 40 if ['pr', 'update-branch', '7', '-R', 'o/r'] in self.calls and self.updated else 'a' * 40
-            out = {'behind_by': self.behind} if '/compare/' in path else {'head': {'sha': head}} if '/pulls/' in path else \
+            out = {'behind_by': self.behind * path.endswith('...' + 'a' * 40)} if '/compare/' in path else {'head': {'sha': head}} if '/pulls/' in path \
+                else self.made if path.endswith('/commits/' + 'd' * 40) else \
                 {'check_runs': [{'status': status, 'conclusion': conclusion} for status, conclusion in self.poll(path.split('/')[4])]}
             return subprocess.CompletedProcess(command, 0, json.dumps(out), '')
         if command[2] == 'update-branch':
@@ -243,6 +245,12 @@ class PullRequests(Base):
     def test_out_of_date_new_head_fails_tests(self):
         self.behind, self.checks['d' * 40] = 1, [[('completed', 'failure')]]
         with self.assertRaisesRegex(SystemExit, 'check tests failed'):
+            self.close()
+        self.assertEqual((self.task(1)['state'], self.merges()), ('ready', []))
+
+    def test_out_of_date_new_head_must_be_githubs_update(self):
+        self.behind, self.made['parents'][0]['sha'] = 1, 'f' * 40  # a push between the update and the read
+        with self.assertRaisesRegex(SystemExit, f'new head {"d" * 40} is not the update of {"a" * 40} with main'):
             self.close()
         self.assertEqual((self.task(1)['state'], self.merges()), ('ready', []))
 

@@ -393,6 +393,11 @@ def merge(current, sha):
                 time.sleep(CHECK_PAUSE)
             else:
                 back('did not update: head unchanged')
+            made = api(f'commits/{head}')  # pin: GitHub's merge of the result and main, nothing pushed in between
+            parents = [parent['sha'] for parent in made['parents']]
+            if not (len(parents) == 2 and parents[0] == sha and (made['committer'] or {}).get('login') == 'web-flow'
+                    and made['commit']['verification']['verified'] and api(f'compare/{parents[1]}...main')['behind_by'] == 0):
+                back(f'new head {head} is not the update of {sha} with main')
         for _ in range(CHECK_POLLS):  # ponytail: fixed poll; tests.yml takes 8-13 s
             runs = api(f'commits/{head}/check-runs?check_name=tests')['check_runs']
             if runs and all(run['status'] == 'completed' for run in runs):

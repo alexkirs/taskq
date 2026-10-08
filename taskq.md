@@ -156,7 +156,7 @@ Rules:
   a head that differs from the result SHA, or several PRs, refuses the close.
 - `pr` mode on GitHub (#308): `main` requires the `tests` check (`.github/workflows/tests.yml`), strict: the
   branch must be up to date. `close` merges only a head with `tests` green. A PR behind `main` is updated
-  (`gh pr update-branch`), `tests` runs on the new head, and `close` merges at that new head. A conflict, a failed
+  (`gh pr update-branch`), `tests` runs on the new head, and `close` merges at that new head. The new head must be GitHub's merge of the result SHA and `main` (`web-flow`, verified); a push in between sends the task back. A conflict, a failed
   `tests`, or no result within 10 min sends the task back to `ready`. Set the rule once (repo admin):
 
   ```sh

@@ -345,6 +345,17 @@ class Tick(Base):
         self.run_cli('tick')
         self.assertEqual((self.task(1)['state'], len(self.fake.sent)), ('doing', 1))
 
+    def test_answer_reaches_the_asking_worker_once(self):
+        self.add()
+        self.run_cli('tick')
+        self.board.issues[1]['updated_at'] = taskq.datetime.now(taskq.timezone.utc).isoformat()
+        self.run_cli('ask', '1', '--text', 'which?')
+        self.run_cli('answer', '1', '--text', 'the first')
+        self.run_cli('tick')
+        self.run_cli('tick')
+        self.assertEqual(self.fake.sent, [('s-T1', 'The owner answered your question:\n\nthe first')])
+        self.assertEqual(self.task(1)['state'], 'doing')
+
     def test_waiting_becomes_ready_and_runs(self):
         self.add('one')
         self.add('two', '--deps', '1')

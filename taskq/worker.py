@@ -401,6 +401,8 @@ def recover_closed(issue):
             return
     else:
         return
+    latest = next((body.rsplit('`', 2)[1] for body in reversed(core.notes(core.comments(current['iid'])))
+                   if body.startswith('**close**') and '\n\nTaskQ receipt: `' in body), None)
     fresh = core.api('GET', f'issues/{current["iid"]}')
     if fresh['state'] == 'opened':
         return
@@ -408,8 +410,6 @@ def recover_closed(issue):
     fresh = core.parse({**fresh, 'labels': labels})
     if not fresh or fresh['claim'] != current['claim'] or fresh['result'] != current['result'] or not core.local_claim(fresh['claim'] or {}):
         return
-    latest = next((body.rsplit('`', 2)[1] for body in reversed(core.notes(core.comments(fresh['iid'])))
-                   if body.startswith('**close**') and '\n\nTaskQ receipt: `' in body), None)
     try:
         if json.loads(latest) != {'claim': fresh['claim'], 'result': fresh['result']}:
             return

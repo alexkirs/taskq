@@ -373,7 +373,7 @@ def commit(sha):
 
 def merge(current, sha):
     """pr mode: squash-merge the one open PR/MR of branch taskq-<N> into main at the result SHA: the merge commit, None with no PR.
-    GitHub (#308): a PR behind main is updated first; it merges only once the 'tests' check passes on the head it merges.
+    GitHub (#359): it merges only once the 'tests' check passes on the PR head; a PR behind main is not updated.
     A PR that does not merge (conflict, failing checks) goes back to the worker: requeue with the platform's message."""
     lab, host, branch = CONFIG['board'] == 'gitlab', CONFIG.get('host'), f'taskq-{current["iid"]}'
     where = ['-R', (f'https://{host}/' if lab else f'{host}/') * bool(host) + CONFIG['repo']]  # gh takes HOST/OWNER/REPO, glab a URL
@@ -391,22 +391,8 @@ def merge(current, sha):
     def back(why):
         move(current, 'ready', 'requeue', f'close: PR {number} {why}', claim=None, result=None)
         fail(f'#{current["iid"]}: PR {number} {why}')
-    if not lab:  # #308: main requires a strict 'tests' check; merge only a head that is up to date and green
+    if not lab:  # #359: main requires 'tests' on the PR head only (not strict); a behind PR merges as is, GitHub refuses a conflict
         api = lambda path: run_api('gh', host, 'GET', f'repos/{CONFIG["repo"]}/{path}')
-        if api(f'compare/main...{head}')['behind_by']:
-            code, out = cli('gh', 'pr', 'update-branch', number)
-            code and back(f'did not update: {out}')
-            for _ in range(CHECK_POLLS):  # the update is async: wait for the new head
-                if (head := api(f'pulls/{number}')['head']['sha']) != sha:
-                    break
-                time.sleep(CHECK_PAUSE)
-            else:
-                back('did not update: head unchanged')
-            made = api(f'commits/{head}')  # pin: GitHub's merge of the result and main, nothing pushed in between
-            parents = [parent['sha'] for parent in made['parents']]
-            if not (len(parents) == 2 and parents[0] == sha and (made['committer'] or {}).get('login') == 'web-flow'
-                    and made['commit']['verification']['verified'] and api(f'compare/{parents[1]}...main')['behind_by'] == 0):
-                back(f'new head {head} is not the update of {sha} with main')
         for _ in range(CHECK_POLLS):  # ponytail: fixed poll; tests.yml takes 8-13 s
             runs = api(f'commits/{head}/check-runs?check_name=tests')['check_runs']
             if runs and all(run['status'] == 'completed' for run in runs):
@@ -441,7 +427,7 @@ def cleanup(current):
     return ''
 
 def cmd_close(args):
-    """close N [M ...]: in order; each PR is updated only if behind (#334). A failed task does not stop the rest."""
+    """close N [M ...]: in order; no PR is updated (#359). A failed task does not stop the rest."""
     failed = []
     for n in args.n:
         try:

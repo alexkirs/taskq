@@ -40,6 +40,19 @@ def auto_update():
         os.execv(sys.executable, [sys.executable, '-m', 'taskq', *sys.argv[1:]])
 
 
+def contract_news():
+    """Name a package or coordinator-contract change once per checkout before the pass."""
+    seen = core.TICK_BEAT.with_name('taskq-contract-seen')
+    files = (core.CONTRACTS / 'principles.md', core.CONTRACTS / 'taskq-manager.md')
+    new = hashlib.sha256(core.version().encode() + b''.join(path.read_bytes() for path in files)).hexdigest()[:7]
+    old = seen.read_text().strip() if seen.exists() else ''
+    if old != new:
+        seen.parent.mkdir(parents=True, exist_ok=True)
+        seen.write_text(new + '\n')
+        print(f'TaskQ package or contracts changed since your last tick ({old or "none"}→{new}): re-read '
+              f'{files[0]} and {files[1]} before this pass.')
+
+
 def question(iid):
     """The latest question of an `ask` task, when `tick` last showed it (None: not yet) and the trusted notes it was
     read from, newest first (#223: the pending line is made from that same read, so the text shown and the revision
@@ -715,6 +728,7 @@ def queue_pass(args, act=False):
             failed.append(f'{what}: {core.codex_line(str(error))}')
             core.record(args, what.split()[0], detail=what, status='failed', reason=str(error), task=(item or {}).get('iid'))
     auto_update()
+    contract_news()
     print(f'taskq {core.version()}')
     if warning := clone_warning():
         print(warning)

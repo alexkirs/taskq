@@ -821,7 +821,7 @@ from taskq.doctor import (  # noqa: E402
     tree_gaps, profile_init, runtime_gaps, write_access, queue_labels_missing, board_gaps, report_gaps,
     PERMISSION_MODE, WORKER_ALLOW, permissions_missing, permissions_gap, trusted, setup, migrate, windows_claude_binary, pref)
 from taskq.tick import (  # noqa: E402
-    clone_warning, auto_update, question, report_bootstrap, verify_report, profile_arguments, BOARD_MOVES, board_fix, board_moves, session_link,
+    clone_warning, auto_update, contract_news, question, report_bootstrap, verify_report, profile_arguments, BOARD_MOVES, board_fix, board_moves, session_link,
     inbox_line, tick)
 from taskq.worker import (  # noqa: E402
     BRIEF, DELIVER, need_owner, doing_since, add, edit, later, listing, set_runtime, brief, worker, supervise, take, beat, ask,

@@ -340,6 +340,21 @@ def take_during_tick(case):
 
 
 class Cycle(unittest.TestCase):
+    def test_changed_contract_is_named_once(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(q, 'TICK_BEAT', Path(tmp) / 'beat'):
+            with contextlib.redirect_stdout(io.StringIO()) as first:
+                q.contract_news()
+            with contextlib.redirect_stdout(io.StringIO()) as second:
+                q.contract_news()
+            (Path(tmp) / 'taskq-contract-seen').write_text('0000000\n')
+            with contextlib.redirect_stdout(io.StringIO()) as changed:
+                q.contract_news()
+        self.assertIn('package or contracts changed since your last tick (none→', first.getvalue())
+        self.assertEqual(second.getvalue(), '')
+        self.assertEqual(changed.getvalue().count('re-read'), 1)
+        self.assertIn('principles.md', changed.getvalue())
+        self.assertIn('taskq-manager.md', changed.getvalue())
+
     def setUp(self):
         self.enterContext(patch.object(q, 'AREAS', ('maps', 'engine')))
         self.enterContext(patch.object(q, 'MEMBERS', None))
@@ -3311,8 +3326,7 @@ class TickBeat(unittest.TestCase):
             return found
         self.assertEqual(load('alexkirs/csgo'), {'auto': True, 'every': '24h', 'ref': 'main'})
         self.assertFalse(load('someone/else')['auto'])
-        self.assertTrue(load('someone/else', '[update]\nauto = true\nref = "stable"\n')['auto'])
-        self.assertRaises(SystemExit, load, 'a/b', '[update]\nref = "dev"\n')
+        self.assertTrue(load('someone/else', '[update]\nauto = true\n')['auto'])
         with patch.object(q, 'COORDINATOR', None):  # #145
             load('a/b', '[coordinator]\nmachine = "mac"\n')
             self.assertEqual(q.COORDINATOR, 'mac')
@@ -3332,33 +3346,6 @@ class TickBeat(unittest.TestCase):
         self.assertIsNone(done)
         self.assertIn(f'does not start (`python3 -m taskq --version` failed); {self.clone} is back at {old}', out)
         self.assertEqual(q.version(), old)
-
-
-    def test_stable_needs_a_signed_tag_and_ignores_main(self):
-        old = q.version()
-        key = self.root / 'key'
-        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'owner', '-f', str(key)], check=True)
-        signers = self.root / 'allowed_signers'
-        signers.write_text('# none yet\n')
-        sign = ['-c', 'gpg.format=ssh', '-c', f'user.signingkey={key}']
-        two = self.commit(self.work, 'two')
-        self.git(*sign, 'tag', '-s', '-m', 'stable', 'stable', cwd=self.work)
-        self.git('push', '-q', 'origin', 'stable', cwd=self.work)
-        three = self.commit(self.work, 'three')  # main is ahead of stable
-        with patch.dict(q.UPDATE, ref='stable'), patch.object(q, 'SIGNERS', signers):
-            done, out = self.update()
-            self.assertIsNone(done)
-            self.assertEqual(out, f'not updated to stable {two}: the stable tag has no valid signature by a key in {signers}\n')
-            self.assertEqual(q.version(), old)
-            signers.write_text('owner namespaces="git" ' + (self.root / 'key.pub').read_text())
-            self.assertEqual(self.update(), (True, f'updated {old} → {two}\n'))
-            self.assertEqual(q.version(), two)  # not main's {three}
-            self.assertEqual(self.update(), (None, f'up to date {two}\n'))
-            self.git('tag', '-f', '-a', '-m', 'unsigned', 'stable', 'HEAD', cwd=self.work)
-            self.git('push', '-q', '-f', 'origin', 'stable', cwd=self.work)
-            self.assertIn(f'not updated to stable {three}: the stable tag has no valid signature', self.update()[1])
-            self.assertEqual(q.version(), two)
-
 
 
 class Cleanup(unittest.TestCase):

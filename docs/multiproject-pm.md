@@ -139,7 +139,7 @@ The actor never takes, spawns or releases by itself. Only the native pass does, 
 
 For each runtime `r`:
 
-- occupancy is the number of distinct identities across host and catalog. Two grants count once only when they name the same exact session. A reservation without a launch session, an ownerless lock and a pid-only row each count separately.
+- occupancy is the number of distinct identities across host and catalog. Two grants count once only when they name the same exact session. A reservation without a launch session, an ownerless lock and a pid-only row each count separately. A retained Codex claim in `review`, `ask` or `later` is excluded only when a fresh supported `thread/read` proves the exact session is archived and its executor status is `idle`, `notLoaded` or `systemError`; actual unarchived inventory for that session wins, and a reservation still counts. Claude has no equivalent supported archive proof, so its retained claims stay counted. Missing, stale, malformed or mismatched evidence stays counted.
 - F = max(0, cap[r] - occupancy).
 - L is exactly what native `core.room` subtracts for this project now: its same-host doing claims and reservations.
 - limit[r] = min(project limit[r], L + F). A runtime without a cap (a `[runtimes]` app) gets 0.

@@ -438,6 +438,42 @@ class Acting(unittest.TestCase):
         small = multiproject.budget(caps, {'claude': {'session:s1'}, 'codex': set()}, [own], own, {'claude': 3, 'codex': 2})
         self.assertEqual((small['claude']['F'], small['claude']['limit'], small['codex']['F'], small['codex']['limit']), (5, 3, 3, 2))
 
+    def test_archived_codex_claim_keeps_ownership_but_frees_only_proven_inactive_budget(self):
+        archived = {'status': 'ok', 'L': {'claude': 0, 'codex': 0}, 'uncertain': [],
+                    'held': [(['codex'], 'session:191')], 'inactive': ['session:191'], 'reserved': []}
+        caps, live = {'claude': 8, 'codex': 4}, {'claude': set(), 'codex': {'session:a', 'session:b', 'session:c'}}
+        found = multiproject.budget(caps, live, [archived], archived, {'codex': 4})
+        self.assertEqual((archived['held'], found['codex']['occupancy'], found['codex']['F']),
+                         ([(['codex'], 'session:191')], 3, 1))
+        # A resumed or live exact session wins over its archive readback; a reservation remains retained too.
+        live['codex'].add('session:191')
+        self.assertEqual(multiproject.budget(caps, live, [archived], archived, {'codex': 4})['codex']['F'], 0)
+        live['codex'].remove('session:191')
+        archived['reserved'] = ['session:191']
+        self.assertEqual(multiproject.budget(caps, live, [archived], archived, {'codex': 4})['codex']['F'], 0)
+
+    def test_codex_archive_proof_requires_exact_archived_inactive_thread(self):
+        case = self
+
+        class Codex:
+            socket = type('Socket', (), {'close': lambda self: None})()
+
+            def __init__(self, thread):
+                self.thread = thread
+
+            def call(self, method, params):
+                case.assertEqual((method, params), ('thread/read', {'threadId': '191'}))
+                return {'thread': self.thread}
+
+        good = {'id': '191', 'path': '/x/archived_sessions/191.jsonl', 'status': {'type': 'idle'}}
+        for thread, expected in ((good, True), ({**good, 'id': 'old'}, False),
+                                 ({**good, 'status': {'type': 'active'}}, False),
+                                 ({**good, 'path': '/x/sessions/191.jsonl'}, False)):
+            with self.subTest(thread=thread), patch.object(core, 'Codex', lambda: Codex(thread)):
+                self.assertIs(multiproject.codex_archived_inactive('191'), expected)
+        with patch.object(core, 'Codex', side_effect=OSError('unavailable')):
+            self.assertFalse(multiproject.codex_archived_inactive('191'))
+
     def test_removed_view_reads_the_old_anchored_binding(self):
         claim = lambda session: {'claim': {'runtime': 'claude', 'session': session, 'node': self.node('gone')}}  # noqa: E731
         gone = self.project('gone', 44, tasks=[(1, 'doing', 'claude', claim('s-1')), (2, 'doing', 'claude', claim('s-2')),
@@ -1109,7 +1145,8 @@ class Acting(unittest.TestCase):
     def test_over_cap_refuses_before_native_pass_for_either_runtime_with_L(self):
         policy = self.catalog({**self.alpha, 'limits': {'claude': 2, 'codex': 2}}, caps={'claude': 2, 'codex': 2})
         for runtime in multiproject.CAPS:
-            read = {'status': 'ok', 'held': [([runtime], 'session:a')], 'uncertain': [], 'L': {'claude': 0, 'codex': 0, runtime: 1}}
+            read = {'status': 'ok', 'held': [([runtime], 'session:a')], 'inactive': [], 'reserved': [], 'uncertain': [],
+                    'L': {'claude': 0, 'codex': 0, runtime: 1}}
             live = ['a', 'b', 'c']
             rows = [{'sessionId': session, 'state': 'working'} for session in live] if runtime == 'claude' else []
             threads = [{'id': session, 'status': {'type': 'active'}} for session in live] if runtime == 'codex' else []

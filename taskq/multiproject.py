@@ -23,6 +23,7 @@ import tomllib
 
 import taskq as core
 from taskq.worker import CLAUDE_ENDED
+from taskq.codex import codex_archived
 
 tick, worker = sys.modules['taskq.tick'], sys.modules['taskq.worker']
 
@@ -442,6 +443,23 @@ def codex_inventory(threads):
     return found
 
 
+CODEX_INACTIVE = {'idle', 'notLoaded', 'systemError'}
+
+
+def codex_archived_inactive(session):
+    """Fresh supported proof that this exact retained Codex worker is archived and cannot execute. Unknown stays false."""
+    try:
+        codex = core.Codex()
+        try:
+            thread = codex.call('thread/read', {'threadId': session})['thread']
+        finally:
+            codex.socket.close()
+        return (isinstance(thread, dict) and thread.get('id') == session and codex_archived(thread)
+                and (thread.get('status') or {}).get('type') in CODEX_INACTIVE)
+    except (OSError, SystemExit, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
 def locality(owner):
     """Where a claim or reservation lives: 'local', 'remote' (a well-formed node or pre-#39 host of another
     machine) or None, unknown: a malformed node or host, or neither and no local app evidence (`local_claim`)."""
@@ -461,7 +479,7 @@ def occupancy(entry):
     if (uid := core.user()) != entry['principal']:
         return {'status': 'refused', 'errors': [f'the tracker principal is {uid}, the catalog binds {entry["principal"]}']}
     everything, where = core.load()[0], repository_url(entry)
-    held, uncertain = [], []  # known grants (runtimes, identity); ownership without proof, which refuses acting
+    held, inactive, reserved, uncertain = [], [], set(), []  # inactive is budget-only; ownership always remains held
     for item in everything:
         claim, found, task = item['claim'] or {}, item.get('reservation') or {}, f'{where}#{item["iid"]}'
         # Any state: a review, ask, ready or later claim still names its worker; an empty inventory never settles it.
@@ -472,7 +490,11 @@ def occupancy(entry):
                              f'host {claim.get("host")!r})')
         elif place == 'local':
             if claim.get('runtime') in CAPS and isinstance(claim.get('session'), str) and claim['session']:
-                held.append(([claim['runtime']], f'session:{claim["session"]}'))
+                identity = f'session:{claim["session"]}'
+                held.append(([claim['runtime']], identity))
+                if (item['state'] in ('review', 'ask', 'later') and claim['runtime'] == 'codex'
+                        and codex_archived_inactive(claim['session'])):
+                    inactive.append(identity)
             else:
                 uncertain.append(f'{task}: same-host claim of runtime {claim.get("runtime")!r}, session {claim.get("session")!r}')
         place = locality(found) if item.get('reservation') is not None else 'none'
@@ -484,13 +506,16 @@ def occupancy(entry):
                 uncertain.append(f'{task}: reservation {found.get("attempt")!r} of runtime {found.get("runtime")!r}, principal '
                                  f'{found.get("principal")!r}, pid {found.get("pid")!r}: its owner or launch is unproven')
             else:  # a launch with its session, or with its launching process that native reconcile can settle
-                held.append(([found['runtime']], f'session:{session}' if session else f'reservation:{task}:{found.get("attempt")}'))
+                identity = f'session:{session}' if session else f'reservation:{task}:{found.get("attempt")}'
+                held.append(([found['runtime']], identity))
+                reserved.add(identity)
     owned = {item['iid'] for item in everything if (item['claim'] or {}).get('session') or item.get('reservation')}
     for issue in core.issues(f'state=opened&my_reaction_emoji={core.LOCK}'):
         if issue['iid'] not in owned:  # a take or launch between its lock and its write, or one that died there
             uncertain.append(f'{where}#{issue["iid"]}: tracker lock without a claim or reservation')
     taken = core.room(everything, dict.fromkeys(core.RUNTIMES, 0))
-    return {'status': 'ok', 'L': {runtime: -count for runtime, count in taken.items()}, 'held': held, 'uncertain': uncertain}
+    return {'status': 'ok', 'L': {runtime: -count for runtime, count in taken.items()}, 'held': held, 'inactive': inactive,
+            'reserved': sorted(reserved), 'uncertain': uncertain}
 
 
 def checked_read(found):
@@ -498,11 +523,13 @@ def checked_read(found):
     try:
         if found['status'] in ('refused', 'failed') and all(isinstance(error, str) for error in found['errors']):
             return found
-        valid = (found['status'] == 'ok' and set(found) == {'status', 'L', 'held', 'uncertain'}
+        valid = (found['status'] == 'ok' and set(found) == {'status', 'L', 'held', 'inactive', 'reserved', 'uncertain'}
                  and all(isinstance(runtime, str) and type(count) is int and count >= 0 for runtime, count in found['L'].items())
                  and all(len(pair) == 2 and isinstance(pair[0], list) and pair[0] and all(runtime in CAPS for runtime in pair[0])
                          and isinstance(pair[1], str) and pair[1].startswith(('session:', 'reservation:')) for pair in found['held'])
                  and isinstance(found['held'], list) and isinstance(found['uncertain'], list)
+                 and all(isinstance(identity, str) and identity.startswith('session:') for identity in found['inactive'])
+                 and all(isinstance(identity, str) and identity.startswith(('session:', 'reservation:')) for identity in found['reserved'])
                  and all(isinstance(reason, str) for reason in found['uncertain']))
     except (KeyError, TypeError, AttributeError):
         valid = False
@@ -533,8 +560,12 @@ def budget(caps, inventory, reads, own, limits):
     found = {}
     for runtime, cap in caps.items():
         known = complete and inventory.get(runtime) is not None
-        held = set(inventory.get(runtime) or ()) | {identity for read in reads if read['status'] == 'ok'
-                                                    for runtimes, identity in read['held'] if runtime in runtimes}
+        live = set(inventory.get(runtime) or ())
+        held = live | {identity for read in reads if read['status'] == 'ok'
+                       for runtimes, identity in read['held'] if runtime in runtimes}
+        inactive = {identity for read in reads if read['status'] == 'ok' for identity in read.get('inactive', ())}
+        reserved = {identity for read in reads if read['status'] == 'ok' for identity in read.get('reserved', ())}
+        held -= inactive - live - reserved
         free = max(0, cap - len(held)) if known else 0
         local = own['L'].get(runtime, 0)
         found[runtime] = {'cap': cap, 'occupancy': len(held), 'known': known, 'F': free, 'L': local,

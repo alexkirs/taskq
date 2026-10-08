@@ -704,7 +704,7 @@ def refresh():
         git = [shutil.which('git') or 'git', '-C', str(CLONE)]
         status = subprocess.run([*git, 'status', '--porcelain', '--untracked-files=no'], capture_output=True, text=True, encoding='utf-8')
         if not status.returncode and not status.stdout.strip():
-            pulled = subprocess.run([*git, 'pull', '--ff-only', '-q'], capture_output=True, text=True, encoding='utf-8')
+            pulled = subprocess.run([*git, 'pull', '--ff-only', '-q', 'origin', 'main'], capture_output=True, text=True, encoding='utf-8')  # explicit: a fetch of task branches leaves FETCH_HEAD with several
             if pulled.returncode:
                 print(f'taskq: git pull --ff-only failed: {last_line(pulled.stderr + pulled.stdout)}', file=sys.stderr)
     path = CONFIG['root'] / '.taskq' / 'pm.json'

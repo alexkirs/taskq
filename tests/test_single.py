@@ -202,11 +202,14 @@ class PullRequests(Base):
 
     def cli(self, command, **_):
         self.calls.append(command[1:])
+        if command[1] == 'api' and 'merge_requests' in command[4]:  # the GitLab gate (#479): the MR's pipelines, newest first
+            return subprocess.CompletedProcess(command, 0, json.dumps([{'sha': sha, 'status': status} for sha, status in self.poll('mr')]), '')
         if command[1] == 'api':  # the 'tests' gate (#308): check runs per SHA
             out = {'check_runs': [{'status': status, 'conclusion': conclusion} for status, conclusion in self.poll(command[4].split('/')[4])]}
             return subprocess.CompletedProcess(command, 0, json.dumps(out), '')
         verb = command[2]
-        out = {'list': json.dumps(self.branches.get(command[4], self.prs)), 'view': json.dumps({'state': 'MERGED' if self.merged else 'OPEN', 'mergeCommit': {'oid': 'c' * 40}})}
+        view = {'state': 'merged', 'squash_commit_sha': 'd' * 40} if command[1] == 'mr' else {'state': 'MERGED', 'mergeCommit': {'oid': 'c' * 40}}
+        out = {'list': json.dumps(self.branches.get(command[4], self.prs)), 'view': json.dumps(view if self.merged else {'state': 'OPEN'})}
         return subprocess.CompletedProcess(command, int(verb == 'merge' and not self.merged), out.get(verb, ''), 'Pull request is not mergeable')
 
     def poll(self, sha):  # one poll of the check runs on sha: the polls in order, the last one repeats
@@ -298,11 +301,36 @@ class PullRequests(Base):
         self.assertEqual((self.task(1)['state'], self.task(1)['claim']), ('ready', None))
         self.assertIn('close: PR 7 did not merge: Pull request is not mergeable', self.board.issues[1]['comments'][-1])
 
-    def test_gitlab_and_review_mode(self):
+    def gitlab(self):
         taskq.CONFIG.update(board='gitlab', host='git.example')
         self.prs = [{'iid': 7, 'sha': 'a' * 40, 'target_branch': 'main'}]
-        self.close()
-        self.assertEqual(self.calls[1][-3:], ['--yes', '-R', 'https://git.example/o/r'])
+
+    def test_gitlab_waits_for_pipeline_and_merges_at_sha(self):
+        self.gitlab()
+        self.checks['mr'] = [[], [('a' * 40, 'running'), ('b' * 40, 'success')], [('a' * 40, 'success')]]
+        self.assertEqual(self.close(), '#1 closed\n')
+        self.assertEqual(self.calls[0], ['mr', 'list', '--source-branch', 'taskq-1', '--output', 'json', '-R', 'https://git.example/o/r'])
+        self.assertEqual(sum(call[:4] == ['api', '-X', 'GET', 'projects/o%2Fr/merge_requests/7/pipelines'] and call[-2:] == ['--hostname', 'git.example']
+                             for call in self.calls), 3)
+        self.assertEqual([call for call in self.calls if call[:2] == ['mr', 'merge']],
+                         [['mr', 'merge', '7', '--squash', '--remove-source-branch', '--sha', 'a' * 40, '--auto-merge=false', '--yes', '-R', 'https://git.example/o/r']])
+        self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\nmerged {"d" * 40}')
+
+    def test_gitlab_failed_pipeline_requeues(self):
+        self.gitlab()
+        self.checks['mr'] = [[('a' * 40, 'failed')]]
+        with self.assertRaisesRegex(SystemExit, f'PR 7 pipeline failed on {"a" * 40}'):
+            self.close()
+        self.assertEqual((self.task(1)['state'], [call for call in self.calls if call[:2] == ['mr', 'merge']]), ('ready', []))
+
+    def test_gitlab_conflict_requeues(self):
+        self.gitlab()
+        self.checks['mr'], self.merged = [[('a' * 40, 'success')]], False
+        with self.assertRaisesRegex(SystemExit, 'PR 7 did not merge: Pull request is not mergeable'):
+            self.close()
+        self.assertEqual((self.task(1)['state'], self.task(1)['claim']), ('ready', None))
+
+    def test_review_mode(self):
         with tempfile.TemporaryDirectory() as folder:
             Path(folder, 'taskq.json').write_text('{"publish": "review"}')
             with self.assertRaisesRegex(SystemExit, 'use "direct" or "pr"'):

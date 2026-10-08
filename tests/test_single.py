@@ -154,6 +154,17 @@ class Commands(Base):
         self.assertEqual(self.board.issues[2]['comments'][-1],
                          '**close** · claude:01234567\n\nkept .worktrees/taskq-2 and branch taskq-2: uncommitted changes')
 
+    def test_close_external_workspace_removes_nothing(self):
+        taskq.CONFIG['workspace'] = 'external'  # #477: the host owns the worktree and the branch
+        (self.root / '.worktrees' / 'taskq-1').mkdir(parents=True)
+        self.add()
+        self.run_cli('take', '1')
+        self.run_cli('result', '1', '--sha', 'a' * 40)
+        with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
+            self.run_cli('close', '1')
+        self.assertFalse([call for call in run.call_args_list if {'worktree', 'branch'} & set(call.args[0])])
+        self.assertEqual(self.board.issues[1]['comments'][-1], '**close** · claude:01234567\n\nkept: owned by host')
+
     def test_requeue_and_later(self):
         self.add()
         self.run_cli('take', '1')
@@ -221,6 +232,10 @@ class PullRequests(Base):
         self.assertIn('`glab mr create --yes --target-branch main --source-branch taskq-1', taskq.brief(item, 'claude'))
         taskq.CONFIG['publish'] = 'direct'
         self.assertIn('`git push origin HEAD:main`', taskq.brief(item, 'claude'))
+        self.assertIn('git worktree add -b taskq-1 .worktrees/taskq-1', taskq.brief(item, 'claude'))
+        taskq.CONFIG['workspace'] = 'external'  # #477
+        self.assertNotIn('git worktree add', taskq.brief(item, 'claude'))
+        self.assertIn('take your workspace from the project instructions (AGENTS.md) or the path the manager gave', taskq.brief(item, 'claude'))
 
     def test_close_merges(self):
         self.assertEqual(self.close(), '#1 closed\n')
@@ -228,6 +243,12 @@ class PullRequests(Base):
         self.assertIn(['api', '-X', 'GET', f'repos/o/r/commits/{"a" * 40}/check-runs?check_name=tests'], self.calls)
         self.assertEqual(self.board.issues[1]['state'], 'closed')
         self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\nmerged {"c" * 40}')
+
+    def test_close_external_keeps_the_branch(self):
+        taskq.CONFIG['workspace'] = 'external'  # #477: no --delete-branch; the repo's own policy decides
+        self.close()
+        self.assertEqual(self.merges(), [['pr', 'merge', '7', '--squash', '--match-head-commit', 'a' * 40, '-R', 'o/r']])
+        self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\nmerged {"c" * 40}\n\nkept: owned by host')
 
     def test_close_batch_goes_on_after_a_failure(self):
         self.add()

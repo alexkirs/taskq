@@ -146,11 +146,12 @@ application or completion.
 | `repo` | `owner/repo` (GitHub) or `group/project` (GitLab) | required for github/gitlab |
 | `host` | Enterprise or self-managed host | the CLI's default |
 | `publish` | `direct` or `pr` (§ 6) | `direct` |
+| `workspace` | `external`: the host owns the worker's worktree and branch `taskq-<N>`; taskq never creates or removes them (§ 5, § 6) | taskq-owned `.worktrees/taskq-<N>` |
 | `limits` | Workers per runtime on this machine; `0` turns a runtime off | 1 per runtime |
 | `hosts` | Hostname → machine name; `TASKQ_HOST` overrides the hostname | hostname up to the first dot |
 | `runtimes` | Extra runtimes: `{"name": "runtimes/name.py"}` | none |
 | `permission_mode` | Claude worker permission mode | `dontAsk` |
-| `codex` | Options of `codex exec`, replacing the default | `-s workspace-write`, network on |
+| `codex` | Options of `codex exec`, replacing the default; with `workspace: external` add `--add-dir` for the worktree and its git dir (the project instructions name them) | `-s workspace-write`, network on, `--add-dir <root>/.git` |
 | `pages` | Base URL of `open.html`, the Codex link page | `https://alexkirs.github.io/taskq/` |
 | `board_url` | Board link a board file prints in the tick | GitHub/GitLab issues page |
 
@@ -252,6 +253,8 @@ Rules:
    `git fetch origin && git worktree add -b taskq-<N> .worktrees/taskq-<N> origin/main` and work only there.
    Never edit the main checkout. A branch `taskq-<N>` already exists: continue it
    (`git worktree add .worktrees/taskq-<N> taskq-<N>`). A task that ends in an answer needs no worktree.
+   `workspace: external` (§ 2): take the workspace from the project instructions (`AGENTS.md`) or the path the
+   manager gave, on branch `taskq-<N>`; the host owns it, never remove it.
 4. Expected paths (`scope`) say where the work is expected, not what is forbidden. Another file: change it and
    name it with the reason in the result.
 5. A question only the owner can decide (a product choice, an action that cannot be undone):
@@ -293,6 +296,9 @@ Rules:
 - Both modes, on the machine named in the claim: `close` removes a clean `.worktrees/taskq-<N>` (`git worktree remove`)
   and the local branch `taskq-<N>` (`git branch -D`). A worktree with uncommitted changes stays, with its branch, and
   the close comment says so. Never `--force` (#284).
+- `workspace: external` (§ 2, #477): `close` removes no worktree and no local or remote branch, and the close comment
+  says `kept: owned by host`. In `pr` mode it merges without `--delete-branch` / `--remove-source-branch`: deleting
+  the remote branch on merge is the repo's own setting.
 - `main` is always green: in `direct` mode the worker runs the tests before the push.
 - `pr` mode is workflow, not a security boundary: use protected branches for that.
 

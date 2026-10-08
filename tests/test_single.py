@@ -230,9 +230,10 @@ class FakeRuntime:
         self.sessions, self.sent, self.stopped = {}, [], []
 
     def spawn(self, name, prompt, cwd):
-        self.sessions[f's-{name}'] = True
+        self.names = [*getattr(self, 'names', []), name]
+        self.sessions[f's-{name.split()[0]}'] = True
         self.prompt = prompt
-        return f's-{name}'
+        return f's-{name.split()[0]}'
 
     def send(self, session, text):
         self.sent.append((session, text))
@@ -299,6 +300,12 @@ class Tick(Base):
         taskq.CONFIG['limits'] = {'fake': 0}
         self.add('three')
         self.assertNotIn('spawn', self.run_cli('tick'))
+
+    def test_worker_name_has_task_launcher_title_machine(self):
+        self.add()
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex'}):
+            self.run_cli('tick')
+        self.assertRegex(self.fake.names[0], r'^T1 (CLD|CDX) \S.* \(mac\)$')
 
     def test_claude_send_keeps_name_and_spawn_flags(self):
         claude, calls = taskq.Claude(), []

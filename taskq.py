@@ -31,6 +31,13 @@ def machine():
     name = os.environ.get('TASKQ_HOST') or socket.gethostname()
     return CONFIG.get('hosts', {}).get(name) or name.split('.')[0].lower()
 
+ORCH = {'claude': 'CLD', 'codex': 'CDX', 'dot': 'DOT', 'hermes': 'HRM', 'grok': 'GRK'}
+
+def worker_name(item):
+    """R3 naming (#268): `T<N> <ORCH> <title> (<machine>)`; ORCH is who launched it, UNK for the owner's shell."""
+    launcher = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
+    return f'T{item["iid"]} {ORCH.get(launcher, "UNK")} {item["title"][:40]} ({machine()})'
+
 def session():
     """This agent session, or None for the owner's shell. TASKQ_RUNTIME picks one when a session inherited another's id."""
     found = [r for r in SESSIONS if os.environ.get(SESSIONS[r]) and os.environ.get('TASKQ_RUNTIME', r) == r]
@@ -263,7 +270,7 @@ class Codex:
     def exec(self, name, arguments, cwd):
         # Network on: a worker pushes and calls the board. `"codex": [...]` in taskq.json replaces these options.
         options = CONFIG.get('codex', ['-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true'])
-        log, detach = self.folder() / f'{name}.log', {'creationflags': 0x208} if os.name == 'nt' else {'start_new_session': True}
+        log, detach = self.folder() / f'{name.split()[0]}.log', {'creationflags': 0x208} if os.name == 'nt' else {'start_new_session': True}
         with open(log, 'ab') as out:  # detached: the worker outlives the tick
             process = subprocess.Popen([shutil.which('codex') or fail('codex not found'), 'exec', '--json', *options, *arguments],
                                        cwd=cwd, env=worker_env(), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
@@ -482,7 +489,7 @@ def cmd_tick(args):
         names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
         free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 1)), None)
         if free:  # the tick claims it: the next tick sees the slot taken, the worker needs no `take`
-            session = kinds[free].spawn(f'T{item["iid"]}', brief(item, free), CONFIG['root'])
+            session = kinds[free].spawn(worker_name(item), brief(item, free), CONFIG['root'])
             item['claim'] = {'runtime': free, 'session': session, 'name': here}
             move(item, 'doing', 'spawn', kinds[free].link(session) or '', claim=item['claim'], result=None)
             item['state'], busy[free] = 'doing', busy.get(free, 0) + 1

@@ -88,7 +88,7 @@ One function, ~60 lines:
 3. `doing`, alive, and no comment for 120 minutes: `send(session, 'continue: read your issue')`.
 4. `ask`: nothing; the owner answers.
 5. `ready`, every dep closed, a free slot for its runtime: `spawn`.
-6. Print the table: Task / State / Runtime / Session link.
+6. Print the R6 markdown table: Task / State / Runtime / Session, with issue and session links.
 
 No timer: a sender session loops `taskq wait` and messages the manager per event (`taskq arm tick`, #407). There is no coordinator machine. A tick starts only
 tasks with no `host-*` label or with its own `host-<name>` label; any machine can tick.

@@ -384,13 +384,26 @@ class Tick(Base):
         self.assertEqual((self.task(2)['state'], self.task(3)['state']), ('ready', 'ready'))
         self.assertIn('task #1: one', self.fake.prompt)
         self.assertIn('**spawn** · claude:01234567\n\nhttps://watch/s-T1', self.board.issues[1]['comments'])
-        self.assertIn('#1     doing    fake     https://watch/s-T1', out)
+        self.assertIn('| [#1](https://board/1) | doing | fake | [s-T1](https://watch/s-T1) |', out)
         self.assertTrue(out.endswith('Board: https://github.com/o/r/issues\n'))
         self.fake.sessions['s-T1'] = False  # the worker died: requeued, and the free slot runs it again first
         self.run_cli('tick')
         self.assertEqual([text.split(' ·')[0] for text in self.board.issues[1]['comments']], ['**add**', '**spawn**', '**requeue**', '**spawn**'])
         self.assertIn('session s-T1 is gone', self.board.issues[1]['comments'][2])
         self.assertEqual((self.task(1)['state'], self.task(2)['state']), ('doing', 'ready'))
+
+    def test_row_links_per_runtime(self):
+        claude, codex = taskq.Claude(), taskq.Codex()
+        item = {'iid': 7, 'url': 'https://board/7', 'state': 'doing', 'runtime': 'any',
+                'claim': {'runtime': 'codex', 'session': '019a-thread', 'name': 'mac'}}
+        kinds = {'claude': claude, 'codex': codex}
+        self.assertEqual(taskq.row(item, kinds, 'mac'),
+                         '| [#7](https://board/7) | doing | codex | [019a-thr](https://alexkirs.github.io/taskq/open.html#codex://threads/019a-thread) |')
+        item['claim'] = {'runtime': 'claude', 'session': 'abcdef12-3456', 'name': 'mac'}
+        with mock.patch.object(claude, 'link', return_value='https://claude.ai/code/session_X'):
+            self.assertEqual(taskq.row(item, kinds, 'mac'), '| [#7](https://board/7) | doing | claude | [abcdef12](https://claude.ai/code/session_X) |')
+        self.assertEqual(taskq.row(item, kinds, 'win'), '| [#7](https://board/7) | doing | claude | abcdef12 on mac |')
+        self.assertEqual(taskq.row({**item, 'claim': None, 'state': 'ready'}, kinds, 'mac'), '| [#7](https://board/7) | ready | any |  |')
 
     def test_second_quick_death_asks(self):
         # #393: a worker that dies at once is respawned once, then the owner is asked with the last log line

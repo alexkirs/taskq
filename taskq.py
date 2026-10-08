@@ -324,15 +324,19 @@ class Codex:
         return process, log
 
     def spawn(self, name, prompt, cwd):
+        log = self.folder() / f'{name.split()[0]}.log'
+        start = log.stat().st_size if log.exists() else 0  # #495: the log is appended across runs, older ids sit above
         process, log = self.exec(name, ['-C', str(cwd), prompt], cwd)
-        for _ in range(600):  # the first JSONL line, thread.started, carries the thread id
-            found = re.search(r'"thread_id":\s*"([\w-]+)"', log.read_text('utf-8', 'replace'))
+        for _ in range(600):  # the run's first JSONL line, thread.started, carries the thread id
+            with open(log, 'rb') as file:
+                file.seek(start)
+                found = ([None] + re.findall(r'"thread_id":\s*"([\w-]+)"', file.read().decode('utf-8', 'replace')))[-1]
             if found or process.poll() is not None:
                 break
             time.sleep(0.1)
         found or fail(f'codex exec gave no thread id: see {log}')
-        (log.with_suffix('.pid')).write_text(f'{process.pid} {found[1]}')
-        return found[1]
+        (log.with_suffix('.pid')).write_text(f'{process.pid} {found}')
+        return found
 
     def pid_file(self, session):
         return next((path for path in self.folder().glob('*.pid') if path.read_text().split()[1:] == [session]), None)

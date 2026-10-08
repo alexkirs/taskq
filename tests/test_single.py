@@ -643,6 +643,20 @@ class Tick(Base):
         self.assertEqual([codex.alive(s) for s in ('thread-1', 'thread-2', 'thread-3')], [True, False, None])
         self.assertTrue(codex.link('thread-1').endswith('/open.html#codex://threads/thread-1'))
 
+    def test_codex_spawn_takes_the_newest_thread(self):
+        # #495: a respawn appends to T1.log; the old thread id above must not win
+        codex = taskq.Codex()
+        log = codex.folder() / 'T1.log'
+        log.write_text('{"type":"thread.started","thread_id":"old-thread"}\n')
+
+        def run(name, arguments, cwd):
+            with open(log, 'a') as out:
+                out.write('{"type":"thread.started","thread_id":"new-thread"}\n')
+            return mock.Mock(pid=os.getpid()), log
+        with mock.patch.object(codex, 'exec', run):
+            self.assertEqual(codex.spawn('T1 one (mac)', 'prompt', '.'), 'new-thread')
+        self.assertEqual((codex.folder() / 'T1.pid').read_text(), f'{os.getpid()} new-thread')
+
 
 class Wait(Tick):
     """#407: `taskq wait` returns once per event, or 'tick' after the window; the clock is patched."""

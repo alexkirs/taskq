@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -436,6 +437,12 @@ class Model(unittest.TestCase):
             config = taskq.load_config(Path(folder, 'sub'))
             self.assertEqual((config['publish'], config['root']), ('direct', Path(folder).resolve()))
             self.assertEqual(taskq.make_board(config).list(None), ['fake'])
+
+    def test_contract_keeps_principles(self):
+        # #311: a rewrite of taskq.md must not drop a principle silently (change rule: amend, never overwrite)
+        text = (ROOT / 'taskq.md').read_text()
+        self.assertEqual(re.findall(r'^### (R\d+)\. ', text, re.M), [f'R{n}' for n in range(1, 13)])
+        self.assertIn('\n### Change rule\n', text)
 
 
 if __name__ == '__main__':

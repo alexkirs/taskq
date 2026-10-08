@@ -5,6 +5,105 @@ This file is the whole contract, for every agent (manager or worker) on every ru
 Below, `taskq` means `python3 <taskq clone>/taskq.py` (or the alias of the README). Run it from the project's
 checkout: it reads the nearest `taskq.json` from the current directory up; that folder is the project root.
 
+## Principles (R1–R12)
+
+The canonical rules of taskq (owner decision 2026-10-08, #242; restored by #311 after the single-file cutover #290
+dropped `taskq/contracts/principles.md`). The sections below are their mechanics and never restate them.
+A rule the cutover changed says `Changed:` old → new, with the task. `Open:` marks a decision only the owner can make.
+`tests/test_single.py` fails when a heading of this section disappears.
+
+### Change rule
+
+A task that changes a rule names the R-number it amends in its title or goal, edits this section in the same
+deliverable as the code, and its result lists the amended R-numbers. Amend; never overwrite: a changed rule keeps its
+number and records old → new with the task. A rule elsewhere that disagrees with this section is a defect: fix that
+rule or amend this one, never keep both. A new rule gets the next R-number.
+
+### R1. Board is the only state and lock
+
+The issue's `q-*` label, its JSON block and trusted comments hold all task state, claims and history (§ 3). No extra
+database, queue, receipt store, mirror or protocol. Local files under `.taskq/` are runtime handles only (§ 8).
+
+### R2. One task, one worker session
+
+A task has one worker session at a time. Work bigger than one session is several tasks linked by `--deps`, never
+sub-tasks or multi-task workers. The manager finds duplicates when filing and proposes merge or separate; the owner
+decides before any task changes; an active claim is never re-bound automatically.
+Changed: "one supervisor session and one worker session per task" → one worker session; the supervisor is gone (#290).
+
+### R3. Roles and session names
+
+- Owner: decides product questions, answers `ask`.
+- Manager: the session the owner talks to; files tasks, runs the tick, relays questions, reviews results, closes or
+  requeues (§ 7). Does no task work.
+- Tick: one pass of the queue on one machine (§ 7); dispatches workers within free slots, reconciles board and sessions.
+- Worker: does one task and writes its result to the board (R5, § 5).
+
+The tick names every worker `T<N> <ORCH> <title> (<machine>)`, ORCH the launching orchestrator (CLD Claude,
+CDX Codex, DOT Codex cloud, HRM Hermes, GRK Grok, UNK a shell) (#268, restored in 829d6c3).
+Changed: four roles (root PM, tick, supervisor, worker) → three plus the owner. The supervisor reviewed, published
+and closed (#243); now the manager reviews and `close` publishes (§ 6), and no `S<N>` session exists (#290).
+Open: supervisor per runtime, yes or no (Claude; Codex). Until the owner decides, no runtime has one.
+
+### R4. Tick is a message
+
+A sender runs `taskq tick`; received means one pass, not received means nothing. The owner configures one sender per
+machine outside taskq (§ 7 Arm the tick). A tick starts only tasks with no `host-*` label or its own machine's.
+Changed: "a tick on another machine never coordinates" → every machine's tick runs the same pass for its own claims
+and hosts; there is no coordinator machine (#290).
+
+### R5. Worker writes completion to the task
+
+Result SHA, checks, a question or a blocker go to the issue through `taskq result`, `ask`, `requeue` or a plain
+comment. Completion never depends on session UI, chat or transcript.
+Changed: `taskq problem` → `requeue --text` or a plain issue comment (#290).
+
+### R6. Human report
+
+`taskq tick` prints the report itself: one table `Task | State | Runtime | Session link` with clickable links, then
+`Board: <url>` (§ 7). The manager replies with it as printed, links not bare ids, then the owner's open questions.
+Same table on every runtime; links are built per runtime. No raw JSON to humans.
+Changed: a heading per project and owner questions inside the tick output → one project per tick, questions added by
+the manager (#290). The reply route (`--reply`) and the `cards` format of #274 are not in `taskq.py`.
+Open: bring back the reply route and cards, yes or no (#274).
+
+### R7. Style
+
+Every role and message is short and states unknowns honestly, per
+[gradus-public/caveman](https://gitlab.ufobe.com/gradus-public/caveman/-/tree/62579538f05fb6b69a12449c1ebad9567d1fdecc)
+pinned at `6257953`. taskq links the style; it does not redefine it.
+
+### R8. The contract is the SoT and matches code
+
+This file is the whole contract (with [docs/single-file.md](docs/single-file.md) for design). Briefs and docs link
+here; they never copy it. A change of behavior updates this file in the same deliverable.
+Changed: "the Wiki is the SoT; principles.md is its packaged copy" → `taskq.md` at the root is the SoT (#289, #290).
+Open: delete the Wiki pages or mark them stale.
+
+### R9. No silent changes to model, effort or permissions
+
+Any change is named to the owner first; taskq never edits permission settings itself (`permission_mode` in
+`taskq.json` is the owner's).
+
+### R10. Multi-project only by explicit list
+
+A session manages several projects only from an owner-written list; folders are never auto-discovered.
+Changed: `taskq projects` over `[projects]` in `taskq.local.toml` → no command; the manager runs `taskq tick` in each
+project root the owner listed (#290).
+
+### R11. Retire a worker only after accepted review
+
+A worker session ends only when its result is accepted: `close` stops it on the claim's machine and removes its clean
+worktree and branch (§ 6; #300, #302). A rejected result is `requeue` with the fixes; the next worker continues the
+branch. Sessions are found by the claim in the block, names by the `T<N>` prefix.
+Changed: "supervisor retires its worker; cleanup ends sessions without a task" → `close` does it; no cleanup command
+(#290, #302).
+
+### R12. Unverified means unknown
+
+Report only what a fresh read proved. A delivery, exit code, checkout marker or chat turn is not proof of receipt,
+application or completion.
+
 ## 1. Setup (once per project)
 
 1. python3 >= 3.9; `gh` (GitHub) or `glab` (GitLab) installed and logged in: `gh auth status` / `glab auth status`.

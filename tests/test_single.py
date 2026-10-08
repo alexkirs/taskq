@@ -513,6 +513,46 @@ class Tick(Base):
             self.assertTrue(codex.link('thread-1').endswith('/open.html#codex://threads/thread-1'))
 
 
+class Wait(Tick):
+    """#407: `taskq wait` returns once per event, or 'tick' after the window; the clock is patched."""
+
+    def setUp(self):
+        super().setUp()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        taskq.CONFIG['root'] = Path(folder.name)
+        self.clock = [0.0]
+        for name, fake in (('time', lambda: self.clock[0]), ('sleep', lambda s: self.clock.__setitem__(0, self.clock[0] + s))):
+            patcher = mock.patch.object(taskq.time, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_events_once_then_tick(self):
+        self.add()
+        self.run_cli('tick')
+        self.assertEqual(self.run_cli('wait'), 'tick\n')  # nothing happened: the safety window
+        self.assertEqual(self.clock[0], 600)
+        self.run_cli('result', '1', '--sha', 'a' * 40)
+        self.add('two')  # the event pass spawns it
+        self.fake.sessions['s-T2'] = False
+        self.assertEqual(self.run_cli('wait').splitlines(), ['review #1', 'gone #2'])
+        self.assertEqual(self.clock[0], 600)  # at once, no sleep
+        self.assertEqual(self.run_cli('wait'), 'tick\n')  # never twice for the same event
+        self.run_cli('requeue', '1')
+        self.run_cli('tick')
+        start = self.clock[0]
+        result = lambda: self.run_cli('result', '1', '--sha', 'b' * 40) if self.clock[0] == start + 50 else None
+        with mock.patch.object(taskq.time, 'sleep', lambda s: (self.clock.__setitem__(0, self.clock[0] + s), result())):
+            self.assertEqual(self.run_cli('wait'), 'review #1\n')  # back in review while waiting: a new event
+        self.assertEqual(self.clock[0], start + 50)
+
+    def test_arm_tick_names_target_and_loop(self):
+        out = self.run_cli('arm', 'tick', 'PM main')
+        self.assertIn('manager session PM main', out)
+        self.assertIn('taskq.py wait`', out)
+        self.assertIn('with SendMessage', out)
+
+
 class Model(unittest.TestCase):
     def test_block_keeps_unknown_keys(self):
         board = taskq.BOARD = FakeBoard()

@@ -144,11 +144,15 @@ Configure one sender for the project to run `taskq tick`. Each pass does the mec
 (spawn, nudge, wake, retire) and prints the R6 report: heading, Board link, one table Task | Status |
 Runtime | Session, then what needs judgement and the owner's open questions. It exits 1 for judgement.
 
-For CLI automation, `tick`, `report` and `cleanup` accept `--json`. Stdout is one JSON object with
+For CLI automation, `list`, `view`, `tick`, `spawn`, `report` and `cleanup` accept `--json`. Stdout is one JSON object with
 `outcome` (`ok`, `judgement_needed`, `failure`), `tasks` and the captured prose in `text`; `report` and
 `cleanup` also carry `actions` and `refusals`, and cleanup its `plan` (remove/ask/keep) and, with `--apply`,
 actual removals and freed bytes. JSON does not make a command read-only. `tick --json` exits 1 for judgement
 and 2 for failure; other JSON commands exit 0 for a completed report/plan and 2 for failure.
+`spawn --json` records one action with `runtime`, `session` and `attempt` (the task's `launch` note id).
+`taskq add --reply channel:chat[:thread]` stores where a request came from; the tick report groups its rows by it.
+`[prefs] report = "cards"` in `taskq.local.toml` prints one block per task (Task, Status, Runtime, Session) instead of
+the table, for chats without tables. Agent skill for any runtime: `taskq contract --skill`.
 
 
 Your profile lives in `taskq.local.toml` of the main checkout: personal, never committed

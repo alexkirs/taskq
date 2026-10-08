@@ -159,7 +159,7 @@ def checked(config, path):
         f'[idle] {key}' for key in config.get('idle', {}) if key not in ('stop', 'cleanup')] + [
         f'[machine] {key}' for key in config.get('machine', {}) if key != 'notes'] + [
         f'[profile] {key}' for key in profile if key not in (*PROFILE_DEFAULTS, 'limits')] + [
-        f'[prefs] {key}' for key in config.get('prefs', {}) if key != 'notes'] + [
+        f'[prefs] {key}' for key in config.get('prefs', {}) if key not in ('notes', 'report')] + [
         f'[codex] {key}' for key in codex if key not in ('project', 'section')] + [
         f'[coordinator] {key}' for key in config.get('coordinator', {}) if key != 'session']
     if unknown:
@@ -173,6 +173,8 @@ def checked(config, path):
     notes = config.get('prefs', {}).get('notes', [])
     if not isinstance(notes, list) or not all(isinstance(note, str) for note in notes):
         fail(f'{where("[prefs] notes")}: write a list of strings')
+    if config.get('prefs', {}).get('report', 'table') not in REPORTS:
+        fail(f'{where("[prefs] report")}: write one of {", ".join(REPORTS)}')
     limits = profile.get('limits', {})
     if not isinstance(limits, dict):
         fail(f'{where("[profile.limits]")}: write a table of runtime = N')
@@ -557,6 +559,20 @@ def user():
     return api('GET', '/user')['id']
 
 
+def reply_route(text):
+    """#274: where a request came from, `channel:chat[:thread]` (e.g. telegram:-100123:7); tick groups its report by it."""
+    if not re.fullmatch(r'[\w.-]+:[^:\s]+(:[^:\s]+)?', text):
+        raise argparse.ArgumentTypeError(f'{text!r}: write channel:chat[:thread]')
+    return text
+
+
+REPORTS = ('table', 'cards')  # [prefs] report of taskq.local.toml: the tick report format (#274)
+
+
+def report_format():
+    return personal().get('prefs', {}).get('report', 'table')
+
+
 def limits(text):
     """`--limit claude=1,codex=0`: only the entries it names; the others come from the lower layers (`resolve`)."""
     found = {}
@@ -678,8 +694,10 @@ def age(item):
 
 
 def contract(args):
-    """Where the contracts live: the queue (taskq.md) and the manager/coordinator session (taskq-manager.md)."""
-    print('\n'.join(str(path) for path in sorted(CONTRACTS.glob('taskq*.md'))))
+    """Where the contracts live: the queue (taskq.md) and the manager/coordinator session (taskq-manager.md);
+    `--skill`: the one agent skill (#274) any runtime installs, its role given at launch."""
+    print(CONTRACTS / 'skill' / 'SKILL.md' if getattr(args, 'skill', False) else
+          '\n'.join(str(path) for path in sorted(CONTRACTS.glob('taskq*.md'))))
 
 
 def git(*args, cwd=None):
@@ -820,9 +838,10 @@ def main(argv=None):
             (('--runtime',), {'choices': (*RUNTIMES, 'any'), 'help': 'only a session of this app may take it; default by type'}),
             (('--host',), {'help': 'only a worker on this machine (its [hosts] name, e.g. win) may take it; default any'}),
             (('--mine',), {'action': 'store_true'}), (('--area',), {'nargs': '+', 'default': []}),
+            (('--reply',), {'type': reply_route, 'metavar': 'CHANNEL:CHAT[:THREAD]', 'help': 'where the request came from; tick groups its report by it'}),
             (('--label',), {'nargs': '+', 'default': [], 'help': argparse.SUPPRESS}))
     command('runtime', set_runtime, iid, (('runtime',), {'choices': (*RUNTIMES, 'any')}))
-    command('list', listing, (('--links',), {'action': 'store_true', 'help': 'also the URL of each task'}))
+    command('list', listing, json_flag, (('--links',), {'action': 'store_true', 'help': 'also the URL of each task'}))
     # Absent flags stay None: the personal taskq.local.toml, then taskq.toml, then the defaults decide (`resolve`).
     profile_flags = ((('--filter',), {'help': 'GitLab issues query string, passed unchanged; \'\' means all areas'}),
                      (('--mine',), {'action': argparse.BooleanOptionalAction, 'help': 'only own assignments, or with --no-mine also the pool'}),
@@ -847,14 +866,14 @@ def main(argv=None):
             (('--preferred-runtime',), {'choices': tuple(RUNTIMES), 'help': 'tie-break for own tasks of any runtime'}))
     pref_command = command('pref', pref, (('what',), {'choices': ('add', 'list', 'rm')}))
     pref_command.add_argument('value', nargs='?')
-    spawn_command = command('spawn', spawn, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),
+    spawn_command = command('spawn', spawn, json_flag, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),
             (('--name',), {'default': 'taskq worker', 'help': 'session name: "T<N> <words>"; " (<this machine>)" is added'}),
             (('--remote-control',), {'action': argparse.BooleanOptionalAction, 'default': True,
                                       'help': 'Claude: Remote Control, so tick links the session at claude.ai (default on)'}),
             (('--codex-full-access',), {'dest': 'full_access', 'action': 'store_true',
                                         'help': f'Codex: danger-full-access instead of workspace-write (tick sets it for {FULL_ACCESS})'}))
     text_input(spawn_command, required=False)
-    command('view', view, iid, (('--notes',), {'type': int, 'default': 3, 'help': 'last notes to print (default 3)'}))
+    command('view', view, json_flag, iid, (('--notes',), {'type': int, 'default': 3, 'help': 'last notes to print (default 3)'}))
     claude_session = (('session',), {'help': 'Claude session id (or local_<id>)'})
     command('retire', retire, claude_session)
     thread = (('thread',), {})
@@ -869,7 +888,7 @@ def main(argv=None):
         command(name, migrate, (('--project',), {'help': 'GitLab project path: writes a minimal taskq.toml here if none'}),
                 (('--github',), {'help': 'GitHub repository owner/name: writes a minimal taskq.toml here if none'}),
                 (('--host',), {'help': 'host for that taskq.toml, e.g. gitlab.example.com'}))
-    command('contract', contract)
+    command('contract', contract, (('--skill',), {'action': 'store_true', 'help': 'the path of the agent skill (SKILL.md)'}))
     command('doctor', doctor, (('--fix',), {'action': 'store_true', 'help': 'set up what a command can (taskq.toml, labels, board); '
                                             'print each step only the person can do'}),
             (('--codex',), {'action': 'store_true', 'help': 'with --fix: also the Codex app project of this checkout'}))

@@ -79,7 +79,12 @@ def listed(item):
 
 
 def report_row(item, agents, activity):
-    """One row of the R6 table: the same columns on every runtime, the session links built per runtime
+    """One row of the R6 table."""
+    return '| ' + ' | '.join(report_cells(item, agents, activity)) + ' |'
+
+
+def report_cells(item, agents, activity):
+    """Task, Status, Runtime, Session of one task: the same on every runtime, the session links built per runtime
     (`session_link`): the worker's, then its supervisor's (#243)."""
     claim, found = item['claim'] or {}, item.get('supervisor') or {}
     links = ([session_link(claim, agents.get(claim['session']))] if claim.get('session') else []) + (
@@ -89,7 +94,8 @@ def report_row(item, agents, activity):
     # #268: the orchestrator that launched the session, read from its name; an old name or an unlisted session has none.
     from taskq.runtimes import orchestrator
     orch = next(filter(None, (orchestrator((agents.get(who.get('session')) or {}).get('name')) for who in (claim, found))), None)
-    return f'| {core.ref(item)} {title} | {item["state"]} ({activity}) | {runtime}{core.where(claim)}{f", by {orch}" if orch else ""} | {" · ".join(links) or "unavailable"} |'
+    return (f'{core.ref(item)} {title}', f'{item["state"]} ({activity})', f'{runtime}{core.where(claim)}{f", by {orch}" if orch else ""}',
+            ' · '.join(links) or 'unavailable')
 
 
 def blocker(item):
@@ -103,10 +109,25 @@ def blocker(item):
     return 'blocked: ' + ' '.join(body.split('\n\n', 1)[-1].replace('|', '/').split())[:120] if body.startswith('**problem**') else None
 
 
-def report(board, rows):
-    """R6: the project heading, the Board link and one table Task | Status | Runtime | Session."""
-    print(f'## {core.PROJECT_PATH}\n\nBoard: {board}\n\n| Task | Status | Runtime | Session |\n|---|---|---|---|')
-    print('\n'.join(rows) or '| none | | | |', end='\n\n')
+def report(board, rows, style='table'):
+    """R6: the project heading, the Board link, then Task | Status | Runtime | Session of each (reply, cells) row:
+    one table, or with `cards` one block per task for chats without tables (#274). Rows with a reply route
+    (`add --reply`) come after the rest, one group per route."""
+    print(f'## {core.PROJECT_PATH}\n\nBoard: {board}\n')
+    groups = {}
+    for reply, cells in rows:
+        groups.setdefault(reply, []).append(cells)
+    for reply in sorted(groups, key=lambda reply: reply or ''):
+        if reply:
+            print(f'Reply to {reply}:\n')
+        if style == 'cards':
+            print('\n\n'.join('\n'.join(f'{name}: {cell}' for name, cell in zip(('Task', 'Status', 'Runtime', 'Session'), cells))
+                               for cells in groups[reply]), end='\n\n')
+        else:
+            print('| Task | Status | Runtime | Session |\n|---|---|---|---|')
+            print('\n'.join('| ' + ' | '.join(cells) + ' |' for cells in groups[reply]), end='\n\n')
+    if not rows:
+        print('none\n' if style == 'cards' else '| Task | Status | Runtime | Session |\n|---|---|---|---|\n| none | | | |\n')
 
 
 def profile_arguments(args):
@@ -476,8 +497,8 @@ def queue_pass(args):
     board = board_link(candidates)
     everything = [item for item in everything if item['iid'] in selected]
     # #83: one table of every worker and supervisor (R6); the owner's chat opens only http(s) links.
-    report(board, [report_row(item, agents, blocker(item) or (alive.get(item['iid']) or (None, f'issue {core.age(item)} min ago'))[1])
-                                    for item in everything if listed(item)])
+    report(board, [(item.get('reply'), report_cells(item, agents, blocker(item) or (alive.get(item['iid']) or (None, f'issue {core.age(item)} min ago'))[1]))
+                   for item in everything if listed(item)], core.report_format())
     # #243 (R3): a supervised task's review is its supervisor's, never the coordinator's: the tick wakes that session.
     review = [item for item in everything if item['state'] == 'review' and item['result'] and not item.get('supervisor')]
     # A question reaches the owner once, when it is new; the ones already shown come back as a daily summary.

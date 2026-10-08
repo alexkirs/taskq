@@ -116,7 +116,8 @@ def add(args):
     if unknown:
         core.fail(f'unknown areas {sorted(unknown)}; configure [areas] names and run init')
     runtime = core.DEFAULT_RUNTIME[args.type] if args.runtime is None else None if args.runtime == 'any' else args.runtime
-    block = {'scope': args.scope, 'deps': args.deps, 'claim': None, 'waiting_for': None, 'result': None}
+    block = {'scope': args.scope, 'deps': args.deps, 'claim': None, 'waiting_for': None, 'result': None,
+             **({'reply': args.reply} if getattr(args, 'reply', None) else {})}
     text = f'## Goal\n\n{args.goal}\n\n## Acceptance\n\n{args.acceptance}'
     labels = args.label + [f'area-{area}' for area in args.area] + [f'{core.PREFIX}ready', f'priority-{args.priority}', args.type] + ([core.RUN + runtime] if runtime else []) + ([core.ON + args.host] if args.host else [])
     body = {'title': args.title, 'description': core.render(text, block), 'labels': ','.join(labels)}
@@ -247,10 +248,18 @@ def listing(args):
             detail = '; '.join(filter(None, (detail, f'holds scope for {", ".join(f"#{iid}" for iid in held)}')))
         print(f'#{item["iid"]:<4} {item["state"]:<8} p{item["priority"]} {item["runtime"] or "any":<6} '
               + (f'{item["web_url"]} ' if args.links else '') + item['title'] + (f'  [{detail}]' if detail else ''))
+        if hasattr(args, 'output'):
+            args.output['tasks'].append(task_json(item, detail=detail))
     for issue in odd:
         print(f'#{issue["iid"]:<4} ?        labels {issue["labels"]}: not a valid task, see `tick`')
     for issue in problems:
         print(f'#{issue["iid"]:<4} {core.PROBLEM:<8} {issue["title"]}')
+
+
+def task_json(item, **extra):
+    """A task in `--json` output (#274): the same keys for list and view."""
+    return {'id': item['iid'], 'title': item['title'], 'state': item['state'], 'priority': item['priority'],
+            'runtime': item['runtime'], 'url': item.get('web_url'), 'claim': item['claim'], 'reply': item.get('reply'), **extra}
 
 
 def set_runtime(args):
@@ -647,8 +656,9 @@ def spawn(args):
     if iid and (found := core.task(iid).get('supervisor')) and not core.is_caller(found):
         core.fail(f'#{iid} is supervised by {core.short(found)}: only that session launches its worker')
     session = get(args.runtime, full_access=getattr(args, 'full_access', False), remote_control=args.remote_control).spawn(name, args.text)
-    if iid:
-        core.note(iid, 'launch', f'session {session}')
+    launched = core.note(iid, 'launch', f'session {session}') if iid else None
+    # #274: the attempt is the task's `launch` note (its history entry); a spawn without a task has none.
+    core.record(args, 'spawn', runtime=args.runtime, session=session, attempt=(launched or {}).get('id'))
     if supervised:
         assign(supervised, args.runtime, session)
     if args.runtime == 'codex':
@@ -840,6 +850,10 @@ def view(args):
     print('claim: ' + (f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]}{core.where(claim)}' if claim else 'none'))
     if found := item.get('supervisor'):
         print(f'supervisor: {core.short(found)}')
+    if item.get('reply'):
+        print(f'reply: {item["reply"]}')
+    if hasattr(args, 'output'):
+        args.output['tasks'].append(task_json(item, state='closed' if closed else item['state']))
     if item['state'] == 'doing' and claim.get('session'):
         from taskq.tick import liveness
         state, activity = liveness(item, claude_agents())

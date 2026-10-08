@@ -397,6 +397,7 @@ def cmd_add(args):
     n = BOARD.add(args.title, block(text, {'scope': args.scope, 'deps': args.deps, 'claim': None, 'result': None}), labels)
     BOARD.comment(n, f'**add** · {who()}')
     print(f'#{n} {state}')
+    return n
 
 def cmd_list(args):
     found = [item for item in map(parse, BOARD.list(args.state)) if item and mine(item)]
@@ -572,7 +573,8 @@ def dispatch_lock():
             else:
                 import fcntl
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError:  # mark the event before the holder can end, so its pending check sees it (#481)
+            (folder / 'dispatch.pending').touch()
             yield False
             return
         yield True  # closing the file (or the process exiting) releases the lock
@@ -599,9 +601,10 @@ def one_pass(args, table=True):
     here, kinds = machine(), runtimes()
     limits = CONFIG.get('limits') or {name: 1 for name in kinds}
     with dispatch_lock() as held:  # #357 (R2): one pass at a time per checkout; the list is read under the lock
-        items = sorted(filter(None, map(parse, BOARD.list(None))), key=lambda item: (item['priority'], item['iid']))
-        if not held:  # another pass runs here now: mark the event, that pass runs once more when it ends
-            (CONFIG['root'] / '.taskq' / 'dispatch.pending').touch()
+        tasks = getattr(args, 'tasks', None) or []  # #481: the list lags the event's own write (a new issue, a label): read those directly
+        issues = [issue for issue in BOARD.list(None) if issue['iid'] not in tasks] + [issue for issue in map(BOARD.get, tasks) if issue['state'] == 'open']
+        items = sorted(filter(None, map(parse, issues)), key=lambda item: (item['priority'], item['iid']))
+        if not held:  # another pass runs here now: dispatch_lock marked the event, that pass runs once more when it ends
             print('taskq: another pass is running; it will run again for this event', file=sys.stderr)
         busy, ready = {}, items if held else []
         for item in ready:
@@ -665,15 +668,18 @@ def one_pass(args, table=True):
 
 EVENTS = ('add', 'answer', 'result', 'requeue', 'close')  # R4 (#333): each starts one pass after its move
 
-def dispatch():
+def dispatch(command, tasks):
     """R4 (#405): the event pass runs in a detached `tick --quiet` child, its output in .taskq/dispatch.log; the event returns at once."""
     if os.environ.get('CODEX_SANDBOX'):  # a sandboxed Codex worker can neither start codex nor see other sessions' pids:
         return  # its pass would requeue live tasks as gone and spawn workers that die at once (#269 run 4b)
     try:
         (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
         detach = {'creationflags': 0x208} if os.name == 'nt' else {'start_new_session': True}
+        tasks = [str(n) for n in (tasks if isinstance(tasks, list) else [tasks])]
         with open(CONFIG['root'] / '.taskq' / 'dispatch.log', 'ab') as out:
-            start_pass([sys.executable, str(Path(__file__).resolve()), 'tick', '--quiet'], cwd=CONFIG['root'],
+            out.write(f'{datetime.now():%Y-%m-%d %H:%M:%S} {command} #{" #".join(tasks)}\n'.encode())  # the event, then the child's lines
+            out.flush()
+            start_pass([sys.executable, str(Path(__file__).resolve()), 'tick', '--quiet', '--tasks', *tasks], cwd=CONFIG['root'],
                        stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
     except Exception as error:  # never fails the event: the next tick retries
         print(f'taskq: dispatch stopped: {error}; the next tick retries', file=sys.stderr)
@@ -787,7 +793,8 @@ def main(argv=None):
     command('requeue', cmd_move, text=True)
     command('later', cmd_move, text=True)
     command('close', cmd_close, (('n',), {'nargs': '+', 'type': int}), n=False, text=True)
-    command('tick', lambda args: (event_pass if args.quiet else cmd_tick)(args), (('--quiet',), {'action': 'store_true'}), n=False)
+    command('tick', lambda args: (event_pass if args.quiet else cmd_tick)(args), (('--quiet',), {'action': 'store_true'}),
+            (('--tasks',), {'nargs': '*', 'type': int, 'default': []}), n=False)
     command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}), n=False)
     command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}), n=False)
     command('pm', cmd_pm, n=False)
@@ -797,9 +804,9 @@ def main(argv=None):
         BOARD = make_board(CONFIG)
     if args.command == 'wait' or args.command == 'tick' and not args.quiet:
         refresh()
-    args.function(args)
+    done = args.function(args)
     if args.command in EVENTS:
-        dispatch()
+        dispatch(args.command, done if args.command == 'add' else args.n)
 
 if __name__ == '__main__':
     main()

@@ -234,8 +234,9 @@ Runtime file: four module-level functions, two more optional.
 - `--acceptance` is required; for a `research` task it names what the answer must say.
 - `add` prints `#<N> <state>`; every state change prints the new state.
 - `add`, `answer`, `result`, `requeue` and `close` then start one tick pass without the table in a detached child
-  (R4) and return at once. The pass's output and a failure (`taskq: dispatch stopped: <error>`) go to
-  `.taskq/dispatch.log` and never fail the command.
+  (R4) and return at once. The event's line (`<time> <command> #<N>`), the pass's output and a failure
+  (`taskq: dispatch stopped: <error>`) go to `.taskq/dispatch.log` and never fail the command. The child reads the
+  event's tasks by number: the board's list may not show a write made a second earlier.
 - A command refuses a task in the wrong state and says which state it is in.
 - No `beat` or `problem` command: a progress note or a problem is a plain issue comment
   (`gh issue comment N --body "..."` / `glab issue note N -m "..."`).

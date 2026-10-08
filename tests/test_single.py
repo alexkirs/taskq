@@ -67,7 +67,7 @@ class Base(unittest.TestCase):
         for patcher in (
                 mock.patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': SESSION, 'TASKQ_RUNTIME': 'claude', 'TASKQ_HOST': 'mac'}, clear=True),
                 mock.patch.object(taskq, 'runtimes', return_value={}),  # no real worker from an event's dispatch
-                mock.patch.object(taskq, 'start_pass', lambda *_, **__: taskq.main(['tick', '--quiet'])),  # the child's pass, in process
+                mock.patch.object(taskq, 'start_pass', lambda command, **_: taskq.main(command[2:])),  # the child's pass, in process
                 mock.patch.object(taskq, 'datetime', FixedNow),
                 mock.patch.object(taskq, 'CLONE', self.root),  # no .git, no taskq.md: tick and wait neither pull nor warn
                 mock.patch.object(taskq.subprocess, 'run', real), mock.patch.object(taskq.subprocess, 'Popen', real)):
@@ -535,7 +535,7 @@ class Tick(Base):
             self.assertEqual(self.add(), '#1 ready\n')
         [(command, options)] = started
         self.assertEqual((command[1:], options['cwd'], options['stdout'].name, options['stdin']),
-                         ([str(ROOT / 'taskq.py'), 'tick', '--quiet'], self.root, str(self.root / '.taskq' / 'dispatch.log'), subprocess.DEVNULL))
+                         ([str(ROOT / 'taskq.py'), 'tick', '--quiet', '--tasks', '1'], self.root, str(self.root / '.taskq' / 'dispatch.log'), subprocess.DEVNULL))
         self.assertTrue(options.get('start_new_session') or options.get('creationflags'))  # detached: it outlives the event
         self.assertEqual((self.task(1)['state'], getattr(self.fake, 'names', [])), ('ready', []))  # nothing spawned in this process
 
@@ -733,6 +733,54 @@ class Model(Base):
         text = (ROOT / 'taskq.md').read_text()
         self.assertEqual(re.findall(r'^### (R\d+)\. ', text, re.M), [f'R{n}' for n in range(1, 13)])
         self.assertIn('\n### Change rule\n', text)
+
+
+FILE_BOARD = '''import json, pathlib
+PATH = pathlib.Path(__file__).with_name('issues.json')
+def load(): return json.loads(PATH.read_text()) if PATH.exists() else {}
+def save(issues): PATH.write_text(json.dumps(issues))
+def list(state): return [issue for issue in load().values() if issue['state'] == 'open' and issue.get('listed')]
+def get(n): return load()[str(n)]
+def add(title, body, labels):
+    issues = load(); n = len(issues) + 1
+    issues[str(n)] = {'iid': n, 'title': title, 'body': body, 'labels': labels, 'state': 'open',  # not listed yet: GitHub's list lags
+                      'updated_at': '2026-10-09T00:00:00Z', 'url': '', 'comments': []}
+    save(issues); return n
+def update(n, labels=None, body=None):
+    issues = load(); issues[str(n)].update({k: v for k, v in (('labels', labels), ('body', body)) if v is not None}, listed=True); save(issues)
+def comment(n, text):
+    issues = load(); issues[str(n)]['comments'].append(text); save(issues)
+def close(n):
+    issues = load(); issues[str(n)]['state'] = 'closed'; save(issues)
+'''
+FILE_RUNTIME = '''import pathlib
+def spawn(name, prompt, cwd): pathlib.Path(__file__).with_name('spawned').write_text(name); return 's1'
+def send(session, text): return session
+def alive(session): return True
+def link(session): return None
+'''
+
+
+class RealChild(unittest.TestCase):
+    """#481: `add` in a real process starts the real detached `tick --quiet` child; it spawns and logs, though the list lags the add."""
+
+    def test_add_spawns_from_the_detached_child(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        root = Path(folder.name)
+        (root / 'board.py').write_text(FILE_BOARD)
+        (root / 'fake.py').write_text(FILE_RUNTIME)
+        (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'runtimes': {'fake': 'fake.py'}, 'limits': {'fake': 1}}))
+        env = {'PATH': '', 'TASKQ_HOST': 'mac', 'HOME': str(root)}  # no claude or codex on PATH: their retire fails quietly
+        done = REAL_RUN([taskq.sys.executable, str(ROOT / 'taskq.py'), 'add', 'T', '--goal', 'g', '--acceptance', 'a'],
+                        cwd=root, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual((done.returncode, done.stdout), (0, '#1 ready\n'), done.stderr)
+        end = taskq.time.time() + 20
+        while not (root / 'spawned').exists() and taskq.time.time() < end:
+            taskq.time.sleep(0.1)
+        log = (root / '.taskq' / 'dispatch.log').read_text()
+        self.assertEqual((root / 'spawned').read_text() if (root / 'spawned').exists() else None, 'T1 UNK T (mac)', log)
+        self.assertRegex(log, r'^\S+ \S+ add #1\n#1 doing\n')
 
 
 if __name__ == '__main__':

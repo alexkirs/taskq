@@ -173,7 +173,13 @@ SUPERVISE = 'Continue as the supervisor of task #{iid}: run taskq supervise {iid
 def wake_supervisor(item):
     found, text = item['supervisor'], SUPERVISE.format(iid=item['iid'])
     from taskq.runtimes import get
-    return get(found['runtime'], full_access=found['runtime'] == 'codex').send(found['session'], text)
+    session = get(found['runtime'], full_access=found['runtime'] == 'codex').send(found['session'], text)
+    # #284: a Claude wake may fork a new session id: the block follows it unless the supervisor changed meanwhile
+    if found['runtime'] == 'claude' and isinstance(session, str) and session != found['session']:
+        from taskq.worker import resumed
+        if (fresh := core.task(item['iid'])).get('supervisor') == found:
+            resumed(fresh, {'runtime': 'claude', 'session': session})
+    return session
 
 
 
@@ -477,10 +483,10 @@ def queue_pass(args):
     # #197: the owner's tick (this machine coordinates) applies native cleanup when due; never a timer of its own.
     sys.modules['taskq.cleanup'].scheduled(args)  # the module: `core.cleanup` is the command function
     # #243: a supervisor whose task needs it (a result to review; ready again after an answer or reject) and whose
-    # turn has ended is woken with one fixed line; a busy or unknown one (another machine) is left alone.
+    # turn has ended, or which stopped (#284), is woken with one fixed line; a busy or unknown one (another machine) is left alone.
     supervise = [item for item in everything if item.get('supervisor') and (item['state'] == 'review' and item['result']
                  or item['state'] == 'ready')
-                 and liveness({**item, 'state': 'doing', 'claim': item['supervisor']}, agents)[0] == 'idle']
+                 and liveness({**item, 'state': 'doing', 'claim': item['supervisor']}, agents)[0] in ('idle', 'dead')]
     if not (review or fresh or summary or start or odd or problems or supervise) and not any(item['state'] == 'doing' for item in everything):
         # #153: an ask or review task waits for someone, so it is no idle pass.
         if any(item['state'] in ('ask', 'review') for item in everything):

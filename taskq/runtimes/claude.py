@@ -11,6 +11,7 @@ class Adapter:
         return claude_spawn(name, prompt=prompt, remote_control=self.remote_control)
 
     def send(self, session, text):
+        # #284: the session that continues: a stopped one may resume under a new id
         if self.ops: return self.call('send', session, text)
         from taskq import claude_wake
         return claude_wake(session, text)

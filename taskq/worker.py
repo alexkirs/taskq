@@ -74,6 +74,7 @@ By the task's state (`{tool} view {iid}` reads it again):
   Accepted: `{tool} close {iid} --text "<what you checked>"`: {publish}; close also retires the worker.
   Not accepted: `{tool} reject {iid} --text "<exact fixes>"`, then send the fixes to the same worker as above.
 The tick wakes you when the task needs you; after close end your turn, the tick retires this session.
+Keep this session's name as spawn set it (never rename it) and start no other session but this task's one worker.
 What went wrong or needs the owner: `{tool} problem --task {iid} --text "<what>"`, then end your turn.
 Everything you write through `{tool}` is public: no environment values, paths outside the repository, tokens.
 {preferences}
@@ -189,6 +190,7 @@ def supervisor_change(current, value):
 
 def outsider(current):
     """#240: a decision on a supervised task from a session other than its claim: only its supervisor or the owner."""
+    adopt(current)
     found = current.get('supervisor')
     if found and core.session() is not None and not core.is_caller(found):
         core.fail(f'#{current["iid"]} is supervised by {core.short(found)}: only that session or the owner decides')
@@ -209,9 +211,15 @@ def supervision(current, mine):
 
 
 def supervised_worker(iid, found):
-    """The session of supervisor `found`'s newest `launch` note, or None."""
-    head = f'**launch** · {core.short(found)}\n\nsession '
-    return next((body[len(head):] for body in reversed(core.notes(core.comments(iid))) if body.startswith(head)), None)
+    """The session of supervisor `found`'s newest `launch` note, or None. #284: launches by the sessions it was
+    resumed from (`supervisor A → B (resumed)` notes) are its own."""
+    mine = {core.short(found)}
+    for body in reversed(core.notes(core.comments(iid))):
+        if (resume := re.search(r'^supervisor (\w+):(\S+) → (\w+):(\S+) \(resumed\)$', body, re.M)) and f'{resume[3]}:{resume[4][:8]}' in mine:
+            mine.add(f'{resume[1]}:{resume[2][:8]}')
+        if (launch := re.match(r'\*\*launch\*\* · (\S+)\n\nsession (.+)', body)) and launch[1] in mine:
+            return launch[2]
+    return None
 
 
 def later(args):
@@ -306,6 +314,7 @@ def supervise(args):
             return print(f'#{args.iid} is closed: nothing to supervise. End your turn; the tick retires this session.')
         current = core.task(args.iid)
         if current.get('supervisor'):
+            adopt(current)
             break
         time.sleep(5)
     if not core.is_caller(current.get('supervisor')):
@@ -670,6 +679,19 @@ def assign(iid, runtime, session):
     core.save(current, supervisor=found, note_action='edit', note_text=f'supervisor none → {identity(found)} (spawned)')
 
 
+def resumed(current, new):
+    """#284: supervisor `new` is the block's supervisor resumed under a new session id: the block takes it."""
+    core.save(current, supervisor=new, note_action='edit', note_text=f'supervisor {identity(current["supervisor"])} → {identity(new)} (resumed)')
+    current['supervisor'] = new
+
+
+def adopt(current):
+    """#284: a woken Claude supervisor runs under a new session id; its transcript proves it the same supervisor."""
+    found, mine = current.get('supervisor'), core.session()
+    if found and mine and found['runtime'] == mine['runtime'] == 'claude' and forked(found['session'], mine['session']):
+        resumed(current, mine)
+
+
 def delegation(current, uid):
     """A task assigned to someone else runs only under that owner's explicit delegation; taskq has no such policy yet."""
     assigned = current.get('assignees') or []
@@ -777,9 +799,28 @@ def claude_wake(session, prompt, extra=None):
         jobs = [agent for sid, agent in claude_agents().items() if sid not in before and agent.get('name') in names]
         if failed := next((agent for agent in jobs if agent.get('state') == 'failed'), None):
             core.fail(f'claude --resume {session[:8]}: the job {failed["id"]} failed at once (state failed in `claude agents`)')
+        # #284: `--bg --resume` of a stopped session continues under a new session id; the caller records it
+        if fork := next((agent['sessionId'] for agent in jobs if forked(session, agent['sessionId'])), None):
+            return fork
         if time.time() > end:
-            return
+            return session
         time.sleep(2)
+
+
+def transcript(session):
+    """The message uuids of a Claude session's transcript on this machine (`~/.claude/projects/*/<id>.jsonl`)."""
+    path = next((core.CLAUDE_JOBS.parent / 'projects').glob(f'*/{session}.jsonl'), None)
+    try:
+        return [json.loads(line).get('uuid') for line in path.read_text().splitlines()] if path else []
+    except (OSError, ValueError):
+        return []
+
+
+def forked(old, new):
+    """#284: whether session `new` is `old` resumed under a new id: its transcript starts with a copy of the old
+    one's messages, same uuids (CLI 2.1.x, seen live 2026-10-09: fa18ac97 resumed as c4b88ee4)."""
+    first = next(filter(None, transcript(new)), None) if new != old else None
+    return bool(first) and first in transcript(old)
 
 
 def view(args):

@@ -45,12 +45,16 @@ Changed: four roles (root PM, tick, supervisor, worker) → three plus the owner
 and closed (#243); now the manager reviews and `close` publishes (§ 6), and no `S<N>` session exists (#290).
 Open: supervisor per runtime, yes or no (Claude; Codex). Until the owner decides, no runtime has one.
 
-### R4. Tick is a message
+### R4. Tick is a message or a queue event
 
-A sender runs `taskq tick`; received means one pass, not received means nothing. The owner configures one sender per
-machine outside taskq (§ 7 Arm the tick). A tick starts only tasks with no `host-*` label or its own machine's.
+A tick is one pass (§ 7), started by a message or by a queue event. A sender runs `taskq tick`; received means one
+pass, not received means nothing. `add`, `answer`, `result`, `requeue` and `close` run the same pass once, in the same
+process, after their move: the queue chains itself. The sent tick is the safety net for lost events (dead sessions,
+stalls) and can run rarely. The owner configures one sender per machine outside taskq (§ 7 Arm the tick). A pass
+starts only tasks with no `host-*` label or its own machine's.
 Changed: "a tick on another machine never coordinates" → every machine's tick runs the same pass for its own claims
 and hosts; there is no coordinator machine (#290).
+Changed: "a tick is a message" → a tick is a message or a queue event; spawn no longer waits for the next sent tick (#333).
 
 ### R5. Worker writes completion to the task
 
@@ -212,6 +216,8 @@ Runtime file: four module-level functions, a fifth optional.
 - `--runtime` default `any`; `--type` default `code`; `--priority` default 2. `--host` takes a machine name (§ 2 `hosts`).
 - `--acceptance` is required; for a `research` task it names what the answer must say.
 - `add` prints `#<N> <state>`; every state change prints the new state.
+- `add`, `answer`, `result`, `requeue` and `close` then run one tick pass without the table (R4); its spawns print
+  their state too. A failed pass prints `taskq: dispatch stopped: <error>` to stderr and never fails the command.
 - A command refuses a task in the wrong state and says which state it is in.
 - No `beat` or `problem` command: a progress note or a problem is a plain issue comment
   (`gh issue comment N --body "..."` / `glab issue note N -m "..."`).
@@ -299,6 +305,10 @@ results and closes. It does no task work itself and never answers a worker's que
 4. `ask`, `review`, `later`: nothing; they wait for the manager.
 5. Print the table `Task | State | Runtime | Session link` by priority, then number; then `Board: <url>`.
    Another machine's claim shows its bare session id: only that machine can link it.
+
+The event pass of R4 is steps 1–3 run by `add`, `answer`, `result`, `requeue` or `close`, no table. A worker's
+`result` spawns the next worker on its own machine, named by its own runtime (R3). Run from `.worktrees/taskq-<N>`,
+taskq takes the checkout above it as the project root.
 
 A failure (a spawn that cannot start, a board error) stops the pass with `taskq: <error>` and exit 1, no table;
 the tasks it did not reach wait for the next pass. Fix the cause or tell the owner.

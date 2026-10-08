@@ -53,11 +53,9 @@ REPO = 'https://github.com/alexkirs/taskq'  # where every install takes its upda
 # #111: docs/open.html on REPO's GitHub Pages turns its hash (codex:// or claude:// with a UUID) into a deep link, so the
 # owner's chat (http(s) links only) opens a Codex thread. [pages] base of taskq.toml: a fork's own Pages.
 PAGES = 'https://alexkirs.github.io/taskq/'
-# [update] of taskq.toml: tick checks REPO at most `every`. `ref`: `main` (a commit whose CI passed) or `stable` (the
-# tag the owner moves after review, signed by a key in allowed_signers). `auto` None: on when the project's
+# [update] of taskq.toml: tick checks CI-green REPO main at most `every`. `auto` None: on when the project's
 # repository belongs to REPO's owner, off otherwise (nobody else runs REPO's main unasked).
-UPDATE = {'auto': None, 'every': '24h', 'ref': 'main'}
-SIGNERS = Path(__file__).resolve().parent / 'allowed_signers'  # ssh keys allowed to sign the `stable` tag
+UPDATE = {'auto': None, 'every': '24h'}
 # A cache, not queue state: when this machine last asked REPO for its `main`.
 UPDATE_STAMP = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'taskq' / 'update-last'
 # This machine in claims: a random id made once. Not the hostname: macOS changes it with
@@ -142,8 +140,6 @@ def configure(path=None):
     CLEANUP = cleanup_settings(config.get('cleanup', {}), path)
     UPDATE.update(config.get('update', {}))
     seconds(UPDATE['every'])
-    if UPDATE['ref'] not in ('main', 'stable'):
-        fail(f'[update] ref = "{UPDATE["ref"]}": write "main" or "stable"')
     if UPDATE['auto'] is None:
         UPDATE['auto'] = PROJECT_PATH.split('/')[0].lower() == REPO.rstrip('/').split('/')[-2].lower()
     RULES = ''.join(f'   {line}\n' for line in config.get('brief', {}).get('rules', '').strip().splitlines())
@@ -821,7 +817,7 @@ from taskq.codex import (CODEX_HEADLESS, CODEX_SOCKET, Codex, codex_age, codex_a
 from taskq.cleanup import cleanup  # noqa: E402
 from taskq.selftest import selftest  # noqa: E402
 from taskq.doctor import (  # noqa: E402
-    green, signed, works, update, queue_labels, probe, origin_of, write_config, doctor, personal_gaps, ignore_local,
+    green, works, update, queue_labels, probe, origin_of, write_config, doctor, personal_gaps, ignore_local,
     tree_gaps, profile_init, runtime_gaps, write_access, queue_labels_missing, board_gaps, report_gaps,
     PERMISSION_MODE, WORKER_ALLOW, permissions_missing, permissions_gap, trusted, setup, migrate, windows_claude_binary, pref)
 from taskq.tick import (  # noqa: E402

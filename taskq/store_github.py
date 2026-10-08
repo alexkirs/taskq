@@ -259,12 +259,6 @@ class Github:
             return self.cards()
         if path.startswith('board/items/'):
             return self.card(int(path.rsplit('/', 1)[1]), body['status'])
-        if path == 'leases':  # #145: the refs refs/taskq/coordinator/<key> the #44 lease left; doctor --fix deletes them
-            refs = [item['ref'] for item in self.run('GET', 'git/matching-refs/taskq/coordinator/')]
-            if method == 'DELETE':
-                for ref in refs:
-                    self.run('DELETE', 'git/' + ref)
-            return refs
         if path.startswith('boards'):
             core.fail('GitHub has no GitLab board: the Projects v2 board is `board`')
         if method == 'POST' and path == 'issues':

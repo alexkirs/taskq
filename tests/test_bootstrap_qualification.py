@@ -6,7 +6,6 @@ import importlib
 import io
 import json
 from pathlib import Path
-import re
 import subprocess
 import sys
 import unittest
@@ -79,7 +78,7 @@ class LocalAck(unittest.TestCase):
 
 
 class NetworkOrLogin(unittest.TestCase):
-    """A failing `gh auth status` is told apart by one authorized read, `gh api user`; nothing is written."""
+    """A failed authorized read is shown exactly; nothing is written."""
     def gap(self, reply):
         with patch.object(doctor, 'api_read', Mock(return_value=reply)) as read:
             found = doctor.login_gap('gh', None)
@@ -89,40 +88,18 @@ class NetworkOrLogin(unittest.TestCase):
     def test_read_succeeds_no_gap(self):
         self.assertIsNone(self.gap((0, '')))  # `auth status` alone is not a diagnosis
 
-    def test_network_denial_is_not_a_login_gap(self):
+    def test_failure_is_printed_as_is(self):
         for stderr in ('error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com',
-                       'Get "https://api.github.com/user": dial tcp: lookup api.github.com: no such host',
-                       "Command '['gh', 'api', 'user']' timed out after 60 seconds"):
+                       'gh: Bad credentials (HTTP 401)',
+                       'gh: Resource not accessible by integration (HTTP 403)'):
             with self.subTest(stderr=stderr):
                 what, fix = self.gap((1, stderr))
-                self.assertIn('network denied or offline, not a proven login gap', what)
-                self.assertNotIn('auth login', fix.split('  (')[0])
-
-    def test_server_permission_tls_and_unknown_are_not_login_gaps(self):
-        """PM review of c94fa28: each of these was reported as «not logged in»."""
-        cases = {'gh: Internal Server Error (HTTP 500)': 'server error (HTTP 5xx)',
-                 'gh: Resource not accessible by integration (HTTP 403)': 'permission denied for this token (HTTP 403)',
-                 'Get "https://api.github.com/user": tls: failed to verify certificate: x509: certificate signed by unknown authority':
-                     'TLS/certificate failure',
-                 '': 'unknown failure'}
-        for stderr, kind in cases.items():
-            with self.subTest(stderr=stderr):
-                what, fix = self.gap((1, stderr))
-                self.assertIn(f'failed: {kind}, not a proven login gap', what)
-                self.assertNotIn('not logged in', what)
-                self.assertEqual(fix.split('  (')[0], 'gh api user')
-        self.assertIn('(no error output)', self.gap((1, ''))[0])
-
-    def test_real_auth_failure_gives_owner_login_step(self):
-        for stderr in ('gh: Bad credentials (HTTP 401)', 'gh: Requires authentication (HTTP 401)'):
-            with self.subTest(stderr=stderr):
-                what, fix = self.gap((1, stderr))
-                self.assertEqual((what, fix.split('  (')[0]), ('`gh` is not logged in', 'gh auth login'))
+                self.assertEqual((what, fix), (stderr.splitlines()[-1], 'gh api user'))
+        self.assertEqual(self.gap((1, ''))[0], 'gh api user failed without error output')
 
     def test_api_read_is_read_only_and_survives_a_missing_cli(self):
         self.assertEqual(doctor.api_read(['taskq-no-such-cli-177', 'api', 'user'])[0], 1)
         self.assertEqual(doctor.api_read([sys.executable, '-c', 'import sys; sys.exit(0)']), (0, ''))
-        self.assertTrue(re.search(dict(doctor.FAILURES)['network denied or offline'], str(subprocess.TimeoutExpired(['gh'], 60))))
 
 
 if __name__ == '__main__':

@@ -17,4 +17,4 @@ packages = ["taskq"]
 py-modules = ["taskq_cli"]
 
 [tool.setuptools.package-data]
-taskq = ["contracts/*.md", "allowed_signers"]
+taskq = ["contracts/*.md"]

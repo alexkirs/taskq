@@ -13,87 +13,20 @@ import taskq as core
 
 
 def green(sha):
-    """Require exact-SHA trusted tests; identified Pages suites have separate site eligibility."""
-    repo = '/'.join(core.REPO.rstrip('/').split('/')[-2:])
-
-    def read(endpoint, key=None):
-        command = ['gh', 'api', f'repos/{repo}/{endpoint}']
-        if key:
-            command += ['--paginate', '--slurp']
-        done = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    """Require completed successful `tests.yml` runs for this exact SHA."""
+    try:
+        done = subprocess.run(['gh', 'run', 'list', '--commit', sha, '--workflow', 'tests.yml', '--json', 'conclusion'],
+                              capture_output=True, text=True, timeout=60)
         if done.returncode:
             raise ValueError('unreadable CI')
-        data = json.loads(done.stdout)
-        if key and (not isinstance(data, list) or any(not isinstance(page[key], list) for page in data)):
-            raise ValueError('invalid CI pages')
-        return [item for page in data for item in page[key]] if key else data
-
-    try:
-        workflow = read('actions/workflows/tests.yml')
-        if workflow['path'] != '.github/workflows/tests.yml' or workflow['state'] != 'active':
-            return 'its required tests workflow is not active'
-        workflows = read(f'actions/runs?head_sha={sha}&per_page=100', 'workflow_runs')
-        checks = read(f'commits/{sha}/check-runs?filter=all&per_page=100', 'check_runs')
-        if not isinstance(workflows, list) or not isinstance(checks, list):
-            raise ValueError('invalid CI response')
-        # Suite identity, not a job name, distinguishes tests and Pages from unrelated checks.
-        trusted = [run for run in workflows if run['head_sha'] == sha
-                   and run['repository']['full_name'] == repo]
-        test_runs = [run for run in trusted if run['workflow_id'] == workflow['id']
-                     and run['path'] == workflow['path'] and run['event'] in ('push', 'pull_request')]
-        tests = [run for run in test_runs if run['event'] == 'push']
-        if not tests:
-            return 'it has no trusted exact-SHA tests run yet'
-        latest = max(tests, key=lambda run: run['id'])
-        mandatory = [latest, *[run for run in test_runs if run['event'] == 'pull_request']]
-        if any(run['status'] != 'completed' for run in mandatory):
-            return 'CI still running: tests'
-        if any(run['conclusion'] != 'success' for run in mandatory):
-            return 'CI failed: tests'
-        pages = {run['check_suite_id'] for run in trusted
-                 if (run['path'], run['event']) in (
-                     ('dynamic/pages/pages-build-deployment', 'dynamic'),
-                     ('.github/workflows/pages.yml', 'push'),
-                     ('.github/workflows/pages.yml', 'pull_request'),
-                     ('.github/workflows/pages.yml', 'workflow_dispatch'))}
-        test_suites = {run['check_suite_id'] for run in tests}
-        current = {}
-        for check in checks:
-            suite = check['check_suite']['id']
-            if check['head_sha'] != sha:
-                raise ValueError('wrong check SHA')
-            actions = check['app']['slug'] == 'github-actions' and check['app']['id'] == 15368
-            if actions and (suite in pages or (check['name'] == 'tests' and suite in test_suites
-                                               and suite != latest['check_suite_id'])):
-                continue
-            key = (suite, check['app']['id'], check['name'])
-            if key not in current or check['id'] > current[key]['id']:
-                current[key] = check
-        required_suites = {run['check_suite_id'] for run in mandatory}
-        required = [check for check in current.values() if check['check_suite']['id'] in required_suites
-                    and check['name'] == 'tests' and check['app']['slug'] == 'github-actions'
-                    and check['app']['id'] == 15368]
-        if {check['check_suite']['id'] for check in required} != required_suites:
-            return 'it has no trusted exact-SHA tests check yet'
-        if any(check['status'] != 'completed' for check in required):
-            return 'CI still running: tests'
-        if any(check['conclusion'] != 'success' for check in required):
-            return 'CI failed: tests'
-        waiting = [check['name'] for check in current.values() if check['status'] != 'completed']
-        failed = [check['name'] for check in current.values() if check['status'] == 'completed'
-                  and check['conclusion'] not in ('success', 'skipped', 'neutral')]
-        return (f'CI failed: {", ".join(failed)}' if failed else
-                f'CI still running: {", ".join(waiting)}' if waiting else None)
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        runs = json.loads(done.stdout)
+        if not runs:
+            return 'it has no exact-SHA tests run yet'
+        conclusions = [run['conclusion'] for run in runs]
+        return ('CI still running: tests' if None in conclusions else
+                'CI failed: tests' if any(result != 'success' for result in conclusions) else None)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         return 'its CI could not be read (gh api)'
-
-
-def signed(where, sha):
-    """None when the `stable` tag fetched into `where` points at `sha` and carries a signature by a key in SIGNERS."""
-    if core.git('rev-parse', 'refs/tags/stable^{commit}', cwd=where) != sha:
-        return 'the stable tag moved during the update'
-    if core.git('-c', 'gpg.format=ssh', '-c', f'gpg.ssh.allowedSignersFile={core.SIGNERS}', 'verify-tag', 'refs/tags/stable', cwd=where) is None:
-        return f'the stable tag has no valid signature by a key in {core.SIGNERS}'
 
 
 def works(where):
@@ -106,40 +39,28 @@ def works(where):
 
 def update(args):
     """Bring this install to the `[update] ref` of REPO: fast-forward of an editable clone, else a reinstall from Git.
-    Only to a commit whose CI passed and, for `stable`, a tag signed by a key in SIGNERS. True when it updated.
+    Only to a commit whose CI passed. True when it updated.
     A clone with uncommitted changes or commits the ref lacks is left alone; a clone that does not start after the
     fast-forward goes back."""
     say = print if args.verbose else (lambda text: None)
     kind, where = core.install()
-    ref = core.UPDATE['ref']
-    name = 'refs/heads/main' if ref == 'main' else 'refs/tags/stable'
-    old, remote = core.version(), core.git('ls-remote', core.REPO, name, name + '^{}')
+    old, remote = core.version(), core.git('ls-remote', core.REPO, 'refs/heads/main')
     if not remote:
-        return say(f'update skipped: {core.REPO} did not answer (or has no {ref})')
-    new = remote.splitlines()[-1].split()[0]  # a tag's commit is the peeled `^{}` line, the last one
+        return say(f'update skipped: {core.REPO} did not answer (or has no main)')
+    new = remote.split()[0]
     if kind is None:
         return print(f'not updated: this taskq is not installed from Git; reinstall: uv tool install --force git+{core.REPO}  (or pipx install --force …)')
     if new == (core.git('rev-parse', 'HEAD', cwd=where) if kind == 'clone' else where):
         return print(f'up to date {old}')
     if reason := green(new):
-        return print(f'not updated to {ref} {new[:7]}: {reason}')
-    if ref == 'stable':
-        # A clone checks the tag in itself; another install in a bare repository kept next to the update stamp.
-        store = where if kind == 'clone' else core.UPDATE_STAMP.parent / 'repo.git'
-        if kind != 'clone' and not store.exists():
-            store.parent.mkdir(parents=True, exist_ok=True)
-            core.git('init', '-q', '--bare', str(store))
-        if core.git('fetch', '-q', '--no-tags', core.REPO, '+refs/tags/stable:refs/tags/stable', cwd=store) is None:
-            return say(f'update skipped: fetch of stable from {core.REPO} failed')
-        if reason := signed(store, new):
-            return print(f'not updated to stable {new[:7]}: {reason}')
+        return print(f'not updated to main {new[:7]}: {reason}')
     if kind == 'clone':
         if core.git('status', '--porcelain', '--untracked-files=no', cwd=where):
             return print(f'not updated: {where} has uncommitted changes')
-        if ref == 'main' and core.git('fetch', '-q', core.REPO, 'main', cwd=where) is None:
+        if core.git('fetch', '-q', core.REPO, 'main', cwd=where) is None:
             return say(f'update skipped: fetch from {core.REPO} failed')
         if core.git('merge-base', '--is-ancestor', 'HEAD', new, cwd=where) is None:
-            return print(f'not updated: {where} has commits {ref} of {core.REPO} lacks')
+            return print(f'not updated: {where} has commits main of {core.REPO} lacks')
         if core.git('merge', '-q', '--ff-only', new, cwd=where) is None:
             return print(f'not updated: fast-forward of {where} failed (`git -C {where} merge --ff-only {new[:7]}` says why)')
         if not works(where):
@@ -186,32 +107,13 @@ def api_read(command):
         return 1, str(error)
 
 
-# Only a positively established authentication failure means login; every other failure is named as what it is.
-# ponytail: known wordings of gh/glab and Go's net/tls packages; an unmatched one is `unknown`, never a login gap.
-AUTH = re.compile(r'HTTP 401|\b401 Unauthorized|Bad credentials|Requires authentication|not logged in|auth login', re.I)
-FAILURES = (('TLS/certificate failure', re.compile(r'x509|certificate|tls:? handshake', re.I)),
-            ('network denied or offline', re.compile(r'error connecting to|dial tcp|no such host|could not resolve'
-                                                     r'|connection refused|network is unreachable|timed? ?out', re.I)),
-            ('permission denied for this token (HTTP 403)', re.compile(r'HTTP 403|\b403 Forbidden|not accessible by integration', re.I)),
-            ('server error (HTTP 5xx)', re.compile(r'HTTP 5\d\d|\b5\d\d (Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout)')))
-
-
 def login_gap(cli, host):
-    """#177: `auth status` also fails without network (seen live: «token invalid» in a sandbox that denied
-    api.github.com). One supported authorized read, `<cli> api user`, confirms it: only an authentication
-    failure (401) gives the owner's login step; network, TLS, 403, 5xx and an unrecognised or empty error are
-    reported as that blocker, not as a login gap. (what, fix), or None when the read succeeds. Reads only."""
+    """The failing authorized read is the diagnosis; do not infer its cause."""
     hostname = ['--hostname', host] if host else []
     code, stderr = api_read([cli, 'api', 'user', *hostname])
     if not code:
         return None
-    if AUTH.search(stderr):
-        return (f'`{cli}` is not logged in{f" to {host}" if host else ""}',
-                f'{cli} auth login{f" --hostname {host}" if host else ""}  (the person runs it: OAuth in the browser)')
-    kind = next((label for label, pattern in FAILURES if pattern.search(stderr)), 'unknown failure')
-    shown = core.last_line(stderr) or 'no error output'
-    return (f'`{cli} api user` failed: {kind}, not a proven login gap ({shown})',
-            f'{shlex.join([cli, "api", "user", *hostname])}  (rerun once the cause is fixed; do not run auth login for this)')
+    return (core.last_line(stderr) or f'{cli} api user failed without error output', shlex.join([cli, 'api', 'user', *hostname]))
 
 
 def origin_of():
@@ -283,7 +185,7 @@ def doctor(args, pending=()):
     if gaps or not config:
         return report_gaps(gaps, pending)
     checks = (('write permission', lambda: write_access(github)), ('labels', queue_labels_missing),
-              ('board', lambda: board_gaps(github, host)), ('lease', lease_gaps))
+              ('board', lambda: board_gaps(github, host)))
     for name, check in checks:
         try:
             for what, fix in check():
@@ -451,13 +353,6 @@ def board_gaps(github, host):
             * (list(board['options']) != list(core.STATES)))
 
 
-def lease_gaps():
-    """#145: the coordinator is [coordinator] machine of taskq.toml; a ref of the old lease (#44) is only clutter."""
-    refs = [] if core.BOARDS else core.api('GET', 'leases')
-    return [(f'leftover coordinator lease {ref} (the coordinator is [coordinator] machine of taskq.toml now)',
-             f'{core.TOOL} doctor --fix  (deletes it)') for ref in refs]
-
-
 def report_gaps(gaps, pending=()):
     if not gaps and pending:
         print(f'not ready: {len(pending)} step(s) of the person pending: ' + '; '.join(pending))
@@ -615,9 +510,6 @@ def setup(args):
         print('done: labels' + ' and board' * (not scope))
     else:
         print('ok: labels' + ' and board' * (not scope))
-    if lease_gaps():
-        core.api('DELETE', 'leases')
-        print('done: removed the leftover coordinator lease')
     for fix in scope:
         person(fix, 'a GitHub board needs the token scope `project` (browser consent); until then the queue works with labels only')
     if 'claude' not in idle():

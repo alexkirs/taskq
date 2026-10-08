@@ -50,7 +50,7 @@ class SupervisorLayer(unittest.TestCase):
         first, second = self.add(), self.add()
         self.claude('supervisor-1', 'supervisor-2')
         output, log = self.act()
-        self.assertEqual([name for name, _ in self.spawned], [f'S{first} t (mac-1)', f'S{second} t (mac-1)'])
+        self.assertEqual([name for name, _ in self.spawned], [f'S{first} CLD t (mac-1)', f'S{second} CLD t (mac-1)'])
         self.assertIn(f'taskq supervise {first}` and follow', self.spawned[0][1])
         self.assertIn(f'Done: spawn a claude supervisor for', log)
         for iid, session in ((first, 'supervisor-1'), (second, 'supervisor-2')):
@@ -69,7 +69,7 @@ class SupervisorLayer(unittest.TestCase):
         self.enterContext(patch.object(q, 'codex_spawn', spawn))
         self.enterContext(patch.object(q, 'CODEX_SOCKET', q.ROOT))
         self.act()
-        self.assertEqual([name for name, _ in spawned], [f'S{iid} t (mac-1)'])
+        self.assertEqual([name for name, _ in spawned], [f'S{iid} CLD t (mac-1)'])
         self.assertIn(f'taskq supervise {iid}`', spawned[0][1])
         self.assertEqual(self.block(iid)['supervisor'], {'runtime': 'codex', 'session': 'thread-1'})
 
@@ -92,7 +92,7 @@ class SupervisorLayer(unittest.TestCase):
         self.claude('supervisor-1', 'worker-1', 'supervisor-2')
         with contextlib.redirect_stderr(io.StringIO()), contextlib.suppress(SystemExit):
             self.do(COORDINATOR, 'tick', '--act', '--limit', 'claude=1,codex=0')
-        self.assertEqual([name for name, _ in self.spawned], [f'S{first} t (mac-1)'])  # one slot: one supervisor
+        self.assertEqual([name for name, _ in self.spawned], [f'S{first} CLD t (mac-1)'])  # one slot: one supervisor
         self.do(SUPERVISOR, 'spawn', '--name', f'T{first} t', '--text', 'go')
         self.do(WORKER, 'take', first)
         with contextlib.redirect_stderr(io.StringIO()), contextlib.suppress(SystemExit):
@@ -100,7 +100,7 @@ class SupervisorLayer(unittest.TestCase):
         self.assertEqual(len(self.spawned), 2)  # its live supervisor and worker hold the one slot: nothing more
         with contextlib.redirect_stderr(io.StringIO()), contextlib.suppress(SystemExit):
             self.do(COORDINATOR, 'tick', '--act', '--limit', 'claude=2,codex=0')
-        self.assertEqual(self.spawned[-1][0], f'S{second} t (mac-1)')  # counted once, not twice
+        self.assertEqual(self.spawned[-1][0], f'S{second} CLD t (mac-1)')  # counted once, not twice
 
     def test_review_wakes_the_supervisor_not_the_pm_and_supervisor_closes(self):
         iid, woken = self.add(), []

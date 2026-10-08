@@ -30,13 +30,13 @@ A new rule gets the next R-number.
 - *Supervisor*: launches its one worker, reviews its result, publishes it per the project's `[workspace] publish` (`direct`: the worker pushed `main`, `close` verifies it; `review`: `close` fast-forwards `main` to the reviewed branch), writes the outcome to the board with `close` or `reject`, retires the worker (R11).
 - *Worker*: does the task and writes its result to the board (R5).
 
-Mechanics: [taskq.md § Four roles](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq.md#four-roles), [taskq-manager.md](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq-manager.md).
+Mechanics: `taskq spawn` alone names every session, the same on each runtime (#268): `<T|S><N> <ORCH> <title> (<machine>)`, T a worker, S a supervisor, ORCH the code of the launching orchestrator (CLD Claude, CDX Codex, DOT Codex cloud, HRM Hermes, GRK Grok, UNK unknown); [taskq.md § Four roles](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq.md#four-roles), [taskq-manager.md](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq-manager.md).
 
 **R4. Tick is a message.** A sender invokes `taskq tick`; received means one pass, not received means nothing. The owner configures one sender per project outside taskq. A tick on another machine starts only its own `host-*` tasks and never coordinates. Mechanics: [taskq-manager.md § 2](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq-manager.md#2-arm-the-tick).
 
 **R5. Worker writes completion to the task.** Result SHA, checks, question or blocker go to the task through `taskq result`, `ask` or `problem`. Completion never depends on session UI, chat or transcript.
 
-**R6. Human report.** Per project: heading, Board link, one table Task | Status | Runtime | Session with clickable links, then the owner's open questions. Same table in Claude and Codex; links are built per runtime. No raw JSON to humans; JSON stays inside transport. `taskq tick` prints this report itself.
+**R6. Human report.** Per project: heading, Board link, one table Task | Status | Runtime | Session with clickable links (Runtime names the launching orchestrator when the session name carries it), then the owner's open questions. Same table in Claude and Codex; links are built per runtime. No raw JSON to humans; JSON stays inside transport. `taskq tick` prints this report itself.
 
 **R7. Style.** Every role and message follows [gradus-public/caveman](https://gitlab.ufobe.com/gradus-public/caveman/-/tree/62579538f05fb6b69a12449c1ebad9567d1fdecc) pinned at `6257953`. Short. Unknowns stated honestly. TaskQ links the style; it does not redefine it.
 
@@ -46,7 +46,7 @@ Mechanics: [taskq.md § Four roles](https://github.com/alexkirs/taskq/blob/main/
 
 **R10. Multi-project only by explicit list.** A session manages several projects only from an owner-written list. Folders are never auto-discovered. Mechanics: the list is `[projects]` of the PM's `taskq.local.toml`; `taskq projects` runs one ordinary tick per listed checkout ([docs/multiproject-pm.md](https://github.com/alexkirs/taskq/blob/main/docs/multiproject-pm.md)).
 
-**R11. Retire a task's sessions only after accepted review.** A worker or supervisor session of a task ends only after its result is accepted. Sessions without any task are cleanup's: [taskq-manager.md § Cleaning up finished work](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq-manager.md#cleaning-up-finished-work).
+**R11. Retire a task's sessions only after accepted review.** A worker or supervisor session of a task ends only after its result is accepted. A task's sessions are found by the `T<N>`/`S<N>` name prefix; the old form without ORCH still matches. Sessions without any task are cleanup's: [taskq-manager.md § Cleaning up finished work](https://github.com/alexkirs/taskq/blob/main/taskq/contracts/taskq-manager.md#cleaning-up-finished-work).
 
 **R12. Unverified means unknown.** Report only what a fresh read proved. A delivery, exit code, checkout marker or chat turn is not proof of receipt, application or completion.
 

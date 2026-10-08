@@ -370,7 +370,7 @@ class Cycle(unittest.TestCase):
         self.enterContext(patch.object(q, 'AREAS', ('maps', 'engine')))
         self.enterContext(patch.object(q, 'MEMBERS', None))
         self.enterContext(patch.object(q.socket, 'gethostname', return_value='mac-1.local'))
-        self.enterContext(patch.dict(os.environ, {'TASKQ_HOST': ''}))
+        self.enterContext(patch.dict(os.environ, {'TASKQ_HOST': '', 'TASKQ_RUNTIME': ''}))
         self.gitlab = Gitlab()
         self.codex, self.ipc = CodexServer(), AppIpc()
         directory = tempfile.TemporaryDirectory()

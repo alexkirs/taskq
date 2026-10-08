@@ -624,18 +624,19 @@ def report(args):
 def spawn(args):
     """Create a worker session in the main checkout that starts on `--text` (the worker prompt) and print its id.
     Claude: a CLI background session (`claude_spawn`). Codex: `codex_spawn`. Without `--text` the session is idle.
-    The name ends with ` (<machine>)`: the owner sees where each worker runs. No `@`: SendMessage
+    #268: the name is `<T|S><N> <ORCH> <title> (<machine>)` (`session_name`): the owner sees which orchestrator
+    launched each worker and where it runs. No `@`: SendMessage
     rejects a name containing it as a name@team address. A task's worker (`T<N> …`) gets a `launch` note naming
     its session: the binding `take` checks for a supervised task. #243: a supervisor (`S<N> …`) is written into
     its task's block (`assign`)."""
     from taskq.tick import worker_iid, supervisor_iid
-    name = args.name if args.name.endswith(f' ({core.machine()})') else f'{args.name} ({core.machine()})'
+    from taskq.runtimes import get, session_name
+    name = session_name(args.name, core.machine())
     iid, supervised = worker_iid(args.name), supervisor_iid(args.name)
     if supervised:
         unsupervised(core.task(supervised))  # #243: a supervisor (`S<N> …`) only for a ready task without one
     if iid and (found := core.task(iid).get('supervisor')) and not core.is_caller(found):
         core.fail(f'#{iid} is supervised by {core.short(found)}: only that session launches its worker')
-    from taskq.runtimes import get
     session = get(args.runtime, full_access=getattr(args, 'full_access', False), remote_control=args.remote_control).spawn(name, args.text)
     if iid:
         core.note(iid, 'launch', f'session {session}')

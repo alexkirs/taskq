@@ -86,7 +86,10 @@ def report_row(item, agents, activity):
         ['supervisor ' + session_link(found, agents.get(found['session']))] if found else [])
     runtime = claim.get('runtime') or found.get('runtime') or 'unknown'
     title = ' '.join(item['title'].replace('|', '/').split())
-    return f'| {core.ref(item)} {title} | {item["state"]} ({activity}) | {runtime}{core.where(claim)} | {" · ".join(links) or "unavailable"} |'
+    # #268: the orchestrator that launched the session, read from its name; an old name or an unlisted session has none.
+    from taskq.runtimes import orchestrator
+    orch = next(filter(None, (orchestrator((agents.get(who.get('session')) or {}).get('name')) for who in (claim, found))), None)
+    return f'| {core.ref(item)} {title} | {item["state"]} ({activity}) | {runtime}{core.where(claim)}{f", by {orch}" if orch else ""} | {" · ".join(links) or "unavailable"} |'
 
 
 def report(board, rows):

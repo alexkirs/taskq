@@ -371,7 +371,7 @@ The PM starts no worker itself and does no task work (#243, [R2–R3](principles
    its `supervisor`. The supervisor spawns the worker (`T<N> …`) itself, follows it,
    reviews, publishes and closes. Claude: a `claude --bg` session in the main checkout,
    no app window change (§ "Window focus on spawn"). Codex: the first turn of the new thread is the
-   prompt (§ "Other machines"). spawn adds ` (<machine>)` to the name and prints the session id.
+   prompt (§ "Other machines"). spawn turns the name into `<T|S><N> <ORCH> <title> (<machine>)` (#268; ORCH: the launching runtime's code) and prints the session id.
    Never edit the prompt.
 2. Later messages to a worker (an answer, a nudge): Claude — `SendMessage` to the name as `ListAgents`
    shows it; Codex — `taskq codex-send <id> --text "<text>"`.

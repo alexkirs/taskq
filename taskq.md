@@ -87,6 +87,7 @@ Runtime file: four module-level functions.
 ```
 
 - History: every command posts one comment `**<action>** · <runtime>:<session 8>` (or `owner`), then its text.
+  An agent session (the manager too) is named by its own session; a plain shell is `owner`.
   The comments are the log; read them with `gh issue view N --comments` / `glab issue view N --comments`.
 - Trust: only issues and comments of collaborators (GitHub) or members with Reporter or higher (GitLab) count.
   Another author's issue is never a task.
@@ -164,7 +165,8 @@ results and closes. It does no task work itself and never answers a worker's que
 ### Arm the tick
 
 - Claude: `/loop 5m python3 <taskq clone>/taskq.py tick`, from the project root.
-- Headless or no agent: any scheduler (cron, Windows Task Scheduler) that runs `taskq tick` in the project root
+- Headless agent: run `taskq tick`, wait (`python3 -c "import time; time.sleep(300)"`), repeat.
+- No agent: any scheduler (cron, Windows Task Scheduler) that runs `taskq tick` in the project root
   every 5 minutes; nobody reads the table then, so check `taskq list` yourself.
 - Codex: an automation every 5 minutes with the prompt "Run `python3 <taskq clone>/taskq.py tick` in
   `<project root>` and follow the table it prints."
@@ -176,9 +178,10 @@ results and closes. It does no task work itself and never answers a worker's que
 2. `doing`, claimed on this machine: `alive` False → requeue (`session ... is gone`); alive and the issue unchanged
    for 120 minutes → `send(session, 'continue: read your issue')`, comment `nudge`.
 3. `ready`, deps closed, host matches, a free slot for its runtime (`run-*` label, else the first free in
-   `limits`) → `spawn(T<N>, brief, root)`, claim, `q-doing`, comment `spawn` with the session link.
+   `limits`) → `spawn(T<N>, brief, root)`, claim, `q-doing`, comment `spawn` (with the session link when the runtime has one yet).
 4. `ask`, `review`, `later`: nothing; they wait for the manager.
-5. Print the table `Task | State | Runtime | Session link`, then `Board: <url>`.
+5. Print the table `Task | State | Runtime | Session link` by priority, then number; then `Board: <url>`.
+   Another machine's claim shows its bare session id: only that machine can link it.
 
 A failure (a spawn that cannot start, a board error) stops the pass with `taskq: <error>` and exit 1, no table;
 the tasks it did not reach wait for the next pass. Fix the cause or tell the owner.
@@ -192,7 +195,7 @@ Reply to the owner with the table as printed (links, not bare ids), then one or 
   the next tick and a new worker continues branch `taskq-<N>`; a live one reads it on its next nudge.
 - `review`: check the result.
   1. `git show <sha> --stat`, then the diff, against every Acceptance item (`pr` mode: the PR diff).
-  2. CI on that exact SHA is green: `gh run list --commit <sha>` / `glab api "projects/:id/pipelines?sha=<sha>"`, where the project
+  2. A commit: CI on that exact SHA is green (an answer on `origin/main` needs no CI check): `gh run list --commit <sha>` / `glab api "projects/:id/pipelines?sha=<sha>"`, where the project
      has CI.
   3. Accepted: `taskq close N --text "<what was checked, what was not>"`.
   4. Not accepted: `taskq requeue N --text "<exact fixes>"`. The next worker reads the reason in the history.

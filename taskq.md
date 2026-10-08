@@ -155,6 +155,9 @@ Rules:
 - `pr` mode: a PR that does not merge (conflict, failing checks) goes back to `ready` with the platform's message;
   a head that differs from the result SHA, or several PRs, refuses the close.
 - `pr` mode and no PR (an answer): `close` checks the SHA is on `origin/main`, as in `direct`.
+- Both modes, on the machine named in the claim: `close` removes a clean `.worktrees/taskq-<N>` (`git worktree remove`)
+  and the local branch `taskq-<N>` (`git branch -D`). A worktree with uncommitted changes stays, with its branch, and
+  the close comment says so. Never `--force` (#284).
 - `main` is always green: in `direct` mode the worker runs the tests before the push.
 - `pr` mode is workflow, not a security boundary: use protected branches for that.
 

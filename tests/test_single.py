@@ -114,6 +114,29 @@ class Commands(Base):
             self.run_cli('close', '1')
         self.assertEqual(self.board.issues[1]['state'], 'open')
 
+    def test_close_removes_clean_worktree_keeps_dirty(self):
+        real = subprocess.run
+        fake = lambda command, **kw: subprocess.CompletedProcess(command, 0) if {'fetch', 'merge-base'} & set(command) else real(command, **kw)
+        with tempfile.TemporaryDirectory() as folder:
+            root = taskq.CONFIG['root'] = Path(folder)
+            git = ['git', '-C', folder, '-c', 'user.name=t', '-c', 'user.email=t@t']
+            real([*git, 'init', '-q'], check=True)
+            real([*git, 'commit', '-q', '--allow-empty', '-m', 'init'], check=True)
+            for n in (1, 2):
+                self.add()
+                self.run_cli('take', str(n))
+                self.run_cli('result', str(n), '--sha', 'a' * 40)
+                real([*git, 'worktree', 'add', '-q', '-b', f'taskq-{n}', f'.worktrees/taskq-{n}'], check=True)
+            (root / '.worktrees' / 'taskq-2' / 'wip.txt').write_text('x')
+            with mock.patch.object(taskq.subprocess, 'run', side_effect=fake):
+                self.run_cli('close', '1')
+                self.run_cli('close', '2')
+            branches = real([*git, 'branch', '--list', 'taskq-*'], capture_output=True, text=True).stdout.split()
+            self.assertEqual((sorted(p.name for p in (root / '.worktrees').iterdir()), branches), (['taskq-2'], ['+', 'taskq-2']))
+        self.assertEqual(self.board.issues[1]['comments'][-1], '**close** · claude:01234567')
+        self.assertEqual(self.board.issues[2]['comments'][-1],
+                         '**close** · claude:01234567\n\nkept .worktrees/taskq-2 and branch taskq-2: uncommitted changes')
+
     def test_requeue_and_later(self):
         self.add()
         self.run_cli('take', '1')

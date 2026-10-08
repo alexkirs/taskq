@@ -2,6 +2,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import subprocess
 import tempfile
@@ -111,9 +112,6 @@ class Commands(Base):
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)), \
                 self.assertRaisesRegex(SystemExit, 'not on origin/main'):
             self.run_cli('close', '1')
-        taskq.CONFIG['publish'] = 'pr'
-        with self.assertRaisesRegex(SystemExit, 'not supported yet'):
-            self.run_cli('close', '1')
         self.assertEqual(self.board.issues[1]['state'], 'open')
 
     def test_requeue_and_later(self):
@@ -136,6 +134,68 @@ class Commands(Base):
         os.environ.pop('CLAUDE_CODE_SESSION_ID')
         with self.assertRaisesRegex(SystemExit, 'agent session'):
             self.run_cli('take', '1')
+
+
+class PullRequests(Base):
+    """pr mode: `close` drives gh / glab, faked here by the command name."""
+
+    def setUp(self):
+        super().setUp()
+        taskq.CONFIG.update(publish='pr', repo='o/r')
+        self.add()
+        self.run_cli('take', '1')
+        self.run_cli('result', '1', '--sha', 'a' * 40)
+        self.calls, self.prs, self.merged = [], [{'number': 7, 'headRefOid': 'a' * 40}], True
+
+    def cli(self, command, **_):
+        self.calls.append(command[1:])
+        verb = command[2]
+        out = {'list': json.dumps(self.prs), 'view': json.dumps({'state': 'MERGED' if self.merged else 'OPEN', 'mergeCommit': {'oid': 'c' * 40}})}
+        return subprocess.CompletedProcess(command, int(verb == 'merge' and not self.merged), out.get(verb, ''), 'Pull request is not mergeable')
+
+    def close(self):
+        with mock.patch.object(taskq.subprocess, 'run', side_effect=self.cli), mock.patch.object(taskq.shutil, 'which', side_effect=lambda name: name):
+            return self.run_cli('close', '1')
+
+    def test_brief(self):
+        item = self.task(1)
+        prompt = taskq.brief(item, 'claude')
+        self.assertIn('`git push --force-with-lease origin HEAD:refs/heads/taskq-1`', prompt)
+        self.assertIn('`gh pr create --base main --head taskq-1 --title "<title>" --body "<summary>"`', prompt)
+        self.assertIn('--sha <PR head full SHA>', prompt)
+        taskq.CONFIG['board'] = 'gitlab'
+        self.assertIn('`glab mr create --yes --target-branch main --source-branch taskq-1', taskq.brief(item, 'claude'))
+        taskq.CONFIG['publish'] = 'direct'
+        self.assertIn('`git push origin HEAD:main`', taskq.brief(item, 'claude'))
+
+    def test_close_merges(self):
+        self.assertEqual(self.close(), '#1 closed\n')
+        self.assertEqual(self.calls[1], ['pr', 'merge', '7', '--squash', '--delete-branch', '--match-head-commit', 'a' * 40, '-R', 'o/r'])
+        self.assertEqual(self.board.issues[1]['state'], 'closed')
+        self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\nmerged {"c" * 40}')
+
+    def test_head_is_not_the_result(self):
+        self.prs[0]['headRefOid'] = 'b' * 40
+        with self.assertRaisesRegex(SystemExit, 'do not match the result'):
+            self.close()
+        self.assertEqual((self.task(1)['state'], len(self.calls)), ('review', 1))
+
+    def test_refusal_requeues(self):
+        self.merged = False
+        with self.assertRaisesRegex(SystemExit, 'PR 7 did not merge: Pull request is not mergeable'):
+            self.close()
+        self.assertEqual((self.task(1)['state'], self.task(1)['claim']), ('ready', None))
+        self.assertIn('close: PR 7 did not merge: Pull request is not mergeable', self.board.issues[1]['comments'][-1])
+
+    def test_gitlab_and_review_mode(self):
+        taskq.CONFIG.update(board='gitlab', host='git.example')
+        self.prs = [{'iid': 7, 'sha': 'a' * 40}]
+        self.close()
+        self.assertEqual(self.calls[1][-3:], ['--yes', '-R', 'https://git.example/o/r'])
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, 'taskq.json').write_text('{"publish": "review"}')
+            with self.assertRaisesRegex(SystemExit, 'use "direct" or "pr"'):
+                taskq.load_config(folder)
 
 
 class FakeRuntime:

@@ -15,35 +15,30 @@ BLOCK = re.compile(r'<!-- taskq:start -->\s*```json\n(.*?)\n```\s*<!-- taskq:end
 SESSIONS = {'claude': 'CLAUDE_CODE_SESSION_ID', 'codex': 'CODEX_THREAD_ID'}
 CONFIG, BOARD = {}, None  # set by main, or by a test
 
-
 def fail(message):
     sys.exit(f'taskq: {message}')
-
 
 def load_config(start=None):
     """taskq.json: the nearest one from `start` (the current directory) up; its folder is the project root."""
     here = Path(start or Path.cwd()).resolve()
     for folder in [here, *here.parents]:
         if (folder / 'taskq.json').is_file():
-            return {'board': 'github', 'publish': 'direct', **json.loads((folder / 'taskq.json').read_text('utf-8')), 'root': folder}
+            config = {'board': 'github', 'publish': 'direct', **json.loads((folder / 'taskq.json').read_text('utf-8')), 'root': folder}
+            return config if config['publish'] in ('direct', 'pr') else fail(f'publish {config["publish"]!r}: use "direct" or "pr"')
     fail('no taskq.json in this directory or above')
-
 
 def machine():
     name = os.environ.get('TASKQ_HOST') or socket.gethostname()
     return CONFIG.get('hosts', {}).get(name) or name.split('.')[0].lower()
-
 
 def session():
     """This agent session, or None for the owner's shell. TASKQ_RUNTIME picks one when a session inherited another's id."""
     found = [r for r in SESSIONS if os.environ.get(SESSIONS[r]) and os.environ.get('TASKQ_RUNTIME', r) == r]
     return {'runtime': found[0], 'session': os.environ[SESSIONS[found[0]]]} if found else None
 
-
 def who():
     current = session()
     return f'{current["runtime"]}:{current["session"][:8]}' if current else 'owner'
-
 
 def parse(issue):
     """A board issue as a task, or None when it is not one: no block or not exactly one known q-* label."""
@@ -59,7 +54,6 @@ def parse(issue):
             'host': next((label[len(ON):] for label in labels if label.startswith(ON)), None),
             'priority': min([int(label[9:]) for label in labels if re.fullmatch(r'priority-\d', label)] or [9]),
             'updated_at': issue.get('updated_at'), 'url': issue.get('url'), 'text': BLOCK.sub('', issue['body']).strip()}
-
 
 def block(text, fields):
     """The description: the task's text, then its JSON block. Keys the model does not know are kept as they are."""
@@ -77,7 +71,6 @@ def run_api(tool, host, method, path, body=None):
     if done.returncode:
         fail(f'{tool} api {method} {path}: {done.stderr.strip() or done.stdout.strip()}')
     return json.loads(done.stdout) if done.stdout.strip() else None
-
 
 class GitHub:
     def __init__(self, repo, host=None):
@@ -124,7 +117,6 @@ class GitHub:
     def close(self, n):
         self.api('PATCH', f'issues/{n}', {'state': 'closed'})
 
-
 class GitLab(GitHub):
     members = None  # read once per process
 
@@ -163,14 +155,12 @@ class GitLab(GitHub):
     def close(self, n):
         self.api('PUT', f'issues/{n}', {'state_event': 'close'})
 
-
 def load_file(path, root=None):
     """A board or runtime file (relative to the project root): its module-level functions are the protocol."""
     spec = importlib.util.spec_from_file_location(f'taskq_{Path(path).stem}', (root or CONFIG['root']) / path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
 
 def make_board(config):
     """`board`: github, gitlab, or a .py file with the six functions at module level."""
@@ -187,7 +177,6 @@ def make_board(config):
 
 def worker_env():  # a worker must not inherit the tick's session id
     return {key: value for key, value in os.environ.items() if key not in SESSIONS.values()}
-
 
 class Claude:
     # #38, #51, #71: a worker gets only these tools, no MCP, no Chrome, and a pinned mode (else `auto` stops `taskq`).
@@ -239,7 +228,6 @@ class Claude:
         bridge = job.get('bridgeSessionId') if job.get('sessionId') == session else None
         return bridge and 'https://claude.ai/code/session_' + re.sub('^(cse_|session_)', '', bridge)
 
-
 def pid_alive(pid):
     if os.name != 'nt':
         try:
@@ -254,7 +242,6 @@ def pid_alive(pid):
     ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
     ctypes.windll.kernel32.CloseHandle(handle)
     return code.value == 259  # STILL_ACTIVE
-
 
 class Codex:
     """`codex exec`, headless: one process per turn, its JSONL in .taskq/<name>.log, `<pid> <thread>` in .taskq/<name>.pid."""
@@ -298,7 +285,6 @@ class Codex:
     def link(self, session):
         return f'{CONFIG.get("pages", "https://alexkirs.github.io/taskq/").rstrip("/")}/open.html#codex://threads/{session}'
 
-
 def runtimes():
     """claude, codex, and each `"runtimes": {"name": "runtimes/name.py"}` file of taskq.json."""
     return {'claude': Claude(), 'codex': Codex(), **{name: load_file(path) for name, path in CONFIG.get('runtimes', {}).items()}}
@@ -315,7 +301,6 @@ def task(n, *states):
         fail(f'#{n} is {found["state"]}, not {" or ".join(states)}')
     return found
 
-
 def move(current, state, action, text='', **fields):
     """One update moves the label and the block together; one comment is the history. State None: no state label."""
     labels = [label for label in current['labels'] if not label.startswith(PREFIX)] + ([PREFIX + state] if state else [])
@@ -324,10 +309,8 @@ def move(current, state, action, text='', **fields):
     BOARD.comment(current['iid'], f'**{action}** · {who()}' + (f'\n\n{text}' if text else ''))
     print(f'#{current["iid"]} {state or "closed"}')
 
-
 def open_deps(deps):
     return [n for n in deps or [] if BOARD.get(n)['state'] == 'open']
-
 
 def cmd_add(args):
     text = f'## Goal\n\n{args.goal}\n\n## Acceptance\n\n{args.acceptance}'
@@ -337,7 +320,6 @@ def cmd_add(args):
     n = BOARD.add(args.title, block(text, {'scope': args.scope, 'deps': args.deps, 'claim': None, 'result': None}), labels)
     BOARD.comment(n, f'**add** · {who()}')
     print(f'#{n} {state}')
-
 
 def cmd_list(args):
     found = [item for item in map(parse, BOARD.list(args.state)) if item]
@@ -349,13 +331,11 @@ def cmd_list(args):
         print(f'#{item["iid"]:<4} {item["state"]:<8} p{item["priority"]} {item["runtime"]:<6} {item["title"]}'
               + (f'  [{detail}]' if detail else ''))
 
-
 def cmd_take(args):
     current, mine = task(args.n, 'ready'), session() or fail('take needs an agent session: set ' + ' or '.join(SESSIONS.values()))
     if open_deps(current['deps']):
         fail(f'#{args.n} has open dependencies')
     move(current, 'doing', 'take', claim={**mine, 'name': machine()}, result=None)
-
 
 # Moves with no other check: command -> (states it takes from, state it goes to, block changes).
 MOVES = {'ask': (('doing',), 'ask', lambda args: {}), 'answer': (('ask',), 'doing', lambda args: {}),
@@ -363,33 +343,58 @@ MOVES = {'ask': (('doing',), 'ask', lambda args: {}), 'answer': (('ask',), 'doin
          'later': (STATES, 'later', lambda args: {'waiting_for': args.text or None}),
          'result': (('doing',), 'review', lambda args: {'result': {'sha': args.sha, 'checks': args.checks}})}
 
-
 def cmd_move(args):
     sources, state, fields = MOVES[args.command]
     move(task(args.n, *sources), state, args.command, args.text, **fields(args))
-
 
 def commit(sha):
     """A result's commit: hex only, so it never reaches git as an option."""
     return sha if re.fullmatch('[0-9a-f]{7,40}', sha) else fail(f'{sha!r} is not a commit: 7 to 40 lowercase hex digits')
 
+def merge(current, sha):
+    """pr mode: squash-merge the one open PR/MR of branch taskq-<N> when its head is the result: the merge commit, None with no PR.
+    A PR that does not merge (conflict, failing checks) goes back to the worker: requeue with the platform's message."""
+    lab, host, branch = CONFIG['board'] == 'gitlab', CONFIG.get('host'), f'taskq-{current["iid"]}'
+    where = ['-R', (f'https://{host}/' if lab else f'{host}/') * bool(host) + CONFIG['repo']]  # gh takes HOST/OWNER/REPO, glab a URL
+
+    def cli(*command):
+        done = subprocess.run([shutil.which(command[0]) or fail(f'{command[0]} not found'), *command[1:], *where], capture_output=True, text=True, encoding='utf-8')
+        return done.returncode, (done.stderr.strip() or done.stdout.strip()) if done.returncode else done.stdout
+    code, out = cli(*(['glab', 'mr', 'list', '--source-branch', branch, '--output', 'json'] if lab else ['gh', 'pr', 'list', '--head', branch, '--json', 'number,headRefOid']))
+    found = code and fail(out) or [(str(pr.get('iid', pr.get('number'))), pr.get('sha', pr.get('headRefOid'))) for pr in json.loads(out)]
+    if len(found) != 1 or not found[0][1].startswith(sha):
+        return found and fail(f'{branch}: open PRs (number, head) {found} do not match the result {sha}')
+    number, head = found[0]
+    _, out = cli(*(['glab', 'mr', 'merge', number, '--squash', '--remove-source-branch', '--sha', head, '--auto-merge=false', '--yes'] if lab
+                   else ['gh', 'pr', 'merge', number, '--squash', '--delete-branch', '--match-head-commit', head]))
+    code, viewed = cli(*(['glab', 'mr', 'view', number, '--output', 'json'] if lab else ['gh', 'pr', 'view', number, '--json', 'state,mergeCommit']))
+    pr = {} if code else json.loads(viewed)
+    if str(pr.get('state')).lower() != 'merged':  # read back: a merge that reported an error may still have merged
+        move(current, 'ready', 'requeue', f'close: PR {number} did not merge: {out}', claim=None, result=None)
+        fail(f'#{current["iid"]}: PR {number} did not merge: {out}')
+    return pr.get('merge_commit_sha') or pr.get('squash_commit_sha') or pr['mergeCommit']['oid']
 
 def cmd_close(args):
     current = task(args.n, 'review')
-    if CONFIG['publish'] != 'direct':
-        fail(f'publish mode {CONFIG["publish"]!r}: not supported yet')
     sha = commit((current['result'] or {}).get('sha') or '')
-    git = [shutil.which('git') or fail('git not found'), '-C', str(CONFIG['root'])]
-    subprocess.run([*git, 'fetch', 'origin'], capture_output=True)
-    if subprocess.run([*git, 'merge-base', '--is-ancestor', sha, 'origin/main'], capture_output=True).returncode:
-        fail(f'#{args.n}: result {sha} is not on origin/main')
+    merged = CONFIG['publish'] == 'pr' and merge(current, sha)
+    if merged:
+        args.text = f'merged {merged}' + (f'\n\n{args.text}' if args.text else '')
+    else:  # direct mode, or a pr-mode task with no PR (an answer): the result must be on main
+        git = [shutil.which('git') or fail('git not found'), '-C', str(CONFIG['root'])]
+        subprocess.run([*git, 'fetch', 'origin'], capture_output=True)
+        if subprocess.run([*git, 'merge-base', '--is-ancestor', sha, 'origin/main'], capture_output=True).returncode:
+            fail(f'#{args.n}: result {sha} is not on origin/main')
     move(current, None, 'close', args.text)
     BOARD.close(args.n)
-
 
 def brief(item, runtime):
     """The worker's prompt: the task, its workspace, the taskq commands it uses."""
     n, root, tq = item['iid'], CONFIG['root'], f'python3 {Path(__file__).resolve()}'
+    create = f'glab mr create --yes --target-branch main --source-branch taskq-{n} --title "<title>" --description' if CONFIG['board'] == 'gitlab' \
+        else f'gh pr create --base main --head taskq-{n} --title "<title>" --body'
+    push = f'`git push --force-with-lease origin HEAD:refs/heads/taskq-{n}`, open a pull request once (a push updates it):\n  `{create} "<summary>"`, ' \
+        f'then `{tq} result {n} --sha <PR head full SHA>' if CONFIG['publish'] == 'pr' else f'`git push origin HEAD:main`, then\n  `{tq} result {n} --sha <pushed full SHA>'
     return f'''You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
 Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
 
@@ -398,20 +403,18 @@ Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_
 Expected paths: {", ".join(item["scope"] or []) or "none named"}. They say where the work is expected, not what is forbidden.
 
 Workspace: from {root} run `git fetch origin && git worktree add -b taskq-{n} .worktrees/taskq-{n} origin/main`, work only there,
-never in the main checkout. A task that ends in an answer, not a commit, needs no worktree. Commands:
+never in the main checkout; a branch taskq-{n} left by an earlier worker: continue it. A task that ends in an answer, not a commit,
+needs no worktree. Commands:
 - A question only the owner can decide (a product choice, an action that cannot be undone): `{tq} ask {n} --text "<question>"`, then stop.
 - Cannot be done: `{tq} requeue {n} --text "<why>"`, then stop.
-- Deliver: commit, `git fetch origin && git rebase origin/main`, run the tests, `git push origin HEAD:main`, then
-  `{tq} result {n} --sha <pushed full SHA> --checks "<commands and outcome>" --text "<summary>"`, then stop.
+- Deliver: commit on branch taskq-{n}, `git fetch origin && git rebase origin/main`, run the tests, {push} --checks "<commands and outcome>" --text "<summary>"`, then stop.
   An answer with no commit: the result names the current origin/main SHA and the text holds the answer.
 Everything written through taskq is public: no secrets, tokens or paths outside the repository.'''
-
 
 def age(item):
     """Minutes since the issue last changed: a comment changes it too."""
     changed = datetime.fromisoformat((item['updated_at'] or '').replace('Z', '+00:00'))
     return (datetime.now(timezone.utc) - changed).total_seconds() / 60
-
 
 def cmd_tick(args):
     """One pass: requeue dead workers, nudge silent ones, free waiting tasks, spawn ready ones, print the table."""
@@ -456,9 +459,7 @@ def cmd_tick(args):
     host, repo = CONFIG.get('host'), CONFIG.get('repo')
     url = CONFIG.get('board_url') or {'github': f'https://{host or "github.com"}/{repo}/issues',
                                       'gitlab': f'https://{host or "gitlab.com"}/{repo}/-/issues'}.get(CONFIG['board'])
-    if url:  # a board file names its page in `board_url`
-        print(f'Board: {url}')
-
+    url and print(f'Board: {url}')  # a board file names its page in `board_url`
 
 def main(argv=None):
     global CONFIG, BOARD
@@ -493,7 +494,6 @@ def main(argv=None):
         CONFIG = load_config()
         BOARD = make_board(CONFIG)
     args.function(args)
-
 
 if __name__ == '__main__':
     main()

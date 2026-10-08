@@ -862,9 +862,15 @@ def main(argv=None):
         item.set_defaults(function=function)
         for names, options in arguments:
             item.add_argument(*names, **options)
+        return item
+
+    def text_input(item, required=True):
+        """One literal text source; file input avoids shell escaping, never transforms its bytes."""
+        group = item.add_mutually_exclusive_group(required=required)
+        group.add_argument('--text')
+        group.add_argument('--text-file', type=Path, metavar='PATH')
     json_flag = (('--json',), {'action': 'store_true', 'help': 'structured JSON output'})
     iid = (('iid',), {'type': int})
-    text = (('--text',), {'required': True})
     command('add', add, (('--title',), {'required': True}), (('--goal',), {'required': True}),
             (('--acceptance',), {'required': True}), (('--type',), {'required': True, 'choices': TYPES}),
             (('--scope',), {'nargs': '*', 'default': []}), (('--deps',), {'nargs': '*', 'type': int, 'default': []}),
@@ -886,12 +892,12 @@ def main(argv=None):
     command('worker', worker, *profile_flags)
     command('take', take, iid)
     command('beat', beat, iid)
-    command('ask', ask, iid, text)
-    command('result', result, iid, text, (('--sha',), {'type': commit}), (('--checks',), {'required': True}))
+    text_input(command('ask', ask, iid))
+    text_input(command('result', result, iid, (('--sha',), {'type': commit}), (('--checks',), {'required': True})))
     for name in ('answer', 'reject', 'release'):
-        command(name, requeue, iid, text)
-    command('close', close, iid, text)
-    command('later', later, iid, text)
+        text_input(command(name, requeue, iid))
+    text_input(command('close', close, iid))
+    text_input(command('later', later, iid))
     command('edit', edit, iid, (('--deps',), {'nargs': '*', 'type': int}), (('--scope',), {'nargs': '*'}),
             (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}))
     command('report-verify', verify_report, (('file',), {'help': 'supported-channel report readback JSON; no transport or receipt writes'}))
@@ -903,26 +909,26 @@ def main(argv=None):
             (('--uninstall-timer',), {'action': 'store_true', 'help': 'remove that launchd timer'}))
     command('profile', profile_init, (('what',), {'choices': ('init',)}), *profile_flags,
             (('--preferred-runtime',), {'choices': tuple(RUNTIMES), 'help': 'tie-break for own tasks of any runtime'}))
-    command('spawn', spawn, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),
+    spawn_command = command('spawn', spawn, (('--runtime',), {'choices': tuple(RUNTIMES), 'default': 'claude'}),
             (('--name',), {'default': 'taskq worker', 'help': 'session name: "T<N> <words>"; " (<this machine>)" is added'}),
             (('--remote-control',), {'action': argparse.BooleanOptionalAction, 'default': True,
                                       'help': 'Claude: Remote Control, so tick links the session at claude.ai (default on)'}),
-            (('--text',), {'help': 'the worker prompt the session starts on (tick prints it); idle without it'}),
             (('--codex-full-access',), {'dest': 'full_access', 'action': 'store_true',
                                         'help': f'Codex: danger-full-access instead of workspace-write (tick sets it for {FULL_ACCESS})'}))
+    text_input(spawn_command, required=False)
     command('view', view, iid, (('--notes',), {'type': int, 'default': 3, 'help': 'last notes to print (default 3)'}))
     claude_session = (('session',), {'help': 'Claude session id (or local_<id>)'})
     command('show', show, claude_session,
             (('--restore',), {'help': 'app session to show again after the import (default: the calling session)'}))
     command('retire', retire, claude_session)
     thread = (('thread',), {})
-    command('codex-send', codex_send, thread, text)
-    command('send', send, (('--runtime',), {'required': True, 'choices': tuple(RUNTIMES)}), (('session',), {}), text)
+    text_input(command('codex-send', codex_send, thread))
+    text_input(command('send', send, (('--runtime',), {'required': True, 'choices': tuple(RUNTIMES)}), (('session',), {})))
     command('codex-read', codex_read, thread,
             (('--limit',), {'type': int, 'choices': range(1, 21), 'default': 3, 'metavar': '1..20',
                            'help': 'recent turns (default 3), up to 100 latest events per turn'}))
     command('codex-archive', codex_archive, thread)
-    command('problem', problem, text, (('--task',), {'type': int}))
+    text_input(command('problem', problem, (('--task',), {'type': int})))
     command('cleanup', cleanup, json_flag, (('--apply',), {'action': 'store_true'}))
     for name in ('init', 'migrate'):
         command(name, migrate, (('--project',), {'help': 'GitLab project path: writes a minimal taskq.toml here if none'}),
@@ -942,6 +948,12 @@ def main(argv=None):
                                  'help': 'environment of the worker side, e.g. GITLAB_TOKEN=broken or GH_TOKEN=broken to see a failure named'}),
             (('--wait',), {'type': int, 'default': 600, 'help': 'full: seconds a worker session may take per step'}))
     args = parser.parse_args(argv)
+    if getattr(args, 'text_file', None) is not None:
+        try:
+            with args.text_file.open(encoding='utf-8', newline='') as handle:
+                args.text = handle.read()
+        except (OSError, UnicodeError) as error:
+            parser.error(f'cannot read --text-file {args.text_file}: {error}')
     where = getattr(args, 'project', None) or getattr(args, 'github', None)
     if where:
         write_config(not args.project, where, args.host)

@@ -51,7 +51,7 @@ Example:
 | Route | Source | Destination/readback | Current status |
 |---|---|---|---|
 | DOT ↔ Codex | `taskq codex-send THREAD --text TEXT` | Codex thread; `codex-read` is diagnostic only | unqualified |
-| DOT ↔ Claude | configured `taskq send --runtime R SESSION --text TEXT` | runtime-supported readback | unqualified |
+| DOT ↔ Claude | configured runtime executor | runtime-supported readback; generic `taskq send --runtime claude` refuses | unqualified |
 | worker ↔ PM board | `claim`, `result`, `ask`, `answer`, issue notes | `taskq view IID --notes N` | authoring reproduction below; live route qualification incomplete |
 | PM report | #191 readback JSON | `taskq report-verify FILE` | schema/fixture only unless supported live evidence is supplied |
 
@@ -77,11 +77,12 @@ Root GitHub подтверждает221CLOSED07:49:18 exact620d0207;223покаq
 
 ## Exact minimal refactor proposal — pending acceptance
 
-Do not implement this proposal until it is accepted and registered.
+Implemented by #232 after technical acceptance: `ce4e4ce` is the docs-first
+proposal; the parser change keeps delivery text verbatim.
 
 | Area | Proposed change |
 |---|---|
-| `taskq/__init__.py` | Extend the shared parser used by `ask`, `result`, `answer`, `reject`, `release`, `codex-send` and `send`: exactly one of existing `--text TEXT` or optional `--text-file PATH`; read the latter as UTF-8 text verbatim. |
+| `taskq/__init__.py` | Extend the shared parser used by `ask`, `result`, `answer`, `reject`, `release`, `close`, `later`, `problem`, `codex-send`, `send` and optional-text `spawn`: exactly one input where text is required; UTF-8 file text is read verbatim. |
 | `taskq/worker.py`, `taskq/codex.py` | No route/serialization change: both continue consuming `args.text`. |
 | tests | Parser/read-file regressions: real paragraphs, Unicode, Markdown links, code, literal backslash-n unchanged; reject absent/both inputs; assert the existing `--text` callers remain compatible. |
 
@@ -93,9 +94,10 @@ newline mistakes while leaving transport text verbatim.
 
 - The #191 report-contract fixture accepts labelled Codex, Claude and DOT
   readback schemas. It is not live transport qualification.
-- `taskq codex-read 01a11aab-0be7-7632-b8433-da13f9400c62 --limit 1` was
+- `taskq codex-read 01a11aab-0be7-7632-8433-da13f9400c62 --limit 1` was
   refused locally with `PermissionError: [Errno 1] Operation not permitted`
-  while connecting to the Codex socket. No Codex payload was sent or read.
+  while connecting to the Codex socket. No Codex payload was sent or read. An
+  earlier malformed probe ID is not evidence that it caused this refusal.
 - No owned Claude session was supplied for a harmless probe; do not message
   another worker's session.
 - Board evidence above is an exact source/readback reproduction, not a

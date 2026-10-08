@@ -257,6 +257,22 @@ How to start manager and coordinator sessions, enable the tick and run acceptanc
 
 ## Task flow
 
+### Message input
+
+Commands that require `--text TEXT` also accept `--text-file PATH`; give exactly one.
+TaskQ reads the file as strict UTF-8 and passes its contents verbatim: LF/CRLF,
+spaces, Unicode, links, code and literal `\\n` stay unchanged. A missing, unreadable
+or invalid-UTF-8 file stops before any action or tracker write. `spawn` keeps its
+old optional text behavior: omit both for an idle session, or use exactly one.
+Supported commands are `ask`, `result`, `answer`, `reject`, `release`, `close`,
+`later`, `problem`, `codex-send`, `send`, and `spawn`.
+
+```sh
+taskq ask 12 --text-file question.md
+taskq codex-send THREAD --text-file handoff.md
+taskq result 12 --checks 'tests passed' --text 'Done'
+```
+
 ```
 add → ready ⇄ waiting                       tick only, by deps
       ready → take → doing → result → review → close

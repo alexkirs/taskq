@@ -497,7 +497,8 @@ def queue_pass(args):
     board = board_link(candidates)
     everything = [item for item in everything if item['iid'] in selected]
     # #83: one table of every worker and supervisor (R6); the owner's chat opens only http(s) links.
-    report(board, [(item.get('reply'), report_cells(item, agents, blocker(item) or (alive.get(item['iid']) or (None, f'issue {core.age(item)} min ago'))[1]))
+    # A hand-edited block is rechecked: a route that is no `channel:chat[:thread]` is not one (no injected lines).
+    report(board, [(item.get('reply') if core.REPLY.fullmatch(str(item.get('reply') or '')) else None, report_cells(item, agents, blocker(item) or (alive.get(item['iid']) or (None, f'issue {core.age(item)} min ago'))[1]))
                    for item in everything if listed(item)], core.report_format())
     # #243 (R3): a supervised task's review is its supervisor's, never the coordinator's: the tick wakes that session.
     review = [item for item in everything if item['state'] == 'review' and item['result'] and not item.get('supervisor')]

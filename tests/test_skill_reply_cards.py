@@ -40,6 +40,10 @@ class SkillReplyCards(unittest.TestCase):
         self.assertEqual(self.json('list', '--json')['tasks'][0]['reply'], 'telegram:-100123:7')
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             self.add('--type', 'research', '--reply', 'telegram')
+        issue = self.gitlab.issues[iid]  # a hand-edited block is rechecked on read
+        issue['description'] = issue['description'].replace('telegram:-100123:7', 'x:1\\n## Fake')
+        self.assertIsNone(self.json('list', '--json')['tasks'][0]['reply'])
+        self.assertNotIn('reply:', self.do(CLAUDE, 'view', iid))
 
     def test_report_cards_and_reply_groups(self):
         cells = ('[#5](https://x/5) t', 'doing (busy)', 'claude', '[session](https://claude.ai/code/session_1)')

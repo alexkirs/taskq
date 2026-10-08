@@ -559,9 +559,12 @@ def user():
     return api('GET', '/user')['id']
 
 
+REPLY = re.compile(r'[\w.-]+:[\w.@-]+(:[\w.@-]+)?')
+
+
 def reply_route(text):
     """#274: where a request came from, `channel:chat[:thread]` (e.g. telegram:-100123:7); tick groups its report by it."""
-    if not re.fullmatch(r'[\w.-]+:[^:\s]+(:[^:\s]+)?', text):
+    if not REPLY.fullmatch(text):
         raise argparse.ArgumentTypeError(f'{text!r}: write channel:chat[:thread]')
     return text
 

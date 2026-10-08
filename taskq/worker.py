@@ -259,7 +259,8 @@ def listing(args):
 def task_json(item, **extra):
     """A task in `--json` output (#274): the same keys for list and view."""
     return {'id': item['iid'], 'title': item['title'], 'state': item['state'], 'priority': item['priority'],
-            'runtime': item['runtime'], 'url': item.get('web_url'), 'claim': item['claim'], 'reply': item.get('reply'), **extra}
+            'runtime': item['runtime'], 'url': item.get('web_url'), 'claim': item['claim'],
+            'reply': item.get('reply') if core.REPLY.fullmatch(str(item.get('reply') or '')) else None, **extra}
 
 
 def set_runtime(args):
@@ -850,7 +851,7 @@ def view(args):
     print('claim: ' + (f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]}{core.where(claim)}' if claim else 'none'))
     if found := item.get('supervisor'):
         print(f'supervisor: {core.short(found)}')
-    if item.get('reply'):
+    if core.REPLY.fullmatch(str(item.get('reply') or '')):
         print(f'reply: {item["reply"]}')
     if hasattr(args, 'output'):
         args.output['tasks'].append(task_json(item, state='closed' if closed else item['state']))

@@ -118,27 +118,12 @@ class Builtin:
 
 
 def retire_command(root, tree):
-    """Remove a finished tree: the helpers' retire, else `git worktree remove` (no --force: git refuses a dirty tree)."""
-    if core.HELPERS:
-        return [sys.executable, str(Path(root) / core.HELPERS / 'workspace_gc.py'), 'retire', str(tree), '--delete']
+    """Remove a finished tree without force: git refuses a dirty tree."""
     return ['git', '-C', str(root), 'worktree', 'remove', '--', str(tree)]
 
 
-def helpers(root):
-    """The project's worktree tools (`workspace_gc`, `host_gentle`) from [workspace] cleanup_helpers, else the built-ins."""
-    if not core.HELPERS:
-        return Builtin
-    folder = str(Path(root) / core.HELPERS)
-    if folder not in sys.path:
-        sys.path.insert(0, folder)
-    import host_gentle
-    import workspace_gc
-    host_gentle.lower_priority()
-    return workspace_gc
-
-
 def cleanup_plan(root):
-    gc = helpers(root)
+    gc = Builtin
     rows = gc.worktrees(root)
     roots = {Path(row['worktree']).resolve() for row in rows}
     issues, app = cleanup_issues(), core.claude_sessions()
@@ -162,8 +147,9 @@ def cleanup_plan(root):
     task_name = lambda name: bool(re.fullmatch(r'(?:worktree-)?taskq-[0-9]+', name))
     spawned_trees = {Path(meta['cwd']).resolve() for sid, meta in app.items()
                      if meta.get('cwd') and meta.get('adoptedFromOtherSurface') and meta.get('sessionId') == f'local_{sid}'}
+    pattern = re.compile(r'^[TS][0-9]+(?:\s|$)')
     spawned_trees.update(Path(thread['cwd']).resolve() for sid, thread in threads.items()
-                         if thread.get('cwd') and ('codex', sid) in workers)
+                         if pattern.match(thread.get('name') or '') and thread.get('cwd') and ('codex', sid) in workers)
     owned = {}
     for iid, issue in issues.items():
         if not issue['closed']:
@@ -173,9 +159,9 @@ def cleanup_plan(root):
                 owned[name] = f'open task #{iid} ({issue["state"]})'
     for row in rows:
         branch = row.get('branch', '').removeprefix('refs/heads/')
-        if any((thread.get('status') or {}).get('type') not in ('idle', 'notLoaded') or ('codex', sid) in mine
+        if any(pattern.match(thread.get('name') or '') and ((thread.get('status') or {}).get('type') not in ('idle', 'notLoaded') or ('codex', sid) in mine
                or any(iid not in issues or not issues[iid]['closed'] for iid in workers.get(('codex', sid), ()))
-               for sid, thread in threads.items() if Path(thread.get('cwd') or '/').resolve() == Path(row['worktree']).resolve()):
+               ) for sid, thread in threads.items() if Path(thread.get('cwd') or '/').resolve() == Path(row['worktree']).resolve()):
             owned[branch or row['worktree']] = 'current / active / unknown Codex session state'
     for identity in mine:
         for iid in workers.get(identity, ()):
@@ -269,6 +255,8 @@ def cleanup_plan(root):
         return any(iid not in issues or not issues[iid]['closed'] for iid in workers.get(identity, ()))
 
     for sid, thread in threads.items():
+        if not pattern.match(thread.get('name') or ''):
+            continue
         identity = ('codex', sid)
         status = (thread.get('status') or {}).get('type')
         what = f'Codex session {sid}'
@@ -280,9 +268,10 @@ def cleanup_plan(root):
             ask.append({'what': what, 'why': f'no proven closed task, or state unknown ({status})',
                         'choices': [('keep', 'true'), ('archive', shlex.join([core.TOOL, 'codex-archive', sid]))]})
     # Only this machine's app archives its sessions; an archived one is done.
-    claude = {sid for runtime, sid in workers if runtime == 'claude' and sid in app and not app[sid].get('isArchived')}
+    claude = {sid for runtime, sid in workers if runtime == 'claude' and sid in app and not app[sid].get('isArchived')
+              and pattern.match(app[sid].get('name') or '')}
     # A spawned worker that never took a task: imported from the CLI in the main checkout, idle, with no claim.
-    unknown = {sid for sid, meta in app.items() if meta.get('adoptedFromOtherSurface') and not meta.get('isArchived')
+    unknown = {sid for sid, meta in app.items() if pattern.match(meta.get('name') or '') and meta.get('adoptedFromOtherSurface') and not meta.get('isArchived')
                and meta.get('sessionId') == f'local_{sid}' and Path(meta.get('cwd') or '/').resolve() == root.resolve()
                and time.time() - meta.get('lastActivityAt', 0) / 1000 > core.STALE_MINUTES * 60} - {sid for _, sid in workers}
     for sid in sorted(claude):
@@ -301,6 +290,8 @@ def cleanup_plan(root):
                         'choices': [('keep', 'true'), ('archive', f'coordinator: archive_session local_{sid}')]})
     # `claude --bg` workers of this checkout; `retire` stops them and drops them from `claude agents`.
     for sid, agent in core.claude_agents().items():
+        if not pattern.match(agent.get('name') or ''):
+            continue
         identity, what = ('claude', sid), f'Claude background session {agent["id"]} ({agent.get("name")})'
         if Path(agent.get('cwd') or '/').resolve() != root.resolve():
             continue
@@ -434,50 +425,35 @@ def apply_plan(args, root, gc):
     return {**counts, 'pending_asks': [item['what'] for item in ask]}
 
 
-def apply_scheduled(args, root, gc, trigger):
-    """#197: `cleanup --apply` (manual), the owner's tick (tick) and the idle stop (idle) apply only here, under one
-    lock and one state. Returns the schedule report, also recorded as a `cleanup` action."""
-    from taskq import cleanup_schedule as schedule
-    now = schedule.datetime.now(schedule.UTC)
-    report = schedule.run(schedule.settings(), schedule.state_path(), now, lambda: apply_plan(args, root, gc), trigger)
-    # partial is an execution error too: status `failed` is what json_command and tick_pass (#191) turn into
-    # `failure`; the action keeps outcome `partial`.
-    status = {'success': 'done', 'partial': 'failed', 'failed': 'failed'}.get(report['outcome'], report['outcome'])
-    core.record(args, 'cleanup', status=status, **report)
-    print(f'\nCleanup ({trigger}): {report["outcome"]}, {report["reason"]}; last success {report.get("last_success") or "none"}; '
-          f'next due {report.get("next_due_local") or report.get("next_due") or "none"} ({report["timezone"]}'
-          + (', the missing-setting fallback' if report['timezone_fallback'] else '') + ').')
-    return report
-
-
 def scheduled(args):
-    """The owner's tick: cleanup when due, from the main checkout on branch main only (as `cleanup` itself); the
-    plan goes to the tick's log, its events to the tick's report. Never raises: a refusal is a recorded action."""
-    # Events join the tick's own actions; the tick's JSON plan, refusals and outcome stay the tick's.
+    """The owner's tick applies cleanup once per hour, using one simple mtime stamp."""
     actions = (args.output if hasattr(args, 'output') else args.pm_report)['actions']
-    sub = argparse.Namespace(apply=True, trigger='tick', json=getattr(args, 'json', False), pm_report={'actions': actions})
+    sub = argparse.Namespace(apply=True, json=getattr(args, 'json', False), pm_report={'actions': actions})
     root = core.main_checkout(Path.cwd())
     try:
-        gc = helpers(root)
-        if Path.cwd().resolve() != root.resolve() or gc._git(root, 'branch', '--show-current').strip() != 'main':
+        if Path.cwd().resolve() != root.resolve() or Builtin._git(root, 'branch', '--show-current').strip() != 'main':
             return core.record(sub, 'cleanup', status='refused', trigger='tick',
                                reason='scheduled cleanup runs only from the main checkout on branch main')
+        if not core.CLEANUP.get('enabled', True):
+            return
+        stamp = core.TICK_BEAT.with_name('taskq-cleanup-last')
+        if stamp.exists() and time.time() - stamp.stat().st_mtime < 3600:
+            return
         with contextlib.redirect_stdout(sys.stderr):
-            return apply_scheduled(sub, root, gc, 'tick')
+            apply_plan(sub, root, Builtin)
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+        core.record(sub, 'cleanup', status='done', trigger='tick')
     except (SystemExit, OSError, ValueError, subprocess.SubprocessError) as error:
         core.record(sub, 'cleanup', status='failed', trigger='tick', reason=str(error))
 
 
 def cleanup(args):
     root = core.main_checkout(Path.cwd())
-    gc = helpers(root)
-    if Path.cwd().resolve() != root.resolve() or gc._git(root, 'branch', '--show-current').strip() != 'main':
+    if Path.cwd().resolve() != root.resolve() or Builtin._git(root, 'branch', '--show-current').strip() != 'main':
         core.fail('cleanup runs only from the main checkout on branch main')
     if args.apply:
-        report = apply_scheduled(args, root, gc, getattr(args, 'trigger', 'manual'))
-        if hasattr(args, 'output'):
-            args.output['cleanup'] = report
-        return
+        return apply_plan(args, root, Builtin)
     # Fetch updates tracking refs only; report never changes local branches, trees or sessions.
     subprocess.run(['git', '-C', str(root), 'fetch', '-q', 'origin'], check=True)
     show(args, *cleanup_plan(root))

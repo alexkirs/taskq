@@ -74,7 +74,7 @@ STALE_MINUTES = 120  # a `doing` task this long without a collaborator's note or
 LOCK, LOCK_SECONDS = 'lock', 120
 PROBLEM = 'problem'  # label of an issue for a problem without a task
 PROTECTED_REFS = ()  # [workspace] protected_refs: local names or origin/name, also full Git refs
-CLEANUP = {}  # [cleanup] of taskq.toml as written; taskq.local.toml's [cleanup] replaces it (cleanup_schedule.settings)
+CLEANUP = {}  # [cleanup] enabled = false disables the hourly tick cleanup.
 CLEANUP_DAYS = 30  # cleanup reads open issues and the ones closed this recently, not the whole history
 PREFIX, RUN, ON = 'q-', 'run-', 'host-'
 PRIORITIES = (1, 2)
@@ -135,7 +135,7 @@ def configure(path=None):
     WORKSPACE = {key: workspace.get(key, text) for key, text in TREE_WORKSPACE.items()}
     # A project's own `new` without `retire` makes its trees elsewhere: the default retire would miss them.
     RETIRE = workspace.get('retire', None if 'new' in workspace else TREE_RETIRE)
-    HELPERS = workspace.get('cleanup_helpers')
+    HELPERS = None
     PROTECTED_REFS = workspace.get('protected_refs', ())
     if not isinstance(PROTECTED_REFS, list | tuple) or not all(isinstance(ref, str) and ref for ref in PROTECTED_REFS):
         fail(f'{path}: [workspace] protected_refs: write a list of non-empty ref names')
@@ -201,14 +201,11 @@ def checked(config, path):
 
 
 def cleanup_settings(table, path):
-    """[cleanup] as written, after #197 validation: an invalid table stops with the file, never falls back."""
-    from taskq.cleanup_schedule import validate
+    """The only cleanup setting is an explicit on/off switch."""
     if not isinstance(table, dict):
         fail(f'{path}: [cleanup]: write a table')
-    try:
-        validate(table)
-    except ValueError as error:
-        fail(f'{path}: [cleanup] {error}')
+    if set(table) - {'enabled'} or not isinstance(table.get('enabled', True), bool):
+        fail(f'{path}: [cleanup] enabled: write true or false')
     return table
 
 

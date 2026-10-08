@@ -750,9 +750,8 @@ app session metadata (`claude-code-sessions/*/*/local_*.json`: cwd, time, archiv
 read conversations). This run changes no local branches, trees or sessions. The report has three
 sections: "Remove", "Ask the owner", "Kept".
 
-1. `cleanup --apply` re-checks each "Remove" item before acting. Trees are removed by the project's
-   helpers when `[workspace] cleanup_helpers` names them (`workspace_gc.py retire --delete`), else by
-   the built-ins: a tree is finished when `git status` is clean, it is not locked, no process of this
+1. `cleanup --apply` re-checks each "Remove" item before acting. A tree is finished when `git status` is clean,
+   it is not locked, no process of this
    user works in it (`lsof`; when `lsof` fails, the tree is a question) and every patch is in
    `origin/main`; `git worktree remove` (no `--force`) removes it. Both `.worktrees/taskq-N` and the
    older `../taskq-N` are found through `git worktree list`. Then branches go by `git branch -d`. To check

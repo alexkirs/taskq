@@ -728,9 +728,7 @@ def idle_stop(act, step, failed):
     """#153: count this empty pass; on the [idle] stop-th in a row (taskq.local.toml, default 5, 0 = never) the line
     that stops the timer, and the count starts over. `act` (launchd) stops its own timer and runs cleanup here."""
     idle = core.personal().get('idle', {})
-    from taskq.cleanup_schedule import settings
-    # #197: [cleanup] enabled = false stops idle cleanup as well; [idle] cleanup = false stays the idle-only opt-out.
-    stop, clean = idle.get('stop', 5), idle.get('cleanup', True) and settings()['enabled']
+    stop, clean = idle.get('stop', 5), idle.get('cleanup', True) and core.CLEANUP.get('enabled', True)
     count = int(idle_ticks().read_text()) + 1 if idle_ticks().exists() else 1
     if not stop or count < stop:
         idle_ticks().write_text(f'{count}\n')

@@ -81,7 +81,6 @@ It holds no secrets: the token belongs to `glab`.
 | `[workspace] publish` | `direct` or `review`; shared only, invalid values fail (§ Publication before or after review) | `direct` |
 | `[workspace] retire` | What `close` runs from the main checkout to remove the task's tree (then `git branch -d taskq-<N>`) | `git worktree remove .worktrees/taskq-<N>`; nothing when the project sets its own `new` without `retire` |
 | `[workspace] protected_refs` | Refs cleanup must keep, including in owner questions: local names (`"release"`), remote names (`"origin/release"`), or full Git refs | `[]`; main and the calling branch are always protected |
-| `[workspace] cleanup_helpers` | Project folder with `workspace_gc.py`, `host_gentle.py`, `host_tools.py` for `cleanup`, an optional override | none: built-ins (`git worktree remove`, `lsof`) |
 | `[update] auto`, `every`, `ref` | `tick` updates taskq from REPO (github.com/alexkirs/taskq) at most `every` (`30m`, `24h`, `7d`); `taskq update` does it by hand. `ref = "main"`: the newest `main` commit whose trusted exact-SHA tests passed and other non-Pages check-runs passed; `ref = "stable"`: the `stable` tag, only when CI passed and the tag is signed by a key in the package's `allowed_signers` (README: Develop taskq). A refused update prints one line and nothing new runs; a clone whose new code does not start (`python3 -m taskq --version`) goes back. Missing keys take their defaults in memory; `taskq.toml` is never written | `auto`: `true` when the project's repository has REPO's owner, else `false`; `24h`; `main` |
 | `[profile]`, `[profile.limits]` | Team defaults for the tick/worker profile, below the personal file (§ Shared and personal configuration); never one person's choices | none |
 | `[hosts]` | Hostname → short machine name (`"DESKTOP-7" = "win"`), for `host-<name>` labels and tick lines | the hostname up to the first dot |
@@ -517,28 +516,16 @@ Without a flag it prints a report "Remove / Ask the owner / Kept" after fetch; i
 local branches, trees or sessions. `cleanup --apply` executes only the "Remove" items that are
 proven finished, rechecking before each action.
 Running and current sessions are kept, sessions are only archived, and remote branches
-need a separate answer from the owner. Retire checks stay in `workspace_gc.py`.
+need a separate answer from the owner. Trees use built-in git and `lsof` checks.
 Only taskq-owned trees and branches are eligible: `taskq-<N>`, `worktree-taskq-<N>`, or trees identified by spawned worker metadata. Unknown ownership is kept. `[workspace] protected_refs` prevents local and remote deletion suggestions.
 Task trees are found in `.worktrees/taskq-<N>` and in `../taskq-<N>` alike (§ Task flow, «Where task trees live»).
 Procedure for owner questions and Claude archiving:
 [taskq-manager](taskq-manager.md) § Cleaning up finished work.
 
-**On existing ticks (#197).** Accepted spec: [Wiki Cleanup-schedule](https://github.com/alexkirs/taskq/wiki/Cleanup-schedule/6642908fbd612b7a3d85df1e8ac64d46e63f9bd5);
-details: [docs/cleanup-schedule.md](../../docs/cleanup-schedule.md). `[cleanup]` takes `enabled` (default true),
-`schedule` (`hourly` default, `daily`/`weekly` with `at = "HH:MM"` and `weekday`, `custom` with exactly one of a
-positive `interval_minutes`, no minimum, or `weekdays` plus `at`) and an IANA `timezone` (default `Etc/UTC`,
-reported as the fallback). An invalid table stops every command with its file and key; nothing is written back.
-The owner's tick (the coordinator machine's pass, with or without `--act`) applies cleanup when due; there is
-no timer of its own, so no ticks means no cleanup. `cleanup --apply` (manual), the tick and the idle stop share
-one lock and one state file, `<main checkout>/.local/taskq-cleanup.json`: a manual run dedups the next ticks,
-an overlapping one reports `busy`. Each attempt fetches and builds a fresh native plan and acts only on its
-"Remove" items with the usual rechecks; Ask stays pending, Claude app sessions stay a visible refusal.
-Intervals count from the last successful completion; a failed or partial attempt keeps the last success and
-retries one hour after its completion; an interrupted one is replanned, never replayed. `enabled = false`
-stops tick and idle cleanup, not the owner's `cleanup --apply`. The tick report carries a `cleanup` action:
-trigger, reason, outcome, attempted/succeeded/refused/errors/pending asks, observed/due/finished, last success,
-next due (UTC and local) and timezone. Implemented and tested with fixtures; a live existing-tick receipt is a
-separate qualification, not claimed by the tests.
+**On existing ticks.** The owner's tick applies cleanup at most once per hour when the mtime of
+`<main checkout>/.local/taskq-cleanup-last` is older than an hour. `[cleanup] enabled` is the only setting;
+`false` disables tick and idle cleanup, not `cleanup --apply`. There is no timer, lock, retry state, timezone,
+or custom schedule. Details: [docs/cleanup-schedule.md](../../docs/cleanup-schedule.md).
 
 ## History and report
 
@@ -590,8 +577,7 @@ in full: history growth does not slow `tick`, `take`, `list` or `worker`.
 
 ## Verification
 
-From a package clone: `python3 -m unittest discover -s tests` (the `cleanup` tests need `TASKQ_CLEANUP_HELPERS=<project folder
-with workspace_gc.py, host_tools.py, host_gentle.py>`) — full cycles against a fake GitLab, including the
+From a package clone: `python3 -m unittest discover -s tests` — full cycles against a fake GitLab, including the
 ready↔waiting move by dependencies, showing a question once and the daily summary, the lock (success, 404,
 removal on `release`/`reject`/`close`/stuck-task return, tick removing a failed `take`'s lock), races
 on one task and on overlapping `scope` in both orders, a single `beat`, and `problem` without a task.

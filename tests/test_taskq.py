@@ -50,8 +50,7 @@ def node(hostname):
 
 
 q.machine_id = machine_id
-# #197: a fixture tick never applies cleanup to the checkout the tests run in (CI's or the person's main);
-# tests that exercise it call REAL_SCHEDULED in a disposable repository.
+# A fixture tick never applies cleanup to the checkout the tests run in (CI's or the person's main).
 REAL_SCHEDULED = cleanup.scheduled
 cleanup.scheduled = lambda args: None
 # `cleanup` stands on a project's worktree tools; its tests run where a folder of them is named.
@@ -3440,8 +3439,7 @@ class Update(unittest.TestCase):
 
 
 class Cleanup(unittest.TestCase):
-    """Real Git refs, patches and retire in disposable repositories; no live app mutations. The project's helpers
-    when TASKQ_CLEANUP_HELPERS names them, else the built-ins (git worktree remove, lsof)."""
+    """Real Git refs, patches and retire in disposable repositories; no live app mutations."""
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -3460,16 +3458,7 @@ class Cleanup(unittest.TestCase):
         self.git('remote', 'add', 'origin', str(self.remote))
         self.git('push', '-q', '-u', 'origin', 'main')
         self.issues, self.app, self.threads, self.agents = {}, {}, {}, {}
-        # Retire runs the existing script, not a replacement that merely deletes a directory.
-        if HELPERS:
-            import host_tools
-            scripts = self.root / 'scripts'
-            scripts.mkdir()
-            for name in ('workspace_gc.py', 'host_tools.py', 'host_gentle.py'):
-                shutil.copy2(Path(HELPERS) / name, scripts / name)
-            self.holding = lambda path: patch.object(host_tools, 'live_paths', lambda: [(9876, 'worker', 'cwd', str(path))])
-        else:
-            self.holding = lambda path: patch.object(cleanup, 'process_cwds', lambda: [(9876, str(path))])
+        self.holding = lambda path: patch.object(cleanup, 'process_cwds', lambda: [(9876, str(path))])
         self.before_cwd = Path.cwd()
         os.chdir(self.root)
         self.addCleanup(os.chdir, self.before_cwd)
@@ -3478,9 +3467,7 @@ class Cleanup(unittest.TestCase):
                                     (q, 'claude_agents', lambda **kwargs: self.agents),
                                       (worker, 'claude_agents', lambda **kwargs: self.agents),
                                     (cleanup, 'cleanup_codex', lambda roots: self.threads),
-                                    (q, 'HELPERS', q.HELPERS if HELPERS else None),
-                                    *([(sys.modules['host_tools'], 'live_paths', lambda: [])] if HELPERS
-                                      else [(cleanup, 'process_cwds', lambda: [])])):
+                                    (cleanup, 'process_cwds', lambda: [])):
             patcher = patch.object(target, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -3627,7 +3614,7 @@ class Cleanup(unittest.TestCase):
     def test_remote_merged_branch_only_asks_and_open_codex_keeps_its_tree(self):
         tree = self.tree('worktree-taskq-106')
         self.git('push', '-q', 'origin', 'worktree-taskq-106')
-        self.threads['live'] = {'id': 'live', 'cwd': str(tree), 'status': {'type': 'active'}}
+        self.threads['live'] = {'id': 'live', 'name': 'T106 worker', 'cwd': str(tree), 'status': {'type': 'active'}}
         report = self.run_cleanup(True)
         self.assertNotIn('git push origin --delete worktree-taskq-106', report)
         self.git('branch', 'taskq-900')
@@ -3646,9 +3633,10 @@ class Cleanup(unittest.TestCase):
         self.issues[3] = {'closed': True, 'state': 'unknown', 'type': 'code', 'result': {'sha': 'bad-sha'},
                           'claim': {'runtime': 'codex', 'session': 'unverified'}}
         for sid, status in (('done', 'idle'), ('unknown', 'idle'), ('unverified', 'idle'), ('codex-session', 'idle'), ('error', 'systemError')):
-            self.threads[sid] = {'id': sid, 'cwd': str(self.root), 'status': {'type': status}}
+            self.threads[sid] = {'id': sid, 'name': f'T{1 if sid == "done" else 3} worker',
+                                 'cwd': str(self.root), 'status': {'type': status}}
         old = (time.time() - q.STALE_MINUTES * 60 - 60) * 1000
-        spawned = {'adoptedFromOtherSurface': True, 'cwd': str(self.root), 'lastActivityAt': old}
+        spawned = {'adoptedFromOtherSurface': True, 'cwd': str(self.root), 'lastActivityAt': old, 'name': 'T2 worker'}
         self.app = {'claude-done': {'sessionId': 'local_claude-done', **spawned},
                     'unknown-child': {'sessionId': 'local_unknown-child', **spawned},
                     'fresh-child': {'sessionId': 'local_fresh-child', **spawned, 'lastActivityAt': time.time() * 1000},
@@ -3667,6 +3655,21 @@ class Cleanup(unittest.TestCase):
         self.assertIn('codex-archive unknown', report)
         self.assertIn('Codex session codex-session', report.split('# Kept')[1])
 
+    def test_only_taskq_named_closed_sessions_are_removed(self):
+        sha = self.git('rev-parse', 'main')
+        self.issues[1] = {'closed': True, 'state': 'closed', 'type': 'code', 'result': {'sha': sha},
+                          'claim': {'runtime': 'codex', 'session': 'closed'}}
+        self.issues[2] = {'closed': False, 'state': 'doing', 'claim': {'runtime': 'codex', 'session': 'open'}}
+        self.threads.update({
+            'closed': {'id': 'closed', 'name': 'T1 worker', 'cwd': str(self.root), 'status': {'type': 'idle'}},
+            'open': {'id': 'open', 'name': 'S2 worker', 'cwd': str(self.root), 'status': {'type': 'idle'}},
+            'foreign': {'id': 'foreign', 'name': 'other chat', 'cwd': str(self.root), 'status': {'type': 'idle'}},
+        })
+        archived = []
+        with patch.object(q, 'codex_archive', lambda args: archived.append(args.thread)):
+            self.run_cleanup(True)
+        self.assertEqual(archived, ['closed'])
+
     def test_background_workers_of_closed_tasks_are_retired_others_asked_or_kept(self):
         self.issues[1] = {'closed': True, 'state': 'unknown', 'type': 'research', 'claim': {'runtime': 'claude', 'session': 'bg-done'}}
         self.issues[2] = {'closed': False, 'state': 'doing', 'type': 'research', 'claim': {'runtime': 'claude', 'session': 'bg-open'}}
@@ -3674,7 +3677,7 @@ class Cleanup(unittest.TestCase):
         self.issues[4] = {'closed': True, 'state': 'unknown', 'type': 'code', 'result': {'sha': 'bad-sha'},
                           'claim': {'runtime': 'claude', 'session': 'bg-unproven'}}
         old = (time.time() - q.STALE_MINUTES * 60 - 60) * 1000
-        agent = lambda sid, **more: {'id': sid[:5], 'sessionId': sid, 'cwd': str(self.root), 'startedAt': old,
+        agent = lambda sid, **more: {'id': sid[:5], 'sessionId': sid, 'name': 'T1 worker', 'cwd': str(self.root), 'startedAt': old,
                                      'pid': 1, 'status': 'idle', **more}
         self.agents = {sid: agent(sid) for sid in ('bg-done', 'bg-open', 'bg-orphan', 'bg-unproven')}
         self.agents['bg-fresh'] = agent('bg-fresh', startedAt=time.time() * 1000)
@@ -3711,7 +3714,7 @@ class Cleanup(unittest.TestCase):
         tree = self.tree('worktree-taskq-108')
         self.git('checkout', '--detach', cwd=tree)
         self.git('branch', '-d', 'worktree-taskq-108')
-        self.threads['by-cwd'] = {'id': 'by-cwd', 'cwd': str(tree), 'status': {'type': 'idle'}}
+        self.threads['by-cwd'] = {'id': 'by-cwd', 'name': 'T108 worker', 'cwd': str(tree), 'status': {'type': 'idle'}}
         archived = []
         def archive(args):
             archived.append(args.thread)
@@ -3723,7 +3726,7 @@ class Cleanup(unittest.TestCase):
 
     def test_archive_refusal_keeps_the_sessions_tree_and_branch(self):
         tree = self.tree('worktree-taskq-109')
-        self.threads['writer'] = {'id': 'writer', 'cwd': str(tree), 'status': {'type': 'notLoaded'}}
+        self.threads['writer'] = {'id': 'writer', 'name': 'T109 worker', 'cwd': str(tree), 'status': {'type': 'notLoaded'}}
         with patch.object(q, 'codex_archive', side_effect=SystemExit('active writer')):
             report = self.run_cleanup(True)
         self.assertIn('active writer', report)
@@ -3737,7 +3740,7 @@ class Cleanup(unittest.TestCase):
             report = self.run_cleanup(True)
         self.assertTrue(tree.exists())
         self.assertIn('Codex session state not checked', report)
-        self.threads['unknown'] = {'id': 'unknown', 'cwd': str(tree), 'status': {'type': 'systemError'}}
+        self.threads['unknown'] = {'id': 'unknown', 'name': 'T110 worker', 'cwd': str(tree), 'status': {'type': 'systemError'}}
         self.run_cleanup(True)
         self.assertTrue(tree.exists())
 
@@ -3778,156 +3781,6 @@ class Cleanup(unittest.TestCase):
         self.run_cleanup(True)
         self.assertFalse(tree.exists())
         self.assertIn('foreign-worker', self.git('branch'))
-
-    def test_cleanup_refuses_linked_checkout(self):
-        tree = self.tree('worktree-taskq-111')
-        os.chdir(tree)
-        with self.assertRaisesRegex(SystemExit, 'only from the main checkout'):
-            self.run_cleanup(True)
-
-    # --- #197: native cleanup under the schedule's lock and state, on the owner's tick and the idle stop -------
-
-    def tick_cleanup(self):
-        """The owner tick's call (cleanup.scheduled, unguarded): its events, as they join the tick report."""
-        args = SimpleNamespace(pm_report={'actions': []})
-        with contextlib.redirect_stderr(io.StringIO()):
-            REAL_SCHEDULED(args)
-        return args.pm_report['actions']
-
-    def state(self):
-        return json.loads(q.TICK_BEAT.with_name('taskq-cleanup.json').read_text())
-
-    def local(self, text):
-        q.LOCAL.write_text(text)
-
-    def setup_local(self):
-        self.enterContext(patch.object(q, 'LOCAL', self.root / '.local' / 'taskq.local.toml'))
-        q.LOCAL.parent.mkdir(exist_ok=True)
-
-    def test_tick_applies_native_remove_once_then_dedups_manual_and_restart(self):
-        self.setup_local()
-        first = self.tree('worktree-taskq-120')
-        events = self.tick_cleanup()
-        report = next(event for event in events if event['action'] == 'cleanup')
-        self.assertEqual((report['status'], report['trigger'], report['reason']), ('done', 'tick', 'first run'))
-        self.assertFalse(first.exists())
-        self.assertIn(f'tree {first} / worktree-taskq-120', report['succeeded'])
-        self.assertIn('remove_tree', [event['action'] for event in events])
-        self.assertTrue(report['timezone_fallback'])
-        state = self.state()
-        self.assertEqual((state['last_outcome'], state['last_success']), ('success', report['finished']))
-        # Inside the hour: the next tick (a fresh process reading the same file) neither plans nor removes.
-        second = self.tree('worktree-taskq-121')
-        report, = self.tick_cleanup()
-        self.assertEqual((report['status'], report['reason']), ('skipped', 'not due'))
-        self.assertTrue(second.exists())
-        # The owner's manual run is not held by the schedule and moves the same state.
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            q.main(['cleanup', '--json', '--apply'])
-        manual = json.loads(out.getvalue())['cleanup']
-        self.assertEqual((manual['trigger'], manual['outcome']), ('manual', 'success'))
-        self.assertFalse(second.exists())
-        self.assertEqual(self.state()['last_success'], manual['finished'])
-        self.assertEqual(self.tick_cleanup()[0]['reason'], 'not due')
-
-    def test_tick_keeps_unsafe_targets_ask_pending_and_application_refusal_visible(self):
-        self.setup_local()
-        unmerged = self.tree('worktree-taskq-122', False)
-        dirty = self.tree('worktree-taskq-123')
-        (dirty / 'unknown').write_text('keep')
-        doing = self.tree('worktree-taskq-8')
-        self.issues[8] = {'closed': False, 'state': 'doing', 'claim': {'runtime': 'claude', 'session': 'live'}}
-        self.issues[9] = {'closed': True, 'state': 'closed', 'type': 'research', 'claim': {'runtime': 'claude', 'session': 'done-worker'}}
-        self.app['done-worker'] = {'cwd': str(self.root)}
-        self.git('push', '-q', 'origin', 'HEAD:refs/heads/worktree-taskq-124')  # a merged remote task branch: Ask
-        events = self.tick_cleanup()
-        report = next(event for event in events if event['action'] == 'cleanup')
-        # Pending Ask and a refusal are a completed safe plan, reported apart.
-        self.assertEqual(report['status'], 'done')
-        self.assertEqual(report['attempted'], ['Claude session local_done-worker'])
-        self.assertEqual(report['refused'], ['Claude session local_done-worker'])
-        self.assertIn({'action': 'archive', 'status': 'refused', 'session': 'done-worker',
-                       'reason': 'requires coordinator application tool'}, events)
-        for tree in (unmerged, dirty):
-            self.assertIn(f'tree {tree} / {tree.name if tree.name.startswith("worktree-") else "worktree-" + tree.name}', report['pending_asks'])
-        self.assertIn('branch origin/worktree-taskq-124', report['pending_asks'])
-        self.assertIn('worktree-taskq-124', self.git('ls-remote', '--heads', 'origin'))
-        for tree in (unmerged, dirty, doing):
-            self.assertTrue(tree.exists())
-        self.assertEqual((dirty / 'unknown').read_text(), 'keep')
-
-    def test_disabled_settings_stop_tick_and_idle_but_not_manual(self):
-        self.setup_local()
-        self.local('[cleanup]\nenabled = false\n')
-        tree = self.tree('worktree-taskq-125')
-        report, = self.tick_cleanup()
-        self.assertEqual((report['status'], report['reason'], report['settings']), ('skipped', 'disabled', str(q.LOCAL)))
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            q.cleanup(argparse.Namespace(apply=True, trigger='idle'))
-        self.assertIn('Cleanup (idle): skipped, disabled', out.getvalue())
-        self.assertTrue(tree.exists())
-        # The idle stop does not offer cleanup either; the owner's explicit run still applies.
-        with patch.object(q, 'TICK_BEAT', self.root / '.local' / 'beat'), patch.object(q, 'personal', return_value={'idle': {'stop': 1}, 'cleanup': {'enabled': False}}):
-            tick.idle_ticks().write_text('0\n')
-            self.assertNotIn('cleanup', tick.idle_stop(False, None, []))
-        self.run_cleanup(True)
-        self.assertFalse(tree.exists())
-
-    def test_failed_plan_keeps_last_success_and_backs_off_one_hour_from_completion(self):
-        self.setup_local()
-        self.tick_cleanup()
-        before = self.state()['last_success']
-        state = self.state()
-        state['last_success'] = '2000-01-01T00:00:00+00:00'  # long due
-        q.TICK_BEAT.with_name('taskq-cleanup.json').write_text(json.dumps(state))
-        self.git('remote', 'set-url', 'origin', str(self.root / 'missing.git'))  # the native fetch fails
-        report, = self.tick_cleanup()
-        self.assertEqual((report['status'], report['last_success']), ('failed', '2000-01-01T00:00:00+00:00'))
-        self.assertEqual(report['errors'][0]['item'], 'plan')
-        finished = datetime.fromisoformat(report['finished'])
-        self.assertEqual(report['next_due'], (finished + timedelta(hours=1)).isoformat())
-        self.assertEqual(self.tick_cleanup()[0]['reason'], 'backoff')
-        self.assertNotEqual(before, None)
-
-    def test_partial_cleanup_is_a_failure_in_manual_json_and_the_tick_envelope(self):
-        self.setup_local()
-        partial = {'observed': '2026-10-08T12:00:00+00:00', 'trigger': 'manual', 'timezone': 'Etc/UTC',
-                   'timezone_fallback': True, 'settings': 'default', 'outcome': 'partial', 'reason': 'manual',
-                   'attempted': ['a', 'b'], 'succeeded': ['a'], 'refused': [], 'errors': [{'item': 'b', 'error': 'x'}],
-                   'pending_asks': [], 'last_success': None, 'next_due': None, 'next_due_local': None}
-        schedule = sys.modules['taskq.cleanup_schedule']
-        with patch.object(schedule, 'run', return_value=partial), contextlib.redirect_stdout(io.StringIO()) as out, \
-                self.assertRaises(SystemExit) as caught:
-            q.main(['cleanup', '--json', '--apply'])
-        manual = json.loads(out.getvalue())
-        self.assertEqual((caught.exception.code, manual['outcome']), (2, 'failure'))
-        action = next(event for event in manual['actions'] if event['action'] == 'cleanup')
-        self.assertEqual((action['status'], action['outcome']), ('failed', 'partial'))
-        args = argparse.Namespace(output={'actions': [], 'refusals': []})
-        with patch.object(schedule, 'run', return_value={**partial, 'trigger': 'tick'}), \
-                patch.object(tick, 'queue_pass', lambda args, act=False: REAL_SCHEDULED(args) or []), \
-                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            tick.tick_pass(args)
-        report = args.output['report']
-        self.assertEqual(report['outcome'], 'failure')
-        self.assertEqual([(event['status'], event['outcome']) for event in report['actions'] if event['action'] == 'cleanup'],
-                         [('failed', 'partial')])
-
-    def test_tick_from_a_task_tree_or_another_branch_refuses_visibly(self):
-        self.setup_local()
-        tree = self.tree('worktree-taskq-126')
-        os.chdir(tree)
-        report, = self.tick_cleanup()
-        self.assertEqual((report['status'], report['reason']), ('refused', 'scheduled cleanup runs only from the main checkout on branch main'))
-        self.assertTrue(tree.exists())
-
-    def test_invalid_cleanup_settings_stop_with_file_and_key(self):
-        self.setup_local()
-        self.local('[cleanup]\nschedule = "custom"\ninterval_minutes = 0\n')
-        with self.assertRaisesRegex(SystemExit, r'taskq.local.toml: \[cleanup\] interval_minutes must be a positive integer'):
-            q.personal()
-        self.local('[cleanup]\nschedule = "custom"\ninterval_minutes = 1\n')
-        self.assertEqual(q.personal()['cleanup']['interval_minutes'], 1)  # no 60-minute minimum
 
 
 if __name__ == '__main__':

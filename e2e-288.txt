@@ -1,0 +1,1 @@
+pr-mode e2e for #288, task 295

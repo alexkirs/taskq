@@ -90,7 +90,7 @@ One function, ~60 lines:
 5. `ready`, every dep closed, a free slot for its runtime: `spawn`.
 6. Print the table: Task / State / Runtime / Session link.
 
-The timer is the manager agent: `/loop 5m taskq tick`. There is no coordinator machine. A tick starts only
+No timer: a sender session loops `taskq wait` and messages the manager per event (`taskq arm tick`, #407). There is no coordinator machine. A tick starts only
 tasks with no `host-*` label or with its own `host-<name>` label; any machine can tick.
 
 ## 6. Windows

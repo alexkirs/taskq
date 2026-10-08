@@ -1,22 +1,49 @@
-"""Read-only multiproject observation (#186 stage 2) over two fixture repositories; each reader is a real subprocess
-whose tracker is a fake that logs every call, so no network and no mutation can pass unseen."""
+"""Multiproject passes (#186) over isolated fixture repositories. Stage 2: read-only observation, each reader a real
+subprocess whose tracker is a fake that logs every call, so no network and no mutation can pass unseen. Stage 3
+(pinned Wiki Multiproject-acting-pass dcc97303): the real wrapper, actor and occupancy readers over on-disk in-memory
+trackers, a file `claude agents` list and logged fake launches; no real tracker, runtime, project, PM or timer."""
+import contextlib
 from datetime import datetime, timedelta, timezone
+import io
 import json
 import os
 from pathlib import Path
+import pickle
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(1, str(Path(__file__).resolve().parent))
 import taskq as core  # noqa: E402
 import taskq.multiproject as multiproject  # noqa: E402
 
-tick = sys.modules['taskq.tick']
+tick, worker = sys.modules['taskq.tick'], sys.modules['taskq.worker']
 CHILD = [sys.executable, str(Path(__file__).resolve()), '--child']
+ACT = [sys.executable, str(Path(__file__).resolve()), '--act-child']
+ACTOR = ACT + ['actor', '--actor']
+# A separate process asks the host guard: `held` while an actor owns it.
+PROBE = ('import fcntl, os, sys\nfd = os.open(sys.argv[1], os.O_RDWR)\ntry:\n    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n'
+         '    print("free")\nexcept BlockingIOError:\n    print("held")')
+# A worker descendant: does any of its open descriptors name the guard's inode?
+DESCENDANT = """import json, os, sys, time
+guard = os.stat(sys.argv[1])
+names = os.listdir('/dev/fd')
+inherited = []
+for name in names:
+    try:
+        found = os.fstat(int(name))
+    except OSError:
+        continue
+    inherited.append((found.st_dev, found.st_ino) == (guard.st_dev, guard.st_ino))
+open(sys.argv[2], 'w').write(json.dumps({'pid': os.getpid(), 'inherited': any(inherited)}))
+time.sleep(30)
+"""
 
 
 def child():
@@ -253,7 +280,367 @@ class Multiproject(unittest.TestCase):
         self.assertEqual(self.calls(), [])  # the real reader never touched the fixture's fake
 
 
+def toml(top, entries):
+    def value(item):
+        return json.dumps(item) if not isinstance(item, dict) else '{ ' + ', '.join(f'{key} = {value(inner)}' for key, inner in item.items()) + ' }'
+    return ''.join(f'{key} = {value(item)}\n' for key, item in top.items()) + ''.join(
+        '\n[[project]]\n' + ''.join(f'{key} = {value(item)}\n' for key, item in entry.items()) for entry in entries)
+
+
+LIVE = [  # `claude agents --json --all`: six rows hold a place, any kind; a finished one does not
+    {'id': 'i', 'kind': 'interactive', 'sessionId': 'owner-chat', 'cwd': '/elsewhere', 'pid': 101, 'status': 'idle'},
+    *({'id': f'b{n}', 'kind': 'background', 'sessionId': f'bg-{n}', 'cwd': '/elsewhere', 'name': f'job {n}', 'state': 'working',
+       'status': 'busy', 'pid': 200 + n} for n in range(4)),
+    {'id': 'k', 'kind': 'background', 'sessionId': 'waiting-owner', 'cwd': '/elsewhere', 'name': 'x', 'state': 'blocked'},
+    {'id': 'd', 'kind': 'background', 'sessionId': 'finished', 'cwd': '/elsewhere', 'name': 'y', 'state': 'done', 'pid': 300, 'status': 'idle'}]
+
+
+class Acting(unittest.TestCase):
+    """#186 stage 3: the guarded acting pass. Fixture-only: it qualifies no live project, runtime, PM or timer."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = Path(folder.name).resolve()
+        (self.dir / 'taskq').mkdir(mode=0o700)
+        self.machine = 'ab' * 16
+        (self.dir / 'taskq' / 'machine-id').write_text(self.machine + '\n')
+        self.enterContext(patch.dict(os.environ, {'XDG_STATE_HOME': str(self.dir), 'TASKQ_FIXTURE': str(self.dir), 'TASKQ_HOST': 'fixture-host',
+                                                  'CLAUDE_CODE_SESSION_ID': 'coordinator', 'CODEX_THREAD_ID': ''}))
+        self.enterContext(patch.object(core, 'UPDATE_STAMP', self.dir / 'taskq' / 'update-last'))
+        self.guard = multiproject.guard_path()
+        self.agents(LIVE)
+        self.alpha = self.project('alpha', 11, tasks=[(1,), (2,)])
+        self.beta = self.project('beta', 22, tasks=[(1,)])
+
+    def agents(self, rows):
+        (self.dir / 'agents.json').write_text(json.dumps(rows))
+
+    def node(self, name):
+        import hashlib
+        return hashlib.sha256(f'acme/{name}:{self.machine}'.encode()).hexdigest()[:12]
+
+    def project(self, name, repo_id, uid=1, tasks=(), update=False, **settings):
+        """A main checkout with taskq.toml, origin and fixture.json, and its tracker with `tasks`: (iid, state, runtime, block, assignees)."""
+        import test_taskq
+        path = self.dir / name
+        path.mkdir()
+        subprocess.run(['git', 'init', '-q', str(path)], check=True)
+        subprocess.run(['git', '-C', str(path), 'remote', 'add', 'origin', f'git@gitlab.example:acme/{name}.git'], check=True)
+        (path / 'taskq.toml').write_text(f'[gitlab]\nproject = "acme/{name}"\nhost = "gitlab.example"\nboard = "{name}-board"\n'
+                                         f'[update]\nauto = {str(update).lower()}\n')
+        (path / 'fixture.json').write_text(json.dumps(settings))
+        store = test_taskq.Gitlab()
+        store.repo_id, store.uid, store.boards = repo_id, uid, [{'id': 7, 'name': f'{name}-board', 'lists': []}]
+        for iid, state, runtime, block, assignees in ((*task, 'ready', 'claude', {}, ())[:1] + task[1:] + ('ready', 'claude', {}, ())[len(task) - 1:]
+                                                      for task in tasks):
+            store.issues[iid] = {'iid': iid, 'state': 'opened', 'web_url': f'https://gitlab.example/acme/{name}/-/issues/{iid}',
+                                 'title': f'Task {iid}', 'labels': [f'q-{state}', 'code', f'run-{runtime}'],
+                                 'description': core.render('goal', {'scope': [], 'deps': [], 'claim': None, 'waiting_for': None, 'result': None, **block}),
+                                 'assignees': [{'id': one} for one in assignees], 'milestone_id': None,
+                                 'updated_at': store.now(), 'created_at': store.now(), 'author': {'id': 1}}
+            store.created = max(store.created, iid)
+        (self.dir / f'acme_{name}.pickle').write_bytes(pickle.dumps(store))
+        return {'provider': 'gitlab', 'host': 'gitlab.example', 'repository_id': repo_id, 'repository': f'acme/{name}',
+                'board': f'{name}-board', 'checkout': str(path)}
+
+    def store(self, name):
+        return pickle.loads((self.dir / f'acme_{name}.pickle').read_bytes())
+
+    def block(self, name, iid):
+        return json.loads(core.BLOCK.search(self.store(name).issues[iid]['description'])[1])
+
+    def catalog(self, *entries, file='policy.toml', **top):
+        bindings = [{'principal': 1, 'act': True, 'limits': {'claude': 2, 'codex': 0}, 'effects': list(multiproject.EFFECTS),
+                     'timeout': 120, **entry} for entry in entries]
+        path = self.dir / file
+        path.write_text(toml({'version': 1, 'machine': 'fixture-host', 'os_user': os.getuid(), **top}, bindings))
+        return path
+
+    def act(self, view, policy):
+        manifest = self.dir / 'manifest.toml'
+        manifest.write_text(toml({'version': 1}, view))
+        return multiproject.act(manifest, policy, ACTOR)
+
+    def calls(self, kind=None):
+        rows = [json.loads(line) for line in (self.dir / 'calls.jsonl').read_text().splitlines()] if (self.dir / 'calls.jsonl').exists() else []
+        return [row for row in rows if kind in (None, row[1])]
+
+    def mutations(self, name):
+        return [row for row in self.calls('api') if row[2] == f'acme/{name}' and row[3] != 'GET']
+
+    def probe(self):
+        return subprocess.run([sys.executable, '-c', PROBE, str(self.guard)], capture_output=True, text=True).stdout.strip()
+
+    def wait(self, condition, seconds=60):
+        deadline = time.monotonic() + seconds
+        while not condition():
+            self.assertLess(time.monotonic(), deadline, 'fixture condition not reached')
+            time.sleep(0.1)
+
+    def limits(self, project):
+        return {runtime: (found['occupancy'], found['known'], found['F'], found['L'], found['limit']) for runtime, found in project['budget'].items()}
+
+    def test_one_aggregate_budget_over_two_projects_reaches_native_launch_admission(self):
+        foreign = {'attempt': 'f00d', 'runtime': 'claude', 'principal': 2, 'coordinator': 'claude:other', 'node': '0' * 12, 'pid': 1}
+        self.alpha = self.project('alpha2', 33, tasks=[(1,), (2,), (3, 'ready', 'claude', {}, (2,)), (4, 'ready', 'claude', {'reservation': foreign})])
+        policy = self.catalog({**self.alpha}, {**self.beta, 'limits': {'claude': 1, 'codex': 2}})
+        result = self.act([self.alpha, self.beta], policy)
+        alpha, beta = result['projects']
+        self.assertEqual([alpha['status'], beta['status']], ['ok', 'ok'], result)
+        # Six live rows of any kind; F = 8 - 6 = 2 for alpha. Its two launches make beta's occupancy 8: F = 0.
+        self.assertEqual(self.limits(alpha), {'claude': (6, True, 2, 0, 2), 'codex': (0, False, 0, 0, 0)})
+        self.assertEqual(self.limits(beta), {'claude': (8, True, 0, 0, 0), 'codex': (0, False, 0, 0, 0)})
+        spawned = self.calls('spawn')
+        self.assertEqual([(row[2], row[3]) for row in spawned], [('acme/alpha2', 'T1 Task 1 (fixture-host)'), ('acme/alpha2', 'T2 Task 2 (fixture-host)')])
+        self.assertEqual({row[4] for row in spawned}, {'held'})  # the host guard is held during the native mutation
+        self.assertEqual(self.store('alpha2').issues[3]['assignees'], [{'id': 2}])
+        self.assertEqual(self.block('alpha2', 4)['reservation'], foreign)
+        self.assertNotIn('reservation', self.block('alpha2', 3))
+        self.assertEqual([row for row in self.calls('api') if row[0] == 'occupancy' and row[3] != 'GET'], [])
+        self.assertEqual(self.mutations('beta'), [])
+        for project in (alpha, beta):
+            self.assertEqual(tick.validate_report(project['report']), [])
+            self.assertEqual(project['received_applied'], 'unknown')
+            self.assertEqual(project['guard']['inode'], self.guard.stat().st_ino)
+        self.assertEqual(result['received_applied'], 'unknown')
+        self.assertIn('claude=2 (L 0 + F 2, occupancy 6/8', multiproject.render(result))
+
+    def test_budget_counts_exact_sessions_once_and_unknowns_hold_every_runtime(self):
+        self.assertEqual(multiproject.claude_inventory(LIVE), {'session:owner-chat', 'session:bg-0', 'session:bg-1', 'session:bg-2',
+                                                               'session:bg-3', 'session:waiting-owner'})
+        self.assertEqual(multiproject.claude_inventory([{'kind': 'interactive', 'pid': 7}]), {'pid:7'})
+        self.assertIsNone(multiproject.claude_inventory([{'kind': 'background', 'state': 'working'}]))  # unidentified live row
+        self.assertIsNone(multiproject.claude_inventory({'rows': []}))
+        caps = {'claude': 8, 'codex': 4}
+        own = {'status': 'ok', 'L': {'claude': 1, 'codex': 0},
+               'held': [(['claude'], 'session:s1'), (['claude'], 'reservation:r'), (['claude', 'codex'], 'lock:l')]}
+        seven = {f'session:s{n}' for n in range(1, 8)}
+        found = multiproject.budget(caps, {'claude': seven, 'codex': None}, [own], own, {'claude': 3, 'codex': 2})
+        # s1 is one exact session; the reservation without one and the ownerless lock stay separate: 9 > 8, F clamps at 0.
+        self.assertEqual((found['claude']['occupancy'], found['claude']['F'], found['claude']['limit']), (9, 0, 1))
+        self.assertEqual((found['codex']['known'], found['codex']['limit']), (False, 0))
+        small = multiproject.budget(caps, {'claude': {'session:s1'}, 'codex': set()}, [own], own, {'claude': 3, 'codex': 2})
+        self.assertEqual((small['claude']['F'], small['claude']['limit'], small['codex']['F'], small['codex']['limit']), (5, 3, 3, 2))
+        unread = multiproject.budget(caps, {'claude': set(), 'codex': set()}, [own, {'status': 'failed'}], own, {'claude': 3, 'codex': 2})
+        self.assertEqual({runtime: (item['F'], item['limit']) for runtime, item in unread.items()}, {'claude': (0, 1), 'codex': (0, 0)})
+
+    def test_removed_view_ownership_and_a_missing_binding_hold_the_budget(self):
+        claim = lambda session: {'claim': {'runtime': 'claude', 'session': session, 'node': self.node('gone')}}  # noqa: E731
+        gone = self.project('gone', 44, tasks=[(1, 'doing', 'claude', claim('s-1')), (2, 'doing', 'claude', claim('s-2')),
+                                               (3, 'doing', 'claude', claim('bg-0'))])
+        result = self.act([self.beta], self.catalog({**gone, 'act': False}, self.beta))
+        self.assertEqual(self.limits(result['projects'][0])['claude'], (8, True, 0, 0, 0))  # 6 rows + s-1, s-2; bg-0 once
+        self.assertEqual(self.mutations('gone'), [])
+        missing = {**self.project('missing', 55), 'checkout': str(self.dir / 'nowhere')}
+        result = self.act([self.alpha], self.catalog(self.alpha, missing))
+        self.assertEqual(self.limits(result['projects'][0])['claude'], (6, False, 0, 0, 0))
+        self.assertEqual([item['status'] for item in result['projects'][0]['catalog']], ['ok', 'failed'])
+        self.assertFalse(any(row[2] == 'acme/alpha' for row in self.calls('spawn')))
+
+    def test_policy_identity_and_principal_mismatch_refuse_before_any_mutation(self):
+        twin = {**self.beta, 'board': 'other-board'}
+        policy = self.catalog({**self.alpha, 'ready': True}, self.beta)
+        result = self.act([self.alpha, twin], policy)
+        self.assertIn('ready: unknown key; readiness and effects come from', result['projects'][0]['errors'][0])
+        self.assertIn('no valid execution catalog binding', result['projects'][1]['errors'][0])
+        self.assertEqual(self.calls(), [])  # no actor started
+        for top in ({'evidence': 'doctor ok'}, {'caps': {'claude': 9}}):
+            with self.assertRaises(SystemExit):
+                multiproject.load_policy(self.catalog(self.alpha, **top))
+        result = self.act([self.alpha, self.beta], self.catalog({**self.alpha, 'principal': 5}, {**self.beta, 'act': False}))
+        self.assertEqual([project['status'] for project in result['projects']], ['refused', 'refused'])
+        self.assertIn('the tracker principal is 1, the catalog binds 5; no delegation exists', result['projects'][0]['errors'])
+        self.assertIn('catalog-only binding', result['projects'][1]['errors'][0])
+        result = self.act([self.alpha], self.catalog(self.alpha, machine='other-host'))
+        self.assertIn("this host is 'fixture-host', the catalog binds 'other-host'", result['projects'][0]['errors'])
+        self.assertEqual((self.mutations('alpha'), self.calls('spawn')), ([], []))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            multiproject.main(['--manifest', str(self.dir / 'manifest.toml'), '--act'])
+
+    def test_effects_and_readiness_come_from_the_workflow_and_a_failure_does_not_stop_the_next(self):
+        narrow = self.project('narrow', 61, tasks=[(1,)])
+        unready = self.project('unready', 62, tasks=[(1,)], doctor='`claude` is not logged in')
+        stale = self.project('stale', 63, tasks=[(1,)], update=True)
+        broken = self.project('broken', 64, tasks=[(1,)], lock_fails=True)
+        policy = self.catalog({**narrow, 'effects': ['queue']}, unready, stale, broken, self.beta)
+        result = self.act([narrow, unready, stale, broken, self.beta], policy)
+        self.assertEqual([project['status'] for project in result['projects']], ['refused', 'refused', 'refused', 'failed', 'ok'])
+        self.assertIn("its settings turn on native effects ['cleanup', 'idle_stop'] the catalog did not select", result['projects'][0]['errors'])
+        self.assertIn('`claude` is not logged in', result['projects'][1]['errors'][0])
+        self.assertIn('auto-update is due', result['projects'][2]['errors'][0])
+        self.assertEqual(result['projects'][3]['native']['outcome'], 'failure')
+        for name in ('narrow', 'unready', 'stale'):
+            self.assertEqual(self.mutations(name), [])
+        self.assertNotIn('reservation', self.block('broken', 1))
+        self.assertEqual([row[2] for row in self.calls('spawn')], ['acme/beta'])
+        self.assertEqual(result['outcome'], 'blocked')
+
+    def test_timeout_keeps_actor_and_guard_and_admits_nothing_more_then_restart_reads_back(self):
+        slow = self.project('slow', 71, tasks=[(1,)], spawn={'sleep': 8})
+        policy = self.catalog({**slow, 'timeout': 3, 'limits': {'claude': 1}}, self.beta)
+        multiproject.guard_free({'os_user': os.getuid()})
+        inode = self.guard.stat().st_ino
+        result = self.act([slow, self.beta], policy)
+        self.assertEqual([project['status'] for project in result['projects']], ['unknown', 'not_admitted'])
+        self.assertIn('outcome unknown; nothing more is admitted', result['projects'][1]['errors'][0])
+        self.wait(lambda: self.calls('spawn'))
+        self.assertEqual(self.probe(), 'held')  # the actor was not killed: it still owns the guard
+        self.assertIsNotNone(multiproject.guard_free({'os_user': os.getuid()}))
+        self.wait(lambda: multiproject.guard_free({'os_user': os.getuid()}) is None)
+        self.assertEqual(self.guard.stat().st_ino, inode)
+        self.assertFalse(any(row[0] == 'actor' and 'beta' in json.dumps(row) for row in self.calls()))
+        self.assertTrue(self.block('slow', 1)['reservation'])  # the kept actor finished its launch
+        again = self.act([self.beta], policy)['projects'][0]
+        self.assertEqual((again['status'], self.limits(again)['claude']), ('ok', (7, True, 1, 0, 1)))  # slow's worker counts
+
+    def test_wrapper_death_keeps_the_actor_and_its_guard_and_descendants_inherit_nothing(self):
+        held = self.project('held', 81, tasks=[(1,)], spawn={'descendant': True, 'sleep': 3})
+        manifest = self.dir / 'manifest.toml'
+        manifest.write_text(toml({'version': 1}, [held]))
+        wrapper = subprocess.Popen(ACT + ['wrapper', '--manifest', str(manifest), '--act', '--execution-policy',
+                                          str(self.catalog({**held, 'limits': {'claude': 1}})), '--json'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.wait(lambda: self.calls('spawn'))
+        wrapper.send_signal(signal.SIGKILL)
+        wrapper.wait()
+        self.assertEqual(self.probe(), 'held')
+        self.wait(lambda: multiproject.guard_free({'os_user': os.getuid()}) is None)
+        descendant = json.loads((self.dir / 'descendant.json').read_text())
+        self.addCleanup(lambda: os.kill(descendant['pid'], signal.SIGKILL))
+        os.kill(descendant['pid'], 0)  # still running, and the guard is free: it never held it
+        self.assertFalse(descendant['inherited'])
+        self.assertIn('Attempt', '\n'.join(note['body'] for note in self.store('held').notes.values()))
+        self.assertTrue(any(row['sessionId'].startswith('w-held') for row in json.loads((self.dir / 'agents.json').read_text())))
+
+    def test_crash_frees_the_lock_keeps_the_inode_and_restart_counts_the_orphan_without_releasing_it(self):
+        crash = self.project('crash', 91, tasks=[(1,)], spawn={'crash': True})
+        policy = self.catalog({**crash, 'limits': {'claude': 1}}, self.beta)
+        multiproject.guard_free({'os_user': os.getuid()})
+        inode = self.guard.stat().st_ino
+        result = self.act([crash, self.beta], policy)
+        self.assertEqual([project['status'] for project in result['projects']], ['unknown', 'not_admitted'])
+        self.assertIn('actor exit 9 without a result', result['projects'][0]['errors'][0])
+        self.assertEqual((multiproject.guard_free({'os_user': os.getuid()}), self.guard.stat().st_ino), (None, inode))
+        orphan, written = self.block('crash', 1)['reservation'], self.mutations('crash')
+        again = self.act([self.beta], policy)['projects'][0]
+        self.assertEqual((again['status'], self.limits(again)['claude']), ('ok', (7, True, 1, 0, 1)))  # the orphan holds a place
+        self.assertEqual((self.block('crash', 1)['reservation'], self.mutations('crash')), (orphan, written))  # read back, not released
+
+    def test_differing_principals_contend_on_one_host_inode(self):
+        first = self.project('first', 101, tasks=[(1,)], spawn={'sleep': 4})
+        other = self.project('other', 102, uid=2, tasks=[(1,)])
+        manifest = self.dir / 'first.toml'
+        manifest.write_text(toml({'version': 1}, [first]))
+        wrapper = subprocess.Popen(ACT + ['wrapper', '--manifest', str(manifest), '--act', '--execution-policy',
+                                          str(self.catalog({**first, 'limits': {'claude': 1}}, file='first-policy.toml')), '--json'],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.wait(lambda: self.calls('spawn'))
+        policy = self.catalog({**other, 'principal': 2}, file='other-policy.toml')
+        refused = self.act([other, self.beta], self.catalog({**other, 'principal': 2}, self.beta, file='other-policy.toml'))
+        self.assertEqual([project['status'] for project in refused['projects']], ['refused', 'not_admitted'])
+        self.assertIn('host guard held', refused['projects'][0]['errors'][0])
+        out, _ = wrapper.communicate(timeout=60)
+        later = self.act([other], policy)['projects'][0]
+        self.assertEqual(later['status'], 'ok', later)
+        self.assertEqual(later['guard']['inode'], json.loads(out)['projects'][0]['guard']['inode'])
+        self.assertEqual([row[2] for row in self.calls('spawn')], ['acme/first', 'acme/other'])
+
+    def test_unsupported_guard_domain_is_refused_without_permission_changes(self):
+        with self.assertRaisesRegex(SystemExit, 'outside the catalog'):
+            multiproject.guard({'os_user': os.getuid() + 1})
+        self.assertFalse(self.guard.exists())
+        self.guard.touch()
+        os.chmod(self.guard, 0o666)
+        inode = self.guard.stat().st_ino
+        with self.assertRaisesRegex(SystemExit, 'alone; refused, no permission changed'):
+            multiproject.guard({'os_user': os.getuid()})
+        self.assertEqual((self.guard.stat().st_mode & 0o777, self.guard.stat().st_ino), (0o666, inode))
+        result = self.act([self.alpha, self.beta], self.catalog(self.alpha, self.beta, os_user=os.getuid() + 1))
+        self.assertEqual([project['status'] for project in result['projects']], ['refused', 'not_admitted'])
+        self.assertEqual(self.calls(), [])
+
+    def test_one_entry_view_acts_like_the_same_project_in_a_larger_view(self):
+        idle = self.project('idle', 111)
+        policy = self.catalog(idle, {**self.beta, 'limits': {'claude': 1}})
+        before = (self.dir / 'acme_beta.pickle').read_bytes()
+        alone = self.act([self.beta], policy)['projects'][0]
+        (self.dir / 'acme_beta.pickle').write_bytes(before)
+        self.agents(LIVE)
+        together = self.act([idle, self.beta], policy)['projects'][1]
+        self.assertEqual((alone['status'], together['status']), ('ok', 'ok'))
+        self.assertEqual(alone['budget'], together['budget'])
+        self.assertEqual(self.limits(alone)['claude'], (6, True, 2, 0, 1))
+        self.assertEqual(alone['native']['actions'][0]['action'], together['native']['actions'][0]['action'])
+
+
+def act_child():
+    """The acting fixture: the real wrapper, actor or occupancy reader (argv[2]). Each project's tracker is
+    test_taskq's in-memory GitLab, pickled between processes; `claude agents --json --all` is agents.json; launches,
+    doctor, cleanup, timer, retire and wake are logged fakes; no Codex app server. Every call goes to calls.jsonl."""
+    import test_taskq as base
+    role, fixture = sys.argv[2], Path(os.environ['TASKQ_FIXTURE'])
+    core.machine_id, core.MEMBERS, core.CODEX_SOCKET = base.REAL_MACHINE_ID, None, fixture / 'no-codex.sock'
+    agents = fixture / 'agents.json'
+
+    def write(*row):
+        with (fixture / 'calls.jsonl').open('a') as out:
+            out.write(json.dumps([role, *row]) + '\n')
+
+    def settings():
+        return json.loads(Path('fixture.json').read_text()) if Path('fixture.json').is_file() else {}
+
+    def api(method, path, body=None):
+        stored = fixture / f'{core.PROJECT_PATH.replace("/", "_")}.pickle'
+        store = pickle.loads(stored.read_bytes())
+        write('api', core.PROJECT_PATH, method, path)
+        if path == '/' + core.PROJECT:
+            return {'id': store.repo_id}
+        if method == 'POST' and 'award_emoji' in path and settings().get('lock_fails'):
+            raise SystemExit('fixture: tracker write refused')
+        found = store(method, path, body)
+        if method != 'GET':
+            stored.write_bytes(pickle.dumps(store))
+        return found
+
+    def rows():
+        return json.loads(agents.read_text())
+
+    def doctor(args):
+        if settings().get('doctor'):
+            print(f'not ready: 1 gap(s); each line is the command that closes it\n- {settings()["doctor"]}')
+            sys.exit(1)
+        print('ready')
+
+    def spawn(name, extra=None, prompt=None, remote_control=True):
+        hook = settings().get('spawn', {})
+        probe = subprocess.run([sys.executable, '-c', PROBE, str(multiproject.guard_path())], capture_output=True, text=True).stdout.strip()
+        write('spawn', core.PROJECT_PATH, name, probe, os.getpid())
+        if hook.get('crash'):
+            os._exit(9)
+        if hook.get('descendant'):
+            subprocess.Popen([sys.executable, '-c', DESCENDANT, str(multiproject.guard_path()), str(fixture / 'descendant.json')],
+                             close_fds=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(hook.get('sleep', 0))
+        found = rows()
+        session = f'w-{core.PROJECT_PATH.split("/")[-1]}-{len(found)}'
+        agents.write_text(json.dumps(found + [{'id': session[:8], 'cwd': str(core.ROOT), 'kind': 'background', 'sessionId': session,
+                                               'name': name, 'state': 'working', 'status': 'busy', 'pid': os.getpid()}]))
+        return session
+    core.api, multiproject.claude_rows, core.doctor, worker.claude_spawn = api, rows, doctor, spawn
+    core.claude_agents = lambda strict=False: {row['sessionId']: row for row in rows() if row.get('kind') == 'background'}
+    sys.modules['taskq.cleanup'].scheduled = lambda args: write('cleanup')
+    tick.timer = lambda install: write('timer', install)
+    core.claude_stop = lambda session, remove=False: write('stop', session)
+    core.claude_wake = lambda session, prompt, extra=None: write('wake', session)
+    multiproject.ACTOR, multiproject.OCCUPANCY = ACTOR, ACT + ['occupancy', '--occupancy']
+    write('start', os.getpid())
+    multiproject.main(sys.argv[3:])
+
+
 if __name__ == '__main__' and sys.argv[1:2] == ['--child']:
     child()
+elif __name__ == '__main__' and sys.argv[1:2] == ['--act-child']:
+    act_child()
 elif __name__ == '__main__':
     unittest.main()

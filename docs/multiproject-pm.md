@@ -1,6 +1,8 @@
-# Multiproject read-only observation (#186, stage 2)
+# Multiproject observation and acting pass (#186, stages 2 and 3)
 
-Specification: [accepted Wiki 9ffd02dd](https://github.com/alexkirs/taskq/wiki/Multiproject-read-only-preparation/9ffd02dd07dbff81da333089613642c883bbcf6f). This stage observes; it never acts.
+Specifications: observation, [accepted Wiki 9ffd02dd](https://github.com/alexkirs/taskq/wiki/Multiproject-read-only-preparation/9ffd02dd07dbff81da333089613642c883bbcf6f);
+acting, [accepted Wiki dcc97303](https://github.com/alexkirs/taskq/wiki/Multiproject-acting-pass/dcc973038f3138dd8f83dabbcc98adf2a72b775e).
+The default observes and never acts. Acting needs `--act` and a separately reviewed execution policy ([§ Acting](#acting-stage-3)).
 
 ```
 python -m taskq.multiproject --manifest FILE --json
@@ -65,8 +67,86 @@ The parent revalidates every report with `validate_report`, so stale or invalid 
 
 `received_applied` is always `unknown`. Delivery, receipt and application stay with `taskq report-verify` and a supported channel's readback.
 
+## Acting (stage 3)
+
+```
+python -m taskq.multiproject --manifest FILE --act --execution-policy POLICY --json
+```
+
+The manifest stays the view: which projects to visit in this invocation, and their `filter`, `mine` and `limits`. A view confers nothing. Acting authority comes only from the execution policy, a second TOML file the owner writes and has reviewed. The adapter only reads both files. It writes no profile, policy, configuration or permission.
+
+### Execution policy
+
+```toml
+version = 1
+machine = "macbook-m2"   # this host's taskq machine name (TASKQ_HOST, [hosts] or the hostname)
+os_user = 501            # the numeric OS user of the guard's domain (`id -u`)
+caps = { claude = 8, codex = 4 }  # optional; at most 8 and 4
+
+[[project]]              # the complete approved catalog, one binding per project
+provider = "github"
+host = "github.com"
+repository_id = 123456789
+repository = "owner/repo"
+board = "repo"
+checkout = "/abs/path/to/main/checkout"
+principal = 1640869      # the tracker user id this project's pass runs as (`gh api user --jq .id`)
+act = true               # false: catalog-only, never admitted; its ownership still counts
+limits = { claude = 1, codex = 0 }  # the project limit; a view's limits can only lower it
+effects = ["queue", "cleanup", "idle_stop"]
+timeout = 600            # optional; seconds for this project's actor, 1..600
+```
+
+Identity fields are checked as in the manifest. A view entry is admitted only when a valid binding has the same provider, host, repository id, repository, board and checkout, and `act = true`. Any other key is refused: readiness and effects evidence never come from this file.
+
+`effects` only narrows. The actor reads which native effects the project's own settings turn on: `queue` always (releases, unlocks, board and ready/waiting moves, reservation reconcile, Codex archive, nudges, retire, launches); `cleanup` when its `[cleanup]` is enabled; `idle_stop` when `[idle] stop` is not 0 (on the idle stop `tick --act` removes its launchd timer and runs idle cleanup). An effect the settings turn on and the binding does not list refuses the project before the native pass.
+
+### Per project
+
+Each view entry gets at most one attempt, serially, in manifest order. The wrapper first checks the binding, then checks that no actor holds the host guard. Then it starts the actor: `python -P -m taskq.multiproject --actor`, a subprocess in its own session with the checkout as cwd. Everything below happens in that one process:
+
+1. Lock the host guard and hold it until the process ends.
+2. Check identity as in observation. Check the policy's `machine` against this host and `principal` against the tracker's authenticated user; there is no delegation. Run `taskq doctor` read-only; a gap refuses. Refuse when `[update] auto` is due: its exec would end the guarded pass, so run `taskq update` there first. Check the effects.
+3. Read back the complete catalog, act = false bindings included, one read-only subprocess per binding: its same-host doing claims, reservations (with the session of their launch note, if any) and own tracker locks that no claim or reservation owns. Read the host's runtimes: every row of `claude agents --json --all` of any kind without a terminal state, and the Codex app server's running threads and `T<N>` worker threads.
+4. Compute the budget below and run the existing `tick --act --json` in this process, under its own checkout lock, with `--limit` set to it for every runtime.
+
+The actor never takes, spawns or releases by itself. Only the native pass does, through #208 `reserve`, which rechecks the whole queue and room under the tracker lock.
+
+### Budget
+
+For each runtime `r`:
+
+- occupancy is the number of distinct identities across host and catalog. Two grants count once only when they name the same exact session. A reservation without a launch session, an ownerless lock and a pid-only row each count separately.
+- F = max(0, cap[r] - occupancy).
+- L is exactly what native `core.room` subtracts for this project now: its same-host doing claims and reservations.
+- limit[r] = min(project limit[r], L + F). A runtime without a cap (a `[runtimes]` app) gets 0.
+
+An unreadable inventory makes F = 0 for its runtime. An unidentified live row (no session id and no pid) does the same. An unread catalog binding (refused identity, missing checkout, tracker failure) makes F = 0 for every runtime. The budget is recomputed for every project, after the previous project's actor ended.
+
+### Host guard
+
+The guard is one file: `multiproject-acting.lock` in the OS user's taskq state folder (`$XDG_STATE_HOME/taskq`, default `~/.local/state/taskq`, beside `machine-id`). It is keyed by the host, never by the backend principal: different principals of one OS user contend on the same inode. The file is never deleted or replaced.
+
+- **Domain.** Its domain is one OS user: the policy's `os_user`, checked against the process. Its folder and the file must belong to that user and not be writable by group or others. Otherwise acting is refused; no permission is changed. Two OS users on one host do not share a guard. So the caps hold for one OS user's acting passes, not host-wide; the adapter claims no host-global capacity. Windows and other platforms without flock are refused.
+- **Continuity.** The actor locks the guard before final admission and holds it through the native pass in the same process. Its descriptor is close-on-exec, so a spawned worker or other descendant inherits nothing. The actor runs in its own session: a killed wrapper does not end it or its guard. A crash ends the process, and the OS frees the lock; the inode stays for the next readback.
+- **Not a boundary.** Single-project `tick`, manual commands and other coordinators keep their own supervision contract. They do not take this guard; the readback counts what they own.
+
+### Timeout, crash and restart
+
+The actor is never killed. At its `timeout` the wrapper reports it `unknown`, leaves it running with its guard, and admits nothing more in this invocation. An actor that ends without a result (crash, lost output) is also `unknown` and stops admission. A refusal or a known native failure lets the next project run.
+
+A restarted wrapper first meets the same guard: while an actor runs, nothing is admitted. After release, the next actor reads everything back fresh (step 3) and releases nothing in that readback. Ownership the tracker and runtimes show is the only durable record. Tracker claims, reservations and locks survive a wrapper restart and a view change. An orphan reservation of a crashed launch holds its place until native reconcile settles it. There is no receipt file. Guard release or a successful readback never means a report was received or applied.
+
+### Results
+
+Statuses are `ok`, `judgement_needed` (native exit 1 with a valid report), `blocked` (report validation failed), `failed` (known native failure), `refused` (before any mutation), `unknown` (timeout, crash, unreadable output) and `not_admitted`. Each actor result keeps its guard (path, inode, domain), the budget per runtime, the catalog readback, the native outcome/actions/refusals and the native v1 report, revalidated by the wrapper. `received_applied` stays `unknown`.
+
+### Removing bindings
+
+Removing a view entry only stops admission; the catalog binding and its ownership still count. To retire a binding, set `act = false`. Wait until its readback shows no same-host claims, reservations or locks, then delete it. A binding deleted before that is no longer read. Its live sessions still count through the host runtime inventory, but its tracker-only grants (reservations without a worker, own locks) do not. That is the one case this stage cannot detect without a receipt store, which it does not add.
+
 ## Not here
 
-The manifest is the only state; there is no database, queue, scheduler or receipt store. Removing an entry stops future reads and leaves the tracker's claims and ownership as they are. Single-project `tick` is unchanged.
+The manifest and execution policy are the only inputs; there is no database, queue, scheduler or receipt store. Removing a manifest entry stops future reads and admission and leaves the tracker's claims and ownership as they are. Single-project `tick` is unchanged.
 
-There is no acting pass, timer, extra PM or live project activation. Acting multiproject passes are a later stage that needs #208, and parent #186 still depends on #185, #176 and #177. Fixture tests prove behavior against fakes only. They do not qualify live transport, approval or multiproject readiness.
+There is no timer, extra PM or live project activation. Parent #186 still depends on #185, #176 and #177, and live project selection is still open. Fixture tests prove behavior against fakes only: on-disk in-memory trackers, a file `claude agents` list and logged fake launches. They do not qualify live transport, approval, runtime launch or multiproject readiness.

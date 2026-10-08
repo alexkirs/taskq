@@ -57,29 +57,37 @@ def revision(item):
     """#223: the revision of a pending item: `<kind> <note id>` of the newest trusted note that put it where it is (the
     claim session's `result` for review, anyone's `ask` as `question` reads it, the claim session's `result`, `ask` or
     `problem` for doing), then the result block itself (`sha` and `checks`). The block is always part of it: a PUT that
-    landed with a new `checks` and the same SHA while its note failed is a new revision with the old note."""
+    landed with a new `checks` and the same SHA while its note failed is a new revision with the old note.
+    The note's body is kept on the item (`_note`): what the coordinator reads is the note the revision names, from
+    the same read, never a second read that a newer note could have reached in between."""
     claim = item['claim'] or {}
     who = f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]}'
     heads = {'review': [f'**result** · {who}'], 'ask': ['**ask**'],
              'doing': [f'**{kind}** · {who}' for kind in ('result', 'ask', 'problem')]}.get(item['state'], [])
     block = json.dumps(item.get('result'), sort_keys=True)
+    item['_note'] = 'none'
     for note in reversed(core.comments(item['iid'])):
         head = note['body'].split('\n', 1)[0]
         if any(head.startswith(found) for found in heads):
+            item['_note'] = note['body']
             return f'{head[2:].split("**", 1)[0]} {note["id"]} {block}'
     return f'block {block}'
 
 
 def pending(item):
-    """#223: the pending tuple of an item as one line: state, task, claim and revision. The wake key hashes these,
-    and the item is re-read against its line immediately before the send."""
-    claim = item['claim'] or {}
-    return f'{item["state"]} {item["iid"]} {claim.get("runtime")}:{claim.get("session")} {item.get("_revision") or revision(item)}'
+    """#223: the pending tuple of an item as one line: state, task, claim and revision, read once per item and kept
+    (`_pending`) with the note it names. The wake key hashes these lines; the item is re-read against its line
+    immediately before the send."""
+    if '_pending' not in item:
+        claim = item['claim'] or {}
+        item['_pending'] = f'{item["state"]} {item["iid"]} {claim.get("runtime")}:{claim.get("session")} {revision(item)}'
+    return item['_pending']
 
 
 def still_pending(item, line):
-    """A fresh read of the issue and its trusted notes gives the same pending line: state, claim and revision unchanged.
-    A gone tuple means resolved or superseded, never that the coordinator received or applied the earlier wake."""
+    """A fresh read of the issue and its trusted notes gives the same pending line: state, claim, the note the
+    revision names and the result block unchanged; any later result, ask or problem note or block write is a new line.
+    A gone line means resolved or superseded, never that the coordinator received or applied the earlier wake."""
     issue = core.api('GET', f'issues/{item["iid"]}')
     fresh = core.parse(issue) if issue['state'] == 'opened' else None
     return bool(fresh) and pending(fresh) == line
@@ -559,12 +567,14 @@ def act(args):
         args.output['outcome'] = 'failure' if any(event.get('status') == 'failed' for event in args.output['actions']) else 'judgement_needed'
         args.output['refusals'] = judgement
     print(said.getvalue(), end='')
+    pending_set = getattr(args, 'pending', ())
+    if args.wake and (judgement or pending_set):
+        # #223: a shown question has no judgement line for a day, but it is pending: the bounded re-wake covers it.
+        # Delivery is a fact; receipt and application are not read from it. The pending lines name what was sent.
+        status = wake(said.getvalue(), judgement, pending_set)
+        core.record(args, 'wake', status=status, acknowledged='unknown', pending=[line for _, line in pending_set])
     if not judgement:
         return
-    if args.wake:
-        status = wake(said.getvalue(), judgement, getattr(args, 'pending', ()))
-        # #223: delivery is a fact; receipt and application are not read from it. The pending lines name what was sent.
-        core.record(args, 'wake', status=status, acknowledged='unknown', pending=[line for _, line in getattr(args, 'pending', ())])
     sys.stdout.flush()
     sys.exit(1)
 
@@ -583,7 +593,11 @@ def wake(output, judgement, pending=()):
     if not session:
         print(f'\nNo coordinator to wake: no [coordinator] session in {core.LOCAL} (manager contract § 2).')
         return 'no coordinator'
-    key = hashlib.sha256('\n'.join([session, *judgement, *(line for _, line in pending)]).encode()).hexdigest()[:12]  # #185: a handoff wakes the new owner
+    # #185: a handoff wakes the new owner. #223: a review, ask or stuck line of an item with a pending line is covered
+    # by that finer line; a question leaving the list when shown is the same set, not a new one.
+    covered = {str(item['iid']) for item, _ in pending}
+    rest = [line for line in judgement if not (line.split()[0] in ('review', 'ask', 'stuck') and line.split()[1] in covered)]
+    key = hashlib.sha256('\n'.join([session, *rest, *(line for _, line in pending)]).encode()).hexdigest()[:12]
     sent = woken().read_text().split() if woken().exists() else []
     again = bool(sent) and sent[0] == key
     if again and time.time() - float(sent[1] if len(sent) > 1 else 0) < TICK_LIVE_MINUTES * 60:
@@ -604,6 +618,11 @@ def wake(output, judgement, pending=()):
     if moved := [item['iid'] for item, line in pending if not still_pending(item, line)]:
         print(f'\nNot woken: {", ".join(f"#{iid}" for iid in moved)} changed since this tick read it; the next tick reads again.')
         return 'pending changed'
+    if again or not judgement:
+        # A re-delivery, or a set with no judgement line (questions already shown): the pending items and their
+        # notes, from the same read the lines were made of, so the turn has what it decides on.
+        output += '\n## Pending, acknowledgement unknown\n\n' + ''.join(
+            f'- {line}\n{core.data(item.get("_note", "none"))}' for item, line in pending)
     core.claude_wake(session, f'Project {core.PROJECT_PATH}, main checkout {core.ROOT}. ' + WAKE_PROMPT + output)
     woken().write_text(f'{key}\n{time.time():.0f}\n')
     print(f'\nWoke the coordinator {session}' + (' again: the same items are still pending; acknowledgement unknown.' if again else '.'))
@@ -901,6 +920,9 @@ def queue_pass(args, act=False):
     archive_finished_codex(loaded[0], log, args)
     # #197: the owner's tick (this machine coordinates) applies native cleanup when due; never a timer of its own.
     sys.modules['taskq.cleanup'].scheduled(args)  # the module: `core.cleanup` is the command function
+    # #223: one read per item gives its pending line and the note it names; what is printed below comes from that
+    # same read. A shown question is pending without a judgement line, so the lines are made before the idle return.
+    args.pending = [(item, pending(item)) for item in review + [item for item, *_ in asked]]
     if not (review or fresh or summary or start or codex_stopped or odd or problems) and not any(item['state'] == 'doing' for item in everything):
         # #153: an ask or review task waits for someone, so it is no idle pass.
         if any(item['state'] in ('ask', 'review') for item in everything):
@@ -920,11 +942,10 @@ def queue_pass(args, act=False):
         session, runtime = item['claim']['session'], item['claim'].get('runtime')
         state, activity = alive.get(item['iid']) or liveness(item, agents)
         item['_report_activity'] = activity
-        found = revision(item) if item['state'] == 'doing' and not item.get('result') and state != 'busy' else ''
-        if found.startswith('problem '):
+        found = pending(item) if item['state'] == 'doing' and not item.get('result') and state != 'busy' else ''
+        if found.split(' ')[3:4] == ['problem']:
             # #223: the worker ended its turn on a `problem` note, no result or ask: judgement, never a nudge or a
             # release; its claim stays. Unknown (another machine, no CLI) is listed too: a listing has no effect.
-            item['_revision'] = found
             stuck.append(item)
         elif state == 'idle' and item['state'] == 'doing' and not item.get('result'):
             (claude_idle if runtime == 'claude' else idle).append(item)
@@ -974,8 +995,7 @@ def queue_pass(args, act=False):
               f'`{core.TOOL} codex-send <session> --text "<next step>"`), or `{core.TOOL} release <N>` only for a stopped session. '
               'Do not answer: the task is not in ask.\n')
         for item in stuck:
-            body = next((note['body'] for note in reversed(core.comments(item['iid'])) if str(note['id']) == item['_revision'].split()[1]), '')
-            print(f'- {core.ref(item)} {item["claim"]["runtime"]} {item["claim"]["session"]}:\n' + core.data(body.split('\n\n', 1)[-1]))
+            print(f'- {core.ref(item)} {item["claim"]["runtime"]} {item["claim"]["session"]}:\n' + core.data(item['_note'].split('\n\n', 1)[-1]))
     if odd:
         print('## Board mismatch\n\nThese issues are not in a state taskq can run. Fix each:\n')
         print(core.data(''.join(f'- {line}\n' for line in odd).rstrip()))
@@ -985,7 +1005,8 @@ def queue_pass(args, act=False):
         print(core.data(''.join(f'- {core.ref(issue)} {issue["title"]}\n' for issue in problems).rstrip()))
     for item in review:
         sha = item['result'].get('sha')
-        print(f'## Review {core.ref(item)}: {item["title"]}\n\n{item["text"]}\n\nHanded in:\n\n{core.data(core.handed_in(item))}\n'
+        # #223: the hand-in is the note the pending line names, from the same read: never a newer note under an old line.
+        print(f'## Review {core.ref(item)}: {item["title"]}\n\n{item["text"]}\n\nHanded in:\n\n{core.data(item["_note"])}\n'
               + (f'Commit: [{sha}]({core.commit_url(item, sha)})\n' if sha and item.get('web_url') else '') +
               f'Check the result against the Acceptance above (for code and docs read the commit).\n'
               f'Accepted: `{core.TOOL} close {item["iid"]} --text "<what you checked>"`. '
@@ -1021,8 +1042,8 @@ def queue_pass(args, act=False):
         print(core.data(''.join(f'- {line}\n' for line in failed).rstrip()))
     # #223: every unresolved review, question (shown or not) and worker problem is pending, with its revision; the
     # judgement lines below stay the coordinator's list and the report's refusals.
-    args.pending = [(item, pending(item)) for item in review + [item for item, *_ in asked] + stuck]
+    args.pending += [(item, pending(item)) for item in stuck]
     return ([f'review {item["iid"]} {item["result"].get("sha")}' for item in review] + [f'ask {item["iid"]}' for item, _ in fresh + summary]
-            + [f'stuck {item["iid"]} {item["_revision"].split()[1]}' for item in stuck]
+            + [f'stuck {item["iid"]} {pending(item).split(" ")[4]}' for item in stuck]
             + [observation['notify_dedup'] for observation in permissions]
             + odd + [f'problem {issue["iid"]}' for issue in problems] + [f'inbox {issue["iid"]}' for issue in inbox] + failed)

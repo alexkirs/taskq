@@ -41,6 +41,15 @@ failed is a new revision with the old note id.
 
 The pending set of a pass is every `review` item with a result, every `ask` item (shown or not; the daily
 summary hides a question from the judgement lines, never from the set) and every `stuck` doing item.
+Each item is read once (`tick.pending`): the line and the note it names (`_note`) come from that same
+read, and that note is what the review section and the pending section print. A result note that lands
+after the read is a different line on the fresh compare, so the old text is never sent under the new
+revision; it is sent on the next pass, with its own line.
+
+The wake key hashes the pending lines and the judgement lines that no pending line covers (permissions,
+board mismatch, problems, inbox, failed steps). A question leaving the judgement lines when shown is the
+same set; the bounded re-wake after `TICK_LIVE_MINUTES` reaches it even when no judgement line is left,
+and the turn then carries a `## Pending, acknowledgement unknown` section with each line and its note.
 
 A **decision** is exactly one of the existing state-changing commands by a session other than the claim
 session: `close`, `reject`, `answer`, `later`, `release`. Each changes the state in the same `save()` as
@@ -91,9 +100,13 @@ which only the coordinator's own command writes.
 
 ## Tests — `tests/test_completion_supervision.py`
 
-Six cases, each with a mutation that fails it: resubmitted result and second question wake again
+Eight cases, each with a mutation that fails it: resubmitted result and second question wake again
 (block, note id); every open question is pending while the summary hides it, and an owner answer through
-the board resolves it; the block is part of the revision (same SHA, new checks, old note), delivery is
+the board resolves it; a shown question alone (no judgement line) is re-delivered once after
+`TICK_LIVE_MINUTES` with its text in the turn (independent review P1); the hand-in text and the line
+come from one read, a result note landing after it stops the send and goes out on the next pass under
+its own line, and a same-SHA new-checks PUT without a note landing before the send stops it too
+(independent review P1); the block is part of the revision (same SHA, new checks, old note), delivery is
 rechecked and re-sent once after `TICK_LIVE_MINUTES` with `acknowledged: unknown`, a decision leaves
 nothing that says applied; a problem note reaches judgement and keeps the claim, `answer` on doing is
 refused, a busy worker is never stuck; the observation names both sources and the conflict, the snapshot
@@ -101,7 +114,9 @@ reads running, ended and unread tails; a result while the thread is `notLoaded` 
 nudge or release, out-of-order decisions are refused by state, the next brief holds the answer.
 
 Negative controls run on 2026-10-08: dropping the pending lines from the key, the pre-send recheck, the
-block from the revision, the stuck detection, or the conflict flag each fails the module.
+block from the revision, the stuck detection, the conflict flag, the wake on a pending set without
+judgement, the same-read hand-in (a second `handed_in` read), the pending-covered judgement lines from
+the key, or the revision part of the fresh compare each fails the module.
 
 ## Qualification on the actual route (read only, 2026-10-08)
 

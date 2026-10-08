@@ -92,18 +92,80 @@ class Supervision(unittest.TestCase):
         self.act()
         self.assertEqual(len(self.woken), 1)
         self.assertEqual([line.split()[0] for line in self.wakes()[-1]['pending']], ['review', 'ask'])
-        # Shown: the question leaves the judgement lines for a day (one more wake for the shorter list, as before
-        # #223), not the pending set.
-        self.act()
-        self.assertEqual(len(self.woken), 2)
-        self.assertEqual([line.split()[0] for line in self.wakes()[-1]['pending']], ['review', 'ask'])
+        # Shown: the question leaves the judgement lines for a day, not the pending set; the set is the same, no wake.
         self.assertIn('already woken', self.act())
+        self.assertEqual(len(self.woken), 1)
+        self.assertEqual([line.split()[0] for line in self.wakes()[-1]['pending']], ['review', 'ask'])
         # The owner answers through the board: the question is resolved, the set is new although the lines are the same.
         self.do(COORDINATOR, 'answer', asked, '--text', 'A')
         self.assertEqual(self.state(asked), 'ready')
         self.act()
-        self.assertEqual(len(self.woken), 3)
+        self.assertEqual(len(self.woken), 2)
         self.assertEqual([line.split()[0] for line in self.wakes()[-1]['pending']], ['review'])
+
+    def test_shown_question_alone_is_re_delivered_after_tick_live_minutes(self):
+        """P1 of the independent review: an ask-only queue has no judgement line once shown; the pending set still
+        reaches the coordinator again, bounded by TICK_LIVE_MINUTES, with the question in the turn."""
+        asked = self.add('--type', 'asset', '--runtime', 'claude')
+        self.do(CLAUDE, 'take', asked)
+        self.do(CLAUDE, 'ask', asked, '--text', 'A or B?')
+        self.assertIn('New questions', self.act())
+        self.assertEqual(len(self.woken), 1)
+        output = self.act()  # shown: no judgement line, nothing to do, the set unchanged
+        self.assertIn('Nothing to do', output)
+        self.assertEqual((len(self.woken), self.wakes()[-1]['status']), (1, 'already delivered'))
+        key = tick.woken().read_text().split()[0]
+        tick.woken().write_text(f'{key}\n{time.time() - tick.TICK_LIVE_MINUTES * 60 - 1:.0f}\n')
+        output = self.act()
+        self.assertEqual((len(self.woken), self.wakes()[-1]['status'], self.state(asked)), (2, 'delivered again', 'ask'))
+        self.assertTrue(self.wakes()[-1]['pending'][0].startswith(f'ask {asked} claude:claude-session ask '))
+        self.assertIn('## Pending, acknowledgement unknown', self.woken[-1][1])
+        self.assertIn('A or B?', self.woken[-1][1])
+        self.assertIn('already woken', self.act())
+        self.assertEqual(len(self.woken), 2)
+
+    def test_hand_in_text_and_revision_come_from_one_read_and_a_later_note_stops_the_send(self):
+        """P1 of the independent review: a trusted result note landing after the read (same block) must not be sent
+        as the old text under the new revision; the fresh compare before the send sees the later note."""
+        code = self.add('--type', 'code', '--runtime', 'claude')
+        self.do(CLAUDE, 'take', code)
+        self.do(CLAUDE, 'result', code, '--sha', 'abc1234', '--text', 'OLD PAYLOAD', '--checks', 'same')
+        comments, landed = q.comments, []
+
+        def racing(iid, everyone=False):
+            found = comments(iid, everyone)
+            if not landed:  # the note lands right after the tick's one read of this item
+                landed.append(self.gitlab('POST', f'issues/{iid}/notes', {'body': '**result** · claude:claude-s\n\n`abc1234`\n\nNEW PAYLOAD\n\nChecks: same'})['id'])
+            return found
+        with patch.object(q, 'comments', racing):
+            output = self.act()
+        self.assertIn('OLD PAYLOAD', output)
+        self.assertNotIn('NEW PAYLOAD', output)  # one read: the text and the line are the old note's
+        self.assertIn(f'result {int(landed[0]) - 1} ', self.wakes()[-1]['pending'][0])
+        self.assertEqual((self.woken, self.wakes()[-1]['status']), ([], 'pending changed'))
+        self.assertIn('changed since this tick read it', output)
+        output = self.act()
+        self.assertEqual(len(self.woken), 1)
+        self.assertIn('NEW PAYLOAD', self.woken[0][1])
+        self.assertNotIn('OLD PAYLOAD', self.woken[0][1])
+        self.assertIn(f'result {landed[0]} ', self.wakes()[-1]['pending'][0])
+        # A PUT with the same SHA and new checks and no note, landing after the read: the fresh block stops the send too.
+        key = tick.woken().read_text().split()[0]
+        tick.woken().write_text(f'{key}\n{time.time() - tick.TICK_LIVE_MINUTES * 60 - 1:.0f}\n')
+        still, written = tick.still_pending, []
+
+        def racing_block(item, line):
+            if not written:
+                written.append(q.save(q.task(item['iid']), result={'sha': 'abc1234', 'checks': 'new'}))
+            return still(item, line)
+        with patch.object(tick, 'still_pending', racing_block):
+            output = self.act()
+        self.assertEqual((len(self.woken), self.wakes()[-1]['status']), (1, 'pending changed'))
+        self.assertIn('"checks": "same"', self.wakes()[-1]['pending'][0])
+        self.act()
+        self.assertEqual(len(self.woken), 2)
+        self.assertIn('"checks": "new"', self.wakes()[-1]['pending'][0])
+        self.assertNotIn('applied', json.dumps(self.report))
 
     def test_result_block_is_part_of_the_revision_and_delivery_is_rechecked(self):
         code = self.add('--type', 'code', '--runtime', 'claude')

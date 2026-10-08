@@ -246,6 +246,12 @@ def codex_send_app(codex, thread, metadata, text, full_access=False):
             return None
         owner, item = found['handledByClientId'], [{'type': 'text', 'text': text, 'text_elements': []}]
         turns = codex.call('thread/turns/list', {'threadId': thread, 'limit': 1, 'itemsView': 'notLoaded'})['data']
+        if turns and turns[0]['status'] == 'inProgress':
+            cwd = metadata.get('cwd') or str(core.ROOT)
+            reply = ipc.request('thread-follower-steer-turn', {'conversationId': thread, 'input': item, 'restoreMessage':
+                                {'text': text, 'cwd': cwd, 'context': {'workspaceRoots': [cwd]}}}, 1, owner)
+            if reply['resultType'] == 'success':
+                return 'steered the active turn in the Codex app'
         reply = ipc.request('thread-follower-start-turn', {'conversationId': thread, 'turnStart': {
             'request': {'threadId': thread, 'input': item, **codex_turn_policy(full_access)}, 'context': {}}}, 2, owner)
         if reply['resultType'] != 'success':

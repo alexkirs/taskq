@@ -804,7 +804,7 @@ from taskq.codex import (CODEX_HEADLESS, CODEX_SOCKET, Codex, codex_age, codex_a
 from taskq.cleanup import cleanup  # noqa: E402
 from taskq.selftest import selftest  # noqa: E402
 from taskq.doctor import (  # noqa: E402
-    green, signed, works, update, queue_labels, probe, origin_of, write_config, doctor, personal_gaps, ignore_local,
+    green, works, update, queue_labels, probe, origin_of, write_config, doctor, personal_gaps, ignore_local,
     tree_gaps, profile_init, write_access, queue_labels_missing, board_gaps, report_gaps,
     PERMISSION_MODE, WORKER_ALLOW, permissions_missing, permissions_gap, trusted, setup, migrate, windows_claude_binary, pref)
 from taskq.tick import (  # noqa: E402

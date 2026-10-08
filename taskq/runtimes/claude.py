@@ -36,4 +36,4 @@ class Adapter:
     def link(self, session):
         if self.ops: return self.call('link', session)
         from taskq import claude_url
-        return claude_url(session) or f'claude attach {session}'
+        return claude_url(session)

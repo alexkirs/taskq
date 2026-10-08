@@ -648,10 +648,9 @@ def retire_local(current):
 
     session = claim.get('session')
     if session and core.local_claim(claim):
-        if claim.get('runtime') == 'claude':
-            step('session', lambda: f'retired {session}' if claude_stop(session, remove=True) else f'{session} is not a background session here')
-        elif claim.get('runtime') == 'codex':
-            step('session', lambda: core.codex_archive(argparse.Namespace(thread=session)))
+        from taskq.runtimes import get
+        step('session', lambda: (get(claim['runtime']).close(session), f'retired {session}')[1]
+             if claim['runtime'] == 'claude' else get(claim['runtime']).close(session))
     elif session:
         print(f'session: {claim.get("runtime")}:{session} is on another machine; retire it there')
     if current['type'] not in ('code', 'docs'):
@@ -758,10 +757,8 @@ def assign(iid, attempt, session):
     current, runtime = core.task(iid), attempt['runtime']
     if current['state'] != 'ready' or current.get('supervisor') or current.get('reservation') != attempt:
         with contextlib.suppress(Exception, SystemExit):
-            if runtime == 'claude':
-                claude_stop(session, remove=True)
-            elif runtime == 'codex':
-                core.codex_archive(argparse.Namespace(thread=session))
+            from taskq.runtimes import get
+            get(runtime).close(session)
         core.fail(f'#{iid}: its reservation {attempt["attempt"]} changed while its supervisor started; that session was retired')
     found = {'runtime': runtime, 'session': session}
     core.save(current, supervisor=found, reservation=None, note_action='edit',

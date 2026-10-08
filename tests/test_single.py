@@ -591,6 +591,11 @@ class Tick(Base):
         self.assertIn('background command', out)
         self.assertIn('wait', out)
 
+    def test_arm_tick_prints_the_codex_compact_line(self):
+        out = self.run_cli('arm', 'tick')
+        self.assertIn('codex -c model_auto_compact_token_limit=200000 -c "compact_prompt=\\"Keep only the owner\'s open '
+                      'questions and decisions; the board is the state.\\""', out)
+
     def test_brief_carries_the_requeue_reason(self):
         self.add()
         self.run_cli('requeue', '1', '--text', 'fix test X')

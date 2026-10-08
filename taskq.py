@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
+import argparse, importlib.util, json, os, re, shutil, socket, subprocess, sys
+from pathlib import Path
+from urllib.parse import quote
+
+# --- config + task model --------------------------------------------------------------------
+
+STATES = ('ready', 'waiting', 'doing', 'review', 'ask', 'later')
+TYPES = ('code', 'docs', 'research', 'asset')
+FIELDS = ('scope', 'deps', 'claim', 'result')
+PREFIX, RUN, ON = 'q-', 'run-', 'host-'
+BLOCK = re.compile(r'<!-- taskq:start -->\s*```json\n(.*?)\n```\s*<!-- taskq:end -->', re.S)
+SESSIONS = {'claude': 'CLAUDE_CODE_SESSION_ID', 'codex': 'CODEX_THREAD_ID'}
+CONFIG, BOARD = {}, None  # set by main, or by a test
+
+
+def fail(message):
+    sys.exit(f'taskq: {message}')
+
+
+def load_config(start=None):
+    """taskq.json: the nearest one from `start` (the current directory) up; its folder is the project root."""
+    here = Path(start or Path.cwd()).resolve()
+    for folder in [here, *here.parents]:
+        if (folder / 'taskq.json').is_file():
+            return {'board': 'github', 'publish': 'direct', **json.loads((folder / 'taskq.json').read_text('utf-8')), 'root': folder}
+    fail('no taskq.json in this directory or above')
+
+
+def machine():
+    name = os.environ.get('TASKQ_HOST') or socket.gethostname()
+    return CONFIG.get('hosts', {}).get(name) or name.split('.')[0].lower()
+
+
+def session():
+    """This agent session, or None for the owner's shell. TASKQ_RUNTIME picks one when a session inherited another's id."""
+    found = [r for r in SESSIONS if os.environ.get(SESSIONS[r]) and os.environ.get('TASKQ_RUNTIME', r) == r]
+    return {'runtime': found[0], 'session': os.environ[SESSIONS[found[0]]]} if found else None
+
+
+def who():
+    current = session()
+    return f'{current["runtime"]}:{current["session"][:8]}' if current else 'owner'
+
+
+def parse(issue):
+    """A board issue as a task, or None when it is not one: no block or not exactly one known q-* label."""
+    found = BLOCK.search(issue.get('body') or '')
+    labels = issue['labels']
+    states = [label[len(PREFIX):] for label in labels if label.startswith(PREFIX)]
+    if not found or len(states) != 1 or states[0] not in STATES:
+        return None
+    raw = json.loads(found.group(1))
+    return {**{key: raw.get(key) for key in FIELDS}, 'raw': raw, 'iid': issue['iid'], 'title': issue['title'],
+            'state': states[0], 'labels': labels, 'type': next((label for label in labels if label in TYPES), None),
+            'runtime': next((label[len(RUN):] for label in labels if label.startswith(RUN)), 'any'),
+            'host': next((label[len(ON):] for label in labels if label.startswith(ON)), None),
+            'priority': min([int(label[9:]) for label in labels if re.fullmatch(r'priority-\d', label)] or [9]),
+            'updated_at': issue.get('updated_at'), 'url': issue.get('url'), 'text': BLOCK.sub('', issue['body']).strip()}
+
+
+def block(text, fields):
+    """The description: the task's text, then its JSON block. Keys the model does not know are kept as they are."""
+    return f'{text}\n\n<!-- taskq:start -->\n```json\n{json.dumps(fields, indent=1, ensure_ascii=False)}\n```\n<!-- taskq:end -->'
+
+
+# --- board ----------------------------------------------------------------------------------
+# Six functions: list(state), get(n), add(title, body, labels), update(n, labels=None, body=None), comment(n, text),
+# close(n). An issue is {iid, title, body, labels, state: open|closed, updated_at, url} and from get also comments.
+
+def run_api(tool, host, method, path, body=None):
+    command = [shutil.which(tool) or fail(f'{tool} not found'), 'api', '-X', method, path]
+    command += ['--hostname', host] * bool(host) + ['--input', '-', '-H', 'Content-Type: application/json'] * (body is not None)
+    done = subprocess.run(command, input=body and json.dumps(body), capture_output=True, text=True, encoding='utf-8')
+    if done.returncode:
+        fail(f'{tool} api {method} {path}: {done.stderr.strip() or done.stdout.strip()}')
+    return json.loads(done.stdout) if done.stdout.strip() else None
+
+
+class GitHub:
+    def __init__(self, repo, host=None):
+        self.repo, self.host = repo, host
+
+    def api(self, method, path, body=None):
+        return run_api('gh', self.host, method, f'repos/{self.repo}/{path}', body)
+
+    def trusted(self, item):
+        """Anyone may open or comment on a public issue: only collaborators' issues are tasks, their comments answers."""
+        return item.get('author_association') in ('OWNER', 'MEMBER', 'COLLABORATOR')
+
+    def pages(self, path):
+        found, page = [], 1
+        while True:
+            batch = self.api('GET', f'{path}{"&" if "?" in path else "?"}per_page=100&page={page}')
+            found += batch
+            if len(batch) < 100:
+                return [item for item in found if self.trusted(item)]
+            page += 1
+
+    def issue(self, item):
+        # An untrusted author's description is read as empty: never a task.
+        return {'iid': item['number'], 'title': item['title'], 'body': self.trusted(item) and item.get('body') or '', 'url': item['html_url'],
+                'labels': [label['name'] for label in item['labels']], 'state': item['state'], 'updated_at': item['updated_at']}
+
+    def list(self, state):
+        query = 'issues?state=open' + (f'&labels={PREFIX}{state}' if state else '')
+        return [self.issue(item) for item in self.pages(query) if 'pull_request' not in item
+                and any(label['name'].startswith(PREFIX) for label in item['labels'])]
+
+    def get(self, n):
+        return {**self.issue(self.api('GET', f'issues/{n}')), 'comments': [item['body'] for item in self.pages(f'issues/{n}/comments')]}
+
+    def add(self, title, body, labels):
+        return self.api('POST', 'issues', {'title': title, 'body': body, 'labels': labels})['number']
+
+    def update(self, n, labels=None, body=None):
+        self.api('PATCH', f'issues/{n}', {key: value for key, value in (('labels', labels), ('body', body)) if value is not None})
+
+    def comment(self, n, text):
+        self.api('POST', f'issues/{n}/comments', {'body': text})
+
+    def close(self, n):
+        self.api('PATCH', f'issues/{n}', {'state': 'closed'})
+
+
+class GitLab(GitHub):
+    members = None  # read once per process
+
+    def api(self, method, path, body=None):
+        return run_api('glab', self.host, method, f'projects/{quote(self.repo, safe="")}/{path}', body)
+
+    def trusted(self, item):
+        """Members with Reporter or higher: GitLab has no author_association. A member item itself has no author."""
+        if self.members is None and 'author' in item:
+            self.members = {member['id'] for member in self.pages('members/all') if member['access_level'] >= 20}
+        return 'author' not in item or (item['author'] or {}).get('id') in self.members
+
+    def issue(self, item):
+        return {'iid': item['iid'], 'title': item['title'], 'body': self.trusted(item) and item.get('description') or '', 'url': item['web_url'],
+                'labels': item['labels'], 'state': 'open' if item['state'] == 'opened' else 'closed',
+                'updated_at': item['updated_at']}
+
+    def list(self, state):
+        query = 'issues?state=opened' + (f'&labels={PREFIX}{state}' if state else '')
+        return [self.issue(item) for item in self.pages(query) if any(label.startswith(PREFIX) for label in item['labels'])]
+
+    def get(self, n):
+        return {**self.issue(self.api('GET', f'issues/{n}')), 'comments': [
+            item['body'] for item in self.pages(f'issues/{n}/notes?sort=asc&activity_filter=only_comments')]}
+
+    def add(self, title, body, labels):
+        return self.api('POST', 'issues', {'title': title, 'description': body, 'labels': ','.join(labels)})['iid']
+
+    def update(self, n, labels=None, body=None):
+        self.api('PUT', f'issues/{n}', {key: value for key, value in (('labels', None if labels is None else ','.join(labels)),
+                                                                     ('description', body)) if value is not None})
+
+    def comment(self, n, text):
+        self.api('POST', f'issues/{n}/notes', {'body': text})
+
+    def close(self, n):
+        self.api('PUT', f'issues/{n}', {'state_event': 'close'})
+
+
+def make_board(config):
+    """`board`: github, gitlab, or a .py file (relative to the project root) with the six functions at module level."""
+    kind = config['board']
+    if kind.endswith('.py'):
+        spec = importlib.util.spec_from_file_location('taskq_board', config['root'] / kind)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    return {'github': GitHub, 'gitlab': GitLab}.get(kind, lambda *_: fail(f'unknown board {kind!r}'))(
+        config['repo'], config.get('host'))
+
+
+# --- commands -------------------------------------------------------------------------------
+
+def task(n, *states):
+    issue = BOARD.get(n)
+    found = parse(issue) if issue['state'] == 'open' else None
+    if not found:
+        fail(f'#{n} is not an open taskq task')
+    if states and found['state'] not in states:
+        fail(f'#{n} is {found["state"]}, not {" or ".join(states)}')
+    return found
+
+
+def move(current, state, action, text='', **fields):
+    """One update moves the label and the block together; one comment is the history. State None: no state label."""
+    labels = [label for label in current['labels'] if not label.startswith(PREFIX)] + ([PREFIX + state] if state else [])
+    raw = {**current['raw'], **{key: current[key] for key in FIELDS}, **fields}
+    BOARD.update(current['iid'], labels=labels, body=block(current['text'], raw))
+    BOARD.comment(current['iid'], f'**{action}** · {who()}' + (f'\n\n{text}' if text else ''))
+    print(f'#{current["iid"]} {state or "closed"}')
+
+
+def open_deps(deps):
+    return [n for n in deps or [] if BOARD.get(n)['state'] == 'open']
+
+
+def cmd_add(args):
+    text = f'## Goal\n\n{args.goal}\n\n## Acceptance\n\n{args.acceptance}'
+    state = 'waiting' if open_deps(args.deps) else 'ready'
+    labels = [PREFIX + state, f'priority-{args.priority}', args.type] + ([RUN + args.runtime] if args.runtime != 'any' else []) \
+        + ([ON + args.host] if args.host else [])
+    n = BOARD.add(args.title, block(text, {'scope': args.scope, 'deps': args.deps, 'claim': None, 'result': None}), labels)
+    BOARD.comment(n, f'**add** · {who()}')
+    print(f'#{n} {state}')
+
+
+def cmd_list(args):
+    found = [item for item in map(parse, BOARD.list(args.state)) if item]
+    for item in sorted(found, key=lambda item: (STATES.index(item['state']), item['priority'], item['iid'])):
+        claim = item['claim'] or {}
+        detail = {'ready': 'continue' if claim else '', 'later': item['raw'].get('waiting_for') or '',
+                  'doing': f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]} @{claim.get("name")}' if claim else '',
+                  'waiting': f'open dependencies {open_deps(item["deps"])}' if item['state'] == 'waiting' else ''}.get(item['state'], '')
+        print(f'#{item["iid"]:<4} {item["state"]:<8} p{item["priority"]} {item["runtime"]:<6} {item["title"]}'
+              + (f'  [{detail}]' if detail else ''))
+
+
+def cmd_take(args):
+    current, mine = task(args.n, 'ready'), session() or fail('take needs an agent session: set ' + ' or '.join(SESSIONS.values()))
+    if open_deps(current['deps']):
+        fail(f'#{args.n} has open dependencies')
+    move(current, 'doing', 'take', claim={**mine, 'name': machine()}, result=None)
+
+
+# Moves with no other check: command -> (states it takes from, state it goes to, block changes).
+MOVES = {'ask': (('doing',), 'ask', lambda args: {}), 'answer': (('ask',), 'doing', lambda args: {}),
+         'requeue': (STATES, 'ready', lambda args: {'claim': None, 'result': None}),
+         'later': (STATES, 'later', lambda args: {'waiting_for': args.text or None}),
+         'result': (('doing',), 'review', lambda args: {'result': {'sha': args.sha, 'checks': args.checks}})}
+
+
+def cmd_move(args):
+    sources, state, fields = MOVES[args.command]
+    move(task(args.n, *sources), state, args.command, args.text, **fields(args))
+
+
+def commit(sha):
+    """A result's commit: hex only, so it never reaches git as an option."""
+    return sha if re.fullmatch('[0-9a-f]{7,40}', sha) else fail(f'{sha!r} is not a commit: 7 to 40 lowercase hex digits')
+
+
+def cmd_close(args):
+    current = task(args.n, 'review')
+    if CONFIG['publish'] != 'direct':
+        fail(f'publish mode {CONFIG["publish"]!r}: not supported yet')
+    sha = commit((current['result'] or {}).get('sha') or '')
+    git = [shutil.which('git') or fail('git not found'), '-C', str(CONFIG['root'])]
+    subprocess.run([*git, 'fetch', 'origin'], capture_output=True)
+    if subprocess.run([*git, 'merge-base', '--is-ancestor', sha, 'origin/main'], capture_output=True).returncode:
+        fail(f'#{args.n}: result {sha} is not on origin/main')
+    move(current, None, 'close', args.text)
+    BOARD.close(args.n)
+
+
+def main(argv=None):
+    global CONFIG, BOARD
+    parser = argparse.ArgumentParser(prog='taskq')
+    commands = parser.add_subparsers(dest='command', required=True)
+
+    def command(name, function, *options, n=True, text=False):
+        sub = commands.add_parser(name)
+        if n:
+            sub.add_argument('n', type=int)
+        if text:
+            sub.add_argument('--text', required=text == 'required', default='')
+        for flags, extra in options:
+            sub.add_argument(*flags, **extra)
+        sub.set_defaults(function=function)
+
+    command('add', cmd_add, (('title',), {}), (('--goal',), {'required': True}), (('--acceptance',), {'required': True}),
+            (('--scope',), {'nargs': '*', 'default': []}), (('--deps',), {'nargs': '*', 'type': int, 'default': []}),
+            (('--type',), {'choices': TYPES, 'default': 'code'}), (('--runtime',), {'default': 'any'}),
+            (('--priority',), {'type': int, 'choices': (1, 2), 'default': 2}), (('--host',), {}), n=False)
+    command('list', cmd_list, (('state',), {'nargs': '?', 'choices': STATES}), n=False)
+    command('take', cmd_take)
+    command('ask', cmd_move, text='required')
+    command('answer', cmd_move, text='required')
+    command('result', cmd_move, (('--sha',), {'required': True, 'type': commit}), (('--checks',), {'default': ''}), text=True)
+    command('requeue', cmd_move, text=True)
+    command('later', cmd_move, text=True)
+    command('close', cmd_close, text=True)
+    args = parser.parse_args(argv)
+    if BOARD is None:
+        CONFIG = load_config()
+        BOARD = make_board(CONFIG)
+    args.function(args)
+
+
+if __name__ == '__main__':
+    main()

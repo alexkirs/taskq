@@ -19,27 +19,26 @@ import socket
 import subprocess
 import sys
 import time
-from urllib.parse import parse_qs, quote
+from urllib.parse import quote
 
 # Set from the project's taskq.toml by `configure`.
 PROJECT = PROJECT_PATH = ROOT = TICK_BEAT = HELPERS = None  # GitLab API prefix, `relates_to` target, main checkout
 HOST = None  # GitLab or GitHub host for glab/gh; None: the CLI's own choice (the git remote of the current directory)
 STORE = None  # `gitlab` or a `Github`: what `api` speaks to (set by `configure`)
 BOARD = 'taskq'
-BOARDS = True  # GitLab's board is a view over the q-* labels; GitHub's Projects v2 board is a copy `Github` keeps in step
+BOARDS = True  # GitLab's board is a view over the q-* labels; GitHub's is the label-filtered issue list (`issue_board`)
 AREAS = ()
 HOSTS = {}  # [hosts] of taskq.toml: hostname → short machine name (`mac`, `win`); the `host-<name>` label pins a task
 # [coordinator] machine of taskq.toml (#145): the one machine whose tick spawns shared work, reviews and closes; None:
 # every tick coordinates (a single-machine project). The owner moves it by editing that line: no failover.
 COORDINATOR = None
-CODEX_PROJECT = CODEX_SECTION = None  # the Codex app's project and sidebar section for worker threads
 CODEX_WRITABLE = ()  # [codex] writable: extra sandbox roots of Codex turns, as written (#154)
 # The person's own settings: `taskq.local.toml` in the main checkout (all its worktrees read the same file, never
 # committed). [profile] is the tick/worker profile, [codex] the app project override; read anew on every use.
 LOCAL, SHARED = None, {}  # its path; [profile] of taskq.toml: team defaults under the personal file
 PROFILE_DEFAULTS = {'filter': '', 'mine': False, 'preferred_runtime': None}
 # Task trees live inside the main checkout, in `.worktrees/` (gitignored by `init`): `taskq-N` of different projects
-# never meet in one parent folder. Trees made before 2026-10-07 sit next to the checkout (`../taskq-N`); `doctor` names them.
+# never meet in one parent folder.
 TREES = '.worktrees'
 WORKSPACE = TREE_WORKSPACE = {
     'continue': 'this task was started before in worktree `.worktrees/taskq-{iid}` of the main checkout (`git worktree list` shows its path); continue there. If it is gone, create it: `git fetch origin && git worktree add -b taskq-{iid} .worktrees/taskq-{iid} origin/main`.',
@@ -67,9 +66,9 @@ STATES = ('ready', 'waiting', 'doing', 'review', 'ask', 'later')
 SUMMARY_SECONDS = 24 * 3600  # questions already shown come back as one summary this often
 TYPES = ('code', 'docs', 'research', 'asset')  # the type label is the bare name
 STALE_MINUTES = 120  # a `doing` task this long without a collaborator's note or label change goes back to the queue
-# The lock is this award emoji on the task's issue: GitLab lets one user award one name once (404 on the
-# second). Across users the earliest reaction wins. An old lock on an unheld task is a crash's.
-LOCK, LOCK_SECONDS = 'lock', 120
+# `take` is decided by note order: the earliest trusted `take` note since the task last became ready wins; one
+# older than this, with the task still ready, is a take that died before its move (void).
+TAKE_SECONDS = 120
 PROBLEM = 'problem'  # label of an issue for a problem without a task
 PROTECTED_REFS = ()  # [workspace] protected_refs: local names or origin/name, also full Git refs
 CLEANUP = {}  # [cleanup] enabled = false disables the hourly tick cleanup.
@@ -99,7 +98,7 @@ def main_checkout(start):
 def configure(path=None):
     """Load the project's taskq.toml: `path`, else the nearest one from the current directory up. Read only: a key it
     lacks takes its default in memory (a write would dirty the editable clone, and update stops on a dirty clone)."""
-    global RULES, HOST, HOSTS, COORDINATOR, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_PROJECT, CODEX_SECTION, CODEX_WRITABLE, WORKSPACE, PUBLISH, RETIRE, HELPERS, PROTECTED_REFS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED, PAGES, CLEANUP
+    global RULES, HOST, HOSTS, COORDINATOR, PROJECT, PROJECT_PATH, STORE, BOARD, BOARDS, AREAS, CODEX_WRITABLE, WORKSPACE, PUBLISH, RETIRE, HELPERS, PROTECTED_REFS, ROOT, TICK_BEAT, WORKER, LOCAL, SHARED, PAGES, CLEANUP
     import tomllib
     here = Path.cwd()
     path = Path(path) if path else next((folder / 'taskq.toml' for folder in (here, *here.parents)
@@ -112,8 +111,7 @@ def configure(path=None):
         fail(f'{path}: write exactly one of [gitlab] project = "group/project" or [github] repo = "owner/repo"')
     PROJECT_PATH, HOST = tracker.get('project') or tracker.get('repo'), tracker.get('host')
     if 'github' in config:
-        BOARD = tracker.get('board') or PROJECT_PATH.split('/')[-1]  # boards belong to the owner: one per repository
-        STORE, BOARDS = Github(PROJECT_PATH, HOST, BOARD), False
+        STORE, BOARDS = Github(PROJECT_PATH, HOST), False
     else:
         BOARD = tracker.get('board', 'taskq')
         STORE, BOARDS = gitlab, True
@@ -124,7 +122,7 @@ def configure(path=None):
     COORDINATOR = config.get('coordinator', {}).get('machine')
     if COORDINATOR is not None and not isinstance(COORDINATOR, str):
         fail(f'{path}: [coordinator] machine: write the coordinator\'s machine name from [hosts] as a string, e.g. "mac"')
-    CODEX_PROJECT, CODEX_SECTION, CODEX_WRITABLE = codex.get('project'), codex.get('section'), codex.get('writable', ())
+    CODEX_WRITABLE = codex.get('writable', ())
     if not isinstance(CODEX_WRITABLE, list | tuple) or not all(isinstance(item, str) for item in CODEX_WRITABLE):
         fail(f'{path}: [codex] writable: write a list of paths, e.g. ["../media"] (relative to the main checkout, or ~/...)')
     PUBLISH = workspace.get('publish', 'direct')
@@ -222,8 +220,8 @@ def preferences_text():
 
 
 def codex_override(key):
-    """[codex] project/section: the personal file's, else taskq.toml's (kept until migrated), else None."""
-    return personal().get('codex', {}).get(key) or {'project': CODEX_PROJECT, 'section': CODEX_SECTION}[key]
+    """[codex] project/section of the personal file, else None."""
+    return personal().get('codex', {}).get(key)
 
 
 def codex_writable():
@@ -249,7 +247,7 @@ def seconds(every):
 
 def session():
     """This session's identity, or None for the owner's own shell. A configured app started from a Claude or
-    Codex session inherits that session's variable; two identities are an error."""
+    Codex session inherits that session's variable: its own [runtimes] variable wins; two of a kind are an error."""
     found = [runtime for runtime, variable in RUNTIMES.items() if os.environ.get(variable)]
     if len(found) > 1:
         fail('two session identities set: ' + ' and '.join(RUNTIMES[runtime] for runtime in found) + '; unset the inherited one')
@@ -281,24 +279,20 @@ def machine_id():
         return MACHINE_ID.read_text().strip()
 
 
-def node(identity=None):
-    """A machine in a claim: a short hash of its machine id (a hostname in claims from before #46)."""
-    return hashlib.sha256(f'{PROJECT_PATH}:{identity or machine_id()}'.encode()).hexdigest()[:12]
+def node():
+    """A machine in a claim: a short hash of its machine id."""
+    return hashlib.sha256(f'{PROJECT_PATH}:{machine_id()}'.encode()).hexdigest()[:12]
 
 
 def local_node(found):
-    """True when `found` (a claim's node) is this machine's, also from before #46 under this hostname."""
-    return found in (node(), node(socket.gethostname()))
+    return found == node()
 
 
 def where(claim):
     """` @name` of a claim's machine: this one and named ones by name, another by its hash."""
-    if claim.get('host'):  # a claim from before #39
-        return f' @{machine(claim["host"])}'
     if not claim.get('node'):
         return ''
-    names = {node(host): name for host, name in HOSTS.items()}  # claims from before #46
-    return f' @{machine() if local_node(claim["node"]) else claim.get("name") or names.get(claim["node"], claim["node"][:6])}'
+    return f' @{machine() if local_node(claim["node"]) else claim.get("name") or claim["node"][:6]}'
 
 
 def machine(hostname=None):
@@ -316,7 +310,7 @@ def who():
 
 
 def short(identity):
-    """`runtime:session8` of a claim or supervisor, the form `who()` writes into notes and reservations."""
+    """`runtime:session8` of a claim or supervisor, the form `who()` writes into notes."""
     return f'{identity["runtime"]}:{identity["session"][:8]}' if identity else 'none'
 
 
@@ -328,8 +322,7 @@ def is_caller(identity):
 
 def api(method, path, body=None):
     """The store protocol: GitLab's REST shape for what taskq uses — issues (`iid`, `description`, label names,
-    `state` opened/closed, `assignees` with `id`), notes, labels, milestones, award emoji (the lock), label events,
-    links, boards. `gitlab` is that shape itself; `Github` speaks it on GitHub; the tests' fake speaks it in memory."""
+    `state` opened/closed, `assignees` with `id`), notes, labels, milestones, label events, links, boards. `gitlab` is that shape itself; `Github` speaks it on GitHub; the tests' fake speaks it in memory."""
     return STORE(method, path, body)
 
 
@@ -340,9 +333,8 @@ TRANSIENT = re.compile(r'unexpected end of JSON input|invalid JSON|Something wen
 
 def cli_api(command, body, what):
     """Run `gh api`/`glab api` and parse its JSON; a transient failure of a safe request is tried once more.
-    ponytail: one retry after 1 s. A POST other than a GraphQL query (a new issue, comment, lock) is never
-    replayed: the store may have applied it, a retry would land it twice (#155). It fails saying so; an orphan
-    lock goes with the tick's stale-lock sweep."""
+    ponytail: one retry after 1 s. A POST other than a GraphQL query (a new issue, comment) is never
+    replayed: the store may have applied it, a retry would land it twice (#155). It fails saying so."""
     safe = command[command.index('-X') + 1] != 'POST' or not str((body or {}).get('query', 'mutation')).lstrip().startswith('mutation')
     for attempt in (1, 2) if safe else (2,):
         started = time.time()
@@ -370,9 +362,6 @@ def gitlab(method, path, body=None):
     return cli_api(command, body, f'GitLab {method} {path}')
 
 
-TAKEN = ('has already been taken', 'Reference already exists')  # the lock's conflict answer: GitLab 404, GitHub 422
-
-
 def gone(error):
     """The store's answer for a deleted or missing thing: 404, or GitHub's 410 «This issue was deleted»."""
     return re.search(r'(HTTP |"status":"|\b)(404|410)( Not Found|\)|")', str(error))
@@ -384,7 +373,7 @@ def stamp(text):
 
 def note(iid, action, text=''):
     """Every taskq note starts with `**action** · who`: the history anyone reads in GitLab, and `report`'s input."""
-    api('POST', f'issues/{iid}/notes', {'body': f'**{action}** · {who()}' + (f'\n\n{text}' if text else '')})
+    return api('POST', f'issues/{iid}/notes', {'body': f'**{action}** · {who()}' + (f'\n\n{text}' if text else '')})
 
 
 # --- issue <-> task -----------------------------------------------------------------------
@@ -413,6 +402,12 @@ def ref(issue):
 def commit_url(issue, sha):
     """The commit page next to the issue: GitHub `…/issues/N` → `…/commit/<sha>`, GitLab `…/-/issues/N` → `…/-/commit/<sha>`."""
     return issue['web_url'].rsplit('/issues/', 1)[0] + f'/commit/{sha}'
+
+
+def issue_board():
+    """GitHub's board (owner 2026-10-08, R1: no mirror): the open issues filtered by the q-* labels."""
+    labels = ','.join(PREFIX + state for state in STATES)
+    return f'https://{HOST or "github.com"}/{PROJECT_PATH}/issues?q=' + quote(f'is:issue is:open label:{labels}')
 
 
 def render(text, block):
@@ -461,16 +456,14 @@ def task(iid, states=STATES):
 
 
 def unchanged(item):
-    """Tick and board writes act on a read made before: a take, answer or hand edit since then wins. Rereads the
-    issue; None, with one printed line, when its state, claim or updated_at moved or a take holds the lock of a
-    ready or waiting task (later and ask keep their worker's lock); else the fresh task to write from."""
+    """Tick writes act on a read made before: a take, answer or hand edit since then wins. Rereads the issue;
+    None, with one printed line, when its state, claim or updated_at moved; else the fresh task to write from."""
     issue = api('GET', f'issues/{item["iid"]}')
     fresh = parse(issue) if issue['state'] == 'opened' else None
     why = ('it is no open task now' if not fresh else f'its state is {fresh["state"]} now' if fresh['state'] != item['state']
            else 'its claim changed' if fresh['claim'] != item['claim']
-           else 'its reservation changed' if fresh.get('reservation') != item.get('reservation')
            else 'it changed' if (active(item['iid']) != item['active'] if 'active' in item else fresh['updated_at'] != item['updated_at'])
-           else 'a take holds its lock' if fresh['state'] in ('ready', 'waiting') and not fresh.get('reservation') and locks(item['iid']) else None)
+           else None)
     if why:
         print(f'Skipped #{item["iid"]}: {why} since this tick read it.')
     return None if why else fresh
@@ -478,11 +471,10 @@ def unchanged(item):
 
 def save(current, state=None, note_action=None, note_text='', close=False, add=(), remove=(), assignee_ids=None, **changes):
     """One PUT moves the labels and the block together; the note is the readable history."""
-    block = {key: current.get(key) for key in (*FIELDS, 'reservation', 'supervisor')}
+    block = {key: current.get(key) for key in (*FIELDS, 'supervisor')}
     block.update(changes)
-    for key in ('reservation', 'supervisor'):
-        if block[key] is None:
-            del block[key]  # #208, #240: only a reserved or supervised task carries the key
+    if block['supervisor'] is None:
+        del block['supervisor']  # #240: only a supervised task carries the key
     add, remove = list(add), list(remove)
     if state and state != current['state']:
         add, remove = add + [PREFIX + state], remove + [PREFIX + current['state']]
@@ -577,32 +569,13 @@ def limits(text):
 
 
 def local_claim(claim):
-    if claim.get('node'):
-        return local_node(claim['node'])
-    if claim.get('host'):
-        return claim['host'] == socket.gethostname()
-    # Upgrade existing claims from local app evidence, without editing someone else's task.
-    sid = claim.get('session')
-    if not sid:
-        return False
-    if claim.get('runtime') == 'claude':
-        return any(CLAUDE_APP_SESSIONS.glob(f'*/*/local_{sid}.json'))
-    if claim.get('runtime') == 'codex':
-        root = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex'))
-        return any(any((root / folder).glob(f'**/*-{sid}.jsonl')) for folder in ('sessions', 'archived_sessions'))
-    return False
+    return bool(claim.get('node')) and local_node(claim['node'])
 
 
 def room(everything, capacity):
     taken = [(item['claim'] or {}).get('runtime') for item in everything
              if item['state'] == 'doing' and local_claim(item['claim'] or {})]
-    # #208: a launch reserved on this machine holds its place until its worker takes the task or it is released.
-    taken += [item['reservation'].get('runtime') for item in everything if reserved_here(item)]
     return {name: count - taken.count(name) for name, count in capacity.items()}
-
-
-def reserved_here(item):
-    return bool(item.get('reservation')) and local_node(item['reservation'].get('node') or '')
 
 
 def eligible(item, uid, mine=False):
@@ -660,10 +633,7 @@ def profile(args):
 
 def refusal(candidate, everything, open_iids, runtime=None):
     """Why this ready task cannot start now (in a session of `runtime`, if named), or None. The only admission rule."""
-    if candidate.get('reservation'):
-        found = candidate['reservation']
-        return f'reserved by {found.get("coordinator")}{where(found)} for its {found.get("runtime")} worker'
-    if (candidate['claim'] or {}).get('session'):  # #208: a ready task naming a worker: whose it is is unknown
+    if (candidate['claim'] or {}).get('session'):  # a ready task naming a worker: whose it is is unknown
         return f'its claim still names session {candidate["claim"]["session"]}; release it first'
     if runtime and candidate['runtime'] not in (None, runtime):
         return f'runtime is {candidate["runtime"]}'
@@ -672,9 +642,9 @@ def refusal(candidate, everything, open_iids, runtime=None):
     waiting = sorted(set(candidate['deps']) & open_iids)
     if waiting:
         return f'open dependencies {waiting}'
-    # A started task keeps its paths through questions and review, until closed or released; a reserved one too (#208).
+    # A started task keeps its paths through questions and review, until closed or released.
     for other in everything:
-        if (other['claim'] or other.get('reservation')) and other['iid'] != candidate['iid'] and overlap(candidate['scope'], other['scope']):
+        if other['claim'] and other['iid'] != candidate['iid'] and overlap(candidate['scope'], other['scope']):
             return f'scope overlaps #{other["iid"]}'
     return None
 
@@ -689,38 +659,6 @@ def sandbox_refusal(candidate, runtime):
 def startable(runtime=None, loaded=None):
     everything, open_iids, *_ = loaded or load()
     return [item for item in everything if item['state'] == 'ready' and not refusal(item, everything, open_iids, runtime)]
-
-
-def lock(iid):
-    """True: this call set the lock. False: it was already set (GitLab answers 404 «has already been taken»)."""
-    try:
-        award = api('POST', f'issues/{iid}/award_emoji', {'name': LOCK})
-        first = min(locks(iid), key=lambda item: (stamp(item['created_at']), item['id']))
-        if first['id'] != award['id']:
-            api('DELETE', f'issues/{iid}/award_emoji/{award["id"]}')
-            return False
-        return True
-    except SystemExit as error:
-        if any(text in str(error) for text in TAKEN):
-            return False
-        raise
-
-
-def locks(iid):
-    try:
-        return [item for item in api('GET', f'issues/{iid}/award_emoji?per_page=100') if item['name'] == LOCK]
-    except SystemExit as error:
-        if gone(error):  # a deleted GitLab issue has no awards
-            return []
-        raise
-
-
-def unlock(iid):
-    uid = user()
-    for item in locks(iid):
-        if item['user']['id'] != uid:
-            continue
-        api('DELETE', f'issues/{iid}/award_emoji/{item["id"]}')
 
 
 def active(iid):
@@ -771,15 +709,13 @@ def version():
     kind, where = install()
     return (git('rev-parse', '--short=7', 'HEAD', cwd=where) if kind == 'clone' else (where or '')[:7]) or 'unknown'
 CLAUDE_CONFIG = Path.home() / '.claude.json'  # Claude Code keeps folder trust here, per project path
-# The Claude app writes `<account>/<org>/local_<id>.json` here when it has imported a session.
-CLAUDE_APP_SESSIONS = Path.home() / 'Library/Application Support/Claude/claude-code-sessions'
 CLAUDE_JOBS = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude') / 'jobs'  # `claude --bg` job records
 
 
 CONTRACTS = Path(__file__).resolve().parent / 'contracts'
 
 
-# --- Runtime labels and the selftest label (selftest itself: taskq/selftest.py) ---------------------
+# --- [runtimes] executors and the selftest label (selftest itself: taskq/selftest.py) ---------------
 
 SELFTEST = 'selftest'  # label of a selftest task: only a profile whose filter names it sees one
 FULL_ACCESS = 'codex-full-access'  # label: the task's Codex turns run with danger-full-access (#157)
@@ -805,15 +741,14 @@ from taskq.cleanup import cleanup  # noqa: E402
 from taskq.selftest import selftest  # noqa: E402
 from taskq.doctor import (  # noqa: E402
     green, works, update, queue_labels, probe, origin_of, write_config, doctor, personal_gaps, ignore_local,
-    tree_gaps, profile_init, write_access, queue_labels_missing, board_gaps, report_gaps,
+    profile_init, write_access, queue_labels_missing, board_gaps, report_gaps,
     PERMISSION_MODE, WORKER_ALLOW, permissions_missing, permissions_gap, trusted, setup, migrate, windows_claude_binary, pref)
 from taskq.tick import (  # noqa: E402
     clone_warning, auto_update, contract_news, question, profile_arguments, session_link, inbox_line, tick)
 from taskq.worker import (  # noqa: E402
     BRIEF, DELIVER, need_owner, doing_since, add, edit, later, listing, set_runtime, brief, worker, supervise, take, beat, ask,
-    result, requeue, close, retire_local, spawn, reserve, reconcile, preflight, runtime_status, claude_env, CLAUDE_WORKER_TOOLS, claude_spawn,
-    claude_agents, claude_url, claude_stop, problem, report, claude_wake, view, show, retire, claude_import,
-    claude_sessions, driver_app_session)
+    result, requeue, close, retire_local, spawn, claude_env, CLAUDE_WORKER_TOOLS, claude_spawn,
+    claude_agents, claude_url, claude_stop, problem, report, claude_wake, view, retire)
 
 
 def record(args, action, **values):
@@ -888,14 +823,11 @@ def main(argv=None):
             (('--label',), {'nargs': '+', 'default': [], 'help': argparse.SUPPRESS}))
     command('runtime', set_runtime, iid, (('runtime',), {'choices': (*RUNTIMES, 'any')}))
     command('list', listing, (('--links',), {'action': 'store_true', 'help': 'also the URL of each task'}))
-    command('preflight', preflight, json_flag)
-    command('runtime-status', runtime_status, json_flag,
-            (('--runtime',), {'required': True, 'choices': tuple(RUNTIMES)}), (('session',), {}))
     # Absent flags stay None: the personal taskq.local.toml, then taskq.toml, then the defaults decide (`resolve`).
     profile_flags = ((('--filter',), {'help': 'GitLab issues query string, passed unchanged; \'\' means all areas'}),
                      (('--mine',), {'action': argparse.BooleanOptionalAction, 'help': 'only own assignments, or with --no-mine also the pool'}),
                      (('--limit',), {'type': limits, 'metavar': 'claude=N,codex=M', 'help': 'slots on this machine; only the named runtimes'}))
-    command('worker', worker, *profile_flags)
+    command('worker', worker, *profile_flags, (('--task',), {'type': int, 'help': 'the brief of this task: the one a supervisor launched it for'}))
     command('supervise', supervise, iid)  # #243: the brief of the task's supervisor session
     command('take', take, iid)
     command('beat', beat, iid)
@@ -924,8 +856,6 @@ def main(argv=None):
     text_input(spawn_command, required=False)
     command('view', view, iid, (('--notes',), {'type': int, 'default': 3, 'help': 'last notes to print (default 3)'}))
     claude_session = (('session',), {'help': 'Claude session id (or local_<id>)'})
-    command('show', show, claude_session,
-            (('--restore',), {'help': 'app session to show again after the import (default: the calling session)'}))
     command('retire', retire, claude_session)
     thread = (('thread',), {})
     text_input(command('codex-send', codex_send, thread))
@@ -935,7 +865,7 @@ def main(argv=None):
     command('codex-archive', codex_archive, thread)
     text_input(command('problem', problem, (('--task',), {'type': int})))
     command('cleanup', cleanup, json_flag, (('--apply',), {'action': 'store_true'}))
-    for name in ('init', 'migrate'):
+    for name in ('init',):
         command(name, migrate, (('--project',), {'help': 'GitLab project path: writes a minimal taskq.toml here if none'}),
                 (('--github',), {'help': 'GitHub repository owner/name: writes a minimal taskq.toml here if none'}),
                 (('--host',), {'help': 'host for that taskq.toml, e.g. gitlab.example.com'}))

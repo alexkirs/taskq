@@ -169,12 +169,8 @@ SUPERVISE = 'Continue as the supervisor of task #{iid}: run taskq supervise {iid
 
 def wake_supervisor(item):
     found, text = item['supervisor'], SUPERVISE.format(iid=item['iid'])
-    if found['runtime'] == 'claude':
-        return core.claude_wake(found['session'], text)
-    if found['runtime'] == 'codex':
-        # a supervisor reaches the app server to drive its worker: workspace-write denies that socket
-        return core.codex_send(argparse.Namespace(thread=found['session'], text=text, full_access=True))
-    return core.executor_run(found['runtime'], 'send', session=found['session'], text=text)
+    from taskq.runtimes import get
+    return get(found['runtime'], full_access=found['runtime'] == 'codex').send(found['session'], text)
 
 
 
@@ -351,7 +347,8 @@ def retire(open_iids):
     """R11, the one retire step: this checkout's `T<N>`/`S<N>` sessions (spawn names them) whose task N is closed,
     once their turn has ended. Claude: stop and remove; Codex: archive (reversible). Trees and branches: `cleanup`.
     A failure is the sender's log line, never judgement: the next pass tries again (an app-held Codex thread)."""
-    found = [(sid, iid, lambda sid=sid: core.claude_stop(sid, remove=True)) for sid, agent in core.claude_agents().items()
+    from taskq.runtimes import get
+    found = [(sid, iid, lambda sid=sid: get('claude').close(sid)) for sid, agent in core.claude_agents().items()
              if (iid := session_iid(agent.get('name'))) and local(agent) and not busy(agent)]
     if core.CODEX_SOCKET.exists():
         from taskq.cleanup import cleanup_codex
@@ -361,7 +358,7 @@ def retire(open_iids):
         except (OSError, SystemExit, ValueError) as error:
             threads = {}
             print(f'Codex threads not checked: {core.codex_line(str(error))[:120]}', file=sys.stderr)
-        found += [(sid, iid, lambda sid=sid: core.codex_archive(argparse.Namespace(thread=sid))) for sid, thread in threads.items()
+        found += [(sid, iid, lambda sid=sid: get('codex').close(sid)) for sid, thread in threads.items()
                   if (iid := session_iid(thread.get('name'))) and Path(thread.get('cwd') or '/').resolve() == root
                   and (thread.get('status') or {}).get('type') in ('idle', 'notLoaded')]
     for sid, iid, stop in found:

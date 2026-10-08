@@ -8,10 +8,6 @@ board = "taskq"
 claude = 2
 codex = 3
 
-[codex]
-project = "codex-project"
-section = "codex-section"
-
 [workspace]
 new = "from the main checkout run `make worktree NAME=taskq-{iid}` and work only there; prepare only what the task needs (`make prepare WHAT=<step>`)."
 continue = "this task was started before in worktree `taskq-{iid}`; continue there. If it is gone, create it: `make worktree NAME=taskq-{iid}`."

@@ -165,7 +165,7 @@ def doctor(args, pending=()):
             'run taskq from that project\'s checkout, or fix [github] repo / [gitlab] project and host in taskq.toml')
     if config:
         claude = 'claude' not in idle()
-        for what, fix in personal_gaps() + tree_gaps() + (permissions_gap(core.ROOT) + trust_gap(core.ROOT) if claude else []):
+        for what, fix in personal_gaps() + (permissions_gap(core.ROOT) + trust_gap(core.ROOT) if claude else []):
             gap(what, fix)
         if claude and probe(['claude', 'auth', 'status']):  # None: no claude CLI on this machine, nothing to check
             gap('`claude` is not logged in: background workers stop at «Not logged in»',
@@ -185,7 +185,7 @@ def doctor(args, pending=()):
     if gaps or not config:
         return report_gaps(gaps, pending)
     checks = (('write permission', lambda: write_access(github)), ('labels', queue_labels_missing),
-              ('board', lambda: board_gaps(github, host)))
+              ('board', lambda: board_gaps(github)))
     for name, check in checks:
         try:
             for what, fix in check():
@@ -234,17 +234,6 @@ def ignore_local():
             print(f'added {line} to {path}')
     if core.git('ls-files', '--error-unmatch', '--', core.LOCAL.name, cwd=core.LOCAL.parent) is not None:
         print(f'{core.LOCAL} is tracked by git: run `cd {core.LOCAL.parent} && git rm --cached -- {core.LOCAL.name}` (keeps the file), then commit')
-
-
-def tree_gaps():
-    """This project's task trees (`taskq-N`) outside `.worktrees/`, each with the command that moves it. Reads only:
-    a worker may still run in an old tree, so the person moves it."""
-    listed = core.git('worktree', 'list', '--porcelain', cwd=core.ROOT) or ''
-    trees = [Path(line[len('worktree '):]) for line in listed.splitlines() if line.startswith('worktree ')]
-    return [(f'task tree {tree} is outside {core.ROOT / core.TREES}',
-             f'cd {core.ROOT} && mkdir -p {core.TREES} && git worktree move {shlex.quote(str(tree))} {core.TREES}/{tree.name}  '
-             '(when no worker runs in it)')
-            for tree in trees if re.fullmatch(r'taskq-\d+', tree.name) and tree.parent.resolve() != (core.ROOT / core.TREES).resolve()]
 
 
 def profile_init(args):
@@ -338,19 +327,14 @@ def queue_labels_missing():
     return [(f'labels missing: {", ".join(missing)}', 'taskq init')] if missing else []
 
 
-def board_gaps(github, host):
-    if not github:
-        board = next((board for board in core.api('GET', 'boards') if board['name'] == core.BOARD), None)
-        columns = board and [item['label']['name'] for item in sorted(board['lists'], key=lambda item: item['position'])]
-        want = [core.PREFIX + state for state in core.STATES]
-        return [] if columns == want else [(f'board {core.BOARD} ' + ('missing' if board is None else f'columns are {columns}, not {want}'), 'taskq init')]
-    board = core.api('GET', 'board')
-    if board is False:
-        return [('the gh token lacks the scope `project`: no Projects v2 board', f'gh auth refresh -h {host or "github.com"} -s project  (the person confirms in the browser)')]
-    if not board:
-        return [(f'no Projects v2 board {core.BOARD}', 'taskq init')]
-    return ([(f'board {core.BOARD} Status options are {list(board["options"])}, not {list(core.STATES)}', 'taskq init')]
-            * (list(board['options']) != list(core.STATES)))
+def board_gaps(github):
+    """GitLab's label board; GitHub's board is the label-filtered issue list: nothing to set up."""
+    if github:
+        return []
+    board = next((board for board in core.api('GET', 'boards') if board['name'] == core.BOARD), None)
+    columns = board and [item['label']['name'] for item in sorted(board['lists'], key=lambda item: item['position'])]
+    want = [core.PREFIX + state for state in core.STATES]
+    return [] if columns == want else [(f'board {core.BOARD} ' + ('missing' if board is None else f'columns are {columns}, not {want}'), 'taskq init')]
 
 
 def report_gaps(gaps, pending=()):
@@ -503,15 +487,11 @@ def setup(args):
     if write_access(github):
         person(f'ask an owner of {core.PROJECT_PATH} for write access', 'this account cannot write to the repository')
         stop()
-    gaps = queue_labels_missing() + board_gaps(github, host)
-    scope = [fix.split('  (')[0] for what, fix in gaps if 'scope' in what]
-    if gaps and len(gaps) > len(scope):
+    if queue_labels_missing() + board_gaps(github):
         migrate(args)
-        print('done: labels' + ' and board' * (not scope))
+        print('done: labels and board')
     else:
-        print('ok: labels' + ' and board' * (not scope))
-    for fix in scope:
-        person(fix, 'a GitHub board needs the token scope `project` (browser consent); until then the queue works with labels only')
+        print('ok: labels and board')
     if 'claude' not in idle():
         for what, fix in permissions_gap(core.ROOT):
             person(fix.split('  (')[0], what)
@@ -548,11 +528,8 @@ def migrate(args):
     for name in queue_labels():
         if name not in have:
             have[name] = core.api('POST', 'labels', {'name': name, 'color': '#6699cc'})
-    board = cards = None
-    if not core.BOARDS:  # GitHub: the Projects v2 board; every open task gets a card in the column of its label
-        board = core.api('POST', 'board')
-        cards = board and core.api('GET', 'board/items')
-    else:
+    board = core.issue_board() if not core.BOARDS else None  # GitHub: the label-filtered issue list
+    if core.BOARDS:
         board = next((board for board in core.api('GET', 'boards') if board['name'] == core.BOARD), None) or core.api('POST', 'boards', {'name': core.BOARD})
         lists = {item['label']['name']: item for item in board['lists']}
         for name, item in lists.items():
@@ -576,9 +553,5 @@ def migrate(args):
     everything = core.load()[0]
     for item in everything:
         core.link(item['iid'], item['deps'])
-        if board and not core.BOARDS and cards.get(item['iid']) is None:
-            core.api('PUT', f'board/items/{item["iid"]}', {'status': item['state']})
-    if not board:
-        print(f'no board on GitHub: the token lacks the scope `project`; run `gh auth refresh -h {core.HOST or "github.com"} -s project`, then `taskq init` again')
-    print((f'board {board["url"] if not core.BOARDS else board["id"]}' if board else 'labels only') +
+    print(f'board {board["id"] if core.BOARDS else board}' +
           f': {", ".join(core.PREFIX + state for state in core.STATES)}; links checked on {len(everything)} tasks')

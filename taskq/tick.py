@@ -225,8 +225,8 @@ def codex_workers(match=worker_iid):
 
 
 def launched(iid, runtime):
-    """#208: session ids of this checkout's live `T<iid>` workers of `runtime`, the evidence a reservation is matched
-    and settled by; None when that inventory is unreadable or the runtime has none (a [runtimes] app)."""
+    """Session ids of this checkout's live `T<iid>` workers of `runtime`, a supervised worker's binding before its
+    launch note lands; None when that inventory is unreadable or the runtime has none (a [runtimes] app)."""
     if runtime == 'claude':
         agents = core.claude_agents(strict=True)
         return None if agents is None else [sid for sid, agent in agents.items() if local(agent) and alive(agent) and worker_iid(agent.get('name')) == iid]
@@ -246,12 +246,6 @@ def starts(args, loaded, selected):
         if item.get('supervisor'):
             print(f'{core.ref(item)}: supervised by {core.short(item["supervisor"])}; that session launches its worker, not this tick.')
     ready = [item for item in ready if not item.get('supervisor')]
-    held = {(claim.get('runtime'), claim.get('session')) for item in loaded[0] if item['state'] == 'doing' and (claim := item['claim'] or {})}
-    supervisors = {(found['runtime'], found['session']) for item in loaded[0] if (found := item.get('supervisor'))} - held
-    if supervisors:
-        runtimes = [runtime for runtime, _ in supervisors]
-        print('Supervisors on open tasks: ' + ', '.join(f'{name} {runtimes.count(name)}' for name in sorted(set(runtimes)))
-              + ' (from task metadata; a live supervisor of this machine and its worker hold one slot together).')
     # #185: a worker spawned by an earlier pass that has not taken its task yet (a manual TICK, a restart) is not
     # spawned again, and holds its runtime's place like a claim. An unreadable inventory holds what it could hide.
     # #243: the same for a supervisor (`S<N>`): a task's live supervisor and worker hold one slot together.
@@ -260,9 +254,8 @@ def starts(args, loaded, selected):
             + [('codex', iid, sid) for iid, sid in codex or []])
     # Exactly what room counted: a local claim of a doing task. A live session of a ready/review/ask task still holds a place.
     counted = {item['iid'] for item in loaded[0] if item['state'] == 'doing' and core.local_claim(item['claim'] or {})}
-    reserved = {item['iid'] for item in loaded[0] if core.reserved_here(item)}  # #208: room counted its place
     for iid, runtime in {iid: runtime for runtime, iid, _ in live}.items():
-        if iid not in counted | reserved and runtime in free:
+        if iid not in counted and runtime in free:
             free[runtime] -= 1
     spawned = {iid for _, iid, _ in live}
     unknown = {'claude': agents is None, 'codex': codex is None}
@@ -386,22 +379,12 @@ def board_link(candidates):
     """The Board link of the R6 report, or 'unavailable' when it cannot be read (R12)."""
     try:
         if not core.BOARDS:
-            return (core.api('GET', 'board') or {}).get('url') or 'unavailable'
+            return core.issue_board()
         board = next((board for board in core.api('GET', 'boards') if board['name'] == core.BOARD), None)
         issue = next((item for item in candidates if item.get('web_url')), None)
         return f'{re.split(r"/(?:-/)?issues/", issue["web_url"])[0]}/-/boards/{board["id"]}' if board and issue else 'unavailable'
     except (SystemExit, OSError, ValueError, subprocess.SubprocessError):
         return 'unavailable'
-
-
-def board_sync(everything, selected):
-    """GitHub's board is a one-way copy of the q-* labels: every card goes back to its label's column (reading the
-    cards also archives closed ones). Owner moves go through `answer`, `later` and `reject`."""
-    cards = core.api('GET', 'board/items')
-    for item in everything:
-        if item['iid'] in selected and cards.get(item['iid'], item['state']) != item['state']:
-            core.api('PUT', f'board/items/{item["iid"]}', {'status': item['state']})
-            print(f'Board card of {core.ref(item)} put back to {item["state"]}: owner moves go through answer, later or reject.')
 
 
 def queue_pass(args):
@@ -447,9 +430,7 @@ def queue_pass(args):
         args.iid, args.action, args.text = item['iid'], 'release', why
         core.requeue(args)
         print(f'Released {"dead" if item in dead else "stalled"} {core.ref(item)}.')
-    # #208: reservations found again (restart, a launch that died) are settled by evidence on their machine, never by age.
-    released = [item for item in loaded[0] if item['state'] == 'ready' and item.get('reservation') and core.reconcile(item, args)]
-    stalled = dead + stalled + released
+    stalled = dead + stalled
     retire(loaded[1])
     if not holder:
         # A task pinned to this machine (`host-<name>`) starts only here: the coordinator elsewhere cannot start it.
@@ -460,12 +441,6 @@ def queue_pass(args):
         launch(start, step)
         return failed
     loaded = core.load() if stalled else loaded
-    # A lock on a task nobody holds: a take that died between the lock and the move, or a card moved by hand.
-    held = {item['iid'] for item in loaded[0] if item['state'] not in ('ready', 'waiting') or item.get('reservation')}  # #208: no TTL steal
-    for issue in core.issues(f'state=opened&my_reaction_emoji={core.LOCK}'):
-        if issue['iid'] in selected and issue['iid'] not in held and all(time.time() - core.stamp(item['created_at']) > core.LOCK_SECONDS for item in core.locks(issue['iid'])):
-            core.unlock(issue['iid'])
-            print(f'Unlocked {core.ref(issue)}: nobody holds it.')
     # Only tick moves ready<->waiting: a card a hand moved between them goes back here.
     moved = 0
     for item in loaded[0]:
@@ -481,8 +456,7 @@ def queue_pass(args):
         moved += 1
         print(f'Moved {core.ref(item)} {item["state"]} → {"ready" if item["state"] == "waiting" else "waiting"}.')
     everything, _, odd, problems, inbox = loaded = core.load() if moved else loaded
-    if (board := board_link(candidates)) != 'unavailable' and not core.BOARDS:
-        board_sync(everything, selected)
+    board = board_link(candidates)
     everything = [item for item in everything if item['iid'] in selected]
     # #83: one table of every worker and supervisor (R6); the owner's chat opens only http(s) links.
     report(board, [report_row(item, agents, (alive.get(item['iid']) or (None, f'issue {core.age(item)} min ago'))[1])
@@ -493,7 +467,7 @@ def queue_pass(args):
     asked = [(item, *question(item['iid'])) for item in everything if item['state'] == 'ask']
     fresh = [(item, text) for item, text, shown in asked if shown is None]
     summary = [(item, text) for item, text, shown in asked if shown and time.time() - shown >= core.SUMMARY_SECONDS]
-    # A card moved by hand on the board into a state its data does not support.
+    # An issue whose labels or data do not fit a state taskq can run.
     odd = [f'{core.ref(issue)} labels {issue["labels"]}: give it exactly one state label' for issue in odd] + [
         f'{core.ref(item)} is doing without a worker: move it back to ready or `release {item["iid"]}`'
         for item in everything if item['state'] == 'doing' and not (item['claim'] or {}).get('session')] + [
@@ -505,7 +479,7 @@ def queue_pass(args):
     # #243: a supervisor whose task needs it (a result to review; ready again after an answer or reject) and whose
     # turn has ended is woken with one fixed line; a busy or unknown one (another machine) is left alone.
     supervise = [item for item in everything if item.get('supervisor') and (item['state'] == 'review' and item['result']
-                 or item['state'] == 'ready' and not item.get('reservation'))
+                 or item['state'] == 'ready')
                  and liveness({**item, 'state': 'doing', 'claim': item['supervisor']}, agents)[0] == 'idle']
     if not (review or fresh or summary or start or odd or problems or supervise) and not any(item['state'] == 'doing' for item in everything):
         # #153: an ask or review task waits for someone, so it is no idle pass.

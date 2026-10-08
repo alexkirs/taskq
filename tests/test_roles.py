@@ -95,14 +95,11 @@ class Roles(unittest.TestCase):
         self.launches()
         for who in (COORDINATOR, OWNER, OTHER):
             self.assertIn('supervised by claude:supervis', self.refused(who, 'spawn', '--name', f'T{iid} t', '--text', 'go'))
-        self.assertEqual((self.gitlab.locked(), self.agents), ([], {}))  # no lock, no session
+        self.assertEqual(self.agents, {})  # no session
         self.assertIn(f'supervised by claude:supervis', self.do(COORDINATOR, 'tick'))
         self.assertNotIn(f'T{iid} t', self.do(COORDINATOR, 'tick'))  # no spawn command for it
-        self.assertIn('unacknowledged', self.do(OWNER, 'view', iid))
-        self.do(SUPERVISOR, 'problem', '--task', iid, '--text', 'a plain note is no acknowledgement')
-        self.assertIn('unacknowledged', self.do(OWNER, 'view', iid))
         self.do(SUPERVISOR, 'spawn', '--name', f'T{iid} t', '--text', 'go')
-        self.assertIn('supervisor: claude:supervis (acknowledged)', self.do(OWNER, 'view', iid))
+        self.assertIn('supervisor: claude:supervis', self.do(OWNER, 'view', iid))
 
     def test_take_only_by_the_launched_worker(self):
         iid = self.supervised()
@@ -162,16 +159,6 @@ class Roles(unittest.TestCase):
     def test_nudge_forbids_fresh_work(self):
         self.assertIn('do not take another task', tick.NUDGE)
         self.assertNotIn('`', tick.NUDGE)  # it goes inside a double-quoted shell argument
-
-    def test_supervisor_count_is_information_deduplicated(self):
-        self.started()
-        line = 'Supervisors on open tasks: claude 1 (from task metadata; a live supervisor of this machine and its worker'
-        self.assertIn(line, self.do(COORDINATOR, 'tick'))
-        held = self.add()
-        self.do(OWNER, 'edit', held, '--supervisor', 'claude:worker-1')  # also a doing claim: counted there, not twice
-        self.assertIn(line, self.do(COORDINATOR, 'tick'))
-        self.assertNotIn('enforced by', self.do(COORDINATOR, 'tick'))
-
 
 if __name__ == '__main__':
     unittest.main()

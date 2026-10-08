@@ -16,7 +16,7 @@ import taskq as core
 # --- cleanup: report first; only proven finished rows may be applied ---------------------------
 
 def cleanup_issues():
-    """Live issues own task state and link workers to their tasks (closed issues before 2026-10-06 keep `type` in the block).
+    """Live issues own task state and link workers to their tasks.
     Open issues and those closed in the last CLEANUP_DAYS: a worker of an older task is no longer proven
     finished, so its session is asked about, never removed."""
     found = {}
@@ -27,7 +27,7 @@ def cleanup_issues():
             block = block and json.loads(block.group(1))
             if block:
                 found[issue['iid']] = {**block, 'closed': issue['state'] == 'closed',
-                                       'type': next((label for label in issue['labels'] if label in core.TYPES), block.get('type')),
+                                       'type': next((label for label in issue['labels'] if label in core.TYPES), None),
                                        'state': (core.parse(issue) or {}).get('state', 'unknown')}
         except (ValueError, TypeError):  # a malformed block is no record: skip it
             continue
@@ -126,7 +126,7 @@ def cleanup_plan(root):
     gc = Builtin
     rows = gc.worktrees(root)
     roots = {Path(row['worktree']).resolve() for row in rows}
-    issues, app = cleanup_issues(), core.claude_sessions()
+    issues = cleanup_issues()
     mine = {(runtime, os.environ[variable]) for runtime, variable in core.RUNTIMES.items() if os.environ.get(variable)}
     workers = {}
     for iid, issue in issues.items():
@@ -145,16 +145,14 @@ def cleanup_plan(root):
     protected = {'main', current, 'origin/main', 'origin/HEAD'}
     protected.update(ref.removeprefix('refs/heads/').removeprefix('refs/remotes/') for ref in core.PROTECTED_REFS)
     task_name = lambda name: bool(re.fullmatch(r'(?:worktree-)?taskq-[0-9]+', name))
-    spawned_trees = {Path(meta['cwd']).resolve() for sid, meta in app.items()
-                     if meta.get('cwd') and meta.get('adoptedFromOtherSurface') and meta.get('sessionId') == f'local_{sid}'}
     pattern = re.compile(r'^[TS][0-9]+(?:\s|$)')
-    spawned_trees.update(Path(thread['cwd']).resolve() for sid, thread in threads.items()
-                         if pattern.match(thread.get('name') or '') and thread.get('cwd') and ('codex', sid) in workers)
+    spawned_trees = {Path(thread['cwd']).resolve() for sid, thread in threads.items()
+                     if pattern.match(thread.get('name') or '') and thread.get('cwd') and ('codex', sid) in workers}
     owned = {}
     for iid, issue in issues.items():
         if not issue['closed']:
-            # A ready task with an old claim also keeps its continuation tree: `.worktrees/taskq-N` (branch `taskq-N`),
-            # `../taskq-N` from before 2026-10-07, or a Claude `.claude/worktrees/taskq-N` (branch `worktree-taskq-N`).
+            # A ready task with an old claim also keeps its continuation tree: `.worktrees/taskq-N` (branch `taskq-N`)
+            # or a Claude `.claude/worktrees/taskq-N` (branch `worktree-taskq-N`).
             for name in (f'taskq-{iid}', f'worktree-taskq-{iid}'):
                 owned[name] = f'open task #{iid} ({issue["state"]})'
     for row in rows:
@@ -267,27 +265,6 @@ def cleanup_plan(root):
         else:
             ask.append({'what': what, 'why': f'no proven closed task, or state unknown ({status})',
                         'choices': [('keep', 'true'), ('archive', shlex.join([core.TOOL, 'codex-archive', sid]))]})
-    # Only this machine's app archives its sessions; an archived one is done.
-    claude = {sid for runtime, sid in workers if runtime == 'claude' and sid in app and not app[sid].get('isArchived')
-              and pattern.match(app[sid].get('name') or '')}
-    # A spawned worker that never took a task: imported from the CLI in the main checkout, idle, with no claim.
-    unknown = {sid for sid, meta in app.items() if pattern.match(meta.get('name') or '') and meta.get('adoptedFromOtherSurface') and not meta.get('isArchived')
-               and meta.get('sessionId') == f'local_{sid}' and Path(meta.get('cwd') or '/').resolve() == root.resolve()
-               and time.time() - meta.get('lastActivityAt', 0) / 1000 > core.STALE_MINUTES * 60} - {sid for _, sid in workers}
-    for sid in sorted(claude):
-        identity, what = ('claude', sid), f'Claude session local_{sid}'
-        if identity in mine or active_task(identity):
-            keep.append({'what': what, 'why': 'current session / open task'})
-        elif finished(identity):
-            remove.append({'kind': 'claude', 'what': what, 'thread': sid, 'why': 'worker of closed tasks; the coordinator checks liveness'})
-        else:
-            unknown.add(sid)
-    for sid in sorted(unknown):
-        if any(session == sid for _, session in mine):
-            keep.append({'what': f'session {sid}', 'why': 'current session'})
-        else:
-            ask.append({'what': f'Claude session local_{sid}', 'why': 'worker without a proven closed task (spawn without a claim, or the task is not finished)',
-                        'choices': [('keep', 'true'), ('archive', f'coordinator: archive_session local_{sid}')]})
     # `claude --bg` workers of this checkout; `retire` stops them and drops them from `claude agents`.
     for sid, agent in core.claude_agents().items():
         if not pattern.match(agent.get('name') or ''):
@@ -329,8 +306,6 @@ def show(args, remove, ask, keep):
             print(f'- {item["what"]}: {item["why"]}')
             for label, command in item.get('choices', []):
                 print(f'  {label}: {command}')
-            if item.get('kind') == 'claude':
-                print(f'  coordinator: archive_session local_{item["thread"]}')
 
 
 def apply_removals(args, root, gc, remove):
@@ -348,11 +323,6 @@ def apply_removals(args, root, gc, remove):
     for item in sorted(remove, key=lambda item: item['kind'] != 'codex'):
         counts['attempted'].append(item['what'])
         try:
-            if item['kind'] == 'claude':
-                # Only the coordinator's application tool can archive these: a visible refusal, never a guess.
-                core.record(args, 'archive', status='refused', session=item['thread'], reason='requires coordinator application tool')
-                counts['refused'].append(item['what'])
-                continue
             if item['kind'] == 'tree' and Path(item['path']).resolve() in blocked_trees:
                 refuse(item, 'session not archived', f'Kept: the session of this tree is not archived: {item["what"]}')
                 continue

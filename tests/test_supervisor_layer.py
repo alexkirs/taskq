@@ -56,9 +56,7 @@ class SupervisorLayer(unittest.TestCase):
         for iid, session in ((first, 'supervisor-1'), (second, 'supervisor-2')):
             found = self.block(iid)
             self.assertEqual(found['supervisor'], {'runtime': 'claude', 'session': session})
-            self.assertNotIn('reservation', found)  # the supervisor reserves again for its worker
             self.assertEqual((self.state(iid), found['claim']), ('ready', None))  # nothing taken in the PM's pass
-        self.assertEqual(self.gitlab.locked(), [])
         self.act()
         self.assertEqual(len(self.spawned), 2)  # supervised: never started again
 

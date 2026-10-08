@@ -50,11 +50,11 @@ and separate worker/manager permissions to enforce review before publication.
 | Machine | Label `host-<name>` (`add --host win`): only a worker on that machine takes it; without one, the machine whose worker takes it first. A machine's name: `TASKQ_HOST`, else `[hosts]` of taskq.toml (`"DESKTOP-7" = "win"`), else the hostname up to the first dot |
 | Type | Label `code`, `docs`, `research` or `asset` |
 | Priority | Label `priority-1` or `priority-2` |
-| Other data | JSON block in the issue description: `scope`, `deps`, `claim`, `waiting_for` (reason for `later`), `result` — only what a label cannot express; `reservation` (#208) and `supervisor` (#240) only while set |
+| Other data | JSON block in the issue description: `scope`, `deps`, `claim`, `waiting_for` (reason for `later`), `result` — only what a label cannot express; `supervisor` (#240) only while set |
 | Supervisor (#240) | Block `supervisor` = `{"runtime", "session"}`: the one session that launches and steers the task's worker (§ Four roles) |
 | Goal and acceptance | Issue description text |
 | History | Issue notes: every taskq note starts with `**action** · app:session` (`take`, `beat`, `ask`, `shown`, `result`, `answer`, `reject`, `release`, `close`, `later`, `waiting`, `ready`, `deps`, `runtime`, `problem`) |
-| Task lock | Award emoji `lock` on the task's issue; on GitHub the ref `refs/taskq/lock/<N>` (§ Taking a task) |
+| Who takes | The earliest trusted `take` note since the task last became ready (§ Taking a task); no lock |
 | Problem without a task | Its own issue with label `problem`; `tick` names it, the coordinator closes it after review |
 
 The board is the only state ([R1](principles.md)): any machine with `glab` sees and changes the queue the same way
@@ -72,10 +72,9 @@ It holds no secrets: the token belongs to `glab`.
 | `[gitlab] project` | GitLab project path (`group/project`) | one of `[gitlab] project`, `[github] repo` |
 | `[github] repo` | GitHub repository (`owner/repo`); `[github] host` for GitHub Enterprise | one of the two |
 | `[gitlab] board` | Board name | `taskq` |
-| `[github] board` | Title of the Projects v2 board linked to the repository | the repository name (`owner/repo` → `repo`) |
 | `[gitlab] host` | GitLab host for `glab` (commands also work outside the project checkout) | `glab` picks it from the current directory's git remote |
 | `[areas] names` | Project work areas; `init` creates `area-*` labels | empty |
-| `[codex] project`, `section` | Override of the Codex app project for `spawn --runtime codex`, and its sidebar section; kept for compatibility below the personal `[codex]` until migrated | project: the app's project whose root is the main checkout (`project/list`), created by `project/create` when none is; no section |
+| `[codex] project`, `section` | Only in the personal `taskq.local.toml`: override of the Codex app project for `spawn --runtime codex`, and its sidebar section | project: the app's project whose root is the main checkout (`project/list`), created by `project/create` when none is; no section |
 | `[codex] writable` | Extra writable roots of Codex worker turns, for project files outside the checkout (e.g. `["../csgo-media"]`): paths relative to the main checkout or `~/…`, resolved to absolute and added after the built-in roots by `codex_turn_policy()`; a missing path is skipped and `doctor` warns. A root that is a linked worktree of this checkout also adds its gitdir, so Codex on Linux lets git commit there (#163) | none: the main checkout's `.git`, `.worktrees` and the taskq state dir |
 | `[workspace] new`, `continue`, `none` | Brief text about the workspace; `{iid}` is the task number | `git worktree add -b taskq-<N> .worktrees/taskq-<N> origin/main` inside the main checkout (§ Task flow, «Where task trees live») |
 | `[workspace] publish` | `direct` or `review`; shared only, invalid values fail (§ Publication before or after review) | `direct` |
@@ -226,12 +225,9 @@ moves the card back by `deps` and prints `Moved #N …`. `tick` lists everything
 mismatch": `doing` without a worker, `review` without a result, an issue with a block but without exactly
 one state label (including one moved to Open).
 
-**Board on GitHub (2026-10-06):** the Projects v2 project linked to the repository and titled `[github] board` (default: the repository name), a view taskq keeps in step with
-the labels (§ GitHub). A card move does not change the label: `tick` executes `ready`/`waiting`→`later`
-(`later`), `later`→`ready`/`waiting` (`answer`) and `review`→`ready` (`reject`), each with the note «moved on the
-board»; `ready`↔`waiting` goes back silently; any other move goes back to the label's column and is listed under
-"Board mismatch" with the fix command (`ask`→`ready` is not an answer: `answer N --text`; `doing`→`ready` is
-`release N`).
+**Board on GitHub (owner 2026-10-08, R1):** the open issues filtered by the `q-*` labels
+(`issues?q=is:issue is:open label:q-ready,…`); the tick's Board link opens it. No Projects v2 copy: the owner
+moves a task with `answer`, `later`, `reject` or `release`.
 
 ## Epics and subtasks
 
@@ -250,29 +246,28 @@ the three legacy roles below (manager, coordinator, worker).
 
 - **Tick spawns supervisors** (#243): for each ready task without a supervisor, within a free slot, `tick`
   runs `taskq spawn --runtime R --name "S<N> <title>" --text
-  "Run `cd <main checkout> && taskq supervise N` …"` — the same command on Claude and Codex. Spawn reserves
-  the task like a worker launch (#208), starts the session, then in one write replaces the reservation with
-  `supervisor` = that session (note `supervisor none → R:session (spawned by attempt …)`) and drops the lock.
+  "Run `cd <main checkout> && taskq supervise N` …"` — the same command on Claude and Codex. Spawn starts the
+  session, then writes `supervisor` = that session on a fresh read (note `supervisor none → R:session (spawned)`);
+  a task that got a supervisor or left ready meanwhile keeps it, and the new session is retired.
   The PM session starts no worker and holds no task.
 - **Supervisor** — the session named in the task's block `supervisor`. `taskq supervise N` (and `taskq worker`
-  run by it) prints its brief: launch the worker once (`spawn --name "T<N> …"`; `reserve` refuses any other
-  session, `tick` names the task instead of starting it); after an `answer` or `reject` resume that same worker
+  run by it) prints its brief: launch the worker once (`spawn --name "T<N> …" --text "… taskq worker --task N …"`;
+  spawn refuses any other session, `tick` names the task instead of starting it; spawn posts a `launch` note
+  naming the worker's session); after an `answer` or `reject` resume that same worker
   (Claude `claude --bg --resume`, Codex `codex-send`), never a second one; in `review`, check the exact SHA,
   then `close` (it publishes per `[workspace] publish` and retires the worker) or `reject`. It never takes its
   own task. Only it or the owner's shell rejects, releases or closes a supervised task; `answer` and `later`
-  are the owner's words, which the PM relays from its session. `take` accepts only the worker adopting the
-  supervisor's reservation, or the worker of the supervisor's newest `launch` note (the same worker after a
-  queue answer). The tick wakes an idle supervisor whose task is in review, or ready again without a
-  reservation, with one fixed line, and the PM's Review section leaves
+  are the owner's words, which the PM relays from its session. `take` accepts only the worker of the
+  supervisor's newest `launch` note (the same worker after a queue answer); before that note lands, a live
+  `T<N>` worker of this checkout. `taskq worker` without `--task` never picks a supervised task. The tick wakes
+  an idle supervisor whose task is in review, or ready again, with one fixed line, and the PM's Review section leaves
   supervised tasks out. After `close` the tick retires the supervisor (Claude: `claude stop` + `rm` of a
   local, not busy job; Codex: the `S<N>` thread is archived once no open task names it).
 - **Capacity**: one slot of a runtime holds a task's supervisor and its worker together. `tick` counts a task
-  once per slot: its local doing claim, its reservation here, or a live `T<N>`/`S<N>` session of this
-  checkout. The worker runs on its supervisor's runtime.
+  once per slot: its local doing claim, or a live `T<N>`/`S<N>` session of this checkout. The worker runs on its supervisor's runtime.
 - **Assignment and handoff**: `taskq edit N --supervisor RUNTIME:SESSION` from the owner's shell (no session
   identity) assigns, changes or clears (`''`); the current supervisor may only name its successor. The `edit`
-  note records it; `view` prints the supervisor and whether it has acted since (a `reserve`, `answer`, `reject`
-  or `release` by it). This is cooperative tracker authority, like claims: session identities are
+  note records it; `view` prints the supervisor. This is cooperative tracker authority, like claims: session identities are
   self-declared, so it is no proof that a command came from a root PM session.
 - **Continuation**: a session holding a `doing` claim gets that task's brief from `taskq worker`, never a fresh
   task; the tick's nudge says so.
@@ -385,47 +380,30 @@ ready/waiting/later → ask (manager) → answer → ready
 
 ## Taking a task
 
-The lock is the award emoji `lock` on the task's issue. GitLab lets one user put one reaction
-on one issue once: a second attempt gets 404 "Award Emoji Name has already been taken"
-(a unique key in the database; checked 2026-10-06 on GitLab 17.2.9). This is an atomic test-and-set.
+`take N` (#249, owner 2026-10-08: no tracker lock, no launch reservation):
 
-`take N`:
-
-1. Reads the queue; the task must be `ready` and pass `refusal` (dependencies, `scope`,
-   runtime). Otherwise it refuses with a reason.
-2. `POST award_emoji name=lock`. 404 means another worker took the task: refusal `another worker holds its lock`;
-   the worker runs `worker` again and takes the next one.
-3. One `PUT`: `q-doing` and `claim`.
-4. `scope` is a rule across tasks; the lock on one issue does not cover them. So after
-   step 3, if the task has a `scope`, `take` rereads the queue. If a path overlaps another task
-   with a `claim`, the one that entered `doing` later gives way: the time is the last
+1. Reads the queue; the task must be `ready` and pass `refusal` (dependencies, `scope`, runtime, host), the
+   sandbox, assignment and supervisor checks. Otherwise it refuses with a reason.
+2. Posts the note `take`, then reads the notes. The earliest trusted `take` note since the task last became
+   ready (the newest `ready`, `answer`, `reject` or `release` note) wins. Notes are append-only and ordered by
+   the store (note id), so two parallel takes read the same winner. A `take` note older than `TAKE_SECONDS`
+   (120 s) before this one is a take that died before its move: void. The loser deletes its note and gets
+   `another worker took it first`.
+3. One `PUT`: `q-doing` and `claim`. A failed write deletes the note.
+4. `scope` is a rule across tasks. After step 3, if the task has a `scope`, `take` rereads the queue. If a path
+   overlaps another task with a `claim`, the one that entered `doing` later gives way: the time is the last
    `add q-doing` label event (`resource_label_events`, GitLab clock); on a tie, the higher number gives way.
-   Every `take` first moves the task, then reads, so the later of the two always sees the
-   earlier one, and both order them the same way. The one giving way returns its task to `ready` with its
-   previous data, removes the lock and gets refusal `scope overlaps #N`. Live race on 2026-10-06
-   (two takes entered `doing` 18 ms apart): one gave way.
-5. Note `take`.
+   Every `take` first moves the task, then reads, so the later of the two always sees the earlier one. The one
+   giving way returns its task to `ready` with its previous data, deletes its note and gets `scope overlaps #N`.
 
-The lock is held while a worker holds the task: in `doing`, `ask`, `review`, and `later` from `ask`. It
-is removed by `answer`/`reject`/`release` (a move to `ready`, including the tick returning a stuck `doing`,
-which is the same `release`) and by `close`. An `answer` in the worker's own session keeps the lock: the task
-is `doing` again for the same worker. `take` is idempotent: a task already in `doing` with this session's `claim`
-is accepted again without the lock and without checking `scope` ("#N is yours").
-
-An orphan lock comes from a `take` that failed between steps 2 and 3, or from a card moved by hand from
-`ask`/`review` to `ready`. `tick` finds these with one request (`issues?my_reaction_emoji=lock`) and
-removes a lock older than `LOCK_SECONDS` (120 s) from a task in `ready`/`waiting` or from an issue that is
-not a task ("Unlocked #N"). While the lock is younger, it may belong to a `take` in progress.
+`take` is idempotent: a task already in `doing` with this session's `claim` is accepted again ("#N is yours").
+Known ceiling: the order needs read-after-write of notes; `selftest --scope quick` races two takes live.
 
 **GitHub (2026-10-06).** The package speaks one store protocol — GitLab's REST shape for the few endpoints it uses
-(issues, notes, labels, milestones, award emoji, label events, links, boards) — and `Github` speaks it on GitHub
-REST through `gh api`; the tests' fake speaks it in memory. Differences that show: the lock is the ref
-`refs/taskq/lock/<N>` on a blob holding its time — a second `POST git/refs` is 422 «Reference already exists» for
-any user (checked live 2026-10-06), so the lock is atomic between people with their own accounts (the owner's rule
-in the amendment to csgo #241); it is no branch, so no CI runs; anyone may remove it, the claim names the holder.
-`tick` finds orphan locks through `git/matching-refs/taskq/lock/`. Labels move as the full set in one PATCH
+(issues, notes, labels, milestones, label events, links, boards) — and `Github` speaks it on GitHub
+REST through `gh api`; the tests' fake speaks it in memory. Differences that show: labels move as the full set in one PATCH
 (the set last read in the process, else one GET). Comments have no `sort=desc`: the newest is read from the
-last page by the issue's comment count. The board is a Projects v2 project (below), there are no issue links (`deps` in the block is the source of truth), and `DELETE issues/N` is the GraphQL
+last page by the issue's comment count. The board is the label-filtered issue list (§ States), there are no issue links (`deps` in the block is the source of truth), and `DELETE issues/N` is the GraphQL
 `deleteIssue` (admin; `selftest` closes instead when refused). `--filter` is GitHub's list-issues query
 (`labels=`, `assignee=<login>`, `milestone=<number>`). Pull requests are dropped from issue lists. GitHub's REST issue list lags a
 just-created issue by up to half a minute (measured live 2026-10-06: 25–35 s, sometimes none; a `take` right after
@@ -433,39 +411,8 @@ just-created issue by up to half a minute (measured live 2026-10-06: 25–35 s, 
 through GraphQL (`repository.issues`, 100 per page, with `states`, `labels`, `filterBy`); single issues, comments,
 labels and refs stay REST.
 
-The board: the Projects v2 project titled `[github] board` (default: the repository name) among the projects
-linked to the repository (`repository { projectsV2 }`). A project belongs to the owner, not the repository: an
-owner-level project of that title not linked to this repository is another queue's board and is ignored, so two
-repositories of one owner never share one. `init` creates it once when the repository has none — owner the
-repository owner, user or organization (`createProjectV2` with `ownerId` and `repositoryId`, which links it) — gives its
-single-select field Status the options STATES in order (`updateProjectV2Field` with new options: the project's
-Todo/In Progress/Done go), deletes the project's built-in workflows (`deleteProjectV2Workflow`; the API cannot
-disable them: «Auto-close issue» closes an issue whose card reaches the old Done option, others set Status on
-add, close and merge — taskq alone writes Status), adds every open task without a card and prints the URL.
-A second `init` changes nothing. The store puts a card in its column in the same request batch as the label:
-`POST issues` adds the item (`addProjectV2ItemById`) and sets Status (`updateProjectV2ItemFieldValue`); a `PUT`
-that changes the `q-*` label sets Status; `close` archives the item (`archiveProjectV2Item`: the board shows open
-tasks only; the issue keeps its history). The project, the field and its option ids are looked up once per
-process. `tick` reads the cards in one query (100 open issues per page, each with its `projectItems`: the
-project's own `items` list stayed empty for minutes after adds, live 2026-10-06) and treats Status as the
-owner's intent (§ States) only when the card changed after the issue's last `labeled` event. The card step is
-best effort: a failed one prints a line and the command still succeeds (the label is the queue's state). The
-next read of the cards puts a stale card back to its label and adds a missing card, one printed line each.
-Without the token scope `project` (`gh auth refresh -h github.com -s project`) GraphQL refuses the lookup: there
-is no board, `init` names the command and makes the labels, every other command works as before.
-
-Live on alexkirs/taskq, 2026-10-06: `init` made the labels; the cycle add → tick → worker → take → beat ×2 (one
-note) → ask → tick shows the question → answer → take → result → tick shows the review → reject → take → release
-(ref gone) → take → result → close ran through with the ref `refs/taskq/lock/1` set while held and gone at the
-end; two `take` processes at once on one task: one «is yours», the other «another worker holds its lock»; the
-probe issues were deleted through the GraphQL path.
-
-**Multiple GitLab users.** Each person uses their own `glab` account. Reactions are unique per
-user, so `take` also reads all lock reactions after posting its own. The earliest reaction wins
-(creation time, then reaction id); a losing user deletes only their own reaction and gets refused.
-`unlock` removes only the current user's reactions. This is optimistic ordering, not a GitLab
-transaction across reaction and issue updates; live concurrent verification is required per project.
-An orphan reaction owned by another user must be cleared by that user; taskq does not delete it.
+**Multiple users.** Each person uses their own `glab`/`gh` account; the `take` note order decides between
+them as between sessions.
 
 ## Scheduled runs
 
@@ -476,10 +423,7 @@ Scheduling and creating sessions is an app action, not a script action.
   background session of the CLI in the main checkout that starts on the prompt (#270, 2026-10-06: the app
   window does not change; #41: no SendMessage). Remote Control is on (#83; `--no-remote-control` turns it
   off): the tick's "Workers" table links each worker's `https://claude.ai/code/session_…`. The owner watches
-  it there (browser, phone), `claude agents` / `claude attach`, or on request in the app:
-  `taskq show <id>` stops the background run and imports the session with the link
-  `claude://resume?session=<id>`, which is undocumented, may change with an app update and always
-  shows the session for a moment (~0.2 s). A finished worker: `close` retires it on its machine; by hand `taskq retire <id>`. Worker sessions
+  it there (browser, phone) or with `claude agents` / `claude attach`. A finished worker: `close` retires it on its machine; by hand `taskq retire <id>`. Worker sessions
   run without permission prompts: `.claude/settings.local.json` in the main checkout holds the allow list and
   `defaultMode: dontAsk` (the file is not in git), and spawn pins `--permission-mode dontAsk` (#71;
   [taskq-manager](taskq-manager.md) § 1 «Permissions»).
@@ -509,7 +453,7 @@ Scheduling and creating sessions is an app action, not a script action.
 - `taskq runtime N claude|codex|any` changes the runtime label of a task in `ready`, `waiting`, `ask`
   or `later` and writes a note to the issue; in `doing` and `review` it refuses.
 
-Workers on different machines share scope and lock checks: the lock decides who takes a task
+Workers on different machines share scope checks; the `take` note order decides who takes a task
 (§ Taking a task); the extra worker gets a refusal and "No task can start now".
 
 ## Cleanup
@@ -581,9 +525,8 @@ in full: history growth does not slow `tick`, `take`, `list` or `worker`.
 ## Verification
 
 From a package clone: `python3 -m unittest discover -s tests` — full cycles against a fake GitLab, including the
-ready↔waiting move by dependencies, showing a question once and the daily summary, the lock (success, 404,
-removal on `release`/`reject`/`close`/stuck-task return, tick removing a failed `take`'s lock), races
-on one task and on overlapping `scope` in both orders, a single `beat`, and `problem` without a task.
+ready↔waiting move by dependencies, showing a question once and the daily summary, the `take` note order
+(one winner, a void dead take, the reset by `release`/`answer`/`reject`), races on one task and on overlapping `scope` in both orders, a single `beat`, and `problem` without a task.
 
 Live cycle on 2026-10-05: tick started a worker, the worker created a worktree and pushed a commit to main, tick accepted the result and closed the task.
 Live Codex cycle on 2026-10-06: a coordinator in Claude started a Codex worker with `spawn --runtime codex`; the worker created a worktree and pushed a commit to main.

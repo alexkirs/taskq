@@ -202,7 +202,6 @@ commit during a readiness check.
 
 Extras only on request, each with its requirement and exact message:
 
-- **GitHub board scope:** “The queue works with labels only. A GitHub board needs Projects permission. To add it, run: `gh auth refresh -h <host> -s project`. Complete browser consent, then tell me ‘done’.” After consent, rerun init and doctor. Without the request, report the board deferred and doctor nonzero for that gap; label-only readiness is not full readiness.
 - **Codex workers:** “Codex workers need a signed-in Codex app server on its control socket, and a project for this checkout. I’ll prepare the project without starting a worker.” Verify `~/.codex/app-server-control`; the Codex app starts that server, and without the app (headless Linux, #160) the person runs `codex login --device-auth && codex app-server daemon start` (`daemon bootstrap` keeps it across reboots); find/create the project by the canonical main-checkout path through `taskq doctor --fix --codex`. Do not use `taskq spawn` as a project-creation workaround. A missing app or login goes through the human-only messages above.
 - **Areas:** “Which areas should this queue have?” Merge agreed names into `[areas] names`, run init, then doctor; use existing labels if sufficient. Creating areas does not broaden a confirmed worker profile.
 
@@ -368,8 +367,8 @@ free slot; one slot holds a task's supervisor and its worker). The other runtime
 The PM starts no worker itself and does no task work (#243, [R2–R3](principles.md)). One at a time:
 1. Run the command the section prints for the task, as printed:
    `taskq spawn --runtime <r> --name "S<N> <title>" --text "<supervisor prompt>"` (#41, #243). The
-   supervisor session starts on `taskq supervise N` at once; no SendMessage. spawn reserves the task, then
-   writes the session as its `supervisor`. The supervisor spawns the worker (`T<N> …`) itself, follows it,
+   supervisor session starts on `taskq supervise N` at once; no SendMessage. spawn writes the session as
+   its `supervisor`. The supervisor spawns the worker (`T<N> …`) itself, follows it,
    reviews, publishes and closes. Claude: a `claude --bg` session in the main checkout,
    no app window change (§ "Window focus on spawn"). Codex: the first turn of the new thread is the
    prompt (§ "Other machines"). spawn adds ` (<machine>)` to the name and prints the session id.
@@ -390,8 +389,7 @@ The PM starts no worker itself and does no task work (#243, [R2–R3](principles
    a page that redirects to the app link (#111; `[pages] base` of taskq.toml for a fork's Pages).
    The URL comes from the job record `~/.claude/jobs/<short id>/state.json`, `bridgeSessionId`
    `cse_<id>` = `session_<id>` (not in `claude agents --json`; checked live 2026-10-07, CLI 2.1.291).
-   A task itself, read only (state, claim, last notes, result): `taskq view <N>`; `taskq show`
-   takes a Claude session id and imports it into the app (§ "Showing a worker in the app").
+   A task itself, read only (state, claim, worker liveness, last notes, result): `taskq view <N>`.
 
 **Window focus on spawn (#270, 2026-10-06, app 2.19675.0, CLI 2.1.291).**
 - *Claude.* A worker is a `claude --bg` session (documented CLI: `claude agents`, `attach`, `logs`,
@@ -407,25 +405,6 @@ The PM starts no worker itself and does no task work (#243, [R2–R3](principles
   `importCliSession`, always switches the main pane to the session (no flag; `-g` only keeps the
   app in the background). A session record written straight into `claude-code-sessions` is not
   read until the app restarts; the app's own "CLI sessions in the sidebar" is compiled off.
-
-**Showing a worker in the app** (the owner asks “Show worker session <session id>.”,
-«покажи сессию воркера <session id>», «покажи сессию»): `taskq show <session id>`. It
-stops the background run first (the app does not refuse a live one and would be a second writer of
-the transcript: the worker's turn ends; continue it in the app with a message), imports it, and
-returns the pane to the calling session (`--restore <local_id>` names another) as soon as the
-app's log has the line `setFocusedSession: sessionId=local_<id>` (~0.2 s of the new session; the
-record file ~1.1 s is the fallback).
-- *Codex.* The spawn steps (thread/start, name, section, first turn, unsubscribe, broadcast
-  `thread-unarchived`) do not switch the window: screenshot before and after shows the same session,
-  the new one is in Recents/<project>. Only `open -g codex://threads/<id>` switches it (it also hands
-  the session to the app's own server). It is needed only for the recipe that archives a session the app
-  holds when no app window owns it; after that, return the window to the session open before, with the same link and its id.
-  Do not open worker sessions with this link without need.
-
-Entry phrase: “Show me the question from #N.” («Покажи вопрос из #N», «Покажи вопрос по задаче #N»).
-Run `taskq view N` read-only; relay the latest pending question verbatim and wait for the owner's
-answer. If there is no pending question, say so. Record an answer with `taskq answer N` as below;
-showing a question alone does not answer it, start workers or arm the tick.
 
 **Questions to the owner (sections Waiting for the owner and Still waiting for the owner).** These
 are `q-ask` tasks (the board's `q-ask` column): a question from a worker or the manager. The tick
@@ -485,8 +464,8 @@ marks for more than 20 minutes — look at the session and send a message. After
 without issue changes the tick returns the task to the queue itself.
 
 **Board mismatches (section Board mismatch).** The owner may move cards on the project board (the
-`[gitlab] board` or the GitHub Projects v2 board from taskq.toml). The tick lists issues it cannot run, with a fix command (on GitHub every card goes back to its label: owner
-moves go through `answer`, `later` and `reject`); fix it or ask the owner what was meant. The tick retires the
+`[gitlab] board`; on GitHub the label-filtered issue list, where nothing moves by hand). The tick lists what it
+cannot accept; fix it or ask the owner what was meant. The tick retires the
 sessions of closed tasks itself (R11). A manual `ready`↔`waiting` move is not an error; the tick moves it back
 by `deps`.
 
@@ -499,30 +478,6 @@ server-provided rollout. This reads existing history without resume; it is not a
 not change the worker. If the command started outside that tail or the rollout is unavailable, the
 current operation may be unknown. An unreachable server prints `status unknown`; it does not mean
 idle and does not block the rest of the coordinator's work.
-
-**Permission observations (#176).** `taskq runtime-status --runtime codex|claude <session> --json`
-reads supported runtime metadata without resume, private rollout or approval replies. Its observation
-distinguishes `waiting_permission`, `active`, `terminal`, and `unknown`, with `observed_at`, a session
-link when available, and the exact blocker. Empty activeFlags never proves no pending approval.
-Codex typed approval requests seen on the current connection and `waitingOnApproval` are positive
-evidence. Requests resolved elsewhere, requests predating connection, and Claude's pending approvals
-may be invisible: report `unknown`, not "no approvals". Event timestamps are separate from observation
-time. An execution item is execution evidence, not proof of permission visibility for every layer.
-The tick retains its existing rollout fallback and labels that mixed provenance; `runtime-status`
-uses supported app-server reads only. Unknown or still-active observations are held, not idle-nudged.
-The existing Workers report names permission waits and adds them to PM wake deduplication. A flag
-without a request ID cannot distinguish two successive unseen requests; do not promise exactly-once
-notification for that case. The owner approves in the linked UI. Keep the same worker, never accept
-on their behalf, nudge a permission wait, release it as idle, or spawn a replacement.
-
-**External PM bootstrap (#177).** Before any worker launch, ask the selected local executor to run
-`taskq preflight --json` through its supported command tool and return stdout, stderr and exit code.
-The ACK is an actual read-only subprocess in the resolved main checkout, not conversation activity.
-Its `ready` only proves local-command execution; runtime capability and effective launch policy
-remain `unknown` until separately qualified. Do not infer settings or change them to clear a blocker.
-The owner applies agreed scoped local settings. This preflight does not authorize a spawn, enforce
-a cross-host launch gate, or prove that a later worker received the same permissions. Record the
-actual launch route/policy separately; do not claim complete #176/#177 qualification from this ACK.
 
 **App and server turn (2026-10-06).** `thread-unarchived` via IPC refreshes the session list and
 metadata (`handleThreadUnarchived` in the installed app), but does not subscribe the window to item
@@ -645,14 +600,7 @@ sections: "Remove", "Ask the owner", "Kept".
    (retire keeps the transcript: `claude --resume <id>` opens it). One with an open task, busy, or
    the calling session (the coordinator) is kept; an idle worker of a closed task not proven in
    `origin/main` is a question with a `taskq retire` option.
-   For Claude sessions in the app (imported workers, `taskq show`) the script prints
-   `coordinator: archive_session local_<id>` for workers of closed tasks, found by claim, if the
-   session exists in this machine's app and is not archived. Only the coordinator has this app tool:
-   it checks that the worker finished and holds no background command, then runs `archive_session`
-   for each such id. An imported session that never took a task is found by the app metadata: imported from the CLI
-   (`adoptedFromOtherSurface`, `sessionId` = `local_<cliSessionId>`), cwd is the main checkout, not
-   archived, no activity for longer than `STALE_MINUTES`, no claim. This is a question to the owner
-   with an `archive_session` option. Codex spawn sessions are found in `thread/list` by the app's
+   Codex spawn sessions are found in `thread/list` by the app's
    project; no separate log is needed for them.
 
 If the Codex inventory is unavailable, trees are kept until the next check. Task state comes only

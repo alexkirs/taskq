@@ -15,6 +15,7 @@ import time
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
+from urllib.parse import parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import taskq as q  # noqa: E402
@@ -217,7 +218,7 @@ class Gitlab:
     def __init__(self):
         self.issues, self.notes, self.labels, self.boards, self.links = {}, {}, {}, [], set()
         self.milestones = [{'id': 5, 'title': 'Maps'}]
-        self.awards, self.events = {}, {}  # award emoji by id; label events by issue
+        self.events = {}  # label events by issue
         self.uid = 1
         self.clock = self.created = 0
         self.access = 30  # Developer
@@ -227,9 +228,6 @@ class Gitlab:
         """Real time, but strictly increasing by at least 1 ms: the order of GitLab's writes."""
         self.clock = max(time.time(), self.clock + 0.001)
         return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(self.clock)) + f'.{int(self.clock * 1000) % 1000:03d}Z'
-
-    def locked(self):
-        return sorted(award['iid'] for award in self.awards.values() if award['name'] == q.LOCK)
 
     def __call__(self, method, path, body=None):
         if path == '/user':
@@ -279,22 +277,9 @@ class Gitlab:
         if method == 'GET' and path.startswith('issues?'):
             label = re.search(r'labels=([^&]+)', path)
             state = re.search(r'state=(\w+)', path)[1]
-            emoji = re.search(r'my_reaction_emoji=(\w+)', path)
             return [issue for issue in self.issues.values() if state in ('all', issue['state'])
-                    and (not label or label[1] in issue['labels'])
-                    and (not emoji or any(award['iid'] == issue['iid'] and award['name'] == emoji[1] for award in self.awards.values()))]
+                    and (not label or label[1] in issue['labels'])]
         iid = int(re.match(r'issues/(\d+)', path).group(1))
-        if '/award_emoji' in path:
-            if method == 'POST':
-                if any(award['iid'] == iid and award['name'] == body['name'] and award['user']['id'] == self.uid for award in self.awards.values()):
-                    q.fail(f'GitLab POST {path} failed: 404 Award Emoji Name has already been taken Not Found')
-                number = max(self.awards, default=0) + 1
-                self.awards[number] = {'id': number, 'iid': iid, 'name': body['name'], 'user': {'id': self.uid}, 'created_at': self.now()}
-                return self.awards[number]
-            if method == 'DELETE':
-                del self.awards[int(path.rsplit('/', 1)[1])]
-                return None
-            return [award for award in self.awards.values() if award['iid'] == iid]
         if path.endswith('/resource_label_events') or '/resource_label_events?' in path:
             return self.events.get(iid, [])
         if path.endswith('/links'):
@@ -546,10 +531,10 @@ class Cycle(unittest.TestCase):
         self.assertFalse([label for label in self.gitlab.issues[iid]['labels'] if label.startswith('q-')])
         self.assertIn('Nothing to do', self.do(CLAUDE, 'tick'))
 
-    def race(self, first, second, at='lock'):
+    def race(self, first, second, at='note'):
         """Two workers on two machines take at once: `second` runs its whole take while `first` stops right
-        after its lock (`at='lock'`) or right after moving its task to doing (`at='save'`). Nothing local is
-        shared: only the fake GitLab is common. Returns who got a task."""
+        after its `take` note (`at='note'`) or right after moving its task to doing (`at='save'`). Nothing local is
+        shared: only the fake store is common. Returns who got a task."""
         won, paused = [], []
 
         def take(who, iid):
@@ -562,15 +547,13 @@ class Cycle(unittest.TestCase):
         def pause(original):
             def step(*args, **kwargs):
                 value = original(*args, **kwargs)
-                if not paused and (at == 'lock' or kwargs.get('claim', {}) and args[1:2] == ('doing',)):
+                if not paused and (at == 'note' and args[1:2] == ('take',) or kwargs.get('claim', {}) and args[1:2] == ('doing',)):
                     paused.append(1)
                     take(*second)
                 return value
             return step
         with patch.object(q, at, pause(getattr(q, at))):
             take(*first)
-        # A lock is held only by a task someone holds.
-        self.assertEqual(self.gitlab.locked(), sorted(iid for iid in self.gitlab.issues if self.state(iid) == 'doing'))
         return won
 
     def test_two_machines_take_at_once_exactly_one_wins(self):
@@ -579,7 +562,7 @@ class Cycle(unittest.TestCase):
         self.assertEqual(self.race((CLAUDE, same), (other, same)), ['claude-session'])
         self.assertEqual(q.parse(self.gitlab.issues[same])['claim']['session'], 'claude-session')
         # Overlapping scope, two tasks: the take that entered doing later gives way, whichever reads first.
-        for at, winner in (('lock', 'codex-session'), ('save', 'other-machine')):
+        for at, winner in (('note', 'codex-session'), ('save', 'other-machine')):
             left, right = self.add('--type', 'code', '--scope', f'v1/{at}'), self.add('--type', 'code', '--scope', f'v1/{at}/a.rs', '--runtime', 'codex')
             self.assertEqual(self.race((other, left), (CODEX, right), at), [winner])
             self.assertEqual(sorted(self.state(iid) for iid in (left, right)), ['doing', 'ready'])
@@ -592,29 +575,6 @@ class Cycle(unittest.TestCase):
         self.do(third, 'take', same)
         one, two = self.add('--type', 'code', '--scope', 'a'), self.add('--type', 'code', '--scope', 'b')
         self.assertEqual(sorted(self.race((third, one), (CLAUDE, two))), ['claude-session', 'third-machine'])
-
-    def test_lock_success_404_release_and_crash(self):
-        iid = self.add('--type', 'research', '--runtime', 'any')
-        self.assertTrue(q.lock(iid))
-        self.assertFalse(q.lock(iid))  # GitLab's 404 «has already been taken»
-        # A take that died between its lock and the move: refused until tick clears the old lock.
-        self.assertIn('another worker holds its lock', self.refused(CLAUDE, 'take', iid))
-        self.do(COORDINATOR, 'tick')
-        self.assertEqual(self.gitlab.locked(), [iid])  # younger than LOCK_SECONDS: maybe a take in progress
-        with patch.object(q, 'LOCK_SECONDS', -1):
-            self.assertIn(f'Unlocked {link(iid)}', self.do(COORDINATOR, 'tick'))
-        self.do(CLAUDE, 'take', iid)
-        self.assertEqual(self.gitlab.locked(), [iid])
-        self.do(COORDINATOR, 'release', iid, '--text', 'dead worker')
-        self.assertEqual(self.gitlab.locked(), [])
-        self.do(CODEX, 'take', iid)
-        self.do(CODEX, 'result', iid, '--text', 'done', '--checks', 'none')
-        self.do(COORDINATOR, 'reject', iid, '--text', 'again')
-        self.assertEqual(self.gitlab.locked(), [])
-        self.do(CODEX, 'take', iid)
-        self.do(CODEX, 'result', iid, '--text', 'done', '--checks', 'none')
-        self.do(COORDINATOR, 'close', iid, '--text', 'ok')
-        self.assertEqual(self.gitlab.locked(), [])
 
     def test_second_release_in_a_row_asks_the_owner(self):
         """#157: take, crash, release on every tick is bounded: the second release without an answer goes to ask."""
@@ -631,12 +591,12 @@ class Cycle(unittest.TestCase):
         self.do(COORDINATOR, 'release', iid, '--text', 'one more')  # the answer started the count over
         self.assertEqual(self.state(iid), 'ready')
 
-    def test_take_that_fails_after_its_lock_releases_it(self):
-        """#105: a save that raises after lock() leaves no lock behind; the error still shows."""
+    def test_take_that_fails_after_its_note_deletes_it(self):
+        """#105: a save that raises after the `take` note leaves no take note behind; the error still shows."""
         iid = self.add('--type', 'research', '--runtime', 'any')
         with patch.object(q, 'save', lambda *args, **kwargs: q.fail('GitHub PATCH issues/1 failed: boom')):
             self.assertIn('boom', self.refused(CLAUDE, 'take', iid))
-        self.assertEqual(self.gitlab.locked(), [])
+        self.assertFalse([body for body in self.gitlab.said(iid) if body.startswith('**take**')])  # its note went too
         self.do(CLAUDE, 'take', iid)
         self.assertEqual(self.state(iid), 'doing')
 
@@ -677,19 +637,16 @@ class Cycle(unittest.TestCase):
                     self.assertEqual(bool(q.gone(error.exception)), status == 404)
                     self.assertEqual(run.call_count, 2 if status == 500 else 1)
 
-    def test_deleted_gitlab_issue_has_no_locks_and_view_names_not_found(self):
+    def test_deleted_gitlab_issue_view_names_not_found(self):
         with patch.object(q, 'api', q.gitlab), patch.object(q.subprocess, 'run') as run:
             run.return_value = SimpleNamespace(returncode=0, stdout='', stderr='')
             q.api('DELETE', 'issues/7')
             run.return_value = SimpleNamespace(returncode=0, stdout='{"message":"404 Not found"}',
                                                stderr='glab: 404 Not found (HTTP 404)')
-            self.assertEqual(q.locks(7), [])
             with self.assertRaisesRegex(SystemExit, '#7 not found'):
                 worker.view(SimpleNamespace(iid=7, notes=5))
             run.return_value = SimpleNamespace(returncode=0, stdout='{"message":"Forbidden"}',
                                                stderr='glab: Forbidden (HTTP 403)')
-            with self.assertRaisesRegex(SystemExit, 'HTTP 403'):
-                q.locks(7)
             with self.assertRaisesRegex(SystemExit, 'HTTP 403'):
                 worker.view(SimpleNamespace(iid=7, notes=5))
 
@@ -714,12 +671,6 @@ class Cycle(unittest.TestCase):
 
     def test_fixed_coordinator_machine(self):
         fixed_coordinator(self)
-
-    def test_award_on_a_deleted_issue_does_not_break_tick(self):
-        iid = self.add('--type', 'research')
-        self.assertTrue(q.lock(iid))
-        q.api('DELETE', f'issues/{iid}')
-        self.assertIn('Nothing to do', self.do(COORDINATOR, 'tick'))
 
     def test_beat_keeps_one_note_and_problem_without_task_is_an_issue(self):
         iid = self.add('--type', 'research')
@@ -753,12 +704,12 @@ class Cycle(unittest.TestCase):
         self.gitlab.links.clear()
         current = q.parse(self.gitlab.issues[second])
         q.save(current, deps=[first])  # deps written before links existed
-        self.assertIn(f'label q-held kept: still on [{old}]', self.do(CLAUDE, 'migrate'))
+        self.assertIn(f'label q-held kept: still on [{old}]', self.do(CLAUDE, 'init'))
         self.assertEqual([item['label']['name'] for item in self.gitlab.boards[0]['lists']], [f'q-{state}' for state in q.STATES])
         self.assertIn((second, first), self.gitlab.links)
         self.gitlab.issues[old]['labels'] = ['code']
         before = json.dumps(self.gitlab.boards)
-        self.assertNotIn('kept', self.do(CLAUDE, 'migrate'))
+        self.assertNotIn('kept', self.do(CLAUDE, 'init'))
         self.assertNotIn('q-held', self.gitlab.labels)
         self.assertEqual(before, json.dumps(self.gitlab.boards))
 
@@ -1030,37 +981,10 @@ class Cycle(unittest.TestCase):
         with patch.dict(os.environ, {'TASKQ_HOST': 'win'}):
             self.assertEqual(q.machine(), 'win')
 
-    def test_legacy_codex_locality_uses_files_without_app_server(self):
-        root = self.directory / 'sessions' / '2026' / '10' / '06'
-        root.mkdir(parents=True)
-        (root / 'rollout-2026-10-06-local-thread.jsonl').write_text('')
-        with patch.dict(os.environ, {'CODEX_HOME': str(self.directory)}):
-            self.assertTrue(q.local_claim({'runtime': 'codex', 'session': 'local-thread'}))
-            self.assertFalse(q.local_claim({'runtime': 'codex', 'session': 'remote-thread'}))
-
     def test_worker_retry_preserves_profile_arguments(self):
         self.add('--type', 'code', '--mine', '--area', 'maps')
         text = self.do(CLAUDE, 'worker', '--filter', 'labels=area-maps', '--mine', '--limit', 'claude=1,codex=0')
         self.assertIn('taskq worker --filter labels=area-maps --mine --limit claude=1,codex=0', text)
-
-    def test_legacy_local_claims_still_fill_machine_slots(self):
-        for sid in ('234', '240'):
-            iid = self.add('--type', 'code')
-            self.do(CLAUDE, 'take', iid)
-            issue = self.gitlab.issues[iid]
-            current = q.parse(issue)
-            block = {key: current.get(key) for key in q.FIELDS}
-            block['claim'] = {'runtime': 'claude', 'session': sid}
-            issue['description'] = q.render(current['text'], block)
-            folder = self.directory / 'account' / 'org'
-            folder.mkdir(parents=True, exist_ok=True)
-            (folder / f'local_{sid}.json').write_text('{}')
-        self.add('--type', 'code')
-        with patch.object(q, 'CLAUDE_APP_SESSIONS', self.directory):
-            self.assertEqual(started(self, CLAUDE, '--limit', 'claude=2,codex=0'), [])
-            self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--limit', 'claude=2,codex=0'))
-        with patch.object(q, 'CLAUDE_APP_SESSIONS', self.directory / 'different-machine'):
-            self.assertEqual(len(started(self, CLAUDE, '--limit', 'claude=2,codex=0')), 1)
 
     def test_two_users_assignees_pool_manual_take_and_ask(self):
         first = self.add('--type', 'code', '--mine', '--area', 'maps')
@@ -1113,7 +1037,7 @@ class Cycle(unittest.TestCase):
             self.assertIn('flag: filter, mine, limit.claude', out)
             self.assertEqual(self.launched, [])
             self.assertEqual(started(self, CLAUDE, '--no-mine', '--limit', 'claude=1'), [f'S{maps} claude'])
-            # #243: the supervisor prompt names its task; the worker it launches adopts that reservation, whatever the profile.
+            # #243: the supervisor prompt names its task; its worker is launched with `worker --task N`, whatever the profile.
             self.assertIn(f"taskq supervise {maps}` and follow", tick.supervisor_prompt(maps))
             self.assertIn("mine=True", self.do(CLAUDE, 'tick'))
 
@@ -1211,12 +1135,6 @@ class Cycle(unittest.TestCase):
         self.assertEqual(gitignore.read_text(), '.worktrees/\n/taskq.local.toml\n')
         self.assertIn("mine=True", self.do(CLAUDE, 'tick'))
 
-    def test_personal_codex_override_wins_over_the_shared_one(self):
-        with patch.object(q, 'CODEX_PROJECT', 'shared-project'):
-            self.assertEqual(q.codex_project(None), 'shared-project')
-            self.personal('[codex]\nproject = "my-project"\n')
-            self.assertEqual(q.codex_project(None), 'my-project')
-
     def test_filter_keeps_dependency_and_scope_safety(self):
         engine = self.add('--type', 'code', '--area', 'engine', '--scope', 'shared')
         maps = self.add('--type', 'code', '--area', 'maps', '--deps', engine)
@@ -1224,36 +1142,6 @@ class Cycle(unittest.TestCase):
         self.do(CLAUDE, 'take', engine)
         self.add('--type', 'code', '--area', 'maps', '--scope', 'shared')
         self.assertIn('No task can start', self.do(CLAUDE, 'worker', '--filter', 'labels=area-maps'))
-
-    def test_two_users_race_one_task_only_first_wins(self):
-        iid = self.add('--type', 'code', '--runtime', 'any')
-        real, raced = self.gitlab, False
-        def interleaved(method, path, body=None):
-            nonlocal raced
-            if not raced and method == 'GET' and '/award_emoji?' in path:
-                raced = True
-                self.gitlab.uid = 2
-                try:
-                    self.assertIn('another worker holds its lock', self.refused(CODEX, 'take', iid))
-                finally:
-                    self.gitlab.uid = 1
-            return real(method, path, body)
-        with patch.object(q, 'api', interleaved):
-            self.assertIn('is yours', self.do(CLAUDE, 'take', iid))
-        self.assertEqual(self.gitlab.issues[iid]['assignees'], [{'id': 1}])
-        self.assertEqual(q.parse(self.gitlab.issues[iid])['claim']['session'], 'claude-session')
-        self.assertEqual(self.gitlab.locked(), [iid])
-
-    def test_cross_user_lock_first_reaction_wins(self):
-        iid = self.add('--type', 'code')
-        self.assertTrue(q.lock(iid))
-        self.gitlab.uid = 2
-        self.assertFalse(q.lock(iid))
-        q.unlock(iid)
-        self.assertEqual(self.gitlab.locked(), [iid])
-        self.gitlab.uid = 1
-        q.unlock(iid)
-        self.assertEqual(self.gitlab.locked(), [])
 
     def test_codex_doing_does_not_block_claude(self):
         for _ in range(2):
@@ -1285,7 +1173,6 @@ class Cycle(unittest.TestCase):
         with patch.object(q, 'STALE_MINUTES', -1):
             self.assertIn(f'Released stalled {link(iid)}', self.do(CLAUDE, 'tick'))
         self.assertEqual(self.state(iid), 'ready')
-        self.assertEqual(self.gitlab.locked(), [])  # the release took the lock off
         self.assertIn('continue', self.do(CLAUDE, 'list'))
         self.do(CLAUDE, 'take', iid)
 
@@ -1637,15 +1524,17 @@ class Cycle(unittest.TestCase):
         self.assertEqual((calls['thread/start']['sandbox'], calls['turn/start']['sandboxPolicy']), ('danger-full-access', full))
 
     def test_codex_spawn_finds_the_app_project_by_the_checkout_path(self):
-        """#24: an id is per machine; the checkout path is shared. An explicit [codex] project still wins."""
+        """#24: an id is per machine; the checkout path is shared. A personal [codex] project still wins."""
         def spawned_in():
             self.codex.calls.clear()
             with patch.object(codex, 'codex_announce'):
                 self.do(CLAUDE, 'spawn', '--runtime', 'codex', '--name', 'probe')
             return next(params for method, params in self.codex.calls if method == 'thread/start')['projectId']
+        self.personal('[codex]\nproject = "codex-project"\n')
         self.assertEqual(spawned_in(), 'codex-project')
         self.assertNotIn('project/list', [method for method, _ in self.codex.calls])
-        with patch.object(q, 'CODEX_PROJECT', None):
+        q.LOCAL.unlink()
+        if True:
             self.codex.projects = [{'id': 'other', 'roots': [{'path': '/elsewhere'}]},
                                    {'id': 'mine', 'roots': [{'path': str(q.ROOT)}]}]
             self.assertEqual(spawned_in(), 'mine')
@@ -1685,43 +1574,6 @@ class Cycle(unittest.TestCase):
         self.agents = {}
         with self.run_recorded({'claude --bg': 'backgrounded · ffff0000 · T1 x'})[1]:
             self.assertIn('does not list the new session ffff0000', self.refused(CLAUDE, 'spawn'))
-
-    def test_show_stops_the_background_run_then_imports_and_restores_on_the_focus_line(self):
-        self.enterContext(patch.object(sys, 'platform', 'darwin'))  # the macOS path, on any CI
-        home = self.directory / 'home'
-        log = home / 'Library/Logs/Claude/main.log'
-        log.parent.mkdir(parents=True)
-        log.write_text('old line\n')
-        self.agents = {'s1': {'id': 's1short', 'sessionId': 's1', 'pid': 7}}
-        runs = []
-
-        def run(argv, **kwargs):
-            runs.append(argv)
-            if 'resume?session=s1' in argv[-1]:
-                with log.open('a') as out:
-                    out.write('[info] [CCD] LocalSessions.setFocusedSession: sessionId=local_s1\n')
-            return SimpleNamespace(returncode=0, stdout='', stderr='')
-        permitted(self.directory)
-        with patch.object(q.subprocess, 'run', run), patch.object(q.Path, 'home', lambda: home), \
-                patch.object(q, 'CLAUDE_APP_SESSIONS', self.directory / 'none'), patch.object(q, 'ROOT', self.directory):
-            started = time.time()
-            printed = self.do(CLAUDE, 'show', 'local_s1', '--restore', 'owner')
-        self.assertLess(time.time() - started, 5)  # the log line, not the 20 s timeout
-        self.assertEqual(runs, [['claude', 'stop', 's1short'], ['open', '-g', 'claude://resume?session=s1'],
-                                ['open', '-g', 'claude://claude.ai/epitaxy/local_owner']])
-        self.assertIn('stopped the background run s1short', printed)
-
-    def test_show_without_dontask_leaves_the_worker_running_and_names_attach(self):
-        """#71: the app opens a session in the checkout's defaultMode, else its own (auto): its classifier stops taskq."""
-        self.enterContext(patch.object(sys, 'platform', 'darwin'))  # the macOS path, on any CI
-        self.agents = {'s1': {'id': 's1short', 'sessionId': 's1', 'pid': 7}}
-        permitted(self.directory, defaultMode='auto')
-        runs, patched = self.run_recorded()
-        with patched, patch.object(q, 'ROOT', self.directory):
-            printed = self.do(CLAUDE, 'show', 'local_s1')
-        self.assertEqual(runs, [])  # neither stopped nor imported
-        self.assertIn('not opened in the app: it would run there without dontAsk', printed)
-        self.assertIn('`claude attach s1short`', printed)
 
     def test_tick_links_tasks_sessions_and_commits(self):
         tick_links(self, GL, 'https://gitlab.example/g/p/-/commit/')
@@ -1906,75 +1758,10 @@ class Cycle(unittest.TestCase):
 
 class GithubRest:
     """GitHub's REST shapes for what `Github` asks: issues by `number` with label objects, comments, labels,
-    milestones, label events, blobs and refs (the lock), the user, `deleteIssue` and Projects v2 over GraphQL."""
+    milestones, label events, the user, `deleteIssue` and the issue list over GraphQL."""
     def __init__(self):
-        self.issues, self.comments, self.labels, self.refs, self.blobs, self.deleted = {}, {}, {}, {}, {}, set()
+        self.issues, self.comments, self.labels, self.deleted = {}, {}, {}, set()
         self.calls, self.clock, self.push = [], 0, True
-        self.projects, self.scope, self.mutations = [], True, []  # the owner's Projects v2; False: the token lacks `project`
-        self.broken = False  # True: every card mutation fails like GitHub's 'Something went wrong'
-
-    def project(self, query, found):
-        """Projects v2 GraphQL: lookup by title, create, Status options, items, card moves and archive."""
-        if not self.scope:
-            q.fail("GitHub POST graphql failed: GraphQL: Your token has not been granted the required scopes to execute this query. The 'projectsV2' field requires one of the following scopes: ['read:project']")
-        if self.broken and 'ProjectV2Item' in query:
-            q.fail('GitHub POST graphql failed: GraphQL: Something went wrong while executing your query.')
-        if query.startswith('mutation'):
-            self.mutations.append(query.split('{', 1)[1].split('(', 1)[0].strip())
-        shape = lambda board: {'id': board['id'], 'number': int(board['id'][7:]), 'title': board['title'], 'url': board['url'],
-                               'field': {'id': board['id'] + ':status', 'options': [dict(option) for option in board['options']]}}
-        if 'createProjectV2(' in query:  # the repository id is its owner/name here; `repositoryId` links it
-            board = {'id': f'project{len(self.projects) + 1}', 'title': found['title'], 'url': f'project-url/{len(self.projects) + 1}',
-                     'repo': found['repo'], 'linked': [found['repo']], 'items': {}, 'workflows': ['Auto-close issue', 'Item added to project', 'Item closed'], 'options': [{'id': f'o{index}', 'name': name} for index, name in enumerate(('Todo', 'In Progress', 'Done'))]}
-            self.projects.append(board)
-            return {'createProjectV2': {'projectV2': shape(board)}}
-        if 'projectsV2(' in query:  # the repository's linked projects, matched by title like GitHub's `query`
-            repo = f'{found["owner"]}/{found["name"]}'
-            nodes = [shape(board) for board in self.projects if found['board'] in board['title'] and repo in board['linked']]
-            return {'repository': {'id': repo, 'owner': {'id': found['owner']}, 'projectsV2': {'nodes': nodes}}}
-        key = str(found.get('project') or found.get('field') or found.get('id') or '').split(':')[0]
-        board = next((board for board in self.projects if board['id'] == key), self.projects[0])
-        if 'workflows(' in query:
-            return {'node': {'workflows': {'nodes': [{'id': f'{board["id"]}:{name}'} for name in board['workflows']]}}}
-        if 'deleteProjectV2Workflow(' in query:
-            board['workflows'].remove(found['id'].split(':', 1)[1])
-            return {}
-        if 'updateProjectV2Field(' in query:
-            board['options'] = [{'id': option.get('id') or f'o{len(board["options"]) + index}', 'name': option['name']}
-                                for index, option in enumerate(found['options'])]
-            return {'updateProjectV2Field': {'projectV2Field': shape(board)['field']}}
-        if 'addProjectV2ItemById(' in query:
-            number = next(number for number, issue in self.issues.items() if issue['node_id'] == found['node'])
-            item = board['items'].setdefault(number, {'id': f'item{number}', 'option': None, 'archived': False, 'updated': self.now()})
-            return {'addProjectV2ItemById': {'item': {'id': item['id']}}}
-        item = next((item for item in board['items'].values() if item['id'] == found.get('item')), None)
-        if 'updateProjectV2ItemFieldValue(' in query:
-            item['option'], item['updated'] = found['option'], self.now()
-            return {}
-        if 'archiveProjectV2Item(' in query:
-            item['archived'] = True
-            return {}
-        names = {option['id']: option['name'] for option in board['options']}
-        nodes = [{'number': number, 'labels': {'nodes': issue['labels']},
-                  'timelineItems': {'nodes': [{'createdAt': event['created_at']} for event in issue['events'][-1:]]}, 'projectItems': {'nodes': [
-                     {'id': item['id'], 'updatedAt': item['updated'], 'project': {'id': board['id']}, 'fieldValueByName': {'name': names[item['option']]} if item['option'] in names else None}
-                     for item in [board['items'].get(number)] if item and not item['archived']]}}
-                 for number, issue in self.issues.items() if issue['state'] == 'open']
-        cards = [{'id': item['id'], 'isArchived': False, 'content': {'number': number, 'state': self.issues[number]['state'].upper()}}
-                 for number, item in board['items'].items() if not item['archived']]
-        start = int(found.get('cards') or 0)  # board items come 100 a page; the cursor is the offset
-        page = {'pageInfo': {'hasNextPage': start + 100 < len(cards), 'endCursor': str(start + 100)}, 'nodes': cards[start:start + 100]}
-        return {'repository': {'issues': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}, 'board': {'items': page}}
-
-    def column(self, number):
-        """The Status of the issue's card on the one board; 'archived'; None: no card."""
-        item = self.projects[0]['items'].get(number) if self.projects else None
-        return item and ('archived' if item['archived'] else {option['id']: option['name'] for option in self.projects[0]['options']}.get(item['option']))
-
-    def move(self, number, status):
-        """The owner drags the card to the column `status`."""
-        self.projects[0]['items'][number]['updated'] = self.now()
-        self.projects[0]['items'][number]['option'] = next(option['id'] for option in self.projects[0]['options'] if option['name'] == status)
 
     def now(self):
         self.clock = max(time.time(), self.clock + 0.001)
@@ -1983,11 +1770,8 @@ class GithubRest:
     def label(self, name):
         return self.labels.get(name) or {'id': 0, 'name': name}
 
-    def locks(self):
-        return sorted(ref for ref in self.refs if ref.startswith('refs/taskq/lock/'))
-
     def page(self, items, query):
-        found = {key: value[0] for key, value in q.parse_qs(query).items()}
+        found = {key: value[0] for key, value in parse_qs(query).items()}
         size, page = int(found.get('per_page', 30)), int(found.get('page', 1))
         return items[(page - 1) * size:page * size]
 
@@ -2005,8 +1789,6 @@ class GithubRest:
             del self.issues[number]
             self.deleted.add(number)
             return {'data': {}}
-        if route == 'graphql' and 'Project' in body['query']:
-            return {'data': self.project(body['query'], body['variables'])}
         if route == 'graphql':
             found = body['variables']
             items = [issue for issue in self.issues.values() if (not found['states'] or issue['state'].upper() in found['states'])
@@ -2028,34 +1810,8 @@ class GithubRest:
                 return self.labels[body['name']]
             return self.page(list(self.labels.values()), query)
         if route.startswith('labels/'):
-            del self.labels[q.parse_qs('x=' + route[7:])['x'][0]]
+            del self.labels[parse_qs('x=' + route[7:])['x'][0]]
             return None
-        if route == 'git/blobs':
-            sha = f'blob{len(self.blobs) + 1}'
-            self.blobs[sha] = body['content']
-            return {'sha': sha}
-        if route.startswith('git/blobs/'):
-            import base64
-            return {'content': base64.b64encode(self.blobs[route[10:]].encode()).decode()}
-        if route == 'git/refs':
-            if body['ref'] in self.refs:
-                q.fail('GitHub POST git/refs failed: {"message":"Reference already exists","status":"422"}')
-            self.refs[body['ref']] = body['sha']
-            return {'ref': body['ref'], 'object': {'sha': body['sha']}}
-        if route.startswith('git/ref/'):
-            ref = 'refs/' + route[8:]
-            if ref not in self.refs:
-                q.fail('GitHub GET failed: {"message":"Not Found","status":"404"}')
-            return {'ref': ref, 'object': {'sha': self.refs[ref]}}
-        if route.startswith('git/refs/') and method == 'PATCH':
-            self.refs['refs/' + route[9:]] = body['sha']
-            return {'ref': 'refs/' + route[9:], 'object': {'sha': body['sha']}}
-        if route.startswith('git/refs/'):
-            del self.refs['refs/' + route[9:]]
-            return None
-        if route.startswith('git/matching-refs/'):
-            prefix = 'refs/' + route[18:]
-            return [{'ref': ref} for ref in self.refs if ref.startswith(prefix)]
         if route == 'issues' and method == 'POST':
             number = len(self.issues) + 1
             self.issues[number] = {'number': number, 'node_id': f'node{number}', 'state': 'open', 'title': body['title'],
@@ -2066,7 +1822,7 @@ class GithubRest:
                                    'events': [], 'user': {'id': 1, 'login': 'alice'}, 'author_association': body.get('association', 'OWNER')}
             return self.issues[number]
         if route == 'issues':
-            found = {key: value[0] for key, value in q.parse_qs(query).items()}
+            found = {key: value[0] for key, value in parse_qs(query).items()}
             items = [issue for issue in self.issues.values() if found.get('state', 'open') in ('all', issue['state'])
                      and all(name in [label['name'] for label in issue['labels']] for name in found.get('labels', '').split(',') if name)
                      and (not found.get('since') or issue['updated_at'] >= found['since'])]
@@ -2161,7 +1917,6 @@ class GithubCycle(unittest.TestCase):
         self.assertIn(f'take {number}', self.do(CLAUDE, 'worker'))
         self.do(CLAUDE, 'take', number)
         self.assertEqual(self.state(number), 'doing')
-        self.assertIn('refs/taskq/lock/%d' % number, self.github.refs)
         self.do(CLAUDE, 'beat', number)
         self.do(CLAUDE, 'beat', number)
         self.assertEqual(sum(item['body'].startswith('**beat**') for item in self.github.comments.values()), 1)
@@ -2174,7 +1929,6 @@ class GithubCycle(unittest.TestCase):
         self.do(CLAUDE, 'close', number, '--text', 'ok')
         self.assertEqual(self.github.issues[number]['state'], 'closed')
         self.assertFalse([name for name in self.names(number) if name.startswith('q-')])
-        self.assertEqual(self.github.locks(), [])
         self.assertIn(f'#{number}: take → ask', self.do(CLAUDE, 'report'))
 
     def test_outsiders_issues_are_no_tasks_and_tick_names_them_in_the_inbox(self):
@@ -2207,54 +1961,21 @@ class GithubCycle(unittest.TestCase):
         self.assertNotIn('forged', brief)
         self.assertIn('2 comments by non-collaborators omitted', brief)
 
-    def test_lock_is_a_ref_second_taker_loses_and_tick_heals_a_dead_lock(self):
+    def test_two_parallel_takes_one_wins_by_note_order(self):
         number = self.add('--type', 'code')
-        self.assertTrue(q.lock(number))
-        self.assertFalse(q.lock(number))  # 422 Reference already exists
-        with patch.object(q, 'LOCK_SECONDS', -1):
-            self.assertIn(f'Unlocked {link(number, GH)}', self.do(CLAUDE, 'tick'))
-        self.assertEqual(self.github.locks(), [])
         other = {'CLAUDE_CODE_SESSION_ID': 'other-machine', 'CODEX_THREAD_ID': ''}
+        self.assertEqual(Cycle.race(self, (CLAUDE, number), (other, number)), ['claude-session'])
+        self.assertEqual(q.parse(q.api('GET', f'issues/{number}'))['claim']['session'], 'claude-session')
+        self.assertEqual([item['body'].split(' ')[0] for item in self.github.comments.values()], ['**take**'])  # the loser's note went
+        self.do(COORDINATOR, 'release', number, '--text', 'next')
         self.do(other, 'take', number)
         with self.assertRaises(SystemExit) as refused, contextlib.redirect_stdout(io.StringIO()):
             with patch.dict(os.environ, CLAUDE):
                 q.main(['take', str(number)])
         self.assertIn('cannot start', str(refused.exception))
 
-    def test_every_claim_release_removes_its_lock_ref(self):
-        released = self.add('--type', 'research', '--runtime', 'any')
-        self.do(CODEX, 'take', released)
-        self.do(COORDINATOR, 'release', released, '--text', 'stopped')
-
-        rejected = self.add('--type', 'research', '--runtime', 'any')
-        self.do(CODEX, 'take', rejected)
-        self.do(CODEX, 'result', rejected, '--text', 'done', '--checks', 'none')
-        self.do(COORDINATOR, 'reject', rejected, '--text', 'again')
-
-        stale = self.add('--type', 'research', '--runtime', 'any')
-        self.do(CODEX, 'take', stale)
-        with patch.object(q, 'STALE_MINUTES', -1):
-            self.do(COORDINATOR, 'tick')
-
-        repeated = self.add('--type', 'research', '--runtime', 'any')
-        self.do(CODEX, 'take', repeated)
-        self.do(COORDINATOR, 'release', repeated, '--text', 'stopped')
-        self.do(CODEX, 'take', repeated)
-        self.do(COORDINATOR, 'release', repeated, '--text', 'stopped again')
-
-        self.assertEqual(self.github.locks(), [])
-
     def test_fixed_coordinator_machine(self):
         fixed_coordinator(self)
-
-    def test_lock_ref_of_a_deleted_or_closed_issue_does_not_break_tick(self):
-        deleted, closed = self.add('--type', 'code'), self.add('--type', 'code')
-        self.assertTrue(q.lock(deleted) and q.lock(closed))
-        q.api('DELETE', f'issues/{deleted}')
-        self.github.issues[closed]['state'] = 'closed'  # closed by hand, its lock left
-        self.do(COORDINATOR, 'tick')  # was: GitHub GET issues/1 failed: gh: This issue was deleted (HTTP 410)
-        self.assertEqual(self.github.locks(), [f'refs/taskq/lock/{closed}'])  # the deleted issue's ref is removed
-        self.do(COORDINATOR, 'tick')
 
     def test_newest_comment_is_read_from_the_last_page(self):
         number = self.add('--type', 'code')
@@ -2285,144 +2006,12 @@ class GithubCycle(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp), contextlib.redirect_stdout(io.StringIO()) as out:
             q.main(['init', '--github', 'owner/repo'])
             self.assertEqual(Path('taskq.toml').read_text().splitlines()[1:], ['[github]', 'repo = "owner/repo"'])
-        self.assertIn('board project-url/1:', out.getvalue())
-        self.addCleanup(q.configure, Path(__file__).resolve().parent / 'taskq.toml')
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / 'taskq.toml'
-            for extra, board in (('', 'repo'), ('board = "taskq"\n', 'taskq')):  # no [github] board: the repository name
-                config.write_text('[github]\nrepo = "owner/repo"\n' + extra + '[update]\nauto = false\nevery = "24h"\n')
-                with contextlib.redirect_stdout(io.StringIO()):
-                    q.configure(config)
-                self.assertEqual((q.BOARD, q.STORE.title), (board, board))
+        # The board is the issue list filtered by the q-* labels: nothing to create (owner 2026-10-08).
+        self.assertIn('/issues?q=is%3Aissue%20is%3Aopen%20label%3Aq-ready%2Cq-waiting', out.getvalue())
 
-    def test_init_makes_the_board_once_with_one_column_per_state(self):
-        self.do(CLAUDE, 'init')
-        calls, mutations = len(self.github.calls), len(self.github.mutations)
-        self.assertIn('board project-url/1', self.do(CLAUDE, 'init'))
-        self.assertEqual([(board['title'], board['repo'], [option['name'] for option in board['options']]) for board in self.github.projects],
-                         [('repo', 'owner/repo', list(q.STATES))])
-        self.assertEqual(self.github.projects[0]['workflows'], [])  # Status Done would close the issue: taskq alone moves cards
-        writes = [path for method, path in self.github.calls[calls:] if method != 'GET' and path != 'graphql']
-        self.assertEqual((writes, self.github.mutations[mutations:]), ([], []))
-
-    def test_each_repository_of_one_owner_gets_its_own_linked_board(self):
-        boards = {}
-        for repo, board in (('owner/one', None), ('owner/two', None), ('owner/three', 'shared')):
-            store = q.Github(repo, board=board)
-            store.run = self.github
-            boards[repo] = store('POST', 'board')['url']
-        self.github.projects.append({'id': 'project9', 'title': 'four', 'url': 'project-url/9', 'repo': 'owner/x', 'linked': ['owner/x'],
-                                     'items': {}, 'workflows': [], 'options': []})  # an owner-level project not linked to owner/four
-        store = q.Github('owner/four')
-        store.run = self.github
-        boards['owner/four'] = store('POST', 'board')['url']
-        self.assertEqual([(board['title'], board['linked']) for board in self.github.projects],
-                         [('one', ['owner/one']), ('two', ['owner/two']), ('shared', ['owner/three']),
-                          ('four', ['owner/x']), ('four', ['owner/four'])])
-        self.assertEqual(len(set(boards.values())), 4)
-        mutations = len(self.github.mutations)
-        again = q.Github('owner/two')
-        again.run = self.github
-        self.assertEqual((again('POST', 'board')['url'], self.github.mutations[mutations:]), (boards['owner/two'], []))
-
-    def test_without_the_project_scope_init_names_the_command_and_makes_labels(self):
-        self.github.scope = False
-        out = self.do(CLAUDE, 'init')
-        self.assertIn('gh auth refresh -h github.com -s project', out)
-        self.assertIn('q-later', self.github.labels)
-        number = self.add('--type', 'code')
-        self.do(CLAUDE, 'take', number)  # commands work as before, without a board
-        self.assertEqual(self.state(number), 'doing')
-
-    def test_every_state_change_moves_the_card_and_close_archives_it(self):
-        number = self.add('--type', 'research')
-        self.do(CLAUDE, 'init')  # a task from before the board gets its card
-        self.assertEqual(self.github.column(number), 'ready')
-        number = self.add('--type', 'research')
-        self.assertEqual(self.github.column(number), 'ready')
-        self.do(CLAUDE, 'take', number)
-        self.assertEqual(self.github.column(number), 'doing')
-        self.do(CLAUDE, 'ask', number, '--text', 'which?')
-        self.assertEqual(self.github.column(number), 'ask')
-        self.do(CLAUDE, 'answer', number, '--text', 'this')
-        self.assertEqual(self.github.column(number), 'doing')
-        self.do(CLAUDE, 'result', number, '--text', 'done', '--checks', 'none')
-        self.assertEqual(self.github.column(number), 'review')
-        self.do(COORDINATOR, 'reject', number, '--text', 'more')
-        self.assertEqual(self.github.column(number), 'ready')
-        self.do(CLAUDE, 'take', number)
-        self.do(CLAUDE, 'result', number, '--text', 'done', '--checks', 'none')
-        self.do(CLAUDE, 'close', number, '--text', 'ok')
-        self.assertEqual(self.github.column(number), 'archived')
-
-    def test_owner_card_moves_are_put_back(self):
-        """The board is a one-way copy of the labels: a card moved by hand goes back; owner moves are commands."""
-        self.do(CLAUDE, 'init')
-        deferred, taken = self.add('--type', 'research'), self.add('--type', 'research')
-        self.do(CLAUDE, 'take', taken)
-        self.github.move(deferred, 'later')
-        self.github.move(taken, 'review')
-        out = self.do(CLAUDE, 'tick')
-        self.assertIn('Board: project-url/1', out)
-        self.assertEqual((self.state(deferred), self.state(taken)), ('ready', 'doing'))
-        self.assertIn(f'Board card of {link(deferred, GH)} put back to ready', out)
-        self.assertEqual((self.github.column(deferred), self.github.column(taken)), ('ready', 'doing'))
-
-    def test_tick_archives_the_card_of_an_issue_closed_by_hand(self):
-        self.do(CLAUDE, 'init')
-        closed, kept = self.add('--type', 'research'), self.add('--type', 'research')
-        self.do(CLAUDE, 'tick')
-        self.github.mutations.clear()
-        self.do(CLAUDE, 'tick')
-        self.assertEqual(self.github.mutations, [])  # nothing stale: no call beyond the board read
-        self.github.issues[closed]['state'] = 'closed'  # closed on GitHub, not by `close`
-        out = self.do(CLAUDE, 'tick')
-        self.assertIn(f'Board card of #{closed} archived: its issue is closed.', out)
-        self.assertEqual((self.github.column(closed), self.github.column(kept)), ('archived', 'ready'))
-        self.assertEqual(self.github.mutations, ['archiveProjectV2Item'])
-
-    def test_tick_archives_closed_cards_past_the_first_board_page(self):
-        self.do(CLAUDE, 'init')
-        closed = self.add('--type', 'research')
-        self.do(CLAUDE, 'tick')
-        board = self.github.projects[0]
-        for number in range(1000, 1100):  # 100 open issues ahead of the task's card: it lands on page two
-            self.github.issues[number] = {**self.github.issues[closed], 'number': number, 'labels': [], 'events': [], 'node_id': f'node{number}'}
-            board['items'][number] = {'id': f'item{number}', 'option': None, 'archived': False, 'updated': self.github.now()}
-        board['items'][closed] = board['items'].pop(closed)
-        self.github.mutations.clear()
-        self.do(CLAUDE, 'tick')
-        self.assertEqual(self.github.mutations, [])
-        self.github.issues[closed]['state'] = 'closed'
-        self.assertIn(f'Board card of #{closed} archived: its issue is closed.', self.do(CLAUDE, 'tick'))
-        self.assertEqual((self.github.column(closed), self.github.mutations), ('archived', ['archiveProjectV2Item']))
-        for number in range(1000, 1100):  # 101 closed cards: every one leaves the board
-            self.github.issues[number]['state'] = 'closed'
-        board['items'][closed]['archived'] = False
-        self.github.mutations.clear()
-        self.do(CLAUDE, 'tick')
-        self.assertEqual(len(self.github.mutations), 101)
-        self.assertTrue(all(item['archived'] for item in board['items'].values()))
-
-    def test_a_failed_card_sync_is_repaired_not_executed(self):
-        self.do(CLAUDE, 'init')
-        number, moved = self.add('--type', 'research'), self.add('--type', 'research')
-        self.do(CLAUDE, 'later', number, '--text', 'not now')
-        self.do(CLAUDE, 'later', moved, '--text', 'not now')
-        self.github.broken = True
-        self.assertIn(f'Board card of #{number} not updated', self.do(CLAUDE, 'answer', number, '--text', 'go'))
-        self.assertEqual((self.state(number), self.github.column(number)), ('ready', 'later'))
-        created = self.add('--type', 'research')  # exits 0 with the issue: the card is best effort
-        self.github.broken = False
-        self.github.move(moved, 'ready')  # the owner's own move, after the label event
-        out = self.do(CLAUDE, 'tick')
-        self.assertIn(f'Board card of #{number} put back to ready', out)
-        self.assertNotIn(f'Board move of {link(number, GH)}', out)
-        self.assertEqual((self.state(number), self.github.column(number)), ('ready', 'ready'))
-        self.assertEqual((self.state(moved), self.github.column(moved)), ('later', 'later'))  # put back, not executed
-        self.assertIn(f'Board card of #{created} added in ready', out)
-        self.assertEqual(self.github.column(created), 'ready')
-
+    def test_tick_links_the_label_filtered_issue_list_as_the_board(self):
+        self.add('--type', 'research')
+        self.assertIn(f'Board: {q.issue_board()}', self.do(CLAUDE, 'tick'))
 
 class Selftest(unittest.TestCase):
     """`selftest --scope quick` against the fake GitLab; its worker processes run in this process."""
@@ -2460,7 +2049,6 @@ class Selftest(unittest.TestCase):
             self.assertIn(mechanism, report)
         self.assertEqual(self.gitlab.tasks(), [99])  # the selftest tasks are deleted
         self.assertTrue(self.gitlab.said(99)[-1].startswith('**selftest** · claude:coordina'))
-        self.assertFalse(self.gitlab.locked())
         self.assertFalse((self.directory / 'beat').exists())  # the real tick's last-run time is untouched
 
     def record(self, pid, created):
@@ -2475,10 +2063,9 @@ class Selftest(unittest.TestCase):
             q.main(['selftest', '--scope', 'check'])
         self.assertIn(f'is still alive (pid {os.getppid()})', str(refused.exception))
 
-    def test_a_run_cleans_a_crashed_run_its_issues_and_locks(self):
+    def test_a_run_cleans_a_crashed_run_and_its_issues(self):
         iid = self.add('--type', 'research', '--label', 'selftest')
         live = self.add('--type', 'research', '--label', 'selftest')
-        q.lock(iid)
         dead = subprocess.Popen(['true'])
         dead.wait()
         path = self.record(dead.pid, [iid])
@@ -2487,7 +2074,6 @@ class Selftest(unittest.TestCase):
             report = self.do(COORDINATOR, 'selftest', '--scope', 'quick')  # check would refuse: a run is alive
         self.assertIn('13 of 13 ok', report)
         self.assertEqual(self.gitlab.tasks(), [live])  # the live run's task is not a leftover
-        self.assertFalse(self.gitlab.locked())
         self.assertFalse(path.exists())
 
     def test_cleanup_repeatedly_handles_zero_exit_http_404(self):
@@ -2631,6 +2217,8 @@ class Selftest(unittest.TestCase):
     def test_view_prints_state_claim_notes_and_result_without_writing(self):
         iid = self.add('--type', 'research')
         self.do(CLAUDE, 'take', iid)
+        self.agents = {'claude-session': {'sessionId': 'claude-session', 'kind': 'background', 'state': 'working', 'status': 'busy', 'pid': 3}}
+        self.assertIn('worker: busy', self.do(COORDINATOR, 'view', iid))  # #249: liveness, once runtime-status
         self.do(CLAUDE, 'result', iid, '--checks', 'c', '--text', 'done here')
         before = json.dumps(self.gitlab.issues)
         out = self.do(COORDINATOR, 'view', iid)
@@ -2747,20 +2335,6 @@ class Doctor(unittest.TestCase):
         with patch.object(q, 'git', lambda *args, **kwargs: '' if args[0] == 'ls-files' else self.origin if args[:2] == ('remote', 'get-url') else None):
             self.assertIn('git rm --cached -- taskq.local.toml', self.doctor()[1])
 
-    def test_task_trees_outside_dot_worktrees_are_named_with_the_move_command(self):
-        self.enterContext(patch.object(q, 'api', Gitlab()))
-        old, new = q.ROOT.parent / 'taskq-3', q.ROOT / '.worktrees/taskq-5'
-        listed = ''.join(f'worktree {tree}\nHEAD abc\n\n' for tree in (q.ROOT, old, new, q.ROOT / '.claude/worktrees/x'))
-        self.enterContext(patch.object(q, 'git', lambda *args, **kwargs: listed if args[:2] == ('worktree', 'list')
-                                       else self.origin if args[:2] == ('remote', 'get-url') else None))
-        code, out = self.doctor()
-        self.assertEqual(code, 1)
-        self.assertIn(f'task tree {old} is outside {q.ROOT / ".worktrees"}', out)
-        self.assertIn(f'cd {q.ROOT} && mkdir -p .worktrees && git worktree move {old} .worktrees/taskq-3', out)
-        self.assertNotIn('taskq-5', out)
-        self.assertNotIn('worktrees/x', out)
-        self.assertTrue(old.parent.exists() and not new.exists())  # doctor moves nothing
-
     def doctor(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             try:
@@ -2873,7 +2447,7 @@ class Doctor(unittest.TestCase):
             self.assertIn('not valid TOML', self.doctor()[1])
             self.assertEqual(os.listdir(tmp), ['taskq.toml'])
 
-    def test_github_scope_board_options_link_and_write_permission(self):
+    def test_github_write_permission_and_no_board_to_set_up(self):
         github = GithubRest()
         store = q.Github('owner/repo')
         store.run = github
@@ -2882,30 +2456,22 @@ class Doctor(unittest.TestCase):
         self.enterContext(patch.object(q, 'HOST', None))
         self.enterContext(patch.object(q, 'PROJECT_PATH', 'owner/repo'))
         self.origin = 'git@github.com:owner/repo.git'
-        github.scope, github.push = False, False
+        github.push = False
         code, out = self.doctor()
         self.assertEqual(code, 1)
-        self.assertIn('gh auth refresh -h github.com -s project', out)
         self.assertIn('cannot write to owner/repo', out)
         self.assertEqual([call for call in github.calls if call[0] != 'GET' and call[1] != 'graphql'], [])
-        github.scope, github.push = True, True
-        store.board = None
-        self.assertIn('no Projects v2 board taskq', self.doctor()[1])
+        github.push = True
+        self.assertIn('labels missing', self.doctor()[1])
         with contextlib.redirect_stdout(io.StringIO()):
             q.main(['init'])
-        store.board = None
         self.assertEqual(self.doctor()[0], 0)
-        github.projects[0]['options'] = github.projects[0]['options'][:2]
-        store.board, mutations = None, len(github.mutations)
-        code, out = self.doctor()
-        self.assertIn("Status options are ['ready', 'waiting']", out)
-        self.assertEqual(github.mutations[mutations:], [])
 
 
 class Setup(unittest.TestCase):
     """`doctor --fix`: what a command can do is done once and `ok` on a rerun; the person's steps are printed, not run."""
     GLOBALS = ('PROJECT', 'PROJECT_PATH', 'HOST', 'STORE', 'BOARD', 'BOARDS', 'AREAS', 'ROOT', 'TICK_BEAT', 'WORKER', 'RULES',
-               'CODEX_PROJECT', 'CODEX_SECTION', 'CODEX_WRITABLE', 'WORKSPACE', 'RETIRE', 'HELPERS', 'LOCAL', 'SHARED')
+               'CODEX_WRITABLE', 'WORKSPACE', 'RETIRE', 'HELPERS', 'LOCAL', 'SHARED')
 
     def setUp(self):
         for name in self.GLOBALS:  # `configure` sets them from the new taskq.toml
@@ -3059,28 +2625,21 @@ class Setup(unittest.TestCase):
         self.assertNotIn('\nready:', out)
         self.assertIn('No workers or timer started', out)
 
-    def test_github_without_project_scope_is_labels_only_until_refresh(self):
+    def test_github_init_makes_labels_once_and_needs_no_board_scope(self):
         github = GithubRest()
         store = q.Github('owner/repo')
         store.run = github
         self.enterContext(patch.object(q, 'api', store))
         self.origin = 'https://github.com/owner/repo.git'
         self.trust_and_permissions()
-        github.scope = False
-        code, out = self.fix()
-        self.assertEqual(code, 1)
-        self.assertIn('wrote taskq.toml for owner/repo', out)
-        self.assertNotIn('host', (self.tmp / 'taskq.toml').read_text())
-        self.assertIn('done: labels\n', out)
-        self.assertIn('you: gh auth refresh -h github.com -s project', out)
-        self.assertIn('q-ready', github.labels)
-        github.scope, store.board = True, None
         code, out = self.fix()
         self.assertEqual(code, 0, out)
+        self.assertIn('wrote taskq.toml for owner/repo', out)
+        self.assertNotIn('host', (self.tmp / 'taskq.toml').read_text())
         self.assertIn('done: labels and board', out)
-        store.board, mutations = None, len(github.mutations)
+        self.assertIn('q-ready', github.labels)
         code, out = self.fix()
-        self.assertEqual((code, github.mutations[mutations:]), (0, []))
+        self.assertEqual(code, 0, out)
         self.assertIn('ok: labels and board', out)
 
     def test_origin_of_another_project_changes_nothing(self):
@@ -3365,13 +2924,13 @@ class Cleanup(unittest.TestCase):
         self.git('init', '-q', '--bare', str(self.remote))
         self.git('remote', 'add', 'origin', str(self.remote))
         self.git('push', '-q', '-u', 'origin', 'main')
-        self.issues, self.app, self.threads, self.agents = {}, {}, {}, {}
+        self.issues, self.threads, self.agents = {}, {}, {}
         self.holding = lambda path: patch.object(cleanup, 'process_cwds', lambda: [(9876, str(path))])
         self.before_cwd = Path.cwd()
         os.chdir(self.root)
         self.addCleanup(os.chdir, self.before_cwd)
         # Explicit patches keep app and issue reads outside these disposable Git fixtures.
-        for target, name, value in ((cleanup, 'cleanup_issues', lambda: self.issues), (q, 'claude_sessions', lambda: self.app),
+        for target, name, value in ((cleanup, 'cleanup_issues', lambda: self.issues),
                                     (q, 'claude_agents', lambda **kwargs: self.agents),
                                       (worker, 'claude_agents', lambda **kwargs: self.agents),
                                     (cleanup, 'cleanup_codex', lambda roots: self.threads),
@@ -3543,21 +3102,10 @@ class Cleanup(unittest.TestCase):
         for sid, status in (('done', 'idle'), ('unknown', 'idle'), ('unverified', 'idle'), ('codex-session', 'idle'), ('error', 'systemError')):
             self.threads[sid] = {'id': sid, 'name': f'T{1 if sid == "done" else 3} worker',
                                  'cwd': str(self.root), 'status': {'type': status}}
-        old = (time.time() - q.STALE_MINUTES * 60 - 60) * 1000
-        spawned = {'adoptedFromOtherSurface': True, 'cwd': str(self.root), 'lastActivityAt': old, 'name': 'T2 worker'}
-        self.app = {'claude-done': {'sessionId': 'local_claude-done', **spawned},
-                    'unknown-child': {'sessionId': 'local_unknown-child', **spawned},
-                    'fresh-child': {'sessionId': 'local_fresh-child', **spawned, 'lastActivityAt': time.time() * 1000},
-                    'archived-child': {'sessionId': 'local_archived-child', **spawned, 'isArchived': True},
-                    'owner-chat': {'sessionId': 'local_other-id', 'cwd': str(self.root), 'lastActivityAt': old}}
         archived = []
         with patch.object(q, 'codex_archive', lambda args: archived.append(args.thread)):
             report = self.run_cleanup(True)
         self.assertEqual(archived, ['done'])
-        self.assertIn('coordinator: archive_session local_claude-done', report)
-        self.assertIn('Claude session local_unknown-child: worker without a proven', report)
-        for sid in ('fresh-child', 'archived-child', 'owner-chat', 'other-id'):
-            self.assertNotIn(sid, report)
         self.assertIn('Codex session unknown', report.split('# Ask the owner')[1])
         self.assertIn('Codex session unverified', report.split('# Ask the owner')[1])
         self.assertIn('codex-archive unknown', report)
@@ -3680,16 +3228,6 @@ class Cleanup(unittest.TestCase):
                 self.assertTrue(tree.exists())
             self.assertFalse(eligible.exists())
         self.assertIn('refs/heads/taskq-804', self.git('ls-remote', '--heads', 'origin'))
-
-    def test_spawned_detached_worker_tree_is_eligible(self):
-        tree = self.tree('foreign-worker')
-        self.git('checkout', '--detach', cwd=tree)
-        self.app['spawned'] = {'cwd': str(tree), 'adoptedFromOtherSurface': True,
-                               'sessionId': 'local_spawned', 'isArchived': True}
-        self.run_cleanup(True)
-        self.assertFalse(tree.exists())
-        self.assertIn('foreign-worker', self.git('branch'))
-
 
 if __name__ == '__main__':
     unittest.main()

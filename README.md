@@ -72,16 +72,14 @@ GitHub:
 gh auth status --hostname <host>
 # If not authenticated:
 gh auth login --hostname <host>
-# If project scope is missing:
-gh auth refresh -h <host> -s project
 ```
 
 ```bash
 taskq init --github <owner/repo> --host <host>
 ```
 
-Keep existing config. The board is the Projects v2 project linked to the repository and named after it
-(`[github] board` overrides the name); init creates it once, manages Status and disables its built-in workflows.
+Keep existing config. The board is the repository's issue list filtered by the `q-*` labels: init makes the
+labels and prints its link.
 GitHub needs a pushed commit before claiming tasks. For an empty repository:
 
 ```bash

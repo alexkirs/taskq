@@ -44,7 +44,7 @@ class Selftest:
     def records(self):
         """Every run's record but this one's, as (path, data, alive): a live run's tasks are not leftovers."""
         found = []
-        for path in sorted(self.record.parent.glob('last*.json')):  # last.json: a record from before pids
+        for path in sorted(self.record.parent.glob('last-*.json')):
             if path != self.record:
                 data = json.loads(path.read_text())
                 found.append((path, data, alive(data.get('pid'))))
@@ -186,13 +186,8 @@ class Selftest:
             raise SelftestError(f'tick names #{iid} under Board mismatch')
         return f'tick prints {needles[0]}'
 
-    def unlocked(self, iid):
-        if core.locks(iid):
-            raise SelftestError(f'#{iid} keeps its lock after release')
-        return f'#{iid} ready, lock removed'
-
     def race(self, runtime):
-        """Two worker processes take one task at the same moment: GitLab's lock lets exactly one through."""
+        """Two worker processes take one task at the same moment: the order of their `take` notes lets exactly one through."""
         iid = self.add('race', runtime)
         sessions = [f'{core.SELFTEST}-{self.stamp}-{name}' for name in 'bc']
         done = selftest_run([(core.selftest_env(runtime, session, self.extra), ('take', iid)) for session in sessions])
@@ -275,9 +270,8 @@ class Selftest:
 
         def again(action):
             self.owner(action, iid, '--text', f'selftest {action}')
-            unlocked = self.unlocked(iid) if action == 'release' else ''
             send()
-            return '; '.join(filter(None, (unlocked, until('review', 'result'))))
+            return until('review', 'result')
 
         self.chain()
         self.step('add', runtime, add)
@@ -318,8 +312,6 @@ class Selftest:
         def issues_gone():
             closed = []
             for iid in created:
-                if core.locks(iid):
-                    core.unlock(iid)  # first: the GitHub lock ref outlives its issue
                 try:
                     core.api('DELETE', f'issues/{iid}')
                 except SystemExit as error:
@@ -331,9 +323,6 @@ class Selftest:
             left = [issue['iid'] for issue in core.issues(f'state=opened&labels={core.SELFTEST}') if issue['iid'] not in busy]
             if left:
                 raise SelftestError(f'open selftest issues remain: {left}')
-            locked = [iid for iid in created if core.locks(iid)]
-            if locked:
-                raise SelftestError(f'lock refs of selftest issues remain: {locked}')
             return f'deleted {sorted(set(created) - set(closed))}' + (f', closed (no right to delete) {closed}' if closed else '')
 
         def worktrees():

@@ -307,7 +307,8 @@ class Acting(unittest.TestCase):
         self.machine = 'ab' * 16
         (self.dir / 'taskq' / 'machine-id').write_text(self.machine + '\n')
         self.enterContext(patch.dict(os.environ, {'XDG_STATE_HOME': str(self.dir), 'TASKQ_FIXTURE': str(self.dir), 'TASKQ_HOST': 'fixture-host',
-                                                  'CLAUDE_CODE_SESSION_ID': 'coordinator', 'CODEX_THREAD_ID': ''}))
+                                                  'CLAUDE_CODE_SESSION_ID': 'coordinator', 'CODEX_THREAD_ID': '',
+                                                  'CODEX_HOME': str(self.dir / 'codex-home')}))
         self.enterContext(patch.object(core, 'UPDATE_STAMP', self.dir / 'taskq' / 'update-last'))
         # In-process enrollment reads back through the fixture's subprocesses, never a real tracker.
         self.enterContext(patch.multiple(multiproject, OCCUPANCY=ACT + ['occupancy', '--occupancy'], CHECK=CHECK, ACTOR=ACTOR,
@@ -502,6 +503,50 @@ class Acting(unittest.TestCase):
         (self.dir / 'acme_beta.pickle').write_bytes(clean)
         self.assertEqual(self.act([self.alpha], policy)['projects'][0]['status'], 'blocked')  # known again: the pass runs
         self.assertEqual(len(self.calls('native')), 1)
+
+    def test_claims_and_reservations_of_unknown_locality_refuse_and_known_remote_is_excluded(self):
+        self.alpha = self.project('alpha2', 33, tasks=[(1,), (2,)])
+        policy = self.catalog(self.alpha, {**self.beta, 'limits': {'claude': 0}})  # beta starts nobody: occupancy stays the fixture's
+        before, clean = self.anchor.read_bytes(), (self.dir / 'acme_alpha2.pickle').read_bytes()
+        nameless = {'runtime': 'claude', 'session': 'unproven-host-session'}
+
+        def retain(state, **block):
+            (self.dir / 'acme_alpha2.pickle').write_bytes(clean)
+            store = self.store('alpha2')
+            store.issues[1]['labels'] = [f'q-{state}', 'code', 'run-claude']
+            (self.dir / 'acme_alpha2.pickle').write_bytes(pickle.dumps(store))
+            self.edit('alpha2', 1, **block)
+        cases = [(state, {'claim': nameless}) for state in ('review', 'ask', 'ready', 'doing')] + [
+            ('doing', {'claim': {**nameless, 'node': 'xyz'}}), ('doing', {'claim': {**nameless, 'node': 5}}),
+            ('review', {'claim': {**nameless, 'host': ''}}),
+            ('ready', {'reservation': {'attempt': 'n0de', 'runtime': 'claude', 'principal': 1, 'pid': 7}})]
+        for state, block in cases:
+            retain(state, **block)
+            described = self.store('alpha2').issues[1]['description']
+            found = self.act([self.beta], policy)['projects'][0]
+            self.assertEqual(found['status'], 'refused', block)
+            self.assertIn('without a proven machine', found['errors'][0])
+            self.assertEqual(found['catalog'][0]['L'], {'claude': 0, 'codex': 0})  # exactly native room: nothing local proven
+            refused = multiproject.accept(self.catalog(self.beta, enroll=False, file='candidate.toml'), CHECK)
+            self.assertIn('alpha2: ownership unknown', ' '.join(refused['errors']), block)
+            self.assertEqual((self.anchor.read_bytes(), self.store('alpha2').issues[1]['description']), (before, described))
+        self.assertEqual((self.calls('native'), self.mutations('alpha2')), ([], []))
+        # No node, but the Claude app imported the session here: native evidence of a local claim, a held place.
+        app = self.dir / 'app-sessions' / 'account' / 'org'
+        app.mkdir(parents=True)
+        (app / 'local_unproven-host-session.json').write_text('{}')
+        retain('review', claim=nameless)
+        found = self.act([self.beta], policy)['projects'][0]
+        self.assertEqual((found['status'], found['budget']['claude']['occupancy']), ('ok', 7))
+        refused = multiproject.accept(self.catalog(self.beta, enroll=False, file='candidate.toml'), CHECK)
+        self.assertIn('https://gitlab.example/acme/alpha2: still owns session:unproven-host-session', refused['errors'])
+        self.assertEqual(self.anchor.read_bytes(), before)
+        # A well-formed node of another machine is that machine's to settle: excluded, not counted.
+        retain('doing', claim={**nameless, 'node': '0' * 12})
+        found = self.act([self.beta], policy)['projects'][0]
+        self.assertEqual((found['status'], found['budget']['claude']['occupancy'], found['catalog'][0]['L']), ('ok', 6, {'claude': 0, 'codex': 0}))
+        replaced = multiproject.accept(self.catalog(self.beta, enroll=False, file='candidate.toml'), CHECK)
+        self.assertEqual((replaced['status'], replaced['generation']), ('replaced', 2))
 
     def test_malformed_readback_is_unknown_and_refuses_before_native_pass(self):
         policy = self.catalog(self.alpha)
@@ -785,6 +830,7 @@ def act_child():
     import test_taskq as base
     role, fixture = sys.argv[2], Path(os.environ['TASKQ_FIXTURE'])
     core.machine_id, core.MEMBERS, core.CODEX_SOCKET = base.REAL_MACHINE_ID, None, fixture / 'no-codex.sock'
+    core.CLAUDE_APP_SESSIONS = fixture / 'app-sessions'  # local app evidence of a claim: the fixture's, never the host's
     agents = fixture / 'agents.json'
 
     def write(*row):

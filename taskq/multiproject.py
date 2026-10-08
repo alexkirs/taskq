@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -433,6 +434,17 @@ def codex_inventory(threads):
     return found
 
 
+def locality(owner):
+    """Where a claim or reservation lives: 'local', 'remote' (a well-formed node or pre-#39 host of another
+    machine) or None, unknown: a malformed node or host, or neither and no local app evidence (`local_claim`)."""
+    node, host = owner.get('node'), owner.get('host')
+    if node is not None:
+        return None if not isinstance(node, str) or not re.fullmatch(r'[0-9a-f]{12}', node) else 'local' if core.local_node(node) else 'remote'
+    if host is not None:
+        return None if not isinstance(host, str) or not host else 'local' if host == socket.gethostname() else 'remote'
+    return 'local' if core.local_claim(owner) else None
+
+
 def occupancy(entry):
     """One catalog binding's same-host ownership, read only, from #208's evidence: `L`, exactly what native `room`
     subtracts; each proven claim (any state) and reservation as (runtimes, identity); everything unproven as uncertain."""
@@ -444,13 +456,21 @@ def occupancy(entry):
     held, uncertain = [], []  # known grants (runtimes, identity); ownership without proof, which refuses acting
     for item in everything:
         claim, found, task = item['claim'] or {}, item.get('reservation') or {}, f'{where}#{item["iid"]}'
-        # Any state: a review, ask or later claim still names its worker; an empty inventory never settles it.
-        if claim and core.local_claim(claim):
+        # Any state: a review, ask, ready or later claim still names its worker; an empty inventory never settles it.
+        # A released claim ({'runtime': None, 'session': None}) owns nothing.
+        place = locality(claim) if any(value is not None for value in claim.values()) else 'none'
+        if place is None:
+            uncertain.append(f'{task}: claim of session {claim.get("session")!r} without a proven machine (node {claim.get("node")!r}, '
+                             f'host {claim.get("host")!r})')
+        elif place == 'local':
             if claim.get('runtime') in CAPS and isinstance(claim.get('session'), str) and claim['session']:
                 held.append(([claim['runtime']], f'session:{claim["session"]}'))
             else:
                 uncertain.append(f'{task}: same-host claim of runtime {claim.get("runtime")!r}, session {claim.get("session")!r}')
-        if core.reserved_here(item):
+        place = locality(found) if item.get('reservation') is not None else 'none'
+        if place is None:
+            uncertain.append(f'{task}: reservation {found.get("attempt") if isinstance(found, dict) else found!r} without a proven machine')
+        elif place == 'local':
             session = worker.launch_session(item['iid'], found.get('attempt') or '')
             if found.get('runtime') not in CAPS or found.get('principal') != entry['principal'] or not (session or found.get('pid')):
                 uncertain.append(f'{task}: reservation {found.get("attempt")!r} of runtime {found.get("runtime")!r}, principal '
@@ -751,7 +771,7 @@ def act_project(spec):
         reads = [checked_read(read_occupancy(other, errors)) for other, errors in catalog]
         own = next(read for (other, _), read in zip(catalog, reads) if other is binding)
         result['catalog'] = [{'repository': project_result(other, errors)['repository'], 'status': read['status'],
-                              'errors': read.get('errors', [])} for (other, errors), read in zip(catalog, reads)]
+                              'errors': read.get('errors', []), 'L': read.get('L')} for (other, errors), read in zip(catalog, reads)]
         # Unknown ownership or an unreadable inventory the project touches refuses before native_pass: its zero
         # limits would still let the pass release, move and reconcile.
         if unread := [f'{found["repository"]}: {found["status"]} ({"; ".join(found["errors"])})' for found in result['catalog'] if found['status'] != 'ok']:

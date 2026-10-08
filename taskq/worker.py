@@ -335,6 +335,7 @@ def releases(iid):
 def close(args):
     issue = core.api('GET', f'issues/{args.iid}')
     if issue['state'] != 'opened':
+        recover_closed(issue)
         print(f'#{args.iid} already closed')
         return
     current = core.task(args.iid, ('review',))
@@ -356,12 +357,46 @@ def close(args):
     current = core.unchanged(current)
     if not current:
         return
-    core.save(current, close=True, note_action='close', note_text=args.text)
+    receipt = json.dumps({'claim': current['claim'], 'result': current['result']}, sort_keys=True)
+    core.save(current, close=True, note_action='close', note_text=f'{args.text}\n\nTaskQ receipt: `{receipt}`')
     core.unlock(args.iid)
     print(f'#{args.iid} closed')
     if current['type'] in ('code', 'docs'):
         # Author, date and subject show whether the commit is this task's.
         subprocess.run(['git', 'log', '-1', '--format=%h %an %ad %s', sha], check=False)
+    retire_local(current)
+
+
+def recover_closed(issue):
+    """Retry only a close receipt that still names this exact local, published result."""
+    labels = [label for label in issue['labels'] if not label.startswith(core.PREFIX)] + [core.PREFIX + core.STATES[0]]
+    current = core.parse({**issue, 'labels': labels})
+    if not current or current['type'] not in ('code', 'docs') or not current.get('result'):
+        return
+    receipt = next((body.rsplit('`', 2)[1] for body in reversed(core.notes(core.comments(current['iid'])))
+                    if body.startswith('**close**') and '\n\nTaskQ receipt: `' in body), None)
+    try:
+        receipt = json.loads(receipt)
+    except (TypeError, ValueError):
+        return
+    if receipt != {'claim': current['claim'], 'result': current['result']} or not core.local_claim(current['claim'] or {}):
+        return
+    try:
+        sha = core.commit(current['result']['sha'])
+        subprocess.run(['git', 'fetch', '-q', 'origin', 'main'], check=True)
+    except (argparse.ArgumentTypeError, subprocess.CalledProcessError):
+        return
+    if subprocess.run(['git', 'merge-base', '--is-ancestor', sha, 'origin/main']).returncode:
+        return
+    session, runtime = current['claim'].get('session'), current['claim'].get('runtime')
+    if runtime == 'claude':
+        agents = claude_agents(strict=True)
+        if agents is None or session in agents:
+            return
+    elif runtime == 'codex' and not core.codex_is_archived(session):
+        return
+    else:
+        return
     retire_local(current)
 
 

@@ -142,6 +142,16 @@ class Review(unittest.TestCase):
         self.do(COORDINATOR, 'close', iid, '--text', 'retry')
         self.assertEqual(self.main_head(), before)
 
+    def test_closed_retry_recovers_only_the_receipted_ended_local_claim(self):
+        iid, _, _ = self.candidate()
+        with patch.object(worker, 'retire_local', side_effect=RuntimeError('interrupted')):
+            with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                self.do(COORDINATOR, 'close', iid, '--text', 'accepted')
+        self.assertEqual(self.gitlab.issues[iid]['state'], 'closed')
+        with patch.object(worker, 'retire_local') as retire:
+            self.do(COORDINATOR, 'close', iid, '--text', 'restart')
+        retire.assert_called_once()
+
     def test_missing_published_branch_keeps_review_evidence(self):
         iid, _, sha = self.candidate()
         self.git('merge', '--ff-only', sha)

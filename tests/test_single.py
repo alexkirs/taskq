@@ -977,10 +977,12 @@ class RealChild(unittest.TestCase):
         done = REAL_RUN([taskq.sys.executable, str(ROOT / 'taskq.py'), 'add', 'T', '--goal', 'g', '--acceptance', 'a'],
                         cwd=root, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual((done.returncode, done.stdout), (0, '#1 ready\n'), done.stderr)
-        end = taskq.time.time() + 20
-        while not (root / 'spawned').exists() and taskq.time.time() < end:
+        path, end = root / '.taskq' / 'dispatch.log', taskq.time.time() + 20
+        while taskq.time.time() < end:  # #500: the child writes 'spawned' before it logs '#1 doing': wait for both
+            log = path.read_text() if path.exists() else ''
+            if (root / 'spawned').exists() and '#1 doing\n' in log:
+                break
             taskq.time.sleep(0.1)
-        log = (root / '.taskq' / 'dispatch.log').read_text()
         self.assertEqual((root / 'spawned').read_text() if (root / 'spawned').exists() else None, 'T1 UNK T (mac)', log)
         self.assertRegex(log, r'^\S+ \S+ add #1\n#1 doing\n')
 

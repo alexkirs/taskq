@@ -416,7 +416,9 @@ def inbox_line(inbox):
     return f'Inbox: {len(inbox)} issues by non-collaborators ({", ".join(map(core.ref, sorted(inbox, key=lambda issue: issue["iid"])))})\n\n' if inbox else ''
 
 
-NUDGE = 'Continue the assigned task; hand in result or ask the owner through taskq.'
+# #240: a resumed worker continues its own claim; `taskq worker` gives such a session its own task's brief.
+NUDGE = ('Continue the task you claimed (taskq worker prints its brief); do not take another task; '
+         'hand in result or ask the owner through taskq.')
 # #42: the launchd timer's turn of the coordinator session, before the tick's output.
 WAKE_PROMPT = ('taskq tick --act (the launchd timer) found what needs judgement; it already did the mechanical steps '
                '(spawn, retire, nudges). Do the coordinator pass by taskq-manager.md § 3 on the output below; do not run '
@@ -475,6 +477,17 @@ def starts(args, loaded, selected):
     free, start = core.room(loaded[0], args.profile['limits']), []
     preferred = args.profile['preferred_runtime']
     ready = [item for item in core.startable(loaded=loaded) if item['iid'] in selected]
+    # #240: a supervised task's worker is launched by its supervisor only; this tick names it and starts nothing.
+    for item in ready:
+        if item.get('supervisor'):
+            print(f'{core.ref(item)}: supervised by {core.short(item["supervisor"])}; that session launches its worker, not this tick.')
+    ready = [item for item in ready if not item.get('supervisor')]
+    held = {(claim.get('runtime'), claim.get('session')) for item in loaded[0] if item['state'] == 'doing' and (claim := item['claim'] or {})}
+    supervisors = {(found['runtime'], found['session']) for item in loaded[0] if (found := item.get('supervisor'))} - held
+    if supervisors:
+        runtimes = [runtime for runtime, _ in supervisors]
+        print('Supervisors on open tasks: ' + ', '.join(f'{name} {runtimes.count(name)}' for name in sorted(set(runtimes)))
+              + ' (from task metadata; their place in the global caps is the central\'s accounting, not counted or enforced here).')
     # #185: a worker spawned by an earlier pass that has not taken its task yet (a manual TICK, a restart) is not
     # spawned again, and holds its runtime's place like a claim. An unreadable inventory holds what it could hide.
     agents, codex = (core.claude_agents(strict=True), codex_workers()) if ready else ({}, [])

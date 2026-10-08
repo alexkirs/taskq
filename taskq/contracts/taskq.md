@@ -49,7 +49,8 @@ and separate worker/manager permissions to enforce review before publication.
 | Machine | Label `host-<name>` (`add --host win`): only a worker on that machine takes it; without one, the machine whose worker takes it first. A machine's name: `TASKQ_HOST`, else `[hosts]` of taskq.toml (`"DESKTOP-7" = "win"`), else the hostname up to the first dot |
 | Type | Label `code`, `docs`, `research` or `asset` |
 | Priority | Label `priority-1` or `priority-2` |
-| Other data | JSON block in the issue description: `scope`, `deps`, `claim`, `waiting_for` (reason for `later`), `result` — only what a label cannot express |
+| Other data | JSON block in the issue description: `scope`, `deps`, `claim`, `waiting_for` (reason for `later`), `result` — only what a label cannot express; `reservation` (#208) and `supervisor` (#240) only while set |
+| Supervisor (#240) | Block `supervisor` = `{"runtime", "session"}`: the one session that launches and steers the task's worker (§ Four roles) |
 | Goal and acceptance | Issue description text |
 | History | Issue notes: every taskq note starts with `**action** · app:session` (`take`, `beat`, `ask`, `shown`, `result`, `answer`, `reject`, `release`, `close`, `later`, `waiting`, `ready`, `deps`, `runtime`, `problem`) |
 | Task lock | Award emoji `lock` on the task's issue; on GitHub the ref `refs/taskq/lock/<N>` (§ Taking a task) |
@@ -239,9 +240,28 @@ board»; `ready`↔`waiting` goes back silently; any other move goes back to the
   issue. If it is bigger, split it into several issues in one milestone and link them with `deps`. A checklist
   in the description is fine for acceptance steps.
 
-## Three roles
+## Four roles
 
-A role is what a session is doing right now. There is no role owner and no role handover.
+A role is what a session is doing right now. A task without a `supervisor` keeps the three roles below
+unchanged (legacy). A supervised task adds the fourth (#240): one canonical task, one supervisor, one worker,
+one session.
+
+- **Supervisor** — the session named in the task's block `supervisor`. Only it launches the task's worker
+  (`spawn`; `reserve` refuses any other session, `tick` names the task instead of starting it), and only it
+  or the owner decides from outside the worker (`answer`, `reject`, `later`, `release`). It never takes or
+  `close`s its own task: the coordinator's publication lane closes after review. `take` accepts only the worker
+  adopting the supervisor's reservation, or the worker of the supervisor's newest `launch` note (the same
+  worker after a queue answer). Global capacity of supervisor sessions (Claude 2, Codex 6) is the central's
+  accounting; `tick` prints a count, not an admission rule.
+- **Assignment and handoff**: `taskq edit N --supervisor RUNTIME:SESSION` from the owner's shell (no session
+  identity) assigns, changes or clears (`''`); the current supervisor may only name its successor. The `edit`
+  note records it; `view` prints the supervisor and whether it has acted since (a `reserve`, `answer`, `reject`
+  or `release` by it). This is cooperative tracker authority, like claims: session identities are
+  self-declared, so it is no proof that a command came from a root PM session.
+- **Continuation**: a session holding a `doing` claim gets that task's brief from `taskq worker`, never a fresh
+  task; the tick's nudge says so.
+- **Migration**: a taskq older than #240 drops `supervisor` when it writes the task. Update every machine
+  (`taskq update`) before the first assignment.
 
 - **Manager** — the session the owner talks to. Creates tasks (`add`), relays the owner's
   answers (`answer`), shows the queue (`list`).

@@ -112,14 +112,89 @@ def edit(args):
         changes['deps'], notes = args.deps, notes + [f'deps {current["deps"]} → {args.deps}']
     if args.scope is not None:
         changes['scope'], notes = args.scope, notes + [f'scope {current["scope"]} → {args.scope}']
+    if args.supervisor is not None and (found := supervisor_change(current, args.supervisor)) != current.get('supervisor'):
+        changes['supervisor'] = found
+        notes.append(f'supervisor {identity(current.get("supervisor"))} → {identity(found)}')
     if changes:
         core.save(current, note_action='edit', note_text='; '.join(notes), **changes)
     print(f'#{args.iid} edited')
 
 
+def identity(found):
+    return f'{found["runtime"]}:{found["session"]}' if found else 'none'
+
+
+def supervisor_change(current, value):
+    """#240: the supervisor `edit --supervisor` may write. Cooperative tracker authority, the same boundary as claims:
+    a session identity is self-declared, so this is no proof of a root PM session. The owner's shell (no session)
+    assigns, hands off or clears ('' or none); the current supervisor only names its successor; no other session."""
+    found = None
+    if value not in ('', 'none'):
+        runtime, _, session = value.partition(':')
+        if runtime not in (*core.RUNTIMES, *core.EXECUTORS) or not session:
+            core.fail(f'--supervisor: write RUNTIME:SESSION with the full session id, RUNTIME one of {", ".join((*core.RUNTIMES, *core.EXECUTORS))}')
+        found = {'runtime': runtime, 'session': session}
+    old = current.get('supervisor')
+    if core.session() is not None and not (found and core.is_caller(old)):
+        core.fail(f'#{current["iid"]}: only the owner\'s shell assigns or clears a supervisor; '
+                  'the current supervisor may only hand off to a successor')
+    claim = current['claim'] or {}
+    if found and (claim.get('runtime'), claim.get('session')) == (found['runtime'], found['session']):
+        core.fail(f'#{current["iid"]}: the supervisor cannot be the claim session')
+    return found
+
+
+def outsider(current):
+    """#240: a decision on a supervised task from a session other than its claim: only its supervisor or the owner."""
+    found = current.get('supervisor')
+    if found and core.session() is not None and not core.is_caller(found):
+        core.fail(f'#{current["iid"]} is supervised by {core.short(found)}: only that session or the owner decides')
+
+
+def supervision(current, mine):
+    """#240: why session `mine` cannot take supervised `current`, or None. Allowed: the worker adopting a reservation
+    of its supervisor, or the worker of the supervisor's newest launch (the same worker after a queue answer)."""
+    found = current.get('supervisor')
+    if not found:
+        return None
+    if (mine['runtime'], mine['session']) == (found['runtime'], found['session']):
+        return 'its supervisor does not take it'
+    reservation = current['state'] == 'ready' and current.get('reservation')
+    if reservation:
+        return None if reservation.get('coordinator') == core.short(found) else \
+            f'reserved by {reservation.get("coordinator")}, not by its supervisor {core.short(found)}'
+    return None if supervised_worker(current['iid'], found) == mine['session'] else \
+        f'supervised by {core.short(found)}: only the worker it launched takes it'
+
+
+def supervised_worker(iid, found):
+    """The session of the newest `launch` note of an attempt that supervisor `found` reserved, or None."""
+    attempts, session, who = set(), None, core.short(found)
+    for body in core.notes(core.comments(iid)):
+        head, _, text = body.partition('\n\n')
+        if head == f'**reserve** · {who}' and (match := re.match(r'Attempt (\w+):', text)):
+            attempts.add(match[1])
+        elif head.startswith('**launch**') and (match := re.match(r'Attempt (\w+) launched session (\S+)$', text)) and match[1] in attempts:
+            session = match[2]
+    return session
+
+
+def acknowledged(iid, found):
+    """Whether supervisor `found` acted since its assignment: a reserve, answer, reject or release by that session."""
+    done = False
+    for body in core.notes(core.comments(iid)):
+        head, _, text = body.partition('\n\n')
+        if head.startswith('**edit**') and f'→ {identity(found)}' in text:
+            done = False
+        elif head in (f'**{action}** · {core.short(found)}' for action in ('reserve', 'answer', 'reject', 'release')):
+            done = True
+    return done
+
+
 def later(args):
     """The owner defers a task; nobody waits on anything. Back with `answer` or by hand to ready."""
     current = core.task(args.iid, ('ready', 'waiting', 'ask'))
+    outsider(current)
     core.save(current, 'later', 'later', args.text, waiting_for=args.text)
 
 
@@ -181,6 +256,12 @@ def worker(args):
     loaded, candidates = core.profile(args)
     mine = core.me()
     runtime = mine['runtime']
+    # #240: a session that holds a doing claim here continues that task; it never selects fresh work.
+    own = [item for item in loaded[0] if item['state'] == 'doing' and core.local_claim(item['claim'] or {})
+           and ((item['claim'] or {}).get('runtime'), (item['claim'] or {}).get('session')) == (runtime, mine['session'])]
+    if own:
+        return print(f'No task can start now for this session: it holds #{own[0]["iid"]} (doing, your claim). '
+                     f'Continue that task; do not take another. Its brief:\n\n{brief(own[0])}')
     free = core.room(loaded[0], args.profile['limits'])
     # #208: the worker a coordinator launched for a reserved task gets that task; its place is already counted.
     found = [item for item in loaded[0] if item['state'] == 'ready' and item.get('reservation') and adopts(item, mine)] or [
@@ -204,7 +285,8 @@ def take(args):
         return current, (f'state is {current["state"]}' if current['state'] != 'ready' else
                          (core.refusal(current, everything, open_iids) if reserved and not adopts(current, mine) else None)
                          or core.refusal({**current, 'reservation': None}, everything, open_iids, mine['runtime'])
-                         or core.sandbox_refusal(current, mine['runtime']) or delegation(current, uid))
+                         or core.sandbox_refusal(current, mine['runtime']) or delegation(current, uid)
+                         or supervision(current, mine))
     current, reason = read()
     claim = current['claim'] or {}
     if current['state'] == 'doing' and (claim.get('runtime'), claim.get('session')) == (mine['runtime'], mine['session']):
@@ -299,6 +381,8 @@ def requeue(args):
         # place was free while the task waited, so the limit is not checked: the worker never left.
         core.save(current, 'doing', args.action, args.text, waiting_for=None, result=None)
         return print(f'#{args.iid} is doing again with your claim: continue in this session')
+    if getattr(args, 'function', None) is requeue:
+        outsider(current)  # the tick's dead/stalled release (its own command) keeps its evidence path
     before = args.action == 'release' and releases(args.iid)
     if current.get('reservation'):
         # #208: only the reserving user releases, and only the attempt it read: the last read before the write.
@@ -339,6 +423,8 @@ def close(args):
         print(f'#{args.iid} already closed')
         return
     current = core.task(args.iid, ('review',))
+    if core.is_caller(current.get('supervisor')):
+        core.fail(f'#{args.iid}: its supervisor does not close it; the publication lane closes after review')
     if current['type'] in ('code', 'docs'):
         try:
             sha = core.commit(current['result']['sha'])
@@ -580,6 +666,8 @@ def admission(iid, runtime, uid, limits):
     current = next((item for item in everything if item['iid'] == iid), None) or core.fail(f'#{iid} is not an open taskq task')
     return current, (f'state is {current["state"]}' if current['state'] != 'ready' else
                      core.refusal(current, everything, open_iids, runtime) or delegation(current, uid)
+                     or (current.get('supervisor') and not core.is_caller(current['supervisor'])
+                         and f'supervised by {core.short(current["supervisor"])}: only that session launches its worker')
                      or (f'no Codex app server on this machine ({core.CODEX_SOCKET})' if runtime == 'codex' and not core.CODEX_SOCKET.exists() else None)
                      or (f'no free {runtime} place on this machine' if core.room(everything, limits).get(runtime, 0) <= 0 else None))
 
@@ -955,6 +1043,8 @@ def view(args):
     print(f'#{item["iid"]} {item["title"]}\nstate: ' + ('closed' if closed else item['state'])
           + f', p{item["priority"]}, runtime {item["runtime"] or "any"}, last change {core.age(item)} min ago')
     print('claim: ' + (f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]}{core.where(claim)}' if claim else 'none'))
+    if found := item.get('supervisor'):
+        print(f'supervisor: {core.short(found)} ({"acknowledged" if acknowledged(item["iid"], found) else "unacknowledged"})')
     found = core.notes(core.comments(item['iid']))
     for body in found[-args.notes:]:
         print('\n---\n' + body)

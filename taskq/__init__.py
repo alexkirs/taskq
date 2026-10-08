@@ -312,6 +312,17 @@ def who():
     return f'{current["runtime"]}:{current["session"][:8]}' if current else 'owner'
 
 
+def short(identity):
+    """`runtime:session8` of a claim or supervisor, the form `who()` writes into notes and reservations."""
+    return f'{identity["runtime"]}:{identity["session"][:8]}' if identity else 'none'
+
+
+def is_caller(identity):
+    """#240: whether this session is `identity` (a supervisor). The owner's shell has no session: never."""
+    current = session()
+    return bool(current and identity) and (current['runtime'], current['session']) == (identity['runtime'], identity['session'])
+
+
 def api(method, path, body=None):
     """The store protocol: GitLab's REST shape for what taskq uses — issues (`iid`, `description`, label names,
     `state` opened/closed, `assignees` with `id`), notes, labels, milestones, award emoji (the lock), label events,
@@ -464,10 +475,11 @@ def unchanged(item):
 
 def save(current, state=None, note_action=None, note_text='', close=False, add=(), remove=(), assignee_ids=None, **changes):
     """One PUT moves the labels and the block together; the note is the readable history."""
-    block = {key: current.get(key) for key in (*FIELDS, 'reservation')}
+    block = {key: current.get(key) for key in (*FIELDS, 'reservation', 'supervisor')}
     block.update(changes)
-    if block['reservation'] is None:
-        del block['reservation']  # #208: only a reserved task carries the key
+    for key in ('reservation', 'supervisor'):
+        if block[key] is None:
+            del block[key]  # #208, #240: only a reserved or supervised task carries the key
     add, remove = list(add), list(remove)
     if state and state != current['state']:
         add, remove = add + [PREFIX + state], remove + [PREFIX + current['state']]
@@ -899,7 +911,9 @@ def main(argv=None):
     text_input(command('close', close, iid))
     text_input(command('later', later, iid))
     command('edit', edit, iid, (('--deps',), {'nargs': '*', 'type': int}), (('--scope',), {'nargs': '*'}),
-            (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}))
+            (('--milestone',), {'help': 'milestone title (epic); empty string removes it'}),
+            (('--supervisor',), {'metavar': 'RUNTIME:SESSION', 'help': "#240: the one session that launches and steers this "
+                                 "task's worker; owner's shell assigns or clears (''), the current supervisor hands off"}))
     command('report-verify', verify_report, (('file',), {'help': 'supported-channel report readback JSON; no transport or receipt writes'}))
     command('tick', tick, json_flag, *profile_flags, (('--prompt-version',), {'type': int, 'metavar': 'N',
             'help': "the timer prompt's version (manager contract § 2); older ones are told to re-arm"}),

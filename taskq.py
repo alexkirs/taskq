@@ -14,7 +14,7 @@ PREFIX, RUN, ON = 'q-', 'run-', 'host-'
 BLOCK = re.compile(r'<!-- taskq:start -->\s*```json\n(.*?)\n```\s*<!-- taskq:end -->', re.S)
 SESSIONS = {'claude': 'CLAUDE_CODE_SESSION_ID', 'codex': 'CODEX_THREAD_ID'}
 CONFIG, BOARD = {}, None  # set by main, or by a test
-CHECK_POLLS, CHECK_PAUSE = 60, 10  # pr-mode close waits up to 10 min for the 'tests' check
+CHECK_POLLS, CHECK_PAUSE = 60, 10  # pr-mode close waits up to 10 min for the 'tests' check / the MR pipeline
 
 def fail(message):
     sys.exit(f'taskq: {message}')
@@ -430,7 +430,8 @@ def commit(sha):
 
 def merge(current, sha):
     """pr mode: squash-merge the one open PR/MR of branch taskq-<N> into main at the result SHA: the merge commit, None with no PR.
-    GitHub (#359): it merges only once the 'tests' check passes on the PR head; a PR behind main is not updated.
+    It merges only once the gate passes on the PR head: GitHub the 'tests' check (#359), GitLab the MR's pipeline (#479);
+    a PR behind main is not updated.
     A PR that does not merge (conflict, failing checks) goes back to the worker: requeue with the platform's message."""
     lab, host, branch = CONFIG['board'] == 'gitlab', CONFIG.get('host'), f'taskq-{current["iid"]}'
     where = ['-R', (f'https://{host}/' if lab else f'{host}/') * bool(host) + CONFIG['repo']]  # gh takes HOST/OWNER/REPO, glab a URL
@@ -448,17 +449,24 @@ def merge(current, sha):
     def back(why):
         move(current, 'ready', 'requeue', f'close: PR {number} {why}', claim=None, result=None)
         fail(f'#{current["iid"]}: PR {number} {why}')
-    if not lab:  # #359: main requires 'tests' on the PR head only (not strict); a behind PR merges as is, GitHub refuses a conflict
-        api = lambda path: run_api('gh', host, 'GET', f'repos/{CONFIG["repo"]}/{path}')
-        for _ in range(CHECK_POLLS):  # ponytail: fixed poll; tests.yml takes 8-13 s
-            runs = api(f'commits/{head}/check-runs?check_name=tests')['check_runs']
-            if runs and all(run['status'] == 'completed' for run in runs):
-                if any(run['conclusion'] != 'success' for run in runs):
-                    back(f'check tests failed on {head}')
-                break
-            time.sleep(CHECK_PAUSE)
-        else:
-            back(f'check tests did not finish on {head}')
+    if lab:  # the MR's latest pipeline on its head; failed, canceled or skipped sends it back
+        gate = 'pipeline'
+        runs = lambda: [(pipe['status'] in ('success', 'failed', 'canceled', 'skipped'), pipe['status'] == 'success') for pipe in
+                        run_api('glab', host, 'GET', f'projects/{quote(CONFIG["repo"], safe="")}/merge_requests/{number}/pipelines')
+                        if pipe['sha'] == head][:1]
+    else:  # #359: main requires 'tests' on the PR head only (not strict); a behind PR merges as is, GitHub refuses a conflict
+        gate = 'check tests'
+        runs = lambda: [(run['status'] == 'completed', run['conclusion'] == 'success') for run in
+                        run_api('gh', host, 'GET', f'repos/{CONFIG["repo"]}/commits/{head}/check-runs?check_name=tests')['check_runs']]
+    for _ in range(CHECK_POLLS):  # ponytail: fixed poll; tests.yml takes 8-13 s
+        polled = runs()
+        if polled and all(done for done, _ in polled):
+            if not all(ok for _, ok in polled):
+                back(f'{gate} failed on {head}')
+            break
+        time.sleep(CHECK_PAUSE)
+    else:
+        back(f'{gate} did not finish on {head}')
     keep = CONFIG.get('workspace') == 'external'  # #477: the host owns the branch; the repo's own policy may still delete it
     _, out = cli(*(['glab', 'mr', 'merge', number, '--squash', *['--remove-source-branch'] * (not keep), '--sha', head, '--auto-merge=false', '--yes'] if lab
                    else ['gh', 'pr', 'merge', number, '--squash', *['--delete-branch'] * (not keep), '--match-head-commit', head]))

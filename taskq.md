@@ -275,7 +275,7 @@ Rules:
 | `publish` | Worker pushes | `result --sha` | `close` |
 |---|---|---|---|
 | `direct` | `git push origin HEAD:main` | the pushed SHA | checks the SHA is on `origin/main`, closes |
-| `pr` | `git push --force-with-lease origin HEAD:refs/heads/taskq-<N>`, then once `gh pr create --base main --head taskq-<N>` / `glab mr create --target-branch main --source-branch taskq-<N>` | the PR head SHA | squash-merges the one open PR of `taskq-<N>` into `main` once `tests` passes on its head, deletes the branch, closes |
+| `pr` | `git push --force-with-lease origin HEAD:refs/heads/taskq-<N>`, then once `gh pr create --base main --head taskq-<N>` / `glab mr create --target-branch main --source-branch taskq-<N>` | the PR head SHA | squash-merges the one open PR/MR of `taskq-<N>` into `main` at that SHA once its gate passes on the head (GitHub: `tests`; GitLab: the MR pipeline), deletes the branch, closes |
 
 - `pr` mode: a PR that does not merge (conflict, failing checks) goes back to `ready` with the platform's message;
   a head that differs from the result SHA, or several PRs, refuses the close.
@@ -294,6 +294,12 @@ Rules:
   gate itself. Check it: `gh api repos/OWNER/REPO/branches/main/protection --jq .required_status_checks`.
   Changed: strict check, `close` updates a behind PR (`gh pr update-branch`) and merges the new head → `tests` on the
   PR head only, no update (#308 → #359): the strict check made merges serial, about 41 s each (#269).
+- `pr` mode on GitLab (#479), same flow: `close` finds the open MR of `taskq-<N>` (`glab mr list --source-branch`),
+  waits for the MR's latest pipeline on its head (`projects/:id/merge_requests/:iid/pipelines`) to reach `success`,
+  then `glab mr merge --squash --remove-source-branch --sha <head>`. A failed, canceled or skipped pipeline, no
+  finished pipeline within 10 min, or a refused merge (conflict) sends the task back to `ready`. The project needs CI
+  (`.gitlab-ci.yml`) that runs on MRs, and squash allowed. Self-managed: `"host"` in `taskq.json`; `glab` gets
+  `-R https://<host>/<group>/<project>`.
 - `pr` mode and no PR (an answer): `close` checks the SHA is on `origin/main`, as in `direct`.
 - Both modes, on the machine named in the claim: `close` removes a clean `.worktrees/taskq-<N>` (`git worktree remove`)
   and the local branch `taskq-<N>` (`git branch -D`). A worktree with uncommitted changes stays, with its branch, and

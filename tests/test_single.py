@@ -891,6 +891,66 @@ class Tick(TickSetup):
         taskq.adopt([n], taskq.session())  # migration of active work does not rebind sessions
         self.assertEqual(self.task(n)['claim'], claim)
 
+    def test_assignee_only_take_under_the_dispatch_lock(self):
+        # #576 review 1: a dispatcher that claims the task during take's identity call keeps its supervisor and slot
+        self.board.user = lambda: 'alice'
+        n = self.restricted(['alice'])
+        with taskq.dispatch_lock(), self.assertRaisesRegex(SystemExit, 'dispatch.lock'):
+            self.run_cli('take', str(n))  # a pass of this checkout runs: take waits for none, writes nothing
+        self.assertEqual((self.task(n)['state'], self.notes(n)), ('ready', []))
+        reserved = {'supervisor': {'runtime': 'fake', 'session': 's-S1', 'name': 'mac'}, 'claim': {'runtime': 'fake', 'session': None, 'name': 'mac'}}
+        calls = []
+        def user():  # the first identity call is slow: a dispatcher claims the task meanwhile
+            calls.append(1)
+            if len(calls) == 1:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    taskq.move(self.task(n), 'doing', 'spawn', 'supervisor s-S1', **reserved)
+            return 'alice'
+        self.board.user = user
+        with self.assertRaisesRegex(SystemExit, 'doing|supervisor'):
+            self.run_cli('take', str(n))
+        self.assertEqual((self.task(n)['supervisor'], self.task(n)['claim']), (reserved['supervisor'], reserved['claim']))
+
+    def test_assignee_only_latest_snapshot_before_send_and_spawn(self):
+        # #576 review 2: follow's and replace's own reads are checked: a reassignment there stops the send, retire and spawn
+        original = self.board.get
+        def reassigned_after(n, reads):  # the board reassigns the task to bob right after its first `reads` reads
+            seen = []
+            def get(m):
+                issue = original(m)
+                seen.append(m)
+                if seen.count(n) == reads and m == n:
+                    self.board.issues[n]['assignees'] = ['bob']
+                return issue
+            return get
+        for case in ('unsupervised answer', 'supervised answer', 'dispatch', 'worker order'):
+            with self.subTest(case=case):
+                self.board.issues.clear()
+                self.fake.names, self.fake.sent, self.fake.sessions = [], [], {}
+                self.board.user = lambda: 'alice'
+                n = self.restricted(['alice'])
+                if case == 'unsupervised answer':
+                    self.legacy(n)
+                if case in ('supervised answer', 'worker order'):
+                    self.run_cli('tick')
+                    self.fake.sessions['s-S%d' % n] = True  # running: no supervisor send of its own
+                if case == 'supervised answer':
+                    with self.acting('s-S%d' % n):
+                        self.run_cli('run', str(n))
+                if case.endswith('answer'):
+                    self.board.comment(n, '**answer** · owner\n\ngo on')
+                before, names = self.task(n), list(self.fake.names)
+                if case == 'worker order':
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        taskq.move(before, 'doing', 'run', 'run', order='run')
+                    before = self.task(n)
+                with mock.patch.object(self.board, 'get', side_effect=reassigned_after(n, 1)), contextlib.redirect_stderr(io.StringIO()):
+                    self.run_cli('tick')
+                after = self.task(n)
+                self.assertEqual((self.fake.sent, self.fake.names, self.fake.stopped), ([], names, []))
+                self.assertEqual((after['state'], after['claim'], after['supervisor'], after['raw'].get('order')),
+                                 (before['state'], before['claim'], before['supervisor'], before['raw'].get('order')))
+
     def test_assignee_starts_only_matching_tasks(self):
         # #480: "assignee" set: tick starts, and tick/wait/list show, only tasks assigned to it; unassigned ones are skipped
         self.board.user = lambda: 'alice'

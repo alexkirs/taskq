@@ -533,12 +533,21 @@ def cmd_list(args):
 
 def cmd_take(args):
     current, mine = task(args.n, 'ready'), session() or fail('take needs an agent session: set ' + ' or '.join(SESSIONS.values()))
-    reason = execution_reason(current)
-    if reason:
-        fail(reason)
-    if open_deps(current['deps']):
-        fail(f'#{args.n} has open dependencies')
-    move(current, 'doing', 'take', claim={**mine, 'name': machine()}, result=None)
+    guarded = 'assignee-only' in current['labels']  # #576: unlabelled take is unchanged
+    with dispatch_lock() if guarded else contextlib.nullcontext(True) as locked:
+        if not locked:
+            fail('cannot take: another taskq process holds .taskq/dispatch.lock; nothing taken, run it again')
+        reason = execution_reason(current)
+        if reason:
+            fail(reason)
+        if guarded:  # re-read under the lock after the identity call: a pass may have claimed the task meanwhile
+            current = task(args.n, 'ready')
+            reason = execution_reason(current) or current['supervisor'] and f'#{args.n} already has a supervisor'
+            if reason:
+                fail(reason)
+        if open_deps(current['deps']):
+            fail(f'#{args.n} has open dependencies')
+        move(current, 'doing', 'take', claim={**mine, 'name': machine()}, result=None)
 
 def decision(args):
     """#490: the decision card of an ask or result: what was done (the text's first line), results, options, one recommended."""
@@ -1034,11 +1043,14 @@ def replace(item, kind, runtime, role, running=False):
     another task's. A Codex spawn rewrites `.taskq/T<N>.pid` / `S<N>.pid`, the old thread's handle. A replaced
     worker goes running or not; a supervisor only once stopped (R11), its handle kept until then. Best effort."""
     issue = BOARD.get(item['iid'])
+    if not executable(issue):
+        return False  # #576: a reassignment seen by this read: no retire, no spawn
     try:
         getattr(kind, 'retire', lambda *_: None)(lambda n, sid=None, live=None: n == item['iid']
                                                   and recorded(issue, runtime, sid) == role, running)
     except Exception as error:
         print(f'#{item["iid"]}: could not retire the replaced {role}: {error}', file=sys.stderr)
+    return True
 
 EVENT_OF = {'result': 'review', 'ask': 'ask', 'answer': 'answer', 'gone': 'gone', 'requeue': 'requeue'}
 
@@ -1084,7 +1096,10 @@ def tail_of(kind, sid):
 
 def follow(item, kind, claim, supervised):
     """A live worker: an answer, a supervisor's `nudge:` comment or 120 silent minutes reach it once (step 2, step 4)."""
-    last = (BOARD.get(item['iid'])['comments'] or [''])[-1]
+    issue = BOARD.get(item['iid'])
+    if not executable(issue):
+        return claim  # #576: a reassignment seen by this read: no send, the claim stays
+    last = (issue['comments'] or [''])[-1]
     answer = last.partition('\n\n')[2] if last.startswith('**answer**') else None  # #307: an answer wakes the worker at once
     told = last.partition('nudge:')[2].strip() if supervised and last.startswith('nudge:') else None
     if answer is None and told is None and age(item) < 120:
@@ -1107,7 +1122,8 @@ def supervise(item, kinds):
         return  # ineligible: sessions, claim and order stay as they are
     if item['raw'].get('order') and claim.get('runtime') in kinds and fresh['raw'].get('order') and not (fresh['claim'] or {}).get('session'):  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
         kind = kinds[claim['runtime']]
-        replace(item, kind, claim['runtime'], 'worker', running=True)
+        if not replace(item, kind, claim['runtime'], 'worker', running=True):
+            return
         sid = spawn_named(item, kind, 'T', brief(item, claim['runtime']))
         item['claim'], item['raw']['order'] = {**claim, 'session': sid}, None
         move(item, 'doing', 'spawn', note('worker', sid, kind), claim=item['claim'], order=None)
@@ -1132,7 +1148,8 @@ def supervise(item, kinds):
         if getattr(lead, 'resumable', lambda _: False)(boss['session']):  # Codex: the same thread, the same id
             lead.send(boss['session'], f'restart #{n}: your last turn ended {evidence}; read your issue')
         else:  # a new supervisor adopts the live worker from the board; the dead one is retired first
-            replace(item, lead, boss['runtime'], 'supervisor')
+            if not replace(item, lead, boss['runtime'], 'supervisor'):
+                return
             sid = spawn_named(item, lead, 'S', supervisor_brief(item, boss['runtime'], lead))
             item['supervisor'] = {**boss, 'session': sid}
             move(item, item['state'], 'spawn', note('supervisor', sid, lead), supervisor=item['supervisor'])
@@ -1281,7 +1298,8 @@ def one_pass(args, table=True):
             if fresh and fresh['state'] == 'ready' and fresh['pm'] == item['pm']:  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
                 item.update(fresh)
                 runtime = lead(item)
-                replace(item, kinds[runtime], runtime, 'supervisor')  # a requeued task's old S<N>
+                if not replace(item, kinds[runtime], runtime, 'supervisor'):  # a requeued task's old S<N>
+                    continue
                 session = spawn_named(item, kinds[runtime], 'S', supervisor_brief(item, runtime, kinds[runtime]))
                 item.update(supervisor={'runtime': runtime, 'session': session, 'name': here}, claim={'runtime': free, 'session': None, 'name': here})
                 move(item, 'doing', 'spawn', note('supervisor', session, kinds[runtime]), supervisor=item['supervisor'], claim=item['claim'],

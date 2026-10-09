@@ -358,8 +358,11 @@ Runtime file: four module-level functions, three more optional.
   eligible; eligibility grants no PM/controller authority and no extra worker slot or board lock (R2–R4).
   Checked at manual `take`, at adoption of an unstarted task, and on a fresh read of the task before the pass
   starts a supervisor, continues an unsupervised worker (§ 7 step 2) or acts for a supervised one (§ 7 step 4).
-  Every read step 4 makes is checked: a read that shows the task ineligible ends that task's step at once, before
-  any worker spawn, supervisor send, resume or respawn. No assignees, missing/empty identity or an identity lookup
+  Every read the pass makes for the task is checked (step 4's, the follow read before a worker send, the read before
+  a replacement's retire and spawn): a read that shows the task ineligible ends that task's step at once, before any
+  worker spawn, session send, resume, retire or respawn. Manual `take` of such a task holds the checkout's dispatch
+  lock (busy: refused, nothing written), re-reads the task under it after the identity call and refuses one no longer
+  ready, ineligible or with a supervisor; unlabelled `take` is unchanged. No assignees, missing/empty identity or an identity lookup
   error refuse the task with a visible reason (fail closed); other tasks of the pass go on. A configured login or
   cached `me` never supplies authentication. GitHub and GitLab use the same policy through their `user` API.
   Reassignment never steals or retires active work, changes its PM, or rebinds its supervisor/worker: an ineligible

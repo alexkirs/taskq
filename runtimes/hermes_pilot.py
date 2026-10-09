@@ -67,6 +67,21 @@ def comment(n, text):
 def close(n):
     with transaction() as rows:
         rows[str(n)]['state'] = 'closed'; stamp(rows[str(n)])
+import contextlib, sqlite3, uuid
+GUARD_DB = pathlib.Path(__file__).with_name('coordination.sqlite')
+def acquire(owner):
+    with contextlib.closing(sqlite3.connect(GUARD_DB, timeout=5)) as db, db:
+        db.execute('CREATE TABLE IF NOT EXISTS grant (slot INTEGER PRIMARY KEY CHECK (slot=1), token TEXT, owner TEXT)')
+        token = str(uuid.uuid4())
+        try:
+            db.execute('INSERT INTO grant VALUES (1, ?, ?)', (token, owner))
+        except sqlite3.IntegrityError:
+            return None
+        return token
+def release(token):
+    with contextlib.closing(sqlite3.connect(GUARD_DB, timeout=5)) as db, db:
+        if db.execute('DELETE FROM grant WHERE slot=1 AND token=?', (token,)).rowcount != 1:
+            raise RuntimeError('exact grant no longer present')
 '''
 
 

@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import textwrap
 import unittest
 from pathlib import Path
@@ -26,6 +27,23 @@ class FakeBoard:
 
     def __init__(self):
         self.issues = {}
+        self.guard = None
+        self.guard_serial = 0
+        self.guard_mutex = threading.Lock()
+
+    def acquire(self, owner):
+        with self.guard_mutex:
+            if self.guard is not None:
+                return None
+            self.guard_serial += 1
+            self.guard = f'grant-{self.guard_serial}'
+            return self.guard
+
+    def release(self, token):
+        with self.guard_mutex:
+            if self.guard != token:
+                raise RuntimeError('exact grant no longer present')
+            self.guard = None
 
     def list(self, state):
         return [dict(issue) for issue in self.issues.values() if issue['state'] == 'open'
@@ -70,10 +88,16 @@ class Base(unittest.TestCase):
         if os.name == 'nt':  # Windows has no /usr/bin fallback after clear=True; preserve only the native git directory
             git = taskq.shutil.which('git')
             env.update(PATH=str(Path(git).parent) if git else '', SYSTEMROOT=os.environ['SYSTEMROOT'])
+        def child(command, **_):
+            try:
+                taskq.main(command[2:])
+            except SystemExit:
+                pass  # real detached child failure cannot fail its settled parent command
         for patcher in (
                 mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(taskq, 'GUARD_WAIT', 0),
                 mock.patch.object(taskq, 'runtimes', return_value={}),  # no real worker from an event's dispatch
-                mock.patch.object(taskq, 'start_pass', lambda command, **_: taskq.main(command[2:])),  # the child's pass, in process
+                mock.patch.object(taskq, 'start_pass', child),  # the child's pass, in process
                 mock.patch.object(taskq, 'datetime', FixedNow),
                 mock.patch.object(taskq, 'CLONE', self.root),  # no .git, no taskq.md: tick and wait neither pull nor warn
                 mock.patch.object(taskq.subprocess, 'run', real), mock.patch.object(taskq.subprocess, 'Popen', real)):
@@ -92,6 +116,197 @@ class Base(unittest.TestCase):
     def add(self, title='T', *extra):
         return self.run_cli('add', title, '--goal', 'g', '--acceptance', 'a', '--scope', 'x.py', *extra)
 
+
+
+class Coordination(Base):
+    def test_nested_guard_and_other_thread_cannot_share_grant(self):
+        failures = []
+        with taskq.coordination():
+            token = self.board.guard
+            with taskq.coordination():
+                self.assertEqual(self.board.guard, token)
+            def contender():
+                try:
+                    with taskq.coordination():
+                        failures.append('entered')
+                except SystemExit as error:
+                    failures.append(str(error))
+            thread = threading.Thread(target=contender)
+            thread.start(); thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(failures), 1)
+            self.assertIn('project guard busy', failures[0])
+            self.assertEqual(self.board.guard, token)
+        self.assertIsNone(self.board.guard)
+
+    def test_before_effect_failure_releases_and_post_effect_baseexceptions_retain(self):
+        with self.assertRaisesRegex(SystemExit, 'validation'):
+            with taskq.coordination():
+                taskq.fail('validation')
+        self.assertIsNone(self.board.guard)
+        for failure in (ValueError('write unknown'), SystemExit('stopped'), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__), self.assertRaises(type(failure)):
+                with taskq.coordination():
+                    taskq.effect(lambda: (_ for _ in ()).throw(failure))
+            token = self.board.guard
+            self.assertIsNotNone(token)
+            with self.assertRaisesRegex(SystemExit, 'project guard busy'):
+                with taskq.coordination():
+                    self.fail('entered orphaned guard')
+            self.board.release(token)  # explicit fixture quiescence/reconciliation
+
+    def test_caught_nested_effect_failure_poison_stops_further_effects(self):
+        later = mock.Mock()
+        with self.assertRaisesRegex(SystemExit, 'retained'):
+            with taskq.coordination():
+                try:
+                    with taskq.coordination():
+                        taskq.effect(lambda: (_ for _ in ()).throw(RuntimeError('unknown')))
+                except RuntimeError:
+                    pass
+                with self.assertRaisesRegex(SystemExit, 'poisoned'):
+                    taskq.effect(later)
+        later.assert_not_called()
+        self.assertIsNotNone(self.board.guard)
+
+    def test_caught_effect_failure_without_followup_is_nonzero(self):
+        with self.assertRaisesRegex(SystemExit, 'retained'):
+            with taskq.coordination():
+                try:
+                    taskq.effect(lambda: (_ for _ in ()).throw(RuntimeError('retire failed')))
+                except RuntimeError:
+                    pass
+        self.assertIsNotNone(self.board.guard)
+
+    def test_poisoned_scope_cannot_dispatch_as_settled(self):
+        def bad_transition(args):
+            try:
+                taskq.effect(lambda: (_ for _ in ()).throw(RuntimeError('unknown write')))
+            except RuntimeError:
+                pass
+            raise taskq.SettledError('nominally settled', [1])
+        with mock.patch.object(taskq, 'cmd_add', bad_transition), mock.patch.object(taskq, 'dispatch') as dispatch, \
+                self.assertRaisesRegex(SystemExit, 'retained') as error:
+            self.add()
+        self.assertNotIsInstance(error.exception, taskq.SettledError)
+        dispatch.assert_not_called()
+        self.assertIsNotNone(self.board.guard)
+
+    def test_sandbox_tick_and_status_never_acquire(self):
+        self.add()
+        with mock.patch.object(self.board, 'acquire', side_effect=AssertionError('read-only')), \
+                mock.patch.dict(os.environ, {'CODEX_SANDBOX': '1'}):
+            self.run_cli('tick')
+            self.run_cli('status')
+
+    def test_missing_codex_handle_is_unknown_and_failed_archive_keeps_handle(self):
+        codex = taskq.Codex()
+        self.assertIsNone(codex.state('another-checkout-session'))
+        path = self.root / '.taskq' / 'S1.pid'
+        path.parent.mkdir(exist_ok=True)
+        path.write_text('99999 session')
+        with mock.patch.object(taskq, 'pid_alive', return_value=False), \
+                mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)), \
+                self.assertRaisesRegex(RuntimeError, 'archive failed'):
+            with taskq.coordination():
+                taskq.effect(codex.retire, lambda *args: True)
+        self.assertTrue(path.is_file())
+        self.assertIsNotNone(self.board.guard)
+
+    def test_failed_claude_stop_never_resumes_or_removes(self):
+        claude = taskq.Claude()
+        agent = {'id': 'job', 'sessionId': 'sid', 'pid': 1, 'name': 'S1 CDX task (mac)'}
+        with mock.patch.object(claude, 'agents', return_value={'sid': agent}), \
+                mock.patch.object(claude, 'start') as start, \
+                mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)) as run:
+            with self.assertRaisesRegex(RuntimeError, 'stop failed'):
+                claude.send('sid', 'resume')
+            start.assert_not_called()
+            with self.assertRaisesRegex(RuntimeError, 'stop failed'):
+                claude.retire(lambda *args: True)
+            self.assertTrue(all('rm' not in call.args[0] for call in run.call_args_list))
+
+    def test_unknown_acquisition_and_release_never_fall_back(self):
+        with mock.patch.object(self.board, 'acquire', side_effect=TimeoutError('unknown')), \
+                mock.patch.object(self.board, 'release') as release, self.assertRaisesRegex(SystemExit, 'no grant assumed'):
+            with taskq.coordination():
+                self.fail('entered without acknowledgement')
+        release.assert_not_called()
+        with mock.patch.object(self.board, 'release', side_effect=TimeoutError('unknown')) as release, \
+                self.assertRaisesRegex(SystemExit, 'exact token'):
+            with taskq.coordination():
+                token = self.board.guard
+        release.assert_called_once_with(token)
+        self.assertEqual(self.board.guard, token)
+
+    def test_custom_read_only_board_refuses_writes_before_read_or_effect(self):
+        from types import SimpleNamespace
+        self.add()
+        taskq.BOARD = SimpleNamespace(list=self.board.list)
+        self.assertIn('#1', self.run_cli('list'))
+        with self.assertRaisesRegex(SystemExit, 'no atomic acquire/release'):
+            self.run_cli('take', '1')
+        self.assertEqual(self.task(1)['state'], 'ready')
+
+    def test_every_take_reads_and_writes_inside_guard_and_dispatch_follows_release(self):
+        self.add()
+        real = self.board.get
+        def fresh(n):
+            self.assertIsNotNone(self.board.guard)
+            return real(n)
+        with mock.patch.object(self.board, 'get', fresh):
+            self.run_cli('take', '1')
+        def dispatch(*args):
+            self.assertIsNone(self.board.guard)
+        with mock.patch.object(taskq, 'dispatch', dispatch):
+            self.run_cli('result', '1', '--sha', 'a' * 40)
+
+    def test_adapters_grant_only_acknowledged_new_token_and_exact_release(self):
+        github = taskq.GitHub('o/r')
+        github.coordination_label = 'taskq-probe-fixture'
+        with mock.patch.object(taskq, 'coordination_api', side_effect=[(404, {}), (201, {'name': github.coordination_label, 'node_id': 'NODE'})]) as api:
+            self.assertEqual(github.acquire('owner'), 'NODE')
+        self.assertEqual(api.call_args.args[4]['name'], github.coordination_label)
+        duplicate = {'errors': [{'resource': 'Label', 'field': 'name', 'code': 'already_exists'}]}
+        with mock.patch.object(taskq, 'coordination_api', side_effect=[(404, {}), (422, duplicate)]):
+            self.assertIsNone(github.acquire('owner'))
+        with mock.patch.object(taskq, 'coordination_api', return_value=(200, {'name': github.coordination_label, 'node_id': 'OTHER'})) as api:
+            self.assertIsNone(github.acquire('owner'))
+            api.assert_called_once()  # presence polling makes no mutating request
+        for response in ((401, {}), (500, {}), (422, {'message': 'spam'})):
+            with self.subTest(response=response), mock.patch.object(taskq, 'coordination_api', side_effect=[(404, {}), response]), \
+                    self.assertRaisesRegex(RuntimeError, 'failed/unknown'):
+                github.acquire('owner')
+        with mock.patch.object(taskq, 'coordination_api', return_value=(200, {'data': {'deleteLabel': {}}})) as api:
+            github.release('NODE')
+        self.assertEqual(api.call_args.args[3:], ('graphql', {'query': 'mutation($id: ID!) { deleteLabel(input: {id: $id}) { clientMutationId } }', 'variables': {'id': 'NODE'}}))
+        for data in ({'errors': [{'message': 'failed'}]}, {'data': {'deleteLabel': None}}, {}):
+            with mock.patch.object(taskq, 'coordination_api', return_value=(200, data)), self.assertRaises(RuntimeError):
+                github.release('NODE')
+        lab = taskq.GitLab('o/r', 'gitlab.example', {'coordination_board': 8, 'coordination_label': 9})
+        with mock.patch.object(taskq, 'coordination_api', side_effect=[(200, []), (201, {'id': 77})]):
+            self.assertEqual(lab.acquire('owner'), 77)
+        with mock.patch.object(taskq, 'coordination_api', side_effect=[(200, []), (400, {'message': {'error': 'Label has already been taken'}})]):
+            self.assertIsNone(lab.acquire('owner'))
+        for response in ((401, {}), (500, {}), (400, {'message': 'bad request'})):
+            with mock.patch.object(taskq, 'coordination_api', side_effect=[(200, []), response]), self.assertRaises(RuntimeError):
+                lab.acquire('owner')
+        with mock.patch.object(taskq, 'coordination_api', return_value=(204, None)) as api:
+            lab.release(77)
+        self.assertEqual(api.call_args.args[2:], ('DELETE', 'projects/o%2Fr/boards/8/lists/77'))
+        with mock.patch.object(taskq, 'coordination_api') as api, self.assertRaisesRegex(RuntimeError, 'explicitly provisioned'):
+            taskq.GitLab('o/r').acquire('owner')
+        api.assert_not_called()
+
+    def test_structured_coordination_transport_rejects_unknown_success(self):
+        with mock.patch.object(taskq.shutil, 'which', return_value='gh'), mock.patch.object(taskq.subprocess, 'run') as run:
+            run.return_value = subprocess.CompletedProcess([], 1, 'HTTP/2.0 422 Unprocessable Entity\nX-Test: yes\n\n{"errors":[]}', 'failed')
+            self.assertEqual(taskq.coordination_api('gh', None, 'POST', 'test', {}), (422, {'errors': []}))
+            self.assertEqual(run.call_args.kwargs['timeout'], 30)
+            for out in ('not HTTP', 'HTTP/2.0 201 Created\n\nnot JSON'):
+                run.return_value = subprocess.CompletedProcess([], 0, out, '')
+                with self.assertRaises(RuntimeError):
+                    taskq.coordination_api('gh', None, 'POST', 'test')
 
 
 class Commands(Base):
@@ -406,6 +621,8 @@ class PullRequests(Base):
             self.close('1', '2')
         self.assertEqual((self.task(1)['state'], self.board.issues[2]['state']), ('ready', 'closed'))
 
+        self.assertIsNone(self.board.guard)  # acknowledged CI-red requeue and other close are settled
+
     def test_head_is_not_the_result(self):
         for change in ({'headRefOid': 'b' * 40}, {'baseRefName': 'release'}):
             self.prs[0].update(change)
@@ -659,6 +876,7 @@ def retire(gone, running=True): pass
         self.assertEqual(receipt.read_bytes(), before)
         self.native.wake_manager = mock.Mock(return_value=SESSION)
         with self.native_env():
+            self.board.release(self.board.guard)  # fixture confirms failed wake is quiescent before exact-token recovery
             self.assertEqual(self.run_cli('wait', '--window', '0'), 'ask #1\n')
             self.assertEqual(self.run_cli('wait', '--window', '0'), 'tick\n')
         self.native.wake_manager.assert_called_once_with(SESSION, 'ask #1')
@@ -1078,19 +1296,34 @@ class Tick(TickSetup):
         self.assertEqual(self.task(1)['state'], 'ready')
         self.assertIn('| [#1 T](https://board/1) | blocked (no manager) | any |  |', self.run_cli('tick'))
 
+    def test_other_checkout_codex_supervisor_handle_is_not_death(self):
+        self.add()
+        before = json.loads(json.dumps(self.board.issues[1]))
+        other = self.root / 'other-checkout' / '.taskq'
+        other.mkdir(parents=True)
+        (other / 'S1.pid').write_text(f'{os.getpid()} s-S1')
+        codex = taskq.Codex()  # its root is this checkout; the recorded supervisor belongs to the other one
+        with mock.patch.object(taskq, 'runtimes', return_value={'fake': codex}), \
+                mock.patch.object(codex, 'spawn', side_effect=AssertionError('duplicate supervisor')), \
+                mock.patch.object(codex, 'send', side_effect=AssertionError('duplicate resume')):
+            self.assertIsNone(codex.state('s-S1'))
+            self.run_cli('tick')
+        self.assertEqual(self.board.issues[1], before)
+        self.assertTrue((other / 'S1.pid').is_file())
+
     def test_two_passes_at_once_spawn_one_worker(self):
         # #357 (R2): a tick runs while an event pass spawns; it finds the lock held and starts nothing
         taskq.CONFIG['limits'] = {'fake': 2}
         spawn, err = self.fake.spawn, io.StringIO()
 
         def overlapping(*spawn_args):
-            with contextlib.redirect_stderr(err):
+            with contextlib.redirect_stderr(err), self.assertRaisesRegex(SystemExit, 'project guard'):
                 self.run_cli('tick')
             return spawn(*spawn_args)
         self.fake.spawn = overlapping
         self.add('one')  # the add's pass spawns #1's supervisor, and the tick runs at that moment
         self.assertEqual(self.fake.names, ['S1 UNK one (mac)'])
-        self.assertIn('another pass is running', err.getvalue())
+        self.assertIsNone(self.board.guard)
         self.fake.spawn = spawn
         stale = [dict(self.board.issues[1], labels=['q-ready'])]  # a list from before the spawn: the re-read sees #1 taken
         with mock.patch.object(self.board, 'list', return_value=stale):
@@ -1331,7 +1564,7 @@ class Tick(TickSetup):
         # #576 review 1: a dispatcher that claims the task during take's identity call keeps its supervisor and slot
         self.board.user = lambda: 'alice'
         n = self.restricted(['alice'])
-        with taskq.dispatch_lock(), self.assertRaisesRegex(SystemExit, 'dispatch.lock'):
+        with taskq.coordination(), self.assertRaisesRegex(SystemExit, 'project guard'):
             self.run_cli('take', str(n))  # a pass of this checkout runs: take waits for none, writes nothing
         self.assertEqual((self.task(n)['state'], self.notes(n)), ('ready', []))
         reserved = {'supervisor': {'runtime': 'fake', 'session': 's-S1', 'name': 'mac'}, 'claim': {'runtime': 'fake', 'session': None, 'name': 'mac'}}
@@ -1480,17 +1713,14 @@ class Tick(TickSetup):
 
     def test_event_during_a_pass_is_not_lost(self):
         self.add()
-        calls = []
-        real = taskq.one_pass
-        def first(args, table=True):
-            calls.append(table)
-            if len(calls) == 1:
-                (taskq.CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
-                (taskq.CONFIG['root'] / '.taskq' / 'dispatch.pending').touch()  # an event came while we held the lock
-            return real(args, table)
-        with mock.patch.object(taskq, 'one_pass', first):
-            taskq.cmd_tick(None, table=False)
-        self.assertEqual(len(calls), 2)
+        held = self.board.acquire('other process')
+        with mock.patch.object(taskq, 'GUARD_WAIT', 1), \
+                mock.patch.object(taskq.time, 'sleep', side_effect=lambda _: self.board.release(held)) as waiting:
+            self.run_cli('tick')
+        waiting.assert_called_once()
+        self.assertIsNone(self.board.guard)
+        self.assertFalse((self.root / '.taskq' / 'dispatch.pending').exists())
+
 
     def test_arm_tick_without_target_arms_this_session(self):
         out = self.run_cli('arm', 'tick')
@@ -1592,7 +1822,7 @@ class Tick(TickSetup):
             'b': {'id': 'jb', 'name': 'T5 CLD fix (mac)', 'state': 'stopped'},
             'c': {'id': 'jc', 'name': 'T6 CLD other (mac)', 'state': 'stopped'},
             'd': {'id': 'jd', 'name': 'T5 notes', 'state': 'stopped'}}  # the owner's own job
-        with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:])):
+        with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:]) or subprocess.CompletedProcess(command, 0)):
             claude.retire(lambda n, *_: n == 5)
             self.assertEqual(calls, [['stop', 'ja'], ['rm', 'ja'], ['rm', 'jb']])
             calls.clear()
@@ -1606,7 +1836,7 @@ class Tick(TickSetup):
             for n in (3, 4):
                 (Path(folder) / '.taskq' / f'T{n}.pid').write_text(f'999999999 thread-{n}')
             calls = []
-            with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:])):
+            with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:]) or subprocess.CompletedProcess(command, 0)):
                 taskq.Codex().retire(lambda n, *_: n == 3)
             self.assertEqual(calls, [['archive', 'thread-3']])
             self.assertEqual([path.name for path in (Path(folder) / '.taskq').iterdir()], ['T4.pid'])
@@ -1686,11 +1916,16 @@ class Tick(TickSetup):
         spawn = self.fake.spawn
         self.fake.spawn = unnamed
         self.add('one')
+        self.assertIsNotNone(self.board.guard)
+        with self.assertRaisesRegex(SystemExit, 'project guard busy'):
+            self.run_cli('tick')
+        self.board.release(self.board.guard)  # explicit quiescent fixture recovery: failed session is confirmed stopped
         with self.assertRaisesRegex(SystemExit, r'#1: supervisor s-S1\.1 not named'):
             self.run_cli('tick')
         self.assertEqual((self.task(1)['state'], self.task(1)['supervisor'], set(self.notes(1)[1:])), ('ready', None, {'**gone**'}))  # the add's pass too
         self.assertTrue(self.board.issues[1]['comments'][-1].endswith('\n\nsupervisor s-S1.1 not named: thread/read: s-S1.1 named None'))
         self.fake.spawn = spawn
+        self.board.release(self.board.guard)  # both failed sessions are stopped; retain the original retirement assertion
         self.run_cli('tick')
         self.assertEqual((self.fake.stopped, self.task(1)['supervisor']['session']), (['s-S1', 's-S1.1'], 's-S1.2'))
 
@@ -1803,7 +2038,7 @@ class Tick(TickSetup):
         with mock.patch.object(codex, 'exec', run), mock.patch.object(codex, 'title'):
             codex.spawn('S1 one (mac)', 'prompt', '.')
         calls = []
-        with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:])):
+        with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:]) or subprocess.CompletedProcess(command, 0)):
             codex.retire(lambda n, sid, live: sid == 'old-thread')
         self.assertEqual((calls, (codex.folder() / 'S1.pid').read_text()), ([['archive', 'old-thread']], '999999998 new-thread'))
 
@@ -1870,7 +2105,7 @@ class Tick(TickSetup):
             (codex.folder() / f'{name}.pid').write_text(f'{pid} th-{name[1]}')
             (codex.folder() / f'{name}.log').write_text(log)
         with mock.patch.dict(os.environ, {'CODEX_HOME': str(home)}):
-            self.assertEqual([codex.state(f'th-{n}') for n in (1, 2, 3, 4)], ['running', 'dead', 'dead', 'dead'])  # th-2: no rollout
+            self.assertEqual([codex.state(f'th-{n}') for n in (1, 2, 3, 4)], ['running', 'dead', 'dead', None])  # th-2: no rollout; th-4: another checkout may own it
             (home / 'sessions' / '2026' / '10' / '09' / 'rollout-x-th-2.jsonl').write_text('')
             self.assertEqual((codex.state('th-2'), codex.resumable('th-2'), codex.resumable('th-3')), ('idle', True, False))
         claude = taskq.Claude()
@@ -2188,7 +2423,7 @@ class MultiPM(Base):
         def get_then_b(n):  # B's adoption runs inside A's, right after A read the task
             issue = get(n)
             if not refused:
-                with self.pm(self.B), self.assertRaisesRegex(SystemExit, 'holds .taskq/dispatch.lock; nothing adopted'):
+                with self.pm(self.B), self.assertRaisesRegex(SystemExit, 'holds the project guard'):
                     refused.append(self.run_cli('pm', '--adopt', '1'))
             return issue
         with self.pm(self.A), mock.patch.object(self.board, 'get', get_then_b):
@@ -2215,6 +2450,8 @@ class MultiPM(Base):
                 issues = load(); issues[str(n)]['comments'].append(text); save(issues)
             def close(n): pass
         '''))
+        with open(self.root / 'board.py', 'a') as fixture:
+            fixture.write('\nimport pathlib\n' + FILE_GUARD)
         with self.pm({}):
             self.add('one', '--runtime', 'fake')
         (self.root / 'issues.json').write_text(json.dumps({'1': {**self.board.issues[1], 'iid': 1}}))
@@ -2592,6 +2829,24 @@ if mode == 'hang':  # replied, then never exits
     time.sleep(60)
 '''
 
+FILE_GUARD = """
+import contextlib, sqlite3, uuid
+GUARD_DB = pathlib.Path(__file__).with_name('coordination.sqlite')
+def acquire(owner):
+    with contextlib.closing(sqlite3.connect(GUARD_DB, timeout=5)) as db, db:
+        db.execute('CREATE TABLE IF NOT EXISTS grant (slot INTEGER PRIMARY KEY CHECK (slot=1), token TEXT, owner TEXT)')
+        token = str(uuid.uuid4())
+        try:
+            db.execute('INSERT INTO grant VALUES (1, ?, ?)', (token, owner))
+        except sqlite3.IntegrityError:
+            return None
+        return token
+def release(token):
+    with contextlib.closing(sqlite3.connect(GUARD_DB, timeout=5)) as db, db:
+        if db.execute('DELETE FROM grant WHERE slot=1 AND token=?', (token,)).rowcount != 1:
+            raise RuntimeError('exact grant no longer present')
+"""
+
 FILE_BOARD = '''import json, pathlib
 PATH = pathlib.Path(__file__).with_name('issues.json')
 def load(): return json.loads(PATH.read_text()) if PATH.exists() else {}
@@ -2610,6 +2865,8 @@ def comment(n, text):
 def close(n):
     issues = load(); issues[str(n)]['state'] = 'closed'; save(issues)
 '''
+FILE_BOARD += FILE_GUARD
+
 FILE_RUNTIME = '''import pathlib
 def spawn(name, prompt, cwd): pathlib.Path(__file__).with_name('spawned').write_text(name); return 's1'
 def send(session, text): return session
@@ -2620,6 +2877,72 @@ def link(session): return None
 
 class RealChild(unittest.TestCase):
     """#481: `add` in a real process starts the real detached `tick --quiet` child; it spawns and logs, though the list lags the add."""
+
+    def test_quiet_guard_timeout_is_nonzero_without_writes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'board.py').write_text(FILE_BOARD)
+            (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'update': False}))
+            board = taskq.load_file('board.py', root)
+            token = board.acquire('other process')
+            try:
+                code = f"import runpy; d=runpy.run_path({str(ROOT / 'taskq.py')!r}); d['main'].__globals__['GUARD_WAIT']=0.05; d['main'](['tick','--quiet'])"
+                env = {k: v for k, v in os.environ.items() if k != 'CODEX_SANDBOX'}
+                done = REAL_RUN([sys.executable, '-c', code], cwd=root, env=env, capture_output=True, text=True, encoding='utf-8', timeout=5)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn('project guard busy', done.stderr)
+                self.assertFalse((root / 'issues.json').exists())
+                self.assertIsNone(board.acquire('still blocked'))
+            finally:
+                board.release(token)
+
+    def test_two_checkouts_share_board_guard_and_one_slot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            shared = Path(folder)
+            issues = {str(n): {'iid': n, 'title': f'task {n}', 'body': taskq.block('g', {'deps': [],
+                        'pm': {'runtime': 'fake', 'session': 'pm', 'name': 'fixture'}}),
+                        'labels': ['q-ready'], 'state': 'open', 'listed': True, 'comments': [],
+                        'updated_at': '2026-10-09T00:00:00Z', 'url': ''} for n in (1, 2)}
+            (shared / 'issues.json').write_text(json.dumps(issues))
+            roots = [shared / name for name in ('checkout-a', 'checkout-b')]
+            processes = []
+            try:
+                for root in roots:
+                    root.mkdir()
+                    (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'update': False,
+                        'runtimes': {'fake': 'fake.py'}, 'limits': {'fake': 1}}))
+                    (root / 'board.py').write_text(FILE_BOARD +
+                        f'\nPATH = pathlib.Path({str(shared / "issues.json")!r})\n'
+                        f'GUARD_DB = pathlib.Path({str(shared / "coordination.sqlite")!r})\n')
+                    (root / 'fake.py').write_text(
+                        'import pathlib, time\n'
+                        f'LOG = pathlib.Path({str(shared / "spawned")!r})\n'
+                        'def spawn(name, prompt, cwd):\n'
+                        '    with LOG.open("a") as out: out.write(name + "\\n")\n'
+                        '    time.sleep(0.3)\n'
+                        '    return "session-" + name.split()[0]\n'
+                        'def alive(sid): return True\n'
+                        'def send(sid, text): return sid\n'
+                        'def link(sid): return None\n')
+                    env = {**os.environ, 'TASKQ_HOST': 'fixture'}
+                    for key in (*taskq.SESSIONS.values(), 'TASKQ_RUNTIME', 'TASKQ_HOST_ONLY', 'TASKQ_LIMITS', 'CODEX_SANDBOX'):
+                        env.pop(key, None)
+                    processes.append(REAL_POPEN([sys.executable, str(ROOT / 'taskq.py'), 'tick'], cwd=root,
+                        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8'))
+                outputs = [process.communicate(timeout=15) for process in processes]
+                self.assertEqual([process.returncode for process in processes], [0, 0], outputs)
+                self.assertEqual(len((shared / 'spawned').read_text().splitlines()), 1, outputs)
+                current = json.loads((shared / 'issues.json').read_text())
+                self.assertEqual(current['1']['labels'], ['q-doing'])
+                self.assertEqual(current['2']['labels'], ['q-ready'])
+                self.assertEqual(taskq.parse(current['1'])['supervisor']['session'], 'session-S1')
+                self.assertFalse(any((root / '.taskq' / name).exists() for root in roots
+                                     for name in ('dispatch.lock', 'dispatch.pending')))
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
 
     def test_native_redirected_unicode_report_and_cli_error(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -2877,6 +3200,7 @@ class HermesNativeBoundary(unittest.TestCase):
                 self.runtime.call(sid, 'session.history')  # fixture releases delayed native event on next RPC
                 actual = self.runtime.completed(sid, timeout=1)['persisted_turn']
                 self.assertGreater(actual['user_row_id'], first['final_assistant_row_id'])
+                board.release(board.guard)  # the delayed turn is now complete: explicit fixture recovery of its exact grant
                 with contextlib.redirect_stdout(io.StringIO()):
                     taskq.main(['wait', '--window', '0'])
                 self.assertEqual(json.loads(receipt.read_text()), {'1': 'ask'})

@@ -23,6 +23,8 @@ rule or amend this one, never keep both. A new rule gets the next R-number.
 
 The issue's `q-*` label, its JSON block and trusted comments hold all task state, claims and history (§ 3). No extra
 database, queue, receipt store, mirror or protocol. Local files under `.taskq/` are runtime handles only (§ 8).
+Changed (#603, owner decision 2026-10-10): checkout-local dispatch files → one board-backed project guard.
+Task state stays on issues; the board adapter supplies atomic acquisition and exact-token release (§ 2).
 Changed: execution had no per-task identity restriction → `assignee-only` uses native board Assignees,
 never a duplicate identity field or per-user label (#545 recovered by #576, owner decision 2026-10-09).
 
@@ -85,8 +87,8 @@ review). No such task is orphaned. The unsupervised path is a migration path onl
 pass starts gets its supervisor. A task with no `pm` (filed before #532, or from a plain shell with no
 `TASKQ_RUNTIME`) starts nothing: it waits and the table says `blocked (no manager)` (§ 7 step 3, R6) until a manager adopts
 it explicitly, `taskq pm --adopt N`, which records that session as its `pm` (a task with a `pm` is refused: never the
-last writer). Adoption holds the checkout's dispatch lock and re-reads each task under it; a busy lock refuses the
-adoption (nothing written, run it again). Across checkouts or machines it is not atomic (R4). Adoption changes no claim: a task already started (#526, #532) keeps its supervisor and worker to its
+last writer). Adoption holds the board's project guard and re-reads each task under it; unresolved contention refuses the
+adoption visibly with nothing written (R4). Adoption changes no claim: a task already started (#526, #532) keeps its supervisor and worker to its
 end; its `pm` only adds the manager's gate and `wait` events. Until adopted, the owner's shell controls it and every
 manager's `wait` shows it.
 Changed: a pass with no manager spawned `T<N>` itself → it starts nothing; the supervisor's runtime has no source (#525).
@@ -102,7 +104,8 @@ move, in a detached `taskq tick --quiet` child, and return at once: the queue ch
 the runtime starts (a spawn or a resume, `S<N>` or `T<N>`) also gets one detached `taskq tick --quiet --after <pid>`
 that runs the pass when that turn's process exits: a sandboxed Codex session's own commands start no pass (#502), so
 its `run`, `result`, `requeue` or `close` takes effect at its turn's end. The children write to `.taskq/dispatch.log`;
-a child that finds the dispatch lock busy exits. After setup and one `taskq pm`, an approved queue runs by itself:
+a child that finds the project guard busy waits for a bounded opportunity to run its own fresh pass;
+a timeout is a visible failure in that log, never an acknowledged or silently dropped event. With successful guard acquisition and effects, after setup and one `taskq pm`, an approved queue runs by itself:
 workers, supervisor wakes, reviews, reworks, closes and the next task need no owner message, no sender session and no
 timer (owner clarification 2026-10-09, #525). The manager is woken only for its short outcomes: `taskq wait` blocks
 until a task enters `ask` or closes, an unsupervised task (R3 Transition) enters `review`, a local session is gone, or
@@ -112,11 +115,23 @@ those with no `pm`), each event once per manager: one manager never consumes ano
 consumes as the manager it serves: `arm tick <manager>` prints `taskq wait --pm <manager id>`, which reads that
 manager's tasks and shares its receipt file, so the manager's own wait and its sender print each event once between
 them; the sender's routes and lifetime stay as #522 set them.
-Atomicity, honestly (#532): `.taskq/dispatch.lock` serializes passes of one checkout, and a pass re-reads a task from
-the board before it starts a supervisor or a worker, so duplicate events in one checkout give one `S<N>` and one
-`T<N>`. Across checkouts or machines nothing is atomic: the board has no compare-and-swap. A task's sessions start
-only on its `pm`'s machine, so one checkout per project per machine gives one controller; two checkouts on one
-machine may race.
+Changed (#603, owner decision 2026-10-10): one checkout's `.taskq/dispatch.lock` and pending file → a
+board-backed guard shared by every cooperating TaskQ process for that project. All board mutations, adoption,
+manual take, dispatch and cleanup hold the same guard across fresh reads, runtime/publication effects and records.
+Only the acknowledged acquirer enters. A missing checkout-local Codex handle means unknown liveness, never proof
+that another checkout's board-recorded session died. Sandbox ticks remain read-only and acquire no grant. A process may nest its own operation; threads, new command invocations,
+and children acquire independently. Tokens are never inherited by a child. Every pass refreshes the tasks before
+accounting/admission: a lagging list is not authority. A conflicting acquisition waits up to 30 seconds, then fails
+visibly; it never writes a local pending receipt. Unknown acquisition/authentication/transport errors fail immediately.
+A successful operation releases its exact token. A failure before effects begin may release; an exception after
+any effect began conservatively retains the grant, except an explicitly identified, fully acknowledged terminal
+transition (such as CI-red requeue), which releases and triggers its event despite the CLI refusal. This is because a lost response or unrecorded spawn may still act.
+Release failure is visible and never retried automatically. There is no timeout-based ownership expiry, stealing,
+or claim of fencing an old in-flight operation. Recovery requires explicitly stopping/draining all relevant
+controllers and in-flight requests, reconciling board state and runtime sessions, then deleting only the exact
+orphan token through the adapter's documented API. Read-only reports remain available while blocked.
+Migration requires stopping/draining old TaskQ controllers on every host before enabling this version. Older
+versions ignore this guard; mixed versions and direct manual board edits are not coordinated or declared safe.
 Changed: "a tick on another machine never coordinates" → every machine's tick runs the same pass for its own claims
 and hosts; there is no coordinator machine (#290).
 Changed: "a tick is a message" → a tick is a message or a queue event; spawn no longer waits for the next sent tick (#333).
@@ -440,6 +455,7 @@ not replace the isolated spawn, naming, result and retirement qualification requ
 | Field | What | Default |
 |---|---|---|
 | `board` | `github`, `gitlab`, or a `.py` file relative to the root | `github` |
+| `board_options` | GitLab: `{"coordination_board": ID, "coordination_label": ID}`; permanent dedicated board and label, provisioned explicitly once | required for GitLab writes |
 | `repo` | `owner/repo` (GitHub) or `group/project` (GitLab) | required for github/gitlab |
 | `host` | Enterprise or self-managed host | the CLI's default |
 | `update` | `false`: `pm`, `tick` and `wait` do not `git pull` the taskq clone (§ 7) | `true` |
@@ -464,7 +480,7 @@ its waiting-to-ready step and automatic retirement use the same scope. Manual `t
 including explicit `run-*` tasks and pending supervisor worker orders. It is a nonempty JSON object of runtime
 names to nonnegative integers; invalid values or a host/machine mismatch fail before board writes or dispatch.
 Existing local reservations and active workers still consume slots even outside the host scope; accounting reads
-their current board claims under the dispatch lock, not the potentially stale list. A later read showing a changed
+their current board claims under the project guard, not the potentially stale list. A later read showing a changed
 state, PM, claim, supervisor or order stops that task's step without overwriting it. Lowering a limit
 never stops a session or drops a claim: active workers continue; pending workers wait for capacity, in task priority
 and number order. The supervisor's runtime still follows its board PM (R3), independent of worker limits.
@@ -475,7 +491,7 @@ or independent invocations. Custom runtime adapters must preserve them when laun
 On Windows, set `$env:TASKQ_HOST='win'`, `$env:TASKQ_HOST_ONLY='win'` and `$env:TASKQ_LIMITS='{"codex":5}'`
 in the intended invocation shell. Setting these values alone starts no queue and adopts no tasks.
 
-Board file: six module-level functions. An issue is a dict `{iid, title, body, labels, state: open|closed,
+Board file: six data functions plus `acquire(owner)` and `release(token)` for writes; modules without the guard support read-only commands only. An issue is a dict `{iid, title, body, labels, state: open|closed,
 updated_at, url}`, optionally `assignees` (logins); `get` adds `comments` (a list of strings, oldest first).
 With `"assignee": "me"` or an `assignee-only` task the file also needs `user()`: the authenticated current login.
 The configured `assignee` filter (and its cached `me`) is selection, never identity authentication.
@@ -488,6 +504,30 @@ The configured `assignee` filter (and its cached `me`) is selection, never ident
 | `update(n, labels=None, body=None)` | replace the labels and/or the body |
 | `comment(n, text)` | append one comment |
 | `close(n)` | close the issue |
+| `acquire(owner)` | atomically create one project grant; return its opaque, nonempty exact token, or `None` for recognized contention only; errors raise |
+| `release(token)` | delete that exact grant; never a successor, never a name-based fallback; errors raise |
+
+The scope is the entire configured board project, independent of checkout, host, assignee and local limits.
+GitHub creates the reserved label `taskq-coordination` with owner diagnostics, accepts only an acknowledged new
+label and its GraphQL node ID, and releases through GraphQL `deleteLabel(id)`. GraphQL errors, including HTTP
+200 with `errors`, are failures. GitLab uses the explicitly configured permanent board/label IDs: acquisition
+creates their unique board list, release deletes only that list ID. Missing locators fail closed; TaskQ never
+recreates a missing coordination resource, nor deletes those permanent resources. Use a dedicated board so list
+removal cannot reorder a working issue board. Never attach the reserved label to tasks. All installations for a
+project must use the same permanent locator pair; changing it while any controller can act is unsafe.
+GitLab's list token is authoritative but does not persist the human owner name; failure diagnostics print the
+known exact token locally. No owner-description write is added to the permanent label.
+An unknown GitLab POST outcome cannot be recovered by treating an existing list as one's own grant. Owner
+metadata is diagnostic, never authority. A retained grant blocks further writes until explicit quiescent recovery.
+
+Why this primitive (#603, amending the owner's earlier #249 first-trusted-claim-note approach): legacy first-note/minimum-ID claims depended on a complete ordered history and expiry handling; their expiry could admit a successor while a late owner still acted. The current owner authorizes the simpler server-backed grant on both adapters. Writing an empty field then reading it back is not atomic: A may read its own write
+and act before B overwrites it and also acts. Last-entry-wins history has the same race. First-unreleased-entry ordering could work only with a guaranteed complete ordered prefix and a defined crash/recovery protocol; those unsupported guarantees and extra protocol make server-enforced uniqueness the simpler supported choice. GitLab labels
+have atomic title uniqueness but their REST deletion falls back from numeric ID to title; milestones have only
+application title validation, not database uniqueness. GitLab lists have database uniqueness on `(board_id,
+label_id)` and strict ID deletion. The approved isolated GitLab 17.2.9-ee probe observed one 201 grant and one
+400 duplicate, then 404 for stale deletion while the recreated successor survived. GitHub uses label uniqueness
+and strict GraphQL node identity. No alternate local lock or queue state is used.
+
 
 Runtime file: four module-level functions, three more optional.
 
@@ -524,9 +564,8 @@ Runtime file: four module-level functions, three more optional.
   starts a supervisor, continues an unsupervised worker (§ 7 step 2) or acts for a supervised one (§ 7 step 4).
   Every read the pass makes for the task is checked (step 4's, the follow read before a worker send, the read before
   a replacement's retire and spawn): a read that shows the task ineligible ends that task's step at once, before any
-  worker spawn, session send, resume, retire or respawn. Manual `take` of such a task holds the checkout's dispatch
-  lock (busy: refused, nothing written), re-reads the task under it after the identity call and refuses one no longer
-  ready, ineligible or with a supervisor; unlabelled `take` is unchanged. No assignees, missing/empty identity or an identity lookup
+  worker spawn, session send, resume, retire or respawn. Every manual `take` holds the project guard, re-reads the task after the identity call and refuses one no longer
+  ready, ineligible or with a supervisor. No assignees, missing/empty identity or an identity lookup
   error refuse the task with a visible reason (fail closed); other tasks of the pass go on. A configured login or
   cached `me` never supplies authentication. GitHub and GitLab use the same policy through their `user` API.
   Reassignment never steals or retires active work, changes its PM, or rebinds its supervisor/worker: an ineligible
@@ -580,7 +619,7 @@ Runtime file: four module-level functions, three more optional.
 | `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4); `--after PID`: first wait for that Codex turn's process to end (R4) |
 | `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed, for the tasks whose `pm` is this session or that have none (all of them from a plain shell); print `ask #N`, `review #N` (an unsupervised task, R3 Transition), `closed #N <verdict>` (a supervised task, § 7 Supervisor 3.3), `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7); each manager's events are its own, once (`.taskq/wait-<session>.json`; a plain shell: `.taskq/wait.json`); `--pm ID`: wait as manager `ID`, its tasks and its file (a sender, R4) |
 | `taskq wait --task N [--window MIN] [--every SEC]` | the supervisor's wait: block until its task needs it; print `review #N`, `ask #N`, `answer #N`, `gone #N` (its worker), `requeue #N` (by its worker), one line each, each once (`.taskq/S<N>.seen`); `stop #N` when the task is closed or the calling session is not its supervisor; `tick` after the window |
-| `taskq pm [--adopt N ..]` | print the manager role (Principles, § 7, how to tick this session) under a first line `taskq pm contract <hash>`; record the hash of the clone's `taskq.md` in `.taskq/pm.json` (§ 7), nothing else: a task's manager is its `pm` (R3, #532); refused for a session an open task records as its supervisor or worker, so neither passes the gate as the manager (R3). `--adopt N`: record this session as the `pm` of open tasks that have none, under the dispatch lock with a fresh read; a task with a `pm`, or a busy lock, refuses all of them (R3 Transition) |
+| `taskq pm [--adopt N ..]` | print the manager role (Principles, § 7, how to tick this session) under a first line `taskq pm contract <hash>`; record the hash of the clone's `taskq.md` in `.taskq/pm.json` (§ 7), nothing else: a task's manager is its `pm` (R3, #532); refused for a session an open task records as its supervisor or worker, so neither passes the gate as the manager (R3). `--adopt N`: record this session as the `pm` of open tasks that have none, under the project guard with a fresh read; a task with a `pm`, or a busy lock, refuses all of them (R3 Transition) |
 | `taskq cleanup [--dry-run]` | the owner's manual sweep of this machine (below); `--dry-run` prints the same and changes nothing |
 | `taskq arm tick [<manager>]` | print the prompt for a tick-sender session of this runtime (Codex: `exec resume` only for a thread with a local rollout, § 7); without `<manager>`: how this session ticks itself (a background `taskq wait` that wakes it) (§ 7) |
 

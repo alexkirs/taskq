@@ -2451,7 +2451,7 @@ def freshness_notice():
         print(f'taskq: update availability unknown ({cached["error"]}); retry after the five-minute cache window', file=sys.stderr)
     elif cached['upstream_sha'] != CLONE.name:
         print(f'TaskQ upstream revision {cached["upstream_sha"]} differs from loaded {CLONE.name}; '
-              'run taskq update to preview. Qualification and installation remain explicit.')
+              'run taskq update to preview. Qualification and installation remain explicit.', file=sys.stderr)
 
 
 def refresh(pm=False):
@@ -2459,7 +2459,7 @@ def refresh(pm=False):
     path = CONFIG['root'] / '.taskq' / 'pm.json'
     known = json.loads(path.read_text('utf-8')).get('contract') if path.is_file() else None
     if not pm and contract() and known and known != contract():  # no pm.json: this session never took the role
-        print('The manager contract changed: run taskq pm and follow it from now on.')
+        print('The manager contract changed: run taskq pm and follow it from now on.', file=sys.stderr)
     freshness_notice()
 
 def cmd_migrate(args):

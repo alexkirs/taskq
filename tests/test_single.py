@@ -3170,9 +3170,12 @@ class Contract(Base):
         self.run_cli('pm')
         self.assertNotIn(line, self.run_cli('tick'))
         (self.root / 'taskq.md').write_text('v2\n## Principles\nx\n## 7. Manager\ny\n## 8. Runtimes\n')
-        with mock.patch.object(taskq.time, 'time', side_effect=[0, 1e9]):
-            self.assertEqual(self.wait_and_ack().splitlines(), [line, 'tick'])
-        self.assertEqual(self.run_cli('tick').splitlines()[0], line)  # first, once per run
+        with mock.patch.object(taskq.time, 'time', side_effect=[0, 1e9]), contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(self.wait_and_ack().splitlines(), ['tick'])
+        self.assertIn(line, errors.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.run_cli('tick')
+        self.assertIn(line, errors.getvalue())
         self.run_cli('pm')
         self.assertNotIn(line, self.run_cli('tick'))
 
@@ -3181,8 +3184,10 @@ class Contract(Base):
         (self.root / 'taskq.md').write_text('old contract')
         self.run_cli('pm')
         (self.root / 'taskq.md').write_text('new contract')
-        with mock.patch.object(taskq.subprocess, 'run', side_effect=AssertionError('refresh ran git')):
-            self.assertIn('contract changed', self.run_cli('tick'))
+        with mock.patch.object(taskq.subprocess, 'run', side_effect=AssertionError('refresh ran git')), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.run_cli('tick')
+            self.assertIn('contract changed', errors.getvalue())
             self.run_cli('pm')
         self.assertEqual((self.root / 'taskq.md').read_text(), 'new contract')
 
@@ -3293,9 +3298,15 @@ class Contract(Base):
                 mock.patch.object(taskq.subprocess, 'run', return_value=mock.Mock(returncode=0,
                     stdout=json.dumps({'object': {'sha': 'b' * 40}}))) as run:
             for argv in (('pm',), ('tick',), ('wait', '--window', '0')):
-                out = self.run_cli(*argv)
-                self.assertIn('run taskq update to preview', out)
-                self.assertIn('Qualification and installation remain explicit', out)
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    out = self.run_cli(*argv)
+                self.assertNotIn('run taskq update', out)
+                self.assertIn('run taskq update to preview', errors.getvalue())
+                self.assertIn('Qualification and installation remain explicit', errors.getvalue())
+            (self.root / '.taskq' / 'pm.json').write_text(json.dumps({'contract': 'stale'}))
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(json.loads(self.run_cli('wait', '--json', '--window', '0')), {'events': [], 'tick': True})
+            self.assertIn('contract changed', errors.getvalue())
             self.assertEqual(run.call_count, 1)
             self.assertEqual(run.call_args.args[0], ['gh', 'api', '--hostname', 'github.com', 'repos/alexkirs/taskq/git/ref/heads/main'])
             self.assertEqual(run.call_args.kwargs['timeout'], 10)

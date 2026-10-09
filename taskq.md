@@ -887,7 +887,7 @@ open tasks with no `pm`, including tasks outside the report filter. Triage them 
 project-specific `taskq pm --adopt N` action before leaving them blocked; adoption remains an explicit choice,
 never automatic. Never seize a task with a manager or change foreign claims. `taskq pm`, `taskq tick` and
 `taskq wait` compare the hash of the running release's
-`taskq.md` with `.taskq/pm.json` (a runtime handle, R1). A different hash prints first: `The manager contract changed:
+`taskq.md` with `.taskq/pm.json` (a runtime handle, R1). A different hash warns on stderr: `The manager contract changed:
 run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#430). `taskq pm` prints that release's
 contract itself, so it skips that line. These commands never update source code. In a managed install they also check canonical GitHub `main`
 availability on startup, at most once per five-minute local cache window (concurrent cache misses may each

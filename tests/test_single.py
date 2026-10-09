@@ -951,24 +951,73 @@ class Tick(TickSetup):
         self.assertEqual((codex.folder() / 'T1.pid').read_text(), f'{os.getpid()} new-thread')
         title.assert_called_once_with('new-thread', 'T1 one (mac)')  # R3 (#572): the new thread gets its native name
 
-    def test_codex_title_sets_and_reads_back_the_name(self):
-        # R3 (#572): thread/name/set, then thread/read proves the persisted name; a mismatch is printed, never raised
-        sent = []
+    def test_codex_title_waits_for_each_reply(self):
+        # R3 (#572): a real local fake `codex app-server`: each request goes only after its own successful reply, the
+        # read must return the thread and the name; an error, a wrong read or a hang raises, all within one deadline
+        folder = Path(self.root) / 'bin'
+        folder.mkdir()
+        server = folder / 'codex'
+        server.write_text(f'#!{sys.executable}\n' + APP_SERVER)
+        server.chmod(0o755)
+        cases = {'ok': None, 'set-error': 'thread/name/set: ', 'wrong-name': "thread/read: th named 'other'",
+                 'silent': 'initialize: no reply', 'hang': None}
+        for mode, error in cases.items():
+            log = folder / f'{mode}.log'
+            with self.subTest(mode), mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN), \
+                    mock.patch.object(taskq.shutil, 'which', return_value=str(server)), mock.patch.object(taskq.Codex, 'WAIT', 2), \
+                    mock.patch.dict(os.environ, {'FAKE_MODE': mode, 'FAKE_LOG': str(log)}):
+                began = taskq.time.monotonic()
+                if error:
+                    with self.assertRaisesRegex(ValueError, re.escape(error)):
+                        taskq.Codex().title('th', 'S1 CDX one (mac)')
+                else:
+                    taskq.Codex().title('th', 'S1 CDX one (mac)')
+                self.assertLess(taskq.time.monotonic() - began, 10)  # the deadline holds through shutdown
+            methods = log.read_text().split()
+            self.assertEqual(methods, {'set-error': ['initialize', 'initialized', 'thread/name/set'], 'silent': ['initialize']}.get(
+                mode, ['initialize', 'initialized', 'thread/name/set', 'thread/read']))
 
-        class Server(contextlib.nullcontext):
-            def __init__(self, reply):
-                super().__init__(self)
-                self.stdout, self.kill = io.StringIO(reply), lambda: None
-                self.stdin = mock.Mock(write=lambda text: sent.extend(map(json.loads, text.splitlines())))
-        for named, err in (('S1 CDX one (mac)', ''), ('other', "taskq: codex thread th not named 'S1 CDX one (mac)': other\n")):
-            reply = '{"id":0,"result":{}}\n{"id":1,"result":{}}\n{"id":2,"result":{"thread":{"id":"th","name":"%s"}}}\n' % named
-            with self.subTest(named), mock.patch.object(taskq.subprocess, 'Popen', lambda *a, **k: Server(reply)), \
-                    mock.patch('sys.stderr', new=io.StringIO()) as stderr:
-                taskq.Codex().title('th', 'S1 CDX one (mac)')
-            self.assertEqual(stderr.getvalue(), err)
-        self.assertEqual([(m.get('method'), m.get('params')) for m in sent[:4]],
-                         [('initialize', {'clientInfo': {'name': 'taskq', 'version': '1'}}), ('initialized', None),
-                          ('thread/name/set', {'threadId': 'th', 'name': 'S1 CDX one (mac)'}), ('thread/read', {'threadId': 'th'})])
+    def test_codex_unnamed_spawn_stops_and_keeps_its_handle(self):
+        # R3 (#572): a thread whose name is not confirmed never counts as spawned: its turn is stopped, its pid file kept
+        codex = taskq.Codex()
+        log, process = codex.folder() / 'S1.log', mock.Mock(pid=4242)
+
+        def run(*_):
+            log.write_text('{"type":"thread.started","thread_id":"th"}\n')
+            return process, log
+        with mock.patch.object(codex, 'exec', run), \
+                mock.patch.object(codex, 'title', side_effect=ValueError('thread/name/set: no rollout found')), \
+                self.assertRaisesRegex(taskq.Unnamed, '^th not named: thread/name/set: no rollout found$'):
+            codex.spawn('S1 CDX one (mac)', 'prompt', '.')
+        process.terminate.assert_called_once_with()
+        self.assertEqual((codex.folder() / 'S1.pid').read_text(), '4242 th')
+
+    def test_unnamed_spawn_is_recorded_gone_not_spawned(self):
+        # R3/R11 (#572): the pass fails, the board records the id in a gone note only; the next pass retires it
+        def unnamed(name, prompt, cwd):
+            sid = spawn(name, prompt, cwd)
+            self.fake.sessions[sid] = False  # stopped
+            raise taskq.Unnamed(sid, ValueError(f'thread/read: {sid} named None'))
+        spawn = self.fake.spawn
+        self.fake.spawn = unnamed
+        self.add('one')
+        with self.assertRaisesRegex(SystemExit, r'#1: supervisor s-S1\.1 not named'):
+            self.run_cli('tick')
+        self.assertEqual((self.task(1)['state'], self.task(1)['supervisor'], set(self.notes(1)[1:])), ('ready', None, {'**gone**'}))  # the add's pass too
+        self.assertTrue(self.board.issues[1]['comments'][-1].endswith('\n\nsupervisor s-S1.1 not named: thread/read: s-S1.1 named None'))
+        self.fake.spawn = spawn
+        self.run_cli('tick')
+        self.assertEqual((self.fake.stopped, self.task(1)['supervisor']['session']), (['s-S1', 's-S1.1'], 's-S1.2'))
+
+    def test_codex_resume_keeps_the_named_thread(self):
+        # R3 (#572): `exec resume` goes to the same thread under its handle; it renames nothing (the name stays native)
+        codex = taskq.Codex()
+        (codex.folder() / 'S1.pid').write_text('1 th')
+        with mock.patch.object(codex, 'exec', return_value=(mock.Mock(pid=4242), codex.folder() / 'S1.log')) as run, \
+                mock.patch.object(codex, 'title', side_effect=AssertionError('resume renames nothing')):
+            self.assertEqual(codex.send('th', 'review #1: read your issue'), 'th')
+        run.assert_called_once_with('S1', ['resume', 'th', 'review #1: read your issue'], self.root)
+        self.assertEqual((codex.folder() / 'S1.pid').read_text(), '4242 th')
 
     def test_supervisor_runtime_follows_the_manager(self):
         # R3 (#525): S<N> runs in the manager's runtime (DOT: Codex), T<N> in the task's; no manager here: the task waits
@@ -1723,6 +1772,29 @@ class Model(Base):
         self.assertIn('\n### Change rule\n', text)
         self.assertIn('\n## Product\n', text)  # #505: product decisions live here
 
+
+APP_SERVER = '''import json, os, sys, time
+mode, log = os.environ['FAKE_MODE'], open(os.environ['FAKE_LOG'], 'w')
+for line in sys.stdin:
+    message = json.loads(line)
+    log.write(message['method'] + '\\n')
+    log.flush()
+    if mode == 'silent':
+        time.sleep(60)
+    if 'id' not in message:
+        continue
+    out = [{'method': 'note'}, {'id': 9, 'method': 'ask'}, {'id': 7, 'result': {}}]  # notifications and others first, slowly
+    if message['method'] == 'thread/name/set' and mode == 'set-error':
+        out.append({'id': message['id'], 'error': {'code': -32600, 'message': 'no rollout found'}})
+    else:
+        name = 'other' if mode == 'wrong-name' else 'S1 CDX one (mac)'
+        out.append({'id': message['id'], 'result': {'thread': {'id': 'th', 'name': name}} if message['method'] == 'thread/read' else {}})
+    for reply in out:
+        time.sleep(0.05)
+        print(json.dumps(reply), flush=True)
+if mode == 'hang':  # replied, then never exits
+    time.sleep(60)
+'''
 
 FILE_BOARD = '''import json, pathlib
 PATH = pathlib.Path(__file__).with_name('issues.json')

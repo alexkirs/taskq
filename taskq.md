@@ -62,7 +62,9 @@ ORCH the launching orchestrator (CLD Claude, CDX Codex, DOT Codex cloud, HRM Her
 restored in 829d6c3): the runtime of the task's `pm` on the board, never the worker's runtime or the session whose
 command started the pass; a task with no `pm` (Transition below) takes the caller's. The name is the session's native
 title on every runtime (§ 8): Claude `--name` on spawn and resume; Codex `thread/name/set`, read back with
-`thread/read` (`exec resume` keeps it); and the first line of every brief, the title a runtime falls back to.
+`thread/read` (`exec resume` keeps it); and the first line of every brief, the title a runtime falls back to. A
+session whose name is not confirmed is no spawn: it is stopped, a `gone` note records its id (R11 retires it), and
+the pass fails (§ 7).
 Changed: ORCH from the session that ran the pass, and Codex threads titled by the brief's first line `You are the
 taskq supervisor ...` → ORCH from the task's `pm`, Codex threads named natively (#572).
 Changed: four roles (root PM, tick, supervisor, worker) → three plus the owner. The supervisor reviewed, published
@@ -666,7 +668,7 @@ the task's code, never starts a session itself (step 4 does it) and never decide
 
 The manager never sees a supervised task's retries: `wait` prints only its `ask` and `closed #N <verdict>`.
 
-A failure (a spawn that cannot start, a board error) stops the pass with `taskq: <error>` and exit 1, no table;
+A failure (a spawn that cannot start or is not named, R3; a board error) stops the pass with `taskq: <error>` and exit 1, no table;
 the tasks it did not reach wait for the next pass. Fix the cause or tell the owner.
 
 ### After each pass
@@ -746,7 +748,7 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 | Runtime | spawn | send | alive | link | retire |
 |---|---|---|---|---|---|
 | Claude | `claude --bg --name "T<N> <ORCH> <title> (<machine>)"` in the project root; tools `Bash Read Edit Write Glob Grep WebFetch WebSearch`, no MCP, `--permission-mode dontAsk` | `claude stop`, then `claude --bg --resume <id> <text>` (a new id) | `claude agents --json --all` | Remote Control URL | `claude stop <job id>` when running, then `claude rm <job id>` |
-| Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread>` in `.taskq/T<N>.pid`; then `codex app-server` `thread/name/set` the name and `thread/read` it back (a mismatch is printed, never fails the spawn) | `codex exec resume <id> <text>` | the pid is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` (or a replaced `T<N>-<thread>.pid`) |
+| Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread>` in `.taskq/T<N>.pid`; then `codex app-server`: `initialize`, `thread/name/set` the name, `thread/read` it back, each after the last one's success, all within 60 s (R3: anything else stops the turn, keeps the pid file, fails the spawn) | `codex exec resume <id> <text>` | the pid is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` (or a replaced `T<N>-<thread>.pid`) |
 
 - A supervisor starts and retires as a worker does, named `S<N> ...` (Codex: `.taskq/S<N>.log`,
   `.taskq/S<N>.pid`), with the same tools, `permission_mode` and `codex` options (R9). A running Claude supervisor

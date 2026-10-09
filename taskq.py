@@ -331,6 +331,13 @@ def codex_options():
     return CONFIG.get('codex', ['-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true',
                                 '--add-dir', str(CONFIG['root'] / '.git')])  # git fetch/commit write the main .git
 
+class Unnamed(Exception):
+    """R3 (#572): a started session whose native name was not confirmed; `thread` is its id."""
+
+    def __init__(self, thread, why):
+        super().__init__(f'{thread} not named: {why}')
+        self.thread = thread
+
 class Codex:
     """`codex exec`, headless: one process per turn, its JSONL in .taskq/<name>.log, `<pid> <thread>` in .taskq/<name>.pid."""
 
@@ -363,36 +370,49 @@ class Codex:
         if old[1:] and old[1] != found:  # #568: a replaced thread not yet retired (a running one) keeps its handle
             pid.rename(pid.with_name(f'{pid.stem}-{old[1]}.pid'))
         pid.write_text(f'{process.pid} {found}')
-        self.title(found, name)
+        try:
+            self.title(found, name)
+        except (OSError, ValueError) as error:  # R3 (#572): no unnamed thread works; its pid file stays for the retire (R11)
+            process.terminate()
+            raise Unnamed(found, error)
         return found
+
+    WAIT = 60  # seconds for the whole app-server exchange, its shutdown included
 
     def title(self, thread, name):
         """R3 (#572): `codex exec` names no thread; the app-server's `thread/name/set` does, `thread/read` proves it.
-        `exec resume` keeps the name. A failure never fails the spawn: it is printed, the prompt's first line stays the title."""
-        calls = [('initialize', {'clientInfo': {'name': 'taskq', 'version': '1'}}), ('thread/name/set', {'threadId': thread, 'name': name}),
-                 ('thread/read', {'threadId': thread})]
-        lines = [json.dumps({'jsonrpc': '2.0', 'id': i, 'method': m, 'params': p}) for i, (m, p) in enumerate(calls)]
-        lines.insert(1, json.dumps({'jsonrpc': '2.0', 'method': 'initialized'}))
-        replies = {}
-        try:  # stdin stays open until the read's reply: the server drops what is pending when its stdin ends
-            with subprocess.Popen([shutil.which('codex') or 'codex', 'app-server'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, env=worker_env(), text=True, encoding='utf-8') as server:
-                timer = threading.Timer(60, server.kill)  # ponytail: one deadline for the whole exchange
-                timer.start()
-                server.stdin.write('\n'.join(lines) + '\n')
-                server.stdin.flush()
-                for line in server.stdout:
-                    msg = json.loads(line) if line.startswith('{') else {}
-                    replies[msg.get('id')] = msg
-                    if 2 in replies:
-                        break
-                timer.cancel()
+        Each request waits for its own successful reply. `exec resume` keeps the name. Raises ValueError unless named."""
+        server = subprocess.Popen([shutil.which('codex') or 'codex', 'app-server'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, env=worker_env(), text=True, encoding='utf-8')
+        timer = threading.Timer(self.WAIT, server.kill)  # one deadline through shutdown: a hung server is killed, its stdout ends
+        timer.start()
+
+        def send(message):
+            server.stdin.write(json.dumps({'jsonrpc': '2.0', **message}) + '\n')
+            server.stdin.flush()
+
+        def call(n, method, params):
+            send({'id': n, 'method': method, 'params': params})
+            for line in server.stdout:  # notifications and the server's own requests pass by
+                reply = json.loads(line) if line.startswith('{') else {}
+                if reply.get('id') == n and 'method' not in reply:
+                    if 'result' not in reply:
+                        raise ValueError(f'{method}: {reply.get("error")}')
+                    return reply['result']
+            raise ValueError(f'{method}: no reply in {self.WAIT} s')
+        try:
+            call(0, 'initialize', {'clientInfo': {'name': 'taskq', 'version': '1'}})
+            send({'method': 'initialized'})
+            call(1, 'thread/name/set', {'threadId': thread, 'name': name})
+            read = call(2, 'thread/read', {'threadId': thread}).get('thread') or {}
+            if (read.get('id'), read.get('name')) != (thread, name):
+                raise ValueError(f'thread/read: {read.get("id")} named {read.get("name")!r}')
+        finally:
+            with contextlib.suppress(OSError):
                 server.stdin.close()
-            read = ((replies.get(2) or {}).get('result') or {}).get('thread') or {}
-        except (OSError, subprocess.SubprocessError, ValueError) as error:
-            read, replies = {}, {1: {'error': str(error)}}
-        if read.get('name') != name:
-            print(f'taskq: codex thread {thread} not named {name!r}: {(replies.get(1) or {}).get("error") or read.get("name")}', file=sys.stderr)
+            server.wait()  # bounded: the timer kills it
+            timer.cancel()
+            server.stdout.close()
 
     def pid_file(self, session):
         return next((path for path in self.folder().glob('*.pid') if path.read_text().split()[1:] == [session]), None)
@@ -972,6 +992,16 @@ def note(who, sid, kind):
     """A spawn note names the role and the id (R11 retires by it), then the link when the runtime has one."""
     return f'{who} {sid}' + (f'\n{link}' if (link := kind.link(sid)) else '')
 
+def spawn_named(item, kind, letter, prompt):
+    """Spawn under the R3 name. A session the runtime could not name (#572) is stopped, recorded by a `gone` note
+    (R11 retires it), never as a spawn; the pass fails (§ 7) and the next one tries again."""
+    try:
+        return kind.spawn(worker_name(item, letter), prompt, CONFIG['root'])
+    except Unnamed as error:
+        role = 'supervisor' if letter == 'S' else 'worker'
+        BOARD.comment(item['iid'], f'**gone** · {who()}\n\n{role} {error}')
+        fail(f'#{item["iid"]}: {role} {error}')
+
 def replace(item, kind, runtime, role, running=False):
     """#568: before a replacement spawn, retire the task's earlier `role` sessions the board records (R11, #478), never
     another task's. A Codex spawn rewrites `.taskq/T<N>.pid` / `S<N>.pid`, the old thread's handle. A replaced
@@ -1049,7 +1079,7 @@ def supervise(item, kinds):
     if fresh and fresh['raw'].get('order') and not (fresh['claim'] or {}).get('session'):  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
         kind = kinds[claim['runtime']]
         replace(item, kind, claim['runtime'], 'worker', running=True)
-        sid = kind.spawn(worker_name(item), brief(item, claim['runtime']), CONFIG['root'])
+        sid = spawn_named(item, kind, 'T', brief(item, claim['runtime']))
         item['claim'], item['raw']['order'] = {**claim, 'session': sid}, None
         move(item, 'doing', 'spawn', note('worker', sid, kind), claim=item['claim'], order=None)
     elif item['state'] == 'doing' and claim.get('session') and claim.get('runtime') in kinds:
@@ -1072,7 +1102,7 @@ def supervise(item, kinds):
             lead.send(boss['session'], f'restart #{n}: your last turn ended {evidence}; read your issue')
         else:  # a new supervisor adopts the live worker from the board; the dead one is retired first
             replace(item, lead, boss['runtime'], 'supervisor')
-            sid = lead.spawn(worker_name(item, 'S'), supervisor_brief(item, boss['runtime'], lead), CONFIG['root'])
+            sid = spawn_named(item, lead, 'S', supervisor_brief(item, boss['runtime'], lead))
             item['supervisor'] = {**boss, 'session': sid}
             move(item, item['state'], 'spawn', note('supervisor', sid, lead), supervisor=item['supervisor'])
     else:
@@ -1218,7 +1248,7 @@ def one_pass(args, table=True):
                 item.update(fresh)
                 runtime = lead(item)
                 replace(item, kinds[runtime], runtime, 'supervisor')  # a requeued task's old S<N>
-                session = kinds[runtime].spawn(worker_name(item, 'S'), supervisor_brief(item, runtime, kinds[runtime]), CONFIG['root'])
+                session = spawn_named(item, kinds[runtime], 'S', supervisor_brief(item, runtime, kinds[runtime]))
                 item.update(supervisor={'runtime': runtime, 'session': session, 'name': here}, claim={'runtime': free, 'session': None, 'name': here})
                 move(item, 'doing', 'spawn', note('supervisor', session, kinds[runtime]), supervisor=item['supervisor'], claim=item['claim'],
                      result=None, order=None)

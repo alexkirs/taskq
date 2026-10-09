@@ -1709,5 +1709,10 @@ class RealChild(unittest.TestCase):
         self.assertRegex(log, r'^\S+ \S+ add #1\n#1 doing\n')
 
 
+class Live526Red(unittest.TestCase):
+    def test_controlled_red(self):
+        self.fail('controlled CI failure #526')
+
+
 if __name__ == '__main__':
     unittest.main()

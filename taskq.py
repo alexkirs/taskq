@@ -106,7 +106,7 @@ def execution_reason(item):
 def executable(issue):
     """#545: a fresh board issue the pass may act on: a task, and eligible; else the reason goes to stderr."""
     item = parse(issue)
-    reason = execution_reason(item) if item else f'#{issue["iid"]} is no longer a task'
+    reason = (execution_reason(item) or policy_reason(issue)) if item else f'#{issue["iid"]} is no longer a task'
     reason and print(f'taskq: {reason}', file=sys.stderr)
     return item if not reason else None
 
@@ -243,7 +243,7 @@ def make_board(config):
 # None, a supervisor's liveness (taskq.md § 7 step 4); without it alive() stands in (False: dead).
 
 def worker_env():  # a worker must not inherit the tick's session id, nor a spawning worker's task (#333)
-    return {key: value for key, value in os.environ.items() if key not in (*SESSIONS.values(), 'TASKQ_TASK', 'TASKQ_RUNTIME')}
+    return {key: value for key, value in os.environ.items() if key not in (*SESSIONS.values(), 'TASKQ_TASK', 'TASKQ_RUNTIME', 'TASKQ_NATIVE_POLICY')}
 
 class Claude:
     # #38, #51, #71: a worker gets only these tools, no MCP, no Chrome, and a pinned mode (else `auto` stops `taskq`).
@@ -359,6 +359,105 @@ def codex_options():
     return CONFIG.get('codex', ['-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true',
                                 '--add-dir', str(CONFIG['root'] / '.git')])  # git fetch/commit write the main .git
 
+def task_policy(issue):
+    """#577: fresh trusted board state is authority; local handles and labels are not."""
+    item = parse(issue)
+    profile = item['raw'].get('execution_profile') if item else None
+    if profile is None:
+        return None
+    notes = [text for text in issue.get('comments', []) if text.startswith('**execution-profile** · owner\n\n')]
+    if not isinstance(profile, str) or not notes or notes[-1] != f'**execution-profile** · owner\n\n{profile}':
+        raise ValueError('execution profile lacks matching explicit owner approval on the board')
+    if profile == 'host-gpu':
+        raise ValueError('unsupported host-gpu: native exec has no action-time approval transport; owner and Mac runtime '
+                         'administrator must provision an isolated Blender/Chrome/GPU runner and record permitted host '
+                         'actions, supported approval client and approval location on this task; answer/requeue is not provisioning')
+    if profile != 'workspace':
+        raise ValueError('unsupported execution profile')
+    if item['runtime'] != 'codex' or (item['pm'] or {}).get('runtime') not in ('codex', 'dot'):
+        raise ValueError('workspace profile requires native Codex supervisor and worker; runtime unchanged')
+    options, kept = list(CONFIG.get('codex', [])), []
+    while options:
+        flag = options.pop(0)
+        if flag in ('-m', '--model') and options:
+            kept += [flag, options.pop(0)]
+        elif flag in ('-c', '--config') and options:
+            value = options.pop(0)
+            if value.split('=', 1)[0] not in ('model', 'model_reasoning_effort') or '=' not in value:
+                raise ValueError('workspace profile conflicts with project Codex options; owner must review configuration')
+            kept += [flag, value]
+        else:
+            raise ValueError('workspace profile conflicts with project Codex options; owner must review configuration')
+    return [*kept, '-s', 'workspace-write', '-c', 'approval_policy="never"',
+            '-c', 'sandbox_workspace_write.network_access=true', '--add-dir', str(CONFIG['root'] / '.git')]
+
+def policy_reason(issue):
+    try:
+        task_policy(issue)
+    except ValueError as error:
+        return str(error)
+    return None
+
+def cmd_policy(args):
+    if session() or os.environ.get('TASKQ_TASK'):
+        fail('execution profile requires explicit owner shell approval, not an agent command')
+    with dispatch_lock() as locked:
+        if not locked:
+            fail('execution profile: dispatch lock busy; nothing changed')
+        current = task(args.n)
+        if current['claim'] or current['supervisor']:
+            fail('execution profile: retire the existing claim/supervisor before changing policy')
+        move(current, current['state'], 'execution-profile', args.profile,
+             execution_profile=None if args.profile == 'default' else args.profile)
+
+def effective_policy(n):
+    """Read only policy fields from the latest context; never return prompts, environment or credentials."""
+    issue = BOARD.get(n)
+    options = task_policy(issue)
+    if options is None:
+        return {'profile': 'default', 'effective': 'unverified (legacy defaults unchanged)'}
+    me = session() or {}
+    if me.get('runtime') != 'codex':
+        raise ValueError('effective-policy mismatch: not a native Codex turn')
+    path = Codex().pid_file(me['session'])
+    token = os.environ.get('TASKQ_NATIVE_POLICY')
+    try:
+        handle = json.loads(path.with_suffix('.policy').read_text()) if path else {}
+        if not path or not re.fullmatch(rf'[TS]{n}', path.stem) or not token or handle.get('token') != token:
+            raise ValueError('native adapter handle absent (including app continuation)')
+        home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+        files = list(home.glob(f'sessions/*/*/*/rollout-*-{glob.escape(me["session"])}.jsonl'))
+        if len(files) != 1:
+            raise ValueError('current rollout unavailable or ambiguous')
+        context = None
+        with files[0].open() as stream:
+            for line in stream:
+                if re.search(r'"type":\s*"turn_context"', line):
+                    entry = json.loads(line)
+                    if entry.get('type') == 'turn_context':
+                        context = entry
+        if not context or datetime.fromisoformat(context['timestamp'].replace('Z', '+00:00')).timestamp() < handle['started']:
+            raise ValueError('fresh turn context absent')
+        payload = context['payload']
+        policy = payload.get('sandbox_policy') or {}
+        if payload.get('approval_policy') != 'never' or policy.get('type') != 'workspace-write' \
+                or policy.get('network_access') is not True \
+                or policy.get('writable_roots') != [str(CONFIG['root'] / '.git')]:
+            raise ValueError('observed sandbox/approval/network/Git policy differs from workspace profile')
+    except (OSError, KeyError, TypeError, AttributeError, json.JSONDecodeError):
+        raise ValueError('effective-policy mismatch: unreadable or malformed native policy evidence') from None
+    except ValueError as error:
+        raise ValueError(f'effective-policy mismatch: {error}') from None
+    return {'profile': 'workspace', 'adapter': 'native-exec', 'sandbox': 'workspace-write',
+            'approval': 'never', 'network': True, 'git_writable': True,
+            'model': payload.get('model'), 'effort': payload.get('effort'), 'turn': payload.get('turn_id')}
+
+def cmd_policy_check(args):
+    try:
+        print(json.dumps(effective_policy(args.n)))
+    except ValueError as error:
+        fail(f'#{args.n}: {error}; stop task work and report on the board')
+
 class Unnamed(Exception):
     """R3 (#572): a started session whose native name was not confirmed; `thread` is its id."""
 
@@ -374,10 +473,29 @@ class Codex:
         return CONFIG['root'] / '.taskq'
 
     def exec(self, name, arguments, cwd):
+        match = re.match(r'[TS](\d+)(?: |$)', name)
+        options, env = codex_options(), worker_env()
+        if match:
+            n = int(match[1])
+            issue = BOARD.get(n)
+            try:
+                selected = task_policy(issue)
+            except ValueError as error:
+                fail(f'#{n}: {error}')
+            if selected is not None:
+                if os.environ.get('CODEX_SANDBOX'):
+                    fail(f'#{n}: profiled execution requires the native adapter outside the worker sandbox')
+                options = selected
+                token = os.urandom(16).hex()
+                self.folder().joinpath(f'{name.split()[0]}.policy').write_text(
+                    json.dumps({'token': token, 'started': time.time()}))
+                env['TASKQ_NATIVE_POLICY'] = token
+                arguments = [*arguments[:-1], f'Before task work run `python3 {Path(__file__).resolve()} policy-check {n}`. '
+                             'Stop on mismatch; report it on the board.\n' + arguments[-1]]
         log, detach = self.folder() / f'{name.split()[0]}.log', {'creationflags': 0x208} if os.name == 'nt' else {'start_new_session': True}
         with open(log, 'ab') as out:  # detached: the worker outlives the tick
-            process = subprocess.Popen([shutil.which('codex') or fail('codex not found'), 'exec', '--json', *codex_options(), *arguments],
-                                       cwd=cwd, env=worker_env(), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
+            process = subprocess.Popen([shutil.which('codex') or fail('codex not found'), 'exec', '--json', *options, *arguments],
+                                       cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
         dispatch('turn end', [], after=process.pid)  # #525: a sandboxed turn starts no pass; one runs when it ends (no sender, no timer)
         return process, log
 
@@ -446,6 +564,12 @@ class Codex:
         return next((path for path in self.folder().glob('*.pid') if path.read_text().split()[1:] == [session]), None)
 
     def send(self, session, text):
+        if self.pid_file(session) is None:
+            for issue in BOARD.list(None):
+                item = parse(issue)
+                if item and item['raw'].get('execution_profile') is not None and session in (
+                        (item['claim'] or {}).get('session'), (item['supervisor'] or {}).get('session')):
+                    fail(f'#{item["iid"]}: effective-policy mismatch: resume has no native adapter handle')
         process, log = self.exec(getattr(self.pid_file(session), 'stem', session), ['resume', session, text], CONFIG['root'])
         log.with_suffix('.pid').write_text(f'{process.pid} {session}')
         return session
@@ -480,6 +604,7 @@ class Codex:
                 os.kill(int(pid), signal.SIGTERM)
             subprocess.run([shutil.which('codex') or 'codex', 'archive', thread], capture_output=True, timeout=60)
             path.unlink()
+            path.with_suffix('.policy').unlink(missing_ok=True)
 
     def tail(self, session):
         path = self.pid_file(session)
@@ -581,16 +706,21 @@ def cmd_list(args):
 
 def cmd_take(args):
     current, mine = task(args.n, 'ready'), session() or fail('take needs an agent session: set ' + ' or '.join(SESSIONS.values()))
-    guarded = 'assignee-only' in current['labels']  # #576: unlabelled take is unchanged
+    guarded = 'assignee-only' in current['labels'] or current['raw'].get('execution_profile') is not None
     with dispatch_lock() if guarded else contextlib.nullcontext(True) as locked:
         if not locked:
             fail('cannot take: another taskq process holds .taskq/dispatch.lock; nothing taken, run it again')
-        reason = execution_reason(current)
+        reason = execution_reason(current) or policy_reason(BOARD.get(args.n))
+        if not reason and current['raw'].get('execution_profile'):
+            try:
+                effective_policy(args.n)
+            except ValueError as error:
+                reason = str(error)
         if reason:
             fail(reason)
         if guarded:  # re-read under the lock after the identity call: a pass may have claimed the task meanwhile
             current = task(args.n, 'ready')
-            reason = execution_reason(current) or current['supervisor'] and f'#{args.n} already has a supervisor'
+            reason = execution_reason(current) or policy_reason(BOARD.get(args.n)) or current['supervisor'] and f'#{args.n} already has a supervisor'
             if reason:
                 fail(reason)
         if open_deps(current['deps']):
@@ -615,7 +745,10 @@ MOVES = {'ask': (('doing', 'review'), 'ask', lambda args: {'decision': decision(
 
 def cmd_move(args):
     sources, state, fields = MOVES[args.command]
-    move(task(args.n, *sources), state, args.command, args.text, **fields(args))
+    current = task(args.n, *sources)
+    if args.command == 'result' and current['raw'].get('execution_profile') is not None:
+        cmd_policy_check(args)
+    move(current, state, args.command, args.text, **fields(args))
 
 def role(current):
     """Who runs this command for the task: supervisor, worker, manager, owner (a plain shell), or None (another session)."""
@@ -630,6 +763,11 @@ def gate(current):
     """R3 one controller (#525): `run`, `close` and a rework `requeue` of a supervised task come from its supervisor, the
     task's own manager, its `pm` (on the owner's word, #532), or the owner's shell; another session, another manager too, is refused."""
     found, boss = role(current), current['supervisor']
+    if found in ('supervisor', 'worker') and current['raw'].get('execution_profile') is not None:
+        try:
+            effective_policy(current['iid'])
+        except ValueError as error:
+            fail(str(error))
     if boss and found not in ('supervisor', 'manager', 'owner'):
         fail(f'#{current["iid"]} is supervised by {boss["runtime"]}:{boss["session"][:8]}: only it, the task\'s manager or the owner controls it')
     return found
@@ -1398,6 +1536,9 @@ def report(items, listed, kinds, here):
     items = list(filter(mine, items))
 
     def state(item):  # what the row says; only a plain `ready` is counted ready
+        profile = item['raw'].get('execution_profile')
+        if profile is not None and profile != 'workspace':
+            return 'blocked (unsupported host-gpu)' if profile == 'host-gpu' else 'blocked (unsupported execution profile)'
         deps = ', '.join(f'#{n}' for n in item['deps'] or [] if n in listed)
         if item['state'] == 'waiting':
             return f'waiting ({deps})' if deps else 'waiting'
@@ -1410,7 +1551,7 @@ def report(items, listed, kinds, here):
     url = CONFIG.get('board_url') or {'github': f'https://{host or "github.com"}/{repo}/issues',
                                       'gitlab': f'https://{host or "gitlab.com"}/{repo}/-/issues'}.get(CONFIG['board'])
     lines = [CONFIG['root'].name + (f' · [board]({url})' if url else ''),  # a board file names its page in `board_url`
-             f'In work {count("doing", "review")} · Waiting for answer {count("ask")} · Ready {count("ready")}', '']
+             f'In work {sum(item["state"] in ("doing", "review") for item in items)} · Waiting for answer {sum(item["state"] == "ask" for item in items)} · Ready {count("ready")}', '']
     rows = [row(item, kinds, here, states[item['iid']]) for item in items if item['state'] not in ('ask', 'later')]
     lines += ['| Task | State | Runtime | Session |', '|---|---|---|---|', *rows, ''] if rows else []  # empty: left out
     cards = decisions(items)
@@ -1709,6 +1850,8 @@ def main(argv=None):
             (('--priority',), {'type': int, 'choices': (1, 2), 'default': 2}), (('--host',), {}), n=False)
     command('list', cmd_list, (('state',), {'nargs': '?', 'choices': STATES}), n=False)
     command('take', cmd_take)
+    command('policy', cmd_policy, (('--profile',), {'required': True, 'choices': ('default', 'workspace', 'host-gpu')}))
+    command('policy-check', cmd_policy_check)
     card = ((('--option',), {'action': 'append', 'default': []}), (('--recommend',), {'type': int, 'default': 1}),
             (('--link',), {'action': 'append', 'default': []}))  # #490: the decision card
     command('ask', cmd_move, *card, text='required')

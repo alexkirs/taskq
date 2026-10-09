@@ -561,3 +561,76 @@ Recommend option 1: no general wording cure was established and more trials in t
 explicitly stopped. A narrowing requires owner acceptance under R13, then a contract amendment before any
 further implementation. Neither this packet nor the option publishes, deploys or closes the task. The existing
 supervisor must independently review the exact candidate; no replacement reviewer/sender is started.
+## 9. Task #577
+
+Candidate implementation only; main publication and live qualification remain held. R9/R13 and
+[task execution profiles](../taskq.md#task-execution-profiles-577) are the policy SoT. No new approval
+transport was implemented. The restricted `workspace` profile is an offline-tested selection and evidence
+guard, not a qualified GPU route. The `host-gpu` profile deliberately refuses execution before spawn/resume.
+The existing supervisor must independently review the exact candidate SHA and CI, then `taskq ask 577` with
+the PR link, missing topology and an explicit separate publication choice. Never close this task before that
+authorization: close publishes. Do not activate held csgo #340/#336/#341/#342/#348.
+
+### Safe evidence, 2026-10-10
+
+Read-only metadata from the current worker, not a new spawn/resume or GPU qualification:
+
+| Boundary | Observed | Limit |
+|---|---|---|
+| Installed CLI | codex-cli 0.159.3; exec help supports sandbox/config overrides | Help is syntax evidence, not effective-policy application |
+| Installed generated schema | CommandExecutionRequestApprovalParams, PermissionsRequestApprovalParams, ThreadStartParams, ThreadResumeParams, TurnStartParams present | Approval RPC exists; no inference or approval request was sent |
+| TaskQ native adapter | exec stdin is DEVNULL; app-server handles initialize/name-set/thread-read only | No action-time approval request/response handler; expanded actions unsupported |
+| Current worker rollout | source=exec, cli_version=0.159.3, originator=codex_work_desktop; workspace-write, never; repository Git metadata writable; gpt-6.1-sol, low | Current Git prerequisite only; desktop originator proves neither app continuation nor future policy |
+| Credential availability | OPENAI_API_KEY, CODEX_API_KEY, OPENAI_BASE_URL absent; auth file present; login status exits 0, ChatGPT login reported | Auth contents not read; no credentials copied, printed or changed; availability proves no inference entitlement |
+| Backend metadata | configured provider openai, custom provider count 0, local profile count 0 | No endpoint/token values printed; no backend changes |
+| Project limits | live checkout Claude0/Codex4; candidate tracked configuration Claude4/Codex4 | No settings changed; candidate must not dispatch live without the approved isolated Claude0/Codex4 setup |
+| Native profile spawn/resume | Real local process/file boundary with fake CLI; isolated tests verify selection, new per-turn handles and context mismatch | No paid/live Codex turn; no actual browser proof; not a live PASS |
+| Blender/Chrome/GPU | No probe performed | No approved external runner supplied; live qualification incomplete |
+
+[Official app-server approvals](https://developers.openai.com/codex/app-server) require the client to respond
+to server-initiated approval requests. The installed schema supports these requests; the absence is in this
+TaskQ execution adapter, not a claim that Codex itself lacks approvals. Adding a transport is outside #577's
+requeue scope. The profile guard uses a native per-turn handle and a fresh rollout context; it is cooperative
+runtime evidence, not an ACL, cryptographic attestation, or proof that arbitrary desktop continuation inherits
+native policy. Local handles never select or approve a profile. Missing evidence must stop task work.
+
+### External prerequisite and original observations
+
+Owner and Mac runtime administrator: provision an isolated real Blender/Chrome/GPU runner, name its supported
+action-time approval client, record permitted host-side actions and the approval location on #577, and obtain
+separate qualification scope preserving TaskQ approval never, model/effort/runtime and Claude0/Codex4 limits.
+A manually approved host-side prerequisite executor can be evaluated separately; none has been supplied or
+qualified. A board answer alone does not provision it. Do not retry the previously denied bind/Chrome topology.
+After the reviewable candidate exists, the supervisor asks for this concrete prerequisite and a separate
+publication choice. Proposed future unblock order must be reviewed after qualification; no order is activated.
+
+Original evidence and game acceptance criteria remain unchanged:
+
+- [csgo #342](https://gitlab.ufobe.com/alex/csgo/-/issues/342): existing own model must pass build/import/version/
+  update/selection and actual movement/shoot/reload/death proof; launcher qualification blocks it.
+- [csgo #348](https://gitlab.ufobe.com/alex/csgo/-/issues/348): project-wide codex array selected spawn/resume,
+  codex-full-access unused; workspace-write/never and taskq Git metadata read-only led to worktree ref-lock EPERM,
+  later fetch exit 255/FETCH_HEAD denial. Repeated owner answers returned to ask without supplying the external
+  prerequisite. Historical failures were not retried here; current worker Git access does not qualify csgo.
+- [csgo #336](https://gitlab.ufobe.com/alex/csgo/-/issues/336): own P6 selectable, real third-person/death evidence;
+  bounded Chrome launch returned steps=[] and "Chrome did not report a debugging port". This alone does not
+  distinguish launcher sandbox, host, Chrome or GPU failure. No working GPU route is established.
+- [csgo #341](https://gitlab.ufobe.com/alex/csgo/-/issues/341) depends on #336. #340 also remains held.
+
+### Offline regression evidence
+
+Tests live in [ExecutionPolicy](../tests/test_single.py); existing Tick/Commands/Contract cases retain lifecycle
+coverage. Historical selection and permission failures are reported observations, not red-before-fix replay.
+The local fake-CLI test makes no real adapter/model calls; elapsed time and CI belong in the exact-SHA result.
+
+| Requirement / consequence | Assertion and cheapest level | Red before fix | Blindspot / disposition |
+|---|---|---|---|
+| Unrelated tasks acquire permissions | No profile leaves project defaults unchanged; labels/prose confer nothing (isolated) | reported selection gap | Retain; real defaults are not requalified |
+| Forged/mismatched task selection | Owner-shell gate, matching trusted approval note, unsupported profile/options rejected (isolated) | unknown | Retain; existing board ACL trust remains |
+| S/W or resume/restart use different policy | Fresh resolver at exec, equivalent options, new turn handle; requeue/adopt retain board field (isolated) | reported project-wide selection | Retain; paid lifecycle proof still needed |
+| App continuation silently inherits permission claim | Same thread without native handle rejected; stale/newest mismatched rollout context rejected (isolated) | unknown | Retain; cooperative handle, no OS attestation |
+| External prerequisite answer/retry loop | host-gpu remains blocked after answer/requeue, zero runtime starts (isolated) | reported | Retain; external runner unavailable |
+| Environment leaks session authority or credentials | Parent ids/old handle removed; credential transport unchanged; output excludes secret fixture (isolated) | unknown | Retain; auth availability is not entitlement |
+| Process/env boundary loses selection | Bounded real child with fake CLI records applied argv/env on spawn/resume (local boundary) | synthetic candidate check | Retain; no real Codex/GPU capability claimed |
+
+No benchmark, test migration or cost instrumentation. Development/model cost and historical flake rate unknown.

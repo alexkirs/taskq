@@ -15,10 +15,9 @@ BLOCK = re.compile(r'<!-- taskq:start -->\s*```json\n(.*?)\n```\s*<!-- taskq:end
 SESSIONS = {'claude': 'CLAUDE_CODE_SESSION_ID', 'codex': 'CODEX_THREAD_ID', 'hermes': 'HERMES_SESSION_ID'}
 CONFIG, BOARD = {}, None  # set by main, or by a test
 GUARD, GUARD_WAIT, GUARD_PAUSE = threading.local(), 30, 2
-CHECK_POLLS, CHECK_PAUSE = 60, 10  # pr-mode close waits up to 10 min for the 'tests' check / the MR pipeline
 
 class SettledError(SystemExit):
-    """A fully acknowledged terminal transition (for example CI-red requeue), still a CLI refusal."""
+    """A fully known refusal; tasks lists only acknowledged transitions that need an event."""
     def __init__(self, message, tasks):
         super().__init__(f'taskq: {message}')
         self.tasks = tasks
@@ -310,7 +309,13 @@ class GitHub:
         return [self.issue(item) for item in self.pages(query) if 'pull_request' not in item]  # None: every open issue (§ 2)
 
     def get(self, n):
-        return {**self.issue(self.api('GET', f'issues/{n}')), 'comments': [item['body'] for item in self.pages(f'issues/{n}/comments')]}
+        return {**self.metadata(n), 'comments': self.comments(n)}
+
+    def metadata(self, n):
+        return self.issue(self.api('GET', f'issues/{n}'))
+
+    def comments(self, n):
+        return [item['body'] for item in self.pages(f'issues/{n}/comments')]
 
     def add(self, title, body, labels):
         return self.api('POST', 'issues', {'title': title, 'body': body, 'labels': labels})['number']
@@ -376,9 +381,8 @@ class GitLab(GitHub):
         query = 'issues?state=opened' + (f'&labels={PREFIX}{state}' if state else '')
         return [self.issue(item) for item in self.pages(query)]  # None: every open issue (§ 2)
 
-    def get(self, n):
-        return {**self.issue(self.api('GET', f'issues/{n}')), 'comments': [
-            item['body'] for item in self.pages(f'issues/{n}/notes?sort=asc&activity_filter=only_comments')]}
+    def comments(self, n):
+        return [item['body'] for item in self.pages(f'issues/{n}/notes?sort=asc&activity_filter=only_comments')]
 
     def add(self, title, body, labels):
         return self.api('POST', 'issues', {'title': title, 'description': body, 'labels': ','.join(labels)})['iid']
@@ -723,8 +727,21 @@ def runtimes():
 
 # --- commands -------------------------------------------------------------------------------
 
+def read_issue(n):
+    """Fresh metadata when supported; legacy adapters keep their complete get(n) contract."""
+    return getattr(BOARD, 'metadata', BOARD.get)(n)
+
+
+def issue_history(issue):
+    """Load trusted comments only when consumed, without another metadata request."""
+    if 'comments' not in issue:
+        comments = getattr(BOARD, 'comments', None)
+        issue = {**issue, 'comments': comments(issue['iid']) if comments else BOARD.get(issue['iid'])['comments']}
+    return issue
+
+
 def task(n, *states):
-    issue = BOARD.get(n)
+    issue = read_issue(n)
     found = parse(issue) if issue['state'] == 'open' else None
     if not found:
         fail(f'#{n} is not an open taskq task')
@@ -741,7 +758,7 @@ def move(current, state, action, text='', **fields):
     print(f'#{current["iid"]} {state or "closed"}')
 
 def open_deps(deps):
-    return [n for n in deps or [] if BOARD.get(n)['state'] == 'open']
+    return [n for n in deps or [] if read_issue(n)['state'] == 'open']
 
 def cmd_add(args):
     text = f'## Goal\n\n{args.goal}\n\n## Acceptance\n\n{args.acceptance}'
@@ -911,15 +928,11 @@ def merge(current, sha):
         gate = 'check tests'
         runs = lambda: [(run['status'] == 'completed', run['conclusion'] == 'success') for run in
                         run_api('gh', host, 'GET', f'repos/{CONFIG["repo"]}/commits/{head}/check-runs?check_name=tests')['check_runs']]
-    for _ in range(CHECK_POLLS):  # ponytail: fixed poll; tests.yml takes 8-13 s
-        polled = runs()
-        if polled and all(done for done, _ in polled):
-            if not all(ok for _, ok in polled):
-                back(f'{gate} failed on {head}')
-            break
-        time.sleep(CHECK_PAUSE)
-    else:
-        back(f'{gate} did not finish on {head}')
+    checked = runs()  # never wait for CI while holding the project's mutation guard
+    if not checked or not all(done for done, _ in checked):
+        raise SettledError(f'#{current["iid"]}: PR {number} {gate} pending or missing on {head}; retry after CI finishes', [])
+    if not all(ok for _, ok in checked):
+        back(f'{gate} failed on {head}')
     keep = CONFIG.get('workspace') == 'external'  # #477: the host owns the branch; the repo's own policy may still delete it
     _, out = effect(cli, *(['glab', 'mr', 'merge', number, '--squash', *['--remove-source-branch'] * (not keep), '--sha', head, '--auto-merge=false', '--yes'] if lab
                    else ['gh', 'pr', 'merge', number, '--squash', *['--delete-branch'] * (not keep), '--match-head-commit', head]))
@@ -949,19 +962,22 @@ def cleanup(current):
 
 def cmd_close(args):
     """close N [M ...]: in order; no PR is updated (#359). A failed task does not stop the rest."""
-    failed = []
+    failed, changed = [], []
     for n in args.n:
         try:
             close_one(argparse.Namespace(n=n, text=args.text))
+            changed.append(n)
         except SystemExit as error:
             if (getattr(GUARD, 'held', None) or {}).get('poisoned'):
                 raise  # no more closes or settled-event dispatch after an uncertain effect
             if len(args.n) == 1:
                 raise
             failed.append(n)
+            if isinstance(error, SettledError):
+                changed.extend(error.tasks)
             print(error, file=sys.stderr)
     if failed:
-        raise SettledError(f'not closed: {" ".join(f"#{n}" for n in failed)}', args.n)
+        raise SettledError(f'not closed: {" ".join(f"#{n}" for n in failed)}', changed)
 
 def publish_direct(current, sha, git):
     """#533: close is acceptance; transfer and qualify the exact candidate before main can change."""
@@ -989,7 +1005,7 @@ def publish_direct(current, sha, git):
     else:  # custom board: the reviewer verifies project-owned CI/checks (§ 6)
         green = True
     if not green:
-        fail(f'#{current["iid"]}: CI is not green on candidate {sha}')
+        raise SettledError(f'#{current["iid"]}: CI is not green on candidate {sha}', [])
     if run('ls-remote', 'origin', branch).split()[:1] != [sha]:
         fail(f'{branch}: remote candidate changed during acceptance')
     run('push', 'origin', f'{sha}:refs/heads/main')
@@ -1359,7 +1375,7 @@ def supervise(item, kinds, worker_allowed=True):
         if boss['runtime'] == 'hermes':
             fail('Hermes native supervisor bridge is not configured')
         return
-    fresh = executable(BOARD.get(n), item)  # #532: the list may lag a spawn; #545: or an assignee-only label or reassignment
+    fresh = executable(read_issue(n), item)  # #532: the list may lag a spawn; #545: or an assignee-only label or reassignment
     if not fresh:
         return  # ineligible: sessions, claim and order stay as they are
     admitted = True
@@ -1383,12 +1399,12 @@ def supervise(item, kinds, worker_allowed=True):
             if follow(item, kind, claim, True) is None:
                 return  # #576: no supervisor send, resume or respawn either
     state = lead_state(lead, boss['session'])
-    issue = BOARD.get(n)
+    issue = read_issue(n)
     if not executable(issue, item):
         return  # #545: a reassignment seen by this second read stops every supervisor send, resume and respawn
     if state == 'dead':
         evidence = tail_of(lead, boss['session']) or 'no log'
-        if lead_deaths(issue['comments']):  # the second death since the last result or answer: the owner decides
+        if lead_deaths(issue_history(issue)['comments']):  # the second death since the last result or answer: the owner decides
             move(item, 'ask', 'ask', f'supervisor {boss["session"]} is gone again: fix the runtime, then answer.\n\nLast log line: {evidence}')
             return
         move(item, item['state'], 'gone', f'supervisor {boss["session"]} is gone: {evidence}')
@@ -1400,9 +1416,9 @@ def supervise(item, kinds, worker_allowed=True):
             sid = spawn_named(item, lead, 'S', supervisor_brief(item, boss['runtime'], lead))
             item['supervisor'] = {**boss, 'session': sid}
             move(item, item['state'], 'spawn', note('supervisor', sid, lead), supervisor=item['supervisor'])
-    else:
-        found, count = pending(issue, boss)
-        if found and state == 'idle':  # running: its own wait (Claude) or the pass at its turn's end (Codex) delivers them; idle: its process ended: resume it with the events (#525: no sender, no timer)
+    elif state == 'idle':
+        found, count = pending(issue_history(issue), boss)
+        if found:  # running: its own wait or turn-end pass delivers events; idle: resume with events
             sid = effect(lead.send, boss['session'], f'{" ".join(found)}: read your issue')
             seen(n, sid, count)
             if sid != boss['session']:  # Claude resumes under a new id (#284): record it; the old one is refused and retired
@@ -1496,7 +1512,7 @@ def one_pass(args, table=True):
     with contextlib.nullcontext() if blind else coordination():  # a sandbox pass remains read-only
         held = not blind
         tasks = getattr(args, 'tasks', None) or []  # #481: the list lags the event's own write (a new issue, a label): read those directly
-        issues = [issue for issue in BOARD.list(None) if issue['iid'] not in tasks] + [issue for issue in map(BOARD.get, tasks) if issue['state'] == 'open']
+        issues = [issue for issue in BOARD.list(None) if issue['iid'] not in tasks] + [issue for issue in map(read_issue, tasks) if issue['state'] == 'open']
         items = sorted(filter(None, map(parse, issues)), key=lambda item: (item['priority'], item['iid']))
         blind = bool(os.environ.get('CODEX_SANDBOX'))  # #502: a sandbox sees no other session alive: it would requeue live workers as gone
         if blind:
@@ -1505,7 +1521,7 @@ def one_pass(args, table=True):
         if ready:
             # Admission/accounting use fresh reservations, including work outside this host-label scope.
             # A lagging list can otherwise hide an active worker or overwrite a claim moved to another machine.
-            fresh_issues = [BOARD.get(item['iid']) for item in ready]
+            fresh_issues = [read_issue(item['iid']) for item in ready]
             items = ready = sorted(filter(None, (parse(issue) for issue in fresh_issues if issue['state'] == 'open')),
                                    key=lambda item: (item['priority'], item['iid']))
         worker_slots, occupied = set(), {}
@@ -1529,7 +1545,7 @@ def one_pass(args, table=True):
                     busy[claim.get('runtime')] = busy.get(claim.get('runtime'), 0) + 1
                 continue
             if item['state'] == 'waiting' and not open_deps(item['deps']):
-                if not executable(BOARD.get(item['iid']), item):
+                if not executable(read_issue(item['iid']), item):
                     continue
                 move(item, 'ready', 'ready', 'dependencies closed')
                 item['state'] = 'ready'
@@ -1541,7 +1557,7 @@ def one_pass(args, table=True):
                 continue
             if item['state'] != 'doing' or claim.get('name') != here or claim.get('runtime') not in kinds:
                 continue  # another machine's, or a session no runtime here can see
-            if not executable(BOARD.get(item['iid']), item):  # #545: the list's labels may lag; an ineligible task keeps its session and slot
+            if not executable(read_issue(item['iid']), item):  # #545: the list's labels may lag; an ineligible task keeps its session and slot
                 busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
                 continue
             runtime = kinds[claim['runtime']]  # step 2: unsupervised (R3 Transition: started before #525, or taken by hand)
@@ -1565,7 +1581,7 @@ def one_pass(args, table=True):
                 continue  # no manager: the task waits, the table says so; another machine's manager: that machine starts it (§ 7 step 3)
             names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
             free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 0 if local is not None else 1)), None)
-            fresh = free and executable(BOARD.get(item['iid']), item)  # #357: the board may have moved since the list; #545: eligibility
+            fresh = free and executable(read_issue(item['iid']), item)  # #357: the board may have moved since the list; #545: eligibility
             if fresh and fresh['state'] == 'ready' and fresh['pm'] == item['pm']:  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
                 if local is not None and fresh['runtime'] not in ('any', free):
                     continue  # a stale list must not select a different or disabled worker runtime
@@ -1798,7 +1814,7 @@ def cmd_pm(args):
     with coordination() if args.adopt else contextlib.nullcontext():
         snapshot = [item for item in map(parse, BOARD.list(None)) if item]
         if args.adopt:
-            snapshot = list(filter(None, (parse(BOARD.get(item['iid'])) for item in snapshot)))
+            snapshot = list(filter(None, (parse(read_issue(item['iid'])) for item in snapshot)))
         if me and any(role(item) in ('supervisor', 'worker') for item in snapshot):
             fail('a recorded supervisor or worker cannot take the manager role (R3 one controller)')
         if args.adopt:
@@ -1942,7 +1958,8 @@ def main(argv=None):
         with coordination() if writes else contextlib.nullcontext():
             done = args.function(args)
     except SettledError as error:
-        dispatch(args.command, error.tasks)
+        if error.tasks:
+            dispatch(args.command, error.tasks)
         raise
     if args.command in EVENTS:
         dispatch(args.command, done if args.command in ('add', 'answer') else args.n)

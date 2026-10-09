@@ -515,6 +515,7 @@ class DirectPublication(Base):
             with self.subTest(checks=checks), self.assertRaisesRegex(SystemExit, 'CI is not green'):
                 self.close()
             self.assertEqual((self.task(1)['state'], self.main_sha()), ('review', self.base))
+            self.assertIsNone(self.board.guard)
 
     def test_main_advance_during_ci_refuses_push_without_losing_work(self):
         self.git('checkout', 'main')
@@ -573,8 +574,7 @@ class PullRequests(Base):
         return polls.pop(0) if len(polls) > 1 else polls[0]
 
     def close(self, *numbers):
-        with mock.patch.object(taskq.subprocess, 'run', side_effect=self.cli), mock.patch.object(taskq.shutil, 'which', side_effect=lambda name: name), \
-                mock.patch.object(taskq.time, 'sleep'):
+        with mock.patch.object(taskq.subprocess, 'run', side_effect=self.cli), mock.patch.object(taskq.shutil, 'which', side_effect=lambda name: name):
             return self.run_cli('close', *(numbers or ['1']), '--text', 'accepted; users see it; open: none')
 
     def merges(self):
@@ -631,11 +631,45 @@ class PullRequests(Base):
             self.prs[0].update(headRefOid='a' * 40, baseRefName='main')
         self.assertEqual((self.task(1)['state'], [call[1] for call in self.calls]), ('review', ['list', 'list']))
 
-    def test_waits_for_tests(self):
-        self.checks['a' * 40] = [[], [('queued', None)], [('completed', 'success'), ('in_progress', None)], [('completed', 'success')]]
-        self.close()
-        self.assertEqual((len(self.merges()), self.board.issues[1]['state']), (1, 'closed'))
-        self.assertEqual(sum('check-runs' in call[3] for call in self.calls if call[0] == 'api'), 4)
+    def test_pending_or_missing_tests_refuse_once_without_requeue(self):
+        before = self.board.get(1)
+        for checks in ([], [('queued', None)], [('completed', 'success'), ('in_progress', None)]):
+            self.calls.clear()
+            self.checks['a' * 40] = [checks, [('completed', 'success')]]
+            with self.subTest(checks=checks), mock.patch.object(taskq, 'dispatch') as dispatch, \
+                    mock.patch.object(taskq.time, 'sleep', side_effect=AssertionError('CI must not wait')) as sleep, \
+                    self.assertRaisesRegex(SystemExit, 'pending or missing'):
+                self.close()
+            self.assertEqual(self.board.get(1), before)
+            self.assertEqual(self.merges(), [])
+            self.assertEqual(sum('check-runs' in call[3] for call in self.calls if call[0] == 'api'), 1)
+            self.assertIsNone(self.board.guard)
+            dispatch.assert_not_called()
+            sleep.assert_not_called()
+        self.close()  # a later attempt sees the green exact head
+        self.assertEqual(self.board.issues[1]['state'], 'closed')
+
+    def test_batch_pending_after_close_releases_and_dispatches_only_changes(self):
+        self.add()
+        self.run_cli('take', '2')
+        self.run_cli('result', '2', '--sha', 'b' * 40)
+        self.branches['taskq-2'] = [{'number': 8, 'headRefOid': 'b' * 40, 'baseRefName': 'main'}]
+        self.checks['b' * 40] = [[('queued', None)]]
+        before = self.board.get(2)
+        self.checks['a' * 40] = [[('queued', None)]]
+        with mock.patch.object(taskq, 'dispatch') as dispatch, self.assertRaisesRegex(SystemExit, 'not closed: #1 #2$'):
+            self.close('1', '2')
+        self.assertEqual(self.task(1)['state'], 'review')
+        self.assertEqual(self.board.get(2), before)
+        self.assertIsNone(self.board.guard)
+        dispatch.assert_not_called()
+        self.checks['a' * 40] = [[('completed', 'success')]]
+        with mock.patch.object(taskq, 'dispatch') as dispatch, self.assertRaisesRegex(SystemExit, 'not closed: #2$'):
+            self.close('1', '2')
+        self.assertEqual(self.board.issues[1]['state'], 'closed')
+        self.assertEqual(self.board.get(2), before)
+        self.assertIsNone(self.board.guard)
+        dispatch.assert_called_once_with('close', [1])
 
     def test_failed_tests_requeue(self):
         self.checks['a' * 40] = [[('completed', 'failure')]]
@@ -676,9 +710,16 @@ class PullRequests(Base):
         taskq.CONFIG.update(board='gitlab', host='git.example')
         self.prs = [{'iid': 7, 'sha': 'a' * 40, 'target_branch': 'main'}]
 
-    def test_gitlab_waits_for_pipeline_and_merges_at_sha(self):
+    def test_gitlab_checks_pipeline_once_and_merges_at_sha(self):
         self.gitlab()
         self.checks['mr'] = [[], [('a' * 40, 'running'), ('b' * 40, 'success')], [('a' * 40, 'success')]]
+        before = self.board.get(1)
+        for _ in range(2):
+            with mock.patch.object(taskq, 'dispatch') as dispatch, self.assertRaisesRegex(SystemExit, 'pending or missing'):
+                self.close()
+            self.assertEqual(self.board.get(1), before)
+            self.assertIsNone(self.board.guard)
+            dispatch.assert_not_called()
         self.assertEqual(self.close(), '#1 closed\n')
         self.assertEqual(self.calls[0], ['mr', 'list', '--source-branch', 'taskq-1', '--output', 'json', '-R', 'https://git.example/o/r'])
         self.assertEqual(sum(call[:4] == ['api', '-X', 'GET', 'projects/o%2Fr/merge_requests/7/pipelines'] and call[-2:] == ['--hostname', 'git.example']
@@ -1052,8 +1093,11 @@ class Tick(TickSetup):
                     self.board.issues[2]['labels'].remove('host-mac')
                 before = json.dumps(self.board.issues, sort_keys=True)
                 with mock.patch.dict(os.environ, {'TASKQ_LIMITS': '{"fake":1}', 'TASKQ_HOST_ONLY': 'mac'}), \
-                        mock.patch.object(self.board, 'list', return_value=listed):
+                        mock.patch.object(self.board, 'list', return_value=listed), \
+                        mock.patch.object(self.board, 'metadata', create=True,
+                                          side_effect=lambda n: {k: v for k, v in self.board.get(n).items() if k != 'comments'}) as metadata:
                     self.run_cli('tick')
+                self.assertIn(mock.call(2), metadata.call_args_list)  # metadata, not the stale list, owns capacity
                 self.assertEqual(self.task(1)['claim']['session'], None)
                 self.assertEqual(self.task(1)['raw']['order'], 'run')
                 self.assertEqual(self.task(2)['claim'], active)
@@ -1489,8 +1533,12 @@ class Tick(TickSetup):
                 def reassign(lead, session):
                     self.board.issues[n]['assignees'] = ['bob']
                     return real(lead, session)
-                with mock.patch.object(taskq, 'lead_state', side_effect=reassign), contextlib.redirect_stderr(io.StringIO()):
+                with mock.patch.object(taskq, 'lead_state', side_effect=reassign), contextlib.redirect_stderr(io.StringIO()), \
+                        mock.patch.object(self.board, 'metadata', create=True,
+                                          side_effect=lambda n: {k: v for k, v in self.board.get(n).items() if k != 'comments'}) as metadata, \
+                        mock.patch.object(self.board, 'comments', create=True, side_effect=AssertionError('ineligible history read')):
                     self.run_cli('tick')
+                self.assertGreaterEqual(metadata.call_count, 3)  # accounting plus both admission reads
                 self.assertEqual((self.fake.names, self.fake.sent), ([f'S{n} UNK restricted (mac)'], []))
                 self.assertEqual((self.task(n)['supervisor'], self.task(n)['state']), (boss, 'doing'))
                 self.assertNotIn('**gone**', self.notes(n))
@@ -2746,6 +2794,36 @@ class Cleanup(Base):
 
 
 class Model(Base):
+
+    def test_metadata_reads_skip_comments_and_history_keeps_adapter_trust(self):
+        for board, lab in ((taskq.GitHub('o/r'), False), (taskq.GitLab('o/r'), True)):
+            with self.subTest(board=type(board).__name__):
+                taskq.BOARD = board
+                raw = {'number': 1, 'iid': 1, 'title': 't', 'body': taskq.block('g', {}),
+                       'description': taskq.block('g', {}), 'html_url': 'u', 'web_url': 'u',
+                       'labels': ['q-ready'] if lab else [{'name': 'q-ready'}],
+                       'state': 'opened' if lab else 'open', 'updated_at': 'now', 'author_association': 'OWNER'}
+                board.members = {1}
+                trusted = {'body': 'trusted answer', 'author': {'id': 1}, 'author_association': 'OWNER'}
+                untrusted = {'body': 'untrusted answer', 'author': {'id': 2}, 'author_association': 'NONE'}
+                with mock.patch.object(board, 'api', side_effect=[raw, raw, [trusted, untrusted]]) as api:
+                    issue = taskq.read_issue(1)
+                    self.assertNotIn('comments', issue)
+                    self.assertEqual(taskq.open_deps([1]), [1])  # a second fresh metadata request
+                    self.assertEqual(api.call_args_list, [mock.call('GET', 'issues/1')] * 2)
+                    self.assertEqual(taskq.issue_history(issue)['comments'], ['trusted answer'])
+                    self.assertEqual(api.call_count, 3)
+                    self.assertIn('/notes?' if lab else '/comments?', api.call_args.args[1])
+                with mock.patch.object(board, 'api', side_effect=[raw, [trusted]]) as api:
+                    self.assertEqual(board.get(1)['comments'], ['trusted answer'])  # old public get stays complete
+                    self.assertEqual(api.call_count, 2)
+
+    def test_legacy_get_fallback_retains_comments_without_an_extra_read(self):
+        self.add()
+        with mock.patch.object(self.board, 'get', wraps=self.board.get) as get:
+            issue = taskq.read_issue(1)
+            self.assertEqual(taskq.issue_history(issue), issue)
+            get.assert_called_once_with(1)
 
     def test_block_keeps_unknown_keys(self):
         board = taskq.BOARD = FakeBoard()

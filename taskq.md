@@ -124,8 +124,12 @@ and children acquire independently. Tokens are never inherited by a child. Every
 accounting/admission: a lagging list is not authority. A conflicting acquisition waits up to 30 seconds, then fails
 visibly; it never writes a local pending receipt. Unknown acquisition/authentication/transport errors fail immediately.
 A successful operation releases its exact token. A failure before effects begin may release; an exception after
-any effect began conservatively retains the grant, except an explicitly identified, fully acknowledged terminal
-transition (such as CI-red requeue), which releases and triggers its event despite the CLI refusal. This is because a lost response or unrecorded spawn may still act.
+any effect began conservatively retains the grant, except an explicitly identified, fully acknowledged outcome
+(such as CI-red requeue or pending-CI refusal). These release despite the CLI refusal; only completed transitions
+trigger events. A batch retains the grant if any earlier effect is unknown. This is because a lost response or unrecorded spawn may still act.
+Changed (owner-approved queue optimization, 2026-10-10): polling PR CI under the project guard → one exact-head
+CI read per close attempt. Pending or missing CI leaves review unchanged and releases the guard, including after
+acknowledged earlier closes in a batch; the reviewer retries after CI completes, outside the guard.
 Release failure is visible and never retried automatically. There is no timeout-based ownership expiry, stealing,
 or claim of fencing an old in-flight operation. Recovery requires explicitly stopping/draining all relevant
 controllers and in-flight requests, reconciling board state and runtime sessions, then deleting only the exact
@@ -282,6 +286,8 @@ This file is the whole contract (with [docs/single-file.md](docs/single-file.md)
 here; they never copy it. A change of behavior updates this file in the same deliverable.
 Changed: testing mechanics implicit in worker/review commands → § 10 defines risk-based evidence, preserved
 fault detection and a bounded pilot; no broad suite migration (#533).
+Changed (owner-approved queue optimization, 2026-10-10): full history on every fresh read → optional metadata-only
+adapter reads and lazy trusted comments (§ 2), preserving fresh admission checks and custom `get(n)` compatibility.
 Changed: "the Wiki is the SoT; principles.md is its packaged copy" → `taskq.md` at the root is the SoT (#289, #290).
 Changed: Open "delete the Wiki pages or mark them stale" → the Wiki is a stub linking here (#452).
 
@@ -351,6 +357,8 @@ edits this file first, in the same deliverable; code, README and pages follow it
 recorded decision is an `ask` with options, not an edit. Only the owner accepts a change of a decision here.
 Changed: publication/testing contradiction in § 5/§ 6 → accepted #530 methodology and candidate-first
 publication reconciled in § 5/§ 6/§ 7/§ 10 (#533, owner approval 2026-10-09); supervisor reviews, worker implements.
+Changed (owner-approved queue optimization, 2026-10-10): guarded CI waiting and mandatory full-history reads →
+R4's immediate CI refusal and R8's metadata reads, specified before implementation; exact-SHA review and publication remain required.
 Every agent (Claude, Codex, DOT, Hermes, other) reads this file before work; `AGENTS.md` and `CLAUDE.md` point here.
 
 ## Product
@@ -493,6 +501,10 @@ in the intended invocation shell. Setting these values alone starts no queue and
 
 Board file: six data functions plus `acquire(owner)` and `release(token)` for writes; modules without the guard support read-only commands only. An issue is a dict `{iid, title, body, labels, state: open|closed,
 updated_at, url}`, optionally `assignees` (logins); `get` adds `comments` (a list of strings, oldest first).
+Optional `metadata(n)` returns the same fresh issue without comments; optional `comments(n)` returns trusted
+comments in oldest-first order. Built-in adapters provide both. TaskQ uses metadata for current state, claims,
+eligibility and capacity, and fetches history only where consumed. Neither caches nor removes a fresh safety read.
+Adapters without these optional methods retain the full `get(n)` path unchanged.
 With `"assignee": "me"` or an `assignee-only` task the file also needs `user()`: the authenticated current login.
 The configured `assignee` filter (and its cached `me`) is selection, never identity authentication.
 
@@ -704,8 +716,9 @@ Rules:
   a head that differs from the result SHA, or several PRs, refuses the close.
 - `pr` mode on GitHub (#359): `main` requires the `tests` check (`.github/workflows/tests.yml`) on the PR head only,
   not strict: a PR behind `main` merges without an update. `close` merges only a head with `tests` green; GitHub
-  refuses a PR with conflicts. `tests.yml` runs again on `main` after each merge, as the alarm. A conflict, a failed
-  `tests`, or no result within 10 min sends the task back to `ready`. Set the rule once (repo admin):
+  refuses a PR with conflicts. `tests.yml` runs again on `main` after each merge, as the alarm. A conflict or failed
+  `tests` sends the task back to `ready`. Each close reads CI once: pending or missing checks leave `review`
+  unchanged, release the guard and refuse without an event; retry after CI finishes. Set the rule once (repo admin):
 
   ```sh
   echo '{"required_status_checks": {"strict": false, "checks": [{"context": "tests", "app_id": 15368}]},
@@ -718,9 +731,10 @@ Rules:
   Changed: strict check, `close` updates a behind PR (`gh pr update-branch`) and merges the new head → `tests` on the
   PR head only, no update (#308 → #359): the strict check made merges serial, about 41 s each (#269).
 - `pr` mode on GitLab (#479), same flow: `close` finds the open MR of `taskq-<N>` (`glab mr list --source-branch`),
-  waits for the MR's latest pipeline on its head (`projects/:id/merge_requests/:iid/pipelines`) to reach `success`,
-  then `glab mr merge --squash --remove-source-branch --sha <head>`. A failed, canceled or skipped pipeline, no
-  finished pipeline within 10 min, or a refused merge (conflict) sends the task back to `ready`. The project needs CI
+  checks the MR's latest pipeline on its head once (`projects/:id/merge_requests/:iid/pipelines`) for `success`,
+  then `glab mr merge --squash --remove-source-branch --sha <head>`. A pending or missing
+  pipeline leaves `review` unchanged with the guard released; a refused merge (conflict) sends the
+  task back to `ready`, as does a failed/canceled/skipped pipeline. The project needs CI
   (`.gitlab-ci.yml`) that runs on MRs, and squash allowed. Self-managed: `"host"` in `taskq.json`; `glab` gets
   `-R https://<host>/<group>/<project>`.
 - An answer without a commit, or a legacy result already on `origin/main`: `close` verifies ancestry and closes

@@ -638,7 +638,7 @@ def cmd_cleanup(args):
     if CONFIG.get('workspace') == 'external':
         kept.append('worktrees and branches: owned by host (workspace: external)')
     else:
-        git('fetch', '-q', 'origin')
+        git('fetch', '-q', '--prune', 'origin')  # #515: a branch GitHub already deleted is neither reported nor pushed
         dry or git('worktree', 'prune')
         for tree in sorted((root / '.worktrees').glob('taskq-*'), key=lambda path: path.name):
             if not re.fullmatch(r'taskq-\d+', tree.name) or not tree.is_dir():

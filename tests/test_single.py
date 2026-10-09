@@ -896,6 +896,14 @@ class Cleanup(Base):
         self.assertEqual(self.cleanup(), out[7:])  # a second run removes nothing, keeps and reports the same
         self.assertEqual(self.state(), after)
 
+    def test_remote_branch_deleted_elsewhere(self):
+        sha = self.git('rev-parse', 'origin/taskq-4').strip()
+        self.git('push', '-q', 'origin', '--delete', 'taskq-4')  # #515: deleted on the remote, a stale origin/taskq-4 left here
+        self.git('update-ref', 'refs/remotes/origin/taskq-4', sha)
+        out = self.cleanup()
+        self.assertFalse([line for line in out if 'origin/taskq-4' in line])
+        self.assertNotIn('refs/remotes/origin/taskq-4', self.state()[1])
+
     def test_external_workspace_touches_no_worktree_or_branch(self):
         taskq.CONFIG['workspace'] = 'external'  # #477
         trees, refs = self.state()[:2]

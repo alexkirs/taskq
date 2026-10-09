@@ -284,9 +284,9 @@ Runtime file: four module-level functions, two more optional.
   (`taskq: dispatch stopped: <error>`) go to `.taskq/dispatch.log` and never fail the command. The child reads the
   event's tasks by number: the board's list may not show a write made a second earlier.
 - A command refuses a task in the wrong state and says which state it is in.
-- `cleanup` (#476), on demand only, never run by a tick or an event. After `git fetch origin` it removes, for tasks
-  not open: a clean `.worktrees/taskq-<N>` (`git worktree remove`); a local or `origin` branch `taskq-<N>` with nothing
-  unmerged (an ancestor of `origin/main`, or a squash-merged one: merging it into `origin/main` changes no file;
+- `cleanup` (#476), on demand only, never run by a tick or an event. After `git fetch --prune origin` (#515: a branch
+  already deleted on the remote is neither reported nor pushed) it removes, for tasks not open: a clean
+  `.worktrees/taskq-<N>` (`git worktree remove`); a local or `origin` branch `taskq-<N>` with nothing unmerged (an ancestor of `origin/main`, or a squash-merged one: merging it into `origin/main` changes no file;
   needs git >= 2.38); a stopped session of a closed task found through each runtime's `retire` (Claude: names
   `T<N> ` and the old `S<N> `) only when the task records its id (#478: the block's claim, the spawn note's link, or
   the take note's `<runtime>:<id prefix>`); `.taskq/S<N>.pid` of dead processes; `.taskq/wait.json` entries of tasks

@@ -4462,7 +4462,7 @@ class HermesPilotLocal(unittest.TestCase):
         bare_before = REAL_RUN([git, '--git-dir', str(self.root / 'origin.git'), 'show-ref'], capture_output=True, text=True, timeout=20).stdout
         local = taskq.load_file('taskq.py', self.root)
         local.CONFIG, local.BOARD = config, local.make_board(config)
-        raw = {'claim': {'runtime': 'codex', 'session': 'fixture-worker', 'name': 'local-pilot'},
+        raw = {'event_schema': 1, 'claim': {'runtime': 'codex', 'session': 'fixture-worker', 'name': 'local-pilot'},
                'supervisor': {'runtime': 'hermes', 'session': 'fixture-supervisor', 'name': 'local-pilot'},
                'pm': {'runtime': 'hermes', 'session': 'fixture-manager', 'name': 'local-pilot'},
                'result': {'sha': seed, 'checks': 'local research answer'}}

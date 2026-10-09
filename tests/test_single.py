@@ -29,7 +29,7 @@ class FakeBoard:
 
     def list(self, state):
         return [dict(issue) for issue in self.issues.values() if issue['state'] == 'open'
-                and any(label == f'q-{state}' if state else label.startswith('q-') for label in issue['labels'])]
+                and (not state or f'q-{state}' in issue['labels'])]  # None: every open issue, a task or not (§ 2)
 
     def get(self, n):
         return dict(self.issues[n])
@@ -576,7 +576,7 @@ class Tick(TickSetup):
         self.assertIn('**spawn** · claude:01234567\n\nsupervisor s-S1\nhttps://watch/s-S1', self.board.issues[1]['comments'])
         self.assertIn('| [#1 one](https://board/1) | doing | fake | [s-S1](https://watch/s-S1) |', out)
         self.assertTrue(out.startswith(f'{self.root.name} · [board](https://github.com/o/r/issues)\n'))
-        self.assertTrue(out.endswith('\nMode: event queue (R4); this report ran a pass; sender unknown (taskq arm tick)\n'))
+        self.assertTrue(out.endswith('\n\nMode: events · arm: unconfirmed · taskq arm tick\n'))
         with self.acting('s-S1'):
             self.run_cli('run', '1')  # the supervisor orders; its event pass spawns the worker
         self.assertEqual((self.task(1)['claim']['session'], self.fake.names[-1]), ('s-T1', 'T1 UNK one (mac)'))
@@ -630,12 +630,13 @@ class Tick(TickSetup):
 
     def test_status_report_one_snapshot_read_only(self):
         """#574 (R6): counters and rows from one list and one filter; review is in work; blocked, waiting and later are never
-        ready; `status` lists once and writes, pulls, dispatches and spawns nothing; `arm tick` output is no sender proof."""
+        ready, nor is one whose dep is an open ordinary issue (same list); `status` lists once and writes, pulls, dispatches
+        and spawns nothing; `arm tick` output is no sender proof; titles, reasons and options stay one cell."""
         taskq.CONFIG['limits'] = {'fake': 0}  # the adds' passes start nothing
         with contextlib.redirect_stdout(io.StringIO()):
             self.add('gone')
             self.board.issues[1]['state'] = 'closed'
-            for title in ('doing', 'review', 'asking', 'a|b [x]'):
+            for title in ('doing', 'review', 'asking', 'a|b\n[x]'):
                 self.add(title)
             self.add('dep closed', '--deps', '1')
             self.add('dep open', '--deps', '5')
@@ -645,10 +646,14 @@ class Tick(TickSetup):
             self.run_cli('later', '9', '--text', 'not now')
             self.unmanaged()
             self.add('orphan')
+            self.manager('fake')
+            self.board.add('plain bug', 'no taskq block', ['bug'])  # #11: an open ordinary issue, never a task
+            self.add('dep issue', '--deps', '11')
+            taskq.move(self.task(12), 'ready', 'requeue')  # ready, its dep an open non-task issue: blocked, not Ready
             for n in (2, 3, 4):
                 self.legacy(n)
             self.run_cli('result', '3', '--sha', 'a' * 40, '--text', 'done')
-            self.run_cli('ask', '4', '--text', 'Built A.\nKeep it?', '--option', 'keep', '--option', 'drop', '--recommend', '2')
+            self.run_cli('ask', '4', '--text', 'Built A | B.\nKeep it?', '--option', 'keep\nit', '--option', 'drop', '--recommend', '2')
         before, lists = json.dumps(self.board.issues, sort_keys=True), []
         listing = self.board.list
         with mock.patch.object(self.board, 'list', lambda state: lists.append(state) or listing(state)), \
@@ -670,21 +675,25 @@ class Tick(TickSetup):
             | [#7 dep open](https://board/7) | blocked (#5 open) | any |  |
             | [#8 waits](https://board/8) | waiting (#5) | any |  |
             | [#10 orphan](https://board/10) | blocked (no manager) | any |  |
+            | [#12 dep issue](https://board/12) | blocked (#11 open) | any |  |
 
-            Questions (answer: taskq answer N.M ...):
-            [#4 asking](https://board/4) ask: Built A. · 4.1 keep · 4.2 drop ★
+            Questions (answer N.M):
+
+            | Question | Brief reason | Options |
+            |---|---|---|
+            | [#4 asking](https://board/4) | Built A \\| B. | 4.1 keep it · 4.2 drop ★ |
 
             Later: [#9 parked](https://board/9)
 
-            Mode: event queue (R4); read-only, no pass; sender unknown (taskq arm tick)
+            Mode: events · arm: unconfirmed · taskq arm tick
             '''))
         self.run_cli('arm', 'tick', SESSION)  # prints a sender prompt; nothing proves a sender runs
-        self.assertIn('; sender unknown (taskq arm tick)\n', self.run_cli('status'))
+        self.assertTrue(self.run_cli('status').endswith('\nMode: events · arm: unconfirmed · taskq arm tick\n'))
 
     def test_status_empty_queue_is_compact(self):
+        # #574: an empty table or section is left out, no placeholder
         self.assertEqual(self.run_cli('status'), f'{self.root.name} · [board](https://github.com/o/r/issues)\n'
-                         'In work 0 · Waiting for answer 0 · Ready 0\n\nNothing in work.\n\n'
-                         'Mode: event queue (R4); read-only, no pass; sender unknown (taskq arm tick)\n')
+                         'In work 0 · Waiting for answer 0 · Ready 0\n\nMode: events · arm: unconfirmed · taskq arm tick\n')
 
     def test_second_quick_death_asks(self):
         # #393: an unsupervised worker that dies at once is requeued once, then the owner is asked with the last log line
@@ -762,10 +771,11 @@ class Tick(TickSetup):
                      '--recommend', '2', '--link', 'https://x/shot.png', '--link', 'https://x/demo.mp4')
         self.run_cli('result', '2', '--sha', 'a' * 40, '--text', 'Done X', '--option', 'close as is', '--option', 'also do Y')
         self.run_cli('result', '3', '--sha', 'a' * 40, '--text', 'plain')  # no options: no card
-        out = self.run_cli('tick').split('Questions (answer: taskq answer N.M ...):\n')[1].split('\n\n')[0]
+        out = self.run_cli('tick').split('Questions (answer N.M):\n\n')[1].split('\n\n')[0]
         self.assertEqual(out.splitlines(), [
-            '[#1 one](https://board/1) ask: Built A and B. · ![1](https://x/shot.png) · https://x/demo.mp4 · 1.1 keep A · 1.2 keep B ★',
-            '[#2 two](https://board/2) review: Done X · 2.1 close as is ★ · 2.2 also do Y'])
+            '| Question | Brief reason | Options |', '|---|---|---|',
+            '| [#1 one](https://board/1) | Built A and B. · ![1](https://x/shot.png) · https://x/demo.mp4 | 1.1 keep A · 1.2 keep B ★ |',
+            '| [#2 two](https://board/2) review | Done X | 2.1 close as is ★ · 2.2 also do Y |'])
         taskq.CONFIG['inline_media'] = False
         self.assertIn(' · https://x/shot.png · ', self.run_cli('tick'))
         for bad, message in (('1.3', 'no option 3'), ('3.1', 'no option 1'), ('1.x', 'codes like'), ('9', 'codes like')):

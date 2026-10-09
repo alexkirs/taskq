@@ -130,8 +130,7 @@ class GitHub:
 
     def list(self, state):
         query = 'issues?state=open' + (f'&labels={PREFIX}{state}' if state else '')
-        return [self.issue(item) for item in self.pages(query) if 'pull_request' not in item
-                and any(label['name'].startswith(PREFIX) for label in item['labels'])]
+        return [self.issue(item) for item in self.pages(query) if 'pull_request' not in item]  # None: every open issue (§ 2)
 
     def get(self, n):
         return {**self.issue(self.api('GET', f'issues/{n}')), 'comments': [item['body'] for item in self.pages(f'issues/{n}/comments')]}
@@ -170,7 +169,7 @@ class GitLab(GitHub):
 
     def list(self, state):
         query = 'issues?state=opened' + (f'&labels={PREFIX}{state}' if state else '')
-        return [self.issue(item) for item in self.pages(query) if any(label.startswith(PREFIX) for label in item['labels'])]
+        return [self.issue(item) for item in self.pages(query)]  # None: every open issue (§ 2)
 
     def get(self, n):
         return {**self.issue(self.api('GET', f'issues/{n}')), 'comments': [
@@ -1195,11 +1194,14 @@ def row(item, kinds, here, state=None):
     cell = f'[{session[:8]}]({url})' if url else session and f'{session[:8]} on {claim.get("name")}'
     return f'| {heading(item)} | {state or item["state"]} | {runtime} | {cell} |'
 
+def cell(text):
+    """R6 (#574): one table cell and one link text: a newline becomes a space; `|`, `[`, `]` and a backslash are escaped."""
+    return re.sub(r'([\\[\]|])', r'\\\1', ' '.join(str(text).split()))
+
 def heading(item):
-    """`[#N <title>](url)`, the title cut to 60 and safe inside a link and a table cell (R6, #574)."""
-    title = item.get('title') or ''
-    title = re.sub(r'([\\[\]|])', r'\\\1', title if len(title) <= 60 else title[:59] + '…')
-    text = f'#{item["iid"]} {title}'.strip()
+    """`[#N <title>](url)`, the title cut to 60 (R6, #574)."""
+    title = ' '.join((item.get('title') or '').split())
+    text = f'#{item["iid"]} {cell(title if len(title) <= 60 else title[:59] + "…")}'.strip()
     return f'[{text}]({item["url"]})' if item.get('url') else text
 
 def one_pass(args, table=True):
@@ -1263,19 +1265,18 @@ def one_pass(args, table=True):
         if held and not blind:  # R11 (#360, #525): stopped sessions the board no longer holds, by recorded id only
             retire(stale({item['iid']: item for item in items}), 'could not remove stopped sessions', running=False)
     if table:
-        report(items, kinds, here, 'this report ran a pass' if held and not blind else 'no pass ran here')
+        report(items, {issue['iid'] for issue in issues}, kinds, here)
     return held
 
 def cmd_status(args):
     """`taskq status` (R6, #574): the report with no pass: one board list; no pull, write, dispatch or session."""
-    items = sorted(filter(None, map(parse, BOARD.list(None))), key=lambda item: (item['priority'], item['iid']))
-    report(items, runtimes(), machine(), 'read-only, no pass')
+    issues = BOARD.list(None)
+    items = sorted(filter(None, map(parse, issues)), key=lambda item: (item['priority'], item['iid']))
+    report(items, {issue['iid'] for issue in issues}, runtimes(), machine())
 
-def report(items, kinds, here, mode):
-    """R6 (#574): the one report of tick and status. Counters and rows come from the same `items` (one board list) and the
-    same filter; a dep is open when the list holds it. ponytail: a dep open on the board but not a task counts closed;
-    a BOARD.get per dep would leave the snapshot."""
-    listed = {item['iid'] for item in items}
+def report(items, listed, kinds, here):
+    """R6 (#574): the one report of tick and status. Counters and rows come from the same `items` and the same filter; a dep
+    is open when `listed`, the iids of that same board list (every open issue, a task or not), holds it: no BOARD.get."""
     items = list(filter(mine, items))
 
     def state(item):  # what the row says; only a plain `ready` is counted ready
@@ -1293,17 +1294,17 @@ def report(items, kinds, here, mode):
     lines = [CONFIG['root'].name + (f' · [board]({url})' if url else ''),  # a board file names its page in `board_url`
              f'In work {count("doing", "review")} · Waiting for answer {count("ask")} · Ready {count("ready")}', '']
     rows = [row(item, kinds, here, states[item['iid']]) for item in items if item['state'] not in ('ask', 'later')]
-    lines += ['| Task | State | Runtime | Session |', '|---|---|---|---|', *rows] if rows else ['Nothing in work.']
+    lines += ['| Task | State | Runtime | Session |', '|---|---|---|---|', *rows, ''] if rows else []  # empty: left out
     cards = decisions(items)
-    lines += ['', 'Questions (answer: taskq answer N.M ...):', *cards] if cards else []
+    lines += ['Questions (answer N.M):', '', '| Question | Brief reason | Options |', '|---|---|---|', *cards, ''] if cards else []
     later = [heading(item) for item in items if item['state'] == 'later']
-    lines += ['', 'Later: ' + ', '.join(later)] if later else []
-    print('\n'.join([*lines, '', f'Mode: event queue (R4); {mode}; sender unknown (taskq arm tick)']))
+    lines += ['Later: ' + ', '.join(later), ''] if later else []
+    print('\n'.join([*lines, 'Mode: events · arm: unconfirmed · taskq arm tick']))  # R12: taskq records no sender
 
 MEDIA = re.compile(r'\.(png|jpe?g|gif|webp|svg)(\?.*)?$', re.I)
 
 def decisions(items):
-    """#490, R6 Questions: one line per task waiting on the owner: an ask, or a review with options; ★ the recommended one.
+    """#490, R6 Questions: one table row per task waiting on the owner: an ask, or a review with options; ★ the recommended one.
     Images inline unless `inline_media` is false."""
     lines = []
     for item in items:
@@ -1312,8 +1313,9 @@ def decisions(items):
             continue
         n, inline = item['iid'], CONFIG.get('inline_media', True)
         links = [f'![{n}]({link})' if inline and MEDIA.search(link) else link for link in card.get('links') or []]
-        options = [f'{n}.{k} {text}' + ' ★' * (k == card.get('recommend')) for k, text in enumerate(card.get('options') or [], 1)]
-        lines.append(' · '.join(filter(None, [f'{heading(item)} {item["state"]}: {card.get("summary") or item["title"]}', *links, *options])))
+        options = [f'{n}.{k} {cell(text)}' + ' ★' * (k == card.get('recommend')) for k, text in enumerate(card.get('options') or [], 1)]
+        question = heading(item) + ' review' * (item['state'] == 'review')
+        lines.append(f'| {question} | {" · ".join([cell(card.get("summary") or item["title"]), *links])} | {" · ".join(options)} |')
     return lines
 
 EVENTS = ('add', 'answer', 'run', 'result', 'requeue', 'close')  # R4 (#333): each starts one pass after its move

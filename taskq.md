@@ -140,24 +140,50 @@ Changed: `taskq problem` → `requeue --text` or a plain issue comment (#290).
 ### R6. Human report
 
 One report per project, printed by `taskq tick` after its pass and by `taskq status` (read-only, § 4), one renderer
-(#574). From one board list (one snapshot) and one filter (`assignee`, § 2), in this order:
+(#574). From one board list (one snapshot of every open issue, § 2) and one filter (`assignee`, § 2), in this order;
+an empty table or section is left out, with no placeholder:
 
 1. `<project> · [board](<url>)`: the project root's folder name and the board page.
 2. Exactly three counters: `In work N · Waiting for answer N · Ready N`. In work: `doing` and `review` (a review is
-   still in work; its row says `review`). Waiting for answer: `ask`. Ready: `ready` with no open dep in the snapshot and
-   a manager (`pm`) that can start it; any other `ready` is blocked, never counted ready. `waiting` and `later` are
+   still in work; its row says `review`). Waiting for answer: `ask`. Ready: `ready` with no dep open in the snapshot
+   (a task or an ordinary issue) and a manager (`pm`) that can start it; any other `ready` is blocked, never counted ready. `waiting` and `later` are
    never ready.
 3. The table of current work `| Task | State | Runtime | Session |`, one row per open task except `ask` (item 4) and
    `later` (item 5), by priority, then number. A row is `| [#N <title>](<issue url>) | <state> | <runtime> |
    [<session[:8]>](<link>) |`; a blocked or waiting row names why: `blocked (no manager)`, `blocked (#M open)`,
-   `waiting (#M)`. No rows: `Nothing in work.`
-4. `Questions (answer: taskq answer N.M ...):` one line per `ask`, and per `review` with options (#490): `[#N
-   <title>](url) <state>: <reason, the ask's first line> · <links> · N.1 <option> · N.2 <option> ★`; ★ marks the
-   recommended option; `taskq answer N.M` answers it. Omitted when empty.
-5. `Later: [#N <title>](url), ...` on one line. Omitted when empty.
-6. One mode line, what taskq proved only (R12): `Mode: event queue (R4); this report ran a pass` (`tick`) or `...;
-   read-only, no pass` (`status`), then `; sender unknown (taskq arm tick)`. taskq records no sender: `arm tick`
-   only prints a prompt, never proof that a sender runs, so the sender is always unknown here.
+   `waiting (#M)`.
+4. `Questions (answer N.M):`, then the table `| Question | Brief reason | Options |`, one row per `ask`, and per
+   `review` with options (#490): `| [#N <title>](url) | <the ask's first line> · <links> | N.1 <option> · N.2
+   <option> ★ |` (a review adds `review` after the link); ★ marks the recommended option. The owner answers `N.M`
+   only; the manager runs `taskq answer N.M` (§ 7 After each pass).
+5. `Later: [#N <title>](url), ...` on one line.
+6. One mode line: `Mode: events · arm: unconfirmed · taskq arm tick`. taskq proves only its event chain (R4); it records
+   no sender, and `arm tick` only prints a prompt, so arming is never shown as confirmed (R12).
+
+Titles, reasons and options pass one formatter: a newline becomes a space, `|`, `[`, `]` and `\` are escaped, so a
+cell stays one table cell and one link. Illustrative only, never a live status:
+
+```
+taskq · [board](https://github.com/OWNER/REPO/issues)
+In work 2 · Waiting for answer 1 · Ready 1
+
+| Task | State | Runtime | Session |
+|---|---|---|---|
+| [#12 Fix login](…/12) | doing | claude | [1a2b3c4d](https://claude.ai/code/session_…) |
+| [#13 Docs \| FAQ](…/13) | review | codex | [019a0b1c](https://alexkirs.github.io/taskq/open.html#codex://threads/…) |
+| [#15 Release notes](…/15) | ready | any |  |
+| [#16 Deploy](…/16) | blocked (#14 open) | any |  |
+
+Questions (answer N.M):
+
+| Question | Brief reason | Options |
+|---|---|---|
+| [#14 New logo](…/14) | Made two variants. · ![14](…/a.png) | 14.1 keep A · 14.2 keep B ★ |
+
+Later: [#9 Dark mode](…/9)
+
+Mode: events · arm: unconfirmed · taskq arm tick
+```
 
 Session links: Claude `https://claude.ai/code/session_<id>` in every client. Codex: `codex://threads/<id>` direct when
 the client that finally renders the report is Codex, else the wrapper `<pages>/open.html#codex://threads/<id>`. That
@@ -173,8 +199,8 @@ Unknown (R12): taskq cannot tell the Codex app from the Codex CLI or IDE (all ge
 and other OS are not observed.
 Changed: `taskq tick` printed a table of every task, then `Board: <url>`, then a `Decisions` block with `(recommended)`;
 the link was "https only" (#488) while #521 already made it client-specific → one report: project and board,
-three counters, the work table with titles, Questions with ★, Later, a mode line; `taskq status` prints it read-only;
-the final rendering client, `TASKQ_CLIENT` first, picks the Codex link (#574).
+three counters, the work table with titles, a Questions table with ★ answered `N.M`, Later, a mode line; `taskq status`
+prints it read-only; the final rendering client, `TASKQ_CLIENT` first, picks the Codex link (#574).
 Changed: the Codex link was always the https wrapper → direct when the tick runs in Codex, else the wrapper (#521).
 Changed: a space-padded `Session link` column → the markdown table with `[#N](issue)` and session links (#489).
 Changed: a heading per project and owner questions inside the tick output → one project per tick, questions added by
@@ -332,7 +358,7 @@ With `"assignee": "me"` the file also needs `user()`: the current login.
 
 | Function | Does |
 |---|---|
-| `list(state)` | open issues with label `q-<state>`; `None`: every issue with a `q-*` label |
+| `list(state)` | open issues with label `q-<state>`; `None`: every open issue, a task or not (a non-task one only shows that a dependency is open, R6; a board file that returns only `q-*` issues counts such a dependency closed) |
 | `get(n)` | one issue with its comments |
 | `add(title, body, labels)` | new issue; returns its number |
 | `update(n, labels=None, body=None)` | replace the labels and/or the body |

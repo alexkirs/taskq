@@ -34,6 +34,24 @@ def machine():
     name = os.environ.get('TASKQ_HOST') or socket.gethostname()
     return CONFIG.get('hosts', {}).get(name) or name.split('.')[0].lower()
 
+def local_limits():
+    """#604: explicit inherited limits replace, never merge with, shared defaults."""
+    if 'TASKQ_LIMITS' not in os.environ:
+        return None
+    try:
+        limits = json.loads(os.environ['TASKQ_LIMITS'])
+    except ValueError:
+        limits = None
+    if not isinstance(limits, dict) or not limits or any(not re.fullmatch(r'[a-z][a-z0-9_-]*', name)
+            or type(value) is not int or value < 0 for name, value in limits.items()):
+        fail('TASKQ_LIMITS needs a nonempty JSON object of runtime names to nonnegative integers')
+    return limits
+
+def host_scope(item):
+    """#604: explicit host only; conflicting labels fail closed, including fresh board reads."""
+    wanted = os.environ.get('TASKQ_HOST_ONLY')
+    return wanted is None or [label for label in item['labels'] if label.startswith(ON)] == [ON + wanted]
+
 ORCH = {'claude': 'CLD', 'codex': 'CDX', 'dot': 'DOT', 'hermes': 'HRM', 'grok': 'GRK'}
 
 def worker_name(item, letter='T'):
@@ -88,6 +106,8 @@ def mine(item):
 
 def execution_reason(item):
     """#545: an `assignee-only` task runs only for the board's authenticated user among its native assignees. None: allowed."""
+    if not host_scope(item):
+        return f'#{item["iid"]}: outside TASKQ_HOST_ONLY={os.environ["TASKQ_HOST_ONLY"]}; execution refused'
     if 'assignee-only' not in item['labels']:
         return None
     prefix = f'#{item["iid"]} assignee-only'
@@ -1163,7 +1183,7 @@ def follow(item, kind, claim, supervised):
     item['claim'] = claim  # the nudge comment is now the last note: one send per answer
     return claim
 
-def supervise(item, kinds):
+def supervise(item, kinds, worker_allowed=True):
     """§ 7 step 4, a supervised task whose supervisor runs here: the pass is its hands, never its judge."""
     n, boss, claim = item['iid'], item['supervisor'], item['claim'] or {}
     lead = kinds.get(boss['runtime'])
@@ -1174,11 +1194,14 @@ def supervise(item, kinds):
     fresh = executable(BOARD.get(n))  # #532: the list may lag a spawn; #545: or an assignee-only label or reassignment
     if not fresh:
         return  # ineligible: sessions, claim and order stay as they are
+    if ('TASKQ_HOST_ONLY' in os.environ or 'TASKQ_LIMITS' in os.environ) and \
+            (fresh['supervisor'] != boss or fresh['claim'] != item['claim'] or fresh['pm'] != item['pm']):
+        return  # changed controller/reservation: let the next pass read its actual slot and authority
     admitted = True
     if boss['runtime'] == 'hermes':
         state = lead_state(lead, boss['session'])  # prove bridge/state before admitting any worker action
         admitted = state != 'dead'
-    if admitted and item['raw'].get('order') and claim.get('runtime') in kinds and fresh['raw'].get('order') and not (fresh['claim'] or {}).get('session'):  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
+    if admitted and worker_allowed and item['raw'].get('order') and claim.get('runtime') in kinds and fresh['raw'].get('order') and not (fresh['claim'] or {}).get('session'):  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
         kind = kinds[claim['runtime']]
         if not replace(item, kind, claim['runtime'], 'worker', running=True):
             return
@@ -1294,7 +1317,7 @@ def stale(by_number):
                 issues[n] = BOARD.get(n)
             except (Exception, SystemExit):
                 issues[n] = None
-        return bool(issues[n] and recorded(issues[n], name, sid))
+        return bool(issues[n] and host_scope(issues[n]) and recorded(issues[n], name, sid))
     return gone
 
 def row(item, kinds, here, state=None):
@@ -1321,7 +1344,8 @@ def heading(item):
 def one_pass(args, table=True):
     """One pass: free waiting tasks, follow unsupervised workers, act for supervisors, spawn ready tasks' supervisors, print the table."""
     here, kinds = machine(), runtimes()
-    limits = CONFIG.get('limits') or {name: 1 for name in kinds}
+    local = local_limits()
+    limits = local if local is not None else CONFIG.get('limits') or {name: 1 for name in kinds}
     with dispatch_lock() as held:  # #357 (R2): one pass at a time per checkout; the list is read under the lock
         tasks = getattr(args, 'tasks', None) or []  # #481: the list lags the event's own write (a new issue, a label): read those directly
         issues = [issue for issue in BOARD.list(None) if issue['iid'] not in tasks] + [issue for issue in map(BOARD.get, tasks) if issue['state'] == 'open']
@@ -1332,14 +1356,34 @@ def one_pass(args, table=True):
         if blind:
             print('taskq: inside a Codex sandbox: the pass only prints the table', file=sys.stderr)
         busy, ready = {}, items if held and not blind else []
+        worker_slots, occupied = set(), {}
+        if local is not None:  # existing active workers consume capacity, even outside this invocation's host scope
+            for item in ready:
+                claim = item['claim'] or {}
+                if item['state'] in ('doing', 'review', 'ask') and claim.get('name') == here and claim.get('session'):
+                    name = claim.get('runtime')
+                    occupied[name] = occupied.get(name, 0) + 1
+            for item in ready:  # pending reservations retain their board claims; admit only within remaining capacity
+                claim = item['claim'] or {}
+                name = claim.get('runtime')
+                if item['supervisor'] and item['state'] in ('doing', 'review', 'ask') and claim.get('name') == here \
+                        and not claim.get('session') and occupied.get(name, 0) < limits.get(name, 0):
+                    worker_slots.add(item['iid'])
+                    occupied[name] = occupied.get(name, 0) + 1
         for item in ready:
             claim = item['claim'] or {}
+            if not host_scope(item):
+                if item['state'] in ('doing', 'review', 'ask') and claim.get('name') == here:
+                    busy[claim.get('runtime')] = busy.get(claim.get('runtime'), 0) + 1
+                continue
             if item['state'] == 'waiting' and not open_deps(item['deps']):
+                if 'TASKQ_HOST_ONLY' in os.environ and not executable(BOARD.get(item['iid'])):
+                    continue
                 move(item, 'ready', 'ready', 'dependencies closed')
                 item['state'] = 'ready'
             if item['supervisor']:  # step 4; the worker's slot is held from the supervisor's spawn to close
                 if item['supervisor'].get('name') == here:
-                    supervise(item, kinds)
+                    supervise(item, kinds, local is None or item['iid'] in worker_slots)
                 if item['state'] in ('doing', 'review', 'ask') and claim.get('name') == here:
                     busy[claim.get('runtime')] = busy.get(claim.get('runtime'), 0) + 1
                 continue
@@ -1364,13 +1408,15 @@ def one_pass(args, table=True):
                 claim = follow(item, runtime, claim, False) or claim  # denied: the original claim keeps its slot
             busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
         for item in ready:
-            if item['state'] != 'ready' or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']) \
+            if item['state'] != 'ready' or not host_scope(item) or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']) \
                     or (item['pm'] and item['pm'].get('name') != here) or not lead(item, kinds, admit=True):
                 continue  # no manager: the task waits, the table says so; another machine's manager: that machine starts it (§ 7 step 3)
             names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
-            free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 1)), None)
+            free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 0 if local is not None else 1)), None)
             fresh = free and executable(BOARD.get(item['iid']))  # #357: the board may have moved since the list; #545: eligibility
             if fresh and fresh['state'] == 'ready' and fresh['pm'] == item['pm']:  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
+                if local is not None and fresh['runtime'] not in ('any', free):
+                    continue  # a stale list must not select a different or disabled worker runtime
                 item.update(fresh)
                 runtime = lead(item, kinds)
                 if not replace(item, kinds[runtime], runtime, 'supervisor'):  # a requeued task's old S<N>
@@ -1730,6 +1776,9 @@ def main(argv=None):
     if BOARD is None:
         CONFIG = load_config()
         BOARD = make_board(CONFIG)
+    local_limits()  # fail before any command writes, refreshes, starts an event or admits work
+    if 'TASKQ_HOST_ONLY' in os.environ and (not os.environ['TASKQ_HOST_ONLY'] or os.environ['TASKQ_HOST_ONLY'] != machine()):
+        fail('TASKQ_HOST_ONLY must equal this machine name (TASKQ_HOST / hosts)')
     if args.command == 'wait' and not args.task or args.command == 'tick' and not args.quiet or args.command == 'pm':
         refresh(args.command == 'pm')
     done = args.function(args)

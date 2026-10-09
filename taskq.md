@@ -650,6 +650,16 @@ Fully acknowledged entries may be compacted, and acknowledging an already compac
 Each recipient is role, runtime and full session ID. Tasks without a manager use a wildcard manager
 recipient and retain their per-manager acknowledgements until adoption resolves the wildcard to its recorded PM, retaining an acknowledgement from that PM. Unowned tasks can fill the same bound. An explicit worker/supervisor replacement or clear cancels obsolete recipient deliveries; it never forwards an old answer to a replacement worker. Fully cancelled entries compact like acknowledged ones; session retirement records are preserved. `retry_counts` and `session_records` preserve recovery limits and retirement identity when a
 diagnostic history comment fails. `worker_comment_cursor` acknowledges external `nudge:` comments per worker.
+Review corrections (owner-approved audit slice): manager identity includes runtime and full session ID;
+an explicit `--pm` sender may observe another runtime but never wakes a different runtime's native bridge.
+Migration imports every pending legacy answer after that worker's acknowledged history boundary. A resumed
+worker keeps its previous comment cursor. An unsupervised worker produces `gone` only while still `doing`,
+rechecked under the project guard; a supervised task keeps its supervisor-death notification in any open state.
+`action_payloads` retains the latest full `{id, by, text}` for each of `ask`, `answer`, `requeue`, and `result`.
+Only a newer action of that same kind supersedes its payload; spawn, nudge, ack and event compaction leave it
+available in the issue and in worker/supervisor briefs. This fixed four-action map is not an unbounded history.
+Migration seeds it from trusted history, so current rework instructions and full result text survive comment
+failure and session replacement. Short decision summaries remain display text only.
 
 `wait` prints human event lines with `[event N:ID]`; `wait --json` prints `{events:[{id,text}],tick:bool}`.
 Neither consumes versioned events. `taskq ack N:ID [...] [--pm ID]` acknowledges the current recipient;

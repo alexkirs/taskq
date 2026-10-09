@@ -17,6 +17,7 @@ CONFIG, BOARD = {}, None  # set by main, or by a test
 GUARD, GUARD_WAIT, GUARD_PAUSE = threading.local(), 30, 2
 EVENT_SCHEMA, EVENT_LIMIT = 1, 64
 EVENT_LABEL = 'taskq-events'
+PAYLOAD_ACTIONS = ('ask', 'answer', 'requeue', 'result')
 
 class SettledError(SystemExit):
     """A fully known refusal; tasks lists only acknowledged transitions that need an event."""
@@ -224,6 +225,8 @@ def append_event(raw, action, text, targets=None):
         fail(f'pending event capacity ({EVENT_LIMIT}) reached; deliver/ack outstanding events first')
     number = raw.get('event_seq', 0) + 1
     event = {'id': number, 'action': action, 'text': text, 'by': who(), 'recipients': targets, 'acks': []}
+    if action in PAYLOAD_ACTIONS:
+        raw['action_payloads'] = {**raw.get('action_payloads', {}), action: {key: event[key] for key in ('id', 'by', 'text')}}
     if targets:
         events.append(event)
     raw.update(event_schema=EVENT_SCHEMA, event_seq=number, action=event, events=events)
@@ -236,6 +239,13 @@ def initialize_events(issue):
     if raw.get('event_schema') == EVENT_SCHEMA:
         return raw
     comments = issue.get('comments') or []
+    payloads = dict(raw.get('action_payloads') or {})
+    for index, note_text in enumerate(comments):
+        head, _, text = note_text.partition('\n\n')
+        action, _, by = head.partition(' · ')
+        if action.strip('*') in PAYLOAD_ACTIONS:
+            payloads[action.strip('*')] = {'id': f'legacy:{index + 1}', 'by': by, 'text': text}
+    raw['action_payloads'] = payloads
     deaths = 0
     for note_text in reversed(comments):
         if note_text.startswith(('**result**', '**answer**')):
@@ -251,9 +261,11 @@ def initialize_events(issue):
         targets = [target for target in event_targets(raw, action, text) if target.startswith('manager:')]
         append_event(raw, action, text, targets)
     elif state == 'doing':
-        answer = legacy_worker_message(issue, raw.get('claim') or {}, bool(raw.get('supervisor')))
-        if answer and answer[0] == 'answer':
-            append_event(raw, 'answer', answer[1], [recipient('worker', raw['claim'])])
+        claim = raw.get('claim') or {}
+        if claim.get('session'):
+            for action_name, text, _ in legacy_worker_messages(issue, claim, bool(raw.get('supervisor'))):
+                if action_name == 'answer':
+                    append_event(raw, 'answer', text, [recipient('worker', claim)])
     boss = raw.get('supervisor') or {}
     if boss.get('session') and issue['state'] == 'open':
         for action_name, text in legacy_supervisor_events(issue, boss):
@@ -1583,8 +1595,14 @@ def cmd_cleanup(args):
 
 def history(n):
     """The review notes a new worker must read: every requeue and answer since the last close, with the result they answer."""
-    notes = [text for text in BOARD.get(n)['comments'] or [] if text.startswith(('**result**', '**requeue**', '**answer**', '**ask**'))]
-    return 'History of this task (read it first; a requeue says what to fix):\n\n' + '\n\n'.join(notes[-6:]) + '\n\n' if notes else ''
+    issue = BOARD.get(n)
+    notes = [text for text in issue['comments'] or [] if text.startswith(('**result**', '**requeue**', '**answer**', '**ask**'))][-6:]
+    for action, payload in issue_data(issue).get('action_payloads', {}).items():
+        if action in PAYLOAD_ACTIONS:
+            text = f'**{action}** · {payload["by"]}' + (f'\n\n{payload["text"]}' if payload['text'] else '')
+            if text not in notes:
+                notes.append(text)
+    return 'History of this task (read it first; a requeue says what to fix):\n\n' + '\n\n'.join(notes) + '\n\n' if notes else ''
 
 def brief(item, runtime):
     """The worker's prompt: its name first (R3, #572: a runtime's fallback title), the task, its workspace, the taskq commands it uses."""
@@ -1797,6 +1815,10 @@ def cmd_ack(args):
 
 
 def legacy_worker_message(issue, claim, supervised):
+    return next(legacy_worker_messages(issue, claim, supervised), None)
+
+
+def legacy_worker_messages(issue, claim, supervised):
     """Relevant signals only: ordinary comments cannot hide an answer or a nudge."""
     comments = issue.get('comments') or []
     cursor = issue_data(issue).get('worker_comment_cursor', {}).get(claim.get('session'), -1)
@@ -1805,10 +1827,9 @@ def legacy_worker_message(issue, claim, supervised):
                       and re.search(r'\n\nworker ' + re.escape(claim.get('session') or '') + r'(?:\s|$)', text)), default=-1)
     for i, text in enumerate(comments[cursor + 1:], cursor + 1):
         if text.startswith('**answer**') and not issue_data(issue).get('event_schema'):
-            return 'answer', text.partition('\n\n')[2], i
+            yield 'answer', text.partition('\n\n')[2], i
         if supervised and text.startswith('nudge:'):
-            return 'nudge', text.partition('nudge:')[2].strip(), i
-    return None
+            yield 'nudge', text.partition('nudge:')[2].strip(), i
 
 def follow(item, kind, claim, supervised):
     """A live worker: an answer, a supervisor's `nudge:` comment or 120 silent minutes reach it once (step 2, step 4).
@@ -1836,6 +1857,8 @@ def follow(item, kind, claim, supervised):
             if event['id'] in [value['id'] for value in events]:
                 event['acks'] = list(event.get('acks', [])) + [target]
     cursor = dict(raw.get('worker_comment_cursor') or {})
+    if old in cursor:
+        cursor[claim['session']] = cursor[old]  # a resumed copy is the same worker's delivery history
     if legacy and not events:
         cursor[claim['session']] = legacy[2]
     item['raw'] = raw
@@ -2191,6 +2214,10 @@ def cmd_wait(args):
         return wait_task(args)
     identity, kinds, here = session() or {}, runtimes(), machine()
     me = args.pm or identity.get('session')
+    def selected(raw):
+        pm = raw.get('pm') or {}
+        return (not me or pm.get('session') in (None, me)) and \
+            (bool(args.pm) or not me or not pm or pm.get('runtime') == identity.get('runtime'))
     path = CONFIG['root'] / '.taskq' / (f'wait-{me}.json' if me else 'wait.json')
     legacy_seen = json.loads(path.read_text('utf-8')) if path.is_file() else {}
     end = time.time() + args.window * 60
@@ -2199,7 +2226,7 @@ def cmd_wait(args):
         issues = BOARD.list(None) + list(getattr(BOARD, 'closed', lambda: [])())
         for issue in issues:
             raw = issue_data(issue)
-            if not raw or me and (raw.get('pm') or {}).get('session') not in (None, me):
+            if not raw or not selected(raw):
                 continue
             item = parse(issue) if issue['state'] == 'open' else parse({**issue, 'labels': [PREFIX + 'ready']})
             if not item or not mine(item):
@@ -2209,13 +2236,18 @@ def cmd_wait(args):
                 target = recipient('manager', pm)
                 held = raw.get('supervisor') or raw.get('claim') or {}
                 sid = held.get('session')
-                if issue['state'] == 'open' and sid and held.get('name') == here and held.get('runtime') in kinds \
+                if issue['state'] == 'open' and (raw.get('supervisor') or item['state'] == 'doing') \
+                        and sid and held.get('name') == here and held.get('runtime') in kinds \
                         and not os.environ.get('CODEX_SANDBOX') and sid not in raw.get('observed_dead', []) \
                         and lead_state(kinds[held['runtime']], sid) == 'dead':
                     with coordination():
                         fresh_issue = read_issue(issue['iid'])
                         fresh = issue_data(fresh_issue)
-                        if (fresh.get('supervisor') or fresh.get('claim')) == held and sid not in fresh.get('observed_dead', []):
+                        fresh_item = parse(fresh_issue) if fresh_issue['state'] == 'open' else None
+                        if fresh.get('pm') != raw.get('pm') or not selected(fresh):
+                            continue  # a new owner is not this observation's delivery recipient
+                        if fresh_item and (fresh.get('supervisor') or fresh_item['state'] == 'doing') \
+                                and (fresh.get('supervisor') or fresh.get('claim')) == held and sid not in fresh.get('observed_dead', []):
                             append_event(fresh, 'observed-gone', '', [target])
                             fresh['observed_dead'] = [*fresh.get('observed_dead', []), sid]
                             effect(BOARD.update, issue['iid'], labels=event_labels(fresh, fresh_issue['labels']), body=block(BLOCK.sub('', fresh_issue['body']).strip(), fresh))
@@ -2235,22 +2267,29 @@ def cmd_wait(args):
             n = str(item['iid'])
             legacy_now[n] = state
             if state in ('review', 'ask', 'gone') and legacy_seen.get(n) != state:
-                events.append({'id': None, 'text': f'{state} #{n}'})
+                events.append({'id': None, 'text': f'{state} #{n}', 'target': recipient('manager', raw.get('pm') or identity)})
         for n in legacy_seen:
-            if n.isdigit() and n not in legacy_now and (line := closed(n)) and not issue_data(read_issue(int(n))).get('event_schema'):
-                events.append({'id': None, 'text': line})
+            if n.isdigit() and n not in legacy_now:
+                old = issue_data(read_issue(int(n)))
+                if not old.get('event_schema') and selected(old) and (line := closed(n)):
+                    events.append({'id': None, 'text': line, 'target': recipient('manager', old.get('pm') or identity)})
         if events or time.time() >= end:
             native = kinds.get('hermes') if identity.get('runtime') == 'hermes' and identity.get('session') == me else None
-            if events and callable(getattr(native, 'owned', None)) and native.owned(me):
+            native_target = recipient('manager', identity)
+            if any(event.get('target') == native_target for event in events) and callable(getattr(native, 'owned', None)) and native.owned(me):
                 with coordination():
                     # Re-read receipts under the board grant; concurrent waits cannot both consume an acked batch.
                     pending_events = []
                     for event in events:
+                        if event.get('target') != native_target:
+                            continue  # explicit sender --pm may observe another runtime, never wake this bridge for it
                         if not event['id']:
                             pending_events.append(event)
                             continue
                         n, number = map(int, event['id'].split(':'))
-                        if any(value['id'] == number for value in event_pending(issue_data(read_issue(n)), event['target'])):
+                        fresh = issue_data(read_issue(n))
+                        if (not fresh.get('pm') or recipient('manager', fresh['pm']) == native_target) and \
+                                any(value['id'] == number for value in event_pending(fresh, event['target'])):
                             pending_events.append(event)
                     if pending_events:
                         native.check()
@@ -2265,7 +2304,7 @@ def cmd_wait(args):
                             if event['id']:
                                 n, number = map(int, event['id'].split(':'))
                                 acknowledge(read_issue(n), event['target'], [number])
-                    events = pending_events
+                    events = [event for event in events if event.get('target') != native_target] + pending_events
             # Legacy installations retain their historical receipt path until explicit migration.
             if legacy_now or any(not issue_data(read_issue(int(n))).get('event_schema') for n in legacy_seen if n.isdigit()):
                 path.parent.mkdir(exist_ok=True)

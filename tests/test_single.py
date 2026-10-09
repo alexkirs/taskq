@@ -123,7 +123,15 @@ class Base(unittest.TestCase):
 
     def wait_and_ack(self, *argv):
         """Simulate the recipient handling its observed batch, then explicitly acknowledging it."""
-        out = self.run_cli('wait', *argv)
+        actor, held = taskq.session() or {}, taskq.origin() or {}
+        if '--task' in argv:
+            held = (self.task(int(argv[argv.index('--task') + 1])) or {}).get('supervisor') or {}
+        # TickSetup's synthetic runtime uses a native-session fixture; simulate its full recipient identity.
+        if held.get('runtime') == 'fake' and held.get('session') == actor.get('session'):
+            with mock.patch.object(taskq, 'session', return_value={**actor, 'runtime': 'fake'}):
+                out = self.run_cli('wait', *argv)
+        else:
+            out = self.run_cli('wait', *argv)
         ids = re.findall(r'\[event (\d+:\d+)\]', out)
         if ids:
             extra = ['--pm', argv[argv.index('--pm') + 1]] if '--pm' in argv else []
@@ -2783,6 +2791,99 @@ class EventDelivery(Base):
         self.assertEqual(taskq.event_pending(self.task(1)['raw'], taskq.recipient('supervisor', boss)), [])
         self.assertEqual(self.task(1)['raw']['retry_counts']['supervisor'], 1)
         self.assertEqual(taskq.recorded(self.board.get(1), 'fake', 'old-boss'), 'supervisor')
+
+    def test_manager_runtime_collision_never_wakes_or_acks_another_runtime(self):
+        self.worker(); self.run_cli('ask', '1', '--text', 'Claude question')
+        native = mock.Mock()
+        native.owned.return_value = True
+        native.state.return_value = 'idle'
+        native.wake_manager.return_value = SESSION
+        with mock.patch.dict(os.environ, TASKQ_RUNTIME='hermes', HERMES_SESSION_ID=SESSION), \
+                mock.patch.object(taskq, 'runtimes', return_value={'hermes': native}):
+            self.assertEqual(self.run_cli('wait', '--window', '0'), 'tick\n')
+            observed = json.loads(self.run_cli('wait', '--window', '0', '--pm', SESSION, '--json'))
+            self.assertEqual(len(observed['events']), 1)  # an explicitly delegated sender may observe it
+            native.wake_manager.assert_not_called()
+            with self.assertRaisesRegex(SystemExit, 'recorded recipient'):
+                self.run_cli('ack', observed['events'][0]['id'])
+        self.assertTrue(taskq.event_pending(self.task(1)['raw'], taskq.recipient('manager', self.task(1)['pm'])))
+
+    def test_migration_imports_all_pending_answers_after_the_worker_boundary(self):
+        fake, claim = self.worker()
+        raw = {key: value for key, value in self.task(1)['raw'].items() if key not in ('event_schema', 'events', 'event_seq', 'action')}
+        self.board.issues[1]['body'] = taskq.block('g', raw)
+        self.board.issues[1]['comments'] += ['**answer** · owner\n\nalready delivered',
+            '**nudge** · owner\n\nworker worker-one', '**answer** · owner\n\nfirst pending',
+            'ordinary progress', '**answer** · owner\n\nsecond pending']
+        self.run_cli('migrate', '--apply', '--controllers-stopped')
+        pending = taskq.event_pending(self.task(1)['raw'], taskq.recipient('worker', claim))
+        self.assertEqual([event['text'] for event in pending], ['first pending', 'second pending'])
+        self.assertEqual(len({event['id'] for event in pending}), 2)
+        with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
+            taskq.follow(self.task(1), fake, claim, False)
+            taskq.follow(self.task(1), fake, claim, False)
+        self.assertEqual(fake.sent, [('worker-one', 'The owner answered your question:\n\nfirst pending\n\nsecond pending')])
+
+    def test_resumed_worker_keeps_acknowledged_manual_nudge_cursor(self):
+        fake, claim = self.worker()
+        self.board.comment(1, 'nudge: already delivered instruction')
+        raw = self.task(1)['raw']; raw['worker_comment_cursor'] = {'worker-one': len(self.board.issues[1]['comments']) - 1}
+        self.board.issues[1]['body'] = taskq.block('g', raw)
+        self.run_cli('ask', '1', '--text', 'question'); self.run_cli('answer', '1', '--text', 'new answer')
+        fake.send = mock.Mock(return_value='worker-two'); fake.sessions['worker-two'] = 'idle'
+        with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
+            resumed = taskq.follow(self.task(1), fake, claim, True)
+            taskq.follow(self.task(1), fake, resumed, True)
+        fake.send.assert_called_once_with('worker-one', 'The owner answered your question:\n\nnew answer')
+        self.assertEqual(self.task(1)['raw']['worker_comment_cursor']['worker-two'], raw['worker_comment_cursor']['worker-one'])
+
+    def test_wait_does_not_report_review_worker_as_gone_or_overwrite_fresh_state(self):
+        fake, claim = self.worker(); fake.sessions[claim['session']] = False
+        with mock.patch.object(taskq, 'runtimes', return_value={'fake': fake}):
+            self.run_cli('result', '1', '--sha', 'a' * 40)
+            out = self.run_cli('wait', '--window', '0')
+            self.assertIn('review #1', out); self.assertNotIn('gone #1', out)
+            self.assertNotIn('observed_dead', self.task(1)['raw'])
+            # A read after guard acquisition sees a result or an ownership change, even though list said doing.
+            for change in ('state', 'pm'):
+                with self.subTest(change=change):
+                    item = self.task(1)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        taskq.move(item, 'doing', 'take', claim=claim)
+                    def fresh(n):
+                        if change == 'state':
+                            self.board.issues[n]['labels'] = ['q-review']
+                        else:
+                            body = taskq.issue_data(self.board.get(n)); body['pm'] = {'runtime': 'claude', 'session': 'other-manager', 'name': 'mac'}
+                            self.board.issues[n]['body'] = taskq.block('g', body)
+                        return self.board.get(n)
+                    with mock.patch.object(self.board, 'metadata', side_effect=fresh, create=True):
+                        self.assertNotIn('gone #1', self.run_cli('wait', '--window', '0'))
+                    self.assertNotIn('observed_dead', self.task(1)['raw'])
+
+    def test_failed_rework_and_result_logs_keep_full_payload_through_session_changes(self):
+        fake, claim = self.worker()
+        boss = {'runtime': 'claude', 'session': SESSION, 'name': 'mac'}
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'doing', 'spawn', 'supervisor ' + SESSION, supervisor=boss)
+        fixes = 'FIX_UNIQUE: repair the complete implementation'
+        with mock.patch.object(self.board, 'comment', side_effect=RuntimeError('log unavailable')):
+            self.run_cli('requeue', '1', '--text', fixes)
+        self.assertIn(fixes, taskq.brief(self.task(1), 'fake'))
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'doing', 'spawn', 'worker replacement', claim={**claim, 'session': 'replacement'}, order=None)
+        result = 'Completed research\nUNIQUE_RESULT_DETAILS_REQUIRED_BY_REVIEW'
+        with mock.patch.object(self.board, 'comment', side_effect=RuntimeError('log unavailable')):
+            self.run_cli('result', '1', '--sha', 'a' * 40, '--text', result)
+        fake.sessions[SESSION] = 'idle'; fake.send = mock.Mock(return_value='resumed-supervisor')
+        with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
+            taskq.supervise(self.task(1), {'claude': fake, 'fake': fake})
+        current = self.task(1)
+        self.assertEqual(current['supervisor']['session'], 'resumed-supervisor')
+        self.assertEqual(current['raw']['action_payloads']['requeue']['text'], fixes)
+        self.assertEqual(current['raw']['action_payloads']['result']['text'], result)
+        self.assertIn(result, taskq.supervisor_brief(current, 'claude', fake))
+        self.assertIn(fixes, taskq.brief(current, 'fake'))
 
     def test_legacy_answer_ignores_unrelated_last_comment(self):
         fake, claim = self.worker()

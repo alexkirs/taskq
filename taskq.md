@@ -165,14 +165,14 @@ an empty table or section is left out, with no placeholder:
    only; the manager runs `taskq answer N.M` (§ 7 After each pass).
 5. `Later: [#N <title>](url), ...` on one line.
 6. One mode line: `Mode: events · arm: <arm_tick>`, the report's only field. taskq knows only its event chain (R4); it
-   records no sender or timer, so it never fills the field. The final owning manager (the one that shows the report to
-   the owner) replaces exactly `<arm_tick>`, nothing else, with one of:
+   records no sender or timer, so it never fills the field. The executing PM for this explicit project (standalone Codex/Claude has the same role) replaces exactly `<arm_tick>`, nothing else, with one of:
    - `armed, every <interval>`: only when it confirmed its own arming and the interval from evidence it read (its
      running wait, its scheduler entry);
    - `not armed · taskq arm tick`: only when it confirmed it is not armed;
    - `unknown`: the default, every other case.
    Never inferred: no interval from a default or `arm tick` output, no arming done to fill the field, and a child
-   manager's wait or timer is not the root's. A child leaves the field as printed. `<arm_tick>` never reaches the owner.
+   manager's queue monitoring is distinct from root transport. The executing PM fills the field; root DOT
+   relays the completed block unchanged and must not replace known executing-PM state with its own unknown. `<arm_tick>` never reaches the owner.
 
 Titles, reasons and options pass one formatter: a newline becomes a space, `|`, `[`, `]` and `\` are escaped, so a
 cell stays one table cell and one link. Illustrative only, never a live status:
@@ -199,7 +199,7 @@ Later: [#9 Dark mode](…/9)
 Mode: events · arm: unknown
 ```
 
-The sample shows the field after the final manager's default; `taskq` prints `arm: <arm_tick>`.
+The sample shows the field after the executing PM's default; `taskq` prints `arm: <arm_tick>`.
 
 Session links: Claude `https://claude.ai/code/session_<id>` in every client. Codex: `codex://threads/<id>` direct when
 the client that finally renders the report is Codex, else the wrapper `<pages>/open.html#codex://threads/<id>`. That
@@ -209,7 +209,7 @@ A child manager that relays to a root manager in another client sets `TASKQ_CLIE
 unknown clients get the wrapper (direct unverified there). A session with no link on this machine shows
 `<session[:8]> on <machine>`; no session: empty cell. No raw JSON to humans.
 Relay: every manager (Claude, Codex, DOT; root or child) loads the current contract with `taskq pm` and passes the
-report on complete and unchanged, except the final owning manager's `<arm_tick>` (item 6), its own short commentary
+report on complete and unchanged, except the executing PM's `<arm_tick>` (item 6), its own short commentary
 below it, separate. Limitation (R12): only the prompt asks for this; taskq cannot verify that a relay was exact or that
 the field was replaced, and builds no transport for it.
 Unknown (R12): taskq cannot tell the Codex app from the Codex CLI or IDE (all get direct); Claude Code, web, mobile
@@ -225,6 +225,9 @@ the manager (#290). The reply route (`--reply`) and the `cards` format of #274 a
 Open: bring back the reply route and cards, yes or no (#274).
 Changed: the manager adds the owner's open questions → `tick` prints them as the `Decisions` block; the owner answers
 all in one line, `taskq answer 43.1 44.2` (#490).
+
+Changed: the final owning manager filled ARM and a child left the placeholder → the executing PM fills ARM for
+its explicit projects; root relays the completed block unchanged (#580).
 
 ### R7. Style
 
@@ -252,6 +255,10 @@ Any change is named to the owner first; taskq never edits permission settings it
 ### R10. Multi-project only by explicit list
 
 A session manages several projects only from an owner-written list; folders are never auto-discovered.
+The list stays in session context; task ownership stays in each board task's `pm`. Keep a separate R6 report per
+project. If `N.M` is ambiguous across projects, require the project with the answer and run `taskq answer N.M`
+in that project root; never guess the board. Per-project runtime limits remain independent.
+Changed: explicit project list only → separate project reports and project-qualified ambiguous answers (#580).
 Changed: `taskq projects` over `[projects]` in `taskq.local.toml` → no command; the manager runs `taskq tick` in each
 project root the owner listed (#290).
 
@@ -609,7 +616,10 @@ supervisor's one-line outcome. It does no task work, reads no diffs or test logs
 supervisor does, R3, #524) and never answers a worker's or a supervisor's question for the owner. An unsupervised
 task (R3 Transition) keeps the manager's exact-head review (§ After each pass, Unsupervised review).
 
-The manager starts with `taskq pm` in the project root and follows what it prints. `taskq pm`, `taskq tick` and
+The manager starts with `taskq pm` in each explicit project root and follows what it prints. Onboarding shows
+open tasks with no `pm`, including tasks outside the report filter. Triage them explicitly and state the exact
+project-specific `taskq pm --adopt N` action before leaving them blocked; adoption remains an explicit choice,
+never automatic. Never seize a task with a manager or change foreign claims. `taskq pm`, `taskq tick` and
 `taskq wait` first run `git pull --ff-only` in the taskq clone when it is clean (one line on failure), then compare the hash of its
 `taskq.md` with `.taskq/pm.json` (a runtime handle, R1). A different hash prints first: `The manager contract changed:
 run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#430). `taskq pm` prints the pulled
@@ -768,10 +778,11 @@ the tasks it did not reach wait for the next pass. Fix the cause or tell the own
 
 ### After each pass
 
-Reply to the owner with the R6 report complete and unchanged, as printed (links, not bare ids), except `<arm_tick>`,
-which the final owning manager replaces (R6 item 6), then one or two lines of your own on what else needs them,
-separate from it. A child manager relays its report to the root the same way, the field left as printed; the root
-passes it on unchanged but for that field (R6 Relay). To show the queue without moving it, run `taskq status`. The owner answers the block in one line, `43.1 44.2`: run `taskq answer 43.1 44.2` verbatim.
+Reply to the owner with a separate complete R6 report for each explicit project (links, not bare ids). The
+executing PM replaces only `<arm_tick>` using R6 item 6; root DOT relays the completed block unchanged, then one
+or two lines of commentary, separate. Root transport is not evidence of executing-PM queue monitoring. To show
+the queue without moving it, run `taskq status`. The owner answers `43.1 44.2`: run `taskq answer 43.1 44.2`
+verbatim in the named project root. If an answer is ambiguous across projects, ask for its project first.
 Changed: the manager relayed each `ask` comment verbatim → the `Decisions` block carries every pending choice (#490);
 the block is the report's Questions (#574).
 

@@ -1353,7 +1353,7 @@ def report(items, listed, kinds, here):
     lines += ['Questions (answer N.M):', '', '| Question | Brief reason | Options |', '|---|---|---|', *cards, ''] if cards else []
     later = [heading(item) for item in items if item['state'] == 'later']
     lines += ['Later: ' + ', '.join(later), ''] if later else []
-    print('\n'.join([*lines, 'Mode: events · arm: <arm_tick>']))  # R6 item 6: the final owning manager fills the one field
+    print('\n'.join([*lines, 'Mode: events · arm: <arm_tick>']))  # R6 item 6: the executing PM fills the one field
 
 MEDIA = re.compile(r'\.(png|jpe?g|gif|webp|svg)(\?.*)?$', re.I)
 
@@ -1510,7 +1510,8 @@ def cmd_pm(args):
     """The manager role: Principles and § 7 of taskq.md, then how to tick this session; the hash goes to .taskq/pm.json,
     nothing else: a task's manager is its own `pm` on the board (R3, #532). `--adopt N`: become the `pm` of tasks with none."""
     me = session() or {}
-    if me and any(role(item) in ('supervisor', 'worker') for item in map(parse, BOARD.list(None)) if item):
+    snapshot = [item for item in map(parse, BOARD.list(None)) if item]
+    if me and any(role(item) in ('supervisor', 'worker') for item in snapshot):
         fail('a recorded supervisor or worker cannot take the manager role (R3 one controller)')
     if args.adopt:
         adopt(args.adopt, me)
@@ -1520,6 +1521,11 @@ def cmd_pm(args):
     (CONFIG['root'] / '.taskq' / 'pm.json').write_text(json.dumps({'contract': digest}), 'utf-8')
     print(f'taskq pm contract {digest}\nYou are the taskq manager of {CONFIG["root"]}. Follow this role from now on; '
           f'`taskq` is `python3 {Path(__file__).resolve()}`.\n\n' + '\n'.join(sections))
+    for item in sorted(snapshot, key=lambda item: (item['priority'], item['iid'])):
+        if not item['pm'] and item['iid'] not in args.adopt:
+            print(f'Unassigned manager: #{item["iid"]} {item["title"]} ({item["state"]}). '
+                  f'Triage explicitly; to adopt in project {CONFIG["root"].name}: '
+                  f'`cd {shlex.quote(str(CONFIG["root"]))} && taskq pm --adopt {item["iid"]}`. No ownership or claims changed.')
     cmd_arm(argparse.Namespace(target=None))
 
 CODEX_COMPACT = ('-c model_auto_compact_token_limit=200000 -c "compact_prompt=\\"Keep only the owner\'s open questions and '

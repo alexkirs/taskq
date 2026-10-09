@@ -1889,6 +1889,48 @@ class Contract(Base):
         self.assertNotIn('## 8. Runtimes', out)
         self.assertEqual(json.loads((self.root / '.taskq' / 'pm.json').read_text()), {'contract': digest})  # #532: the hash only
 
+    def test_pm_onboarding_is_one_read_only_snapshot(self):
+        (self.root / 'taskq.md').write_text((ROOT / 'taskq.md').read_text())
+        self.add('assigned')
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': ''}, clear=True):
+            self.add('unassigned')
+            self.add('claimed')
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(3), 'doing', 'take', claim={'runtime': 'codex', 'session': 'foreign', 'name': 'mac'})
+        self.board.add('ordinary issue', '', [])
+        taskq.CONFIG['assignee'] = 'nobody'  # onboarding must reveal tasks hidden by the report filter
+        before = json.dumps(self.board.issues, sort_keys=True)
+        with mock.patch.object(self.board, 'list', wraps=self.board.list) as listed, \
+                mock.patch.object(taskq, 'dispatch', side_effect=AssertionError('pm dispatched')):
+            out = self.run_cli('pm')
+        listed.assert_called_once_with(None)
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        hints = [line for line in out.splitlines() if line.startswith('Unassigned manager:')]
+        self.assertEqual(len(hints), 2)
+        for n, line in zip((2, 3), hints):
+            self.assertIn(f'#{n} ', line)
+            self.assertIn(f'project {self.root.name}:', line)
+            self.assertIn(f'cd {self.root} && taskq pm --adopt {n}', line)
+            self.assertIn('No ownership or claims changed.', line)
+        for part in ('executing PM fills the field', 'relays the completed block unchanged',
+                     'must not replace known executing-PM state', 'no interval from a default or `arm tick` output',
+                     'If an answer is ambiguous across projects', 'never automatic'):
+            self.assertIn(part, out)
+
+    def test_pm_refuses_recorded_session_roles_before_onboarding(self):
+        self.add()
+        (self.root / 'taskq.md').write_text((ROOT / 'taskq.md').read_text())
+        for field in ('claim', 'supervisor'):
+            with self.subTest(field=field):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    taskq.move(self.task(1), 'doing', 'take',
+                               **dict({'claim': None, 'supervisor': None},
+                                      **{field: {'runtime': 'claude', 'session': SESSION, 'name': 'mac'}}))
+                before = json.dumps(self.board.issues, sort_keys=True)
+                with self.assertRaisesRegex(SystemExit, 'cannot take the manager role'):
+                    self.run_cli('pm')
+                self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+
     def test_changed_contract_until_pm(self):
         line = 'The manager contract changed: run taskq pm and follow it from now on.'
         (self.root / 'taskq.md').write_text('v1\n## Principles\nx\n## 7. Manager\ny\n## 8. Runtimes\n')

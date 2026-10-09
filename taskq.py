@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 STATES = ('ready', 'waiting', 'doing', 'review', 'ask', 'later')
 TYPES = ('code', 'docs', 'research', 'asset')
-FIELDS = ('scope', 'deps', 'claim', 'result', 'supervisor', 'order')
+FIELDS = ('scope', 'deps', 'claim', 'result', 'supervisor', 'order', 'pm')
 PREFIX, RUN, ON = 'q-', 'run-', 'host-'
 BLOCK = re.compile(r'<!-- taskq:start -->\s*```json\n(.*?)\n```\s*<!-- taskq:end -->', re.S)
 SESSIONS = {'claude': 'CLAUDE_CODE_SESSION_ID', 'codex': 'CODEX_THREAD_ID'}
@@ -45,6 +45,13 @@ def session():
     """This agent session, or None for the owner's shell. TASKQ_RUNTIME picks one when a session inherited another's id."""
     found = [r for r in SESSIONS if os.environ.get(SESSIONS[r]) and os.environ.get('TASKQ_RUNTIME', r) == r]
     return {'runtime': found[0], 'session': os.environ[SESSIONS[found[0]]]} if found else None
+
+def origin():
+    """R3 (#532): the task's manager, the session that files or adopts it: {runtime, session, name}; a plain shell names its
+    runtime with TASKQ_RUNTIME (no session); neither: None, the task waits for an explicit adoption."""
+    me = session() or {}
+    runtime = me.get('runtime') or os.environ.get('TASKQ_RUNTIME')
+    return {'runtime': runtime, 'session': me.get('session'), 'name': machine()} if runtime else None
 
 def who():
     current = session()
@@ -431,7 +438,7 @@ def cmd_add(args):
     state = 'waiting' if open_deps(args.deps) else 'ready'
     labels = [PREFIX + state, f'priority-{args.priority}', args.type] + ([RUN + args.runtime] if args.runtime != 'any' else []) \
         + ([ON + args.host] if args.host else [])
-    n = BOARD.add(args.title, block(text, {'scope': args.scope, 'deps': args.deps, 'claim': None, 'result': None}), labels)
+    n = BOARD.add(args.title, block(text, {'scope': args.scope, 'deps': args.deps, 'claim': None, 'result': None, 'pm': origin()}), labels)
     BOARD.comment(n, f'**add** · {who()}')
     print(f'#{n} {state}')
     return n
@@ -472,23 +479,18 @@ def cmd_move(args):
     sources, state, fields = MOVES[args.command]
     move(task(args.n, *sources), state, args.command, args.text, **fields(args))
 
-def manager():
-    """This machine's manager, recorded by `taskq pm` in .taskq/pm.json: {contract, runtime, session}; {} with none."""
-    path = CONFIG['root'] / '.taskq' / 'pm.json'
-    return json.loads(path.read_text('utf-8')) if path.is_file() else {}
-
 def role(current):
     """Who runs this command for the task: supervisor, worker, manager, owner (a plain shell), or None (another session)."""
     me = (session() or {}).get('session')
     return 'owner' if not me else next((name for name, held in (('supervisor', current['supervisor']), ('worker', current['claim']),
-                                                                ('manager', manager())) if me == (held or {}).get('session')), None)
+                                                                ('manager', current['pm'])) if me == (held or {}).get('session')), None)
 
 def gate(current):
-    """R3 one controller (#525): `run`, `close` and a rework `requeue` of a supervised task come from its supervisor, this
-    machine's manager (on the owner's word) or the owner's shell; another session is refused."""
+    """R3 one controller (#525): `run`, `close` and a rework `requeue` of a supervised task come from its supervisor, the
+    task's own manager, its `pm` (on the owner's word, #532), or the owner's shell; another session, another manager too, is refused."""
     found, boss = role(current), current['supervisor']
     if boss and found not in ('supervisor', 'manager', 'owner'):
-        fail(f'#{current["iid"]} is supervised by {boss["runtime"]}:{boss["session"][:8]}: only it, the manager or the owner controls it')
+        fail(f'#{current["iid"]} is supervised by {boss["runtime"]}:{boss["session"][:8]}: only it, the task\'s manager or the owner controls it')
     return found
 
 def workers(n, comments):
@@ -796,12 +798,12 @@ def cmd_cleanup(args):
         if n and state(int(n[1])) == 'closed' and not (pid.isdigit() and pid_alive(int(pid))):
             dry or path.unlink()
             removed.append(f'{verb} .taskq/{path.name}')
-    wait = root / '.taskq' / 'wait.json'
-    seen = json.loads(wait.read_text('utf-8')) if wait.is_file() else {}
-    stale = [n for n in seen if not n.isdigit() or state(int(n)) != 'open']
-    if stale:
-        dry or wait.write_text(json.dumps({n: value for n, value in seen.items() if n not in stale}), 'utf-8')
-        removed.append(f'{verb} .taskq/wait.json entries {" ".join(f"#{n}" for n in stale)}')
+    for wait in sorted((root / '.taskq').glob('wait*.json')):  # one per manager (#532)
+        seen = json.loads(wait.read_text('utf-8'))
+        stale = [n for n in seen if not n.isdigit() or state(int(n)) != 'open']
+        if stale:
+            dry or wait.write_text(json.dumps({n: value for n, value in seen.items() if n not in stale}), 'utf-8')
+            removed.append(f'{verb} .taskq/{wait.name} entries {" ".join(f"#{n}" for n in stale)}')
     prs = open_prs()
     for item in items:
         claim, n, sha = item['claim'] or {}, item['iid'], (item['result'] or {}).get('sha') or ''
@@ -948,7 +950,8 @@ def supervise(item, kinds):
     lead = kinds.get(boss['runtime'])
     if lead is None:
         return
-    if item['raw'].get('order') and claim.get('runtime') in kinds:  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
+    fresh = item['raw'].get('order') and claim.get('runtime') in kinds and parse(BOARD.get(n))  # #532: the list may lag a spawn
+    if fresh and fresh['raw'].get('order') and not (fresh['claim'] or {}).get('session'):  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
         kind = kinds[claim['runtime']]
         sid = kind.spawn(worker_name(item), brief(item, claim['runtime']), CONFIG['root'])
         item['claim'], item['raw']['order'] = {**claim, 'session': sid}, None
@@ -1064,8 +1067,11 @@ def one_pass(args, table=True):
     """One pass: free waiting tasks, follow unsupervised workers, act for supervisors, spawn ready tasks' supervisors, print the table."""
     here, kinds = machine(), runtimes()
     limits = CONFIG.get('limits') or {name: 1 for name in kinds}
-    lead = {'dot': 'codex'}.get(manager().get('runtime'), manager().get('runtime'))  # R3: the supervisor follows the manager
-    lead = lead if lead in kinds else None
+
+    def lead(item):  # R3 (#532): the supervisor follows the task's own manager (DOT: Codex); None: no manager can start it here
+        runtime = (item['pm'] or {}).get('runtime')
+        runtime = {'dot': 'codex'}.get(runtime, runtime)
+        return runtime if runtime in kinds else None
     with dispatch_lock() as held:  # #357 (R2): one pass at a time per checkout; the list is read under the lock
         tasks = getattr(args, 'tasks', None) or []  # #481: the list lags the event's own write (a new issue, a label): read those directly
         issues = [issue for issue in BOARD.list(None) if issue['iid'] not in tasks] + [issue for issue in map(BOARD.get, tasks) if issue['state'] == 'open']
@@ -1105,16 +1111,18 @@ def one_pass(args, table=True):
                 claim = follow(item, runtime, claim, False)
             busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
         for item in ready:
-            if item['state'] != 'ready' or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']) or not lead:
-                continue  # no manager here: the task waits, the table says so (§ 7 step 3)
+            if item['state'] != 'ready' or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']) \
+                    or not lead(item) or item['pm'].get('name') != here:
+                continue  # no manager: the task waits, the table says so; another machine's manager: that machine starts it (§ 7 step 3)
             names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
             free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 1)), None)
             fresh = free and parse(BOARD.get(item['iid']))  # #357: the board may have moved since the list
-            if fresh and fresh['state'] == 'ready':  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
+            if fresh and fresh['state'] == 'ready' and fresh['pm'] == item['pm']:  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
                 item.update(fresh)
-                session = kinds[lead].spawn(worker_name(item, 'S'), supervisor_brief(item, lead, kinds[lead]), CONFIG['root'])
-                item.update(supervisor={'runtime': lead, 'session': session, 'name': here}, claim={'runtime': free, 'session': None, 'name': here})
-                move(item, 'doing', 'spawn', note('supervisor', session, kinds[lead]), supervisor=item['supervisor'], claim=item['claim'],
+                runtime = lead(item)
+                session = kinds[runtime].spawn(worker_name(item, 'S'), supervisor_brief(item, runtime, kinds[runtime]), CONFIG['root'])
+                item.update(supervisor={'runtime': runtime, 'session': session, 'name': here}, claim={'runtime': free, 'session': None, 'name': here})
+                move(item, 'doing', 'spawn', note('supervisor', session, kinds[runtime]), supervisor=item['supervisor'], claim=item['claim'],
                      result=None, order=None)
                 item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
         if held and not blind:  # R11 (#360, #525): stopped sessions the board no longer holds, by recorded id only
@@ -1123,7 +1131,7 @@ def one_pass(args, table=True):
         return held
     print('| Task | State | Runtime | Session |\n|---|---|---|---|')
     for item in filter(mine, items):
-        print(row(item, kinds, here, None if lead else 'no manager'))
+        print(row(item, kinds, here, None if lead(item) else 'no manager'))
     host, repo = CONFIG.get('host'), CONFIG.get('repo')
     url = CONFIG.get('board_url') or {'github': f'https://{host or "github.com"}/{repo}/issues',
                                       'gitlab': f'https://{host or "gitlab.com"}/{repo}/-/issues'}.get(CONFIG['board'])
@@ -1192,15 +1200,17 @@ def closed(n):
 def cmd_wait(args):
     """Block until the manager is needed: print 'ask #N', 'closed #N <text>' (supervised), 'review #N' and 'gone #N'
     (unsupervised worker, or a dead supervisor), or 'tick' after the window (#407, #525).
-    .taskq/wait.json keeps the states last reported, so an event is printed once."""
+    .taskq/wait-<session>.json (a shell: wait.json) keeps the states last reported to this manager, so an event is printed once each."""
     if args.task:
         return wait_task(args)
-    path, kinds, here = CONFIG['root'] / '.taskq' / 'wait.json', runtimes(), machine()
+    me, kinds, here = args.pm or (session() or {}).get('session'), runtimes(), machine()  # --pm: a sender waits as its manager (R4)
+    path = CONFIG['root'] / '.taskq' / (f'wait-{me}.json' if me else 'wait.json')  # #532: each manager's events, once each
+    ours = lambda item: not me or (item['pm'] or {}).get('session') in (None, me)  # its own tasks and those with no manager
     seen = json.loads(path.read_text('utf-8')) if path.is_file() else {}
     end = time.time() + args.window * 60
     while True:
         now, blind = {}, bool(os.environ.get('CODEX_SANDBOX'))
-        for item in filter(mine, filter(None, map(parse, BOARD.list(None)))):
+        for item in filter(ours, filter(mine, filter(None, map(parse, BOARD.list(None))))):
             claim, boss, state = item['claim'] or {}, item['supervisor'] or {}, item['state']
             if boss:  # a supervised review is its supervisor's (#524); only a dead supervisor is the manager's
                 state = 'gone' if not blind and boss.get('name') == here and boss.get('runtime') in kinds \
@@ -1260,16 +1270,33 @@ def refresh():
     if contract() and known and known != contract():  # no pm.json: this session never took the role
         print('The manager contract changed: run taskq pm and follow it from now on.')
 
+def adopt(numbers, me):
+    """R3 Transition (#532): record this session as the `pm` of tasks with none. The dispatch lock and a read under it keep
+    two adoptions in one checkout from overwriting each other; across checkouts nothing is atomic (R4)."""
+    if not origin():
+        fail('cannot adopt: a plain shell needs TASKQ_RUNTIME')
+    with dispatch_lock() as locked:
+        if not locked:
+            fail('cannot adopt: another taskq process holds .taskq/dispatch.lock; nothing adopted, run it again')
+        adopted = [task(n) for n in numbers]
+        held = [f'#{item["iid"]} ({item["pm"]["runtime"]}:{(item["pm"]["session"] or "shell")[:8]})' for item in adopted if item['pm']]
+        if held:  # explicit, never the last writer
+            fail(f'cannot adopt: {" ".join(held)} already has a manager')
+        for item in adopted:
+            move(item, item['state'], 'adopt', f'pm {origin()["runtime"]}:{me.get("session") or "shell"}', pm=origin())
+
 def cmd_pm(args):
-    """The manager role: Principles and § 7 of taskq.md, then how to tick this session; the hash goes to .taskq/pm.json."""
-    me = session() or {}  # R3 (#525): this machine's supervisors run in the manager's runtime; its id passes the gate
+    """The manager role: Principles and § 7 of taskq.md, then how to tick this session; the hash goes to .taskq/pm.json,
+    nothing else: a task's manager is its own `pm` on the board (R3, #532). `--adopt N`: become the `pm` of tasks with none."""
+    me = session() or {}
     if me and any(role(item) in ('supervisor', 'worker') for item in map(parse, BOARD.list(None)) if item):
         fail('a recorded supervisor or worker cannot take the manager role (R3 one controller)')
+    if args.adopt:
+        adopt(args.adopt, me)
     text, digest = (CLONE / 'taskq.md').read_text('utf-8'), contract()
     sections = re.findall(r'^## (?:Principles|7\. Manager)\b.*?(?=^## )', text, re.M | re.S)
     (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
-    (CONFIG['root'] / '.taskq' / 'pm.json').write_text(json.dumps(
-        {'contract': digest, 'runtime': me.get('runtime') or os.environ.get('TASKQ_RUNTIME'), 'session': me.get('session')}), 'utf-8')
+    (CONFIG['root'] / '.taskq' / 'pm.json').write_text(json.dumps({'contract': digest}), 'utf-8')
     print(f'taskq pm contract {digest}\nYou are the taskq manager of {CONFIG["root"]}. Follow this role from now on; '
           f'`taskq` is `python3 {Path(__file__).resolve()}`.\n\n' + '\n'.join(sections))
     cmd_arm(argparse.Namespace(target=None))
@@ -1305,6 +1332,8 @@ When it ends you are woken with its output (`ask #N`, `closed #N <text>`, `revie
 do § 7 After each pass for those tasks, then start `{wait}` in the background again. Keep exactly one wait running.
 Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.json autoCompactWindow 200000).''')
     resume = f'codex exec {shlex.join(codex_options())} resume {args.target}'  # the options a worker turn gets
+    pm = re.split(r'session_|threads/|/', args.target)[-1]  # #532: the sender consumes as its manager, the id the board records
+    wait = f'{wait} --pm {shlex.quote(pm)}'
     send, shell, note = f'with {SENDERS.get(runtime, "your messaging tool")}', '', ''
     where = rollout(args.target) if runtime == 'codex' else None
     if where == 'local':  # a CLI thread: exec resume finds it
@@ -1322,6 +1351,8 @@ Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.j
                 'whose send_message_to_thread reaches it. Not a collaboration subagent of the manager: it cannot send to its ancestor '
                 'and starts no turn. A session without that tool (a CLI worker) hands this prompt to the owner or the app manager.\n'
                 'Workers still dispatch without a sender (R4 event chain); only review, ask and gone wait for the manager.\n\n')
+    if not any((item['pm'] or {}).get('session') == pm for item in map(parse, BOARD.list(None)) if item):
+        note += f'taskq: no open task records {pm} as its pm; this wait shows only tasks with no manager until one does.\n'
     print(f'''{note}You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
 Stay in this one turn and repeat, from {CONFIG["root"]}; do not end the turn between events (an ended turn forwards nothing):
 1. Run `{wait}`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
@@ -1362,9 +1393,9 @@ def main(argv=None):
     command('tick', lambda args: (event_pass if args.quiet else cmd_tick)(args), (('--quiet',), {'action': 'store_true'}),
             (('--tasks',), {'nargs': '*', 'type': int, 'default': []}), (('--after',), {'type': int}), n=False)
     command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}),
-            (('--task',), {'type': int}), n=False)
+            (('--task',), {'type': int}), (('--pm',), {}), n=False)
     command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}), n=False)
-    command('pm', cmd_pm, n=False)
+    command('pm', cmd_pm, (('--adopt',), {'nargs': '+', 'type': int, 'default': []}), n=False)
     command('cleanup', cmd_cleanup, (('--dry-run',), {'action': 'store_true'}), n=False)
     args = parser.parse_args(argv)
     if BOARD is None:

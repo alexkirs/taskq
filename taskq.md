@@ -199,11 +199,17 @@ the branch, never a resumed one (#291).
   `close`. What `close` cannot reach (a sandbox, #502; another machine: it says so in the comment) waits for the pass.
 - Each pass: removes the recorded sessions on its machine, stopped only, of tasks not open and of replaced sessions.
   A supervisor is never stopped mid-turn; it is retired once stopped.
+- A replacement spawn (a rework's `T<N>`, a respawned or requeued task's `S<N>`) first retires the task's earlier
+  sessions of that role the board records: a worker running or not, a supervisor stopped only. A Codex spawn rewrites
+  `.taskq/T<N>.pid`/`S<N>.pid`, the old thread's only handle: a replaced thread still running keeps it as
+  `.taskq/T<N>-<thread>.pid`/`S<N>-<thread>.pid` until retired (#568).
 
 - The runtimes find their own sessions by name (`T<N> `/`S<N> ` Claude jobs, `.taskq/T<N>.pid`/`S<N>.pid` Codex
   handles); the name only finds candidates, the recorded id decides. A closed task's block keeps `claim` and
   `supervisor` as its record.
 Changed: sessions were matched by the `T<N> ` name prefix and the task number → by recorded id (#525).
+Changed: a replaced session waited for the end-of-pass retire, after the replacement's spawn had overwritten its
+Codex handle (an old thread left unarchived) → retired before the spawn, its handle kept while it runs (#568).
 Changed: `close` stops every `T<N>` session by name; the pass removes stopped ones → one rule for `T<N>` and `S<N>`:
 recorded ids only, the running supervisor left to the pass (#524).
 Changed: "supervisor retires its worker; cleanup ends sessions without a task" → `close` does it; no cleanup command
@@ -730,7 +736,7 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 | Runtime | spawn | send | alive | link | retire |
 |---|---|---|---|---|---|
 | Claude | `claude --bg --name "T<N> <ORCH> <title> (<machine>)"` in the project root; tools `Bash Read Edit Write Glob Grep WebFetch WebSearch`, no MCP, `--permission-mode dontAsk` | `claude stop`, then `claude --bg --resume <id> <text>` (a new id) | `claude agents --json --all` | Remote Control URL | `claude stop <job id>` when running, then `claude rm <job id>` |
-| Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread>` in `.taskq/T<N>.pid` | `codex exec resume <id> <text>` | the pid is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` |
+| Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread>` in `.taskq/T<N>.pid` | `codex exec resume <id> <text>` | the pid is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` (or a replaced `T<N>-<thread>.pid`) |
 
 - A supervisor starts and retires as a worker does, named `S<N> ...` (Codex: `.taskq/S<N>.log`,
   `.taskq/S<N>.pid`), with the same tools, `permission_mode` and `codex` options (R9). A running Claude supervisor

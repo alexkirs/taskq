@@ -380,8 +380,10 @@ run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#4
 No fixed interval (#407): the manager is woken only when it has work.
 
 1. In the project root run `taskq arm tick "<manager>"` (its session name, id or link). It prints the prompt for
-   this runtime: loop { `taskq wait`; send its output to `<manager>` (Claude: `SendMessage`; Codex: its thread
-   send) }.
+   this runtime: loop { `taskq wait`; send its output to `<manager>` (Claude: `SendMessage`; Codex:
+   `codex exec resume <thread> "<output>"`, a new turn that wakes an idle thread, or the same loop in a shell) }.
+   Without `<manager>` in a Codex session (not woken when a background command ends, #497): loop `taskq wait` and
+   the pass in the foreground, and before a turn ends start a sender for this thread (#510).
 2. Start a separate sender session on that prompt. It does no task work.
 3. `taskq wait` lists the board every 25 s and returns at once with one line per new event: `review #N`, `ask #N`,
    `gone #N` (a worker claimed on this machine whose session `alive` says gone), or `tick` when nothing happened for

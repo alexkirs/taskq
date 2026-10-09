@@ -748,6 +748,14 @@ class Wait(Tick):
         self.assertIn('taskq.py wait`', out)
         self.assertIn('with SendMessage', out)
 
+    def test_arm_tick_in_codex_names_resume(self):
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_THREAD_ID': 'T1'}):
+            sender, self_arm = self.run_cli('arm', 'tick', 'T1'), self.run_cli('arm', 'tick')
+        self.assertIn('resume T1 "<its output>"', sender)
+        self.assertIn('resume T1 "$e"; done', sender)
+        self.assertIn('in the foreground', self_arm)
+        self.assertIn('arm tick T1`', self_arm)
+
 
 class Contract(Base):
     """#430: `taskq pm` gives the manager role; tick and wait pull the clone and say when the contract changed."""

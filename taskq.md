@@ -323,6 +323,8 @@ Owner decisions on what taskq looks and sounds like, one line each (#505). Chang
 
 ## 1. Setup (once per project)
 
+Setup again (the clone exists): first `git pull --ff-only` the clone and the project, then re-read this file.
+
 1. python3 >= 3.9, git; `gh` (GitHub) or `glab` (GitLab) installed and logged in: `gh auth status` / `glab auth status`.
    Workers need the `claude` and/or `codex` CLI.
    Self-managed GitLab: the user's `glab` needs the host's OAuth Application ID before a web login. With `glab_client_id`

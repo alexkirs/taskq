@@ -404,6 +404,9 @@ replace its entrypoint in place, or diagnose the new CLI with `python -m taskq -
    intended worker limits and board login with the native CLI of the chosen environment. Do not silently convert
    a legacy TOML profile, overwrite JSON, adopt another manager's tasks or start a production pass as an install test.
    Windows and WSL have separate CLI logins and executable paths; a WSL check does not qualify native Windows.
+   Validate a harmless board read through the same Python process that will run TaskQ. Store Python may give
+   a child CLI a redirected configuration view: direct CLI login can succeed while that child's API returns
+   401/404. If this is reproduced, use a qualified non-Store Python interpreter; do not copy tokens between views.
 6. Switch only this user's command or shell function to the new absolute entrypoint after these checks. Preserve
    its previous definition for rollback. For normal self-updates, the new clone must be clean `main`; use
    `git switch main` only when it still names the verified SHA (otherwise verify the new head's CI first).

@@ -637,17 +637,54 @@ def cmd_close(args):
             print(error, file=sys.stderr)
     failed and fail(f'not closed: {" ".join(f"#{n}" for n in failed)}')
 
+def publish_direct(current, sha, git):
+    """#533: close is acceptance; transfer and qualify the exact candidate before main can change."""
+    if role(current) not in ('supervisor', 'manager', 'owner'):
+        fail(f'#{current["iid"]}: only the accepting reviewer can publish a direct candidate')
+
+    def run(*args):
+        done = subprocess.run([*git, *args], capture_output=True, text=True, encoding='utf-8')
+        if done.returncode:
+            fail(done.stderr.strip() or f'git {args[0]} failed')
+        return done.stdout.strip()
+
+    branch = f'refs/heads/taskq-{current["iid"]}'
+    if run('ls-remote', 'origin', branch).split()[:1] != [sha]:
+        fail(f'{branch}: remote candidate does not match result {sha}')
+    run('merge-base', '--is-ancestor', 'origin/main', sha)  # fast-forward only; never discard new main work
+    board, host = CONFIG['board'], CONFIG.get('host')
+    if board == 'github':
+        checks = run_api('gh', host, 'GET', f'repos/{CONFIG["repo"]}/commits/{sha}/check-runs?check_name=tests')['check_runs']
+        green = bool(checks) and all(c['status'] == 'completed' and c['conclusion'] == 'success' for c in checks)
+    elif board == 'gitlab':
+        checks = run_api('glab', host, 'GET', f'projects/{quote(CONFIG["repo"], safe="")}/pipelines?sha={sha}')
+        green = bool(checks) and checks[0]['sha'] == sha and checks[0]['status'] == 'success'
+    else:  # custom board: the reviewer verifies project-owned CI/checks (§ 6)
+        green = True
+    if not green:
+        fail(f'#{current["iid"]}: CI is not green on candidate {sha}')
+    if run('ls-remote', 'origin', branch).split()[:1] != [sha]:
+        fail(f'{branch}: remote candidate changed during acceptance')
+    run('push', 'origin', f'{sha}:refs/heads/main')
+    run('fetch', 'origin')
+    run('merge-base', '--is-ancestor', sha, 'origin/main')  # read back, including a concurrent later fast-forward
+
 def close_one(args):
     current = task(args.n, 'review')
     gate(current)
     sha = commit((current['result'] or {}).get('sha') or '')
     if CONFIG['publish'] == 'pr' and (merged := merge(current, sha)):
         args.text = f'merged {merged}' + (f'\n\n{args.text}' if args.text else '')
-    else:  # direct mode, or a pr-mode task with no PR (an answer): the result must be on main
+    else:  # an already-published result/answer, or an unpublished direct candidate
         git = [shutil.which('git') or fail('git not found'), '-C', str(CONFIG['root'])]
-        subprocess.run([*git, 'fetch', 'origin'], capture_output=True)
+        fetched = subprocess.run([*git, 'fetch', 'origin'], capture_output=True)
+        if fetched.returncode:
+            fail(f'#{args.n}: could not fetch origin for publication')
         if subprocess.run([*git, 'merge-base', '--is-ancestor', sha, 'origin/main'], capture_output=True).returncode:
-            fail(f'#{args.n}: result {sha} is not on origin/main')
+            if CONFIG['publish'] != 'direct':
+                fail(f'#{args.n}: result {sha} is not on origin/main')
+            publish_direct(current, sha, git)
+            args.text = f'published {sha}' + (f'\n\n{args.text}' if args.text else '')
     claim = current['claim'] or {}
     if hasattr(runtimes().get(claim.get('runtime')), 'retire') and claim.get('name') not in (None, machine()):
         args.text = (f'{args.text}\n\n' if args.text else '') + f'session {claim.get("session")} runs on {claim.get("name")}: stop it there'
@@ -832,7 +869,7 @@ def brief(item, runtime):
     create = f'glab mr create --yes --target-branch main --source-branch taskq-{n} --title "<title>" --description' if CONFIG['board'] == 'gitlab' \
         else f'gh pr create --base main --head taskq-{n} --title "<title>" --body'
     push = f'`git push --force-with-lease origin HEAD:refs/heads/taskq-{n}`, open a pull request once (a push updates it):\n  `{create} "<summary>"`, ' \
-        f'then `{tq} result {n} --sha <PR head full SHA>' if CONFIG['publish'] == 'pr' else f'`git push origin HEAD:main`, then\n  `{tq} result {n} --sha <pushed full SHA>'
+        f'then `{tq} result {n} --sha <PR head full SHA>' if CONFIG['publish'] == 'pr' else f'`git push --force-with-lease origin HEAD:refs/heads/taskq-{n}`, then\n  `{tq} result {n} --sha <candidate full SHA>'
     workspace = f'take your workspace from the project instructions (AGENTS.md) or the path the manager gave, on branch taskq-{n};\nthe host owns it: never remove it' \
         if CONFIG.get('workspace') == 'external' else f'from {root} run `git fetch origin && git worktree add -b taskq-{n} .worktrees/taskq-{n} origin/main`, work only there,\nnever in the main checkout'
     return f'''You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
@@ -849,7 +886,7 @@ needs no worktree. Commands:
   --option "<A>" --option "<B>" --recommend <K> [--link <url of a result, image or video>]`, then stop. A result that leaves the owner a choice
   takes the same --option/--recommend/--link; an option starting `close` accepts the result.
 - Cannot be done: `{tq} requeue {n} --text "<why>"`, then stop.
-- Deliver: commit on branch taskq-{n}, `git fetch origin && git rebase origin/main`, run the tests, {push} --checks "<commands and outcome>" --text "<summary>"`, then stop.
+- Deliver: commit on branch taskq-{n}, `git fetch origin && git rebase origin/main`, run the tests required by § 10 Testing policy, {push} --checks "<commands and outcome>" --text "<summary>"`, then stop.
   An answer with no commit: the result names the current origin/main SHA and the text holds the answer.
 Everything written through taskq is public: no secrets, tokens or paths outside the repository.'''
 
@@ -873,7 +910,9 @@ Read `{Path(__file__).resolve().with_name("taskq.md")}` (§ 7 Supervisor, § 6) 
 2. `{tq} run {n}` orders the worker (the queue spawns it); then {wait}.
 3. Woken by `review #{n}`: `git fetch origin`, `git show <sha> --stat`, then the diff, against every Acceptance item and taskq.md
    ({CONFIG["publish"]} mode{": the PR diff" if CONFIG["publish"] == "pr" else ""}). A commit: CI on exactly that SHA is green (`{ci}`, where the project has CI);
-   an answer on origin/main needs no CI.
+   an answer on origin/main needs no CI. Evaluate § 10 testing evidence, sensitivity, blindspots and applicable
+   isolated candidate live proof BEFORE publication. Missing required evidence is rework or ask, never PASS.
+   close records your acceptance and publishes the exact candidate; the worker never pushes main.
    - Accepted: `{tq} close {n} --text "<one line for the manager: what was checked, what was not>"`, then end your turn.
    - Not accepted, CI red, or close sent it back: `{tq} requeue {n} --text "<exact fixes>"`; a new worker continues the branch.
      Then wait as in 2. The third rework is refused: ask the owner.

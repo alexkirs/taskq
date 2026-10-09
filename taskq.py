@@ -368,6 +368,13 @@ def task_policy(issue):
     notes = [text for text in issue.get('comments', []) if text.startswith('**execution-profile** · owner\n\n')]
     if not isinstance(profile, str) or not notes or notes[-1] != f'**execution-profile** · owner\n\n{profile}':
         raise ValueError('execution profile lacks matching explicit owner approval on the board')
+    return task_profile_options(item)
+
+def task_profile_options(item):
+    """Deterministic validation shared with the list report; never proves owner approval."""
+    profile = item['raw'].get('execution_profile')
+    if profile is None:
+        return None
     if profile == 'host-gpu':
         raise ValueError('unsupported host-gpu: native exec has no action-time approval transport; owner and Mac runtime '
                          'administrator must provision an isolated Blender/Chrome/GPU runner and record permitted host '
@@ -1536,15 +1543,21 @@ def report(items, listed, kinds, here):
     items = list(filter(mine, items))
 
     def state(item):  # what the row says; only a plain `ready` is counted ready
-        profile = item['raw'].get('execution_profile')
-        if profile is not None and profile != 'workspace':
-            return 'blocked (unsupported host-gpu)' if profile == 'host-gpu' else 'blocked (unsupported execution profile)'
         deps = ', '.join(f'#{n}' for n in item['deps'] or [] if n in listed)
-        if item['state'] == 'waiting':
-            return f'waiting ({deps})' if deps else 'waiting'
-        if item['state'] == 'ready' and not lead(item, kinds):
-            return 'blocked (no manager)'
-        return f'blocked ({deps} open)' if item['state'] == 'ready' and deps else item['state']
+        value = item['state']
+        if value == 'waiting':
+            value = f'waiting ({deps})' if deps else 'waiting'
+        elif value == 'ready':
+            if deps:
+                value = f'blocked ({deps} open)'
+            elif not lead(item, kinds):
+                value = 'blocked (no manager)'
+        try:
+            task_profile_options(item)
+        except ValueError as error:
+            reason = str(error)
+            value = f'blocked ({reason})' if value == 'ready' else f'{value}; policy blocked ({reason})'
+        return value
     states = {item['iid']: state(item) for item in items}
     count = lambda *wanted: sum(value in wanted for value in states.values())
     host, repo = CONFIG.get('host'), CONFIG.get('repo')

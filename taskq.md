@@ -942,6 +942,10 @@ The command refuses an active claim/supervisor: changing a running task's enviro
 No field (or null) means the existing project defaults, unchanged. `workspace` pins workspace-write, approval never,
 network access and the repository Git metadata writable root for native Codex S and W alike. Only existing
 model/effort options may accompany this profile; conflicting/unknown options are rejected, never silently dropped.
+The report validates deterministic profile/runtime/config errors from its one snapshot, using the same option
+resolver as dispatch. It retains waiting/dependency reasons and appends any policy blocker; doing/review/ask
+counters keep their state meaning. List data cannot prove the trusted owner approval note: otherwise eligible
+workspace tasks remain provisionally Ready, with approval checked only on the fresh dispatch read.
 Other runtimes cannot consume a selected profile. `host-gpu` always blocks before dispatch: the native exec
 adapter has no action-time approval handler. It does not launch Blender, Chrome or a bind probe. No new approval
 transport, danger-full-access, bypass, global permission change, runtime/model/effort/limit change is authorized.

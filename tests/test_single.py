@@ -240,6 +240,45 @@ class ExecutionPolicy(Base):
             with mock.patch.object(self.board, 'get', side_effect=AssertionError('report fetched outside snapshot')):
                 self.assertIn(counters, self.run_cli('status'))
 
+    def test_report_rejects_same_deterministic_errors_as_dispatch(self):
+        self.approve()
+        original = self.board.get(1)
+        for options, worker, manager, reason in (
+                (['-s', 'danger-full-access'], 'codex', 'codex', 'conflicts'),
+                (['-s', 'workspace-write'], 'codex', 'codex', 'conflicts'),
+                ([], 'claude', 'codex', 'runtime unchanged'),
+                ([], 'codex', 'claude', 'runtime unchanged')):
+            with self.subTest(options=options, worker=worker, manager=manager):
+                taskq.CONFIG['codex'] = options
+                item = taskq.parse(original)
+                self.board.update(1, body=taskq.block(item['text'], {**item['raw'], 'pm': {'runtime': manager}}),
+                                  labels=[label for label in original['labels'] if not label.startswith('run-')] + ['run-' + worker])
+                self.assertIn(reason, taskq.policy_reason(self.board.get(1)))
+                with mock.patch.object(self.board, 'get', side_effect=AssertionError('outside snapshot')):
+                    out = self.run_cli('status')
+                self.assertIn('Ready 0', out)
+                self.assertIn(reason, out)
+        taskq.CONFIG['codex'] = []
+        self.board.issues[1] = original
+        self.add('default')
+        with mock.patch.object(self.board, 'get', side_effect=AssertionError('approval unavailable in list')), \
+                mock.patch.object(taskq, 'runtimes', return_value={'codex': FakeRuntime()}):
+            self.assertIn('Ready 1', self.run_cli('status'))
+        self.assertIsNone(taskq.task_policy(self.board.get(2)))
+
+    def test_report_retains_wait_dependencies_and_active_counters_with_policy_blocker(self):
+        self.approve('host-gpu')
+        self.add('dependency')
+        for state, expected in (('waiting', 'waiting (#2)'), ('ready', 'blocked (#2 open)'),
+                                ('doing', 'doing'), ('review', 'review')):
+            with self.subTest(state=state):
+                taskq.move(self.task(1), state, 'fixture', deps=[2])
+                with mock.patch.object(self.board, 'get', side_effect=AssertionError('outside snapshot')):
+                    out = self.run_cli('status')
+                self.assertIn(expected + '; policy blocked (unsupported host-gpu:', out)
+                self.assertIn('In work ' + str(int(state in ('doing', 'review'))), out)
+                self.assertIn('Ready 0', out)
+
     def test_missing_native_resume_handle_and_wrong_runtime_are_blockers(self):
         self.approve()
         taskq.move(self.task(1), 'doing', 'fixture', claim={'runtime': 'codex', 'session': 'app-th'})

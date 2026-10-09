@@ -634,3 +634,22 @@ The local fake-CLI test makes no real adapter/model calls; elapsed time and CI b
 | Process/env boundary loses selection | Bounded real child with fake CLI records applied argv/env on spawn/resume (local boundary) | synthetic candidate check | Retain; no real Codex/GPU capability claimed |
 
 No benchmark, test migration or cost instrumentation. Development/model cost and historical flake rate unknown.
+
+### Report/dispatch review correction (#577)
+
+The report now shares deterministic profile/runtime/config validation with dispatch, without fetching comments
+or adding board reads. Conflicting explicit sandbox options (including workspace-write), a non-Codex worker,
+and a non-Codex/DOT manager exclude a task from Ready. Waiting and dependency reasons remain visible alongside
+the policy blocker; doing/review/ask counters still reflect board state. A list cannot verify owner approval:
+otherwise eligible workspace tasks are provisionally Ready, and dispatch still requires the fresh trusted note.
+
+| Requirement / consequence | Assertion and cheapest level | Red before fix | Blindspot / disposition |
+|---|---|---|---|
+| Report counts a deterministically refused task Ready | ExecutionPolicy.test_report_rejects_same_deterministic_errors_as_dispatch covers dangerous/explicit workspace config and worker/PM runtime; BOARD.get forbidden during status | reported by exact-head supervisor review | Retain; no live dispatch; list approval remains unavailable |
+| Policy blocker erases wait/dependency or changes active counters | ExecutionPolicy.test_report_retains_wait_dependencies_and_active_counters_with_policy_blocker covers waiting/ready/doing/review; existing ask counter case retained | reported by supervisor review | Retain; one snapshot, no host capability proof |
+
+Focused ExecutionPolicy/Commands/Contract: 29 tests passed locally. The first focused attempt failed because
+the positive report fixture had no installed Codex runtime; the fixture now supplies FakeRuntime explicitly.
+No production runtime/config/credential change, live probe or Memory behavior change is part of this correction.
+The external prerequisite and separate publication gate above remain unchanged. Final-gate and exact-head CI
+outcomes are recorded in the task result; prior-head Linux success does not prove this candidate.

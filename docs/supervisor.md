@@ -373,3 +373,70 @@ The Hermes runtime has no diff from origin/main, and the failing class's AST is 
 This establishes unchanged source/platform incompatibility, not a completed baseline execution.
 No test was disabled and no Linux support shim was added. The final gate is not green; applicable
 exact-head checks and live wake proof remain required before acceptance/publication.
+
+
+### Diagnostic continuation, 2026-10-09 19:00-19:03 UTC
+
+The existing branch/PR #596 and supervisor were preserved. This continuation performs no model launch,
+production pass, monitor wait/send, adoption, rebinding, credential read or permission change. No role or
+cross-agent behavior changed; no Memory or R-number amendment is needed for this diagnostic record.
+
+The initial error above is the retained safe error evidence. The matching installed CLI still reports
+`codex-cli 0.159.3`; even `codex --version` also reports
+`WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)`.
+That warning is nonfatal and does not establish the app-server failure's syscall.
+
+Read-only inspection of the [version-tagged exec source](https://github.com/openai/codex/blob/rust-v0.159.3/codex-rs/exec/src/lib.rs#L985)
+locates the reported error at `InProcessAppServerClient::start`, before thread start/resume and user turn.
+The [in-process source](https://github.com/openai/codex/blob/rust-v0.159.3/codex-rs/app-server/src/in_process.rs#L377)
+propagates startup configuration/auth bootstrap and installation-ID errors before its initialize request.
+An initialize RPC rejection would instead include `in-process initialize failed:`. The retained error has
+no such prefix. No runtime trace exists to distinguish all startup substeps.
+
+The [installation-ID source](https://github.com/openai/codex/blob/rust-v0.159.3/codex-rs/core/src/installation_id.rs#L19)
+unconditionally opens the installation-ID file read/write/create and locks it, even when a valid ID exists.
+A metadata-only check at `19:02:23.470467Z` found the existing installation-ID file present, with advisory
+write access false for both file and parent. No contents, open-for-write or chmod was attempted. Combined
+with this worker's restricted writable roots, this identifies a concrete incompatible required startup
+operation. It is a strong filesystem/sandbox hypothesis, not proof that this particular syscall produced
+the retained errno; configuration/auth bootstrap remains another possible source. No credentials were inspected.
+
+| Hypothesis / bounded diagnostic | Observation | Classification / stop |
+|---|---|---|
+| CLI error is caused by PM/ARM wording | Tagged exec source fails before thread/user turn; original zero JSONL events | No instruction-understanding evidence; do not spend candidate model trials on this unavailable route |
+| Local IPC socket creation/bind is generally prohibited | At `19:01:14.442315Z`, fresh AF_UNIX and loopback AF_INET sockets each created, bound and listened successfully in an auto-cleaned temporary directory | Broad IPC hypothesis rejected; no app-server or wake proof |
+| Required installation metadata is writable | Existing file/parent report advisory write access false; tagged source requires read/write open | Filesystem/sandbox blocker candidate; exact failing syscall unknown; no denied open retry |
+| Prior macOS failures indicate an ARM regression | `runtimes/hermes.py` byte-identical and `HermesNativeBoundary` AST-identical to origin/main; Darwin has no `os.pidfd_open`, while adapter explicitly requires Linux pidfds | Unchanged unsupported Linux-only boundary; no shim, skip annotation or weakened assertion introduced |
+
+Safe reproduction of socket diagnostics (use the existing authorized shell; no Codex-home override):
+
+```sh
+export TASKQ_TASK=595 TASKQ_RUNTIME=codex && python3 - <<'PYCODE'
+import socket, tempfile
+with tempfile.TemporaryDirectory(prefix='taskq-595-boundary-') as root:
+    for family in (socket.AF_UNIX, socket.AF_INET):
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.bind(root + '/probe.sock' if family == socket.AF_UNIX else ('127.0.0.1', 0))
+            probe.listen(1)
+            print(family, 'bind/listen PASS')
+PYCODE
+```
+
+Capabilities were inspected from this session's actual callable inventory: shell execution/continuation
+available; no independent app `send_message_to_thread` and no established DOT parent/local-child route.
+Collaboration and UI tooling do not establish those missing routes. No replacement sender was created.
+All control/I/H live matrix cells remain BLOCKED as previously classified, with no winning wording,
+idle wake, receipt, next targeted wait, omission counts or wake latency. Claude 0 remains preserved.
+
+Focused candidate regression command `python3 -m unittest tests.test_single.Wait tests.test_single.MultiPM
+ tests.test_single.Contract`: 21 tests PASS in 2.807 s. A separate diagnostic selection of all classes except
+`HermesNativeBoundary` assesses whether reported failures extend beyond the unsupported Linux boundary;
+135 tests PASS in 20.901 s. It is explicitly not the contract's full final gate and does not turn that earlier failed gate green.
+Existing PR exact-head CI reports both test checks SUCCESS at `3fcbb6ab8db019827347ec596c85e1c917899ea5`;
+CI is not live macOS wake evidence or independent supervisor acceptance.
+
+Smallest prerequisite: the existing PM/supervisor must make the already authorized isolated qualification
+reachable through an existing supported app-session route and provide safe receipt/next-wait evidence, or
+obtain an explicitly reviewed narrowly scoped CLI startup-access prerequisite. The worker cannot grant
+itself access or relocate Codex home to evade the denial. Prefer the existing app route; do not change model,
+effort, credentials, monitor ownership or security settings. Hold main publication/deployment and acceptance.

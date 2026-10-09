@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
-import argparse, contextlib, hashlib, importlib.util, json, os, re, shutil, signal, socket, subprocess, sys, time
+import argparse, contextlib, hashlib, importlib.util, json, os, re, shlex, shutil, signal, socket, subprocess, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -306,6 +306,11 @@ def pid_alive(pid):
     ctypes.windll.kernel32.CloseHandle(handle)
     return code.value == 259  # STILL_ACTIVE
 
+def codex_options():
+    # Network on: a worker pushes and calls the board. `"codex": [...]` in taskq.json replaces these options.
+    return CONFIG.get('codex', ['-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true',
+                                '--add-dir', str(CONFIG['root'] / '.git')])  # git fetch/commit write the main .git
+
 class Codex:
     """`codex exec`, headless: one process per turn, its JSONL in .taskq/<name>.log, `<pid> <thread>` in .taskq/<name>.pid."""
 
@@ -314,12 +319,9 @@ class Codex:
         return CONFIG['root'] / '.taskq'
 
     def exec(self, name, arguments, cwd):
-        # Network on: a worker pushes and calls the board. `"codex": [...]` in taskq.json replaces these options.
-        options = CONFIG.get('codex', ['-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true',
-                                       '--add-dir', str(CONFIG['root'] / '.git')])  # git fetch/commit write the main .git
         log, detach = self.folder() / f'{name.split()[0]}.log', {'creationflags': 0x208} if os.name == 'nt' else {'start_new_session': True}
         with open(log, 'ab') as out:  # detached: the worker outlives the tick
-            process = subprocess.Popen([shutil.which('codex') or fail('codex not found'), 'exec', '--json', *options, *arguments],
+            process = subprocess.Popen([shutil.which('codex') or fail('codex not found'), 'exec', '--json', *codex_options(), *arguments],
                                        cwd=cwd, env=worker_env(), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
         return process, log
 
@@ -937,7 +939,7 @@ def cmd_wait(args):
         seen = now  # a task that leaves review and comes back while we wait is a new event
         time.sleep(args.every)
 
-SENDERS = {'claude': 'SendMessage', 'codex': 'its thread send'}
+SENDERS = {'claude': 'SendMessage'}
 CLONE = Path(__file__).resolve().parent  # the taskq clone: its taskq.md is the manager contract (#430)
 
 def contract():
@@ -979,17 +981,28 @@ def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
     runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
     wait = f'python3 {Path(__file__).resolve()} wait'
+    if not args.target and runtime == 'codex':  # #510: a Codex session is not woken when a background command ends
+        thread = os.environ.get('CODEX_THREAD_ID') or '<this thread>'
+        return print(f'''Arm the tick in this session. Codex is not woken when a background command ends, so tick in the foreground:
+loop {{ run `{wait}`; on its output (`review #N`, `ask #N`, `gone #N` or `tick`) run one pass (`taskq tick`) and do
+§ 7 After each pass for those tasks }}. Before you end a turn, start a separate sender for the time between turns:
+run `python3 {Path(__file__).resolve()} arm tick {thread}` and start a session (or a shell loop) on what it prints.
+Codex manager: start it with `codex {CODEX_COMPACT}`.''')
     if not args.target:  # no target: this session ticks itself (Claude: a background command wakes the session on exit)
         return print(f'''Arm the tick in this session. Run `{wait}` as a background command (Claude Code: run_in_background).
 When it ends you are woken with its output (`review #N`, `ask #N`, `gone #N` or `tick`): run one pass (`taskq tick`),
 do § 7 After each pass for those tasks, then start `{wait}` in the background again. Keep exactly one wait running.
 A runtime that cannot wake a session when a background command ends (Codex): use `taskq arm tick "<manager>"` from a separate sender session.
 Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.json autoCompactWindow 200000).''')
+    resume = f'codex exec {shlex.join(codex_options())} resume {args.target}'  # the options a worker turn gets
+    send = f'by running `{resume} "<its output>"`: a new turn on that thread wakes it' if runtime == 'codex' else \
+        f'with {SENDERS.get(runtime, "your messaging tool")}'
+    shell = f'\nNo agent needed: `cd {CONFIG["root"]} && while :; do e=$({wait}) && {resume} "$e"; done` in a terminal.' if runtime == 'codex' else ''
     print(f'''You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
 Repeat forever, from {CONFIG["root"]}:
-1. Run `python3 {Path(__file__).resolve()} wait`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
-2. Send its output, verbatim, to {args.target} with {SENDERS.get(runtime, "your messaging tool")}.
-3. Go back to 1 at once. A failed run or send: say so to {args.target} once, then go on.''')
+1. Run `{wait}`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
+2. Send its output, verbatim, to {args.target} {send}.
+3. Go back to 1 at once. A failed run or send: say so to {args.target} once, then go on.{shell}''')
 
 def main(argv=None):
     global CONFIG, BOARD

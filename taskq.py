@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 STATES = ('ready', 'waiting', 'doing', 'review', 'ask', 'later')
 TYPES = ('code', 'docs', 'research', 'asset')
-FIELDS = ('scope', 'deps', 'claim', 'result')
+FIELDS = ('scope', 'deps', 'claim', 'result', 'supervisor', 'order')
 PREFIX, RUN, ON = 'q-', 'run-', 'host-'
 BLOCK = re.compile(r'<!-- taskq:start -->\s*```json\n(.*?)\n```\s*<!-- taskq:end -->', re.S)
 SESSIONS = {'claude': 'CLAUDE_CODE_SESSION_ID', 'codex': 'CODEX_THREAD_ID'}
@@ -36,10 +36,10 @@ def machine():
 
 ORCH = {'claude': 'CLD', 'codex': 'CDX', 'dot': 'DOT', 'hermes': 'HRM', 'grok': 'GRK'}
 
-def worker_name(item):
-    """R3 naming (#268): `T<N> <ORCH> <title> (<machine>)`; ORCH is who launched it, UNK for the owner's shell."""
+def worker_name(item, letter='T'):
+    """R3 naming (#268): `T<N> <ORCH> <title> (<machine>)`, `S<N> ...` the supervisor; ORCH is who launched it, UNK for the owner's shell."""
     launcher = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
-    return f'T{item["iid"]} {ORCH.get(launcher, "UNK")} {item["title"][:40]} ({machine()})'
+    return f'{letter}{item["iid"]} {ORCH.get(launcher, "UNK")} {item["title"][:40]} ({machine()})'
 
 def session():
     """This agent session, or None for the owner's shell. TASKQ_RUNTIME picks one when a session inherited another's id."""
@@ -200,9 +200,11 @@ def make_board(config):
 # --- runtime --------------------------------------------------------------------------------
 # Four functions: spawn(name, prompt, cwd) -> session, send(session, text) -> session (a Claude resume may continue
 # under a new id), alive(session) -> True/False/None (running / gone / cannot tell), link(session) -> url or None.
-# Optional fifth: retire(gone, running=True) stops and removes this machine's `T<N>` sessions whose task gone(N) names:
-# close calls it for its task (#302, #360), the tick for closed tasks, stopped sessions only. The built-ins call
-# gone(N, session, live): `taskq cleanup` removes only a session the board records (#478).
+# Optional fifth: retire(gone, running=True) stops and removes this machine's `T<N>` / `S<N>` sessions for which
+# gone(N, session, live) is true: close calls it for its task's workers (#302, #360), the tick for sessions the board
+# no longer holds, stopped ones only. A session goes only by the id its task records (R11, #478, #525).
+# Optional sixth: tail(session), the last log line. Optional seventh: state(session) -> 'running', 'idle', 'dead' or
+# None, a supervisor's liveness (taskq.md § 7 step 4); without it alive() stands in (False: dead).
 
 def worker_env():  # a worker must not inherit the tick's session id, nor a spawning worker's task (#333)
     return {key: value for key, value in os.environ.items() if key not in (*SESSIONS.values(), 'TASKQ_TASK', 'TASKQ_RUNTIME')}
@@ -211,7 +213,8 @@ class Claude:
     # #38, #51, #71: a worker gets only these tools, no MCP, no Chrome, and a pinned mode (else `auto` stops `taskq`).
     # `--tools` takes several values: a flag must follow it, never the prompt.
     TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'WebFetch', 'WebSearch']
-    names = r'T(\d+) [A-Z]{3} '  # worker_name; `taskq cleanup` widens it to the old `T<N> ` / `S<N> ` names
+    names = r'[TS](\d+) [A-Z]{3} '  # worker_name; `taskq cleanup` widens it to the old `T<N> ` / `S<N> ` names
+    SELF_WAKE = True  # while its process runs, a supervisor wakes on its own background `taskq wait --task N`
 
     def agents(self):
         """This machine's `claude --bg` sessions by session id, stopped ones too; None when the list cannot be read."""
@@ -261,6 +264,15 @@ class Claude:
     def alive(self, session):
         agent = (self.agents() or {}).get(session)
         return None if agent is None else self.running(agent)
+
+    def state(self, session):
+        """A supervisor (§ 7 step 4): a listed pid is running (its own background wait wakes it); listed with no pid, its
+        turn ended: idle, the pass resumes it (a new id, recorded); not listed or `failed`: dead."""
+        agents = self.agents()
+        if agents is None:
+            return None
+        agent = agents.get(session)
+        return 'dead' if not agent or not agent.get('pid') and agent.get('state') == 'failed' else 'running' if agent.get('pid') else 'idle'
 
     def retire(self, gone, running=True):
         """`claude stop` + `claude rm`: duplicate spawns and resumes leave several jobs per task, and a stopped job stays listed (#360)."""
@@ -323,6 +335,7 @@ class Codex:
         with open(log, 'ab') as out:  # detached: the worker outlives the tick
             process = subprocess.Popen([shutil.which('codex') or fail('codex not found'), 'exec', '--json', *codex_options(), *arguments],
                                        cwd=cwd, env=worker_env(), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
+        dispatch('turn end', [], after=process.pid)  # #525: a sandboxed turn starts no pass; one runs when it ends (no sender, no timer)
         return process, log
 
     def spawn(self, name, prompt, cwd):
@@ -352,10 +365,26 @@ class Codex:
         path = self.pid_file(session)
         return None if path is None else pid_alive(int(path.read_text().split()[0]))
 
+    def state(self, session):
+        """A supervisor (§ 7 step 4): its process exits at every turn end, by design. Pid running: running; exited after a
+        last turn that ended `turn.completed`, with a local rollout: idle; anything else: dead."""
+        path = self.pid_file(session)
+        if path is None:
+            return 'dead'
+        if pid_alive(int(path.read_text().split()[0])):
+            return 'running'
+        log = path.with_suffix('.log')
+        turn = (log.read_text('utf-8', 'replace') if log.exists() else '').rpartition('"turn.started"')
+        ends = re.findall(r'"type":\s*"(turn\.completed|turn\.failed|error)"', turn[2]) if turn[1] else []
+        return 'idle' if ends[-1:] == ['turn.completed'] and rollout(session) == 'local' else 'dead'
+
+    def resumable(self, session):  # a dead supervisor's first recovery: `exec resume` of the same thread
+        return rollout(session) == 'local'
+
     def retire(self, gone, running=True):
-        """Kill the turn's process, `codex archive` the thread, drop .taskq/T<N>.pid (#360)."""
-        for path in (CONFIG['root'] / '.taskq').glob('T*.pid'):
-            n, (pid, thread) = re.fullmatch(r'T(\d+)', path.stem), path.read_text().split()
+        """Kill the turn's process, `codex archive` the thread, drop .taskq/T<N>.pid or S<N>.pid (#360)."""
+        for path in (CONFIG['root'] / '.taskq').glob('*.pid'):
+            n, (pid, thread) = re.fullmatch(r'[TS](\d+)', path.stem), path.read_text().split()
             if not n or not gone(int(n[1]), thread, pid_alive(int(pid))) or pid_alive(int(pid)) and not running:
                 continue
             if pid_alive(int(pid)):
@@ -432,14 +461,69 @@ def decision(args):
     return {'summary': args.text.strip().split('\n')[0][:120], 'links': args.link, 'options': args.option, 'recommend': args.recommend}
 
 # Moves with no other check: command -> (states it takes from, state it goes to, block changes).
-MOVES = {'ask': (('doing',), 'ask', lambda args: {'decision': decision(args)}), 'answer': (('ask',), 'doing', lambda args: {'decision': None}),
-         'requeue': (STATES, 'ready', lambda args: {'claim': None, 'result': None, 'decision': None}),
-         'later': (STATES, 'later', lambda args: {'waiting_for': args.text or None}),
+# A supervisor asks from review too: a result with options, or the third rework (§ 7 Supervisor).
+DROP = {'claim': None, 'supervisor': None, 'order': None}  # R11: the task's sessions are retired once stopped
+MOVES = {'ask': (('doing', 'review'), 'ask', lambda args: {'decision': decision(args)}), 'answer': (('ask',), 'doing', lambda args: {'decision': None}),
+         'requeue': (STATES, 'ready', lambda args: {**DROP, 'result': None, 'decision': None}),
+         'later': (STATES, 'later', lambda args: {**DROP, 'waiting_for': args.text or None}),
          'result': (('doing',), 'review', lambda args: {'result': {'sha': args.sha, 'checks': args.checks}, 'decision': decision(args)})}
 
 def cmd_move(args):
     sources, state, fields = MOVES[args.command]
     move(task(args.n, *sources), state, args.command, args.text, **fields(args))
+
+def manager():
+    """This machine's manager, recorded by `taskq pm` in .taskq/pm.json: {contract, runtime, session}; {} with none."""
+    path = CONFIG['root'] / '.taskq' / 'pm.json'
+    return json.loads(path.read_text('utf-8')) if path.is_file() else {}
+
+def role(current):
+    """Who runs this command for the task: supervisor, worker, manager, owner (a plain shell), or None (another session)."""
+    me = (session() or {}).get('session')
+    return 'owner' if not me else next((name for name, held in (('supervisor', current['supervisor']), ('worker', current['claim']),
+                                                                ('manager', manager())) if me == (held or {}).get('session')), None)
+
+def gate(current):
+    """R3 one controller (#525): `run`, `close` and a rework `requeue` of a supervised task come from its supervisor, this
+    machine's manager (on the owner's word) or the owner's shell; another session is refused."""
+    found, boss = role(current), current['supervisor']
+    if boss and found not in ('supervisor', 'manager', 'owner'):
+        fail(f'#{current["iid"]} is supervised by {boss["runtime"]}:{boss["session"][:8]}: only it, the manager or the owner controls it')
+    return found
+
+def workers(n, comments):
+    """Workers spawned for task n since the last answer: the first plus each rework."""
+    count = 0
+    for text in reversed(comments or []):
+        if text.startswith('**answer**'):
+            break
+        count += text.startswith('**spawn**') and '\n\nworker ' in text
+    return count
+
+def cmd_run(args):
+    """The supervisor orders its worker: the next pass on its machine spawns T<N> (§ 7 step 4)."""
+    current = task(args.n, 'doing')
+    current['supervisor'] or fail(f'#{args.n} has no supervisor: the tick runs it')
+    gate(current)
+    if (current['claim'] or {}).get('session'):
+        fail(f'#{args.n} has a worker: {current["claim"]["session"]}')
+    move(current, 'doing', 'run', args.text, order='run')
+
+def cmd_requeue(args):
+    """Supervised (#525): the supervisor's requeue is a rework (a new worker continues the branch; the third is an ask);
+    the worker's drops only its claim and wakes the supervisor; the manager's or owner's drops the supervisor too."""
+    current = task(args.n)
+    found, claim = role(current), current['claim'] or {}
+    if current['supervisor'] and found == 'worker':
+        move(current, current['state'], 'requeue', args.text, claim={**claim, 'session': None})
+        return
+    gate(current)
+    if current['supervisor'] and found == 'supervisor':
+        if workers(args.n, BOARD.get(args.n)['comments']) >= 3:
+            fail(f'#{args.n}: third rework: ask the owner (taskq ask {args.n} ...)')
+        move(current, 'doing', 'requeue', args.text, claim={**claim, 'session': None}, result=None, decision=None, order='rework')
+    else:
+        cmd_move(args)
 
 def codes(words):
     """'43.1 44.2' (spaces or commas) -> [(43, 1), (44, 2)]."""
@@ -489,8 +573,9 @@ def merge(current, sha):
         return found and fail(f'{branch}: open PRs (number, head, base) {found} do not match the result {sha} into main')
     number, head, _ = found[0]
 
-    def back(why):
-        move(current, 'ready', 'requeue', f'close: PR {number} {why}', claim=None, result=None)
+    def back(why):  # a supervised task stays with its supervisor: it requeues with the fixes (§ 7 Supervisor 3.4)
+        kept = {'claim': {**(current['claim'] or {}), 'session': None}} if current['supervisor'] else {'claim': None}
+        move(current, 'doing' if current['supervisor'] else 'ready', 'requeue', f'close: PR {number} {why}', result=None, **kept)
         fail(f'#{current["iid"]}: PR {number} {why}')
     if lab:  # the MR's latest pipeline on its head; failed, canceled or skipped sends it back
         gate = 'pipeline'
@@ -552,6 +637,7 @@ def cmd_close(args):
 
 def close_one(args):
     current = task(args.n, 'review')
+    gate(current)
     sha = commit((current['result'] or {}).get('sha') or '')
     if CONFIG['publish'] == 'pr' and (merged := merge(current, sha)):
         args.text = f'merged {merged}' + (f'\n\n{args.text}' if args.text else '')
@@ -566,13 +652,34 @@ def close_one(args):
     kept = cleanup(current)
     BOARD.close(args.n)  # first (#496): a failed close keeps the q-* label, the task stays on the board
     move(current, None, 'close', '\n\n'.join(filter(None, (args.text, kept))))
-    retire(lambda n, *_: n == args.n, f'#{args.n}: could not stop its sessions')
+    if os.environ.get('CODEX_SANDBOX'):  # #502: the sandbox can neither stop nor archive: the next pass outside retires them
+        return
+    issue, me = BOARD.get(args.n), (session() or {}).get('session')  # R11: its recorded workers, never the session running close
+    retire(lambda name, n, sid, _: n == args.n and sid != me and recorded(issue, name, sid) == 'worker', f'#{args.n}: could not stop its sessions')
+
+def recorded(issue, runtime, sid):
+    """R11 (#478, #525): 'supervisor' or 'worker' when the task records this session (the block's supervisor or claim,
+    a spawn, nudge or gone note, the take note's `<runtime>:<id[:8]>`), else None: a name alone never counts."""
+    found = BLOCK.search((issue or {}).get('body') or '')
+    raw = json.loads(found.group(1)) if found else {}
+    if not sid:
+        return None
+    for name, key in (('supervisor', 'supervisor'), ('worker', 'claim')):
+        if (raw.get(key) or {}).get('runtime') == runtime and raw[key].get('session') == sid:
+            return name
+    named = re.compile(rf'(?<![\w-]){re.escape(sid)}(?![\w-])')
+    for text in (issue or {}).get('comments') or []:
+        if text.startswith(('**spawn**', '**nudge**', '**gone**')) and named.search(text):
+            return 'supervisor' if '\n\nsupervisor ' in text else 'worker'
+        if text.startswith(f'**take** · {runtime}:{sid[:8]}'):
+            return 'worker'
+    return None
 
 def retire(gone, why, running=True):
-    """Each runtime's retire, best effort: a session left behind never fails close or the tick."""
-    for runtime in runtimes().values():
+    """Each runtime's retire, best effort: a session left behind never fails close or the tick. gone(runtime, n, session, live)."""
+    for name, runtime in runtimes().items():
         try:
-            getattr(runtime, 'retire', lambda *_: None)(gone, running)
+            getattr(runtime, 'retire', lambda *_: None)(lambda n, sid=None, live=None, name=name: gone(name, n, sid, live), running)
         except Exception as error:
             print(f'{why}: {error}', file=sys.stderr)
 
@@ -615,13 +722,6 @@ def cmd_cleanup(args):
             except (Exception, SystemExit):
                 states[n] = 'unknown'
         return states[n]
-
-    def recorded(runtime, n, session):  # #478: the block's claim, the spawn note's link, the take note's `<runtime>:<id[:8]>`
-        found = BLOCK.search(issues[n].get('body') or '')
-        claim = (json.loads(found.group(1)).get('claim') if found else None) or {}
-        notes = issues[n].get('comments') or []
-        return bool(session) and (claim.get('runtime') == runtime and claim.get('session') == session or any(
-            text.startswith('**spawn**') and session in text or text.startswith(f'**take** · {runtime}:{session[:8]}') for text in notes))
 
     def git(*argv):
         return subprocess.run([shutil.which('git') or fail('git not found'), '-C', str(root), *argv], capture_output=True, text=True, encoding='utf-8')
@@ -676,7 +776,7 @@ def cmd_cleanup(args):
             what = f'{name} session {session or "?"} of #{n}'
             why = {'open': 'open task', 'unknown': 'unknown task'}.get(state(n)) or \
                 ('running' if live else 'liveness unknown' if live is None else None) or \
-                (None if recorded(name, n, session) else 'name only, not recorded on the board')
+                (None if recorded(issues[n], name, session) else 'name only, not recorded on the board')
             if why:
                 kept.append(f'{what}: {why}')
                 return False
@@ -751,6 +851,139 @@ needs no worktree. Commands:
   An answer with no commit: the result names the current origin/main SHA and the text holds the answer.
 Everything written through taskq is public: no secrets, tokens or paths outside the repository.'''
 
+def supervisor_brief(item, runtime, kind):
+    """S<N>'s prompt (§ 7 Supervisor): the task, its orders, review and close; never the task's code."""
+    n, tq, lab = item['iid'], f'python3 {Path(__file__).resolve()}', CONFIG['board'] == 'gitlab'
+    wait = f'run `{tq} wait --task {n}` in the background (run_in_background) and end your turn; its output wakes you' \
+        if getattr(kind, 'SELF_WAKE', False) else 'end your turn; the queue wakes you with the event'
+    ci = f'glab api "projects/:id/pipelines?sha=<sha>"' if lab else 'gh run list --commit <sha>'
+    view = f'glab issue view {n} --comments' if lab else f'gh issue view {n} --comments'
+    nudge = f'glab issue note {n} -m "nudge: <text>"' if lab else f'gh issue comment {n} --body "nudge: <text>"'
+    return f'''You are the taskq supervisor S{n} of task #{n}: {item["title"]}. You are its only controller: you order its worker, follow it,
+review its result and close or rework it. You never edit the task's code, never start a session yourself, never decide for the owner.
+Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
+Read `{Path(__file__).resolve().with_name("taskq.md")}` (§ 7 Supervisor, § 6) first and do only what it allows (R13).
+
+{item["text"]}
+
+{history(n)}Steps:
+1. Read the whole issue: `{view}`. A task that conflicts with a recorded decision: `{tq} ask {n}` with options.
+2. `{tq} run {n}` orders the worker (the queue spawns it); then {wait}.
+3. Woken by `review #{n}`: `git fetch origin`, `git show <sha> --stat`, then the diff, against every Acceptance item and taskq.md
+   ({CONFIG["publish"]} mode{": the PR diff" if CONFIG["publish"] == "pr" else ""}). A commit: CI on exactly that SHA is green (`{ci}`, where the project has CI);
+   an answer on origin/main needs no CI.
+   - Accepted: `{tq} close {n} --text "<one line for the manager: what was checked, what was not>"`, then end your turn.
+   - Not accepted, CI red, or close sent it back: `{tq} requeue {n} --text "<exact fixes>"`; a new worker continues the branch.
+     Then wait as in 2. The third rework is refused: ask the owner.
+   - A result with options (a choice for the owner): `{tq} ask {n} --text "<...>" --option "<A>" --option "<B>" --recommend <K>`.
+4. Woken by `gone #{n}`, `requeue #{n}` (the worker's) or `ask #{n}`: read why; `{tq} requeue {n} --text "<what to do>"` or ask the owner
+   (a product choice, a second death). `answer #{n}`: act on it; a live worker gets the answer from the queue. Then wait as in 2.
+5. A silent worker (120 min, issue unchanged): `{nudge}`; the queue sends the text to it.
+6. `stop #{n}`: the task is closed or no longer yours: end your turn. `tick`: wait again.
+Everything written through taskq is public: no secrets, tokens or paths outside the repository.'''
+
+def note(who, sid, kind):
+    """A spawn note names the role and the id (R11 retires by it), then the link when the runtime has one."""
+    return f'{who} {sid}' + (f'\n{link}' if (link := kind.link(sid)) else '')
+
+EVENT_OF = {'result': 'review', 'ask': 'ask', 'answer': 'answer', 'gone': 'gone', 'requeue': 'requeue'}
+
+def pending(issue, boss):
+    """The supervisor's events since it last got them (.taskq/S<N>.seen, else since its spawn note): `review #N`,
+    `ask #N`, `answer #N`, `gone #N` (its worker), `requeue #N` (by its worker); its own ask and requeue are no event.
+    Returns them and the comment count to mark them seen with."""
+    n, sid, comments = issue['iid'], boss['session'], issue.get('comments') or []
+    start = max([i + 1 for i, text in enumerate(comments) if text.startswith('**spawn**') and f'\n\nsupervisor {sid}' in text] or [0])
+    held = (CONFIG['root'] / '.taskq' / f'S{n}.seen').read_text().split() if (CONFIG['root'] / '.taskq' / f'S{n}.seen').is_file() else []
+    start = max(start, int(held[1])) if held[:1] == [sid] else start
+    found = []
+    for text in comments[start:]:
+        head, _, body = text.partition('\n\n')
+        action, _, by = head.partition(' · ')
+        event = EVENT_OF.get(action.strip('*'))
+        if event and not (event in ('ask', 'requeue') and by.endswith(f':{sid[:8]}')) and (event != 'gone' or body.startswith('worker ')):
+            found.append(f'{event} #{n}')
+    return found, len(comments)
+
+def seen(n, sid, count):
+    (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
+    (CONFIG['root'] / '.taskq' / f'S{n}.seen').write_text(f'{sid} {count}')
+
+def lead_state(kind, sid):
+    """§ 7 step 4: running, idle or dead; None cannot tell. A runtime without state(): alive() (False: dead)."""
+    return kind.state(sid) if hasattr(kind, 'state') else {True: 'running', False: 'dead'}.get(kind.alive(sid))
+
+def lead_deaths(comments):
+    """Supervisor deaths since the last result or answer (#393 bound)."""
+    count = 0
+    for text in reversed(comments or []):
+        if text.startswith(('**result**', '**answer**')):
+            break
+        count += text.startswith('**gone**') and '\n\nsupervisor ' in text
+    return count
+
+def tail_of(kind, sid):
+    try:
+        return getattr(kind, 'tail', lambda _: '')(sid)
+    except Exception as error:  # best effort: the note goes out without the line
+        return f'no log: {error}'
+
+def follow(item, kind, claim, supervised):
+    """A live worker: an answer, a supervisor's `nudge:` comment or 120 silent minutes reach it once (step 2, step 4)."""
+    last = (BOARD.get(item['iid'])['comments'] or [''])[-1]
+    answer = last.partition('\n\n')[2] if last.startswith('**answer**') else None  # #307: an answer wakes the worker at once
+    told = last.partition('nudge:')[2].strip() if supervised and last.startswith('nudge:') else None
+    if answer is None and told is None and age(item) < 120:
+        return claim
+    text = f'The owner answered your question:\n\n{answer}' if answer is not None else told or 'continue: read your issue'
+    old = claim['session']
+    claim = {**claim, 'session': kind.send(old, text)}  # R11: a Claude send resumes under a new id; the note names both
+    move(item, item['state'], 'nudge', f'worker {claim["session"]}' + (f' replaces {old}' * (old != claim['session'])), claim=claim)
+    item['claim'] = claim  # the nudge comment is now the last note: one send per answer
+    return claim
+
+def supervise(item, kinds):
+    """§ 7 step 4, a supervised task whose supervisor runs here: the pass is its hands, never its judge."""
+    n, boss, claim = item['iid'], item['supervisor'], item['claim'] or {}
+    lead = kinds.get(boss['runtime'])
+    if lead is None:
+        return
+    if item['raw'].get('order') and claim.get('runtime') in kinds:  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
+        kind = kinds[claim['runtime']]
+        sid = kind.spawn(worker_name(item), brief(item, claim['runtime']), CONFIG['root'])
+        item['claim'], item['raw']['order'] = {**claim, 'session': sid}, None
+        move(item, 'doing', 'spawn', note('worker', sid, kind), claim=item['claim'], order=None)
+    elif item['state'] == 'doing' and claim.get('session') and claim.get('runtime') in kinds:
+        kind = kinds[claim['runtime']]
+        live = kind.alive(claim['session'])
+        if live is False:  # the supervisor decides: rework or ask
+            item['claim'] = {**claim, 'session': None}
+            move(item, 'doing', 'gone', f'worker {claim["session"]} is gone', claim=item['claim'])
+        elif live:
+            follow(item, kind, claim, True)
+    state = lead_state(lead, boss['session'])
+    issue = BOARD.get(n)
+    if state == 'dead':
+        evidence = tail_of(lead, boss['session']) or 'no log'
+        if lead_deaths(issue['comments']):  # the second death since the last result or answer: the owner decides
+            move(item, 'ask', 'ask', f'supervisor {boss["session"]} is gone again: fix the runtime, then answer.\n\nLast log line: {evidence}')
+            return
+        move(item, item['state'], 'gone', f'supervisor {boss["session"]} is gone: {evidence}')
+        if getattr(lead, 'resumable', lambda _: False)(boss['session']):  # Codex: the same thread, the same id
+            lead.send(boss['session'], f'restart #{n}: your last turn ended {evidence}; read your issue')
+        else:  # a new supervisor adopts the live worker from the board; the pass retires the old id once stopped
+            sid = lead.spawn(worker_name(item, 'S'), supervisor_brief(item, boss['runtime'], lead), CONFIG['root'])
+            item['supervisor'] = {**boss, 'session': sid}
+            move(item, item['state'], 'spawn', note('supervisor', sid, lead), supervisor=item['supervisor'])
+    else:
+        found, count = pending(issue, boss)
+        if found and state == 'idle':  # running: its own wait (Claude) or the pass at its turn's end (Codex) delivers them; idle: its process ended: resume it with the events (#525: no sender, no timer)
+            sid = lead.send(boss['session'], f'{" ".join(found)}: read your issue')
+            seen(n, sid, count)
+            if sid != boss['session']:  # Claude resumes under a new id (#284): record it; the old one is refused and retired
+                item['supervisor'] = {**boss, 'session': sid}
+                move(item, item['state'], 'nudge', f'supervisor {sid} replaces {boss["session"]}', supervisor=item['supervisor'])
+
 def age(item):
     """Minutes since the issue last changed: a comment changes it too."""
     changed = datetime.fromisoformat((item['updated_at'] or '').replace('Z', '+00:00'))
@@ -797,21 +1030,42 @@ def direct():
     anything else: the https wrapper. ponytail: CODEX_THREAD_ID cannot tell the Codex app from the CLI or IDE."""
     return (session() or {}).get('runtime') == 'codex'
 
-def row(item, kinds, here):
-    """R6 (#489): one markdown row, `[#N](issue)` and `[<session[:8]>](link)`; a session with no link here stays plain text."""
-    claim = item['claim'] or {}
+def stale(by_number):
+    """R11: gone(runtime, n, session, live) for the pass: a session its task records, of a task not open, or replaced
+    (no longer the claim or the supervisor). The open tasks' current sessions are answered without a board read."""
+    issues = {}
+
+    def gone(name, n, sid, _live):
+        current = by_number.get(n)
+        if current and sid in ((current['claim'] or {}).get('session'), (current['supervisor'] or {}).get('session')):
+            return False
+        if n not in issues:
+            try:
+                issues[n] = BOARD.get(n)
+            except (Exception, SystemExit):
+                issues[n] = None
+        return bool(issues[n] and recorded(issues[n], name, sid))
+    return gone
+
+def row(item, kinds, here, waits=None):
+    """R6 (#489): one markdown row, `[#N](issue)` and `[<session[:8]>](link)`; a session with no link here stays plain text.
+    `waits`: why a ready task does not start (no manager on this machine, § 7 step 3)."""
+    claim = item['claim'] if (item['claim'] or {}).get('session') else item.get('supervisor') or item['claim'] or {}  # no worker yet: its supervisor
     runtime, session = claim.get('runtime') or item['runtime'], claim.get('session') or ''
     url = session and claim.get('name') == here and runtime in kinds and kinds[runtime].link(session)
     if url and runtime == 'codex' and direct():  # #521: Codex opens its own thread link; the wrapper only loads a page first
         url = f'codex://threads/{session}'
     task = f'[#{item["iid"]}]({item["url"]})' if item.get('url') else f'#{item["iid"]}'
     cell = f'[{session[:8]}]({url})' if url else session and f'{session[:8]} on {claim.get("name")}'
-    return f'| {task} | {item["state"]} | {runtime} | {cell} |'
+    state = f'{item["state"]} ({waits})' if waits and item['state'] == 'ready' else item['state']
+    return f'| {task} | {state} | {runtime} | {cell} |'
 
 def one_pass(args, table=True):
-    """One pass: requeue dead workers, nudge silent ones, free waiting tasks, spawn ready ones, print the table."""
+    """One pass: free waiting tasks, follow unsupervised workers, act for supervisors, spawn ready tasks' supervisors, print the table."""
     here, kinds = machine(), runtimes()
     limits = CONFIG.get('limits') or {name: 1 for name in kinds}
+    lead = {'dot': 'codex'}.get(manager().get('runtime'), manager().get('runtime'))  # R3: the supervisor follows the manager
+    lead = lead if lead in kinds else None
     with dispatch_lock() as held:  # #357 (R2): one pass at a time per checkout; the list is read under the lock
         tasks = getattr(args, 'tasks', None) or []  # #481: the list lags the event's own write (a new issue, a label): read those directly
         issues = [issue for issue in BOARD.list(None) if issue['iid'] not in tasks] + [issue for issue in map(BOARD.get, tasks) if issue['state'] == 'open']
@@ -827,51 +1081,49 @@ def one_pass(args, table=True):
             if item['state'] == 'waiting' and not open_deps(item['deps']):
                 move(item, 'ready', 'ready', 'dependencies closed')
                 item['state'] = 'ready'
+            if item['supervisor']:  # step 4; the worker's slot is held from the supervisor's spawn to close
+                if item['supervisor'].get('name') == here:
+                    supervise(item, kinds)
+                if item['state'] in ('doing', 'review', 'ask') and claim.get('name') == here:
+                    busy[claim.get('runtime')] = busy.get(claim.get('runtime'), 0) + 1
+                continue
             if item['state'] != 'doing' or claim.get('name') != here or claim.get('runtime') not in kinds:
                 continue  # another machine's, or a session no runtime here can see
-            runtime = kinds[claim['runtime']]
+            runtime = kinds[claim['runtime']]  # step 2: unsupervised (R3 Transition: started before #525, or taken by hand)
             state = runtime.alive(claim['session'])
             if state is False:
                 gone = f'session {claim["session"]} is gone'
                 if quick_deaths(item['iid']):  # #393: the second death in a row with no result or answer asks, not respawns
-                    try:
-                        tail = getattr(runtime, 'tail', lambda _: '')(claim['session'])
-                    except Exception as error:  # best effort: the ask goes out without the line
-                        tail = f'no log: {error}'
-                    move(item, 'ask', 'ask', f'{gone} again, the worker dies at once: fix the runtime, then answer.\n\nLast log line: {tail or "none"}')
+                    move(item, 'ask', 'ask', f'{gone} again, the worker dies at once: fix the runtime, then answer.\n\n'
+                                             f'Last log line: {tail_of(runtime, claim["session"]) or "none"}')
                     item['state'] = 'ask'
                     continue
                 move(item, 'ready', 'requeue', gone, claim=None, result=None)
                 item.update(state='ready', claim=None)
                 continue
-            last = (BOARD.get(item['iid'])['comments'] or [''])[-1] if state else ''
-            answer = last.partition('\n\n')[2] if last.startswith('**answer**') else None  # #307: an answer wakes the worker at once
-            if answer is not None or state and age(item) >= 120:
-                text = f'The owner answered your question:\n\n{answer}' if answer is not None else 'continue: read your issue'
-                claim = {**claim, 'session': runtime.send(claim['session'], text)}
-                move(item, 'doing', 'nudge', claim=claim)  # the nudge comment is now the last note: one send per answer
-                item['claim'] = claim
+            if state:
+                claim = follow(item, runtime, claim, False)
             busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
         for item in ready:
-            if item['state'] != 'ready' or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']):
-                continue
+            if item['state'] != 'ready' or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']) or not lead:
+                continue  # no manager here: the task waits, the table says so (§ 7 step 3)
             names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
             free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 1)), None)
             fresh = free and parse(BOARD.get(item['iid']))  # #357: the board may have moved since the list
-            if fresh and fresh['state'] == 'ready':  # the tick claims it: the next tick sees the slot taken, the worker needs no `take`
+            if fresh and fresh['state'] == 'ready':  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
                 item.update(fresh)
-                session = kinds[free].spawn(worker_name(item), brief(item, free), CONFIG['root'])
-                item['claim'] = {'runtime': free, 'session': session, 'name': here}
-                move(item, 'doing', 'spawn', kinds[free].link(session) or '', claim=item['claim'], result=None)
+                session = kinds[lead].spawn(worker_name(item, 'S'), supervisor_brief(item, lead, kinds[lead]), CONFIG['root'])
+                item.update(supervisor={'runtime': lead, 'session': session, 'name': here}, claim={'runtime': free, 'session': None, 'name': here})
+                move(item, 'doing', 'spawn', note('supervisor', session, kinds[lead]), supervisor=item['supervisor'], claim=item['claim'],
+                     result=None, order=None)
                 item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
-        if held and not blind:  # #360: sessions of tasks no longer open (the list holds open tasks only)
-            open_tasks = {item['iid'] for item in items}
-            retire(lambda n, *_: n not in open_tasks, 'could not remove sessions of closed tasks', running=False)
+        if held and not blind:  # R11 (#360, #525): stopped sessions the board no longer holds, by recorded id only
+            retire(stale({item['iid']: item for item in items}), 'could not remove stopped sessions', running=False)
     if not table:
         return held
     print('| Task | State | Runtime | Session |\n|---|---|---|---|')
     for item in filter(mine, items):
-        print(row(item, kinds, here))
+        print(row(item, kinds, here, None if lead else 'no manager'))
     host, repo = CONFIG.get('host'), CONFIG.get('repo')
     url = CONFIG.get('board_url') or {'github': f'https://{host or "github.com"}/{repo}/issues',
                                       'gitlab': f'https://{host or "gitlab.com"}/{repo}/-/issues'}.get(CONFIG['board'])
@@ -896,9 +1148,9 @@ def decisions(items):
         lines.append(' · '.join(filter(None, [f'{head} {item["state"]}: {card.get("summary") or item["title"]}', *links, *options])))
     return lines
 
-EVENTS = ('add', 'answer', 'result', 'requeue', 'close')  # R4 (#333): each starts one pass after its move
+EVENTS = ('add', 'answer', 'run', 'result', 'requeue', 'close')  # R4 (#333): each starts one pass after its move
 
-def dispatch(command, tasks):
+def dispatch(command, tasks, after=None):
     """R4 (#405): the event pass runs in a detached `tick --quiet` child, its output in .taskq/dispatch.log; the event returns at once."""
     if os.environ.get('CODEX_SANDBOX'):  # a sandboxed Codex worker can neither start codex nor see other sessions' pids:
         return  # its pass would requeue live tasks as gone and spawn workers that die at once (#269 run 4b)
@@ -907,9 +1159,10 @@ def dispatch(command, tasks):
         detach = {'creationflags': 0x208} if os.name == 'nt' else {'start_new_session': True}
         tasks = [str(n) for n in (tasks if isinstance(tasks, list) else [tasks])]
         with open(CONFIG['root'] / '.taskq' / 'dispatch.log', 'ab') as out:
-            out.write(f'{datetime.now():%Y-%m-%d %H:%M:%S} {command} #{" #".join(tasks)}\n'.encode())  # the event, then the child's lines
-            out.flush()
-            start_pass([sys.executable, str(Path(__file__).resolve()), 'tick', '--quiet', '--tasks', *tasks], cwd=CONFIG['root'],
+            out.write(f'{datetime.now():%Y-%m-%d %H:%M:%S} {command} {" ".join(f"#{n}" for n in tasks) or f"pid {after}"}\n'.encode())
+            out.flush()  # the event, then the child's lines
+            start_pass([sys.executable, str(Path(__file__).resolve()), 'tick', '--quiet', *['--after', str(after)] * bool(after), '--tasks', *tasks],
+                       cwd=CONFIG['root'],
                        stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
     except Exception as error:  # never fails the event: the next tick retries
         print(f'taskq: dispatch stopped: {error}; the next tick retries', file=sys.stderr)
@@ -917,33 +1170,69 @@ def dispatch(command, tasks):
 start_pass = subprocess.Popen  # tests run the child's pass in process
 
 def event_pass(args):
-    """`tick --quiet`: the tick pass without the table. A failure never fails the event: the next tick retries."""
+    """`tick --quiet`: the tick pass without the table. `--after PID`: first wait for that Codex turn to end (R4 #525).
+    A failure never fails the event: the next tick retries."""
+    while args.after and pid_alive(args.after):  # ponytail: 5 s poll of one pid; lives exactly as long as the turn
+        time.sleep(5)
     try:
         cmd_tick(args, table=False)
     except (SystemExit, Exception) as error:
         print(f'taskq: dispatch stopped: {str(error).removeprefix("taskq: ")}; the next tick retries', file=sys.stderr)
 
+def closed(n):
+    """`closed #N <text>` for a supervised task that closed: the first line of its close comment, the supervisor's line."""
+    issue = BOARD.get(int(n))
+    found = BLOCK.search(issue.get('body') or '') if issue['state'] == 'closed' else None
+    if not found or not json.loads(found.group(1)).get('supervisor'):
+        return None
+    text = next((text for text in reversed(issue.get('comments') or []) if text.startswith('**close**')), '')
+    body = text.partition('\n\n')[2].strip()
+    return f'closed #{n} {body.splitlines()[0]}' if body else f'closed #{n}'
+
 def cmd_wait(args):
-    """Block until the manager is needed: print 'review #N', 'ask #N', 'gone #N', or 'tick' after the window (#407).
+    """Block until the manager is needed: print 'ask #N', 'closed #N <text>' (supervised), 'review #N' and 'gone #N'
+    (unsupervised worker, or a dead supervisor), or 'tick' after the window (#407, #525).
     .taskq/wait.json keeps the states last reported, so an event is printed once."""
+    if args.task:
+        return wait_task(args)
     path, kinds, here = CONFIG['root'] / '.taskq' / 'wait.json', runtimes(), machine()
     seen = json.loads(path.read_text('utf-8')) if path.is_file() else {}
     end = time.time() + args.window * 60
     while True:
-        now = {}
+        now, blind = {}, bool(os.environ.get('CODEX_SANDBOX'))
         for item in filter(mine, filter(None, map(parse, BOARD.list(None)))):
-            claim, state = item['claim'] or {}, item['state']
-            if state == 'doing' and not os.environ.get('CODEX_SANDBOX') and claim.get('name') == here and claim.get('runtime') in kinds \
+            claim, boss, state = item['claim'] or {}, item['supervisor'] or {}, item['state']
+            if boss:  # a supervised review is its supervisor's (#524); only a dead supervisor is the manager's
+                state = 'gone' if not blind and boss.get('name') == here and boss.get('runtime') in kinds \
+                    and lead_state(kinds[boss['runtime']], boss['session']) == 'dead' else 'review*' if state == 'review' else state
+            elif state == 'doing' and not blind and claim.get('name') == here and claim.get('runtime') in kinds \
                     and kinds[claim['runtime']].alive(claim['session']) is False:  # ponytail: one alive call per local worker per poll
                 state = 'gone'
             now[str(item['iid'])] = state
         events = [f'{state} #{n}' for n, state in now.items() if state in ('review', 'ask', 'gone') and seen.get(n) != state]
+        events += filter(None, (closed(n) for n in seen if n.isdigit() and n not in now))  # left the open list: closed?
         if events or time.time() >= end:
             path.parent.mkdir(exist_ok=True)
             path.write_text(json.dumps(now), 'utf-8')
             print('\n'.join(events) or 'tick')
             return
         seen = now  # a task that leaves review and comes back while we wait is a new event
+        time.sleep(args.every)
+
+def wait_task(args):
+    """The supervisor's wait (§ 7 Supervisor): block until its task needs it, print its events (`pending`), `stop #N` when the
+    task is closed or no longer this session's, or `tick` after the window. Events are marked seen once printed."""
+    n, me, end = args.task, (session() or {}).get('session'), time.time() + args.window * 60
+    while True:
+        issue = BOARD.get(n)
+        current = parse(issue) if issue['state'] == 'open' else None
+        boss = (current or {}).get('supervisor') or {}
+        if not me or boss.get('session') != me:
+            return print(f'stop #{n}')
+        found, count = pending(issue, boss)
+        if found or time.time() >= end:
+            found and seen(n, me, count)
+            return print('\n'.join(found) or 'tick')
         time.sleep(args.every)
 
 SENDERS = {'claude': 'SendMessage'}
@@ -973,10 +1262,14 @@ def refresh():
 
 def cmd_pm(args):
     """The manager role: Principles and § 7 of taskq.md, then how to tick this session; the hash goes to .taskq/pm.json."""
+    me = session() or {}  # R3 (#525): this machine's supervisors run in the manager's runtime; its id passes the gate
+    if me and any(role(item) in ('supervisor', 'worker') for item in map(parse, BOARD.list(None)) if item):
+        fail('a recorded supervisor or worker cannot take the manager role (R3 one controller)')
     text, digest = (CLONE / 'taskq.md').read_text('utf-8'), contract()
     sections = re.findall(r'^## (?:Principles|7\. Manager)\b.*?(?=^## )', text, re.M | re.S)
     (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
-    (CONFIG['root'] / '.taskq' / 'pm.json').write_text(json.dumps({'contract': digest}), 'utf-8')
+    (CONFIG['root'] / '.taskq' / 'pm.json').write_text(json.dumps(
+        {'contract': digest, 'runtime': me.get('runtime') or os.environ.get('TASKQ_RUNTIME'), 'session': me.get('session')}), 'utf-8')
     print(f'taskq pm contract {digest}\nYou are the taskq manager of {CONFIG["root"]}. Follow this role from now on; '
           f'`taskq` is `python3 {Path(__file__).resolve()}`.\n\n' + '\n'.join(sections))
     cmd_arm(argparse.Namespace(target=None))
@@ -995,18 +1288,21 @@ def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
     runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
     wait = f'python3 {Path(__file__).resolve()} wait'
+    start = ('Start: run one pass now (`taskq tick`, outside a Codex sandbox). From then on the approved queue runs by itself (R4): '
+             'supervisors, workers, reviews, reworks, closes and the next task start on queue events and Codex turn ends; '
+             'no sender, timer or extension. Arming below only brings you the short outcomes.\n')
     if not args.target and runtime == 'codex':  # #510: a Codex session is not woken when a background command ends
         thread = os.environ.get('CODEX_THREAD_ID') or '<this thread>'
-        return print(f'''Arm the tick in this session. Codex is not woken when a background command ends, so tick in the foreground:
-loop {{ run `{wait}`; on its output (`review #N`, `ask #N`, `gone #N` or `tick`) run one pass (`taskq tick`) and do
-§ 7 After each pass for those tasks }}. Before you end a turn, start a separate sender for the time between turns:
-run `python3 {Path(__file__).resolve()} arm tick {thread}` and start a session (or a shell loop) on what it prints.
+        return print(f'''{start}Arm the tick in this session. Codex is not woken when a background command ends, so tick in the foreground:
+loop {{ run `{wait}`; on its output (`ask #N`, `closed #N <text>`, `review #N`, `gone #N` or `tick`) run one pass (`taskq tick`) and do
+§ 7 After each pass for those tasks }}. Between turns the outcomes wait on the board for your next pass; the queue does not.
+Optional, only to be woken between turns: `python3 {Path(__file__).resolve()} arm tick {thread}` prints a sender prompt for a
+thread with a local rollout only; no wake of a Codex app thread is promised (#522).
 Codex manager: start it with `codex {CODEX_COMPACT}`.''')
     if not args.target:  # no target: this session ticks itself (Claude: a background command wakes the session on exit)
-        return print(f'''Arm the tick in this session. Run `{wait}` as a background command (Claude Code: run_in_background).
-When it ends you are woken with its output (`review #N`, `ask #N`, `gone #N` or `tick`): run one pass (`taskq tick`),
+        return print(f'''{start}Arm the tick in this session. Run `{wait}` as a background command (Claude Code: run_in_background).
+When it ends you are woken with its output (`ask #N`, `closed #N <text>`, `review #N`, `gone #N` or `tick`): run one pass (`taskq tick`),
 do § 7 After each pass for those tasks, then start `{wait}` in the background again. Keep exactly one wait running.
-A runtime that cannot wake a session when a background command ends (Codex): use `taskq arm tick "<manager>"` from a separate sender session.
 Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.json autoCompactWindow 200000).''')
     resume = f'codex exec {shlex.join(codex_options())} resume {args.target}'  # the options a worker turn gets
     send, shell, note = f'with {SENDERS.get(runtime, "your messaging tool")}', '', ''
@@ -1059,12 +1355,14 @@ def main(argv=None):
     command('ask', cmd_move, *card, text='required')
     command('answer', cmd_answer, (('n',), {'nargs': '+'}), n=False, text=True)
     command('result', cmd_move, (('--sha',), {'required': True, 'type': commit}), (('--checks',), {'default': ''}), *card, text=True)
-    command('requeue', cmd_move, text=True)
+    command('requeue', cmd_requeue, text=True)
+    command('run', cmd_run, text=True)
     command('later', cmd_move, text=True)
     command('close', cmd_close, (('n',), {'nargs': '+', 'type': int}), n=False, text=True)
     command('tick', lambda args: (event_pass if args.quiet else cmd_tick)(args), (('--quiet',), {'action': 'store_true'}),
-            (('--tasks',), {'nargs': '*', 'type': int, 'default': []}), n=False)
-    command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}), n=False)
+            (('--tasks',), {'nargs': '*', 'type': int, 'default': []}), (('--after',), {'type': int}), n=False)
+    command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}),
+            (('--task',), {'type': int}), n=False)
     command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}), n=False)
     command('pm', cmd_pm, n=False)
     command('cleanup', cmd_cleanup, (('--dry-run',), {'action': 'store_true'}), n=False)
@@ -1072,7 +1370,7 @@ def main(argv=None):
     if BOARD is None:
         CONFIG = load_config()
         BOARD = make_board(CONFIG)
-    if args.command == 'wait' or args.command == 'tick' and not args.quiet:
+    if args.command == 'wait' and not args.task or args.command == 'tick' and not args.quiet:
         refresh()
     done = args.function(args)
     if args.command in EVENTS:

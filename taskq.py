@@ -525,20 +525,148 @@ class Claude:
 def last_line(text):
     return next((line.strip() for line in reversed(text.splitlines()) if line.strip()), '')
 
-def pid_alive(pid):
-    if os.name != 'nt':
-        try:
-            os.kill(pid, 0)
-        except OSError as error:
-            return isinstance(error, PermissionError)  # someone else's process
-        return True
-    import ctypes  # Windows: os.kill(pid, 0) would terminate the process
-    handle, code = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid), ctypes.c_ulong()  # QUERY_LIMITED_INFORMATION
+@contextlib.contextmanager
+def windows_process(pid, terminate=False):
+    """A stable kernel handle; never truncate a 64-bit HANDLE through ctypes defaults."""
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4]
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    handle = kernel.OpenProcess(0x1000 | 0x100000 | (1 if terminate else 0), False, pid)
     if not handle:
-        return False
-    ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
-    ctypes.windll.kernel32.CloseHandle(handle)
-    return code.value == 259  # STILL_ACTIVE
+        error = ctypes.get_last_error()
+        if error == 87:  # ERROR_INVALID_PARAMETER: no such PID
+            raise ProcessLookupError(pid)
+        raise OSError(error, 'OpenProcess failed')
+    try:
+        yield kernel, handle
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def windows_birth(kernel, handle):
+    import ctypes
+    from ctypes import wintypes
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not kernel.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+        raise OSError('GetProcessTimes failed')
+    return f'windows:{(times[0].dwHighDateTime << 32) | times[0].dwLowDateTime}'
+
+
+def darwin_identity(pid):
+    """libproc PROC_PIDTBSDINFO: xnu/bsd/sys/proc_info.h and libproc.c, not ps text."""
+    import ctypes
+    import errno
+    class BsdInfo(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint32) for name in
+                    ('flags', 'status', 'xstatus', 'pid', 'ppid', 'uid', 'gid', 'ruid', 'rgid', 'svuid', 'svgid', 'reserved')]
+        _fields_ += [('comm', ctypes.c_char * 16), ('name', ctypes.c_char * 32)]
+        _fields_ += [(name, ctypes.c_uint32) for name in ('nfiles', 'pgid', 'pjobc', 'tdev', 'tpgid')]
+        _fields_ += [('nice', ctypes.c_int32), ('start_sec', ctypes.c_uint64), ('start_usec', ctypes.c_uint64)]
+    lib = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+    lib.proc_pidinfo.restype = ctypes.c_int
+    info = BsdInfo()
+    ctypes.set_errno(0)
+    size = lib.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+    if size == 0 and ctypes.get_errno() == errno.ESRCH:
+        return 'dead', None
+    if size != ctypes.sizeof(info) or info.pid != pid or not info.start_sec or info.start_usec >= 1000000:
+        return 'unknown', None
+    return ('dead' if info.status == 5 else 'running'), f'darwin:{info.start_sec}:{info.start_usec}'
+
+
+def process_identity(pid):
+    """(running/dead/unknown, birth). OS process creation identity, never a bare PID."""
+    if not isinstance(pid, int) or pid <= 0:
+        return 'unknown', None
+    try:
+        if os.name == 'nt':
+            with windows_process(pid) as (kernel, handle):
+                wait = kernel.WaitForSingleObject(handle, 0)
+                if wait == 0:
+                    return 'dead', windows_birth(kernel, handle)
+                if wait != 258:  # WAIT_TIMEOUT: still running
+                    return 'unknown', None
+                return 'running', windows_birth(kernel, handle)
+        if sys.platform == 'darwin':
+            return darwin_identity(pid)
+        if sys.platform == 'linux':
+            try:
+                boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            except OSError:
+                return 'unknown', None
+            try:
+                fields = Path(f'/proc/{pid}/stat').read_text().rpartition(')')[2].split()
+            except FileNotFoundError:
+                return 'dead', None
+            return ('dead' if fields[0] in ('Z', 'X') else 'running'), f'linux:{boot}:{fields[19]}'
+    except ProcessLookupError:
+        return 'dead', None
+    except (OSError, ValueError, IndexError):
+        pass
+    return 'unknown', None  # unsupported POSIX hosts cannot safely establish ownership
+
+
+def process_state(pid, birth):
+    if not isinstance(birth, str) or not re.fullmatch(r'(?:windows:\d+|linux:[0-9a-f-]{36}:\d+|darwin:\d+:\d+)', birth):
+        return 'unknown'  # legacy handle: preserve even when its bare PID is absent
+    state, actual = process_identity(pid)
+    return 'dead' if actual is not None and actual != birth else state
+
+
+def stop_process(pid, birth):
+    """Pin before checking identity. No os.kill fallback: PID reuse must never kill a foreign process."""
+    if process_state(pid, birth) == 'dead':
+        return
+    if process_state(pid, birth) != 'running':
+        raise RuntimeError('process ownership unknown; recovery handle retained')
+    if os.name == 'nt':
+        with windows_process(pid, terminate=True) as (kernel, handle):
+            if windows_birth(kernel, handle) != birth:
+                return
+            if not kernel.TerminateProcess(handle, 1) or kernel.WaitForSingleObject(handle, 5000) != 0:
+                raise RuntimeError('process termination unconfirmed; recovery handle retained')
+    elif sys.platform == 'linux' and hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal'):
+        import select
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return
+        try:
+            if process_state(pid, birth) == 'dead':
+                return
+            if process_state(pid, birth) != 'running':
+                raise RuntimeError('process ownership unknown; recovery handle retained')
+            signal.pidfd_send_signal(fd, signal.SIGTERM)
+            if not select.select([fd], [], [], 5)[0]:
+                raise RuntimeError('process termination unconfirmed; recovery handle retained')
+        finally:
+            os.close(fd)
+    else:
+        raise RuntimeError('safe process termination unavailable; recovery handle retained')
+
+
+def read_process(path):
+    """Compatibility parser: PID/session remain readable; only a birth-bearing record proves ownership."""
+    try:
+        fields = path.read_text(encoding='utf-8').split()
+        return int(fields[0]), fields[1], fields[2] if len(fields) == 3 else None
+    except (OSError, ValueError, IndexError):
+        return 0, None, None
+
+
+def write_process(path, process, session):
+    birth = getattr(process, 'taskq_birth', None)
+    if not isinstance(birth, str):
+        birth = process_identity(process.pid)[1]
+    path.write_text(f'{process.pid} {session} {birth or "-"}', encoding='utf-8')
+
 
 def codex_options():
     # Network on: a worker pushes and calls the board. `"codex": [...]` in taskq.json replaces these options.
@@ -553,7 +681,7 @@ class Unnamed(Exception):
         self.thread = thread
 
 class Codex:
-    """`codex exec`, headless: one process per turn, its JSONL in .taskq/<name>.log, `<pid> <thread>` in .taskq/<name>.pid."""
+    """`codex exec`, headless: one process per turn, its JSONL in .taskq/<name>.log, `<pid> <thread> <birth>` in .taskq/<name>.pid."""
 
     def folder(self):
         (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
@@ -564,7 +692,8 @@ class Codex:
         with open(log, 'ab') as out:  # detached: the worker outlives the tick
             process = subprocess.Popen([shutil.which('codex') or fail('codex not found'), 'exec', '--json', *codex_options(), *arguments],
                                        cwd=cwd, env=worker_env(), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
-        dispatch('turn end', [], after=process.pid)  # #525: a sandboxed turn starts no pass; one runs when it ends (no sender, no timer)
+        process.taskq_birth = process_identity(process.pid)[1]
+        dispatch('turn end', [], after=process.pid, after_birth=process.taskq_birth)  # #525: a sandboxed turn starts no pass; one runs when it ends (no sender, no timer)
         return process, log
 
     def spawn(self, name, prompt, cwd):
@@ -583,7 +712,7 @@ class Codex:
         old = pid.read_text().split() if pid.exists() else []
         if old[1:] and old[1] != found:  # #568: a replaced thread not yet retired (a running one) keeps its handle
             pid.rename(pid.with_name(f'{pid.stem}-{old[1]}.pid'))
-        pid.write_text(f'{process.pid} {found}')
+        write_process(pid, process, found)
         try:
             self.title(found, name)
         except (OSError, ValueError) as error:  # R3 (#572): no unnamed thread works; its pid file stays for the retire (R11)
@@ -629,16 +758,18 @@ class Codex:
             server.stdout.close()
 
     def pid_file(self, session):
-        return next((path for path in self.folder().glob('*.pid') if path.read_text().split()[1:] == [session]), None)
+        return next((path for path in self.folder().glob('*.pid') if read_process(path)[1] == session), None)
 
     def send(self, session, text):
+        state = self.state(session)
+        if state not in ('idle', 'dead'):
+            raise RuntimeError(f'codex session {state or "unknown"}; resume refused')
         process, log = self.exec(getattr(self.pid_file(session), 'stem', session), ['resume', session, text], CONFIG['root'])
-        log.with_suffix('.pid').write_text(f'{process.pid} {session}')
+        write_process(log.with_suffix('.pid'), process, session)
         return session
 
     def alive(self, session):
-        path = self.pid_file(session)
-        return None if path is None else pid_alive(int(path.read_text().split()[0]))
+        return {'running': True, 'idle': False, 'dead': False}.get(self.state(session))
 
     def state(self, session):
         """A supervisor (§ 7 step 4): its process exits at every turn end, by design. Pid running: running; exited after a
@@ -646,8 +777,10 @@ class Codex:
         path = self.pid_file(session)
         if path is None:
             return None
-        if pid_alive(int(path.read_text().split()[0])):
-            return 'running'
+        pid, _, birth = read_process(path)
+        state = process_state(pid, birth)
+        if state != 'dead':
+            return state
         log = path.with_suffix('.log')
         turn = (log.read_text('utf-8', 'replace') if log.exists() else '').rpartition('"turn.started"')
         ends = re.findall(r'"type":\s*"(turn\.completed|turn\.failed|error)"', turn[2]) if turn[1] else []
@@ -659,11 +792,15 @@ class Codex:
     def retire(self, gone, running=True):
         """Kill the turn's process, `codex archive` the thread, drop .taskq/T<N>.pid or S<N>.pid (#360)."""
         for path in (CONFIG['root'] / '.taskq').glob('*.pid'):
-            n, (pid, thread) = re.fullmatch(r'[TS](\d+)(-[\w-]+)?', path.stem), path.read_text().split()  # S<N>-<thread>: a replaced one
-            if not n or not gone(int(n[1]), thread, pid_alive(int(pid))) or pid_alive(int(pid)) and not running:
+            n = re.fullmatch(r'[TS](\d+)(-[\w-]+)?', path.stem)
+            pid, thread, birth = read_process(path)
+            state = process_state(pid, birth)
+            if not n or not thread or state == 'unknown':
                 continue
-            if pid_alive(int(pid)):
-                os.kill(int(pid), signal.SIGTERM)
+            if not gone(int(n[1]), thread, state == 'running') or state == 'running' and not running:
+                continue
+            if state == 'running':
+                stop_process(pid, birth)
             done = subprocess.run([shutil.which('codex') or 'codex', 'archive', thread], capture_output=True, timeout=60)
             if done.returncode:
                 raise RuntimeError('codex archive failed; recovery handle retained')
@@ -1183,8 +1320,8 @@ def cmd_cleanup(args):
             kept.append(f'{name} sessions: unknown ({error})')
     for path in sorted((root / '.taskq').glob('*.pid')):
         n = re.fullmatch(r'S(\d+)', path.stem)  # the gone supervisor's; a T<N>.pid is Codex's handle, its retire decides (#478)
-        pid = (path.read_text().split() or ['0'])[0]
-        if n and state(int(n[1])) == 'closed' and not (pid.isdigit() and pid_alive(int(pid))):
+        pid, _, birth = read_process(path)
+        if n and state(int(n[1])) == 'closed' and process_state(pid, birth) == 'dead':
             dry or effect(path.unlink)
             removed.append(f'{verb} .taskq/{path.name}')
     for wait in sorted((root / '.taskq').glob('wait*.json')):  # one per manager (#532)
@@ -1330,9 +1467,13 @@ def seen(n, sid, count):
     (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
     (CONFIG['root'] / '.taskq' / f'S{n}.seen').write_text(f'{sid} {count}')
 
-def lead_state(kind, sid):
-    """§ 7 step 4: running, idle or dead; None cannot tell. A runtime without state(): alive() (False: dead)."""
-    return kind.state(sid) if hasattr(kind, 'state') else {True: 'running', False: 'dead'}.get(kind.alive(sid))
+def runtime_state(kind, sid):
+    """Minimal capability shared by workers/supervisors; legacy alive cannot prove idle."""
+    state = kind.state(sid) if callable(getattr(kind, 'state', None)) else {True: 'running', False: 'dead'}.get(kind.alive(sid))
+    return state if state in ('running', 'idle', 'dead') else 'unknown'
+
+
+lead_state = runtime_state
 
 def lead_deaths(comments):
     """Supervisor deaths since the last result or answer (#393 bound)."""
@@ -1391,11 +1532,11 @@ def supervise(item, kinds, worker_allowed=True):
         move(item, 'doing', 'spawn', note('worker', sid, kind), claim=item['claim'], order=None)
     elif admitted and item['state'] == 'doing' and claim.get('session') and claim.get('runtime') in kinds:
         kind = kinds[claim['runtime']]
-        live = kind.alive(claim['session'])
-        if live is False:  # the supervisor decides: rework or ask
+        live = runtime_state(kind, claim['session'])
+        if live == 'dead':  # the supervisor decides: rework or ask
             item['claim'] = {**claim, 'session': None}
             move(item, 'doing', 'gone', f'worker {claim["session"]} is gone', claim=item['claim'])
-        elif live:
+        elif live in ('running', 'idle'):
             if follow(item, kind, claim, True) is None:
                 return  # #576: no supervisor send, resume or respawn either
     state = lead_state(lead, boss['session'])
@@ -1561,8 +1702,8 @@ def one_pass(args, table=True):
                 busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
                 continue
             runtime = kinds[claim['runtime']]  # step 2: unsupervised (R3 Transition: started before #525, or taken by hand)
-            state = runtime.alive(claim['session'])
-            if state is False:
+            state = runtime_state(runtime, claim['session'])
+            if state == 'dead':
                 gone = f'session {claim["session"]} is gone'
                 if quick_deaths(item['iid']):  # #393: the second death in a row with no result or answer asks, not respawns
                     move(item, 'ask', 'ask', f'{gone} again, the worker dies at once: fix the runtime, then answer.\n\n'
@@ -1572,7 +1713,7 @@ def one_pass(args, table=True):
                 move(item, 'ready', 'requeue', gone, claim=None, result=None)
                 item.update(state='ready', claim=None)
                 continue
-            if state:
+            if state in ('running', 'idle'):
                 claim = follow(item, runtime, claim, False) or claim  # denied: the original claim keeps its slot
             busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
         for item in ready:
@@ -1652,7 +1793,7 @@ def decisions(items):
 
 EVENTS = ('add', 'answer', 'run', 'result', 'requeue', 'close')  # R4 (#333): each starts one pass after its move
 
-def dispatch(command, tasks, after=None):
+def dispatch(command, tasks, after=None, after_birth=None):
     """R4 (#405): the event pass runs in a detached `tick --quiet` child, its output in .taskq/dispatch.log; the event returns at once."""
     if os.environ.get('CODEX_SANDBOX'):  # a sandboxed Codex worker can neither start codex nor see other sessions' pids:
         return  # its pass would requeue live tasks as gone and spawn workers that die at once (#269 run 4b)
@@ -1663,7 +1804,7 @@ def dispatch(command, tasks, after=None):
         with open(CONFIG['root'] / '.taskq' / 'dispatch.log', 'ab') as out:
             out.write(f'{datetime.now():%Y-%m-%d %H:%M:%S} {command} {" ".join(f"#{n}" for n in tasks) or f"pid {after}"}\n'.encode())
             out.flush()  # the event, then the child's lines
-            start_pass([sys.executable, str(Path(__file__).resolve()), 'tick', '--quiet', *['--after', str(after)] * bool(after), '--tasks', *tasks],
+            start_pass([sys.executable, str(Path(__file__).resolve()), 'tick', '--quiet', *(['--after', str(after), '--after-birth', after_birth or '-'] if after else []), '--tasks', *tasks],
                        cwd=CONFIG['root'],
                        stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
     except Exception as error:  # parent board mutation is already settled; report failure to launch its event
@@ -1672,11 +1813,16 @@ def dispatch(command, tasks, after=None):
 start_pass = subprocess.Popen  # tests run the child's pass in process
 
 def event_pass(args):
-    """`tick --quiet`: the tick pass without the table. `--after PID`: first wait for that Codex turn to end (R4 #525).
+    """`tick --quiet`: the tick pass without the table. `--after PID --after-birth ID`: first wait for that Codex turn to end (R4 #525).
     A failed pass exits nonzero and logs its blocker; the detached parent mutation remains settled."""
-    while args.after and pid_alive(args.after):  # ponytail: 5 s poll of one pid; lives exactly as long as the turn
-        time.sleep(5)
     try:
+        while args.after:
+            state = process_state(args.after, getattr(args, 'after_birth', None))
+            if state == 'unknown':
+                raise RuntimeError('turn-end process identity unknown; pass refused')
+            if state == 'dead':
+                break
+            time.sleep(5)
         cmd_tick(args, table=False)
     except (SystemExit, Exception) as error:
         print(f'taskq: dispatch stopped: {str(error).removeprefix("taskq: ")}; resolve the blocker, then run a fresh tick', file=sys.stderr)
@@ -1935,7 +2081,7 @@ def main(argv=None):
     command('close', cmd_close, (('n',), {'nargs': '+', 'type': int}), n=False, text=True)
     command('status', cmd_status, n=False)
     command('tick', lambda args: (event_pass if args.quiet else cmd_tick)(args), (('--quiet',), {'action': 'store_true'}),
-            (('--tasks',), {'nargs': '*', 'type': int, 'default': []}), (('--after',), {'type': int}), n=False)
+            (('--tasks',), {'nargs': '*', 'type': int, 'default': []}), (('--after',), {'type': int}), (('--after-birth',), {}), n=False)
     command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}),
             (('--task',), {'type': int}), (('--pm',), {}), n=False)
     command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}), n=False)

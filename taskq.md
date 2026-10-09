@@ -39,6 +39,10 @@ Changed: "one supervisor session and one worker session per task" → one worker
 Changed: one worker session → one supervisor and one worker session per task, on every runtime (owner decision
 2026-10-09, #524; research and limits: [docs/supervisor.md](docs/supervisor.md)).
 
+Changed (owner-approved audit, 2026-10-10): worker answers/nudges could interrupt or overlap a turn ->
+deliver only when the runtime confirms idle; running/unknown defers without consuming the board message.
+No native steering is assumed.
+
 ### R3. Roles and session names
 
 - Owner: decides product questions, answers `ask`.
@@ -101,7 +105,7 @@ Changed: any board identity could execute a task → `assignee-only` requires au
 A tick is one pass (§ 7), started by a message or by a queue event. A sender runs `taskq tick`; received means one
 pass, not received means nothing. `add`, `answer`, `run`, `result`, `requeue` and `close` start the same pass once after their
 move, in a detached `taskq tick --quiet` child, and return at once: the queue chains itself. Every `codex exec` turn
-the runtime starts (a spawn or a resume, `S<N>` or `T<N>`) also gets one detached `taskq tick --quiet --after <pid>`
+the runtime starts (a spawn or a resume, `S<N>` or `T<N>`) also gets one detached `taskq tick --quiet --after <pid> --after-birth <identity>`
 that runs the pass when that turn's process exits: a sandboxed Codex session's own commands start no pass (#502), so
 its `run`, `result`, `requeue` or `close` takes effect at its turn's end. The children write to `.taskq/dispatch.log`;
 a child that finds the project guard busy waits for a bounded opportunity to run its own fresh pass;
@@ -167,6 +171,9 @@ a cross-gateway wake. Concurrent owned-manager waits serialize the delivery/rece
 
 Hermes limitation (local candidate, § 8): the native bridge must supply turn/event delivery and manager wake;
 without that qualified bridge the unattended lifecycle above is unverified (R12).
+
+Changed (owner-approved audit, 2026-10-10): bare PID turn-end polling -> polling the recorded process birth
+identity; a reused PID ends the original wait. Missing/unverifiable identity stops the pass visibly.
 
 ### R5. Worker writes completion to the task
 
@@ -343,12 +350,29 @@ Changed: no cleanup command → `taskq cleanup`, run by the owner on demand, nev
 of tasks not open, never unmerged or uncommitted work, and never with `--force` (#476, § 4). A session goes only by
 the id the board records, never by its name, never while it runs (#478).
 
+Changed (owner-approved audit, 2026-10-10): Codex PID-only ownership -> Windows creation time, Linux
+boot ID/start time, or macOS libproc start seconds/microseconds. Termination pins a Windows process handle
+or Linux pidfd before verifying identity.
+Legacy PID-only handles, unreadable identity and unsupported platforms stay unknown and are preserved;
+cleanup never deletes them or signals their PID. macOS confirms liveness and turn-end with libproc;
+running-process termination is refused because no stable signal handle is implemented. Stopped macOS
+sessions can still be resumed or archived. macOS native qualification remains required. The layout and
+return semantics follow Apple
+[`proc_info.h`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info.h) and
+[`libproc.c`](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/libproc/libproc.c).
+
 ### R12. Unverified means unknown
 
 Report only what a fresh read proved. A delivery, exit code, checkout marker or chat turn is not proof of receipt,
 application or completion.
 Changed: automated green alone → scoped assertions plus applicable changed-boundary qualification before main
 publication; missing required evidence holds publication (#533).
+
+Changed (owner-approved audit, 2026-10-10): runtime-specific liveness interpretation -> a shared minimal
+`running`/`idle`/`dead`/`unknown` capability. Custom runtimes without `state` retain `alive` fallback
+(True running, False dead, otherwise unknown); that fallback cannot prove idle or admit a worker send.
+Claude resume IDs and Hermes busy refusal remain native runtime behavior. Local mock/process checks prove
+only these boundaries; changed live-runtime qualification is still required before publication.
 
 ### R13. Spec first
 
@@ -551,7 +575,7 @@ Runtime file: four module-level functions, three more optional.
 | `link(session)` | a URL the owner opens to watch the session, or `None` |
 | `retire(gone, running=True)` | optional: stop and remove this machine's `T<N>`/`S<N>` sessions with `gone(N, session, live)` true; `close` calls it for its task's recorded workers, the tick with `running=False` for recorded sessions of tasks not open or replaced (R11) |
 | `tail(session)` | optional: the session's last log line, for the ask after a second quick death (§ 7) |
-| `state(session)` | optional: a supervisor's `running`, `idle`, `dead` or `None` (§ 7 step 4); without it `alive` stands in |
+| `state(session)` | optional: a session's `running`, `idle`, `dead` or `unknown` (`None` is accepted as unknown); without it `alive` stands in, never proving idle |
 
 ## 3. Data model
 
@@ -628,7 +652,7 @@ Runtime file: four module-level functions, three more optional.
 | `taskq later N [--text T]` | park: any state → `later`; drops claim and supervisor |
 | `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
 | `taskq status` | print the R6 report only: one board list, no pass, no pull, no write, no dispatch, no session started (#574) |
-| `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4); `--after PID`: first wait for that Codex turn's process to end (R4) |
+| `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4); `--after PID --after-birth ID`: first wait for that identified Codex turn to end (R4) |
 | `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed, for the tasks whose `pm` is this session or that have none (all of them from a plain shell); print `ask #N`, `review #N` (an unsupervised task, R3 Transition), `closed #N <verdict>` (a supervised task, § 7 Supervisor 3.3), `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7); each manager's events are its own, once (`.taskq/wait-<session>.json`; a plain shell: `.taskq/wait.json`); `--pm ID`: wait as manager `ID`, its tasks and its file (a sender, R4) |
 | `taskq wait --task N [--window MIN] [--every SEC]` | the supervisor's wait: block until its task needs it; print `review #N`, `ask #N`, `answer #N`, `gone #N` (its worker), `requeue #N` (by its worker), one line each, each once (`.taskq/S<N>.seen`); `stop #N` when the task is closed or the calling session is not its supervisor; `tick` after the window |
 | `taskq pm [--adopt N ..]` | print the manager role (Principles, § 7, how to tick this session) under a first line `taskq pm contract <hash>`; record the hash of the clone's `taskq.md` in `.taskq/pm.json` (§ 7), nothing else: a task's manager is its `pm` (R3, #532); refused for a session an open task records as its supervisor or worker, so neither passes the gate as the manager (R3). `--adopt N`: record this session as the `pm` of open tasks that have none, under the project guard with a fresh read; a task with a `pm`, or a busy lock, refuses all of them (R3 Transition) |
@@ -846,7 +870,7 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
      root)`, record `claim`, comment `spawn`. A requeue spawns a new worker that continues branch `taskq-<N>` (#291).
    - the supervisor's state. `alive` alone cannot tell: a Codex supervisor's process exits at the end of every turn,
      by design. From what the pass can read:
-     - running. Codex: the pid in `.taskq/S<N>.pid` runs; the pass at its turn's end (R4) delivers what came
+     - running. Codex: the process birth identity in `.taskq/S<N>.pid` matches a running process; the pass at its turn's end (R4) delivers what came
        meanwhile. Claude: `claude agents` lists it with a pid; its own background `taskq wait --task N` delivers.
      - idle, the expected state between events. Codex: the pid has exited, the last turn in `.taskq/S<N>.log` (after
        its last `turn.started`) ended `turn.completed`, and the thread's rollout is local (the #522 check of
@@ -855,7 +879,8 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
        either way it is woken: by its wait, or by the pass's resume. #526 records it. Idle is never respawned, never
        reported `gone`, never an `ask`. A runtime file may define
        `state(session)`; without it `alive` stands in (False: dead).
-     - dead: anything else of the recorded supervisor of an open task. Codex: no pid file, the last turn ended
+     - unknown: no local handle, legacy PID-only handle, unreadable identity or unsupported platform; preserve and defer.
+     - dead: anything else of the recorded supervisor of an open task. Codex: an identified process exited and the last turn ended
        `turn.failed`, `error` or with no terminal event (killed), or no local rollout. Claude: not listed, or
        `failed` with no pid.
    - an event for the supervisor (`review`, `ask` by the worker, `answer`, worker `gone`, a worker's `requeue`):
@@ -886,7 +911,7 @@ The event pass of R4 is steps 1–4 run by `taskq tick --quiet`, the detached ch
 `result`, `requeue` or `close`, no table. A worker's `result` wakes its supervisor (an unsupervised one's waits for
 the manager's review); a `close` frees the slot for the next task on that machine. Run from `.worktrees/taskq-<N>`, taskq takes the checkout above it as the
 project root. Inside a Codex sandbox no pass runs (#502): a sandboxed supervisor's `run`, `requeue` or `close` takes
-effect in `taskq tick --quiet --after <pid>`, the pass the runtime left for that turn's end (R4).
+effect in `taskq tick --quiet --after <pid> --after-birth <identity>`, the pass the runtime left for that turn's end (R4).
 Changed: the pass spawned workers and the manager reviewed → the pass spawns one supervisor per task and runs its
 orders; the supervisor reviews (#524).
 
@@ -1024,7 +1049,7 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 | Runtime | spawn | send | alive | link | retire |
 |---|---|---|---|---|---|
 | Claude | `claude --bg --name "T<N> <ORCH> <title> (<machine>)"` in the project root; tools `Bash Read Edit Write Glob Grep WebFetch WebSearch`, no MCP, `--permission-mode dontAsk` | `claude stop`, then `claude --bg --resume <id> <text>` (a new id) | `claude agents --json --all` | Remote Control URL | `claude stop <job id>` when running, then `claude rm <job id>` |
-| Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread>` in `.taskq/T<N>.pid`; then `codex app-server`: `initialize`, `thread/name/set` the name, `thread/read` it back, each after the last one's success, all within 60 s (R3: anything else stops the turn, keeps the pid file, fails the spawn) | `codex exec resume <id> <text>` | the pid is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` (or a replaced `T<N>-<thread>.pid`) |
+| Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread> <birth>` in `.taskq/T<N>.pid`; then `codex app-server`: `initialize`, `thread/name/set` the name, `thread/read` it back, each after the last one's success, all within 60 s (R3: anything else stops the turn, keeps the pid file, fails the spawn) | `codex exec resume <id> <text>` | the identified process is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` (or a replaced `T<N>-<thread>.pid`) |
 
 - A supervisor starts and retires as a worker does, named `S<N> ...` (Codex: `.taskq/S<N>.log`,
   `.taskq/S<N>.pid`), with the same tools, `permission_mode` and `codex` options (R9). A running Claude supervisor

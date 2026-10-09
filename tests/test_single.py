@@ -204,8 +204,8 @@ class Coordination(Base):
         self.assertIsNone(codex.state('another-checkout-session'))
         path = self.root / '.taskq' / 'S1.pid'
         path.parent.mkdir(exist_ok=True)
-        path.write_text('99999 session')
-        with mock.patch.object(taskq, 'pid_alive', return_value=False), \
+        path.write_text('99999 session windows:1')
+        with mock.patch.object(taskq, 'process_identity', return_value=('dead', None)), \
                 mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)), \
                 self.assertRaisesRegex(RuntimeError, 'archive failed'):
             with taskq.coordination():
@@ -1884,7 +1884,7 @@ class Tick(TickSetup):
             taskq.CONFIG['root'] = Path(folder)
             (Path(folder) / '.taskq').mkdir()
             for n in (3, 4):
-                (Path(folder) / '.taskq' / f'T{n}.pid').write_text(f'999999999 thread-{n}')
+                (Path(folder) / '.taskq' / f'T{n}.pid').write_text(f'999999999 thread-{n} windows:1')
             calls = []
             with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:]) or subprocess.CompletedProcess(command, 0)):
                 taskq.Codex().retire(lambda n, *_: n == 3)
@@ -1893,8 +1893,8 @@ class Tick(TickSetup):
 
     def test_codex_alive_from_pid_file(self):
         codex = taskq.Codex()
-        (codex.folder() / 'T1.pid').write_text(f'{os.getpid()} thread-1')
-        (codex.folder() / 'T2.pid').write_text('999999999 thread-2')  # above any pid_max: no such process
+        (codex.folder() / 'T1.pid').write_text(f'{os.getpid()} thread-1 {taskq.process_identity(os.getpid())[1]}')
+        (codex.folder() / 'T2.pid').write_text('999999999 thread-2 windows:1')  # above any pid_max: no such process
         self.assertEqual([codex.alive(s) for s in ('thread-1', 'thread-2', 'thread-3')], [True, False, None])
         self.assertTrue(codex.link('thread-1').endswith('/open.html#codex://threads/thread-1'))
 
@@ -1910,7 +1910,7 @@ class Tick(TickSetup):
             return mock.Mock(pid=os.getpid()), log
         with mock.patch.object(codex, 'exec', run), mock.patch.object(codex, 'title') as title:
             self.assertEqual(codex.spawn('T1 one (mac)', 'prompt', '.'), 'new-thread')
-        self.assertEqual((codex.folder() / 'T1.pid').read_text(), f'{os.getpid()} new-thread')
+        self.assertEqual((codex.folder() / 'T1.pid').read_text(), f'{os.getpid()} new-thread {taskq.process_identity(os.getpid())[1]}')
         title.assert_called_once_with('new-thread', 'T1 one (mac)')  # R3 (#572): the new thread gets its native name
 
     def test_codex_title_waits_for_each_reply(self):
@@ -1955,7 +1955,7 @@ class Tick(TickSetup):
                 self.assertRaisesRegex(taskq.Unnamed, '^th not named: thread/name/set: no rollout found$'):
             codex.spawn('S1 CDX one (mac)', 'prompt', '.')
         process.terminate.assert_called_once_with()
-        self.assertEqual((codex.folder() / 'S1.pid').read_text(), '4242 th')
+        self.assertEqual((codex.folder() / 'S1.pid').read_text(), '4242 th -')
 
     def test_unnamed_spawn_is_recorded_gone_not_spawned(self):
         # R3/R11 (#572): the pass fails, the board records the id in a gone note only; the next pass retires it
@@ -1982,12 +1982,12 @@ class Tick(TickSetup):
     def test_codex_resume_keeps_the_named_thread(self):
         # R3 (#572): `exec resume` goes to the same thread under its handle; it renames nothing (the name stays native)
         codex = taskq.Codex()
-        (codex.folder() / 'S1.pid').write_text('1 th')
+        (codex.folder() / 'S1.pid').write_text('999999999 th windows:1')
         with mock.patch.object(codex, 'exec', return_value=(mock.Mock(pid=4242), codex.folder() / 'S1.log')) as run, \
                 mock.patch.object(codex, 'title', side_effect=AssertionError('resume renames nothing')):
             self.assertEqual(codex.send('th', 'review #1: read your issue'), 'th')
         run.assert_called_once_with('S1', ['resume', 'th', 'review #1: read your issue'], self.root)
-        self.assertEqual((codex.folder() / 'S1.pid').read_text(), '4242 th')
+        self.assertEqual((codex.folder() / 'S1.pid').read_text(), '4242 th -')
 
     def test_supervisor_runtime_follows_the_manager(self):
         # R3 (#525): S<N> runs in the manager's runtime (DOT: Codex), T<N> in the task's; no manager here: the task waits
@@ -2079,7 +2079,7 @@ class Tick(TickSetup):
     def test_codex_respawn_keeps_the_replaced_handle(self):
         # #568: a running replaced thread keeps a handle (S<N>-<thread>.pid) so retire still finds and archives it
         codex = taskq.Codex()
-        (codex.folder() / 'S1.pid').write_text('999999999 old-thread')
+        (codex.folder() / 'S1.pid').write_text('999999999 old-thread windows:1')
         log = codex.folder() / 'S1.log'
 
         def run(*_):
@@ -2090,7 +2090,7 @@ class Tick(TickSetup):
         calls = []
         with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:]) or subprocess.CompletedProcess(command, 0)):
             codex.retire(lambda n, sid, live: sid == 'old-thread')
-        self.assertEqual((calls, (codex.folder() / 'S1.pid').read_text()), ([['archive', 'old-thread']], '999999998 new-thread'))
+        self.assertEqual((calls, (codex.folder() / 'S1.pid').read_text()), ([['archive', 'old-thread']], '999999998 new-thread -'))
 
     def test_supervisor_death_respawns_then_asks(self):
         # § 7 step 4: the first death respawns S<N> (a resumable one resumes), the second since the last result or answer asks
@@ -2152,7 +2152,7 @@ class Tick(TickSetup):
         (home / 'sessions' / '2026' / '10' / '09' / 'rollout-x-th-1.jsonl').write_text('')
         for name, pid, log in (('S1', os.getpid(), ''), ('S2', 999999999, '{"type":"turn.started"}\n{"type":"turn.completed"}\n'),
                                ('S3', 999999999, '{"type":"turn.completed"}\n{"type":"turn.started"}\n{"type":"turn.failed"}\n')):
-            (codex.folder() / f'{name}.pid').write_text(f'{pid} th-{name[1]}')
+            (codex.folder() / f'{name}.pid').write_text(f'{pid} th-{name[1]} {taskq.process_identity(pid)[1] or "windows:1"}')
             (codex.folder() / f'{name}.log').write_text(log)
         with mock.patch.dict(os.environ, {'CODEX_HOME': str(home)}):
             self.assertEqual([codex.state(f'th-{n}') for n in (1, 2, 3, 4)], ['running', 'dead', 'dead', None])  # th-2: no rollout; th-4: another checkout may own it
@@ -2175,8 +2175,8 @@ class Tick(TickSetup):
             self.run_cli('result', '1', '--sha', 'a' * 40)
         self.assertEqual(self.fake.sent, [])
         self.fake.sessions['s-S1'] = 'idle'
-        with mock.patch.object(taskq, 'pid_alive', side_effect=[True, False]), mock.patch.object(taskq.time, 'sleep') as slept:
-            self.run_cli('tick', '--quiet', '--after', '4242')
+        with mock.patch.object(taskq, 'process_identity', side_effect=[('running', 'windows:1'), ('dead', None)]), mock.patch.object(taskq.time, 'sleep') as slept:
+            self.run_cli('tick', '--quiet', '--after', '4242', '--after-birth', 'windows:1')
         self.assertEqual((slept.call_count, self.fake.sent), (1, [('s-S1', 'review #1: read your issue')]))
         self.run_cli('tick')
         self.assertEqual(len(self.fake.sent), 1)  # once
@@ -2188,7 +2188,7 @@ class Tick(TickSetup):
                 mock.patch.object(taskq.shutil, 'which', return_value='codex'), \
                 mock.patch.object(taskq, 'start_pass', lambda command, **_: started.append(command[2:])):
             taskq.Codex().exec('S1 CDX one (mac)', ['resume', 'th', 'review #1: read your issue'], self.root)
-        self.assertEqual(started, [['tick', '--quiet', '--after', '4242', '--tasks']])
+        self.assertEqual(started, [['tick', '--quiet', '--after', '4242', '--after-birth', '-', '--tasks']])
         self.assertTrue((self.root / '.taskq' / 'dispatch.log').read_text().endswith('turn end pid 4242\n'))
 
     def test_recorded_session_cannot_take_the_manager_role(self):
@@ -2202,6 +2202,153 @@ class Tick(TickSetup):
             with self.acting(sid), self.assertRaisesRegex(SystemExit, 'cannot take the manager role'):
                 self.run_cli('pm')
         self.assertFalse((self.root / '.taskq' / 'pm.json').exists())  # refused: nothing written
+
+
+class RuntimeProcessBoundary(Base):
+    """Local processes only. No installed model CLI, board network or paid calls."""
+
+    def test_runtime_capability_fallback_cannot_invent_idle(self):
+        legacy = mock.Mock(spec=['alive'])
+        for value, expected in ((True, 'running'), (False, 'dead'), (None, 'unknown')):
+            legacy.alive.return_value = value
+            self.assertEqual(taskq.runtime_state(legacy, 'sid'), expected)
+        native = mock.Mock(spec=['state'])
+        for value in ('running', 'idle', 'dead', 'unknown', None, 'unexpected'):
+            native.state.return_value = value
+            self.assertEqual(taskq.runtime_state(native, 'sid'), value if value in ('running', 'idle', 'dead') else 'unknown')
+
+    def test_darwin_native_birth_layout_errors_and_retirement_capability(self):
+        import ctypes
+        import errno
+        import struct
+        # Apple xnu proc_bsdinfo: 136 bytes, start timeval at offset 120; an independent byte fixture.
+        library = mock.Mock()
+        def reply(pid, flavor, arg, buffer, size):
+            self.assertEqual((pid, flavor, arg, size), (123, 3, 0, 136))
+            data = struct.pack('=12I16s32s5IiQQ', 0, status, 0, returned_pid, *([0] * 8),
+                               b'mock', b'mock', *([0] * 6), 1700000000, 123456)
+            ctypes.memmove(buffer, data, len(data))
+            ctypes.set_errno(error)
+            return length
+        library.proc_pidinfo.side_effect = reply
+        with mock.patch.object(ctypes, 'CDLL', return_value=library):
+            for status, returned_pid, length, error, expected in (
+                    (2, 123, 136, 0, ('running', 'darwin:1700000000:123456')),
+                    (5, 123, 136, 0, ('dead', 'darwin:1700000000:123456')),
+                    (2, 123, 0, errno.ESRCH, ('dead', None)),
+                    (2, 123, 0, errno.EPERM, ('unknown', None)),
+                    (2, 123, 128, 0, ('unknown', None)),
+                    (2, 124, 136, 0, ('unknown', None))):
+                with self.subTest(status=status, length=length, error=error, pid=returned_pid):
+                    self.assertEqual(taskq.darwin_identity(123), expected)
+        with mock.patch.object(taskq.os, 'name', 'posix'), mock.patch.object(taskq.sys, 'platform', 'darwin'), \
+                mock.patch.object(taskq, 'process_identity', return_value=('running', 'darwin:1:2')), \
+                mock.patch.object(taskq.os, 'kill') as kill, \
+                self.assertRaisesRegex(RuntimeError, 'safe process termination unavailable'):
+            taskq.stop_process(123, 'darwin:1:2')
+        kill.assert_not_called()
+
+    def test_legacy_and_unknown_handles_are_preserved(self):
+        codex = taskq.Codex()
+        path = codex.folder() / 'T1.pid'
+        for text in ('123 sid', '123 sid -', '123 sid malformed', '123 sid windows:1'):
+            with self.subTest(handle=text), mock.patch.object(taskq, 'process_identity', return_value=('unknown', None)), \
+                    mock.patch.object(taskq, 'stop_process') as stop, mock.patch.object(codex, 'exec') as execute:
+                path.write_text(text)
+                self.assertEqual(codex.state('sid'), 'unknown')
+                with self.assertRaisesRegex(RuntimeError, 'unknown.*refused'):
+                    codex.send('sid', 'continue')
+                codex.retire(lambda *args: True)
+                self.assertEqual(path.read_text(), text)
+                execute.assert_not_called()
+                stop.assert_not_called()
+
+    def test_reused_pid_never_signals_foreign_process_or_waits_for_it(self):
+        codex = taskq.Codex()
+        path = codex.folder() / 'T1.pid'
+        path.write_text('123 sid windows:1')
+        with mock.patch.object(taskq, 'process_identity', return_value=('running', 'windows:2')), \
+                mock.patch.object(taskq, 'stop_process') as stop, \
+                mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as archive, \
+                mock.patch.object(taskq, 'cmd_tick') as tick, mock.patch.object(taskq.time, 'sleep') as sleep:
+            codex.retire(lambda *args: True)
+            taskq.event_pass(type('Args', (), {'after': 123, 'after_birth': 'windows:1'})())
+            stop.assert_not_called()
+            sleep.assert_not_called()
+            tick.assert_called_once()
+            self.assertEqual(archive.call_args.args[0][-2:], ['archive', 'sid'])
+            self.assertFalse(path.exists())
+
+    def test_turn_end_unknown_identity_refuses_dispatch(self):
+        for birth in (None, '-', 'windows:1'):
+            with mock.patch.object(taskq, 'process_identity', return_value=('unknown', None)), \
+                    mock.patch.object(taskq, 'cmd_tick') as tick, contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                taskq.event_pass(type('Args', (), {'after': 123, 'after_birth': birth})())
+            tick.assert_not_called()
+
+    @unittest.skipUnless(os.name == 'nt' or sys.platform in ('linux', 'darwin'), 'supported process birth API required')
+    def test_real_mock_codex_turn_busy_refusal_and_identified_exit(self):
+        script = self.root / 'fake_codex.py'
+        release = self.root / 'release'
+        script.write_text("import pathlib, sys, time\nrelease=pathlib.Path(sys.argv[1])\n"
+                          "print('{\"type\":\"thread.started\",\"thread_id\":\"local-thread\"}', flush=True)\n"
+                          "print('{\"type\":\"turn.started\"}', flush=True)\n"
+                          "while not release.exists(): time.sleep(.01)\n"
+                          "print('{\"type\":\"turn.completed\"}', flush=True)\n")
+        children = []
+        def launch(command, **kwargs):
+            child = REAL_POPEN([sys.executable, str(script), str(release)], **kwargs)
+            children.append(child)
+            return child
+        codex = taskq.Codex()
+        try:
+            with mock.patch.object(taskq.subprocess, 'Popen', launch), \
+                    mock.patch.object(taskq.shutil, 'which', return_value=sys.executable), \
+                    mock.patch.object(taskq, 'dispatch') as dispatch, mock.patch.object(codex, 'title'):
+                self.assertEqual(codex.spawn('T1 mock', 'local only', self.root), 'local-thread')
+                child = children[0]
+                path = codex.pid_file('local-thread')
+                original = path.read_text()
+                pid, sid, birth = taskq.read_process(path)
+                self.assertEqual(taskq.process_state(pid, birth), 'running')
+                with self.assertRaisesRegex(RuntimeError, 'running.*refused'):
+                    codex.send(sid, 'do not overlap')
+                self.assertEqual(len(children), 1)
+                self.assertEqual(path.read_text(), original)
+                dispatch.assert_called_once_with('turn end', [], after=pid, after_birth=birth)
+            def finish(_):
+                release.touch()
+                child.wait(timeout=5)
+            with mock.patch.object(taskq, 'time', mock.Mock(sleep=finish)), mock.patch.object(taskq, 'cmd_tick') as tick:
+                taskq.event_pass(type('Args', (), {'after': pid, 'after_birth': birth})())
+                tick.assert_called_once()
+            self.assertEqual(taskq.process_state(pid, birth), 'dead')
+            self.assertIn('turn.completed', path.with_suffix('.log').read_text())
+            with mock.patch.object(taskq, 'rollout', return_value='local'):
+                self.assertEqual(codex.state(sid), 'idle')
+        finally:
+            release.touch()
+            for child in children:
+                if child.poll() is None:
+                    child.terminate()
+                child.wait(timeout=5)
+
+    @unittest.skipUnless(os.name == 'nt' or (sys.platform == 'linux' and hasattr(os, 'pidfd_open')
+                                          and hasattr(taskq.signal, 'pidfd_send_signal')), 'safe signal primitive required')
+    def test_real_owned_process_retirement_waits_for_exit(self):
+        child = REAL_POPEN([sys.executable, '-c', 'import time; time.sleep(30)'])
+        try:
+            state, birth = taskq.process_identity(child.pid)
+            self.assertEqual(state, 'running')
+            self.assertTrue(birth)
+            taskq.stop_process(child.pid, birth)
+            child.wait(timeout=5)
+            self.assertEqual(taskq.process_state(child.pid, birth), 'dead')
+        finally:
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=5)
 
 
 class Wait(TickSetup):
@@ -2725,7 +2872,7 @@ class Cleanup(Base):
             self.board.issues[n]['state'] = 'closed'
         self.fake.sessions.update({'s-T1': False, 's-T2': True, 's-T3': False, 's-T4': False})  # #1's worker died; #2's still runs
         self.board.issues[3]['comments'].append('**spawn** · fake:tick\n\nhttps://watch/s-T3')  # #478: recorded; s-T4: a name only
-        (self.root / '.taskq' / 'S2.pid').write_text('999999999 old')
+        (self.root / '.taskq' / 'S2.pid').write_text('999999999 old windows:1')
         (self.root / '.taskq' / 'wait.json').write_text('{"1": "doing", "2": "review"}')
 
     def state(self):
@@ -3104,7 +3251,7 @@ def link(session): return None
             parsed = taskq.parse(saved['2'])
             saved['2']['body'] = taskq.block('g', {**parsed['raw'], 'order': 'run'})
             (root / 'issues.json').write_text(json.dumps(saved))
-            launcher = "import taskq; taskq.CONFIG=taskq.load_config(); taskq.dispatch('turn end', [], after=2147483647)"
+            launcher = "import taskq; taskq.CONFIG=taskq.load_config(); taskq.dispatch('turn end', [], after=2147483647, after_birth='windows:1')"
             done = REAL_RUN([sys.executable, '-c', launcher], cwd=root, env=env, capture_output=True, text=True, timeout=20)
             self.assertEqual(done.returncode, 0, done.stderr)
             completed()

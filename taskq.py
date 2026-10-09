@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
-import argparse, contextlib, hashlib, importlib.util, json, os, re, shlex, shutil, signal, socket, subprocess, sys, time
+import argparse, contextlib, glob, hashlib, importlib.util, json, os, re, shlex, shutil, signal, socket, subprocess, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -977,6 +977,13 @@ def cmd_pm(args):
 CODEX_COMPACT = ('-c model_auto_compact_token_limit=200000 -c "compact_prompt=\\"Keep only the owner\'s open questions and '
                  'decisions; the board is the state.\\""')  # #507: a compacted manager costs ~10x less per tick (#503)
 
+def rollout(thread):
+    """#522: where the thread's local Codex rollout is: 'local' (exec resume finds it), 'archived', or None (unknown)."""
+    home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+    name = f'rollout-*-{glob.escape(thread)}.jsonl'
+    return next((kind for kind, pattern in (('local', f'sessions/*/*/*/{name}'), ('archived', f'archived_sessions/{name}'))
+                 if next(home.glob(pattern), None)), None)
+
 def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
     runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
@@ -995,14 +1002,29 @@ do § 7 After each pass for those tasks, then start `{wait}` in the background a
 A runtime that cannot wake a session when a background command ends (Codex): use `taskq arm tick "<manager>"` from a separate sender session.
 Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.json autoCompactWindow 200000).''')
     resume = f'codex exec {shlex.join(codex_options())} resume {args.target}'  # the options a worker turn gets
-    send = f'by running `{resume} "<its output>"`: a new turn on that thread wakes it' if runtime == 'codex' else \
-        f'with {SENDERS.get(runtime, "your messaging tool")}'
-    shell = f'\nNo agent needed: `cd {CONFIG["root"]} && while :; do e=$({wait}) && {resume} "$e"; done` in a terminal.' if runtime == 'codex' else ''
-    print(f'''You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
-Repeat forever, from {CONFIG["root"]}:
+    send, shell, note = f'with {SENDERS.get(runtime, "your messaging tool")}', '', ''
+    where = rollout(args.target) if runtime == 'codex' else None
+    if where == 'local':  # a CLI thread: exec resume finds it
+        send = f'by running `{resume} "<its output>"`: a new turn on that thread wakes it'
+        shell = (f'\nNo agent needed: `cd {CONFIG["root"]} && while e=$({wait}) && {resume} "$e"; do :; done; '
+                 'echo "taskq sender stopped"` in a terminal.')
+    elif where == 'archived':  # #522: exec resume of an archived thread is unverified (R12): no route
+        return print(f'taskq: {args.target} is archived in Codex; `exec resume` of an archived thread is unverified, so no sender.\n'
+                     f'Run `codex unarchive {args.target}`, then `taskq arm tick {args.target}` again.')
+    elif runtime == 'codex':  # #522: unknown target; an app thread fails `no rollout found` (#269)
+        send = 'with `send_message_to_thread`'
+        note = (f'taskq: no local Codex rollout of {args.target}, so no `codex exec resume` and no promised wake. Unknown what it is: '
+                'a Codex app thread (exec resume fails `no rollout found`), a thread name, a typo or another machine\'s thread.\n'
+                f'Only if {args.target} is a known Codex app thread: run this prompt in an independent, user-visible Codex app session '
+                'whose send_message_to_thread reaches it. Not a collaboration subagent of the manager: it cannot send to its ancestor '
+                'and starts no turn. A session without that tool (a CLI worker) hands this prompt to the owner or the app manager.\n'
+                'Workers still dispatch without a sender (R4 event chain); only review, ask and gone wait for the manager.\n\n')
+    print(f'''{note}You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
+Stay in this one turn and repeat, from {CONFIG["root"]}; do not end the turn between events (an ended turn forwards nothing):
 1. Run `{wait}`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
 2. Send its output, verbatim, to {args.target} {send}.
-3. Go back to 1 at once. A failed run or send: say so to {args.target} once, then go on.{shell}''')
+3. Go back to 1 at once. A failed wait, a failed send or no such send tool: stop, say here
+   `taskq sender stopped: <error>` once; never retry, never another route.{shell}''')
 
 def main(argv=None):
     global CONFIG, BOARD

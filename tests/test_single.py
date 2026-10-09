@@ -2107,7 +2107,7 @@ class MultiPM(Base):
         self.assertEqual(self.notes(1), ['**add**', '**adopt**'])  # one adoption, B wrote nothing
     def test_concurrent_adoption_clis_one_wins(self):
         # bounded real evidence: two `taskq pm --adopt 1` processes at once on a file board with a slow read; exactly one wins
-        (self.root / 'taskq.json').write_text('{"board": "board.py", "limits": {"claude": 0, "codex": 0}}')
+        (self.root / 'taskq.json').write_text('{"board": "board.py", "update": false, "limits": {"claude": 0, "codex": 0}}')
         (self.root / 'board.py').write_text(textwrap.dedent('''
             import json, time
             from pathlib import Path
@@ -2129,7 +2129,7 @@ class MultiPM(Base):
             self.add('one', '--runtime', 'fake')
         (self.root / 'issues.json').write_text(json.dumps({'1': {**self.board.issues[1], 'iid': 1}}))
         script = Path(taskq.__file__).resolve()
-        procs = [REAL_POPEN([sys.executable, str(script), 'pm', '--adopt', '1'], cwd=self.root, text=True,
+        procs = [REAL_POPEN([sys.executable, str(script), 'pm', '--adopt', '1'], cwd=self.root, text=True, encoding='utf-8',
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
                             'TASKQ_HOST': 'mac', 'HOME': str(self.root), **env}) for env in (self.A, self.B)]
         outs = [proc.communicate(timeout=30) for proc in procs]
@@ -2530,6 +2530,27 @@ def link(session): return None
 
 class RealChild(unittest.TestCase):
     """#481: `add` in a real process starts the real detached `tick --quiet` child; it spawns and logs, though the list lags the add."""
+
+    def test_native_redirected_unicode_report_and_cli_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'taskq.py').write_text((ROOT / 'taskq.py').read_text('utf-8'), encoding='utf-8')
+            (root / 'board.py').write_text(FILE_BOARD, encoding='utf-8')
+            (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'update': False, 'board_url': 'https://board'}))
+            issue = {'iid': 1, 'title': 'Привет 🌍', 'body': taskq.block('g', {'deps': []}), 'labels': ['q-ready'],
+                     'state': 'open', 'listed': True, 'comments': [], 'updated_at': '2026-10-09T00:00:00Z', 'url': ''}
+            (root / 'issues.json').write_text(json.dumps({'1': issue}))
+            env = {'PATH': '', 'HOME': str(root), 'TASKQ_HOST': 'win',
+                   'PYTHONIOENCODING': 'cp1252' if os.name == 'nt' else 'utf-8'}
+            if os.name == 'nt':
+                env['SYSTEMROOT'] = os.environ['SYSTEMROOT']
+            for command, code, stream, expected in (('status', 0, 'stdout', 'Привет 🌍'), ('💥', 2, 'stderr', '💥')):
+                with self.subTest(command=command):
+                    done = REAL_RUN([sys.executable, str(root / 'taskq.py'), command], cwd=root, env=env,
+                                    capture_output=True, timeout=20)
+                    self.assertEqual(done.returncode, code, done.stderr)
+                    self.assertIn(expected, getattr(done, stream).decode('utf-8'))
+                    self.assertNotIn(b'UnicodeEncodeError', done.stderr)
 
     def test_local_scope_survives_native_event_and_turn_end_children(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -1021,6 +1021,8 @@ supported explicit named profile and disposable local-only Git fetch (owner corr
 
 ## 9. Windows
 
+- CLI stdout and stderr use UTF-8, including redirected pipes and detached dispatch logs. This keeps Unicode
+  task titles and the contract readable on hosts whose default redirected encoding is a legacy code page (#604).
 - Run `py -3 <clone>\taskq.py` or `python <clone>\taskq.py`; a PowerShell function is the alias:
   `function taskq { python C:\src\taskq\taskq.py @args }` in `$PROFILE`.
 - `gh`, `glab`, `claude` (`claude.cmd`), `codex` and `git` are found on `PATH`; no bash is needed by taskq.

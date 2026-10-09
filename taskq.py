@@ -1736,6 +1736,10 @@ Stay in this one turn and repeat, from {CONFIG["root"]}; do not end the turn bet
 
 def main(argv=None):
     global CONFIG, BOARD
+    if os.name == 'nt':  # redirected Windows streams otherwise use a legacy code page that rejects task titles/contract
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, 'reconfigure'):
+                stream.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(prog='taskq')
     commands = parser.add_subparsers(dest='command', required=True)
 

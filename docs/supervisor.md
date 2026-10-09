@@ -156,7 +156,7 @@ live behavior. Existing claims are not rebound. No suite migration or new paid b
 
 ## 9. Executable PM/ARM handoff investigation (#595)
 
-Status: **incomplete; live qualification BLOCKED**, 2026-10-09 18:46 UTC
+Status: **incomplete; isolated persistent ARM qualification BLOCKED**, 2026-10-09 19:39 UTC
 (2026-10-10 in the owner's timezone). This is a bounded research record, not a new role contract.
 The owner activated #595, per-project Claude 0 / Codex 3 for taskq and csgo, and the independently
 reviewed publication lifecycle. The original intake-only/later restriction is superseded. No additional
@@ -262,7 +262,7 @@ These are hypotheses, not successful prompt wording. No live-winning wording has
 |---|---|---|---|---|
 | Claude baseline | BLOCKED / BLOCKED | BLOCKED / BLOCKED | BLOCKED / BLOCKED | No authorized existing Claude experiment PM/wake session accessible from this worker; Claude workers are disabled by the selected project's limit 0. Installed CLI alone proves no session/tool wake. No launch attempted. |
 | Direct Codex CLI | BLOCKED / BLOCKED | BLOCKED / BLOCKED | BLOCKED / BLOCKED | One isolated C PM launch failed before role receipt: in-process app-server initialization denied by the current sandbox. ARM and candidates stopped at that dependency. |
-| Direct Codex app | BLOCKED / BLOCKED | BLOCKED / BLOCKED | BLOCKED / BLOCKED | Existing independent app sender/target not reachable with the supplied tools; no `send_message_to_thread`. No resume fallback or replacement sender. |
+| Direct Codex app | Foreground observed / full ARM BLOCKED | Foreground observed / full ARM BLOCKED | Foreground observed / full ARM BLOCKED | Existing executor completed fresh comparisons below; no continuing running wait or isolated independent sender/idle wake. This worker has no `send_message_to_thread`; no resume fallback or replacement sender. |
 | DOT cloud + local execution child | BLOCKED / BLOCKED | BLOCKED / BLOCKED | BLOCKED / BLOCKED | No accessible actual cloud parent/local child handoff and no existing ARM sender access. This worker's local CLI is not proof of that topology. |
 
 CLI control command, in the newly created isolated empty-board scope only:
@@ -440,3 +440,78 @@ reachable through an existing supported app-session route and provide safe recei
 obtain an explicitly reviewed narrowly scoped CLI startup-access prerequisite. The worker cannot grant
 itself access or relocate Codex home to evade the denial. Prefer the existing app route; do not change model,
 effort, credentials, monitor ownership or security settings. Hold main publication/deployment and acceptance.
+
+
+### Reconciled app evidence, 2026-10-09 19:39 UTC
+
+This section supersedes the earlier zero-model-receipt/app-inaccessible claims for the existing app
+executor only. Those claims still describe the CLI worker's own capabilities. No production prompt,
+role, runtime setting or Memory behavior changes in this continuation; I/H remain research overlays.
+
+The [guided PM evidence](https://github.com/alexkirs/taskq/issues/595#issuecomment-6087506889)
+and [independent confirmation](https://github.com/alexkirs/taskq/issues/595#issuecomment-6087525265)
+report an idle observation, subsequent PM receipt turn, and six actual empty-board harness commands:
+pm, arm, tick, wait returning tick, handling tick, next wait returning tick, all exit 0.
+This is explicitly steered app transport/action proof, not an unsteered comparison. Both waits completed;
+it does not establish a continuing running monitor. Full role readback was truncated. Per-event UTC,
+receipt/tool identifiers, running wait handle, model/effort and latency were not supplied and remain unknown.
+
+Candidate correspondence was checked before attributing this evidence: recorded head
+`64661cda773b93889e06a6e35735344185393d8c`, taskq.py SHA256
+`6df4c532df36a8ea43d48573f2a41ac075e52d76bce2f5de550ced0acc2a3cfb`, taskq.md SHA256
+`dd08f16a775ae76337dad212f63b115b215fc4f0f9666e63fa9c64851497d422`.
+The private harness SHA256 `bc9e0ea67999924c4f673b66de16e8fc89107422ebe1dd7a2f13d9a0e0b4d829`
+is executor-reported, not independently readable by this worker. Board refused writes, spawning was
+disabled, update false, limits Claude 0 / Codex 3. Production sender evidence remains separate.
+
+The [completed fresh comparison](https://github.com/alexkirs/taskq/issues/595#issuecomment-6087977620)
+reports these sequential one-shot app observations with unchanged scope and inputs above:
+
+| Variant / app PM identity | ARM-input observed sequence | Additional next wait | Access interventions / wording clarification | Full qualification |
+|---|---|---|---|---|
+| C / `01a12221-7e86-72ac-ab3d-c26141388099` | arm, tick, wait returning tick, handling tick | None | 1 initial fixture-local pm write retry / 0 observed | BLOCKED: no idle wake or running next wait |
+| I / `01a12224-ecea-7181-bd79-7f28b1aae088` | arm, status/read-only wrapper inspection, tick, wait returning tick, handling tick | Invoked, returned tick; completed | 1 initial fixture-local pm write retry / 0 observed | BLOCKED: no idle wake or running next wait |
+| H / `01a12228-8f25-74d8-973b-a46e9885a0a8` | arm, tick, wait returning tick, handling tick | None | 1 initial fixture-local pm write retry / 0 observed | BLOCKED: no idle wake or running next wait |
+
+All post-access reported commands exit 0. C waits were approximately 4.97 s; I waits 4.974 s and
+4.970 s; H waits 4.958 s in its PM turn and 4.963 s in its ARM turn. These are completed foreground
+wait durations, never idle-wake latency. Exact send/receipt UTC, full sanitized role output, runtime
+version/model/effort, continuing monitor identity and sender capability names are unknown in these
+comments. C used baseline contract `6aaff37c4277`; I/H used candidate plus the exact overlays above.
+Source revision, trial order, context and access-retry confounds prevent causal attribution to wording.
+
+The earlier interrupted C trial is excluded: approval rejected its initial follow-on tick, a scheduled
+ARM input arrived before the stop instruction, and fixture wait access then blocked. This is approval/
+access interruption with protocol deviation, not a prompt-understanding failure or valid comparison.
+Fresh C already executed returned instructions after supported access resolution. Foreground ARM
+handling was observed in 3/3 trials; additional next-wait invocation in 1/3 (I); full persistent ARM
+successes 0/3 qualified. No winning overlay or general Codex defect is established. Omitted continuing
+wait actions cannot be classified as wording failures when supported monitor/sender access is missing.
+
+### Concrete remaining executor handoff and gates
+
+Reuse only an already approved fresh isolated app target above, separately labeled transport
+qualification, through the existing PM/app executor. Do not repeat C/I/H or the guided production-PM
+probe. Privately verify the existing isolated harness revision and safe monitor/wait identity first.
+No production wait consumption, replacement monitor/session/bridge, unsupported resume, CLI startup
+retry, foreign adoption/rebinding or security/model/effort/credential changes.
+
+Within one existing safety window (at most 10 minutes), the existing authorized independent sender
+must forward actual isolated `taskq wait --pm <selected isolated PM id>` output verbatim after observed
+PM idle. Record UTC idle/send/receipt, target turn/tool identifier and actual output; observe isolated
+tick completion and the intended sender/session entering its next targeted **running** wait with a
+safe handle. Repeat identical `taskq arm tick` once and inspect the same monitor/wait identity for no
+duplicate. Observe paused and foreign ownership only through existing approved isolated fixtures.
+Missing sender, fixture or monitor inspection stops that step BLOCKED; no workaround is provisioned.
+
+This worker can integrate evidence and run isolated repository tests, but its callable inventory has
+no supported `send_message_to_thread` or established DOT execution-child route. The missing action
+belongs to the existing executor, not renewed broad owner authorization. Ask only for an exact missing
+scope/access prerequisite if that executor cannot observe the approved isolated target/wait.
+
+The prior full macOS gate remains FAILED in unchanged Linux-only HermesNativeBoundary. Existing
+exact-head CI at 64661cd has two SUCCESS checks; it does not repair the local platform failure or prove
+app wake. This continuation changes research documentation only; no code/test edit or platform shim.
+Required applicable final checks, isolated live evidence and independent exact-head supervisor review
+remain HOLD before acceptance/main publication/deployment. Unique id/link regressions stay retained;
+no overlay implementation or redundant benchmark is justified by this sample.

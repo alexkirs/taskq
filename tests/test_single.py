@@ -521,6 +521,170 @@ class FakeRuntime:
                 del self.sessions[session]
 
 
+class HermesAdmission(Base):
+    def setUp(self):
+        super().setUp()
+        self.native, self.worker = FakeRuntime(), FakeRuntime()
+        self.native.available = lambda: True
+        self.bridge = taskq.Hermes(self.native)
+        self.kinds = {'hermes': self.bridge, 'codex': self.worker}
+        taskq.CONFIG.update(limits={'codex': 1}, repo='o/r')
+        self.patch = mock.patch.object(taskq, 'runtimes', return_value=self.kinds)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+
+    def native_env(self, sid=SESSION):
+        return mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'hermes', 'HERMES_SESSION_ID': sid})
+
+    def test_identity_no_codex_impersonation(self):
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'hermes', 'CODEX_THREAD_ID': SESSION}, clear=True):
+            with self.assertRaisesRegex(SystemExit, 'genuine HERMES_SESSION_ID'):
+                self.add()
+            self.assertEqual(self.board.issues, {})
+        with mock.patch.dict(os.environ, {'HERMES_SESSION_ID': '   '}, clear=True):
+            with self.assertRaisesRegex(SystemExit, 'genuine HERMES_SESSION_ID'):
+                taskq.session()
+        with self.native_env():
+            self.assertEqual(taskq.session(), {'runtime': 'hermes', 'session': SESSION})
+            self.assertNotIn('HERMES_SESSION_ID', taskq.worker_env())
+            self.assertNotIn('CODEX_THREAD_ID', taskq.worker_env())
+        with mock.patch.dict(os.environ, {'HERMES_SESSION_ID': SESSION, 'CODEX_THREAD_ID': 'codex'}, clear=True):
+            with self.assertRaisesRegex(SystemExit, 'ambiguous'):
+                taskq.session()
+
+    def test_native_supervisor_then_codex_worker(self):
+        with self.native_env():
+            self.add('native', '--runtime', 'codex')
+        item = self.task(1)
+        self.assertEqual(item['pm']['runtime'], 'hermes')
+        self.assertEqual(item['supervisor']['runtime'], 'hermes')
+        self.assertIsNone(item['claim']['session'])
+        self.assertEqual(self.native.names, ['S1 HRM native (mac)'])
+        self.assertFalse(self.worker.sessions)
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_THREAD_ID': 's-S1'}):
+            with self.assertRaisesRegex(SystemExit, 'only it'):
+                self.run_cli('run', '1')
+        with self.native_env('s-S1'):
+            self.run_cli('run', '1')
+        self.assertEqual(self.task(1)['claim']['runtime'], 'codex')
+        self.assertEqual(self.worker.names, ['T1 HRM native (mac)'])
+        self.native.sessions['s-S1'] = 'idle'
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_THREAD_ID': 's-T1'}):
+            self.run_cli('result', '1', '--sha', 'a' * 40)
+        self.assertIn('review #1', self.native.sent[-1][1])
+        self.assertFalse(self.worker.sent)
+
+    def test_bridge_failure_preserves_board_and_order(self):
+        with self.native_env():
+            self.add('native', '--runtime', 'codex')
+        item = self.task(1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(item, 'doing', 'run', order='run')
+        before = self.board.get(1)['body']
+        for available, state in ((False, True), (True, None), (True, 'invalid')):
+            with self.subTest(available=available, state=state):
+                self.native.available = lambda: available
+                self.native.sessions['s-S1'] = state
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    self.run_cli('tick', '--quiet')
+                self.assertRegex(errors.getvalue(), 'unavailable|state unknown')
+                self.assertEqual(self.board.get(1)['body'], before)
+                self.assertFalse(self.worker.sessions)
+        self.native.available = lambda: True
+        self.native.sessions['s-S1'] = False
+        self.run_cli('tick', '--quiet')
+        self.assertFalse(self.worker.sessions)  # dead supervisor recovered first
+        self.assertEqual(self.task(1)['supervisor']['session'], 's-S1.1')
+        self.assertEqual(self.task(1)['raw']['order'], 'run')
+        self.run_cli('tick', '--quiet')
+        self.assertTrue(self.worker.sessions)
+
+    def test_runtime_file_boundary_with_fake_downstream(self):
+        path = self.root / 'hermes.py'
+        path.write_text("""def available(): return True
+def spawn(name, prompt, cwd):
+    assert name.startswith('S1 HRM ')
+    return 'fixture-native-session'
+def send(session, text): return session
+def alive(session): return True
+def link(session): return None
+def state(session): return 'idle'
+def retire(gone, running=True): pass
+""")
+        taskq.CONFIG['runtimes'] = {'hermes': 'hermes.py'}
+        adapter = taskq.Hermes(taskq.load_file('hermes.py'))
+        self.assertEqual(adapter.spawn('S1 HRM native (mac)', 'prompt', self.root), 'fixture-native-session')
+        self.assertEqual(adapter.state('fixture-native-session'), 'idle')
+        self.assertEqual(adapter.send('fixture-native-session', 'review #1'), 'fixture-native-session')
+
+    def test_missing_bridge_and_required_lifecycle_fail_closed(self):
+        item = {'pm': {'runtime': 'hermes', 'session': SESSION}}
+        with self.assertRaisesRegex(SystemExit, 'not configured'):
+            taskq.lead(item, {'codex': self.worker}, admit=True)
+        item['pm']['session'] = None
+        with self.assertRaisesRegex(SystemExit, 'genuine HERMES_SESSION_ID'):
+            taskq.lead(item, self.kinds, admit=True)
+        del self.native.available
+        with self.assertRaisesRegex(SystemExit, 'needs spawn/send'):
+            self.bridge.spawn('S1 HRM native (mac)', 'prompt', self.root)
+        self.native.available = lambda: True
+        with mock.patch.object(self.native, 'spawn', return_value=None):
+            with self.assertRaisesRegex(SystemExit, 'no genuine session id'):
+                self.bridge.spawn('S1 HRM native (mac)', 'prompt', self.root)
+        with self.native_env():
+            out = self.run_cli('arm', 'tick')
+        self.assertIn('No Codex resume route', out)
+        self.assertNotIn('codex exec', out)
+
+    def test_wait_native_wake_failure_preserves_receipt_then_delivers_once(self):
+        with self.native_env():
+            self.add('native', '--runtime', 'codex')
+        item = self.task(1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(item, 'ask', 'ask', 'Need owner decision')
+        self.native.sessions[SESSION] = 'idle'
+        self.native.owned = lambda sid: sid == SESSION
+        receipt = self.root / '.taskq' / f'wait-{SESSION}.json'
+        receipt.write_text(json.dumps({'1': 'doing'}))
+        before = receipt.read_bytes()
+        self.native.wake_manager = mock.Mock(side_effect=TimeoutError('no verified message.complete'))
+        with self.native_env():
+            with self.assertRaisesRegex(SystemExit, 'wake failed.*receipt unchanged'):
+                self.run_cli('wait', '--window', '0')
+        self.assertEqual(receipt.read_bytes(), before)
+        self.native.wake_manager = mock.Mock(return_value=SESSION)
+        with self.native_env():
+            self.assertEqual(self.run_cli('wait', '--window', '0'), 'ask #1\n')
+            self.assertEqual(self.run_cli('wait', '--window', '0'), 'tick\n')
+        self.native.wake_manager.assert_called_once_with(SESSION, 'ask #1')
+        self.assertEqual(json.loads(receipt.read_text()), {'1': 'ask'})
+
+    def test_wait_busy_unknown_and_foreign_manager_never_consume_for_wake(self):
+        with self.native_env():
+            self.add('native', '--runtime', 'codex')
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'ask', 'ask', 'Need owner decision')
+        self.native.owned = lambda sid: sid == SESSION
+        self.native.wake_manager = mock.Mock(return_value=SESSION)
+        receipt = self.root / '.taskq' / f'wait-{SESSION}.json'
+        for status in (True, None):
+            self.native.sessions[SESSION] = status
+            with self.native_env(), self.assertRaises(SystemExit):
+                self.run_cli('wait', '--window', '0')
+            self.assertFalse(receipt.exists())
+        self.native.wake_manager.assert_not_called()
+        with self.native_env('different-manager'):
+            self.assertEqual(self.run_cli('wait', '--pm', SESSION, '--window', '0'), 'ask #1\n')
+        self.native.wake_manager.assert_not_called()  # --pm is no cross-gateway attach
+        self.native.owned = lambda sid: False
+        receipt.unlink()
+        with self.native_env():
+            self.assertEqual(self.run_cli('wait', '--window', '0'), 'ask #1\n')
+        self.native.wake_manager.assert_not_called()  # ordinary printing works without an owned handle
+
+
+
 class TickSetup(Base):
     """Fixture only, no tests (#534, § 10): a fake runtime and a manager for Tick and Wait."""
 
@@ -613,7 +777,7 @@ class Tick(TickSetup):
         wrapper = '| [#7](https://board/7) | doing | codex | [019a-thr](https://alexkirs.github.io/taskq/open.html#codex://threads/019a-thread-full-id) |'
         sources = {'codex': {'CODEX_THREAD_ID': 'mgr'}, 'claude': {'CLAUDE_CODE_SESSION_ID': 'mgr'}, 'shell': {},
                    'claude from codex': {'CLAUDE_CODE_SESSION_ID': 'mgr', 'CODEX_THREAD_ID': 'x', 'TASKQ_RUNTIME': 'claude'},
-                   'unknown runtime': {'CODEX_THREAD_ID': 'x', 'TASKQ_RUNTIME': 'hermes'},
+                   'unknown runtime': {'CODEX_THREAD_ID': 'x', 'TASKQ_RUNTIME': 'grok'},
                    # #574: the final rendering client wins over the session running the command, never the worker's runtime
                    'final codex, run in claude': {'CLAUDE_CODE_SESSION_ID': 'mgr', 'TASKQ_CLIENT': 'codex'},
                    'final claude, run in codex': {'CODEX_THREAD_ID': 'mgr', 'TASKQ_CLIENT': 'claude'},
@@ -1363,7 +1527,9 @@ class Tick(TickSetup):
             taskq.CONFIG['limits'] = {'fake': 2}
             self.add('two')
             self.assertEqual((self.task(2)['state'], len(lead.names)), ('ready', 1))
-            self.assertIn('| [#2 two](https://board/2) | blocked (no manager) | any |  |', self.run_cli('tick'))
+            with self.assertRaisesRegex(SystemExit, 'Hermes native supervisor bridge is not configured'):
+                self.run_cli('tick')
+            self.assertIn('| [#2 two](https://board/2) | blocked (no manager) | any |  |', self.run_cli('status'))
 
     def test_one_controller_under_duplicate_events(self):
         # R3 (#525): run and close come from the supervisor, the manager or the owner; repeats spawn nothing more
@@ -2291,6 +2457,559 @@ class RealChild(unittest.TestCase):
             taskq.time.sleep(0.1)
         self.assertEqual((root / 'spawned').read_text() if (root / 'spawned').exists() else None, 'S1 UNK T (mac)', log)
         self.assertRegex(log, r'^\S+ \S+ add #1\n#1 doing\n')
+
+
+class HermesNativeBoundary(unittest.TestCase):
+    """Real owner/stdin boundary, protocol-accurate fake downstream; optional real Hermes."""
+    def setUp(self):
+        artifacts = ROOT / '.taskq' / 'native-tests'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix='tq-h-', dir=str(artifacts))
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.runtime = taskq.load_file('runtimes/hermes.py', ROOT)
+        self.runtime.folder = lambda: self.root / '.taskq'
+        self.runtime.host = lambda: taskq
+        self.addCleanup(self.shutdown)
+
+    def shutdown(self):
+        # Explicit teardown of only this fixture's verified owners, including failed setup.
+        for endpoint in self.runtime.folder().glob('*.ipc'):
+            owner = json.loads((endpoint / 'owner.json').read_text())
+            self.runtime.request(endpoint, '_stop', expected=owner)
+            import time
+            end = time.monotonic() + 8
+            while self.runtime.birth(owner['pid']) == owner['birth'] and time.monotonic() < end:
+                time.sleep(.02)
+            self.assertNotEqual(self.runtime.birth(owner['pid']), owner['birth'], 'fixture owner survived teardown')
+            self.assertIsNone(self.runtime.birth(owner['gateway']['pid']), 'gateway survived teardown')
+
+    def fake(self, mode='normal'):
+        gateway = self.root / 'gateway.py'
+        gateway.write_text(HERMES_TUI_FIXTURE)
+        return mock.patch.dict(os.environ, {'HERMES_HOME': str(self.root), 'FAKE_HERMES_MODE': mode,
+            'TASKQ_HERMES_COMMAND': json.dumps([sys.executable, str(gateway)])})
+
+    def exercise(self):
+        prompt = 'Compute 17 + 25. Reply with decimal answer only. Do not use tools.'
+        sid = self.runtime.spawn('S1 HRM isolated (test)', prompt, self.root)
+        self.assertNotEqual(sid, self.runtime.data_for(sid)['runtime_id'])
+        payload = self.runtime.completed(sid)
+        self.assertEqual(payload['text'].strip(), '42')
+        self.assertNotIn('42', prompt)  # proof cannot come from finding expected text in a user prompt
+        receipt = payload['persisted_turn']
+        self.assertNotEqual(receipt['user_row_id'], receipt['final_assistant_row_id'])
+        self.assertEqual(self.runtime.state(sid), 'idle')
+        self.assertTrue(self.runtime.alive(sid))  # idle worker is not dead
+        self.assertEqual(self.runtime.wake_manager(sid, 'Compute 19 + 23. Decimal answer only. No tools.'), sid)
+        data = self.runtime.data_for(sid)
+        events = [json.loads(line) for line in Path(data['endpoint']).with_suffix('.events.jsonl').read_text().splitlines()]
+        self.assertEqual(len({event['submit'] for event in events if event['event']['type'] == 'message.complete'}), 2)
+        self.runtime.retire(lambda *args: True)
+        self.assertEqual(self.runtime.state(sid), 'dead')
+        self.assertFalse(list(self.runtime.folder().glob('h-*.handle.json')))
+        self.assertIsNone(self.runtime.birth(data['owner']['pid']))
+        self.assertIsNone(self.runtime.birth(data['owner']['gateway']['pid']))
+        self.assertTrue(Path(data['endpoint']).with_suffix('.exit.json').exists())
+
+    def test_real_stdio_model_events_and_retirement(self):
+        with self.fake():
+            self.exercise()
+
+    def test_prompt_echo_wrong_event_and_failed_completion_never_pass(self):
+        for mode in ('echo_only', 'wrong_session', 'error_complete', 'wrong_receipt'):
+            with self.subTest(mode=mode), self.fake(mode):
+                sid = self.runtime.spawn('S1 HRM isolated (test)', 'Say 42; user text contains 42.', self.root)
+                with self.assertRaises((ValueError, TimeoutError)):
+                    self.runtime.completed(sid, timeout=.3)
+                # Reading an echoed prompt is insufficient even when it contains the answer.
+                history = self.runtime.call(sid, 'session.history')['messages']
+                self.assertIn('42', history[0]['text'])
+                self.runtime.stop(sid)
+
+    def test_identical_prompt_replay_cannot_consume_wait(self):
+        with self.fake('replay_identical_delayed'):
+            sid = self.runtime.spawn('PM HRM isolated (test)', 'ask #1', self.root)
+            first = self.runtime.completed(sid)['persisted_turn']
+            previous_token = self.runtime.data_for(sid)['turn']
+            completed = self.runtime.completed
+
+            def short_completion(session, timeout=None):
+                self.assertNotEqual(self.runtime.data_for(session)['turn'], previous_token)
+                try:
+                    return completed(session, timeout=.3 if timeout is None else timeout)
+                except TimeoutError as error:
+                    self.assertEqual(str(error), 'Hermes message.complete/idle proof deadline exceeded')
+                    raise
+
+            board = FakeBoard()
+            raw = {'pm': {'runtime': 'hermes', 'session': sid, 'name': 'test'}}
+            board.add('Need owner', '<!-- taskq:start -->\n```json\n' + json.dumps(raw) + '\n```\n<!-- taskq:end -->', ['q-ask'])
+            receipt = self.root / '.taskq' / f'wait-{sid}.json'
+            with mock.patch.object(taskq, 'BOARD', board), \
+                    mock.patch.object(taskq, 'CONFIG', {'root': self.root, 'board': 'board.py', 'publish': 'direct', 'hosts': {}}), \
+                    mock.patch.object(taskq, 'CLONE', self.root), \
+                    mock.patch.object(taskq, 'runtimes', return_value={'hermes': taskq.Hermes(self.runtime)}), \
+                    mock.patch.object(self.runtime, 'completed', side_effect=short_completion) as completion_wait, \
+                    mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'hermes', 'HERMES_SESSION_ID': sid, 'TASKQ_HOST': 'test'}):
+                with self.assertRaisesRegex(SystemExit, r'^taskq: Hermes manager wake failed \(TimeoutError\); event receipt unchanged$'), contextlib.redirect_stdout(io.StringIO()):
+                    taskq.main(['wait', '--window', '0'])
+                completion_wait.assert_called_once_with(sid)  # admission finished; only proof timed out
+                self.assertTrue((self.root / 'admission-delayed').exists())
+                self.assertFalse(receipt.exists(), 'old completion consumed the board event')
+                data = self.runtime.data_for(sid)
+                self.assertNotEqual(data['turn'], previous_token)
+                turn = self.runtime.call(sid, '_turn', turn=data['turn'])
+                self.assertTrue(turn['started'])
+                self.assertIsNone(turn['complete'])
+                self.assertEqual(turn['boundary'], first['final_assistant_row_id'])
+                events = [json.loads(line) for line in Path(data['endpoint']).with_suffix('.events.jsonl').read_text().splitlines()]
+                replayed = [row['event']['payload']['persisted_turn'] for row in events
+                            if row['submit'] == data['turn'] and row['event']['type'] == 'message.complete']
+                self.assertEqual(replayed, [first], 'test must reject the actual old receipt under the new token')
+                (self.root / 'release-real').touch()
+                self.runtime.call(sid, 'session.history')  # fixture releases delayed native event on next RPC
+                actual = self.runtime.completed(sid, timeout=1)['persisted_turn']
+                self.assertGreater(actual['user_row_id'], first['final_assistant_row_id'])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    taskq.main(['wait', '--window', '0'])
+                self.assertEqual(json.loads(receipt.read_text()), {'1': 'ask'})
+            self.runtime.stop(sid)
+
+    def test_admission_timeout_reproduces_stale_handle_token(self):
+        with self.fake('replay_identical_held'):
+            sid = self.runtime.spawn('PM HRM isolated (test)', 'ask #1', self.root)
+            self.runtime.completed(sid)
+            previous_token = self.runtime.data_for(sid)['turn']
+            request = self.runtime.request
+            clock = self.runtime.time.monotonic
+            marker = self.root / 'admission-delayed'
+
+            def expire_admission(path, method, params=None, expected=None):
+                if method != '_submit':
+                    return request(path, method, params, expected)
+                start = clock()
+
+                def admission_clock():
+                    if clock() - start > 5:
+                        self.fail('fixture never reached native prompt admission')
+                    # Expire only after the owner replaced its token, before the delayed reply.
+                    return start + self.runtime.WAIT + 1 if marker.exists() else start
+                with mock.patch.object(self.runtime.time, 'monotonic', side_effect=admission_clock):
+                    return request(path, method, params, expected)
+
+            with mock.patch.object(self.runtime, 'request', side_effect=expire_admission):
+                with self.assertRaisesRegex(TimeoutError, '^Hermes RPC deadline exceeded; delivery unknown$'):
+                    self.runtime.send(sid, 'ask #1')
+            (self.root / 'release-admission').touch()
+            self.assertEqual(self.runtime.data_for(sid)['turn'], previous_token)
+            with self.assertRaisesRegex(ValueError, '^Hermes RPC failed: KeyError$'):
+                self.runtime.call(sid, '_turn', turn=previous_token)
+            self.runtime.stop(sid)
+
+    def test_missing_persisted_history_boundary_refuses_submit(self):
+        with self.fake('missing_history'):
+            with self.assertRaisesRegex(ValueError, 'history boundary unavailable'):
+                self.runtime.spawn('S1 HRM isolated (test)', 'unused', self.root)
+        self.assertNotIn('prompt.submit', json.loads((self.root / 'calls.json').read_text()))
+
+    def test_unpersisted_title_never_resumes_or_submits(self):
+        with self.fake('unpersisted'):
+            with self.assertRaisesRegex(taskq.Unnamed, 'persistence not confirmed'):
+                self.runtime.spawn('S1 HRM isolated (test)', 'unused', self.root)
+        self.assertFalse(list(self.runtime.folder().glob('*.ipc')))
+        calls = json.loads((self.root / 'calls.json').read_text())
+        self.assertNotIn('session.resume', calls)
+        self.assertNotIn('prompt.submit', calls)
+        self.runtime.retire(lambda *args: True)
+
+    def test_busy_at_owner_admission_is_refused(self):
+        with self.fake('busy_at_submit'):
+            with self.assertRaisesRegex(ValueError, 'busy/unknown'):
+                self.runtime.spawn('S1 HRM isolated (test)', 'unused', self.root)
+        self.assertNotIn('prompt.submit', json.loads((self.root / 'calls.json').read_text()))
+        self.assertFalse(list(self.runtime.folder().glob('*.ipc')))
+
+    def test_unknown_structured_state_and_owner_reuse_fail_closed(self):
+        for snapshot in ({'output': 'Agent Running: No'}, {'running': False},
+                         {'session_id': 'live', 'session_key': 'stored', 'running': False, 'hydrating': True},
+                         {'session_id': 'other', 'session_key': 'stored', 'running': False}):
+            self.assertIsNone(self.runtime.snapshot_state(snapshot, 'stored', 'live'))
+        self.assertEqual(self.runtime.snapshot_state({'session_id': 'live', 'session_key': 'stored', 'running': False}, 'stored', 'live'), 'idle')
+        endpoint = self.root / 'reused.ipc'
+        endpoint.mkdir()
+        owner = {'pid': os.getpid(), 'birth': 'not-the-current-birth', 'nonce': 'old'}
+        (endpoint / 'owner.json').write_text(json.dumps(owner))
+        with self.assertRaisesRegex(ConnectionRefusedError, 'identity changed'):
+            self.runtime.request(endpoint, '_stop', expected=owner)
+        self.assertEqual(sorted(path.name for path in endpoint.iterdir()), ['owner.json'])
+        self.assertTrue(self.runtime.birth(os.getpid()))
+
+    def test_owner_sigterm_kills_gateway_children_and_keeps_evidence(self):
+        with self.fake('child'):
+            sid = self.runtime.spawn('S1 HRM isolated (test)', 'Compute 17 + 25.', self.root)
+            self.runtime.completed(sid)
+            data = self.runtime.data_for(sid)
+            fd = self.runtime.owner_fd(data['owner'])
+            try:
+                self.runtime.signal.pidfd_send_signal(fd, self.runtime.signal.SIGTERM)
+            finally:
+                os.close(fd)
+            import time
+            deadline = time.monotonic() + 8
+            while self.runtime.birth(data['owner']['pid']) == data['owner']['birth'] and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertEqual(self.runtime.state(sid), 'dead')
+            self.assertIsNone(self.runtime.birth(data['owner']['gateway']['pid']))
+            child = json.loads((self.root / 'child.json').read_text())
+            self.assertNotEqual(self.runtime.birth(child['pid']), child['birth'])
+            self.assertTrue(Path(data['endpoint']).with_suffix('.events.jsonl').exists())
+            self.assertTrue(Path(data['endpoint']).with_suffix('.exit.json').exists())
+            self.runtime.retire(lambda *args: True)
+
+    def test_current_wait_requires_exact_native_completion_before_receipt(self):
+        with self.fake():
+            sid = self.runtime.spawn('PM HRM isolated (test)', 'Compute 17 + 25.', self.root)
+            self.runtime.completed(sid)
+            board = FakeBoard()
+            raw = {'pm': {'runtime': 'hermes', 'session': sid, 'name': 'test'}}
+            board.add('Need owner', '<!-- taskq:start -->\n```json\n' + json.dumps(raw) + '\n```\n<!-- taskq:end -->', ['q-ask'])
+            config = {'root': self.root, 'board': 'board.py', 'publish': 'direct', 'hosts': {}}
+            env = {'TASKQ_RUNTIME': 'hermes', 'HERMES_SESSION_ID': sid, 'TASKQ_HOST': 'test'}
+            with mock.patch.object(taskq, 'BOARD', board), mock.patch.object(taskq, 'CONFIG', config), \
+                    mock.patch.object(taskq, 'CLONE', self.root), \
+                    mock.patch.object(taskq, 'runtimes', return_value={'hermes': taskq.Hermes(self.runtime)}), \
+                    mock.patch.dict(os.environ, env):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    taskq.main(['wait', '--window', '0'])
+                self.assertEqual(out.getvalue(), 'ask #1\n')
+                data = self.runtime.data_for(sid)
+                turn = self.runtime.call(sid, '_turn', turn=data['turn'])
+                self.assertEqual(turn['prompt'], 'ask #1')
+                self.assertTrue(turn['started'])
+                self.assertEqual(turn['complete']['status'], 'complete')
+                self.assertTrue(turn['complete']['persisted_turn']['complete'])
+                receipt = self.root / '.taskq' / f'wait-{sid}.json'
+                self.assertEqual(json.loads(receipt.read_text()), {'1': 'ask'})
+                with contextlib.redirect_stdout(io.StringIO()):
+                    taskq.main(['wait', '--window', '0'])
+                self.assertEqual(self.runtime.data_for(sid)['turn'], data['turn'])
+            self.runtime.stop(sid)
+
+    def test_installed_hermes_isolated(self):
+        home, command = os.environ.get('TASKQ_HERMES_TEST_HOME'), os.environ.get('TASKQ_HERMES_COMMAND')
+        if not home or not command:
+            self.skipTest('BLOCKER: explicitly supply pre-provisioned isolated TASKQ_HERMES_TEST_HOME and TASKQ_HERMES_COMMAND; no credentials copied')
+        home = Path(home).resolve()
+        if home == (Path.home() / '.hermes').resolve() or not (home / 'config.yaml').is_file():
+            self.skipTest('BLOCKER: isolated config.yaml unavailable or default home refused')
+        # Named profiles may use Hermes's root pool fallback without local auth files.
+        # Explicit home/command opt in; the actual protocol/model boundary proves auth.
+        with mock.patch.dict(os.environ, {'HERMES_HOME': str(home)}):
+            self.exercise()
+
+
+class HermesPilotLocal(unittest.TestCase):
+    """No models/auth: real disposable Git/file-board boundary and profile admission."""
+    def setUp(self):
+        artifacts = ROOT / '.taskq' / 'pilot-tests'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=artifacts)
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.pilot = taskq.load_file('runtimes/hermes_pilot.py', ROOT)
+
+    def test_repeated_runs_have_distinct_native_names_and_hosts(self):
+        item = {'iid': 1, 'title': 'Same research task', 'pm': {'runtime': 'hermes'}}
+        names = []
+        for suffix in ('0123456789ab', 'fedcba987654'):
+            identity = self.pilot.run_identity(self.root / ('hermes-pilot-' + suffix))
+            self.assertEqual(identity['host'], 'local-pilot-' + suffix)
+            self.assertEqual(identity['manager_name'], f"PM HRM local pilot ({identity['host']})")
+            with mock.patch.dict(os.environ, {'TASKQ_HOST': identity['host']}), \
+                    mock.patch.object(taskq, 'CONFIG', {'hosts': {}}):
+                supervisor = taskq.worker_name(item, 'S')
+                worker = taskq.worker_name(item, 'T')
+            self.assertEqual(supervisor, f"S1 HRM Same research task ({identity['host']})")
+            self.assertEqual(worker, f"T1 HRM Same research task ({identity['host']})")
+            names.append((identity['manager_name'], supervisor, worker))
+        for first, second in zip(*names):
+            self.assertNotEqual(first, second)
+
+    def test_unnamed_evidence_retains_safe_title_code_without_provider_body(self):
+        error = taskq.Unnamed('native-session', ValueError('Hermes RPC failed: Hermes session.title refused (code 4022)'))
+        evidence_reason = self.pilot.topology_failure(error)
+        self.assertIn('Unnamed: session.title code 4022', evidence_reason)
+        self.assertIn('fresh pilot fixture', evidence_reason)
+        self.assertNotIn('native-session', evidence_reason)
+        unknown = taskq.Unnamed('native-session', ValueError('provider secret body'))
+        self.assertNotIn('provider secret body', self.pilot.topology_failure(unknown))
+        self.assertIn('exception body withheld', self.pilot.topology_failure(unknown))
+        pending = taskq.Unnamed('native-session', ValueError('Hermes stored row/native title persistence not confirmed'))
+        self.assertIn('persistence not confirmed', self.pilot.topology_failure(pending))
+
+    def test_supervisor_must_be_distinct_from_manager_and_ids_are_recorded(self):
+        evidence = {}
+        with self.assertRaisesRegex(ValueError, 'SID equals manager SID'):
+            self.pilot.record_supervisor(evidence, 'manager', 'manager')
+        self.assertEqual(evidence, {})
+        self.pilot.record_supervisor(evidence, 'manager', 'supervisor')
+        self.assertEqual(evidence['sessions'], {'manager': 'manager', 'supervisor': 'supervisor'})
+
+    def test_provenance_includes_harness_and_rejects_changes(self):
+        before = self.pilot.provenance()
+        self.assertIn('runtimes/hermes_pilot.py', before['sha256'])
+        self.assertIn('tests/test_single.py', before['sha256'])
+        self.assertIn('taskq.md', before['sha256'])
+        self.assertRegex(before['head'], r'^[0-9a-f]{40}$')
+        self.pilot.unchanged(before)
+        changed = json.loads(json.dumps(before))
+        changed['sha256']['runtimes/hermes_pilot.py'] = 'changed'
+        with mock.patch.object(self.pilot, 'provenance', return_value=changed):
+            with self.assertRaisesRegex(ValueError, 'changed during pilot'):
+                self.pilot.unchanged(before)
+
+    def test_calculation_contract_prefix_and_codex_wrapper_are_exact(self):
+        supervisor = 'export TASKQ_TASK=1 TASKQ_RUNTIME=hermes && python3 -c "print(17 + 25)"'
+        worker = 'export TASKQ_TASK=1 TASKQ_RUNTIME=codex && python3 -c "print(17 + 25)"'
+        for command in (supervisor, worker, "/bin/bash -lc '" + worker + "'"):
+            with self.subTest(command=command):
+                self.assertTrue(self.pilot.calculation_command(command))
+        # Actual pilot worker combined calculation and SHA lookup: deliberately reject it.
+        recorded_worker = "/bin/bash -lc '" + worker + " && git rev-parse origin/main'"
+        for command in (recorded_worker, supervisor + '; echo 42', supervisor + ' && echo 42',
+                        supervisor.replace('python3 -c "print(17 + 25)"', 'echo 42'),
+                        supervisor.replace('TASKQ_TASK=1', 'TASKQ_TASK=2'),
+                        supervisor.replace('TASKQ_RUNTIME=hermes', 'TASKQ_RUNTIME=other'),
+                        supervisor.replace(' && ', ' ; '),
+                        supervisor.replace(' && ', ' EXTRA=spoof && ')):
+            with self.subTest(command=command):
+                self.assertFalse(self.pilot.calculation_command(command))
+
+    def test_independent_review_requires_successful_tool_in_exact_turn(self):
+        args = {'command': 'export TASKQ_TASK=1 TASKQ_RUNTIME=hermes && python3 -c "print(17 + 25)"'}
+        tool = {'role': 'tool', 'name': 'terminal', 'tool_call_id': 'calc', 'args': args}
+        rows = [{'role': 'user', 'row_id': 10, 'text': 'review #1'}, tool,
+                {'role': 'assistant', 'row_id': 14, 'text': 'closed: 42'}]
+        receipt = {'user_row_id': 10, 'final_assistant_row_id': 14}
+        start = {'tool_id': 'calc', 'name': 'terminal', 'args': args}
+        complete = {**start, 'result': {'output': '42\n', 'exit_code': 0, 'error': None}}
+        turn = {'tools': [{'type': 'tool.start', 'payload': start}, {'type': 'tool.complete', 'payload': complete}]}
+        proof = self.pilot.supervisor_calculation({'messages': rows}, turn, receipt)
+        self.assertEqual(proof['tool_id'], 'calc')
+        for history, events in ((rows, {'tools': []}), (rows[:1]+rows[2:], turn),
+                                ([tool]+rows[:1]+rows[2:], turn), (rows, {'tools': turn['tools'][1:]})):
+            with self.assertRaisesRegex(ValueError, 'lacks successful calculation'):
+                self.pilot.supervisor_calculation({'messages': history}, events, receipt)
+        self.assertFalse(self.pilot.calculation_command('echo \"print(17 + 25)\"; echo 42'))
+        complete['result']['exit_code'] = 1
+        with self.assertRaises(ValueError):
+            self.pilot.supervisor_calculation({'messages': rows}, turn, receipt)
+
+    def test_worker_echo_is_not_calculation_evidence(self):
+        path = self.root / 'T1.log'
+        events = [{'type': 'thread.started', 'thread_id': 'worker'},
+                  {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': '42'}}]
+        path.write_text('\n'.join(map(json.dumps, events)))
+        with self.assertRaises(ValueError):
+            self.pilot.worker_calculation(path, 'worker')
+        events.append({'type': 'item.completed', 'item': {'id': 'calc', 'type': 'command_execution',
+                      'command': '/bin/bash -lc \'export TASKQ_TASK=1 TASKQ_RUNTIME=codex && python3 -c "print(17 + 25)"\'', 'status': 'completed', 'exit_code': 0, 'aggregated_output': '42\n'}})
+        path.write_text('\n'.join(map(json.dumps, events)))
+        self.assertEqual(self.pilot.worker_calculation(path, 'worker')['item_id'], 'calc')
+        with self.assertRaises(ValueError):
+            self.pilot.worker_calculation(path, 'other-worker')
+
+    def args(self, hermes, codex):
+        return taskq.argparse.Namespace(hermes_home=str(hermes), codex_home=str(codex),
+            hermes_command=json.dumps([sys.executable, '-m', 'tui_gateway.entry']), run=True, auth_ready=False)
+
+    def test_named_profile_without_auth_file_or_env_is_accepted_default_is_refused(self):
+        project = self.root / 'project'
+        project.mkdir()
+        profile = self.root / 'global' / 'profiles' / 'taskqpilot20261009'
+        profile.mkdir(parents=True)
+        (profile / 'config.yaml').write_text('model: fixture\n')
+        codex = project / 'codex'
+        codex.mkdir()
+        (codex / 'config.toml').write_text('')
+        args = self.args(profile, codex)
+        with mock.patch.object(self.pilot, 'ROOT', project), \
+                mock.patch.object(self.pilot.shutil, 'which', return_value='/fixture/codex'), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.pilot.preflight(args), [])
+            args.hermes_home = str(Path.home() / '.hermes')
+            self.assertTrue(any('default home refused' in item for item in self.pilot.preflight(args)))
+        self.assertEqual(sorted(path.name for path in profile.iterdir()), ['config.yaml'])
+        self.assertFalse((codex / 'auth.json').exists())  # runtime, not file existence, determines auth
+
+    def test_existing_default_codex_home_only_when_explicit_no_auth_or_config_writes(self):
+        project = self.root / 'project'
+        project.mkdir()
+        user = self.root / 'user'
+        profile = user / '.hermes' / 'profiles' / 'pilot'
+        profile.mkdir(parents=True)
+        (profile / 'config.yaml').write_text('model: fixture\n')
+        codex = user / '.codex'
+        codex.mkdir()
+        config = codex / 'config.toml'
+        config.write_text('# existing fixture config\n')
+        before = config.read_bytes()
+        args = self.args(profile, codex)
+        with mock.patch.object(self.pilot, 'ROOT', project), mock.patch.object(Path, 'home', return_value=user), \
+                mock.patch.object(self.pilot.shutil, 'which', return_value='/fixture/codex'), \
+                mock.patch.dict(os.environ, {'HOME': str(user), 'CODEX_HOME': str(codex)}, clear=True):
+            self.assertEqual(self.pilot.preflight(args), [])
+            args.codex_home = '~/.codex'
+            self.assertEqual(self.pilot.preflight(args), [])
+            args.codex_home = None
+            self.assertTrue(any('Codex: explicitly supplied' in item for item in self.pilot.preflight(args)))
+            args.codex_home = str(codex)
+            args.hermes_home = str(user / '.hermes')
+            self.assertTrue(any('default home refused' in item for item in self.pilot.preflight(args)))
+        self.assertEqual(config.read_bytes(), before)
+        self.assertEqual(sorted(path.name for path in codex.iterdir()), ['config.toml'])
+
+    def test_optional_hermes_named_profile_has_no_local_auth_assertion_gate(self):
+        profile = self.root / 'profiles' / 'pilot'
+        profile.mkdir(parents=True)
+        (profile / 'config.yaml').write_text('model: fixture\n')
+        check = HermesNativeBoundary('test_installed_hermes_isolated')
+        # This tests opt-in selection only. No gateway/model/auth is mocked as successful.
+        def selected():
+            self.assertEqual(os.environ['HERMES_HOME'], str(profile.resolve()))
+            self.assertNotIn('TASKQ_HERMES_TEST_AUTH_READY', os.environ)
+        check.exercise = mock.Mock(side_effect=selected)
+        with mock.patch.dict(os.environ, {'TASKQ_HERMES_TEST_HOME': str(profile),
+                'TASKQ_HERMES_COMMAND': json.dumps([sys.executable, '-m', 'tui_gateway.entry'])}, clear=True):
+            check.test_installed_hermes_isolated()
+        check.exercise.assert_called_once_with()
+        self.assertEqual(sorted(path.name for path in profile.iterdir()), ['config.yaml'])
+
+    def test_disposable_origin_genuine_research_close_without_push(self):
+        (self.root / 'board.py').write_text(self.pilot.FILE_BOARD)
+        (self.root / 'issues.json').write_text('{}')
+        config, seed = self.pilot.prepare(self.root)
+        instructions = (self.root / 'AGENTS.md').read_text()
+        self.assertIn('BOTH worker and supervisor: calculation must be its own terminal tool call, containing only', instructions)
+        for runtime in ('codex', 'hermes'):
+            self.assertIn(f'export TASKQ_TASK=1 TASKQ_RUNTIME={runtime} && python3 -c "print(17 + 25)"', instructions)
+        self.assertIn('Do not chain any other commands onto the calculation.', instructions)
+        self.assertIn('in the next separate terminal tool call, using its required TaskQ export prefix.', instructions)
+        git = taskq.shutil.which('git')
+        def read(*argv):
+            return REAL_RUN([git, '-C', str(self.root), *argv], capture_output=True, text=True, timeout=20)
+        self.assertEqual(read('remote', 'get-url', 'origin').stdout.strip(), str(self.root / 'origin.git'))
+        self.assertEqual(read('rev-parse', 'origin/main').stdout.strip(), seed)
+        bare_before = REAL_RUN([git, '--git-dir', str(self.root / 'origin.git'), 'show-ref'], capture_output=True, text=True, timeout=20).stdout
+        local = taskq.load_file('taskq.py', self.root)
+        local.CONFIG, local.BOARD = config, local.make_board(config)
+        raw = {'claim': {'runtime': 'codex', 'session': 'fixture-worker', 'name': 'local-pilot'},
+               'supervisor': {'runtime': 'hermes', 'session': 'fixture-supervisor', 'name': 'local-pilot'},
+               'pm': {'runtime': 'hermes', 'session': 'fixture-manager', 'name': 'local-pilot'},
+               'result': {'sha': seed, 'checks': 'local research answer'}}
+        body = '<!-- taskq:start -->\n```json\n' + json.dumps(raw) + '\n```\n<!-- taskq:end -->'
+        n = local.BOARD.add('Research', body, ['q-review', 'research', 'run-codex'])
+        local.BOARD.comment(n, '**result** · codex:fixture-\n\n42')
+        env = {'PATH': str(self.root / 'bin') + os.pathsep + os.environ.get('PATH', os.defpath),
+               'TASKQ_RUNTIME': 'hermes', 'HERMES_SESSION_ID': 'fixture-supervisor', 'TASKQ_HOST': 'local-pilot',
+               'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_ALLOW_PROTOCOL': 'file'}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(local, 'runtimes', return_value={}), \
+                mock.patch.object(local, 'dispatch') as dispatch, contextlib.redirect_stdout(io.StringIO()):
+            local.main(['close', '1', '--text', 'Independently checked 42; research answered; open: none'])
+        issue = local.BOARD.get(1)
+        self.assertEqual(issue['state'], 'closed')
+        self.assertIn('**close** · hermes:fixture-', issue['comments'][-1])
+        self.assertEqual(read('rev-parse', 'HEAD').stdout.strip(), seed)
+        bare_after = REAL_RUN([git, '--git-dir', str(self.root / 'origin.git'), 'show-ref'], capture_output=True, text=True, timeout=20).stdout
+        self.assertEqual(bare_after, bare_before)  # close fetched, never published or pushed
+        self.assertTrue((self.root / '.git' / 'FETCH_HEAD').is_file())
+        remote = REAL_RUN([str(self.root / 'bin/git'), 'fetch', 'https://invalid.example/taskq.git'],
+                          cwd=self.root, env=env, capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(remote.returncode, 0)
+        self.assertIn("transport 'https' not allowed", remote.stderr)
+        for command in ([str(self.root / 'bin/git'), 'push', 'origin', 'HEAD:main'],
+                        [str(self.root / 'bin/gh'), 'issue', 'list']):
+            done = REAL_RUN(command, cwd=self.root, env=env, capture_output=True, text=True, timeout=20)
+            self.assertNotEqual(done.returncode, 0)
+            self.assertIn('LOCAL-ONLY', done.stderr)
+
+
+
+HERMES_TUI_FIXTURE = r'''import json, os, pathlib, subprocess, sys, time
+sid, live, title, persisted, rows, activations = 'stored-native-id', 'live-process-id', '', False, [], 0
+mode = os.environ.get('FAKE_HERMES_MODE', 'normal')
+calls = []
+previous, pending = None, None
+if mode == 'child':
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True)
+    fields = pathlib.Path(f'/proc/{child.pid}/stat').read_text().rpartition(')')[2].split()
+    pathlib.Path('child.json').write_text(json.dumps({'pid': child.pid, 'birth': fields[19]}))
+def emit(kind, payload=None, target=live):
+    print(json.dumps({'jsonrpc': '2.0', 'method': 'event', 'params': {'type': kind, 'session_id': target, 'payload': payload or {}}}), flush=True)
+def snapshot():
+    return {'session_id': live, 'session_key': sid, 'running': False, 'status': 'idle', 'messages': [], 'info': {}, 'message_count': len(rows)}
+for line in sys.stdin:
+    req = json.loads(line); p, method = req['params'], req['method']
+    calls.append(method); pathlib.Path('calls.json').write_text(json.dumps(calls))
+    if pending and pathlib.Path('release-real').exists():
+        user_id = len(rows) + 1
+        rows.extend([{'role': 'user', 'row_id': user_id, 'text': pending}, {'role': 'assistant', 'row_id': user_id + 1, 'text': '42'}])
+        previous = {'text': '42', 'status': 'complete', 'persisted_turn': {'row_ids': [user_id, user_id+1], 'complete': True, 'user_row_id': user_id, 'final_assistant_row_id': user_id+1}}
+        emit('message.complete', previous)
+        pending = None
+    if method == 'session.create':
+        assert not persisted
+        result = {'session_id': live, 'stored_session_id': sid, 'messages': [], 'message_count': 0, 'info': {}}
+    elif method == 'session.resume':
+        assert p['session_id'] == sid and persisted, 'cannot resume an unpersisted stored ID'
+        result = snapshot()
+    else:
+        assert p['session_id'] == live
+        if method == 'session.title':
+            if 'title' in p:
+                title = p['title']; persisted = mode != 'unpersisted'
+                result = {'title': title, 'pending': not persisted}
+            else: result = {'title': title, 'session_key': sid}
+        elif method == 'session.activate':
+            activations += 1
+            result = snapshot()
+            if mode == 'busy_at_submit' and activations >= 2: result['running'] = True
+        elif method == 'prompt.submit':
+            assert persisted
+            result = {'status': 'streaming'}
+            if mode in ('replay_identical', 'replay_identical_delayed', 'replay_identical_held') and previous and not pathlib.Path('release-real').exists():
+                if mode in ('replay_identical_delayed', 'replay_identical_held'):
+                    pathlib.Path('admission-delayed').touch()
+                    if mode == 'replay_identical_held':
+                        deadline = time.monotonic() + 5
+                        while not pathlib.Path('release-admission').exists():
+                            assert time.monotonic() < deadline, 'admission fixture release deadline'
+                            time.sleep(.02)
+                    else:
+                        time.sleep(.4)  # longer than the proof-only deadline; transport admission must finish
+                pending = p['text']
+                emit('message.start')
+                emit('message.complete', previous)
+                print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}), flush=True)
+                continue
+            user_id = len(rows) + 1
+            rows.append({'role': 'user', 'row_id': user_id, 'text': p['text']})
+            emit('message.start')
+            if mode != 'echo_only':
+                assistant_id = len(rows) + 1
+                rows.append({'role': 'assistant', 'row_id': assistant_id, 'text': '42'})
+                payload = {'text': '42', 'status': 'error' if mode == 'error_complete' else 'complete',
+                    'persisted_turn': {'row_ids': [user_id, assistant_id], 'complete': True,
+                        'user_row_id': assistant_id if mode == 'wrong_receipt' else user_id, 'final_assistant_row_id': assistant_id}}
+                previous = payload
+                emit('message.complete', payload, target='unowned-session' if mode == 'wrong_session' else live)
+        elif method == 'session.history': result = {} if mode == 'missing_history' else {'messages': rows, 'count': len(rows)}
+        elif method == 'session.close': result = {'closed': True}
+        else: raise AssertionError(method)
+    print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}), flush=True)
+'''
 
 
 if __name__ == '__main__':

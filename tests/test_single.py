@@ -2528,9 +2528,20 @@ class HermesNativeBoundary(unittest.TestCase):
                 self.runtime.stop(sid)
 
     def test_identical_prompt_replay_cannot_consume_wait(self):
-        with self.fake('replay_identical'):
+        with self.fake('replay_identical_delayed'):
             sid = self.runtime.spawn('PM HRM isolated (test)', 'ask #1', self.root)
             first = self.runtime.completed(sid)['persisted_turn']
+            previous_token = self.runtime.data_for(sid)['turn']
+            completed = self.runtime.completed
+
+            def short_completion(session, timeout=None):
+                self.assertNotEqual(self.runtime.data_for(session)['turn'], previous_token)
+                try:
+                    return completed(session, timeout=.3 if timeout is None else timeout)
+                except TimeoutError as error:
+                    self.assertEqual(str(error), 'Hermes message.complete/idle proof deadline exceeded')
+                    raise
+
             board = FakeBoard()
             raw = {'pm': {'runtime': 'hermes', 'session': sid, 'name': 'test'}}
             board.add('Need owner', '<!-- taskq:start -->\n```json\n' + json.dumps(raw) + '\n```\n<!-- taskq:end -->', ['q-ask'])
@@ -2539,16 +2550,23 @@ class HermesNativeBoundary(unittest.TestCase):
                     mock.patch.object(taskq, 'CONFIG', {'root': self.root, 'board': 'board.py', 'publish': 'direct', 'hosts': {}}), \
                     mock.patch.object(taskq, 'CLONE', self.root), \
                     mock.patch.object(taskq, 'runtimes', return_value={'hermes': taskq.Hermes(self.runtime)}), \
-                    mock.patch.object(self.runtime, 'WAIT', .3), \
+                    mock.patch.object(self.runtime, 'completed', side_effect=short_completion) as completion_wait, \
                     mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'hermes', 'HERMES_SESSION_ID': sid, 'TASKQ_HOST': 'test'}):
-                with self.assertRaises((SystemExit, TimeoutError, ValueError)), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(SystemExit, r'^taskq: Hermes manager wake failed \(TimeoutError\); event receipt unchanged$'), contextlib.redirect_stdout(io.StringIO()):
                     taskq.main(['wait', '--window', '0'])
+                completion_wait.assert_called_once_with(sid)  # admission finished; only proof timed out
+                self.assertTrue((self.root / 'admission-delayed').exists())
                 self.assertFalse(receipt.exists(), 'old completion consumed the board event')
                 data = self.runtime.data_for(sid)
+                self.assertNotEqual(data['turn'], previous_token)
                 turn = self.runtime.call(sid, '_turn', turn=data['turn'])
                 self.assertTrue(turn['started'])
                 self.assertIsNone(turn['complete'])
                 self.assertEqual(turn['boundary'], first['final_assistant_row_id'])
+                events = [json.loads(line) for line in Path(data['endpoint']).with_suffix('.events.jsonl').read_text().splitlines()]
+                replayed = [row['event']['payload']['persisted_turn'] for row in events
+                            if row['submit'] == data['turn'] and row['event']['type'] == 'message.complete']
+                self.assertEqual(replayed, [first], 'test must reject the actual old receipt under the new token')
                 (self.root / 'release-real').touch()
                 self.runtime.call(sid, 'session.history')  # fixture releases delayed native event on next RPC
                 actual = self.runtime.completed(sid, timeout=1)['persisted_turn']
@@ -2556,6 +2574,37 @@ class HermesNativeBoundary(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()):
                     taskq.main(['wait', '--window', '0'])
                 self.assertEqual(json.loads(receipt.read_text()), {'1': 'ask'})
+            self.runtime.stop(sid)
+
+    def test_admission_timeout_reproduces_stale_handle_token(self):
+        with self.fake('replay_identical_held'):
+            sid = self.runtime.spawn('PM HRM isolated (test)', 'ask #1', self.root)
+            self.runtime.completed(sid)
+            previous_token = self.runtime.data_for(sid)['turn']
+            request = self.runtime.request
+            clock = self.runtime.time.monotonic
+            marker = self.root / 'admission-delayed'
+
+            def expire_admission(path, method, params=None, expected=None):
+                if method != '_submit':
+                    return request(path, method, params, expected)
+                start = clock()
+
+                def admission_clock():
+                    if clock() - start > 5:
+                        self.fail('fixture never reached native prompt admission')
+                    # Expire only after the owner replaced its token, before the delayed reply.
+                    return start + self.runtime.WAIT + 1 if marker.exists() else start
+                with mock.patch.object(self.runtime.time, 'monotonic', side_effect=admission_clock):
+                    return request(path, method, params, expected)
+
+            with mock.patch.object(self.runtime, 'request', side_effect=expire_admission):
+                with self.assertRaisesRegex(TimeoutError, '^Hermes RPC deadline exceeded; delivery unknown$'):
+                    self.runtime.send(sid, 'ask #1')
+            (self.root / 'release-admission').touch()
+            self.assertEqual(self.runtime.data_for(sid)['turn'], previous_token)
+            with self.assertRaisesRegex(ValueError, '^Hermes RPC failed: KeyError$'):
+                self.runtime.call(sid, '_turn', turn=previous_token)
             self.runtime.stop(sid)
 
     def test_missing_persisted_history_boundary_refuses_submit(self):
@@ -2888,7 +2937,7 @@ class HermesPilotLocal(unittest.TestCase):
 
 
 
-HERMES_TUI_FIXTURE = r'''import json, os, pathlib, subprocess, sys
+HERMES_TUI_FIXTURE = r'''import json, os, pathlib, subprocess, sys, time
 sid, live, title, persisted, rows, activations = 'stored-native-id', 'live-process-id', '', False, [], 0
 mode = os.environ.get('FAKE_HERMES_MODE', 'normal')
 calls = []
@@ -2930,7 +2979,16 @@ for line in sys.stdin:
         elif method == 'prompt.submit':
             assert persisted
             result = {'status': 'streaming'}
-            if mode == 'replay_identical' and previous and not pathlib.Path('release-real').exists():
+            if mode in ('replay_identical', 'replay_identical_delayed', 'replay_identical_held') and previous and not pathlib.Path('release-real').exists():
+                if mode in ('replay_identical_delayed', 'replay_identical_held'):
+                    pathlib.Path('admission-delayed').touch()
+                    if mode == 'replay_identical_held':
+                        deadline = time.monotonic() + 5
+                        while not pathlib.Path('release-admission').exists():
+                            assert time.monotonic() < deadline, 'admission fixture release deadline'
+                            time.sleep(.02)
+                    else:
+                        time.sleep(.4)  # longer than the proof-only deadline; transport admission must finish
                 pending = p['text']
                 emit('message.start')
                 emit('message.complete', previous)

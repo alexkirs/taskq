@@ -15,10 +15,12 @@ BLOCK = re.compile(r'<!-- taskq:start -->\s*```json\n(.*?)\n```\s*<!-- taskq:end
 SESSIONS = {'claude': 'CLAUDE_CODE_SESSION_ID', 'codex': 'CODEX_THREAD_ID', 'hermes': 'HERMES_SESSION_ID'}
 CONFIG, BOARD = {}, None  # set by main, or by a test
 GUARD, GUARD_WAIT, GUARD_PAUSE = threading.local(), 30, 2
-CHECK_POLLS, CHECK_PAUSE = 60, 10  # pr-mode close waits up to 10 min for the 'tests' check / the MR pipeline
+EVENT_SCHEMA, EVENT_LIMIT = 1, 64
+EVENT_LABEL = 'taskq-events'
+PAYLOAD_ACTIONS = ('ask', 'answer', 'requeue', 'result')
 
 class SettledError(SystemExit):
-    """A fully acknowledged terminal transition (for example CI-red requeue), still a CLI refusal."""
+    """A fully known refusal; tasks lists only acknowledged transitions that need an event."""
     def __init__(self, message, tasks):
         super().__init__(f'taskq: {message}')
         self.tasks = tasks
@@ -98,7 +100,7 @@ def parse(issue):
     states = [label[len(PREFIX):] for label in labels if label.startswith(PREFIX)]
     if not found or len(states) != 1 or states[0] not in STATES:
         return None
-    raw = json.loads(found.group(1))
+    raw = issue_data(issue)
     return {**{key: raw.get(key) for key in FIELDS}, 'raw': raw, 'iid': issue['iid'], 'title': issue['title'],
             'state': states[0], 'labels': labels, 'type': next((label for label in labels if label in TYPES), None),
             'runtime': next((label[len(RUN):] for label in labels if label.startswith(RUN)), 'any'),
@@ -114,8 +116,22 @@ def mine(item):
         wanted = CONFIG['me'] = CONFIG.get('me') or BOARD.user()  # one board call per process
     return not wanted or wanted in item['assignees']
 
+def compatibility_reason(item):
+    stale = release_reason()
+    if stale:
+        return stale
+    version = item['raw'].get('event_schema', 0)
+    if type(version) is not int or version not in (0, 1):
+        return f'#{item["iid"]}: unsupported event_schema {version!r}; writes refused'
+    if version == 0:
+        return f'#{item["iid"]}: legacy event_schema 0 is read-only; stop/drain controllers and run taskq migrate'
+    return None
+
+
 def execution_reason(item):
     """#545: an `assignee-only` task runs only for the board's authenticated user among its native assignees. None: allowed."""
+    if compatibility_reason(item):
+        return compatibility_reason(item)
     if not host_scope(item):
         return f'#{item["iid"]}: outside TASKQ_HOST_ONLY={os.environ["TASKQ_HOST_ONLY"]}; execution refused'
     if 'assignee-only' not in item['labels']:
@@ -147,6 +163,133 @@ def executable(issue, expected=None):
 def block(text, fields):
     """The description: the task's text, then its JSON block. Keys the model does not know are kept as they are."""
     return f'{text}\n\n<!-- taskq:start -->\n```json\n{json.dumps(fields, indent=1, ensure_ascii=False)}\n```\n<!-- taskq:end -->'
+
+
+def issue_data(issue):
+    found = BLOCK.search(issue.get('body') or '')
+    raw = json.loads(found.group(1)) if found else {}
+    version = raw.get('event_schema', 0)
+    if type(version) is not int or version not in (0, EVENT_SCHEMA):
+        fail(f'unsupported event_schema {version!r}; update TaskQ before using this board')
+    return raw
+
+
+def recipient(role, identity):
+    identity = identity or {}
+    return f'{role}:{identity.get("runtime", "owner")}:{identity.get("session") or "owner"}'
+
+
+def event_targets(raw, action, text, actor=None):
+    targets, actor = [], actor or session() or {}
+    boss, worker = raw.get('supervisor') or {}, raw.get('claim') or {}
+    manager = recipient('manager', raw['pm']) if raw.get('pm') else 'manager:*'
+    if action in ('ask', 'close') or action == 'result' and not boss or action == 'gone' and (not boss or text.startswith('supervisor ')):
+        targets.append(manager)
+    if boss.get('session') and action in ('result', 'ask', 'answer', 'gone', 'requeue') \
+            and not (action in ('ask', 'requeue') and actor.get('session') == boss['session']) \
+            and (action != 'gone' or text.startswith('worker ')):
+        targets.append(recipient('supervisor', boss))
+    if action == 'answer' and worker.get('session'):
+        targets.append(recipient('worker', worker))
+    return targets
+
+
+def event_pending(raw, target):
+    return [event for event in raw.get('events', []) if not set(event['recipients']).issubset(event.get('acks', []))
+            and target not in event.get('acks', [])
+            and (target in event['recipients'] or target.startswith('manager:')
+                 and 'manager:*' in event['recipients'] and 'manager:*' not in event.get('acks', []))]
+
+
+def event_labels(raw, labels):
+    pending_manager = any(target.startswith('manager:') and target not in event.get('acks', [])
+                          for event in raw.get('events', []) for target in event['recipients'])
+    return [label for label in labels if label != EVENT_LABEL] + ([EVENT_LABEL] if pending_manager else [])
+
+
+def reconcile_recipients(raw):
+    """An explicit controller replacement ends its old recipient's pending work; adoption resolves wildcard PM."""
+    for event in raw.get('events', []):
+        for target in list(event['recipients']):
+            role_name = target.split(':')[0]
+            if target == 'manager:*' and raw.get('pm'):
+                event['recipients'] = [recipient('manager', raw['pm']) if value == target else value for value in event['recipients']]
+            elif role_name in ('worker', 'supervisor') and target != recipient(role_name, raw.get('claim' if role_name == 'worker' else 'supervisor')):
+                event['acks'] = list(dict.fromkeys([*event.get('acks', []), target]))
+                event['cancelled'] = list(dict.fromkeys([*event.get('cancelled', []), target]))
+
+
+def append_event(raw, action, text, targets=None):
+    events = [dict(event) for event in raw.get('events', [])
+              if not set(event['recipients']).issubset(event.get('acks', []))]
+    targets = event_targets(raw, action, text) if targets is None else targets
+    if targets and len(events) >= EVENT_LIMIT:
+        fail(f'pending event capacity ({EVENT_LIMIT}) reached; deliver/ack outstanding events first')
+    number = raw.get('event_seq', 0) + 1
+    event = {'id': number, 'action': action, 'text': text, 'by': who(), 'recipients': targets, 'acks': []}
+    if action in PAYLOAD_ACTIONS:
+        raw['action_payloads'] = {**raw.get('action_payloads', {}), action: {key: event[key] for key in ('id', 'by', 'text')}}
+    if targets:
+        events.append(event)
+    raw.update(event_schema=EVENT_SCHEMA, event_seq=number, action=event, events=events)
+    return event
+
+
+def initialize_events(issue):
+    """Explicit migration helper: preserve current outstanding signals, not every historical outcome."""
+    raw = dict(issue_data(issue))
+    if raw.get('event_schema') == EVENT_SCHEMA:
+        return raw
+    comments = issue.get('comments') or []
+    payloads = dict(raw.get('action_payloads') or {})
+    for index, note_text in enumerate(comments):
+        head, _, text = note_text.partition('\n\n')
+        action, _, by = head.partition(' · ')
+        if action.strip('*') in PAYLOAD_ACTIONS:
+            payloads[action.strip('*')] = {'id': f'legacy:{index + 1}', 'by': by, 'text': text}
+    raw['action_payloads'] = payloads
+    deaths = 0
+    for note_text in reversed(comments):
+        if note_text.startswith(('**result**', '**answer**')):
+            break
+        deaths += note_text.startswith('**requeue**') and ' is gone' in note_text
+    raw.update(event_schema=EVENT_SCHEMA, event_seq=0, events=[], retry_counts={
+        'workers': workers(issue['iid'], comments), 'supervisor': lead_deaths(comments),
+        'worker': deaths})
+    state = next((label[len(PREFIX):] for label in issue['labels'] if label.startswith(PREFIX)), '')
+    action = 'close' if issue['state'] == 'closed' else {'review': 'result', 'ask': 'ask'}.get(state)
+    if action:
+        text = next((note.partition('\n\n')[2] for note in reversed(comments) if note.startswith(f'**{action}**')), '')
+        targets = [target for target in event_targets(raw, action, text) if target.startswith('manager:')]
+        append_event(raw, action, text, targets)
+    elif state == 'doing':
+        claim = raw.get('claim') or {}
+        if claim.get('session'):
+            for action_name, text, _ in legacy_worker_messages(issue, claim, bool(raw.get('supervisor'))):
+                if action_name == 'answer':
+                    append_event(raw, 'answer', text, [recipient('worker', claim)])
+    boss = raw.get('supervisor') or {}
+    if boss.get('session') and issue['state'] == 'open':
+        for action_name, text in legacy_supervisor_events(issue, boss):
+            append_event(raw, action_name, text, [recipient('supervisor', boss)])
+    raw['legacy_comments'] = len(comments)
+    claim = raw.get('claim') or {}
+    if claim.get('session'):
+        signal = legacy_worker_message(issue, claim, bool(boss))
+        raw['worker_comment_cursor'] = {claim['session']: signal[2] - 1 if signal else len(comments) - 1}
+    return raw
+
+
+def diagnostic_comment(n, text):
+    """Only log comments: run_api's fail() must not poison an otherwise settled authoritative action."""
+    held = getattr(GUARD, 'held', None)
+    poisoned = held and held['poisoned']
+    try:
+        BOARD.comment(n, text)
+    except (Exception, SystemExit) as error:
+        if held:
+            held['poisoned'] = poisoned
+        print(f'taskq: #{n} action saved; diagnostic comment failed: {error}', file=sys.stderr)
 
 
 # --- board ----------------------------------------------------------------------------------
@@ -186,6 +329,9 @@ def coordination_api(tool, host, method, path, body=None):
 
 def effect(function, *args, **kwargs):
     """An exception after effects begin poisons this grant, even when a caller catches it."""
+    reason = release_reason()
+    if reason:
+        fail(reason)
     held = getattr(GUARD, 'held', None)
     if held:
         if held['poisoned']:
@@ -309,8 +455,33 @@ class GitHub:
         query = 'issues?state=open' + (f'&labels={PREFIX}{state}' if state else '')
         return [self.issue(item) for item in self.pages(query) if 'pull_request' not in item]  # None: every open issue (§ 2)
 
+    def closed(self):
+        return [self.issue(item) for item in self.pages(f'issues?state=closed&labels={EVENT_LABEL}') if 'pull_request' not in item]
+
     def get(self, n):
-        return {**self.issue(self.api('GET', f'issues/{n}')), 'comments': [item['body'] for item in self.pages(f'issues/{n}/comments')]}
+        return {**self.metadata(n), 'comments': self.comments(n)}
+
+    def metadata(self, n):
+        return self.issue(self.api('GET', f'issues/{n}'))
+
+    def comments(self, n):
+        return [item['body'] for item in self.pages(f'issues/{n}/comments')]
+
+    def ensure_event_label(self):
+        """Explicit migration/setup only; no auto-provision in ordinary event mutations."""
+        gitlab = isinstance(self, GitLab)
+        tool = 'glab' if gitlab else 'gh'
+        base = f'projects/{quote(self.repo, safe="")}' if gitlab else f'repos/{self.repo}'
+        code, data = coordination_api(tool, self.host, 'GET', f'{base}/labels/taskq-events')
+        if code == 200 and isinstance(data, dict) and data.get('name') == 'taskq-events':
+            return
+        if code != 404:
+            fail(f'taskq-events label lookup failed/unknown (HTTP {code})')
+        code, data = effect(coordination_api, tool, self.host, 'POST', f'{base}/labels',
+                            {'name': 'taskq-events', 'color': '#666666' if gitlab else '666666',
+                             'description': 'TaskQ pending manager events'})
+        if code != 201 or not isinstance(data, dict) or data.get('name') != 'taskq-events':
+            fail(f'taskq-events label creation failed/unknown (HTTP {code}); reconcile before retry')
 
     def add(self, title, body, labels):
         return self.api('POST', 'issues', {'title': title, 'body': body, 'labels': labels})['number']
@@ -376,9 +547,11 @@ class GitLab(GitHub):
         query = 'issues?state=opened' + (f'&labels={PREFIX}{state}' if state else '')
         return [self.issue(item) for item in self.pages(query)]  # None: every open issue (§ 2)
 
-    def get(self, n):
-        return {**self.issue(self.api('GET', f'issues/{n}')), 'comments': [
-            item['body'] for item in self.pages(f'issues/{n}/notes?sort=asc&activity_filter=only_comments')]}
+    def comments(self, n):
+        return [item['body'] for item in self.pages(f'issues/{n}/notes?sort=asc&activity_filter=only_comments')]
+
+    def closed(self):
+        return [self.issue(item) for item in self.pages(f'issues?state=closed&labels={EVENT_LABEL}')]
 
     def add(self, title, body, labels):
         return self.api('POST', 'issues', {'title': title, 'description': body, 'labels': ','.join(labels)})['iid']
@@ -521,20 +694,177 @@ class Claude:
 def last_line(text):
     return next((line.strip() for line in reversed(text.splitlines()) if line.strip()), '')
 
-def pid_alive(pid):
-    if os.name != 'nt':
-        try:
-            os.kill(pid, 0)
-        except OSError as error:
-            return isinstance(error, PermissionError)  # someone else's process
-        return True
-    import ctypes  # Windows: os.kill(pid, 0) would terminate the process
-    handle, code = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid), ctypes.c_ulong()  # QUERY_LIMITED_INFORMATION
+@contextlib.contextmanager
+def windows_process(pid, terminate=False):
+    """A stable kernel handle; never truncate a 64-bit HANDLE through ctypes defaults."""
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4]
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    handle = kernel.OpenProcess(0x1000 | 0x100000 | (1 if terminate else 0), False, pid)
     if not handle:
-        return False
-    ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
-    ctypes.windll.kernel32.CloseHandle(handle)
-    return code.value == 259  # STILL_ACTIVE
+        error = ctypes.get_last_error()
+        if error == 87:  # ERROR_INVALID_PARAMETER: no such PID
+            raise ProcessLookupError(pid)
+        raise OSError(error, 'OpenProcess failed')
+    try:
+        yield kernel, handle
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def process_domain(platform=None):
+    """Local observation domain; a foreign OS/host PID cannot prove the recorded process died."""
+    platform = platform or ('windows' if os.name == 'nt' else sys.platform)
+    try:
+        if platform == 'linux':
+            boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            return f'linux:{boot}' if re.fullmatch(r'[0-9a-f-]{36}', boot) else None
+        if platform in ('windows', 'darwin'):
+            hostname = socket.gethostname().strip().casefold()
+            return f'{platform}:{hashlib.sha256(hostname.encode()).hexdigest()}' if hostname else None
+    except OSError:
+        pass
+    return None
+
+
+def birth_domain(birth):
+    if not isinstance(birth, str) or not re.fullmatch(
+            r'(?:windows:[0-9a-f]{64}:\d+|linux:[0-9a-f-]{36}:\d+|darwin:[0-9a-f]{64}:\d+:\d+)', birth):
+        return None
+    return ':'.join(birth.split(':')[:2])
+
+
+def windows_birth(kernel, handle):
+    import ctypes
+    from ctypes import wintypes
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not kernel.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+        raise OSError('GetProcessTimes failed')
+    domain = process_domain('windows')
+    return f'{domain}:{(times[0].dwHighDateTime << 32) | times[0].dwLowDateTime}' if domain else None
+
+
+def darwin_identity(pid):
+    """libproc PROC_PIDTBSDINFO: xnu/bsd/sys/proc_info.h and libproc.c, not ps text."""
+    import ctypes
+    import errno
+    class BsdInfo(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint32) for name in
+                    ('flags', 'status', 'xstatus', 'pid', 'ppid', 'uid', 'gid', 'ruid', 'rgid', 'svuid', 'svgid', 'reserved')]
+        _fields_ += [('comm', ctypes.c_char * 16), ('name', ctypes.c_char * 32)]
+        _fields_ += [(name, ctypes.c_uint32) for name in ('nfiles', 'pgid', 'pjobc', 'tdev', 'tpgid')]
+        _fields_ += [('nice', ctypes.c_int32), ('start_sec', ctypes.c_uint64), ('start_usec', ctypes.c_uint64)]
+    lib = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+    lib.proc_pidinfo.restype = ctypes.c_int
+    info = BsdInfo()
+    ctypes.set_errno(0)
+    size = lib.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+    if size == 0 and ctypes.get_errno() == errno.ESRCH:
+        return 'dead', None
+    if size != ctypes.sizeof(info) or info.pid != pid or not info.start_sec or info.start_usec >= 1000000:
+        return 'unknown', None
+    domain = process_domain('darwin')
+    return (('dead' if info.status == 5 else 'running'), f'{domain}:{info.start_sec}:{info.start_usec}') if domain else ('unknown', None)
+
+
+def process_identity(pid):
+    """(running/dead/unknown, birth). OS process creation identity, never a bare PID."""
+    if not isinstance(pid, int) or pid <= 0:
+        return 'unknown', None
+    try:
+        if os.name == 'nt':
+            with windows_process(pid) as (kernel, handle):
+                wait = kernel.WaitForSingleObject(handle, 0)
+                if wait == 0:
+                    return 'dead', windows_birth(kernel, handle)
+                if wait != 258:  # WAIT_TIMEOUT: still running
+                    return 'unknown', None
+                return 'running', windows_birth(kernel, handle)
+        if sys.platform == 'darwin':
+            return darwin_identity(pid)
+        if sys.platform == 'linux':
+            domain = process_domain('linux')
+            if domain is None:
+                return 'unknown', None
+            try:
+                fields = Path(f'/proc/{pid}/stat').read_text().rpartition(')')[2].split()
+            except FileNotFoundError:
+                return 'dead', None
+            return ('dead' if fields[0] in ('Z', 'X') else 'running'), f'{domain}:{fields[19]}'
+    except ProcessLookupError:
+        return 'dead', None
+    except (OSError, ValueError, IndexError):
+        pass
+    return 'unknown', None  # unsupported POSIX hosts cannot safely establish ownership
+
+
+def process_state(pid, birth):
+    domain = birth_domain(birth)
+    if domain is None or domain != process_domain():
+        return 'unknown'  # legacy/foreign ownership is never inferred from a local PID or its absence
+    state, actual = process_identity(pid)
+    if state == 'unknown' or state == 'running' and actual is None or actual is not None and birth_domain(actual) != domain:
+        return 'unknown'
+    return 'dead' if actual is not None and actual != birth else state
+
+
+def stop_process(pid, birth):
+    """Pin before checking identity. No os.kill fallback: PID reuse must never kill a foreign process."""
+    if process_state(pid, birth) == 'dead':
+        return
+    if process_state(pid, birth) != 'running':
+        raise RuntimeError('process ownership unknown; recovery handle retained')
+    if os.name == 'nt':
+        with windows_process(pid, terminate=True) as (kernel, handle):
+            if windows_birth(kernel, handle) != birth:
+                return
+            if not kernel.TerminateProcess(handle, 1) or kernel.WaitForSingleObject(handle, 5000) != 0:
+                raise RuntimeError('process termination unconfirmed; recovery handle retained')
+    elif sys.platform == 'linux' and hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal'):
+        import select
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return
+        try:
+            if process_state(pid, birth) == 'dead':
+                return
+            if process_state(pid, birth) != 'running':
+                raise RuntimeError('process ownership unknown; recovery handle retained')
+            signal.pidfd_send_signal(fd, signal.SIGTERM)
+            if not select.select([fd], [], [], 5)[0]:
+                raise RuntimeError('process termination unconfirmed; recovery handle retained')
+        finally:
+            os.close(fd)
+    else:
+        raise RuntimeError('safe process termination unavailable; recovery handle retained')
+
+
+def read_process(path):
+    """Compatibility parser: PID/session remain readable; only a birth-bearing record proves ownership."""
+    try:
+        fields = path.read_text(encoding='utf-8').split()
+        return int(fields[0]), fields[1], fields[2] if len(fields) == 3 else None
+    except (OSError, ValueError, IndexError):
+        return 0, None, None
+
+
+def write_process(path, process, session):
+    birth = getattr(process, 'taskq_birth', None)
+    if not isinstance(birth, str):
+        birth = process_identity(process.pid)[1]
+    temporary = path.with_name(f'.{path.name}.{uuid.uuid4().hex}.tmp')
+    with open(temporary, 'x', encoding='utf-8') as stream:
+        stream.write(f'{process.pid} {session} {birth or "-"}')
+    os.replace(temporary, path)  # failure preserves the previous handle and the temporary evidence
+
 
 def codex_options():
     # Network on: a worker pushes and calls the board. `"codex": [...]` in taskq.json replaces these options.
@@ -549,7 +879,7 @@ class Unnamed(Exception):
         self.thread = thread
 
 class Codex:
-    """`codex exec`, headless: one process per turn, its JSONL in .taskq/<name>.log, `<pid> <thread>` in .taskq/<name>.pid."""
+    """`codex exec`, headless: one process per turn, its JSONL in .taskq/<name>.log, `<pid> <thread> <birth>` in .taskq/<name>.pid."""
 
     def folder(self):
         (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
@@ -560,11 +890,17 @@ class Codex:
         with open(log, 'ab') as out:  # detached: the worker outlives the tick
             process = subprocess.Popen([shutil.which('codex') or fail('codex not found'), 'exec', '--json', *codex_options(), *arguments],
                                        cwd=cwd, env=worker_env(), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
-        dispatch('turn end', [], after=process.pid)  # #525: a sandboxed turn starts no pass; one runs when it ends (no sender, no timer)
+        process.taskq_birth = process_identity(process.pid)[1]
+        dispatch('turn end', [], after=process.pid, after_birth=process.taskq_birth)  # #525: a sandboxed turn starts no pass; one runs when it ends (no sender, no timer)
         return process, log
 
     def spawn(self, name, prompt, cwd):
         log = self.folder() / f'{name.split()[0]}.log'
+        target = log.with_suffix('.pid')
+        if target.exists() or target.is_symlink():
+            pid, sid, birth = read_process(target)
+            if not sid or process_state(pid, birth) != 'dead':
+                raise RuntimeError(f'codex target handle {target.name} is unresolved or running; spawn refused')
         start = log.stat().st_size if log.exists() else 0  # #495: the log is appended across runs, older ids sit above
         process, log = self.exec(name, ['-C', str(cwd), prompt], cwd)
         for _ in range(600):  # the run's first JSONL line, thread.started, carries the thread id
@@ -579,7 +915,7 @@ class Codex:
         old = pid.read_text().split() if pid.exists() else []
         if old[1:] and old[1] != found:  # #568: a replaced thread not yet retired (a running one) keeps its handle
             pid.rename(pid.with_name(f'{pid.stem}-{old[1]}.pid'))
-        pid.write_text(f'{process.pid} {found}')
+        write_process(pid, process, found)
         try:
             self.title(found, name)
         except (OSError, ValueError) as error:  # R3 (#572): no unnamed thread works; its pid file stays for the retire (R11)
@@ -625,16 +961,18 @@ class Codex:
             server.stdout.close()
 
     def pid_file(self, session):
-        return next((path for path in self.folder().glob('*.pid') if path.read_text().split()[1:] == [session]), None)
+        return next((path for path in self.folder().glob('*.pid') if read_process(path)[1] == session), None)
 
     def send(self, session, text):
+        state = self.state(session)
+        if state not in ('idle', 'dead'):
+            raise RuntimeError(f'codex session {state or "unknown"}; resume refused')
         process, log = self.exec(getattr(self.pid_file(session), 'stem', session), ['resume', session, text], CONFIG['root'])
-        log.with_suffix('.pid').write_text(f'{process.pid} {session}')
+        write_process(log.with_suffix('.pid'), process, session)
         return session
 
     def alive(self, session):
-        path = self.pid_file(session)
-        return None if path is None else pid_alive(int(path.read_text().split()[0]))
+        return {'running': True, 'idle': False, 'dead': False}.get(self.state(session))
 
     def state(self, session):
         """A supervisor (§ 7 step 4): its process exits at every turn end, by design. Pid running: running; exited after a
@@ -642,8 +980,10 @@ class Codex:
         path = self.pid_file(session)
         if path is None:
             return None
-        if pid_alive(int(path.read_text().split()[0])):
-            return 'running'
+        pid, _, birth = read_process(path)
+        state = process_state(pid, birth)
+        if state != 'dead':
+            return state
         log = path.with_suffix('.log')
         turn = (log.read_text('utf-8', 'replace') if log.exists() else '').rpartition('"turn.started"')
         ends = re.findall(r'"type":\s*"(turn\.completed|turn\.failed|error)"', turn[2]) if turn[1] else []
@@ -653,17 +993,29 @@ class Codex:
         return rollout(session) == 'local'
 
     def retire(self, gone, running=True):
-        """Kill the turn's process, `codex archive` the thread, drop .taskq/T<N>.pid or S<N>.pid (#360)."""
+        """True: selected predecessors retired; False: preserve/defer. Unknown effects still raise."""
+        complete = True
+        safe_stop = os.name == 'nt' or (sys.platform == 'linux' and hasattr(os, 'pidfd_open')
+                                       and hasattr(signal, 'pidfd_send_signal'))
         for path in (CONFIG['root'] / '.taskq').glob('*.pid'):
-            n, (pid, thread) = re.fullmatch(r'[TS](\d+)(-[\w-]+)?', path.stem), path.read_text().split()  # S<N>-<thread>: a replaced one
-            if not n or not gone(int(n[1]), thread, pid_alive(int(pid))) or pid_alive(int(pid)) and not running:
+            n = re.fullmatch(r'[TS](\d+)(-[\w-]+)?', path.stem)
+            pid, thread, birth = read_process(path)
+            if not n or not thread:
                 continue
-            if pid_alive(int(pid)):
-                os.kill(int(pid), signal.SIGTERM)
+            state = process_state(pid, birth)
+            live = None if state == 'unknown' else state == 'running'
+            if not gone(int(n[1]), thread, live):
+                continue
+            if state == 'unknown' or state == 'running' and (not running or not safe_stop):
+                complete = False
+                continue
+            if state == 'running':
+                stop_process(pid, birth)
             done = subprocess.run([shutil.which('codex') or 'codex', 'archive', thread], capture_output=True, timeout=60)
             if done.returncode:
                 raise RuntimeError('codex archive failed; recovery handle retained')
             path.unlink()
+        return complete
 
     def tail(self, session):
         path = self.pid_file(session)
@@ -723,33 +1075,80 @@ def runtimes():
 
 # --- commands -------------------------------------------------------------------------------
 
+def read_issue(n):
+    """Fresh metadata when supported; legacy adapters keep their complete get(n) contract."""
+    return getattr(BOARD, 'metadata', BOARD.get)(n)
+
+
+def issue_history(issue):
+    """Load trusted comments only when consumed, without another metadata request."""
+    if 'comments' not in issue:
+        comments = getattr(BOARD, 'comments', None)
+        issue = {**issue, 'comments': comments(issue['iid']) if comments else BOARD.get(issue['iid'])['comments']}
+    return issue
+
+
 def task(n, *states):
-    issue = BOARD.get(n)
+    issue = read_issue(n)
     found = parse(issue) if issue['state'] == 'open' else None
     if not found:
         fail(f'#{n} is not an open taskq task')
+    if compatibility_reason(found):
+        fail(compatibility_reason(found))
     if states and found['state'] not in states:
         fail(f'#{n} is {found["state"]}, not {" or ".join(states)}')
     return found
 
 def move(current, state, action, text='', **fields):
     """One update moves the label and the block together; one comment is the history. State None: no state label."""
+    if compatibility_reason(current):
+        fail(compatibility_reason(current))
     labels = [label for label in current['labels'] if not label.startswith(PREFIX)] + ([PREFIX + state] if state else [])
     raw = {**current['raw'], **{key: current[key] for key in FIELDS}, **fields}
+    raw['events'] = [dict(event, acks=list(event.get('acks', []))) for event in raw.get('events', [])]
+    reconcile_recipients(raw)
+    append_event(raw, action, text)
+    labels = event_labels(raw, labels)
+    counts = dict(raw.get('retry_counts') or {})
+    if action in ('answer', 'result'):
+        counts.update(supervisor=0, worker=0)
+    if action == 'answer':
+        counts['workers'] = 0
+    if action == 'spawn' and text.startswith('worker '):
+        counts['workers'] = counts.get('workers', 0) + 1
+    if action == 'gone' and text.startswith('supervisor '):
+        counts['supervisor'] = counts.get('supervisor', 0) + 1
+    if action == 'requeue' and ' is gone' in text:
+        counts['worker'] = counts.get('worker', 0) + 1
+    raw['retry_counts'] = counts
+    records = list(raw.get('session_records') or [])
+    for source in (current, raw):
+        for role_name, key in (('supervisor', 'supervisor'), ('worker', 'claim')):
+            identity = source.get(key) or {}
+            if identity.get('session'):
+                record = {'role': role_name, 'runtime': identity['runtime'], 'session': identity['session']}
+                if record not in records:
+                    records.append(record)
+    raw['session_records'] = records
     effect(BOARD.update, current['iid'], labels=labels, body=block(current['text'], raw))
-    effect(BOARD.comment, current['iid'], f'**{action}** · {who()}' + (f'\n\n{text}' if text else ''))
+    current.update(raw=raw, labels=labels, **{key: raw.get(key) for key in FIELDS})
+    if state:
+        current['state'] = state
+    diagnostic_comment(current['iid'], f'**{action}** · {who()}' + (f'\n\n{text}' if text else ''))
     print(f'#{current["iid"]} {state or "closed"}')
 
 def open_deps(deps):
-    return [n for n in deps or [] if BOARD.get(n)['state'] == 'open']
+    return [n for n in deps or [] if read_issue(n)['state'] == 'open']
 
 def cmd_add(args):
     text = f'## Goal\n\n{args.goal}\n\n## Acceptance\n\n{args.acceptance}'
     state = 'waiting' if open_deps(args.deps) else 'ready'
     labels = [PREFIX + state, f'priority-{args.priority}', args.type] + ([RUN + args.runtime] if args.runtime != 'any' else []) \
         + ([ON + args.host] if args.host else [])
-    n = effect(BOARD.add, args.title, block(text, {'scope': args.scope, 'deps': args.deps, 'claim': None, 'result': None, 'pm': origin()}), labels)
-    effect(BOARD.comment, n, f'**add** · {who()}')
+    raw = {'scope': args.scope, 'deps': args.deps, 'claim': None, 'result': None, 'pm': origin()}
+    append_event(raw, 'add', '')
+    n = effect(BOARD.add, args.title, block(text, raw), labels)
+    diagnostic_comment(n, f'**add** · {who()}')
     print(f'#{n} {state}')
     return n
 
@@ -842,7 +1241,10 @@ def cmd_requeue(args):
         return
     gate(current)
     if current['supervisor'] and found == 'supervisor':
-        if workers(args.n, BOARD.get(args.n)['comments']) >= 3:
+        attempts = current['raw'].get('retry_counts', {}).get('workers')
+        if attempts is None:
+            attempts = workers(args.n, issue_history(read_issue(args.n))['comments'])
+        if attempts >= 3:
             fail(f'#{args.n}: third rework: ask the owner (taskq ask {args.n} ...)')
         move(current, 'doing', 'requeue', args.text, claim={**claim, 'session': None}, result=None, decision=None, order='rework')
     else:
@@ -911,15 +1313,11 @@ def merge(current, sha):
         gate = 'check tests'
         runs = lambda: [(run['status'] == 'completed', run['conclusion'] == 'success') for run in
                         run_api('gh', host, 'GET', f'repos/{CONFIG["repo"]}/commits/{head}/check-runs?check_name=tests')['check_runs']]
-    for _ in range(CHECK_POLLS):  # ponytail: fixed poll; tests.yml takes 8-13 s
-        polled = runs()
-        if polled and all(done for done, _ in polled):
-            if not all(ok for _, ok in polled):
-                back(f'{gate} failed on {head}')
-            break
-        time.sleep(CHECK_PAUSE)
-    else:
-        back(f'{gate} did not finish on {head}')
+    checked = runs()  # never wait for CI while holding the project's mutation guard
+    if not checked or not all(done for done, _ in checked):
+        raise SettledError(f'#{current["iid"]}: PR {number} {gate} pending or missing on {head}; retry after CI finishes', [])
+    if not all(ok for _, ok in checked):
+        back(f'{gate} failed on {head}')
     keep = CONFIG.get('workspace') == 'external'  # #477: the host owns the branch; the repo's own policy may still delete it
     _, out = effect(cli, *(['glab', 'mr', 'merge', number, '--squash', *['--remove-source-branch'] * (not keep), '--sha', head, '--auto-merge=false', '--yes'] if lab
                    else ['gh', 'pr', 'merge', number, '--squash', *['--delete-branch'] * (not keep), '--match-head-commit', head]))
@@ -949,19 +1347,22 @@ def cleanup(current):
 
 def cmd_close(args):
     """close N [M ...]: in order; no PR is updated (#359). A failed task does not stop the rest."""
-    failed = []
+    failed, changed = [], []
     for n in args.n:
         try:
             close_one(argparse.Namespace(n=n, text=args.text))
+            changed.append(n)
         except SystemExit as error:
             if (getattr(GUARD, 'held', None) or {}).get('poisoned'):
                 raise  # no more closes or settled-event dispatch after an uncertain effect
             if len(args.n) == 1:
                 raise
             failed.append(n)
+            if isinstance(error, SettledError):
+                changed.extend(error.tasks)
             print(error, file=sys.stderr)
     if failed:
-        raise SettledError(f'not closed: {" ".join(f"#{n}" for n in failed)}', args.n)
+        raise SettledError(f'not closed: {" ".join(f"#{n}" for n in failed)}', changed)
 
 def publish_direct(current, sha, git):
     """#533: close is acceptance; transfer and qualify the exact candidate before main can change."""
@@ -989,7 +1390,7 @@ def publish_direct(current, sha, git):
     else:  # custom board: the reviewer verifies project-owned CI/checks (§ 6)
         green = True
     if not green:
-        fail(f'#{current["iid"]}: CI is not green on candidate {sha}')
+        raise SettledError(f'#{current["iid"]}: CI is not green on candidate {sha}', [])
     if run('ls-remote', 'origin', branch).split()[:1] != [sha]:
         fail(f'{branch}: remote candidate changed during acceptance')
     run('push', 'origin', f'{sha}:refs/heads/main')
@@ -1005,6 +1406,7 @@ def verdict(text):
 def close_one(args):
     current = task(args.n, 'review')
     gate(current)
+    append_event(dict(current['raw']), 'close', args.text)  # capacity before publication/close effects
     if role(current) == 'supervisor':
         verdict(args.text)
     sha = commit((current['result'] or {}).get('sha') or '')
@@ -1041,6 +1443,9 @@ def recorded(issue, runtime, sid):
     for name, key in (('supervisor', 'supervisor'), ('worker', 'claim')):
         if (raw.get(key) or {}).get('runtime') == runtime and raw[key].get('session') == sid:
             return name
+    for record in raw.get('session_records', []):
+        if record['runtime'] == runtime and record['session'] == sid:
+            return record['role']
     named = re.compile(rf'(?<![\w-]){re.escape(sid)}(?![\w-])')
     for text in (issue or {}).get('comments') or []:
         if text.startswith(('**spawn**', '**nudge**', '**gone**')) and named.search(text):
@@ -1084,6 +1489,10 @@ def cmd_cleanup(args):
     root, dry, here, kinds = CONFIG['root'], args.dry_run, machine(), runtimes()
     verb, removed, kept, mess = 'would remove' if args.dry_run else 'removed', [], [], []
     items = list(filter(None, map(parse, BOARD.list(None))))
+    if not dry:
+        for item in items:
+            if compatibility_reason(item):
+                fail(compatibility_reason(item))
     states = {item['iid']: 'open' for item in items}
 
     issues = {}
@@ -1167,8 +1576,8 @@ def cmd_cleanup(args):
             kept.append(f'{name} sessions: unknown ({error})')
     for path in sorted((root / '.taskq').glob('*.pid')):
         n = re.fullmatch(r'S(\d+)', path.stem)  # the gone supervisor's; a T<N>.pid is Codex's handle, its retire decides (#478)
-        pid = (path.read_text().split() or ['0'])[0]
-        if n and state(int(n[1])) == 'closed' and not (pid.isdigit() and pid_alive(int(pid))):
+        pid, _, birth = read_process(path)
+        if n and state(int(n[1])) == 'closed' and process_state(pid, birth) == 'dead':
             dry or effect(path.unlink)
             removed.append(f'{verb} .taskq/{path.name}')
     for wait in sorted((root / '.taskq').glob('wait*.json')):  # one per manager (#532)
@@ -1181,7 +1590,7 @@ def cmd_cleanup(args):
     for item in items:
         claim, n, sha = item['claim'] or {}, item['iid'], (item['result'] or {}).get('sha') or ''
         if item['state'] == 'doing' and claim.get('name') == here and claim.get('runtime') in kinds \
-                and kinds[claim['runtime']].alive(claim['session']) is False:
+                and runtime_state(kinds[claim['runtime']], claim['session']) == 'dead':
             mess.append(f'#{n} doing: session {claim["session"]} is gone')
         if item['state'] == 'review' and CONFIG['publish'] == 'pr' and prs is not None and f'taskq-{n}' not in prs and not (
                 re.fullmatch('[0-9a-f]{7,40}', sha) and not git('merge-base', '--is-ancestor', sha, 'origin/main').returncode):  # an answer is on main
@@ -1196,8 +1605,14 @@ def cmd_cleanup(args):
 
 def history(n):
     """The review notes a new worker must read: every requeue and answer since the last close, with the result they answer."""
-    notes = [text for text in BOARD.get(n)['comments'] or [] if text.startswith(('**result**', '**requeue**', '**answer**', '**ask**'))]
-    return 'History of this task (read it first; a requeue says what to fix):\n\n' + '\n\n'.join(notes[-6:]) + '\n\n' if notes else ''
+    issue = BOARD.get(n)
+    notes = [text for text in issue['comments'] or [] if text.startswith(('**result**', '**requeue**', '**answer**', '**ask**'))][-6:]
+    for action, payload in issue_data(issue).get('action_payloads', {}).items():
+        if action in PAYLOAD_ACTIONS:
+            text = f'**{action}** · {payload["by"]}' + (f'\n\n{payload["text"]}' if payload['text'] else '')
+            if text not in notes:
+                notes.append(text)
+    return 'History of this task (read it first; a requeue says what to fix):\n\n' + '\n\n'.join(notes) + '\n\n' if notes else ''
 
 def brief(item, runtime):
     """The worker's prompt: its name first (R3, #572: a runtime's fallback title), the task, its workspace, the taskq commands it uses."""
@@ -1211,6 +1626,7 @@ def brief(item, runtime):
     return f'''{worker_name(item)}
 You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
 Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
+{release_context()}
 Read `{Path(__file__).resolve().with_name("taskq.md")}` first and do only what it allows (R13): a task that conflicts with a recorded decision is an ask with options, not an edit.
 
 {item["text"]}
@@ -1239,6 +1655,7 @@ def supervisor_brief(item, runtime, kind):
 You are the taskq supervisor S{n} of task #{n}: {item["title"]}. You are its only controller: you order its worker, follow it,
 review its result and close or rework it. You never edit the task's code, never start a session yourself, never decide for the owner.
 Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
+{release_context()}
 Read `{Path(__file__).resolve().with_name("taskq.md")}` (§ 7 Supervisor, § 6) first and do only what it allows (R13).
 
 {item["text"]}
@@ -1257,7 +1674,8 @@ Read `{Path(__file__).resolve().with_name("taskq.md")}` (§ 7 Supervisor, § 6) 
      Then wait as in 2. The third rework is refused: ask the owner.
    - A result with options (a choice for the owner): `{tq} ask {n} --text "<...>" --option "<A>" --option "<B>" --recommend <K>`.
 4. Woken by `gone #{n}`, `requeue #{n}` (the worker's) or `ask #{n}`: read why; `{tq} requeue {n} --text "<what to do>"` or ask the owner
-   (a product choice, a second death). `answer #{n}`: act on it; a live worker gets the answer from the queue. Then wait as in 2.
+   (a product choice, a second death). `answer #{n}`: act on it; an idle worker gets the answer from the queue.
+   After handling observed `[event N:ID]`, run `{tq} ack N:ID` for those IDs before waiting again.
 5. A silent worker (120 min, issue unchanged): `{nudge}`; the queue sends the text to it.
 6. `stop #{n}`: the task is closed or no longer yours: end your turn. `tick`: wait again.
 Everything written through taskq is public: no secrets, tokens or paths outside the repository.'''
@@ -1280,15 +1698,18 @@ def spawn_named(item, kind, letter, prompt):
 def replace(item, kind, runtime, role, running=False):
     """#568: before a replacement spawn, retire the task's earlier `role` sessions the board records (R11, #478), never
     another task's. A Codex spawn rewrites `.taskq/T<N>.pid` / `S<N>.pid`, the old thread's handle. A replaced
-    worker goes running or not; a supervisor only once stopped (R11), its handle kept until then. Best effort."""
+    worker goes running or not; a supervisor only once stopped (R11). Explicit incomplete retirement defers admission."""
     issue = BOARD.get(item['iid'])
     if not executable(issue, item):
         return False  # #576: a reassignment seen by this read: no retire, no spawn
     try:
-        effect(getattr(kind, 'retire', lambda *_: None), lambda n, sid=None, live=None: n == item['iid']
+        retired = effect(getattr(kind, 'retire', lambda *_: None), lambda n, sid=None, live=None: n == item['iid']
                                                   and recorded(issue, runtime, sid) == role, running)
+        if retired is False:
+            return False
     except Exception as error:
         print(f'#{item["iid"]}: could not retire the replaced {role}: {error}', file=sys.stderr)
+        raise
     return True
 
 EVENT_OF = {'result': 'review', 'ask': 'ask', 'answer': 'answer', 'gone': 'gone', 'requeue': 'requeue'}
@@ -1297,6 +1718,15 @@ def pending(issue, boss):
     """The supervisor's events since it last got them (.taskq/S<N>.seen, else since its spawn note): `review #N`,
     `ask #N`, `answer #N`, `gone #N` (its worker), `requeue #N` (by its worker); its own ask and requeue are no event.
     Returns them and the comment count to mark them seen with."""
+    raw = issue_data(issue)
+    if raw.get('event_schema'):
+        events = event_pending(raw, recipient('supervisor', boss))
+        return [event_line(issue['iid'], event) for event in events], [event['id'] for event in events]
+    return [f'{EVENT_OF[action]} #{issue["iid"]}' for action, _ in legacy_supervisor_events(issue, boss)], len(issue.get('comments') or [])
+
+
+def legacy_supervisor_events(issue, boss):
+    """Legacy ordered history and existing checkout receipt; used only for compatibility/migration."""
     n, sid, comments = issue['iid'], boss['session'], issue.get('comments') or []
     start = max([i + 1 for i, text in enumerate(comments) if text.startswith('**spawn**') and f'\n\nsupervisor {sid}' in text] or [0])
     held = (CONFIG['root'] / '.taskq' / f'S{n}.seen').read_text().split() if (CONFIG['root'] / '.taskq' / f'S{n}.seen').is_file() else []
@@ -1307,16 +1737,25 @@ def pending(issue, boss):
         action, _, by = head.partition(' · ')
         event = EVENT_OF.get(action.strip('*'))
         if event and not (event in ('ask', 'requeue') and by.endswith(f':{sid[:8]}')) and (event != 'gone' or body.startswith('worker ')):
-            found.append(f'{event} #{n}')
-    return found, len(comments)
+            found.append((action.strip('*'), body))
+    return found
 
 def seen(n, sid, count):
+    if isinstance(count, list):
+        issue = read_issue(n)
+        boss = issue_data(issue).get('supervisor') or {}
+        acknowledge(issue, recipient('supervisor', boss), count)
+        return
     (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
     (CONFIG['root'] / '.taskq' / f'S{n}.seen').write_text(f'{sid} {count}')
 
-def lead_state(kind, sid):
-    """§ 7 step 4: running, idle or dead; None cannot tell. A runtime without state(): alive() (False: dead)."""
-    return kind.state(sid) if hasattr(kind, 'state') else {True: 'running', False: 'dead'}.get(kind.alive(sid))
+def runtime_state(kind, sid):
+    """Minimal capability shared by workers/supervisors; legacy alive cannot prove idle."""
+    state = kind.state(sid) if callable(getattr(kind, 'state', None)) else {True: 'running', False: 'dead'}.get(kind.alive(sid))
+    return state if state in ('running', 'idle', 'dead') else 'unknown'
+
+
+lead_state = runtime_state
 
 def lead_deaths(comments):
     """Supervisor deaths since the last result or answer (#393 bound)."""
@@ -1333,21 +1772,111 @@ def tail_of(kind, sid):
     except Exception as error:  # best effort: the note goes out without the line
         return f'no log: {error}'
 
+
+def event_line(n, event):
+    name = {'result': 'review', 'close': 'closed', 'observed-gone': 'gone'}.get(event['action'], event['action'])
+    verdict = (' ' + event['text'].splitlines()[0]) if name == 'closed' and event['text'] else ''
+    return f'{name} #{n}{verdict} [event {n}:{event["id"]}]'
+
+
+def acknowledge(issue, target, ids):
+    raw = issue_data(issue)
+    events = [dict(event, acks=list(event.get('acks', []))) for event in raw.get('events', [])]
+    for number in ids:
+        if not 0 < number <= raw.get('event_seq', 0):
+            fail(f'#{issue["iid"]}: unknown event {number}')
+        event = next((event for event in events if event['id'] == number), None)
+        if event is None:  # acknowledged entries are compacted; sequence identities are never reused
+            continue
+        if target not in event['recipients'] and not (target.startswith('manager:') and 'manager:*' in event['recipients']):
+            fail(f'#{issue["iid"]}:{number}: event belongs to another recipient')
+        if target not in event['acks']:
+            event['acks'].append(target)
+        if issue['state'] == 'closed' and not raw.get('pm') and target.startswith('manager:') and 'manager:*' in event['recipients']:
+            if 'manager:*' not in event['acks']:
+                event['acks'].append('manager:*')
+    if events != raw.get('events', []):
+        raw['events'] = events
+        effect(BOARD.update, issue['iid'], labels=event_labels(raw, issue['labels']), body=block(BLOCK.sub('', issue['body']).strip(), raw))
+
+
+def cmd_ack(args):
+    tokens = list(args.events)
+    if args.stdin:
+        tokens += re.findall(r'\[event (\d+:\d+)\]', sys.stdin.read())
+    parsed = []
+    for token in tokens:
+        matched = re.fullmatch(r'(\d+):(\d+)', token)
+        if not matched:
+            fail(f'invalid event identity {token!r}; expected N:ID')
+        issue = read_issue(int(matched[1]))
+        raw = issue_data(issue)
+        actor, boss, pm = session() or {}, raw.get('supervisor') or {}, raw.get('pm') or {}
+        if args.pm:
+            if pm.get('session') not in (None, args.pm):
+                fail(f'#{matched[1]} belongs to another manager')
+            target = recipient('manager', pm or {'runtime': actor.get('runtime', 'owner'), 'session': args.pm})
+        elif actor.get('session') and actor.get('session') == boss.get('session') and actor.get('runtime') == boss.get('runtime'):
+            target = recipient('supervisor', boss)
+        elif not pm or actor.get('session') == pm.get('session') and actor.get('runtime') == pm.get('runtime'):
+            target = recipient('manager', actor)
+        else:
+            fail(f'#{matched[1]}: ack requires its recorded recipient or explicit sender --pm')
+        parsed.append((int(matched[1]), target, int(matched[2])))
+    for n, target, number in parsed:
+        acknowledge(read_issue(n), target, [number])
+
+
+def legacy_worker_message(issue, claim, supervised):
+    return next(legacy_worker_messages(issue, claim, supervised), None)
+
+
+def legacy_worker_messages(issue, claim, supervised):
+    """Relevant signals only: ordinary comments cannot hide an answer or a nudge."""
+    comments = issue.get('comments') or []
+    cursor = issue_data(issue).get('worker_comment_cursor', {}).get(claim.get('session'), -1)
+    if cursor < 0 and not issue_data(issue).get('event_schema'):
+        cursor = max((i for i, text in enumerate(comments) if text.startswith('**nudge**')
+                      and re.search(r'\n\nworker ' + re.escape(claim.get('session') or '') + r'(?:\s|$)', text)), default=-1)
+    for i, text in enumerate(comments[cursor + 1:], cursor + 1):
+        if text.startswith('**answer**') and not issue_data(issue).get('event_schema'):
+            yield 'answer', text.partition('\n\n')[2], i
+        if supervised and text.startswith('nudge:'):
+            yield 'nudge', text.partition('nudge:')[2].strip(), i
+
 def follow(item, kind, claim, supervised):
     """A live worker: an answer, a supervisor's `nudge:` comment or 120 silent minutes reach it once (step 2, step 4).
     None: this read shows the task ineligible (#576): the caller ends the task's step."""
-    issue = BOARD.get(item['iid'])
+    issue = read_issue(item['iid'])
     if not executable(issue, item):
         return None  # #576: a reassignment seen by this read: no send, the claim stays
-    last = (issue['comments'] or [''])[-1]
-    answer = last.partition('\n\n')[2] if last.startswith('**answer**') else None  # #307: an answer wakes the worker at once
-    told = last.partition('nudge:')[2].strip() if supervised and last.startswith('nudge:') else None
+    if lead_state(kind, claim['session']) != 'idle':
+        return claim  # busy/unknown: no comment history fetch and no consumption
+    raw = issue_data(issue)
+    old = claim['session']
+    target = recipient('worker', claim)
+    events = event_pending(raw, target)
+    if not events:
+        issue = issue_history(issue)
+    legacy = legacy_worker_message(issue, claim, supervised) if not events else None
+    answer = '\n\n'.join(event['text'] for event in events) if events else legacy[1] if legacy and legacy[0] == 'answer' else None
+    told = legacy[1] if legacy and legacy[0] == 'nudge' else None
     if answer is None and told is None and age(item) < 120:
         return claim
     text = f'The owner answered your question:\n\n{answer}' if answer is not None else told or 'continue: read your issue'
-    old = claim['session']
     claim = {**claim, 'session': effect(kind.send, old, text)}  # R11: a Claude send resumes under a new id; the note names both
-    move(item, item['state'], 'nudge', f'worker {claim["session"]}' + (f' replaces {old}' * (old != claim['session'])), claim=claim)
+    if events:
+        for event in raw['events']:
+            if event['id'] in [value['id'] for value in events]:
+                event['acks'] = list(event.get('acks', [])) + [target]
+    cursor = dict(raw.get('worker_comment_cursor') or {})
+    if old in cursor:
+        cursor[claim['session']] = cursor[old]  # a resumed copy is the same worker's delivery history
+    if legacy and not events:
+        cursor[claim['session']] = legacy[2]
+    item['raw'] = raw
+    move(item, item['state'], 'nudge', f'worker {claim["session"]}' + (f' replaces {old}' * (old != claim['session'])),
+         claim=claim, worker_comment_cursor=cursor)
     item['claim'] = claim  # the nudge comment is now the last note: one send per answer
     return claim
 
@@ -1359,7 +1888,7 @@ def supervise(item, kinds, worker_allowed=True):
         if boss['runtime'] == 'hermes':
             fail('Hermes native supervisor bridge is not configured')
         return
-    fresh = executable(BOARD.get(n), item)  # #532: the list may lag a spawn; #545: or an assignee-only label or reassignment
+    fresh = executable(read_issue(n), item)  # #532: the list may lag a spawn; #545: or an assignee-only label or reassignment
     if not fresh:
         return  # ineligible: sessions, claim and order stay as they are
     admitted = True
@@ -1375,20 +1904,23 @@ def supervise(item, kinds, worker_allowed=True):
         move(item, 'doing', 'spawn', note('worker', sid, kind), claim=item['claim'], order=None)
     elif admitted and item['state'] == 'doing' and claim.get('session') and claim.get('runtime') in kinds:
         kind = kinds[claim['runtime']]
-        live = kind.alive(claim['session'])
-        if live is False:  # the supervisor decides: rework or ask
+        live = runtime_state(kind, claim['session'])
+        if live == 'dead':  # the supervisor decides: rework or ask
             item['claim'] = {**claim, 'session': None}
             move(item, 'doing', 'gone', f'worker {claim["session"]} is gone', claim=item['claim'])
-        elif live:
+        elif live in ('running', 'idle'):
             if follow(item, kind, claim, True) is None:
                 return  # #576: no supervisor send, resume or respawn either
     state = lead_state(lead, boss['session'])
-    issue = BOARD.get(n)
+    issue = read_issue(n)
     if not executable(issue, item):
         return  # #545: a reassignment seen by this second read stops every supervisor send, resume and respawn
     if state == 'dead':
         evidence = tail_of(lead, boss['session']) or 'no log'
-        if lead_deaths(issue['comments']):  # the second death since the last result or answer: the owner decides
+        deaths = item['raw'].get('retry_counts', {}).get('supervisor')
+        if deaths is None:
+            deaths = lead_deaths(issue_history(issue)['comments'])
+        if deaths:  # second death since result/answer
             move(item, 'ask', 'ask', f'supervisor {boss["session"]} is gone again: fix the runtime, then answer.\n\nLast log line: {evidence}')
             return
         move(item, item['state'], 'gone', f'supervisor {boss["session"]} is gone: {evidence}')
@@ -1400,11 +1932,12 @@ def supervise(item, kinds, worker_allowed=True):
             sid = spawn_named(item, lead, 'S', supervisor_brief(item, boss['runtime'], lead))
             item['supervisor'] = {**boss, 'session': sid}
             move(item, item['state'], 'spawn', note('supervisor', sid, lead), supervisor=item['supervisor'])
-    else:
-        found, count = pending(issue, boss)
-        if found and state == 'idle':  # running: its own wait (Claude) or the pass at its turn's end (Codex) delivers them; idle: its process ended: resume it with the events (#525: no sender, no timer)
+    elif state == 'idle':
+        found, count = pending(issue if issue_data(issue).get('event_schema') else issue_history(issue), boss)
+        if found:  # running: its own wait or turn-end pass delivers events; idle: resume with events
             sid = effect(lead.send, boss['session'], f'{" ".join(found)}: read your issue')
             seen(n, sid, count)
+            item['raw'] = issue_data(read_issue(n))
             if sid != boss['session']:  # Claude resumes under a new id (#284): record it; the old one is refused and retired
                 item['supervisor'] = {**boss, 'session': sid}
                 move(item, item['state'], 'nudge', f'supervisor {sid} replaces {boss["session"]}', supervisor=item['supervisor'])
@@ -1416,8 +1949,12 @@ def age(item):
 
 def quick_deaths(n):
     """'requeue ... is gone' notes since the last result or answer."""
+    issue = BOARD.get(n)
+    raw = issue_data(issue)
+    if 'worker' in raw.get('retry_counts', {}):
+        return raw['retry_counts']['worker']
     count = 0
-    for text in reversed(BOARD.get(n)['comments'] or []):
+    for text in reversed(issue['comments'] or []):
         if text.startswith(('**result**', '**answer**')):
             break
         count += text.startswith('**requeue**') and ' is gone' in text
@@ -1496,7 +2033,7 @@ def one_pass(args, table=True):
     with contextlib.nullcontext() if blind else coordination():  # a sandbox pass remains read-only
         held = not blind
         tasks = getattr(args, 'tasks', None) or []  # #481: the list lags the event's own write (a new issue, a label): read those directly
-        issues = [issue for issue in BOARD.list(None) if issue['iid'] not in tasks] + [issue for issue in map(BOARD.get, tasks) if issue['state'] == 'open']
+        issues = [issue for issue in BOARD.list(None) if issue['iid'] not in tasks] + [issue for issue in map(read_issue, tasks) if issue['state'] == 'open']
         items = sorted(filter(None, map(parse, issues)), key=lambda item: (item['priority'], item['iid']))
         blind = bool(os.environ.get('CODEX_SANDBOX'))  # #502: a sandbox sees no other session alive: it would requeue live workers as gone
         if blind:
@@ -1505,9 +2042,12 @@ def one_pass(args, table=True):
         if ready:
             # Admission/accounting use fresh reservations, including work outside this host-label scope.
             # A lagging list can otherwise hide an active worker or overwrite a claim moved to another machine.
-            fresh_issues = [BOARD.get(item['iid']) for item in ready]
+            fresh_issues = [read_issue(item['iid']) for item in ready]
             items = ready = sorted(filter(None, (parse(issue) for issue in fresh_issues if issue['state'] == 'open')),
                                    key=lambda item: (item['priority'], item['iid']))
+        for item in ready:
+            if compatibility_reason(item):
+                fail(compatibility_reason(item))
         worker_slots, occupied = set(), {}
         if local is not None:  # existing active workers consume capacity, even outside this invocation's host scope
             for item in ready:
@@ -1529,7 +2069,7 @@ def one_pass(args, table=True):
                     busy[claim.get('runtime')] = busy.get(claim.get('runtime'), 0) + 1
                 continue
             if item['state'] == 'waiting' and not open_deps(item['deps']):
-                if not executable(BOARD.get(item['iid']), item):
+                if not executable(read_issue(item['iid']), item):
                     continue
                 move(item, 'ready', 'ready', 'dependencies closed')
                 item['state'] = 'ready'
@@ -1541,12 +2081,12 @@ def one_pass(args, table=True):
                 continue
             if item['state'] != 'doing' or claim.get('name') != here or claim.get('runtime') not in kinds:
                 continue  # another machine's, or a session no runtime here can see
-            if not executable(BOARD.get(item['iid']), item):  # #545: the list's labels may lag; an ineligible task keeps its session and slot
+            if not executable(read_issue(item['iid']), item):  # #545: the list's labels may lag; an ineligible task keeps its session and slot
                 busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
                 continue
             runtime = kinds[claim['runtime']]  # step 2: unsupervised (R3 Transition: started before #525, or taken by hand)
-            state = runtime.alive(claim['session'])
-            if state is False:
+            state = runtime_state(runtime, claim['session'])
+            if state == 'dead':
                 gone = f'session {claim["session"]} is gone'
                 if quick_deaths(item['iid']):  # #393: the second death in a row with no result or answer asks, not respawns
                     move(item, 'ask', 'ask', f'{gone} again, the worker dies at once: fix the runtime, then answer.\n\n'
@@ -1556,7 +2096,7 @@ def one_pass(args, table=True):
                 move(item, 'ready', 'requeue', gone, claim=None, result=None)
                 item.update(state='ready', claim=None)
                 continue
-            if state:
+            if state in ('running', 'idle'):
                 claim = follow(item, runtime, claim, False) or claim  # denied: the original claim keeps its slot
             busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
         for item in ready:
@@ -1565,7 +2105,7 @@ def one_pass(args, table=True):
                 continue  # no manager: the task waits, the table says so; another machine's manager: that machine starts it (§ 7 step 3)
             names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
             free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 0 if local is not None else 1)), None)
-            fresh = free and executable(BOARD.get(item['iid']), item)  # #357: the board may have moved since the list; #545: eligibility
+            fresh = free and executable(read_issue(item['iid']), item)  # #357: the board may have moved since the list; #545: eligibility
             if fresh and fresh['state'] == 'ready' and fresh['pm'] == item['pm']:  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
                 if local is not None and fresh['runtime'] not in ('any', free):
                     continue  # a stale list must not select a different or disabled worker runtime
@@ -1636,8 +2176,12 @@ def decisions(items):
 
 EVENTS = ('add', 'answer', 'run', 'result', 'requeue', 'close')  # R4 (#333): each starts one pass after its move
 
-def dispatch(command, tasks, after=None):
+def dispatch(command, tasks, after=None, after_birth=None):
     """R4 (#405): the event pass runs in a detached `tick --quiet` child, its output in .taskq/dispatch.log; the event returns at once."""
+    reason = release_reason()
+    if reason:
+        print(f'taskq: dispatch stopped: {reason}', file=sys.stderr)
+        return
     if os.environ.get('CODEX_SANDBOX'):  # a sandboxed Codex worker can neither start codex nor see other sessions' pids:
         return  # its pass would requeue live tasks as gone and spawn workers that die at once (#269 run 4b)
     try:
@@ -1647,7 +2191,7 @@ def dispatch(command, tasks, after=None):
         with open(CONFIG['root'] / '.taskq' / 'dispatch.log', 'ab') as out:
             out.write(f'{datetime.now():%Y-%m-%d %H:%M:%S} {command} {" ".join(f"#{n}" for n in tasks) or f"pid {after}"}\n'.encode())
             out.flush()  # the event, then the child's lines
-            start_pass([sys.executable, str(Path(__file__).resolve()), 'tick', '--quiet', *['--after', str(after)] * bool(after), '--tasks', *tasks],
+            start_pass([sys.executable, str(Path(__file__).resolve()), 'tick', '--quiet', *(['--after', str(after), '--after-birth', after_birth or '-'] if after else []), '--tasks', *tasks],
                        cwd=CONFIG['root'],
                        stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
     except Exception as error:  # parent board mutation is already settled; report failure to launch its event
@@ -1656,11 +2200,16 @@ def dispatch(command, tasks, after=None):
 start_pass = subprocess.Popen  # tests run the child's pass in process
 
 def event_pass(args):
-    """`tick --quiet`: the tick pass without the table. `--after PID`: first wait for that Codex turn to end (R4 #525).
+    """`tick --quiet`: the tick pass without the table. `--after PID --after-birth ID`: first wait for that Codex turn to end (R4 #525).
     A failed pass exits nonzero and logs its blocker; the detached parent mutation remains settled."""
-    while args.after and pid_alive(args.after):  # ponytail: 5 s poll of one pid; lives exactly as long as the turn
-        time.sleep(5)
     try:
+        while args.after:
+            state = process_state(args.after, getattr(args, 'after_birth', None))
+            if state == 'unknown':
+                raise RuntimeError('turn-end process identity unknown; pass refused')
+            if state == 'dead':
+                break
+            time.sleep(5)
         cmd_tick(args, table=False)
     except (SystemExit, Exception) as error:
         print(f'taskq: dispatch stopped: {str(error).removeprefix("taskq: ")}; resolve the blocker, then run a fresh tick', file=sys.stderr)
@@ -1677,74 +2226,131 @@ def closed(n):
     return f'closed #{n} {body.splitlines()[0]}' if body else f'closed #{n}'
 
 def cmd_wait(args):
-    """Block until the manager is needed: print 'ask #N', 'closed #N <verdict>' (supervised), 'review #N' and 'gone #N'
-    (unsupervised worker, or a dead supervisor), or 'tick' after the window (#407, #525).
-    .taskq/wait-<session>.json (a shell: wait.json) keeps the states last reported to this manager, so an event is printed once each."""
+    """Observe versioned board events; only successful native delivery or explicit ack consumes them."""
     if args.task:
         return wait_task(args)
-    me, kinds, here = args.pm or (session() or {}).get('session'), runtimes(), machine()  # --pm: a sender waits as its manager (R4)
-    path = CONFIG['root'] / '.taskq' / (f'wait-{me}.json' if me else 'wait.json')  # #532: each manager's events, once each
-    ours = lambda item: not me or (item['pm'] or {}).get('session') in (None, me)  # its own tasks and those with no manager
-    seen = json.loads(path.read_text('utf-8')) if path.is_file() else {}
-    receipt = dict(seen)  # the on-disk receipt when this wait began
+    identity, kinds, here = session() or {}, runtimes(), machine()
+    me = args.pm or identity.get('session')
+    def selected(raw):
+        pm = raw.get('pm') or {}
+        return (not me or pm.get('session') in (None, me)) and \
+            (bool(args.pm) or not me or not pm or pm.get('runtime') == identity.get('runtime'))
+    path = CONFIG['root'] / '.taskq' / (f'wait-{me}.json' if me else 'wait.json')
+    legacy_seen = json.loads(path.read_text('utf-8')) if path.is_file() else {}
     end = time.time() + args.window * 60
     while True:
-        now, blind = {}, bool(os.environ.get('CODEX_SANDBOX'))
-        for item in filter(ours, filter(mine, filter(None, map(parse, BOARD.list(None))))):
+        events, legacy_now = [], {}
+        issues = BOARD.list(None) + list(getattr(BOARD, 'closed', lambda: [])())
+        for issue in issues:
+            raw = issue_data(issue)
+            if not raw or not selected(raw):
+                continue
+            item = parse(issue) if issue['state'] == 'open' else parse({**issue, 'labels': [PREFIX + 'ready']})
+            if not item or not mine(item):
+                continue
+            if raw.get('event_schema'):
+                pm = raw.get('pm') or {'runtime': identity.get('runtime', 'owner'), 'session': me}
+                target = recipient('manager', pm)
+                held = raw.get('supervisor') or raw.get('claim') or {}
+                sid = held.get('session')
+                if issue['state'] == 'open' and (raw.get('supervisor') or item['state'] == 'doing') \
+                        and sid and held.get('name') == here and held.get('runtime') in kinds \
+                        and not os.environ.get('CODEX_SANDBOX') and sid not in raw.get('observed_dead', []) \
+                        and lead_state(kinds[held['runtime']], sid) == 'dead':
+                    with coordination():
+                        fresh_issue = read_issue(issue['iid'])
+                        fresh = issue_data(fresh_issue)
+                        fresh_item = parse(fresh_issue) if fresh_issue['state'] == 'open' else None
+                        if fresh.get('pm') != raw.get('pm') or not selected(fresh):
+                            continue  # a new owner is not this observation's delivery recipient
+                        if fresh_item and (fresh.get('supervisor') or fresh_item['state'] == 'doing') \
+                                and (fresh.get('supervisor') or fresh.get('claim')) == held and sid not in fresh.get('observed_dead', []):
+                            append_event(fresh, 'observed-gone', '', [target])
+                            fresh['observed_dead'] = [*fresh.get('observed_dead', []), sid]
+                            effect(BOARD.update, issue['iid'], labels=event_labels(fresh, fresh_issue['labels']), body=block(BLOCK.sub('', fresh_issue['body']).strip(), fresh))
+                        raw = fresh
+                for event in event_pending(raw, target):
+                    events.append({'id': f'{issue["iid"]}:{event["id"]}', 'text': event_line(issue['iid'], event), 'target': target})
+                continue
+            if issue['state'] != 'open':
+                continue
             claim, boss, state = item['claim'] or {}, item['supervisor'] or {}, item['state']
-            if boss:  # a supervised review is its supervisor's (#524); only a dead supervisor is the manager's
-                state = 'gone' if not blind and boss.get('name') == here and boss.get('runtime') in kinds \
+            if boss:
+                state = 'gone' if not os.environ.get('CODEX_SANDBOX') and boss.get('name') == here and boss.get('runtime') in kinds \
                     and lead_state(kinds[boss['runtime']], boss['session']) == 'dead' else 'review*' if state == 'review' else state
-            elif state == 'doing' and not blind and claim.get('name') == here and claim.get('runtime') in kinds \
-                    and kinds[claim['runtime']].alive(claim['session']) is False:  # ponytail: one alive call per local worker per poll
+            elif state == 'doing' and not os.environ.get('CODEX_SANDBOX') and claim.get('name') == here and claim.get('runtime') in kinds \
+                    and lead_state(kinds[claim['runtime']], claim['session']) == 'dead':
                 state = 'gone'
-            now[str(item['iid'])] = state
-        events = [f'{state} #{n}' for n, state in now.items() if state in ('review', 'ask', 'gone') and seen.get(n) != state]
-        events += filter(None, (closed(n) for n in seen if n.isdigit() and n not in now))  # left the open list: closed?
+            n = str(item['iid'])
+            legacy_now[n] = state
+            if state in ('review', 'ask', 'gone') and legacy_seen.get(n) != state:
+                events.append({'id': None, 'text': f'{state} #{n}', 'target': recipient('manager', raw.get('pm') or identity)})
+        for n in legacy_seen:
+            if n.isdigit() and n not in legacy_now:
+                old = issue_data(read_issue(int(n)))
+                if not old.get('event_schema') and selected(old) and (line := closed(n)):
+                    events.append({'id': None, 'text': line, 'target': recipient('manager', old.get('pm') or identity)})
         if events or time.time() >= end:
-            path.parent.mkdir(exist_ok=True)
-            identity = session() or {}
             native = kinds.get('hermes') if identity.get('runtime') == 'hermes' and identity.get('session') == me else None
-            owned = getattr(native, 'owned', None)
-            if events and callable(owned) and owned(me):
-                # Same current manager only; --pm cannot attach to another gateway. Serialize
-                # native delivery and the existing receipt; never mark an unsuccessful wake seen.
+            native_target = recipient('manager', identity)
+            if any(event.get('target') == native_target for event in events) and callable(getattr(native, 'owned', None)) and native.owned(me):
                 with coordination():
-                    latest = json.loads(path.read_text('utf-8')) if path.is_file() else {}
-                    if latest != receipt:
-                        events = [f'{state} #{n}' for n, state in now.items()
-                                  if state in ('review', 'ask', 'gone') and latest.get(n) != state]
-                        events += filter(None, (closed(n) for n in latest if n.isdigit() and n not in now))
-                    if events:
+                    # Re-read receipts under the board grant; concurrent waits cannot both consume an acked batch.
+                    pending_events = []
+                    for event in events:
+                        if event.get('target') != native_target:
+                            continue  # explicit sender --pm may observe another runtime, never wake this bridge for it
+                        if not event['id']:
+                            pending_events.append(event)
+                            continue
+                        n, number = map(int, event['id'].split(':'))
+                        fresh = issue_data(read_issue(n))
+                        if (not fresh.get('pm') or recipient('manager', fresh['pm']) == native_target) and \
+                                any(value['id'] == number for value in event_pending(fresh, event['target'])):
+                            pending_events.append(event)
+                    if pending_events:
+                        native.check()
+                        if native.state(me) != 'idle':
+                            fail('Hermes manager not confirmed idle; event receipt unchanged')
                         try:
-                            native.check()  # admission guard; no wake for an unavailable bridge
-                            if native.state(me) != 'idle':
-                                fail('Hermes manager not confirmed idle; event receipt unchanged')
-                            if effect(native.wake_manager, me, '\n'.join(events)) != me:
+                            if effect(native.wake_manager, me, '\n'.join(event['text'] for event in pending_events)) != me:
                                 fail('Hermes manager wake changed identity; event receipt unchanged')
                         except Exception as error:
                             fail(f'Hermes manager wake failed ({type(error).__name__}); event receipt unchanged')
-                    effect(path.write_text, json.dumps(now), 'utf-8')
+                        for event in pending_events:
+                            if event['id']:
+                                n, number = map(int, event['id'].split(':'))
+                                acknowledge(read_issue(n), event['target'], [number])
+                    events = [event for event in events if event.get('target') != native_target] + pending_events
+            # Legacy installations retain their historical receipt path until explicit migration.
+            if legacy_now or any(not issue_data(read_issue(int(n))).get('event_schema') for n in legacy_seen if n.isdigit()):
+                path.parent.mkdir(exist_ok=True)
+                path.write_text(json.dumps(legacy_now), 'utf-8')
+            if getattr(args, 'json', False):
+                print(json.dumps({'events': [{key: value for key, value in event.items() if key != 'target'} for event in events], 'tick': not events}))
             else:
-                path.write_text(json.dumps(now), 'utf-8')
-            print('\n'.join(events) or 'tick')
+                print('\n'.join(event['text'] for event in events) or 'tick')
             return
-        seen = now  # a task that leaves review and comes back while we wait is a new event
+        legacy_seen = legacy_now
         time.sleep(args.every)
+
 
 def wait_task(args):
     """The supervisor's wait (§ 7 Supervisor): block until its task needs it, print its events (`pending`), `stop #N` when the
-    task is closed or no longer this session's, or `tick` after the window. Events are marked seen once printed."""
+    task is closed or no longer this session's, or `tick` after the window. Versioned events require explicit ack."""
     n, me, end = args.task, (session() or {}).get('session'), time.time() + args.window * 60
     while True:
-        issue = BOARD.get(n)
+        issue = read_issue(n)
         current = parse(issue) if issue['state'] == 'open' else None
         boss = (current or {}).get('supervisor') or {}
         if not me or boss.get('session') != me:
             return print(f'stop #{n}')
-        found, count = pending(issue, boss)
+        found, count = pending(issue if issue_data(issue).get('event_schema') else issue_history(issue), boss)
         if found or time.time() >= end:
-            found and seen(n, me, count)
+            if found and not isinstance(count, list):
+                seen(n, me, count)  # legacy compatibility only; versioned observation never consumes
+            if getattr(args, 'json', False):
+                return print(json.dumps({'events': [{'id': f'{n}:{number}', 'text': text} for number, text in zip(count, found)] if isinstance(count, list) else [], 'tick': not found}))
             return print('\n'.join(found) or 'tick')
         time.sleep(args.every)
 
@@ -1756,23 +2362,267 @@ def contract():
     path = CLONE / 'taskq.md'
     return hashlib.sha256(path.read_bytes()).hexdigest()[:12] if path.is_file() else None
 
+def release_reason():
+    """Managed launchers select once; older cooperative processes become read-only after pointer switch."""
+    folder = os.environ.get('TASKQ_INSTALL_DIR')
+    if not folder:
+        return None  # direct source invocation is not a managed installation
+    try:
+        selected = json.loads((Path(folder) / 'current.json').read_text('utf-8'))
+        path = Path(selected['path']).resolve()
+        if path == CLONE.resolve() and selected['commit'] == CLONE.name and re.fullmatch(r'[0-9a-f]{40}', selected['commit']):
+            return None
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return 'stale or invalid installed release; use the taskq launcher and re-read taskq pm before further mutations'
+
+
+def release_context():
+    return f'Loaded TaskQ release: {CLONE}; contract {contract() or "unavailable"}. For a new turn use the taskq launcher and re-read its contract.'
+
+
+def cmd_launch(args):
+    """Stable bootstrap: validate and pin one release, then start its code and contract in a fresh interpreter."""
+    if not args.install_dir:
+        fail('launch needs --install-dir or TASKQ_INSTALL_DIR after a qualified explicit update')
+    root = Path(args.install_dir).expanduser().resolve()
+    try:
+        selected = json.loads((root / 'current.json').read_text('utf-8'))
+        commit, source = selected['commit'], selected['path']
+        if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit) or not isinstance(source, str):
+            raise ValueError('pointer needs a full lowercase commit SHA and absolute source path')
+        expected = root / 'releases' / commit
+        path = Path(source)
+        if not path.is_absolute() or path != expected or path.resolve() != expected:
+            raise ValueError('release path is not the canonical installation release directory')
+        for name in ('taskq.py', 'taskq.md'):
+            target = expected / name
+            if target.is_symlink() or not target.is_file():
+                raise ValueError(f'release has no regular {name}')
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        fail(f'launch invalid installation pointer/release: {error}')
+    argv = args.arguments[1:] if args.arguments[:1] == ['--'] else args.arguments
+    os.environ['TASKQ_INSTALL_DIR'] = str(root)
+    os.environ['TASKQ_RELEASE_COMMIT'] = commit
+    os.execv(sys.executable, [sys.executable, str(expected / 'taskq.py'), *argv])
+
+
+def cmd_version(args):
+    git = shutil.which('git')
+    data = {'source': str(CLONE), 'commit': None, 'dirty': None, 'contract': contract(), 'event_schema': 1,
+            'install': os.environ.get('TASKQ_INSTALL_DIR'), 'stale': bool(release_reason())}
+    if git:
+        for key, command in (('commit', ['rev-parse', 'HEAD']), ('dirty', ['status', '--porcelain', '--untracked-files=all'])):
+            done = subprocess.run([git, '-C', str(CLONE), *command], capture_output=True, text=True, encoding='utf-8')
+            if not done.returncode:
+                data[key] = bool(done.stdout.strip()) if key == 'dirty' else done.stdout.strip()
+    if data['install']:
+        try:
+            data['selected'] = json.loads((Path(data['install']) / 'current.json').read_text('utf-8'))
+        except (OSError, ValueError):
+            data['selected'] = None
+    print(json.dumps(data, ensure_ascii=False))
+
+
+def freshness_notice():
+    """Managed-install availability only: bounded remote read, disposable local cache, never an update."""
+    folder = os.environ.get('TASKQ_INSTALL_DIR')
+    if not folder or not re.fullmatch(r'[0-9a-f]{40}', CLONE.name):
+        return
+    path, now = Path(folder) / '.freshness.json', time.time()
+    cached = None
+    try:
+        candidate = json.loads(path.read_text('utf-8'))
+        stamp, sha = candidate['checked_at'], candidate.get('upstream_sha')
+        if type(stamp) in (int, float) and 0 <= now - stamp < 300 and (
+                isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha)
+                or sha is None and isinstance(candidate.get('error'), str)):
+            cached = candidate
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    if cached is None:
+        cached = {'checked_at': now, 'upstream_sha': None}
+        try:
+            gh = shutil.which('gh')
+            if not gh:
+                raise ValueError('gh not found')
+            done = subprocess.run([gh, 'api', '--hostname', 'github.com', 'repos/alexkirs/taskq/git/ref/heads/main'],
+                                  capture_output=True, text=True, encoding='utf-8', timeout=10)
+            if done.returncode:
+                raise ValueError('upstream query failed')
+            sha = json.loads(done.stdout)['object']['sha']
+            if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha):
+                raise ValueError('invalid upstream SHA')
+            cached['upstream_sha'] = sha
+        except (OSError, ValueError, TypeError, KeyError, subprocess.TimeoutExpired) as error:
+            cached['error'] = 'query timed out' if isinstance(error, subprocess.TimeoutExpired) else str(error)[:160]
+        try:
+            path.write_text(json.dumps(cached) + '\n', encoding='utf-8')
+        except OSError:
+            print('taskq: update availability cache unavailable; later commands may check again', file=sys.stderr)
+    if cached['upstream_sha'] is None:
+        print(f'taskq: update availability unknown ({cached["error"]}); retry after the five-minute cache window', file=sys.stderr)
+    elif cached['upstream_sha'] != CLONE.name:
+        print(f'TaskQ upstream revision {cached["upstream_sha"]} differs from loaded {CLONE.name}; '
+              'run taskq update to preview. Qualification and installation remain explicit.', file=sys.stderr)
+
+
 def refresh(pm=False):
-    """#430, before pm, tick and wait: `git pull --ff-only` a clean clone (`"update": false` skips it), then tell a manager
-    whose contract is stale to re-read it; `pm` re-reads it itself."""
-    if CONFIG.get('update', True) and (CLONE / '.git').exists():
-        git = [shutil.which('git') or 'git', '-C', str(CLONE)]
-        status = subprocess.run([*git, 'status', '--porcelain', '--untracked-files=no'], capture_output=True, text=True, encoding='utf-8')
-        if not status.returncode and not status.stdout.strip():
-            # fetch into origin/main, then fast-forward from that ref: FETCH_HEAD is shared with concurrent fetches of task branches
-            pulled = subprocess.run([*git, 'fetch', '-q', 'origin'], capture_output=True, text=True, encoding='utf-8')
-            if not pulled.returncode:  # the clone's own upstream, whatever its default branch is called
-                pulled = subprocess.run([*git, 'merge', '--ff-only', '-q', '@{upstream}'], capture_output=True, text=True, encoding='utf-8')
-            if pulled.returncode:
-                print(f'taskq: git pull --ff-only failed: {last_line(pulled.stderr + pulled.stdout)}', file=sys.stderr)
+    """Compare the running release contract; managed installs also report bounded upstream availability."""
     path = CONFIG['root'] / '.taskq' / 'pm.json'
     known = json.loads(path.read_text('utf-8')).get('contract') if path.is_file() else None
     if not pm and contract() and known and known != contract():  # no pm.json: this session never took the role
-        print('The manager contract changed: run taskq pm and follow it from now on.')
+        print('The manager contract changed: run taskq pm and follow it from now on.', file=sys.stderr)
+    freshness_notice()
+
+def cmd_migrate(args):
+    """Explicit board-only transition. Preflight the whole fresh snapshot before the first write."""
+    if args.apply and not args.controllers_stopped:
+        fail('migrate --apply requires --controllers-stopped after stopping/draining old controllers on every host')
+    with coordination() if args.apply else contextlib.nullcontext():
+        issues = [BOARD.get(issue['iid']) for issue in BOARD.list(None) if BLOCK.search(issue.get('body') or '')]
+        changes = []
+        for issue in issues:
+            item = parse(issue) if issue['state'] == 'open' else None
+            if not item:
+                continue
+            version = item['raw'].get('event_schema', 0)
+            if type(version) is not int or version not in (0, 1):
+                fail(f'#{item["iid"]}: unsupported event_schema {version!r}; migration refused')
+            if version == 0:
+                changes.append((issue, initialize_events(issue)))
+        if args.apply:
+            ensure = getattr(BOARD, 'ensure_event_label', None)
+            if not callable(ensure):
+                fail('board adapter needs ensure_event_label for explicit event-index setup')
+            ensure()
+        else:
+            print('Setup requires reserved taskq-events label (checked/provisioned only on apply)')
+        for issue, raw in changes:
+            print(f'#{issue["iid"]} event_schema 0 -> 1' + (' (apply)' if args.apply else ' (preview)'))
+            if args.apply:
+                # Replace only the matched block, preserving surrounding human prose byte-for-byte.
+                body = BLOCK.sub(lambda _: block('', raw).lstrip('\n'), issue['body'], count=1)
+                effect(BOARD.update, issue['iid'], body=body, labels=event_labels(raw, issue['labels']))
+        print(f'{len(changes)} task(s) ' + ('migrated' if args.apply else 'would migrate; apply requires --controllers-stopped'))
+
+
+def update_git(folder, *argv):
+    try:
+        done = subprocess.run([shutil.which('git') or fail('git not found'), '-C', str(folder), *argv],
+                              capture_output=True, text=True, encoding='utf-8', timeout=120 if argv[0] == 'clone' else 30)
+    except subprocess.TimeoutExpired:
+        fail(f'update git {argv[0]} timed out; selected pointer unchanged')
+    if done.returncode:
+        fail(f'update git {argv[0]}: {last_line(done.stderr + done.stdout)}')
+    return done.stdout.strip()
+
+
+def qualified_checks(commit, upstream):
+    """An operator record is not CI. Require the actual exact-SHA TaskQ upstream tests independently."""
+    if not re.fullmatch(r'(?:https://github\.com/|git@github\.com:)alexkirs/taskq(?:\.git)?/?', upstream):
+        fail('update requires the canonical github.com/alexkirs/taskq upstream')
+    try:
+        done = subprocess.run([shutil.which('gh') or fail('gh not found'), 'api', '--hostname', 'github.com', '--paginate', '--slurp',
+                               f'repos/alexkirs/taskq/commits/{commit}/check-runs'],
+                              capture_output=True, text=True, encoding='utf-8', timeout=30)
+    except subprocess.TimeoutExpired:
+        fail('update exact-SHA CI timed out; selected pointer unchanged')
+    if done.returncode:
+        fail(f'update exact-SHA CI unavailable: {last_line(done.stderr + done.stdout)}')
+    try:
+        pages = json.loads(done.stdout)
+        checks = [check for page in pages for check in page['check_runs'] if check['name'] == 'tests']
+        green = bool(checks) and all(check['head_sha'] == commit and check['status'] == 'completed'
+                                     and check['conclusion'] == 'success' for check in checks)
+    except (ValueError, KeyError, TypeError):
+        green = False
+    if not green:
+        fail('update requires completed successful tests checks for the exact qualified SHA')
+
+
+@contextlib.contextmanager
+def installation_lock(root):
+    """Local installation serialization only, never task state or a board coordination substitute."""
+    root.mkdir(parents=True, exist_ok=True)
+    path, token = root / '.update.lock', uuid.uuid4().hex
+    try:
+        with path.open('x', encoding='utf-8') as handle:
+            handle.write(token)
+    except FileExistsError:
+        fail(f'update installation busy: {path}; no expiry/steal; reconcile a stopped installer explicitly')
+    try:
+        yield
+    finally:
+        if path.read_text('utf-8') != token:
+            fail(f'update installation lock changed; retaining {path} for reconciliation')
+        path.unlink()  # exact owned file only; never delete a release or another installer's lock
+
+
+def verify_release(release, commit, upstream):
+    if update_git(release, 'remote', 'get-url', 'origin') != upstream:
+        fail('update release origin differs; preserving it and the pointer')
+    update_git(release, 'merge-base', '--is-ancestor', commit, 'refs/remotes/origin/main')
+    if update_git(release, 'rev-parse', 'HEAD') != commit or update_git(release, 'status', '--porcelain', '--untracked-files=all'):
+        fail('update release verification failed; preserving it and the pointer')
+    for name in ('taskq.py', 'taskq.md'):
+        entry = update_git(release, 'ls-tree', 'HEAD', '--', name)
+        if not entry.startswith(('100644 ', '100755 ')) or not (release / name).is_file():
+            fail(f'update release has no regular {name}; pointer unchanged')
+
+
+def cmd_update(args):
+    """Install a qualified exact upstream revision without changing any running source checkout."""
+    if not args.install_dir:
+        fail('unmanaged installation: use update --install-dir <directory>; the managed launcher supplies it thereafter')
+    upstream = update_git(CLONE, 'remote', 'get-url', 'origin')
+    candidate = args.commit
+    if candidate is None:
+        lines = update_git(CLONE, 'ls-remote', '--exit-code', 'origin', 'refs/heads/main').splitlines()
+        if len(lines) != 1 or len(lines[0].split()) != 2 or lines[0].split()[1] != 'refs/heads/main':
+            fail('update could not resolve one exact upstream main SHA')
+        candidate = lines[0].split()[0]
+    if not re.fullmatch(r'[0-9a-f]{40}', candidate):
+        fail('update --commit requires a full lowercase 40-character commit SHA')
+    root = Path(args.install_dir).expanduser().resolve()
+    release = root / 'releases' / candidate
+    print(f'Update {candidate} from {upstream}\nRelease: {release}\nPointer: {root / "current.json"}')
+    if not args.apply:
+        return print(f'Preview only; next: taskq update --install-dir {shlex.quote(str(root))} --commit {candidate} --apply --qualification <reviewed-evidence.json>')
+    if not args.qualification:
+        fail('update --apply requires --qualification with reviewed exact-SHA test evidence; upstream CI is checked independently')
+    try:
+        evidence = json.loads(Path(args.qualification).read_text('utf-8'))
+    except (OSError, ValueError) as error:
+        fail(f'update qualification unreadable: {error}')
+    if not isinstance(evidence, dict) or any(evidence.get(key) != value for key, value in
+            dict(commit=candidate, upstream=upstream, tests='passed', review='accepted').items()):
+        fail('update qualification must record this commit/upstream, tests passed and review accepted')
+    qualified_checks(candidate, upstream)
+    with installation_lock(root):
+        previous = root / 'current.json'
+        selected = None
+        if previous.is_file():
+            try:
+                selected = json.loads(previous.read_text('utf-8'))
+                if not re.fullmatch(r'[0-9a-f]{40}', selected['commit']) or not isinstance(selected['path'], str):
+                    raise ValueError('invalid pointer')
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                fail(f'update previous pointer invalid; reconcile explicitly: {error}')
+        if not release.exists():
+            release.parent.mkdir(parents=True, exist_ok=True)
+            # Failure leaves evidence; neither existing source nor active pointer is changed.
+            update_git(root, 'clone', '--no-checkout', '--single-branch', '--branch', 'main', '--', upstream, str(release))
+            update_git(release, 'merge-base', '--is-ancestor', candidate, 'refs/remotes/origin/main')
+            update_git(release, 'checkout', '--detach', candidate)
+        verify_release(release, candidate, upstream)  # retries may reuse only an intact exact qualified release
+        if selected:
+            update_git(release, 'merge-base', '--is-ancestor', selected['commit'], candidate)
+        temporary = root / f'.current-{uuid.uuid4().hex}.json'
+        temporary.write_text(json.dumps({'commit': candidate, 'path': str(release)}) + '\n', encoding='utf-8')
+        os.replace(temporary, previous)
+    print('Installed for new launcher processes; running releases unchanged. Board migration remains explicit.')
+
 
 def adopt(numbers, me):
     """R3 Transition (#532): record this session as the `pm` of tasks with none. The project guard and a fresh read keep
@@ -1798,7 +2648,7 @@ def cmd_pm(args):
     with coordination() if args.adopt else contextlib.nullcontext():
         snapshot = [item for item in map(parse, BOARD.list(None)) if item]
         if args.adopt:
-            snapshot = list(filter(None, (parse(BOARD.get(item['iid'])) for item in snapshot)))
+            snapshot = list(filter(None, (parse(read_issue(item['iid'])) for item in snapshot)))
         if me and any(role(item) in ('supervisor', 'worker') for item in snapshot):
             fail('a recorded supervisor or worker cannot take the manager role (R3 one controller)')
         if args.adopt:
@@ -1845,14 +2695,14 @@ def cmd_arm(args):
         thread = os.environ.get('CODEX_THREAD_ID') or '<this thread>'
         return print(f'''{start}Arm the tick in this session. Codex is not woken when a background command ends, so tick in the foreground:
 loop {{ run `{wait}`; on its output (`ask #N`, `closed #N <verdict>`, `review #N`, `gone #N` or `tick`) run one pass (`taskq tick`) and do
-§ 7 After each pass for those tasks }}. Between turns the outcomes wait on the board for your next pass; the queue does not.
+§ 7 After each pass for those tasks; acknowledge handled [event N:ID] with `taskq ack N:ID` }}. Between turns the outcomes wait on the board for your next pass; the queue does not.
 Optional, only to be woken between turns: `python3 {Path(__file__).resolve()} arm tick {thread}` prints a sender prompt for a
 thread with a local rollout only; no wake of a Codex app thread is promised (#522).
 Codex manager: start it with `codex {CODEX_COMPACT}`.''')
     if not args.target:  # no target: this session ticks itself (Claude: a background command wakes the session on exit)
         return print(f'''{start}Arm the tick in this session. Run `{wait}` as a background command (Claude Code: run_in_background).
 When it ends you are woken with its output (`ask #N`, `closed #N <verdict>`, `review #N`, `gone #N` or `tick`): run one pass (`taskq tick`),
-do § 7 After each pass for those tasks, then start `{wait}` in the background again. Keep exactly one wait running.
+do § 7 After each pass for those tasks, acknowledge handled [event N:ID] with `taskq ack N:ID`, then start `{wait}` in the background again. Keep exactly one wait running.
 Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.json autoCompactWindow 200000).''')
     pm = re.split(r'session_|threads/|/', args.target)[-1]  # #532: the sender consumes as its manager, the id the board records
     resume = f'codex exec {shlex.join(codex_options())} resume {shlex.quote(pm)}'  # the options a worker turn gets
@@ -1861,7 +2711,8 @@ Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.j
     where = rollout(pm) if runtime == 'codex' else None
     if where == 'local':  # a CLI thread: exec resume finds it
         send = f'by running `{resume} "<its output>"`: a new turn on that thread wakes it'
-        shell = (f'\nNo agent needed: `cd {CONFIG["root"]} && while e=$({wait}) && {resume} "$e"; do :; done; '
+        ack = f'python3 {Path(__file__).resolve()} ack --stdin --pm {shlex.quote(pm)}'
+        shell = (f'\nNo agent needed: `cd {CONFIG["root"]} && while e=$({wait}) && {resume} "$e" && printf "%s\\n" "$e" | {ack}; do :; done; '
                  'echo "taskq sender stopped"` in a terminal.')
     elif where == 'archived':  # #522: exec resume of an archived thread is unverified (R12): no route
         return print(f'taskq: {pm} is archived in Codex; `exec resume` of an archived thread is unverified, so no sender.\n'
@@ -1876,11 +2727,13 @@ Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.j
                 'Workers still dispatch without a sender (R4 event chain); only review, ask and gone wait for the manager.\n\n')
     if not any((item['pm'] or {}).get('session') == pm for item in map(parse, BOARD.list(None)) if item):
         note += f'taskq: no open task records {pm} as its pm; this wait shows only tasks with no manager until one does.\n'
-    print(f'''{action}{note}You are the taskq tick sender for the manager session {pm}. Do no task work and run no other taskq command.
+    print(f'''{action}{note}You are the taskq tick sender for the manager session {pm}. Do no task work; use only wait and ack.
 Stay in this one turn and repeat, from {CONFIG["root"]}; do not end the turn between events (an ended turn forwards nothing):
 1. Run `{wait}`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
 2. Send its output, verbatim, to {pm} {send}.
-3. Go back to 1 at once. A failed wait, a failed send or no such send tool: stop, say here
+3. Only after successful delivery run `python3 {Path(__file__).resolve()} ack <N:ID ...> --pm {shlex.quote(pm)}` for every [event N:ID] from that output.
+   A tick has no event to acknowledge. A failed ack stops with one blocker; never assume a lost response was a delivery failure.
+4. Go back to 1 at once. A failed wait, a failed send or no such send tool: stop, say here
    `taskq sender stopped: <error>` once; never retry, never another route.{shell}''')
 
 def main(argv=None):
@@ -1919,13 +2772,24 @@ def main(argv=None):
     command('close', cmd_close, (('n',), {'nargs': '+', 'type': int}), n=False, text=True)
     command('status', cmd_status, n=False)
     command('tick', lambda args: (event_pass if args.quiet else cmd_tick)(args), (('--quiet',), {'action': 'store_true'}),
-            (('--tasks',), {'nargs': '*', 'type': int, 'default': []}), (('--after',), {'type': int}), n=False)
+            (('--tasks',), {'nargs': '*', 'type': int, 'default': []}), (('--after',), {'type': int}), (('--after-birth',), {}), n=False)
     command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}),
-            (('--task',), {'type': int}), (('--pm',), {}), n=False)
+            (('--task',), {'type': int}), (('--pm',), {}), (('--json',), {'action': 'store_true'}), n=False)
+    command('ack', cmd_ack, (('events',), {'nargs': '*'}), (('--pm',), {}), (('--stdin',), {'action': 'store_true'}), n=False)
     command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}), n=False)
     command('pm', cmd_pm, (('--adopt',), {'nargs': '+', 'type': int, 'default': []}), n=False)
     command('cleanup', cmd_cleanup, (('--dry-run',), {'action': 'store_true'}), n=False)
+    command('launch', cmd_launch, (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
+            (('arguments',), {'nargs': argparse.REMAINDER}), n=False)
+    command('version', cmd_version, n=False)
+    command('contract', lambda args: print(f'{CLONE / "taskq.md"} {contract() or "unavailable"}'), n=False)
+    command('migrate', cmd_migrate, (('--apply',), {'action': 'store_true'}),
+            (('--controllers-stopped',), {'action': 'store_true'}), n=False)
+    command('update', cmd_update, (('--commit',), {}), (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
+            (('--qualification',), {}), (('--apply',), {'action': 'store_true'}), n=False)
     args = parser.parse_args(argv)
+    if args.command in ('launch', 'update', 'version', 'contract'):
+        return args.function(args)  # source installation needs no consumer project or board adapter
     if BOARD is None:
         CONFIG = load_config()
         BOARD = make_board(CONFIG)
@@ -1934,15 +2798,19 @@ def main(argv=None):
         fail('TASKQ_HOST_ONLY must equal this machine name (TASKQ_HOST / hosts)')
     if args.command == 'wait' and not args.task or args.command == 'tick' and not args.quiet or args.command == 'pm':
         refresh(args.command == 'pm')
-    writes = args.command in ('add', 'take', 'ask', 'answer', 'result', 'requeue', 'run', 'later', 'close') or \
+    writes = args.command in ('add', 'take', 'ask', 'answer', 'result', 'requeue', 'run', 'later', 'close', 'ack') or \
         args.command == 'cleanup' and not args.dry_run
-    if (writes or args.command == 'tick' or args.command == 'pm' and args.adopt) and getattr(GUARD, 'held', None):
+    if (writes or args.command == 'migrate' and args.apply or args.command == 'tick' or args.command == 'pm' and args.adopt) and getattr(GUARD, 'held', None):
         raise SystemExit('taskq: another command holds the project guard; a new command must acquire independently')
+    if (writes or args.command in ('tick', 'wait') or args.command == 'migrate' and args.apply
+            or args.command == 'pm' and args.adopt) and release_reason():
+        fail(release_reason())
     try:
         with coordination() if writes else contextlib.nullcontext():
             done = args.function(args)
     except SettledError as error:
-        dispatch(args.command, error.tasks)
+        if error.tasks:
+            dispatch(args.command, error.tasks)
         raise
     if args.command in EVENTS:
         dispatch(args.command, done if args.command in ('add', 'answer') else args.n)

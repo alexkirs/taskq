@@ -48,6 +48,10 @@ def stamp(row): row['updated_at'] = datetime.datetime.now(datetime.timezone.utc)
 def list(state):
     with transaction() as rows:
         return [row for row in rows.values() if row['state'] == 'open' and (not state or 'q-' + state in row['labels'])]
+def closed():
+    with transaction() as rows:
+        return [row for row in rows.values() if row['state'] == 'closed' and 'taskq-events' in row['labels']]
+def ensure_event_label(): pass  # file board accepts arbitrary labels; no remote label resource exists
 def get(n):
     with transaction() as rows: return rows[str(n)]
 def add(title, body, labels):

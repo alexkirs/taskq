@@ -25,6 +25,9 @@ The issue's `q-*` label, its JSON block and trusted comments hold all task state
 database, queue, receipt store, mirror or protocol. Local files under `.taskq/` are runtime handles only (§ 8).
 Changed (#603, owner decision 2026-10-10): checkout-local dispatch files → one board-backed project guard.
 Task state stays on issues; the board adapter supplies atomic acquisition and exact-token release (§ 2).
+Changed (owner-approved audit optimizations, 2026-10-10; R1/R4/R8/R12/R13): delivery receipts for
+versioned tasks move from checkout files to their issue JSON. § 3 defines bounded pending events;
+no extra service or local queue is introduced.
 Changed: execution had no per-task identity restriction → `assignee-only` uses native board Assignees,
 never a duplicate identity field or per-user label (#545 recovered by #576, owner decision 2026-10-09).
 
@@ -38,6 +41,10 @@ Changed: "finds duplicates when filing and proposes merge or separate" → triag
 Changed: "one supervisor session and one worker session per task" → one worker session; the supervisor is gone (#290).
 Changed: one worker session → one supervisor and one worker session per task, on every runtime (owner decision
 2026-10-09, #524; research and limits: [docs/supervisor.md](docs/supervisor.md)).
+
+Changed (owner-approved audit, 2026-10-10): worker answers/nudges could interrupt or overlap a turn ->
+deliver only when the runtime confirms idle; running/unknown defers without consuming the board message.
+No native steering is assumed.
 
 ### R3. Roles and session names
 
@@ -98,10 +105,19 @@ Changed: any board identity could execute a task → `assignee-only` requires au
 
 ### R4. Tick is a message or a queue event
 
+Changed (owner-approved audit optimizations, 2026-10-10): a printed observation consumed an outcome →
+versioned-task observation never acknowledges it. The sender acknowledges the exact event IDs only after
+successful delivery; a manager acknowledges after handling them. A failed/lost send leaves events pending.
+Replay is possible, including a lost acknowledgement response; acknowledgement is idempotent, delivery is
+not claimed exactly once. Recipients include runtime and full session identity, never merely board login.
+State, action payload and event identity share one issue update. Human history comments are diagnostic:
+their failure warns without undoing an acknowledged action or poisoning the project grant. Unknown authoritative
+writes, sends, spawns and publication still retain the grant. Operational retry/session records remain in JSON.
+
 A tick is one pass (§ 7), started by a message or by a queue event. A sender runs `taskq tick`; received means one
 pass, not received means nothing. `add`, `answer`, `run`, `result`, `requeue` and `close` start the same pass once after their
 move, in a detached `taskq tick --quiet` child, and return at once: the queue chains itself. Every `codex exec` turn
-the runtime starts (a spawn or a resume, `S<N>` or `T<N>`) also gets one detached `taskq tick --quiet --after <pid>`
+the runtime starts (a spawn or a resume, `S<N>` or `T<N>`) also gets one detached `taskq tick --quiet --after <pid> --after-birth <identity>`
 that runs the pass when that turn's process exits: a sandboxed Codex session's own commands start no pass (#502), so
 its `run`, `result`, `requeue` or `close` takes effect at its turn's end. The children write to `.taskq/dispatch.log`;
 a child that finds the project guard busy waits for a bounded opportunity to run its own fresh pass;
@@ -111,10 +127,7 @@ timer (owner clarification 2026-10-09, #525). The manager is woken only for its 
 until a task enters `ask` or closes, an unsupervised task (R3 Transition) enters `review`, a local session is gone, or
 a safety window (10 min) passes (§ 7 Arm the tick). A pass starts only tasks with no `host-*` label or its own
 machine's, and only those whose `pm` is on its machine (R3). Each manager's `wait` reports only its own tasks (and
-those with no `pm`), each event once per manager: one manager never consumes another's outcome (#532). A sender
-consumes as the manager it serves: `arm tick <manager>` prints `taskq wait --pm <manager id>`, which reads that
-manager's tasks and shares its receipt file, so the manager's own wait and its sender print each event once between
-them; the sender's routes and lifetime stay as #522 set them.
+those with no `pm`), each event acknowledged separately per manager: one manager never consumes another's outcome (#532). A sender observes as the manager it serves: `arm tick <manager>` prints `taskq wait --pm <manager id>`; after delivery it acknowledges that manager's exact board event IDs (§ 3). Routes and lifetime stay as #522 set them.
 Changed (#603, owner decision 2026-10-10): one checkout's `.taskq/dispatch.lock` and pending file → a
 board-backed guard shared by every cooperating TaskQ process for that project. All board mutations, adoption,
 manual take, dispatch and cleanup hold the same guard across fresh reads, runtime/publication effects and records.
@@ -124,8 +137,12 @@ and children acquire independently. Tokens are never inherited by a child. Every
 accounting/admission: a lagging list is not authority. A conflicting acquisition waits up to 30 seconds, then fails
 visibly; it never writes a local pending receipt. Unknown acquisition/authentication/transport errors fail immediately.
 A successful operation releases its exact token. A failure before effects begin may release; an exception after
-any effect began conservatively retains the grant, except an explicitly identified, fully acknowledged terminal
-transition (such as CI-red requeue), which releases and triggers its event despite the CLI refusal. This is because a lost response or unrecorded spawn may still act.
+any effect began conservatively retains the grant, except an explicitly identified, fully acknowledged outcome
+(such as CI-red requeue or pending-CI refusal). These release despite the CLI refusal; only completed transitions
+trigger events. A batch retains the grant if any earlier effect is unknown. This is because a lost response or unrecorded spawn may still act.
+Changed (owner-approved queue optimization, 2026-10-10): polling PR CI under the project guard → one exact-head
+CI read per close attempt. Pending or missing CI leaves review unchanged and releases the guard, including after
+acknowledged earlier closes in a batch; the reviewer retries after CI completes, outside the guard.
 Release failure is visible and never retried automatically. There is no timeout-based ownership expiry, stealing,
 or claim of fencing an old in-flight operation. Recovery requires explicitly stopping/draining all relevant
 controllers and in-flight requests, reconciling board state and runtime sessions, then deleting only the exact
@@ -159,10 +176,13 @@ Changed: Hermes wait had no native wake → the current Hermes manager, only wit
 and confirmed idle state, receives the wait outcome before its existing wait receipt is written. Wake failure
 is visible and preserves the previous receipt (owner lifecycle corrections, 2026-10-09). A busy/unknown owned
 manager refuses consumption; a manager with no bridge handle keeps the printed wait path. `--pm` never grants
-a cross-gateway wake. Concurrent owned-manager waits serialize the delivery/receipt boundary locally.
+a cross-gateway wake. Concurrent owned-manager waits serialize the delivery/ack boundary under the project guard.
 
 Hermes limitation (local candidate, § 8): the native bridge must supply turn/event delivery and manager wake;
 without that qualified bridge the unattended lifecycle above is unverified (R12).
+
+Changed (owner-approved audit, 2026-10-10): bare PID turn-end polling -> polling the recorded process birth
+identity; a reused PID ends the original wait. Missing/unverifiable identity stops the pass visibly.
 
 ### R5. Worker writes completion to the task
 
@@ -280,8 +300,14 @@ Changed: free-text questions → decision cards with option codes `N.K` (#490).
 
 This file is the whole contract (with [docs/single-file.md](docs/single-file.md) for design). Briefs and docs link
 here; they never copy it. A change of behavior updates this file in the same deliverable.
+Changed (owner-approved compatibility update, 2026-10-10): implicit hot pull → explicit qualified immutable
+release update; legacy issue blocks are read-only until guarded migration (§ 1). Running code and its contract
+always come from the same release. Managed installs also give a bounded, cached cross-host upstream
+availability reminder on normal command startup; this is notification, never installation or qualification.
 Changed: testing mechanics implicit in worker/review commands → § 10 defines risk-based evidence, preserved
 fault detection and a bounded pilot; no broad suite migration (#533).
+Changed (owner-approved queue optimization, 2026-10-10): full history on every fresh read → optional metadata-only
+adapter reads and lazy trusted comments (§ 2), preserving fresh admission checks and custom `get(n)` compatibility.
 Changed: "the Wiki is the SoT; principles.md is its packaged copy" → `taskq.md` at the root is the SoT (#289, #290).
 Changed: Open "delete the Wiki pages or mark them stale" → the Wiki is a stub linking here (#452).
 
@@ -337,12 +363,44 @@ Changed: no cleanup command → `taskq cleanup`, run by the owner on demand, nev
 of tasks not open, never unmerged or uncommitted work, and never with `--force` (#476, § 4). A session goes only by
 the id the board records, never by its name, never while it runs (#478).
 
+Changed (owner-approved audit, 2026-10-10): Codex PID-only ownership -> Windows creation time, Linux
+boot ID/start time, or macOS libproc start seconds/microseconds. Termination pins a Windows process handle
+or Linux pidfd before verifying identity.
+Process ownership also requires the local OS/host domain: Linux boot UUID, or a SHA-256 of the native
+Windows/macOS hostname. A different OS, boot or hostname domain means unknown, even if that local PID
+is absent. Birth mismatch means dead only inside the same domain. Earlier Windows/macOS tokens without
+a hostname domain remain unknown. Hostname hashing distinguishes ordinary hosts, not cloned hostnames
+or an authenticated machine identity; renamed hosts require explicit handle reconciliation.
+Preserving a requested predecessor also defers its replacement: `retire` returns explicit False for
+unknown ownership, a running predecessor that must not be stopped, or unavailable safe termination.
+`replace` then admits no new session and keeps the order pending. Unknown unrelated handles do not block
+the requested task. Fully retired selected sessions return True; legacy custom-runtime None remains
+compatible. Uncertain termination/archive errors propagate and retain the project guard.
+Before any Codex spawn, its canonical target handle must be absent or identify a confirmed dead process.
+Malformed, unreadable, unknown or running target handles block launch and stay intact, even when no
+session ID can be attributed; the filename permits refusal, never destruction. Other target names do not
+block this launch. Handle writes use an exclusive nonce temporary file and atomic replacement; a failed
+write/replacement preserves the prior handle and leaves any temporary evidence for reconciliation.
+Legacy PID-only handles, unreadable identity and unsupported platforms stay unknown and are preserved;
+cleanup never deletes them or signals their PID. macOS confirms liveness and turn-end with libproc;
+running-process termination is refused because no stable signal handle is implemented. Stopped macOS
+sessions can still be resumed or archived. macOS native qualification remains required. The layout and
+return semantics follow Apple
+[`proc_info.h`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info.h) and
+[`libproc.c`](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/libproc/libproc.c).
+
 ### R12. Unverified means unknown
 
 Report only what a fresh read proved. A delivery, exit code, checkout marker or chat turn is not proof of receipt,
 application or completion.
 Changed: automated green alone → scoped assertions plus applicable changed-boundary qualification before main
 publication; missing required evidence holds publication (#533).
+
+Changed (owner-approved audit, 2026-10-10): runtime-specific liveness interpretation -> a shared minimal
+`running`/`idle`/`dead`/`unknown` capability. Custom runtimes without `state` retain `alive` fallback
+(True running, False dead, otherwise unknown); that fallback cannot prove idle or admit a worker send.
+Claude resume IDs and Hermes busy refusal remain native runtime behavior. Local mock/process checks prove
+only these boundaries; changed live-runtime qualification is still required before publication.
 
 ### R13. Spec first
 
@@ -351,6 +409,8 @@ edits this file first, in the same deliverable; code, README and pages follow it
 recorded decision is an `ask` with options, not an edit. Only the owner accepts a change of a decision here.
 Changed: publication/testing contradiction in § 5/§ 6 → accepted #530 methodology and candidate-first
 publication reconciled in § 5/§ 6/§ 7/§ 10 (#533, owner approval 2026-10-09); supervisor reviews, worker implements.
+Changed (owner-approved queue optimization, 2026-10-10): guarded CI waiting and mandatory full-history reads →
+R4's immediate CI refusal and R8's metadata reads, specified before implementation; exact-SHA review and publication remain required.
 Every agent (Claude, Codex, DOT, Hermes, other) reads this file before work; `AGENTS.md` and `CLAUDE.md` point here.
 
 ## Product
@@ -372,7 +432,7 @@ Owner decisions on what taskq looks and sounds like, one line each (#505). Chang
 
 Setup again: identify the installed entrypoint first. A legacy package follows § "Upgrade a legacy package
 installation" below before any pull of its clone. An already qualified single-file clone follows § 1.2's
-Git update procedure and then re-reads this file; preserve project changes when updating the project checkout.
+explicit update procedure below and then re-reads this file; preserve project changes when updating the project checkout.
 
 1. python3 >= 3.9, git; `gh` (GitHub) or `glab` (GitLab) installed and logged in: `gh auth status` / `glab auth status`.
    Workers need the `claude` and/or `codex` CLI.
@@ -384,9 +444,11 @@ Git update procedure and then re-reads this file; preserve project changes when 
    glab's prompts need a real terminal. It gives the user one line for their own terminal:
    `glab auth login --hostname <host> --web`.
 2. `git clone https://github.com/alexkirs/taskq ~/taskq`; `taskq.py` is the only file it needs. Alias:
-   `ln -s ~/taskq/taskq.py ~/.local/bin/taskq` or `alias taskq='python3 ~/taskq/taskq.py'` (Windows: § 9).
-   Update: `git pull` in the clone; `taskq pm`, `taskq tick` and `taskq wait` pull it themselves (`update`, § 2), so keep
-   it on clean `main`.
+   After the first qualified `update --install-dir ~/.local/share/taskq --apply --qualification <record>` from
+   that source, keep it as the immutable bootstrap and use the managed alias:
+   `alias taskq='python3 ~/taskq/taskq.py launch --install-dir ~/.local/share/taskq --'` (Windows: § 9).
+   Before installing a pointer, invoke the source entrypoint directly for read-only setup and explicit update.
+   Update: use the explicit qualified release procedure below. `pm`, `tick` and `wait` never fetch, pull or swap code.
 3. At the project root write `taskq.json` (fields: § 2) and commit it. Labels are created by the first `add`.
 4. Check: `taskq list` prints the queue (empty is fine) and no error. Claude workers: run `claude` once in the
    project root and accept the folder trust prompt (only the owner can); else every spawn fails `Workspace not trusted`.
@@ -426,19 +488,68 @@ replace its entrypoint in place, or diagnose the new CLI with `python -m taskq -
    a child CLI a redirected configuration view: direct CLI login can succeed while that child's API returns
    401/404. If this is reproduced, use a qualified non-Store Python interpreter; do not copy tokens between views.
 6. Switch only this user's command or shell function to the new absolute entrypoint after these checks. Preserve
-   its previous definition for rollback. For normal self-updates, the new clone must be clean `main`; use
-   `git switch main` only when it still names the verified SHA (otherwise verify the new head's CI first).
+   its previous definition for rollback. Normal updates use the qualified immutable release procedure below.
    A candidate branch is reviewed and qualified before becoming an installed production entrypoint (§ 10).
 
 Rollback restores the previous command/function and uses the untouched old installation. It does not reset,
 delete or recreate any old checkout, branch, resource, profile or board claim. If startup or native readiness
-fails, keep the old command available and report the failed check. The current single-file CLI has no `update`
-subcommand: its clone updates by Git (§ 1.2); installation instructions must not promise the legacy command.
+fails, keep the old command available and report the failed check. The explicit `update` command below never
+modifies an existing source checkout or migrates the board implicitly.
 
 For Windows Codex, the supported current runtime uses `codex exec` and `codex app-server` over stdio (§ 8).
 Its startup `initialize` handshake can be tested without creating a thread or model turn. The old package's
 `app-server proxy` control-socket error is not evidence that this stdio route fails. Startup proof still does
 not replace the isolated spawn, naming, result and retirement qualification required by § 10.
+
+### Explicit release update and issue migration
+
+`taskq update` resolves and previews configured origin/main (an explicit network read). The managed launcher
+supplies `TASKQ_INSTALL_DIR`; an unmanaged installation needs `--install-dir <directory>`. Optional
+`--commit <full SHA>` pins the reviewed revision, including when main moves after preview. Preview reports the source,
+exact commit and destination without a fetch or a write. Apply adds `--apply --qualification <JSON file>`.
+The qualification record is explicit operator evidence: `{"commit":"<full SHA>","upstream":"<origin URL>",
+"tests":"passed","review":"accepted"}`. It attests review/local qualification; it is not an authenticated CI
+receipt. Apply independently requires every `tests` check on that exact SHA in the canonical GitHub TaskQ
+upstream to be completed/successful, and refuses missing checks or unreadable CI. It fetches origin/main into
+a new checkout, requires that qualified SHA to be on its history, checks out that exact commit detached and
+verifies clean source. Unknown upstreams refuse application. There is no arbitrary-HEAD or offline bypass.
+
+Apply creates `<install-dir>/releases/<SHA>`, then atomically replaces `<install-dir>/current.json` with
+`{"commit":"<SHA>","path":"<absolute release directory>"}`. An existing release is reused only after exact SHA, origin, main ancestry, clean-tree and regular-file
+verification plus current qualification/CI checks; incomplete releases are preserved and refused. A local exclusive
+installation lock serializes applies, with exact-token release and no expiry/steal; a crashed lock requires explicit
+reconciliation after stopping the installer. A candidate must descend from the selected commit: automatic downgrades
+are refused. No release is reset or overwritten. Git discovery/fetch operations have a 30-second timeout,
+clone has 120 seconds, and upstream CI queries have 30 seconds. Timeout/offline failures keep the selected pointer unchanged. Source and previous releases remain untouched.
+`taskq.py launch --install-dir <directory> -- <arguments>` is the canonical managed launcher in this same file.
+`--install-dir` defaults to `TASKQ_INSTALL_DIR`. Keep the qualified bootstrap source unchanged: its stable pointer
+protocol loads the selected release; it does not run queue commands itself. It reads the pointer once, requires
+a full lowercase SHA and exactly the canonical `<root>/releases/<SHA>` path without release-directory symlinks,
+and requires regular `taskq.py` and `taskq.md` files there. It exports `TASKQ_INSTALL_DIR` plus
+`TASKQ_RELEASE_COMMIT`, then replaces itself with the same Python interpreter executing that release
+and forwards the remaining arguments. Launch reads no project configuration or board; children use their
+parent's release path. Every new-version mutation/dispatch/effect checks the current
+pointer and refuses when this process is stale or the pointer invalid. Read-only inspection remains available.
+Briefs identify the loaded release and contract hash and direct a new turn to the launcher. `taskq pm` prints
+the current release contract; no global hash file proves every individual agent has read it. Old versions lack
+this gate: explicit all-host stop/drain remains mandatory. `taskq version` reports source, Git SHA/dirty state,
+contract hash, supported schema and selected pointer; `taskq contract` prints its canonical path and hash. Pointer rollback requires the corresponding board format
+and controller compatibility; restoring an old launcher does not make mixed versions safe. A direct alias to
+a source file is not switched by this command. No board change, dispatch, model call or publication is an update.
+
+`taskq migrate` previews all open task blocks, regardless of report filters. `taskq migrate --apply
+--controllers-stopped` records the operator's explicit confirmation that old controllers on **every host**
+and all in-flight requests have stopped/drained and their sessions have been reconciled. This is mandatory:
+old clients ignore markers and the new guard cannot fence them. Apply takes the common project guard, reads
+fresh full issues, preflights every version before any write, ensures the reserved `taskq-events` label, and initializes `event_schema: 1` plus the event
+fields defined in R4. Absent/zero is legacy; one is already migrated and remains unchanged; unknown, invalid or
+future versions fail closed. Re-running migration is idempotent. Raw unknown fields, claims, PM ownership,
+human text and comment history are preserved; labels retain their values plus the reserved pending-event index
+as required by the event helper. Run apply once for a new board as explicit label setup even without legacy tasks.
+Custom boards need `ensure_event_label()` for this explicit setup; missing capability refuses setup, not read-only reports. Migration is explicit, never startup/dispatch behavior.
+Legacy tasks remain visible in read-only reports but cannot be mutated, adopted or executed by new clients.
+New tasks are created at version one. Partial write failures retain the common guard for reconciliation;
+no automatic retry or rollback erases acknowledged work. Closed history is not rewritten.
 
 ## 2. Configuration: taskq.json
 
@@ -458,7 +569,7 @@ not replace the isolated spawn, naming, result and retirement qualification requ
 | `board_options` | GitLab: `{"coordination_board": ID, "coordination_label": ID}`; permanent dedicated board and label, provisioned explicitly once | required for GitLab writes |
 | `repo` | `owner/repo` (GitHub) or `group/project` (GitLab) | required for github/gitlab |
 | `host` | Enterprise or self-managed host | the CLI's default |
-| `update` | `false`: `pm`, `tick` and `wait` do not `git pull` the taskq clone (§ 7) | `true` |
+| `update` | legacy setting accepted; commands never hot-pull, whatever its value | unused |
 | `glab_client_id` | Self-managed GitLab: the OAuth Application ID users give `glab` before login (§ 1) | none |
 | `publish` | `direct` or `pr` (§ 6) | `direct` |
 | `workspace` | `external`: the host owns the worker's worktree and branch `taskq-<N>`; taskq never creates or removes them (§ 5, § 6) | taskq-owned `.worktrees/taskq-<N>` |
@@ -493,6 +604,10 @@ in the intended invocation shell. Setting these values alone starts no queue and
 
 Board file: six data functions plus `acquire(owner)` and `release(token)` for writes; modules without the guard support read-only commands only. An issue is a dict `{iid, title, body, labels, state: open|closed,
 updated_at, url}`, optionally `assignees` (logins); `get` adds `comments` (a list of strings, oldest first).
+Optional `metadata(n)` returns the same fresh issue without comments; optional `comments(n)` returns trusted
+comments in oldest-first order. Built-in adapters provide both. TaskQ uses metadata for current state, claims,
+eligibility and capacity, and fetches history only where consumed. Neither caches nor removes a fresh safety read.
+Adapters without these optional methods retain the full `get(n)` path unchanged.
 With `"assignee": "me"` or an `assignee-only` task the file also needs `user()`: the authenticated current login.
 The configured `assignee` filter (and its cached `me`) is selection, never identity authentication.
 
@@ -537,11 +652,44 @@ Runtime file: four module-level functions, three more optional.
 | `send(session, text)` | deliver one message; returns the session id (it may change) |
 | `alive(session)` | `True` running, `False` gone, `None` cannot tell |
 | `link(session)` | a URL the owner opens to watch the session, or `None` |
-| `retire(gone, running=True)` | optional: stop and remove this machine's `T<N>`/`S<N>` sessions with `gone(N, session, live)` true; `close` calls it for its task's recorded workers, the tick with `running=False` for recorded sessions of tasks not open or replaced (R11) |
+| `retire(gone, running=True)` | optional: stop and remove this machine's `T<N>`/`S<N>` sessions with `gone(N, session, live)` true (`live=None` unknown); explicit False defers replacement, True confirms selected retirements, legacy None is accepted; `close` calls it for its task's recorded workers, the tick with `running=False` for recorded sessions of tasks not open or replaced (R11) |
 | `tail(session)` | optional: the session's last log line, for the ask after a second quick death (§ 7) |
-| `state(session)` | optional: a supervisor's `running`, `idle`, `dead` or `None` (§ 7 step 4); without it `alive` stands in |
+| `state(session)` | optional: a session's `running`, `idle`, `dead` or `unknown` (`None` is accepted as unknown); without it `alive` stands in, never proving idle |
 
 ## 3. Data model
+
+Event schema (owner-approved audit optimizations, 2026-10-10): `event_schema: 1` marks the delivery
+format. Missing means legacy; newer or invalid versions are refused. Existing unknown JSON fields,
+claims and PM identities are preserved. Migration requires the explicit quiescent update procedure;
+old clients must not write concurrently. `initialize_events(issue)` captures outstanding legacy signals
+and existing retry counts for that procedure. Legacy histories remain readable.
+
+`event_seq` is a monotonic per-issue integer. `action` records the last action's ID, name, text and author;
+`events` retains at most 64 unacknowledged entries, each with `id`, `action`, `text`, `by`, `recipients`
+and `acks`. A full pending set refuses the next action before its write; it never overwrites an outcome.
+Fully acknowledged entries may be compacted, and acknowledging an already compacted ID is a no-op.
+Each recipient is role, runtime and full session ID. Tasks without a manager use a wildcard manager
+recipient and retain their per-manager acknowledgements until adoption resolves the wildcard to its recorded PM, retaining an acknowledgement from that PM. For a closed unowned task, the first explicit manager acknowledgement completes the wildcard delivery without assigning a PM; it removes the pending-event index and does not broadcast old outcomes to future managers. Unowned open tasks can fill the same bound. An explicit worker/supervisor replacement or clear cancels obsolete recipient deliveries; it never forwards an old answer to a replacement worker. Fully cancelled entries compact like acknowledged ones; session retirement records are preserved. `retry_counts` and `session_records` preserve recovery limits and retirement identity when a
+diagnostic history comment fails. `worker_comment_cursor` acknowledges external `nudge:` comments per worker.
+Review corrections (owner-approved audit slice): manager identity includes runtime and full session ID;
+an explicit `--pm` sender may observe another runtime but never wakes a different runtime's native bridge.
+Migration imports every pending legacy answer after that worker's acknowledged history boundary. A resumed
+worker keeps its previous comment cursor. An unsupervised worker produces `gone` only while still `doing`,
+rechecked under the project guard; a supervised task keeps its supervisor-death notification in any open state.
+`action_payloads` retains the latest full `{id, by, text}` for each of `ask`, `answer`, `requeue`, and `result`.
+Only a newer action of that same kind supersedes its payload; spawn, nudge, ack and event compaction leave it
+available in the issue and in worker/supervisor briefs. This fixed four-action map is not an unbounded history.
+Migration seeds it from trusted history, so current rework instructions and full result text survive comment
+failure and session replacement. Short decision summaries remain display text only.
+
+`wait` prints human event lines with `[event N:ID]`; `wait --json` prints `{events:[{id,text}],tick:bool}`.
+Neither consumes versioned events. `taskq ack N:ID [...] [--pm ID]` acknowledges the current recipient;
+`--pm` is the sender's explicit delegation to the task's recorded manager, never a change of task ownership.
+`taskq ack --stdin [--pm ID]` reads those human lines from stdin. The sender must use the same target for wait,
+delivery and ack, and stop on a failed send or ack. Supervisor waits use the same explicit acknowledgement.
+Successful in-process supervisor/worker sends and verified native Hermes wakes acknowledge their exact batch.
+The reserved non-state label `taskq-events` indexes issues with pending manager deliveries; label and JSON are updated together, including removal after ack. Setup/migration provisions this label explicitly. `wait` may record a newly observed dead session under the project guard, but does not acknowledge it. An optional board `closed()` returns closed issues carrying that index; built-in boards implement it so a manager also discovers
+outcomes closed before its first wait. A custom adapter without it cannot discover never-observed closed tasks.
 
 - A task is an open issue. Closed issue: done.
 - State: exactly one label `q-<state>`.
@@ -593,9 +741,9 @@ Runtime file: four module-level functions, three more optional.
   `runtime` the worker's), its `session` filled by the worker's spawn and emptied when that worker is gone or requeues.
 - `order` (#525): `"run"` or `"rework"`, set by `run` or the supervisor's `requeue`; the pass spawns `T<N>` and clears it.
 
-- History: every command posts one comment `**<action>** · <runtime>:<session 8>` (or `owner`), then its text.
+- History: every command attempts one diagnostic comment `**<action>** · <runtime>:<session 8>` (or `owner`), then its text.
   An agent session (the manager too) is named by its own session; a plain shell is `owner`.
-  The comments are the log; read them with `gh issue view N --comments` / `glab issue view N --comments`.
+  The comments are a diagnostic log; authoritative current payload, pending events, retry counts and session records are in JSON. Read the log with `gh issue view N --comments` / `glab issue view N --comments`.
 - Trust: only issues and comments of collaborators (GitHub) or members with Reporter or higher (GitLab) count.
   Another author's issue is never a task.
 - Never edit labels or the block by hand while a task is `doing`; use the commands.
@@ -616,9 +764,9 @@ Runtime file: four module-level functions, three more optional.
 | `taskq later N [--text T]` | park: any state → `later`; drops claim and supervisor |
 | `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
 | `taskq status` | print the R6 report only: one board list, no pass, no pull, no write, no dispatch, no session started (#574) |
-| `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4); `--after PID`: first wait for that Codex turn's process to end (R4) |
-| `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed, for the tasks whose `pm` is this session or that have none (all of them from a plain shell); print `ask #N`, `review #N` (an unsupervised task, R3 Transition), `closed #N <verdict>` (a supervised task, § 7 Supervisor 3.3), `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7); each manager's events are its own, once (`.taskq/wait-<session>.json`; a plain shell: `.taskq/wait.json`); `--pm ID`: wait as manager `ID`, its tasks and its file (a sender, R4) |
-| `taskq wait --task N [--window MIN] [--every SEC]` | the supervisor's wait: block until its task needs it; print `review #N`, `ask #N`, `answer #N`, `gone #N` (its worker), `requeue #N` (by its worker), one line each, each once (`.taskq/S<N>.seen`); `stop #N` when the task is closed or the calling session is not its supervisor; `tick` after the window |
+| `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4); `--after PID --after-birth ID`: first wait for that identified Codex turn to end (R4) |
+| `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed, for the tasks whose `pm` is this session or that have none (all of them from a plain shell); print `ask #N`, `review #N` (an unsupervised task, R3 Transition), `closed #N <verdict>` (a supervised task, § 7 Supervisor 3.3), `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7); versioned events include `[event N:ID]` and replay until `ack` (§ 3); `--json` prints event IDs and text; `--pm ID`: observe as the task's manager ID (a sender, R4) |
+| `taskq wait --task N [--window MIN] [--every SEC]` | the supervisor's wait: block until its task needs it; print `review #N`, `ask #N`, `answer #N`, `gone #N` (its worker), `requeue #N` (by its worker), one line each, replayed until `ack` for versioned tasks (§ 3); `stop #N` when the task is closed or the calling session is not its supervisor; `tick` after the window |
 | `taskq pm [--adopt N ..]` | print the manager role (Principles, § 7, how to tick this session) under a first line `taskq pm contract <hash>`; record the hash of the clone's `taskq.md` in `.taskq/pm.json` (§ 7), nothing else: a task's manager is its `pm` (R3, #532); refused for a session an open task records as its supervisor or worker, so neither passes the gate as the manager (R3). `--adopt N`: record this session as the `pm` of open tasks that have none, under the project guard with a fresh read; a task with a `pm`, or a busy lock, refuses all of them (R3 Transition) |
 | `taskq cleanup [--dry-run]` | the owner's manual sweep of this machine (below); `--dry-run` prints the same and changes nothing |
 | `taskq arm tick [<manager>]` | print the prompt for a tick-sender session of this runtime (Codex: `exec resume` only for a thread with a local rollout, § 7); without `<manager>`: how this session ticks itself (a background `taskq wait` that wakes it) (§ 7) |
@@ -704,8 +852,9 @@ Rules:
   a head that differs from the result SHA, or several PRs, refuses the close.
 - `pr` mode on GitHub (#359): `main` requires the `tests` check (`.github/workflows/tests.yml`) on the PR head only,
   not strict: a PR behind `main` merges without an update. `close` merges only a head with `tests` green; GitHub
-  refuses a PR with conflicts. `tests.yml` runs again on `main` after each merge, as the alarm. A conflict, a failed
-  `tests`, or no result within 10 min sends the task back to `ready`. Set the rule once (repo admin):
+  refuses a PR with conflicts. `tests.yml` runs again on `main` after each merge, as the alarm. A conflict or failed
+  `tests` sends the task back to `ready`. Each close reads CI once: pending or missing checks leave `review`
+  unchanged, release the guard and refuse without an event; retry after CI finishes. Set the rule once (repo admin):
 
   ```sh
   echo '{"required_status_checks": {"strict": false, "checks": [{"context": "tests", "app_id": 15368}]},
@@ -718,9 +867,10 @@ Rules:
   Changed: strict check, `close` updates a behind PR (`gh pr update-branch`) and merges the new head → `tests` on the
   PR head only, no update (#308 → #359): the strict check made merges serial, about 41 s each (#269).
 - `pr` mode on GitLab (#479), same flow: `close` finds the open MR of `taskq-<N>` (`glab mr list --source-branch`),
-  waits for the MR's latest pipeline on its head (`projects/:id/merge_requests/:iid/pipelines`) to reach `success`,
-  then `glab mr merge --squash --remove-source-branch --sha <head>`. A failed, canceled or skipped pipeline, no
-  finished pipeline within 10 min, or a refused merge (conflict) sends the task back to `ready`. The project needs CI
+  checks the MR's latest pipeline on its head once (`projects/:id/merge_requests/:iid/pipelines`) for `success`,
+  then `glab mr merge --squash --remove-source-branch --sha <head>`. A pending or missing
+  pipeline leaves `review` unchanged with the guard released; a refused merge (conflict) sends the
+  task back to `ready`, as does a failed/canceled/skipped pipeline. The project needs CI
   (`.gitlab-ci.yml`) that runs on MRs, and squash allowed. Self-managed: `"host"` in `taskq.json`; `glab` gets
   `-R https://<host>/<group>/<project>`.
 - An answer without a commit, or a legacy result already on `origin/main`: `close` verifies ancestry and closes
@@ -746,10 +896,17 @@ The manager starts with `taskq pm` in each explicit project root and follows wha
 open tasks with no `pm`, including tasks outside the report filter. Triage them explicitly and state the exact
 project-specific `taskq pm --adopt N` action before leaving them blocked; adoption remains an explicit choice,
 never automatic. Never seize a task with a manager or change foreign claims. `taskq pm`, `taskq tick` and
-`taskq wait` first run `git pull --ff-only` in the taskq clone when it is clean (one line on failure), then compare the hash of its
-`taskq.md` with `.taskq/pm.json` (a runtime handle, R1). A different hash prints first: `The manager contract changed:
-run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#430). `taskq pm` prints the pulled
-contract itself, so it skips that line. `"update": false` in `taskq.json` turns the pull off.
+`taskq wait` compare the hash of the running release's
+`taskq.md` with `.taskq/pm.json` (a runtime handle, R1). A different hash warns on stderr: `The manager contract changed:
+run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#430). `taskq pm` prints that release's
+contract itself, so it skips that line. These commands never update source code. In a managed install they also check canonical GitHub `main`
+availability on startup, at most once per five-minute local cache window (concurrent cache misses may each
+check). The read-only query is explicitly pinned to github.com with a 10-second timeout. A differing SHA
+prints `taskq update` preview guidance, never claims the revision is qualified, and never installs or dispatches.
+Offline/malformed responses show availability unknown, cache that result for the same window, and allow
+compatible work to continue. `<install-dir>/.freshness.json` holds only this disposable timestamp/result cache:
+it is no authority, grant, queue state or event receipt. A corrupt/expired cache is ignored. Other hosts see the
+reminder on their next regular command after the cache window; an idle host is not automatically updated.
 
 ### Arm the tick
 
@@ -788,9 +945,9 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
      prompt to the owner or the app manager.
    No shell bridge, no copy of rollouts or auth. A Claude sender reaches only Claude sessions. A failed wait, a
    failed send or a missing send tool stops the sender with one blocker line: no retry, no other route, no loop on
-   a failing board. The wait file has marked that event; the manager's next pass still shows it.
+   a failing board. The board event stays pending until an explicit ack after delivery; a later observation can replay it.
    An agent sender forwards only while its own turn runs: it stays in that one active turn and repeats wait, send
-   without ending it between events. An ended sender turn or a wait left running alone forwards nothing; taskq
+   without ending it between events, then acknowledges the delivered IDs before waiting again. An ended sender turn or a wait left running alone forwards nothing; taskq
    promises no unattended lifetime beyond a sender that is running (#522).
 2. Optional: start a separate sender session on that prompt. It does no task work. The queue never needs it (R4):
    it only carries the manager's short outcomes to a manager that cannot wake itself.
@@ -798,8 +955,7 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
    `review #N` (an unsupervised task only; a supervised one's review is its supervisor's, #524),
    `closed #N <verdict>` (a supervised task: the first line of its close text, the supervisor's verdict, § Supervisor 3.3), `gone #N` (an unsupervised worker, or a supervisor
    found dead by step 4, claimed on this machine), or `tick` when nothing happened for 10 min. `.taskq/wait-<session>.json`
-   (a plain shell: `.taskq/wait.json`) keeps the states last reported to this manager, so an event is printed once per
-   manager (a runtime handle, R1); its sender's `wait --pm` uses the same file.
+   is a legacy receipt only. Versioned tasks use their board event IDs: wait is observation, then delivery/handling, then explicit ack (§ 3).
 4. The manager treats any message from the sender as a tick: one pass (`taskq tick`), then § After each pass. A
    stalled worker (120 min silent) is nudged by the pass the `tick` line starts.
 
@@ -817,9 +973,8 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
 1. `waiting` with every dep closed → `ready`.
 2. `doing`, claimed on this machine, no `supervisor` (R3 Transition: started before #525 or taken by hand, § 5): `alive` False → requeue (`session ... is gone`); the second such requeue since
    the last `result` or `answer` → `ask` instead, with the last log line (`tail`; Codex: `.taskq/T<N>.log`, Claude:
-   `claude logs`), and no new spawn (#393). Alive and the issue unchanged
-   for 120 minutes → `send(session, 'continue: read your issue')`, comment `nudge`. Alive and the last comment an
-   `answer` → `send` the answer text at once, comment `nudge` (one send per answer).
+   `claude logs`), and no new spawn (#393). Confirmed idle and the issue unchanged
+   for 120 minutes → `send(session, 'continue: read your issue')`, comment `nudge`. Confirmed idle with pending answer events or a supervisor's `nudge:` comment → deliver their payloads even through intervening ordinary comments, then acknowledge those exact events/recipient. Running or unknown workers defer delivery; observation does not lose pending work. The human `nudge` log is diagnostic.
 3. `ready`, deps closed, host matches, a free slot for its worker's runtime (`run-*` label, else the first free in
    `limits`), its `pm` on this machine (R3, #532; no `pm`: the task waits, the report says `blocked (no manager)`; another
    machine's: that machine starts it), re-read from the board →
@@ -832,7 +987,7 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
      root)`, record `claim`, comment `spawn`. A requeue spawns a new worker that continues branch `taskq-<N>` (#291).
    - the supervisor's state. `alive` alone cannot tell: a Codex supervisor's process exits at the end of every turn,
      by design. From what the pass can read:
-     - running. Codex: the pid in `.taskq/S<N>.pid` runs; the pass at its turn's end (R4) delivers what came
+     - running. Codex: the process birth identity in `.taskq/S<N>.pid` matches a running process; the pass at its turn's end (R4) delivers what came
        meanwhile. Claude: `claude agents` lists it with a pid; its own background `taskq wait --task N` delivers.
      - idle, the expected state between events. Codex: the pid has exited, the last turn in `.taskq/S<N>.log` (after
        its last `turn.started`) ended `turn.completed`, and the thread's rollout is local (the #522 check of
@@ -841,12 +996,13 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
        either way it is woken: by its wait, or by the pass's resume. #526 records it. Idle is never respawned, never
        reported `gone`, never an `ask`. A runtime file may define
        `state(session)`; without it `alive` stands in (False: dead).
-     - dead: anything else of the recorded supervisor of an open task. Codex: no pid file, the last turn ended
+     - unknown: no local handle, legacy PID-only handle, unreadable identity or unsupported platform; preserve and defer.
+     - dead: anything else of the recorded supervisor of an open task. Codex: an identified process exited and the last turn ended
        `turn.failed`, `error` or with no terminal event (killed), or no local rollout. Claude: not listed, or
        `failed` with no pid.
    - an event for the supervisor (`review`, `ask` by the worker, `answer`, worker `gone`, a worker's `requeue`):
      idle → `send(supervisor, '<event> #N ...: read your issue')` with every event since it last got them
-     (`.taskq/S<N>.seen`: `<id> <comment count>`, a runtime handle; none yet: since its `spawn` note), once. Codex
+     with exact board event IDs; acknowledge only after successful send. Legacy tasks use their existing `.taskq/S<N>.seen` boundary until migration. Codex
      `exec resume` keeps the thread id; a Claude resume makes a new id (#284): the pass records it as `supervisor`
      with comment `nudge` `supervisor <new> replaces <old>`, so the old id is refused (§ 4) and retired once stopped.
      Running → nothing: it gets them from its own `taskq wait --task N` (Claude) or at its turn's end (Codex, R4).
@@ -858,8 +1014,7 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
      supervisor adopts it from the board. The second death → `ask` with `tail`, no resume, no respawn (#393).
    - a recorded worker `alive` False → comment `worker <id> is gone`, empty the claim's session (the slot stays) and
      wake the supervisor as above; the supervisor decides (rework `requeue` or `ask`). A supervisor's plain comment
-     `nudge: <text>` as the last comment, an `answer` as the last comment, or 120 silent minutes →
-     `send(worker, text)`, comment `nudge`, as in step 2.
+     pending `nudge: <text>`, pending answer events, or 120 silent minutes → send only when confirmed idle, then acknowledge the exact events/recipient as in step 2. Running or unknown sessions defer.
    - closed, parked or requeued by the manager, or a replaced session: retire the recorded `S<N>` and `T<N>` once
      stopped (R11; the pass, for every task it lists or reads).
    `later`, an `ask` of the supervisor: nothing; they wait for the owner.
@@ -872,7 +1027,7 @@ The event pass of R4 is steps 1–4 run by `taskq tick --quiet`, the detached ch
 `result`, `requeue` or `close`, no table. A worker's `result` wakes its supervisor (an unsupervised one's waits for
 the manager's review); a `close` frees the slot for the next task on that machine. Run from `.worktrees/taskq-<N>`, taskq takes the checkout above it as the
 project root. Inside a Codex sandbox no pass runs (#502): a sandboxed supervisor's `run`, `requeue` or `close` takes
-effect in `taskq tick --quiet --after <pid>`, the pass the runtime left for that turn's end (R4).
+effect in `taskq tick --quiet --after <pid> --after-birth <identity>`, the pass the runtime left for that turn's end (R4).
 Changed: the pass spawned workers and the manager reviewed → the pass spawns one supervisor per task and runs its
 orders; the supervisor reviews (#524).
 
@@ -1010,7 +1165,7 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 | Runtime | spawn | send | alive | link | retire |
 |---|---|---|---|---|---|
 | Claude | `claude --bg --name "T<N> <ORCH> <title> (<machine>)"` in the project root; tools `Bash Read Edit Write Glob Grep WebFetch WebSearch`, no MCP, `--permission-mode dontAsk` | `claude stop`, then `claude --bg --resume <id> <text>` (a new id) | `claude agents --json --all` | Remote Control URL | `claude stop <job id>` when running, then `claude rm <job id>` |
-| Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread>` in `.taskq/T<N>.pid`; then `codex app-server`: `initialize`, `thread/name/set` the name, `thread/read` it back, each after the last one's success, all within 60 s (R3: anything else stops the turn, keeps the pid file, fails the spawn) | `codex exec resume <id> <text>` | the pid is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` (or a replaced `T<N>-<thread>.pid`) |
+| Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread> <birth>` in `.taskq/T<N>.pid`; then `codex app-server`: `initialize`, `thread/name/set` the name, `thread/read` it back, each after the last one's success, all within 60 s (R3: anything else stops the turn, keeps the pid file, fails the spawn) | `codex exec resume <id> <text>` | the identified process is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` (or a replaced `T<N>-<thread>.pid`) |
 
 - A supervisor starts and retires as a worker does, named `S<N> ...` (Codex: `.taskq/S<N>.log`,
   `.taskq/S<N>.pid`), with the same tools, `permission_mode` and `codex` options (R9). A running Claude supervisor
@@ -1062,7 +1217,7 @@ not provider authentication or successful turn completion; RPC failures stop adm
 The existing Hermes admission guard validates this concrete file's lifecycle interface. Handles contain no board
 state, authority, queue or receipts. `wake_manager` submits only to an idle manager already owned by this bridge;
 it cannot attach to a manager owned by another gateway. `taskq wait` invokes it only for the current manager,
-and writes the existing receipt only after verified model completion. Timeout/error/unknown/busy stops visibly
+and acknowledges the board event IDs only after verified model completion. Timeout/error/unknown/busy stops visibly
 without updating that receipt. Owner identity uses Linux process birth stamps and pidfds, not PID liveness alone;
 SIGTERM/failed setup shuts down the gateway process group and waits for exit, with evidence retained.
 Interactive server requests are refused, never approved.
@@ -1108,7 +1263,8 @@ supported explicit named profile and disposable local-only Git fetch (owner corr
 - CLI stdout and stderr use UTF-8, including redirected pipes and detached dispatch logs. This keeps Unicode
   task titles and the contract readable on hosts whose default redirected encoding is a legacy code page (#604).
 - Run `py -3 <clone>\taskq.py` or `python <clone>\taskq.py`; a PowerShell function is the alias:
-  `function taskq { python C:\src\taskq\taskq.py @args }` in `$PROFILE`.
+  after the first qualified install, keep that source as the immutable bootstrap and put
+  `function taskq { python C:\src\taskq\taskq.py launch --install-dir C:\src\taskq-install -- @args }` in `$PROFILE`.
 - `gh`, `glab`, `claude` (`claude.cmd`), `codex` and `git` are found on `PATH`; no bash is needed by taskq.
   `claude.ps1` blocked by the execution policy: use `claude.cmd` (#139).
 - Every command in this file runs in PowerShell as written, except `export`: use `$env:NAME=value;`.
@@ -1117,8 +1273,8 @@ supported explicit named profile and disposable local-only Git fetch (owner corr
 
 ## 10. Develop taskq itself
 
-Every session on a machine runs the clone's `taskq.py`: keep that clone on clean `main` and change taskq only in a
-worktree (`git worktree add -b <branch> .worktrees/<branch> origin/main`); `pm`, `tick` and `wait` pull a clean clone (§ 7). Testing: below.
+Every session runs one qualified release's `taskq.py` and contract. Change taskq only in a separate
+worktree (`git worktree add -b <branch> .worktrees/<branch> origin/main`); installed releases stay unchanged. Testing: below.
 ### Testing policy
 
 Use the cheapest check that can detect the changed requirement's plausible failure. Test count and a fixed mix
@@ -1173,8 +1329,8 @@ parser/text edits. Any live check remains subject to existing approvals, limits,
 safeguards; testing does not authorize a new benchmark or load stage.
 
 Before merge or direct publication to `main`, require the applicable approved changed-live-boundary proof on
-an isolated candidate worktree at the recorded candidate SHA. `tick` and `wait` auto-pull `main`: qualification
-after publication is too late. Use only an already approved isolated topology, board and runtime scope; do not
+an isolated candidate worktree at the recorded candidate SHA. Explicit updates require a qualified exact upstream SHA; qualification
+after installation is too late. Use only an already approved isolated topology, board and runtime scope; do not
 expand permissions, limits or approvals. If the necessary isolated proof cannot be obtained within that scope,
 report the blocker and hold main publication; a pending required proof is never PASS. Unrelated parser or
 documentation changes need no paid full lifecycle run.

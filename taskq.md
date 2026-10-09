@@ -173,7 +173,8 @@ For an available board the renderer prints:
      running wait, its scheduler entry);
    - `not armed · taskq arm tick`: only when it confirmed it is not armed;
    - `unknown`: the default, every other case.
-   Keep the state and actual wait/safety-window parameters short; long proof belongs in the task evidence.
+   Project unavailability and paused monitoring are separate blockers, never ARM evidence or a fourth ARM state.
+   Keep the state and actual wait/safety-window parameters short; private proof stays private, not in public task/PR/logs.
    Explicit owner arming is an action under § 7 Arm the tick, not permission to infer a state from printed instructions.
    Never inferred: no interval from a default or `arm tick` output, no arming done to fill the field, and a child
    manager's queue monitoring is distinct from root transport. The executing PM fills the field; root DOT
@@ -210,6 +211,8 @@ Session links: Claude `https://claude.ai/code/session_<id>` in every client. Cod
 the client that finally renders the report is Codex, else the wrapper `<pages>/open.html#codex://threads/<id>`. That
 client is `TASKQ_CLIENT` (`codex`, `claude`, any other: the wrapper) when set, else the session that runs the command
 (`CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`, `TASKQ_RUNTIME` picks one): never the worker's runtime or the ORCH.
+The executing PM sets `TASKQ_CLIENT` to the final owner client before preparing each canonical block;
+for macOS Codex desktop use `TASKQ_CLIENT=codex` and direct `codex://threads/<id>` links. Root never rewrites links.
 A child manager that relays to a root manager in another client sets `TASKQ_CLIENT` to the root's client. DOT and
 unknown clients get the wrapper (direct unverified there). A session with no link on this machine shows
 `<session[:8]> on <machine>`; no session: empty cell. No raw JSON to humans.
@@ -263,7 +266,8 @@ Any change is named to the owner first; taskq never edits permission settings it
 A session manages several projects only from an owner-written list; folders are never auto-discovered.
 The list stays in session context; task ownership stays in each board task's `pm`. Keep a separate R6 report per
 project. If `N.M` is ambiguous across projects, require the project with the answer and run `taskq answer N.M`
-in that project root; never guess the board. An unavailable project still gets its own blocker block (R6);
+in that project root; never guess the board. External blocker choices use the contextual numeric routing in
+§ 7 After each pass, not the board answer command; ambiguity includes board versus contextual choices. An unavailable project still gets its own blocker block (R6);
 never omit it or substitute another project's snapshot. Per-project runtime limits remain independent.
 Changed: explicit project list only → separate project reports and project-qualified ambiguous answers (#580).
 Changed: `taskq projects` over `[projects]` in `taskq.local.toml` → no command; the manager runs `taskq tick` in each
@@ -796,11 +800,22 @@ the tasks it did not reach wait for the next pass. Fix the cause or tell the own
 Reply to the owner with a separate complete R6 report for each explicit project (links, not bare ids). The
 executing PM replaces only `<arm_tick>` using R6 item 6; root DOT relays the completed block unchanged, then one
 or two lines of commentary, separate. Current work comes first; questions/problems below it are compact and
-numbered (existing N.M options for board questions), with a recommendation and a verified actionable session link
+numbered (N.M options), with a recommendation and a verified actionable session link
 when session action is needed. Verify the recorded session and supported action, not merely a URL's shape; if
 unverified, say so and do not offer it as a working login/wake route. Root transport is not evidence of executing-PM queue monitoring. To show
 the queue without moving it, run `taskq status`. The owner answers `43.1 44.2`: run `taskq answer 43.1 44.2`
-verbatim in the named project root. If an answer is ambiguous across projects, ask for its project first.
+verbatim in the named project root only for board task options. If an answer is ambiguous across projects, ask for its project first.
+External runtime blockers use numeric `N.M` too: the executing PM labels each as `Problem N (session choice, not board task)`,
+prints `N.1 <action> · N.2 <action> ★`, and keeps that mapping only in the current session context. Choose N distinct
+from board question numbers in the current project report; if the board is unreadable, do not assume no collision.
+For example, `Problem 1 (session choice, not board task): login session unverified; 1.1 provide a verified session ★ · 1.2 keep unavailable`.
+The PM applies an owner's contextual choice to that displayed action, never passes it to `taskq answer`, and never
+creates a task or store for it. If a code could name more than one project, board task or contextual problem,
+require the project and `task` or `problem` qualifier before acting; never guess. A changed or missing contextual
+mapping requires re-presenting the choices, not applying an old code. No alternate codes such as `OAuth.1`.
+A final canonical relay requires owner/PM confirmation of receipt through the existing authorized route;
+send acceptance alone is not receipt. Worker CLI cannot claim independent observation of executing-PM/root sender
+behavior. Record only safe minimal evidence availability/limits publicly; detailed PM proof stays private.
 Keep external runtime blockers visible even when a board read fails (R6). For GitLab `invalid_grant`, offer owner
 login in a verified real session; do not begin login, retry GitLab or change credentials. If no such session is
 verified, state that limit and ask for one. Reuse the existing task, never file one duplicate per runtime failure.

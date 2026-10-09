@@ -1935,7 +1935,11 @@ class Contract(Base):
                      'An explicit owner request to arm means execute', 'continued next wait',
                      'repeated arm must', 'Keep external runtime blockers visible',
                      'do not begin login, retry GitLab or change credentials',
-                     'verified actionable session link', "decision's `--link` field"):
+                     'verified actionable session link', "decision's `--link` field", 'Problem N (session choice, not board task)',
+                     'never passes it to `taskq answer`', 'require the project and `task` or `problem` qualifier',
+                     'for macOS Codex desktop use `TASKQ_CLIENT=codex`', 'Root never rewrites links',
+                     'never ARM evidence or a fourth ARM state', 'send acceptance alone is not receipt',
+                     'detailed PM proof stays private'):
             self.assertIn(part, out)
 
     def test_pm_refuses_recorded_session_roles_before_onboarding(self):

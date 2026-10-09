@@ -83,6 +83,15 @@ Changed: `taskq problem` → `requeue --text` or a plain issue comment (#290).
 Mac with Codex). A session with no link on this machine shows `<session[:8]> on <machine>`; a task with no session
 leaves the cell empty. Then a `Decisions` block (§ 7): one line per task waiting on the owner. The manager
 replies with both as printed. No raw JSON to humans.
+Source client (#521): the table, Board line and Decisions block are the same everywhere; only a Codex session's link
+depends on the client that renders the reply, taken as the session that runs `tick` (`CODEX_THREAD_ID` or
+`CLAUDE_CODE_SESSION_ID`, `TASKQ_RUNTIME` picks one), never the task's runtime or the launcher's ORCH. Codex: direct
+`codex://threads/<id>` (owner-confirmed in the Codex app: both links open the right thread, direct skips the
+website). Claude, a shell or any other: the https wrapper (Claude Desktop ordinary chat: a direct link is plain text,
+the wrapper is a link that opens the Codex app, final thread unverified). Claude links are https in every client.
+Unknown (R12): taskq cannot tell the Codex app from the Codex CLI or IDE (all get direct); Claude Code, web, mobile
+and other OS are not observed.
+Changed: the Codex link was always the https wrapper → direct when the tick runs in Codex, else the wrapper (#521).
 Changed: a space-padded `Session link` column → the markdown table with `[#N](issue)` and session links (#489).
 Changed: a heading per project and owner questions inside the tick output → one project per tick, questions added by
 the manager (#290). The reply route (`--reply`) and the `cards` format of #274 are not in `taskq.py`.
@@ -442,7 +451,8 @@ No fixed interval (#407): the manager is woken only when it has work.
    `limits`) → `spawn(T<N> <ORCH> <title> (<machine>), brief, root)` (ORCH: CLD, CDX, DOT, HRM, GRK of the launcher, UNK from a shell), claim, `q-doing`, comment `spawn` (with the session link when the runtime has one yet).
 4. `ask`, `review`, `later`: nothing; they wait for the manager.
 5. Print the R6 markdown table `| Task | State | Runtime | Session |` by priority, then number; then `Board: <url>`.
-   Another machine's claim shows its bare session id: only that machine can link it.
+   Another machine's claim shows its bare session id: only that machine can link it. A Codex link is direct when
+   the tick runs in Codex, else the https wrapper (R6, #521).
 6. Print the `Decisions` block (#490): one line per `ask`, and per `review` with options:
    `[#N](url) <state>: <what was done> · <links> · N.1 <option> (recommended) · N.2 <option>`. An image link prints as
    `![N](url)` (`inline_media`, § 2); a video or page stays a link.

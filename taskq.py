@@ -1469,9 +1469,10 @@ def contract():
     path = CLONE / 'taskq.md'
     return hashlib.sha256(path.read_bytes()).hexdigest()[:12] if path.is_file() else None
 
-def refresh():
-    """#430, before tick and wait: `git pull --ff-only` a clean clone, then tell a manager whose contract is stale to re-read it."""
-    if (CLONE / '.git').exists():
+def refresh(pm=False):
+    """#430, before pm, tick and wait: `git pull --ff-only` a clean clone (`"update": false` skips it), then tell a manager
+    whose contract is stale to re-read it; `pm` re-reads it itself."""
+    if CONFIG.get('update', True) and (CLONE / '.git').exists():
         git = [shutil.which('git') or 'git', '-C', str(CLONE)]
         status = subprocess.run([*git, 'status', '--porcelain', '--untracked-files=no'], capture_output=True, text=True, encoding='utf-8')
         if not status.returncode and not status.stdout.strip():
@@ -1483,7 +1484,7 @@ def refresh():
                 print(f'taskq: git pull --ff-only failed: {last_line(pulled.stderr + pulled.stdout)}', file=sys.stderr)
     path = CONFIG['root'] / '.taskq' / 'pm.json'
     known = json.loads(path.read_text('utf-8')).get('contract') if path.is_file() else None
-    if contract() and known and known != contract():  # no pm.json: this session never took the role
+    if not pm and contract() and known and known != contract():  # no pm.json: this session never took the role
         print('The manager contract changed: run taskq pm and follow it from now on.')
 
 def adopt(numbers, me):
@@ -1622,8 +1623,8 @@ def main(argv=None):
     if BOARD is None:
         CONFIG = load_config()
         BOARD = make_board(CONFIG)
-    if args.command == 'wait' and not args.task or args.command == 'tick' and not args.quiet:
-        refresh()
+    if args.command == 'wait' and not args.task or args.command == 'tick' and not args.quiet or args.command == 'pm':
+        refresh(args.command == 'pm')
     done = args.function(args)
     if args.command in EVENTS:
         dispatch(args.command, done if args.command in ('add', 'answer') else args.n)

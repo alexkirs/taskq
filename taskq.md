@@ -336,7 +336,8 @@ Setup again (the clone exists): first `git pull --ff-only` the clone and the pro
    `glab auth login --hostname <host> --web`.
 2. `git clone https://github.com/alexkirs/taskq ~/taskq`; `taskq.py` is the only file it needs. Alias:
    `ln -s ~/taskq/taskq.py ~/.local/bin/taskq` or `alias taskq='python3 ~/taskq/taskq.py'` (Windows: § 9).
-   Update: `git pull` in the clone; `taskq tick` and `taskq wait` pull it themselves, so keep it on clean `main`.
+   Update: `git pull` in the clone; `taskq pm`, `taskq tick` and `taskq wait` pull it themselves (`update`, § 2), so keep
+   it on clean `main`.
 3. At the project root write `taskq.json` (fields: § 2) and commit it. Labels are created by the first `add`.
 4. Check: `taskq list` prints the queue (empty is fine) and no error. Claude workers: run `claude` once in the
    project root and accept the folder trust prompt (only the owner can); else every spawn fails `Workspace not trusted`.
@@ -366,6 +367,7 @@ Setup again (the clone exists): first `git pull --ff-only` the clone and the pro
 | `board` | `github`, `gitlab`, or a `.py` file relative to the root | `github` |
 | `repo` | `owner/repo` (GitHub) or `group/project` (GitLab) | required for github/gitlab |
 | `host` | Enterprise or self-managed host | the CLI's default |
+| `update` | `false`: `pm`, `tick` and `wait` do not `git pull` the taskq clone (§ 7) | `true` |
 | `glab_client_id` | Self-managed GitLab: the OAuth Application ID users give `glab` before login (§ 1) | none |
 | `publish` | `direct` or `pr` (§ 6) | `direct` |
 | `workspace` | `external`: the host owns the worker's worktree and branch `taskq-<N>`; taskq never creates or removes them (§ 5, § 6) | taskq-owned `.worktrees/taskq-<N>` |
@@ -607,10 +609,11 @@ supervisor's one-line outcome. It does no task work, reads no diffs or test logs
 supervisor does, R3, #524) and never answers a worker's or a supervisor's question for the owner. An unsupervised
 task (R3 Transition) keeps the manager's exact-head review (§ After each pass, Unsupervised review).
 
-The manager starts with `taskq pm` in the project root and follows what it prints. `taskq tick` and `taskq wait`
-first run `git pull --ff-only` in the taskq clone when it is clean (one line on failure), then compare the hash of its
+The manager starts with `taskq pm` in the project root and follows what it prints. `taskq pm`, `taskq tick` and
+`taskq wait` first run `git pull --ff-only` in the taskq clone when it is clean (one line on failure), then compare the hash of its
 `taskq.md` with `.taskq/pm.json` (a runtime handle, R1). A different hash prints first: `The manager contract changed:
-run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#430).
+run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#430). `taskq pm` prints the pulled
+contract itself, so it skips that line. `"update": false` in `taskq.json` turns the pull off.
 
 ### Arm the tick
 
@@ -877,7 +880,7 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 ## 10. Develop taskq itself
 
 Every session on a machine runs the clone's `taskq.py`: keep that clone on clean `main` and change taskq only in a
-worktree (`git worktree add -b <branch> .worktrees/<branch> origin/main`); `tick` and `wait` pull a clean clone (§ 7). Testing: below.
+worktree (`git worktree add -b <branch> .worktrees/<branch> origin/main`); `pm`, `tick` and `wait` pull a clean clone (§ 7). Testing: below.
 ### Testing policy
 
 Use the cheapest check that can detect the changed requirement's plausible failure. Test count and a fixed mix

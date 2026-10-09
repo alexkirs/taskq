@@ -1925,6 +1925,16 @@ class Contract(Base):
             self.git(writer, 'push', '-q', 'origin', 'HEAD')
             self.run_cli('tick')
             self.assertEqual((clone / 'taskq.md').read_text(), 'local edit\n')
+            self.git(clone, 'checkout', '--', 'taskq.md')  # clean again: pm pulls and prints the new contract, no stale line
+            out = self.run_cli('pm')
+            self.assertEqual((clone / 'taskq.md').read_text(), 'v3\n')
+            self.assertNotIn('contract changed', out)
+            (writer / 'taskq.md').write_text('v4\n')
+            self.git(writer, 'commit', '-qam', 'v4')
+            self.git(writer, 'push', '-q', 'origin', 'HEAD')
+            with mock.patch.dict(taskq.CONFIG, {'update': False}):  # the setting turns the pull off
+                self.run_cli('pm')
+            self.assertEqual((clone / 'taskq.md').read_text(), 'v3\n')
 
 
 class Cleanup(Base):

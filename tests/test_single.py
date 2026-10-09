@@ -415,6 +415,26 @@ class Tick(Base):
         self.assertEqual(taskq.row(item, kinds, 'win'), '| [#7](https://board/7) | doing | claude | abcdef12 on mac |')
         self.assertEqual(taskq.row({**item, 'claim': None, 'state': 'ready'}, kinds, 'mac'), '| [#7](https://board/7) | ready | any |  |')
 
+    def test_row_codex_link_per_source_client(self):
+        """#521 (R6): a tick run in Codex links Codex threads directly; Claude, a shell or an unknown client get the wrapper."""
+        claude, codex = taskq.Claude(), taskq.Codex()
+        kinds = {'claude': claude, 'codex': codex}
+        item = {'iid': 7, 'url': 'https://board/7', 'state': 'doing', 'runtime': 'any',
+                'claim': {'runtime': 'codex', 'session': '019a-thread-full-id', 'name': 'mac'}}
+        wrapper = '| [#7](https://board/7) | doing | codex | [019a-thr](https://alexkirs.github.io/taskq/open.html#codex://threads/019a-thread-full-id) |'
+        sources = {'codex': {'CODEX_THREAD_ID': 'mgr'}, 'claude': {'CLAUDE_CODE_SESSION_ID': 'mgr'}, 'shell': {},
+                   'claude from codex': {'CLAUDE_CODE_SESSION_ID': 'mgr', 'CODEX_THREAD_ID': 'x', 'TASKQ_RUNTIME': 'claude'},
+                   'unknown runtime': {'CODEX_THREAD_ID': 'x', 'TASKQ_RUNTIME': 'hermes'}}
+        for source, env in sources.items():
+            with self.subTest(source), mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(taskq.row(item, kinds, 'mac'), wrapper.replace(
+                    'https://alexkirs.github.io/taskq/open.html#', '') if source == 'codex' else wrapper)
+                self.assertEqual(taskq.row(item, kinds, 'win'), '| [#7](https://board/7) | doing | codex | 019a-thr on mac |')
+                self.assertEqual(taskq.row({**item, 'claim': None, 'state': 'ready'}, kinds, 'mac'), '| [#7](https://board/7) | ready | any |  |')
+                claimed = {**item, 'claim': {'runtime': 'claude', 'session': 'abcdef12-3456', 'name': 'mac'}}
+                with mock.patch.object(claude, 'link', return_value='https://claude.ai/code/session_X'):
+                    self.assertEqual(taskq.row(claimed, kinds, 'mac'), '| [#7](https://board/7) | doing | claude | [abcdef12](https://claude.ai/code/session_X) |')
+
     def test_second_quick_death_asks(self):
         # #393: a worker that dies at once is respawned once, then the owner is asked with the last log line
         self.fake.tail = lambda session: 'error: unsupported model'

@@ -792,11 +792,18 @@ def cmd_tick(args, table=True):
         pending.unlink(missing_ok=True)
         held = one_pass(args, False)
 
+def direct():
+    """R6 (#521): the tick's source client is the session running it. Codex: direct codex:// links; Claude, a shell or
+    anything else: the https wrapper. ponytail: CODEX_THREAD_ID cannot tell the Codex app from the CLI or IDE."""
+    return (session() or {}).get('runtime') == 'codex'
+
 def row(item, kinds, here):
     """R6 (#489): one markdown row, `[#N](issue)` and `[<session[:8]>](link)`; a session with no link here stays plain text."""
     claim = item['claim'] or {}
     runtime, session = claim.get('runtime') or item['runtime'], claim.get('session') or ''
     url = session and claim.get('name') == here and runtime in kinds and kinds[runtime].link(session)
+    if url and runtime == 'codex' and direct():  # #521: Codex opens its own thread link; the wrapper only loads a page first
+        url = f'codex://threads/{session}'
     task = f'[#{item["iid"]}]({item["url"]})' if item.get('url') else f'#{item["iid"]}'
     cell = f'[{session[:8]}]({url})' if url else session and f'{session[:8]} on {claim.get("name")}'
     return f'| {task} | {item["state"]} | {runtime} | {cell} |'

@@ -197,7 +197,8 @@ def event_targets(raw, action, text, actor=None):
 def event_pending(raw, target):
     return [event for event in raw.get('events', []) if not set(event['recipients']).issubset(event.get('acks', []))
             and target not in event.get('acks', [])
-            and (target in event['recipients'] or target.startswith('manager:') and 'manager:*' in event['recipients'])]
+            and (target in event['recipients'] or target.startswith('manager:')
+                 and 'manager:*' in event['recipients'] and 'manager:*' not in event.get('acks', []))]
 
 
 def event_labels(raw, labels):

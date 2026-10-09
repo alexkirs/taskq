@@ -2695,6 +2695,14 @@ class Wait(TickSetup):
 
 
 class EventDelivery(Base):
+    def test_completed_manager_wildcard_preserves_pending_supervisor(self):
+        event = {'id': 1, 'action': 'ask', 'text': 'Question', 'by': None,
+                 'recipients': ['manager:*', 'supervisor:fake:s'],
+                 'acks': ['manager:claude:first', 'manager:*']}
+        raw = {'events': [event]}
+        self.assertEqual(taskq.event_pending(raw, 'manager:claude:second'), [])
+        self.assertEqual(taskq.event_pending(raw, 'supervisor:fake:s'), [event])
+
     def test_closed_unowned_delivery_completes_without_assigning_manager(self):
         self.add()
         with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):

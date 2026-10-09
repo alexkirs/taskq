@@ -2411,12 +2411,56 @@ def cmd_version(args):
     print(json.dumps(data, ensure_ascii=False))
 
 
+def freshness_notice():
+    """Managed-install availability only: bounded remote read, disposable local cache, never an update."""
+    folder = os.environ.get('TASKQ_INSTALL_DIR')
+    if not folder or not re.fullmatch(r'[0-9a-f]{40}', CLONE.name):
+        return
+    path, now = Path(folder) / '.freshness.json', time.time()
+    cached = None
+    try:
+        candidate = json.loads(path.read_text('utf-8'))
+        stamp, sha = candidate['checked_at'], candidate.get('upstream_sha')
+        if type(stamp) in (int, float) and 0 <= now - stamp < 300 and (
+                isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha)
+                or sha is None and isinstance(candidate.get('error'), str)):
+            cached = candidate
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    if cached is None:
+        cached = {'checked_at': now, 'upstream_sha': None}
+        try:
+            gh = shutil.which('gh')
+            if not gh:
+                raise ValueError('gh not found')
+            done = subprocess.run([gh, 'api', '--hostname', 'github.com', 'repos/alexkirs/taskq/git/ref/heads/main'],
+                                  capture_output=True, text=True, encoding='utf-8', timeout=10)
+            if done.returncode:
+                raise ValueError('upstream query failed')
+            sha = json.loads(done.stdout)['object']['sha']
+            if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha):
+                raise ValueError('invalid upstream SHA')
+            cached['upstream_sha'] = sha
+        except (OSError, ValueError, TypeError, KeyError, subprocess.TimeoutExpired) as error:
+            cached['error'] = 'query timed out' if isinstance(error, subprocess.TimeoutExpired) else str(error)[:160]
+        try:
+            path.write_text(json.dumps(cached) + '\n', encoding='utf-8')
+        except OSError:
+            print('taskq: update availability cache unavailable; later commands may check again', file=sys.stderr)
+    if cached['upstream_sha'] is None:
+        print(f'taskq: update availability unknown ({cached["error"]}); retry after the five-minute cache window', file=sys.stderr)
+    elif cached['upstream_sha'] != CLONE.name:
+        print(f'TaskQ upstream revision {cached["upstream_sha"]} differs from loaded {CLONE.name}; '
+              'run taskq update to preview. Qualification and installation remain explicit.')
+
+
 def refresh(pm=False):
-    """Compare the running release contract locally; never hot-swap loaded code or fetch source."""
+    """Compare the running release contract; managed installs also report bounded upstream availability."""
     path = CONFIG['root'] / '.taskq' / 'pm.json'
     known = json.loads(path.read_text('utf-8')).get('contract') if path.is_file() else None
     if not pm and contract() and known and known != contract():  # no pm.json: this session never took the role
         print('The manager contract changed: run taskq pm and follow it from now on.')
+    freshness_notice()
 
 def cmd_migrate(args):
     """Explicit board-only transition. Preflight the whole fresh snapshot before the first write."""

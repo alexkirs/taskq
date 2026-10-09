@@ -3278,6 +3278,56 @@ class Contract(Base):
         with self.assertRaisesRegex(SystemExit, 'canonical'):
             taskq.qualified_checks(sha, 'https://example.com/arbitrary/taskq')
 
+    def test_managed_freshness_is_cached_across_pm_tick_wait_and_never_installs(self):
+        install = self.root / 'installed'
+        release = install / 'releases' / ('a' * 40)
+        release.mkdir(parents=True)
+        (release / 'taskq.md').write_text('original contract')
+        (release / 'taskq.py').write_text('original source')
+        pointer = install / 'current.json'
+        before = json.dumps({'commit': release.name, 'path': str(release)})
+        pointer.write_text(before)
+        with mock.patch.dict(os.environ, {'TASKQ_INSTALL_DIR': str(install), 'GH_HOST': 'enterprise.invalid'}), \
+                mock.patch.object(taskq, 'CLONE', release), mock.patch.object(taskq.time, 'time', return_value=1000), \
+                mock.patch.object(taskq.shutil, 'which', return_value='gh'), \
+                mock.patch.object(taskq.subprocess, 'run', return_value=mock.Mock(returncode=0,
+                    stdout=json.dumps({'object': {'sha': 'b' * 40}}))) as run:
+            for argv in (('pm',), ('tick',), ('wait', '--window', '0')):
+                out = self.run_cli(*argv)
+                self.assertIn('run taskq update to preview', out)
+                self.assertIn('Qualification and installation remain explicit', out)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0], ['gh', 'api', '--hostname', 'github.com', 'repos/alexkirs/taskq/git/ref/heads/main'])
+            self.assertEqual(run.call_args.kwargs['timeout'], 10)
+            self.assertEqual(pointer.read_text(), before)
+            self.assertEqual((release / 'taskq.md').read_text(), 'original contract')
+            self.assertEqual((release / 'taskq.py').read_text(), 'original source')
+            with mock.patch.object(taskq.time, 'time', return_value=1300):
+                self.run_cli('pm')
+            self.assertEqual(run.call_count, 2)
+
+    def test_managed_freshness_offline_backs_off_without_blocking_compatible_work(self):
+        install = self.root / 'installed'
+        release = install / 'releases' / ('a' * 40)
+        release.mkdir(parents=True)
+        (release / 'taskq.md').write_text('original contract')
+        pointer = install / 'current.json'
+        before = json.dumps({'commit': release.name, 'path': str(release)})
+        pointer.write_text(before)
+        (install / '.freshness.json').write_text('corrupt cache')
+        with mock.patch.dict(os.environ, {'TASKQ_INSTALL_DIR': str(install)}), mock.patch.object(taskq, 'CLONE', release), \
+                mock.patch.object(taskq.time, 'time', return_value=1000), mock.patch.object(taskq.shutil, 'which', return_value='gh'), \
+                mock.patch.object(taskq.subprocess, 'run', side_effect=subprocess.TimeoutExpired('gh', 10)) as run, \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.run_cli('pm')
+            self.run_cli('tick')
+            self.assertIn('availability unknown (query timed out)', errors.getvalue())
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(pointer.read_text(), before)
+            self.add('compatible work continues')
+            self.assertEqual(self.task(1)['title'], 'compatible work continues')
+            self.assertEqual((release / 'taskq.md').read_text(), 'original contract')
+
     def test_update_ci_pins_canonical_host_despite_gh_host_override(self):
         sha = 'a' * 40
         check = dict(name='tests', head_sha=sha, status='completed', conclusion='success')

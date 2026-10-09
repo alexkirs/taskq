@@ -302,7 +302,8 @@ This file is the whole contract (with [docs/single-file.md](docs/single-file.md)
 here; they never copy it. A change of behavior updates this file in the same deliverable.
 Changed (owner-approved compatibility update, 2026-10-10): implicit hot pull → explicit qualified immutable
 release update; legacy issue blocks are read-only until guarded migration (§ 1). Running code and its contract
-always come from the same release.
+always come from the same release. Managed installs also give a bounded, cached cross-host upstream
+availability reminder on normal command startup; this is notification, never installation or qualification.
 Changed: testing mechanics implicit in worker/review commands → § 10 defines risk-based evidence, preserved
 fault detection and a bounded pilot; no broad suite migration (#533).
 Changed (owner-approved queue optimization, 2026-10-10): full history on every fresh read → optional metadata-only
@@ -888,7 +889,14 @@ never automatic. Never seize a task with a manager or change foreign claims. `ta
 `taskq wait` compare the hash of the running release's
 `taskq.md` with `.taskq/pm.json` (a runtime handle, R1). A different hash prints first: `The manager contract changed:
 run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#430). `taskq pm` prints that release's
-contract itself, so it skips that line. These commands never update source code.
+contract itself, so it skips that line. These commands never update source code. In a managed install they also check canonical GitHub `main`
+availability on startup, at most once per five-minute local cache window (concurrent cache misses may each
+check). The read-only query is explicitly pinned to github.com with a 10-second timeout. A differing SHA
+prints `taskq update` preview guidance, never claims the revision is qualified, and never installs or dispatches.
+Offline/malformed responses show availability unknown, cache that result for the same window, and allow
+compatible work to continue. `<install-dir>/.freshness.json` holds only this disposable timestamp/result cache:
+it is no authority, grant, queue state or event receipt. A corrupt/expired cache is ignored. Other hosts see the
+reminder on their next regular command after the cache window; an idle host is not automatically updated.
 
 ### Arm the tick
 

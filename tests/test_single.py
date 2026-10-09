@@ -90,6 +90,128 @@ class Base(unittest.TestCase):
 
 
 
+class ApprovalRouter(unittest.TestCase):
+    """Source/mock only: installed 0.159.3 request shapes, no app-server or external presenter."""
+
+    def setUp(self):
+        self.output, self.cards = io.StringIO(), []
+        self.router = taskq.ApprovalRouter('thread', 'turn', self.output.write, self.cards.append)
+        self.request = {'id': 7, 'method': self.router.COMMAND, 'params': {
+            'threadId': 'thread', 'turnId': 'turn', 'itemId': 'item', 'approvalId': 'callback',
+            'startedAtMs': 1, 'command': 'mock-command', 'cwd': '/mock'}}
+
+    def receive(self):
+        self.router.receive(json.dumps(self.request) + '\n')
+
+    def reply(self, decision='accept'):
+        return {**{key: self.cards[-1][key] for key in ('id', 'threadId', 'turnId', 'itemId', 'approvalId')},
+                'decision': decision}
+
+    def results(self):
+        return [json.loads(line) for line in self.output.getvalue().splitlines()]
+
+    def test_exact_human_reply_once_decline_and_cancel(self):
+        for decision in ('accept', 'decline', 'cancel'):
+            with self.subTest(decision=decision):
+                self.setUp()
+                self.receive()
+                self.assertEqual(self.results(), [])  # no autoaccept
+                self.router.decide(self.reply(decision))
+                self.assertEqual(self.results(), [{'id': 7, 'result': {'decision': decision}}])
+                with self.assertRaises(ValueError):
+                    self.router.decide(self.reply(decision))
+                self.assertEqual(len(self.results()), 1)
+
+    def test_wrong_unknown_and_malformed_requests_close(self):
+        variants = [None, [], {'id': True}, {**self.request, 'method': 'unknown'},
+                    {**self.request, 'jsonrpc': '1.0'}, {**self.request, 'result': {}},
+                    {**self.request, 'params': []}]
+        for key, value in (('threadId', 'wrong'), ('turnId', 'wrong'), ('itemId', ''),
+                           ('startedAtMs', True), ('command', None), ('cwd', []),
+                           ('approvalId', 2), ('kind', 'writeStdin'), ('additionalPermissions', {}),
+                           ('proposedExecpolicyAmendment', ['mock']), ('networkApprovalContext', {}),
+                           ('proposedNetworkPolicyAmendments', [])):
+            variants.append({**self.request, 'params': {**self.request['params'], key: value}})
+        for line in ['{', '{"id":7,"id":8}', *map(json.dumps, variants)]:
+            with self.subTest(line=line):
+                self.setUp()
+                with self.assertRaises(ValueError):
+                    self.router.receive(line)
+                self.assertTrue(self.router.closed)
+                self.assertEqual(self.cards, [])
+                self.assertEqual(self.results(), [])
+
+    def test_wrong_reply_and_session_or_amendment_never_accept(self):
+        changes = [(key, 'wrong') for key in ('id', 'threadId', 'turnId', 'itemId', 'approvalId')]
+        changes += [('id', '7'), ('decision', 'acceptForSession'),
+                    ('decision', {'acceptWithExecpolicyAmendment': {'execpolicy_amendment': ['mock']}}),
+                    ('decision', {'applyNetworkPolicyAmendment': {'network_policy_amendment': {}}})]
+        for key, value in changes:
+            with self.subTest(key=key, value=value):
+                self.setUp()
+                self.receive()
+                with self.assertRaises(ValueError):
+                    self.router.decide({**self.reply(), key: value})
+                self.assertTrue(self.router.closed)
+                self.assertEqual(self.results(), [{'id': 7, 'result': {'decision': 'cancel'}}])
+
+    def test_duplicate_request_cancels_pending_and_cannot_replay(self):
+        self.receive()
+        with self.assertRaises(ValueError):
+            self.receive()
+        self.assertEqual(self.results(), [{'id': 7, 'result': {'decision': 'cancel'}}])
+        with self.assertRaises(ValueError):
+            self.router.decide(self.reply())
+        self.setUp()
+        self.receive()
+        self.router.decide(self.reply())
+        with self.assertRaises(ValueError):
+            self.receive()
+        self.assertEqual(len(self.results()), 1)
+
+    def test_deadline_disconnect_and_presenter_failure_cancel(self):
+        with mock.patch.object(taskq.time, 'monotonic', return_value=1) as clock:
+            self.receive()
+            clock.return_value = 61
+            with self.assertRaises(ValueError):
+                self.router.decide(self.reply())
+        self.assertEqual(self.results()[-1]['result'], {'decision': 'cancel'})
+        self.setUp()
+        self.receive()
+        self.router.close()  # stdio EOF or human endpoint disconnect
+        self.router.close()
+        self.assertEqual(len(self.results()), 1)
+        self.setUp()
+        self.router.present = mock.Mock(side_effect=OSError('offline'))
+        with self.assertRaises(ValueError):
+            self.receive()
+        self.assertEqual(self.results()[-1]['result'], {'decision': 'cancel'})
+        self.setUp()
+        self.receive()
+        self.router.write = mock.Mock(side_effect=BrokenPipeError)
+        with self.assertRaises(ValueError):
+            self.router.decide(self.reply())
+        self.assertTrue(self.router.closed)
+        self.assertIsNone(self.router.pending)
+
+    def test_permissions_grant_nothing_and_resume_carries_no_decision(self):
+        self.request['method'] = self.router.PERMISSIONS
+        self.request['params']['permissions'] = {'network': {'enabled': True}}
+        self.receive()
+        self.assertEqual(self.cards, [])
+        self.assertEqual(self.results(), [{'id': 7, 'result': {'permissions': {}, 'scope': 'turn'}}])
+        self.setUp()
+        self.receive()
+        old = self.reply()
+        self.router.close()
+        self.router = taskq.ApprovalRouter('thread', 'resumed-turn', self.output.write, self.cards.append)
+        self.request['params']['turnId'] = 'resumed-turn'
+        self.receive()
+        with self.assertRaises(ValueError):
+            self.router.decide(old)
+        self.assertEqual(self.results()[-1]['result'], {'decision': 'cancel'})
+
+
 class ExecutionPolicy(Base):
     """#577: board authority, fail-closed topology, lifecycle and observed-context checks."""
 

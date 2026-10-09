@@ -274,6 +274,8 @@ Any change is named to the owner first; taskq never edits permission settings it
 Changed: project-wide Codex options only -> an explicitly owner-approved board task profile may select the
 restricted native route in § 8; defaults, models, effort, runtimes and limits remain unchanged (#577, owner
 decision 2026-10-09). Unsupported capabilities fail closed; approval never is not an approval transport.
+Changed: no approval client interface -> dormant source/mock stdio router and presenter interfaces only
+(#577, owner decision 2026-10-10). They are not connected to dispatch or any human endpoint; no policy changes.
 
 ### R10. Multi-project only by explicit list
 
@@ -339,6 +341,8 @@ publication reconciled in § 5/§ 6/§ 7/§ 10 (#533, owner approval 2026-10-09)
 Changed: an external prerequisite could return to answer/retry -> a profile blocker persists on the board;
 answer/requeue alone cannot supply the missing capability or approval. Candidate review and live qualification
 remain separate; #577 requires a separate owner publication choice before close (#577).
+Changed: prerequisite wording required a new runner -> existing Mac evidence may establish the host; the
+unconnected action-time human endpoint remains a blocker, not resolved by prose (#577, owner 2026-10-10).
 Every agent (Claude, Codex, DOT, Hermes, other) reads this file before work; `AGENTS.md` and `CLAUDE.md` point here.
 
 ## Product
@@ -947,15 +951,43 @@ resolver as dispatch. It retains waiting/dependency reasons and appends any poli
 counters keep their state meaning. List data cannot prove the trusted owner approval note: otherwise eligible
 workspace tasks remain provisionally Ready, with approval checked only on the fresh dispatch read.
 Other runtimes cannot consume a selected profile. `host-gpu` always blocks before dispatch: the native exec
-adapter has no action-time approval handler. It does not launch Blender, Chrome or a bind probe. No new approval
+adapter has no action-time approval handler. It does not launch Blender, Chrome or a bind probe. No enabled approval
 transport, danger-full-access, bypass, global permission change, runtime/model/effort/limit change is authorized.
 
 Spawn and every resume resolve the fresh board selection; requeue/restart/adoption retain it. Unsupported or
 unapproved profiles remain blocked on every pass and after answers, without spawning or retrying platform actions.
-The owner and Mac runtime administrator must provision an isolated real Blender/Chrome/GPU runner, identify its
-supported action-time approval client, permitted host actions and approval location on the blocked board task.
-A textual answer does not provision it. Do not retry the same topology until that prerequisite exists and a
-separately reviewed supported adapter/route is available.
+The owner and Mac runtime administrator must identify an isolated qualification scope on the existing Mac
+or another supported runner, its action-time approval client, permitted host actions and approval location on
+the blocked board task. The approved manager probe (2026-10-10) bound loopback and exchanged bytes; Blender
+5.2.1 LTS and Chrome 154.0.8037.98 version commands exited 0. This disproves a necessarily absent host, not
+the recorded EPERM or the missing native lifecycle/GPU/browser proof. A textual answer does not connect a
+client. Do not retry the same topology until that prerequisite exists and a separately reviewed supported
+adapter/route is available.
+
+#### Dormant approval interfaces (source/mock only, #577)
+
+`ApprovalRouter` consumes newline-delimited stdio JSON-RPC server requests and emits responses through an
+injected writer; an injected nonblocking presenter receives an isolated pending card. Neither interface is
+instantiated by TaskQ runtime/dispatch. There is no TaskQ opt-in setting or enabled UI in this candidate.
+The concrete authenticated external human endpoint remains unresolved, owned by the owner and Mac runtime
+administrator on #577. No credentials are read or transported by these interfaces.
+
+One card binds exact typed request id, thread, turn, item and optional approval callback id. Only an explicit
+matching response can accept one command. Session acceptance and policy amendments are rejected; permission
+requests return an empty turn-scoped grant. Unknown/malformed input, duplicate requests, mismatched replies,
+timeout, presenter failure and disconnect fail closed. Resume requires a new router after confirmed
+`thread/resume` and `turn/start`; pending cards and decisions never survive it. The caller must service expiry
+within the bounded deadline, close on EOF, and never log command/cwd/reason cards publicly.
+
+Before any separately authorized activation, review the exact board opt-in and authenticated human UI scope,
+per-command lifetime and isolated qualification procedure. Installed 0.159.3 supports `approvalPolicy` and
+`approvalsReviewer` on thread start/resume and turn start; no setting is sent here. The protocol routes human
+review with `approvalsReviewer: "user"`; `approvalPolicy: "on-request"` would change the current `never`
+policy and is not authorized by this continuation. `TurnStart` approvalPolicy, approvalsReviewer and
+sandboxPolicy overrides persist for subsequent turns, not just the current turn. A future adapter must re-read
+board authority and verify effective policy on every start/resume, never infer restoration from a thread id.
+The one-command `accept` lifetime is distinct from persistent TurnStart configuration. No session grant,
+execpolicy/network amendment, autoaccept, security/config change or enabled host-gpu is included.
 
 Profiled turns run `taskq policy-check N` before task work. Native exec passes a per-turn local handle; the check
 requires that handle and fresh persisted turn-context evidence (workspace-write, never, network, Git writable root).
@@ -967,7 +999,7 @@ task; never infer effective policy from the brief, title, thread id or launch ar
 Historical #157 Blender exit 139 and csgo #348 Git EPERM are retained observations, not a universal diagnosis.
 The csgo #336 Chrome debugging-port timeout (`steps=[]`) does not prove a sandbox/GPU root cause. Host/GPU
 qualification needs bounded actual Blender and Chrome evidence on the approved runner. #340/#336/#341/#342/#348
-remain held with their original acceptance criteria. See [supervisor topology evidence](docs/supervisor.md#9-task-577).
+remain held with their original acceptance criteria. See [supervisor topology evidence](docs/supervisor.md#10-task-577).
 
 ### Native Hermes admission (local candidate)
 

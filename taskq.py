@@ -359,6 +359,114 @@ def codex_options():
     return CONFIG.get('codex', ['-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true',
                                 '--add-dir', str(CONFIG['root'] / '.git')])  # git fetch/commit write the main .git
 
+class ApprovalRouter:
+    """Dormant #577 stdio/presenter interface. No dispatch caller or human endpoint is installed."""
+
+    COMMAND = 'item/commandExecution/requestApproval'
+    PERMISSIONS = 'item/permissions/requestApproval'
+
+    def __init__(self, thread, turn, write, present, timeout=60):
+        if not all(isinstance(value, str) and value for value in (thread, turn)) or not 0 < timeout <= 60:
+            raise ValueError('approval router requires confirmed thread/turn and bounded timeout')
+        self.thread, self.turn, self.write, self.present = thread, turn, write, present
+        self.timeout, self.pending, self.seen, self.closed = timeout, None, set(), False
+
+    @staticmethod
+    def identity(value):
+        if type(value) not in (int, str) or value == '':
+            raise ValueError('invalid approval request id')
+        return type(value), value
+
+    def emit(self, request, result):
+        try:
+            self.write(json.dumps({'id': request['id'], 'result': result}) + '\n')
+        except Exception:
+            self.pending, self.closed = None, True
+            raise ValueError('approval writer disconnected') from None
+
+    def close(self):
+        pending, self.pending, self.closed = self.pending, None, True
+        if pending:
+            self.emit(pending[0], {'decision': 'cancel'})
+
+    def reject(self):
+        self.close()
+        raise ValueError('approval input rejected; transport must stop')
+
+    def expire(self):
+        if self.pending and time.monotonic() >= self.pending[1]:
+            self.close()
+            return True
+        return False
+
+    def receive(self, line):
+        """Caller supplies only server requests, not responses/notifications from the stdio demultiplexer."""
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError('duplicate JSON key')
+                result[key] = value
+            return result
+        if self.closed or self.expire():
+            raise ValueError('approval transport closed')
+        try:
+            request = json.loads(line, object_pairs_hook=unique)
+            if not isinstance(request, dict) or set(request) - {'jsonrpc', 'id', 'method', 'params'} \
+                    or request.get('jsonrpc', '2.0') != '2.0':
+                self.reject()
+            identity = self.identity(request.get('id'))
+            method, params = request.get('method'), request.get('params')
+            if identity in self.seen or self.pending or method not in (self.COMMAND, self.PERMISSIONS) \
+                    or not isinstance(params, dict):
+                self.reject()
+            if (params.get('threadId'), params.get('turnId')) != (self.thread, self.turn) \
+                    or not isinstance(params.get('itemId'), str) or not params['itemId'] \
+                    or type(params.get('startedAtMs')) is not int:
+                self.reject()
+            self.seen.add(identity)
+            if method == self.PERMISSIONS:
+                if not isinstance(params.get('permissions'), dict) or not isinstance(params.get('cwd'), str):
+                    self.reject()
+                self.emit(request, {'permissions': {}, 'scope': 'turn'})
+                return
+            allowed = {'threadId', 'turnId', 'itemId', 'approvalId', 'environmentId', 'command', 'cwd',
+                       'reason', 'kind', 'startedAtMs', 'commandActions', 'proposedExecpolicyAmendment',
+                       'proposedNetworkPolicyAmendments', 'networkApprovalContext'}
+            if set(params) - allowed or any(params.get(key) is not None for key in
+                    ('proposedExecpolicyAmendment', 'proposedNetworkPolicyAmendments', 'networkApprovalContext')):
+                self.reject()  # unseen permission/policy context must never reach single-command acceptance
+            if params.get('kind', 'command') != 'command' \
+                    or not isinstance(params.get('command'), str) or not params['command'] \
+                    or not isinstance(params.get('cwd'), str) or not params['cwd'] \
+                    or any(params.get(key) is not None and not isinstance(params[key], str)
+                           for key in ('approvalId', 'environmentId', 'reason')):
+                self.reject()
+            card = {'id': request['id'], **{key: params.get(key) for key in
+                    ('threadId', 'turnId', 'itemId', 'approvalId', 'environmentId', 'command', 'cwd', 'reason')}}
+            self.pending = (card, time.monotonic() + self.timeout)
+            self.present(dict(card))  # private, nonblocking UI interface; never a board/log transport
+        except Exception:
+            self.close()
+            raise ValueError('approval request failed closed') from None
+
+    def decide(self, reply):
+        """Called only by a future authenticated human presenter, never by model/board text."""
+        if self.closed or self.expire():
+            raise ValueError('approval transport closed')
+        if not self.pending or not isinstance(reply, dict):
+            self.reject()
+        card = self.pending[0]
+        keys = ('id', 'threadId', 'turnId', 'itemId', 'approvalId')
+        if set(reply) != {*keys, 'decision'} or any(reply.get(key) != card[key] for key in keys) \
+                or type(reply['id']) is not type(card['id']) \
+                or reply['decision'] not in ('accept', 'decline', 'cancel'):
+            self.reject()
+        self.pending = None  # consume once, even if the writer disconnects
+        self.emit(card, {'decision': reply['decision']})
+        if reply['decision'] == 'cancel':
+            self.closed = True
+
 def task_policy(issue):
     """#577: fresh trusted board state is authority; local handles and labels are not."""
     item = parse(issue)
@@ -377,8 +485,8 @@ def task_profile_options(item):
         return None
     if profile == 'host-gpu':
         raise ValueError('unsupported host-gpu: native exec has no action-time approval transport; owner and Mac runtime '
-                         'administrator must provision an isolated Blender/Chrome/GPU runner and record permitted host '
-                         'actions, supported approval client and approval location on this task; answer/requeue is not provisioning')
+                         'administrator must identify supported isolated qualification on the existing Mac or another runner '
+                         'and record permitted host actions, supported approval client and approval location on this task; answer/requeue is not provisioning')
     if profile != 'workspace':
         raise ValueError('unsupported execution profile')
     if item['runtime'] != 'codex' or (item['pm'] or {}).get('runtime') not in ('codex', 'dot'):

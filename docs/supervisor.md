@@ -561,11 +561,11 @@ Recommend option 1: no general wording cure was established and more trials in t
 explicitly stopped. A narrowing requires owner acceptance under R13, then a contract amendment before any
 further implementation. Neither this packet nor the option publishes, deploys or closes the task. The existing
 supervisor must independently review the exact candidate; no replacement reviewer/sender is started.
-## 9. Task #577
+## 10. Task #577
 
 Candidate implementation only; main publication and live qualification remain held. R9/R13 and
-[task execution profiles](../taskq.md#task-execution-profiles-577) are the policy SoT. No new approval
-transport was implemented. The restricted `workspace` profile is an offline-tested selection and evidence
+[task execution profiles](../taskq.md#task-execution-profiles-577) are the policy SoT. Dormant source/mock approval interfaces were added on 2026-10-10; no enabled approval
+transport or external human endpoint was implemented. The restricted `workspace` profile is an offline-tested selection and evidence
 guard, not a qualified GPU route. The `host-gpu` profile deliberately refuses execution before spawn/resume.
 The existing supervisor must independently review the exact candidate SHA and CI, then `taskq ask 577` with
 the PR link, missing topology and an explicit separate publication choice. Never close this task before that
@@ -583,26 +583,29 @@ Read-only metadata from the current worker, not a new spawn/resume or GPU qualif
 | Current worker rollout | source=exec, cli_version=0.159.3, originator=codex_work_desktop; workspace-write, never; repository Git metadata writable; gpt-6.1-sol, low | Current Git prerequisite only; desktop originator proves neither app continuation nor future policy |
 | Credential availability | OPENAI_API_KEY, CODEX_API_KEY, OPENAI_BASE_URL absent; auth file present; login status exits 0, ChatGPT login reported | Auth contents not read; no credentials copied, printed or changed; availability proves no inference entitlement |
 | Backend metadata | configured provider openai, custom provider count 0, local profile count 0 | No endpoint/token values printed; no backend changes |
-| Project limits | live checkout Claude0/Codex4; candidate tracked configuration Claude4/Codex4 | No settings changed; candidate must not dispatch live without the approved isolated Claude0/Codex4 setup |
+| Project limits | prior evidence: live Claude0/Codex4; current continuation scope Claude0/Codex3; candidate tracked Claude4/Codex4 | No settings changed; no live dispatch; future qualification must preserve the current approved Claude0/Codex3 scope |
 | Native profile spawn/resume | Real local process/file boundary with fake CLI; isolated tests verify selection, new per-turn handles and context mismatch | No paid/live Codex turn; no actual browser proof; not a live PASS |
-| Blender/Chrome/GPU | No probe performed | No approved external runner supplied; live qualification incomplete |
+| Existing Mac manager evidence (owner handoff, 2026-10-10) | Approved disposable loopback bind/connect/byte exchange exit 0; Blender 5.2.1 LTS and Chrome 154.0.8037.98 version commands exit 0 | Existing host is present; not native TaskQ lifecycle or Blender workload/browser/GPU proof; not repeated here |
+| Replacement worker board read, 2026-10-10 | One native BOARD.get(577) completed; the command then exited 1 because the output expression called nonexistent taskq.phase | DNS failure did not repeat on this read; command is not reported exit 0; no second diagnostic board read |
 
 [Official app-server approvals](https://developers.openai.com/codex/app-server) require the client to respond
 to server-initiated approval requests. The installed schema supports these requests; the absence is in this
-TaskQ execution adapter, not a claim that Codex itself lacks approvals. Adding a transport is outside #577's
-requeue scope. The profile guard uses a native per-turn handle and a fresh rollout context; it is cooperative
+TaskQ execution adapter, not a claim that Codex itself lacks approvals. The new continuation authorizes
+source/mock interfaces only, not adapter activation. The profile guard uses a native per-turn handle and a fresh rollout context; it is cooperative
 runtime evidence, not an ACL, cryptographic attestation, or proof that arbitrary desktop continuation inherits
 native policy. Local handles never select or approve a profile. Missing evidence must stop task work.
 
 ### External prerequisite and original observations
 
-Owner and Mac runtime administrator: provision an isolated real Blender/Chrome/GPU runner, name its supported
-action-time approval client, record permitted host-side actions and the approval location on #577, and obtain
-separate qualification scope preserving TaskQ approval never, model/effort/runtime and Claude0/Codex4 limits.
-A manually approved host-side prerequisite executor can be evaluated separately; none has been supplied or
-qualified. A board answer alone does not provision it. Do not retry the previously denied bind/Chrome topology.
-After the reviewable candidate exists, the supervisor asks for this concrete prerequisite and a separate
-publication choice. Proposed future unblock order must be reviewed after qualification; no order is activated.
+Owner and Mac runtime administrator: identify the existing Mac's supported per-command human approval
+endpoint and an isolated diagnostic scope on #577 (or another supported host if necessary), with permitted
+host actions, UI/approval location, lifetime and Claude0/Codex3 limits. The manager's approved loopback and
+version evidence proves that a new Mac runner is not necessarily absent. It does not provision that endpoint
+for a native never-policy worker; a textual answer/requeue into the unchanged worker does not connect it.
+The supervisor must order a separately approved supported adapter/executor qualification after endpoint review.
+Do not retry the previously denied bind/Chrome topology. No publication, workload or held game activation.
+After exact-head review, the supervisor reports the unresolved endpoint and separate publication choice.
+Proposed future unblock order still requires qualification and review; no order is activated.
 
 Original evidence and game acceptance criteria remain unchanged:
 
@@ -629,7 +632,7 @@ The local fake-CLI test makes no real adapter/model calls; elapsed time and CI b
 | Forged/mismatched task selection | Owner-shell gate, matching trusted approval note, unsupported profile/options rejected (isolated) | unknown | Retain; existing board ACL trust remains |
 | S/W or resume/restart use different policy | Fresh resolver at exec, equivalent options, new turn handle; requeue/adopt retain board field (isolated) | reported project-wide selection | Retain; paid lifecycle proof still needed |
 | App continuation silently inherits permission claim | Same thread without native handle rejected; stale/newest mismatched rollout context rejected (isolated) | unknown | Retain; cooperative handle, no OS attestation |
-| External prerequisite answer/retry loop | host-gpu remains blocked after answer/requeue, zero runtime starts (isolated) | reported | Retain; external runner unavailable |
+| External prerequisite answer/retry loop | host-gpu remains blocked after answer/requeue, zero runtime starts (isolated) | reported | Retain; native human endpoint unresolved, existing host present |
 | Environment leaks session authority or credentials | Parent ids/old handle removed; credential transport unchanged; output excludes secret fixture (isolated) | unknown | Retain; auth availability is not entitlement |
 | Process/env boundary loses selection | Bounded real child with fake CLI records applied argv/env on spawn/resume (local boundary) | synthetic candidate check | Retain; no real Codex/GPU capability claimed |
 
@@ -653,3 +656,41 @@ the positive report fixture had no installed Codex runtime; the fixture now supp
 No production runtime/config/credential change, live probe or Memory behavior change is part of this correction.
 The external prerequisite and separate publication gate above remain unchanged. Final-gate and exact-head CI
 outcomes are recorded in the task result; prior-head Linux success does not prove this candidate.
+
+### Dormant stdio interfaces, owner continuation 2026-10-10
+
+`ApprovalRouter` is deliberately unreferenced by runtime/dispatch; only mock tests instantiate it. The
+writer accepts newline-delimited response text; the presenter accepts a private pending card and returns
+immediately. A future authenticated human UI alone may call `decide`. No board/prose/model decision input,
+public card logging, automatic acceptance, installed UI, config toggle or credential access/transfer exists.
+See the [contract](../taskq.md#dormant-approval-interfaces-sourcemock-only-577) for opt-in and lifecycle limits.
+
+Fresh installed codex-cli 0.159.3 schema generation performed without starting app-server/inference. The
+schema has command request id plus threadId/turnId/itemId, startedAtMs and optional approvalId, with distinct
+callback ids possible for one item. Responses use decision accept/decline/cancel; acceptForSession and
+execpolicy/network amendments exist upstream but this interface rejects them. Command cards include the
+exact command/cwd/reason/environment identity. Unknown fields, non-command stdin kinds and non-null policy
+amendment/network contexts fail closed rather than letting a presenter approve hidden scope. Permission
+requests always return permissions={} and scope=turn; no expanded grant is implemented.
+
+Installed ThreadStart/ThreadResume/TurnStart schemas expose approvalPolicy and approvalsReviewer.
+TurnStart explicitly describes approvalPolicy, approvalsReviewer and sandboxPolicy as overriding this and
+subsequent turns. Upstream human opt-in would require approvalsReviewer=user and a supported request-producing
+policy such as on-request, which changes never and remains unauthorized. There is no TaskQ activation setting
+in this candidate. Exact endpoint/authentication, board opt-in and UI ownership must be resolved before a
+separately approved activation; persistent TurnStart overrides require fresh policy checking on each resume.
+UI cards last only until one reply, deadline (maximum 60 seconds), cancellation or disconnect. The future
+stdio demultiplexer must feed only server requests, service expire within deadline and close on EOF/failure.
+Unknown/malformed input stops that transport; it must not continue an execution after rejection.
+
+| Requirement / consequence | Assertion and cheapest level | Red before fix | Blindspot / disposition |
+|---|---|---|---|
+| Wrong action or replay accepted | ApprovalRouter exact typed id/thread/turn/item/callback and duplicate request/reply mocks | unknown; synthetic rejection assertions | Retain; no authenticated human endpoint or live server proof |
+| Malformed/unknown request grants access | Wrong ids/types, duplicate JSON keys, malformed JSON/method, unsupported context close mocks | unknown | Retain; deliberately narrow command subset, not a complete protocol implementation |
+| Silent grant or persistent permission | No output before matching human reply; decline/cancel; session/amendment rejected; permission grants empty/turn | unknown | Retain; actual server enforcement unqualified |
+| Stale UI approval on timeout/resume/disconnect | Controlled monotonic deadline, EOF/presenter/writer failure, fresh resumed-turn router rejects old reply | unknown | Retain; caller servicing/event loop remains dormant and unresolved |
+
+Source/mock continuation changes no active agent behavior; no Memory behavior-policy update is needed.
+No credential reads/transmission, workload, approval/security/config/model/effort/runtime/limit changes,
+live spawn/resume, browser proof, denial retry, benchmark, merge/deploy/close or held game activation.
+Full-suite and exact-head CI results belong in the new result, never inherited from an older candidate SHA.

@@ -300,6 +300,9 @@ Changed: free-text questions → decision cards with option codes `N.K` (#490).
 
 This file is the whole contract (with [docs/single-file.md](docs/single-file.md) for design). Briefs and docs link
 here; they never copy it. A change of behavior updates this file in the same deliverable.
+Changed (owner-approved compatibility update, 2026-10-10): implicit hot pull → explicit qualified immutable
+release update; legacy issue blocks are read-only until guarded migration (§ 1). Running code and its contract
+always come from the same release.
 Changed: testing mechanics implicit in worker/review commands → § 10 defines risk-based evidence, preserved
 fault detection and a bounded pilot; no broad suite migration (#533).
 Changed (owner-approved queue optimization, 2026-10-10): full history on every fresh read → optional metadata-only
@@ -418,7 +421,7 @@ Owner decisions on what taskq looks and sounds like, one line each (#505). Chang
 
 Setup again: identify the installed entrypoint first. A legacy package follows § "Upgrade a legacy package
 installation" below before any pull of its clone. An already qualified single-file clone follows § 1.2's
-Git update procedure and then re-reads this file; preserve project changes when updating the project checkout.
+explicit update procedure below and then re-reads this file; preserve project changes when updating the project checkout.
 
 1. python3 >= 3.9, git; `gh` (GitHub) or `glab` (GitLab) installed and logged in: `gh auth status` / `glab auth status`.
    Workers need the `claude` and/or `codex` CLI.
@@ -431,8 +434,7 @@ Git update procedure and then re-reads this file; preserve project changes when 
    `glab auth login --hostname <host> --web`.
 2. `git clone https://github.com/alexkirs/taskq ~/taskq`; `taskq.py` is the only file it needs. Alias:
    `ln -s ~/taskq/taskq.py ~/.local/bin/taskq` or `alias taskq='python3 ~/taskq/taskq.py'` (Windows: § 9).
-   Update: `git pull` in the clone; `taskq pm`, `taskq tick` and `taskq wait` pull it themselves (`update`, § 2), so keep
-   it on clean `main`.
+   Update: use the explicit qualified release procedure below. `pm`, `tick` and `wait` never fetch, pull or swap code.
 3. At the project root write `taskq.json` (fields: § 2) and commit it. Labels are created by the first `add`.
 4. Check: `taskq list` prints the queue (empty is fine) and no error. Claude workers: run `claude` once in the
    project root and accept the folder trust prompt (only the owner can); else every spawn fails `Workspace not trusted`.
@@ -472,19 +474,61 @@ replace its entrypoint in place, or diagnose the new CLI with `python -m taskq -
    a child CLI a redirected configuration view: direct CLI login can succeed while that child's API returns
    401/404. If this is reproduced, use a qualified non-Store Python interpreter; do not copy tokens between views.
 6. Switch only this user's command or shell function to the new absolute entrypoint after these checks. Preserve
-   its previous definition for rollback. For normal self-updates, the new clone must be clean `main`; use
-   `git switch main` only when it still names the verified SHA (otherwise verify the new head's CI first).
+   its previous definition for rollback. Normal updates use the qualified immutable release procedure below.
    A candidate branch is reviewed and qualified before becoming an installed production entrypoint (§ 10).
 
 Rollback restores the previous command/function and uses the untouched old installation. It does not reset,
 delete or recreate any old checkout, branch, resource, profile or board claim. If startup or native readiness
-fails, keep the old command available and report the failed check. The current single-file CLI has no `update`
-subcommand: its clone updates by Git (§ 1.2); installation instructions must not promise the legacy command.
+fails, keep the old command available and report the failed check. The explicit `update` command below never
+modifies an existing source checkout or migrates the board implicitly.
 
 For Windows Codex, the supported current runtime uses `codex exec` and `codex app-server` over stdio (§ 8).
 Its startup `initialize` handshake can be tested without creating a thread or model turn. The old package's
 `app-server proxy` control-socket error is not evidence that this stdio route fails. Startup proof still does
 not replace the isolated spawn, naming, result and retirement qualification required by § 10.
+
+### Explicit release update and issue migration
+
+`taskq update` resolves and previews configured origin/main (an explicit network read). The managed launcher
+supplies `TASKQ_INSTALL_DIR`; an unmanaged installation needs `--install-dir <directory>`. Optional
+`--commit <full SHA>` pins the reviewed revision, including when main moves after preview. Preview reports the source,
+exact commit and destination without a fetch or a write. Apply adds `--apply --qualification <JSON file>`.
+The qualification record is explicit operator evidence: `{"commit":"<full SHA>","upstream":"<origin URL>",
+"tests":"passed","review":"accepted"}`. It attests review/local qualification; it is not an authenticated CI
+receipt. Apply independently requires every `tests` check on that exact SHA in the canonical GitHub TaskQ
+upstream to be completed/successful, and refuses missing checks or unreadable CI. It fetches origin/main into
+a new checkout, requires that qualified SHA to be on its history, checks out that exact commit detached and
+verifies clean source. Unknown upstreams refuse application. There is no arbitrary-HEAD or offline bypass.
+
+Apply creates `<install-dir>/releases/<SHA>`, then atomically replaces `<install-dir>/current.json` with
+`{"commit":"<SHA>","path":"<absolute release directory>"}`. An existing release is reused only after exact SHA, origin, main ancestry, clean-tree and regular-file
+verification plus current qualification/CI checks; incomplete releases are preserved and refused. A local exclusive
+installation lock serializes applies, with exact-token release and no expiry/steal; a crashed lock requires explicit
+reconciliation after stopping the installer. A candidate must descend from the selected commit: automatic downgrades
+are refused. No release is reset or overwritten. Source and previous releases remain untouched.
+The launcher resolves that pointer once per new process, exports `TASKQ_INSTALL_DIR`, then executes its absolute
+`taskq.py`; children use their parent's release path. Every new-version mutation/dispatch/effect checks the current
+pointer and refuses when this process is stale or the pointer invalid. Read-only inspection remains available.
+Briefs identify the loaded release and contract hash and direct a new turn to the launcher. `taskq pm` prints
+the current release contract; no global hash file proves every individual agent has read it. Old versions lack
+this gate: explicit all-host stop/drain remains mandatory. `taskq version` reports source, Git SHA/dirty state,
+contract hash, supported schema and selected pointer; `taskq contract` prints its canonical path and hash. Pointer rollback requires the corresponding board format
+and controller compatibility; restoring an old launcher does not make mixed versions safe. A direct alias to
+a source file is not switched by this command. No board change, dispatch, model call or publication is an update.
+
+`taskq migrate` previews all open task blocks, regardless of report filters. `taskq migrate --apply
+--controllers-stopped` records the operator's explicit confirmation that old controllers on **every host**
+and all in-flight requests have stopped/drained and their sessions have been reconciled. This is mandatory:
+old clients ignore markers and the new guard cannot fence them. Apply takes the common project guard, reads
+fresh full issues, preflights every version before any write, ensures the reserved `taskq-events` label, and initializes `event_schema: 1` plus the event
+fields defined in R4. Absent/zero is legacy; one is already migrated and remains unchanged; unknown, invalid or
+future versions fail closed. Re-running migration is idempotent. Raw unknown fields, claims, PM ownership,
+human text and comment history are preserved; labels retain their values plus the reserved pending-event index
+as required by the event helper. Run apply once for a new board as explicit label setup even without legacy tasks.
+Custom boards need `ensure_event_label()` for this explicit setup; missing capability refuses setup, not read-only reports. Migration is explicit, never startup/dispatch behavior.
+Legacy tasks remain visible in read-only reports but cannot be mutated, adopted or executed by new clients.
+New tasks are created at version one. Partial write failures retain the common guard for reconciliation;
+no automatic retry or rollback erases acknowledged work. Closed history is not rewritten.
 
 ## 2. Configuration: taskq.json
 
@@ -504,7 +548,7 @@ not replace the isolated spawn, naming, result and retirement qualification requ
 | `board_options` | GitLab: `{"coordination_board": ID, "coordination_label": ID}`; permanent dedicated board and label, provisioned explicitly once | required for GitLab writes |
 | `repo` | `owner/repo` (GitHub) or `group/project` (GitLab) | required for github/gitlab |
 | `host` | Enterprise or self-managed host | the CLI's default |
-| `update` | `false`: `pm`, `tick` and `wait` do not `git pull` the taskq clone (§ 7) | `true` |
+| `update` | legacy setting accepted; commands never hot-pull, whatever its value | unused |
 | `glab_client_id` | Self-managed GitLab: the OAuth Application ID users give `glab` before login (§ 1) | none |
 | `publish` | `direct` or `pr` (§ 6) | `direct` |
 | `workspace` | `external`: the host owns the worker's worktree and branch `taskq-<N>`; taskq never creates or removes them (§ 5, § 6) | taskq-owned `.worktrees/taskq-<N>` |
@@ -821,10 +865,10 @@ The manager starts with `taskq pm` in each explicit project root and follows wha
 open tasks with no `pm`, including tasks outside the report filter. Triage them explicitly and state the exact
 project-specific `taskq pm --adopt N` action before leaving them blocked; adoption remains an explicit choice,
 never automatic. Never seize a task with a manager or change foreign claims. `taskq pm`, `taskq tick` and
-`taskq wait` first run `git pull --ff-only` in the taskq clone when it is clean (one line on failure), then compare the hash of its
+`taskq wait` compare the hash of the running release's
 `taskq.md` with `.taskq/pm.json` (a runtime handle, R1). A different hash prints first: `The manager contract changed:
-run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#430). `taskq pm` prints the pulled
-contract itself, so it skips that line. `"update": false` in `taskq.json` turns the pull off.
+run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#430). `taskq pm` prints that release's
+contract itself, so it skips that line. These commands never update source code.
 
 ### Arm the tick
 
@@ -1190,8 +1234,8 @@ supported explicit named profile and disposable local-only Git fetch (owner corr
 
 ## 10. Develop taskq itself
 
-Every session on a machine runs the clone's `taskq.py`: keep that clone on clean `main` and change taskq only in a
-worktree (`git worktree add -b <branch> .worktrees/<branch> origin/main`); `pm`, `tick` and `wait` pull a clean clone (§ 7). Testing: below.
+Every session runs one qualified release's `taskq.py` and contract. Change taskq only in a separate
+worktree (`git worktree add -b <branch> .worktrees/<branch> origin/main`); installed releases stay unchanged. Testing: below.
 ### Testing policy
 
 Use the cheapest check that can detect the changed requirement's plausible failure. Test count and a fixed mix
@@ -1246,8 +1290,8 @@ parser/text edits. Any live check remains subject to existing approvals, limits,
 safeguards; testing does not authorize a new benchmark or load stage.
 
 Before merge or direct publication to `main`, require the applicable approved changed-live-boundary proof on
-an isolated candidate worktree at the recorded candidate SHA. `tick` and `wait` auto-pull `main`: qualification
-after publication is too late. Use only an already approved isolated topology, board and runtime scope; do not
+an isolated candidate worktree at the recorded candidate SHA. Explicit updates require a qualified exact upstream SHA; qualification
+after installation is too late. Use only an already approved isolated topology, board and runtime scope; do not
 expand permissions, limits or approvals. If the necessary isolated proof cannot be obtained within that scope,
 report the blocker and hold main publication; a pending required proof is never PASS. Unrelated parser or
 documentation changes need no paid full lifecycle run.

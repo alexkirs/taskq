@@ -33,6 +33,9 @@ class FakeBoard:
         self.guard_serial = 0
         self.guard_mutex = threading.Lock()
 
+    def ensure_event_label(self):
+        pass  # fake board labels need no native provisioning
+
     def acquire(self, owner):
         with self.guard_mutex:
             if self.guard is not None:
@@ -1467,7 +1470,7 @@ class Tick(TickSetup):
         self.assertNotIn('spawn', self.run_cli('tick'))
 
     def restricted(self, people, **fields):
-        n = self.board.add('restricted', taskq.block('g', {'deps': [], 'pm': taskq.origin(), **fields}),
+        n = self.board.add('restricted', taskq.block('g', {'event_schema': 1, 'deps': [], 'pm': taskq.origin(), **fields}),
                            ['q-ready', 'assignee-only'])
         self.board.issues[n]['assignees'] = people
         return n
@@ -2994,7 +2997,7 @@ class MultiPM(Base):
 
 
 class Contract(Base):
-    """#430: `taskq pm` gives the manager role; tick and wait pull the clone and say when the contract changed."""
+    """The running release owns its contract; explicit updates never replace running code."""
 
     def git(self, folder, *argv):
         REAL_RUN(['git', '-C', str(folder), '-c', 'user.name=t', '-c', 'user.email=t@t', *argv], check=True, capture_output=True)
@@ -3030,7 +3033,7 @@ class Contract(Base):
         for n, line in zip((2, 3), hints):
             self.assertIn(f'#{n} ', line)
             self.assertIn(f'project {self.root.name}:', line)
-            self.assertIn(f'cd {self.root} && taskq pm --adopt {n}', line)
+            self.assertIn(f'cd {taskq.shlex.quote(str(self.root))} && taskq pm --adopt {n}', line)
             self.assertIn('No ownership or claims changed.', line)
         for part in ('executing PM fills the field', 'relays the completed block unchanged',
                      'must not replace known executing-PM state', 'no interval from a default or `arm tick` output',
@@ -3072,40 +3075,200 @@ class Contract(Base):
         self.run_cli('pm')
         self.assertNotIn(line, self.run_cli('tick'))
 
-    def test_tick_pulls_a_clean_clone(self):
-        origin, writer, clone = self.root / 'origin.git', self.root / 'writer', self.root / 'clone'
+    def test_refresh_never_fetches_or_changes_source(self):
+        (self.root / '.git').write_text('gitdir: elsewhere')  # linked worktree also remains untouched
+        (self.root / 'taskq.md').write_text('old contract')
+        self.run_cli('pm')
+        (self.root / 'taskq.md').write_text('new contract')
+        with mock.patch.object(taskq.subprocess, 'run', side_effect=AssertionError('refresh ran git')):
+            self.assertIn('contract changed', self.run_cli('tick'))
+            self.run_cli('pm')
+        self.assertEqual((self.root / 'taskq.md').read_text(), 'new contract')
+
+    def test_update_exact_sha_with_real_isolated_git_and_atomic_pointer(self):
+        origin, writer, install = self.root / 'origin.git', self.root / 'writer', self.root / 'install'
         with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN), \
-                mock.patch.object(taskq, 'CLONE', clone), \
+                mock.patch.object(taskq, 'CLONE', writer), \
                 mock.patch.dict(os.environ, {'PATH': os.defpath + os.pathsep + os.environ.get('PATH', '')}):
             REAL_RUN(['git', 'init', '-q', '--bare', str(origin)], check=True)
             REAL_RUN(['git', 'clone', '-q', str(origin), str(writer)], check=True, capture_output=True)
-            (writer / 'taskq.md').write_text('v1\n')
+            self.git(writer, 'checkout', '-qb', 'main')
+            (writer / 'taskq.py').write_text('print("qualified")\n')
+            (writer / 'taskq.md').write_text('qualified contract\n')
             self.git(writer, 'add', '.')
-            self.git(writer, 'commit', '-qm', 'v1')
-            self.git(writer, 'push', '-q', 'origin', 'HEAD')
-            REAL_RUN(['git', 'clone', '-q', str(origin), str(clone)], check=True, capture_output=True)
-            self.run_cli('pm')
-            (writer / 'taskq.md').write_text('v2\n')
-            self.git(writer, 'commit', '-qam', 'v2')
-            self.git(writer, 'push', '-q', 'origin', 'HEAD')
-            self.assertIn('contract changed', self.run_cli('tick'))
-            self.assertEqual((clone / 'taskq.md').read_text(), 'v2\n')
-            (clone / 'taskq.md').write_text('local edit\n')  # a dirty clone is never pulled
-            (writer / 'taskq.md').write_text('v3\n')
-            self.git(writer, 'commit', '-qam', 'v3')
-            self.git(writer, 'push', '-q', 'origin', 'HEAD')
-            self.run_cli('tick')
-            self.assertEqual((clone / 'taskq.md').read_text(), 'local edit\n')
-            self.git(clone, 'checkout', '--', 'taskq.md')  # clean again: pm pulls and prints the new contract, no stale line
-            out = self.run_cli('pm')
-            self.assertEqual((clone / 'taskq.md').read_text(), 'v3\n')
-            self.assertNotIn('contract changed', out)
-            (writer / 'taskq.md').write_text('v4\n')
-            self.git(writer, 'commit', '-qam', 'v4')
-            self.git(writer, 'push', '-q', 'origin', 'HEAD')
-            with mock.patch.dict(taskq.CONFIG, {'update': False}):  # the setting turns the pull off
-                self.run_cli('pm')
-            self.assertEqual((clone / 'taskq.md').read_text(), 'v3\n')
+            self.git(writer, 'commit', '-qm', 'candidate')
+            self.git(writer, 'push', '-q', '-u', 'origin', 'main')
+            sha = taskq.update_git(writer, 'rev-parse', 'HEAD')
+            args = ('update', '--commit', sha, '--install-dir', str(install))
+            self.assertIn('Preview only', self.run_cli(*args))
+            self.assertFalse(install.exists())
+            proof = self.root / 'proof.json'
+            proof.write_text(json.dumps(dict(commit=sha, upstream=str(origin), tests='passed', review='accepted')))
+            with mock.patch.object(taskq, 'qualified_checks', side_effect=SystemExit('CI red')):
+                with self.assertRaisesRegex(SystemExit, 'CI red'):
+                    self.run_cli(*args, '--apply', '--qualification', str(proof))
+            self.assertFalse(install.exists())
+            install.mkdir()
+            pointer = install / 'current.json'
+            pointer.write_text(json.dumps({'commit': sha, 'path': str(writer)}))
+            before = taskq.update_git(writer, 'rev-parse', 'HEAD')
+            with mock.patch.object(taskq, 'qualified_checks') as checked:
+                self.run_cli(*args, '--apply', '--qualification', str(proof))
+                checked.assert_called_once_with(sha, str(origin))
+            selected = json.loads(pointer.read_text())
+            release = Path(selected['path'])
+            self.assertEqual(selected['commit'], sha)
+            self.assertEqual(taskq.update_git(release, 'rev-parse', 'HEAD'), sha)
+            self.assertEqual((release / 'taskq.md').read_text(), 'qualified contract\n')
+            self.assertEqual(taskq.update_git(writer, 'rev-parse', 'HEAD'), before)
+            self.assertEqual(taskq.update_git(writer, 'status', '--porcelain'), '')
+            old_pointer = pointer.read_text()
+            with mock.patch.object(taskq, 'qualified_checks'):
+                self.run_cli(*args, '--apply', '--qualification', str(proof))
+            self.assertEqual(pointer.read_text(), old_pointer)
+            # A second exact SHA cannot race an active installer; a completed checkout survives pointer failure.
+            (writer / 'taskq.md').write_text('next qualified contract\n')
+            self.git(writer, 'commit', '-qam', 'next')
+            self.git(writer, 'push', '-q', 'origin', 'main')
+            next_sha = taskq.update_git(writer, 'rev-parse', 'HEAD')
+            next_proof = self.root / 'next-proof.json'
+            next_proof.write_text(json.dumps(dict(commit=next_sha, upstream=str(origin), tests='passed', review='accepted')))
+            next_args = ('update', '--commit', next_sha, '--install-dir', str(install), '--apply', '--qualification', str(next_proof))
+            with taskq.installation_lock(install), mock.patch.object(taskq, 'qualified_checks'):
+                with self.assertRaisesRegex(SystemExit, 'installation busy'):
+                    self.run_cli(*next_args)
+            self.assertEqual(pointer.read_text(), old_pointer)
+            with mock.patch.object(taskq, 'qualified_checks'), mock.patch.object(taskq.os, 'replace', side_effect=OSError('pointer interrupted')):
+                with self.assertRaisesRegex(OSError, 'pointer interrupted'):
+                    self.run_cli(*next_args)
+            self.assertEqual(pointer.read_text(), old_pointer)
+            self.assertFalse((install / '.update.lock').exists())
+            with mock.patch.object(taskq, 'qualified_checks'):
+                self.run_cli(*next_args)
+            self.assertEqual(json.loads(pointer.read_text())['commit'], next_sha)
+            old_pointer = pointer.read_text()
+            with mock.patch.object(taskq, 'qualified_checks'), self.assertRaisesRegex(SystemExit, 'update git merge-base'):
+                self.run_cli(*args, '--apply', '--qualification', str(proof))
+            self.assertEqual(pointer.read_text(), old_pointer)
+            # A reviewed commit outside upstream main is not installable; failed checkout never switches pointer.
+            self.git(writer, 'checkout', '-qb', 'unmerged')
+            (writer / 'taskq.md').write_text('not merged\n')
+            self.git(writer, 'commit', '-qam', 'unmerged')
+            unmerged = taskq.update_git(writer, 'rev-parse', 'HEAD')
+            proof.write_text(json.dumps(dict(commit=unmerged, upstream=str(origin), tests='passed', review='accepted')))
+            with mock.patch.object(taskq, 'qualified_checks'), self.assertRaisesRegex(SystemExit, 'update git merge-base'):
+                self.run_cli('update', '--commit', unmerged, '--install-dir', str(install), '--apply', '--qualification', str(proof))
+            self.assertEqual(pointer.read_text(), old_pointer)
+
+    def test_update_requires_exact_upstream_ci_not_just_operator_evidence(self):
+        sha = 'a' * 40
+        good = dict(name='tests', head_sha=sha, status='completed', conclusion='success')
+        cases = [([], False), ([good], True), ([good, dict(good, conclusion='failure')], False),
+                 ([dict(good, head_sha='b' * 40)], False), ([dict(good, status='queued')], False)]
+        for checks, allowed in cases:
+            with self.subTest(checks=checks), mock.patch.object(taskq.shutil, 'which', return_value='gh'), \
+                    mock.patch.object(taskq.subprocess, 'run', return_value=mock.Mock(returncode=0,
+                        stdout=json.dumps([{'check_runs': checks}]), stderr='')):
+                if allowed:
+                    taskq.qualified_checks(sha, 'https://github.com/alexkirs/taskq')
+                else:
+                    with self.assertRaisesRegex(SystemExit, 'exact qualified SHA'):
+                        taskq.qualified_checks(sha, 'https://github.com/alexkirs/taskq')
+        with self.assertRaisesRegex(SystemExit, 'canonical'):
+            taskq.qualified_checks(sha, 'https://example.com/arbitrary/taskq')
+
+    def test_stale_managed_process_keeps_contract_but_refuses_effects(self):
+        install = self.root / 'installation'
+        old = install / 'releases' / ('a' * 40)
+        new = install / 'releases' / ('b' * 40)
+        old.mkdir(parents=True); new.mkdir()
+        (old / 'taskq.md').write_text('old contract')
+        (new / 'taskq.md').write_text('new contract')
+        pointer = install / 'current.json'
+        pointer.write_text(json.dumps({'commit': old.name, 'path': str(old)}))
+        with mock.patch.dict(os.environ, {'TASKQ_INSTALL_DIR': str(install)}), mock.patch.object(taskq, 'CLONE', old):
+            self.add('before switch')
+            old_digest = taskq.contract()
+            pointer.write_text(json.dumps({'commit': new.name, 'path': str(new)}))
+            self.assertEqual(taskq.contract(), old_digest)
+            self.assertIn(str(old / 'taskq.md'), self.run_cli('contract'))
+            self.assertIn('before switch', self.run_cli('list'))
+            before = json.dumps(self.board.issues, sort_keys=True)
+            with self.assertRaisesRegex(SystemExit, 'stale or invalid'):
+                self.add('old process cannot write')
+            with self.assertRaisesRegex(SystemExit, 'stale or invalid'):
+                taskq.effect(self.board.comment, 1, 'cannot write through helper')
+            self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+            with mock.patch.object(taskq, 'CLONE', new):
+                self.assertIsNone(taskq.release_reason())
+                self.assertNotEqual(taskq.contract(), old_digest)
+                self.add('fresh process')
+            self.assertEqual((old / 'taskq.md').read_text(), 'old contract')
+
+    def test_event_label_setup_is_explicit_and_unknown_create_retains_guard(self):
+        for adapter, tool in ((taskq.GitHub, 'gh'), (taskq.GitLab, 'glab')):
+            board = adapter('owner/repo')
+            with self.subTest(adapter=tool), mock.patch.object(taskq, 'coordination_api',
+                    return_value=(200, {'name': 'taskq-events'})) as api:
+                board.ensure_event_label()
+                self.assertEqual(api.call_count, 1)
+                self.assertEqual(api.call_args.args[0], tool)
+            with self.subTest(create=tool), mock.patch.object(taskq, 'coordination_api',
+                    side_effect=[(404, {}), (201, {'name': 'taskq-events'})]) as api:
+                with taskq.coordination():
+                    board.ensure_event_label()
+                self.assertEqual(api.call_count, 2)
+                self.assertIsNone(self.board.guard)
+        with mock.patch.object(taskq, 'coordination_api', side_effect=[(404, {}), (500, {})]):
+            with self.assertRaisesRegex(SystemExit, 'creation failed/unknown'):
+                with taskq.coordination():
+                    board.ensure_event_label()
+        self.assertIsNotNone(self.board.guard)
+
+    def test_legacy_migration_guard_preservation_idempotence_and_future_refusal(self):
+        self.add()
+        issue = self.board.issues[1]
+        raw = dict(self.task(1)['raw'], unknown={'keep': [1, 2]}, claim={'session': 'old'}, pm={'session': 'owner'})
+        raw.pop('event_schema', None)
+        original_text = '  human prose before\n\n'
+        suffix = '\n  human prose after\n'
+        issue['body'] = original_text + taskq.block('', raw).lstrip('\n') + suffix
+        issue['comments'] = ['original trusted history']
+        original = json.loads(json.dumps(issue))
+        # Migration orchestration is tested independently of the event helper's own legacy conversion cases.
+        def initialize(source):
+            return dict(taskq.parse(source)['raw'], event_schema=1)
+        with mock.patch.object(taskq, 'initialize_events', side_effect=initialize, create=True), \
+                mock.patch.object(taskq, 'event_labels', side_effect=lambda raw, labels: labels, create=True):
+            self.assertIn('1 task(s) would migrate', self.run_cli('migrate'))
+            self.assertEqual(issue, original)
+            with self.assertRaisesRegex(SystemExit, 'controllers-stopped'):
+                self.run_cli('migrate', '--apply')
+            with self.assertRaisesRegex(SystemExit, 'legacy event_schema'):
+                self.run_cli('later', '1')
+            self.assertIn('#1', self.run_cli('list'))
+            self.assertEqual(issue, original)
+            with mock.patch.object(self.board, 'update', wraps=self.board.update) as updated:
+                self.run_cli('migrate', '--apply', '--controllers-stopped')
+                updated.assert_called_once()
+            self.assertIsNone(self.board.guard)
+            migrated = json.loads(json.dumps(issue))
+            self.assertEqual(self.task(1)['raw'], dict(raw, event_schema=1))
+            self.assertTrue(issue['body'].startswith(original_text))
+            self.assertTrue(issue['body'].endswith(suffix))
+            for key in ('comments', 'labels', 'state'):
+                self.assertEqual(issue[key], original[key])
+            self.assertIn('0 task(s) migrated', self.run_cli('migrate', '--apply', '--controllers-stopped'))
+            self.assertEqual(issue, migrated)
+            self.add('second')
+            issue['body'] = taskq.block('legacy', raw)
+            self.board.issues[2]['body'] = taskq.block('future', dict(raw, event_schema=2))
+            before = json.dumps(self.board.issues, sort_keys=True)
+            with self.assertRaisesRegex(SystemExit, 'unsupported event_schema'):
+                self.run_cli('migrate', '--apply', '--controllers-stopped')
+            self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+            self.assertIsNone(self.board.guard)
+
 
 
 class Cleanup(Base):
@@ -3261,7 +3424,7 @@ class Model(Base):
 
     def test_block_keeps_unknown_keys(self):
         board = taskq.BOARD = FakeBoard()
-        n = board.add('t', taskq.block('text', {'scope': [], 'deps': [], 'claim': None, 'result': None, 'extra': {'x': 1}}),
+        n = board.add('t', taskq.block('text', {'event_schema': 1, 'scope': [], 'deps': [], 'claim': None, 'result': None, 'extra': {'x': 1}}),
                       ['q-later'])
         with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'none'}), contextlib.redirect_stdout(io.StringIO()), \
                 mock.patch.object(taskq, 'runtimes', return_value={}):
@@ -3282,7 +3445,7 @@ class Model(Base):
         for board, tool, key in ((taskq.GitHub('o/r'), 'gh', 'login'),
                                   (taskq.GitLab('o/r', 'gitlab.example'), 'glab', 'username')):
             with self.subTest(board=tool):
-                native = {'title': 'T', 'body': taskq.block('g', {}), 'description': taskq.block('g', {}),
+                native = {'title': 'T', 'body': taskq.block('g', {'event_schema': 1}), 'description': taskq.block('g', {'event_schema': 1}),
                           'number': 1, 'iid': 1, 'html_url': 'u', 'web_url': 'u', 'updated_at': 'now',
                           'author_association': 'OWNER', 'assignees': [{key: 'alice'}, {key: 'bob'}],
                           'labels': [{'name': 'q-ready'}, {'name': 'assignee-only'}] if tool == 'gh'
@@ -3413,7 +3576,7 @@ class RealChild(unittest.TestCase):
     def test_two_checkouts_share_board_guard_and_one_slot(self):
         with tempfile.TemporaryDirectory() as folder:
             shared = Path(folder)
-            issues = {str(n): {'iid': n, 'title': f'task {n}', 'body': taskq.block('g', {'deps': [],
+            issues = {str(n): {'iid': n, 'title': f'task {n}', 'body': taskq.block('g', {'event_schema': 1, 'deps': [],
                         'pm': {'runtime': 'fake', 'session': 'pm', 'name': 'fixture'}}),
                         'labels': ['q-ready'], 'state': 'open', 'listed': True, 'comments': [],
                         'updated_at': '2026-10-09T00:00:00Z', 'url': ''} for n in (1, 2)}
@@ -3464,7 +3627,7 @@ class RealChild(unittest.TestCase):
             (root / 'taskq.py').write_text((ROOT / 'taskq.py').read_text('utf-8'), encoding='utf-8')
             (root / 'board.py').write_text(FILE_BOARD, encoding='utf-8')
             (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'update': False, 'board_url': 'https://board'}))
-            issue = {'iid': 1, 'title': 'Привет 🌍', 'body': taskq.block('g', {'deps': []}), 'labels': ['q-ready'],
+            issue = {'iid': 1, 'title': 'Привет 🌍', 'body': taskq.block('g', {'event_schema': 1, 'deps': []}), 'labels': ['q-ready'],
                      'state': 'open', 'listed': True, 'comments': [], 'updated_at': '2026-10-09T00:00:00Z', 'url': ''}
             (root / 'issues.json').write_text(json.dumps({'1': issue}))
             env = {'PATH': '', 'HOME': str(root), 'TASKQ_HOST': 'win',
@@ -3502,7 +3665,7 @@ def link(session): return None
             issues = {}
             for n, labels in enumerate((['host-win'], ['host-win'], ['host-win'], [], ['host-mac'],
                                        ['host-win', 'run-fake'], ['host-win', 'host-mac']), 1):
-                issues[str(n)] = {'iid': n, 'title': f'T{n}', 'body': taskq.block('g', {'deps': [], 'pm':
+                issues[str(n)] = {'iid': n, 'title': f'T{n}', 'body': taskq.block('g', {'event_schema': 1, 'deps': [], 'pm':
                                  {'runtime': 'fake', 'session': SESSION, 'name': 'win'}}), 'labels': ['q-ready', 'priority-2', *labels],
                                  'state': 'open', 'listed': True, 'comments': [],
                                  'updated_at': '2026-10-09T00:00:00Z', 'url': ''}
@@ -3563,7 +3726,7 @@ def link(session): return None
                     with self.subTest(boundary=boundary, people=people, identity=identity):
                         (root / 'identity').write_text(identity)
                         (root / 'spawned').unlink(missing_ok=True)
-                        issue = {'iid': 1, 'title': 'T', 'body': taskq.block('g', {'deps': [], 'pm':
+                        issue = {'iid': 1, 'title': 'T', 'body': taskq.block('g', {'event_schema': 1, 'deps': [], 'pm':
                                  {'runtime': 'fake', 'session': SESSION, 'name': 'mac'}}), 'labels': ['q-ready', 'assignee-only'],
                                  'assignees': people, 'state': 'open', 'listed': True, 'comments': [],
                                  'updated_at': '2026-10-09T00:00:00Z', 'url': ''}

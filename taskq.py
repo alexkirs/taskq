@@ -115,8 +115,22 @@ def mine(item):
         wanted = CONFIG['me'] = CONFIG.get('me') or BOARD.user()  # one board call per process
     return not wanted or wanted in item['assignees']
 
+def compatibility_reason(item):
+    stale = release_reason()
+    if stale:
+        return stale
+    version = item['raw'].get('event_schema', 0)
+    if type(version) is not int or version not in (0, 1):
+        return f'#{item["iid"]}: unsupported event_schema {version!r}; writes refused'
+    if version == 0:
+        return f'#{item["iid"]}: legacy event_schema 0 is read-only; stop/drain controllers and run taskq migrate'
+    return None
+
+
 def execution_reason(item):
     """#545: an `assignee-only` task runs only for the board's authenticated user among its native assignees. None: allowed."""
+    if compatibility_reason(item):
+        return compatibility_reason(item)
     if not host_scope(item):
         return f'#{item["iid"]}: outside TASKQ_HOST_ONLY={os.environ["TASKQ_HOST_ONLY"]}; execution refused'
     if 'assignee-only' not in item['labels']:
@@ -301,6 +315,9 @@ def coordination_api(tool, host, method, path, body=None):
 
 def effect(function, *args, **kwargs):
     """An exception after effects begin poisons this grant, even when a caller catches it."""
+    reason = release_reason()
+    if reason:
+        fail(reason)
     held = getattr(GUARD, 'held', None)
     if held:
         if held['poisoned']:
@@ -435,6 +452,22 @@ class GitHub:
 
     def comments(self, n):
         return [item['body'] for item in self.pages(f'issues/{n}/comments')]
+
+    def ensure_event_label(self):
+        """Explicit migration/setup only; no auto-provision in ordinary event mutations."""
+        gitlab = isinstance(self, GitLab)
+        tool = 'glab' if gitlab else 'gh'
+        base = f'projects/{quote(self.repo, safe="")}' if gitlab else f'repos/{self.repo}'
+        code, data = coordination_api(tool, self.host, 'GET', f'{base}/labels/taskq-events')
+        if code == 200 and isinstance(data, dict) and data.get('name') == 'taskq-events':
+            return
+        if code != 404:
+            fail(f'taskq-events label lookup failed/unknown (HTTP {code})')
+        code, data = effect(coordination_api, tool, self.host, 'POST', f'{base}/labels',
+                            {'name': 'taskq-events', 'color': '#666666' if gitlab else '666666',
+                             'description': 'TaskQ pending manager events'})
+        if code != 201 or not isinstance(data, dict) or data.get('name') != 'taskq-events':
+            fail(f'taskq-events label creation failed/unknown (HTTP {code}); reconcile before retry')
 
     def add(self, title, body, labels):
         return self.api('POST', 'issues', {'title': title, 'body': body, 'labels': labels})['number']
@@ -1038,16 +1071,18 @@ def task(n, *states):
     found = parse(issue) if issue['state'] == 'open' else None
     if not found:
         fail(f'#{n} is not an open taskq task')
+    if compatibility_reason(found):
+        fail(compatibility_reason(found))
     if states and found['state'] not in states:
         fail(f'#{n} is {found["state"]}, not {" or ".join(states)}')
     return found
 
 def move(current, state, action, text='', **fields):
     """One update moves the label and the block together; one comment is the history. State None: no state label."""
+    if compatibility_reason(current):
+        fail(compatibility_reason(current))
     labels = [label for label in current['labels'] if not label.startswith(PREFIX)] + ([PREFIX + state] if state else [])
     raw = {**current['raw'], **{key: current[key] for key in FIELDS}, **fields}
-    if not raw.get('event_schema'):
-        raw = {**initialize_events(BOARD.get(current['iid'])), **raw}
     raw['events'] = [dict(event, acks=list(event.get('acks', []))) for event in raw.get('events', [])]
     reconcile_recipients(raw)
     append_event(raw, action, text)
@@ -1432,6 +1467,10 @@ def cmd_cleanup(args):
     root, dry, here, kinds = CONFIG['root'], args.dry_run, machine(), runtimes()
     verb, removed, kept, mess = 'would remove' if args.dry_run else 'removed', [], [], []
     items = list(filter(None, map(parse, BOARD.list(None))))
+    if not dry:
+        for item in items:
+            if compatibility_reason(item):
+                fail(compatibility_reason(item))
     states = {item['iid']: 'open' for item in items}
 
     issues = {}
@@ -1559,6 +1598,7 @@ def brief(item, runtime):
     return f'''{worker_name(item)}
 You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
 Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
+{release_context()}
 Read `{Path(__file__).resolve().with_name("taskq.md")}` first and do only what it allows (R13): a task that conflicts with a recorded decision is an ask with options, not an edit.
 
 {item["text"]}
@@ -1587,6 +1627,7 @@ def supervisor_brief(item, runtime, kind):
 You are the taskq supervisor S{n} of task #{n}: {item["title"]}. You are its only controller: you order its worker, follow it,
 review its result and close or rework it. You never edit the task's code, never start a session yourself, never decide for the owner.
 Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
+{release_context()}
 Read `{Path(__file__).resolve().with_name("taskq.md")}` (§ 7 Supervisor, § 6) first and do only what it allows (R13).
 
 {item["text"]}
@@ -1968,6 +2009,9 @@ def one_pass(args, table=True):
             fresh_issues = [read_issue(item['iid']) for item in ready]
             items = ready = sorted(filter(None, (parse(issue) for issue in fresh_issues if issue['state'] == 'open')),
                                    key=lambda item: (item['priority'], item['iid']))
+        for item in ready:
+            if compatibility_reason(item):
+                fail(compatibility_reason(item))
         worker_slots, occupied = set(), {}
         if local is not None:  # existing active workers consume capacity, even outside this invocation's host scope
             for item in ready:
@@ -2262,23 +2306,191 @@ def contract():
     path = CLONE / 'taskq.md'
     return hashlib.sha256(path.read_bytes()).hexdigest()[:12] if path.is_file() else None
 
+def release_reason():
+    """Managed launchers select once; older cooperative processes become read-only after pointer switch."""
+    folder = os.environ.get('TASKQ_INSTALL_DIR')
+    if not folder:
+        return None  # direct source invocation is not a managed installation
+    try:
+        selected = json.loads((Path(folder) / 'current.json').read_text('utf-8'))
+        path = Path(selected['path']).resolve()
+        if path == CLONE.resolve() and selected['commit'] == CLONE.name and re.fullmatch(r'[0-9a-f]{40}', selected['commit']):
+            return None
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return 'stale or invalid installed release; use the taskq launcher and re-read taskq pm before further mutations'
+
+
+def release_context():
+    return f'Loaded TaskQ release: {CLONE}; contract {contract() or "unavailable"}. For a new turn use the taskq launcher and re-read its contract.'
+
+
+def cmd_version(args):
+    git = shutil.which('git')
+    data = {'source': str(CLONE), 'commit': None, 'dirty': None, 'contract': contract(), 'event_schema': 1,
+            'install': os.environ.get('TASKQ_INSTALL_DIR'), 'stale': bool(release_reason())}
+    if git:
+        for key, command in (('commit', ['rev-parse', 'HEAD']), ('dirty', ['status', '--porcelain', '--untracked-files=all'])):
+            done = subprocess.run([git, '-C', str(CLONE), *command], capture_output=True, text=True, encoding='utf-8')
+            if not done.returncode:
+                data[key] = bool(done.stdout.strip()) if key == 'dirty' else done.stdout.strip()
+    if data['install']:
+        try:
+            data['selected'] = json.loads((Path(data['install']) / 'current.json').read_text('utf-8'))
+        except (OSError, ValueError):
+            data['selected'] = None
+    print(json.dumps(data, ensure_ascii=False))
+
+
 def refresh(pm=False):
-    """#430, before pm, tick and wait: `git pull --ff-only` a clean clone (`"update": false` skips it), then tell a manager
-    whose contract is stale to re-read it; `pm` re-reads it itself."""
-    if CONFIG.get('update', True) and (CLONE / '.git').exists():
-        git = [shutil.which('git') or 'git', '-C', str(CLONE)]
-        status = subprocess.run([*git, 'status', '--porcelain', '--untracked-files=no'], capture_output=True, text=True, encoding='utf-8')
-        if not status.returncode and not status.stdout.strip():
-            # fetch into origin/main, then fast-forward from that ref: FETCH_HEAD is shared with concurrent fetches of task branches
-            pulled = subprocess.run([*git, 'fetch', '-q', 'origin'], capture_output=True, text=True, encoding='utf-8')
-            if not pulled.returncode:  # the clone's own upstream, whatever its default branch is called
-                pulled = subprocess.run([*git, 'merge', '--ff-only', '-q', '@{upstream}'], capture_output=True, text=True, encoding='utf-8')
-            if pulled.returncode:
-                print(f'taskq: git pull --ff-only failed: {last_line(pulled.stderr + pulled.stdout)}', file=sys.stderr)
+    """Compare the running release contract locally; never hot-swap loaded code or fetch source."""
     path = CONFIG['root'] / '.taskq' / 'pm.json'
     known = json.loads(path.read_text('utf-8')).get('contract') if path.is_file() else None
     if not pm and contract() and known and known != contract():  # no pm.json: this session never took the role
         print('The manager contract changed: run taskq pm and follow it from now on.')
+
+def cmd_migrate(args):
+    """Explicit board-only transition. Preflight the whole fresh snapshot before the first write."""
+    if args.apply and not args.controllers_stopped:
+        fail('migrate --apply requires --controllers-stopped after stopping/draining old controllers on every host')
+    with coordination() if args.apply else contextlib.nullcontext():
+        issues = [BOARD.get(issue['iid']) for issue in BOARD.list(None) if BLOCK.search(issue.get('body') or '')]
+        changes = []
+        for issue in issues:
+            item = parse(issue) if issue['state'] == 'open' else None
+            if not item:
+                continue
+            version = item['raw'].get('event_schema', 0)
+            if type(version) is not int or version not in (0, 1):
+                fail(f'#{item["iid"]}: unsupported event_schema {version!r}; migration refused')
+            if version == 0:
+                changes.append((issue, initialize_events(issue)))
+        if args.apply:
+            ensure = getattr(BOARD, 'ensure_event_label', None)
+            if not callable(ensure):
+                fail('board adapter needs ensure_event_label for explicit event-index setup')
+            ensure()
+        else:
+            print('Setup requires reserved taskq-events label (checked/provisioned only on apply)')
+        for issue, raw in changes:
+            print(f'#{issue["iid"]} event_schema 0 -> 1' + (' (apply)' if args.apply else ' (preview)'))
+            if args.apply:
+                # Replace only the matched block, preserving surrounding human prose byte-for-byte.
+                body = BLOCK.sub(lambda _: block('', raw).lstrip('\n'), issue['body'], count=1)
+                effect(BOARD.update, issue['iid'], body=body, labels=event_labels(raw, issue['labels']))
+        print(f'{len(changes)} task(s) ' + ('migrated' if args.apply else 'would migrate; apply requires --controllers-stopped'))
+
+
+def update_git(folder, *argv):
+    done = subprocess.run([shutil.which('git') or fail('git not found'), '-C', str(folder), *argv],
+                          capture_output=True, text=True, encoding='utf-8')
+    if done.returncode:
+        fail(f'update git {argv[0]}: {last_line(done.stderr + done.stdout)}')
+    return done.stdout.strip()
+
+
+def qualified_checks(commit, upstream):
+    """An operator record is not CI. Require the actual exact-SHA TaskQ upstream tests independently."""
+    if not re.fullmatch(r'(?:https://github\.com/|git@github\.com:)alexkirs/taskq(?:\.git)?/?', upstream):
+        fail('update requires the canonical github.com/alexkirs/taskq upstream')
+    done = subprocess.run([shutil.which('gh') or fail('gh not found'), 'api', '--paginate', '--slurp',
+                           f'repos/alexkirs/taskq/commits/{commit}/check-runs'],
+                          capture_output=True, text=True, encoding='utf-8')
+    if done.returncode:
+        fail(f'update exact-SHA CI unavailable: {last_line(done.stderr + done.stdout)}')
+    try:
+        pages = json.loads(done.stdout)
+        checks = [check for page in pages for check in page['check_runs'] if check['name'] == 'tests']
+        green = bool(checks) and all(check['head_sha'] == commit and check['status'] == 'completed'
+                                     and check['conclusion'] == 'success' for check in checks)
+    except (ValueError, KeyError, TypeError):
+        green = False
+    if not green:
+        fail('update requires completed successful tests checks for the exact qualified SHA')
+
+
+@contextlib.contextmanager
+def installation_lock(root):
+    """Local installation serialization only, never task state or a board coordination substitute."""
+    root.mkdir(parents=True, exist_ok=True)
+    path, token = root / '.update.lock', uuid.uuid4().hex
+    try:
+        with path.open('x', encoding='utf-8') as handle:
+            handle.write(token)
+    except FileExistsError:
+        fail(f'update installation busy: {path}; no expiry/steal; reconcile a stopped installer explicitly')
+    try:
+        yield
+    finally:
+        if path.read_text('utf-8') != token:
+            fail(f'update installation lock changed; retaining {path} for reconciliation')
+        path.unlink()  # exact owned file only; never delete a release or another installer's lock
+
+
+def verify_release(release, commit, upstream):
+    if update_git(release, 'remote', 'get-url', 'origin') != upstream:
+        fail('update release origin differs; preserving it and the pointer')
+    update_git(release, 'merge-base', '--is-ancestor', commit, 'refs/remotes/origin/main')
+    if update_git(release, 'rev-parse', 'HEAD') != commit or update_git(release, 'status', '--porcelain', '--untracked-files=all'):
+        fail('update release verification failed; preserving it and the pointer')
+    for name in ('taskq.py', 'taskq.md'):
+        entry = update_git(release, 'ls-tree', 'HEAD', '--', name)
+        if not entry.startswith(('100644 ', '100755 ')) or not (release / name).is_file():
+            fail(f'update release has no regular {name}; pointer unchanged')
+
+
+def cmd_update(args):
+    """Install a qualified exact upstream revision without changing any running source checkout."""
+    if not args.install_dir:
+        fail('unmanaged installation: use update --install-dir <directory>; the managed launcher supplies it thereafter')
+    upstream = update_git(CLONE, 'remote', 'get-url', 'origin')
+    candidate = args.commit
+    if candidate is None:
+        lines = update_git(CLONE, 'ls-remote', '--exit-code', 'origin', 'refs/heads/main').splitlines()
+        if len(lines) != 1 or len(lines[0].split()) != 2 or lines[0].split()[1] != 'refs/heads/main':
+            fail('update could not resolve one exact upstream main SHA')
+        candidate = lines[0].split()[0]
+    if not re.fullmatch(r'[0-9a-f]{40}', candidate):
+        fail('update --commit requires a full lowercase 40-character commit SHA')
+    root = Path(args.install_dir).expanduser().resolve()
+    release = root / 'releases' / candidate
+    print(f'Update {candidate} from {upstream}\nRelease: {release}\nPointer: {root / "current.json"}')
+    if not args.apply:
+        return print(f'Preview only; next: taskq update --install-dir {shlex.quote(str(root))} --commit {candidate} --apply --qualification <reviewed-evidence.json>')
+    if not args.qualification:
+        fail('update --apply requires --qualification with reviewed exact-SHA test evidence; upstream CI is checked independently')
+    try:
+        evidence = json.loads(Path(args.qualification).read_text('utf-8'))
+    except (OSError, ValueError) as error:
+        fail(f'update qualification unreadable: {error}')
+    if not isinstance(evidence, dict) or any(evidence.get(key) != value for key, value in
+            dict(commit=candidate, upstream=upstream, tests='passed', review='accepted').items()):
+        fail('update qualification must record this commit/upstream, tests passed and review accepted')
+    qualified_checks(candidate, upstream)
+    with installation_lock(root):
+        previous = root / 'current.json'
+        selected = None
+        if previous.is_file():
+            try:
+                selected = json.loads(previous.read_text('utf-8'))
+                if not re.fullmatch(r'[0-9a-f]{40}', selected['commit']) or not isinstance(selected['path'], str):
+                    raise ValueError('invalid pointer')
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                fail(f'update previous pointer invalid; reconcile explicitly: {error}')
+        if not release.exists():
+            release.parent.mkdir(parents=True, exist_ok=True)
+            # Failure leaves evidence; neither existing source nor active pointer is changed.
+            update_git(root, 'clone', '--no-checkout', '--single-branch', '--branch', 'main', '--', upstream, str(release))
+            update_git(release, 'merge-base', '--is-ancestor', candidate, 'refs/remotes/origin/main')
+            update_git(release, 'checkout', '--detach', candidate)
+        verify_release(release, candidate, upstream)  # retries may reuse only an intact exact qualified release
+        if selected:
+            update_git(release, 'merge-base', '--is-ancestor', selected['commit'], candidate)
+        temporary = root / f'.current-{uuid.uuid4().hex}.json'
+        temporary.write_text(json.dumps({'commit': candidate, 'path': str(release)}) + '\n', encoding='utf-8')
+        os.replace(temporary, previous)
+    print('Installed for new launcher processes; running releases unchanged. Board migration remains explicit.')
+
 
 def adopt(numbers, me):
     """R3 Transition (#532): record this session as the `pm` of tasks with none. The project guard and a fresh read keep
@@ -2435,7 +2647,15 @@ def main(argv=None):
     command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}), n=False)
     command('pm', cmd_pm, (('--adopt',), {'nargs': '+', 'type': int, 'default': []}), n=False)
     command('cleanup', cmd_cleanup, (('--dry-run',), {'action': 'store_true'}), n=False)
+    command('version', cmd_version, n=False)
+    command('contract', lambda args: print(f'{CLONE / "taskq.md"} {contract() or "unavailable"}'), n=False)
+    command('migrate', cmd_migrate, (('--apply',), {'action': 'store_true'}),
+            (('--controllers-stopped',), {'action': 'store_true'}), n=False)
+    command('update', cmd_update, (('--commit',), {}), (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
+            (('--qualification',), {}), (('--apply',), {'action': 'store_true'}), n=False)
     args = parser.parse_args(argv)
+    if args.command in ('update', 'version', 'contract'):
+        return args.function(args)  # source installation needs no consumer project or board adapter
     if BOARD is None:
         CONFIG = load_config()
         BOARD = make_board(CONFIG)
@@ -2446,8 +2666,11 @@ def main(argv=None):
         refresh(args.command == 'pm')
     writes = args.command in ('add', 'take', 'ask', 'answer', 'result', 'requeue', 'run', 'later', 'close', 'ack') or \
         args.command == 'cleanup' and not args.dry_run
-    if (writes or args.command == 'tick' or args.command == 'pm' and args.adopt) and getattr(GUARD, 'held', None):
+    if (writes or args.command == 'migrate' and args.apply or args.command == 'tick' or args.command == 'pm' and args.adopt) and getattr(GUARD, 'held', None):
         raise SystemExit('taskq: another command holds the project guard; a new command must acquire independently')
+    if (writes or args.command in ('tick', 'wait') or args.command == 'migrate' and args.apply
+            or args.command == 'pm' and args.adopt) and release_reason():
+        fail(release_reason())
     try:
         with coordination() if writes else contextlib.nullcontext():
             done = args.function(args)

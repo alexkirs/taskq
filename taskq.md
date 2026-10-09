@@ -433,7 +433,10 @@ explicit update procedure below and then re-reads this file; preserve project ch
    glab's prompts need a real terminal. It gives the user one line for their own terminal:
    `glab auth login --hostname <host> --web`.
 2. `git clone https://github.com/alexkirs/taskq ~/taskq`; `taskq.py` is the only file it needs. Alias:
-   `ln -s ~/taskq/taskq.py ~/.local/bin/taskq` or `alias taskq='python3 ~/taskq/taskq.py'` (Windows: § 9).
+   After the first qualified `update --install-dir ~/.local/share/taskq --apply --qualification <record>` from
+   that source, keep it as the immutable bootstrap and use the managed alias:
+   `alias taskq='python3 ~/taskq/taskq.py launch --install-dir ~/.local/share/taskq --'` (Windows: § 9).
+   Before installing a pointer, invoke the source entrypoint directly for read-only setup and explicit update.
    Update: use the explicit qualified release procedure below. `pm`, `tick` and `wait` never fetch, pull or swap code.
 3. At the project root write `taskq.json` (fields: § 2) and commit it. Labels are created by the first `add`.
 4. Check: `taskq list` prints the queue (empty is fine) and no error. Claude workers: run `claude` once in the
@@ -505,9 +508,16 @@ Apply creates `<install-dir>/releases/<SHA>`, then atomically replaces `<install
 verification plus current qualification/CI checks; incomplete releases are preserved and refused. A local exclusive
 installation lock serializes applies, with exact-token release and no expiry/steal; a crashed lock requires explicit
 reconciliation after stopping the installer. A candidate must descend from the selected commit: automatic downgrades
-are refused. No release is reset or overwritten. Source and previous releases remain untouched.
-The launcher resolves that pointer once per new process, exports `TASKQ_INSTALL_DIR`, then executes its absolute
-`taskq.py`; children use their parent's release path. Every new-version mutation/dispatch/effect checks the current
+are refused. No release is reset or overwritten. Git discovery/fetch operations have a 30-second timeout,
+clone has 120 seconds, and upstream CI queries have 30 seconds. Timeout/offline failures keep the selected pointer unchanged. Source and previous releases remain untouched.
+`taskq.py launch --install-dir <directory> -- <arguments>` is the canonical managed launcher in this same file.
+`--install-dir` defaults to `TASKQ_INSTALL_DIR`. Keep the qualified bootstrap source unchanged: its stable pointer
+protocol loads the selected release; it does not run queue commands itself. It reads the pointer once, requires
+a full lowercase SHA and exactly the canonical `<root>/releases/<SHA>` path without release-directory symlinks,
+and requires regular `taskq.py` and `taskq.md` files there. It exports `TASKQ_INSTALL_DIR` plus
+`TASKQ_RELEASE_COMMIT`, then replaces itself with the same Python interpreter executing that release
+and forwards the remaining arguments. Launch reads no project configuration or board; children use their
+parent's release path. Every new-version mutation/dispatch/effect checks the current
 pointer and refuses when this process is stale or the pointer invalid. Read-only inspection remains available.
 Briefs identify the loaded release and contract hash and direct a new turn to the launcher. `taskq pm` prints
 the current release contract; no global hash file proves every individual agent has read it. Old versions lack
@@ -1235,7 +1245,8 @@ supported explicit named profile and disposable local-only Git fetch (owner corr
 - CLI stdout and stderr use UTF-8, including redirected pipes and detached dispatch logs. This keeps Unicode
   task titles and the contract readable on hosts whose default redirected encoding is a legacy code page (#604).
 - Run `py -3 <clone>\taskq.py` or `python <clone>\taskq.py`; a PowerShell function is the alias:
-  `function taskq { python C:\src\taskq\taskq.py @args }` in `$PROFILE`.
+  after the first qualified install, keep that source as the immutable bootstrap and put
+  `function taskq { python C:\src\taskq\taskq.py launch --install-dir C:\src\taskq-install -- @args }` in `$PROFILE`.
 - `gh`, `glab`, `claude` (`claude.cmd`), `codex` and `git` are found on `PATH`; no bash is needed by taskq.
   `claude.ps1` blocked by the execution policy: use `claude.cmd` (#139).
 - Every command in this file runs in PowerShell as written, except `export`: use `$env:NAME=value;`.

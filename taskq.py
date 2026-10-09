@@ -2364,6 +2364,32 @@ def release_context():
     return f'Loaded TaskQ release: {CLONE}; contract {contract() or "unavailable"}. For a new turn use the taskq launcher and re-read its contract.'
 
 
+def cmd_launch(args):
+    """Stable bootstrap: validate and pin one release, then start its code and contract in a fresh interpreter."""
+    if not args.install_dir:
+        fail('launch needs --install-dir or TASKQ_INSTALL_DIR after a qualified explicit update')
+    root = Path(args.install_dir).expanduser().resolve()
+    try:
+        selected = json.loads((root / 'current.json').read_text('utf-8'))
+        commit, source = selected['commit'], selected['path']
+        if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit) or not isinstance(source, str):
+            raise ValueError('pointer needs a full lowercase commit SHA and absolute source path')
+        expected = root / 'releases' / commit
+        path = Path(source)
+        if not path.is_absolute() or path != expected or path.resolve() != expected:
+            raise ValueError('release path is not the canonical installation release directory')
+        for name in ('taskq.py', 'taskq.md'):
+            target = expected / name
+            if target.is_symlink() or not target.is_file():
+                raise ValueError(f'release has no regular {name}')
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        fail(f'launch invalid installation pointer/release: {error}')
+    argv = args.arguments[1:] if args.arguments[:1] == ['--'] else args.arguments
+    os.environ['TASKQ_INSTALL_DIR'] = str(root)
+    os.environ['TASKQ_RELEASE_COMMIT'] = commit
+    os.execv(sys.executable, [sys.executable, str(expected / 'taskq.py'), *argv])
+
+
 def cmd_version(args):
     git = shutil.which('git')
     data = {'source': str(CLONE), 'commit': None, 'dirty': None, 'contract': contract(), 'event_schema': 1,
@@ -2421,8 +2447,11 @@ def cmd_migrate(args):
 
 
 def update_git(folder, *argv):
-    done = subprocess.run([shutil.which('git') or fail('git not found'), '-C', str(folder), *argv],
-                          capture_output=True, text=True, encoding='utf-8')
+    try:
+        done = subprocess.run([shutil.which('git') or fail('git not found'), '-C', str(folder), *argv],
+                              capture_output=True, text=True, encoding='utf-8', timeout=120 if argv[0] == 'clone' else 30)
+    except subprocess.TimeoutExpired:
+        fail(f'update git {argv[0]} timed out; selected pointer unchanged')
     if done.returncode:
         fail(f'update git {argv[0]}: {last_line(done.stderr + done.stdout)}')
     return done.stdout.strip()
@@ -2432,9 +2461,12 @@ def qualified_checks(commit, upstream):
     """An operator record is not CI. Require the actual exact-SHA TaskQ upstream tests independently."""
     if not re.fullmatch(r'(?:https://github\.com/|git@github\.com:)alexkirs/taskq(?:\.git)?/?', upstream):
         fail('update requires the canonical github.com/alexkirs/taskq upstream')
-    done = subprocess.run([shutil.which('gh') or fail('gh not found'), 'api', '--paginate', '--slurp',
-                           f'repos/alexkirs/taskq/commits/{commit}/check-runs'],
-                          capture_output=True, text=True, encoding='utf-8')
+    try:
+        done = subprocess.run([shutil.which('gh') or fail('gh not found'), 'api', '--paginate', '--slurp',
+                               f'repos/alexkirs/taskq/commits/{commit}/check-runs'],
+                              capture_output=True, text=True, encoding='utf-8', timeout=30)
+    except subprocess.TimeoutExpired:
+        fail('update exact-SHA CI timed out; selected pointer unchanged')
     if done.returncode:
         fail(f'update exact-SHA CI unavailable: {last_line(done.stderr + done.stdout)}')
     try:
@@ -2686,6 +2718,8 @@ def main(argv=None):
     command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}), n=False)
     command('pm', cmd_pm, (('--adopt',), {'nargs': '+', 'type': int, 'default': []}), n=False)
     command('cleanup', cmd_cleanup, (('--dry-run',), {'action': 'store_true'}), n=False)
+    command('launch', cmd_launch, (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
+            (('arguments',), {'nargs': argparse.REMAINDER}), n=False)
     command('version', cmd_version, n=False)
     command('contract', lambda args: print(f'{CLONE / "taskq.md"} {contract() or "unavailable"}'), n=False)
     command('migrate', cmd_migrate, (('--apply',), {'action': 'store_true'}),
@@ -2693,7 +2727,7 @@ def main(argv=None):
     command('update', cmd_update, (('--commit',), {}), (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
             (('--qualification',), {}), (('--apply',), {'action': 'store_true'}), n=False)
     args = parser.parse_args(argv)
-    if args.command in ('update', 'version', 'contract'):
+    if args.command in ('launch', 'update', 'version', 'contract'):
         return args.function(args)  # source installation needs no consumer project or board adapter
     if BOARD is None:
         CONFIG = load_config()

@@ -3278,6 +3278,69 @@ class Contract(Base):
         with self.assertRaisesRegex(SystemExit, 'canonical'):
             taskq.qualified_checks(sha, 'https://example.com/arbitrary/taskq')
 
+    def test_managed_launcher_pins_new_process_code_and_contract(self):
+        install = self.root / 'installed'
+        source = (ROOT / 'taskq.py').read_text('utf-8')
+        for label, marker in (('a', 'A'), ('b', 'B')):
+            release = install / 'releases' / (label * 40)
+            release.mkdir(parents=True)
+            (release / 'taskq.py').write_text(source, encoding='utf-8')
+            (release / 'taskq.md').write_text(f'contract {marker}', encoding='utf-8')
+        pointer = install / 'current.json'
+        command = [sys.executable, '-X', 'utf8', '-B', str(ROOT / 'taskq.py'), 'launch', '--install-dir', str(install), '--', 'version']
+        with mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
+            for label, marker in (('a', 'A'), ('b', 'B')):
+                release = install / 'releases' / (label * 40)
+                pointer.write_text(json.dumps({'commit': release.name, 'path': str(release)}))
+                child = REAL_RUN(command, cwd=self.root, capture_output=True, text=True, encoding='utf-8',
+                                 env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}, timeout=15)
+                self.assertEqual(child.returncode, 0, child.stderr)
+                result = json.loads(child.stdout)
+                self.assertEqual(result['source'], str(release))
+                self.assertEqual(result['contract'], taskq.hashlib.sha256(f'contract {marker}'.encode()).hexdigest()[:12])
+                self.assertEqual(result['selected']['commit'], release.name)
+                self.assertEqual(result['install'], str(install))
+                self.assertFalse(result['stale'])
+        # Forwarded argv and pinned release identity use this same interpreter, with no board/config read.
+        with mock.patch.dict(os.environ, {'TASKQ_INSTALL_DIR': str(install)}), mock.patch.object(taskq.os, 'execv') as execute:
+            self.run_cli('launch', '--', 'contract')
+            execute.assert_called_once_with(sys.executable, [sys.executable, str(release / 'taskq.py'), 'contract'])
+            self.assertEqual(os.environ['TASKQ_RELEASE_COMMIT'], release.name)
+
+    def test_managed_launcher_refuses_invalid_or_escaping_release(self):
+        install = self.root / 'installed'
+        release = install / 'releases' / ('a' * 40)
+        release.mkdir(parents=True)
+        (release / 'taskq.py').write_text('print("never")')
+        (release / 'taskq.md').write_text('contract')
+        pointer = install / 'current.json'
+        cases = [dict(commit='short', path=str(release)), dict(commit=release.name, path=str(self.root)),
+                 dict(commit='b' * 40, path=str(release)), dict(commit=release.name, path='relative'), []]
+        for data in cases:
+            pointer.write_text(json.dumps(data))
+            with self.subTest(data=data), mock.patch.object(taskq.os, 'execv') as execute:
+                with self.assertRaisesRegex(SystemExit, 'invalid installation pointer/release'):
+                    self.run_cli('launch', '--install-dir', str(install), '--', 'version')
+                execute.assert_not_called()
+        pointer.write_text(json.dumps(dict(commit=release.name, path=str(release))))
+        (release / 'taskq.md').unlink()
+        with self.assertRaisesRegex(SystemExit, 'no regular taskq.md'):
+            self.run_cli('launch', '--install-dir', str(install), '--', 'version')
+
+    def test_update_network_timeouts_are_bounded_and_preserve_pointer(self):
+        pointer = self.root / 'current.json'
+        pointer.write_text('previous selection')
+        timeout = subprocess.TimeoutExpired('offline', 30)
+        with mock.patch.object(taskq.subprocess, 'run', side_effect=timeout) as run:
+            for operation, limit in (('ls-remote', 30), ('clone', 120)):
+                with self.assertRaisesRegex(SystemExit, 'timed out'):
+                    taskq.update_git(self.root, operation, 'origin')
+                self.assertEqual(run.call_args.kwargs['timeout'], limit)
+            with mock.patch.object(taskq.shutil, 'which', return_value='gh'), self.assertRaisesRegex(SystemExit, 'CI timed out'):
+                taskq.qualified_checks('a' * 40, 'https://github.com/alexkirs/taskq')
+            self.assertEqual(run.call_args.kwargs['timeout'], 30)
+        self.assertEqual(pointer.read_text(), 'previous selection')
+
     def test_stale_managed_process_keeps_contract_but_refuses_effects(self):
         install = self.root / 'installation'
         old = install / 'releases' / ('a' * 40)

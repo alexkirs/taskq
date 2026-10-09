@@ -352,7 +352,9 @@ Owner decisions on what taskq looks and sounds like, one line each (#505). Chang
 
 ## 1. Setup (once per project)
 
-Setup again (the clone exists): first `git pull --ff-only` the clone and the project, then re-read this file.
+Setup again: identify the installed entrypoint first. A legacy package follows § "Upgrade a legacy package
+installation" below before any pull of its clone. An already qualified single-file clone follows § 1.2's
+Git update procedure and then re-reads this file; preserve project changes when updating the project checkout.
 
 1. python3 >= 3.9, git; `gh` (GitHub) or `glab` (GitLab) installed and logged in: `gh auth status` / `glab auth status`.
    Workers need the `claude` and/or `codex` CLI.
@@ -378,6 +380,47 @@ Setup again (the clone exists): first `git pull --ff-only` the clone and the pro
    the worker hands in (`taskq list` shows `review`); accept with `taskq close N --text "Checked the reply."`.
 6. Another board or runtime: copy the GitHub class or the Claude class of `taskq.py` into `boards/<name>.py` or
    `runtimes/<name>.py` as module-level functions (§ 2), and name the file in `taskq.json`.
+
+### Upgrade a legacy package installation (#603)
+
+An older `uv`/`pipx`/editable launcher imports `taskq_cli`; this checkout is a single file and does not provide
+that package. Preserve the old installation and its worktrees. Do not fast-forward its clone into this one,
+replace its entrypoint in place, or diagnose the new CLI with `python -m taskq --version`.
+
+1. Record the old command (`type taskq` on POSIX, `Get-Command taskq` on Windows), its checkout SHA and whether
+   it has changes or unique commits. Stop any installation-changing procedure if they would be overwritten.
+2. Resolve upstream `main` with `git ls-remote https://github.com/alexkirs/taskq refs/heads/main`; keep its full SHA.
+   Check that exact SHA, independent of the consumer repository:
+   `gh run list --repo https://github.com/alexkirs/taskq --commit <full SHA> --workflow tests.yml --json headSha,status,conclusion`.
+   Require at least one exact-SHA run, all completed with `success`. Missing, running, cancelled, failed or
+   unreadable CI stops the upgrade. Do not turn a login/network failure into a gate bypass.
+3. Clone upstream into a separate, previously nonexistent directory, fetch and check out the recorded SHA;
+   `git rev-parse HEAD` must equal it. Keep the old clone and launcher unchanged. Windows Store Python can
+   virtualize `%LOCALAPPDATA%`: prefer a normal user directory, such as Documents, and verify the actual Python
+   process can read the checkout before assuming Git's successful clone proves that.
+4. Run the new absolute entrypoint's `--help`: `python3 <new checkout>/taskq.py --help` on POSIX,
+   `python <new checkout>\taskq.py --help` on Windows. This checks startup, not board/runtime execution.
+5. Read this checkout's `AGENTS.md` and contract. Check the existing project's `taskq.json`, adapters, host mapping,
+   intended worker limits and board login with the native CLI of the chosen environment. Do not silently convert
+   a legacy TOML profile, overwrite JSON, adopt another manager's tasks or start a production pass as an install test.
+   Windows and WSL have separate CLI logins and executable paths; a WSL check does not qualify native Windows.
+   Validate a harmless board read through the same Python process that will run TaskQ. Store Python may give
+   a child CLI a redirected configuration view: direct CLI login can succeed while that child's API returns
+   401/404. If this is reproduced, use a qualified non-Store Python interpreter; do not copy tokens between views.
+6. Switch only this user's command or shell function to the new absolute entrypoint after these checks. Preserve
+   its previous definition for rollback. For normal self-updates, the new clone must be clean `main`; use
+   `git switch main` only when it still names the verified SHA (otherwise verify the new head's CI first).
+   A candidate branch is reviewed and qualified before becoming an installed production entrypoint (§ 10).
+
+Rollback restores the previous command/function and uses the untouched old installation. It does not reset,
+delete or recreate any old checkout, branch, resource, profile or board claim. If startup or native readiness
+fails, keep the old command available and report the failed check. The current single-file CLI has no `update`
+subcommand: its clone updates by Git (§ 1.2); installation instructions must not promise the legacy command.
+
+For Windows Codex, the supported current runtime uses `codex exec` and `codex app-server` over stdio (§ 8).
+Its startup `initialize` handshake can be tested without creating a thread or model turn. The old package's
+`app-server proxy` control-socket error is not evidence that this stdio route fails. Startup proof still does
+not replace the isolated spawn, naming, result and retirement qualification required by § 10.
 
 ## 2. Configuration: taskq.json
 

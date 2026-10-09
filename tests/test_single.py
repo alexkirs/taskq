@@ -2414,3 +2414,77 @@ class RealChild(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class HermesNativeBoundary(unittest.TestCase):
+    """Real local broker/stdin boundary; optional isolated installed-Hermes proof."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='tq-h-', dir=os.environ.get('TMPDIR'))
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.runtime = taskq.load_file('runtimes/hermes.py', ROOT)
+        self.runtime.folder = lambda: self.root / '.taskq'
+
+    def exercise(self):
+        sid = self.runtime.spawn('S1 HRM isolated (test)', 'Reply with exactly TASKQ_ISOLATED_OK. Do not use tools.', self.root)
+        self.addCleanup(lambda: self.runtime.retire(lambda *args: True))
+        self.assertTrue(sid)
+        self.assertEqual(self.runtime.call(sid, 'session.title')['title'], 'S1 HRM isolated (test)')
+        import time
+        deadline = time.monotonic() + 60
+        while self.runtime.state(sid) == 'running' and time.monotonic() < deadline:
+            time.sleep(.1)
+        self.assertEqual(self.runtime.state(sid), 'idle')
+        history = self.runtime.call(sid, 'session.history')
+        self.assertIn('TASKQ_ISOLATED_OK', json.dumps(history))
+        self.assertEqual(self.runtime.wake_manager(sid, 'Reply with exactly TASKQ_ISOLATED_OK. Do not use tools.'), sid)
+        self.runtime.retire(lambda *args: True)
+        self.assertEqual(self.runtime.state(sid), 'dead')
+        self.assertFalse(list(self.runtime.folder().glob('*.json')))
+
+    def test_real_stdio_with_fake_hermes(self):
+        gateway = self.root / 'gateway.py'
+        gateway.write_text('''import json, sys
+sid = 'stored-native-id'
+title = ''
+for line in sys.stdin:
+    req = json.loads(line); p = req['params']; method = req['method']
+    if method == 'session.create': result = {'session_id': 'live-id', 'stored_session_id': sid}
+    elif method == 'session.resume':
+        assert p['session_id'] == sid
+        result = {'session_id': 'live-id'}
+    else:
+        assert p['session_id'] == 'live-id'
+        if method == 'session.title':
+            title = p.get('title', title); result = {'title': title, 'session_key': sid}
+        elif method == 'session.status': result = {'output': 'Agent Running: No'}
+        elif method == 'prompt.submit': result = {'status': 'streaming'}
+        elif method == 'session.history': result = {'messages': [{'role': 'assistant', 'content': 'TASKQ_ISOLATED_OK'}]}
+        elif method == 'session.close': result = {'closed': True}
+        else: raise AssertionError(method)
+    print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}), flush=True)
+''')
+        with mock.patch.dict(os.environ, {'HERMES_HOME': str(self.root),
+                                         'TASKQ_HERMES_COMMAND': json.dumps([sys.executable, str(gateway)])}):
+            self.exercise()
+
+    def test_installed_hermes_isolated(self):
+        home = os.environ.get('TASKQ_HERMES_TEST_HOME')
+        command = os.environ.get('TASKQ_HERMES_COMMAND')
+        if not home or not command:
+            self.skipTest('BLOCKER: supply isolated TASKQ_HERMES_TEST_HOME with authentication/config and TASKQ_HERMES_COMMAND; no live home or credentials copied')
+        home = Path(home).resolve()
+        if home == Path.home() / '.hermes' or not (home / 'config.yaml').is_file():
+            self.skipTest('BLOCKER: test needs an isolated Hermes home with config.yaml and pre-provisioned authentication')
+        if not (home / '.env').is_file() and not os.environ.get('TASKQ_HERMES_TEST_AUTH_READY'):
+            self.skipTest('BLOCKER: isolated authentication unavailable (pre-provision .env or assert TASKQ_HERMES_TEST_AUTH_READY)')
+        with mock.patch.dict(os.environ, {'HERMES_HOME': str(home)}):
+            self.exercise()
+
+    def test_unknown_and_busy_fail_closed(self):
+        with mock.patch.object(self.runtime, 'call', return_value={'output': 'unexpected'}):
+            self.assertIsNone(self.runtime.state('native'))
+            with self.assertRaisesRegex(ValueError, 'not idle'):
+                self.runtime.send('native', 'must not submit')
+        with mock.patch.object(self.runtime, 'call', side_effect=ConnectionRefusedError):
+            self.assertEqual(self.runtime.state('native'), 'dead')

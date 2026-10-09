@@ -928,16 +928,22 @@ explicitly; an ambiguous Hermes identity is refused. A Hermes PM without a sessi
 The task's board `pm` routes to Hermes only; `run-codex` selects the worker independently. Hermes controller
 authority matches both runtime and session: a Codex identity with the same text cannot impersonate Hermes.
 
-Configure the existing `runtimes` file interface with key `hermes`. No built-in Hermes CLI adapter is provided:
-the local CLI has no documented external spawn/steer/resume command. The file must implement the four required
-functions plus `state`, `retire` and `available()`. `available()` returns exactly `True` only when the native
-external supervisor bridge is usable. Missing configuration, functions, unavailable bridge or unknown/invalid
-supervisor state stop admission visibly before worker spawn/send; the board claim/order stays intact. `state`
-must distinguish `running`, `idle`, `dead` and unknown (`None`); `alive=False` alone cannot stand in for it.
-Spawn/send return only genuine nonempty Hermes session IDs and confirm the native session name (R3); the bridge
-injects that session's own identity, using the sanitized `worker_env()` for child processes. The adapter owns
-native transport, never task authority or a duplicate session registry. TaskQ cannot authenticate environment
-provenance or prove transport receipt from a returned ID (R12).
+Configure `"runtimes": {"hermes": "runtimes/hermes.py"}` for the project-contained POSIX bridge.
+Supply an explicit isolated `HERMES_HOME` and `TASKQ_HERMES_COMMAND`, a JSON argv for the installed
+Hermes Python interpreter running `-m tui_gateway.entry`. No invented CLI session command is used.
+The bridge keeps one detached stdio gateway owner per session, with private file-IPC/log/JSON runtime handles
+under `.taskq/`; Hermes owns both stored and process-local session IDs. `session.create` returns these IDs,
+`session.title` sets and reads back the native name before `prompt.submit` admits any work. Hermes's native
+session context supplies child `HERMES_SESSION_ID`; inherited manager/native IDs are removed on launch.
+`send` refuses busy sessions, resumes only the same live owner, and requires a streaming admission reply.
+`session.status` distinguishes running/idle; lost transport is dead, invalid/unreachable status is unknown.
+`session.close` must confirm retirement before the transport stops. `available()` checks explicit launch setup,
+not provider authentication or successful turn completion; RPC failures stop admission visibly.
+The existing Hermes admission guard validates this concrete file's lifecycle interface. Handles contain no board
+state, authority, queue or receipts. `wake_manager` submits only to an idle manager already owned by this bridge;
+it cannot attach to a manager owned by another gateway. Interactive server requests are refused, never approved.
+Changed: generic unimplemented runtime-file candidate → concrete isolated TUI stdio bridge (owner request
+2026-10-09); no live-board qualification or restart durability is claimed.
 
 Supported external integration is through Hermes ACP/TUI JSON-RPC/API, not an invented CLI command. Public
 subagent lifecycle is restart-nondurable: a bridge must report lost sessions as dead, never infer idle from

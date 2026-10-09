@@ -25,6 +25,9 @@ The issue's `q-*` label, its JSON block and trusted comments hold all task state
 database, queue, receipt store, mirror or protocol. Local files under `.taskq/` are runtime handles only (§ 8).
 Changed (#603, owner decision 2026-10-10): checkout-local dispatch files → one board-backed project guard.
 Task state stays on issues; the board adapter supplies atomic acquisition and exact-token release (§ 2).
+Changed (owner-approved audit optimizations, 2026-10-10; R1/R4/R8/R12/R13): delivery receipts for
+versioned tasks move from checkout files to their issue JSON. § 3 defines bounded pending events;
+no extra service or local queue is introduced.
 Changed: execution had no per-task identity restriction → `assignee-only` uses native board Assignees,
 never a duplicate identity field or per-user label (#545 recovered by #576, owner decision 2026-10-09).
 
@@ -102,6 +105,15 @@ Changed: any board identity could execute a task → `assignee-only` requires au
 
 ### R4. Tick is a message or a queue event
 
+Changed (owner-approved audit optimizations, 2026-10-10): a printed observation consumed an outcome →
+versioned-task observation never acknowledges it. The sender acknowledges the exact event IDs only after
+successful delivery; a manager acknowledges after handling them. A failed/lost send leaves events pending.
+Replay is possible, including a lost acknowledgement response; acknowledgement is idempotent, delivery is
+not claimed exactly once. Recipients include runtime and full session identity, never merely board login.
+State, action payload and event identity share one issue update. Human history comments are diagnostic:
+their failure warns without undoing an acknowledged action or poisoning the project grant. Unknown authoritative
+writes, sends, spawns and publication still retain the grant. Operational retry/session records remain in JSON.
+
 A tick is one pass (§ 7), started by a message or by a queue event. A sender runs `taskq tick`; received means one
 pass, not received means nothing. `add`, `answer`, `run`, `result`, `requeue` and `close` start the same pass once after their
 move, in a detached `taskq tick --quiet` child, and return at once: the queue chains itself. Every `codex exec` turn
@@ -115,10 +127,7 @@ timer (owner clarification 2026-10-09, #525). The manager is woken only for its 
 until a task enters `ask` or closes, an unsupervised task (R3 Transition) enters `review`, a local session is gone, or
 a safety window (10 min) passes (§ 7 Arm the tick). A pass starts only tasks with no `host-*` label or its own
 machine's, and only those whose `pm` is on its machine (R3). Each manager's `wait` reports only its own tasks (and
-those with no `pm`), each event once per manager: one manager never consumes another's outcome (#532). A sender
-consumes as the manager it serves: `arm tick <manager>` prints `taskq wait --pm <manager id>`, which reads that
-manager's tasks and shares its receipt file, so the manager's own wait and its sender print each event once between
-them; the sender's routes and lifetime stay as #522 set them.
+those with no `pm`), each event acknowledged separately per manager: one manager never consumes another's outcome (#532). A sender observes as the manager it serves: `arm tick <manager>` prints `taskq wait --pm <manager id>`; after delivery it acknowledges that manager's exact board event IDs (§ 3). Routes and lifetime stay as #522 set them.
 Changed (#603, owner decision 2026-10-10): one checkout's `.taskq/dispatch.lock` and pending file → a
 board-backed guard shared by every cooperating TaskQ process for that project. All board mutations, adoption,
 manual take, dispatch and cleanup hold the same guard across fresh reads, runtime/publication effects and records.
@@ -167,7 +176,7 @@ Changed: Hermes wait had no native wake → the current Hermes manager, only wit
 and confirmed idle state, receives the wait outcome before its existing wait receipt is written. Wake failure
 is visible and preserves the previous receipt (owner lifecycle corrections, 2026-10-09). A busy/unknown owned
 manager refuses consumption; a manager with no bridge handle keeps the printed wait path. `--pm` never grants
-a cross-gateway wake. Concurrent owned-manager waits serialize the delivery/receipt boundary locally.
+a cross-gateway wake. Concurrent owned-manager waits serialize the delivery/ack boundary under the project guard.
 
 Hermes limitation (local candidate, § 8): the native bridge must supply turn/event delivery and manager wake;
 without that qualified bridge the unattended lifecycle above is unverified (R12).
@@ -584,6 +593,29 @@ Runtime file: four module-level functions, three more optional.
 
 ## 3. Data model
 
+Event schema (owner-approved audit optimizations, 2026-10-10): `event_schema: 1` marks the delivery
+format. Missing means legacy; newer or invalid versions are refused. Existing unknown JSON fields,
+claims and PM identities are preserved. Migration requires the explicit quiescent update procedure;
+old clients must not write concurrently. `initialize_events(issue)` captures outstanding legacy signals
+and existing retry counts for that procedure. Legacy histories remain readable.
+
+`event_seq` is a monotonic per-issue integer. `action` records the last action's ID, name, text and author;
+`events` retains at most 64 unacknowledged entries, each with `id`, `action`, `text`, `by`, `recipients`
+and `acks`. A full pending set refuses the next action before its write; it never overwrites an outcome.
+Fully acknowledged entries may be compacted, and acknowledging an already compacted ID is a no-op.
+Each recipient is role, runtime and full session ID. Tasks without a manager use a wildcard manager
+recipient and retain their per-manager acknowledgements until adoption resolves the wildcard to its recorded PM, retaining an acknowledgement from that PM. Unowned tasks can fill the same bound. An explicit worker/supervisor replacement or clear cancels obsolete recipient deliveries; it never forwards an old answer to a replacement worker. Fully cancelled entries compact like acknowledged ones; session retirement records are preserved. `retry_counts` and `session_records` preserve recovery limits and retirement identity when a
+diagnostic history comment fails. `worker_comment_cursor` acknowledges external `nudge:` comments per worker.
+
+`wait` prints human event lines with `[event N:ID]`; `wait --json` prints `{events:[{id,text}],tick:bool}`.
+Neither consumes versioned events. `taskq ack N:ID [...] [--pm ID]` acknowledges the current recipient;
+`--pm` is the sender's explicit delegation to the task's recorded manager, never a change of task ownership.
+`taskq ack --stdin [--pm ID]` reads those human lines from stdin. The sender must use the same target for wait,
+delivery and ack, and stop on a failed send or ack. Supervisor waits use the same explicit acknowledgement.
+Successful in-process supervisor/worker sends and verified native Hermes wakes acknowledge their exact batch.
+The reserved non-state label `taskq-events` indexes issues with pending manager deliveries; label and JSON are updated together, including removal after ack. Setup/migration provisions this label explicitly. `wait` may record a newly observed dead session under the project guard, but does not acknowledge it. An optional board `closed()` returns closed issues carrying that index; built-in boards implement it so a manager also discovers
+outcomes closed before its first wait. A custom adapter without it cannot discover never-observed closed tasks.
+
 - A task is an open issue. Closed issue: done.
 - State: exactly one label `q-<state>`.
 
@@ -634,9 +666,9 @@ Runtime file: four module-level functions, three more optional.
   `runtime` the worker's), its `session` filled by the worker's spawn and emptied when that worker is gone or requeues.
 - `order` (#525): `"run"` or `"rework"`, set by `run` or the supervisor's `requeue`; the pass spawns `T<N>` and clears it.
 
-- History: every command posts one comment `**<action>** · <runtime>:<session 8>` (or `owner`), then its text.
+- History: every command attempts one diagnostic comment `**<action>** · <runtime>:<session 8>` (or `owner`), then its text.
   An agent session (the manager too) is named by its own session; a plain shell is `owner`.
-  The comments are the log; read them with `gh issue view N --comments` / `glab issue view N --comments`.
+  The comments are a diagnostic log; authoritative current payload, pending events, retry counts and session records are in JSON. Read the log with `gh issue view N --comments` / `glab issue view N --comments`.
 - Trust: only issues and comments of collaborators (GitHub) or members with Reporter or higher (GitLab) count.
   Another author's issue is never a task.
 - Never edit labels or the block by hand while a task is `doing`; use the commands.
@@ -658,8 +690,8 @@ Runtime file: four module-level functions, three more optional.
 | `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
 | `taskq status` | print the R6 report only: one board list, no pass, no pull, no write, no dispatch, no session started (#574) |
 | `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4); `--after PID --after-birth ID`: first wait for that identified Codex turn to end (R4) |
-| `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed, for the tasks whose `pm` is this session or that have none (all of them from a plain shell); print `ask #N`, `review #N` (an unsupervised task, R3 Transition), `closed #N <verdict>` (a supervised task, § 7 Supervisor 3.3), `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7); each manager's events are its own, once (`.taskq/wait-<session>.json`; a plain shell: `.taskq/wait.json`); `--pm ID`: wait as manager `ID`, its tasks and its file (a sender, R4) |
-| `taskq wait --task N [--window MIN] [--every SEC]` | the supervisor's wait: block until its task needs it; print `review #N`, `ask #N`, `answer #N`, `gone #N` (its worker), `requeue #N` (by its worker), one line each, each once (`.taskq/S<N>.seen`); `stop #N` when the task is closed or the calling session is not its supervisor; `tick` after the window |
+| `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed, for the tasks whose `pm` is this session or that have none (all of them from a plain shell); print `ask #N`, `review #N` (an unsupervised task, R3 Transition), `closed #N <verdict>` (a supervised task, § 7 Supervisor 3.3), `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7); versioned events include `[event N:ID]` and replay until `ack` (§ 3); `--json` prints event IDs and text; `--pm ID`: observe as the task's manager ID (a sender, R4) |
+| `taskq wait --task N [--window MIN] [--every SEC]` | the supervisor's wait: block until its task needs it; print `review #N`, `ask #N`, `answer #N`, `gone #N` (its worker), `requeue #N` (by its worker), one line each, replayed until `ack` for versioned tasks (§ 3); `stop #N` when the task is closed or the calling session is not its supervisor; `tick` after the window |
 | `taskq pm [--adopt N ..]` | print the manager role (Principles, § 7, how to tick this session) under a first line `taskq pm contract <hash>`; record the hash of the clone's `taskq.md` in `.taskq/pm.json` (§ 7), nothing else: a task's manager is its `pm` (R3, #532); refused for a session an open task records as its supervisor or worker, so neither passes the gate as the manager (R3). `--adopt N`: record this session as the `pm` of open tasks that have none, under the project guard with a fresh read; a task with a `pm`, or a busy lock, refuses all of them (R3 Transition) |
 | `taskq cleanup [--dry-run]` | the owner's manual sweep of this machine (below); `--dry-run` prints the same and changes nothing |
 | `taskq arm tick [<manager>]` | print the prompt for a tick-sender session of this runtime (Codex: `exec resume` only for a thread with a local rollout, § 7); without `<manager>`: how this session ticks itself (a background `taskq wait` that wakes it) (§ 7) |
@@ -831,9 +863,9 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
      prompt to the owner or the app manager.
    No shell bridge, no copy of rollouts or auth. A Claude sender reaches only Claude sessions. A failed wait, a
    failed send or a missing send tool stops the sender with one blocker line: no retry, no other route, no loop on
-   a failing board. The wait file has marked that event; the manager's next pass still shows it.
+   a failing board. The board event stays pending until an explicit ack after delivery; a later observation can replay it.
    An agent sender forwards only while its own turn runs: it stays in that one active turn and repeats wait, send
-   without ending it between events. An ended sender turn or a wait left running alone forwards nothing; taskq
+   without ending it between events, then acknowledges the delivered IDs before waiting again. An ended sender turn or a wait left running alone forwards nothing; taskq
    promises no unattended lifetime beyond a sender that is running (#522).
 2. Optional: start a separate sender session on that prompt. It does no task work. The queue never needs it (R4):
    it only carries the manager's short outcomes to a manager that cannot wake itself.
@@ -841,8 +873,7 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
    `review #N` (an unsupervised task only; a supervised one's review is its supervisor's, #524),
    `closed #N <verdict>` (a supervised task: the first line of its close text, the supervisor's verdict, § Supervisor 3.3), `gone #N` (an unsupervised worker, or a supervisor
    found dead by step 4, claimed on this machine), or `tick` when nothing happened for 10 min. `.taskq/wait-<session>.json`
-   (a plain shell: `.taskq/wait.json`) keeps the states last reported to this manager, so an event is printed once per
-   manager (a runtime handle, R1); its sender's `wait --pm` uses the same file.
+   is a legacy receipt only. Versioned tasks use their board event IDs: wait is observation, then delivery/handling, then explicit ack (§ 3).
 4. The manager treats any message from the sender as a tick: one pass (`taskq tick`), then § After each pass. A
    stalled worker (120 min silent) is nudged by the pass the `tick` line starts.
 
@@ -860,9 +891,8 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
 1. `waiting` with every dep closed → `ready`.
 2. `doing`, claimed on this machine, no `supervisor` (R3 Transition: started before #525 or taken by hand, § 5): `alive` False → requeue (`session ... is gone`); the second such requeue since
    the last `result` or `answer` → `ask` instead, with the last log line (`tail`; Codex: `.taskq/T<N>.log`, Claude:
-   `claude logs`), and no new spawn (#393). Alive and the issue unchanged
-   for 120 minutes → `send(session, 'continue: read your issue')`, comment `nudge`. Alive and the last comment an
-   `answer` → `send` the answer text at once, comment `nudge` (one send per answer).
+   `claude logs`), and no new spawn (#393). Confirmed idle and the issue unchanged
+   for 120 minutes → `send(session, 'continue: read your issue')`, comment `nudge`. Confirmed idle with pending answer events or a supervisor's `nudge:` comment → deliver their payloads even through intervening ordinary comments, then acknowledge those exact events/recipient. Running or unknown workers defer delivery; observation does not lose pending work. The human `nudge` log is diagnostic.
 3. `ready`, deps closed, host matches, a free slot for its worker's runtime (`run-*` label, else the first free in
    `limits`), its `pm` on this machine (R3, #532; no `pm`: the task waits, the report says `blocked (no manager)`; another
    machine's: that machine starts it), re-read from the board →
@@ -890,7 +920,7 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
        `failed` with no pid.
    - an event for the supervisor (`review`, `ask` by the worker, `answer`, worker `gone`, a worker's `requeue`):
      idle → `send(supervisor, '<event> #N ...: read your issue')` with every event since it last got them
-     (`.taskq/S<N>.seen`: `<id> <comment count>`, a runtime handle; none yet: since its `spawn` note), once. Codex
+     with exact board event IDs; acknowledge only after successful send. Legacy tasks use their existing `.taskq/S<N>.seen` boundary until migration. Codex
      `exec resume` keeps the thread id; a Claude resume makes a new id (#284): the pass records it as `supervisor`
      with comment `nudge` `supervisor <new> replaces <old>`, so the old id is refused (§ 4) and retired once stopped.
      Running → nothing: it gets them from its own `taskq wait --task N` (Claude) or at its turn's end (Codex, R4).
@@ -902,8 +932,7 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
      supervisor adopts it from the board. The second death → `ask` with `tail`, no resume, no respawn (#393).
    - a recorded worker `alive` False → comment `worker <id> is gone`, empty the claim's session (the slot stays) and
      wake the supervisor as above; the supervisor decides (rework `requeue` or `ask`). A supervisor's plain comment
-     `nudge: <text>` as the last comment, an `answer` as the last comment, or 120 silent minutes →
-     `send(worker, text)`, comment `nudge`, as in step 2.
+     pending `nudge: <text>`, pending answer events, or 120 silent minutes → send only when confirmed idle, then acknowledge the exact events/recipient as in step 2. Running or unknown sessions defer.
    - closed, parked or requeued by the manager, or a replaced session: retire the recorded `S<N>` and `T<N>` once
      stopped (R11; the pass, for every task it lists or reads).
    `later`, an `ask` of the supervisor: nothing; they wait for the owner.
@@ -1106,7 +1135,7 @@ not provider authentication or successful turn completion; RPC failures stop adm
 The existing Hermes admission guard validates this concrete file's lifecycle interface. Handles contain no board
 state, authority, queue or receipts. `wake_manager` submits only to an idle manager already owned by this bridge;
 it cannot attach to a manager owned by another gateway. `taskq wait` invokes it only for the current manager,
-and writes the existing receipt only after verified model completion. Timeout/error/unknown/busy stops visibly
+and acknowledges the board event IDs only after verified model completion. Timeout/error/unknown/busy stops visibly
 without updating that receipt. Owner identity uses Linux process birth stamps and pidfds, not PID liveness alone;
 SIGTERM/failed setup shuts down the gateway process group and waits for exit, with evidence retained.
 Interactive server requests are refused, never approved.

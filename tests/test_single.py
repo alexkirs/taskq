@@ -54,6 +54,9 @@ class FakeBoard:
     def get(self, n):
         return dict(self.issues[n])
 
+    def closed(self):
+        return [dict(issue) for issue in self.issues.values() if issue['state'] == 'closed' and taskq.EVENT_LABEL in issue['labels']]
+
     def add(self, title, body, labels):
         n = len(self.issues) + 1
         self.issues[n] = {'iid': n, 'title': title, 'body': body, 'labels': list(labels), 'state': 'open',
@@ -114,6 +117,19 @@ class Base(unittest.TestCase):
 
     def task(self, n):
         return taskq.parse(self.board.get(n))
+
+    def wait_and_ack(self, *argv):
+        """Simulate the recipient handling its observed batch, then explicitly acknowledging it."""
+        out = self.run_cli('wait', *argv)
+        ids = re.findall(r'\[event (\d+:\d+)\]', out)
+        if ids:
+            extra = ['--pm', argv[argv.index('--pm') + 1]] if '--pm' in argv else []
+            identity = taskq.session() or {}
+            raw = self.task(int(ids[0].split(':')[0])) if self.board.get(int(ids[0].split(':')[0]))['state'] == 'open' else {'raw': taskq.issue_data(self.board.get(int(ids[0].split(':')[0])))}
+            held = raw['raw'].get('supervisor' if '--task' in argv else 'pm') or identity
+            with mock.patch.object(taskq, 'session', return_value={**identity, 'runtime': held.get('runtime', identity.get('runtime'))} if identity else None):
+                self.run_cli('ack', *ids, *extra)
+        return re.sub(r' \[event \d+:\d+\]', '', out)
 
     def add(self, title='T', *extra):
         return self.run_cli('add', title, '--goal', 'g', '--acceptance', 'a', '--scope', 'x.py', *extra)
@@ -917,15 +933,15 @@ def retire(gone, running=True): pass
         self.native.wake_manager = mock.Mock(side_effect=TimeoutError('no verified message.complete'))
         with self.native_env():
             with self.assertRaisesRegex(SystemExit, 'wake failed.*receipt unchanged'):
-                self.run_cli('wait', '--window', '0')
+                self.wait_and_ack( '--window', '0')
         self.assertEqual(receipt.read_bytes(), before)
         self.native.wake_manager = mock.Mock(return_value=SESSION)
         with self.native_env():
             self.board.release(self.board.guard)  # fixture confirms failed wake is quiescent before exact-token recovery
-            self.assertEqual(self.run_cli('wait', '--window', '0'), 'ask #1\n')
-            self.assertEqual(self.run_cli('wait', '--window', '0'), 'tick\n')
-        self.native.wake_manager.assert_called_once_with(SESSION, 'ask #1')
-        self.assertEqual(json.loads(receipt.read_text()), {'1': 'ask'})
+            self.assertEqual(self.wait_and_ack( '--window', '0'), 'ask #1\n')
+            self.assertEqual(self.wait_and_ack( '--window', '0'), 'tick\n')
+        self.native.wake_manager.assert_called_once_with(SESSION, 'ask #1 [event 1:3]')
+        self.assertEqual(receipt.read_bytes(), before)  # legacy file is no longer receipt authority
 
     def test_wait_busy_unknown_and_foreign_manager_never_consume_for_wake(self):
         with self.native_env():
@@ -938,16 +954,16 @@ def retire(gone, running=True): pass
         for status in (True, None):
             self.native.sessions[SESSION] = status
             with self.native_env(), self.assertRaises(SystemExit):
-                self.run_cli('wait', '--window', '0')
+                self.wait_and_ack( '--window', '0')
             self.assertFalse(receipt.exists())
         self.native.wake_manager.assert_not_called()
         with self.native_env('different-manager'):
-            self.assertEqual(self.run_cli('wait', '--pm', SESSION, '--window', '0'), 'ask #1\n')
+            self.assertIn('ask #1 [event', self.run_cli('wait', '--pm', SESSION, '--window', '0'))
         self.native.wake_manager.assert_not_called()  # --pm is no cross-gateway attach
         self.native.owned = lambda sid: False
-        receipt.unlink()
+        self.assertFalse(receipt.exists())
         with self.native_env():
-            self.assertEqual(self.run_cli('wait', '--window', '0'), 'ask #1\n')
+            self.assertEqual(self.wait_and_ack( '--window', '0'), 'ask #1\n')
         self.native.wake_manager.assert_not_called()  # ordinary printing works without an owned handle
 
 
@@ -1205,7 +1221,7 @@ class Tick(TickSetup):
         self.run_cli('tick')
         self.assertEqual((self.task(1)['state'], self.task(1)['claim']['session'], self.task(2)['state']), ('doing', None, 'ready'))
         self.assertIn('worker s-T1 is gone', self.board.issues[1]['comments'][-1])
-        self.assertEqual(self.fake.sent, [('s-S1', 'gone #1: read your issue')])  # woken once
+        self.assertEqual(self.fake.sent, [('s-S1', 'gone #1 [event 1:5]: read your issue')])  # woken once
         self.run_cli('tick')
         self.assertEqual((len(self.fake.sent), self.fake.names), (1, ['S1 UNK one (mac)', 'T1 UNK one (mac)']))
 
@@ -1385,6 +1401,7 @@ class Tick(TickSetup):
         self.board.issues[1]['updated_at'] = taskq.datetime.now(taskq.timezone.utc).isoformat()
         self.run_cli('tick')
         self.assertEqual(self.fake.sent, [])
+        self.fake.sessions['s-T1'] = 'idle'
         self.board.issues[1]['updated_at'] = '2026-01-01T00:00:00Z'
         self.run_cli('tick')
         self.assertEqual(self.fake.sent, [('s-T1', 'continue: read your issue')])
@@ -1399,6 +1416,7 @@ class Tick(TickSetup):
         self.legacy(1)
         self.board.issues[1]['updated_at'] = taskq.datetime.now(taskq.timezone.utc).isoformat()
         self.run_cli('ask', '1', '--text', 'which?')
+        self.fake.sessions[self.task(1)['claim']['session']] = 'idle'
         self.run_cli('answer', '1', '--text', 'the first')
         self.run_cli('tick')
         self.run_cli('tick')
@@ -1426,6 +1444,7 @@ class Tick(TickSetup):
             with self.assertRaisesRegex(SystemExit, message):
                 self.run_cli('answer', '1.2', bad)
         self.assertEqual(self.task(1)['state'], 'ask')  # a bad code moves nothing
+        self.fake.sessions['s-T1'] = 'idle'
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')):
             self.run_cli('answer', '1.2, 2.1')
         self.assertEqual((self.task(1)['state'], self.task(1)['raw']['decision'], self.board.issues[2]['state']), ('doing', None, 'closed'))
@@ -1708,7 +1727,7 @@ class Tick(TickSetup):
         with contextlib.redirect_stdout(io.StringIO()):  # unsupervised reviews reach the manager's wait
             taskq.move(self.task(3), 'review', 'result', supervisor=None, result={'sha': 'a' * 40})
         self.board.update(2, labels=['q-review'])
-        self.assertEqual(self.run_cli('wait', '--window', '0'), 'review #3\n')
+        self.assertEqual(self.wait_and_ack( '--window', '0'), 'review #3\n')
         taskq.CONFIG['assignee'] = 'bob'
         self.run_cli('requeue', '3')
         self.board.update(2, labels=['q-ready'])
@@ -1752,6 +1771,7 @@ class Tick(TickSetup):
         with self.acting('s-S1.1'):
             self.run_cli('run', '1')
             self.run_cli('ask', '1', '--text', 'which?')  # ask is no event: the slot stays held
+        self.fake.sessions[self.task(1)['claim']['session']] = 'idle'
         self.run_cli('answer', '1', '--text', 'this')  # the live worker gets the answer, the slot stays full
         self.assertEqual(spawns(), ['S1', 'T1', 'T1', 'S1', 'T1'])
         self.assertEqual(self.fake.sent, [('s-T1.2', 'The owner answered your question:\n\nthis')])
@@ -1809,7 +1829,7 @@ class Tick(TickSetup):
         self.fake.sessions['s-T1'] = False  # the sandbox cannot see the worker's process
         with mock.patch.dict(os.environ, {'CODEX_SANDBOX': 'seatbelt'}), mock.patch.object(taskq.time, 'sleep'):
             self.run_cli('tick')
-            self.assertNotIn('gone', self.run_cli('wait', '--window', '0'))
+            self.assertNotIn('gone', self.wait_and_ack( '--window', '0'))
         self.assertEqual(self.task(1)['state'], 'doing')
         self.assertNotIn('**requeue**', ' '.join(self.board.issues[1]['comments']))
 
@@ -2045,7 +2065,7 @@ class Tick(TickSetup):
         self.fake.sessions['s-S1'] = 'idle'
         self.run_cli('tick')
         self.run_cli('tick')
-        self.assertEqual(self.fake.sent, [('s-S1', 'requeue #1: read your issue')])
+        self.assertEqual(self.fake.sent, [('s-S1', 'requeue #1 [event 1:5]: read your issue')])
         with self.acting('s-S1'):
             self.run_cli('requeue', '1', '--text', 'try B')  # its own requeue: no event for it
             self.run_cli('requeue', '1', '--text', 'try C')
@@ -2057,8 +2077,8 @@ class Tick(TickSetup):
         with self.acting('s-S1'):
             self.run_cli('requeue', '1', '--text', 'try D')
         self.assertEqual(len(self.fake.names), 5)
-        self.assertIn(('s-S1', 'answer #1: read your issue'), self.fake.sent)
-        self.assertEqual([text for _, text in self.fake.sent].count('requeue #1: read your issue'), 1)  # its own requeues woke nothing
+        self.assertIn(('s-S1', 'answer #1 [event 1:11]: read your issue'), self.fake.sent)
+        self.assertEqual([text for _, text in self.fake.sent].count('requeue #1 [event 1:5]: read your issue'), 1)  # its own requeues woke nothing
 
     def test_replacement_retires_the_recorded_old_session_first(self):
         # #568: a rework's T<N> and a respawned S<N> retire their predecessor by board-recorded id before they spawn
@@ -2124,10 +2144,10 @@ class Tick(TickSetup):
             self.run_cli('result', '1', '--sha', 'a' * 40)
         self.assertEqual(self.fake.sent, [])  # its process runs: its own wait reads the event
         with self.acting('s-S1'):
-            self.assertEqual(self.run_cli('wait', '--task', '1', '--window', '0'), 'review #1\n')
-            self.assertEqual(self.run_cli('wait', '--task', '1', '--window', '0'), 'tick\n')  # once
+            self.assertEqual(self.wait_and_ack( '--task', '1', '--window', '0'), 'review #1\n')
+            self.assertEqual(self.wait_and_ack( '--task', '1', '--window', '0'), 'tick\n')  # once
         with self.acting('s-S2'):
-            self.assertEqual(self.run_cli('wait', '--task', '1', '--window', '0'), 'stop #1\n')  # not its task
+            self.assertEqual(self.wait_and_ack( '--task', '1', '--window', '0'), 'stop #1\n')  # not its task
         with self.acting('s-S1'):
             self.run_cli('requeue', '1', '--text', 'fix X')
         with self.acting('s-T1.1'):
@@ -2135,15 +2155,15 @@ class Tick(TickSetup):
         self.fake.sessions['s-S1'] = 'idle'  # its turn ended, the process is gone
         self.fake.send = lambda session, text: self.fake.sent.append((session, text)) or 's-S1r'
         self.run_cli('tick')
-        self.assertEqual(self.fake.sent, [('s-S1', 'review #1: read your issue')])
+        self.assertEqual(self.fake.sent, [('s-S1', 'review #1 [event 1:8]: read your issue')])
         self.assertEqual((self.task(1)['supervisor']['session'], self.board.issues[1]['comments'][-1]),
                          ('s-S1r', '**nudge** · claude:01234567\n\nsupervisor s-S1r replaces s-S1'))
         with self.acting('s-S1'), self.assertRaisesRegex(SystemExit, 'only it, the task.s manager or the owner'):
             self.run_cli('close', '1')
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), self.acting('s-S1r'):
-            self.assertEqual(self.run_cli('wait', '--task', '1', '--window', '0'), 'tick\n')  # already delivered
+            self.assertEqual(self.wait_and_ack( '--task', '1', '--window', '0'), 'tick\n')  # already delivered
             self.run_cli('close', '1', '--text', 'ok; works; open: none')
-            self.assertEqual(self.run_cli('wait', '--task', '1', '--window', '0'), 'stop #1\n')
+            self.assertEqual(self.wait_and_ack( '--task', '1', '--window', '0'), 'stop #1\n')
         self.fake.sessions['s-S1'] = False  # the resume stopped the old job
         self.run_cli('tick')
         self.assertIn('s-S1', self.fake.stopped)  # the replaced id, once stopped
@@ -2179,7 +2199,7 @@ class Tick(TickSetup):
         self.fake.sessions['s-S1'] = 'idle'
         with mock.patch.object(taskq, 'process_identity', side_effect=[('running', BIRTH), ('dead', None)]), mock.patch.object(taskq.time, 'sleep') as slept:
             self.run_cli('tick', '--quiet', '--after', '4242', '--after-birth', BIRTH)
-        self.assertEqual((slept.call_count, self.fake.sent), (1, [('s-S1', 'review #1: read your issue')]))
+        self.assertEqual((slept.call_count, self.fake.sent), (1, [('s-S1', 'review #1 [event 1:5]: read your issue')]))
         self.run_cli('tick')
         self.assertEqual(len(self.fake.sent), 1)  # once
 
@@ -2410,21 +2430,21 @@ class Wait(TickSetup):
         self.unmanaged()  # unsupervised tasks (R3 Transition): the manager reviews, so wait prints review
         self.add()
         self.legacy(1)
-        self.assertEqual(self.run_cli('wait'), 'tick\n')  # nothing happened: the safety window
+        self.assertEqual(self.wait_and_ack(), 'tick\n')  # nothing happened: the safety window
         self.assertEqual(self.clock[0], 600)
         self.run_cli('result', '1', '--sha', 'a' * 40)
         self.add('two')
         self.legacy(2)
         self.fake.sessions['s-T2'] = False
-        self.assertEqual(self.run_cli('wait').splitlines(), ['review #1', 'gone #2'])
+        self.assertEqual(self.wait_and_ack().splitlines(), ['review #1', 'gone #2'])
         self.assertEqual(self.clock[0], 600)  # at once, no sleep
-        self.assertEqual(self.run_cli('wait'), 'tick\n')  # never twice for the same event
+        self.assertEqual(self.wait_and_ack(), 'tick\n')  # never twice for the same event
         self.run_cli('requeue', '1')
         self.legacy(1, 's-T1b')
         start = self.clock[0]
         result = lambda: self.run_cli('result', '1', '--sha', 'b' * 40) if self.clock[0] == start + 50 else None
         with mock.patch.object(taskq.time, 'sleep', lambda s: (self.clock.__setitem__(0, self.clock[0] + s), result())):
-            self.assertEqual(self.run_cli('wait'), 'review #1\n')  # back in review while waiting: a new event
+            self.assertEqual(self.wait_and_ack(), 'review #1\n')  # back in review while waiting: a new event
         self.assertEqual(self.clock[0], start + 50)
 
     def test_arm_tick_names_target_and_loop(self):
@@ -2447,7 +2467,8 @@ class Wait(TickSetup):
         with mock.patch.dict(os.environ, {**self.codex_home('sessions/2026/10/09', 'T1'), 'CODEX_THREAD_ID': 'T1'}):
             sender, self_arm = self.run_cli('arm', 'tick', 'T1'), self.run_cli('arm', 'tick')
         self.assertIn('resume T1 "<its output>"', sender)
-        self.assertIn('resume T1 "$e"; do :; done; echo "taskq sender stopped"', sender)
+        self.assertIn('resume T1 "$e" && printf', sender)
+        self.assertIn('ack --stdin --pm T1; do :; done;', sender)
         self.assertNotIn('send_message_to_thread', sender)
         self.assertIn('in the foreground', self_arm)
         self.assertIn('Optional, only to be woken between turns: `', self_arm)
@@ -2499,7 +2520,7 @@ class Wait(TickSetup):
             fake_wait = f'sh -c \'n=$(cat {events}); echo $((n+1)) > {events}; [ $n -lt 2 ] && echo "review #$n"\''
             sent.write_text('')
             with mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
-                run = REAL_RUN(['bash', '-c', loop.replace(wait, fake_wait)], capture_output=True, text=True, timeout=10,
+                run = REAL_RUN(['bash', '-c', loop.replace(wait, fake_wait).replace(f'python3 {Path(taskq.__file__).resolve()} ack --stdin --pm T1', 'cat >/dev/null')], capture_output=True, text=True, timeout=10,
                                env={**os.environ, 'PATH': f'{bin_}:/usr/bin:/bin', 'SEND_EXIT': send_exit})
             self.assertEqual(run.stdout, 'taskq sender stopped\n')
             self.assertEqual(len(sent.read_text().splitlines()), expect)
@@ -2537,16 +2558,185 @@ class Wait(TickSetup):
         self.assertTrue(passes and all(command[:2] == ['tick', '--quiet'] for command in passes))  # only event passes
         self.assertEqual(self.fake.names, ['S1 UNK one (mac)', 'T1 UNK one (mac)'])  # one spawn each
         self.assertEqual((self.task(1)['state'], self.task(2)['state']), ('review', 'ready'))
-        self.assertEqual(self.run_cli('wait'), 'tick\n')  # a supervised review is the supervisor's
+        self.assertEqual(self.wait_and_ack(), 'tick\n')  # a supervised review is the supervisor's
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), self.acting('s-S1'):
             self.run_cli('close', '1', '--text', 'one shipped; users get one; open: none\n\nmore')
-        self.assertEqual(self.run_cli('wait'), 'closed #1 one shipped; users get one; open: none\n')
-        self.assertEqual(self.run_cli('wait'), 'tick\n')  # never sent twice
+        self.assertEqual(self.wait_and_ack(), 'closed #1 one shipped; users get one; open: none\n')
+        self.assertEqual(self.wait_and_ack(), 'tick\n')  # never sent twice
         self.assertEqual(self.fake.names[-1], 'S2 UNK two (mac)')  # the close freed the slot
         self.assertEqual((self.fake.stopped, self.fake.sessions['s-S1']), (['s-T1'], True))  # close never stops the session that runs it
         self.fake.sessions['s-S1'] = False  # its turn ended: the next pass retires it
         self.run_cli('tick')
         self.assertEqual(self.fake.stopped, ['s-T1', 's-S1'])
+
+
+class EventDelivery(Base):
+    """Board receipts survive comments, checkout changes and response loss; no live services."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(taskq, 'dispatch')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.add()
+
+    def worker(self):
+        claim = {'runtime': 'fake', 'session': 'worker-one', 'name': 'mac'}
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'doing', 'take', claim=claim)
+        fake = FakeRuntime()
+        fake.sessions[claim['session']] = 'idle'
+        return fake, claim
+
+    def test_two_answers_survive_ordinary_comments_and_ack_exact_recipient(self):
+        fake, claim = self.worker()
+        for answer in ('first', 'second'):
+            self.run_cli('ask', '1', '--text', 'which?')
+            self.run_cli('answer', '1', '--text', answer)
+            self.board.comment(1, 'ordinary progress note')
+            self.board.comment(1, '**nudge** · owner\n\nsupervisor unrelated-session')
+        with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
+            taskq.follow(self.task(1), fake, claim, False)
+            taskq.follow(self.task(1), fake, claim, False)
+        self.assertEqual(fake.sent, [('worker-one', 'The owner answered your question:\n\nfirst\n\nsecond')])
+        self.assertEqual(taskq.event_pending(self.task(1)['raw'], taskq.recipient('worker', claim)), [])
+        self.assertEqual(len(taskq.event_pending(self.task(1)['raw'], taskq.recipient('manager', self.task(1)['pm']))), 2)
+
+    def test_comment_failure_preserves_action_dispatch_and_grant(self):
+        self.worker()
+        with mock.patch.object(self.board, 'comment', side_effect=SystemExit('comment transport lost')), \
+                contextlib.redirect_stderr(io.StringIO()) as err, mock.patch.object(taskq, 'dispatch') as dispatch:
+            self.run_cli('ask', '1', '--text', 'choose A')
+        self.assertEqual(self.task(1)['state'], 'ask')
+        self.assertEqual(self.task(1)['raw']['action']['text'], 'choose A')
+        self.assertIsNone(self.board.guard)
+        dispatch.assert_called_once_with('ask', 1) if 'ask' in taskq.EVENTS else None
+        self.assertIn('diagnostic comment failed', err.getvalue())
+        first = self.run_cli('wait', '--window', '0', '--json')
+        self.assertEqual(self.run_cli('wait', '--window', '0', '--json'), first)
+        self.assertFalse(list((self.root / '.taskq').glob('wait*.json')))
+
+    def test_wait_replays_until_explicit_ack_shared_across_checkouts(self):
+        self.worker()
+        self.run_cli('ask', '1', '--text', 'question')
+        first = json.loads(self.run_cli('wait', '--window', '0', '--json'))
+        token = first['events'][0]['id']
+        self.assertEqual(json.loads(self.run_cli('wait', '--window', '0', '--json')), first)
+        other = self.root / 'other'; other.mkdir()
+        with mock.patch.dict(taskq.CONFIG, root=other):
+            self.assertEqual(json.loads(self.run_cli('wait', '--window', '0', '--json')), first)
+            self.run_cli('ack', token)
+        self.run_cli('ack', token)
+        self.assertEqual(self.run_cli('wait', '--window', '0'), 'tick\n')
+
+    def test_ack_lost_response_replays_idempotently_but_retains_unknown_guard(self):
+        self.worker(); self.run_cli('ask', '1', '--text', 'question')
+        token = json.loads(self.run_cli('wait', '--json', '--window', '0'))['events'][0]['id']
+        update = self.board.update
+        def lost(*args, **kwargs):
+            update(*args, **kwargs)
+            raise RuntimeError('response lost')
+        with mock.patch.object(self.board, 'update', side_effect=lost), self.assertRaisesRegex(RuntimeError, 'response lost'):
+            self.run_cli('ack', token)
+        self.assertIsNotNone(self.board.guard)
+        self.board.guard = None  # fixture's explicit quiescent reconciliation; production never steals a grant
+        self.run_cli('ack', token)
+        self.assertEqual(self.run_cli('wait', '--window', '0'), 'tick\n')
+
+    def test_bound_never_overwrites_pending_payload_and_future_schema_refused(self):
+        self.worker()
+        with mock.patch.object(taskq, 'EVENT_LIMIT', 1):
+            self.run_cli('ask', '1', '--text', 'preserve me')
+            before = self.board.get(1)['body']
+            with self.assertRaisesRegex(SystemExit, 'pending event capacity'):
+                self.run_cli('answer', '1', '--text', 'cannot erase')
+        self.assertEqual(self.board.get(1)['body'], before)
+        self.assertIsNone(self.board.guard)
+        self.board.issues[1]['body'] = taskq.block('g', {**self.task(1)['raw'], 'event_schema': 2})
+        with self.assertRaisesRegex(SystemExit, 'unsupported event_schema'):
+            self.run_cli('wait', '--window', '0')
+
+    def test_closed_before_first_wait_and_same_account_foreign_session(self):
+        self.worker()
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), None, 'close', 'accepted; open: none')
+        self.board.close(1)
+        event = json.loads(self.run_cli('wait', '--window', '0', '--json'))['events'][0]
+        self.assertIn('closed #1 accepted; open: none', event['text'])
+        with mock.patch.dict(os.environ, CLAUDE_CODE_SESSION_ID='another-agent'):
+            self.assertEqual(self.run_cli('wait', '--window', '0'), 'tick\n')
+            with self.assertRaisesRegex(SystemExit, 'recorded recipient'):
+                self.run_cli('ack', event['id'])
+            self.run_cli('ack', event['id'], '--pm', SESSION)  # explicit sender delegation
+        self.assertEqual(self.run_cli('wait', '--window', '0'), 'tick\n')
+
+    def test_adoption_resolves_wildcard_and_replacements_cancel_obsolete_recipients(self):
+        fake, claim = self.worker()
+        raw = self.task(1)['raw']; raw['pm'] = None
+        self.board.issues[1]['body'] = taskq.block('g', raw)
+        self.run_cli('ask', '1', '--text', 'shared question')
+        token = json.loads(self.run_cli('wait', '--json', '--window', '0'))['events'][0]['id']
+        self.run_cli('ack', token)
+        self.assertIn(taskq.EVENT_LABEL, self.board.get(1)['labels'])  # other managers can still observe while unowned
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'ask', 'adopt', pm=taskq.origin())
+        self.assertNotIn(taskq.EVENT_LABEL, self.board.get(1)['labels'])
+        self.run_cli('answer', '1', '--text', 'old worker answer')
+        self.assertTrue(taskq.event_pending(self.task(1)['raw'], taskq.recipient('worker', claim)))
+        replacement = {**claim, 'session': 'replacement-worker'}
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'doing', 'spawn', 'worker replacement-worker', claim=replacement)
+        self.assertEqual(taskq.event_pending(self.task(1)['raw'], taskq.recipient('worker', claim)), [])
+        self.assertEqual(taskq.event_pending(self.task(1)['raw'], taskq.recipient('worker', replacement)), [])
+        self.assertEqual(taskq.recorded(self.board.get(1), 'fake', 'worker-one'), 'worker')
+
+    def test_answer_delivery_does_not_consume_a_separate_pending_nudge(self):
+        fake, claim = self.worker()
+        self.run_cli('ask', '1', '--text', 'question')
+        self.run_cli('answer', '1', '--text', 'answer')
+        self.board.comment(1, 'nudge: also inspect the output')
+        self.board.comment(1, 'unrelated ordinary note')
+        with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
+            taskq.follow(self.task(1), fake, claim, True)
+            taskq.follow(self.task(1), fake, claim, True)
+            taskq.follow(self.task(1), fake, claim, True)
+        self.assertEqual([text for _, text in fake.sent], ['The owner answered your question:\n\nanswer', 'also inspect the output'])
+
+    def test_busy_worker_never_fetches_history_or_consumes_event(self):
+        fake, claim = self.worker()
+        self.run_cli('ask', '1', '--text', 'question'); self.run_cli('answer', '1', '--text', 'answer')
+        item, issue = self.task(1), self.board.get(1)
+        fake.sessions[claim['session']] = True
+        metadata = {key: value for key, value in issue.items() if key != 'comments'}
+        with mock.patch.object(self.board, 'metadata', return_value=metadata, create=True), \
+                mock.patch.object(self.board, 'get', side_effect=AssertionError('busy history fetched')):
+            self.assertEqual(taskq.follow(item, fake, claim, True), claim)
+        self.assertEqual(fake.sent, [])
+        self.assertTrue(taskq.event_pending(self.task(1)['raw'], taskq.recipient('worker', claim)))
+
+    def test_replacement_supervisor_cancels_its_old_events_and_missing_logs_keep_counts(self):
+        self.worker()
+        boss = {'runtime': 'fake', 'session': 'old-boss', 'name': 'mac'}
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(self.board, 'comment', side_effect=RuntimeError('log down')):
+            taskq.move(self.task(1), 'doing', 'spawn', 'supervisor old-boss', supervisor=boss)
+            taskq.move(self.task(1), 'review', 'result', 'result payload', result={'sha': 'a' * 40})
+            self.assertTrue(taskq.event_pending(self.task(1)['raw'], taskq.recipient('supervisor', boss)))
+            taskq.move(self.task(1), 'review', 'spawn', 'supervisor new-boss', supervisor={**boss, 'session': 'new-boss'})
+            taskq.move(self.task(1), 'review', 'gone', 'supervisor new-boss is gone')
+        self.assertEqual(taskq.event_pending(self.task(1)['raw'], taskq.recipient('supervisor', boss)), [])
+        self.assertEqual(self.task(1)['raw']['retry_counts']['supervisor'], 1)
+        self.assertEqual(taskq.recorded(self.board.get(1), 'fake', 'old-boss'), 'supervisor')
+
+    def test_legacy_answer_ignores_unrelated_last_comment(self):
+        fake, claim = self.worker()
+        issue = self.board.get(1)
+        raw = {key: value for key, value in self.task(1)['raw'].items() if key not in ('event_schema', 'events', 'event_seq', 'action')}
+        issue['body'] = taskq.block('g', raw)
+        issue['comments'] += ['**answer** · owner\n\nlegacy answer', 'ordinary comment']
+        self.assertEqual(taskq.legacy_worker_message(issue, claim, False)[:2], ('answer', 'legacy answer'))
+        migrated = taskq.initialize_events(issue)
+        self.assertEqual(migrated['events'][-1]['text'], 'legacy answer')
+        self.assertEqual(migrated['claim'], claim)
 
 
 class MultiPM(Base):
@@ -2599,7 +2789,7 @@ class MultiPM(Base):
         self.assertEqual((self.cdx.names, self.cld.names), (['S1 CDX one (mac)'], ['S2 CLD two (mac)']))
         for env in (self.A, self.B):
             with self.pm(env):
-                self.assertEqual(self.run_cli('wait'), 'tick\n')
+                self.assertEqual(self.wait_and_ack(), 'tick\n')
         for sid in ('s-S1', 's-S2'):
             with self.acting(sid):
                 self.run_cli('run', sid[-1])
@@ -2612,12 +2802,12 @@ class MultiPM(Base):
         with self.acting('s-T3'):
             self.run_cli('result', '3', '--sha', 'b' * 40)
         with self.pm(self.A):
-            self.assertEqual(self.run_cli('wait'), 'review #3\nclosed #1 checked; works; open: none\n')
+            self.assertEqual(self.wait_and_ack(), 'review #3\nclosed #1 checked; works; open: none\n')
         with self.pm(self.B):
-            self.assertEqual(self.run_cli('wait'), 'ask #2\nreview #3\n')
+            self.assertEqual(self.wait_and_ack(), 'ask #2\nreview #3\n')
         for env in (self.A, self.B):
             with self.pm(env):
-                self.assertEqual(self.run_cli('wait'), 'tick\n')  # never twice, never the other's
+                self.assertEqual(self.wait_and_ack(), 'tick\n')  # never twice, never the other's
 
     def test_duplicate_events_on_a_shared_task_spawn_one_worker(self):
         # both managers tick a shared task; a list from before the spawn still shows the order: the re-read wins (one T<N>)
@@ -2724,7 +2914,7 @@ class MultiPM(Base):
         with self.pm(env):
             prompt = self.run_cli('arm', 'tick', target)
             pm = re.search(r'wait --pm (\S+)`', prompt)[1]
-            return self.run_cli('wait', '--pm', pm)
+            return self.wait_and_ack( '--pm', pm)
 
     def test_agent_sender_delivers_its_managers_outcome_once(self):
         # a separate Claude sender session serves pmA-codex: it gets A's ask once; A's own wait shares the receipt; B keeps its own
@@ -2733,9 +2923,9 @@ class MultiPM(Base):
         self.assertEqual(self.sender_wait(sender, 'pmA-codex'), 'ask #1\n')
         self.assertEqual(self.sender_wait(sender, 'pmA-codex'), 'tick\n')
         with self.pm(self.A):
-            self.assertEqual(self.run_cli('wait'), 'tick\n')  # same receipt file: never twice
+            self.assertEqual(self.wait_and_ack(), 'tick\n')  # same receipt file: never twice
         with self.pm(self.B):
-            self.assertEqual(self.run_cli('wait'), 'ask #2\n')  # never consumed by A's sender
+            self.assertEqual(self.wait_and_ack(), 'ask #2\n')  # never consumed by A's sender
         self.assertFalse((self.root / '.taskq' / 'wait-sender-claude.json').exists())
 
     def test_shell_sender_delivers_its_managers_outcome_once(self):
@@ -2743,9 +2933,9 @@ class MultiPM(Base):
         self.senders_setup()
         self.assertEqual(self.sender_wait({}, 'https://claude.ai/code/session_pmB-claude'), 'ask #2\n')
         with self.pm(self.B):
-            self.assertEqual(self.run_cli('wait'), 'tick\n')
+            self.assertEqual(self.wait_and_ack(), 'tick\n')
         with self.pm(self.A):
-            self.assertEqual(self.run_cli('wait'), 'ask #1\n')
+            self.assertEqual(self.wait_and_ack(), 'ask #1\n')
         self.assertFalse((self.root / '.taskq' / 'wait.json').exists())
 
 
@@ -2823,7 +3013,7 @@ class Contract(Base):
         self.assertNotIn(line, self.run_cli('tick'))
         (self.root / 'taskq.md').write_text('v2\n## Principles\nx\n## 7. Manager\ny\n## 8. Runtimes\n')
         with mock.patch.object(taskq.time, 'time', side_effect=[0, 1e9]):
-            self.assertEqual(self.run_cli('wait').splitlines(), [line, 'tick'])
+            self.assertEqual(self.wait_and_ack().splitlines(), [line, 'tick'])
         self.assertEqual(self.run_cli('tick').splitlines()[0], line)  # first, once per run
         self.run_cli('pm')
         self.assertNotIn(line, self.run_cli('tick'))

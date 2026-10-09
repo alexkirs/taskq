@@ -271,6 +271,11 @@ Changed: Open "delete the Wiki pages or mark them stale" → the Wiki is a stub 
 
 Any change is named to the owner first; taskq never edits permission settings itself (`permission_mode` in
 `taskq.json` is the owner's).
+Changed: project-wide Codex options only -> an explicitly owner-approved board task profile may select the
+restricted native route in § 8; defaults, models, effort, runtimes and limits remain unchanged (#577, owner
+decision 2026-10-09). Unsupported capabilities fail closed; approval never is not an approval transport.
+Changed: no approval client interface -> dormant source/mock stdio router and presenter interfaces only
+(#577, owner decision 2026-10-10). They are not connected to dispatch or any human endpoint; no policy changes.
 
 ### R10. Multi-project only by explicit list
 
@@ -333,6 +338,11 @@ edits this file first, in the same deliverable; code, README and pages follow it
 recorded decision is an `ask` with options, not an edit. Only the owner accepts a change of a decision here.
 Changed: publication/testing contradiction in § 5/§ 6 → accepted #530 methodology and candidate-first
 publication reconciled in § 5/§ 6/§ 7/§ 10 (#533, owner approval 2026-10-09); supervisor reviews, worker implements.
+Changed: an external prerequisite could return to answer/retry -> a profile blocker persists on the board;
+answer/requeue alone cannot supply the missing capability or approval. Candidate review and live qualification
+remain separate; #577 requires a separate owner publication choice before close (#577).
+Changed: prerequisite wording required a new runner -> existing Mac evidence may establish the host; the
+unconnected action-time human endpoint remains a blocker, not resolved by prose (#577, owner 2026-10-10).
 Every agent (Claude, Codex, DOT, Hermes, other) reads this file before work; `AGENTS.md` and `CLAUDE.md` point here.
 
 ## Product
@@ -909,7 +919,7 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 | Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread>` in `.taskq/T<N>.pid`; then `codex app-server`: `initialize`, `thread/name/set` the name, `thread/read` it back, each after the last one's success, all within 60 s (R3: anything else stops the turn, keeps the pid file, fails the spawn) | `codex exec resume <id> <text>` | the pid is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` (or a replaced `T<N>-<thread>.pid`) |
 
 - A supervisor starts and retires as a worker does, named `S<N> ...` (Codex: `.taskq/S<N>.log`,
-  `.taskq/S<N>.pid`), with the same tools, `permission_mode` and `codex` options (R9). A running Claude supervisor
+  `.taskq/S<N>.pid`), with the same tools, `permission_mode` and resolved task/default `codex` options (R9). A running Claude supervisor
   is never `send`-ed to: its own `taskq wait --task N` wakes it. Only an idle one (its process ended) is: the resume
   makes a new id (#284), which the same pass records as `supervisor` before anyone acts on it (§ 7 step 4); the old
   id is refused and retired once stopped (R11). Its liveness is the running / idle / dead state of § 7 step 4, not
@@ -924,8 +934,72 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 - Claude: `claude --bg --resume <short id>` starts a copy, not the same session; resume by the full id.
 - A process started with `nohup` or `disown` in a worker's shell dies when the tool call ends (#130); use the
   tool's background mode (Claude: `run_in_background`).
-- Codex on macOS: the `workspace-write` sandbox denies the GPU, so Metal apps (Blender) exit 139 (#157). Run such a
-  task with `--runtime claude`.
+### Task execution profiles (#577)
+
+The owner's plain shell (no agent session or `TASKQ_TASK`) may run `taskq policy N --profile workspace`
+or `--profile host-gpu`, or `--profile default` to remove selection. It writes `execution_profile` in the board
+JSON and a trusted `execution-profile` owner note. Both must agree on a fresh board read; a label, task prose,
+local config/profile or local handle grants nothing. Existing board trust/ACLs are the boundary (R1), as for
+other owner-shell commands; this is not cryptographic owner authentication against a malicious collaborator.
+The command refuses an active claim/supervisor: changing a running task's environment requires explicit retirement.
+
+No field (or null) means the existing project defaults, unchanged. `workspace` pins workspace-write, approval never,
+network access and the repository Git metadata writable root for native Codex S and W alike. Only existing
+model/effort options may accompany this profile; conflicting/unknown options are rejected, never silently dropped.
+The report validates deterministic profile/runtime/config errors from its one snapshot, using the same option
+resolver as dispatch. It retains waiting/dependency reasons and appends any policy blocker; doing/review/ask
+counters keep their state meaning. List data cannot prove the trusted owner approval note: otherwise eligible
+workspace tasks remain provisionally Ready, with approval checked only on the fresh dispatch read.
+Other runtimes cannot consume a selected profile. `host-gpu` always blocks before dispatch: the native exec
+adapter has no action-time approval handler. It does not launch Blender, Chrome or a bind probe. No enabled approval
+transport, danger-full-access, bypass, global permission change, runtime/model/effort/limit change is authorized.
+
+Spawn and every resume resolve the fresh board selection; requeue/restart/adoption retain it. Unsupported or
+unapproved profiles remain blocked on every pass and after answers, without spawning or retrying platform actions.
+The owner and Mac runtime administrator must identify an isolated qualification scope on the existing Mac
+or another supported runner, its action-time approval client, permitted host actions and approval location on
+the blocked board task. The approved manager probe (2026-10-10) bound loopback and exchanged bytes; Blender
+5.2.1 LTS and Chrome 154.0.8037.98 version commands exited 0. This disproves a necessarily absent host, not
+the recorded EPERM or the missing native lifecycle/GPU/browser proof. A textual answer does not connect a
+client. Do not retry the same topology until that prerequisite exists and a separately reviewed supported
+adapter/route is available.
+
+#### Dormant approval interfaces (source/mock only, #577)
+
+`ApprovalRouter` consumes newline-delimited stdio JSON-RPC server requests and emits responses through an
+injected writer; an injected nonblocking presenter receives an isolated pending card. Neither interface is
+instantiated by TaskQ runtime/dispatch. There is no TaskQ opt-in setting or enabled UI in this candidate.
+The concrete authenticated external human endpoint remains unresolved, owned by the owner and Mac runtime
+administrator on #577. No credentials are read or transported by these interfaces.
+
+One card binds exact typed request id, thread, turn, item and optional approval callback id. Only an explicit
+matching response can accept one command. Session acceptance and policy amendments are rejected; permission
+requests return an empty turn-scoped grant. Unknown/malformed input, duplicate requests, mismatched replies,
+timeout, presenter failure and disconnect fail closed. Resume requires a new router after confirmed
+`thread/resume` and `turn/start`; pending cards and decisions never survive it. The caller must service expiry
+within the bounded deadline, close on EOF, and never log command/cwd/reason cards publicly.
+
+Before any separately authorized activation, review the exact board opt-in and authenticated human UI scope,
+per-command lifetime and isolated qualification procedure. Installed 0.159.3 supports `approvalPolicy` and
+`approvalsReviewer` on thread start/resume and turn start; no setting is sent here. The protocol routes human
+review with `approvalsReviewer: "user"`; `approvalPolicy: "on-request"` would change the current `never`
+policy and is not authorized by this continuation. `TurnStart` approvalPolicy, approvalsReviewer and
+sandboxPolicy overrides persist for subsequent turns, not just the current turn. A future adapter must re-read
+board authority and verify effective policy on every start/resume, never infer restoration from a thread id.
+The one-command `accept` lifetime is distinct from persistent TurnStart configuration. No session grant,
+execpolicy/network amendment, autoaccept, security/config change or enabled host-gpu is included.
+
+Profiled turns run `taskq policy-check N` before task work. Native exec passes a per-turn local handle; the check
+requires that handle and fresh persisted turn-context evidence (workspace-write, never, network, Git writable root).
+Missing evidence or an app continuation without the native handle is a mismatch, even for the same thread.
+Handles are not policy authority. This guard diagnoses supported cooperative workers; it is not an OS ACL or
+proof of actions performed before the guard. Missing/mismatched evidence blocks work and must be reported on the
+task; never infer effective policy from the brief, title, thread id or launch arguments alone.
+
+Historical #157 Blender exit 139 and csgo #348 Git EPERM are retained observations, not a universal diagnosis.
+The csgo #336 Chrome debugging-port timeout (`steps=[]`) does not prove a sandbox/GPU root cause. Host/GPU
+qualification needs bounded actual Blender and Chrome evidence on the approved runner. #340/#336/#341/#342/#348
+remain held with their original acceptance criteria. See [supervisor topology evidence](docs/supervisor.md#10-task-577).
 
 ### Native Hermes admission (local candidate)
 

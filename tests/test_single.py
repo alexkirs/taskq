@@ -90,6 +90,371 @@ class Base(unittest.TestCase):
 
 
 
+class ApprovalRouter(unittest.TestCase):
+    """Source/mock only: installed 0.159.3 request shapes, no app-server or external presenter."""
+
+    def setUp(self):
+        self.output, self.cards = io.StringIO(), []
+        self.router = taskq.ApprovalRouter('thread', 'turn', self.output.write, self.cards.append)
+        self.request = {'id': 7, 'method': self.router.COMMAND, 'params': {
+            'threadId': 'thread', 'turnId': 'turn', 'itemId': 'item', 'approvalId': 'callback',
+            'startedAtMs': 1, 'command': 'mock-command', 'cwd': '/mock'}}
+
+    def receive(self):
+        self.router.receive(json.dumps(self.request) + '\n')
+
+    def reply(self, decision='accept'):
+        return {**{key: self.cards[-1][key] for key in ('id', 'threadId', 'turnId', 'itemId', 'approvalId')},
+                'decision': decision}
+
+    def results(self):
+        return [json.loads(line) for line in self.output.getvalue().splitlines()]
+
+    def test_exact_human_reply_once_decline_and_cancel(self):
+        for decision in ('accept', 'decline', 'cancel'):
+            with self.subTest(decision=decision):
+                self.setUp()
+                self.receive()
+                self.assertEqual(self.results(), [])  # no autoaccept
+                self.router.decide(self.reply(decision))
+                self.assertEqual(self.results(), [{'id': 7, 'result': {'decision': decision}}])
+                with self.assertRaises(ValueError):
+                    self.router.decide(self.reply(decision))
+                self.assertEqual(len(self.results()), 1)
+
+    def test_wrong_unknown_and_malformed_requests_close(self):
+        variants = [None, [], {'id': True}, {**self.request, 'method': 'unknown'},
+                    {**self.request, 'jsonrpc': '1.0'}, {**self.request, 'result': {}},
+                    {**self.request, 'params': []}]
+        for key, value in (('threadId', 'wrong'), ('turnId', 'wrong'), ('itemId', ''),
+                           ('startedAtMs', True), ('command', None), ('cwd', []),
+                           ('approvalId', 2), ('kind', 'writeStdin'), ('additionalPermissions', {}),
+                           ('proposedExecpolicyAmendment', ['mock']), ('networkApprovalContext', {}),
+                           ('proposedNetworkPolicyAmendments', [])):
+            variants.append({**self.request, 'params': {**self.request['params'], key: value}})
+        for line in ['{', '{"id":7,"id":8}', *map(json.dumps, variants)]:
+            with self.subTest(line=line):
+                self.setUp()
+                with self.assertRaises(ValueError):
+                    self.router.receive(line)
+                self.assertTrue(self.router.closed)
+                self.assertEqual(self.cards, [])
+                self.assertEqual(self.results(), [])
+
+    def test_wrong_reply_and_session_or_amendment_never_accept(self):
+        changes = [(key, 'wrong') for key in ('id', 'threadId', 'turnId', 'itemId', 'approvalId')]
+        changes += [('id', '7'), ('decision', 'acceptForSession'),
+                    ('decision', {'acceptWithExecpolicyAmendment': {'execpolicy_amendment': ['mock']}}),
+                    ('decision', {'applyNetworkPolicyAmendment': {'network_policy_amendment': {}}})]
+        for key, value in changes:
+            with self.subTest(key=key, value=value):
+                self.setUp()
+                self.receive()
+                with self.assertRaises(ValueError):
+                    self.router.decide({**self.reply(), key: value})
+                self.assertTrue(self.router.closed)
+                self.assertEqual(self.results(), [{'id': 7, 'result': {'decision': 'cancel'}}])
+
+    def test_duplicate_request_cancels_pending_and_cannot_replay(self):
+        self.receive()
+        with self.assertRaises(ValueError):
+            self.receive()
+        self.assertEqual(self.results(), [{'id': 7, 'result': {'decision': 'cancel'}}])
+        with self.assertRaises(ValueError):
+            self.router.decide(self.reply())
+        self.setUp()
+        self.receive()
+        self.router.decide(self.reply())
+        with self.assertRaises(ValueError):
+            self.receive()
+        self.assertEqual(len(self.results()), 1)
+
+    def test_deadline_disconnect_and_presenter_failure_cancel(self):
+        with mock.patch.object(taskq.time, 'monotonic', return_value=1) as clock:
+            self.receive()
+            clock.return_value = 61
+            with self.assertRaises(ValueError):
+                self.router.decide(self.reply())
+        self.assertEqual(self.results()[-1]['result'], {'decision': 'cancel'})
+        self.setUp()
+        self.receive()
+        self.router.close()  # stdio EOF or human endpoint disconnect
+        self.router.close()
+        self.assertEqual(len(self.results()), 1)
+        self.setUp()
+        self.router.present = mock.Mock(side_effect=OSError('offline'))
+        with self.assertRaises(ValueError):
+            self.receive()
+        self.assertEqual(self.results()[-1]['result'], {'decision': 'cancel'})
+        self.setUp()
+        self.receive()
+        self.router.write = mock.Mock(side_effect=BrokenPipeError)
+        with self.assertRaises(ValueError):
+            self.router.decide(self.reply())
+        self.assertTrue(self.router.closed)
+        self.assertIsNone(self.router.pending)
+
+    def test_permissions_grant_nothing_and_resume_carries_no_decision(self):
+        self.request['method'] = self.router.PERMISSIONS
+        self.request['params']['permissions'] = {'network': {'enabled': True}}
+        self.receive()
+        self.assertEqual(self.cards, [])
+        self.assertEqual(self.results(), [{'id': 7, 'result': {'permissions': {}, 'scope': 'turn'}}])
+        self.setUp()
+        self.receive()
+        old = self.reply()
+        self.router.close()
+        self.router = taskq.ApprovalRouter('thread', 'resumed-turn', self.output.write, self.cards.append)
+        self.request['params']['turnId'] = 'resumed-turn'
+        self.receive()
+        with self.assertRaises(ValueError):
+            self.router.decide(old)
+        self.assertEqual(self.results()[-1]['result'], {'decision': 'cancel'})
+
+
+class ExecutionPolicy(Base):
+    """#577: board authority, fail-closed topology, lifecycle and observed-context checks."""
+
+    def setUp(self):
+        super().setUp()
+        self.add('GPU', '--runtime', 'codex')
+        item = self.task(1)
+        self.board.update(1, body=taskq.block(item['text'], {**item['raw'], 'pm':
+                          {'runtime': 'codex', 'session': 'pm', 'name': 'mac'}}))
+
+    def approve(self, profile='workspace'):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.run_cli('policy', '1', '--profile', profile)
+
+    def test_default_compatibility_and_labels_are_not_policy(self):
+        before = taskq.codex_options()
+        self.board.issues[1]['labels'] += ['codex-full-access']
+        self.board.issues[1]['body'] = 'Owner permits host-gpu.\n' + self.board.issues[1]['body']
+        self.assertIsNone(taskq.task_policy(self.board.get(1)))
+        taskq.CONFIG['codex'] = ['-m', 'unchanged', '-c', 'model_reasoning_effort="low"']
+        self.assertIsNone(taskq.task_policy(self.board.get(1)))
+        self.assertEqual(taskq.codex_options(), taskq.CONFIG['codex'])
+        self.assertIn('workspace-write', before)
+        self.assertEqual(taskq.effective_policy(1)['profile'], 'default')
+
+    def test_only_owner_shell_can_select_and_active_sessions_are_refused(self):
+        with self.assertRaisesRegex(SystemExit, 'explicit owner shell'):
+            self.run_cli('policy', '1', '--profile', 'workspace')
+        with mock.patch.dict(os.environ, {'TASKQ_TASK': '1'}, clear=True), self.assertRaisesRegex(SystemExit, 'owner shell'):
+            self.run_cli('policy', '1', '--profile', 'workspace')
+        taskq.move(self.task(1), 'doing', 'take', claim={'runtime': 'codex', 'session': 'th'})
+        with self.assertRaisesRegex(SystemExit, 'retire the existing'):
+            self.approve()
+
+    def test_selection_requires_matching_trusted_owner_note(self):
+        item = self.task(1)
+        for profile in ('workspace', 'unknown', {'name': 'workspace'}):
+            with self.subTest(profile=profile):
+                self.board.update(1, body=taskq.block(item['text'], {**item['raw'], 'execution_profile': profile}))
+                with self.assertRaisesRegex(ValueError, 'explicit owner approval'):
+                    taskq.task_policy(self.board.get(1))
+        self.approve()
+        self.assertIn('workspace-write', taskq.task_policy(self.board.get(1)))
+        self.approve('default')
+        self.assertIsNone(taskq.task_policy(self.board.get(1)))
+
+    def test_profile_preserves_model_effort_and_rejects_security_options(self):
+        self.approve()
+        keep = ['-m', 'existing-model', '-c', 'model_reasoning_effort="low"']
+        taskq.CONFIG['codex'] = keep
+        self.assertEqual(taskq.task_policy(self.board.get(1))[:4], keep)
+        for options in (['--dangerously-bypass-approvals-and-sandbox'], ['-s', 'danger-full-access'],
+                        ['-c', 'approval_policy="on-request"'], ['-c', 'model'], ['--unknown']):
+            taskq.CONFIG['codex'] = options
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, 'conflicts'):
+                taskq.task_policy(self.board.get(1))
+        self.assertEqual(taskq.CONFIG['codex'], ['--unknown'])
+
+    def test_unsupported_profile_never_dispatches_after_answer_or_requeue(self):
+        self.approve('host-gpu')
+        fake = FakeRuntime()
+        with mock.patch.object(taskq, 'runtimes', return_value={'codex': fake}):
+            for state in ('ready', 'doing', 'ask'):
+                taskq.move(self.task(1), state, 'fixture')
+                if state == 'ask':
+                    self.run_cli('answer', '1', '--text', 'try again')
+                self.run_cli('requeue', '1', '--text', 'try again')
+                self.assertIn('unsupported host-gpu', self.run_cli('tick'))
+        self.assertEqual(getattr(fake, 'names', []), [])
+        self.assertIn('approval location on this task', taskq.policy_reason(self.board.get(1)))
+        self.assertEqual(self.task(1)['raw']['execution_profile'], 'host-gpu')
+
+    def test_spawn_resume_restart_supervisor_worker_share_fresh_selection(self):
+        self.approve()
+        codex = taskq.Codex()
+        calls = []
+        def launch(command, **kwargs):
+            calls.append((command, kwargs['env']))
+            return mock.Mock(pid=4242)
+        with mock.patch.object(taskq.subprocess, 'Popen', side_effect=launch), \
+                mock.patch.object(taskq.shutil, 'which', return_value='codex'), mock.patch.object(taskq, 'dispatch'):
+            for name, arguments in (('S1 CDX GPU (mac)', ['-C', str(self.root), 'spawn']),
+                                    ('T1 CDX GPU (mac)', ['-C', str(self.root), 'spawn']),
+                                    ('S1', ['resume', 'th', 'restart']), ('T1', ['resume', 'th', 'answer'])):
+                codex.exec(name, arguments, self.root)
+            self.approve('host-gpu')
+            with self.assertRaisesRegex(SystemExit, 'unsupported host-gpu'):
+                codex.exec('S1', ['resume', 'th', 'restart'], self.root)
+        self.assertEqual(len(calls), 4)
+        expected = calls[0][0][3:-3]
+        self.assertEqual(calls[1][0][3:-3], expected)
+        self.assertEqual(calls[2][0][3:-3], expected)
+        self.assertEqual(calls[3][0][3:-3], expected)
+        self.assertEqual(len({env['TASKQ_NATIVE_POLICY'] for _, env in calls}), 4)
+        for command, env in calls:
+            self.assertIn('policy-check 1', command[-1])
+            self.assertNotIn('CLAUDE_CODE_SESSION_ID', env)
+            self.assertNotIn('TASKQ_TASK', env)
+
+    def context(self):
+        self.approve()
+        codex = taskq.Codex()
+        (codex.folder() / 'T1.pid').write_text('4242 th')
+        (codex.folder() / 'T1.policy').write_text(json.dumps({'token': 'turn-token', 'started': 1}))
+        folder = self.root / 'codex' / 'sessions' / '2026' / '10' / '10'
+        folder.mkdir(parents=True)
+        path = folder / 'rollout-x-th.jsonl'
+        entry = {'timestamp': '2026-10-10T00:00:00Z', 'type': 'turn_context', 'payload':
+                 {'turn_id': 'turn', 'approval_policy': 'never', 'model': 'existing', 'effort': 'low',
+                  'sandbox_policy': {'type': 'workspace-write', 'network_access': True,
+                                     'writable_roots': [str(self.root / '.git')]}}}
+        path.write_text(json.dumps(entry) + '\n')
+        os.environ.pop('CLAUDE_CODE_SESSION_ID')
+        os.environ.update({'CODEX_THREAD_ID': 'th', 'TASKQ_RUNTIME': 'codex',
+                           'CODEX_HOME': str(self.root / 'codex'), 'TASKQ_NATIVE_POLICY': 'turn-token'})
+        return path, entry
+
+    def test_fresh_effective_context_and_app_continuation_mismatch(self):
+        path, entry = self.context()
+        self.assertEqual(taskq.effective_policy(1)['approval'], 'never')
+        with mock.patch.dict(os.environ, {'TASKQ_NATIVE_POLICY': ''}), self.assertRaisesRegex(ValueError, 'app continuation'):
+            taskq.effective_policy(1)  # same thread id is insufficient
+        for key, value in (('approval_policy', 'on-request'), ('sandbox_policy', {'type': 'danger-full-access'})):
+            bad = {**entry, 'payload': {**entry['payload'], key: value}}
+            path.write_text(json.dumps(entry) + '\n' + json.dumps(bad) + '\n')
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'differs'):
+                taskq.effective_policy(1)  # newest evidence wins
+        path.write_text(json.dumps({**entry, 'timestamp': '1970-01-01T00:00:00Z'}) + '\n')
+        with self.assertRaisesRegex(ValueError, 'fresh turn context absent'):
+            taskq.effective_policy(1)
+
+    def test_mismatch_refuses_result_but_allows_board_blocker_report(self):
+        self.context()
+        taskq.move(self.task(1), 'doing', 'fixture', claim={'runtime': 'codex', 'session': 'th'})
+        os.environ.pop('TASKQ_NATIVE_POLICY')
+        with self.assertRaisesRegex(SystemExit, 'effective-policy mismatch'):
+            self.run_cli('result', '1', '--sha', 'a' * 40)
+        self.assertEqual(self.task(1)['state'], 'doing')
+        self.run_cli('ask', '1', '--text', 'Native adapter handle absent; owner must supply approved topology')
+        self.assertEqual(self.task(1)['state'], 'ask')
+
+    def test_profile_report_uses_one_snapshot_and_keeps_state_counters(self):
+        self.approve('host-gpu')
+        for state, counters in (('ready', 'In work 0 · Waiting for answer 0 · Ready 0'),
+                                ('doing', 'In work 1 · Waiting for answer 0 · Ready 0'),
+                                ('ask', 'In work 0 · Waiting for answer 1 · Ready 0')):
+            taskq.move(self.task(1), state, 'fixture')
+            with mock.patch.object(self.board, 'get', side_effect=AssertionError('report fetched outside snapshot')):
+                self.assertIn(counters, self.run_cli('status'))
+
+    def test_report_rejects_same_deterministic_errors_as_dispatch(self):
+        self.approve()
+        original = self.board.get(1)
+        for options, worker, manager, reason in (
+                (['-s', 'danger-full-access'], 'codex', 'codex', 'conflicts'),
+                (['-s', 'workspace-write'], 'codex', 'codex', 'conflicts'),
+                ([], 'claude', 'codex', 'runtime unchanged'),
+                ([], 'codex', 'claude', 'runtime unchanged')):
+            with self.subTest(options=options, worker=worker, manager=manager):
+                taskq.CONFIG['codex'] = options
+                item = taskq.parse(original)
+                self.board.update(1, body=taskq.block(item['text'], {**item['raw'], 'pm': {'runtime': manager}}),
+                                  labels=[label for label in original['labels'] if not label.startswith('run-')] + ['run-' + worker])
+                self.assertIn(reason, taskq.policy_reason(self.board.get(1)))
+                with mock.patch.object(self.board, 'get', side_effect=AssertionError('outside snapshot')):
+                    out = self.run_cli('status')
+                self.assertIn('Ready 0', out)
+                self.assertIn(reason, out)
+        taskq.CONFIG['codex'] = []
+        self.board.issues[1] = original
+        self.add('default')
+        with mock.patch.object(self.board, 'get', side_effect=AssertionError('approval unavailable in list')), \
+                mock.patch.object(taskq, 'runtimes', return_value={'codex': FakeRuntime()}):
+            self.assertIn('Ready 1', self.run_cli('status'))
+        self.assertIsNone(taskq.task_policy(self.board.get(2)))
+
+    def test_report_retains_wait_dependencies_and_active_counters_with_policy_blocker(self):
+        self.approve('host-gpu')
+        self.add('dependency')
+        for state, expected in (('waiting', 'waiting (#2)'), ('ready', 'blocked (#2 open)'),
+                                ('doing', 'doing'), ('review', 'review')):
+            with self.subTest(state=state):
+                taskq.move(self.task(1), state, 'fixture', deps=[2])
+                with mock.patch.object(self.board, 'get', side_effect=AssertionError('outside snapshot')):
+                    out = self.run_cli('status')
+                self.assertIn(expected + '; policy blocked (unsupported host-gpu:', out)
+                self.assertIn('In work ' + str(int(state in ('doing', 'review'))), out)
+                self.assertIn('Ready 0', out)
+
+    def test_missing_native_resume_handle_and_wrong_runtime_are_blockers(self):
+        self.approve()
+        taskq.move(self.task(1), 'doing', 'fixture', claim={'runtime': 'codex', 'session': 'app-th'})
+        with self.assertRaisesRegex(SystemExit, 'no native adapter handle'):
+            taskq.Codex().send('app-th', 'continue')
+        item = self.task(1)
+        self.board.update(1, body=taskq.block(item['text'], {**item['raw'], 'pm': {'runtime': 'claude'}}))
+        with self.assertRaisesRegex(ValueError, 'runtime unchanged'):
+            taskq.task_policy(self.board.get(1))
+
+    def test_requeue_and_manager_adoption_preserve_board_policy(self):
+        self.approve()
+        original = self.task(1)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.run_cli('requeue', '1', '--text', 'offline rework')
+        item = self.task(1)
+        self.board.update(1, body=taskq.block(item['text'], {**item['raw'], 'pm': None}))
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_THREAD_ID': 'new-pm'}, clear=True):
+            taskq.adopt([1], taskq.origin())
+        self.assertEqual(self.task(1)['raw']['execution_profile'], original['raw']['execution_profile'])
+        self.assertIn('workspace-write', taskq.task_policy(self.board.get(1)))
+
+    def test_profiled_exec_real_local_boundary_with_fake_cli(self):
+        self.approve()
+        cli = self.root / 'fake-codex'
+        record = self.root / 'record.json'
+        cli.write_text(f'#!{sys.executable}\n' +
+                       'import json,os,sys\n' +
+                       'from pathlib import Path\n' +
+                       'Path(os.environ["FAKE_POLICY_RECORD"]).write_text(json.dumps({"args":sys.argv[1:],'
+                       '"native":bool(os.environ.get("TASKQ_NATIVE_POLICY")),'
+                       '"parent_session":"CLAUDE_CODE_SESSION_ID" in os.environ}))\n')
+        cli.chmod(0o755)
+        with mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN), \
+                mock.patch.object(taskq.shutil, 'which', return_value=str(cli)), \
+                mock.patch.object(taskq, 'dispatch'), \
+                mock.patch.dict(os.environ, {'FAKE_POLICY_RECORD': str(record)}):
+            for args in (['-C', str(self.root), 'spawn'], ['resume', 'th', 'restart']):
+                process, _ = taskq.Codex().exec('S1', args, self.root)
+                self.assertEqual(process.wait(timeout=5), 0)
+                observed = json.loads(record.read_text())
+                self.assertTrue(observed['native'])
+                self.assertFalse(observed['parent_session'])
+                self.assertIn('approval_policy="never"', observed['args'])
+                self.assertIn('policy-check 1', observed['args'][-1])
+
+    def test_safe_environment_keeps_credentials_without_exposing_values(self):
+        with mock.patch.dict(os.environ, {'OPENAI_API_KEY': 'test-only-secret', 'TASKQ_NATIVE_POLICY': 'old'}):
+            env = taskq.worker_env()
+            self.assertEqual(env['OPENAI_API_KEY'], 'test-only-secret')
+            self.assertNotIn('TASKQ_NATIVE_POLICY', env)
+            self.assertNotIn('test-only-secret', self.run_cli('policy-check', '1'))
+
+
 class Commands(Base):
 
     def test_add_ready_or_waiting(self):
@@ -1708,6 +2073,7 @@ class Tick(TickSetup):
     def test_codex_turn_starts_a_pass_at_its_end(self):
         # #525: every `codex exec` turn (spawn or resume) gets one detached pass that waits for its pid
         started = []
+        self.add('one')  # exec resolves the fresh board task before starting a turn (#577)
         with mock.patch.object(taskq.subprocess, 'Popen', return_value=mock.Mock(pid=4242)), \
                 mock.patch.object(taskq.shutil, 'which', return_value='codex'), \
                 mock.patch.object(taskq, 'start_pass', lambda command, **_: started.append(command[2:])):

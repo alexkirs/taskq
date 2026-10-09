@@ -1650,14 +1650,14 @@ def dispatch(command, tasks, after=None):
             start_pass([sys.executable, str(Path(__file__).resolve()), 'tick', '--quiet', *['--after', str(after)] * bool(after), '--tasks', *tasks],
                        cwd=CONFIG['root'],
                        stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
-    except Exception as error:  # never fails the event: the next tick retries
-        print(f'taskq: dispatch stopped: {error}; the next tick retries', file=sys.stderr)
+    except Exception as error:  # parent board mutation is already settled; report failure to launch its event
+        print(f'taskq: dispatch stopped: {error}; resolve the blocker, then run a fresh tick', file=sys.stderr)
 
 start_pass = subprocess.Popen  # tests run the child's pass in process
 
 def event_pass(args):
     """`tick --quiet`: the tick pass without the table. `--after PID`: first wait for that Codex turn to end (R4 #525).
-    A failure never fails the event: the next tick retries."""
+    A failed pass exits nonzero and logs its blocker; the detached parent mutation remains settled."""
     while args.after and pid_alive(args.after):  # ponytail: 5 s poll of one pid; lives exactly as long as the turn
         time.sleep(5)
     try:

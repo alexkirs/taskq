@@ -807,8 +807,10 @@ class HermesAdmission(Base):
                 self.native.available = lambda: available
                 self.native.sessions['s-S1'] = state
                 errors = io.StringIO()
-                with contextlib.redirect_stderr(errors):
+                with contextlib.redirect_stderr(errors), self.assertRaises(SystemExit) as error:
                     self.run_cli('tick', '--quiet')
+                self.assertEqual(error.exception.code, 1)
+                self.assertIsNone(self.board.guard)  # no effects occurred: failed admission releases its grant
                 self.assertRegex(errors.getvalue(), 'unavailable|state unknown')
                 self.assertEqual(self.board.get(1)['body'], before)
                 self.assertFalse(self.worker.sessions)

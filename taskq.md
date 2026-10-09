@@ -325,11 +325,13 @@ Owner decisions on what taskq looks and sounds like, one line each (#505). Chang
 
 1. python3 >= 3.9, git; `gh` (GitHub) or `glab` (GitLab) installed and logged in: `gh auth status` / `glab auth status`.
    Workers need the `claude` and/or `codex` CLI.
-   Self-managed GitLab: its admin creates an OAuth application once (Admin Area > Applications; redirect URI
-   `http://localhost:7171/auth/redirect`, scopes `openid profile read_user write_repository api`, not confidential)
-   and writes its Application ID to `glab_client_id` in `taskq.json`. The agent does not run the login: glab's prompts
-   need a real terminal. It gives the user two lines for their own terminal, unjoined (Windows PowerShell 5.1 has no `&&`):
-   `glab config set client_id <glab_client_id> -g --host <host>` and `glab auth login --hostname <host> --web`.
+   Self-managed GitLab: the user's `glab` needs the host's OAuth Application ID before a web login. With `glab_client_id`
+   in `taskq.json` the agent runs `glab config set client_id <glab_client_id> -g --host <host>` itself. Without it,
+   an admin's agent (`glab api user` shows `"is_admin": true`) creates the application once,
+   `glab api -X POST applications -f name=glab -f redirect_uri=http://localhost:7171/auth/redirect -f "scopes=openid profile read_user write_repository api" -f confidential=false`,
+   and commits its `application_id` as `glab_client_id`; anyone else asks the admin. The agent does not run the login:
+   glab's prompts need a real terminal. It gives the user one line for their own terminal:
+   `glab auth login --hostname <host> --web`.
 2. `git clone https://github.com/alexkirs/taskq ~/taskq`; `taskq.py` is the only file it needs. Alias:
    `ln -s ~/taskq/taskq.py ~/.local/bin/taskq` or `alias taskq='python3 ~/taskq/taskq.py'` (Windows: § 9).
    Update: `git pull` in the clone; `taskq tick` and `taskq wait` pull it themselves, so keep it on clean `main`.

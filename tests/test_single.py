@@ -512,7 +512,9 @@ class FakeRuntime:
                 del self.sessions[session]
 
 
-class Tick(Base):
+class TickSetup(Base):
+    """Fixture only, no tests (#534, § 10): a fake runtime and a manager for Tick and Wait."""
+
     def setUp(self):
         super().setUp()
         self.fake = FakeRuntime()
@@ -547,6 +549,9 @@ class Tick(Base):
 
     def notes(self, n):
         return [text.split(' ·')[0] for text in self.board.issues[n]['comments']]
+
+
+class Tick(TickSetup):
 
     def test_spawn_one_per_free_slot(self):
         # #525 (R2, R3): a ready task gets one supervisor in the manager's runtime; its worker's slot is held from then on
@@ -1113,8 +1118,9 @@ class Tick(Base):
         self.assertFalse((self.root / '.taskq' / 'pm.json').exists())  # refused: nothing written
 
 
-class Wait(Tick):
-    """#407: `taskq wait` returns once per event, or 'tick' after the window; the clock is patched."""
+class Wait(TickSetup):
+    """#407: `taskq wait` returns once per event, or 'tick' after the window; the clock is patched.
+    #534: no longer reruns Tick's tests; none of them reads this clock but three `wait --window 0` calls (no sleep)."""
 
     def setUp(self):
         super().setUp()
@@ -1242,7 +1248,7 @@ class Wait(Tick):
 class MultiPM(Base):
     """#532 (R1, R3, R4): a Codex and a Claude manager share one checkout and board; each task's `pm` is the authority."""
     A, B = {'CODEX_THREAD_ID': 'pmA-codex', 'TASKQ_RUNTIME': 'codex'}, {'CLAUDE_CODE_SESSION_ID': 'pmB-claude', 'TASKQ_RUNTIME': 'claude'}
-    legacy, acting, notes = Tick.legacy, Tick.acting, Tick.notes
+    legacy, acting, notes = TickSetup.legacy, TickSetup.acting, TickSetup.notes
 
     def setUp(self):
         super().setUp()

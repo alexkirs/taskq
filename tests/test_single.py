@@ -66,8 +66,12 @@ class Base(unittest.TestCase):
         self.root = Path(folder.name)
         taskq.CONFIG = {'board': 'github', 'publish': 'direct', 'root': self.root, 'hosts': {}}
         real = lambda *_, **__: self.fail('a test started a real process')  # a test fakes subprocess.run where it needs one
+        env = {'CLAUDE_CODE_SESSION_ID': SESSION, 'TASKQ_RUNTIME': 'claude', 'TASKQ_HOST': 'mac'}
+        if os.name == 'nt':  # Windows has no /usr/bin fallback after clear=True; preserve only the native git directory
+            git = taskq.shutil.which('git')
+            env.update(PATH=str(Path(git).parent) if git else '', SYSTEMROOT=os.environ['SYSTEMROOT'])
         for patcher in (
-                mock.patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': SESSION, 'TASKQ_RUNTIME': 'claude', 'TASKQ_HOST': 'mac'}, clear=True),
+                mock.patch.dict(os.environ, env, clear=True),
                 mock.patch.object(taskq, 'runtimes', return_value={}),  # no real worker from an event's dispatch
                 mock.patch.object(taskq, 'start_pass', lambda command, **_: taskq.main(command[2:])),  # the child's pass, in process
                 mock.patch.object(taskq, 'datetime', FixedNow),
@@ -1547,11 +1551,14 @@ class Tick(TickSetup):
         server = folder / 'codex'
         server.write_text(f'#!{sys.executable}\n' + APP_SERVER)
         server.chmod(0o755)
+        # Windows does not execute a shebang: use the real Python process for this same fake stdio server.
+        def launch(command, **kwargs):
+            return REAL_POPEN(([sys.executable, *command] if os.name == 'nt' else command), **kwargs)
         cases = {'ok': None, 'set-error': 'thread/name/set: ', 'wrong-name': "thread/read: th named 'other'",
                  'silent': 'initialize: no reply', 'hang': None}
         for mode, error in cases.items():
             log = folder / f'{mode}.log'
-            with self.subTest(mode), mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN), \
+            with self.subTest(mode), mock.patch.object(taskq.subprocess, 'Popen', launch), \
                     mock.patch.object(taskq.shutil, 'which', return_value=str(server)), mock.patch.object(taskq.Codex, 'WAIT', 2), \
                     mock.patch.dict(os.environ, {'FAKE_MODE': mode, 'FAKE_LOG': str(log)}):
                 began = taskq.time.monotonic()

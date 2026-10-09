@@ -1580,7 +1580,7 @@ def cmd_cleanup(args):
     for item in items:
         claim, n, sha = item['claim'] or {}, item['iid'], (item['result'] or {}).get('sha') or ''
         if item['state'] == 'doing' and claim.get('name') == here and claim.get('runtime') in kinds \
-                and kinds[claim['runtime']].alive(claim['session']) is False:
+                and runtime_state(kinds[claim['runtime']], claim['session']) == 'dead':
             mess.append(f'#{n} doing: session {claim["session"]} is gone')
         if item['state'] == 'review' and CONFIG['publish'] == 'pr' and prs is not None and f'taskq-{n}' not in prs and not (
                 re.fullmatch('[0-9a-f]{7,40}', sha) and not git('merge-base', '--is-ancestor', sha, 'origin/main').returncode):  # an answer is on main
@@ -2165,6 +2165,10 @@ EVENTS = ('add', 'answer', 'run', 'result', 'requeue', 'close')  # R4 (#333): ea
 
 def dispatch(command, tasks, after=None, after_birth=None):
     """R4 (#405): the event pass runs in a detached `tick --quiet` child, its output in .taskq/dispatch.log; the event returns at once."""
+    reason = release_reason()
+    if reason:
+        print(f'taskq: dispatch stopped: {reason}', file=sys.stderr)
+        return
     if os.environ.get('CODEX_SANDBOX'):  # a sandboxed Codex worker can neither start codex nor see other sessions' pids:
         return  # its pass would requeue live tasks as gone and spawn workers that die at once (#269 run 4b)
     try:

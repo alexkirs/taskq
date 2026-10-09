@@ -3374,6 +3374,10 @@ class Contract(Base):
                 self.add('old process cannot write')
             with self.assertRaisesRegex(SystemExit, 'stale or invalid'):
                 taskq.effect(self.board.comment, 1, 'cannot write through helper')
+            with mock.patch.object(taskq, 'start_pass') as spawn, contextlib.redirect_stderr(io.StringIO()) as errors:
+                taskq.dispatch('result', [1])
+            spawn.assert_not_called()
+            self.assertIn('stale or invalid', errors.getvalue())
             self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
             with mock.patch.object(taskq, 'CLONE', new):
                 self.assertIsNone(taskq.release_reason())
@@ -3509,6 +3513,15 @@ class Cleanup(Base):
 
     def cleanup(self, *argv):
         return self.run_cli('cleanup', *argv).splitlines()
+
+    def test_cleanup_does_not_report_idle_or_unknown_worker_as_dead(self):
+        real_state = self.fake.state
+        real_alive = self.fake.alive
+        for state in ('idle', None):
+            with self.subTest(state=state), mock.patch.object(self.fake, 'state',
+                    side_effect=lambda sid: state if sid == 's-T1' else real_state(sid)), \
+                    mock.patch.object(self.fake, 'alive', side_effect=lambda sid: False if sid == 's-T1' else real_alive(sid)):
+                self.assertNotIn('mess: #1 doing: session s-T1 is gone', self.cleanup('--dry-run'))
 
     def test_removes_leftovers_keeps_work(self):
         before = self.state()

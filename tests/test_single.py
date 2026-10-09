@@ -2636,6 +2636,20 @@ class Wait(TickSetup):
 
 
 class EventDelivery(Base):
+    def test_closed_unowned_delivery_completes_without_assigning_manager(self):
+        self.add()
+        with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), None, 'close', 'Accepted; no further work.', pm=None)
+            self.board.close(1)
+        event = taskq.issue_data(self.board.get(1))['events'][-1]
+        self.assertIn('closed #1', self.run_cli('wait', '--window', '0'))
+        self.run_cli('ack', f'1:{event["id"]}')
+        self.assertNotIn(taskq.EVENT_LABEL, self.board.get(1)['labels'])
+        self.assertIsNone(taskq.issue_data(self.board.get(1))['pm'])
+        self.assertEqual(self.run_cli('wait', '--window', '0').strip(), 'tick')
+        with mock.patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': 'different-manager'}):
+            self.assertEqual(self.run_cli('wait', '--window', '0').strip(), 'tick')
+
     """Board receipts survive comments, checkout changes and response loss; no live services."""
 
     def setUp(self):

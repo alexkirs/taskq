@@ -195,7 +195,8 @@ def event_targets(raw, action, text, actor=None):
 
 
 def event_pending(raw, target):
-    return [event for event in raw.get('events', []) if target not in event.get('acks', [])
+    return [event for event in raw.get('events', []) if not set(event['recipients']).issubset(event.get('acks', []))
+            and target not in event.get('acks', [])
             and (target in event['recipients'] or target.startswith('manager:') and 'manager:*' in event['recipients'])]
 
 
@@ -1782,6 +1783,9 @@ def acknowledge(issue, target, ids):
             fail(f'#{issue["iid"]}:{number}: event belongs to another recipient')
         if target not in event['acks']:
             event['acks'].append(target)
+        if issue['state'] == 'closed' and not raw.get('pm') and target.startswith('manager:') and 'manager:*' in event['recipients']:
+            if 'manager:*' not in event['acks']:
+                event['acks'].append('manager:*')
     if events != raw.get('events', []):
         raw['events'] = events
         effect(BOARD.update, issue['iid'], labels=event_labels(raw, issue['labels']), body=block(BLOCK.sub('', issue['body']).strip(), raw))

@@ -749,12 +749,26 @@ class Wait(Tick):
         self.assertIn('with SendMessage', out)
 
     def test_arm_tick_in_codex_names_resume(self):
-        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_THREAD_ID': 'T1'}):
+        """#522: a CLI thread (local rollout) gets exec resume."""
+        home = self.root / 'codex'
+        (home / 'sessions/2026/10/09').mkdir(parents=True)
+        (home / 'sessions/2026/10/09/rollout-2026-10-09T07-46-53-T1.jsonl').write_text('')
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_THREAD_ID': 'T1', 'CODEX_HOME': str(home)}):
             sender, self_arm = self.run_cli('arm', 'tick', 'T1'), self.run_cli('arm', 'tick')
         self.assertIn('resume T1 "<its output>"', sender)
         self.assertIn('resume T1 "$e"; done', sender)
+        self.assertNotIn('send_message_to_thread', sender)
         self.assertIn('in the foreground', self_arm)
         self.assertIn('arm tick T1`', self_arm)
+
+    def test_arm_tick_in_codex_app_thread_uses_native_sender(self):
+        """#522: an app thread has no local rollout; exec resume would fail `no rollout found`, so no resume is printed."""
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_HOME': str(self.root / 'none')}):
+            sender = self.run_cli('arm', 'tick', 'APP1')
+        self.assertIn('no local rollout of APP1', sender)
+        self.assertIn('with the Codex app tool `send_message_to_thread`', sender)
+        self.assertNotIn('resume APP1', sender)
+        self.assertNotIn('while :', sender)
 
 
 class Contract(Base):

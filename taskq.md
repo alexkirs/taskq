@@ -62,6 +62,9 @@ Changed: "a tick is a message" → a tick is a message or a queue event; spawn n
 Changed: a sender on a fixed interval (`/loop 5m taskq tick`) → a sender that loops `taskq wait` and messages the
 manager per event, `tick` after the safety window (#407).
 Changed: the event pass ran in the same process → in a detached child; an event no longer waits for spawns (#405).
+Changed: a Codex sender always sent with `codex exec resume` → only to a thread with a local rollout; a Codex app
+thread gets a sender agent in the app that sends with `send_message_to_thread` (#522; `exec resume` of an app thread
+fails `no rollout found`, #269).
 
 ### R5. Worker writes completion to the task
 
@@ -273,7 +276,7 @@ Runtime file: four module-level functions, two more optional.
 | `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed; print `review #N`, `ask #N`, `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7) |
 | `taskq pm` | print the manager role (Principles, § 7, how to tick this session) under a first line `taskq pm contract <hash>`; record the hash of the clone's `taskq.md` in `.taskq/pm.json` (§ 7) |
 | `taskq cleanup [--dry-run]` | the owner's manual sweep of this machine (below); `--dry-run` prints the same and changes nothing |
-| `taskq arm tick [<manager>]` | print the prompt for a tick-sender session of this runtime; without `<manager>`: how this session ticks itself (a background `taskq wait` that wakes it) (§ 7) |
+| `taskq arm tick [<manager>]` | print the prompt for a tick-sender session of this runtime (Codex: `exec resume` for a thread with a local rollout, else the app's `send_message_to_thread`); without `<manager>`: how this session ticks itself (a background `taskq wait` that wakes it) (§ 7) |
 
 - `--sha`: 7 to 40 lowercase hex digits; give the full SHA.
 - `--runtime` default `any`; `--type` default `code`; `--priority` default 2. `--host` takes a machine name (§ 2 `hosts`).
@@ -388,10 +391,16 @@ run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#4
 No fixed interval (#407): the manager is woken only when it has work.
 
 1. In the project root run `taskq arm tick "<manager>"` (its session name, id or link). It prints the prompt for
-   this runtime: loop { `taskq wait`; send its output to `<manager>` (Claude: `SendMessage`; Codex:
-   `codex exec resume <thread> "<output>"`, a new turn that wakes an idle thread, or the same loop in a shell) }.
+   this runtime: loop { `taskq wait`; send its output to `<manager>` (Claude: `SendMessage`; Codex: below) }.
    Without `<manager>` in a Codex session (not woken when a background command ends, #497): loop `taskq wait` and
    the pass in the foreground, and before a turn ends start a sender for this thread (#510).
+   Codex (#522): `arm tick` first looks for the thread's local rollout (`$CODEX_HOME/sessions/**/rollout-*-<thread>.jsonl`,
+   default `~/.codex`). Found (a CLI thread): `codex exec resume <thread> "<output>"`, a new turn that wakes an idle
+   thread, or the same loop in a shell. Not found (a thread of the Codex app): `exec resume` fails `no rollout found`,
+   so it prints that diagnostic and a prompt for a sender agent in the Codex app that sends with its native
+   `send_message_to_thread`; a session without that tool (a CLI worker) cannot be that sender and hands the prompt
+   to the app manager. No shell bridge, no copy of rollouts or auth. A Claude sender reaches only Claude sessions.
+   A failed send is reported once and loses only that event: `wait` never repeats it and no worker is spawned for it.
 2. Start a separate sender session on that prompt. It does no task work.
 3. `taskq wait` lists the board every 25 s and returns at once with one line per new event: `review #N`, `ask #N`,
    `gone #N` (a worker claimed on this machine whose session `alive` says gone), or `tick` when nothing happened for

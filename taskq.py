@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
-import argparse, contextlib, hashlib, importlib.util, json, os, re, shlex, shutil, signal, socket, subprocess, sys, time
+import argparse, contextlib, glob, hashlib, importlib.util, json, os, re, shlex, shutil, signal, socket, subprocess, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -977,6 +977,11 @@ def cmd_pm(args):
 CODEX_COMPACT = ('-c model_auto_compact_token_limit=200000 -c "compact_prompt=\\"Keep only the owner\'s open questions and '
                  'decisions; the board is the state.\\""')  # #507: a compacted manager costs ~10x less per tick (#503)
 
+def rollout(thread):
+    """#522: the thread's local Codex rollout, which `codex exec resume` needs; None for an app thread or a name."""
+    home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+    return next(home.glob(f'sessions/*/*/*/rollout-*-{glob.escape(thread)}.jsonl'), None) if thread else None
+
 def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
     runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
@@ -995,10 +1000,16 @@ do § 7 After each pass for those tasks, then start `{wait}` in the background a
 A runtime that cannot wake a session when a background command ends (Codex): use `taskq arm tick "<manager>"` from a separate sender session.
 Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.json autoCompactWindow 200000).''')
     resume = f'codex exec {shlex.join(codex_options())} resume {args.target}'  # the options a worker turn gets
-    send = f'by running `{resume} "<its output>"`: a new turn on that thread wakes it' if runtime == 'codex' else \
-        f'with {SENDERS.get(runtime, "your messaging tool")}'
-    shell = f'\nNo agent needed: `cd {CONFIG["root"]} && while :; do e=$({wait}) && {resume} "$e"; done` in a terminal.' if runtime == 'codex' else ''
-    print(f'''You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
+    send, shell, note = f'with {SENDERS.get(runtime, "your messaging tool")}', '', ''
+    if runtime == 'codex' and rollout(args.target):  # a CLI thread: exec resume finds it
+        send = f'by running `{resume} "<its output>"`: a new turn on that thread wakes it'
+        shell = f'\nNo agent needed: `cd {CONFIG["root"]} && while :; do e=$({wait}) && {resume} "$e"; done` in a terminal.'
+    elif runtime == 'codex':  # #522: an app thread has no local rollout, exec resume fails `no rollout found`
+        send = 'with the Codex app tool `send_message_to_thread`'
+        note = (f'taskq: no local rollout of {args.target}: `codex exec resume` would fail `no rollout found` (a Codex app thread).\n'
+                'Run this prompt as a sender agent in the Codex app. A session without send_message_to_thread (a CLI worker) '
+                'cannot be that sender: hand this prompt to the app manager; no shell bridge.\n\n')
+    print(f'''{note}You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
 Repeat forever, from {CONFIG["root"]}:
 1. Run `{wait}`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
 2. Send its output, verbatim, to {args.target} {send}.

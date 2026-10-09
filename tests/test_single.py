@@ -730,6 +730,167 @@ class Tick(TickSetup):
         self.add('three')
         self.assertNotIn('spawn', self.run_cli('tick'))
 
+    def restricted(self, people, **fields):
+        n = self.board.add('restricted', taskq.block('g', {'deps': [], 'pm': taskq.origin(), **fields}),
+                           ['q-ready', 'assignee-only'])
+        self.board.issues[n]['assignees'] = people
+        return n
+
+    def test_assignee_only_dispatch_and_take(self):
+        for people, identity, allowed in ((['alice'], 'alice', True), (['alice'], 'bob', False), (['bob'], 'alice', False),
+                                          ([], 'alice', False), (['bob', 'alice'], 'alice', True),
+                                          (['alice'], '', False)):
+            for boundary in ('tick', 'take'):
+                with self.subTest(people=people, identity=identity, boundary=boundary):
+                    self.board.issues.clear()
+                    self.fake.sessions.clear()
+                    self.fake.names = []
+                    self.board.user = lambda: identity
+                    taskq.CONFIG.update(assignee='alice', me='alice')  # forged filter/cache cannot authenticate
+                    n = self.restricted(people)
+                    errors = io.StringIO()
+                    with contextlib.redirect_stderr(errors):
+                        if boundary == 'take' and not allowed:
+                            with self.assertRaisesRegex(SystemExit, 'assignee-only'):
+                                self.run_cli('take', str(n))
+                        else:
+                            self.run_cli(boundary, *([str(n)] if boundary == 'take' else []))
+                    self.assertEqual(self.task(n)['state'], 'doing' if allowed else 'ready')
+                    if not allowed and boundary == 'tick' and 'alice' in people:  # else the `assignee` filter skips it first
+                        self.assertIn('assignee-only', errors.getvalue())
+        del taskq.CONFIG['assignee']
+        self.board.issues.clear()
+        self.board.user = lambda: 'foreign'
+        n = self.restricted(['alice'])
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.run_cli('tick')
+        self.assertEqual(self.task(n)['state'], 'ready')  # unfiltered manager
+
+    def test_assignee_only_identity_errors(self):
+        # #576: an identity error refuses the task (take fails); the pass goes on with the other tasks
+        n = self.restricted(['alice'])
+        self.fake.names = []
+        for error in (RuntimeError('offline'), SystemExit('auth failed')):
+            self.board.user = mock.Mock(side_effect=error)
+            with self.subTest(error=error), self.assertRaisesRegex(SystemExit, 'assignee-only.*identity'):
+                self.run_cli('take', str(n))
+            errors = io.StringIO()
+            with self.subTest(error=error), contextlib.redirect_stderr(errors):
+                self.run_cli('tick')
+            self.assertRegex(errors.getvalue(), 'assignee-only.*identity unavailable')
+            self.assertEqual(self.task(n)['state'], 'ready')
+            self.assertEqual(self.fake.names, [])
+        del self.board.user  # a board file without user()
+        with self.assertRaisesRegex(SystemExit, 'assignee-only.*identity'):
+            self.run_cli('take', str(n))
+
+    def test_assignee_only_label_added_after_the_list(self):
+        # #576 race 1: the list lacks `assignee-only`, the fresh read has it: an unsupervised worker is neither requeued nor nudged
+        self.board.user = lambda: 'alice'
+        n = self.restricted(['bob'])
+        self.board.issues[n]['labels'].remove('assignee-only')
+        self.legacy(n)
+        active = self.task(n)['claim']
+        self.fake.sessions[active['session']] = False  # gone: unrestricted, the pass would requeue it
+        stale = self.board.list
+        self.board.issues[n]['labels'].append('assignee-only')
+        listed = lambda state: [{**issue, 'labels': [label for label in issue['labels'] if label != 'assignee-only']} for issue in stale(state)]
+        errors = io.StringIO()
+        with mock.patch.object(self.board, 'list', side_effect=listed), contextlib.redirect_stderr(errors):
+            self.run_cli('tick')
+        self.assertIn('not assigned', errors.getvalue())
+        self.assertEqual((self.task(n)['state'], self.task(n)['claim']), ('doing', active))
+        self.assertEqual((self.fake.sent, self.notes(n)[-1]), ([], '**take**'))
+
+    def test_assignee_only_second_read_reassignment(self):
+        # #576 race 2: eligible at supervise's first read, reassigned before its second: no supervisor send, resume or respawn
+        for supervisor in ('dead', 'idle'):
+            with self.subTest(supervisor=supervisor):
+                self.board.issues.clear()
+                self.fake.names, self.fake.sent = [], []
+                self.board.user = lambda: 'alice'
+                n = self.restricted(['alice'])
+                self.run_cli('tick')
+                boss = self.task(n)['supervisor']
+                self.board.comment(n, '**ask** · claude:01234567\n\nworker question')  # an event for an idle supervisor
+                self.fake.sessions[boss['session']] = {'dead': False, 'idle': 'idle'}[supervisor]
+                real = taskq.lead_state
+                def reassign(lead, session):
+                    self.board.issues[n]['assignees'] = ['bob']
+                    return real(lead, session)
+                with mock.patch.object(taskq, 'lead_state', side_effect=reassign), contextlib.redirect_stderr(io.StringIO()):
+                    self.run_cli('tick')
+                self.assertEqual((self.fake.names, self.fake.sent), ([f'S{n} UNK restricted (mac)'], []))
+                self.assertEqual((self.task(n)['supervisor'], self.task(n)['state']), (boss, 'doing'))
+                self.assertNotIn('**gone**', self.notes(n))
+
+    def test_assignee_only_fresh_read_and_active_continuation(self):
+        self.board.user = lambda: 'alice'
+        n = self.restricted(['alice'])
+        self.fake.names = []
+        original = self.board.get
+        def reassigned(n):
+            return {**original(n), 'assignees': ['bob']}
+        with mock.patch.object(self.board, 'get', side_effect=reassigned), contextlib.redirect_stderr(io.StringIO()):
+            self.run_cli('tick')
+        self.assertEqual(self.fake.names, [])
+        self.run_cli('tick')
+        boss, claim = self.task(n)['supervisor'], self.task(n)['claim']
+        self.board.issues[n]['assignees'] = ['bob']
+        with self.acting(boss['session']), contextlib.redirect_stderr(io.StringIO()):
+            self.run_cli('run', str(n))
+        self.assertEqual((self.task(n)['supervisor'], self.task(n)['claim']), (boss, claim))
+        self.assertEqual(self.task(n)['raw']['order'], 'run')
+        self.assertEqual(len(self.fake.names), 1)
+        self.board.issues[n]['assignees'] = ['alice', 'bob']
+        self.run_cli('tick')
+        self.run_cli('tick')
+        self.assertEqual(len(self.fake.names), 2)  # one supervisor, one worker
+        active = self.task(n)['claim']
+        self.board.user = lambda: 'bob'
+        with self.assertRaisesRegex(SystemExit, 'doing'):
+            self.run_cli('take', str(n))
+        self.board.issues[n]['assignees'] = []
+        self.fake.sessions[active['session']] = False
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.run_cli('tick')
+        self.assertEqual(self.task(n)['claim'], active)  # never steals/requeues active work
+
+    def test_assignee_only_legacy_and_no_label(self):
+        self.board.user = mock.Mock(side_effect=RuntimeError('identity unavailable'))
+        n = self.restricted(['alice'])
+        self.board.issues[n]['labels'].remove('assignee-only')
+        self.run_cli('take', str(n))
+        self.board.user.assert_not_called()  # unlabeled manual take unchanged
+        self.board.issues.clear()
+        n = self.restricted(['alice'])
+        self.board.issues[n]['labels'].remove('assignee-only')
+        self.run_cli('tick')
+        self.board.user.assert_not_called()  # unlabeled dispatch unchanged
+        with self.assertRaisesRegex(SystemExit, 'not doing|not ready|doing'):
+            self.run_cli('take', str(n))
+        self.board.issues.clear()
+        n = self.restricted(['alice'])
+        self.legacy(n)
+        active = self.task(n)['claim']
+        self.board.user = lambda: 'bob'
+        self.fake.sessions[active['session']] = False
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.run_cli('tick')
+        self.assertEqual(self.task(n)['claim'], active)
+        self.assertEqual(self.task(n)['state'], 'doing')
+
+    def test_assignee_only_adoption(self):
+        self.board.user = lambda: 'bob'
+        n = self.restricted(['alice'], pm=None)
+        with self.assertRaisesRegex(SystemExit, 'assignee-only'):
+            taskq.adopt([n], taskq.session())
+        self.assertIsNone(self.task(n)['pm'])
+        self.legacy(n)
+        claim = self.task(n)['claim']
+        taskq.adopt([n], taskq.session())  # migration of active work does not rebind sessions
+        self.assertEqual(self.task(n)['claim'], claim)
+
     def test_assignee_starts_only_matching_tasks(self):
         # #480: "assignee" set: tick starts, and tick/wait/list show, only tasks assigned to it; unassigned ones are skipped
         self.board.user = lambda: 'alice'
@@ -1751,6 +1912,26 @@ class Model(Base):
         self.assertIsNone(taskq.parse(github.issue(item)))
         self.assertTrue(taskq.parse(github.issue({**item, 'author_association': 'OWNER'})))
 
+    def test_assignee_only_native_adapters(self):
+        for board, tool, key in ((taskq.GitHub('o/r'), 'gh', 'login'),
+                                  (taskq.GitLab('o/r', 'gitlab.example'), 'glab', 'username')):
+            with self.subTest(board=tool):
+                native = {'title': 'T', 'body': taskq.block('g', {}), 'description': taskq.block('g', {}),
+                          'number': 1, 'iid': 1, 'html_url': 'u', 'web_url': 'u', 'updated_at': 'now',
+                          'author_association': 'OWNER', 'assignees': [{key: 'alice'}, {key: 'bob'}],
+                          'labels': [{'name': 'q-ready'}, {'name': 'assignee-only'}] if tool == 'gh'
+                                    else ['q-ready', 'assignee-only'], 'state': 'open' if tool == 'gh' else 'opened'}
+                taskq.BOARD = board
+                item = taskq.parse(board.issue(native))
+                self.assertEqual(item['assignees'], ['alice', 'bob'])
+                with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, json.dumps({key: 'alice'}), '')) as run, \
+                        mock.patch.object(taskq.shutil, 'which', lambda name: name):
+                    self.assertIsNone(taskq.execution_reason(item))
+                command = run.call_args.args[0]
+                self.assertEqual(command[1:6], ['api', '-X', 'GET', 'user'] + (['--hostname'] if tool == 'glab' else []))
+                if tool == 'glab':
+                    self.assertEqual(command[-1], 'gitlab.example')
+
     def test_config_and_board_file(self):
         with tempfile.TemporaryDirectory() as folder:
             Path(folder, 'taskq.json').write_text('{"board": "boards/fake.py"}')
@@ -1824,6 +2005,40 @@ def link(session): return None
 
 class RealChild(unittest.TestCase):
     """#481: `add` in a real process starts the real detached `tick --quiet` child; it spawns and logs, though the list lags the add."""
+
+    def test_assignee_only_cli_board_runtime_boundary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'taskq.py').write_text((ROOT / 'taskq.py').read_text())  # no real clone refresh
+            (root / 'board.py').write_text(FILE_BOARD + "\ndef user(): return pathlib.Path(__file__).with_name('identity').read_text()\n")
+            (root / 'fake.py').write_text(FILE_RUNTIME)
+            (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'runtimes': {'fake': 'fake.py'},
+                                                       'limits': {'fake': 1}, 'assignee': 'alice'}))
+            env = {'PATH': '', 'HOME': str(root), 'TASKQ_HOST': 'mac', 'TASKQ_RUNTIME': 'claude',
+                   'CLAUDE_CODE_SESSION_ID': SESSION}
+            for boundary in ('tick', 'take'):
+                for people, identity, allowed in ((['alice'], 'alice', True), (['bob', 'alice'], 'alice', True),
+                                                  (['alice'], 'bob', False), ([], 'alice', False)):
+                    with self.subTest(boundary=boundary, people=people, identity=identity):
+                        (root / 'identity').write_text(identity)
+                        (root / 'spawned').unlink(missing_ok=True)
+                        issue = {'iid': 1, 'title': 'T', 'body': taskq.block('g', {'deps': [], 'pm':
+                                 {'runtime': 'fake', 'session': SESSION, 'name': 'mac'}}), 'labels': ['q-ready', 'assignee-only'],
+                                 'assignees': people, 'state': 'open', 'listed': True, 'comments': [],
+                                 'updated_at': '2026-10-09T00:00:00Z', 'url': ''}
+                        (root / 'issues.json').write_text(json.dumps({'1': issue}))
+                        done = REAL_RUN([sys.executable, str(root / 'taskq.py'), boundary] + (['1'] if boundary == 'take' else []),
+                                        cwd=root, env=env, capture_output=True, text=True, timeout=20)
+                        self.assertEqual(done.returncode, 0 if allowed or boundary == 'tick' else 1, done.stderr)
+                        saved = taskq.parse(json.loads((root / 'issues.json').read_text())['1'])
+                        self.assertEqual(saved['state'], 'doing' if allowed else 'ready')
+                        self.assertEqual((root / 'spawned').exists(), allowed and boundary == 'tick')
+                        if allowed and boundary == 'tick':
+                            self.assertEqual((root / 'spawned').read_text(), 'S1 UNK T (mac)')  # ORCH of the pm's runtime (#572)
+                            self.assertEqual(saved['supervisor']['session'], 's1')
+                        if not allowed and (boundary == 'take' or 'alice' in people):  # else the `assignee` filter skips it first
+                            self.assertIn('assignee-only', done.stderr)
+                            self.assertEqual(saved['claim'], None)
 
     def test_add_spawns_from_the_detached_child(self):
         folder = tempfile.TemporaryDirectory()

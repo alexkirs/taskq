@@ -81,6 +81,30 @@ def mine(item):
         wanted = CONFIG['me'] = CONFIG.get('me') or BOARD.user()  # one board call per process
     return not wanted or wanted in item['assignees']
 
+def execution_reason(item):
+    """#545: an `assignee-only` task runs only for the board's authenticated user among its native assignees. None: allowed."""
+    if 'assignee-only' not in item['labels']:
+        return None
+    prefix = f'#{item["iid"]} assignee-only'
+    if not item['assignees']:
+        return f'{prefix}: no board assignees; execution refused'
+    try:
+        identity = BOARD.user()  # never CONFIG['assignee'] or its cached 'me': selection, not authentication
+    except (Exception, SystemExit) as error:
+        return f'{prefix}: authenticated board identity unavailable ({error}); execution refused'
+    if not isinstance(identity, str) or not identity.strip():
+        return f'{prefix}: authenticated board identity is empty; execution refused'
+    if identity not in item['assignees']:
+        return f'{prefix}: authenticated board user {identity} is not assigned; execution refused'
+    return None
+
+def executable(issue):
+    """#545: a fresh board issue the pass may act on: a task, and eligible; else the reason goes to stderr."""
+    item = parse(issue)
+    reason = execution_reason(item) if item else f'#{issue["iid"]} is no longer a task'
+    reason and print(f'taskq: {reason}', file=sys.stderr)
+    return item if not reason else None
+
 def block(text, fields):
     """The description: the task's text, then its JSON block. Keys the model does not know are kept as they are."""
     return f'{text}\n\n<!-- taskq:start -->\n```json\n{json.dumps(fields, indent=1, ensure_ascii=False)}\n```\n<!-- taskq:end -->'
@@ -509,6 +533,9 @@ def cmd_list(args):
 
 def cmd_take(args):
     current, mine = task(args.n, 'ready'), session() or fail('take needs an agent session: set ' + ' or '.join(SESSIONS.values()))
+    reason = execution_reason(current)
+    if reason:
+        fail(reason)
     if open_deps(current['deps']):
         fail(f'#{args.n} has open dependencies')
     move(current, 'doing', 'take', claim={**mine, 'name': machine()}, result=None)
@@ -1075,8 +1102,10 @@ def supervise(item, kinds):
     lead = kinds.get(boss['runtime'])
     if lead is None:
         return
-    fresh = item['raw'].get('order') and claim.get('runtime') in kinds and parse(BOARD.get(n))  # #532: the list may lag a spawn
-    if fresh and fresh['raw'].get('order') and not (fresh['claim'] or {}).get('session'):  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
+    fresh = executable(BOARD.get(n))  # #532: the list may lag a spawn; #545: or an assignee-only label or reassignment
+    if not fresh:
+        return  # ineligible: sessions, claim and order stay as they are
+    if item['raw'].get('order') and claim.get('runtime') in kinds and fresh['raw'].get('order') and not (fresh['claim'] or {}).get('session'):  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
         kind = kinds[claim['runtime']]
         replace(item, kind, claim['runtime'], 'worker', running=True)
         sid = spawn_named(item, kind, 'T', brief(item, claim['runtime']))
@@ -1092,6 +1121,8 @@ def supervise(item, kinds):
             follow(item, kind, claim, True)
     state = lead_state(lead, boss['session'])
     issue = BOARD.get(n)
+    if not executable(issue):
+        return  # #545: a reassignment seen by this second read stops every supervisor send, resume and respawn
     if state == 'dead':
         evidence = tail_of(lead, boss['session']) or 'no log'
         if lead_deaths(issue['comments']):  # the second death since the last result or answer: the owner decides
@@ -1222,6 +1253,9 @@ def one_pass(args, table=True):
                 continue
             if item['state'] != 'doing' or claim.get('name') != here or claim.get('runtime') not in kinds:
                 continue  # another machine's, or a session no runtime here can see
+            if not executable(BOARD.get(item['iid'])):  # #545: the list's labels may lag; an ineligible task keeps its session and slot
+                busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
+                continue
             runtime = kinds[claim['runtime']]  # step 2: unsupervised (R3 Transition: started before #525, or taken by hand)
             state = runtime.alive(claim['session'])
             if state is False:
@@ -1243,7 +1277,7 @@ def one_pass(args, table=True):
                 continue  # no manager: the task waits, the table says so; another machine's manager: that machine starts it (§ 7 step 3)
             names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
             free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 1)), None)
-            fresh = free and parse(BOARD.get(item['iid']))  # #357: the board may have moved since the list
+            fresh = free and executable(BOARD.get(item['iid']))  # #357: the board may have moved since the list; #545: eligibility
             if fresh and fresh['state'] == 'ready' and fresh['pm'] == item['pm']:  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
                 item.update(fresh)
                 runtime = lead(item)
@@ -1410,6 +1444,10 @@ def adopt(numbers, me):
         held = [f'#{item["iid"]} ({item["pm"]["runtime"]}:{(item["pm"]["session"] or "shell")[:8]})' for item in adopted if item['pm']]
         if held:  # explicit, never the last writer
             fail(f'cannot adopt: {" ".join(held)} already has a manager')
+        for item in adopted:
+            reason = not item['claim'] and not item['supervisor'] and execution_reason(item)
+            if reason:  # #545: an unstarted task; recorded sessions only change their PM routing
+                fail(f'cannot adopt: {reason}')
         for item in adopted:
             move(item, item['state'], 'adopt', f'pm {origin()["runtime"]}:{me.get("session") or "shell"}', pm=origin())
 

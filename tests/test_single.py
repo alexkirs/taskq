@@ -521,6 +521,123 @@ class FakeRuntime:
                 del self.sessions[session]
 
 
+class HermesAdmission(Base):
+    def setUp(self):
+        super().setUp()
+        self.native, self.worker = FakeRuntime(), FakeRuntime()
+        self.native.available = lambda: True
+        self.bridge = taskq.Hermes(self.native)
+        self.kinds = {'hermes': self.bridge, 'codex': self.worker}
+        taskq.CONFIG.update(limits={'codex': 1}, repo='o/r')
+        self.patch = mock.patch.object(taskq, 'runtimes', return_value=self.kinds)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+
+    def native_env(self, sid=SESSION):
+        return mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'hermes', 'HERMES_SESSION_ID': sid})
+
+    def test_identity_no_codex_impersonation(self):
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'hermes', 'CODEX_THREAD_ID': SESSION}, clear=True):
+            with self.assertRaisesRegex(SystemExit, 'genuine HERMES_SESSION_ID'):
+                self.add()
+            self.assertEqual(self.board.issues, {})
+        with mock.patch.dict(os.environ, {'HERMES_SESSION_ID': '   '}, clear=True):
+            with self.assertRaisesRegex(SystemExit, 'genuine HERMES_SESSION_ID'):
+                taskq.session()
+        with self.native_env():
+            self.assertEqual(taskq.session(), {'runtime': 'hermes', 'session': SESSION})
+            self.assertNotIn('HERMES_SESSION_ID', taskq.worker_env())
+            self.assertNotIn('CODEX_THREAD_ID', taskq.worker_env())
+        with mock.patch.dict(os.environ, {'HERMES_SESSION_ID': SESSION, 'CODEX_THREAD_ID': 'codex'}, clear=True):
+            with self.assertRaisesRegex(SystemExit, 'ambiguous'):
+                taskq.session()
+
+    def test_native_supervisor_then_codex_worker(self):
+        with self.native_env():
+            self.add('native', '--runtime', 'codex')
+        item = self.task(1)
+        self.assertEqual(item['pm']['runtime'], 'hermes')
+        self.assertEqual(item['supervisor']['runtime'], 'hermes')
+        self.assertIsNone(item['claim']['session'])
+        self.assertEqual(self.native.names, ['S1 HRM native (mac)'])
+        self.assertFalse(self.worker.sessions)
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_THREAD_ID': 's-S1'}):
+            with self.assertRaisesRegex(SystemExit, 'only it'):
+                self.run_cli('run', '1')
+        with self.native_env('s-S1'):
+            self.run_cli('run', '1')
+        self.assertEqual(self.task(1)['claim']['runtime'], 'codex')
+        self.assertEqual(self.worker.names, ['T1 HRM native (mac)'])
+        self.native.sessions['s-S1'] = 'idle'
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_THREAD_ID': 's-T1'}):
+            self.run_cli('result', '1', '--sha', 'a' * 40)
+        self.assertIn('review #1', self.native.sent[-1][1])
+        self.assertFalse(self.worker.sent)
+
+    def test_bridge_failure_preserves_board_and_order(self):
+        with self.native_env():
+            self.add('native', '--runtime', 'codex')
+        item = self.task(1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(item, 'doing', 'run', order='run')
+        before = self.board.get(1)['body']
+        for available, state in ((False, True), (True, None), (True, 'invalid')):
+            with self.subTest(available=available, state=state):
+                self.native.available = lambda: available
+                self.native.sessions['s-S1'] = state
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    self.run_cli('tick', '--quiet')
+                self.assertRegex(errors.getvalue(), 'unavailable|state unknown')
+                self.assertEqual(self.board.get(1)['body'], before)
+                self.assertFalse(self.worker.sessions)
+        self.native.available = lambda: True
+        self.native.sessions['s-S1'] = False
+        self.run_cli('tick', '--quiet')
+        self.assertFalse(self.worker.sessions)  # dead supervisor recovered first
+        self.assertEqual(self.task(1)['supervisor']['session'], 's-S1.1')
+        self.assertEqual(self.task(1)['raw']['order'], 'run')
+        self.run_cli('tick', '--quiet')
+        self.assertTrue(self.worker.sessions)
+
+    def test_runtime_file_boundary_with_fake_downstream(self):
+        path = self.root / 'hermes.py'
+        path.write_text("""def available(): return True
+def spawn(name, prompt, cwd):
+    assert name.startswith('S1 HRM ')
+    return 'fixture-native-session'
+def send(session, text): return session
+def alive(session): return True
+def link(session): return None
+def state(session): return 'idle'
+def retire(gone, running=True): pass
+""")
+        taskq.CONFIG['runtimes'] = {'hermes': 'hermes.py'}
+        adapter = taskq.Hermes(taskq.load_file('hermes.py'))
+        self.assertEqual(adapter.spawn('S1 HRM native (mac)', 'prompt', self.root), 'fixture-native-session')
+        self.assertEqual(adapter.state('fixture-native-session'), 'idle')
+        self.assertEqual(adapter.send('fixture-native-session', 'review #1'), 'fixture-native-session')
+
+    def test_missing_bridge_and_required_lifecycle_fail_closed(self):
+        item = {'pm': {'runtime': 'hermes', 'session': SESSION}}
+        with self.assertRaisesRegex(SystemExit, 'not configured'):
+            taskq.lead(item, {'codex': self.worker}, admit=True)
+        item['pm']['session'] = None
+        with self.assertRaisesRegex(SystemExit, 'genuine HERMES_SESSION_ID'):
+            taskq.lead(item, self.kinds, admit=True)
+        del self.native.available
+        with self.assertRaisesRegex(SystemExit, 'needs spawn/send'):
+            self.bridge.spawn('S1 HRM native (mac)', 'prompt', self.root)
+        self.native.available = lambda: True
+        with mock.patch.object(self.native, 'spawn', return_value=None):
+            with self.assertRaisesRegex(SystemExit, 'no genuine session id'):
+                self.bridge.spawn('S1 HRM native (mac)', 'prompt', self.root)
+        with self.native_env():
+            out = self.run_cli('arm', 'tick')
+        self.assertIn('No Codex resume route', out)
+        self.assertNotIn('codex exec', out)
+
+
 class TickSetup(Base):
     """Fixture only, no tests (#534, § 10): a fake runtime and a manager for Tick and Wait."""
 
@@ -613,7 +730,7 @@ class Tick(TickSetup):
         wrapper = '| [#7](https://board/7) | doing | codex | [019a-thr](https://alexkirs.github.io/taskq/open.html#codex://threads/019a-thread-full-id) |'
         sources = {'codex': {'CODEX_THREAD_ID': 'mgr'}, 'claude': {'CLAUDE_CODE_SESSION_ID': 'mgr'}, 'shell': {},
                    'claude from codex': {'CLAUDE_CODE_SESSION_ID': 'mgr', 'CODEX_THREAD_ID': 'x', 'TASKQ_RUNTIME': 'claude'},
-                   'unknown runtime': {'CODEX_THREAD_ID': 'x', 'TASKQ_RUNTIME': 'hermes'},
+                   'unknown runtime': {'CODEX_THREAD_ID': 'x', 'TASKQ_RUNTIME': 'grok'},
                    # #574: the final rendering client wins over the session running the command, never the worker's runtime
                    'final codex, run in claude': {'CLAUDE_CODE_SESSION_ID': 'mgr', 'TASKQ_CLIENT': 'codex'},
                    'final claude, run in codex': {'CODEX_THREAD_ID': 'mgr', 'TASKQ_CLIENT': 'claude'},
@@ -1363,7 +1480,9 @@ class Tick(TickSetup):
             taskq.CONFIG['limits'] = {'fake': 2}
             self.add('two')
             self.assertEqual((self.task(2)['state'], len(lead.names)), ('ready', 1))
-            self.assertIn('| [#2 two](https://board/2) | blocked (no manager) | any |  |', self.run_cli('tick'))
+            with self.assertRaisesRegex(SystemExit, 'Hermes native supervisor bridge is not configured'):
+                self.run_cli('tick')
+            self.assertIn('| [#2 two](https://board/2) | blocked (no manager) | any |  |', self.run_cli('status'))
 
     def test_one_controller_under_duplicate_events(self):
         # R3 (#525): run and close come from the supervisor, the manager or the owner; repeats spawn nothing more

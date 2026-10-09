@@ -12,7 +12,7 @@ TYPES = ('code', 'docs', 'research', 'asset')
 FIELDS = ('scope', 'deps', 'claim', 'result', 'supervisor', 'order', 'pm')
 PREFIX, RUN, ON = 'q-', 'run-', 'host-'
 BLOCK = re.compile(r'<!-- taskq:start -->\s*```json\n(.*?)\n```\s*<!-- taskq:end -->', re.S)
-SESSIONS = {'claude': 'CLAUDE_CODE_SESSION_ID', 'codex': 'CODEX_THREAD_ID'}
+SESSIONS = {'claude': 'CLAUDE_CODE_SESSION_ID', 'codex': 'CODEX_THREAD_ID', 'hermes': 'HERMES_SESSION_ID'}
 CONFIG, BOARD = {}, None  # set by main, or by a test
 CHECK_POLLS, CHECK_PAUSE = 60, 10  # pr-mode close waits up to 10 min for the 'tests' check / the MR pipeline
 
@@ -44,6 +44,11 @@ def worker_name(item, letter='T'):
 
 def session():
     """This agent session, or None for the owner's shell. TASKQ_RUNTIME picks one when a session inherited another's id."""
+    selected = os.environ.get('TASKQ_RUNTIME')
+    if (selected == 'hermes' or not selected and 'HERMES_SESSION_ID' in os.environ) and not os.environ.get('HERMES_SESSION_ID', '').strip():
+        fail('Hermes needs genuine HERMES_SESSION_ID from the native runtime/bridge')
+    if not selected and os.environ.get('HERMES_SESSION_ID') and any(os.environ.get(SESSIONS[r]) for r in ('claude', 'codex')):
+        fail('ambiguous Hermes identity: select TASKQ_RUNTIME explicitly')
     found = [r for r in SESSIONS if os.environ.get(SESSIONS[r]) and os.environ.get('TASKQ_RUNTIME', r) == r]
     return {'runtime': found[0], 'session': os.environ[SESSIONS[found[0]]]} if found else None
 
@@ -483,9 +488,53 @@ class Codex:
     def link(self, session):
         return f'{CONFIG.get("pages", "https://alexkirs.github.io/taskq/").rstrip("/")}/open.html#codex://threads/{session}'
 
+class Hermes:
+    """Admission guard over the existing runtime-file interface; no native transport or session registry."""
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+
+    def check(self):
+        required = ('spawn', 'send', 'alive', 'link', 'state', 'retire', 'available')
+        if not all(callable(getattr(self.adapter, name, None)) for name in required):
+            fail('Hermes native supervisor bridge needs spawn/send/alive/link/state/retire/available')
+        try:
+            ready = self.adapter.available()
+        except Exception as error:
+            fail(f'Hermes native supervisor bridge unavailable: {error}')
+        if ready is not True:
+            fail('Hermes native supervisor bridge unavailable')
+
+    def __getattr__(self, name):
+        return getattr(self.adapter, name)
+
+    def spawn(self, name, prompt, cwd):
+        self.check()
+        return self.identity(self.adapter.spawn(name, prompt, cwd))
+
+    def send(self, sid, text):
+        self.check()
+        return self.identity(self.adapter.send(sid, text))
+
+    @staticmethod
+    def identity(sid):
+        if not isinstance(sid, str) or not sid.strip():
+            fail('Hermes bridge returned no genuine session id')
+        return sid
+
+    def state(self, sid):
+        self.check()
+        state = self.adapter.state(sid)
+        if state not in ('running', 'idle', 'dead'):
+            fail('Hermes supervisor state unknown: admission stopped')
+        return state
+
 def runtimes():
     """claude, codex, and each `"runtimes": {"name": "runtimes/name.py"}` file of taskq.json."""
-    return {'claude': Claude(), 'codex': Codex(), **{name: load_file(path) for name, path in CONFIG.get('runtimes', {}).items()}}
+    extra = {name: load_file(path) for name, path in CONFIG.get('runtimes', {}).items()}
+    if 'hermes' in extra:
+        extra['hermes'] = Hermes(extra['hermes'])
+    return {'claude': Claude(), 'codex': Codex(), **extra}
 
 
 # --- commands -------------------------------------------------------------------------------
@@ -570,9 +619,12 @@ def cmd_move(args):
 
 def role(current):
     """Who runs this command for the task: supervisor, worker, manager, owner (a plain shell), or None (another session)."""
-    me = (session() or {}).get('session')
+    identity = session() or {}
+    me = identity.get('session')
     return 'owner' if not me else next((name for name, held in (('supervisor', current['supervisor']), ('worker', current['claim']),
-                                                                ('manager', current['pm'])) if me == (held or {}).get('session')), None)
+                                                                ('manager', current['pm'])) if me == (held or {}).get('session')
+        and ('hermes' not in (identity.get('runtime'), (held or {}).get('runtime'))
+             or identity.get('runtime') == (held or {}).get('runtime'))), None)
 
 def gate(current):
     """R3 one controller (#525): `run`, `close` and a rework `requeue` of a supervised task come from its supervisor, the
@@ -1116,18 +1168,24 @@ def supervise(item, kinds):
     n, boss, claim = item['iid'], item['supervisor'], item['claim'] or {}
     lead = kinds.get(boss['runtime'])
     if lead is None:
+        if boss['runtime'] == 'hermes':
+            fail('Hermes native supervisor bridge is not configured')
         return
     fresh = executable(BOARD.get(n))  # #532: the list may lag a spawn; #545: or an assignee-only label or reassignment
     if not fresh:
         return  # ineligible: sessions, claim and order stay as they are
-    if item['raw'].get('order') and claim.get('runtime') in kinds and fresh['raw'].get('order') and not (fresh['claim'] or {}).get('session'):  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
+    admitted = True
+    if boss['runtime'] == 'hermes':
+        state = lead_state(lead, boss['session'])  # prove bridge/state before admitting any worker action
+        admitted = state != 'dead'
+    if admitted and item['raw'].get('order') and claim.get('runtime') in kinds and fresh['raw'].get('order') and not (fresh['claim'] or {}).get('session'):  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
         kind = kinds[claim['runtime']]
         if not replace(item, kind, claim['runtime'], 'worker', running=True):
             return
         sid = spawn_named(item, kind, 'T', brief(item, claim['runtime']))
         item['claim'], item['raw']['order'] = {**claim, 'session': sid}, None
         move(item, 'doing', 'spawn', note('worker', sid, kind), claim=item['claim'], order=None)
-    elif item['state'] == 'doing' and claim.get('session') and claim.get('runtime') in kinds:
+    elif admitted and item['state'] == 'doing' and claim.get('session') and claim.get('runtime') in kinds:
         kind = kinds[claim['runtime']]
         live = kind.alive(claim['session'])
         if live is False:  # the supervisor decides: rework or ask
@@ -1210,9 +1268,15 @@ def direct():
     ponytail: CODEX_THREAD_ID cannot tell the Codex app from the CLI or IDE."""
     return (os.environ.get('TASKQ_CLIENT') or (session() or {}).get('runtime')) == 'codex'
 
-def lead(item, kinds):
+def lead(item, kinds, admit=False):
     """R3 (#532): the supervisor follows the task's own manager (DOT: Codex); None: no manager can start it here."""
     runtime = (item['pm'] or {}).get('runtime')
+    if runtime == 'hermes' and admit:
+        if not item['pm'].get('session'):
+            fail('Hermes manager needs genuine HERMES_SESSION_ID')
+        if runtime not in kinds:
+            fail('Hermes native supervisor bridge is not configured')
+        kinds[runtime].check()
     runtime = {'dot': 'codex'}.get(runtime, runtime)
     return runtime if runtime in kinds else None
 
@@ -1301,7 +1365,7 @@ def one_pass(args, table=True):
             busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
         for item in ready:
             if item['state'] != 'ready' or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']) \
-                    or not lead(item, kinds) or item['pm'].get('name') != here:
+                    or (item['pm'] and item['pm'].get('name') != here) or not lead(item, kinds, admit=True):
                 continue  # no manager: the task waits, the table says so; another machine's manager: that machine starts it (§ 7 step 3)
             names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
             free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 1)), None)
@@ -1546,6 +1610,10 @@ def cmd_arm(args):
              'repeated arm must not create duplicates. Keep paused projects paused. Prove an idle-manager wake and the next wait; '
              'printed output is not proof. No supported access to the existing sender: report one blocker through the existing task, '
               'never create a replacement sender or bridge. See § 7 Arm the tick.\n')
+    if runtime == 'hermes':
+        return print(action + 'Hermes manager wake/event delivery requires the configured native external bridge. '
+                     'No background wake, restart durability or unattended event delivery is verified; '
+                     'outcomes remain on the board until read. No Codex resume route.')
     start = action + ('Start: run one pass now (`taskq tick`, outside a Codex sandbox). From then on the approved queue runs by itself (R4): '
              'supervisors, workers, reviews, reworks, closes and the next task start on queue events and Codex turn ends; '
              'no sender, timer or extension. Arming below only brings you the short outcomes.\n')

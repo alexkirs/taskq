@@ -52,13 +52,15 @@ Changed: one worker session → one supervisor and one worker session per task, 
 
 Each task has one manager, its `pm` (§ 3): the session that filed it, with its runtime and machine, recorded by `add`
 on the task's block. The board is the only authority (R1): the task's `pm` decides its supervisor's runtime (Claude
-manager: Claude supervisor; Codex or DOT manager: Codex supervisor) and machine, which manager passes its gate (§ 4)
+manager: Claude supervisor; Codex or DOT manager: Codex supervisor; Hermes manager: native Hermes supervisor) and machine, which manager passes its gate (§ 4)
 and whose `taskq wait` gets its outcomes (R4); the worker's runtime is chosen separately (`run-*`, `limits`).
 `.taskq/pm.json` holds only the contract hash (§ 7), never authority. Managers of several runtimes (a Claude and a
 Codex manager) share one checkout and board: `taskq pm` of one never moves another's task, and a task's supervisor
 never changes runtime after it started (an active claim is never re-bound, R2).
 Changed: the supervisor followed this machine's manager, the last session to run `taskq pm` (`.taskq/pm.json`) → it
 follows the task's own `pm` on the board; a second manager's `taskq pm` re-routed every task and took the gate (#532).
+Changed: Hermes had no native identity/admission contract → explicit `HERMES_SESSION_ID` and a configured native
+Hermes runtime-file bridge, never a Codex supervisor fallback (owner-authorized local candidate, 2026-10-09; § 8).
 The tick names every supervisor `S<N> <ORCH> <title> (<machine>)` and every worker `T<N> <ORCH> <title> (<machine>)`,
 ORCH the launching orchestrator (CLD Claude, CDX Codex, DOT Codex cloud, HRM Hermes, GRK Grok, UNK a shell) (#268,
 restored in 829d6c3): the runtime of the task's `pm` on the board, never the worker's runtime or the session whose
@@ -134,6 +136,9 @@ the queue to move; a separate sender is only one way to wake a manager that cann
 Changed: dispatch eligibility used only host/PM/filter routing → an `assignee-only` task also needs the authenticated
 board identity, judged on a fresh read of the task (never the list, whose labels may lag) before every start,
 continuation or session send; manual `take` uses the same policy (#545, #576).
+
+Hermes limitation (local candidate, § 8): the native bridge must supply turn/event delivery and manager wake;
+without that qualified bridge the unattended lifecycle above is unverified (R12).
 
 ### R5. Worker writes completion to the task
 
@@ -491,7 +496,7 @@ Runtime file: four module-level functions, three more optional.
 |---|---|
 | `taskq add "<title>" --goal G --acceptance A [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 1\|2] [--host H]` | new task: `q-ready`, or `q-waiting` with open deps |
 | `taskq list [state]` | open tasks by state, priority, number |
-| `taskq take N` | claim a ready task for this session (needs `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`) |
+| `taskq take N` | claim a ready task for this session (needs `CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID` or genuine `HERMES_SESSION_ID`) |
 | `taskq ask N --text Q [--option O ..] [--recommend K] [--link URL ..]` | worker or supervisor asks the owner: `doing` or `review` → `ask`; the options make the decision card (§ 7) |
 | `taskq answer N --text A` | the owner's answer: `ask` → `doing` |
 | `taskq answer N.K [M.K ...]` | pick option K of each task's card, all checked first (#490): an `ask` → `doing` with the option's text; a `review` → `close` when the option starts with `close`, else → `doing` with the option's text. Codes may be one quoted string: `'43.1 44.2'` |
@@ -905,7 +910,7 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
   recorded workers, never itself; the pass retires it once its turn ended. Inside a Codex sandbox `close` retires
   nothing (#502); the next pass outside does.
 - A worker never inherits the tick's session id: `taskq.py` removes `CLAUDE_CODE_SESSION_ID` and
-  `CODEX_THREAD_ID` from its environment.
+  `CODEX_THREAD_ID` and `HERMES_SESSION_ID` from its environment.
 - A session that carries both ids (a Claude session started from Codex): set `TASKQ_RUNTIME` to the right one.
 - Add `.taskq/` and `.worktrees/` to the project's `.gitignore`.
 - Claude: the Remote Control link needs a claude.ai subscription login; without it the worker has no link.
@@ -914,6 +919,34 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
   tool's background mode (Claude: `run_in_background`).
 - Codex on macOS: the `workspace-write` sandbox denies the GPU, so Metal apps (Blender) exit 139 (#157). Run such a
   task with `--runtime claude`.
+
+### Native Hermes admission (local candidate)
+
+`TASKQ_RUNTIME=hermes` requires a nonempty `HERMES_SESSION_ID` supplied by the genuine Hermes runtime/bridge;
+TaskQ never invents it or substitutes `CODEX_THREAD_ID`. With several native IDs present, select the runtime
+explicitly; an ambiguous Hermes identity is refused. A Hermes PM without a session cannot admit work.
+The task's board `pm` routes to Hermes only; `run-codex` selects the worker independently. Hermes controller
+authority matches both runtime and session: a Codex identity with the same text cannot impersonate Hermes.
+
+Configure the existing `runtimes` file interface with key `hermes`. No built-in Hermes CLI adapter is provided:
+the local CLI has no documented external spawn/steer/resume command. The file must implement the four required
+functions plus `state`, `retire` and `available()`. `available()` returns exactly `True` only when the native
+external supervisor bridge is usable. Missing configuration, functions, unavailable bridge or unknown/invalid
+supervisor state stop admission visibly before worker spawn/send; the board claim/order stays intact. `state`
+must distinguish `running`, `idle`, `dead` and unknown (`None`); `alive=False` alone cannot stand in for it.
+Spawn/send return only genuine nonempty Hermes session IDs and confirm the native session name (R3); the bridge
+injects that session's own identity, using the sanitized `worker_env()` for child processes. The adapter owns
+native transport, never task authority or a duplicate session registry. TaskQ cannot authenticate environment
+provenance or prove transport receipt from a returned ID (R12).
+
+Supported external integration is through Hermes ACP/TUI JSON-RPC/API, not an invented CLI command. Public
+subagent lifecycle is restart-nondurable: a bridge must report lost sessions as dead, never infer idle from
+process exit. A dead supervisor is recovered before a pending worker order is admitted.
+Existing board-driven bounded recovery applies; no durable restart or unattended event delivery
+is claimed. The bridge must arrange a pass after native turns/events where needed and prove receipt, lifecycle,
+retirement and manager wake before real qualification. Hermes `arm tick` reports these gaps, without promising
+Claude background wake or Codex resume. This candidate is local-only: no live pilot, main publication or deployment
+without an available genuine bridge and approved isolated changed-boundary proof (§ 10).
 
 ## 9. Windows
 

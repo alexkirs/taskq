@@ -325,6 +325,11 @@ Owner decisions on what taskq looks and sounds like, one line each (#505). Chang
 
 1. python3 >= 3.9, git; `gh` (GitHub) or `glab` (GitLab) installed and logged in: `gh auth status` / `glab auth status`.
    Workers need the `claude` and/or `codex` CLI.
+   Self-managed GitLab: its admin creates an OAuth application once (Admin Area > Applications; redirect URI
+   `http://localhost:7171/auth/redirect`, scopes `openid profile read_user write_repository api`, not confidential)
+   and writes its Application ID to `glab_client_id` in `taskq.json`. The agent does not run the login: glab's prompts
+   need a real terminal. It gives the user two lines for their own terminal, unjoined (Windows PowerShell 5.1 has no `&&`):
+   `glab config set client_id <glab_client_id> -g --host <host>` and `glab auth login --hostname <host> --web`.
 2. `git clone https://github.com/alexkirs/taskq ~/taskq`; `taskq.py` is the only file it needs. Alias:
    `ln -s ~/taskq/taskq.py ~/.local/bin/taskq` or `alias taskq='python3 ~/taskq/taskq.py'` (Windows: § 9).
    Update: `git pull` in the clone; `taskq tick` and `taskq wait` pull it themselves, so keep it on clean `main`.
@@ -357,6 +362,7 @@ Owner decisions on what taskq looks and sounds like, one line each (#505). Chang
 | `board` | `github`, `gitlab`, or a `.py` file relative to the root | `github` |
 | `repo` | `owner/repo` (GitHub) or `group/project` (GitLab) | required for github/gitlab |
 | `host` | Enterprise or self-managed host | the CLI's default |
+| `glab_client_id` | Self-managed GitLab: the OAuth Application ID users give `glab` before login (§ 1) | none |
 | `publish` | `direct` or `pr` (§ 6) | `direct` |
 | `workspace` | `external`: the host owns the worker's worktree and branch `taskq-<N>`; taskq never creates or removes them (§ 5, § 6) | taskq-owned `.worktrees/taskq-<N>` |
 | `limits` | Workers per runtime on this machine; `0` turns a runtime off | 1 per runtime |

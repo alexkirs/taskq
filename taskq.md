@@ -60,24 +60,28 @@ decision 2026-10-09, #524): the manager's context stays clean, it thinks in task
 not a reviewer started only after the result. The #284/#291 forks and the #270 sandbox are handled as
 [docs/supervisor.md](docs/supervisor.md) § 2 says; topologies it cannot serve are blockers there (§ 5), not bypassed.
 
-Transition (#524 → #525). This file states the accepted model first; the executable follows in #525. Until #525
-ships, `taskq.py` has no `S<N>`, no `supervisor` field, no `run`, no `wait --task` and no runtime or id in
-`pm.json`: each item marked *planned (#525)* below is not yet a command. Until then, and after it for every task
-whose block has no `supervisor` (every task started before #525 ships, #525 itself among them), the unsupervised path
-holds: the pass spawns and follows the worker (§ 7 step 2 and step 3 unsupervised), `wait` prints `review #N`, and
-the manager reviews the exact head and closes or requeues it (§ 7 Unsupervised review). No such task is orphaned. The
-unsupervised path is a migration path only, not a substitute: the accepted model is the full task supervisor.
+Transition (#525 shipped). Every task whose block has no `supervisor` (started before #525, #525 and #526 among
+them, or claimed by hand with `take`) keeps the unsupervised path to its end: the pass follows its worker (§ 7 step
+2), `wait` prints `review #N`, and the manager reviews the exact head and closes or requeues it (§ 7 Unsupervised
+review). No such task is orphaned. The unsupervised path is a migration path only, not a substitute: every task the
+pass starts gets its supervisor. A machine with no manager recorded (`taskq pm` writes its runtime to
+`.taskq/pm.json`) starts no task: a ready task waits and the table says `ready (no manager)` (§ 7 step 3).
+Changed: a pass with no manager spawned `T<N>` itself → it starts nothing; the supervisor's runtime has no source (#525).
 
 ### R4. Tick is a message or a queue event
 
 A tick is one pass (§ 7), started by a message or by a queue event. A sender runs `taskq tick`; received means one
 pass, not received means nothing. `add`, `answer`, `run`, `result`, `requeue` and `close` start the same pass once after their
-move, in a detached `taskq tick --quiet` child, and return at once: the queue chains itself. The child writes to
-`.taskq/dispatch.log`; a child that finds the dispatch lock busy exits. The manager is woken only when it has work: a
-sender session loops `taskq wait`, which blocks until a task enters `ask` or closes, an unsupervised task (R3
-Transition) enters `review`, a local session is gone, or a
-safety window (10 min) passes, and sends its output to the manager, who then runs a pass. One sender per machine, armed
-with `taskq arm tick <manager>` (§ 7 Arm the tick). A pass starts only tasks with no `host-*` label or its own machine's.
+move, in a detached `taskq tick --quiet` child, and return at once: the queue chains itself. Every `codex exec` turn
+the runtime starts (a spawn or a resume, `S<N>` or `T<N>`) also gets one detached `taskq tick --quiet --after <pid>`
+that runs the pass when that turn's process exits: a sandboxed Codex session's own commands start no pass (#502), so
+its `run`, `result`, `requeue` or `close` takes effect at its turn's end. The children write to `.taskq/dispatch.log`;
+a child that finds the dispatch lock busy exits. After setup and one `taskq pm`, an approved queue runs by itself:
+workers, supervisor wakes, reviews, reworks, closes and the next task need no owner message, no sender session and no
+timer (owner clarification 2026-10-09, #525). The manager is woken only for its short outcomes: `taskq wait` blocks
+until a task enters `ask` or closes, an unsupervised task (R3 Transition) enters `review`, a local session is gone, or
+a safety window (10 min) passes (§ 7 Arm the tick). A pass starts only tasks with no `host-*` label or its own
+machine's.
 Changed: "a tick on another machine never coordinates" → every machine's tick runs the same pass for its own claims
 and hosts; there is no coordinator machine (#290).
 Changed: "a tick is a message" → a tick is a message or a queue event; spawn no longer waits for the next sent tick (#333).
@@ -88,9 +92,12 @@ Changed: a Codex sender always sent with `codex exec resume` → only to a threa
 gets no resume and no promised wake (an app thread fails `no rollout found`, #269), only a prompt for an independent
 Codex app session that can send to it; a failed wait or send stops the sender with a blocker (#522).
 Dispatch needs no sender and no periodic tick (owner clarification 2026-10-09, #522): the event chain above starts
-workers. The sender only wakes the manager for `ask`, `closed`, `gone` and an unsupervised `review` (#524); with no
+workers. A sender only wakes the manager for `ask`, `closed`, `gone` and an unsupervised `review` (#524); with no
 working sender they wait until the manager is next talked to. #524 changes only which events `wait` prints; the
 sender's routes, its one-blocker stop and the Codex rollout rule above stay as #522 set them.
+Changed: a sandboxed Codex supervisor's or worker's commands waited for a pass from a sender, a manager tick or a
+scheduler → the pass at its turn's end runs them (#525). The owner runs no sender, timer or lifetime extension for
+the queue to move; a separate sender is only one way to wake a manager that cannot wake itself (§ 7).
 
 ### R5. Worker writes completion to the task
 
@@ -156,8 +163,9 @@ manager's or owner's `requeue`). A rejected result is a rework `requeue` with th
 the branch, never a resumed one (#291).
 
 - Which: the task's recorded sessions only: the block's `claim` and `supervisor` and every id its history records
-  (`spawn` and `take` notes, as `cleanup` does, #478; and the `nudge` note of a Claude `send`, which #525 makes
-  name the id it replaced), which covers duplicate spawns and resume copies (#360).
+  (`spawn`, `nudge` and `gone` notes, matched as a whole id; the `take` note's `<runtime>:<id[:8]>`, as `cleanup`
+  does, #478). A `spawn` note reads `supervisor <id>` or `worker <id>`, then the link; a `nudge` note of a Claude
+  `send` reads `worker <new> replaces <old>`. This covers duplicate spawns and resume copies (#360).
   Never a session found by name only, never one of another task or project.
 - `close` on the claim's machine: stops and removes the recorded worker sessions, running or not, and the clean
   worktree and branch (§ 6; #300, #302). It never stops the session that runs it: a supervisor ends its turn after
@@ -165,9 +173,10 @@ the branch, never a resumed one (#291).
 - Each pass: removes the recorded sessions on its machine, stopped only, of tasks not open and of replaced sessions.
   A supervisor is never stopped mid-turn; it is retired once stopped.
 
-Current executable until #525 (R3 Transition): sessions are matched by the `T<N> ` name prefix and the task number
-on this machine, not by recorded id; `close` stops running ones too, the pass stopped ones only; no `S<N>` exists.
-#525 replaces the name match with the recorded ids above; nothing else changes.
+- The runtimes find their own sessions by name (`T<N> `/`S<N> ` Claude jobs, `.taskq/T<N>.pid`/`S<N>.pid` Codex
+  handles); the name only finds candidates, the recorded id decides. A closed task's block keeps `claim` and
+  `supervisor` as its record.
+Changed: sessions were matched by the `T<N> ` name prefix and the task number → by recorded id (#525).
 Changed: `close` stops every `T<N>` session by name; the pass removes stopped ones → one rule for `T<N>` and `S<N>`:
 recorded ids only, the running supervisor left to the pass (#524).
 Changed: "supervisor retires its worker; cleanup ends sessions without a task" → `close` does it; no cleanup command
@@ -215,7 +224,8 @@ Owner decisions on what taskq looks and sounds like, one line each (#505). Chang
    project root and accept the folder trust prompt (only the owner can); else every spawn fails `Workspace not trusted`.
    Log in once with the same `claude` the tick starts: `claude auth login`. Codex workers: `codex login` once; they
    use your Codex model and config. Add `.taskq/` and `.worktrees/` to the project's `.gitignore`.
-5. Try it: `taskq pm` in your agent session (it takes the manager role), `taskq arm tick`, then
+5. Try it: `taskq pm` in your agent session (it takes the manager role and records its runtime: supervisors run in
+   it), then
    `taskq add "Try taskq" --type research --goal "Reply: taskq works. No file changes." --acceptance "The result says: taskq works."`;
    the worker hands in (`taskq list` shows `review`); accept with `taskq close N --text "Checked the reply."`.
 6. Another board or runtime: copy the GitHub class or the Claude class of `taskq.py` into `boards/<name>.py` or
@@ -263,7 +273,7 @@ With `"assignee": "me"` the file also needs `user()`: the current login.
 | `comment(n, text)` | append one comment |
 | `close(n)` | close the issue |
 
-Runtime file: four module-level functions, two more optional.
+Runtime file: four module-level functions, three more optional.
 
 | Function | Does |
 |---|---|
@@ -271,8 +281,9 @@ Runtime file: four module-level functions, two more optional.
 | `send(session, text)` | deliver one message; returns the session id (it may change) |
 | `alive(session)` | `True` running, `False` gone, `None` cannot tell |
 | `link(session)` | a URL the owner opens to watch the session, or `None` |
-| `retire(gone, running=True)` | optional: stop and remove this machine's `T<N>` sessions with `gone(N)` true; `close` calls it for its task, the tick for tasks no longer open with `running=False` |
+| `retire(gone, running=True)` | optional: stop and remove this machine's `T<N>`/`S<N>` sessions with `gone(N, session, live)` true; `close` calls it for its task's recorded workers, the tick with `running=False` for recorded sessions of tasks not open or replaced (R11) |
 | `tail(session)` | optional: the session's last log line, for the ask after a second quick death (§ 7) |
+| `state(session)` | optional: a supervisor's `running`, `idle`, `dead` or `None` (§ 7 step 4); without it `alive` stands in |
 
 ## 3. Data model
 
@@ -300,9 +311,12 @@ Runtime file: four module-level functions, two more optional.
 ```
 
 - `decision` (#490): set by `ask` and `result` from `--option`, `--recommend`, `--link`; cleared by `answer` and `requeue`.
-- `supervisor` (#524, *planned (#525)*): `{"runtime", "session", "name"}` of `S<N>`, same shape as `claim` (the worker's). Set by the
-  pass that spawns it, replaced by the pass that respawns a dead one; cleared with `claim` when the task closes,
-  parks, or the manager or owner requeues it.
+- `supervisor` (#524, #525): `{"runtime", "session", "name"}` of `S<N>`, same shape as `claim` (the worker's). Set by the
+  pass that spawns it, replaced by the pass that respawns a dead one; cleared with `claim` and `order` when the task
+  parks (`later`) or the manager or owner requeues it; kept as the record when the task closes (R11).
+- `claim` of a supervised task: set with `session` null by the pass that starts `S<N>` (it holds the worker's slot,
+  `runtime` the worker's), its `session` filled by the worker's spawn and emptied when that worker is gone or requeues.
+- `order` (#525): `"run"` or `"rework"`, set by `run` or the supervisor's `requeue`; the pass spawns `T<N>` and clears it.
 
 - History: every command posts one comment `**<action>** · <runtime>:<session 8>` (or `owner`), then its text.
   An agent session (the manager too) is named by its own session; a plain shell is `owner`.
@@ -318,18 +332,18 @@ Runtime file: four module-level functions, two more optional.
 | `taskq add "<title>" --goal G --acceptance A [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 1\|2] [--host H]` | new task: `q-ready`, or `q-waiting` with open deps |
 | `taskq list [state]` | open tasks by state, priority, number |
 | `taskq take N` | claim a ready task for this session (needs `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`) |
-| `taskq ask N --text Q [--option O ..] [--recommend K] [--link URL ..]` | worker asks the owner: `doing` → `ask`; the options make the decision card (§ 7) |
+| `taskq ask N --text Q [--option O ..] [--recommend K] [--link URL ..]` | worker or supervisor asks the owner: `doing` or `review` → `ask`; the options make the decision card (§ 7) |
 | `taskq answer N --text A` | the owner's answer: `ask` → `doing` |
 | `taskq answer N.K [M.K ...]` | pick option K of each task's card, all checked first (#490): an `ask` → `doing` with the option's text; a `review` → `close` when the option starts with `close`, else → `doing` with the option's text. Codes may be one quoted string: `'43.1 44.2'` |
 | `taskq result N --sha SHA [--checks C] [--text T] [--option O ..] [--recommend K] [--link URL ..]` | hand in: `doing` → `review`; options: the owner must choose (§ 7) |
-| `taskq run N` | *planned (#525)*. The recorded supervisor orders its worker: the next pass on its machine spawns `T<N>` (§ 7) |
-| `taskq requeue N [--text T]` | drop claim and result: any state → `ready`. *Planned (#525)*: by the recorded supervisor (rework): keeps `supervisor`, the task stays `doing` and the next worker is ordered as by `run`. By the recorded worker (cannot be done): drops only its claim and wakes the supervisor |
-| `taskq later N [--text T]` | park: any state → `later` |
+| `taskq run N` | the recorded supervisor orders its worker: `doing` with no worker session, sets `order`; its event pass spawns `T<N>` (§ 7) |
+| `taskq requeue N [--text T]` | drop claim, supervisor and result: any state → `ready`. By the recorded supervisor (rework): keeps `supervisor`, the task goes to `doing` and the next worker is ordered as by `run`; refused once 3 workers were spawned since the last `answer` (ask the owner). By the recorded worker of a supervised task (cannot be done): drops only its claim session; the supervisor gets `requeue #N` |
+| `taskq later N [--text T]` | park: any state → `later`; drops claim and supervisor |
 | `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
-| `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4) |
-| `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed; print `ask #N`, `review #N` (an unsupervised task, R3 Transition), `closed #N <text>` (*planned (#525)*; today `review #N` for every task), `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7) |
-| `taskq wait --task N` | *planned (#525)*. The supervisor's wait: block until its task needs it; print `review #N`, `ask #N`, `answer #N`, `gone #N` (its worker), `requeue #N` (by its worker) |
-| `taskq pm` | print the manager role (Principles, § 7, how to tick this session) under a first line `taskq pm contract <hash>`; record the hash of the clone's `taskq.md` in `.taskq/pm.json`, and (*planned (#525)*) this session's runtime and id (§ 7) |
+| `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4); `--after PID`: first wait for that Codex turn's process to end (R4) |
+| `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed; print `ask #N`, `review #N` (an unsupervised task, R3 Transition), `closed #N <text>` (a supervised task), `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7) |
+| `taskq wait --task N [--window MIN] [--every SEC]` | the supervisor's wait: block until its task needs it; print `review #N`, `ask #N`, `answer #N`, `gone #N` (its worker), `requeue #N` (by its worker), one line each, each once (`.taskq/S<N>.seen`); `stop #N` when the task is closed or the calling session is not its supervisor; `tick` after the window |
+| `taskq pm` | print the manager role (Principles, § 7, how to tick this session) under a first line `taskq pm contract <hash>`; record the hash of the clone's `taskq.md`, this session's runtime and id in `.taskq/pm.json` (§ 7) |
 | `taskq cleanup [--dry-run]` | the owner's manual sweep of this machine (below); `--dry-run` prints the same and changes nothing |
 | `taskq arm tick [<manager>]` | print the prompt for a tick-sender session of this runtime (Codex: `exec resume` only for a thread with a local rollout, § 7); without `<manager>`: how this session ticks itself (a background `taskq wait` that wakes it) (§ 7) |
 
@@ -337,14 +351,15 @@ Runtime file: four module-level functions, two more optional.
 - `--runtime` default `any`; `--type` default `code`; `--priority` default 2. `--host` takes a machine name (§ 2 `hosts`).
 - `--acceptance` is required; for a `research` task it names what the answer must say.
 - `add` prints `#<N> <state>`; every state change prints the new state.
-- `add`, `answer`, `result`, `requeue` and `close` then start one tick pass without the table in a detached child
+- `add`, `answer`, `run`, `result`, `requeue` and `close` then start one tick pass without the table in a detached child
   (R4) and return at once. The event's line (`<time> <command> #<N>`), the pass's output and a failure
   (`taskq: dispatch stopped: <error>`) go to `.taskq/dispatch.log` and never fail the command. The child reads the
   event's tasks by number: the board's list may not show a write made a second earlier.
 - A command refuses a task in the wrong state and says which state it is in.
-- One controller (R3, #524, *planned (#525)*): `run`, `close` and a rework `requeue` of a task with a `supervisor` come from that
-  recorded session. Another agent session is refused, except this machine's manager (`.taskq/pm.json`) on the
-  owner's word and a plain shell (`owner`); their `requeue`, `later` or `close` drops the supervisor (R11 retires it).
+- One controller (R3, #524, #525): `run`, `close` and `requeue` of a task with a `supervisor` come from that
+  recorded session. Another agent session is refused (its worker too, except the worker's own `requeue` above),
+  except this machine's manager (`.taskq/pm.json`) on the owner's word and a plain shell (`owner`); their `requeue`
+  or `later` drops the supervisor (R11 retires it once stopped).
 - `cleanup` (#476), on demand only, never run by a tick or an event. After `git fetch --prune origin` (#515: a branch
   already deleted on the remote is neither reported nor pushed) it removes, for tasks not open: a clean
   `.worktrees/taskq-<N>` (`git worktree remove`); a local or `origin` branch `taskq-<N>` with nothing unmerged (an ancestor of `origin/main`, or a squash-merged one: merging it into `origin/main` changes no file;
@@ -448,7 +463,10 @@ run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#4
 
 ### Arm the tick
 
-No fixed interval (#407): the manager is woken only when it has work.
+No fixed interval (#407): the manager is woken only when it has work. The queue itself needs none of this (R4,
+#525): an approved task runs to `closed` and the next one starts on queue events and Codex turn ends. Arming only
+brings the manager its short outcomes (`ask`, `closed`, `gone`); a Claude manager arms itself with a background
+`taskq wait`, no separate session.
 
 1. In the project root run `taskq arm tick "<manager>"` (its session name, id or link). It prints the prompt for
    this runtime: loop { `taskq wait`; send its output to `<manager>` (Claude: `SendMessage`; Codex: below) }.
@@ -471,10 +489,11 @@ No fixed interval (#407): the manager is woken only when it has work.
    An agent sender forwards only while its own turn runs: it stays in that one active turn and repeats wait, send
    without ending it between events. An ended sender turn or a wait left running alone forwards nothing; taskq
    promises no unattended lifetime beyond a sender that is running (#522).
-2. Start a separate sender session on that prompt. It does no task work.
+2. Optional: start a separate sender session on that prompt. It does no task work. The queue never needs it (R4):
+   it only carries the manager's short outcomes to a manager that cannot wake itself.
 3. `taskq wait` lists the board every 25 s and returns at once with one line per new event: `ask #N`,
    `review #N` (an unsupervised task only; a supervised one's review is its supervisor's, #524),
-   `closed #N <the supervisor's close text>` (*planned (#525)*), `gone #N` (an unsupervised worker, or a supervisor
+   `closed #N <the first line of the close text>` (a supervised task), `gone #N` (an unsupervised worker, or a supervisor
    found dead by step 4, claimed on this machine), or `tick` when nothing happened for 10 min. `.taskq/wait.json` keeps the states last reported, so an event is printed once (a runtime handle, R1).
 4. The manager treats any message from the sender as a tick: one pass (`taskq tick`), then § After each pass. A
    stalled worker (120 min silent) is nudged by the pass the `tick` line starts.
@@ -491,8 +510,7 @@ No fixed interval (#407): the manager is woken only when it has work.
 ### One tick pass
 
 1. `waiting` with every dep closed → `ready`.
-2. `doing`, claimed on this machine, no `supervisor` (R3 Transition: every task until #525 ships; after it, one
-   started before it or taken by hand, § 5): `alive` False → requeue (`session ... is gone`); the second such requeue since
+2. `doing`, claimed on this machine, no `supervisor` (R3 Transition: started before #525 or taken by hand, § 5): `alive` False → requeue (`session ... is gone`); the second such requeue since
    the last `result` or `answer` → `ask` instead, with the last log line (`tail`; Codex: `.taskq/T<N>.log`, Claude:
    `claude logs`), and no new spawn (#393). Alive and the issue unchanged
    for 120 minutes → `send(session, 'continue: read your issue')`, comment `nudge`. Alive and the last comment an
@@ -501,37 +519,43 @@ No fixed interval (#407): the manager is woken only when it has work.
    `limits`), a manager on this machine (`.taskq/pm.json`; none: the task waits, the table says `no manager`) →
    `spawn(S<N> <ORCH> <title> (<machine>), supervisor brief, root)` in the manager's runtime (R3) (ORCH: CLD, CDX,
    DOT, HRM, GRK of the launcher, UNK from a shell), record `supervisor`, `q-doing`, comment `spawn` (with the
-   session link when the runtime has one yet). The slot is the worker's: it is held from here to `close`.
-   *Planned (#525)*; until then (R3 Transition) the same task gets `spawn(T<N> <ORCH> <title> (<machine>), brief,
-   root)`, `claim`, `q-doing` and comment `spawn` instead, and step 2 follows it.
-4. Supervised tasks claimed on this machine (*planned (#525)*; the pass is the supervisor's hands, never its judge):
+   session link when the runtime has one yet), and `claim` with no session: the slot is the worker's, held through
+   `doing`, `review` and `ask` until `close`, `later` or the manager's `requeue`. DOT counts as Codex.
+4. Supervised tasks whose supervisor runs on this machine (the pass is the supervisor's hands, never its judge):
    - an order (`run`, a rework `requeue`) with no live worker → `spawn(T<N> <ORCH> <title> (<machine>), brief,
      root)`, record `claim`, comment `spawn`. A requeue spawns a new worker that continues branch `taskq-<N>` (#291).
    - the supervisor's state. `alive` alone cannot tell: a Codex supervisor's process exits at the end of every turn,
      by design. From what the pass can read:
-     - running. Codex: the pid in `.taskq/S<N>.pid` runs. Claude: `claude agents` lists it with a pid and a state not
-       `done`, `failed` or `stopped`.
+     - running. Codex: the pid in `.taskq/S<N>.pid` runs; the pass at its turn's end (R4) delivers what came
+       meanwhile. Claude: `claude agents` lists it with a pid; its own background `taskq wait --task N` delivers.
      - idle, the expected state between events. Codex: the pid has exited, the last turn in `.taskq/S<N>.log` (after
        its last `turn.started`) ended `turn.completed`, and the thread's rollout is local (the #522 check of
-       `$CODEX_HOME/sessions`). Claude: listed with a pid; which `state` a `claude --bg` job shows after its turn
-       ended with a background `taskq wait --task N` still running is unverified (R12, docs/supervisor.md § 5.2);
-       #526 records it. Idle is never respawned, never reported `gone`, never an `ask`.
+       `$CODEX_HOME/sessions`). Claude: listed with no pid and not `failed` (its process ended). Whether a
+       `claude --bg` job keeps its pid while its background wait runs is unverified (R12, docs/supervisor.md § 5.2);
+       either way it is woken: by its wait, or by the pass's resume. #526 records it. Idle is never respawned, never
+       reported `gone`, never an `ask`. A runtime file may define
+       `state(session)`; without it `alive` stands in (False: dead).
      - dead: anything else of the recorded supervisor of an open task. Codex: no pid file, the last turn ended
-       `turn.failed`, `error` or with no terminal event (killed), or no local rollout. Claude: not listed, or listed
-       with no pid (nothing left to wake it).
+       `turn.failed`, `error` or with no terminal event (killed), or no local rollout. Claude: not listed, or
+       `failed` with no pid.
    - an event for the supervisor (`review`, `ask` by the worker, `answer`, worker `gone`, a worker's `requeue`):
-     Codex supervisor idle → `send(supervisor, '<event> #N: read your issue')` (`exec resume` keeps the thread id);
-     running → the next pass. A Claude supervisor is never sent to: its own background `taskq wait --task N` wakes
-     it (a `send` would fork it, #284).
+     idle → `send(supervisor, '<event> #N ...: read your issue')` with every event since it last got them
+     (`.taskq/S<N>.seen`: `<id> <comment count>`, a runtime handle; none yet: since its `spawn` note), once. Codex
+     `exec resume` keeps the thread id; a Claude resume makes a new id (#284): the pass records it as `supervisor`
+     with comment `nudge` `supervisor <new> replaces <old>`, so the old id is refused (§ 4) and retired once stopped.
+     Running → nothing: it gets them from its own `taskq wait --task N` (Claude) or at its turn's end (Codex, R4).
+     Its own `ask` and `requeue` are no event.
    - a dead supervisor: comment `gone` with the evidence (the log's last event, or the listed state). Bounded
      recovery: the first death since the last `result` or `answer`, Codex with a local rollout → one `exec resume`
      of the same thread (`'restart #N: your last turn ended <event>; read your issue'`), same id; otherwise respawn
      `S<N>`, replace `supervisor`, comment `spawn`, retire the old id (R11); the worker keeps running and the new
      supervisor adopts it from the board. The second death → `ask` with `tail`, no resume, no respawn (#393).
-   - a recorded worker `alive` False → comment `gone` and wake the supervisor as above; the supervisor decides
-     (rework `requeue` or `ask`; a second death is an `ask`, as in step 2). A supervisor's `nudge` comment, or an
-     `answer` to its worker's `ask` → `send(worker, text)`, as in step 2.
-   - closed, parked or requeued by the manager: retire the recorded `S<N>` and `T<N>` once stopped (R11).
+   - a recorded worker `alive` False → comment `worker <id> is gone`, empty the claim's session (the slot stays) and
+     wake the supervisor as above; the supervisor decides (rework `requeue` or `ask`). A supervisor's plain comment
+     `nudge: <text>` as the last comment, an `answer` as the last comment, or 120 silent minutes →
+     `send(worker, text)`, comment `nudge`, as in step 2.
+   - closed, parked or requeued by the manager, or a replaced session: retire the recorded `S<N>` and `T<N>` once
+     stopped (R11; the pass, for every task it lists or reads).
    `later`, an `ask` of the supervisor: nothing; they wait for the owner.
 5. Print the R6 markdown table `| Task | State | Runtime | Session |` by priority, then number; then `Board: <url>`.
    Another machine's claim shows its bare session id: only that machine can link it. A Codex link is direct when
@@ -543,19 +567,20 @@ No fixed interval (#407): the manager is woken only when it has work.
 The event pass of R4 is steps 1–4 run by `taskq tick --quiet`, the detached child of `add`, `answer`, `run`,
 `result`, `requeue` or `close`, no table. A worker's `result` wakes its supervisor (an unsupervised one's waits for
 the manager's review); a `close` frees the slot for the next task on that machine. Run from `.worktrees/taskq-<N>`, taskq takes the checkout above it as the
-project root. Inside a Codex sandbox no pass runs (#502): a sandboxed supervisor's `run`, `requeue` or `close` waits
-for the next pass outside it on that machine (docs/supervisor.md § 5).
+project root. Inside a Codex sandbox no pass runs (#502): a sandboxed supervisor's `run`, `requeue` or `close` takes
+effect in `taskq tick --quiet --after <pid>`, the pass the runtime left for that turn's end (R4).
 Changed: the pass spawned workers and the manager reviewed → the pass spawns one supervisor per task and runs its
 orders; the supervisor reviews (#524).
 
 ### Supervisor
 
-*Planned (#525)*: no `S<N>` is started before #525 ships (R3 Transition). The tick starts `S<N>` with the supervisor brief: the task text, this section, § 6 and the commands. It never edits
+The tick starts `S<N>` with the supervisor brief: the task text, this section, § 6 and the commands. It never edits
 the task's code, never starts a session itself (step 4 does it) and never decides for the owner.
 
 1. Read `taskq.md` and the whole issue; a task that conflicts with a recorded decision is an `ask` with options (R13).
 2. `taskq run N`. Claude: start `taskq wait --task N` in the background (`run_in_background`) and end the turn; it
-   wakes you. Codex: end the turn; step 4 wakes you with `exec resume`.
+   wakes you with its events, `stop #N` (end the turn) or `tick` (wait again). Codex: end the turn; step 4 wakes you
+   with `exec resume`.
 3. Woken by `review`: check the result.
    1. `git show <sha> --stat`, then the diff, against every Acceptance item and against `taskq.md` (R13: a diff
       that breaks a recorded decision without editing it is not accepted) (`pr` mode: the PR diff).
@@ -563,11 +588,12 @@ the task's code, never starts a session itself (step 4 does it) and never decide
       has CI.
    3. Accepted: `taskq close N --text "<one line for the manager: what was checked, what was not>"`, end the turn.
    4. Not accepted, CI red, or `close` sent the task back (§ 6): `taskq requeue N --text "<exact fixes>"`; the next
-      worker reads them. Back to waiting, as in 2. The third rework of one task is an `ask` to the owner.
+      worker reads them. Back to waiting, as in 2. The third rework of one task (3 workers since the last `answer`)
+      is refused: `ask` the owner.
    5. A result with options (a choice for the owner): `taskq ask N` with those options; the owner decides.
 4. Woken by `gone`, a worker's `requeue` or `ask`: read why; `requeue` with what to do, or `ask` the owner (a product
    choice, a second death). An `answer`: act on it, or let step 4 pass it to the worker.
-5. Silent worker (120 min, issue unchanged): comment `nudge` with the text for it.
+5. Silent worker (120 min, issue unchanged): a plain comment `nudge: <text>`; step 4 sends the text to it.
 
 The manager never sees a supervised task's retries: `wait` prints only its `ask` and `closed #N <text>`.
 
@@ -583,7 +609,7 @@ Changed: the manager relayed each `ask` comment verbatim → the `Decisions` blo
 - `ask`: a card with no options: read the question (the last `ask` comment), relay it verbatim. Record the owner's
   reply: `taskq answer N --text "<verbatim answer>"`. The task goes back to `doing`; the supervisor gets it (step 4).
 - `closed #N <text>`: relay the supervisor's line as is. Never open the diff to check it; the owner may ask.
-- Unsupervised review: `review` of a task with no `supervisor` (R3 Transition; every task until #525 ships). The
+- Unsupervised review: `review` of a task with no `supervisor` (R3 Transition: started before #525). The
   manager checks it as a supervisor does (§ Supervisor step 3.1–3.2: the diff against Acceptance and `taskq.md`, CI
   green on the exact head SHA), then `taskq close N --text "<what was checked, what was not>"` or
   `taskq requeue N --text "<exact fixes>"` (the next worker continues the branch); a result with options goes to the
@@ -656,7 +682,9 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 - A supervisor starts and retires as a worker does, named `S<N> ...` (Codex: `.taskq/S<N>.log`,
   `.taskq/S<N>.pid`), with the same tools, `permission_mode` and `codex` options (R9). A Claude supervisor is never
   `send`-ed to (the resume makes a new id, #284). Its liveness is the running / idle / dead state of § 7 step 4, not
-  `alive`: a Codex supervisor between turns has no process, by design (*planned (#525)*).
+  `alive`: a Codex supervisor between turns has no process, by design. `close` run by the supervisor retires the
+  recorded workers, never itself; the pass retires it once its turn ended. Inside a Codex sandbox `close` retires
+  nothing (#502); the next pass outside does.
 - A worker never inherits the tick's session id: `taskq.py` removes `CLAUDE_CODE_SESSION_ID` and
   `CODEX_THREAD_ID` from its environment.
 - A session that carries both ids (a Claude session started from Codex): set `TASKQ_RUNTIME` to the right one.

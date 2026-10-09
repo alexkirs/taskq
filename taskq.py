@@ -2404,7 +2404,10 @@ def cmd_launch(args):
     argv = args.arguments[1:] if args.arguments[:1] == ['--'] else args.arguments
     os.environ['TASKQ_INSTALL_DIR'] = str(root)
     os.environ['TASKQ_RELEASE_COMMIT'] = commit
-    os.execv(sys.executable, [sys.executable, str(expected / 'taskq.py'), *argv])
+    command = [sys.executable, str(expected / 'taskq.py'), *argv]
+    if os.name == 'nt':  # Windows execv can exit the observed parent before the spawned interpreter finishes.
+        raise SystemExit(subprocess.run(command).returncode)
+    os.execv(sys.executable, command)
 
 
 def cmd_version(args):

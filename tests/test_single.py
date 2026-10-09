@@ -3455,10 +3455,26 @@ class Contract(Base):
                 self.assertEqual(result['selected']['commit'], release.name)
                 self.assertEqual(result['install'], str(install))
                 self.assertFalse(result['stale'])
+            failed = REAL_RUN([*command[:-1], 'definitely-invalid-command'], cwd=self.root,
+                              capture_output=True, text=True, encoding='utf-8',
+                              env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}, timeout=15)
+            self.assertEqual(failed.returncode, 2, failed.stderr)
+            self.assertEqual(failed.stdout, '')
+            self.assertIn("invalid choice: 'definitely-invalid-command'", failed.stderr)
         # Forwarded argv and pinned release identity use this same interpreter, with no board/config read.
-        with mock.patch.dict(os.environ, {'TASKQ_INSTALL_DIR': str(install)}), mock.patch.object(taskq.os, 'execv') as execute:
-            self.run_cli('launch', '--', 'contract')
-            execute.assert_called_once_with(sys.executable, [sys.executable, str(release / 'taskq.py'), 'contract'])
+        with mock.patch.dict(os.environ, {'TASKQ_INSTALL_DIR': str(install)}), mock.patch.object(taskq.os, 'execv') as execute, \
+                mock.patch.object(taskq.subprocess, 'run', return_value=mock.Mock(returncode=7)) as waited:
+            forwarded = [sys.executable, str(release / 'taskq.py'), 'contract']
+            if os.name == 'nt':
+                with self.assertRaises(SystemExit) as exited:
+                    self.run_cli('launch', '--', 'contract')
+                self.assertEqual(exited.exception.code, 7)
+                waited.assert_called_once_with(forwarded)  # inherited stdio; no detached or captured child
+                execute.assert_not_called()
+            else:
+                self.run_cli('launch', '--', 'contract')
+                execute.assert_called_once_with(sys.executable, forwarded)
+                waited.assert_not_called()
             self.assertEqual(os.environ['TASKQ_RELEASE_COMMIT'], release.name)
 
     def test_managed_launcher_refuses_invalid_or_escaping_release(self):

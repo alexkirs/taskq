@@ -526,8 +526,10 @@ clone has 120 seconds, and upstream CI queries have 30 seconds. Timeout/offline 
 protocol loads the selected release; it does not run queue commands itself. It reads the pointer once, requires
 a full lowercase SHA and exactly the canonical `<root>/releases/<SHA>` path without release-directory symlinks,
 and requires regular `taskq.py` and `taskq.md` files there. It exports `TASKQ_INSTALL_DIR` plus
-`TASKQ_RELEASE_COMMIT`, then replaces itself with the same Python interpreter executing that release
-and forwards the remaining arguments. Launch reads no project configuration or board; children use their
+`TASKQ_RELEASE_COMMIT`, then executes that release with the same Python interpreter and forwards the remaining
+arguments. POSIX replaces the bootstrap process. On Windows the bootstrap waits synchronously for the fresh
+interpreter, inherits its input/output/error streams and returns its exact exit code; a child failure must never
+be reported as a successful launcher exit. Launch reads no project configuration or board; children use their
 parent's release path. Every new-version mutation/dispatch/effect checks the current
 pointer and refuses when this process is stale or the pointer invalid. Read-only inspection remains available.
 Briefs identify the loaded release and contract hash and direct a new turn to the launcher. `taskq pm` prints

@@ -157,8 +157,15 @@ an empty table or section is left out, with no placeholder:
    <option> ★ |` (a review adds `review` after the link); ★ marks the recommended option. The owner answers `N.M`
    only; the manager runs `taskq answer N.M` (§ 7 After each pass).
 5. `Later: [#N <title>](url), ...` on one line.
-6. One mode line: `Mode: events · arm: unconfirmed · taskq arm tick`. taskq proves only its event chain (R4); it records
-   no sender, and `arm tick` only prints a prompt, so arming is never shown as confirmed (R12).
+6. One mode line: `Mode: events · arm: <arm_tick>`, the report's only field. taskq knows only its event chain (R4); it
+   records no sender or timer, so it never fills the field. The final owning manager (the one that shows the report to
+   the owner) replaces exactly `<arm_tick>`, nothing else, with one of:
+   - `armed, every <interval>`: only when it confirmed its own arming and the interval from evidence it read (its
+     running wait, its scheduler entry);
+   - `not armed · taskq arm tick`: only when it confirmed it is not armed;
+   - `unknown`: the default, every other case.
+   Never inferred: no interval from a default or `arm tick` output, no arming done to fill the field, and a child
+   manager's wait or timer is not the root's. A child leaves the field as printed. `<arm_tick>` never reaches the owner.
 
 Titles, reasons and options pass one formatter: a newline becomes a space, `|`, `[`, `]` and `\` are escaped, so a
 cell stays one table cell and one link. Illustrative only, never a live status:
@@ -182,8 +189,10 @@ Questions (answer N.M):
 
 Later: [#9 Dark mode](…/9)
 
-Mode: events · arm: unconfirmed · taskq arm tick
+Mode: events · arm: unknown
 ```
+
+The sample shows the field after the final manager's default; `taskq` prints `arm: <arm_tick>`.
 
 Session links: Claude `https://claude.ai/code/session_<id>` in every client. Codex: `codex://threads/<id>` direct when
 the client that finally renders the report is Codex, else the wrapper `<pages>/open.html#codex://threads/<id>`. That
@@ -193,8 +202,9 @@ A child manager that relays to a root manager in another client sets `TASKQ_CLIE
 unknown clients get the wrapper (direct unverified there). A session with no link on this machine shows
 `<session[:8]> on <machine>`; no session: empty cell. No raw JSON to humans.
 Relay: every manager (Claude, Codex, DOT; root or child) loads the current contract with `taskq pm` and passes the
-report on complete and unchanged, its own short commentary below it, separate. Limitation (R12): only the prompt
-asks for this; taskq cannot verify that a relay was exact, and builds no transport for it.
+report on complete and unchanged, except the final owning manager's `<arm_tick>` (item 6), its own short commentary
+below it, separate. Limitation (R12): only the prompt asks for this; taskq cannot verify that a relay was exact or that
+the field was replaced, and builds no transport for it.
 Unknown (R12): taskq cannot tell the Codex app from the Codex CLI or IDE (all get direct); Claude Code, web, mobile
 and other OS are not observed.
 Changed: `taskq tick` printed a table of every task, then `Board: <url>`, then a `Decisions` block with `(recommended)`;
@@ -720,9 +730,10 @@ the tasks it did not reach wait for the next pass. Fix the cause or tell the own
 
 ### After each pass
 
-Reply to the owner with the R6 report complete and unchanged, as printed (links, not bare ids), then one or two
-lines of your own on what else needs them, separate from it. A child manager relays its report to the root the same
-way; the root passes it on unchanged (R6 Relay). To show the queue without moving it, run `taskq status`. The owner answers the block in one line, `43.1 44.2`: run `taskq answer 43.1 44.2` verbatim.
+Reply to the owner with the R6 report complete and unchanged, as printed (links, not bare ids), except `<arm_tick>`,
+which the final owning manager replaces (R6 item 6), then one or two lines of your own on what else needs them,
+separate from it. A child manager relays its report to the root the same way, the field left as printed; the root
+passes it on unchanged but for that field (R6 Relay). To show the queue without moving it, run `taskq status`. The owner answers the block in one line, `43.1 44.2`: run `taskq answer 43.1 44.2` verbatim.
 Changed: the manager relayed each `ask` comment verbatim → the `Decisions` block carries every pending choice (#490);
 the block is the report's Questions (#574).
 

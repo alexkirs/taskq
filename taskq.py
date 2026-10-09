@@ -1299,7 +1299,7 @@ def report(items, listed, kinds, here):
     lines += ['Questions (answer N.M):', '', '| Question | Brief reason | Options |', '|---|---|---|', *cards, ''] if cards else []
     later = [heading(item) for item in items if item['state'] == 'later']
     lines += ['Later: ' + ', '.join(later), ''] if later else []
-    print('\n'.join([*lines, 'Mode: events · arm: unconfirmed · taskq arm tick']))  # R12: taskq records no sender
+    print('\n'.join([*lines, 'Mode: events · arm: <arm_tick>']))  # R6 item 6: the final owning manager fills the one field
 
 MEDIA = re.compile(r'\.(png|jpe?g|gif|webp|svg)(\?.*)?$', re.I)
 

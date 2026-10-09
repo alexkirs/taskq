@@ -576,7 +576,7 @@ class Tick(TickSetup):
         self.assertIn('**spawn** · claude:01234567\n\nsupervisor s-S1\nhttps://watch/s-S1', self.board.issues[1]['comments'])
         self.assertIn('| [#1 one](https://board/1) | doing | fake | [s-S1](https://watch/s-S1) |', out)
         self.assertTrue(out.startswith(f'{self.root.name} · [board](https://github.com/o/r/issues)\n'))
-        self.assertTrue(out.endswith('\n\nMode: events · arm: unconfirmed · taskq arm tick\n'))
+        self.assertTrue(out.endswith('\n\nMode: events · arm: <arm_tick>\n'))
         with self.acting('s-S1'):
             self.run_cli('run', '1')  # the supervisor orders; its event pass spawns the worker
         self.assertEqual((self.task(1)['claim']['session'], self.fake.names[-1]), ('s-T1', 'T1 UNK one (mac)'))
@@ -685,15 +685,16 @@ class Tick(TickSetup):
 
             Later: [#9 parked](https://board/9)
 
-            Mode: events · arm: unconfirmed · taskq arm tick
+            Mode: events · arm: <arm_tick>
             '''))
-        self.run_cli('arm', 'tick', SESSION)  # prints a sender prompt; nothing proves a sender runs
-        self.assertTrue(self.run_cli('status').endswith('\nMode: events · arm: unconfirmed · taskq arm tick\n'))
+        self.run_cli('arm', 'tick', SESSION)  # prints a sender prompt; taskq still fills nothing (R6 item 6)
+        out = self.run_cli('status')
+        self.assertEqual((out.count('<arm_tick>'), out.count('<'), out.endswith('\nMode: events · arm: <arm_tick>\n')), (1, 1, True))
 
     def test_status_empty_queue_is_compact(self):
         # #574: an empty table or section is left out, no placeholder
         self.assertEqual(self.run_cli('status'), f'{self.root.name} · [board](https://github.com/o/r/issues)\n'
-                         'In work 0 · Waiting for answer 0 · Ready 0\n\nMode: events · arm: unconfirmed · taskq arm tick\n')
+                         'In work 0 · Waiting for answer 0 · Ready 0\n\nMode: events · arm: <arm_tick>\n')
 
     def test_second_quick_death_asks(self):
         # #393: an unsupervised worker that dies at once is requeued once, then the owner is asked with the last log line

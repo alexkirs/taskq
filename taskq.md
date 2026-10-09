@@ -420,7 +420,9 @@ its waiting-to-ready step and automatic retirement use the same scope. Manual `t
 `TASKQ_LIMITS='{"codex":5}'` replaces worker limits for this invocation: omitted runtimes have zero slots,
 including explicit `run-*` tasks and pending supervisor worker orders. It is a nonempty JSON object of runtime
 names to nonnegative integers; invalid values or a host/machine mismatch fail before board writes or dispatch.
-Existing local reservations and active workers still consume slots even outside the host scope. Lowering a limit
+Existing local reservations and active workers still consume slots even outside the host scope; accounting reads
+their current board claims under the dispatch lock, not the potentially stale list. A later read showing a changed
+state, PM, claim, supervisor or order stops that task's step without overwriting it. Lowering a limit
 never stops a session or drops a claim: active workers continue; pending workers wait for capacity, in task priority
 and number order. The supervisor's runtime still follows its board PM (R3), independent of worker limits.
 Both variables are ordinary inherited environment, retained by native worker launches, event children and Codex

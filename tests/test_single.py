@@ -812,6 +812,69 @@ class Tick(TickSetup):
             self.assertEqual(self.task(2)['raw']['order'], 'run')
             self.assertTrue(self.fake.sessions['s-T1'])
 
+    def test_local_limits_count_fresh_active_claims_before_pending_admission(self):
+        taskq.CONFIG['limits'] = {'fake': 2}
+        for n in range(2):
+            self.add(str(n), '--host', 'mac')
+        with mock.patch.object(taskq, 'dispatch'):
+            for n in (1, 2):
+                with self.acting(f's-S{n}'):
+                    self.run_cli('run', str(n))
+        listed = json.loads(json.dumps(self.board.list(None)))  # both listed as pending, but #2 has since started
+        current = self.task(2)
+        active = {**current['claim'], 'session': 's-T2'}
+        self.board.issues[2]['body'] = taskq.block('g', {**current['raw'], 'claim': active, 'order': None})
+        self.fake.sessions['s-T2'] = True
+        # An active worker outside this invocation's strict host scope still consumes the local capacity.
+        for outside_scope in (False, True):
+            with self.subTest(outside_scope=outside_scope):
+                if outside_scope:
+                    self.board.issues[2]['labels'].remove('host-mac')
+                before = json.dumps(self.board.issues, sort_keys=True)
+                with mock.patch.dict(os.environ, {'TASKQ_LIMITS': '{"fake":1}', 'TASKQ_HOST_ONLY': 'mac'}), \
+                        mock.patch.object(self.board, 'list', return_value=listed):
+                    self.run_cli('tick')
+                self.assertEqual(self.task(1)['claim']['session'], None)
+                self.assertEqual(self.task(1)['raw']['order'], 'run')
+                self.assertEqual(self.task(2)['claim'], active)
+                self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+                self.assertFalse(any(name.startswith('T') for name in self.fake.names))
+
+    def test_local_scope_never_overwrites_fresh_foreign_execution(self):
+        with mock.patch.object(taskq, 'dispatch'):
+            self.add('owned', '--host', 'mac')
+            self.legacy(1)
+        original = json.loads(json.dumps(self.board.issues[1]))
+        for state in ('doing', 'waiting'):
+            for changed_read in (1, 2):  # stale list, then a change after the accounting refresh but before action
+                with self.subTest(state=state, changed_read=changed_read):
+                    self.board.issues[1] = json.loads(json.dumps(original))
+                    if state == 'waiting':
+                        self.board.issues[1]['labels'].remove('q-doing')
+                        self.board.issues[1]['labels'].append('q-waiting')
+                    listed = json.loads(json.dumps(self.board.list(None)))
+                    current = self.task(1)
+                    foreign = json.loads(json.dumps(self.board.issues[1]))
+                    foreign['labels'] = [label for label in foreign['labels'] if not label.startswith('q-')] + ['q-doing']
+                    foreign['body'] = taskq.block('g', {**current['raw'], 'order': 'run',
+                        'claim': {'runtime': 'fake', 'session': 'foreign-session', 'name': 'other-host'},
+                        'pm': {'runtime': 'fake', 'session': 'foreign-manager', 'name': 'other-host'}})
+                    reads = 0
+                    def get(n):
+                        nonlocal reads
+                        reads += 1
+                        if reads == changed_read:
+                            self.board.issues[1] = foreign
+                        return dict(self.board.issues[n])
+                    self.fake.sessions['s-T1'] = False
+                    with mock.patch.dict(os.environ, {'TASKQ_HOST_ONLY': 'mac', 'TASKQ_LIMITS': '{"fake":1}'}), \
+                            mock.patch.object(self.board, 'list', return_value=listed), mock.patch.object(self.board, 'get', get), \
+                            mock.patch.object(self.fake, 'alive', side_effect=AssertionError('foreign liveness queried')), \
+                            mock.patch.object(self.fake, 'spawn', side_effect=AssertionError('foreign claim replaced')), \
+                            mock.patch.object(self.fake, 'send', side_effect=AssertionError('foreign session sent to')):
+                        self.run_cli('tick')
+                    self.assertEqual(self.board.issues[1], foreign)
+
     def test_invalid_local_scope_fails_before_mutation_or_dispatch(self):
         for value in ('', '{}', '[]', '{"codex":true}', '{"codex":-1}', '{"codex":1.5}', '{"":5}'):
             with self.subTest(value=value), mock.patch.dict(os.environ, {'TASKQ_LIMITS': value}), \

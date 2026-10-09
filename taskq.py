@@ -123,10 +123,14 @@ def execution_reason(item):
         return f'{prefix}: authenticated board user {identity} is not assigned; execution refused'
     return None
 
-def executable(issue):
+def executable(issue, expected=None):
     """#545: a fresh board issue the pass may act on: a task, and eligible; else the reason goes to stderr."""
     item = parse(issue)
     reason = execution_reason(item) if item else f'#{issue["iid"]} is no longer a task'
+    if not reason and expected and ('TASKQ_HOST_ONLY' in os.environ or 'TASKQ_LIMITS' in os.environ) and \
+            (any(item[key] != expected[key] for key in ('state', 'pm', 'claim', 'supervisor'))
+             or item['raw'].get('order') != expected['raw'].get('order')):
+        reason = f'#{item["iid"]}: execution changed since this pass read it; leaving it untouched'
     reason and print(f'taskq: {reason}', file=sys.stderr)
     return item if not reason else None
 
@@ -1114,7 +1118,7 @@ def replace(item, kind, runtime, role, running=False):
     another task's. A Codex spawn rewrites `.taskq/T<N>.pid` / `S<N>.pid`, the old thread's handle. A replaced
     worker goes running or not; a supervisor only once stopped (R11), its handle kept until then. Best effort."""
     issue = BOARD.get(item['iid'])
-    if not executable(issue):
+    if not executable(issue, item):
         return False  # #576: a reassignment seen by this read: no retire, no spawn
     try:
         getattr(kind, 'retire', lambda *_: None)(lambda n, sid=None, live=None: n == item['iid']
@@ -1169,7 +1173,7 @@ def follow(item, kind, claim, supervised):
     """A live worker: an answer, a supervisor's `nudge:` comment or 120 silent minutes reach it once (step 2, step 4).
     None: this read shows the task ineligible (#576): the caller ends the task's step."""
     issue = BOARD.get(item['iid'])
-    if not executable(issue):
+    if not executable(issue, item):
         return None  # #576: a reassignment seen by this read: no send, the claim stays
     last = (issue['comments'] or [''])[-1]
     answer = last.partition('\n\n')[2] if last.startswith('**answer**') else None  # #307: an answer wakes the worker at once
@@ -1191,12 +1195,9 @@ def supervise(item, kinds, worker_allowed=True):
         if boss['runtime'] == 'hermes':
             fail('Hermes native supervisor bridge is not configured')
         return
-    fresh = executable(BOARD.get(n))  # #532: the list may lag a spawn; #545: or an assignee-only label or reassignment
+    fresh = executable(BOARD.get(n), item)  # #532: the list may lag a spawn; #545: or an assignee-only label or reassignment
     if not fresh:
         return  # ineligible: sessions, claim and order stay as they are
-    if ('TASKQ_HOST_ONLY' in os.environ or 'TASKQ_LIMITS' in os.environ) and \
-            (fresh['supervisor'] != boss or fresh['claim'] != item['claim'] or fresh['pm'] != item['pm']):
-        return  # changed controller/reservation: let the next pass read its actual slot and authority
     admitted = True
     if boss['runtime'] == 'hermes':
         state = lead_state(lead, boss['session'])  # prove bridge/state before admitting any worker action
@@ -1219,7 +1220,7 @@ def supervise(item, kinds, worker_allowed=True):
                 return  # #576: no supervisor send, resume or respawn either
     state = lead_state(lead, boss['session'])
     issue = BOARD.get(n)
-    if not executable(issue):
+    if not executable(issue, item):
         return  # #545: a reassignment seen by this second read stops every supervisor send, resume and respawn
     if state == 'dead':
         evidence = tail_of(lead, boss['session']) or 'no log'
@@ -1356,6 +1357,12 @@ def one_pass(args, table=True):
         if blind:
             print('taskq: inside a Codex sandbox: the pass only prints the table', file=sys.stderr)
         busy, ready = {}, items if held and not blind else []
+        if ready and (local is not None or 'TASKQ_HOST_ONLY' in os.environ):
+            # Admission/accounting use fresh reservations, including work outside this host-label scope.
+            # A lagging list can otherwise hide an active worker or overwrite a claim moved to another machine.
+            fresh_issues = [BOARD.get(item['iid']) for item in ready]
+            ready = sorted(filter(None, (parse(issue) for issue in fresh_issues if issue['state'] == 'open')),
+                           key=lambda item: (item['priority'], item['iid']))
         worker_slots, occupied = set(), {}
         if local is not None:  # existing active workers consume capacity, even outside this invocation's host scope
             for item in ready:
@@ -1377,7 +1384,7 @@ def one_pass(args, table=True):
                     busy[claim.get('runtime')] = busy.get(claim.get('runtime'), 0) + 1
                 continue
             if item['state'] == 'waiting' and not open_deps(item['deps']):
-                if 'TASKQ_HOST_ONLY' in os.environ and not executable(BOARD.get(item['iid'])):
+                if (local is not None or 'TASKQ_HOST_ONLY' in os.environ) and not executable(BOARD.get(item['iid']), item):
                     continue
                 move(item, 'ready', 'ready', 'dependencies closed')
                 item['state'] = 'ready'
@@ -1389,7 +1396,7 @@ def one_pass(args, table=True):
                 continue
             if item['state'] != 'doing' or claim.get('name') != here or claim.get('runtime') not in kinds:
                 continue  # another machine's, or a session no runtime here can see
-            if not executable(BOARD.get(item['iid'])):  # #545: the list's labels may lag; an ineligible task keeps its session and slot
+            if not executable(BOARD.get(item['iid']), item):  # #545: the list's labels may lag; an ineligible task keeps its session and slot
                 busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
                 continue
             runtime = kinds[claim['runtime']]  # step 2: unsupervised (R3 Transition: started before #525, or taken by hand)
@@ -1413,7 +1420,7 @@ def one_pass(args, table=True):
                 continue  # no manager: the task waits, the table says so; another machine's manager: that machine starts it (§ 7 step 3)
             names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
             free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 0 if local is not None else 1)), None)
-            fresh = free and executable(BOARD.get(item['iid']))  # #357: the board may have moved since the list; #545: eligibility
+            fresh = free and executable(BOARD.get(item['iid']), item)  # #357: the board may have moved since the list; #545: eligibility
             if fresh and fresh['state'] == 'ready' and fresh['pm'] == item['pm']:  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
                 if local is not None and fresh['runtime'] not in ('any', free):
                     continue  # a stale list must not select a different or disabled worker runtime

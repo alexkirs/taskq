@@ -125,6 +125,9 @@ the queue to move; a separate sender is only one way to wake a manager that cann
 
 Result SHA, checks, a question or a blocker go to the issue through `taskq result`, `ask`, `requeue` or a plain
 comment. Completion never depends on session UI, chat or transcript.
+Changed: worker publishes before review → worker transfers an unpublished candidate; the accepting supervisor
+reviews testing/live evidence and publishes that exact candidate with `close` in both modes (#533, owner decision
+2026-10-09). Legacy results already on main and research answers keep their existing close path (§ 6).
 Changed: `taskq problem` → `requeue --text` or a plain issue comment (#290).
 
 ### R6. Human report
@@ -164,6 +167,8 @@ Changed: free-text questions → decision cards with option codes `N.K` (#490).
 
 This file is the whole contract (with [docs/single-file.md](docs/single-file.md) for design). Briefs and docs link
 here; they never copy it. A change of behavior updates this file in the same deliverable.
+Changed: testing mechanics implicit in worker/review commands → § 10 defines risk-based evidence, preserved
+fault detection and a bounded pilot; no broad suite migration (#533).
 Changed: "the Wiki is the SoT; principles.md is its packaged copy" → `taskq.md` at the root is the SoT (#289, #290).
 Changed: Open "delete the Wiki pages or mark them stale" → the Wiki is a stub linking here (#452).
 
@@ -211,12 +216,16 @@ the id the board records, never by its name, never while it runs (#478).
 
 Report only what a fresh read proved. A delivery, exit code, checkout marker or chat turn is not proof of receipt,
 application or completion.
+Changed: automated green alone → scoped assertions plus applicable changed-boundary qualification before main
+publication; missing required evidence holds publication (#533).
 
 ### R13. Spec first
 
 Decisions live in this file, product ones too (§ Product), never only in chat (#505). A change that alters a decision
 edits this file first, in the same deliverable; code, README and pages follow it. A task that conflicts with a
 recorded decision is an `ask` with options, not an edit. Only the owner accepts a change of a decision here.
+Changed: publication/testing contradiction in § 5/§ 6 → accepted #530 methodology and candidate-first
+publication reconciled in § 5/§ 6/§ 7/§ 10 (#533, owner approval 2026-10-09); supervisor reviews, worker implements.
 Every agent (Claude, Codex, DOT, Hermes, other) reads this file before work; `AGENTS.md` and `CLAUDE.md` point here.
 
 ## Product
@@ -426,9 +435,9 @@ Rules:
    (keep A or switch to B) takes the same options; an option starting `close` accepts the result as is. `--link`:
    each result the owner should see (PR, page, image, video); `--recommend` defaults to 1.
 6. Cannot be done: `taskq requeue N --text "<why>"`, then stop.
-7. Before `result`: commit on `taskq-<N>`, `git fetch origin && git rebase origin/main`, run the focused tests of
-   the changed behavior (and the full suite when the change is shared), and name each command and its outcome in
-   `--checks`.
+7. Before `result`: commit on `taskq-<N>`, `git fetch origin && git rebase origin/main`, run the checks required by
+   § 10 Testing policy, and name each command, checked SHA and outcome in `--checks`. The worker justifies the
+   coverage and remaining blindspots there; the accepting reviewer evaluates that evidence (§ 7).
 8. Deliver (§ 6), then `taskq result N --sha <full SHA> --checks "<...>" --text "<summary>"`, then stop.
 9. An answer with no commit (`research`): `--sha` is the current `origin/main` SHA, `--text` holds the answer.
 10. Everything written through taskq is public: no secrets, tokens, or paths outside the repository.
@@ -438,9 +447,17 @@ Rules:
 
 | `publish` | Worker pushes | `result --sha` | `close` |
 |---|---|---|---|
-| `direct` | `git push origin HEAD:main` | the pushed SHA | checks the SHA is on `origin/main`, closes |
+| `direct` | `git push --force-with-lease origin HEAD:refs/heads/taskq-<N>` (no PR) | the full candidate SHA | accepting reviewer checks evidence, exact remote branch SHA and CI, fast-forward pushes that immutable SHA to `main`, verifies publication, closes |
 | `pr` | `git push --force-with-lease origin HEAD:refs/heads/taskq-<N>`, then once `gh pr create --base main --head taskq-<N>` / `glab mr create --target-branch main --source-branch taskq-<N>` | the PR head SHA | squash-merges the one open PR/MR of `taskq-<N>` into `main` at that SHA once its gate passes on the head (GitHub: `tests`; GitLab: the MR pipeline), deletes the branch, closes |
 
+- Before either mode publishes: the accepting supervisor reviews the exact candidate, testing and applicable live
+  evidence (§ 7/§ 10). Invoking `close` records that acceptance; a result alone is not acceptance. The worker
+  cannot publish a direct candidate through `close`, including legacy unsupervised claims. Main protection is
+  the security boundary; taskq cannot prevent arbitrary out-of-band git pushes.
+- Direct candidates must descend from current `origin/main`; a changed branch, red/pending/missing CI or rejected
+  push leaves review open for fixes. GitHub requires exact-SHA `tests` success; GitLab requires the latest
+  exact-SHA pipeline success. A custom board has no built-in CI adapter: reviewer verifies project CI/checks.
+  Configure CI to run on `taskq-*` pushes before using direct candidates. No force push to main.
 - `pr` mode: a PR that does not merge (conflict, failing checks) goes back to `ready` with the platform's message;
   a head that differs from the result SHA, or several PRs, refuses the close.
 - `pr` mode on GitHub (#359): `main` requires the `tests` check (`.github/workflows/tests.yml`) on the PR head only,
@@ -464,14 +481,16 @@ Rules:
   finished pipeline within 10 min, or a refused merge (conflict) sends the task back to `ready`. The project needs CI
   (`.gitlab-ci.yml`) that runs on MRs, and squash allowed. Self-managed: `"host"` in `taskq.json`; `glab` gets
   `-R https://<host>/<group>/<project>`.
-- `pr` mode and no PR (an answer): `close` checks the SHA is on `origin/main`, as in `direct`.
+- An answer without a commit, or a legacy result already on `origin/main`: `close` verifies ancestry and closes
+  without a new publication/CI run. This compatibility path does not qualify historical research/claims as live
+  evidence. In `pr` mode no PR is allowed only for this already-published path.
 - Both modes, on the machine named in the claim: `close` removes a clean `.worktrees/taskq-<N>` (`git worktree remove`)
   and the local branch `taskq-<N>` (`git branch -D`). A worktree with uncommitted changes stays, with its branch, and
   the close comment says so. Never `--force` (#284).
 - `workspace: external` (§ 2, #477): `close` removes no worktree and no local or remote branch, and the close comment
   says `kept: owned by host`. In `pr` mode it merges without `--delete-branch` / `--remove-source-branch`: deleting
   the remote branch on merge is the repo's own setting.
-- `main` is always green: in `direct` mode the worker runs the tests before the push.
+- Both modes require prepublication evidence; CI on main after publication is an alarm, never prior qualification.
 - `pr` mode is workflow, not a security boundary: use protected branches for that.
 
 ## 7. Manager
@@ -616,6 +635,8 @@ the task's code, never starts a session itself (step 4 does it) and never decide
 3. Woken by `review`: check the result.
    1. `git show <sha> --stat`, then the diff, against every Acceptance item and against `taskq.md` (R13: a diff
       that breaks a recorded decision without editing it is not accepted) (`pr` mode: the PR diff).
+      Evaluate the worker's testing evidence against § 10 Testing policy; unresolved required evidence is rework
+      or an owner question, never a PASS. In both modes accept the exact candidate before `close` publishes it.
    2. A commit: CI on that exact SHA is green (an answer on `origin/main` needs no CI check): `gh run list --commit <sha>` / `glab api "projects/:id/pipelines?sha=<sha>"`, where the project
       has CI.
    3. Accepted: `taskq close N --text "<one line for the manager: what was checked, what was not>"`, end the turn.
@@ -743,7 +764,107 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 ## 10. Develop taskq itself
 
 Every session on a machine runs the clone's `taskq.py`: keep that clone on clean `main` and change taskq only in a
-worktree (`git worktree add -b <branch> .worktrees/<branch> origin/main`); `tick` and `wait` pull a clean clone (§ 7). Tests: `python3 -m unittest tests.test_single`; CI runs them on every push.
+worktree (`git worktree add -b <branch> .worktrees/<branch> origin/main`); `tick` and `wait` pull a clean clone (§ 7). Testing: below.
+### Testing policy
+
+Use the cheapest check that can detect the changed requirement's plausible failure. Test count and a fixed mix
+of test types are not targets. Passing checks prove only their assertions at the recorded revision/environment.
+
+#### Structure and levels
+
+Keep automated tests in `tests/test_single.py`, using stdlib `unittest`; no new framework, service or policy file.
+Levels describe evidence, not extra directories or runners:
+
+- Contract and isolated checks: `Model` (data/trust and contract sentinels), `Contract` (contract loading/update),
+  `DirectPublication` (real local git transport with fake CI), `Commands` (state transitions and one fake-board lifecycle), `Tick` (dispatch, claims and recovery), `Wait`
+  (clock-controlled wait/events), `PullRequests` (mocked publication outcomes), and `Cleanup` (preservation and
+  retirement). Reuse `Base`, `FakeBoard` and `FakeRuntime`; isolate state, environment and clocks. Unexpected
+  real adapter/process/model calls must fail isolated tests. A fake CLI response is not real adapter evidence.
+- Local boundary checks: keep `RealChild` for the real parent/detached-child/file-adapter boundary with fake
+  runtime downstream. Keep the printed sender shell execution check in `Wait`, with fake wait/send programs.
+  Add a similar bounded local check only when a changed boundary cannot be proved by isolated assertions.
+  Temp resources, cleanup and observable completion are required; sleeps alone are not a completion oracle.
+- Live qualification: record evidence in the task result using the existing approved lifecycle/cadence procedure,
+  not in the default unittest run. Exercise the changed board/CLI/runtime topology, prove receipt/application
+  and relevant lifecycle outcomes. A prompt, spawn return or process exit alone does not prove them (R12).
+
+A separate next task migrates one demonstrated-equivalent fixture group, not this policy deliverable.
+After that migration, move the existing `Tick.setUp` and its fixture helpers (`manager`, `unmanaged`, `legacy`,
+`acting`, `notes`) unchanged into one fixture-only `TickSetup(Base)` in this same file. Use `Tick(TickSetup)`
+and `Wait(TickSetup)`; only `Wait.setUp` adds its controlled clock. `Base` and `TickSetup` contain no test methods. Do not inherit test methods just to reuse setup. Preserve any useful
+second clock environment as an explicit scenario, with its distinct failure named. Prefer a small table/subTest
+for cases with the same setup and oracle; keep distinct failures identifiable. Do not rewrite unrelated classes.
+
+#### Add, run and accept
+
+For each changed requirement, the worker names the failure consequence, assertion, cheapest adequate level and
+remaining blindspot. Add or update a regression for a reproduced bug or nontrivial branch, state transition or
+trust boundary; extend an existing case/table where sufficient. Wording-only changes need review and any affected
+contract sentinel, not invented behavioral tests. Assert observable outcomes; assert call order only when that
+order itself protects the contract or data.
+
+Run focused affected methods/classes while iterating, for example
+`python3 -m unittest tests.test_single.Commands.test_close_failure_keeps_the_label` or
+`python3 -m unittest tests.test_single.Tick tests.test_single.Wait`.
+After the final edit/rebase, freeze a code or test diff and run `python3 -m unittest tests.test_single` once before
+publication, including shared-code changes. A later code/test edit or rebase needs a new final gate. Do not rerun
+a green unchanged suite without a failure or a specific flake hypothesis. An answer on current `origin/main`
+requires no test/CI run; documentation-only work runs affected sentinels where applicable. CI behavior stays as
+configured: the full suite, including local boundary checks. A hang or incomplete run is not green.
+
+When subprocess/filesystem/CLI/board-adapter behavior changes, run a focused check across the real local boundary
+with fake downstream where sufficient. If acceptance depends on real service/runtime behavior, obtain the approved
+topology-specific live proof before claiming it works. Do not launch paid live lifecycle checks for unrelated
+parser/text edits. Any live check remains subject to existing approvals, limits, model/permission rules and safety
+safeguards; testing does not authorize a new benchmark or load stage.
+
+Before merge or direct publication to `main`, require the applicable approved changed-live-boundary proof on
+an isolated candidate worktree at the recorded candidate SHA. `tick` and `wait` auto-pull `main`: qualification
+after publication is too late. Use only an already approved isolated topology, board and runtime scope; do not
+expand permissions, limits or approvals. If the necessary isolated proof cannot be obtained within that scope,
+report the blocker and hold main publication; a pending required proof is never PASS. Unrelated parser or
+documentation changes need no paid full lifecycle run.
+
+The proof covers the changed behavior: board event, intended session receipt/turn, result, exact-head review/CI
+where applicable, rework or merge/close, and recorded retirement/next dispatch. Exercise any merge/close segment
+in the approved isolated qualification setup, never by publishing the unqualified candidate to production main.
+Record topology, CLI/runtime versions, SHA, timestamps, interventions and limits. A candidate edit/rebase requires
+fresh final checks and re-evaluation of whether the live proof still applies; old green never proves a new head.
+
+Before main publication the accepting supervisor evaluates coverage, sensitivity, duplication, available cost
+and applicable live proof, then checks exact-head CI as § 7 requires. Use R3 Transition's unsupervised review route
+where required. In direct mode this review and required proof precede the accepting reviewer's `close` push to main; in PR mode they
+precede merge. Keep § 6's head-SHA gate, non-strict GitHub rule and post-merge main alarm unchanged. Deployment
+also requires applicable qualification; neither publication nor deployment permits a bypass.
+
+In the existing result include a small evidence row, grouping requirements when appropriate:
+`requirement/issue | test/asserted failure | red-before-fix observed/reported/unknown | blindspot |
+retain/combine/remove/live-proof-needed and reason | already available elapsed/flake/maintenance/cost evidence`.
+Link the test and issue rather than creating another contract or ledger. Use existing command/CI records;
+unknown costs are accepted as unknown. Token/model-cost figures are optional when already available: no new
+instrumentation, mandatory token accounting or extra runs to fill a row. Zero direct model calls in fake tests
+does not imply zero development cost. The supervisor evaluates the worker's justification; self-PASS is not acceptance.
+
+#### Retain, combine, remove
+
+Retain unique contract/safety checks and known-bug coverage. Combine only after demonstrating redundancy of requirement, failure mode, oracle
+and effective environment, plus preserved fault sensitivity; retain meaningful time/process/topology differences explicitly. Remove a test
+only when an accepted contract supersedes its behavior or named remaining checks detect its relevant faults.
+Unknown value or cost is not zero and is not grounds for deletion. A flaky valuable check needs isolation or
+repair, not reruns until green. Fault injection, bounded property checks or targeted mutation need a named gap,
+a plausible fault/input distribution and a useful oracle; use existing stdlib facilities, not a standing quota
+or new framework. Report synthetic sensitivity separately from historical failure-before-fix evidence.
+
+#### Bounded pilot
+
+After publication of the separately authorized one-group migration with preserved detection and final suite/exact CI, observe the next 5 qualifying changes. A qualifying change changes state transitions, claims, recovery, publication or a runtime/adapter boundary, or fixes a reproduced regression; unrelated wording/formatting changes do not qualify. Five is a bounded observation window, not an ideal test count or statistical proof.
+
+Budget: at most one small evidence/review row in each existing qualifying task result, with at most 10 minutes of additional evidence collation/review per change (50 minutes total). Use already available command timings, CI logs, outcomes and rough maintenance estimates. If unavailable within this budget, write unknown; author/reviewer token and monetary figures are optional when already exposed. No new instrumentation, separate cost ledger, mandatory token accounting, benchmark, paid call or repeated live run is authorized for the pilot. Ordinary safety gates remain mandatory even when observation budget is exhausted; the budget limits pilot bookkeeping, not validation.
+
+Record applicable historical/synthetic failures detected or missed and the detecting check; distinguish actual replay from logical analysis and synthetic sensitivity. Use #495/#496/#311 and #481 delayed-list evidence only when safely available from the separately authorized migration's preservation checks, not as an additional pilot replay campaign. Record first-attempt failures and unchanged-SHA reruns already performed for a named hypothesis (flake numerator/denominator), diagnosis/repair effort, focused/full/adapter elapsed times and CI waiting where available. Reuse approved lifecycle evidence only if it applies to the candidate/topology; #526's existence is not a PASS. Record model calls/tokens/cost only if available from independently authorized live qualification; do not rerun it for measurement.
+
+Success: preserve all applicable known-bug detections and safety assertions for the migrated group; no lost environment-specific detection; required changed-boundary proof present; compare available baseline/candidate runtime, flakiness and maintenance evidence for reduced redundant work. Unknown metrics remain unknown, not proof of savings. Any missed relevant fault blocks the associated deletion/claim and triggers restoration/review. After 5 qualifying changes, one short review decides retain the policy, amend it or stop migration; no automatic expansion or permanent measurement program.
+
 Cadence test (#269): method in [bench/README.md](bench/README.md). Owner decision 2026-10-09 (#522): series 1+1, then 3+3,
 then 10+10 tasks (Claude + Codex), limits unchanged (claude 4, codex 4), each stage after the owner's go; the earlier
 10/20/50 runs stay the baseline.

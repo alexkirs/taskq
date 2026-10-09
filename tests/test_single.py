@@ -143,9 +143,14 @@ class Commands(Base):
         self.run_cli('take', '1')
         self.run_cli('result', '1', '--sha', 'b' * 40)
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)), \
+                self.assertRaisesRegex(SystemExit, 'could not fetch origin'):
+            self.run_cli('close', '1')
+        taskq.CONFIG['publish'] = 'pr'  # no PR and not on main: publication is still refused
+        with mock.patch.object(taskq, 'merge', return_value=None), \
+                mock.patch.object(taskq.subprocess, 'run', side_effect=[subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)]), \
                 self.assertRaisesRegex(SystemExit, 'not on origin/main'):
             self.run_cli('close', '1')
-        self.assertEqual(self.board.issues[1]['state'], 'open')
+        self.assertEqual((self.board.issues[1]['state'], self.task(1)['state']), ('open', 'review'))
 
     def test_close_removes_clean_worktree_keeps_dirty(self):
         trees, calls = [self.root / '.worktrees' / f'taskq-{n}' for n in (1, 2)], []
@@ -200,6 +205,116 @@ class Commands(Base):
             self.run_cli('take', '1')
 
 
+class DirectPublication(Base):
+    """Actual git transport to an isolated bare origin; fake board and exact-SHA CI responses."""
+
+    def git(self, *args, folder=None):
+        return REAL_RUN(['git', '-C', str(folder or self.root), '-c', 'user.name=t', '-c', 'user.email=t@t', *args],
+                        capture_output=True, text=True, check=True).stdout.strip()
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        remote = tempfile.TemporaryDirectory()
+        self.addCleanup(remote.cleanup)
+        self.remote = Path(remote.name)
+        self.git('init', '--bare', str(self.remote))
+        self.git('init', '-b', 'main')
+        self.git('commit', '--allow-empty', '-m', 'base')
+        self.base = self.git('rev-parse', 'HEAD')
+        self.git('remote', 'add', 'origin', str(self.remote))
+        self.git('push', 'origin', 'main')
+        self.git('checkout', '-b', 'taskq-1')
+        self.git('commit', '--allow-empty', '-m', 'candidate')
+        self.sha = self.git('rev-parse', 'HEAD')
+        self.git('push', 'origin', 'taskq-1')
+        taskq.CONFIG.update(repo='o/r', workspace='external')
+        self.add()
+        self.run_cli('take', '1')
+        self.run_cli('result', '1', '--sha', self.sha, '--checks', 'focused candidate checks')
+        os.environ['CLAUDE_CODE_SESSION_ID'] = 'reviewer'
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'review', 'spawn', supervisor={'runtime': 'claude', 'session': 'reviewer', 'name': 'mac'})
+        self.checks = {'check_runs': [{'status': 'completed', 'conclusion': 'success'}]}
+
+    def close(self):
+        with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq, 'run_api', return_value=self.checks) as api:
+            result = self.run_cli('close', '1', '--text', 'accepted exact diff and evidence')
+        self.assertEqual(api.call_args.args[3], f'repos/o/r/commits/{self.sha}/check-runs?check_name=tests')
+        return result
+
+    def main_sha(self):
+        return self.git('rev-parse', 'refs/heads/main', folder=self.remote)
+
+    def test_acceptance_publishes_exact_candidate_and_answer_still_closes(self):
+        self.assertEqual(self.main_sha(), self.base)  # result transfers; it never publishes
+        self.assertEqual(self.close(), '#1 closed\n')
+        self.assertEqual(self.main_sha(), self.sha)
+        self.assertIn(f'published {self.sha}', self.board.issues[1]['comments'][-1])
+        self.add('answer', '--type', 'research')
+        self.run_cli('take', '2')
+        self.run_cli('result', '2', '--sha', self.sha, '--text', 'research answer')
+        with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq, 'run_api', side_effect=AssertionError('answer needs no CI')):
+            self.run_cli('close', '2')
+        self.assertEqual(self.main_sha(), self.sha)
+
+    def test_unaccepted_worker_and_other_manager_cannot_publish(self):
+        for sid in (SESSION, 'other-manager'):
+            with self.subTest(session=sid), mock.patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': sid}), \
+                    self.assertRaisesRegex(SystemExit, 'supervised by'):
+                self.close()
+            self.assertEqual(self.main_sha(), self.base)
+        # Legacy claims have no supervisor, but their worker still cannot accept a new candidate.
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'review', 'spawn', supervisor=None)
+        with mock.patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': SESSION}), \
+                self.assertRaisesRegex(SystemExit, 'only the accepting reviewer'):
+            self.close()
+        self.assertEqual(self.main_sha(), self.base)
+
+    def test_candidate_mismatch_leaves_review_and_main(self):
+        self.git('commit', '--allow-empty', '-m', 'unreviewed')
+        self.git('push', 'origin', 'taskq-1')
+        with self.assertRaisesRegex(SystemExit, 'does not match result'):
+            self.close()
+        self.assertEqual((self.task(1)['state'], self.main_sha()), ('review', self.base))
+
+    def test_red_pending_or_missing_ci_never_publishes(self):
+        for checks in ([], [{'status': 'queued', 'conclusion': None}], [{'status': 'completed', 'conclusion': 'failure'}]):
+            self.checks = {'check_runs': checks}
+            with self.subTest(checks=checks), self.assertRaisesRegex(SystemExit, 'CI is not green'):
+                self.close()
+            self.assertEqual((self.task(1)['state'], self.main_sha()), ('review', self.base))
+
+    def test_main_advance_during_ci_refuses_push_without_losing_work(self):
+        self.git('checkout', 'main')
+        self.git('commit', '--allow-empty', '-m', 'concurrent main')
+        newer = self.git('rev-parse', 'HEAD')
+
+        def ci(*_):
+            self.git('push', 'origin', 'main')  # main advances after the ancestry check
+            return self.checks
+        with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq, 'run_api', side_effect=ci), \
+                self.assertRaisesRegex(SystemExit, 'rejected'):
+            self.run_cli('close', '1')
+        self.assertEqual((self.task(1)['state'], self.main_sha()), ('review', newer))
+
+    def test_gitlab_candidate_requires_latest_exact_pipeline(self):
+        taskq.CONFIG.update(board='gitlab')
+        for pipelines in ([], [{'sha': 'b' * 40, 'status': 'success'}], [{'sha': self.sha, 'status': 'failed'}]):
+            with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq, 'run_api', return_value=pipelines), \
+                    self.assertRaisesRegex(SystemExit, 'CI is not green'):
+                self.run_cli('close', '1')
+            self.assertEqual(self.main_sha(), self.base)
+        with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), \
+                mock.patch.object(taskq, 'run_api', return_value=[{'sha': self.sha, 'status': 'success'}]) as api:
+            self.run_cli('close', '1')
+        self.assertIn(f'pipelines?sha={self.sha}', api.call_args.args[3])
+        self.assertEqual(self.main_sha(), self.sha)
+
+
 class PullRequests(Base):
     """pr mode: `close` drives gh / glab, faked here by the command name."""
 
@@ -243,12 +358,13 @@ class PullRequests(Base):
         self.assertIn('`git push --force-with-lease origin HEAD:refs/heads/taskq-1`', prompt)
         self.assertIn('`gh pr create --base main --head taskq-1 --title "<title>" --body "<summary>"`', prompt)
         self.assertIn('--sha <PR head full SHA>', prompt)
-        self.assertIn('`git fetch origin && git rebase origin/main`, run the tests', prompt)  # #334: up to date before result
+        self.assertIn('`git fetch origin && git rebase origin/main`, run the tests required by § 10 Testing policy', prompt)  # #334: up to date before result
         self.assertIn('taskq.md` first and do only what it allows (R13)', prompt)  # #505: spec first
         taskq.CONFIG['board'] = 'gitlab'
         self.assertIn('`glab mr create --yes --target-branch main --source-branch taskq-1', taskq.brief(item, 'claude'))
         taskq.CONFIG['publish'] = 'direct'
-        self.assertIn('`git push origin HEAD:main`', taskq.brief(item, 'claude'))
+        self.assertNotIn('HEAD:main', taskq.brief(item, 'claude'))
+        self.assertIn('--sha <candidate full SHA>', taskq.brief(item, 'claude'))
         self.assertIn('git worktree add -b taskq-1 .worktrees/taskq-1', taskq.brief(item, 'claude'))
         taskq.CONFIG['workspace'] = 'external'  # #477
         self.assertNotIn('git worktree add', taskq.brief(item, 'claude'))

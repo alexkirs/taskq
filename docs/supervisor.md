@@ -142,3 +142,13 @@ events `wait` prints changes.
   rework, exact-SHA merge, close and retirement of both sessions; a Codex supervisor idle across turns is not
   respawned, a killed one is recovered once; proves or refutes § 5.2, records the Claude idle `state` and the turn-end pass live; measures
   total cost and manager context.
+
+## 8. Prepublication evidence (#533)
+
+The accepted [#530 methodology](https://github.com/alexkirs/taskq/issues/530#issuecomment-6073516046)
+is applied in `taskq.md` R5/R8/R12/R13, § 5/§ 6/§ 7/§ 10. That contract is the testing/publication SoT.
+The worker transfers a candidate in both modes; the accepting supervisor reviews exact-SHA checks and applicable
+isolated live qualification before `close` publishes. Direct mode uses the existing `taskq-N` branch without a PR;
+close fast-forward pushes the accepted immutable SHA after remote-head and CI checks. PR exact-head merging stays.
+Legacy already-published results and research answers close without a new publication, and prove no unobserved
+live behavior. Existing claims are not rebound. No suite migration or new paid benchmark is part of #533.

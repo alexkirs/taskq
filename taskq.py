@@ -2462,7 +2462,7 @@ def qualified_checks(commit, upstream):
     if not re.fullmatch(r'(?:https://github\.com/|git@github\.com:)alexkirs/taskq(?:\.git)?/?', upstream):
         fail('update requires the canonical github.com/alexkirs/taskq upstream')
     try:
-        done = subprocess.run([shutil.which('gh') or fail('gh not found'), 'api', '--paginate', '--slurp',
+        done = subprocess.run([shutil.which('gh') or fail('gh not found'), 'api', '--hostname', 'github.com', '--paginate', '--slurp',
                                f'repos/alexkirs/taskq/commits/{commit}/check-runs'],
                               capture_output=True, text=True, encoding='utf-8', timeout=30)
     except subprocess.TimeoutExpired:

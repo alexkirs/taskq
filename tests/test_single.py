@@ -3278,6 +3278,18 @@ class Contract(Base):
         with self.assertRaisesRegex(SystemExit, 'canonical'):
             taskq.qualified_checks(sha, 'https://example.com/arbitrary/taskq')
 
+    def test_update_ci_pins_canonical_host_despite_gh_host_override(self):
+        sha = 'a' * 40
+        check = dict(name='tests', head_sha=sha, status='completed', conclusion='success')
+        with mock.patch.dict(os.environ, {'GH_HOST': 'enterprise.invalid'}), \
+                mock.patch.object(taskq.shutil, 'which', return_value='gh'), \
+                mock.patch.object(taskq.subprocess, 'run', return_value=mock.Mock(returncode=0,
+                    stdout=json.dumps([{'check_runs': [check]}]), stderr='')) as run:
+            taskq.qualified_checks(sha, 'https://github.com/alexkirs/taskq')
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index('--hostname') + 1], 'github.com')
+        self.assertEqual(argv[-1], f'repos/alexkirs/taskq/commits/{sha}/check-runs')
+
     def test_managed_launcher_pins_new_process_code_and_contract(self):
         install = self.root / 'installed'
         source = (ROOT / 'taskq.py').read_text('utf-8')

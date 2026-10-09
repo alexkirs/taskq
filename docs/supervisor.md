@@ -90,7 +90,7 @@ is idle (resumed on the next event), not listed or `failed` is dead. Death count
 ## 4. One controller
 
 - The board's `supervisor` field names the controller. `run`, `close` and a rework `requeue` of a supervised task
-  come from that session; another agent session is refused, except the machine's manager (recorded by `taskq pm`)
+  come from that session; another agent session is refused, except the task's manager (its `pm`, #532)
   on the owner's word, and the owner's shell. Their `requeue`, `later` or `close` drops the supervisor.
 - The pass never judges: it spawns, wakes, checks liveness and retires, and only on the board's word (the order,
   the event, the recorded id). The dispatch lock (#357) keeps passes from racing on one machine.
@@ -117,8 +117,11 @@ is idle (resumed on the next event), not listed or `failed` is dead. Death count
    board and the manager's `taskq wait` or a sender carries it (R4). A Codex app or DOT cloud thread with no local rollout has no
    `exec resume` route; it gets the line only through an independent Codex app sender or when next talked to (#522).
    A Claude sender reaches only Claude sessions.
-4. **No manager on the machine.** Supervisor runtime follows the machine's manager (`.taskq/pm.json`); a machine
-   with none starts no supervisor and its tasks wait (the table says `no manager`).
+4. **No manager on the task.** Supervisor runtime and machine follow the task's own manager, its `pm` on the board
+   (#532), never `.taskq/pm.json`; a task with none starts no supervisor and waits (the table says `no manager`)
+   until a manager adopts it (`taskq pm --adopt N`). A Codex and a Claude manager share one checkout without taking
+   each other's tasks, gate or `wait` events. The dispatch lock serializes one checkout only; across checkouts or
+   machines the board has no compare-and-swap (`taskq.md` R4).
 5. **Cross-machine.** A Codex supervisor is woken only by a pass on its own machine; a pass elsewhere shows its bare
    id (R6) and cannot wake or retire it.
 
@@ -133,7 +136,7 @@ events `wait` prints changes.
 ## 7. Follow-ups
 
 - #525 shipped § 3 and § 4: `supervisor` block field, `run`, the id gate, pass step 4, `wait --task N`, `pm.json`
-  runtime and id, the idle/dead state of § 3a, the Codex turn-end pass, retire by recorded id (R11); tests on fakes
+  runtime and id (replaced by the task's `pm` in #532), the idle/dead state of § 3a, the Codex turn-end pass, retire by recorded id (R11); tests on fakes
   only.
 - #526 live check (`--deps 525`): Claude manager and Codex manager, each a full cycle with a controlled CI failure,
   rework, exact-SHA merge, close and retirement of both sessions; a Codex supervisor idle across turns is not

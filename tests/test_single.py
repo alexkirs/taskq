@@ -97,6 +97,7 @@ class Commands(Base):
         self.assertEqual((first['state'], first['runtime'], first['priority'], first['scope'], first['type']),
                          ('ready', 'claude', 1, ['x.py'], 'code'))
         self.assertEqual(self.board.issues[1]['comments'], ['**add** · claude:01234567'])
+        self.assertEqual(first['pm'], {'runtime': 'claude', 'session': SESSION, 'name': 'mac'})  # #532: its manager, on the board
 
     def test_list(self):
         self.add('one')
@@ -401,15 +402,19 @@ class Tick(Base):
         patcher = mock.patch.object(taskq, 'runtimes', return_value={'fake': self.fake})
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.manager('fake')  # this test session is the machine's manager; supervisors run in its runtime
+        self.manager('fake')  # this test session files the tasks: their manager; supervisors run in its runtime
 
-    def manager(self, runtime):
-        (self.root / '.taskq').mkdir(exist_ok=True)
-        (self.root / '.taskq' / 'pm.json').write_text(json.dumps({'contract': None, 'runtime': runtime, 'session': SESSION}))
+    def manager(self, runtime, sid=SESSION, name='mac'):
+        """The tasks added from now on record this manager as their `pm` (R3, #532)."""
+        patcher = mock.patch.object(taskq, 'origin', return_value={'runtime': runtime, 'session': sid, 'name': name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def unmanaged(self):
-        """No manager on this machine: ready tasks wait, no supervisor starts (R3)."""
-        (self.root / '.taskq' / 'pm.json').unlink()
+        """Tasks added from now on have no manager: they wait, no supervisor starts (R3)."""
+        patcher = mock.patch.object(taskq, 'origin', return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def legacy(self, n, session=None):
         """Task n as an unsupervised worker's (R3 Transition: started before #525 or taken by hand)."""
@@ -831,7 +836,7 @@ class Tick(Base):
         # R3 (#525): run and close come from the supervisor, the manager or the owner; repeats spawn nothing more
         self.add('one')
         for command in (('run', '1'), ('requeue', '1')):
-            with self.acting('s-T9'), self.assertRaisesRegex(SystemExit, 'only it, the manager or the owner controls it'):
+            with self.acting('s-T9'), self.assertRaisesRegex(SystemExit, 'only it, the task.s manager or the owner controls it'):
                 self.run_cli(*command)
         with self.acting(''):  # the owner's shell
             self.run_cli('run', '1')
@@ -842,7 +847,7 @@ class Tick(Base):
         self.assertEqual(self.fake.names, ['S1 CLD one (mac)', 'T1 CLD one (mac)'])
         with self.acting('s-T1'):
             self.run_cli('result', '1', '--sha', 'a' * 40)
-            with self.assertRaisesRegex(SystemExit, 'only it, the manager or the owner'):  # the worker never closes its own task
+            with self.assertRaisesRegex(SystemExit, 'only it, the task.s manager or the owner'):  # the worker never closes its own task
                 self.run_cli('close', '1')
         with self.assertRaisesRegex(SystemExit, 'has no supervisor'):
             self.add('two')
@@ -922,7 +927,7 @@ class Tick(Base):
         self.assertEqual(self.fake.sent, [('s-S1', 'review #1: read your issue')])
         self.assertEqual((self.task(1)['supervisor']['session'], self.board.issues[1]['comments'][-1]),
                          ('s-S1r', '**nudge** · claude:01234567\n\nsupervisor s-S1r replaces s-S1'))
-        with self.acting('s-S1'), self.assertRaisesRegex(SystemExit, 'only it, the manager or the owner'):
+        with self.acting('s-S1'), self.assertRaisesRegex(SystemExit, 'only it, the task.s manager or the owner'):
             self.run_cli('close', '1')
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), self.acting('s-S1r'):
             self.assertEqual(self.run_cli('wait', '--task', '1', '--window', '0'), 'tick\n')  # already delivered
@@ -987,7 +992,7 @@ class Tick(Base):
         for sid in ('s-S1', 's-T1'):
             with self.acting(sid), self.assertRaisesRegex(SystemExit, 'cannot take the manager role'):
                 self.run_cli('pm')
-        self.assertEqual(taskq.manager()['session'], SESSION)
+        self.assertFalse((self.root / '.taskq' / 'pm.json').exists())  # refused: nothing written
 
 
 class Wait(Tick):
@@ -1115,6 +1120,111 @@ class Wait(Tick):
         self.assertEqual(self.fake.stopped, ['s-T1', 's-S1'])
 
 
+class MultiPM(Base):
+    """#532 (R1, R3, R4): a Codex and a Claude manager share one checkout and board; each task's `pm` is the authority."""
+    A, B = {'CODEX_THREAD_ID': 'pmA-codex', 'TASKQ_RUNTIME': 'codex'}, {'CLAUDE_CODE_SESSION_ID': 'pmB-claude', 'TASKQ_RUNTIME': 'claude'}
+    legacy, acting = Tick.legacy, Tick.acting
+
+    def setUp(self):
+        super().setUp()
+        self.fake, self.cdx, self.cld, clock = FakeRuntime(), FakeRuntime(), FakeRuntime(), [0.0]
+        taskq.CONFIG.update(limits={'fake': 3}, repo='o/r')
+        for patcher in (mock.patch.object(taskq, 'runtimes', return_value={'fake': self.fake, 'codex': self.cdx, 'claude': self.cld}),
+                        mock.patch.object(taskq.time, 'time', lambda: clock[0]),  # wait's window passes at once
+                        mock.patch.object(taskq.time, 'sleep', lambda pause: clock.__setitem__(0, clock[0] + pause))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        (self.root / 'taskq.md').write_text('## Principles\nx\n## 7. Manager\ny\n## 8. Runtimes\n')
+
+    def pm(self, env):
+        """Run the next commands as that manager session ({}: a plain shell)."""
+        return mock.patch.dict(os.environ, {'TASKQ_HOST': 'mac', **env}, clear=True)
+
+    def test_second_manager_neither_reroutes_nor_takes_the_gate(self):
+        # the review repro: PM_A Codex adds, PM_B Claude runs `taskq pm`, PM_A ticks: the task keeps a Codex S and PM_A's gate
+        with mock.patch.object(taskq, 'dispatch'):  # the add's own pass comes later, as in the repro
+            with self.pm(self.A):
+                self.add('one', '--runtime', 'fake')
+            with self.pm(self.B):
+                self.run_cli('pm')
+            with self.pm(self.A):
+                self.run_cli('tick')
+            self.assertEqual((self.cdx.names, getattr(self.cld, 'names', [])), (['S1 CDX one (mac)'], []))
+            self.assertEqual(self.task(1)['supervisor']['runtime'], 'codex')
+            with self.pm(self.B), self.assertRaisesRegex(SystemExit, 'only it, the task.s manager or the owner'):
+                self.run_cli('run', '1')
+            with self.pm(self.A):
+                self.run_cli('run', '1')  # its own manager passes the gate
+        self.assertEqual(self.task(1)['raw']['order'], 'run')
+        self.assertNotIn('runtime', json.loads((self.root / '.taskq' / 'pm.json').read_text()))
+
+    def test_two_managers_route_and_wait_independently(self):
+        # simultaneous managers: each task keeps its pm's supervisor runtime; each wait gets its own outcomes, once
+        with self.pm(self.A):
+            self.add('one', '--runtime', 'fake')
+        with self.pm(self.B):
+            self.add('two', '--runtime', 'fake')
+        with self.pm({}):  # a plain shell with no TASKQ_RUNTIME: no pm, the task waits (R3 Transition)
+            self.add('three', '--runtime', 'fake')
+        self.legacy(3)
+        self.assertEqual((self.cdx.names, self.cld.names), (['S1 CDX one (mac)'], ['S2 CLD two (mac)']))
+        for env in (self.A, self.B):
+            with self.pm(env):
+                self.assertEqual(self.run_cli('wait'), 'tick\n')
+        for sid in ('s-S1', 's-S2'):
+            with self.acting(sid):
+                self.run_cli('run', sid[-1])
+        with self.acting('s-T1'):
+            self.run_cli('result', '1', '--sha', 'a' * 40)
+        with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), self.acting('s-S1'):
+            self.run_cli('close', '1', '--text', 'checked')
+        with self.acting('s-T2'):
+            self.run_cli('ask', '2', '--text', 'which?')
+        with self.acting('s-T3'):
+            self.run_cli('result', '3', '--sha', 'b' * 40)
+        with self.pm(self.A):
+            self.assertEqual(self.run_cli('wait'), 'review #3\nclosed #1 checked\n')
+        with self.pm(self.B):
+            self.assertEqual(self.run_cli('wait'), 'ask #2\nreview #3\n')
+        for env in (self.A, self.B):
+            with self.pm(env):
+                self.assertEqual(self.run_cli('wait'), 'tick\n')  # never twice, never the other's
+
+    def test_duplicate_events_on_a_shared_task_spawn_one_worker(self):
+        # both managers tick a shared task; a list from before the spawn still shows the order: the re-read wins (one T<N>)
+        with self.pm(self.A):
+            self.add('one', '--runtime', 'fake')
+        with mock.patch.object(taskq, 'dispatch'):
+            with self.acting('s-S1'):
+                self.run_cli('run', '1')
+            stale = [dict(self.board.issues[1])]
+            with self.pm(self.A):
+                self.run_cli('tick')
+            for env in (self.B, self.A):
+                with self.pm(env), mock.patch.object(self.board, 'list', return_value=stale):
+                    self.run_cli('tick')
+        self.assertEqual((self.cdx.names, self.fake.names), (['S1 CDX one (mac)'], ['T1 CDX one (mac)']))
+
+    def test_adoption_is_explicit_and_keeps_claims(self):
+        # a task with no pm waits; one manager adopts it; the other is refused; a started task keeps its sessions
+        with self.pm({}):
+            self.add('one', '--runtime', 'fake')
+            self.add('two', '--runtime', 'fake')
+        self.legacy(2)
+        with self.pm(self.A):
+            self.assertIn('| [#1](https://board/1) | ready (no manager) |', self.run_cli('tick'))
+        claim = self.task(2)['claim']
+        with self.pm(self.B):
+            self.run_cli('pm', '--adopt', '1', '2')
+        with self.pm(self.A), self.assertRaisesRegex(SystemExit, 'cannot adopt: #1 .claude:pmB-clau. already has a manager'):
+            self.run_cli('pm', '--adopt', '1')
+        self.assertEqual((self.task(1)['pm']['session'], self.task(2)['claim']), ('pmB-claude', claim))
+        self.assertEqual(self.board.issues[1]['comments'][-1], '**adopt** · claude:pmB-clau\n\npm claude:pmB-claude')
+        with self.pm(self.A):
+            self.run_cli('tick')
+        self.assertEqual((getattr(self.cdx, 'names', []), self.cld.names), ([], ['S1 CDX one (mac)']))  # A's pass starts B's task in B's runtime (ORCH: the launcher)
+
+
 class Contract(Base):
     """#430: `taskq pm` gives the manager role; tick and wait pull the clone and say when the contract changed."""
 
@@ -1129,7 +1239,7 @@ class Contract(Base):
         for part in ('### R6. Human report', '### R13. Spec first', '## 7. Manager', '### After each pass', '### Take requests', 'run_in_background'):
             self.assertIn(part, out)
         self.assertNotIn('## 8. Runtimes', out)
-        self.assertEqual(json.loads((self.root / '.taskq' / 'pm.json').read_text()), {'contract': digest, 'runtime': 'claude', 'session': SESSION})
+        self.assertEqual(json.loads((self.root / '.taskq' / 'pm.json').read_text()), {'contract': digest})  # #532: the hash only
 
     def test_changed_contract_until_pm(self):
         line = 'The manager contract changed: run taskq pm and follow it from now on.'
@@ -1367,9 +1477,7 @@ class RealChild(unittest.TestCase):
         (root / 'board.py').write_text(FILE_BOARD)
         (root / 'fake.py').write_text(FILE_RUNTIME)
         (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'runtimes': {'fake': 'fake.py'}, 'limits': {'fake': 1}}))
-        (root / '.taskq').mkdir()
-        (root / '.taskq' / 'pm.json').write_text('{"contract": null, "runtime": "fake", "session": null}')  # the manager's runtime
-        env = {'PATH': '', 'TASKQ_HOST': 'mac', 'HOME': str(root)}  # no claude or codex on PATH: their retire fails quietly
+        env = {'PATH': '', 'TASKQ_HOST': 'mac', 'HOME': str(root), 'TASKQ_RUNTIME': 'fake'}  # a shell manager: the task's pm runtime  # no claude or codex on PATH: their retire fails quietly
         done = REAL_RUN([taskq.sys.executable, str(ROOT / 'taskq.py'), 'add', 'T', '--goal', 'g', '--acceptance', 'a'],
                         cwd=root, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual((done.returncode, done.stdout), (0, '#1 ready\n'), done.stderr)

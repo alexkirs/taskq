@@ -4,5 +4,6 @@ build/
 .local/
 .worktrees/
 /taskq.local.toml
-.claude/
+.claude/*
+!.claude/settings.json
 .taskq/

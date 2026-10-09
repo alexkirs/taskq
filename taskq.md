@@ -391,6 +391,11 @@ No fixed interval (#407): the manager is woken only when it has work.
 
 - No agent: any scheduler (cron, Windows Task Scheduler) that runs `taskq tick` in the project root
   every 5 minutes; nobody reads the table then, so check `taskq list` yourself.
+- The manager auto-compacts at 200k tokens (#507; a compacted manager costs ~10x less per tick, #503). Claude: the
+  project's `.claude/settings.json` has `"autoCompactWindow": 200000`. Codex: start the manager with the line
+  `taskq arm tick` prints, `-c model_auto_compact_token_limit=200000` and `compact_prompt` "Keep only the owner's
+  open questions and decisions; the board is the state." Model, effort and permissions stay as they are (R9).
+  Changed: the manager compacted at the runtime default → at 200k tokens with that prompt (#507).
 - One tick sender per machine. Any machine may tick; each starts only tasks with no `host-*` label or its own.
 
 ### One tick pass

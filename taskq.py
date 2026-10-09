@@ -972,6 +972,9 @@ def cmd_pm(args):
           f'`taskq` is `python3 {Path(__file__).resolve()}`.\n\n' + '\n'.join(sections))
     cmd_arm(argparse.Namespace(target=None))
 
+CODEX_COMPACT = ('-c model_auto_compact_token_limit=200000 -c "compact_prompt=\\"Keep only the owner\'s open questions and '
+                 'decisions; the board is the state.\\""')  # #507: a compacted manager costs ~10x less per tick (#503)
+
 def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
     runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
@@ -980,7 +983,8 @@ def cmd_arm(args):
         return print(f'''Arm the tick in this session. Run `{wait}` as a background command (Claude Code: run_in_background).
 When it ends you are woken with its output (`review #N`, `ask #N`, `gone #N` or `tick`): run one pass (`taskq tick`),
 do § 7 After each pass for those tasks, then start `{wait}` in the background again. Keep exactly one wait running.
-A runtime that cannot wake a session when a background command ends (Codex): use `taskq arm tick "<manager>"` from a separate sender session.''')
+A runtime that cannot wake a session when a background command ends (Codex): use `taskq arm tick "<manager>"` from a separate sender session.
+Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.json autoCompactWindow 200000).''')
     print(f'''You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
 Repeat forever, from {CONFIG["root"]}:
 1. Run `python3 {Path(__file__).resolve()} wait`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.

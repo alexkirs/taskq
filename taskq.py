@@ -80,6 +80,30 @@ def mine(item):
         wanted = CONFIG['me'] = CONFIG.get('me') or BOARD.user()  # one board call per process
     return not wanted or wanted in item['assignees']
 
+def execution_reason(item):
+    """#545: native assignees authorize execution, independently of selection and PM/controller routing."""
+    if 'assignee-only' not in item['labels']:
+        return None
+    prefix = f'#{item["iid"]} assignee-only'
+    if not item['assignees']:
+        return f'{prefix}: no board assignees; execution refused'
+    try:
+        identity = BOARD.user()  # never CONFIG['assignee'] or its cached 'me'
+    except (Exception, SystemExit) as error:
+        fail(f'{prefix}: authenticated board identity unavailable: {error}')
+    if not isinstance(identity, str) or not identity.strip():
+        return f'{prefix}: authenticated board identity is empty; execution refused'
+    if identity not in item['assignees']:
+        return f'{prefix}: authenticated board user {identity} is not assigned; execution refused'
+    return None
+
+def executable(item):
+    reason = execution_reason(item)
+    if reason:
+        print(f'taskq: {reason}', file=sys.stderr)
+    return reason is None
+
+
 def block(text, fields):
     """The description: the task's text, then its JSON block. Keys the model does not know are kept as they are."""
     return f'{text}\n\n<!-- taskq:start -->\n```json\n{json.dumps(fields, indent=1, ensure_ascii=False)}\n```\n<!-- taskq:end -->'
@@ -454,10 +478,19 @@ def cmd_list(args):
               + (f'  [{detail}]' if detail else ''))
 
 def cmd_take(args):
-    current, mine = task(args.n, 'ready'), session() or fail('take needs an agent session: set ' + ' or '.join(SESSIONS.values()))
-    if open_deps(current['deps']):
-        fail(f'#{args.n} has open dependencies')
-    move(current, 'doing', 'take', claim={**mine, 'name': machine()}, result=None)
+    me = session() or fail('take needs an agent session: set ' + ' or '.join(SESSIONS.values()))
+    with dispatch_lock() as locked:
+        if not locked:
+            fail('cannot take: another taskq process holds .taskq/dispatch.lock')
+        current = task(args.n, 'ready')
+        reason = execution_reason(current)
+        if reason:
+            fail(reason)
+        if current['supervisor']:
+            fail(f'#{args.n} already has a supervisor')
+        if open_deps(current['deps']):
+            fail(f'#{args.n} has open dependencies')
+        move(current, 'doing', 'take', claim={**me, 'name': machine()}, result=None)
 
 def decision(args):
     """#490: the decision card of an ask or result: what was done (the text's first line), results, options, one recommended."""
@@ -985,12 +1018,15 @@ def follow(item, kind, claim, supervised):
 
 def supervise(item, kinds):
     """§ 7 step 4, a supervised task whose supervisor runs here: the pass is its hands, never its judge."""
+    current = parse(BOARD.get(item['iid']))
+    if not current or not executable(current):
+        return
     n, boss, claim = item['iid'], item['supervisor'], item['claim'] or {}
     lead = kinds.get(boss['runtime'])
     if lead is None:
         return
     fresh = item['raw'].get('order') and claim.get('runtime') in kinds and parse(BOARD.get(n))  # #532: the list may lag a spawn
-    if fresh and fresh['raw'].get('order') and not (fresh['claim'] or {}).get('session'):  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
+    if fresh and fresh['raw'].get('order') and not (fresh['claim'] or {}).get('session') and executable(fresh):  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
         kind = kinds[claim['runtime']]
         sid = kind.spawn(worker_name(item), brief(item, claim['runtime']), CONFIG['root'])
         item['claim'], item['raw']['order'] = {**claim, 'session': sid}, None
@@ -1123,6 +1159,10 @@ def one_pass(args, table=True):
         busy, ready = {}, items if held and not blind else []
         for item in ready:
             claim = item['claim'] or {}
+            if not executable(item):
+                if item['state'] in ('doing', 'review', 'ask') and claim.get('name') == here:
+                    busy[claim.get('runtime')] = busy.get(claim.get('runtime'), 0) + 1
+                continue
             if item['state'] == 'waiting' and not open_deps(item['deps']):
                 move(item, 'ready', 'ready', 'dependencies closed')
                 item['state'] = 'ready'
@@ -1134,6 +1174,10 @@ def one_pass(args, table=True):
                 continue
             if item['state'] != 'doing' or claim.get('name') != here or claim.get('runtime') not in kinds:
                 continue  # another machine's, or a session no runtime here can see
+            fresh = parse(BOARD.get(item['iid'])) if 'assignee-only' in item['labels'] else item
+            if not fresh or not executable(fresh):
+                busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
+                continue
             runtime = kinds[claim['runtime']]  # step 2: unsupervised (R3 Transition: started before #525, or taken by hand)
             state = runtime.alive(claim['session'])
             if state is False:
@@ -1156,7 +1200,7 @@ def one_pass(args, table=True):
             names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
             free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 1)), None)
             fresh = free and parse(BOARD.get(item['iid']))  # #357: the board may have moved since the list
-            if fresh and fresh['state'] == 'ready' and fresh['pm'] == item['pm']:  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
+            if fresh and fresh['state'] == 'ready' and fresh['pm'] == item['pm'] and executable(fresh):  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
                 item.update(fresh)
                 runtime = lead(item)
                 session = kinds[runtime].spawn(worker_name(item, 'S'), supervisor_brief(item, runtime, kinds[runtime]), CONFIG['root'])
@@ -1321,6 +1365,11 @@ def adopt(numbers, me):
         held = [f'#{item["iid"]} ({item["pm"]["runtime"]}:{(item["pm"]["session"] or "shell")[:8]})' for item in adopted if item['pm']]
         if held:  # explicit, never the last writer
             fail(f'cannot adopt: {" ".join(held)} already has a manager')
+        for item in adopted:
+            if not item['claim'] and not item['supervisor']:
+                reason = execution_reason(item)
+                if reason:
+                    fail(reason)
         for item in adopted:
             move(item, item['state'], 'adopt', f'pm {origin()["runtime"]}:{me.get("session") or "shell"}', pm=origin())
 

@@ -23,6 +23,8 @@ rule or amend this one, never keep both. A new rule gets the next R-number.
 
 The issue's `q-*` label, its JSON block and trusted comments hold all task state, claims and history (§ 3). No extra
 database, queue, receipt store, mirror or protocol. Local files under `.taskq/` are runtime handles only (§ 8).
+Changed: execution had no per-task identity restriction → `assignee-only` uses native board Assignees,
+never a duplicate identity field or per-user label (#545, owner decision 2026-10-09).
 
 ### R2. One task, one supervisor and one worker session
 
@@ -80,6 +82,8 @@ end; its `pm` only adds the manager's gate and `wait` events. Until adopted, the
 manager's `wait` shows it.
 Changed: a pass with no manager spawned `T<N>` itself → it starts nothing; the supervisor's runtime has no source (#525).
 Changed: no manager recorded on the machine → no `pm` on the task; adoption is one explicit command per task (#532).
+Changed: any board identity could execute a task → `assignee-only` requires authenticated assignee membership
+(§ 3); PM routing and controller authority still apply, and reassignment never rebinds active sessions (#545).
 
 ### R4. Tick is a message or a queue event
 
@@ -120,6 +124,9 @@ sender's routes, its one-blocker stop and the Codex rollout rule above stay as #
 Changed: a sandboxed Codex supervisor's or worker's commands waited for a pass from a sender, a manager tick or a
 scheduler → the pass at its turn's end runs them (#525). The owner runs no sender, timer or lifetime extension for
 the queue to move; a separate sender is only one way to wake a manager that cannot wake itself (§ 7).
+
+Changed: dispatch eligibility used only host/PM/filter routing → labeled tasks also require authenticated
+board identity at fresh dispatch reads and continuation; manual `take` uses the same policy (#545).
 
 ### R5. Worker writes completion to the task
 
@@ -293,7 +300,8 @@ Owner decisions on what taskq looks and sounds like, one line each (#505). Chang
 
 Board file: six module-level functions. An issue is a dict `{iid, title, body, labels, state: open|closed,
 updated_at, url}`, optionally `assignees` (logins); `get` adds `comments` (a list of strings, oldest first).
-With `"assignee": "me"` the file also needs `user()`: the current login.
+With `"assignee": "me"` or `assignee-only` the file also needs `user()`: the authenticated current login.
+The configured `assignee` filter (and its cached `me`) is selection, never identity authentication.
 
 | Function | Does |
 |---|---|
@@ -332,6 +340,20 @@ Runtime file: four module-level functions, three more optional.
 
 - Other labels: type `code`, `docs`, `research`, `asset`; `priority-1` or `priority-2` (lower first);
   `run-<runtime>` (none: any runtime); `host-<machine>` (none: any machine).
+- `assignee-only` (#545): execution is allowed only when the board's authenticated `user()` is in the native
+  Assignees list. Without this label behavior and configured filters stay unchanged. Multiple assignees are
+  eligible; eligibility grants no PM/controller authority and no extra worker slot or atomic board lock (R2–R4).
+  Check at manual `take`, fresh dispatch reads, and before continuing/spawning/resuming recorded sessions.
+  Manual `take` shares the checkout dispatch lock, reads under it, and refuses an existing supervisor;
+  multiple eligible identities still cannot claim an already doing task. Cross-checkout races remain R4 limits.
+  No assignees, missing/empty identity or identity lookup errors fail closed with a visible reason; a configured
+  login or cached `me` never supplies authentication. GitHub and GitLab use the same policy through their adapters.
+  Reassignment never steals or retires active work, changes its PM, or rebinds its supervisor/worker: an ineligible
+  pass leaves its sessions and orders untouched and holds its existing slot. Recorded controller commands remain
+  authorized by § 4; execution by a later pass still needs eligibility. Adoption of an unstarted task requires
+  eligibility; adoption of already recorded sessions changes only PM routing (R3 Transition), never their claims.
+  Older clients cannot enforce this label. It is cooperative TaskQ policy, not platform ACL security; board and
+  repository permissions remain the security boundary.
 - The description holds the text (`## Goal`, `## Acceptance`) and one JSON block between
   `<!-- taskq:start -->` and `<!-- taskq:end -->`:
 

@@ -1203,7 +1203,7 @@ def cmd_wait(args):
     .taskq/wait-<session>.json (a shell: wait.json) keeps the states last reported to this manager, so an event is printed once each."""
     if args.task:
         return wait_task(args)
-    me, kinds, here = (session() or {}).get('session'), runtimes(), machine()
+    me, kinds, here = args.pm or (session() or {}).get('session'), runtimes(), machine()  # --pm: a sender waits as its manager (R4)
     path = CONFIG['root'] / '.taskq' / (f'wait-{me}.json' if me else 'wait.json')  # #532: each manager's events, once each
     ours = lambda item: not me or (item['pm'] or {}).get('session') in (None, me)  # its own tasks and those with no manager
     seen = json.loads(path.read_text('utf-8')) if path.is_file() else {}
@@ -1270,18 +1270,29 @@ def refresh():
     if contract() and known and known != contract():  # no pm.json: this session never took the role
         print('The manager contract changed: run taskq pm and follow it from now on.')
 
+def adopt(numbers, me):
+    """R3 Transition (#532): record this session as the `pm` of tasks with none. The dispatch lock and a read under it keep
+    two adoptions in one checkout from overwriting each other; across checkouts nothing is atomic (R4)."""
+    if not origin():
+        fail('cannot adopt: a plain shell needs TASKQ_RUNTIME')
+    with dispatch_lock() as locked:
+        if not locked:
+            fail('cannot adopt: another taskq process holds .taskq/dispatch.lock; nothing adopted, run it again')
+        adopted = [task(n) for n in numbers]
+        held = [f'#{item["iid"]} ({item["pm"]["runtime"]}:{(item["pm"]["session"] or "shell")[:8]})' for item in adopted if item['pm']]
+        if held:  # explicit, never the last writer
+            fail(f'cannot adopt: {" ".join(held)} already has a manager')
+        for item in adopted:
+            move(item, item['state'], 'adopt', f'pm {origin()["runtime"]}:{me.get("session") or "shell"}', pm=origin())
+
 def cmd_pm(args):
     """The manager role: Principles and § 7 of taskq.md, then how to tick this session; the hash goes to .taskq/pm.json,
     nothing else: a task's manager is its own `pm` on the board (R3, #532). `--adopt N`: become the `pm` of tasks with none."""
     me = session() or {}
     if me and any(role(item) in ('supervisor', 'worker') for item in map(parse, BOARD.list(None)) if item):
         fail('a recorded supervisor or worker cannot take the manager role (R3 one controller)')
-    adopted = [task(n) for n in args.adopt or []]
-    held = [f'#{item["iid"]} ({item["pm"]["runtime"]}:{(item["pm"]["session"] or "shell")[:8]})' for item in adopted if item['pm']]
-    if held or adopted and not origin():  # explicit, never the last writer (R3 Transition)
-        fail(f'cannot adopt: {" ".join(held)} already has a manager' if held else 'cannot adopt: a plain shell needs TASKQ_RUNTIME')
-    for item in adopted:
-        move(item, item['state'], 'adopt', f'pm {origin()["runtime"]}:{me.get("session") or "shell"}', pm=origin())
+    if args.adopt:
+        adopt(args.adopt, me)
     text, digest = (CLONE / 'taskq.md').read_text('utf-8'), contract()
     sections = re.findall(r'^## (?:Principles|7\. Manager)\b.*?(?=^## )', text, re.M | re.S)
     (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
@@ -1321,6 +1332,8 @@ When it ends you are woken with its output (`ask #N`, `closed #N <text>`, `revie
 do § 7 After each pass for those tasks, then start `{wait}` in the background again. Keep exactly one wait running.
 Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.json autoCompactWindow 200000).''')
     resume = f'codex exec {shlex.join(codex_options())} resume {args.target}'  # the options a worker turn gets
+    pm = re.split(r'session_|threads/|/', args.target)[-1]  # #532: the sender consumes as its manager, the id the board records
+    wait = f'{wait} --pm {shlex.quote(pm)}'
     send, shell, note = f'with {SENDERS.get(runtime, "your messaging tool")}', '', ''
     where = rollout(args.target) if runtime == 'codex' else None
     if where == 'local':  # a CLI thread: exec resume finds it
@@ -1338,6 +1351,8 @@ Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.j
                 'whose send_message_to_thread reaches it. Not a collaboration subagent of the manager: it cannot send to its ancestor '
                 'and starts no turn. A session without that tool (a CLI worker) hands this prompt to the owner or the app manager.\n'
                 'Workers still dispatch without a sender (R4 event chain); only review, ask and gone wait for the manager.\n\n')
+    if not any((item['pm'] or {}).get('session') == pm for item in map(parse, BOARD.list(None)) if item):
+        note += f'taskq: no open task records {pm} as its pm; this wait shows only tasks with no manager until one does.\n'
     print(f'''{note}You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
 Stay in this one turn and repeat, from {CONFIG["root"]}; do not end the turn between events (an ended turn forwards nothing):
 1. Run `{wait}`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
@@ -1378,7 +1393,7 @@ def main(argv=None):
     command('tick', lambda args: (event_pass if args.quiet else cmd_tick)(args), (('--quiet',), {'action': 'store_true'}),
             (('--tasks',), {'nargs': '*', 'type': int, 'default': []}), (('--after',), {'type': int}), n=False)
     command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}),
-            (('--task',), {'type': int}), n=False)
+            (('--task',), {'type': int}), (('--pm',), {}), n=False)
     command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}), n=False)
     command('pm', cmd_pm, (('--adopt',), {'nargs': '+', 'type': int, 'default': []}), n=False)
     command('cleanup', cmd_cleanup, (('--dry-run',), {'action': 'store_true'}), n=False)

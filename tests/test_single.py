@@ -6,7 +6,9 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1030,7 +1032,8 @@ class Wait(Tick):
     def test_arm_tick_names_target_and_loop(self):
         out = self.run_cli('arm', 'tick', 'PM main')
         self.assertIn('manager session PM main', out)
-        self.assertIn('taskq.py wait`', out)
+        self.assertIn("taskq.py wait --pm 'PM main'`", out)  # #532: a name matches no task's pm, and the prompt says so
+        self.assertIn('taskq: no open task records PM main as its pm', out)
         self.assertIn('with SendMessage', out)
 
     def codex_home(self, folder, thread):
@@ -1123,7 +1126,7 @@ class Wait(Tick):
 class MultiPM(Base):
     """#532 (R1, R3, R4): a Codex and a Claude manager share one checkout and board; each task's `pm` is the authority."""
     A, B = {'CODEX_THREAD_ID': 'pmA-codex', 'TASKQ_RUNTIME': 'codex'}, {'CLAUDE_CODE_SESSION_ID': 'pmB-claude', 'TASKQ_RUNTIME': 'claude'}
-    legacy, acting = Tick.legacy, Tick.acting
+    legacy, acting, notes = Tick.legacy, Tick.acting, Tick.notes
 
     def setUp(self):
         super().setUp()
@@ -1223,6 +1226,99 @@ class MultiPM(Base):
         with self.pm(self.A):
             self.run_cli('tick')
         self.assertEqual((getattr(self.cdx, 'names', []), self.cld.names), ([], ['S1 CDX one (mac)']))  # A's pass starts B's task in B's runtime (ORCH: the launcher)
+
+    def test_overlapping_adoptions_never_overwrite(self):
+        # the review's interleaving: B adopts while A is between its read and its write. A holds the dispatch lock across
+        # both, so B is refused with nothing written (a later B meets A's pm: test_adoption_is_explicit_and_keeps_claims)
+        with self.pm({}):
+            self.add('one', '--runtime', 'fake')
+        get, refused = self.board.get, []
+
+        def get_then_b(n):  # B's adoption runs inside A's, right after A read the task
+            issue = get(n)
+            if not refused:
+                with self.pm(self.B), self.assertRaisesRegex(SystemExit, 'holds .taskq/dispatch.lock; nothing adopted'):
+                    refused.append(self.run_cli('pm', '--adopt', '1'))
+            return issue
+        with self.pm(self.A), mock.patch.object(self.board, 'get', get_then_b):
+            self.run_cli('pm', '--adopt', '1')
+        self.assertEqual(self.task(1)['pm']['session'], 'pmA-codex')
+        self.assertEqual(self.notes(1), ['**add**', '**adopt**'])  # one adoption, B wrote nothing
+    def test_concurrent_adoption_clis_one_wins(self):
+        # bounded real evidence: two `taskq pm --adopt 1` processes at once on a file board with a slow read; exactly one wins
+        (self.root / 'taskq.json').write_text('{"board": "board.py", "limits": {"claude": 0, "codex": 0}}')
+        (self.root / 'board.py').write_text(textwrap.dedent('''
+            import json, time
+            from pathlib import Path
+            FILE = Path(__file__).with_name('issues.json')
+            def load(): return json.loads(FILE.read_text())
+            def save(issues): FILE.write_text(json.dumps(issues))
+            def list(state): return [i for i in load().values() if i['state'] == 'open']
+            def get(n):
+                time.sleep(0.5)  # a slow board widens the race window
+                return load()[str(n)]
+            def add(title, body, labels): raise SystemExit('no add')
+            def update(n, labels=None, body=None):
+                issues = load(); issues[str(n)].update({k: v for k, v in (('labels', labels), ('body', body)) if v is not None}); save(issues)
+            def comment(n, text):
+                issues = load(); issues[str(n)]['comments'].append(text); save(issues)
+            def close(n): pass
+        '''))
+        with self.pm({}):
+            self.add('one', '--runtime', 'fake')
+        (self.root / 'issues.json').write_text(json.dumps({'1': {**self.board.issues[1], 'iid': 1}}))
+        script = Path(taskq.__file__).resolve()
+        procs = [REAL_POPEN([sys.executable, str(script), 'pm', '--adopt', '1'], cwd=self.root, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+                            'TASKQ_HOST': 'mac', 'HOME': str(self.root), **env}) for env in (self.A, self.B)]
+        outs = [proc.communicate(timeout=30) for proc in procs]
+        codes = sorted(proc.returncode for proc in procs)
+        issue = json.loads((self.root / 'issues.json').read_text())['1']
+        winners = [env for env, proc in zip((self.A, self.B), procs) if proc.returncode == 0]
+        self.assertEqual(codes, [0, 1], outs)
+        self.assertIn(next(iter(winners[0].values())), issue['body'])
+        self.assertEqual(sum(text.startswith('**adopt**') for text in issue['comments']), 1)
+        self.assertTrue(any('cannot adopt' in err for _, err in outs), outs)
+
+    def senders_setup(self):
+        """Task 1 is pmA-codex's and task 2 pmB-claude's, both in ask: one outcome for each manager."""
+        with self.pm(self.A):
+            self.add('one', '--runtime', 'fake')
+        with self.pm(self.B):
+            self.add('two', '--runtime', 'fake')
+        for n in (1, 2):
+            self.legacy(n)
+            with self.acting(f's-T{n}'):
+                self.run_cli('ask', str(n), '--text', 'which?')
+
+    def sender_wait(self, env, target):
+        """The wait the `arm tick <target>` prompt prints, run as that sender."""
+        with self.pm(env):
+            prompt = self.run_cli('arm', 'tick', target)
+            pm = re.search(r'wait --pm (\S+)`', prompt)[1]
+            return self.run_cli('wait', '--pm', pm)
+
+    def test_agent_sender_delivers_its_managers_outcome_once(self):
+        # a separate Claude sender session serves pmA-codex: it gets A's ask once; A's own wait shares the receipt; B keeps its own
+        self.senders_setup()
+        sender = {'CLAUDE_CODE_SESSION_ID': 'sender-claude', 'TASKQ_RUNTIME': 'claude'}
+        self.assertEqual(self.sender_wait(sender, 'pmA-codex'), 'ask #1\n')
+        self.assertEqual(self.sender_wait(sender, 'pmA-codex'), 'tick\n')
+        with self.pm(self.A):
+            self.assertEqual(self.run_cli('wait'), 'tick\n')  # same receipt file: never twice
+        with self.pm(self.B):
+            self.assertEqual(self.run_cli('wait'), 'ask #2\n')  # never consumed by A's sender
+        self.assertFalse((self.root / '.taskq' / 'wait-sender-claude.json').exists())
+
+    def test_shell_sender_delivers_its_managers_outcome_once(self):
+        # the printed shell loop runs with no session: it waits as the manager its link names, not as the owner's shell
+        self.senders_setup()
+        self.assertEqual(self.sender_wait({}, 'https://claude.ai/code/session_pmB-claude'), 'ask #2\n')
+        with self.pm(self.B):
+            self.assertEqual(self.run_cli('wait'), 'tick\n')
+        with self.pm(self.A):
+            self.assertEqual(self.run_cli('wait'), 'ask #1\n')
+        self.assertFalse((self.root / '.taskq' / 'wait.json').exists())
 
 
 class Contract(Base):

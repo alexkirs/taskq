@@ -1487,6 +1487,7 @@ def cmd_wait(args):
     path = CONFIG['root'] / '.taskq' / (f'wait-{me}.json' if me else 'wait.json')  # #532: each manager's events, once each
     ours = lambda item: not me or (item['pm'] or {}).get('session') in (None, me)  # its own tasks and those with no manager
     seen = json.loads(path.read_text('utf-8')) if path.is_file() else {}
+    receipt = dict(seen)  # the on-disk receipt when this wait began
     end = time.time() + args.window * 60
     while True:
         now, blind = {}, bool(os.environ.get('CODEX_SANDBOX'))
@@ -1503,7 +1504,35 @@ def cmd_wait(args):
         events += filter(None, (closed(n) for n in seen if n.isdigit() and n not in now))  # left the open list: closed?
         if events or time.time() >= end:
             path.parent.mkdir(exist_ok=True)
-            path.write_text(json.dumps(now), 'utf-8')
+            identity = session() or {}
+            native = kinds.get('hermes') if identity.get('runtime') == 'hermes' and identity.get('session') == me else None
+            owned = getattr(native, 'owned', None)
+            if events and callable(owned) and owned(me):
+                # Same current manager only; --pm cannot attach to another gateway. Serialize
+                # native delivery and the existing receipt; never mark an unsuccessful wake seen.
+                import fcntl
+                with open(path.with_suffix('.lock'), 'a') as lock:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        fail('Hermes manager wait delivery busy; event receipt unchanged')
+                    latest = json.loads(path.read_text('utf-8')) if path.is_file() else {}
+                    if latest != receipt:
+                        events = [f'{state} #{n}' for n, state in now.items()
+                                  if state in ('review', 'ask', 'gone') and latest.get(n) != state]
+                        events += filter(None, (closed(n) for n in latest if n.isdigit() and n not in now))
+                    if events:
+                        try:
+                            native.check()  # admission guard; no wake for an unavailable bridge
+                            if native.state(me) != 'idle':
+                                fail('Hermes manager not confirmed idle; event receipt unchanged')
+                            if native.wake_manager(me, '\n'.join(events)) != me:
+                                fail('Hermes manager wake changed identity; event receipt unchanged')
+                        except Exception as error:
+                            fail(f'Hermes manager wake failed ({type(error).__name__}); event receipt unchanged')
+                    path.write_text(json.dumps(now), 'utf-8')
+            else:
+                path.write_text(json.dumps(now), 'utf-8')
             print('\n'.join(events) or 'tick')
             return
         seen = now  # a task that leaves review and comes back while we wait is a new event

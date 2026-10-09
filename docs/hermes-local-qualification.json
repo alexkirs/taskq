@@ -1,0 +1,123 @@
+{
+  "status": "PASS",
+  "topology": "Hermes manager -> Hermes supervisor -> actual Codex CLI research -> independent close -> manager wake",
+  "scope": "local-only authorization and accidental CLI guards; no OS network isolation; provider network required",
+  "candidate": {
+    "head": "e1eebf6325897d3eed69bfe8f65ee985e494f8b6",
+    "dirty": "M runtimes/hermes.py\n M taskq.md\n M taskq.py\n M tests/test_single.py\n?? runtimes/hermes_pilot.py",
+    "sha256": {
+      "AGENTS.md": "3e8ba0950865844558c2783a3301ae4b8a7e5c35145295728922267fe9007988",
+      "taskq.md": "560103f9391d162f3848898512222c72b1fcf685cd3279724677015e7083dd42",
+      "taskq.py": "d7ac9903949da0566cdd8080e1bdd2612293369a268c8ae5c881b00882aee58a",
+      "runtimes/hermes.py": "71393fe297231b9bb07a3ffe6b4fde5a04e7967aeada343fca51c46e7b37dd16",
+      "runtimes/hermes_pilot.py": "9348e489252ad8c573d070eb571d2066f70745e5d2484eb75f5daf31833e06ca",
+      "tests/test_single.py": "6e9154c8a9015c92886c4de6d4f41619c513419a3a73effb52cc0f0a0d68656f"
+    }
+  },
+  "seed_sha": "bad2deef36c0b6e912f3f2871415df10b995a490",
+  "run_identity": {
+    "host": "local-pilot-061c68d12c45",
+    "manager_name": "PM HRM local pilot (local-pilot-061c68d12c45)"
+  },
+  "sessions": {
+    "manager": "20261009_163721_e76a30",
+    "supervisor": "20261009_163804_d9ba2c"
+  },
+  "supervisor_receipt": {
+    "row_ids": [
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      107,
+      108,
+      110,
+      112
+    ],
+    "complete": true,
+    "user_row_id": 98,
+    "final_assistant_row_id": 112
+  },
+  "worker_calculation": {
+    "thread_id": "01a12187-dbff-7260-8b56-92a5c46230a6",
+    "item_id": "item_4",
+    "exit_code": 0,
+    "output": "42"
+  },
+  "manager_receipt": {
+    "row_ids": [
+      109,
+      111
+    ],
+    "complete": true,
+    "user_row_id": 109,
+    "final_assistant_row_id": 111
+  },
+  "cleanup": [
+    {
+      "session": "20261009_163804_d9ba2c",
+      "owner_dead": true,
+      "gateway_dead": true
+    },
+    {
+      "session": "20261009_163721_e76a30",
+      "owner_dead": true,
+      "gateway_dead": true
+    }
+  ],
+  "supervisor_calculation": {
+    "tool_id": "call_49a1f5ebfae74458ae5214b6bca32c1c",
+    "user_row_id": 98,
+    "final_assistant_row_id": 112,
+    "result": {
+      "output": "42",
+      "exit_code": 0,
+      "error": null
+    }
+  },
+  "date": "2026-10-09",
+  "source": ".taskq/hermes-pilot-061c68d12c45/evidence.json",
+  "issue": {
+    "iid": 1,
+    "state": "closed"
+  },
+  "validation": {
+    "full_suite": {
+      "command": "python3 -m unittest -v tests.test_single",
+      "tests": 141,
+      "seconds": 21.888,
+      "status": "OK",
+      "skipped": 1,
+      "skip_reason": "Optional installed Hermes test lacked explicitly supplied test home/command; separate authenticated pilot passed"
+    },
+    "real_pilot": "PASS; parent executed authenticated Hermes and Codex models",
+    "service_shutdown": {
+      "state": "inactive",
+      "MainPID": 0,
+      "verified_by": "parent"
+    }
+  },
+  "limits": {
+    "RuntimeMaxSec": 600,
+    "pilot_timeout_sec": 500,
+    "MemoryMax": "1280M",
+    "MemoryHigh": "1024M",
+    "MemorySwapMax": "256M",
+    "CPUQuota": "150%",
+    "TasksMax": 256
+  },
+  "interventions": [
+    "Explicit local tick/wait calls in harness loop; not an autonomous-delivery proof",
+    "Native session.close followed by SIGKILL process-group/adopted-child cleanup; owner and gateway deaths confirmed"
+  ],
+  "exclusions": [
+    "No production board or publication qualification",
+    "No restart durability",
+    "No hostile-model or OS network isolation claim"
+  ]
+}

@@ -137,6 +137,12 @@ Changed: dispatch eligibility used only host/PM/filter routing → an `assignee-
 board identity, judged on a fresh read of the task (never the list, whose labels may lag) before every start,
 continuation or session send; manual `take` uses the same policy (#545, #576).
 
+Changed: Hermes wait had no native wake → the current Hermes manager, only with a same-bridge owned handle
+and confirmed idle state, receives the wait outcome before its existing wait receipt is written. Wake failure
+is visible and preserves the previous receipt (owner lifecycle corrections, 2026-10-09). A busy/unknown owned
+manager refuses consumption; a manager with no bridge handle keeps the printed wait path. `--pm` never grants
+a cross-gateway wake. Concurrent owned-manager waits serialize the delivery/receipt boundary locally.
+
 Hermes limitation (local candidate, § 8): the native bridge must supply turn/event delivery and manager wake;
 without that qualified bridge the unattended lifecycle above is unverified (R12).
 
@@ -928,20 +934,33 @@ explicitly; an ambiguous Hermes identity is refused. A Hermes PM without a sessi
 The task's board `pm` routes to Hermes only; `run-codex` selects the worker independently. Hermes controller
 authority matches both runtime and session: a Codex identity with the same text cannot impersonate Hermes.
 
-Configure `"runtimes": {"hermes": "runtimes/hermes.py"}` for the project-contained POSIX bridge.
+Configure `"runtimes": {"hermes": "runtimes/hermes.py"}` for the project-contained Linux bridge.
 Supply an explicit isolated `HERMES_HOME` and `TASKQ_HERMES_COMMAND`, a JSON argv for the installed
 Hermes Python interpreter running `-m tui_gateway.entry`. No invented CLI session command is used.
 The bridge keeps one detached stdio gateway owner per session, with private file-IPC/log/JSON runtime handles
 under `.taskq/`; Hermes owns both stored and process-local session IDs. `session.create` returns these IDs,
-`session.title` sets and reads back the native name before `prompt.submit` admits any work. Hermes's native
+`session.title` must acknowledge `pending: false` and read back the matching stored key and native name
+before `prompt.submit` admits any work. Creation drafts are not restart-durable; the bridge keeps the original
+owner alive and never restarts it just to inject identity. A native resume uses the stored key only within that
+same confirmed owner, and must return the original process-local ID. Hermes's native
 session context supplies child `HERMES_SESSION_ID`; inherited manager/native IDs are removed on launch.
 `send` refuses busy sessions, resumes only the same live owner, and requires a streaming admission reply.
-`session.status` distinguishes running/idle; lost transport is dead, invalid/unreachable status is unknown.
+State uses `session.activate`'s structured `running`, `session_id` and `session_key` fields, never
+`session.status`'s human-rendered output. Missing/mismatched fields or pending hydration/queued turns fail closed.
+Lost transport is dead, invalid/unreachable state is unknown. Only `message.start` followed by successful
+`message.complete` for the owned process-local ID after this serialized submit proves a model turn. Its
+`persisted_turn` row IDs must be strictly ordered and newer than a pre-submit persisted history watermark,
+and resolve to this prompt's user row and its final assistant row before a manager
+wake can consume a board event. Echoed prompt text, admission replies and process exits are not completion.
 `session.close` must confirm retirement before the transport stops. `available()` checks explicit launch setup,
 not provider authentication or successful turn completion; RPC failures stop admission visibly.
 The existing Hermes admission guard validates this concrete file's lifecycle interface. Handles contain no board
 state, authority, queue or receipts. `wake_manager` submits only to an idle manager already owned by this bridge;
-it cannot attach to a manager owned by another gateway. Interactive server requests are refused, never approved.
+it cannot attach to a manager owned by another gateway. `taskq wait` invokes it only for the current manager,
+and writes the existing receipt only after verified model completion. Timeout/error/unknown/busy stops visibly
+without updating that receipt. Owner identity uses Linux process birth stamps and pidfds, not PID liveness alone;
+SIGTERM/failed setup shuts down the gateway process group and waits for exit, with evidence retained.
+Interactive server requests are refused, never approved.
 Changed: generic unimplemented runtime-file candidate → concrete isolated TUI stdio bridge (owner request
 2026-10-09); no live-board qualification or restart durability is claimed.
 
@@ -953,6 +972,31 @@ is claimed. The bridge must arrange a pass after native turns/events where neede
 retirement and manager wake before real qualification. Hermes `arm tick` reports these gaps, without promising
 Claude background wake or Codex resume. This candidate is local-only: no live pilot, main publication or deployment
 without an available genuine bridge and approved isolated changed-boundary proof (§ 10).
+The executable `runtimes/hermes_pilot.py` is LOCAL-ONLY and accepts explicitly supplied Hermes
+and Codex homes. `--codex-home` may explicitly select the existing default `~/.codex` login and rollout store;
+the harness never reads/copies auth values or writes Codex auth/config. It never selects that home implicitly. An existing distinct named Hermes profile (`<root>/profiles/<name>`) may be outside the worktree;
+Hermes itself uses the supported root credential-pool fallback for single-use OAuth grants. No profile-local
+auth.json or .env, auth copies, environment-variable assertion, or default-home/config edit is required by the
+harness. Genuine provider failures remain blockers at the runtime boundary. The default Hermes home is refused.
+Before any model calls, the harness seeds a disposable checkout and bare `origin` entirely under its `.taskq/`
+pilot root, with one local fixture commit. Each run uses its unique fixture suffix in the manager native
+name and `TASKQ_HOST`, keeping R3 supervisor/worker names unique across repeated runs without altering prior
+Hermes sessions. Native naming failures retain sanitized title RPC codes/reasons in evidence. Manager and
+supervisor IDs must be distinct and are recorded in that evidence. Research uses that seed's `origin/main` SHA; genuine `close` performs
+its required local fetch and ancestry check without a push or publication. Git permits file transport only;
+generated instructions and CLI guards forbid push, external boards and external Git network transport.
+These are authorized-scope instructions and accidental CLI guards, not an OS security sandbox. Provider
+network is required for the models; absolute binaries and other network access remain technically available. Only the fixture's Git
+configuration changes. `--prepare-only` exercises local setup without authentication or model calls.
+The manager → native Hermes supervisor → actual Codex CLI research → independent supervisor review/close →
+verified manager wake path must all be observed before PASS. File-board/runtime evidence is retained locally;
+missing receipts, identity/result evidence, or cleanup fail closed. Evidence records candidate HEAD, dirty
+status and SHA256 of the spec, TaskQ, runtime, harness, contract and tests, and rejects end-of-run changes.
+The specific calculation must have a successful supervisor terminal tool result joined to the exact review
+turn history, independently of close attribution, plus successful actual Codex calculation log evidence. Parent executes the authenticated pilot;
+ordinary tests require no auth. This authorizes no live board, production Git remote, default profile/plugin/core
+change, or publication. Changed: outside-worktree profile/auth-file and no-remotes preflight restrictions →
+supported explicit named profile and disposable local-only Git fetch (owner correction, 2026-10-09).
 
 ## 9. Windows
 

@@ -488,30 +488,76 @@ handling was observed in 3/3 trials; additional next-wait invocation in 1/3 (I);
 successes 0/3 qualified. No winning overlay or general Codex defect is established. Omitted continuing
 wait actions cannot be classified as wording failures when supported monitor/sender access is missing.
 
-### Concrete remaining executor handoff and gates
+### Isolated I transport evidence, 2026-10-09 19:49 UTC
 
-Reuse only an already approved fresh isolated app target above, separately labeled transport
-qualification, through the existing PM/app executor. Do not repeat C/I/H or the guided production-PM
-probe. Privately verify the existing isolated harness revision and safe monitor/wait identity first.
-No production wait consumption, replacement monitor/session/bridge, unsupported resume, CLI startup
-retry, foreign adoption/rebinding or security/model/effort/credential changes.
+The [existing executor's transport report](https://github.com/alexkirs/taskq/issues/595#issuecomment-6088121463)
+supersedes the preceding missing-idle-receipt observation for isolated I only. It is a separately labeled
+post-comparison transport qualification, not another unsteered I cell or a winning overlay.
+The sender independently observed target `01a12224-ecea-7181-bd79-7f28b1aae088` idle and verified
+candidate/harness hashes. Its actual isolated `wait --pm <I target> --window 0.1 --every 1` returned
+`tick`, exit 0, in 6.061 s. It observed the target idle again and sent that output with scope/target.
+The independently inspected completed target receipt turn invoked isolated tick (exit 0, zero counters)
+and a target-local wait (exit 0, `tick`, 5.014 s). These target command observations establish application,
+not merely send acceptance. The sender then invoked exactly one same-target
+`wait --pm <I target> --window 0.5 --every 1`; independent process inspection established it was running.
+It subsequently terminated only that isolated child. Neither isolated wait remains running.
 
-Within one existing safety window (at most 10 minutes), the existing authorized independent sender
-must forward actual isolated `taskq wait --pm <selected isolated PM id>` output verbatim after observed
-PM idle. Record UTC idle/send/receipt, target turn/tool identifier and actual output; observe isolated
-tick completion and the intended sender/session entering its next targeted **running** wait with a
-safe handle. Repeat identical `taskq arm tick` once and inspect the same monitor/wait identity for no
-duplicate. Observe paused and foreign ownership only through existing approved isolated fixtures.
-Missing sender, fixture or monitor inspection stops that step BLOCKED; no workaround is provisioned.
+Code and contract SHA256 match the recorded candidate above; post-comparison wrapper SHA256 is
+`2613d396a4e7b225c4208800b9ff819252ba69cfabcf9db1b13e570e29937769`, executor-reported.
+The worker did not inspect the private wrapper or transcript. Per-event UTC, receipt turn/tool id,
+running process handle, messaging tool name and model/effort are not supplied; wake latency is unknown.
+The comment publication time is not a send or receipt timestamp. Production sender proof remains separate.
 
-This worker can integrate evidence and run isolated repository tests, but its callable inventory has
-no supported `send_message_to_thread` or established DOT execution-child route. The missing action
-belongs to the existing executor, not renewed broad owner authorization. Ask only for an exact missing
-scope/access prerequisite if that executor cannot observe the approved isolated target/wait.
+**Bound NOT PASS:** cleanup was about 66 s after the initial probe clock, exceeding the requested 60 s
+because of reported tool latency. Action/overlap within 60 s is unproved. Target foreground wait overlapped
+or may have overlapped the sender's next wait; no independently proved monitor-reuse/duplicate-free
+coordination. Paused and foreign-project fixtures remain BLOCKED. Do not repeat completed probes or
+start further trials to erase these limitations. No full acceptance or persistent-monitor claim follows.
 
-The prior full macOS gate remains FAILED in unchanged Linux-only HermesNativeBoundary. Existing
-exact-head CI at 64661cd has two SUCCESS checks; it does not repair the local platform failure or prove
-app wake. This continuation changes research documentation only; no code/test edit or platform shim.
-Required applicable final checks, isolated live evidence and independent exact-head supervisor review
-remain HOLD before acceptance/main publication/deployment. Unique id/link regressions stay retained;
-no overlay implementation or redundant benchmark is justified by this sample.
+### Own-session routing assessment and review packet
+
+`cmd_wait` selects `args.pm or session()['session']` and uses `.taskq/wait-<selected id>.json`.
+Thus omitting `--pm` in the actual target session selects that session's own receipt, provided its real
+session environment resolves to the I id. The transport report does not expose that environment;
+actual live target routing remains conditional, not independently verified by this worker.
+Existing `MultiPM.test_agent_sender_delivers_its_managers_outcome_once` and
+`test_shell_sender_delivers_its_managers_outcome_once` assert sequential explicit-sender/own-session
+receipt sharing and foreign-manager separation. They do not assert concurrent Codex wait exclusion.
+Codex ordinary waits read their initial receipt without a monitor lock; the native Hermes delivery lock
+is a separate branch. Two concurrent ordinary waits can therefore both observe an event. Rendering ARM
+neither starts nor deduplicates a monitor. No new coordination mechanism is authorized by this finding.
+
+| Requirement / acceptance | Available evidence / failure oracle | Red-before-fix | Remaining blindspot / disposition | Available cost |
+|---|---|---|---|---|
+| Id/link normalization, §7 | Nine synthetic local/archived/unknown route cases and real bash loop with fake wait/send; same extracted PM for lookup/wait/send | Six synthetic link failures observed | Retain unique regression and minimal fix; no live CLI link-resume proof | Prior focused 21 checks: 2.267 s and 2.807 s; no direct model calls, development cost unknown |
+| Unsteered role execution, A1/A4 | C/I/H foreground handling 3/3; next completed wait 0/1, 1/1, 0/1; wording clarification 0 observed each | General wording defect unproved | Source/order/context/access confounds; no winning overlay; retain research only | Completed foreground wait durations above; model cost unknown |
+| App receipt/application/next wait, A2 | Isolated-I idle observation, inspected receipt/tick and independently running sender process | Historical failure unknown | Partial observed sequence; 60 s bound failed; exact UTC/handles and live own-session environment unknown | 6.061 s sender wait, 5.014 s target wait, about 66 s cleanup; no wake latency |
+| Repeat ARM/paused/foreign, A3/A5 | Existing no-write repeated rendering and sequential MultiPM receipt/ownership checks | Historical red unknown | Live overlap/deduplication unproved; approved paused/foreign fixtures unavailable; BLOCKED | Existing test timings only; no new live trials |
+| Claude/direct CLI/DOT, A1/A2 | Claude0 preserved; CLI fails before role receipt; no established DOT parent/local-child receipt route | CLI startup failure observed | BLOCKED: unchanged limits, required startup filesystem access unavailable, supported DOT route unavailable respectively | CLI failure 0.209 s; other latency unknown |
+| Intake/current state, A6 | Original intake comments document later/unclaimed; explicit activation supersedes parked-state restriction | Not applicable | Current task is active and supervised; never claim current null claim/supervisor/order | Board comments only |
+| Final gate / independent review | Prior full macOS 146 checks FAILED in unchanged Linux-only HermesNativeBoundary; Ubuntu full-suite CI at e0a28ff has two SUCCESS checks | Mac platform failure observed | Linux CI is applicable automated coverage, not Mac live wake qualification; final candidate exact-head CI and supervisor decision required | Mac 24.206 s; e0a28ff CI jobs 17 s and 24 s |
+
+The local full gate remains FAILED; no test skip, platform shim or green-by-subset claim is introduced.
+The configured CI runs the complete suite on Ubuntu/Python 3.11, which supplies the required Linux pidfd
+platform for the unchanged Hermes boundary. Exact-head green CI can supply that automated platform evidence;
+it cannot prove idle wake, duplicate-free ARM or paused/foreign preservation. This continuation changes
+research documentation only, so affected Contract sentinels are the applicable local check (§10).
+No R-number or cross-agent/Memory behavior changes in this continuation. The existing normalization
+clarification restores the recorded id/link contract and does not amend R3/R4/R6/R9/R12/R13.
+
+The original acceptance cannot be completed in the currently reachable approved fixtures. Submit a concrete
+owner choice, without changing acceptance on the owner's behalf:
+
+1. Narrow #595 spec-first to the documented research findings and minimal id/link normalization candidate.
+   Defer winning-overlay/full topology, live CLI link-resume, duplicate-free repeated ARM and paused/foreign
+   preservation qualification explicitly. This does not waive security or exact-head independent review/CI;
+   the supervisor must assess which live proof remains applicable to the narrowed output before publication.
+2. Retain original acceptance HOLD. Required prerequisites are an approved inspectable isolated monitor and
+   coordinated wait ownership for repeated ARM, existing approved paused/foreign fixtures, a supported CLI
+   startup/link-resume qualification route without bypass, and an approved supported Claude/DOT topology.
+   Full role evidence, actual runtime/settings and per-event identifiers/timestamps remain missing as recorded.
+
+Recommend option 1: no general wording cure was established and more trials in the existing scope were
+explicitly stopped. A narrowing requires owner acceptance under R13, then a contract amendment before any
+further implementation. Neither this packet nor the option publishes, deploys or closes the task. The existing
+supervisor must independently review the exact candidate; no replacement reviewer/sender is started.

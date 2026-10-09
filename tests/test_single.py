@@ -748,27 +748,55 @@ class Wait(Tick):
         self.assertIn('taskq.py wait`', out)
         self.assertIn('with SendMessage', out)
 
-    def test_arm_tick_in_codex_names_resume(self):
-        """#522: a CLI thread (local rollout) gets exec resume."""
+    def codex_home(self, folder, thread):
         home = self.root / 'codex'
-        (home / 'sessions/2026/10/09').mkdir(parents=True)
-        (home / 'sessions/2026/10/09/rollout-2026-10-09T07-46-53-T1.jsonl').write_text('')
-        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_THREAD_ID': 'T1', 'CODEX_HOME': str(home)}):
+        (home / folder).mkdir(parents=True)
+        (home / folder / f'rollout-2026-10-09T07-46-53-{thread}.jsonl').write_text('')
+        return {'TASKQ_RUNTIME': 'codex', 'CODEX_HOME': str(home)}
+
+    def test_arm_tick_in_codex_names_resume(self):
+        """#522: a local thread (rollout under sessions/) gets exec resume; the shell loop stops on a failed send."""
+        with mock.patch.dict(os.environ, {**self.codex_home('sessions/2026/10/09', 'T1'), 'CODEX_THREAD_ID': 'T1'}):
             sender, self_arm = self.run_cli('arm', 'tick', 'T1'), self.run_cli('arm', 'tick')
         self.assertIn('resume T1 "<its output>"', sender)
-        self.assertIn('resume T1 "$e"; done', sender)
+        self.assertIn('resume T1 "$e"; do :; done; echo "taskq sender stopped"', sender)
         self.assertNotIn('send_message_to_thread', sender)
         self.assertIn('in the foreground', self_arm)
         self.assertIn('arm tick T1`', self_arm)
 
-    def test_arm_tick_in_codex_app_thread_uses_native_sender(self):
-        """#522: an app thread has no local rollout; exec resume would fail `no rollout found`, so no resume is printed."""
+    def test_arm_tick_in_codex_unknown_target_promises_no_wake(self):
+        """#522: no local rollout is not proof of an app thread: no resume, no promised wake, the app sender only if known."""
         with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_HOME': str(self.root / 'none')}):
             sender = self.run_cli('arm', 'tick', 'APP1')
-        self.assertIn('no local rollout of APP1', sender)
-        self.assertIn('with the Codex app tool `send_message_to_thread`', sender)
+        self.assertIn('no local Codex rollout of APP1, so no `codex exec resume` and no promised wake. Unknown what it is', sender)
+        self.assertIn('Only if APP1 is a known Codex app thread: run this prompt in an independent', sender)
+        self.assertIn('Not a collaboration subagent of the manager', sender)
+        self.assertIn('Send its output, verbatim, to APP1 with `send_message_to_thread`', sender)
+        self.assertIn('never retry the event, never another route', sender)
         self.assertNotIn('resume APP1', sender)
-        self.assertNotIn('while :', sender)
+        self.assertNotIn('while ', sender)
+
+    def test_arm_tick_in_codex_archived_thread_has_no_route(self):
+        """#522: exec resume of an archived thread is unverified: no sender prompt, unarchive first."""
+        with mock.patch.dict(os.environ, self.codex_home('archived_sessions', 'OLD1')):
+            out = self.run_cli('arm', 'tick', 'OLD1')
+        self.assertIn('OLD1 is archived in Codex', out)
+        self.assertIn('`codex unarchive OLD1`', out)
+        self.assertNotIn('tick sender', out)
+
+    def test_dispatch_chains_without_a_tick_and_wait_wakes_once(self):
+        """#522 (R4): add and result dispatch with no periodic tick; the sender's wait wakes the manager once per review."""
+        passes, start = [], taskq.start_pass
+        with mock.patch.object(taskq, 'start_pass', lambda command, **o: passes.append(command[2:]) or start(command, **o)):
+            self.add('one')
+            self.add('two')
+            self.run_cli('result', '1', '--sha', 'a' * 40)
+        self.assertTrue(passes and all(command[:2] == ['tick', '--quiet'] for command in passes))  # only event passes
+        self.assertEqual(self.fake.names, ['T1 CLD one (mac)', 'T2 CLD two (mac)'])  # one spawn per task
+        self.assertEqual((self.task(1)['state'], self.task(2)['state']), ('review', 'doing'))
+        self.assertEqual(self.run_cli('wait'), 'review #1\n')
+        self.assertEqual(self.run_cli('wait'), 'tick\n')  # never sent twice
+        self.assertEqual(len(self.fake.names), 2)
 
 
 class Contract(Base):

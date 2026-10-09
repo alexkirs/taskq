@@ -665,7 +665,8 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
 1. In the project root run `taskq arm tick "<manager>"` (its session name, id or link). It prints the prompt for
    this runtime: loop { `taskq wait --pm <manager id>`; send its output to `<manager>` (Claude: `SendMessage`; Codex:
    below) }. The id is `<manager>` itself or the end of its link (`session_<id>`, `threads/<id>`): the id its tasks
-   record as `pm` (#532); a name matches no task, and `arm tick` says so when no open task records that id.
+   record as `pm` (#532); use that same extracted id for rollout lookup and every send/resume, including links
+   supplied as targets (#595). A name matches no task, and `arm tick` says so when no open task records that id.
    Without `<manager>` (what `taskq pm` prints): first one pass now, outside a Codex sandbox (the queue's start,
    R4); then a Claude session runs a background `taskq wait`, a Codex session (not woken when a background command
    ends, #497) loops `taskq wait` and the pass in the foreground. Between Codex turns the outcomes wait on the board

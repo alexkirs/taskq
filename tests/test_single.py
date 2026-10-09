@@ -1789,10 +1789,36 @@ class Wait(TickSetup):
         self.assertNotIn('Before you end a turn', self_arm)
         self.assertIn('no sender, timer or extension', self_arm)
 
+    def test_arm_tick_links_use_the_same_pm_for_lookup_wait_and_send(self):
+        """#595: a supported link must select the same route as its id, without mutating queue state."""
+        for folder, route in (('sessions/2026/10/09', 'local'), ('archived_sessions', 'archived'), ('missing', None)):
+            thread = f'PM-{route}'
+            links = (thread, f'codex://threads/{thread}',
+                     f'https://alexkirs.github.io/taskq/open.html#codex://threads/{thread}')
+            with self.subTest(route=route), mock.patch.dict(os.environ, self.codex_home(folder, thread)):
+                before = json.dumps(self.board.issues, sort_keys=True)
+                for target in links:
+                    with self.subTest(target=target):
+                        out = self.run_cli('arm', 'tick', target)
+                        if route == 'local':
+                            self.assertIn(f'resume {thread} "<its output>"', out)
+                            self.assertNotIn('send_message_to_thread', out)
+                        elif route == 'archived':
+                            self.assertIn(f'{thread} is archived in Codex', out)
+                            self.assertNotIn('tick sender', out)
+                        else:
+                            self.assertIn(f'no local Codex rollout of {thread}', out)
+                            self.assertIn(f'to {thread} with `send_message_to_thread`', out)
+                            self.assertNotIn(f'resume {thread}', out)
+                        if route != 'archived':
+                            self.assertIn(f'wait --pm {thread}`', out)
+                        self.assertEqual(out, self.run_cli('arm', 'tick', target))
+                self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+
     def test_arm_tick_shell_loop_stops_on_failed_wait_or_send(self):
         """#522: the printed shell loop sends each event once and stops on the first failed wait or send."""
         with mock.patch.dict(os.environ, self.codex_home('sessions/2026/10/09', 'T1')):
-            sender = self.run_cli('arm', 'tick', 'T1')
+            sender = self.run_cli('arm', 'tick', 'codex://threads/T1')
         self.assertIn('Stay in this one turn and repeat', sender)
         self.assertIn('A failed wait, a failed send or no such send tool: stop', sender)
         loop = sender.split('No agent needed: `', 1)[1].split('` in a terminal', 1)[0]

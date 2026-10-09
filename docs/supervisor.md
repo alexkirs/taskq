@@ -152,3 +152,412 @@ isolated live qualification before `close` publishes. Direct mode uses the exist
 close fast-forward pushes the accepted immutable SHA after remote-head and CI checks. PR exact-head merging stays.
 Legacy already-published results and research answers close without a new publication, and prove no unobserved
 live behavior. Existing claims are not rebound. No suite migration or new paid benchmark is part of #533.
+
+
+## 9. Executable PM/ARM handoff investigation (#595)
+
+Status: **incomplete; isolated persistent ARM qualification BLOCKED**, 2026-10-09 19:39 UTC
+(2026-10-10 in the owner's timezone). This is a bounded research record, not a new role contract.
+The owner activated #595, per-project Claude 0 / Codex 3 for taskq and csgo, and the independently
+reviewed publication lifecycle. The original intake-only/later restriction is superseded. No additional
+project, permission, model, effort, credential or replacement sender was authorized here.
+
+### Observations and scope
+
+- Fresh issue read: #595 is open `q-doing`, with distinct recorded manager, supervisor and worker,
+  `order: null`, `result: null`. Its history records intake, activation, supervisor order and worker spawn.
+  Acceptance 6's original `q-later`/null claim/supervisor assertion describes intake, not the activated state.
+- The supplied screenshot/user report is evidence of a PM-loaded/no-workers/no-ARM interaction with
+  pending decisions. It does not distinguish prompt omission from pending authorization. Claude's
+  reported success remains user-reported, not an independently observed baseline.
+- This worker is a local Codex CLI session with `CODEX_SANDBOX=seatbelt`; that observation does not
+  identify the owner's app/DOT session. CLI version: `codex-cli 0.159.3`; installed Claude CLI:
+  `2.1.295 (Claude Code)`. The isolated CLI launch inherited configured `gpt-6.1-sol`, effort `low`;
+  no model turn started, so effective model/effort are not independently confirmed. Other contexts'
+  versions/models/effort are unknown. No setting was changed.
+- Available execution tools include shell execution and continuation of a running shell process.
+  The supplied callable tool inventory has no `send_message_to_thread`. Collaboration messaging
+  is not an independent app sender and is not an ancestor-wake route. No existing app sender or
+  DOT cloud-parent/execution-child session was accessible for qualification. Their actual state is unknown.
+- The executing checkout's limits were read as Claude 0 / Codex 3; the branch's tracked fixture
+  configuration still has the repository defaults. Neither was edited. csgo was not accessed or changed.
+  No real task was adopted/rebound, parked state altered, monitor replaced, wait consumed, runtime
+  resumed, production tick launched, or publication/deployment performed by the experiment.
+
+The initial candidate branch was based on `0d51c8b17840f1afa1443b6dfc74f7acfcfaedf5`.
+Current prompts are reproducible from that revision's `cmd_pm`, `cmd_arm` and the contract sections
+loaded by `cmd_pm`; do not duplicate the whole contract here. PM includes Principles and Manager,
+then the self-arm instructions. The current ARM prefix already says:
+
+> Explicit owner arm: execute the proven route, not just this prompt. Reuse the existing monitor and targeted wait;
+> repeated arm must not create duplicates. Keep paused projects paused. Prove an idle-manager wake and the next wait;
+> printed output is not proof.
+
+This text and the contract already require action. Stronger verbs alone are not evidence that a supported
+route exists or that a pending approval disappeared.
+
+### Fixed input, exact candidate overlays and matrix
+
+Within each topology keep the user inputs exactly `taskq pm`, then `taskq arm tick`, with the same
+explicit project/scope request. For the only attempted cell that scope was:
+`Isolated #595 empty-board project only; no production board, publication or deployment.`
+PM identity must be the genuine session selected in that cell; never reuse the production worker's
+identity as an experiment manager. Keep the runtime's existing model, effort, permissions and limits.
+
+Three variants are defined, with one control and at most one run per candidate/command/topology.
+Stop a blocked step; do not launch later variants through the same unavailable route.
+These overlays are proposed tool-output text, not extra user clarification or adopted contract changes:
+
+**Control C:** unmodified output from `taskq pm` / `taskq arm tick` at the baseline revision above.
+The failed CLI preflight used candidate files (including the id/link clarification); initialization failed
+before any role was rendered, so this is not a completed baseline/candidate prompt comparison.
+
+**Imperative I:** prepend to the same current output, respectively:
+
+```text
+PM: Execute this manager workflow now for the owner's explicit projects and authorized scope.
+Run the initial taskq tick through the supported execution session, handle its report, then perform
+this role's next supported wait. Report the exact blocked step if approval, access or transport is missing.
+```
+
+```text
+ARM: Execute the authorized arming workflow now. Inspect and reuse this PM/project's existing
+monitor and targeted wait; preserve paused monitoring. Use the supported route below. Record
+manager receipt, its tick handling and the next targeted wait before reporting armed. Stop at a blocker.
+```
+
+**Handoff H:** prepend the common PM/ARM sentence and exactly one verified-context paragraph below:
+
+```text
+PM: Take this manager role and execute its next authorized step now for the explicit project scope.
+ARM: Reuse this PM/project's monitor and execute its next supported wait/wake step now.
+```
+
+```text
+Claude Code: Run the initial authorized tick here, then reuse or start exactly one background
+wait using the available run_in_background tool. On its completion handle the tick here and wait again.
+If that wake capability is unavailable, stop and report it.
+```
+
+```text
+Direct Codex app or CLI: Keep the PM and foreground wait/tick loop in this session. Do not delegate
+ordinary direct-session monitoring. Between turns use only a separately supported, reachable route:
+local CLI resume requires the target's local rollout; app messaging requires an existing independent
+app sender with a supported tool. A background command finishing is not an idle-thread wake.
+```
+
+```text
+Verified DOT cloud parent: Hand the explicit project scope and intended PM identity to your existing
+authorized local execution child. Have that child run taskq pm and execute the returned workflow there.
+Route ARM to the session that owns that project's existing monitor. Require its canonical report and
+receipt/next-wait evidence; relay the completed report unchanged. Stop if that child or route is unavailable.
+Do not rebind tasks to the child, replace a sender or infer parent wake from child command completion.
+```
+
+Select a paragraph from observed topology and actual tool capabilities, not an environment-name guess.
+For app and CLI the direct-session instruction is intentionally the same; between-turn transport differs.
+These are hypotheses, not successful prompt wording. No live-winning wording has been established.
+
+| Context | C PM / ARM | I PM / ARM | H PM / ARM | Precise blocker and evidence |
+|---|---|---|---|---|
+| Claude baseline | BLOCKED / BLOCKED | BLOCKED / BLOCKED | BLOCKED / BLOCKED | No authorized existing Claude experiment PM/wake session accessible from this worker; Claude workers are disabled by the selected project's limit 0. Installed CLI alone proves no session/tool wake. No launch attempted. |
+| Direct Codex CLI | BLOCKED / BLOCKED | BLOCKED / BLOCKED | BLOCKED / BLOCKED | One isolated C PM launch failed before role receipt: in-process app-server initialization denied by the current sandbox. ARM and candidates stopped at that dependency. |
+| Direct Codex app | Foreground observed / full ARM BLOCKED | Foreground observed / full ARM BLOCKED | Foreground observed / full ARM BLOCKED | Existing executor completed fresh comparisons below; no continuing running wait or isolated independent sender/idle wake. This worker has no `send_message_to_thread`; no resume fallback or replacement sender. |
+| DOT cloud + local execution child | BLOCKED / BLOCKED | BLOCKED / BLOCKED | BLOCKED / BLOCKED | No accessible actual cloud parent/local child handoff and no existing ARM sender access. This worker's local CLI is not proof of that topology. |
+
+CLI control command, in the newly created isolated empty-board scope only:
+
+```sh
+codex exec --json -s workspace-write -c sandbox_workspace_write.network_access=true \
+  -C <isolated-project> --skip-git-repo-check 'taskq pm'
+```
+
+The isolated project contained the candidate `taskq.py`/contract, a stdlib board adapter returning no
+issues and refusing every mutation, `update: false`, and the same Claude 0 / Codex 3 limits.
+Its AGENTS context was exactly:
+
+```text
+Isolated #595 probe. The owner requests only this project. No production board, publication or deployment.
+Use python3 ./taskq.py for taskq. Run taskq pm and follow its returned authorized instructions.
+Do not create a sender, task or replacement bridge. Stop and report any unsupported action;
+do not bypass sandbox restrictions. No model, effort or permission changes.
+```
+
+Inherited parent session ids were removed for the child, as the runtime adapter does; no synthetic
+PM id was installed. This setup is only a capability/control probe, not an idle-wake qualification.
+The 45-second bound was not reached: at `2026-10-09T18:46:03.923248Z`, exit 1 in 0.209 seconds,
+zero JSONL events, with `Error: failed to initialize in-process app-server client: Operation not permitted (os error 1)`.
+Raw local probe logs contain no production transcript inputs and remain private; only this safe summary is public.
+
+Observed live successes: 0. Completed supported idle-wake trials: 0; success rate and wake latency unknown,
+not 0%. Omitted authorized actions and unnecessary clarification counts are unknown because no model received
+the test role. This is an access/capability blocker, not an instruction-understanding failure. No rejected
+step was retried via a different permission, credential, bridge or transport.
+
+### Reproduced implementation defect and minimal candidate
+
+An isolated synthetic route check found a separate deterministic defect: a manager link was normalized
+for `wait --pm`, but the original full link was used for rollout lookup and resume/send. A local CLI
+thread passed by `codex://threads/<id>` or its taskq wrapper link therefore received the unknown/app
+fallback; an archived link missed the archived blocker. This does not explain the owner's screenshot.
+
+The candidate uses the already extracted PM id for lookup, quoted CLI resume and sender instructions.
+`taskq.md` was clarified first. This restores the existing id/link contract; **no R3/R4/R6/R9/R12/R13
+principle is amended**, no new wake transport or automatic monitor/adoption is introduced.
+General prompt overlays above remain unimplemented because their effect is unproved.
+
+Reproduction / focused regressions:
+
+```sh
+python3 -m unittest tests.test_single.Wait.test_arm_tick_links_use_the_same_pm_for_lookup_wait_and_send
+python3 -m unittest tests.test_single.Wait tests.test_single.MultiPM tests.test_single.Contract
+```
+
+The new test covers id, direct link and wrapper link for local/archived/unknown synthetic rollouts.
+Before the fix: six link subcases failed; after: all nine route subcases pass. Repeated rendering is
+identical and leaves the fake board unchanged. The existing printed-shell-loop test now starts from a
+link and executes its generated loop through real bash with fake wait/send downstream, proving event
+forwarding count and first-error stop. Neither test proves a model follows prose or an idle manager wakes.
+Focused checks: 21 tests pass in 2.267 seconds. Cost/model calls for these checks: no direct model calls;
+development cost is unknown.
+
+| Requirement / issue | Check and failure oracle | Red before fix | Blindspot | Disposition |
+|---|---|---|---|---|
+| #595 id/link routing | Wait link matrix selects local/archived/unknown route and the same PM for wait/send | Observed six synthetic failures | No real resume/app receipt | Retain unique link regression; live proof still required |
+| #595 printed CLI sender boundary | Existing Wait shell test, now link input; two sends on success, one on send failure; stops on failed wait | Existing ID test was green; link matrix above failed | Fake CLI sends are not a manager wake | Reuse existing boundary test; no redundant test harness |
+| #595 foreign PM/paused state and duplicate ARM | Existing MultiPM routing/ownership and ARM no-write/repeated-render assertions | Historical red unknown | Rendering does not inspect or deduplicate a live monitor; paused-project live case blocked | Keep current safety coverage; require live observation |
+| #595 role/capability/context | Existing Contract and Wait role/transport tests; proposed context cells above | Wording omission unknown | No Claude/app/DOT model execution | Do not invent a mocked model PASS; qualify separately |
+
+### Required completion evidence and recommendations
+
+Before accepting the full research task or publishing the changed transport output to main, the existing
+supervisor must obtain the required accessible isolated topology evidence. Publication, deployment and
+any claim of successful arming remain held. Exact-head independent review/CI is that supervisor's job;
+this worker does not substitute its own checks or start a replacement reviewer/sender.
+
+For each unblocked cell record genuine PM/session identity, explicit projects, monitor state, observed
+capabilities, runtime/version/model/effort (unknown if unavailable), exact prompt revision/commands,
+timestamps and interventions. Prove this sequence with the existing supported route:
+
+1. Role/command received; intended PM/execution-child selected without additional wording-only clarification.
+2. A manager demonstrably idle before the event receives and handles that event in its own next turn,
+   then invokes the intended tick. Sender submission/acceptance alone is insufficient.
+3. The intended manager or sender subsequently enters the next targeted wait, evidenced by a running
+   tool/wait invocation with the same PM/project. A printed instruction or timer assertion is insufficient.
+4. Repeat ARM with the existing monitor; verify the same monitor/targeted wait, no duplicate wait/timer,
+   paused state and foreign ownership unchanged, and no unsupported fallback. If the existing monitor
+   cannot be inspected, mark that step BLOCKED rather than provisioning another.
+
+Count omitted actions and wording-only clarification separately from required approval/access questions.
+A direct CLI foreground continuation is not proof of wake between turns. A DOT child's result is not proof
+of cloud-parent receipt. Reuse the current contract and supported capabilities; do not add a persistent
+bridge, receipt store, benchmark, model/effort change or pending-approval bypass.
+
+If later evidence justifies adopting H, propose a spec-first amendment to R3 (verified parent/child role
+handoff) and R4 (next-step/receipt/continued-wait instruction), under R13, before implementation.
+R6's exact report/ARM proof, R9's settings gate and R12's unknown/blocker semantics must be preserved;
+name any actual change to them separately. No such principle change is made by this candidate.
+
+Sources checked: [official Codex non-interactive documentation](https://learn.chatgpt.com/docs/non-interactive-mode)
+distinguishes bounded CLI execution/resume; [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
+describes its own thread/turn protocol, which is not evidence that this worker has an app messaging tool.
+[Langfuse experiment documentation](https://langfuse.com/docs/evaluation/experiments/datasets) supports a fixed
+comparison dataset/context. Documentation does not qualify the local wake topology.
+No #269 cadence trial, #538 onboarding trial or #577 execution-policy qualification was duplicated or treated as PASS.
+
+Final local gate on the frozen code/test diff: `python3 -m unittest tests.test_single` ran 146 tests
+in 24.206 seconds and **FAILED** (2 failures, 11 errors, 1 skipped). All failures/errors were in
+`HermesNativeBoundary`: the current macOS runtime lacks Linux `os.pidfd_open`; spawn refuses with
+`Hermes needs Linux pidfds, explicit isolated HERMES_HOME and TASKQ_HERMES_COMMAND`.
+The Hermes runtime has no diff from origin/main, and the failing class's AST is identical to origin/main.
+This establishes unchanged source/platform incompatibility, not a completed baseline execution.
+No test was disabled and no Linux support shim was added. The final gate is not green; applicable
+exact-head checks and live wake proof remain required before acceptance/publication.
+
+
+### Diagnostic continuation, 2026-10-09 19:00-19:03 UTC
+
+The existing branch/PR #596 and supervisor were preserved. This continuation performs no model launch,
+production pass, monitor wait/send, adoption, rebinding, credential read or permission change. No role or
+cross-agent behavior changed; no Memory or R-number amendment is needed for this diagnostic record.
+
+The initial error above is the retained safe error evidence. The matching installed CLI still reports
+`codex-cli 0.159.3`; even `codex --version` also reports
+`WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)`.
+That warning is nonfatal and does not establish the app-server failure's syscall.
+
+Read-only inspection of the [version-tagged exec source](https://github.com/openai/codex/blob/rust-v0.159.3/codex-rs/exec/src/lib.rs#L985)
+locates the reported error at `InProcessAppServerClient::start`, before thread start/resume and user turn.
+The [in-process source](https://github.com/openai/codex/blob/rust-v0.159.3/codex-rs/app-server/src/in_process.rs#L377)
+propagates startup configuration/auth bootstrap and installation-ID errors before its initialize request.
+An initialize RPC rejection would instead include `in-process initialize failed:`. The retained error has
+no such prefix. No runtime trace exists to distinguish all startup substeps.
+
+The [installation-ID source](https://github.com/openai/codex/blob/rust-v0.159.3/codex-rs/core/src/installation_id.rs#L19)
+unconditionally opens the installation-ID file read/write/create and locks it, even when a valid ID exists.
+A metadata-only check at `19:02:23.470467Z` found the existing installation-ID file present, with advisory
+write access false for both file and parent. No contents, open-for-write or chmod was attempted. Combined
+with this worker's restricted writable roots, this identifies a concrete incompatible required startup
+operation. It is a strong filesystem/sandbox hypothesis, not proof that this particular syscall produced
+the retained errno; configuration/auth bootstrap remains another possible source. No credentials were inspected.
+
+| Hypothesis / bounded diagnostic | Observation | Classification / stop |
+|---|---|---|
+| CLI error is caused by PM/ARM wording | Tagged exec source fails before thread/user turn; original zero JSONL events | No instruction-understanding evidence; do not spend candidate model trials on this unavailable route |
+| Local IPC socket creation/bind is generally prohibited | At `19:01:14.442315Z`, fresh AF_UNIX and loopback AF_INET sockets each created, bound and listened successfully in an auto-cleaned temporary directory | Broad IPC hypothesis rejected; no app-server or wake proof |
+| Required installation metadata is writable | Existing file/parent report advisory write access false; tagged source requires read/write open | Filesystem/sandbox blocker candidate; exact failing syscall unknown; no denied open retry |
+| Prior macOS failures indicate an ARM regression | `runtimes/hermes.py` byte-identical and `HermesNativeBoundary` AST-identical to origin/main; Darwin has no `os.pidfd_open`, while adapter explicitly requires Linux pidfds | Unchanged unsupported Linux-only boundary; no shim, skip annotation or weakened assertion introduced |
+
+Safe reproduction of socket diagnostics (use the existing authorized shell; no Codex-home override):
+
+```sh
+export TASKQ_TASK=595 TASKQ_RUNTIME=codex && python3 - <<'PYCODE'
+import socket, tempfile
+with tempfile.TemporaryDirectory(prefix='taskq-595-boundary-') as root:
+    for family in (socket.AF_UNIX, socket.AF_INET):
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.bind(root + '/probe.sock' if family == socket.AF_UNIX else ('127.0.0.1', 0))
+            probe.listen(1)
+            print(family, 'bind/listen PASS')
+PYCODE
+```
+
+Capabilities were inspected from this session's actual callable inventory: shell execution/continuation
+available; no independent app `send_message_to_thread` and no established DOT parent/local-child route.
+Collaboration and UI tooling do not establish those missing routes. No replacement sender was created.
+All control/I/H live matrix cells remain BLOCKED as previously classified, with no winning wording,
+idle wake, receipt, next targeted wait, omission counts or wake latency. Claude 0 remains preserved.
+
+Focused candidate regression command `python3 -m unittest tests.test_single.Wait tests.test_single.MultiPM
+ tests.test_single.Contract`: 21 tests PASS in 2.807 s. A separate diagnostic selection of all classes except
+`HermesNativeBoundary` assesses whether reported failures extend beyond the unsupported Linux boundary;
+135 tests PASS in 20.901 s. It is explicitly not the contract's full final gate and does not turn that earlier failed gate green.
+Existing PR exact-head CI reports both test checks SUCCESS at `3fcbb6ab8db019827347ec596c85e1c917899ea5`;
+CI is not live macOS wake evidence or independent supervisor acceptance.
+
+Smallest prerequisite: the existing PM/supervisor must make the already authorized isolated qualification
+reachable through an existing supported app-session route and provide safe receipt/next-wait evidence, or
+obtain an explicitly reviewed narrowly scoped CLI startup-access prerequisite. The worker cannot grant
+itself access or relocate Codex home to evade the denial. Prefer the existing app route; do not change model,
+effort, credentials, monitor ownership or security settings. Hold main publication/deployment and acceptance.
+
+
+### Reconciled app evidence, 2026-10-09 19:39 UTC
+
+This section supersedes the earlier zero-model-receipt/app-inaccessible claims for the existing app
+executor only. Those claims still describe the CLI worker's own capabilities. No production prompt,
+role, runtime setting or Memory behavior changes in this continuation; I/H remain research overlays.
+
+The [guided PM evidence](https://github.com/alexkirs/taskq/issues/595#issuecomment-6087506889)
+and [independent confirmation](https://github.com/alexkirs/taskq/issues/595#issuecomment-6087525265)
+report an idle observation, subsequent PM receipt turn, and six actual empty-board harness commands:
+pm, arm, tick, wait returning tick, handling tick, next wait returning tick, all exit 0.
+This is explicitly steered app transport/action proof, not an unsteered comparison. Both waits completed;
+it does not establish a continuing running monitor. Full role readback was truncated. Per-event UTC,
+receipt/tool identifiers, running wait handle, model/effort and latency were not supplied and remain unknown.
+
+Candidate correspondence was checked before attributing this evidence: recorded head
+`64661cda773b93889e06a6e35735344185393d8c`, taskq.py SHA256
+`6df4c532df36a8ea43d48573f2a41ac075e52d76bce2f5de550ced0acc2a3cfb`, taskq.md SHA256
+`dd08f16a775ae76337dad212f63b115b215fc4f0f9666e63fa9c64851497d422`.
+The private harness SHA256 `bc9e0ea67999924c4f673b66de16e8fc89107422ebe1dd7a2f13d9a0e0b4d829`
+is executor-reported, not independently readable by this worker. Board refused writes, spawning was
+disabled, update false, limits Claude 0 / Codex 3. Production sender evidence remains separate.
+
+The [completed fresh comparison](https://github.com/alexkirs/taskq/issues/595#issuecomment-6087977620)
+reports these sequential one-shot app observations with unchanged scope and inputs above:
+
+| Variant / app PM identity | ARM-input observed sequence | Additional next wait | Access interventions / wording clarification | Full qualification |
+|---|---|---|---|---|
+| C / `01a12221-7e86-72ac-ab3d-c26141388099` | arm, tick, wait returning tick, handling tick | None | 1 initial fixture-local pm write retry / 0 observed | BLOCKED: no idle wake or running next wait |
+| I / `01a12224-ecea-7181-bd79-7f28b1aae088` | arm, status/read-only wrapper inspection, tick, wait returning tick, handling tick | Invoked, returned tick; completed | 1 initial fixture-local pm write retry / 0 observed | BLOCKED: no idle wake or running next wait |
+| H / `01a12228-8f25-74d8-973b-a46e9885a0a8` | arm, tick, wait returning tick, handling tick | None | 1 initial fixture-local pm write retry / 0 observed | BLOCKED: no idle wake or running next wait |
+
+All post-access reported commands exit 0. C waits were approximately 4.97 s; I waits 4.974 s and
+4.970 s; H waits 4.958 s in its PM turn and 4.963 s in its ARM turn. These are completed foreground
+wait durations, never idle-wake latency. Exact send/receipt UTC, full sanitized role output, runtime
+version/model/effort, continuing monitor identity and sender capability names are unknown in these
+comments. C used baseline contract `6aaff37c4277`; I/H used candidate plus the exact overlays above.
+Source revision, trial order, context and access-retry confounds prevent causal attribution to wording.
+
+The earlier interrupted C trial is excluded: approval rejected its initial follow-on tick, a scheduled
+ARM input arrived before the stop instruction, and fixture wait access then blocked. This is approval/
+access interruption with protocol deviation, not a prompt-understanding failure or valid comparison.
+Fresh C already executed returned instructions after supported access resolution. Foreground ARM
+handling was observed in 3/3 trials; additional next-wait invocation in 1/3 (I); full persistent ARM
+successes 0/3 qualified. No winning overlay or general Codex defect is established. Omitted continuing
+wait actions cannot be classified as wording failures when supported monitor/sender access is missing.
+
+### Isolated I transport evidence, 2026-10-09 19:49 UTC
+
+The [existing executor's transport report](https://github.com/alexkirs/taskq/issues/595#issuecomment-6088121463)
+supersedes the preceding missing-idle-receipt observation for isolated I only. It is a separately labeled
+post-comparison transport qualification, not another unsteered I cell or a winning overlay.
+The sender independently observed target `01a12224-ecea-7181-bd79-7f28b1aae088` idle and verified
+candidate/harness hashes. Its actual isolated `wait --pm <I target> --window 0.1 --every 1` returned
+`tick`, exit 0, in 6.061 s. It observed the target idle again and sent that output with scope/target.
+The independently inspected completed target receipt turn invoked isolated tick (exit 0, zero counters)
+and a target-local wait (exit 0, `tick`, 5.014 s). These target command observations establish application,
+not merely send acceptance. The sender then invoked exactly one same-target
+`wait --pm <I target> --window 0.5 --every 1`; independent process inspection established it was running.
+It subsequently terminated only that isolated child. Neither isolated wait remains running.
+
+Code and contract SHA256 match the recorded candidate above; post-comparison wrapper SHA256 is
+`2613d396a4e7b225c4208800b9ff819252ba69cfabcf9db1b13e570e29937769`, executor-reported.
+The worker did not inspect the private wrapper or transcript. Per-event UTC, receipt turn/tool id,
+running process handle, messaging tool name and model/effort are not supplied; wake latency is unknown.
+The comment publication time is not a send or receipt timestamp. Production sender proof remains separate.
+
+**Bound NOT PASS:** cleanup was about 66 s after the initial probe clock, exceeding the requested 60 s
+because of reported tool latency. Action/overlap within 60 s is unproved. Target foreground wait overlapped
+or may have overlapped the sender's next wait; no independently proved monitor-reuse/duplicate-free
+coordination. Paused and foreign-project fixtures remain BLOCKED. Do not repeat completed probes or
+start further trials to erase these limitations. No full acceptance or persistent-monitor claim follows.
+
+### Own-session routing assessment and review packet
+
+`cmd_wait` selects `args.pm or session()['session']` and uses `.taskq/wait-<selected id>.json`.
+Thus omitting `--pm` in the actual target session selects that session's own receipt, provided its real
+session environment resolves to the I id. The transport report does not expose that environment;
+actual live target routing remains conditional, not independently verified by this worker.
+Existing `MultiPM.test_agent_sender_delivers_its_managers_outcome_once` and
+`test_shell_sender_delivers_its_managers_outcome_once` assert sequential explicit-sender/own-session
+receipt sharing and foreign-manager separation. They do not assert concurrent Codex wait exclusion.
+Codex ordinary waits read their initial receipt without a monitor lock; the native Hermes delivery lock
+is a separate branch. Two concurrent ordinary waits can therefore both observe an event. Rendering ARM
+neither starts nor deduplicates a monitor. No new coordination mechanism is authorized by this finding.
+
+| Requirement / acceptance | Available evidence / failure oracle | Red-before-fix | Remaining blindspot / disposition | Available cost |
+|---|---|---|---|---|
+| Id/link normalization, §7 | Nine synthetic local/archived/unknown route cases and real bash loop with fake wait/send; same extracted PM for lookup/wait/send | Six synthetic link failures observed | Retain unique regression and minimal fix; no live CLI link-resume proof | Prior focused 21 checks: 2.267 s and 2.807 s; no direct model calls, development cost unknown |
+| Unsteered role execution, A1/A4 | C/I/H foreground handling 3/3; next completed wait 0/1, 1/1, 0/1; wording clarification 0 observed each | General wording defect unproved | Source/order/context/access confounds; no winning overlay; retain research only | Completed foreground wait durations above; model cost unknown |
+| App receipt/application/next wait, A2 | Isolated-I idle observation, inspected receipt/tick and independently running sender process | Historical failure unknown | Partial observed sequence; 60 s bound failed; exact UTC/handles and live own-session environment unknown | 6.061 s sender wait, 5.014 s target wait, about 66 s cleanup; no wake latency |
+| Repeat ARM/paused/foreign, A3/A5 | Existing no-write repeated rendering and sequential MultiPM receipt/ownership checks | Historical red unknown | Live overlap/deduplication unproved; approved paused/foreign fixtures unavailable; BLOCKED | Existing test timings only; no new live trials |
+| Claude/direct CLI/DOT, A1/A2 | Claude0 preserved; CLI fails before role receipt; no established DOT parent/local-child receipt route | CLI startup failure observed | BLOCKED: unchanged limits, required startup filesystem access unavailable, supported DOT route unavailable respectively | CLI failure 0.209 s; other latency unknown |
+| Intake/current state, A6 | Original intake comments document later/unclaimed; explicit activation supersedes parked-state restriction | Not applicable | Current task is active and supervised; never claim current null claim/supervisor/order | Board comments only |
+| Final gate / independent review | Prior full macOS 146 checks FAILED in unchanged Linux-only HermesNativeBoundary; Ubuntu full-suite CI at e0a28ff has two SUCCESS checks | Mac platform failure observed | Linux CI is applicable automated coverage, not Mac live wake qualification; final candidate exact-head CI and supervisor decision required | Mac 24.206 s; e0a28ff CI jobs 17 s and 24 s |
+
+The local full gate remains FAILED; no test skip, platform shim or green-by-subset claim is introduced.
+The configured CI runs the complete suite on Ubuntu/Python 3.11, which supplies the required Linux pidfd
+platform for the unchanged Hermes boundary. Exact-head green CI can supply that automated platform evidence;
+it cannot prove idle wake, duplicate-free ARM or paused/foreign preservation. This continuation changes
+research documentation only, so affected Contract sentinels are the applicable local check (§10).
+No R-number or cross-agent/Memory behavior changes in this continuation. The existing normalization
+clarification restores the recorded id/link contract and does not amend R3/R4/R6/R9/R12/R13.
+
+The original acceptance cannot be completed in the currently reachable approved fixtures. Submit a concrete
+owner choice, without changing acceptance on the owner's behalf:
+
+1. Narrow #595 spec-first to the documented research findings and minimal id/link normalization candidate.
+   Defer winning-overlay/full topology, live CLI link-resume, duplicate-free repeated ARM and paused/foreign
+   preservation qualification explicitly. This does not waive security or exact-head independent review/CI;
+   the supervisor must assess which live proof remains applicable to the narrowed output before publication.
+2. Retain original acceptance HOLD. Required prerequisites are an approved inspectable isolated monitor and
+   coordinated wait ownership for repeated ARM, existing approved paused/foreign fixtures, a supported CLI
+   startup/link-resume qualification route without bypass, and an approved supported Claude/DOT topology.
+   Full role evidence, actual runtime/settings and per-event identifiers/timestamps remain missing as recorded.
+
+Recommend option 1: no general wording cure was established and more trials in the existing scope were
+explicitly stopped. A narrowing requires owner acceptance under R13, then a contract amendment before any
+further implementation. Neither this packet nor the option publishes, deploys or closes the task. The existing
+supervisor must independently review the exact candidate; no replacement reviewer/sender is started.

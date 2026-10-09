@@ -973,6 +973,18 @@ class Tick(Base):
         self.assertEqual(started, [['tick', '--quiet', '--after', '4242', '--tasks']])
         self.assertTrue((self.root / '.taskq' / 'dispatch.log').read_text().endswith('turn end pid 4242\n'))
 
+    def test_recorded_session_cannot_take_the_manager_role(self):
+        # R3 (#525): `taskq pm` would let a supervisor or worker pass the gate as the manager; it is refused
+        self.add('one')
+        self.run_cli('tick')
+        with self.acting(''):
+            self.run_cli('run', '1')
+        self.run_cli('tick')
+        for sid in ('s-S1', 's-T1'):
+            with self.acting(sid), self.assertRaisesRegex(SystemExit, 'cannot take the manager role'):
+                self.run_cli('pm')
+        self.assertEqual(taskq.manager()['session'], SESSION)
+
 
 class Wait(Tick):
     """#407: `taskq wait` returns once per event, or 'tick' after the window; the clock is patched."""

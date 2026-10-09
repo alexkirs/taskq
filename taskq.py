@@ -1262,10 +1262,12 @@ def refresh():
 
 def cmd_pm(args):
     """The manager role: Principles and § 7 of taskq.md, then how to tick this session; the hash goes to .taskq/pm.json."""
+    me = session() or {}  # R3 (#525): this machine's supervisors run in the manager's runtime; its id passes the gate
+    if me and any(role(item) in ('supervisor', 'worker') for item in map(parse, BOARD.list(None)) if item):
+        fail('a recorded supervisor or worker cannot take the manager role (R3 one controller)')
     text, digest = (CLONE / 'taskq.md').read_text('utf-8'), contract()
     sections = re.findall(r'^## (?:Principles|7\. Manager)\b.*?(?=^## )', text, re.M | re.S)
     (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
-    me = session() or {}  # R3 (#525): this machine's supervisors run in the manager's runtime; its id passes the gate
     (CONFIG['root'] / '.taskq' / 'pm.json').write_text(json.dumps(
         {'contract': digest, 'runtime': me.get('runtime') or os.environ.get('TASKQ_RUNTIME'), 'session': me.get('session')}), 'utf-8')
     print(f'taskq pm contract {digest}\nYou are the taskq manager of {CONFIG["root"]}. Follow this role from now on; '

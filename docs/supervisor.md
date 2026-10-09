@@ -17,6 +17,9 @@ Not accepted: a permanent global supervisor, and a fresh reviewer started only a
 of this note). The contract is `taskq.md` (R2, R3, R11, § 3, § 4, § 7); this note never overrides it. Numbers marked
 *estimate* were not measured (R12).
 
+Status: accepted model, not yet code. #525 implements it; until it ships, `taskq.py` runs the unsupervised path
+(§ 6 below).
+
 ## 1. Variants studied
 
 - **(a) Persistent supervisor per task** (#243, removed by #290): the tick spawns `S<N>`; `S<N>` spawns `T<N>`
@@ -44,7 +47,7 @@ of this note). The contract is `taskq.md` (R2, R3, R11, § 3, § 4, § 7); this 
 | #207 | DOT-created Codex sessions stayed in the active UI; archive routes unqualified. | Cloud threads and app-held threads belong to another process; `thread/archive` fails "active writer" (#158). | `S<N>` and `T<N>` are local headless `codex exec` threads with `.taskq/<name>.pid`, retired by recorded id. DOT only runs the manager. |
 | #290 | The supervisor was deleted in the single-file cutover. | Cost: typed supervisor, handoff races (#240 P1), fork adoption (#284, #291), sandboxed access (#270), wake logic, an authority model; about a third of the old code. | No fork adoption (no resume of Claude), no sandboxed spawn, one id gate on four commands, one block field, one brief. |
 | #502 | A tick inside a sandboxed Codex session called live workers gone and requeued them. | The sandbox cannot see other processes; `alive` returned False. | Unchanged: no pass runs in the sandbox. Liveness of `S<N>` and `T<N>` is checked only by an unsandboxed pass. |
-| #510 | A Codex manager is not woken when a background `taskq wait` ends. | Codex has no wake on a finished background command. | A Codex supervisor ends its turn and is woken by `exec resume` from the pass (a local rollout exists: `codex exec` made it). The manager gets the one line through its sender (R4, #522). |
+| #510 | A Codex manager is not woken when a background `taskq wait` ends. | Codex has no wake on a finished background command. | A Codex supervisor ends its turn and is woken by `exec resume` from the pass (a local rollout exists: `codex exec` made it). Its process exits at every turn end, so the pass reads idle from the log and rollout, not from the pid (§ 3a). The manager gets the one line through its sender (R4, #522 unchanged). |
 
 ## 3. Per runtime (c2)
 
@@ -55,15 +58,33 @@ of this note). The contract is `taskq.md` (R2, R3, R11, § 3, § 4, § 7); this 
 | Woken | Its background `taskq wait --task N` (Bash `run_in_background`) ends: same session, same id | Pass step 4: `exec resume <thread> '<event> #N: read your issue'` when no turn runs |
 | Reaches the board | `taskq` and `gh`/`glab` through Bash | Same, network on in the sandbox (as workers' `result`) |
 | Worker dies | Pass comments `gone`, wakes it; it requeues (rework) or asks; second death: `ask` | Same |
-| Supervisor dies | Pass respawns `S<N>`, replaces `supervisor`; the new one adopts the live worker from the board; second death: `ask` with `tail` | Same |
-| CI red or merge refused | `close` sends the task back (§ 6); supervisor requeues with the fixes; third rework: `ask` | Same |
-| Retire | Ends its turn after `close`; the next pass retires `S<N>` and `T<N>` by recorded id once stopped | `close` in the sandbox cannot kill or archive; the next unsandboxed pass retires both |
+| Idle (expected) | Listed with a pid, its background wait running; the exact `state` shown is unverified (§ 5.2) | Pid exited, last turn `turn.completed` in `.taskq/S<N>.log`, local rollout: never respawned (§ 3a) |
+| Supervisor dies | Not listed, or no pid. First death: respawn `S<N>`, replace `supervisor`, retire the old id; the new one adopts the live worker from the board. Second: `ask` with `tail` | Last turn `turn.failed`/`error`/none, or no local rollout. First death: one `exec resume` of the same thread when the rollout is local, else respawn as Claude. Second: `ask` with `tail` |
+| CI red or merge refused | `close` sends the task back (`taskq.md` § 6); supervisor requeues with the fixes; third rework: `ask` | Same |
+| Retire | Ends its turn after `close` (never stopped by it); `close` stops `T<N>`, the next pass retires `S<N>` by recorded id once stopped (R11) | `close` in the sandbox cannot kill or archive; the next unsandboxed pass retires both, stopped only |
 | Tokens (*estimate*) | One context per task: system + tools + `taskq.md` (~10k) + issue, then per review the diff and CI; about 50k-150k input per task, cached within a turn, re-read cold after 5 min idle on each wake | Similar; larger Codex system prompt; each `exec resume` re-reads the thread |
 
 Manager saving (measured in #503): before compaction a manager tick cost 4.47M input tokens at 650k context, after
 0.44M at 100k. Diffs and CI logs read during reviews feed that growth; with (c2) the manager reads one line per task.
 Total cost rises by the supervisor sessions; no saving is claimed until #526 measures both (owner: count total cost,
 not only manager context).
+
+### 3a. Idle or dead
+
+`alive` (§ 8 of `taskq.md`) is pid-running for Codex. A Codex supervisor ends its turn by design and waits for
+`exec resume`, so pid exited is its normal idle state; reading it as death would respawn or `ask` after every turn.
+The pass decides from evidence on disk only:
+
+| Evidence (Codex) | State | Pass does |
+|---|---|---|
+| pid in `.taskq/S<N>.pid` running | running | an event waits for the next pass |
+| pid exited, last turn after the last `turn.started` ended `turn.completed`, rollout in `$CODEX_HOME/sessions` (the #522 `rollout` check) | idle | `exec resume` on the next event, same thread; nothing else |
+| no pid file; last turn `turn.failed`, `error` or no terminal event (killed); no local rollout | dead | comment `gone` with the evidence; first death: one `exec resume` of the same thread if the rollout is local, else respawn; second: `ask` with `tail` |
+
+These event names were read in this machine's `.taskq/T*.log` (`thread.started`, `turn.started`, `turn.completed`,
+`turn.failed`, `error`). For Claude, running and dead are read from `claude agents --json --all` (listed with a pid;
+not listed or no pid); the state a `--bg` job shows while idle on its background wait is not proved (§ 5.2), so
+#525 must not treat a listed job with a pid as dead. Death counts reset at each `result` or `answer`, as #393.
 
 ## 4. One controller
 
@@ -80,7 +101,7 @@ not only manager context).
 1. **Codex supervisor, no unsandboxed pass on the machine.** A sandboxed supervisor's `run`, `requeue` and `close`
    start no pass (#502), and a sandboxed manager's tick only prints. With only sandboxed Codex sessions on a machine,
    nothing spawns, wakes or retires. Needs a pass outside the sandbox: a Claude manager or sender, a shell, or a
-   scheduler (`taskq tick` from cron, § 7). taskq does not change the sandbox (R9).
+   scheduler (`taskq tick` from cron, `taskq.md` § 7). taskq does not change the sandbox (R9).
 2. **Claude supervisor wake inside a `claude --bg` job is unverified (R12).** The manager role proved a background
    `taskq wait` wakes an interactive session; a `--bg` job that ended its turn is not yet proved to be woken by it.
    If #526 shows it is not, a Claude supervisor cannot be woken without the #284 fork: a blocker for Claude
@@ -94,10 +115,23 @@ not only manager context).
 5. **Cross-machine.** A Codex supervisor is woken only by a pass on its own machine; a pass elsewhere shows its bare
    id (R6) and cannot wake or retire it.
 
-## 6. Follow-ups
+## 6. Transition (until #525 ships)
+
+`taskq.md` publishes the accepted model before the code (R13). Until #525 ships, the executable is the unsupervised
+path: no `S<N>`, no `supervisor` field, no `run`, no `wait --task`, no runtime or id in `pm.json`, and R11 retire
+still matches `T<N> ` names by task number. Every task with no `supervisor` field (all tasks started before #525
+ships, #525 and #526 among them) keeps that path to its end: the pass spawns and follows `T<N>`, `wait` prints
+`review #N`, the manager reviews the diff and the exact-head CI and closes or requeues it (`taskq.md` § 7
+Unsupervised review). This is a migration path, not a review-only substitute: once #525 ships, every new task gets
+its supervisor at step 3. The #522 sender (routes, rollout rule, one-blocker stop) is unchanged; only the set of
+events `wait` prints changes.
+
+## 7. Follow-ups
 
 - #525 implements § 3 and § 4 (`--deps 524`): `supervisor` block field, `run`, the id gate, pass step 4,
-  `wait --task N`, `pm.json` runtime and id, retire of `S<N>`; tests on fakes only.
+  `wait --task N`, `pm.json` runtime and id, the idle/dead state of § 3a, retire by recorded id (R11) for `T<N>`
+  and `S<N>`; the unsupervised path stays for tasks with no `supervisor`; tests on fakes only.
 - #526 live check (`--deps 525`): Claude manager and Codex manager, each a full cycle with a controlled CI failure,
-  rework, exact-SHA merge, close and retirement of both sessions; proves or refutes § 5.2; measures total cost and
-  manager context.
+  rework, exact-SHA merge, close and retirement of both sessions; a Codex supervisor idle across turns is not
+  respawned, a killed one is recovered once; proves or refutes § 5.2 and records the Claude idle `state`; measures
+  total cost and manager context.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
-import argparse, contextlib, glob, hashlib, importlib.util, json, os, re, shlex, shutil, signal, socket, subprocess, sys, time
+import argparse, contextlib, glob, hashlib, importlib.util, json, os, re, shlex, shutil, signal, socket, subprocess, sys, threading, time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -37,8 +37,9 @@ def machine():
 ORCH = {'claude': 'CLD', 'codex': 'CDX', 'dot': 'DOT', 'hermes': 'HRM', 'grok': 'GRK'}
 
 def worker_name(item, letter='T'):
-    """R3 naming (#268): `T<N> <ORCH> <title> (<machine>)`, `S<N> ...` the supervisor; ORCH is who launched it, UNK for the owner's shell."""
-    launcher = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
+    """R3 naming (#268, #572): `T<N> <ORCH> <title> (<machine>)`, `S<N> ...` the supervisor; ORCH is the task's `pm` on the
+    board, never the caller that runs the pass; a task with no `pm` (R3 Transition): the caller, UNK for the owner's shell."""
+    launcher = (item.get('pm') or {}).get('runtime') or (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
     return f'{letter}{item["iid"]} {ORCH.get(launcher, "UNK")} {item["title"][:40]} ({machine()})'
 
 def session():
@@ -330,6 +331,13 @@ def codex_options():
     return CONFIG.get('codex', ['-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true',
                                 '--add-dir', str(CONFIG['root'] / '.git')])  # git fetch/commit write the main .git
 
+class Unnamed(Exception):
+    """R3 (#572): a started session whose native name was not confirmed; `thread` is its id."""
+
+    def __init__(self, thread, why):
+        super().__init__(f'{thread} not named: {why}')
+        self.thread = thread
+
 class Codex:
     """`codex exec`, headless: one process per turn, its JSONL in .taskq/<name>.log, `<pid> <thread>` in .taskq/<name>.pid."""
 
@@ -362,7 +370,49 @@ class Codex:
         if old[1:] and old[1] != found:  # #568: a replaced thread not yet retired (a running one) keeps its handle
             pid.rename(pid.with_name(f'{pid.stem}-{old[1]}.pid'))
         pid.write_text(f'{process.pid} {found}')
+        try:
+            self.title(found, name)
+        except (OSError, ValueError) as error:  # R3 (#572): no unnamed thread works; its pid file stays for the retire (R11)
+            process.terminate()
+            raise Unnamed(found, error)
         return found
+
+    WAIT = 60  # seconds for the whole app-server exchange, its shutdown included
+
+    def title(self, thread, name):
+        """R3 (#572): `codex exec` names no thread; the app-server's `thread/name/set` does, `thread/read` proves it.
+        Each request waits for its own successful reply. `exec resume` keeps the name. Raises ValueError unless named."""
+        server = subprocess.Popen([shutil.which('codex') or 'codex', 'app-server'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, env=worker_env(), text=True, encoding='utf-8')
+        timer = threading.Timer(self.WAIT, server.kill)  # one deadline through shutdown: a hung server is killed, its stdout ends
+        timer.start()
+
+        def send(message):
+            server.stdin.write(json.dumps({'jsonrpc': '2.0', **message}) + '\n')
+            server.stdin.flush()
+
+        def call(n, method, params):
+            send({'id': n, 'method': method, 'params': params})
+            for line in server.stdout:  # notifications and the server's own requests pass by
+                reply = json.loads(line) if line.startswith('{') else {}
+                if reply.get('id') == n and 'method' not in reply:
+                    if 'result' not in reply:
+                        raise ValueError(f'{method}: {reply.get("error")}')
+                    return reply['result']
+            raise ValueError(f'{method}: no reply in {self.WAIT} s')
+        try:
+            call(0, 'initialize', {'clientInfo': {'name': 'taskq', 'version': '1'}})
+            send({'method': 'initialized'})
+            call(1, 'thread/name/set', {'threadId': thread, 'name': name})
+            read = call(2, 'thread/read', {'threadId': thread}).get('thread') or {}
+            if (read.get('id'), read.get('name')) != (thread, name):
+                raise ValueError(f'thread/read: {read.get("id")} named {read.get("name")!r}')
+        finally:
+            with contextlib.suppress(OSError):
+                server.stdin.close()
+            server.wait()  # bounded: the timer kills it
+            timer.cancel()
+            server.stdout.close()
 
     def pid_file(self, session):
         return next((path for path in self.folder().glob('*.pid') if path.read_text().split()[1:] == [session]), None)
@@ -876,7 +926,7 @@ def history(n):
     return 'History of this task (read it first; a requeue says what to fix):\n\n' + '\n\n'.join(notes[-6:]) + '\n\n' if notes else ''
 
 def brief(item, runtime):
-    """The worker's prompt: the task, its workspace, the taskq commands it uses."""
+    """The worker's prompt: its name first (R3, #572: a runtime's fallback title), the task, its workspace, the taskq commands it uses."""
     n, root, tq = item['iid'], CONFIG['root'], f'python3 {Path(__file__).resolve()}'
     create = f'glab mr create --yes --target-branch main --source-branch taskq-{n} --title "<title>" --description' if CONFIG['board'] == 'gitlab' \
         else f'gh pr create --base main --head taskq-{n} --title "<title>" --body'
@@ -884,7 +934,8 @@ def brief(item, runtime):
         f'then `{tq} result {n} --sha <PR head full SHA>' if CONFIG['publish'] == 'pr' else f'`git push --force-with-lease origin HEAD:refs/heads/taskq-{n}`, then\n  `{tq} result {n} --sha <candidate full SHA>'
     workspace = f'take your workspace from the project instructions (AGENTS.md) or the path the manager gave, on branch taskq-{n};\nthe host owns it: never remove it' \
         if CONFIG.get('workspace') == 'external' else f'from {root} run `git fetch origin && git worktree add -b taskq-{n} .worktrees/taskq-{n} origin/main`, work only there,\nnever in the main checkout'
-    return f'''You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
+    return f'''{worker_name(item)}
+You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
 Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
 Read `{Path(__file__).resolve().with_name("taskq.md")}` first and do only what it allows (R13): a task that conflicts with a recorded decision is an ask with options, not an edit.
 
@@ -903,14 +954,15 @@ needs no worktree. Commands:
 Everything written through taskq is public: no secrets, tokens or paths outside the repository.'''
 
 def supervisor_brief(item, runtime, kind):
-    """S<N>'s prompt (§ 7 Supervisor): the task, its orders, review and close; never the task's code."""
+    """S<N>'s prompt (§ 7 Supervisor): its name first (R3), the task, its orders, review and close; never the task's code."""
     n, tq, lab = item['iid'], f'python3 {Path(__file__).resolve()}', CONFIG['board'] == 'gitlab'
     wait = f'run `{tq} wait --task {n}` in the background (run_in_background) and end your turn; its output wakes you' \
         if getattr(kind, 'SELF_WAKE', False) else 'end your turn; the queue wakes you with the event'
     ci = f'glab api "projects/:id/pipelines?sha=<sha>"' if lab else 'gh run list --commit <sha>'
     view = f'glab issue view {n} --comments' if lab else f'gh issue view {n} --comments'
     nudge = f'glab issue note {n} -m "nudge: <text>"' if lab else f'gh issue comment {n} --body "nudge: <text>"'
-    return f'''You are the taskq supervisor S{n} of task #{n}: {item["title"]}. You are its only controller: you order its worker, follow it,
+    return f'''{worker_name(item, 'S')}
+You are the taskq supervisor S{n} of task #{n}: {item["title"]}. You are its only controller: you order its worker, follow it,
 review its result and close or rework it. You never edit the task's code, never start a session yourself, never decide for the owner.
 Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
 Read `{Path(__file__).resolve().with_name("taskq.md")}` (§ 7 Supervisor, § 6) first and do only what it allows (R13).
@@ -939,6 +991,16 @@ Everything written through taskq is public: no secrets, tokens or paths outside 
 def note(who, sid, kind):
     """A spawn note names the role and the id (R11 retires by it), then the link when the runtime has one."""
     return f'{who} {sid}' + (f'\n{link}' if (link := kind.link(sid)) else '')
+
+def spawn_named(item, kind, letter, prompt):
+    """Spawn under the R3 name. A session the runtime could not name (#572) is stopped, recorded by a `gone` note
+    (R11 retires it), never as a spawn; the pass fails (§ 7) and the next one tries again."""
+    try:
+        return kind.spawn(worker_name(item, letter), prompt, CONFIG['root'])
+    except Unnamed as error:
+        role = 'supervisor' if letter == 'S' else 'worker'
+        BOARD.comment(item['iid'], f'**gone** · {who()}\n\n{role} {error}')
+        fail(f'#{item["iid"]}: {role} {error}')
 
 def replace(item, kind, runtime, role, running=False):
     """#568: before a replacement spawn, retire the task's earlier `role` sessions the board records (R11, #478), never
@@ -1017,7 +1079,7 @@ def supervise(item, kinds):
     if fresh and fresh['raw'].get('order') and not (fresh['claim'] or {}).get('session'):  # run or a rework requeue: a new worker on branch taskq-<N> (#291)
         kind = kinds[claim['runtime']]
         replace(item, kind, claim['runtime'], 'worker', running=True)
-        sid = kind.spawn(worker_name(item), brief(item, claim['runtime']), CONFIG['root'])
+        sid = spawn_named(item, kind, 'T', brief(item, claim['runtime']))
         item['claim'], item['raw']['order'] = {**claim, 'session': sid}, None
         move(item, 'doing', 'spawn', note('worker', sid, kind), claim=item['claim'], order=None)
     elif item['state'] == 'doing' and claim.get('session') and claim.get('runtime') in kinds:
@@ -1040,7 +1102,7 @@ def supervise(item, kinds):
             lead.send(boss['session'], f'restart #{n}: your last turn ended {evidence}; read your issue')
         else:  # a new supervisor adopts the live worker from the board; the dead one is retired first
             replace(item, lead, boss['runtime'], 'supervisor')
-            sid = lead.spawn(worker_name(item, 'S'), supervisor_brief(item, boss['runtime'], lead), CONFIG['root'])
+            sid = spawn_named(item, lead, 'S', supervisor_brief(item, boss['runtime'], lead))
             item['supervisor'] = {**boss, 'session': sid}
             move(item, item['state'], 'spawn', note('supervisor', sid, lead), supervisor=item['supervisor'])
     else:
@@ -1186,7 +1248,7 @@ def one_pass(args, table=True):
                 item.update(fresh)
                 runtime = lead(item)
                 replace(item, kinds[runtime], runtime, 'supervisor')  # a requeued task's old S<N>
-                session = kinds[runtime].spawn(worker_name(item, 'S'), supervisor_brief(item, runtime, kinds[runtime]), CONFIG['root'])
+                session = spawn_named(item, kinds[runtime], 'S', supervisor_brief(item, runtime, kinds[runtime]))
                 item.update(supervisor={'runtime': runtime, 'session': session, 'name': here}, claim={'runtime': free, 'session': None, 'name': here})
                 move(item, 'doing', 'spawn', note('supervisor', session, kinds[runtime]), supervisor=item['supervisor'], claim=item['claim'],
                      result=None, order=None)

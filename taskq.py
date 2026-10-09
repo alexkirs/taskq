@@ -1318,6 +1318,9 @@ def stale(by_number):
                 issues[n] = BOARD.get(n)
             except (Exception, SystemExit):
                 issues[n] = None
+        fresh = parse(issues[n]) if issues[n] and issues[n]['state'] == 'open' else None
+        if fresh and sid in ((fresh['claim'] or {}).get('session'), (fresh['supervisor'] or {}).get('session')):
+            return False  # a fresh controller/worker is current even when the pass's earlier read held another id
         return bool(issues[n] and host_scope(issues[n]) and recorded(issues[n], name, sid))
     return gone
 
@@ -1361,8 +1364,8 @@ def one_pass(args, table=True):
             # Admission/accounting use fresh reservations, including work outside this host-label scope.
             # A lagging list can otherwise hide an active worker or overwrite a claim moved to another machine.
             fresh_issues = [BOARD.get(item['iid']) for item in ready]
-            ready = sorted(filter(None, (parse(issue) for issue in fresh_issues if issue['state'] == 'open')),
-                           key=lambda item: (item['priority'], item['iid']))
+            items = ready = sorted(filter(None, (parse(issue) for issue in fresh_issues if issue['state'] == 'open')),
+                                   key=lambda item: (item['priority'], item['iid']))
         worker_slots, occupied = set(), {}
         if local is not None:  # existing active workers consume capacity, even outside this invocation's host scope
             for item in ready:

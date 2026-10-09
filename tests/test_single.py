@@ -840,6 +840,33 @@ class Tick(TickSetup):
                 self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
                 self.assertFalse(any(name.startswith('T') for name in self.fake.names))
 
+    def test_local_scope_reports_and_protects_newly_spawned_supervisor(self):
+        with mock.patch.object(taskq, 'dispatch'):
+            self.add('new', '--host', 'mac')
+        retireable = []
+        def retire(gone, *args, **kwargs):
+            retireable.append(gone('fake', 1, 's-S1', False))
+        with mock.patch.dict(os.environ, {'TASKQ_HOST_ONLY': 'mac', 'TASKQ_LIMITS': '{"fake":1}'}), \
+                mock.patch.object(taskq, 'retire', retire):
+            report = self.run_cli('tick')
+        self.assertEqual(retireable, [False])  # even if the new supervisor's first turn already stopped
+        self.assertEqual(self.task(1)['supervisor']['session'], 's-S1')
+        self.assertIn('In work 1 · Waiting for answer 0 · Ready 0', report)
+        self.assertIn('| [#1 new](https://board/1) | doing | fake | [s-S1](https://watch/s-S1) |', report)
+
+    def test_retirement_fresh_read_keeps_current_open_sessions(self):
+        self.add('owned', '--host', 'mac')
+        earlier = self.task(1)
+        for field in ('claim', 'supervisor'):
+            with self.subTest(field=field):
+                current = {**earlier['raw'], field: {'runtime': 'fake', 'session': 'fresh-session', 'name': 'mac'}}
+                self.board.issues[1]['body'] = taskq.block('g', current)
+                for state, retireable in (('open', False), ('closed', True)):
+                    with self.subTest(state=state), mock.patch.dict(os.environ, {'TASKQ_HOST_ONLY': 'mac'}):
+                        self.board.issues[1]['state'] = state
+                        self.assertEqual(taskq.stale({1: earlier})('fake', 1, 'fresh-session', False), retireable)
+                self.board.issues[1]['state'] = 'open'
+
     def test_local_scope_never_overwrites_fresh_foreign_execution(self):
         with mock.patch.object(taskq, 'dispatch'):
             self.add('owned', '--host', 'mac')

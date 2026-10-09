@@ -587,7 +587,7 @@ Runtime file: four module-level functions, three more optional.
 | `send(session, text)` | deliver one message; returns the session id (it may change) |
 | `alive(session)` | `True` running, `False` gone, `None` cannot tell |
 | `link(session)` | a URL the owner opens to watch the session, or `None` |
-| `retire(gone, running=True)` | optional: stop and remove this machine's `T<N>`/`S<N>` sessions with `gone(N, session, live)` true; `close` calls it for its task's recorded workers, the tick with `running=False` for recorded sessions of tasks not open or replaced (R11) |
+| `retire(gone, running=True)` | optional: stop and remove this machine's `T<N>`/`S<N>` sessions with `gone(N, session, live)` true (`live=None` unknown); explicit False defers replacement, True confirms selected retirements, legacy None is accepted; `close` calls it for its task's recorded workers, the tick with `running=False` for recorded sessions of tasks not open or replaced (R11) |
 | `tail(session)` | optional: the session's last log line, for the ask after a second quick death (§ 7) |
 | `state(session)` | optional: a session's `running`, `idle`, `dead` or `unknown` (`None` is accepted as unknown); without it `alive` stands in, never proving idle |
 

@@ -938,14 +938,21 @@ class Codex:
         return rollout(session) == 'local'
 
     def retire(self, gone, running=True):
-        """Kill the turn's process, `codex archive` the thread, drop .taskq/T<N>.pid or S<N>.pid (#360)."""
+        """True: selected predecessors retired; False: preserve/defer. Unknown effects still raise."""
+        complete = True
+        safe_stop = os.name == 'nt' or (sys.platform == 'linux' and hasattr(os, 'pidfd_open')
+                                       and hasattr(signal, 'pidfd_send_signal'))
         for path in (CONFIG['root'] / '.taskq').glob('*.pid'):
             n = re.fullmatch(r'[TS](\d+)(-[\w-]+)?', path.stem)
             pid, thread, birth = read_process(path)
-            state = process_state(pid, birth)
-            if not n or not thread or state == 'unknown':
+            if not n or not thread:
                 continue
-            if not gone(int(n[1]), thread, state == 'running') or state == 'running' and not running:
+            state = process_state(pid, birth)
+            live = None if state == 'unknown' else state == 'running'
+            if not gone(int(n[1]), thread, live):
+                continue
+            if state == 'unknown' or state == 'running' and (not running or not safe_stop):
+                complete = False
                 continue
             if state == 'running':
                 stop_process(pid, birth)
@@ -953,6 +960,7 @@ class Codex:
             if done.returncode:
                 raise RuntimeError('codex archive failed; recovery handle retained')
             path.unlink()
+        return complete
 
     def tail(self, session):
         path = self.pid_file(session)
@@ -1621,15 +1629,18 @@ def spawn_named(item, kind, letter, prompt):
 def replace(item, kind, runtime, role, running=False):
     """#568: before a replacement spawn, retire the task's earlier `role` sessions the board records (R11, #478), never
     another task's. A Codex spawn rewrites `.taskq/T<N>.pid` / `S<N>.pid`, the old thread's handle. A replaced
-    worker goes running or not; a supervisor only once stopped (R11), its handle kept until then. Best effort."""
+    worker goes running or not; a supervisor only once stopped (R11). Explicit incomplete retirement defers admission."""
     issue = BOARD.get(item['iid'])
     if not executable(issue, item):
         return False  # #576: a reassignment seen by this read: no retire, no spawn
     try:
-        effect(getattr(kind, 'retire', lambda *_: None), lambda n, sid=None, live=None: n == item['iid']
+        retired = effect(getattr(kind, 'retire', lambda *_: None), lambda n, sid=None, live=None: n == item['iid']
                                                   and recorded(issue, runtime, sid) == role, running)
+        if retired is False:
+            return False
     except Exception as error:
         print(f'#{item["iid"]}: could not retire the replaced {role}: {error}', file=sys.stderr)
+        raise
     return True
 
 EVENT_OF = {'result': 'review', 'ask': 'ask', 'answer': 'answer', 'gone': 'gone', 'requeue': 'requeue'}

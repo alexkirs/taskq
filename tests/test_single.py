@@ -2098,6 +2098,43 @@ class Tick(TickSetup):
         self.assertEqual(seen, [('S1', []), ('T1', []), ('T1', ['s-T1']), ('S1', ['s-T1', 's-S1'])])
         self.assertEqual((self.task(1)['claim']['session'], self.fake.sessions.get('s-T1.1'), self.fake.sessions.get('s-T7')), ('s-T1.1', True, True))
 
+    def test_unknown_recorded_predecessor_defers_rework_but_unrelated_handle_does_not(self):
+        self.add('one')
+        claim = {'runtime': 'codex', 'session': 'old-worker', 'name': 'mac'}
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'doing', 'spawn', 'worker old-worker', claim=claim)
+            taskq.move(self.task(1), 'doing', 'requeue', 'fix', claim={**claim, 'session': None}, order='rework')
+        codex = taskq.Codex()
+        owned, unrelated = codex.folder() / 'T1.pid', codex.folder() / 'T7.pid'
+        owned.write_text('123 old-worker')
+        unrelated.write_text('456 other-worker')
+        with mock.patch.object(taskq, 'runtimes', return_value={'fake': self.fake, 'codex': codex}), \
+                mock.patch.object(codex, 'spawn', return_value='new-worker') as spawn, \
+                mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as archive:
+            self.run_cli('tick')
+            self.assertIsNone(self.task(1)['claim']['session'])
+            self.assertEqual(self.task(1)['raw']['order'], 'rework')
+            self.assertEqual(owned.read_text(), '123 old-worker')
+            spawn.assert_not_called()
+            archive.assert_not_called()
+            self.assertIsNone(self.board.guard)  # known deferral has no uncertain side effect
+            # A reconciled, exited predecessor permits admission; the unrelated unknown handle stays untouched.
+            owned.write_text(f'999999999 old-worker {BIRTH}')
+            archive.return_value = subprocess.CompletedProcess([], 1)
+            with self.assertRaisesRegex(RuntimeError, 'archive failed'), contextlib.redirect_stderr(io.StringIO()):
+                self.run_cli('tick')
+            spawn.assert_not_called()
+            self.assertIsNotNone(self.board.guard)
+            self.assertTrue(owned.exists())
+            self.board.release(self.board.guard)  # fixture-only reconciliation: fake archive has no external effects
+            archive.return_value = subprocess.CompletedProcess([], 0)
+            self.run_cli('tick')
+            self.assertEqual(self.task(1)['claim']['session'], 'new-worker')
+            self.assertIsNone(self.task(1)['raw']['order'])
+            spawn.assert_called_once()
+            self.assertEqual(archive.call_args.args[0][-2:], ['archive', 'old-worker'])
+            self.assertEqual(unrelated.read_text(), '456 other-worker')
+
     def test_codex_respawn_keeps_the_replaced_handle(self):
         # #568: a running replaced thread keeps a handle (S<N>-<thread>.pid) so retire still finds and archives it
         codex = taskq.Codex()
@@ -2313,6 +2350,23 @@ class RuntimeProcessBoundary(Base):
                 probe.assert_not_called()
                 execute.assert_not_called()
                 archive.assert_not_called()
+
+    def test_running_retirement_without_safe_signal_defers(self):
+        codex = taskq.Codex()
+        path = codex.folder() / 'T1.pid'
+        path.write_text(f'123 sid {BIRTH}')
+        # Pre-created paths avoid changing pathlib's host selection while exercising Darwin's capability branch.
+        root = mock.MagicMock()
+        root.__truediv__.return_value.glob.return_value = [path]
+        with mock.patch.dict(taskq.CONFIG, root=root), mock.patch.object(taskq.os, 'name', 'posix'), \
+                mock.patch.object(taskq.sys, 'platform', 'darwin'), \
+                mock.patch.object(taskq, 'read_process', return_value=(123, 'sid', BIRTH)), \
+                mock.patch.object(taskq, 'process_state', return_value='running'), \
+                mock.patch.object(taskq, 'stop_process') as stop:
+            self.assertIs(codex.retire(lambda *args: True), False)
+            self.assertIs(codex.retire(lambda *args: False), True)
+            stop.assert_not_called()
+        self.assertEqual(path.read_text(), f'123 sid {BIRTH}')
 
     def test_windows_and_darwin_domains_derive_from_native_hostname(self):
         for platform in ('windows', 'darwin'):

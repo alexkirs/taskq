@@ -45,7 +45,7 @@ Changed: one worker session → one supervisor and one worker session per task, 
   slots, and runs the process steps a supervisor orders (spawn, wake, liveness, retire).
 - Supervisor `S<N>`: one per task, the task's only controller. Orders its worker's launch, follows it, reviews the
   diff and the CI of the exact head SHA, then `requeue` with the fixes, `close` (merge or publish, § 6) or `ask`;
-  its last command's text is the one line the manager gets. Never edits the task's code and starts no session itself.
+  its last command's text is the one line the manager gets (`close`: a verdict, § 7 Supervisor 3.3). Never edits the task's code and starts no session itself.
 - Worker `T<N>`: does one task and writes its result to the board (R5, § 5).
 
 Each task has one manager, its `pm` (§ 3): the session that filed it, with its runtime and machine, recorded by `add`
@@ -375,7 +375,7 @@ Runtime file: four module-level functions, three more optional.
 | `taskq later N [--text T]` | park: any state → `later`; drops claim and supervisor |
 | `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
 | `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4); `--after PID`: first wait for that Codex turn's process to end (R4) |
-| `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed, for the tasks whose `pm` is this session or that have none (all of them from a plain shell); print `ask #N`, `review #N` (an unsupervised task, R3 Transition), `closed #N <text>` (a supervised task), `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7); each manager's events are its own, once (`.taskq/wait-<session>.json`; a plain shell: `.taskq/wait.json`); `--pm ID`: wait as manager `ID`, its tasks and its file (a sender, R4) |
+| `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed, for the tasks whose `pm` is this session or that have none (all of them from a plain shell); print `ask #N`, `review #N` (an unsupervised task, R3 Transition), `closed #N <verdict>` (a supervised task, § 7 Supervisor 3.3), `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7); each manager's events are its own, once (`.taskq/wait-<session>.json`; a plain shell: `.taskq/wait.json`); `--pm ID`: wait as manager `ID`, its tasks and its file (a sender, R4) |
 | `taskq wait --task N [--window MIN] [--every SEC]` | the supervisor's wait: block until its task needs it; print `review #N`, `ask #N`, `answer #N`, `gone #N` (its worker), `requeue #N` (by its worker), one line each, each once (`.taskq/S<N>.seen`); `stop #N` when the task is closed or the calling session is not its supervisor; `tick` after the window |
 | `taskq pm [--adopt N ..]` | print the manager role (Principles, § 7, how to tick this session) under a first line `taskq pm contract <hash>`; record the hash of the clone's `taskq.md` in `.taskq/pm.json` (§ 7), nothing else: a task's manager is its `pm` (R3, #532); refused for a session an open task records as its supervisor or worker, so neither passes the gate as the manager (R3). `--adopt N`: record this session as the `pm` of open tasks that have none, under the dispatch lock with a fresh read; a task with a `pm`, or a busy lock, refuses all of them (R3 Transition) |
 | `taskq cleanup [--dry-run]` | the owner's manual sweep of this machine (below); `--dry-run` prints the same and changes nothing |
@@ -541,7 +541,7 @@ brings the manager its short outcomes (`ask`, `closed`, `gone`); a Claude manage
    it only carries the manager's short outcomes to a manager that cannot wake itself.
 3. `taskq wait` lists the board every 25 s and returns at once with one line per new event of this manager's tasks: `ask #N`,
    `review #N` (an unsupervised task only; a supervised one's review is its supervisor's, #524),
-   `closed #N <the first line of the close text>` (a supervised task), `gone #N` (an unsupervised worker, or a supervisor
+   `closed #N <verdict>` (a supervised task: the first line of its close text, the supervisor's verdict, § Supervisor 3.3), `gone #N` (an unsupervised worker, or a supervisor
    found dead by step 4, claimed on this machine), or `tick` when nothing happened for 10 min. `.taskq/wait-<session>.json`
    (a plain shell: `.taskq/wait.json`) keeps the states last reported to this manager, so an event is printed once per
    manager (a runtime handle, R1); its sender's `wait --pm` uses the same file.
@@ -639,7 +639,12 @@ the task's code, never starts a session itself (step 4 does it) and never decide
       or an owner question, never a PASS. In both modes accept the exact candidate before `close` publishes it.
    2. A commit: CI on that exact SHA is green (an answer on `origin/main` needs no CI check): `gh run list --commit <sha>` / `glab api "projects/:id/pipelines?sha=<sha>"`, where the project
       has CI.
-   3. Accepted: `taskq close N --text "<one line for the manager: what was checked, what was not>"`, end the turn.
+   3. Accepted: `taskq close N --text "<verdict>"`, end the turn. The verdict is one line for the manager, who
+      thinks in tasks, never in code (#524, #567): `<what was accepted>; <what changed for the user>; open: <follow-ups
+      or none>`. No SHA, diff or test log in it. `close` by a supervisor refuses an empty first line, a bare SHA, a
+      line starting `merged` or `published`, or one with no `open:`; the merged or published SHA follows the verdict
+      in the close comment, never before it.
+      Changed: "what was checked, what was not" and `merged <SHA>` as the first line → the verdict (#567).
    4. Not accepted, CI red, or `close` sent the task back (§ 6): `taskq requeue N --text "<exact fixes>"`; the next
       worker reads them. Back to waiting, as in 2. The third rework of one task (3 workers since the last `answer`)
       is refused: `ask` the owner.
@@ -648,7 +653,7 @@ the task's code, never starts a session itself (step 4 does it) and never decide
    choice, a second death). An `answer`: act on it, or let step 4 pass it to the worker.
 5. Silent worker (120 min, issue unchanged): a plain comment `nudge: <text>`; step 4 sends the text to it.
 
-The manager never sees a supervised task's retries: `wait` prints only its `ask` and `closed #N <text>`.
+The manager never sees a supervised task's retries: `wait` prints only its `ask` and `closed #N <verdict>`.
 
 A failure (a spawn that cannot start, a board error) stops the pass with `taskq: <error>` and exit 1, no table;
 the tasks it did not reach wait for the next pass. Fix the cause or tell the owner.
@@ -661,7 +666,7 @@ Changed: the manager relayed each `ask` comment verbatim → the `Decisions` blo
 
 - `ask`: a card with no options: read the question (the last `ask` comment), relay it verbatim. Record the owner's
   reply: `taskq answer N --text "<verbatim answer>"`. The task goes back to `doing`; the supervisor gets it (step 4).
-- `closed #N <text>`: relay the supervisor's line as is. Never open the diff to check it; the owner may ask.
+- `closed #N <verdict>`: relay the supervisor's verdict as is. Never open the diff to check it; the owner may ask.
 - Unsupervised review: `review` of a task with no `supervisor` (R3 Transition: started before #525). The
   manager checks it as a supervisor does (§ Supervisor step 3.1–3.2: the diff against Acceptance and `taskq.md`, CI
   green on the exact head SHA), then `taskq close N --text "<what was checked, what was not>"` or

@@ -788,10 +788,10 @@ Levels describe evidence, not extra directories or runners:
   not in the default unittest run. Exercise the changed board/CLI/runtime topology, prove receipt/application
   and relevant lifecycle outcomes. A prompt, spawn return or process exit alone does not prove them (R12).
 
-A separate next task migrates one demonstrated-equivalent fixture group, not this policy deliverable.
-After that migration, move the existing `Tick.setUp` and its fixture helpers (`manager`, `unmanaged`, `legacy`,
-`acting`, `notes`) unchanged into one fixture-only `TickSetup(Base)` in this same file. Use `Tick(TickSetup)`
-and `Wait(TickSetup)`; only `Wait.setUp` adds its controlled clock. `Base` and `TickSetup` contain no test methods. Do not inherit test methods just to reuse setup. Preserve any useful
+The one demonstrated-equivalent fixture group is migrated (#534): `Tick.setUp` and its fixture helpers (`manager`,
+`unmanaged`, `legacy`, `acting`, `notes`) moved unchanged into one fixture-only `TickSetup(Base)` in this same file.
+`Tick(TickSetup)` and `Wait(TickSetup)`; only `Wait.setUp` adds its controlled clock. Further groups need their
+own authorized task. `Base` and `TickSetup` contain no test methods. Do not inherit test methods just to reuse setup. Preserve any useful
 second clock environment as an explicit scenario, with its distinct failure named. Prefer a small table/subTest
 for cases with the same setup and oracle; keep distinct failures identifiable. Do not rewrite unrelated classes.
 

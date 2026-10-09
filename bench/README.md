@@ -5,7 +5,7 @@ file `bench/cadence/<executor>/<N>.txt` with one line, then goes through the nor
 merge to main):
 
 ```
-#<N> executor=<executor> taken=<UTC ISO time when the worker started> finished=<UTC ISO time before result>
+#<N> executor=<executor> taken=<UTC ISO time the file work starts, after the required reads> finished=<UTC ISO time the file work ends, before the final write and commit>
 ```
 
 One file per task, so parallel tasks never conflict. Series (owner decision 2026-10-09, #522): 1+1, then 3+3, then

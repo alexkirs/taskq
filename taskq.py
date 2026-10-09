@@ -1020,11 +1020,11 @@ Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.j
                 'and starts no turn. A session without that tool (a CLI worker) hands this prompt to the owner or the app manager.\n'
                 'Workers still dispatch without a sender (R4 event chain); only review, ask and gone wait for the manager.\n\n')
     print(f'''{note}You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
-Repeat forever, from {CONFIG["root"]}:
+Stay in this one turn and repeat, from {CONFIG["root"]}; do not end the turn between events (an ended turn forwards nothing):
 1. Run `{wait}`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
 2. Send its output, verbatim, to {args.target} {send}.
-3. Go back to 1 at once. A failed wait: say so here, then go on. A failed send or no such send tool: stop, say here
-   `taskq sender stopped: <error>` once; never retry the event, never another route.{shell}''')
+3. Go back to 1 at once. A failed wait, a failed send or no such send tool: stop, say here
+   `taskq sender stopped: <error>` once; never retry, never another route.{shell}''')
 
 def main(argv=None):
     global CONFIG, BOARD

@@ -64,7 +64,7 @@ manager per event, `tick` after the safety window (#407).
 Changed: the event pass ran in the same process → in a detached child; an event no longer waits for spawns (#405).
 Changed: a Codex sender always sent with `codex exec resume` → only to a thread with a local rollout; any other target
 gets no resume and no promised wake (an app thread fails `no rollout found`, #269), only a prompt for an independent
-Codex app session that can send to it; a failed send stops the sender with a blocker (#522).
+Codex app session that can send to it; a failed wait or send stops the sender with a blocker (#522).
 Dispatch needs no sender and no periodic tick (owner clarification 2026-10-09, #522): the event chain above starts
 workers. The sender only wakes the manager for `review`, `ask` and `gone`; with no working sender they wait until the
 manager is next talked to.
@@ -408,9 +408,12 @@ No fixed interval (#407): the manager is woken only when it has work.
      wake proved, #520). A collaboration subagent of the manager is not one: it cannot send to its ancestor and its
      message starts no turn (#522). A session without such a tool (a CLI worker) cannot be the sender; it hands the
      prompt to the owner or the app manager.
-   No shell bridge, no copy of rollouts or auth. A Claude sender reaches only Claude sessions. A failed send or a
-   missing send tool stops the sender with one blocker line: no retry of the event, no other route. `wait.json` has
-   marked that event; the manager's next pass still shows it.
+   No shell bridge, no copy of rollouts or auth. A Claude sender reaches only Claude sessions. A failed wait, a
+   failed send or a missing send tool stops the sender with one blocker line: no retry, no other route, no loop on
+   a failing board. `wait.json` has marked that event; the manager's next pass still shows it.
+   An agent sender forwards only while its own turn runs: it stays in that one active turn and repeats wait, send
+   without ending it between events. An ended sender turn or a wait left running alone forwards nothing; taskq
+   promises no unattended lifetime beyond a sender that is running (#522).
 2. Start a separate sender session on that prompt. It does no task work.
 3. `taskq wait` lists the board every 25 s and returns at once with one line per new event: `review #N`, `ask #N`,
    `gone #N` (a worker claimed on this machine whose session `alive` says gone), or `tick` when nothing happened for

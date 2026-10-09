@@ -1659,32 +1659,32 @@ Codex manager: start it with `codex {CODEX_COMPACT}`.''')
 When it ends you are woken with its output (`ask #N`, `closed #N <verdict>`, `review #N`, `gone #N` or `tick`): run one pass (`taskq tick`),
 do § 7 After each pass for those tasks, then start `{wait}` in the background again. Keep exactly one wait running.
 Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.json autoCompactWindow 200000).''')
-    resume = f'codex exec {shlex.join(codex_options())} resume {args.target}'  # the options a worker turn gets
     pm = re.split(r'session_|threads/|/', args.target)[-1]  # #532: the sender consumes as its manager, the id the board records
+    resume = f'codex exec {shlex.join(codex_options())} resume {shlex.quote(pm)}'  # the options a worker turn gets
     wait = f'{wait} --pm {shlex.quote(pm)}'
     send, shell, note = f'with {SENDERS.get(runtime, "your messaging tool")}', '', ''
-    where = rollout(args.target) if runtime == 'codex' else None
+    where = rollout(pm) if runtime == 'codex' else None
     if where == 'local':  # a CLI thread: exec resume finds it
         send = f'by running `{resume} "<its output>"`: a new turn on that thread wakes it'
         shell = (f'\nNo agent needed: `cd {CONFIG["root"]} && while e=$({wait}) && {resume} "$e"; do :; done; '
                  'echo "taskq sender stopped"` in a terminal.')
     elif where == 'archived':  # #522: exec resume of an archived thread is unverified (R12): no route
-        return print(f'taskq: {args.target} is archived in Codex; `exec resume` of an archived thread is unverified, so no sender.\n'
-                     f'Run `codex unarchive {args.target}`, then `taskq arm tick {args.target}` again.')
+        return print(f'taskq: {pm} is archived in Codex; `exec resume` of an archived thread is unverified, so no sender.\n'
+                     f'Run `codex unarchive {pm}`, then `taskq arm tick {pm}` again.')
     elif runtime == 'codex':  # #522: unknown target; an app thread fails `no rollout found` (#269)
         send = 'with `send_message_to_thread`'
-        note = (f'taskq: no local Codex rollout of {args.target}, so no `codex exec resume` and no promised wake. Unknown what it is: '
+        note = (f'taskq: no local Codex rollout of {pm}, so no `codex exec resume` and no promised wake. Unknown what it is: '
                 'a Codex app thread (exec resume fails `no rollout found`), a thread name, a typo or another machine\'s thread.\n'
-                f'Only if {args.target} is a known Codex app thread: run this prompt in an independent, user-visible Codex app session '
+                f'Only if {pm} is a known Codex app thread: run this prompt in an independent, user-visible Codex app session '
                 'whose send_message_to_thread reaches it. Not a collaboration subagent of the manager: it cannot send to its ancestor '
                 'and starts no turn. A session without that tool (a CLI worker) hands this prompt to the owner or the app manager.\n'
                 'Workers still dispatch without a sender (R4 event chain); only review, ask and gone wait for the manager.\n\n')
     if not any((item['pm'] or {}).get('session') == pm for item in map(parse, BOARD.list(None)) if item):
         note += f'taskq: no open task records {pm} as its pm; this wait shows only tasks with no manager until one does.\n'
-    print(f'''{action}{note}You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
+    print(f'''{action}{note}You are the taskq tick sender for the manager session {pm}. Do no task work and run no other taskq command.
 Stay in this one turn and repeat, from {CONFIG["root"]}; do not end the turn between events (an ended turn forwards nothing):
 1. Run `{wait}`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
-2. Send its output, verbatim, to {args.target} {send}.
+2. Send its output, verbatim, to {pm} {send}.
 3. Go back to 1 at once. A failed wait, a failed send or no such send tool: stop, say here
    `taskq sender stopped: <error>` once; never retry, never another route.{shell}''')
 

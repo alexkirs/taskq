@@ -79,7 +79,7 @@ them, or claimed by hand with `take`) keeps the unsupervised path to its end: th
 2), `wait` prints `review #N`, and the manager reviews the exact head and closes or requeues it (§ 7 Unsupervised
 review). No such task is orphaned. The unsupervised path is a migration path only, not a substitute: every task the
 pass starts gets its supervisor. A task with no `pm` (filed before #532, or from a plain shell with no
-`TASKQ_RUNTIME`) starts nothing: it waits and the table says `ready (no manager)` (§ 7 step 3) until a manager adopts
+`TASKQ_RUNTIME`) starts nothing: it waits and the table says `blocked (no manager)` (§ 7 step 3, R6) until a manager adopts
 it explicitly, `taskq pm --adopt N`, which records that session as its `pm` (a task with a `pm` is refused: never the
 last writer). Adoption holds the checkout's dispatch lock and re-reads each task under it; a busy lock refuses the
 adoption (nothing written, run it again). Across checkouts or machines it is not atomic (R4). Adoption changes no claim: a task already started (#526, #532) keeps its supervisor and worker to its
@@ -139,20 +139,78 @@ Changed: `taskq problem` → `requeue --text` or a plain issue comment (#290).
 
 ### R6. Human report
 
-`taskq tick` prints the report itself: one markdown table `| Task | State | Runtime | Session |`, then `Board: <url>`
-(§ 7). A row is `| [#N](<issue url>) | <state> | <runtime> | [<session[:8]>](<link>) |`; the link is https only
-(#488): Claude `https://claude.ai/code/session_<id>`, Codex `<pages>/open.html#codex://threads/<id>` (opens on the
-Mac with Codex). A session with no link on this machine shows `<session[:8]> on <machine>`; a task with no session
-leaves the cell empty. Then a `Decisions` block (§ 7): one line per task waiting on the owner. The manager
-replies with both as printed. No raw JSON to humans.
-Source client (#521): the table, Board line and Decisions block are the same everywhere; only a Codex session's link
-depends on the client that renders the reply, taken as the session that runs `tick` (`CODEX_THREAD_ID` or
-`CLAUDE_CODE_SESSION_ID`, `TASKQ_RUNTIME` picks one), never the task's runtime or the launcher's ORCH. Codex: direct
-`codex://threads/<id>` (owner-confirmed in the Codex app: both links open the right thread, direct skips the
-website). Claude, a shell or any other: the https wrapper (Claude Desktop ordinary chat: a direct link is plain text,
-the wrapper is a link that opens the Codex app, final thread unverified). Claude links are https in every client.
+One report per project, printed by `taskq tick` after its pass and by `taskq status` (read-only, § 4), one renderer
+(#574). From one board list (one snapshot of every open issue, § 2) and one filter (`assignee`, § 2), in this order;
+an empty table or section is left out, with no placeholder:
+
+1. `<project> · [board](<url>)`: the project root's folder name and the board page.
+2. Exactly three counters: `In work N · Waiting for answer N · Ready N`. In work: `doing` and `review` (a review is
+   still in work; its row says `review`). Waiting for answer: `ask`. Ready: `ready` with no dep open in the snapshot
+   (a task or an ordinary issue) and a manager (`pm`) that can start it; any other `ready` is blocked, never counted ready. `waiting` and `later` are
+   never ready.
+3. The table of current work `| Task | State | Runtime | Session |`, one row per open task except `ask` (item 4) and
+   `later` (item 5), by priority, then number. A row is `| [#N <title>](<issue url>) | <state> | <runtime> |
+   [<session[:8]>](<link>) |`; a blocked or waiting row names why: `blocked (no manager)`, `blocked (#M open)`,
+   `waiting (#M)`.
+4. `Questions (answer N.M):`, then the table `| Question | Brief reason | Options |`, one row per `ask`, and per
+   `review` with options (#490): `| [#N <title>](url) | <the ask's first line> · <links> | N.1 <option> · N.2
+   <option> ★ |` (a review adds `review` after the link); ★ marks the recommended option. The owner answers `N.M`
+   only; the manager runs `taskq answer N.M` (§ 7 After each pass).
+5. `Later: [#N <title>](url), ...` on one line.
+6. One mode line: `Mode: events · arm: <arm_tick>`, the report's only field. taskq knows only its event chain (R4); it
+   records no sender or timer, so it never fills the field. The final owning manager (the one that shows the report to
+   the owner) replaces exactly `<arm_tick>`, nothing else, with one of:
+   - `armed, every <interval>`: only when it confirmed its own arming and the interval from evidence it read (its
+     running wait, its scheduler entry);
+   - `not armed · taskq arm tick`: only when it confirmed it is not armed;
+   - `unknown`: the default, every other case.
+   Never inferred: no interval from a default or `arm tick` output, no arming done to fill the field, and a child
+   manager's wait or timer is not the root's. A child leaves the field as printed. `<arm_tick>` never reaches the owner.
+
+Titles, reasons and options pass one formatter: a newline becomes a space, `|`, `[`, `]` and `\` are escaped, so a
+cell stays one table cell and one link. Illustrative only, never a live status:
+
+```
+taskq · [board](https://github.com/OWNER/REPO/issues)
+In work 2 · Waiting for answer 1 · Ready 1
+
+| Task | State | Runtime | Session |
+|---|---|---|---|
+| [#12 Fix login](…/12) | doing | claude | [1a2b3c4d](https://claude.ai/code/session_…) |
+| [#13 Docs \| FAQ](…/13) | review | codex | [019a0b1c](https://alexkirs.github.io/taskq/open.html#codex://threads/…) |
+| [#15 Release notes](…/15) | ready | any |  |
+| [#16 Deploy](…/16) | blocked (#14 open) | any |  |
+
+Questions (answer N.M):
+
+| Question | Brief reason | Options |
+|---|---|---|
+| [#14 New logo](…/14) | Made two variants. · ![14](…/a.png) | 14.1 keep A · 14.2 keep B ★ |
+
+Later: [#9 Dark mode](…/9)
+
+Mode: events · arm: unknown
+```
+
+The sample shows the field after the final manager's default; `taskq` prints `arm: <arm_tick>`.
+
+Session links: Claude `https://claude.ai/code/session_<id>` in every client. Codex: `codex://threads/<id>` direct when
+the client that finally renders the report is Codex, else the wrapper `<pages>/open.html#codex://threads/<id>`. That
+client is `TASKQ_CLIENT` (`codex`, `claude`, any other: the wrapper) when set, else the session that runs the command
+(`CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`, `TASKQ_RUNTIME` picks one): never the worker's runtime or the ORCH.
+A child manager that relays to a root manager in another client sets `TASKQ_CLIENT` to the root's client. DOT and
+unknown clients get the wrapper (direct unverified there). A session with no link on this machine shows
+`<session[:8]> on <machine>`; no session: empty cell. No raw JSON to humans.
+Relay: every manager (Claude, Codex, DOT; root or child) loads the current contract with `taskq pm` and passes the
+report on complete and unchanged, except the final owning manager's `<arm_tick>` (item 6), its own short commentary
+below it, separate. Limitation (R12): only the prompt asks for this; taskq cannot verify that a relay was exact or that
+the field was replaced, and builds no transport for it.
 Unknown (R12): taskq cannot tell the Codex app from the Codex CLI or IDE (all get direct); Claude Code, web, mobile
 and other OS are not observed.
+Changed: `taskq tick` printed a table of every task, then `Board: <url>`, then a `Decisions` block with `(recommended)`;
+the link was "https only" (#488) while #521 already made it client-specific → one report: project and board,
+three counters, the work table with titles, a Questions table with ★ answered `N.M`, Later, a mode line; `taskq status`
+prints it read-only; the final rendering client, `TASKQ_CLIENT` first, picks the Codex link (#574).
 Changed: the Codex link was always the https wrapper → direct when the tick runs in Codex, else the wrapper (#521).
 Changed: a space-padded `Session link` column → the markdown table with `[#N](issue)` and session links (#489).
 Changed: a heading per project and owner questions inside the tick output → one project per tick, questions added by
@@ -301,7 +359,7 @@ Owner decisions on what taskq looks and sounds like, one line each (#505). Chang
 | `codex` | Options of `codex exec`, replacing the default; with `workspace: external` add `--add-dir` for the worktree and its git dir (the project instructions name them) | `-s workspace-write`, network on, `--add-dir <root>/.git` |
 | `pages` | Base URL of `open.html`, the Codex link page | `https://alexkirs.github.io/taskq/` |
 | `board_url` | Board link a board file prints in the tick | GitHub/GitLab issues page |
-| `inline_media` | `false`: the `Decisions` block prints image links as plain links, not `![](url)` (where the surface does not render them) | `true` |
+| `inline_media` | `false`: the Questions of the report (R6) print image links as plain links, not `![](url)` (where the surface does not render them) | `true` |
 | `assignee` | `"me"` (the board's logged-in user) or a login: `tick` starts, and `tick`/`wait`/`list` show, only tasks assigned to it; unassigned tasks are skipped (#480) | unset: every task |
 
 Board file: six module-level functions. An issue is a dict `{iid, title, body, labels, state: open|closed,
@@ -310,7 +368,7 @@ With `"assignee": "me"` the file also needs `user()`: the current login.
 
 | Function | Does |
 |---|---|
-| `list(state)` | open issues with label `q-<state>`; `None`: every issue with a `q-*` label |
+| `list(state)` | open issues with label `q-<state>`; `None`: every open issue, a task or not (a non-task one only shows that a dependency is open, R6; a board file that returns only `q-*` issues counts such a dependency closed) |
 | `get(n)` | one issue with its comments |
 | `add(title, body, labels)` | new issue; returns its number |
 | `update(n, labels=None, body=None)` | replace the labels and/or the body |
@@ -387,6 +445,7 @@ Runtime file: four module-level functions, three more optional.
 | `taskq requeue N [--text T]` | drop claim, supervisor and result: any state → `ready`. By the recorded supervisor (rework): keeps `supervisor`, the task goes to `doing` and the next worker is ordered as by `run`; refused once 3 workers were spawned since the last `answer` (ask the owner). By the recorded worker of a supervised task (cannot be done): drops only its claim session; the supervisor gets `requeue #N` |
 | `taskq later N [--text T]` | park: any state → `later`; drops claim and supervisor |
 | `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
+| `taskq status` | print the R6 report only: one board list, no pass, no pull, no write, no dispatch, no session started (#574) |
 | `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4); `--after PID`: first wait for that Codex turn's process to end (R4) |
 | `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed, for the tasks whose `pm` is this session or that have none (all of them from a plain shell); print `ask #N`, `review #N` (an unsupervised task, R3 Transition), `closed #N <verdict>` (a supervised task, § 7 Supervisor 3.3), `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7); each manager's events are its own, once (`.taskq/wait-<session>.json`; a plain shell: `.taskq/wait.json`); `--pm ID`: wait as manager `ID`, its tasks and its file (a sender, R4) |
 | `taskq wait --task N [--window MIN] [--every SEC]` | the supervisor's wait: block until its task needs it; print `review #N`, `ask #N`, `answer #N`, `gone #N` (its worker), `requeue #N` (by its worker), one line each, each once (`.taskq/S<N>.seen`); `stop #N` when the task is closed or the calling session is not its supervisor; `tick` after the window |
@@ -579,7 +638,7 @@ brings the manager its short outcomes (`ask`, `closed`, `gone`); a Claude manage
    for 120 minutes → `send(session, 'continue: read your issue')`, comment `nudge`. Alive and the last comment an
    `answer` → `send` the answer text at once, comment `nudge` (one send per answer).
 3. `ready`, deps closed, host matches, a free slot for its worker's runtime (`run-*` label, else the first free in
-   `limits`), its `pm` on this machine (R3, #532; no `pm`: the task waits, the table says `no manager`; another
+   `limits`), its `pm` on this machine (R3, #532; no `pm`: the task waits, the report says `blocked (no manager)`; another
    machine's: that machine starts it), re-read from the board →
    `spawn(S<N> <ORCH> <title> (<machine>), supervisor brief, root)` in its `pm`'s runtime (R3) (ORCH: CLD, CDX,
    DOT, HRM, GRK of the task's `pm`, R3), record `supervisor`, `q-doing`, comment `spawn` (with the
@@ -621,12 +680,10 @@ brings the manager its short outcomes (`ask`, `closed`, `gone`); a Claude manage
    - closed, parked or requeued by the manager, or a replaced session: retire the recorded `S<N>` and `T<N>` once
      stopped (R11; the pass, for every task it lists or reads).
    `later`, an `ask` of the supervisor: nothing; they wait for the owner.
-5. Print the R6 markdown table `| Task | State | Runtime | Session |` by priority, then number; then `Board: <url>`.
-   Another machine's claim shows its bare session id: only that machine can link it. A Codex link is direct when
-   the tick runs in Codex, else the https wrapper (R6, #521).
-6. Print the `Decisions` block (#490): one line per `ask`, and per `review` with options:
-   `[#N](url) <state>: <what was done> · <links> · N.1 <option> (recommended) · N.2 <option>`. An image link prints as
-   `![N](url)` (`inline_media`, § 2); a video or page stays a link.
+5. Print the R6 report from the pass's own list, as updated by the pass: project and board, the three counters, the
+   work table, Questions, Later, the mode line. Another machine's claim shows its bare session id: only that machine
+   can link it. In Questions an image link prints as `![N](url)` (`inline_media`, § 2); a video or page stays a link.
+   `taskq status` prints the same report with no pass (§ 4).
 
 The event pass of R4 is steps 1–4 run by `taskq tick --quiet`, the detached child of `add`, `answer`, `run`,
 `result`, `requeue` or `close`, no table. A worker's `result` wakes its supervisor (an unsupervised one's waits for
@@ -673,9 +730,12 @@ the tasks it did not reach wait for the next pass. Fix the cause or tell the own
 
 ### After each pass
 
-Reply to the owner with the table and the `Decisions` block as printed (links, not bare ids), then one or two lines
-on what else needs them. The owner answers the block in one line, `43.1 44.2`: run `taskq answer 43.1 44.2` verbatim.
-Changed: the manager relayed each `ask` comment verbatim → the `Decisions` block carries every pending choice (#490).
+Reply to the owner with the R6 report complete and unchanged, as printed (links, not bare ids), except `<arm_tick>`,
+which the final owning manager replaces (R6 item 6), then one or two lines of your own on what else needs them,
+separate from it. A child manager relays its report to the root the same way, the field left as printed; the root
+passes it on unchanged but for that field (R6 Relay). To show the queue without moving it, run `taskq status`. The owner answers the block in one line, `43.1 44.2`: run `taskq answer 43.1 44.2` verbatim.
+Changed: the manager relayed each `ask` comment verbatim → the `Decisions` block carries every pending choice (#490);
+the block is the report's Questions (#574).
 
 - `ask`: a card with no options: read the question (the last `ask` comment), relay it verbatim. Record the owner's
   reply: `taskq answer N --text "<verbatim answer>"`. The task goes back to `doing`; the supervisor gets it (step 4).
@@ -684,7 +744,7 @@ Changed: the manager relayed each `ask` comment verbatim → the `Decisions` blo
   manager checks it as a supervisor does (§ Supervisor step 3.1–3.2: the diff against Acceptance and `taskq.md`, CI
   green on the exact head SHA), then `taskq close N --text "<what was checked, what was not>"` or
   `taskq requeue N --text "<exact fixes>"` (the next worker continues the branch); a result with options goes to the
-  `Decisions` block.
+  report's Questions.
 - `doing` with no session link for long: read the issue; `requeue` it if its worker (unsupervised) or its supervisor
   is gone.
 - After a breakdown (dozens of stale sessions, worktrees, branches): offer the owner `taskq cleanup --dry-run`, then
@@ -711,7 +771,7 @@ their source, and missing deps.
 7. Apply only the rows answered yes, in one batch: closes and merges, amends, new tasks, deps. Each carries
    "Owner decision YYYY-MM-DD (intake)". A merge keeps the source links, requirements, decisions, acceptance and
    deps in the canonical task; the others close with `duplicate of #A`. Re-read the changed tasks; reply with the
-   R6 table. Rows answered no are dropped.
+   R6 report. Rows answered no are dropped.
 8. Follow: on later passes, recommend (requeue, split, park) from what the workers deliver.
 
 | # | Request | Proposal | Conflicts | Advice | Yes/no |

@@ -118,7 +118,7 @@ is idle (resumed on the next event), not listed or `failed` is dead. Death count
    `exec resume` route; it gets the line only through an independent Codex app sender or when next talked to (#522).
    A Claude sender reaches only Claude sessions.
 4. **No manager on the task.** Supervisor runtime and machine follow the task's own manager, its `pm` on the board
-   (#532), never `.taskq/pm.json`; a task with none starts no supervisor and waits (the table says `no manager`)
+   (#532), never `.taskq/pm.json`; a task with none starts no supervisor and waits (the report says `blocked (no manager)`)
    until a manager adopts it (`taskq pm --adopt N`). A Codex and a Claude manager share one checkout without taking
    each other's tasks, gate or `wait` events. The dispatch lock serializes one checkout only; across checkouts or
    machines the board has no compare-and-swap (`taskq.md` R4).

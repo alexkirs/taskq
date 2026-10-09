@@ -2146,6 +2146,29 @@ class Tick(TickSetup):
             self.assertEqual(archive.call_args.args[0][-2:], ['archive', 'old-worker'])
             self.assertEqual(unrelated.read_text(), '456 other-worker')
 
+    def test_malformed_canonical_handle_blocks_board_rework_before_exec(self):
+        self.add('one')
+        claim = {'runtime': 'codex', 'session': 'old-worker', 'name': 'mac'}
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'doing', 'spawn', 'worker old-worker', claim=claim)
+            taskq.move(self.task(1), 'doing', 'requeue', 'fix', claim={**claim, 'session': None}, order='rework')
+        codex = taskq.Codex()
+        target = codex.folder() / 'T1.pid'
+        with mock.patch.object(taskq, 'runtimes', return_value={'fake': self.fake, 'codex': codex}), \
+                mock.patch.object(codex, 'exec') as execute:
+            for malformed in ('123', ''):
+                with self.subTest(handle=malformed):
+                    target.write_text(malformed)
+                    with self.assertRaisesRegex(RuntimeError, 'target handle T1.pid.*spawn refused'), \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        self.run_cli('tick')
+                    execute.assert_not_called()
+                    self.assertEqual(target.read_text(), malformed)
+                    self.assertIsNone(self.task(1)['claim']['session'])
+                    self.assertEqual(self.task(1)['raw']['order'], 'rework')
+                    self.assertIsNotNone(self.board.guard)
+                    self.board.release(self.board.guard)  # isolated refusal: no child or external effect began
+
     def test_codex_respawn_keeps_the_replaced_handle(self):
         # #568: a running replaced thread keeps a handle (S<N>-<thread>.pid) so retire still finds and archives it
         codex = taskq.Codex()
@@ -2276,6 +2299,42 @@ class Tick(TickSetup):
 
 class RuntimeProcessBoundary(Base):
     """Local processes only. No installed model CLI, board network or paid calls."""
+
+    def test_spawn_preserves_unresolved_canonical_handle_before_exec(self):
+        codex = taskq.Codex()
+        target = codex.folder() / 'T1.pid'
+        current_birth = taskq.process_identity(os.getpid())[1]
+        for text in ('', '123', '123 old-worker', '123 old-worker malformed', f'{os.getpid()} live {current_birth}'):
+            with self.subTest(handle=text), mock.patch.object(codex, 'exec') as execute:
+                target.write_text(text)
+                with self.assertRaisesRegex(RuntimeError, 'target handle T1.pid.*spawn refused'):
+                    codex.spawn('T1 mock', 'local only', self.root)
+                self.assertEqual(target.read_text(), text)
+                execute.assert_not_called()
+        # An unrelated malformed filename cannot block another canonical target.
+        log = codex.folder() / 'T2.log'
+        def execute(*args):
+            log.write_text('{"type":"thread.started","thread_id":"new-thread"}\n')
+            return mock.Mock(pid=999999999), log
+        with mock.patch.object(codex, 'exec', side_effect=execute) as launched, mock.patch.object(codex, 'title'):
+            self.assertEqual(codex.spawn('T2 mock', 'local only', self.root), 'new-thread')
+            launched.assert_called_once()
+        self.assertEqual(target.read_text(), f'{os.getpid()} live {current_birth}')
+
+    def test_atomic_handle_replacement_preserves_previous_on_failure(self):
+        path = self.root / 'T1.pid'
+        path.write_text('original evidence')
+        process = mock.Mock(pid=123, taskq_birth=BIRTH)
+        with mock.patch.object(taskq.os, 'replace', side_effect=OSError('replace refused')), \
+                self.assertRaisesRegex(OSError, 'replace refused'):
+            taskq.write_process(path, process, 'new-worker')
+        self.assertEqual(path.read_text(), 'original evidence')
+        evidence = list(self.root.glob('.T1.pid.*.tmp'))
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].read_text(), f'123 new-worker {BIRTH}')
+        taskq.write_process(path, process, 'final-worker')
+        self.assertEqual(path.read_text(), f'123 final-worker {BIRTH}')
+        self.assertEqual(list(self.root.glob('.T1.pid.*.tmp')), evidence)  # failed evidence retained; success renamed its temp
 
     def test_runtime_capability_fallback_cannot_invent_idle(self):
         legacy = mock.Mock(spec=['alive'])

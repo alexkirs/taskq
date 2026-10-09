@@ -859,7 +859,10 @@ def write_process(path, process, session):
     birth = getattr(process, 'taskq_birth', None)
     if not isinstance(birth, str):
         birth = process_identity(process.pid)[1]
-    path.write_text(f'{process.pid} {session} {birth or "-"}', encoding='utf-8')
+    temporary = path.with_name(f'.{path.name}.{uuid.uuid4().hex}.tmp')
+    with open(temporary, 'x', encoding='utf-8') as stream:
+        stream.write(f'{process.pid} {session} {birth or "-"}')
+    os.replace(temporary, path)  # failure preserves the previous handle and the temporary evidence
 
 
 def codex_options():
@@ -892,6 +895,11 @@ class Codex:
 
     def spawn(self, name, prompt, cwd):
         log = self.folder() / f'{name.split()[0]}.log'
+        target = log.with_suffix('.pid')
+        if target.exists() or target.is_symlink():
+            pid, sid, birth = read_process(target)
+            if not sid or process_state(pid, birth) != 'dead':
+                raise RuntimeError(f'codex target handle {target.name} is unresolved or running; spawn refused')
         start = log.stat().st_size if log.exists() else 0  # #495: the log is appended across runs, older ids sit above
         process, log = self.exec(name, ['-C', str(cwd), prompt], cwd)
         for _ in range(600):  # the run's first JSONL line, thread.started, carries the thread id

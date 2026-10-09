@@ -371,6 +371,16 @@ Windows/macOS hostname. A different OS, boot or hostname domain means unknown, e
 is absent. Birth mismatch means dead only inside the same domain. Earlier Windows/macOS tokens without
 a hostname domain remain unknown. Hostname hashing distinguishes ordinary hosts, not cloned hostnames
 or an authenticated machine identity; renamed hosts require explicit handle reconciliation.
+Preserving a requested predecessor also defers its replacement: `retire` returns explicit False for
+unknown ownership, a running predecessor that must not be stopped, or unavailable safe termination.
+`replace` then admits no new session and keeps the order pending. Unknown unrelated handles do not block
+the requested task. Fully retired selected sessions return True; legacy custom-runtime None remains
+compatible. Uncertain termination/archive errors propagate and retain the project guard.
+Before any Codex spawn, its canonical target handle must be absent or identify a confirmed dead process.
+Malformed, unreadable, unknown or running target handles block launch and stay intact, even when no
+session ID can be attributed; the filename permits refusal, never destruction. Other target names do not
+block this launch. Handle writes use an exclusive nonce temporary file and atomic replacement; a failed
+write/replacement preserves the prior handle and leaves any temporary evidence for reconciliation.
 Legacy PID-only handles, unreadable identity and unsupported platforms stay unknown and are preserved;
 cleanup never deletes them or signals their PID. macOS confirms liveness and turn-end with libproc;
 running-process termination is refused because no stable signal handle is implemented. Stopped macOS

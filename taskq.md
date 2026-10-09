@@ -148,7 +148,10 @@ Changed: `taskq problem` → `requeue --text` or a plain issue comment (#290).
 
 One report per project, printed by `taskq tick` after its pass and by `taskq status` (read-only, § 4), one renderer
 (#574). From one board list (one snapshot of every open issue, § 2) and one filter (`assignee`, § 2), in this order;
-an empty table or section is left out, with no placeholder:
+an empty table or section is left out, with no placeholder. Current work precedes questions/problems.
+If the board cannot be read, the executing PM shows a project-qualified unavailable block with the actual error and known external
+runtime blockers, then the single mode line; no stale table presented as fresh, no fabricated zero counters.
+For an available board the renderer prints:
 
 1. `<project> · [board](<url>)`: the project root's folder name and the board page.
 2. Exactly three counters: `In work N · Waiting for answer N · Ready N`. In work: `doing` and `review` (a review is
@@ -170,6 +173,8 @@ an empty table or section is left out, with no placeholder:
      running wait, its scheduler entry);
    - `not armed · taskq arm tick`: only when it confirmed it is not armed;
    - `unknown`: the default, every other case.
+   Keep the state and actual wait/safety-window parameters short; long proof belongs in the task evidence.
+   Explicit owner arming is an action under § 7 Arm the tick, not permission to infer a state from printed instructions.
    Never inferred: no interval from a default or `arm tick` output, no arming done to fill the field, and a child
    manager's queue monitoring is distinct from root transport. The executing PM fills the field; root DOT
    relays the completed block unchanged and must not replace known executing-PM state with its own unknown. `<arm_tick>` never reaches the owner.
@@ -227,7 +232,8 @@ Changed: the manager adds the owner's open questions → `tick` prints them as t
 all in one line, `taskq answer 43.1 44.2` (#490).
 
 Changed: the final owning manager filled ARM and a child left the placeholder → the executing PM fills ARM for
-its explicit projects; root relays the completed block unchanged (#580).
+its explicit projects; root relays the completed block unchanged. Explicit arm requires execution and wake evidence;
+unreadable boards retain external blockers without fabricated counters (#580).
 
 ### R7. Style
 
@@ -257,7 +263,8 @@ Any change is named to the owner first; taskq never edits permission settings it
 A session manages several projects only from an owner-written list; folders are never auto-discovered.
 The list stays in session context; task ownership stays in each board task's `pm`. Keep a separate R6 report per
 project. If `N.M` is ambiguous across projects, require the project with the answer and run `taskq answer N.M`
-in that project root; never guess the board. Per-project runtime limits remain independent.
+in that project root; never guess the board. An unavailable project still gets its own blocker block (R6);
+never omit it or substitute another project's snapshot. Per-project runtime limits remain independent.
 Changed: explicit project list only → separate project reports and project-qualified ambiguous answers (#580).
 Changed: `taskq projects` over `[projects]` in `taskq.local.toml` → no command; the manager runs `taskq tick` in each
 project root the owner listed (#290).
@@ -632,6 +639,14 @@ No fixed interval (#407): the manager is woken only when it has work. The queue 
 brings the manager its short outcomes (`ask`, `closed`, `gone`); a Claude manager arms itself with a background
 `taskq wait`, no separate session.
 
+An explicit owner request to arm means execute the proven environment route below, not merely print its prompt.
+Before starting anything, reuse the existing monitor and its targeted wait for this PM/project; repeated arm must
+not create duplicate waits or senders. Keep a paused project's monitoring paused unless the owner explicitly resumes it.
+Prove an actual idle-manager wake and the continued next wait before claiming successful arming; printed instructions,
+a process return or an unobserved send are not receipt (R12). If the existing independent app sender cannot be
+reached with the available supported tool, report that blocker and ask through the existing task; do not create a
+replacement sender, bridge, store/protocol or duplicate task. Do not resume a worker to bypass queue rework (R11).
+
 1. In the project root run `taskq arm tick "<manager>"` (its session name, id or link). It prints the prompt for
    this runtime: loop { `taskq wait --pm <manager id>`; send its output to `<manager>` (Claude: `SendMessage`; Codex:
    below) }. The id is `<manager>` itself or the end of its link (`session_<id>`, `threads/<id>`): the id its tasks
@@ -780,9 +795,16 @@ the tasks it did not reach wait for the next pass. Fix the cause or tell the own
 
 Reply to the owner with a separate complete R6 report for each explicit project (links, not bare ids). The
 executing PM replaces only `<arm_tick>` using R6 item 6; root DOT relays the completed block unchanged, then one
-or two lines of commentary, separate. Root transport is not evidence of executing-PM queue monitoring. To show
+or two lines of commentary, separate. Current work comes first; questions/problems below it are compact and
+numbered (existing N.M options for board questions), with a recommendation and a verified actionable session link
+when session action is needed. Verify the recorded session and supported action, not merely a URL's shape; if
+unverified, say so and do not offer it as a working login/wake route. Root transport is not evidence of executing-PM queue monitoring. To show
 the queue without moving it, run `taskq status`. The owner answers `43.1 44.2`: run `taskq answer 43.1 44.2`
 verbatim in the named project root. If an answer is ambiguous across projects, ask for its project first.
+Keep external runtime blockers visible even when a board read fails (R6). For GitLab `invalid_grant`, offer owner
+login in a verified real session; do not begin login, retry GitLab or change credentials. If no such session is
+verified, state that limit and ask for one. Reuse the existing task, never file one duplicate per runtime failure.
+Use the decision's `--link` field for the PR/result URL; the short first-line summary is not its link transport.
 Changed: the manager relayed each `ask` comment verbatim → the `Decisions` block carries every pending choice (#490);
 the block is the report's Questions (#574).
 

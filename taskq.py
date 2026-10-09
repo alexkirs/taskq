@@ -1542,7 +1542,11 @@ def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
     runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
     wait = f'python3 {Path(__file__).resolve()} wait'
-    start = ('Start: run one pass now (`taskq tick`, outside a Codex sandbox). From then on the approved queue runs by itself (R4): '
+    action = ('Explicit owner arm: execute the proven route, not just this prompt. Reuse the existing monitor and targeted wait; '
+             'repeated arm must not create duplicates. Keep paused projects paused. Prove an idle-manager wake and the next wait; '
+             'printed output is not proof. No supported access to the existing sender: report one blocker through the existing task, '
+              'never create a replacement sender or bridge. See § 7 Arm the tick.\n')
+    start = action + ('Start: run one pass now (`taskq tick`, outside a Codex sandbox). From then on the approved queue runs by itself (R4): '
              'supervisors, workers, reviews, reworks, closes and the next task start on queue events and Codex turn ends; '
              'no sender, timer or extension. Arming below only brings you the short outcomes.\n')
     if not args.target and runtime == 'codex':  # #510: a Codex session is not woken when a background command ends
@@ -1580,7 +1584,7 @@ Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.j
                 'Workers still dispatch without a sender (R4 event chain); only review, ask and gone wait for the manager.\n\n')
     if not any((item['pm'] or {}).get('session') == pm for item in map(parse, BOARD.list(None)) if item):
         note += f'taskq: no open task records {pm} as its pm; this wait shows only tasks with no manager until one does.\n'
-    print(f'''{note}You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
+    print(f'''{action}{note}You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
 Stay in this one turn and repeat, from {CONFIG["root"]}; do not end the turn between events (an ended turn forwards nothing):
 1. Run `{wait}`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
 2. Send its output, verbatim, to {args.target} {send}.

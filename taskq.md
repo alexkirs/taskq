@@ -470,8 +470,10 @@ brings the manager its short outcomes (`ask`, `closed`, `gone`); a Claude manage
 
 1. In the project root run `taskq arm tick "<manager>"` (its session name, id or link). It prints the prompt for
    this runtime: loop { `taskq wait`; send its output to `<manager>` (Claude: `SendMessage`; Codex: below) }.
-   Without `<manager>` in a Codex session (not woken when a background command ends, #497): loop `taskq wait` and
-   the pass in the foreground, and before a turn ends start a sender for this thread (#510).
+   Without `<manager>` (what `taskq pm` prints): first one pass now, outside a Codex sandbox (the queue's start,
+   R4); then a Claude session runs a background `taskq wait`, a Codex session (not woken when a background command
+   ends, #497) loops `taskq wait` and the pass in the foreground. Between Codex turns the outcomes wait on the board
+   for the next pass; a sender for this thread is optional (#510), never required (#525).
    Codex (#522): `arm tick` looks for the target in `$CODEX_HOME` (default `~/.codex`) and prints only what it found:
    - `sessions/**/rollout-*-<thread>.jsonl`, a local thread: `codex exec resume <thread> "<output>"`, a new turn that
      wakes an idle thread, or the same loop in a shell.
@@ -680,8 +682,10 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 | Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread>` in `.taskq/T<N>.pid` | `codex exec resume <id> <text>` | the pid is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` |
 
 - A supervisor starts and retires as a worker does, named `S<N> ...` (Codex: `.taskq/S<N>.log`,
-  `.taskq/S<N>.pid`), with the same tools, `permission_mode` and `codex` options (R9). A Claude supervisor is never
-  `send`-ed to (the resume makes a new id, #284). Its liveness is the running / idle / dead state of § 7 step 4, not
+  `.taskq/S<N>.pid`), with the same tools, `permission_mode` and `codex` options (R9). A running Claude supervisor
+  is never `send`-ed to: its own `taskq wait --task N` wakes it. Only an idle one (its process ended) is: the resume
+  makes a new id (#284), which the same pass records as `supervisor` before anyone acts on it (§ 7 step 4); the old
+  id is refused and retired once stopped (R11). Its liveness is the running / idle / dead state of § 7 step 4, not
   `alive`: a Codex supervisor between turns has no process, by design. `close` run by the supervisor retires the
   recorded workers, never itself; the pass retires it once its turn ended. Inside a Codex sandbox `close` retires
   nothing (#502); the next pass outside does.

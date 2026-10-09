@@ -679,6 +679,10 @@ class Tick(Base):
         out = self.run_cli('arm', 'tick')
         self.assertIn('background command', out)
         self.assertIn('wait', out)
+        # #525: one start, then the queue runs by itself; no sender is required
+        self.assertIn('Start: run one pass now', out)
+        self.assertIn('no sender, timer or extension', out)
+        self.assertNotIn('separate sender', out)
 
     def test_arm_tick_prints_the_codex_compact_line(self):
         out = self.run_cli('arm', 'tick')
@@ -1038,7 +1042,10 @@ class Wait(Tick):
         self.assertIn('resume T1 "$e"; do :; done; echo "taskq sender stopped"', sender)
         self.assertNotIn('send_message_to_thread', sender)
         self.assertIn('in the foreground', self_arm)
+        self.assertIn('Optional, only to be woken between turns: `', self_arm)
         self.assertIn('arm tick T1`', self_arm)
+        self.assertNotIn('Before you end a turn', self_arm)
+        self.assertIn('no sender, timer or extension', self_arm)
 
     def test_arm_tick_shell_loop_stops_on_failed_wait_or_send(self):
         """#522: the printed shell loop sends each event once and stops on the first failed wait or send."""

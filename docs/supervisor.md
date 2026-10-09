@@ -97,6 +97,11 @@ is idle (resumed on the next event), not listed or `failed` is dead. Death count
 - The gate is safe because the board always names the current id: Codex `exec resume` keeps the thread id; a
   Claude resume makes a new one, and the pass that made it records it before anyone acts on it. #284 failed because
   the session itself had to adopt the new id.
+- Adoption is bounded and stays with one controller: only the pass resumes, and only an idle supervisor (a running
+  one wakes on its own wait, never `send`-ed). One resume per event batch (`.taskq/S<N>.seen`), under the dispatch
+  lock, so duplicate events make no second copy. A new supervisor (respawn after a death) adopts the live worker from
+  the board, never by name. The replaced id is refused by the gate, gets `stop` from `wait --task N` and is retired
+  by recorded id once stopped (R11); a second death is an `ask`, no further resume or respawn.
 
 ## 5. Unsupported topologies (blockers, not bypassed)
 

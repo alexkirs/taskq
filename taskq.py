@@ -1288,18 +1288,21 @@ def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
     runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
     wait = f'python3 {Path(__file__).resolve()} wait'
+    start = ('Start: run one pass now (`taskq tick`, outside a Codex sandbox). From then on the approved queue runs by itself (R4): '
+             'supervisors, workers, reviews, reworks, closes and the next task start on queue events and Codex turn ends; '
+             'no sender, timer or extension. Arming below only brings you the short outcomes.\n')
     if not args.target and runtime == 'codex':  # #510: a Codex session is not woken when a background command ends
         thread = os.environ.get('CODEX_THREAD_ID') or '<this thread>'
-        return print(f'''Arm the tick in this session. Codex is not woken when a background command ends, so tick in the foreground:
+        return print(f'''{start}Arm the tick in this session. Codex is not woken when a background command ends, so tick in the foreground:
 loop {{ run `{wait}`; on its output (`ask #N`, `closed #N <text>`, `review #N`, `gone #N` or `tick`) run one pass (`taskq tick`) and do
-§ 7 After each pass for those tasks }}. Before you end a turn, start a separate sender for the time between turns:
-run `python3 {Path(__file__).resolve()} arm tick {thread}` and start a session (or a shell loop) on what it prints.
+§ 7 After each pass for those tasks }}. Between turns the outcomes wait on the board for your next pass; the queue does not.
+Optional, only to be woken between turns: `python3 {Path(__file__).resolve()} arm tick {thread}` prints a sender prompt for a
+thread with a local rollout only; no wake of a Codex app thread is promised (#522).
 Codex manager: start it with `codex {CODEX_COMPACT}`.''')
     if not args.target:  # no target: this session ticks itself (Claude: a background command wakes the session on exit)
-        return print(f'''Arm the tick in this session. Run `{wait}` as a background command (Claude Code: run_in_background).
+        return print(f'''{start}Arm the tick in this session. Run `{wait}` as a background command (Claude Code: run_in_background).
 When it ends you are woken with its output (`ask #N`, `closed #N <text>`, `review #N`, `gone #N` or `tick`): run one pass (`taskq tick`),
 do § 7 After each pass for those tasks, then start `{wait}` in the background again. Keep exactly one wait running.
-A runtime that cannot wake a session when a background command ends (Codex): use `taskq arm tick "<manager>"` from a separate sender session.
 Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.json autoCompactWindow 200000).''')
     resume = f'codex exec {shlex.join(codex_options())} resume {args.target}'  # the options a worker turn gets
     send, shell, note = f'with {SENDERS.get(runtime, "your messaging tool")}', '', ''

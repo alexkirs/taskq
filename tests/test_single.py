@@ -1711,3 +1711,7 @@ class RealChild(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Live526Red(unittest.TestCase):
+    def test_controlled_red(self): self.fail('controlled CI failure #526')

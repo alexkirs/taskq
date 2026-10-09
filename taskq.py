@@ -154,8 +154,7 @@ class GitHub:
 
     def list(self, state):
         query = 'issues?state=open' + (f'&labels={PREFIX}{state}' if state else '')
-        return [self.issue(item) for item in self.pages(query) if 'pull_request' not in item
-                and any(label['name'].startswith(PREFIX) for label in item['labels'])]
+        return [self.issue(item) for item in self.pages(query) if 'pull_request' not in item]  # None: every open issue (§ 2)
 
     def get(self, n):
         return {**self.issue(self.api('GET', f'issues/{n}')), 'comments': [item['body'] for item in self.pages(f'issues/{n}/comments')]}
@@ -194,7 +193,7 @@ class GitLab(GitHub):
 
     def list(self, state):
         query = 'issues?state=opened' + (f'&labels={PREFIX}{state}' if state else '')
-        return [self.issue(item) for item in self.pages(query) if any(label.startswith(PREFIX) for label in item['labels'])]
+        return [self.issue(item) for item in self.pages(query)]  # None: every open issue (§ 2)
 
     def get(self, n):
         return {**self.issue(self.api('GET', f'issues/{n}')), 'comments': [
@@ -1206,9 +1205,16 @@ def cmd_tick(args, table=True):
         held = one_pass(args, False)
 
 def direct():
-    """R6 (#521): the tick's source client is the session running it. Codex: direct codex:// links; Claude, a shell or
-    anything else: the https wrapper. ponytail: CODEX_THREAD_ID cannot tell the Codex app from the CLI or IDE."""
-    return (session() or {}).get('runtime') == 'codex'
+    """R6 (#521, #574): the client that finally renders the report: TASKQ_CLIENT, else the session running the command.
+    Codex: direct codex:// links; Claude, DOT, a shell or anything else: the https wrapper.
+    ponytail: CODEX_THREAD_ID cannot tell the Codex app from the CLI or IDE."""
+    return (os.environ.get('TASKQ_CLIENT') or (session() or {}).get('runtime')) == 'codex'
+
+def lead(item, kinds):
+    """R3 (#532): the supervisor follows the task's own manager (DOT: Codex); None: no manager can start it here."""
+    runtime = (item['pm'] or {}).get('runtime')
+    runtime = {'dot': 'codex'}.get(runtime, runtime)
+    return runtime if runtime in kinds else None
 
 def stale(by_number):
     """R11: gone(runtime, n, session, live) for the pass: a session its task records, of a task not open, or replaced
@@ -1227,28 +1233,31 @@ def stale(by_number):
         return bool(issues[n] and recorded(issues[n], name, sid))
     return gone
 
-def row(item, kinds, here, waits=None):
-    """R6 (#489): one markdown row, `[#N](issue)` and `[<session[:8]>](link)`; a session with no link here stays plain text.
-    `waits`: why a ready task does not start (no manager on this machine, § 7 step 3)."""
+def row(item, kinds, here, state=None):
+    """R6 (#489, #574): one markdown row, `[#N <title>](issue)` and `[<session[:8]>](link)`; a session with no link here stays
+    plain text. `state`: the report's state of the task (`blocked (no manager)`, ...), else its label."""
     claim = item['claim'] if (item['claim'] or {}).get('session') else item.get('supervisor') or item['claim'] or {}  # no worker yet: its supervisor
     runtime, session = claim.get('runtime') or item['runtime'], claim.get('session') or ''
     url = session and claim.get('name') == here and runtime in kinds and kinds[runtime].link(session)
     if url and runtime == 'codex' and direct():  # #521: Codex opens its own thread link; the wrapper only loads a page first
         url = f'codex://threads/{session}'
-    task = f'[#{item["iid"]}]({item["url"]})' if item.get('url') else f'#{item["iid"]}'
     cell = f'[{session[:8]}]({url})' if url else session and f'{session[:8]} on {claim.get("name")}'
-    state = f'{item["state"]} ({waits})' if waits and item['state'] == 'ready' else item['state']
-    return f'| {task} | {state} | {runtime} | {cell} |'
+    return f'| {heading(item)} | {state or item["state"]} | {runtime} | {cell} |'
+
+def cell(text):
+    """R6 (#574): one table cell and one link text: a newline becomes a space; `|`, `[`, `]` and a backslash are escaped."""
+    return re.sub(r'([\\[\]|])', r'\\\1', ' '.join(str(text).split()))
+
+def heading(item):
+    """`[#N <title>](url)`, the title cut to 60 (R6, #574)."""
+    title = ' '.join((item.get('title') or '').split())
+    text = f'#{item["iid"]} {cell(title if len(title) <= 60 else title[:59] + "…")}'.strip()
+    return f'[{text}]({item["url"]})' if item.get('url') else text
 
 def one_pass(args, table=True):
     """One pass: free waiting tasks, follow unsupervised workers, act for supervisors, spawn ready tasks' supervisors, print the table."""
     here, kinds = machine(), runtimes()
     limits = CONFIG.get('limits') or {name: 1 for name in kinds}
-
-    def lead(item):  # R3 (#532): the supervisor follows the task's own manager (DOT: Codex); None: no manager can start it here
-        runtime = (item['pm'] or {}).get('runtime')
-        runtime = {'dot': 'codex'}.get(runtime, runtime)
-        return runtime if runtime in kinds else None
     with dispatch_lock() as held:  # #357 (R2): one pass at a time per checkout; the list is read under the lock
         tasks = getattr(args, 'tasks', None) or []  # #481: the list lags the event's own write (a new issue, a label): read those directly
         issues = [issue for issue in BOARD.list(None) if issue['iid'] not in tasks] + [issue for issue in map(BOARD.get, tasks) if issue['state'] == 'open']
@@ -1292,14 +1301,14 @@ def one_pass(args, table=True):
             busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
         for item in ready:
             if item['state'] != 'ready' or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']) \
-                    or not lead(item) or item['pm'].get('name') != here:
+                    or not lead(item, kinds) or item['pm'].get('name') != here:
                 continue  # no manager: the task waits, the table says so; another machine's manager: that machine starts it (§ 7 step 3)
             names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
             free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 1)), None)
             fresh = free and executable(BOARD.get(item['iid']))  # #357: the board may have moved since the list; #545: eligibility
             if fresh and fresh['state'] == 'ready' and fresh['pm'] == item['pm']:  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
                 item.update(fresh)
-                runtime = lead(item)
+                runtime = lead(item, kinds)
                 if not replace(item, kinds[runtime], runtime, 'supervisor'):  # a requeued task's old S<N>
                     continue
                 session = spawn_named(item, kinds[runtime], 'S', supervisor_brief(item, runtime, kinds[runtime]))
@@ -1309,23 +1318,48 @@ def one_pass(args, table=True):
                 item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
         if held and not blind:  # R11 (#360, #525): stopped sessions the board no longer holds, by recorded id only
             retire(stale({item['iid']: item for item in items}), 'could not remove stopped sessions', running=False)
-    if not table:
-        return held
-    print('| Task | State | Runtime | Session |\n|---|---|---|---|')
-    for item in filter(mine, items):
-        print(row(item, kinds, here, None if lead(item) else 'no manager'))
+    if table:
+        report(items, {issue['iid'] for issue in issues}, kinds, here)
+    return held
+
+def cmd_status(args):
+    """`taskq status` (R6, #574): the report with no pass: one board list; no pull, write, dispatch or session."""
+    issues = BOARD.list(None)
+    items = sorted(filter(None, map(parse, issues)), key=lambda item: (item['priority'], item['iid']))
+    report(items, {issue['iid'] for issue in issues}, runtimes(), machine())
+
+def report(items, listed, kinds, here):
+    """R6 (#574): the one report of tick and status. Counters and rows come from the same `items` and the same filter; a dep
+    is open when `listed`, the iids of that same board list (every open issue, a task or not), holds it: no BOARD.get."""
+    items = list(filter(mine, items))
+
+    def state(item):  # what the row says; only a plain `ready` is counted ready
+        deps = ', '.join(f'#{n}' for n in item['deps'] or [] if n in listed)
+        if item['state'] == 'waiting':
+            return f'waiting ({deps})' if deps else 'waiting'
+        if item['state'] == 'ready' and not lead(item, kinds):
+            return 'blocked (no manager)'
+        return f'blocked ({deps} open)' if item['state'] == 'ready' and deps else item['state']
+    states = {item['iid']: state(item) for item in items}
+    count = lambda *wanted: sum(value in wanted for value in states.values())
     host, repo = CONFIG.get('host'), CONFIG.get('repo')
     url = CONFIG.get('board_url') or {'github': f'https://{host or "github.com"}/{repo}/issues',
                                       'gitlab': f'https://{host or "gitlab.com"}/{repo}/-/issues'}.get(CONFIG['board'])
-    url and print(f'Board: {url}')  # a board file names its page in `board_url`
-    cards = decisions(filter(mine, items))
-    cards and print('\n'.join(['', 'Decisions (answer: taskq answer N.K ...):', *cards]))
-    return held
+    lines = [CONFIG['root'].name + (f' · [board]({url})' if url else ''),  # a board file names its page in `board_url`
+             f'In work {count("doing", "review")} · Waiting for answer {count("ask")} · Ready {count("ready")}', '']
+    rows = [row(item, kinds, here, states[item['iid']]) for item in items if item['state'] not in ('ask', 'later')]
+    lines += ['| Task | State | Runtime | Session |', '|---|---|---|---|', *rows, ''] if rows else []  # empty: left out
+    cards = decisions(items)
+    lines += ['Questions (answer N.M):', '', '| Question | Brief reason | Options |', '|---|---|---|', *cards, ''] if cards else []
+    later = [heading(item) for item in items if item['state'] == 'later']
+    lines += ['Later: ' + ', '.join(later), ''] if later else []
+    print('\n'.join([*lines, 'Mode: events · arm: <arm_tick>']))  # R6 item 6: the final owning manager fills the one field
 
 MEDIA = re.compile(r'\.(png|jpe?g|gif|webp|svg)(\?.*)?$', re.I)
 
 def decisions(items):
-    """#490: one line per task waiting on the owner: an ask, or a review with options. Images inline unless `inline_media` is false."""
+    """#490, R6 Questions: one table row per task waiting on the owner: an ask, or a review with options; ★ the recommended one.
+    Images inline unless `inline_media` is false."""
     lines = []
     for item in items:
         card = item['raw'].get('decision') or {}
@@ -1333,9 +1367,9 @@ def decisions(items):
             continue
         n, inline = item['iid'], CONFIG.get('inline_media', True)
         links = [f'![{n}]({link})' if inline and MEDIA.search(link) else link for link in card.get('links') or []]
-        options = [f'{n}.{k} {text}' + ' (recommended)' * (k == card.get('recommend')) for k, text in enumerate(card.get('options') or [], 1)]
-        head = f'[#{n}]({item["url"]})' if item.get('url') else f'#{n}'
-        lines.append(' · '.join(filter(None, [f'{head} {item["state"]}: {card.get("summary") or item["title"]}', *links, *options])))
+        options = [f'{n}.{k} {cell(text)}' + ' ★' * (k == card.get('recommend')) for k, text in enumerate(card.get('options') or [], 1)]
+        question = heading(item) + ' review' * (item['state'] == 'review')
+        lines.append(f'| {question} | {" · ".join([cell(card.get("summary") or item["title"]), *links])} | {" · ".join(options)} |')
     return lines
 
 EVENTS = ('add', 'answer', 'run', 'result', 'requeue', 'close')  # R4 (#333): each starts one pass after its move
@@ -1576,6 +1610,7 @@ def main(argv=None):
     command('run', cmd_run, text=True)
     command('later', cmd_move, text=True)
     command('close', cmd_close, (('n',), {'nargs': '+', 'type': int}), n=False, text=True)
+    command('status', cmd_status, n=False)
     command('tick', lambda args: (event_pass if args.quiet else cmd_tick)(args), (('--quiet',), {'action': 'store_true'}),
             (('--tasks',), {'nargs': '*', 'type': int, 'default': []}), (('--after',), {'type': int}), n=False)
     command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}),

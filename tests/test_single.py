@@ -241,7 +241,7 @@ class DirectPublication(Base):
 
     def close(self):
         with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq, 'run_api', return_value=self.checks) as api:
-            result = self.run_cli('close', '1', '--text', 'accepted exact diff and evidence')
+            result = self.run_cli('close', '1', '--text', 'exact candidate accepted; users get it on main; open: none')
         self.assertEqual(api.call_args.args[3], f'repos/o/r/commits/{self.sha}/check-runs?check_name=tests')
         return result
 
@@ -274,6 +274,15 @@ class DirectPublication(Base):
             self.close()
         self.assertEqual(self.main_sha(), self.base)
 
+    def test_supervisor_close_needs_a_verdict(self):
+        # #567: the manager gets a verdict, never a SHA; refused before anything is published
+        for text in ('', self.sha, self.sha[:7], f'merged {self.sha}', 'Published it', 'accepted; users get it'):
+            with self.subTest(text=text), self.assertRaisesRegex(SystemExit, 'needs a verdict'):
+                self.run_cli('close', '1', *(['--text', text] if text else []))
+        self.assertEqual((self.task(1)['state'], self.main_sha()), ('review', self.base))
+        self.close()
+        self.assertIn(f'\n\nexact candidate accepted; users get it on main; open: none\n\npublished {self.sha}', self.board.issues[1]['comments'][-1])
+
     def test_candidate_mismatch_leaves_review_and_main(self):
         self.git('commit', '--allow-empty', '-m', 'unreviewed')
         self.git('push', 'origin', 'taskq-1')
@@ -298,7 +307,7 @@ class DirectPublication(Base):
             return self.checks
         with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq, 'run_api', side_effect=ci), \
                 self.assertRaisesRegex(SystemExit, 'rejected'):
-            self.run_cli('close', '1')
+            self.run_cli('close', '1', '--text', 'accepted; users get it; open: none')
         self.assertEqual((self.task(1)['state'], self.main_sha()), ('review', newer))
 
     def test_gitlab_candidate_requires_latest_exact_pipeline(self):
@@ -306,11 +315,11 @@ class DirectPublication(Base):
         for pipelines in ([], [{'sha': 'b' * 40, 'status': 'success'}], [{'sha': self.sha, 'status': 'failed'}]):
             with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq, 'run_api', return_value=pipelines), \
                     self.assertRaisesRegex(SystemExit, 'CI is not green'):
-                self.run_cli('close', '1')
+                self.run_cli('close', '1', '--text', 'accepted; users get it; open: none')
             self.assertEqual(self.main_sha(), self.base)
         with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), \
                 mock.patch.object(taskq, 'run_api', return_value=[{'sha': self.sha, 'status': 'success'}]) as api:
-            self.run_cli('close', '1')
+            self.run_cli('close', '1', '--text', 'accepted; users get it; open: none')
         self.assertIn(f'pipelines?sha={self.sha}', api.call_args.args[3])
         self.assertEqual(self.main_sha(), self.sha)
 
@@ -347,7 +356,7 @@ class PullRequests(Base):
     def close(self, *numbers):
         with mock.patch.object(taskq.subprocess, 'run', side_effect=self.cli), mock.patch.object(taskq.shutil, 'which', side_effect=lambda name: name), \
                 mock.patch.object(taskq.time, 'sleep'):
-            return self.run_cli('close', *(numbers or ['1']))
+            return self.run_cli('close', *(numbers or ['1']), '--text', 'accepted; users see it; open: none')
 
     def merges(self):
         return [call for call in self.calls if call[:2] == ['pr', 'merge']]
@@ -375,13 +384,13 @@ class PullRequests(Base):
         self.assertEqual(self.merges(), [['pr', 'merge', '7', '--squash', '--delete-branch', '--match-head-commit', 'a' * 40, '-R', 'o/r']])
         self.assertIn(['api', '-X', 'GET', f'repos/o/r/commits/{"a" * 40}/check-runs?check_name=tests'], self.calls)
         self.assertEqual(self.board.issues[1]['state'], 'closed')
-        self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\nmerged {"c" * 40}')
+        self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\naccepted; users see it; open: none\n\nmerged {"c" * 40}')
 
     def test_close_external_keeps_the_branch(self):
         taskq.CONFIG['workspace'] = 'external'  # #477: no --delete-branch; the repo's own policy decides
         self.close()
         self.assertEqual(self.merges(), [['pr', 'merge', '7', '--squash', '--match-head-commit', 'a' * 40, '-R', 'o/r']])
-        self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\nmerged {"c" * 40}\n\nkept: owned by host')
+        self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\naccepted; users see it; open: none\n\nmerged {"c" * 40}\n\nkept: owned by host')
 
     def test_close_batch_goes_on_after_a_failure(self):
         self.add()
@@ -455,7 +464,7 @@ class PullRequests(Base):
                              for call in self.calls), 3)
         self.assertEqual([call for call in self.calls if call[:2] == ['mr', 'merge']],
                          [['mr', 'merge', '7', '--squash', '--remove-source-branch', '--sha', 'a' * 40, '--auto-merge=false', '--yes', '-R', 'https://git.example/o/r']])
-        self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\nmerged {"d" * 40}')
+        self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\naccepted; users see it; open: none\n\nmerged {"d" * 40}')
 
     def test_gitlab_failed_pipeline_requeues(self):
         self.gitlab()
@@ -784,7 +793,7 @@ class Tick(TickSetup):
         with self.acting('s-T1.2'):
             self.run_cli('result', '1', '--sha', 'b' * 40)
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), self.acting('s-S1.1'):
-            self.run_cli('close', '1', '--text', 'checked')  # frees the slot: #2 starts in the same pass
+            self.run_cli('close', '1', '--text', 'checked; works; open: none')  # frees the slot: #2 starts in the same pass
         self.assertEqual(spawns(), ['S1', 'T1', 'T1', 'S1', 'T1', 'S2'])
         self.run_cli('tick')  # the safety net finds nothing left to do
         self.assertEqual(spawns(), ['S1', 'T1', 'T1', 'S1', 'T1', 'S2'])
@@ -1054,7 +1063,7 @@ class Tick(TickSetup):
             self.run_cli('close', '1')
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), self.acting('s-S1r'):
             self.assertEqual(self.run_cli('wait', '--task', '1', '--window', '0'), 'tick\n')  # already delivered
-            self.run_cli('close', '1', '--text', 'ok')
+            self.run_cli('close', '1', '--text', 'ok; works; open: none')
             self.assertEqual(self.run_cli('wait', '--task', '1', '--window', '0'), 'stop #1\n')
         self.fake.sessions['s-S1'] = False  # the resume stopped the old job
         self.run_cli('tick')
@@ -1235,8 +1244,8 @@ class Wait(TickSetup):
         self.assertEqual((self.task(1)['state'], self.task(2)['state']), ('review', 'ready'))
         self.assertEqual(self.run_cli('wait'), 'tick\n')  # a supervised review is the supervisor's
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), self.acting('s-S1'):
-            self.run_cli('close', '1', '--text', 'diff and CI on aaaaaaa checked\n\nmore')
-        self.assertEqual(self.run_cli('wait'), 'closed #1 diff and CI on aaaaaaa checked\n')
+            self.run_cli('close', '1', '--text', 'one shipped; users get one; open: none\n\nmore')
+        self.assertEqual(self.run_cli('wait'), 'closed #1 one shipped; users get one; open: none\n')
         self.assertEqual(self.run_cli('wait'), 'tick\n')  # never sent twice
         self.assertEqual(self.fake.names[-1], 'S2 CLD two (mac)')  # the close freed the slot
         self.assertEqual((self.fake.stopped, self.fake.sessions['s-S1']), (['s-T1'], True))  # close never stops the session that runs it
@@ -1302,13 +1311,13 @@ class MultiPM(Base):
         with self.acting('s-T1'):
             self.run_cli('result', '1', '--sha', 'a' * 40)
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), self.acting('s-S1'):
-            self.run_cli('close', '1', '--text', 'checked')
+            self.run_cli('close', '1', '--text', 'checked; works; open: none')
         with self.acting('s-T2'):
             self.run_cli('ask', '2', '--text', 'which?')
         with self.acting('s-T3'):
             self.run_cli('result', '3', '--sha', 'b' * 40)
         with self.pm(self.A):
-            self.assertEqual(self.run_cli('wait'), 'review #3\nclosed #1 checked\n')
+            self.assertEqual(self.run_cli('wait'), 'review #3\nclosed #1 checked; works; open: none\n')
         with self.pm(self.B):
             self.assertEqual(self.run_cli('wait'), 'ask #2\nreview #3\n')
         for env in (self.A, self.B):

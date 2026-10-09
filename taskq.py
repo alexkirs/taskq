@@ -669,12 +669,20 @@ def publish_direct(current, sha, git):
     run('fetch', 'origin')
     run('merge-base', '--is-ancestor', sha, 'origin/main')  # read back, including a concurrent later fast-forward
 
+def verdict(text):
+    """#567 (§ 7 Supervisor 3.3): the manager gets `<accepted>; <changed for the user>; open: <follow-ups or none>`, never a SHA."""
+    line = (text or '').strip().split('\n')[0].strip()
+    if not line or re.fullmatch(r'[0-9a-f]{7,40}', line) or re.match(r'(merged|published)\b', line, re.I) or 'open:' not in line:
+        fail('close --text needs a verdict: "<what was accepted>; <what changed for the user>; open: <follow-ups or none>"')
+
 def close_one(args):
     current = task(args.n, 'review')
     gate(current)
+    if role(current) == 'supervisor':
+        verdict(args.text)
     sha = commit((current['result'] or {}).get('sha') or '')
     if CONFIG['publish'] == 'pr' and (merged := merge(current, sha)):
-        args.text = f'merged {merged}' + (f'\n\n{args.text}' if args.text else '')
+        args.text = (f'{args.text}\n\n' if args.text else '') + f'merged {merged}'  # #567: the verdict stays the first line
     else:  # an already-published result/answer, or an unpublished direct candidate
         git = [shutil.which('git') or fail('git not found'), '-C', str(CONFIG['root'])]
         fetched = subprocess.run([*git, 'fetch', 'origin'], capture_output=True)
@@ -684,7 +692,7 @@ def close_one(args):
             if CONFIG['publish'] != 'direct':
                 fail(f'#{args.n}: result {sha} is not on origin/main')
             publish_direct(current, sha, git)
-            args.text = f'published {sha}' + (f'\n\n{args.text}' if args.text else '')
+            args.text = (f'{args.text}\n\n' if args.text else '') + f'published {sha}'
     claim = current['claim'] or {}
     if hasattr(runtimes().get(claim.get('runtime')), 'retire') and claim.get('name') not in (None, machine()):
         args.text = (f'{args.text}\n\n' if args.text else '') + f'session {claim.get("session")} runs on {claim.get("name")}: stop it there'
@@ -913,7 +921,8 @@ Read `{Path(__file__).resolve().with_name("taskq.md")}` (§ 7 Supervisor, § 6) 
    an answer on origin/main needs no CI. Evaluate § 10 testing evidence, sensitivity, blindspots and applicable
    isolated candidate live proof BEFORE publication. Missing required evidence is rework or ask, never PASS.
    close records your acceptance and publishes the exact candidate; the worker never pushes main.
-   - Accepted: `{tq} close {n} --text "<one line for the manager: what was checked, what was not>"`, then end your turn.
+   - Accepted: `{tq} close {n} --text "<what was accepted>; <what changed for the user>; open: <follow-ups or none>"`, then end
+     your turn. One line for the manager, who thinks in tasks: no SHA, diff or test log; a bare SHA or `merged ...` is refused.
    - Not accepted, CI red, or close sent it back: `{tq} requeue {n} --text "<exact fixes>"`; a new worker continues the branch.
      Then wait as in 2. The third rework is refused: ask the owner.
    - A result with options (a choice for the owner): `{tq} ask {n} --text "<...>" --option "<A>" --option "<B>" --recommend <K>`.
@@ -1227,7 +1236,7 @@ def event_pass(args):
         print(f'taskq: dispatch stopped: {str(error).removeprefix("taskq: ")}; the next tick retries', file=sys.stderr)
 
 def closed(n):
-    """`closed #N <text>` for a supervised task that closed: the first line of its close comment, the supervisor's line."""
+    """`closed #N <verdict>` for a supervised task that closed: the first line of its close comment, the supervisor's verdict (#567)."""
     issue = BOARD.get(int(n))
     found = BLOCK.search(issue.get('body') or '') if issue['state'] == 'closed' else None
     if not found or not json.loads(found.group(1)).get('supervisor'):
@@ -1237,7 +1246,7 @@ def closed(n):
     return f'closed #{n} {body.splitlines()[0]}' if body else f'closed #{n}'
 
 def cmd_wait(args):
-    """Block until the manager is needed: print 'ask #N', 'closed #N <text>' (supervised), 'review #N' and 'gone #N'
+    """Block until the manager is needed: print 'ask #N', 'closed #N <verdict>' (supervised), 'review #N' and 'gone #N'
     (unsupervised worker, or a dead supervisor), or 'tick' after the window (#407, #525).
     .taskq/wait-<session>.json (a shell: wait.json) keeps the states last reported to this manager, so an event is printed once each."""
     if args.task:
@@ -1360,14 +1369,14 @@ def cmd_arm(args):
     if not args.target and runtime == 'codex':  # #510: a Codex session is not woken when a background command ends
         thread = os.environ.get('CODEX_THREAD_ID') or '<this thread>'
         return print(f'''{start}Arm the tick in this session. Codex is not woken when a background command ends, so tick in the foreground:
-loop {{ run `{wait}`; on its output (`ask #N`, `closed #N <text>`, `review #N`, `gone #N` or `tick`) run one pass (`taskq tick`) and do
+loop {{ run `{wait}`; on its output (`ask #N`, `closed #N <verdict>`, `review #N`, `gone #N` or `tick`) run one pass (`taskq tick`) and do
 § 7 After each pass for those tasks }}. Between turns the outcomes wait on the board for your next pass; the queue does not.
 Optional, only to be woken between turns: `python3 {Path(__file__).resolve()} arm tick {thread}` prints a sender prompt for a
 thread with a local rollout only; no wake of a Codex app thread is promised (#522).
 Codex manager: start it with `codex {CODEX_COMPACT}`.''')
     if not args.target:  # no target: this session ticks itself (Claude: a background command wakes the session on exit)
         return print(f'''{start}Arm the tick in this session. Run `{wait}` as a background command (Claude Code: run_in_background).
-When it ends you are woken with its output (`ask #N`, `closed #N <text>`, `review #N`, `gone #N` or `tick`): run one pass (`taskq tick`),
+When it ends you are woken with its output (`ask #N`, `closed #N <verdict>`, `review #N`, `gone #N` or `tick`): run one pass (`taskq tick`),
 do § 7 After each pass for those tasks, then start `{wait}` in the background again. Keep exactly one wait running.
 Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.json autoCompactWindow 200000).''')
     resume = f'codex exec {shlex.join(codex_options())} resume {args.target}'  # the options a worker turn gets

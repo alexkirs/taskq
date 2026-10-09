@@ -1015,6 +1015,40 @@ class Tick(TickSetup):
         self.assertIn(('s-S1', 'answer #1: read your issue'), self.fake.sent)
         self.assertEqual([text for _, text in self.fake.sent].count('requeue #1: read your issue'), 1)  # its own requeues woke nothing
 
+    def test_replacement_retires_the_recorded_old_session_first(self):
+        # #568: a rework's T<N> and a respawned S<N> retire their predecessor by board-recorded id before they spawn
+        # (a Codex spawn rewrites the T<N>/S<N> handle); a stranger's or the live worker's session is never touched
+        spawn, seen = self.fake.spawn, []
+        self.fake.spawn = lambda name, *rest: (seen.append((name.split()[0], list(self.fake.stopped))), spawn(name, *rest))[1]
+        self.add('one')
+        self.fake.sessions['s-T7'] = True  # another task's, unrecorded here
+        with self.acting('s-S1'):
+            self.run_cli('run', '1')
+        with self.acting('s-T1'):
+            self.run_cli('result', '1', '--sha', 'a' * 40)
+        with self.acting('s-S1'):
+            self.run_cli('requeue', '1', '--text', 'fix B')  # s-T1 still runs: replaced, retired first
+        self.fake.sessions['s-S1'] = False
+        self.run_cli('tick')
+        self.assertEqual(seen, [('S1', []), ('T1', []), ('T1', ['s-T1']), ('S1', ['s-T1', 's-S1'])])
+        self.assertEqual((self.task(1)['claim']['session'], self.fake.sessions.get('s-T1.1'), self.fake.sessions.get('s-T7')), ('s-T1.1', True, True))
+
+    def test_codex_respawn_keeps_the_replaced_handle(self):
+        # #568: a running replaced thread keeps a handle (S<N>-<thread>.pid) so retire still finds and archives it
+        codex = taskq.Codex()
+        (codex.folder() / 'S1.pid').write_text('999999999 old-thread')
+        log = codex.folder() / 'S1.log'
+
+        def run(*_):
+            log.write_text('{"thread_id":"new-thread"}\n')
+            return mock.Mock(pid=999999998), log
+        with mock.patch.object(codex, 'exec', run):
+            codex.spawn('S1 one (mac)', 'prompt', '.')
+        calls = []
+        with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:])):
+            codex.retire(lambda n, sid, live: sid == 'old-thread')
+        self.assertEqual((calls, (codex.folder() / 'S1.pid').read_text()), ([['archive', 'old-thread']], '999999998 new-thread'))
+
     def test_supervisor_death_respawns_then_asks(self):
         # § 7 step 4: the first death respawns S<N> (a resumable one resumes), the second since the last result or answer asks
         self.fake.tail = lambda session: 'error: rate limit'

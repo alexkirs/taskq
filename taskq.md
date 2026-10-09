@@ -148,7 +148,10 @@ Changed: `taskq problem` → `requeue --text` or a plain issue comment (#290).
 
 One report per project, printed by `taskq tick` after its pass and by `taskq status` (read-only, § 4), one renderer
 (#574). From one board list (one snapshot of every open issue, § 2) and one filter (`assignee`, § 2), in this order;
-an empty table or section is left out, with no placeholder:
+an empty table or section is left out, with no placeholder. Current work precedes questions/problems.
+If the board cannot be read, the executing PM shows a project-qualified unavailable block with the actual error and known external
+runtime blockers, then the single mode line; no stale table presented as fresh, no fabricated zero counters.
+For an available board the renderer prints:
 
 1. `<project> · [board](<url>)`: the project root's folder name and the board page.
 2. Exactly three counters: `In work N · Waiting for answer N · Ready N`. In work: `doing` and `review` (a review is
@@ -165,14 +168,17 @@ an empty table or section is left out, with no placeholder:
    only; the manager runs `taskq answer N.M` (§ 7 After each pass).
 5. `Later: [#N <title>](url), ...` on one line.
 6. One mode line: `Mode: events · arm: <arm_tick>`, the report's only field. taskq knows only its event chain (R4); it
-   records no sender or timer, so it never fills the field. The final owning manager (the one that shows the report to
-   the owner) replaces exactly `<arm_tick>`, nothing else, with one of:
+   records no sender or timer, so it never fills the field. The executing PM for this explicit project (standalone Codex/Claude has the same role) replaces exactly `<arm_tick>`, nothing else, with one of:
    - `armed, every <interval>`: only when it confirmed its own arming and the interval from evidence it read (its
      running wait, its scheduler entry);
    - `not armed · taskq arm tick`: only when it confirmed it is not armed;
    - `unknown`: the default, every other case.
+   Project unavailability and paused monitoring are separate blockers, never ARM evidence or a fourth ARM state.
+   Keep the state and actual wait/safety-window parameters short; private proof stays private, not in public task/PR/logs.
+   Explicit owner arming is an action under § 7 Arm the tick, not permission to infer a state from printed instructions.
    Never inferred: no interval from a default or `arm tick` output, no arming done to fill the field, and a child
-   manager's wait or timer is not the root's. A child leaves the field as printed. `<arm_tick>` never reaches the owner.
+   manager's queue monitoring is distinct from root transport. The executing PM fills the field; root DOT
+   relays the completed block unchanged and must not replace known executing-PM state with its own unknown. `<arm_tick>` never reaches the owner.
 
 Titles, reasons and options pass one formatter: a newline becomes a space, `|`, `[`, `]` and `\` are escaped, so a
 cell stays one table cell and one link. Illustrative only, never a live status:
@@ -199,17 +205,19 @@ Later: [#9 Dark mode](…/9)
 Mode: events · arm: unknown
 ```
 
-The sample shows the field after the final manager's default; `taskq` prints `arm: <arm_tick>`.
+The sample shows the field after the executing PM's default; `taskq` prints `arm: <arm_tick>`.
 
 Session links: Claude `https://claude.ai/code/session_<id>` in every client. Codex: `codex://threads/<id>` direct when
 the client that finally renders the report is Codex, else the wrapper `<pages>/open.html#codex://threads/<id>`. That
 client is `TASKQ_CLIENT` (`codex`, `claude`, any other: the wrapper) when set, else the session that runs the command
 (`CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`, `TASKQ_RUNTIME` picks one): never the worker's runtime or the ORCH.
+The executing PM sets `TASKQ_CLIENT` to the final owner client before preparing each canonical block;
+for macOS Codex desktop use `TASKQ_CLIENT=codex` and direct `codex://threads/<id>` links. Root never rewrites links.
 A child manager that relays to a root manager in another client sets `TASKQ_CLIENT` to the root's client. DOT and
 unknown clients get the wrapper (direct unverified there). A session with no link on this machine shows
 `<session[:8]> on <machine>`; no session: empty cell. No raw JSON to humans.
 Relay: every manager (Claude, Codex, DOT; root or child) loads the current contract with `taskq pm` and passes the
-report on complete and unchanged, except the final owning manager's `<arm_tick>` (item 6), its own short commentary
+report on complete and unchanged, except the executing PM's `<arm_tick>` (item 6), its own short commentary
 below it, separate. Limitation (R12): only the prompt asks for this; taskq cannot verify that a relay was exact or that
 the field was replaced, and builds no transport for it.
 Unknown (R12): taskq cannot tell the Codex app from the Codex CLI or IDE (all get direct); Claude Code, web, mobile
@@ -225,6 +233,10 @@ the manager (#290). The reply route (`--reply`) and the `cards` format of #274 a
 Open: bring back the reply route and cards, yes or no (#274).
 Changed: the manager adds the owner's open questions → `tick` prints them as the `Decisions` block; the owner answers
 all in one line, `taskq answer 43.1 44.2` (#490).
+
+Changed: the final owning manager filled ARM and a child left the placeholder → the executing PM fills ARM for
+its explicit projects; root relays the completed block unchanged. Explicit arm requires execution and wake evidence;
+unreadable boards retain external blockers without fabricated counters (#580).
 
 ### R7. Style
 
@@ -252,6 +264,12 @@ Any change is named to the owner first; taskq never edits permission settings it
 ### R10. Multi-project only by explicit list
 
 A session manages several projects only from an owner-written list; folders are never auto-discovered.
+The list stays in session context; task ownership stays in each board task's `pm`. Keep a separate R6 report per
+project. If `N.M` is ambiguous across projects, require the project with the answer and run `taskq answer N.M`
+in that project root; never guess the board. External blocker choices use the contextual numeric routing in
+§ 7 After each pass, not the board answer command; ambiguity includes board versus contextual choices. An unavailable project still gets its own blocker block (R6);
+never omit it or substitute another project's snapshot. Per-project runtime limits remain independent.
+Changed: explicit project list only → separate project reports and project-qualified ambiguous answers (#580).
 Changed: `taskq projects` over `[projects]` in `taskq.local.toml` → no command; the manager runs `taskq tick` in each
 project root the owner listed (#290).
 
@@ -609,7 +627,10 @@ supervisor's one-line outcome. It does no task work, reads no diffs or test logs
 supervisor does, R3, #524) and never answers a worker's or a supervisor's question for the owner. An unsupervised
 task (R3 Transition) keeps the manager's exact-head review (§ After each pass, Unsupervised review).
 
-The manager starts with `taskq pm` in the project root and follows what it prints. `taskq pm`, `taskq tick` and
+The manager starts with `taskq pm` in each explicit project root and follows what it prints. Onboarding shows
+open tasks with no `pm`, including tasks outside the report filter. Triage them explicitly and state the exact
+project-specific `taskq pm --adopt N` action before leaving them blocked; adoption remains an explicit choice,
+never automatic. Never seize a task with a manager or change foreign claims. `taskq pm`, `taskq tick` and
 `taskq wait` first run `git pull --ff-only` in the taskq clone when it is clean (one line on failure), then compare the hash of its
 `taskq.md` with `.taskq/pm.json` (a runtime handle, R1). A different hash prints first: `The manager contract changed:
 run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#430). `taskq pm` prints the pulled
@@ -621,6 +642,14 @@ No fixed interval (#407): the manager is woken only when it has work. The queue 
 #525): an approved task runs to `closed` and the next one starts on queue events and Codex turn ends. Arming only
 brings the manager its short outcomes (`ask`, `closed`, `gone`); a Claude manager arms itself with a background
 `taskq wait`, no separate session.
+
+An explicit owner request to arm means execute the proven environment route below, not merely print its prompt.
+Before starting anything, reuse the existing monitor and its targeted wait for this PM/project; repeated arm must
+not create duplicate waits or senders. Keep a paused project's monitoring paused unless the owner explicitly resumes it.
+Prove an actual idle-manager wake and the continued next wait before claiming successful arming; printed instructions,
+a process return or an unobserved send are not receipt (R12). If the existing independent app sender cannot be
+reached with the available supported tool, report that blocker and ask through the existing task; do not create a
+replacement sender, bridge, store/protocol or duplicate task. Do not resume a worker to bypass queue rework (R11).
 
 1. In the project root run `taskq arm tick "<manager>"` (its session name, id or link). It prints the prompt for
    this runtime: loop { `taskq wait --pm <manager id>`; send its output to `<manager>` (Claude: `SendMessage`; Codex:
@@ -768,10 +797,29 @@ the tasks it did not reach wait for the next pass. Fix the cause or tell the own
 
 ### After each pass
 
-Reply to the owner with the R6 report complete and unchanged, as printed (links, not bare ids), except `<arm_tick>`,
-which the final owning manager replaces (R6 item 6), then one or two lines of your own on what else needs them,
-separate from it. A child manager relays its report to the root the same way, the field left as printed; the root
-passes it on unchanged but for that field (R6 Relay). To show the queue without moving it, run `taskq status`. The owner answers the block in one line, `43.1 44.2`: run `taskq answer 43.1 44.2` verbatim.
+Reply to the owner with a separate complete R6 report for each explicit project (links, not bare ids). The
+executing PM replaces only `<arm_tick>` using R6 item 6; root DOT relays the completed block unchanged, then one
+or two lines of commentary, separate. Current work comes first; questions/problems below it are compact and
+numbered (N.M options), with a recommendation and a verified actionable session link
+when session action is needed. Verify the recorded session and supported action, not merely a URL's shape; if
+unverified, say so and do not offer it as a working login/wake route. Root transport is not evidence of executing-PM queue monitoring. To show
+the queue without moving it, run `taskq status`. The owner answers `43.1 44.2`: run `taskq answer 43.1 44.2`
+verbatim in the named project root only for board task options. If an answer is ambiguous across projects, ask for its project first.
+External runtime blockers use numeric `N.M` too: the executing PM labels each as `Problem N (session choice, not board task)`,
+prints `N.1 <action> · N.2 <action> ★`, and keeps that mapping only in the current session context. Choose N distinct
+from board question numbers in the current project report; if the board is unreadable, do not assume no collision.
+For example, `Problem 1 (session choice, not board task): login session unverified; 1.1 provide a verified session ★ · 1.2 keep unavailable`.
+The PM applies an owner's contextual choice to that displayed action, never passes it to `taskq answer`, and never
+creates a task or store for it. If a code could name more than one project, board task or contextual problem,
+require the project and `task` or `problem` qualifier before acting; never guess. A changed or missing contextual
+mapping requires re-presenting the choices, not applying an old code. No alternate codes such as `OAuth.1`.
+A final canonical relay requires owner/PM confirmation of receipt through the existing authorized route;
+send acceptance alone is not receipt. Worker CLI cannot claim independent observation of executing-PM/root sender
+behavior. Record only safe minimal evidence availability/limits publicly; detailed PM proof stays private.
+Keep external runtime blockers visible even when a board read fails (R6). For GitLab `invalid_grant`, offer owner
+login in a verified real session; do not begin login, retry GitLab or change credentials. If no such session is
+verified, state that limit and ask for one. Reuse the existing task, never file one duplicate per runtime failure.
+Use the decision's `--link` field for the PR/result URL; the short first-line summary is not its link transport.
 Changed: the manager relayed each `ask` comment verbatim → the `Decisions` block carries every pending choice (#490);
 the block is the report's Questions (#574).
 

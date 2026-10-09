@@ -691,6 +691,16 @@ class Tick(TickSetup):
         out = self.run_cli('status')
         self.assertEqual((out.count('<arm_tick>'), out.count('<'), out.endswith('\nMode: events · arm: <arm_tick>\n')), (1, 1, True))
 
+    def test_status_unreadable_board_prints_no_fresh_report(self):
+        # #580: a failed read must not turn unavailable state into fresh-looking empty counters.
+        output = io.StringIO()
+        with mock.patch.object(self.board, 'list', side_effect=SystemExit('invalid_grant')) as listed, \
+                contextlib.redirect_stdout(output), self.assertRaisesRegex(SystemExit, 'invalid_grant'):
+            taskq.cmd_status(None)
+        listed.assert_called_once_with(None)
+        self.assertEqual(output.getvalue(), '')  # the PM supplies the external blocker block, not fabricated rows
+        self.assertEqual(getattr(self.fake, 'names', []), [])
+
     def test_status_empty_queue_is_compact(self):
         # #574: an empty table or section is left out, no placeholder
         self.assertEqual(self.run_cli('status'), f'{self.root.name} · [board](https://github.com/o/r/issues)\n'
@@ -1138,6 +1148,10 @@ class Tick(TickSetup):
         self.assertIn('Start: run one pass now', out)
         self.assertIn('no sender, timer or extension', out)
         self.assertNotIn('separate sender', out)
+        for part in ('Explicit owner arm: execute the proven route', 'Reuse the existing monitor and targeted wait',
+                     'repeated arm must not create duplicates', 'Prove an idle-manager wake and the next wait',
+                     'never create a replacement sender or bridge'):
+            self.assertIn(part, out)
 
     def test_arm_tick_prints_the_codex_compact_line(self):
         out = self.run_cli('arm', 'tick')
@@ -1587,6 +1601,8 @@ class Wait(TickSetup):
         self.assertIn("taskq.py wait --pm 'PM main'`", out)  # #532: a name matches no task's pm, and the prompt says so
         self.assertIn('taskq: no open task records PM main as its pm', out)
         self.assertIn('with SendMessage', out)
+        self.assertIn('Reuse the existing monitor and targeted wait', out)
+        self.assertIn('Prove an idle-manager wake and the next wait', out)
 
     def codex_home(self, folder, thread):
         home = self.root / 'codex'
@@ -1888,6 +1904,57 @@ class Contract(Base):
             self.assertIn(part, out)
         self.assertNotIn('## 8. Runtimes', out)
         self.assertEqual(json.loads((self.root / '.taskq' / 'pm.json').read_text()), {'contract': digest})  # #532: the hash only
+
+    def test_pm_onboarding_is_one_read_only_snapshot(self):
+        (self.root / 'taskq.md').write_text((ROOT / 'taskq.md').read_text())
+        self.add('assigned')
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': ''}, clear=True):
+            self.add('unassigned')
+            self.add('claimed')
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(3), 'doing', 'take', claim={'runtime': 'codex', 'session': 'foreign', 'name': 'mac'})
+        self.board.add('ordinary issue', '', [])
+        taskq.CONFIG['assignee'] = 'nobody'  # onboarding must reveal tasks hidden by the report filter
+        before = json.dumps(self.board.issues, sort_keys=True)
+        with mock.patch.object(self.board, 'list', wraps=self.board.list) as listed, \
+                mock.patch.object(taskq, 'dispatch', side_effect=AssertionError('pm dispatched')):
+            out = self.run_cli('pm')
+        listed.assert_called_once_with(None)
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        hints = [line for line in out.splitlines() if line.startswith('Unassigned manager:')]
+        self.assertEqual(len(hints), 2)
+        for n, line in zip((2, 3), hints):
+            self.assertIn(f'#{n} ', line)
+            self.assertIn(f'project {self.root.name}:', line)
+            self.assertIn(f'cd {self.root} && taskq pm --adopt {n}', line)
+            self.assertIn('No ownership or claims changed.', line)
+        for part in ('executing PM fills the field', 'relays the completed block unchanged',
+                     'must not replace known executing-PM state', 'no interval from a default or `arm tick` output',
+                     'If an answer is ambiguous across projects', 'never automatic',
+                     'no stale table presented as fresh', 'no fabricated zero counters',
+                     'An explicit owner request to arm means execute', 'continued next wait',
+                     'repeated arm must', 'Keep external runtime blockers visible',
+                     'do not begin login, retry GitLab or change credentials',
+                     'verified actionable session link', "decision's `--link` field", 'Problem N (session choice, not board task)',
+                     'never passes it to `taskq answer`', 'require the project and `task` or `problem` qualifier',
+                     'for macOS Codex desktop use `TASKQ_CLIENT=codex`', 'Root never rewrites links',
+                     'never ARM evidence or a fourth ARM state', 'send acceptance alone is not receipt',
+                     'detailed PM proof stays private'):
+            self.assertIn(part, out)
+
+    def test_pm_refuses_recorded_session_roles_before_onboarding(self):
+        self.add()
+        (self.root / 'taskq.md').write_text((ROOT / 'taskq.md').read_text())
+        for field in ('claim', 'supervisor'):
+            with self.subTest(field=field):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    taskq.move(self.task(1), 'doing', 'take',
+                               **dict({'claim': None, 'supervisor': None},
+                                      **{field: {'runtime': 'claude', 'session': SESSION, 'name': 'mac'}}))
+                before = json.dumps(self.board.issues, sort_keys=True)
+                with self.assertRaisesRegex(SystemExit, 'cannot take the manager role'):
+                    self.run_cli('pm')
+                self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
 
     def test_changed_contract_until_pm(self):
         line = 'The manager contract changed: run taskq pm and follow it from now on.'

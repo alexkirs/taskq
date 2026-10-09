@@ -1353,7 +1353,7 @@ def report(items, listed, kinds, here):
     lines += ['Questions (answer N.M):', '', '| Question | Brief reason | Options |', '|---|---|---|', *cards, ''] if cards else []
     later = [heading(item) for item in items if item['state'] == 'later']
     lines += ['Later: ' + ', '.join(later), ''] if later else []
-    print('\n'.join([*lines, 'Mode: events · arm: <arm_tick>']))  # R6 item 6: the final owning manager fills the one field
+    print('\n'.join([*lines, 'Mode: events · arm: <arm_tick>']))  # R6 item 6: the executing PM fills the one field
 
 MEDIA = re.compile(r'\.(png|jpe?g|gif|webp|svg)(\?.*)?$', re.I)
 
@@ -1510,7 +1510,8 @@ def cmd_pm(args):
     """The manager role: Principles and § 7 of taskq.md, then how to tick this session; the hash goes to .taskq/pm.json,
     nothing else: a task's manager is its own `pm` on the board (R3, #532). `--adopt N`: become the `pm` of tasks with none."""
     me = session() or {}
-    if me and any(role(item) in ('supervisor', 'worker') for item in map(parse, BOARD.list(None)) if item):
+    snapshot = [item for item in map(parse, BOARD.list(None)) if item]
+    if me and any(role(item) in ('supervisor', 'worker') for item in snapshot):
         fail('a recorded supervisor or worker cannot take the manager role (R3 one controller)')
     if args.adopt:
         adopt(args.adopt, me)
@@ -1520,6 +1521,11 @@ def cmd_pm(args):
     (CONFIG['root'] / '.taskq' / 'pm.json').write_text(json.dumps({'contract': digest}), 'utf-8')
     print(f'taskq pm contract {digest}\nYou are the taskq manager of {CONFIG["root"]}. Follow this role from now on; '
           f'`taskq` is `python3 {Path(__file__).resolve()}`.\n\n' + '\n'.join(sections))
+    for item in sorted(snapshot, key=lambda item: (item['priority'], item['iid'])):
+        if not item['pm'] and item['iid'] not in args.adopt:
+            print(f'Unassigned manager: #{item["iid"]} {item["title"]} ({item["state"]}). '
+                  f'Triage explicitly; to adopt in project {CONFIG["root"].name}: '
+                  f'`cd {shlex.quote(str(CONFIG["root"]))} && taskq pm --adopt {item["iid"]}`. No ownership or claims changed.')
     cmd_arm(argparse.Namespace(target=None))
 
 CODEX_COMPACT = ('-c model_auto_compact_token_limit=200000 -c "compact_prompt=\\"Keep only the owner\'s open questions and '
@@ -1536,7 +1542,11 @@ def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
     runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
     wait = f'python3 {Path(__file__).resolve()} wait'
-    start = ('Start: run one pass now (`taskq tick`, outside a Codex sandbox). From then on the approved queue runs by itself (R4): '
+    action = ('Explicit owner arm: execute the proven route, not just this prompt. Reuse the existing monitor and targeted wait; '
+             'repeated arm must not create duplicates. Keep paused projects paused. Prove an idle-manager wake and the next wait; '
+             'printed output is not proof. No supported access to the existing sender: report one blocker through the existing task, '
+              'never create a replacement sender or bridge. See § 7 Arm the tick.\n')
+    start = action + ('Start: run one pass now (`taskq tick`, outside a Codex sandbox). From then on the approved queue runs by itself (R4): '
              'supervisors, workers, reviews, reworks, closes and the next task start on queue events and Codex turn ends; '
              'no sender, timer or extension. Arming below only brings you the short outcomes.\n')
     if not args.target and runtime == 'codex':  # #510: a Codex session is not woken when a background command ends
@@ -1574,7 +1584,7 @@ Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.j
                 'Workers still dispatch without a sender (R4 event chain); only review, ask and gone wait for the manager.\n\n')
     if not any((item['pm'] or {}).get('session') == pm for item in map(parse, BOARD.list(None)) if item):
         note += f'taskq: no open task records {pm} as its pm; this wait shows only tasks with no manager until one does.\n'
-    print(f'''{note}You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
+    print(f'''{action}{note}You are the taskq tick sender for the manager session {args.target}. Do no task work and run no other taskq command.
 Stay in this one turn and repeat, from {CONFIG["root"]}; do not end the turn between events (an ended turn forwards nothing):
 1. Run `{wait}`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
 2. Send its output, verbatim, to {args.target} {send}.

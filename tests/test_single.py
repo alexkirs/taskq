@@ -571,14 +571,14 @@ class Tick(TickSetup):
         one = self.task(1)
         self.assertEqual((one['state'], one['supervisor'], one['claim']), ('doing', {'runtime': 'fake', 'session': 's-S1', 'name': 'mac'},
                                                                          {'runtime': 'fake', 'session': None, 'name': 'mac'}))
-        self.assertEqual((self.task(2)['state'], self.task(3)['state'], self.fake.names), ('ready', 'ready', ['S1 CLD one (mac)']))
+        self.assertEqual((self.task(2)['state'], self.task(3)['state'], self.fake.names), ('ready', 'ready', ['S1 UNK one (mac)']))
         self.assertIn('You are the taskq supervisor S1 of task #1: one', self.fake.prompts['s-S1'])
         self.assertIn('**spawn** · claude:01234567\n\nsupervisor s-S1\nhttps://watch/s-S1', self.board.issues[1]['comments'])
         self.assertIn('| [#1](https://board/1) | doing | fake | [s-S1](https://watch/s-S1) |', out)
         self.assertTrue(out.endswith('Board: https://github.com/o/r/issues\n'))
         with self.acting('s-S1'):
             self.run_cli('run', '1')  # the supervisor orders; its event pass spawns the worker
-        self.assertEqual((self.task(1)['claim']['session'], self.fake.names[-1]), ('s-T1', 'T1 CLD one (mac)'))
+        self.assertEqual((self.task(1)['claim']['session'], self.fake.names[-1]), ('s-T1', 'T1 UNK one (mac)'))
         self.assertIn('taskq worker for task #1: one', self.fake.prompts['s-T1'])
         self.assertEqual(self.notes(1), ['**add**', '**spawn**', '**run**', '**spawn**'])
         self.assertTrue(self.board.issues[1]['comments'][-1].endswith('worker s-T1\nhttps://watch/s-T1'))
@@ -588,7 +588,7 @@ class Tick(TickSetup):
         self.assertIn('worker s-T1 is gone', self.board.issues[1]['comments'][-1])
         self.assertEqual(self.fake.sent, [('s-S1', 'gone #1: read your issue')])  # woken once
         self.run_cli('tick')
-        self.assertEqual((len(self.fake.sent), self.fake.names), (1, ['S1 CLD one (mac)', 'T1 CLD one (mac)']))
+        self.assertEqual((len(self.fake.sent), self.fake.names), (1, ['S1 UNK one (mac)', 'T1 UNK one (mac)']))
 
     def test_row_links_per_runtime(self):
         claude, codex = taskq.Claude(), taskq.Codex()
@@ -654,13 +654,13 @@ class Tick(TickSetup):
             return spawn(*spawn_args)
         self.fake.spawn = overlapping
         self.add('one')  # the add's pass spawns #1's supervisor, and the tick runs at that moment
-        self.assertEqual(self.fake.names, ['S1 CLD one (mac)'])
+        self.assertEqual(self.fake.names, ['S1 UNK one (mac)'])
         self.assertIn('another pass is running', err.getvalue())
         self.fake.spawn = spawn
         stale = [dict(self.board.issues[1], labels=['q-ready'])]  # a list from before the spawn: the re-read sees #1 taken
         with mock.patch.object(self.board, 'list', return_value=stale):
             self.run_cli('tick')
-        self.assertEqual(self.fake.names, ['S1 CLD one (mac)'])
+        self.assertEqual(self.fake.names, ['S1 UNK one (mac)'])
 
     def test_nudge_only_a_silent_worker(self):
         self.unmanaged()
@@ -757,13 +757,15 @@ class Tick(TickSetup):
         self.assertEqual([self.task(n)['state'] for n in (1, 2, 3)], ['doing', 'doing', 'doing'])
 
     def test_worker_name_has_task_launcher_title_machine(self):
-        self.add()
-        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex'}):
-            self.run_cli('tick')
-        self.assertRegex(self.fake.names[0], r'^S1 (CLD|CDX) \S.* \(mac\)$')
-        with self.acting('s-S1'):
-            self.run_cli('run', '1')
-        self.assertEqual(self.fake.names[1], 'T1 CLD T (mac)')
+        # R3 (#572): ORCH is the task's pm on the board, never the caller whose event ran the pass; no pm: the caller
+        self.manager('codex')
+        with mock.patch.object(taskq, 'runtimes', return_value={'fake': self.fake, 'codex': self.fake}):
+            self.add()
+            with self.acting('s-S1'):  # a Claude caller
+                self.run_cli('run', '1')
+        self.assertEqual(self.fake.names, ['S1 CDX T (mac)', 'T1 CDX T (mac)'])
+        self.assertEqual(self.fake.prompts['s-S1'].split('\n')[0], 'S1 CDX T (mac)')  # the brief's first line: a fallback title
+        self.assertEqual(taskq.worker_name({'iid': 2, 'title': 'x', 'pm': None}), 'T2 CLD x (mac)')
 
     def test_events_spawn_the_next_task_at_once(self):
         # #333 (R4): add, run, result, requeue, close and answer each run the pass once; a full slot spawns nothing
@@ -944,9 +946,29 @@ class Tick(TickSetup):
             with open(log, 'a') as out:
                 out.write('{"type":"thread.started","thread_id":"new-thread"}\n')
             return mock.Mock(pid=os.getpid()), log
-        with mock.patch.object(codex, 'exec', run):
+        with mock.patch.object(codex, 'exec', run), mock.patch.object(codex, 'title') as title:
             self.assertEqual(codex.spawn('T1 one (mac)', 'prompt', '.'), 'new-thread')
         self.assertEqual((codex.folder() / 'T1.pid').read_text(), f'{os.getpid()} new-thread')
+        title.assert_called_once_with('new-thread', 'T1 one (mac)')  # R3 (#572): the new thread gets its native name
+
+    def test_codex_title_sets_and_reads_back_the_name(self):
+        # R3 (#572): thread/name/set, then thread/read proves the persisted name; a mismatch is printed, never raised
+        sent = []
+
+        class Server(contextlib.nullcontext):
+            def __init__(self, reply):
+                super().__init__(self)
+                self.stdout, self.kill = io.StringIO(reply), lambda: None
+                self.stdin = mock.Mock(write=lambda text: sent.extend(map(json.loads, text.splitlines())))
+        for named, err in (('S1 CDX one (mac)', ''), ('other', "taskq: codex thread th not named 'S1 CDX one (mac)': other\n")):
+            reply = '{"id":0,"result":{}}\n{"id":1,"result":{}}\n{"id":2,"result":{"thread":{"id":"th","name":"%s"}}}\n' % named
+            with self.subTest(named), mock.patch.object(taskq.subprocess, 'Popen', lambda *a, **k: Server(reply)), \
+                    mock.patch('sys.stderr', new=io.StringIO()) as stderr:
+                taskq.Codex().title('th', 'S1 CDX one (mac)')
+            self.assertEqual(stderr.getvalue(), err)
+        self.assertEqual([(m.get('method'), m.get('params')) for m in sent[:4]],
+                         [('initialize', {'clientInfo': {'name': 'taskq', 'version': '1'}}), ('initialized', None),
+                          ('thread/name/set', {'threadId': 'th', 'name': 'S1 CDX one (mac)'}), ('thread/read', {'threadId': 'th'})])
 
     def test_supervisor_runtime_follows_the_manager(self):
         # R3 (#525): S<N> runs in the manager's runtime (DOT: Codex), T<N> in the task's; no manager here: the task waits
@@ -956,7 +978,7 @@ class Tick(TickSetup):
             self.add('one', '--runtime', 'fake')
             with self.acting('s-S1'):
                 self.run_cli('run', '1')
-            self.assertEqual((lead.names, self.fake.names), (['S1 CLD one (mac)'], ['T1 CLD one (mac)']))
+            self.assertEqual((lead.names, self.fake.names), (['S1 DOT one (mac)'], ['T1 DOT one (mac)']))  # ORCH: the pm, not the Claude caller
             self.assertEqual((self.task(1)['supervisor']['runtime'], self.task(1)['claim']), ('codex', {'runtime': 'fake', 'session': 's-T1', 'name': 'mac'}))
             self.manager('hermes')  # a manager whose runtime has no file here
             taskq.CONFIG['limits'] = {'fake': 2}
@@ -976,7 +998,7 @@ class Tick(TickSetup):
             self.run_cli('run', '1')
         for _ in range(3):
             self.run_cli('tick')
-        self.assertEqual(self.fake.names, ['S1 CLD one (mac)', 'T1 CLD one (mac)'])
+        self.assertEqual(self.fake.names, ['S1 UNK one (mac)', 'T1 UNK one (mac)'])
         with self.acting('s-T1'):
             self.run_cli('result', '1', '--sha', 'a' * 40)
             with self.assertRaisesRegex(SystemExit, 'only it, the task.s manager or the owner'):  # the worker never closes its own task
@@ -1042,7 +1064,7 @@ class Tick(TickSetup):
         def run(*_):
             log.write_text('{"thread_id":"new-thread"}\n')
             return mock.Mock(pid=999999998), log
-        with mock.patch.object(codex, 'exec', run):
+        with mock.patch.object(codex, 'exec', run), mock.patch.object(codex, 'title'):
             codex.spawn('S1 one (mac)', 'prompt', '.')
         calls = []
         with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:])):
@@ -1274,14 +1296,14 @@ class Wait(TickSetup):
             with self.acting('s-T1'):
                 self.run_cli('result', '1', '--sha', 'a' * 40)
         self.assertTrue(passes and all(command[:2] == ['tick', '--quiet'] for command in passes))  # only event passes
-        self.assertEqual(self.fake.names, ['S1 CLD one (mac)', 'T1 CLD one (mac)'])  # one spawn each
+        self.assertEqual(self.fake.names, ['S1 UNK one (mac)', 'T1 UNK one (mac)'])  # one spawn each
         self.assertEqual((self.task(1)['state'], self.task(2)['state']), ('review', 'ready'))
         self.assertEqual(self.run_cli('wait'), 'tick\n')  # a supervised review is the supervisor's
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), self.acting('s-S1'):
             self.run_cli('close', '1', '--text', 'one shipped; users get one; open: none\n\nmore')
         self.assertEqual(self.run_cli('wait'), 'closed #1 one shipped; users get one; open: none\n')
         self.assertEqual(self.run_cli('wait'), 'tick\n')  # never sent twice
-        self.assertEqual(self.fake.names[-1], 'S2 CLD two (mac)')  # the close freed the slot
+        self.assertEqual(self.fake.names[-1], 'S2 UNK two (mac)')  # the close freed the slot
         self.assertEqual((self.fake.stopped, self.fake.sessions['s-S1']), (['s-T1'], True))  # close never stops the session that runs it
         self.fake.sessions['s-S1'] = False  # its turn ended: the next pass retires it
         self.run_cli('tick')
@@ -1390,7 +1412,7 @@ class MultiPM(Base):
         self.assertEqual(self.board.issues[1]['comments'][-1], '**adopt** · claude:pmB-clau\n\npm claude:pmB-claude')
         with self.pm(self.A):
             self.run_cli('tick')
-        self.assertEqual((getattr(self.cdx, 'names', []), self.cld.names), ([], ['S1 CDX one (mac)']))  # A's pass starts B's task in B's runtime (ORCH: the launcher)
+        self.assertEqual((getattr(self.cdx, 'names', []), self.cld.names), ([], ['S1 CLD one (mac)']))  # A's pass starts B's task in B's runtime; ORCH is B's, not A's (#572)
 
     def test_overlapping_adoptions_never_overwrite(self):
         # the review's interleaving: B adopts while A is between its read and its write. A holds the dispatch lock across

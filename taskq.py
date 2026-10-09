@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
-import argparse, contextlib, glob, hashlib, importlib.util, json, os, re, shlex, shutil, signal, socket, subprocess, sys, time
+import argparse, contextlib, glob, hashlib, importlib.util, json, os, re, shlex, shutil, signal, socket, subprocess, sys, threading, time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -37,8 +37,9 @@ def machine():
 ORCH = {'claude': 'CLD', 'codex': 'CDX', 'dot': 'DOT', 'hermes': 'HRM', 'grok': 'GRK'}
 
 def worker_name(item, letter='T'):
-    """R3 naming (#268): `T<N> <ORCH> <title> (<machine>)`, `S<N> ...` the supervisor; ORCH is who launched it, UNK for the owner's shell."""
-    launcher = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
+    """R3 naming (#268, #572): `T<N> <ORCH> <title> (<machine>)`, `S<N> ...` the supervisor; ORCH is the task's `pm` on the
+    board, never the caller that runs the pass; a task with no `pm` (R3 Transition): the caller, UNK for the owner's shell."""
+    launcher = (item.get('pm') or {}).get('runtime') or (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
     return f'{letter}{item["iid"]} {ORCH.get(launcher, "UNK")} {item["title"][:40]} ({machine()})'
 
 def session():
@@ -362,7 +363,36 @@ class Codex:
         if old[1:] and old[1] != found:  # #568: a replaced thread not yet retired (a running one) keeps its handle
             pid.rename(pid.with_name(f'{pid.stem}-{old[1]}.pid'))
         pid.write_text(f'{process.pid} {found}')
+        self.title(found, name)
         return found
+
+    def title(self, thread, name):
+        """R3 (#572): `codex exec` names no thread; the app-server's `thread/name/set` does, `thread/read` proves it.
+        `exec resume` keeps the name. A failure never fails the spawn: it is printed, the prompt's first line stays the title."""
+        calls = [('initialize', {'clientInfo': {'name': 'taskq', 'version': '1'}}), ('thread/name/set', {'threadId': thread, 'name': name}),
+                 ('thread/read', {'threadId': thread})]
+        lines = [json.dumps({'jsonrpc': '2.0', 'id': i, 'method': m, 'params': p}) for i, (m, p) in enumerate(calls)]
+        lines.insert(1, json.dumps({'jsonrpc': '2.0', 'method': 'initialized'}))
+        replies = {}
+        try:  # stdin stays open until the read's reply: the server drops what is pending when its stdin ends
+            with subprocess.Popen([shutil.which('codex') or 'codex', 'app-server'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, env=worker_env(), text=True, encoding='utf-8') as server:
+                timer = threading.Timer(60, server.kill)  # ponytail: one deadline for the whole exchange
+                timer.start()
+                server.stdin.write('\n'.join(lines) + '\n')
+                server.stdin.flush()
+                for line in server.stdout:
+                    msg = json.loads(line) if line.startswith('{') else {}
+                    replies[msg.get('id')] = msg
+                    if 2 in replies:
+                        break
+                timer.cancel()
+                server.stdin.close()
+            read = ((replies.get(2) or {}).get('result') or {}).get('thread') or {}
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            read, replies = {}, {1: {'error': str(error)}}
+        if read.get('name') != name:
+            print(f'taskq: codex thread {thread} not named {name!r}: {(replies.get(1) or {}).get("error") or read.get("name")}', file=sys.stderr)
 
     def pid_file(self, session):
         return next((path for path in self.folder().glob('*.pid') if path.read_text().split()[1:] == [session]), None)
@@ -876,7 +906,7 @@ def history(n):
     return 'History of this task (read it first; a requeue says what to fix):\n\n' + '\n\n'.join(notes[-6:]) + '\n\n' if notes else ''
 
 def brief(item, runtime):
-    """The worker's prompt: the task, its workspace, the taskq commands it uses."""
+    """The worker's prompt: its name first (R3, #572: a runtime's fallback title), the task, its workspace, the taskq commands it uses."""
     n, root, tq = item['iid'], CONFIG['root'], f'python3 {Path(__file__).resolve()}'
     create = f'glab mr create --yes --target-branch main --source-branch taskq-{n} --title "<title>" --description' if CONFIG['board'] == 'gitlab' \
         else f'gh pr create --base main --head taskq-{n} --title "<title>" --body'
@@ -884,7 +914,8 @@ def brief(item, runtime):
         f'then `{tq} result {n} --sha <PR head full SHA>' if CONFIG['publish'] == 'pr' else f'`git push --force-with-lease origin HEAD:refs/heads/taskq-{n}`, then\n  `{tq} result {n} --sha <candidate full SHA>'
     workspace = f'take your workspace from the project instructions (AGENTS.md) or the path the manager gave, on branch taskq-{n};\nthe host owns it: never remove it' \
         if CONFIG.get('workspace') == 'external' else f'from {root} run `git fetch origin && git worktree add -b taskq-{n} .worktrees/taskq-{n} origin/main`, work only there,\nnever in the main checkout'
-    return f'''You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
+    return f'''{worker_name(item)}
+You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
 Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
 Read `{Path(__file__).resolve().with_name("taskq.md")}` first and do only what it allows (R13): a task that conflicts with a recorded decision is an ask with options, not an edit.
 
@@ -903,14 +934,15 @@ needs no worktree. Commands:
 Everything written through taskq is public: no secrets, tokens or paths outside the repository.'''
 
 def supervisor_brief(item, runtime, kind):
-    """S<N>'s prompt (§ 7 Supervisor): the task, its orders, review and close; never the task's code."""
+    """S<N>'s prompt (§ 7 Supervisor): its name first (R3), the task, its orders, review and close; never the task's code."""
     n, tq, lab = item['iid'], f'python3 {Path(__file__).resolve()}', CONFIG['board'] == 'gitlab'
     wait = f'run `{tq} wait --task {n}` in the background (run_in_background) and end your turn; its output wakes you' \
         if getattr(kind, 'SELF_WAKE', False) else 'end your turn; the queue wakes you with the event'
     ci = f'glab api "projects/:id/pipelines?sha=<sha>"' if lab else 'gh run list --commit <sha>'
     view = f'glab issue view {n} --comments' if lab else f'gh issue view {n} --comments'
     nudge = f'glab issue note {n} -m "nudge: <text>"' if lab else f'gh issue comment {n} --body "nudge: <text>"'
-    return f'''You are the taskq supervisor S{n} of task #{n}: {item["title"]}. You are its only controller: you order its worker, follow it,
+    return f'''{worker_name(item, 'S')}
+You are the taskq supervisor S{n} of task #{n}: {item["title"]}. You are its only controller: you order its worker, follow it,
 review its result and close or rework it. You never edit the task's code, never start a session yourself, never decide for the owner.
 Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
 Read `{Path(__file__).resolve().with_name("taskq.md")}` (§ 7 Supervisor, § 6) first and do only what it allows (R13).

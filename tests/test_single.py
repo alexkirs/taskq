@@ -19,6 +19,8 @@ spec = importlib.util.spec_from_file_location('taskq_single', ROOT / 'taskq.py')
 taskq = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(taskq)
 SESSION = '0123456789abcdef'
+BIRTH = f'{taskq.process_domain()}:1' + (':0' if sys.platform == 'darwin' else '')
+NEXT_BIRTH = f'{taskq.process_domain()}:2' + (':0' if sys.platform == 'darwin' else '')
 REAL_RUN, REAL_POPEN = subprocess.run, subprocess.Popen  # Base fails any real process; the pull test needs git, the sender loop bash
 
 
@@ -204,7 +206,7 @@ class Coordination(Base):
         self.assertIsNone(codex.state('another-checkout-session'))
         path = self.root / '.taskq' / 'S1.pid'
         path.parent.mkdir(exist_ok=True)
-        path.write_text('99999 session windows:1')
+        path.write_text(f'99999 session {BIRTH}')
         with mock.patch.object(taskq, 'process_identity', return_value=('dead', None)), \
                 mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)), \
                 self.assertRaisesRegex(RuntimeError, 'archive failed'):
@@ -1884,7 +1886,7 @@ class Tick(TickSetup):
             taskq.CONFIG['root'] = Path(folder)
             (Path(folder) / '.taskq').mkdir()
             for n in (3, 4):
-                (Path(folder) / '.taskq' / f'T{n}.pid').write_text(f'999999999 thread-{n} windows:1')
+                (Path(folder) / '.taskq' / f'T{n}.pid').write_text(f'999999999 thread-{n} {BIRTH}')
             calls = []
             with mock.patch.object(taskq.subprocess, 'run', side_effect=lambda command, **_: calls.append(command[1:]) or subprocess.CompletedProcess(command, 0)):
                 taskq.Codex().retire(lambda n, *_: n == 3)
@@ -1894,7 +1896,7 @@ class Tick(TickSetup):
     def test_codex_alive_from_pid_file(self):
         codex = taskq.Codex()
         (codex.folder() / 'T1.pid').write_text(f'{os.getpid()} thread-1 {taskq.process_identity(os.getpid())[1]}')
-        (codex.folder() / 'T2.pid').write_text('999999999 thread-2 windows:1')  # above any pid_max: no such process
+        (codex.folder() / 'T2.pid').write_text(f'999999999 thread-2 {BIRTH}')  # above any pid_max: no such process
         self.assertEqual([codex.alive(s) for s in ('thread-1', 'thread-2', 'thread-3')], [True, False, None])
         self.assertTrue(codex.link('thread-1').endswith('/open.html#codex://threads/thread-1'))
 
@@ -1982,7 +1984,7 @@ class Tick(TickSetup):
     def test_codex_resume_keeps_the_named_thread(self):
         # R3 (#572): `exec resume` goes to the same thread under its handle; it renames nothing (the name stays native)
         codex = taskq.Codex()
-        (codex.folder() / 'S1.pid').write_text('999999999 th windows:1')
+        (codex.folder() / 'S1.pid').write_text(f'999999999 th {BIRTH}')
         with mock.patch.object(codex, 'exec', return_value=(mock.Mock(pid=4242), codex.folder() / 'S1.log')) as run, \
                 mock.patch.object(codex, 'title', side_effect=AssertionError('resume renames nothing')):
             self.assertEqual(codex.send('th', 'review #1: read your issue'), 'th')
@@ -2079,7 +2081,7 @@ class Tick(TickSetup):
     def test_codex_respawn_keeps_the_replaced_handle(self):
         # #568: a running replaced thread keeps a handle (S<N>-<thread>.pid) so retire still finds and archives it
         codex = taskq.Codex()
-        (codex.folder() / 'S1.pid').write_text('999999999 old-thread windows:1')
+        (codex.folder() / 'S1.pid').write_text(f'999999999 old-thread {BIRTH}')
         log = codex.folder() / 'S1.log'
 
         def run(*_):
@@ -2152,7 +2154,7 @@ class Tick(TickSetup):
         (home / 'sessions' / '2026' / '10' / '09' / 'rollout-x-th-1.jsonl').write_text('')
         for name, pid, log in (('S1', os.getpid(), ''), ('S2', 999999999, '{"type":"turn.started"}\n{"type":"turn.completed"}\n'),
                                ('S3', 999999999, '{"type":"turn.completed"}\n{"type":"turn.started"}\n{"type":"turn.failed"}\n')):
-            (codex.folder() / f'{name}.pid').write_text(f'{pid} th-{name[1]} {taskq.process_identity(pid)[1] or "windows:1"}')
+            (codex.folder() / f'{name}.pid').write_text(f'{pid} th-{name[1]} {taskq.process_identity(pid)[1] or BIRTH}')
             (codex.folder() / f'{name}.log').write_text(log)
         with mock.patch.dict(os.environ, {'CODEX_HOME': str(home)}):
             self.assertEqual([codex.state(f'th-{n}') for n in (1, 2, 3, 4)], ['running', 'dead', 'dead', None])  # th-2: no rollout; th-4: another checkout may own it
@@ -2175,8 +2177,8 @@ class Tick(TickSetup):
             self.run_cli('result', '1', '--sha', 'a' * 40)
         self.assertEqual(self.fake.sent, [])
         self.fake.sessions['s-S1'] = 'idle'
-        with mock.patch.object(taskq, 'process_identity', side_effect=[('running', 'windows:1'), ('dead', None)]), mock.patch.object(taskq.time, 'sleep') as slept:
-            self.run_cli('tick', '--quiet', '--after', '4242', '--after-birth', 'windows:1')
+        with mock.patch.object(taskq, 'process_identity', side_effect=[('running', BIRTH), ('dead', None)]), mock.patch.object(taskq.time, 'sleep') as slept:
+            self.run_cli('tick', '--quiet', '--after', '4242', '--after-birth', BIRTH)
         self.assertEqual((slept.call_count, self.fake.sent), (1, [('s-S1', 'review #1: read your issue')]))
         self.run_cli('tick')
         self.assertEqual(len(self.fake.sent), 1)  # once
@@ -2233,8 +2235,8 @@ class RuntimeProcessBoundary(Base):
         library.proc_pidinfo.side_effect = reply
         with mock.patch.object(ctypes, 'CDLL', return_value=library):
             for status, returned_pid, length, error, expected in (
-                    (2, 123, 136, 0, ('running', 'darwin:1700000000:123456')),
-                    (5, 123, 136, 0, ('dead', 'darwin:1700000000:123456')),
+                    (2, 123, 136, 0, ('running', f'{taskq.process_domain("darwin")}:1700000000:123456')),
+                    (5, 123, 136, 0, ('dead', f'{taskq.process_domain("darwin")}:1700000000:123456')),
                     (2, 123, 0, errno.ESRCH, ('dead', None)),
                     (2, 123, 0, errno.EPERM, ('unknown', None)),
                     (2, 123, 128, 0, ('unknown', None)),
@@ -2242,16 +2244,16 @@ class RuntimeProcessBoundary(Base):
                 with self.subTest(status=status, length=length, error=error, pid=returned_pid):
                     self.assertEqual(taskq.darwin_identity(123), expected)
         with mock.patch.object(taskq.os, 'name', 'posix'), mock.patch.object(taskq.sys, 'platform', 'darwin'), \
-                mock.patch.object(taskq, 'process_identity', return_value=('running', 'darwin:1:2')), \
+                mock.patch.object(taskq, 'process_identity', return_value=('running', f'{taskq.process_domain("darwin")}:1:2')), \
                 mock.patch.object(taskq.os, 'kill') as kill, \
                 self.assertRaisesRegex(RuntimeError, 'safe process termination unavailable'):
-            taskq.stop_process(123, 'darwin:1:2')
+            taskq.stop_process(123, f'{taskq.process_domain("darwin")}:1:2')
         kill.assert_not_called()
 
     def test_legacy_and_unknown_handles_are_preserved(self):
         codex = taskq.Codex()
         path = codex.folder() / 'T1.pid'
-        for text in ('123 sid', '123 sid -', '123 sid malformed', '123 sid windows:1'):
+        for text in ('123 sid', '123 sid -', '123 sid malformed', '123 sid windows:1', f'123 sid {BIRTH}'):
             with self.subTest(handle=text), mock.patch.object(taskq, 'process_identity', return_value=('unknown', None)), \
                     mock.patch.object(taskq, 'stop_process') as stop, mock.patch.object(codex, 'exec') as execute:
                 path.write_text(text)
@@ -2263,16 +2265,57 @@ class RuntimeProcessBoundary(Base):
                 execute.assert_not_called()
                 stop.assert_not_called()
 
+    def test_foreign_process_domains_are_unknown_even_when_local_pid_is_absent(self):
+        win = 'windows:' + 'a' * 64
+        mac = 'darwin:' + 'a' * 64
+        linux = 'linux:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        codex = taskq.Codex()
+        path = codex.folder() / 'T1.pid'
+        cases = ((linux, win + ':1'), (win, linux + ':1'),
+                 (linux, 'linux:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:1'),
+                 (win, 'windows:' + 'b' * 64 + ':1'),
+                 (mac, 'darwin:' + 'b' * 64 + ':1:0'),
+                 (win, mac + ':1:0'), (mac, win + ':1'),
+                 (win, 'windows:1'), (mac, 'darwin:1:0'))
+        for local, recorded in cases:
+            with self.subTest(local=local, recorded=recorded), \
+                    mock.patch.object(taskq, 'process_domain', return_value=local), \
+                    mock.patch.object(taskq, 'process_identity', return_value=('dead', None)) as probe, \
+                    mock.patch.object(codex, 'exec') as execute, \
+                    mock.patch.object(taskq.subprocess, 'run') as archive:
+                original = f'123 sid {recorded}'
+                path.write_text(original)
+                self.assertEqual(codex.state('sid'), 'unknown')
+                with self.assertRaisesRegex(RuntimeError, 'unknown.*refused'):
+                    codex.send('sid', 'continue')
+                codex.retire(lambda *args: True)
+                self.assertEqual(path.read_text(), original)
+                probe.assert_not_called()
+                execute.assert_not_called()
+                archive.assert_not_called()
+
+    def test_windows_and_darwin_domains_derive_from_native_hostname(self):
+        for platform in ('windows', 'darwin'):
+            with mock.patch.object(taskq.socket, 'gethostname', return_value='host-a'):
+                first = taskq.process_domain(platform)
+            with mock.patch.object(taskq.socket, 'gethostname', return_value='host-b'):
+                second = taskq.process_domain(platform)
+            self.assertNotEqual(first, second)
+            self.assertEqual(len(first.split(':')[1]), 64)
+            self.assertTrue(first.startswith(platform + ':'))
+        with mock.patch.object(taskq, 'process_identity', return_value=('running', None)):
+            self.assertEqual(taskq.process_state(123, BIRTH), 'unknown')
+
     def test_reused_pid_never_signals_foreign_process_or_waits_for_it(self):
         codex = taskq.Codex()
         path = codex.folder() / 'T1.pid'
-        path.write_text('123 sid windows:1')
-        with mock.patch.object(taskq, 'process_identity', return_value=('running', 'windows:2')), \
+        path.write_text(f'123 sid {BIRTH}')
+        with mock.patch.object(taskq, 'process_identity', return_value=('running', NEXT_BIRTH)), \
                 mock.patch.object(taskq, 'stop_process') as stop, \
                 mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as archive, \
                 mock.patch.object(taskq, 'cmd_tick') as tick, mock.patch.object(taskq.time, 'sleep') as sleep:
             codex.retire(lambda *args: True)
-            taskq.event_pass(type('Args', (), {'after': 123, 'after_birth': 'windows:1'})())
+            taskq.event_pass(type('Args', (), {'after': 123, 'after_birth': BIRTH})())
             stop.assert_not_called()
             sleep.assert_not_called()
             tick.assert_called_once()
@@ -2280,7 +2323,7 @@ class RuntimeProcessBoundary(Base):
             self.assertFalse(path.exists())
 
     def test_turn_end_unknown_identity_refuses_dispatch(self):
-        for birth in (None, '-', 'windows:1'):
+        for birth in (None, '-', 'windows:1', BIRTH):
             with mock.patch.object(taskq, 'process_identity', return_value=('unknown', None)), \
                     mock.patch.object(taskq, 'cmd_tick') as tick, contextlib.redirect_stderr(io.StringIO()), \
                     self.assertRaises(SystemExit):
@@ -2872,7 +2915,7 @@ class Cleanup(Base):
             self.board.issues[n]['state'] = 'closed'
         self.fake.sessions.update({'s-T1': False, 's-T2': True, 's-T3': False, 's-T4': False})  # #1's worker died; #2's still runs
         self.board.issues[3]['comments'].append('**spawn** · fake:tick\n\nhttps://watch/s-T3')  # #478: recorded; s-T4: a name only
-        (self.root / '.taskq' / 'S2.pid').write_text('999999999 old windows:1')
+        (self.root / '.taskq' / 'S2.pid').write_text(f'999999999 old {BIRTH}')
         (self.root / '.taskq' / 'wait.json').write_text('{"1": "doing", "2": "review"}')
 
     def state(self):
@@ -3251,7 +3294,7 @@ def link(session): return None
             parsed = taskq.parse(saved['2'])
             saved['2']['body'] = taskq.block('g', {**parsed['raw'], 'order': 'run'})
             (root / 'issues.json').write_text(json.dumps(saved))
-            launcher = "import taskq; taskq.CONFIG=taskq.load_config(); taskq.dispatch('turn end', [], after=2147483647, after_birth='windows:1')"
+            launcher = "import taskq; taskq.CONFIG=taskq.load_config(); taskq.dispatch('turn end', [], after=2147483647, after_birth=taskq.process_domain()+':1'+(':0' if taskq.sys.platform=='darwin' else ''))"
             done = REAL_RUN([sys.executable, '-c', launcher], cwd=root, env=env, capture_output=True, text=True, timeout=20)
             self.assertEqual(done.returncode, 0, done.stderr)
             completed()

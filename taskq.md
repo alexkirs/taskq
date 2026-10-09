@@ -353,6 +353,11 @@ the id the board records, never by its name, never while it runs (#478).
 Changed (owner-approved audit, 2026-10-10): Codex PID-only ownership -> Windows creation time, Linux
 boot ID/start time, or macOS libproc start seconds/microseconds. Termination pins a Windows process handle
 or Linux pidfd before verifying identity.
+Process ownership also requires the local OS/host domain: Linux boot UUID, or a SHA-256 of the native
+Windows/macOS hostname. A different OS, boot or hostname domain means unknown, even if that local PID
+is absent. Birth mismatch means dead only inside the same domain. Earlier Windows/macOS tokens without
+a hostname domain remain unknown. Hostname hashing distinguishes ordinary hosts, not cloned hostnames
+or an authenticated machine identity; renamed hosts require explicit handle reconciliation.
 Legacy PID-only handles, unreadable identity and unsupported platforms stay unknown and are preserved;
 cleanup never deletes them or signals their PID. macOS confirms liveness and turn-end with libproc;
 running-process termination is refused because no stable signal handle is implemented. Stopped macOS

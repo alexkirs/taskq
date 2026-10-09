@@ -549,13 +549,36 @@ def windows_process(pid, terminate=False):
         kernel.CloseHandle(handle)
 
 
+def process_domain(platform=None):
+    """Local observation domain; a foreign OS/host PID cannot prove the recorded process died."""
+    platform = platform or ('windows' if os.name == 'nt' else sys.platform)
+    try:
+        if platform == 'linux':
+            boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            return f'linux:{boot}' if re.fullmatch(r'[0-9a-f-]{36}', boot) else None
+        if platform in ('windows', 'darwin'):
+            hostname = socket.gethostname().strip().casefold()
+            return f'{platform}:{hashlib.sha256(hostname.encode()).hexdigest()}' if hostname else None
+    except OSError:
+        pass
+    return None
+
+
+def birth_domain(birth):
+    if not isinstance(birth, str) or not re.fullmatch(
+            r'(?:windows:[0-9a-f]{64}:\d+|linux:[0-9a-f-]{36}:\d+|darwin:[0-9a-f]{64}:\d+:\d+)', birth):
+        return None
+    return ':'.join(birth.split(':')[:2])
+
+
 def windows_birth(kernel, handle):
     import ctypes
     from ctypes import wintypes
     times = [wintypes.FILETIME() for _ in range(4)]
     if not kernel.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
         raise OSError('GetProcessTimes failed')
-    return f'windows:{(times[0].dwHighDateTime << 32) | times[0].dwLowDateTime}'
+    domain = process_domain('windows')
+    return f'{domain}:{(times[0].dwHighDateTime << 32) | times[0].dwLowDateTime}' if domain else None
 
 
 def darwin_identity(pid):
@@ -578,7 +601,8 @@ def darwin_identity(pid):
         return 'dead', None
     if size != ctypes.sizeof(info) or info.pid != pid or not info.start_sec or info.start_usec >= 1000000:
         return 'unknown', None
-    return ('dead' if info.status == 5 else 'running'), f'darwin:{info.start_sec}:{info.start_usec}'
+    domain = process_domain('darwin')
+    return (('dead' if info.status == 5 else 'running'), f'{domain}:{info.start_sec}:{info.start_usec}') if domain else ('unknown', None)
 
 
 def process_identity(pid):
@@ -597,15 +621,14 @@ def process_identity(pid):
         if sys.platform == 'darwin':
             return darwin_identity(pid)
         if sys.platform == 'linux':
-            try:
-                boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
-            except OSError:
+            domain = process_domain('linux')
+            if domain is None:
                 return 'unknown', None
             try:
                 fields = Path(f'/proc/{pid}/stat').read_text().rpartition(')')[2].split()
             except FileNotFoundError:
                 return 'dead', None
-            return ('dead' if fields[0] in ('Z', 'X') else 'running'), f'linux:{boot}:{fields[19]}'
+            return ('dead' if fields[0] in ('Z', 'X') else 'running'), f'{domain}:{fields[19]}'
     except ProcessLookupError:
         return 'dead', None
     except (OSError, ValueError, IndexError):
@@ -614,9 +637,12 @@ def process_identity(pid):
 
 
 def process_state(pid, birth):
-    if not isinstance(birth, str) or not re.fullmatch(r'(?:windows:\d+|linux:[0-9a-f-]{36}:\d+|darwin:\d+:\d+)', birth):
-        return 'unknown'  # legacy handle: preserve even when its bare PID is absent
+    domain = birth_domain(birth)
+    if domain is None or domain != process_domain():
+        return 'unknown'  # legacy/foreign ownership is never inferred from a local PID or its absence
     state, actual = process_identity(pid)
+    if state == 'unknown' or state == 'running' and actual is None or actual is not None and birth_domain(actual) != domain:
+        return 'unknown'
     return 'dead' if actual is not None and actual != birth else state
 
 

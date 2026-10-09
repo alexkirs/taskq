@@ -2,7 +2,7 @@
 
 taskq is a task queue on an issue board (GitHub or GitLab). One file, `taskq.py`: stdlib only, python3 >= 3.9.
 This file is the whole contract, for every agent (manager or worker) on every runtime (Claude, Codex, other).
-Below, `taskq` means `python3 <taskq clone>/taskq.py` (or the alias of the README). Run it from the project's
+Below, `taskq` means `python3 <taskq clone>/taskq.py` (or its alias, § 1). Run it from the project's
 checkout: it reads the nearest `taskq.json` from the current directory up; that folder is the project root.
 
 ## Principles (R1–R13)
@@ -139,7 +139,9 @@ Every agent (Claude, Codex, DOT, Hermes, other) reads this file before work; `AG
 
 Owner decisions on what taskq looks and sounds like, one line each (#505). Change one only per R13.
 
-- README first screen: the header picture, the tagline, the 3 steps; nothing else, Tight style (#505, #27, #78).
+- README is the whole page: header, tagline, 3 steps, Mix agents, one link to taskq.md, license, donate; nothing else.
+  Install, setup, commands and development live in taskq.md (#513).
+  Changed: "README first screen: the header picture, the tagline, the 3 steps; nothing else" → the whole page (#513).
 - Header: `docs/header.webp` with the caption `Agents working.` stays at the top, verbatim (#16; lost twice: #27, #33).
 - Tagline: a few short lines of what taskq is, above the steps, no jargon (#106, owner's variant 2).
 - Steps: set up, start working, talk to the manager; phrases the owner tells the agent (#78, variant A; #27, #33).
@@ -150,14 +152,20 @@ Owner decisions on what taskq looks and sounds like, one line each (#505). Chang
 
 ## 1. Setup (once per project)
 
-1. python3 >= 3.9; `gh` (GitHub) or `glab` (GitLab) installed and logged in: `gh auth status` / `glab auth status`.
-2. `git clone https://github.com/alexkirs/taskq` anywhere; `taskq.py` is the only file it needs. Update: `git pull`.
+1. python3 >= 3.9, git; `gh` (GitHub) or `glab` (GitLab) installed and logged in: `gh auth status` / `glab auth status`.
+   Workers need the `claude` and/or `codex` CLI.
+2. `git clone https://github.com/alexkirs/taskq ~/taskq`; `taskq.py` is the only file it needs. Alias:
+   `ln -s ~/taskq/taskq.py ~/.local/bin/taskq` or `alias taskq='python3 ~/taskq/taskq.py'` (Windows: § 9).
+   Update: `git pull` in the clone; `taskq tick` and `taskq wait` pull it themselves, so keep it on clean `main`.
 3. At the project root write `taskq.json` (fields: § 2) and commit it. Labels are created by the first `add`.
 4. Check: `taskq list` prints the queue (empty is fine) and no error. Claude workers: run `claude` once in the
    project root and accept the folder trust prompt (only the owner can); else every spawn fails `Workspace not trusted`.
    Log in once with the same `claude` the tick starts: `claude auth login`. Codex workers: `codex login` once; they
-   use your Codex model and config.
-5. Another board or runtime: copy the GitHub class or the Claude class of `taskq.py` into `boards/<name>.py` or
+   use your Codex model and config. Add `.taskq/` and `.worktrees/` to the project's `.gitignore`.
+5. Try it: `taskq pm` in your agent session (it takes the manager role), `taskq arm tick`, then
+   `taskq add "Try taskq" --type research --goal "Reply: taskq works. No file changes." --acceptance "The result says: taskq works."`;
+   the worker hands in (`taskq list` shows `review`); accept with `taskq close N --text "Checked the reply."`.
+6. Another board or runtime: copy the GitHub class or the Claude class of `taskq.py` into `boards/<name>.py` or
    `runtimes/<name>.py` as module-level functions (§ 2), and name the file in `taskq.json`.
 
 ## 2. Configuration: taskq.json
@@ -528,5 +536,5 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 ## 10. Develop taskq itself
 
 Every session on a machine runs the clone's `taskq.py`: keep that clone on clean `main` and change taskq only in a
-worktree (`.worktrees/<branch>`); `tick` and `wait` pull a clean clone (§ 7). Tests: `python3 -m unittest tests.test_single`; CI runs them on every push.
+worktree (`git worktree add -b <branch> .worktrees/<branch> origin/main`); `tick` and `wait` pull a clean clone (§ 7). Tests: `python3 -m unittest tests.test_single`; CI runs them on every push.
 Design: [docs/single-file.md](docs/single-file.md).

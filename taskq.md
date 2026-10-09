@@ -136,6 +136,9 @@ the queue to move; a separate sender is only one way to wake a manager that cann
 Changed: dispatch eligibility used only host/PM/filter routing → an `assignee-only` task also needs the authenticated
 board identity, judged on a fresh read of the task (never the list, whose labels may lag) before every start,
 continuation or session send; manual `take` uses the same policy (#545, #576).
+Changed: host routing always included unlabelled tasks and worker limits came only from shared configuration →
+optional inherited `TASKQ_HOST_ONLY` and `TASKQ_LIMITS` constrain one invocation and its descendants (#604, § 2).
+Absent these variables, routing and limits retain their defaults. Board PM/controller authority never changes.
 
 Changed: Hermes wait had no native wake → the current Hermes manager, only with a same-bridge owned handle
 and confirmed idle state, receives the wait outcome before its existing wait receipt is written. Wake failure
@@ -452,6 +455,25 @@ not replace the isolated spawn, naming, result and retirement qualification requ
 | `board_url` | Board link a board file prints in the tick | GitHub/GitLab issues page |
 | `inline_media` | `false`: the Questions of the report (R6) print image links as plain links, not `![](url)` (where the surface does not render them) | `true` |
 | `assignee` | `"me"` (the board's logged-in user) or a login: `tick` starts, and `tick`/`wait`/`list` show, only tasks assigned to it; unassigned tasks are skipped (#480) | unset: every task |
+
+Invocation-local admission (#604): `TASKQ_HOST_ONLY=win` requires this machine to resolve to `win` and
+the task to carry exactly `host-win` (no other `host-*` label). Unlabelled and other-host tasks are left alone,
+including their claims, orders and sessions. The pass checks fresh reads before starting or continuing a task;
+its waiting-to-ready step and automatic retirement use the same scope. Manual `take` also requires the host.
+`TASKQ_LIMITS='{"codex":5}'` replaces worker limits for this invocation: omitted runtimes have zero slots,
+including explicit `run-*` tasks and pending supervisor worker orders. It is a nonempty JSON object of runtime
+names to nonnegative integers; invalid values or a host/machine mismatch fail before board writes or dispatch.
+Existing local reservations and active workers still consume slots even outside the host scope; accounting reads
+their current board claims under the dispatch lock, not the potentially stale list. A later read showing a changed
+state, PM, claim, supervisor or order stops that task's step without overwriting it. Lowering a limit
+never stops a session or drops a claim: active workers continue; pending workers wait for capacity, in task priority
+and number order. The supervisor's runtime still follows its board PM (R3), independent of worker limits.
+Both variables are ordinary inherited environment, retained by native worker launches, event children and Codex
+turn-end children. Set them on the invoking process/session, not in shared `taskq.json`; no persistent profile,
+board field or new authority is written. They apply only to that process tree, not already-running controllers
+or independent invocations. Custom runtime adapters must preserve them when launching descendants.
+On Windows, set `$env:TASKQ_HOST='win'`, `$env:TASKQ_HOST_ONLY='win'` and `$env:TASKQ_LIMITS='{"codex":5}'`
+in the intended invocation shell. Setting these values alone starts no queue and adopts no tasks.
 
 Board file: six module-level functions. An issue is a dict `{iid, title, body, labels, state: open|closed,
 updated_at, url}`, optionally `assignees` (logins); `get` adds `comments` (a list of strings, oldest first).
@@ -1044,6 +1066,8 @@ supported explicit named profile and disposable local-only Git fetch (owner corr
 
 ## 9. Windows
 
+- CLI stdout and stderr use UTF-8, including redirected pipes and detached dispatch logs. This keeps Unicode
+  task titles and the contract readable on hosts whose default redirected encoding is a legacy code page (#604).
 - Run `py -3 <clone>\taskq.py` or `python <clone>\taskq.py`; a PowerShell function is the alias:
   `function taskq { python C:\src\taskq\taskq.py @args }` in `$PROFILE`.
 - `gh`, `glab`, `claude` (`claude.cmd`), `codex` and `git` are found on `PATH`; no bash is needed by taskq.

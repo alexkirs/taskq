@@ -66,8 +66,12 @@ class Base(unittest.TestCase):
         self.root = Path(folder.name)
         taskq.CONFIG = {'board': 'github', 'publish': 'direct', 'root': self.root, 'hosts': {}}
         real = lambda *_, **__: self.fail('a test started a real process')  # a test fakes subprocess.run where it needs one
+        env = {'CLAUDE_CODE_SESSION_ID': SESSION, 'TASKQ_RUNTIME': 'claude', 'TASKQ_HOST': 'mac'}
+        if os.name == 'nt':  # Windows has no /usr/bin fallback after clear=True; preserve only the native git directory
+            git = taskq.shutil.which('git')
+            env.update(PATH=str(Path(git).parent) if git else '', SYSTEMROOT=os.environ['SYSTEMROOT'])
         for patcher in (
-                mock.patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': SESSION, 'TASKQ_RUNTIME': 'claude', 'TASKQ_HOST': 'mac'}, clear=True),
+                mock.patch.dict(os.environ, env, clear=True),
                 mock.patch.object(taskq, 'runtimes', return_value={}),  # no real worker from an event's dispatch
                 mock.patch.object(taskq, 'start_pass', lambda command, **_: taskq.main(command[2:])),  # the child's pass, in process
                 mock.patch.object(taskq, 'datetime', FixedNow),
@@ -725,6 +729,190 @@ class TickSetup(Base):
 
 
 class Tick(TickSetup):
+
+    def test_local_limits_replace_defaults_and_reserve_five_codex_slots(self):
+        taskq.CONFIG['limits'] = {'fake': 8, 'codex': 1}
+        with mock.patch.object(taskq, 'dispatch'):
+            for n in range(7):
+                self.add(str(n), '--runtime', 'codex', '--host', 'mac')
+            self.add('other runtime', '--runtime', 'fake', '--host', 'mac')
+            self.add('any', '--host', 'mac')
+        config = dict(taskq.CONFIG['limits'])
+        with mock.patch.dict(os.environ, {'TASKQ_LIMITS': '{"codex":5}', 'TASKQ_HOST_ONLY': 'mac'}), \
+                mock.patch.object(taskq, 'runtimes', return_value={'fake': self.fake, 'codex': self.fake}):
+            self.run_cli('tick')
+            self.assertEqual([self.task(n)['state'] for n in range(1, 10)], ['doing'] * 5 + ['ready'] * 4)
+            self.assertTrue(all(self.task(n)['claim']['runtime'] == 'codex' for n in range(1, 6)))
+            self.assertTrue(all(self.task(n)['supervisor']['runtime'] == 'fake' for n in range(1, 6)))
+            for n in range(1, 6):
+                with self.acting(f's-S{n}'):
+                    self.run_cli('run', str(n))
+            self.assertEqual(len([name for name in self.fake.names if name.startswith('T')]), 5)
+            self.assertEqual(taskq.worker_env()['TASKQ_LIMITS'], '{"codex":5}')
+            self.assertEqual(taskq.worker_env()['TASKQ_HOST_ONLY'], 'mac')
+        self.assertEqual(taskq.CONFIG['limits'], config)
+
+    def test_strict_host_preserves_unlabelled_foreign_and_conflicting_tasks(self):
+        with mock.patch.object(taskq, 'dispatch'):
+            self.add('unlabelled')
+            self.add('foreign', '--host', 'win')
+            self.add('conflicting', '--host', 'mac')
+            self.board.issues[3]['labels'].append('host-win')
+            self.add('wanted', '--host', 'mac')
+            self.legacy(1)
+            self.fake.sessions['s-T1'] = False  # strict pass must not requeue or retire this foreign-scope session
+        before = json.dumps({n: self.board.issues[n] for n in (1, 2, 3)}, sort_keys=True)
+        taskq.CONFIG['limits'] = {'fake': 2}
+        with mock.patch.dict(os.environ, {'TASKQ_HOST_ONLY': 'mac'}):
+            self.run_cli('tick')
+            self.assertEqual(self.task(4)['state'], 'doing')
+            self.assertEqual(json.dumps({n: self.board.issues[n] for n in (1, 2, 3)}, sort_keys=True), before)
+            self.assertFalse(taskq.stale({})('fake', 1, 's-T1', False))
+            with self.assertRaisesRegex(SystemExit, 'outside TASKQ_HOST_ONLY'):
+                self.run_cli('take', '2')
+
+    def test_strict_host_rechecks_stale_list_and_pending_worker_order(self):
+        with mock.patch.object(taskq, 'dispatch'):
+            self.add('wanted', '--host', 'mac')
+        listed = json.loads(json.dumps(self.board.list(None)))
+        self.board.issues[1]['labels'].remove('host-mac')
+        with mock.patch.dict(os.environ, {'TASKQ_HOST_ONLY': 'mac'}), mock.patch.object(self.board, 'list', return_value=listed):
+            self.run_cli('tick')
+        self.assertEqual(getattr(self.fake, 'names', []), [])
+        self.board.issues[1]['labels'].append('host-mac')
+        self.run_cli('tick')
+        with mock.patch.object(taskq, 'dispatch'), self.acting('s-S1'):
+            self.run_cli('run', '1')
+        listed = json.loads(json.dumps(self.board.list(None)))
+        self.board.issues[1]['labels'].remove('host-mac')
+        before = json.dumps(self.board.issues, sort_keys=True)
+        with mock.patch.dict(os.environ, {'TASKQ_HOST_ONLY': 'mac'}), mock.patch.object(self.board, 'list', return_value=listed):
+            self.run_cli('tick')
+        self.assertEqual(self.fake.names, ['S1 UNK wanted (mac)'])
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+
+    def test_local_limits_hold_pending_orders_without_rebinding_claims(self):
+        taskq.CONFIG['limits'] = {'fake': 3}
+        for n in range(3):
+            self.add(str(n))
+        with mock.patch.object(taskq, 'dispatch'):
+            for n in range(1, 4):
+                with self.acting(f's-S{n}'):
+                    self.run_cli('run', str(n))
+        before = self.task(2)['claim'].copy()
+        with mock.patch.dict(os.environ, {'TASKQ_LIMITS': '{"fake":1}'}):
+            self.run_cli('tick')
+            self.assertEqual(self.task(1)['claim']['session'], 's-T1')
+            self.assertEqual(self.task(2)['claim'], before)
+            self.assertEqual(self.task(2)['raw']['order'], 'run')
+            self.assertEqual(self.task(3)['claim']['session'], None)
+        with mock.patch.dict(os.environ, {'TASKQ_LIMITS': '{"codex":5}'}):
+            self.run_cli('tick')
+            self.assertEqual(self.task(2)['claim'], before)
+            self.assertEqual(self.task(2)['raw']['order'], 'run')
+            self.assertTrue(self.fake.sessions['s-T1'])
+
+    def test_local_limits_count_fresh_active_claims_before_pending_admission(self):
+        taskq.CONFIG['limits'] = {'fake': 2}
+        for n in range(2):
+            self.add(str(n), '--host', 'mac')
+        with mock.patch.object(taskq, 'dispatch'):
+            for n in (1, 2):
+                with self.acting(f's-S{n}'):
+                    self.run_cli('run', str(n))
+        listed = json.loads(json.dumps(self.board.list(None)))  # both listed as pending, but #2 has since started
+        current = self.task(2)
+        active = {**current['claim'], 'session': 's-T2'}
+        self.board.issues[2]['body'] = taskq.block('g', {**current['raw'], 'claim': active, 'order': None})
+        self.fake.sessions['s-T2'] = True
+        # An active worker outside this invocation's strict host scope still consumes the local capacity.
+        for outside_scope in (False, True):
+            with self.subTest(outside_scope=outside_scope):
+                if outside_scope:
+                    self.board.issues[2]['labels'].remove('host-mac')
+                before = json.dumps(self.board.issues, sort_keys=True)
+                with mock.patch.dict(os.environ, {'TASKQ_LIMITS': '{"fake":1}', 'TASKQ_HOST_ONLY': 'mac'}), \
+                        mock.patch.object(self.board, 'list', return_value=listed):
+                    self.run_cli('tick')
+                self.assertEqual(self.task(1)['claim']['session'], None)
+                self.assertEqual(self.task(1)['raw']['order'], 'run')
+                self.assertEqual(self.task(2)['claim'], active)
+                self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+                self.assertFalse(any(name.startswith('T') for name in self.fake.names))
+
+    def test_local_scope_reports_and_protects_newly_spawned_supervisor(self):
+        with mock.patch.object(taskq, 'dispatch'):
+            self.add('new', '--host', 'mac')
+        retireable = []
+        def retire(gone, *args, **kwargs):
+            retireable.append(gone('fake', 1, 's-S1', False))
+        with mock.patch.dict(os.environ, {'TASKQ_HOST_ONLY': 'mac', 'TASKQ_LIMITS': '{"fake":1}'}), \
+                mock.patch.object(taskq, 'retire', retire):
+            report = self.run_cli('tick')
+        self.assertEqual(retireable, [False])  # even if the new supervisor's first turn already stopped
+        self.assertEqual(self.task(1)['supervisor']['session'], 's-S1')
+        self.assertIn('In work 1 · Waiting for answer 0 · Ready 0', report)
+        self.assertIn('| [#1 new](https://board/1) | doing | fake | [s-S1](https://watch/s-S1) |', report)
+
+    def test_retirement_fresh_read_keeps_current_open_sessions(self):
+        self.add('owned', '--host', 'mac')
+        earlier = self.task(1)
+        for field in ('claim', 'supervisor'):
+            with self.subTest(field=field):
+                current = {**earlier['raw'], field: {'runtime': 'fake', 'session': 'fresh-session', 'name': 'mac'}}
+                self.board.issues[1]['body'] = taskq.block('g', current)
+                for state, retireable in (('open', False), ('closed', True)):
+                    with self.subTest(state=state), mock.patch.dict(os.environ, {'TASKQ_HOST_ONLY': 'mac'}):
+                        self.board.issues[1]['state'] = state
+                        self.assertEqual(taskq.stale({1: earlier})('fake', 1, 'fresh-session', False), retireable)
+                self.board.issues[1]['state'] = 'open'
+
+    def test_local_scope_never_overwrites_fresh_foreign_execution(self):
+        with mock.patch.object(taskq, 'dispatch'):
+            self.add('owned', '--host', 'mac')
+            self.legacy(1)
+        original = json.loads(json.dumps(self.board.issues[1]))
+        for state in ('doing', 'waiting'):
+            for changed_read in (1, 2):  # stale list, then a change after the accounting refresh but before action
+                with self.subTest(state=state, changed_read=changed_read):
+                    self.board.issues[1] = json.loads(json.dumps(original))
+                    if state == 'waiting':
+                        self.board.issues[1]['labels'].remove('q-doing')
+                        self.board.issues[1]['labels'].append('q-waiting')
+                    listed = json.loads(json.dumps(self.board.list(None)))
+                    current = self.task(1)
+                    foreign = json.loads(json.dumps(self.board.issues[1]))
+                    foreign['labels'] = [label for label in foreign['labels'] if not label.startswith('q-')] + ['q-doing']
+                    foreign['body'] = taskq.block('g', {**current['raw'], 'order': 'run',
+                        'claim': {'runtime': 'fake', 'session': 'foreign-session', 'name': 'other-host'},
+                        'pm': {'runtime': 'fake', 'session': 'foreign-manager', 'name': 'other-host'}})
+                    reads = 0
+                    def get(n):
+                        nonlocal reads
+                        reads += 1
+                        if reads == changed_read:
+                            self.board.issues[1] = foreign
+                        return dict(self.board.issues[n])
+                    self.fake.sessions['s-T1'] = False
+                    with mock.patch.dict(os.environ, {'TASKQ_HOST_ONLY': 'mac', 'TASKQ_LIMITS': '{"fake":1}'}), \
+                            mock.patch.object(self.board, 'list', return_value=listed), mock.patch.object(self.board, 'get', get), \
+                            mock.patch.object(self.fake, 'alive', side_effect=AssertionError('foreign liveness queried')), \
+                            mock.patch.object(self.fake, 'spawn', side_effect=AssertionError('foreign claim replaced')), \
+                            mock.patch.object(self.fake, 'send', side_effect=AssertionError('foreign session sent to')):
+                        self.run_cli('tick')
+                    self.assertEqual(self.board.issues[1], foreign)
+
+    def test_invalid_local_scope_fails_before_mutation_or_dispatch(self):
+        for value in ('', '{}', '[]', '{"codex":true}', '{"codex":-1}', '{"codex":1.5}', '{"":5}'):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {'TASKQ_LIMITS': value}), \
+                    mock.patch.object(taskq, 'dispatch') as dispatch, self.assertRaisesRegex(SystemExit, 'TASKQ_LIMITS'):
+                self.add()
+            dispatch.assert_not_called()
+            self.assertEqual(self.board.issues, {})
+        for host in ('', 'win'):
+            with mock.patch.dict(os.environ, {'TASKQ_HOST_ONLY': host}), self.assertRaisesRegex(SystemExit, 'TASKQ_HOST_ONLY'):
+                self.add()
+            self.assertEqual(self.board.issues, {})
 
     def test_spawn_one_per_free_slot(self):
         # #525 (R2, R3): a ready task gets one supervisor in the manager's runtime; its worker's slot is held from then on
@@ -1453,11 +1641,14 @@ class Tick(TickSetup):
         server = folder / 'codex'
         server.write_text(f'#!{sys.executable}\n' + APP_SERVER)
         server.chmod(0o755)
+        # Windows does not execute a shebang: use the real Python process for this same fake stdio server.
+        def launch(command, **kwargs):
+            return REAL_POPEN(([sys.executable, *command] if os.name == 'nt' else command), **kwargs)
         cases = {'ok': None, 'set-error': 'thread/name/set: ', 'wrong-name': "thread/read: th named 'other'",
                  'silent': 'initialize: no reply', 'hang': None}
         for mode, error in cases.items():
             log = folder / f'{mode}.log'
-            with self.subTest(mode), mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN), \
+            with self.subTest(mode), mock.patch.object(taskq.subprocess, 'Popen', launch), \
                     mock.patch.object(taskq.shutil, 'which', return_value=str(server)), mock.patch.object(taskq.Codex, 'WAIT', 2), \
                     mock.patch.dict(os.environ, {'FAKE_MODE': mode, 'FAKE_LOG': str(log)}):
                 began = taskq.time.monotonic()
@@ -2006,7 +2197,7 @@ class MultiPM(Base):
         self.assertEqual(self.notes(1), ['**add**', '**adopt**'])  # one adoption, B wrote nothing
     def test_concurrent_adoption_clis_one_wins(self):
         # bounded real evidence: two `taskq pm --adopt 1` processes at once on a file board with a slow read; exactly one wins
-        (self.root / 'taskq.json').write_text('{"board": "board.py", "limits": {"claude": 0, "codex": 0}}')
+        (self.root / 'taskq.json').write_text('{"board": "board.py", "update": false, "limits": {"claude": 0, "codex": 0}}')
         (self.root / 'board.py').write_text(textwrap.dedent('''
             import json, time
             from pathlib import Path
@@ -2028,7 +2219,7 @@ class MultiPM(Base):
             self.add('one', '--runtime', 'fake')
         (self.root / 'issues.json').write_text(json.dumps({'1': {**self.board.issues[1], 'iid': 1}}))
         script = Path(taskq.__file__).resolve()
-        procs = [REAL_POPEN([sys.executable, str(script), 'pm', '--adopt', '1'], cwd=self.root, text=True,
+        procs = [REAL_POPEN([sys.executable, str(script), 'pm', '--adopt', '1'], cwd=self.root, text=True, encoding='utf-8',
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
                             'TASKQ_HOST': 'mac', 'HOME': str(self.root), **env}) for env in (self.A, self.B)]
         outs = [proc.communicate(timeout=30) for proc in procs]
@@ -2429,6 +2620,95 @@ def link(session): return None
 
 class RealChild(unittest.TestCase):
     """#481: `add` in a real process starts the real detached `tick --quiet` child; it spawns and logs, though the list lags the add."""
+
+    def test_native_redirected_unicode_report_and_cli_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'taskq.py').write_text((ROOT / 'taskq.py').read_text('utf-8'), encoding='utf-8')
+            (root / 'board.py').write_text(FILE_BOARD, encoding='utf-8')
+            (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'update': False, 'board_url': 'https://board'}))
+            issue = {'iid': 1, 'title': 'Привет 🌍', 'body': taskq.block('g', {'deps': []}), 'labels': ['q-ready'],
+                     'state': 'open', 'listed': True, 'comments': [], 'updated_at': '2026-10-09T00:00:00Z', 'url': ''}
+            (root / 'issues.json').write_text(json.dumps({'1': issue}))
+            env = {'PATH': '', 'HOME': str(root), 'TASKQ_HOST': 'win',
+                   'PYTHONIOENCODING': 'cp1252' if os.name == 'nt' else 'utf-8'}
+            if os.name == 'nt':
+                env['SYSTEMROOT'] = os.environ['SYSTEMROOT']
+            for command, code, stream, expected in (('status', 0, 'stdout', 'Привет 🌍'), ('💥', 2, 'stderr', '💥')):
+                with self.subTest(command=command):
+                    done = REAL_RUN([sys.executable, str(root / 'taskq.py'), command], cwd=root, env=env,
+                                    capture_output=True, timeout=20)
+                    self.assertEqual(done.returncode, code, done.stderr)
+                    self.assertIn(expected, getattr(done, stream).decode('utf-8'))
+                    self.assertNotIn(b'UnicodeEncodeError', done.stderr)
+
+    def test_local_scope_survives_native_event_and_turn_end_children(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            # The completion marker is after the actual child's main(), not a sleep or spawn-return oracle.
+            source = (ROOT / 'taskq.py').read_text('utf-8')
+            (root / 'taskq.py').write_text(source + "\nif __name__ == '__main__' and sys.argv[1] == 'tick':\n"
+                                         "    (Path.cwd() / 'completed').write_text('done')\n", encoding='utf-8')
+            (root / 'board.py').write_text(FILE_BOARD, encoding='utf-8')
+            (root / 'fake.py').write_text('''import json, os, pathlib
+def spawn(name, prompt, cwd):
+    with pathlib.Path(__file__).with_name('spawned').open('a') as out:
+        out.write(json.dumps([name, os.environ.get('TASKQ_HOST_ONLY'), os.environ.get('TASKQ_LIMITS')]) + '\\n')
+    return 's-' + name.split()[0]
+def send(session, text): return session
+def alive(session): return True
+def link(session): return None
+''', encoding='utf-8')
+            config = json.dumps({'board': 'board.py', 'update': False, 'runtimes': {'fake': 'fake.py', 'codex': 'fake.py'},
+                                 'limits': {'fake': 8, 'codex': 1}})
+            (root / 'taskq.json').write_text(config)
+            issues = {}
+            for n, labels in enumerate((['host-win'], ['host-win'], ['host-win'], [], ['host-mac'],
+                                       ['host-win', 'run-fake'], ['host-win', 'host-mac']), 1):
+                issues[str(n)] = {'iid': n, 'title': f'T{n}', 'body': taskq.block('g', {'deps': [], 'pm':
+                                 {'runtime': 'fake', 'session': SESSION, 'name': 'win'}}), 'labels': ['q-ready', 'priority-2', *labels],
+                                 'state': 'open', 'listed': True, 'comments': [],
+                                 'updated_at': '2026-10-09T00:00:00Z', 'url': ''}
+            (root / 'issues.json').write_text(json.dumps(issues))
+            env = {'PATH': '', 'HOME': str(root), 'TASKQ_HOST': 'win', 'TASKQ_RUNTIME': 'fake',
+                   'TASKQ_HOST_ONLY': 'win', 'TASKQ_LIMITS': '{"codex":2}'}
+            if os.name == 'nt':
+                env['SYSTEMROOT'] = os.environ['SYSTEMROOT']
+
+            def invoke(*args):
+                done = REAL_RUN([sys.executable, str(root / 'taskq.py'), *args], cwd=root, env=env,
+                                capture_output=True, text=True, timeout=20)
+                self.assertEqual(done.returncode, 0, done.stderr)
+
+            def completed():
+                end = taskq.time.monotonic() + 20
+                while not (root / 'completed').exists() and taskq.time.monotonic() < end:
+                    taskq.time.sleep(0.05)
+                self.assertTrue((root / 'completed').exists(), (root / '.taskq' / 'dispatch.log').read_text())
+                (root / 'completed').unlink()
+
+            invoke('add', 'event', '--goal', 'g', '--acceptance', 'a', '--host', 'win')
+            completed()
+            saved = json.loads((root / 'issues.json').read_text())
+            self.assertEqual([taskq.parse(saved[str(n)])['state'] for n in range(1, 9)], ['doing'] * 2 + ['ready'] * 6)
+            for n in range(3, 8):
+                self.assertEqual(saved[str(n)], issues[str(n)])
+            invoke('run', '1')  # the real detached event now admits the first reserved worker
+            completed()
+            self.assertEqual(taskq.parse(json.loads((root / 'issues.json').read_text())['1'])['claim']['session'], 's-T1')
+            # A real turn-end child takes --after, uses the same inherited scope, and admits the second order.
+            saved = json.loads((root / 'issues.json').read_text())
+            parsed = taskq.parse(saved['2'])
+            saved['2']['body'] = taskq.block('g', {**parsed['raw'], 'order': 'run'})
+            (root / 'issues.json').write_text(json.dumps(saved))
+            launcher = "import taskq; taskq.CONFIG=taskq.load_config(); taskq.dispatch('turn end', [], after=2147483647)"
+            done = REAL_RUN([sys.executable, '-c', launcher], cwd=root, env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            completed()
+            spawned = [json.loads(line) for line in (root / 'spawned').read_text().splitlines()]
+            self.assertEqual([entry[0].split()[0] for entry in spawned], ['S1', 'S2', 'T1', 'T2'])
+            self.assertTrue(all(entry[1:] == ['win', '{"codex":2}'] for entry in spawned))
+            self.assertEqual((root / 'taskq.json').read_text(), config)
 
     def test_assignee_only_cli_board_runtime_boundary(self):
         with tempfile.TemporaryDirectory() as folder:

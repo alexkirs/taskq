@@ -914,16 +914,16 @@ class Tick(TickSetup):
     def test_assignee_only_latest_snapshot_before_send_and_spawn(self):
         # #576 review 2: follow's and replace's own reads are checked: a reassignment there stops the send, retire and spawn
         original = self.board.get
-        def reassigned_after(n, reads):  # the board reassigns the task to bob right after its first `reads` reads
+        def reassigned_after(n, reads, transient):  # bob from right after the first `reads` reads; transient: for one read only
             seen = []
             def get(m):
                 issue = original(m)
                 seen.append(m)
-                if seen.count(n) == reads and m == n:
-                    self.board.issues[n]['assignees'] = ['bob']
+                if m == n and seen.count(n) in (reads, reads + transient):
+                    self.board.issues[n]['assignees'] = ['bob'] if seen.count(n) == reads else ['alice']
                 return issue
             return get
-        for case in ('unsupervised answer', 'supervised answer', 'dispatch', 'worker order'):
+        for case in ('unsupervised answer', 'supervised answer', 'dispatch', 'worker order', 'transient denial at follow'):
             with self.subTest(case=case):
                 self.board.issues.clear()
                 self.fake.names, self.fake.sent, self.fake.sessions = [], [], {}
@@ -931,20 +931,22 @@ class Tick(TickSetup):
                 n = self.restricted(['alice'])
                 if case == 'unsupervised answer':
                     self.legacy(n)
-                if case in ('supervised answer', 'worker order'):
+                if case in ('supervised answer', 'worker order', 'transient denial at follow'):
                     self.run_cli('tick')
                     self.fake.sessions['s-S%d' % n] = True  # running: no supervisor send of its own
-                if case == 'supervised answer':
+                if case in ('supervised answer', 'transient denial at follow'):
                     with self.acting('s-S%d' % n):
                         self.run_cli('run', str(n))
-                if case.endswith('answer'):
+                if case.endswith('answer') or case.startswith('transient'):
                     self.board.comment(n, '**answer** · owner\n\ngo on')
+                if case.startswith('transient'):  # #576 review 3: bob only at follow's read; the idle supervisor's answer event must wait too
+                    self.fake.sessions['s-S%d' % n] = 'idle'
                 before, names = self.task(n), list(self.fake.names)
                 if case == 'worker order':
                     with contextlib.redirect_stdout(io.StringIO()):
                         taskq.move(before, 'doing', 'run', 'run', order='run')
                     before = self.task(n)
-                with mock.patch.object(self.board, 'get', side_effect=reassigned_after(n, 1)), contextlib.redirect_stderr(io.StringIO()):
+                with mock.patch.object(self.board, 'get', side_effect=reassigned_after(n, 1, case.startswith('transient'))), contextlib.redirect_stderr(io.StringIO()):
                     self.run_cli('tick')
                 after = self.task(n)
                 self.assertEqual((self.fake.sent, self.fake.names, self.fake.stopped), ([], names, []))

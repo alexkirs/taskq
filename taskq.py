@@ -1095,10 +1095,11 @@ def tail_of(kind, sid):
         return f'no log: {error}'
 
 def follow(item, kind, claim, supervised):
-    """A live worker: an answer, a supervisor's `nudge:` comment or 120 silent minutes reach it once (step 2, step 4)."""
+    """A live worker: an answer, a supervisor's `nudge:` comment or 120 silent minutes reach it once (step 2, step 4).
+    None: this read shows the task ineligible (#576): the caller ends the task's step."""
     issue = BOARD.get(item['iid'])
     if not executable(issue):
-        return claim  # #576: a reassignment seen by this read: no send, the claim stays
+        return None  # #576: a reassignment seen by this read: no send, the claim stays
     last = (issue['comments'] or [''])[-1]
     answer = last.partition('\n\n')[2] if last.startswith('**answer**') else None  # #307: an answer wakes the worker at once
     told = last.partition('nudge:')[2].strip() if supervised and last.startswith('nudge:') else None
@@ -1134,7 +1135,8 @@ def supervise(item, kinds):
             item['claim'] = {**claim, 'session': None}
             move(item, 'doing', 'gone', f'worker {claim["session"]} is gone', claim=item['claim'])
         elif live:
-            follow(item, kind, claim, True)
+            if follow(item, kind, claim, True) is None:
+                return  # #576: no supervisor send, resume or respawn either
     state = lead_state(lead, boss['session'])
     issue = BOARD.get(n)
     if not executable(issue):
@@ -1286,7 +1288,7 @@ def one_pass(args, table=True):
                 item.update(state='ready', claim=None)
                 continue
             if state:
-                claim = follow(item, runtime, claim, False)
+                claim = follow(item, runtime, claim, False) or claim  # denied: the original claim keeps its slot
             busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
         for item in ready:
             if item['state'] != 'ready' or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']) \

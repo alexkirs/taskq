@@ -229,6 +229,8 @@ class ModelIntegration(unittest.TestCase):
         changed = json.loads(json.dumps(raw)); changed['model_turns']['worker']['runtime']['session'] = 'foreign'; cases.append(changed)
         changed = json.loads(json.dumps(raw)); changed['model_turns']['worker']['phase'] = 'bound'; cases.append(changed)
         changed = json.loads(json.dumps(raw)); changed['action_payloads']['close'] = {'id': 10}; cases.append(changed)
+        changed = json.loads(json.dumps(raw)); changed['acceptance_receipts'] = {'native': {'status': 'accepted'}}; cases.append(changed)
+        changed = json.loads(json.dumps(raw)); changed['events'].append({'id': 10, 'action': 'close', 'text': 'accepted', 'by': 'supervisor', 'recipients': [], 'acks': []}); cases.append(changed)
         changed = json.loads(json.dumps(raw)); changed['events'][-1]['by'] = 'codex:foreign'; cases.append(changed)
         for changed in cases:
             with self.subTest(changed=changed):

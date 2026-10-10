@@ -1486,6 +1486,7 @@ def rejected_result_rework(current, event_id):
             or rejection['by'] != f'{boss.get("runtime")}:{str(boss.get("session", ""))[:8]}' \
             or submitted['id'] >= event_id or not worker.get('session') \
             or raw.get('order') or (raw.get('action_payloads') or {}).get('close') \
+            or raw.get('acceptance_receipts') or any(event['action'] == 'close' for event in raw.get('events', [])) \
             or 'legacy_recovery' in raw or raw.get('model_recovery'):
         fail('rework requires an exact supervisor rejection of an open submitted result')
     history = list(raw.get('rejected_results') or [])

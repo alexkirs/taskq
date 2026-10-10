@@ -18,6 +18,19 @@ BLOCKED. No reconcile apply command is shipped. Future application needs a
 separately reviewed identity-aware transition preserving history, pending answers,
 results and receipts with guarded fresh readback and idempotent effect proof.
 
+Changed (explicit owner approval 2026-10-11, R1/R2/R12): unresolved ownership
+blocked schema conversion -> `repair --hold-legacy` may convert the wire format
+while retaining every original identity and pending payload under an immutable
+`legacy_recovery` hold. This is neither reconciliation nor proof of drain.
+All ordinary mutations, acknowledgement, resume, replacement and automatic
+retirement of the held task are refused. An independent task may execute after
+the whole board reaches current schema and finite admission readiness passes.
+This path requires reviewed qualification that participating old native writers
+use the same project guard and refuse current schema on fresh reads; unknown
+external writers remain a startup blocker. The flag is explicit transition
+consent, never a runtime-observation receipt. No release/unhold operation ships
+with this slice. Unknown heavy resources are not released or claimed absent.
+
 taskq is a task queue on an issue board (GitHub or GitLab). One file, `taskq.py`: stdlib only, python3 >= 3.9.
 This file is the whole contract, for every agent (manager or worker) on every runtime (Claude, Codex, other).
 Below, `taskq` means `python3 <taskq clone>/taskq.py` (or its alias, § 1). Run it from the project's
@@ -48,8 +61,12 @@ with a finite `model:codex` dimension. Other adapters without correlated turn bi
 this admission; no unlimited or alternate-worker fallback. Controlled-artifact is a separate
 finite tool/resource profile; its completion cannot stand in for model-turn evidence.
 
-An invocation-local limit smaller than a provisioned model capacity refuses admission;
-provision matching finite capacities explicitly, never rewrite shared authority silently.
+Changed (owner multi-host decision 2026-10-11, R1/R4): an invocation-local limit
+is the ceiling for its participating host, not the shared project. A provisioned
+host model capacity exceeding that invocation's limit refuses admission. The
+independently provisioned finite project ceiling may exceed one host's ceiling:
+Mac4 plus Windows4 may share project8. Both authorities still reserve every turn;
+neither limit rewrites the other and neither has an unlimited fallback.
 Before model launch, persist an immutable board turn intent and acquire applicable project
 then host grants. Unknown launch/binding never retries a spawn. Bind the real CLI PID/birth,
 log offset and returned native thread ID. Resume uses the same worker and binds exact pending
@@ -172,6 +189,20 @@ multiline, Unicode and empty values for result/ask/answer text and options witho
   retries stay out of its context.
 - Tick: one pass of the queue on one machine (§ 7). A helper, never a controller: it starts supervisors within free
   slots, and runs the process steps a supervisor orders (spawn, wake, liveness, retire).
+Changed (owner two-host decision 2026-10-11, R3/R6): host placement required
+the manager on that host -> explicitly delegated headless dispatch may start
+supervisors for the exact recorded remote manager. `tick --headless` requires
+owner-provisioned project config `dispatch` with exactly `pm` (native runtime,
+session, name), `hosts` (participating host names), and `board_user` (authenticated
+native board login). It preserves the PM and all existing role identities; the
+caller remains its own genuine host/session or owner's shell, never impersonates
+the PM. This mode only acts on tasks with that exact PM, emits no user table,
+does not consume manager events, and never retires unrelated sessions. Ordinary
+guard, schema, assignee, host placement, runtime and capacity checks remain in
+force. No delegation is inferred from `--quiet`, a limit or a matching runtime.
+Unlabelled tasks are platform-neutral; explicit `host-win`/`host-mac` labels are
+hard placement requirements. Conflicting host labels remain refused. This does
+not reinterpret existing placement labels without an approved task edit.
 - Supervisor `S<N>`: one per task, the task's only controller. Orders its worker's launch, follows it, reviews the
   diff and the CI of the exact head SHA, then `requeue` with the fixes, `close` (merge or publish, § 6) or `ask`;
   its last command's text is the one line the manager gets (`close`: a verdict, § 7 Supervisor 3.3). Never edits the task's code and starts no session itself.

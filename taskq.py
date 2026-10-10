@@ -129,6 +129,8 @@ def compatibility_reason(item):
         return f'#{item["iid"]}: unsupported event_schema {version!r}; writes refused'
     if version != EVENT_SCHEMA:
         return f'#{item["iid"]}: legacy event_schema {version} is read-only; review taskq repair before starting work'
+    if 'legacy_recovery' in item['raw']:
+        return f'#{item["iid"]}: legacy recovery hold; no mutation, resume, replacement or acknowledgement'
     return None
 
 
@@ -1961,7 +1963,7 @@ def model_providers(admission=False):
         if type((selected.get(name) or {}).get('model:codex')) is not int:
             fail('finite model:codex capacity required; no unlimited fallback')
         limits = local_limits() if local_limits() is not None else CONFIG.get('limits', {})
-        if admission and selected[name]['model:codex'] > limits.get('codex', 0):
+        if admission and name == 'host_caps' and selected[name]['model:codex'] > limits.get('codex', 0):
             fail('model capacity exceeds invocation limit; explicitly provision matching finite capacity')
     project = BOARD.capacity_provider(selected['project_caps'])
     if project.scope != 'project' or project.owner != CONFIG.get('repo') or project.caps != selected['project_caps']:
@@ -2189,6 +2191,8 @@ def event_line(n, event):
 
 def acknowledge(issue, target, ids):
     raw = issue_data(issue)
+    if 'legacy_recovery' in raw:
+        fail(f'#{issue["iid"]}: legacy recovery hold; acknowledgement refused')
     if raw.get('event_schema') == 2:
         fail('schema2 events require their native application handler; legacy ack refused')
     events = [dict(event, acks=list(event.get('acks', []))) for event in raw.get('events', [])]
@@ -2618,10 +2622,30 @@ def cmd_tick(args, table=True):
     try:
         one_pass(args, table)
     except SystemExit as error:
-        if table and getattr(args, 'diagnose', False) and 'project guard' in str(error):
+        if table and not getattr(args, 'headless', False) and getattr(args, 'diagnose', False) and 'project guard' in str(error):
             print('Проблема проекта: guard — операция отказала; stop/drain и сверка исходов, без снятия блокировки.')
             cmd_status(args)
         raise
+
+
+def dispatch_manager(args):
+    """Explicit project delegation, not a fabricated native session or manager adoption."""
+    if not getattr(args, 'headless', False):
+        return None
+    value = CONFIG.get('dispatch')
+    if not isinstance(value, dict) or set(value) != {'pm', 'hosts', 'board_user'}:
+        fail('headless tick requires explicit project dispatch authority')
+    pm, hosts = value['pm'], value['hosts']
+    if not isinstance(pm, dict) or set(pm) != {'runtime', 'session', 'name'} \
+            or pm.get('runtime') != 'codex' or any(not isinstance(v, str) or not v.strip() for v in pm.values()) \
+            or not isinstance(hosts, list) or not hosts \
+            or any(not isinstance(h, str) or not h.strip() for h in hosts) \
+            or len(hosts) != len(set(hosts)) or machine() not in hosts:
+        fail('headless dispatch PM/participating host identity invalid')
+    if not isinstance(value['board_user'], str) or not value['board_user'].strip() \
+            or BOARD.user() != value['board_user']:
+        fail('headless dispatch authenticated board user mismatch')
+    return pm
 
 
 def direct():
@@ -2686,6 +2710,8 @@ def heading(item):
 def one_pass(args, table=True):
     """One pass: free waiting tasks, follow unsupervised workers, act for supervisors, spawn ready tasks' supervisors, print the table."""
     here, kinds = machine(), runtimes()
+    delegated_pm = dispatch_manager(args)
+    table = table and delegated_pm is None
     local = local_limits()
     limits = local if local is not None else CONFIG.get('limits') or {name: 1 for name in kinds}
     blind = bool(os.environ.get('CODEX_SANDBOX'))
@@ -2696,6 +2722,8 @@ def one_pass(args, table=True):
         if held:
             board_schema_gate(issues)
         items = sorted(filter(None, map(parse, issues)), key=lambda item: (item['priority'], item['iid']))
+        if delegated_pm is not None:
+            items = [item for item in items if item['pm'] == delegated_pm]
         blind = bool(os.environ.get('CODEX_SANDBOX'))  # #502: a sandbox sees no other session alive: it would requeue live workers as gone
         if blind:
             print('taskq: inside a Codex sandbox: the pass only prints the table', file=sys.stderr)
@@ -2706,7 +2734,11 @@ def one_pass(args, table=True):
             fresh_issues = [read_issue(item['iid']) for item in ready]
             items = ready = sorted(filter(None, (parse(issue) for issue in fresh_issues if issue['state'] == 'open')),
                                    key=lambda item: (item['priority'], item['iid']))
+            if delegated_pm is not None:
+                items = ready = [item for item in ready if item['pm'] == delegated_pm]
         for item in ready:
+            if 'legacy_recovery' in item['raw']:
+                continue
             if item['raw'].get('event_schema') != 2 and compatibility_reason(item):
                 fail(compatibility_reason(item))
             if item['raw'].get('model_turns'):
@@ -2733,6 +2765,8 @@ def one_pass(args, table=True):
                     occupied[name] = occupied.get(name, 0) + 1
         for item in ready:
             claim = item['claim'] or {}
+            if 'legacy_recovery' in item['raw']:
+                continue
             if item['raw'].get('event_schema') == 2:
                 queue_pass(item)
                 if claim.get('name') == here and claim.get('session') and item['state'] in ('doing','review','ask'):
@@ -2778,11 +2812,14 @@ def one_pass(args, table=True):
                 claim = follow(item, runtime, claim, False) or claim  # denied: the original claim keeps its slot
             busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
         for item in ready:
+            if 'legacy_recovery' in item['raw']:
+                continue
             if item['raw'].get('event_schema') == 2 or item['state'] != 'ready' or not host_scope(item) or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']) \
-                    or (item['pm'] and item['pm'].get('name') != here) or not lead(item, kinds, admit=True):
+                    or (item['pm'] and item['pm'].get('name') != here and item['pm'] != delegated_pm) or not lead(item, kinds, admit=True):
                 continue  # no manager: the task waits, the table says so; another machine's manager: that machine starts it (§ 7 step 3)
             names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
-            free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 0 if local is not None else 1)), None)
+            free = next((name for name in names if name in kinds and limits.get(name, 0 if local is not None else 1) > 0
+                         and (model_mode and name == 'codex' or busy.get(name, 0) < limits.get(name, 0 if local is not None else 1))), None)
             fresh = free and executable(read_issue(item['iid']), item)  # #357: the board may have moved since the list; #545: eligibility
             if fresh and fresh['state'] == 'ready' and fresh['pm'] == item['pm']:  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
                 if local is not None and fresh['runtime'] not in ('any', free):
@@ -2798,7 +2835,7 @@ def one_pass(args, table=True):
                 move(item, 'doing', 'spawn', note('supervisor', session, kinds[runtime]), supervisor=item['supervisor'], claim=item['claim'],
                      result=None, order=None)
                 item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
-        if held and not blind:  # R11 (#360, #525): stopped sessions the board no longer holds, by recorded id only
+        if held and not blind and delegated_pm is None and not any('legacy_recovery' in item['raw'] for item in items):
             retire(stale({item['iid']: item for item in items}), 'could not remove stopped sessions', running=False)
     if table:
         if getattr(args, 'diagnose', False):
@@ -3371,6 +3408,8 @@ def lifecycle_read(n, refuse=fail, manager=False):
 
 def write_task_verified(issue, raw, labels, preserve_text=False):
     """A successful transport response is not a receipt until fresh task readback matches."""
+    if 'legacy_recovery' in issue_data(issue):
+        fail(f'#{issue["iid"]}: legacy recovery hold; authoritative writes refused')
     body=(BLOCK.sub(lambda _: block('',raw).lstrip('\n'),issue['body'],count=1) if preserve_text
           else block(BLOCK.sub('',issue['body']).strip(),raw))
     def write_and_read():
@@ -4075,7 +4114,7 @@ def cmd_wait(args):
         issues = BOARD.list(None) + list(getattr(BOARD, 'closed', lambda: [])())
         for issue in issues:
             raw = issue_data(issue)
-            if not raw or not selected(raw):
+            if not raw or not selected(raw) or 'legacy_recovery' in raw:
                 continue
             item = parse(issue) if issue['state'] == 'open' else parse({**issue, 'labels': [PREFIX + 'ready']})
             if not item or not mine(item):
@@ -4174,6 +4213,8 @@ def wait_task(args):
     while True:
         issue = read_issue(n)
         current = parse(issue) if issue['state'] == 'open' else None
+        if current and 'legacy_recovery' in current['raw']:
+            return print(f'stop #{n}: legacy recovery hold')
         boss = (current or {}).get('supervisor') or {}
         if not me or boss.get('session') != me:
             return print(f'stop #{n}')
@@ -4424,7 +4465,7 @@ SCHEMA_TRANSITIONS = {0: {'to': EVENT_SCHEMA, 'summary': 'Import pending message
                       1: {'to': EVENT_SCHEMA, 'summary': 'Preserve existing events/acks; separate model turns from task/resource ownership.'}}
 
 
-def repair_plan():
+def repair_plan(hold_legacy=False):
     """Shipped transitions only. Preflight the entire fresh board before any effect."""
     changes = []
     for listed in BOARD.list(None):
@@ -4441,7 +4482,7 @@ def repair_plan():
         if not transition or transition['to'] != EVENT_SCHEMA:
             fail(f'#{issue["iid"]}: no qualified repair from schema {version} to {EVENT_SCHEMA}; board unchanged')
         for role in ('claim', 'supervisor'):
-            if (raw.get(role) or {}).get('session'):
+            if (raw.get(role) or {}).get('session') and not hold_legacy:
                 fail(f'#{issue["iid"]}: {role} ownership unresolved; repair cannot retire or replace a session')
         converted = initialize_events(issue)
         if 'schema_repair' in raw:
@@ -4450,6 +4491,12 @@ def repair_plan():
             fail(f'#{issue["iid"]}: repair would overwrite existing data; qualified transition required')
         converted['schema_repair'] = {'from': version, 'to': EVENT_SCHEMA,
                                       'source_sha256': hashlib.sha256(issue['body'].encode('utf-8')).hexdigest()}
+        if hold_legacy and any((raw.get(role) or {}).get('session') for role in ('claim', 'supervisor')):
+            if 'legacy_recovery' in raw:
+                fail(f'#{issue["iid"]}: conflicting legacy recovery record; preserve it')
+            converted['legacy_recovery'] = {'kind': 'unresolved-ownership',
+                'source_sha256': converted['schema_repair']['source_sha256'],
+                'from': version, 'drain_proven': False}
         changes.append((issue, converted))
     return changes
 
@@ -4459,7 +4506,7 @@ def cmd_repair(args):
     if args.apply and not args.yes:
         fail('repair --apply requires --yes after reviewing taskq repair; no board changes')
     with coordination() if args.apply else contextlib.nullcontext():
-        changes = repair_plan()
+        changes = repair_plan(getattr(args, 'hold_legacy', False))
         for issue, raw in changes:
             print(f'#{issue["iid"]}: schema {raw["schema_repair"]["from"]} -> {EVENT_SCHEMA}: '
                   + SCHEMA_TRANSITIONS[raw['schema_repair']['from']]['summary'])
@@ -4776,6 +4823,7 @@ def main(argv=None):
     command('recovery-plan', cmd_recovery_plan, (('--role',), {'choices': ('worker', 'supervisor'), 'required': True}), (('--json',), {'action': 'store_true'}))
     command('reconcile', cmd_reconcile, (('--json',), {'action': 'store_true'}))
     command('tick', lambda args: (event_pass if args.quiet else cmd_tick)(args), (('--quiet',), {'action': 'store_true'}),
+            (('--headless',), {'action': 'store_true'}),
             (('--tasks',), {'nargs': '*', 'type': int, 'default': []}), (('--after',), {'type': int}), (('--after-birth',), {}),
             (('--diagnose',), {'action': 'store_true'}), (('--unknown-after',), {'type': positive_minutes, 'nargs': '?', 'const': 30}), n=False)
     command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}),
@@ -4794,7 +4842,8 @@ def main(argv=None):
     command('contract', lambda args: print(f'{CLONE / "taskq.md"} {contract() or "unavailable"}'), n=False)
     command('migrate', cmd_migrate, (('--native-receipts',), {'action': 'store_true'}), (('--apply',), {'action': 'store_true'}),
             (('--controllers-stopped',), {'action': 'store_true'}), n=False)
-    command('repair', cmd_repair, (('--apply',), {'action': 'store_true'}), (('--yes',), {'action': 'store_true'}), n=False)
+    command('repair', cmd_repair, (('--apply',), {'action': 'store_true'}), (('--yes',), {'action': 'store_true'}),
+            (('--hold-legacy',), {'action': 'store_true'}), n=False)
     command('update', cmd_update, (('--commit',), {}), (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
             (('--qualification',), {}), (('--apply',), {'action': 'store_true'}), n=False)
     args = parser.parse_args(argv)

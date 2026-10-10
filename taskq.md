@@ -319,6 +319,9 @@ Changed (#623, owner decision 2026-10-10): optional context reduction → enable
 supporting-context compression for every PM, supervisor, worker and nested reviewer/agent. Every role
 must use the § 2 Supporting context helper for eligible bulk evidence it assembles, and pass that
 requirement to every nested assignment. Clear complete output and immutable authority take precedence.
+Changed (#623 provider compatibility): compiler-only response checks → explicit compiler/Neural Keep
+schemas with unchanged local preservation guards; absent Neural Keep verification is reported, never
+treated as a semantic guarantee (§ 2 Supporting context).
 
 Every role and message is short and states unknowns honestly, per
 [gradus-public/caveman](https://gitlab.ufobe.com/gradus-public/caveman/-/tree/62579538f05fb6b69a12449c1ebad9567d1fdecc)
@@ -707,6 +710,12 @@ to the original. Accept only nonempty ordered whole-line extraction, smaller byt
 provider token counts with fewer kept tokens. Fenced blocks and lines with backticks, numbers,
 recognized English negative/authority words or explicit critical markers are retained exactly; this conservative guard and the provider's
 checks are not a proof of semantic preservation. Read original evidence before consequential acceptance.
+Hosted `mode:"neural-keep"` omits all three compiler verification fields. Accept that specific
+schema through the same local extraction, protected-line and size checks; missing remote verification
+is not a safety verdict and is reported on acceptance. Only compiler and Neural Keep modes are accepted;
+an omitted mode uses the legacy compiler schema. Compiler/legacy responses require an empty `critical_lines_dropped`, low
+`compression_risk` and a finite low-risk verifier score from 0.85 through 1. If any verification field
+is present, including on Neural Keep, require the complete safe triple; null/partial/unsafe fields fail.
 Security exception: known API-key matches or credential-assignment patterns withhold the supporting
 block with a sanitized warning before any request or new local copy, including when disabled or small.
 The source file remains the user's original. This guard cannot recognize every possible secret; callers

@@ -255,6 +255,23 @@ class Compression(Base):
                     self.assertNotIn('remote-secret-value', status)
                     self.assertNotIn(self.KEY, text + status)
 
+    def test_hosted_neural_schema_uses_same_local_protection(self):
+        neural = {key: self.result[key] for key in ('compressed_text', 'original_tokens', 'kept_tokens')}
+        neural['mode'] = 'neural-keep'
+        self.assertTrue(taskq.valid_compression(self.source, neural, self.KEY))
+        variants = [{**neural, 'mode': 'unknown'}, {**neural, 'mode': 'compiler'},
+                    {**neural, 'compressed_text': 'relevant evidence\n'},
+                    {**neural, 'compressed_text': 'generated advice\n'},
+                    {**neural, 'compressed_text': self.source},
+                    {**neural, 'kept_tokens': neural['original_tokens']}]
+        for field in ('critical_lines_dropped', 'compression_risk', 'verifier'):
+            variants.append({**neural, field: None})
+            variants.append({**neural, field: self.result[field]})
+        for result in variants:
+            with self.subTest(result=result):
+                self.assertFalse(taskq.valid_compression(self.source, result, self.KEY))
+        self.assertTrue(taskq.valid_compression(self.source, {**self.result, 'mode': 'neural-keep'}, self.KEY))
+
     def test_credentials_withheld_before_transport_preservation_or_disabled_fallback(self):
         for source in (self.KEY, 'API_KEY=private value\n' + self.source):
             for option in ('on', 'off'):

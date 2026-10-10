@@ -5893,8 +5893,6 @@ for line in sys.stdin:
 '''
 
 
-if __name__ == '__main__':
-    unittest.main()
 
 
 class TightAssignmentDesign(unittest.TestCase):
@@ -5922,3 +5920,190 @@ class TightAssignmentDesign(unittest.TestCase):
 
     def test_candidate_is_not_imported_by_production(self):
         self.assertNotIn('assignment_model', (ROOT / 'taskq.py').read_text())
+
+
+class StateKernel(unittest.TestCase):
+    """#641 deterministic abstract replays, not native/persistence qualification."""
+
+    def setUp(self):
+        self.state = taskq.pilot_state()
+        self.trace = []
+
+    def step(self, action, n=1, worker='A', **extra):
+        command = dict(task=n, worker=worker, action=action,
+                       revision=self.state['tasks'][str(n)]['revision'], **extra)
+        self.trace.append(command)
+        self.state = taskq.pilot_transition(self.state, command)
+        return command
+
+    def refuse(self, action, n=1, worker='A', **extra):
+        before = json.loads(json.dumps(self.state))
+        with self.assertRaises(ValueError):
+            self.step(action, n, worker, **extra)
+        self.assertEqual(self.state, before)
+
+    def test_accepted_result_resume_historical_boundary(self):
+        # Existing native regression: tests/test_lifecycle.py, accepted-result rework.
+        self.step('claim'); self.step('resume'); self.step('answer', event=1)
+        self.step('apply', event=1); self.step('ack', event=1)
+        self.step('terminal', terminal=True, cli_dead=True); self.step('accept')
+        self.refuse('resume'); self.refuse('answer', event=2)
+        self.assertTrue(self.state['tasks']['1']['accepted'])
+        self.assert_replay()
+
+    def test_dead_cli_live_writer_and_separate_capacities(self):
+        self.step('claim'); self.step('resume'); self.step('heavy')
+        self.refuse('terminal', terminal=False, cli_dead=True)
+        self.step('claim', 2, 'B'); self.refuse('resume', 2, 'B')
+        self.step('terminal', terminal=True, cli_dead=True)
+        self.assertTrue(self.state['tasks']['1']['writer'])
+        self.assertTrue(self.state['tasks']['1']['heavy'])
+        self.refuse('resume'); self.refuse('accept'); self.refuse('repair-start')
+        self.step('resume', 2, 'B'); self.refuse('heavy', 2, 'B')
+        self.refuse('drain', writer_drained=False)
+        self.step('drain', writer_drained=True); self.step('heavy', 2, 'B')
+        self.assert_replay()
+
+    def test_lost_ack_retries_receipt_not_effect(self):
+        # Lost-response-after-commit shape also exercised by test_native_action.py.
+        self.step('claim'); self.step('resume'); self.refuse('answer', event=2)
+        self.step('answer', event=1)
+        self.refuse('ack', event=1); self.refuse('apply', event=2)
+        self.step('apply', event=1)
+        revision = self.state['tasks']['1']['revision']
+        self.step('apply', event=1); self.step('answer', event=1)
+        self.assertEqual(self.state['tasks']['1']['revision'], revision)
+        self.step('ack', event=1); self.step('ack', event=1)
+        self.assertEqual(self.state['tasks']['1']['effects'], 1)
+        self.assertEqual(self.state['tasks']['1']['acks'], [1])
+        self.assert_replay()
+
+    def test_concurrent_claims_both_serializations_stale_and_foreign_resume(self):
+        for first, second in (('A', 'B'), ('B', 'A')):
+            self.state = taskq.pilot_state(); self.trace = []
+            self.step('claim', worker=first)
+            before = json.loads(json.dumps(self.state))
+            with self.assertRaisesRegex(ValueError, 'stale'):
+                taskq.pilot_transition(self.state, dict(task=1, worker=second, action='claim', revision=0))
+            self.refuse('claim', worker=second); self.refuse('resume', worker=second)
+            self.refuse('claim', 2, first)
+            self.assertEqual(self.state, before)
+            self.assert_replay()
+
+    def test_partial_repair_resume_preserves_ownership_receipts(self):
+        # Historical repair partial-write regression remains in Model/repair suite.
+        self.step('claim'); self.step('answer', event=1)
+        original = json.loads(json.dumps(self.state['tasks']))
+        self.step('repair-start'); self.step('repair-checkpoint')
+        self.state = json.loads(json.dumps(self.state))  # simulated restart, not durable-write proof
+        self.step('repair-start'); self.step('repair-checkpoint')
+        self.refuse('repair-finish'); self.refuse('resume')
+        self.step('repair-checkpoint', 2, 'B'); self.step('repair-finish')
+        self.assertEqual(self.state['tasks'], original)
+        self.assertIsNone(self.state['repair']); self.assert_replay()
+
+    def assert_replay(self):
+        from experiments.state_replay import replay
+        self.assertEqual(replay(self.trace)['state'], self.state)
+        self.assertEqual(replay(self.trace), replay(json.loads(json.dumps(self.trace))))
+
+    def test_injected_faults_are_detected_by_same_deterministic_replays(self):
+        source = (ROOT / 'taskq.py').read_text()
+        start = source.index('def pilot_state():')
+        end = source.index('# --- config + task model', start)
+        kernel = source[start:end]
+        faults = (
+            ('accepted resume', "task['accepted'] or task['model']", "task['model']",
+             self.test_accepted_result_resume_historical_boundary),
+            ('dead CLI releases heavy', "task['model'] = False  #", "task['heavy'] = task['writer'] = False; task['model'] = False  #",
+             self.test_dead_cli_live_writer_and_separate_capacities),
+            ('duplicate repeats effect', "return saved  # lost ACK", "task['effects'] += 1; return saved  # lost ACK",
+             self.test_lost_ack_retries_receipt_not_effect),
+            ('delivery ACK', "if event not in task['receipts']:", "if False:",
+             self.test_lost_ack_retries_receipt_not_effect),
+            ('no model ceiling', "if sum(t['model'] for t in saved['tasks'].values()) >= 1:", "if False:",
+             self.test_dead_cli_live_writer_and_separate_capacities),
+            ('foreign resume', "if task['owner'] != worker or saved['repair'] is not None:", "if saved['repair'] is not None:",
+             self.test_concurrent_claims_both_serializations_stale_and_foreign_resume),
+            ('lost repair checkpoint', "saved['repair'] = []", "saved['repair'] = [1, 2]",
+             self.test_partial_repair_resume_preserves_ownership_receipts),
+        )
+        for name, old, new, check in faults:
+            with self.subTest(fault=name):
+                self.assertEqual(kernel.count(old), 1)
+                namespace = {'json': json}
+                exec(kernel.replace(old, new), namespace)
+                self.setUp()
+                with mock.patch.object(taskq, 'pilot_transition', namespace['pilot_transition']):
+                    with self.assertRaises(AssertionError):
+                        check()
+
+
+try:
+    from hypothesis import settings, strategies as st
+    from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
+except ImportError:
+    class TestStateKernel(unittest.TestCase):
+        @unittest.skip('Hypothesis absent: #641 stateful pilot NOT VERIFIED')
+        def test_dependency_required(self):
+            pass
+else:
+    class KernelMachine(RuleBasedStateMachine):
+        def __init__(self):
+            super().__init__()
+            self.state = taskq.pilot_state()
+            self.trace = []
+
+        @rule(n=st.integers(1, 2), worker=st.sampled_from(('A', 'B')),
+              action=st.sampled_from(('claim', 'resume', 'heavy', 'terminal', 'drain',
+                                      'answer', 'apply', 'ack', 'accept', 'repair-start',
+                                      'repair-checkpoint', 'repair-finish')),
+              event=st.integers(1, 3), stale=st.booleans(), proof=st.booleans())
+        def command(self, n, worker, action, event, stale, proof):
+            old_state = self.state
+            before = json.loads(json.dumps(self.state))
+            command = dict(task=n, worker=worker, action=action, event=event,
+                           revision=self.state['tasks'][str(n)]['revision'] - int(stale),
+                           terminal=proof, cli_dead=proof, writer_drained=proof)
+            self.trace.append(command)
+            try:
+                self.state = taskq.pilot_transition(self.state, command)
+            except ValueError:
+                assert self.state == before
+                return
+            assert old_state == before, self.trace
+            # Independent safety oracles, not another transition implementation.
+            if stale:
+                assert self.state == before, self.trace
+            for key, old in before['tasks'].items():
+                new = self.state['tasks'][key]
+                if old['owner'] is not None:
+                    assert new['owner'] == old['owner'], self.trace
+                if old['accepted']:
+                    assert not new['model'], self.trace
+                if action == 'terminal':
+                    assert (new['heavy'], new['writer']) == (old['heavy'], old['writer']), self.trace
+                if action == 'apply' and event in old['receipts']:
+                    assert new['effects'] == old['effects'], self.trace
+
+        @invariant()
+        def safety_and_replay(self):
+            tasks = list(self.state['tasks'].values())
+            assert sum(t['model'] for t in tasks) <= 1, self.trace
+            assert sum(t['heavy'] for t in tasks) <= 1, self.trace
+            owners = [t['owner'] for t in tasks if t['owner'] is not None]
+            assert len(owners) == len(set(owners)), self.trace
+            for task in tasks:
+                assert set(task['acks']) <= set(task['receipts']) <= set(task['events']), self.trace
+                assert task['effects'] == len(task['receipts']), self.trace
+                assert not task['accepted'] or not (task['model'] or task['heavy'] or task['writer']), self.trace
+            from experiments.state_replay import replay
+            assert replay(self.trace)['state'] == self.state, self.trace
+
+    TestStateKernel = KernelMachine.TestCase
+    TestStateKernel.settings = settings(max_examples=100, stateful_step_count=50,
+                                        derandomize=True, database=None, deadline=None)
+
+
+if __name__ == '__main__':
+    unittest.main()

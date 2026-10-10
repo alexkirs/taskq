@@ -738,6 +738,16 @@ Every agent (Claude, Codex, DOT, Hermes, other) reads this file before work; `AG
 
 ### Executable behavioral model
 
+Changed (#641, R13, owner641.1 authorization): stdlib-only test frameworks -> a
+narrow test-only Hypothesis exception for the research pilot of two tasks/two
+workers. Runtime remains stdlib. The runtime module owns the executable pure
+transition kernel; the isolated replay runner and stateful tests call that same
+kernel. No production dispatch/admission change, new schema, storage or daemon.
+Other Later tasks and existing named ARM admission remain unchanged. Quint is
+conditional later only if interleaving/liveness needs it, with Python trace replay;
+Lean is not mandatory. Model assertions do not qualify persistence, subprocesses
+or native writers.
+
 States, events, transitions and invariants define behavioral truth; the board and native
 receipts remain operational truth. Keep pure transitions separate from I/O. Lifecycle
 changes update the model/properties first, then adapters. Use one executable Python kernel
@@ -1674,7 +1684,12 @@ of test types are not targets. Passing checks prove only their assertions at the
 
 #### Structure and levels
 
-Keep automated tests in `tests/test_single.py`, using stdlib `unittest`; no new framework, service or policy file.
+Keep automated tests in `tests/test_single.py`, using stdlib `unittest`; no new framework, service or policy file
+except the owner-authorized #641 test-only Hypothesis pilot above. Install its
+pinned dependency with `python3 -m pip install -r requirements-test.txt`; run
+`python3 -m unittest tests.test_single.StateKernel tests.test_single.TestStateKernel`.
+The normal suite skips the stateful pilot when Hypothesis is absent; that skip is
+not pilot PASS. CI installs the test dependency and includes the pilot in the full suite.
 Levels describe evidence, not extra directories or runners:
 
 - Contract and isolated checks: `Model` (data/trust and contract sentinels), `Contract` (contract loading/update),

@@ -5,6 +5,107 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+# --- #641 research kernel: no production admission or I/O -------------------------------
+
+def pilot_state():
+    """Two-task/two-worker bounded behavioral state, never board authority."""
+    return {'tasks': {str(n): {'owner': None, 'revision': 0, 'model': False,
+            'heavy': False, 'writer': False, 'accepted': False, 'events': [],
+            'receipts': [], 'acks': [], 'effects': 0} for n in (1, 2)},
+            'repair': None}
+
+
+def pilot_transition(state, command):
+    """Pure guarded transition; callers serialize fresh board reads/writes, not this model."""
+    saved = json.loads(json.dumps(state))
+    n, worker, action = command['task'], command['worker'], command['action']
+    if type(n) is not int or n not in (1, 2) or worker not in ('A', 'B'):
+        raise ValueError('pilot requires two tasks/two workers')
+    task = saved['tasks'][str(n)]
+    if command.get('revision') != task['revision']:
+        raise ValueError('stale transition')
+    if action == 'claim':
+        if saved['repair'] is not None or task['owner'] not in (None, worker):
+            raise ValueError('claim held or repair pending')
+        if task['owner'] == worker:
+            return saved
+        if any(t['owner'] == worker for t in saved['tasks'].values()):
+            raise ValueError('one task per worker')
+        task['owner'] = worker
+    elif action in ('repair-start', 'repair-checkpoint', 'repair-finish'):
+        if any(t['model'] or t['writer'] or t['heavy'] for t in saved['tasks'].values()):
+            raise ValueError('repair requires qualified absence of effects')
+        if action == 'repair-start':
+            if saved['repair'] is None:
+                saved['repair'] = []
+            return saved
+        if saved['repair'] is None:
+            raise ValueError('repair not started')
+        if action == 'repair-checkpoint':
+            if n not in saved['repair']:
+                saved['repair'].append(n)
+            return saved
+        if set(saved['repair']) != {1, 2}:
+            raise ValueError('repair incomplete')
+        saved['repair'] = None
+        return saved
+    else:
+        if task['owner'] != worker or saved['repair'] is not None:
+            raise ValueError('wrong owner or repair pending')
+        if action == 'resume':
+            if task['accepted'] or task['model'] or task['writer'] or task['heavy']:
+                raise ValueError('accepted or unresolved execution')
+            if sum(t['model'] for t in saved['tasks'].values()) >= 1:
+                raise ValueError('finite model capacity')
+            task['model'] = True
+        elif action == 'heavy':
+            if not task['model'] or task['heavy'] or any(t['heavy'] for t in saved['tasks'].values()):
+                raise ValueError('finite heavy capacity or no active turn')
+            task['heavy'] = task['writer'] = True
+        elif action == 'terminal':
+            if command.get('terminal') is not True or command.get('cli_dead') is not True:
+                raise ValueError('unknown terminal/birth death retains model grant')
+            task['model'] = False  # model completion never settles detached writers/heavy work
+        elif action == 'drain':
+            if command.get('writer_drained') is not True:
+                raise ValueError('unknown writer retains heavy grant')
+            task['writer'] = task['heavy'] = False
+        elif action == 'answer':
+            event = command.get('event')
+            if type(event) is not int or event <= 0 or task['accepted']:
+                raise ValueError('invalid answer')
+            if event in task['events']:
+                return saved
+            if event != len(task['events']) + 1:
+                raise ValueError('out-of-order event')
+            task['events'].append(event)
+        elif action in ('apply', 'ack'):
+            event = command.get('event')
+            if type(event) is not int or event not in task['events']:
+                raise ValueError('unknown event')
+            if action == 'apply':
+                if event in task['receipts']:
+                    return saved  # lost ACK retries receipt, never the effect
+                if event != len(task['receipts']) + 1 or not task['model']:
+                    raise ValueError('out-of-order application or no active turn')
+                task['effects'] += 1
+                task['receipts'].append(event)
+            else:
+                if event not in task['receipts']:
+                    raise ValueError('delivery is not application')
+                if event in task['acks']:
+                    return saved
+                task['acks'].append(event)
+        elif action == 'accept':
+            if task['model'] or task['writer'] or task['heavy'] or set(task['acks']) != set(task['events']):
+                raise ValueError('acceptance requires settled grants and application ACK')
+            task['accepted'] = True
+        else:
+            raise ValueError('unsupported pilot action')
+    task['revision'] += 1
+    return saved
+
+
 # --- config + task model --------------------------------------------------------------------
 
 STATES = ('ready', 'waiting', 'doing', 'review', 'ask', 'later')

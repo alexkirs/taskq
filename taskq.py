@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
-import argparse, contextlib, glob, hashlib, http.client, importlib.util, json, math, os, re, shlex, shutil, signal, socket, subprocess, sys, threading, time, uuid
+import argparse, contextlib, glob, hashlib, http.client, importlib.util, json, math, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -30,6 +30,10 @@ def fail(message):
     if held and held["effects"]:
         held["poisoned"] = True
     sys.exit(f'taskq: {message}')
+
+def no_window():
+    return {'creationflags': 0x08000000} if os.name == 'nt' else {}  # CREATE_NO_WINDOW
+
 
 def load_config(start=None):
     """taskq.json: the nearest one from `start` (the current directory) up; its folder is the project root."""
@@ -300,7 +304,7 @@ def diagnostic_comment(n, text):
 def run_api(tool, host, method, path, body=None):
     command = [shutil.which(tool) or fail(f'{tool} not found'), 'api', '-X', method, path]
     command += ['--hostname', host] * bool(host) + ['--input', '-', '-H', 'Content-Type: application/json'] * (body is not None)
-    done = subprocess.run(command, input=body and json.dumps(body), capture_output=True, text=True, encoding='utf-8')
+    done = subprocess.run(command, input=body and json.dumps(body), capture_output=True, **no_window(), text=True, encoding='utf-8')
     if done.returncode:
         fail(f'{tool} api {method} {path}: {done.stderr.strip() or done.stdout.strip()}')
     return json.loads(done.stdout) if done.stdout.strip() else None
@@ -312,7 +316,7 @@ def coordination_api(tool, host, method, path, body=None):
     if body is not None:
         command += ['--input', '-', '-H', 'Content-Type: application/json']
     done = subprocess.run(command, input=json.dumps(body) if body is not None else None,
-                          capture_output=True, text=True, encoding='utf-8', timeout=30)
+                          capture_output=True, **no_window(), text=True, encoding='utf-8', timeout=30)
     header, separator, payload = done.stdout.partition('\n\n')
     status = re.match(r'HTTP/\S+\s+(\d+)', header)
     if not separator or not status:
@@ -604,7 +608,7 @@ class Claude:
     def agents(self):
         """This machine's `claude --bg` sessions by session id, stopped ones too; None when the list cannot be read."""
         try:
-            done = subprocess.run([shutil.which('claude') or 'claude', 'agents', '--json', '--all'], capture_output=True, text=True, encoding='utf-8', timeout=60)
+            done = subprocess.run([shutil.which('claude') or 'claude', 'agents', '--json', '--all'], capture_output=True, **no_window(), text=True, encoding='utf-8', timeout=60)
             listed = json.loads(done.stdout) if not done.returncode else None
         except (OSError, subprocess.SubprocessError, ValueError):
             return None
@@ -614,7 +618,7 @@ class Claude:
     def start(self, arguments, cwd):
         """`claude --bg ...`; it prints `backgrounded · <short id>`, `claude agents` gives the full one."""
         done = subprocess.run([shutil.which('claude') or fail('claude not found'), '--bg', *arguments], cwd=cwd, env=worker_env(),
-                              capture_output=True, text=True, encoding='utf-8', timeout=120)
+                              capture_output=True, **no_window(), text=True, encoding='utf-8', timeout=120)
         short = re.search(r'backgrounded · (\w+)', re.sub(r'\x1b\[[0-9;]*m', '', done.stdout))  # FORCE_COLOR colours it
         if done.returncode or not short:
             fail(f'claude could not start the session: {done.stderr.strip() or done.stdout.strip()}')
@@ -634,7 +638,7 @@ class Claude:
         """`claude stop <job id>` when the session still has a process; its agent, or {} when not listed."""
         agent = (self.agents() or {}).get(session) or {}
         if agent.get('pid'):
-            done = subprocess.run([shutil.which('claude') or 'claude', 'stop', agent['id']], capture_output=True, timeout=60)
+            done = subprocess.run([shutil.which('claude') or 'claude', 'stop', agent['id']], capture_output=True, **no_window(), timeout=60)
             if done.returncode:
                 raise RuntimeError('claude stop failed; session was not confirmed stopped')
         return agent
@@ -669,17 +673,17 @@ class Claude:
             if not n or not agent.get('id') or not gone(int(n[1]), agent.get('sessionId'), self.running(agent)) or self.running(agent) and not running:
                 continue
             if agent.get('pid'):
-                done = subprocess.run([claude, 'stop', agent['id']], capture_output=True, timeout=60)
+                done = subprocess.run([claude, 'stop', agent['id']], capture_output=True, **no_window(), timeout=60)
                 if done.returncode:
                     raise RuntimeError('claude stop failed; retirement refused')
-            done = subprocess.run([claude, 'rm', agent['id']], capture_output=True, timeout=60)
+            done = subprocess.run([claude, 'rm', agent['id']], capture_output=True, **no_window(), timeout=60)
             if done.returncode:
                 raise RuntimeError('claude rm failed; retirement unconfirmed')
 
     def tail(self, session):
         """The last line of `claude logs`, for an ask (#393)."""
         job = ((self.agents() or {}).get(session) or {}).get('id') or session
-        done = subprocess.run([shutil.which('claude') or 'claude', 'logs', job], capture_output=True, text=True, encoding='utf-8', timeout=60)
+        done = subprocess.run([shutil.which('claude') or 'claude', 'logs', job], capture_output=True, **no_window(), text=True, encoding='utf-8', timeout=60)
         return last_line(re.sub(r'\x1b\[[0-9;]*m', '', done.stdout + done.stderr))
 
     def link(self, session):
@@ -886,9 +890,11 @@ class Codex:
 
     def exec(self, name, arguments, cwd):
         log, detach = self.folder() / f'{name.split()[0]}.log', {'creationflags': 0x208} if os.name == 'nt' else {'start_new_session': True}
-        with open(log, 'ab') as out:  # detached: the worker outlives the tick
-            process = subprocess.Popen([shutil.which('codex') or fail('codex not found'), 'exec', '--json', *codex_options(), *arguments],
-                                       cwd=cwd, env=worker_env(), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **detach)
+        with tempfile.TemporaryFile() as prompt, open(log, 'ab') as out:  # detached: the worker outlives the tick
+            prompt.write(arguments[-1].encode('utf-8'))
+            prompt.seek(0)  # file-backed stdin avoids both argv limits and blocking writes to a slow child
+            process = subprocess.Popen([shutil.which('codex') or fail('codex not found'), 'exec', '--json', *codex_options(), *arguments[:-1], '-'],
+                                       cwd=cwd, env=worker_env(), stdin=prompt, stdout=out, stderr=subprocess.STDOUT, **detach)
         process.taskq_birth = process_identity(process.pid)[1]
         dispatch('turn end', [], after=process.pid, after_birth=process.taskq_birth)  # #525: a sandboxed turn starts no pass; one runs when it ends (no sender, no timer)
         return process, log
@@ -928,7 +934,7 @@ class Codex:
         """R3 (#572): `codex exec` names no thread; the app-server's `thread/name/set` does, `thread/read` proves it.
         Each request waits for its own successful reply. `exec resume` keeps the name. Raises ValueError unless named."""
         server = subprocess.Popen([shutil.which('codex') or 'codex', 'app-server'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, env=worker_env(), text=True, encoding='utf-8')
+                                  stderr=subprocess.DEVNULL, env=worker_env(), text=True, encoding='utf-8', **no_window())
         deadline, request_id = time.monotonic() + self.WAIT, 0
         timer = threading.Timer(self.WAIT, server.kill)  # one deadline through shutdown: a hung server is killed, its stdout ends
         timer.start()
@@ -1031,7 +1037,7 @@ class Codex:
                 continue
             if state == 'running':
                 stop_process(pid, birth)
-            done = subprocess.run([shutil.which('codex') or 'codex', 'archive', thread], capture_output=True, timeout=60)
+            done = subprocess.run([shutil.which('codex') or 'codex', 'archive', thread], capture_output=True, **no_window(), timeout=60)
             if done.returncode:
                 raise RuntimeError('codex archive failed; recovery handle retained')
             path.unlink()
@@ -1309,7 +1315,7 @@ def merge(current, sha):
     where = ['-R', (f'https://{host}/' if lab else f'{host}/') * bool(host) + CONFIG['repo']]  # gh takes HOST/OWNER/REPO, glab a URL
 
     def cli(*command):
-        done = subprocess.run([shutil.which(command[0]) or fail(f'{command[0]} not found'), *command[1:], *where], capture_output=True, text=True, encoding='utf-8')
+        done = subprocess.run([shutil.which(command[0]) or fail(f'{command[0]} not found'), *command[1:], *where], capture_output=True, **no_window(), text=True, encoding='utf-8')
         return done.returncode, (done.stderr.strip() or done.stdout.strip()) if done.returncode else done.stdout
     code, out = cli(*(['glab', 'mr', 'list', '--source-branch', branch, '--output', 'json'] if lab else ['gh', 'pr', 'list', '--head', branch, '--json', 'number,headRefOid,baseRefName']))
     found = code and fail(out) or [(str(pr.get('iid', pr.get('number'))), pr.get('sha', pr.get('headRefOid')), pr.get('target_branch', pr.get('baseRefName')))
@@ -1357,12 +1363,12 @@ def cleanup(current):
     if (current['claim'] or {}).get('name') != machine() or not tree.is_dir():
         return ''
     git = [shutil.which('git') or fail('git not found'), '-C', str(CONFIG['root'])]
-    status = subprocess.run([*git, '-C', str(tree), 'status', '--porcelain'], capture_output=True, text=True, encoding='utf-8')
+    status = subprocess.run([*git, '-C', str(tree), 'status', '--porcelain'], capture_output=True, **no_window(), text=True, encoding='utf-8')
     removed = not status.returncode and not status.stdout.strip() and \
-        not effect(subprocess.run, [*git, 'worktree', 'remove', str(tree)], capture_output=True).returncode
+        not effect(subprocess.run, [*git, 'worktree', 'remove', str(tree)], capture_output=True, **no_window()).returncode
     if not removed:
         return f'kept .worktrees/{branch} and branch {branch}: uncommitted changes'
-    effect(subprocess.run, [*git, 'branch', '-D', branch], capture_output=True)
+    effect(subprocess.run, [*git, 'branch', '-D', branch], capture_output=True, **no_window())
     return ''
 
 def cmd_close(args):
@@ -1390,8 +1396,8 @@ def publish_direct(current, sha, git):
         fail(f'#{current["iid"]}: only the accepting reviewer can publish a direct candidate')
 
     def run(*args):
-        done = (effect(subprocess.run, [*git, *args], capture_output=True, text=True, encoding='utf-8')
-                if args[0] in ('push', 'fetch') else subprocess.run([*git, *args], capture_output=True, text=True, encoding='utf-8'))
+        done = (effect(subprocess.run, [*git, *args], capture_output=True, **no_window(), text=True, encoding='utf-8')
+                if args[0] in ('push', 'fetch') else subprocess.run([*git, *args], capture_output=True, **no_window(), text=True, encoding='utf-8'))
         if done.returncode:
             fail(done.stderr.strip() or f'git {args[0]} failed')
         return done.stdout.strip()
@@ -1434,10 +1440,10 @@ def close_one(args):
         args.text = (f'{args.text}\n\n' if args.text else '') + f'merged {merged}'  # #567: the verdict stays the first line
     else:  # an already-published result/answer, or an unpublished direct candidate
         git = [shutil.which('git') or fail('git not found'), '-C', str(CONFIG['root'])]
-        fetched = subprocess.run([*git, 'fetch', 'origin'], capture_output=True)
+        fetched = subprocess.run([*git, 'fetch', 'origin'], capture_output=True, **no_window())
         if fetched.returncode:
             fail(f'#{args.n}: could not fetch origin for publication')
-        if subprocess.run([*git, 'merge-base', '--is-ancestor', sha, 'origin/main'], capture_output=True).returncode:
+        if subprocess.run([*git, 'merge-base', '--is-ancestor', sha, 'origin/main'], capture_output=True, **no_window()).returncode:
             if CONFIG['publish'] != 'direct':
                 fail(f'#{args.n}: result {sha} is not on origin/main')
             publish_direct(current, sha, git)
@@ -1489,7 +1495,7 @@ def open_prs():
         return None
     command = ['glab', 'mr', 'list', '--output', 'json', '-R', f'https://{host}/{CONFIG["repo"]}' if host else CONFIG['repo']] if lab else \
         ['gh', 'pr', 'list', '--state', 'open', '--limit', '500', '--json', 'number,headRefName', '-R', f'{host}/{CONFIG["repo"]}' if host else CONFIG['repo']]
-    done = subprocess.run([shutil.which(command[0]), *command[1:]], capture_output=True, text=True, encoding='utf-8')
+    done = subprocess.run([shutil.which(command[0]), *command[1:]], capture_output=True, **no_window(), text=True, encoding='utf-8')
     return None if done.returncode else {pr.get('source_branch', pr.get('headRefName')): pr.get('iid', pr.get('number')) for pr in json.loads(done.stdout)}
 
 def merged(git, ref):
@@ -1527,7 +1533,7 @@ def cmd_cleanup(args):
         return states[n]
 
     def git(*argv):
-        return subprocess.run([shutil.which('git') or fail('git not found'), '-C', str(root), *argv], capture_output=True, text=True, encoding='utf-8')
+        return subprocess.run([shutil.which('git') or fail('git not found'), '-C', str(root), *argv], capture_output=True, **no_window(), text=True, encoding='utf-8')
 
     def act(what, *command):  # one removal: done (or only printed with --dry-run), else kept with git's reason
         done = None if dry else effect(git, *command)
@@ -1704,7 +1710,7 @@ def compression_request(context, query, key):
     try:
         child = subprocess.Popen([sys.executable, '-c', COMPRESS_WORKER, str(Path(__file__).resolve())],
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                               env={name: os.environ[name] for name in ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP') if name in os.environ})
+                               env={name: os.environ[name] for name in ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP') if name in os.environ}, **no_window())
         timer = threading.Timer(COMPRESS_TIMEOUT, expire)
         timer.start()
         output, _ = child.communicate(json.dumps([context, query, key]).encode('utf-8'))
@@ -2776,7 +2782,7 @@ def cmd_version(args):
             'install': os.environ.get('TASKQ_INSTALL_DIR'), 'stale': bool(release_reason())}
     if git:
         for key, command in (('commit', ['rev-parse', 'HEAD']), ('dirty', ['status', '--porcelain', '--untracked-files=all'])):
-            done = subprocess.run([git, '-C', str(CLONE), *command], capture_output=True, text=True, encoding='utf-8')
+            done = subprocess.run([git, '-C', str(CLONE), *command], capture_output=True, **no_window(), text=True, encoding='utf-8')
             if not done.returncode:
                 data[key] = bool(done.stdout.strip()) if key == 'dirty' else done.stdout.strip()
     if data['install']:
@@ -2810,7 +2816,7 @@ def freshness_notice():
             if not gh:
                 raise ValueError('gh not found')
             done = subprocess.run([gh, 'api', '--hostname', 'github.com', 'repos/alexkirs/taskq/git/ref/heads/main'],
-                                  capture_output=True, text=True, encoding='utf-8', timeout=10)
+                                  capture_output=True, **no_window(), text=True, encoding='utf-8', timeout=10)
             if done.returncode:
                 raise ValueError('upstream query failed')
             sha = json.loads(done.stdout)['object']['sha']
@@ -2873,7 +2879,7 @@ def cmd_migrate(args):
 def update_git(folder, *argv):
     try:
         done = subprocess.run([shutil.which('git') or fail('git not found'), '-C', str(folder), *argv],
-                              capture_output=True, text=True, encoding='utf-8', timeout=120 if argv[0] == 'clone' else 30)
+                              capture_output=True, **no_window(), text=True, encoding='utf-8', timeout=120 if argv[0] == 'clone' else 30)
     except subprocess.TimeoutExpired:
         fail(f'update git {argv[0]} timed out; selected pointer unchanged')
     if done.returncode:
@@ -2888,7 +2894,7 @@ def qualified_checks(commit, upstream):
     try:
         done = subprocess.run([shutil.which('gh') or fail('gh not found'), 'api', '--hostname', 'github.com', '--paginate', '--slurp',
                                f'repos/alexkirs/taskq/commits/{commit}/check-runs'],
-                              capture_output=True, text=True, encoding='utf-8', timeout=30)
+                              capture_output=True, **no_window(), text=True, encoding='utf-8', timeout=30)
     except subprocess.TimeoutExpired:
         fail('update exact-SHA CI timed out; selected pointer unchanged')
     if done.returncode:

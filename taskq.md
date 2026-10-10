@@ -1,5 +1,35 @@
 # taskq — the contract
 
+### #646 first executable slice: execution vs subscription
+
+Candidate-only route: `taskq arm tick --execute [--scope-task N ...]` runs one
+existing headless guarded pass. It never opens a PM subscription, starts a timer
+or replaces an activation. It uses existing dispatch authority and shared finite
+capacity, not PM availability. The future named activation/stop interface is not
+implemented by this single-pass route.
+
+`taskq pm --subscribe NAME [--scope-task N ...]` is a read-only board observer.
+It emits one typed initial snapshot, then changed task observations/native events.
+An envelope is durably pending before output and replays byte-identically until
+`--delivery-ack DIGEST` confirms transport acceptance. This local SQLite receipt
+cache is not board/task/decision authority. Each genuine session + name has its
+own cursor. ACK changes only that subscriber's local cache, never native event
+ACKs, questions, claims or decisions. Unknown/wrong digest preserves pending.
+Scope changes require a separate subscription; changing interests is not adoption.
+
+The existing board retains pending events, not a complete historical event log.
+The observer re-reads every selected/previously known task (including closed),
+deduplicates task:event IDs and explicitly reports unavailable sequence ranges.
+It does not claim gap-free history from a list snapshot. Freshness timestamps are
+observation time, not atomic provider snapshots. Unchanged polls emit no envelope.
+At most 200 tasks are observed; overflow or read failure refuses without advancing
+a cursor. Pending delivery applies backpressure; no second poll overtakes it.
+
+Decision/version/commandID processing, snapshot+history guarantee, named ARM
+activation/stop and dot display integration remain subsequent approved slices;
+this receipt cache must not be mistaken for their implementation. Existing
+production schedulers and the older PM role route remain unchanged until rollout.
+
 ### Closed-task model settlement
 
 A normal guarded pass reconciles outstanding model-only grants from the local

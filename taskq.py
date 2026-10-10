@@ -2779,6 +2779,8 @@ def one_pass(args, table=True):
                                    key=lambda item: (item['priority'], item['iid']))
             if delegated_pm is not None:
                 items = ready = [item for item in ready if item['pm'] == delegated_pm]
+        if getattr(args, 'execution_scope', None):
+            items = ready = [item for item in items if item['iid'] in args.execution_scope]
         for item in ready:
             if 'legacy_recovery' in item['raw']:
                 continue
@@ -4736,7 +4738,111 @@ def adopt(numbers, me):
         for item in adopted:
             move(item, item['state'], 'adopt', f'pm {origin()["runtime"]}:{me.get("session") or "shell"}', pm=origin())
 
+def subscription_poll(args):
+    """Local delivery receipts only; native task/application authority stays on the board."""
+    import sqlite3
+    identity = session()
+    if not identity or not identity.get('session'):
+        fail('subscription needs a genuine agent session')
+    name = args.subscribe
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', name):
+        fail('subscription name requires 1..64 letters, digits, underscores or hyphens')
+    scope = sorted(set(getattr(args, 'scope_task', None) or []))
+    if any(type(n) is not int or n <= 0 for n in scope):
+        fail('subscription scope requires positive task IDs')
+    owner = {'repo': CONFIG['repo'], 'subscriber': recipient('subscriber', identity), 'name': name}
+    key = hashlib.sha256(json.dumps(owner, sort_keys=True).encode()).hexdigest()
+    folder = CONFIG['root'] / '.taskq'
+    folder.mkdir(exist_ok=True)
+    path = folder / 'pm-receipts.sqlite'
+    if path.is_symlink():
+        fail('subscription receipt path is a symlink; no changes')
+    db = sqlite3.connect(path, timeout=5)
+    try:
+        if os.name != 'nt':
+            os.chmod(path, 0o600)
+        db.execute('CREATE TABLE IF NOT EXISTS subscriber (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT body FROM subscriber WHERE id=?', (key,)).fetchone()
+        state = json.loads(row[0]) if row else {'scope': scope, 'known': {}, 'initialized': False,
+                                               'pending': None, 'last_ack': None}
+        if state['scope'] != scope:
+            fail('subscription scope changed; use a new name and review its snapshot')
+        ack = getattr(args, 'delivery_ack', None)
+        if ack:
+            pending = state['pending']
+            if pending and pending['digest'] == ack:
+                state['known'] = pending['known']
+                state['initialized'] = True
+                state['pending'] = None
+                state['last_ack'] = ack
+                output = {'type': 'taskq.delivery', 'digest': ack, 'repeated': False}
+            elif not pending and state['last_ack'] == ack:
+                output = {'type': 'taskq.delivery', 'digest': ack, 'repeated': True}
+            else:
+                fail('unknown delivery digest; pending envelope and cursor unchanged')
+        elif state['pending']:
+            return state['pending']['wire']  # stable replay; no second observation overtakes delivery
+        else:
+            listed = [i for i in BOARD.list(None) if BLOCK.search(i.get('body') or '')]
+            ids = set(scope) if scope else {i['iid'] for i in listed} | set(map(int, state['known']))
+            if len(ids) > 200:
+                fail('subscription task bound exceeded; narrow scope without dropping its cursor')
+            known, observations, events, gaps = {}, [], [], []
+            for n in sorted(ids):
+                issue = read_issue(n)  # includes closed known tasks; list alone is not freshness proof
+                raw = issue_data(issue)
+                if raw.get('event_schema') != EVENT_SCHEMA:
+                    fail('subscription requires current native task schema; no cursor advanced')
+                seq = raw.get('event_seq', 0)
+                if type(seq) is not int or seq < 0:
+                    fail('malformed event cursor; no cursor advanced')
+                previous = state['known'].get(str(n))
+                if previous and seq < previous['seq']:
+                    fail('event cursor moved backwards; no cursor advanced')
+                observation = {'task': n, 'state': issue['state'] if issue['state'] == 'closed' else
+                               next((x[len(PREFIX):] for x in issue['labels'] if x.startswith(PREFIX)
+                                     and x[len(PREFIX):] in STATES), 'unknown'),
+                               'title': issue['title'], 'claim': raw.get('claim'), 'supervisor': raw.get('supervisor'),
+                               'decision': raw.get('decision'), 'authority': raw.get('pm'), 'event_seq': seq}
+                digest = hashlib.sha256(json.dumps(observation, sort_keys=True).encode()).hexdigest()
+                known[str(n)] = {'seq': seq, 'digest': digest}
+                if not previous or previous['digest'] != digest:
+                    observations.append(observation)
+                retained = {e['id']: e for e in [*raw.get('events', []), *([raw['action']] if raw.get('action') else [])]}
+                start = previous['seq'] + 1 if previous else seq + 1  # initial snapshot isn't historical replay
+                available = sorted(k for k in retained if start <= k <= seq)
+                if previous and len(available) != seq - previous['seq']:
+                    gaps.append({'task': n, 'from': start, 'through': seq, 'available': available,
+                                 'reason': 'board-history-not-retained'})
+                for event_id in available:
+                    events.append({'task': n, **retained[event_id]})
+            if state['initialized'] and not observations and not events and not gaps:
+                return None  # unchanged is quiet; no cursor write is needed
+            output = {'type': 'taskq.subscription', 'version': 1, 'subscription': owner,
+                      'mode': 'delta' if state['initialized'] else 'snapshot', 'scope': scope,
+                      'observed_at': datetime.now(timezone.utc).isoformat(),
+                      'atomic_snapshot': False, 'untrusted_task_content': True,
+                      'tasks': observations, 'events': events, 'gaps': gaps}
+            digest = hashlib.sha256(json.dumps(output, sort_keys=True).encode()).hexdigest()
+            output['digest'] = digest
+            wire = json.dumps(output, ensure_ascii=False, sort_keys=True)
+            state['pending'] = {'digest': digest, 'wire': wire, 'known': known}
+        db.execute('INSERT OR REPLACE INTO subscriber VALUES (?,?)', (key, json.dumps(state, sort_keys=True)))
+        db.commit()
+        return state['pending']['wire'] if state['pending'] else json.dumps(output, sort_keys=True)
+    finally:
+        db.close()  # uncommitted errors/returns roll back; pending replay never changes native board ACK
+
+
 def cmd_pm(args):
+    if getattr(args, 'subscribe', None):
+        if args.adopt:
+            fail('subscription interest is not adoption authority')
+        wire = subscription_poll(args)
+        if wire is not None:
+            print(wire)
+        return
     """The manager role: Principles and § 7 of taskq.md, then how to tick this session; the hash goes to .taskq/pm.json,
     nothing else: a task's manager is its own `pm` on the board (R3, #532). `--adopt N`: become the `pm` of tasks with none."""
     me = session() or {}
@@ -4898,8 +5004,10 @@ def main(argv=None):
     command('applied', cmd_applied, (('event',), {}), (('--artifact',), {'required': True}), (('--sha',), {'required': True}), n=False)
     command('apply-event', cmd_apply_event, (('event',), {}), (('--artifact',), {'required': True}), (('--role',), {'choices': ('worker', 'manager'), 'default': 'worker'}), n=False)
     command('ack', cmd_ack, (('events',), {'nargs': '*'}), (('--pm',), {}), (('--role',), {'choices': ('manager','supervisor')}), (('--stdin',), {'action': 'store_true'}), n=False)
-    command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}), n=False)
-    command('pm', cmd_pm, (('--adopt',), {'nargs': '+', 'type': int, 'default': []}), n=False)
+    command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}),
+            (('--execute',), {'action':'store_true'}), (('--scope-task',), {'type':int,'nargs':'+'}), n=False)
+    command('pm', cmd_pm, (('--adopt',), {'nargs': '+', 'type': int, 'default': []}),
+            (('--subscribe',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), (('--delivery-ack',), {}), n=False)
     command('cleanup', cmd_cleanup, (('--dry-run',), {'action': 'store_true'}), n=False)
     command('launch', cmd_launch, (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
             (('arguments',), {'nargs': argparse.REMAINDER}), n=False)
@@ -4912,6 +5020,16 @@ def main(argv=None):
     command('update', cmd_update, (('--commit',), {}), (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
             (('--qualification',), {}), (('--apply',), {'action': 'store_true'}), n=False)
     args = parser.parse_args(argv)
+    if args.command == 'arm' and args.execute:
+        if args.target or args.scope_task and any(n <= 0 for n in args.scope_task):
+            fail('execution scope is not PM target; use positive task IDs')
+        args.command = 'tick'
+        args.function = event_pass
+        args.quiet, args.headless, args.tasks, args.after = True, True, [], None
+        args.after_birth, args.diagnose, args.unknown_after = None, False, None
+        args.execution_scope = args.scope_task
+    if args.command == 'pm' and args.delivery_ack and not args.subscribe:
+        fail('delivery ACK requires a named subscription')
     if args.command in ('launch', 'update', 'version', 'contract', 'capacity-child'):
         return args.function(args)  # source installation needs no consumer project or board adapter
     if BOARD is None:
@@ -4922,7 +5040,7 @@ def main(argv=None):
         fail('qualified board capacity provider and explicit host/project caps required; no defaults')
     if 'TASKQ_HOST_ONLY' in os.environ and (not os.environ['TASKQ_HOST_ONLY'] or os.environ['TASKQ_HOST_ONLY'] != machine()):
         fail('TASKQ_HOST_ONLY must equal this machine name (TASKQ_HOST / hosts)')
-    if args.command == 'wait' and not args.task or args.command == 'tick' and not args.quiet or args.command == 'pm':
+    if args.command == 'wait' and not args.task or args.command == 'tick' and not args.quiet or args.command == 'pm' and not args.subscribe:
         refresh(args.command == 'pm')
     writes = args.command in ('add', 'take', 'ask', 'answer', 'result', 'requeue', 'run', 'later', 'close', 'ack', 'applied', 'apply-event', 'lifecycle') or \
         args.command == 'cleanup' and not args.dry_run

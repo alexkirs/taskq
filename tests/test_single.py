@@ -1812,6 +1812,19 @@ class RecoveryTimeout(TickSetup):
 
 class Tick(TickSetup):
 
+    def test_arm_execution_scope_limits_admissions_without_pm_subscription(self):
+        with mock.patch.object(taskq, 'dispatch'):
+            self.add('selected task')
+            self.add('outside task')
+        with mock.patch.object(taskq, 'dispatch_manager', return_value=None), \
+                mock.patch.object(taskq, 'runtimes', return_value={'fake':self.fake}), \
+                mock.patch.object(taskq, 'spawn_named', return_value=None) as admit, \
+                mock.patch.object(taskq, 'subscription_poll', side_effect=AssertionError('no subscription')):
+            self.run_cli('arm','tick','--execute','--scope-task','1')
+        self.assertEqual([call.args[0]['iid'] for call in admit.call_args_list],[1])
+        self.assertEqual(self.task(2)['state'],'ready')
+
+
     def test_idle_model_ownership_does_not_preempt_finite_turn_admission(self):
         pm = {'runtime': 'codex', 'session': 'pm', 'name': 'mac'}
         taskq.CONFIG.update(capacity={'host_caps': {'model:codex':4}}, limits={'codex':4, 'claude':0})

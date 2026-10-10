@@ -78,6 +78,13 @@ title on every runtime (§ 8): Claude `--name` on spawn and resume; Codex `threa
 `thread/read` (`exec resume` keeps it); and the first line of every brief, the title a runtime falls back to. A
 session whose name is not confirmed is no spawn: it is stopped, a `gone` note records its id (R11 retires it), and
 the pass fails (§ 7).
+Changed (#614, Windows startup incident 2026-10-10): `thread.started` was treated as immediately
+nameable by another app-server -> only `thread/name/set` error -32600 with the exact known missing-rollout
+message naming that same thread ID is retried while its owned process remains running, within the existing
+single 60-second naming/shutdown deadline.
+A started ID is not proof of persisted rollout readiness. Every other RPC error fails immediately;
+name acknowledgement and matching `thread/read` remain mandatory before spawn is accepted. Timeout still
+stops the owned turn, preserves its handle and records the failed spawn; retries do not start another turn.
 Changed: ORCH from the session that ran the pass, and Codex threads titled by the brief's first line `You are the
 taskq supervisor ...` → ORCH from the task's `pm`, Codex threads named natively (#572).
 Changed: four roles (root PM, tick, supervisor, worker) → three plus the owner. The supervisor reviewed, published

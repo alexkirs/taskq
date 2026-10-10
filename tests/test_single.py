@@ -4182,6 +4182,23 @@ class Contract(Base):
                 waited.assert_not_called()
             self.assertEqual(os.environ['TASKQ_RELEASE_COMMIT'], release.name)
 
+    def test_managed_launcher_preserves_inherited_stdin_stdout_stderr_and_exit(self):
+        install = self.root / 'installed'
+        release = install / 'releases' / ('a' * 40)
+        release.mkdir(parents=True)
+        (release / 'taskq.md').write_text('fixture contract', encoding='utf-8')
+        (release / 'taskq.py').write_text(
+            "import sys\nvalue=sys.stdin.buffer.read()\nsys.stdout.buffer.write(value)\n"
+            "sys.stderr.buffer.write(b'fixture diagnostic')\nsys.exit(7)\n", encoding='utf-8')
+        (install / 'current.json').write_text(json.dumps({'commit': release.name, 'path': str(release)}), encoding='utf-8')
+        original = 'exact Юникод 😀 input\r\nsecond line\n'.encode('utf-8')
+        with mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
+            child = REAL_RUN([sys.executable, str(ROOT / 'taskq.py'), 'launch', '--install-dir', str(install)],
+                             cwd=self.root, input=original, capture_output=True, env=dict(os.environ), timeout=15)
+        self.assertEqual(child.returncode, 7)
+        self.assertEqual(child.stdout, original)
+        self.assertEqual(child.stderr, b'fixture diagnostic')
+
     def test_managed_launcher_refuses_invalid_or_escaping_release(self):
         install = self.root / 'installed'
         release = install / 'releases' / ('a' * 40)

@@ -2772,7 +2772,7 @@ def cmd_launch(args):
     os.environ['TASKQ_RELEASE_COMMIT'] = commit
     command = [sys.executable, str(expected / 'taskq.py'), *argv]
     if os.name == 'nt':  # Windows execv can exit the observed parent before the spawned interpreter finishes.
-        raise SystemExit(subprocess.run(command, **no_window()).returncode)
+        raise SystemExit(subprocess.run(command).returncode)
     os.execv(sys.executable, command)
 
 

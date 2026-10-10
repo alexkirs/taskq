@@ -1426,7 +1426,8 @@ supported explicit named profile and disposable local-only Git fetch (owner corr
   `claude.ps1` blocked by the execution policy: use `claude.cmd` (#139).
 - Every command in this file runs in PowerShell as written, except `export`: use `$env:NAME=value;`.
 - Core noninteractive subprocesses (board/git commands, runtime probes and app-server naming, the
-  compression helper and managed CLI forwarding) use `CREATE_NO_WINDOW` on Windows. Existing
+  compression helper) use `CREATE_NO_WINDOW` on Windows. Managed CLI forwarding retains inherited
+  stdin/stdout/stderr and does not request this flag. Existing
   detached worker/event-pass flags remain unchanged; output capture, stdin and ownership checks
   retain their contracts. This does not control consoles launched independently by external tools.
 - Codex workers start detached (`DETACHED_PROCESS`); their pid check uses the Windows API.

@@ -1981,18 +1981,21 @@ class Tick(TickSetup):
         server.chmod(0o755)
         def launch(command, **kwargs):
             return REAL_POPEN(([sys.executable, *command] if os.name == 'nt' else command), **kwargs)
-        for mode in ('rollout-late', 'rollout-never', 'rollout-exited', 'rollout-unowned', 'set-other-error', 'set-wrong-code', 'set-wrong-thread'):
+        for mode in ('rollout-late', 'rollout-never', 'rollout-exited', 'rollout-unowned', 'set-other-error', 'set-wrong-code', 'set-wrong-thread',
+                     'empty-late', 'empty-posix', 'empty-never', 'empty-exited', 'empty-unowned', 'empty-wrong-code',
+                     'empty-wrong-thread', 'empty-wrong-file', 'empty-wrong-path', 'empty-wrong-wrapper',
+                     'empty-uri', 'empty-relative', 'empty-corrupt', 'empty-read'):
             log = self.root / f'{mode}.log'
             with self.subTest(mode=mode), mock.patch.object(taskq.subprocess, 'Popen', launch), \
                     mock.patch.object(taskq.shutil, 'which', return_value=str(server)), \
                     mock.patch.object(taskq.Codex, 'WAIT', 3), \
                     mock.patch.dict(os.environ, {'FAKE_MODE': mode, 'FAKE_LOG': str(log)}):
                 owned = mock.Mock()
-                owned.poll.return_value = 0 if mode == 'rollout-exited' else None
-                if mode == 'rollout-unowned':
+                owned.poll.return_value = 0 if mode in ('rollout-exited', 'empty-exited') else None
+                if mode in ('rollout-unowned', 'empty-unowned'):
                     owned = None
                 began = taskq.time.monotonic()
-                if mode == 'rollout-late':
+                if mode in ('rollout-late', 'empty-late', 'empty-posix'):
                     taskq.Codex().title('th', 'S1 CDX one (mac)', process=owned)
                 else:
                     with self.assertRaises((OSError, ValueError)):
@@ -2001,15 +2004,15 @@ class Tick(TickSetup):
                 methods = log.read_text().splitlines()
                 sets = methods.count('thread/name/set')
                 self.assertEqual(methods.count('initialize'), 1)
-                if mode == 'rollout-late':
+                if mode in ('rollout-late', 'empty-late', 'empty-posix'):
                     self.assertEqual(sets, 3)
                     self.assertEqual(methods[-1], 'thread/read')
-                elif mode == 'rollout-never':
+                elif mode in ('rollout-never', 'empty-never'):
                     self.assertGreater(sets, 1)
                     self.assertNotIn('thread/read', methods)
                 else:
                     self.assertEqual(sets, 1)
-                    self.assertNotIn('thread/read', methods)
+                    self.assertEqual(methods.count('thread/read'), int(mode == 'empty-read'))
 
     def test_codex_unnamed_spawn_stops_and_keeps_its_handle(self):
         # R3 (#572): a thread whose name is not confirmed never counts as spawned: its turn is stopped, its pid file kept
@@ -3882,7 +3885,25 @@ for line in sys.stdin:
     seen.add(message['id'])
     sets += message['method'] == 'thread/name/set'
     out = [{'method': 'note'}, {'id': -9, 'method': 'ask'}, {'id': -7, 'result': {}}]  # notifications and others first, slowly
-    if message['method'] == 'thread/name/set' and (mode in ('set-error', 'rollout-never', 'rollout-exited', 'rollout-unowned', 'set-other-error', 'set-wrong-code', 'set-wrong-thread') or mode == 'rollout-late' and sets < 3):
+    if mode.startswith('empty-') and ((message['method'] == 'thread/name/set' and mode != 'empty-read'
+                                     and (mode not in ('empty-late', 'empty-posix') or sets < 3))
+                                    or mode == 'empty-read' and message['method'] == 'thread/read'):
+        thread = message['params']['threadId']
+        filename = 'rollout-2026-10-10T07-22-27-' + ('other' if mode == 'empty-wrong-file' else thread) + '.jsonl'
+        path = ('/home/test/.codex/sessions/2026/10/10/' if mode == 'empty-posix' else
+                'C:' + chr(92) + 'Users' + chr(92) + 'test space' + chr(92) + '.codex' + chr(92)) + filename
+        if mode in ('empty-uri', 'empty-relative'):
+            path = ('file:///home/test/' if mode == 'empty-uri' else 'relative/') + filename
+        reason = ('failed to set thread name: Fatal error: failed to update thread metadata '
+                  + ('other' if mode == 'empty-wrong-thread' else thread)
+                  + ': thread-store internal error: failed to read session metadata ' + path
+                  + ': rollout at ' + (path.replace('test space', 'foreign') if mode == 'empty-wrong-path' else path)
+                  + (' is corrupt' if mode == 'empty-corrupt' else ' is empty'))
+        if mode == 'empty-wrong-wrapper':
+            reason = reason.replace('failed to update thread metadata', 'failed to update another resource')
+        out.append({'id': message['id'], 'error': {'code': -32600 if mode == 'empty-wrong-code' else -32603,
+                                                 'message': reason}})
+    elif message['method'] == 'thread/name/set' and (mode in ('set-error', 'rollout-never', 'rollout-exited', 'rollout-unowned', 'set-other-error', 'set-wrong-code', 'set-wrong-thread') or mode == 'rollout-late' and sets < 3):
         out.append({'id': message['id'], 'error': {'code': -32000 if mode == 'set-wrong-code' else -32600,
                     'message': 'permission denied' if mode in ('set-error', 'set-other-error') else
                     'no rollout found for thread id ' + ('other' if mode == 'set-wrong-thread' else message['params']['threadId'])}})

@@ -953,8 +953,15 @@ class Codex:
                         error = reply.get('error')
                         missing = (isinstance(error, dict) and error.get('code') == -32600
                                    and error.get('message') == f'no rollout found for thread id {thread}')
+                        # #616: a new rollout can exist before its first session metadata line is written.
+                        empty = (isinstance(error, dict) and error.get('code') == -32603
+                                 and isinstance(error.get('message'), str) and re.fullmatch(
+                                     r'failed to set thread name: Fatal error: failed to update thread metadata '
+                                     + re.escape(thread) + r': thread-store internal error: failed to read session metadata '
+                                     + r'(?P<path>(?:[A-Za-z]:[\\/]|/|\\\\)[^:\r\n]*[\\/]rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-'
+                                     + re.escape(thread) + r'\.jsonl): rollout at (?P=path) is empty', error['message']))
                         remaining = deadline - time.monotonic()
-                        if wait_rollout and missing and remaining > 0 and process is not None and process.poll() is None:
+                        if wait_rollout and (missing or empty) and remaining > 0 and process is not None and process.poll() is None:
                             time.sleep(min(.1, remaining))
                             break  # same app-server, fresh request ID, same overall deadline
                         raise ValueError(f'{method}: {error}')

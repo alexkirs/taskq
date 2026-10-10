@@ -1315,8 +1315,12 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 | Runtime | spawn | send | alive | link | retire |
 |---|---|---|---|---|---|
 | Claude | `claude --bg --name "T<N> <ORCH> <title> (<machine>)"` in the project root; tools `Bash Read Edit Write Glob Grep WebFetch WebSearch`, no MCP, `--permission-mode dontAsk` | `claude stop`, then `claude --bg --resume <id> <text>` (a new id) | `claude agents --json --all` | Remote Control URL | `claude stop <job id>` when running, then `claude rm <job id>` |
-| Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread> <birth>` in `.taskq/T<N>.pid`; then `codex app-server`: `initialize`, `thread/name/set` the name, `thread/read` it back, each after the last one's success, all within 60 s (R3: anything else stops the turn, keeps the pid file, fails the spawn) | `codex exec resume <id> <text>` | the identified process is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` (or a replaced `T<N>-<thread>.pid`) |
+| Codex | `codex exec --json -C <root> -` (UTF-8 prompt on stdin), detached; log `.taskq/T<N>.log`, `<pid> <thread> <birth>` in `.taskq/T<N>.pid`; then `codex app-server`: `initialize`, `thread/name/set` the name, `thread/read` it back, each after the last one's success, all within 60 s (R3: anything else stops the turn, keeps the pid file, fails the spawn) | `codex exec resume <id> -` (UTF-8 prompt on stdin) | the identified process is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` (or a replaced `T<N>-<thread>.pid`) |
 
+- Codex spawn and resume pass the exact UTF-8 prompt through a temporary binary stdin stream,
+  never argv. The parent closes its temporary handle immediately after creation; the inherited child
+  handle remains readable until the child closes it. This avoids Windows command-line limits and
+  blocking pipe writes, with no persistent prompt artifact. Spawn failure closes the stream.
 - Codex spawn and resume use the same `codex` options (§ 2), defaulting to `-s danger-full-access` on every
   host (R9). The default has no workspace-sandbox network setting or `--add-dir`; those do not restrict full
   access. The process retains its launching account's OS permissions.
@@ -1421,6 +1425,10 @@ supported explicit named profile and disposable local-only Git fetch (owner corr
 - `gh`, `glab`, `claude` (`claude.cmd`), `codex` and `git` are found on `PATH`; no bash is needed by taskq.
   `claude.ps1` blocked by the execution policy: use `claude.cmd` (#139).
 - Every command in this file runs in PowerShell as written, except `export`: use `$env:NAME=value;`.
+- Core noninteractive subprocesses (board/git commands, runtime probes and app-server naming, the
+  compression helper and managed CLI forwarding) use `CREATE_NO_WINDOW` on Windows. Existing
+  detached worker/event-pass flags remain unchanged; output capture, stdin and ownership checks
+  retain their contracts. This does not control consoles launched independently by external tools.
 - Codex workers start detached (`DETACHED_PROCESS`); their pid check uses the Windows API.
 - Name the machine in `hosts` (`"DESKTOP-7": "win"`) or with `TASKQ_HOST=win`; a task for it only: `--host win`.
 

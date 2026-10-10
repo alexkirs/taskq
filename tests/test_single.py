@@ -2541,6 +2541,7 @@ class Tick(TickSetup):
         server.chmod(0o755)
         # Windows does not execute a shebang: use the real Python process for this same fake stdio server.
         def launch(command, **kwargs):
+            self.assertEqual(kwargs.get('creationflags', 0), 0x08000000 if os.name == 'nt' else 0)
             return REAL_POPEN(([sys.executable, *command] if os.name == 'nt' else command), **kwargs)
         cases = {'ok': None, 'set-error': 'thread/name/set: ', 'wrong-name': "thread/read: th named 'other'",
                  'silent': 'initialize: no reply', 'hang': None}
@@ -2565,6 +2566,7 @@ class Tick(TickSetup):
         server.write_text(f'#!{sys.executable}\n' + APP_SERVER)
         server.chmod(0o755)
         def launch(command, **kwargs):
+            self.assertEqual(kwargs.get('creationflags', 0), 0x08000000 if os.name == 'nt' else 0)
             return REAL_POPEN(([sys.executable, *command] if os.name == 'nt' else command), **kwargs)
         for mode in ('rollout-late', 'rollout-never', 'rollout-exited', 'rollout-unowned', 'set-other-error', 'set-wrong-code', 'set-wrong-thread',
                      'empty-late', 'empty-posix', 'empty-never', 'empty-exited', 'empty-unowned', 'empty-wrong-code',
@@ -2925,19 +2927,24 @@ class RuntimeProcessBoundary(Base):
     """Local processes only. No installed model CLI, board network or paid calls."""
 
     def test_codex_spawn_and_resume_options_default_and_explicit_overrides(self):
-        # #620: prove the argv at a real child boundary; explicit options replace, never merge with, the default.
+        # The real child consumes exact stdin beyond Windows argv limits; options still replace the default.
         script, received = self.root / 'fake_codex.py', self.root / 'argv.jsonl'
         script.write_text("import json, pathlib, sys\n"
-                          "with pathlib.Path(sys.argv[1]).open('a') as out: out.write(json.dumps(sys.argv[2:]) + '\\n')\n"
+                          "value = {'argv': sys.argv[2:], 'prompt': sys.stdin.buffer.read().decode('utf-8')}\n"
+                          "with pathlib.Path(sys.argv[1]).open('a', encoding='utf-8') as out: out.write(json.dumps(value) + '\\n')\n"
                           "print('{\"type\":\"thread.started\",\"thread_id\":\"local-thread\"}', flush=True)\n"
                           "print('{\"type\":\"turn.completed\"}', flush=True)\n")
-        children = []
+        children, streams = [], []
         def launch(command, **kwargs):
+            self.assertLess(len(subprocess.list2cmdline(command)), 32767)
+            streams.append(kwargs['stdin'])
             child = REAL_POPEN([sys.executable, str(script), str(received), *command[1:]], **kwargs)
             children.append(child)
             return child
         custom = ['-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true',
                   '--add-dir', str(self.root / 'external git'), '-m', 'owner-model']
+        prompts = [('owner query unchanged: "quotes" \r\nЮникод 😀 ' + ('evidence\n' * 10000)),
+                   ('answer #42 [event 42:7]\r\n' + ('résumé 😀 `exact command`\n' * 10000))]
         codex = taskq.Codex()
         try:
             for options in (None, [], custom):
@@ -2948,14 +2955,15 @@ class RuntimeProcessBoundary(Base):
                         mock.patch.object(taskq, 'dispatch'), mock.patch.object(codex, 'title'):
                     if options is not None:
                         taskq.CONFIG['codex'] = options
-                    self.assertEqual(codex.spawn('T1 mock', 'spawn prompt', self.root), 'local-thread')
+                    self.assertEqual(codex.spawn('T1 mock', prompts[0], self.root), 'local-thread')
                     children[-1].wait(timeout=5)
-                    self.assertEqual(codex.send('local-thread', 'resume prompt'), 'local-thread')
+                    self.assertEqual(codex.send('local-thread', prompts[1]), 'local-thread')
                     children[-1].wait(timeout=5)
-                    commands = [json.loads(line) for line in received.read_text().splitlines()]
+                    commands = [json.loads(line) for line in received.read_text(encoding='utf-8').splitlines()]
                     self.assertEqual(commands[-2:], [
-                        ['exec', '--json', *expected, '-C', str(self.root), 'spawn prompt'],
-                        ['exec', '--json', *expected, 'resume', 'local-thread', 'resume prompt']])
+                        {'argv': ['exec', '--json', *expected, '-C', str(self.root), '-'], 'prompt': prompts[0]},
+                        {'argv': ['exec', '--json', *expected, 'resume', 'local-thread', '-'], 'prompt': prompts[1]}])
+                    self.assertTrue(all(stream.closed for stream in streams))
                     if options is not None:
                         self.assertEqual(taskq.CONFIG['codex'], expected)
         finally:
@@ -2963,6 +2971,38 @@ class RuntimeProcessBoundary(Base):
                 if child.poll() is None:
                     child.terminate()
                 child.wait(timeout=5)
+
+    def test_codex_failed_prompt_spawn_closes_stream_preserves_resume_handle(self):
+        codex, streams = taskq.Codex(), []
+        target = codex.folder() / 'T1.pid'
+        original = f'123 local-thread {BIRTH}'
+        target.write_text(original)
+        def refused(command, **kwargs):
+            streams.append(kwargs['stdin'])
+            raise OSError('synthetic launch refused')
+        with mock.patch.object(taskq.subprocess, 'Popen', refused), mock.patch.object(codex, 'state', return_value='idle'), \
+                mock.patch.object(taskq.shutil, 'which', return_value='codex'), mock.patch.object(taskq, 'dispatch') as dispatch:
+            with self.assertRaisesRegex(OSError, 'synthetic launch refused'):
+                codex.send('local-thread', 'exact answer')
+        self.assertTrue(streams[0].closed)
+        self.assertEqual(target.read_text(), original)
+        dispatch.assert_not_called()
+
+    def test_noninteractive_board_child_has_no_windows_console_and_keeps_io(self):
+        code = ('import ctypes,json,os,sys; '
+                'console=ctypes.windll.kernel32.GetConsoleWindow() if os.name=="nt" else None; '
+                'print(json.dumps({"console":console,"input":sys.stdin.read()}))')
+        calls = []
+        def run(command, **kwargs):
+            calls.append(kwargs)
+            return REAL_RUN([sys.executable, '-c', code], **kwargs)
+        body = {'query': 'exact Юникод 😀\r\n'}
+        with mock.patch.object(taskq.subprocess, 'run', run), mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN), \
+                mock.patch.object(taskq.shutil, 'which', return_value='fixture-cli'):
+            result = taskq.run_api('gh', None, 'POST', '/local-fixture', body)
+        self.assertEqual(json.loads(result['input']), body)
+        self.assertEqual(result['console'], 0 if os.name == 'nt' else None)
+        self.assertEqual(calls[0].get('creationflags', 0), 0x08000000 if os.name == 'nt' else 0)
 
     def test_spawn_preserves_unresolved_canonical_handle_before_exec(self):
         codex = taskq.Codex()

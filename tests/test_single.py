@@ -4475,10 +4475,19 @@ def link(session): return None
         self.addCleanup(folder.cleanup)
         root = Path(folder.name)
         (root / 'board.py').write_text(FILE_BOARD)
-        (root / 'fake.py').write_text(FILE_RUNTIME)
+        (root / 'fake.py').write_text(FILE_RUNTIME + '''
+original_spawn = spawn
+def spawn(name, prompt, cwd):
+    pathlib.Path(__file__).with_name('received-prompt').write_text(prompt, encoding='utf-8')
+    return original_spawn(name, prompt, cwd)
+''')
         (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'runtimes': {'fake': 'fake.py'}, 'limits': {'fake': 1}}))
-        env = {'PATH': '', 'TASKQ_HOST': 'mac', 'HOME': str(root), 'TASKQ_RUNTIME': 'fake'}  # a shell manager: the task's pm runtime  # no claude or codex on PATH: their retire fails quietly
-        done = REAL_RUN([taskq.sys.executable, str(ROOT / 'taskq.py'), 'add', 'T', '--goal', 'g', '--acceptance', 'a'],
+        # No provider environment/config/package; the real CLI and detached queue child still launch.
+        env = {'PATH': '', 'TASKQ_HOST': 'mac', 'HOME': str(root), 'USERPROFILE': str(root), 'TASKQ_RUNTIME': 'fake'}
+        if os.name == 'nt':
+            env['SYSTEMROOT'] = os.environ['SYSTEMROOT']
+        query = 'Exact owner query: "Привет 🌍"; NEVER deploy.'
+        done = REAL_RUN([taskq.sys.executable, str(ROOT / 'taskq.py'), 'add', 'T', '--goal', query, '--acceptance', 'a'],
                         cwd=root, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual((done.returncode, done.stdout), (0, '#1 ready\n'), done.stderr)
         path, end = root / '.taskq' / 'dispatch.log', taskq.time.time() + 20
@@ -4489,6 +4498,11 @@ def link(session): return None
             taskq.time.sleep(0.1)
         self.assertEqual((root / 'spawned').read_text() if (root / 'spawned').exists() else None, 'S1 UNK T (mac)', log)
         self.assertRegex(log, r'^\S+ \S+ add #1\n#1 doing\n')
+        received = (root / 'received-prompt').read_text('utf-8')
+        self.assertIn(query, received)
+        self.assertNotRegex((done.stderr + log + received).lower(),
+                            r'supercompress|compress --input|context compression|required onboarding')
+        self.assertFalse((root / '.supercompress').exists())
 
 
 @unittest.skipUnless(LINUX_HERMES, 'Hermes owner boundary requires Linux /proc and pidfds (§ 8)')

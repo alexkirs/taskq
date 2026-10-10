@@ -1,5 +1,5 @@
 """Native candidate subscription receipt cache; no network, models or timers."""
-import argparse, copy, importlib.util, json, pathlib, tempfile, unittest
+import argparse, copy, importlib.util, json, os, pathlib, tempfile, unittest
 from unittest import mock
 spec=importlib.util.spec_from_file_location('subscriptions_taskq',pathlib.Path(__file__).resolve().parents[1]/'taskq.py')
 q=importlib.util.module_from_spec(spec);spec.loader.exec_module(q)
@@ -137,6 +137,59 @@ class NamedArm(unittest.TestCase):
         self.arm('start','--name','main')
         with self.assertRaisesRegex(SystemExit,'recorded scope'):
             self.arm('tick','--name','main','--execute','--scope-task','1')
+
+    def test_scheduled_owner_shell_is_explicit_bound_and_single_instance(self):
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME':'codex','TASKQ_HOST':'fixture',
+                                          'TASKQ_LIMITS':'{"codex":4,"claude":0}'}, clear=True):
+            self.arm('start','--name','main','--scope-task','1')
+            self.identity = None
+            with mock.patch.object(q,'event_pass') as execute:
+                with self.assertRaisesRegex(SystemExit,'authorization absent'):
+                    self.arm('tick','--name','main','--execute','--scheduled')
+                execute.assert_not_called()
+            self.identity = {'runtime':'codex','session':'pm-one'}
+            first = self.arm('authorize-scheduler','--name','main')
+            self.assertEqual(self.arm('authorize-scheduler','--name','main')['activation'], first['activation'])
+            self.identity = None
+            def pass_once(args):
+                self.assertEqual(args.execution_scope,[1]); self.assertTrue(args.headless)
+                with self.assertRaisesRegex(SystemExit,'busy'):
+                    self.arm('tick','--name','main','--execute','--scheduled')
+            with mock.patch.object(q,'event_pass',side_effect=pass_once) as execute:
+                result = self.arm('tick','--name','main','--execute','--scheduled')
+                execute.assert_called_once()
+                self.assertEqual(result['executor'],'owner-shell-scheduler')
+                self.assertEqual(result['activation']['owner'], first['activation']['owner'])
+            with mock.patch.dict(os.environ, {'TASKQ_LIMITS':'{"codex":5,"claude":0}'}), mock.patch.object(q,'event_pass') as execute:
+                with self.assertRaisesRegex(SystemExit,'configuration/invocation changed'):
+                    self.arm('tick','--name','main','--execute','--scheduled')
+                execute.assert_not_called()
+            with mock.patch.dict(os.environ, {'CODEX_THREAD_ID':'copied-id'}), mock.patch.object(q,'event_pass') as execute:
+                with self.assertRaisesRegex(SystemExit,'inherited agent IDs'):
+                    self.arm('tick','--name','main','--execute','--scheduled')
+                execute.assert_not_called()
+            self.board.update.assert_not_called()
+
+    def test_scheduler_revoke_scope_update_stop_and_foreign_owner_refuse(self):
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME':'codex','TASKQ_HOST':'fixture',
+                                          'TASKQ_LIMITS':'{"codex":4,"claude":0}'}, clear=True):
+            self.arm('start','--name','main')
+            self.identity = {'runtime':'codex','session':'foreign'}
+            with self.assertRaisesRegex(SystemExit,'another session'):
+                self.arm('authorize-scheduler','--name','main')
+            self.identity = {'runtime':'codex','session':'pm-one'}
+            for action in ('revoke-scheduler','update','stop'):
+                self.arm('authorize-scheduler','--name','main')
+                if action == 'update': self.arm(action,'--name','main','--scope-task','2')
+                else: self.arm(action,'--name','main')
+                owner = self.identity; self.identity = None
+                with mock.patch.object(q,'event_pass') as execute:
+                    with self.assertRaises(SystemExit):
+                        self.arm('tick','--name','main','--execute','--scheduled')
+                    execute.assert_not_called()
+                self.identity = owner
+            with self.assertRaisesRegex(SystemExit,'owner-shell'):
+                self.arm('start','--name','main','--scheduled')
 
 class DecisionCommands(unittest.TestCase):
     setUp = Subscriptions.setUp

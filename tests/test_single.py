@@ -873,6 +873,7 @@ class ShellBriefs(Base):
         events = ['review #1 [event 1:1] "two words" \\"quoted path" Привет',
                   'review #2 [event 2:1] owner\'s $value; C:\\path with space\\']
         options = ['-c', 'test=["two words", "C:\\\\path\\\\", "%PATH%", "Привет"]']
+        expected_args = ['exec', *options, 'resume', "PM's literal", '-']
         launch = taskq.native_command
         def receiver(arguments, capture=False):
             return launch(arguments, capture=True) if capture else launch([sys.executable, str(codex), *arguments[1:]])
@@ -899,7 +900,7 @@ class ShellBriefs(Base):
                                  f'    assert sys.stdin.buffer.read().decode("utf-8").splitlines() == {events!r}\n', 'utf-8')
                 codex.write_text('import sys\nfrom pathlib import Path\n'
                                  f'with Path({str(calls)!r}).open("a", encoding="utf-8") as out: out.write("send\\n")\n'
-                                 f'assert sys.argv[1:] == { ["exec", *options, "resume", "PM's literal", "-"]!r}\n'
+                                 f'assert sys.argv[1:] == {expected_args!r}\n'
                                  f'assert sys.stdin.buffer.read().decode("utf-8").splitlines() == {events!r}\n'
                                  f'sys.exit({19 if fail_at == "send" else 0})\n', 'utf-8')
                 run = self.run_powershell(loop)

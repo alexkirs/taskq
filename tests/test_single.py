@@ -4932,7 +4932,11 @@ class HermesNativeBoundary(unittest.TestCase):
                 self.assertEqual(out.getvalue(), 'ask #1\n')
                 data = self.runtime.data_for(sid)
                 turn = self.runtime.call(sid, '_turn', turn=data['turn'])
-                self.assertEqual(turn['prompt'], 'ask #1')
+                control, separator, policy = turn['prompt'].partition('\n\nContext compression: ')
+                self.assertEqual(control, 'ask #1')  # exact event authority precedes the inherited role policy
+                self.assertTrue(separator)
+                self.assertIn('EVERY nested assignment', policy)
+                self.assertIn('NEVER compress or replace the user ask/query', policy)
                 self.assertTrue(turn['started'])
                 self.assertEqual(turn['complete']['status'], 'complete')
                 self.assertTrue(turn['complete']['persisted_turn']['complete'])

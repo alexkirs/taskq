@@ -18,6 +18,19 @@ BLOCKED. No reconcile apply command is shipped. Future application needs a
 separately reviewed identity-aware transition preserving history, pending answers,
 results and receipts with guarded fresh readback and idempotent effect proof.
 
+Changed (explicit owner approval 2026-10-11, R1/R2/R12): unresolved ownership
+blocked schema conversion -> `repair --hold-legacy` may convert the wire format
+while retaining every original identity and pending payload under an immutable
+`legacy_recovery` hold. This is neither reconciliation nor proof of drain.
+All ordinary mutations, acknowledgement, resume, replacement and automatic
+retirement of the held task are refused. An independent task may execute after
+the whole board reaches current schema and finite admission readiness passes.
+This path requires reviewed qualification that participating old native writers
+use the same project guard and refuse current schema on fresh reads; unknown
+external writers remain a startup blocker. The flag is explicit transition
+consent, never a runtime-observation receipt. No release/unhold operation ships
+with this slice. Unknown heavy resources are not released or claimed absent.
+
 taskq is a task queue on an issue board (GitHub or GitLab). One file, `taskq.py`: stdlib only, python3 >= 3.9.
 This file is the whole contract, for every agent (manager or worker) on every runtime (Claude, Codex, other).
 Below, `taskq` means `python3 <taskq clone>/taskq.py` (or its alias, § 1). Run it from the project's

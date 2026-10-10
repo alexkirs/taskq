@@ -1831,6 +1831,36 @@ class RecoveryTimeout(TickSetup):
 
 class Tick(TickSetup):
 
+    def test_idle_model_ownership_does_not_preempt_finite_turn_admission(self):
+        pm = {'runtime': 'codex', 'session': 'pm', 'name': 'mac'}
+        taskq.CONFIG.update(capacity={'host_caps': {'model:codex':4}}, limits={'codex':4, 'claude':0})
+        with mock.patch.object(taskq, 'origin', return_value=pm), mock.patch.object(taskq, 'dispatch'):
+            for n in range(4):
+                self.add('idle owner', '--runtime','codex')
+                raw = self.task(n+1)['raw']
+                raw['claim'] = {'runtime':'codex','session':f'idle-{n}','name':'mac'}
+                raw['model_turns'] = {'worker': {'phase':'complete','completion':{'terminal':'turn.completed'}}}
+                self.board.issues[n+1].update(body=taskq.block('idle owner',raw), labels=['q-doing','run-codex'])
+            self.add('new turn','--runtime','codex')
+        originals = [self.board.get(n)['body'] for n in range(1,5)]
+        with mock.patch.object(taskq,'runtimes',return_value={'codex':self.fake}), \
+                mock.patch.object(taskq,'model_reconcile'), mock.patch.object(taskq,'follow'), \
+                mock.patch.object(taskq,'spawn_named',return_value=None) as admit:
+            self.run_cli('tick')
+            self.assertEqual(admit.call_count,1)  # authority may refuse; task ownership is not a model slot
+            self.assertEqual(admit.call_args.args[0]['iid'],5)
+            self.assertEqual([self.board.get(n)['body'] for n in range(1,5)], originals)
+            self.assertEqual(self.task(5)['state'],'ready')
+
+    def test_headless_diagnostic_guard_failure_never_renders_user_report(self):
+        args = taskq.argparse.Namespace(headless=True, diagnose=True)
+        with mock.patch.object(taskq, 'one_pass', side_effect=SystemExit('project guard busy')), \
+                mock.patch.object(taskq, 'cmd_status') as report, contextlib.redirect_stdout(io.StringIO()) as output:
+            with self.assertRaisesRegex(SystemExit, 'project guard busy'):
+                taskq.cmd_tick(args)
+            report.assert_not_called()
+            self.assertEqual(output.getvalue(), '')
+
     def test_headless_remote_manager_dispatch_preserves_identity_and_foreign_tasks(self):
         pm = {'runtime': 'codex', 'session': 'native-mac-pm', 'name': 'mac'}
         taskq.CONFIG['dispatch'] = {'pm': pm, 'hosts': ['mac', 'win'], 'board_user': 'owner'}
@@ -4609,6 +4639,67 @@ class Contract(Base):
 
 
 class SchemaRepair(Base):
+
+    def test_held_wait_never_observes_gone_delivers_or_acknowledges(self):
+        issue, raw = self.legacy()
+        raw['supervisor'] = {'runtime':'codex','session':'old-supervisor','name':'mac'}
+        issue['body'] = taskq.block('preserved',raw)
+        self.run_cli('repair','--hold-legacy','--apply','--yes')
+        before = json.dumps(self.board.issues,sort_keys=True)
+        with mock.patch.object(taskq,'lead_state',return_value='dead') as probe:
+            self.assertEqual(self.run_cli('wait','--window','0').strip(),'tick')
+            with mock.patch.dict(os.environ,{'CLAUDE_CODE_SESSION_ID':'old-supervisor'}):
+                self.assertIn('legacy recovery hold',self.run_cli('wait','--task','1','--window','0'))
+            probe.assert_not_called()
+        self.assertEqual(json.dumps(self.board.issues,sort_keys=True),before)
+
+    def test_explicit_legacy_hold_preserves_identity_payload_and_blocks_mutation(self):
+        issue, raw = self.legacy()
+        raw['claim'] = {'runtime': 'codex', 'session': 'old-worker', 'name': 'win'}
+        raw['supervisor'] = {'runtime': 'codex', 'session': 'old-supervisor', 'name': 'win'}
+        raw['result'] = {'sha': 'a' * 40, 'text': 'unsurrendered result'}
+        issue['body'] = taskq.block('preserved human text', raw)
+        digest = taskq.hashlib.sha256(issue['body'].encode()).hexdigest()
+        with self.assertRaisesRegex(SystemExit, 'ownership unresolved'):
+            self.run_cli('repair', '--apply', '--yes')
+        self.run_cli('repair', '--hold-legacy', '--apply', '--yes')
+        repaired = taskq.issue_data(self.board.get(1))
+        for key, value in raw.items():
+            self.assertEqual(repaired[key], value)
+        self.assertEqual(repaired['legacy_recovery'], {'kind': 'unresolved-ownership',
+            'source_sha256': digest, 'from': 0, 'drain_proven': False})
+        before = json.dumps(self.board.issues, sort_keys=True)
+        for command in (['ask','1','--text','q'], ['answer','1','--text','a'],
+                        ['requeue','1'], ['later','1'], ['run','1'],
+                        ['result','1','--sha','a'*40,'--text','r']):
+            with self.subTest(command=command), self.assertRaisesRegex(SystemExit, 'legacy recovery hold'):
+                self.run_cli(*command)
+            self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        with self.assertRaisesRegex(SystemExit, 'legacy recovery hold'):
+            taskq.acknowledge(self.board.get(1), 'manager:*', [1])
+        with self.assertRaisesRegex(SystemExit, 'legacy recovery hold'):
+            taskq.write_task_verified(self.board.get(1), repaired, issue['labels'])
+        self.assertIn('0 task(s)', self.run_cli('repair','--hold-legacy','--apply','--yes'))
+
+    def test_held_task_cannot_resume_or_retire_but_independent_task_can_dispatch(self):
+        issue, raw = self.legacy()
+        raw['claim'] = {'runtime': 'codex', 'session': 'old-worker', 'name': 'mac'}
+        issue['body'] = taskq.block('preserved', raw)
+        self.run_cli('repair','--hold-legacy','--apply','--yes')
+        before = json.loads(json.dumps(issue))
+        pm = {'runtime': 'codex', 'session': 'current-pm', 'name': 'mac'}
+        fake = FakeRuntime()
+        taskq.CONFIG['limits'] = {'codex': 1}
+        with mock.patch.object(taskq, 'origin', return_value=pm), mock.patch.object(taskq, 'dispatch'):
+            self.add('independent', '--runtime', 'codex')
+        with mock.patch.object(taskq, 'runtimes', return_value={'codex': fake}), \
+                mock.patch.object(taskq, 'retire') as retire, \
+                mock.patch.object(taskq, 'follow') as follow:
+            self.run_cli('tick')
+            self.assertEqual(self.board.get(1), before)
+            self.assertEqual(self.task(2)['state'], 'doing')
+            retire.assert_not_called()
+            follow.assert_not_called()
     def legacy(self):
         self.add()
         issue = self.board.issues[1]

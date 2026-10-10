@@ -4318,6 +4318,130 @@ class MultiPM(Base):
 
 
 class Contract(Base):
+    def test_launcher_update_boundary_refuses_original_effect_and_consumes_marker(self):
+        with mock.patch.dict(os.environ, TASKQ_LAUNCH_BOUNDARY='1', TASKQ_INSTALL_DIR=str(self.root)), \
+                mock.patch.object(taskq, 'release_reason', return_value=None), \
+                mock.patch.object(taskq, 'compatible_update', return_value=True) as update, \
+                mock.patch.object(taskq, 'load_config', side_effect=AssertionError('project loaded before transition')), \
+                mock.patch.object(taskq, 'cmd_tick', side_effect=AssertionError('original effects executed')):
+            with self.assertRaisesRegex(SystemExit, 'original command was not executed'):
+                self.run_cli('tick')
+            update.assert_called_once_with(self.root)
+            self.assertNotIn('TASKQ_LAUNCH_BOUNDARY', os.environ)
+
+    def publication(self):
+        pair = {'commit': 'a' * 40, 'contract': 'c' * 64}
+        return dict(commit='b' * 40, contract='d' * 64, event_schema=taskq.EVENT_SCHEMA,
+                    protocol=1, compatible_from=[pair], qualified_hosts=['win', 'wsl'], tests='passed', review='accepted')
+
+    def test_automatic_publication_requires_exact_qualified_pair_host_and_tag(self):
+        good = self.publication()
+        cases = [(good, {}, 'b' * 40, 'win', True)]
+        for field, value in (('commit', 'short'), ('contract', 'short'), ('event_schema', 99),
+                             ('protocol', 2), ('protocol', True), ('review', 'pending'), ('tests', 'failed'),
+                             ('qualified_hosts', []), ('qualified_hosts', 'win'), ('compatible_from', []), ('compatible_from', [{}])):
+            cases.append((dict(good, **{field: value}), {}, 'b' * 40, 'win', False))
+        cases.extend((good, override, 'b' * 40, 'win', False) for override in
+                     ({'draft': True}, {'prerelease': True}, {'author': {'login': 'other'}}))
+        cases.extend([(good, {}, 'a' * 40, 'win', False), (good, {}, 'b' * 40, None, False)])
+        for evidence, overrides, tag_sha, host, allowed in cases:
+            publication = dict(draft=False, prerelease=False, author={'login': 'alexkirs'},
+                               body=json.dumps(evidence), tag_name='qualified-579')
+            publication.update(overrides)
+            answers = [mock.Mock(returncode=0, stdout=json.dumps(publication)),
+                       mock.Mock(returncode=0, stdout=json.dumps({'sha': tag_sha}))]
+            with self.subTest(evidence=evidence, overrides=overrides, host=host), \
+                    mock.patch.object(taskq, 'update_host', return_value=host), \
+                    mock.patch.object(taskq.shutil, 'which', return_value='gh'), \
+                    mock.patch.object(taskq.subprocess, 'run', side_effect=answers) as query:
+                if allowed:
+                    self.assertEqual(taskq.qualified_publication(), good)
+                else:
+                    with self.assertRaises(SystemExit):
+                        taskq.qualified_publication()
+                self.assertTrue(all(call.kwargs['timeout'] == 10 for call in query.call_args_list))
+                self.assertTrue(all('github.com' in call.args[0] for call in query.call_args_list))
+
+    def test_automatic_offline_cache_preserves_selection_and_rechecks_after_window(self):
+        (self.root / 'current.json').write_text('untouched')
+        with mock.patch.object(taskq, 'qualified_publication', side_effect=SystemExit('offline')) as query, \
+                mock.patch.object(taskq.time, 'time', return_value=1000), contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertFalse(taskq.compatible_update(self.root))
+            self.assertFalse(taskq.compatible_update(self.root))
+            query.assert_called_once()
+            self.assertIn('freshness unknown', errors.getvalue())
+            self.assertEqual((self.root / 'current.json').read_text(), 'untouched')
+        with mock.patch.object(taskq, 'qualified_publication', return_value=dict(commit=self.root.name)) as query, \
+                mock.patch.object(taskq.time, 'time', return_value=1301):
+            self.assertFalse(taskq.compatible_update(self.root))
+            query.assert_called_once()
+
+    def test_qualified_predecessor_can_finish_but_cannot_dispatch(self):
+        install = self.root / 'install'
+        old = install / 'releases' / ('a' * 40)
+        old.mkdir(parents=True)
+        (old / 'taskq.md').write_text('old contract')
+        pair = dict(commit=old.name, contract=taskq.hashlib.sha256((old / 'taskq.md').read_bytes()).hexdigest())
+        pointer = install / 'current.json'
+        pointer.write_text(json.dumps(dict(commit=old.name, path=str(old))))
+        with mock.patch.object(taskq, 'CLONE', old), mock.patch.dict(os.environ, TASKQ_INSTALL_DIR=str(install)):
+            self.add('completion receipt')
+            self.run_cli('take', '1')
+            pointer.write_text(json.dumps(dict(commit='b' * 40, path=str(install / 'releases' / ('b' * 40)), compatible_from=[pair])))
+            self.assertIsNone(taskq.release_reason(continuation=True))
+            self.assertIsNotNone(taskq.release_reason())
+            with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(taskq, 'start_pass') as child:
+                self.run_cli('ask', '1', '--text', 'completion preserved')
+                self.assertEqual(self.task(1)['state'], 'ask')
+                self.assertIn('completion preserved', self.board.get(1)['body'])
+                taskq.dispatch('result', [579])
+                child.assert_not_called()
+            self.assertFalse(taskq.GUARD.completion)
+            with self.assertRaisesRegex(SystemExit, 'stale or invalid'):
+                taskq.effect(self.board.comment, 1, 'outside completion command')
+            (old / 'taskq.md').write_text('changed contract')
+            self.assertIsNotNone(taskq.release_reason(continuation=True))
+
+    def test_automatic_install_real_git_verifies_contract_and_retained_predecessors(self):
+        origin, writer, install = self.root / 'origin.git', self.root / 'writer', self.root / 'install'
+        with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
+            REAL_RUN(['git', 'init', '-q', '--bare', str(origin)], check=True)
+            REAL_RUN(['git', 'clone', '-q', str(origin), str(writer)], check=True, capture_output=True)
+            self.git(writer, 'checkout', '-qb', 'main')
+            (writer / 'taskq.py').write_text(f'print({json.dumps(dict(event_schema=taskq.EVENT_SCHEMA, update_protocol=1))!r})\n')
+            (writer / 'taskq.md').write_text('A\n')
+            self.git(writer, 'add', '.')
+            self.git(writer, 'commit', '-qm', 'A')
+            self.git(writer, 'push', '-qu', 'origin', 'main')
+            first = taskq.update_git(writer, 'rev-parse', 'HEAD')
+            proof = self.root / 'proof.json'
+            proof.write_text(json.dumps(dict(commit=first, upstream=str(origin), tests='passed', review='accepted')))
+            with mock.patch.object(taskq, 'CLONE', writer), mock.patch.object(taskq, 'qualified_checks'):
+                self.run_cli('update', '--install-dir', str(install), '--commit', first, '--apply', '--qualification', str(proof))
+            old = install / 'releases' / first
+            pair = dict(commit=first, contract=taskq.hashlib.sha256((old / 'taskq.md').read_bytes()).hexdigest())
+            (writer / 'taskq.md').write_text('B\n')
+            self.git(writer, 'commit', '-qam', 'B')
+            self.git(writer, 'push', '-q', 'origin', 'main')
+            second = taskq.update_git(writer, 'rev-parse', 'HEAD')
+            evidence = dict(self.publication(), commit=second, compatible_from=[pair],
+                            contract=taskq.hashlib.sha256(b'B\n').hexdigest())
+            pointer = install / 'current.json'
+            before = pointer.read_text()
+            with mock.patch.object(taskq, 'CLONE', old), mock.patch.object(taskq, 'qualified_checks'):
+                args = taskq.argparse.Namespace(install_dir=str(install), commit=second, apply=True,
+                                               qualification=None, qualification_data=evidence)
+                for bad in (dict(evidence, compatible_from=[]), dict(evidence, contract='e' * 64)):
+                    args.qualification_data = bad
+                    with self.assertRaises(SystemExit):
+                        taskq.cmd_update(args)
+                    self.assertEqual(pointer.read_text(), before)
+                args.qualification_data = evidence
+                taskq.cmd_update(args)
+                self.assertEqual(json.loads(pointer.read_text())['compatible_from'], [pair])
+                with self.assertRaisesRegex(SystemExit, 'selected source changed'):
+                    taskq.cmd_update(args)
+
     """The running release owns its contract; explicit updates never replace running code."""
 
     def git(self, folder, *argv):

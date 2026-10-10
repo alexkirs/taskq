@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
-import argparse, contextlib, glob, hashlib, importlib.util, json, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, uuid
+import argparse, contextlib, glob, hashlib, importlib.util, io, json, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -121,7 +121,7 @@ def mine(item):
     return not wanted or wanted in item['assignees']
 
 def compatibility_reason(item):
-    stale = release_reason()
+    stale = release_reason(continuation=getattr(GUARD, 'completion', False))
     if stale:
         return stale
     version = item['raw'].get('event_schema', 0)
@@ -346,7 +346,7 @@ def coordination_api(tool, host, method, path, body=None):
 
 def effect(function, *args, **kwargs):
     """An exception after effects begin poisons this grant, even when a caller catches it."""
-    reason = release_reason()
+    reason = release_reason(continuation=getattr(GUARD, 'completion', False))
     if reason:
         fail(reason)
     held = getattr(GUARD, 'held', None)
@@ -1998,9 +1998,13 @@ def powershell(runtime):
 def shell_quote(value, native=False):
     return "'" + str(value).replace("'", "''") + "'" if native else shlex.quote(str(value))
 
-def queue_tool(runtime):
+def queue_tool(runtime, launch=False):
     script = Path(__file__).resolve()
-    return native_command([sys.executable, str(script)], capture=True) if powershell(runtime) else f'python3 {script}'
+    arguments = [sys.executable, str(script)]
+    if launch and os.environ.get('TASKQ_INSTALL_DIR'):
+        arguments += ['launch', '--install-dir', os.environ['TASKQ_INSTALL_DIR'], '--']
+    return native_command(arguments, capture=True) if powershell(runtime) else \
+        (' '.join(shlex.quote(value) for value in ['python3', *arguments[1:]]) if launch else f'python3 {script}')
 
 def native_command(arguments, capture=False):
     """PS 5.1 reparses native argv. Pass a quote-free program to Python; it preserves argv and inherited stdio."""
@@ -2039,7 +2043,7 @@ def brief(item, runtime):
     return f'''{worker_name(item)}
 You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
 Queue tool: `{tq}`. {shell_instructions(runtime, n)}
-{release_context()}
+{release_context(runtime)}
 Read `{Path(__file__).resolve().with_name("taskq.md")}` first and do only what it allows (R13): a task that conflicts with a recorded decision is an ask with options, not an edit.
 
 {item["text"]}
@@ -2074,7 +2078,7 @@ def supervisor_brief(item, runtime, kind):
 You are the taskq supervisor S{n} of task #{n}: {item["title"]}. You are its only controller: you order its worker, follow it,
 review its result and close or rework it. You never edit the task's code, never start a session yourself, never decide for the owner.
 Queue tool: `{tq}`. {shell_instructions(runtime, n)}
-{release_context()}
+{release_context(runtime)}
 Read `{Path(__file__).resolve().with_name("taskq.md")}` (§ 7 Supervisor, § 6) first and do only what it allows (R13).
 
 {item["text"]}
@@ -4532,8 +4536,8 @@ def contract():
     path = CLONE / 'taskq.md'
     return hashlib.sha256(path.read_bytes()).hexdigest()[:12] if path.is_file() else None
 
-def release_reason():
-    """Managed launchers select once; older cooperative processes become read-only after pointer switch."""
+def release_reason(continuation=False):
+    """Older cooperative processes stop new work; qualified predecessors may complete receipts."""
     folder = os.environ.get('TASKQ_INSTALL_DIR')
     if not folder:
         return None  # direct source invocation is not a managed installation
@@ -4542,13 +4546,28 @@ def release_reason():
         path = Path(selected['path']).resolve()
         if path == CLONE.resolve() and selected['commit'] == CLONE.name and re.fullmatch(r'[0-9a-f]{40}', selected['commit']):
             return None
+        if continuation and re.fullmatch(r'[0-9a-f]{40}', selected['commit']) \
+                and path == Path(folder).resolve() / 'releases' / selected['commit'] \
+                and {'commit': CLONE.name, 'contract': hashlib.sha256((CLONE / 'taskq.md').read_bytes()).hexdigest()} in selected.get('compatible_from', []):
+            return None  # qualified receipts only; dispatch and admission retain the strict gate
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return 'stale or invalid installed release; use the taskq launcher and re-read taskq pm before further mutations'
 
 
-def release_context():
-    return f'Loaded TaskQ release: {CLONE}; contract {contract() or "unavailable"}. For a new turn use the taskq launcher and re-read its contract.'
+@contextlib.contextmanager
+def completion_release(enabled):
+    previous = getattr(GUARD, 'completion', False)
+    GUARD.completion = enabled
+    try:
+        yield
+    finally:
+        GUARD.completion = previous
+
+
+def release_context(runtime=None):
+    launcher = queue_tool(runtime or os.environ.get('TASKQ_RUNTIME'), launch=True)
+    return f'Loaded TaskQ release: {CLONE}; contract {contract() or "unavailable"}; board schema {EVENT_SCHEMA}. For a new turn use `{launcher} contract`, read the selected taskq.md, then use `{launcher}` for commands. Agent rule adoption is unverified until acknowledged.'
 
 
 def cmd_launch(args):
@@ -4574,6 +4593,7 @@ def cmd_launch(args):
     argv = args.arguments[1:] if args.arguments[:1] == ['--'] else args.arguments
     os.environ['TASKQ_INSTALL_DIR'] = str(root)
     os.environ['TASKQ_RELEASE_COMMIT'] = commit
+    os.environ['TASKQ_LAUNCH_BOUNDARY'] = '1'
     command = [sys.executable, str(expected / 'taskq.py'), *argv]
     if os.name == 'nt':  # Windows execv can exit the observed parent before the spawned interpreter finishes.
         raise SystemExit(subprocess.run(command).returncode)
@@ -4582,7 +4602,7 @@ def cmd_launch(args):
 
 def cmd_version(args):
     git = shutil.which('git')
-    data = {'source': str(CLONE), 'commit': None, 'dirty': None, 'contract': contract(), 'event_schema': EVENT_SCHEMA,
+    data = {'source': str(CLONE), 'commit': None, 'dirty': None, 'contract': contract(), 'event_schema': EVENT_SCHEMA, 'update_protocol': 1,
             'install': os.environ.get('TASKQ_INSTALL_DIR'), 'stale': bool(release_reason())}
     if git:
         for key, command in (('commit', ['rev-parse', 'HEAD']), ('dirty', ['status', '--porcelain', '--untracked-files=all'])):
@@ -4884,6 +4904,8 @@ def installation_lock(root):
 
 
 def verify_release(release, commit, upstream):
+    if release.resolve() != release:
+        fail('update release directory is linked; pointer unchanged')
     if update_git(release, 'remote', 'get-url', 'origin') != upstream:
         fail('update release origin differs; preserving it and the pointer')
     update_git(release, 'merge-base', '--is-ancestor', commit, 'refs/remotes/origin/main')
@@ -4891,10 +4913,88 @@ def verify_release(release, commit, upstream):
         fail('update release verification failed; preserving it and the pointer')
     for name in ('taskq.py', 'taskq.md'):
         entry = update_git(release, 'ls-tree', 'HEAD', '--', name)
-        if not entry.startswith(('100644 ', '100755 ')) or not (release / name).is_file():
+        if not entry.startswith(('100644 ', '100755 ')) or (release / name).is_symlink() or not (release / name).is_file():
             fail(f'update release has no regular {name}; pointer unchanged')
         if update_git(release, 'hash-object', '--no-filters', '--', name) != entry.split()[2]:
             fail(f'update release {name} bytes differ from qualified Git blob; preserving it and the pointer')
+
+
+def update_host():
+    if sys.platform == 'win32':
+        return 'win'
+    if sys.platform == 'linux' and 'microsoft' in os.uname().release.lower():
+        return 'wsl'
+    return None
+
+
+def qualified_publication():
+    """Owner-published exact release evidence; cached availability is never qualification."""
+    def query(endpoint):
+        done = subprocess.run([shutil.which('gh') or fail('gh not found'), 'api', '--hostname', 'github.com',
+                               f'repos/alexkirs/taskq/{endpoint}'], capture_output=True, **no_window(),
+                              text=True, encoding='utf-8', timeout=10)
+        if done.returncode:
+            fail('automatic release qualification unavailable')
+        return json.loads(done.stdout)
+    published = query('releases/latest')
+    if published['draft'] or published['prerelease'] or published['author']['login'] != 'alexkirs':
+        fail('automatic release is not an owner-published stable qualification')
+    evidence = json.loads(published['body'])
+    if not isinstance(evidence, dict):
+        fail('automatic release qualification must be an object')
+    sha = evidence.get('commit')
+    if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha) \
+            or not isinstance(evidence.get('contract'), str) or not re.fullmatch(r'[0-9a-f]{64}', evidence['contract']) \
+            or type(evidence.get('protocol')) is not int or evidence['protocol'] != 1 or type(evidence.get('event_schema')) is not int \
+            or evidence['event_schema'] != EVENT_SCHEMA or evidence.get('tests') != 'passed' \
+            or evidence.get('review') != 'accepted' or not isinstance(evidence.get('qualified_hosts'), list) or update_host() is None \
+            or update_host() not in evidence.get('qualified_hosts', []):
+        fail('automatic release lacks compatible schema/protocol/native host qualification')
+    pairs = evidence.get('compatible_from')
+    if not isinstance(pairs, list) or not 1 <= len(pairs) <= 16 or any(
+            not isinstance(pair, dict) or set(pair) != {'commit', 'contract'}
+            or not isinstance(pair['commit'], str) or not re.fullmatch(r'[0-9a-f]{40}', pair['commit'])
+            or not isinstance(pair['contract'], str) or not re.fullmatch(r'[0-9a-f]{64}', pair['contract']) for pair in pairs):
+        fail('automatic release compatibility pairs invalid')
+    tag = published['tag_name']
+    if not isinstance(tag, str) or not tag or not re.fullmatch(r'[A-Za-z0-9._/-]+', tag):
+        fail('automatic release tag invalid')
+    if query(f'commits/{tag}')['sha'] != sha:
+        fail('automatic release tag differs from qualified commit')
+    return evidence
+
+
+def compatible_update(root):
+    """Bounded launch-boundary check; failure never authorizes board/config conversion."""
+    path, now = root / '.compatible-freshness.json', time.time()
+    try:
+        cached = json.loads(path.read_text('utf-8'))
+        if cached['selected'] == CLONE.name and type(cached['checked_at']) in (int, float) \
+                and 0 <= now - cached['checked_at'] < 300:
+            if cached.get('error'):
+                print(f'taskq: automatic update freshness unknown ({cached["error"]}); using selected release', file=sys.stderr)
+            return False
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    cached = {'selected': CLONE.name, 'checked_at': now}
+    changed = False
+    try:
+        evidence = qualified_publication()
+        if evidence['commit'] != CLONE.name:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_update(argparse.Namespace(install_dir=str(root), commit=evidence['commit'], apply=True,
+                                             qualification=None, qualification_data=evidence))
+            changed = True
+            cached['selected'] = evidence['commit']
+            print('taskq: qualified compatible release selected; fresh process required. Re-read taskq contract/pm before next effects; agent adoption unverified.', file=sys.stderr)
+    except (SystemExit, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
+        cached['error'] = str(error)[:240]
+        print(f'taskq: automatic update freshness unknown ({cached["error"]}); using selected release', file=sys.stderr)
+    try:
+        path.write_text(json.dumps(cached) + '\n', encoding='utf-8')
+    except OSError:
+        print('taskq: automatic update freshness cache unavailable', file=sys.stderr)
+    return changed
 
 
 def cmd_update(args):
@@ -4915,14 +5015,15 @@ def cmd_update(args):
     print(f'Update {candidate} from {upstream}\nRelease: {release}\nPointer: {root / "current.json"}')
     if not args.apply:
         return print(f'Preview only; next: taskq update --install-dir {shlex.quote(str(root))} --commit {candidate} --apply --qualification <reviewed-evidence.json>')
-    if not args.qualification:
+    automatic = getattr(args, 'qualification_data', None)
+    if not args.qualification and automatic is None:
         fail('update --apply requires --qualification with reviewed exact-SHA test evidence; upstream CI is checked independently')
     try:
-        evidence = json.loads(Path(args.qualification).read_text('utf-8'))
+        evidence = automatic if automatic is not None else json.loads(Path(args.qualification).read_text('utf-8'))
     except (OSError, ValueError) as error:
         fail(f'update qualification unreadable: {error}')
     if not isinstance(evidence, dict) or any(evidence.get(key) != value for key, value in
-            dict(commit=candidate, upstream=upstream, tests='passed', review='accepted').items()):
+            dict(commit=candidate, **({} if automatic is not None else {'upstream': upstream}), tests='passed', review='accepted').items()):
         fail('update qualification must record this commit/upstream, tests passed and review accepted')
     qualified_checks(candidate, upstream)
     with installation_lock(root):
@@ -4935,6 +5036,11 @@ def cmd_update(args):
                     raise ValueError('invalid pointer')
             except (OSError, ValueError, KeyError, TypeError) as error:
                 fail(f'update previous pointer invalid; reconcile explicitly: {error}')
+        if automatic is not None:
+            loaded = {'commit': CLONE.name, 'contract': hashlib.sha256((CLONE / 'taskq.md').read_bytes()).hexdigest()}
+            if not selected or selected['commit'] != CLONE.name or Path(selected['path']).resolve() != CLONE.resolve() \
+                    or any(pair not in evidence['compatible_from'] for pair in [loaded, *selected.get('compatible_from', [])]):
+                fail('automatic update selected source changed or predecessor qualification missing')
         if not release.exists():
             release.parent.mkdir(parents=True, exist_ok=True)
             # Failure leaves evidence; neither existing source nor active pointer is changed.
@@ -4942,10 +5048,21 @@ def cmd_update(args):
             update_git(release, 'merge-base', '--is-ancestor', candidate, 'refs/remotes/origin/main')
             update_git(release, 'checkout', '--detach', candidate)
         verify_release(release, candidate, upstream)  # retries may reuse only an intact exact qualified release
+        if automatic is not None and hashlib.sha256((release / 'taskq.md').read_bytes()).hexdigest() != evidence['contract']:
+            fail('automatic update contract bytes differ from qualified digest')
+        if automatic is not None:
+            done = subprocess.run([sys.executable, '-B', str(release / 'taskq.py'), 'version'],
+                                  capture_output=True, **no_window(), text=True, encoding='utf-8', timeout=10)
+            version = json.loads(done.stdout) if not done.returncode else {}
+            if not isinstance(version, dict) or version.get('event_schema') != EVENT_SCHEMA or version.get('update_protocol') != 1:
+                fail('automatic candidate executable schema/protocol differs; pointer unchanged')
         if selected:
             update_git(release, 'merge-base', '--is-ancestor', selected['commit'], candidate)
         temporary = root / f'.current-{uuid.uuid4().hex}.json'
-        temporary.write_text(json.dumps({'commit': candidate, 'path': str(release)}) + '\n', encoding='utf-8')
+        pointer = {'commit': candidate, 'path': str(release)}
+        if automatic is not None:
+            pointer['compatible_from'] = evidence['compatible_from']
+        temporary.write_text(json.dumps(pointer) + '\n', encoding='utf-8')
         os.replace(temporary, previous)
     print('Installed for new launcher processes; running releases unchanged. Board migration remains explicit. '
           'Before work, the selected release checks board schema; review taskq repair if incompatible.')
@@ -5150,7 +5267,7 @@ def cmd_pm(args):
     (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
     (CONFIG['root'] / '.taskq' / 'pm.json').write_text(json.dumps({'contract': digest}), 'utf-8')
     print(f'taskq pm contract {digest}\nYou are the taskq manager of {CONFIG["root"]}. Follow this role from now on; '
-          f'`taskq` is `{tq}`.' + (f' {shell_instructions(runtime)}' if powershell(runtime) else '') + '\n\n' + '\n'.join(sections))
+          f'`taskq` is `{tq}`.' + (f' {shell_instructions(runtime)}' if powershell(runtime) else '') + '\n' + release_context(runtime) + '\n\n' + '\n'.join(sections))
     for item in sorted(snapshot, key=lambda item: (item['priority'], item['iid'])):
         if not item['pm'] and item['iid'] not in args.adopt:
             print(f'Unassigned manager: #{item["iid"]} {item["title"]} ({item["state"]}). '
@@ -5414,6 +5531,11 @@ def main(argv=None):
     command('update', cmd_update, (('--commit',), {}), (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
             (('--qualification',), {}), (('--apply',), {'action': 'store_true'}), n=False)
     args = parser.parse_args(argv)
+    boundary = os.environ.pop('TASKQ_LAUNCH_BOUNDARY', None)
+    if boundary == '1' and args.command not in ('launch', 'update', 'version', 'contract', 'capacity-child'):
+        folder = os.environ.get('TASKQ_INSTALL_DIR')
+        if folder and release_reason() is None and compatible_update(Path(folder)):
+            fail('compatible release installed; original command was not executed. Use the launcher contract command, read selected taskq.md, then retry through the launcher in a fresh process')
     if args.command == 'arm' and args.what != 'tick' and (args.name is None or args.target or args.execute):
         fail('ARM lifecycle needs --name, without target or --execute')
     if args.command == 'arm' and args.name is not None and args.what == 'tick' and not args.execute:
@@ -5453,10 +5575,12 @@ def main(argv=None):
     if (writes or args.command in ('migrate','repair') and args.apply or args.command == 'tick' or args.command == 'pm' and args.adopt) and getattr(GUARD, 'held', None):
         raise SystemExit('taskq: another command holds the project guard; a new command must acquire independently')
     if (writes or args.command in ('tick', 'wait') or args.command in ('migrate','repair') and args.apply
-            or args.command == 'pm' and args.adopt) and release_reason():
+            or args.command == 'pm' and args.adopt) and release_reason(
+                continuation=args.command in ('ask', 'result', 'requeue', 'ack', 'applied', 'apply-event')):
         fail(release_reason())
     try:
-        with coordination() if writes else contextlib.nullcontext():
+        with completion_release(args.command in ('ask', 'result', 'requeue', 'ack', 'applied', 'apply-event')), \
+                coordination() if writes else contextlib.nullcontext():
             if args.command in ('add','take','ask','answer','result','requeue','run','later','close','cleanup','ack','applied','apply-event','lifecycle') or args.command=='pm' and args.adopt:
                 board_schema_gate()
             done = args.function(args)

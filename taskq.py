@@ -4842,7 +4842,7 @@ def subscription_poll(args):
 
 
 def cmd_pm(args):
-    if getattr(args, 'subscribe', None):
+    if getattr(args, 'subscribe', None) is not None:
         if args.adopt:
             fail('subscription interest is not adoption authority')
         wire = subscription_poll(args)
@@ -5026,6 +5026,10 @@ def main(argv=None):
     command('update', cmd_update, (('--commit',), {}), (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
             (('--qualification',), {}), (('--apply',), {'action': 'store_true'}), n=False)
     args = parser.parse_args(argv)
+    if args.command == 'arm' and args.scope_task and not args.execute:
+        fail('ARM execution scope requires --execute; subscription interests belong to PM')
+    if args.command == 'pm' and args.scope_task and args.subscribe is None:
+        fail('PM interest scope requires --subscribe; it is not ARM execution scope')
     if args.command == 'arm' and args.execute:
         if args.target or args.scope_task and any(n <= 0 for n in args.scope_task):
             fail('execution scope is not PM target; use positive task IDs')
@@ -5046,7 +5050,7 @@ def main(argv=None):
         fail('qualified board capacity provider and explicit host/project caps required; no defaults')
     if 'TASKQ_HOST_ONLY' in os.environ and (not os.environ['TASKQ_HOST_ONLY'] or os.environ['TASKQ_HOST_ONLY'] != machine()):
         fail('TASKQ_HOST_ONLY must equal this machine name (TASKQ_HOST / hosts)')
-    if args.command == 'wait' and not args.task or args.command == 'tick' and not args.quiet or args.command == 'pm' and not args.subscribe:
+    if args.command == 'wait' and not args.task or args.command == 'tick' and not args.quiet or args.command == 'pm' and args.subscribe is None:
         refresh(args.command == 'pm')
     writes = args.command in ('add', 'take', 'ask', 'answer', 'result', 'requeue', 'run', 'later', 'close', 'ack', 'applied', 'apply-event', 'lifecycle') or \
         args.command == 'cleanup' and not args.dry_run

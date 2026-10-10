@@ -75,3 +75,12 @@ class Subscriptions(unittest.TestCase):
     def test_execute_arm_rejects_subscription_target(self):
         with self.assertRaisesRegex(SystemExit,'execution scope is not PM target'):
             q.main(['arm','tick','pm-target','--execute'])
+
+    def test_scope_never_silently_crosses_role_boundary(self):
+        with self.assertRaisesRegex(SystemExit,'execution scope requires --execute'):
+            q.main(['arm','tick','--scope-task','1'])
+        with self.assertRaisesRegex(SystemExit,'interest scope requires --subscribe'):
+            q.main(['pm','--scope-task','1'])
+    def test_empty_subscription_name_is_not_legacy_role(self):
+        with self.assertRaisesRegex(SystemExit,'subscription name requires'):
+            q.main(['pm','--subscribe',''])

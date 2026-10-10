@@ -1,5 +1,108 @@
 # taskq — the contract
 
+### #646 executable ARM/PM contract
+
+PM presentation: `taskq pm --subscribe NAME --format json|text|dot` consumes the
+same durable envelope. JSON is the canonical transport; text is a quoted,
+inert standalone view; dot is a typed `taskq.pm.view` adapter payload, not a claim
+that a GUI subscriber is installed. Neither renderer executes task text or
+answers a question. Dot response intents carry the task/revision; the receiving
+client must supply a new command ID and send an explicit owner answer through
+the authority-checked command above. It must ACK delivery only after durably
+accepting the source digest. Delivery, decision and application are separate.
+
+`--status` reads this subscriber's local pending digest, cursor and latest
+successful observation timestamp without polling/adopting/acknowledging tasks.
+Its freshness is age since a completed native poll, never current-board proof.
+A pending replay does not refresh that timestamp; offline reads leave it and
+the cursor intact. A quiet successful poll records observation time without a
+new envelope. Reconnect uses the same session/name/cache and replays pending
+bytes; a new session starts its own snapshot. Missing event history remains
+explicit in the envelope. No new daemon, UI bridge or second task authority is
+introduced by these adapters.
+
+Versioned owner decision: the typed snapshot exposes `question_revision` for a
+current ask/review card. `taskq answer N --text TEXT --question-revision HASH
+--command-id ID` requires the recorded manager or owner's shell and the native
+project guard. It binds the revision, exact text and genuine actor in one bounded
+board receipt written together with the answer event. Same ID/same request returns
+that receipt without a new event or dispatch; conflicting ID or stale question
+refuses. Transport delivery ACK and worker `applied` remain separate operations.
+Lost write/readback retains the guard; after legitimate reconciliation a retry
+reads the board receipt, never repeats an unconfirmed effect blindly. At most 32
+decision command receipts per task are retained; overflow refuses, never evicts.
+This is guarded single-writer coordination, not provider compare-and-swap: all
+participating writers must honor the existing atomic project guard. Unknown
+external writers block readiness; fresh readback conflicts fail closed. This
+command does not implement review acceptance/publication or grant new authority.
+
+Named ARM runtime handle: `taskq arm start --name NAME [--scope-task N ...]`
+records an enabled local activation; `update` changes its scope, `status` reads
+it, and `stop` disables future admissions without cancelling any worker. These
+commands do not install or launch a scheduler. An existing qualified scheduler
+may invoke `taskq arm tick --execute --name NAME`; a stopped or missing handle
+refuses execution. Repeating identical start/update/stop is idempotent. Start
+with conflicting scope refuses; explicit update is required. The handle belongs
+to its genuine runtime/session, project and host. It grants no board authority.
+Every pass still uses existing native dispatch authority, project guard and
+finite host/project capacities; activation names never multiply those budgets.
+One local transaction covers the named pass: concurrent pass/update/stop refuses
+busy, rather than claiming it stopped an in-flight pass. Once stop succeeds no
+subsequent named pass admits work. An interrupted transaction rolls back; actual
+task/launch effects remain subject to native board recovery. Different checkouts
+still coordinate through the native project guard, not this runtime handle.
+
+Candidate-only route: `taskq arm tick --execute [--scope-task N ...]` runs one
+existing headless guarded pass. It never opens a PM subscription, starts a timer
+or replaces an activation. It uses existing dispatch authority and shared finite
+capacity, not PM availability. The named runtime handle below is separate from
+this unnamed single-pass route.
+
+`taskq pm --subscribe NAME [--scope-task N ...]` is a read-only board observer.
+It emits one typed initial snapshot, then changed task observations/native events.
+An envelope is durably pending before output and replays byte-identically until
+`--delivery-ack DIGEST` confirms transport acceptance. This local SQLite receipt
+cache is not board/task/decision authority. Each genuine session + name has its
+own cursor. ACK changes only that subscriber's local cache, never native event
+ACKs, questions, claims or decisions. Unknown/wrong digest preserves pending.
+Omitted scope reuses the named interest on reconnect/status. Explicit scope changes
+require a separate subscription; changing interests is not adoption.
+
+The existing board retains pending events, not a complete historical event log.
+The observer re-reads every selected/previously known task (including closed),
+deduplicates task:event IDs and explicitly reports unavailable sequence ranges.
+It does not claim gap-free history from a list snapshot. Freshness timestamps are
+observation time, not atomic provider snapshots. Unchanged polls emit no envelope.
+At most 200 tasks are observed; overflow or read failure refuses without advancing
+a cursor. Pending delivery applies backpressure; no second poll overtakes it.
+
+History beyond retained native events, production scheduler installation and GUI
+subscriber wiring are outside this minimal CLI/typed-adapter contract. The cache
+must not be mistaken for their implementation. Existing production schedulers and
+the older PM role route remain unchanged until rollout.
+
+### Closed-task model settlement
+
+A normal guarded pass reconciles outstanding model-only grants from the local
+host ledger and project capacity anchor, including their exact closed tasks.
+It selects only bounded outstanding reservations, never enumerates closed issue
+history. The ledger request, current task turn, session, child birth and strict
+terminal log segment must agree. Closure is not terminal proof; a reused PID,
+missing/malformed log or later active turn retains the grant. Only
+`model:codex:1` grants are settled; resource leases and legacy recovery holds are
+unchanged. Completion is written and freshly verified before either grant is released.
+Unknown/refused board writes retain drained/reserved grants for bounded retry.
+A verified complete turn with an outstanding grant resumes only settlement, not
+execution; its saved completion must match strict native terminal proof.
+Settlement is idempotent and records completion without reopening,
+dispatching or otherwise changing the closed task.
+
+The former automatic CLI wait/send/wait shortcut is withheld: successful resume
+exit alone proves neither event application nor a completed queue pass. The
+qualified application sender uses the receipt handshake above; this patch adds
+no timer, daemon or sender-side ACK. `experiments/sender_handshake.py` is a
+behavioral model only, not a production transport.
+
 ### Legacy ownership reconciliation preflight
 
 `taskq reconcile N --json` is read-only, including on an incompatible board. It
@@ -143,7 +246,14 @@ rule or amend this one, never keep both. A new rule gets the next R-number.
 ### R1. Board is the only state and lock
 
 The issue's `q-*` label, its JSON block and trusted comments hold all task state, claims and history (§ 3). No extra
-database, queue, receipt store, mirror or protocol. Local files under `.taskq/` are runtime handles only (§ 8).
+task database, task queue or authoritative receipt store. Local files under `.taskq/` are runtime handles (§ 8),
+with the bounded transport-cache exception below.
+Changed (#646, owner-approved ARM/PM contract): local files were runtime handles only → a named PM subscriber
+may retain one pending typed envelope and its delivery cursor in a local bounded transport cache. This cache
+supports replay after reconnect; it is never task state, claim, decision or application authority. Its delivery
+ACK changes only that subscriber's cursor, not native board ACKs, owner answers or worker application receipts.
+Every new observation reads the native board; missing history and non-atomic snapshot freshness are explicit.
+The cache cannot authorize execution, repair, adoption or settlement and creates no second task queue.
 Changed (#603, owner decision 2026-10-10): checkout-local dispatch files → one board-backed project guard.
 Task state stays on issues; the board adapter supplies atomic acquisition and exact-token release (§ 2).
 Changed (owner-approved audit optimizations, 2026-10-10; R1/R4/R8/R12/R13): delivery receipts for
@@ -1169,8 +1279,12 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
    No shell bridge, no copy of rollouts or auth. A Claude sender reaches only Claude sessions. A failed wait, a
    failed send or a missing send tool stops the sender with one blocker line: no retry, no other route, no loop on
    a failing board. The board event stays pending until an explicit ack after delivery; a later observation can replay it.
-   An agent sender forwards only while its own turn runs: it stays in that one active turn and repeats wait, send
-   without ending it between events, then waits again without acknowledging; the manager owns handling receipts. An ended sender turn or a wait left running alone forwards nothing; taskq
+   An agent sender forwards only while its own turn runs: it stays in that one active turn. Before delivering a
+   versioned event, fresh-read its exact recorded recipient ACK; already handled observations are retained as
+   superseded without another send. After successful event delivery, wait for the recorded manager's authoritative
+   ACK before the next wait. Delivery alone is not this handshake; the sender never ACKs. A literal tick instead
+   requires the manager's actual completed pass receipt. Unknown receipt/read stops without retry or another route.
+   Do not start a second wait while waiting for handling, or end the sender turn between events. An ended sender turn or a wait left running alone forwards nothing; taskq
    promises no unattended lifetime beyond a sender that is running (#522).
 2. Optional: start a separate sender session on that prompt. It does no task work. The queue never needs it (R4):
    it only carries the manager's short outcomes to a manager that cannot wake itself.

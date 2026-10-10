@@ -789,7 +789,8 @@ class ShellBriefs(Base):
         shell = Path(os.environ['SYSTEMROOT']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
         with mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
             return REAL_RUN([str(shell), '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
-                            capture_output=True, text=True, timeout=15)
+                            capture_output=True, text=True, timeout=15,
+                            env={**os.environ, 'PATHEXT': '.COM;.EXE;.BAT;.CMD'})  # PS otherwise shell-opens .exe asynchronously
 
     def test_role_briefs_choose_native_windows_codex_only(self):
         self.add()
@@ -819,6 +820,7 @@ class ShellBriefs(Base):
         (self.root / 'taskq.md').write_text('## Principles\nFixture\n\n## 7. Manager\nFixture\n', 'utf-8')
         with mock.patch.object(taskq.sys, 'platform', 'win32'), \
                 mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_THREAD_ID': 'PM'}), \
+                mock.patch.object(taskq.shutil, 'which', return_value='codex.exe'), \
                 mock.patch.object(taskq, 'rollout', return_value='local'):
             tq = taskq.queue_tool('codex')
             for prompt in (self.run_cli('pm'), self.run_cli('arm', 'tick'), self.run_cli('arm', 'tick', 'PM')):
@@ -866,29 +868,59 @@ class ShellBriefs(Base):
 
     @unittest.skipUnless(os.name == 'nt', 'native PowerShell boundary')
     def test_native_sender_stops_on_failed_wait_send_or_ack(self):
-        queue, codex, calls = (self.root / name for name in ("queue's stub.ps1", "codex's stub.ps1", 'calls'))
+        queue, codex, calls = (self.root / name for name in ("queue's stub.py", "codex's stub.py", 'calls'))
+        events = ['review #1 [event 1:1] "two words" \\"quoted path" Привет',
+                  'review #2 [event 2:1] owner\'s $value; C:\\path with space\\']
+        options = ['-c', 'test=["two words", "C:\\\\path\\\\", "%PATH%", "Привет"]']
+        launch = taskq.native_command
+        def receiver(arguments):
+            return launch([sys.executable, str(codex), *arguments[1:]])
         with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex'}), \
-                mock.patch.object(taskq.sys, 'executable', str(queue)), mock.patch.object(taskq, 'rollout', return_value='local'), \
-                mock.patch.object(taskq.shutil, 'which', return_value=str(codex)):
+                mock.patch.object(taskq, '__file__', str(queue)), mock.patch.object(taskq, 'rollout', return_value='local'), \
+                mock.patch.object(taskq.shutil, 'which', return_value='codex.exe'), \
+                mock.patch.object(taskq, 'codex_options', return_value=options), \
+                mock.patch.object(taskq, 'native_command', side_effect=receiver):
             prompt = self.run_cli('arm', 'tick', "PM's literal")
         loop = prompt.split('No agent needed: `', 1)[1].split('` in a terminal', 1)[0]
-        log = taskq.shell_quote(calls, True)
         for fail_at, expected in (('wait', ['wait']), ('send', ['wait', 'send']), ('ack', ['wait', 'send', 'ack']),
                                   ('third-wait', ['wait', 'send', 'ack', 'wait', 'send', 'ack', 'wait'])):
             with self.subTest(fail_at=fail_at):
                 calls.write_text('', 'utf-8')
-                queue.write_text(f'$action = $args[1]; Add-Content -LiteralPath {log} -Value $action\n'
-                                 f'if ($action -eq \'{fail_at}\') {{ exit 19 }}\n'
-                                 f'if ($action -eq "wait") {{ if (@(Get-Content -LiteralPath {log} | Where-Object {{ $_ -eq "wait" }}).Count -gt 2) {{ exit 19 }}; '
-                                 'Write-Output "review #1 [event 1:1]"; Write-Output "review #2 [event 2:1]" }\nexit 0\n', 'utf-8')
-                codex.write_text(f'Add-Content -LiteralPath {log} -Value "send"\n'
-                                 'if ($args[-2] -ne "PM\'s literal" -or $args[-1] -ne ("review #1 [event 1:1]" + [Environment]::NewLine + "review #2 [event 2:1]")) { throw "bad sender argv" }\n'
-                                 f'exit {19 if fail_at == "send" else 0}\n', 'utf-8')
+                queue.write_text('import sys\nfrom pathlib import Path\n'
+                                 'sys.stdout.reconfigure(encoding="utf-8")\n'
+                                 f'log=Path({str(calls)!r})\naction=sys.argv[1]\n'
+                                 'with log.open("a", encoding="utf-8") as out: out.write(action + "\\n")\n'
+                                 f'if action == {fail_at!r}: sys.exit(19)\n'
+                                 'if action == "wait":\n'
+                                 '    if log.read_text().splitlines().count("wait") > 2: sys.exit(19)\n'
+                                 f'    print("\\n".join({events!r}))\n'
+                                 'else:\n'
+                                 f'    assert sys.stdin.buffer.read().decode("utf-8").splitlines() == {events!r}\n', 'utf-8')
+                codex.write_text('import sys\nfrom pathlib import Path\n'
+                                 f'with Path({str(calls)!r}).open("a", encoding="utf-8") as out: out.write("send\\n")\n'
+                                 f'assert sys.argv[1:] == { ["exec", *options, "resume", "PM's literal", "-"]!r}\n'
+                                 f'assert sys.stdin.buffer.read().decode("utf-8").splitlines() == {events!r}\n'
+                                 f'sys.exit({19 if fail_at == "send" else 0})\n', 'utf-8')
                 run = self.run_powershell(loop)
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertEqual(run.stderr, '')
                 self.assertEqual(run.stdout.strip(), 'taskq sender stopped')
                 self.assertEqual(calls.read_text('utf-8').splitlines(), expected)
+
+    @unittest.skipUnless(os.name == 'nt', 'native PowerShell boundary')
+    def test_native_manager_preserves_compact_configuration_argv(self):
+        receiver, received = self.root / 'native receiver.py', self.root / 'argv.json'
+        receiver.write_text('import sys,json\nfrom pathlib import Path\n'
+                            f'Path({str(received)!r}).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")\n', 'utf-8')
+        launch = taskq.native_command
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex'}), \
+                mock.patch.object(taskq.shutil, 'which', return_value='codex.exe'), \
+                mock.patch.object(taskq, 'native_command', side_effect=lambda args: launch([sys.executable, str(receiver), *args[1:]])):
+            prompt = self.run_cli('arm', 'tick')
+        command = re.search(r'Codex manager: start it with `([^`]+)`', prompt)[1]
+        run = self.run_powershell(command)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(received.read_text('utf-8')), taskq.shlex.split(taskq.CODEX_COMPACT))
 
 
 class FakeRuntime:

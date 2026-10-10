@@ -55,6 +55,10 @@ assignments and quoted absolute paths to the running Python and TaskQ script. Wo
 identity is set on every command. Manager and sender commands use the same native syntax; sequential
 steps stop on failure. POSIX hosts and non-Codex Bash runtimes retain their shell route. This changes no
 global configuration, model, permission, board authority or coordination safeguard.
+Native Codex commands preserve every argument through the running Python's subprocess launcher;
+PowerShell 5.1's native argument parser must not strip quotes from owner options or the compact prompt.
+The native sender delivers event text through UTF-8 stdin (`exec resume <id> -`), then acknowledges only
+after successful delivery. Failed wait, delivery or acknowledgement stops the sender.
 
 - Owner: decides product questions, answers `ask`.
 - Manager: the session the owner talks to; takes requests, sets priority, files tasks, runs the tick, relays the

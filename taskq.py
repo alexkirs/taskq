@@ -1645,6 +1645,12 @@ def queue_tool(runtime):
     script = Path(__file__).resolve()
     return f'& {shell_quote(sys.executable, True)} {shell_quote(script, True)}' if powershell(runtime) else f'python3 {script}'
 
+def native_command(arguments):
+    """PS 5.1 reparses native argv. Pass a quote-free program to Python; it preserves argv and inherited stdio."""
+    encoded = json.dumps(arguments, ensure_ascii=True).encode('utf-8').hex()
+    program = f"import json,subprocess,sys;sys.exit(subprocess.call(json.loads(bytes.fromhex('{encoded}'))))"
+    return f'& {shell_quote(sys.executable, True)} -c {shell_quote(program, True)}'
+
 def shell_instructions(runtime, n=None):
     if powershell(runtime):
         prefix = f'$env:TASKQ_TASK={shell_quote(n, True)}; $env:TASKQ_RUNTIME={shell_quote(runtime, True)}; $ErrorActionPreference=\'Stop\';'
@@ -2747,13 +2753,13 @@ def cmd_arm(args):
              'no sender, timer or extension. Arming below only brings you the short outcomes.\n')
     if not args.target and runtime == 'codex':  # #510: a Codex session is not woken when a background command ends
         thread = os.environ.get('CODEX_THREAD_ID') or '<this thread>'
-        compact = ' '.join(shell_quote(arg, True) for arg in shlex.split(CODEX_COMPACT)) if native else CODEX_COMPACT
+        manager = native_command([shutil.which('codex') or 'codex', *shlex.split(CODEX_COMPACT)]) if native else f'codex {CODEX_COMPACT}'
         return print(f'''{start}Arm the tick in this session. Codex is not woken when a background command ends, so tick in the foreground:
 loop {{ run `{wait}`; on its output (`ask #N`, `closed #N <verdict>`, `review #N`, `gone #N` or `tick`) run one pass (`taskq tick`) and do
 § 7 After each pass for those tasks; acknowledge handled [event N:ID] with `taskq ack N:ID` }}. Between turns the outcomes wait on the board for your next pass; the queue does not.
 Optional, only to be woken between turns: `{tq} arm tick {shell_quote(thread, native) if native else thread}` prints a sender prompt for a
 thread with a local rollout only; no wake of a Codex app thread is promised (#522).
-Codex manager: start it with `codex {compact}`.''')
+Codex manager: start it with `{manager}`.''')
     if not args.target:  # no target: this session ticks itself (Claude: a background command wakes the session on exit)
         return print(f'''{start}Arm the tick in this session. Run `{wait}` as a background command (Claude Code: run_in_background).
 When it ends you are woken with its output (`ask #N`, `closed #N <verdict>`, `review #N`, `gone #N` or `tick`): run one pass (`taskq tick`),
@@ -2762,19 +2768,23 @@ Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.j
     pm = re.split(r'session_|threads/|/', args.target)[-1]  # #532: the sender consumes as its manager, the id the board records
     resume = f'codex exec {shlex.join(codex_options())} resume {shlex.quote(pm)}'  # the options a worker turn gets
     if native:
-        resume = '& ' + ' '.join(shell_quote(arg, True) for arg in (shutil.which('codex') or 'codex', 'exec', *codex_options(), 'resume', pm))
+        resume = native_command([shutil.which('codex') or 'codex', 'exec', *codex_options(), 'resume', pm, '-'])
     wait = f'{wait} --pm {shell_quote(pm, native)}'
     send, shell, note = f'with {SENDERS.get(runtime, "your messaging tool")}', '', ''
     where = rollout(pm) if runtime == 'codex' else None
     if where == 'local':  # a CLI thread: exec resume finds it
         send = f'by running `{resume} "<its output>"`: a new turn on that thread wakes it'
+        if native:
+            send = ('by setting `[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)` '
+                    f'and piping its output to `{resume}` as stdin: a new turn on that thread wakes it')
         ack = f'{tq} ack --stdin --pm {shell_quote(pm, native)}'
         shell = (f'\nNo agent needed: `cd {CONFIG["root"]} && while e=$({wait}) && {resume} "$e" && printf "%s\\n" "$e" | {ack}; do :; done; '
                  'echo "taskq sender stopped"` in a terminal.')
         if native:
             shell = (f'\nNo agent needed: `$ErrorActionPreference=\'Stop\'; Set-Location -LiteralPath {shell_quote(CONFIG["root"], True)} -ErrorAction Stop; '
+                     '[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
                      f'while ($true) {{ $e = {wait}; if ($LASTEXITCODE -ne 0) {{ break }}; '
-                     f'{resume} ($e -join [Environment]::NewLine); if ($LASTEXITCODE -ne 0) {{ break }}; '
+                     f'$e | {resume}; if ($LASTEXITCODE -ne 0) {{ break }}; '
                      f'$e | {ack}; if ($LASTEXITCODE -ne 0) {{ break }} }}; '
                      'Write-Output "taskq sender stopped"` in a terminal.')
     elif where == 'archived':  # #522: exec resume of an archived thread is unverified (R12): no route

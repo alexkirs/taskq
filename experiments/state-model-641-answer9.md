@@ -78,3 +78,39 @@ code. A malformed read-only `status 641` invocation was also refused without eff
 Rejected result7 evidence is retained in `state-model-641.md` as historical evidence,
 explicitly superseded by this answer application. This document is a repository
 artifact for the existing native application receipt, not a second task authority.
+
+## Native application blocker (observed, not bypassed)
+
+The committed technical application at
+`d3fdfa9abbb6ed1391b6b9d829cac1a46e89c639` passed the final local full gate:
+`python3 -m unittest tests.test_single` (311 tests, 17 platform skips, 52.537 seconds;
+Hypothesis executed). Final focused pilot: 10 tests, 1.692 seconds, PASS.
+
+After that commit the selected installed release
+`b58b2e283dc15570b539c3e6b9d2d5da13909cbe` ran exactly:
+
+```text
+applied 641:9 --artifact experiments/state-model-641-answer9.md --sha d3fdfa9abbb6ed1391b6b9d829cac1a46e89c639
+```
+
+The identical command was repeated once. Both exited 1 with:
+
+```text
+taskq: applied artifact must be a real scoped file inside this task workspace
+```
+
+Fresh native issue readback after both refusals confirmed scope=[], the same exact
+worker identity recorded above, answer9 still bound to its worker turn, and no
+application_receipts["9"]. Answer9 contained only the already existing supervisor
+ACK; it had no worker application ACK. Thus successful applied/idempotence is NOT
+VERIFIED, and formal result submission is blocked. No claim/event/receipt was edited
+to bypass this guard. The artifact exists in the required worker worktree, but the
+installed adapter resolves CONFIG.root to the main project checkout (load_config's
+worktree rule) and requires both a matching declared scope and exact root Git HEAD.
+A supported scoped-worktree application route is an upstream prerequisite, not a
+reason to write to main, rebind the worker, grant permissions or forge an ACK.
+
+This final evidence-only amendment preserves the earlier exact code/test gate;
+the amended artifact's own commit and affected documentation sentinel outcomes
+are recorded in the PR/handoff. No formal successful result may be reported until
+native application and its successful identical replay have been verified.

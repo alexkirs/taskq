@@ -435,6 +435,12 @@ return semantics follow Apple
 
 ### R12. Unverified means unknown
 
+Clarified (#625, native Windows test portability): test results name the supported host/runtime
+boundary. Native Codex sender checks execute PowerShell with real executable receivers; POSIX
+sender checks remain on POSIX. Hermes owner/gateway checks requiring Linux /proc and pidfds run
+only where those facilities exist; portable Hermes protocol and admission assertions still run
+on every host. An unavailable Linux/WSL run is unknown, never a native Windows failure or PASS.
+
 Changed (#623): no compression coverage report → PM and role policy distinguish enabled configuration
 from accepted compression. Missing direct-route key, disabled mode, rejected response or transport failure warns and
 keeps the original. TaskQ controls its assembled supporting context only; app history, arbitrary tool

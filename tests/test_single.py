@@ -5913,3 +5913,30 @@ for line in sys.stdin:
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TightAssignmentDesign(unittest.TestCase):
+    """Dormant proposal, not qualification of operational dispatch."""
+
+    def test_native_assignment_without_personal_filter(self):
+        spec = importlib.util.spec_from_file_location(
+            'assignment_design', ROOT / 'experiments' / 'assignment_model.py')
+        candidate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(candidate)
+        cases = [
+            (['tight'], 'alexkirs', False, False),
+            (['tight'], 'tight', False, True),
+            (['tight', 'alexkirs'], 'tight', False, True),
+            (['tight'], None, False, False),
+            (['tight'], '', False, False),
+            (['tight'], ' ', False, False),
+            ([], 'alexkirs', False, True),
+            ([], None, False, True),
+            ([], 'tight', True, False),
+        ]
+        for assignees, login, strict, expected in cases:
+            with self.subTest(assignees=assignees, login=login, strict=strict):
+                self.assertEqual(candidate.eligible(assignees, login, strict), expected)
+
+    def test_candidate_is_not_imported_by_production(self):
+        self.assertNotIn('assignment_model', (ROOT / 'taskq.py').read_text())

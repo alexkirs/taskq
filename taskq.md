@@ -1168,6 +1168,47 @@ Rules:
 
 ## 6. Publication
 
+### Commit and PR/MR messages (#581)
+
+Use a short subject explaining the change, an optional short paragraph explaining its effect,
+then a blank line and `Task: <full canonical issue URL>`. Take the URL from the board adapter's
+issue `url` (GitHub `html_url`, GitLab `web_url`), never from a task number or reconstructed host.
+The worker brief supplies that exact URL for new commits and the PR/MR description. Keep checks,
+full candidate SHA and detailed work evidence in `result --checks` and task history; a PR can
+state a short check outcome or remaining blocker without copying the work log. No mandatory
+`Fixes`/`Closes` keywords: TaskQ review/close owns lifecycle. Historical commits stay unchanged.
+
+Illustrative GitHub commit/PR body:
+```
+Keep pending checks in review
+
+Task: https://github.com/owner/project/issues/42
+```
+Illustrative self-managed GitLab commit/MR body:
+```
+Preserve the task link when squashing
+
+Task: https://git.example/group/project/-/issues/42
+```
+
+Each additional task actually covered gets its own `Task: <adapter URL>` line; never infer
+attribution from bare numbers, branch names, dependencies or another project's task. The reviewer
+checks additional attribution against those boards. PR/MR titles are the short change explanation.
+Before squash, `close` requires the current task's exact line in the description, takes the title
+and all explicit Task lines as the squash message, and supplies the same message for GitLab's
+merge commit. It reads the resulting commit message(s) back before closing the task. Missing
+or unknown link evidence leaves review open; it never retries an unconfirmed merge automatically.
+Direct publication requires the candidate tip's message to contain the exact Task line before
+the unchanged exact-SHA fast-forward. Rebase preserves those messages; no history rewrite is
+introduced. Already-published results/research retain their existing compatibility path.
+
+Acceptance checks: generated brief contains the adapter URL; missing/wrong-project descriptions
+refuse before merge; multiple explicit links survive squash; final message readback failure keeps
+the task open; direct tips retain the link. Exact SHA/CI/verdict evidence remains separate.
+Notification clients may truncate bodies or suppress previews: verify visible links where observable,
+and report unobserved GitHub/GitLab email, mobile, Codex and DOT rendering as unknown. CLI/API
+message bytes alone do not prove notification delivery or client rendering (#597, R12).
+
 | `publish` | Worker pushes | `result --sha` | `close` |
 |---|---|---|---|
 | `direct` | `git push --force-with-lease origin HEAD:refs/heads/taskq-<N>` (no PR) | the full candidate SHA | accepting reviewer checks evidence, exact remote branch SHA and CI, fast-forward pushes that immutable SHA to `main`, verifies publication, closes |

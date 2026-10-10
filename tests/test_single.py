@@ -989,7 +989,7 @@ class DirectPublication(Base):
         self.git('remote', 'add', 'origin', str(self.remote))
         self.git('push', 'origin', 'main')
         self.git('checkout', '-b', 'taskq-1')
-        self.git('commit', '--allow-empty', '-m', 'candidate')
+        self.git('commit', '--allow-empty', '-m', 'candidate', '-m', 'Task: https://board/1')
         self.sha = self.git('rev-parse', 'HEAD')
         self.git('push', 'origin', 'taskq-1')
         taskq.CONFIG.update(repo='o/r', workspace='external')
@@ -1052,6 +1052,16 @@ class DirectPublication(Base):
             self.close()
         self.assertEqual((self.task(1)['state'], self.main_sha()), ('review', self.base))
 
+    def test_missing_task_link_refuses_direct_publication(self):
+        self.git('commit', '--allow-empty', '-m', 'missing link')
+        self.sha = self.git('rev-parse', 'HEAD')
+        self.git('push', 'origin', 'taskq-1')
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'review', 'result', result={'sha': self.sha, 'checks': 'ok'})
+        with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), self.assertRaisesRegex(SystemExit, 'message needs Task:'):
+            self.run_cli('close', '1', '--text', 'accepted; users get it; open: none')
+        self.assertEqual((self.task(1)['state'], self.main_sha()), ('review', self.base))
+
     def test_red_pending_or_missing_ci_never_publishes(self):
         for checks in ([], [{'status': 'queued', 'conclusion': None}], [{'status': 'completed', 'conclusion': 'failure'}]):
             self.checks = {'check_runs': checks}
@@ -1099,9 +1109,16 @@ class PullRequests(Base):
         self.calls, self.prs, self.merged = [], [{'number': 7, 'headRefOid': 'a' * 40, 'baseRefName': 'main'}], True
         self.branches = {}  # branch -> its PRs, for tasks other than #1
         self.checks = {'a' * 40: [[('completed', 'success')]]}
+        self.description = None
+        self.published_message = None
+        self.messages = {}
+        self.gitlab_merge_sha = None
 
     def cli(self, command, **_):
         self.calls.append(command[1:])
+        if command[1] == 'api' and '/commits/' in command[4] and 'check-runs' not in command[4]:
+            message = self.published_message if self.published_message is not None else self.messages.get(command[4].split('/')[-1], '')
+            return subprocess.CompletedProcess(command, 0, json.dumps({'message': message, 'commit': {'message': message}}), '')
         if command[1] == 'api' and 'merge_requests' in command[4]:  # the GitLab gate (#479): the MR's pipelines, newest first
             return subprocess.CompletedProcess(command, 0, json.dumps([{'sha': sha, 'status': status} for sha, status in self.poll('mr')]), '')
         if command[1] == 'api':  # the 'tests' gate (#308): check runs per SHA
@@ -1109,7 +1126,17 @@ class PullRequests(Base):
             return subprocess.CompletedProcess(command, 0, json.dumps(out), '')
         verb = command[2]
         view = {'state': 'merged', 'squash_commit_sha': 'd' * 40} if command[1] == 'mr' else {'state': 'MERGED', 'mergeCommit': {'oid': 'c' * 40}}
-        out = {'list': json.dumps(self.branches.get(command[4], self.prs)), 'view': json.dumps(view if self.merged else {'state': 'OPEN'})}
+        if command[1] == 'mr' and self.gitlab_merge_sha:
+            view['merge_commit_sha'] = self.gitlab_merge_sha
+        n = int(command[3]) - 6 if verb != 'list' else 1
+        description = self.description if self.description is not None else f'Task: https://board/{n}'
+        view.update(title='Fix the change', body=description, description=description)
+        if verb == 'merge':
+            message = command[command.index('--squash-message') + 1] if command[1] == 'mr' else command[command.index('--subject') + 1] + '\n\n' + command[command.index('--body') + 1]
+            self.messages['d' * 40 if command[1] == 'mr' else 'c' * 40] = message
+            if self.gitlab_merge_sha:
+                self.messages[self.gitlab_merge_sha] = message
+        out = {'list': json.dumps(self.branches.get(command[4], self.prs)), 'view': json.dumps(view if self.merged else {**view, 'state': 'OPEN'})}
         return subprocess.CompletedProcess(command, int(verb == 'merge' and not self.merged), out.get(verb, ''), 'Pull request is not mergeable')
 
     def poll(self, sha):  # one poll of the check runs on sha: the polls in order, the last one repeats
@@ -1131,6 +1158,8 @@ class PullRequests(Base):
         self.assertIn('--sha <PR head full SHA>', prompt)
         self.assertIn('`git fetch origin && git rebase origin/main`, run the tests required by § 10 Testing policy', prompt)  # #334: up to date before result
         self.assertIn('taskq.md` first and do only what it allows (R13)', prompt)  # #505: spec first
+        self.assertIn('Task: https://board/1', prompt)
+        self.assertIn('Do not rewrite historical commits', prompt)
         taskq.CONFIG['board'] = 'gitlab'
         self.assertIn('`glab mr create --yes --target-branch main --source-branch taskq-1', taskq.brief(item, 'claude'))
         taskq.CONFIG['publish'] = 'direct'
@@ -1143,7 +1172,7 @@ class PullRequests(Base):
 
     def test_close_merges(self):
         self.assertEqual(self.close(), '#1 closed\n')
-        self.assertEqual(self.merges(), [['pr', 'merge', '7', '--squash', '--delete-branch', '--match-head-commit', 'a' * 40, '-R', 'o/r']])
+        self.assertEqual(self.merges(), [['pr', 'merge', '7', '--squash', '--delete-branch', '--match-head-commit', 'a' * 40, '--subject', 'Fix the change', '--body', 'Task: https://board/1', '-R', 'o/r']])
         self.assertIn(['api', '-X', 'GET', f'repos/o/r/commits/{"a" * 40}/check-runs?check_name=tests'], self.calls)
         self.assertEqual(self.board.issues[1]['state'], 'closed')
         self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\naccepted; users see it; open: none\n\nmerged {"c" * 40}')
@@ -1151,7 +1180,7 @@ class PullRequests(Base):
     def test_close_external_keeps_the_branch(self):
         taskq.CONFIG['workspace'] = 'external'  # #477: no --delete-branch; the repo's own policy decides
         self.close()
-        self.assertEqual(self.merges(), [['pr', 'merge', '7', '--squash', '--match-head-commit', 'a' * 40, '-R', 'o/r']])
+        self.assertEqual(self.merges(), [['pr', 'merge', '7', '--squash', '--match-head-commit', 'a' * 40, '--subject', 'Fix the change', '--body', 'Task: https://board/1', '-R', 'o/r']])
         self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\naccepted; users see it; open: none\n\nmerged {"c" * 40}\n\nkept: owned by host')
 
     def test_close_batch_goes_on_after_a_failure(self):
@@ -1165,6 +1194,50 @@ class PullRequests(Base):
         self.assertEqual((self.task(1)['state'], self.board.issues[2]['state']), ('ready', 'closed'))
 
         self.assertIsNone(self.board.guard)  # acknowledged CI-red requeue and other close are settled
+
+    def test_task_links_are_explicit_and_publication_is_verified(self):
+        for description in ('#1', 'Task: https://other/project/issues/1', 'Task: https://board/1-extra'):
+            self.description = description
+            with self.subTest(description=description), self.assertRaisesRegex(SystemExit, 'message needs Task:'):
+                self.close()
+            self.assertEqual(self.merges(), [])
+            self.assertEqual(self.task(1)['state'], 'review')
+            self.assertIsNone(self.board.guard)
+        self.description = 'Short effect.\r\n\r\nTask: https://board/1\r\nTask: https://git.example/other/project/-/issues/1\r\n'
+        self.close()
+        self.assertEqual(self.messages['c' * 40], 'Fix the change\n\nTask: https://board/1\nTask: https://git.example/other/project/-/issues/1')
+
+    def test_missing_published_link_keeps_review_and_guard(self):
+        self.published_message = 'Provider dropped the body'
+        with self.assertRaisesRegex(SystemExit, 'task links unverified'):
+            self.close()
+        self.assertEqual(self.task(1)['state'], 'review')
+        self.assertIsNotNone(self.board.guard)
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_gitlab_reads_both_squash_and_merge_messages(self):
+        self.gitlab()
+        self.gitlab_merge_sha = 'e' * 40
+        self.checks['mr'] = [[('a' * 40, 'success')]]
+        self.close()
+        paths = [call[3] for call in self.calls if call[:3] == ['api', '-X', 'GET'] and '/repository/commits/' in call[3]]
+        self.assertEqual(paths, [f'projects/o%2Fr/repository/commits/{sha * 40}' for sha in ('d', 'e')])
+        self.assertIn(f'merged {"e" * 40}', self.board.issues[1]['comments'][-1])
+
+    def test_gitlab_missing_merge_message_link_retains_review(self):
+        self.gitlab()
+        self.gitlab_merge_sha = 'e' * 40
+        self.checks['mr'] = [[('a' * 40, 'success')]]
+        cli = self.cli
+        def missing(command, **kwargs):
+            done = cli(command, **kwargs)
+            if command[1] == 'api' and command[4].endswith('/repository/commits/' + 'e' * 40):
+                return subprocess.CompletedProcess(command, 0, json.dumps({'message': 'Link lost'}), '')
+            return done
+        with mock.patch.object(self, 'cli', side_effect=missing), self.assertRaisesRegex(SystemExit, 'task links unverified'):
+            self.close()
+        self.assertEqual(self.task(1)['state'], 'review')
+        self.assertIsNotNone(self.board.guard)
 
     def test_head_is_not_the_result(self):
         for change in ({'headRefOid': 'b' * 40}, {'baseRefName': 'release'}):
@@ -1268,7 +1341,7 @@ class PullRequests(Base):
         self.assertEqual(sum(call[:4] == ['api', '-X', 'GET', 'projects/o%2Fr/merge_requests/7/pipelines'] and call[-2:] == ['--hostname', 'git.example']
                              for call in self.calls), 3)
         self.assertEqual([call for call in self.calls if call[:2] == ['mr', 'merge']],
-                         [['mr', 'merge', '7', '--squash', '--remove-source-branch', '--sha', 'a' * 40, '--auto-merge=false', '--yes', '-R', 'https://git.example/o/r']])
+                         [['mr', 'merge', '7', '--squash', '--remove-source-branch', '--sha', 'a' * 40, '--auto-merge=false', '--yes', '--squash-message', 'Fix the change\n\nTask: https://board/1', '--message', 'Fix the change\n\nTask: https://board/1', '-R', 'https://git.example/o/r']])
         self.assertEqual(self.board.issues[1]['comments'][-1], f'**close** · claude:01234567\n\naccepted; users see it; open: none\n\nmerged {"d" * 40}')
 
     def test_gitlab_failed_pipeline_requeues(self):

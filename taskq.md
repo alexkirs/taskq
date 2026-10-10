@@ -315,6 +315,14 @@ unreadable boards retain external blockers without fabricated counters (#580).
 
 ### R7. Style
 
+Changed (#623, owner decision 2026-10-10): optional context reduction → enabled-by-default shared
+supporting-context compression for every PM, supervisor, worker and nested reviewer/agent. Every role
+must use the § 2 Supporting context helper for eligible bulk evidence it assembles, and pass that
+requirement to every nested assignment. Clear complete output and immutable authority take precedence.
+Changed (#623 provider compatibility): compiler-only response checks → explicit compiler/Neural Keep
+schemas with unchanged local preservation guards; absent Neural Keep verification is reported, never
+treated as a semantic guarantee (§ 2 Supporting context).
+
 Every role and message is short and states unknowns honestly, per
 [gradus-public/caveman](https://gitlab.ufobe.com/gradus-public/caveman/-/tree/62579538f05fb6b69a12449c1ebad9567d1fdecc)
 pinned at `6257953`. taskq links the style; it does not redefine it.
@@ -323,6 +331,10 @@ recommended (§ 5 rule 5, § 7 After each pass).
 Changed: free-text questions → decision cards with option codes `N.K` (#490).
 
 ### R8. The contract is the SoT and matches code
+
+Changed (#623): role context had no shared compression boundary → § 2 defines one Python-stdlib
+adapter and inherited option for all projects. That adapter runs independently of the optional SDK and
+of the provider proxy installed during mandatory onboarding.
 
 This file is the whole contract (with [docs/single-file.md](docs/single-file.md) for design). Briefs and docs link
 here; they never copy it. A change of behavior updates this file in the same deliverable.
@@ -422,6 +434,14 @@ return semantics follow Apple
 [`libproc.c`](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/libproc/libproc.c).
 
 ### R12. Unverified means unknown
+
+Changed (#623): no compression coverage report → PM and role policy distinguish enabled configuration
+from accepted compression. Missing direct-route key, disabled mode, rejected response or transport failure warns and
+keeps the original. TaskQ controls its assembled supporting context only; app history, arbitrary tool
+results and nested-agent transport are not intercepted. Helper instructions are required, but compliance
+and full inference coverage are unverified. Report measured UTF-8 input/output bytes for accepted
+responses; provider token counters may have different scopes and prove no token or monetary savings
+or semantic equivalence.
 
 Report only what a fresh read proved. A delivery, exit code, checkout marker or chat turn is not proof of receipt,
 application or completion.
@@ -635,6 +655,102 @@ board field or new authority is written. They apply only to that process tree, n
 or independent invocations. Custom runtime adapters must preserve them when launching descendants.
 On Windows, set `$env:TASKQ_HOST='win'`, `$env:TASKQ_HOST_ONLY='win'` and `$env:TASKQ_LIMITS='{"codex":5}'`
 in the intended invocation shell. Setting these values alone starts no queue and adopts no tasks.
+
+### Supporting context (#623)
+
+`TASKQ_COMPRESS=on` is the shared default; `off` disables it visibly. It is ordinary inherited environment,
+including across runtime launches. Set `SUPERCOMPRESS_API_KEY` through the user's secret/environment
+mechanism before launching TaskQ; never put a key in a command, issue, prompt, repository or log.
+The helper resolves a nonempty `SUPERCOMPRESS_API_KEY` first, otherwise the provider's user-scoped
+`api_key` in `$SUPERCOMPRESS_CONFIG_DIR/config.json` or `~/.supercompress/config.json`. Config reads
+are limited to 64 KiB UTF-8 JSON and a header-safe nonempty string key; absent/invalid config warns
+without printing its contents or path. It never writes that config. This makes completed provider
+onboarding apply to future projects and invocations outside a wrapper.
+Mandatory onboarding (owner clarification #623): run `npm install -g supercompress-proxy`,
+then `supercompress setup`, then `supercompress doctor`. Inspect the supported setup targets and keep
+existing agent login/model/permissions intact. The provider proxy's supported routes and TaskQ's helper
+are separate coverage: `doctor` checks setup, not successful compression of every inference. ChatGPT
+login and app-backed history are not thereby intercepted. Missing setup remains a visible coverage gap.
+The TaskQ helper changes no key-store, login, model, reasoning, permission or global configuration.
+New projects use this same default. An invalid option preserves the
+original and warns rather than silently enabling.
+
+Every PM and spawned role must compress eligible supporting context before including bulk evidence/tool
+output in a prompt, and explicitly pass the policy to each nested reviewer/agent. Never compress or replace
+the user's ask/query: the compression query is passed verbatim. First inspect the provider's
+`inbox/latest.md` under its resolved config directory when present; prefer its current-call delta only
+through the validation below. A digest without the bound response envelope is not usable compressed
+evidence. Otherwise prefer exposed MCP `compress_context(contextdump, query, session_id)` with the
+actual calling runtime session ID, never a shared default or inherited parent ID. If it reports account
+not linked, call `connect_account` once and retry once. Do not invent missing tools. Capture the parsed
+MCP JSON and locally supplied request binding in a UTF-8 JSON envelope:
+`{"request_id":"<fresh random per-call ID>","session_id":"<actual caller>","context_sha256":"<SHA256 of exact input UTF-8 bytes>","query":"<unchanged owner query>","response":<parsed MCP JSON>}`.
+Run `taskq compress --input <supporting file> --query <owner query> --response <envelope file> --request-id <same fresh ID>`.
+The two new options are paired; this route never makes a remote request, even on rejection, and needs
+no API key. The envelope (at most 1 MiB) must match the requested ID, current `session()` ID, input hash
+and query exactly. The response must match the session, explicitly have `compacted:false`, no non-null
+`skipped`, error or partial result. Use only `response.delta`, never rolling `compressed_text` or memory.
+The orchestrator generates a fresh ID for every acquisition and keeps it with that call: replay with a
+new ID fails. This local capture binding is not cryptographic provider provenance or a replay registry.
+Both routes use the same extraction/protection/size validator. Any provided safety metadata must pass
+the complete safe verification triple below; absence on MCP is reported as unavailable verification.
+If MCP is unavailable, use `taskq compress --input <UTF-8 supporting file> --query <owner query>`
+and keep its coverage warning visible. Its bounded HTTP adapter never retries.
+The helper prints usable context to stdout, and status/warnings to stderr; capture them separately.
+Capture bulk tool output to a local file and invoke the selected compression route inside the same tool
+invocation, before the model sees the original; return only the resulting context plus visible warnings.
+Compressing text after the model already read it is not a demonstrated context saving.
+Inputs must already be sanitized, non-secret supporting material. Authority (assignment,
+acceptance, permissions, IDs, exact commands, owner answers/decisions, negative requirements, critical
+evidence and queue control events) stays in a separate verbatim block. Never compress a mixed authority
+and evidence prompt. Mandatory policy is not proof of runtime interception or agent compliance.
+
+Brief assembly preserves the existing history and action payloads verbatim and in their original order;
+result age does not classify mixed prose as supporting evidence. Bulk compression requires explicitly
+separated, sanitized supporting material through the mandatory role policy above. Resume events remain
+exact, with role policy reattached; no redundant history is fetched just to compress it. PM policy/contract
+and board state remain exact. No eligible context means no API call and no claimed savings. Under 2,000 UTF-16 code units is
+passed through as small; over 120,000 is passed through with a warning, never truncated or split.
+
+Before any request, retain the exact UTF-8 original under `.taskq/context/<sha256>.txt` (runtime evidence,
+never queue state); accepted text carries that local reference. If preservation fails, use original text
+and warn. The helper does not print remote errors, headers, credentials or rejected text. Missing direct-route key,
+off/invalid option, timeout, HTTP error (including redirect/auth/rate-limit), oversized/malformed response,
+reported critical-line loss, unsafe verifier result, nonextractive output, or no size reduction falls back
+to the original. Accept only nonempty ordered whole-line extraction and smaller net UTF-8 bytes
+including the original reference. Provider token counters are diagnostics with potentially different
+scopes, never an acceptance condition or token-saving claim. Status reports measured input/output bytes.
+Fenced blocks and lines with backticks, numbers,
+recognized English negative/authority words or explicit critical markers are retained exactly; this conservative guard and the provider's
+checks are not a proof of semantic preservation. Read original evidence before consequential acceptance.
+Hosted `mode:"neural-keep"` omits all three compiler verification fields. Accept that specific
+schema through the same local extraction, protected-line and size checks; missing remote verification
+is not a safety verdict and is reported on acceptance. Only compiler and Neural Keep modes are accepted;
+an omitted direct-route mode uses the legacy compiler schema. Direct compiler/legacy responses require an empty `critical_lines_dropped`, low
+`compression_risk` and a finite low-risk verifier score from 0.85 through 1. If any verification field
+is present, including on Neural Keep or captured MCP, require the complete safe triple; null/partial/unsafe fields fail.
+Security exception: known API-key matches or credential-assignment patterns withhold the supporting
+block with a sanitized warning before any request or new local copy, including when disabled or small.
+The source file remains the user's original. This guard cannot recognize every possible secret; callers
+must classify and sanitize input first.
+
+Provider contract reviewed at Supercompress/Supercompress commit
+`1b76c6f607de9b5c0eb2beef795f180f39f02f30`: HTTPS POST
+`https://www.supercompress.dev/api/v1/compress`, `X-API-Key`, JSON context/query with `ccr:false`,
+`cache_prefix:false`, `log:false`, and fixed `coding_agent:"taskq"`, `source:"taskq"` attribution without
+task/project/user identifiers. Provider agent analytics are best effort; an API response alone does not prove
+dashboard counters updated. Fixed host, no redirects, retries or remote retrieval. One owned short
+stdlib Python network subprocess receives context/query/key only through private stdin, never argv,
+files or inherited credentials. It starts no descendants. After OS process creation, one 60-second
+deadline watchdog kills that owned child through its process handle, including blocked stdin transfer
+and DNS/request/header/body stalls. It is always cancelled and joined; the child is always waited for.
+OS process creation itself is host-controlled, not an absolute bounded-time guarantee. The response
+limit is 1 MiB. No persistent process/service or unjoinable thread is used. Remote errors and child
+stderr never reach agent output.
+The stdlib adapter retains critical/verifier fields omitted by the optional Python SDK. `log:false` disables
+the provider's optional request log, not its mandatory billing/response ledger: no zero-retention claim.
+Precision mode is not a documented retention guarantee. A working key/SDK alone proves no successful
+compression; genuine sanitized API and delivered-role proof remain acceptance requirements under § 10.
 
 Board file: six data functions plus `acquire(owner)` and `release(token)` for writes; modules without the guard support read-only commands only. An issue is a dict `{iid, title, body, labels, state: open|closed,
 updated_at, url}`, optionally `assignees` (logins); `get` adds `comments` (a list of strings, oldest first).

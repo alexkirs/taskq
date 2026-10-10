@@ -92,7 +92,8 @@ class Base(unittest.TestCase):
         self.root = Path(folder.name)
         taskq.CONFIG = {'board': 'github', 'publish': 'direct', 'root': self.root, 'hosts': {}}
         real = lambda *_, **__: self.fail('a test started a real process')  # a test fakes subprocess.run where it needs one
-        env = {'CLAUDE_CODE_SESSION_ID': SESSION, 'TASKQ_RUNTIME': 'claude', 'TASKQ_HOST': 'mac'}
+        env = {'CLAUDE_CODE_SESSION_ID': SESSION, 'TASKQ_RUNTIME': 'claude', 'TASKQ_HOST': 'mac',
+               'SUPERCOMPRESS_CONFIG_DIR': str(self.root / 'supercompress')}
         if os.name == 'nt':  # Windows has no /usr/bin fallback after clear=True; preserve only the native git directory
             git = taskq.shutil.which('git')
             env.update(PATH=str(Path(git).parent) if git else '', SYSTEMROOT=os.environ['SYSTEMROOT'])
@@ -104,6 +105,7 @@ class Base(unittest.TestCase):
         for patcher in (
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch.object(taskq, 'GUARD_WAIT', 0),
+                mock.patch.object(taskq, 'compression_config_path', return_value=self.root / 'supercompress' / 'config.json'),
                 mock.patch.object(taskq, 'runtimes', return_value={}),  # no real worker from an event's dispatch
                 mock.patch.object(taskq, 'start_pass', child),  # the child's pass, in process
                 mock.patch.object(taskq, 'datetime', FixedNow),
@@ -145,6 +147,441 @@ class Base(unittest.TestCase):
     def add(self, title='T', *extra):
         return self.run_cli('add', title, '--goal', 'g', '--acceptance', 'a', '--scope', 'x.py', *extra)
 
+
+
+class Compression(Base):
+    """Sanitized supporting data only; no live API/key/model use."""
+    KEY = 'synthetic-test-credential'
+    config_path = staticmethod(taskq.compression_config_path)
+
+    def setUp(self):
+        super().setUp()
+        self.source = 'CRITICAL: keep `git status` and task #623; never change permissions.\n' + ('ordinary background detail\n' * 150) + 'relevant evidence\n'
+        self.kept = self.source.splitlines()[0] + '\nrelevant evidence\n'
+        self.result = {'compressed_text': self.kept, 'original_tokens': 900, 'kept_tokens': 40,
+                       'critical_lines_dropped': [], 'compression_risk': 'low', 'verifier': {'risk': 'low', 'score': 0.99}}
+        patcher = mock.patch.object(taskq, 'compression_request', side_effect=AssertionError('unexpected API call'))
+        self.request = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def compress(self, source=None):
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            text = taskq.supporting_context(self.source if source is None else source, 'relevant evidence')
+        return text, out.getvalue()
+
+    def test_user_config_resolution_precedence_and_sanitized_status(self):
+        config = self.root / 'supercompress' / 'config.json'
+        config.parent.mkdir()
+        config.write_text(json.dumps({'api_key': self.KEY}), 'utf-8')
+        self.assertEqual(taskq.compression_key()[0], self.KEY)
+        self.assertNotIn(self.KEY, taskq.compression_state())
+        self.request.side_effect = None
+        self.request.return_value = (None, 'synthetic unavailable')
+        context, warning = self.compress()
+        self.assertEqual(self.request.call_args.args[2], self.KEY)
+        self.assertEqual(context, self.source)
+        self.assertNotIn(self.KEY, warning)
+        with mock.patch.dict(os.environ, SUPERCOMPRESS_API_KEY='explicit-fixture-key'), mock.patch.object(Path, 'open', side_effect=AssertionError('env key must skip config')):
+            self.assertEqual(taskq.compression_key()[0], 'explicit-fixture-key')
+        for content in ('not json private fixture', '[]', '{}', '{"api_key":3}', '{"api_key":"bad\\nheader"}', 'x' * 65537):
+            with self.subTest(kind=content[:8]):
+                config.write_text(content, 'utf-8')
+                key, status = taskq.compression_key()
+                self.assertEqual(key, '')
+                self.assertNotIn('private fixture', status)
+                self.assertNotIn(str(config), status)
+        config.unlink()
+        self.assertEqual(taskq.compression_key(), ('', 'key missing'))
+        with mock.patch.dict(os.environ, SUPERCOMPRESS_CONFIG_DIR=str(self.root / 'custom')):
+            self.assertEqual(Compression.config_path(), self.root / 'custom' / 'config.json')
+        with mock.patch.dict(os.environ, SUPERCOMPRESS_CONFIG_DIR=''), mock.patch.object(Path, 'home', return_value=self.root):
+            self.assertEqual(Compression.config_path(), self.root / '.supercompress' / 'config.json')
+
+    def test_disabled_missing_small_oversized_and_unicode_boundaries(self):
+        for environment, source, status in (({}, self.source, 'key missing'),
+                ({'TASKQ_COMPRESS': 'off', 'SUPERCOMPRESS_API_KEY': self.KEY}, self.source, 'disabled'),
+                ({'TASKQ_COMPRESS': 'bad', 'SUPERCOMPRESS_API_KEY': self.KEY}, self.source, 'invalid'),
+                ({'SUPERCOMPRESS_API_KEY': self.KEY}, 'small', 'small'),
+                ({'SUPERCOMPRESS_API_KEY': self.KEY}, '\U0001f600' * 60001, 'bounded size')):
+            with self.subTest(status=status), mock.patch.dict(os.environ, environment):
+                text, warning = self.compress(source)
+                self.assertEqual(text, source)
+                self.assertIn(status, warning)
+                self.assertIn('accepted=0', warning)
+        self.request.assert_not_called()
+        with mock.patch.dict(os.environ, SUPERCOMPRESS_API_KEY=self.KEY):
+            self.request.side_effect = None
+            self.request.return_value = (None, 'test transport unavailable')
+            self.assertEqual(self.compress('\U0001f600' * 60000)[0], '\U0001f600' * 60000)
+            self.request.assert_called_once()
+
+    def test_accepted_extract_keeps_original_and_critical_evidence(self):
+        with mock.patch.dict(os.environ, SUPERCOMPRESS_API_KEY=self.KEY):
+            self.request.side_effect = None
+            self.request.return_value = (self.result, None)
+            text, status = self.compress()
+        self.assertIn(self.kept, text)
+        self.assertIn('accepted=1', status)
+        self.assertIn(f'input_bytes={len(self.source.encode())}', status)
+        self.assertIn(f'output_bytes={len(text.encode())}', status)
+        self.assertNotIn('token', status)
+        original = self.root / '.taskq' / 'context' / (taskq.hashlib.sha256(self.source.encode()).hexdigest() + '.txt')
+        self.assertEqual(original.read_bytes(), self.source.encode())
+        self.assertIn(str(original), text)
+        self.assertLess(len(text.encode()), len(self.source.encode()))
+        self.assertNotIn(self.KEY, text + status)
+
+    def test_rejects_malformed_larger_untrusted_and_critical_loss(self):
+        variants = [None, [], {'compressed_text': ''}, {**self.result, 'compressed_text': self.source},
+                    {**self.result, 'compressed_text': 'remote-secret-value'},
+                    {**self.result, 'compressed_text': self.KEY},
+                    {**self.result, 'compressed_text': 'relevant evidence\n'},
+                    {**self.result, 'compressed_text': 'relevant evidence\n' + self.source.splitlines()[0]},
+                    {**self.result, 'critical_lines_dropped': ['private response']},
+                    {**self.result, 'critical_lines_dropped': None},
+                    {**self.result, 'verifier': None}, {**self.result, 'compression_risk': 'high'},
+                    {**self.result, 'verifier': {'risk': 'low', 'score': float('nan')}},
+                    {**self.result, 'verifier': {'risk': 'low', 'score': 10 ** 400}},
+                    {**self.result, 'verifier': {'risk': 'medium', 'score': 0.99}}]
+        with mock.patch.dict(os.environ, SUPERCOMPRESS_API_KEY=self.KEY):
+            self.request.side_effect = None
+            for result in variants:
+                with self.subTest(result=result):
+                    self.request.return_value = (result, None)
+                    text, status = self.compress()
+                    self.assertEqual(text, self.source)
+                    self.assertIn('WARNING', status)
+                    self.assertNotIn('private response', status)
+                    self.assertNotIn('remote-secret-value', status)
+                    self.assertNotIn(self.KEY, text + status)
+
+    def test_hosted_neural_schema_uses_same_local_protection(self):
+        neural = {key: self.result[key] for key in ('compressed_text', 'original_tokens', 'kept_tokens')}
+        neural['mode'] = 'neural-keep'
+        self.assertTrue(taskq.valid_compression(self.source, neural, self.KEY))
+        variants = [{**neural, 'mode': 'unknown'}, {**neural, 'mode': 'compiler'},
+                    {**neural, 'compressed_text': 'relevant evidence\n'},
+                    {**neural, 'compressed_text': 'generated advice\n'},
+                    {**neural, 'compressed_text': self.source}]
+        for field in ('critical_lines_dropped', 'compression_risk', 'verifier'):
+            variants.append({**neural, field: None})
+            variants.append({**neural, field: self.result[field]})
+        for result in variants:
+            with self.subTest(result=result):
+                self.assertFalse(taskq.valid_compression(self.source, result, self.KEY))
+        self.assertTrue(taskq.valid_compression(self.source, {**self.result, 'mode': 'neural-keep'}, self.KEY))
+
+    def captured(self, **changes):
+        return {'request_id': 'fresh-call-id', 'session_id': SESSION,
+                'context_sha256': taskq.hashlib.sha256(self.source.encode()).hexdigest(),
+                'query': 'relevant evidence', 'response': {
+                    'session_id': SESSION, 'compacted': False, 'skipped': None,
+                    'delta': self.kept, 'compressed_text': 'rolling memory must never be consumed',
+                    'original_tokens': 601, 'kept_tokens': 2089}, **changes}
+
+    def compress_captured(self, envelope, request_id='fresh-call-id'):
+        path = self.root / 'response.json'
+        path.write_bytes(json.dumps(envelope).encode())
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            text = taskq.supporting_context(self.source, 'relevant evidence', path, request_id)
+        return text, out.getvalue()
+
+    def test_current_mcp_delta_accepts_without_key_ignores_memory_and_mixed_token_scopes(self):
+        text, status = self.compress_captured(self.captured())
+        self.assertIn(self.kept, text)
+        self.assertNotIn('rolling memory', text)
+        self.assertIn('accepted=1', status)
+        self.assertIn('remote verifier unavailable', status)
+        self.assertIn(f'input_bytes={len(self.source.encode())}', status)
+        self.assertIn(f'output_bytes={len(text.encode())}', status)
+        self.assertNotIn('token', status)
+        self.request.assert_not_called()
+        original = self.root / '.taskq' / 'context' / (taskq.hashlib.sha256(self.source.encode()).hexdigest() + '.txt')
+        self.assertEqual(original.read_bytes(), self.source.encode())
+        # Token counts are diagnostic only in both acquisition routes.
+        for counts in ({'original_tokens': 601, 'kept_tokens': 2089},
+                       {'original_tokens': True, 'kept_tokens': 'unknown'},
+                       {'original_tokens': None, 'kept_tokens': None}):
+            self.assertTrue(taskq.valid_compression(self.source, {**self.result, **counts}, ''))
+
+    def test_captured_rejects_stale_replayed_partial_and_unsafe_without_remote_fallback(self):
+        envelope = self.captured()
+        variants = [self.captured(**{field: 'stale-private-value'}) for field in
+                    ('request_id', 'session_id', 'context_sha256', 'query')]
+        variants += [None, [], {**envelope, 'response': None}]
+        for fields in ({'session_id': 'parent-session'}, {'compacted': True}, {'compacted': None},
+                       {'skipped': 'already_seen'}, {'skipped': 'partial_chunk_failure'},
+                       {'partial': True}, {'error': 'private error'}, {'errors': ['private error']},
+                       {'isError': True}, {'paywall': True}, {'partial': 0}, {'status': 'error'},
+                       {'delta': ''}, {'delta': None},
+                       {'delta': self.kept.splitlines()[0][:20] + '\nrelevant evidence\n'},
+                       {'delta': 'relevant evidence\n'}, {'delta': self.source},
+                       {'critical_lines_dropped': ['private dropped line']}, {'verifier': None},
+                       {'compression_risk': 'high'}):
+            variants.append({**envelope, 'response': {**envelope['response'], **fields}})
+        for variant in variants:
+            with self.subTest(variant=variant):
+                text, status = self.compress_captured(variant)
+                self.assertEqual(text, self.source)
+                self.assertIn('accepted=0', status)
+                self.assertNotIn('private', status)
+        # Fresh call ID rejects the previously captured envelope, without storing queue/replay state.
+        self.assertEqual(self.compress_captured(envelope, 'next-fresh-call-id')[0], self.source)
+        with mock.patch.object(taskq, 'session', return_value=None):
+            self.assertEqual(self.compress_captured(envelope)[0], self.source)
+        self.request.assert_not_called()
+
+    def test_captured_cli_bounds_pairs_and_secret_withholding(self):
+        source, response = self.root / 'support.txt', self.root / 'response.json'
+        source.write_bytes(self.source.encode())
+        args = ('compress', '--input', str(source), '--query', 'relevant evidence')
+        for payload in (b'not json private value', b'x' * (taskq.COMPRESS_BYTES + 1), b'\xff', b'[' * 2000 + b']' * 2000):
+            response.write_bytes(payload)
+            with contextlib.redirect_stderr(io.StringIO()) as warnings:
+                self.assertEqual(self.run_cli(*args, '--response', str(response), '--request-id', 'fresh-call-id'), self.source)
+            self.assertIn('accepted=0', warnings.getvalue())
+            self.assertNotIn('private', warnings.getvalue())
+        for extra in (('--response', str(response)), ('--request-id', 'fresh-call-id')):
+            with contextlib.redirect_stderr(io.StringIO()) as warnings:
+                self.assertEqual(self.run_cli(*args, *extra), self.source)
+            self.assertIn('supplied together', warnings.getvalue())
+        response.write_text(json.dumps(self.captured()), encoding='utf-8')
+        with contextlib.redirect_stderr(io.StringIO()) as warnings:
+            self.assertIn(self.kept, self.run_cli(*args, '--response', str(response), '--request-id', 'fresh-call-id'))
+        self.assertIn('accepted=1', warnings.getvalue())
+        for secret in ('API_KEY=private value', self.KEY):
+            source.write_text(secret + self.source, encoding='utf-8')
+            with mock.patch.dict(os.environ, SUPERCOMPRESS_API_KEY=self.KEY), contextlib.redirect_stderr(io.StringIO()):
+                self.assertIn('withheld', self.run_cli(*args, '--response', str(response), '--request-id', 'fresh-call-id'))
+        self.request.assert_not_called()
+
+    def test_credentials_withheld_before_transport_preservation_or_disabled_fallback(self):
+        for source in (self.KEY, 'API_KEY=private value\n' + self.source):
+            for option in ('on', 'off'):
+                with mock.patch.dict(os.environ, SUPERCOMPRESS_API_KEY=self.KEY, TASKQ_COMPRESS=option):
+                    text, status = self.compress(source)
+                    self.assertNotIn(self.KEY, text + status)
+                    self.assertNotIn('private value', text + status)
+                    self.assertIn('withheld', text + status)
+        self.assertFalse((self.root / '.taskq' / 'context').exists())
+        self.request.assert_not_called()
+
+    def test_preservation_failure_and_rejected_transport_keep_original(self):
+        with mock.patch.dict(os.environ, SUPERCOMPRESS_API_KEY=self.KEY):
+            with mock.patch.object(Path, 'mkdir', side_effect=OSError('private path')):
+                text, warning = self.compress()
+                self.assertEqual(text, self.source)
+                self.assertNotIn('private path', warning)
+                self.request.assert_not_called()
+            self.request.side_effect = None
+            self.request.return_value = (None, 'timeout')
+            self.assertEqual(self.compress()[0], self.source)
+
+    def test_fenced_commands_cannot_be_dropped_even_without_numbers_or_markers(self):
+        for fence in ('```', '~~~'):
+            source = self.source + fence + '\ngit status\n' + fence + '\n'
+            dropped = {**self.result, 'compressed_text': self.kept + fence + '\n' + fence + '\n'}
+            self.assertFalse(taskq.valid_compression(source, dropped, self.KEY))
+            kept = {**self.result, 'compressed_text': self.kept + fence + '\ngit status\n' + fence + '\n'}
+            self.assertTrue(taskq.valid_compression(source, kept, self.KEY))
+
+    def test_fixed_http_no_retry_redirect_or_remote_error_disclosure(self):
+        # Exercise the actual adapter, bypassing only the TLS connection with a scripted peer.
+        self.request.side_effect = None
+        self.request.return_value = (None, None)
+        for status in (200, 301, 302, 307, 401, 429, 500, 503):
+            with self.subTest(status=status), mock.patch.object(taskq.http.client, 'HTTPSConnection') as connect:
+                response = connect.return_value.getresponse.return_value
+                response.status = status
+                response.read1.side_effect = [json.dumps(self.result).encode(), b'']
+                result, reason = Compression.http_request(self.source, 'intent', self.KEY)
+                connect.assert_called_once_with('www.supercompress.dev', timeout=60)
+                connection = connect.return_value
+                connection.request.assert_called_once()
+                method, path, body, headers = connection.request.call_args.args
+                self.assertEqual((method, path), ('POST', '/api/v1/compress'))
+                self.assertEqual(headers['X-API-Key'], self.KEY)
+                self.assertEqual(json.loads(body), {'context': self.source, 'query': 'intent', 'ccr': False, 'cache_prefix': False, 'log': False,
+                                                   'coding_agent': 'taskq', 'source': 'taskq'})
+                connection.close.assert_called_once()
+                if status == 200:
+                    self.assertEqual(result, self.result)
+                    self.assertIsNone(reason)
+                else:
+                    self.assertIsNone(result)
+                    self.assertIn('HTTP failure', reason)
+                    response.read1.assert_not_called()
+        for payload in (b'not JSON private-secret', b'\xff', b'x' * (taskq.COMPRESS_BYTES + 1)):
+            with mock.patch.object(taskq.http.client, 'HTTPSConnection') as connect:
+                response = connect.return_value.getresponse.return_value
+                response.status = 200
+                response.read1.side_effect = [payload, b'']
+                result, reason = Compression.http_request(self.source, 'intent', self.KEY)
+                self.assertIsNone(result)
+                self.assertNotIn('private-secret', reason)
+        for error in (TimeoutError(self.KEY), OSError('remote private-secret')):
+            with mock.patch.object(taskq.http.client, 'HTTPSConnection') as connect:
+                connect.return_value.request.side_effect = error
+                result, reason = Compression.http_request(self.source, 'intent', self.KEY)
+                self.assertIsNone(result)
+                self.assertNotIn(self.KEY, reason)
+                self.assertNotIn('private-secret', reason)
+                connect.return_value.request.assert_called_once()
+
+    http_request = staticmethod(taskq._compression_http)
+    network_request = staticmethod(taskq.compression_request)
+
+    def test_owned_network_child_uses_private_stdin_and_sanitizes_all_failures(self):
+        with mock.patch.object(taskq.subprocess, 'Popen') as spawn, mock.patch.object(taskq.threading, 'Timer') as timer:
+            spawn.return_value.communicate.return_value = (json.dumps([self.result, None]).encode(), None)
+            spawn.return_value.returncode = 0
+            result, reason = Compression.network_request(self.source, 'owner query stays exact', self.KEY)
+            self.assertEqual(result, self.result)
+            self.assertIsNone(reason)
+            argv = spawn.call_args.args[0]
+            options = spawn.call_args.kwargs
+            self.assertNotIn(self.KEY, str(argv) + str(options['env']))
+            self.assertNotIn(self.source, str(argv))
+            self.assertEqual(json.loads(spawn.return_value.communicate.call_args.args[0]), [self.source, 'owner query stays exact', self.KEY])
+            self.assertEqual(timer.call_args.args[0], 60)
+            timer.return_value.cancel.assert_called_once()
+            timer.return_value.join.assert_called_once()
+            spawn.return_value.wait.assert_called_once()
+            self.assertEqual(options['stderr'], subprocess.DEVNULL)
+        for output in (b'private remote error', b'[null,"private remote error"]', b'x' * (taskq.COMPRESS_BYTES + 1)):
+            with mock.patch.object(taskq.subprocess, 'Popen') as spawn:
+                spawn.return_value.communicate.return_value = (output, None)
+                spawn.return_value.returncode = 0
+                result, reason = Compression.network_request(self.source, 'intent', self.KEY)
+                self.assertIsNone(result)
+                self.assertNotIn('private remote error', reason)
+        with mock.patch.object(taskq.subprocess, 'Popen') as spawn:
+            spawn.return_value.communicate.side_effect = BrokenPipeError('private failure')
+            spawn.return_value.poll.return_value = None
+            self.assertEqual(Compression.network_request(self.source, 'intent', self.KEY), (None, 'compression worker unavailable'))
+            spawn.return_value.kill.assert_called_once()
+            spawn.return_value.wait.assert_called_once()
+
+    def test_real_stalled_network_child_is_killed_and_waited_without_leaking_stderr(self):
+        for reads_input in (False, True):
+            with self.subTest(reads_input=reads_input):
+                marker = self.root / ('network-' + str(reads_input) + '.pid')
+                worker = ('import json,os,sys,time,pathlib;'
+                          f'pathlib.Path({str(marker)!r}).write_text(str(os.getpid()));' +
+                          ('json.load(sys.stdin);' if reads_input else '') +
+                          'sys.stderr.write("private synthetic child diagnostic");sys.stderr.flush();time.sleep(60)')
+                started = taskq.time.monotonic()
+                with mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN), \
+                        mock.patch.object(taskq, 'COMPRESS_WORKER', worker), mock.patch.object(taskq, 'COMPRESS_TIMEOUT', 1):
+                    self.assertEqual(Compression.network_request('x' * 120000, 'intent', self.KEY), (None, 'timeout'))
+                self.assertLess(taskq.time.monotonic() - started, 5)
+                self.assertTrue(marker.exists(), 'the owned child must have started before the deadline')
+                self.assertEqual(taskq.process_identity(int(marker.read_text()))[0], 'dead')
+
+    def test_history_is_verbatim_and_ordered_without_implicit_evidence_classification(self):
+        self.add()
+        notes = ['**result** · worker\n\nOwner query: never replace it\n' + self.source,
+                 '**answer** · owner\n\nChoose B exactly', '**result** · worker\n\nLatest evidence']
+        self.board.issues[1]['comments'] = notes
+        expected = 'History of this task (read it first; a requeue says what to fix):\n\n' + '\n\n'.join(notes) + '\n\n'
+        for option in ('on', 'off'):
+            with mock.patch.dict(os.environ, TASKQ_COMPRESS=option, SUPERCOMPRESS_API_KEY=self.KEY):
+                self.assertEqual(taskq.history(1), expected)
+        self.request.assert_not_called()
+
+    def test_real_slow_header_peer_cannot_extend_the_owned_exchange_deadline(self):
+        listener = taskq.socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(1)
+        listener.settimeout(3)
+        port = listener.getsockname()[1]
+        stop, headers = threading.Event(), threading.Event()
+        def serve():
+            try:
+                connection, _ = listener.accept()
+                with connection:
+                    connection.settimeout(3)
+                    connection.recv(65536)
+                    connection.sendall(b'HTTP/1.1 200 OK\r\nX-Slow: ')
+                    headers.set()
+                    while not stop.wait(0.03):
+                        connection.sendall(b'x')  # bytes keep socket inactivity timeouts alive, never finish headers
+            except OSError:
+                pass
+        peer = threading.Thread(target=serve)
+        peer.start()
+        # Only this synthetic child replaces TLS with a loopback HTTP peer; production retains its fixed HTTPS host.
+        worker = ('import json,runpy,sys,http.client;scope=runpy.run_path(sys.argv[1]);'
+                  f'scope["http"].client.HTTPSConnection=lambda *a,**kw:http.client.HTTPConnection("127.0.0.1",{port},timeout=10);'
+                  'value=scope["_compression_http"](*json.load(sys.stdin));sys.stdout.write(json.dumps(value))')
+        started = taskq.time.monotonic()
+        try:
+            with mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN), \
+                    mock.patch.object(taskq, 'COMPRESS_WORKER', worker), mock.patch.object(taskq, 'COMPRESS_TIMEOUT', 1):
+                self.assertEqual(Compression.network_request(self.source, 'intent', self.KEY), (None, 'timeout'))
+            self.assertTrue(headers.is_set(), 'must reach the header-reading boundary')
+            self.assertLess(taskq.time.monotonic() - started, 5)
+        finally:
+            stop.set()
+            listener.close()
+            peer.join(4)
+        self.assertFalse(peer.is_alive())
+
+    def test_real_cli_file_to_stdout_preserves_unicode_newlines_without_api(self):
+        (self.root / 'taskq.json').write_text(json.dumps({'board': 'github', 'repo': 'fixture/local'}), 'utf-8')
+        source = self.root / 'support.txt'
+        original = 'CRITICAL: task #623; never deploy.\r\nЮникод 😀\n'.encode('utf-8')
+        source.write_bytes(original)
+        with mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
+            result = REAL_RUN([sys.executable, str(ROOT / 'taskq.py'), 'compress', '--input', str(source), '--query', 'intent'],
+                              cwd=self.root, env={**os.environ, 'TASKQ_COMPRESS': 'off'}, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, original)
+        self.assertIn(b'WARNING', result.stderr)
+        self.assertIn(b'accepted=0', result.stderr)
+        self.assertFalse((self.root / '.taskq' / 'context').exists())
+
+    def test_briefs_pm_resume_and_helper_share_policy_preserve_authority(self):
+        self.add()
+        authority = 'NEVER deploy; acceptance #623; exact `git status`; owner decided no changes.'
+        issue = self.board.issues[1]
+        issue['body'] = taskq.block(authority, self.task(1)['raw'])
+        issue['comments'] = ['**result** · test\n\n' + self.source, '**answer** · owner\n\n' + authority,
+                             '**requeue** · reviewer\n\n' + authority, '**result** · test\n\ncurrent result ' + authority]
+        item = self.task(1)
+        with mock.patch.dict(os.environ, SUPERCOMPRESS_API_KEY=self.KEY):
+            self.request.side_effect = None
+            self.request.return_value = (self.result, None)
+            with contextlib.redirect_stderr(io.StringIO()):
+                for runtime in ('claude', 'codex', 'hermes', 'other'):
+                    for text in (taskq.brief(item, runtime), taskq.supervisor_brief(item, runtime, object()),
+                                 taskq.resume_context('answer #623 [event 623:7]\n' + authority, runtime)):
+                        self.assertIn(authority, text)
+                        self.assertIn('EVERY nested assignment', text)
+                        self.assertIn('compress --input', text)
+                        self.assertIn('application unverified', text)
+                        self.assertIn('not automatically compressed', text)
+                        self.assertIn('NEVER compress or replace the user ask/query', text)
+                        self.assertIn('task/context identity is established', text)
+                        self.assertIn('connect_account once and retry once', text)
+                        self.assertIn('actual calling runtime session ID', text)
+                        self.assertIn('SAME tool call', text)
+                        self.assertIn('--response <envelope-file> --request-id <same-fresh-ID>', text)
+                        self.assertIn('never consume unchecked digest or rolling memory', text)
+                        self.assertNotIn(self.KEY, text)
+                for call in self.request.call_args_list:
+                    self.assertNotIn(authority, call.args[0])
+            self.assertEqual(taskq.worker_env()['SUPERCOMPRESS_API_KEY'], self.KEY)
+        with mock.patch.object(taskq, 'CLONE', ROOT), mock.patch.object(taskq, 'refresh'), mock.patch.object(taskq, 'cmd_arm'):
+            pm = self.run_cli('pm')
+            self.assertIn('Context compression: enabled; key missing', pm)
+            self.assertIn('EVERY nested assignment', pm)
+        source = self.root / 'support.txt'
+        source.write_bytes('line\r\nЮникод 😀\n'.encode())
+        with mock.patch.dict(os.environ, TASKQ_COMPRESS='off'), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.run_cli('compress', '--input', str(source), '--query', 'intent'), source.read_bytes().decode())
 
 
 class Coordination(Base):
@@ -1099,7 +1536,7 @@ def retire(gone, running=True): pass
             self.board.release(self.board.guard)  # fixture confirms failed wake is quiescent before exact-token recovery
             self.assertEqual(self.wait_and_ack( '--window', '0'), 'ask #1\n')
             self.assertEqual(self.wait_and_ack( '--window', '0'), 'tick\n')
-        self.native.wake_manager.assert_called_once_with(SESSION, 'ask #1 [event 1:3]')
+        self.native.wake_manager.assert_called_once_with(SESSION, taskq.resume_context('ask #1 [event 1:3]', 'hermes'))
         self.assertEqual(receipt.read_bytes(), before)  # legacy file is no longer receipt authority
 
     def test_wait_busy_unknown_and_foreign_manager_never_consume_for_wake(self):
@@ -1380,7 +1817,7 @@ class Tick(TickSetup):
         self.run_cli('tick')
         self.assertEqual((self.task(1)['state'], self.task(1)['claim']['session'], self.task(2)['state']), ('doing', None, 'ready'))
         self.assertIn('worker s-T1 is gone', self.board.issues[1]['comments'][-1])
-        self.assertEqual(self.fake.sent, [('s-S1', 'gone #1 [event 1:5]: read your issue')])  # woken once
+        self.assertEqual(self.fake.sent, [('s-S1', taskq.resume_context('gone #1 [event 1:5]: read your issue', 'fake'))])  # woken once
         self.run_cli('tick')
         self.assertEqual((len(self.fake.sent), self.fake.names), (1, ['S1 UNK one (mac)', 'T1 UNK one (mac)']))
 
@@ -1563,7 +2000,7 @@ class Tick(TickSetup):
         self.fake.sessions['s-T1'] = 'idle'
         self.board.issues[1]['updated_at'] = '2026-01-01T00:00:00Z'
         self.run_cli('tick')
-        self.assertEqual(self.fake.sent, [('s-T1', 'continue: read your issue')])
+        self.assertEqual(self.fake.sent, [('s-T1', taskq.resume_context('continue: read your issue', 'fake'))])
         self.assertEqual(self.board.issues[1]['comments'][-1], '**nudge** · claude:01234567\n\nworker s-T1')
         self.fake.sessions['s-T1'] = None  # cannot tell: left alone
         self.run_cli('tick')
@@ -1579,7 +2016,7 @@ class Tick(TickSetup):
         self.run_cli('answer', '1', '--text', 'the first')
         self.run_cli('tick')
         self.run_cli('tick')
-        self.assertEqual(self.fake.sent, [('s-T1', 'The owner answered your question:\n\nthe first')])
+        self.assertEqual(self.fake.sent, [('s-T1', taskq.resume_context('The owner answered your question:\n\nthe first', 'fake'))])
         self.assertEqual(self.task(1)['state'], 'doing')
 
     def test_decisions_block_and_answer_by_codes(self):
@@ -1608,7 +2045,7 @@ class Tick(TickSetup):
             self.run_cli('answer', '1.2, 2.1')
         self.assertEqual((self.task(1)['state'], self.task(1)['raw']['decision'], self.board.issues[2]['state']), ('doing', None, 'closed'))
         self.assertEqual(self.board.issues[2]['comments'][-1], '**close** · claude:01234567\n\n2.1: close as is')
-        self.assertEqual(self.fake.sent[-1], ('s-T1', 'The owner answered your question:\n\n1.2: keep B'))
+        self.assertEqual(self.fake.sent[-1], ('s-T1', taskq.resume_context('The owner answered your question:\n\n1.2: keep B', 'fake')))
         self.assertNotIn('Questions', self.run_cli('tick'))
         with self.assertRaisesRegex(SystemExit, 'pick 1 to 1'):
             self.run_cli('ask', '1', '--text', 'q', '--option', 'a', '--recommend', '2')
@@ -1933,7 +2370,7 @@ class Tick(TickSetup):
         self.fake.sessions[self.task(1)['claim']['session']] = 'idle'
         self.run_cli('answer', '1', '--text', 'this')  # the live worker gets the answer, the slot stays full
         self.assertEqual(spawns(), ['S1', 'T1', 'T1', 'S1', 'T1'])
-        self.assertEqual(self.fake.sent, [('s-T1.2', 'The owner answered your question:\n\nthis')])
+        self.assertEqual(self.fake.sent, [('s-T1.2', taskq.resume_context('The owner answered your question:\n\nthis', 'fake'))])
         with self.acting('s-T1.2'):
             self.run_cli('result', '1', '--sha', 'b' * 40)
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), self.acting('s-S1.1'):
@@ -2263,7 +2700,7 @@ class Tick(TickSetup):
         self.fake.sessions['s-S1'] = 'idle'
         self.run_cli('tick')
         self.run_cli('tick')
-        self.assertEqual(self.fake.sent, [('s-S1', 'requeue #1 [event 1:5]: read your issue')])
+        self.assertEqual(self.fake.sent, [('s-S1', taskq.resume_context('requeue #1 [event 1:5]: read your issue', 'fake'))])
         with self.acting('s-S1'):
             self.run_cli('requeue', '1', '--text', 'try B')  # its own requeue: no event for it
             self.run_cli('requeue', '1', '--text', 'try C')
@@ -2275,8 +2712,8 @@ class Tick(TickSetup):
         with self.acting('s-S1'):
             self.run_cli('requeue', '1', '--text', 'try D')
         self.assertEqual(len(self.fake.names), 5)
-        self.assertIn(('s-S1', 'answer #1 [event 1:11]: read your issue'), self.fake.sent)
-        self.assertEqual([text for _, text in self.fake.sent].count('requeue #1 [event 1:5]: read your issue'), 1)  # its own requeues woke nothing
+        self.assertIn(('s-S1', taskq.resume_context('answer #1 [event 1:11]: read your issue', 'fake')), self.fake.sent)
+        self.assertEqual([text for _, text in self.fake.sent].count(taskq.resume_context('requeue #1 [event 1:5]: read your issue', 'fake')), 1)  # its own requeues woke nothing
 
     def test_replacement_retires_the_recorded_old_session_first(self):
         # #568: a rework's T<N> and a respawned S<N> retire their predecessor by board-recorded id before they spawn
@@ -2388,7 +2825,7 @@ class Tick(TickSetup):
         self.assertIn('supervisor s-S1.1 is gone again', self.board.issues[1]['comments'][-1])
         self.fake.resumable = lambda session: True  # Codex: exec resume keeps the thread
         self.run_cli('answer', '1', '--text', 'fixed')  # resets the bound; its pass recovers the supervisor
-        self.assertEqual((self.task(1)['supervisor']['session'], self.fake.sent[-1]), ('s-S1.1', ('s-S1.1', 'restart #1: your last turn ended error: rate limit; read your issue')))
+        self.assertEqual((self.task(1)['supervisor']['session'], self.fake.sent[-1]), ('s-S1.1', ('s-S1.1', taskq.resume_context('restart #1: your last turn ended error: rate limit; read your issue', 'fake'))))
 
     def test_self_waking_supervisor_is_never_sent_to(self):
         # #525 owner clarification: the queue wakes the supervisor, no sender. A Claude one with its process reads its own
@@ -2413,7 +2850,7 @@ class Tick(TickSetup):
         self.fake.sessions['s-S1'] = 'idle'  # its turn ended, the process is gone
         self.fake.send = lambda session, text: self.fake.sent.append((session, text)) or 's-S1r'
         self.run_cli('tick')
-        self.assertEqual(self.fake.sent, [('s-S1', 'review #1 [event 1:8]: read your issue')])
+        self.assertEqual(self.fake.sent, [('s-S1', taskq.resume_context('review #1 [event 1:8]: read your issue', 'fake'))])
         self.assertEqual((self.task(1)['supervisor']['session'], self.board.issues[1]['comments'][-1]),
                          ('s-S1r', '**nudge** · claude:01234567\n\nsupervisor s-S1r replaces s-S1'))
         with self.acting('s-S1'), self.assertRaisesRegex(SystemExit, 'only it, the task.s manager or the owner'):
@@ -2457,7 +2894,7 @@ class Tick(TickSetup):
         self.fake.sessions['s-S1'] = 'idle'
         with mock.patch.object(taskq, 'process_identity', side_effect=[('running', BIRTH), ('dead', None)]), mock.patch.object(taskq.time, 'sleep') as slept:
             self.run_cli('tick', '--quiet', '--after', '4242', '--after-birth', BIRTH)
-        self.assertEqual((slept.call_count, self.fake.sent), (1, [('s-S1', 'review #1 [event 1:5]: read your issue')]))
+        self.assertEqual((slept.call_count, self.fake.sent), (1, [('s-S1', taskq.resume_context('review #1 [event 1:5]: read your issue', 'fake'))]))
         self.run_cli('tick')
         self.assertEqual(len(self.fake.sent), 1)  # once
 
@@ -2972,7 +3409,7 @@ class EventDelivery(Base):
         with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
             taskq.follow(self.task(1), fake, claim, False)
             taskq.follow(self.task(1), fake, claim, False)
-        self.assertEqual(fake.sent, [('worker-one', 'The owner answered your question:\n\nfirst\n\nsecond')])
+        self.assertEqual(fake.sent, [('worker-one', taskq.resume_context('The owner answered your question:\n\nfirst\n\nsecond', 'fake'))])
         self.assertEqual(taskq.event_pending(self.task(1)['raw'], taskq.recipient('worker', claim)), [])
         self.assertEqual(len(taskq.event_pending(self.task(1)['raw'], taskq.recipient('manager', self.task(1)['pm']))), 2)
 
@@ -3074,7 +3511,7 @@ class EventDelivery(Base):
             taskq.follow(self.task(1), fake, claim, True)
             taskq.follow(self.task(1), fake, claim, True)
             taskq.follow(self.task(1), fake, claim, True)
-        self.assertEqual([text for _, text in fake.sent], ['The owner answered your question:\n\nanswer', 'also inspect the output'])
+        self.assertEqual([text for _, text in fake.sent], [taskq.resume_context(text, 'fake') for text in ('The owner answered your question:\n\nanswer', 'also inspect the output')])
 
     def test_busy_worker_never_fetches_history_or_consumes_event(self):
         fake, claim = self.worker()
@@ -3131,7 +3568,7 @@ class EventDelivery(Base):
         with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
             taskq.follow(self.task(1), fake, claim, False)
             taskq.follow(self.task(1), fake, claim, False)
-        self.assertEqual(fake.sent, [('worker-one', 'The owner answered your question:\n\nfirst pending\n\nsecond pending')])
+        self.assertEqual(fake.sent, [('worker-one', taskq.resume_context('The owner answered your question:\n\nfirst pending\n\nsecond pending', 'fake'))])
 
     def test_resumed_worker_keeps_acknowledged_manual_nudge_cursor(self):
         fake, claim = self.worker()
@@ -3143,7 +3580,7 @@ class EventDelivery(Base):
         with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
             resumed = taskq.follow(self.task(1), fake, claim, True)
             taskq.follow(self.task(1), fake, resumed, True)
-        fake.send.assert_called_once_with('worker-one', 'The owner answered your question:\n\nnew answer')
+        fake.send.assert_called_once_with('worker-one', taskq.resume_context('The owner answered your question:\n\nnew answer', 'fake'))
         self.assertEqual(self.task(1)['raw']['worker_comment_cursor']['worker-two'], raw['worker_comment_cursor']['worker-one'])
 
     def test_wait_does_not_report_review_worker_as_gone_or_overwrite_fresh_state(self):
@@ -4155,6 +4592,13 @@ def link(session): return None
 class RealChild(unittest.TestCase):
     """#481: `add` in a real process starts the real detached `tick --quiet` child; it spawns and logs, though the list lags the add."""
 
+    def setUp(self):
+        config = tempfile.TemporaryDirectory()
+        self.addCleanup(config.cleanup)
+        patcher = mock.patch.dict(os.environ, SUPERCOMPRESS_CONFIG_DIR=config.name, SUPERCOMPRESS_API_KEY='')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_quiet_guard_timeout_is_nonzero_without_writes(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -4593,7 +5037,11 @@ class HermesNativeBoundary(unittest.TestCase):
                 self.assertEqual(out.getvalue(), 'ask #1\n')
                 data = self.runtime.data_for(sid)
                 turn = self.runtime.call(sid, '_turn', turn=data['turn'])
-                self.assertEqual(turn['prompt'], 'ask #1')
+                control, separator, policy = turn['prompt'].partition('\n\nContext compression: ')
+                self.assertEqual(control, 'ask #1')  # exact event authority precedes the inherited role policy
+                self.assertTrue(separator)
+                self.assertIn('EVERY nested assignment', policy)
+                self.assertIn('NEVER compress or replace the user ask/query', policy)
                 self.assertTrue(turn['started'])
                 self.assertEqual(turn['complete']['status'], 'complete')
                 self.assertTrue(turn['complete']['persisted_turn']['complete'])

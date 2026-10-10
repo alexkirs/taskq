@@ -1131,6 +1131,18 @@ def move(current, state, action, text='', **fields):
         fail(compatibility_reason(current))
     labels = [label for label in current['labels'] if not label.startswith(PREFIX)] + ([PREFIX + state] if state else [])
     raw = {**current['raw'], **{key: current[key] for key in FIELDS}, **fields}
+    old = current['raw'].get('decision') or {}
+    if old.get('options') or (raw.get('decision') or {}).get('options') or 'decision_next' in raw:
+        start, next_option = old.get('start', 1), raw.get('decision_next', 0)
+        if type(start) is not int or start < 1 or type(next_option) is not int or next_option < 0:
+            fail(f'#{current["iid"]}: invalid decision numbering; re-present the decision')
+        next_option = max(next_option, start + len(old.get('options') or [])) if next_option else 0
+        card = fields.get('decision') or {}
+        if card.get('options'):
+            raw['decision'] = {**card, 'start': next_option or 1}
+            if next_option:
+                next_option += len(card['options'])
+        raw['decision_next'] = next_option  # issue-local codes are never rebound to another action
     raw['events'] = [dict(event, acks=list(event.get('acks', []))) for event in raw.get('events', [])]
     reconcile_recipients(raw)
     append_event(raw, action, text)
@@ -1171,7 +1183,7 @@ def cmd_add(args):
     state = 'waiting' if open_deps(args.deps) else 'ready'
     labels = [PREFIX + state, f'priority-{args.priority}', args.type] + ([RUN + args.runtime] if args.runtime != 'any' else []) \
         + ([ON + args.host] if args.host else [])
-    raw = {'scope': args.scope, 'deps': args.deps, 'claim': None, 'result': None, 'pm': origin()}
+    raw = {'scope': args.scope, 'deps': args.deps, 'claim': None, 'result': None, 'pm': origin(), 'decision_next': 1}
     append_event(raw, 'add', '')
     n = effect(BOARD.add, args.title, block(text, raw), labels)
     diagnostic_comment(n, f'**add** · {who()}')
@@ -1185,7 +1197,8 @@ def cmd_list(args):
         detail = {'ready': 'continue' if claim else '', 'later': item['raw'].get('waiting_for') or '',
                   'doing': f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]} @{claim.get("name")}' if claim else '',
                   'waiting': f'open dependencies {open_deps(item["deps"])}' if item['state'] == 'waiting' else ''}.get(item['state'], '')
-        print(f'#{item["iid"]:<4} {item["state"]:<8} p{item["priority"]} {item["runtime"]:<6} {item["title"]}'
+        print(f'#{item["iid"]} {item["title"] if args.full else task_label(item)} · {item["state"]} · p{item["priority"]}'
+              + (f' · {item["runtime"]}' if item['runtime'] != 'any' else '')
               + (f'  [{detail}]' if detail else ''))
 
 def cmd_take(args):
@@ -1203,12 +1216,12 @@ def cmd_take(args):
 
 
 def decision(args):
-    """#490: the decision card of an ask or result: what was done (the text's first line), results, options, one recommended."""
+    """R6/R7: complete ask/result context, evidence links and numbered options with one recommendation."""
     if not args.option and args.recommend != 1:
         fail('--recommend needs --option')
     if args.option and not 1 <= args.recommend <= len(args.option):
         fail(f'--recommend {args.recommend}: pick 1 to {len(args.option)}')
-    return {'summary': args.text.strip().split('\n')[0][:120], 'links': args.link, 'options': args.option, 'recommend': args.recommend}
+    return {'summary': args.text.strip(), 'links': args.link, 'options': args.option, 'recommend': args.recommend}
 
 # Moves with no other check: command -> (states it takes from, state it goes to, block changes).
 # A supervisor asks from review too: a result with options, or the third rework (§ 7 Supervisor).
@@ -1288,13 +1301,37 @@ def cmd_answer(args):
     if args.text:
         if len(args.n) != 1 or not args.n[0].isdigit():
             fail('answer N --text A: one task number')
+        current = task(int(args.n[0]), 'ask', 'review')
+        options = (current['raw'].get('decision') or {}).get('options') or []
+        if options and not current['raw'].get('decision_next') and args.text not in options:
+            fail(f'#{current["iid"]}: confirm the exact current option text; legacy numeric tokens are unsafe')
+        if current['state'] == 'review':
+            if args.text not in options:
+                fail(f'#{current["iid"]}: confirm the exact current review option text')
+            if args.text.lower().startswith('close'):
+                close_one(argparse.Namespace(n=current['iid'], text=args.text))
+            else:
+                move(current, 'doing', 'answer', args.text, decision=None)
+            return [current['iid']]
         cmd_move(argparse.Namespace(**{**vars(args), 'n': int(args.n[0])}))
         return [int(args.n[0])]
+    selected = codes(args.n)
+    if len({n for n, _ in selected}) != len(selected):
+        fail('duplicate task in answer batch; select each task once')
     picks = []
-    for n, k in codes(args.n):
+    for n, k in selected:
         current = task(n, 'ask', 'review')
-        options = (current['raw'].get('decision') or {}).get('options') or []
-        picks.append((current, k, 0 < k <= len(options) and options[k - 1] or fail(f'#{n} has no option {k}')))
+        card = current['raw'].get('decision') or {}
+        options, start = card.get('options') or [], card.get('start', 1)
+        if type(start) is not int or start < 1:
+            fail(f'#{n}: invalid decision numbering; re-present the decision')
+        next_option = current['raw'].get('decision_next', 0)
+        if type(next_option) is not int or next_option < 0 or next_option and start + len(options) > next_option:
+            fail(f'#{n}: invalid decision numbering; re-present the decision')
+        if not next_option:
+            fail(f'#{n}: uncertain legacy choices; read the fresh card and confirm the action with answer {n} --text')
+        picks.append((current, k, start <= k < start + len(options) and options[k - start]
+                      or fail(f'#{n} has no option {k}; read the current decision')))
     for current, k, text in picks:
         if current['state'] == 'review' and text.lower().startswith('close'):
             close_one(argparse.Namespace(n=current['iid'], text=f'{current["iid"]}.{k}: {text}'))
@@ -2370,25 +2407,32 @@ def stale(by_number):
     return gone
 
 def row(item, kinds, here, state=None):
-    """R6 (#489, #574): one markdown row, `[#N <title>](issue)` and `[<session[:8]>](link)`; a session with no link here stays
-    plain text. `state`: the report's state of the task (`blocked (no manager)`, ...), else its label."""
+    """R6 (#597): stacked work, preserving runtime/session links and blockers without empty columns."""
     claim = item['claim'] if (item['claim'] or {}).get('session') else item.get('supervisor') or item['claim'] or {}  # no worker yet: its supervisor
     runtime, session = claim.get('runtime') or item['runtime'], claim.get('session') or ''
     url = session and claim.get('name') == here and runtime in kinds and kinds[runtime].link(session)
     if url and runtime == 'codex' and direct():  # #521: Codex opens its own thread link; the wrapper only loads a page first
         url = f'codex://threads/{session}'
-    cell = f'[{session[:8]}]({url})' if url else session and f'{session[:8]} on {claim.get("name")}'
-    return f'| {heading(item)} | {state or item["state"]} | {runtime} | {cell} |'
+    detail = f'[{cell(session[:8])}]({url})' if url else session and cell(f'{session[:8]} on {claim.get("name")}')
+    parts = [heading(item), cell(state or item['state'])]
+    if runtime and runtime != 'any':
+        parts.append(cell(runtime))
+    if detail:
+        parts.append(detail)
+    return '- ' + ' · '.join(parts)
 
 def cell(text):
     """R6 (#574): one table cell and one link text: a newline becomes a space; `|`, `[`, `]` and a backslash are escaped."""
-    return re.sub(r'([\\[\]|])', r'\\\1', ' '.join(str(text).split()))
+    return re.sub(r'([\\[\]|*_`<>!])', r'\\\1', re.sub(r'[\r\n]+', ' ', str(text)))
+
+def task_label(item):
+    """Navigation hint only: canonical title and decision context are never shortened."""
+    return ' '.join(str(item.get('title') or '').split()[:4]) or 'Task'
 
 def heading(item):
-    """`[#N <title>](url)`, the title cut to 60 (R6, #574)."""
-    title = ' '.join((item.get('title') or '').split())
-    text = f'#{item["iid"]} {cell(title if len(title) <= 60 else title[:59] + "…")}'.strip()
-    return f'[{text}]({item["url"]})' if item.get('url') else text
+    """R6: derived label plus issue number; the canonical title/history is one click away."""
+    text = f'#{item["iid"]} {cell(task_label(item))}'
+    return f'[{text}]({quote(item["url"], safe=":/?#=&%@+;,~")})' if item.get('url') else text
 
 def one_pass(args, table=True):
     """One pass: free waiting tasks, follow unsupervised workers, act for supervisors, spawn ready tasks' supervisors, print the table."""
@@ -2516,28 +2560,46 @@ def report(items, listed, kinds, here):
     lines = [CONFIG['root'].name + (f' · [board]({url})' if url else ''),  # a board file names its page in `board_url`
              f'In work {count("doing", "review")} · Waiting for answer {count("ask")} · Ready {count("ready")}', '']
     rows = [row(item, kinds, here, states[item['iid']]) for item in items if item['state'] not in ('ask', 'later')]
-    lines += ['| Task | State | Runtime | Session |', '|---|---|---|---|', *rows, ''] if rows else []  # empty: left out
+    lines += [*rows, ''] if rows else []
     cards = decisions(items)
-    lines += ['Questions (answer N.M):', '', '| Question | Brief reason | Options |', '|---|---|---|', *cards, ''] if cards else []
-    later = [heading(item) for item in items if item['state'] == 'later']
-    lines += ['Later: ' + ', '.join(later), ''] if later else []
+    lines += ['Questions (answer N.M):', '', *cards, ''] if cards else []
+    later = [item for item in items if item['state'] == 'later']
+    if later:
+        query = '?q=is%3Aissue+is%3Aopen+label%3Aq-later' if CONFIG['board'] == 'github' else '?state=opened&label_name%5B%5D=q-later'
+        filterable = url and CONFIG['board'] in ('github', 'gitlab') and not CONFIG.get('assignee') and '?' not in url and '#' not in url
+        lines += [f'Later {len(later)} · [later tasks]({url}{query})', ''] if filterable \
+            else [f'Later {len(later)}:', *('- ' + heading(item) for item in later), '']
     print('\n'.join([*lines, 'Mode: events · arm: <arm_tick>']))  # R6 item 6: the executing PM fills the one field
 
 MEDIA = re.compile(r'\.(png|jpe?g|gif|webp|svg)(\?.*)?$', re.I)
 
 def decisions(items):
-    """#490, R6 Questions: one table row per task waiting on the owner: an ask, or a review with options; ★ the recommended one.
-    Images inline unless `inline_media` is false."""
+    """R6: complete context and one option per line; direct media links never depend on preview support."""
     lines = []
     for item in items:
         card = item['raw'].get('decision') or {}
         if not (item['state'] == 'ask' or item['state'] == 'review' and card.get('options')):
             continue
-        n, inline = item['iid'], CONFIG.get('inline_media', True)
-        links = [f'![{n}]({link})' if inline and MEDIA.search(link) else link for link in card.get('links') or []]
-        options = [f'{n}.{k} {cell(text)}' + ' ★' * (k == card.get('recommend')) for k, text in enumerate(card.get('options') or [], 1)]
+        n, inline = item['iid'], CONFIG.get('inline_media', True) and os.environ.get('TASKQ_CLIENT') in ('codex', 'claude')
+        links = []
+        for k, link in enumerate(card.get('links') or [], 1):
+            image = bool(MEDIA.search(link))
+            target = quote(link, safe=':/?#=&%@+;,~')
+            label = f'{"Image" if image else "Result"} {n} v{card.get("start", 1)}.{k}'
+            links.append(f'[{label}]({target})' + (f'\n![{label}]({target})' if inline and image else ''))
+        start = card.get('start', 1)
+        if type(start) is not int or start < 1:
+            lines += [heading(item), 'Invalid decision numbering; read the issue and re-present choices.', '']
+            continue
+        options = [f'- {n}.{start + k - 1} ' + str(text).replace('\r\n', '\n').replace('\r', '\n').replace('\n', '\n  ')
+                   + ' ★' * (k == card.get('recommend'))
+                   for k, text in enumerate(card.get('options') or [], 1)]
         question = heading(item) + ' review' * (item['state'] == 'review')
-        lines.append(f'| {question} | {" · ".join([cell(card.get("summary") or item["title"]), *links])} | {" · ".join(options)} |')
+        warning = ([f'Numeric answers unavailable: uncertain legacy history. Confirm the current action with answer {n} --text.']
+                   if not item['raw'].get('decision_next') else [])
+        lines += [question, card.get('summary') or item['title'], *warning, *options, *links, '']
+    if lines:
+        lines.pop()
     return lines
 
 EVENTS = ('add', 'answer', 'run', 'result', 'requeue', 'close')  # R4 (#333): each starts one pass after its move
@@ -3032,11 +3094,12 @@ def cmd_pm(args):
           f'`taskq` is `{tq}`.' + (f' {shell_instructions(runtime)}' if powershell(runtime) else '') + '\n\n' + compression_policy(runtime) + '\n\n' + '\n'.join(sections))
     for item in sorted(snapshot, key=lambda item: (item['priority'], item['iid'])):
         if not item['pm'] and item['iid'] not in args.adopt:
-            print(f'Unassigned manager: #{item["iid"]} {item["title"]} ({item["state"]}). '
+            print(f'Unassigned manager: #{item["iid"]} {task_label(item)} ({item["state"]}). '
                   f'Triage explicitly; to adopt in project {CONFIG["root"].name}: '
                   f'`' + (f'Set-Location -LiteralPath {shell_quote(CONFIG["root"], True)} -ErrorAction Stop; {tq} pm --adopt {item["iid"]}'
                           if powershell(runtime) else f'cd {shlex.quote(str(CONFIG["root"]))} && taskq pm --adopt {item["iid"]}')
                   + '`. No ownership or claims changed.')
+    print('Canonical titles: taskq list --full.')
     cmd_arm(argparse.Namespace(target=None))
 
 CODEX_COMPACT = ('-c model_auto_compact_token_limit=200000 -c "compact_prompt=\\"Keep only the owner\'s open questions and '
@@ -3149,7 +3212,7 @@ def main(argv=None):
             (('--scope',), {'nargs': '*', 'default': []}), (('--deps',), {'nargs': '*', 'type': int, 'default': []}),
             (('--type',), {'choices': TYPES, 'default': 'code'}), (('--runtime',), {'default': 'any'}),
             (('--priority',), {'type': int, 'choices': (1, 2), 'default': 2}), (('--host',), {}), n=False)
-    command('list', cmd_list, (('state',), {'nargs': '?', 'choices': STATES}), n=False)
+    command('list', cmd_list, (('state',), {'nargs': '?', 'choices': STATES}), (('--full',), {'action': 'store_true'}), n=False)
     command('take', cmd_take)
     card = ((('--option',), {'action': 'append', 'default': []}), (('--recommend',), {'type': int, 'default': 1}),
             (('--link',), {'action': 'append', 'default': []}))  # #490: the decision card

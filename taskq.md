@@ -2,6 +2,21 @@
 
 ### #646 first executable slice: execution vs subscription
 
+Versioned owner decision: the typed snapshot exposes `question_revision` for a
+current ask/review card. `taskq answer N --text TEXT --question-revision HASH
+--command-id ID` requires the recorded manager or owner's shell and the native
+project guard. It binds the revision, exact text and genuine actor in one bounded
+board receipt written together with the answer event. Same ID/same request returns
+that receipt without a new event or dispatch; conflicting ID or stale question
+refuses. Transport delivery ACK and worker `applied` remain separate operations.
+Lost write/readback retains the guard; after legitimate reconciliation a retry
+reads the board receipt, never repeats an unconfirmed effect blindly. At most 32
+decision command receipts per task are retained; overflow refuses, never evicts.
+This is guarded single-writer coordination, not provider compare-and-swap: all
+participating writers must honor the existing atomic project guard. Unknown
+external writers block readiness; fresh readback conflicts fail closed. This
+command does not implement review acceptance/publication or grant new authority.
+
 Named ARM runtime handle: `taskq arm start --name NAME [--scope-task N ...]`
 records an enabled local activation; `update` changes its scope, `status` reads
 it, and `stop` disables future admissions without cancelling any worker. These
@@ -41,7 +56,7 @@ observation time, not atomic provider snapshots. Unchanged polls emit no envelop
 At most 200 tasks are observed; overflow or read failure refuses without advancing
 a cursor. Pending delivery applies backpressure; no second poll overtakes it.
 
-Decision/version/commandID processing, snapshot+history guarantee, scheduler
+Snapshot+history guarantees beyond retained native events, scheduler
 activation integration and dot display integration remain subsequent approved slices;
 this receipt cache must not be mistaken for their implementation. Existing
 production schedulers and the older PM role route remain unchanged until rollout.

@@ -135,3 +135,72 @@ class NamedArm(unittest.TestCase):
         self.arm('start','--name','main')
         with self.assertRaisesRegex(SystemExit,'recorded scope'):
             self.arm('tick','--name','main','--execute','--scope-task','1')
+
+class DecisionCommands(unittest.TestCase):
+    setUp = Subscriptions.setUp
+    def setUp(self):
+        Subscriptions.setUp(self)
+        self.identity={'runtime':'codex','session':'owner'}
+        self.board.update.side_effect=lambda n,**fields:self.issue.update(copy.deepcopy(fields))
+    def args(self,text='choose A',command='choice-one',revision=None):
+        return argparse.Namespace(n=['1'],text=text,command='answer',command_id=command,
+            question_revision=revision or q.question_revision(q.parse(self.issue)))
+    def answer(self,args):
+        with mock.patch('builtins.print') as output:q.cmd_answer(args)
+        return json.loads(output.call_args.args[0])
+    def test_repeat_returns_same_board_receipt_without_event_or_write(self):
+        args=self.args();first=self.answer(args);body=self.issue['body'];writes=self.board.update.call_count
+        repeat=self.answer(args)
+        self.assertTrue(repeat['repeated']);self.assertEqual(repeat['request_digest'],first['request_digest'])
+        self.assertEqual(self.issue['body'],body);self.assertEqual(self.board.update.call_count,writes)
+        self.assertFalse(first['application_ack']);self.assertNotIn('application_receipts',q.issue_data(self.issue))
+    def test_conflicting_command_or_stale_question_refuses(self):
+        args=self.args();self.answer(args)
+        with self.assertRaisesRegex(SystemExit,'conflicting answer'):
+            self.answer(self.args(text='different',revision=args.question_revision))
+        with self.assertRaisesRegex(SystemExit,'stale question'):
+            self.answer(self.args(command='other',revision=args.question_revision))
+        self.assertEqual(self.board.update.call_count,1)
+    def test_foreign_pm_and_worker_have_no_owner_decision_authority(self):
+        args=self.args();self.identity={'runtime':'codex','session':'foreign'}
+        with self.assertRaisesRegex(SystemExit,'recorded manager'):
+            self.answer(args)
+        self.raw['claim']={'runtime':'codex','session':'foreign'}
+        self.issue['body']=q.block('goal',self.raw)
+        with self.assertRaisesRegex(SystemExit,'recorded manager'):
+            self.answer(args)
+        self.board.update.assert_not_called()
+    def test_ack_changes_do_not_change_question_revision(self):
+        revision=q.question_revision(q.parse(self.issue))
+        self.raw['events'][0]['acks']=['manager:codex:owner'];self.issue['body']=q.block('goal',self.raw)
+        self.assertEqual(q.question_revision(q.parse(self.issue)),revision)
+        self.raw['decision']['options']=['new'];self.issue['body']=q.block('goal',self.raw)
+        self.assertNotEqual(q.question_revision(q.parse(self.issue)),revision)
+    def test_lost_readback_after_write_retries_recorded_receipt(self):
+        args=self.args();read=q.read_issue
+        with mock.patch.object(q,'read_issue',side_effect=[copy.deepcopy(self.issue),copy.deepcopy(self.issue),RuntimeError('readback lost')]):
+            with self.assertRaisesRegex(RuntimeError,'readback lost'):self.answer(args)
+        self.assertEqual(self.board.update.call_count,1)
+        self.assertTrue(self.answer(args)['repeated']);self.assertEqual(self.board.update.call_count,1)
+    def test_refused_write_leaves_question_for_retry(self):
+        args=self.args();write=self.board.update.side_effect
+        with mock.patch.object(self.board,'update',side_effect=RuntimeError('not written')):
+            with self.assertRaisesRegex(RuntimeError,'not written'):self.answer(args)
+        self.assertEqual(q.question_revision(q.parse(self.issue)),args.question_revision)
+        self.assertFalse(self.answer(args)['repeated'])
+    def test_duplicate_cli_does_not_dispatch(self):
+        args=self.args();self.answer(args)
+        import contextlib
+        with mock.patch.object(q,'coordination',return_value=contextlib.nullcontext()),mock.patch.object(q,'board_schema_gate'),mock.patch.object(q,'release_reason',return_value=None),mock.patch.object(q,'dispatch') as dispatch,mock.patch('builtins.print'):
+            q.main(['answer','1','--text',args.text,'--command-id',args.command_id,'--question-revision',args.question_revision])
+        dispatch.assert_not_called()
+
+    def test_same_session_id_wrong_runtime_is_not_manager(self):
+        args=self.args();self.identity={'runtime':'claude','session':'owner'}
+        with self.assertRaisesRegex(SystemExit,'recorded manager'):self.answer(args)
+        self.board.update.assert_not_called()
+    def test_changed_fresh_source_refuses_without_write(self):
+        args=self.args();changed=copy.deepcopy(self.issue);changed['body']+='foreign write'
+        with mock.patch.object(q,'read_issue',side_effect=[copy.deepcopy(self.issue),changed]):
+            with self.assertRaisesRegex(SystemExit,'changed before write'):self.answer(args)
+        self.board.update.assert_not_called()

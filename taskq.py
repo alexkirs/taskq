@@ -1463,10 +1463,73 @@ def codes(words):
     found = [re.fullmatch(r'(\d+)\.(\d+)', word) for word in re.split(r'[\s,]+', ' '.join(words).strip())]
     return [(int(code[1]), int(code[2])) for code in found] if all(found) else fail(f'{" ".join(words)!r}: answer N --text A, or codes like 43.1 44.2')
 
+def question_revision(current):
+    """Question identity excludes transport/native ACKs, but binds its authority and content."""
+    if current['state'] not in ('ask', 'review') or not current['raw'].get('decision'):
+        return None
+    raw = current['raw']
+    value = {'task': current['iid'], 'state': current['state'], 'decision': raw['decision'],
+             'event_seq': raw.get('event_seq'), 'pm': raw.get('pm'),
+             'supervisor': raw.get('supervisor'), 'claim': raw.get('claim')}
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def answer_command(args):
+    """Guarded single-writer decision command, not provider CAS or application acknowledgement."""
+    if len(args.n) != 1 or not args.n[0].isdigit() or not args.text.strip():
+        fail('versioned answer requires one task number and nonempty --text')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', args.command_id or '') or not re.fullmatch(r'[0-9a-f]{64}', args.question_revision or ''):
+        fail('versioned answer requires valid --command-id and --question-revision')
+    n = int(args.n[0])
+    issue = read_issue(n)
+    current = parse(issue)
+    if not current or current['raw'].get('event_schema') != EVENT_SCHEMA:
+        fail('versioned answer needs current native task schema')
+    identity = session() or {}
+    pm = current['raw'].get('pm') or {}
+    if identity.get('session') and any(identity.get(k) != pm.get(k) for k in ('runtime', 'session')):
+        fail('versioned owner answer requires recorded manager or owner shell')
+    actor = {k: identity.get(k) for k in ('runtime', 'session')} if identity.get('session') else {'runtime': 'owner', 'session': 'shell'}
+    request = {'revision': args.question_revision, 'text': args.text, 'actor': actor}
+    digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+    raw = current['raw']
+    if 'legacy_recovery' in raw or raw.get('model_recovery'):
+        fail('versioned answer recovery hold; no changes')
+    commands = dict(raw.get('answer_commands') or {})
+    previous = commands.get(args.command_id)
+    if previous:
+        if previous['request_digest'] != digest:
+            fail('conflicting answer command ID; no changes')
+        print(json.dumps({'type': 'taskq.decision', 'repeated': True, **previous}))
+        return []
+    if issue['state'] != 'open' or question_revision(current) != args.question_revision:
+        fail('stale question revision; no answer recorded')
+    if len(commands) >= 32:
+        fail('answer command receipt bound reached; no receipt discarded')
+    receipt = {'command_id': args.command_id, 'request_digest': digest,
+               'question_revision': args.question_revision, 'actor': actor,
+               'answer_event': raw.get('event_seq', 0) + 1, 'application_ack': False}
+    commands[args.command_id] = receipt
+    raw = {**raw, 'answer_commands': commands, 'decision': None}
+    raw['events'] = [dict(event, acks=list(event.get('acks', []))) for event in raw.get('events', [])]
+    reconcile_recipients(raw)
+    append_event(raw, 'answer', args.text)
+    raw['retry_counts'] = {**raw.get('retry_counts', {}), 'supervisor': 0, 'worker': 0, 'workers': 0}
+    labels = [label for label in issue['labels'] if not label.startswith(PREFIX)] + [PREFIX + 'doing']
+    fresh = read_issue(n)
+    if any(fresh.get(k) != issue.get(k) for k in ('body', 'labels', 'state')):
+        fail('question changed before write; no answer recorded')
+    write_task_verified(issue, raw, event_labels(raw, labels))
+    print(json.dumps({'type': 'taskq.decision', 'repeated': False, **receipt}))
+    return [n]
+
+
 def cmd_answer(args):
     """`answer N --text A`, or `answer 43.1 44.2` (#490): each code picks an option of the task's card. An ask goes back to
     `doing` with the option's text; a review: an option starting `close` closes it, another goes back to the worker.
     Every code is checked before any task moves."""
+    if getattr(args, 'command_id', None) is not None or getattr(args, 'question_revision', None) is not None:
+        return answer_command(args)
     if args.text:
         if len(args.n) != 1 or not args.n[0].isdigit():
             fail('answer N --text A: one task number')
@@ -4810,7 +4873,8 @@ def subscription_poll(args):
                                next((x[len(PREFIX):] for x in issue['labels'] if x.startswith(PREFIX)
                                      and x[len(PREFIX):] in STATES), 'unknown'),
                                'title': issue['title'], 'claim': raw.get('claim'), 'supervisor': raw.get('supervisor'),
-                               'decision': raw.get('decision'), 'authority': raw.get('pm'), 'event_seq': seq}
+                               'decision': raw.get('decision'), 'authority': raw.get('pm'), 'event_seq': seq,
+                               'question_revision': question_revision(parse(issue))}
                 digest = hashlib.sha256(json.dumps(observation, sort_keys=True).encode()).hexdigest()
                 known[str(n)] = {'seq': seq, 'digest': digest}
                 if not previous or previous['digest'] != digest:
@@ -5063,7 +5127,7 @@ def main(argv=None):
     card = ((('--option',), {'action': 'append', 'default': []}), (('--recommend',), {'type': int, 'default': 1}),
             (('--link',), {'action': 'append', 'default': []}))  # #490: the decision card
     command('ask', cmd_move, *card, text='required')
-    command('answer', cmd_answer, (('n',), {'nargs': '+'}), n=False, text=True)
+    command('answer', cmd_answer, (('n',), {'nargs': '+'}), (('--command-id',), {}), (('--question-revision',), {}), n=False, text=True)
     command('result', cmd_move, (('--sha',), {'type': commit}), (('--checks',), {'default': ''}), *card, text=True)
     command('requeue', cmd_requeue, text=True)
     command('run', cmd_run, text=True)
@@ -5147,7 +5211,7 @@ def main(argv=None):
         if error.tasks and not (args.command == 'add' and args.later):
             dispatch(args.command, error.tasks)
         raise
-    if args.command in EVENTS and not (args.command == 'add' and args.later):
+    if args.command in EVENTS and not (args.command == 'add' and args.later) and not (args.command == 'answer' and done == []):
         dispatch(args.command, done if args.command in ('add', 'answer') else args.n)
 
 if __name__ == '__main__':

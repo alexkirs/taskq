@@ -223,7 +223,9 @@ class Compression(Base):
             text, status = self.compress()
         self.assertIn(self.kept, text)
         self.assertIn('accepted=1', status)
-        self.assertIn('900->40', status)
+        self.assertIn(f'input_bytes={len(self.source.encode())}', status)
+        self.assertIn(f'output_bytes={len(text.encode())}', status)
+        self.assertNotIn('token', status)
         original = self.root / '.taskq' / 'context' / (taskq.hashlib.sha256(self.source.encode()).hexdigest() + '.txt')
         self.assertEqual(original.read_bytes(), self.source.encode())
         self.assertIn(str(original), text)
@@ -238,7 +240,6 @@ class Compression(Base):
                     {**self.result, 'compressed_text': 'relevant evidence\n' + self.source.splitlines()[0]},
                     {**self.result, 'critical_lines_dropped': ['private response']},
                     {**self.result, 'critical_lines_dropped': None},
-                    {**self.result, 'kept_tokens': 901}, {**self.result, 'original_tokens': True},
                     {**self.result, 'verifier': None}, {**self.result, 'compression_risk': 'high'},
                     {**self.result, 'verifier': {'risk': 'low', 'score': float('nan')}},
                     {**self.result, 'verifier': {'risk': 'low', 'score': 10 ** 400}},
@@ -262,8 +263,7 @@ class Compression(Base):
         variants = [{**neural, 'mode': 'unknown'}, {**neural, 'mode': 'compiler'},
                     {**neural, 'compressed_text': 'relevant evidence\n'},
                     {**neural, 'compressed_text': 'generated advice\n'},
-                    {**neural, 'compressed_text': self.source},
-                    {**neural, 'kept_tokens': neural['original_tokens']}]
+                    {**neural, 'compressed_text': self.source}]
         for field in ('critical_lines_dropped', 'compression_risk', 'verifier'):
             variants.append({**neural, field: None})
             variants.append({**neural, field: self.result[field]})
@@ -271,6 +271,91 @@ class Compression(Base):
             with self.subTest(result=result):
                 self.assertFalse(taskq.valid_compression(self.source, result, self.KEY))
         self.assertTrue(taskq.valid_compression(self.source, {**self.result, 'mode': 'neural-keep'}, self.KEY))
+
+    def captured(self, **changes):
+        return {'request_id': 'fresh-call-id', 'session_id': SESSION,
+                'context_sha256': taskq.hashlib.sha256(self.source.encode()).hexdigest(),
+                'query': 'relevant evidence', 'response': {
+                    'session_id': SESSION, 'compacted': False, 'skipped': None,
+                    'delta': self.kept, 'compressed_text': 'rolling memory must never be consumed',
+                    'original_tokens': 601, 'kept_tokens': 2089}, **changes}
+
+    def compress_captured(self, envelope, request_id='fresh-call-id'):
+        path = self.root / 'response.json'
+        path.write_bytes(json.dumps(envelope).encode())
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            text = taskq.supporting_context(self.source, 'relevant evidence', path, request_id)
+        return text, out.getvalue()
+
+    def test_current_mcp_delta_accepts_without_key_ignores_memory_and_mixed_token_scopes(self):
+        text, status = self.compress_captured(self.captured())
+        self.assertIn(self.kept, text)
+        self.assertNotIn('rolling memory', text)
+        self.assertIn('accepted=1', status)
+        self.assertIn('remote verifier unavailable', status)
+        self.assertIn(f'input_bytes={len(self.source.encode())}', status)
+        self.assertIn(f'output_bytes={len(text.encode())}', status)
+        self.assertNotIn('token', status)
+        self.request.assert_not_called()
+        original = self.root / '.taskq' / 'context' / (taskq.hashlib.sha256(self.source.encode()).hexdigest() + '.txt')
+        self.assertEqual(original.read_bytes(), self.source.encode())
+        # Token counts are diagnostic only in both acquisition routes.
+        for counts in ({'original_tokens': 601, 'kept_tokens': 2089},
+                       {'original_tokens': True, 'kept_tokens': 'unknown'},
+                       {'original_tokens': None, 'kept_tokens': None}):
+            self.assertTrue(taskq.valid_compression(self.source, {**self.result, **counts}, ''))
+
+    def test_captured_rejects_stale_replayed_partial_and_unsafe_without_remote_fallback(self):
+        envelope = self.captured()
+        variants = [self.captured(**{field: 'stale-private-value'}) for field in
+                    ('request_id', 'session_id', 'context_sha256', 'query')]
+        variants += [None, [], {**envelope, 'response': None}]
+        for fields in ({'session_id': 'parent-session'}, {'compacted': True}, {'compacted': None},
+                       {'skipped': 'already_seen'}, {'skipped': 'partial_chunk_failure'},
+                       {'partial': True}, {'error': 'private error'}, {'errors': ['private error']},
+                       {'isError': True}, {'paywall': True}, {'partial': 0}, {'status': 'error'},
+                       {'delta': ''}, {'delta': None},
+                       {'delta': self.kept.splitlines()[0][:20] + '\nrelevant evidence\n'},
+                       {'delta': 'relevant evidence\n'}, {'delta': self.source},
+                       {'critical_lines_dropped': ['private dropped line']}, {'verifier': None},
+                       {'compression_risk': 'high'}):
+            variants.append({**envelope, 'response': {**envelope['response'], **fields}})
+        for variant in variants:
+            with self.subTest(variant=variant):
+                text, status = self.compress_captured(variant)
+                self.assertEqual(text, self.source)
+                self.assertIn('accepted=0', status)
+                self.assertNotIn('private', status)
+        # Fresh call ID rejects the previously captured envelope, without storing queue/replay state.
+        self.assertEqual(self.compress_captured(envelope, 'next-fresh-call-id')[0], self.source)
+        with mock.patch.object(taskq, 'session', return_value=None):
+            self.assertEqual(self.compress_captured(envelope)[0], self.source)
+        self.request.assert_not_called()
+
+    def test_captured_cli_bounds_pairs_and_secret_withholding(self):
+        source, response = self.root / 'support.txt', self.root / 'response.json'
+        source.write_bytes(self.source.encode())
+        args = ('compress', '--input', str(source), '--query', 'relevant evidence')
+        for payload in (b'not json private value', b'x' * (taskq.COMPRESS_BYTES + 1), b'\xff', b'[' * 2000 + b']' * 2000):
+            response.write_bytes(payload)
+            with contextlib.redirect_stderr(io.StringIO()) as warnings:
+                self.assertEqual(self.run_cli(*args, '--response', str(response), '--request-id', 'fresh-call-id'), self.source)
+            self.assertIn('accepted=0', warnings.getvalue())
+            self.assertNotIn('private', warnings.getvalue())
+        for extra in (('--response', str(response)), ('--request-id', 'fresh-call-id')):
+            with contextlib.redirect_stderr(io.StringIO()) as warnings:
+                self.assertEqual(self.run_cli(*args, *extra), self.source)
+            self.assertIn('supplied together', warnings.getvalue())
+        response.write_text(json.dumps(self.captured()), encoding='utf-8')
+        with contextlib.redirect_stderr(io.StringIO()) as warnings:
+            self.assertIn(self.kept, self.run_cli(*args, '--response', str(response), '--request-id', 'fresh-call-id'))
+        self.assertIn('accepted=1', warnings.getvalue())
+        for secret in ('API_KEY=private value', self.KEY):
+            source.write_text(secret + self.source, encoding='utf-8')
+            with mock.patch.dict(os.environ, SUPERCOMPRESS_API_KEY=self.KEY), contextlib.redirect_stderr(io.StringIO()):
+                self.assertIn('withheld', self.run_cli(*args, '--response', str(response), '--request-id', 'fresh-call-id'))
+        self.request.assert_not_called()
 
     def test_credentials_withheld_before_transport_preservation_or_disabled_fallback(self):
         for source in (self.KEY, 'API_KEY=private value\n' + self.source):
@@ -483,6 +568,8 @@ class Compression(Base):
                         self.assertIn('connect_account once and retry once', text)
                         self.assertIn('actual calling runtime session ID', text)
                         self.assertIn('SAME tool call', text)
+                        self.assertIn('--response <envelope-file> --request-id <same-fresh-ID>', text)
+                        self.assertIn('never consume unchecked digest or rolling memory', text)
                         self.assertNotIn(self.KEY, text)
                 for call in self.request.call_args_list:
                     self.assertNotIn(authority, call.args[0])

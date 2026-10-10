@@ -1680,11 +1680,13 @@ def compression_policy(runtime):
             'Doctor checks setup, not compression of every inference; preserve existing login/model/permissions. '
             'WARNING: app history, arbitrary tool results and nested-agent transport are not automatically compressed. '
             'Every role (PM, supervisor, worker, reviewer and nested agent) must compress supporting context only; NEVER compress or replace the user ask/query. '
-            f'First inspect `{inbox}` if present: use only a relevant current digest whose task/context identity is established. '
-            'A stale or unverified digest is not authority. Otherwise use exposed MCP compress_context(contextdump, unchanged user query); '
-            'supply your actual calling runtime session ID when supported, never a shared default or inherited parent session ID. '
-            'if account not linked, connect_account once and retry once. If MCP is unavailable, use the shared fallback '
-            f'`{queue_tool(runtime)} compress --input <sanitized-supporting-file> --query <owner-query>`. '
+            f'First inspect `{inbox}` if present: task/context identity is established only by the bound current-call envelope below; never consume unchecked digest or rolling memory. '
+            'Otherwise use exposed MCP compress_context(contextdump, unchanged user query), with your actual calling runtime session ID, never a shared default or inherited parent ID; '
+            'if account not linked, connect_account once and retry once. Generate a fresh random request ID per call. '
+            'Capture parsed MCP JSON in a UTF-8 envelope {"request_id":<fresh ID>,"session_id":<actual caller>,"context_sha256":<SHA256 of exact input UTF-8 bytes>,"query":<unchanged query>,"response":<parsed MCP JSON>}. '
+            f'Validate using `{queue_tool(runtime)} compress --input <sanitized-supporting-file> --query <owner-query> --response <envelope-file> --request-id <same-fresh-ID>`. '
+            'Consume only validated current-call delta; rejected/stale/compacted/partial responses retain the original with a warning and never make a remote fallback request. '
+            f'If MCP is unavailable, use `{queue_tool(runtime)} compress --input <sanitized-supporting-file> --query <owner-query>`. '
             'Capture bulk tool output to a local file and invoke compression inside that SAME tool call, before the model sees the original; '
             'return resulting context and visible warnings (helper stdout/stderr). '
             'Keep assignment, acceptance, permissions, IDs, commands, owner decisions/answers, negative requirements and critical evidence verbatim, outside that file. '
@@ -1776,23 +1778,20 @@ def _compression_http(context, query, key):
                 connection.close()
 
 
-def valid_compression(original, result, key):
+def valid_compression(original, result, key, local_response=False):
     if not isinstance(result, dict):
         return False
     if result.get('mode', 'compiler') not in ('compiler', 'neural-keep'):
         return False
     text = result.get('compressed_text')
-    before, after = result.get('original_tokens'), result.get('kept_tokens')
     verifier = result.get('verifier')
-    if not isinstance(text, str) or not text.strip() or key in text or len(text.encode('utf-8')) >= len(original.encode('utf-8')):
+    if not isinstance(text, str) or not text.strip() or (key and key in text) or len(text.encode('utf-8')) >= len(original.encode('utf-8')):
         return False
-    if type(before) is not int or type(after) is not int or not 0 < after < before <= len(original.encode('utf-8')):
-        return False
-    # The hosted Neural Keep path omits all three compiler verification fields.
-    # Its output still passes every local extraction/protection check below.
+    # Hosted Neural Keep and MCP may omit compiler verification fields.
+    # Their output still passes every local extraction/protection check below.
     neural = result.get('mode') == 'neural-keep'
     verification = ('critical_lines_dropped', 'compression_risk', 'verifier')
-    if not (neural and all(field not in result for field in verification)):
+    if not ((neural or local_response) and all(field not in result for field in verification)):
         if result.get('critical_lines_dropped') != [] or result.get('compression_risk') != 'low' or not isinstance(verifier, dict):
             return False
         score = verifier.get('score')
@@ -1820,7 +1819,36 @@ def valid_compression(original, result, key):
     return not any(protected[position:])
 
 
-def supporting_context(text, query):
+def captured_compression(path, request_id, text, query):
+    """Bind one locally captured MCP delta to this invocation; never consume rolling memory."""
+    try:
+        caller = session()
+        if not isinstance(request_id, str) or not request_id.strip() or not caller:
+            raise ValueError()
+        with Path(path).open('rb') as source:
+            raw = source.read(COMPRESS_BYTES + 1)
+        if len(raw) > COMPRESS_BYTES:
+            raise ValueError()
+        envelope = json.loads(raw.decode('utf-8'))
+        if not isinstance(envelope, dict) or any(envelope.get(field) != value for field, value in (
+                ('request_id', request_id), ('session_id', caller['session']),
+                ('context_sha256', hashlib.sha256(text.encode('utf-8')).hexdigest()), ('query', query))):
+            raise ValueError()
+        result = envelope.get('response')
+        if not isinstance(result, dict) or result.get('session_id') != caller['session'] or result.get('compacted') is not False:
+            raise ValueError()
+        if result.get('skipped') is not None or result.get('error') is not None or result.get('errors') not in (None, []):
+            raise ValueError()
+        if any(result.get(field) is not None and result.get(field) is not False for field in ('partial', 'isError', 'paywall')):
+            raise ValueError()
+        if result.get('status') not in (None, 'ok', 'success'):
+            raise ValueError()
+        return {**result, 'compressed_text': result.get('delta')}, None
+    except (OSError, ValueError, UnicodeError, TypeError, RecursionError, SystemExit):
+        return None, 'captured response rejected; check current-call binding and complete delta'
+
+
+def supporting_context(text, query, response=None, request_id=None):
     """Compress separately classified evidence only. Always preserve/fall back to the exact original."""
     def fallback(reason, warning=True):
         print(f'taskq compression: {"WARNING: " if warning else ""}{reason}; original retained; accepted=0.', file=sys.stderr)
@@ -1832,7 +1860,10 @@ def supporting_context(text, query):
     option = os.environ.get('TASKQ_COMPRESS', 'on')
     if option != 'on':
         return fallback('disabled or invalid TASKQ_COMPRESS; set TASKQ_COMPRESS=on')
-    if not key:
+    local_response = response is not None or request_id is not None
+    if local_response and (response is None or request_id is None):
+        return fallback('response and request-id must be supplied together')
+    if not local_response and not key:
         return fallback(key_status + '; run supercompress setup or load SUPERCOMPRESS_API_KEY through user secret/environment setup')
     if not text.strip():
         return fallback('no supporting context', False)
@@ -1858,11 +1889,12 @@ def supporting_context(text, query):
                 return fallback('original preservation unavailable')
     except (OSError, KeyError):
         return fallback('original preservation unavailable')
-    result, reason = compression_request(text, query, key)
+    result, reason = (captured_compression(response, request_id, text, query) if local_response
+                      else compression_request(text, query, key))
     if reason:
         return fallback(reason)
     try:
-        valid = valid_compression(text, result, key)
+        valid = valid_compression(text, result, key, local_response)
     except (ValueError, UnicodeError):
         valid = False
     if not valid:
@@ -1871,8 +1903,8 @@ def supporting_context(text, query):
     if len(output.encode('utf-8')) >= len(raw):
         return fallback('reference overhead removes size reduction')
     verification_note = ('remote verifier unavailable; local extraction checks passed; '
-                         if result.get('mode') == 'neural-keep' and 'verifier' not in result else '')
-    print(f'taskq compression: accepted=1; provider token estimates {result["original_tokens"]}->{result["kept_tokens"]}; {verification_note}'
+                         if 'verifier' not in result else '')
+    print(f'taskq compression: accepted=1; input_bytes={len(raw)}; output_bytes={len(output.encode("utf-8"))}; {verification_note}'
           'semantic equivalence unverified.', file=sys.stderr)
     return output
 
@@ -1882,7 +1914,7 @@ def cmd_compress(args):
         text = Path(args.input).read_bytes().decode('utf-8')
     except (OSError, UnicodeError):
         fail('supporting input unavailable; supply a readable sanitized UTF-8 file')
-    output = supporting_context(text, args.query)
+    output = supporting_context(text, args.query, args.response, args.request_id)
     if hasattr(sys.stdout, 'buffer'):
         sys.stdout.buffer.write(output.encode('utf-8'))  # preserve UTF-8 and original CRLF through native Windows pipes
     else:
@@ -3130,7 +3162,7 @@ def main(argv=None):
     command('ack', cmd_ack, (('events',), {'nargs': '*'}), (('--pm',), {}), (('--stdin',), {'action': 'store_true'}), n=False)
     command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}), n=False)
     command('pm', cmd_pm, (('--adopt',), {'nargs': '+', 'type': int, 'default': []}), n=False)
-    command('compress', cmd_compress, (('--input',), {'required': True}), (('--query',), {'required': True}), n=False)
+    command('compress', cmd_compress, (('--input',), {'required': True}), (('--query',), {'required': True}), (('--response',), {}), (('--request-id',), {}), n=False)
     command('cleanup', cmd_cleanup, (('--dry-run',), {'action': 'store_true'}), n=False)
     command('launch', cmd_launch, (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
             (('arguments',), {'nargs': argparse.REMAINDER}), n=False)

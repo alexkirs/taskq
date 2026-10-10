@@ -436,11 +436,12 @@ return semantics follow Apple
 ### R12. Unverified means unknown
 
 Changed (#623): no compression coverage report → PM and role policy distinguish enabled configuration
-from accepted compression. Missing key, disabled mode, rejected response or transport failure warns and
+from accepted compression. Missing direct-route key, disabled mode, rejected response or transport failure warns and
 keeps the original. TaskQ controls its assembled supporting context only; app history, arbitrary tool
 results and nested-agent transport are not intercepted. Helper instructions are required, but compliance
-and full inference coverage are unverified. Report measured provider token estimates only for accepted
-responses, never inferred monetary savings or semantic equivalence.
+and full inference coverage are unverified. Report measured UTF-8 input/output bytes for accepted
+responses; provider token counters may have different scopes and prove no token or monetary savings
+or semantic equivalence.
 
 Report only what a fresh read proved. A delivery, exit code, checkout marker or chat turn is not proof of receipt,
 application or completion.
@@ -677,14 +678,24 @@ original and warns rather than silently enabling.
 Every PM and spawned role must compress eligible supporting context before including bulk evidence/tool
 output in a prompt, and explicitly pass the policy to each nested reviewer/agent. Never compress or replace
 the user's ask/query: the compression query is passed verbatim. First inspect the provider's
-`inbox/latest.md` under its resolved config directory when present; use it only if its task/context identity,
-relevance and currency are established. An unverified or stale global digest is never authority or a
-substitute for current evidence. Otherwise prefer exposed MCP `compress_context(contextdump, query)`;
-use the actual calling runtime session ID when that interface supports `session_id`, never a shared
-default or a parent session ID copied into every agent's assignment (the provider maintains rolling memory).
-if it reports account not linked, call `connect_account` once and retry once. Do not invent missing tools.
-If MCP is unavailable, use the common `taskq compress --input <UTF-8 supporting file> --query <owner query>`
-helper and keep its coverage warning visible. Its bounded HTTP adapter never retries.
+`inbox/latest.md` under its resolved config directory when present; prefer its current-call delta only
+through the validation below. A digest without the bound response envelope is not usable compressed
+evidence. Otherwise prefer exposed MCP `compress_context(contextdump, query, session_id)` with the
+actual calling runtime session ID, never a shared default or inherited parent ID. If it reports account
+not linked, call `connect_account` once and retry once. Do not invent missing tools. Capture the parsed
+MCP JSON and locally supplied request binding in a UTF-8 JSON envelope:
+`{"request_id":"<fresh random per-call ID>","session_id":"<actual caller>","context_sha256":"<SHA256 of exact input UTF-8 bytes>","query":"<unchanged owner query>","response":<parsed MCP JSON>}`.
+Run `taskq compress --input <supporting file> --query <owner query> --response <envelope file> --request-id <same fresh ID>`.
+The two new options are paired; this route never makes a remote request, even on rejection, and needs
+no API key. The envelope (at most 1 MiB) must match the requested ID, current `session()` ID, input hash
+and query exactly. The response must match the session, explicitly have `compacted:false`, no non-null
+`skipped`, error or partial result. Use only `response.delta`, never rolling `compressed_text` or memory.
+The orchestrator generates a fresh ID for every acquisition and keeps it with that call: replay with a
+new ID fails. This local capture binding is not cryptographic provider provenance or a replay registry.
+Both routes use the same extraction/protection/size validator. Any provided safety metadata must pass
+the complete safe verification triple below; absence on MCP is reported as unavailable verification.
+If MCP is unavailable, use `taskq compress --input <UTF-8 supporting file> --query <owner query>`
+and keep its coverage warning visible. Its bounded HTTP adapter never retries.
 The helper prints usable context to stdout, and status/warnings to stderr; capture them separately.
 Capture bulk tool output to a local file and invoke the selected compression route inside the same tool
 invocation, before the model sees the original; return only the resulting context plus visible warnings.
@@ -703,19 +714,21 @@ passed through as small; over 120,000 is passed through with a warning, never tr
 
 Before any request, retain the exact UTF-8 original under `.taskq/context/<sha256>.txt` (runtime evidence,
 never queue state); accepted text carries that local reference. If preservation fails, use original text
-and warn. The helper does not print remote errors, headers, credentials or rejected text. Missing key,
+and warn. The helper does not print remote errors, headers, credentials or rejected text. Missing direct-route key,
 off/invalid option, timeout, HTTP error (including redirect/auth/rate-limit), oversized/malformed response,
 reported critical-line loss, unsafe verifier result, nonextractive output, or no size reduction falls back
-to the original. Accept only nonempty ordered whole-line extraction, smaller bytes and sane positive
-provider token counts with fewer kept tokens. Fenced blocks and lines with backticks, numbers,
+to the original. Accept only nonempty ordered whole-line extraction and smaller net UTF-8 bytes
+including the original reference. Provider token counters are diagnostics with potentially different
+scopes, never an acceptance condition or token-saving claim. Status reports measured input/output bytes.
+Fenced blocks and lines with backticks, numbers,
 recognized English negative/authority words or explicit critical markers are retained exactly; this conservative guard and the provider's
 checks are not a proof of semantic preservation. Read original evidence before consequential acceptance.
 Hosted `mode:"neural-keep"` omits all three compiler verification fields. Accept that specific
 schema through the same local extraction, protected-line and size checks; missing remote verification
 is not a safety verdict and is reported on acceptance. Only compiler and Neural Keep modes are accepted;
-an omitted mode uses the legacy compiler schema. Compiler/legacy responses require an empty `critical_lines_dropped`, low
+an omitted direct-route mode uses the legacy compiler schema. Direct compiler/legacy responses require an empty `critical_lines_dropped`, low
 `compression_risk` and a finite low-risk verifier score from 0.85 through 1. If any verification field
-is present, including on Neural Keep, require the complete safe triple; null/partial/unsafe fields fail.
+is present, including on Neural Keep or captured MCP, require the complete safe triple; null/partial/unsafe fields fail.
 Security exception: known API-key matches or credential-assignment patterns withhold the supporting
 block with a sanitized warning before any request or new local copy, including when disabled or small.
 The source file remains the user's original. This guard cannot recognize every possible secret; callers

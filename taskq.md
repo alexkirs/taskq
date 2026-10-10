@@ -1040,6 +1040,10 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
 
 ### One tick pass
 
+Design under independent review (#634): [Tick hygiene](docs/tick-hygiene.md) inventories
+this pass and proposes default-on observation and bounded recovery. It is not an implemented
+contract or permission to change the behavior below; implementation follows an approved slice.
+
 1. `waiting` with every dep closed → `ready`.
 2. `doing`, claimed on this machine, no `supervisor` (R3 Transition: started before #525 or taken by hand, § 5): `alive` False → requeue (`session ... is gone`); the second such requeue since
    the last `result` or `answer` → `ask` instead, with the last log line (`tail`; Codex: `.taskq/T<N>.log`, Claude:

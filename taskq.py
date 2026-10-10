@@ -917,7 +917,7 @@ class Codex:
             pid.rename(pid.with_name(f'{pid.stem}-{old[1]}.pid'))
         write_process(pid, process, found)
         try:
-            self.title(found, name)
+            self.title(found, name, process=process)
         except (OSError, ValueError) as error:  # R3 (#572): no unnamed thread works; its pid file stays for the retire (R11)
             process.terminate()
             raise Unnamed(found, error)
@@ -925,11 +925,12 @@ class Codex:
 
     WAIT = 60  # seconds for the whole app-server exchange, its shutdown included
 
-    def title(self, thread, name):
+    def title(self, thread, name, process=None):
         """R3 (#572): `codex exec` names no thread; the app-server's `thread/name/set` does, `thread/read` proves it.
         Each request waits for its own successful reply. `exec resume` keeps the name. Raises ValueError unless named."""
         server = subprocess.Popen([shutil.which('codex') or 'codex', 'app-server'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL, env=worker_env(), text=True, encoding='utf-8')
+        deadline, request_id = time.monotonic() + self.WAIT, 0
         timer = threading.Timer(self.WAIT, server.kill)  # one deadline through shutdown: a hung server is killed, its stdout ends
         timer.start()
 
@@ -937,20 +938,33 @@ class Codex:
             server.stdin.write(json.dumps({'jsonrpc': '2.0', **message}) + '\n')
             server.stdin.flush()
 
-        def call(n, method, params):
-            send({'id': n, 'method': method, 'params': params})
-            for line in server.stdout:  # notifications and the server's own requests pass by
-                reply = json.loads(line) if line.startswith('{') else {}
-                if reply.get('id') == n and 'method' not in reply:
-                    if 'result' not in reply:
-                        raise ValueError(f'{method}: {reply.get("error")}')
-                    return reply['result']
-            raise ValueError(f'{method}: no reply in {self.WAIT} s')
+        def call(method, params, wait_rollout=False):
+            nonlocal request_id
+            while True:
+                if time.monotonic() >= deadline:
+                    raise ValueError(f'{method}: no reply in {self.WAIT} s')
+                n, request_id = request_id, request_id + 1
+                send({'id': n, 'method': method, 'params': params})
+                for line in server.stdout:  # notifications and the server's own requests pass by
+                    reply = json.loads(line) if line.startswith('{') else {}
+                    if reply.get('id') == n and 'method' not in reply:
+                        if 'result' in reply:
+                            return reply['result']
+                        error = reply.get('error')
+                        missing = (isinstance(error, dict) and error.get('code') == -32600
+                                   and error.get('message') == f'no rollout found for thread id {thread}')
+                        remaining = deadline - time.monotonic()
+                        if wait_rollout and missing and remaining > 0 and process is not None and process.poll() is None:
+                            time.sleep(min(.1, remaining))
+                            break  # same app-server, fresh request ID, same overall deadline
+                        raise ValueError(f'{method}: {error}')
+                else:
+                    raise ValueError(f'{method}: no reply in {self.WAIT} s')
         try:
-            call(0, 'initialize', {'clientInfo': {'name': 'taskq', 'version': '1'}})
+            call('initialize', {'clientInfo': {'name': 'taskq', 'version': '1'}})
             send({'method': 'initialized'})
-            call(1, 'thread/name/set', {'threadId': thread, 'name': name})
-            read = call(2, 'thread/read', {'threadId': thread}).get('thread') or {}
+            call('thread/name/set', {'threadId': thread, 'name': name}, wait_rollout=True)
+            read = call('thread/read', {'threadId': thread}).get('thread') or {}
             if (read.get('id'), read.get('name')) != (thread, name):
                 raise ValueError(f'thread/read: {read.get("id")} named {read.get("name")!r}')
         finally:

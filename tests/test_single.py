@@ -1944,7 +1944,7 @@ class Tick(TickSetup):
         with mock.patch.object(codex, 'exec', run), mock.patch.object(codex, 'title') as title:
             self.assertEqual(codex.spawn('T1 one (mac)', 'prompt', '.'), 'new-thread')
         self.assertEqual((codex.folder() / 'T1.pid').read_text(), f'{os.getpid()} new-thread {taskq.process_identity(os.getpid())[1]}')
-        title.assert_called_once_with('new-thread', 'T1 one (mac)')  # R3 (#572): the new thread gets its native name
+        self.assertEqual(title.call_args.args, ('new-thread', 'T1 one (mac)'))  # R3 (#572): the new thread gets its native name
 
     def test_codex_title_waits_for_each_reply(self):
         # R3 (#572): a real local fake `codex app-server`: each request goes only after its own successful reply, the
@@ -1974,6 +1974,42 @@ class Tick(TickSetup):
             methods = log.read_text().split()
             self.assertEqual(methods, {'set-error': ['initialize', 'initialized', 'thread/name/set'], 'silent': ['initialize']}.get(
                 mode, ['initialize', 'initialized', 'thread/name/set', 'thread/read']))
+
+    def test_codex_title_waits_for_rollout_readiness_with_one_deadline(self):
+        server = self.root / 'fake_codex'
+        server.write_text(f'#!{sys.executable}\n' + APP_SERVER)
+        server.chmod(0o755)
+        def launch(command, **kwargs):
+            return REAL_POPEN(([sys.executable, *command] if os.name == 'nt' else command), **kwargs)
+        for mode in ('rollout-late', 'rollout-never', 'rollout-exited', 'rollout-unowned', 'set-other-error', 'set-wrong-code', 'set-wrong-thread'):
+            log = self.root / f'{mode}.log'
+            with self.subTest(mode=mode), mock.patch.object(taskq.subprocess, 'Popen', launch), \
+                    mock.patch.object(taskq.shutil, 'which', return_value=str(server)), \
+                    mock.patch.object(taskq.Codex, 'WAIT', 3), \
+                    mock.patch.dict(os.environ, {'FAKE_MODE': mode, 'FAKE_LOG': str(log)}):
+                owned = mock.Mock()
+                owned.poll.return_value = 0 if mode == 'rollout-exited' else None
+                if mode == 'rollout-unowned':
+                    owned = None
+                began = taskq.time.monotonic()
+                if mode == 'rollout-late':
+                    taskq.Codex().title('th', 'S1 CDX one (mac)', process=owned)
+                else:
+                    with self.assertRaises((OSError, ValueError)):
+                        taskq.Codex().title('th', 'S1 CDX one (mac)', process=owned)
+                self.assertLess(taskq.time.monotonic() - began, 6)
+                methods = log.read_text().splitlines()
+                sets = methods.count('thread/name/set')
+                self.assertEqual(methods.count('initialize'), 1)
+                if mode == 'rollout-late':
+                    self.assertEqual(sets, 3)
+                    self.assertEqual(methods[-1], 'thread/read')
+                elif mode == 'rollout-never':
+                    self.assertGreater(sets, 1)
+                    self.assertNotIn('thread/read', methods)
+                else:
+                    self.assertEqual(sets, 1)
+                    self.assertNotIn('thread/read', methods)
 
     def test_codex_unnamed_spawn_stops_and_keeps_its_handle(self):
         # R3 (#572): a thread whose name is not confirmed never counts as spawned: its turn is stopped, its pid file kept
@@ -3832,6 +3868,7 @@ class Model(Base):
 
 APP_SERVER = '''import json, os, sys, time
 mode, log = os.environ['FAKE_MODE'], open(os.environ['FAKE_LOG'], 'w')
+seen, sets = set(), 0
 for line in sys.stdin:
     message = json.loads(line)
     log.write(message['method'] + '\\n')
@@ -3840,9 +3877,15 @@ for line in sys.stdin:
         time.sleep(60)
     if 'id' not in message:
         continue
-    out = [{'method': 'note'}, {'id': 9, 'method': 'ask'}, {'id': 7, 'result': {}}]  # notifications and others first, slowly
-    if message['method'] == 'thread/name/set' and mode == 'set-error':
-        out.append({'id': message['id'], 'error': {'code': -32600, 'message': 'no rollout found'}})
+    if message['id'] in seen:
+        raise RuntimeError('duplicate request id')
+    seen.add(message['id'])
+    sets += message['method'] == 'thread/name/set'
+    out = [{'method': 'note'}, {'id': -9, 'method': 'ask'}, {'id': -7, 'result': {}}]  # notifications and others first, slowly
+    if message['method'] == 'thread/name/set' and (mode in ('set-error', 'rollout-never', 'rollout-exited', 'rollout-unowned', 'set-other-error', 'set-wrong-code', 'set-wrong-thread') or mode == 'rollout-late' and sets < 3):
+        out.append({'id': message['id'], 'error': {'code': -32000 if mode == 'set-wrong-code' else -32600,
+                    'message': 'permission denied' if mode in ('set-error', 'set-other-error') else
+                    'no rollout found for thread id ' + ('other' if mode == 'set-wrong-thread' else message['params']['threadId'])}})
     else:
         name = 'other' if mode == 'wrong-name' else 'S1 CDX one (mac)'
         out.append({'id': message['id'], 'result': {'thread': {'id': 'th', 'name': name}} if message['method'] == 'thread/read' else {}})

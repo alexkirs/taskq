@@ -1961,7 +1961,7 @@ def model_providers(admission=False):
         if type((selected.get(name) or {}).get('model:codex')) is not int:
             fail('finite model:codex capacity required; no unlimited fallback')
         limits = local_limits() if local_limits() is not None else CONFIG.get('limits', {})
-        if admission and selected[name]['model:codex'] > limits.get('codex', 0):
+        if admission and name == 'host_caps' and selected[name]['model:codex'] > limits.get('codex', 0):
             fail('model capacity exceeds invocation limit; explicitly provision matching finite capacity')
     project = BOARD.capacity_provider(selected['project_caps'])
     if project.scope != 'project' or project.owner != CONFIG.get('repo') or project.caps != selected['project_caps']:
@@ -2624,6 +2624,26 @@ def cmd_tick(args, table=True):
         raise
 
 
+def dispatch_manager(args):
+    """Explicit project delegation, not a fabricated native session or manager adoption."""
+    if not getattr(args, 'headless', False):
+        return None
+    value = CONFIG.get('dispatch')
+    if not isinstance(value, dict) or set(value) != {'pm', 'hosts', 'board_user'}:
+        fail('headless tick requires explicit project dispatch authority')
+    pm, hosts = value['pm'], value['hosts']
+    if not isinstance(pm, dict) or set(pm) != {'runtime', 'session', 'name'} \
+            or pm.get('runtime') != 'codex' or any(not isinstance(v, str) or not v.strip() for v in pm.values()) \
+            or not isinstance(hosts, list) or not hosts \
+            or any(not isinstance(h, str) or not h.strip() for h in hosts) \
+            or len(hosts) != len(set(hosts)) or machine() not in hosts:
+        fail('headless dispatch PM/participating host identity invalid')
+    if not isinstance(value['board_user'], str) or not value['board_user'].strip() \
+            or BOARD.user() != value['board_user']:
+        fail('headless dispatch authenticated board user mismatch')
+    return pm
+
+
 def direct():
     """R6 (#521, #574): the client that finally renders the report: TASKQ_CLIENT, else the session running the command.
     Codex: direct codex:// links; Claude, DOT, a shell or anything else: the https wrapper.
@@ -2686,6 +2706,8 @@ def heading(item):
 def one_pass(args, table=True):
     """One pass: free waiting tasks, follow unsupervised workers, act for supervisors, spawn ready tasks' supervisors, print the table."""
     here, kinds = machine(), runtimes()
+    delegated_pm = dispatch_manager(args)
+    table = table and delegated_pm is None
     local = local_limits()
     limits = local if local is not None else CONFIG.get('limits') or {name: 1 for name in kinds}
     blind = bool(os.environ.get('CODEX_SANDBOX'))
@@ -2696,6 +2718,8 @@ def one_pass(args, table=True):
         if held:
             board_schema_gate(issues)
         items = sorted(filter(None, map(parse, issues)), key=lambda item: (item['priority'], item['iid']))
+        if delegated_pm is not None:
+            items = [item for item in items if item['pm'] == delegated_pm]
         blind = bool(os.environ.get('CODEX_SANDBOX'))  # #502: a sandbox sees no other session alive: it would requeue live workers as gone
         if blind:
             print('taskq: inside a Codex sandbox: the pass only prints the table', file=sys.stderr)
@@ -2706,6 +2730,8 @@ def one_pass(args, table=True):
             fresh_issues = [read_issue(item['iid']) for item in ready]
             items = ready = sorted(filter(None, (parse(issue) for issue in fresh_issues if issue['state'] == 'open')),
                                    key=lambda item: (item['priority'], item['iid']))
+            if delegated_pm is not None:
+                items = ready = [item for item in ready if item['pm'] == delegated_pm]
         for item in ready:
             if item['raw'].get('event_schema') != 2 and compatibility_reason(item):
                 fail(compatibility_reason(item))
@@ -2779,7 +2805,7 @@ def one_pass(args, table=True):
             busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
         for item in ready:
             if item['raw'].get('event_schema') == 2 or item['state'] != 'ready' or not host_scope(item) or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']) \
-                    or (item['pm'] and item['pm'].get('name') != here) or not lead(item, kinds, admit=True):
+                    or (item['pm'] and item['pm'].get('name') != here and item['pm'] != delegated_pm) or not lead(item, kinds, admit=True):
                 continue  # no manager: the task waits, the table says so; another machine's manager: that machine starts it (§ 7 step 3)
             names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
             free = next((name for name in names if name in kinds and busy.get(name, 0) < limits.get(name, 0 if local is not None else 1)), None)
@@ -2798,7 +2824,7 @@ def one_pass(args, table=True):
                 move(item, 'doing', 'spawn', note('supervisor', session, kinds[runtime]), supervisor=item['supervisor'], claim=item['claim'],
                      result=None, order=None)
                 item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
-        if held and not blind:  # R11 (#360, #525): stopped sessions the board no longer holds, by recorded id only
+        if held and not blind and delegated_pm is None:  # headless dispatch never sweeps unrelated native sessions
             retire(stale({item['iid']: item for item in items}), 'could not remove stopped sessions', running=False)
     if table:
         if getattr(args, 'diagnose', False):
@@ -4776,6 +4802,7 @@ def main(argv=None):
     command('recovery-plan', cmd_recovery_plan, (('--role',), {'choices': ('worker', 'supervisor'), 'required': True}), (('--json',), {'action': 'store_true'}))
     command('reconcile', cmd_reconcile, (('--json',), {'action': 'store_true'}))
     command('tick', lambda args: (event_pass if args.quiet else cmd_tick)(args), (('--quiet',), {'action': 'store_true'}),
+            (('--headless',), {'action': 'store_true'}),
             (('--tasks',), {'nargs': '*', 'type': int, 'default': []}), (('--after',), {'type': int}), (('--after-birth',), {}),
             (('--diagnose',), {'action': 'store_true'}), (('--unknown-after',), {'type': positive_minutes, 'nargs': '?', 'const': 30}), n=False)
     command('wait', cmd_wait, (('--window',), {'type': float, 'default': 10}), (('--every',), {'type': float, 'default': 25}),

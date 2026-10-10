@@ -1831,6 +1831,44 @@ class RecoveryTimeout(TickSetup):
 
 class Tick(TickSetup):
 
+    def test_headless_remote_manager_dispatch_preserves_identity_and_foreign_tasks(self):
+        pm = {'runtime': 'codex', 'session': 'native-mac-pm', 'name': 'mac'}
+        taskq.CONFIG['dispatch'] = {'pm': pm, 'hosts': ['mac', 'win'], 'board_user': 'owner'}
+        with mock.patch.object(taskq, 'origin', return_value=pm), mock.patch.object(taskq, 'dispatch'):
+            self.add('common', '--runtime', 'codex')
+            self.add('Windows only', '--runtime', 'codex', '--host', 'win')
+            self.add('Mac only', '--runtime', 'codex', '--host', 'mac')
+        with mock.patch.object(taskq, 'dispatch'):
+            self.add('different manager', '--runtime', 'codex')
+        source = self.board.get(4)['body']
+        with mock.patch.object(taskq, 'machine', return_value='win'), \
+                mock.patch.object(self.board, 'user', return_value='owner', create=True), \
+                mock.patch.object(taskq, 'runtimes', return_value={'codex': self.fake}), \
+                mock.patch.dict(os.environ, {'TASKQ_LIMITS': '{"codex":4,"claude":0}'}), \
+                mock.patch.object(taskq, 'retire') as retire:
+            output = self.run_cli('tick', '--headless')
+            self.assertNotIn('|', output)  # operation receipts are internal logs, never a user table
+            self.assertEqual([self.task(n)['state'] for n in range(1, 5)], ['doing', 'doing', 'ready', 'ready'])
+            self.assertEqual(self.task(1)['pm'], pm)
+            self.assertEqual(self.task(1)['supervisor']['name'], 'win')
+            self.assertEqual(self.board.get(4)['body'], source)
+            retire.assert_not_called()
+            self.run_cli('tick', '--headless')
+            self.assertEqual(len([name for name in self.fake.names if name.startswith('S')]), 2)
+
+    def test_headless_refuses_missing_or_wrong_authority_before_board_effects(self):
+        with self.assertRaisesRegex(SystemExit, 'explicit project dispatch'):
+            self.run_cli('tick', '--headless')
+        taskq.CONFIG['dispatch'] = {'pm': {'runtime': 'codex', 'session': 'pm', 'name': 'mac'},
+                                    'hosts': ['mac'], 'board_user': 'owner'}
+        with mock.patch.object(self.board, 'user', return_value='other', create=True):
+            with self.assertRaisesRegex(SystemExit, 'board user mismatch'):
+                self.run_cli('tick', '--headless')
+        taskq.CONFIG['dispatch']['hosts'] = [{}]
+        with self.assertRaisesRegex(SystemExit, 'identity invalid'):
+            self.run_cli('tick', '--headless')
+        self.assertIsNone(self.board.guard)
+
     def test_local_limits_replace_defaults_and_reserve_five_codex_slots(self):
         taskq.CONFIG['limits'] = {'fake': 8, 'codex': 1}
         with mock.patch.object(taskq, 'dispatch'):
@@ -4784,6 +4822,21 @@ class Cleanup(Base):
 
 
 class Model(Base):
+
+    def test_project_capacity_can_span_hosts_without_overriding_local_host_limit(self):
+        taskq.CONFIG.update(repo='o/r', capacity={'project_caps': {'model:codex': 8},
+                            'host_caps': {'model:codex': 4}, 'host_path': str(self.root / 'host.db')})
+        provider = mock.Mock(scope='project', owner='o/r', caps={'model:codex': 8})
+        taskq.BOARD.capacity_provider = mock.Mock(return_value=provider)
+        with mock.patch.dict(os.environ, {'TASKQ_LIMITS': '{"codex":4,"claude":0}'}), \
+                mock.patch.object(taskq, 'SQLiteCapacity') as host:
+            project, _ = taskq.model_providers(admission=True)
+            self.assertIs(project, provider)
+            host.assert_called_once_with(str(self.root / 'host.db'), 'host', taskq.machine(), {'model:codex': 4})
+            taskq.CONFIG['capacity']['host_caps']['model:codex'] = 5
+            with self.assertRaisesRegex(SystemExit, 'exceeds invocation limit'):
+                taskq.model_providers(admission=True)
+            self.assertEqual(host.call_count, 1)
 
     def test_metadata_reads_skip_comments_and_history_keeps_adapter_trust(self):
         for board, lab in ((taskq.GitHub('o/r'), False), (taskq.GitLab('o/r'), True)):

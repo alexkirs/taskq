@@ -7,7 +7,7 @@ Your repository board is the task list; your usual AI apps do the work.
 Add taskq, then ask Codex or Claude to turn any request into tickets.
 
 The manager picks up tickets, runs as many workers as you choose, and tracks progress.
-No extra worker apps required.
+No extra worker apps required. Compression stays under your global user settings; TaskQ needs no compression provider.
 
 You stay in control: tasks wait for your input and continue when you reply.
 

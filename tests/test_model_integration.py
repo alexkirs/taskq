@@ -283,6 +283,12 @@ class ModelIntegration(unittest.TestCase):
         self.board.issues[1]['body'] = q.block('synthetic', changed)
         with self.assertRaises(SystemExit): q.cmd_applied(args)
         self.board.issues[1] = issue
+        scoped = q.issue_data(issue)
+        scoped['scope'] = ['other.txt']
+        self.board.issues[1]['body'] = q.block('synthetic', scoped)
+        with self.assertRaises(SystemExit): q.cmd_applied(args)
+        scoped['scope'] = []  # ordinary intake default: no expected paths named
+        self.board.issues[1]['body'] = q.block('synthetic', scoped)
         with q.coordination(): q.cmd_applied(args)
         before = json.dumps(self.board.issues, sort_keys=True)
         with q.coordination(): q.cmd_applied(args)

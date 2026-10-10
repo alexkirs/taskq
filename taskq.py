@@ -2510,7 +2510,7 @@ def cmd_applied(args):
     import fnmatch
     if relative.is_absolute() or '..' in relative.parts or not relative.name or path.is_symlink() \
             or not path.is_file() or not path.resolve().is_relative_to(root) \
-            or not any(fnmatch.fnmatchcase(relative.as_posix(), scope) for scope in item['scope']):
+            or (item['scope'] != [] and not any(fnmatch.fnmatchcase(relative.as_posix(), scope) for scope in item['scope'])):
         fail('applied artifact must be a real scoped file inside this task workspace')
     content = path.read_bytes()
     if len(content) > 1024 * 1024:

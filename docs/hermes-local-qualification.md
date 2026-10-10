@@ -13,7 +13,7 @@ The actual topology was native Hermes manager → native Hermes supervisor → r
 Codex CLI worker → independent supervisor review/close → native manager wake.
 Local file-board issue 1 closed. Manager `20261009_163721_e76a30` and supervisor
 `20261009_163804_d9ba2c` were distinct; the worker thread was
-`01a12187-dbff-7260-8b56-92a5c46230a6`. Both worker and supervisor calculated
+`00000000-0000-0000-0000-000000000001`. Both worker and supervisor calculated
 `17 + 25` in separate successful tool calls, producing `42` with exit code 0.
 The supervisor tool result was joined to its exact review turn (persisted user/final
 rows 98/112). The exact closed-board outcome woke the manager with a successful

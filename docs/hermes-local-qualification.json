@@ -44,7 +44,7 @@
     "final_assistant_row_id": 112
   },
   "worker_calculation": {
-    "thread_id": "01a12187-dbff-7260-8b56-92a5c46230a6",
+    "thread_id": "00000000-0000-0000-0000-000000000001",
     "item_id": "item_4",
     "exit_code": 0,
     "output": "42"

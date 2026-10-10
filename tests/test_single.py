@@ -19,6 +19,9 @@ ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location('taskq_single', ROOT / 'taskq.py')
 taskq = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(taskq)
+recovery_spec = importlib.util.spec_from_file_location('recovery_fixture_model', ROOT / 'experiments' / 'recovery_receipt_model.py')
+recovery_model = importlib.util.module_from_spec(recovery_spec)
+recovery_spec.loader.exec_module(recovery_model)
 SESSION = '0123456789abcdef'
 BIRTH = f'{taskq.process_domain()}:1' + (':0' if sys.platform == 'darwin' else '')
 NEXT_BIRTH = f'{taskq.process_domain()}:2' + (':0' if sys.platform == 'darwin' else '')
@@ -92,23 +95,29 @@ class Base(unittest.TestCase):
         self.board = taskq.BOARD = FakeBoard()
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
-        self.root = Path(folder.name)
+        self.root = Path(folder.name).resolve()
         taskq.CONFIG = {'board': 'github', 'publish': 'direct', 'root': self.root, 'hosts': {}}
         real = lambda *_, **__: self.fail('a test started a real process')  # a test fakes subprocess.run where it needs one
         env = {'CLAUDE_CODE_SESSION_ID': SESSION, 'TASKQ_RUNTIME': 'claude', 'TASKQ_HOST': 'mac'}
         if os.name == 'nt':  # Windows has no /usr/bin fallback after clear=True; preserve only the native git directory
             git = taskq.shutil.which('git')
-            env.update(PATH=str(Path(git).parent) if git else '', SYSTEMROOT=os.environ['SYSTEMROOT'])
+            env.update(PATH=str(Path(git).parent) if git else '', SYSTEMROOT=os.environ['SYSTEMROOT'],
+                       USERPROFILE=str(self.root))  # isolated Windows home; no real profile/credentials
         def child(command, **_):
             try:
                 taskq.main(command[2:])
             except SystemExit:
                 pass  # real detached child failure cannot fail its settled parent command
+        def model_protocol(item, kind, role_name, prompt, events=(), resume=None):
+            # Historical fake adapter/control tests, not finite model-budget or native qualification.
+            return kind.send(resume, prompt) if resume else kind.spawn(
+                taskq.worker_name(item, 'T' if role_name == 'worker' else 'S'), prompt, taskq.CONFIG['root'])
         for patcher in (
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch.object(taskq, 'GUARD_WAIT', 0),
                 mock.patch.object(taskq, 'runtimes', return_value={}),  # no real worker from an event's dispatch
                 mock.patch.object(taskq, 'start_pass', child),  # the child's pass, in process
+                mock.patch.object(taskq, 'owned_model_turn', side_effect=model_protocol),
                 mock.patch.object(taskq, 'datetime', FixedNow),
                 mock.patch.object(taskq, 'CLONE', self.root),  # no .git, no taskq.md: tick and wait neither pull nor warn
                 mock.patch.object(taskq.subprocess, 'run', real), mock.patch.object(taskq.subprocess, 'Popen', real)):
@@ -148,6 +157,455 @@ class Base(unittest.TestCase):
     def add(self, title='T', *extra):
         return self.run_cli('add', title, '--goal', 'g', '--acceptance', 'a', '--scope', 'x.py', *extra)
 
+
+
+class RecoveryQualification(Base):
+    def setUp(self):
+        super().setUp()
+        recovery_model.CONFIG = taskq.CONFIG
+
+    def item(self):
+        return {'iid': 1, 'claim': {'runtime': 'codex', 'session': 'old', 'name': 'mac'}}
+
+    def op(self):
+        return recovery_model.RecoveryOperation(self.item(), 'worker')
+
+    def receipt(self, op, stage, status='ok'):
+        request = op.request(stage)
+        keys = {'drain': ('session_unloaded', 'inflight_reconciled'),
+                'continue': ('same_session', 'native_birth_verified'),
+                'board': ('identity_rechecked', 'history_preserved'),
+                'application': ('exact_payload_applied',)}[stage]
+        return {**request, 'kind': 'receipt', 'status': status,
+                'evidence': {'source': 'qualified-runtime', **dict.fromkeys(keys, True)}}
+
+    def test_order_checkpoint_and_application_separation(self):
+        op = self.op()
+        for stage in op.stages:
+            value = self.receipt(op, stage)
+            op.receipt(value)
+            op.receipt(value)
+            op = recovery_model.RecoveryOperation.restore(op.snapshot(), self.item())
+            self.assertEqual(op.phase == 'applied', stage == 'application')
+        with self.assertRaises(ValueError):
+            op.request('application')
+
+    def test_unknown_and_decline_block_every_stage_even_final(self):
+        for stop in self.op().stages:
+            for status in ('unknown', 'declined'):
+                op = self.op()
+                for stage in op.stages:
+                    op.receipt(self.receipt(op, stage, status if stage == stop else 'ok'))
+                    if stage == stop:
+                        break
+                restored = recovery_model.RecoveryOperation.restore(op.snapshot(), self.item())
+                self.assertEqual(restored.phase, 'blocked')
+                for stage in op.stages:
+                    with self.assertRaises(ValueError):
+                        restored.request(stage)
+
+    def test_wrong_correlation_and_conflicting_duplicate(self):
+        for key in ('operation', 'request', 'stage', 'target'):
+            op = self.op(); value = self.receipt(op, 'drain')
+            value[key] = 'wrong'
+            with self.assertRaises(ValueError):
+                op.receipt(value)
+            self.assertEqual(op.phase, 'awaiting-drain')
+        op = self.op(); value = self.receipt(op, 'drain'); op.receipt(value)
+        value['status'] = 'unknown'
+        with self.assertRaises(ValueError):
+            op.receipt(value)
+
+    def test_stale_identity_and_tampered_checkpoint(self):
+        op = self.op(); op.receipt(self.receipt(op, 'drain'))
+        for key in ('session', 'runtime', 'name'):
+            item = self.item(); item['claim'][key] = 'replacement'
+            with self.assertRaises(ValueError):
+                recovery_model.RecoveryOperation.restore(op.snapshot(), item)
+        saved = op.snapshot(); saved['phase'] = 'applied'
+        with self.assertRaises(ValueError):
+            recovery_model.RecoveryOperation.restore(saved, self.item())
+
+    def test_new_pending_payload_rejects_old_checkpoint(self):
+        op = self.op()
+        changed = self.item(); changed['raw'] = {'order': 'new answer payload', 'event_seq': 3}
+        with self.assertRaises(ValueError):
+            recovery_model.RecoveryOperation.restore(op.snapshot(), changed)
+
+    def test_same_sequence_changed_answer_content_rejects_checkpoint(self):
+        item = self.item(); item['raw'] = {'event_seq': 4, 'action_payloads': {'answer': 'first'}}
+        op = recovery_model.RecoveryOperation(item, 'worker')
+        item['raw']['action_payloads']['answer'] = 'second'
+        with self.assertRaises(ValueError):
+            recovery_model.RecoveryOperation.restore(op.snapshot(), item)
+
+    def test_timeout_and_manual_assertions_are_not_drain(self):
+        op = self.op(); value = self.receipt(op, 'drain')
+        value['evidence'] = {'source': 'timeout', 'session_unloaded': True, 'inflight_reconciled': True}
+        with self.assertRaises(ValueError):
+            op.receipt(value)
+        with self.assertRaises(ValueError):
+            op.request('continue')
+
+    def test_local_and_remote_plans_never_authorize_effects(self):
+        for host in ('mac', 'windows'):
+            item = self.item(); item['claim']['name'] = host
+            plan = taskq.recovery_plan(item, 'worker', {}, 'mac')
+            self.assertEqual(plan['state'], 'unsupported')
+            self.assertEqual(plan['automatic_actions'], [])
+            self.assertEqual(plan['slot'], 'reserved')
+
+    def test_threshold_rejects_nonfinite_and_nonpositive(self):
+        for value in ('nan', 'inf', '-1', '0', 'bad'):
+            with self.assertRaises(taskq.argparse.ArgumentTypeError):
+                taskq.positive_minutes(value)
+        self.assertEqual(taskq.positive_minutes('0.5'), .5)
+
+
+class ObligationDiagnostics(Base):
+    """Candidate real CLI/report paths; synthetic adapter/runtime evidence, no production effects."""
+
+    def fixture(self, state='doing', **fields):
+        raw = {'pm': {'runtime': 'claude', 'session': SESSION, 'name': 'mac'},
+               'claim': {'runtime': 'fake', 'session': 'worker', 'name': 'mac'},
+               'supervisor': {'runtime': 'fake', 'session': 'supervisor', 'name': 'mac'},
+               'event_seq': 9, **fields}
+        self.board.add('Captured incident', taskq.block('goal', raw), ['q-' + state])
+        return self.task(1)
+
+    def runtime(self, observation):
+        kind = mock.Mock()
+        kind.link.return_value = 'https://session/worker'
+        kind.observe.return_value = observation
+        return mock.patch.object(taskq, 'runtimes', return_value={'fake': kind})
+
+    def test_native_adapters_diagnosis_uses_only_fresh_get_requests(self):
+        item = self.fixture()
+        body = taskq.block('goal', item['raw'])
+        for adapter in (taskq.GitHub('owner/repo'), taskq.GitLab('owner/repo')):
+            native = {'number': 1, 'iid': 1, 'title': 'T', 'body': body, 'description': body,
+                      'html_url': 'https://issue/1', 'web_url': 'https://issue/1', 'updated_at': '2026-10-09',
+                      'author_association': 'OWNER', 'state': 'opened' if isinstance(adapter, taskq.GitLab) else 'open',
+                      'labels': ['q-doing'] if isinstance(adapter, taskq.GitLab) else [{'name': 'q-doing'}]}
+            def api(client, host, method, path, payload=None):
+                self.assertEqual(method, 'GET')
+                self.assertIsNone(payload)
+                return [native] if '?' in path else native
+            with self.subTest(adapter=type(adapter).__name__), mock.patch.object(taskq, 'BOARD', adapter), \
+                    mock.patch.object(taskq, 'run_api', side_effect=api) as called, \
+                    self.runtime({'state': 'unknown', 'code': 'surface-auth'}):
+                out = self.run_cli('status', '--diagnose')
+                self.assertIn('surface-auth', out)
+                self.assertEqual(called.call_count, 2)
+                self.assertTrue(called.call_args.args[3].endswith('issues/1'))
+
+    def test_codex_keeps_all_distinct_command_obligations(self):
+        folder = self.root / '.taskq'; folder.mkdir()
+        (folder / 'T1.pid').write_text(f'1 worker {BIRTH}')
+        entries = [{'type':'thread.started','thread_id':'worker'}, {'type': 'turn.started'}]
+        for ident, command, output in [('a', 'gh api route', 'no access token'),
+                                      ('b', 'taskq result 1', 'network unavailable'),
+                                      ('c', 'other', 'pong_timeout')]:
+            entries.append({'type': 'item.completed', 'item': {'id': ident, 'type': 'command_execution',
+                'command': command, 'exit_code': 1, 'aggregated_output': output}})
+        (folder / 'T1.log').write_text('\n'.join(json.dumps(x) for x in entries))
+        with mock.patch.object(taskq, 'process_state', return_value='dead'):
+            evidence = taskq.Codex().observe('worker')
+        self.assertEqual({p['code'] for p in evidence['problems']},
+                         {'surface-auth', 'result-unsubmitted', 'transport-loss'})
+        self.fixture()
+        with self.runtime(evidence):
+            out = self.run_cli('status', '--diagnose')
+        for code in ('surface-auth', 'result-unsubmitted', 'transport-loss'):
+            self.assertIn(code, out)
+
+    def test_guard_adapters_are_get_only_and_report_does_not_declare_orphan(self):
+        for adapter, response in ((taskq.GitHub('owner/repo'),
+                {'name':'taskq-coordination','node_id':'exact','description':'mac codex:01234567 pid=1 uuid'}),
+                (taskq.GitLab('owner/repo', options={'coordination_board':13,'coordination_label':105}),
+                 [{'id':290,'label':{'id':105}}])):
+            with self.subTest(adapter=type(adapter).__name__), \
+                    mock.patch.object(taskq,'coordination_api',return_value=(200,response)) as api, \
+                    mock.patch.object(taskq,'BOARD',adapter):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out): taskq.report_guard()
+                self.assertEqual(api.call_args.args[2], 'GET')
+                self.assertIn('held', out.getvalue())
+                self.assertIn('operation unknown', out.getvalue())
+                self.assertNotIn('orphan', out.getvalue())
+
+    def test_other_pm_remote_roles_are_visible_unknown_without_local_probe(self):
+        self.fixture(pm={'runtime':'codex','session':'foreign','name':'win'},
+                     claim={'runtime':'fake','session':'remote','name':'win'})
+        with self.runtime({'state':'idle'}) as runtime:
+            out = self.run_cli('status','--diagnose')
+        self.assertIn('owning-host',out)
+        self.assertNotIn(mock.call('remote'),runtime.return_value['fake'].observe.call_args_list)
+
+    def test_prerequisite_and_missing_result_receipt_are_not_claimed_produced(self):
+        self.fixture(deps=[2])
+        self.board.add('Gate',taskq.block('gate',{}),['q-later'])
+        with self.runtime({'state':'idle'}): out=self.run_cli('status','--diagnose')
+        self.assertIn('blocked-prerequisite',out)
+        self.assertIn('dependency:#2',out)
+        self.assertIn('production-unverified',out)
+        self.assertNotIn('result-unsubmitted:',out)
+
+    def test_question_event_dedup_survives_module_restart(self):
+        self.fixture('ask', decision={'summary':'current','options':['retain','qualify']},
+                     action_payloads={'ask':{'id':9,'text':'current'}},
+                     events=[{'id':9,'recipients':['PM','PM'],'acks':[]}])
+        with self.runtime({'state':'idle'}): first=self.run_cli('status','--diagnose')
+        restarted_spec=importlib.util.spec_from_file_location('taskq_restarted', ROOT/'taskq.py')
+        restarted=importlib.util.module_from_spec(restarted_spec); restarted_spec.loader.exec_module(restarted)
+        restarted.CONFIG={**taskq.CONFIG}; restarted.BOARD=self.board
+        out=io.StringIO()
+        with mock.patch.object(restarted,'runtimes',return_value={'fake':mock.Mock(observe=mock.Mock(return_value={'state':'idle'}))}), \
+                contextlib.redirect_stdout(out): restarted.main(['status','--diagnose'])
+        self.assertEqual(re.findall(r'P1-[a-f0-9]{12}',first), re.findall(r'P1-[a-f0-9]{12}',out.getvalue()))
+        self.assertEqual(out.getvalue().count('pending-event:'),1)
+        self.assertIn('1.1 retain',out.getvalue())
+        self.assertFalse((self.root/'.taskq').exists())
+
+    def test_history_failure_ids_survive_later_turn_and_runtime_restart(self):
+        folder=self.root/'.taskq'; folder.mkdir()
+        (folder/'T1.pid').write_text(f'1 worker {BIRTH}')
+        log=folder/'T1.log'
+        log.write_text('\n'.join(json.dumps(e) for e in [
+            {'type':'thread.started','thread_id':'worker'}, {'type':'turn.started'}, {'type':'item.completed','item':{'id':'a','type':'command_execution',
+              'command':'taskq result 1','exit_code':1,'aggregated_output':'failed'}}, {'type':'turn.completed'}]))
+        with mock.patch.object(taskq,'process_state',return_value='dead'), mock.patch.object(taskq,'rollout',return_value='local'):
+            first=taskq.Codex().observe('worker')['problems']
+            with log.open('a') as stream: stream.write('\n{"type":"turn.started"}\n{"type":"turn.completed"}\n')
+            self.assertEqual(first,taskq.Codex().observe('worker')['problems'])
+        self.assertEqual(first[0]['code'],'result-unsubmitted')
+
+    def test_replacement_threads_do_not_inherit_or_settle_each_others_failures(self):
+        folder=self.root/'.taskq'; folder.mkdir()
+        pid=folder/'T1.pid'; log=folder/'T1.log'
+        pid.write_text(f'1 worker {BIRTH}')
+        entries=[{'type':'thread.started','thread_id':'old'}, {'type':'turn.started'},
+                 {'type':'item.completed','item':{'id':'old-a','type':'command_execution','command':'gh api route',
+                  'exit_code':1,'aggregated_output':'no access token'}}, {'type':'turn.completed'},
+                 {'type':'thread.started','thread_id':'worker'}, {'type':'turn.started'},
+                 {'type':'item.completed','item':{'id':'new-a','type':'command_execution','command':'gh api route',
+                  'exit_code':0,'aggregated_output':'ok'}}, {'type':'turn.completed'}]
+        log.write_text('\n'.join(json.dumps(x) for x in entries))
+        with mock.patch.object(taskq,'process_state',return_value='dead'), mock.patch.object(taskq,'rollout',return_value='local'):
+            self.assertIsNone(taskq.Codex().observe('worker')['code'])
+            pid.write_text(f'1 old {BIRTH}')
+            self.assertEqual(taskq.Codex().observe('old')['problems'][0]['code'],'surface-auth')
+
+    def test_legacy_two_field_completed_handle_is_actionable_unknown(self):
+        folder=self.root/'.taskq'; folder.mkdir()
+        pid=folder/'T1.pid'; pid.write_text('1 worker')
+        (folder/'T1.log').write_text('\n'.join(json.dumps(x) for x in [
+            {'type':'thread.started','thread_id':'worker'}, {'type':'turn.started'}, {'type':'turn.completed'}]))
+        with mock.patch.object(taskq,'process_identity',side_effect=AssertionError('legacy PID must not be trusted')):
+            observed=taskq.Codex().observe('worker')
+        self.assertEqual(observed['state'],'unknown')
+        self.assertIn('legacy-handle',[x['code'] for x in observed['problems']])
+        self.assertEqual(pid.read_text(),'1 worker')
+        self.fixture()
+        with self.runtime(observed): out=self.run_cli('status','--diagnose')
+        self.assertIn('crash не доказан',out)
+        self.assertIn('не выдумывать birth',out)
+
+    def test_non_task_open_prerequisite_is_reported(self):
+        self.fixture(deps=[2])
+        self.board.add('Ordinary issue','no TaskQ block',[])
+        with self.runtime({'state':'idle'}): out=self.run_cli('status','--diagnose')
+        self.assertIn('dependency:#2',out)
+
+    def test_status_held_guard_has_diagnostics_without_any_write(self):
+        self.fixture()
+        self.board.guard = 'retained'
+        before = json.dumps(self.board.issues, sort_keys=True)
+        with self.runtime({'state': 'idle', 'code': 'result-unsubmitted'}), \
+                mock.patch.object(self.board, 'acquire', side_effect=AssertionError('acquire')), \
+                mock.patch.object(self.board, 'update', side_effect=AssertionError('write')):
+            out = self.run_cli('status', '--diagnose')
+        self.assertIn('Результат не передан', out)
+        self.assertIn('worker', out)
+        self.assertEqual(self.board.guard, 'retained')
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        self.assertFalse((self.root / '.taskq').exists())
+
+    def test_tick_guard_refusal_still_reports_and_keeps_nonzero(self):
+        self.fixture()
+        self.board.guard = 'retained'
+        out = io.StringIO()
+        with self.runtime({'state': 'unknown'}), contextlib.redirect_stdout(out), \
+                self.assertRaisesRegex(SystemExit, 'project guard busy'):
+            taskq.main(['tick', '--diagnose'])
+        self.assertIn('guard', out.getvalue())
+        self.assertIn('Проблемы сессий', out.getvalue())
+        self.assertEqual(self.board.guard, 'retained')
+
+    def test_fresh_issue_replaces_stale_role_before_probe(self):
+        old = self.fixture()
+        fresh = dict(self.board.get(1))
+        fresh['body'] = taskq.block('goal', {**old['raw'], 'claim': {'runtime': 'fake', 'session': 'new', 'name': 'win'}})
+        with self.runtime({'state': 'idle'}) as patched, mock.patch.object(self.board, 'get', return_value=fresh):
+            out = self.run_cli('status', '--diagnose')
+            calls = patched.return_value['fake'].observe.call_args_list
+        self.assertNotIn(mock.call('worker'), calls)
+        self.assertIn('owning-host', out)
+        self.assertIn('new', out)
+
+    def test_fresh_closed_task_does_not_probe_old_worker(self):
+        self.fixture()
+        fresh = {**self.board.get(1), 'state': 'closed'}
+        with self.runtime({'state': 'idle'}) as patched, mock.patch.object(self.board, 'get', return_value=fresh):
+            out = self.run_cli('status', '--diagnose')
+        patched.return_value['fake'].observe.assert_not_called()
+        self.assertIn('In work 0', out)
+
+    def test_unreadable_fresh_task_never_uses_old_role(self):
+        self.fixture()
+        with self.runtime({'state': 'dead'}) as patched, \
+                mock.patch.object(self.board, 'get', side_effect=RuntimeError('private TOKEN=secret')):
+            out = self.run_cli('status', '--diagnose')
+        patched.return_value['fake'].observe.assert_not_called()
+        self.assertIn('fresh-read-unavailable', out)
+        self.assertNotIn('secret', out)
+        self.assertNotIn('| doing |', out)
+
+    def test_remote_unknown_and_probe_error_do_not_become_dead(self):
+        self.fixture(claim={'runtime': 'fake', 'session': 'remote', 'name': 'win'})
+        with self.runtime({'state': 'dead'}) as patched:
+            patched.return_value['fake'].observe.side_effect = RuntimeError('TOKEN=secret')
+            out = self.run_cli('status', '--diagnose')
+        self.assertIn('owning-host', out)
+        self.assertIn('unknown', out)
+        self.assertNotIn('dead', out)
+        self.assertNotIn('secret', out)
+
+    def test_incident_codes_have_responsibility_and_action(self):
+        self.fixture()
+        for code in ('active-writer', 'surface-auth', 'after-hook', 'transport-loss',
+                     'result-unsubmitted', 'ack-contention', 'native-windows', 'runtime-rejected'):
+            with self.subTest(code=code), self.runtime({'state': 'idle', 'code': code}):
+                out = self.run_cli('status', '--diagnose')
+                self.assertIn(code, out)
+                self.assertIn('Следующее действие', out)
+                self.assertNotIn('recovered', out)
+
+    def test_missing_worker_order_is_supervisor_obligation_not_spawn(self):
+        self.fixture(claim=None, order=None)
+        with self.runtime({'state': 'idle'}):
+            out = self.run_cli('status', '--diagnose')
+        self.assertIn('missing-order', out)
+        self.assertIn('supervisor', out)
+
+    def test_repeated_report_stable_ids_fresh_question_version_changes_id(self):
+        item = self.fixture('ask', decision={'summary': 'choose', 'options': ['keep', 'repair']},
+                            action_payloads={'ask': {'id': 9, 'text': 'choose'}})
+        with self.runtime({'state': 'idle'}):
+            one = self.run_cli('status', '--diagnose')
+            two = self.run_cli('status', '--diagnose')
+            self.assertEqual(one, two)
+            raw = {**item['raw'], 'action_payloads': {'ask': {'id': 10, 'text': 'changed'}}}
+            self.board.issues[1]['body'] = taskq.block('goal', raw)
+            three = self.run_cli('status', '--diagnose')
+        ids = lambda s: re.findall(r'P1-[a-f0-9]{12}', s)
+        self.assertEqual(len(ids(one)), len(set(ids(one))))
+        self.assertNotEqual(ids(one), ids(three))
+        self.assertIn('ask:10', three)
+
+    def test_codex_failure_survives_clean_turn_and_no_folder_write(self):
+        kind = taskq.Codex()
+        self.assertEqual(kind.observe('absent')['state'], 'unknown')
+        self.assertFalse((self.root / '.taskq').exists())
+        folder = self.root / '.taskq'
+        folder.mkdir()
+        (folder / 'T1.pid').write_text(f'1 worker {BIRTH}')
+        log = [ {'type':'thread.started','thread_id':'worker'}, {'type': 'turn.started'},
+                {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': 'taskq result 1',
+                    'exit_code': 1, 'aggregated_output': 'OAuth2 no access token TOKEN=secret'}},
+                {'type': 'turn.completed'} ]
+        (folder / 'T1.log').write_text('\n'.join(json.dumps(x) for x in log))
+        with mock.patch.object(taskq, 'process_state', return_value='dead'), \
+                mock.patch.object(taskq, 'rollout', return_value='local'):
+            observed = kind.observe('worker')
+            self.assertEqual(observed['state'], 'idle')
+            self.assertEqual(observed['code'], 'surface-auth')
+            self.assertNotIn('secret', json.dumps(observed))
+            with (folder / 'T1.log').open('a') as stream:
+                stream.write('\n' + json.dumps({'type': 'turn.started'}) + '\n' + json.dumps({'type': 'turn.completed'}))
+            self.assertEqual(kind.observe('worker')['code'], 'surface-auth')
+            with (folder / 'T1.log').open('a') as stream:
+                stream.write('\n' + json.dumps({'type': 'item.completed', 'item': {'type': 'command_execution',
+                    'command': 'taskq result 1', 'exit_code': 0, 'aggregated_output': 'receipt'}}))
+            self.assertIsNone(kind.observe('worker')['code'])
+
+    def test_codex_open_writer_observation_does_not_assert_dead_or_unload(self):
+        kind = taskq.Codex()
+        folder = self.root / '.taskq'; folder.mkdir()
+        (folder / 'T1.pid').write_text(f'1 worker {BIRTH}')
+        (folder / 'T1.log').write_text('{"type":"thread.started","thread_id":"worker"}\n{"type":"turn.started"}\n{"type":"turn.completed"}\n')
+        lock = self.root / 'thread-writer-locks' / 'worker.lock'; lock.parent.mkdir(); lock.touch()
+        with mock.patch.dict(os.environ, {'CODEX_HOME': str(self.root)}), \
+                mock.patch.object(taskq, 'process_state', return_value='dead'), \
+                mock.patch.object(taskq, 'rollout', return_value='local'), \
+                mock.patch.object(taskq.shutil, 'which', return_value='/usr/sbin/lsof'), \
+                mock.patch.object(taskq.subprocess, 'run', return_value=mock.Mock(returncode=0, stdout='2891\n', stderr='')) as ran:
+            observation = kind.observe('worker')
+        self.assertEqual(observation['code'], 'active-writer')
+        self.assertEqual(observation['state'], 'unknown')
+        self.assertIn('-t', ran.call_args.args[0])
+
+    def test_all_distinct_event_recipient_obligations_survive_deduplication(self):
+        self.fixture(events=[{'id': 8, 'recipients': ['PM', 'supervisor'], 'acks': []},
+                             {'id': 9, 'recipients': ['PM', 'PM'], 'acks': []}])
+        with self.runtime({'state': 'idle'}):
+            out = self.run_cli('status', '--diagnose')
+        rows = [line for line in out.splitlines() if 'pending-event:' in line]
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(sum('event:8;' in line for line in rows), 2)
+
+    def test_fresh_assignee_transfer_prevents_observation_and_problem_leak(self):
+        self.fixture()
+        taskq.CONFIG['assignee'] = 'alice'
+        self.board.issues[1]['assignees'] = ['alice']
+        fresh = {**self.board.get(1), 'assignees': ['bob']}
+        with self.runtime({'state': 'idle', 'code': 'surface-auth'}) as patched, \
+                mock.patch.object(self.board, 'get', return_value=fresh):
+            out = self.run_cli('status', '--diagnose')
+        patched.return_value['fake'].observe.assert_not_called()
+        self.assertNotIn('surface-auth', out)
+
+    def test_codex_successful_same_command_retry_clears_failure(self):
+        folder = self.root / '.taskq'; folder.mkdir()
+        (folder / 'T1.pid').write_text(f'1 worker {BIRTH}')
+        entries = [{'type':'thread.started','thread_id':'worker'}, {'type': 'turn.started'},
+                   {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': 'gh api route',
+                       'exit_code': 1, 'aggregated_output': 'no access token'}},
+                   {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': 'gh api route',
+                       'exit_code': 0, 'aggregated_output': 'ok'}}, {'type': 'turn.completed'}]
+        (folder / 'T1.log').write_text('\n'.join(json.dumps(x) for x in entries))
+        with mock.patch.object(taskq, 'process_state', return_value='dead'), \
+                mock.patch.object(taskq, 'rollout', return_value='local'):
+            self.assertIsNone(taskq.Codex().observe('worker')['code'])
+
+    def test_new_evidence_changes_reference_but_source_is_retained(self):
+        self.fixture()
+        with self.runtime({'state': 'unknown', 'code': 'active-writer', 'source': 'writer-holder', 'evidence_id': 'turn:A'}):
+            one = self.run_cli('status', '--diagnose')
+        with self.runtime({'state': 'unknown', 'code': 'active-writer', 'source': 'writer-holder', 'evidence_id': 'turn:B'}):
+            two = self.run_cli('status', '--diagnose')
+        self.assertIn('writer-holder', one)
+        self.assertNotEqual(re.findall(r'P1-[a-f0-9]{12}', one), re.findall(r'P1-[a-f0-9]{12}', two))
+
+    def test_failed_writer_probe_is_unknown_not_idle(self):
+        kind = taskq.Codex()
+        lock = self.root / 'thread-writer-locks' / 'worker.lock'; lock.parent.mkdir(); lock.touch()
+        with mock.patch.dict(os.environ, {'CODEX_HOME': str(self.root)}), \
+                mock.patch.object(taskq.shutil, 'which', return_value='/usr/sbin/lsof'), \
+                mock.patch.object(taskq.subprocess, 'run', return_value=mock.Mock(returncode=2, stdout='', stderr='denied')):
+            observation = kind.observe('worker')
+        self.assertEqual(observation['state'], 'unknown')
+        self.assertEqual(observation['source'], 'writer-unverified')
 
 
 class UserManagedContext(Base):
@@ -364,6 +822,37 @@ class Coordination(Base):
 
 
 class Commands(Base):
+
+    def test_add_later_is_guarded_intake_without_dispatch_or_dependency_read(self):
+        self.add('existing', '--later')
+        original = json.dumps(self.board.issues[1], sort_keys=True)
+        with mock.patch.object(taskq, 'dispatch') as dispatch, mock.patch.object(taskq, 'open_deps') as deps:
+            self.assertEqual(self.add('parked', '--later', '--deps', '1'), '#2 later\n')
+        dispatch.assert_not_called(); deps.assert_not_called()
+        self.assertEqual(json.dumps(self.board.issues[1], sort_keys=True), original)
+        item = self.task(2)
+        self.assertEqual((item['state'], item['deps'], item['claim']), ('later', [1], None))
+        self.assertIsNone(self.board.guard)
+
+    def test_add_later_unknown_creation_retains_guard_and_refuses_repeat(self):
+        original = self.board.add
+        def lost(*args, **kwargs):
+            original(*args, **kwargs)
+            raise RuntimeError('creation response lost')
+        with mock.patch.object(self.board, 'add', side_effect=lost), mock.patch.object(taskq, 'dispatch') as dispatch:
+            with self.assertRaises(RuntimeError): self.add('parked', '--later')
+            with self.assertRaises(SystemExit): self.add('parked', '--later')
+        dispatch.assert_not_called()
+        self.assertEqual(len(self.board.issues), 1)
+        self.assertEqual(self.task(1)['state'], 'later')
+        self.assertIsNotNone(self.board.guard)
+
+    def test_add_later_settled_refusal_cannot_dispatch(self):
+        with mock.patch.object(taskq, 'cmd_add', side_effect=taskq.SettledError('refused', [1])), \
+                mock.patch.object(taskq, 'dispatch') as dispatch:
+            with self.assertRaises(taskq.SettledError): self.add('parked', '--later')
+        dispatch.assert_not_called()
+        self.assertFalse(self.board.issues)
 
     def test_add_ready_or_waiting(self):
         self.assertEqual(self.add('one', '--runtime', 'claude', '--priority', '1'), '#1 ready\n')
@@ -855,7 +1344,7 @@ class ShellBriefs(Base):
                 self.assertNotIn(' && ', prompt)
             sender = self.run_cli('arm', 'tick', 'PM')
             self.assertIn('while ($true)', sender)
-            self.assertIn("ack --stdin --pm 'PM'", sender)
+            self.assertNotIn("ack --stdin", sender)
             self.assertIn('if ($LASTEXITCODE -ne 0) { break }', sender)
             self.assertIn('A failed wait, a failed send or no such send tool: stop', sender)
 
@@ -893,7 +1382,7 @@ class ShellBriefs(Base):
             self.assertEqual(run.stdout.strip(), 'fetch origin')
 
     @unittest.skipUnless(os.name == 'nt', 'native PowerShell boundary')
-    def test_native_sender_stops_on_failed_wait_send_or_ack(self):
+    def test_native_sender_stops_on_failed_wait_or_send_without_ack(self):
         queue, codex, calls = (self.root / name for name in ("queue's stub.py", "codex's stub.py", 'calls'))
         events = ['review #1 [event 1:1] "two words" \\"quoted path" Привет',
                   'review #2 [event 2:1] owner\'s $value; C:\\path with space\\']
@@ -909,8 +1398,9 @@ class ShellBriefs(Base):
                 mock.patch.object(taskq, 'native_command', side_effect=receiver):
             prompt = self.run_cli('arm', 'tick', "PM's literal")
         loop = prompt.split('No agent needed: `', 1)[1].split('` in a terminal', 1)[0]
-        for fail_at, expected in (('wait', ['wait']), ('send', ['wait', 'send']), ('ack', ['wait', 'send', 'ack']),
-                                  ('third-wait', ['wait', 'send', 'ack', 'wait', 'send', 'ack', 'wait'])):
+        self.assertNotIn('ack --stdin', loop)
+        for fail_at, expected in (('wait', ['wait']), ('send', ['wait', 'send']),
+                                  ('third-wait', ['wait', 'send', 'wait', 'send', 'wait'])):
             with self.subTest(fail_at=fail_at):
                 calls.write_text('', 'utf-8')
                 queue.write_text('import sys\nfrom pathlib import Path\n'
@@ -932,7 +1422,9 @@ class ShellBriefs(Base):
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertEqual(run.stderr, '')
                 self.assertEqual(run.stdout.strip(), 'taskq sender stopped')
-                self.assertEqual(calls.read_text('utf-8').splitlines(), expected)
+                observed = calls.read_text('utf-8').splitlines()
+                self.assertEqual(observed, expected)
+                self.assertNotIn('ack', observed)
 
     @unittest.skipUnless(os.name == 'nt', 'native PowerShell boundary')
     def test_native_manager_preserves_compact_configuration_argv(self):
@@ -1207,6 +1699,134 @@ class TickSetup(Base):
 
     def notes(self, n):
         return [text.split(' ·')[0] for text in self.board.issues[n]['comments']]
+
+
+class RecoveryTimeout(TickSetup):
+    def prepare(self):
+        self.add(); self.legacy(1)
+        self.board.issues[1]['updated_at'] = '2026-10-08T00:00:00Z'
+        return self.task(1)
+
+    def diagnose(self, item, state='unknown', minutes=10):
+        observer = mock.Mock()
+        observer.observe.return_value = {'state': state}
+        with contextlib.redirect_stdout(io.StringIO()):
+            return taskq.recovery_question(item, {'fake': observer}, 'mac', minutes)
+
+    def test_single_question_preserves_role_order_and_pending_history(self):
+        item = self.prepare()
+        original = item['claim'].copy()
+        events = item['raw']['events'][:]
+        self.assertTrue(self.diagnose(item))
+        first = self.task(1)
+        self.assertEqual(first['state'], 'ask')
+        self.assertEqual(first['claim'], original)
+        self.assertEqual(first['raw'].get('order'), item['raw'].get('order'))
+        self.assertEqual(first['raw']['events'][:len(events)], events)
+        self.assertEqual(sum(k.startswith('recovery:') for k in first['raw']['retry_counts']), 1)
+        before = json.dumps(self.board.issues, sort_keys=True)
+        self.assertTrue(self.diagnose(first))
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+
+    def test_native_recovery_plan_is_read_only_and_unsupported(self):
+        self.prepare()
+        before = json.dumps(self.board.issues, sort_keys=True)
+        plan = json.loads(self.run_cli('recovery-plan', '1', '--role', 'worker', '--json'))
+        self.assertEqual(plan['automatic_actions'], [])
+        self.assertEqual(plan['state'], 'unsupported')
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        self.assertIsNone(self.board.guard)
+
+    def test_known_role_or_short_timeout_does_not_write(self):
+        item = self.prepare()
+        before = json.dumps(self.board.issues, sort_keys=True)
+        self.assertFalse(self.diagnose(item, 'idle'))
+        self.assertTrue(self.diagnose(item, minutes=2000))
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+
+    def test_fresh_payload_is_preserved(self):
+        item = self.prepare()
+        raw = self.task(1)['raw']; raw['pending_extension'] = {'answer': 'keep'}
+        self.board.issues[1]['body'] = taskq.block('goal', raw)
+        self.assertTrue(self.diagnose(item))
+        self.assertEqual(self.task(1)['raw']['pending_extension'], {'answer': 'keep'})
+
+    def test_fresh_result_or_activity_prevents_timeout_question(self):
+        for settled in (True, False):
+            item = self.prepare()
+            if settled:
+                raw = self.task(1)['raw']; raw['result'] = 'settled'
+                self.board.issues[1]['body'] = taskq.block('goal', raw)
+            else:
+                self.board.issues[1]['updated_at'] = '2026-10-09T00:00:00Z'
+            before = json.dumps(self.board.issues, sort_keys=True)
+            self.assertTrue(self.diagnose(item))
+            self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+            self.board.issues.clear()
+
+    def test_runtime_without_observe_uses_known_state(self):
+        item = self.prepare()
+        before = json.dumps(self.board.issues, sort_keys=True)
+        self.assertFalse(taskq.recovery_question(item, {'fake': self.fake}, 'mac', 30))
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+
+    def test_runtime_becomes_known_during_fresh_read(self):
+        item = self.prepare()
+        observer = mock.Mock()
+        observer.observe.side_effect = [{'state': 'unknown'}, {'state': 'idle'}]
+        before = json.dumps(self.board.issues, sort_keys=True)
+        self.assertTrue(taskq.recovery_question(item, {'fake': observer}, 'mac', 30))
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+
+    def test_unknown_slot_preserved_independent_task_uses_free_slot(self):
+        item = self.prepare()
+        self.fake.sessions[item['claim']['session']] = None
+        taskq.CONFIG['limits'] = {'fake': 2}
+        with mock.patch.object(taskq, 'dispatch'):
+            self.add('independent')
+        self.run_cli('tick', '--unknown-after')
+        self.assertEqual(self.task(1)['state'], 'ask')
+        self.assertEqual(self.task(1)['claim'], item['claim'])
+        self.assertEqual(self.task(2)['state'], 'doing')
+        self.assertEqual(self.fake.sent, [])
+
+    def test_unknown_slot_blocks_admission_at_capacity(self):
+        item = self.prepare()
+        self.fake.sessions[item['claim']['session']] = None
+        with mock.patch.object(taskq, 'dispatch'):
+            self.add('independent')
+        self.run_cli('tick', '--unknown-after', '30')
+        self.assertEqual(self.task(2)['state'], 'ready')
+        self.assertEqual(self.task(1)['claim'], item['claim'])
+
+    def test_pending_answer_survives_unknown_then_delivers_once_when_idle(self):
+        item = self.prepare()
+        claim = item['claim']
+        with mock.patch.object(taskq, 'dispatch'):
+            self.run_cli('ask', '1', '--text', 'question')
+            self.run_cli('answer', '1', '--text', 'preserved answer')
+        target = taskq.recipient('worker', claim)
+        self.fake.sessions[claim['session']] = None
+        with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
+            taskq.follow(self.task(1), self.fake, claim, False)
+        self.assertEqual(self.fake.sent, [])
+        self.assertTrue(taskq.event_pending(self.task(1)['raw'], target))
+        self.fake.sessions[claim['session']] = 'idle'
+        self.board.issues[1]['updated_at'] = '2026-10-09T00:00:00Z'
+        with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
+            taskq.follow(self.task(1), self.fake, claim, False)
+            taskq.follow(self.task(1), self.fake, claim, False)
+        self.assertEqual(self.fake.sent, [(claim['session'], 'The owner answered your question:\n\npreserved answer')])
+        self.assertEqual(taskq.event_pending(self.task(1)['raw'], target), [])
+        self.assertEqual(self.task(1)['claim'], claim)
+
+    def test_identity_changed_no_question_or_takeover(self):
+        item = self.prepare()
+        raw = self.task(1)['raw']; raw['claim']['session'] = 'new-owner'
+        self.board.issues[1]['body'] = taskq.block('goal', raw)
+        before = json.dumps(self.board.issues, sort_keys=True)
+        self.assertTrue(self.diagnose(item))
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
 
 
 class Tick(TickSetup):
@@ -1669,7 +2289,7 @@ class Tick(TickSetup):
         self.assertNotIn('spawn', self.run_cli('tick'))
 
     def restricted(self, people, **fields):
-        n = self.board.add('restricted', taskq.block('g', {'event_schema': 1, 'deps': [], 'pm': taskq.origin(), **fields}),
+        n = self.board.add('restricted', taskq.block('g', {'event_schema': taskq.EVENT_SCHEMA, 'deps': [], 'pm': taskq.origin(), **fields}),
                            ['q-ready', 'assignee-only'])
         self.board.issues[n]['assignees'] = people
         return n
@@ -2903,13 +3523,13 @@ class Wait(TickSetup):
         if os.name == 'nt':
             self.assertIn(taskq.native_command(['codex', 'exec', *taskq.codex_options(), 'resume', 'T1', '-']), sender)
             self.assertIn('while ($true)', sender)
-            self.assertIn("ack --stdin --pm 'T1'", sender)
+            self.assertNotIn("ack --stdin", sender)
             self.assertIn('if ($LASTEXITCODE -ne 0) { break }', sender)
         else:
             self.assertIn('resume T1 "<its output>"', sender)
             self.assertIn('codex exec -s danger-full-access resume T1', sender)
-            self.assertIn('resume T1 "$e" && printf', sender)
-            self.assertIn('ack --stdin --pm T1; do :; done;', sender)
+            self.assertIn('resume T1 "$e"; do :; done;', sender)
+            self.assertNotIn('ack --stdin', sender)
         self.assertNotIn('send_message_to_thread', sender)
         self.assertIn('in the foreground', self_arm)
         self.assertIn('Optional, only to be woken between turns: `', self_arm)
@@ -3117,7 +3737,7 @@ class EventDelivery(Base):
                 self.run_cli('answer', '1', '--text', 'cannot erase')
         self.assertEqual(self.board.get(1)['body'], before)
         self.assertIsNone(self.board.guard)
-        self.board.issues[1]['body'] = taskq.block('g', {**self.task(1)['raw'], 'event_schema': 2})
+        self.board.issues[1]['body'] = taskq.block('g', {**self.task(1)['raw'], 'event_schema': 4})
         with self.assertRaisesRegex(SystemExit, 'unsupported event_schema'):
             self.run_cli('wait', '--window', '0')
 
@@ -3132,7 +3752,9 @@ class EventDelivery(Base):
             self.assertEqual(self.run_cli('wait', '--window', '0'), 'tick\n')
             with self.assertRaisesRegex(SystemExit, 'recorded recipient'):
                 self.run_cli('ack', event['id'])
-            self.run_cli('ack', event['id'], '--pm', SESSION)  # explicit sender delegation
+            with self.assertRaisesRegex(SystemExit,'sender acknowledgement refused'):
+                self.run_cli('ack', event['id'], '--pm', SESSION)
+        self.run_cli('ack',event['id'])  # only the genuine recorded recipient handles it
         self.assertEqual(self.run_cli('wait', '--window', '0'), 'tick\n')
 
     def test_adoption_resolves_wildcard_and_replacements_cancel_obsolete_recipients(self):
@@ -3472,16 +4094,18 @@ class MultiPM(Base):
         with self.pm(env):
             prompt = self.run_cli('arm', 'tick', target)
             pm = re.search(r'wait --pm (\S+)`', prompt)[1]
-            return self.wait_and_ack( '--pm', pm)
+            out=self.run_cli('wait','--pm',pm,'--window','0')
+            return re.sub(r' \[event \d+:\d+\]', '', out)
 
     def test_agent_sender_delivers_its_managers_outcome_once(self):
-        # a separate Claude sender session serves pmA-codex: it gets A's ask once; A's own wait shares the receipt; B keeps its own
+        # Sender delivery does not consume A's event; only genuine A handling does, while B remains pending.
         self.senders_setup()
         sender = {'CLAUDE_CODE_SESSION_ID': 'sender-claude', 'TASKQ_RUNTIME': 'claude'}
         self.assertEqual(self.sender_wait(sender, 'pmA-codex'), 'ask #1\n')
-        self.assertEqual(self.sender_wait(sender, 'pmA-codex'), 'tick\n')
+        self.assertEqual(self.sender_wait(sender, 'pmA-codex'), 'ask #1\n')
         with self.pm(self.A):
-            self.assertEqual(self.wait_and_ack(), 'tick\n')  # same receipt file: never twice
+            self.assertEqual(self.wait_and_ack(), 'ask #1\n')
+        self.assertEqual(self.sender_wait(sender, 'pmA-codex'), 'tick\n')
         with self.pm(self.B):
             self.assertEqual(self.wait_and_ack(), 'ask #2\n')  # never consumed by A's sender
         self.assertFalse((self.root / '.taskq' / 'wait-sender-claude.json').exists())
@@ -3491,7 +4115,8 @@ class MultiPM(Base):
         self.senders_setup()
         self.assertEqual(self.sender_wait({}, 'https://claude.ai/code/session_pmB-claude'), 'ask #2\n')
         with self.pm(self.B):
-            self.assertEqual(self.wait_and_ack(), 'tick\n')
+            self.assertEqual(self.wait_and_ack(), 'ask #2\n')
+        self.assertEqual(self.sender_wait({}, 'https://claude.ai/code/session_pmB-claude'), 'tick\n')
         with self.pm(self.A):
             self.assertEqual(self.wait_and_ack(), 'ask #1\n')
         self.assertFalse((self.root / '.taskq' / 'wait.json').exists())
@@ -3911,14 +4536,14 @@ class Contract(Base):
         original = json.loads(json.dumps(issue))
         # Migration orchestration is tested independently of the event helper's own legacy conversion cases.
         def initialize(source):
-            return dict(taskq.parse(source)['raw'], event_schema=1)
+            return dict(taskq.parse(source)['raw'], event_schema=taskq.EVENT_SCHEMA)
         with mock.patch.object(taskq, 'initialize_events', side_effect=initialize, create=True), \
                 mock.patch.object(taskq, 'event_labels', side_effect=lambda raw, labels: labels, create=True):
             self.assertIn('1 task(s) would migrate', self.run_cli('migrate'))
             self.assertEqual(issue, original)
             with self.assertRaisesRegex(SystemExit, 'controllers-stopped'):
                 self.run_cli('migrate', '--apply')
-            with self.assertRaisesRegex(SystemExit, 'legacy event_schema'):
+            with self.assertRaisesRegex(SystemExit, 'taskq repair'):
                 self.run_cli('later', '1')
             self.assertIn('#1', self.run_cli('list'))
             self.assertEqual(issue, original)
@@ -3927,7 +4552,7 @@ class Contract(Base):
                 updated.assert_called_once()
             self.assertIsNone(self.board.guard)
             migrated = json.loads(json.dumps(issue))
-            self.assertEqual(self.task(1)['raw'], dict(raw, event_schema=1))
+            self.assertEqual(self.task(1)['raw'], dict(raw, event_schema=taskq.EVENT_SCHEMA))
             self.assertTrue(issue['body'].startswith(original_text))
             self.assertTrue(issue['body'].endswith(suffix))
             for key in ('comments', 'labels', 'state'):
@@ -3936,13 +4561,98 @@ class Contract(Base):
             self.assertEqual(issue, migrated)
             self.add('second')
             issue['body'] = taskq.block('legacy', raw)
-            self.board.issues[2]['body'] = taskq.block('future', dict(raw, event_schema=2))
+            self.board.issues[2]['body'] = taskq.block('future', dict(raw, event_schema=4))
             before = json.dumps(self.board.issues, sort_keys=True)
             with self.assertRaisesRegex(SystemExit, 'unsupported event_schema'):
                 self.run_cli('migrate', '--apply', '--controllers-stopped')
             self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
             self.assertIsNone(self.board.guard)
 
+
+
+class SchemaRepair(Base):
+    def legacy(self):
+        self.add()
+        issue = self.board.issues[1]
+        raw = dict(self.task(1)['raw'], unknown={'keep': [1,2]})
+        raw.pop('event_schema', None)
+        raw.pop('events', None);raw.pop('event_seq', None);raw.pop('retry_counts', None)
+        issue['body'] = taskq.block('preserved human text', raw)
+        issue['comments'] = ['preserved history']
+        return issue, raw
+
+    def test_preview_consent_verified_apply_and_repeat(self):
+        issue, raw = self.legacy()
+        before = json.loads(json.dumps(issue))
+        self.assertIn('require repair', self.run_cli('repair'))
+        self.assertEqual(issue, before)
+        with self.assertRaisesRegex(SystemExit, '--yes'):self.run_cli('repair','--apply')
+        self.run_cli('repair','--apply','--yes')
+        repaired = self.task(1)['raw']
+        for key,value in raw.items():self.assertEqual(repaired[key],value)
+        self.assertEqual(repaired['event_schema'],taskq.EVENT_SCHEMA)
+        self.assertEqual(issue['comments'],before['comments'])
+        settled = json.loads(json.dumps(issue))
+        self.assertIn('0 task(s)',self.run_cli('repair','--apply','--yes'))
+        self.assertEqual(issue,settled);self.assertIsNone(self.board.guard)
+
+    def test_unknown_owner_and_unsupported_transition_refuse_before_writes(self):
+        issue, raw = self.legacy()
+        for changed in (dict(raw,claim={'session':'unknown'}),dict(raw,event_schema=2)):
+            issue['body']=taskq.block('preserved',changed)
+            before=json.loads(json.dumps(issue))
+            with mock.patch.object(self.board,'update',side_effect=AssertionError('unexpected repair write')):
+                with self.assertRaises(SystemExit):self.run_cli('repair','--apply','--yes')
+            self.assertEqual(issue,before);self.assertIsNone(self.board.guard)
+
+    def test_mixed_board_blocks_unrelated_task_and_partial_repair_resumes(self):
+        issue, raw = self.legacy()
+        self.board.add('current task',taskq.block('current',taskq.initialize_events(issue)),['q-ready'])
+        before=json.loads(json.dumps(self.board.issues))
+        with mock.patch.object(self.board,'update',side_effect=AssertionError('mutation before repair')):
+            with self.assertRaisesRegex(SystemExit,'taskq repair'):self.run_cli('later','2')
+        self.assertEqual(json.loads(json.dumps(self.board.issues)),before)
+        update=self.board.update
+        def lost(n,**kwargs):update(n,**kwargs);raise RuntimeError('lost response')
+        with mock.patch.object(self.board,'update',side_effect=lost):
+            with self.assertRaisesRegex(RuntimeError,'lost response'):self.run_cli('repair','--apply','--yes')
+        self.assertIsNotNone(self.board.guard)
+        # Fixture operator reconciles its own completed write/guard, never production unlock.
+        self.assertEqual(self.task(1)['raw']['event_schema'],taskq.EVENT_SCHEMA)
+        self.board.release(self.board.guard)
+        settled=json.loads(json.dumps(self.board.issues))
+        with mock.patch.object(self.board,'update',side_effect=AssertionError('duplicate repaired write')):
+            self.assertIn('0 task(s)',self.run_cli('repair','--apply','--yes'))
+        self.assertEqual(json.loads(json.dumps(self.board.issues)),settled)
+
+    def test_conflicting_stamp_and_closed_snapshot_are_preserved(self):
+        issue,raw=self.legacy()
+        raw['schema_repair']={'private':'preserve'}
+        issue['body']=taskq.block('text',raw)
+        before=json.loads(json.dumps(issue))
+        with self.assertRaisesRegex(SystemExit,'conflicting repair receipt'):self.run_cli('repair','--apply','--yes')
+        self.assertEqual(issue,before)
+        raw.pop('schema_repair');issue['body']=taskq.block('text',raw)
+        get=self.board.get
+        with mock.patch.object(self.board,'get',side_effect=lambda n:{**get(n),'state':'closed'}):
+            with self.assertRaisesRegex(SystemExit,'task changed'):self.run_cli('repair','--apply','--yes')
+        self.assertEqual(self.task(1)['raw'],raw)
+
+    def test_prewrite_source_change_is_never_overwritten(self):
+        issue,raw=self.legacy()
+        def concurrent():issue['body']=taskq.block('newer human text',dict(raw,new_answer='retain'))
+        with mock.patch.object(self.board,'ensure_event_label',side_effect=concurrent),mock.patch.object(self.board,'update',side_effect=AssertionError('overwrite')):
+            with self.assertRaisesRegex(SystemExit,'source changed'):self.run_cli('repair','--apply','--yes')
+        self.assertEqual(self.task(1)['raw']['new_answer'],'retain')
+        self.assertEqual(self.task(1)['raw'].get('event_schema',0),0)
+
+    def test_experimental_schema_cannot_use_ordinary_or_explicit_mutation_routes(self):
+        issue,raw=self.legacy();raw['event_schema']=2;issue['body']=taskq.block('old fixture',raw)
+        before=json.loads(json.dumps(issue))
+        for args in (('later','1'),('ack','1:1'),('apply-event','1:1','--artifact','x.txt')):
+            with self.subTest(args=args),mock.patch.object(self.board,'update',side_effect=AssertionError('schema2 write')):
+                with self.assertRaisesRegex(SystemExit,'taskq repair'):self.run_cli(*args)
+        self.assertEqual(issue,before)
 
 
 class Cleanup(Base):
@@ -4107,7 +4817,7 @@ class Model(Base):
 
     def test_block_keeps_unknown_keys(self):
         board = taskq.BOARD = FakeBoard()
-        n = board.add('t', taskq.block('text', {'event_schema': 1, 'scope': [], 'deps': [], 'claim': None, 'result': None, 'extra': {'x': 1}}),
+        n = board.add('t', taskq.block('text', {'event_schema': taskq.EVENT_SCHEMA, 'scope': [], 'deps': [], 'claim': None, 'result': None, 'extra': {'x': 1}}),
                       ['q-later'])
         with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'none'}), contextlib.redirect_stdout(io.StringIO()), \
                 mock.patch.object(taskq, 'runtimes', return_value={}):
@@ -4128,7 +4838,7 @@ class Model(Base):
         for board, tool, key in ((taskq.GitHub('o/r'), 'gh', 'login'),
                                   (taskq.GitLab('o/r', 'gitlab.example'), 'glab', 'username')):
             with self.subTest(board=tool):
-                native = {'title': 'T', 'body': taskq.block('g', {'event_schema': 1}), 'description': taskq.block('g', {'event_schema': 1}),
+                native = {'title': 'T', 'body': taskq.block('g', {'event_schema': taskq.EVENT_SCHEMA}), 'description': taskq.block('g', {'event_schema': taskq.EVENT_SCHEMA}),
                           'number': 1, 'iid': 1, 'html_url': 'u', 'web_url': 'u', 'updated_at': 'now',
                           'author_association': 'OWNER', 'assignees': [{key: 'alice'}, {key: 'bob'}],
                           'labels': [{'name': 'q-ready'}, {'name': 'assignee-only'}] if tool == 'gh'
@@ -4302,7 +5012,7 @@ class RealChild(unittest.TestCase):
     def test_two_checkouts_share_board_guard_and_one_slot(self):
         with tempfile.TemporaryDirectory() as folder:
             shared = Path(folder)
-            issues = {str(n): {'iid': n, 'title': f'task {n}', 'body': taskq.block('g', {'event_schema': 1, 'deps': [],
+            issues = {str(n): {'iid': n, 'title': f'task {n}', 'body': taskq.block('g', {'event_schema': taskq.EVENT_SCHEMA, 'deps': [],
                         'pm': {'runtime': 'fake', 'session': 'pm', 'name': 'fixture'}}),
                         'labels': ['q-ready'], 'state': 'open', 'listed': True, 'comments': [],
                         'updated_at': '2026-10-09T00:00:00Z', 'url': ''} for n in (1, 2)}
@@ -4353,7 +5063,7 @@ class RealChild(unittest.TestCase):
             (root / 'taskq.py').write_text((ROOT / 'taskq.py').read_text('utf-8'), encoding='utf-8')
             (root / 'board.py').write_text(FILE_BOARD, encoding='utf-8')
             (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'update': False, 'board_url': 'https://board'}))
-            issue = {'iid': 1, 'title': 'Привет 🌍', 'body': taskq.block('g', {'event_schema': 1, 'deps': []}), 'labels': ['q-ready'],
+            issue = {'iid': 1, 'title': 'Привет 🌍', 'body': taskq.block('g', {'event_schema': taskq.EVENT_SCHEMA, 'deps': []}), 'labels': ['q-ready'],
                      'state': 'open', 'listed': True, 'comments': [], 'updated_at': '2026-10-09T00:00:00Z', 'url': ''}
             (root / 'issues.json').write_text(json.dumps({'1': issue}))
             env = {'PATH': '', 'HOME': str(root), 'TASKQ_HOST': 'win',
@@ -4391,7 +5101,7 @@ def link(session): return None
             issues = {}
             for n, labels in enumerate((['host-win'], ['host-win'], ['host-win'], [], ['host-mac'],
                                        ['host-win', 'run-fake'], ['host-win', 'host-mac']), 1):
-                issues[str(n)] = {'iid': n, 'title': f'T{n}', 'body': taskq.block('g', {'event_schema': 1, 'deps': [], 'pm':
+                issues[str(n)] = {'iid': n, 'title': f'T{n}', 'body': taskq.block('g', {'event_schema': taskq.EVENT_SCHEMA, 'deps': [], 'pm':
                                  {'runtime': 'fake', 'session': SESSION, 'name': 'win'}}), 'labels': ['q-ready', 'priority-2', *labels],
                                  'state': 'open', 'listed': True, 'comments': [],
                                  'updated_at': '2026-10-09T00:00:00Z', 'url': ''}
@@ -4439,7 +5149,7 @@ def link(session): return None
     def test_assignee_only_cli_board_runtime_boundary(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            (root / 'taskq.py').write_text((ROOT / 'taskq.py').read_text())  # no real clone refresh
+            (root / 'taskq.py').write_text((ROOT / 'taskq.py').read_text(encoding='utf-8'), encoding='utf-8')  # no real clone refresh
             (root / 'board.py').write_text(FILE_BOARD + "\ndef user(): return pathlib.Path(__file__).with_name('identity').read_text()\n")
             (root / 'fake.py').write_text(FILE_RUNTIME)
             (root / 'taskq.json').write_text(json.dumps({'board': 'board.py', 'runtimes': {'fake': 'fake.py'},
@@ -4452,7 +5162,7 @@ def link(session): return None
                     with self.subTest(boundary=boundary, people=people, identity=identity):
                         (root / 'identity').write_text(identity)
                         (root / 'spawned').unlink(missing_ok=True)
-                        issue = {'iid': 1, 'title': 'T', 'body': taskq.block('g', {'event_schema': 1, 'deps': [], 'pm':
+                        issue = {'iid': 1, 'title': 'T', 'body': taskq.block('g', {'event_schema': taskq.EVENT_SCHEMA, 'deps': [], 'pm':
                                  {'runtime': 'fake', 'session': SESSION, 'name': 'mac'}}), 'labels': ['q-ready', 'assignee-only'],
                                  'assignees': people, 'state': 'open', 'listed': True, 'comments': [],
                                  'updated_at': '2026-10-09T00:00:00Z', 'url': ''}
@@ -4950,7 +5660,7 @@ class HermesPilotLocal(unittest.TestCase):
         bare_before = REAL_RUN([git, '--git-dir', str(self.root / 'origin.git'), 'show-ref'], capture_output=True, text=True, timeout=20).stdout
         local = taskq.load_file('taskq.py', self.root)
         local.CONFIG, local.BOARD = config, local.make_board(config)
-        raw = {'event_schema': 1, 'claim': {'runtime': 'codex', 'session': 'fixture-worker', 'name': 'local-pilot'},
+        raw = {'event_schema': taskq.EVENT_SCHEMA, 'claim': {'runtime': 'codex', 'session': 'fixture-worker', 'name': 'local-pilot'},
                'supervisor': {'runtime': 'hermes', 'session': 'fixture-supervisor', 'name': 'local-pilot'},
                'pm': {'runtime': 'hermes', 'session': 'fixture-manager', 'name': 'local-pilot'},
                'result': {'sha': seed, 'checks': 'local research answer'}}

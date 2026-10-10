@@ -1,5 +1,10 @@
 # Single-file taskq
 
+Historical design record for #290, not the current runtime/command contract. Later owner
+decisions in [taskq.md](../taskq.md) supersede the planned removals and line targets below.
+Current schema1 model-worker execution and experimental schema2 bounded artifacts are distinct;
+no supported migration or app drain is implied by this historical runtime description.
+
 Design of the rewrite: one file `taskq.py`, stdlib only, python3 >= 3.9. No pipx, no package, no `tomllib`:
 the config is `taskq.json` beside the file. Target ~500 lines of Python, a ~250-line contract `taskq.md`
 and ~150 lines of tests.

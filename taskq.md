@@ -1420,6 +1420,18 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 - Codex on macOS with an explicit `workspace-write` override: that sandbox denies the GPU, so Metal apps
   (Blender) exit 139 (#157). Run such a task with `--runtime claude`.
 
+### Tight onboarding design/mock scope (#538; not activated)
+
+Owner approval in [6093477377](https://github.com/alexkirs/taskq/issues/538#issuecomment-6093477377),
+restored by [6101797775](https://github.com/alexkirs/taskq/issues/538#issuecomment-6101797775),
+authorizes portable design/mock preparation only. The proposed R1/R3/R4/R8 changes and
+qualification matrix are in [docs/tight-onboarding.md](docs/tight-onboarding.md).
+They do not change the operational assignee policy, PM authority or runtime admission.
+`experiments/assignment_model.py` is an isolated selection model, never imported by TaskQ.
+Registration, credentials, external activation, permission changes and live Hermes launch
+are not authorized by this slice. Linux qualification is a separate explicit prerequisite;
+existing runtime/model/effort/security defaults remain unchanged.
+
 ### Native Hermes admission (local candidate)
 
 `TASKQ_RUNTIME=hermes` requires a nonempty `HERMES_SESSION_ID` supplied by the genuine Hermes runtime/bridge;

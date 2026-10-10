@@ -59,6 +59,8 @@ Native Codex commands preserve every argument through the running Python's subpr
 PowerShell 5.1's native argument parser must not strip quotes from owner options or the compact prompt.
 The native sender delivers event text through UTF-8 stdin (`exec resume <id> -`), then acknowledges only
 after successful delivery. Failed wait, delivery or acknowledgement stops the sender.
+The native queue command captures PowerShell arguments before invoking Python, preserving quoted,
+multiline, Unicode and empty values for result/ask/answer text and options without extra escaping.
 
 - Owner: decides product questions, answers `ask`.
 - Manager: the session the owner talks to; takes requests, sets priority, files tasks, runs the tick, relays the

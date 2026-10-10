@@ -804,7 +804,7 @@ class ShellBriefs(Base):
                     if native:
                         self.assertIn('shell="powershell.exe", login=false and native Windows paths', prompt)
                         self.assertIn("$env:TASKQ_TASK='1'; $env:TASKQ_RUNTIME='codex';", prompt)
-                        self.assertIn(f'Queue tool: `& {taskq.shell_quote(interpreter, True)} {taskq.shell_quote(script, True)}`', prompt)
+                        self.assertIn(f'Queue tool: `{taskq.queue_tool(runtime)}`', prompt)
                         self.assertNotIn('export TASKQ_', prompt)
                         self.assertNotIn('python3 ', prompt)
                         self.assertNotIn(' && ', prompt)
@@ -839,19 +839,20 @@ class ShellBriefs(Base):
         self.add()
         folder = self.root / "queue's clone with spaces"
         folder.mkdir()
-        script, interpreter = folder / 'taskq.py', folder / "Python's launcher.ps1"
-        interpreter.write_text('@{task=$env:TASKQ_TASK; runtime=$env:TASKQ_RUNTIME; argv=@($args | ForEach-Object { [string]$_ })} '
-                               '| ConvertTo-Json -Compress\n', 'utf-8')
-        with mock.patch.object(taskq.sys, 'executable', str(interpreter)), mock.patch.object(taskq, '__file__', str(script)):
+        script = folder / 'taskq.py'
+        script.write_text('import json,os,sys\nprint(json.dumps(dict(task=os.environ.get("TASKQ_TASK"), '
+                          'runtime=os.environ.get("TASKQ_RUNTIME"), argv=sys.argv)))\n', 'utf-8')
+        payload = 'worker\'s "two words" $value; & text\nПривет \\"quoted" C:\\trailing slash\\'
+        with mock.patch.object(taskq, '__file__', str(script)):
             prompts = self.prompts('codex')
         for prompt in prompts:
             prefix = re.search(r'Start every shell command with `([^`]+)`', prompt)[1]
             command = re.search(r'Queue tool: `([^`]+)`', prompt)[1]
-            run = self.run_powershell(prefix + ' ' + command + " result 1 --text 'worker''s literal $value; & text'")
+            run = self.run_powershell(prefix + ' ' + command + ' result 1 --text ' + taskq.shell_quote(payload, True) + " --option ''")
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertTrue(run.stdout.strip(), run.stderr)
             self.assertEqual(json.loads(run.stdout), {'task': '1', 'runtime': 'codex',
-                             'argv': [str(script), 'result', '1', '--text', "worker's literal $value; & text"]})
+                             'argv': [str(script), 'result', '1', '--text', payload, '--option', '']})
 
     @unittest.skipUnless(os.name == 'nt', 'native PowerShell boundary')
     def test_native_worker_git_sequences_stop_on_failure(self):
@@ -873,8 +874,8 @@ class ShellBriefs(Base):
                   'review #2 [event 2:1] owner\'s $value; C:\\path with space\\']
         options = ['-c', 'test=["two words", "C:\\\\path\\\\", "%PATH%", "Привет"]']
         launch = taskq.native_command
-        def receiver(arguments):
-            return launch([sys.executable, str(codex), *arguments[1:]])
+        def receiver(arguments, capture=False):
+            return launch(arguments, capture=True) if capture else launch([sys.executable, str(codex), *arguments[1:]])
         with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex'}), \
                 mock.patch.object(taskq, '__file__', str(queue)), mock.patch.object(taskq, 'rollout', return_value='local'), \
                 mock.patch.object(taskq.shutil, 'which', return_value='codex.exe'), \
@@ -915,7 +916,8 @@ class ShellBriefs(Base):
         launch = taskq.native_command
         with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex'}), \
                 mock.patch.object(taskq.shutil, 'which', return_value='codex.exe'), \
-                mock.patch.object(taskq, 'native_command', side_effect=lambda args: launch([sys.executable, str(receiver), *args[1:]])):
+                mock.patch.object(taskq, 'native_command', side_effect=lambda args, capture=False:
+                                  launch(args, capture=True) if capture else launch([sys.executable, str(receiver), *args[1:]])):
             prompt = self.run_cli('arm', 'tick')
         command = re.search(r'Codex manager: start it with `([^`]+)`', prompt)[1]
         run = self.run_powershell(command)

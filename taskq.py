@@ -1643,13 +1643,20 @@ def shell_quote(value, native=False):
 
 def queue_tool(runtime):
     script = Path(__file__).resolve()
-    return f'& {shell_quote(sys.executable, True)} {shell_quote(script, True)}' if powershell(runtime) else f'python3 {script}'
+    return native_command([sys.executable, str(script)], capture=True) if powershell(runtime) else f'python3 {script}'
 
-def native_command(arguments):
+def native_command(arguments, capture=False):
     """PS 5.1 reparses native argv. Pass a quote-free program to Python; it preserves argv and inherited stdio."""
     encoded = json.dumps(arguments, ensure_ascii=True).encode('utf-8').hex()
-    program = f"import json,subprocess,sys;sys.exit(subprocess.call(json.loads(bytes.fromhex('{encoded}'))))"
-    return f'& {shell_quote(sys.executable, True)} -c {shell_quote(program, True)}'
+    extra = '+json.loads(base64.b64decode(sys.argv[1]))' if capture else ''
+    program = f"import base64,json,subprocess,sys;sys.exit(subprocess.call(json.loads(bytes.fromhex('{encoded}')){extra}))"
+    command = f'& {shell_quote(sys.executable, True)} -c {shell_quote(program, True)}'
+    if not capture:
+        return command
+    return ('& { $taskqArgs = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('
+            '(ConvertTo-Json -InputObject @($args | ForEach-Object { [string]$_ }) -Compress))); '
+            '[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
+            f'$input | {command} $taskqArgs; $global:LASTEXITCODE = $LASTEXITCODE }}')
 
 def shell_instructions(runtime, n=None):
     if powershell(runtime):

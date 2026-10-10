@@ -5994,4 +5994,4 @@ class TightAssignmentDesign(unittest.TestCase):
                 self.assertEqual(candidate.eligible(assignees, login, strict), expected)
 
     def test_candidate_is_not_imported_by_production(self):
-        self.assertNotIn('assignment_model', (ROOT / 'taskq.py').read_text())
+        self.assertNotIn('assignment_model', (ROOT / 'taskq.py').read_text(encoding='utf-8'))

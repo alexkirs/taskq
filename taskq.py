@@ -4887,8 +4887,81 @@ def rollout(thread):
     return next((kind for kind, pattern in (('local', f'sessions/*/*/*/{name}'), ('archived', f'archived_sessions/{name}'))
                  if next(home.glob(pattern), None)), None)
 
+def named_arm(args):
+    """Local activation handle; board authority and finite capacity remain native."""
+    import sqlite3
+    identity = session()
+    if not identity or not identity.get('session'):
+        fail('named ARM needs a genuine agent session')
+    name = args.name
+    if args.target:
+        fail('named ARM is not a PM delivery target')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', name or ''):
+        fail('ARM name requires 1..64 letters, digits, underscores or hyphens')
+    scope = sorted(set(args.scope_task or []))
+    if any(n <= 0 for n in scope):
+        fail('ARM scope requires positive task IDs')
+    folder = CONFIG['root'] / '.taskq'
+    folder.mkdir(exist_ok=True)
+    path = folder / 'arm-runtime.sqlite'
+    if path.is_symlink():
+        fail('ARM runtime path is a symlink; no changes')
+    key = json.dumps([CONFIG['repo'], machine(), name])
+    owner = recipient('arm', identity)
+    db = sqlite3.connect(path, timeout=0)
+    try:
+        if os.name != 'nt':
+            os.chmod(path, 0o600)
+        db.execute('CREATE TABLE IF NOT EXISTS activation (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT body FROM activation WHERE id=?', (key,)).fetchone()
+        state = json.loads(row[0]) if row else None
+        if state and state['owner'] != owner:
+            fail('named ARM belongs to another session; no changes')
+        operation = args.what
+        repeated = False
+        if operation == 'start':
+            if state and state['scope'] != scope:
+                fail('named ARM scope differs; use explicit update')
+            repeated = bool(state and state['enabled'])
+            state = state or {'owner': owner, 'scope': scope, 'revision': 0}
+            if not repeated:
+                state.update(enabled=True, revision=state['revision'] + 1)
+        elif not state:
+            fail('named ARM not started')
+        elif operation == 'update':
+            repeated = state['scope'] == scope
+            if not repeated:
+                state.update(scope=scope, revision=state['revision'] + 1)
+        elif operation == 'stop':
+            repeated = not state['enabled']
+            if not repeated:
+                state.update(enabled=False, revision=state['revision'] + 1)
+        elif operation == 'tick':
+            if not state['enabled']:
+                fail('named ARM stopped; no admissions')
+            if args.scope_task is not None:
+                fail('named ARM tick uses recorded scope; use update')
+            if release_reason():
+                fail(release_reason())
+            args.execution_scope = state['scope']
+            args.quiet, args.headless, args.tasks, args.after = True, True, [], None
+            args.after_birth, args.diagnose, args.unknown_after = None, False, None
+            event_pass(args)
+        db.execute('INSERT OR REPLACE INTO activation VALUES (?,?)', (key, json.dumps(state)))
+        db.commit()
+        return print(json.dumps({'type': 'taskq.arm', 'version': 1, 'name': name,
+                                 'host': machine(), 'operation': operation,
+                                 'repeated': repeated, 'activation': state}))
+    except sqlite3.OperationalError as error:
+        fail('named ARM runtime busy or unavailable; no new pass: ' + str(error))
+    finally:
+        db.close()
+
 def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
+    if getattr(args, 'name', None) is not None:
+        return named_arm(args)
     runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
     native = powershell(runtime)
     tq = queue_tool(runtime)
@@ -5010,8 +5083,8 @@ def main(argv=None):
     command('applied', cmd_applied, (('event',), {}), (('--artifact',), {'required': True}), (('--sha',), {'required': True}), n=False)
     command('apply-event', cmd_apply_event, (('event',), {}), (('--artifact',), {'required': True}), (('--role',), {'choices': ('worker', 'manager'), 'default': 'worker'}), n=False)
     command('ack', cmd_ack, (('events',), {'nargs': '*'}), (('--pm',), {}), (('--role',), {'choices': ('manager','supervisor')}), (('--stdin',), {'action': 'store_true'}), n=False)
-    command('arm', cmd_arm, (('what',), {'choices': ('tick',)}), (('target',), {'nargs': '?'}),
-            (('--execute',), {'action':'store_true'}), (('--scope-task',), {'type':int,'nargs':'+'}), n=False)
+    command('arm', cmd_arm, (('what',), {'choices': ('tick','start','update','status','stop')}), (('target',), {'nargs': '?'}),
+            (('--execute',), {'action':'store_true'}), (('--name',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), n=False)
     command('pm', cmd_pm, (('--adopt',), {'nargs': '+', 'type': int, 'default': []}),
             (('--subscribe',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), (('--delivery-ack',), {}), n=False)
     command('cleanup', cmd_cleanup, (('--dry-run',), {'action': 'store_true'}), n=False)
@@ -5026,11 +5099,17 @@ def main(argv=None):
     command('update', cmd_update, (('--commit',), {}), (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
             (('--qualification',), {}), (('--apply',), {'action': 'store_true'}), n=False)
     args = parser.parse_args(argv)
-    if args.command == 'arm' and args.scope_task and not args.execute:
+    if args.command == 'arm' and args.what != 'tick' and (args.name is None or args.target or args.execute):
+        fail('ARM lifecycle needs --name, without target or --execute')
+    if args.command == 'arm' and args.name is not None and args.what == 'tick' and not args.execute:
+        fail('named ARM tick requires --execute')
+    if args.command == 'arm' and args.what in ('status','stop') and args.scope_task:
+        fail('ARM status/stop cannot change scope')
+    if args.command == 'arm' and args.scope_task and not args.execute and args.name is None:
         fail('ARM execution scope requires --execute; subscription interests belong to PM')
     if args.command == 'pm' and args.scope_task and args.subscribe is None:
         fail('PM interest scope requires --subscribe; it is not ARM execution scope')
-    if args.command == 'arm' and args.execute:
+    if args.command == 'arm' and args.execute and args.name is None:
         if args.target or args.scope_task and any(n <= 0 for n in args.scope_task):
             fail('execution scope is not PM target; use positive task IDs')
         args.command = 'tick'

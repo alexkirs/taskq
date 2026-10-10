@@ -2,11 +2,27 @@
 
 ### #646 first executable slice: execution vs subscription
 
+Named ARM runtime handle: `taskq arm start --name NAME [--scope-task N ...]`
+records an enabled local activation; `update` changes its scope, `status` reads
+it, and `stop` disables future admissions without cancelling any worker. These
+commands do not install or launch a scheduler. An existing qualified scheduler
+may invoke `taskq arm tick --execute --name NAME`; a stopped or missing handle
+refuses execution. Repeating identical start/update/stop is idempotent. Start
+with conflicting scope refuses; explicit update is required. The handle belongs
+to its genuine runtime/session, project and host. It grants no board authority.
+Every pass still uses existing native dispatch authority, project guard and
+finite host/project capacities; activation names never multiply those budgets.
+One local transaction covers the named pass: concurrent pass/update/stop refuses
+busy, rather than claiming it stopped an in-flight pass. Once stop succeeds no
+subsequent named pass admits work. An interrupted transaction rolls back; actual
+task/launch effects remain subject to native board recovery. Different checkouts
+still coordinate through the native project guard, not this runtime handle.
+
 Candidate-only route: `taskq arm tick --execute [--scope-task N ...]` runs one
 existing headless guarded pass. It never opens a PM subscription, starts a timer
 or replaces an activation. It uses existing dispatch authority and shared finite
-capacity, not PM availability. The future named activation/stop interface is not
-implemented by this single-pass route.
+capacity, not PM availability. The named runtime handle below is separate from
+this unnamed single-pass route.
 
 `taskq pm --subscribe NAME [--scope-task N ...]` is a read-only board observer.
 It emits one typed initial snapshot, then changed task observations/native events.
@@ -25,8 +41,8 @@ observation time, not atomic provider snapshots. Unchanged polls emit no envelop
 At most 200 tasks are observed; overflow or read failure refuses without advancing
 a cursor. Pending delivery applies backpressure; no second poll overtakes it.
 
-Decision/version/commandID processing, snapshot+history guarantee, named ARM
-activation/stop and dot display integration remain subsequent approved slices;
+Decision/version/commandID processing, snapshot+history guarantee, scheduler
+activation integration and dot display integration remain subsequent approved slices;
 this receipt cache must not be mistaken for their implementation. Existing
 production schedulers and the older PM role route remain unchanged until rollout.
 

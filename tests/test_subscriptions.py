@@ -84,3 +84,54 @@ class Subscriptions(unittest.TestCase):
     def test_empty_subscription_name_is_not_legacy_role(self):
         with self.assertRaisesRegex(SystemExit,'subscription name requires'):
             q.main(['pm','--subscribe',''])
+
+class NamedArm(unittest.TestCase):
+    setUp = Subscriptions.setUp
+    def arm(self, *argv):
+        with mock.patch('builtins.print') as output, mock.patch.object(q,'release_reason',return_value=None):
+            q.main(['arm', *argv])
+        return json.loads(output.call_args.args[0])
+    def test_start_repeat_update_stop_preserves_workers(self):
+        before=copy.deepcopy(self.issue)
+        first=self.arm('start','--name','main','--scope-task','1')
+        again=self.arm('start','--name','main','--scope-task','1')
+        self.assertEqual(first['activation'],again['activation']);self.assertTrue(again['repeated'])
+        with self.assertRaisesRegex(SystemExit,'scope differs'):
+            self.arm('start','--name','main','--scope-task','2')
+        changed=self.arm('update','--name','main','--scope-task','2')
+        self.assertEqual(changed['activation']['scope'],[2])
+        self.assertFalse(self.arm('stop','--name','main')['activation']['enabled'])
+        self.assertTrue(self.arm('stop','--name','main')['repeated'])
+        with mock.patch.object(q,'event_pass') as execute:
+            with self.assertRaisesRegex(SystemExit,'stopped'):
+                self.arm('tick','--name','main','--execute')
+            execute.assert_not_called()
+        self.assertEqual(before,self.issue);self.board.update.assert_not_called()
+    def test_named_pass_single_instance_and_shared_native_path(self):
+        self.arm('start','--name','main','--scope-task','1')
+        def pass_once(args):
+            self.assertEqual(args.execution_scope,[1]);self.assertTrue(args.headless)
+            with self.assertRaisesRegex(SystemExit,'busy'):
+                self.arm('tick','--name','main','--execute')
+            with self.assertRaisesRegex(SystemExit,'busy'):
+                self.arm('stop','--name','main')
+        with mock.patch.object(q,'event_pass',side_effect=pass_once) as execute:
+            result=self.arm('tick','--name','main','--execute')
+            self.assertEqual(execute.call_count,1);self.assertTrue(result['activation']['enabled'])
+    def test_other_session_cannot_control_activation(self):
+        self.arm('start','--name','main')
+        self.identity={'runtime':'codex','session':'other'}
+        with self.assertRaisesRegex(SystemExit,'another session'):
+            self.arm('stop','--name','main')
+    def test_failed_pass_does_not_disable_or_change_scope(self):
+        self.arm('start','--name','main','--scope-task','1')
+        with mock.patch.object(q,'event_pass',side_effect=SystemExit('unknown effects')):
+            with self.assertRaisesRegex(SystemExit,'unknown effects'):
+                self.arm('tick','--name','main','--execute')
+        self.assertEqual(self.arm('status','--name','main')['activation']['scope'],[1])
+    def test_named_tick_refuses_scope_override_and_missing_activation(self):
+        with self.assertRaisesRegex(SystemExit,'not started'):
+            self.arm('tick','--name','main','--execute')
+        self.arm('start','--name','main')
+        with self.assertRaisesRegex(SystemExit,'recorded scope'):
+            self.arm('tick','--name','main','--execute','--scope-task','1')

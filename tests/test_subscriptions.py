@@ -27,6 +27,8 @@ class Subscriptions(unittest.TestCase):
     def change(self,seq,state='closed',action='close'):
         self.raw.update(event_seq=seq,action={'id':seq,'action':action,'text':'outcome','by':'worker','recipients':[],'acks':[]})
         self.issue.update(state=state,body=q.block('goal',self.raw))
+        if state == 'closed':
+            self.issue['labels'] = [label for label in self.issue['labels'] if not label.startswith(q.PREFIX)]
     def test_snapshot_lost_output_replays_exact_before_ack(self):
         first=q.subscription_poll(self.args());reads=self.board.metadata.call_count+self.board.get.call_count
         self.change(2)
@@ -282,3 +284,19 @@ class Presentation(unittest.TestCase):
         self.assertEqual(self.poll()['digest'],first['digest'])
         self.poll(ack=first['digest']);self.change(2)
         self.assertEqual(self.poll()['scope'],[1])
+
+    def test_real_closed_task_without_state_label_replays_delta_without_revision(self):
+        first=self.poll();self.poll(ack=first['digest']);self.change(2)
+        self.assertEqual(self.issue['labels'],[]);self.assertIsNone(q.parse(self.issue))
+        wire=q.subscription_poll(self.args());delta=json.loads(wire)
+        self.assertEqual(delta['tasks'][0]['state'],'closed')
+        self.assertIsNone(delta['tasks'][0]['question_revision'])
+        self.assertIsNone(json.loads(q.render_subscription(wire,'dot'))['cards'][0]['response_intent'])
+        self.assertEqual(q.subscription_poll(self.args()),wire)
+        self.poll(ack=delta['digest']);self.assertIsNone(self.poll())
+        self.board.update.assert_not_called()
+    def test_closed_stale_question_label_never_emits_actionable_revision(self):
+        first=self.poll();self.poll(ack=first['digest']);self.change(2)
+        self.issue['labels']=['q-ask']
+        delta=self.poll();self.assertIsNone(delta['tasks'][0]['question_revision'])
+        self.assertIsNone(q.question_revision(None))

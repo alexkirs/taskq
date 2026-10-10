@@ -1465,7 +1465,7 @@ def codes(words):
 
 def question_revision(current):
     """Question identity excludes transport/native ACKs, but binds its authority and content."""
-    if current['state'] not in ('ask', 'review') or not current['raw'].get('decision'):
+    if not current or current['state'] not in ('ask', 'review') or not current['raw'].get('decision'):
         return None
     raw = current['raw']
     value = {'project': {k: CONFIG.get(k) for k in ('board', 'host', 'repo')},
@@ -4890,7 +4890,7 @@ def subscription_poll(args):
                                      and x[len(PREFIX):] in STATES), 'unknown'),
                                'title': issue['title'], 'claim': raw.get('claim'), 'supervisor': raw.get('supervisor'),
                                'decision': raw.get('decision'), 'authority': raw.get('pm'), 'event_seq': seq,
-                               'question_revision': question_revision(parse(issue)),
+                               'question_revision': question_revision(parse(issue)) if issue['state'] == 'open' else None,
                                'decision_receipts': raw.get('answer_commands', {}),
                                'application_receipts': raw.get('application_receipts', {})}
                 digest = hashlib.sha256(json.dumps(observation, sort_keys=True).encode()).hexdigest()

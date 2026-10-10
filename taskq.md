@@ -233,15 +233,19 @@ For an available board the renderer prints:
    still in work; its row says `review`). Waiting for answer: `ask`. Ready: `ready` with no dep open in the snapshot
    (a task or an ordinary issue) and a manager (`pm`) that can start it; any other `ready` is blocked, never counted ready. `waiting` and `later` are
    never ready.
-3. The table of current work `| Task | State | Runtime | Session |`, one row per open task except `ask` (item 4) and
-   `later` (item 5), by priority, then number. A row is `| [#N <title>](<issue url>) | <state> | <runtime> |
-   [<session[:8]>](<link>) |`; a blocked or waiting row names why: `blocked (no manager)`, `blocked (#M open)`,
-   `waiting (#M)`.
-4. `Questions (answer N.M):`, then the table `| Question | Brief reason | Options |`, one row per `ask`, and per
-   `review` with options (#490): `| [#N <title>](url) | <the ask's first line> · <links> | N.1 <option> · N.2
-   <option> ★ |` (a review adds `review` after the link); ★ marks the recommended option. The owner answers `N.M`
-   only; the manager runs `taskq answer N.M` (§ 7 After each pass).
-5. `Later: [#N <title>](url), ...` on one line.
+3. Current work: one stacked row per task except `ask` and `later`, by priority then number:
+   `- [#N <derived label>](<issue url>) · <state> · <runtime/session when present>`.
+   Omit runtime `any` and absent sessions. Keep an actual runtime and session together; do not add empty columns.
+   A blocked or waiting row names why: `blocked (no manager)`, `blocked (#M open)`, `waiting (#M)`.
+4. `Questions (answer N.M):`, then stacked decision blocks for every `ask` and `review` with options.
+   Lead with `[#N <derived label>](url)` (add `review` when applicable), then the concrete action, target,
+   consequence and conditions. Put each complete option on its own line: `- N.M <option> ★`.
+   One ★ marks the recommendation. Keep the entire decision context; never clip it to a first line or character limit.
+   Put optional evidence links after the options. An ask without options links the issue and retains its full question.
+5. `Later N · [later tasks](<board URL with q-later filter>)`: count plus one descriptive board link.
+   With no filterable built-in board, an assignee filter or a custom board URL already containing query/fragment,
+   print stacked issue references instead, preserving the report's exact selection. Full parked titles and reasons remain
+   available through `taskq list later` and the issue history; never imply a truncated list is complete.
 6. One mode line: `Mode: events · arm: <arm_tick>`, the report's only field. taskq knows only its event chain (R4); it
    records no sender or timer, so it never fills the field. The executing PM for this explicit project (standalone Codex/Claude has the same role) replaces exactly `<arm_tick>`, nothing else, with one of:
    - `armed, every <interval>`: only when it confirmed its own arming and the interval from evidence it read (its
@@ -255,32 +259,46 @@ For an available board the renderer prints:
    manager's queue monitoring is distinct from root transport. The executing PM fills the field; root DOT
    relays the completed block unchanged and must not replace known executing-PM state with its own unknown. `<arm_tick>` never reaches the owner.
 
-Titles, reasons and options pass one formatter: a newline becomes a space, `|`, `[`, `]` and `\` are escaped, so a
-cell stays one table cell and one link. Illustrative only, never a live status:
+Changed (#597, owner activation 2026-10-10; R6/R7): wide work/question tables, long ellipsized titles and
+a wall of Later links → stacked work and decision blocks, derived labels and one filtered Later link.
+Canonical issue/session titles and exact commands stay unchanged. A deterministic label uses the first four
+whitespace-separated title words (short titles keep every word), without a manually maintained field.
+Do not invent an acronym or interpret a prefix. Empty titles use `Task`; unsegmented/non-English text stays intact.
+Long single words wrap in capable clients rather than being cut. Labels are navigation hints, never decision context.
+Shared/generic prefixes and label collisions are disambiguated by the mandatory issue number and project block;
+if still unclear for a decision, expand the canonical title/context. Full titles/history are reachable through the issue
+link and `taskq list --full`. Newlines become spaces in labels; Markdown punctuation is escaped. CLI uses explicit
+URLs when links cannot be clicked; its terminal wrapping is not assumed to match an app.
 
-```
+Illustrative only, not live status:
+
+```text
 taskq · [board](https://github.com/OWNER/REPO/issues)
 In work 2 · Waiting for answer 1 · Ready 1
 
-| Task | State | Runtime | Session |
-|---|---|---|---|
-| [#12 Fix login](…/12) | doing | claude | [1a2b3c4d](https://claude.ai/code/session_…) |
-| [#13 Docs \| FAQ](…/13) | review | codex | [019a0b1c](https://alexkirs.github.io/taskq/open.html#codex://threads/…) |
-| [#15 Release notes](…/15) | ready | any |  |
-| [#16 Deploy](…/16) | blocked (#14 open) | any |  |
+- [#12 Fix login redirect loop](…/12) · doing · claude · [session](…)
+- [#13 Docs and FAQ](…/13) · review · codex · [session](…)
+- [#15 Release notes](…/15) · ready
+- [#16 Deploy](…/16) · blocked (#14 open)
 
 Questions (answer N.M):
+[#14 New logo](…/14)
+Choose A or B for the public logo; both previews are approved for public delivery.
+- 14.1 keep A
+- 14.2 keep B ★
+[Image 14.1](<verified image URL>) · [Image 14.2](<verified image URL>)
 
-| Question | Brief reason | Options |
-|---|---|---|
-| [#14 New logo](…/14) | Made two variants. · ![14](…/a.png) | 14.1 keep A · 14.2 keep B ★ |
-
-Later: [#9 Dark mode](…/9)
-
+Later 7 · [later tasks](…/issues?q=is%3Aissue+is%3Aopen+label%3Aq-later)
 Mode: events · arm: unknown
 ```
 
 The sample shows the field after the executing PM's default; `taskq` prints `arm: <arm_tick>`.
+Asset URLs above are placeholders, not proof. A link extension is only a display hint: the submitting role verifies
+trusted issue/update provenance, relevance, permission and accessible delivery before using result media for a choice.
+Every asset gets a direct descriptive numbered link tied to the issue/card. `inline_media` adds a preview only in a
+known supported final client; CLI/unknown/DOT clients receive explicit links. Do not invent assets or label an
+unverified link as verified. Renderer fetching arbitrary media would add a privacy/network boundary and is not done.
+Link previews are client-controlled; TaskQ cannot promise to suppress them.
 
 Session links: Claude `https://claude.ai/code/session_<id>` in every client. Codex: `codex://threads/<id>` direct when
 the client that finally renders the report is Codex, else the wrapper `<pages>/open.html#codex://threads/<id>`. That
@@ -290,7 +308,7 @@ The executing PM sets `TASKQ_CLIENT` to the final owner client before preparing 
 for macOS Codex desktop use `TASKQ_CLIENT=codex` and direct `codex://threads/<id>` links. Root never rewrites links.
 A child manager that relays to a root manager in another client sets `TASKQ_CLIENT` to the root's client. DOT and
 unknown clients get the wrapper (direct unverified there). A session with no link on this machine shows
-`<session[:8]> on <machine>`; no session: empty cell. No raw JSON to humans.
+`<session[:8]> on <machine>`; no session: omit it. No raw JSON to humans.
 Relay: every manager (Claude, Codex, DOT; root or child) loads the current contract with `taskq pm` and passes the
 report on complete and unchanged, except the executing PM's `<arm_tick>` (item 6), its own short commentary
 below it, separate. Limitation (R12): only the prompt asks for this; taskq cannot verify that a relay was exact or that
@@ -326,8 +344,51 @@ treated as a semantic guarantee (§ 2 Supporting context).
 Every role and message is short and states unknowns honestly, per
 [gradus-public/caveman](https://gitlab.ufobe.com/gradus-public/caveman/-/tree/62579538f05fb6b69a12449c1ebad9567d1fdecc)
 pinned at `6257953`. taskq links the style; it does not redefine it.
-A question to the owner is one line: what was done, its results (links, images, video), numbered options, one
-recommended (§ 5 rule 5, § 7 After each pass).
+Changed (#597; R7): a question had to fit one line → use the shortest complete decision block, expanding
+material context and stacking complete numbered options. R7 applies to every human-facing surface, including
+task descriptions, private app messages and relays; protocol/control payloads remain exact.
+Reuse the pinned authored profiles, not vendored plugin instructions:
+[README](https://gitlab.ufobe.com/gradus-public/caveman/-/blob/62579538f05fb6b69a12449c1ebad9567d1fdecc/README.md),
+[SOURCES](https://gitlab.ufobe.com/gradus-public/caveman/-/blob/62579538f05fb6b69a12449c1ebad9567d1fdecc/SOURCES.md),
+[core](https://gitlab.ufobe.com/gradus-public/caveman/-/blob/62579538f05fb6b69a12449c1ebad9567d1fdecc/rules/core.md),
+[agents](https://gitlab.ufobe.com/gradus-public/caveman/-/blob/62579538f05fb6b69a12449c1ebad9567d1fdecc/rules/agents.md),
+[notifications](https://gitlab.ufobe.com/gradus-public/caveman/-/blob/62579538f05fb6b69a12449c1ebad9567d1fdecc/rules/notifications.md),
+[documentation](https://gitlab.ufobe.com/gradus-public/caveman/-/blob/62579538f05fb6b69a12449c1ebad9567d1fdecc/rules/documentation.md),
+[indicators](https://gitlab.ufobe.com/gradus-public/caveman/-/blob/62579538f05fb6b69a12449c1ebad9567d1fdecc/rules/indicators.md),
+[examples](https://gitlab.ufobe.com/gradus-public/caveman/-/blob/62579538f05fb6b69a12449c1ebad9567d1fdecc/examples/messages.md).
+
+Presentation inventory (#597): each row covers content, timing and detail/link fallback. This matrix is part of
+the contract, not a second manual/template framework. Use compact tables only for genuine comparisons; all
+owner decisions and queue rows use stacked lists, including narrow clients.
+
+| Surface/event | What and when | Detail/link/fallback |
+|---|---|---|
+| Tick/status and DOT relay | Project, three counters, work, questions, Later, ARM; on request/first report | R6 stacked blocks; relay unchanged; full route `taskq status` |
+| Routine PM progress | Meaningful changes since its last delivered report; no repeated unchanged tick narration | Current actionable blockers/questions always visible; no local status registry; if prior context unknown, full R6 |
+| Queue/list/onboarding | Issue + derived label, state/priority and actual runtime/session; on command/start | Issue has canonical title/history; `list --full`; exact adoption command; omit empty fields |
+| Task description/intake | Goal, acceptance, scope, conditions; when filing/triaging | Natural grammar; no loss of owner words/constraints; issue is canonical; narrow intake uses stacked rows |
+| PM/ARM help and command help | Concrete next action, target and prerequisite; on request/onboarding | Exact command and permission boundaries; optional mechanics link to this contract; arming proof stays R12 |
+| Questions and answers | Action/target/consequence, context, each option, one ★, batch tokens; when owner input needed | Expand ambiguity; project/task/problem routing; verified media links; verbatim owner answer |
+| Blocker/error/unavailable board | Project, actual error, impact, next action, uncertainty; on occurrence/change | Keep actionable error/command exact; diagnostic logs link; no stale counters or guessed ARM |
+| Review/result/completion | Concrete result, checked revision/outcome, remaining work; on handoff | Distinguish implemented/tested/published/deployed/verified; link exact evidence/history; § 10 evidence row |
+| Publication notice | Actual publication/verification state and result reference; after that transition | #581 owns commit/PR text and canonical history formatting; no duplicate policy |
+| Private app/relay messages | Same shortest complete facts and action; meaningful transitions only | Channel-native links; private proof stays private; unsupported formatting → text/URLs |
+| Protocol payloads/briefs/wait/ack | Exact role authority, identities, commands, events and owner text; existing cadence | Not prose to abridge; no control/transport change to #595; JSON stays internal |
+
+Illustrative rewrites (not observed deliveries):
+- Long repeated title `Design R6/R7: compact user messages and derived task labels across TaskQ interfaces`
+  → `#597 Design R6/R7: compact user` linked to that unchanged canonical title. A shared prefix on #598 keeps #598.
+- Repeated full tick report → `taskq: #597 entered review; PR ready for review. Full status: taskq status.`
+  Include any pending question/blocker; do not claim unchanged status when the prior report is unavailable.
+- `29 focused tests pass and Linux CI green while local gate fails` → `29 focused tests passed; Linux CI green;
+  local gate failed.` Never `all tests passed`; link the exact outcomes.
+- Board unavailable → `project A: board unavailable — invalid_grant. Login session unverified. ARM unknown.`
+  Then `Problem 1 (session choice, not board task)` with complete 1.1/1.2 options. A concurrent project B
+  question 1.1 requires `project A problem 1.1` or `project B task 1.1`, never a guessed route.
+- Media choice → `#14: choose the public logo; verified image 14.1 (version A) / image 14.2 (version B).`
+  Stack 14.1/14.2 actions and ★ before direct links. CLI prints the same labeled URLs; inline previews are optional.
+These shorten repeated presentation only; commands, permissions, conditions, evidence and unknowns are never
+mechanically summarized. Character/line measurements describe the specific fixture, not a quality or savings guarantee.
 Changed: free-text questions → decision cards with option codes `N.K` (#490).
 
 ### R8. The contract is the SoT and matches code
@@ -640,7 +701,7 @@ no automatic retry or rollback erases acknowledged work. Closed history is not r
 | `codex` | Options of `codex exec`, replacing the complete default; an explicit `workspace-write` override needs network access and `--add-dir` for required worktree/git paths (the project instructions name them) | `-s danger-full-access` on every host (R9) |
 | `pages` | Base URL of `open.html`, the Codex link page | `https://alexkirs.github.io/taskq/` |
 | `board_url` | Board link a board file prints in the tick | GitHub/GitLab issues page |
-| `inline_media` | `false`: the Questions of the report (R6) print image links as plain links, not `![](url)` (where the surface does not render them) | `true` |
+| `inline_media` | `false`: direct labeled image links only. `true`: request previews when `TASKQ_CLIENT` explicitly names `codex`/`claude`; actual client rendering still requires observation (R12). CLI/unknown/DOT use links only (R6) | `true` |
 | `assignee` | `"me"` (the board's logged-in user) or a login: `tick` starts, and `tick`/`wait`/`list` show, only tasks assigned to it; unassigned tasks are skipped (#480) | unset: every task |
 
 Invocation-local admission (#604): `TASKQ_HOST_ONLY=win` requires this machine to resolve to `win` and
@@ -883,9 +944,18 @@ outcomes closed before its first wait. A custom adapter without it cannot discov
 ```json
 {"scope": ["paths expected to change"], "deps": [12], "claim": {"runtime": "claude", "session": "<id>", "name": "mac"},
  "result": {"sha": "<full sha>", "checks": "<commands and outcome>"},
- "decision": {"summary": "<first line of the ask/result text>", "links": ["<url>"], "options": ["<A>", "<B>"], "recommend": 1}}
+ "decision": {"summary": "<complete ask/result context>", "links": ["<url>"], "options": ["<A>", "<B>"], "recommend": 1}}
 ```
 
+- Changed (#597; R6/R7): decision text was first-line/120-character clipped → full context, stacked choices.
+  `decision.start` is the first option number (legacy default 1); `decision_next` is the next unused number
+  on this same issue. Each new card reserves its option numbers in the existing board JSON, even after an
+  answer/requeue. Never reuse a number for a changed action: replacing 577.1/577.2 yields 577.3/577.4.
+  `recommend` remains the one-based option position, not the displayed number. Old/missing options refuse
+  the entire batch before actions; duplicate task numbers (including conflicting choices) also refuse it.
+  Existing legacy cards keep their current codes until replaced/consumed; historical pre-upgrade reuse cannot
+  be reconstructed reliably, so PMs re-present any stale/uncertain legacy mapping and obtain a fresh answer.
+  No new registry, transport or token syntax; direct manual/old-client writes are not made safe by this policy.
 - `decision` (#490): set by `ask` and `result` from `--option`, `--recommend`, `--link`; cleared by `answer` and `requeue`.
 - `supervisor` (#524, #525): `{"runtime", "session", "name"}` of `S<N>`, same shape as `claim` (the worker's). Set by the
   pass that spawns it, replaced by the pass that respawns a dead one; cleared with `claim` and `order` when the task
@@ -909,11 +979,11 @@ outcomes closed before its first wait. A custom adapter without it cannot discov
 | Command | Does |
 |---|---|
 | `taskq add "<title>" --goal G --acceptance A [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 1\|2] [--host H]` | new task: `q-ready`, or `q-waiting` with open deps |
-| `taskq list [state]` | open tasks by state, priority, number |
+| `taskq list [state] [--full]` | open tasks by state, priority, number |
 | `taskq take N` | claim a ready task for this session (needs `CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID` or genuine `HERMES_SESSION_ID`) |
 | `taskq ask N --text Q [--option O ..] [--recommend K] [--link URL ..]` | worker or supervisor asks the owner: `doing` or `review` → `ask`; the options make the decision card (§ 7) |
 | `taskq answer N --text A` | the owner's answer: `ask` → `doing` |
-| `taskq answer N.K [M.K ...]` | pick option K of each task's card, all checked first (#490): an `ask` → `doing` with the option's text; a `review` → `close` when the option starts with `close`, else → `doing` with the option's text. Codes may be one quoted string: `'43.1 44.2'` |
+| `taskq answer N.K [M.K ...]` | pick displayed option K of each task's card, all checked first (#490): an `ask` → `doing` with the option's text; a `review` → `close` when the option starts with `close`, else → `doing` with the option's text. Codes may be one quoted string: `'43.1 44.2'` |
 | `taskq result N --sha SHA [--checks C] [--text T] [--option O ..] [--recommend K] [--link URL ..]` | hand in: `doing` → `review`; options: the owner must choose (§ 7) |
 | `taskq run N` | the recorded supervisor orders its worker: `doing` with no worker session, sets `order`; its event pass spawns `T<N>` (§ 7) |
 | `taskq requeue N [--text T]` | drop claim, supervisor and result: any state → `ready`. By the recorded supervisor (rework): keeps `supervisor`, the task goes to `doing` and the next worker is ordered as by `run`; refused once 3 workers were spawned since the last `answer` (ask the owner). By the recorded worker of a supervised task (cannot be done): drops only its claim session; the supervisor gets `requeue #N` |
@@ -1175,8 +1245,8 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
      stopped (R11; the pass, for every task it lists or reads).
    `later`, an `ask` of the supervisor: nothing; they wait for the owner.
 5. Print the R6 report from the pass's own list, as updated by the pass: project and board, the three counters, the
-   work table, Questions, Later, the mode line. Another machine's claim shows its bare session id: only that machine
-   can link it. In Questions an image link prints as `![N](url)` (`inline_media`, § 2); a video or page stays a link.
+   stacked work, Questions, compact Later, the mode line. Another machine's claim shows its bare session id: only that machine
+   can link it. In Questions every asset has a direct labeled link; a supported image preview is optional (`inline_media`, § 2).
    `taskq status` prints the same report with no pass (§ 4).
 
 The event pass of R4 is steps 1–4 run by `taskq tick --quiet`, the detached child of `add`, `answer`, `run`,
@@ -1224,14 +1294,21 @@ the tasks it did not reach wait for the next pass. Fix the cause or tell the own
 
 ### After each pass
 
-Reply to the owner with a separate complete R6 report for each explicit project (links, not bare ids). The
+Changed (#597; R6/R7): repeat the complete report after every pass → first/requested reports are complete;
+routine progress shows only meaningful changes per explicit project, plus every actionable blocker/question and
+`Full status: taskq status`. Use the manager's current delivered context only, no new state registry. If it cannot
+compare reliably, print the complete R6 report. CLI `tick`/`status` remain complete snapshot renderers.
+Reply to the owner with a separate complete R6 report for each explicit project when a full report is due (links, not bare ids). The
 executing PM replaces only `<arm_tick>` using R6 item 6; root DOT relays the completed block unchanged, then one
 or two lines of commentary, separate. Current work comes first; questions/problems below it are compact and
 numbered (N.M options), with a recommendation and a verified actionable session link
 when session action is needed. Verify the recorded session and supported action, not merely a URL's shape; if
 unverified, say so and do not offer it as a working login/wake route. Root transport is not evidence of executing-PM queue monitoring. To show
 the queue without moving it, run `taskq status`. The owner answers `43.1 44.2`: run `taskq answer 43.1 44.2`
-verbatim in the named project root only for board task options. If an answer is ambiguous across projects, ask for its project first.
+verbatim in the named project root only for board task options. Before applying a batch, compare each displayed
+card's complete action/options and target to the current trusted issue decision. Changed/missing/uncertain mapping:
+re-present the current card and obtain a fresh answer; never reinterpret the old tokens. Reject duplicate task picks.
+Current TaskQ cards reserve fresh option numbers on each replacement (§ 3); this also rejects stale CLI tokens. If an answer is ambiguous across projects, ask for its project first.
 External runtime blockers use numeric `N.M` too: the executing PM labels each as `Problem N (session choice, not board task)`,
 prints `N.1 <action> · N.2 <action> ★`, and keeps that mapping only in the current session context. Choose N distinct
 from board question numbers in the current project report; if the board is unreadable, do not assume no collision.
@@ -1246,7 +1323,7 @@ behavior. Record only safe minimal evidence availability/limits publicly; detail
 Keep external runtime blockers visible even when a board read fails (R6). For GitLab `invalid_grant`, offer owner
 login in a verified real session; do not begin login, retry GitLab or change credentials. If no such session is
 verified, state that limit and ask for one. Reuse the existing task, never file one duplicate per runtime failure.
-Use the decision's `--link` field for the PR/result URL; the short first-line summary is not its link transport.
+Use the decision's `--link` field for the PR/result URL; the summary is not its link transport.
 Changed: the manager relayed each `ask` comment verbatim → the `Decisions` block carries every pending choice (#490);
 the block is the report's Questions (#574).
 

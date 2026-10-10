@@ -794,9 +794,9 @@ class Commands(Base):
         self.add('two', '--deps', '1')
         self.run_cli('take', '1')
         self.assertEqual(self.run_cli('list').splitlines(), [
-            '#2    waiting  p2 any    two  [open dependencies [1]]',
-            '#1    doing    p2 any    one  [claude:01234567 @mac]'])
-        self.assertEqual(self.run_cli('list', 'doing').splitlines(), ['#1    doing    p2 any    one  [claude:01234567 @mac]'])
+            '#2 two · waiting · p2  [open dependencies [1]]',
+            '#1 one · doing · p2  [claude:01234567 @mac]'])
+        self.assertEqual(self.run_cli('list', 'doing').splitlines(), ['#1 one · doing · p2  [claude:01234567 @mac]'])
 
     def test_full_cycle(self):
         self.add()
@@ -877,7 +877,7 @@ class Commands(Base):
         self.run_cli('requeue', '1', '--text', 'stuck')
         self.assertEqual((self.task(1)['state'], self.task(1)['claim']), ('ready', None))
         self.run_cli('later', '1', '--text', 'after release')
-        self.assertEqual(self.run_cli('list').splitlines(), ['#1    later    p2 any    T  [after release]'])
+        self.assertEqual(self.run_cli('list').splitlines(), ['#1 T · later · p2  [after release]'])
 
     def test_refusals(self):
         self.add()
@@ -1751,7 +1751,7 @@ class Tick(TickSetup):
         self.assertEqual(retireable, [False])  # even if the new supervisor's first turn already stopped
         self.assertEqual(self.task(1)['supervisor']['session'], 's-S1')
         self.assertIn('In work 1 · Waiting for answer 0 · Ready 0', report)
-        self.assertIn('| [#1 new](https://board/1) | doing | fake | [s-S1](https://watch/s-S1) |', report)
+        self.assertIn('- [#1 new](https://board/1) · doing · fake · [s-S1](https://watch/s-S1)', report)
 
     def test_retirement_fresh_read_keeps_current_open_sessions(self):
         self.add('owned', '--host', 'mac')
@@ -1825,7 +1825,7 @@ class Tick(TickSetup):
         self.assertEqual((self.task(2)['state'], self.task(3)['state'], self.fake.names), ('ready', 'ready', ['S1 UNK one (mac)']))
         self.assertIn('You are the taskq supervisor S1 of task #1: one', self.fake.prompts['s-S1'])
         self.assertIn('**spawn** · claude:01234567\n\nsupervisor s-S1\nhttps://watch/s-S1', self.board.issues[1]['comments'])
-        self.assertIn('| [#1 one](https://board/1) | doing | fake | [s-S1](https://watch/s-S1) |', out)
+        self.assertIn('- [#1 one](https://board/1) · doing · fake · [s-S1](https://watch/s-S1)', out)
         self.assertTrue(out.startswith(f'{self.root.name} · [board](https://github.com/o/r/issues)\n'))
         self.assertTrue(out.endswith('\n\nMode: events · arm: <arm_tick>\n'))
         with self.acting('s-S1'):
@@ -1848,12 +1848,12 @@ class Tick(TickSetup):
                 'claim': {'runtime': 'codex', 'session': '019a-thread', 'name': 'mac'}}
         kinds = {'claude': claude, 'codex': codex}
         self.assertEqual(taskq.row(item, kinds, 'mac'),
-                         '| [#7](https://board/7) | doing | codex | [019a-thr](https://alexkirs.github.io/taskq/open.html#codex://threads/019a-thread) |')
+                         '- [#7 Task](https://board/7) · doing · codex · [019a-thr](https://alexkirs.github.io/taskq/open.html#codex://threads/019a-thread)')
         item['claim'] = {'runtime': 'claude', 'session': 'abcdef12-3456', 'name': 'mac'}
         with mock.patch.object(claude, 'link', return_value='https://claude.ai/code/session_X'):
-            self.assertEqual(taskq.row(item, kinds, 'mac'), '| [#7](https://board/7) | doing | claude | [abcdef12](https://claude.ai/code/session_X) |')
-        self.assertEqual(taskq.row(item, kinds, 'win'), '| [#7](https://board/7) | doing | claude | abcdef12 on mac |')
-        self.assertEqual(taskq.row({**item, 'claim': None, 'state': 'ready'}, kinds, 'mac'), '| [#7](https://board/7) | ready | any |  |')
+            self.assertEqual(taskq.row(item, kinds, 'mac'), '- [#7 Task](https://board/7) · doing · claude · [abcdef12](https://claude.ai/code/session_X)')
+        self.assertEqual(taskq.row(item, kinds, 'win'), '- [#7 Task](https://board/7) · doing · claude · abcdef12 on mac')
+        self.assertEqual(taskq.row({**item, 'claim': None, 'state': 'ready'}, kinds, 'mac'), '- [#7 Task](https://board/7) · ready')
 
     def test_row_codex_link_per_source_client(self):
         """#521 (R6): a tick run in Codex links Codex threads directly; Claude, a shell or an unknown client get the wrapper."""
@@ -1861,7 +1861,7 @@ class Tick(TickSetup):
         kinds = {'claude': claude, 'codex': codex}
         item = {'iid': 7, 'url': 'https://board/7', 'state': 'doing', 'runtime': 'any',
                 'claim': {'runtime': 'codex', 'session': '019a-thread-full-id', 'name': 'mac'}}
-        wrapper = '| [#7](https://board/7) | doing | codex | [019a-thr](https://alexkirs.github.io/taskq/open.html#codex://threads/019a-thread-full-id) |'
+        wrapper = '- [#7 Task](https://board/7) · doing · codex · [019a-thr](https://alexkirs.github.io/taskq/open.html#codex://threads/019a-thread-full-id)'
         sources = {'codex': {'CODEX_THREAD_ID': 'mgr'}, 'claude': {'CLAUDE_CODE_SESSION_ID': 'mgr'}, 'shell': {},
                    'claude from codex': {'CLAUDE_CODE_SESSION_ID': 'mgr', 'CODEX_THREAD_ID': 'x', 'TASKQ_RUNTIME': 'claude'},
                    'unknown runtime': {'CODEX_THREAD_ID': 'x', 'TASKQ_RUNTIME': 'grok'},
@@ -1873,11 +1873,11 @@ class Tick(TickSetup):
             with self.subTest(source), mock.patch.dict(os.environ, env, clear=True):
                 self.assertEqual(taskq.row(item, kinds, 'mac'), wrapper.replace(
                     'https://alexkirs.github.io/taskq/open.html#', '') if source in ('codex', 'final codex, run in claude') else wrapper)
-                self.assertEqual(taskq.row(item, kinds, 'win'), '| [#7](https://board/7) | doing | codex | 019a-thr on mac |')
-                self.assertEqual(taskq.row({**item, 'claim': None, 'state': 'ready'}, kinds, 'mac'), '| [#7](https://board/7) | ready | any |  |')
+                self.assertEqual(taskq.row(item, kinds, 'win'), '- [#7 Task](https://board/7) · doing · codex · 019a-thr on mac')
+                self.assertEqual(taskq.row({**item, 'claim': None, 'state': 'ready'}, kinds, 'mac'), '- [#7 Task](https://board/7) · ready')
                 claimed = {**item, 'claim': {'runtime': 'claude', 'session': 'abcdef12-3456', 'name': 'mac'}}
                 with mock.patch.object(claude, 'link', return_value='https://claude.ai/code/session_X'):
-                    self.assertEqual(taskq.row(claimed, kinds, 'mac'), '| [#7](https://board/7) | doing | claude | [abcdef12](https://claude.ai/code/session_X) |')
+                    self.assertEqual(taskq.row(claimed, kinds, 'mac'), '- [#7 Task](https://board/7) · doing · claude · [abcdef12](https://claude.ai/code/session_X)')
 
     def test_status_report_one_snapshot_read_only(self):
         """#574 (R6): counters and rows from one list and one filter; review is in work; blocked, waiting and later are never
@@ -1917,24 +1917,24 @@ class Tick(TickSetup):
             {self.root.name} · [board](https://github.com/o/r/issues)
             In work 2 · Waiting for answer 1 · Ready 2
 
-            | Task | State | Runtime | Session |
-            |---|---|---|---|
-            | [#2 doing](https://board/2) | doing | fake | [s-T2](https://watch/s-T2) |
-            | [#3 review](https://board/3) | review | fake | [s-T3](https://watch/s-T3) |
-            | [#5 a\\|b \\[x\\]](https://board/5) | ready | any |  |
-            | [#6 dep closed](https://board/6) | ready | any |  |
-            | [#7 dep open](https://board/7) | blocked (#5 open) | any |  |
-            | [#8 waits](https://board/8) | waiting (#5) | any |  |
-            | [#10 orphan](https://board/10) | blocked (no manager) | any |  |
-            | [#12 dep issue](https://board/12) | blocked (#11 open) | any |  |
+            - [#2 doing](https://board/2) · doing · fake · [s-T2](https://watch/s-T2)
+            - [#3 review](https://board/3) · review · fake · [s-T3](https://watch/s-T3)
+            - [#5 a\\|b \\[x\\]](https://board/5) · ready
+            - [#6 dep closed](https://board/6) · ready
+            - [#7 dep open](https://board/7) · blocked (#5 open)
+            - [#8 waits](https://board/8) · waiting (#5)
+            - [#10 orphan](https://board/10) · blocked (no manager)
+            - [#12 dep issue](https://board/12) · blocked (#11 open)
 
             Questions (answer N.M):
 
-            | Question | Brief reason | Options |
-            |---|---|---|
-            | [#4 asking](https://board/4) | Built A \\| B. | 4.1 keep it · 4.2 drop ★ |
+            [#4 asking](https://board/4)
+            Built A | B.
+            Keep it?
+            - 4.1 keep it
+            - 4.2 drop ★
 
-            Later: [#9 parked](https://board/9)
+            Later 1 · [later tasks](https://github.com/o/r/issues?q=is%3Aissue+is%3Aopen+label%3Aq-later)
 
             Mode: events · arm: <arm_tick>
             '''))
@@ -1975,7 +1975,7 @@ class Tick(TickSetup):
         self.run_cli('answer', '1', '--text', 'fixed')  # an answer resets the count: the next death requeues
         self.run_cli('tick')
         self.assertEqual(self.task(1)['state'], 'ready')
-        self.assertIn('| [#1 T](https://board/1) | blocked (no manager) | any |  |', self.run_cli('tick'))
+        self.assertIn('- [#1 T](https://board/1) · blocked (no manager)', self.run_cli('tick'))
 
     def test_other_checkout_codex_supervisor_handle_is_not_death(self):
         self.add()
@@ -2050,14 +2050,18 @@ class Tick(TickSetup):
                      '--recommend', '2', '--link', 'https://x/shot.png', '--link', 'https://x/demo.mp4')
         self.run_cli('result', '2', '--sha', 'a' * 40, '--text', 'Done X', '--option', 'close as is', '--option', 'also do Y')
         self.run_cli('result', '3', '--sha', 'a' * 40, '--text', 'plain')  # no options: no card
-        out = self.run_cli('tick').split('Questions (answer N.M):\n\n')[1].split('\n\n')[0]
-        self.assertEqual(out.splitlines(), [
-            '| Question | Brief reason | Options |', '|---|---|---|',
-            '| [#1 one](https://board/1) | Built A and B. · ![1](https://x/shot.png) · https://x/demo.mp4 | 1.1 keep A · 1.2 keep B ★ |',
-            '| [#2 two](https://board/2) review | Done X | 2.1 close as is ★ · 2.2 also do Y |'])
-        taskq.CONFIG['inline_media'] = False
-        self.assertIn(' · https://x/shot.png · ', self.run_cli('tick'))
-        for bad, message in (('1.3', 'no option 3'), ('3.1', 'no option 1'), ('1.x', 'codes like'), ('9', 'codes like')):
+        out = self.run_cli('tick').split('Questions (answer N.M):\n\n')[1]
+        self.assertIn('[#1 one](https://board/1)\nBuilt A and B.\nWhich one?\n'
+                      '- 1.1 keep A\n- 1.2 keep B ★\n'
+                      '[Image 1 v1.1](https://x/shot.png)\n[Result 1 v1.2](https://x/demo.mp4)', out)
+        self.assertIn('[#2 two](https://board/2) review\nDone X\n'
+                      '- 2.1 close as is ★\n- 2.2 also do Y', out)
+        self.assertNotIn('![', out)  # CLI/unknown client does not imply preview support
+        with mock.patch.dict(os.environ, {'TASKQ_CLIENT': 'claude'}):
+            self.assertIn('![Image 1 v1.1](https://x/shot.png)', self.run_cli('tick'))
+            taskq.CONFIG['inline_media'] = False
+            self.assertNotIn('![', self.run_cli('tick'))
+        for bad, message in (('1.3', 'duplicate task'), ('3.1', 'no option 1'), ('1.x', 'codes like'), ('9', 'codes like')):
             with self.assertRaisesRegex(SystemExit, message):
                 self.run_cli('answer', '1.2', bad)
         self.assertEqual(self.task(1)['state'], 'ask')  # a bad code moves nothing
@@ -2082,6 +2086,130 @@ class Tick(TickSetup):
         taskq.CONFIG['limits'] = {'fake': 0}
         self.add('three')
         self.assertNotIn('spawn', self.run_cli('tick'))
+
+    def test_compact_labels_keep_canonical_titles_and_distinguish_collisions(self):
+        taskq.CONFIG['limits'] = {'fake': 0}
+        titles = ('Design R6/R7: compact user messages across interfaces',
+                  'Design R6/R7: compact user questions and results',
+                  '修复登录问题', 'Fix login', '', '*title* [x] | \\path extra words',
+                  'First\nsecond\tthird fourth fifth', 'x' * 100)
+        for title in titles:
+            self.add(title)
+        before = json.dumps(self.board.issues, sort_keys=True)
+        out = self.run_cli('status')
+        self.assertIn('[#1 Design R6/R7: compact user](https://board/1)', out)
+        self.assertIn('[#2 Design R6/R7: compact user](https://board/2)', out)
+        self.assertEqual([taskq.task_label(self.task(n)) for n in range(3, 9)],
+                         ['修复登录问题', 'Fix login', 'Task', '*title* [x] | \\path',
+                          'First second third fourth', 'x' * 100])
+        self.assertIn(r'\*title\* \[x\] \| \\path', out)
+        self.assertNotIn('…', out)
+        self.assertNotIn('| Task |', out)
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        self.assertIn(titles[0], self.run_cli('list', '--full'))
+        self.assertNotIn(titles[0], self.run_cli('list'))
+
+    def test_decision_keeps_long_multiline_context_and_all_options(self):
+        self.unmanaged()
+        self.add('Very long meaningful task title with repeated generic words')
+        self.legacy(1)
+        context = ('Choose deployment only after verifying the target and permission. ' * 4
+                   + '\n29 focused tests pass and Linux CI green while local gate fails.\n'
+                   + 'Exact command:\n```powershell\ngit push --force-with-lease origin HEAD:refs/heads/taskq-1\n```')
+        self.run_cli('ask', '1', '--text', context, '--option', 'retain current deployment until local gate passes',
+                     '--option', 'investigate the failed local gate and report its exact error', '--recommend', '2')
+        out = self.run_cli('status')
+        self.assertIn(context, out)
+        self.assertIn('- 1.1 retain current deployment until local gate passes\n', out)
+        self.assertIn('- 1.2 investigate the failed local gate and report its exact error ★\n', out)
+        self.assertEqual(self.task(1)['raw']['decision']['summary'], context)
+        # Narrow terminal fixtures wrap complete choices rather than clipping columns.
+        for width in (28, 40, 80):
+            wrapped = '\n'.join(textwrap.fill(line, width, break_long_words=True) for line in out.splitlines())
+            self.assertIn('1.1', wrapped)
+            self.assertIn('1.2', wrapped)
+            self.assertIn('★', wrapped)
+            self.assertNotIn('| Options |', wrapped)
+
+    def test_replaced_decisions_never_rebind_old_answer_codes(self):
+        self.unmanaged()
+        for title in ('one', 'two'):
+            self.add(title)
+            self.legacy(len(self.board.issues))
+        self.run_cli('ask', '1', '--text', 'Original action', '--option', 'keep A', '--option', 'keep B')
+        self.run_cli('answer', '1.1')
+        self.run_cli('ask', '1', '--text', 'Changed action', '--option', 'delete A', '--option', 'delete B', '--recommend', '2')
+        self.run_cli('ask', '2', '--text', 'other question', '--option', 'keep')
+        self.assertIn('- 1.3 delete A\n- 1.4 delete B ★', self.run_cli('status'))
+        before = json.dumps(self.board.issues, sort_keys=True)
+        with self.assertRaisesRegex(SystemExit, 'no option 1'):
+            self.run_cli('answer', '2.1', '1.1')
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        for picks in (('1.3', '1.3'), ('1.3', '1.4')):
+            with self.subTest(picks=picks), self.assertRaisesRegex(SystemExit, 'duplicate task'):
+                self.run_cli('answer', *picks)
+            self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        self.run_cli('answer', '1.4', '2.1')
+        self.assertEqual((self.task(1)['state'], self.task(2)['state']), ('doing', 'doing'))
+        self.run_cli('requeue', '1')
+        self.legacy(1)
+        self.run_cli('ask', '1', '--text', 'Third action', '--option', 'retry')
+        self.assertIn('- 1.5 retry ★', self.run_cli('status'))
+
+    def test_legacy_and_invalid_decision_numbering(self):
+        self.unmanaged()
+        self.add('legacy')
+        self.legacy(1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'ask', 'ask', decision={'summary': 'legacy', 'options': ['keep'], 'recommend': 1})
+        issue = self.board.issues[1]
+        parsed = self.task(1)
+        raw = dict(parsed['raw'])
+        raw.pop('decision_next')
+        raw['decision'].pop('start')
+        issue['body'] = taskq.block(parsed['text'], raw)
+        self.run_cli('answer', '1.1')
+        self.run_cli('ask', '1', '--text', 'new', '--option', 'changed')
+        self.assertIn('- 1.2 changed ★', self.run_cli('status'))
+        raw = self.task(1)['raw']
+        raw['decision']['start'] = 'bad'
+        issue['body'] = taskq.block(self.task(1)['text'], raw)
+        with self.assertRaisesRegex(SystemExit, 'invalid decision numbering'):
+            self.run_cli('answer', '1.2')
+        self.assertIn('Invalid decision numbering; read the issue', self.run_cli('status'))
+
+    def test_later_and_media_links_have_narrow_client_fallbacks(self):
+        taskq.CONFIG['limits'] = {'fake': 0}
+        for n in range(1, 9):
+            self.add('Long parked title repeated across every issue number')
+            self.run_cli('later', str(n))
+        out = self.run_cli('status')
+        self.assertIn('Later 8 · [later tasks]', out)
+        self.assertNotIn('Long parked', out)
+        taskq.CONFIG.update(board='gitlab')
+        self.assertIn('issues?state=opened&label_name%5B%5D=q-later)', self.run_cli('status'))
+        taskq.CONFIG.update(board='github', assignee='alice')
+        for issue in self.board.issues.values():
+            issue['assignees'] = ['alice']
+        self.assertIn('Later 8:\n- [#1 Long parked title repeated]', self.run_cli('status'))
+        del taskq.CONFIG['assignee']
+        taskq.CONFIG['board_url'] = 'https://board/?custom=1'
+        self.assertIn('Later 8:\n- [#1 Long parked title repeated]', self.run_cli('status'))
+        taskq.CONFIG.update(board='file', board_url=None)
+        out = self.run_cli('status')
+        self.assertIn('Later 8:\n- [#1 Long parked title repeated]', out)
+        self.assertEqual(out.count('https://board/'), 8)
+        item = {'iid': 7, 'title': 'Media choice', 'state': 'ask', 'url': 'https://board/7',
+                'raw': {'decision': {'summary': 'Illustrative asset, not verified.', 'start': 3,
+                                     'options': ['keep', 'change'], 'recommend': 2,
+                                     'links': ['https://x/shot(a).png', 'https://x/demo.mp4']}}}
+        for client in ('codex', 'claude', 'dot', 'cli', ''):
+            with self.subTest(client=client), mock.patch.dict(os.environ, {'TASKQ_CLIENT': client}):
+                rendered = '\n'.join(taskq.decisions([item]))
+                self.assertIn('[Image 7 v3.1](https://x/shot%28a%29.png)', rendered)
+                self.assertIn('[Result 7 v3.2](https://x/demo.mp4)', rendered)
+                self.assertIn('- 7.4 change ★', rendered)
+                self.assertEqual('![Image' in rendered, client in ('codex', 'claude'))
 
     def restricted(self, people, **fields):
         n = self.board.add('restricted', taskq.block('g', {'event_schema': 1, 'deps': [], 'pm': taskq.origin(), **fields}),
@@ -2327,7 +2455,7 @@ class Tick(TickSetup):
         self.assertEqual((self.task(ready)['state'], self.task(active)['claim']['session'], self.fake.names), ('ready', f's-T{active}', []))
         for text in (out, ticked):
             self.assertIn('In work 1 · Waiting for answer 0 · Ready 1', text)
-            self.assertIn(f'| [#{ready} restricted](https://board/{ready}) | ready |', text)
+            self.assertIn(f'- [#{ready} restricted](https://board/{ready}) · ready', text)
 
     def test_assignee_starts_only_matching_tasks(self):
         # #480: "assignee" set: tick starts, and tick/wait/list show, only tasks assigned to it; unassigned ones are skipped
@@ -2685,7 +2813,7 @@ class Tick(TickSetup):
             self.assertEqual((self.task(2)['state'], len(lead.names)), ('ready', 1))
             with self.assertRaisesRegex(SystemExit, 'Hermes native supervisor bridge is not configured'):
                 self.run_cli('tick')
-            self.assertIn('| [#2 two](https://board/2) | blocked (no manager) | any |  |', self.run_cli('status'))
+            self.assertIn('- [#2 two](https://board/2) · blocked (no manager)', self.run_cli('status'))
 
     def test_one_controller_under_duplicate_events(self):
         # R3 (#525): run and close come from the supervisor, the manager or the owner; repeats spawn nothing more
@@ -3804,7 +3932,7 @@ class MultiPM(Base):
             self.add('two', '--runtime', 'fake')
         self.legacy(2)
         with self.pm(self.A):
-            self.assertIn('| [#1 one](https://board/1) | blocked (no manager) |', self.run_cli('tick'))
+            self.assertIn('- [#1 one](https://board/1) · blocked (no manager)', self.run_cli('tick'))
         claim = self.task(2)['claim']
         with self.pm(self.B):
             self.run_cli('pm', '--adopt', '1', '2')

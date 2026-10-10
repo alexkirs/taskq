@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,8 @@ SESSION = '0123456789abcdef'
 BIRTH = f'{taskq.process_domain()}:1' + (':0' if sys.platform == 'darwin' else '')
 NEXT_BIRTH = f'{taskq.process_domain()}:2' + (':0' if sys.platform == 'darwin' else '')
 REAL_RUN, REAL_POPEN = subprocess.run, subprocess.Popen  # Base fails any real process; the pull test needs git, the sender loop bash
+LINUX_HERMES = (sys.platform == 'linux' and hasattr(os, 'pidfd_open') and
+                hasattr(signal, 'pidfd_send_signal') and Path('/proc/sys/kernel/random/boot_id').is_file())
 
 
 class FakeBoard:
@@ -1398,6 +1401,24 @@ class FakeRuntime:
 
 
 class HermesAdmission(Base):
+    def test_native_structured_state_requires_exact_identity_and_idle_proof(self):
+        bridge = taskq.load_file('runtimes/hermes.py', ROOT)
+        for snapshot in ({'output': 'Agent Running: No'}, {'running': False},
+                         {'session_id': 'live', 'session_key': 'stored', 'running': False, 'hydrating': True},
+                         {'session_id': 'other', 'session_key': 'stored', 'running': False}):
+            self.assertIsNone(bridge.snapshot_state(snapshot, 'stored', 'live'))
+        self.assertEqual(bridge.snapshot_state({'session_id': 'live', 'session_key': 'stored', 'running': False}, 'stored', 'live'), 'idle')
+
+    def test_linux_bridge_refuses_unsupported_hosts_before_launch(self):
+        bridge = taskq.load_file('runtimes/hermes.py', ROOT)
+        with mock.patch.dict(os.environ, {'HERMES_HOME': str(self.root),
+                'TASKQ_HERMES_COMMAND': json.dumps([sys.executable, '-m', 'tui_gateway.entry'])}):
+            for platform in ('win32', 'darwin'):
+                with self.subTest(platform=platform), mock.patch.object(bridge.sys, 'platform', platform):
+                    self.assertFalse(bridge.available())
+                    with self.assertRaisesRegex(ValueError, 'Hermes needs Linux pidfds'):
+                        bridge.spawn('S1 unsupported', 'Never launch', self.root)
+
     def setUp(self):
         super().setUp()
         self.native, self.worker = FakeRuntime(), FakeRuntime()
@@ -3294,14 +3315,20 @@ class Wait(TickSetup):
         """#522: a local thread (rollout under sessions/) gets exec resume; the shell loop stops on a failed send."""
         with mock.patch.dict(os.environ, {**self.codex_home('sessions/2026/10/09', 'T1'), 'CODEX_THREAD_ID': 'T1'}):
             sender, self_arm = self.run_cli('arm', 'tick', 'T1'), self.run_cli('arm', 'tick')
-        self.assertIn('resume T1 "<its output>"', sender)
-        self.assertIn('codex exec -s danger-full-access resume T1', sender)
-        self.assertIn('resume T1 "$e" && printf', sender)
-        self.assertIn('ack --stdin --pm T1; do :; done;', sender)
+        if os.name == 'nt':
+            self.assertIn(taskq.native_command(['codex', 'exec', *taskq.codex_options(), 'resume', 'T1', '-']), sender)
+            self.assertIn('while ($true)', sender)
+            self.assertIn("ack --stdin --pm 'T1'", sender)
+            self.assertIn('if ($LASTEXITCODE -ne 0) { break }', sender)
+        else:
+            self.assertIn('resume T1 "<its output>"', sender)
+            self.assertIn('codex exec -s danger-full-access resume T1', sender)
+            self.assertIn('resume T1 "$e" && printf', sender)
+            self.assertIn('ack --stdin --pm T1; do :; done;', sender)
         self.assertNotIn('send_message_to_thread', sender)
         self.assertIn('in the foreground', self_arm)
         self.assertIn('Optional, only to be woken between turns: `', self_arm)
-        self.assertIn('arm tick T1`', self_arm)
+        self.assertIn("arm tick 'T1'`" if os.name == 'nt' else 'arm tick T1`', self_arm)
         self.assertNotIn('Before you end a turn', self_arm)
         self.assertIn('no sender, timer or extension', self_arm)
 
@@ -3317,7 +3344,8 @@ class Wait(TickSetup):
                     with self.subTest(target=target):
                         out = self.run_cli('arm', 'tick', target)
                         if route == 'local':
-                            self.assertIn(f'resume {thread} "<its output>"', out)
+                            self.assertIn(taskq.native_command(['codex', 'exec', *taskq.codex_options(), 'resume', thread, '-'])
+                                          if os.name == 'nt' else f'resume {thread} "<its output>"', out)
                             self.assertNotIn('send_message_to_thread', out)
                         elif route == 'archived':
                             self.assertIn(f'{thread} is archived in Codex', out)
@@ -3327,10 +3355,11 @@ class Wait(TickSetup):
                             self.assertIn(f'to {thread} with `send_message_to_thread`', out)
                             self.assertNotIn(f'resume {thread}', out)
                         if route != 'archived':
-                            self.assertIn(f'wait --pm {thread}`', out)
+                            self.assertIn(f'wait --pm {taskq.shell_quote(thread, os.name == "nt")}`', out)
                         self.assertEqual(out, self.run_cli('arm', 'tick', target))
                 self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX sender shell; native receiver boundary is ShellBriefs.test_native_sender_stops_on_failed_wait_send_or_ack')
     def test_arm_tick_shell_loop_stops_on_failed_wait_or_send(self):
         """#522: the printed shell loop sends each event once and stops on the first failed wait or send."""
         with mock.patch.dict(os.environ, self.codex_home('sessions/2026/10/09', 'T1')):
@@ -4350,7 +4379,7 @@ class Cleanup(Base):
         for patcher in (mock.patch.object(taskq, 'runtimes', return_value={'fake': self.fake}),
                         mock.patch.object(taskq, 'open_prs', return_value={'taskq-1': 11, 'taskq-9': 12}),
                         mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN),
-                        mock.patch.dict(os.environ, {'PATH': os.defpath})):
+                        mock.patch.dict(os.environ, {'PATH': os.environ.get('PATH', os.defpath)})):
             patcher.start()
             self.addCleanup(patcher.stop)
         origin = tempfile.TemporaryDirectory()
@@ -4655,6 +4684,9 @@ class RealChild(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, SUPERCOMPRESS_CONFIG_DIR=config.name, SUPERCOMPRESS_API_KEY='')
         patcher.start()
         self.addCleanup(patcher.stop)
+        # These children execute the candidate, not the parent's immutable installed release.
+        for key in ('TASKQ_INSTALL_DIR', 'TASKQ_RELEASE_COMMIT'):
+            os.environ.pop(key, None)
 
     def test_quiet_guard_timeout_is_nonzero_without_writes(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -4866,6 +4898,7 @@ def link(session): return None
         self.assertRegex(log, r'^\S+ \S+ add #1\n#1 doing\n')
 
 
+@unittest.skipUnless(LINUX_HERMES, 'Hermes owner boundary requires Linux /proc and pidfds (§ 8)')
 class HermesNativeBoundary(unittest.TestCase):
     """Real owner/stdin boundary, protocol-accurate fake downstream; optional real Hermes."""
     def setUp(self):
@@ -5039,11 +5072,6 @@ class HermesNativeBoundary(unittest.TestCase):
         self.assertFalse(list(self.runtime.folder().glob('*.ipc')))
 
     def test_unknown_structured_state_and_owner_reuse_fail_closed(self):
-        for snapshot in ({'output': 'Agent Running: No'}, {'running': False},
-                         {'session_id': 'live', 'session_key': 'stored', 'running': False, 'hydrating': True},
-                         {'session_id': 'other', 'session_key': 'stored', 'running': False}):
-            self.assertIsNone(self.runtime.snapshot_state(snapshot, 'stored', 'live'))
-        self.assertEqual(self.runtime.snapshot_state({'session_id': 'live', 'session_key': 'stored', 'running': False}, 'stored', 'live'), 'idle')
         endpoint = self.root / 'reused.ipc'
         endpoint.mkdir()
         owner = {'pid': os.getpid(), 'birth': 'not-the-current-birth', 'nonce': 'old'}
@@ -5249,7 +5277,7 @@ class HermesPilotLocal(unittest.TestCase):
         args = self.args(profile, codex)
         with mock.patch.object(self.pilot, 'ROOT', project), \
                 mock.patch.object(self.pilot.shutil, 'which', return_value='/fixture/codex'), \
-                mock.patch.dict(os.environ, {}, clear=True):
+                mock.patch.dict(os.environ, {'HOME': str(self.root), 'USERPROFILE': str(self.root)}, clear=True):
             self.assertEqual(self.pilot.preflight(args), [])
             args.hermes_home = str(Path.home() / '.hermes')
             self.assertTrue(any('default home refused' in item for item in self.pilot.preflight(args)))
@@ -5271,7 +5299,7 @@ class HermesPilotLocal(unittest.TestCase):
         args = self.args(profile, codex)
         with mock.patch.object(self.pilot, 'ROOT', project), mock.patch.object(Path, 'home', return_value=user), \
                 mock.patch.object(self.pilot.shutil, 'which', return_value='/fixture/codex'), \
-                mock.patch.dict(os.environ, {'HOME': str(user), 'CODEX_HOME': str(codex)}, clear=True):
+                mock.patch.dict(os.environ, {'HOME': str(user), 'USERPROFILE': str(user), 'CODEX_HOME': str(codex)}, clear=True):
             self.assertEqual(self.pilot.preflight(args), [])
             args.codex_home = '~/.codex'
             self.assertEqual(self.pilot.preflight(args), [])
@@ -5294,11 +5322,13 @@ class HermesPilotLocal(unittest.TestCase):
             self.assertNotIn('TASKQ_HERMES_TEST_AUTH_READY', os.environ)
         check.exercise = mock.Mock(side_effect=selected)
         with mock.patch.dict(os.environ, {'TASKQ_HERMES_TEST_HOME': str(profile),
+                'HOME': str(self.root), 'USERPROFILE': str(self.root),
                 'TASKQ_HERMES_COMMAND': json.dumps([sys.executable, '-m', 'tui_gateway.entry'])}, clear=True):
             check.test_installed_hermes_isolated()
         check.exercise.assert_called_once_with()
         self.assertEqual(sorted(path.name for path in profile.iterdir()), ['config.yaml'])
 
+    @unittest.skipUnless(LINUX_HERMES, 'Linux Hermes pilot file-board uses fcntl and POSIX executable guards (§ 8)')
     def test_disposable_origin_genuine_research_close_without_push(self):
         (self.root / 'board.py').write_text(self.pilot.FILE_BOARD)
         (self.root / 'issues.json').write_text('{}')

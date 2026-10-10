@@ -717,7 +717,7 @@ Provider contract reviewed at Supercompress/Supercompress commit
 `https://www.supercompress.dev/api/v1/compress`, `X-API-Key`, JSON context/query with `ccr:false`,
 `cache_prefix:false`, `log:false`; fixed host, no redirects, retries or remote retrieval. One owned short
 stdlib Python network subprocess receives context/query/key only through private stdin, never argv,
-files or inherited credentials. It starts no descendants. After OS process creation, one 10-second
+files or inherited credentials. It starts no descendants. After OS process creation, one 60-second
 deadline watchdog kills that owned child through its process handle, including blocked stdin transfer
 and DNS/request/header/body stalls. It is always cancelled and joined; the child is always waited for.
 OS process creation itself is host-controlled, not an absolute bounded-time guarantee. The response

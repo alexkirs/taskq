@@ -295,7 +295,7 @@ class Compression(Base):
                 response.status = status
                 response.read1.side_effect = [json.dumps(self.result).encode(), b'']
                 result, reason = Compression.http_request(self.source, 'intent', self.KEY)
-                connect.assert_called_once_with('www.supercompress.dev', timeout=10)
+                connect.assert_called_once_with('www.supercompress.dev', timeout=60)
                 connection = connect.return_value
                 connection.request.assert_called_once()
                 method, path, body, headers = connection.request.call_args.args
@@ -342,7 +342,7 @@ class Compression(Base):
             self.assertNotIn(self.KEY, str(argv) + str(options['env']))
             self.assertNotIn(self.source, str(argv))
             self.assertEqual(json.loads(spawn.return_value.communicate.call_args.args[0]), [self.source, 'owner query stays exact', self.KEY])
-            self.assertEqual(timer.call_args.args[0], 10)
+            self.assertEqual(timer.call_args.args[0], 60)
             timer.return_value.cancel.assert_called_once()
             timer.return_value.join.assert_called_once()
             spawn.return_value.wait.assert_called_once()

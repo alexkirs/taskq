@@ -1624,7 +1624,7 @@ def cmd_cleanup(args):
     print('\n'.join([*removed, *(f'kept {line}' for line in kept), *(f'mess: {line}' for line in mess)]) or 'nothing to clean')
 
 COMPRESS_HOST = 'www.supercompress.dev'
-COMPRESS_LIMIT, COMPRESS_MIN, COMPRESS_BYTES, COMPRESS_TIMEOUT = 120000, 2000, 1048576, 10
+COMPRESS_LIMIT, COMPRESS_MIN, COMPRESS_BYTES, COMPRESS_TIMEOUT = 120000, 2000, 1048576, 60
 COMPRESS_WORKER = ('import json,runpy,sys;scope=runpy.run_path(sys.argv[1]);'
                   'value=scope["_compression_http"](*json.load(sys.stdin));'
                   'output=json.dumps(value).encode("utf-8");'

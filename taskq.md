@@ -756,8 +756,8 @@ Cover duplicate/out-of-order inputs, partial success, crash/recovery and determi
 replay without weakening requirements to make tests pass. Model PASS is not native process,
 persistence or provider qualification. This principle introduces no new database, schema,
 daemon, DSL or dependency. Current regression command is `python3 -B -m unittest discover -s tests`;
-platform skips and native-proof boundaries must be reported. Hypothesis remains a test-only
-pilot pending dependency review; no existing suite is claimed to use it already.
+platform skips and native-proof boundaries must be reported. Hypothesis is the reviewed test-only #641 pilot dependency; other suites and
+production admission are not qualified by that pilot.
 
 ## Product
 
@@ -1769,8 +1769,8 @@ and effective environment, plus preserved fault sensitivity; retain meaningful t
 only when an accepted contract supersedes its behavior or named remaining checks detect its relevant faults.
 Unknown value or cost is not zero and is not grounds for deletion. A flaky valuable check needs isolation or
 repair, not reruns until green. Fault injection, bounded property checks or targeted mutation need a named gap,
-a plausible fault/input distribution and a useful oracle; use existing stdlib facilities, not a standing quota
-or new framework. Report synthetic sensitivity separately from historical failure-before-fix evidence.
+a plausible fault/input distribution and a useful oracle; use existing stdlib facilities (except the narrow #641 Hypothesis pilot), not a standing quota
+or another framework. Report synthetic sensitivity separately from historical failure-before-fix evidence.
 
 #### Bounded pilot
 

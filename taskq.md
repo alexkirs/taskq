@@ -48,6 +48,14 @@ No native steering is assumed.
 
 ### R3. Roles and session names
 
+Changed (#622, native Windows Codex startup): generated role instructions assumed POSIX `export`,
+`python3` and Bash command chains on every host → native Windows Codex instructions require
+`exec_command` with `shell="powershell.exe"`, `login=false`, native Windows paths, PowerShell environment
+assignments and quoted absolute paths to the running Python and TaskQ script. Worker and supervisor
+identity is set on every command. Manager and sender commands use the same native syntax; sequential
+steps stop on failure. POSIX hosts and non-Codex Bash runtimes retain their shell route. This changes no
+global configuration, model, permission, board authority or coordination safeguard.
+
 - Owner: decides product questions, answers `ask`.
 - Manager: the session the owner talks to; takes requests, sets priority, files tasks, runs the tick, relays the
   owner's questions and each supervisor's one-line outcome (§ 7). Does no task work; code, diffs, test logs and

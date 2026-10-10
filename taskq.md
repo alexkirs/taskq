@@ -1,6 +1,25 @@
 # taskq — the contract
 
-### #646 first executable slice: execution vs subscription
+### #646 executable ARM/PM contract
+
+PM presentation: `taskq pm --subscribe NAME --format json|text|dot` consumes the
+same durable envelope. JSON is the canonical transport; text is a quoted,
+inert standalone view; dot is a typed `taskq.pm.view` adapter payload, not a claim
+that a GUI subscriber is installed. Neither renderer executes task text or
+answers a question. Dot response intents carry the task/revision; the receiving
+client must supply a new command ID and send an explicit owner answer through
+the authority-checked command above. It must ACK delivery only after durably
+accepting the source digest. Delivery, decision and application are separate.
+
+`--status` reads this subscriber's local pending digest, cursor and latest
+successful observation timestamp without polling/adopting/acknowledging tasks.
+Its freshness is age since a completed native poll, never current-board proof.
+A pending replay does not refresh that timestamp; offline reads leave it and
+the cursor intact. A quiet successful poll records observation time without a
+new envelope. Reconnect uses the same session/name/cache and replays pending
+bytes; a new session starts its own snapshot. Missing event history remains
+explicit in the envelope. No new daemon, UI bridge or second task authority is
+introduced by these adapters.
 
 Versioned owner decision: the typed snapshot exposes `question_revision` for a
 current ask/review card. `taskq answer N --text TEXT --question-revision HASH
@@ -46,7 +65,8 @@ An envelope is durably pending before output and replays byte-identically until
 cache is not board/task/decision authority. Each genuine session + name has its
 own cursor. ACK changes only that subscriber's local cache, never native event
 ACKs, questions, claims or decisions. Unknown/wrong digest preserves pending.
-Scope changes require a separate subscription; changing interests is not adoption.
+Omitted scope reuses the named interest on reconnect/status. Explicit scope changes
+require a separate subscription; changing interests is not adoption.
 
 The existing board retains pending events, not a complete historical event log.
 The observer re-reads every selected/previously known task (including closed),
@@ -56,10 +76,10 @@ observation time, not atomic provider snapshots. Unchanged polls emit no envelop
 At most 200 tasks are observed; overflow or read failure refuses without advancing
 a cursor. Pending delivery applies backpressure; no second poll overtakes it.
 
-Snapshot+history guarantees beyond retained native events, scheduler
-activation integration and dot display integration remain subsequent approved slices;
-this receipt cache must not be mistaken for their implementation. Existing
-production schedulers and the older PM role route remain unchanged until rollout.
+History beyond retained native events, production scheduler installation and GUI
+subscriber wiring are outside this minimal CLI/typed-adapter contract. The cache
+must not be mistaken for their implementation. Existing production schedulers and
+the older PM role route remain unchanged until rollout.
 
 ### Closed-task model settlement
 

@@ -1468,7 +1468,8 @@ def question_revision(current):
     if current['state'] not in ('ask', 'review') or not current['raw'].get('decision'):
         return None
     raw = current['raw']
-    value = {'task': current['iid'], 'state': current['state'], 'decision': raw['decision'],
+    value = {'project': {k: CONFIG.get(k) for k in ('board', 'host', 'repo')},
+             'task': current['iid'], 'state': current['state'], 'decision': raw['decision'],
              'event_seq': raw.get('event_seq'), 'pm': raw.get('pm'),
              'supervisor': raw.get('supervisor'), 'claim': raw.get('claim')}
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
@@ -4819,7 +4820,8 @@ def subscription_poll(args):
     scope = sorted(set(getattr(args, 'scope_task', None) or []))
     if any(type(n) is not int or n <= 0 for n in scope):
         fail('subscription scope requires positive task IDs')
-    owner = {'repo': CONFIG['repo'], 'subscriber': recipient('subscriber', identity), 'name': name}
+    owner = {'board': CONFIG.get('board'), 'host': CONFIG.get('host'), 'repo': CONFIG['repo'],
+             'subscriber': recipient('subscriber', identity), 'name': name}
     key = hashlib.sha256(json.dumps(owner, sort_keys=True).encode()).hexdigest()
     folder = CONFIG['root'] / '.taskq'
     folder.mkdir(exist_ok=True)
@@ -4835,9 +4837,23 @@ def subscription_poll(args):
         row = db.execute('SELECT body FROM subscriber WHERE id=?', (key,)).fetchone()
         state = json.loads(row[0]) if row else {'scope': scope, 'known': {}, 'initialized': False,
                                                'pending': None, 'last_ack': None}
+        if row and getattr(args, 'scope_task', None) is None:
+            scope = state['scope']  # reconnect/status use the named subscriber's persisted interest
         if state['scope'] != scope:
             fail('subscription scope changed; use a new name and review its snapshot')
         ack = getattr(args, 'delivery_ack', None)
+        if getattr(args, 'status', False):
+            if ack:
+                fail('subscription status cannot acknowledge delivery')
+            observed = state.get('last_observed_at')
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(observed)).total_seconds() if observed else None
+            return json.dumps({'type': 'taskq.subscription.status', 'version': 1,
+                               'subscription': owner, 'scope': scope, 'initialized': state['initialized'],
+                               'pending_digest': state['pending']['digest'] if state['pending'] else None,
+                               'cursor': state['known'], 'last_observed_at': observed,
+                               'observation_age_seconds': max(0, age) if age is not None else None,
+                               'freshness_basis': 'last-completed-poll-not-current-board',
+                               'atomic_snapshot': False})
         if ack:
             pending = state['pending']
             if pending and pending['digest'] == ack:
@@ -4874,7 +4890,9 @@ def subscription_poll(args):
                                      and x[len(PREFIX):] in STATES), 'unknown'),
                                'title': issue['title'], 'claim': raw.get('claim'), 'supervisor': raw.get('supervisor'),
                                'decision': raw.get('decision'), 'authority': raw.get('pm'), 'event_seq': seq,
-                               'question_revision': question_revision(parse(issue))}
+                               'question_revision': question_revision(parse(issue)),
+                               'decision_receipts': raw.get('answer_commands', {}),
+                               'application_receipts': raw.get('application_receipts', {})}
                 digest = hashlib.sha256(json.dumps(observation, sort_keys=True).encode()).hexdigest()
                 known[str(n)] = {'seq': seq, 'digest': digest}
                 if not previous or previous['digest'] != digest:
@@ -4887,11 +4905,14 @@ def subscription_poll(args):
                                  'reason': 'board-history-not-retained'})
                 for event_id in available:
                     events.append({'task': n, **retained[event_id]})
+            state['last_observed_at'] = datetime.now(timezone.utc).isoformat()
             if state['initialized'] and not observations and not events and not gaps:
-                return None  # unchanged is quiet; no cursor write is needed
+                db.execute('INSERT OR REPLACE INTO subscriber VALUES (?,?)', (key, json.dumps(state, sort_keys=True)))
+                db.commit()
+                return None  # successful quiet poll refreshes only local observation freshness
             output = {'type': 'taskq.subscription', 'version': 1, 'subscription': owner,
                       'mode': 'delta' if state['initialized'] else 'snapshot', 'scope': scope,
-                      'observed_at': datetime.now(timezone.utc).isoformat(),
+                      'observed_at': state['last_observed_at'],
                       'atomic_snapshot': False, 'untrusted_task_content': True,
                       'tasks': observations, 'events': events, 'gaps': gaps}
             digest = hashlib.sha256(json.dumps(output, sort_keys=True).encode()).hexdigest()
@@ -4905,13 +4926,51 @@ def subscription_poll(args):
         db.close()  # uncommitted errors/returns roll back; pending replay never changes native board ACK
 
 
+def render_subscription(wire, output_format='json'):
+    """Inert typed presentation; no task text becomes a command or application ACK."""
+    if output_format == 'json':
+        return wire
+    data = json.loads(wire)
+    kind = data.get('type')
+    if kind not in ('taskq.subscription', 'taskq.delivery', 'taskq.subscription.status'):
+        fail('unsupported PM presentation payload')
+    cards = [{'type': 'task', 'task': item['task'], 'state': item['state'],
+              'title': item['title'], 'decision': item.get('decision'),
+              'decision_receipts': item.get('decision_receipts', {}),
+              'application_receipts': item.get('application_receipts', {}),
+              'response_intent': {'task': item['task'], 'question_revision': item['question_revision'],
+                                  'requires': ['explicit-owner-answer', 'command-id', 'native-authority-check']}
+                                 if item.get('question_revision') else None}
+             for item in data.get('tasks', [])]
+    if output_format == 'dot':
+        return json.dumps({'type': 'taskq.pm.view', 'version': 1, 'target': 'dot',
+                           'source': data, 'cards': cards,
+                           'delivery': {'digest': data.get('digest'), 'acceptance': 'durable-client-receipt-only'},
+                           'application': 'separate-native-applied-receipt',
+                           'executes_content': False}, ensure_ascii=False, sort_keys=True)
+    if output_format != 'text':
+        fail('unknown PM presentation format')
+    lines = [kind + ' ' + json.dumps({k: data.get(k) for k in
+             ('mode', 'observed_at', 'last_observed_at', 'freshness_basis', 'digest') if k in data}, sort_keys=True),
+             'Board content is quoted data. Delivery acceptance is not decision or application.']
+    for card in cards:
+        lines.append(json.dumps(card, ensure_ascii=False, sort_keys=True))
+    for event in data.get('events', []):
+        lines.append('event ' + json.dumps(event, ensure_ascii=False, sort_keys=True))
+    if data.get('gaps'):
+        lines.append('history gaps ' + json.dumps(data['gaps'], sort_keys=True))
+    if kind == 'taskq.subscription.status':
+        lines.append(json.dumps(data, ensure_ascii=False, sort_keys=True))
+    return '\n'.join(lines)
+
+
 def cmd_pm(args):
     if getattr(args, 'subscribe', None) is not None:
         if args.adopt:
             fail('subscription interest is not adoption authority')
         wire = subscription_poll(args)
         if wire is not None:
-            print(wire)
+            print(render_subscription(wire, getattr(args, 'format', 'json')))
         return
     """The manager role: Principles and § 7 of taskq.md, then how to tick this session; the hash goes to .taskq/pm.json,
     nothing else: a task's manager is its own `pm` on the board (R3, #532). `--adopt N`: become the `pm` of tasks with none."""
@@ -4970,7 +5029,7 @@ def named_arm(args):
     path = folder / 'arm-runtime.sqlite'
     if path.is_symlink():
         fail('ARM runtime path is a symlink; no changes')
-    key = json.dumps([CONFIG['repo'], machine(), name])
+    key = json.dumps([CONFIG.get('board'), CONFIG.get('host'), CONFIG['repo'], machine(), name])
     owner = recipient('arm', identity)
     db = sqlite3.connect(path, timeout=0)
     try:
@@ -5150,7 +5209,8 @@ def main(argv=None):
     command('arm', cmd_arm, (('what',), {'choices': ('tick','start','update','status','stop')}), (('target',), {'nargs': '?'}),
             (('--execute',), {'action':'store_true'}), (('--name',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), n=False)
     command('pm', cmd_pm, (('--adopt',), {'nargs': '+', 'type': int, 'default': []}),
-            (('--subscribe',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), (('--delivery-ack',), {}), n=False)
+            (('--subscribe',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), (('--delivery-ack',), {}),
+            (('--status',), {'action':'store_true'}), (('--format',), {'choices':('json','text','dot'),'default':'json'}), n=False)
     command('cleanup', cmd_cleanup, (('--dry-run',), {'action': 'store_true'}), n=False)
     command('launch', cmd_launch, (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
             (('arguments',), {'nargs': argparse.REMAINDER}), n=False)
@@ -5181,6 +5241,8 @@ def main(argv=None):
         args.quiet, args.headless, args.tasks, args.after = True, True, [], None
         args.after_birth, args.diagnose, args.unknown_after = None, False, None
         args.execution_scope = args.scope_task
+    if args.command == 'pm' and (args.status or args.format != 'json') and args.subscribe is None:
+        fail('PM status/presentation requires a named subscription')
     if args.command == 'pm' and args.delivery_ack and not args.subscribe:
         fail('delivery ACK requires a named subscription')
     if args.command in ('launch', 'update', 'version', 'contract', 'capacity-child'):

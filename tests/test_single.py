@@ -1931,7 +1931,8 @@ class Tick(TickSetup):
             [#4 asking](https://board/4)
             Built A | B.
             Keep it?
-            - 4.1 keep it
+            - 4.1 keep
+              it
             - 4.2 drop ★
 
             Later 1 · [later tasks](https://github.com/o/r/issues?q=is%3Aissue+is%3Aopen+label%3Aq-later)
@@ -2117,12 +2118,14 @@ class Tick(TickSetup):
                    + '\n29 focused tests pass and Linux CI green while local gate fails.\n'
                    + 'Exact command:\n```powershell\ngit push --force-with-lease origin HEAD:refs/heads/taskq-1\n```')
         self.run_cli('ask', '1', '--text', context, '--option', 'retain current deployment until local gate passes',
-                     '--option', 'investigate the failed local gate and report its exact error', '--recommend', '2')
+                     '--option', 'investigate the failed local gate and report its exact error',
+                     '--option', 'Run only after approval:\n```powershell\n& $tool --text "a|b"\n```', '--recommend', '2')
         out = self.run_cli('status')
         self.assertIn(context, out)
         self.assertIn('- 1.1 retain current deployment until local gate passes\n', out)
         self.assertIn('- 1.2 investigate the failed local gate and report its exact error ★\n', out)
         self.assertEqual(self.task(1)['raw']['decision']['summary'], context)
+        self.assertIn('- 1.3 Run only after approval:\n  ```powershell\n  & $tool --text "a|b"\n  ```', out)
         # Narrow terminal fixtures wrap complete choices rather than clipping columns.
         for width in (28, 40, 80):
             wrapped = '\n'.join(textwrap.fill(line, width, break_long_words=True) for line in out.splitlines())
@@ -2168,15 +2171,47 @@ class Tick(TickSetup):
         raw.pop('decision_next')
         raw['decision'].pop('start')
         issue['body'] = taskq.block(parsed['text'], raw)
-        self.run_cli('answer', '1.1')
+        before = json.dumps(self.board.issues, sort_keys=True)
+        with self.assertRaisesRegex(SystemExit, 'uncertain legacy choices'):
+            self.run_cli('answer', '1.1')
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        with self.assertRaisesRegex(SystemExit, 'exact current option text'):
+            self.run_cli('answer', '1', '--text', '1.1')
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        self.run_cli('answer', '1', '--text', 'keep')
         self.run_cli('ask', '1', '--text', 'new', '--option', 'changed')
-        self.assertIn('- 1.2 changed ★', self.run_cli('status'))
+        self.assertIn('Numeric answers unavailable', self.run_cli('status'))
+        with self.assertRaisesRegex(SystemExit, 'uncertain legacy choices'):
+            self.run_cli('answer', '1.1')
+        self.assertEqual(self.task(1)['raw']['decision_next'], 0)
+        self.run_cli('answer', '1', '--text', 'changed')
+        self.run_cli('requeue', '1')
+        self.legacy(1)
+        raw = self.task(1)['raw']
+        raw.pop('decision_next')
+        issue['body'] = taskq.block(self.task(1)['text'], raw)
+        self.run_cli('ask', '1', '--text', 'requeued legacy', '--option', 'different action')
+        with self.assertRaisesRegex(SystemExit, 'uncertain legacy choices'):
+            self.run_cli('answer', '1.1')
         raw = self.task(1)['raw']
         raw['decision']['start'] = 'bad'
         issue['body'] = taskq.block(self.task(1)['text'], raw)
         with self.assertRaisesRegex(SystemExit, 'invalid decision numbering'):
             self.run_cli('answer', '1.2')
         self.assertIn('Invalid decision numbering; read the issue', self.run_cli('status'))
+        raw['decision']['start'] = 1
+        issue['body'] = taskq.block(self.task(1)['text'], raw)
+        issue['labels'] = [label for label in issue['labels'] if not label.startswith('q-')] + ['q-review']
+        self.run_cli('answer', '1', '--text', 'different action')
+        self.assertEqual(self.task(1)['state'], 'doing')
+        self.assertEqual(self.task(1)['raw']['decision_next'], 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            taskq.move(self.task(1), 'review', 'result', decision={'summary': 'Confirm current result',
+                       'options': ['close accepted candidate'], 'recommend': 1})
+        with mock.patch.object(taskq, 'close_one') as close:
+            self.run_cli('answer', '1', '--text', 'close accepted candidate')
+        self.assertEqual(close.call_args.args[0].n, 1)
+        self.assertEqual(close.call_args.args[0].text, 'close accepted candidate')
 
     def test_later_and_media_links_have_narrow_client_fallbacks(self):
         taskq.CONFIG['limits'] = {'fake': 0}
@@ -4072,6 +4107,7 @@ class Contract(Base):
             out = self.run_cli('pm')
         listed.assert_called_once_with(None)
         self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        self.assertIn('Canonical titles: taskq list --full.', out)
         hints = [line for line in out.splitlines() if line.startswith('Unassigned manager:')]
         self.assertEqual(len(hints), 2)
         for n, line in zip((2, 3), hints):

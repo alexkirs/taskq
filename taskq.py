@@ -1133,14 +1133,15 @@ def move(current, state, action, text='', **fields):
     raw = {**current['raw'], **{key: current[key] for key in FIELDS}, **fields}
     old = current['raw'].get('decision') or {}
     if old.get('options') or (raw.get('decision') or {}).get('options') or 'decision_next' in raw:
-        start, next_option = old.get('start', 1), raw.get('decision_next', 1)
-        if type(start) is not int or start < 1 or type(next_option) is not int or next_option < 1:
+        start, next_option = old.get('start', 1), raw.get('decision_next', 0)
+        if type(start) is not int or start < 1 or type(next_option) is not int or next_option < 0:
             fail(f'#{current["iid"]}: invalid decision numbering; re-present the decision')
-        next_option = max(next_option, start + len(old.get('options') or []))
+        next_option = max(next_option, start + len(old.get('options') or [])) if next_option else 0
         card = fields.get('decision') or {}
         if card.get('options'):
-            raw['decision'] = {**card, 'start': next_option}
-            next_option += len(card['options'])
+            raw['decision'] = {**card, 'start': next_option or 1}
+            if next_option:
+                next_option += len(card['options'])
         raw['decision_next'] = next_option  # issue-local codes are never rebound to another action
     raw['events'] = [dict(event, acks=list(event.get('acks', []))) for event in raw.get('events', [])]
     reconcile_recipients(raw)
@@ -1182,7 +1183,7 @@ def cmd_add(args):
     state = 'waiting' if open_deps(args.deps) else 'ready'
     labels = [PREFIX + state, f'priority-{args.priority}', args.type] + ([RUN + args.runtime] if args.runtime != 'any' else []) \
         + ([ON + args.host] if args.host else [])
-    raw = {'scope': args.scope, 'deps': args.deps, 'claim': None, 'result': None, 'pm': origin()}
+    raw = {'scope': args.scope, 'deps': args.deps, 'claim': None, 'result': None, 'pm': origin(), 'decision_next': 1}
     append_event(raw, 'add', '')
     n = effect(BOARD.add, args.title, block(text, raw), labels)
     diagnostic_comment(n, f'**add** · {who()}')
@@ -1300,6 +1301,18 @@ def cmd_answer(args):
     if args.text:
         if len(args.n) != 1 or not args.n[0].isdigit():
             fail('answer N --text A: one task number')
+        current = task(int(args.n[0]), 'ask', 'review')
+        options = (current['raw'].get('decision') or {}).get('options') or []
+        if options and not current['raw'].get('decision_next') and args.text not in options:
+            fail(f'#{current["iid"]}: confirm the exact current option text; legacy numeric tokens are unsafe')
+        if current['state'] == 'review':
+            if args.text not in options:
+                fail(f'#{current["iid"]}: confirm the exact current review option text')
+            if args.text.lower().startswith('close'):
+                close_one(argparse.Namespace(n=current['iid'], text=args.text))
+            else:
+                move(current, 'doing', 'answer', args.text, decision=None)
+            return [current['iid']]
         cmd_move(argparse.Namespace(**{**vars(args), 'n': int(args.n[0])}))
         return [int(args.n[0])]
     selected = codes(args.n)
@@ -1312,6 +1325,11 @@ def cmd_answer(args):
         options, start = card.get('options') or [], card.get('start', 1)
         if type(start) is not int or start < 1:
             fail(f'#{n}: invalid decision numbering; re-present the decision')
+        next_option = current['raw'].get('decision_next', 0)
+        if type(next_option) is not int or next_option < 0 or next_option and start + len(options) > next_option:
+            fail(f'#{n}: invalid decision numbering; re-present the decision')
+        if not next_option:
+            fail(f'#{n}: uncertain legacy choices; read the fresh card and confirm the action with answer {n} --text')
         picks.append((current, k, start <= k < start + len(options) and options[k - start]
                       or fail(f'#{n} has no option {k}; read the current decision')))
     for current, k, text in picks:
@@ -2573,10 +2591,13 @@ def decisions(items):
         if type(start) is not int or start < 1:
             lines += [heading(item), 'Invalid decision numbering; read the issue and re-present choices.', '']
             continue
-        options = [f'- {n}.{start + k - 1} {cell(text)}' + ' ★' * (k == card.get('recommend'))
+        options = [f'- {n}.{start + k - 1} ' + str(text).replace('\r\n', '\n').replace('\r', '\n').replace('\n', '\n  ')
+                   + ' ★' * (k == card.get('recommend'))
                    for k, text in enumerate(card.get('options') or [], 1)]
         question = heading(item) + ' review' * (item['state'] == 'review')
-        lines += [question, card.get('summary') or item['title'], *options, *links, '']
+        warning = ([f'Numeric answers unavailable: uncertain legacy history. Confirm the current action with answer {n} --text.']
+                   if not item['raw'].get('decision_next') else [])
+        lines += [question, card.get('summary') or item['title'], *warning, *options, *links, '']
     if lines:
         lines.pop()
     return lines
@@ -3078,6 +3099,7 @@ def cmd_pm(args):
                   f'`' + (f'Set-Location -LiteralPath {shell_quote(CONFIG["root"], True)} -ErrorAction Stop; {tq} pm --adopt {item["iid"]}'
                           if powershell(runtime) else f'cd {shlex.quote(str(CONFIG["root"]))} && taskq pm --adopt {item["iid"]}')
                   + '`. No ownership or claims changed.')
+    print('Canonical titles: taskq list --full.')
     cmd_arm(argparse.Namespace(target=None))
 
 CODEX_COMPACT = ('-c model_auto_compact_token_limit=200000 -c "compact_prompt=\\"Keep only the owner\'s open questions and '

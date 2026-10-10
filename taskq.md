@@ -953,8 +953,12 @@ outcomes closed before its first wait. A custom adapter without it cannot discov
   answer/requeue. Never reuse a number for a changed action: replacing 577.1/577.2 yields 577.3/577.4.
   `recommend` remains the one-based option position, not the displayed number. Old/missing options refuse
   the entire batch before actions; duplicate task numbers (including conflicting choices) also refuse it.
-  Existing legacy cards keep their current codes until replaced/consumed; historical pre-upgrade reuse cannot
-  be reconstructed reliably, so PMs re-present any stale/uncertain legacy mapping and obtain a fresh answer.
+  Owner selection 597.1 (2026-10-10): fresh numbers, with fail-closed legacy confirmation.
+  New tasks initialize `decision_next` to 1. Missing/zero means the historical numbering floor is unknown;
+  numeric answers are refused, including after a consumed/requeued legacy card. Re-present complete current
+  actions and obtain explicit action text through `answer N --text`; never interpret an old token as confirmation.
+  Zero remains on that issue: textual confirmation does not prove a safe historical numeric floor, so subsequent
+  legacy cards also require explicit text. No automatic numeric re-enablement or invented history.
   No new registry, transport or token syntax; direct manual/old-client writes are not made safe by this policy.
 - `decision` (#490): set by `ask` and `result` from `--option`, `--recommend`, `--link`; cleared by `answer` and `requeue`.
 - `supervisor` (#524, #525): `{"runtime", "session", "name"}` of `S<N>`, same shape as `claim` (the worker's). Set by the

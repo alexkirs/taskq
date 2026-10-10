@@ -26,7 +26,7 @@ All implementation is in `taskq.py`, with regressions in `tests/test_single.py`.
 Read-only #608 history confirms owner answer at 03:08 UTC, a worker nudge, a PM recovery
 note at 03:51 describing idle roles and unsubmitted result, then a result from the same
 worker at 03:52. This supports targeted existing-worker handoff recovery; board history
-alone does not retrospectively verify process state. The csgo #350 rejection and running
+alone does not retrospectively verify process state. The consuming-project rejection and running
 #597/#632 are owner-supplied examples, not independently observed runtime snapshots here.
 No remote Mac process was inspected. No live role was resumed during this research.
 
@@ -180,7 +180,7 @@ These are design invariants and planned checks, not executed recovery proofs.
 | Scenario | Required observable assertion / cheapest level |
 |---|---|
 | #608 acknowledged answer, completed idle worker | One qualified handoff to same role, exact result resolves; ambiguous evidence asks, preserved branch/assets; Tick fake-board test. Real idle receipt/result proof required before automatic enablement. |
-| #350 rejection and setup errors | Classify runtime blocker; zero sends/spawns/permission changes, sanitized rejection retained; Tick table test. Exact terminal-tool provenance needed, not a tail-string guess. |
+| Runtime rejection and setup errors | Classify runtime blocker; zero sends/spawns/permission changes, sanitized rejection retained; Tick table test. Exact terminal-tool provenance needed, not a tail-string guess. |
 | Running / idle legitimate wait / interrupted | Running never sent; legitimate wait silent; interrupted owned turn follows bound without clearing work; extend existing Tick state/death cases. |
 | PID reuse / legacy / remote / unknown | No unrelated kill/send/spawn or invented runtime status; extend RuntimeProcessBoundary cases. macOS native qualification is still unknown. |
 | Pending answer/result, lost ack, role replacement | Original payload/recipient preserved, ack only after delivery, no competing hygiene send; EventDelivery regressions retained. Lost authoritative response retains grant. |

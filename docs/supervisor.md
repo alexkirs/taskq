@@ -158,7 +158,7 @@ live behavior. Existing claims are not rebound. No suite migration or new paid b
 
 Status: **incomplete; isolated persistent ARM qualification BLOCKED**, 2026-10-09 19:39 UTC
 (2026-10-10 in the owner's timezone). This is a bounded research record, not a new role contract.
-The owner activated #595, per-project Claude 0 / Codex 3 for taskq and csgo, and the independently
+The owner activated #595, per-project Claude 0 / Codex 3 for two selected consuming projects, and the independently
 reviewed publication lifecycle. The original intake-only/later restriction is superseded. No additional
 project, permission, model, effort, credential or replacement sender was authorized here.
 
@@ -180,7 +180,7 @@ project, permission, model, effort, credential or replacement sender was authori
   is not an independent app sender and is not an ancestor-wake route. No existing app sender or
   DOT cloud-parent/execution-child session was accessible for qualification. Their actual state is unknown.
 - The executing checkout's limits were read as Claude 0 / Codex 3; the branch's tracked fixture
-  configuration still has the repository defaults. Neither was edited. csgo was not accessed or changed.
+  configuration still has the repository defaults. Neither was edited. The other consuming project was not accessed or changed.
   No real task was adopted/rebound, parked state altered, monitor replaced, wait consumed, runtime
   resumed, production tick launched, or publication/deployment performed by the experiment.
 
@@ -469,9 +469,9 @@ reports these sequential one-shot app observations with unchanged scope and inpu
 
 | Variant / app PM identity | ARM-input observed sequence | Additional next wait | Access interventions / wording clarification | Full qualification |
 |---|---|---|---|---|
-| C / `01a12221-7e86-72ac-ab3d-c26141388099` | arm, tick, wait returning tick, handling tick | None | 1 initial fixture-local pm write retry / 0 observed | BLOCKED: no idle wake or running next wait |
-| I / `01a12224-ecea-7181-bd79-7f28b1aae088` | arm, status/read-only wrapper inspection, tick, wait returning tick, handling tick | Invoked, returned tick; completed | 1 initial fixture-local pm write retry / 0 observed | BLOCKED: no idle wake or running next wait |
-| H / `01a12228-8f25-74d8-973b-a46e9885a0a8` | arm, tick, wait returning tick, handling tick | None | 1 initial fixture-local pm write retry / 0 observed | BLOCKED: no idle wake or running next wait |
+| C / `00000000-0000-0000-0000-000000000001` | arm, tick, wait returning tick, handling tick | None | 1 initial fixture-local pm write retry / 0 observed | BLOCKED: no idle wake or running next wait |
+| I / `00000000-0000-0000-0000-000000000001` | arm, status/read-only wrapper inspection, tick, wait returning tick, handling tick | Invoked, returned tick; completed | 1 initial fixture-local pm write retry / 0 observed | BLOCKED: no idle wake or running next wait |
+| H / `00000000-0000-0000-0000-000000000001` | arm, tick, wait returning tick, handling tick | None | 1 initial fixture-local pm write retry / 0 observed | BLOCKED: no idle wake or running next wait |
 
 All post-access reported commands exit 0. C waits were approximately 4.97 s; I waits 4.974 s and
 4.970 s; H waits 4.958 s in its PM turn and 4.963 s in its ARM turn. These are completed foreground
@@ -493,7 +493,7 @@ wait actions cannot be classified as wording failures when supported monitor/sen
 The [existing executor's transport report](https://github.com/alexkirs/taskq/issues/595#issuecomment-6088121463)
 supersedes the preceding missing-idle-receipt observation for isolated I only. It is a separately labeled
 post-comparison transport qualification, not another unsteered I cell or a winning overlay.
-The sender independently observed target `01a12224-ecea-7181-bd79-7f28b1aae088` idle and verified
+The sender independently observed target `00000000-0000-0000-0000-000000000001` idle and verified
 candidate/harness hashes. Its actual isolated `wait --pm <I target> --window 0.1 --every 1` returned
 `tick`, exit 0, in 6.061 s. It observed the target idle again and sent that output with scope/target.
 The independently inspected completed target receipt turn invoked isolated tick (exit 0, zero counters)

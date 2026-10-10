@@ -1,0 +1,38 @@
+[
+  {
+    "variant": "baseline",
+    "exit": 0,
+    "seconds": 0.066,
+    "summary": "OK"
+  },
+  {
+    "variant": "guard",
+    "exit": 1,
+    "seconds": 0.045,
+    "summary": "FAILED (failures=1)"
+  },
+  {
+    "variant": "writer",
+    "exit": 1,
+    "seconds": 0.042,
+    "summary": "FAILED (failures=1)"
+  },
+  {
+    "variant": "retry",
+    "exit": 1,
+    "seconds": 0.041,
+    "summary": "FAILED (failures=5)"
+  },
+  {
+    "variant": "receipt",
+    "exit": 1,
+    "seconds": 0.05,
+    "summary": "FAILED (failures=1)"
+  },
+  {
+    "variant": "question",
+    "exit": 1,
+    "seconds": 0.061,
+    "summary": "FAILED (failures=1)"
+  }
+]

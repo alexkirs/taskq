@@ -1,11 +1,115 @@
 # taskq — the contract
 
+### Legacy ownership reconciliation preflight
+
+`taskq reconcile N --json` is read-only, including on an incompatible board. It
+never clears claims, retires sessions, acknowledges events, settles results,
+releases grants or changes schema. Its complete source-payload digest binds every
+original identity and pending answer/result/receipt. Repeated identical inputs
+produce an identical plan without effects.
+
+Readiness requires a supported addressed runtime observer on the recorded host,
+exact task/role/session/source digest and verified absence of writers, inflight
+requests and resources for that identity. Active, ambiguous, foreign, stale,
+malformed or unsupported observations block. App turn completion, archival,
+root PID death, operator files/flags and owner permission are not drain evidence.
+Codex currently has no qualified legacy addressed drain observer: its plan is
+BLOCKED. No reconcile apply command is shipped. Future application needs a
+separately reviewed identity-aware transition preserving history, pending answers,
+results and receipts with guarded fresh readback and idempotent effect proof.
+
 taskq is a task queue on an issue board (GitHub or GitLab). One file, `taskq.py`: stdlib only, python3 >= 3.9.
 This file is the whole contract, for every agent (manager or worker) on every runtime (Claude, Codex, other).
 Below, `taskq` means `python3 <taskq clone>/taskq.py` (or its alias, § 1). Run it from the project's
 checkout: it reads the nearest `taskq.json` from the current directory up; that folder is the project root.
 
 ## Principles (R1–R13)
+
+### Current schema policy — owner decision 2026-10-10
+
+Changed (R1/R2/R4/R12, owner turn-budget decision 2026-10-10): runtime limit held by
+task until close -> active model-turn concurrency. Task/session ownership is a separate
+board invariant: an idle task retains its exact worker, pending messages and no-replacement
+barrier. Project and explicitly participating host model grants count active TaskQ-owned
+turns, including supervisors. A correlated terminal turn plus its exact CLI PID/birth death
+may release only a model grant. It never proves artifact acceptance, application of an
+answer, application-writer drain or settlement of heavy/GPU/job resources. Unknown turn
+completion retains its model grant; unknown tool/resource effects retain their own lease
+and task recovery barrier. Process groups are not universal detached-process containment.
+
+Current candidate ordinary wire schema is 3 (uninstalled). Explicit repair 0 -> 3 imports pending messages; 1 -> 3
+preserves existing events/acks and changes only the schema and bounded repair receipt.
+Unknown recorded worker/supervisor ownership blocks either repair; experimental schema2
+has no ordinary repair transition. Old schemas are repair input only, never working modes.
+
+Initial model adapter to qualify is owned Codex CLI, preserving exec/spawn/resume and
+native naming. Actual model admission requires explicitly provisioned project/host capacity
+with a finite `model:codex` dimension. Other adapters without correlated turn binding refuse
+this admission; no unlimited or alternate-worker fallback. Controlled-artifact is a separate
+finite tool/resource profile; its completion cannot stand in for model-turn evidence.
+
+An invocation-local limit smaller than a provisioned model capacity refuses admission;
+provision matching finite capacities explicitly, never rewrite shared authority silently.
+Before model launch, persist an immutable board turn intent and acquire applicable project
+then host grants. Unknown launch/binding never retries a spawn. Bind the real CLI PID/birth,
+log offset and returned native thread ID. Resume uses the same worker and binds exact pending
+event IDs/immutable payload digest (ACK state excluded); delivery/start does not ack. `taskq applied N:ID --artifact RELPATH
+--sha FULLSHA` verifies the native recorded worker/turn, scoped artifact and exact local Git
+commit before writing a native application receipt plus ack with fresh readback. Repeating
+that receipt performs no model turn or artifact write. An exact repeated answer while
+doing/review emits no new event or delivery. When the same native session holds both
+manager and supervisor roles, `ack --role manager|supervisor` chooses its exact recorded
+recipient; sender `--pm` remains refused. Formal result remains independently
+reviewed under existing task acceptance/publication rules. No production activation follows
+fixture or model-probe success.
+
+A model-owned worker's failure `requeue` preserves its exact claim and pending application
+receipts. It records a recovery barrier, never cancels an unapplied answer or authorizes a
+replacement/resume. Ordinary admission and supervisor rework refuse this barrier until a
+separately qualified recovery operation exists; elapsed time is not recovery evidence.
+This includes unsupervised workers and generic defer/reassignment paths: ordinary moves
+cannot retire or replace a model-owned worker identity without qualified recovery.
+
+Changed (R1/R12/R13): parallel operational support for old board schemas -> one current
+operational schema. This decision supersedes the legacy compatibility and migration plans
+below; implementation and qualification are pending. Do not infer that existing releases
+already implement `taskq repair`.
+
+Program release and board schema version are distinct: a code-only update need not repair a
+board. Each schema change has a short, shipped transition entry: from/to version, changed
+fields or semantics, deterministic repair procedure, and verification conditions. This is
+an executable, reviewed transition specification, not arbitrary prose executed by an agent.
+
+On an incompatible board, normal mutations, worker admission and automatic passes stop
+before effects. Read-only diagnosis remains available and reports current/required schema
+and `taskq repair`. Global code installation does not enumerate or rewrite consumer boards.
+Before a selected release starts work in a project, it checks that project's schema gate.
+Explicit owner confirmation authorizes repair of that selected board only, not every project.
+
+`taskq repair` previews the required transitions, then applies them under the existing
+board guard after confirmation. Any authorized agent may invoke the same command; its
+identity does not override active claims or an unknown guard owner. Interrupted repair
+resumes from verified board checkpoints rather than repeating unconfirmed effects.
+Preserve tasks, results, pending questions/answers and their identities. Keep one bounded
+repair receipt on the board; no legacy operational mirror or second queue is maintained.
+
+Publish the current board version only after all affected records pass verification.
+Unknown live worker ownership, unresolved writes or unsupported transitions block repair
+with a concrete diagnostic; elapsed time never proves death or authorizes duplicate work.
+Successful repair enables the current implementation. Old-schema execution is unsupported;
+transition readers exist only for repair. GitHub and GitLab use the same repair contract
+through their native board adapters. No product-wide shared board or cross-user database.
+
+Initial implementation slice: current ordinary wire format is event_schema 1. The shipped
+0 -> 1 repair imports pending comment messages using the reviewed importer and preserves
+existing fields, surrounding prose and comment history. An existing worker/supervisor
+session or conflicting existing imported field blocks this transition; there is no force
+flag. Experimental schema2 is not convertible to ordinary model tasks in this slice.
+Preview: `taskq repair`. Confirm: `taskq repair --apply --yes`. Each converted issue stores
+one source-body hash/from/to receipt alongside its verified schema stamp. Ordinary commands
+refuse a mixed incompatible open board. Closed historical issues are retained and never
+executed; conversion of closed history and replacement of experimental lifecycle commands
+remain unqualified, rather than claimed as complete repair support.
 
 The canonical rules of taskq (owner decision 2026-10-08, #242; restored by #311 after the single-file cutover #290
 dropped `taskq/contracts/principles.md`). The sections below are their mechanics and never restate them.
@@ -57,8 +161,8 @@ steps stop on failure. POSIX hosts and non-Codex Bash runtimes retain their shel
 global configuration, model, permission, board authority or coordination safeguard.
 Native Codex commands preserve every argument through the running Python's subprocess launcher;
 PowerShell 5.1's native argument parser must not strip quotes from owner options or the compact prompt.
-The native sender delivers event text through UTF-8 stdin (`exec resume <id> -`), then acknowledges only
-after successful delivery. Failed wait, delivery or acknowledgement stops the sender.
+The native sender delivers event text through UTF-8 stdin (`exec resume <id> -`) and never acknowledges
+manager events. Failed wait or delivery stops the sender; the manager owns handling acknowledgement.
 The native queue command captures PowerShell arguments before invoking Python, preserving quoted,
 multiline, Unicode and empty values for result/ask/answer text and options without extra escaping.
 
@@ -132,8 +236,8 @@ Changed: any board identity could execute a task → `assignee-only` requires au
 ### R4. Tick is a message or a queue event
 
 Changed (owner-approved audit optimizations, 2026-10-10): a printed observation consumed an outcome →
-versioned-task observation never acknowledges it. The sender acknowledges the exact event IDs only after
-successful delivery; a manager acknowledges after handling them. A failed/lost send leaves events pending.
+versioned-task observation never acknowledges it. The sender only delivers; a manager acknowledges
+after handling through the schema-specific native boundary. A failed/lost send leaves events pending.
 Replay is possible, including a lost acknowledgement response; acknowledgement is idempotent, delivery is
 not claimed exactly once. Recipients include runtime and full session identity, never merely board login.
 State, action payload and event identity share one issue update. Human history comments are diagnostic:
@@ -153,7 +257,7 @@ timer (owner clarification 2026-10-09, #525). The manager is woken only for its 
 until a task enters `ask` or closes, an unsupervised task (R3 Transition) enters `review`, a local session is gone, or
 a safety window (10 min) passes (§ 7 Arm the tick). A pass starts only tasks with no `host-*` label or its own
 machine's, and only those whose `pm` is on its machine (R3). Each manager's `wait` reports only its own tasks (and
-those with no `pm`), each event acknowledged separately per manager: one manager never consumes another's outcome (#532). A sender observes as the manager it serves: `arm tick <manager>` prints `taskq wait --pm <manager id>`; after delivery it acknowledges that manager's exact board event IDs (§ 3). Routes and lifetime stay as #522 set them.
+those with no `pm`), each event acknowledged separately per manager: one manager never consumes another's outcome (#532). A sender observes as the manager it serves: `arm tick <manager>` prints `taskq wait --pm <manager id>`; after delivery the recorded manager applies and acknowledges its exact events (§ 3). Routes and lifetime stay as #522 set them.
 Changed (#603, owner decision 2026-10-10): one checkout's `.taskq/dispatch.lock` and pending file → a
 board-backed guard shared by every cooperating TaskQ process for that project. All board mutations, adoption,
 manual take, dispatch and cleanup hold the same guard across fresh reads, runtime/publication effects and records.
@@ -465,6 +569,19 @@ Changed (owner-approved queue optimization, 2026-10-10): guarded CI waiting and 
 R4's immediate CI refusal and R8's metadata reads, specified before implementation; exact-SHA review and publication remain required.
 Every agent (Claude, Codex, DOT, Hermes, other) reads this file before work; `AGENTS.md` and `CLAUDE.md` point here.
 
+### Executable behavioral model
+
+States, events, transitions and invariants define behavioral truth; the board and native
+receipts remain operational truth. Keep pure transitions separate from I/O. Lifecycle
+changes update the model/properties first, then adapters. Use one executable Python kernel
+in runtime and Hypothesis stateful tests, rather than a second synchronized implementation.
+Cover duplicate/out-of-order inputs, partial success, crash/recovery and deterministic
+replay without weakening requirements to make tests pass. Model PASS is not native process,
+persistence or provider qualification. This principle introduces no new database, schema,
+daemon, DSL or dependency. Current regression command is `python3 -B -m unittest discover -s tests`;
+platform skips and native-proof boundaries must be reported. Hypothesis remains a test-only
+pilot pending dependency review; no existing suite is claimed to use it already.
+
 ## Product
 
 Owner decisions on what taskq looks and sounds like, one line each (#505). Change one only per R13.
@@ -753,10 +870,11 @@ Migration seeds it from trusted history, so current rework instructions and full
 failure and session replacement. Short decision summaries remain display text only.
 
 `wait` prints human event lines with `[event N:ID]`; `wait --json` prints `{events:[{id,text}],tick:bool}`.
-Neither consumes versioned events. `taskq ack N:ID [...] [--pm ID]` acknowledges the current recipient;
-`--pm` is the sender's explicit delegation to the task's recorded manager, never a change of task ownership.
-`taskq ack --stdin [--pm ID]` reads those human lines from stdin. The sender must use the same target for wait,
-delivery and ack, and stop on a failed send or ack. Supervisor waits use the same explicit acknowledgement.
+Neither consumes versioned events. `taskq ack N:ID [...]` acknowledges the genuine current schema1
+recipient; sender `--pm` delegation is refused. `taskq ack --stdin` reads those human lines from stdin.
+The sender uses the same target for wait and delivery and stops on failed send. Schema2 manager ask/result
+application uses `apply-event --role manager`; delivery-only ack is refused. Supervisor schema1 waits retain
+explicit handling acknowledgement until their own native handler is qualified.
 Successful in-process supervisor/worker sends and verified native Hermes wakes acknowledge their exact batch.
 The reserved non-state label `taskq-events` indexes issues with pending manager deliveries; label and JSON are updated together, including removal after ack. Setup/migration provisions this label explicitly. `wait` may record a newly observed dead session under the project guard, but does not acknowledge it. An optional board `closed()` returns closed issues carrying that index; built-in boards implement it so a manager also discovers
 outcomes closed before its first wait. A custom adapter without it cannot discover never-observed closed tasks.
@@ -822,7 +940,7 @@ outcomes closed before its first wait. A custom adapter without it cannot discov
 
 | Command | Does |
 |---|---|
-| `taskq add "<title>" --goal G --acceptance A [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 1\|2] [--host H]` | new task: `q-ready`, or `q-waiting` with open deps |
+| `taskq add "<title>" --goal G --acceptance A [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 1\|2] [--host H] [--later]` | new task: `q-ready`, or `q-waiting` with open deps; explicit `--later` creates `q-later` directly |
 | `taskq list [state]` | open tasks by state, priority, number |
 | `taskq take N` | claim a ready task for this session (needs `CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID` or genuine `HERMES_SESSION_ID`) |
 | `taskq ask N --text Q [--option O ..] [--recommend K] [--link URL ..]` | worker or supervisor asks the owner: `doing` or `review` → `ask`; the options make the decision card (§ 7) |
@@ -845,7 +963,11 @@ outcomes closed before its first wait. A custom adapter without it cannot discov
 - `--runtime` default `any`; `--type` default `code`; `--priority` default 2. `--host` takes a machine name (§ 2 `hosts`).
 - `--acceptance` is required; for a `research` task it names what the answer must say.
 - `add` prints `#<N> <state>`; every state change prints the new state.
-- `add`, `answer`, `run`, `result`, `requeue` and `close` then start one tick pass without the table in a detached child
+- `add --later` is intake only: acquire the ordinary project guard, create one parked task, record its add event,
+  and return without dispatch, admission, ARM or runtime launch. Dependencies remain recorded but are not evaluated
+  for parked intake. Unknown creation responses retain the normal guard and must be reconciled before another
+  creation attempt; a pending owner request must not be resubmitted as a new task after an ambiguous outcome.
+- `add` without `--later`, `answer`, `run`, `result`, `requeue` and `close` then start one tick pass without the table in a detached child
   (R4) and return at once. The event's line (`<time> <command> #<N>`), the pass's output and a failure
   (`taskq: dispatch stopped: <error>`) go to `.taskq/dispatch.log` and never fail the command. The child reads the
   event's tasks by number: the board's list may not show a write made a second earlier.
@@ -1017,7 +1139,7 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
    failed send or a missing send tool stops the sender with one blocker line: no retry, no other route, no loop on
    a failing board. The board event stays pending until an explicit ack after delivery; a later observation can replay it.
    An agent sender forwards only while its own turn runs: it stays in that one active turn and repeats wait, send
-   without ending it between events, then acknowledges the delivered IDs before waiting again. An ended sender turn or a wait left running alone forwards nothing; taskq
+   without ending it between events, then waits again without acknowledging; the manager owns handling receipts. An ended sender turn or a wait left running alone forwards nothing; taskq
    promises no unattended lifetime beyond a sender that is running (#522).
 2. Optional: start a separate sender session on that prompt. It does no task work. The queue never needs it (R4):
    it only carries the manager's short outcomes to a manager that cannot wake itself.
@@ -1464,3 +1586,379 @@ Cadence test (#269): method in [bench/README.md](bench/README.md). Owner decisio
 then 10+10 tasks (Claude + Codex), limits unchanged (claude 4, codex 4), each stage after the owner's go; the earlier
 10/20/50 runs stay the baseline.
 Design: [docs/single-file.md](docs/single-file.md).
+
+## Research-only session-contract qualification (#601, following #634)
+
+This isolated branch proposes R3/R4/R5/R6/R11 amendments in
+[docs/session-contract-qualification.md](docs/session-contract-qualification.md).
+It does not activate a new schema, report, recovery path or coordination protocol.
+Owner request Sentinel_c6f51941cf948191a1b85840a6fc59f1 authorizes investigation and
+disposable experiments; consequential design and migration remain subject to review.
+Synthetic operation receipts are fixture state only, never a production receipt store.
+
+### Isolated observation slice — proposed R4/R6/R11 amendment
+
+Changed (candidate only, #601): no machine-readable session diagnosis in status and no
+report on refused guard acquisition -> opt-in `taskq status --diagnose` and
+`taskq tick --diagnose`. Legacy commands remain unchanged pending qualification.
+Diagnosis re-reads each assignee-selected task before probing its current identities;
+the work table reflects those re-reads, with failed reads marked unknown. The dependency
+set remains a named list snapshot, never an atomic view of the board. Closed/removed
+tasks and replaced roles from stale lists are not probed. No guard is acquired by status,
+no event acknowledged, no issue/comment/schema/local receipt file written and no role
+sent, started, retired or recovered. Tick guard refusal keeps its nonzero result and
+adds a read-only report; an unavailable board prints an unavailable block, not zero
+work counters. Opt-in diagnosis requires runtime `observe(session)` to be read-only;
+unsupported/remote/failed evidence is unknown, never a legacy alive=False inference.
+Native Codex observation reads bounded, thread-attributed JSONL history and process identity; raw
+commands/output/transcripts never enter reports. An open writer descriptor is only a
+holder observation requiring addressed owning-runtime verification, not proof of an
+active turn or authority to unload. Read-only lsof probing is optional and bounded;
+its absence/failure supplies no writer-release proof. A terminated CLI turn is not a
+dead application session. No age, deadline or output marker permits takeover.
+Problems carry a stable reference derived from task/role/obligation/question version
+and sanitized evidence category. Repeated reads deduplicate within their report and
+write no suppression state; changed current question versions change the reference.
+These references are not answer tokens and cannot invoke recovery. Existing owner
+choices remain in their native question card. No new human choice or retry is inferred.
+
+Candidate observation qualification limit: runtime evidence covers existing thread-attributed CLI log history, not app-only commands or missing/truncated logs. A subsequent clean turn is not proof of settling earlier obligations. Output markers are symptoms, not established causes. These limitations must accompany candidate qualification reports; no production activation or recovery authority follows.
+
+Candidate qualification extension (still dormant): diagnosis is read-only for every assignee-selected fresh task, regardless of caller PM identity; this grants no lifecycle authority. Report project guard presence from a GET-only adapter observer, never infer controller death from absent PID or orphan status from guard presence. Report open prerequisites and absent result receipt separately from proven failed submission. Foreign-host runtime stays unknown.
+Unresolved structured CLI command failures are reconstructed across turns/restarts from thread.started/thread_id segments for the observed session in the existing append-only log (no new receipt file, board field or schema migration). Only a structured successful exact-command retry or corresponding authoritative board result receipt settles that evidence; clean turns do not. Scan at most 16 MiB and explicitly report an incomplete/unreadable history; retention beyond available logs/app-only commands remains unknown. Diagnostic IDs use exact item offset and session identity, not unrelated board event changes. Questions and pending delivery remain reconstructed from current board payloads.
+
+### Dormant recovery qualification slice (#601/#638)
+
+This branch adds explicit recovery operation/receipt correlation and a GET-only `recovery-plan N --role worker|supervisor` command. It is a plan, never an apply/unlock command. The operation remains bound to task, role, session, runtime and host; receipts are distinct for addressed drain, same-session continuation start, board record and application receipt. A start/board update is not application delivery. Wrong/stale/duplicate-conflicting/out-of-order receipts fail closed. Serialized state exists only in isolated qualifications and must be validated after restart; it is not a new production store or board schema. Receipt correlation alone does not authenticate runtime evidence.
+
+Native Codex has no qualified addressed app-writer/controller drain adapter in this execution surface. Recovery plans explicitly say unsupported; neither writer descriptor absence, PID absence, legacy birth=None, turn.completed, manual assertions nor timeout satisfy drain. Same-session continuation may proceed only in the isolated adapter qualification after scoped drain and fresh board identity checks, with a new process's independently verified birth. Never stamp a birth onto the legacy PID. No native continuation implementation or production apply flag is enabled by this slice.
+
+Opt-in candidate `tick --unknown-after [MINUTES]` (finite positive; omitted value selects 30 minutes, omission of the flag keeps the feature disabled) diagnoses local unknown roles after board inactivity exceeds the threshold, not a proven duration of runtime death. Missing clock remains unknown. It preserves role/reservation/order/results/answers and records at most one recovery question per same role/session using the existing native ask payload/history; no extra schema field. It does not overwrite an existing owner question or ask after a settled result, and known/remote roles are not timed out. A runtime without structured observation uses its ordinary state API; running/idle evidence prevents a question. Recheck runtime state after the authoritative board read before persisting a timeout question. Observation failure remains unknown. Production defaults remain unchanged; unknown slots stay occupied while unrelated work may use remaining capacity. A threshold permits a question only, never ownership, resume, replacement, ack or guard release. Activation still requires review, per-host canaries and the authorized install workflow.
+
+Unknown-question dedup is an explicitly proposed compatibility extension within existing retry_counts: `recovery:<operation-id>` stores integer1 in the same authoritative ask update. This preserves single-ask behavior when history comments fail or events compact. It is not inferred from a diagnostic comment, and pending answers/acks/cursors are preserved. No new top-level field/schema version or production migration is applied. Mixed-version activation is not qualified; review and all-host maintenance still precede activation.
+
+Recovery qualification checkpoints and every receipt also bind a digest of the entire authoritative task payload, including order/decision/result, pending action payloads, events and recipient acknowledgements; a new pending obligation rejects an old checkpoint even for the same session. This is correlation, not authentication or executable authority. Fresh result and activity are rechecked immediately before proposing a timeout question.
+
+## Owner-selected queue repair — planned, not activated (2026-10-10)
+
+Owner choices: retain TaskQ; separate infrastructure acceptance from UI #597; implement one native
+acknowledgement mechanism; include safe park/resume in this repair. The earlier alternatives are settled.
+Initial policy is at most 10 new unrelated questions per project/pass, one infrastructure blocker per cause,
+and at most 3 bounded read retries with backoff/jitter. Unknown writes never receive blind retries.
+Project, host/machine and heavy/GPU budgets must coexist. Their new operational numeric caps are not supplied:
+no guessing, configuration overwrite or implicit unlimited fallback. Existing limits remain effective.
+Paid research is permissible in principle, but a provider/account/action/data/cost review still precedes any
+new purchase, persistent access or security setting. Queues and ARM remain paused pending a new owner command.
+
+### Native receipts: selected mechanism and implementation boundary
+
+Planned amendments to R1/R3/R4/R8/R12: one native receipt owner, bound to the recorded recipient, replaces
+sender/PM acknowledgement competition. Board issue JSON remains the durable state; no receipt service or local
+ledger is added. Sender observation/delivery does not consume an event. Distinct ordered stages are delivery,
+handling, application and result acceptance. The last requires task-specific criteria, verified artifacts and
+exact-head CI where applicable; exit0/turn completion does not imply acceptance.
+
+Slice 1 is a dormant pure operation reducer and serializable board envelope, without CLI/board migration or
+active sender changes. It binds repository, task, recorded recipient, exact event ID/action/payload and recorded
+identity. A stable operation digest permits repeated observation. Identical receipts are idempotent;
+conflicting duplicates, wrong target/payload, reordered stages and stale identities fail before any mutation.
+Evidence must be authenticated by a supplied qualified adapter verifier; a field saying 'verified' is not proof.
+No default verifier exists. Replaying a checkpoint validates the same immutable input and every receipt again.
+Fixture verifiers prove reducer behavior only, never native runtime authenticity or exactly-once execution.
+
+Slice 2 qualifies a concrete supported adapter's application receipt and guards its board read/write with
+fresh identity/operation checks. Only that native path may acknowledge after handling/application. Event schema
+migration and all-host mixed-version refusal must precede activation. Until then schema1 CLI and existing ack
+behavior remain installed; their old semantics are not silently redefined by this planned section.
+
+### Safe park/resume: planned transitions
+
+Request park -> preserve current question/answer/history/role/order/result -> stop accepting new work for the
+exact task -> obtain addressed predecessor drain plus reconciliation of pending effects -> record parked state
+and release its exact reservation in one coordinated transition. Unknown/declined/absent drain leaves the task
+and slot occupied. A completed turn, timeout, missing PID, archive or synthetic receipt is not sufficient.
+Resume requires fresh unchanged role/identity and pending obligations, a fresh atomic resource reservation,
+then same-session continuation where supported. No replacement may start while a predecessor is live or unknown.
+Fairness uses original admission age plus explicit priority; repeated park/resume must not reset age or starve
+other eligible tasks. Current destructive `later` semantics are NOT a safe park implementation and stay inactive
+for this new path. No production claims are cleared by the first receipt slice.
+
+### Resource scopes and admission: planned
+
+TaskQ has no product-wide reservation database. Project/task claims and project budgets remain on
+their own board. A host capacity provider is owned by that execution host and accounts for physical
+resources consumed there; participation is limited to launchers that use that provider. An optional
+owner-managed pool can coordinate explicitly selected projects/hosts under a shared budget. No
+project or other user joins it implicitly; pool ownership, access, membership and resource dimensions
+are configured explicitly. GitHub/GitLab are project adapters, not mandatory global coordinators.
+
+A host provider must not become a shadow task queue: it stores only verifiable resource leases linked
+to board task/operation and exact native child identity. Any durable host lease format is a separate
+planned compatibility amendment and needs qualification before use. Existing runtime handles do
+not themselves enforce a host capacity budget. New operational numeric caps remain explicitly unset.
+
+Within a qualified provider, reserve the whole applicable vector atomically: project/runtime or
+host/machine/heavy/GPU or explicit pool dimensions. Cross-provider admission is not one atomic
+transaction: acquire applicable grants in fixed order and spawn only after every exact grant is
+confirmed. Known no-effect failure releases only verified acquired grants; an unknown acquisition,
+spawn or release retains the corresponding capacity until addressed reconciliation. This avoids
+oversubscription for participating launchers at the cost of temporary blocked capacity. It does not
+count unrelated host processes or promise availability during a partition.
+
+Independent boards cannot enforce one shared multi-host limit. If that limit is requested, an
+explicitly owned pool needs one qualified authoritative provider; without it report unsupported.
+Project-only mode must not claim a host/pool guarantee. Host capacity cannot be inferred by adding
+per-project counters. No central issue, local lease database or provider is implemented by this plan.
+
+### Sequential implementation and evidence
+
+1. Implement/test the dormant native receipt reducer: restart, loss, duplicate, order, conflicting and stale input.
+2. Qualify the smallest actual adapter receipt; test delivery success/write loss and durable recipient dedup.
+3. Implement guarded park/resume only for that qualified drain boundary; test unknown, live predecessor,
+   preserved pending answers, crash at each transition and admission fairness.
+4. Qualify scope-specific capacity providers; implement grant composition and test competing projects/hosts,
+   partial failures and abandoned unknown reservations. Set explicit owner caps before activation.
+5. Integrate selected question/read retry policy, doctor explanations, artifact/acceptance gates and exact-head CI.
+6. Final per-host isolated canaries and rollback review. Installation/publication and queue restart are separate.
+
+Unqualified boundaries remain visible: native active app drain/application acknowledgement, production legacy
+mapping, external artifact authenticity, cross-board atomic reservations. Neither the reducer nor passing fake
+fault tests resolves them. This plan records authorization; it is not an executable migration or guard release.
+
+Slice 1 checkpoint: ReceiptOperation is now implemented as a dormant pure reducer. Ten focused tests cover
+loss/restart, duplicate/conflicting/out-of-order receipts, authenticated adapter refusal, stale answer/repository/
+role identity, result acceptance separation, unknown/decline, malformed recipients and obsolete workers.
+No native adapter, board persistence, event migration, park/resume, resource coordinator or production ACK
+activation is implemented by this checkpoint. Serialized fixtures are correlation evidence only.
+
+The initial private two-project GitHub coordination selection was withdrawn by the owner; it is not
+a product default. The scope-specific design above supersedes that proposed placement.
+
+Slice 2 implementation target is deliberately narrow but executable: `apply-event N:ID --artifact RELPATH`
+materializes the exact answer event text as one bounded UTF-8 artifact, on an open doing/ask schema2
+opt-in disposable task. A parked or otherwise inactive task refuses application, including replay.
+It is not a generic shell command runner. It requires the genuine recorded worker session on its owning host,
+not delegated `--pm` or owner impersonation. Native CLI invocation records delivery/handling; artifact bytes
+verified by the native handler establish application for this supported action only. The final controller
+independently verifies task acceptance; the handler never self-accepts the whole task or claims native app drain.
+
+Both schema2 handlers enforce fresh assignee selection, TASKQ_HOST_ONLY and authenticated
+assignee-only membership before provider initialization or effects. Schema2 opt-in does not bypass
+these execution restrictions; ordinary schema1 execution remains unchanged.
+
+A schema2 task is read-only to schema1 clients. This slice supports reading schema2 but refuses its ordinary
+legacy execution/ack path. No migration or implicit schema2 creation is added. Under the project guard,
+prepare the operation on the issue before the file effect; create only with exclusive creation, fsync, and
+fresh digest verification; a pre-existing different artifact is refused, never overwritten. Artifact path and
+operation identity are bound on the board. Matching durable bytes permit reconciliation without rewriting;
+missing bytes may be materialized only for that prepared operation. After verified application, one board
+update persists application receipt and exact recipient ack together. Lost board responses retain the guard.
+Unknown writes are not blindly retried; addressed controller quiescence and exact token reconciliation precede
+any explicit recovery. This supplies idempotent materialization, not exactly-once arbitrary model/tool execution.
+
+Owner correction: the preceding GitHub coordination-domain selection is WITHDRAWN. TaskQ is a product for
+arbitrary independent users/projects; no mandatory central board/database collects everyone's reservations.
+Project task state stays on its own board. Physical host capacity and an optional owner-selected multi-project
+pool are distinct scopes. No project joins a shared pool implicitly. Pool placement, access, membership,
+resource ownership and supported atomicity must be explicit and qualified; the earlier private two-project
+example is not a universal architecture. Continue native receipt qualification independently. Capacity-provider
+options and composition are under design, not implemented or activated. Independent counters must never claim
+to enforce an atomic shared cap. No central production issue or database has been created.
+
+### Documentation ownership boundary
+
+TaskQ documentation contains this product's contracts, implementation/qualification evidence and universal
+examples. Consumer-project migration runbooks, live task inventories and host-specific operational handoffs
+belong to their consuming project or a private evidence archive, not the distributed TaskQ documentation.
+Before removing or generalizing an existing record, preserve its full bytes and verified provenance outside
+the product tree. Keep TaskQ decisions and reusable lessons; do not rewrite Git history. External transfer,
+visibility and destination remain explicit owner choices. Local archival is not publication or execution
+of historical commands. Generic maintenance guidance must not masquerade as a current live checkpoint.
+
+### Executable capacity/park qualification slice
+
+This isolated slice is opt-in and fail-closed: a board must supply its own qualified atomic
+capacity_provider(caps), and the selected host provider must have explicit finite caps and ownership.
+Existing GitHub/GitLab adapters have no such primitive and refuse this path before effects; a
+file-backed qualification board can implement it on its own SQLite authority. Host SQLite holds
+resource leases only, never task payload/history/questions as a second queue. It is an explicitly
+selected per-owner/per-host provider, not a central product database. No default path/config/cap.
+Both providers use the same reserve/observe/release protocol, immutable scoped request IDs and
+atomic vector admission. Admission intent is retained on the task's board before provider effects.
+Project then host grants are required before a qualified runtime may act. Waiting for a host grant
+is pending admission, not failure: retain its project grant and original age for fairness. Known
+unsatisfiable demands are validated before acquisition. Explicit cancellation releases exact grants;
+unknown responses retain intent for exact readback/reconciliation.
+No time-based expiry. Pending capacity requests preserve original admission age and priority; the
+oldest currently fitting request wins, so a heavy-blocked request need not block a light task.
+
+The first qualified runtime is controlled-artifact, a finite built-in child with no arbitrary commands,
+network or spawned descendants. It gates every effect on the exact host grant and atomically binds
+its own birth-bearing native PID before work. It materializes the specified bounded answer artifact,
+records application proof, then waits for a park request. A duplicate child is refused before effects.
+A revoked unbound grant prevents a late child from acting. A bound child is never released merely
+because a timeout, outer controller or turn ended. Drain requires this adapter's durable settled
+receipt, matching native process death and independently verified artifact bytes. This is not a
+qualified drain for Codex/app or arbitrary code, and cannot retire their unknown claims.
+
+Park preserves claim, supervisor, manager, order, answers, events, original admission age and history.
+The board records draining intent first; after qualified drain it records parked/releasing intent,
+releases the exact host and project grants, then records parked. Crash at any boundary resumes by
+reading the same grants and durable child receipt, never repeating an unknown effect. Unknown
+release remains occupied until exact readback; repeated confirmed release is idempotent. A new answer
+while parked is retained and is read on same-session resume. Resume preserves the durable runtime
+session but obtains fresh generation grants and child birth; repeated resume of that generation
+cannot spawn again. Changed recorded identities refuse, and live/unknown predecessor prevents resume.
+
+Runtime action success is distinct from task-specific acceptance. No lifecycle command sets result,
+closes a task or calls a product task completed from process exit. Explicit answer-artifact criteria
+bind task/event, operation, relative path and expected SHA256; only the recorded supervisor/manager
+may independently accept matching application evidence. Other product criteria/runtime adapters are
+unsupported rather than inheriting this synthetic artifact acceptance. Publication/CI remains separate.
+
+Applicable proof includes real controlled child processes and competing provider processes on disposable
+boards, plus crash/lost-response injections at intent/drain/park/release/resume, answer during park,
+repeat resume, fairness and project+host/heavy contention. Passing it does not qualify native GitHub/
+GitLab project grants, arbitrary Codex application drain or a final production canary. Queues/ARM stay held.
+
+Native project capacity uses an explicitly provisioned issue on that same project board, selected by
+`board_options.capacity_issue` and `capacity_project_id`. No issue is auto-created.
+Native capacity additionally requires an explicit validated `host` on either backend; CLI/environment
+defaults cannot identify an authority because numeric project IDs are server-local.
+Its separate
+`taskq:capacity` block contains schema, canonical backend/host/native project identity, finite caps
+and reservation leases only; it is not a task and stores no task question/history. Normal project guard
+ownership is required before provider reads/writes. A fresh project GET validates the configured native
+ID. GitHub/GitLab issue updates are not assumed to provide CAS or retry deduplication: participating
+writers serialize through the acknowledged native project guard. After a write, exact anchor readback
+must match; missing/malformed/stale readback or any write error retains the poisoned guard. No blind
+retry, timer-based recovery or absent-read inference. An explicitly initialized anchor is required;
+wrong ownership/caps, closed anchor or task labels refuse before effects. Reservation ordering and
+request validation use the same reducer as the local host authority. This adapter remains unqualified
+for production until isolated real-server contention/lost-response proof on each backend; unit HTTP
+fixtures are not that proof. GitLab guard relies on server uniqueness of board_id/label_id (verified
+in 17.2.9-ee source); supported deployed versions need equivalent guarantees and live qualification.
+
+Controlled-artifact crash exception: if its native child dies before writing a settled receipt,
+the qualified adapter may reconcile that finite process only after matching its birth-bearing
+binding, isolated Python entry-point implementation hash and immutable input hash. This adapter
+has no subprocess/network/arbitrary-code capability: kernel-confirmed death settles its possible
+writers, while partial/missing artifacts remain unknown and preserved. Record an UNKNOWN application
+receipt and drain proof; release capacity but do not ack/accept that event or overwrite its partial
+artifact. If any identity/code/input proof is absent or changed, retain grants and report the blocker.
+This exception never applies to Codex/app, legacy handles or generic turn.completed/process-exit proof.
+
+Fairness refinement from an actual red regression: sorting only by original task age lets repeated
+resume of an old task jump an already waiting task forever. Preserve original admission age as task
+provenance, but give each new generation/acquisition a durable provider FIFO ticket. Retries keep their
+ticket; a resumed generation joins behind existing same-priority waiters. Select the oldest fitting
+ticket at the explicit priority, with original admission age as a stable tie-break. A heavy-blocked
+request can still yield to a fitting light request. Provider metadata version2 records these tickets;
+version1 qualification DBs are refused, not silently converted. No production provider exists/migrates.
+
+
+### Integrated schema2 queue candidate (still uninstalled)
+
+Amendment to R3/R4/R8/R12/R13 for the isolated candidate: normal run, tick, later, answer,
+ack and result now route explicitly opted-in schema2 tasks to the same guarded lifecycle service,
+not to legacy move/spawn/retire code. No task is implicitly migrated or assigned a replacement role.
+Only the exact recorded supervisor (or PM when no supervisor exists) on the owning host can operate
+this service. A manager tick cannot act for a different supervisor. Unsupported runtime/drain capability,
+foreign identity or unknown grants preserve the task/slot; one such task must not prevent an eligible
+independent task's pass. Existing schema1 behavior stays unchanged.
+
+For the finite controlled-artifact adapter, a normal tick admits the ready task, requests addressed park,
+and reconciles its application and drain before releasing grants. This adapter always materializes its
+bounded action before settling its stop request. Parked tasks stay parked; a normal run or an owner answer
+explicitly requests the next generation. Tick never repeatedly resumes a parked or accepted task.
+Normal later preserves identities/order/history/pending events instead of destructive legacy later.
+An answer during draining/park is recorded atomically and retained until same-session continuation is safe;
+an active task must settle its predecessor before the new event can be applied. Options are resolved from
+the actual task decision, never invented. Neither a failed drain nor an answer authorizes replacement.
+
+Application proof and worker ack are one board update, verified by an independent fresh native readback.
+Normal ack cannot consume schema2 events via sender --pm or delivery success. Only the recorded controller
+may reconcile that qualified worker application; arbitrary PM/supervisor handling receipts remain unsupported.
+Every receipt-sensitive task update verifies exact task JSON, task state and labels by fresh readback before
+reporting success. Missing, stale or conflicting readback retains the guard; no automatic retry/release.
+Idempotent re-entry also revalidates artifact/application evidence rather than trusting a prior boolean.
+
+Normal result for this adapter requires settled grants, the exact current event's acknowledged application,
+and explicit answer-artifact criteria matching event/path/SHA256. The recorded controller independently
+checks it, then persists a task-specific acceptance receipt plus a bounded artifact result in review.
+--sha/--checks publication claims are refused for this path; legacy result still requires --sha. Repeated
+identical result is idempotent; changed criteria, artifact, event or identity refuse. This is acceptance of
+that declared bounded artifact task, not generic code quality/CI/publication. Close/requeue/take/migration of
+schema2 remain refused until separately qualified. No production release, numeric cap or ARM change.
+
+Previous b3b7d1c native live final task ack readback: NOT VERIFIED. Final GETs occurred after fixture deletion.
+This integration does not retroactively repair that evidence. Further external fixtures need new approval.
+
+Native preflight refusal is an explicit validation category, separate from effect failure. It never
+creates or clears guard poison from earlier tasks; an already poisoned guard still stops the pass.
+Qualify eligible → stale → eligible ordering, not only a stale first task. Generation key and artifact
+are re-derived from the exact recorded task identity before any runtime effects.
+
+### Native manager question receipt qualification
+`apply-event N:ID --role manager --artifact RELPATH` applies one schema2 ask notification
+to a bounded owned workspace artifact and atomically records its exact manager recipient ack.
+Only the genuine recorded PM on the selected owning host may invoke it. This receipt proves
+notification application, not a human answer or task acceptance. Sender delivery and manual
+`ack --pm` cannot acknowledge it. The separately bounded result handler below requires existing
+acceptance authority and independently verified artifact evidence. Replay revalidates exact
+event, roles, path and bytes; changed notification identity or artifact refuses without overwrite.
+
+### Native result notification and explicit receipt migration
+Release-review boundary: the common lifecycle refuses new admit/resume/answer after a recorded
+result, including direct lifecycle commands. Rework needs a separately qualified transition;
+park/reconciliation and receipt verification remain available without restarting accepted work.
+Native migration of a recorded Codex worker/supervisor is unsupported until addressed app
+ownership and in-flight drain are qualified. A dead CLI birth handle is necessary but insufficient;
+active or unknown app ownership fails closed, even with --controllers-stopped. Never migrate
+ordinary model tasks merely to enable execution: schema1 remains their supported route.
+Native conversion of schema0/1 tasks is refused even without a recorded worker: no qualified
+model execution adapter exists, and a notification-only conversion would strand future work.
+Existing schema2 fixtures stay readable; ordinary schema0-to-schema1 migration is unchanged.
+The runtime recovery helper supplies correlation only. The dormant recovery receipt state machine
+lives in experiments, not the production runtime; it grants no execution or release authority.
+Ordinary model-worker boundary: schema1 Codex exec/spawn/resume, native PID/birth handles,
+question/answer history and SHA result submission remain the existing route. Its answer ack
+records delivery/start, not independently verified application. Per-project model limits do not
+join the optional host capacity provider. No shared model-worker budget or safe unknown-send
+retry is qualified by controlled-artifact results. A new TaskQ-owned CLI worker can be studied
+without draining an unrelated legacy app session, but needs its own correlated turn/result
+receipts and admission qualification before this stronger guarantee can be offered.
+
+For a schema2 result notification, the same manager apply-event handler verifies the recorded
+supervisor (or PM when unsupervised) acceptance against the exact current criteria, application,
+artifact bytes and released/drained native host/project grants before any notification effect.
+The acceptance-stage receipt references that existing independently checked acceptance; it never
+acts as, rebinds or silently replaces the supervisor. Replays repeat verification and refuse stale
+criteria, identities, bytes or grants. This boundary supports only same-host controlled-artifact
+results. Remote or generic Codex execution/drain is explicitly unqualified, not an infinite release
+prerequisite and not evidence of death. New owned controlled-artifact workers may use the bounded
+contract; ordinary arbitrary model workers remain on schema1 pending a qualified adapter.
+
+ARM senders only deliver notifications; they do not issue manual acknowledgements, including
+schema1 deliveries. The recorded PM owns schema1 handling acknowledgement. Schema2 PM handling
+uses apply-event for supported ask/result notifications. Merely forwarding is not application.
+
+`migrate --native-receipts` currently diagnoses/refuses schema0/1 conversion; it does not
+convert ordinary tasks to execution-unsupported schema2 or arbitrary execution to controlled-artifact.
+Apply still requires --controllers-stopped and a fresh guarded preflight of every task. Preserve all roles, history, pending answers and unknown
+fields. A PM must be the genuine caller on its recorded host; other recorded roles require
+supported same-host runtime identity observations. A claimed worker needs both a birth-qualified dead CLI process and qualified addressed app
+ownership/in-flight drain. That Codex app adapter is currently unavailable, so any recorded
+Codex worker/supervisor refuses native migration, including idle observations; roles are preserved.
+Missing/foreign/legacy unknown mappings refuse the whole migration before writes. The owner must reconcile that exact session on its
+original runtime/host, preserve pending data and obtain supported identity/drain evidence; elapsed
+time, absent bare PID and flags cannot substitute. No automatic retirement or replacement.
+Tasks migrated to schema2 without a qualified execution profile remain visible but execution
+refuses. This is an explicit notification migration, not qualification of generic Codex drain.
+
+If a legacy session has no supported birth-qualified handle, migration deliberately offers no
+conversion or automatic repair. Concrete owner choices are to keep that task/version and unknown
+slot preserved while reconciling the recorded host/session via supported tools, or separately
+authorize a new independent task preserving/linking the old history after demonstrating absence
+of competing execution. Neither choice is performed by migrate. No retrospective birth assignment,
+manual JSON claim removal or absent-process inference is a supported resolution.

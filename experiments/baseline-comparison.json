@@ -1,0 +1,20 @@
+{
+  "baseline": "c08678b3e2c0ed80bdcdc008bbcbd41bec6a7c44",
+  "fixture_sha256": "64fbc0e99fc2172bcbd0216d9c65ecf0b3c2bc7404064636c9a1be66ff38429f",
+  "results": {
+    "baseline": {
+      "guard": false,
+      "question": true,
+      "pending_event": false,
+      "auth": false,
+      "ordinary_prerequisite": false
+    },
+    "candidate": {
+      "guard": true,
+      "question": true,
+      "pending_event": true,
+      "auth": true,
+      "ordinary_prerequisite": true
+    }
+  }
+}

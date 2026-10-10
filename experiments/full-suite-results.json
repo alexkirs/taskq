@@ -1,0 +1,19 @@
+[
+  {
+    "name": "baseline",
+    "exit": 0,
+    "summary": [
+      "Ran 235 tests in 44.087s",
+      "OK (skipped=17)"
+    ]
+  },
+  {
+    "name": "candidate-final",
+    "exit": 0,
+    "summary": [
+      "Ran 261 tests in 43.891s",
+      "OK (skipped=17)"
+    ],
+    "command": "TMPDIR=/private/tmp python3 -m unittest tests.test_single"
+  }
+]

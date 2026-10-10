@@ -1475,6 +1475,45 @@ def question_revision(current):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def rejected_result_rework(current, event_id):
+    """Explicit manager order; preserve rejected work and exact executors, never accepted work."""
+    raw = current['raw']
+    boss, worker = raw.get('supervisor') or {}, raw.get('claim') or {}
+    rejection = next((event for event in raw.get('events', []) if event['id'] == event_id), None)
+    submitted = (raw.get('action_payloads') or {}).get('result')
+    if current['state'] != 'ask' or not raw.get('result') or not submitted \
+            or not rejection or rejection['action'] != 'ask' \
+            or rejection['by'] != f'{boss.get("runtime")}:{str(boss.get("session", ""))[:8]}' \
+            or submitted['id'] >= event_id or not worker.get('session') \
+            or raw.get('order') or (raw.get('action_payloads') or {}).get('close') \
+            or 'legacy_recovery' in raw or raw.get('model_recovery'):
+        fail('rework requires an exact supervisor rejection of an open submitted result')
+    history = list(raw.get('rejected_results') or [])
+    if len(history) >= EVENT_LIMIT:
+        fail('rejected result history full; no history discarded')
+    project, host = model_providers()
+    for role, identity in (('worker', worker), ('supervisor', boss)):
+        turn = (raw.get('model_turns') or {}).get(role) or {}
+        runtime, child = turn.get('runtime') or {}, turn.get('child') or {}
+        completion = turn.get('completion') or {}
+        if identity.get('runtime') != 'codex' or not identity.get('session') \
+                or turn.get('phase') != 'complete' or not turn.get('key') \
+                or runtime.get('session') != identity['session'] \
+                or completion.get('session') != identity['session'] \
+                or completion.get('terminal') != 'turn.completed' \
+                or not child.get('pid') or not child.get('birth') \
+                or process_state(child['pid'], child['birth']) != 'dead':
+            fail('rework exact completed model identity/death evidence unavailable')
+        grant, lease = project.observe(turn['key']), host.observe(turn['key'])
+        if not grant or not lease or grant['phase'] != 'released' or lease['phase'] != 'released' \
+                or grant['request'] != turn['request'] or lease['request'] != turn['request'] \
+                or lease.get('runtime') != runtime or lease.get('child') != child \
+                or lease.get('drain') != completion:
+            fail('rework exact model grant settlement unavailable')
+    return history + [{'result': raw['result'], 'submission': submitted,
+                       'rejection': model_event_input(rejection), 'worker': worker, 'supervisor': boss}]
+
+
 def answer_command(args):
     """Guarded single-writer decision command, not provider CAS or application acknowledgement."""
     if len(args.n) != 1 or not args.n[0].isdigit() or not args.text.strip():
@@ -1492,6 +1531,9 @@ def answer_command(args):
         fail('versioned owner answer requires recorded manager or owner shell')
     actor = {k: identity.get(k) for k in ('runtime', 'session')} if identity.get('session') else {'runtime': 'owner', 'session': 'shell'}
     request = {'revision': args.question_revision, 'text': args.text, 'actor': actor}
+    rejection_id = getattr(args, 'rework_rejection', None)
+    if rejection_id is not None:
+        request['rework_rejection'] = rejection_id
     digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
     raw = current['raw']
     if 'legacy_recovery' in raw or raw.get('model_recovery'):
@@ -1510,6 +1552,10 @@ def answer_command(args):
     receipt = {'command_id': args.command_id, 'request_digest': digest,
                'question_revision': args.question_revision, 'actor': actor,
                'answer_event': raw.get('event_seq', 0) + 1, 'application_ack': False}
+    if rejection_id is not None:
+        raw = {**raw, 'rejected_results': rejected_result_rework(current, rejection_id), 'result': None}
+        receipt['rework_rejection'] = rejection_id
+        receipt['worker'] = raw['claim']
     commands[args.command_id] = receipt
     raw = {**raw, 'answer_commands': commands, 'decision': None}
     raw['events'] = [dict(event, acks=list(event.get('acks', []))) for event in raw.get('events', [])]
@@ -1529,6 +1575,8 @@ def cmd_answer(args):
     """`answer N --text A`, or `answer 43.1 44.2` (#490): each code picks an option of the task's card. An ask goes back to
     `doing` with the option's text; a review: an option starting `close` closes it, another goes back to the worker.
     Every code is checked before any task moves."""
+    if getattr(args, 'rework_rejection', None) is not None and not (getattr(args, 'command_id', None) and getattr(args, 'question_revision', None)):
+        fail('rework requires versioned answer command and question revision')
     if getattr(args, 'command_id', None) is not None or getattr(args, 'question_revision', None) is not None:
         return answer_command(args)
     if args.text:
@@ -5010,11 +5058,24 @@ def rollout(thread):
     return next((kind for kind, pattern in (('local', f'sessions/*/*/*/{name}'), ('archived', f'archived_sessions/{name}'))
                  if next(home.glob(pattern), None)), None)
 
+def scheduler_binding():
+    config = {key: value for key, value in CONFIG.items() if not key.startswith('_')}
+    invocation = {key: os.environ.get(key) for key in
+                  ('TASKQ_HOST', 'TASKQ_HOST_ONLY', 'TASKQ_LIMITS', 'TASKQ_RUNTIME', 'TASKQ_CLIENT', 'TASKQ_COMPRESS')}
+    if invocation['TASKQ_RUNTIME'] != 'codex' or local_limits() is None:
+        fail('scheduler authorization requires explicit Codex runtime and finite invocation limits')
+    return hashlib.sha256(json.dumps({'config': config, 'invocation': invocation}, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def named_arm(args):
     """Local activation handle; board authority and finite capacity remain native."""
     import sqlite3
     identity = session()
-    if not identity or not identity.get('session'):
+    scheduled = getattr(args, 'scheduled', False)
+    if scheduled and (args.what != 'tick' or not args.execute or identity
+                      or any(os.environ.get(key) for key in SESSIONS.values())):
+        fail('scheduled ARM requires only an owner-shell execution pass; no inherited agent IDs')
+    if not scheduled and (not identity or not identity.get('session')):
         fail('named ARM needs a genuine agent session')
     name = args.name
     if args.target:
@@ -5030,7 +5091,7 @@ def named_arm(args):
     if path.is_symlink():
         fail('ARM runtime path is a symlink; no changes')
     key = json.dumps([CONFIG.get('board'), CONFIG.get('host'), CONFIG['repo'], machine(), name])
-    owner = recipient('arm', identity)
+    owner = recipient('arm', identity) if identity else None
     db = sqlite3.connect(path, timeout=0)
     try:
         if os.name != 'nt':
@@ -5039,7 +5100,7 @@ def named_arm(args):
         db.execute('BEGIN IMMEDIATE')
         row = db.execute('SELECT body FROM activation WHERE id=?', (key,)).fetchone()
         state = json.loads(row[0]) if row else None
-        if state and state['owner'] != owner:
+        if state and not scheduled and state['owner'] != owner:
             fail('named ARM belongs to another session; no changes')
         operation = args.what
         repeated = False
@@ -5056,15 +5117,30 @@ def named_arm(args):
             repeated = state['scope'] == scope
             if not repeated:
                 state.update(scope=scope, revision=state['revision'] + 1)
+                state.pop('scheduler', None)
+        elif operation == 'authorize-scheduler':
+            if not state['enabled']:
+                fail('authorize only an enabled named ARM')
+            binding = scheduler_binding()
+            repeated = state.get('scheduler') == binding
+            if not repeated:
+                state.update(scheduler=binding, revision=state['revision'] + 1)
+        elif operation == 'revoke-scheduler':
+            repeated = 'scheduler' not in state
+            if not repeated:
+                state.pop('scheduler'); state['revision'] += 1
         elif operation == 'stop':
             repeated = not state['enabled']
             if not repeated:
                 state.update(enabled=False, revision=state['revision'] + 1)
+                state.pop('scheduler', None)
         elif operation == 'tick':
             if not state['enabled']:
                 fail('named ARM stopped; no admissions')
             if args.scope_task is not None:
                 fail('named ARM tick uses recorded scope; use update')
+            if scheduled and state.get('scheduler') != scheduler_binding():
+                fail('scheduled ARM authorization absent or configuration/invocation changed')
             if release_reason():
                 fail(release_reason())
             args.execution_scope = state['scope']
@@ -5075,7 +5151,8 @@ def named_arm(args):
         db.commit()
         return print(json.dumps({'type': 'taskq.arm', 'version': 1, 'name': name,
                                  'host': machine(), 'operation': operation,
-                                 'repeated': repeated, 'activation': state}))
+                                 'repeated': repeated, 'activation': state,
+                                 **({'executor': 'owner-shell-scheduler'} if scheduled else {})}))
     except sqlite3.OperationalError as error:
         fail('named ARM runtime busy or unavailable; no new pass: ' + str(error))
     finally:
@@ -5083,6 +5160,8 @@ def named_arm(args):
 
 def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
+    if getattr(args, 'scheduled', False) and getattr(args, 'name', None) is None:
+        fail('scheduled execution requires one authorized named ARM')
     if getattr(args, 'name', None) is not None:
         return named_arm(args)
     runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
@@ -5186,7 +5265,7 @@ def main(argv=None):
     card = ((('--option',), {'action': 'append', 'default': []}), (('--recommend',), {'type': int, 'default': 1}),
             (('--link',), {'action': 'append', 'default': []}))  # #490: the decision card
     command('ask', cmd_move, *card, text='required')
-    command('answer', cmd_answer, (('n',), {'nargs': '+'}), (('--command-id',), {}), (('--question-revision',), {}), n=False, text=True)
+    command('answer', cmd_answer, (('n',), {'nargs': '+'}), (('--command-id',), {}), (('--question-revision',), {}), (('--rework-rejection',), {'type': int}), n=False, text=True)
     command('result', cmd_move, (('--sha',), {'type': commit}), (('--checks',), {'default': ''}), *card, text=True)
     command('requeue', cmd_requeue, text=True)
     command('run', cmd_run, text=True)
@@ -5206,8 +5285,8 @@ def main(argv=None):
     command('applied', cmd_applied, (('event',), {}), (('--artifact',), {'required': True}), (('--sha',), {'required': True}), n=False)
     command('apply-event', cmd_apply_event, (('event',), {}), (('--artifact',), {'required': True}), (('--role',), {'choices': ('worker', 'manager'), 'default': 'worker'}), n=False)
     command('ack', cmd_ack, (('events',), {'nargs': '*'}), (('--pm',), {}), (('--role',), {'choices': ('manager','supervisor')}), (('--stdin',), {'action': 'store_true'}), n=False)
-    command('arm', cmd_arm, (('what',), {'choices': ('tick','start','update','status','stop')}), (('target',), {'nargs': '?'}),
-            (('--execute',), {'action':'store_true'}), (('--name',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), n=False)
+    command('arm', cmd_arm, (('what',), {'choices': ('tick','start','update','status','stop','authorize-scheduler','revoke-scheduler')}), (('target',), {'nargs': '?'}),
+            (('--execute',), {'action':'store_true'}), (('--scheduled',), {'action':'store_true'}), (('--name',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), n=False)
     command('pm', cmd_pm, (('--adopt',), {'nargs': '+', 'type': int, 'default': []}),
             (('--subscribe',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), (('--delivery-ack',), {}),
             (('--status',), {'action':'store_true'}), (('--format',), {'choices':('json','text','dot'),'default':'json'}), n=False)

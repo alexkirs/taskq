@@ -36,6 +36,19 @@ participating writers must honor the existing atomic project guard. Unknown
 external writers block readiness; fresh readback conflicts fail closed. This
 command does not implement review acceptance/publication or grant new authority.
 
+Changed R11/R13: explicit rejected-result continuation is distinct from accepted-result
+resume or executor replacement. A recorded manager may use versioned `answer` with
+`--rework-rejection EVENT` for an open ask from its recorded supervisor, after a submitted
+result. The command archives that exact result, rejecting event and executor identities;
+it clears only the current rejected submission and writes the ordinary answer atomically.
+Both existing model turns must be natively complete, their exact bound grants released,
+and their birth-qualified CLI roots dead. Unknown ownership, recovery holds, closed or
+accepted results refuse. This model-only proof does not release heavy resources or claim
+universal writer drain. Ordinary admission resumes the same worker SID with the new answer
+event; application still requires the scoped committed artifact and native `applied`
+receipt. Same command ID is idempotent. No replacement, direct unaccounted model call,
+automatic rejection inference or standalone-model acceptance is authorized by this path.
+
 Named ARM runtime handle: `taskq arm start --name NAME [--scope-task N ...]`
 records an enabled local activation; `update` changes its scope, `status` reads
 it, and `stop` disables future admissions without cancelling any worker. These
@@ -51,6 +64,19 @@ busy, rather than claiming it stopped an in-flight pass. Once stop succeeds no
 subsequent named pass admits work. An interrupted transaction rolls back; actual
 task/launch effects remain subject to native board recovery. Different checkouts
 still coordinate through the native project guard, not this runtime handle.
+
+Changed R4/R13: conversational heartbeat delivery is not an independent execution
+scheduler. The genuine named activation owner may `arm authorize-scheduler --name NAME`
+to authorize its current project/configuration and finite invocation environment for
+an owner-shell scheduler. `arm tick --execute --scheduled --name NAME` then requires
+that exact authorization, enabled handle and unchanged configuration/limits/host scope;
+it accepts no inherited agent session IDs and never fabricates one. This permission is
+only for that named execution pass, not handle controls or PM/task authority. Native
+Windows Task Scheduler may replace the existing conversational timer after qualification:
+pause the old source, prove no overlap, register one current-user non-elevated native task,
+verify actual receipt and retain rollback. Never run both timers. Stop/update/revoke and
+configuration drift block scheduled admission. No installation of a timer follows merely
+from authorizing it. Its local handle is no security sandbox against the owning OS user.
 
 Candidate-only route: `taskq arm tick --execute [--scope-task N ...]` runs one
 existing headless guarded pass. It never opens a PM subscription, starts a timer
@@ -1255,6 +1281,8 @@ Prove an actual idle-manager wake and the continued next wait before claiming su
 a process return or an unobserved send are not receipt (R12). If the existing independent app sender cannot be
 reached with the available supported tool, report that blocker and ask through the existing task; do not create a
 replacement sender, bridge, store/protocol or duplicate task. Do not resume a worker to bypass queue rework (R11).
+The explicit versioned rejected-result continuation above is the qualified same-worker exception;
+it preserves rejected work and identity, and does not permit accepted-result resume.
 
 1. In the project root run `taskq arm tick "<manager>"` (its session name, id or link). It prints the prompt for
    this runtime: loop { `taskq wait --pm <manager id>`; send its output to `<manager>` (Claude: `SendMessage`; Codex:

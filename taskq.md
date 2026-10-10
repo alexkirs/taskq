@@ -327,6 +327,12 @@ Changed: Open "delete the Wiki pages or mark them stale" → the Wiki is a stub 
 
 Any change is named to the owner first; taskq never edits permission settings itself (`permission_mode` in
 `taskq.json` is the owner's).
+Changed (#620, explicit owner decision 2026-10-10): TaskQ-owned Codex turns defaulted to `workspace-write`
+with network access and a writable main git directory → `danger-full-access` on every host, for spawn and
+resume. This is an execution-policy choice, not a fix for a Codex CLI sandbox defect or a grant of OS/admin
+privileges. Explicit `codex` options in `taskq.json` still replace the complete default. TaskQ never edits
+personal/global Codex configuration. Model, effort, Claude/Hermes permissions, review and delivery gates stay
+unchanged.
 
 ### R10. Multi-project only by explicit list
 
@@ -591,7 +597,7 @@ no automatic retry or rollback erases acknowledged work. Closed history is not r
 | `hosts` | Hostname → machine name; `TASKQ_HOST` overrides the hostname | hostname up to the first dot |
 | `runtimes` | Extra runtimes: `{"name": "runtimes/name.py"}` | none |
 | `permission_mode` | Claude worker permission mode | `dontAsk` |
-| `codex` | Options of `codex exec`, replacing the default; with `workspace: external` add `--add-dir` for the worktree and its git dir (the project instructions name them) | `-s workspace-write`, network on, `--add-dir <root>/.git` |
+| `codex` | Options of `codex exec`, replacing the complete default; an explicit `workspace-write` override needs network access and `--add-dir` for required worktree/git paths (the project instructions name them) | `-s danger-full-access` on every host (R9) |
 | `pages` | Base URL of `open.html`, the Codex link page | `https://alexkirs.github.io/taskq/` |
 | `board_url` | Board link a board file prints in the tick | GitHub/GitLab issues page |
 | `inline_media` | `false`: the Questions of the report (R6) print image links as plain links, not `![](url)` (where the surface does not render them) | `true` |
@@ -1181,6 +1187,9 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 | Claude | `claude --bg --name "T<N> <ORCH> <title> (<machine>)"` in the project root; tools `Bash Read Edit Write Glob Grep WebFetch WebSearch`, no MCP, `--permission-mode dontAsk` | `claude stop`, then `claude --bg --resume <id> <text>` (a new id) | `claude agents --json --all` | Remote Control URL | `claude stop <job id>` when running, then `claude rm <job id>` |
 | Codex | `codex exec --json -C <root> <prompt>`, detached; log `.taskq/T<N>.log`, `<pid> <thread> <birth>` in `.taskq/T<N>.pid`; then `codex app-server`: `initialize`, `thread/name/set` the name, `thread/read` it back, each after the last one's success, all within 60 s (R3: anything else stops the turn, keeps the pid file, fails the spawn) | `codex exec resume <id> <text>` | the identified process is running | `open.html#codex://threads/<id>` | kill the running turn, `codex archive <thread>`, delete `.taskq/T<N>.pid` (or a replaced `T<N>-<thread>.pid`) |
 
+- Codex spawn and resume use the same `codex` options (§ 2), defaulting to `-s danger-full-access` on every
+  host (R9). The default has no workspace-sandbox network setting or `--add-dir`; those do not restrict full
+  access. The process retains its launching account's OS permissions.
 - A supervisor starts and retires as a worker does, named `S<N> ...` (Codex: `.taskq/S<N>.log`,
   `.taskq/S<N>.pid`), with the same tools, `permission_mode` and `codex` options (R9). A running Claude supervisor
   is never `send`-ed to: its own `taskq wait --task N` wakes it. Only an idle one (its process ended) is: the resume
@@ -1197,8 +1206,8 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 - Claude: `claude --bg --resume <short id>` starts a copy, not the same session; resume by the full id.
 - A process started with `nohup` or `disown` in a worker's shell dies when the tool call ends (#130); use the
   tool's background mode (Claude: `run_in_background`).
-- Codex on macOS: the `workspace-write` sandbox denies the GPU, so Metal apps (Blender) exit 139 (#157). Run such a
-  task with `--runtime claude`.
+- Codex on macOS with an explicit `workspace-write` override: that sandbox denies the GPU, so Metal apps
+  (Blender) exit 139 (#157). Run such a task with `--runtime claude`.
 
 ### Native Hermes admission (local candidate)
 

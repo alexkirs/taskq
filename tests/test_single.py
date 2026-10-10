@@ -2339,6 +2339,46 @@ class Tick(TickSetup):
 class RuntimeProcessBoundary(Base):
     """Local processes only. No installed model CLI, board network or paid calls."""
 
+    def test_codex_spawn_and_resume_options_default_and_explicit_overrides(self):
+        # #620: prove the argv at a real child boundary; explicit options replace, never merge with, the default.
+        script, received = self.root / 'fake_codex.py', self.root / 'argv.jsonl'
+        script.write_text("import json, pathlib, sys\n"
+                          "with pathlib.Path(sys.argv[1]).open('a') as out: out.write(json.dumps(sys.argv[2:]) + '\\n')\n"
+                          "print('{\"type\":\"thread.started\",\"thread_id\":\"local-thread\"}', flush=True)\n"
+                          "print('{\"type\":\"turn.completed\"}', flush=True)\n")
+        children = []
+        def launch(command, **kwargs):
+            child = REAL_POPEN([sys.executable, str(script), str(received), *command[1:]], **kwargs)
+            children.append(child)
+            return child
+        custom = ['-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true',
+                  '--add-dir', str(self.root / 'external git'), '-m', 'owner-model']
+        codex = taskq.Codex()
+        try:
+            for options in (None, [], custom):
+                expected = ['-s', 'danger-full-access'] if options is None else list(options)
+                with self.subTest(options=options), mock.patch.dict(taskq.CONFIG), \
+                        mock.patch.object(taskq.subprocess, 'Popen', launch), \
+                        mock.patch.object(taskq.shutil, 'which', return_value=sys.executable), \
+                        mock.patch.object(taskq, 'dispatch'), mock.patch.object(codex, 'title'):
+                    if options is not None:
+                        taskq.CONFIG['codex'] = options
+                    self.assertEqual(codex.spawn('T1 mock', 'spawn prompt', self.root), 'local-thread')
+                    children[-1].wait(timeout=5)
+                    self.assertEqual(codex.send('local-thread', 'resume prompt'), 'local-thread')
+                    children[-1].wait(timeout=5)
+                    commands = [json.loads(line) for line in received.read_text().splitlines()]
+                    self.assertEqual(commands[-2:], [
+                        ['exec', '--json', *expected, '-C', str(self.root), 'spawn prompt'],
+                        ['exec', '--json', *expected, 'resume', 'local-thread', 'resume prompt']])
+                    if options is not None:
+                        self.assertEqual(taskq.CONFIG['codex'], expected)
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.terminate()
+                child.wait(timeout=5)
+
     def test_spawn_preserves_unresolved_canonical_handle_before_exec(self):
         codex = taskq.Codex()
         target = codex.folder() / 'T1.pid'
@@ -2630,6 +2670,7 @@ class Wait(TickSetup):
         with mock.patch.dict(os.environ, {**self.codex_home('sessions/2026/10/09', 'T1'), 'CODEX_THREAD_ID': 'T1'}):
             sender, self_arm = self.run_cli('arm', 'tick', 'T1'), self.run_cli('arm', 'tick')
         self.assertIn('resume T1 "<its output>"', sender)
+        self.assertIn('codex exec -s danger-full-access resume T1', sender)
         self.assertIn('resume T1 "$e" && printf', sender)
         self.assertIn('ack --stdin --pm T1; do :; done;', sender)
         self.assertNotIn('send_message_to_thread', sender)

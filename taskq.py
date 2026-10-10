@@ -867,9 +867,8 @@ def write_process(path, process, session):
 
 
 def codex_options():
-    # Network on: a worker pushes and calls the board. `"codex": [...]` in taskq.json replaces these options.
-    return CONFIG.get('codex', ['-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true',
-                                '--add-dir', str(CONFIG['root'] / '.git')])  # git fetch/commit write the main .git
+    # R9 (#620): owner-approved full access on every host; explicit project options replace the whole default.
+    return CONFIG.get('codex', ['-s', 'danger-full-access'])
 
 class Unnamed(Exception):
     """R3 (#572): a started session whose native name was not confirmed; `thread` is its id."""

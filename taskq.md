@@ -39,7 +39,11 @@ history. The ledger request, current task turn, session, child birth and strict
 terminal log segment must agree. Closure is not terminal proof; a reused PID,
 missing/malformed log or later active turn retains the grant. Only
 `model:codex:1` grants are settled; resource leases and legacy recovery holds are
-unchanged. Settlement is idempotent and records completion without reopening,
+unchanged. Completion is written and freshly verified before either grant is released.
+Unknown/refused board writes retain drained/reserved grants for bounded retry.
+A verified complete turn with an outstanding grant resumes only settlement, not
+execution; its saved completion must match strict native terminal proof.
+Settlement is idempotent and records completion without reopening,
 dispatching or otherwise changing the closed task.
 
 The former automatic CLI wait/send/wait shortcut is withheld: successful resume

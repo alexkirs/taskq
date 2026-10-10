@@ -268,6 +268,35 @@ class ClosedModelSettlement(unittest.TestCase):
         self.assertEqual(self.host.outstanding_models('o/r'), {})
         self.assertEqual(self.project.outstanding_models(), {})
 
+    def test_board_write_refusal_retains_grants_and_retries_completion(self):
+        with mock.patch.object(q, 'write_task_verified', side_effect=RuntimeError('write lost')):
+            with self.assertRaisesRegex(RuntimeError, 'write lost'):
+                self.reconcile()
+        self.assertEqual(self.host.observe('turn')['phase'], 'drained')
+        self.assertEqual(self.project.observe('turn')['phase'], 'reserved')
+        self.assertEqual(q.issue_data(self.issue)['model_turns']['supervisor']['phase'], 'bound')
+        self.reconcile()
+        self.assertEqual(self.host.observe('turn')['phase'], 'released')
+        self.assertEqual(self.project.observe('turn')['phase'], 'released')
+        self.assertEqual(q.issue_data(self.issue)['model_turns']['supervisor']['phase'], 'complete')
+
+    def test_board_write_applied_but_receipt_lost_reconciles_without_rewrite(self):
+        write = q.write_task_verified
+        def lost(*args):
+            write(*args)
+            raise RuntimeError('readback unknown')
+        with mock.patch.object(q, 'write_task_verified', side_effect=lost):
+            with self.assertRaisesRegex(RuntimeError, 'readback unknown'):
+                self.reconcile()
+        self.assertEqual(self.host.observe('turn')['phase'], 'drained')
+        self.assertEqual(self.project.observe('turn')['phase'], 'reserved')
+        self.assertEqual(q.issue_data(self.issue)['model_turns']['supervisor']['phase'], 'complete')
+        writes = len(self.writes)
+        self.reconcile()
+        self.assertEqual(len(self.writes), writes)
+        self.assertEqual(self.host.observe('turn')['phase'], 'released')
+        self.assertEqual(self.project.observe('turn')['phase'], 'released')
+
 
 if __name__ == '__main__':
     unittest.main()

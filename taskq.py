@@ -1977,7 +1977,7 @@ def model_reconcile(item):
         return
     project, host = model_providers()
     for role_name, turn in list(turns.items()):
-        if turn['phase'] == 'complete':
+        if turn['phase'] == 'complete' and not turn.get('key'):
             continue
         issue = read_issue(item['iid'])
         raw = issue_data(issue)
@@ -1995,14 +1995,20 @@ def model_reconcile(item):
             settled = host.settle_model(turn['key'], turn['runtime'])
         except (ValueError, OSError):
             continue
-        host.release(turn['key'])
-        project.release(turn['key'])
         issue = read_issue(item['iid'])
         raw = issue_data(issue)
-        if (raw.get('model_turns') or {}).get(role_name) != turn:
+        if 'legacy_recovery' in raw or (raw.get('model_turns') or {}).get(role_name) != turn:
             fail('model turn changed during settlement; preserve newer board state')
-        raw['model_turns'][role_name] = {**turn, 'phase': 'complete', 'completion': settled['drain']}
-        fresh = write_task_verified(issue, raw, issue['labels'])
+        if turn['phase'] == 'complete':
+            if turn.get('completion') != settled['drain']:
+                continue  # completion is not permission to release a different native turn
+            fresh = issue
+        else:
+            raw['model_turns'][role_name] = {**turn, 'phase': 'complete', 'completion': settled['drain']}
+            fresh = write_task_verified(issue, raw, issue['labels'])
+        # Keep both outstanding selectors recoverable until verified board completion.
+        host.release(turn['key'])
+        project.release(turn['key'])
         parsed = parse(fresh)
         if parsed:
             item.update(parsed)

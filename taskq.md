@@ -715,7 +715,9 @@ must classify and sanitize input first.
 Provider contract reviewed at Supercompress/Supercompress commit
 `1b76c6f607de9b5c0eb2beef795f180f39f02f30`: HTTPS POST
 `https://www.supercompress.dev/api/v1/compress`, `X-API-Key`, JSON context/query with `ccr:false`,
-`cache_prefix:false`, `log:false`; fixed host, no redirects, retries or remote retrieval. One owned short
+`cache_prefix:false`, `log:false`, and fixed `coding_agent:"taskq"`, `source:"taskq"` attribution without
+task/project/user identifiers. Provider agent analytics are best effort; an API response alone does not prove
+dashboard counters updated. Fixed host, no redirects, retries or remote retrieval. One owned short
 stdlib Python network subprocess receives context/query/key only through private stdin, never argv,
 files or inherited credentials. It starts no descendants. After OS process creation, one 60-second
 deadline watchdog kills that owned child through its process handle, including blocked stdin transfer

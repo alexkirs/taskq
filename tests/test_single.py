@@ -301,7 +301,8 @@ class Compression(Base):
                 method, path, body, headers = connection.request.call_args.args
                 self.assertEqual((method, path), ('POST', '/api/v1/compress'))
                 self.assertEqual(headers['X-API-Key'], self.KEY)
-                self.assertEqual(json.loads(body), {'context': self.source, 'query': 'intent', 'ccr': False, 'cache_prefix': False, 'log': False})
+                self.assertEqual(json.loads(body), {'context': self.source, 'query': 'intent', 'ccr': False, 'cache_prefix': False, 'log': False,
+                                                   'coding_agent': 'taskq', 'source': 'taskq'})
                 connection.close.assert_called_once()
                 if status == 200:
                     self.assertEqual(result, self.result)

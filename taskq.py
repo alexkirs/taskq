@@ -1739,7 +1739,8 @@ def _compression_http(context, query, key):
     connection = None
     try:
         connection = http.client.HTTPSConnection(COMPRESS_HOST, timeout=COMPRESS_TIMEOUT)
-        data = json.dumps({'context': context, 'query': query, 'ccr': False, 'cache_prefix': False, 'log': False}).encode('utf-8')
+        data = json.dumps({'context': context, 'query': query, 'ccr': False, 'cache_prefix': False, 'log': False,
+                           'coding_agent': 'taskq', 'source': 'taskq'}).encode('utf-8')
         connection.request('POST', '/api/v1/compress', data, {'X-API-Key': key, 'Content-Type': 'application/json'})
         transport = connection.sock  # retain it when Connection: close detaches the response from the connection
         left = deadline - time.monotonic()

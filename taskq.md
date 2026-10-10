@@ -85,6 +85,11 @@ single 60-second naming/shutdown deadline.
 A started ID is not proof of persisted rollout readiness. Every other RPC error fails immediately;
 name acknowledgement and matching `thread/read` remain mandatory before spawn is accepted. Timeout still
 stops the owned turn, preserves its handle and records the failed spawn; retries do not start another turn.
+Changed (#616, Windows startup incident 2026-10-10): missing-rollout-only readiness -> also retry
+the observed -32603 `thread/name/set` empty-rollout metadata error, only when its thread ID and rollout
+filename match the new thread and both reported paths are identical. This narrow startup condition uses
+the same owned-running-process check and original 60-second deadline; other fatal/metadata errors and
+all readback failures still fail immediately. A created rollout file is not proof its metadata is ready.
 Changed: ORCH from the session that ran the pass, and Codex threads titled by the brief's first line `You are the
 taskq supervisor ...` → ORCH from the task's `pm`, Codex threads named natively (#572).
 Changed: four roles (root PM, tick, supervisor, worker) → three plus the owner. The supervisor reviewed, published

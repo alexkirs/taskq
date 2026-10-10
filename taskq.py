@@ -2506,6 +2506,20 @@ def cmd_applied(args):
         fail('answer input changed from the exact admitted turn; acknowledgement refused')
     relative = Path(args.artifact)
     root = CONFIG['root'].resolve()
+    executable = shutil.which('git') or fail('git not found')
+    workspace = root / '.worktrees' / f'taskq-{n}'
+    if CONFIG.get('workspace') != 'external' and workspace.exists():
+        if workspace.is_symlink() or not workspace.is_dir() or not workspace.resolve().is_relative_to(root):
+            fail('applied worker worktree must stay inside its project')
+        registered = subprocess.run([executable, '-C', str(root), 'worktree', 'list', '--porcelain', '-z'],
+                                    capture_output=True, text=True, encoding='utf-8', timeout=10)
+        branch = subprocess.run([executable, '-C', str(workspace), 'symbolic-ref', '--quiet', '--short', 'HEAD'],
+                                capture_output=True, text=True, encoding='utf-8', timeout=10)
+        if registered.returncode or branch.returncode or branch.stdout.strip() != f'taskq-{n}' \
+                or not any(Path(line[9:]).resolve() == workspace.resolve()
+                           for line in registered.stdout.split('\0') if line.startswith('worktree ')):
+            fail('applied requires its registered task branch/worktree')
+        root = workspace.resolve()
     path = root / relative
     import fnmatch
     if relative.is_absolute() or '..' in relative.parts or not relative.name or path.is_symlink() \
@@ -2515,7 +2529,7 @@ def cmd_applied(args):
     content = path.read_bytes()
     if len(content) > 1024 * 1024:
         fail('applied artifact exceeds 1 MiB bound')
-    git = [shutil.which('git') or fail('git not found'), '-C', str(root)]
+    git = [executable, '-C', str(root)]
     head = subprocess.run([*git, 'rev-parse', 'HEAD'], capture_output=True, timeout=10)
     blob = subprocess.run([*git, 'show', f'{args.sha}:{relative.as_posix()}'], capture_output=True, timeout=10)
     if head.returncode or head.stdout.decode().strip() != args.sha or blob.returncode or blob.stdout != content:

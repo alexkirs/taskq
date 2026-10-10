@@ -205,6 +205,9 @@ commit before writing a native application receipt plus ack with fresh readback.
 An empty expected-path list permits a committed artifact inside the owning task workspace;
 it is not a deny-all artifact scope. Named paths still constrain application artifacts.
 Native identity, immutable answer input, path containment and exact commit checks remain required.
+For the built-in worker route, verify the project's registered `.worktrees/taskq-N`
+on branch `taskq-N` and inspect its artifact/HEAD, rather than the main checkout.
+External workspaces retain their configured root; arbitrary workspace overrides are refused.
 Repeating that receipt performs no model turn or artifact write. An exact repeated answer while
 doing/review emits no new event or delivery. When the same native session holds both
 manager and supervisor roles, `ack --role manager|supervisor` chooses its exact recorded

@@ -260,6 +260,12 @@ class ModelIntegration(unittest.TestCase):
         self.assertEqual(converted['event_schema'], 3)
 
     def test_applied_requires_native_identity_exact_commit_and_repeat_is_no_write(self):
+        self.exercise_applied()
+
+    def test_applied_uses_registered_worker_worktree_not_main_checkout(self):
+        self.exercise_applied(worktree=True)
+
+    def exercise_applied(self, worktree=False):
         self.start(); self.complete()
         with q.coordination():
             q.move(self.item(), 'ask', 'ask', 'choose')
@@ -270,7 +276,14 @@ class ModelIntegration(unittest.TestCase):
         git = ['git', '-C', str(self.root)]
         for argv in (['init', '-q'], ['config', 'user.name', 'Fixture'], ['config', 'user.email', 'fixture@example.invalid']):
             subprocess.run(git+argv, check=True, capture_output=True)
-        (self.root/'artifact.txt').write_text('chosen value')
+        workspace = self.root
+        if worktree:
+            subprocess.run(git+['commit', '--allow-empty', '-qm', 'project baseline'], check=True)
+            workspace = self.root/'.worktrees/taskq-1'
+            workspace.parent.mkdir()
+            subprocess.run(git+['worktree', 'add', '-qb', 'taskq-1', str(workspace)], check=True)
+            git = ['git', '-C', str(workspace)]
+        (workspace/'artifact.txt').write_text('chosen value')
         subprocess.run(git+['add', 'artifact.txt'], check=True)
         subprocess.run(git+['commit', '-qm', 'synthetic artifact'], check=True)
         sha = subprocess.check_output(git+['rev-parse', 'HEAD'], text=True).strip()
@@ -289,11 +302,18 @@ class ModelIntegration(unittest.TestCase):
         with self.assertRaises(SystemExit): q.cmd_applied(args)
         scoped['scope'] = []  # ordinary intake default: no expected paths named
         self.board.issues[1]['body'] = q.block('synthetic', scoped)
+        for path in ('../artifact.txt', str(workspace/'artifact.txt')):
+            with self.assertRaises(SystemExit):
+                q.cmd_applied(argparse.Namespace(event=args.event, artifact=path, sha=sha))
+        if worktree:
+            subprocess.run(git+['checkout', '-qb', 'foreign-task'], check=True)
+            with self.assertRaises(SystemExit): q.cmd_applied(args)
+            subprocess.run(git+['checkout', '-q', 'taskq-1'], check=True)
         with q.coordination(): q.cmd_applied(args)
         before = json.dumps(self.board.issues, sort_keys=True)
         with q.coordination(): q.cmd_applied(args)
         self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
-        (self.root/'artifact.txt').write_text('changed')
+        (workspace/'artifact.txt').write_text('changed')
         with self.assertRaises(SystemExit): q.cmd_applied(args)
         self.complete()
 

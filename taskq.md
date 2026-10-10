@@ -1,5 +1,23 @@
 # taskq — the contract
 
+### Closed-task model settlement
+
+A normal guarded pass reconciles outstanding model-only grants from the local
+host ledger and project capacity anchor, including their exact closed tasks.
+It selects only bounded outstanding reservations, never enumerates closed issue
+history. The ledger request, current task turn, session, child birth and strict
+terminal log segment must agree. Closure is not terminal proof; a reused PID,
+missing/malformed log or later active turn retains the grant. Only
+`model:codex:1` grants are settled; resource leases and legacy recovery holds are
+unchanged. Settlement is idempotent and records completion without reopening,
+dispatching or otherwise changing the closed task.
+
+The former automatic CLI wait/send/wait shortcut is withheld: successful resume
+exit alone proves neither event application nor a completed queue pass. The
+qualified application sender uses the receipt handshake above; this patch adds
+no timer, daemon or sender-side ACK. `experiments/sender_handshake.py` is a
+behavioral model only, not a production transport.
+
 ### Legacy ownership reconciliation preflight
 
 `taskq reconcile N --json` is read-only, including on an incompatible board. It
@@ -1169,8 +1187,12 @@ replacement sender, bridge, store/protocol or duplicate task. Do not resume a wo
    No shell bridge, no copy of rollouts or auth. A Claude sender reaches only Claude sessions. A failed wait, a
    failed send or a missing send tool stops the sender with one blocker line: no retry, no other route, no loop on
    a failing board. The board event stays pending until an explicit ack after delivery; a later observation can replay it.
-   An agent sender forwards only while its own turn runs: it stays in that one active turn and repeats wait, send
-   without ending it between events, then waits again without acknowledging; the manager owns handling receipts. An ended sender turn or a wait left running alone forwards nothing; taskq
+   An agent sender forwards only while its own turn runs: it stays in that one active turn. Before delivering a
+   versioned event, fresh-read its exact recorded recipient ACK; already handled observations are retained as
+   superseded without another send. After successful event delivery, wait for the recorded manager's authoritative
+   ACK before the next wait. Delivery alone is not this handshake; the sender never ACKs. A literal tick instead
+   requires the manager's actual completed pass receipt. Unknown receipt/read stops without retry or another route.
+   Do not start a second wait while waiting for handling, or end the sender turn between events. An ended sender turn or a wait left running alone forwards nothing; taskq
    promises no unattended lifetime beyond a sender that is running (#522).
 2. Optional: start a separate sender session on that prompt. It does no task work. The queue never needs it (R4):
    it only carries the manager's short outcomes to a manager that cannot wake itself.

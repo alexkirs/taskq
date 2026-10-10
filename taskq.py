@@ -1979,9 +1979,18 @@ def model_reconcile(item):
     for role_name, turn in list(turns.items()):
         if turn['phase'] == 'complete':
             continue
+        issue = read_issue(item['iid'])
+        raw = issue_data(issue)
+        if 'legacy_recovery' in raw or (raw.get('model_turns') or {}).get(role_name) != turn:
+            continue
         lease = host.observe(turn['key'])
         if not lease or lease['phase'] not in ('bound', 'drained', 'released'):
             continue  # launch outcome unknown or reservation waiting; no guessed release
+        grant = project.observe(turn['key'])
+        if not grant or grant['phase'] not in ('reserved', 'released') \
+                or grant['request'] != turn['request'] or lease['request'] != turn['request'] \
+                or lease.get('runtime') != turn['runtime'] or lease.get('child') != turn.get('child'):
+            continue  # exact ledger/task binding, never a key or closed status alone
         try:
             settled = host.settle_model(turn['key'], turn['runtime'])
         except (ValueError, OSError):
@@ -1994,7 +2003,39 @@ def model_reconcile(item):
             fail('model turn changed during settlement; preserve newer board state')
         raw['model_turns'][role_name] = {**turn, 'phase': 'complete', 'completion': settled['drain']}
         fresh = write_task_verified(issue, raw, issue['labels'])
-        item.update(parse(fresh))
+        parsed = parse(fresh)
+        if parsed:
+            item.update(parsed)
+        else:
+            item['raw'] = issue_data(fresh)  # closed tasks normally have no q-* label
+
+
+def model_reconcile_outstanding(delegated_pm=None):
+    """Exact tasks selected by outstanding native model grants, never closed history."""
+    project, host = model_providers()
+    candidates = {**project.outstanding_models(), **host.outstanding_models(CONFIG['repo'])}
+    if len(candidates) > 100:
+        fail('outstanding model reconciliation bound exceeded; inspect ledger without guessing release')
+    actor = delegated_pm or origin()
+    for key, lease in candidates.items():
+        request = lease['request']
+        n = request.get('task')
+        if type(n) is not int or n <= 0 or request.get('repo') != CONFIG['repo'] \
+                or request.get('demand') != {'model:codex': 1}:
+            continue
+        local = host.observe(key)
+        if not local or local['phase'] not in ('bound', 'drained', 'released'):
+            continue  # a foreign host's outstanding grant is not this host's authority
+        issue = read_issue(n)
+        raw = issue_data(issue)
+        if raw.get('event_schema') != EVENT_SCHEMA or 'legacy_recovery' in raw or raw.get('pm') != actor:
+            continue
+        role = request.get('role')
+        turn = (raw.get('model_turns') or {}).get(role)
+        if role not in ('worker', 'supervisor') or not turn or turn.get('key') != key \
+                or turn.get('generation') != request.get('generation') or turn.get('request') != request:
+            continue
+        model_reconcile({'iid': n, 'raw': {'model_turns': {role: turn}}})
 
 
 def model_role_state(item, role_name):
@@ -2721,6 +2762,8 @@ def one_pass(args, table=True):
         issues = [issue for issue in BOARD.list(None) if issue['iid'] not in tasks] + [issue for issue in map(read_issue, tasks) if issue['state'] == 'open']
         if held:
             board_schema_gate(issues)
+            if isinstance(CONFIG.get('capacity'), dict) and 'model:codex' in CONFIG['capacity'].get('host_caps', {}):
+                model_reconcile_outstanding(delegated_pm)
         items = sorted(filter(None, map(parse, issues)), key=lambda item: (item['priority'], item['iid']))
         if delegated_pm is not None:
             items = [item for item in items if item['pm'] == delegated_pm]
@@ -3029,6 +3072,10 @@ class BoardCapacity:
     def observe(self,key):
         return self.load()[1]['leases'].get(key)
 
+    def outstanding_models(self):
+        return {key: value for key, value in self.load()[1]['leases'].items()
+                if value['phase'] == 'reserved' and value['request'].get('demand') == {'model:codex': 1}}
+
     def change(self,key,request=None):
         issue,value,match = self.load()
         before = json.dumps(value,sort_keys=True)
@@ -3148,6 +3195,26 @@ class SQLiteCapacity:
     def observe(self, key):
         with self.transaction() as db:
             return self.row(db, key)
+
+    def outstanding_models(self, repo=None):
+        if self.scope == 'project':
+            query = "json_extract(body, '$.phase') = 'reserved'"
+            repo = self.owner
+        else:
+            if not repo:
+                raise ValueError('host model selection requires project')
+            query = ("json_extract(body, '$.phase') IN ('bound','drained') AND "
+                     "json_extract(body, '$.runtime.kind') = 'codex-model-turn'")
+        with self.transaction() as db:
+            rows = db.execute("SELECT id, body FROM capacity_lease WHERE " + query +
+                              " AND json_extract(body, '$.request.repo') = ?"
+                              " AND json_extract(body, '$.request.demand.\"model:codex\"') = 1"
+                              " AND (SELECT COUNT(*) FROM json_each(json_extract(body, '$.request.demand'))) = 1"
+                              " LIMIT 101", (repo,)).fetchall()
+        if len(rows) > 100:
+            raise ValueError('outstanding model bound exceeded')
+        return {key: value for key, body in rows
+                if (value := json.loads(body))['request'].get('demand') == {'model:codex': 1}}
 
     def reserve(self, key, request):
         with self.transaction() as db:
@@ -4753,15 +4820,9 @@ Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.j
         if native:
             send = ('by setting `[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)` '
                     f'and piping its output to `{resume}` as stdin: a new turn on that thread wakes it')
-        shell = (f'\nNo agent needed: `cd {CONFIG["root"]} && while e=$({wait}) && {resume} "$e"; do :; done; '
-                 'echo "taskq sender stopped"` in a terminal.')
-        if native:
-            shell = (f'\nNo agent needed: `$ErrorActionPreference=\'Stop\'; Set-Location -LiteralPath {shell_quote(CONFIG["root"], True)} -ErrorAction Stop; '
-                     '[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
-                     f'while ($true) {{ $e = {wait}; if ($LASTEXITCODE -ne 0) {{ break }}; '
-                     f'$e | {resume}; if ($LASTEXITCODE -ne 0) {{ break }}; '
-                     '}; '
-                     'Write-Output "taskq sender stopped"` in a terminal.')
+        shell = ('\nAutomatic terminal wait/send/wait shortcut withheld: resume exit is not a native application '
+                 'receipt. Use the sender handshake above; no next wait until verified manager handling. '
+                 'No new scheduler or sender acknowledgement is introduced.')
     elif where == 'archived':  # #522: exec resume of an archived thread is unverified (R12): no route
         return print(f'taskq: {pm} is archived in Codex; `exec resume` of an archived thread is unverified, so no sender.\n'
                      f'Run `codex unarchive {pm}`, then `taskq arm tick {pm}` again.')
@@ -4781,7 +4842,11 @@ Stay in this one turn and repeat, from {CONFIG["root"]}; do not end the turn bet
 2. Send its output, verbatim, to {pm} {send}.
 3. Do not run ack: the recorded manager owns application acknowledgement. Delivery success is not application.
    Schema2 ask/result requires the manager native apply-event handler; unsupported handling remains pending on the board.
-4. Go back to 1 at once. A failed wait, a failed send or no such send tool: stop, say here
+4. For versioned events, fresh-read the exact recipient ACK before delivery; alreadyACKed observations are superseded,
+   never resent. After delivery wait for that manager's authoritative ACK before the next wait. For literal tick,
+   verify its manager's actual completed pass receipt. Never start another wait merely because send succeeded.
+   Unknown read/handling receipt stops; the sender never acknowledges on the manager's behalf.
+5. Only after that handshake go back to 1. A failed wait, a failed send or no such send tool: stop, say here
    `taskq sender stopped: <error>` once; never retry, never another route.{shell}''')
 
 def main(argv=None):

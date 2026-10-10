@@ -1343,9 +1343,9 @@ class ShellBriefs(Base):
                 self.assertNotIn('python3 ', prompt)
                 self.assertNotIn(' && ', prompt)
             sender = self.run_cli('arm', 'tick', 'PM')
-            self.assertIn('while ($true)', sender)
+            self.assertNotIn('while ($true)', sender)
             self.assertNotIn("ack --stdin", sender)
-            self.assertIn('if ($LASTEXITCODE -ne 0) { break }', sender)
+            self.assertIn('Automatic terminal wait/send/wait shortcut withheld', sender)
             self.assertIn('A failed wait, a failed send or no such send tool: stop', sender)
 
     @unittest.skipUnless(os.name == 'nt', 'native PowerShell boundary')
@@ -1382,49 +1382,30 @@ class ShellBriefs(Base):
             self.assertEqual(run.stdout.strip(), 'fetch origin')
 
     @unittest.skipUnless(os.name == 'nt', 'native PowerShell boundary')
-    def test_native_sender_stops_on_failed_wait_or_send_without_ack(self):
-        queue, codex, calls = (self.root / name for name in ("queue's stub.py", "codex's stub.py", 'calls'))
-        events = ['review #1 [event 1:1] "two words" \\"quoted path" Привет',
-                  'review #2 [event 2:1] owner\'s $value; C:\\path with space\\']
-        options = ['-c', 'test=["two words", "C:\\\\path\\\\", "%PATH%", "Привет"]']
-        expected_args = ['exec', *options, 'resume', "PM's literal", '-']
+    def test_native_sender_withholds_unreceipted_loop_preserves_one_delivery(self):
+        codex, calls = self.root / "codex's stub.py", self.root / 'calls'
+        events = 'review #1 [event 1:1] "two words" Привет'
+        options = ['-c', 'test=["two words"]']
+        expected = ['exec', *options, 'resume', "PM's literal", '-']
         launch = taskq.native_command
         def receiver(arguments, capture=False):
             return launch(arguments, capture=True) if capture else launch([sys.executable, str(codex), *arguments[1:]])
-        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex'}), \
-                mock.patch.object(taskq, '__file__', str(queue)), mock.patch.object(taskq, 'rollout', return_value='local'), \
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME':'codex'}), \
+                mock.patch.object(taskq, 'rollout', return_value='local'), \
                 mock.patch.object(taskq.shutil, 'which', return_value='codex.exe'), \
                 mock.patch.object(taskq, 'codex_options', return_value=options), \
                 mock.patch.object(taskq, 'native_command', side_effect=receiver):
             prompt = self.run_cli('arm', 'tick', "PM's literal")
-        loop = prompt.split('No agent needed: `', 1)[1].split('` in a terminal', 1)[0]
-        self.assertNotIn('ack --stdin', loop)
-        for fail_at, expected in (('wait', ['wait']), ('send', ['wait', 'send']),
-                                  ('third-wait', ['wait', 'send', 'wait', 'send', 'wait'])):
-            with self.subTest(fail_at=fail_at):
-                calls.write_text('', 'utf-8')
-                queue.write_text('import sys\nfrom pathlib import Path\n'
-                                 'sys.stdout.reconfigure(encoding="utf-8")\n'
-                                 f'log=Path({str(calls)!r})\naction=sys.argv[1]\n'
-                                 'with log.open("a", encoding="utf-8") as out: out.write(action + "\\n")\n'
-                                 f'if action == {fail_at!r}: sys.exit(19)\n'
-                                 'if action == "wait":\n'
-                                 '    if log.read_text().splitlines().count("wait") > 2: sys.exit(19)\n'
-                                 f'    print("\\n".join({events!r}))\n'
-                                 'else:\n'
-                                 f'    assert sys.stdin.buffer.read().decode("utf-8").splitlines() == {events!r}\n', 'utf-8')
-                codex.write_text('import sys\nfrom pathlib import Path\n'
-                                 f'with Path({str(calls)!r}).open("a", encoding="utf-8") as out: out.write("send\\n")\n'
-                                 f'assert sys.argv[1:] == {expected_args!r}\n'
-                                 f'assert sys.stdin.buffer.read().decode("utf-8").splitlines() == {events!r}\n'
-                                 f'sys.exit({19 if fail_at == "send" else 0})\n', 'utf-8')
-                run = self.run_powershell(loop)
-                self.assertEqual(run.returncode, 0, run.stderr)
-                self.assertEqual(run.stderr, '')
-                self.assertEqual(run.stdout.strip(), 'taskq sender stopped')
-                observed = calls.read_text('utf-8').splitlines()
-                self.assertEqual(observed, expected)
-                self.assertNotIn('ack', observed)
+        self.assertNotIn('No agent needed:', prompt)
+        self.assertNotIn('while ($true)', prompt)
+        codex.write_text('import sys\nfrom pathlib import Path\n'
+                         f'assert sys.argv[1:] == {expected!r}\n'
+                         f'Path({str(calls)!r}).write_bytes(sys.stdin.buffer.read())\n', 'utf-8')
+        delivery = prompt.split('piping its output to `',1)[1].split('`',1)[0]
+        command = '[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false); ' + taskq.shell_quote(events, True) + ' | ' + delivery
+        run = self.run_powershell(command)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(calls.read_text('utf-8').strip(), events)
 
     @unittest.skipUnless(os.name == 'nt', 'native PowerShell boundary')
     def test_native_manager_preserves_compact_configuration_argv(self):
@@ -1844,7 +1825,8 @@ class Tick(TickSetup):
             self.add('new turn','--runtime','codex')
         originals = [self.board.get(n)['body'] for n in range(1,5)]
         with mock.patch.object(taskq,'runtimes',return_value={'codex':self.fake}), \
-                mock.patch.object(taskq,'model_reconcile'), mock.patch.object(taskq,'follow'), \
+                mock.patch.object(taskq,'model_reconcile'), mock.patch.object(taskq,'model_reconcile_outstanding'), \
+                mock.patch.object(taskq,'follow'), \
                 mock.patch.object(taskq,'spawn_named',return_value=None) as admit:
             self.run_cli('tick')
             self.assertEqual(admit.call_count,1)  # authority may refuse; task ownership is not a model slot
@@ -3585,18 +3567,18 @@ class Wait(TickSetup):
         return {'TASKQ_RUNTIME': 'codex', 'CODEX_HOME': str(home)}
 
     def test_arm_tick_in_codex_names_resume(self):
-        """#522: a local thread (rollout under sessions/) gets exec resume; the shell loop stops on a failed send."""
+        """#522: a local thread gets one resume route, without an unreceipted automatic loop."""
         with mock.patch.dict(os.environ, {**self.codex_home('sessions/2026/10/09', 'T1'), 'CODEX_THREAD_ID': 'T1'}):
             sender, self_arm = self.run_cli('arm', 'tick', 'T1'), self.run_cli('arm', 'tick')
         if os.name == 'nt':
             self.assertIn(taskq.native_command(['codex', 'exec', *taskq.codex_options(), 'resume', 'T1', '-']), sender)
-            self.assertIn('while ($true)', sender)
+            self.assertNotIn('while ($true)', sender)
             self.assertNotIn("ack --stdin", sender)
-            self.assertIn('if ($LASTEXITCODE -ne 0) { break }', sender)
+            self.assertIn('Automatic terminal wait/send/wait shortcut withheld', sender)
         else:
             self.assertIn('resume T1 "<its output>"', sender)
             self.assertIn('codex exec -s danger-full-access resume T1', sender)
-            self.assertIn('resume T1 "$e"; do :; done;', sender)
+            self.assertNotIn('resume T1 "$e"; do :; done;', sender)
             self.assertNotIn('ack --stdin', sender)
         self.assertNotIn('send_message_to_thread', sender)
         self.assertIn('in the foreground', self_arm)
@@ -3632,29 +3614,16 @@ class Wait(TickSetup):
                         self.assertEqual(out, self.run_cli('arm', 'tick', target))
                 self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
 
-    @unittest.skipIf(os.name == 'nt', 'POSIX sender shell; native receiver boundary is ShellBriefs.test_native_sender_stops_on_failed_wait_send_or_ack')
-    def test_arm_tick_shell_loop_stops_on_failed_wait_or_send(self):
-        """#522: the printed shell loop sends each event once and stops on the first failed wait or send."""
+    def test_arm_sender_withholds_unreceipted_automatic_loop(self):
         with mock.patch.dict(os.environ, self.codex_home('sessions/2026/10/09', 'T1')):
             sender = self.run_cli('arm', 'tick', 'codex://threads/T1')
-        self.assertIn('Stay in this one turn and repeat', sender)
-        self.assertIn('A failed wait, a failed send or no such send tool: stop', sender)
-        loop = sender.split('No agent needed: `', 1)[1].split('` in a terminal', 1)[0]
-        wait = f'python3 {Path(taskq.__file__).resolve()} wait'
-        bin_, sent = self.root / 'bin', self.root / 'sent'
-        bin_.mkdir()
-        (bin_ / 'codex').write_text(f'#!/bin/sh\necho "$@" >> {sent}\nexit ${{SEND_EXIT:-0}}\n')
-        (bin_ / 'codex').chmod(0o755)
-        events = self.root / 'events'
-        for send_exit, expect in (('0', 2), ('1', 1)):  # wait fails on its 3rd run; a failed send stops at once
-            events.write_text('0')
-            fake_wait = f'sh -c \'n=$(cat {events}); echo $((n+1)) > {events}; [ $n -lt 2 ] && echo "review #$n"\''
-            sent.write_text('')
-            with mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
-                run = REAL_RUN(['bash', '-c', loop.replace(wait, fake_wait).replace(f'python3 {Path(taskq.__file__).resolve()} ack --stdin --pm T1', 'cat >/dev/null')], capture_output=True, text=True, timeout=10,
-                               env={**os.environ, 'PATH': f'{bin_}:/usr/bin:/bin', 'SEND_EXIT': send_exit})
-            self.assertEqual(run.stdout, 'taskq sender stopped\n')
-            self.assertEqual(len(sent.read_text().splitlines()), expect)
+        self.assertIn('Automatic terminal wait/send/wait shortcut withheld', sender)
+        self.assertNotIn('No agent needed:', sender)
+        self.assertNotIn('while e=', sender)
+        self.assertIn('alreadyACKed observations are superseded', sender)
+        self.assertIn('authoritative ACK before the next wait', sender)
+        self.assertIn('actual completed pass receipt', sender)
+        self.assertIn('never acknowledges on the manager', sender)
 
     def test_arm_tick_in_codex_unknown_target_promises_no_wake(self):
         """#522: no local rollout is not proof of an app thread: no resume, no promised wake, the app sender only if known."""

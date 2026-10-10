@@ -195,7 +195,14 @@ rule or amend this one, never keep both. A new rule gets the next R-number.
 ### R1. Board is the only state and lock
 
 The issue's `q-*` label, its JSON block and trusted comments hold all task state, claims and history (§ 3). No extra
-database, queue, receipt store, mirror or protocol. Local files under `.taskq/` are runtime handles only (§ 8).
+task database, task queue or authoritative receipt store. Local files under `.taskq/` are runtime handles (§ 8),
+with the bounded transport-cache exception below.
+Changed (#646, owner-approved ARM/PM contract): local files were runtime handles only → a named PM subscriber
+may retain one pending typed envelope and its delivery cursor in a local bounded transport cache. This cache
+supports replay after reconnect; it is never task state, claim, decision or application authority. Its delivery
+ACK changes only that subscriber's cursor, not native board ACKs, owner answers or worker application receipts.
+Every new observation reads the native board; missing history and non-atomic snapshot freshness are explicit.
+The cache cannot authorize execution, repair, adoption or settlement and creates no second task queue.
 Changed (#603, owner decision 2026-10-10): checkout-local dispatch files → one board-backed project guard.
 Task state stays on issues; the board adapter supplies atomic acquisition and exact-token release (§ 2).
 Changed (owner-approved audit optimizations, 2026-10-10; R1/R4/R8/R12/R13): delivery receipts for

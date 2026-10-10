@@ -778,6 +778,154 @@ class PullRequests(Base):
                 taskq.load_config(folder)
 
 
+class ShellBriefs(Base):
+    """#622: generated instructions stay inside the native Codex shell and preserve role identity."""
+
+    def prompts(self, runtime):
+        item = self.task(1)
+        return (taskq.brief(item, runtime), taskq.supervisor_brief(item, runtime, object()))
+
+    def run_powershell(self, command):
+        shell = Path(os.environ['SYSTEMROOT']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+        with mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
+            return REAL_RUN([str(shell), '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
+                            capture_output=True, text=True, timeout=15,
+                            env={**os.environ, 'PATHEXT': '.COM;.EXE;.BAT;.CMD'})  # PS otherwise shell-opens .exe asynchronously
+
+    def test_role_briefs_choose_native_windows_codex_only(self):
+        self.add()
+        script = self.root / "queue's clone with spaces" / 'taskq.py'
+        interpreter = str(self.root / "Python's install" / 'python.exe')
+        for platform, runtime, native in (('win32', 'codex', True), ('linux', 'codex', False),
+                                           ('darwin', 'codex', False), ('win32', 'claude', False)):
+            with self.subTest(platform=platform, runtime=runtime), mock.patch.object(taskq.sys, 'platform', platform), \
+                    mock.patch.object(taskq.sys, 'executable', interpreter), mock.patch.object(taskq, '__file__', str(script)):
+                for prompt in self.prompts(runtime):
+                    if native:
+                        self.assertIn('shell="powershell.exe", login=false and native Windows paths', prompt)
+                        self.assertIn("$env:TASKQ_TASK='1'; $env:TASKQ_RUNTIME='codex';", prompt)
+                        self.assertIn(f'Queue tool: `{taskq.queue_tool(runtime)}`', prompt)
+                        self.assertNotIn('export TASKQ_', prompt)
+                        self.assertNotIn('python3 ', prompt)
+                        self.assertNotIn(' && ', prompt)
+                    else:
+                        self.assertIn(f'Queue tool: `python3 {script}`', prompt)
+                        self.assertIn(f'export TASKQ_TASK=1 TASKQ_RUNTIME={runtime} &&', prompt)
+                        self.assertNotIn('shell="powershell.exe"', prompt)
+                self.assertIn('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }' if native else 'git fetch origin && git rebase origin/main',
+                              self.prompts(runtime)[0])
+
+    def test_native_manager_and_sender_use_the_same_queue_command(self):
+        self.add()
+        (self.root / 'taskq.md').write_text('## Principles\nFixture\n\n## 7. Manager\nFixture\n', 'utf-8')
+        with mock.patch.object(taskq.sys, 'platform', 'win32'), \
+                mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_THREAD_ID': 'PM'}), \
+                mock.patch.object(taskq.shutil, 'which', return_value='codex.exe'), \
+                mock.patch.object(taskq, 'rollout', return_value='local'):
+            tq = taskq.queue_tool('codex')
+            for prompt in (self.run_cli('pm'), self.run_cli('arm', 'tick'), self.run_cli('arm', 'tick', 'PM')):
+                self.assertIn(tq, prompt)
+                self.assertIn('shell="powershell.exe", login=false', prompt)
+                self.assertNotIn('python3 ', prompt)
+                self.assertNotIn(' && ', prompt)
+            sender = self.run_cli('arm', 'tick', 'PM')
+            self.assertIn('while ($true)', sender)
+            self.assertIn("ack --stdin --pm 'PM'", sender)
+            self.assertIn('if ($LASTEXITCODE -ne 0) { break }', sender)
+            self.assertIn('A failed wait, a failed send or no such send tool: stop', sender)
+
+    @unittest.skipUnless(os.name == 'nt', 'native PowerShell boundary')
+    def test_native_brief_commands_execute_with_literal_paths_and_identity(self):
+        self.add()
+        folder = self.root / "queue's clone with spaces"
+        folder.mkdir()
+        script = folder / 'taskq.py'
+        script.write_text('import json,os,sys\nprint(json.dumps(dict(task=os.environ.get("TASKQ_TASK"), '
+                          'runtime=os.environ.get("TASKQ_RUNTIME"), argv=sys.argv)))\n', 'utf-8')
+        payload = 'worker\'s "two words" $value; & text\nПривет \\"quoted" C:\\trailing slash\\'
+        with mock.patch.object(taskq, '__file__', str(script)):
+            prompts = self.prompts('codex')
+        for prompt in prompts:
+            prefix = re.search(r'Start every shell command with `([^`]+)`', prompt)[1]
+            command = re.search(r'Queue tool: `([^`]+)`', prompt)[1]
+            run = self.run_powershell(prefix + ' ' + command + ' result 1 --text ' + taskq.shell_quote(payload, True) + " --option ''")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertTrue(run.stdout.strip(), run.stderr)
+            self.assertEqual(json.loads(run.stdout), {'task': '1', 'runtime': 'codex',
+                             'argv': [str(script), 'result', '1', '--text', payload, '--option', '']})
+
+    @unittest.skipUnless(os.name == 'nt', 'native PowerShell boundary')
+    def test_native_worker_git_sequences_stop_on_failure(self):
+        self.add()
+        prompt = self.prompts('codex')[0]
+        chains = re.findall(r'`(git fetch origin;[^`]+)`', prompt)
+        self.assertEqual(len(chains), 2)
+        stub = self.root / 'git.ps1'
+        stub.write_text('Write-Output ($args -join " ")\nif ($args[0] -eq "fetch") { exit 19 }\n', 'utf-8')
+        for chain in chains:
+            run = self.run_powershell(chain.replace('git ', f'& {taskq.shell_quote(stub, True)} '))
+            self.assertEqual(run.returncode, 19, run.stderr)
+            self.assertEqual(run.stdout.strip(), 'fetch origin')
+
+    @unittest.skipUnless(os.name == 'nt', 'native PowerShell boundary')
+    def test_native_sender_stops_on_failed_wait_send_or_ack(self):
+        queue, codex, calls = (self.root / name for name in ("queue's stub.py", "codex's stub.py", 'calls'))
+        events = ['review #1 [event 1:1] "two words" \\"quoted path" Привет',
+                  'review #2 [event 2:1] owner\'s $value; C:\\path with space\\']
+        options = ['-c', 'test=["two words", "C:\\\\path\\\\", "%PATH%", "Привет"]']
+        expected_args = ['exec', *options, 'resume', "PM's literal", '-']
+        launch = taskq.native_command
+        def receiver(arguments, capture=False):
+            return launch(arguments, capture=True) if capture else launch([sys.executable, str(codex), *arguments[1:]])
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex'}), \
+                mock.patch.object(taskq, '__file__', str(queue)), mock.patch.object(taskq, 'rollout', return_value='local'), \
+                mock.patch.object(taskq.shutil, 'which', return_value='codex.exe'), \
+                mock.patch.object(taskq, 'codex_options', return_value=options), \
+                mock.patch.object(taskq, 'native_command', side_effect=receiver):
+            prompt = self.run_cli('arm', 'tick', "PM's literal")
+        loop = prompt.split('No agent needed: `', 1)[1].split('` in a terminal', 1)[0]
+        for fail_at, expected in (('wait', ['wait']), ('send', ['wait', 'send']), ('ack', ['wait', 'send', 'ack']),
+                                  ('third-wait', ['wait', 'send', 'ack', 'wait', 'send', 'ack', 'wait'])):
+            with self.subTest(fail_at=fail_at):
+                calls.write_text('', 'utf-8')
+                queue.write_text('import sys\nfrom pathlib import Path\n'
+                                 'sys.stdout.reconfigure(encoding="utf-8")\n'
+                                 f'log=Path({str(calls)!r})\naction=sys.argv[1]\n'
+                                 'with log.open("a", encoding="utf-8") as out: out.write(action + "\\n")\n'
+                                 f'if action == {fail_at!r}: sys.exit(19)\n'
+                                 'if action == "wait":\n'
+                                 '    if log.read_text().splitlines().count("wait") > 2: sys.exit(19)\n'
+                                 f'    print("\\n".join({events!r}))\n'
+                                 'else:\n'
+                                 f'    assert sys.stdin.buffer.read().decode("utf-8").splitlines() == {events!r}\n', 'utf-8')
+                codex.write_text('import sys\nfrom pathlib import Path\n'
+                                 f'with Path({str(calls)!r}).open("a", encoding="utf-8") as out: out.write("send\\n")\n'
+                                 f'assert sys.argv[1:] == {expected_args!r}\n'
+                                 f'assert sys.stdin.buffer.read().decode("utf-8").splitlines() == {events!r}\n'
+                                 f'sys.exit({19 if fail_at == "send" else 0})\n', 'utf-8')
+                run = self.run_powershell(loop)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(run.stderr, '')
+                self.assertEqual(run.stdout.strip(), 'taskq sender stopped')
+                self.assertEqual(calls.read_text('utf-8').splitlines(), expected)
+
+    @unittest.skipUnless(os.name == 'nt', 'native PowerShell boundary')
+    def test_native_manager_preserves_compact_configuration_argv(self):
+        receiver, received = self.root / 'native receiver.py', self.root / 'argv.json'
+        receiver.write_text('import sys,json\nfrom pathlib import Path\n'
+                            f'Path({str(received)!r}).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")\n', 'utf-8')
+        launch = taskq.native_command
+        with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex'}), \
+                mock.patch.object(taskq.shutil, 'which', return_value='codex.exe'), \
+                mock.patch.object(taskq, 'native_command', side_effect=lambda args, capture=False:
+                                  launch(args, capture=True) if capture else launch([sys.executable, str(receiver), *args[1:]])):
+            prompt = self.run_cli('arm', 'tick')
+        command = re.search(r'Codex manager: start it with `([^`]+)`', prompt)[1]
+        run = self.run_powershell(command)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(received.read_text('utf-8')), taskq.shlex.split(taskq.CODEX_COMPACT))
+
+
 class FakeRuntime:
     """The runtime functions over a dict: session -> True running, False gone, 'idle' (a supervisor between turns), None."""
 

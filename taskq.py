@@ -1634,18 +1634,54 @@ def history(n):
                 notes.append(text)
     return 'History of this task (read it first; a requeue says what to fix):\n\n' + '\n\n'.join(notes) + '\n\n' if notes else ''
 
+def powershell(runtime):
+    """Only native Windows Codex uses this shell; Claude's Bash and POSIX hosts keep their route."""
+    return sys.platform == 'win32' and runtime == 'codex'
+
+def shell_quote(value, native=False):
+    return "'" + str(value).replace("'", "''") + "'" if native else shlex.quote(str(value))
+
+def queue_tool(runtime):
+    script = Path(__file__).resolve()
+    return native_command([sys.executable, str(script)], capture=True) if powershell(runtime) else f'python3 {script}'
+
+def native_command(arguments, capture=False):
+    """PS 5.1 reparses native argv. Pass a quote-free program to Python; it preserves argv and inherited stdio."""
+    encoded = json.dumps(arguments, ensure_ascii=True).encode('utf-8').hex()
+    extra = '+json.loads(base64.b64decode(sys.argv[1]))' if capture else ''
+    program = f"import base64,json,subprocess,sys;sys.exit(subprocess.call(json.loads(bytes.fromhex('{encoded}')){extra}))"
+    command = f'& {shell_quote(sys.executable, True)} -c {shell_quote(program, True)}'
+    if not capture:
+        return command
+    return ('& { $taskqArgs = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('
+            '(ConvertTo-Json -InputObject @($args | ForEach-Object { [string]$_ }) -Compress))); '
+            '[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
+            f'$input | {command} $taskqArgs; $global:LASTEXITCODE = $LASTEXITCODE }}')
+
+def shell_instructions(runtime, n=None):
+    if powershell(runtime):
+        prefix = f'$env:TASKQ_TASK={shell_quote(n, True)}; $env:TASKQ_RUNTIME={shell_quote(runtime, True)}; $ErrorActionPreference=\'Stop\';'
+        return ('Use exec_command with shell="powershell.exe", login=false and native Windows paths. '
+                'Do not invoke Bash, WSL or a shell bridge. '
+                + (f'Start every shell command with `{prefix}`.' if n is not None else 'Set $ErrorActionPreference=\'Stop\' in each command.'))
+    return f'Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.' if n is not None else ''
+
+def shell_steps(runtime, *commands):
+    """PowerShell 5.1 has no &&: native command failures must stop before the next step."""
+    return ('; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; ' if powershell(runtime) else ' && ').join(commands)
+
 def brief(item, runtime):
     """The worker's prompt: its name first (R3, #572: a runtime's fallback title), the task, its workspace, the taskq commands it uses."""
-    n, root, tq = item['iid'], CONFIG['root'], f'python3 {Path(__file__).resolve()}'
+    n, root, tq = item['iid'], CONFIG['root'], queue_tool(runtime)
     create = f'glab mr create --yes --target-branch main --source-branch taskq-{n} --title "<title>" --description' if CONFIG['board'] == 'gitlab' \
         else f'gh pr create --base main --head taskq-{n} --title "<title>" --body'
     push = f'`git push --force-with-lease origin HEAD:refs/heads/taskq-{n}`, open a pull request once (a push updates it):\n  `{create} "<summary>"`, ' \
         f'then `{tq} result {n} --sha <PR head full SHA>' if CONFIG['publish'] == 'pr' else f'`git push --force-with-lease origin HEAD:refs/heads/taskq-{n}`, then\n  `{tq} result {n} --sha <candidate full SHA>'
     workspace = f'take your workspace from the project instructions (AGENTS.md) or the path the manager gave, on branch taskq-{n};\nthe host owns it: never remove it' \
-        if CONFIG.get('workspace') == 'external' else f'from {root} run `git fetch origin && git worktree add -b taskq-{n} .worktrees/taskq-{n} origin/main`, work only there,\nnever in the main checkout'
+        if CONFIG.get('workspace') == 'external' else f'from {root} run `{shell_steps(runtime, "git fetch origin", f"git worktree add -b taskq-{n} .worktrees/taskq-{n} origin/main")}`, work only there,\nnever in the main checkout'
     return f'''{worker_name(item)}
 You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
-Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
+Queue tool: `{tq}`. {shell_instructions(runtime, n)}
 {release_context()}
 Read `{Path(__file__).resolve().with_name("taskq.md")}` first and do only what it allows (R13): a task that conflicts with a recorded decision is an ask with options, not an edit.
 
@@ -1659,13 +1695,13 @@ needs no worktree. Commands:
   --option "<A>" --option "<B>" --recommend <K> [--link <url of a result, image or video>]`, then stop. A result that leaves the owner a choice
   takes the same --option/--recommend/--link; an option starting `close` accepts the result.
 - Cannot be done: `{tq} requeue {n} --text "<why>"`, then stop.
-- Deliver: commit on branch taskq-{n}, `git fetch origin && git rebase origin/main`, run the tests required by § 10 Testing policy, {push} --checks "<commands and outcome>" --text "<summary>"`, then stop.
+- Deliver: commit on branch taskq-{n}, `{shell_steps(runtime, "git fetch origin", "git rebase origin/main")}`, run the tests required by § 10 Testing policy, {push} --checks "<commands and outcome>" --text "<summary>"`, then stop.
   An answer with no commit: the result names the current origin/main SHA and the text holds the answer.
 Everything written through taskq is public: no secrets, tokens or paths outside the repository.'''
 
 def supervisor_brief(item, runtime, kind):
     """S<N>'s prompt (§ 7 Supervisor): its name first (R3), the task, its orders, review and close; never the task's code."""
-    n, tq, lab = item['iid'], f'python3 {Path(__file__).resolve()}', CONFIG['board'] == 'gitlab'
+    n, tq, lab = item['iid'], queue_tool(runtime), CONFIG['board'] == 'gitlab'
     wait = f'run `{tq} wait --task {n}` in the background (run_in_background) and end your turn; its output wakes you' \
         if getattr(kind, 'SELF_WAKE', False) else 'end your turn; the queue wakes you with the event'
     ci = f'glab api "projects/:id/pipelines?sha=<sha>"' if lab else 'gh run list --commit <sha>'
@@ -1674,7 +1710,7 @@ def supervisor_brief(item, runtime, kind):
     return f'''{worker_name(item, 'S')}
 You are the taskq supervisor S{n} of task #{n}: {item["title"]}. You are its only controller: you order its worker, follow it,
 review its result and close or rework it. You never edit the task's code, never start a session yourself, never decide for the owner.
-Queue tool: `{tq}`. Start every shell command with `export TASKQ_TASK={n} TASKQ_RUNTIME={runtime} &&`.
+Queue tool: `{tq}`. {shell_instructions(runtime, n)}
 {release_context()}
 Read `{Path(__file__).resolve().with_name("taskq.md")}` (§ 7 Supervisor, § 6) first and do only what it allows (R13).
 
@@ -2668,6 +2704,8 @@ def cmd_pm(args):
     """The manager role: Principles and § 7 of taskq.md, then how to tick this session; the hash goes to .taskq/pm.json,
     nothing else: a task's manager is its own `pm` on the board (R3, #532). `--adopt N`: become the `pm` of tasks with none."""
     me = session() or {}
+    runtime = me.get('runtime') or os.environ.get('TASKQ_RUNTIME')
+    tq = queue_tool(runtime)
     with coordination() if args.adopt else contextlib.nullcontext():
         snapshot = [item for item in map(parse, BOARD.list(None)) if item]
         if args.adopt:
@@ -2681,12 +2719,14 @@ def cmd_pm(args):
     (CONFIG['root'] / '.taskq').mkdir(exist_ok=True)
     (CONFIG['root'] / '.taskq' / 'pm.json').write_text(json.dumps({'contract': digest}), 'utf-8')
     print(f'taskq pm contract {digest}\nYou are the taskq manager of {CONFIG["root"]}. Follow this role from now on; '
-          f'`taskq` is `python3 {Path(__file__).resolve()}`.\n\n' + '\n'.join(sections))
+          f'`taskq` is `{tq}`.' + (f' {shell_instructions(runtime)}' if powershell(runtime) else '') + '\n\n' + '\n'.join(sections))
     for item in sorted(snapshot, key=lambda item: (item['priority'], item['iid'])):
         if not item['pm'] and item['iid'] not in args.adopt:
             print(f'Unassigned manager: #{item["iid"]} {item["title"]} ({item["state"]}). '
                   f'Triage explicitly; to adopt in project {CONFIG["root"].name}: '
-                  f'`cd {shlex.quote(str(CONFIG["root"]))} && taskq pm --adopt {item["iid"]}`. No ownership or claims changed.')
+                  f'`' + (f'Set-Location -LiteralPath {shell_quote(CONFIG["root"], True)} -ErrorAction Stop; {tq} pm --adopt {item["iid"]}'
+                          if powershell(runtime) else f'cd {shlex.quote(str(CONFIG["root"]))} && taskq pm --adopt {item["iid"]}')
+                  + '`. No ownership or claims changed.')
     cmd_arm(argparse.Namespace(target=None))
 
 CODEX_COMPACT = ('-c model_auto_compact_token_limit=200000 -c "compact_prompt=\\"Keep only the owner\'s open questions and '
@@ -2702,11 +2742,15 @@ def rollout(thread):
 def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
     runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
-    wait = f'python3 {Path(__file__).resolve()} wait'
+    native = powershell(runtime)
+    tq = queue_tool(runtime)
+    wait = f'{tq} wait'
     action = ('Explicit owner arm: execute the proven route, not just this prompt. Reuse the existing monitor and targeted wait; '
              'repeated arm must not create duplicates. Keep paused projects paused. Prove an idle-manager wake and the next wait; '
              'printed output is not proof. No supported access to the existing sender: report one blocker through the existing task, '
               'never create a replacement sender or bridge. See § 7 Arm the tick.\n')
+    if native:
+        action += shell_instructions(runtime) + f' `taskq` means `{tq}`.\n'
     if runtime == 'hermes':
         return print(action + 'Hermes manager wake/event delivery requires the configured native external bridge. '
                      'No background wake, restart durability or unattended event delivery is verified; '
@@ -2716,12 +2760,13 @@ def cmd_arm(args):
              'no sender, timer or extension. Arming below only brings you the short outcomes.\n')
     if not args.target and runtime == 'codex':  # #510: a Codex session is not woken when a background command ends
         thread = os.environ.get('CODEX_THREAD_ID') or '<this thread>'
+        manager = native_command([shutil.which('codex') or 'codex', *shlex.split(CODEX_COMPACT)]) if native else f'codex {CODEX_COMPACT}'
         return print(f'''{start}Arm the tick in this session. Codex is not woken when a background command ends, so tick in the foreground:
 loop {{ run `{wait}`; on its output (`ask #N`, `closed #N <verdict>`, `review #N`, `gone #N` or `tick`) run one pass (`taskq tick`) and do
 § 7 After each pass for those tasks; acknowledge handled [event N:ID] with `taskq ack N:ID` }}. Between turns the outcomes wait on the board for your next pass; the queue does not.
-Optional, only to be woken between turns: `python3 {Path(__file__).resolve()} arm tick {thread}` prints a sender prompt for a
+Optional, only to be woken between turns: `{tq} arm tick {shell_quote(thread, native) if native else thread}` prints a sender prompt for a
 thread with a local rollout only; no wake of a Codex app thread is promised (#522).
-Codex manager: start it with `codex {CODEX_COMPACT}`.''')
+Codex manager: start it with `{manager}`.''')
     if not args.target:  # no target: this session ticks itself (Claude: a background command wakes the session on exit)
         return print(f'''{start}Arm the tick in this session. Run `{wait}` as a background command (Claude Code: run_in_background).
 When it ends you are woken with its output (`ask #N`, `closed #N <verdict>`, `review #N`, `gone #N` or `tick`): run one pass (`taskq tick`),
@@ -2729,14 +2774,26 @@ do § 7 After each pass for those tasks, acknowledge handled [event N:ID] with `
 Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.json autoCompactWindow 200000).''')
     pm = re.split(r'session_|threads/|/', args.target)[-1]  # #532: the sender consumes as its manager, the id the board records
     resume = f'codex exec {shlex.join(codex_options())} resume {shlex.quote(pm)}'  # the options a worker turn gets
-    wait = f'{wait} --pm {shlex.quote(pm)}'
+    if native:
+        resume = native_command([shutil.which('codex') or 'codex', 'exec', *codex_options(), 'resume', pm, '-'])
+    wait = f'{wait} --pm {shell_quote(pm, native)}'
     send, shell, note = f'with {SENDERS.get(runtime, "your messaging tool")}', '', ''
     where = rollout(pm) if runtime == 'codex' else None
     if where == 'local':  # a CLI thread: exec resume finds it
         send = f'by running `{resume} "<its output>"`: a new turn on that thread wakes it'
-        ack = f'python3 {Path(__file__).resolve()} ack --stdin --pm {shlex.quote(pm)}'
+        if native:
+            send = ('by setting `[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)` '
+                    f'and piping its output to `{resume}` as stdin: a new turn on that thread wakes it')
+        ack = f'{tq} ack --stdin --pm {shell_quote(pm, native)}'
         shell = (f'\nNo agent needed: `cd {CONFIG["root"]} && while e=$({wait}) && {resume} "$e" && printf "%s\\n" "$e" | {ack}; do :; done; '
                  'echo "taskq sender stopped"` in a terminal.')
+        if native:
+            shell = (f'\nNo agent needed: `$ErrorActionPreference=\'Stop\'; Set-Location -LiteralPath {shell_quote(CONFIG["root"], True)} -ErrorAction Stop; '
+                     '[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
+                     f'while ($true) {{ $e = {wait}; if ($LASTEXITCODE -ne 0) {{ break }}; '
+                     f'$e | {resume}; if ($LASTEXITCODE -ne 0) {{ break }}; '
+                     f'$e | {ack}; if ($LASTEXITCODE -ne 0) {{ break }} }}; '
+                     'Write-Output "taskq sender stopped"` in a terminal.')
     elif where == 'archived':  # #522: exec resume of an archived thread is unverified (R12): no route
         return print(f'taskq: {pm} is archived in Codex; `exec resume` of an archived thread is unverified, so no sender.\n'
                      f'Run `codex unarchive {pm}`, then `taskq arm tick {pm}` again.')
@@ -2754,7 +2811,7 @@ Codex manager: start it with `codex {CODEX_COMPACT}` (Claude: .claude/settings.j
 Stay in this one turn and repeat, from {CONFIG["root"]}; do not end the turn between events (an ended turn forwards nothing):
 1. Run `{wait}`. It blocks until the manager is needed (at most 10 minutes) and prints one line per event.
 2. Send its output, verbatim, to {pm} {send}.
-3. Only after successful delivery run `python3 {Path(__file__).resolve()} ack <N:ID ...> --pm {shlex.quote(pm)}` for every [event N:ID] from that output.
+3. Only after successful delivery run `{tq} ack <N:ID ...> --pm {shell_quote(pm, native)}` for every [event N:ID] from that output.
    A tick has no event to acknowledge. A failed ack stops with one blocker; never assume a lost response was a delivery failure.
 4. Go back to 1 at once. A failed wait, a failed send or no such send tool: stop, say here
    `taskq sender stopped: <error>` once; never retry, never another route.{shell}''')

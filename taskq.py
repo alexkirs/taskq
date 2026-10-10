@@ -5,107 +5,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-# --- #641 research kernel: no production admission or I/O -------------------------------
-
-def pilot_state():
-    """Two-task/two-worker bounded behavioral state, never board authority."""
-    return {'tasks': {str(n): {'owner': None, 'revision': 0, 'model': False,
-            'heavy': False, 'writer': False, 'accepted': False, 'events': [],
-            'receipts': [], 'acks': [], 'effects': 0} for n in (1, 2)},
-            'repair': None}
-
-
-def pilot_transition(state, command):
-    """Pure guarded transition; callers serialize fresh board reads/writes, not this model."""
-    saved = json.loads(json.dumps(state))
-    n, worker, action = command['task'], command['worker'], command['action']
-    if type(n) is not int or n not in (1, 2) or worker not in ('A', 'B'):
-        raise ValueError('pilot requires two tasks/two workers')
-    task = saved['tasks'][str(n)]
-    if command.get('revision') != task['revision']:
-        raise ValueError('stale transition')
-    if action == 'claim':
-        if saved['repair'] is not None or task['owner'] not in (None, worker):
-            raise ValueError('claim held or repair pending')
-        if task['owner'] == worker:
-            return saved
-        if any(t['owner'] == worker for t in saved['tasks'].values()):
-            raise ValueError('one task per worker')
-        task['owner'] = worker
-    elif action in ('repair-start', 'repair-checkpoint', 'repair-finish'):
-        if any(t['model'] or t['writer'] or t['heavy'] for t in saved['tasks'].values()):
-            raise ValueError('repair requires qualified absence of effects')
-        if action == 'repair-start':
-            if saved['repair'] is None:
-                saved['repair'] = []
-            return saved
-        if saved['repair'] is None:
-            raise ValueError('repair not started')
-        if action == 'repair-checkpoint':
-            if n not in saved['repair']:
-                saved['repair'].append(n)
-            return saved
-        if set(saved['repair']) != {1, 2}:
-            raise ValueError('repair incomplete')
-        saved['repair'] = None
-        return saved
-    else:
-        if task['owner'] != worker or saved['repair'] is not None:
-            raise ValueError('wrong owner or repair pending')
-        if action == 'resume':
-            if task['accepted'] or task['model'] or task['writer'] or task['heavy']:
-                raise ValueError('accepted or unresolved execution')
-            if sum(t['model'] for t in saved['tasks'].values()) >= 1:
-                raise ValueError('finite model capacity')
-            task['model'] = True
-        elif action == 'heavy':
-            if not task['model'] or task['heavy'] or any(t['heavy'] for t in saved['tasks'].values()):
-                raise ValueError('finite heavy capacity or no active turn')
-            task['heavy'] = task['writer'] = True
-        elif action == 'terminal':
-            if command.get('terminal') is not True or command.get('cli_dead') is not True:
-                raise ValueError('unknown terminal/birth death retains model grant')
-            task['model'] = False  # model completion never settles detached writers/heavy work
-        elif action == 'drain':
-            if command.get('writer_drained') is not True:
-                raise ValueError('unknown writer retains heavy grant')
-            task['writer'] = task['heavy'] = False
-        elif action == 'answer':
-            event = command.get('event')
-            if type(event) is not int or event <= 0 or task['accepted']:
-                raise ValueError('invalid answer')
-            if event in task['events']:
-                return saved
-            if event != len(task['events']) + 1:
-                raise ValueError('out-of-order event')
-            task['events'].append(event)
-        elif action in ('apply', 'ack'):
-            event = command.get('event')
-            if type(event) is not int or event not in task['events']:
-                raise ValueError('unknown event')
-            if action == 'apply':
-                if event in task['receipts']:
-                    return saved  # lost ACK retries receipt, never the effect
-                if event != len(task['receipts']) + 1 or not task['model']:
-                    raise ValueError('out-of-order application or no active turn')
-                task['effects'] += 1
-                task['receipts'].append(event)
-            else:
-                if event not in task['receipts']:
-                    raise ValueError('delivery is not application')
-                if event in task['acks']:
-                    return saved
-                task['acks'].append(event)
-        elif action == 'accept':
-            if task['model'] or task['writer'] or task['heavy'] or set(task['acks']) != set(task['events']):
-                raise ValueError('acceptance requires settled grants and application ACK')
-            task['accepted'] = True
-        else:
-            raise ValueError('unsupported pilot action')
-    task['revision'] += 1
-    return saved
-
-
 # --- config + task model --------------------------------------------------------------------
 
 STATES = ('ready', 'waiting', 'doing', 'review', 'ask', 'later')
@@ -3764,26 +3663,104 @@ def lifecycle_prepare(n, refuse=fail, manager=False):
     return issue,item,project,host,runtime,fingerprint,artifact_for
 
 
+def lifecycle_transition(raw, transition, facts):
+    """Pure lifecycle reducer shared by runtime and isolated replay; facts are adapter observations."""
+    raw=json.loads(json.dumps(raw))
+    execution=raw['execution'];identity=raw['claim'];life=raw.get('lifecycle')
+    action=facts.get('action',transition)
+    if raw.get('result') is not None and (action in ('admit','resume','answer') or
+            action == 'reconcile' and (not life or life['phase'] not in ('draining','parked-releasing','parked'))):
+        raise ValueError('accepted native result requires separately qualified rework; no new execution or answer')
+    if transition=='guard':
+        return raw
+    elif transition=='answer':
+        text=facts['text']
+        if not life or life['phase'] not in ('draining','parked-releasing','parked') or text is None:
+            raise ValueError('bounded parked answer requires text and an existing park intent')
+        if len(raw.get('events',[]))>=EVENT_LIMIT:
+            raise ValueError('event history full; qualified compaction required')
+        event_id=raw.get('event_seq',0)+1
+        raw['events'].append({'id':event_id,'action':'answer','text':text,'by':facts['actor'],
+                              'recipients':[recipient('worker',identity)],'acks':[]})
+        raw['event_seq']=event_id;execution['event']=event_id
+    elif transition=='admission':
+        action=facts['action'];fingerprint=facts['fingerprint']
+        if action not in ('admit','resume','reconcile'):
+            raise ValueError('unsupported lifecycle action')
+        if life and life['phase'] in ('draining','parked-releasing'):
+            raise ValueError('drain/release unfinished; reconcile park before resume')
+        if life and life['phase']=='parked' and action!='resume':
+            raise ValueError('parked task requires explicit resume')
+        if not life or life['phase']=='parked':
+            if life and not facts['predecessor_settled']:
+                raise ValueError('predecessor drain changed; resume refused')
+            generation=life['generation']+1 if life else 1
+            age=life['age'] if life else raw.get('admission_age')
+            if type(age) not in (int,float):
+                raise ValueError('original admission age required')
+            key=hashlib.sha256(json.dumps([fingerprint,generation],sort_keys=True).encode()).hexdigest()
+            life={'identity':fingerprint,'generation':generation,'age':age,'phase':'reserving','key':key,
+                  'demand':execution['demand'],'event':execution['event'],'artifact':facts['artifact']}
+            raw['lifecycle']=life
+        if life['event']!=execution['event'] or life['artifact']!=facts['artifact'] or life['demand']!=execution['demand']:
+            raise ValueError('active execution changed; park/reconcile before continuation')
+    elif transition=='application':
+        application=facts['application']
+        event=next((e for e in raw['events'] if e['id']==life['event']),None)
+        if application.get('status')=='ok' and event and recipient('worker',identity) in event['recipients'] \
+                and application.get('artifact')==life['artifact'] and application.get('event')==life['event'] \
+                and application.get('session')==identity['session'] and facts['file_ok'] \
+                and application.get('sha256')==facts['file_sha256']==hashlib.sha256(event['text'].encode()).hexdigest():
+            target=recipient('worker',identity)
+            if target not in event['acks']:
+                event['acks'].append(target)
+            raw.setdefault('applications',{})[life['key']]={'event':life['event'],'identity':identity,'proof':application}
+    elif transition=='accept':
+        criteria=raw.get('acceptance_criteria') or {}
+        event=next((e for e in raw['events'] if e['id']==execution['event']),None)
+        if criteria.get('kind')!='answer-artifact' or criteria.get('event')!=execution['event'] or criteria.get('artifact')!=facts['artifact'] \
+                or not event or criteria.get('sha256')!=hashlib.sha256(event['text'].encode()).hexdigest():
+            raise ValueError('task-specific acceptance criteria unavailable or changed; action/exit0 is not task success')
+        value=facts['host']
+        application=((value or {}).get('drain') or {}).get('application') or {}
+        if not facts['drain_verified'] or application.get('status')!='ok' or application.get('session')!=identity['session'] or application.get('event')!=execution['event'] \
+                or application.get('sha256')!=criteria['sha256'] or not facts['file_ok'] \
+                or facts['file_sha256']!=criteria['sha256']:
+            raise ValueError('exact independently verifiable application receipt/artifact missing')
+        if not life or life['phase'] != 'parked' or value['phase'] != 'released' \
+                or facts['project'] is not None and facts['project']['phase'] != 'released' \
+                or recipient('worker',identity) not in event['acks'] \
+                or (raw.get('applications',{}).get(life['key']) or {}).get('proof') != application:
+            raise ValueError('application ack or predecessor grants are not settled on the task board')
+        receipt={'kind':'answer-artifact','key':life['key'],'criteria':criteria,'authority':facts['actor'],'application':application}
+        receipts=raw.setdefault('acceptance_receipts',{})
+        if receipts.get(life['key']) and receipts[life['key']]!=receipt:
+            raise ValueError('conflicting task acceptance receipt')
+        if not receipts.get(life['key']):
+            receipts[life['key']]=receipt
+    else:
+        raise ValueError('unsupported lifecycle transition')
+    return raw
+
+
 def lifecycle(n, action, text=None):
     issue,item,project,host,runtime,fingerprint,artifact_for=lifecycle_prepare(n)
     raw=item['raw'];execution=raw['execution'];identity=item['claim'];life=raw.get('lifecycle')
-    if raw.get('result') is not None and (action in ('admit','resume','answer') or
-            action == 'reconcile' and (not life or life['phase'] not in ('draining','parked-releasing','parked'))):
-        fail('accepted native result requires separately qualified rework; no new execution or answer')
+    def transition(stage, **facts):
+        nonlocal raw, execution, life
+        try:
+            raw=lifecycle_transition(raw,stage,facts)
+        except ValueError as error:
+            fail(str(error))
+        execution=raw['execution'];life=raw.get('lifecycle')
+    transition('guard',action=action)
     def request_for(lifecycle):
         return {**fingerprint,'generation':lifecycle['generation'],'age':lifecycle['age'],
                 'priority':item['priority'],'demand':lifecycle['demand']}
     if action=='answer':
-        if not life or life['phase'] not in ('draining','parked-releasing','parked') or text is None:
-            fail('bounded parked answer requires text and an existing park intent')
-        if len(raw.get('events',[]))>=EVENT_LIMIT:
-            fail('event history full; qualified compaction required')
-        event_id=raw.get('event_seq',0)+1
-        raw['events'].append({'id':event_id,'action':'answer','text':text,'by':origin(),
-                              'recipients':[recipient('worker',identity)],'acks':[]})
-        raw['event_seq']=event_id;execution['event']=event_id
+        transition('answer',text=text,actor=origin())
         lifecycle_write(issue,raw)
-        return {'phase':life['phase'],'answer_event':event_id,'task_accepted':False}
+        return {'phase':life['phase'],'answer_event':raw['event_seq'],'task_accepted':False}
     if action in ('park','reconcile') and life and life['phase'] in ('draining','parked-releasing','parked','active','starting','reserving','waiting'):
         if action=='reconcile' and life['phase'] in ('active','starting','reserving','waiting'):
             pass  # readback/re-entry uses admission below; never blindly repeat a spawn
@@ -3801,17 +3778,10 @@ def lifecycle(n, action, text=None):
             if project.observe(life['key']) is not None:
                 effect(project.release,life['key'])
             life['phase']='parked'
-            application=drained['drain'].get('application') or {}
-            event=next((e for e in raw['events'] if e['id']==life['event']),None)
             path=Path(CONFIG['root'])/life['artifact']
-            if application.get('status')=='ok' and event and recipient('worker',identity) in event['recipients'] \
-                    and application.get('artifact')==life['artifact'] and application.get('event')==life['event'] \
-                    and application.get('session')==identity['session'] and path.is_file() and not path.is_symlink() \
-                    and application.get('sha256')==hashlib.sha256(path.read_bytes()).hexdigest()==hashlib.sha256(event['text'].encode()).hexdigest():
-                target=recipient('worker',identity)
-                if target not in event['acks']:
-                    event['acks'].append(target)
-                raw.setdefault('applications',{})[life['key']]={'event':life['event'],'identity':identity,'proof':application}
+            file_ok=path.is_file() and not path.is_symlink()
+            transition('application',application=drained['drain'].get('application') or {},
+                       file_ok=file_ok,file_sha256=hashlib.sha256(path.read_bytes()).hexdigest() if file_ok else None)
             lifecycle_write(issue,raw,'later')
             return {'phase':'parked','generation':life['generation'],'task_accepted':False}
     if action=='park':
@@ -3820,48 +3790,23 @@ def lifecycle(n, action, text=None):
         if not life or life['phase']!='parked':
             fail('result acceptance requires an already settled park; no automatic drain')
         native_ack(n,life['event'])
-        criteria=raw.get('acceptance_criteria') or {}
-        event=next((e for e in raw['events'] if e['id']==execution['event']),None)
-        if criteria.get('kind')!='answer-artifact' or criteria.get('event')!=execution['event'] or criteria.get('artifact')!=artifact_for(execution['event']) \
-                or not event or criteria.get('sha256')!=hashlib.sha256(event['text'].encode()).hexdigest():
-            fail('task-specific acceptance criteria unavailable or changed; action/exit0 is not task success')
-        path=Path(CONFIG['root'])/artifact_for(execution['event']);value=host.observe(life['key']) if life else None
-        application=((value or {}).get('drain') or {}).get('application') or {}
-        if not host.drain_verified(value) or application.get('status')!='ok' or application.get('session')!=identity['session'] or application.get('event')!=execution['event'] \
-                or application.get('sha256')!=criteria['sha256'] or not path.is_file() or path.is_symlink() \
-                or hashlib.sha256(path.read_bytes()).hexdigest()!=criteria['sha256']:
-            fail('exact independently verifiable application receipt/artifact missing')
-        if not life or life['phase'] != 'parked' or value['phase'] != 'released' \
-                or project.observe(life['key']) is not None and project.observe(life['key'])['phase'] != 'released' \
-                or recipient('worker',identity) not in event['acks'] \
-                or (raw.get('applications',{}).get(life['key']) or {}).get('proof') != application:
-            fail('application ack or predecessor grants are not settled on the task board')
-        receipt={'kind':'answer-artifact','key':life['key'],'criteria':criteria,'authority':origin(),'application':application}
-        receipts=raw.setdefault('acceptance_receipts',{})
-        if receipts.get(life['key']) and receipts[life['key']]!=receipt:
-            fail('conflicting task acceptance receipt')
-        if not receipts.get(life['key']):
-            receipts[life['key']]=receipt;lifecycle_write(issue,raw)
+        path=Path(CONFIG['root'])/artifact_for(execution['event']);value=host.observe(life['key'])
+        file_ok=path.is_file() and not path.is_symlink()
+        before=raw
+        transition('accept',artifact=artifact_for(execution['event']),host=value,
+                   project=project.observe(life['key']),drain_verified=host.drain_verified(value),
+                   file_ok=file_ok,file_sha256=hashlib.sha256(path.read_bytes()).hexdigest() if file_ok else None,
+                   actor=origin())
+        if raw!=before:
+            lifecycle_write(issue,raw)
         return {'phase':life['phase'],'task_accepted':True,'criterion':'answer-artifact'}
-    if action not in ('admit','resume','reconcile'):
-        fail('unsupported lifecycle action')
-    if life and life['phase'] in ('draining','parked-releasing'):
-        fail('drain/release unfinished; reconcile park before resume')
-    if life and life['phase']=='parked' and action!='resume':
-        fail('parked task requires explicit resume')
-    if not life or life['phase']=='parked':
-        if life and (not host.drain_verified(host.observe(life['key'])) or project.observe(life['key']) is not None and project.observe(life['key'])['phase']!='released'):
-            fail('predecessor drain changed; resume refused')
-        generation=life['generation']+1 if life else 1
-        age=life['age'] if life else raw.get('admission_age')
-        if type(age) not in (int,float):
-            fail('original admission age required')
-        key=hashlib.sha256(json.dumps([fingerprint,generation],sort_keys=True).encode()).hexdigest()
-        life={'identity':fingerprint,'generation':generation,'age':age,'phase':'reserving','key':key,
-              'demand':execution['demand'],'event':execution['event'],'artifact':artifact_for(execution['event'])}
-        raw['lifecycle']=life;lifecycle_write(issue,raw)
-    if life['event']!=execution['event'] or life['artifact']!=artifact_for(execution['event']) or life['demand']!=execution['demand']:
-        fail('active execution changed; park/reconcile before continuation')
+    before=raw
+    settled=not life or life['phase']!='parked' or (host.drain_verified(host.observe(life['key']))
+                and (project.observe(life['key']) is None or project.observe(life['key'])['phase']=='released'))
+    transition('admission',action=action,fingerprint=fingerprint,
+               artifact=artifact_for(execution['event']),predecessor_settled=settled)
+    if raw!=before:
+        lifecycle_write(issue,raw)
     request=request_for(life)
     selected=CONFIG['capacity']
     demand=life['demand']

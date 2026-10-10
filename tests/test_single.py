@@ -5922,121 +5922,212 @@ class TightAssignmentDesign(unittest.TestCase):
         self.assertNotIn('assignment_model', (ROOT / 'taskq.py').read_text())
 
 
-class StateKernel(unittest.TestCase):
-    """#641 deterministic abstract replays, not native/persistence qualification."""
+def kernel_fixture(n=1):
+    """Native schema2 component input; fixture only, not a behavioral model."""
+    actor = {'runtime': 'claude', 'session': SESSION, 'name': 'mac'}
+    identity = {'runtime': 'controlled-artifact', 'session': f'worker-{n}', 'name': 'mac'}
+    text = 'first answer\n'
+    import hashlib
+    raw = {'event_schema': 2, 'event_seq': 1, 'events': [
+        {'id': 1, 'action': 'answer', 'text': text, 'by': actor,
+         'recipients': [taskq.recipient('worker', identity)], 'acks': []}],
+        'claim': identity, 'supervisor': actor, 'pm': actor, 'admission_age': 123,
+        'history': [{'kind': 'original'}], 'scope': ['artifact-{event}.txt'],
+        'execution': {'kind': 'controlled-artifact', 'event': 1,
+                      'artifact': 'artifact-{event}.txt', 'demand': {'slots': 1, 'heavy': 1}},
+        'acceptance_criteria': {'kind': 'answer-artifact', 'event': 1, 'artifact': 'artifact-1.txt',
+                                'sha256': hashlib.sha256(text.encode()).hexdigest()}}
+    fingerprint = {'repo': 'fixture/project', 'project_domain': {'board': 'github', 'repo': 'fixture/project'},
+                   'task': n, 'identity': identity, 'authorities': {'supervisor': actor, 'pm': actor}}
+    return raw, fingerprint
+
+
+class StateKernel(Base):
+    """Actual runtime lifecycle + extracted reducers; all downstream effects isolated."""
 
     def setUp(self):
-        self.state = taskq.pilot_state()
-        self.trace = []
+        super().setUp()
+        taskq.CONFIG.update(repo='fixture/project', capacity={
+            'project_caps': {'slots': 1}, 'host_caps': {'slots': 2, 'heavy': 1}})
+        self.project = mock.Mock(scope='project', owner='fixture/project', caps={'slots': 1},
+                                 domain={'board': 'github', 'repo': 'fixture/project'})
+        self.host = mock.Mock()
+        self.runtime = mock.Mock()
+        self.project.observe.return_value = None
+        self.project.reserve.return_value = {'phase': 'reserved'}
+        self.host.reserve.return_value = {'phase': 'reserved'}
+        self.host.drain_verified.return_value = True
+        self.runtime.start.return_value = {'phase': 'bound', 'child': {'pid': 1, 'birth': 'fixture'}}
+        patch = mock.patch.object(taskq, 'capacity_context', return_value=(self.project, self.host, self.runtime))
+        patch.start(); self.addCleanup(patch.stop)
+        for n in (1, 2):
+            raw, _ = kernel_fixture(n)
+            self.board.issues[n] = {'iid': n, 'title': 'isolated lifecycle', 'state': 'open',
+                'labels': ['q-ready'], 'body': taskq.block('preserve prose', raw), 'comments': []}
 
-    def step(self, action, n=1, worker='A', **extra):
-        command = dict(task=n, worker=worker, action=action,
-                       revision=self.state['tasks'][str(n)]['revision'], **extra)
-        self.trace.append(command)
-        self.state = taskq.pilot_transition(self.state, command)
-        return command
+    def call(self, action, n=1, text=None):
+        return taskq.lifecycle(n, action, text)
 
-    def refuse(self, action, n=1, worker='A', **extra):
-        before = json.loads(json.dumps(self.state))
-        with self.assertRaises(ValueError):
-            self.step(action, n, worker, **extra)
-        self.assertEqual(self.state, before)
+    def park(self, n=1):
+        raw = self.task(n)['raw']; life = raw['lifecycle']
+        application = {'status': 'ok', 'session': raw['claim']['session'], 'event': life['event'],
+                       'artifact': life['artifact'], 'sha256': raw['acceptance_criteria']['sha256']}
+        (self.root / life['artifact']).write_text(raw['events'][0]['text'])
+        self.runtime.drain.return_value = {'drain': {'application': application}}
+        self.host.observe.return_value = {'phase': 'released', 'drain': {'application': application}}
+        self.assertEqual(self.call('park', n)['phase'], 'parked')
 
-    def test_accepted_result_resume_historical_boundary(self):
-        # Existing native regression: tests/test_lifecycle.py, accepted-result rework.
-        self.step('claim'); self.step('resume'); self.step('answer', event=1)
-        self.step('apply', event=1); self.step('ack', event=1)
-        self.step('terminal', terminal=True, cli_dead=True); self.step('accept')
-        self.refuse('resume'); self.refuse('answer', event=2)
-        self.assertTrue(self.state['tasks']['1']['accepted'])
-        self.assert_replay()
+    def test_actual_runtime_accepted_result_resume_refusal_reaches_assertions(self):
+        with mock.patch.object(taskq, 'lifecycle_transition', wraps=taskq.lifecycle_transition) as kernel:
+            self.assertEqual(self.call('admit')['phase'], 'active')
+            self.park()
+            self.assertTrue(self.call('accept')['task_accepted'])
+            item = self.task(1)
+            args = type('Args', (), {'command': 'result', 'n': 1, 'text': 'bounded accepted artifact',
+                                     'sha': None, 'checks': None})()
+            # The actual result adapter, not a manually invented accepted flag.
+            with contextlib.redirect_stdout(io.StringIO()):
+                taskq.queue_move(args, item)
+            self.assertIsNotNone(self.task(1)['raw']['result'])
+            before = json.dumps(self.board.issues, sort_keys=True)
+            self.runtime.start.reset_mock()
+            for action in ('admit', 'resume', 'answer'):
+                with self.subTest(action=action), self.assertRaisesRegex(SystemExit, 'rework'):
+                    self.call(action, text='new answer' if action == 'answer' else None)
+            self.runtime.start.assert_not_called()
+            self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+            self.assertIn('accept', [call.args[1] for call in kernel.call_args_list])
+            self.assertGreaterEqual(sum(call.args[1] == 'guard' for call in kernel.call_args_list), 3)
 
-    def test_dead_cli_live_writer_and_separate_capacities(self):
-        self.step('claim'); self.step('resume'); self.step('heavy')
-        self.refuse('terminal', terminal=False, cli_dead=True)
-        self.step('claim', 2, 'B'); self.refuse('resume', 2, 'B')
-        self.step('terminal', terminal=True, cli_dead=True)
-        self.assertTrue(self.state['tasks']['1']['writer'])
-        self.assertTrue(self.state['tasks']['1']['heavy'])
-        self.refuse('resume'); self.refuse('accept'); self.refuse('repair-start')
-        self.step('resume', 2, 'B'); self.refuse('heavy', 2, 'B')
-        self.refuse('drain', writer_drained=False)
-        self.step('drain', writer_drained=True); self.step('heavy', 2, 'B')
-        self.assert_replay()
+    def test_actual_runtime_foreign_authority_and_unfinished_drain_refuse(self):
+        self.call('admit')
+        self.runtime.drain.return_value = None
+        self.assertEqual(self.call('park')['phase'], 'draining')
+        before = json.dumps(self.board.issues, sort_keys=True)
+        self.runtime.start.reset_mock()
+        with self.assertRaisesRegex(SystemExit, 'unfinished'):
+            self.call('resume')
+        with mock.patch.object(taskq, 'origin', return_value={'runtime': 'claude', 'session': 'foreign', 'name': 'mac'}):
+            with self.assertRaisesRegex(SystemExit, 'authority'):
+                self.call('resume')
+        self.assertEqual(before, json.dumps(self.board.issues, sort_keys=True)); self.runtime.start.assert_not_called()
 
-    def test_lost_ack_retries_receipt_not_effect(self):
-        # Lost-response-after-commit shape also exercised by test_native_action.py.
-        self.step('claim'); self.step('resume'); self.refuse('answer', event=2)
-        self.step('answer', event=1)
-        self.refuse('ack', event=1); self.refuse('apply', event=2)
-        self.step('apply', event=1)
-        revision = self.state['tasks']['1']['revision']
-        self.step('apply', event=1); self.step('answer', event=1)
-        self.assertEqual(self.state['tasks']['1']['revision'], revision)
-        self.step('ack', event=1); self.step('ack', event=1)
-        self.assertEqual(self.state['tasks']['1']['effects'], 1)
-        self.assertEqual(self.state['tasks']['1']['acks'], [1])
-        self.assert_replay()
+    def test_actual_runtime_kernel_answers_and_idempotent_application(self):
+        self.call('admit'); self.park()
+        raw = self.task(1)['raw']; life = raw['lifecycle']
+        proof = raw['applications'][life['key']]['proof']
+        facts = dict(application=proof, file_ok=True, file_sha256=proof['sha256'])
+        repeated = taskq.lifecycle_transition(raw, 'application', facts)
+        self.assertEqual(repeated, raw)
+        for changed in (dict(proof, session='foreign'), dict(proof, event=2), dict(proof, sha256='bad')):
+            missing = json.loads(json.dumps(raw)); missing['events'][0]['acks'] = []; missing.pop('applications')
+            result = taskq.lifecycle_transition(missing, 'application', dict(facts, application=changed))
+            self.assertEqual(result, missing)
+        self.call('answer', text='second answer')
+        self.assertEqual(self.task(1)['raw']['events'][-1]['acks'], [])
+        self.assertEqual(self.task(1)['raw']['claim'], raw['claim'])
+        self.assertEqual(self.call('resume')['generation'], 2)
 
-    def test_concurrent_claims_both_serializations_stale_and_foreign_resume(self):
+    def test_capacity_same_reducer_both_claim_orders_conflicts_and_heavy_separation(self):
         for first, second in (('A', 'B'), ('B', 'A')):
-            self.state = taskq.pilot_state(); self.trace = []
-            self.step('claim', worker=first)
-            before = json.loads(json.dumps(self.state))
-            with self.assertRaisesRegex(ValueError, 'stale'):
-                taskq.pilot_transition(self.state, dict(task=1, worker=second, action='claim', revision=0))
-            self.refuse('claim', worker=second); self.refuse('resume', worker=second)
-            self.refuse('claim', 2, first)
-            self.assertEqual(self.state, before)
-            self.assert_replay()
+            leases = {}
+            caps = {'model:codex': 1, 'heavy': 1}
+            request = {'age': 1, 'priority': 0, 'demand': {'model:codex': 1}}
+            self.assertEqual(taskq.capacity_reserve(leases, caps, first, request)['phase'], 'reserved')
+            self.assertEqual(taskq.capacity_reserve(leases, caps, second, request)['phase'], 'waiting')
+            before = json.loads(json.dumps(leases))
+            self.assertEqual(taskq.capacity_reserve(leases, caps, first, request), before[first])
+            with self.assertRaisesRegex(ValueError, 'identity reused'):
+                taskq.capacity_reserve(leases, caps, first, dict(request, age=2))
+            self.assertEqual(leases, before)
+            self.assertEqual(taskq.capacity_reserve(leases, caps, 'heavy', dict(request, demand={'heavy': 1}))['phase'], 'reserved')
 
-    def test_partial_repair_resume_preserves_ownership_receipts(self):
-        # Historical repair partial-write regression remains in Model/repair suite.
-        self.step('claim'); self.step('answer', event=1)
-        original = json.loads(json.dumps(self.state['tasks']))
-        self.step('repair-start'); self.step('repair-checkpoint')
-        self.state = json.loads(json.dumps(self.state))  # simulated restart, not durable-write proof
-        self.step('repair-start'); self.step('repair-checkpoint')
-        self.refuse('repair-finish'); self.refuse('resume')
-        self.step('repair-checkpoint', 2, 'B'); self.step('repair-finish')
-        self.assertEqual(self.state['tasks'], original)
-        self.assertIsNone(self.state['repair']); self.assert_replay()
-
-    def assert_replay(self):
+    def test_pure_replay_actual_guard_and_admission(self):
         from experiments.state_replay import replay
-        self.assertEqual(replay(self.trace)['state'], self.state)
-        self.assertEqual(replay(self.trace), replay(json.loads(json.dumps(self.trace))))
+        raw, fingerprint = kernel_fixture()
+        commands = [dict(transition='admission', facts=dict(action='admit', fingerprint=fingerprint,
+                    artifact='artifact-1.txt', predecessor_settled=False)),
+                    dict(transition='admission', facts=dict(action='resume', fingerprint=fingerprint,
+                    artifact='artifact-1.txt', predecessor_settled=False))]
+        result = replay(raw, commands)
+        self.assertEqual(result['raw']['lifecycle']['generation'], 1)
+        self.assertEqual(result, replay(json.loads(json.dumps(raw)), json.loads(json.dumps(commands))))
+        self.assertNotIn('lifecycle', raw)
+        accepted = dict(result['raw'], result={'kind': 'answer-artifact'})
+        refused = replay(accepted, [dict(transition='guard', facts={'action': 'resume'})])
+        self.assertEqual(refused['raw'], accepted); self.assertIn('rework', refused['outcomes'][0])
 
-    def test_injected_faults_are_detected_by_same_deterministic_replays(self):
-        source = (ROOT / 'taskq.py').read_text()
-        start = source.index('def pilot_state():')
-        end = source.index('# --- config + task model', start)
-        kernel = source[start:end]
+    def test_injected_faults_detected_in_actual_shared_kernel(self):
+        import inspect
+        source = inspect.getsource(taskq.lifecycle_transition)
         faults = (
-            ('accepted resume', "task['accepted'] or task['model']", "task['model']",
-             self.test_accepted_result_resume_historical_boundary),
-            ('dead CLI releases heavy', "task['model'] = False  #", "task['heavy'] = task['writer'] = False; task['model'] = False  #",
-             self.test_dead_cli_live_writer_and_separate_capacities),
-            ('duplicate repeats effect', "return saved  # lost ACK", "task['effects'] += 1; return saved  # lost ACK",
-             self.test_lost_ack_retries_receipt_not_effect),
-            ('delivery ACK', "if event not in task['receipts']:", "if False:",
-             self.test_lost_ack_retries_receipt_not_effect),
-            ('no model ceiling', "if sum(t['model'] for t in saved['tasks'].values()) >= 1:", "if False:",
-             self.test_dead_cli_live_writer_and_separate_capacities),
-            ('foreign resume', "if task['owner'] != worker or saved['repair'] is not None:", "if saved['repair'] is not None:",
-             self.test_concurrent_claims_both_serializations_stale_and_foreign_resume),
-            ('lost repair checkpoint', "saved['repair'] = []", "saved['repair'] = [1, 2]",
-             self.test_partial_repair_resume_preserves_ownership_receipts),
+            ('accepted resume', "if raw.get('result') is not None", 'if False',
+             self.test_actual_runtime_accepted_result_resume_refusal_reaches_assertions),
+            ('resume before drain', "if life and life['phase'] in ('draining','parked-releasing'):", 'if False:',
+             self.test_actual_runtime_foreign_authority_and_unfinished_drain_refuse),
+            ('foreign application ack', "application.get('session')==identity['session']", 'True',
+             self.test_actual_runtime_kernel_answers_and_idempotent_application),
         )
         for name, old, new, check in faults:
             with self.subTest(fault=name):
-                self.assertEqual(kernel.count(old), 1)
-                namespace = {'json': json}
-                exec(kernel.replace(old, new), namespace)
-                self.setUp()
-                with mock.patch.object(taskq, 'pilot_transition', namespace['pilot_transition']):
-                    with self.assertRaises(AssertionError):
-                        check()
+                self.assertEqual(source.count(old), 1)
+                namespace = dict(vars(taskq))
+                exec(source.replace(old, new), namespace)
+                # Each replay uses the actual lifecycle caller and the mutated shared function.
+                test = StateKernel(check.__name__)
+                test.setUp()
+                try:
+                    with mock.patch.object(taskq, 'lifecycle_transition', namespace['lifecycle_transition']):
+                        with self.assertRaises(AssertionError):
+                            getattr(test, check.__name__)()
+                finally:
+                    test.doCleanups()
+
+    def test_actual_runtime_two_workers_share_capacity_in_both_orders(self):
+        for first, second in ((1, 2), (2, 1)):
+            project_leases, host_leases = {}, {}
+            self.project.reserve.side_effect = lambda key, request: taskq.capacity_reserve(
+                project_leases, {'slots': 1}, key, request)
+            self.host.reserve.side_effect = lambda key, request: taskq.capacity_reserve(
+                host_leases, {'slots': 2, 'heavy': 1}, key, request)
+            for n in (1, 2):
+                raw, _ = kernel_fixture(n)
+                self.board.issues[n].update(labels=['q-ready'], body=taskq.block('preserve prose', raw))
+            self.runtime.start.reset_mock()
+            self.assertEqual(self.call('admit', first)['phase'], 'active')
+            self.assertEqual(self.call('admit', second),
+                             {'phase': 'waiting', 'resource': 'project', 'task_accepted': False})
+            self.assertEqual(self.runtime.start.call_count, 1)
+            for n in (1, 2):
+                self.assertEqual(self.task(n)['raw']['claim'], kernel_fixture(n)[0]['claim'])
+                self.assertEqual(self.task(n)['raw']['history'], [{'kind': 'original'}])
+
+    def test_actual_runtime_calls_replay_with_the_same_inputs(self):
+        from experiments.state_replay import replay
+        original = taskq.lifecycle_transition
+        records = []
+        def record(raw, stage, facts):
+            before = json.loads(json.dumps(raw))
+            result = original(raw, stage, facts)
+            records.append((before, dict(transition=stage, facts=json.loads(json.dumps(facts))),
+                            json.loads(json.dumps(result))))
+            return result
+        with mock.patch.object(taskq, 'lifecycle_transition', side_effect=record):
+            self.call('admit'); self.park(); self.call('accept')
+        self.assertEqual({command['transition'] for _, command, _ in records},
+                         {'guard', 'admission', 'application', 'accept'})
+        for raw, command, expected in records:
+            self.assertEqual(replay(raw, [command]), {'raw': expected, 'outcomes': ['ok']})
+
+    def test_injected_capacity_ceiling_is_detected(self):
+        import inspect
+        source = inspect.getsource(taskq.capacity_reserve)
+        old = "used[r]+v['request']['demand'].get(r,0)<=cap"
+        self.assertEqual(source.count(old), 1)
+        namespace = dict(vars(taskq)); exec(source.replace(old, 'True'), namespace)
+        with mock.patch.object(taskq, 'capacity_reserve', namespace['capacity_reserve']):
+            with self.assertRaises(AssertionError):
+                self.test_capacity_same_reducer_both_claim_orders_conflicts_and_heavy_separation()
 
 
 try:
@@ -6051,54 +6142,108 @@ else:
     class KernelMachine(RuleBasedStateMachine):
         def __init__(self):
             super().__init__()
-            self.state = taskq.pilot_state()
-            self.trace = []
+            self.initial = {n: kernel_fixture(n)[0] for n in (1, 2)}
+            self.tasks = json.loads(json.dumps(self.initial))
+            self.traces = {n: [] for n in (1, 2)}
+            self.leases = {}
+            self.caps = {'model:codex': 1, 'heavy': 1}
+            self.operations = {}
+            self.effects = {1: 0, 2: 0}
+            for n, raw in self.initial.items():
+                item = {'iid': n, 'raw': raw, **{k: raw[k] for k in ('claim', 'supervisor', 'pm')}}
+                self.operations[n] = taskq.ReceiptOperation(item, 1, taskq.recipient('worker', raw['claim']))
 
-        @rule(n=st.integers(1, 2), worker=st.sampled_from(('A', 'B')),
-              action=st.sampled_from(('claim', 'resume', 'heavy', 'terminal', 'drain',
-                                      'answer', 'apply', 'ack', 'accept', 'repair-start',
-                                      'repair-checkpoint', 'repair-finish')),
-              event=st.integers(1, 3), stale=st.booleans(), proof=st.booleans())
-        def command(self, n, worker, action, event, stale, proof):
-            old_state = self.state
-            before = json.loads(json.dumps(self.state))
-            command = dict(task=n, worker=worker, action=action, event=event,
-                           revision=self.state['tasks'][str(n)]['revision'] - int(stale),
-                           terminal=proof, cli_dead=proof, writer_drained=proof)
-            self.trace.append(command)
+        @rule(n=st.integers(1, 2), action=st.sampled_from(('admit', 'resume', 'reconcile', 'answer')),
+              settled=st.booleans(), text=st.text(max_size=12))
+        def lifecycle(self, n, action, settled, text):
+            raw = self.tasks[str(n)]
+            _, fingerprint = kernel_fixture(n)
+            stage = 'answer' if action == 'answer' else 'admission'
+            facts = dict(action=action, fingerprint=fingerprint, predecessor_settled=settled,
+                         artifact=f"artifact-{raw['execution']['event']}.txt", actor=raw['supervisor'], text=text)
+            command = {'transition': stage, 'facts': facts}
+            self.traces[n].append(command)
+            before = json.loads(json.dumps(raw))
             try:
-                self.state = taskq.pilot_transition(self.state, command)
+                self.tasks[str(n)] = taskq.lifecycle_transition(raw, stage, facts)
             except ValueError:
-                assert self.state == before
-                return
-            assert old_state == before, self.trace
-            # Independent safety oracles, not another transition implementation.
-            if stale:
-                assert self.state == before, self.trace
-            for key, old in before['tasks'].items():
-                new = self.state['tasks'][key]
-                if old['owner'] is not None:
-                    assert new['owner'] == old['owner'], self.trace
-                if old['accepted']:
-                    assert not new['model'], self.trace
-                if action == 'terminal':
-                    assert (new['heavy'], new['writer']) == (old['heavy'], old['writer']), self.trace
-                if action == 'apply' and event in old['receipts']:
-                    assert new['effects'] == old['effects'], self.trace
+                assert raw == before
+            assert raw == before  # reducer cannot mutate its input even on success
+            assert self.tasks[str(n)]['claim'] == self.initial[n]['claim'], self.traces[n]
+            assert self.tasks[str(n)]['history'] == self.initial[n]['history'], self.traces[n]
+
+        @rule(n=st.integers(1, 2), phase=st.sampled_from(('active', 'draining', 'parked-releasing', 'parked')),
+              accepted=st.booleans(), valid=st.booleans())
+        def observed_checkpoint(self, n, phase, accepted, valid):
+            # Test supplies a native checkpoint/adapter observations, never implements a transition.
+            raw, fingerprint = kernel_fixture(n)
+            raw = taskq.lifecycle_transition(raw, 'admission', dict(action='admit', fingerprint=fingerprint,
+                    artifact='artifact-1.txt', predecessor_settled=True))
+            raw['lifecycle']['phase'] = phase
+            if accepted:
+                raw['result'] = {'kind': 'answer-artifact'}
+            before = json.loads(json.dumps(raw))
+            command = dict(transition='admission', facts=dict(action='resume', fingerprint=fingerprint,
+                           artifact='artifact-1.txt', predecessor_settled=valid))
+            from experiments.state_replay import replay
+            outcome = replay(raw, [command])
+            assert raw == before
+            if accepted or phase in ('draining', 'parked-releasing') or phase == 'parked' and not valid:
+                assert outcome['raw'] == raw and outcome['outcomes'][0] != 'ok', command
+            else:
+                assert outcome['outcomes'] == ['ok'], command
+                assert outcome['raw']['claim'] == raw['claim']
+
+        @rule(n=st.integers(1, 2), dimension=st.sampled_from(('model:codex', 'heavy')),
+              conflict=st.booleans())
+        def reservation(self, n, dimension, conflict):
+            key = f'{n}:{dimension}'
+            request = {'age': n + int(conflict), 'priority': 0, 'demand': {dimension: 1}}
+            before = json.loads(json.dumps(self.leases))
+            try:
+                value = taskq.capacity_reserve(self.leases, self.caps, key, request)
+                if key in before and before[key]['phase'] != 'waiting':
+                    assert value == before[key]
+            except ValueError:
+                assert self.leases == before
+            for dimension, cap in self.caps.items():
+                assert sum(v['request']['demand'].get(dimension, 0) for v in self.leases.values()
+                           if v['phase'] not in ('waiting', 'released')) <= cap
+
+        @rule(n=st.integers(1, 2), stage=st.sampled_from(('delivery', 'handling', 'application')),
+              foreign=st.booleans(), authenticated=st.booleans(), duplicate=st.booleans())
+        def receipt(self, n, stage, foreign, authenticated, duplicate):
+            op = self.operations[n]
+            before = op.snapshot()
+            if duplicate and op.receipts:
+                value = json.loads(json.dumps(op.receipts[-1]))
+            else:
+                value = {'operation': op.id, 'stage': stage, 'target': op.input['target'],
+                         'actor': op.input['target'], 'status': 'ok', 'evidence': {'fixture': authenticated}}
+                if foreign:
+                    value['target'] = 'worker:controlled-artifact:foreign'
+            try:
+                changed = op.receipt(value, lambda request, receipt: receipt['evidence'] == {'fixture': True})
+                self.effects[n] += int(changed)
+            except ValueError:
+                assert op.snapshot() == before
+            assert self.effects[n] == len(op.receipts)
+            item_raw = self.initial[n]
+            item = {'iid': n, 'raw': item_raw, **{k: item_raw[k] for k in ('claim', 'supervisor', 'pm')}}
+            restored = taskq.ReceiptOperation.restore(op.snapshot(), item,
+                         lambda request, receipt: receipt['evidence'] == {'fixture': True})
+            assert restored.snapshot() == op.snapshot()
 
         @invariant()
-        def safety_and_replay(self):
-            tasks = list(self.state['tasks'].values())
-            assert sum(t['model'] for t in tasks) <= 1, self.trace
-            assert sum(t['heavy'] for t in tasks) <= 1, self.trace
-            owners = [t['owner'] for t in tasks if t['owner'] is not None]
-            assert len(owners) == len(set(owners)), self.trace
-            for task in tasks:
-                assert set(task['acks']) <= set(task['receipts']) <= set(task['events']), self.trace
-                assert task['effects'] == len(task['receipts']), self.trace
-                assert not task['accepted'] or not (task['model'] or task['heavy'] or task['writer']), self.trace
+        def deterministic_replay_and_native_event_invariants(self):
             from experiments.state_replay import replay
-            assert replay(self.trace)['state'] == self.state, self.trace
+            for n in (1, 2):
+                raw = self.tasks[str(n)]
+                assert replay(self.initial[n], self.traces[n])['raw'] == raw, self.traces[n]
+                events = raw['events']
+                assert len({e['id'] for e in events}) == len(events)
+                assert all(set(e['acks']) <= set(e['recipients']) for e in events)
+                assert raw['claim'] == self.initial[n]['claim']
 
     TestStateKernel = KernelMachine.TestCase
     TestStateKernel.settings = settings(max_examples=100, stateful_step_count=50,

@@ -740,9 +740,11 @@ Every agent (Claude, Codex, DOT, Hermes, other) reads this file before work; `AG
 
 Changed (#641, R13, owner641.1 authorization): stdlib-only test frameworks -> a
 narrow test-only Hypothesis exception for the research pilot of two tasks/two
-workers. Runtime remains stdlib. The runtime module owns the executable pure
-transition kernel; the isolated replay runner and stateful tests call that same
-kernel. No production dispatch/admission change, new schema, storage or daemon.
+workers. Runtime remains stdlib. The actual lifecycle calls the extracted pure
+transition kernel; isolated Hypothesis/replay reuse those exact transitions and
+existing capacity/receipt reducers. Rejected result7 is superseded by the same-worker
+answer9 application (Sentinel_68fb95025c788191b8c5d1916fc24ba7); no second synchronized
+pilot model remains. No production activation, new schema, storage or daemon.
 Other Later tasks and existing named ARM admission remain unchanged. Quint is
 conditional later only if interleaving/liveness needs it, with Python trace replay;
 Lean is not mandatory. Model assertions do not qualify persistence, subprocesses

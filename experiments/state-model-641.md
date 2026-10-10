@@ -1,5 +1,9 @@
 # #641 bounded state-model pilot
 
+Historical evidence for rejected result7, retained unchanged below. Supervisor
+ask8 rejected the separate pilot implementation. Current same-worker answer9
+application is documented in [state-model-641-answer9.md](state-model-641-answer9.md).
+
 Owner641.1 authorized this research-only two-task/two-worker pilot. R13 and §10
 were amended before implementation. No queue, ARM, dispatch, production schema,
 receipt store, daemon or production activation changed. Other Later work is unchanged.

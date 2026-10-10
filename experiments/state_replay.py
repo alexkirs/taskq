@@ -1,26 +1,27 @@
-"""#641 isolated trace replay; no board/process effects or production activation.
+"""#641 pure replay of the actual lifecycle reducer, never board authority.
 
-Input: JSON command list on stdin. Output includes every refusal and final state.
-Revisions are explicit, so stale/concurrent commands replay without wall clocks.
+stdin: {"raw": native task payload, "commands": [{"transition": ..., "facts": ...}]}
+Adapter facts in a trace are abstract observations, not native process/drain proof.
 """
 import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from taskq import pilot_state, pilot_transition
+from taskq import lifecycle_transition
 
 
-def replay(commands, transition=pilot_transition):
-    state, outcomes = pilot_state(), []
+def replay(raw, commands):
+    outcomes = []
     for command in commands:
         try:
-            state = transition(state, command)
+            raw = lifecycle_transition(raw, command['transition'], command['facts'])
             outcomes.append('ok')
         except ValueError as error:
             outcomes.append(str(error))
-    return {'state': state, 'outcomes': outcomes}
+    return {'raw': raw, 'outcomes': outcomes}
 
 
 if __name__ == '__main__':
-    print(json.dumps(replay(json.load(sys.stdin)), sort_keys=True))
+    trace = json.load(sys.stdin)
+    print(json.dumps(replay(trace['raw'], trace['commands']), sort_keys=True))

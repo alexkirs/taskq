@@ -4340,9 +4340,12 @@ class Contract(Base):
 
     def test_update_exact_sha_with_real_isolated_git_and_atomic_pointer(self):
         origin, writer, install = self.root / 'origin.git', self.root / 'writer', self.root / 'install'
+        global_git = self.root / 'isolated-global.gitconfig'
+        global_git.write_text('[core]\n\tautocrlf = true\n', encoding='utf-8')
         with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN), \
                 mock.patch.object(taskq, 'CLONE', writer), \
-                mock.patch.dict(os.environ, {'PATH': os.defpath + os.pathsep + os.environ.get('PATH', '')}):
+                mock.patch.dict(os.environ, {'PATH': os.defpath + os.pathsep + os.environ.get('PATH', ''),
+                                            'GIT_CONFIG_GLOBAL': str(global_git), 'GIT_CONFIG_NOSYSTEM': '1'}):
             REAL_RUN(['git', 'init', '-q', '--bare', str(origin)], check=True)
             REAL_RUN(['git', 'clone', '-q', str(origin), str(writer)], check=True, capture_output=True)
             self.git(writer, 'checkout', '-qb', 'main')
@@ -4373,12 +4376,29 @@ class Contract(Base):
             self.assertEqual(selected['commit'], sha)
             self.assertEqual(taskq.update_git(release, 'rev-parse', 'HEAD'), sha)
             self.assertEqual((release / 'taskq.md').read_text(), 'qualified contract\n')
+            self.assertEqual((release / 'taskq.md').read_bytes(), b'qualified contract\n')
+            self.assertEqual(taskq.update_git(release, 'config', 'core.autocrlf'), 'false')
             self.assertEqual(taskq.update_git(writer, 'rev-parse', 'HEAD'), before)
             self.assertEqual(taskq.update_git(writer, 'status', '--porcelain'), '')
             old_pointer = pointer.read_text()
             with mock.patch.object(taskq, 'qualified_checks'):
                 self.run_cli(*args, '--apply', '--qualification', str(proof))
             self.assertEqual(pointer.read_text(), old_pointer)
+            # Git can call a translated checkout clean; reuse must still refuse before pointer replacement.
+            bad_install = self.root / 'translated-install'
+            translated = bad_install / 'releases' / sha
+            translated.parent.mkdir(parents=True)
+            REAL_RUN(['git', 'clone', '-q', '--config', 'core.autocrlf=true', '--no-checkout',
+                      '--branch', 'main', str(origin), str(translated)], check=True, capture_output=True)
+            self.git(translated, 'checkout', '-q', '--detach', sha)
+            self.assertEqual((translated / 'taskq.md').read_bytes(), b'qualified contract\r\n')
+            self.assertEqual(taskq.update_git(translated, 'status', '--porcelain'), '')
+            bad_pointer = bad_install / 'current.json'
+            bad_pointer.write_text(old_pointer, encoding='utf-8')
+            with mock.patch.object(taskq, 'qualified_checks'), self.assertRaisesRegex(SystemExit, 'bytes differ from qualified Git blob'):
+                self.run_cli('update', '--commit', sha, '--install-dir', str(bad_install), '--apply', '--qualification', str(proof))
+            self.assertEqual(bad_pointer.read_text(), old_pointer)
+            self.assertEqual((translated / 'taskq.md').read_bytes(), b'qualified contract\r\n')
             # A second exact SHA cannot race an active installer; a completed checkout survives pointer failure.
             (writer / 'taskq.md').write_text('next qualified contract\n')
             self.git(writer, 'commit', '-qam', 'next')

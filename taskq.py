@@ -2450,10 +2450,11 @@ def model_reconcile(item):
             item['raw'] = issue_data(fresh)  # closed tasks normally have no q-* label
 
 
-def model_reconcile_outstanding(delegated_pm=None):
+def model_reconcile_outstanding(delegated_pm=None, separate=False):
     """Exact tasks selected by outstanding native model grants, never closed history."""
-    project, host = model_providers()
-    candidates = {**project.outstanding_models(), **host.outstanding_models(CONFIG['repo'])}
+    with coordination() if separate else contextlib.nullcontext():
+        project, host = model_providers()
+        candidates = {**project.outstanding_models(), **host.outstanding_models(CONFIG['repo'])}
     if len(candidates) > 100:
         fail('outstanding model reconciliation bound exceeded; inspect ledger without guessing release')
     actor = delegated_pm or origin()
@@ -2466,16 +2467,19 @@ def model_reconcile_outstanding(delegated_pm=None):
         local = host.observe(key)
         if not local or local['phase'] not in ('bound', 'drained', 'released'):
             continue  # a foreign host's outstanding grant is not this host's authority
-        issue = read_issue(n)
-        raw = issue_data(issue)
-        if raw.get('event_schema') != EVENT_SCHEMA or 'legacy_recovery' in raw or raw.get('pm') != actor:
-            continue
-        role = request.get('role')
-        turn = (raw.get('model_turns') or {}).get(role)
-        if role not in ('worker', 'supervisor') or not turn or turn.get('key') != key \
-                or turn.get('generation') != request.get('generation') or turn.get('request') != request:
-            continue
-        model_reconcile({'iid': n, 'raw': {'model_turns': {role: turn}}})
+        with coordination() if separate else contextlib.nullcontext():
+            if separate:
+                board_schema_gate()
+            issue = read_issue(n)
+            raw = issue_data(issue)
+            if raw.get('event_schema') != EVENT_SCHEMA or 'legacy_recovery' in raw or raw.get('pm') != actor:
+                continue
+            role = request.get('role')
+            turn = (raw.get('model_turns') or {}).get(role)
+            if role not in ('worker', 'supervisor') or not turn or turn.get('key') != key \
+                    or turn.get('generation') != request.get('generation') or turn.get('request') != request:
+                continue
+            model_reconcile({'iid': n, 'raw': {'model_turns': {role: turn}}})
 
 
 def model_role_state(item, role_name):
@@ -3309,6 +3313,27 @@ def heading(item):
     text = f'#{item["iid"]} {cell(title if len(title) <= 60 else title[:59] + "…")}'.strip()
     return f'[{text}]({item["url"]})' if item.get('url') else text
 
+@contextlib.contextmanager
+def pass_task(item, separate, delegated_pm):
+    if not separate:
+        yield item
+        return
+    issue = read_issue(item['iid'])
+    candidate = parse(issue) if issue['state'] == 'open' else None
+    if not candidate or delegated_pm is not None and candidate['pm'] != delegated_pm:
+        yield None
+        return
+    with coordination():
+        board_schema_gate()
+        issue = read_issue(item['iid'])
+        fresh = parse(issue) if issue['state'] == 'open' else None
+        if not fresh or delegated_pm is not None and fresh['pm'] != delegated_pm:
+            yield None
+            return
+        item.update(fresh)
+        yield item
+
+
 def one_pass(args, table=True):
     """One pass: free waiting tasks, follow unsupervised workers, act for supervisors, spawn ready tasks' supervisors, print the table."""
     here, kinds = machine(), runtimes()
@@ -3317,14 +3342,15 @@ def one_pass(args, table=True):
     local = local_limits()
     limits = local if local is not None else CONFIG.get('limits') or {name: 1 for name in kinds}
     blind = bool(os.environ.get('CODEX_SANDBOX'))
-    with contextlib.nullcontext() if blind else coordination():  # a sandbox pass remains read-only
+    model_mode = isinstance(CONFIG.get('capacity'), dict) and 'model:codex' in CONFIG['capacity'].get('host_caps', {})
+    with contextlib.nullcontext() if blind or model_mode else coordination():  # a sandbox pass remains read-only
         held = not blind
         tasks = getattr(args, 'tasks', None) or []  # #481: the list lags the event's own write (a new issue, a label): read those directly
         issues = [issue for issue in BOARD.list(None) if issue['iid'] not in tasks] + [issue for issue in map(read_issue, tasks) if issue['state'] == 'open']
         if held:
             board_schema_gate(issues)
             if isinstance(CONFIG.get('capacity'), dict) and 'model:codex' in CONFIG['capacity'].get('host_caps', {}):
-                model_reconcile_outstanding(delegated_pm)
+                model_reconcile_outstanding(delegated_pm, separate=model_mode)
         items = sorted(filter(None, map(parse, issues)), key=lambda item: (item['priority'], item['iid']))
         if delegated_pm is not None:
             items = [item for item in items if item['pm'] == delegated_pm]
@@ -3343,13 +3369,15 @@ def one_pass(args, table=True):
         if getattr(args, 'execution_scope', None):
             items = ready = [item for item in items if item['iid'] in args.execution_scope]
         for item in ready:
-            if 'legacy_recovery' in item['raw']:
-                continue
-            if item['raw'].get('event_schema') != 2 and compatibility_reason(item):
-                fail(compatibility_reason(item))
-            if item['raw'].get('model_turns'):
-                model_reconcile(item)
-        model_mode = isinstance(CONFIG.get('capacity'), dict) and 'model:codex' in CONFIG['capacity'].get('host_caps', {})
+            with pass_task(item, model_mode, delegated_pm) as current:
+                if current is None:
+                    continue
+                if 'legacy_recovery' in item['raw']:
+                    continue
+                if item['raw'].get('event_schema') != 2 and compatibility_reason(item):
+                    fail(compatibility_reason(item))
+                if item['raw'].get('model_turns'):
+                    model_reconcile(item)
         worker_slots, occupied = set(), {}
         if local is not None:  # existing active workers consume capacity, even outside this invocation's host scope
             for item in ready:
@@ -3370,80 +3398,87 @@ def one_pass(args, table=True):
                     worker_slots.add(item['iid'])
                     occupied[name] = occupied.get(name, 0) + 1
         for item in ready:
-            claim = item['claim'] or {}
-            if 'legacy_recovery' in item['raw']:
-                continue
-            if item['raw'].get('event_schema') == 2:
-                queue_pass(item)
-                if claim.get('name') == here and claim.get('session') and item['state'] in ('doing','review','ask'):
-                    busy[claim.get('runtime')] = busy.get(claim.get('runtime'),0)+1
-                continue
-            if not host_scope(item):
-                if item['state'] in ('doing', 'review', 'ask') and claim.get('name') == here:
-                    busy[claim.get('runtime')] = busy.get(claim.get('runtime'), 0) + 1
-                continue
-            if getattr(args, 'unknown_after', None) is not None and recovery_question(item, kinds, here, args.unknown_after):
-                if item['state'] in ('doing', 'ask') and claim.get('name') == here:
-                    busy[claim.get('runtime')] = busy.get(claim.get('runtime'), 0) + 1
-                continue
-            if item['state'] == 'waiting' and not open_deps(item['deps']):
-                if not executable(read_issue(item['iid']), item):
+            with pass_task(item, model_mode, delegated_pm) as current:
+                if current is None:
                     continue
-                move(item, 'ready', 'ready', 'dependencies closed')
-                item['state'] = 'ready'
-            if item['supervisor']:  # step 4; the worker's slot is held from the supervisor's spawn to close
-                if item['supervisor'].get('name') == here:
-                    supervise(item, kinds, model_mode or local is None or item['iid'] in worker_slots)
-                if item['state'] in ('doing', 'review', 'ask') and claim.get('name') == here:
-                    busy[claim.get('runtime')] = busy.get(claim.get('runtime'), 0) + 1
-                continue
-            if item['state'] != 'doing' or claim.get('name') != here or claim.get('runtime') not in kinds:
-                continue  # another machine's, or a session no runtime here can see
-            if not executable(read_issue(item['iid']), item):  # #545: the list's labels may lag; an ineligible task keeps its session and slot
+                claim = item['claim'] or {}
+                if 'legacy_recovery' in item['raw']:
+                    continue
+                if item['raw'].get('event_schema') == 2:
+                    queue_pass(item)
+                    if claim.get('name') == here and claim.get('session') and item['state'] in ('doing','review','ask'):
+                        busy[claim.get('runtime')] = busy.get(claim.get('runtime'),0)+1
+                    continue
+                if not host_scope(item):
+                    if item['state'] in ('doing', 'review', 'ask') and claim.get('name') == here:
+                        busy[claim.get('runtime')] = busy.get(claim.get('runtime'), 0) + 1
+                    continue
+                if getattr(args, 'unknown_after', None) is not None and recovery_question(item, kinds, here, args.unknown_after):
+                    if item['state'] in ('doing', 'ask') and claim.get('name') == here:
+                        busy[claim.get('runtime')] = busy.get(claim.get('runtime'), 0) + 1
+                    continue
+                if item['state'] == 'waiting' and not open_deps(item['deps']):
+                    if not executable(read_issue(item['iid']), item):
+                        continue
+                    move(item, 'ready', 'ready', 'dependencies closed')
+                    item['state'] = 'ready'
+                if item['supervisor']:  # step 4; the worker's slot is held from the supervisor's spawn to close
+                    if item['supervisor'].get('name') == here:
+                        supervise(item, kinds, model_mode or local is None or item['iid'] in worker_slots)
+                    if item['state'] in ('doing', 'review', 'ask') and claim.get('name') == here:
+                        busy[claim.get('runtime')] = busy.get(claim.get('runtime'), 0) + 1
+                    continue
+                if item['state'] != 'doing' or claim.get('name') != here or claim.get('runtime') not in kinds:
+                    continue  # another machine's, or a session no runtime here can see
+                if not executable(read_issue(item['iid']), item):  # #545: the list's labels may lag; an ineligible task keeps its session and slot
+                    busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
+                    continue
+                runtime = kinds[claim['runtime']]  # step 2: unsupervised (R3 Transition: started before #525, or taken by hand)
+                state = model_role_state(item, 'worker') or runtime_state(runtime, claim['session'])
+                if state == 'dead':
+                    gone = f'session {claim["session"]} is gone'
+                    if quick_deaths(item['iid']):  # #393: the second death in a row with no result or answer asks, not respawns
+                        move(item, 'ask', 'ask', f'{gone} again, the worker dies at once: fix the runtime, then answer.\n\n'
+                                                 f'Last log line: {tail_of(runtime, claim["session"]) or "none"}')
+                        item['state'] = 'ask'
+                        continue
+                    move(item, 'ready', 'requeue', gone, claim=None, result=None)
+                    item.update(state='ready', claim=None)
+                    continue
+                if state in ('running', 'idle') or \
+                        ((item['raw'].get('model_turns') or {}).get('worker') or {}).get('phase') == 'reserving':
+                    claim = follow(item, runtime, claim, False) or claim  # denied: the original claim keeps its slot
                 busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
-                continue
-            runtime = kinds[claim['runtime']]  # step 2: unsupervised (R3 Transition: started before #525, or taken by hand)
-            state = model_role_state(item, 'worker') or runtime_state(runtime, claim['session'])
-            if state == 'dead':
-                gone = f'session {claim["session"]} is gone'
-                if quick_deaths(item['iid']):  # #393: the second death in a row with no result or answer asks, not respawns
-                    move(item, 'ask', 'ask', f'{gone} again, the worker dies at once: fix the runtime, then answer.\n\n'
-                                             f'Last log line: {tail_of(runtime, claim["session"]) or "none"}')
-                    item['state'] = 'ask'
-                    continue
-                move(item, 'ready', 'requeue', gone, claim=None, result=None)
-                item.update(state='ready', claim=None)
-                continue
-            if state in ('running', 'idle') or \
-                    ((item['raw'].get('model_turns') or {}).get('worker') or {}).get('phase') == 'reserving':
-                claim = follow(item, runtime, claim, False) or claim  # denied: the original claim keeps its slot
-            busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
         for item in ready:
-            if 'legacy_recovery' in item['raw']:
-                continue
-            if item['raw'].get('event_schema') == 2 or item['state'] != 'ready' or not host_scope(item) or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']) \
-                    or (item['pm'] and item['pm'].get('name') != here and item['pm'] != delegated_pm) or not lead(item, kinds, admit=True):
-                continue  # no manager: the task waits, the table says so; another machine's manager: that machine starts it (§ 7 step 3)
-            names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
-            free = next((name for name in names if name in kinds and limits.get(name, 0 if local is not None else 1) > 0
-                         and (model_mode and name == 'codex' or busy.get(name, 0) < limits.get(name, 0 if local is not None else 1))), None)
-            fresh = free and executable(read_issue(item['iid']), item)  # #357: the board may have moved since the list; #545: eligibility
-            if fresh and fresh['state'] == 'ready' and fresh['pm'] == item['pm']:  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
-                if local is not None and fresh['runtime'] not in ('any', free):
-                    continue  # a stale list must not select a different or disabled worker runtime
-                item.update(fresh)
-                runtime = lead(item, kinds)
-                if not replace(item, kinds[runtime], runtime, 'supervisor'):  # a requeued task's old S<N>
+            with pass_task(item, model_mode, delegated_pm) as current:
+                if current is None:
                     continue
-                session = spawn_named(item, kinds[runtime], 'S', supervisor_brief(item, runtime, kinds[runtime]))
-                if not session:
+                if 'legacy_recovery' in item['raw']:
                     continue
-                item.update(supervisor={'runtime': runtime, 'session': session, 'name': here}, claim={'runtime': free, 'session': None, 'name': here})
-                move(item, 'doing', 'spawn', note('supervisor', session, kinds[runtime]), supervisor=item['supervisor'], claim=item['claim'],
-                     result=None, order=None)
-                item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
+                if item['raw'].get('event_schema') == 2 or item['state'] != 'ready' or not host_scope(item) or item['host'] not in (None, here) or not mine(item) or open_deps(item['deps']) \
+                        or (item['pm'] and item['pm'].get('name') != here and item['pm'] != delegated_pm) or not lead(item, kinds, admit=True):
+                    continue  # no manager: the task waits, the table says so; another machine's manager: that machine starts it (§ 7 step 3)
+                names = [item['runtime']] if item['runtime'] != 'any' else list(limits)
+                free = next((name for name in names if name in kinds and limits.get(name, 0 if local is not None else 1) > 0
+                             and (model_mode and name == 'codex' or busy.get(name, 0) < limits.get(name, 0 if local is not None else 1))), None)
+                fresh = free and executable(read_issue(item['iid']), item)  # #357: the board may have moved since the list; #545: eligibility
+                if fresh and fresh['state'] == 'ready' and fresh['pm'] == item['pm']:  # the tick claims the slot for the worker; the supervisor orders the worker (`run`)
+                    if local is not None and fresh['runtime'] not in ('any', free):
+                        continue  # a stale list must not select a different or disabled worker runtime
+                    item.update(fresh)
+                    runtime = lead(item, kinds)
+                    if not replace(item, kinds[runtime], runtime, 'supervisor'):  # a requeued task's old S<N>
+                        continue
+                    session = spawn_named(item, kinds[runtime], 'S', supervisor_brief(item, runtime, kinds[runtime]))
+                    if not session:
+                        continue
+                    item.update(supervisor={'runtime': runtime, 'session': session, 'name': here}, claim={'runtime': free, 'session': None, 'name': here})
+                    move(item, 'doing', 'spawn', note('supervisor', session, kinds[runtime]), supervisor=item['supervisor'], claim=item['claim'],
+                         result=None, order=None)
+                    item['state'], busy[free] = 'doing', busy.get(free, 0) + 1
         if held and not blind and delegated_pm is None and not any('legacy_recovery' in item['raw'] for item in items):
-            retire(stale({item['iid']: item for item in items}), 'could not remove stopped sessions', running=False)
+            with coordination() if model_mode else contextlib.nullcontext():
+                retire(stale({item['iid']: item for item in items}), 'could not remove stopped sessions', running=False)
     if table:
         if getattr(args, 'diagnose', False):
             cmd_status(args)

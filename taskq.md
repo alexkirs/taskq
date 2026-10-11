@@ -179,6 +179,19 @@ subscriber wiring are outside this minimal CLI/typed-adapter contract. The cache
 must not be mistaken for their implementation. Existing production schedulers and
 the older PM role route remain unchanged until rollout.
 
+### Owned-model transaction boundaries
+
+Owned-model queue passes discover candidate tasks outside project coordination.
+Each task's settlement or execution step then acquires its own exact grant,
+rechecks the current board schema and authoritative task/manager, and keeps the
+complete reservation, native launch and task record inside that transaction.
+Unrelated task discovery and later transactions do not retain an earlier grant.
+The atomic capacity providers remain admission authority; legacy non-model pass
+accounting retains its original whole-pass exclusion. Unknown effects still
+retain their exact grant and abort the pass. This reduces aggregate lock hold;
+it does not promise FIFO guard acquisition or a fixed latency for an individual
+slow provider request or native launch.
+
 ### Legacy model-worker continuation
 
 Completed model workers retain their exact session when the ordinary supervisor

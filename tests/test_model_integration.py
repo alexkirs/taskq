@@ -6,9 +6,11 @@ import importlib.util
 import io
 import json
 import pathlib
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -214,6 +216,136 @@ class ModelIntegration(unittest.TestCase):
             self.assertEqual(q.parse(self.board.get(5))['raw']['model_turns']['supervisor']['phase'],'bound')
             q.one_pass(args,False)
             self.assertEqual(len(self.children),5)
+
+    def test_outstanding_settlement_rechecks_schema_after_discovery(self):
+        self.start()
+        host = self.host(); original_observe = host.observe
+        q.board_schema_gate()
+        def changed(key):
+            self.assertIsNone(self.board.guard)
+            lease = original_observe(key)
+            self.board.add('incompatible newcomer', q.block('work', {**self.raw, 'event_schema': 1}), ['q-ready'])
+            return lease
+        with mock.patch.object(q, 'model_providers', return_value=(self.project, host)), \
+                mock.patch.object(host, 'observe', side_effect=changed), \
+                mock.patch.object(q, 'model_reconcile') as reconcile, \
+                self.assertRaisesRegex(SystemExit, 'board schema 1 differs'):
+            q.model_reconcile_outstanding(separate=True)
+        reconcile.assert_not_called()
+        self.assertIsNone(self.board.guard)
+
+    def test_model_pass_discovers_without_guard_and_uses_distinct_task_grants(self):
+        self.board.add('second', q.block('work', {**self.raw, 'order': None}), ['q-doing'])
+        original = self.board.list; discovered = []
+        def listing(state):
+            if not discovered:
+                self.assertIsNone(self.board.guard)
+                discovered.append(True)
+            return original(state)
+        grants = []
+        def supervise(item, *args):
+            self.assertIsNotNone(self.board.guard)
+            grants.append(self.board.guard)
+        args = argparse.Namespace(headless=False, tasks=[], unknown_after=None, execution_scope=None)
+        with mock.patch.object(self.board, 'list', side_effect=listing), \
+                mock.patch.object(q, 'runtimes', return_value={'codex': self.kind}), \
+                mock.patch.object(q, 'supervise', side_effect=supervise), mock.patch.object(q, 'retire'):
+            q.one_pass(args, False)
+        self.assertEqual(len(grants), 2)
+        self.assertEqual(len(set(grants)), 2)
+        self.assertIsNone(self.board.guard)
+
+    def test_task_transaction_refreshes_manager_and_unknown_effect_aborts_pass(self):
+        item = self.item(); original = self.board.get; reads = []
+        def changed(n):
+            issue = original(n); reads.append(n)
+            if len(reads) == 2:
+                raw = q.issue_data(issue); raw['pm'] = {**self.actor, 'session': 'foreign-manager'}
+                issue = {**issue, 'body': q.block('work', raw)}
+            return issue
+        with mock.patch.object(self.board, 'get', side_effect=changed):
+            with q.pass_task(item, True, self.actor) as current:
+                self.assertIsNone(current)
+        self.assertIsNone(self.board.guard)
+        self.board.add('second', q.block('work', {**self.raw, 'order': None}), ['q-doing'])
+        visited = []
+        def unknown(item, *args):
+            visited.append(item['iid'])
+            def effect(): raise RuntimeError('unknown task launch')
+            q.effect(effect)
+        args = argparse.Namespace(headless=False, tasks=[], unknown_after=None, execution_scope=None)
+        with self.assertRaisesRegex(RuntimeError, 'unknown task launch'), \
+                mock.patch.object(q, 'runtimes', return_value={'codex': self.kind}), \
+                mock.patch.object(q, 'supervise', side_effect=unknown), mock.patch.object(q, 'retire'):
+            q.one_pass(args, False)
+        self.assertEqual(visited, [1])
+        self.assertIsNotNone(self.board.guard)
+
+    def test_native_run_and_result_finish_between_slow_model_task_transactions(self):
+        for n in range(2, 9):
+            raw = {**self.raw, 'order': None}
+            if n == 2:
+                raw['claim'] = {**raw['claim'], 'session': 'fixture-worker'}
+            self.board.add('task ' + str(n), q.block('work', raw), ['q-doing'])
+        board_path = self.root / 'board.py'
+        board_path.write_text(f.FILE_BOARD + '''
+import os
+def save(issues):
+ target=PATH.with_suffix('.tmp-'+str(os.getpid()))
+ target.write_text(json.dumps(issues));os.replace(target,PATH)
+''')
+        issues = self.board.issues
+        for issue in issues.values():
+            issue['listed'] = True
+        (self.root / 'issues.json').write_text(json.dumps(issues))
+        q.BOARD = board = q.load_file(board_path)
+        config = {**q.CONFIG, 'root': str(self.root)}
+        script = self.root / 'writer.py'
+        script.write_text(f'''
+import argparse,json,pathlib,sys
+sys.path.insert(0,{str(pathlib.Path(q.__file__).parent)!r})
+import taskq as q
+q.CONFIG=json.loads({json.dumps(config)!r});q.CONFIG['root']=pathlib.Path(q.CONFIG['root'])
+q.BOARD=q.load_file(pathlib.Path({str(board_path)!r}))
+actor=json.loads({json.dumps(self.actor)!r});q.origin=lambda:actor;q.session=lambda:actor
+q.GUARD_WAIT=.75;q.GUARD_PAUSE=.01
+pathlib.Path({str(self.root / 'writer-ready')!r}).write_text('ready')
+with q.coordination():q.cmd_run(argparse.Namespace(n=1,text='native fixture order'))
+actor.update(session='fixture-worker')
+with q.coordination():q.cmd_move(argparse.Namespace(command='result',n=2,sha='a'*40,
+ text='native fixture result',checks='passed',option=[],recommend=1,link=[]))
+pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
+''')
+        writer = []; first_finished = []
+        original_get = board.get
+        def get(n):
+            if n == 2 and first_finished and not getattr(q.GUARD, 'held', None):
+                stdout, stderr = writer[0].communicate(timeout=3)
+                self.assertEqual(writer[0].returncode, 0, stdout + stderr)
+                self.assertTrue((self.root / 'writer-done').is_file())
+            return original_get(n)
+        def slow_step(item, *args):
+            self.assertIsNotNone(getattr(q.GUARD, 'held', None))
+            if item['iid'] == 1:
+                env = dict(os.environ); env.pop('TASKQ_INSTALL_DIR', None)
+                child = subprocess.Popen([sys.executable, '-B', str(script)], cwd=self.root, env=env,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                writer.append(child); self.children.append(child)
+                deadline = time.monotonic() + 3
+                while not (self.root / 'writer-ready').exists() and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue((self.root / 'writer-ready').exists())
+                first_finished.append(True)
+            time.sleep(.15)
+        args = argparse.Namespace(headless=False, tasks=[], unknown_after=None, execution_scope=None)
+        with mock.patch.object(board, 'get', side_effect=get), mock.patch.object(q, 'model_reconcile_outstanding'), \
+                mock.patch.object(q, 'runtimes', return_value={'codex': self.kind}), \
+                mock.patch.object(q, 'supervise', side_effect=slow_step), mock.patch.object(q, 'retire'):
+            q.one_pass(args, False)
+        stdout, stderr = writer[0].communicate(timeout=3)
+        self.assertEqual(writer[0].returncode, 0, stdout + stderr)
+        self.assertEqual(q.issue_data(board.get(1))['order'], 'run')
+        self.assertEqual(q.issue_data(board.get(2))['result']['sha'], 'a' * 40)
 
     def waiting_supervisor(self):
         host = self.host()

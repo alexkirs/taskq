@@ -1629,6 +1629,16 @@ def commit(sha):
     """A result's commit: hex only, so it never reaches git as an option."""
     return sha if re.fullmatch('[0-9a-f]{7,40}', sha) else fail(f'{sha!r} is not a commit: 7 to 40 lowercase hex digits')
 
+def publication_links(current, text):
+    """Explicit attribution only; the adapter supplies the current task's canonical URL."""
+    url = current.get('url') or ''
+    if not re.fullmatch(r'https?://[^\s<>]+', url):
+        fail(f'#{current["iid"]}: canonical board task URL unavailable')
+    links = list(dict.fromkeys(line for line in (text or '').splitlines() if re.fullmatch(r'Task: https?://[^\s<>]+', line)))
+    if f'Task: {url}' not in links:
+        fail(f'#{current["iid"]}: message needs Task: {url}')
+    return links
+
 def merge(current, sha):
     """pr mode: squash-merge the one open PR/MR of branch taskq-<N> into main at the result SHA: the merge commit, None with no PR.
     It merges only once the gate passes on the PR head: GitHub the 'tests' check (#359), GitLab the MR's pipeline (#479);
@@ -1646,6 +1656,14 @@ def merge(current, sha):
     if found != [(found and found[0][0], sha, 'main')]:  # exactly one, into main, at the full result SHA
         return found and fail(f'{branch}: open PRs (number, head, base) {found} do not match the result {sha} into main')
     number, head, _ = found[0]
+    code, viewed = cli(*(['glab', 'mr', 'view', number, '--output', 'json'] if lab else ['gh', 'pr', 'view', number, '--json', 'title,body']))
+    details = code and fail(viewed) or json.loads(viewed)
+    links = publication_links(current, details.get('description' if lab else 'body'))
+    title = details.get('title') or ''
+    if not title.strip() or '\n' in title or '\r' in title:
+        fail(f'#{current["iid"]}: PR/MR needs a one-line change explanation')
+    body = '\n'.join(links)
+    message = f'{title}\n\n{body}'
 
     def back(why, settled=True):  # a supervised task stays with its supervisor: it requeues with the fixes (§ 7 Supervisor 3.4)
         kept = {'claim': {**(current['claim'] or {}), 'session': None}} if current['supervisor'] else {'claim': None}
@@ -1668,13 +1686,22 @@ def merge(current, sha):
     if not all(ok for _, ok in checked):
         back(f'{gate} failed on {head}')
     keep = CONFIG.get('workspace') == 'external'  # #477: the host owns the branch; the repo's own policy may still delete it
-    _, out = effect(cli, *(['glab', 'mr', 'merge', number, '--squash', *['--remove-source-branch'] * (not keep), '--sha', head, '--auto-merge=false', '--yes'] if lab
-                   else ['gh', 'pr', 'merge', number, '--squash', *['--delete-branch'] * (not keep), '--match-head-commit', head]))
+    _, out = effect(cli, *(['glab', 'mr', 'merge', number, '--squash', *['--remove-source-branch'] * (not keep), '--sha', head, '--auto-merge=false', '--yes', '--squash-message', message, '--message', message] if lab
+                   else ['gh', 'pr', 'merge', number, '--squash', *['--delete-branch'] * (not keep), '--match-head-commit', head, '--subject', title, '--body', body]))
     code, viewed = cli(*(['glab', 'mr', 'view', number, '--output', 'json'] if lab else ['gh', 'pr', 'view', number, '--json', 'state,mergeCommit']))
     pr = {} if code else json.loads(viewed)
     if str(pr.get('state')).lower() != 'merged':  # read back: a merge that reported an error may still have merged
         back(f'did not merge: {out}', settled=False)
-    return pr.get('merge_commit_sha') or pr.get('squash_commit_sha') or pr['mergeCommit']['oid']
+    commits = list(dict.fromkeys(filter(None, [pr.get('squash_commit_sha'), pr.get('merge_commit_sha'), (pr.get('mergeCommit') or {}).get('oid')])))
+    if not commits:
+        fail(f'#{current["iid"]}: merged commit SHA unavailable; reconcile publication')
+    for published in commits:
+        data = run_api('glab' if lab else 'gh', host, 'GET',
+                       f'projects/{quote(CONFIG["repo"], safe="")}/repository/commits/{published}' if lab else f'repos/{CONFIG["repo"]}/commits/{published}')
+        actual = data.get('message') if lab else (data.get('commit') or {}).get('message')
+        if not actual or any(link not in actual.splitlines() for link in links):
+            fail(f'#{current["iid"]}: published {published} task links unverified; reconcile publication')
+    return pr.get('merge_commit_sha') or commits[0]
 
 def cleanup(current):
     """The worker's .worktrees/taskq-<N> and branch taskq-<N>, on the claim's machine: removed when clean, else kept
@@ -1729,6 +1756,7 @@ def publish_direct(current, sha, git):
     if run('ls-remote', 'origin', branch).split()[:1] != [sha]:
         fail(f'{branch}: remote candidate does not match result {sha}')
     run('merge-base', '--is-ancestor', 'origin/main', sha)  # fast-forward only; never discard new main work
+    publication_links(current, run('show', '-s', '--format=%B', sha))
     board, host = CONFIG['board'], CONFIG.get('host')
     if board == 'github':
         checks = run_api('gh', host, 'GET', f'repos/{CONFIG["repo"]}/commits/{sha}/check-runs?check_name=tests')['check_runs']
@@ -2017,6 +2045,12 @@ Read `{Path(__file__).resolve().with_name("taskq.md")}` first and do only what i
 {item["text"]}
 
 {history(n)}Expected paths: {", ".join(item["scope"] or []) or "none named"}. They say where the work is expected, not what is forbidden.
+
+Commit and PR/MR format (§ 6): short change explanation, optional short effect paragraph, then a blank line and
+Task: {item.get("url") or "unavailable: read the canonical issue URL from the board before committing"}
+Use that exact line in new commits and the PR/MR description; preserve it through rebase/squash. Add other Task lines
+only for tasks actually covered, using their adapter URLs. No automatic-closing keywords or copied work logs;
+exact SHA/check evidence belongs in taskq result and task history. Do not rewrite historical commits.
 
 Workspace: {workspace}; a branch taskq-{n} left by an earlier worker: continue it. A task that ends in an answer, not a commit,
 needs no worktree. Commands:

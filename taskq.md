@@ -207,6 +207,7 @@ it is not a deny-all artifact scope. Named paths still constrain application art
 Native identity, immutable answer input, path containment and exact commit checks remain required.
 For the built-in worker route, verify the project's registered `.worktrees/taskq-N`
 on branch `taskq-N` and inspect its artifact/HEAD, rather than the main checkout.
+An absent built-in worker tree refuses application; it never falls back to main.
 External workspaces retain their configured root; arbitrary workspace overrides are refused.
 Repeating that receipt performs no model turn or artifact write. An exact repeated answer while
 doing/review emits no new event or delivery. When the same native session holds both

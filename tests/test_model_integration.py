@@ -193,6 +193,7 @@ class ModelIntegration(unittest.TestCase):
                                   rework_rejection=item['raw']['event_seq']), sid
 
     def test_explicit_rejected_result_rework_same_identity_and_idempotent_application(self):
+        q.CONFIG['workspace'] = 'external'
         args, sid = self.rejected_fixture(); old = self.item()['raw']; boss = old['supervisor']
         with q.coordination(): q.cmd_answer(args)
         raw = self.item()['raw']
@@ -302,6 +303,11 @@ class ModelIntegration(unittest.TestCase):
         with self.assertRaises(SystemExit): q.cmd_applied(args)
         scoped['scope'] = []  # ordinary intake default: no expected paths named
         self.board.issues[1]['body'] = q.block('synthetic', scoped)
+        if not worktree:
+            before = json.dumps(self.board.issues, sort_keys=True)
+            with self.assertRaises(SystemExit): q.cmd_applied(args)  # missing built-in tree never falls back to main
+            self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+            q.CONFIG['workspace'] = 'external'
         for path in ('../artifact.txt', str(workspace/'artifact.txt')):
             with self.assertRaises(SystemExit):
                 q.cmd_applied(argparse.Namespace(event=args.event, artifact=path, sha=sha))

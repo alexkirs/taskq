@@ -2508,7 +2508,7 @@ def cmd_applied(args):
     root = CONFIG['root'].resolve()
     executable = shutil.which('git') or fail('git not found')
     workspace = root / '.worktrees' / f'taskq-{n}'
-    if CONFIG.get('workspace') != 'external' and workspace.exists():
+    if CONFIG.get('workspace') != 'external':
         if workspace.is_symlink() or not workspace.is_dir() or not workspace.resolve().is_relative_to(root):
             fail('applied worker worktree must stay inside its project')
         registered = subprocess.run([executable, '-C', str(root), 'worktree', 'list', '--porcelain', '-z'],

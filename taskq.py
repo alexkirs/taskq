@@ -2234,7 +2234,8 @@ def close_one(args):
         return
     issue, me = BOARD.get(args.n), (session() or {}).get('session')  # R11: its recorded workers, never the session running close
     retire(lambda name, n, sid, _: n == args.n and sid != me and recorded(issue, name, sid) == 'worker'
-           and not abandoned_identity(issue_data(issue), {'runtime': name, 'session': sid}), f'#{args.n}: could not stop its sessions')
+           and not abandoned_identity(issue_data(issue), {'runtime': name, 'session': sid}), f'#{args.n}: could not stop its sessions',
+           running=not bool(current['raw'].get('task_slot')))
 
 def recorded(issue, runtime, sid):
     """R11 (#478, #525): 'supervisor' or 'worker' when the task records this session (the block's supervisor or claim,
@@ -2563,6 +2564,9 @@ def spawn_named(item, kind, letter, prompt):
         fail(f'#{item["iid"]}: {role} {error}')
 
 
+MODEL_DEMANDS = ({'model:codex': 1}, {'model:codex:supervisor': 1})
+
+
 def model_providers(admission=False):
     selected = CONFIG.get('capacity')
     if not isinstance(selected, dict) or not callable(getattr(BOARD, 'capacity_provider', None)):
@@ -2571,12 +2575,152 @@ def model_providers(admission=False):
         if type((selected.get(name) or {}).get('model:codex')) is not int:
             fail('finite model:codex capacity required; no unlimited fallback')
         limits = local_limits() if local_limits() is not None else CONFIG.get('limits', {})
-        if admission and name == 'host_caps' and selected[name]['model:codex'] > limits.get('codex', 0):
-            fail('model capacity exceeds invocation limit; explicitly provision matching finite capacity')
+        if admission:
+            if any(type(selected[name].get(key)) is not int or selected[name][key] < 1
+                   for key in ('task:codex', 'model:codex:supervisor')):
+                fail('finite task:codex and model:codex:supervisor capacity must be explicitly provisioned')
+            if name == 'host_caps' and selected[name]['task:codex'] > limits.get('codex', 0):
+                fail('task capacity exceeds invocation limit; explicitly provision matching finite capacity')
     project = BOARD.capacity_provider(selected['project_caps'])
     if project.scope != 'project' or project.owner != CONFIG.get('repo') or project.caps != selected['project_caps']:
         fail('model project capacity authority mismatch')
     return project, SQLiteCapacity(selected['host_path'], 'host', machine(), selected['host_caps'])
+
+
+def task_slot_transition(slot, action, *, admitted=False, retired=False):
+    """Task lifetime is independent of model turns; unknown retirement never releases it."""
+    if action == 'admit' and slot['phase'] in ('reserving', 'active'):
+        return {**slot, 'phase': 'active' if admitted else slot['phase']}
+    if action == 'close' and slot['phase'] in ('active', 'retiring', 'released'):
+        if slot['phase'] == 'released':
+            return dict(slot)
+        return {**slot, 'phase': 'released' if retired else 'retiring'}
+    raise ValueError('unqualified task slot transition')
+
+
+def task_slot_admit(item, project, host):
+    issue = read_issue(item['iid']); raw = issue_data(issue)
+    slot = raw.get('task_slot')
+    if not slot:
+        if raw.get('model_turns') or any((raw.get(role) or {}).get('runtime') == 'codex'
+                and (raw.get(role) or {}).get('session') for role in ('claim', 'supervisor')):
+            fail(f'#{item["iid"]}: existing model ownership needs explicit task-capacity reconciliation')
+    if not slot or slot['phase'] == 'reserving':
+        for listed in BOARD.list(None):
+            prior_issue = read_issue(listed['iid']); prior = issue_data(prior_issue)
+            if prior_issue['state'] == 'open' and any(PREFIX + state in prior_issue['labels'] for state in ('doing', 'review')) \
+                    and not prior.get('task_slot') and (prior.get('model_turns') or any(
+                    (prior.get(role) or {}).get('runtime') == 'codex' and (prior.get(role) or {}).get('session')
+                    for role in ('claim', 'supervisor'))):
+                fail(f'#{listed["iid"]}: existing model ownership needs explicit task-capacity reconciliation')
+    if not slot:
+        request = {'repo': CONFIG['repo'], 'task': item['iid'], 'host': machine(),
+                   'owner': raw.get('pm'), 'generation': raw.get('execution_generation', 0),
+                   'repair_count': len(raw.get('repair_history', [])),
+                   'age': raw.get('admission_age', time.time()), 'priority': item['priority'],
+                   'demand': {'task:codex': 1}}
+        if hasattr(project, 'domain'):
+            request['project_domain'] = project.domain
+        slot = {'key': hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest(),
+                'phase': 'reserving', 'request': request}
+        raw['task_slot'] = slot
+        write_task_verified(issue, raw, issue['labels'])
+    request, key = slot['request'], slot['key']
+    if slot['phase'] not in ('reserving', 'active') or request.get('host') != machine() \
+            or request.get('repo') != CONFIG['repo'] or request.get('task') != item['iid'] \
+            or request.get('owner') != raw.get('pm') or request.get('demand') != {'task:codex': 1} \
+            or request.get('generation') != raw.get('execution_generation', 0) \
+            or request.get('repair_count') != len(raw.get('repair_history', [])):
+        fail('task slot ownership changed; retain grants')
+    if slot['phase'] == 'active':
+        if any(not grant or grant.get('request') != request or grant.get('phase') != 'reserved'
+               for grant in (project.observe(key), host.observe(key))):
+            fail('active task grant missing or unsettled; explicit reconciliation required')
+        return True
+    if project.reserve(key, request)['phase'] != 'reserved':
+        return False
+    if host.reserve(key, request)['phase'] != 'reserved':
+        return False
+    fresh = read_issue(item['iid']); data = issue_data(fresh)
+    if fresh['state'] != 'open' or data.get('task_slot') != slot or data.get('pm') != request['owner']:
+        fail('task changed during admission; retain grants')
+    if slot['phase'] != 'active':
+        data['task_slot'] = task_slot_transition(slot, 'admit', admitted=True)
+        write_task_verified(fresh, data, fresh['labels'])
+    item.update(parse(read_issue(item['iid'])))
+    return True
+
+
+def retire_model_task(raw):
+    """Archive exact settled closed-task sessions; no detached-writer fencing claim."""
+    sessions = {turn['runtime']['session'] for turn in
+                [*(raw.get('model_turns') or {}).values(), *raw.get('model_turn_history', [])]}
+    for sid in sorted(sessions):
+        if rollout(sid) == 'archived':
+            continue
+        done = effect(subprocess.run, [shutil.which('codex') or 'codex', 'archive', sid],
+                      capture_output=True, timeout=60, **no_window())
+        if done.returncode or rollout(sid) != 'archived':
+            return False
+    return True
+
+
+def task_slots_reconcile(delegated_pm=None):
+    """Recover lifetime grants even after board close or a lost release response."""
+    with coordination():
+        project, host = model_providers()
+        candidates = {**project.outstanding_tasks(), **host.outstanding_tasks(CONFIG['repo'])}
+    actor = delegated_pm or origin()
+    for key, lease in candidates.items():
+        request = lease['request']
+        if request.get('host') != machine() or request.get('owner') != actor \
+                or request.get('repo') != CONFIG['repo'] or request.get('demand') != {'task:codex': 1} \
+                or type(request.get('task')) is not int or request['task'] <= 0:
+            continue
+        with coordination():
+            issue = read_issue(request['task']); raw = issue_data(issue); slot = raw.get('task_slot')
+            if issue['state'] != 'closed' or raw.get('pm') != actor or not slot \
+                    or slot.get('key') != key or slot.get('request') != request \
+                    or request.get('generation') != raw.get('execution_generation', 0) \
+                    or request.get('repair_count') != len(raw.get('repair_history', [])) \
+                    or raw.get('legacy_recovery') or raw.get('model_recovery'):
+                continue
+            grants = (project.observe(key), host.observe(key))
+            if any(not grant or grant['request'] != request or grant['phase'] not in ('reserved', 'released') for grant in grants):
+                continue
+            turns = [*(raw.get('model_turns') or {}).values(), *raw.get('model_turn_history', [])]
+            if not turns or any(turn.get('phase') != 'complete' for turn in turns):
+                continue
+            if any(identity.get('runtime') != 'codex' or identity.get('name') != machine()
+                   or identity['session'] != ((raw.get('model_turns') or {}).get(role, {}).get('runtime') or {}).get('session')
+                   for role, field in (('worker', 'claim'), ('supervisor', 'supervisor'))
+                   if (identity := raw.get(field) or {}).get('session')):
+                continue
+            verified = True
+            for turn in turns:
+                model = host.observe(turn['key']); shared = project.observe(turn['key'])
+                if not model or not shared or model['request'] != turn['request'] or shared['request'] != turn['request'] \
+                        or model['phase'] != 'released' or shared['phase'] != 'released' \
+                        or model.get('runtime') != turn.get('runtime') or model.get('child') != turn.get('child') \
+                        or model.get('drain') != turn.get('completion') \
+                        or process_state(turn['child']['pid'], turn['child']['birth']) != 'dead' \
+                        or turn in (raw.get('model_turns') or {}).values() and not host.drain_verified(model):
+                    verified = False
+                    break
+            if not verified:
+                continue
+            if slot['phase'] != 'released':
+                raw['task_slot'] = task_slot_transition(slot, 'close')
+                issue = write_task_verified(issue, raw, issue['labels'])
+                if not retire_model_task(raw):
+                    continue
+                fresh = read_issue(request['task'])
+                if fresh['state'] != 'closed' or issue_data(fresh) != raw:
+                    fail('closed task changed during retirement; retain task slot')
+                raw['task_slot'] = task_slot_transition(raw['task_slot'], 'close', retired=True)
+                write_task_verified(fresh, raw, fresh['labels'])
+            host.release(key)
+            project.release(key)
 
 
 def model_reconcile(item):
@@ -2636,7 +2780,7 @@ def model_reconcile_outstanding(delegated_pm=None, separate=False):
         request = lease['request']
         n = request.get('task')
         if type(n) is not int or n <= 0 or request.get('repo') != CONFIG['repo'] \
-                or request.get('demand') != {'model:codex': 1}:
+                or request.get('demand') not in MODEL_DEMANDS:
             continue
         local = host.observe(key)
         if not local or local['phase'] not in ('bound', 'drained', 'released'):
@@ -2693,7 +2837,7 @@ def model_reservation_retry(turn, project, host, n, session, events, role='super
     identity = bool(inputs and session) if not initial else role == 'worker' and session is None and not inputs
     return bool(identity and turn.get('phase') == 'reserving' and 'child' not in turn
                 and role in ('worker', 'supervisor') and request.get('task') == n and request.get('role') == role
-                and request.get('demand') == {'model:codex': 1}
+                and request.get('demand') in MODEL_DEMANDS
                 and (turn.get('runtime') or {}).get('session') == session
                 and turn.get('event_ids') == request.get('events') == [event['id'] for event in events]
                 and turn.get('event_inputs') == inputs
@@ -2812,11 +2956,14 @@ def owned_model_turn(item, kind, role_name, prompt, events=(), resume=None, lega
     if prior and prior['phase'] == 'complete' and prior['event_ids'] == event_ids and prior['event_digest'] == digest:
         return prior['runtime']['session']  # exact already handled input, no new turn
     project, host = model_providers(admission=True)
+    if not task_slot_admit(current, project, host):
+        return None
+    issue = read_issue(item['iid']); raw = issue_data(issue)
     generation = (prior or {}).get('generation', 0) + 1
     request = {'repo': CONFIG['repo'], 'task': item['iid'], 'role': role_name, 'generation': generation,
                'owner': origin(), 'age': raw.get('admission_age', time.time()), 'priority': item['priority'],
                'events': event_ids, 'event_digest': digest, 'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest(),
-               'demand': {'model:codex': 1}}
+               'demand': {'model:codex:supervisor' if role_name == 'supervisor' else 'model:codex': 1}}
     if raw.get('execution_generation'):
         request['execution_generation'] = raw['execution_generation']
     if hasattr(project, 'domain'):
@@ -3597,6 +3744,8 @@ def one_pass(args, table=True):
             board_schema_gate(issues)
             if isinstance(CONFIG.get('capacity'), dict) and 'model:codex' in CONFIG['capacity'].get('host_caps', {}):
                 model_reconcile_outstanding(delegated_pm, separate=model_mode)
+                if 'task:codex' in CONFIG['capacity']['host_caps']:
+                    task_slots_reconcile(delegated_pm)
         items = sorted(filter(None, map(parse, issues)), key=lambda item: (item['priority'], item['iid']))
         if delegated_pm is not None:
             items = [item for item in items if item['pm'] == delegated_pm]
@@ -3853,7 +4002,8 @@ def capacity_reserve(leases, caps, key, request):
                    if v['phase'] not in ('waiting','released')) for r in caps}
     waiting = sorted(((k,v) for k,v in leases.items() if v['phase']=='waiting'),
                      key=lambda pair:(pair[1]['request']['priority'],pair[1]['ticket'],pair[1]['request']['age'],pair[0]))
-    first = next((k for k,v in waiting if all(used[r]+v['request']['demand'].get(r,0)<=cap for r,cap in caps.items())),None)
+    first = next((k for k,v in waiting if any(demand.get(r,0) and v['request']['demand'].get(r,0) for r in caps)
+                  and all(used[r]+v['request']['demand'].get(r,0)<=cap for r,cap in caps.items())),None)
     if first == key:
         value['phase'] = 'reserved'
     return value
@@ -3921,7 +4071,11 @@ class BoardCapacity:
 
     def outstanding_models(self):
         return {key: value for key, value in self.load()[1]['leases'].items()
-                if value['phase'] == 'reserved' and value['request'].get('demand') == {'model:codex': 1}}
+                if value['phase'] == 'reserved' and value['request'].get('demand') in MODEL_DEMANDS}
+
+    def outstanding_tasks(self):
+        return {key: value for key, value in self.load()[1]['leases'].items()
+                if value['phase'] == 'reserved' and value['request'].get('demand') == {'task:codex': 1}}
 
     def change(self,key,request=None):
         issue,value,match = self.load()
@@ -4061,13 +4215,26 @@ class SQLiteCapacity:
         with self.transaction() as db:
             rows = db.execute("SELECT id, body FROM capacity_lease WHERE " + query +
                               " AND json_extract(body, '$.request.repo') = ?"
-                              " AND json_extract(body, '$.request.demand.\"model:codex\"') = 1"
+                              " AND (json_extract(body, '$.request.demand.\"model:codex\"') = 1 OR "
+                              "json_extract(body, '$.request.demand.\"model:codex:supervisor\"') = 1)"
                               " AND (SELECT COUNT(*) FROM json_each(json_extract(body, '$.request.demand'))) = 1"
                               " LIMIT 101", (repo,)).fetchall()
         if len(rows) > 100:
             raise ValueError('outstanding model bound exceeded')
         return {key: value for key, body in rows
-                if (value := json.loads(body))['request'].get('demand') == {'model:codex': 1}}
+                if (value := json.loads(body))['request'].get('demand') in MODEL_DEMANDS}
+
+    def outstanding_tasks(self, repo=None):
+        if self.scope == 'host' and not repo:
+            raise ValueError('host task selection requires project')
+        with self.transaction() as db:
+            rows = db.execute("SELECT id, body FROM capacity_lease WHERE json_extract(body, '$.phase') = 'reserved' "
+                              "AND json_extract(body, '$.request.repo') = ? "
+                              "AND json_extract(body, '$.request.demand.\"task:codex\"') = 1 LIMIT 101",
+                              (self.owner if self.scope == 'project' else repo,)).fetchall()
+        if len(rows) > 100:
+            raise ValueError('outstanding task bound exceeded')
+        return {key: json.loads(body) for key, body in rows}
 
     def reserve(self, key, request):
         with self.transaction() as db:
@@ -4132,7 +4299,7 @@ class SQLiteCapacity:
             value = self.row(db, key)
             demand = ((value or {}).get('request') or {}).get('demand') or {}
             if not value or value['phase'] != 'launching' or not demand \
-                    or demand != {'model:codex': 1} \
+                    or demand not in MODEL_DEMANDS \
                     or value.get('runtime') != runtime or not isinstance(runtime, dict) \
                     or runtime.get('kind') != 'codex-model-turn':
                 raise ValueError('model-only launch binding required')
@@ -4146,7 +4313,7 @@ class SQLiteCapacity:
             demand = ((value or {}).get('request') or {}).get('demand') or {}
             if self.scope != 'host' or not value or value['phase'] not in ('bound', 'drained', 'released') \
                     or value.get('runtime') != runtime or not demand \
-                    or demand != {'model:codex': 1}:
+                    or demand not in MODEL_DEMANDS:
                 raise ValueError('model-only bound grant required')
             proof = model_turn_receipt(runtime, value.get('child'))
             if value['phase'] in ('drained', 'released') and value.get('drain') != proof:
@@ -4174,7 +4341,7 @@ class SQLiteCapacity:
         child=value.get('child') or {}
         if proof.get('kind') == 'model-turn':
             demand = (value.get('request') or {}).get('demand') or {}
-            if demand != {'model:codex': 1} \
+            if demand not in MODEL_DEMANDS \
                     or value['phase'] not in ('drained', 'released'):
                 return False
             try:

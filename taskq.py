@@ -7,7 +7,7 @@ from urllib.parse import quote, urlsplit
 
 # --- config + task model --------------------------------------------------------------------
 
-STATES = ('ready', 'waiting', 'doing', 'review', 'ask', 'later')
+STATES = ('ready', 'waiting', 'doing', 'review', 'ask', 'later', 'failed')
 TYPES = ('code', 'docs', 'research', 'asset')
 FIELDS = ('scope', 'deps', 'claim', 'result', 'supervisor', 'order', 'pm')
 PREFIX, RUN, ON = 'q-', 'run-', 'host-'
@@ -166,6 +166,8 @@ def execution_reason(item):
 
 def execution_policy_reason(item):
     """Fresh board eligibility shared by legacy and explicitly opt-in schema2 handlers."""
+    if item['state'] == 'failed':
+        return f'#{item["iid"]}: failed hold; execution requires separately qualified recovery'
     if not host_scope(item):
         return f'#{item["iid"]}: outside TASKQ_HOST_ONLY={os.environ["TASKQ_HOST_ONLY"]}; execution refused'
     if 'assignee-only' not in item['labels']:
@@ -222,7 +224,7 @@ def event_targets(raw, action, text, actor=None):
     targets, actor = [], actor or session() or {}
     boss, worker = raw.get('supervisor') or {}, raw.get('claim') or {}
     manager = recipient('manager', raw['pm']) if raw.get('pm') else 'manager:*'
-    if action in ('ask', 'close', 'integrated-review') or action == 'result' and not boss or action == 'gone' and (not boss or text.startswith('supervisor ')):
+    if action in ('ask', 'close', 'integrated-review', 'failed') or action == 'result' and not boss or action == 'gone' and (not boss or text.startswith('supervisor ')):
         targets.append(manager)
     if boss.get('session') and action in ('result', 'ask', 'answer', 'gone', 'requeue', 'integrated-review') \
             and not (action in ('ask', 'requeue') and actor.get('session') == boss['session']) \
@@ -1368,6 +1370,7 @@ def cmd_list(args):
     for item in sorted(found, key=lambda item: (STATES.index(item['state']), item['priority'], item['iid'])):
         claim = item['claim'] or {}
         detail = {'ready': 'continue' if claim else '', 'later': item['raw'].get('waiting_for') or '',
+                  'failed': item['raw'].get('failure_reason') or '',
                   'doing': f'{claim.get("runtime")}:{(claim.get("session") or "")[:8]} @{claim.get("name")}' if claim else '',
                   'waiting': f'open dependencies {open_deps(item["deps"])}' if item['state'] == 'waiting' else ''}.get(item['state'], '')
         print(f'#{item["iid"]:<4} {item["state"]:<8} p{item["priority"]} {item["runtime"]:<6} {item["title"]}'
@@ -1399,12 +1402,18 @@ def decision(args):
 # A supervisor asks from review too: a result with options, or the third rework (§ 7 Supervisor).
 DROP = {'claim': None, 'supervisor': None, 'order': None}  # R11: the task's sessions are retired once stopped
 MOVES = {'ask': (('doing', 'review'), 'ask', lambda args: {'decision': decision(args)}), 'answer': (('ask',), 'doing', lambda args: {'decision': None}),
-         'requeue': (STATES, 'ready', lambda args: {**DROP, 'result': None, 'decision': None}),
-         'later': (STATES, 'later', lambda args: {**DROP, 'waiting_for': args.text or None}),
+         'requeue': (tuple(state for state in STATES if state != 'failed'), 'ready', lambda args: {**DROP, 'result': None, 'decision': None}),
+         'later': (tuple(state for state in STATES if state != 'failed'), 'later', lambda args: {**DROP, 'waiting_for': args.text or None}),
+         'failed': (STATES, 'failed', lambda args: {'failure_reason': args.text}),
          'result': (('doing',), 'review', lambda args: {'result': {'sha': args.sha, 'checks': args.checks}, 'decision': decision(args)})}
 
 def cmd_move(args):
     current = parse(read_issue(args.n))
+    if args.command == 'failed':
+        if current and current['raw'].get('event_schema') == 2:
+            fail('schema2 failed classification unsupported; task and grants retained')
+        if not args.text.strip():
+            fail('failed requires a nonblank reason')
     if current and current['raw'].get('event_schema') == 2:
         return queue_move(args, current)
     if args.command == 'result' and not args.sha:
@@ -1430,6 +1439,12 @@ def cmd_move(args):
             fail('ask from ask requires its recorded manager or supervisor and an open submitted result without recovery or acceptance')
     else:
         current = task(args.n, *sources)
+    if args.command == 'failed':
+        actor = session()
+        if actor and (role(current) not in ('manager', 'supervisor') or not any(
+                actor.get('runtime') == (current.get(key) or {}).get('runtime')
+                and actor.get('session') == (current.get(key) or {}).get('session') for key in ('pm', 'supervisor'))):
+            fail('failed requires recorded manager, supervisor or owner shell')
     if args.command == 'result':
         require_controls_applied(current)
     move(current, state, args.command, args.text, **fields(args))
@@ -1480,6 +1495,8 @@ def cmd_requeue(args):
     """Supervised (#525): the supervisor's requeue is a rework (a new worker continues the branch; the third is an ask);
     the worker's drops only its claim and wakes the supervisor; the manager's or owner's drops the supervisor too."""
     current = task(args.n)
+    if current['state'] == 'failed':
+        fail('failed hold requires separately qualified diagnosis/fencing before retry')
     found, claim = role(current), current['claim'] or {}
     if found == 'worker' and (current['supervisor'] or current['raw'].get('model_turns')):
         turn = (current['raw'].get('model_turns') or {}).get('worker')
@@ -1599,7 +1616,7 @@ def cmd_inbox(args):
     target = recipient(selected, raw.get(key)) if key else None
     output = {'type': 'taskq.inbox', 'task': args.n, 'state': current['state'],
               'task_card': {key: current.get(key) for key in ('title', 'text', 'scope', 'deps', 'result')},
-              'decision': raw.get('decision'),
+              'decision': raw.get('decision'), 'failure_reason': raw.get('failure_reason'),
               'schema': raw.get('event_schema', 0), 'revision': control_revision(current, CONFIG),
               'question_revision': question_revision(current), 'recipient': target,
               'pending': event_pending(raw, target) if target else raw.get('events', []),
@@ -3503,6 +3520,8 @@ def stale(by_number):
 
     def gone(name, n, sid, _live):
         current = by_number.get(n)
+        if current and current['state'] == 'failed':
+            return False
         if current and sid in ((current['claim'] or {}).get('session'), (current['supervisor'] or {}).get('session')):
             return False
         if n not in issues:
@@ -3511,6 +3530,8 @@ def stale(by_number):
             except (Exception, SystemExit):
                 issues[n] = None
         fresh = parse(issues[n]) if issues[n] and issues[n]['state'] == 'open' else None
+        if fresh and fresh['state'] == 'failed':
+            return False
         if fresh and sid in ((fresh['claim'] or {}).get('session'), (fresh['supervisor'] or {}).get('session')):
             return False  # a fresh controller/worker is current even when the pass's earlier read held another id
         return bool(issues[n] and host_scope(issues[n]) and recorded(issues[n], name, sid)
@@ -3627,6 +3648,8 @@ def one_pass(args, table=True):
                 if current is None:
                     continue
                 claim = item['claim'] or {}
+                if item['state'] == 'failed':
+                    continue
                 if 'legacy_recovery' in item['raw']:
                     continue
                 if item['raw'].get('event_schema') == 2:
@@ -4883,7 +4906,7 @@ def observe_obligations(items, kinds, here, listed=None):
         fresh.append(item)
         if not mine(item):
             continue  # a fresh transfer is not authority to inspect someone else's runtime
-        if item['state'] == 'later':
+        if item['state'] in ('later', 'failed'):
             continue
         raw = item['raw']
         open_ids = listed if listed is not None else {entry['iid'] for entry in items}
@@ -4956,12 +4979,15 @@ def report(items, listed, kinds, here, problems=None):
                                       'gitlab': f'https://{host or "gitlab.com"}/{repo}/-/issues'}.get(CONFIG['board'])
     lines = [CONFIG['root'].name + (f' · [board]({url})' if url else ''),  # a board file names its page in `board_url`
              f'In work {count("doing", "review")} · Waiting for answer {count("ask")} · Ready {count("ready")}', '']
-    rows = [row(item, kinds, here, states[item['iid']]) for item in items if item['state'] not in ('ask', 'later')]
+    rows = [row(item, kinds, here, states[item['iid']]) for item in items if item['state'] not in ('ask', 'later', 'failed')]
     lines += ['| Task | State | Runtime | Session |', '|---|---|---|---|', *rows, ''] if rows else []  # empty: left out
     cards = decisions(items)
     lines += ['Questions (answer N.M):', '', '| Question | Brief reason | Options |', '|---|---|---|', *cards, ''] if cards else []
     later = [heading(item) for item in items if item['state'] == 'later']
     lines += ['Later: ' + ', '.join(later), ''] if later else []
+    failed = [f'| {heading(item)} | {cell(item["raw"].get("failure_reason") or "reason unavailable")} |'
+              for item in items if item['state'] == 'failed']
+    lines += ['Failed:', '', '| Task | Reason |', '|---|---|', *failed, ''] if failed else []
     if problems:
         lines += ['Проблемы сессий (read-only; references не являются answer tokens):', '',
                   '| Reference / task | Роль / состояние | Свидетельство / проблема | Ответственный / Следующее действие |',
@@ -5118,7 +5144,7 @@ def cmd_wait(args):
                 target = recipient('manager', pm)
                 held = raw.get('supervisor') or raw.get('claim') or {}
                 sid = held.get('session')
-                if issue['state'] == 'open' and (raw.get('supervisor') or item['state'] == 'doing') \
+                if issue['state'] == 'open' and item['state'] != 'failed' and (raw.get('supervisor') or item['state'] == 'doing') \
                         and sid and held.get('name') == here and held.get('runtime') in kinds \
                         and not os.environ.get('CODEX_SANDBOX') and sid not in raw.get('observed_dead', []) \
                         and lead_state(kinds[held['runtime']], sid) == 'dead':
@@ -5128,16 +5154,19 @@ def cmd_wait(args):
                         fresh_item = parse(fresh_issue) if fresh_issue['state'] == 'open' else None
                         if fresh.get('pm') != raw.get('pm') or not selected(fresh):
                             continue  # a new owner is not this observation's delivery recipient
-                        if fresh_item and (fresh.get('supervisor') or fresh_item['state'] == 'doing') \
+                        if fresh_item and fresh_item['state'] != 'failed' and (fresh.get('supervisor') or fresh_item['state'] == 'doing') \
                                 and (fresh.get('supervisor') or fresh.get('claim')) == held and sid not in fresh.get('observed_dead', []):
                             append_event(fresh, 'observed-gone', '', [target])
                             fresh['observed_dead'] = [*fresh.get('observed_dead', []), sid]
                             effect(BOARD.update, issue['iid'], labels=event_labels(fresh, fresh_issue['labels']), body=block(BLOCK.sub('', fresh_issue['body']).strip(), fresh))
                         raw = fresh
+                        item = fresh_item or item
                 for event in event_pending(raw, target):
+                    if item['state'] == 'failed' and event['action'] != 'failed':
+                        continue
                     events.append({'id': f'{issue["iid"]}:{event["id"]}', 'text': event_line(issue['iid'], event, raw.get('event_schema')), 'target': target})
                 continue
-            if issue['state'] != 'open':
+            if issue['state'] != 'open' or item['state'] == 'failed':
                 continue
             claim, boss, state = item['claim'] or {}, item['supervisor'] or {}, item['state']
             if boss:
@@ -5212,6 +5241,8 @@ def wait_task(args):
     while True:
         issue = read_issue(n)
         current = parse(issue) if issue['state'] == 'open' else None
+        if current and current['state'] == 'failed':
+            return print(f'stop #{n}: failed')
         if current and 'legacy_recovery' in current['raw']:
             return print(f'stop #{n}: legacy recovery hold')
         boss = (current or {}).get('supervisor') or {}
@@ -5648,6 +5679,8 @@ def runtime_repair_plan(numbers, force=False, reason='', manager=None, accepted_
         item = parse(issue) if issue.get('state') == 'open' else None
         if not item or item['raw'].get('event_schema') != EVENT_SCHEMA:
             fail(f'#{n}: runtime repair requires a selected open schema{EVENT_SCHEMA} task; review schema repair separately')
+        if item['state'] == 'failed':
+            fail(f'#{n}: failed hold; repair cannot authorize retry or remove required fencing')
         if not mine(item):
             fail(f'#{n}: outside configured selection')
         if reason_blocked := execution_policy_reason(item):
@@ -7250,6 +7283,7 @@ def main(argv=None):
     command('requeue', cmd_requeue, text=True)
     command('run', cmd_run, text=True)
     command('later', cmd_move, text=True)
+    command('failed', cmd_move, text='required')
     command('close', cmd_close, (('n',), {'nargs': '+', 'type': int}), n=False, text=True)
     command('review-integrated', cmd_review_integrated, (('--published-sha',), {'required': True}),
             (('--integration-task',), {'type': int, 'required': True}), (('--source-map',), {'required': True}),
@@ -7362,7 +7396,7 @@ def main(argv=None):
         dispatch_service_gate()
     if args.command == 'wait' and not args.task or args.command == 'tick' and not args.quiet or args.command == 'pm' and args.subscribe is None:
         refresh(args.command == 'pm')
-    writes = args.command in ('add', 'take', 'ask', 'answer', 'steer', 'result', 'requeue', 'run', 'later', 'close', 'review-integrated', 'ack', 'applied', 'apply-event', 'lifecycle') or \
+    writes = args.command in ('add', 'take', 'ask', 'answer', 'steer', 'result', 'requeue', 'run', 'later', 'failed', 'close', 'review-integrated', 'ack', 'applied', 'apply-event', 'lifecycle') or \
         args.command == 'cleanup' and not args.dry_run
     if (writes or args.command in ('migrate','repair') and args.apply or args.command == 'tick' or args.command == 'pm' and args.adopt) and getattr(GUARD, 'held', None):
         raise SystemExit('taskq: another command holds the project guard; a new command must acquire independently')
@@ -7373,7 +7407,7 @@ def main(argv=None):
     try:
         with completion_release(args.command in ('ask', 'result', 'requeue', 'ack', 'applied', 'apply-event')), \
                 coordination() if writes else contextlib.nullcontext():
-            if args.command in ('add','take','ask','answer','steer','result','requeue','run','later','close','review-integrated','cleanup','ack','applied','apply-event','lifecycle') or args.command=='pm' and args.adopt:
+            if args.command in ('add','take','ask','answer','steer','result','requeue','run','later','failed','close','review-integrated','cleanup','ack','applied','apply-event','lifecycle') or args.command=='pm' and args.adopt:
                 board_schema_gate()
             done = args.function(args)
     except SettledError as error:

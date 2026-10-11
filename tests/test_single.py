@@ -1854,6 +1854,156 @@ class TickSetup(Base):
         return [text.split(' ·')[0] for text in self.board.issues[n]['comments']]
 
 
+class Failed(TickSetup):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(taskq, 'session', side_effect=lambda: {
+            'runtime': 'fake', 'session': os.environ['CLAUDE_CODE_SESSION_ID']}
+            if os.environ.get('CLAUDE_CODE_SESSION_ID') else None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fixture(self, state='later'):
+        self.add('unreleased', '--later')
+        raw = self.task(1)['raw']
+        raw.update(claim={'runtime': 'fake', 'session': 'worker', 'name': 'mac'},
+                   supervisor={'runtime': 'fake', 'session': 'supervisor', 'name': 'mac'},
+                   order='rework', result={'sha': 'a' * 40, 'checks': 'retained'},
+                   decision={'summary': 'old question', 'options': ['retry'], 'recommend': 1},
+                   waiting_for='No resume until fencing', model_recovery={'reason': 'unfenced'},
+                   custom={'history': ['retain']}, grants={'resource': 'held'},
+                   session_records=[{'runtime': 'fake', 'session': sid, 'role': role}
+                                    for sid, role in (('old-worker', 'worker'), ('supervisor', 'supervisor'), ('worker', 'worker'))])
+        taskq.append_event(raw, 'ask', 'old question')
+        self.board.issues[1].update(body=taskq.block('original prose', raw), labels=['q-' + state])
+        return json.loads(json.dumps(raw))
+
+    def test_classification_preserves_evidence_without_dispatch(self):
+        before = self.fixture()
+        before['model_turns'] = {'worker': {'phase': 'bound', 'key': 'retained', 'runtime': before['claim']}}
+        self.board.issues[1]['body'] = taskq.block('original prose', before)
+        reason = 'Did not reach release | keep [evidence].\nNo retry; ' + 'full reason ' * 100
+        with mock.patch.object(taskq, 'dispatch', side_effect=AssertionError('dispatch')):
+            self.assertEqual(self.run_cli('failed', '1', '--text', reason), '#1 failed\n')
+        item = self.task(1)
+        self.assertEqual((item['state'], self.board.issues[1]['state']), ('failed', 'open'))
+        for key in ('claim', 'supervisor', 'order', 'result', 'decision', 'waiting_for',
+                    'model_recovery', 'model_turns', 'custom', 'grants', 'session_records', 'action_payloads'):
+            self.assertEqual(item['raw'][key], before[key], key)
+        self.assertEqual(item['text'], 'original prose')
+        self.assertEqual(item['raw']['failure_reason'], reason)
+        self.assertEqual(item['raw']['events'][:-1], before['events'])
+        self.assertEqual(item['raw']['events'][-1]['recipients'], [taskq.recipient('manager', before['pm'])])
+        self.assertEqual(json.loads(self.run_cli('inbox', '1'))['failure_reason'], reason)
+        self.assertIn(reason, self.run_cli('list', 'failed'))
+        report = self.run_cli('status')
+        self.assertIn('In work 0 · Waiting for answer 0 · Ready 0', report)
+        self.assertIn('Failed:', report)
+        self.assertIn(taskq.cell(reason), report)
+        self.assertNotIn('| Task | State |', report)
+        self.assertNotIn('Questions (', report)
+
+    def test_authority_schema_and_reason_refusals_are_effect_free(self):
+        self.fixture()
+        for actor in ('worker', 'foreign'):
+            for supervised in (True, False):
+                original = self.board.issues[1]['body']
+                if not supervised:
+                    raw = self.task(1)['raw']; raw['supervisor'] = None
+                    self.board.issues[1]['body'] = taskq.block('original prose', raw)
+                before = json.dumps(self.board.issues, sort_keys=True)
+                with self.acting(actor), self.assertRaisesRegex(SystemExit, 'failed requires'):
+                    self.run_cli('failed', '1', '--text', 'unreleased')
+                self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+                self.board.issues[1]['body'] = original
+        for text in ('', '   \n'):
+            with self.assertRaisesRegex(SystemExit, 'nonblank'):
+                self.run_cli('failed', '1', '--text', text)
+        with mock.patch.object(taskq, 'session', return_value={'runtime': 'foreign', 'session': SESSION}), \
+                self.assertRaisesRegex(SystemExit, 'failed requires'):
+            self.run_cli('failed', '1', '--text', 'unreleased')
+        original = self.board.get(1)
+        changed = json.loads(json.dumps(original))
+        raw = self.task(1)['raw']; raw['pm']['session'] = 'new-manager'
+        changed['body'] = taskq.block('original prose', raw)
+        with mock.patch.object(taskq, 'read_issue', side_effect=[original, changed]), \
+                mock.patch.object(self.board, 'update', side_effect=AssertionError('stale authority')), \
+                self.assertRaisesRegex(SystemExit, 'failed requires'):
+            taskq.cmd_move(taskq.argparse.Namespace(command='failed', n=1, text='unreleased'))
+        raw = self.task(1)['raw']; raw['event_schema'] = 2
+        self.board.issues[1]['body'] = taskq.block('original prose', raw)
+        with mock.patch.object(taskq, 'queue_move', side_effect=AssertionError('native lifecycle')), \
+                self.assertRaisesRegex(SystemExit, 'schema2'):
+            taskq.cmd_move(taskq.argparse.Namespace(command='failed', n=1, text='unreleased'))
+
+    def test_controller_roles_and_all_sources_use_same_transition(self):
+        for state in taskq.STATES:
+            for actor in (SESSION, 'supervisor', None):
+                self.board.issues.clear()
+                self.fixture(state)
+                with mock.patch.object(taskq, 'session', return_value={'runtime': 'fake', 'session': actor} if actor else None):
+                    self.run_cli('failed', '1', '--text', 'unreleased')
+                self.assertEqual(self.task(1)['state'], 'failed')
+
+    def test_no_outgoing_transition_or_runtime_repair(self):
+        self.fixture()
+        self.run_cli('failed', '1', '--text', 'unreleased')
+        before = json.dumps(self.board.issues, sort_keys=True)
+        for command in (('requeue', '1'), ('later', '1'), ('answer', '1', '--text', 'retry'),
+                        ('ask', '1', '--text', 'retry'), ('result', '1', '--sha', 'b' * 40),
+                        ('run', '1'), ('take', '1'), ('close', '1')):
+            for actor in (SESSION, 'worker', 'supervisor'):
+                with self.acting(actor), self.assertRaises(SystemExit):
+                    self.run_cli(*command)
+                self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        self.board.repair_adapter = mock.Mock()
+        for force in (False, True):
+            with self.assertRaisesRegex(SystemExit, 'failed'):
+                taskq.runtime_repair_plan([1], force=force, reason='retry')
+        self.board.repair_adapter.observe.assert_not_called()
+        self.assertEqual(taskq.repair_plan(), [])
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+
+    def test_tick_and_retirement_leave_failed_sessions_untouched(self):
+        self.fixture()
+        self.run_cli('failed', '1', '--text', 'unreleased')
+        before = json.dumps(self.board.issues[1], sort_keys=True)
+        with mock.patch.object(taskq, 'supervise', side_effect=AssertionError('supervise')), \
+                mock.patch.object(taskq, 'recovery_question', side_effect=AssertionError('recovery')), \
+                mock.patch.object(taskq, 'queue_pass', side_effect=AssertionError('schema2')):
+            self.run_cli('tick', '--unknown-after', '1')
+        self.assertEqual(json.dumps(self.board.issues[1], sort_keys=True), before)
+        self.assertIsNone(taskq.executable(self.board.get(1)))
+        self.assertIn('failed hold', taskq.schema2_execution_reason(self.task(1)))
+        for snapshot in ({1: self.task(1)}, {}):
+            for sid in ('worker', 'supervisor', 'old-worker'):
+                self.assertFalse(taskq.stale(snapshot)('fake', 1, sid, False))
+        self.add('independent')
+        self.assertEqual(self.task(2)['state'], 'doing')
+        self.assertEqual(json.dumps(self.board.issues[1], sort_keys=True), before)
+
+    def test_wait_only_notifies_failure_and_supervisor_stops(self):
+        self.fixture()
+        self.run_cli('failed', '1', '--text', 'unreleased')
+        before = json.dumps(self.board.issues, sort_keys=True)
+        with mock.patch.object(taskq, 'lead_state', side_effect=AssertionError('runtime observation')):
+            out = self.run_cli('wait', '--pm', SESSION, '--window', '0')
+            self.assertRegex(out, r'^failed #1 \[event 1:\d+\]\n$')
+            with self.acting('supervisor'):
+                self.assertEqual(self.run_cli('wait', '--task', '1', '--window', '0'), 'stop #1: failed\n')
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+
+    def test_wait_fresh_failure_suppresses_stale_question_and_gone(self):
+        self.fixture('ask')
+        def fail_during_observation(*_):
+            self.run_cli('failed', '1', '--text', 'unreleased')
+            return 'dead'
+        with mock.patch.object(taskq, 'lead_state', side_effect=fail_during_observation):
+            out = self.run_cli('wait', '--pm', SESSION, '--window', '0')
+        self.assertRegex(out, r'^failed #1 \[event 1:\d+\]\n$')
+        self.assertNotIn('observed_dead', self.task(1)['raw'])
+
+
 class RecoveryTimeout(TickSetup):
     def prepare(self):
         self.add(); self.legacy(1)

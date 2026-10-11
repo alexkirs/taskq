@@ -417,6 +417,26 @@ refuse a mixed incompatible open board. Closed historical issues are retained an
 executed; conversion of closed history and replacement of experimental lifecycle commands
 remain unqualified, rather than claimed as complete repair support.
 
+### Failed classification hold — owner decision 2026-10-12
+
+`failed N --text REASON` classifies an open schema3 task that did not reach release.
+Only its recorded manager, supervisor or the owner shell may classify it; workers and
+foreign sessions cannot. The required nonblank full reason is stored as `failure_reason`,
+separately from `waiting_for`. The issue stays open with `q-failed`; Later means deferred.
+Classification preserves results, identities, order, decisions, recovery markers, turns,
+grants and historical payloads under the existing bounded event protocol. It records a
+manager event but dispatches no pass, stops no runtime and proves no drain or fencing.
+Schema2 classification is unsupported and refuses before native lifecycle handling.
+
+Failed tasks appear separately with their reason, outside work/ready/answer counters.
+The queue never executes, resumes, supervises or retires their recorded sessions. Exact
+model-only settlement remains independent and is not writer/resource drain evidence.
+Manager wait exposes only failure events for a failed task; its older events stay in the
+inbox. Supervisor wait returns `stop #N: failed`. Runtime repair, including force, refuses
+failed tasks. `requeue` and `later` cannot escape this hold: a future retry needs separate
+qualified diagnosis and any required fencing mechanism. Existing no-resume-until-fencing
+instructions remain in force; changing the label does not fence historical writers.
+
 ### General repair and explicit owner reset
 
 Changed (owner direction Sentinel_39a31287a4988191a6e2efb86bf774ec): schema conversion alone
@@ -845,9 +865,9 @@ For an available board the renderer prints:
 2. Exactly three counters: `In work N · Waiting for answer N · Ready N`. In work: `doing` and `review` (a review is
    still in work; its row says `review`). Waiting for answer: `ask`. Ready: `ready` with no dep open in the snapshot
    (a task or an ordinary issue) and a manager (`pm`) that can start it; any other `ready` is blocked, never counted ready. `waiting` and `later` are
-   never ready.
+    never ready; `failed` is excluded from all three counters.
 3. The table of current work `| Task | State | Runtime | Session |`, one row per open task except `ask` (item 4) and
-   `later` (item 5), by priority, then number. A row is `| [#N <title>](<issue url>) | <state> | <runtime> |
+    `later` (item 5) and `failed` (its separate reason-bearing section), by priority, then number. A row is `| [#N <title>](<issue url>) | <state> | <runtime> |
    [<session[:8]>](<link>) |`; a blocked or waiting row names why: `blocked (no manager)`, `blocked (#M open)`,
    `waiting (#M)`.
 4. `Questions (answer N.M):`, then the table `| Question | Brief reason | Options |`, one row per `ask`, and per
@@ -855,6 +875,7 @@ For an available board the renderer prints:
    <option> ★ |` (a review adds `review` after the link); ★ marks the recommended option. The owner answers `N.M`
    only; the manager runs `taskq answer N.M` (§ 7 After each pass).
 5. `Later: [#N <title>](url), ...` on one line.
+   Then `Failed:` with a task/reason table when failures exist.
 6. One mode line: `Mode: events · arm: <arm_tick>`, the report's only field. taskq knows only its event chain (R4); it
    records no sender or timer, so it never fills the field. The executing PM for this explicit project (standalone Codex/Claude has the same role) replaces exactly `<arm_tick>`, nothing else, with one of:
    - `armed, every <interval>`: only when it confirmed its own arming and the interval from evidence it read (its
@@ -1611,6 +1632,7 @@ outcomes closed before its first wait. A custom adapter without it cannot discov
 | `q-ask` | the owner's move: a question | `ask` |
 | `q-review` | result handed in | `result` |
 | `q-later` | parked | `later` |
+| `q-failed` | did not reach release; classification hold | `failed` |
 
 - Other labels: type `code`, `docs`, `research`, `asset`; `priority-1` or `priority-2` (lower first);
   `run-<runtime>` (none: any runtime); `host-<machine>` (none: any machine).
@@ -1669,8 +1691,9 @@ outcomes closed before its first wait. A custom adapter without it cannot discov
 | `taskq answer N.K [M.K ...]` | pick option K of each task's card, all checked first (#490): an `ask` → `doing` with the option's text; a `review` → `close` when the option starts with `close`, else → `doing` with the option's text. Codes may be one quoted string: `'43.1 44.2'` |
 | `taskq result N --sha SHA [--checks C] [--text T] [--option O ..] [--recommend K] [--link URL ..]` | hand in: `doing` → `review`; options: the owner must choose (§ 7) |
 | `taskq run N` | the recorded supervisor orders its worker: `doing` with no worker session, sets `order`; its event pass spawns `T<N>` (§ 7) |
-| `taskq requeue N [--text T]` | drop claim, supervisor and result: any state → `ready`. By the recorded supervisor (rework): keeps `supervisor`, the task goes to `doing` and the next worker is ordered as by `run`; refused once 3 workers were spawned since the last `answer` (ask the owner). By the recorded worker of a supervised task (cannot be done): drops only its claim session; the supervisor gets `requeue #N` |
-| `taskq later N [--text T]` | park: any state → `later`; drops claim and supervisor |
+| `taskq requeue N [--text T]` | drop claim, supervisor and result: any state except `failed` → `ready`. By the recorded supervisor (rework): keeps `supervisor`, the task goes to `doing` and the next worker is ordered as by `run`; refused once 3 workers were spawned since the last `answer` (ask the owner). By the recorded worker of a supervised task (cannot be done): drops only its claim session; the supervisor gets `requeue #N` |
+| `taskq later N [--text T]` | park: any state except `failed` → `later`; drops claim and supervisor |
+| `taskq failed N --text REASON` | classify an open schema3 task as failed, preserving evidence and ownership; recorded controller or owner only; no dispatch |
 | `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
 | `taskq inbox N [--role worker\|supervisor\|manager] [--history]` | read the native task card, revisions, pending controls and retained receipts as JSON; optional native comments/repair audit; no acknowledgement or writes |
 | `taskq steer N --revision HASH --command-id ID --text TEXT` | record idempotent schema3 worker steering from the exact supervisor, manager or owner; a qualified Codex application path is required; delivery is pointer-only and application is explicit |
@@ -1695,6 +1718,7 @@ outcomes closed before its first wait. A custom adapter without it cannot discov
   (`taskq: dispatch stopped: <error>`) go to `.taskq/dispatch.log` and never fail the command. The child reads the
   event's tasks by number: the board's list may not show a write made a second earlier.
 - A command refuses a task in the wrong state and says which state it is in.
+- Failed has no outgoing requeue/Later transition until a separate recovery mechanism is qualified.
 - One controller (R3, #524, #525): `run`, `close` and `requeue` of a task with a `supervisor` come from that
   recorded session. Another agent session is refused (its worker too, except the worker's own `requeue` above),
   except the task's manager (its `pm` session, #532; another manager is refused) on the owner's word and a plain
@@ -2019,9 +2043,9 @@ contract or permission to change the behavior below; implementation follows an a
      wake the supervisor as above; the supervisor decides (rework `requeue` or `ask`). Pending worker answer/steer events or 120 silent minutes → pointer-only wake when confirmed idle; explicit application receipts acknowledge worker controls. Schema3 `nudge:` comments are history only. Running or unknown sessions defer.
    - closed, parked or requeued by the manager, or a replaced session: retire the recorded `S<N>` and `T<N>` once
      stopped (R11; the pass, for every task it lists or reads).
-   `later`, an `ask` of the supervisor: nothing; they wait for the owner.
+   `later`, `failed`, an `ask` of the supervisor: nothing; they wait for the owner. Failed sessions are not retired.
 5. Print the R6 report from the pass's own list, as updated by the pass: project and board, the three counters, the
-   work table, Questions, Later, the mode line. Another machine's claim shows its bare session id: only that machine
+   work table, Questions, Later, Failed, the mode line. Another machine's claim shows its bare session id: only that machine
    can link it. In Questions an image link prints as `![N](url)` (`inline_media`, § 2); a video or page stays a link.
    `taskq status` prints the same report with no pass (§ 4).
 
@@ -2154,6 +2178,7 @@ taskq add "<title>" --type code --goal "<what and why, exact paths, owner decisi
 - `research` and `asset` end with an answer; a task that commits is `code` or `docs`.
 - Irreversible or external steps: the Goal says "if anything differs, do not do it, ask via `ask`".
 - Park: `taskq later N --text "<why>"`; bring back: `taskq requeue N`.
+- Did not reach release: `taskq failed N --text "<why>"`; classification is not cleanup or permission to retry.
 
 ### What the manager does not do
 

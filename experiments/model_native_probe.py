@@ -86,7 +86,7 @@ def ensure_event_label():pass
     (root/'board.py').write_text(source, encoding='utf-8')
     (root/'probe-gate.py').write_text('TASKQ='+repr(str(TASKQ))+'\n'+GATE, encoding='utf-8')
     (root/'taskq.json').write_text(json.dumps({'board': 'board.py', 'repo': 'isolated/board-control-three-turn',
-        'publish': 'direct', 'update': False, 'workspace': 'external', 'codex': ['-s', 'workspace-write'],
+        'publish': 'direct', 'update': False, 'workspace': 'external',
         'limits': {'claude': 0, 'codex': 1}, 'capacity': {'project_caps': {'model:codex': 1},
         'host_caps': {'model:codex': 1, 'heavy': 1}, 'host_path': str(root/'host.sqlite')}}), encoding='utf-8')
     goal = '''Owner-authorized isolated three-turn proof. Work only in this existing checkout.

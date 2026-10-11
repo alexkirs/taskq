@@ -20,6 +20,41 @@ q = f.taskq
 
 
 class ModelInputProperties(unittest.TestCase):
+    def test_native_archive_replay_requires_saved_archived_state(self):
+        raw = {'model_turns': {'worker': {'runtime': {'session': 'exact-native'}}}}
+        for states, code, expected, calls in ((['archived'], 0, True, 0),
+                (['local', 'archived'], 0, True, 1), (['local', None], 0, False, 1),
+                ([None], 1, False, 1)):
+            with self.subTest(states=states, code=code), mock.patch.object(q, 'rollout', side_effect=states), \
+                    mock.patch.object(q.subprocess, 'run', return_value=mock.Mock(returncode=code)) as archive, \
+                    mock.patch.object(q, 'effect', side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
+                self.assertEqual(q.retire_model_task(raw), expected)
+                self.assertEqual(archive.call_count, calls)
+                if calls: self.assertEqual(archive.call_args.args[0][-2:], ['archive', 'exact-native'])
+
+    def test_stale_task_waiter_does_not_starve_independent_model_pools(self):
+        leases = {}; caps = {'task:codex': 1, 'model:codex': 1, 'model:codex:supervisor': 1}
+        request = {'age': 1, 'priority': 0, 'demand': {'task:codex': 1}}
+        self.assertEqual(q.capacity_reserve(leases, caps, 'task1', request)['phase'], 'reserved')
+        self.assertEqual(q.capacity_reserve(leases, caps, 'task2', request)['phase'], 'waiting')
+        leases['task1']['phase'] = 'released'
+        for dimension in ('model:codex', 'model:codex:supervisor'):
+            self.assertEqual(q.capacity_reserve(leases, caps, dimension,
+                             {**request, 'demand': {dimension: 1}})['phase'], 'reserved')
+        self.assertEqual(q.capacity_reserve(leases, caps, 'task3', request)['phase'], 'waiting')
+        self.assertEqual(q.capacity_reserve(leases, caps, 'task2', request)['phase'], 'reserved')
+
+    def test_task_slot_kernel_holds_until_retirement_and_replays_release(self):
+        slot = {'key': 'task', 'request': {}, 'phase': 'reserving'}
+        self.assertEqual(q.task_slot_transition(slot, 'admit'), slot)
+        active = q.task_slot_transition(slot, 'admit', admitted=True)
+        retiring = q.task_slot_transition(active, 'close')
+        self.assertEqual(retiring['phase'], 'retiring')
+        released = q.task_slot_transition(retiring, 'close', retired=True)
+        self.assertEqual(q.task_slot_transition(released, 'close'), released)
+        for action in ('ask', 'failed', 'answer', 'result'):
+            with self.assertRaises(ValueError): q.task_slot_transition(active, action, retired=True)
+
     def test_prompt_sources_are_exact_bounded_and_never_infer_execution_permission(self):
         pair = {'commit': 'a' * 40, 'contract': 'b' * 64}
         self.assertEqual(q.model_prompt_sources([pair], [pair]), [pair])
@@ -191,10 +226,10 @@ class ModelIntegration(unittest.TestCase):
         prior = q.CONFIG, q.BOARD
         self.addCleanup(lambda: self.restore(prior))
         q.CONFIG = {'root': self.root, 'board': 'fixture.py', 'repo': 'fixture/model', 'publish': 'direct',
-                    'limits': {'codex': 1}, 'hosts': {}, 'capacity': {'project_caps': {'model:codex': 1},
-                    'host_caps': {'model:codex': 1, 'heavy': 1}, 'host_path': str(self.root / 'host.sqlite')}}
+                    'limits': {'codex': 1}, 'hosts': {}, 'capacity': {'project_caps': {'model:codex': 1, 'model:codex:supervisor': 1, 'task:codex': 1},
+                    'host_caps': {'model:codex': 1, 'model:codex:supervisor': 1, 'task:codex': 1, 'heavy': 1}, 'host_path': str(self.root / 'host.sqlite')}}
         self.board = q.BOARD = f.FakeBoard()
-        self.project = q.SQLiteCapacity(self.root / 'project.sqlite', 'project', 'fixture/model', {'model:codex': 1})
+        self.project = q.SQLiteCapacity(self.root / 'project.sqlite', 'project', 'fixture/model', q.CONFIG['capacity']['project_caps'])
         self.board.capacity_provider = lambda caps: self.project
         self.actor = {'runtime': 'codex', 'session': 'fixture-controller', 'name': q.machine()}
         self.identity = dict(self.actor)
@@ -206,8 +241,13 @@ class ModelIntegration(unittest.TestCase):
         self.raw = {'event_schema': q.EVENT_SCHEMA, 'event_seq': 0, 'events': [], 'scope': ['artifact.txt'],
                     'deps': [], 'claim': {'runtime': 'codex', 'session': None, 'name': q.machine()},
                     'supervisor': self.actor, 'pm': self.actor, 'order': 'run', 'result': None}
-        self.board.add('model fixture', q.block('synthetic', self.raw), ['q-doing'])
+        self.board.add('model fixture', q.block('synthetic', {**self.raw, 'supervisor': None}), ['q-doing'])
+        with q.coordination():
+            q.task_slot_admit(self.item(), self.project, self.host())
+        self.board.update(1, body=q.block('synthetic', {**self.raw, 'task_slot': self.item()['raw']['task_slot']}))
         self.kind = q.Codex(); self.children = []; self.launches = 0
+        guard = mock.patch.object(self.kind, 'exec', side_effect=AssertionError('unexpected real Codex execution'))
+        guard.start(); self.addCleanup(guard.stop)
         self.addCleanup(self.cleanup)
 
     def restore(self, prior):
@@ -218,16 +258,61 @@ class ModelIntegration(unittest.TestCase):
             if child.poll() is None: child.kill()
             child.communicate(timeout=5)
 
+    def test_supervisor_pool_remains_available_with_full_worker_pool(self):
+        host = self.host()
+        worker = {'repo': q.CONFIG['repo'], 'age': 1, 'priority': 0, 'demand': {'model:codex': 1}}
+        self.assertEqual(host.reserve('worker', worker)['phase'], 'reserved')
+        supervisor = {**worker, 'demand': {'model:codex:supervisor': 1}}
+        self.assertEqual(host.reserve('supervisor', supervisor)['phase'], 'reserved')
+        self.assertEqual(host.reserve('next-worker', worker)['phase'], 'waiting')
+        self.assertEqual(host.reserve('next-supervisor', supervisor)['phase'], 'waiting')
+
+    def test_existing_active_task_slot_cannot_recreate_missing_grant(self):
+        with q.coordination():
+            self.assertTrue(q.task_slot_admit(self.item(), self.project, self.host()))
+            slot = self.item()['raw']['task_slot']
+            self.host().release(slot['key'])
+        with self.assertRaisesRegex(SystemExit, 'active task grant'), q.coordination():
+            q.task_slot_admit(self.item(), self.project, self.host())
+        self.assertEqual(self.host().observe(slot['key'])['phase'], 'released')
+
+    def test_repair_cannot_reuse_task_slot_after_erasing_turn_obligations(self):
+        before = self.item()['raw']
+        for fields in ({'execution_generation': 1}, {'repair_history': [{'historical_drain_proven': False}]}):
+            self.board.update(1, body=q.block('synthetic', {**before, **fields}))
+            with self.assertRaisesRegex(SystemExit, 'task slot ownership changed'), q.coordination():
+                q.task_slot_admit(self.item(), self.project, self.host())
+            self.assertEqual(self.host().observe(before['task_slot']['key'])['phase'], 'reserved')
+
+    def test_preexisting_model_owner_blocks_new_task_admission(self):
+        prior = {**self.raw, 'supervisor': {**self.actor, 'name': 'another-host'}}
+        self.board.add('preexisting', q.block('fixture', prior), ['q-review'])
+        self.board.add('new task', q.block('fixture', {**self.raw, 'supervisor': None}), ['q-ready'])
+        with q.coordination(), self.assertRaisesRegex(SystemExit, 'explicit task-capacity reconciliation'):
+            q.task_slot_admit(q.parse(self.board.get(3)), self.project, self.host())
+        self.assertNotIn('task_slot', q.issue_data(self.board.get(3)))
+
+    def test_old_parked_ask_is_quarantined_but_never_silently_admitted(self):
+        self.board.add('old ask', q.block('fixture', self.raw), ['q-ask'])
+        old = self.board.get(2)
+        self.board.add('new task', q.block('fixture', {**self.raw, 'supervisor': None}), ['q-ready'])
+        with q.coordination():
+            self.assertFalse(q.task_slot_admit(q.parse(self.board.get(3)), self.project, self.host()))
+        self.assertEqual(self.board.get(2), old)
+        with mock.patch.object(self.board, 'list', return_value=[]), \
+                self.assertRaisesRegex(SystemExit, 'explicit task-capacity reconciliation'), q.coordination():
+            q.task_slot_admit(q.parse(self.board.get(2)), self.project, self.host())
+
     def host(self):
         return q.SQLiteCapacity(pathlib.Path(q.CONFIG['capacity']['host_path']), 'host', q.machine(), q.CONFIG['capacity']['host_caps'])
 
     def item(self):
         return q.parse(self.board.get(1))
 
-    def test_one_pass_fills_four_and_terminal_release_admits_fifth(self):
-        q.CONFIG.update(limits={'codex':4},capacity={'project_caps':{'model:codex':8},
-            'host_caps':{'model:codex':4},'host_path':str(self.root/'host4.sqlite')})
-        self.project=q.SQLiteCapacity(self.root/'project8.sqlite','project','fixture/model',{'model:codex':8})
+    def test_four_tasks_hold_through_review_until_verified_close_retirement(self):
+        q.CONFIG.update(limits={'codex':4},capacity={'project_caps':{'model:codex':8,'model:codex:supervisor':8,'task:codex':8},
+            'host_caps':{'model:codex':4,'model:codex:supervisor':4,'task:codex':4},'host_path':str(self.root/'host4.sqlite')})
+        self.project=q.SQLiteCapacity(self.root/'project8.sqlite','project','fixture/model',q.CONFIG['capacity']['project_caps'])
         self.board.issues.clear()
         for n in range(1,6):
             self.board.add('finite '+str(n),q.block('g',{'scope':[],'deps':[],'claim':None,'result':None,
@@ -246,7 +331,8 @@ class ModelIntegration(unittest.TestCase):
         with mock.patch.object(q,'local_limits',return_value={'codex':4}), \
                 mock.patch.object(q,'runtimes',return_value={'codex':self.kind}), \
                 mock.patch.object(self.kind,'spawn',side_effect=launch), \
-                mock.patch.object(q,'supervise'),mock.patch.object(q,'retire'):
+                mock.patch.object(q,'supervise'),mock.patch.object(q,'retire'), \
+                mock.patch.object(q,'retire_model_task',return_value=False) as retirement:
             q.one_pass(args,False)
             self.assertEqual(sorted(children),[1,2,3,4])
             first=self.item()['raw']['model_turns']['supervisor']
@@ -256,7 +342,15 @@ class ModelIntegration(unittest.TestCase):
             q.one_pass(args,False)
             self.assertEqual(sorted(children),[1,2,3,4])
             with logs[1].open('a') as stream:stream.write('{"type":"turn.completed"}\n')
+            for state in ('review','ask','failed'):
+                self.board.issues[1]['labels']=['q-'+state,'run-codex']
+                q.one_pass(args,False)
+                self.assertEqual(sorted(children),[1,2,3,4])
+                self.assertEqual(self.host().observe(self.item()['raw']['task_slot']['key'])['phase'],'reserved')
             self.board.issues[1]['state']='closed'
+            q.one_pass(args,False)
+            self.assertEqual(sorted(children),[1,2,3,4])
+            retirement.return_value=True
             q.one_pass(args,False)
             self.assertEqual(sorted(children),[1,2,3,4,5])
             self.assertEqual(self.host().observe(first['key'])['phase'],'released')
@@ -386,6 +480,7 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
             time.sleep(.15)
         args = argparse.Namespace(headless=False, tasks=[], unknown_after=None, execution_scope=None)
         with mock.patch.object(board, 'get', side_effect=get), mock.patch.object(q, 'model_reconcile_outstanding'), \
+                mock.patch.object(q, 'task_slots_reconcile'), \
                 mock.patch.object(q, 'runtimes', return_value={'codex': self.kind}), \
                 mock.patch.object(q, 'supervise', side_effect=slow_step), mock.patch.object(q, 'retire'):
             q.one_pass(args, False)
@@ -396,8 +491,8 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
 
     def waiting_supervisor(self):
         host = self.host()
-        blocker = {'repo': q.CONFIG['repo'], 'task': 99, 'role': 'worker',
-                   'demand': {'model:codex': 1}, 'age': 0, 'priority': 0}
+        blocker = {'repo': q.CONFIG['repo'], 'task': 99, 'role': 'supervisor',
+                   'demand': {'model:codex:supervisor': 1}, 'age': 0, 'priority': 0}
         host.reserve('blocker', blocker)
         with q.coordination():
             q.move(self.item(), 'review', 'result', 'review fixture', order=None,
@@ -755,8 +850,8 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
         with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=AssertionError('unsafe resume')):
             with self.assertRaises(SystemExit): q.owned_model_turn(self.item(), self.kind, 'worker', 'without order', resume=self.item()['claim']['session'])
 
-    def test_larger_provider_cannot_bypass_local_model_limit(self):
-        q.CONFIG['capacity']['host_caps']['model:codex'] = 2
+    def test_larger_provider_cannot_bypass_local_task_limit(self):
+        q.CONFIG['capacity']['host_caps']['task:codex'] = 2
         with self.assertRaises(SystemExit), mock.patch.object(self.kind, 'spawn', side_effect=AssertionError('spawn')):
             q.owned_model_turn(self.item(), self.kind, 'worker', 'synthetic')
         self.assertNotIn('model_turns', self.item()['raw'])

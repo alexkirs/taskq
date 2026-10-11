@@ -318,11 +318,28 @@ checkout: it reads the nearest `taskq.json` from the current directory up; that 
 
 ### Current schema policy — owner decision 2026-10-10
 
-Changed (R1/R2/R4/R12, owner turn-budget decision 2026-10-10): runtime limit held by
-task until close -> active model-turn concurrency. Task/session ownership is a separate
+Changed (R1/R2/R4/R12, owner decision 2026-10-12): `limits.codex=N` admits at most N
+tasks on the participating host. Provision finite `task:codex` project/host capacity
+separately from worker `model:codex` and supervisor `model:codex:supervisor` turns.
+A task reserves its lifetime slot before its supervisor starts and retains it through
+execution, review, rework and merge. Model completion releases only that turn's grant.
+The supervisor never consumes worker model capacity. Existing admitted tasks are
+followed before new tasks are prepared. Changed provider caps require explicit
+reconciliation/provisioning; old capacity grants remain readable for settlement.
+Close releases the lifetime slot after every recorded native turn settles and the
+recorded sessions have verified native saved-session archive state; an already archived
+session is an idempotent retirement replay, and archive failure/unknown readback holds.
+A repair generation/history change cannot reuse or release earlier task grants without
+explicit reconciliation of their retirement obligations. A failed or parked ask retains its slot until
+writer retirement is proved; ordinary Codex currently has no qualified detached-writer
+fencing adapter for these transitions, so they remain held. An answered held ask keeps
+its slot and worker identity. A future qualified park release must require fresh
+admission before answer execution. Neither labels nor CLI completion prove detached
+writer drain. Unknown identity, launch, settlement or retirement retains capacity.
+Task/session ownership is a separate
 board invariant: an idle task retains its exact worker, pending messages and no-replacement
 barrier. Project and explicitly participating host model grants count active TaskQ-owned
-turns, including supervisors. A correlated terminal turn plus its exact CLI PID/birth death
+turns in separate worker/supervisor pools. A correlated terminal turn plus its exact CLI PID/birth death
 may release only a model grant. It never proves artifact acceptance, application of an
 answer, application-writer drain or settlement of heavy/GPU/job resources. Unknown turn
 completion retains its model grant; unknown tool/resource effects retain their own lease
@@ -341,7 +358,7 @@ finite tool/resource profile; its completion cannot stand in for model-turn evid
 
 Changed (owner multi-host decision 2026-10-11, R1/R4): an invocation-local limit
 is the ceiling for its participating host, not the shared project. A provisioned
-host model capacity exceeding that invocation's limit refuses admission. The
+host task capacity exceeding that invocation's limit refuses admission. The
 independently provisioned finite project ceiling may exceed one host's ceiling:
 Mac4 plus Windows4 may share project8. Both authorities still reserve every turn;
 neither limit rewrites the other and neither has an unlimited fallback.
@@ -1485,12 +1502,27 @@ no automatic retry or rollback erases acknowledged work. Closed history is not r
 | `glab_client_id` | Self-managed GitLab: the OAuth Application ID users give `glab` before login (§ 1) | none |
 | `publish` | `direct` or `pr` (§ 6) | `direct` |
 | `workspace` | `external`: the host owns the worker's worktree and branch `taskq-<N>`; taskq never creates or removes them (§ 5, § 6) | taskq-owned `.worktrees/taskq-<N>` |
-| `limits` | Workers per runtime on this machine; `0` turns a runtime off | 1 per runtime |
+| `limits` | Tasks per runtime on this machine; Codex holds its task slot through close retirement; `0` turns a runtime off | 1 per runtime |
 | `hosts` | Hostname → machine name; `TASKQ_HOST` overrides the hostname | hostname up to the first dot |
 | `runtimes` | Extra runtimes: `{"name": "runtimes/name.py"}` | none |
 | `permission_mode` | Claude worker permission mode | `dontAsk` |
 | `codex` | Options of `codex exec`, replacing the complete default; an explicit `workspace-write` override needs network access and `--add-dir` for required worktree/git paths (the project instructions name them) | `-s danger-full-access` on every host (R9) |
 | `pages` | Base URL of `open.html`, the Codex link page | `https://alexkirs.github.io/taskq/` |
+
+Owned Codex admission requires explicit finite capacity in both authorities. For
+Windows4 plus Mac4, provision project caps `{"task:codex":8,"model:codex":8,"model:codex:supervisor":8}`
+and each host caps `{"task:codex":4,"model:codex":4,"model:codex:supervisor":4}`, with
+`limits.codex=4` on each host. Worker and supervisor model caps are independent of the
+task count. This configuration is an example, not permission to change a live ledger.
+Capacity FIFO precedence applies to requests sharing a demanded resource; a waiting
+task ticket cannot block an independent worker or supervisor model pool.
+Before cutover account for or fence every `doing`/`review` Codex owner across the
+project, including owners without native turn metadata; they block new admission with
+the issue number. Older parked asks remain quarantined outside the new task-slot cohort,
+untouched and unable to resume automatically. Attempting to admit any existing owner
+without its task slot refuses regardless of state or list visibility. The N-task bound
+covers participants in this admission protocol, not all historical tasks or detached
+writers; no lease or fencing proof is inferred for quarantined owners.
 | `board_url` | Board link a board file prints in the tick | GitHub/GitLab issues page |
 | `inline_media` | `false`: the Questions of the report (R6) print image links as plain links, not `![](url)` (where the surface does not render them) | `true` |
 | `assignee` | `"me"` (the board's logged-in user) or a login: `tick` starts, and `tick`/`wait`/`list` show, only tasks assigned to it; unassigned tasks are skipped (#480) | unset: every task |

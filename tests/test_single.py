@@ -3105,6 +3105,22 @@ class Tick(TickSetup):
         self.assertNotIn('stop it there', self.board.issues[1]['comments'][-1])
         self.assertEqual(self.board.issues[2]['comments'][-1], '**close** · claude:01234567\n\nsession s-T2 runs on win: stop it there')
 
+    def test_managed_close_preserves_live_worker_for_native_terminal_receipt(self):
+        self.unmanaged()
+        for managed in (False, True):
+            with self.subTest(managed=managed):
+                self.add()
+                n = len(self.board.issues)
+                self.legacy(n)
+                taskq.move(self.task(n), 'review', 'result', result={'sha': 'a' * 40},
+                           task_slot={'phase': 'active'} if managed else None)
+                with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), \
+                        mock.patch.object(taskq, 'retire') as retire:
+                    self.run_cli('close', str(n))
+                close_calls = [call for call in retire.call_args_list if call.args[1] == f'#{n}: could not stop its sessions']
+                self.assertEqual(len(close_calls), 1)
+                self.assertEqual(close_calls[0].kwargs['running'], not managed)
+
     def test_tick_removes_stopped_sessions_of_closed_tasks(self):
         # R11 (#525): by recorded id only: a stopped session its closed task records goes; a name alone or a running one stays
         for title in ('one', 'two', 'three'):
@@ -6411,16 +6427,16 @@ class ProjectBootstrap(Base):
 class Model(Base):
 
     def test_project_capacity_can_span_hosts_without_overriding_local_host_limit(self):
-        taskq.CONFIG.update(repo='o/r', capacity={'project_caps': {'model:codex': 8},
-                            'host_caps': {'model:codex': 4}, 'host_path': str(self.root / 'host.db')})
-        provider = mock.Mock(scope='project', owner='o/r', caps={'model:codex': 8})
+        taskq.CONFIG.update(repo='o/r', capacity={'project_caps': {'model:codex': 8, 'model:codex:supervisor': 8, 'task:codex': 8},
+                            'host_caps': {'model:codex': 4, 'model:codex:supervisor': 4, 'task:codex': 4}, 'host_path': str(self.root / 'host.db')})
+        provider = mock.Mock(scope='project', owner='o/r', caps=taskq.CONFIG['capacity']['project_caps'])
         taskq.BOARD.capacity_provider = mock.Mock(return_value=provider)
         with mock.patch.dict(os.environ, {'TASKQ_LIMITS': '{"codex":4,"claude":0}'}), \
                 mock.patch.object(taskq, 'SQLiteCapacity') as host:
             project, _ = taskq.model_providers(admission=True)
             self.assertIs(project, provider)
-            host.assert_called_once_with(str(self.root / 'host.db'), 'host', taskq.machine(), {'model:codex': 4})
-            taskq.CONFIG['capacity']['host_caps']['model:codex'] = 5
+            host.assert_called_once_with(str(self.root / 'host.db'), 'host', taskq.machine(), taskq.CONFIG['capacity']['host_caps'])
+            taskq.CONFIG['capacity']['host_caps']['task:codex'] = 5
             with self.assertRaisesRegex(SystemExit, 'exceeds invocation limit'):
                 taskq.model_providers(admission=True)
             self.assertEqual(host.call_count, 1)

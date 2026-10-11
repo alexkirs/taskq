@@ -193,6 +193,7 @@ class ModelIntegration(unittest.TestCase):
                                   rework_rejection=item['raw']['event_seq']), sid
 
     def test_explicit_rejected_result_rework_same_identity_and_idempotent_application(self):
+        q.CONFIG['workspace'] = 'external'
         args, sid = self.rejected_fixture(); old = self.item()['raw']; boss = old['supervisor']
         with q.coordination(): q.cmd_answer(args)
         raw = self.item()['raw']
@@ -260,6 +261,12 @@ class ModelIntegration(unittest.TestCase):
         self.assertEqual(converted['event_schema'], 3)
 
     def test_applied_requires_native_identity_exact_commit_and_repeat_is_no_write(self):
+        self.exercise_applied()
+
+    def test_applied_uses_registered_worker_worktree_not_main_checkout(self):
+        self.exercise_applied(worktree=True)
+
+    def exercise_applied(self, worktree=False):
         self.start(); self.complete()
         with q.coordination():
             q.move(self.item(), 'ask', 'ask', 'choose')
@@ -270,7 +277,14 @@ class ModelIntegration(unittest.TestCase):
         git = ['git', '-C', str(self.root)]
         for argv in (['init', '-q'], ['config', 'user.name', 'Fixture'], ['config', 'user.email', 'fixture@example.invalid']):
             subprocess.run(git+argv, check=True, capture_output=True)
-        (self.root/'artifact.txt').write_text('chosen value')
+        workspace = self.root
+        if worktree:
+            subprocess.run(git+['commit', '--allow-empty', '-qm', 'project baseline'], check=True)
+            workspace = self.root/'.worktrees/taskq-1'
+            workspace.parent.mkdir()
+            subprocess.run(git+['worktree', 'add', '-qb', 'taskq-1', str(workspace)], check=True)
+            git = ['git', '-C', str(workspace)]
+        (workspace/'artifact.txt').write_text('chosen value')
         subprocess.run(git+['add', 'artifact.txt'], check=True)
         subprocess.run(git+['commit', '-qm', 'synthetic artifact'], check=True)
         sha = subprocess.check_output(git+['rev-parse', 'HEAD'], text=True).strip()
@@ -283,11 +297,29 @@ class ModelIntegration(unittest.TestCase):
         self.board.issues[1]['body'] = q.block('synthetic', changed)
         with self.assertRaises(SystemExit): q.cmd_applied(args)
         self.board.issues[1] = issue
+        scoped = q.issue_data(issue)
+        scoped['scope'] = ['other.txt']
+        self.board.issues[1]['body'] = q.block('synthetic', scoped)
+        with self.assertRaises(SystemExit): q.cmd_applied(args)
+        scoped['scope'] = []  # ordinary intake default: no expected paths named
+        self.board.issues[1]['body'] = q.block('synthetic', scoped)
+        if not worktree:
+            before = json.dumps(self.board.issues, sort_keys=True)
+            with self.assertRaises(SystemExit): q.cmd_applied(args)  # missing built-in tree never falls back to main
+            self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+            q.CONFIG['workspace'] = 'external'
+        for path in ('../artifact.txt', str(workspace/'artifact.txt')):
+            with self.assertRaises(SystemExit):
+                q.cmd_applied(argparse.Namespace(event=args.event, artifact=path, sha=sha))
+        if worktree:
+            subprocess.run(git+['checkout', '-qb', 'foreign-task'], check=True)
+            with self.assertRaises(SystemExit): q.cmd_applied(args)
+            subprocess.run(git+['checkout', '-q', 'taskq-1'], check=True)
         with q.coordination(): q.cmd_applied(args)
         before = json.dumps(self.board.issues, sort_keys=True)
         with q.coordination(): q.cmd_applied(args)
         self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
-        (self.root/'artifact.txt').write_text('changed')
+        (workspace/'artifact.txt').write_text('changed')
         with self.assertRaises(SystemExit): q.cmd_applied(args)
         self.complete()
 

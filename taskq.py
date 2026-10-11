@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
-import argparse, contextlib, glob, hashlib, importlib.util, io, json, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, uuid
+import argparse, contextlib, glob, hashlib, importlib.util, io, json, os, re, shlex, shutil, signal, socket, sqlite3, subprocess, sys, tempfile, threading, time, uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 # --- config + task model --------------------------------------------------------------------
 
@@ -44,7 +44,8 @@ def load_config(start=None):
                 continue  # a worker's .worktrees/taskq-<N>: the root is the main checkout above it (#333)
             config = {'board': 'github', 'publish': 'direct', **json.loads((folder / 'taskq.json').read_text('utf-8')), 'root': folder}
             return config if config['publish'] in ('direct', 'pr') else fail(f'publish {config["publish"]!r}: use "direct" or "pr"')
-    fail('no taskq.json in this directory or above')
+    fail('no taskq.json in this directory or above; preview setup with taskq pm --setup PATH --name NAME '
+         '--provider github|gitlab --repo namespace/name --host HOST')
 
 def machine():
     name = os.environ.get('TASKQ_HOST') or socket.gethostname()
@@ -4357,6 +4358,12 @@ def dispatch(command, tasks, after=None, after_birth=None):
     if reason:
         print(f'taskq: dispatch stopped: {reason}', file=sys.stderr)
         return
+    try:
+        if dispatch_service_owned():
+            return  # service cadence owns admission; task mutations/receipts remain native
+    except (ValueError, OSError, sqlite3.Error) as error:
+        print(f'taskq: service ownership unknown: {error}; no detached dispatch', file=sys.stderr)
+        return
     if os.environ.get('CODEX_SANDBOX'):  # a sandboxed Codex worker can neither start codex nor see other sessions' pids:
         return  # its pass would requeue live tasks as gone and spawn workers that die at once (#269 run 4b)
     try:
@@ -4374,6 +4381,43 @@ def dispatch(command, tasks, after=None, after_birth=None):
 
 start_pass = subprocess.Popen  # tests run the child's pass in process
 
+def service_module():
+    path = CLONE / 'host_service.py'
+    if path.is_symlink() or not path.is_file():
+        fail('selected release has no regular host_service.py')
+    spec = importlib.util.spec_from_file_location('taskq_host_service', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+class ServiceRuntime:
+    # runpy/test loading need not register this module in sys.modules.
+    def __getattr__(self, name):
+        return globals()[name]
+    def __setattr__(self, name, value):
+        globals()[name] = value
+
+def dispatch_service_owned():
+    path = CONFIG['root'] / '.taskq' / 'dispatch-owner.sqlite'
+    if not path.exists():
+        return False
+    host_service = service_module()
+    import sqlite3
+    if path.is_symlink():
+        fail('dispatch ownership symlink refused')
+    with contextlib.closing(sqlite3.connect(f'{path.as_uri()}?mode=ro', uri=True)) as db:
+        return host_service.read_state(db)['phase'] != 'legacy'
+
+def dispatch_service_gate():
+    if not (CONFIG['root'] / '.taskq' / 'dispatch-owner.sqlite').exists():
+        return
+    host_service = service_module()
+    state, birth = process_identity(os.getpid())
+    try:
+        host_service.gate(CONFIG['root'], {'pid': os.getpid(), 'birth': birth} if state == 'running' else None)
+    except (ValueError, OSError, sqlite3.Error) as error:
+        fail(str(error))
+
 def event_pass(args):
     """`tick --quiet`: the tick pass without the table. `--after PID --after-birth ID`: first wait for that Codex turn to end (R4 #525).
     A failed pass exits nonzero and logs its blocker; the detached parent mutation remains settled."""
@@ -4385,6 +4429,7 @@ def event_pass(args):
             if state == 'dead':
                 break
             time.sleep(5)
+        dispatch_service_gate()
         cmd_tick(args, table=False)
     except (SystemExit, Exception) as error:
         print(f'taskq: dispatch stopped: {str(error).removeprefix("taskq: ")}; resolve the blocker, then run a fresh tick', file=sys.stderr)
@@ -4950,7 +4995,7 @@ def verify_release(release, commit, upstream):
     update_git(release, 'merge-base', '--is-ancestor', commit, 'refs/remotes/origin/main')
     if update_git(release, 'rev-parse', 'HEAD') != commit or update_git(release, 'status', '--porcelain', '--untracked-files=all'):
         fail('update release verification failed; preserving it and the pointer')
-    for name in ('taskq.py', 'taskq.md'):
+    for name in ('taskq.py', 'taskq.md', *(['host_service.py'] if (release / 'host_service.py').exists() else [])):
         entry = update_git(release, 'ls-tree', 'HEAD', '--', name)
         if not entry.startswith(('100644 ', '100755 ')) or (release / name).is_symlink() or not (release / name).is_file():
             fail(f'update release has no regular {name}; pointer unchanged')
@@ -4961,6 +5006,8 @@ def verify_release(release, commit, upstream):
 def update_host():
     if sys.platform == 'win32':
         return 'win'
+    if sys.platform == 'darwin':
+        return 'mac'
     if sys.platform == 'linux' and 'microsoft' in os.uname().release.lower():
         return 'wsl'
     return None
@@ -5304,6 +5351,647 @@ def render_subscription(wire, output_format='json'):
     return '\n'.join(lines)
 
 
+def bootstrap_hash(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
+def bootstrap_git(root, *arguments, optional=False):
+    if any(os.environ.get(key) for key in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS')):
+        fail('setup requires an ordinary Git environment without repository/config overrides')
+    done = subprocess.run([shutil.which('git') or fail('git not found'), '--no-optional-locks', '-c', 'core.fsmonitor=false',
+                           '-C', str(root), *arguments],
+                          capture_output=True, text=True, encoding='utf-8', timeout=30, **no_window())
+    if done.returncode and not optional:
+        fail(f'setup git {arguments[0]} failed: {last_line(done.stderr)}')
+    return done.stdout.strip() if not done.returncode else None
+
+
+def bootstrap_git_root(root):
+    for name in ('', 'config', 'index', 'HEAD', 'commondir'):
+        path = root / '.git' / name
+        if path.is_symlink() or path.exists() and getattr(path.lstat(), 'st_file_attributes', 0) & 0x400:
+            fail('setup refuses linked Git metadata; select an independent main repository')
+    common = Path(bootstrap_git(root, 'rev-parse', '--git-common-dir'))
+    if (common if common.is_absolute() else root / common).resolve() != root / '.git':
+        fail('setup Git common directory is outside the selected root; preserve it and choose its main repository')
+
+
+def bootstrap_local(root):
+    """Bound approval to the selected folder; never follow an ancestor project or a worktree."""
+    if any(os.environ.get(key) for key in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS')):
+        fail('setup requires an ordinary Git environment without repository/config overrides')
+    root = Path(root).absolute()
+    if root.resolve() != root or any(folder.is_symlink() or folder.exists()
+            and getattr(folder.lstat(), 'st_file_attributes', 0) & 0x400 for folder in (root, *root.parents)):
+        fail('setup refuses symlinked project paths; choose the actual folder explicitly')
+    if not root.parent.is_dir() or root.exists() and not root.is_dir():
+        fail('setup needs a project folder with an existing parent directory')
+    for parent in root.parents:
+        if (parent / 'taskq.json').exists() or (parent / '.git').exists():
+            fail(f'setup found an ancestor project at {parent}; choose an independent project root')
+    trees, registered = None, set()
+    git_path = root / '.git'
+    if git_path.is_dir() and not git_path.is_symlink() and not getattr(git_path.lstat(), 'st_file_attributes', 0) & 0x400:
+        bootstrap_git_root(root)
+        trees = bootstrap_git(root, 'worktree', 'list', '--porcelain')
+        registered = {Path(line[len('worktree '):]).resolve() for line in trees.splitlines() if line.startswith('worktree ')} - {root}
+    files = []
+    if root.exists():
+        for folder, directories, names in os.walk(root, followlinks=False):
+            here = Path(folder)
+            if '.git' in directories or '.git' in names:
+                if here != root or not (here / '.git').is_dir() or (here / '.git').is_symlink() \
+                        or getattr((here / '.git').lstat(), 'st_file_attributes', 0) & 0x400:
+                    fail('setup refuses nested repositories and linked worktrees')
+                directories.remove('.git')
+            for name in [*directories, *names]:
+                path = here / name
+                relative = path.relative_to(root).as_posix()
+                if relative in ('.taskq/bootstrap.json', '.taskq/bootstrap.lock', '.taskq/bootstrap.tmp'):
+                    continue
+                if path.is_symlink() or getattr(path.lstat(), 'st_file_attributes', 0) & 0x400:
+                    fail(f'setup refuses linked paths: {relative}')
+                if path in registered:
+                    directories.remove(name)
+                    continue
+                stat = path.stat()
+                if path.is_file():
+                    digest = hashlib.sha256()
+                    with path.open('rb') as source:
+                        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                            digest.update(chunk)
+                    files.append([relative, stat.st_size, stat.st_mtime_ns, digest.hexdigest()])
+                if len(files) > 10000:
+                    fail('setup inventory exceeds 10000 files; manual setup required')
+    config_path = root / 'taskq.json'
+    try:
+        config = json.loads(config_path.read_text('utf-8')) if config_path.exists() else {}
+    except (ValueError, OSError) as error:
+        fail(f'setup cannot read taskq.json: {error}')
+    if not isinstance(config, dict):
+        fail('taskq.json must contain an object')
+    git = None
+    if (root / '.git').exists():
+        top = bootstrap_git(root, 'rev-parse', '--show-toplevel')
+        if Path(top).resolve() != root or bootstrap_git(root, 'rev-parse', '--is-bare-repository') != 'false':
+            fail('setup requires the main non-bare Git root')
+        git = {'head': bootstrap_git(root, 'rev-parse', '--verify', 'HEAD', optional=True),
+               'worktrees': trees,
+               'index': hashlib.sha256((root / '.git' / 'index').read_bytes()).hexdigest() if (root / '.git' / 'index').exists() else None,
+               'config_bytes': hashlib.sha256((root / '.git' / 'config').read_bytes()).hexdigest(),
+               'config': bootstrap_git(root, 'config', '--local', '--list', '--null'),
+               'status': bootstrap_git(root, 'status', '--porcelain=v1', '--untracked-files=all', '--', '.',
+                                       ':(exclude).taskq/bootstrap.json', ':(exclude).taskq/bootstrap.lock',
+                                       ':(exclude).taskq/bootstrap.tmp'),
+               'remotes': bootstrap_git(root, 'remote', '-v')}
+    return {'exists': root.exists(), 'files': sorted(files), 'config': config,
+            'config_bytes': hashlib.sha256(config_path.read_bytes()).hexdigest() if config_path.exists() else None,
+            'git': git}
+
+
+def bootstrap_get(tool, host, path):
+    code, data = coordination_api(tool, host, 'GET', path)
+    if code != 200:
+        fail(f'setup cannot verify {path} (HTTP {code})')
+    return data
+
+
+def bootstrap_repository(provider, data, repo):
+    if not isinstance(data, dict) or type(data.get('id')) is not int or data['id'] <= 0:
+        fail('setup repository native identity is unavailable')
+    if provider == 'github':
+        if data.get('full_name', '').lower() != repo.lower() or not data.get('node_id'):
+            fail('setup repository native identity conflicts with the requested repository')
+        permissions = data.get('permissions') or {}
+        writable = permissions.get('push') is True or permissions.get('admin') is True
+        private, issues, url = data.get('private'), data.get('has_issues'), data.get('clone_url')
+        visibility = 'private' if private else 'public'
+    else:
+        if data.get('path_with_namespace') != repo:
+            fail('setup repository native identity conflicts with the requested repository')
+        permissions = data.get('permissions') or {}
+        writable = max((permissions.get(key) or {}).get('access_level', 0)
+                       for key in ('project_access', 'group_access')) >= 40
+        visibility = data.get('visibility')
+        private, issues, url = visibility == 'private', data.get('issues_enabled'), data.get('http_url_to_repo')
+    if data.get('archived') is not False or issues is not True or not writable or not isinstance(private, bool) \
+            or visibility not in ('private', 'internal', 'public'):
+        fail('setup requires an unarchived issue-enabled repository with verified write permissions')
+    return {'id': data['id'], 'node_id': data.get('node_id'), 'repo': repo, 'private': private,
+            'permissions': permissions, 'clone_url': url, 'visibility': visibility}
+
+
+def bootstrap_provider(provider, host, repo, config, provision=False):
+    tool = 'gh' if provider == 'github' else 'glab'
+    account = bootstrap_get(tool, host, 'user')
+    login = account.get('login' if provider == 'github' else 'username')
+    if type(account.get('id')) is not int or account['id'] <= 0 or not isinstance(login, str) or not login:
+        fail('setup requires a verified authenticated account with a stable native ID')
+    account = {'id': account['id'], 'login': login}
+    namespace, name = repo.rsplit('/', 1)
+    path = f'repos/{repo}' if provider == 'github' else f'projects/{quote(repo, safe="")}'
+    code, data = coordination_api(tool, host, 'GET', path)
+    operations, repository, namespace_identity = [], None, None
+    if code == 200:
+        repository = bootstrap_repository(provider, data, repo)
+    elif code == 404:
+        if provider == 'github':
+            if namespace.lower() == login.lower():
+                create_path = 'user/repos'
+                namespace_identity = account
+            else:
+                org = bootstrap_get(tool, host, f'orgs/{namespace}')
+                membership = bootstrap_get(tool, host, f'orgs/{namespace}/memberships/{login}')
+                if type(org.get('id')) is not int or org.get('login', '').lower() != namespace.lower() \
+                        or membership.get('state') != 'active' or membership.get('role') != 'admin':
+                    fail('setup requires verified organization owner permission to create a repository')
+                namespace_identity = {'id': org['id'], 'login': org['login'], 'role': membership['role']}
+                create_path = f'orgs/{namespace}/repos'
+            body = {'name': name, 'private': True, 'has_issues': True, 'auto_init': False}
+        else:
+            native = bootstrap_get(tool, host, f'namespaces/{quote(namespace, safe="")}')
+            if type(native.get('id')) is not int or native.get('full_path') != namespace:
+                fail('setup could not verify the exact GitLab namespace')
+            if native.get('kind') == 'user' and namespace == login:
+                pass
+            elif native.get('kind') == 'group':
+                member = bootstrap_get(tool, host, f'groups/{native["id"]}/members/all/{account["id"]}')
+                if member.get('access_level', 0) < 50:
+                    fail('setup requires verified GitLab group owner permission to create a project')
+            else:
+                fail('setup requires an owned GitLab namespace')
+            namespace_identity = {'id': native['id'], 'full_path': namespace, 'kind': native['kind']}
+            create_path, body = 'projects', {'name': name, 'path': name, 'namespace_id': native['id'],
+                                            'visibility': 'private', 'issues_enabled': True, 'initialize_with_readme': False}
+        operations.append({'kind': 'repository', 'path': create_path, 'body': body})
+    else:
+        fail(f'setup repository lookup is unknown (HTTP {code}); no creation proposed')
+    if provider == 'gitlab':
+        options = config.get('board_options') or {}
+        board, label = options.get('coordination_board'), options.get('coordination_label')
+        if board is not None or label is not None:
+            if repository is None or any(value is not None and (type(value) is not int or value <= 0) for value in (board, label)) \
+                    or not provision and (board is None or label is None):
+                fail('setup needs both explicit GitLab coordination IDs on an existing repository')
+            if board is not None:
+                native_board = bootstrap_get(tool, host, f'{path}/boards/{board}')
+                if native_board.get('id') != board or not isinstance(native_board.get('lists'), list):
+                    fail('setup cannot verify the dedicated empty GitLab coordination board')
+                if native_board['lists']:
+                    fail('GitLab coordination board is occupied; preserve its holder and retry after normal '
+                         'guard release; setup never clears coordination lists')
+            if label is not None:
+                native_label = bootstrap_get(tool, host, f'{path}/labels/{label}')
+                if native_label.get('id') != label or native_label.get('is_project_label') is not True:
+                    fail('setup cannot verify the dedicated GitLab project label')
+        if board is None or label is None:
+            if repository is not None and not provision:
+                fail('existing GitLab projects need their canonical dedicated coordination_board/coordination_label IDs '
+                     'in taskq.json; setup cannot choose a second shared guard')
+            suffix = bootstrap_hash({'host': host, 'repo': repo})[:12]
+            if label is None:
+                operations.append({'kind': 'label', 'path': f'{path}/labels',
+                                   'body': {'name': f'taskq-coordination-{suffix}', 'color': '#666666'}})
+            if board is None:
+                operations.append({'kind': 'board', 'path': f'{path}/boards',
+                                   'body': {'name': f'TaskQ coordination {suffix}'}})
+    event_label = None
+    code, label = coordination_api(tool, host, 'GET', f'{path}/labels/taskq-events') if repository else (404, None)
+    if code == 200 and isinstance(label, dict) and label.get('name') == EVENT_LABEL and type(label.get('id')) is int \
+            and label['id'] > 0 and (provider == 'github' or label.get('is_project_label') is True):
+        event_label = {'id': label['id'], 'name': EVENT_LABEL}
+    elif code == 404:
+        operations.append({'kind': 'event_label', 'path': f'{path}/labels',
+                           'body': {'name': EVENT_LABEL, 'color': '666666' if provider == 'github' else '#666666',
+                                    'description': 'TaskQ pending manager events'}})
+    else:
+        fail('setup cannot verify the reserved taskq-events label')
+    return {'tool': tool, 'account': account, 'namespace': namespace_identity, 'repository': repository,
+            'operations': operations, 'event_label': event_label}
+
+
+def bootstrap_queue(config):
+    board = make_board(config)
+    issues = board.list(None)
+    board_schema_gate(issues)
+    items = [item for item in map(parse, issues) if item]
+    if any(role(item) in ('worker', 'supervisor') for item in items):
+        fail('a recorded supervisor or worker cannot take the manager role (R3 one controller)')
+    return len(items)
+
+
+def bootstrap_receipt(root, reconcile=None):
+    path = root / '.taskq' / 'bootstrap.json'
+    if not path.exists():
+        return None
+    if path.is_symlink() or path.stat().st_size > 65536:
+        fail('setup receipt is linked or exceeds its bound')
+    try:
+        receipt = json.loads(path.read_text('utf-8'))
+    except (ValueError, OSError):
+        fail('setup receipt is unreadable; explicit reconciliation required')
+    if not isinstance(receipt, dict) or receipt.get('schema') != 1 or not isinstance(receipt.get('operations'), list) \
+            or len(receipt['operations']) > 4:
+        fail('setup receipt is invalid; explicit reconciliation required')
+    if any(not isinstance(operation, dict) or operation.get('kind') not in ('repository', 'label', 'board', 'event_label')
+           for operation in receipt['operations']):
+        fail('setup receipt operations are invalid; explicit reconciliation required')
+    if any(operation.get('state') == 'rejected' and (operation.get('rejection', {}).get('http_status') not in (400, 401, 403, 422)
+           or operation.get('id') is not None) for operation in receipt['operations']):
+        fail('setup rejection receipt is invalid; explicit reconciliation required')
+    if any(operation.get('state') not in ('verified', 'reused', 'rejected') and operation['kind'] not in (reconcile or {})
+           for operation in receipt['operations']):
+        fail('setup has an unknown creation intent; inspect its native outcome, then preview --reconcile-id '
+             'repository:ID|label:ID|board:ID|event_label:ID to explicitly associate an existing resource; creation will not repeat')
+    return receipt
+
+
+def bootstrap_plan(args):
+    for field in ('setup', 'name', 'provider', 'repo', 'host'):
+        if not isinstance(getattr(args, field, None), str) or not getattr(args, field).strip():
+            fail('setup requires --setup PATH --name NAME --provider github|gitlab --repo namespace/name --host HOST')
+    if args.provider not in ('github', 'gitlab'):
+        fail('custom provider provisioning is unsupported; validate its existing queue and use manual setup')
+    if not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', args.host) \
+            or not re.fullmatch(r'[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+', args.repo) \
+            or any(part in ('.', '..') for part in args.repo.split('/')) \
+            or args.provider == 'github' and args.repo.count('/') != 1:
+        fail('setup needs a literal hostname and exact namespace/repository path')
+    if any(ord(char) < 32 for char in args.name):
+        fail('project name contains control characters')
+    if args.board_url:
+        url = urlsplit(args.board_url)
+        if url.scheme != 'https' or not url.hostname or url.username or url.password or any(ord(c) < 32 for c in args.board_url):
+            fail('--board-url must be an HTTPS visual-board URL without credentials')
+    root = Path(args.setup).expanduser().absolute()
+    local = bootstrap_local(root)
+    config = dict(local['config'])
+    if config.get('publish', 'direct') not in ('direct', 'pr') or not isinstance(config.get('board_options', {}), dict):
+        fail('setup requires valid publish and board_options configuration; preserve and correct the existing file first')
+    if str(config.get('board', '')).endswith('.py'):
+        fail('custom provider provisioning is unsupported; preserve taskq.json and use manual setup with its existing adapter')
+    for key, value in (('board', args.provider), ('repo', args.repo), ('host', args.host)):
+        if key in config and config[key] != value:
+            fail(f'existing taskq.json {key} conflicts with setup; choose the existing identity or another folder')
+        config[key] = value
+    if args.board_url:
+        if 'board_url' in config and config['board_url'] != args.board_url:
+            fail('existing board_url conflicts with setup; preserve it or choose its exact URL')
+        config['board_url'] = args.board_url
+    reconcile = {}
+    for value in getattr(args, 'reconcile_id', None) or []:
+        match = re.fullmatch(r'(repository|label|board|event_label):([1-9][0-9]*)', value)
+        if not match or match[1] in reconcile:
+            fail('--reconcile-id requires unique repository:ID, label:ID, board:ID or event_label:ID values')
+        reconcile[match[1]] = int(match[2])
+    receipt = bootstrap_receipt(root, reconcile)
+    if any(not receipt or not any(operation['kind'] == kind and operation['state'] not in ('verified', 'reused')
+                                 for operation in receipt['operations']) for kind in reconcile):
+        fail('--reconcile-id may associate only an unresolved creation intent')
+    request = {'root': str(root), 'name': args.name, 'provider': args.provider, 'repo': args.repo,
+               'host': args.host, 'board_url': args.board_url}
+    if receipt and receipt.get('request') != request:
+        fail('setup receipt belongs to another request; explicit reconciliation required')
+    provision = bool(receipt and any(operation['kind'] == 'repository' and operation['state'] == 'verified'
+                                    for operation in receipt['operations']))
+    provider = bootstrap_provider(args.provider, args.host, args.repo, config, provision)
+    if receipt:
+        if receipt.get('account') != provider['account']:
+            fail('setup authenticated account changed from its operation receipt')
+        if receipt.get('repository') and (not provider['repository'] or any(
+                receipt['repository'].get(key) != provider['repository'].get(key) for key in ('id', 'node_id'))):
+            fail('setup repository no longer matches its retained native identity')
+        if receipt.get('event_label') and receipt['event_label'] != provider['event_label']:
+            fail('setup reserved event label no longer matches its retained native identity')
+        for operation in receipt['operations']:
+            if operation['state'] == 'rejected' and operation['kind'] not in reconcile:
+                continue
+            native_id = reconcile.get(operation['kind'], operation.get('id'))
+            if type(native_id) is not int or native_id <= 0:
+                fail('setup receipt is missing a verified native ID')
+            read_path = (f'repositories/{native_id}' if args.provider == 'github' else f'projects/{native_id}') \
+                if operation['kind'] == 'repository' else operation['path'] + '/' + str(native_id)
+            if operation['kind'] == 'event_label' and args.provider == 'github':
+                read_path = operation['path'] + '/taskq-events'
+            native = bootstrap_get(provider['tool'], args.host, read_path)
+            if native.get('id') != native_id:
+                fail('setup operation native identity changed; explicit reconciliation required')
+            if operation['kind'] == 'repository':
+                verified = bootstrap_repository(args.provider, native, args.repo)
+                if not provider['repository'] or provider['repository'] != verified or not verified['private']:
+                    fail('setup repository no longer matches its creation receipt')
+            else:
+                if native.get('name') != operation['body']['name'] or operation['kind'] == 'board' and native.get('lists') != [] \
+                        or operation['kind'] in ('label', 'event_label') and args.provider == 'gitlab' and native.get('is_project_label') is not True:
+                    fail('setup coordination resource identity or dedicated purpose conflicts with its receipt')
+                if operation['kind'] != 'event_label':
+                    key = 'coordination_label' if operation['kind'] == 'label' else 'coordination_board'
+                    config['board_options'] = {**config.get('board_options', {}), key: native_id}
+            if operation['kind'] in reconcile:
+                operation['reconciliation'] = {'id': native_id, 'read_path': read_path,
+                                               'native_digest': bootstrap_hash(native)}
+        if args.provider == 'gitlab' and all(key in config.get('board_options', {}) for key in ('coordination_board', 'coordination_label')):
+            provider = bootstrap_provider(args.provider, args.host, args.repo, config, provision)
+        else:
+            completed = {operation['kind'] for operation in receipt['operations']
+                         if operation['state'] != 'rejected' or operation['kind'] in reconcile}
+            provider['operations'] = [operation for operation in provider['operations'] if operation['kind'] not in completed]
+    remote = f'https://{args.host}/{args.repo}.git'
+    if provider['repository'] and provider['repository']['clone_url'] != remote:
+        fail('native repository clone URL differs from the approved host/path; choose the canonical identity')
+    remotes = local['git']['remotes'].splitlines() if local['git'] else []
+    for line in remotes:
+        url = line.split()[1]
+        variants = {remote, remote[:-4], f'git@{args.host}:{args.repo}.git', f'git@{args.host}:{args.repo}',
+                    f'ssh://git@{args.host}/{args.repo}.git'}
+        if url not in variants:
+            fail('existing Git remote conflicts with the selected repository; owner choice required')
+    origin_missing = not any(line.split()[0] == 'origin' for line in remotes)
+    ignore_path = root / '.gitignore'
+    ignore = ignore_path.read_bytes() if ignore_path.exists() else None
+    ignore_add = [entry for entry in ('.taskq/', '.worktrees/') if entry.encode() not in (ignore or b'').splitlines()]
+    temporary = root / '.taskq' / 'config.tmp'
+    if temporary.exists() and (not receipt or receipt.get('config_write', {}).get('sha256') != hashlib.sha256(temporary.read_bytes()).hexdigest()):
+        fail('unowned or partial .taskq/config.tmp exists; preserve it and reconcile before setup')
+    writes = []
+    if not local['exists']:
+        writes.append('create project folder')
+    if not local['git']:
+        writes.append('git init (no commit)')
+    if origin_missing:
+        writes.append(f'git remote add origin {remote}')
+    if ignore_add:
+        writes.append('append ' + ', '.join(ignore_add) + ' to .gitignore, preserving existing bytes')
+    if config != local['config'] or local['config_bytes'] is None:
+        writes.append('write taskq.json, preserving existing fields')
+    if not (root / 'AGENTS.md').exists():
+        writes.append('create AGENTS.md pointing to the installed TaskQ contract')
+    writes.append('write bounded .taskq/bootstrap.json operation receipt; temporary exclusive .taskq/bootstrap.lock')
+    count = bootstrap_queue({**config, 'root': root}) if provider['repository'] else None
+    plan = {'request': request, 'root': str(root), 'local': local, 'config': config, 'provider': provider,
+            'operations': provider['operations'], 'writes': writes, 'remote': remote, 'manager': session(),
+            'manager_host': os.environ.get('TASKQ_HOST') or socket.gethostname(),
+            'runtime': os.environ.get('TASKQ_RUNTIME'), 'install_dir': os.environ.get('TASKQ_INSTALL_DIR'),
+            'implementation': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), 'contract': contract(),
+            'queue_count': count, 'receipt': receipt, 'reconcile': reconcile, 'entrypoint': str(Path(__file__).resolve()),
+            'origin_missing': origin_missing, 'ignore_digest': hashlib.sha256(ignore).hexdigest() if ignore is not None else None,
+            'ignore_add': ignore_add,
+            'approval_window': int(time.time()) // 900}
+    plan['digest'] = bootstrap_hash(plan)
+    return plan
+
+
+def bootstrap_save(path, receipt):
+    data = json.dumps(receipt, indent=2, ensure_ascii=False) + '\n'
+    if len(data.encode('utf-8')) > 65536:
+        fail('setup receipt bound exceeded')
+    temporary = path.with_suffix('.tmp')
+    if temporary.exists():
+        fail('retained .taskq/bootstrap.tmp blocks receipt writes; preserve it in a separate recovery file after '
+             'reviewing its request/account, keep bootstrap.json unchanged, then preview again; any unknown '
+             'creation still requires explicit native-ID reconciliation')
+    with temporary.open('x', encoding='utf-8', newline='\n') as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, path)
+
+
+def cmd_bootstrap(args):
+    plan = bootstrap_plan(args)
+    if not args.approve:
+        print('TaskQ setup preview (read-only)')
+        for label, value in (('Project', args.name), ('Folder', plan['root']), ('Provider', args.provider), ('Host', args.host),
+                             ('Account', f'{plan["provider"]["account"]["login"]} (native ID {plan["provider"]["account"]["id"]})'),
+                             ('Repository', args.repo), ('Queue', f'https://{args.host}/{args.repo}'
+                              + ('/-/issues' if args.provider == 'gitlab' else '/issues'))):
+            print(f'{label}: {json.dumps(value, ensure_ascii=False)}')
+        native = plan['provider']['repository']
+        print(f'Repository identity: {native["id"] if native else "new, native ID pending creation"}')
+        print('Visibility: ' + ('PRIVATE' if native is None else native['visibility'].upper()))
+        print('Write permissions: verified' if native else 'Creation authority: verified namespace/account')
+        if plan['provider']['namespace']:
+            for key, value in plan['provider']['namespace'].items():
+                print(f'Namespace {key}: {json.dumps(value)}')
+        if native:
+            for key, value in native['permissions'].items():
+                print('  ' + key + ': ' + str(value))
+        print('Git/config fingerprint: ' + bootstrap_hash(plan['local']))
+        print('Configuration: ' + json.dumps(str(Path(plan['root']) / 'taskq.json'))
+              + (' (existing fields preserved)' if plan['local']['config_bytes'] else ' (new)'))
+        print('Git: ' + ('existing main repository' if plan['local']['git'] else 'new local repository'))
+        for remote in (plan['local']['git'] or {}).get('remotes', '').splitlines():
+            print('Existing remote: ' + json.dumps(remote))
+        for key in ('coordination_board', 'coordination_label'):
+            if key in plan['config'].get('board_options', {}):
+                print(f'GitLab {key} native ID: {plan["config"]["board_options"][key]}')
+        if args.board_url:
+            print('Optional display link only (association/access unverified): ' + json.dumps(args.board_url))
+        for operation in plan['operations']:
+            print('External: create ' + operation['kind'] + ' at ' + json.dumps(operation['path']))
+            for key, value in operation['body'].items():
+                print(f'  {key}={json.dumps(value)}')
+        for kind, native_id in plan['reconcile'].items():
+            print(f'Reconcile: original {kind} creation unknown; associate existing native ID {native_id}.')
+            print('  This grants no creation ownership or cleanup permission.')
+        for operation in (plan['receipt'] or {}).get('operations', []):
+            if operation['state'] == 'rejected':
+                print(f'Previous {operation["kind"]} create was rejected (HTTP {operation["rejection"]["http_status"]}).')
+                print('  Fresh approval retries only a listed create; existing resources are association, not creation ownership.')
+        for write in plan['writes']:
+            print('Local: ' + write)
+        print('Approval digest: ' + plan['digest'])
+        print('Approval expires: ' + datetime.fromtimestamp((plan['approval_window'] + 1) * 900, timezone.utc).isoformat())
+        print('1. Apply this exact plan (recommended).\n2. Change the choice and preview again.\n3. Cancel; keep everything.')
+        print('After reviewing, repeat this setup command with --approve ' + plan['digest'])
+        command = ['pm', '--setup', plan['root'], '--name', args.name,
+                   '--provider', args.provider, '--repo', args.repo, '--host', args.host]
+        if args.board_url:
+            command += ['--board-url', args.board_url]
+        for kind, native_id in plan['reconcile'].items():
+            command += ['--reconcile-id', f'{kind}:{native_id}']
+        command += ['--approve', plan['digest']]
+        runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
+        print(queue_tool(runtime) + ' ' + ' '.join(shell_quote(value, powershell(runtime)) for value in command))
+        return plan
+    if args.approve != plan['digest']:
+        fail('setup approval is stale or incorrect; review a fresh preview before applying')
+    reason = release_reason()
+    if reason:
+        fail(reason)
+    root = Path(plan['root'])
+    root.mkdir(exist_ok=True)
+    folder = root / '.taskq'
+    folder.mkdir(exist_ok=True)
+    lock = folder / 'bootstrap.lock'
+    token = uuid.uuid4().hex
+    try:
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        fail('setup is busy or interrupted; inspect the existing bootstrap lock before explicit reconciliation')
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            handle.write(token)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # A second process must revalidate after obtaining exclusive ownership.
+        current = bootstrap_local(root)
+        current['exists'] = plan['local']['exists']
+        if current != plan['local']:
+            fail('project changed after setup approval; review a fresh preview')
+        provision = bool(plan['receipt'] and any(operation['kind'] == 'repository' and operation['state'] == 'verified'
+                                                for operation in plan['receipt']['operations']))
+        provider = bootstrap_provider(args.provider, args.host, args.repo, plan['config'], provision)
+        if any(provider[key] != plan['provider'][key] for key in ('account', 'repository', 'namespace', 'event_label', 'operations')):
+            fail('provider context changed after setup approval; review a fresh preview')
+        receipt = plan['receipt'] or {'schema': 1, 'request': plan['request'], 'account': provider['account'], 'operations': []}
+        path = folder / 'bootstrap.json'
+        for entry in receipt['operations']:
+            if entry['kind'] in plan['reconcile']:
+                selection = entry['reconciliation']
+                native = bootstrap_get(provider['tool'], args.host, selection['read_path'])
+                if bootstrap_hash(native) != selection['native_digest']:
+                    fail('native reconciliation context changed; review a fresh preview')
+                entry['original_intent'] = {key: value for key, value in entry.items() if key != 'reconciliation'}
+                entry.update(state='reused', id=selection['id'], read_path=selection['read_path'])
+                bootstrap_save(path, receipt)
+        for operation in plan['operations']:
+            account = bootstrap_get(provider['tool'], args.host, 'user')
+            login = account.get('login' if args.provider == 'github' else 'username')
+            if {'id': account.get('id'), 'login': login} != provider['account']:
+                fail('authenticated account changed before creation; review a fresh preview')
+            if provider['repository']:
+                repository_path = ('repositories/' if args.provider == 'github' else 'projects/') + str(provider['repository']['id'])
+                if bootstrap_repository(args.provider, bootstrap_get(provider['tool'], args.host, repository_path), args.repo) != provider['repository']:
+                    fail('repository identity or permissions changed before creation; review a fresh preview')
+            if operation['kind'] != 'repository' and args.provider == 'gitlab':
+                operation = {**operation, 'path': f'projects/{provider["repository"]["id"]}/'
+                             + ('boards' if operation['kind'] == 'board' else 'labels')}
+            if operation['kind'] == 'event_label':
+                code, _ = coordination_api(provider['tool'], args.host, 'GET', operation['path'] + '/taskq-events')
+                if code != 404:
+                    fail('reserved event label context changed; review a fresh preview before creation')
+            entry = {**operation, 'state': 'intent'}
+            previous = next((old for old in receipt['operations'] if old['kind'] == operation['kind'] and old['state'] == 'rejected'), None)
+            if previous is not None:
+                entry['last_rejection'] = {'state': 'rejected', 'request': {'path': previous['path'], 'body': previous['body']},
+                                           **previous['rejection']}
+                receipt['operations'][receipt['operations'].index(previous)] = entry
+            else:
+                receipt['operations'].append(entry)
+            bootstrap_save(path, receipt)
+            try:
+                code, native = coordination_api(provider['tool'], args.host, 'POST', operation['path'], operation['body'])
+                if code in (400, 401, 403, 422):
+                    entry.update(state='rejected', rejection={'http_status': code})
+                    bootstrap_save(path, receipt)
+                    fail(f'setup creation rejected (HTTP {code}); keep this receipt, resolve the cause with the same '
+                         'account, then review a fresh preview before approving another attempt')
+                if code != 201 or not isinstance(native, dict) or type(native.get('id')) is not int or native['id'] <= 0:
+                    fail('setup creation outcome is unknown; preserve its intent and reconcile the exact native identity')
+                entry['id'] = native['id']
+                if operation['kind'] == 'repository':
+                    entry['read_path'] = f'repositories/{native["id"]}' if args.provider == 'github' else f'projects/{native["id"]}'
+                else:
+                    entry['read_path'] = operation['path'] + '/' + str(native['id'])
+                    if args.provider == 'github':
+                        entry['read_path'] = operation['path'] + '/taskq-events'
+                bootstrap_save(path, receipt)
+                fresh = bootstrap_get(provider['tool'], args.host, entry['read_path'])
+                if fresh.get('id') != native['id']:
+                    fail('setup creation native readback conflicts; explicit reconciliation required')
+                if operation['kind'] == 'repository':
+                    verified = bootstrap_repository(args.provider, fresh, args.repo)
+                    if not verified['private'] or verified['clone_url'] != plan['remote']:
+                        fail('created repository visibility or URL differs from approval; explicit reconciliation required')
+                    provider['repository'] = verified
+                elif fresh.get('name') != operation['body']['name'] or operation['kind'] == 'board' and fresh.get('lists') != [] \
+                        or args.provider == 'gitlab' and fresh.get('is_project_label') is not True and operation['kind'] != 'board':
+                    fail('created coordination resource differs from approval; explicit reconciliation required')
+                if operation['kind'] in ('label', 'board'):
+                    key = 'coordination_label' if operation['kind'] == 'label' else 'coordination_board'
+                    plan['config']['board_options'] = {**plan['config'].get('board_options', {}), key: native['id']}
+                if operation['kind'] == 'event_label':
+                    provider['event_label'] = {'id': native['id'], 'name': EVENT_LABEL}
+                entry['state'] = 'verified'
+                bootstrap_save(path, receipt)
+            except BaseException:
+                print('Setup stopped with a retained creation receipt; no automatic create retry.', file=sys.stderr)
+                raise
+        count = bootstrap_queue({**plan['config'], 'root': root})
+        current = bootstrap_local(root)
+        current['exists'] = plan['local']['exists']
+        if current != plan['local']:
+            fail('project changed during setup; preserve created resources and review a fresh preview before local writes')
+        if not plan['local']['git']:
+            bootstrap_git(root, 'init')
+        bootstrap_git_root(root)
+        if plan['origin_missing']:
+            bootstrap_git(root, 'remote', 'add', 'origin', plan['remote'])
+        if plan['ignore_add']:
+            ignore_path = root / '.gitignore'
+            before = ignore_path.read_bytes() if ignore_path.exists() else None
+            if (hashlib.sha256(before).hexdigest() if before is not None else None) != plan['ignore_digest']:
+                fail('.gitignore changed during setup; existing bytes preserved')
+            addition = (b'\n' if before and not before.endswith(b'\n') else b'') \
+                + ('\n'.join(plan['ignore_add']) + '\n').encode('utf-8')
+            with ignore_path.open('ab' if before is not None else 'xb') as output:
+                output.write(addition)
+                output.flush()
+                os.fsync(output.fileno())
+            if ignore_path.read_bytes() != (before or b'') + addition:
+                fail('.gitignore append readback differs; preserve it and reconcile')
+        config_path = root / 'taskq.json'
+        if plan['config'] != plan['local']['config'] or plan['local']['config_bytes'] is None:
+            before = hashlib.sha256(config_path.read_bytes()).hexdigest() if config_path.exists() else None
+            if before != plan['local']['config_bytes']:
+                fail('taskq.json changed during setup; existing bytes preserved')
+            temporary = folder / 'config.tmp'
+            data = (json.dumps(plan['config'], indent=2, ensure_ascii=False) + '\n').encode('utf-8')
+            write_intent = {'sha256': hashlib.sha256(data).hexdigest(), 'source': before}
+            if temporary.exists():
+                if receipt.get('config_write') != write_intent or temporary.read_bytes() != data:
+                    fail('owned config temporary differs from requested write; explicit reconciliation required')
+            else:
+                receipt['config_write'] = write_intent
+                bootstrap_save(path, receipt)
+                with temporary.open('xb') as output:
+                    output.write(data)
+                    output.flush()
+                    os.fsync(output.fileno())
+            os.replace(temporary, config_path)
+        if not (root / 'AGENTS.md').exists():
+            with (root / 'AGENTS.md').open('x', encoding='utf-8', newline='\n') as output:
+                runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
+                entrypoint = queue_tool(runtime, launch=True)
+                output.write('# Project manager\n\nUse TaskQ for this project. From this folder, run:\n\n'
+                             + entrypoint + ' contract\n\nRead the selected contract path it returns, then run:\n\n'
+                             + entrypoint + ' pm\n\nFollow that shared manager contract; preserve existing task ownership.\n')
+        effective = load_config(root)
+        if any(effective.get(key) != value for key, value in plan['config'].items()) or effective['root'] != root:
+            fail('effective setup configuration failed verification')
+        final_provider = bootstrap_provider(args.provider, args.host, args.repo, plan['config'])
+        if any(final_provider[key] != provider[key] for key in ('repository', 'account', 'event_label')):
+            fail('setup native identity or permissions changed during apply; reconcile before handoff')
+        receipt['config_digest'] = bootstrap_hash(plan['config'])
+        receipt['repository'] = {'id': final_provider['repository']['id'], 'node_id': final_provider['repository']['node_id']}
+        receipt['event_label'] = final_provider['event_label']
+        receipt['state'] = 'ready'
+        bootstrap_save(path, receipt)
+        print(f'TaskQ setup ready: {count} readable tasks; native identity, write permissions and manager eligibility verified.')
+        print('Folder: ' + json.dumps(str(root)))
+        print('Next: from this folder run taskq pm to read and accept the current manager contract.')
+        print('Setup readiness does not prove worker execution.')
+        if not plan['local']['git'] or not plan['local']['git']['head']:
+            print('Local Git has no source commit/publication from setup. Plan with add --later; obtain separate '
+                  'owner approval for initial commit/push and execution readiness before admitting work.')
+    finally:
+        if lock.is_symlink() or not lock.is_file() or getattr(lock.lstat(), 'st_file_attributes', 0) & 0x400 \
+                or lock.read_text('utf-8') != token:
+            fail('setup lock changed; retaining it for explicit reconciliation')
+        lock.unlink()
+
+
 def cmd_pm(args):
     if getattr(args, 'subscribe', None) is not None:
         if args.adopt:
@@ -5331,6 +6019,8 @@ def cmd_pm(args):
     (CONFIG['root'] / '.taskq' / 'pm.json').write_text(json.dumps({'contract': digest}), 'utf-8')
     print(f'taskq pm contract {digest}\nYou are the taskq manager of {CONFIG["root"]}. Follow this role from now on; '
           f'`taskq` is `{tq}`.' + (f' {shell_instructions(runtime)}' if powershell(runtime) else '') + '\n' + release_context(runtime) + '\n\n' + '\n'.join(sections))
+    print('Project onboarding follows the shared contract section "Shared project bootstrap"; '
+          'taskq pm --setup PATH previews its explicit setup changes.')
     for item in sorted(snapshot, key=lambda item: (item['priority'], item['iid'])):
         if not item['pm'] and item['iid'] not in args.adopt:
             print(f'Unassigned manager: #{item["iid"]} {item["title"]} ({item["state"]}). '
@@ -5530,10 +6220,17 @@ Stay in this one turn and repeat, from {CONFIG["root"]}; do not end the turn bet
 
 def main(argv=None):
     global CONFIG, BOARD
+    arguments = sys.argv[1:] if argv is None else argv
     if os.name == 'nt':  # redirected Windows streams otherwise use a legacy code page that rejects task titles/contract
         for stream in (sys.stdout, sys.stderr):
             if hasattr(stream, 'reconfigure'):
                 stream.reconfigure(encoding='utf-8')
+    if arguments[:1] == ['service']:
+        host_service = service_module()
+        try:
+            return host_service.main(ServiceRuntime(), arguments[1:])
+        except (ValueError, OSError, host_service.sqlite3.Error) as error:
+            fail(str(error))
     parser = argparse.ArgumentParser(prog='taskq')
     commands = parser.add_subparsers(dest='command', required=True)
 
@@ -5581,6 +6278,14 @@ def main(argv=None):
             (('--execute',), {'action':'store_true'}), (('--scheduled',), {'action':'store_true'}), (('--name',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), n=False)
     command('pm', cmd_pm, (('--adopt',), {'nargs': '+', 'type': int, 'default': []}),
             (('--subscribe',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), (('--delivery-ack',), {}),
+            (('--setup',), {'metavar': 'PATH', 'help': 'preview shared project setup before loading a project configuration'}),
+            (('--name',), {'help': 'explicit project display name for setup'}),
+            (('--provider',), {'choices': ('github', 'gitlab'), 'help': 'native setup provider'}),
+            (('--repo',), {'help': 'exact setup namespace/repository'}), (('--host',), {'help': 'explicit provider hostname'}),
+            (('--board-url',), {'help': 'optional existing visual board URL; issue queue remains authoritative'}),
+            (('--approve',), {'metavar': 'DIGEST', 'help': 'apply exactly this reviewed setup preview'}),
+            (('--reconcile-id',), {'action': 'append', 'metavar': 'RESOURCE:ID',
+                                  'help': 'preview associating an exact existing repository/label/board after unknown creation'}),
             (('--status',), {'action':'store_true'}), (('--format',), {'choices':('json','text','dot'),'default':'json'}), n=False)
     command('cleanup', cmd_cleanup, (('--dry-run',), {'action': 'store_true'}), n=False)
     command('launch', cmd_launch, (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
@@ -5604,6 +6309,14 @@ def main(argv=None):
         folder = os.environ.get('TASKQ_INSTALL_DIR')
         if folder and release_reason() is None and compatible_update(Path(folder)):
             fail('compatible release installed; original command was not executed. Use the launcher contract command, read selected taskq.md, then retry through the launcher in a fresh process')
+    if args.command == 'pm' and args.setup is not None:
+        if fixture:
+            fail('bootstrap is unavailable in a qualification-only installation; use its explicitly scoped fixture workflow')
+        if args.adopt or args.subscribe is not None or args.scope_task or args.delivery_ack or args.status or args.format != 'json':
+            fail('setup cannot be combined with PM adoption or subscription options')
+        return cmd_bootstrap(args)
+    if args.command == 'pm' and any(getattr(args, key) is not None for key in ('name', 'provider', 'repo', 'host', 'board_url', 'approve', 'reconcile_id')):
+        fail('setup options require --setup PATH')
     if args.command == 'arm' and args.what != 'tick' and (args.name is None or args.target or args.execute):
         fail('ARM lifecycle needs --name, without target or --execute')
     if args.command == 'arm' and args.name is not None and args.what == 'tick' and not args.execute:
@@ -5647,6 +6360,8 @@ def main(argv=None):
         fail('qualified board capacity provider and explicit host/project caps required; no defaults')
     if 'TASKQ_HOST_ONLY' in os.environ and (not os.environ['TASKQ_HOST_ONLY'] or os.environ['TASKQ_HOST_ONLY'] != machine()):
         fail('TASKQ_HOST_ONLY must equal this machine name (TASKQ_HOST / hosts)')
+    if args.command == 'tick' and not args.after:
+        dispatch_service_gate()
     if args.command == 'wait' and not args.task or args.command == 'tick' and not args.quiet or args.command == 'pm' and args.subscribe is None:
         refresh(args.command == 'pm')
     writes = args.command in ('add', 'take', 'ask', 'answer', 'result', 'requeue', 'run', 'later', 'close', 'ack', 'applied', 'apply-event', 'lifecycle') or \

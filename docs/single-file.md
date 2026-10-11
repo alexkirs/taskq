@@ -2,6 +2,9 @@
 
 Historical design record for #290, not the current runtime/command contract. Later owner
 decisions in [taskq.md](../taskq.md) supersede the planned removals and line targets below.
+#657 additionally isolates current-user IPC/service lifecycle in `host_service.py`, stdlib only;
+`taskq.py` retains the only task lifecycle/board/lease authority. This is an approved exception
+to the historical one-file packaging target, not a second task engine.
 Current schema1 model-worker execution and experimental schema2 bounded artifacts are distinct;
 no supported migration or app drain is implied by this historical runtime description.
 

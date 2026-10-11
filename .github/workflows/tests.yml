@@ -13,4 +13,4 @@ jobs:
         with:
           python-version: '3.11'
       - run: python3 -m pip install -r requirements-test.txt
-      - run: python3 -m unittest tests.test_single
+      - run: python3 -m unittest discover -s tests

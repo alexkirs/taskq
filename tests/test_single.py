@@ -4579,7 +4579,7 @@ class Contract(Base):
         REAL_RUN(['git', '-C', str(folder), '-c', 'user.name=t', '-c', 'user.email=t@t', *argv], check=True, capture_output=True)
 
     def test_pm_prints_role_and_records_hash(self):
-        (self.root / 'taskq.md').write_text((ROOT / 'taskq.md').read_text())
+        (self.root / 'taskq.md').write_bytes((ROOT / 'taskq.md').read_bytes())
         out = self.run_cli('pm')
         digest = taskq.contract()
         self.assertTrue(out.startswith(f'taskq pm contract {digest}\n'))
@@ -4589,7 +4589,7 @@ class Contract(Base):
         self.assertEqual(json.loads((self.root / '.taskq' / 'pm.json').read_text()), {'contract': digest})  # #532: the hash only
 
     def test_pm_onboarding_is_one_read_only_snapshot(self):
-        (self.root / 'taskq.md').write_text((ROOT / 'taskq.md').read_text())
+        (self.root / 'taskq.md').write_bytes((ROOT / 'taskq.md').read_bytes())
         self.add('assigned')
         with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': ''}, clear=True):
             self.add('unassigned')
@@ -4627,7 +4627,7 @@ class Contract(Base):
 
     def test_pm_refuses_recorded_session_roles_before_onboarding(self):
         self.add()
-        (self.root / 'taskq.md').write_text((ROOT / 'taskq.md').read_text())
+        (self.root / 'taskq.md').write_bytes((ROOT / 'taskq.md').read_bytes())
         for field in ('claim', 'supervisor'):
             with self.subTest(field=field):
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -5314,6 +5314,833 @@ class Cleanup(Base):
             self.assertIn('mess: #1 review: no open PR', self.cleanup('--dry-run'))
 
 
+class ProjectBootstrap(Base):
+    """Real local Git, isolated credentials, and a strict in-memory provider boundary."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = self.root / 'project'
+        self.account = {'id': 123, 'login': 'alice'}
+        self.native = {'id': 456, 'node_id': 'R_fixture', 'full_name': 'alice/demo',
+                       'private': True, 'has_issues': True, 'archived': False,
+                       'permissions': {'push': True, 'admin': True},
+                       'clone_url': 'https://github.com/alice/demo.git',
+                       'html_url': 'https://github.com/alice/demo'}
+        self.exists = True
+        self.event_label = {'id': 777, 'name': taskq.EVENT_LABEL, 'node_id': 'L_events'}
+        self.calls = []
+        self.issues = []
+        self.args = taskq.argparse.Namespace(setup=str(self.folder), name='Demo', provider='github',
+                                            repo='alice/demo', host='github.com', board_url=None,
+                                            approve=None, reconcile_id=[])
+        os.environ.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+                          GIT_TERMINAL_PROMPT='0')
+        previous = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        for patcher in (mock.patch.object(taskq.subprocess, 'run', side_effect=self.local_process),
+                        mock.patch.object(taskq.subprocess, 'Popen', side_effect=self.local_popen),
+                        mock.patch.object(taskq.time, 'time', return_value=1800),
+                        mock.patch.object(taskq, 'run_api', side_effect=self.queue_api),
+                        mock.patch.object(taskq, 'coordination_api', side_effect=self.provider)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def local_process(self, command, **kwargs):
+        self.assertEqual(Path(command[0]).stem.lower(), 'git', command)
+        self.assertFalse(set(command) & {'fetch', 'pull', 'push', 'clone'}, command)
+        return REAL_RUN(command, **kwargs)
+
+    def local_popen(self, command, **kwargs):
+        self.assertEqual(Path(command[0]).stem.lower(), 'git', command)
+        self.assertFalse(set(command) & {'fetch', 'pull', 'push', 'clone'}, command)
+        return REAL_POPEN(command, **kwargs)
+
+    def git(self, *args, folder=None):
+        return self.local_process(['git', '-C', str(folder or self.folder), '-c', 'user.name=t',
+                                   '-c', 'user.email=t@t', *args], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+
+    def provider(self, tool, host, method, path, body=None):
+        self.assertEqual((tool, host), ('gh', 'github.com'))
+        self.calls.append((method, path, body))
+        if method == 'GET' and path == 'user':
+            return 200, dict(self.account)
+        if method == 'GET' and path in ('repos/alice/demo', 'repositories/456'):
+            return (200, json.loads(json.dumps(self.native))) if self.exists else (404, {})
+        if method == 'POST' and path == 'user/repos':
+            self.assertFalse(self.exists, 'attempted duplicate creation')
+            self.assertEqual(body, {'name': 'demo', 'private': True, 'has_issues': True, 'auto_init': False})
+            self.exists = True
+            self.event_label = None
+            return 201, json.loads(json.dumps(self.native))
+        if path == 'repos/alice/demo/labels/taskq-events' and method == 'GET':
+            return (200, dict(self.event_label)) if self.event_label else (404, {})
+        if path == 'repos/alice/demo/labels' and method == 'POST':
+            self.assertEqual(body['name'], taskq.EVENT_LABEL)
+            self.event_label = {'id': 777, 'name': taskq.EVENT_LABEL, 'node_id': 'L_events'}
+            return 201, dict(self.event_label)
+        self.fail(f'unexpected provider effect: {method} {path} {body!r}')
+
+    def queue_api(self, tool, host, method, path, body=None):
+        self.assertEqual((tool, host, method, body), ('gh', 'github.com', 'GET', None))
+        self.assertEqual(path, 'repos/alice/demo/issues?state=open&per_page=100&page=1')
+        return json.loads(json.dumps(self.issues))
+
+    def plan(self):
+        return taskq.bootstrap_plan(self.args)
+
+    def apply(self, plan):
+        self.args.approve = plan['digest']
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            taskq.cmd_bootstrap(self.args)
+        return out.getvalue()
+
+    def mutations(self):
+        return [call for call in self.calls if call[0] != 'GET']
+
+    def test_preview_is_cancellation_safe_for_missing_empty_and_loose_folders(self):
+        for state in ('missing', 'empty', 'loose'):
+            with self.subTest(state=state):
+                self.folder = self.root / state
+                self.args.setup = str(self.folder)
+                if state != 'missing':
+                    self.folder.mkdir()
+                if state == 'loose':
+                    (self.folder / 'notes.txt').write_bytes(b'original\x00\r\n')
+                before = {p.relative_to(self.root): p.read_bytes()
+                          for p in self.root.rglob('*') if p.is_file()}
+                first = self.plan()
+                self.assertEqual(first['digest'], self.plan()['digest'])
+                self.assertEqual(before, {p.relative_to(self.root): p.read_bytes()
+                                         for p in self.root.rglob('*') if p.is_file()})
+                self.assertEqual(self.folder.exists(), state != 'missing')
+                self.assertFalse(self.mutations())
+                self.assertFalse((self.folder / '.taskq').exists())
+
+    def test_apply_initializes_git_without_committing_or_changing_loose_files(self):
+        self.folder.mkdir()
+        original = b'private draft\x00\r\n'
+        (self.folder / 'notes.txt').write_bytes(original)
+        self.apply(self.plan())
+        self.assertEqual((self.folder / 'notes.txt').read_bytes(), original)
+        self.assertEqual(self.git('remote', 'get-url', 'origin'), self.native['clone_url'])
+        self.assertEqual(self.git('ls-files'), '')
+        self.assertEqual(self.git('rev-list', '--all', '--count'), '0')
+        config = json.loads((self.folder / 'taskq.json').read_text('utf-8'))
+        self.assertEqual((config['board'], config['repo']), ('github', 'alice/demo'))
+        self.assertFalse(self.mutations())
+
+    def test_existing_dirty_git_config_and_unknown_fields_are_preserved(self):
+        self.folder.mkdir()
+        self.git('init', '-q')
+        self.git('remote', 'add', 'origin', self.native['clone_url'])
+        self.git('remote', 'add', 'backup', 'git@github.com:alice/demo.git')
+        path = self.folder / 'work.txt'
+        path.write_bytes(b'base\n')
+        self.git('add', 'work.txt')
+        self.git('commit', '-qm', 'base')
+        path.write_bytes(b'staged\n')
+        self.git('add', 'work.txt')
+        path.write_bytes(b'unstaged\r\n')
+        config = b'{ "board": "github", "repo": "alice/demo", "host": "github.com", "mystery": {"keep": [1, 2]} }\n'
+        (self.folder / 'taskq.json').write_bytes(config)
+        (self.folder / 'AGENTS.md').write_bytes(b'# Existing project instructions\r\nKeep these exact bytes.\r\n')
+        before = {name: (self.folder / name).read_bytes()
+                  for name in ('work.txt', 'taskq.json', 'AGENTS.md', '.git/index', '.git/config', '.git/HEAD')}
+        self.apply(self.plan())
+        self.assertEqual(before, {name: (self.folder / name).read_bytes() for name in before})
+        self.assertFalse(self.mutations())
+
+    def test_stale_approval_refuses_account_identity_permissions_visibility_and_file_drift(self):
+        self.folder.mkdir()
+        plan = self.plan()
+        changes = [('account', lambda: self.account.update(id=999)),
+                   ('identity', lambda: self.native.update(id=999)),
+                   ('permissions', lambda: self.native.update(permissions={'push': False})),
+                   ('visibility', lambda: self.native.update(private=False)),
+                   ('manager', lambda: os.environ.update(CLAUDE_CODE_SESSION_ID='different-manager')),
+                   ('manager-host', lambda: os.environ.update(TASKQ_HOST='different-host')),
+                   ('files', lambda: (self.folder / 'late.txt').write_text('new', encoding='utf-8'))]
+        original_account, original_native = dict(self.account), json.loads(json.dumps(self.native))
+        for name, change in changes:
+            with self.subTest(change=name):
+                self.account, self.native = dict(original_account), json.loads(json.dumps(original_native))
+                os.environ['CLAUDE_CODE_SESSION_ID'] = SESSION
+                os.environ['TASKQ_HOST'] = 'mac'
+                change()
+                with self.assertRaises(SystemExit):
+                    self.apply(plan)
+                self.assertFalse((self.folder / 'taskq.json').exists())
+                self.assertFalse((self.folder / '.git').exists())
+                self.assertFalse(self.mutations())
+
+    def test_wrong_approval_has_no_local_or_provider_effects(self):
+        self.args.approve = '0' * 64
+        with self.assertRaises(SystemExit):
+            taskq.cmd_bootstrap(self.args)
+        self.assertFalse(self.folder.exists())
+        self.assertFalse(self.mutations())
+
+    def test_foreign_config_remote_nested_repo_and_worktree_need_owner_resolution(self):
+        for case in ('parent-config', 'different-config', 'different-remote', 'nested-repo', 'worktree'):
+            with self.subTest(case=case):
+                parent = self.root / case
+                parent.mkdir()
+                self.folder = parent / 'project'
+                self.folder.mkdir()
+                self.args.setup = str(self.folder)
+                if case == 'parent-config':
+                    (parent / 'taskq.json').write_text('{"board":"github","repo":"someone/other"}')
+                elif case == 'different-config':
+                    (self.folder / 'taskq.json').write_text('{"board":"github","repo":"someone/other"}')
+                elif case == 'different-remote':
+                    self.git('init', '-q')
+                    self.git('remote', 'add', 'origin', 'https://github.com/someone/other.git')
+                elif case == 'nested-repo':
+                    nested = self.folder / 'child'
+                    nested.mkdir()
+                    self.git('init', '-q', folder=nested)
+                else:
+                    source = parent / 'source'
+                    source.mkdir()
+                    self.git('init', '-q', folder=source)
+                    self.git('commit', '--allow-empty', '-qm', 'base', folder=source)
+                    self.git('worktree', 'add', '-q', str(self.folder), folder=source)
+                before = {p.relative_to(parent): p.read_bytes() for p in parent.rglob('*') if p.is_file()}
+                with self.assertRaises(SystemExit):
+                    self.plan()
+                self.assertEqual(before, {p.relative_to(parent): p.read_bytes()
+                                          for p in parent.rglob('*') if p.is_file()})
+                self.assertFalse(self.mutations())
+
+    def test_repository_creation_is_private_and_lost_reply_cannot_repeat_or_delete_it(self):
+        self.exists = False
+        plan = self.plan()
+        provider = self.provider
+
+        def lose_create_reply(tool, host, method, path, body=None):
+            result = provider(tool, host, method, path, body)
+            if method == 'POST' and path == 'user/repos':
+                raise RuntimeError('connection lost after provider creation')
+            return result
+
+        with mock.patch.object(taskq, 'coordination_api', side_effect=lose_create_reply):
+            with self.assertRaises((SystemExit, RuntimeError)):
+                self.apply(plan)
+        self.assertTrue(self.exists)
+        self.assertFalse((self.folder / 'taskq.json').exists())
+        receipt = self.folder / '.taskq' / 'bootstrap.json'
+        self.assertTrue(receipt.is_file(), 'unknown creation must retain its intent')
+        saved = receipt.read_bytes()
+        with self.assertRaises(SystemExit):
+            self.apply(plan)
+        self.assertEqual(receipt.read_bytes(), saved)
+        self.assertEqual([call[0:2] for call in self.mutations()], [('POST', 'user/repos')])
+        self.assertTrue(self.exists, 'bootstrap may never roll back by deleting the remote')
+        self.args.reconcile_id = ['repository:456']
+        reconciliation = self.plan()
+        self.assertEqual(receipt.read_bytes(), saved, 'reconciliation preview cannot rewrite evidence')
+        self.apply(reconciliation)
+        recovered = json.loads(receipt.read_text('utf-8'))['operations'][0]
+        self.assertEqual((recovered['id'], recovered['state']), (456, 'reused'))
+        self.assertIn('original_intent', recovered)
+        self.assertEqual([call[:2] for call in self.mutations()],
+                         [('POST', 'user/repos'), ('POST', 'repos/alice/demo/labels')])
+
+    def test_verified_creation_resumes_after_local_failure_without_duplicate_creation(self):
+        self.exists = False
+        plan = self.plan()
+        git = taskq.bootstrap_git
+
+        def fail_init(root, *args, **kwargs):
+            if args == ('init',):
+                raise SystemExit('injected local Git failure')
+            return git(root, *args, **kwargs)
+
+        with mock.patch.object(taskq, 'bootstrap_git', side_effect=fail_init):
+            with self.assertRaisesRegex(SystemExit, 'injected local Git failure'):
+                self.apply(plan)
+        receipt_path = self.folder / '.taskq' / 'bootstrap.json'
+        receipt = json.loads(receipt_path.read_text('utf-8'))
+        self.assertEqual([(op['id'], op['state']) for op in receipt['operations']],
+                         [(456, 'verified'), (777, 'verified')])
+        self.assertFalse((self.folder / 'taskq.json').exists())
+        self.apply(self.plan())
+        self.apply(self.plan())
+        self.assertEqual([call[:2] for call in self.mutations()],
+                         [('POST', 'user/repos'), ('POST', 'repos/alice/demo/labels')])
+        self.assertLessEqual(receipt_path.stat().st_size, 65536)
+        receipt = json.loads(receipt_path.read_text('utf-8'))
+        self.assertEqual(receipt['state'], 'ready')
+        self.assertFalse(set(receipt) & {'tasks', 'claim', 'supervisor', 'pm', 'events', 'order'})
+        self.assertFalse((self.folder / '.taskq' / 'bootstrap.lock').exists())
+
+    def test_native_queue_blocks_worker_supervisor_and_legacy_without_adopting_tasks(self):
+        for case in ('worker', 'supervisor', 'legacy', 'unlabelled-legacy', 'unrelated'):
+            with self.subTest(case=case):
+                raw = {'event_schema': taskq.EVENT_SCHEMA, 'events': []}
+                if case in ('worker', 'supervisor'):
+                    raw['claim' if case == 'worker' else 'supervisor'] = {
+                        'session': SESSION, 'runtime': 'claude', 'name': 'mac'}
+                elif case in ('legacy', 'unlabelled-legacy'):
+                    raw['event_schema'] = 1
+                else:
+                    raw['pm'] = {'session': 'another-manager', 'runtime': 'claude', 'name': 'mac'}
+                self.issues = [{'number': 17, 'title': 'Existing task', 'state': 'open',
+                                'html_url': 'https://github.com/alice/demo/issues/17',
+                                'updated_at': '2026-10-11T00:00:00Z', 'author_association': 'OWNER',
+                                'labels': [] if case == 'unlabelled-legacy' else [{'name': 'q-ready'}],
+                                'body': '<!-- taskq:start -->\n```json\n' + json.dumps(raw)
+                                        + '\n```\n<!-- taskq:end -->'}]
+                original = json.loads(json.dumps(self.issues))
+                if case == 'unrelated':
+                    self.assertEqual(self.plan()['queue_count'], 1)
+                else:
+                    with self.assertRaises(SystemExit):
+                        self.plan()
+                self.assertEqual(self.issues, original)
+                self.assertFalse(self.folder.exists())
+                self.assertFalse(self.mutations())
+
+    def test_unknown_auth_or_repository_lookup_never_proposes_creation(self):
+        provider = self.provider
+        for path, code in (('user', 401), ('repos/alice/demo', 403), ('repos/alice/demo', 500)):
+            with self.subTest(path=path, status=code):
+                def refused(tool, host, method, wanted, body=None):
+                    return (code, {}) if wanted == path else provider(tool, host, method, wanted, body)
+                with mock.patch.object(taskq, 'coordination_api', side_effect=refused), self.assertRaises(SystemExit):
+                    self.plan()
+                self.assertFalse(self.folder.exists())
+                self.assertFalse(self.mutations())
+
+    def test_invalid_provider_host_and_visual_url_refuse_before_api_access(self):
+        for field, value in (('provider', 'custom.py'), ('host', 'https://github.com'),
+                             ('repo', 'alice/../demo'), ('board_url', 'https://user:secret@example.com/board')):
+            with self.subTest(field=field):
+                previous = getattr(self.args, field)
+                setattr(self.args, field, value)
+                with self.assertRaises(SystemExit):
+                    self.plan()
+                setattr(self.args, field, previous)
+                self.assertFalse(self.calls)
+                self.assertFalse(self.folder.exists())
+
+    def test_same_size_content_change_with_restored_mtime_invalidates_approval(self):
+        self.folder.mkdir()
+        path = self.folder / 'draft.txt'
+        path.write_bytes(b'before')
+        stat = path.stat()
+        plan = self.plan()
+        path.write_bytes(b'after!')
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        with self.assertRaisesRegex(SystemExit, 'stale|changed'):
+            self.apply(plan)
+        self.assertEqual(path.read_bytes(), b'after!')
+        self.assertFalse((self.folder / '.git').exists())
+        self.assertFalse(self.mutations())
+
+    def test_expired_confirmation_refuses_without_effects(self):
+        plan = self.plan()
+        with mock.patch.object(taskq.time, 'time', return_value=2700):
+            with self.assertRaisesRegex(SystemExit, 'stale|expired'):
+                self.apply(plan)
+        self.assertFalse(self.folder.exists())
+        self.assertFalse(self.mutations())
+
+    def test_preview_names_exact_account_resources_and_private_visibility_without_effects(self):
+        self.exists = False
+        self.args.board_url = 'https://github.com/users/alice/projects/23'
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            plan = taskq.cmd_bootstrap(self.args)
+        rendered = out.getvalue()
+        for value in ('alice', '123', 'github.com', 'alice/demo', 'private', 'user/repos', plan['digest']):
+            self.assertIn(value.lower(), rendered.lower())
+        self.assertIn(str(self.folder).replace('\\', '\\\\'), rendered)
+        self.assertFalse(self.folder.exists())
+        self.assertFalse(self.mutations())
+
+    def test_existing_gitlab_requires_explicit_dedicated_coordination_identities(self):
+        self.args.provider, self.args.host = 'gitlab', 'gitlab.example'
+        self.folder.mkdir()
+        config = {'board': 'gitlab', 'host': 'gitlab.example', 'repo': 'alice/demo',
+                  'board_options': {'coordination_board': 11, 'coordination_label': 12}}
+        native = {'id': 456, 'path_with_namespace': 'alice/demo', 'visibility': 'private',
+                  'archived': False, 'issues_enabled': True, 'http_url_to_repo': 'https://gitlab.example/alice/demo.git',
+                  'permissions': {'project_access': {'access_level': 40}}}
+        board = {'id': 11, 'lists': []}
+        calls = []
+
+        def provider(tool, host, method, path, body=None):
+            self.assertEqual((tool, host, method, body), ('glab', 'gitlab.example', 'GET', None))
+            calls.append(path)
+            values = {'user': {'id': 123, 'username': 'alice'}, 'projects/alice%2Fdemo': native,
+                      'projects/alice%2Fdemo/boards/11': board,
+                      'projects/alice%2Fdemo/labels/12': {'id': 12, 'is_project_label': True},
+                      'projects/alice%2Fdemo/labels/taskq-events':
+                          {'id': 777, 'name': taskq.EVENT_LABEL, 'is_project_label': True}}
+            self.assertIn(path, values)
+            return 200, values[path]
+
+        with mock.patch.object(taskq, 'coordination_api', side_effect=provider), \
+                mock.patch.object(taskq, 'bootstrap_queue', return_value=0):
+            with self.assertRaises(SystemExit):
+                self.plan()
+            self.assertFalse((self.folder / 'taskq.json').exists())
+            (self.folder / 'taskq.json').write_text(json.dumps(config), encoding='utf-8')
+            self.assertEqual(self.plan()['operations'], [])
+            board['lists'] = [{'id': 99}]
+            with self.assertRaises(SystemExit):
+                self.plan()
+        self.assertIn('projects/alice%2Fdemo/boards/11', calls)
+        self.assertEqual(json.loads((self.folder / 'taskq.json').read_text('utf-8')), config)
+        self.assertFalse((self.folder / '.git').exists())
+
+    def test_new_repository_readback_must_match_approved_identity_and_private_visibility(self):
+        original = json.loads(json.dumps(self.native))
+        for change in ({'private': False}, {'full_name': 'alice/collision'}, {'id': 999}):
+            with self.subTest(change=change):
+                self.folder = self.root / next(iter(change))
+                self.args.setup = str(self.folder)
+                self.native, self.exists = json.loads(json.dumps(original)), False
+                plan = self.plan()
+                provider = self.provider
+
+                def changed(tool, host, method, path, body=None):
+                    code, native = provider(tool, host, method, path, body)
+                    if method == 'GET' and path == 'repositories/456':
+                        native.update(change)
+                    return code, native
+
+                with mock.patch.object(taskq, 'coordination_api', side_effect=changed), \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    self.apply(plan)
+                self.assertTrue(self.exists)
+                self.assertFalse((self.folder / 'taskq.json').exists())
+                receipt = json.loads((self.folder / '.taskq' / 'bootstrap.json').read_text('utf-8'))
+                self.assertEqual(receipt['operations'][0]['state'], 'intent')
+                self.assertFalse(any(method == 'DELETE' for method, _, _ in self.calls))
+
+    def test_corrupt_and_oversized_receipts_fail_closed_without_api_or_file_changes(self):
+        (self.folder / '.taskq').mkdir(parents=True)
+        path = self.folder / '.taskq' / 'bootstrap.json'
+        for contents in ('{', 'x' * 65537, '{"schema":1,"operations":[null]}'):
+            with self.subTest(size=len(contents)):
+                path.write_text(contents, encoding='utf-8')
+                before = path.read_bytes()
+                with self.assertRaises(SystemExit):
+                    self.plan()
+                self.assertEqual(path.read_bytes(), before)
+                self.assertFalse(self.calls)
+
+    def test_cli_preview_routes_before_project_config_and_never_starts_manager_or_arm(self):
+        with mock.patch.object(taskq, 'cmd_pm', side_effect=AssertionError('premature manager handoff')), \
+                mock.patch.object(taskq, 'cmd_arm', side_effect=AssertionError('setup started ARM')), \
+                mock.patch.object(taskq, 'BOARD', None), \
+                mock.patch.object(taskq, 'load_config', side_effect=AssertionError('premature project loading')):
+            out = self.run_cli('pm', '--setup', str(self.folder), '--name', 'Demo', '--provider', 'github',
+                               '--repo', 'alice/demo', '--host', 'github.com')
+        self.assertIn('Approval digest:', out)
+        self.assertFalse(self.folder.exists())
+        self.assertFalse(self.mutations())
+
+    def test_git_environment_override_refuses_before_remote_discovery_for_new_folder(self):
+        self.exists = False
+        for key, value in (('GIT_DIR', str(self.root / 'foreign.git')), ('GIT_CONFIG_COUNT', '1')):
+            with self.subTest(variable=key), mock.patch.dict(os.environ, {key: value}):
+                with self.assertRaisesRegex(SystemExit, 'Git environment'):
+                    self.plan()
+                self.assertFalse(self.calls)
+                self.assertFalse(self.folder.exists())
+
+    def test_local_write_failures_resume_preserving_originals_and_verified_resources(self):
+        for boundary in ('.gitignore', 'config.tmp', 'config-replace', 'AGENTS.md', 'ready-receipt'):
+            with self.subTest(boundary=boundary):
+                self.folder = self.root / boundary
+                self.args.setup = str(self.folder)
+                self.exists = False
+                self.calls.clear()
+                self.folder.mkdir()
+                (self.folder / 'original.txt').write_bytes(b'user work\x00\r\n')
+                plan = self.plan()
+                original_open, save, replace = Path.open, taskq.bootstrap_save, os.replace
+
+                def fail_open(path, mode='r', *args, **kwargs):
+                    if path.name == boundary and any(flag in mode for flag in 'wx'):
+                        raise OSError('injected local write failure')
+                    return original_open(path, mode, *args, **kwargs)
+
+                def fail_receipt(path, receipt):
+                    if boundary == 'ready-receipt' and receipt.get('state') == 'ready':
+                        raise OSError('injected local write failure')
+                    return save(path, receipt)
+
+                def fail_replace(source, target):
+                    if boundary == 'config-replace' and Path(target).name == 'taskq.json':
+                        raise OSError('injected local write failure')
+                    return replace(source, target)
+
+                with mock.patch.object(Path, 'open', fail_open), \
+                        mock.patch.object(taskq, 'bootstrap_save', side_effect=fail_receipt), \
+                        mock.patch.object(taskq.os, 'replace', side_effect=fail_replace), \
+                        self.assertRaisesRegex(OSError, 'injected local write failure'):
+                    self.apply(plan)
+                self.assertEqual((self.folder / 'original.txt').read_bytes(), b'user work\x00\r\n')
+                self.assertFalse((self.folder / '.taskq' / 'bootstrap.lock').exists())
+                self.apply(self.plan())
+                self.assertEqual(sum(method == 'POST' and path == 'user/repos'
+                                     for method, path, _ in self.calls), 1)
+                self.assertEqual((self.folder / 'original.txt').read_bytes(), b'user work\x00\r\n')
+                self.assertEqual(json.loads((self.folder / '.taskq' / 'bootstrap.json').read_text('utf-8'))['state'],
+                                 'ready')
+
+    def test_ignore_rules_append_without_rewriting_user_prefix_or_repeating_entries(self):
+        self.folder.mkdir()
+        prefix = b'# personal rules\r\n*.local'
+        path = self.folder / '.gitignore'
+        path.write_bytes(prefix)
+        self.apply(self.plan())
+        self.apply(self.plan())
+        contents = path.read_bytes()
+        self.assertTrue(contents.startswith(prefix))
+        self.assertEqual(contents.splitlines().count(b'.taskq/'), 1)
+        self.assertEqual(contents.splitlines().count(b'.worktrees/'), 1)
+        self.assertEqual(self.git('check-ignore', '.taskq/bootstrap.json'), '.taskq/bootstrap.json')
+
+    def test_matching_backup_remote_is_preserved_when_missing_origin_is_added(self):
+        self.folder.mkdir()
+        self.git('init', '-q')
+        self.git('remote', 'add', 'backup', 'git@github.com:alice/demo.git')
+        self.apply(self.plan())
+        self.assertEqual(self.git('remote', 'get-url', 'backup'), 'git@github.com:alice/demo.git')
+        self.assertEqual(self.git('remote', 'get-url', 'origin'), self.native['clone_url'])
+        self.assertFalse(self.mutations())
+
+    def test_explicit_main_checkout_preserves_registered_worktrees_and_their_dirty_files(self):
+        self.folder.mkdir()
+        self.git('init', '-q')
+        self.git('remote', 'add', 'origin', self.native['clone_url'])
+        (self.folder / 'file.txt').write_bytes(b'base\n')
+        self.git('add', 'file.txt')
+        self.git('commit', '-qm', 'base')
+        linked = self.folder / '.worktrees' / 'candidate'
+        self.git('worktree', 'add', '-q', '-b', 'candidate', str(linked))
+        (linked / 'file.txt').write_bytes(b'preserve dirty worker work\r\n')
+        before = {p.relative_to(linked): p.read_bytes() for p in linked.rglob('*') if p.is_file()}
+        registrations = self.git('worktree', 'list', '--porcelain')
+        self.apply(self.plan())
+        self.assertEqual(before, {p.relative_to(linked): p.read_bytes() for p in linked.rglob('*') if p.is_file()})
+        self.assertEqual(self.git('worktree', 'list', '--porcelain'), registrations)
+        self.assertFalse(self.mutations())
+
+    def test_gitlab_lost_coordination_and_event_label_boundaries_reconcile_without_duplicate_creates(self):
+        self.args.provider, self.args.host = 'gitlab', 'gitlab.example'
+        native = {'id': 456, 'path_with_namespace': 'alice/demo', 'visibility': 'private',
+                  'archived': False, 'issues_enabled': True, 'http_url_to_repo': 'https://gitlab.example/alice/demo.git',
+                  'permissions': {'project_access': {'access_level': 40}}}
+        for interrupted, phase in (('label', 'POST'), ('board', 'GET'), ('event_label', 'POST')):
+            with self.subTest(resource=interrupted, phase=phase):
+                self.folder = self.root / interrupted
+                self.args.setup, self.args.reconcile_id = str(self.folder), []
+                resources, calls, fail_boundary = {}, [], True
+                identities = {'label': 12, 'board': 13, 'event_label': 14}
+
+                def provider(tool, host, method, path, body=None):
+                    self.assertEqual((tool, host), ('glab', 'gitlab.example'))
+                    calls.append((method, path, body))
+                    kind = None
+                    if method == 'GET':
+                        if path == 'user':
+                            return 200, {'id': 123, 'username': 'alice'}
+                        if path == 'namespaces/alice':
+                            return 200, {'id': 321, 'full_path': 'alice', 'kind': 'user'}
+                        if path in ('projects/alice%2Fdemo', 'projects/456'):
+                            return (200, dict(native)) if 'repository' in resources else (404, {})
+                        if path.endswith('/labels/taskq-events'):
+                            kind = 'event_label'
+                        else:
+                            kind = next((key for key, number in identities.items()
+                                         if path.endswith('/' + str(number))), None)
+                        self.assertIsNotNone(kind, path)
+                        if fail_boundary and phase == 'GET' and kind == interrupted:
+                            raise RuntimeError('lost native resource readback')
+                        return (200, dict(resources[kind])) if kind in resources else (404, {})
+                    self.assertEqual(method, 'POST', 'bootstrap may never delete resources')
+                    if path == 'projects':
+                        kind = 'repository'
+                        self.assertEqual((body['visibility'], body['namespace_id']), ('private', 321))
+                        value = dict(native)
+                    elif path == 'projects/456/boards':
+                        kind, value = 'board', {'id': 13, 'name': body['name'], 'lists': []}
+                    else:
+                        self.assertEqual(path, 'projects/456/labels')
+                        kind = 'event_label' if body['name'] == taskq.EVENT_LABEL else 'label'
+                        value = {'id': identities[kind], 'name': body['name'], 'is_project_label': True}
+                    self.assertNotIn(kind, resources, f'duplicate {kind} creation')
+                    resources[kind] = value
+                    if fail_boundary and phase == 'POST' and kind == interrupted:
+                        raise RuntimeError('lost native resource creation reply')
+                    return 201, dict(value)
+
+                with mock.patch.object(taskq, 'coordination_api', side_effect=provider), \
+                        mock.patch.object(taskq, 'bootstrap_queue', return_value=0):
+                    plan = self.plan()
+                    with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(RuntimeError):
+                        self.apply(plan)
+                    self.assertFalse((self.folder / 'taskq.json').exists())
+                    with self.assertRaises(SystemExit):
+                        self.apply(plan)
+                    fail_boundary = False
+                    self.args.reconcile_id = [f'{interrupted}:{identities[interrupted]}']
+                    self.apply(self.plan())
+                    self.args.reconcile_id = []
+                    self.apply(self.plan())
+                self.assertEqual(set(resources), {'repository', 'label', 'board', 'event_label'})
+                self.assertEqual(sum(method == 'POST' for method, _, _ in calls), 4)
+                receipt = json.loads((self.folder / '.taskq' / 'bootstrap.json').read_text('utf-8'))
+                self.assertEqual(receipt['state'], 'ready')
+                config = json.loads((self.folder / 'taskq.json').read_text('utf-8'))
+                self.assertEqual(config['board_options'], {'coordination_board': 13, 'coordination_label': 12})
+
+    def test_missing_event_label_requires_approval_and_is_created_only_once(self):
+        self.event_label = None
+        plan = self.plan()
+        self.assertEqual([operation['kind'] for operation in plan['operations']], ['event_label'])
+        self.assertFalse(self.mutations())
+        self.assertFalse(self.folder.exists())
+        self.apply(plan)
+        self.apply(self.plan())
+        self.assertEqual([call[:2] for call in self.mutations()], [('POST', 'repos/alice/demo/labels')])
+        receipt = json.loads((self.folder / '.taskq' / 'bootstrap.json').read_text('utf-8'))
+        self.assertEqual((receipt['operations'][0]['id'], receipt['operations'][0]['state']), (777, 'verified'))
+
+    def test_unverified_event_label_never_claims_readiness(self):
+        provider = self.provider
+        for code, label in ((403, {}), (200, {'id': 777, 'name': 'wrong-label'})):
+            with self.subTest(status=code):
+                def unverified(tool, host, method, path, body=None):
+                    if path == 'repos/alice/demo/labels/taskq-events':
+                        return code, label
+                    return provider(tool, host, method, path, body)
+                with mock.patch.object(taskq, 'coordination_api', side_effect=unverified), self.assertRaises(SystemExit):
+                    self.plan()
+                self.assertFalse(self.folder.exists())
+                self.assertFalse(self.mutations())
+
+    def test_preview_preserves_unicode_quoted_choices_and_complete_approval_at_terminal_widths(self):
+        self.args.name = '\u0417\u0430\u043c\u0435\u0442\u043a\u0438 \'review\' "phase"'
+        self.args.board_url = 'https://github.com/users/alice/projects/23'
+        rendered = []
+        for width in ('40', '80', '120'):
+            with self.subTest(width=width), mock.patch.dict(os.environ, {'COLUMNS': width}), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                plan = taskq.cmd_bootstrap(self.args)
+                view = output.getvalue()
+                self.assertIn('Project: ' + json.dumps(self.args.name, ensure_ascii=False), view)
+                self.assertIn('1. Apply this exact plan (recommended).\n2. Change the choice and preview again.\n'
+                              '3. Cancel; keep everything.', view)
+                self.assertIn('Approval digest: ' + plan['digest'], view)
+                self.assertIn('Approval expires:', view)
+                self.assertIn('--approve ' + plan['digest'], view)
+                self.assertIn('alice/demo', view)
+                self.assertIn('github.com', view)
+                self.assertIn('123', view)
+                self.assertIn(self.args.board_url, view)
+                self.assertNotIn('\u2026', view)
+                rendered.append(view)
+        self.assertEqual(rendered, [rendered[0]] * 3)
+        self.assertFalse(self.folder.exists())
+        self.assertFalse(self.mutations())
+
+    def test_cli_rejects_mixed_pm_actions_and_qualification_fixture_before_bootstrap(self):
+        argv = ('pm', '--setup', str(self.folder), '--name', 'Demo', '--provider', 'github',
+                '--repo', 'alice/demo', '--host', 'github.com')
+        for extra in (('--adopt', '17'), ('--subscribe', 'watch'), ('--scope-task', '17'),
+                      ('--delivery-ack', 'digest'), ('--status',), ('--format', 'text')):
+            with self.subTest(extra=extra), self.assertRaisesRegex(SystemExit, 'cannot be combined'):
+                self.run_cli(*argv, *extra)
+        with mock.patch.object(taskq, 'qualification_fixture', return_value={'scoped': True}), \
+                self.assertRaisesRegex(SystemExit, 'qualification-only'):
+            self.run_cli(*argv)
+        with self.assertRaisesRegex(SystemExit, 'require --setup'):
+            self.run_cli('pm', '--approve', '0' * 64)
+        self.assertFalse(self.calls)
+        self.assertFalse(self.folder.exists())
+
+    def test_linked_or_reparse_git_metadata_refuses_before_provider_reads(self):
+        self.folder.mkdir()
+        self.git('init', '-q')
+        (self.folder / 'original.txt').write_bytes(b'unchanged\n')
+        self.git('add', 'original.txt')
+        self.git('commit', '-qm', 'base')
+        real_lstat, real_symlink = Path.lstat, Path.is_symlink
+        for name in ('config', 'index', 'HEAD', 'commondir'):
+            metadata = self.folder / '.git' / name
+            if name == 'commondir':
+                metadata.write_text('.\n', encoding='utf-8')
+            before = metadata.read_bytes()
+            for linked in ('symlink', 'reparse'):
+                with self.subTest(name=name, link=linked):
+                    def lstat(path, *args, **kwargs):
+                        result = real_lstat(path, *args, **kwargs)
+                        if linked == 'reparse' and path == metadata:
+                            return taskq.argparse.Namespace(st_mode=result.st_mode, st_file_attributes=0x400)
+                        return result
+
+                    def is_symlink(path):
+                        return linked == 'symlink' and path == metadata or real_symlink(path)
+
+                    with mock.patch.object(Path, 'lstat', lstat), mock.patch.object(Path, 'is_symlink', is_symlink), \
+                            self.assertRaisesRegex(SystemExit, 'linked Git metadata'):
+                        self.plan()
+                    self.assertEqual(metadata.read_bytes(), before)
+                    self.assertFalse(self.calls)
+                    self.assertFalse((self.folder / '.taskq').exists())
+
+    def test_interrupted_intent_save_retains_temp_evidence_and_never_posts(self):
+        self.exists = False
+        plan = self.plan()
+        original_replace = os.replace
+
+        def fail_receipt_publish(source, target):
+            if Path(target).name == 'bootstrap.json':
+                raise OSError('interrupted receipt publish')
+            return original_replace(source, target)
+
+        with mock.patch.object(taskq.os, 'replace', side_effect=fail_receipt_publish), \
+                self.assertRaisesRegex(OSError, 'interrupted receipt publish'):
+            self.apply(plan)
+        temporary = self.folder / '.taskq' / 'bootstrap.tmp'
+        evidence = temporary.read_bytes()
+        self.assertEqual(json.loads(evidence)['operations'][0]['state'], 'intent')
+        self.assertFalse((self.folder / '.taskq' / 'bootstrap.json').exists())
+        self.assertFalse(self.mutations())
+        with self.assertRaisesRegex(SystemExit, 'bootstrap.tmp.*recovery file'):
+            self.apply(self.plan())
+        self.assertEqual(temporary.read_bytes(), evidence)
+        self.assertFalse(self.exists)
+        self.assertFalse(self.mutations())
+        self.assertFalse((self.folder / 'taskq.json').exists())
+
+    def test_replaced_bootstrap_lock_is_retained_for_explicit_reconciliation(self):
+        plan = self.plan()
+        original_local = taskq.bootstrap_local
+        lock = self.folder / '.taskq' / 'bootstrap.lock'
+        owned = []
+
+        def replace_owned_lock(root):
+            if lock.exists():
+                owned.append(lock.read_text('utf-8'))
+                lock.write_text('another setup owns this lock', encoding='utf-8')
+                raise RuntimeError('interrupted before provider mutation')
+            return original_local(root)
+
+        with mock.patch.object(taskq, 'bootstrap_local', side_effect=replace_owned_lock), \
+                self.assertRaisesRegex(SystemExit, 'lock changed'):
+            self.apply(plan)
+        self.assertEqual(len(owned), 1)
+        self.assertTrue(owned[0], 'exclusive lock must carry its acquisition identity')
+        self.assertEqual(lock.read_text('utf-8'), 'another setup owns this lock')
+        self.assertFalse(self.mutations())
+        self.assertFalse((self.folder / 'taskq.json').exists())
+
+    def test_reused_gitlab_repository_requires_canonical_guard_before_any_coordination_creation(self):
+        for rejected in (False, True):
+            with self.subTest(known_rejection=rejected):
+                self.assert_reused_gitlab_repository_keeps_guard(rejected)
+
+    def assert_reused_gitlab_repository_keeps_guard(self, rejected):
+        self.folder = self.root / ('rejected-reuse' if rejected else 'unknown-reuse')
+        self.args.setup, self.args.reconcile_id = str(self.folder), []
+        self.args.provider, self.args.host = 'gitlab', 'gitlab.example'
+        native = {'id': 456, 'path_with_namespace': 'alice/demo', 'visibility': 'private',
+                  'archived': False, 'issues_enabled': True, 'http_url_to_repo': 'https://gitlab.example/alice/demo.git',
+                  'permissions': {'project_access': {'access_level': 40}}}
+        created, calls = False, []
+
+        def provider(tool, host, method, path, body=None):
+            nonlocal created
+            self.assertEqual((tool, host), ('glab', 'gitlab.example'))
+            calls.append((method, path))
+            if method == 'GET' and path == 'user':
+                return 200, {'id': 123, 'username': 'alice'}
+            if method == 'GET' and path == 'namespaces/alice':
+                return 200, {'id': 321, 'full_path': 'alice', 'kind': 'user'}
+            if method == 'GET' and path in ('projects/alice%2Fdemo', 'projects/456'):
+                return (200, dict(native)) if created else (404, {})
+            if method == 'GET' and path.endswith('/labels/taskq-events'):
+                return 200, {'id': 777, 'name': taskq.EVENT_LABEL, 'is_project_label': True}
+            if method == 'GET' and path.endswith('/boards/11'):
+                return 200, {'id': 11, 'lists': []}
+            if method == 'GET' and path.endswith('/labels/12'):
+                return 200, {'id': 12, 'is_project_label': True}
+            if method == 'POST' and path == 'projects':
+                self.assertFalse(created)
+                created = True
+                if rejected:
+                    return 422, {'message': 'project already exists'}
+                raise RuntimeError('lost repository creation reply')
+            self.fail(f'reused repository must not discover or create a second guard: {method} {path}')
+
+        with mock.patch.object(taskq, 'coordination_api', side_effect=provider), \
+                mock.patch.object(taskq, 'bootstrap_queue', return_value=0):
+            plan = self.plan()
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit if rejected else RuntimeError):
+                self.apply(plan)
+            receipt = self.folder / '.taskq' / 'bootstrap.json'
+            original_intent = receipt.read_bytes()
+            self.args.reconcile_id = ['repository:456']
+            with self.assertRaisesRegex(SystemExit, 'canonical|coordination'):
+                self.plan()
+            self.assertEqual(receipt.read_bytes(), original_intent)
+            config = {'board': 'gitlab', 'host': 'gitlab.example', 'repo': 'alice/demo',
+                      'board_options': {'coordination_board': 11, 'coordination_label': 12}}
+            (self.folder / 'taskq.json').write_text(json.dumps(config), encoding='utf-8')
+            self.apply(self.plan())
+        self.assertEqual([call for call in calls if call[0] != 'GET'], [('POST', 'projects')])
+        self.assertTrue(created)
+        self.assertEqual(json.loads((self.folder / 'taskq.json').read_text('utf-8')), config)
+        self.assertEqual(json.loads(receipt.read_text('utf-8'))['operations'][0]['state'], 'reused')
+
+    def test_known_repository_rejections_allow_fresh_approval_after_same_account_repair(self):
+        for status in (400, 401, 403, 422):
+            with self.subTest(status=status):
+                self.folder = self.root / str(status)
+                self.args.setup = str(self.folder)
+                self.exists, self.calls = False, []
+                plan = self.plan()
+                provider = self.provider
+
+                def reject(tool, host, method, path, body=None):
+                    if method == 'POST' and path == 'user/repos':
+                        self.calls.append((method, path, body))
+                        return status, {'message': 'native request rejected before creation'}
+                    return provider(tool, host, method, path, body)
+
+                with mock.patch.object(taskq, 'coordination_api', side_effect=reject), \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    self.apply(plan)
+                receipt = self.folder / '.taskq' / 'bootstrap.json'
+                rejected = json.loads(receipt.read_text('utf-8'))
+                self.assertEqual(rejected['operations'][0]['state'], 'rejected')
+                self.assertIn(str(status), json.dumps(rejected))
+                self.assertFalse(self.exists)
+                self.assertFalse((self.folder / 'taskq.json').exists())
+                recovery = self.plan()
+                self.assertNotEqual(recovery['digest'], plan['digest'])
+                self.apply(recovery)
+                self.apply(self.plan())
+                operations = json.loads(receipt.read_text('utf-8'))['operations']
+                self.assertEqual(sum(operation['kind'] == 'repository' for operation in operations), 1)
+                repository = next(operation for operation in operations if operation['kind'] == 'repository')
+                self.assertEqual(repository['last_rejection']['http_status'], status)
+                self.assertEqual(repository['last_rejection']['request']['path'], 'user/repos')
+                self.assertEqual(sum(method == 'POST' and path == 'user/repos'
+                                     for method, path, _ in self.calls), 2)
+                self.assertTrue(self.exists)
+
+
+
 class Model(Base):
 
     def test_project_capacity_can_span_hosts_without_overriding_local_host_limit(self):
@@ -5416,7 +6243,7 @@ class Model(Base):
 
     def test_contract_keeps_principles(self):
         # #311: a rewrite of taskq.md must not drop a principle silently (change rule: amend, never overwrite)
-        text = (ROOT / 'taskq.md').read_text()
+        text = (ROOT / 'taskq.md').read_text('utf-8')
         self.assertEqual(re.findall(r'^### (R\d+)\. ', text, re.M), [f'R{n}' for n in range(1, 14)])
         self.assertIn('\n### Change rule\n', text)
         self.assertIn('\n## Product\n', text)  # #505: product decisions live here

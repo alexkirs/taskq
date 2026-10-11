@@ -1,3 +1,52 @@
+### #657 host service first slice (protocol 1)
+
+The approved host service is a current-user execution owner, not a replacement model worker.
+`taskq service register --project ABS --install-dir ABS --name ARM` stages one existing
+project in a private host registry without changing board, credentials, ARM or capacity.
+`serve` owns one bounded cadence; `client status|list|pm` returns inert versioned JSON,
+and `client pause|resume|stop` controls only service admission. Existing genuine agents
+still own native ARM authorization, decisions, ACKs and applications; local clients cannot
+assert another agent session. `explain` produces an explicit analytical assignment bound
+to the read snapshot, never an implicit model call from list/status.
+
+Migration requires a reviewed completed-source checkpoint before `claim`: the old OS
+source is disabled, owned controller/after-turn routes accounted, and the exact config,
+release and ARM scheduler binding preserved. Unknown writers refuse. Claim records a
+new project dispatch epoch. Native tick/ARM admissions then require the exact service
+admitted child PID/birth and epoch; completion writes are not fenced. Legacy releases
+without this gate must be settled before cutover. `release` is allowed only while paused
+with no pending operation; restore the SAME old scheduler after release, never live ledgers.
+Do not use a process-dead hint to clear unknown inflight operation or model recovery.
+
+The registry records project locations and controller receipts, never task claims or secrets.
+IPC accepts only the current OS user (Unix peer credentials / Windows named-pipe peer
+process token), versioned JSON bytes, bounded messages, and no pickle/shell-text protocol.
+Both client and server verify the OS peer. The registry directory is owner-only (Unix
+0700; protected current-user Windows DACL). Existing insecure or linked homes refuse;
+registration restricts only its newly created directory, never global OS permissions.
+A local service command grants no native board or manager authority. Mutating requests
+have exact IDs/digests; identical replay returns recorded response, conflicts refuse.
+Responses identify observed_at, atomic=false, epoch and effect status. PM views expose
+inert task events; transport delivery is not event ACK, decision or application.
+Control state and its replay response commit atomically. Before resume or dispatch the
+service verifies that the project still names this exact registry/epoch; interrupted
+cross-registry migration remains fenced rather than automatically restoring ownership.
+
+The service invokes the existing qualified managed launcher with fixed finite invocation
+and no agent IDs. Immutable selection remains at process boundaries. Code/contract/config
+drift refuses; an upgrade original-effect refusal is retained before a fresh later cadence.
+An idle service may restart under the same OS source only after all its journal operations
+are complete. An interrupted unknown child operation blocks admission after restart;
+no worker replacement, PID kill, model barrier clear or automatic ledger rollback.
+Native project coordination serializes an after-turn race; raw process substring matches
+are not admission authority. Mac4/Win4/shared8/Claude0 and existing holds remain unchanged.
+
+Implementation/publication gates require isolated real lifecycle concurrency/replay tests,
+wrong-user/project/epoch/birth/config negatives, native host IPC and natural cadence,
+controlled migration/rollback, exact-head review/CI and qualified upstream release metadata.
+No stable release is inferred from a manually installed commit. Onboarding #600 remains
+project-init; it must not silently install a host service or add a second dispatcher.
+
 # taskq — the contract
 
 ### #646 executable ARM/PM contract
@@ -18,7 +67,7 @@ A pending replay does not refresh that timestamp; offline reads leave it and
 the cursor intact. A quiet successful poll records observation time without a
 new envelope. Reconnect uses the same session/name/cache and replays pending
 bytes; a new session starts its own snapshot. Missing event history remains
-explicit in the envelope. No new daemon, UI bridge or second task authority is
+explicit in the envelope. Subscribing alone installs no daemon, UI bridge or second task authority; none is
 introduced by these adapters.
 
 Versioned owner decision: the typed snapshot exposes `question_revision` for a
@@ -289,6 +338,15 @@ number and records old → new with the task. A rule elsewhere that disagrees wi
 rule or amend this one, never keep both. A new rule gets the next R-number.
 
 ### R1. Board is the only state and lock
+
+Changed (#600, R1/R13): local files were runtime handles only (apart from bounded
+transport caches) -> project bootstrap may keep one bounded owned-resource
+operation handle and serialize its local file/provisioning steps before a queue
+exists. It records intent and verified native resource IDs, never tasks, claims,
+answers, manager authority or acceptance. Unknown effects remain unresolved;
+names alone cannot establish ownership. Once the queue exists its native project
+guard remains the only task-operation lock. No bootstrap receipt authorizes task
+execution or external cleanup.
 
 The issue's `q-*` label, its JSON block and trusted comments hold all task state, claims and history (§ 3). No extra
 task database, task queue or authoritative receipt store. Local files under `.taskq/` are runtime handles (§ 8),
@@ -800,6 +858,110 @@ Owner decisions on what taskq looks and sounds like, one line each (#505). Chang
 
 ## 1. Setup (once per project)
 
+### Shared project bootstrap (#600)
+
+New and existing projects use the same agent conversation, then `taskq pm`.
+The agent previews `taskq pm --setup <exact-folder> --name Notes --provider github
+--repo <owner>/notes --host github.com`. GitLab uses `--provider gitlab` and the
+selected host. The preview is read-only; only `--approve <preview-digest>` applies
+its exact plan after fresh account, resource and local-source checks. Approval of
+one preview is not permission for changed resources, access or publication.
+The preview displays its expiry: approval is valid only within its current
+15-minute UTC window. Expiry requires a fresh preview; resource handles do not expire.
+It also binds the selected runtime/installation and exact implementation/contract;
+an update requires rereading the selected contract and a fresh preview.
+Resolve the name and exact folder first. Inspect files, nearest configuration,
+Git roots/worktrees and every remote before proposing changes. Preserve originals,
+dirty work, unknown configuration fields and existing ownership. Nested repositories,
+foreign parent configuration and conflicting identities need one concrete owner choice.
+
+Recommended plan: authenticated provider account, exact namespace/repository,
+PRIVATE for a new repository, its issue queue, exact folder and required local changes.
+GitHub Projects and GitLab visual boards are optional views, never queue authority;
+`board_url` changes only the link. Native GitLab writes additionally need dedicated,
+explicitly provisioned coordination board/label IDs. Existing resources are verified,
+never repurposed by name. Custom `.py` adapters may read an existing queue after
+validation; unsupported provisioning requires supported-provider/manual setup.
+Verify the reserved `taskq-events` label on either native provider; if absent,
+include its exact creation/readback in the approved bootstrap, even for an empty queue.
+This is label setup, never implicit task repair or migration.
+
+Before creation, sharing, visibility/access changes or external sandbox qualification,
+show the exact account, host, identities, visibility, resources and operations and
+obtain explicit confirmation. Changed account/context invalidates it. Record bounded
+bootstrap operation intents and native identity readbacks, not task state. Unknown
+creation stops for reconciliation; do not repeat it from a matching name. Cancellation
+preserves all files/resources; resource deletion requires separate concrete approval.
+
+Verify effective configuration, native repository/queue identity, queue read (empty is
+valid), required write capabilities and genuine manager role before handing off to
+`taskq pm`. Do not adopt unrelated tasks, arm execution, start workers, choose models,
+change security or install paid services. Setup success is not execution/wake proof.
+
+| Provider | Queue and setup | Optional visual board |
+|---|---|---|
+| GitHub, including explicit enterprise host | Native repository issues; verify existing repository or confirm new PRIVATE repository | Select an existing view with `--board-url`; creation is not supported by this slice |
+| GitLab, including self-managed host | Native project issues; verify existing project or confirm new PRIVATE project; verify/provision dedicated coordination resources | Select an existing view with `--board-url`; the dedicated coordination board is not a task view |
+| Existing custom `.py` adapter | Manual § 2 configuration, validate its read/write/guard capabilities; no generic provider provisioning | Only the adapter's supported operations; do not promise arbitrary visual-board creation |
+
+Keep the shared installation separate. New local Git/config/ignore/agent instructions
+are named in the preview; existing Git history, index, files, instructions, remotes
+and unknown config fields survive. No source-file commit or push is implied. A
+new local repository has no published source branch yet: review and commit the
+setup files per § 1 before execution, then separately approve any initial push.
+Until then plan with `taskq add --later`; do not arm or dispatch an unborn checkout.
+This bootstrap verifies setup/manager readiness, not source publication or workers. A
+partial setup reports its exact boundary and one recovery step; resume verifies
+owned native IDs and local bytes. Never clean up reused/shared resources, and never
+delete a created external resource without separate approval. Login gaps follow
+the supported owner/admin steps below; no credentials are copied or printed.
+
+An unknown creation response cannot prove that a same-name resource is ours.
+After independent inspection the owner may explicitly select its native ID with
+`--reconcile-id repository:ID`, `label:ID`, `board:ID` or `event_label:ID` (repeat for each unresolved
+intent). Review and approve the new preview. This authorizes association with a
+verified existing resource; it preserves the original unknown intent and records
+reuse, never creation ownership or cleanup permission. Changed account/host or
+resource context requires a new decision, never the old approval.
+For GitLab, repository reuse cannot authorize a second coordination guard:
+select/verify its canonical coordination IDs before any further provisioning.
+
+Native POST rejection (HTTP 400/401/403/422) is recorded as rejected with its
+status, not a created-resource claim. Correct the reported input/login/permission
+for the same account, then review and approve a fresh preview; a new attempt keeps
+the last rejection evidence. An existing resource is still reuse, never ownership.
+Transport, 5xx and conflicting/missing readback outcomes remain unknown and cannot
+use this retry route.
+
+Interrupted local receipt publication preserves `.taskq/bootstrap.tmp`; it is not
+silently deleted or promoted. Stop/drain the setup process, inspect the pending
+receipt and its native resource IDs, then explicitly reconcile that local receipt
+before retrying. A retained/replaced `.taskq/bootstrap.lock` likewise requires
+stopped-process reconciliation, never timeout-based stealing. Original/foreign
+files and shared resources remain untouched. Selected linked worktrees, unrelated
+nested repositories and inventories above 10000 files use manual setup; an
+explicit main root preserves its registered worktrees.
+
+Example choice: Notes · GitHub/github.com · alice/notes · PRIVATE · issue queue ·
+~/Projects/notes. 1. Create this exact private repository (recommended).
+2. Select a verified existing repository. 3. Cancel; keep everything.
+RU: Notes · GitHub/github.com · alice/notes · PRIVATE · очередь issues ·
+~/Projects/notes. 1. Создать этот закрытый репозиторий (рекомендуется).
+2. Выбрать проверенный существующий репозиторий. 3. Отмена; ничего не менять.
+
+NEW: “Install TaskQ from https://github.com/alexkirs/taskq. Create project Notes from
+this idea in ~/Projects/notes; help me choose a repository and board, then plan it.”
+EXISTING: “Set up TaskQ for my project in ~/Projects/notes; keep its files and repository,
+then start project management.”
+RU NEW: «Установи TaskQ из https://github.com/alexkirs/taskq. Создай проект Notes из
+этой идеи в ~/Projects/notes; помоги выбрать репозиторий и доску, затем составь план».
+RU EXISTING: «Настрой TaskQ для проекта в ~/Projects/notes; сохрани файлы и репозиторий,
+затем начни управление проектом».
+
+This is a candidate until independent review and provider-specific sandbox
+qualification. Unqualified providers remain explicitly unqualified; do not merge,
+install or describe a mock response as a live project creation/PM receipt.
+
 Setup again: identify the installed entrypoint first. A legacy package follows § "Upgrade a legacy package
 installation" below before any pull of its clone. An already qualified single-file clone follows § 1.2's
 explicit update procedure below and then re-reads this file; preserve project changes when updating the project checkout.
@@ -913,8 +1075,8 @@ line endings require their own exact predecessor digest in the attestation; neve
 Release metadata is trusted to canonical repository maintainers; author metadata does not prove who
 last edited the mutable release body. This is explicit owner qualification,
 including native host evidence and unchanged adapter/model/effort/permission semantics; neither a
-green Linux CI nor an arbitrary main HEAD supplies it. No macOS automatic installation ships: native
-macOS qualification is unavailable. Other Linux hosts are unsupported, not mislabeled WSL.
+green Linux CI nor an arbitrary main HEAD supplies it. macOS automatic selection requires an explicit `mac` native qualification in the same
+owner-published record; an absent Mac proof refuses. #657 adds this host token, not a proof. Other Linux hosts are unsupported, not mislabeled WSL.
 
 The manifest must qualify the selected release and every retained compatible predecessor (maximum
 16) and keep the current operational schema and protocol. Missing pair/host evidence refuses the

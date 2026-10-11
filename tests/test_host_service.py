@@ -22,6 +22,48 @@ class ServiceTests(unittest.TestCase):
         h.save_state(self.db,self.state);self.db.commit()
     def value(self,operation='resume',id='one'):
         return {'version':1,'id':id,'epoch':'epoch1','operation':operation}
+    def test_dispatch_model_paused_wake_and_fallback(self):
+        for phase in ('paused','staged','legacy'):
+            self.assertFalse(h.dispatch_ready(phase,10,0,True))
+        self.assertTrue(h.dispatch_ready('active',10,10,False))
+        self.assertTrue(h.dispatch_ready('active',10,180,True))
+        self.assertFalse(h.dispatch_ready('active',10,180,False))
+    def test_wakes_defer_unknown_birth_coalesce_and_preserve_new_events(self):
+        h.private_home(self.home,created=True)
+        folder=self.home/'.taskq';folder.mkdir()
+        with contextlib.closing(h.connect_db(folder/'dispatch-owner.sqlite')) as owner:
+            h.save_state(owner,{'version':1,'phase':'owned','epoch':'epoch1','registry':str(self.home/'registry.sqlite')});owner.commit()
+        (self.home/'taskq.json').write_bytes(b'{}')
+        state=h.read_state(self.db);state.update(project=str(self.home),config_sha256=h.hashlib.sha256(b'{}').hexdigest())
+        h.save_state(self.db,state);self.db.commit()
+        fake=mock.Mock();fake.process_state.return_value='unknown'
+        h.notify(self.home,[1]);h.notify(self.home,[2]);h.notify(self.home,[],123,'birth1')
+        self.assertEqual(2,self.db.execute('SELECT count(*) FROM wakes').fetchone()[0])
+        self.assertEqual((False,[]),h.take_wakes(fake,self.db,self.home))
+        state['phase']='active';h.save_state(self.db,state);self.db.commit()
+        self.assertEqual((True,[1,2]),h.take_wakes(fake,self.db,self.home))
+        self.assertEqual((False,[]),h.take_wakes(fake,self.db,self.home))
+        fake.process_state.return_value='running'
+        self.assertEqual((False,[]),h.take_wakes(fake,self.db,self.home))
+        fake.process_state.return_value='dead'
+        self.assertEqual((True,[]),h.take_wakes(fake,self.db,self.home))
+        h.notify(self.home,[3])  # a mutation while a pass runs survives for the subsequent pass
+        self.assertEqual((True,[3]),h.take_wakes(fake,self.db,self.home))
+        self.assertEqual((False,[]),h.take_wakes(fake,self.db,self.home))
+        with self.assertRaisesRegex(ValueError,'PID/birth'):h.notify(self.home,[],123,None)
+        (self.home/'taskq.json').write_bytes(b'changed')
+        with self.assertRaisesRegex(ValueError,'config changed'):h.notify(self.home,[4])
+    def test_wake_stale_epoch_malformed_and_bound_fail_closed(self):
+        state=h.read_state(self.db);state['phase']='active';h.save_state(self.db,state);self.db.commit()
+        fake=mock.Mock();fake.process_state.return_value='dead'
+        value={'epoch':'old','tasks':[1],'after':None,'birth':None}
+        key=h.digest({'epoch':'old','pid':None,'birth':None})
+        self.db.execute('INSERT INTO wakes VALUES (?,?)',(key,json.dumps(value)));self.db.commit()
+        with mock.patch.object(h,'validate_owner'):
+            self.assertEqual((False,[]),h.take_wakes(fake,self.db,self.home))
+            self.db.execute('INSERT INTO wakes VALUES (?,?)',('bad','{}'));self.db.commit()
+            with self.assertRaisesRegex(ValueError,'wake'):h.take_wakes(fake,self.db,self.home)
+            self.assertEqual(2,self.db.execute('SELECT count(*) FROM wakes').fetchone()[0])
     def test_mutation_replay_and_conflict_persisted(self):
         first=h.request(None,self.db,self.value());self.assertEqual(first,h.request(None,self.db,self.value()))
         self.db.close();self.db=h.connect_db(self.home/'registry.sqlite');self.addCleanup(self.db.close)
@@ -35,6 +77,37 @@ class ServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(sqlite3.OperationalError,'locked'):
                 h.connect_db(self.home/'failed.sqlite')
         connection.close.assert_called_once_with()
+
+    def test_busy_wake_registry_diagnostic_cannot_kill_source(self):
+        with contextlib.closing(sqlite3.connect(self.home/'registry.sqlite',timeout=0)) as writer:
+            writer.execute('BEGIN IMMEDIATE')
+            with mock.patch('sys.stderr'):
+                h.record_error(self.db,sqlite3.OperationalError('busy wake writer'))
+            self.assertFalse(self.db.in_transaction)
+            writer.rollback()
+        self.assertEqual('paused',h.read_state(self.db)['phase'])
+
+    def test_mailbox_failure_and_read_requests_do_not_starve_due_pass(self):
+        fake=mock.Mock();fake.CLONE=self.home;fake.SESSIONS={}
+        (self.home/'current.json').write_text(json.dumps({'path':str(self.home),'commit':self.home.name}))
+        for queued in (False,True):
+            with self.subTest(queued=queued):
+                state=h.read_state(self.db);state.update(phase='active',stop=False,install_dir=str(self.home))
+                h.save_state(self.db,state);self.db.commit()
+                pending=mock.Mock()
+                pending.get.side_effect=None if queued else h.queue.Empty
+                pending.get.return_value=(mock.Mock(),self.value('status'))
+                def finished(*args):
+                    state=h.read_state(self.db);state['stop']=True;h.save_state(self.db,state);self.db.commit()
+                with mock.patch.object(h,'owner_lock',return_value=contextlib.nullcontext()), \
+                        mock.patch.object(h,'validate_owner'),mock.patch.object(h.ipc,'Listener'), \
+                        mock.patch.object(h.threading,'Thread'),mock.patch.object(h.queue,'Queue',return_value=pending), \
+                        mock.patch.object(h,'request',return_value={'outcome':'observed'}), \
+                        mock.patch.object(h,'take_wakes',side_effect=ValueError('malformed wake')), \
+                        mock.patch.object(h,'run_pass',side_effect=finished) as run, \
+                        mock.patch.dict(os.environ,{},clear=True),mock.patch('sys.stderr'):
+                    h.serve(fake,self.db,self.home,180)
+                run.assert_called_once_with(fake,self.db,self.home,[])
 
     def test_cache_write_failure_rolls_back_control_state(self):
         self.db.execute("CREATE TRIGGER reject_receipt BEFORE INSERT ON requests BEGIN SELECT RAISE(ABORT,'receipt unavailable'); END")
@@ -210,7 +283,7 @@ class NativeMigration(unittest.TestCase):
                         except OSError:
                             self.assertIsNone(process.poll(),log.read_text('utf-8'));self.assertLess(time.monotonic(),deadline);time.sleep(.05)
                     cli(service+['client','resume','--id','resume-fixture'])
-                    deadline=time.monotonic()+70
+                    deadline=time.monotonic()+10  # resume must dispatch before the 60-second fallback
                     while True:
                         # Observe the live journal without schema writes; close even on read failure.
                         with contextlib.closing(sqlite3.connect((home/'registry.sqlite').as_uri()+'?mode=ro',uri=True,timeout=5)) as observed_db:
@@ -220,6 +293,15 @@ class NativeMigration(unittest.TestCase):
                     self.assertEqual(0,state['operation']['exit'],Path(state['operation']['log']).read_text('utf-8'))
                     receipt=json.loads((home/(state['operation']['id']+'-terminal.json')).read_text('utf-8'))
                     self.assertEqual(state['operation']['child'],receipt['child']);self.assertEqual(state['operation']['log_sha256'],receipt['log_sha256'])
+                    previous=state['operation']['id']
+                    h.notify(project,[])  # real cross-process local wake; no task/provider/model fixture
+                    deadline=time.monotonic()+10
+                    while True:
+                        with contextlib.closing(sqlite3.connect((home/'registry.sqlite').as_uri()+'?mode=ro',uri=True,timeout=5)) as observed_db:
+                            state=h.read_state(observed_db)
+                        if state['operation']['id']!=previous and state['operation']['phase']=='complete':break
+                        self.assertIsNone(process.poll(),log.read_text('utf-8'));self.assertLess(time.monotonic(),deadline);time.sleep(.1)
+                    self.assertEqual(0,state['operation']['exit'])
                     observed=cli(service+['client','status','--id','status-fixture']);self.assertEqual('observed',json.loads(observed.stdout)['outcome'])
                     cli(service+['client','stop','--id','stop-fixture']);self.assertEqual(0,process.wait(timeout=10))
                 finally:

@@ -5991,7 +5991,7 @@ class TightAssignmentDesign(unittest.TestCase):
                 self.assertEqual(candidate.eligible(assignees, login, strict), expected)
 
     def test_candidate_is_not_imported_by_production(self):
-        self.assertNotIn('assignment_model', (ROOT / 'taskq.py').read_text())
+        self.assertNotIn('assignment_model', (ROOT / 'taskq.py').read_text(encoding='utf-8'))
 
 
 def kernel_fixture(n=1):
@@ -6044,7 +6044,7 @@ class StateKernel(Base):
         raw = self.task(n)['raw']; life = raw['lifecycle']
         application = {'status': 'ok', 'session': raw['claim']['session'], 'event': life['event'],
                        'artifact': life['artifact'], 'sha256': raw['acceptance_criteria']['sha256']}
-        (self.root / life['artifact']).write_text(raw['events'][0]['text'])
+        (self.root / life['artifact']).write_bytes(raw['events'][0]['text'].encode('utf-8'))
         self.runtime.drain.return_value = {'drain': {'application': application}}
         self.host.observe.return_value = {'phase': 'released', 'drain': {'application': application}}
         self.assertEqual(self.call('park', n)['phase'], 'parked')

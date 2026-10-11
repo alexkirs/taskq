@@ -454,35 +454,36 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
         self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
         self.assertEqual(self.launches, 2)
 
-    def test_completed_worker_nudge_resumes_same_session_once_per_comment(self):
-        sid = self.start(); self.complete()
-        self.board.comment(1, 'nudge: retry the unfinished result')
-        issue = self.board.get(1)
-        legacy = q.legacy_worker_message(issue, self.item()['claim'], True)
-        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=self.launch):
+    def record_steer(self, command='steer-one'):
+        with q.coordination():
+            q.cmd_steer(argparse.Namespace(n=1, revision=q.control_revision(self.item(), q.CONFIG),
+                                          command_id=command, text='retry the unfinished result'))
+
+    def test_completed_worker_steer_resumes_same_session_once_per_input(self):
+        sid = self.start(); self.complete(); self.record_steer()
+        events = q.pending_worker_controls(self.item()['raw'])
+        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=self.launch) as sent:
             q.follow(self.item(), self.kind, self.item()['claim'], True)
+        self.assertNotIn('retry the unfinished result', sent.call_args.args[1])
+        self.assertIn('inbox 1 --role worker', sent.call_args.args[1])
         turn = self.item()['raw']['model_turns']['worker']
         self.assertEqual(self.launches, 2)
         self.assertEqual(turn['runtime']['session'], sid)
-        self.assertEqual(turn['event_ids'], [])
-        self.assertEqual(turn['event_inputs'], q.model_turn_inputs([], legacy, sid))
-        self.assertEqual(self.item()['raw']['worker_comment_cursor'][sid], legacy[2])
+        self.assertEqual(turn['event_inputs'], q.model_turn_inputs(events))
+        self.assertTrue(q.pending_worker_controls(self.item()['raw']))
         self.complete()
-        with q.coordination(), mock.patch.object(q, 'age', return_value=0), \
-                mock.patch.object(self.kind, 'send', side_effect=AssertionError('duplicate')):
+        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=AssertionError('duplicate')):
             q.follow(self.item(), self.kind, self.item()['claim'], True)
-            self.assertEqual(q.owned_model_turn(self.item(), self.kind, 'worker', 'same input',
-                                               resume=sid, legacy=legacy), sid)
-        self.board.comment(1, 'nudge: retry the unfinished result')
+        self.record_steer('steer-two')
         with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=self.launch):
             q.follow(self.item(), self.kind, self.item()['claim'], True)
         self.assertEqual(self.launches, 3)
         self.assertEqual(self.item()['claim']['session'], sid)
-        self.assertEqual(self.item()['raw']['model_turns']['worker']['generation'], 3)
+        self.complete()
 
-    def test_nudge_unknown_launch_retains_guard_and_cursor_without_retry(self):
+    def test_steer_unknown_launch_retains_guard_and_pending_without_retry(self):
         sid = self.start(); self.complete()
-        self.board.comment(1, 'nudge: retry result')
+        self.record_steer()
         before = self.item()['raw'].get('worker_comment_cursor')
         with self.assertRaisesRegex(RuntimeError, 'unknown resume'), q.coordination(), \
                 mock.patch.object(self.kind, 'send', side_effect=RuntimeError('unknown resume')):
@@ -494,13 +495,13 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
         with mock.patch.object(self.kind, 'send', side_effect=AssertionError('duplicate')):
             q.follow(self.item(), self.kind, self.item()['claim'], True)
 
-    def test_nudge_waiting_for_capacity_retries_without_losing_fifo_or_cursor(self):
+    def test_steer_waiting_for_capacity_retries_without_losing_fifo_or_receipts(self):
         sid = self.start(); self.complete()
         host = self.host()
         blocker = {'repo': q.CONFIG['repo'], 'task': 99, 'role': 'worker',
                    'demand': {'model:codex': 1}, 'age': 0, 'priority': 0}
         host.reserve('blocker', blocker)
-        self.board.comment(1, 'nudge: retry result')
+        self.record_steer()
         with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=AssertionError('full')):
             q.supervise(self.item(), {'codex': self.kind})
         turn = self.item()['raw']['model_turns']['worker']
@@ -527,7 +528,9 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
     def test_nudge_cannot_resume_active_foreign_or_accepted_worker(self):
         sid = self.start()
         self.board.comment(1, 'nudge: retry result')
-        legacy = q.legacy_worker_message(self.board.get(1), self.item()['claim'], True)
+        self.assertIsNone(q.legacy_worker_message(self.board.get(1), self.item()['claim'], True))
+        legacy = ('nudge', 'retained old input', 0)  # old intents retain their original identity checks
+        self.record_steer()
         before = json.dumps(self.board.issues, sort_keys=True)
         with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=AssertionError('active')):
             q.follow(self.item(), self.kind, self.item()['claim'], True)
@@ -717,11 +720,18 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
     def test_applied_uses_registered_worker_worktree_not_main_checkout(self):
         self.exercise_applied(worktree=True)
 
-    def exercise_applied(self, worktree=False):
+    def test_steering_applied_has_exact_native_proof_and_compacted_replay(self):
+        self.exercise_applied(action="steer")
+
+    def exercise_applied(self, worktree=False, action="answer"):
         self.start(); self.complete()
         with q.coordination():
-            q.move(self.item(), 'ask', 'ask', 'choose')
-            q.cmd_answer(argparse.Namespace(command='answer', n=['1'], text='chosen value'))
+            if action == 'steer':
+                q.cmd_steer(argparse.Namespace(n=1, revision=q.control_revision(self.item(), q.CONFIG),
+                                              command_id='apply-steer', text='chosen value'))
+            else:
+                q.move(self.item(), 'ask', 'ask', 'choose')
+                q.cmd_answer(argparse.Namespace(command='answer', n=['1'], text='chosen value'))
         with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=self.launch):
             q.follow(self.item(), self.kind, self.item()['claim'], True)
         event_id = self.item()['raw']['model_turns']['worker']['event_ids'][0]
@@ -770,6 +780,13 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
         before = json.dumps(self.board.issues, sort_keys=True)
         with q.coordination(): q.cmd_applied(args)
         self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        if action == 'steer':
+            with q.coordination():
+                q.move(self.item(), 'doing', 'nudge', 'worker remains recorded')
+            self.assertFalse(any(event['id'] == event_id for event in self.item()['raw']['events']))
+            before = json.dumps(self.board.issues, sort_keys=True)
+            with q.coordination(): q.cmd_applied(args)
+            self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
         (workspace/'artifact.txt').write_text('changed')
         with self.assertRaises(SystemExit): q.cmd_applied(args)
         self.complete()

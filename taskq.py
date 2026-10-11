@@ -17,7 +17,7 @@ CONFIG, BOARD = {}, None  # set by main, or by a test
 GUARD, GUARD_WAIT, GUARD_PAUSE = threading.local(), 30, 2
 EVENT_SCHEMA, EVENT_LIMIT = 3, 64
 EVENT_LABEL = 'taskq-events'
-PAYLOAD_ACTIONS = ('ask', 'answer', 'requeue', 'result', 'integrated-review')
+PAYLOAD_ACTIONS = ('ask', 'answer', 'steer', 'requeue', 'result', 'integrated-review')
 
 class SettledError(SystemExit):
     """A fully known refusal; tasks lists only acknowledged transitions that need an event."""
@@ -229,7 +229,7 @@ def event_targets(raw, action, text, actor=None):
             and not (action == 'integrated-review' and actor.get('session') == boss['session']) \
             and (action != 'gone' or text.startswith('worker ')):
         targets.append(recipient('supervisor', boss))
-    if action == 'answer' and worker.get('session'):
+    if action in ('answer', 'steer') and worker.get('session'):
         targets.append(recipient('worker', worker))
     return targets
 
@@ -1430,6 +1430,8 @@ def cmd_move(args):
             fail('ask from ask requires its recorded manager or supervisor and an open submitted result without recovery or acceptance')
     else:
         current = task(args.n, *sources)
+    if args.command == 'result':
+        require_controls_applied(current)
     move(current, state, args.command, args.text, **fields(args))
 
 def role(current):
@@ -1504,6 +1506,142 @@ def codes(words):
     """'43.1 44.2' (spaces or commas) -> [(43, 1), (44, 2)]."""
     found = [re.fullmatch(r'(\d+)\.(\d+)', word) for word in re.split(r'[\s,]+', ' '.join(words).strip())]
     return [(int(code[1]), int(code[2])) for code in found] if all(found) else fail(f'{" ".join(words)!r}: answer N --text A, or codes like 43.1 44.2')
+
+def control_revision(current, project):
+    """Semantic identity ignores delivery, ACK and model admission bookkeeping."""
+    raw = current['raw']
+    value = {'project': {key: project.get(key) for key in ('board', 'host', 'repo')},
+             'task': current['iid'], 'state': current['state'], 'text': current['text'],
+             'fields': {key: raw.get(key) for key in FIELDS},
+             'card': {key: current.get(key) for key in ('title', 'type', 'runtime', 'host', 'priority', 'assignees')},
+             'payloads': raw.get('action_payloads', {}), 'result': raw.get('result'), 'decision': raw.get('decision'),
+             'steering': raw.get('control_commands', {})}
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def control_request(current, project, actor, revision, command_id, text):
+    """Pure steering admission/replay kernel, shared by the command and behavioral tests."""
+    raw = current['raw']
+    if raw.get('event_schema') != EVENT_SCHEMA:
+        raise ValueError('steer requires current native task schema')
+    if actor != {'runtime': 'owner', 'session': 'shell'} and not any(
+            all(actor.get(key) == (raw.get(role) or {}).get(key) for key in ('runtime', 'session'))
+            and actor.get('session') for role in ('pm', 'supervisor')):
+        raise ValueError('steer requires recorded supervisor, manager or owner shell')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', command_id or '') \
+            or not re.fullmatch(r'[0-9a-f]{64}', revision or '') or not text.strip():
+        raise ValueError('steer requires revision, command ID and nonempty text')
+    request = {'revision': revision, 'text': text, 'actor': actor}
+    digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+    previous = (raw.get('control_commands') or {}).get(command_id)
+    if previous:
+        if previous['request_digest'] != digest:
+            raise ValueError('conflicting steer command ID; no changes')
+        return previous, True
+    if current['state'] != 'doing' or control_revision(current, project) != revision:
+        raise ValueError('stale control revision or task is not doing; no steering recorded')
+    claim = raw.get('claim') or {}
+    turn = (raw.get('model_turns') or {}).get('worker') or {}
+    if claim.get('runtime') != 'codex' or not claim.get('session') or turn.get('phase') not in ('bound', 'complete') \
+            or (turn.get('runtime') or {}).get('session') != claim['session']:
+        raise ValueError('steer requires qualified native Codex worker application binding')
+    if 'legacy_recovery' in raw or raw.get('model_recovery') or raw.get('integrated_review'):
+        raise ValueError('steer recovery or acceptance hold; no changes')
+    if len(raw.get('control_commands') or {}) >= 32:
+        raise ValueError('steer command receipt bound reached; no receipt discarded')
+    return {'command_id': command_id, 'request_digest': digest, 'request': request,
+            'event': raw.get('event_seq', 0) + 1, 'recipient': recipient('worker', claim)}, False
+
+
+def pending_worker_controls(raw):
+    claim = raw.get('claim') or {}
+    return [event for event in event_pending(raw, recipient('worker', claim))
+            if event['action'] in ('answer', 'steer')] if claim.get('session') else []
+
+
+def cmd_steer(args):
+    issue = read_issue(args.n)
+    current = parse(issue)
+    if not current:
+        fail('steer requires a task')
+    identity = session() or {}
+    actor = {key: identity.get(key) for key in ('runtime', 'session')} if identity.get('session') else {'runtime': 'owner', 'session': 'shell'}
+    try:
+        receipt, repeated = control_request(current, CONFIG, actor, args.revision, args.command_id, args.text)
+    except ValueError as error:
+        fail(str(error))
+    if not repeated:
+        if issue['state'] != 'open':
+            fail('steer requires an open task')
+        raw = json.loads(json.dumps(current['raw']))
+        raw['control_commands'] = {**raw.get('control_commands', {}), args.command_id: receipt}
+        append_event(raw, 'steer', args.text, targets=[receipt['recipient']])
+        fresh = read_issue(args.n)
+        if any(fresh.get(key) != issue.get(key) for key in ('body', 'labels', 'state', 'title', 'assignees')):
+            fail('task changed before steering write; no changes')
+        write_task_verified(issue, raw, event_labels(raw, issue['labels']))
+        diagnostic_comment(args.n, f'**steer** · {who()}\n\n{args.text}\n\n[event {args.n}:{receipt["event"]}] command {args.command_id}')
+    print(json.dumps({'type': 'taskq.control', 'repeated': repeated, **receipt}))
+    return [] if repeated else [args.n]
+
+
+def cmd_inbox(args):
+    issue = read_issue(args.n)
+    current = parse(issue)
+    if not current and issue['state'] == 'closed' and BLOCK.search(issue['body']):
+        current = parse({**issue, 'labels': [*issue['labels'], PREFIX + 'review']})
+        current['state'] = 'closed'
+    if not current:
+        fail('inbox requires a task')
+    raw = current['raw']
+    selected = args.role or role(current)
+    key = {'worker': 'claim', 'supervisor': 'supervisor', 'manager': 'pm'}.get(selected)
+    target = recipient(selected, raw.get(key)) if key else None
+    output = {'type': 'taskq.inbox', 'task': args.n, 'state': current['state'],
+              'task_card': {key: current.get(key) for key in ('title', 'text', 'scope', 'deps', 'result')},
+              'decision': raw.get('decision'),
+              'schema': raw.get('event_schema', 0), 'revision': control_revision(current, CONFIG),
+              'question_revision': question_revision(current), 'recipient': target,
+              'pending': event_pending(raw, target) if target else raw.get('events', []),
+              'action': raw.get('action'), 'payloads': raw.get('action_payloads', {}),
+              'control_commands': raw.get('control_commands', {}),
+              'answer_commands': raw.get('answer_commands', {}),
+              'application_receipts': raw.get('application_receipts', {}),
+              'history_complete': False, 'history_limit': 'Native comments can be edited/deleted; older events may have compacted.'}
+    if args.history:
+        output['history'] = issue_history(issue).get('comments', [])
+        output['repair_history'] = raw.get('repair_history', [])
+    print(json.dumps(output, ensure_ascii=False))
+
+
+def require_controls_applied(current):
+    pending = pending_worker_controls(current['raw'])
+    if current['raw'].get('event_schema') == EVENT_SCHEMA and pending:
+        fail('unapplied worker control events: ' + ', '.join(f'{current["iid"]}:{event["id"]}' for event in pending))
+
+
+def publication_control_check(current):
+    """Cooperating writers hold the guard; detect newer native state before external publication."""
+    if current['raw'].get('event_schema') != EVENT_SCHEMA:
+        return
+    issue = read_issue(current['iid'])
+    fresh = parse(issue)
+    if not fresh or issue['state'] != 'open':
+        fail('task changed before publication')
+    require_controls_applied(fresh)
+    if control_revision(fresh, CONFIG) != control_revision(current, CONFIG):
+        fail('task control revision changed before publication')
+
+
+def continuation_pointer(n, events, role_name):
+    refs = ' '.join(f'[event {n}:{event["id"]}]' for event in events)
+    text = f'continue #{n}' + (f' {refs}' if refs else '') + f': read taskq inbox {n} --role {role_name}; the board is authoritative.'
+    if role_name == 'worker':
+        text += ' Apply pending answer/steer events, commit your scoped artifact, and run taskq applied N:ID --artifact RELPATH --sha FULLSHA before result. Delivery is not acknowledgement. Read inbox again before Git push and result.'
+    else:
+        text += ' After handling the board events, explicitly run taskq ack N:ID for those IDs.'
+    return text
+
 
 def question_revision(current):
     """Question identity excludes transport/native ACKs, but binds its authority and content."""
@@ -1592,7 +1730,7 @@ def answer_command(args):
         fail('stale question revision; no answer recorded')
     if len(commands) >= 32:
         fail('answer command receipt bound reached; no receipt discarded')
-    receipt = {'command_id': args.command_id, 'request_digest': digest,
+    receipt = {'command_id': args.command_id, 'request_digest': digest, 'request': request,
                'question_revision': args.question_revision, 'actor': actor,
                'answer_event': raw.get('event_seq', 0) + 1, 'application_ack': False}
     if rejection_id is not None:
@@ -1610,8 +1748,17 @@ def answer_command(args):
     if any(fresh.get(k) != issue.get(k) for k in ('body', 'labels', 'state')):
         fail('question changed before write; no answer recorded')
     write_task_verified(issue, raw, event_labels(raw, labels))
+    diagnostic_comment(n, f'**answer** · {who()}\n\n{args.text}\n\n[event {n}:{receipt["answer_event"]}] command {args.command_id}')
     print(json.dumps({'type': 'taskq.decision', 'repeated': False, **receipt}))
     return [n]
+
+
+def answer_authority(current):
+    if current and current['raw'].get('event_schema') == EVENT_SCHEMA:
+        actor = session() or {}
+        if actor.get('session') and not any(actor.get('runtime') == (current.get(key) or {}).get('runtime')
+                and actor['session'] == (current.get(key) or {}).get('session') for key in ('pm', 'supervisor')):
+            fail('answer requires recorded manager, supervisor or owner shell')
 
 
 def cmd_answer(args):
@@ -1626,6 +1773,7 @@ def cmd_answer(args):
         if len(args.n) != 1 or not args.n[0].isdigit():
             fail('answer N --text A: one task number')
         current = parse(read_issue(int(args.n[0])))
+        answer_authority(current)
         if current and current['raw'].get('model_turns') and current['state'] in ('doing', 'review'):
             gate(current)
             latest = next((event for event in reversed(current['raw'].get('events', [])) if event['action'] == 'answer'), None)
@@ -1641,6 +1789,7 @@ def cmd_answer(args):
             current = task(n, 'ask', 'review')
         elif current['state'] != 'ask':
             fail(f'#{n}: schema2 options require its current ask')
+        answer_authority(current)
         options = (current['raw'].get('decision') or {}).get('options') or []
         picks.append((current, k, 0 < k <= len(options) and options[k - 1] or fail(f'#{n} has no option {k}')))
     for current, k, text in picks:
@@ -1713,6 +1862,7 @@ def merge(current, sha):
     if not all(ok for _, ok in checked):
         back(f'{gate} failed on {head}')
     keep = CONFIG.get('workspace') == 'external'  # #477: the host owns the branch; the repo's own policy may still delete it
+    publication_control_check(current)
     _, out = effect(cli, *(['glab', 'mr', 'merge', number, '--squash', *['--remove-source-branch'] * (not keep), '--sha', head, '--auto-merge=false', '--yes', '--squash-message', message, '--message', message] if lab
                    else ['gh', 'pr', 'merge', number, '--squash', *['--delete-branch'] * (not keep), '--match-head-commit', head, '--subject', title, '--body', body]))
     code, viewed = cli(*(['glab', 'mr', 'view', number, '--output', 'json'] if lab else ['gh', 'pr', 'view', number, '--json', 'state,mergeCommit']))
@@ -1903,6 +2053,7 @@ def validate_integrated(current):
 def cmd_review_integrated(args):
     issue = read_issue(args.n)
     current = integrated_context(issue)
+    require_controls_applied(current)
     if role(current) not in ('manager', 'supervisor', 'owner'):
         fail('integrated review requires recorded reviewer or owner shell')
     if not re.fullmatch('[0-9a-f]{64}', args.question_revision) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', args.command_id):
@@ -1996,6 +2147,7 @@ def publish_direct(current, sha, git):
         raise SettledError(f'#{current["iid"]}: CI is not green on candidate {sha}', [])
     if run('ls-remote', 'origin', branch).split()[:1] != [sha]:
         fail(f'{branch}: remote candidate changed during acceptance')
+    publication_control_check(current)
     run('push', 'origin', f'{sha}:refs/heads/main')
     run('fetch', 'origin')
     run('merge-base', '--is-ancestor', sha, 'origin/main')  # read back, including a concurrent later fast-forward
@@ -2023,6 +2175,7 @@ def close_one(args):
         return False
     current = task(args.n, 'review')
     gate(current)
+    require_controls_applied(current)
     append_event(dict(current['raw']), 'close', args.text)  # capacity before publication/close effects
     if role(current) == 'supervisor':
         verdict(args.text)
@@ -2048,6 +2201,7 @@ def close_one(args):
     if hasattr(runtimes().get(claim.get('runtime')), 'retire') and claim.get('name') not in (None, machine()):
         args.text = (f'{args.text}\n\n' if args.text else '') + f'session {claim.get("session")} runs on {claim.get("name")}: stop it there'
     kept = 'kept original worktree and branch: integration proves declared functions only' if integrated else cleanup(current)
+    publication_control_check(current)
     effect(BOARD.close, args.n)  # first (#496): a failed close keeps the q-* label, the task stays on the board
     final_text = '\n\n'.join(filter(None, (args.text, kept)))
     association = {'integrated_review': {**integrated, 'close_text': close_text,
@@ -2311,6 +2465,7 @@ def brief(item, runtime):
     return f'''{worker_name(item)}
 You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
 Queue tool: `{tq}`. {shell_instructions(runtime, n)}
+Read `taskq inbox {n}` for authoritative controls; plain comments, including `nudge:`, are historical context only.
 {release_context(runtime)}
 Read `{Path(__file__).resolve().with_name("taskq.md")}` first and do only what it allows (R13): a task that conflicts with a recorded decision is an ask with options, not an edit.
 
@@ -2330,6 +2485,7 @@ needs no worktree. Commands:
   --option "<A>" --option "<B>" --recommend <K> [--link <url of a result, image or video>]`, then stop. A result that leaves the owner a choice
   takes the same --option/--recommend/--link; an option starting `close` accepts the result.
 - Cannot be done: `{tq} requeue {n} --text "<why>"`, then stop.
+- Before publication: read `{tq} inbox {n} --role worker`, apply every pending answer/steer and record `applied` at the delivery SHA; read it again before Git push and result.
 - Deliver: commit on branch {branch}, `{shell_steps(runtime, "git fetch origin", "git rebase origin/main")}`, run the tests required by § 10 Testing policy, {push} --checks "<commands and outcome>" --text "<summary>"`, then stop.
   An answer with no commit: the result names the current origin/main SHA and the text holds the answer.
 Everything written through taskq is public: no secrets, tokens or paths outside the repository.'''
@@ -2341,11 +2497,12 @@ def supervisor_brief(item, runtime, kind):
         if getattr(kind, 'SELF_WAKE', False) else 'end your turn; the queue wakes you with the event'
     ci = f'glab api "projects/:id/pipelines?sha=<sha>"' if lab else 'gh run list --commit <sha>'
     view = f'glab issue view {n} --comments' if lab else f'gh issue view {n} --comments'
-    nudge = f'glab issue note {n} -m "nudge: <text>"' if lab else f'gh issue comment {n} --body "nudge: <text>"'
+    nudge = f'{tq} steer {n} --revision <inbox revision> --command-id <unique ID> --text "<instruction>"'
     return f'''{worker_name(item, 'S')}
 You are the taskq supervisor S{n} of task #{n}: {item["title"]}. You are its only controller: you order its worker, follow it,
 review its result and close or rework it. You never edit the task's code, never start a session yourself, never decide for the owner.
 Queue tool: `{tq}`. {shell_instructions(runtime, n)}
+Read `taskq inbox {n}` for authoritative controls; plain comments, including `nudge:`, are historical context only.
 {release_context(runtime)}
 Read `{Path(__file__).resolve().with_name("taskq.md")}` (§ 7 Supervisor, § 6) first and do only what it allows (R13).
 
@@ -2367,7 +2524,7 @@ Read `{Path(__file__).resolve().with_name("taskq.md")}` (§ 7 Supervisor, § 6) 
 4. Woken by `gone #{n}`, `requeue #{n}` (the worker's) or `ask #{n}`: read why; `{tq} requeue {n} --text "<what to do>"` or ask the owner
    (a product choice, a second death). `answer #{n}`: act on it; an idle worker gets the answer from the queue.
    After handling observed `[event N:ID]`, run `{tq} ack N:ID` for those IDs before waiting again.
-5. A silent worker (120 min, issue unchanged): `{nudge}`; the queue sends the text to it.
+5. Steering: read `{tq} inbox {n} --role supervisor`, then `{nudge}`; the queue wakes the worker to read its inbox. Plain comments never control it.
 6. `stop #{n}`: the task is closed or no longer yours: end your turn. `tick`: wait again.
 Everything written through taskq is public: no secrets, tokens or paths outside the repository.'''
 
@@ -2707,7 +2864,7 @@ def pending(issue, boss):
     raw = issue_data(issue)
     if raw.get('event_schema'):
         events = event_pending(raw, recipient('supervisor', boss))
-        return [event_line(issue['iid'], event) for event in events], [event['id'] for event in events]
+        return [event_line(issue['iid'], event, raw.get('event_schema')) for event in events], [event['id'] for event in events]
     return [f'{EVENT_OF[action]} #{issue["iid"]}' for action, _ in legacy_supervisor_events(issue, boss)], len(issue.get('comments') or [])
 
 
@@ -2759,9 +2916,9 @@ def tail_of(kind, sid):
         return f'no log: {error}'
 
 
-def event_line(n, event):
+def event_line(n, event, schema=EVENT_SCHEMA):
     name = {'result': 'review', 'close': 'closed', 'observed-gone': 'gone'}.get(event['action'], event['action'])
-    verdict = (' ' + event['text'].splitlines()[0]) if name == 'closed' and event['text'] else ''
+    verdict = (' ' + event['text'].splitlines()[0]) if schema != EVENT_SCHEMA and name == 'closed' and event['text'] else ''
     return f'{name} #{n}{verdict} [event {n}:{event["id"]}]'
 
 
@@ -2911,15 +3068,19 @@ def cmd_applied(args):
             or claim.get('runtime') != 'codex' or claim.get('name') != machine() \
             or (turn.get('runtime') or {}).get('session') != claim.get('session') \
             or event_id not in turn.get('event_ids', []) or turn.get('phase') not in ('bound', 'complete'):
-        fail('applied requires exact native worker, owning host and bound answer turn')
+        fail('applied requires exact native worker, owning host and bound control turn')
     event = next((event for event in raw.get('events', []) if event['id'] == event_id), None)
     target = recipient('worker', claim)
-    if not event or event['action'] != 'answer' or target not in event['recipients']:
-        fail('applied event is not this worker answer')
+    if event is None and str(event_id) in (raw.get('application_receipts') or {}):
+        retained = next((value for value in turn.get('event_inputs', []) if value.get('id') == event_id), None)
+        if retained:
+            event = {**retained, 'acks': [target]}
+    if not event or event['action'] not in ('answer', 'steer') or target not in event['recipients']:
+        fail('applied event is not this worker answer/steer')
     inputs = turn.get('event_inputs') or []
     if hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest() != turn.get('event_digest') \
             or model_event_input(event) not in inputs:
-        fail('answer input changed from the exact admitted turn; acknowledgement refused')
+        fail('control input changed from the exact admitted turn; acknowledgement refused')
     relative = Path(args.artifact)
     root = CONFIG['root'].resolve()
     executable = shutil.which('git') or fail('git not found')
@@ -3067,7 +3228,7 @@ def legacy_worker_messages(issue, claim, supervised):
     for i, text in enumerate(comments[cursor + 1:], cursor + 1):
         if text.startswith('**answer**') and not issue_data(issue).get('event_schema'):
             yield 'answer', text.partition('\n\n')[2], i
-        if supervised and text.startswith('nudge:'):
+        if supervised and issue_data(issue).get('event_schema') != EVENT_SCHEMA and text.startswith('nudge:'):
             yield 'nudge', text.partition('nudge:')[2].strip(), i
 
 def follow(item, kind, claim, supervised):
@@ -3084,7 +3245,7 @@ def follow(item, kind, claim, supervised):
     old = claim['session']
     target = recipient('worker', claim)
     events = event_pending(raw, target)
-    if not events:
+    if not events and raw.get('event_schema') != EVENT_SCHEMA:
         issue = issue_history(issue)
     legacy = legacy_worker_message(issue, claim, supervised) if not events else None
     if retry:
@@ -3097,17 +3258,23 @@ def follow(item, kind, claim, supervised):
     if answer is None and told is None and age(item) < 120:
         return claim
     text = f'The owner answered your question:\n\n{answer}' if answer is not None else told or 'continue: read your issue'
+    if raw.get('event_schema') == EVENT_SCHEMA:
+        text = continuation_pointer(item['iid'], events, 'worker')
     if isinstance(kind, Codex):
-        text += '\n\nApplication event IDs: ' + ', '.join(f'{item["iid"]}:{e["id"]}' for e in events)
-        text += '\nDelivery is not acknowledgement. After applying the answer, commit your scoped artifact locally and run taskq applied N:ID --artifact RELPATH --sha FULLSHA before result. Repeat the same applied command to verify idempotence.'
+        if raw.get('event_schema') != EVENT_SCHEMA:
+            text += '\n\nApplication event IDs: ' + ', '.join(f'{item["iid"]}:{e["id"]}' for e in events)
+            text += '\nDelivery is not acknowledgement. After applying the answer, commit your scoped artifact locally and run taskq applied N:ID --artifact RELPATH --sha FULLSHA before result. Repeat the same applied command to verify idempotence.'
         sid = owned_model_turn(item, kind, 'worker', text, events, resume=old, legacy=legacy)
         if not sid:
             return claim
         claim = {**claim, 'session': sid}
         raw = issue_data(read_issue(item['iid']))
     else:
+        if events and raw.get('event_schema') == EVENT_SCHEMA:
+            print(f'#{item["iid"]}: worker application adapter unsupported; controls remain pending in taskq inbox', file=sys.stderr)
+            return claim
         claim = {**claim, 'session': effect(kind.send, old, text)}
-    if events and not isinstance(kind, Codex):
+    if events and not isinstance(kind, Codex) and raw.get('event_schema') != EVENT_SCHEMA:
         for event in raw['events']:
             if event['id'] in [value['id'] for value in events]:
                 event['acks'] = list(event.get('acks', [])) + [target]
@@ -3170,7 +3337,7 @@ def supervise(item, kinds, worker_allowed=True):
             return
         move(item, item['state'], 'gone', f'supervisor {boss["session"]} is gone: {evidence}')
         if getattr(lead, 'resumable', lambda _: False)(boss['session']):  # Codex: the same thread, the same id
-            text = f'restart #{n}: your last turn ended {evidence}; read your issue'
+            text = continuation_pointer(n, [], 'supervisor') if item['raw'].get('event_schema') == EVENT_SCHEMA else f'restart #{n}: your last turn ended {evidence}; read your issue'
             owned_model_turn(item, lead, 'supervisor', text, resume=boss['session']) if isinstance(lead, Codex) else effect(lead.send, boss['session'], text)
         else:  # a new supervisor adopts the live worker from the board; the dead one is retired first
             if not replace(item, lead, boss['runtime'], 'supervisor'):
@@ -3184,7 +3351,7 @@ def supervise(item, kinds, worker_allowed=True):
             ((issue_data(issue).get('model_turns') or {}).get('supervisor') or {}).get('phase') == 'reserving':
         found, count = pending(issue if issue_data(issue).get('event_schema') else issue_history(issue), boss)
         if found:  # running: its own wait or turn-end pass delivers events; idle: resume with events
-            text = f'{" ".join(found)}: read your issue'
+            text = continuation_pointer(n, event_pending(issue_data(issue), recipient('supervisor', boss)), 'supervisor') if issue_data(issue).get('event_schema') == EVENT_SCHEMA else f'{" ".join(found)}: read your issue'
             if isinstance(lead, Codex):
                 events = event_pending(issue_data(issue), recipient('supervisor', boss))
                 if state != 'idle':
@@ -3198,7 +3365,8 @@ def supervise(item, kinds, worker_allowed=True):
                     return
             else:
                 sid = effect(lead.send, boss['session'], text)
-                seen(n, sid, count)
+                if issue_data(issue).get('event_schema') != EVENT_SCHEMA:
+                    seen(n, sid, count)
             item['raw'] = issue_data(read_issue(n))
             if sid != boss['session']:  # Claude resumes under a new id (#284): record it; the old one is refused and retired
                 item['supervisor'] = {**boss, 'session': sid}
@@ -4759,7 +4927,7 @@ def decisions(items):
         lines.append(f'| {question} | {" · ".join([cell(card.get("summary") or item["title"]), *links])} | {" · ".join(options)} |')
     return lines
 
-EVENTS = ('add', 'answer', 'run', 'result', 'requeue', 'close')  # R4 (#333): each starts one pass after its move
+EVENTS = ('add', 'answer', 'steer', 'run', 'result', 'requeue', 'close')  # R4 (#333): each starts one pass after its move
 
 def dispatch(command, tasks, after=None, after_birth=None):
     """R4 (#405): the event pass runs in a detached `tick --quiet` child, its output in .taskq/dispatch.log; the event returns at once."""
@@ -4904,7 +5072,7 @@ def cmd_wait(args):
                             effect(BOARD.update, issue['iid'], labels=event_labels(fresh, fresh_issue['labels']), body=block(BLOCK.sub('', fresh_issue['body']).strip(), fresh))
                         raw = fresh
                 for event in event_pending(raw, target):
-                    events.append({'id': f'{issue["iid"]}:{event["id"]}', 'text': event_line(issue['iid'], event), 'target': target})
+                    events.append({'id': f'{issue["iid"]}:{event["id"]}', 'text': event_line(issue['iid'], event, raw.get('event_schema')), 'target': target})
                 continue
             if issue['state'] != 'open':
                 continue
@@ -4930,31 +5098,36 @@ def cmd_wait(args):
             if any(event.get('target') == native_target for event in events) and callable(getattr(native, 'owned', None)) and native.owned(me):
                 with coordination():
                     # Re-read receipts under the board grant; concurrent waits cannot both consume an acked batch.
-                    pending_events = []
+                    pending_events, wake_pointers = [], []
                     for event in events:
                         if event.get('target') != native_target:
                             continue  # explicit sender --pm may observe another runtime, never wake this bridge for it
                         if not event['id']:
                             pending_events.append(event)
+                            wake_pointers.append(event['text'])
                             continue
                         n, number = map(int, event['id'].split(':'))
                         fresh = issue_data(read_issue(n))
                         if (not fresh.get('pm') or recipient('manager', fresh['pm']) == native_target) and \
                                 any(value['id'] == number for value in event_pending(fresh, event['target'])):
                             pending_events.append(event)
+                            wake_pointers.append(continuation_pointer(n, [{'id': number}], 'manager')
+                                                 if fresh.get('event_schema') == EVENT_SCHEMA else event['text'])
                     if pending_events:
                         native.check()
                         if native.state(me) != 'idle':
                             fail('Hermes manager not confirmed idle; event receipt unchanged')
                         try:
-                            if effect(native.wake_manager, me, '\n'.join(event['text'] for event in pending_events)) != me:
+                            if effect(native.wake_manager, me, '\n'.join(wake_pointers)) != me:
                                 fail('Hermes manager wake changed identity; event receipt unchanged')
                         except Exception as error:
                             fail(f'Hermes manager wake failed ({type(error).__name__}); event receipt unchanged')
                         for event in pending_events:
                             if event['id']:
                                 n, number = map(int, event['id'].split(':'))
-                                acknowledge(read_issue(n), event['target'], [number])
+                                received = read_issue(n)
+                                if issue_data(received).get('event_schema') != EVENT_SCHEMA:
+                                    acknowledge(received, event['target'], [number])
                     events = [event for event in events if event.get('target') != native_target] + pending_events
             # Legacy installations retain their historical receipt path until explicit migration.
             if legacy_now or any(not issue_data(read_issue(int(n))).get('event_schema') for n in legacy_seen if n.isdigit()):
@@ -5318,7 +5491,7 @@ def repair_checkpoint(item, accepted_risk=None):
             'result_branch': result_branch(item) if review else None,
             'evidence': {'source_state': item['state'], 'result': result if review else None,
                          'result_events': [e['id'] for e in raw.get('events', []) if e.get('action') == 'result'],
-                         'owner_decisions': {k: raw[k] for k in ('answer_commands', 'owner_decision') if k in raw}},
+                         'owner_decisions': {k: raw[k] for k in ('answer_commands', 'control_commands', 'owner_decision') if k in raw}},
             'retains': ['human-specification', 'scope', 'dependencies', 'owner-decisions', 'attempt-audit']
                        + (['completed-result'] if review else []),
             'resets': ['broken-continuation', 'old-role-assignments', 'old-runtime-attempt'],
@@ -5506,7 +5679,7 @@ def repair_transition(issue, context, proof, plan_id, actor):
     raw.update(claim=None, supervisor=None, order=None, pm=context['manager'], decision=None, waiting_for=None,
                model_turns={}, model_turn_history=[], events=[], action_payloads={}, application_receipts={},
                retry_counts={'supervisor': 0, 'worker': 0, 'workers': 0}, repair_history=history + [entry])
-    for key in ('legacy_recovery', 'model_recovery', 'answer_commands', 'acceptance_receipts', 'integrated_review'):
+    for key in ('legacy_recovery', 'model_recovery', 'answer_commands', 'control_commands', 'acceptance_receipts', 'integrated_review'):
         raw.pop(key, None)
     if force:
         raw.update(result=context['checkpoint']['evidence']['result'], execution_generation=context['next_generation'])
@@ -6999,6 +7172,8 @@ def main(argv=None):
             (('--link',), {'action': 'append', 'default': []}))  # #490: the decision card
     command('ask', cmd_move, *card, text='required')
     command('answer', cmd_answer, (('n',), {'nargs': '+'}), (('--command-id',), {}), (('--question-revision',), {}), (('--rework-rejection',), {'type': int}), n=False, text=True)
+    command('inbox', cmd_inbox, (('--role',), {'choices': ('worker', 'supervisor', 'manager')}), (('--history',), {'action': 'store_true'}))
+    command('steer', cmd_steer, (('--revision',), {'required': True}), (('--command-id',), {'required': True}), text='required')
     command('result', cmd_move, (('--sha',), {'type': commit}), (('--checks',), {'default': ''}), *card, text=True)
     command('requeue', cmd_requeue, text=True)
     command('run', cmd_run, text=True)
@@ -7115,7 +7290,7 @@ def main(argv=None):
         dispatch_service_gate()
     if args.command == 'wait' and not args.task or args.command == 'tick' and not args.quiet or args.command == 'pm' and args.subscribe is None:
         refresh(args.command == 'pm')
-    writes = args.command in ('add', 'take', 'ask', 'answer', 'result', 'requeue', 'run', 'later', 'close', 'review-integrated', 'ack', 'applied', 'apply-event', 'lifecycle') or \
+    writes = args.command in ('add', 'take', 'ask', 'answer', 'steer', 'result', 'requeue', 'run', 'later', 'close', 'review-integrated', 'ack', 'applied', 'apply-event', 'lifecycle') or \
         args.command == 'cleanup' and not args.dry_run
     if (writes or args.command in ('migrate','repair') and args.apply or args.command == 'tick' or args.command == 'pm' and args.adopt) and getattr(GUARD, 'held', None):
         raise SystemExit('taskq: another command holds the project guard; a new command must acquire independently')
@@ -7126,15 +7301,15 @@ def main(argv=None):
     try:
         with completion_release(args.command in ('ask', 'result', 'requeue', 'ack', 'applied', 'apply-event')), \
                 coordination() if writes else contextlib.nullcontext():
-            if args.command in ('add','take','ask','answer','result','requeue','run','later','close','review-integrated','cleanup','ack','applied','apply-event','lifecycle') or args.command=='pm' and args.adopt:
+            if args.command in ('add','take','ask','answer','steer','result','requeue','run','later','close','review-integrated','cleanup','ack','applied','apply-event','lifecycle') or args.command=='pm' and args.adopt:
                 board_schema_gate()
             done = args.function(args)
     except SettledError as error:
         if error.tasks and not (args.command == 'add' and args.later):
             dispatch(args.command, error.tasks)
         raise
-    if args.command in EVENTS and not (args.command == 'add' and args.later) and not (args.command in ('answer', 'close') and done == []):
-        dispatch(args.command, done if args.command in ('add', 'answer', 'close') else args.n)
+    if args.command in EVENTS and not (args.command == 'add' and args.later) and not (args.command in ('answer', 'steer', 'close') and done == []):
+        dispatch(args.command, done if args.command in ('add', 'answer', 'steer', 'close') else args.n)
 
 if __name__ == '__main__':
     main()

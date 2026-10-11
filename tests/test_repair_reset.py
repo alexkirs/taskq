@@ -54,6 +54,7 @@ class RepairReset(Base):
         raw.update(claim={'runtime': 'codex', 'session': f'old-worker-{n}', 'name': 'mac'},
                    supervisor={'runtime': 'codex', 'session': f'old-supervisor-{n}', 'name': 'mac'},
                    result={'sha': 'a'*40, 'checks': 'preserved research'} if result else None,
+                   control_commands={'old-steer': {'request': {'text': 'preserve old instruction'}}},
                    unknown={'retain': [1, 2]}, owner_decision='accept research only; no policy change',
                    model_turns={'worker': {'key': 'old-key', 'generation': 1, 'phase': 'complete'}},
                    model_recovery={'reason': 'missing tool surface'}, application_receipts={'5': {'exact': 'preserve'}})
@@ -86,6 +87,8 @@ class RepairReset(Base):
         raw = self.task(1)['raw']; entry = raw['repair_history'][0]
         self.assertFalse(receipt['repeated']); self.assertEqual(len(self.fence.calls), 1)
         self.assertEqual(entry['snapshot']['raw'], before)
+        self.assertNotIn('control_commands', raw)
+        self.assertEqual(raw['repair_checkpoint']['evidence']['owner_decisions']['control_commands'], before['control_commands'])
         self.assertEqual(entry['outcome'], 'abandoned-by-owner')
         self.assertFalse(entry['historical_drain_proven'])
         self.assertEqual(entry['proof']['unknowns'], ['historical descendant coverage unrecorded'])

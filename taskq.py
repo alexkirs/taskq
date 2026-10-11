@@ -5145,7 +5145,11 @@ def repair_digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
 
 def repair_source(issue):
-    return {key: issue.get(key) for key in ('iid', 'state', 'title', 'body', 'labels', 'assignees', 'comments')}
+    value = {key: issue.get(key) for key in ('iid', 'state', 'title', 'body', 'labels', 'assignees', 'comments')}
+    for key in ('labels', 'assignees'):
+        if isinstance(value[key], list):
+            value[key] = sorted(value[key])  # provider set ordering is not a lifecycle/source change
+    return value
 
 def repair_manager(value):
     if value is None:

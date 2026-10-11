@@ -78,3 +78,11 @@ class OwnerRisk(Base):
         entry=self.task(1)['raw']['repair_history'][0];raw=entry['snapshot']['raw']
         self.assertEqual(raw,taskq.issue_data(before));self.assertEqual(entry['snapshot']['labels'],before['labels'])
         self.assertEqual(entry['snapshot_sha256'],taskq.repair_digest(entry['snapshot']))
+
+    def test_provider_set_ordering_is_not_unknown_effect_or_stale_plan(self):
+        args,plan=self.preview();self.board.issues[1]['labels'].reverse()
+        original=self.board.update
+        def reordered(n,**kwargs):
+            result=original(n,**kwargs);self.board.issues[n]['labels'].sort();return result
+        with self.owner(),mock.patch.object(self.board,'update',side_effect=reordered):self.apply(args,plan)
+        self.assertEqual(self.task(1)['state'],'review');self.assertIsNone(self.board.guard)

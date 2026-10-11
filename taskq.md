@@ -435,7 +435,8 @@ residual risk for this transition; it is never represented as safe fencing or pr
 SID-lock is an optional admission measure, not broad fencing; keeper crash/inode loss creates
 an observed resume gap. No keeper is installed or a real session locked by this variant.
 The native receipt and exact committed checkpoint are rechecked on identical replay; no
-second board write. Partial/unknown write preserves coordination for reconciliation.
+second board write. Provider label/assignee set ordering is canonicalized for source/readback equality;
+raw snapshot order and all source text/comments are retained. Partial/unknown write preserves coordination for reconciliation.
 
 ### Change rule
 

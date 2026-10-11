@@ -36,6 +36,31 @@ participating writers must honor the existing atomic project guard. Unknown
 external writers block readiness; fresh readback conflicts fail closed. This
 command does not implement review acceptance/publication or grant new authority.
 
+Changed R11/R13: explicit rejected-result continuation is distinct from accepted-result
+resume or executor replacement. A recorded manager may use versioned `answer` with
+`--rework-rejection EVENT` for an open ask from its recorded supervisor, after a submitted
+result. The command archives that exact result, rejecting event and executor identities;
+it clears only the current rejected submission and writes the ordinary answer atomically.
+Both existing model turns must be natively complete, their exact bound grants released,
+and their birth-qualified CLI roots dead. Unknown ownership, recovery holds, closed or
+accepted results refuse. This model-only proof does not release heavy resources or claim
+universal writer drain. Ordinary admission resumes the same worker SID with the new answer
+event; application still requires the scoped committed artifact and native `applied`
+receipt. Same command ID is idempotent. No replacement, direct unaccounted model call,
+automatic rejection inference or standalone-model acceptance is authorized by this path.
+
+R3/R11/R13: when a submitted result is already in `ask` because the manager requested
+review, its recorded manager may use `ask` to request the owning supervisor's
+review, and its recorded supervisor may use `ask` to record its own explicit rejection.
+This requires the open schema-3 submitted result and preserves result, worker,
+supervisor and model receipts; it never moves to `doing` or wakes the worker.
+The manager's event targets that supervisor, never the worker; the supervisor's
+event records the rejection required by versioned rework. Other callers, absent
+submissions, acceptance/close receipts, pending execution
+orders and recovery holds refuse. The manager must still use the versioned
+rejected-result command and its exact settled-identity checks before same-worker
+rework. Recording the rejection is neither that authorization nor application.
+
 Named ARM runtime handle: `taskq arm start --name NAME [--scope-task N ...]`
 records an enabled local activation; `update` changes its scope, `status` reads
 it, and `stop` disables future admissions without cancelling any worker. These
@@ -51,6 +76,19 @@ busy, rather than claiming it stopped an in-flight pass. Once stop succeeds no
 subsequent named pass admits work. An interrupted transaction rolls back; actual
 task/launch effects remain subject to native board recovery. Different checkouts
 still coordinate through the native project guard, not this runtime handle.
+
+Changed R4/R13: conversational heartbeat delivery is not an independent execution
+scheduler. The genuine named activation owner may `arm authorize-scheduler --name NAME`
+to authorize its current project/configuration and finite invocation environment for
+an owner-shell scheduler. `arm tick --execute --scheduled --name NAME` then requires
+that exact authorization, enabled handle and unchanged configuration/limits/host scope;
+it accepts no inherited agent session IDs and never fabricates one. This permission is
+only for that named execution pass, not handle controls or PM/task authority. Native
+Windows Task Scheduler may replace the existing conversational timer after qualification:
+pause the old source, prove no overlap, register one current-user non-elevated native task,
+verify actual receipt and retain rollback. Never run both timers. Stop/update/revoke and
+configuration drift block scheduled admission. No installation of a timer follows merely
+from authorizing it. Its local handle is no security sandbox against the owning OS user.
 
 Candidate-only route: `taskq arm tick --execute [--scope-task N ...]` runs one
 existing headless guarded pass. It never opens a PM subscription, starts a timer
@@ -175,8 +213,15 @@ then host grants. Unknown launch/binding never retries a spawn. Bind the real CL
 log offset and returned native thread ID. Resume uses the same worker and binds exact pending
 event IDs/immutable payload digest (ACK state excluded); delivery/start does not ack. `taskq applied N:ID --artifact RELPATH
 --sha FULLSHA` verifies the native recorded worker/turn, scoped artifact and exact local Git
-commit before writing a native application receipt plus ack with fresh readback. Repeating
-that receipt performs no model turn or artifact write. An exact repeated answer while
+commit before writing a native application receipt plus ack with fresh readback.
+An empty expected-path list permits a committed artifact inside the owning task workspace;
+it is not a deny-all artifact scope. Named paths still constrain application artifacts.
+Native identity, immutable answer input, path containment and exact commit checks remain required.
+For the built-in worker route, verify the project's registered `.worktrees/taskq-N`
+on branch `taskq-N` and inspect its artifact/HEAD, rather than the main checkout.
+An absent built-in worker tree refuses application; it never falls back to main.
+External workspaces retain their configured root; arbitrary workspace overrides are refused.
+Repeating that receipt performs no model turn or artifact write. An exact repeated answer while
 doing/review emits no new event or delivery. When the same native session holds both
 manager and supervisor roles, `ack --role manager|supervisor` chooses its exact recorded
 recipient; sender `--pm` remains refused. Formal result remains independently
@@ -712,6 +757,18 @@ Every agent (Claude, Codex, DOT, Hermes, other) reads this file before work; `AG
 
 ### Executable behavioral model
 
+Changed (#641, R13, owner641.1 authorization): stdlib-only test frameworks -> a
+narrow test-only Hypothesis exception for the research pilot of two tasks/two
+workers. Runtime remains stdlib. The actual lifecycle calls the extracted pure
+transition kernel; isolated Hypothesis/replay reuse those exact transitions and
+existing capacity/receipt reducers. Rejected result7 is superseded by the same-worker
+answer9 application (Sentinel_68fb95025c788191b8c5d1916fc24ba7); no second synchronized
+pilot model remains. No production activation, new schema, storage or daemon.
+Other Later tasks and existing named ARM admission remain unchanged. Quint is
+conditional later only if interleaving/liveness needs it, with Python trace replay;
+Lean is not mandatory. Model assertions do not qualify persistence, subprocesses
+or native writers.
+
 States, events, transitions and invariants define behavioral truth; the board and native
 receipts remain operational truth. Keep pure transitions separate from I/O. Lifecycle
 changes update the model/properties first, then adapters. Use one executable Python kernel
@@ -720,8 +777,8 @@ Cover duplicate/out-of-order inputs, partial success, crash/recovery and determi
 replay without weakening requirements to make tests pass. Model PASS is not native process,
 persistence or provider qualification. This principle introduces no new database, schema,
 daemon, DSL or dependency. Current regression command is `python3 -B -m unittest discover -s tests`;
-platform skips and native-proof boundaries must be reported. Hypothesis remains a test-only
-pilot pending dependency review; no existing suite is claimed to use it already.
+platform skips and native-proof boundaries must be reported. Hypothesis is the reviewed test-only #641 pilot dependency; other suites and
+production admission are not qualified by that pilot.
 
 ## Product
 
@@ -823,6 +880,9 @@ receipt. Apply independently requires every `tests` check on that exact SHA in t
 upstream to be completed/successful, and refuses missing checks or unreadable CI. It fetches origin/main into
 a new checkout, requires that qualified SHA to be on its history, checks out that exact commit detached and
 verifies clean source. Unknown upstreams refuse application. There is no arbitrary-HEAD or offline bypass.
+New release clones disable automatic CRLF conversion locally; source and contract bytes must match their
+qualified Git blobs even when Git reports a translated checkout as clean. A mismatching existing release
+is preserved and refused before pointer replacement; neither global Git settings nor frozen files are repaired in place.
 
 Apply creates `<install-dir>/releases/<SHA>`, then atomically replaces `<install-dir>/current.json` with
 `{"commit":"<SHA>","path":"<absolute release directory>"}`. An existing release is reused only after exact SHA, origin, main ancestry, clean-tree and regular-file
@@ -1170,6 +1230,13 @@ Rules:
 
 ### Commit and PR/MR messages (#581)
 
+<!-- Scoped application evidence for answer 581:10, not publication acceptance.
+Answer UTF-8 SHA256: ca4343dbc854ac1f5cf183620ee97b59a30713420b4e2ba3b74f713705a9a332.
+Merged main 35f9bc3 without rewriting existing commits; retained both the UTF-8 sentinel
+and main's new tests. Publication functions match qualified result6; bounded proof and
+remaining review/checks stay in https://github.com/alexkirs/taskq/issues/581.
+-->
+
 Use a short subject explaining the change, an optional short paragraph explaining its effect,
 then a blank line and `Task: <full canonical issue URL>`. Take the URL from the board adapter's
 issue `url` (GitHub `html_url`, GitLab `web_url`), never from a task number or reconstructed host.
@@ -1296,6 +1363,8 @@ Prove an actual idle-manager wake and the continued next wait before claiming su
 a process return or an unobserved send are not receipt (R12). If the existing independent app sender cannot be
 reached with the available supported tool, report that blocker and ask through the existing task; do not create a
 replacement sender, bridge, store/protocol or duplicate task. Do not resume a worker to bypass queue rework (R11).
+The explicit versioned rejected-result continuation above is the qualified same-worker exception;
+it preserves rejected work and identity, and does not permit accepted-result resume.
 
 1. In the project root run `taskq arm tick "<manager>"` (its session name, id or link). It prints the prompt for
    this runtime: loop { `taskq wait --pm <manager id>`; send its output to `<manager>` (Claude: `SendMessage`; Codex:
@@ -1687,7 +1756,12 @@ of test types are not targets. Passing checks prove only their assertions at the
 
 #### Structure and levels
 
-Keep automated tests in `tests/test_single.py`, using stdlib `unittest`; no new framework, service or policy file.
+Keep automated tests in `tests/test_single.py`, using stdlib `unittest`; no new framework, service or policy file
+except the owner-authorized #641 test-only Hypothesis pilot above. Install its
+pinned dependency with `python3 -m pip install -r requirements-test.txt`; run
+`python3 -m unittest tests.test_single.StateKernel tests.test_single.TestStateKernel`.
+The normal suite skips the stateful pilot when Hypothesis is absent; that skip is
+not pilot PASS. CI installs the test dependency and includes the pilot in the full suite.
 Levels describe evidence, not extra directories or runners:
 
 - Contract and isolated checks: `Model` (data/trust and contract sentinels), `Contract` (contract loading/update),
@@ -1767,8 +1841,8 @@ and effective environment, plus preserved fault sensitivity; retain meaningful t
 only when an accepted contract supersedes its behavior or named remaining checks detect its relevant faults.
 Unknown value or cost is not zero and is not grounds for deletion. A flaky valuable check needs isolation or
 repair, not reruns until green. Fault injection, bounded property checks or targeted mutation need a named gap,
-a plausible fault/input distribution and a useful oracle; use existing stdlib facilities, not a standing quota
-or new framework. Report synthetic sensitivity separately from historical failure-before-fix evidence.
+a plausible fault/input distribution and a useful oracle; use existing stdlib facilities (except the narrow #641 Hypothesis pilot), not a standing quota
+or another framework. Report synthetic sensitivity separately from historical failure-before-fix evidence.
 
 #### Bounded pilot
 

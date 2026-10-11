@@ -1388,7 +1388,22 @@ def cmd_move(args):
         if any(str(event_id) not in receipts or receipts[str(event_id)]['git_sha'] != args.sha for event_id in turn.get('event_ids', [])):
             fail('model result requires native applied receipts at its exact Git SHA')
     sources, state, fields = MOVES[args.command]
-    move(task(args.n, *sources), state, args.command, args.text, **fields(args))
+    if args.command == 'ask' and current and current['state'] == 'ask':
+        current = task(args.n, 'ask')
+        raw = current['raw']
+        submitted = (raw.get('action_payloads') or {}).get('result') or {}
+        if role(current) not in ('manager', 'supervisor') or not (current.get('supervisor') or {}).get('session') \
+                or raw.get('event_schema') != EVENT_SCHEMA \
+                or not current.get('result') or not (current.get('claim') or {}).get('session') \
+                or type(submitted.get('id')) is not int or not 0 < submitted['id'] < raw.get('event_seq', 0) \
+                or raw.get('order') or raw.get('acceptance_receipts') \
+                or (raw.get('action_payloads') or {}).get('close') \
+                or any(event['action'] == 'close' for event in raw.get('events', [])) \
+                or 'legacy_recovery' in raw or raw.get('model_recovery'):
+            fail('ask from ask requires its recorded manager or supervisor and an open submitted result without recovery or acceptance')
+    else:
+        current = task(args.n, *sources)
+    move(current, state, args.command, args.text, **fields(args))
 
 def role(current):
     """Who runs this command for the task: supervisor, worker, manager, owner (a plain shell), or None (another session)."""
@@ -1475,6 +1490,46 @@ def question_revision(current):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def rejected_result_rework(current, event_id):
+    """Explicit manager order; preserve rejected work and exact executors, never accepted work."""
+    raw = current['raw']
+    boss, worker = raw.get('supervisor') or {}, raw.get('claim') or {}
+    rejection = next((event for event in raw.get('events', []) if event['id'] == event_id), None)
+    submitted = (raw.get('action_payloads') or {}).get('result')
+    if current['state'] != 'ask' or not raw.get('result') or not submitted \
+            or not rejection or rejection['action'] != 'ask' \
+            or rejection['by'] != f'{boss.get("runtime")}:{str(boss.get("session", ""))[:8]}' \
+            or submitted['id'] >= event_id or not worker.get('session') \
+            or raw.get('order') or (raw.get('action_payloads') or {}).get('close') \
+            or raw.get('acceptance_receipts') or any(event['action'] == 'close' for event in raw.get('events', [])) \
+            or 'legacy_recovery' in raw or raw.get('model_recovery'):
+        fail('rework requires an exact supervisor rejection of an open submitted result')
+    history = list(raw.get('rejected_results') or [])
+    if len(history) >= EVENT_LIMIT:
+        fail('rejected result history full; no history discarded')
+    project, host = model_providers()
+    for role, identity in (('worker', worker), ('supervisor', boss)):
+        turn = (raw.get('model_turns') or {}).get(role) or {}
+        runtime, child = turn.get('runtime') or {}, turn.get('child') or {}
+        completion = turn.get('completion') or {}
+        if identity.get('runtime') != 'codex' or not identity.get('session') \
+                or turn.get('phase') != 'complete' or not turn.get('key') \
+                or runtime.get('session') != identity['session'] \
+                or completion.get('session') != identity['session'] \
+                or completion.get('terminal') != 'turn.completed' \
+                or not child.get('pid') or not child.get('birth') \
+                or process_state(child['pid'], child['birth']) != 'dead':
+            fail('rework exact completed model identity/death evidence unavailable')
+        grant, lease = project.observe(turn['key']), host.observe(turn['key'])
+        if not grant or not lease or grant['phase'] != 'released' or lease['phase'] != 'released' \
+                or grant['request'] != turn['request'] or lease['request'] != turn['request'] \
+                or lease.get('runtime') != runtime or lease.get('child') != child \
+                or lease.get('drain') != completion:
+            fail('rework exact model grant settlement unavailable')
+    return history + [{'result': raw['result'], 'submission': submitted,
+                       'rejection': model_event_input(rejection), 'worker': worker, 'supervisor': boss}]
+
+
 def answer_command(args):
     """Guarded single-writer decision command, not provider CAS or application acknowledgement."""
     if len(args.n) != 1 or not args.n[0].isdigit() or not args.text.strip():
@@ -1492,6 +1547,9 @@ def answer_command(args):
         fail('versioned owner answer requires recorded manager or owner shell')
     actor = {k: identity.get(k) for k in ('runtime', 'session')} if identity.get('session') else {'runtime': 'owner', 'session': 'shell'}
     request = {'revision': args.question_revision, 'text': args.text, 'actor': actor}
+    rejection_id = getattr(args, 'rework_rejection', None)
+    if rejection_id is not None:
+        request['rework_rejection'] = rejection_id
     digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
     raw = current['raw']
     if 'legacy_recovery' in raw or raw.get('model_recovery'):
@@ -1510,6 +1568,10 @@ def answer_command(args):
     receipt = {'command_id': args.command_id, 'request_digest': digest,
                'question_revision': args.question_revision, 'actor': actor,
                'answer_event': raw.get('event_seq', 0) + 1, 'application_ack': False}
+    if rejection_id is not None:
+        raw = {**raw, 'rejected_results': rejected_result_rework(current, rejection_id), 'result': None}
+        receipt['rework_rejection'] = rejection_id
+        receipt['worker'] = raw['claim']
     commands[args.command_id] = receipt
     raw = {**raw, 'answer_commands': commands, 'decision': None}
     raw['events'] = [dict(event, acks=list(event.get('acks', []))) for event in raw.get('events', [])]
@@ -1529,6 +1591,8 @@ def cmd_answer(args):
     """`answer N --text A`, or `answer 43.1 44.2` (#490): each code picks an option of the task's card. An ask goes back to
     `doing` with the option's text; a review: an option starting `close` closes it, another goes back to the worker.
     Every code is checked before any task moves."""
+    if getattr(args, 'rework_rejection', None) is not None and not (getattr(args, 'command_id', None) and getattr(args, 'question_revision', None)):
+        fail('rework requires versioned answer command and question revision')
     if getattr(args, 'command_id', None) is not None or getattr(args, 'question_revision', None) is not None:
         return answer_command(args)
     if args.text:
@@ -2491,16 +2555,30 @@ def cmd_applied(args):
         fail('answer input changed from the exact admitted turn; acknowledgement refused')
     relative = Path(args.artifact)
     root = CONFIG['root'].resolve()
+    executable = shutil.which('git') or fail('git not found')
+    workspace = root / '.worktrees' / f'taskq-{n}'
+    if CONFIG.get('workspace') != 'external':
+        if workspace.is_symlink() or not workspace.is_dir() or not workspace.resolve().is_relative_to(root):
+            fail('applied worker worktree must stay inside its project')
+        registered = subprocess.run([executable, '-C', str(root), 'worktree', 'list', '--porcelain', '-z'],
+                                    capture_output=True, text=True, encoding='utf-8', timeout=10)
+        branch = subprocess.run([executable, '-C', str(workspace), 'symbolic-ref', '--quiet', '--short', 'HEAD'],
+                                capture_output=True, text=True, encoding='utf-8', timeout=10)
+        if registered.returncode or branch.returncode or branch.stdout.strip() != f'taskq-{n}' \
+                or not any(Path(line[9:]).resolve() == workspace.resolve()
+                           for line in registered.stdout.split('\0') if line.startswith('worktree ')):
+            fail('applied requires its registered task branch/worktree')
+        root = workspace.resolve()
     path = root / relative
     import fnmatch
     if relative.is_absolute() or '..' in relative.parts or not relative.name or path.is_symlink() \
             or not path.is_file() or not path.resolve().is_relative_to(root) \
-            or not any(fnmatch.fnmatchcase(relative.as_posix(), scope) for scope in item['scope']):
+            or (item['scope'] != [] and not any(fnmatch.fnmatchcase(relative.as_posix(), scope) for scope in item['scope'])):
         fail('applied artifact must be a real scoped file inside this task workspace')
     content = path.read_bytes()
     if len(content) > 1024 * 1024:
         fail('applied artifact exceeds 1 MiB bound')
-    git = [shutil.which('git') or fail('git not found'), '-C', str(root)]
+    git = [executable, '-C', str(root)]
     head = subprocess.run([*git, 'rev-parse', 'HEAD'], capture_output=True, timeout=10)
     blob = subprocess.run([*git, 'show', f'{args.sha}:{relative.as_posix()}'], capture_output=True, timeout=10)
     if head.returncode or head.stdout.decode().strip() != args.sha or blob.returncode or blob.stdout != content:
@@ -3648,26 +3726,104 @@ def lifecycle_prepare(n, refuse=fail, manager=False):
     return issue,item,project,host,runtime,fingerprint,artifact_for
 
 
+def lifecycle_transition(raw, transition, facts):
+    """Pure lifecycle reducer shared by runtime and isolated replay; facts are adapter observations."""
+    raw=json.loads(json.dumps(raw))
+    execution=raw['execution'];identity=raw['claim'];life=raw.get('lifecycle')
+    action=facts.get('action',transition)
+    if raw.get('result') is not None and (action in ('admit','resume','answer') or
+            action == 'reconcile' and (not life or life['phase'] not in ('draining','parked-releasing','parked'))):
+        raise ValueError('accepted native result requires separately qualified rework; no new execution or answer')
+    if transition=='guard':
+        return raw
+    elif transition=='answer':
+        text=facts['text']
+        if not life or life['phase'] not in ('draining','parked-releasing','parked') or text is None:
+            raise ValueError('bounded parked answer requires text and an existing park intent')
+        if len(raw.get('events',[]))>=EVENT_LIMIT:
+            raise ValueError('event history full; qualified compaction required')
+        event_id=raw.get('event_seq',0)+1
+        raw['events'].append({'id':event_id,'action':'answer','text':text,'by':facts['actor'],
+                              'recipients':[recipient('worker',identity)],'acks':[]})
+        raw['event_seq']=event_id;execution['event']=event_id
+    elif transition=='admission':
+        action=facts['action'];fingerprint=facts['fingerprint']
+        if action not in ('admit','resume','reconcile'):
+            raise ValueError('unsupported lifecycle action')
+        if life and life['phase'] in ('draining','parked-releasing'):
+            raise ValueError('drain/release unfinished; reconcile park before resume')
+        if life and life['phase']=='parked' and action!='resume':
+            raise ValueError('parked task requires explicit resume')
+        if not life or life['phase']=='parked':
+            if life and not facts['predecessor_settled']:
+                raise ValueError('predecessor drain changed; resume refused')
+            generation=life['generation']+1 if life else 1
+            age=life['age'] if life else raw.get('admission_age')
+            if type(age) not in (int,float):
+                raise ValueError('original admission age required')
+            key=hashlib.sha256(json.dumps([fingerprint,generation],sort_keys=True).encode()).hexdigest()
+            life={'identity':fingerprint,'generation':generation,'age':age,'phase':'reserving','key':key,
+                  'demand':execution['demand'],'event':execution['event'],'artifact':facts['artifact']}
+            raw['lifecycle']=life
+        if life['event']!=execution['event'] or life['artifact']!=facts['artifact'] or life['demand']!=execution['demand']:
+            raise ValueError('active execution changed; park/reconcile before continuation')
+    elif transition=='application':
+        application=facts['application']
+        event=next((e for e in raw['events'] if e['id']==life['event']),None)
+        if application.get('status')=='ok' and event and recipient('worker',identity) in event['recipients'] \
+                and application.get('artifact')==life['artifact'] and application.get('event')==life['event'] \
+                and application.get('session')==identity['session'] and facts['file_ok'] \
+                and application.get('sha256')==facts['file_sha256']==hashlib.sha256(event['text'].encode()).hexdigest():
+            target=recipient('worker',identity)
+            if target not in event['acks']:
+                event['acks'].append(target)
+            raw.setdefault('applications',{})[life['key']]={'event':life['event'],'identity':identity,'proof':application}
+    elif transition=='accept':
+        criteria=raw.get('acceptance_criteria') or {}
+        event=next((e for e in raw['events'] if e['id']==execution['event']),None)
+        if criteria.get('kind')!='answer-artifact' or criteria.get('event')!=execution['event'] or criteria.get('artifact')!=facts['artifact'] \
+                or not event or criteria.get('sha256')!=hashlib.sha256(event['text'].encode()).hexdigest():
+            raise ValueError('task-specific acceptance criteria unavailable or changed; action/exit0 is not task success')
+        value=facts['host']
+        application=((value or {}).get('drain') or {}).get('application') or {}
+        if not facts['drain_verified'] or application.get('status')!='ok' or application.get('session')!=identity['session'] or application.get('event')!=execution['event'] \
+                or application.get('sha256')!=criteria['sha256'] or not facts['file_ok'] \
+                or facts['file_sha256']!=criteria['sha256']:
+            raise ValueError('exact independently verifiable application receipt/artifact missing')
+        if not life or life['phase'] != 'parked' or value['phase'] != 'released' \
+                or facts['project'] is not None and facts['project']['phase'] != 'released' \
+                or recipient('worker',identity) not in event['acks'] \
+                or (raw.get('applications',{}).get(life['key']) or {}).get('proof') != application:
+            raise ValueError('application ack or predecessor grants are not settled on the task board')
+        receipt={'kind':'answer-artifact','key':life['key'],'criteria':criteria,'authority':facts['actor'],'application':application}
+        receipts=raw.setdefault('acceptance_receipts',{})
+        if receipts.get(life['key']) and receipts[life['key']]!=receipt:
+            raise ValueError('conflicting task acceptance receipt')
+        if not receipts.get(life['key']):
+            receipts[life['key']]=receipt
+    else:
+        raise ValueError('unsupported lifecycle transition')
+    return raw
+
+
 def lifecycle(n, action, text=None):
     issue,item,project,host,runtime,fingerprint,artifact_for=lifecycle_prepare(n)
     raw=item['raw'];execution=raw['execution'];identity=item['claim'];life=raw.get('lifecycle')
-    if raw.get('result') is not None and (action in ('admit','resume','answer') or
-            action == 'reconcile' and (not life or life['phase'] not in ('draining','parked-releasing','parked'))):
-        fail('accepted native result requires separately qualified rework; no new execution or answer')
+    def transition(stage, **facts):
+        nonlocal raw, execution, life
+        try:
+            raw=lifecycle_transition(raw,stage,facts)
+        except ValueError as error:
+            fail(str(error))
+        execution=raw['execution'];life=raw.get('lifecycle')
+    transition('guard',action=action)
     def request_for(lifecycle):
         return {**fingerprint,'generation':lifecycle['generation'],'age':lifecycle['age'],
                 'priority':item['priority'],'demand':lifecycle['demand']}
     if action=='answer':
-        if not life or life['phase'] not in ('draining','parked-releasing','parked') or text is None:
-            fail('bounded parked answer requires text and an existing park intent')
-        if len(raw.get('events',[]))>=EVENT_LIMIT:
-            fail('event history full; qualified compaction required')
-        event_id=raw.get('event_seq',0)+1
-        raw['events'].append({'id':event_id,'action':'answer','text':text,'by':origin(),
-                              'recipients':[recipient('worker',identity)],'acks':[]})
-        raw['event_seq']=event_id;execution['event']=event_id
+        transition('answer',text=text,actor=origin())
         lifecycle_write(issue,raw)
-        return {'phase':life['phase'],'answer_event':event_id,'task_accepted':False}
+        return {'phase':life['phase'],'answer_event':raw['event_seq'],'task_accepted':False}
     if action in ('park','reconcile') and life and life['phase'] in ('draining','parked-releasing','parked','active','starting','reserving','waiting'):
         if action=='reconcile' and life['phase'] in ('active','starting','reserving','waiting'):
             pass  # readback/re-entry uses admission below; never blindly repeat a spawn
@@ -3685,17 +3841,10 @@ def lifecycle(n, action, text=None):
             if project.observe(life['key']) is not None:
                 effect(project.release,life['key'])
             life['phase']='parked'
-            application=drained['drain'].get('application') or {}
-            event=next((e for e in raw['events'] if e['id']==life['event']),None)
             path=Path(CONFIG['root'])/life['artifact']
-            if application.get('status')=='ok' and event and recipient('worker',identity) in event['recipients'] \
-                    and application.get('artifact')==life['artifact'] and application.get('event')==life['event'] \
-                    and application.get('session')==identity['session'] and path.is_file() and not path.is_symlink() \
-                    and application.get('sha256')==hashlib.sha256(path.read_bytes()).hexdigest()==hashlib.sha256(event['text'].encode()).hexdigest():
-                target=recipient('worker',identity)
-                if target not in event['acks']:
-                    event['acks'].append(target)
-                raw.setdefault('applications',{})[life['key']]={'event':life['event'],'identity':identity,'proof':application}
+            file_ok=path.is_file() and not path.is_symlink()
+            transition('application',application=drained['drain'].get('application') or {},
+                       file_ok=file_ok,file_sha256=hashlib.sha256(path.read_bytes()).hexdigest() if file_ok else None)
             lifecycle_write(issue,raw,'later')
             return {'phase':'parked','generation':life['generation'],'task_accepted':False}
     if action=='park':
@@ -3704,48 +3853,23 @@ def lifecycle(n, action, text=None):
         if not life or life['phase']!='parked':
             fail('result acceptance requires an already settled park; no automatic drain')
         native_ack(n,life['event'])
-        criteria=raw.get('acceptance_criteria') or {}
-        event=next((e for e in raw['events'] if e['id']==execution['event']),None)
-        if criteria.get('kind')!='answer-artifact' or criteria.get('event')!=execution['event'] or criteria.get('artifact')!=artifact_for(execution['event']) \
-                or not event or criteria.get('sha256')!=hashlib.sha256(event['text'].encode()).hexdigest():
-            fail('task-specific acceptance criteria unavailable or changed; action/exit0 is not task success')
-        path=Path(CONFIG['root'])/artifact_for(execution['event']);value=host.observe(life['key']) if life else None
-        application=((value or {}).get('drain') or {}).get('application') or {}
-        if not host.drain_verified(value) or application.get('status')!='ok' or application.get('session')!=identity['session'] or application.get('event')!=execution['event'] \
-                or application.get('sha256')!=criteria['sha256'] or not path.is_file() or path.is_symlink() \
-                or hashlib.sha256(path.read_bytes()).hexdigest()!=criteria['sha256']:
-            fail('exact independently verifiable application receipt/artifact missing')
-        if not life or life['phase'] != 'parked' or value['phase'] != 'released' \
-                or project.observe(life['key']) is not None and project.observe(life['key'])['phase'] != 'released' \
-                or recipient('worker',identity) not in event['acks'] \
-                or (raw.get('applications',{}).get(life['key']) or {}).get('proof') != application:
-            fail('application ack or predecessor grants are not settled on the task board')
-        receipt={'kind':'answer-artifact','key':life['key'],'criteria':criteria,'authority':origin(),'application':application}
-        receipts=raw.setdefault('acceptance_receipts',{})
-        if receipts.get(life['key']) and receipts[life['key']]!=receipt:
-            fail('conflicting task acceptance receipt')
-        if not receipts.get(life['key']):
-            receipts[life['key']]=receipt;lifecycle_write(issue,raw)
+        path=Path(CONFIG['root'])/artifact_for(execution['event']);value=host.observe(life['key'])
+        file_ok=path.is_file() and not path.is_symlink()
+        before=raw
+        transition('accept',artifact=artifact_for(execution['event']),host=value,
+                   project=project.observe(life['key']),drain_verified=host.drain_verified(value),
+                   file_ok=file_ok,file_sha256=hashlib.sha256(path.read_bytes()).hexdigest() if file_ok else None,
+                   actor=origin())
+        if raw!=before:
+            lifecycle_write(issue,raw)
         return {'phase':life['phase'],'task_accepted':True,'criterion':'answer-artifact'}
-    if action not in ('admit','resume','reconcile'):
-        fail('unsupported lifecycle action')
-    if life and life['phase'] in ('draining','parked-releasing'):
-        fail('drain/release unfinished; reconcile park before resume')
-    if life and life['phase']=='parked' and action!='resume':
-        fail('parked task requires explicit resume')
-    if not life or life['phase']=='parked':
-        if life and (not host.drain_verified(host.observe(life['key'])) or project.observe(life['key']) is not None and project.observe(life['key'])['phase']!='released'):
-            fail('predecessor drain changed; resume refused')
-        generation=life['generation']+1 if life else 1
-        age=life['age'] if life else raw.get('admission_age')
-        if type(age) not in (int,float):
-            fail('original admission age required')
-        key=hashlib.sha256(json.dumps([fingerprint,generation],sort_keys=True).encode()).hexdigest()
-        life={'identity':fingerprint,'generation':generation,'age':age,'phase':'reserving','key':key,
-              'demand':execution['demand'],'event':execution['event'],'artifact':artifact_for(execution['event'])}
-        raw['lifecycle']=life;lifecycle_write(issue,raw)
-    if life['event']!=execution['event'] or life['artifact']!=artifact_for(execution['event']) or life['demand']!=execution['demand']:
-        fail('active execution changed; park/reconcile before continuation')
+    before=raw
+    settled=not life or life['phase']!='parked' or (host.drain_verified(host.observe(life['key']))
+                and (project.observe(life['key']) is None or project.observe(life['key'])['phase']=='released'))
+    transition('admission',action=action,fingerprint=fingerprint,
+               artifact=artifact_for(execution['event']),predecessor_settled=settled)
+    if raw!=before:
+        lifecycle_write(issue,raw)
     request=request_for(life)
     selected=CONFIG['capacity']
     demand=life['demand']
@@ -4769,6 +4893,8 @@ def verify_release(release, commit, upstream):
         entry = update_git(release, 'ls-tree', 'HEAD', '--', name)
         if not entry.startswith(('100644 ', '100755 ')) or not (release / name).is_file():
             fail(f'update release has no regular {name}; pointer unchanged')
+        if update_git(release, 'hash-object', '--no-filters', '--', name) != entry.split()[2]:
+            fail(f'update release {name} bytes differ from qualified Git blob; preserving it and the pointer')
 
 
 def cmd_update(args):
@@ -4812,7 +4938,7 @@ def cmd_update(args):
         if not release.exists():
             release.parent.mkdir(parents=True, exist_ok=True)
             # Failure leaves evidence; neither existing source nor active pointer is changed.
-            update_git(root, 'clone', '--no-checkout', '--single-branch', '--branch', 'main', '--', upstream, str(release))
+            update_git(root, 'clone', '--config', 'core.autocrlf=false', '--no-checkout', '--single-branch', '--branch', 'main', '--', upstream, str(release))
             update_git(release, 'merge-base', '--is-ancestor', candidate, 'refs/remotes/origin/main')
             update_git(release, 'checkout', '--detach', candidate)
         verify_release(release, candidate, upstream)  # retries may reuse only an intact exact qualified release
@@ -5044,11 +5170,24 @@ def rollout(thread):
     return next((kind for kind, pattern in (('local', f'sessions/*/*/*/{name}'), ('archived', f'archived_sessions/{name}'))
                  if next(home.glob(pattern), None)), None)
 
+def scheduler_binding():
+    config = {key: value for key, value in CONFIG.items() if not key.startswith('_')}
+    invocation = {key: os.environ.get(key) for key in
+                  ('TASKQ_HOST', 'TASKQ_HOST_ONLY', 'TASKQ_LIMITS', 'TASKQ_RUNTIME', 'TASKQ_CLIENT', 'TASKQ_COMPRESS')}
+    if invocation['TASKQ_RUNTIME'] != 'codex' or local_limits() is None:
+        fail('scheduler authorization requires explicit Codex runtime and finite invocation limits')
+    return hashlib.sha256(json.dumps({'config': config, 'invocation': invocation}, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def named_arm(args):
     """Local activation handle; board authority and finite capacity remain native."""
     import sqlite3
     identity = session()
-    if not identity or not identity.get('session'):
+    scheduled = getattr(args, 'scheduled', False)
+    if scheduled and (args.what != 'tick' or not args.execute or identity
+                      or any(os.environ.get(key) for key in SESSIONS.values())):
+        fail('scheduled ARM requires only an owner-shell execution pass; no inherited agent IDs')
+    if not scheduled and (not identity or not identity.get('session')):
         fail('named ARM needs a genuine agent session')
     name = args.name
     if args.target:
@@ -5064,7 +5203,7 @@ def named_arm(args):
     if path.is_symlink():
         fail('ARM runtime path is a symlink; no changes')
     key = json.dumps([CONFIG.get('board'), CONFIG.get('host'), CONFIG['repo'], machine(), name])
-    owner = recipient('arm', identity)
+    owner = recipient('arm', identity) if identity else None
     db = sqlite3.connect(path, timeout=0)
     try:
         if os.name != 'nt':
@@ -5073,7 +5212,7 @@ def named_arm(args):
         db.execute('BEGIN IMMEDIATE')
         row = db.execute('SELECT body FROM activation WHERE id=?', (key,)).fetchone()
         state = json.loads(row[0]) if row else None
-        if state and state['owner'] != owner:
+        if state and not scheduled and state['owner'] != owner:
             fail('named ARM belongs to another session; no changes')
         operation = args.what
         repeated = False
@@ -5090,15 +5229,30 @@ def named_arm(args):
             repeated = state['scope'] == scope
             if not repeated:
                 state.update(scope=scope, revision=state['revision'] + 1)
+                state.pop('scheduler', None)
+        elif operation == 'authorize-scheduler':
+            if not state['enabled']:
+                fail('authorize only an enabled named ARM')
+            binding = scheduler_binding()
+            repeated = state.get('scheduler') == binding
+            if not repeated:
+                state.update(scheduler=binding, revision=state['revision'] + 1)
+        elif operation == 'revoke-scheduler':
+            repeated = 'scheduler' not in state
+            if not repeated:
+                state.pop('scheduler'); state['revision'] += 1
         elif operation == 'stop':
             repeated = not state['enabled']
             if not repeated:
                 state.update(enabled=False, revision=state['revision'] + 1)
+                state.pop('scheduler', None)
         elif operation == 'tick':
             if not state['enabled']:
                 fail('named ARM stopped; no admissions')
             if args.scope_task is not None:
                 fail('named ARM tick uses recorded scope; use update')
+            if scheduled and state.get('scheduler') != scheduler_binding():
+                fail('scheduled ARM authorization absent or configuration/invocation changed')
             if release_reason():
                 fail(release_reason())
             args.execution_scope = state['scope']
@@ -5109,7 +5263,8 @@ def named_arm(args):
         db.commit()
         return print(json.dumps({'type': 'taskq.arm', 'version': 1, 'name': name,
                                  'host': machine(), 'operation': operation,
-                                 'repeated': repeated, 'activation': state}))
+                                 'repeated': repeated, 'activation': state,
+                                 **({'executor': 'owner-shell-scheduler'} if scheduled else {})}))
     except sqlite3.OperationalError as error:
         fail('named ARM runtime busy or unavailable; no new pass: ' + str(error))
     finally:
@@ -5117,6 +5272,8 @@ def named_arm(args):
 
 def cmd_arm(args):
     """The prompt for a tick-sender session of this runtime: wait, send the output to the manager, repeat (#407)."""
+    if getattr(args, 'scheduled', False) and getattr(args, 'name', None) is None:
+        fail('scheduled execution requires one authorized named ARM')
     if getattr(args, 'name', None) is not None:
         return named_arm(args)
     runtime = (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
@@ -5220,7 +5377,7 @@ def main(argv=None):
     card = ((('--option',), {'action': 'append', 'default': []}), (('--recommend',), {'type': int, 'default': 1}),
             (('--link',), {'action': 'append', 'default': []}))  # #490: the decision card
     command('ask', cmd_move, *card, text='required')
-    command('answer', cmd_answer, (('n',), {'nargs': '+'}), (('--command-id',), {}), (('--question-revision',), {}), n=False, text=True)
+    command('answer', cmd_answer, (('n',), {'nargs': '+'}), (('--command-id',), {}), (('--question-revision',), {}), (('--rework-rejection',), {'type': int}), n=False, text=True)
     command('result', cmd_move, (('--sha',), {'type': commit}), (('--checks',), {'default': ''}), *card, text=True)
     command('requeue', cmd_requeue, text=True)
     command('run', cmd_run, text=True)
@@ -5240,8 +5397,8 @@ def main(argv=None):
     command('applied', cmd_applied, (('event',), {}), (('--artifact',), {'required': True}), (('--sha',), {'required': True}), n=False)
     command('apply-event', cmd_apply_event, (('event',), {}), (('--artifact',), {'required': True}), (('--role',), {'choices': ('worker', 'manager'), 'default': 'worker'}), n=False)
     command('ack', cmd_ack, (('events',), {'nargs': '*'}), (('--pm',), {}), (('--role',), {'choices': ('manager','supervisor')}), (('--stdin',), {'action': 'store_true'}), n=False)
-    command('arm', cmd_arm, (('what',), {'choices': ('tick','start','update','status','stop')}), (('target',), {'nargs': '?'}),
-            (('--execute',), {'action':'store_true'}), (('--name',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), n=False)
+    command('arm', cmd_arm, (('what',), {'choices': ('tick','start','update','status','stop','authorize-scheduler','revoke-scheduler')}), (('target',), {'nargs': '?'}),
+            (('--execute',), {'action':'store_true'}), (('--scheduled',), {'action':'store_true'}), (('--name',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), n=False)
     command('pm', cmd_pm, (('--adopt',), {'nargs': '+', 'type': int, 'default': []}),
             (('--subscribe',), {}), (('--scope-task',), {'type':int,'nargs':'+'}), (('--delivery-ack',), {}),
             (('--status',), {'action':'store_true'}), (('--format',), {'choices':('json','text','dot'),'default':'json'}), n=False)

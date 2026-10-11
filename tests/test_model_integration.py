@@ -163,6 +163,88 @@ class ModelIntegration(unittest.TestCase):
         with self.assertRaises(SystemExit), mock.patch.object(q.Claude, 'spawn', side_effect=AssertionError('spawn')):
             q.owned_model_turn(self.item(), q.Claude(), 'worker', 'synthetic')
 
+    def rejected_fixture(self):
+        sid = self.start(); self.complete()
+        def supervisor(*args):
+            child = subprocess.Popen([sys.executable, '-c', 'import sys;sys.stdin.read()'], stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.children.append(child); child.taskq_birth = q.process_identity(child.pid)[1]
+            log = self.kind.folder() / 'S1.log'; q.CONFIG['_model_launch'](child, log)
+            log.write_bytes(b'{"type":"thread.started","thread_id":"fixture-supervisor"}\n{"type":"turn.started"}\n')
+            return 'fixture-supervisor'
+        with q.coordination(), mock.patch.object(self.kind, 'spawn', side_effect=supervisor):
+            boss = q.owned_model_turn(self.item(), self.kind, 'supervisor', 'review')
+            q.move(self.item(), 'doing', 'spawn', 'supervisor '+boss,
+                   supervisor={**self.actor, 'session': boss})
+        with (self.kind.folder()/'S1.log').open('ab') as stream:
+            stream.write(b'{"type":"turn.completed"}\n')
+        self.children[-1].communicate(timeout=5)
+        with q.coordination():
+            q.model_reconcile(self.item())
+            self.identity = dict(self.item()['claim'])
+            q.move(self.item(), 'review', 'result', 'submitted', result={'sha': 'a'*40, 'checks': 'fixture'})
+            self.identity = dict(self.item()['supervisor'])
+            q.move(self.item(), 'ask', 'ask', 'review rejected: correct shared runtime',
+                   decision={'summary': 'rejected', 'options': ['correct'], 'recommend': 1})
+        self.identity = dict(self.actor)
+        item = self.item()
+        return argparse.Namespace(command='answer', n=['1'], text='correct approved scope',
+                                  command_id='rework-fixture', question_revision=q.question_revision(item),
+                                  rework_rejection=item['raw']['event_seq']), sid
+
+    def test_explicit_rejected_result_rework_same_identity_and_idempotent_application(self):
+        q.CONFIG['workspace'] = 'external'
+        args, sid = self.rejected_fixture(); old = self.item()['raw']; boss = old['supervisor']
+        with q.coordination(): q.cmd_answer(args)
+        raw = self.item()['raw']
+        self.assertEqual(raw['rejected_results'][0]['result'], old['result'])
+        self.assertEqual((raw['claim'], raw['supervisor']), (old['claim'], boss))
+        self.assertIsNone(raw['result'])
+        before = json.dumps(self.board.issues, sort_keys=True)
+        with q.coordination(): q.cmd_answer(args)
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=self.launch):
+            q.follow(self.item(), self.kind, self.item()['claim'], True)
+        turn = self.item()['raw']['model_turns']['worker']
+        self.assertEqual(turn['runtime']['session'], sid)
+        self.assertEqual(turn['event_ids'], [raw['event_seq']])
+        self.assertEqual(self.item()['raw']['events'][-2]['acks'], [])
+        git = ['git', '-C', str(self.root)]
+        for argv in (['init', '-q'], ['config', 'user.name', 'Fixture'], ['config', 'user.email', 'fixture@example.invalid']):
+            subprocess.run(git+argv, check=True, capture_output=True)
+        (self.root/'artifact.txt').write_text('corrected')
+        subprocess.run(git+['add', 'artifact.txt'], check=True)
+        subprocess.run(git+['commit', '-qm', 'corrected fixture'], check=True)
+        sha = subprocess.check_output(git+['rev-parse', 'HEAD'], text=True).strip()
+        self.identity = dict(self.item()['claim'])
+        applied = argparse.Namespace(event=f'1:{turn["event_ids"][0]}', artifact='artifact.txt', sha=sha)
+        with q.coordination(): q.cmd_applied(applied)
+        before = json.dumps(self.board.issues, sort_keys=True)
+        with q.coordination(): q.cmd_applied(applied)
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        self.complete()
+
+    def test_rework_refuses_unknown_identity_unsettled_grants_and_accepted_result(self):
+        args, _ = self.rejected_fixture(); issue = self.board.get(1); raw = q.issue_data(issue)
+        cases = []
+        changed = json.loads(json.dumps(raw)); changed['model_turns']['worker']['runtime']['session'] = 'foreign'; cases.append(changed)
+        changed = json.loads(json.dumps(raw)); changed['model_turns']['worker']['phase'] = 'bound'; cases.append(changed)
+        changed = json.loads(json.dumps(raw)); changed['action_payloads']['close'] = {'id': 10}; cases.append(changed)
+        changed = json.loads(json.dumps(raw)); changed['acceptance_receipts'] = {'native': {'status': 'accepted'}}; cases.append(changed)
+        changed = json.loads(json.dumps(raw)); changed['events'].append({'id': 10, 'action': 'close', 'text': 'accepted', 'by': 'supervisor', 'recipients': [], 'acks': []}); cases.append(changed)
+        changed = json.loads(json.dumps(raw)); changed['events'][-1]['by'] = 'codex:foreign'; cases.append(changed)
+        for changed in cases:
+            with self.subTest(changed=changed):
+                self.board.issues[1]['body'] = q.block('synthetic', changed)
+                before = json.dumps(self.board.issues, sort_keys=True)
+                with self.assertRaises(SystemExit), q.coordination(): q.cmd_answer(args)
+                self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        self.board.issues[1] = issue
+        with q.coordination(), mock.patch.object(self.project, 'observe', return_value={'phase': 'reserved'}):
+            with self.assertRaises(SystemExit): q.cmd_answer(args)
+        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=AssertionError('unsafe resume')):
+            with self.assertRaises(SystemExit): q.owned_model_turn(self.item(), self.kind, 'worker', 'without order', resume=self.item()['claim']['session'])
+
     def test_larger_provider_cannot_bypass_local_model_limit(self):
         q.CONFIG['capacity']['host_caps']['model:codex'] = 2
         with self.assertRaises(SystemExit), mock.patch.object(self.kind, 'spawn', side_effect=AssertionError('spawn')):
@@ -179,6 +261,12 @@ class ModelIntegration(unittest.TestCase):
         self.assertEqual(converted['event_schema'], 3)
 
     def test_applied_requires_native_identity_exact_commit_and_repeat_is_no_write(self):
+        self.exercise_applied()
+
+    def test_applied_uses_registered_worker_worktree_not_main_checkout(self):
+        self.exercise_applied(worktree=True)
+
+    def exercise_applied(self, worktree=False):
         self.start(); self.complete()
         with q.coordination():
             q.move(self.item(), 'ask', 'ask', 'choose')
@@ -189,7 +277,14 @@ class ModelIntegration(unittest.TestCase):
         git = ['git', '-C', str(self.root)]
         for argv in (['init', '-q'], ['config', 'user.name', 'Fixture'], ['config', 'user.email', 'fixture@example.invalid']):
             subprocess.run(git+argv, check=True, capture_output=True)
-        (self.root/'artifact.txt').write_text('chosen value')
+        workspace = self.root
+        if worktree:
+            subprocess.run(git+['commit', '--allow-empty', '-qm', 'project baseline'], check=True)
+            workspace = self.root/'.worktrees/taskq-1'
+            workspace.parent.mkdir()
+            subprocess.run(git+['worktree', 'add', '-qb', 'taskq-1', str(workspace)], check=True)
+            git = ['git', '-C', str(workspace)]
+        (workspace/'artifact.txt').write_text('chosen value')
         subprocess.run(git+['add', 'artifact.txt'], check=True)
         subprocess.run(git+['commit', '-qm', 'synthetic artifact'], check=True)
         sha = subprocess.check_output(git+['rev-parse', 'HEAD'], text=True).strip()
@@ -202,11 +297,29 @@ class ModelIntegration(unittest.TestCase):
         self.board.issues[1]['body'] = q.block('synthetic', changed)
         with self.assertRaises(SystemExit): q.cmd_applied(args)
         self.board.issues[1] = issue
+        scoped = q.issue_data(issue)
+        scoped['scope'] = ['other.txt']
+        self.board.issues[1]['body'] = q.block('synthetic', scoped)
+        with self.assertRaises(SystemExit): q.cmd_applied(args)
+        scoped['scope'] = []  # ordinary intake default: no expected paths named
+        self.board.issues[1]['body'] = q.block('synthetic', scoped)
+        if not worktree:
+            before = json.dumps(self.board.issues, sort_keys=True)
+            with self.assertRaises(SystemExit): q.cmd_applied(args)  # missing built-in tree never falls back to main
+            self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+            q.CONFIG['workspace'] = 'external'
+        for path in ('../artifact.txt', str(workspace/'artifact.txt')):
+            with self.assertRaises(SystemExit):
+                q.cmd_applied(argparse.Namespace(event=args.event, artifact=path, sha=sha))
+        if worktree:
+            subprocess.run(git+['checkout', '-qb', 'foreign-task'], check=True)
+            with self.assertRaises(SystemExit): q.cmd_applied(args)
+            subprocess.run(git+['checkout', '-q', 'taskq-1'], check=True)
         with q.coordination(): q.cmd_applied(args)
         before = json.dumps(self.board.issues, sort_keys=True)
         with q.coordination(): q.cmd_applied(args)
         self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
-        (self.root/'artifact.txt').write_text('changed')
+        (workspace/'artifact.txt').write_text('changed')
         with self.assertRaises(SystemExit): q.cmd_applied(args)
         self.complete()
 

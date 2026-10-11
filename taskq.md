@@ -262,6 +262,16 @@ execution; its saved completion must match strict native terminal proof.
 Settlement is idempotent and records completion without reopening,
 dispatching or otherwise changing the closed task.
 
+Changed (R1/R12, recovered native Codex network errors): every intermediate `error`
+blocked model settlement -> a single attributed turn ending `turn.completed` may
+contain the observed native reconnect messages: `Reconnecting... N/M (stream
+disconnected before completion: DETAILS)` or `Reconnecting... waiting for network
+(Connection failed: error sending request)`. Other errors, malformed messages,
+retry-only logs and retries ending `turn.failed` remain refused. A failed turn
+without preceding errors retains its existing model-only settlement behavior.
+Exact child death, session, prefix, one-turn attribution and immutable receipt
+checks remain required; recovery proves no application, resource or external-writer drain.
+
 The former automatic CLI wait/send/wait shortcut is withheld: successful resume
 exit alone proves neither event application nor a completed queue pass. The
 qualified application sender uses the receipt handshake above; this patch adds

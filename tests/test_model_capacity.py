@@ -123,6 +123,42 @@ class ModelCapacity(unittest.TestCase):
                 self.host.release('turn')
         self.assertEqual(self.host.observe('turn')['phase'], 'drained')
 
+    def test_recovered_native_reconnect_releases_only_model_budget(self):
+        self.entries[2:2] = [
+            {'type': 'error', 'message': 'Reconnecting... 2/5 (stream disconnected before completion: '
+             'No connection could be made because the target machine actively refused it. (os error 10061))'},
+            {'type': 'error', 'message': 'Reconnecting... waiting for network (Connection failed: error sending request)'},
+        ]
+        self.write_log()
+        self.host.reserve('heavy', {'age': 1, 'priority': 0, 'demand': {'heavy': 1}})
+        self.bound()
+        with mock.patch.object(q, 'process_state', return_value='dead'):
+            proof = self.host.settle_model('turn', self.runtime)['drain']
+            self.assertEqual(proof['terminal'], 'turn.completed')
+            self.assertNotIn('application', proof)
+            self.assertEqual(self.host.release('turn')['phase'], 'released')
+            self.assertEqual(self.host.settle_model('turn', self.runtime)['phase'], 'released')
+        self.assertEqual(self.host.observe('heavy')['phase'], 'reserved')
+
+    def test_unknown_errors_and_unrecovered_reconnect_keep_model_grant(self):
+        self.bound()
+        start = self.entries[:2]
+        retry = {'type': 'error', 'message': 'Reconnecting... waiting for network (Connection failed: error sending request)'}
+        variants = [
+            start + [retry], start + [retry, {'type': 'turn.failed'}],
+            start + [retry, {'type': 'turn.completed'}, {'type': 'turn.completed'}],
+            *[start + [{'type': 'error', 'message': message}, {'type': 'turn.completed'}]
+              for message in (None, {}, 'fatal error', 'Reconnecting... unknown error',
+                              'Reconnecting... 2/5 (stream disconnected before completion: x)\nextra')],
+        ]
+        for entries in variants:
+            with self.subTest(entries=entries):
+                self.entries = entries
+                self.write_log()
+                with mock.patch.object(q, 'process_state', return_value='dead'), self.assertRaises(ValueError):
+                    self.host.settle_model('turn', self.runtime)
+                self.assertEqual(self.host.observe('turn')['phase'], 'bound')
+
     def test_prefix_rewrite_and_partial_line_refused(self):
         self.bound()
         original = self.log.read_bytes()
@@ -237,6 +273,19 @@ class ClosedModelSettlement(unittest.TestCase):
         self.assertEqual(self.host.observe('turn')['phase'], 'bound')
         self.assertEqual(self.project.observe('turn')['phase'], 'reserved')
         self.assertEqual(self.writes, [])
+
+    def test_closed_recovered_reconnect_settles_once_without_changing_task(self):
+        self.entries.insert(2, {'type': 'error', 'message':
+                               'Reconnecting... waiting for network (Connection failed: error sending request)'})
+        self.write_log(); self.reconcile()
+        self.assertEqual(self.host.observe('turn')['phase'], 'released')
+        self.assertEqual(self.project.observe('turn')['phase'], 'released')
+        after = q.issue_data(self.issue)
+        self.assertEqual(after['model_turns']['supervisor']['completion']['terminal'], 'turn.completed')
+        self.assertEqual({k:v for k,v in after.items() if k!='model_turns'},
+                         {k:v for k,v in self.raw.items() if k!='model_turns'})
+        writes = self.writes[:]; self.reconcile()
+        self.assertEqual(self.writes, writes)
     def test_same_sid_new_active_turn_retains_grants(self):
         self.entries += [{'type': 'thread.started', 'thread_id': 'native-fixture'}, {'type':'turn.started'}]
         self.write_log(); self.reconcile()

@@ -899,6 +899,16 @@ class Coordination(Base):
 
 
 class Commands(Base):
+    def test_service_notifications_do_not_start_an_independent_dispatcher(self):
+        service=mock.Mock()
+        with mock.patch.object(taskq,'dispatch_service_owned',return_value=True), \
+                mock.patch.object(taskq,'service_module',return_value=service), \
+                mock.patch.object(taskq,'start_pass',side_effect=AssertionError('second source')):
+            taskq.dispatch('add',[1,2])
+            service.notify.assert_called_once_with(self.root,[1,2],None,None)
+            service.notify.side_effect=taskq.sqlite3.OperationalError('busy')
+            taskq.dispatch('turn end',[],after=123,after_birth='exact-birth')
+            self.assertEqual(service.notify.call_args,mock.call(self.root,[],123,'exact-birth'))
 
     def test_add_later_is_guarded_intake_without_dispatch_or_dependency_read(self):
         self.add('existing', '--later')

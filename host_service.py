@@ -25,10 +25,11 @@ def digest(value):
 def connect_db(path):
     if path.is_symlink() or path.exists() and (not path.is_file() or path.stat().st_nlink!=1):
         raise ValueError('linked or non-file registry refused')
-    db=sqlite3.connect(path,timeout=0)
+    db=sqlite3.connect(path,timeout=1)  # local wake writers briefly share this registry
     try:
         db.execute('CREATE TABLE IF NOT EXISTS state (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, digest TEXT NOT NULL, response TEXT NOT NULL)')
+        db.execute('CREATE TABLE IF NOT EXISTS wakes (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
         if os.name!='nt': os.chmod(path,0o600)
         return db
     except BaseException:
@@ -44,6 +45,82 @@ def read_state(db):
             or not isinstance(state.get('epoch'),str) or not state['epoch']:
         raise ValueError('unsupported registry state')
     return state
+
+def dispatch_ready(phase,now,due,woke):
+    return phase=='active' and (woke or now>=due)
+
+def record_error(db,error):
+    db.rollback()
+    try:
+        state=read_state(db);state['last_error']=str(error);save_state(db,state);db.commit()
+    except sqlite3.Error:
+        db.rollback()  # a busy wake writer must not crash the sole dispatch source
+    print('taskq service: '+str(error),file=sys.stderr)
+
+def wake_value(key,body):
+    value=json.loads(body)
+    if not isinstance(value,dict) or set(value)!={'epoch','tasks','after','birth'} \
+            or not isinstance(value['epoch'],str) or not value['epoch'] \
+            or not isinstance(value['tasks'],list) or len(value['tasks'])>100 \
+            or any(type(n) is not int or n<=0 for n in value['tasks']) \
+            or value['after'] is not None and (type(value['after']) is not int or value['after']<=0
+                or not isinstance(value['birth'],str) or not value['birth'] or value['birth']=='-') \
+            or key!=digest({'epoch':value['epoch'],'pid':value['after'],'birth':value['birth']}):
+        raise ValueError('invalid wake hint')
+    return value
+
+def notify(project,tasks,after=None,birth=None):
+    """Durable local hint only; the single guarded service owns every admission."""
+    project=Path(project);owner_path=project/'.taskq'/'dispatch-owner.sqlite'
+    if owner_path.is_symlink(): raise ValueError('dispatch ownership symlink refused')
+    with contextlib.closing(sqlite3.connect(owner_path.as_uri()+'?mode=ro',uri=True)) as owner:
+        ownership=read_state(owner)
+    if ownership['phase']!='owned': raise ValueError('dispatch is not service owned')
+    registry=Path(ownership['registry']);home=registry.parent
+    if any(p.is_symlink() or p.exists() and getattr(p.lstat(),'st_file_attributes',0)&0x400 for p in (registry,home,*home.parents)):
+        raise ValueError('linked service registry refused')
+    private_home(home)
+    tasks=tasks if isinstance(tasks,list) else [tasks]
+    if len(tasks)>100 or any(type(n) is not int or n<=0 for n in tasks): raise ValueError('bounded positive wake task IDs required')
+    if after is not None and (type(after) is not int or after<=0 or not isinstance(birth,str) or not birth or birth=='-'):
+        raise ValueError('deferred wake requires exact PID/birth')
+    db=connect_db(registry)
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        state=read_state(db);validate_owner(state,home)
+        if state['epoch']!=ownership['epoch'] or Path(state['project'])!=project or state['phase'] not in ('active','paused'):
+            raise ValueError('wake project/epoch changed')
+        if hashlib.sha256((project/'taskq.json').read_bytes()).hexdigest()!=state['config_sha256']:
+            raise ValueError('wake config changed')
+        key=digest({'epoch':state['epoch'],'pid':after,'birth':birth})
+        row=db.execute('SELECT body FROM wakes WHERE id=?',(key,)).fetchone()
+        previous=wake_value(key,row[0]) if row else {}
+        tasks=sorted(set(tasks+previous.get('tasks',[])))
+        if len(tasks)>100 or not row and db.execute('SELECT count(*) FROM wakes').fetchone()[0]>=100:
+            raise ValueError('wake bound exceeded; cadence fallback required')
+        value={'epoch':state['epoch'],'tasks':tasks,'after':after,'birth':birth}
+        db.execute('INSERT OR REPLACE INTO wakes VALUES (?,?)',(key,json.dumps(value)));db.commit()
+    finally: db.close()
+
+def take_wakes(q,db,home):
+    state=read_state(db)
+    if state['phase']!='active' or state.get('stop'): return False,[]
+    validate_owner(state,home)
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        rows=db.execute('SELECT id,body FROM wakes LIMIT 101').fetchall()
+        if len(rows)>100: raise ValueError('wake bound exceeded')
+        taken=False;tasks=set()
+        for key,body in rows:
+            value=wake_value(key,body)
+            if value['epoch']!=state['epoch']: continue
+            if value['after'] is not None and q.process_state(value['after'],value['birth'])!='dead': continue
+            tasks.update(value['tasks']);taken=True
+            db.execute('DELETE FROM wakes WHERE id=?',(key,))
+        if len(tasks)>100: raise ValueError('wake task bound exceeded')
+        db.commit();return taken,sorted(tasks)
+    except BaseException:
+        db.rollback();raise
 
 def save_state(db,state):
     db.execute("INSERT OR REPLACE INTO state VALUES ('project',?)",(json.dumps(state),))
@@ -193,6 +270,10 @@ def gate(project, identity):
     if state['phase']!='active' or op.get('phase')!='running' or op.get('child')!=identity \
             or os.environ.get('TASKQ_SERVICE_EPOCH')!=state['epoch']:
         raise ValueError('host service owns dispatch; stale or unaccounted controller refused')
+    tasks=op.get('tasks',[])
+    if not isinstance(tasks,list) or len(tasks)>100 or any(type(n) is not int or n<=0 for n in tasks):
+        raise ValueError('invalid service task hints')
+    return tasks
 
 def validate_config(q,state):
     q.CONFIG=q.load_config(state['project'])
@@ -269,14 +350,14 @@ def fixed_env(state):
     env['TASKQ_SERVICE_EPOCH']=state['epoch']
     return env
 
-def run_pass(q,db,home):
+def run_pass(q,db,home,tasks=()):
     state=read_state(db)
     if state['phase']!='active': return
     if (state.get('operation') or {}).get('phase') in ('intent','running'): raise ValueError('unknown interrupted operation; admission held')
     validate_owner(state,home)
     validate_config(q,state)
     ticket=uuid.uuid4().hex;log=home/(ticket+'.log')
-    state['operation']={'id':ticket,'phase':'intent','started_at':time.time(),'log':str(log)}
+    state['operation']={'id':ticket,'phase':'intent','started_at':time.time(),'log':str(log),'tasks':list(tasks)}
     save_state(db,state);db.commit()
     argv=[sys.executable,'-B',str(Path(__file__).resolve()),'child',state['install_dir'],state['name']]
     child_env=fixed_env(state);child_env.update(TASKQ_SERVICE_RECEIPT=str(home/(ticket+'-terminal.json')),TASKQ_SERVICE_OPERATION=ticket)
@@ -356,25 +437,38 @@ def serve(q,db,home,cadence):
                     if 'conn' in locals(): conn.close()
                     if getattr(listener,'_listener',None) is None: return
         thread=threading.Thread(target=accept,daemon=True);thread.start()
-        due=time.monotonic()+cadence
+        due=time.monotonic() if state['phase']=='active' else time.monotonic()+cadence
         try:
             while not read_state(db).get('stop'):
                 try:
-                    conn,value=pending.get(timeout=max(0,due-time.monotonic()))
-                    try: result=request(q,db,value,home)
+                    conn,value=pending.get(timeout=min(1,max(0,due-time.monotonic())))
+                    before=read_state(db)['phase']
+                    try:
+                        result=request(q,db,value,home)
+                        if before=='paused' and read_state(db)['phase']=='active': due=time.monotonic()
                     except (ValueError,OSError,sqlite3.Error) as error:
                         result=envelope(read_state(db),'refused',error=str(error));result['request_id']=value.get('id') if isinstance(value,dict) else None
                     try: conn.send_bytes(json.dumps(result,ensure_ascii=False).encode())
                     finally: conn.close()
                 except queue.Empty:
-                    try: run_pass(q,db,home)
-                    except (ValueError,OSError,sqlite3.Error) as error:
-                        state=read_state(db);state['last_error']=str(error);save_state(db,state);db.commit()
-                    state=read_state(db)
-                    selected=json.loads((Path(state['install_dir'])/'current.json').read_text('utf-8'))
-                    if selected['path']!=str(q.CLONE) and (state.get('operation') or {}).get('phase')=='complete':
-                        state['restart_requested']=True;save_state(db,state);db.commit();return
-                    due=time.monotonic()+cadence  # bounded, no immediate retry/catch-up
+                    pass
+                woke=False
+                try:
+                    woke,tasks=take_wakes(q,db,home)
+                except (ValueError,OSError,sqlite3.Error) as error:
+                    tasks=[];record_error(db,error)  # unavailable hints do not postpone fallback
+                if not dispatch_ready(read_state(db)['phase'],time.monotonic(),due,woke):
+                    if time.monotonic()>=due: due=time.monotonic()+cadence
+                    continue
+                try:
+                    run_pass(q,db,home,tasks)
+                except (ValueError,OSError,sqlite3.Error) as error:
+                    record_error(db,error)
+                due=time.monotonic()+cadence  # failure waits for a new hint or fallback; no catch-up loop
+                state=read_state(db)
+                selected=json.loads((Path(state['install_dir'])/'current.json').read_text('utf-8'))
+                if selected['path']!=str(q.CLONE) and (state.get('operation') or {}).get('phase')=='complete':
+                    state['restart_requested']=True;save_state(db,state);db.commit();return
         finally: listener.close()
 
 def render(response,style='json'):

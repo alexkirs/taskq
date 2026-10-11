@@ -35,6 +35,17 @@ cross-registry migration remains fenced rather than automatically restoring owne
 The service invokes the existing qualified managed launcher with fixed finite invocation
 and no agent IDs. Immutable selection remains at process boundaries. Code/contract/config
 drift refuses; an upgrade original-effect refusal is retained before a fresh later cadence.
+Changed (owner cadence correction): active service startup and successful resume request
+an immediate guarded queue pass. Local native task mutations durably coalesce wake hints
+in the private service registry; a native Codex turn-end hint waits for its exact PID/birth
+death before requesting a pass. Hints grant no task authority, ACK, application or capacity
+release. The existing pass visits all eligible tasks and fills available atomic model slots;
+it independently validates terminal receipts before releasing any model grant. One service
+serializes all passes; hints arriving during a pass remain pending. Local hint/process
+observation is bounded and does not poll the board. The configured cadence is the fallback
+for missed hints, failures and external board changes without a subscription, not a delay
+between ready-task admissions. Paused/stopped sources do not dispatch from hints. Unknown
+process identities retain deferred hints; registry errors do not launch another source.
 An idle service may restart under the same OS source only after all its journal operations
 are complete. An interrupted unknown child operation blocks admission after restart;
 no worker replacement, PID kill, model barrier clear or automatic ledger rollback.

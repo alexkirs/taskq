@@ -4633,7 +4633,8 @@ def dispatch(command, tasks, after=None, after_birth=None):
         return
     try:
         if dispatch_service_owned():
-            return  # service cadence owns admission; task mutations/receipts remain native
+            service_module().notify(CONFIG['root'],tasks,after,after_birth)
+            return  # the single service consumes hints; task mutations/receipts remain native
     except (ValueError, OSError, sqlite3.Error) as error:
         print(f'taskq: service ownership unknown: {error}; no detached dispatch', file=sys.stderr)
         return
@@ -4687,7 +4688,7 @@ def dispatch_service_gate():
     host_service = service_module()
     state, birth = process_identity(os.getpid())
     try:
-        host_service.gate(CONFIG['root'], {'pid': os.getpid(), 'birth': birth} if state == 'running' else None)
+        return host_service.gate(CONFIG['root'], {'pid': os.getpid(), 'birth': birth} if state == 'running' else None)
     except (ValueError, OSError, sqlite3.Error) as error:
         fail(str(error))
 
@@ -4702,7 +4703,8 @@ def event_pass(args):
             if state == 'dead':
                 break
             time.sleep(5)
-        dispatch_service_gate()
+        hinted=dispatch_service_gate()
+        if hinted is not None: args.tasks=sorted(set(args.tasks+hinted))
         cmd_tick(args, table=False)
     except (SystemExit, Exception) as error:
         print(f'taskq: dispatch stopped: {str(error).removeprefix("taskq: ")}; resolve the blocker, then run a fresh tick', file=sys.stderr)

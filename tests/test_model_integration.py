@@ -52,10 +52,50 @@ class ModelIntegration(unittest.TestCase):
             child.communicate(timeout=5)
 
     def host(self):
-        return q.SQLiteCapacity(self.root / 'host.sqlite', 'host', q.machine(), q.CONFIG['capacity']['host_caps'])
+        return q.SQLiteCapacity(pathlib.Path(q.CONFIG['capacity']['host_path']), 'host', q.machine(), q.CONFIG['capacity']['host_caps'])
 
     def item(self):
         return q.parse(self.board.get(1))
+
+    def test_one_pass_fills_four_and_terminal_release_admits_fifth(self):
+        q.CONFIG.update(limits={'codex':4},capacity={'project_caps':{'model:codex':8},
+            'host_caps':{'model:codex':4},'host_path':str(self.root/'host4.sqlite')})
+        self.project=q.SQLiteCapacity(self.root/'project8.sqlite','project','fixture/model',{'model:codex':8})
+        self.board.issues.clear()
+        for n in range(1,6):
+            self.board.add('finite '+str(n),q.block('g',{'scope':[],'deps':[],'claim':None,'result':None,
+                'pm':self.actor,'event_schema':q.EVENT_SCHEMA,'events':[],'event_seq':0}),['q-ready','run-codex'])
+        logs={};children={}
+        def launch(name,*_):
+            n=int(name.split()[0][1:]);sid='finite-'+str(n)
+            child=subprocess.Popen([sys.executable,'-c','import sys;sys.stdin.read()'],stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            self.children.append(child);children[n]=child;child.taskq_birth=q.process_identity(child.pid)[1]
+            log=self.kind.folder()/('S'+str(n)+'.log');logs[n]=log
+            q.CONFIG['_model_launch'](child,log)
+            log.write_text(json.dumps({'type':'thread.started','thread_id':sid})+'\n'+json.dumps({'type':'turn.started'})+'\n')
+            return sid
+        args=argparse.Namespace(headless=False,tasks=[],unknown_after=None,execution_scope=None)
+        with mock.patch.object(q,'local_limits',return_value={'codex':4}), \
+                mock.patch.object(q,'runtimes',return_value={'codex':self.kind}), \
+                mock.patch.object(self.kind,'spawn',side_effect=launch), \
+                mock.patch.object(q,'supervise'),mock.patch.object(q,'retire'):
+            q.one_pass(args,False)
+            self.assertEqual(sorted(children),[1,2,3,4])
+            first=self.item()['raw']['model_turns']['supervisor']
+            self.assertEqual(q.parse(self.board.get(5))['state'],'ready')
+            # Dead process without its correlated terminal does not free a grant.
+            children[1].communicate(timeout=5)
+            q.one_pass(args,False)
+            self.assertEqual(sorted(children),[1,2,3,4])
+            with logs[1].open('a') as stream:stream.write('{"type":"turn.completed"}\n')
+            self.board.issues[1]['state']='closed'
+            q.one_pass(args,False)
+            self.assertEqual(sorted(children),[1,2,3,4,5])
+            self.assertEqual(self.host().observe(first['key'])['phase'],'released')
+            self.assertEqual(q.parse(self.board.get(5))['raw']['model_turns']['supervisor']['phase'],'bound')
+            q.one_pass(args,False)
+            self.assertEqual(len(self.children),5)
 
     def launch(self, *args):
         self.launches += 1

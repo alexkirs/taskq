@@ -5635,7 +5635,8 @@ def main(argv=None):
             or any(CONFIG.get('limits', {}).get(kind) != 0 for kind in ('codex', 'claude')) \
             or any((local_limits() or CONFIG.get('limits', {})).get(kind) != 0 for kind in ('codex', 'claude')) \
             or any(value != 0 for value in CONFIG.get('limits', {}).values()) \
-            or any(value != 0 for value in (local_limits() or CONFIG.get('limits', {})).values())):
+            or any(value != 0 for value in (local_limits() or CONFIG.get('limits', {})).values()) \
+            or CONFIG.get('runtimes')):
         fail('qualification-only project/repository and zero model limits required')
     if fixture and args.command in ('take', 'run', 'tick', 'wait', 'lifecycle', 'arm'):
         fail('qualification-only runtime execution disabled; no implicit runtime limit fallback')

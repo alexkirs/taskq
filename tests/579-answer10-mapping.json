@@ -12,22 +12,22 @@
   "files": [
     {
       "path": "taskq.md",
-      "final_git_blob": "f30487d9aeb47a913e38f1b865897719a10c7b68",
-      "final_normalized_lf_sha256": "3c4f88f4a928cfeeba31cc8cdc9e69ee302f36f67f4ec90de8c713b5313f425a",
+      "final_git_blob": "79f5c18d9d0d7edf5177e9f6ffe0efe0a068caa4",
+      "final_normalized_lf_sha256": "d261e5b02807f1fca53b9fa3fe8369688b9ee3e9e83a92a61f1f420a1906aa81",
       "canonical_git_blob": "b8ee26940f79b64e7cffefbac5b1d700900c032d",
       "qualified_raw_sha256": "a26c980572d80425b9c0e63659bac667d55e3613dbe30ea3e5d5fb416c93e16a"
     },
     {
       "path": "taskq.py",
-      "final_git_blob": "ca7343e0a6e5d2143b99fed2c27d6da13b67f8f1",
-      "final_normalized_lf_sha256": "f97e59c8c89543b37325ccdfec50760e9c85b3abd907fea45af49ba743137936",
+      "final_git_blob": "a845ff2ba20a92629f1bfd173beb06c9fce1d8c8",
+      "final_normalized_lf_sha256": "05cc33e5001acbd70ce189446b1e20b34b99a4e3f0f6f914931f1b7264857fc0",
       "canonical_git_blob": "0394ecce07c520c252e5e5d5bf71a0a8a4bc6a2e",
       "qualified_raw_sha256": "92f66926b8d0628fce93f5de781e460e43cb98f0104ecb7c312f24e46d154c51"
     },
     {
       "path": "tests/test_single.py",
-      "final_git_blob": "e2f9c2dd2939e2db1b783ab6482c821249184dda",
-      "final_normalized_lf_sha256": "37f5f8f26daad3a3fb3c9126f9475de94c1d52e0ec278905d0c6883e16f255c6",
+      "final_git_blob": "c2447bf367d3d93f53914d17dc50fc232fda0b20",
+      "final_normalized_lf_sha256": "5e47c007bad904dcf7b4d18b8fccfb10bdfd7ab3cf1479e3c23d335376041732",
       "canonical_git_blob": "65e6e70ff454b9df097b04df1a3a3bf7967a3d74",
       "qualified_raw_sha256": "8fcab155c05e7d33fe9f5b0ac26e28e4b173f1a7f0ce7148f78f51aa67cedd48"
     }
@@ -182,7 +182,7 @@
     },
     {
       "function": "main",
-      "final_ast_sha256": "5f64f27e5918347756a86c3454fe3e67ac75de4cf3cc853db0f5675c4fc8dd3c",
+      "final_ast_sha256": "bed93b8fc25fe5f16bee7c06856332cae8f291e2372dcff5e076bd77d1c0b58b",
       "qualified_ast_sha256": "2b34c56c2d177f026474f9bdf9f9fc9b8a76295ea4e8eadc44c5f83793d4490e",
       "canonical_ast_sha256": "5326472ed90474faad679626f46954b242fec6091c9e5443635a897276da48ad",
       "matches_qualified": false
@@ -195,9 +195,9 @@
     },
     {
       "guard": "project repository configured/local zero limits",
-      "final_ast_sha256": "4cc26bc4a26094deafcd12cac67c4cc56854efa3a6441e167af5cc125a184bd6",
+      "final_ast_sha256": "97e2b7fec64fd94723612af1e47cc55d6a00c5880d6828ea7a3dec0e3fb9b65a",
       "qualified_ast_sha256": "eda36466c111f6270cab3a305b31d3da56795a5f5a50e589d5cdaeff7c72bbc3",
-      "status": "qualified predicate retained, additional runtime limits checked; config gate moved before adapter; runtime execution separately disabled"
+      "status": "qualified predicate retained, additional runtime limits checked; custom runtime imports refused; config gate moved before adapter; runtime execution separately disabled"
     },
     {
       "guard": "verify_release canonical exact Git blob bytes plus qualified symlink refusal",

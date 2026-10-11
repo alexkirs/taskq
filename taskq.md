@@ -884,7 +884,7 @@ CI and main ancestry through the same installation path; it does not manufacture
 The fixture binding is retained in the pointer and cannot be added to an existing production
 installation. Its launcher must run in that exact project with that repository and zero configured
 and invocation model limits, including additional runtime entries. Validate this before constructing
-the board adapter. Qualification-only runtime admission/pass commands and automatic queue dispatch
+the board adapter; custom runtime adapters are unsupported and refused. Qualification-only runtime admission/pass commands and automatic queue dispatch
 are disabled independently of missing-runtime default limits. Removing/changing the binding or
 selecting a production project refuses before effects.
 Automatic qualification reads that same private repository's owner-published release/tag;

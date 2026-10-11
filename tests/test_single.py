@@ -4393,14 +4393,16 @@ class Contract(Base):
         fixture = self.fixture_binding()
         (install / 'current.json').write_text(json.dumps(dict(qualification_fixture=fixture)))
         config = dict(taskq.CONFIG, repo=fixture['repo'], host='github.com', limits=dict(codex=0, claude=0))
-        with mock.patch.object(Path, 'cwd', return_value=self.root), \
-                mock.patch.dict(os.environ, TASKQ_INSTALL_DIR=str(install)), \
-                mock.patch.object(taskq, 'release_reason', return_value=None), \
-                mock.patch.object(taskq, 'BOARD', None), \
-                mock.patch.object(taskq, 'load_config', return_value=dict(config, board='untrusted.py')), \
-                mock.patch.object(taskq, 'make_board', side_effect=AssertionError('custom adapter imported before refusal')):
-            with self.assertRaisesRegex(SystemExit, 'zero model limits required'):
-                self.run_cli('list')
+        for drift in ({'board': 'untrusted.py'}, {'runtimes': {'custom': 'untrusted.py'}}):
+            with mock.patch.object(Path, 'cwd', return_value=self.root), \
+                    mock.patch.dict(os.environ, TASKQ_INSTALL_DIR=str(install)), \
+                    mock.patch.object(taskq, 'release_reason', return_value=None), \
+                    mock.patch.object(taskq, 'BOARD', None), \
+                    mock.patch.object(taskq, 'load_config', return_value=dict(config, **drift)), \
+                    mock.patch.object(taskq, 'make_board', side_effect=AssertionError('custom adapter imported before refusal')), \
+                    mock.patch.object(taskq, 'load_file', side_effect=AssertionError('custom runtime imported before refusal')):
+                with self.assertRaisesRegex(SystemExit, 'zero model limits required'):
+                    self.run_cli('status')
         taskq.CONFIG = config
         with mock.patch.object(Path, 'cwd', return_value=self.root), \
                 mock.patch.dict(os.environ, TASKQ_INSTALL_DIR=str(install)), \

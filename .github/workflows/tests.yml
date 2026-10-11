@@ -5,12 +5,40 @@ on:
     branches: [main, 'taskq-*']
   pull_request:
 jobs:
-  tests:
-    runs-on: ubuntu-latest
+  native:
+    name: native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: 'false'
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python3 -m pip install -r requirements-test.txt
-      - run: python3 -m unittest discover -s tests
+      - run: git config core.autocrlf false
+      - run: python -m pip install -r requirements-test.txt
+      - run: python -B tests/native_gate.py --output "${{ runner.temp }}/taskq-native"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/taskq-native
+          if-no-files-found: error
+  tests:
+    # Keep the publication check name; a successful Linux job alone is insufficient.
+    needs: native
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: test '${{ needs.native.result }}' = success

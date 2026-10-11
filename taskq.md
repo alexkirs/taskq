@@ -49,6 +49,15 @@ project-init; it must not silently install a host service or add a second dispat
 
 # taskq — the contract
 
+### Native test qualification
+
+The existing `tests` publication check requires both Linux and native Windows CI to
+pass on the exact commit. The gate records the test exit separately from pre/post
+Git blob and workspace checks, retaining a failed post-check without rerunning tests
+or deleting unexpected artifacts. Windows subprocess fixtures use a disposable cwd,
+profile, cache and temp paths with an explicit system drive; no real credentials.
+This source gate does not qualify installation, resident OS-source lifetime or providers.
+
 ### #646 executable ARM/PM contract
 
 PM presentation: `taskq pm --subscribe NAME --format json|text|dot` consumes the

@@ -880,6 +880,9 @@ receipt. Apply independently requires every `tests` check on that exact SHA in t
 upstream to be completed/successful, and refuses missing checks or unreadable CI. It fetches origin/main into
 a new checkout, requires that qualified SHA to be on its history, checks out that exact commit detached and
 verifies clean source. Unknown upstreams refuse application. There is no arbitrary-HEAD or offline bypass.
+New release clones disable automatic CRLF conversion locally; source and contract bytes must match their
+qualified Git blobs even when Git reports a translated checkout as clean. A mismatching existing release
+is preserved and refused before pointer replacement; neither global Git settings nor frozen files are repaired in place.
 
 Apply creates `<install-dir>/releases/<SHA>`, then atomically replaces `<install-dir>/current.json` with
 `{"commit":"<SHA>","path":"<absolute release directory>"}`. An existing release is reused only after exact SHA, origin, main ancestry, clean-tree and regular-file

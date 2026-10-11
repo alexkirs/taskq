@@ -4859,6 +4859,8 @@ def verify_release(release, commit, upstream):
         entry = update_git(release, 'ls-tree', 'HEAD', '--', name)
         if not entry.startswith(('100644 ', '100755 ')) or not (release / name).is_file():
             fail(f'update release has no regular {name}; pointer unchanged')
+        if update_git(release, 'hash-object', '--no-filters', '--', name) != entry.split()[2]:
+            fail(f'update release {name} bytes differ from qualified Git blob; preserving it and the pointer')
 
 
 def cmd_update(args):
@@ -4902,7 +4904,7 @@ def cmd_update(args):
         if not release.exists():
             release.parent.mkdir(parents=True, exist_ok=True)
             # Failure leaves evidence; neither existing source nor active pointer is changed.
-            update_git(root, 'clone', '--no-checkout', '--single-branch', '--branch', 'main', '--', upstream, str(release))
+            update_git(root, 'clone', '--config', 'core.autocrlf=false', '--no-checkout', '--single-branch', '--branch', 'main', '--', upstream, str(release))
             update_git(release, 'merge-base', '--is-ancestor', candidate, 'refs/remotes/origin/main')
             update_git(release, 'checkout', '--detach', candidate)
         verify_release(release, candidate, upstream)  # retries may reuse only an intact exact qualified release

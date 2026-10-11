@@ -224,10 +224,12 @@ These exact `{commit, contract}` pairs never grant old executables admission or 
 `release_reason` continues to recognize only `compatible_from`. A strict explicit update
 writes no `compatible_from`. No implicit source is inferred from installed directories.
 At most sixteen distinct source pairs, including compatibility fallback, are considered.
-Before pointer publication and again before importing source code, verify the immutable
-canonical release path, origin, regular exact Git blobs, exact contract digest and source
-ancestry in selected upstream main and the selected candidate. Malformed, linked, missing,
-dirty, conflicting or unqualified sources refuse without changing the pointer or intent.
+Explicit reconstruction-only sources are verified before pointer publication and again
+before importing source code: immutable canonical release path, origin, regular exact Git
+blobs, exact contract digest and source ancestry in upstream main and the selected candidate.
+The compatibility fallback is verified on disk at reconstruction; it retains the existing
+automatic-release qualification rules. Malformed, linked, missing, dirty, conflicting or
+unqualified reconstruction sources refuse without changing the pointer or intent.
 
 An initial worker reservation with no worker SID, or a supervisor reservation for its
 exact already-recorded Codex SID, may reconstruct its original prompt after the switch.

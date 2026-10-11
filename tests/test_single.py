@@ -4724,6 +4724,56 @@ class Contract(Base):
             self.run_cli('pm')
         self.assertEqual((self.root / 'taskq.md').read_text(), 'new contract')
 
+    def test_explicit_prompt_sources_verify_exact_releases_without_stale_completion_authority(self):
+        origin, writer, install = self.root / 'origin.git', self.root / 'writer', self.root / 'install'
+        with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
+            REAL_RUN(['git', 'init', '-q', '--bare', str(origin)], check=True)
+            REAL_RUN(['git', 'clone', '-q', str(origin), str(writer)], check=True, capture_output=True)
+            self.git(writer, 'checkout', '-qb', 'main')
+            (writer / 'taskq.py').write_text('print("fixture source")\n')
+            (writer / 'taskq.md').write_text('first contract\n')
+            self.git(writer, 'add', '.')
+            self.git(writer, 'commit', '-qm', 'first')
+            self.git(writer, 'push', '-qu', 'origin', 'main')
+            first = taskq.update_git(writer, 'rev-parse', 'HEAD')
+            proof = self.root / 'source-proof.json'
+            proof.write_text(json.dumps(dict(commit=first, upstream=str(origin), tests='passed', review='accepted')))
+            with mock.patch.object(taskq, 'CLONE', writer), mock.patch.object(taskq, 'qualified_checks'):
+                self.run_cli('update', '--install-dir', str(install), '--commit', first, '--apply', '--qualification', str(proof))
+            old = install / 'releases' / first
+            pair = {'commit': first, 'contract': taskq.hashlib.sha256((old / 'taskq.md').read_bytes()).hexdigest()}
+            (writer / 'taskq.md').write_text('second contract\n')
+            self.git(writer, 'commit', '-qam', 'second'); self.git(writer, 'push', '-q', 'origin', 'main')
+            second = taskq.update_git(writer, 'rev-parse', 'HEAD')
+            (writer / 'taskq.md').write_text('future contract\n')
+            self.git(writer, 'commit', '-qam', 'future'); self.git(writer, 'push', '-q', 'origin', 'main')
+            future = taskq.update_git(writer, 'rev-parse', 'HEAD')
+            future_release = install / 'releases' / future
+            REAL_RUN(['git', 'clone', '-q', '--branch', 'main', str(origin), str(future_release)], check=True, capture_output=True)
+            future_pair = {'commit': future, 'contract': taskq.hashlib.sha256((future_release / 'taskq.md').read_bytes()).hexdigest()}
+            pointer = install / 'current.json'; before = pointer.read_bytes()
+            evidence = dict(commit=second, upstream=str(origin), tests='passed', review='accepted', prompt_sources=[pair])
+            args = ['update', '--install-dir', str(install), '--commit', second, '--apply', '--qualification', str(proof)]
+            with mock.patch.object(taskq, 'CLONE', old), mock.patch.object(taskq, 'qualified_checks'):
+                for sources in (None, {}, [{}], [pair] * 17, [{**pair, 'contract': '0' * 64}], [future_pair]):
+                    proof.write_text(json.dumps({**evidence, 'prompt_sources': sources}))
+                    with self.assertRaises(SystemExit): self.run_cli(*args)
+                    self.assertEqual(pointer.read_bytes(), before)
+                proof.write_text(json.dumps(evidence))
+                original = (old / 'taskq.py').read_bytes()
+                (old / 'taskq.py').write_bytes(original + b'# changed source\n')
+                with self.assertRaisesRegex(SystemExit, 'verification failed'): self.run_cli(*args)
+                self.assertEqual(pointer.read_bytes(), before)
+                (old / 'taskq.py').write_bytes(original)
+                self.run_cli(*args)
+                selected = json.loads(pointer.read_text())
+                self.assertEqual(selected['prompt_sources'], [pair])
+                self.assertNotIn('compatible_from', selected)
+                with mock.patch.dict(os.environ, TASKQ_INSTALL_DIR=str(install)):
+                    self.assertIsNotNone(taskq.release_reason(continuation=True))
+                    self.assertIsNotNone(taskq.release_reason())
+                self.assertEqual((old / 'taskq.py').read_bytes(), original)
+
     def test_update_exact_sha_with_real_isolated_git_and_atomic_pointer(self):
         origin, writer, install = self.root / 'origin.git', self.root / 'writer', self.root / 'install'
         global_git = self.root / 'isolated-global.gitconfig'

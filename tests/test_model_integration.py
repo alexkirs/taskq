@@ -20,6 +20,15 @@ q = f.taskq
 
 
 class ModelInputProperties(unittest.TestCase):
+    def test_prompt_sources_are_exact_bounded_and_never_infer_execution_permission(self):
+        pair = {'commit': 'a' * 40, 'contract': 'b' * 64}
+        self.assertEqual(q.model_prompt_sources([pair], [pair]), [pair])
+        for values in (None, {}, 'source', [pair] * 17, [{}], [{**pair, 'extra': True}],
+                       [{**pair, 'commit': 1}], [pair, {**pair, 'contract': 'c' * 64}]):
+            with self.assertRaises(ValueError): q.model_prompt_sources(values)
+        pairs = [{'commit': f'{n:040x}', 'contract': 'b' * 64} for n in range(17)]
+        with self.assertRaises(ValueError): q.model_prompt_sources(pairs[:9], pairs[9:])
+
     def test_reservation_retry_requires_exact_prelaunch_evidence(self):
         event = {'id': 1, 'action': 'result', 'text': 'review', 'by': 'worker', 'recipients': ['supervisor:codex:s']}
         inputs = q.model_turn_inputs([event]); digest = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
@@ -34,6 +43,8 @@ class ModelInputProperties(unittest.TestCase):
             self.assertFalse(q.model_reservation_retry(turn, project, {**host, 'phase': phase}, 1, 's', [event]))
         for key in ('runtime', 'child', 'stop', 'drain'):
             self.assertFalse(q.model_reservation_retry(turn, project, {**host, key: None}, 1, 's', [event]))
+            self.assertFalse(q.model_reservation_retry(turn, {**project, key: None}, host, 1, 's', [event]))
+        self.assertFalse(q.model_reservation_retry({**turn, 'child': None}, project, host, 1, 's', [event]))
         for changed_turn, changed_project, changed_host, n, sid, events in (
                 ({**turn, 'phase': 'launching'}, project, host, 1, 's', [event]),
                 (turn, None, host, 1, 's', [event]), (turn, project, None, 1, 's', [event]),
@@ -86,29 +97,65 @@ class ModelIntegration(unittest.TestCase):
         (old / 'taskq.md').write_text('old contract')
         (old / 'taskq.py').write_text('def brief(item, runtime):\n return "old:"+item["text"]+str(item["scope"])+BOARD.history\n')
         pair = {'commit': old.name, 'contract': hashlib.sha256((old / 'taskq.md').read_bytes()).hexdigest()}
-        pointer = {'commit': selected.name, 'path': str(selected), 'compatible_from': [pair]}
+        pointer = {'commit': selected.name, 'path': str(selected), 'prompt_sources': [pair]}
         (install / 'current.json').write_text(json.dumps(pointer))
         item = {'text': 'work', 'scope': ['artifact.txt']}; self.board.history = 'history'
         prompt = "old:work['artifact.txt']history"
-        turn = {'prompt_source': pair, 'request': {'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest()}}
+        turn = {'prompt_source': pair, 'request': {'role': 'worker', 'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest()}}
         with mock.patch.dict(q.os.environ, TASKQ_INSTALL_DIR=str(install)), mock.patch.object(q, 'CLONE', selected), \
-                mock.patch.object(q, 'update_git', return_value='fixture-origin'), mock.patch.object(q, 'verify_release') as verify:
+                mock.patch.object(q, 'update_git', return_value='https://github.com/alexkirs/taskq.git'), mock.patch.object(q, 'verify_release') as verify:
             self.assertEqual(q.model_original_prompt(item, turn), prompt)
-            self.assertEqual(verify.call_args_list, [mock.call(selected, selected.name, 'fixture-origin'),
-                                                   mock.call(old, old.name, 'fixture-origin')])
+            self.assertEqual(verify.call_args_list, [mock.call(selected, selected.name, 'https://github.com/alexkirs/taskq.git'),
+                                                   mock.call(old, old.name, 'https://github.com/alexkirs/taskq.git')])
             for changed in ({**item, 'text': 'changed'}, {**item, 'scope': ['other.txt']}):
                 self.assertIsNone(q.model_original_prompt(changed, turn))
             self.board.history = 'changed history'
             self.assertIsNone(q.model_original_prompt(item, turn)); self.board.history = 'history'
-            self.assertIsNone(q.model_original_prompt(item, {**turn, 'request': {'prompt_sha256': '0' * 64}}))
+            self.assertIsNone(q.model_original_prompt(item, {**turn, 'request': {**turn['request'], 'prompt_sha256': '0' * 64}}))
             with mock.patch.object(q, 'verify_release', side_effect=SystemExit('foreign source')), \
                     mock.patch.object(q, 'load_file', side_effect=AssertionError('unverified import')), self.assertRaises(SystemExit):
                 q.model_original_prompt(item, turn)
+            with mock.patch.object(q, 'CLONE', old):
+                self.assertIsNotNone(q.release_reason(continuation=True))
+                self.assertIsNotNone(q.release_reason())
+            pointer['compatible_from'] = pointer.pop('prompt_sources')
+            (install / 'current.json').write_text(json.dumps(pointer))
+            self.assertEqual(q.model_original_prompt(item, turn), prompt)  # historical qualified fallback
+            pointer['prompt_sources'] = pointer.pop('compatible_from')
+            (install / 'current.json').write_text(json.dumps(pointer))
             (old / 'taskq.md').write_text('changed bytes')
             with self.assertRaisesRegex(SystemExit, 'contract differs'):
                 q.model_original_prompt(item, turn)
-            pointer['compatible_from'] *= 17; (install / 'current.json').write_text(json.dumps(pointer))
+            pointer['prompt_sources'] *= 17; (install / 'current.json').write_text(json.dumps(pointer))
             with self.assertRaisesRegex(SystemExit, 'bound exceeded'):
+                q.model_original_prompt(item, turn)
+
+    def test_supervisor_original_pointer_uses_qualified_source_and_exact_retained_inputs(self):
+        install = self.root / 'install'; selected = install / 'releases' / ('b' * 40)
+        old = install / 'releases' / ('a' * 40)
+        old.mkdir(parents=True); selected.mkdir()
+        (old / 'taskq.md').write_text('old contract')
+        (old / 'taskq.py').write_text('def event_line(n, event):\n return "review #{} [event {}:{}]".format(n, n, event["id"])\n')
+        pair = {'commit': old.name, 'contract': hashlib.sha256((old / 'taskq.md').read_bytes()).hexdigest()}
+        (install / 'current.json').write_text(json.dumps({'commit': selected.name, 'path': str(selected), 'prompt_sources': [pair]}))
+        boss = {'runtime': 'codex', 'session': 'exact-supervisor'}
+        item = {'iid': 1, 'supervisor': boss}
+        event = {'id': 7, 'action': 'result', 'text': 'semantic payload stays on board', 'by': 'worker',
+                 'recipients': [q.recipient('supervisor', boss)]}
+        prompt = 'review #1 [event 1:7]: read your issue'
+        turn = {'runtime': {'session': boss['session']}, 'event_inputs': [event], 'prompt_source': pair,
+                'request': {'role': 'supervisor', 'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest()}}
+        with mock.patch.dict(q.os.environ, TASKQ_INSTALL_DIR=str(install)), mock.patch.object(q, 'CLONE', selected), \
+                mock.patch.object(q, 'update_git', return_value='https://github.com/alexkirs/taskq.git') as git, \
+                mock.patch.object(q, 'verify_release'):
+            self.assertEqual(q.model_original_prompt(item, turn), prompt)
+            git.assert_any_call(selected, 'merge-base', '--is-ancestor', old.name, selected.name)
+            for changed in ({**event, 'action': 'close'}, {**event, 'recipients': ['supervisor:codex:foreign']}, {**event, 'id': 8}):
+                self.assertIsNone(q.model_original_prompt(item, {**turn, 'event_inputs': [changed]}))
+            self.assertIsNone(q.model_original_prompt({**item, 'supervisor': {**boss, 'session': 'foreign'}}, turn))
+            self.assertIsNone(q.model_original_prompt(item, {**turn, 'request': {**turn['request'], 'role': 'worker'}}))
+            with mock.patch.object(q, 'update_git', side_effect=SystemExit('ancestry refused')), \
+                    mock.patch.object(q, 'load_file', side_effect=AssertionError('unverified import')), self.assertRaises(SystemExit):
                 q.model_original_prompt(item, turn)
 
     def test_initial_reservation_reconstructs_exact_prompt_without_replacing_grants(self):
@@ -365,8 +412,10 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
         host.stop('blocker')
         return turn, host
 
-    def test_oldest_waiting_supervisor_retries_same_reservation_once(self):
-        turn, host = self.waiting_supervisor()
+    def test_oldest_waiting_supervisor_reconstructs_same_reservation_once(self):
+        original = 'review #1 [event 1:1]: read your issue'
+        with mock.patch.object(q, 'continuation_pointer', return_value=original):
+            turn, host = self.waiting_supervisor()
         project_before = self.project.observe(turn['key']); host_before = host.observe(turn['key'])
         sid = self.item()['supervisor']['session']
         def send(session, prompt):
@@ -379,11 +428,18 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
             q.CONFIG['_model_launch'](child, log)
             log.write_text(json.dumps({'type': 'thread.started', 'thread_id': sid}) + '\n{"type":"turn.started"}\n')
             return sid
-        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=send) as sent:
+        before = json.dumps(self.board.issues, sort_keys=True)
+        with q.coordination(), mock.patch.object(q, 'model_original_prompt', return_value=None), \
+                mock.patch.object(self.kind, 'send', side_effect=AssertionError('unqualified')):
+            q.supervise(self.item(), {'codex': self.kind})
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        with q.coordination(), mock.patch.object(q, 'model_original_prompt', return_value=original) as reconstructed, \
+                mock.patch.object(self.kind, 'send', side_effect=send) as sent:
             q.supervise(self.item(), {'codex': self.kind})
             self.assertEqual(sent.call_count, 1)
             q.supervise(self.item(), {'codex': self.kind})
             self.assertEqual(sent.call_count, 1)
+        reconstructed.assert_called_once()
         current = self.item()['raw']['model_turns']['supervisor']
         self.assertEqual((current['key'], current['generation'], current['request']),
                          (turn['key'], turn['generation'], turn['request']))

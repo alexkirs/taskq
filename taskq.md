@@ -217,17 +217,32 @@ original prompt digest must agree. Retry preserves its key, generation, age and
 FIFO tickets; launch remains atomic under project coordination. Launching, bound,
 unknown, changed or missing grants do not become retryable by process absence.
 
-An initial worker reservation whose prompt differs after a qualified release
-update may reconstruct its original brief from at most sixteen explicitly
-compatible installed sources. Each source must have its canonical immutable path,
-verified Git bytes/origin and the exact qualified contract. Reconstruction uses
-the current authoritative task and history and must reproduce the original prompt
-digest exactly; changed instructions, scope or history refuse. This is allowed only
-before any launch, with the same fresh order and exact reserved project and
-waiting/reserved host grants. The selected adapter admits the original request,
-key and tickets; it never runs an older dispatcher or changes a grant. New intents
-record their prompt source commit/contract to narrow later reconstruction. No
-source match means a visible held reservation, never an invented replacement prompt.
+Changed (R4/R8/R12/R13, owner-authorized board-control transition): old prompt
+reconstruction required general predecessor compatibility -> an explicit qualification
+may name reconstruction-only `prompt_sources` in the selected installation pointer.
+These exact `{commit, contract}` pairs never grant old executables admission or completion;
+`release_reason` continues to recognize only `compatible_from`. A strict explicit update
+writes no `compatible_from`. No implicit source is inferred from installed directories.
+At most sixteen distinct source pairs, including compatibility fallback, are considered.
+Before pointer publication and again before importing source code, verify the immutable
+canonical release path, origin, regular exact Git blobs, exact contract digest and source
+ancestry in selected upstream main and the selected candidate. Malformed, linked, missing,
+dirty, conflicting or unqualified sources refuse without changing the pointer or intent.
+
+An initial worker reservation with no worker SID, or a supervisor reservation for its
+exact already-recorded Codex SID, may reconstruct its original prompt after the switch.
+Worker reconstruction calls the qualified predecessor's `brief`; supervisor reconstruction
+uses only retained immutable native ask/answer/result/gone/requeue/integrated-review event
+inputs with the predecessor's `event_line`, followed by `: read your issue`. Close payloads,
+legacy comments, initial supervisors, worker resumes and arbitrary prompt shapes are not
+reconstructed by this slice. The original request's exact prompt SHA256 must agree.
+The shared reservation retry kernel requires the same task/role/SID/input digest/request,
+project reserved and host waiting/reserved, with no launch/child/stop/drain effects.
+Existing idempotent reserve calls may promote that same waiting grant; key, request,
+FIFO age/tickets, generation and SID are never rewritten or cancelled/recreated.
+Unknown, launching, bound and changed receipts remain fail-closed. This authorizes no
+production switch; strict installation and waiting-reservation proof are separate from
+old-executable completion compatibility.
 
 ### Closed-task model settlement
 

@@ -2674,7 +2674,7 @@ def model_reservation_retry(turn, project, host, n, session, events, role='super
     request = turn.get('request') or {}
     inputs = model_turn_inputs(events, legacy, session)
     identity = bool(inputs and session) if not initial else role == 'worker' and session is None and not inputs
-    return bool(identity and turn.get('phase') == 'reserving' and not turn.get('child')
+    return bool(identity and turn.get('phase') == 'reserving' and 'child' not in turn
                 and role in ('worker', 'supervisor') and request.get('task') == n and request.get('role') == role
                 and request.get('demand') == {'model:codex': 1}
                 and (turn.get('runtime') or {}).get('session') == session
@@ -2684,7 +2684,7 @@ def model_reservation_retry(turn, project, host, n, session, events, role='super
                 == hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
                 and project and project.get('phase') == 'reserved' and project.get('request') == request
                 and host and host.get('phase') in ('waiting', 'reserved') and host.get('request') == request
-                and not any(key in host for key in ('runtime', 'child', 'stop', 'drain')))
+                and not any(key in grant for grant in (project, host) for key in ('runtime', 'child', 'stop', 'drain')))
 
 
 def model_prompt_source():
@@ -2694,8 +2694,38 @@ def model_prompt_source():
     return None
 
 
+def model_prompt_sources(*groups):
+    """Bounded exact source identities; reconstruction permission is not execution permission."""
+    sources = []
+    for group in groups:
+        if not isinstance(group, list) or len(group) > 16:
+            raise ValueError('model prompt reconstruction source bound exceeded')
+        for source in group:
+            if not isinstance(source, dict) or set(source) != {'commit', 'contract'} \
+                    or not isinstance(source['commit'], str) or not isinstance(source['contract'], str) \
+                    or not re.fullmatch(r'[0-9a-f]{40}', source['commit']) \
+                    or not re.fullmatch(r'[0-9a-f]{64}', source['contract']):
+                raise ValueError('invalid model prompt source qualification')
+            if any(value['commit'] == source['commit'] and value != source for value in sources):
+                raise ValueError('conflicting model prompt source qualification')
+            if source not in sources:
+                sources.append(source)
+    if len(sources) > 16:
+        raise ValueError('model prompt reconstruction source bound exceeded')
+    return sources
+
+
+def verify_prompt_source(root, source, selected, upstream):
+    release = root / 'releases' / source['commit']
+    verify_release(release, source['commit'], upstream)
+    update_git(selected, 'merge-base', '--is-ancestor', source['commit'], selected.name)
+    if hashlib.sha256((release / 'taskq.md').read_bytes()).hexdigest() != source['contract']:
+        fail('model prompt source contract differs from qualification')
+    return release
+
+
 def model_original_prompt(item, turn):
-    """Reconstruct only a qualified immutable brief whose original digest still agrees."""
+    """Reconstruct qualified immutable prelaunch input without permitting old execution."""
     folder = os.environ.get('TASKQ_INSTALL_DIR')
     if not folder:
         return None
@@ -2704,25 +2734,33 @@ def model_original_prompt(item, turn):
     if selected.get('path') != str(CLONE) or selected.get('commit') != CLONE.name \
             or not re.fullmatch(r'[0-9a-f]{40}', CLONE.name) or CLONE != root / 'releases' / CLONE.name:
         fail('model prompt reconstruction requires the selected immutable release')
-    candidates = selected.get('compatible_from', [])
-    if not isinstance(candidates, list) or len(candidates) > 16:
-        fail('model prompt reconstruction compatible source bound exceeded')
+    try:
+        candidates = model_prompt_sources(selected.get('prompt_sources', []), selected.get('compatible_from', []))
+    except ValueError as error:
+        fail(str(error))
+    role_name = (turn.get('request') or {}).get('role')
+    inputs, sid = turn.get('event_inputs') or [], (turn.get('runtime') or {}).get('session')
+    initial = role_name == 'worker' and sid is None and not inputs
+    boss = item.get('supervisor') or {}
+    supervisor = role_name == 'supervisor' and sid and boss.get('runtime') == 'codex' and boss.get('session') == sid
+    if not initial and not (supervisor and isinstance(inputs, list) and 0 < len(inputs) <= EVENT_LIMIT and all(
+            isinstance(event, dict) and set(event) == {'id', 'action', 'text', 'by', 'recipients'}
+            and type(event['id']) is int and event['id'] > 0
+            and event['action'] in ('ask', 'answer', 'result', 'gone', 'requeue', 'integrated-review')
+            and isinstance(event['recipients'], list) and recipient('supervisor', boss) in event['recipients']
+            for event in inputs)):
+        return None
     upstream = update_git(CLONE, 'remote', 'get-url', 'origin')
+    release_repository(upstream)
     verify_release(CLONE, CLONE.name, upstream)
     for source in candidates:
-        if not isinstance(source, dict) or set(source) != {'commit', 'contract'} \
-                or not re.fullmatch(r'[0-9a-f]{40}', source.get('commit', '')) \
-                or not re.fullmatch(r'[0-9a-f]{64}', source.get('contract', '')):
-            fail('invalid model prompt source qualification')
         if turn.get('prompt_source') and turn['prompt_source'] != source:
             continue
-        release = root / 'releases' / source['commit']
-        verify_release(release, source['commit'], upstream)
-        if hashlib.sha256((release / 'taskq.md').read_bytes()).hexdigest() != source['contract']:
-            fail('model prompt source contract differs from qualification')
+        release = verify_prompt_source(root, source, CLONE, upstream)
         prior = load_file(release / 'taskq.py')
         prior.CONFIG, prior.BOARD = CONFIG, BOARD
-        prompt = prior.brief(item, 'codex')
+        prompt = prior.brief(item, 'codex') if initial else \
+            f'{" ".join(prior.event_line(item["iid"], event) for event in inputs)}: read your issue'
         if hashlib.sha256(prompt.encode()).hexdigest() == turn['request']['prompt_sha256']:
             return prompt
     return None
@@ -2781,10 +2819,13 @@ def owned_model_turn(item, kind, role_name, prompt, events=(), resume=None, lega
         if prior['event_ids'] != event_ids or prior['event_digest'] != digest:
             return None
         if prior['request']['prompt_sha256'] != request['prompt_sha256']:
-            if role_name != 'worker' or resume is not None or (current['claim'] or {}).get('session') \
-                    or raw.get('order') not in ('run', 'rework') \
-                    or not model_reservation_retry(prior, project.observe(prior['key']), host.observe(prior['key']),
-                                                   item['iid'], None, events, 'worker', legacy, initial=True):
+            initial = role_name == 'worker' and resume is None and not (current['claim'] or {}).get('session') \
+                and raw.get('order') in ('run', 'rework')
+            boss = current['supervisor'] or {}
+            supervisor = role_name == 'supervisor' and resume and boss.get('runtime') == 'codex' and boss.get('session') == resume
+            if not (initial or supervisor) or not model_reservation_retry(
+                    prior, project.observe(prior['key']), host.observe(prior['key']),
+                    item['iid'], resume, events, role_name, legacy, initial=initial):
                 return None
             original = model_original_prompt(current, prior)
             if original is None or hashlib.sha256(original.encode()).hexdigest() != prior['request']['prompt_sha256']:
@@ -6042,6 +6083,11 @@ def install_update(args):
     if not isinstance(evidence, dict) or any(evidence.get(key) != value for key, value in
             dict(commit=candidate, **({} if automatic is not None else {'upstream': upstream}), tests='passed', review='accepted').items()):
         fail('update qualification must record this commit/upstream, tests passed and review accepted')
+    try:
+        prompt_sources = model_prompt_sources(evidence.get('prompt_sources', []))
+        model_prompt_sources(prompt_sources, evidence.get('compatible_from', []) if automatic is not None else [])
+    except ValueError as error:
+        fail(str(error))
     qualified_checks(candidate, upstream)
     with installation_lock(root):
         previous = root / 'current.json'
@@ -6078,10 +6124,14 @@ def install_update(args):
                 fail('automatic candidate executable schema/protocol differs; pointer unchanged')
         if selected:
             update_git(release, 'merge-base', '--is-ancestor', selected['commit'], candidate)
+        for source in prompt_sources:
+            verify_prompt_source(root, source, release, upstream)
         temporary = root / f'.current-{uuid.uuid4().hex}.json'
         pointer = {'commit': candidate, 'path': str(release)}
         if fixture:
             pointer['qualification_fixture'] = fixture
+        if prompt_sources:
+            pointer['prompt_sources'] = prompt_sources
         if automatic is not None:
             pointer['compatible_from'] = evidence['compatible_from']
         temporary.write_text(json.dumps(pointer) + '\n', encoding='utf-8')

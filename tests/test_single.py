@@ -6481,7 +6481,9 @@ class RealChild(unittest.TestCase):
             # Main completion precedes process exit; wait for exact death before Windows removes its open log.
             source = (ROOT / 'taskq.py').read_text('utf-8')
             (root / 'taskq.py').write_text(source + "\nif __name__ == '__main__' and sys.argv[1] == 'tick':\n"
-                                         "    (Path.cwd() / 'completed').write_text(json.dumps({'pid': os.getpid(), 'birth': process_identity(os.getpid())[1]}))\n", encoding='utf-8')
+                                         "    marker = Path.cwd() / 'completed.tmp'\n"
+                                         "    marker.write_text(json.dumps({'pid': os.getpid(), 'birth': process_identity(os.getpid())[1]}))\n"
+                                         "    marker.replace(Path.cwd() / 'completed')\n", encoding='utf-8')
             (root / 'board.py').write_text(FILE_BOARD, encoding='utf-8')
             (root / 'fake.py').write_text('''import json, os, pathlib
 def spawn(name, prompt, cwd):

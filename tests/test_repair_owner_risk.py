@@ -86,3 +86,60 @@ class OwnerRisk(Base):
             result=original(n,**kwargs);self.board.issues[n]['labels'].sort();return result
         with self.owner(),mock.patch.object(self.board,'update',side_effect=reordered):self.apply(args,plan)
         self.assertEqual(self.task(1)['state'],'review');self.assertIsNone(self.board.guard)
+
+    def test_checkpoint_model_doing_preserves_exact_result_or_specification(self):
+        self.board.issues[1]['labels']=['q-doing','taskq-events']
+        item=self.task(1);before=copy.deepcopy(item['raw'])
+        review=taskq.repair_checkpoint(item,{'retained_result_sha':'a'*40})
+        self.assertEqual(review['state'],'review');self.assertEqual(review['evidence']['result'],before['result'])
+        self.assertFalse(review['fallback_restart']);self.assertEqual(item['raw'],before)
+        self.held(result=False);self.board.issues[1]['labels']=['q-doing','taskq-events']
+        ready=taskq.repair_checkpoint(self.task(1),{'retained_result_sha':None})
+        self.assertEqual(ready['state'],'ready');self.assertIsNone(ready['evidence']['result'])
+        self.assertTrue(ready['fallback_restart'])
+
+    def test_checkpoint_model_refuses_revival_or_mismatched_result(self):
+        for state in ('ask','waiting','later','ready'):
+            self.board.issues[1]['labels']=['q-'+state,'taskq-events']
+            with self.assertRaisesRegex(SystemExit,'working review'):
+                taskq.repair_checkpoint(self.task(1),{'retained_result_sha':'a'*40})
+        self.board.issues[1]['labels']=['q-doing','taskq-events']
+        for sha in (None,'b'*40):
+            with self.assertRaisesRegex(SystemExit,'exact recorded'):
+                taskq.repair_checkpoint(self.task(1),{'retained_result_sha':sha})
+
+    def test_checkpoint_model_malformed_result_is_not_absent(self):
+        self.board.issues[1]['labels']=['q-doing','taskq-events']
+        for value in ({},False,{'sha':'bad'}):
+            item=self.task(1);item['raw']['result']=value
+            with self.assertRaisesRegex(SystemExit,'exact recorded'):
+                taskq.repair_checkpoint(item,{'retained_result_sha':None})
+
+    def test_doing_no_result_owner_apply_preserves_pm_host_audit_and_no_dispatch(self):
+        self.held(result=False);self.board.issues[1]['labels']=['q-doing','host-mac','taskq-events']
+        before=copy.deepcopy(self.task(1)['raw'])
+        args,plan=self.preview(sha='none')
+        self.assertEqual(plan['tasks'][0]['target_state'],'ready')
+        with self.owner(),mock.patch.object(taskq,'dispatch') as dispatch:self.apply(args,plan)
+        dispatch.assert_not_called();item=self.task(1);entry=item['raw']['repair_history'][0]
+        self.assertEqual(item['state'],'ready');self.assertIsNone(item['raw']['result'])
+        self.assertEqual(item['pm'],before['pm']);self.assertIn('host-mac',item['labels'])
+        self.assertEqual(entry['snapshot']['raw'],before)
+        self.assertIsNone(entry['proof']['result_commit']);self.assertFalse(entry['historical_drain_proven'])
+        self.assertEqual(entry['proof']['related_leases'],'unchanged-unreconciled')
+
+    def test_doing_result_returns_review_without_reacceptance(self):
+        self.board.issues[1]['labels']=['q-doing','taskq-events']
+        before=copy.deepcopy(self.task(1)['raw']);args,plan=self.preview()
+        with self.owner():self.apply(args,plan)
+        item=self.task(1);self.assertEqual(item['state'],'review')
+        self.assertEqual(item['raw']['result'],before['result'])
+        self.assertNotIn('acceptance_receipts',item['raw'])
+
+    def test_no_result_selection_cannot_drop_result_and_live_root_still_refuses(self):
+        self.board.issues[1]['labels']=['q-doing','taskq-events']
+        with self.assertRaisesRegex(SystemExit,'exact recorded'):self.preview(sha='none')
+        self.held(result=False);self.board.issues[1]['labels']=['q-doing','taskq-events']
+        path=taskq.CONFIG['root']/'.taskq';path.mkdir(exist_ok=True);(path/'T1.pid').write_text('123 old-worker-1 birth')
+        with mock.patch.object(taskq,'read_process',return_value=(123,'old-worker-1','birth')),mock.patch.object(taskq,'process_state',return_value='running'),self.assertRaisesRegex(SystemExit,'known running'):
+            self.preview(sha='none')

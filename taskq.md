@@ -416,18 +416,35 @@ A rule the cutover changed says `Changed:` old → new, with the task. `Open:` m
 
 #### Explicit owner-accepted legacy risk
 
+Owner decision 2026-10-12 in WIN_CDX3 authorizes exactly six additional historical
+`doing` checkpoints: #587/#590/#636/#637 return to the accepted specification (`ready`),
+#577 returns to `review` retaining 855df71141a0be0a7db768e964baf6319e292aae,
+and #591 returns to `review` retaining 212972e504b9a15b20664905778e74cc6d5dd67d.
+The owner explicitly accepts the enumerated historical-writer/shared-rights risks.
+This does not authorize #601/#612, live #669–#678, changing PM/host, killing a known
+live root, starting a worker, publishing/accepting a result or releasing leases.
+
+The single-task risk variant now also accepts a historical `doing` checkpoint.
+`--retain-result FULL_SHA` selects the exact recorded result for review, with its
+Git commit verified; `--retain-result none` explicitly selects ready only when no
+result is recorded. An ask/rejected/waiting/Later task is not revived by this
+extension. The exact source/comments, identities, owner reference, reason and
+checkpoint are digest-bound at preview/apply and retained in abandonment audit.
+The pure checkpoint reducer and refusal properties precede native adapter changes.
+
 Owner approval Sentinel_2036b8c3251c8191807c4a402dd890cf authorizes implementation and
 FIRST application only to #571, retaining result c08678b3e2c0ed80bdcdc008bbcbd41bec6a7c44
 and returning it to review. It does not authorize resetting601/612 or accepting/closing571.
 
 A separate supported force variant is `repair --tasks N --force --reason TEXT
---accept-legacy-risk --owner-approval REFERENCE --retain-result FULL_SHA
+--accept-legacy-risk --owner-approval REFERENCE --retain-result FULL_SHA|none
 [--manager RUNTIME:SID:HOST]`. Preview and owner-only `--expected DIGEST --apply --yes`
 bind exactly ONE task, its complete fresh source/comments/identities, exact recorded review
 result, owner reference and the enumerated risks: unknown historical detached writers,
 unfenced shared Git/provider/tool rights, unqualified Desktop resume surface, and loss of
 any optional SID-lock protection. This variant is limited to a recorded working review
-checkpoint, with the exact result Git commit independently present. Known running original
+or the explicit historical doing checkpoint above, with any retained result Git commit
+independently present. Known running original
 Codex birth-qualified roots refuse. Unknown history remains explicit accepted risk rather
 than indefinite drain prerequisite. A different result/task/reason/approval or changed source
 requires a new preview/consent. No generic caller-file proof or false adapter receipt exists.
@@ -437,7 +454,7 @@ not machine verification of a human transcript. Store `abandoned-by-owner` with 
 original attempt snapshot, explicit owner risk scope, `historical_drain_proven:false`,
 `broad_resource_fenced:false`, no denied resources and related leases unchanged/unreconciled.
 Preserve completed research/result, original publication branch, owner decisions and all
-identities in audit; reset only active broken continuation into a fresh review generation.
+identities in audit; reset only active broken continuation into a fresh execution generation.
 No lease release, process kill, archive, credential/security change, keeper requirement,
 worker dispatch, result acceptance, issue closure or dependency completion occurs. Unknown
 writers may still act outside cooperating TaskQ guards: the owner explicitly accepts that

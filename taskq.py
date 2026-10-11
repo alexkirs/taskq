@@ -5161,11 +5161,19 @@ def repair_manager(value):
         fail('repair manager requires RUNTIME:SID:HOST, no identity inference')
     return dict(zip(('runtime', 'session', 'name'), found.groups()))
 
-def repair_checkpoint(item):
+def repair_checkpoint(item, accepted_risk=None):
     """Select the nearest recorded working boundary; native adapter must qualify it before apply."""
     raw = item['raw']; result = raw.get('result')
+    if accepted_risk:
+        retained = accepted_risk['retained_result_sha']
+        valid_result = isinstance(result, dict) and isinstance(result.get('sha'), str) \
+            and bool(re.fullmatch('[0-9a-f]{40}', result['sha'])) and result['sha'] == retained
+        if item['state'] not in ('doing', 'review') or not (valid_result or
+                result is None and item['state'] == 'doing' and retained is None):
+            fail('accepted risk requires an exact recorded working review or historical doing checkpoint')
     review = item['state'] == 'review' and isinstance(result, dict) and isinstance(result.get('sha'), str) \
         and bool(re.fullmatch('[0-9a-f]{40}', result['sha']))
+    review = review or bool(accepted_risk and result and accepted_risk['retained_result_sha'])
     return {'state': 'review' if review else 'ready',
             'step': 'review-recorded-result' if review else 'resume-approved-specification',
             'result_branch': result_branch(item) if review else None,
@@ -5185,10 +5193,10 @@ def repair_risk_selection(numbers, force, accepted, approval, result):
         if approval or result:
             fail('owner approval/result binding requires --accept-legacy-risk')
         return None
-    if not force or len(numbers or []) != 1 or not re.fullmatch('[0-9a-f]{40}', result or '') \
+    if not force or len(numbers or []) != 1 or not (result == 'none' or re.fullmatch('[0-9a-f]{40}', result or '')) \
             or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', approval or ''):
-        fail('accepted legacy risk requires force, exactly one task, owner approval reference and exact retained result SHA')
-    return {'approval_reference': approval, 'retained_result_sha': result,
+        fail('accepted legacy risk requires force, exactly one task, owner approval reference and exact retained result SHA or none')
+    return {'approval_reference': approval, 'retained_result_sha': None if result == 'none' else result,
             'risks': list(REPAIR_ACCEPTED_RISKS)}
 
 def repair_risk_native(context):
@@ -5197,12 +5205,17 @@ def repair_risk_native(context):
         fail('accepted-risk native project binding changed')
     checkpoint = context['checkpoint']; consent = context['owner_accepted_risk']
     result = checkpoint['evidence']['result']
-    if checkpoint['state'] != 'review' or checkpoint['fallback_restart'] \
-            or not result or result.get('sha') != consent['retained_result_sha']:
-        fail('accepted risk requires the exact recorded working review result; no restart/reacceptance')
-    sha = update_git(CONFIG['root'], 'rev-parse', '--verify', result['sha'] + '^{commit}')
-    if sha != result['sha']:
-        fail('accepted-risk result Git object mismatch')
+    sha = None
+    if checkpoint['state'] == 'ready' and checkpoint['evidence']['source_state'] == 'doing' \
+            and checkpoint['fallback_restart'] and result is None and consent['retained_result_sha'] is None:
+        pass  # explicit no-result specification checkpoint; historical closure is still unknown
+    elif checkpoint['state'] == 'review' and not checkpoint['fallback_restart'] \
+            and result and result.get('sha') == consent['retained_result_sha']:
+        sha = update_git(CONFIG['root'], 'rev-parse', '--verify', result['sha'] + '^{commit}')
+        if sha != result['sha']:
+            fail('accepted-risk result Git object mismatch')
+    else:
+        fail('accepted risk requires the exact recorded working review or historical doing checkpoint')
     roots = []
     for role_name in ('claim', 'supervisor'):
         identity = context['roles'].get(role_name)
@@ -5291,7 +5304,7 @@ def runtime_repair_plan(numbers, force=False, reason='', manager=None, accepted_
                    'source_sha256': repair_digest(repair_source(issue)), 'generation': generation,
                    'next_generation': generation + 1 if force else generation, 'manager': selected_manager,
                    'roles': {k: raw.get(k) for k in ('pm', 'claim', 'supervisor')},
-                   'checkpoint': repair_checkpoint(item),
+                   'checkpoint': repair_checkpoint(item, accepted_risk),
                    'turns': raw.get('model_turns', {}), 'resources': list(REPAIR_RESOURCES),
                    'workspace': str(CONFIG['root'] / '.worktrees' / (f'taskq-{n}-g{generation+1}' if force else task_branch(item)))}
         if accepted_risk:

@@ -170,6 +170,15 @@ class NativeMigration(unittest.TestCase):
                 if agent:invocation['CODEX_THREAD_ID']='fixture-manager'
                 done=subprocess.run([sys.executable,'-B',str(release/'taskq.py'),*args],cwd=project,env=invocation,capture_output=True,text=True,encoding='utf-8',timeout=20)
                 self.assertEqual(code,done.returncode,done.stdout+'\n'+done.stderr);return done
+            pointer=install/'current.json';original_pointer=pointer.read_bytes()
+            refused_home=base/'refused-service'
+            scoped_env={**env,'TASKQ_INSTALL_DIR':str(install)}
+            for value in ({'commit':'0'*40,'path':str(install/'releases'/('0'*40))},
+                          {'commit':sha,'path':str(release),'qualification_fixture':{'repo':'alexkirs/taskq-native-qualification-service-refusal','install_dir':str(install),'project_root':str(project)}}):
+                pointer.write_bytes(json.dumps(value).encode())
+                refused=subprocess.run([sys.executable,'-B',str(release/'taskq.py'),'service','--home',str(refused_home),'register','--project',str(project),'--install-dir',str(install),'--name','fixture'],cwd=project,env=scoped_env,capture_output=True,timeout=15)
+                self.assertNotEqual(0,refused.returncode);self.assertFalse(refused_home.exists())
+            pointer.write_bytes(original_pointer)
             cli(['arm','start','--name','fixture'],True);cli(['arm','authorize-scheduler','--name','fixture'],True)
             service=['service','--home',str(home)]
             cli(service+['register','--project',str(project),'--install-dir',str(install),'--name','fixture'])

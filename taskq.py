@@ -6226,6 +6226,10 @@ def main(argv=None):
             if hasattr(stream, 'reconfigure'):
                 stream.reconfigure(encoding='utf-8')
     if arguments[:1] == ['service']:
+        if qualification_fixture() is not None:
+            fail('host service unavailable in a qualification-only installation; preserve its fixture scope')
+        if release_reason():
+            fail(release_reason())
         host_service = service_module()
         try:
             return host_service.main(ServiceRuntime(), arguments[1:])

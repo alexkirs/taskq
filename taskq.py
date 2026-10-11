@@ -2508,6 +2508,65 @@ def model_turn_inputs(events, legacy=None, session=None):
     return inputs
 
 
+def model_reservation_retry(turn, project, host, n, session, events, role='supervisor', legacy=None, initial=False):
+    """Only an exact prelaunch same-session reservation may retry admission."""
+    request = turn.get('request') or {}
+    inputs = model_turn_inputs(events, legacy, session)
+    identity = bool(inputs and session) if not initial else role == 'worker' and session is None and not inputs
+    return bool(identity and turn.get('phase') == 'reserving' and not turn.get('child')
+                and role in ('worker', 'supervisor') and request.get('task') == n and request.get('role') == role
+                and request.get('demand') == {'model:codex': 1}
+                and (turn.get('runtime') or {}).get('session') == session
+                and turn.get('event_ids') == request.get('events') == [event['id'] for event in events]
+                and turn.get('event_inputs') == inputs
+                and turn.get('event_digest') == request.get('event_digest')
+                == hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+                and project and project.get('phase') == 'reserved' and project.get('request') == request
+                and host and host.get('phase') in ('waiting', 'reserved') and host.get('request') == request
+                and not any(key in host for key in ('runtime', 'child', 'stop', 'drain')))
+
+
+def model_prompt_source():
+    folder = os.environ.get('TASKQ_INSTALL_DIR')
+    if folder and re.fullmatch(r'[0-9a-f]{40}', CLONE.name) and CLONE == Path(folder).resolve() / 'releases' / CLONE.name:
+        return {'commit': CLONE.name, 'contract': hashlib.sha256((CLONE / 'taskq.md').read_bytes()).hexdigest()}
+    return None
+
+
+def model_original_prompt(item, turn):
+    """Reconstruct only a qualified immutable brief whose original digest still agrees."""
+    folder = os.environ.get('TASKQ_INSTALL_DIR')
+    if not folder:
+        return None
+    root = Path(folder).resolve()
+    selected = json.loads((root / 'current.json').read_text('utf-8'))
+    if selected.get('path') != str(CLONE) or selected.get('commit') != CLONE.name \
+            or not re.fullmatch(r'[0-9a-f]{40}', CLONE.name) or CLONE != root / 'releases' / CLONE.name:
+        fail('model prompt reconstruction requires the selected immutable release')
+    candidates = selected.get('compatible_from', [])
+    if not isinstance(candidates, list) or len(candidates) > 16:
+        fail('model prompt reconstruction compatible source bound exceeded')
+    upstream = update_git(CLONE, 'remote', 'get-url', 'origin')
+    verify_release(CLONE, CLONE.name, upstream)
+    for source in candidates:
+        if not isinstance(source, dict) or set(source) != {'commit', 'contract'} \
+                or not re.fullmatch(r'[0-9a-f]{40}', source.get('commit', '')) \
+                or not re.fullmatch(r'[0-9a-f]{64}', source.get('contract', '')):
+            fail('invalid model prompt source qualification')
+        if turn.get('prompt_source') and turn['prompt_source'] != source:
+            continue
+        release = root / 'releases' / source['commit']
+        verify_release(release, source['commit'], upstream)
+        if hashlib.sha256((release / 'taskq.md').read_bytes()).hexdigest() != source['contract']:
+            fail('model prompt source contract differs from qualification')
+        prior = load_file(release / 'taskq.py')
+        prior.CONFIG, prior.BOARD = CONFIG, BOARD
+        prompt = prior.brief(item, 'codex')
+        if hashlib.sha256(prompt.encode()).hexdigest() == turn['request']['prompt_sha256']:
+            return prompt
+    return None
+
+
 def owned_model_turn(item, kind, role_name, prompt, events=(), resume=None, legacy=None):
     """Existing CLI adapter, durable no-retry intent, separate finite model budget."""
     if not isinstance(kind, Codex):
@@ -2554,10 +2613,22 @@ def owned_model_turn(item, kind, role_name, prompt, events=(), resume=None, lega
                'offset': len(prefix), 'prefix_sha256': hashlib.sha256(prefix).hexdigest()}
     turn = {'key': key, 'generation': generation, 'phase': 'reserving', 'request': request,
             'event_ids': event_ids, 'event_inputs': inputs, 'event_digest': digest, 'runtime': runtime}
+    source = model_prompt_source()
+    if source:
+        turn['prompt_source'] = source
     if prior and prior['phase'] == 'reserving':
-        if prior['event_ids'] != event_ids or prior['event_digest'] != digest \
-                or prior['request']['prompt_sha256'] != request['prompt_sha256']:
+        if prior['event_ids'] != event_ids or prior['event_digest'] != digest:
             return None
+        if prior['request']['prompt_sha256'] != request['prompt_sha256']:
+            if role_name != 'worker' or resume is not None or (current['claim'] or {}).get('session') \
+                    or raw.get('order') not in ('run', 'rework') \
+                    or not model_reservation_retry(prior, project.observe(prior['key']), host.observe(prior['key']),
+                                                   item['iid'], None, events, 'worker', legacy, initial=True):
+                return None
+            original = model_original_prompt(current, prior)
+            if original is None or hashlib.sha256(original.encode()).hexdigest() != prior['request']['prompt_sha256']:
+                return None
+            prompt = original
         turn, key, request, runtime = prior, prior['key'], prior['request'], prior['runtime']
     elif prior:
         history = list(raw.get('model_turn_history') or [])
@@ -3001,7 +3072,9 @@ def follow(item, kind, claim, supervised):
     issue = read_issue(item['iid'])
     if not executable(issue, item):
         return None  # #576: a reassignment seen by this read: no send, the claim stays
-    if (model_role_state(item, 'worker') or lead_state(kind, claim['session'])) != 'idle':
+    turn = (issue_data(issue).get('model_turns') or {}).get('worker') or {}
+    retry = isinstance(kind, Codex) and turn.get('phase') == 'reserving'
+    if (model_role_state(item, 'worker') or lead_state(kind, claim['session'])) != 'idle' and not retry:
         return claim  # busy/unknown: no comment history fetch and no consumption
     raw = issue_data(issue)
     old = claim['session']
@@ -3010,6 +3083,11 @@ def follow(item, kind, claim, supervised):
     if not events:
         issue = issue_history(issue)
     legacy = legacy_worker_message(issue, claim, supervised) if not events else None
+    if retry:
+        project, host = model_providers()
+        if not model_reservation_retry(turn, project.observe(turn['key']), host.observe(turn['key']),
+                                       item['iid'], old, events, 'worker', legacy):
+            return claim
     answer = '\n\n'.join(event['text'] for event in events) if events else legacy[1] if legacy and legacy[0] == 'answer' else None
     told = legacy[1] if legacy and legacy[0] == 'nudge' else None
     if answer is None and told is None and age(item) < 120:
@@ -3070,7 +3148,8 @@ def supervise(item, kinds, worker_allowed=True):
         if live == 'dead':  # the supervisor decides: rework or ask
             item['claim'] = {**claim, 'session': None}
             move(item, 'doing', 'gone', f'worker {claim["session"]} is gone', claim=item['claim'])
-        elif live in ('running', 'idle'):
+        elif live in ('running', 'idle') or \
+                ((item['raw'].get('model_turns') or {}).get('worker') or {}).get('phase') == 'reserving':
             if follow(item, kind, claim, True) is None:
                 return  # #576: no supervisor send, resume or respawn either
     state = model_role_state(item, 'supervisor') or lead_state(lead, boss['session'])
@@ -3097,12 +3176,19 @@ def supervise(item, kinds, worker_allowed=True):
                 return
             item['supervisor'] = {**boss, 'session': sid}
             move(item, item['state'], 'spawn', note('supervisor', sid, lead), supervisor=item['supervisor'])
-    elif state == 'idle':
+    elif state == 'idle' or isinstance(lead, Codex) and \
+            ((issue_data(issue).get('model_turns') or {}).get('supervisor') or {}).get('phase') == 'reserving':
         found, count = pending(issue if issue_data(issue).get('event_schema') else issue_history(issue), boss)
         if found:  # running: its own wait or turn-end pass delivers events; idle: resume with events
             text = f'{" ".join(found)}: read your issue'
             if isinstance(lead, Codex):
                 events = event_pending(issue_data(issue), recipient('supervisor', boss))
+                if state != 'idle':
+                    turn = issue_data(issue)['model_turns']['supervisor']
+                    project, host = model_providers()
+                    if not model_reservation_retry(turn, project.observe(turn['key']), host.observe(turn['key']),
+                                                   n, boss['session'], events):
+                        return
                 sid = owned_model_turn(item, lead, 'supervisor', text, events, resume=boss['session'])
                 if not sid:
                     return
@@ -3328,7 +3414,8 @@ def one_pass(args, table=True):
                 move(item, 'ready', 'requeue', gone, claim=None, result=None)
                 item.update(state='ready', claim=None)
                 continue
-            if state in ('running', 'idle'):
+            if state in ('running', 'idle') or \
+                    ((item['raw'].get('model_turns') or {}).get('worker') or {}).get('phase') == 'reserving':
                 claim = follow(item, runtime, claim, False) or claim  # denied: the original claim keeps its slot
             busy[claim['runtime']] = busy.get(claim['runtime'], 0) + 1
         for item in ready:

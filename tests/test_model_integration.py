@@ -18,6 +18,38 @@ q = f.taskq
 
 
 class ModelInputProperties(unittest.TestCase):
+    def test_reservation_retry_requires_exact_prelaunch_evidence(self):
+        event = {'id': 1, 'action': 'result', 'text': 'review', 'by': 'worker', 'recipients': ['supervisor:codex:s']}
+        inputs = q.model_turn_inputs([event]); digest = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+        request = {'task': 1, 'role': 'supervisor', 'events': [1], 'event_digest': digest, 'demand': {'model:codex': 1}}
+        turn = {'phase': 'reserving', 'request': request, 'runtime': {'session': 's'},
+                'event_ids': [1], 'event_inputs': inputs, 'event_digest': digest}
+        project = {'phase': 'reserved', 'request': request}
+        host = {'phase': 'waiting', 'request': request}
+        for phase in ('waiting', 'reserved'):
+            self.assertTrue(q.model_reservation_retry(turn, project, {**host, 'phase': phase}, 1, 's', [event]))
+        for phase in ('launching', 'bound', 'drained', 'released', None):
+            self.assertFalse(q.model_reservation_retry(turn, project, {**host, 'phase': phase}, 1, 's', [event]))
+        for key in ('runtime', 'child', 'stop', 'drain'):
+            self.assertFalse(q.model_reservation_retry(turn, project, {**host, key: None}, 1, 's', [event]))
+        for changed_turn, changed_project, changed_host, n, sid, events in (
+                ({**turn, 'phase': 'launching'}, project, host, 1, 's', [event]),
+                (turn, None, host, 1, 's', [event]), (turn, project, None, 1, 's', [event]),
+                (turn, {**project, 'phase': 'released'}, host, 1, 's', [event]),
+                (turn, project, {**host, 'request': {**request, 'task': 2}}, 1, 's', [event]),
+                (turn, project, host, 2, 's', [event]), (turn, project, host, 1, 'other', [event]),
+                (turn, project, host, 1, 's', []), (turn, project, host, 1, 's', [{**event, 'text': 'changed'}])):
+            self.assertFalse(q.model_reservation_retry(changed_turn, changed_project, changed_host, n, sid, events))
+        empty = hashlib.sha256(b'[]').hexdigest()
+        initial_request = {**request, 'role': 'worker', 'events': [], 'event_digest': empty}
+        initial = {**turn, 'request': initial_request, 'runtime': {'session': None}, 'event_ids': [],
+                   'event_inputs': [], 'event_digest': empty}
+        project = {'phase': 'reserved', 'request': initial_request}
+        host = {'phase': 'waiting', 'request': initial_request}
+        self.assertTrue(q.model_reservation_retry(initial, project, host, 1, None, [], 'worker', initial=True))
+        self.assertFalse(q.model_reservation_retry(initial, project, host, 1, 'foreign', [], 'worker', initial=True))
+        self.assertFalse(q.model_reservation_retry(initial, project, host, 1, None, [], 'supervisor', initial=True))
+
     def test_legacy_identity_is_bounded_distinct_and_replay_stable(self):
         identities = set()
         for session in ('worker-a', 'worker-b'):
@@ -45,6 +77,65 @@ class ModelInputProperties(unittest.TestCase):
 
 
 class ModelIntegration(unittest.TestCase):
+    def test_original_prompt_requires_qualified_source_and_unchanged_task(self):
+        install = self.root / 'install'; selected = install / 'releases' / ('b' * 40)
+        old = install / 'releases' / ('a' * 40)
+        old.mkdir(parents=True); selected.mkdir()
+        (old / 'taskq.md').write_text('old contract')
+        (old / 'taskq.py').write_text('def brief(item, runtime):\n return "old:"+item["text"]+str(item["scope"])+BOARD.history\n')
+        pair = {'commit': old.name, 'contract': hashlib.sha256((old / 'taskq.md').read_bytes()).hexdigest()}
+        pointer = {'commit': selected.name, 'path': str(selected), 'compatible_from': [pair]}
+        (install / 'current.json').write_text(json.dumps(pointer))
+        item = {'text': 'work', 'scope': ['artifact.txt']}; self.board.history = 'history'
+        prompt = "old:work['artifact.txt']history"
+        turn = {'prompt_source': pair, 'request': {'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest()}}
+        with mock.patch.dict(q.os.environ, TASKQ_INSTALL_DIR=str(install)), mock.patch.object(q, 'CLONE', selected), \
+                mock.patch.object(q, 'update_git', return_value='fixture-origin'), mock.patch.object(q, 'verify_release') as verify:
+            self.assertEqual(q.model_original_prompt(item, turn), prompt)
+            self.assertEqual(verify.call_args_list, [mock.call(selected, selected.name, 'fixture-origin'),
+                                                   mock.call(old, old.name, 'fixture-origin')])
+            for changed in ({**item, 'text': 'changed'}, {**item, 'scope': ['other.txt']}):
+                self.assertIsNone(q.model_original_prompt(changed, turn))
+            self.board.history = 'changed history'
+            self.assertIsNone(q.model_original_prompt(item, turn)); self.board.history = 'history'
+            self.assertIsNone(q.model_original_prompt(item, {**turn, 'request': {'prompt_sha256': '0' * 64}}))
+            with mock.patch.object(q, 'verify_release', side_effect=SystemExit('foreign source')), \
+                    mock.patch.object(q, 'load_file', side_effect=AssertionError('unverified import')), self.assertRaises(SystemExit):
+                q.model_original_prompt(item, turn)
+            (old / 'taskq.md').write_text('changed bytes')
+            with self.assertRaisesRegex(SystemExit, 'contract differs'):
+                q.model_original_prompt(item, turn)
+            pointer['compatible_from'] *= 17; (install / 'current.json').write_text(json.dumps(pointer))
+            with self.assertRaisesRegex(SystemExit, 'bound exceeded'):
+                q.model_original_prompt(item, turn)
+
+    def test_initial_reservation_reconstructs_exact_prompt_without_replacing_grants(self):
+        host = self.host()
+        host.reserve('blocker', {'repo': q.CONFIG['repo'], 'task': 99, 'role': 'worker',
+                                'demand': {'model:codex': 1}, 'age': 0, 'priority': 0})
+        with q.coordination():
+            self.assertIsNone(q.owned_model_turn(self.item(), self.kind, 'worker', 'original release prompt'))
+        turn = self.item()['raw']['model_turns']['worker']
+        host_before = host.observe(turn['key']); project_before = self.project.observe(turn['key'])
+        host.stop('blocker')
+        before = json.dumps(self.board.issues, sort_keys=True)
+        with q.coordination(), mock.patch.object(q, 'model_original_prompt', return_value=None), \
+                mock.patch.object(self.kind, 'spawn', side_effect=AssertionError('unqualified')):
+            self.assertIsNone(q.owned_model_turn(self.item(), self.kind, 'worker', 'new release prompt'))
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        with q.coordination(), mock.patch.object(q, 'model_original_prompt', return_value='original release prompt') as recovered, \
+                mock.patch.object(self.kind, 'spawn', side_effect=self.launch) as spawned:
+            self.assertEqual(q.owned_model_turn(self.item(), self.kind, 'worker', 'new release prompt'), 'fixture-native')
+            self.assertEqual(recovered.call_count, 1)
+            self.assertEqual(spawned.call_args.args[1], 'original release prompt')
+            self.assertIsNone(q.owned_model_turn(self.item(), self.kind, 'worker', 'new release prompt'))
+            self.assertEqual(spawned.call_count, 1)
+        current = self.item()['raw']['model_turns']['worker']
+        self.assertEqual((current['key'], current['generation'], current['request']),
+                         (turn['key'], turn['generation'], turn['request']))
+        self.assertEqual(host.observe(turn['key'])['ticket'], host_before['ticket'])
+        self.assertEqual(self.project.observe(turn['key']), project_before)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
         self.root = pathlib.Path(temporary.name).resolve()
@@ -123,6 +214,62 @@ class ModelIntegration(unittest.TestCase):
             self.assertEqual(q.parse(self.board.get(5))['raw']['model_turns']['supervisor']['phase'],'bound')
             q.one_pass(args,False)
             self.assertEqual(len(self.children),5)
+
+    def waiting_supervisor(self):
+        host = self.host()
+        blocker = {'repo': q.CONFIG['repo'], 'task': 99, 'role': 'worker',
+                   'demand': {'model:codex': 1}, 'age': 0, 'priority': 0}
+        host.reserve('blocker', blocker)
+        with q.coordination():
+            q.move(self.item(), 'review', 'result', 'review fixture', order=None,
+                   result={'sha': 'a' * 40, 'checks': 'fixture'})
+            with mock.patch.object(self.kind, 'state', return_value='idle'):
+                q.supervise(self.item(), {'codex': self.kind})
+        turn = self.item()['raw']['model_turns']['supervisor']
+        self.assertEqual(turn['phase'], 'reserving')
+        self.assertEqual(host.observe(turn['key'])['phase'], 'waiting')
+        host.reserve('later', {**blocker, 'task': 100, 'age': turn['request']['age'] + 1,
+                               'priority': turn['request']['priority']})
+        host.stop('blocker')
+        return turn, host
+
+    def test_oldest_waiting_supervisor_retries_same_reservation_once(self):
+        turn, host = self.waiting_supervisor()
+        project_before = self.project.observe(turn['key']); host_before = host.observe(turn['key'])
+        sid = self.item()['supervisor']['session']
+        def send(session, prompt):
+            self.assertEqual(session, sid)
+            self.assertEqual(hashlib.sha256(prompt.encode()).hexdigest(), turn['request']['prompt_sha256'])
+            child = subprocess.Popen([sys.executable, '-c', 'import sys;sys.stdin.read()'], stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.children.append(child); child.taskq_birth = q.process_identity(child.pid)[1]
+            log = self.kind.folder() / 'S1.log'
+            q.CONFIG['_model_launch'](child, log)
+            log.write_text(json.dumps({'type': 'thread.started', 'thread_id': sid}) + '\n{"type":"turn.started"}\n')
+            return sid
+        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=send) as sent:
+            q.supervise(self.item(), {'codex': self.kind})
+            self.assertEqual(sent.call_count, 1)
+            q.supervise(self.item(), {'codex': self.kind})
+            self.assertEqual(sent.call_count, 1)
+        current = self.item()['raw']['model_turns']['supervisor']
+        self.assertEqual((current['key'], current['generation'], current['request']),
+                         (turn['key'], turn['generation'], turn['request']))
+        self.assertEqual(current['runtime']['session'], sid)
+        self.assertEqual(host.observe(turn['key'])['ticket'], host_before['ticket'])
+        self.assertEqual(self.project.observe(turn['key']), project_before)
+        self.assertEqual(host.observe('later')['phase'], 'waiting')
+        self.assertEqual(current['phase'], 'bound')
+
+    def test_reserving_supervisor_does_not_retry_unknown_host_launch(self):
+        turn, host = self.waiting_supervisor()
+        host.reserve(turn['key'], turn['request'])
+        self.assertTrue(host.launch(turn['key'], turn['runtime']))
+        before = json.dumps(self.board.issues, sort_keys=True)
+        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=AssertionError('unknown launch')):
+            q.supervise(self.item(), {'codex': self.kind})
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        self.assertEqual(host.observe(turn['key'])['phase'], 'launching')
 
     def launch(self, *args):
         self.launches += 1
@@ -214,6 +361,36 @@ class ModelIntegration(unittest.TestCase):
         self.assertEqual(self.item()['claim']['session'], sid)
         with mock.patch.object(self.kind, 'send', side_effect=AssertionError('duplicate')):
             q.follow(self.item(), self.kind, self.item()['claim'], True)
+
+    def test_nudge_waiting_for_capacity_retries_without_losing_fifo_or_cursor(self):
+        sid = self.start(); self.complete()
+        host = self.host()
+        blocker = {'repo': q.CONFIG['repo'], 'task': 99, 'role': 'worker',
+                   'demand': {'model:codex': 1}, 'age': 0, 'priority': 0}
+        host.reserve('blocker', blocker)
+        self.board.comment(1, 'nudge: retry result')
+        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=AssertionError('full')):
+            q.supervise(self.item(), {'codex': self.kind})
+        turn = self.item()['raw']['model_turns']['worker']
+        self.assertEqual(turn['phase'], 'reserving')
+        waiting = host.observe(turn['key'])
+        self.assertEqual(waiting['phase'], 'waiting')
+        self.assertNotIn(sid, self.item()['raw'].get('worker_comment_cursor', {}))
+        host.reserve('later', {**blocker, 'task': 100, 'age': turn['request']['age'] + 1,
+                               'priority': turn['request']['priority']})
+        host.stop('blocker')
+        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=self.launch) as sent:
+            q.supervise(self.item(), {'codex': self.kind})
+            self.assertEqual(sent.call_count, 1)
+            q.supervise(self.item(), {'codex': self.kind})
+            self.assertEqual(sent.call_count, 1)
+        current = self.item()['raw']['model_turns']['worker']
+        self.assertEqual((current['key'], current['generation'], current['request']),
+                         (turn['key'], turn['generation'], turn['request']))
+        self.assertEqual(host.observe(turn['key'])['ticket'], waiting['ticket'])
+        self.assertEqual(host.observe('later')['phase'], 'waiting')
+        self.assertEqual(self.item()['claim']['session'], sid)
+        self.assertEqual(self.launches, 2)
 
     def test_nudge_cannot_resume_active_foreign_or_accepted_worker(self):
         sid = self.start()

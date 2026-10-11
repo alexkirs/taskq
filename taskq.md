@@ -191,6 +191,27 @@ admission. Pending native answer events take precedence and keep their existing
 application identity and receipt requirements. A comment creates no application
 event or ACK, and cannot resume an accepted result or an unresolved model turn.
 
+A supervisor or same-session worker continuation waiting for model capacity retries its existing reservation through
+the ordinary pass. This is distinct from idle execution: its task turn must still
+be reserving, its exact project grant reserved, and its exact host grant waiting
+or reserved without any launch runtime, child, stop or drain evidence. The same
+task, role, session, immutable request, pending native event or legacy comment inputs and
+original prompt digest must agree. Retry preserves its key, generation, age and
+FIFO tickets; launch remains atomic under project coordination. Launching, bound,
+unknown, changed or missing grants do not become retryable by process absence.
+
+An initial worker reservation whose prompt differs after a qualified release
+update may reconstruct its original brief from at most sixteen explicitly
+compatible installed sources. Each source must have its canonical immutable path,
+verified Git bytes/origin and the exact qualified contract. Reconstruction uses
+the current authoritative task and history and must reproduce the original prompt
+digest exactly; changed instructions, scope or history refuse. This is allowed only
+before any launch, with the same fresh order and exact reserved project and
+waiting/reserved host grants. The selected adapter admits the original request,
+key and tickets; it never runs an older dispatcher or changes a grant. New intents
+record their prompt source commit/contract to narrow later reconstruction. No
+source match means a visible held reservation, never an invented replacement prompt.
+
 ### Closed-task model settlement
 
 A normal guarded pass reconciles outstanding model-only grants from the local

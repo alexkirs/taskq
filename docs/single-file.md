@@ -17,7 +17,7 @@ The decisions below were taken by the owner on 2026-10-09. This document records
 ## 1. Data model (unchanged)
 
 - A task is an issue on the board.
-- Its state is one label `q-<state>`: `ready`, `waiting`, `doing`, `review`, `ask`, `later`.
+- Its state is one label `q-<state>`: `ready`, `waiting`, `doing`, `review`, `ask`, `later`, `failed`.
 - The issue description carries one JSON block: `scope`, `deps`, `claim`, `result`.
 - Comments are the history: every command that changes a task posts one comment.
 
@@ -153,6 +153,7 @@ Beside it:
 | `close N` | accept: in `pr` mode merge the PR, then close the issue |
 | `requeue N` | drop the claim, label `q-ready` |
 | `later N` | park the task: label `q-later` |
+| `failed N --text REASON` | unreleased classification hold: `q-failed`; preserve evidence/ownership, no execution or retry |
 | `tick` | one pass of section 5 |
 
 ## Old modules and where they landed

@@ -325,6 +325,78 @@ refuse a mixed incompatible open board. Closed historical issues are retained an
 executed; conversion of closed history and replacement of experimental lifecycle commands
 remain unqualified, rather than claimed as complete repair support.
 
+### General repair and explicit owner reset
+
+Changed (owner direction Sentinel_39a31287a4988191a6e2efb86bf774ec): schema conversion alone
+and indefinite technical legacy holds -> general repair with two distinct modes. `repair`
+compares authoritative state with qualified current native observations. `repair --force`
+means returning to the last qualified working lifecycle checkpoint, abandoning only the
+broken continuation and preparing a new execution identity where needed. It does not
+assert that missing historical drain has been proved. Latest owner clarification
+Sentinel_367e3d3bfa2481918f9b79b91150abd9 supersedes always restarting from ready.
+The proposed `repair 2-force` spelling is not a command; the supported spelling is `--force`.
+
+The existing schema preview/apply remains available. For runtime repair explicitly select
+tasks: `repair --tasks N ... --json`. Force additionally supplies a bounded `--reason` and
+optionally an owner-selected `--manager RUNTIME:SID:HOST`; absent that selection preserve
+the recorded manager. Preview reports the exact source bindings, planned transition,
+fencing resources, evidence gaps and native next actions. Each selected task shows its
+current broken step, proposed working step, checkpoint evidence, retained stages and
+minimal reset boundary. A recorded complete result at review selects review of that
+exact result; native verification is required before apply. Without a reliable result
+checkpoint, ready from the approved specification is the explicit restart fallback.
+A rejected result in ask is historical evidence, not a working review checkpoint. Later, waiting/dependency and
+intentional product/owner holds are never reset implicitly. Unknown classification refuses;
+force does not mean kill every process, revoke every credential, delete work or accept a result.
+
+Runtime apply: `repair --tasks N ... [--force --reason TEXT] --expected PLAN_DIGEST
+--apply --yes [--manager RUNTIME:SID:HOST]`. Only the owner shell applies force; ordinary
+technical normalization requires the recorded manager or owner. An investigating agent may
+read history/code/native handles and propose this exact plan; its conclusion, a printed
+assignment, a caller file or a JSON boolean is not native proof. No implicit paid agent spawn.
+The invoking agent is the investigator; the CLI's typed investigation assignment honestly
+reports `agent_invoked:false`. The executor is always the guarded supported apply path.
+
+All selected source records and the applicable adapter observations are preflighted before
+the first effect. A qualified board/runtime repair adapter must authenticate exact project,
+source payload, role/SID/native birth/handles, affected leases and resource coverage. Its
+`observe(context)` is read-only. It must either prove stale ownership with no remaining
+effects for ordinary repair, or support `fence(context)` and `verify(context, receipt)` for
+force: old future writes denied to task control, workspace/Git and remote publication,
+owned tools/controllers stopped or isolated, exact related resource leases released and
+new generation workspace isolated. It must exclude unrelated processes, waits, tasks and
+credentials. Missing adapter capability produces concrete operator actions, never automatic
+barrier clearing. Built-in GitHub/GitLab adapters currently provide no such force fence;
+service epoch and a new directory alone are insufficient. Qualification of a native fence
+and its specific security/revocation effects remains a separate checkpoint.
+The adapter authenticates the selected checkpoint as well as the fence; a source SHA
+alone is not proof of a working checkpoint. The adapter binds and idempotently reconciles `context.operation`; a fence failure or an
+incomplete batch is never permission to repeat an unknown native effect. Configured host
+and authenticated assignee restrictions apply to repair too.
+
+After verified closure/fencing, one verified native write preserves original human prose,
+unknown metadata and an append-only attempt snapshot with results, role identities,
+pending inputs/ACKs, owner decisions, model turns and source hashes. Ordinary repair retains
+the existing result and returns it to review; force records `abandoned-by-owner`, including
+historical unknowns separately from proven completion, archives the old active result and
+returns to the selected working step with no claimed role. A qualified completed result
+and its original publication branch survive a review checkpoint; a later new result uses
+the successor branch. Only broken continuation roles/runtime attempts are reset. Approved
+owner decisions remain explicit checkpoint inputs, while historical application ACKs
+are not forwarded to a successor. Full restart is the fallback when no checkpoint qualifies.
+Force continuation increments `execution_generation` and uses branch/worktree `taskq-N-gG`, plus distinct
+T/S native handle names. It does not create that workspace, admit workers, merge/close a
+task, or dispatch an extra pass; the existing normal queue admits only after verified reset.
+An old recorded actor/SID cannot mutate or be assigned into the new generation. This is an
+additional cooperating-client guard, not a substitute for the adapter's real fence.
+
+Identical apply replay verifies the stored receipt and invokes no fence twice. Conflicting
+replay or fresh changed source refuses. Unknown stop/fence/write outcome retains the project
+guard and original records for reconciliation; no blind retry. New attempts keep scope,
+dependencies and approved product/security/model settings. #613 remains dependent on actual
+accepted completion of601/612, not on their reset. No production task reset is implied by
+this candidate contract or synthetic adapter tests.
+
 The canonical rules of taskq (owner decision 2026-10-08, #242; restored by #311 after the single-file cutover #290
 dropped `taskq/contracts/principles.md`). The sections below are their mechanics and never restate them.
 A rule the cutover changed says `Changed:` old → new, with the task. `Open:` marks a decision only the owner can make.

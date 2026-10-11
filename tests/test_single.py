@@ -5193,6 +5193,15 @@ class Cleanup(Base):
         return REAL_RUN(['git', '-C', str(folder or self.root), '-c', 'user.name=t', '-c', 'user.email=t@t', *argv],
                         check=True, capture_output=True, text=True).stdout
 
+    def test_quarantined_original_branch_and_worktree_survive_cleanup(self):
+        issue = self.board.issues[2]
+        raw = taskq.issue_data(issue)
+        raw['repair_history'] = [{'snapshot': {'raw': {'execution_generation': 0, 'claim': None, 'supervisor': None}}}]
+        issue['body'] = taskq.block('closed successor with retained history', raw)
+        out = self.cleanup('--dry-run')
+        self.assertIn('kept worktree .worktrees/taskq-2: quarantined attempt evidence', out)
+        self.assertTrue((self.root / '.worktrees/taskq-2').exists())
+
     def commit(self, folder, name):
         Path(folder, name).write_text(f'{name}\n')
         self.git('add', name, folder=folder)

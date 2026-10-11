@@ -1388,7 +1388,22 @@ def cmd_move(args):
         if any(str(event_id) not in receipts or receipts[str(event_id)]['git_sha'] != args.sha for event_id in turn.get('event_ids', [])):
             fail('model result requires native applied receipts at its exact Git SHA')
     sources, state, fields = MOVES[args.command]
-    move(task(args.n, *sources), state, args.command, args.text, **fields(args))
+    if args.command == 'ask' and current and current['state'] == 'ask':
+        current = task(args.n, 'ask')
+        raw = current['raw']
+        submitted = (raw.get('action_payloads') or {}).get('result') or {}
+        if role(current) not in ('manager', 'supervisor') or not (current.get('supervisor') or {}).get('session') \
+                or raw.get('event_schema') != EVENT_SCHEMA \
+                or not current.get('result') or not (current.get('claim') or {}).get('session') \
+                or type(submitted.get('id')) is not int or not 0 < submitted['id'] < raw.get('event_seq', 0) \
+                or raw.get('order') or raw.get('acceptance_receipts') \
+                or (raw.get('action_payloads') or {}).get('close') \
+                or any(event['action'] == 'close' for event in raw.get('events', [])) \
+                or 'legacy_recovery' in raw or raw.get('model_recovery'):
+            fail('ask from ask requires its recorded manager or supervisor and an open submitted result without recovery or acceptance')
+    else:
+        current = task(args.n, *sources)
+    move(current, state, args.command, args.text, **fields(args))
 
 def role(current):
     """Who runs this command for the task: supervisor, worker, manager, owner (a plain shell), or None (another session)."""

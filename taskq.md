@@ -49,6 +49,18 @@ event; application still requires the scoped committed artifact and native `appl
 receipt. Same command ID is idempotent. No replacement, direct unaccounted model call,
 automatic rejection inference or standalone-model acceptance is authorized by this path.
 
+R3/R11/R13: when a submitted result is already in `ask` because the manager requested
+review, its recorded manager may use `ask` to request the owning supervisor's
+review, and its recorded supervisor may use `ask` to record its own explicit rejection.
+This requires the open schema-3 submitted result and preserves result, worker,
+supervisor and model receipts; it never moves to `doing` or wakes the worker.
+The manager's event targets that supervisor, never the worker; the supervisor's
+event records the rejection required by versioned rework. Other callers, absent
+submissions, acceptance/close receipts, pending execution
+orders and recovery holds refuse. The manager must still use the versioned
+rejected-result command and its exact settled-identity checks before same-worker
+rework. Recording the rejection is neither that authorization nor application.
+
 Named ARM runtime handle: `taskq arm start --name NAME [--scope-task N ...]`
 records an enabled local activation; `update` changes its scope, `status` reads
 it, and `stop` disables future admissions without cancelling any worker. These

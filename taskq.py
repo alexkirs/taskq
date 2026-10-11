@@ -3964,7 +3964,13 @@ def model_turn_receipt(runtime, child):
         raise ValueError('model turn attribution unknown or duplicated')
     terminal = entries[-1].get('type')
     if terminal not in ('turn.completed', 'turn.failed') \
-            or any(entry.get('type') in ('turn.completed', 'turn.failed', 'error') for entry in entries[:-1]) \
+            or any(entry.get('type') in ('turn.completed', 'turn.failed') for entry in entries[:-1]) \
+            or any(terminal != 'turn.completed' or not isinstance(entry.get('message'), str)
+                   or not re.fullmatch(r'Reconnecting\.\.\. (?:[1-9][0-9]*/[1-9][0-9]* '
+                                       r'\(stream disconnected before completion: [^\r\n]+\)|'
+                                       r'waiting for network \(Connection failed: error sending request\))',
+                                       entry['message'])
+                   for entry in entries[:-1] if entry.get('type') == 'error') \
             or next(i for i, entry in enumerate(entries) if entry.get('type') == 'turn.started') >= len(entries) - 1:
         raise ValueError('model turn terminal receipt unavailable')
     return {'kind': 'model-turn', 'session': sid, 'terminal': terminal,

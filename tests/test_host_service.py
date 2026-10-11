@@ -101,6 +101,7 @@ class ServiceTests(unittest.TestCase):
                     state=h.read_state(self.db);state['stop']=True;h.save_state(self.db,state);self.db.commit()
                 with mock.patch.object(h,'owner_lock',return_value=contextlib.nullcontext()), \
                         mock.patch.object(h,'validate_owner'),mock.patch.object(h.ipc,'Listener'), \
+                        mock.patch.object(h.os,'chmod'), \
                         mock.patch.object(h.threading,'Thread'),mock.patch.object(h.queue,'Queue',return_value=pending), \
                         mock.patch.object(h,'request',return_value={'outcome':'observed'}), \
                         mock.patch.object(h,'take_wakes',side_effect=ValueError('malformed wake')), \

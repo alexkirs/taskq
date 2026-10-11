@@ -1,4 +1,6 @@
 """Isolated service contract tests: real SQLite/IPC/child lifecycle, no provider or model."""
+import contextlib
+import sqlite3
 import importlib.util
 import json
 import multiprocessing.connection as ipc
@@ -26,6 +28,14 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(first,h.request(None,self.db,self.value()))
         with self.assertRaisesRegex(ValueError,'conflicting'): h.request(None,self.db,self.value('pause'))
         self.assertEqual('active',h.read_state(self.db)['phase'])
+    def test_registry_initialization_failure_closes_connection(self):
+        connection=mock.Mock()
+        connection.execute.side_effect=sqlite3.OperationalError('database is locked')
+        with mock.patch.object(h.sqlite3,'connect',return_value=connection):
+            with self.assertRaisesRegex(sqlite3.OperationalError,'locked'):
+                h.connect_db(self.home/'failed.sqlite')
+        connection.close.assert_called_once_with()
+
     def test_cache_write_failure_rolls_back_control_state(self):
         self.db.execute("CREATE TRIGGER reject_receipt BEFORE INSERT ON requests BEGIN SELECT RAISE(ABORT,'receipt unavailable'); END")
         self.db.commit()
@@ -202,7 +212,9 @@ class NativeMigration(unittest.TestCase):
                     cli(service+['client','resume','--id','resume-fixture'])
                     deadline=time.monotonic()+70
                     while True:
-                        db=h.connect_db(home/'registry.sqlite');state=h.read_state(db);db.close()
+                        # Observe the live journal without schema writes; close even on read failure.
+                        with contextlib.closing(sqlite3.connect((home/'registry.sqlite').as_uri()+'?mode=ro',uri=True,timeout=5)) as observed_db:
+                            state=h.read_state(observed_db)
                         if (state.get('operation') or {}).get('phase')=='complete':break
                         self.assertIsNone(process.poll(),log.read_text('utf-8'));self.assertLess(time.monotonic(),deadline,log.read_text('utf-8'));time.sleep(.1)
                     self.assertEqual(0,state['operation']['exit'],Path(state['operation']['log']).read_text('utf-8'))

@@ -4579,7 +4579,7 @@ class Contract(Base):
         REAL_RUN(['git', '-C', str(folder), '-c', 'user.name=t', '-c', 'user.email=t@t', *argv], check=True, capture_output=True)
 
     def test_pm_prints_role_and_records_hash(self):
-        (self.root / 'taskq.md').write_text((ROOT / 'taskq.md').read_text())
+        (self.root / 'taskq.md').write_bytes((ROOT / 'taskq.md').read_bytes())
         out = self.run_cli('pm')
         digest = taskq.contract()
         self.assertTrue(out.startswith(f'taskq pm contract {digest}\n'))
@@ -4589,7 +4589,7 @@ class Contract(Base):
         self.assertEqual(json.loads((self.root / '.taskq' / 'pm.json').read_text()), {'contract': digest})  # #532: the hash only
 
     def test_pm_onboarding_is_one_read_only_snapshot(self):
-        (self.root / 'taskq.md').write_text((ROOT / 'taskq.md').read_text())
+        (self.root / 'taskq.md').write_bytes((ROOT / 'taskq.md').read_bytes())
         self.add('assigned')
         with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': ''}, clear=True):
             self.add('unassigned')
@@ -4627,7 +4627,7 @@ class Contract(Base):
 
     def test_pm_refuses_recorded_session_roles_before_onboarding(self):
         self.add()
-        (self.root / 'taskq.md').write_text((ROOT / 'taskq.md').read_text())
+        (self.root / 'taskq.md').write_bytes((ROOT / 'taskq.md').read_bytes())
         for field in ('claim', 'supervisor'):
             with self.subTest(field=field):
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -6243,7 +6243,7 @@ class Model(Base):
 
     def test_contract_keeps_principles(self):
         # #311: a rewrite of taskq.md must not drop a principle silently (change rule: amend, never overwrite)
-        text = (ROOT / 'taskq.md').read_text()
+        text = (ROOT / 'taskq.md').read_text('utf-8')
         self.assertEqual(re.findall(r'^### (R\d+)\. ', text, re.M), [f'R{n}' for n in range(1, 14)])
         self.assertIn('\n### Change rule\n', text)
         self.assertIn('\n## Product\n', text)  # #505: product decisions live here

@@ -26,10 +26,14 @@ def connect_db(path):
     if path.is_symlink() or path.exists() and (not path.is_file() or path.stat().st_nlink!=1):
         raise ValueError('linked or non-file registry refused')
     db=sqlite3.connect(path,timeout=0)
-    db.execute('CREATE TABLE IF NOT EXISTS state (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
-    db.execute('CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, digest TEXT NOT NULL, response TEXT NOT NULL)')
-    if os.name!='nt': os.chmod(path,0o600)
-    return db
+    try:
+        db.execute('CREATE TABLE IF NOT EXISTS state (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
+        db.execute('CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, digest TEXT NOT NULL, response TEXT NOT NULL)')
+        if os.name!='nt': os.chmod(path,0o600)
+        return db
+    except BaseException:
+        db.close()
+        raise
 
 def read_state(db):
     row=db.execute("SELECT body FROM state WHERE id='project'").fetchone()

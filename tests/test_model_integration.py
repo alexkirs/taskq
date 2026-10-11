@@ -779,7 +779,11 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
     def test_steering_applied_has_exact_native_proof_and_compacted_replay(self):
         self.exercise_applied(action="steer")
 
-    def exercise_applied(self, worktree=False, action="answer"):
+    def test_applied_accepts_nested_directory_scope_but_not_sibling_prefix(self):
+        self.exercise_applied(artifact='bench/cadence/codex/result.txt', scope='bench/cadence/codex',
+                              sibling='bench/cadence/codex-sibling/result.txt')
+
+    def exercise_applied(self, worktree=False, action="answer", artifact='artifact.txt', scope=None, sibling=None):
         self.start(); self.complete()
         with q.coordination():
             if action == 'steer':
@@ -801,11 +805,12 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
             workspace.parent.mkdir()
             subprocess.run(git+['worktree', 'add', '-qb', 'taskq-1', str(workspace)], check=True)
             git = ['git', '-C', str(workspace)]
-        (workspace/'artifact.txt').write_text('chosen value')
-        subprocess.run(git+['add', 'artifact.txt'], check=True)
+        (workspace/artifact).parent.mkdir(parents=True, exist_ok=True)
+        (workspace/artifact).write_text('chosen value')
+        subprocess.run(git+['add', artifact], check=True)
         subprocess.run(git+['commit', '-qm', 'synthetic artifact'], check=True)
         sha = subprocess.check_output(git+['rev-parse', 'HEAD'], text=True).strip()
-        args = argparse.Namespace(event=f'1:{event_id}', artifact='artifact.txt', sha=sha)
+        args = argparse.Namespace(event=f'1:{event_id}', artifact=artifact, sha=sha)
         with self.assertRaises(SystemExit): q.cmd_applied(args)  # manager is not worker
         self.identity = self.item()['claim']
         issue = self.board.get(1); changed = q.issue_data(issue)
@@ -818,7 +823,7 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
         scoped['scope'] = ['other.txt']
         self.board.issues[1]['body'] = q.block('synthetic', scoped)
         with self.assertRaises(SystemExit): q.cmd_applied(args)
-        scoped['scope'] = []  # ordinary intake default: no expected paths named
+        scoped['scope'] = [scope] if scope else []  # ordinary intake default: no expected paths named
         self.board.issues[1]['body'] = q.block('synthetic', scoped)
         if not worktree:
             before = json.dumps(self.board.issues, sort_keys=True)
@@ -832,6 +837,17 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
             subprocess.run(git+['checkout', '-qb', 'foreign-task'], check=True)
             with self.assertRaises(SystemExit): q.cmd_applied(args)
             subprocess.run(git+['checkout', '-q', 'taskq-1'], check=True)
+        if sibling:
+            (workspace/sibling).parent.mkdir(parents=True, exist_ok=True)
+            (workspace/sibling).write_text('sibling')
+            subprocess.run(git+['add', sibling], check=True)
+            subprocess.run(git+['commit', '-qm', 'sibling fixture'], check=True)
+            args.sha = subprocess.check_output(git+['rev-parse', 'HEAD'], text=True).strip()
+            self.assertFalse(q.artifact_in_scope(workspace, pathlib.Path(sibling), [scope]))
+            with self.assertRaises(SystemExit):
+                q.cmd_applied(argparse.Namespace(event=args.event, artifact=sibling, sha=args.sha))
+        self.assertTrue(q.artifact_in_scope(workspace, pathlib.Path(artifact), [artifact]))
+        self.assertTrue(q.artifact_in_scope(workspace, pathlib.Path(artifact), ['*.txt']))
         with q.coordination(): q.cmd_applied(args)
         before = json.dumps(self.board.issues, sort_keys=True)
         with q.coordination(): q.cmd_applied(args)
@@ -843,7 +859,7 @@ pathlib.Path({str(self.root / 'writer-done')!r}).write_text('done')
             before = json.dumps(self.board.issues, sort_keys=True)
             with q.coordination(): q.cmd_applied(args)
             self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
-        (workspace/'artifact.txt').write_text('changed')
+        (workspace/artifact).write_text('changed')
         with self.assertRaises(SystemExit): q.cmd_applied(args)
         self.complete()
 

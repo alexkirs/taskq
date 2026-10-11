@@ -342,7 +342,9 @@ event IDs/immutable payload digest (ACK state excluded); delivery/start does not
 --sha FULLSHA` verifies the native recorded worker/turn, scoped artifact and exact local Git
 commit before writing a native application receipt plus ack with fresh readback.
 An empty expected-path list permits a committed artifact inside the owning task workspace;
-it is not a deny-all artifact scope. Named paths still constrain application artifacts.
+it is not a deny-all artifact scope. Named file patterns retain their exact `fnmatchcase`
+semantics. An existing in-root, non-symlink directory scope also permits only descendants
+below its path-component boundary; a sibling prefix, traversal or escaped directory never matches.
 Native identity, immutable answer input, path containment and exact commit checks remain required.
 For the built-in worker route, verify the project's registered `.worktrees/taskq-N`
 on branch `taskq-N` and inspect its artifact/HEAD, rather than the main checkout.

@@ -3093,6 +3093,23 @@ def verify_result_notification(item, event):
     return accepted
 
 
+def artifact_in_scope(root, relative, scopes):
+    import fnmatch
+    if not scopes:
+        return True
+    for scope in scopes:
+        if not isinstance(scope, str) or not scope:
+            continue
+        if fnmatch.fnmatchcase(relative.as_posix(), scope):
+            return True
+        scoped = Path(scope)
+        path = root / scoped
+        if not scoped.is_absolute() and '..' not in scoped.parts and not path.is_symlink() \
+                and path.is_dir() and path.resolve().is_relative_to(root) and relative.is_relative_to(scoped):
+            return True
+    return False
+
+
 def cmd_applied(args):
     """A recorded worker attests application using a scoped artifact and exact local commit."""
     matched = re.fullmatch(r'([1-9]\d*):([1-9]\d*)', args.event)
@@ -3139,10 +3156,9 @@ def cmd_applied(args):
             fail('applied requires its registered task branch/worktree')
         root = workspace.resolve()
     path = root / relative
-    import fnmatch
     if relative.is_absolute() or '..' in relative.parts or not relative.name or path.is_symlink() \
             or not path.is_file() or not path.resolve().is_relative_to(root) \
-            or (item['scope'] != [] and not any(fnmatch.fnmatchcase(relative.as_posix(), scope) for scope in item['scope'])):
+            or not artifact_in_scope(root, relative, item['scope']):
         fail('applied artifact must be a real scoped file inside this task workspace')
     content = path.read_bytes()
     if len(content) > 1024 * 1024:

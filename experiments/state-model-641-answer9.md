@@ -114,3 +114,29 @@ This final evidence-only amendment preserves the earlier exact code/test gate;
 the amended artifact's own commit and affected documentation sentinel outcomes
 are recorded in the PR/handoff. No formal successful result may be reported until
 native application and its successful identical replay have been verified.
+
+## Answer12: qualified native receipt handoff
+
+Owner-approved continuation of answer9 in the same worker/session and PR649,
+source Sentinel_68fb95025c788191b8c5d1916fc24ba7 and owner641.1. The owner approved
+exact release `4fe8eae0a8dd3b3de3b693a8b29b0f63c2645cfd` after PR658 merged with exact CI.
+Its contract was read before this handoff. The installed native route now verifies
+registered `.worktrees/taskq-641` on branch `taskq-641`; scope=[] is not deny-all.
+The historical refusals above remain evidence of the old release, not a current
+application outcome. No old b58 command or old d3fdfa artifact SHA is reused.
+
+This evidence-only addition applies answer12 by selecting the authorized qualified
+route and retaining the existing answer9 implementation and all history. No new
+implementation, model replay or full-suite rerun is required for this receipt-only
+continuation. Prior code/test gates on d3fdfa9 and exact CI/documentation gates on
+440a813 remain recorded; they are not relabeled as new-head executions.
+
+Native applied commands for events 641:9 and 641:12 use the actual current full
+HEAD containing this committed file. Verify working bytes against Git readback
+before each first application; repeat each identical command once. First native
+outcome must be applied=true/repeated=false, then applied=true/repeated=true.
+Only native receipts/readback establish these outcomes; this pre-command artifact
+does not fabricate an ACK. Submit formal result with that same head and truthful
+check/receipt outcomes afterward. Any concrete refusal preserves the same worker,
+identity and history, with no bypass or replacement. This continuation is technical
+completion, not acceptance of rejected result7 or the research result.

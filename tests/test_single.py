@@ -6478,10 +6478,12 @@ class RealChild(unittest.TestCase):
     def test_local_scope_survives_native_event_and_turn_end_children(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            # The completion marker is after the actual child's main(), not a sleep or spawn-return oracle.
+            # Main completion precedes process exit; wait for exact death before Windows removes its open log.
             source = (ROOT / 'taskq.py').read_text('utf-8')
             (root / 'taskq.py').write_text(source + "\nif __name__ == '__main__' and sys.argv[1] == 'tick':\n"
-                                         "    (Path.cwd() / 'completed').write_text('done')\n", encoding='utf-8')
+                                         "    marker = Path.cwd() / 'completed.tmp'\n"
+                                         "    marker.write_text(json.dumps({'pid': os.getpid(), 'birth': process_identity(os.getpid())[1]}))\n"
+                                         "    marker.replace(Path.cwd() / 'completed')\n", encoding='utf-8')
             (root / 'board.py').write_text(FILE_BOARD, encoding='utf-8')
             (root / 'fake.py').write_text('''import json, os, pathlib
 def spawn(name, prompt, cwd):
@@ -6518,6 +6520,11 @@ def link(session): return None
                 while not (root / 'completed').exists() and taskq.time.monotonic() < end:
                     taskq.time.sleep(0.05)
                 self.assertTrue((root / 'completed').exists(), (root / '.taskq' / 'dispatch.log').read_text())
+                child = json.loads((root / 'completed').read_text())
+                self.assertTrue(child['birth'])
+                while taskq.process_state(child['pid'], child['birth']) != 'dead' and taskq.time.monotonic() < end:
+                    taskq.time.sleep(0.05)
+                self.assertEqual(taskq.process_state(child['pid'], child['birth']), 'dead')
                 (root / 'completed').unlink()
 
             invoke('add', 'event', '--goal', 'g', '--acceptance', 'a', '--host', 'win')

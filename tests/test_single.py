@@ -159,6 +159,78 @@ class Base(unittest.TestCase):
 
 
 
+class SubmittedResultRejection(Base):
+    def fixture(self):
+        manager = {'runtime': 'codex', 'session': 'manager', 'name': 'mac'}
+        supervisor = {'runtime': 'codex', 'session': 'supervisor', 'name': 'win'}
+        worker = {'runtime': 'codex', 'session': 'worker', 'name': 'win'}
+        raw = {'scope': [], 'deps': [], 'claim': worker, 'supervisor': supervisor, 'pm': manager,
+               'order': None, 'result': {'sha': 'a' * 40, 'checks': 'original'},
+               'action_payloads': {'result': {'id': 1, 'by': 'codex:worker', 'text': 'submitted'}},
+               'model_turns': {'worker': {'phase': 'complete', 'key': 'worker-key'},
+                               'supervisor': {'phase': 'complete', 'key': 'supervisor-key'}}}
+        raw['event_seq'] = 1
+        # Genuine manager-authored question reproduces the blocked production route.
+        with mock.patch.object(taskq, 'session', return_value=manager):
+            taskq.append_event(raw, 'ask', 'manager requests evidence')
+        self.board.add('submitted task', taskq.block('retained history', raw), ['q-ask', 'research'])
+        return raw, supervisor
+
+    def test_supervisor_records_rejection_without_worker_wake_or_result_clear(self):
+        before, supervisor = self.fixture()
+        with mock.patch.object(taskq, 'session', return_value=supervisor), \
+                mock.patch.object(taskq, 'owned_model_turn') as admission:
+            self.run_cli('ask', '1', '--text', 'HOLD: missing whole-close evidence')
+        after = self.task(1)
+        self.assertEqual(after['state'], 'ask')
+        for key in ('result', 'claim', 'supervisor', 'model_turns', 'order'):
+            self.assertEqual(after['raw'][key], before[key])
+        rejection = after['raw']['action_payloads']['ask']
+        self.assertEqual(rejection['by'], 'codex:supervis')
+        self.assertGreater(rejection['id'], before['action_payloads']['result']['id'])
+        self.assertNotIn(taskq.recipient('worker', before['claim']), after['raw']['events'][-1]['recipients'])
+        admission.assert_not_called()
+
+    def test_wrong_actor_missing_submission_acceptance_and_recovery_do_not_write(self):
+        for case in ('owner', 'worker', 'foreign', 'no-result', 'no-worker', 'no-supervisor', 'no-submission', 'future-submission',
+                     'accepted', 'closed-receipt', 'order', 'recovery', 'legacy'):
+            with self.subTest(case=case):
+                self.board.issues.clear()
+                raw, supervisor = self.fixture()
+                identity = supervisor
+                if case in ('worker', 'foreign'):
+                    identity = {'runtime': 'codex', 'session': case}
+                elif case == 'owner': identity = None
+                elif case == 'no-result': raw['result'] = None
+                elif case == 'no-worker': raw['claim'] = None
+                elif case == 'no-supervisor': raw['supervisor'] = None
+                elif case == 'no-submission': raw['action_payloads'].pop('result')
+                elif case == 'future-submission': raw['action_payloads']['result']['id'] = raw['event_seq']
+                elif case == 'accepted': raw['acceptance_receipts'] = {'receipt': {}}
+                elif case == 'closed-receipt': raw['action_payloads']['close'] = {'id': 3}
+                elif case == 'order': raw['order'] = 'run'
+                elif case == 'recovery': raw['model_recovery'] = {'reason': 'held'}
+                elif case == 'legacy': raw['legacy_recovery'] = {}
+                self.board.issues[1]['body'] = taskq.block('retained history', raw)
+                before = json.dumps(self.board.issues, sort_keys=True)
+                with mock.patch.object(taskq, 'session', return_value=identity), self.assertRaises(SystemExit):
+                    self.run_cli('ask', '1', '--text', 'rejection')
+                self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+
+    def test_manager_review_request_targets_only_the_same_supervisor(self):
+        before, supervisor = self.fixture()
+        with mock.patch.object(taskq, 'session', return_value=before['pm']), \
+                mock.patch.object(taskq, 'owned_model_turn') as admission:
+            self.run_cli('ask', '1', '--text', 'review exact retained result')
+        after = self.task(1)
+        self.assertEqual(after['state'], 'ask')
+        for key in ('result', 'claim', 'supervisor', 'model_turns', 'order'):
+            self.assertEqual(after['raw'][key], before[key])
+        targets = after['raw']['events'][-1]['recipients']
+        self.assertIn(taskq.recipient('supervisor', supervisor), targets)
+        self.assertNotIn(taskq.recipient('worker', before['claim']), targets)
+        admission.assert_not_called()
+
 class RecoveryQualification(Base):
     def setUp(self):
         super().setUp()

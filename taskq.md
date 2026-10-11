@@ -402,6 +402,41 @@ dropped `taskq/contracts/principles.md`). The sections below are their mechanics
 A rule the cutover changed says `Changed:` old → new, with the task. `Open:` marks a decision only the owner can make.
 `tests/test_single.py` fails when a heading of this section disappears.
 
+
+#### Explicit owner-accepted legacy risk
+
+Owner approval Sentinel_2036b8c3251c8191807c4a402dd890cf authorizes implementation and
+FIRST application only to #571, retaining result c08678b3e2c0ed80bdcdc008bbcbd41bec6a7c44
+and returning it to review. It does not authorize resetting601/612 or accepting/closing571.
+
+A separate supported force variant is `repair --tasks N --force --reason TEXT
+--accept-legacy-risk --owner-approval REFERENCE --retain-result FULL_SHA
+[--manager RUNTIME:SID:HOST]`. Preview and owner-only `--expected DIGEST --apply --yes`
+bind exactly ONE task, its complete fresh source/comments/identities, exact recorded review
+result, owner reference and the enumerated risks: unknown historical detached writers,
+unfenced shared Git/provider/tool rights, unqualified Desktop resume surface, and loss of
+any optional SID-lock protection. This variant is limited to a recorded working review
+checkpoint, with the exact result Git commit independently present. Known running original
+Codex birth-qualified roots refuse. Unknown history remains explicit accepted risk rather
+than indefinite drain prerequisite. A different result/task/reason/approval or changed source
+requires a new preview/consent. No generic caller-file proof or false adapter receipt exists.
+
+The genuine owner shell's guarded apply is the risk decision; the reference is audit provenance,
+not machine verification of a human transcript. Store `abandoned-by-owner` with the complete
+original attempt snapshot, explicit owner risk scope, `historical_drain_proven:false`,
+`broad_resource_fenced:false`, no denied resources and related leases unchanged/unreconciled.
+Preserve completed research/result, original publication branch, owner decisions and all
+identities in audit; reset only active broken continuation into a fresh review generation.
+No lease release, process kill, archive, credential/security change, keeper requirement,
+worker dispatch, result acceptance, issue closure or dependency completion occurs. Unknown
+writers may still act outside cooperating TaskQ guards: the owner explicitly accepts that
+residual risk for this transition; it is never represented as safe fencing or proven drain.
+
+SID-lock is an optional admission measure, not broad fencing; keeper crash/inode loss creates
+an observed resume gap. No keeper is installed or a real session locked by this variant.
+The native receipt and exact committed checkpoint are rechecked on identical replay; no
+second board write. Partial/unknown write preserves coordination for reconciliation.
+
 ### Change rule
 
 A task that changes a rule names the R-number it amends in its title or goal, edits this section in the same

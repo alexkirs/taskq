@@ -5171,7 +5171,74 @@ def repair_checkpoint(item):
             'resets': ['broken-continuation', 'old-role-assignments', 'old-runtime-attempt'],
             'fallback_restart': not review, 'native_verification_required': True}
 
-def runtime_repair_plan(numbers, force=False, reason='', manager=None):
+REPAIR_ACCEPTED_RISKS = ('historical-detached-writers', 'unfenced-shared-resource-rights',
+                         'unqualified-desktop-resume', 'optional-keeper-loss')
+
+def repair_risk_selection(numbers, force, accepted, approval, result):
+    if not accepted:
+        if approval or result:
+            fail('owner approval/result binding requires --accept-legacy-risk')
+        return None
+    if not force or len(numbers or []) != 1 or not re.fullmatch('[0-9a-f]{40}', result or '') \
+            or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', approval or ''):
+        fail('accepted legacy risk requires force, exactly one task, owner approval reference and exact retained result SHA')
+    return {'approval_reference': approval, 'retained_result_sha': result,
+            'risks': list(REPAIR_ACCEPTED_RISKS)}
+
+def repair_risk_native(context):
+    """Fresh native checkpoint/known-root observations. No historical closure assertion."""
+    if context['project'] != {k: str(CONFIG.get(k) or '') for k in ('board', 'host', 'repo', 'root')}:
+        fail('accepted-risk native project binding changed')
+    checkpoint = context['checkpoint']; consent = context['owner_accepted_risk']
+    result = checkpoint['evidence']['result']
+    if checkpoint['state'] != 'review' or checkpoint['fallback_restart'] \
+            or not result or result.get('sha') != consent['retained_result_sha']:
+        fail('accepted risk requires the exact recorded working review result; no restart/reacceptance')
+    sha = update_git(CONFIG['root'], 'rev-parse', '--verify', result['sha'] + '^{commit}')
+    if sha != result['sha']:
+        fail('accepted-risk result Git object mismatch')
+    roots = []
+    for role_name in ('claim', 'supervisor'):
+        identity = context['roles'].get(role_name)
+        if not identity:
+            continue
+        evidence = {'role': role_name, 'identity': identity, 'state': 'unknown', 'pid': None, 'birth': None}
+        if identity.get('runtime') == 'codex' and identity.get('name') == machine():
+            folder = CONFIG['root'] / '.taskq'
+            paths = list(folder.glob('*.pid')) if folder.exists() else []
+            for path in paths:
+                if path.is_symlink():
+                    continue
+                pid, sid, native_birth = read_process(path)
+                if sid != identity.get('session'):
+                    continue
+                state = process_state(pid, native_birth)
+                if state == 'running':
+                    fail('accepted legacy risk refuses a known running original root; addressed stop requires separate scope')
+                roots.append({**evidence, 'state': state, 'pid': pid, 'birth': native_birth})
+            if not any(e['role'] == role_name for e in roots):
+                roots.append(evidence)
+        else:
+            roots.append(evidence)
+    return {'result_commit': sha, 'known_roots': roots,
+            'unknowns': list(REPAIR_ACCEPTED_RISKS), 'historical_drain_proven': False,
+            'broad_resource_fenced': False, 'denied_resources': [],
+            'related_leases': 'unchanged-unreconciled'}
+
+def repair_risk_proof(context):
+    return {'context': context, **repair_risk_native(context),
+            'owner_accepted_risk': context['owner_accepted_risk'],
+            'checkpoint_verified': True, 'controllers': 'historical-unknown-risk-accepted',
+            'new_workspace_isolated': False}
+
+def repair_risk_verify(context, proof):
+    native = repair_risk_native(context)
+    return proof == {'context': context, **native,
+                     'owner_accepted_risk': context['owner_accepted_risk'],
+                     'checkpoint_verified': True, 'controllers': 'historical-unknown-risk-accepted',
+                     'new_workspace_isolated': False}
+
+def runtime_repair_plan(numbers, force=False, reason='', manager=None, accepted_risk=None):
     """Read-only preview. Adapter observations are never accepted from a caller file."""
     if not numbers or len(numbers) > 100 or any(type(n) is not int or n <= 0 for n in numbers) or len(set(numbers)) != len(numbers):
         fail('runtime repair requires 1..100 distinct selected task IDs')
@@ -5221,18 +5288,20 @@ def runtime_repair_plan(numbers, force=False, reason='', manager=None):
                    'checkpoint': repair_checkpoint(item),
                    'turns': raw.get('model_turns', {}), 'resources': list(REPAIR_RESOURCES),
                    'workspace': str(CONFIG['root'] / '.worktrees' / (f'taskq-{n}-g{generation+1}' if force else task_branch(item)))}
+        if accepted_risk:
+            context['owner_accepted_risk'] = accepted_risk
         context['operation'] = repair_digest(context)  # adapter fence must replay this operation without repeating effects
-        observation = adapter.observe(json.loads(json.dumps(context))) if qualified else None
-        supported = qualified and isinstance(observation, dict) and observation.get('context') == context \
+        observation = repair_risk_proof(context) if accepted_risk else adapter.observe(json.loads(json.dumps(context))) if qualified else None
+        supported = repair_risk_verify(context, observation) if accepted_risk else qualified and isinstance(observation, dict) and observation.get('context') == context \
             and adapter.verify(json.loads(json.dumps(context)), json.loads(json.dumps(observation))) is True
         available = supported and observation.get('checkpoint_verified') is True \
-            and (observation.get('fence_available') is True if force else observation.get('stale') is True)
+            and (bool(accepted_risk) or (observation.get('fence_available') is True if force else observation.get('stale') is True))
         blockers = [] if available else [
             'No authenticated native repair/fencing adapter for this exact source and resource scope.',
             'Quiesce only the selected old controllers/tools by exact SID and PID/birth; preserve handles and outputs.',
             'Deny old future task/Git/provider writes; a dead root, new directory or service epoch is insufficient.',
             'Reconcile/release only exact related leases; unknown unrelated grants remain untouched.']
-        plans.append({'context': context, 'status': 'fence-required' if force and available else 'normalizable' if available else 'operator-required',
+        plans.append({'context': context, 'status': 'owner-risk-decision-required' if accepted_risk and available else 'fence-required' if force and available else 'normalizable' if available else 'operator-required',
                       'target_state': context['checkpoint']['state'],
                       'rollback': {'from': item['state'], 'to': context['checkpoint']['state'],
                                    'checkpoint': context['checkpoint']},
@@ -5246,6 +5315,10 @@ def runtime_repair_plan(numbers, force=False, reason='', manager=None):
     return {**plan, 'digest': repair_digest(plan)}
 
 def repair_proof(context, proof, force):
+    if context.get('owner_accepted_risk'):
+        if not force or not repair_risk_verify(context, proof):
+            raise ValueError('exact owner risk/checkpoint proof unavailable; no false drain/fence')
+        return
     if not isinstance(proof, dict) or proof.get('context') != context or not isinstance(proof.get('unknowns'), list) \
             or any(not isinstance(text, str) for text in proof['unknowns']) \
             or proof.get('checkpoint_verified') is not True \
@@ -5296,6 +5369,7 @@ def cmd_runtime_repair(args):
         fail('runtime repair --apply requires --yes and exact preview --expected DIGEST')
     force = args.force
     manager = repair_manager(args.manager)
+    accepted_risk = repair_risk_selection(args.tasks, force, args.accept_legacy_risk, args.owner_approval, args.retain_result)
     with coordination() if args.apply else contextlib.nullcontext():
         # Exactly matching stored operation replays without another fence or write.
         if args.apply:
@@ -5308,25 +5382,27 @@ def cmd_runtime_repair(args):
                 if entry:
                     if entry.get('mode') != ('force' if force else 'repair') or entry.get('reason') != (args.reason if force else '') \
                             or manager and entry['context']['manager'] != manager \
+                            or entry['context'].get('owner_accepted_risk') != accepted_risk \
                             or entry.get('snapshot_sha256') != repair_digest(entry.get('snapshot')):
                         fail('conflicting repair replay')
                     adapter = getattr(BOARD, 'repair_adapter', None)
-                    if adapter is None or not callable(getattr(adapter, 'verify', None)) \
-                            or adapter.verify(entry['context'], entry['proof']) is not True:
+                    if not (repair_risk_verify(entry['context'], entry['proof']) if accepted_risk else
+                            adapter is not None and callable(getattr(adapter, 'verify', None))
+                            and adapter.verify(entry['context'], entry['proof']) is True):
                         fail('repair replay native fence verification unavailable; no effects')
                     replay.append(n)
             if replay:
                 if set(replay) != set(args.tasks):
                     fail('partial repair replay; reconcile exact per-task receipts before retry')
                 print(json.dumps({'type': 'taskq.repair', 'repeated': True, 'tasks': replay, 'plan': args.expected})); return
-        plan = runtime_repair_plan(args.tasks, force, args.reason or '', manager)
+        plan = runtime_repair_plan(args.tasks, force, args.reason or '', manager, accepted_risk)
         if not args.apply:
             print(json.dumps(plan, sort_keys=True, ensure_ascii=False)); return
         if plan['digest'] != args.expected:
             fail('repair preview changed; no effects; review a fresh plan')
         if any(task['status'] == 'operator-required' for task in plan['tasks']):
             fail('native fencing/settlement capability unavailable; follow exact preview operator actions')
-        adapter = BOARD.repair_adapter
+        adapter = getattr(BOARD, 'repair_adapter', None)
         # Preflight payload bounds and sources for every task before the first native effect.
         issues = {}
         for task in plan['tasks']:
@@ -5338,17 +5414,20 @@ def cmd_runtime_repair(args):
                       'checkpoint_verified': True,
                       'related_leases': 'released', 'denied_resources': list(REPAIR_RESOURCES),
                       'historical_drain_proven': True, 'new_workspace_isolated': True}
+            if accepted_risk:
+                sizing = repair_risk_proof(context)
             _, _, candidate_body = repair_transition(issue, context, sizing, plan['digest'], origin())
             if len(candidate_body.encode()) + 65536 > 1024 * 1024:
                 fail('repair audit lacks bounded proof capacity; no effects')
             issues[context['task']] = issue
         for task in plan['tasks']:
             context = task['context']; issue = issues[context['task']]
-            proof = effect(adapter.fence, json.loads(json.dumps(context))) if force else adapter.observe(json.loads(json.dumps(context)))
+            proof = repair_risk_proof(context) if accepted_risk else effect(adapter.fence, json.loads(json.dumps(context))) if force else adapter.observe(json.loads(json.dumps(context)))
             if len(json.dumps(proof, ensure_ascii=False).encode()) > 65536:
                 raise RuntimeError('repair proof exceeds preflight bound; retain guard')
             repair_proof(context, proof, force)
-            if adapter.verify(json.loads(json.dumps(context)), json.loads(json.dumps(proof))) is not True:
+            if not (repair_risk_verify(context, proof) if accepted_risk else
+                    adapter.verify(json.loads(json.dumps(context)), json.loads(json.dumps(proof))) is True):
                 raise RuntimeError('native repair proof not authenticated; retain guard')
             fresh = issue_history(read_issue(context['task']))
             raw, labels, body = repair_transition(fresh, context, proof, plan['digest'], origin() or {'runtime': 'owner', 'session': None, 'name': machine()})
@@ -5357,7 +5436,7 @@ def cmd_runtime_repair(args):
                 readback = issue_history(read_issue(context['task']))
                 if repair_source(readback) != repair_source({**fresh, 'labels': labels, 'body': body}):
                     raise RuntimeError('repair write readback unknown/conflicting; retain guard')
-                if adapter.verify(context, proof) is not True:
+                if not (repair_risk_verify(context, proof) if accepted_risk else adapter.verify(context, proof) is True):
                     raise RuntimeError('repair fence changed after write; retain guard')
             effect(write_verified)
         print(json.dumps({'type': 'taskq.repair', 'repeated': False, 'tasks': args.tasks, 'plan': plan['digest'], 'workers_started': 0}))
@@ -5369,7 +5448,7 @@ def cmd_repair(args):
         if args.hold_legacy:
             fail('schema held-legacy conversion and runtime reset must be reviewed separately')
         return cmd_runtime_repair(args)
-    if args.expected or args.manager or args.reason:
+    if args.expected or args.manager or args.reason or args.accept_legacy_risk or args.owner_approval or args.retain_result:
         fail('runtime repair options require --tasks')
     if args.apply and not args.yes:
         fail('repair --apply requires --yes after reviewing taskq repair; no board changes')
@@ -6807,7 +6886,9 @@ def main(argv=None):
     command('repair', cmd_repair, (('--apply',), {'action': 'store_true'}), (('--yes',), {'action': 'store_true'}),
             (('--hold-legacy',), {'action': 'store_true'}), (('--tasks',), {'nargs': '+', 'type': int}),
             (('--force',), {'action': 'store_true'}), (('--reason',), {}), (('--manager',), {}),
-            (('--expected',), {}), (('--json',), {'action': 'store_true'}), n=False)
+            (('--expected',), {}), (('--json',), {'action': 'store_true'}),
+            (('--accept-legacy-risk',), {'action': 'store_true'}), (('--owner-approval',), {}),
+            (('--retain-result',), {}), n=False)
     command('update', cmd_update, (('--commit',), {}), (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
             (('--qualification',), {}), (('--apply',), {'action': 'store_true'}), n=False)
     args = parser.parse_args(argv)

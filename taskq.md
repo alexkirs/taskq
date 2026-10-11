@@ -179,6 +179,73 @@ subscriber wiring are outside this minimal CLI/typed-adapter contract. The cache
 must not be mistaken for their implementation. Existing production schedulers and
 the older PM role route remain unchanged until rollout.
 
+### Owned-model transaction boundaries
+
+Owned-model queue passes discover candidate tasks outside project coordination.
+Each task's settlement or execution step then acquires its own exact grant,
+rechecks the current board schema and authoritative task/manager, and keeps the
+complete reservation, native launch and task record inside that transaction.
+Unrelated task discovery and later transactions do not retain an earlier grant.
+The atomic capacity providers remain admission authority; legacy non-model pass
+accounting retains its original whole-pass exclusion. Unknown effects still
+retain their exact grant and abort the pass. This reduces aggregate lock hold;
+it does not promise FIFO guard acquisition or a fixed latency for an individual
+slow provider request or native launch.
+
+### Legacy model-worker continuation (historical input only)
+
+Superseded for new schema3 sends by board-only semantic control below: existing
+reserved/unknown legacy input is retained for reconciliation, never rewritten. New
+plain comments are not admitted as commands. This paragraph documents old receipts.
+
+Completed model workers retain their exact session when the ordinary supervisor
+`nudge:` path continues unfinished work. A legacy comment is a distinct durable
+model input, bound to the recorded worker session, existing comment cursor index,
+action and text digest. Replaying that same input never launches twice; a later
+comment may start one new turn after terminal settlement and fresh capacity
+reservation. Comment delivery advances its cursor only after acknowledged native
+admission. Pending native answer events take precedence and keep their existing
+application identity and receipt requirements. A comment creates no application
+event or ACK, and cannot resume an accepted result or an unresolved model turn.
+
+A supervisor or same-session worker continuation waiting for model capacity retries its existing reservation through
+the ordinary pass. This is distinct from idle execution: its task turn must still
+be reserving, its exact project grant reserved, and its exact host grant waiting
+or reserved without any launch runtime, child, stop or drain evidence. The same
+task, role, session, immutable request, pending native event or legacy comment inputs and
+original prompt digest must agree. Retry preserves its key, generation, age and
+FIFO tickets; launch remains atomic under project coordination. Launching, bound,
+unknown, changed or missing grants do not become retryable by process absence.
+
+Changed (R4/R8/R12/R13, owner-authorized board-control transition): old prompt
+reconstruction required general predecessor compatibility -> an explicit qualification
+may name reconstruction-only `prompt_sources` in the selected installation pointer.
+These exact `{commit, contract}` pairs never grant old executables admission or completion;
+`release_reason` continues to recognize only `compatible_from`. A strict explicit update
+writes no `compatible_from`. No implicit source is inferred from installed directories.
+At most sixteen distinct source pairs, including compatibility fallback, are considered.
+Explicit reconstruction-only sources are verified before pointer publication and again
+before importing source code: immutable canonical release path, origin, regular exact Git
+blobs, exact contract digest and source ancestry in upstream main and the selected candidate.
+The compatibility fallback is verified on disk at reconstruction; it retains the existing
+automatic-release qualification rules. Malformed, linked, missing, dirty, conflicting or
+unqualified reconstruction sources refuse without changing the pointer or intent.
+
+An initial worker reservation with no worker SID, or a supervisor reservation for its
+exact already-recorded Codex SID, may reconstruct its original prompt after the switch.
+Worker reconstruction calls the qualified predecessor's `brief`; supervisor reconstruction
+uses only retained immutable native ask/answer/result/gone/requeue/integrated-review event
+inputs with the predecessor's `event_line`, followed by `: read your issue`. Close payloads,
+legacy comments, initial supervisors, worker resumes and arbitrary prompt shapes are not
+reconstructed by this slice. The original request's exact prompt SHA256 must agree.
+The shared reservation retry kernel requires the same task/role/SID/input digest/request,
+project reserved and host waiting/reserved, with no launch/child/stop/drain effects.
+Existing idempotent reserve calls may promote that same waiting grant; key, request,
+FIFO age/tickets, generation and SID are never rewritten or cancelled/recreated.
+Unknown, launching, bound and changed receipts remain fail-closed. This authorizes no
+production switch; strict installation and waiting-reservation proof are separate from
+old-executable completion compatibility.
+
 ### Closed-task model settlement
 
 A normal guarded pass reconciles outstanding model-only grants from the local
@@ -281,7 +348,9 @@ For the built-in worker route, verify the project's registered `.worktrees/taskq
 on branch `taskq-N` and inspect its artifact/HEAD, rather than the main checkout.
 An absent built-in worker tree refuses application; it never falls back to main.
 External workspaces retain their configured root; arbitrary workspace overrides are refused.
-Repeating that receipt performs no model turn or artifact write. An exact repeated answer while
+Repeating that receipt in its current bound turn at the same current HEAD performs no model turn or artifact write,
+including after pending-event compaction. A later turn or changed HEAD refuses the old application command;
+the retained receipt stays readable through inbox for audit. An exact repeated answer while
 doing/review emits no new event or delivery. When the same native session holds both
 manager and supervisor roles, `ack --role manager|supervisor` chooses its exact recorded
 recipient; sender `--pm` remains refused. Formal result remains independently
@@ -501,9 +570,57 @@ no extra service or local queue is introduced.
 Changed: execution had no per-task identity restriction → `assignee-only` uses native board Assignees,
 never a duplicate identity field or per-user label (#545 recovered by #576, owner decision 2026-10-09).
 
+### Board-only semantic control — owner decision 2026-10-12
+
+Changed (R1/R2/R4/R5/R8/R12/R13): continuation payloads, plain-comment nudges and
+delivery acknowledgements -> authoritative board controls, pointer-only wakes and
+explicit application/handling acknowledgements.
+
+Questions, answers, steering and results are authoritative native board records.
+For current schema3, continuation wakes contain task/event pointers and protocol only;
+the recipient reads `taskq inbox N --role worker|supervisor|manager` for full pending
+payloads, current control revision and application receipts. Reading never acknowledges. Closed task inboxes remain readable. Ordinary schema3
+answers require the exact recorded manager/supervisor or owner shell; versioned owner
+decisions retain their stricter manager/owner authority.
+Initial briefs may contain the task. Existing unknown/reserving model intents keep their
+original immutable prompt hash and fail closed if an exact retry cannot reconstruct it.
+Schema2 experimental application and historical schema0/1 reading are unchanged.
+
+`taskq steer N --revision HASH --command-id ID --text TEXT` records a worker instruction
+from the exact recorded supervisor, manager, or owner shell, under the project guard.
+It requires an open doing task with a recorded Codex worker and qualified model-turn
+application binding; unsupported worker adapters refuse before recording. The revision
+binds project/task, title/content/state, scope/dependencies, runtime/host, exact roles
+and semantic action IDs; transport,
+nudge, admission and ACK changes alone do not invalidate it. Same ID/request is an
+idempotent replay; conflicts/stale revisions fail without writes. The full request and
+event identity remain in at most 32 `control_commands` receipts; full refuses rather than
+discarding audit. Explicit owner-authorized repair archives those receipts in its existing
+attempt snapshot before clearing the successor command namespace; `inbox --history` includes
+that repair audit. A diagnostic native comment also records the instruction. Comments,
+including old `nudge:` comments, are history only in schema3 and never control authority.
+
+Worker answer/steer delivery does not acknowledge application. Running/unknown workers
+defer; Codex resumes its exact recorded session with immutable board event inputs and
+uses `applied` with scoped committed artifact and exact SHA after applying them. Existing
+answers for other runtimes remain visible in the inbox and explicitly deferred;
+they require a qualified application path before settlement. No implicit delivery ACK.
+Results and acceptance refuse any pending worker answer/steer, including arrivals after
+turn admission. Recheck the native board immediately before TaskQ publication and closure.
+Workers read their inbox before candidate Git push; independent Git rights and manual
+board edits cannot be fenced by this cooperative protocol.
+
+The inbox exposes retained command/application receipts, pending events and latest semantic
+payloads, plus native comment history on `--history`. Native comments may be edited/deleted
+and old payloads may already have been compacted: historical completeness and tamper-proof
+provider retention are not claimed. Versioned answer receipts also retain their full new request and mirror a native diagnostic comment.
+Command receipts retain new steering text even when
+its pending event compacts or its diagnostic comment fails. Application proves exact
+worker/turn/input/artifact attribution, not automatic semantic correctness of that artifact.
+
 ### R2. One task, one supervisor and one worker session
 
-A task has one supervisor session and one worker session at a time; the supervisor is its only controller (R3). Work bigger than one session is several tasks linked by `--deps`, never
+A task has one supervisor session and one worker session at a time; the supervisor is its operational controller (R3), under the recorded manager's and owner's authority, including authorized board steering. Work bigger than one session is several tasks linked by `--deps`, never
 sub-tasks or multi-task workers. The manager finds duplicates and conflicts at intake and proposes amend, merge,
 new, dep or reject per request (§ 7 Take requests); the owner answers per item before any task changes; an active
 claim is never re-bound automatically.
@@ -625,7 +742,7 @@ their failure warns without undoing an acknowledged action or poisoning the proj
 writes, sends, spawns and publication still retain the grant. Operational retry/session records remain in JSON.
 
 A tick is one pass (§ 7), started by a message or by a queue event. A sender runs `taskq tick`; received means one
-pass, not received means nothing. `add`, `answer`, `run`, `result`, `requeue` and `close` start the same pass once after their
+pass, not received means nothing. `add`, `answer`, `steer`, `run`, `result`, `requeue` and `close` start the same pass once after their
 move, in a detached `taskq tick --quiet` child, and return at once: the queue chains itself. Every `codex exec` turn
 the runtime starts (a spawn or a resume, `S<N>` or `T<N>`) also gets one detached `taskq tick --quiet --after <pid> --after-birth <identity>`
 that runs the pass when that turn's process exits: a sandboxed Codex session's own commands start no pass (#502), so
@@ -1448,7 +1565,7 @@ and `acks`. A full pending set refuses the next action before its write; it neve
 Fully acknowledged entries may be compacted, and acknowledging an already compacted ID is a no-op.
 Each recipient is role, runtime and full session ID. Tasks without a manager use a wildcard manager
 recipient and retain their per-manager acknowledgements until adoption resolves the wildcard to its recorded PM, retaining an acknowledgement from that PM. For a closed unowned task, the first explicit manager acknowledgement completes the wildcard delivery without assigning a PM; it removes the pending-event index and does not broadcast old outcomes to future managers. Unowned open tasks can fill the same bound. An explicit worker/supervisor replacement or clear cancels obsolete recipient deliveries; it never forwards an old answer to a replacement worker. Fully cancelled entries compact like acknowledged ones; session retirement records are preserved. `retry_counts` and `session_records` preserve recovery limits and retirement identity when a
-diagnostic history comment fails. `worker_comment_cursor` acknowledges external `nudge:` comments per worker.
+diagnostic history comment fails. `worker_comment_cursor` retains historical external `nudge:` delivery boundaries; schema3 no longer consumes new comments as control.
 Review corrections (owner-approved audit slice): manager identity includes runtime and full session ID;
 an explicit `--pm` sender may observe another runtime but never wakes a different runtime's native bridge.
 Migration imports every pending legacy answer after that worker's acknowledged history boundary. A resumed
@@ -1460,13 +1577,14 @@ available in the issue and in worker/supervisor briefs. This fixed four-action m
 Migration seeds it from trusted history, so current rework instructions and full result text survive comment
 failure and session replacement. Short decision summaries remain display text only.
 
-`wait` prints human event lines with `[event N:ID]`; `wait --json` prints `{events:[{id,text}],tick:bool}`.
+`wait` prints schema3 pointer-only human event lines with `[event N:ID]` (older schema1 historical close lines retain their verdict text); `wait --json` prints `{events:[{id,text}],tick:bool}`.
 Neither consumes versioned events. `taskq ack N:ID [...]` acknowledges the genuine current schema1
 recipient; sender `--pm` delegation is refused. `taskq ack --stdin` reads those human lines from stdin.
 The sender uses the same target for wait and delivery and stops on failed send. Schema2 manager ask/result
 application uses `apply-event --role manager`; delivery-only ack is refused. Supervisor schema1 waits retain
 explicit handling acknowledgement until their own native handler is qualified.
-Successful in-process supervisor/worker sends and verified native Hermes wakes acknowledge their exact batch.
+Schema3 worker sends never acknowledge application; supervisors explicitly acknowledge handling.
+Legacy/schema2 delivery and native application rules remain as specified for those boundaries.
 The reserved non-state label `taskq-events` indexes issues with pending manager deliveries; label and JSON are updated together, including removal after ack. Setup/migration provisions this label explicitly. `wait` may record a newly observed dead session under the project guard, but does not acknowledge it. An optional board `closed()` returns closed issues carrying that index; built-in boards implement it so a manager also discovers
 outcomes closed before its first wait. A custom adapter without it cannot discover never-observed closed tasks.
 
@@ -1542,9 +1660,11 @@ outcomes closed before its first wait. A custom adapter without it cannot discov
 | `taskq requeue N [--text T]` | drop claim, supervisor and result: any state → `ready`. By the recorded supervisor (rework): keeps `supervisor`, the task goes to `doing` and the next worker is ordered as by `run`; refused once 3 workers were spawned since the last `answer` (ask the owner). By the recorded worker of a supervised task (cannot be done): drops only its claim session; the supervisor gets `requeue #N` |
 | `taskq later N [--text T]` | park: any state → `later`; drops claim and supervisor |
 | `taskq close N [M ...] [--text T]` | accept `review` tasks in order: publish check or merge (§ 6), close the issue, stop the worker (on another machine: say so in the comment); a failed one does not stop the rest (#334) |
+| `taskq inbox N [--role worker\|supervisor\|manager] [--history]` | read the native task card, revisions, pending controls and retained receipts as JSON; optional native comments/repair audit; no acknowledgement or writes |
+| `taskq steer N --revision HASH --command-id ID --text TEXT` | record idempotent schema3 worker steering from the exact supervisor, manager or owner; a qualified Codex application path is required; delivery is pointer-only and application is explicit |
 | `taskq status` | print the R6 report only: one board list, no pass, no pull, no write, no dispatch, no session started (#574) |
 | `taskq tick` | one pass of the queue on this machine (§ 7); `--quiet`: the event pass, no table (R4); `--after PID --after-birth ID`: first wait for that identified Codex turn to end (R4) |
-| `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed, for the tasks whose `pm` is this session or that have none (all of them from a plain shell); print `ask #N`, `review #N` (an unsupervised task, R3 Transition), `closed #N <verdict>` (a supervised task, § 7 Supervisor 3.3), `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7); versioned events include `[event N:ID]` and replay until `ack` (§ 3); `--json` prints event IDs and text; `--pm ID`: observe as the task's manager ID (a sender, R4) |
+| `taskq wait [--window MIN] [--every SEC]` | block until the manager is needed, for the tasks whose `pm` is this session or that have none (all of them from a plain shell); print `ask #N`, `review #N` (an unsupervised task, R3 Transition), `closed #N` (read its board inbox for the supervised verdict, § 7 Supervisor 3.3), `gone #N` (one line each) or `tick` after the window (default 10 min); poll the board every 25 s (§ 7); versioned events include `[event N:ID]` and replay until `ack` (§ 3); `--json` prints event IDs and text; `--pm ID`: observe as the task's manager ID (a sender, R4) |
 | `taskq wait --task N [--window MIN] [--every SEC]` | the supervisor's wait: block until its task needs it; print `review #N`, `ask #N`, `answer #N`, `gone #N` (its worker), `requeue #N` (by its worker), one line each, replayed until `ack` for versioned tasks (§ 3); `stop #N` when the task is closed or the calling session is not its supervisor; `tick` after the window |
 | `taskq pm [--adopt N ..]` | print the manager role (Principles, § 7, how to tick this session) under a first line `taskq pm contract <hash>`; record the hash of the clone's `taskq.md` in `.taskq/pm.json` (§ 7), nothing else: a task's manager is its `pm` (R3, #532); refused for a session an open task records as its supervisor or worker, so neither passes the gate as the manager (R3). `--adopt N`: record this session as the `pm` of open tasks that have none, under the project guard with a fresh read; a task with a `pm`, or a busy lock, refuses all of them (R3 Transition) |
 | `taskq cleanup [--dry-run]` | the owner's manual sweep of this machine (below); `--dry-run` prints the same and changes nothing |
@@ -1558,7 +1678,7 @@ outcomes closed before its first wait. A custom adapter without it cannot discov
   and return without dispatch, admission, ARM or runtime launch. Dependencies remain recorded but are not evaluated
   for parked intake. Unknown creation responses retain the normal guard and must be reconciled before another
   creation attempt; a pending owner request must not be resubmitted as a new task after an ambiguous outcome.
-- `add` without `--later`, `answer`, `run`, `result`, `requeue` and `close` then start one tick pass without the table in a detached child
+- `add` without `--later`, `answer`, `steer`, `run`, `result`, `requeue` and `close` then start one tick pass without the table in a detached child
   (R4) and return at once. The event's line (`<time> <command> #<N>`), the pass's output and a failure
   (`taskq: dispatch stopped: <error>`) go to `.taskq/dispatch.log` and never fail the command. The child reads the
   event's tasks by number: the board's list may not show a write made a second earlier.
@@ -1820,7 +1940,7 @@ it preserves rejected work and identity, and does not permit accepted-result res
    it only carries the manager's short outcomes to a manager that cannot wake itself.
 3. `taskq wait` lists the board every 25 s and returns at once with one line per new event of this manager's tasks: `ask #N`,
    `review #N` (an unsupervised task only; a supervised one's review is its supervisor's, #524),
-   `closed #N <verdict>` (a supervised task: the first line of its close text, the supervisor's verdict, § Supervisor 3.3), `gone #N` (an unsupervised worker, or a supervisor
+   `closed #N` (a supervised task: read its board inbox for the verdict, § Supervisor 3.3), `gone #N` (an unsupervised worker, or a supervisor
    found dead by step 4, claimed on this machine), or `tick` when nothing happened for 10 min. `.taskq/wait-<session>.json`
    is a legacy receipt only. Versioned tasks use their board event IDs: wait is observation, then delivery/handling, then explicit ack (§ 3).
 4. The manager treats any message from the sender as a tick: one pass (`taskq tick`), then § After each pass. A
@@ -1845,7 +1965,7 @@ contract or permission to change the behavior below; implementation follows an a
 2. `doing`, claimed on this machine, no `supervisor` (R3 Transition: started before #525 or taken by hand, § 5): `alive` False → requeue (`session ... is gone`); the second such requeue since
    the last `result` or `answer` → `ask` instead, with the last log line (`tail`; Codex: `.taskq/T<N>.log`, Claude:
    `claude logs`), and no new spawn (#393). Confirmed idle and the issue unchanged
-   for 120 minutes → `send(session, 'continue: read your issue')`, comment `nudge`. Confirmed idle with pending answer events or a supervisor's `nudge:` comment → deliver their payloads even through intervening ordinary comments, then acknowledge those exact events/recipient. Running or unknown workers defer delivery; observation does not lose pending work. The human `nudge` log is diagnostic.
+   for 120 minutes → `send(session, 'continue: read your issue')`, comment `nudge`. Confirmed idle with pending answer/steer events → pointer-only wake to read the board inbox; explicit application receipts settle those events. Plain `nudge:` comments are history only in schema3. Running or unknown workers defer delivery; observation does not lose pending work. The human `nudge` log is diagnostic.
 3. `ready`, deps closed, host matches, a free slot for its worker's runtime (`run-*` label, else the first free in
    `limits`), its `pm` on this machine (R3, #532; no `pm`: the task waits, the report says `blocked (no manager)`; another
    machine's: that machine starts it), re-read from the board →
@@ -1873,7 +1993,7 @@ contract or permission to change the behavior below; implementation follows an a
        `failed` with no pid.
    - an event for the supervisor (`review`, `ask` by the worker, `answer`, worker `gone`, a worker's `requeue`):
      idle → `send(supervisor, '<event> #N ...: read your issue')` with every event since it last got them
-     with exact board event IDs; acknowledge only after successful send. Legacy tasks use their existing `.taskq/S<N>.seen` boundary until migration. Codex
+     with exact board event IDs and no event payload; the supervisor explicitly acknowledges handling. Legacy tasks use their existing `.taskq/S<N>.seen` boundary until migration. Codex
      `exec resume` keeps the thread id; a Claude resume makes a new id (#284): the pass records it as `supervisor`
      with comment `nudge` `supervisor <new> replaces <old>`, so the old id is refused (§ 4) and retired once stopped.
      Running → nothing: it gets them from its own `taskq wait --task N` (Claude) or at its turn's end (Codex, R4).
@@ -1884,8 +2004,7 @@ contract or permission to change the behavior below; implementation follows an a
      `S<N>`, replace `supervisor`, comment `spawn`, retire the old id (R11); the worker keeps running and the new
      supervisor adopts it from the board. The second death → `ask` with `tail`, no resume, no respawn (#393).
    - a recorded worker `alive` False → comment `worker <id> is gone`, empty the claim's session (the slot stays) and
-     wake the supervisor as above; the supervisor decides (rework `requeue` or `ask`). A supervisor's plain comment
-     pending `nudge: <text>`, pending answer events, or 120 silent minutes → send only when confirmed idle, then acknowledge the exact events/recipient as in step 2. Running or unknown sessions defer.
+     wake the supervisor as above; the supervisor decides (rework `requeue` or `ask`). Pending worker answer/steer events or 120 silent minutes → pointer-only wake when confirmed idle; explicit application receipts acknowledge worker controls. Schema3 `nudge:` comments are history only. Running or unknown sessions defer.
    - closed, parked or requeued by the manager, or a replaced session: retire the recorded `S<N>` and `T<N>` once
      stopped (R11; the pass, for every task it lists or reads).
    `later`, an `ask` of the supervisor: nothing; they wait for the owner.
@@ -1894,7 +2013,7 @@ contract or permission to change the behavior below; implementation follows an a
    can link it. In Questions an image link prints as `![N](url)` (`inline_media`, § 2); a video or page stays a link.
    `taskq status` prints the same report with no pass (§ 4).
 
-The event pass of R4 is steps 1–4 run by `taskq tick --quiet`, the detached child of `add`, `answer`, `run`,
+The event pass of R4 is steps 1–4 run by `taskq tick --quiet`, the detached child of `add`, `answer`, `steer`, `run`,
 `result`, `requeue` or `close`, no table. A worker's `result` wakes its supervisor (an unsupervised one's waits for
 the manager's review); a `close` frees the slot for the next task on that machine. Run from `.worktrees/taskq-<N>`, taskq takes the checkout above it as the
 project root. Inside a Codex sandbox no pass runs (#502): a sandboxed supervisor's `run`, `requeue` or `close` takes
@@ -1930,9 +2049,9 @@ the task's code, never starts a session itself (step 4 does it) and never decide
    5. A result with options (a choice for the owner): `taskq ask N` with those options; the owner decides.
 4. Woken by `gone`, a worker's `requeue` or `ask`: read why; `requeue` with what to do, or `ask` the owner (a product
    choice, a second death). An `answer`: act on it, or let step 4 pass it to the worker.
-5. Silent worker (120 min, issue unchanged): a plain comment `nudge: <text>`; step 4 sends the text to it.
+5. Steering: read `taskq inbox N --role supervisor`, then `taskq steer N --revision HASH --command-id ID --text TEXT`; step 4 wakes the worker to read its board inbox.
 
-The manager never sees a supervised task's retries: `wait` prints only its `ask` and `closed #N <verdict>`.
+The manager never sees a supervised task's retries: `wait` prints only its `ask` and `closed #N` pointers.
 
 A failure (a spawn that cannot start or is not named, R3; a board error) stops the pass with `taskq: <error>` and exit 1, no table;
 the tasks it did not reach wait for the next pass. Fix the cause or tell the owner.
@@ -1967,7 +2086,7 @@ the block is the report's Questions (#574).
 
 - `ask`: a card with no options: read the question (the last `ask` comment), relay it verbatim. Record the owner's
   reply: `taskq answer N --text "<verbatim answer>"`. The task goes back to `doing`; the supervisor gets it (step 4).
-- `closed #N <verdict>`: relay the supervisor's verdict as is. Never open the diff to check it; the owner may ask.
+- `closed #N`: read `taskq inbox N --role manager` and relay the supervisor's recorded verdict as is. Never open the diff to check it; the owner may ask.
 - Unsupervised review: `review` of a task with no `supervisor` (R3 Transition: started before #525). The
   manager checks it as a supervisor does (§ Supervisor step 3.1–3.2: the diff against Acceptance and `taskq.md`, CI
   green on the exact head SHA), then `taskq close N --text "<what was checked, what was not>"` or
@@ -2107,7 +2226,8 @@ not provider authentication or successful turn completion; RPC failures stop adm
 The existing Hermes admission guard validates this concrete file's lifecycle interface. Handles contain no board
 state, authority, queue or receipts. `wake_manager` submits only to an idle manager already owned by this bridge;
 it cannot attach to a manager owned by another gateway. `taskq wait` invokes it only for the current manager,
-and acknowledges the board event IDs only after verified model completion. Timeout/error/unknown/busy stops visibly
+and retains schema3 board event IDs until the manager explicitly acknowledges handling.
+Legacy verified model completion keeps its prior acknowledgement rule. Timeout/error/unknown/busy stops visibly
 without updating that receipt. Owner identity uses Linux process birth stamps and pidfds, not PID liveness alone;
 SIGTERM/failed setup shuts down the gateway process group and waits for exit, with evidence retained.
 Interactive server requests are refused, never approved.

@@ -963,9 +963,6 @@ class Commands(Base):
         self.add()
         self.run_cli('take', '1')
         self.assertEqual(self.task(1)['claim'], {'runtime': 'claude', 'session': SESSION, 'name': 'mac'})
-        self.run_cli('ask', '1', '--text', 'which?')
-        self.assertEqual(self.task(1)['state'], 'ask')
-        self.run_cli('answer', '1', '--text', 'this')
         self.run_cli('result', '1', '--sha', 'a' * 40, '--checks', 'ok', '--text', 'done')
         self.assertEqual((self.task(1)['state'], self.task(1)['result']), ('review', {'sha': 'a' * 40, 'checks': 'ok'}))
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
@@ -975,8 +972,19 @@ class Commands(Base):
         self.assertEqual(issue['state'], 'closed')
         self.assertFalse([label for label in issue['labels'] if label.startswith('q-')])
         self.assertEqual([text.split('\n')[0] for text in issue['comments']], [
-            f'**{action}** · claude:01234567' for action in ('add', 'take', 'ask', 'answer', 'result', 'close')])
-        self.assertEqual(issue['comments'][2], '**ask** · claude:01234567\n\nwhich?')
+            f'**{action}** · claude:01234567' for action in ('add', 'take', 'result', 'close')])
+        # A distinct manual worker has no qualified application adapter: answering cannot complete its cycle.
+        self.add('question')
+        self.run_cli('take', '2')
+        self.run_cli('ask', '2', '--text', 'which?')
+        self.assertEqual(self.task(2)['state'], 'ask')
+        self.run_cli('answer', '2', '--text', 'this')
+        before = json.dumps(self.board.issues[2], sort_keys=True)
+        with self.assertRaisesRegex(SystemExit, 'unapplied worker control events: 2:'):
+            self.run_cli('result', '2', '--sha', 'b' * 40, '--checks', 'ok', '--text', 'done')
+        self.assertEqual(json.dumps(self.board.issues[2], sort_keys=True), before)
+        self.assertTrue(taskq.pending_worker_controls(self.task(2)['raw']))
+        self.assertIn('**ask** · claude:01234567\n\nwhich?', self.board.issues[2]['comments'])
 
     def test_close_failure_keeps_the_label(self):
         self.add()
@@ -1686,7 +1694,7 @@ class HermesAdmission(Base):
         self.native.sessions['s-S1'] = 'idle'
         with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': 'codex', 'CODEX_THREAD_ID': 's-T1'}):
             self.run_cli('result', '1', '--sha', 'a' * 40)
-        self.assertIn('review #1', self.native.sent[-1][1])
+        self.assertEqual(self.native.sent[-1][1], taskq.continuation_pointer(1, [self.task(1)['raw']['events'][-1]], 'supervisor'))
         self.assertFalse(self.worker.sent)
 
     def test_bridge_failure_preserves_board_and_order(self):
@@ -1773,9 +1781,13 @@ def retire(gone, running=True): pass
         self.native.wake_manager = mock.Mock(return_value=SESSION)
         with self.native_env():
             self.board.release(self.board.guard)  # fixture confirms failed wake is quiescent before exact-token recovery
-            self.assertEqual(self.wait_and_ack( '--window', '0'), 'ask #1\n')
-            self.assertEqual(self.wait_and_ack( '--window', '0'), 'tick\n')
-        self.native.wake_manager.assert_called_once_with(SESSION, 'ask #1 [event 1:3]')
+            self.assertEqual(self.run_cli('wait', '--window', '0'), 'ask #1 [event 1:3]\n')
+            target = taskq.recipient('manager', self.task(1)['pm'])
+            self.assertEqual([event['id'] for event in taskq.event_pending(self.task(1)['raw'], target)], [3])
+            self.run_cli('ack', '--role', 'manager', '1:3')  # the native manager explicitly handled its inbox
+            self.assertFalse(taskq.event_pending(self.task(1)['raw'], target))
+            self.assertEqual(self.run_cli('wait', '--window', '0'), 'tick\n')
+        self.native.wake_manager.assert_called_once_with(SESSION, taskq.continuation_pointer(1, [{'id': 3}], 'manager'))
         self.assertEqual(receipt.read_bytes(), before)  # legacy file is no longer receipt authority
 
     def test_wait_busy_unknown_and_foreign_manager_never_consume_for_wake(self):
@@ -1945,6 +1957,7 @@ class RecoveryTimeout(TickSetup):
         claim = item['claim']
         with mock.patch.object(taskq, 'dispatch'):
             self.run_cli('ask', '1', '--text', 'question')
+        with mock.patch.object(taskq, 'session', return_value=None):
             self.run_cli('answer', '1', '--text', 'preserved answer')
         target = taskq.recipient('worker', claim)
         self.fake.sessions[claim['session']] = None
@@ -1957,8 +1970,8 @@ class RecoveryTimeout(TickSetup):
         with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
             taskq.follow(self.task(1), self.fake, claim, False)
             taskq.follow(self.task(1), self.fake, claim, False)
-        self.assertEqual(self.fake.sent, [(claim['session'], 'The owner answered your question:\n\npreserved answer')])
-        self.assertEqual(taskq.event_pending(self.task(1)['raw'], target), [])
+        self.assertEqual(self.fake.sent, [])
+        self.assertTrue(taskq.event_pending(self.task(1)['raw'], target))
         self.assertEqual(self.task(1)['claim'], claim)
 
     def test_identity_changed_no_question_or_takeover(self):
@@ -2266,7 +2279,9 @@ class Tick(TickSetup):
         self.run_cli('tick')
         self.assertEqual((self.task(1)['state'], self.task(1)['claim']['session'], self.task(2)['state']), ('doing', None, 'ready'))
         self.assertIn('worker s-T1 is gone', self.board.issues[1]['comments'][-1])
-        self.assertEqual(self.fake.sent, [('s-S1', 'gone #1 [event 1:5]: read your issue')])  # woken once
+        self.assertEqual(self.fake.sent, [('s-S1', taskq.continuation_pointer(1, [self.task(1)['raw']['events'][-1]], 'supervisor'))])  # woken once
+        with self.acting('s-S1'):
+            self.wait_and_ack('--task', '1', '--window', '0')
         self.run_cli('tick')
         self.assertEqual((len(self.fake.sent), self.fake.names), (1, ['S1 UNK one (mac)', 'T1 UNK one (mac)']))
 
@@ -2400,7 +2415,8 @@ class Tick(TickSetup):
         self.assertEqual(self.task(1)['state'], 'ask')
         self.assertIn('Waiting for answer 1', out)
         self.assertIn('Last log line: error: unsupported model', self.board.issues[1]['comments'][-1])
-        self.run_cli('answer', '1', '--text', 'fixed')  # an answer resets the count: the next death requeues
+        with mock.patch.object(taskq, 'session', return_value=None):
+            self.run_cli('answer', '1', '--text', 'fixed')  # owner shell resets the count: the next death requeues
         self.run_cli('tick')
         self.assertEqual(self.task(1)['state'], 'ready')
         self.assertIn('| [#1 T](https://board/1) | blocked (no manager) | any |  |', self.run_cli('tick'))
@@ -2449,7 +2465,7 @@ class Tick(TickSetup):
         self.fake.sessions['s-T1'] = 'idle'
         self.board.issues[1]['updated_at'] = '2026-01-01T00:00:00Z'
         self.run_cli('tick')
-        self.assertEqual(self.fake.sent, [('s-T1', 'continue: read your issue')])
+        self.assertEqual(self.fake.sent, [('s-T1', taskq.continuation_pointer(1, [], 'worker'))])
         self.assertEqual(self.board.issues[1]['comments'][-1], '**nudge** · claude:01234567\n\nworker s-T1')
         self.fake.sessions['s-T1'] = None  # cannot tell: left alone
         self.run_cli('tick')
@@ -2462,10 +2478,12 @@ class Tick(TickSetup):
         self.board.issues[1]['updated_at'] = taskq.datetime.now(taskq.timezone.utc).isoformat()
         self.run_cli('ask', '1', '--text', 'which?')
         self.fake.sessions[self.task(1)['claim']['session']] = 'idle'
-        self.run_cli('answer', '1', '--text', 'the first')
+        with mock.patch.object(taskq, 'session', return_value=None):
+            self.run_cli('answer', '1', '--text', 'the first')
         self.run_cli('tick')
         self.run_cli('tick')
-        self.assertEqual(self.fake.sent, [('s-T1', 'The owner answered your question:\n\nthe first')])
+        self.assertEqual(self.fake.sent, [])
+        self.assertTrue(taskq.event_pending(self.task(1)['raw'], taskq.recipient('worker', self.task(1)['claim'])))
         self.assertEqual(self.task(1)['state'], 'doing')
 
     def test_decisions_block_and_answer_by_codes(self):
@@ -2485,16 +2503,19 @@ class Tick(TickSetup):
             '| [#2 two](https://board/2) review | Done X | 2.1 close as is ★ · 2.2 also do Y |'])
         taskq.CONFIG['inline_media'] = False
         self.assertIn(' · https://x/shot.png · ', self.run_cli('tick'))
-        for bad, message in (('1.3', 'no option 3'), ('3.1', 'no option 1'), ('1.x', 'codes like'), ('9', 'codes like')):
-            with self.assertRaisesRegex(SystemExit, message):
-                self.run_cli('answer', '1.2', bad)
+        with mock.patch.object(taskq, 'session', return_value=None):
+            for bad, message in (('1.3', 'no option 3'), ('3.1', 'no option 1'), ('1.x', 'codes like'), ('9', 'codes like')):
+                with self.assertRaisesRegex(SystemExit, message):
+                    self.run_cli('answer', '1.2', bad)
         self.assertEqual(self.task(1)['state'], 'ask')  # a bad code moves nothing
         self.fake.sessions['s-T1'] = 'idle'
-        with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')):
+        with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')), \
+                mock.patch.object(taskq, 'session', return_value=None):
             self.run_cli('answer', '1.2, 2.1')
         self.assertEqual((self.task(1)['state'], self.task(1)['raw']['decision'], self.board.issues[2]['state']), ('doing', None, 'closed'))
-        self.assertEqual(self.board.issues[2]['comments'][-1], '**close** · claude:01234567\n\n2.1: close as is')
-        self.assertEqual(self.fake.sent[-1], ('s-T1', 'The owner answered your question:\n\n1.2: keep B'))
+        self.assertEqual(self.board.issues[2]['comments'][-1], '**close** · owner\n\n2.1: close as is')
+        self.assertEqual(self.fake.sent, [])
+        self.assertTrue(taskq.pending_worker_controls(self.task(1)['raw']))
         self.assertNotIn('Questions', self.run_cli('tick'))
         with self.assertRaisesRegex(SystemExit, 'pick 1 to 1'):
             self.run_cli('ask', '1', '--text', 'q', '--option', 'a', '--recommend', '2')
@@ -2817,16 +2838,30 @@ class Tick(TickSetup):
             self.run_cli('run', '1')
             self.run_cli('ask', '1', '--text', 'which?')  # ask is no event: the slot stays held
         self.fake.sessions[self.task(1)['claim']['session']] = 'idle'
-        self.run_cli('answer', '1', '--text', 'this')  # the live worker gets the answer, the slot stays full
+        with mock.patch.object(taskq, 'session', return_value=None):
+            self.run_cli('answer', '1', '--text', 'this')  # owner shell records the live worker control
         self.assertEqual(spawns(), ['S1', 'T1', 'T1', 'S1', 'T1'])
-        self.assertEqual(self.fake.sent, [('s-T1.2', 'The owner answered your question:\n\nthis')])
-        with self.acting('s-T1.2'):
+        self.assertEqual(self.fake.sent, [])
+        self.assertTrue(taskq.event_pending(self.task(1)['raw'], taskq.recipient('worker', self.task(1)['claim'])))
+        old_target = taskq.recipient('worker', self.task(1)['claim'])
+        answer = self.task(1)['raw']['action_payloads']['answer']
+        with self.acting('s-T1.2'), self.assertRaisesRegex(SystemExit, 'unapplied worker control events: 1:'):
             self.run_cli('result', '1', '--sha', 'b' * 40)
-        with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), self.acting('s-S1.1'):
+        # Explicit manager requeue uses the existing non-model replacement policy; it is not application.
+        self.run_cli('requeue', '1', '--text', 'replace the unqualified fake worker')
+        self.assertFalse(taskq.event_pending(self.task(1)['raw'], old_target))
+        self.assertEqual(self.task(1)['raw']['action_payloads']['answer'], answer)
+        self.assertFalse(self.task(1)['raw'].get('application_receipts'))
+        with self.acting('s-S1.2'):
+            self.run_cli('run', '1')
+        self.assertEqual(self.task(1)['claim']['session'], 's-T1.3')
+        with self.acting('s-T1.3'):
+            self.run_cli('result', '1', '--sha', 'b' * 40)
+        with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), self.acting('s-S1.2'):
             self.run_cli('close', '1', '--text', 'checked; works; open: none')  # frees the slot: #2 starts in the same pass
-        self.assertEqual(spawns(), ['S1', 'T1', 'T1', 'S1', 'T1', 'S2'])
+        self.assertEqual(spawns(), ['S1', 'T1', 'T1', 'S1', 'T1', 'S1', 'T1', 'S2'])
         self.run_cli('tick')  # the safety net finds nothing left to do
-        self.assertEqual(spawns(), ['S1', 'T1', 'T1', 'S1', 'T1', 'S2'])
+        self.assertEqual(spawns(), ['S1', 'T1', 'T1', 'S1', 'T1', 'S1', 'T1', 'S2'])
 
     def test_event_during_a_pass_is_not_lost(self):
         self.add()
@@ -3151,7 +3186,9 @@ class Tick(TickSetup):
         self.fake.sessions['s-S1'] = 'idle'
         self.run_cli('tick')
         self.run_cli('tick')
-        self.assertEqual(self.fake.sent, [('s-S1', 'requeue #1 [event 1:5]: read your issue')])
+        self.assertEqual(self.fake.sent, [('s-S1', taskq.continuation_pointer(1, [{'id': 5}], 'supervisor'))] * 2)
+        with self.acting('s-S1'):
+            self.wait_and_ack('--task', '1', '--window', '0')
         with self.acting('s-S1'):
             self.run_cli('requeue', '1', '--text', 'try B')  # its own requeue: no event for it
             self.run_cli('requeue', '1', '--text', 'try C')
@@ -3159,12 +3196,13 @@ class Tick(TickSetup):
                 self.run_cli('requeue', '1', '--text', 'try D')
             self.run_cli('ask', '1', '--text', 'B and C fail: which?')
         self.assertEqual(([name.split()[0] for name in self.fake.names], self.task(1)['state']), (['S1', 'T1', 'T1', 'T1'], 'ask'))
-        self.run_cli('answer', '1', '--text', 'try D')  # an answer resets the bound
+        with mock.patch.object(taskq, 'session', return_value=None):
+            self.run_cli('answer', '1', '--text', 'try D')  # owner shell resets the bound
         with self.acting('s-S1'):
             self.run_cli('requeue', '1', '--text', 'try D')
         self.assertEqual(len(self.fake.names), 5)
-        self.assertIn(('s-S1', 'answer #1 [event 1:11]: read your issue'), self.fake.sent)
-        self.assertEqual([text for _, text in self.fake.sent].count('requeue #1 [event 1:5]: read your issue'), 1)  # its own requeues woke nothing
+        self.assertIn(('s-S1', taskq.continuation_pointer(1, [{'id': 11}], 'supervisor')), self.fake.sent)
+        self.assertEqual([text for _, text in self.fake.sent].count(taskq.continuation_pointer(1, [{'id': 5}], 'supervisor')), 2)  # replay continues until explicit acknowledgement
 
     def test_replacement_retires_the_recorded_old_session_first(self):
         # #568: a rework's T<N> and a respawned S<N> retire their predecessor by board-recorded id before they spawn
@@ -3275,8 +3313,9 @@ class Tick(TickSetup):
         self.assertEqual(self.task(1)['state'], 'ask')
         self.assertIn('supervisor s-S1.1 is gone again', self.board.issues[1]['comments'][-1])
         self.fake.resumable = lambda session: True  # Codex: exec resume keeps the thread
-        self.run_cli('answer', '1', '--text', 'fixed')  # resets the bound; its pass recovers the supervisor
-        self.assertEqual((self.task(1)['supervisor']['session'], self.fake.sent[-1]), ('s-S1.1', ('s-S1.1', 'restart #1: your last turn ended error: rate limit; read your issue')))
+        with mock.patch.object(taskq, 'session', return_value=None):
+            self.run_cli('answer', '1', '--text', 'fixed')  # owner shell resets the bound; its pass recovers the supervisor
+        self.assertEqual((self.task(1)['supervisor']['session'], self.fake.sent[-1]), ('s-S1.1', ('s-S1.1', taskq.continuation_pointer(1, [], 'supervisor'))))
 
     def test_self_waking_supervisor_is_never_sent_to(self):
         # #525 owner clarification: the queue wakes the supervisor, no sender. A Claude one with its process reads its own
@@ -3301,7 +3340,7 @@ class Tick(TickSetup):
         self.fake.sessions['s-S1'] = 'idle'  # its turn ended, the process is gone
         self.fake.send = lambda session, text: self.fake.sent.append((session, text)) or 's-S1r'
         self.run_cli('tick')
-        self.assertEqual(self.fake.sent, [('s-S1', 'review #1 [event 1:8]: read your issue')])
+        self.assertEqual(self.fake.sent, [('s-S1', taskq.continuation_pointer(1, [{'id': 8}], 'supervisor'))])
         self.assertEqual((self.task(1)['supervisor']['session'], self.board.issues[1]['comments'][-1]),
                          ('s-S1r', '**nudge** · claude:01234567\n\nsupervisor s-S1r replaces s-S1'))
         with self.acting('s-S1'), self.assertRaisesRegex(SystemExit, 'only it, the task.s manager or the owner'):
@@ -3345,7 +3384,9 @@ class Tick(TickSetup):
         self.fake.sessions['s-S1'] = 'idle'
         with mock.patch.object(taskq, 'process_identity', side_effect=[('running', BIRTH), ('dead', None)]), mock.patch.object(taskq.time, 'sleep') as slept:
             self.run_cli('tick', '--quiet', '--after', '4242', '--after-birth', BIRTH)
-        self.assertEqual((slept.call_count, self.fake.sent), (1, [('s-S1', 'review #1 [event 1:5]: read your issue')]))
+        self.assertEqual((slept.call_count, self.fake.sent), (1, [('s-S1', taskq.continuation_pointer(1, [self.task(1)['raw']['events'][-1]], 'supervisor'))]))
+        with self.acting('s-S1'):
+            self.wait_and_ack('--task', '1', '--window', '0')
         self.run_cli('tick')
         self.assertEqual(len(self.fake.sent), 1)  # once
 
@@ -3834,7 +3875,7 @@ class Wait(TickSetup):
         self.assertEqual(self.wait_and_ack(), 'tick\n')  # a supervised review is the supervisor's
         with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), self.acting('s-S1'):
             self.run_cli('close', '1', '--text', 'one shipped; users get one; open: none\n\nmore')
-        self.assertEqual(self.wait_and_ack(), 'closed #1 one shipped; users get one; open: none\n')
+        self.assertEqual(self.wait_and_ack(), 'closed #1\n')
         self.assertEqual(self.wait_and_ack(), 'tick\n')  # never sent twice
         self.assertEqual(self.fake.names[-1], 'S2 UNK two (mac)')  # the close freed the slot
         self.assertEqual((self.fake.stopped, self.fake.sessions['s-S1']), (['s-T1'], True))  # close never stops the session that runs it
@@ -3893,8 +3934,8 @@ class EventDelivery(Base):
         with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
             taskq.follow(self.task(1), fake, claim, False)
             taskq.follow(self.task(1), fake, claim, False)
-        self.assertEqual(fake.sent, [('worker-one', 'The owner answered your question:\n\nfirst\n\nsecond')])
-        self.assertEqual(taskq.event_pending(self.task(1)['raw'], taskq.recipient('worker', claim)), [])
+        self.assertEqual(fake.sent, [])
+        self.assertEqual([event['text'] for event in taskq.event_pending(self.task(1)['raw'], taskq.recipient('worker', claim))], ['first', 'second'])
         self.assertEqual(len(taskq.event_pending(self.task(1)['raw'], taskq.recipient('manager', self.task(1)['pm']))), 2)
 
     def test_comment_failure_preserves_action_dispatch_and_grant(self):
@@ -3957,7 +3998,7 @@ class EventDelivery(Base):
             taskq.move(self.task(1), None, 'close', 'accepted; open: none')
         self.board.close(1)
         event = json.loads(self.run_cli('wait', '--window', '0', '--json'))['events'][0]
-        self.assertIn('closed #1 accepted; open: none', event['text'])
+        self.assertEqual(event['text'], 'closed #1 [event 1:3]')
         with mock.patch.dict(os.environ, CLAUDE_CODE_SESSION_ID='another-agent'):
             self.assertEqual(self.run_cli('wait', '--window', '0'), 'tick\n')
             with self.assertRaisesRegex(SystemExit, 'recorded recipient'):
@@ -3997,7 +4038,8 @@ class EventDelivery(Base):
             taskq.follow(self.task(1), fake, claim, True)
             taskq.follow(self.task(1), fake, claim, True)
             taskq.follow(self.task(1), fake, claim, True)
-        self.assertEqual([text for _, text in fake.sent], [text for text in ('The owner answered your question:\n\nanswer', 'also inspect the output')])
+        self.assertEqual(fake.sent, [])
+        self.assertEqual([event['text'] for event in taskq.event_pending(self.task(1)['raw'], taskq.recipient('worker', claim))], ['answer'])
 
     def test_busy_worker_never_fetches_history_or_consumes_event(self):
         fake, claim = self.worker()
@@ -4054,7 +4096,8 @@ class EventDelivery(Base):
         with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
             taskq.follow(self.task(1), fake, claim, False)
             taskq.follow(self.task(1), fake, claim, False)
-        self.assertEqual(fake.sent, [('worker-one', 'The owner answered your question:\n\nfirst pending\n\nsecond pending')])
+        self.assertEqual(fake.sent, [])
+        self.assertEqual([event['text'] for event in taskq.event_pending(self.task(1)['raw'], taskq.recipient('worker', claim))], ['first pending', 'second pending'])
 
     def test_resumed_worker_keeps_acknowledged_manual_nudge_cursor(self):
         fake, claim = self.worker()
@@ -4066,8 +4109,8 @@ class EventDelivery(Base):
         with taskq.coordination(), contextlib.redirect_stdout(io.StringIO()):
             resumed = taskq.follow(self.task(1), fake, claim, True)
             taskq.follow(self.task(1), fake, resumed, True)
-        fake.send.assert_called_once_with('worker-one', 'The owner answered your question:\n\nnew answer')
-        self.assertEqual(self.task(1)['raw']['worker_comment_cursor']['worker-two'], raw['worker_comment_cursor']['worker-one'])
+        fake.send.assert_not_called()
+        self.assertEqual(self.task(1)['raw']['worker_comment_cursor'], raw['worker_comment_cursor'])
 
     def test_wait_does_not_report_review_worker_as_gone_or_overwrite_fresh_state(self):
         fake, claim = self.worker(); fake.sessions[claim['session']] = False
@@ -4192,7 +4235,7 @@ class MultiPM(Base):
         with self.acting('s-T3'):
             self.run_cli('result', '3', '--sha', 'b' * 40)
         with self.pm(self.A):
-            self.assertEqual(self.wait_and_ack(), 'review #3\nclosed #1 checked; works; open: none\n')
+            self.assertEqual(self.wait_and_ack(), 'review #3\nclosed #1\n')
         with self.pm(self.B):
             self.assertEqual(self.wait_and_ack(), 'ask #2\nreview #3\n')
         for env in (self.A, self.B):
@@ -4680,6 +4723,56 @@ class Contract(Base):
             self.assertIn('contract changed', errors.getvalue())
             self.run_cli('pm')
         self.assertEqual((self.root / 'taskq.md').read_text(), 'new contract')
+
+    def test_explicit_prompt_sources_verify_exact_releases_without_stale_completion_authority(self):
+        origin, writer, install = self.root / 'origin.git', self.root / 'writer', self.root / 'install'
+        with mock.patch.object(taskq.subprocess, 'run', REAL_RUN), mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
+            REAL_RUN(['git', 'init', '-q', '--bare', str(origin)], check=True)
+            REAL_RUN(['git', 'clone', '-q', str(origin), str(writer)], check=True, capture_output=True)
+            self.git(writer, 'checkout', '-qb', 'main')
+            (writer / 'taskq.py').write_text('print("fixture source")\n')
+            (writer / 'taskq.md').write_text('first contract\n')
+            self.git(writer, 'add', '.')
+            self.git(writer, 'commit', '-qm', 'first')
+            self.git(writer, 'push', '-qu', 'origin', 'main')
+            first = taskq.update_git(writer, 'rev-parse', 'HEAD')
+            proof = self.root / 'source-proof.json'
+            proof.write_text(json.dumps(dict(commit=first, upstream=str(origin), tests='passed', review='accepted')))
+            with mock.patch.object(taskq, 'CLONE', writer), mock.patch.object(taskq, 'qualified_checks'):
+                self.run_cli('update', '--install-dir', str(install), '--commit', first, '--apply', '--qualification', str(proof))
+            old = install / 'releases' / first
+            pair = {'commit': first, 'contract': taskq.hashlib.sha256((old / 'taskq.md').read_bytes()).hexdigest()}
+            (writer / 'taskq.md').write_text('second contract\n')
+            self.git(writer, 'commit', '-qam', 'second'); self.git(writer, 'push', '-q', 'origin', 'main')
+            second = taskq.update_git(writer, 'rev-parse', 'HEAD')
+            (writer / 'taskq.md').write_text('future contract\n')
+            self.git(writer, 'commit', '-qam', 'future'); self.git(writer, 'push', '-q', 'origin', 'main')
+            future = taskq.update_git(writer, 'rev-parse', 'HEAD')
+            future_release = install / 'releases' / future
+            REAL_RUN(['git', 'clone', '-q', '--branch', 'main', str(origin), str(future_release)], check=True, capture_output=True)
+            future_pair = {'commit': future, 'contract': taskq.hashlib.sha256((future_release / 'taskq.md').read_bytes()).hexdigest()}
+            pointer = install / 'current.json'; before = pointer.read_bytes()
+            evidence = dict(commit=second, upstream=str(origin), tests='passed', review='accepted', prompt_sources=[pair])
+            args = ['update', '--install-dir', str(install), '--commit', second, '--apply', '--qualification', str(proof)]
+            with mock.patch.object(taskq, 'CLONE', old), mock.patch.object(taskq, 'qualified_checks'):
+                for sources in (None, {}, [{}], [pair] * 17, [{**pair, 'contract': '0' * 64}], [future_pair]):
+                    proof.write_text(json.dumps({**evidence, 'prompt_sources': sources}))
+                    with self.assertRaises(SystemExit): self.run_cli(*args)
+                    self.assertEqual(pointer.read_bytes(), before)
+                proof.write_text(json.dumps(evidence))
+                original = (old / 'taskq.py').read_bytes()
+                (old / 'taskq.py').write_bytes(original + b'# changed source\n')
+                with self.assertRaisesRegex(SystemExit, 'verification failed'): self.run_cli(*args)
+                self.assertEqual(pointer.read_bytes(), before)
+                (old / 'taskq.py').write_bytes(original)
+                self.run_cli(*args)
+                selected = json.loads(pointer.read_text())
+                self.assertEqual(selected['prompt_sources'], [pair])
+                self.assertNotIn('compatible_from', selected)
+                with mock.patch.dict(os.environ, TASKQ_INSTALL_DIR=str(install)):
+                    self.assertIsNotNone(taskq.release_reason(continuation=True))
+                    self.assertIsNotNone(taskq.release_reason())
+                self.assertEqual((old / 'taskq.py').read_bytes(), original)
 
     def test_update_exact_sha_with_real_isolated_git_and_atomic_pointer(self):
         origin, writer, install = self.root / 'origin.git', self.root / 'writer', self.root / 'install'

@@ -14,7 +14,7 @@ class NativeGate(unittest.TestCase):
     def invoke(self, body):
         with tempfile.TemporaryDirectory() as folder:
             base = Path(folder); root = base / 'repo'; root.mkdir(); (root / 'tests').mkdir()
-            source = 'import unittest\nfrom pathlib import Path\nclass One(unittest.TestCase):\n def test_one(self):\n  ' + body + '\n'
+            source = 'import unittest,os\nfrom pathlib import Path\nclass One(unittest.TestCase):\n def test_one(self):\n  ' + body + '\n'
             (root / 'tests' / 'test_one.py').write_bytes(source.encode('utf-8'))
             def git(*args):
                 subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True)
@@ -27,6 +27,7 @@ class NativeGate(unittest.TestCase):
             done = subprocess.run([sys.executable, '-B', str(GATE), '--root', str(root),
                                    '--output', str(base / 'evidence')], env=env, capture_output=True)
             receipt = json.loads((base / 'evidence' / 'receipt.json').read_text('utf-8'))
+            receipt['hypothesis_cache_retained'] = (base / 'evidence' / 'hypothesis' / 'cache').exists()
             return done.returncode, receipt
 
     def test_clean_pass(self):
@@ -49,3 +50,8 @@ class NativeGate(unittest.TestCase):
         code, receipt = self.invoke('Path(__file__).write_bytes(b"changed")')
         self.assertEqual((code, receipt['test_exit']), (1, 0))
         self.assertEqual(receipt['after']['mismatches'], ['tests/test_one.py'])
+
+    def test_hypothesis_storage_is_retained_outside_clean_checkout(self):
+        code, receipt = self.invoke('cache=Path(os.environ["HYPOTHESIS_STORAGE_DIRECTORY"]); cache.mkdir(); (cache/"cache").write_bytes(b"fixture")')
+        self.assertEqual((code, receipt['test_exit'], receipt['after']['status']), (0, 0, ''))
+        self.assertTrue(receipt['hypothesis_cache_retained'])

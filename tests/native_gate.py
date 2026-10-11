@@ -61,9 +61,11 @@ def main():
             raise ValueError('native gate requires no Python encoding overrides')
         command = [sys.executable, '-B', '-m', 'unittest', *(args.test or ['discover', '-s', 'tests'])]
         receipt['command'] = command
+        env = dict(os.environ, HYPOTHESIS_STORAGE_DIRECTORY=str(output / 'hypothesis'))
+        receipt['hypothesis_storage'] = env['HYPOTHESIS_STORAGE_DIRECTORY']
         with log.open('wb') as stream:
             receipt['test_exit'] = subprocess.run(command, cwd=root, stdout=stream,
-                                                  stderr=subprocess.STDOUT).returncode
+                                                  stderr=subprocess.STDOUT, env=env).returncode
         receipt['after'] = snapshot(root)
         if receipt['after']['status'] or receipt['after']['mismatches']:
             raise ValueError('post-gate checkout changed; artifacts retained')

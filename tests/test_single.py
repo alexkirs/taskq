@@ -1453,7 +1453,7 @@ class ShellBriefs(Base):
         shell = Path(os.environ['SYSTEMROOT']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
         with mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
             return REAL_RUN([str(shell), '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
-                            capture_output=True, text=True, timeout=15, cwd=self.root,
+                            capture_output=True, text=True, timeout=15, cwd=self.root, stdin=subprocess.DEVNULL,
                             env={**os.environ, 'PATHEXT': '.COM;.EXE;.BAT;.CMD'})  # PS otherwise shell-opens .exe asynchronously
 
     def test_role_briefs_choose_native_windows_codex_only(self):

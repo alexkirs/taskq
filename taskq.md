@@ -627,6 +627,9 @@ Changed (owner-approved compatibility update, 2026-10-10): implicit hot pull →
 release update; legacy issue blocks are read-only until guarded migration (§ 1). Running code and its contract
 always come from the same release. Managed installs also give a bounded, cached cross-host upstream
 availability reminder on normal command startup; this is notification, never installation or qualification.
+Changed (#579, owner activation 2026-10-10; R8/R13): notification-only -> automatic compatible
+qualified release selection at managed launcher command/turn boundaries. Explicit schema repair,
+native identities and R9 user settings remain unchanged. Qualification and transition are defined below.
 Changed: testing mechanics implicit in worker/review commands → § 10 defines risk-based evidence, preserved
 fault detection and a bounded pilot; no broad suite migration (#533).
 Changed (owner-approved queue optimization, 2026-10-10): full history on every fresh read → optional metadata-only
@@ -815,7 +818,8 @@ explicit update procedure below and then re-reads this file; preserve project ch
    that source, keep it as the immutable bootstrap and use the managed alias:
    `alias taskq='python3 ~/taskq/taskq.py launch --install-dir ~/.local/share/taskq --'` (Windows: § 9).
    Before installing a pointer, invoke the source entrypoint directly for read-only setup and explicit update.
-   Update: use the explicit qualified release procedure below. `pm`, `tick` and `wait` never fetch, pull or swap code.
+   Update: the managed launcher selects qualified compatible releases at work-command boundaries;
+   explicit qualified installation remains available below. Loaded `pm`, `tick` and `wait` handlers never hot-pull code.
 3. At the project root write `taskq.json` (fields: § 2) and commit it. Labels are created by the first `add`.
 4. Check: `taskq list` prints the queue (empty is fine) and no error. Claude workers: run `claude` once in the
    project root and accept the folder trust prompt (only the owner can); else every spawn fails `Workspace not trusted`.
@@ -870,6 +874,93 @@ not replace the isolated spawn, naming, result and retirement qualification requ
 
 ### Explicit release update and issue migration
 
+#### Automatic compatible release selection (#579)
+
+Qualification-only upstream: a reviewed explicit installation record may include
+`qualification_fixture` with exactly `repo`, `install_dir` and `project_root`. It binds a
+private `alexkirs/taskq-native-qualification-*` GitHub repository and two absolute, unlinked
+synthetic directories. The installer checks the repository's private ownership, real exact-head
+CI and main ancestry through the same installation path; it does not manufacture green checks.
+The fixture binding is retained in the pointer and cannot be added to an existing production
+installation. Its launcher must run in that exact project with that repository and zero configured
+and invocation model limits, including additional runtime entries. Validate this before constructing
+the board adapter; custom runtime adapters are unsupported and refused. Qualification-only runtime admission/pass commands and automatic queue dispatch
+are disabled independently of missing-runtime default limits. Removing/changing the binding or
+selecting a production project refuses before effects.
+Automatic qualification reads that same private repository's owner-published release/tag;
+production continues to trust only canonical `alexkirs/taskq`. No new config default, credential,
+daemon, board migration or production release is introduced. This route qualifies the installer,
+not publication of a canonical release or adoption by historical executors.
+
+The selected release checks once at a managed launcher work-command boundary before loading the consumer project.
+Diagnostic `version`/`contract`, explicit `update` and bootstrap/child commands do not trigger installation.
+Direct source commands and ongoing processes never hot-load code. A qualified bootstrap supporting
+this protocol forwards a boundary marker; adopting that bootstrap is an explicit installation step,
+separate from selecting a release pointer. Keep its previous alias/source for rollback; select only
+a reviewed qualified bootstrap and verify inherited stdio, exit status and boundary-marker forwarding.
+No bootstrap file or user alias is rewritten by automatic update.
+Legacy bootstraps remain notification-only until that step. No updater daemon or board enumeration.
+
+The smallest upstream qualification is a published, non-prerelease GitHub release on canonical
+`github.com/alexkirs/taskq`, authored by repository owner `alexkirs`. Its entire body is JSON:
+`{"commit":"<40-hex SHA>","contract":"<full SHA256 of taskq.md bytes>","event_schema":3,
+"protocol":1,"compatible_from":[{"commit":"<selected SHA>","contract":"<full SHA256>"}],
+"qualified_hosts":["win","wsl"],"tests":"passed","review":"accepted"}`.
+Resolve that release's tag independently to the same commit; require existing exact-SHA tests checks,
+canonical origin, clean immutable files and main ancestry. New release clones pin `core.autocrlf=false`
+so contract bytes match the repository blob on Windows and WSL. Existing installations with different
+line endings require their own exact predecessor digest in the attestation; never rewrite them.
+Release metadata is trusted to canonical repository maintainers; author metadata does not prove who
+last edited the mutable release body. This is explicit owner qualification,
+including native host evidence and unchanged adapter/model/effort/permission semantics; neither a
+green Linux CI nor an arbitrary main HEAD supplies it. No macOS automatic installation ships: native
+macOS qualification is unavailable. Other Linux hosts are unsupported, not mislabeled WSL.
+
+The manifest must qualify the selected release and every retained compatible predecessor (maximum
+16) and keep the current operational schema and protocol. Missing pair/host evidence refuses the
+automatic switch; publish a new qualified record rather than guessing. The verified manifest is
+stored with the atomic installation pointer, not on the board or in user configuration. A five-minute
+disposable cache records attempted freshness, never authorization: every attempted installation
+revalidates upstream evidence. A bounded unavailable/invalid check keeps the selected release and
+reports freshness unknown; offline compatible work continues. Concurrent installers use the existing
+exact-token lock and recheck the selected source under it. No downgrade, overwrite or lock stealing.
+
+| Situation | Permitted transition |
+|---|---|
+| Qualified code/contract pair, same schema, qualified native host/adapters | Install immutable descendant; fresh interpreter reads its own contract |
+| Running qualified predecessor | Finish identity-checked ask/result/requeue/ack/application commands; no old-release dispatch, admission or repair |
+| Old/current/newer board | Only current schema executes; old supported input needs explicit repair; newer/unknown refuses writes and downgrade |
+| Missing custom-adapter qualification or incompatible R9 settings | Publisher must withhold compatibility attestation; no automatic fallback |
+| Windows/WSL mixed clients | Each checks on return; only expressly qualified pairs interoperate |
+| macOS or dormant/offline host | No immediate propagation proof; retain compatible release, diagnose incompatible board, stop unsafe effects |
+
+Lifecycle: launcher -> old selected process (bounded qualification check) -> immutable install + atomic
+pointer -> original work command refuses before effects -> launcher -> fresh selected interpreter -> release-bound contract/brief -> agent rereads
+contract -> existing project schema/identity guard -> next effect. Changed release/rules are printed on
+stderr and identified in all generated worker/supervisor briefs and PM contract output. A launch proves
+code/contract binding, not that an LLM adopted instructions: reread/adoption remains explicitly agent
+acknowledged or unverified, never inferred from message delivery. After a switch, read the selected
+contract and retry the refused command through the launcher; a refused command never reports success.
+Every new turn must use the launcher.
+Older qualified contexts may finish receipts; the pointer cannot detect their turn end, so they cannot
+admit/dispatch new work. Propagation is next launcher boundary after the cache window; idle hosts and
+already-running turns have no guaranteed immediate propagation.
+Historical clients without the completion gate can still refuse after a pointer switch: matching
+bytes alone cannot retrofit their behavior. Compatibility qualification must explicitly cover their
+implemented protocol; the retained native completion proof is a synthetic manager ACK and identical
+repeat, not proof for deployed historical workers. Availability/backoff proof covers upstream discovery,
+not an offline board or generic writer drain. Legacy all-host drain remains explicit and unsupported
+native drain evidence remains unknown. No no-loss production rollback is established by fixture installs.
+
+Board consent remains: `taskq repair` supplies affected records, blockers and transition preview;
+owner yes means `repair --apply --yes` on that board, owner no leaves bytes/claims intact and writes
+disabled. Provisioning remains separate. Two contenders serialize under the board guard; unknown
+responses retain it and resume from verified receipts, never duplicate writes. Unknown legacy ownership
+still blocks ordinary conversion; explicit held-legacy repair is a separate authorization. Preserve
+all native roles, history, results, pending messages and unknown fields. A code rollback is only safe
+with supported board/adapters/controllers; after schema change or new incompatible progress there is
+no claimed no-loss reverse conversion. No production board repair or cleanup is part of auto-update.
+
 `taskq update` resolves and previews configured origin/main (an explicit network read). The managed launcher
 supplies `TASKQ_INSTALL_DIR`; an unmanaged installation needs `--install-dir <directory>`. Optional
 `--commit <full SHA>` pins the reviewed revision, including when main moves after preview. Preview reports the source,
@@ -901,7 +992,8 @@ arguments. POSIX replaces the bootstrap process. On Windows the bootstrap waits 
 interpreter, inherits its input/output/error streams and returns its exact exit code; a child failure must never
 be reported as a successful launcher exit. Launch reads no project configuration or board; children use their
 parent's release path. Every new-version mutation/dispatch/effect checks the current
-pointer and refuses when this process is stale or the pointer invalid. Read-only inspection remains available.
+pointer and refuses when this process is stale or the pointer invalid, except the explicitly qualified
+predecessor completion commands above. Read-only inspection remains available.
 Briefs identify the loaded release and contract hash and direct a new turn to the launcher. `taskq pm` prints
 the current release contract; no global hash file proves every individual agent has read it. Old versions lack
 this gate: explicit all-host stop/drain remains mandatory. `taskq version` reports source, Git SHA/dirty state,
@@ -1340,7 +1432,8 @@ never automatic. Never seize a task with a manager or change foreign claims. `ta
 `taskq wait` compare the hash of the running release's
 `taskq.md` with `.taskq/pm.json` (a runtime handle, R1). A different hash warns on stderr: `The manager contract changed:
 run taskq pm and follow it from now on.` The manager then re-runs `taskq pm` (#430). `taskq pm` prints that release's
-contract itself, so it skips that line. These commands never update source code. In a managed install they also check canonical GitHub `main`
+contract itself, so it skips that line. These loaded handlers never update source code; the managed
+launcher boundary separately performs the automatic compatible selection above. They also check canonical GitHub `main`
 availability on startup, at most once per five-minute local cache window (concurrent cache misses may each
 check). The read-only query is explicitly pinned to github.com with a 10-second timeout. A differing SHA
 prints `taskq update` preview guidance, never claims the revision is qualified, and never installs or dispatches.

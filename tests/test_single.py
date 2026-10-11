@@ -2509,11 +2509,13 @@ class Tick(TickSetup):
                     self.run_cli('answer', '1.2', bad)
         self.assertEqual(self.task(1)['state'], 'ask')  # a bad code moves nothing
         self.fake.sessions['s-T1'] = 'idle'
-        with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')):
+        with mock.patch.object(taskq.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')), \
+                mock.patch.object(taskq, 'session', return_value=None):
             self.run_cli('answer', '1.2, 2.1')
         self.assertEqual((self.task(1)['state'], self.task(1)['raw']['decision'], self.board.issues[2]['state']), ('doing', None, 'closed'))
-        self.assertEqual(self.board.issues[2]['comments'][-1], '**close** · claude:01234567\n\n2.1: close as is')
-        self.assertEqual(self.fake.sent[-1], ('s-T1', 'The owner answered your question:\n\n1.2: keep B'))
+        self.assertEqual(self.board.issues[2]['comments'][-1], '**close** · owner\n\n2.1: close as is')
+        self.assertEqual(self.fake.sent, [])
+        self.assertTrue(taskq.pending_worker_controls(self.task(1)['raw']))
         self.assertNotIn('Questions', self.run_cli('tick'))
         with self.assertRaisesRegex(SystemExit, 'pick 1 to 1'):
             self.run_cli('ask', '1', '--text', 'q', '--option', 'a', '--recommend', '2')

@@ -4318,6 +4318,135 @@ class MultiPM(Base):
 
 
 class Contract(Base):
+    def test_legacy_bootstrap_adoption_is_explicit_and_preserves_exit_status(self):
+        install = self.root / 'installed'
+        release = install / 'releases' / ('a' * 40)
+        release.mkdir(parents=True)
+        (release / 'taskq.md').write_text('synthetic contract', encoding='utf-8')
+        source = (ROOT / 'taskq.py').read_text('utf-8')
+        fixture = textwrap.dedent('''\
+            def observe_boundary(root):
+                print('qualified boundary observed')
+                return True
+            compatible_update = observe_boundary
+            cmd_list = lambda args: print('original command completed')
+            BOARD = object()
+            CONFIG = {'root': Path.cwd(), 'hosts': {}, 'limits': {'codex': 0, 'claude': 0}}
+            main()
+        ''')
+        (release / 'taskq.py').write_text(source.replace("if __name__ == '__main__':\n    main()", fixture), encoding='utf-8')
+        (install / 'current.json').write_text(json.dumps(dict(commit=release.name, path=str(release))), encoding='utf-8')
+        marker = "    os.environ['TASKQ_LAUNCH_BOUNDARY'] = '1'\n"
+        self.assertIn(marker, source)
+        for legacy in (True, False):
+            bootstrap = self.root / ('legacy.py' if legacy else 'adopted.py')
+            bootstrap.write_text(source.replace(marker, '') if legacy else source, encoding='utf-8')
+            with self.subTest(legacy=legacy), mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
+                done = REAL_RUN([sys.executable, '-X', 'utf8', '-B', str(bootstrap), 'launch', '--install-dir',
+                                 str(install), '--', 'list'], cwd=self.root, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
+                                capture_output=True, text=True, encoding='utf-8', timeout=15)
+            self.assertEqual(done.returncode, 0 if legacy else 1, done.stderr)
+            self.assertIn('original command completed' if legacy else 'qualified boundary observed', done.stdout)
+            if not legacy:
+                self.assertNotIn('original command completed', done.stdout)
+                self.assertIn('original command was not executed', done.stderr)
+        self.assertEqual(json.loads((install / 'current.json').read_text())['commit'], release.name)
+
+    def fixture_binding(self):
+        return dict(repo='alexkirs/taskq-native-qualification-test', install_dir=str(self.root / 'install'),
+                    project_root=str(self.root))
+
+
+    def test_qualification_binding_refuses_wrong_directory_and_public_repository(self):
+        fixture = self.fixture_binding()
+        with mock.patch.object(Path, 'cwd', return_value=self.root):
+            self.assertEqual(taskq.qualification_fixture(self.root / 'install', {'qualification_fixture': fixture}), fixture)
+            with self.assertRaisesRegex(SystemExit, 'directory mismatch'):
+                taskq.qualification_fixture(self.root / 'other', {'qualification_fixture': fixture})
+        with mock.patch.object(taskq.GUARD, 'fixture', fixture, create=True), \
+                mock.patch.object(taskq, 'run_api', return_value=dict(private=False, owner=dict(login='alexkirs'))):
+            with self.assertRaisesRegex(SystemExit, 'private and owner-controlled'):
+                taskq.release_repository('https://github.com/' + fixture['repo'] + '.git')
+            with self.assertRaisesRegex(SystemExit, 'bound private qualification fixture'):
+                taskq.release_repository('https://github.com/alexkirs/taskq.git')
+
+
+    def test_qualification_project_drift_refuses_before_board_write(self):
+        install = self.root / 'install'
+        install.mkdir()
+        fixture = self.fixture_binding()
+        (install / 'current.json').write_text(json.dumps(dict(qualification_fixture=fixture)))
+        taskq.CONFIG.update(repo=fixture['repo'], host='github.com', limits=dict(codex=0, claude=0))
+        with mock.patch.object(Path, 'cwd', return_value=self.root), \
+                mock.patch.dict(os.environ, TASKQ_INSTALL_DIR=str(install)), \
+                mock.patch.object(taskq, 'release_reason', return_value=None):
+            for change in (dict(repo='alexkirs/taskq'), dict(limits=dict(codex=1, claude=0)),
+                           dict(limits=dict(codex=0, claude=0, hermes=1))):
+                with mock.patch.dict(taskq.CONFIG, change), self.assertRaisesRegex(SystemExit, 'zero model limits required'):
+                    self.run_cli('add', 'refused', '--goal', 'none', '--acceptance', 'none')
+        self.assertEqual(self.board.issues, {})
+        self.assertIsNone(self.board.guard)
+
+    def test_qualification_drift_refuses_before_adapter_import_and_runtime_fallback(self):
+        install = self.root / 'install'
+        install.mkdir()
+        fixture = self.fixture_binding()
+        (install / 'current.json').write_text(json.dumps(dict(qualification_fixture=fixture)))
+        config = dict(taskq.CONFIG, repo=fixture['repo'], host='github.com', limits=dict(codex=0, claude=0))
+        with mock.patch.object(Path, 'cwd', return_value=self.root), \
+                mock.patch.dict(os.environ, TASKQ_INSTALL_DIR=str(install)), \
+                mock.patch.object(taskq, 'release_reason', return_value=None), \
+                mock.patch.object(taskq, 'BOARD', None), \
+                mock.patch.object(taskq, 'load_config', return_value=dict(config, board='untrusted.py')), \
+                mock.patch.object(taskq, 'make_board', side_effect=AssertionError('custom adapter imported before refusal')):
+            with self.assertRaisesRegex(SystemExit, 'zero model limits required'):
+                self.run_cli('list')
+        taskq.CONFIG = config
+        with mock.patch.object(Path, 'cwd', return_value=self.root), \
+                mock.patch.dict(os.environ, TASKQ_INSTALL_DIR=str(install)), \
+                mock.patch.object(taskq, 'release_reason', return_value=None), \
+                mock.patch.object(taskq, 'cmd_tick', side_effect=AssertionError('implicit runtime fallback admitted')), \
+                mock.patch.object(taskq, 'start_pass', side_effect=AssertionError('fixture dispatched a model pass')):
+            with self.assertRaisesRegex(SystemExit, 'runtime execution disabled'):
+                self.run_cli('tick')
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.run_cli('add', 'fixture', '--goal', 'none', '--acceptance', 'none')
+                self.assertIn('queue dispatch disabled', errors.getvalue())
+        self.assertEqual(self.task(1)['state'], 'ready')
+
+
+    def test_private_release_with_removed_binding_refuses_before_command(self):
+        install = self.root / 'install'
+        install.mkdir()
+        (install / 'current.json').write_text('{}')
+        (self.root / '.git').mkdir()
+        with mock.patch.dict(os.environ, TASKQ_INSTALL_DIR=str(install)), \
+                mock.patch.object(taskq, 'update_git', return_value='https://github.com/alexkirs/taskq-native-qualification-test.git'), \
+                mock.patch.object(taskq, 'cmd_version', side_effect=AssertionError('command executed')):
+            with self.assertRaisesRegex(SystemExit, 'retained fixture binding'):
+                self.run_cli('version')
+
+
+    def test_fixture_cannot_replace_existing_production_installation(self):
+        fixture = self.fixture_binding()
+        install = self.root / 'install'
+        install.mkdir()
+        (install / 'current.json').write_text(json.dumps(dict(commit='a' * 40, path=str(install / 'releases' / ('a' * 40)))))
+        proof = self.root / 'proof.json'
+        proof.write_text(json.dumps(dict(commit='b' * 40, upstream='https://github.com/' + fixture['repo'] + '.git',
+                                         tests='passed', review='accepted', qualification_fixture=fixture)))
+        before = (install / 'current.json').read_bytes()
+        with mock.patch.object(Path, 'cwd', return_value=self.root), \
+                mock.patch.object(taskq, 'update_git', return_value='https://github.com/' + fixture['repo'] + '.git') as git, \
+                mock.patch.object(taskq, 'qualified_checks'):
+            with self.assertRaisesRegex(SystemExit, 'cannot replace an existing'):
+                self.run_cli('update', '--commit', 'b' * 40, '--install-dir', str(install), '--qualification', str(proof), '--apply')
+        self.assertEqual((install / 'current.json').read_bytes(), before)
+        self.assertFalse((install / 'releases').exists())
+        self.assertFalse((install / '.update.lock').exists())
+        self.assertEqual(git.call_count, 1)
+
+
     def test_launcher_update_boundary_refuses_original_effect_and_consumes_marker(self):
         with mock.patch.dict(os.environ, TASKQ_LAUNCH_BOUNDARY='1', TASKQ_INSTALL_DIR=str(self.root)), \
                 mock.patch.object(taskq, 'release_reason', return_value=None), \

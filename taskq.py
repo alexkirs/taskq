@@ -4350,6 +4350,9 @@ EVENTS = ('add', 'answer', 'run', 'result', 'requeue', 'close')  # R4 (#333): ea
 
 def dispatch(command, tasks, after=None, after_birth=None):
     """R4 (#405): the event pass runs in a detached `tick --quiet` child, its output in .taskq/dispatch.log; the event returns at once."""
+    if qualification_fixture():
+        print('taskq: qualification-only queue dispatch disabled; no model execution', file=sys.stderr)
+        return
     reason = release_reason()
     if reason:
         print(f'taskq: dispatch stopped: {reason}', file=sys.stderr)
@@ -4862,13 +4865,49 @@ def update_git(folder, *argv):
     return done.stdout.strip()
 
 
+def qualification_fixture(root=None, evidence=None):
+    """Private synthetic installation binding; never infer it from a foreign origin."""
+    fixture = evidence.get('qualification_fixture') if isinstance(evidence, dict) else None
+    if root is None:
+        folder = os.environ.get('TASKQ_INSTALL_DIR')
+        root = Path(folder).resolve() if folder else None
+    if fixture is None and root and (root / 'current.json').is_file():
+        fixture = json.loads((root / 'current.json').read_text('utf-8')).get('qualification_fixture')
+    if fixture is None:
+        return None
+    if not isinstance(fixture, dict) or set(fixture) != {'repo', 'install_dir', 'project_root'} \
+            or not isinstance(fixture['repo'], str) \
+            or not re.fullmatch(r'alexkirs/taskq-native-qualification-[a-z0-9-]+', fixture['repo']):
+        fail('invalid qualification-only fixture binding')
+    for key in ('install_dir', 'project_root'):
+        value = fixture[key]
+        if not isinstance(value, str) or not Path(value).is_absolute() or Path(value).resolve() != Path(value):
+            fail('qualification-only directories must be absolute and unlinked')
+    if root is None or Path(fixture['install_dir']) != root or Path(fixture['project_root']) != Path.cwd().resolve():
+        fail('qualification-only installation/project directory mismatch')
+    return fixture
+
+
+
+def release_repository(upstream):
+    fixture = getattr(GUARD, 'fixture', None) or qualification_fixture()
+    repo = fixture['repo'] if fixture else 'alexkirs/taskq'
+    if not re.fullmatch(r'(?:https://github\.com/|git@github\.com:)' + re.escape(repo) + r'(?:\.git)?/?', upstream):
+        fail('update requires the canonical github.com/alexkirs/taskq upstream or its bound private qualification fixture')
+    if fixture:
+        data = run_api('gh', 'github.com', 'GET', f'repos/{repo}')
+        if data.get('private') is not True or (data.get('owner') or {}).get('login') != 'alexkirs':
+            fail('qualification-only upstream must remain private and owner-controlled')
+    return repo
+
+
+
 def qualified_checks(commit, upstream):
     """An operator record is not CI. Require the actual exact-SHA TaskQ upstream tests independently."""
-    if not re.fullmatch(r'(?:https://github\.com/|git@github\.com:)alexkirs/taskq(?:\.git)?/?', upstream):
-        fail('update requires the canonical github.com/alexkirs/taskq upstream')
+    repo = release_repository(upstream)
     try:
         done = subprocess.run([shutil.which('gh') or fail('gh not found'), 'api', '--hostname', 'github.com', '--paginate', '--slurp',
-                               f'repos/alexkirs/taskq/commits/{commit}/check-runs'],
+                               f'repos/{repo}/commits/{commit}/check-runs'],
                               capture_output=True, **no_window(), text=True, encoding='utf-8', timeout=30)
     except subprocess.TimeoutExpired:
         fail('update exact-SHA CI timed out; selected pointer unchanged')
@@ -4929,9 +4968,11 @@ def update_host():
 
 def qualified_publication():
     """Owner-published exact release evidence; cached availability is never qualification."""
+    fixture = getattr(GUARD, 'fixture', None) or qualification_fixture()
+    repo = release_repository(update_git(CLONE, 'remote', 'get-url', 'origin')) if fixture else 'alexkirs/taskq'
     def query(endpoint):
         done = subprocess.run([shutil.which('gh') or fail('gh not found'), 'api', '--hostname', 'github.com',
-                               f'repos/alexkirs/taskq/{endpoint}'], capture_output=True, **no_window(),
+                               f'repos/{repo}/{endpoint}'], capture_output=True, **no_window(),
                               text=True, encoding='utf-8', timeout=10)
         if done.returncode:
             fail('automatic release qualification unavailable')
@@ -4998,6 +5039,22 @@ def compatible_update(root):
 
 
 def cmd_update(args):
+    root = Path(args.install_dir).expanduser().resolve() if args.install_dir else None
+    evidence = getattr(args, 'qualification_data', None)
+    if args.apply and evidence is None and args.qualification:
+        try:
+            evidence = json.loads(Path(args.qualification).read_text('utf-8'))
+        except (OSError, ValueError) as error:
+            fail(f'update qualification unreadable: {error}')
+    previous = getattr(GUARD, 'fixture', None)
+    try:
+        GUARD.fixture = qualification_fixture(root, evidence) if args.apply else None
+        return install_update(args)
+    finally:
+        GUARD.fixture = previous
+
+
+def install_update(args):
     """Install a qualified exact upstream revision without changing any running source checkout."""
     if not args.install_dir:
         fail('unmanaged installation: use update --install-dir <directory>; the managed launcher supplies it thereafter')
@@ -5036,6 +5093,9 @@ def cmd_update(args):
                     raise ValueError('invalid pointer')
             except (OSError, ValueError, KeyError, TypeError) as error:
                 fail(f'update previous pointer invalid; reconcile explicitly: {error}')
+        fixture = getattr(GUARD, 'fixture', None)
+        if selected and selected.get('qualification_fixture') != fixture:
+            fail('qualification-only binding cannot replace an existing installation binding')
         if automatic is not None:
             loaded = {'commit': CLONE.name, 'contract': hashlib.sha256((CLONE / 'taskq.md').read_bytes()).hexdigest()}
             if not selected or selected['commit'] != CLONE.name or Path(selected['path']).resolve() != CLONE.resolve() \
@@ -5060,12 +5120,15 @@ def cmd_update(args):
             update_git(release, 'merge-base', '--is-ancestor', selected['commit'], candidate)
         temporary = root / f'.current-{uuid.uuid4().hex}.json'
         pointer = {'commit': candidate, 'path': str(release)}
+        if fixture:
+            pointer['qualification_fixture'] = fixture
         if automatic is not None:
             pointer['compatible_from'] = evidence['compatible_from']
         temporary.write_text(json.dumps(pointer) + '\n', encoding='utf-8')
         os.replace(temporary, previous)
     print('Installed for new launcher processes; running releases unchanged. Board migration remains explicit. '
           'Before work, the selected release checks board schema; review taskq repair if incompatible.')
+
 
 
 def adopt(numbers, me):
@@ -5531,6 +5594,11 @@ def main(argv=None):
     command('update', cmd_update, (('--commit',), {}), (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
             (('--qualification',), {}), (('--apply',), {'action': 'store_true'}), n=False)
     args = parser.parse_args(argv)
+    fixture = qualification_fixture()
+    if os.environ.get('TASKQ_INSTALL_DIR') and (CLONE / '.git').exists() \
+            and re.search(r'github\.com[/:]alexkirs/taskq-native-qualification-', update_git(CLONE, 'remote', 'get-url', 'origin')) \
+            and fixture is None:
+        fail('private qualification release requires its retained fixture binding')
     boundary = os.environ.pop('TASKQ_LAUNCH_BOUNDARY', None)
     if boundary == '1' and args.command not in ('launch', 'update', 'version', 'contract', 'capacity-child'):
         folder = os.environ.get('TASKQ_INSTALL_DIR')
@@ -5562,6 +5630,16 @@ def main(argv=None):
         return args.function(args)  # source installation needs no consumer project or board adapter
     if BOARD is None:
         CONFIG = load_config()
+    if fixture and (CONFIG.get('board') != 'github' or CONFIG.get('host', 'github.com') != 'github.com' \
+            or CONFIG.get('repo') != fixture['repo'] or CONFIG.get('root') != Path(fixture['project_root']) \
+            or any(CONFIG.get('limits', {}).get(kind) != 0 for kind in ('codex', 'claude')) \
+            or any((local_limits() or CONFIG.get('limits', {})).get(kind) != 0 for kind in ('codex', 'claude')) \
+            or any(value != 0 for value in CONFIG.get('limits', {}).values()) \
+            or any(value != 0 for value in (local_limits() or CONFIG.get('limits', {})).values())):
+        fail('qualification-only project/repository and zero model limits required')
+    if fixture and args.command in ('take', 'run', 'tick', 'wait', 'lifecycle', 'arm'):
+        fail('qualification-only runtime execution disabled; no implicit runtime limit fallback')
+    if BOARD is None:
         BOARD = make_board(CONFIG)
     local_limits()  # fail before any command writes, refreshes, starts an event or admits work
     if args.command=='lifecycle' and (not isinstance(CONFIG.get('capacity'),dict) or not callable(getattr(BOARD,'capacity_provider',None))):

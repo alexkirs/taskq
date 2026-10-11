@@ -1,0 +1,416 @@
+{
+  "task": 579,
+  "application_event": "579:10",
+  "original_result": "b4d859d8589606406a9b614b74bd1270ff7c2a13",
+  "canonical_base": "349ead13f9fb66a9f18680265ea766f36afdc9ee",
+  "qualified_candidate": "5b8510997af0600900ff6546876a87f2611e2a7c",
+  "private_s1": "07288a8e6dabf9124731fb0c0f545bc12ae98dd0",
+  "private_s2": "43f39d038771bd937b4e1d722483754e5eebcabb",
+  "packet_manifest_sha256": "82fedc3bfa99339d85e4871c7be323c11f436e81bb2d0f74a8fccb2732afb22d",
+  "verified_packet_files": 27,
+  "definition": "AST SHA256 is ast.dump(include_attributes=False); file Git blobs are canonical LF bytes, not full-file equality claims",
+  "files": [
+    {
+      "path": "taskq.md",
+      "final_git_blob": "f30487d9aeb47a913e38f1b865897719a10c7b68",
+      "final_normalized_lf_sha256": "3c4f88f4a928cfeeba31cc8cdc9e69ee302f36f67f4ec90de8c713b5313f425a",
+      "canonical_git_blob": "b8ee26940f79b64e7cffefbac5b1d700900c032d",
+      "qualified_raw_sha256": "a26c980572d80425b9c0e63659bac667d55e3613dbe30ea3e5d5fb416c93e16a"
+    },
+    {
+      "path": "taskq.py",
+      "final_git_blob": "ca7343e0a6e5d2143b99fed2c27d6da13b67f8f1",
+      "final_normalized_lf_sha256": "f97e59c8c89543b37325ccdfec50760e9c85b3abd907fea45af49ba743137936",
+      "canonical_git_blob": "0394ecce07c520c252e5e5d5bf71a0a8a4bc6a2e",
+      "qualified_raw_sha256": "92f66926b8d0628fce93f5de781e460e43cb98f0104ecb7c312f24e46d154c51"
+    },
+    {
+      "path": "tests/test_single.py",
+      "final_git_blob": "e2f9c2dd2939e2db1b783ab6482c821249184dda",
+      "final_normalized_lf_sha256": "37f5f8f26daad3a3fb3c9126f9475de94c1d52e0ec278905d0c6883e16f255c6",
+      "canonical_git_blob": "65e6e70ff454b9df097b04df1a3a3bf7967a3d74",
+      "qualified_raw_sha256": "8fcab155c05e7d33fe9f5b0ac26e28e4b173f1a7f0ce7148f78f51aa67cedd48"
+    }
+  ],
+  "changed_functions": [
+    {
+      "function": "compatibility_reason",
+      "final_ast_sha256": "63c9f5277791fda22f86e5e64a45815a646650ffaeaff8e9d8b59c8ab4064286",
+      "qualified_ast_sha256": "63c9f5277791fda22f86e5e64a45815a646650ffaeaff8e9d8b59c8ab4064286",
+      "canonical_ast_sha256": "3764e654b33f0923864465e77f8783ff2092f5cca47cbec9f59ad3574f8fab5a",
+      "matches_qualified": true
+    },
+    {
+      "function": "effect",
+      "final_ast_sha256": "8d3a9c6816f463835ad172c9c32033fdea8565a6e568bb069b9ad9ec8edc2c83",
+      "qualified_ast_sha256": "8d3a9c6816f463835ad172c9c32033fdea8565a6e568bb069b9ad9ec8edc2c83",
+      "canonical_ast_sha256": "f26a4766d23a02c35a995c07c1ad164bd0351d75d05812d1d8c97735bedc8e93",
+      "matches_qualified": true
+    },
+    {
+      "function": "queue_tool",
+      "final_ast_sha256": "8965dff011ecd992ea6a9a424003ff141450cd9b418becd5e39154b69e9d2f55",
+      "qualified_ast_sha256": "8965dff011ecd992ea6a9a424003ff141450cd9b418becd5e39154b69e9d2f55",
+      "canonical_ast_sha256": "b762636e0c6a951955ef8ff3b9d7a8fd0fb5f20fe4cd8d738cd474f136f0e948",
+      "matches_qualified": true
+    },
+    {
+      "function": "brief",
+      "final_ast_sha256": "7a55d7fae0e9e418f1f7debc3bc7a4b384759932a503ca073db284f45adc79e2",
+      "qualified_ast_sha256": "d9363499111608e94b3d7bd667d8bf70837f92c8033030787bb94d0c9709bbad",
+      "canonical_ast_sha256": "6fb3c427b00424c88217ae746ad2e5c249244822f1f9d0a754476a9ec1aa1e78",
+      "matches_qualified": false
+    },
+    {
+      "function": "supervisor_brief",
+      "final_ast_sha256": "91057589dd4460b8209c3cdc10e9cc33903430b2ddac6ec9e2d1325a3432c514",
+      "qualified_ast_sha256": "91057589dd4460b8209c3cdc10e9cc33903430b2ddac6ec9e2d1325a3432c514",
+      "canonical_ast_sha256": "701822cac581ac7d1b58a3d8e79abbb8dc76a4075490a191d558266270db0f25",
+      "matches_qualified": true
+    },
+    {
+      "function": "dispatch",
+      "final_ast_sha256": "a28eedf1abb223946cc40df81be290219855ec3476d5765f9974ce6481fb50e6",
+      "qualified_ast_sha256": "c4f055724f5174db747e8582c6046e8936a73d61941fa0d9ba166659fa8b2a44",
+      "canonical_ast_sha256": "c4f055724f5174db747e8582c6046e8936a73d61941fa0d9ba166659fa8b2a44",
+      "matches_qualified": false
+    },
+    {
+      "function": "release_reason",
+      "final_ast_sha256": "c93a03f02e4b3f7290f437b6faa9ebc7f46c4acc702de34b8addd1f6acf6d01f",
+      "qualified_ast_sha256": "c93a03f02e4b3f7290f437b6faa9ebc7f46c4acc702de34b8addd1f6acf6d01f",
+      "canonical_ast_sha256": "32d8cc5e646e58669746fa6dd73cd7ea191c8949627b54a094c3ff5c8419f270",
+      "matches_qualified": true
+    },
+    {
+      "function": "completion_release",
+      "final_ast_sha256": "9d04ee40a61ff4630352b6231c7a3f2018f2b5859e1f1ad042fa603e3a0c7f7c",
+      "qualified_ast_sha256": "9d04ee40a61ff4630352b6231c7a3f2018f2b5859e1f1ad042fa603e3a0c7f7c",
+      "canonical_ast_sha256": null,
+      "matches_qualified": true
+    },
+    {
+      "function": "release_context",
+      "final_ast_sha256": "07987e5589d2c39d1856d9461df1b60b9457efe455d071ad9c56bdf090e9ff79",
+      "qualified_ast_sha256": "07987e5589d2c39d1856d9461df1b60b9457efe455d071ad9c56bdf090e9ff79",
+      "canonical_ast_sha256": "c83e7d101b94a79bd037533eaad8bbc456bcae05e7dc1575c33f45e4f7d984de",
+      "matches_qualified": true
+    },
+    {
+      "function": "cmd_launch",
+      "final_ast_sha256": "d004fa0db505b1cc6f823e9e52708d7feab015af5c81ae38b99bfdca1b7c557d",
+      "qualified_ast_sha256": "d004fa0db505b1cc6f823e9e52708d7feab015af5c81ae38b99bfdca1b7c557d",
+      "canonical_ast_sha256": "4f49f95b7273c57be41b5554aa1382fa72e87329519b83c0d6fae82abd3aa8d2",
+      "matches_qualified": true
+    },
+    {
+      "function": "cmd_version",
+      "final_ast_sha256": "97abf62108f94eaed256ecbabbf9c3fc0edc75d87a3d46879037247368d31aad",
+      "qualified_ast_sha256": "97abf62108f94eaed256ecbabbf9c3fc0edc75d87a3d46879037247368d31aad",
+      "canonical_ast_sha256": "15e862b80e3832dc6b9c3e7f38a2f34fe58be521763416beb167f10b4b6b71cf",
+      "matches_qualified": true
+    },
+    {
+      "function": "qualification_fixture",
+      "final_ast_sha256": "1b00cb26cf905d2495464bd7a16e2fe6b207a865a1f09a862b55c03ece98018f",
+      "qualified_ast_sha256": "1b00cb26cf905d2495464bd7a16e2fe6b207a865a1f09a862b55c03ece98018f",
+      "canonical_ast_sha256": null,
+      "matches_qualified": true
+    },
+    {
+      "function": "release_repository",
+      "final_ast_sha256": "5baa42d2d4877a26805fbb289b1e1987863bf32bf2bcaad15453c3b95f7aa829",
+      "qualified_ast_sha256": "5baa42d2d4877a26805fbb289b1e1987863bf32bf2bcaad15453c3b95f7aa829",
+      "canonical_ast_sha256": null,
+      "matches_qualified": true
+    },
+    {
+      "function": "qualified_checks",
+      "final_ast_sha256": "0ed730da781d684a4a80a614e1a5e7911de9f53f306febce24f761e16ea967f6",
+      "qualified_ast_sha256": "0ed730da781d684a4a80a614e1a5e7911de9f53f306febce24f761e16ea967f6",
+      "canonical_ast_sha256": "4692052c863155a5ee2055e31e605a73b391553a952d1da0448485a7a7852813",
+      "matches_qualified": true
+    },
+    {
+      "function": "verify_release",
+      "final_ast_sha256": "8d292fd10f7d9c013f269a1f385579a45a7a1d0af332188452b7c82babd8b4b0",
+      "qualified_ast_sha256": "3329d49626b60686144fb43e2fbc0dc00a4dd7eb4ee1088f3210e3caf3b31e0b",
+      "canonical_ast_sha256": "e1a6b5e3d3ce01ebdae765b129aa5283178c8e6c8ac58f9b263344ac2e47325d",
+      "matches_qualified": false
+    },
+    {
+      "function": "update_host",
+      "final_ast_sha256": "6b29c35a60d182bd66aa8ad09748b1fcc1b34efa41a84388ce36ebfc1348874b",
+      "qualified_ast_sha256": "6b29c35a60d182bd66aa8ad09748b1fcc1b34efa41a84388ce36ebfc1348874b",
+      "canonical_ast_sha256": null,
+      "matches_qualified": true
+    },
+    {
+      "function": "qualified_publication",
+      "final_ast_sha256": "83613ec4875d54cc249145f080940ce6976181d0cc76c7a416121cef97ec14ac",
+      "qualified_ast_sha256": "83613ec4875d54cc249145f080940ce6976181d0cc76c7a416121cef97ec14ac",
+      "canonical_ast_sha256": null,
+      "matches_qualified": true
+    },
+    {
+      "function": "compatible_update",
+      "final_ast_sha256": "09ff43c22aa3a65ae78d1c46ce031a17685b776ea2b882d72abb1a59d1eea50b",
+      "qualified_ast_sha256": "09ff43c22aa3a65ae78d1c46ce031a17685b776ea2b882d72abb1a59d1eea50b",
+      "canonical_ast_sha256": null,
+      "matches_qualified": true
+    },
+    {
+      "function": "cmd_update",
+      "final_ast_sha256": "85889bb846fdc16cfaa1973112be106ebbed038d02cd8aaf1d5fe356daaccd7d",
+      "qualified_ast_sha256": "85889bb846fdc16cfaa1973112be106ebbed038d02cd8aaf1d5fe356daaccd7d",
+      "canonical_ast_sha256": "12029706c7eff181353be59fad0758999bbf1a6c6bf1f207cd7b9b86424fd4a1",
+      "matches_qualified": true
+    },
+    {
+      "function": "install_update",
+      "final_ast_sha256": "b042ee3ff5ab729e79eb51712a44ecf5a90cb2bb2b5318bf09749b55c9e77b94",
+      "qualified_ast_sha256": "b042ee3ff5ab729e79eb51712a44ecf5a90cb2bb2b5318bf09749b55c9e77b94",
+      "canonical_ast_sha256": null,
+      "matches_qualified": true
+    },
+    {
+      "function": "cmd_pm",
+      "final_ast_sha256": "3df958baaca6a0346a2b3f6996f4a61b7d97b082db93d1fca73e7a8f647985c6",
+      "qualified_ast_sha256": "3df958baaca6a0346a2b3f6996f4a61b7d97b082db93d1fca73e7a8f647985c6",
+      "canonical_ast_sha256": "acc2e97c1caae54d559fe0e4e0cb60d07e8afd8ae118422653dbb03f527db6ff",
+      "matches_qualified": true
+    },
+    {
+      "function": "main",
+      "final_ast_sha256": "5f64f27e5918347756a86c3454fe3e67ac75de4cf3cc853db0f5675c4fc8dd3c",
+      "qualified_ast_sha256": "2b34c56c2d177f026474f9bdf9f9fc9b8a76295ea4e8eadc44c5f83793d4490e",
+      "canonical_ast_sha256": "5326472ed90474faad679626f46954b242fec6091c9e5443635a897276da48ad",
+      "matches_qualified": false
+    }
+  ],
+  "shared_guards": [
+    {
+      "guard": "retained fixture binding before commands",
+      "final_and_qualified_ast_sha256": "51e52ffa0c5532a3e43483e072bc7a79cb26336bddfdb14fb005e4839c8ef5cb"
+    },
+    {
+      "guard": "project repository configured/local zero limits",
+      "final_ast_sha256": "4cc26bc4a26094deafcd12cac67c4cc56854efa3a6441e167af5cc125a184bd6",
+      "qualified_ast_sha256": "eda36466c111f6270cab3a305b31d3da56795a5f5a50e589d5cdaeff7c72bbc3",
+      "status": "qualified predicate retained, additional runtime limits checked; config gate moved before adapter; runtime execution separately disabled"
+    },
+    {
+      "guard": "verify_release canonical exact Git blob bytes plus qualified symlink refusal",
+      "canonical_ast_sha256": "e1a6b5e3d3ce01ebdae765b129aa5283178c8e6c8ac58f9b263344ac2e47325d",
+      "qualified_ast_sha256": "3329d49626b60686144fb43e2fbc0dc00a4dd7eb4ee1088f3210e3caf3b31e0b",
+      "final_ast_sha256": "8d292fd10f7d9c013f269a1f385579a45a7a1d0af332188452b7c82babd8b4b0",
+      "status": "qualified verifier deliberately strengthened by retained canonical guard"
+    }
+  ],
+  "retained_canonical_functions": [
+    {
+      "function": "cmd_applied",
+      "canonical_and_final_ast_sha256": "37b2e53bd83b36acbb2b2b816848be6b9f795a29d9dfd7ad7e8174ad8ee7e7f1"
+    },
+    {
+      "function": "cmd_answer",
+      "canonical_and_final_ast_sha256": "4bc2ffdf986bc7cecb09b19c842b13765996476c3643b9f6b3d7bcad8f1fbcb2"
+    },
+    {
+      "function": "cmd_move",
+      "canonical_and_final_ast_sha256": "30c68e798e67bcdecf6da02b58a3bf3167eb8223b3814a6e798395064924c60c"
+    },
+    {
+      "function": "cmd_close",
+      "canonical_and_final_ast_sha256": "08e58cc4857f4f946e40ac0eab64b50a92bcc6f94889b32d9a3e5b5bbb65df0a"
+    },
+    {
+      "function": "named_arm",
+      "canonical_and_final_ast_sha256": "cd2db4acf7f964afad03ca5316419c89e31243019a68c77a9128cba855dcfda6"
+    },
+    {
+      "function": "board_schema_gate",
+      "canonical_and_final_ast_sha256": "f5594ae77b821d84060894f5faac6c3e3f7e09f4c50fe36576ab8a6ce0666471"
+    },
+    {
+      "function": "rejected_result_rework",
+      "canonical_and_final_ast_sha256": "2330e4d48cdd11060ac46fced16d161bd9f5d9c5b418a435f510f9c9bb4386c0"
+    },
+    {
+      "function": "publication_links",
+      "canonical_and_final_ast_sha256": "68ef772396f8e4b34b85efd70f19afc48ddc0a3fa0801c0136a8c62df7674855"
+    },
+    {
+      "function": "owned_model_turn",
+      "canonical_and_final_ast_sha256": "db4abde556580635ccb1db9832f5e1a99a42376e8e302480f5510c12c8046229"
+    },
+    {
+      "function": "model_event_input",
+      "canonical_and_final_ast_sha256": "0f886cec05b7787464828e550327eedac479dee00b93535e4e60f48d21e9ad78"
+    },
+    {
+      "function": "model_turn_receipt",
+      "canonical_and_final_ast_sha256": "0aa1caf754c32739085ac13c6bf670b63ac23f114163222cf2380b65952e1d55"
+    },
+    {
+      "function": "one_pass",
+      "canonical_and_final_ast_sha256": "0a2974c18f8afc12a8905bf366a02f8e34c595284e7262182e2fd752a16891b8"
+    }
+  ],
+  "contract_methods": [
+    {
+      "method": "fixture_binding",
+      "final_ast_sha256": "e8be345ddaf227073c4eae847dbde8e423f42d3768b4f2773cd2af974e5805e1",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_qualification_binding_refuses_wrong_directory_and_public_repository",
+      "final_ast_sha256": "e2362f7e928b070cef43c663e67b344ee915a31d9b5e76152cba28b69a88a2af",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_qualification_project_drift_refuses_before_board_write",
+      "final_ast_sha256": "509947c32cfcd0e3dfd14761f0221df6bb5b756b8f6f47b38174d3ce2442f08c",
+      "matches_qualified": false
+    },
+    {
+      "method": "test_private_release_with_removed_binding_refuses_before_command",
+      "final_ast_sha256": "850ba4a52a1f1aab28101bc94de1d915f4379f35f81aa23b4dfa2278dacd134a",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_fixture_cannot_replace_existing_production_installation",
+      "final_ast_sha256": "29ffce98e053657ee3b700d677d6a9af571096e735f3ac427b66a6c1e6429297",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_launcher_update_boundary_refuses_original_effect_and_consumes_marker",
+      "final_ast_sha256": "6d2ec13328af1a26e6fc5b151ddfebd361525441ba8277b3b47f22a5d6d59e1d",
+      "matches_qualified": true
+    },
+    {
+      "method": "publication",
+      "final_ast_sha256": "fe9e5e7cf30a8026884e2a2c55287290475767d525aa1871b9267552a92358f9",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_automatic_publication_requires_exact_qualified_pair_host_and_tag",
+      "final_ast_sha256": "9b4466d43bfdd9765f06a05983722edb833dce567c2a5746cbaf4dbbb885157c",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_automatic_offline_cache_preserves_selection_and_rechecks_after_window",
+      "final_ast_sha256": "cadf538c61912ec19878e24f6f22fff25e94eea6ec68f7146b3514be2c669fa7",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_qualified_predecessor_can_finish_but_cannot_dispatch",
+      "final_ast_sha256": "443928ac7412fedde80b812b962a24e8068562f936e45eac49b62e22d617fa6c",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_automatic_install_real_git_verifies_contract_and_retained_predecessors",
+      "final_ast_sha256": "5c642369025e3651d6f5b80348339e30fab0fe6d010ea876f6352fc15949f45d",
+      "matches_qualified": true
+    },
+    {
+      "method": "git",
+      "final_ast_sha256": "bfe9e87872276a2298250f923ae992ab64fd9f3851acc3134d34eeec48f78edf",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_pm_prints_role_and_records_hash",
+      "final_ast_sha256": "ef9939fd25b872f4f4abb631736456cab53d9adefeea1efd0a7ec03da64ea4ad",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_pm_onboarding_is_one_read_only_snapshot",
+      "final_ast_sha256": "5b4b6393041f54c8e7b7950e700632c77c98f5484e9bbd3667ff03374e0a25b6",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_pm_refuses_recorded_session_roles_before_onboarding",
+      "final_ast_sha256": "bbbaf70bc1b9f3383db97cfab3bdf0718ff55b091fc00f2f8905befbd8d2a268",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_changed_contract_until_pm",
+      "final_ast_sha256": "7789c226816979565d4e5cfa963d5abe5e7564ffcd56939aeff6285066ee1d21",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_refresh_never_fetches_or_changes_source",
+      "final_ast_sha256": "ee19d856862549277e04125da36b7872686140f167b752ada35741e3ef838d71",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_update_exact_sha_with_real_isolated_git_and_atomic_pointer",
+      "final_ast_sha256": "4f07f1b6083417a8103a6cb864619fec1026ec1828a4a876ee0dabe884fdfb9e",
+      "matches_qualified": false
+    },
+    {
+      "method": "test_update_requires_exact_upstream_ci_not_just_operator_evidence",
+      "final_ast_sha256": "f6c19dcb15d954b63c7f1ce6efe78ac086e340b6850805c8f43c702a5ddd0544",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_managed_freshness_is_cached_across_pm_tick_wait_and_never_installs",
+      "final_ast_sha256": "704c06bd79149baa09e2f32b8fb9b03a77bb281323f37a9596d25cdff98450dc",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_managed_freshness_offline_backs_off_without_blocking_compatible_work",
+      "final_ast_sha256": "ff2a4e5ffad0b0646b83e10648204cc5ef78569e8262cdc9675f2908c525b1cd",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_update_ci_pins_canonical_host_despite_gh_host_override",
+      "final_ast_sha256": "d96e37dbb04197bab0d9a604c38521255f05534b7ca4e664343b493bd536a8f6",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_managed_launcher_pins_new_process_code_and_contract",
+      "final_ast_sha256": "88a470883752f00f91f84fa1938ea07508d1ff8fce3b2ebabfead60e71cd1467",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_managed_launcher_preserves_inherited_stdin_stdout_stderr_and_exit",
+      "final_ast_sha256": "95186f881c628ccbc5c2d9a65a219263534fc7d7c74c07e6a69a65322327e36b",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_managed_launcher_refuses_invalid_or_escaping_release",
+      "final_ast_sha256": "70a554da8f15b373fe3f698ef75e66a44399911aa95db84fe172c51280791b16",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_update_network_timeouts_are_bounded_and_preserve_pointer",
+      "final_ast_sha256": "9ff5df846462c73091ed7aa44ab9940423f45f059441ed42533f217e8ddd85c8",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_stale_managed_process_keeps_contract_but_refuses_effects",
+      "final_ast_sha256": "919473b966db2615b4723ebbec021eb9cba929d17d2935db914a773a37eb2c46",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_event_label_setup_is_explicit_and_unknown_create_retains_guard",
+      "final_ast_sha256": "3d5814258ae82f6e4b76cfc956f274581ea1265018b3a66b7c390330f109bd51",
+      "matches_qualified": true
+    },
+    {
+      "method": "test_legacy_migration_guard_preservation_idempotence_and_future_refusal",
+      "final_ast_sha256": "a9292856d8c78bb809f834332321c6677b917346083a8ee4992f31676bea84d4",
+      "matches_qualified": true
+    }
+  ],
+  "limits": [
+    "No whole-file equivalence to qualified5b; newer canonical lifecycle, ARM, applied and publication retained.",
+    "Native S1/S2 proof retained by function/guard mapping; final head needs local gates and canonical CI.",
+    "verify_release changed-boundary delta requires current canonical byte regression plus local real Git proof.",
+    "Fixture safety strengthened after review: no adapter before config gate, all supplied runtime limits zero, execution/dispatch disabled despite missing-runtime defaults. Local regressions qualify these deltas; not claimed native5b equality.",
+    "Legacy bootstrap adoption requires explicit selection; new local regression proves marker/stdio/exit behavior only.",
+    "Native synthetic manager ACK is not deployed historical worker completion, writer drain, complete offline board proof or no-loss rollback.",
+    "macOS automatic update stopped; WSL before-cache snapshot absent; private CI4/4 exhausted."
+  ]
+}

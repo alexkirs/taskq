@@ -876,10 +876,29 @@ not replace the isolated spawn, naming, result and retirement qualification requ
 
 #### Automatic compatible release selection (#579)
 
+Qualification-only upstream: a reviewed explicit installation record may include
+`qualification_fixture` with exactly `repo`, `install_dir` and `project_root`. It binds a
+private `alexkirs/taskq-native-qualification-*` GitHub repository and two absolute, unlinked
+synthetic directories. The installer checks the repository's private ownership, real exact-head
+CI and main ancestry through the same installation path; it does not manufacture green checks.
+The fixture binding is retained in the pointer and cannot be added to an existing production
+installation. Its launcher must run in that exact project with that repository and zero configured
+and invocation model limits, including additional runtime entries. Validate this before constructing
+the board adapter. Qualification-only runtime admission/pass commands and automatic queue dispatch
+are disabled independently of missing-runtime default limits. Removing/changing the binding or
+selecting a production project refuses before effects.
+Automatic qualification reads that same private repository's owner-published release/tag;
+production continues to trust only canonical `alexkirs/taskq`. No new config default, credential,
+daemon, board migration or production release is introduced. This route qualifies the installer,
+not publication of a canonical release or adoption by historical executors.
+
 The selected release checks once at a managed launcher work-command boundary before loading the consumer project.
 Diagnostic `version`/`contract`, explicit `update` and bootstrap/child commands do not trigger installation.
-Direct source commands and ongoing processes never hot-load code. The unchanged bootstrap forwards a
-boundary marker; adopting a bootstrap that forwards this marker is an explicit installation step.
+Direct source commands and ongoing processes never hot-load code. A qualified bootstrap supporting
+this protocol forwards a boundary marker; adopting that bootstrap is an explicit installation step,
+separate from selecting a release pointer. Keep its previous alias/source for rollback; select only
+a reviewed qualified bootstrap and verify inherited stdio, exit status and boundary-marker forwarding.
+No bootstrap file or user alias is rewritten by automatic update.
 Legacy bootstraps remain notification-only until that step. No updater daemon or board enumeration.
 
 The smallest upstream qualification is a published, non-prerelease GitHub release on canonical
@@ -926,6 +945,12 @@ Every new turn must use the launcher.
 Older qualified contexts may finish receipts; the pointer cannot detect their turn end, so they cannot
 admit/dispatch new work. Propagation is next launcher boundary after the cache window; idle hosts and
 already-running turns have no guaranteed immediate propagation.
+Historical clients without the completion gate can still refuse after a pointer switch: matching
+bytes alone cannot retrofit their behavior. Compatibility qualification must explicitly cover their
+implemented protocol; the retained native completion proof is a synthetic manager ACK and identical
+repeat, not proof for deployed historical workers. Availability/backoff proof covers upstream discovery,
+not an offline board or generic writer drain. Legacy all-host drain remains explicit and unsupported
+native drain evidence remains unknown. No no-loss production rollback is established by fixture installs.
 
 Board consent remains: `taskq repair` supplies affected records, blockers and transition preview;
 owner yes means `repair --apply --yes` on that board, owner no leaves bytes/claims intact and writes

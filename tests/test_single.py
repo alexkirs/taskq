@@ -103,6 +103,11 @@ class Base(unittest.TestCase):
             git = taskq.shutil.which('git')
             env.update(PATH=str(Path(git).parent) if git else '', SYSTEMROOT=os.environ['SYSTEMROOT'],
                        USERPROFILE=str(self.root))  # isolated Windows home; no real profile/credentials
+            env['SystemDrive'] = Path(os.environ['SYSTEMROOT']).anchor.rstrip('\\/')
+            for key in ('ProgramData', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP'):
+                path = self.root / key.lower()
+                path.mkdir()
+                env[key] = str(path)
         def child(command, **_):
             try:
                 taskq.main(command[2:])
@@ -1448,7 +1453,7 @@ class ShellBriefs(Base):
         shell = Path(os.environ['SYSTEMROOT']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
         with mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
             return REAL_RUN([str(shell), '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
-                            capture_output=True, text=True, timeout=15,
+                            capture_output=True, text=True, timeout=15, cwd=self.root, stdin=subprocess.DEVNULL,
                             env={**os.environ, 'PATHEXT': '.COM;.EXE;.BAT;.CMD'})  # PS otherwise shell-opens .exe asynchronously
 
     def test_role_briefs_choose_native_windows_codex_only(self):
@@ -5192,6 +5197,15 @@ class Cleanup(Base):
     def git(self, *argv, folder=None):
         return REAL_RUN(['git', '-C', str(folder or self.root), '-c', 'user.name=t', '-c', 'user.email=t@t', *argv],
                         check=True, capture_output=True, text=True).stdout
+
+    def test_quarantined_original_branch_and_worktree_survive_cleanup(self):
+        issue = self.board.issues[2]
+        raw = taskq.issue_data(issue)
+        raw['repair_history'] = [{'snapshot': {'raw': {'execution_generation': 0, 'claim': None, 'supervisor': None}}}]
+        issue['body'] = taskq.block('closed successor with retained history', raw)
+        out = self.cleanup('--dry-run')
+        self.assertIn('kept worktree .worktrees/taskq-2: quarantined attempt evidence', out)
+        self.assertTrue((self.root / '.worktrees/taskq-2').exists())
 
     def commit(self, folder, name):
         Path(folder, name).write_text(f'{name}\n')

@@ -75,7 +75,28 @@ def worker_name(item, letter='T'):
     """R3 naming (#268, #572): `T<N> <ORCH> <title> (<machine>)`, `S<N> ...` the supervisor; ORCH is the task's `pm` on the
     board, never the caller that runs the pass; a task with no `pm` (R3 Transition): the caller, UNK for the owner's shell."""
     launcher = (item.get('pm') or {}).get('runtime') or (session() or {}).get('runtime') or os.environ.get('TASKQ_RUNTIME')
-    return f'{letter}{item["iid"]} {ORCH.get(launcher, "UNK")} {item["title"][:40]} ({machine()})'
+    suffix = task_branch(item).removeprefix(f'taskq-{item["iid"]}')
+    return f'{letter}{item["iid"]}{suffix} {ORCH.get(launcher, "UNK")} {item["title"][:40]} ({machine()})'
+
+def task_branch(item):
+    generation = (item.get('raw') or {}).get('execution_generation', 0)
+    if type(generation) is not int or generation < 0:
+        fail('malformed execution generation; repair required')
+    return f'taskq-{item["iid"]}' + (f'-g{generation}' if generation else '')
+
+def result_branch(item):
+    checkpoint = item['raw'].get('repair_checkpoint') or {}
+    saved = checkpoint.get('evidence', {}).get('result') or {}
+    return checkpoint['result_branch'] if saved.get('sha') and saved.get('sha') == (item.get('result') or {}).get('sha') \
+        else task_branch(item)
+
+def abandoned_identity(raw, identity):
+    return bool(identity and identity.get('session') and any(
+        identity.get('runtime') == old.get('runtime') and identity['session'] == old.get('session')
+        for entry in raw.get('repair_history', [])
+        for key in ('claim', 'supervisor', 'pm')
+        if key != 'pm' or (entry.get('context') or {}).get('manager') != (entry.get('snapshot') or {}).get('raw', {}).get('pm')
+        if isinstance(old := (entry.get('snapshot') or {}).get('raw', {}).get(key), dict)))
 
 def session():
     """This agent session, or None for the owner's shell. TASKQ_RUNTIME picks one when a session inherited another's id."""
@@ -132,6 +153,8 @@ def compatibility_reason(item):
         return f'#{item["iid"]}: legacy event_schema {version} is read-only; review taskq repair before starting work'
     if 'legacy_recovery' in item['raw']:
         return f'#{item["iid"]}: legacy recovery hold; no mutation, resume, replacement or acknowledgement'
+    if abandoned_identity(item['raw'], session()):
+        return f'#{item["iid"]}: abandoned execution identity; writes and resume refused'
     return None
 
 
@@ -636,7 +659,7 @@ class Claude:
     # #38, #51, #71: a worker gets only these tools, no MCP, no Chrome, and a pinned mode (else `auto` stops `taskq`).
     # `--tools` takes several values: a flag must follow it, never the prompt.
     TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'WebFetch', 'WebSearch']
-    names = r'[TS](\d+) [A-Z]{3} '  # worker_name; `taskq cleanup` widens it to the old `T<N> ` / `S<N> ` names
+    names = r'[TS](\d+)(?:-g\d+)? [A-Z]{3} '  # generation handles preserve earlier attempt files
     SELF_WAKE = True  # while its process runs, a supervisor wakes on its own background `taskq wait --task N`
 
     def agents(self):
@@ -1291,6 +1314,8 @@ def move(current, state, action, text='', **fields):
         fail('model worker identity retirement/replacement is not qualified; preserve pending receipts')
     labels = [label for label in current['labels'] if not label.startswith(PREFIX)] + ([PREFIX + state] if state else [])
     raw = {**current['raw'], **{key: current[key] for key in FIELDS}, **fields}
+    if any(abandoned_identity(raw, raw.get(key)) for key in ('claim', 'supervisor')):
+        fail('abandoned identity cannot be assigned into a successor')
     raw['events'] = [dict(event, acks=list(event.get('acks', []))) for event in raw.get('events', [])]
     reconcile_recipients(raw)
     append_event(raw, action, text)
@@ -1646,7 +1671,7 @@ def merge(current, sha):
     It merges only once the gate passes on the PR head: GitHub the 'tests' check (#359), GitLab the MR's pipeline (#479);
     a PR behind main is not updated.
     A PR that does not merge (conflict, failing checks) goes back to the worker: requeue with the platform's message."""
-    lab, host, branch = CONFIG['board'] == 'gitlab', CONFIG.get('host'), f'taskq-{current["iid"]}'
+    lab, host, branch = CONFIG['board'] == 'gitlab', CONFIG.get('host'), result_branch(current)
     where = ['-R', (f'https://{host}/' if lab else f'{host}/') * bool(host) + CONFIG['repo']]  # gh takes HOST/OWNER/REPO, glab a URL
 
     def cli(*command):
@@ -1710,7 +1735,7 @@ def cleanup(current):
     with a note for the close comment. Never --force: that lost a worker's changes (#284). `"workspace": "external"`: never (#477)."""
     if CONFIG.get('workspace') == 'external':
         return 'kept: owned by host'
-    branch = f'taskq-{current["iid"]}'
+    branch = task_branch(current)
     tree = CONFIG['root'] / '.worktrees' / branch
     if (current['claim'] or {}).get('name') != machine() or not tree.is_dir():
         return ''
@@ -1953,7 +1978,7 @@ def publish_direct(current, sha, git):
             fail(done.stderr.strip() or f'git {args[0]} failed')
         return done.stdout.strip()
 
-    branch = f'refs/heads/taskq-{current["iid"]}'
+    branch = f'refs/heads/{result_branch(current)}'
     if run('ls-remote', 'origin', branch).split()[:1] != [sha]:
         fail(f'{branch}: remote candidate does not match result {sha}')
     run('merge-base', '--is-ancestor', 'origin/main', sha)  # fast-forward only; never discard new main work
@@ -2037,7 +2062,8 @@ def close_one(args):
     if os.environ.get('CODEX_SANDBOX'):  # #502: the sandbox can neither stop nor archive: the next pass outside retires them
         return
     issue, me = BOARD.get(args.n), (session() or {}).get('session')  # R11: its recorded workers, never the session running close
-    retire(lambda name, n, sid, _: n == args.n and sid != me and recorded(issue, name, sid) == 'worker', f'#{args.n}: could not stop its sessions')
+    retire(lambda name, n, sid, _: n == args.n and sid != me and recorded(issue, name, sid) == 'worker'
+           and not abandoned_identity(issue_data(issue), {'runtime': name, 'session': sid}), f'#{args.n}: could not stop its sessions')
 
 def recorded(issue, runtime, sid):
     """R11 (#478, #525): 'supervisor' or 'worker' when the task records this session (the block's supervisor or claim,
@@ -2115,6 +2141,12 @@ def cmd_cleanup(args):
     def git(*argv):
         return subprocess.run([shutil.which('git') or fail('git not found'), '-C', str(root), *argv], capture_output=True, **no_window(), text=True, encoding='utf-8')
 
+    def quarantined_branch(n, branch):
+        state(n)  # load a closed task too, without assuming the earlier open-list snapshot is complete
+        issue = issues.get(n) or next((BOARD.get(i['iid']) for i in items if i['iid'] == n), None)
+        return bool(issue and any(task_branch({'iid': n, 'raw': (entry.get('snapshot') or {}).get('raw', {})}) == branch
+                                  for entry in issue_data(issue).get('repair_history', [])))
+
     def act(what, *command):  # one removal: done (or only printed with --dry-run), else kept with git's reason
         done = None if dry else effect(git, *command)
         if done and done.returncode:
@@ -2133,6 +2165,8 @@ def cmd_cleanup(args):
             if not re.fullmatch(r'taskq-\d+', tree.name) or not tree.is_dir():
                 continue
             n, what = task_of(tree.name), f'worktree .worktrees/{tree.name}'
+            if quarantined_branch(n, tree.name):
+                kept.append(f'{what}: quarantined attempt evidence'); continue
             status = git('-C', str(tree), 'status', '--porcelain')
             why = {'open': 'open task', 'unknown': 'unknown task'}.get(state(n)) or \
                 ('unknown' if status.returncode else 'dirty' if status.stdout.strip() else None)
@@ -2147,6 +2181,8 @@ def cmd_cleanup(args):
                 continue
             local, n = ref.startswith('refs/heads/'), task_of(name)
             what = f'branch {name}' if local else f'remote branch origin/{name}'
+            if quarantined_branch(n, name):
+                kept.append(f'{what}: quarantined attempt evidence'); continue
             if state(n) == 'open':
                 kept.append(f'{what}: open task')
                 continue
@@ -2165,6 +2201,7 @@ def cmd_cleanup(args):
             what = f'{name} session {session or "?"} of #{n}'
             why = {'open': 'open task', 'unknown': 'unknown task'}.get(state(n)) or \
                 ('running' if live else 'liveness unknown' if live is None else None) or \
+                ('quarantined attempt evidence' if abandoned_identity(issue_data(issues[n]), {'runtime': name, 'session': session}) else None) or \
                 (None if recorded(issues[n], name, session) else 'name only, not recorded on the board')
             if why:
                 kept.append(f'{what}: {why}')
@@ -2174,7 +2211,7 @@ def cmd_cleanup(args):
         return gone
     for name, runtime in kinds.items():
         if isinstance(runtime, Claude):
-            runtime.names = r'[TS](\d+) '  # old names too: `T<N> <title>`, the gone supervisor `S<N>`
+            runtime.names = r'[TS](\d+)(?:-g\d+)? '  # old names and isolated generation handles
         try:
             (getattr(runtime, 'retire', lambda *_: None)(goner(name), False) if dry else
              effect(getattr(runtime, 'retire', lambda *_: None), goner(name), False))  # never a live worker
@@ -2182,8 +2219,9 @@ def cmd_cleanup(args):
             kept.append(f'{name} sessions: unknown ({error})')
     for path in sorted((root / '.taskq').glob('*.pid')):
         n = re.fullmatch(r'S(\d+)', path.stem)  # the gone supervisor's; a T<N>.pid is Codex's handle, its retire decides (#478)
-        pid, _, birth = read_process(path)
-        if n and state(int(n[1])) == 'closed' and process_state(pid, birth) == 'dead':
+        pid, sid, birth = read_process(path)
+        if n and state(int(n[1])) == 'closed' and process_state(pid, birth) == 'dead' \
+                and not abandoned_identity(issue_data(issues[int(n[1])]), {'runtime': 'codex', 'session': sid}):
             dry or effect(path.unlink)
             removed.append(f'{verb} .taskq/{path.name}')
     for wait in sorted((root / '.taskq').glob('wait*.json')):  # one per manager (#532)
@@ -2198,7 +2236,7 @@ def cmd_cleanup(args):
         if item['state'] == 'doing' and claim.get('name') == here and claim.get('runtime') in kinds \
                 and runtime_state(kinds[claim['runtime']], claim['session']) == 'dead':
             mess.append(f'#{n} doing: session {claim["session"]} is gone')
-        if item['state'] == 'review' and CONFIG['publish'] == 'pr' and prs is not None and f'taskq-{n}' not in prs and not (
+        if item['state'] == 'review' and CONFIG['publish'] == 'pr' and prs is not None and result_branch(item) not in prs and not (
                 re.fullmatch('[0-9a-f]{7,40}', sha) and not git('merge-base', '--is-ancestor', sha, 'origin/main').returncode):  # an answer is on main
             mess.append(f'#{n} review: no open PR')
     for branch, number in sorted((prs or {}).items(), key=lambda pair: str(pair[0])):
@@ -2263,12 +2301,13 @@ def shell_steps(runtime, *commands):
 def brief(item, runtime):
     """The worker's prompt: its name first (R3, #572: a runtime's fallback title), the task, its workspace, the taskq commands it uses."""
     n, root, tq = item['iid'], CONFIG['root'], queue_tool(runtime)
-    create = f'glab mr create --yes --target-branch main --source-branch taskq-{n} --title "<title>" --description' if CONFIG['board'] == 'gitlab' \
-        else f'gh pr create --base main --head taskq-{n} --title "<title>" --body'
-    push = f'`git push --force-with-lease origin HEAD:refs/heads/taskq-{n}`, open a pull request once (a push updates it):\n  `{create} "<summary>"`, ' \
-        f'then `{tq} result {n} --sha <PR head full SHA>' if CONFIG['publish'] == 'pr' else f'`git push --force-with-lease origin HEAD:refs/heads/taskq-{n}`, then\n  `{tq} result {n} --sha <candidate full SHA>'
-    workspace = f'take your workspace from the project instructions (AGENTS.md) or the path the manager gave, on branch taskq-{n};\nthe host owns it: never remove it' \
-        if CONFIG.get('workspace') == 'external' else f'from {root} run `{shell_steps(runtime, "git fetch origin", f"git worktree add -b taskq-{n} .worktrees/taskq-{n} origin/main")}`, work only there,\nnever in the main checkout'
+    branch = task_branch(item)
+    create = f'glab mr create --yes --target-branch main --source-branch {branch} --title "<title>" --description' if CONFIG['board'] == 'gitlab' \
+        else f'gh pr create --base main --head {branch} --title "<title>" --body'
+    push = f'`git push --force-with-lease origin HEAD:refs/heads/{branch}`, open a pull request once (a push updates it):\n  `{create} "<summary>"`, ' \
+        f'then `{tq} result {n} --sha <PR head full SHA>' if CONFIG['publish'] == 'pr' else f'`git push --force-with-lease origin HEAD:refs/heads/{branch}`, then\n  `{tq} result {n} --sha <candidate full SHA>'
+    workspace = f'take your workspace from the project instructions (AGENTS.md) or the path the manager gave, on branch {branch};\nthe host owns it: never remove it' \
+        if CONFIG.get('workspace') == 'external' else f'from {root} run `{shell_steps(runtime, "git fetch origin", f"git worktree add -b {branch} .worktrees/{branch} origin/main")}`, work only there,\nnever in the main checkout'
     return f'''{worker_name(item)}
 You are the taskq worker for task #{n}: {item["title"]}. The task is claimed for you: do it without asking for confirmation.
 Queue tool: `{tq}`. {shell_instructions(runtime, n)}
@@ -2285,13 +2324,13 @@ Use that exact line in new commits and the PR/MR description; preserve it throug
 only for tasks actually covered, using their adapter URLs. No automatic-closing keywords or copied work logs;
 exact SHA/check evidence belongs in taskq result and task history. Do not rewrite historical commits.
 
-Workspace: {workspace}; a branch taskq-{n} left by an earlier worker: continue it. A task that ends in an answer, not a commit,
+Workspace: {workspace}; a branch {branch} left by an earlier worker: continue it. A task that ends in an answer, not a commit,
 needs no worktree. Commands:
 - A question only the owner can decide (a product choice, an action that cannot be undone): `{tq} ask {n} --text "<what was done; the question>"
   --option "<A>" --option "<B>" --recommend <K> [--link <url of a result, image or video>]`, then stop. A result that leaves the owner a choice
   takes the same --option/--recommend/--link; an option starting `close` accepts the result.
 - Cannot be done: `{tq} requeue {n} --text "<why>"`, then stop.
-- Deliver: commit on branch taskq-{n}, `{shell_steps(runtime, "git fetch origin", "git rebase origin/main")}`, run the tests required by § 10 Testing policy, {push} --checks "<commands and outcome>" --text "<summary>"`, then stop.
+- Deliver: commit on branch {branch}, `{shell_steps(runtime, "git fetch origin", "git rebase origin/main")}`, run the tests required by § 10 Testing policy, {push} --checks "<commands and outcome>" --text "<summary>"`, then stop.
   An answer with no commit: the result names the current origin/main SHA and the text holds the answer.
 Everything written through taskq is public: no secrets, tokens or paths outside the repository.'''
 
@@ -2486,6 +2525,8 @@ def owned_model_turn(item, kind, role_name, prompt, events=(), resume=None):
                'owner': origin(), 'age': raw.get('admission_age', time.time()), 'priority': item['priority'],
                'events': event_ids, 'event_digest': digest, 'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest(),
                'demand': {'model:codex': 1}}
+    if raw.get('execution_generation'):
+        request['execution_generation'] = raw['execution_generation']
     if hasattr(project, 'domain'):
         request['project_domain'] = project.domain
     key = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
@@ -2556,7 +2597,8 @@ def replace(item, kind, runtime, role, running=False):
         return False  # #576: a reassignment seen by this read: no retire, no spawn
     try:
         retired = effect(getattr(kind, 'retire', lambda *_: None), lambda n, sid=None, live=None: n == item['iid']
-                                                  and recorded(issue, runtime, sid) == role, running)
+                                                  and recorded(issue, runtime, sid) == role
+                                                  and not abandoned_identity(issue_data(issue), {'runtime': runtime, 'session': sid}), running)
         if retired is False:
             return False
     except Exception as error:
@@ -2789,7 +2831,7 @@ def cmd_applied(args):
     relative = Path(args.artifact)
     root = CONFIG['root'].resolve()
     executable = shutil.which('git') or fail('git not found')
-    workspace = root / '.worktrees' / f'taskq-{n}'
+    workspace = root / '.worktrees' / task_branch(item)
     if CONFIG.get('workspace') != 'external':
         if workspace.is_symlink() or not workspace.is_dir() or not workspace.resolve().is_relative_to(root):
             fail('applied worker worktree must stay inside its project')
@@ -2797,7 +2839,7 @@ def cmd_applied(args):
                                     capture_output=True, text=True, encoding='utf-8', timeout=10)
         branch = subprocess.run([executable, '-C', str(workspace), 'symbolic-ref', '--quiet', '--short', 'HEAD'],
                                 capture_output=True, text=True, encoding='utf-8', timeout=10)
-        if registered.returncode or branch.returncode or branch.stdout.strip() != f'taskq-{n}' \
+        if registered.returncode or branch.returncode or branch.stdout.strip() != task_branch(item) \
                 or not any(Path(line[9:]).resolve() == workspace.resolve()
                            for line in registered.stdout.split('\0') if line.startswith('worktree ')):
             fail('applied requires its registered task branch/worktree')
@@ -3139,7 +3181,8 @@ def stale(by_number):
         fresh = parse(issues[n]) if issues[n] and issues[n]['state'] == 'open' else None
         if fresh and sid in ((fresh['claim'] or {}).get('session'), (fresh['supervisor'] or {}).get('session')):
             return False  # a fresh controller/worker is current even when the pass's earlier read held another id
-        return bool(issues[n] and host_scope(issues[n]) and recorded(issues[n], name, sid))
+        return bool(issues[n] and host_scope(issues[n]) and recorded(issues[n], name, sid)
+                    and not abandoned_identity(issue_data(issues[n]), {'runtime': name, 'session': sid}))
     return gone
 
 def row(item, kinds, here, state=None):
@@ -3894,6 +3937,8 @@ def write_task_verified(issue, raw, labels, preserve_text=False):
     """A successful transport response is not a receipt until fresh task readback matches."""
     if 'legacy_recovery' in issue_data(issue):
         fail(f'#{issue["iid"]}: legacy recovery hold; authoritative writes refused')
+    if any(abandoned_identity(raw, raw.get(key)) for key in ('claim', 'supervisor')):
+        fail('abandoned identity cannot be assigned into a successor')
     body=(BLOCK.sub(lambda _: block('',raw).lstrip('\n'),issue['body'],count=1) if preserve_text
           else block(BLOCK.sub('',issue['body']).strip(),raw))
     def write_and_read():
@@ -5094,8 +5139,321 @@ def repair_plan(hold_legacy=False):
     return changes
 
 
+REPAIR_RESOURCES = ('task-control', 'workspace-git', 'remote-publication', 'native-tools', 'related-capacity')
+
+def repair_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+
+def repair_source(issue):
+    value = {key: issue.get(key) for key in ('iid', 'state', 'title', 'body', 'labels', 'assignees', 'comments')}
+    for key in ('labels', 'assignees'):
+        if isinstance(value[key], list):
+            value[key] = sorted(value[key])  # provider set ordering is not a lifecycle/source change
+    return value
+
+def repair_manager(value):
+    if value is None:
+        return None
+    found = re.fullmatch(r'([a-z][a-z0-9_-]*):([\w-]{1,80}):([\w.-]{1,80})', value)
+    if not found:
+        fail('repair manager requires RUNTIME:SID:HOST, no identity inference')
+    return dict(zip(('runtime', 'session', 'name'), found.groups()))
+
+def repair_checkpoint(item):
+    """Select the nearest recorded working boundary; native adapter must qualify it before apply."""
+    raw = item['raw']; result = raw.get('result')
+    review = item['state'] == 'review' and isinstance(result, dict) and isinstance(result.get('sha'), str) \
+        and bool(re.fullmatch('[0-9a-f]{40}', result['sha']))
+    return {'state': 'review' if review else 'ready',
+            'step': 'review-recorded-result' if review else 'resume-approved-specification',
+            'result_branch': result_branch(item) if review else None,
+            'evidence': {'source_state': item['state'], 'result': result if review else None,
+                         'result_events': [e['id'] for e in raw.get('events', []) if e.get('action') == 'result'],
+                         'owner_decisions': {k: raw[k] for k in ('answer_commands', 'owner_decision') if k in raw}},
+            'retains': ['human-specification', 'scope', 'dependencies', 'owner-decisions', 'attempt-audit']
+                       + (['completed-result'] if review else []),
+            'resets': ['broken-continuation', 'old-role-assignments', 'old-runtime-attempt'],
+            'fallback_restart': not review, 'native_verification_required': True}
+
+REPAIR_ACCEPTED_RISKS = ('historical-detached-writers', 'unfenced-shared-resource-rights',
+                         'unqualified-desktop-resume', 'optional-keeper-loss')
+
+def repair_risk_selection(numbers, force, accepted, approval, result):
+    if not accepted:
+        if approval or result:
+            fail('owner approval/result binding requires --accept-legacy-risk')
+        return None
+    if not force or len(numbers or []) != 1 or not re.fullmatch('[0-9a-f]{40}', result or '') \
+            or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', approval or ''):
+        fail('accepted legacy risk requires force, exactly one task, owner approval reference and exact retained result SHA')
+    return {'approval_reference': approval, 'retained_result_sha': result,
+            'risks': list(REPAIR_ACCEPTED_RISKS)}
+
+def repair_risk_native(context):
+    """Fresh native checkpoint/known-root observations. No historical closure assertion."""
+    if context['project'] != {k: str(CONFIG.get(k) or '') for k in ('board', 'host', 'repo', 'root')}:
+        fail('accepted-risk native project binding changed')
+    checkpoint = context['checkpoint']; consent = context['owner_accepted_risk']
+    result = checkpoint['evidence']['result']
+    if checkpoint['state'] != 'review' or checkpoint['fallback_restart'] \
+            or not result or result.get('sha') != consent['retained_result_sha']:
+        fail('accepted risk requires the exact recorded working review result; no restart/reacceptance')
+    sha = update_git(CONFIG['root'], 'rev-parse', '--verify', result['sha'] + '^{commit}')
+    if sha != result['sha']:
+        fail('accepted-risk result Git object mismatch')
+    roots = []
+    for role_name in ('claim', 'supervisor'):
+        identity = context['roles'].get(role_name)
+        if not identity:
+            continue
+        evidence = {'role': role_name, 'identity': identity, 'state': 'unknown', 'pid': None, 'birth': None}
+        if identity.get('runtime') == 'codex' and identity.get('name') == machine():
+            folder = CONFIG['root'] / '.taskq'
+            paths = list(folder.glob('*.pid')) if folder.exists() else []
+            for path in paths:
+                if path.is_symlink():
+                    continue
+                pid, sid, native_birth = read_process(path)
+                if sid != identity.get('session'):
+                    continue
+                state = process_state(pid, native_birth)
+                if state == 'running':
+                    fail('accepted legacy risk refuses a known running original root; addressed stop requires separate scope')
+                roots.append({**evidence, 'state': state, 'pid': pid, 'birth': native_birth})
+            if not any(e['role'] == role_name for e in roots):
+                roots.append(evidence)
+        else:
+            roots.append(evidence)
+    return {'result_commit': sha, 'known_roots': roots,
+            'unknowns': list(REPAIR_ACCEPTED_RISKS), 'historical_drain_proven': False,
+            'broad_resource_fenced': False, 'denied_resources': [],
+            'related_leases': 'unchanged-unreconciled'}
+
+def repair_risk_proof(context):
+    return {'context': context, **repair_risk_native(context),
+            'owner_accepted_risk': context['owner_accepted_risk'],
+            'checkpoint_verified': True, 'controllers': 'historical-unknown-risk-accepted',
+            'new_workspace_isolated': False}
+
+def repair_risk_verify(context, proof):
+    native = repair_risk_native(context)
+    return proof == {'context': context, **native,
+                     'owner_accepted_risk': context['owner_accepted_risk'],
+                     'checkpoint_verified': True, 'controllers': 'historical-unknown-risk-accepted',
+                     'new_workspace_isolated': False}
+
+def runtime_repair_plan(numbers, force=False, reason='', manager=None, accepted_risk=None):
+    """Read-only preview. Adapter observations are never accepted from a caller file."""
+    if not numbers or len(numbers) > 100 or any(type(n) is not int or n <= 0 for n in numbers) or len(set(numbers)) != len(numbers):
+        fail('runtime repair requires 1..100 distinct selected task IDs')
+    if force and (not isinstance(reason, str) or not reason.strip() or len(reason.encode()) > 4096):
+        fail('repair --force requires a bounded owner abandonment reason')
+    if manager is not None and not force:
+        fail('manager selection belongs only to an explicit owner force plan')
+    adapter = getattr(BOARD, 'repair_adapter', None)
+    qualified = adapter is not None and all(callable(getattr(adapter, name, None)) for name in ('observe', 'verify', 'fence'))
+    plans = []
+    for n in sorted(numbers):
+        issue = issue_history(read_issue(n))
+        item = parse(issue) if issue.get('state') == 'open' else None
+        if not item or item['raw'].get('event_schema') != EVENT_SCHEMA:
+            fail(f'#{n}: runtime repair requires a selected open schema{EVENT_SCHEMA} task; review schema repair separately')
+        if not mine(item):
+            fail(f'#{n}: outside configured selection')
+        if reason_blocked := execution_policy_reason(item):
+            fail(reason_blocked)
+        raw = item['raw']
+        if not force and raw.get('result') and item['state'] != 'review':
+            fail(f'#{n}: result is not at a working review checkpoint; owner force must select the rollback boundary')
+        intentional = item['state'] in ('later', 'waiting') or any(label in item['labels'] for label in ('intentional-hold', 'product-hold')) \
+            or item['state'] == 'ask' and not (raw.get('legacy_recovery') or raw.get('model_recovery'))
+        if intentional:
+            fail(f'#{n}: intentional Later/product/dependency hold; repair cannot change its intent')
+        if not any(raw.get(key) for key in ('claim', 'supervisor', 'legacy_recovery', 'model_recovery')):
+            fail(f'#{n}: no technical stale assignment or recovery attempt selected')
+        generation = raw.get('execution_generation', 0)
+        if type(generation) is not int or generation < 0 or len(raw.get('repair_history', [])) >= EVENT_LIMIT:
+            fail(f'#{n}: malformed/full repair history; preserve for reconciliation')
+        selected_manager = manager or raw.get('pm')
+        if not isinstance(selected_manager, dict) or any(not isinstance(selected_manager.get(k), str) or not selected_manager[k]
+                                                       for k in ('runtime', 'session', 'name')):
+            fail(f'#{n}: complete legitimate manager selection required')
+        if abandoned_identity(raw, selected_manager):
+            fail(f'#{n}: abandoned identity cannot become the reset manager')
+        if manager is not None and any(manager.get('session') == (raw.get(key) or {}).get('session')
+                                      and manager.get('runtime') == (raw.get(key) or {}).get('runtime')
+                                      for key in ('claim', 'supervisor')):
+            fail(f'#{n}: old execution identity cannot become the reset manager')
+        context = {'version': 1, 'project': {k: str(CONFIG.get(k) or '') for k in ('board', 'host', 'repo', 'root')},
+                   'task': n, 'mode': 'force' if force else 'repair', 'reason': reason if force else '',
+                   'source_sha256': repair_digest(repair_source(issue)), 'generation': generation,
+                   'next_generation': generation + 1 if force else generation, 'manager': selected_manager,
+                   'roles': {k: raw.get(k) for k in ('pm', 'claim', 'supervisor')},
+                   'checkpoint': repair_checkpoint(item),
+                   'turns': raw.get('model_turns', {}), 'resources': list(REPAIR_RESOURCES),
+                   'workspace': str(CONFIG['root'] / '.worktrees' / (f'taskq-{n}-g{generation+1}' if force else task_branch(item)))}
+        if accepted_risk:
+            context['owner_accepted_risk'] = accepted_risk
+        context['operation'] = repair_digest(context)  # adapter fence must replay this operation without repeating effects
+        observation = repair_risk_proof(context) if accepted_risk else adapter.observe(json.loads(json.dumps(context))) if qualified else None
+        supported = repair_risk_verify(context, observation) if accepted_risk else qualified and isinstance(observation, dict) and observation.get('context') == context \
+            and adapter.verify(json.loads(json.dumps(context)), json.loads(json.dumps(observation))) is True
+        available = supported and observation.get('checkpoint_verified') is True \
+            and (bool(accepted_risk) or (observation.get('fence_available') is True if force else observation.get('stale') is True))
+        blockers = [] if available else [
+            'No authenticated native repair/fencing adapter for this exact source and resource scope.',
+            'Quiesce only the selected old controllers/tools by exact SID and PID/birth; preserve handles and outputs.',
+            'Deny old future task/Git/provider writes; a dead root, new directory or service epoch is insufficient.',
+            'Reconcile/release only exact related leases; unknown unrelated grants remain untouched.']
+        plans.append({'context': context, 'status': 'owner-risk-decision-required' if accepted_risk and available else 'fence-required' if force and available else 'normalizable' if available else 'operator-required',
+                      'target_state': context['checkpoint']['state'],
+                      'rollback': {'from': item['state'], 'to': context['checkpoint']['state'],
+                                   'checkpoint': context['checkpoint']},
+                      'retained_result_sha': (raw.get('result') or {}).get('sha'), 'blockers': blockers,
+                      'observation_sha256': repair_digest(observation) if supported else None})
+    plan = {'type': 'taskq.repair-plan', 'version': 1, 'mode': 'force' if force else 'repair', 'tasks': plans,
+            'investigation': {'agent_invoked': False, 'executes_content': False,
+                             'assignment': 'Inspect exact board/code history, native SID/PID births, tool ownership, outputs and resource rights. '
+                             'The agent is investigator/executor of this supported plan, never the source of drain proof. '
+                             'Unknown coverage requires a scoped stop/isolation/revocation checkpoint, not a handwritten receipt.'}}
+    return {**plan, 'digest': repair_digest(plan)}
+
+def repair_proof(context, proof, force):
+    if context.get('owner_accepted_risk'):
+        if not force or not repair_risk_verify(context, proof):
+            raise ValueError('exact owner risk/checkpoint proof unavailable; no false drain/fence')
+        return
+    if not isinstance(proof, dict) or proof.get('context') != context or not isinstance(proof.get('unknowns'), list) \
+            or any(not isinstance(text, str) for text in proof['unknowns']) \
+            or proof.get('checkpoint_verified') is not True \
+            or proof.get('controllers') != 'stopped-or-isolated' or proof.get('related_leases') != 'released' \
+            or set(proof.get('denied_resources') or []) != set(REPAIR_RESOURCES):
+        raise ValueError('exact native future-effect fence/resource settlement unavailable')
+    if not force and (proof.get('historical_drain_proven') is not True or proof['unknowns']):
+        raise ValueError('ordinary repair requires proven stale ownership, not abandonment')
+    if force and proof.get('new_workspace_isolated') is not True:
+        raise ValueError('owner force requires an isolated successor workspace')
+
+def repair_transition(issue, context, proof, plan_id, actor):
+    """One audit-preserving reducer; force abandonment is not historical completion."""
+    if repair_digest(repair_source(issue)) != context['source_sha256']:
+        raise ValueError('repair source changed; no overwrite')
+    raw = json.loads(json.dumps(issue_data(issue)))
+    force = context['mode'] == 'force'
+    repair_proof(context, proof, force)
+    history = list(raw.get('repair_history', []))
+    snapshot = {'raw': {k: v for k, v in raw.items() if k != 'repair_history'},
+                'human_text': BLOCK.sub('', issue['body']).strip(), 'labels': issue['labels'], 'comments': issue.get('comments')}
+    entry = {'plan': plan_id, 'mode': context['mode'], 'actor': actor, 'reason': context['reason'],
+             'source_sha256': context['source_sha256'], 'context': context, 'snapshot': snapshot,
+             'snapshot_sha256': repair_digest(snapshot), 'proof': proof,
+             'outcome': 'abandoned-by-owner' if force else 'stale-ownership-normalized',
+             'historical_drain_proven': proof.get('historical_drain_proven') is True}
+    raw.update(claim=None, supervisor=None, order=None, pm=context['manager'], decision=None, waiting_for=None,
+               model_turns={}, model_turn_history=[], events=[], action_payloads={}, application_receipts={},
+               retry_counts={'supervisor': 0, 'worker': 0, 'workers': 0}, repair_history=history + [entry])
+    for key in ('legacy_recovery', 'model_recovery', 'answer_commands', 'acceptance_receipts', 'integrated_review'):
+        raw.pop(key, None)
+    if force:
+        raw.update(result=context['checkpoint']['evidence']['result'], execution_generation=context['next_generation'])
+        raw['repair_checkpoint'] = context['checkpoint']
+    raw['event_seq'] = snapshot['raw'].get('event_seq', 0)  # event identities never reused
+    append_event(raw, 'repair-reset' if force else 'repair-normalize',
+                 f'{entry["outcome"]}; historical drain ' + ('proven' if entry['historical_drain_proven'] else 'unknown; retained in audit'),
+                 targets=[recipient('manager', context['manager'])])
+    state = context['checkpoint']['state'] if force else 'review' if raw.get('result') else 'ready'
+    labels = event_labels(raw, [label for label in issue['labels'] if not label.startswith(PREFIX)] + [PREFIX + state])
+    body = BLOCK.sub(lambda _: block('', raw).lstrip('\n'), issue['body'], count=1)
+    if len(body.encode()) > 1024 * 1024:
+        raise ValueError('repair audit exceeds bounded native payload; archive qualification required')
+    return raw, labels, body
+
+def cmd_runtime_repair(args):
+    if args.apply and (not args.yes or not re.fullmatch('[0-9a-f]{64}', args.expected or '')):
+        fail('runtime repair --apply requires --yes and exact preview --expected DIGEST')
+    force = args.force
+    manager = repair_manager(args.manager)
+    accepted_risk = repair_risk_selection(args.tasks, force, args.accept_legacy_risk, args.owner_approval, args.retain_result)
+    with coordination() if args.apply else contextlib.nullcontext():
+        # Exactly matching stored operation replays without another fence or write.
+        if args.apply:
+            replay = []
+            for n in args.tasks:
+                issue = read_issue(n); item = parse(issue) if issue.get('state') == 'open' else None
+                if not item or (role(item) != 'owner' if force else role(item) not in ('owner', 'manager')):
+                    fail('owner force requires owner shell; normal repair requires recorded manager or owner')
+                entry = next((e for e in item['raw'].get('repair_history', []) if e.get('plan') == args.expected), None)
+                if entry:
+                    if entry.get('mode') != ('force' if force else 'repair') or entry.get('reason') != (args.reason if force else '') \
+                            or manager and entry['context']['manager'] != manager \
+                            or entry['context'].get('owner_accepted_risk') != accepted_risk \
+                            or entry.get('snapshot_sha256') != repair_digest(entry.get('snapshot')):
+                        fail('conflicting repair replay')
+                    adapter = getattr(BOARD, 'repair_adapter', None)
+                    if not (repair_risk_verify(entry['context'], entry['proof']) if accepted_risk else
+                            adapter is not None and callable(getattr(adapter, 'verify', None))
+                            and adapter.verify(entry['context'], entry['proof']) is True):
+                        fail('repair replay native fence verification unavailable; no effects')
+                    replay.append(n)
+            if replay:
+                if set(replay) != set(args.tasks):
+                    fail('partial repair replay; reconcile exact per-task receipts before retry')
+                print(json.dumps({'type': 'taskq.repair', 'repeated': True, 'tasks': replay, 'plan': args.expected})); return
+        plan = runtime_repair_plan(args.tasks, force, args.reason or '', manager, accepted_risk)
+        if not args.apply:
+            print(json.dumps(plan, sort_keys=True, ensure_ascii=False)); return
+        if plan['digest'] != args.expected:
+            fail('repair preview changed; no effects; review a fresh plan')
+        if any(task['status'] == 'operator-required' for task in plan['tasks']):
+            fail('native fencing/settlement capability unavailable; follow exact preview operator actions')
+        adapter = getattr(BOARD, 'repair_adapter', None)
+        # Preflight payload bounds and sources for every task before the first native effect.
+        issues = {}
+        for task in plan['tasks']:
+            context = task['context']; issue = issue_history(read_issue(context['task']))
+            if repair_digest(repair_source(issue)) != context['source_sha256']:
+                fail('repair source changed before effects')
+            # Only payload sizing uses this preview placeholder, never verification or apply authority.
+            sizing = {'context': context, 'unknowns': [], 'controllers': 'stopped-or-isolated',
+                      'checkpoint_verified': True,
+                      'related_leases': 'released', 'denied_resources': list(REPAIR_RESOURCES),
+                      'historical_drain_proven': True, 'new_workspace_isolated': True}
+            if accepted_risk:
+                sizing = repair_risk_proof(context)
+            _, _, candidate_body = repair_transition(issue, context, sizing, plan['digest'], origin())
+            if len(candidate_body.encode()) + 65536 > 1024 * 1024:
+                fail('repair audit lacks bounded proof capacity; no effects')
+            issues[context['task']] = issue
+        for task in plan['tasks']:
+            context = task['context']; issue = issues[context['task']]
+            proof = repair_risk_proof(context) if accepted_risk else effect(adapter.fence, json.loads(json.dumps(context))) if force else adapter.observe(json.loads(json.dumps(context)))
+            if len(json.dumps(proof, ensure_ascii=False).encode()) > 65536:
+                raise RuntimeError('repair proof exceeds preflight bound; retain guard')
+            repair_proof(context, proof, force)
+            if not (repair_risk_verify(context, proof) if accepted_risk else
+                    adapter.verify(json.loads(json.dumps(context)), json.loads(json.dumps(proof))) is True):
+                raise RuntimeError('native repair proof not authenticated; retain guard')
+            fresh = issue_history(read_issue(context['task']))
+            raw, labels, body = repair_transition(fresh, context, proof, plan['digest'], origin() or {'runtime': 'owner', 'session': None, 'name': machine()})
+            def write_verified():
+                BOARD.update(context['task'], labels=labels, body=body)
+                readback = issue_history(read_issue(context['task']))
+                if repair_source(readback) != repair_source({**fresh, 'labels': labels, 'body': body}):
+                    raise RuntimeError('repair write readback unknown/conflicting; retain guard')
+                if not (repair_risk_verify(context, proof) if accepted_risk else adapter.verify(context, proof) is True):
+                    raise RuntimeError('repair fence changed after write; retain guard')
+            effect(write_verified)
+        print(json.dumps({'type': 'taskq.repair', 'repeated': False, 'tasks': args.tasks, 'plan': plan['digest'], 'workers_started': 0}))
+
+
 def cmd_repair(args):
     """Explicit consent, exact readback and resumable per-issue stamps; no worker effects."""
+    if args.tasks or args.force:
+        if args.hold_legacy:
+            fail('schema held-legacy conversion and runtime reset must be reviewed separately')
+        return cmd_runtime_repair(args)
+    if args.expected or args.manager or args.reason or args.accept_legacy_risk or args.owner_approval or args.retain_result:
+        fail('runtime repair options require --tasks')
     if args.apply and not args.yes:
         fail('repair --apply requires --yes after reviewing taskq repair; no board changes')
     with coordination() if args.apply else contextlib.nullcontext():
@@ -6530,7 +6888,11 @@ def main(argv=None):
     command('migrate', cmd_migrate, (('--native-receipts',), {'action': 'store_true'}), (('--apply',), {'action': 'store_true'}),
             (('--controllers-stopped',), {'action': 'store_true'}), n=False)
     command('repair', cmd_repair, (('--apply',), {'action': 'store_true'}), (('--yes',), {'action': 'store_true'}),
-            (('--hold-legacy',), {'action': 'store_true'}), n=False)
+            (('--hold-legacy',), {'action': 'store_true'}), (('--tasks',), {'nargs': '+', 'type': int}),
+            (('--force',), {'action': 'store_true'}), (('--reason',), {}), (('--manager',), {}),
+            (('--expected',), {}), (('--json',), {'action': 'store_true'}),
+            (('--accept-legacy-risk',), {'action': 'store_true'}), (('--owner-approval',), {}),
+            (('--retain-result',), {}), n=False)
     command('update', cmd_update, (('--commit',), {}), (('--install-dir',), {'default': os.environ.get('TASKQ_INSTALL_DIR')}),
             (('--qualification',), {}), (('--apply',), {'action': 'store_true'}), n=False)
     args = parser.parse_args(argv)

@@ -1,5 +1,8 @@
 # Tight / Hermes onboarding candidate (#538)
 
+Ordinary new/existing project setup uses [shared bootstrap](../taskq.md#shared-project-bootstrap-600).
+That path does not activate this identity-isolation proposal or qualify Hermes.
+
 Status: design and portable mocks only. This is a proposal, not an operational
 policy or activation approval. [taskq.md](../taskq.md) remains the manager contract.
 The recorded owner approval permits this document and isolated fixtures only.

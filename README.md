@@ -12,7 +12,8 @@ No extra worker apps required. Compression stays under your global user settings
 You stay in control: tasks wait for your input and continue when you reply.
 
 1. **⚙ Set up (once per project)**<br>
-   Tell your agent: "Install taskq from https://github.com/alexkirs/taskq and set it up."
+   Tell your agent: "Install taskq from https://github.com/alexkirs/taskq. Create project Notes from my idea or files in ~/Projects/notes, choose a repository and board, then plan it."<br>
+   Existing project: "Set it up here; keep my files and repository."
 
 2. **▶ Start working (each day)**<br>
    "Run taskq pm, then arm the tick." - workers start on ready tasks

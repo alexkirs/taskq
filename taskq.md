@@ -179,6 +179,18 @@ subscriber wiring are outside this minimal CLI/typed-adapter contract. The cache
 must not be mistaken for their implementation. Existing production schedulers and
 the older PM role route remain unchanged until rollout.
 
+### Legacy model-worker continuation
+
+Completed model workers retain their exact session when the ordinary supervisor
+`nudge:` path continues unfinished work. A legacy comment is a distinct durable
+model input, bound to the recorded worker session, existing comment cursor index,
+action and text digest. Replaying that same input never launches twice; a later
+comment may start one new turn after terminal settlement and fresh capacity
+reservation. Comment delivery advances its cursor only after acknowledged native
+admission. Pending native answer events take precedence and keep their existing
+application identity and receipt requirements. A comment creates no application
+event or ACK, and cannot resume an accepted result or an unresolved model turn.
+
 ### Closed-task model settlement
 
 A normal guarded pass reconciles outstanding model-only grants from the local

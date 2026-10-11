@@ -2493,7 +2493,22 @@ def model_event_input(event):
     return {key: event[key] for key in ('id', 'action', 'text', 'by', 'recipients')}
 
 
-def owned_model_turn(item, kind, role_name, prompt, events=(), resume=None):
+def model_turn_inputs(events, legacy=None, session=None):
+    """Native application inputs or one exact legacy comment, never prompt wording."""
+    inputs = [model_event_input(event) for event in events]
+    if legacy is not None:
+        if inputs or not isinstance(legacy, (tuple, list)) or len(legacy) != 3:
+            raise ValueError('one legacy comment without native events required')
+        action, text, index = legacy
+        if action not in ('answer', 'nudge') or not isinstance(text, str) \
+                or type(index) is not int or index < 0 or not isinstance(session, str) or not session:
+            raise ValueError('exact legacy comment and worker session required')
+        inputs.append({'kind': 'legacy-worker-comment', 'session': session, 'action': action,
+                       'index': index, 'text_sha256': hashlib.sha256(text.encode()).hexdigest()})
+    return inputs
+
+
+def owned_model_turn(item, kind, role_name, prompt, events=(), resume=None, legacy=None):
     """Existing CLI adapter, durable no-retry intent, separate finite model budget."""
     if not isinstance(kind, Codex):
         fail('runtime model-turn binding is not qualified; no alternate-worker fallback')
@@ -2510,10 +2525,12 @@ def owned_model_turn(item, kind, role_name, prompt, events=(), resume=None):
     raw = current['raw']
     if role_name == 'worker' and raw.get('model_recovery'):
         return None  # no implicit retry/replacement after a native failure report
+    if legacy is not None and (role_name != 'worker' or not resume or resume != (current['claim'] or {}).get('session')):
+        fail('legacy continuation requires the exact recorded worker session')
     turns = dict(raw.get('model_turns') or {})
     prior = turns.get(role_name)
     event_ids = [event['id'] for event in events]
-    inputs = [model_event_input(event) for event in events]
+    inputs = model_turn_inputs(events, legacy, resume)
     digest = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
     if prior and prior['phase'] not in ('complete', 'reserving'):
         return None  # reservation/binding unknown: never spawn another executor
@@ -3001,7 +3018,7 @@ def follow(item, kind, claim, supervised):
     if isinstance(kind, Codex):
         text += '\n\nApplication event IDs: ' + ', '.join(f'{item["iid"]}:{e["id"]}' for e in events)
         text += '\nDelivery is not acknowledgement. After applying the answer, commit your scoped artifact locally and run taskq applied N:ID --artifact RELPATH --sha FULLSHA before result. Repeat the same applied command to verify idempotence.'
-        sid = owned_model_turn(item, kind, 'worker', text, events, resume=old)
+        sid = owned_model_turn(item, kind, 'worker', text, events, resume=old, legacy=legacy)
         if not sid:
             return claim
         claim = {**claim, 'session': sid}

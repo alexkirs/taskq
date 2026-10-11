@@ -17,6 +17,33 @@ f = importlib.util.module_from_spec(spec); spec.loader.exec_module(f)
 q = f.taskq
 
 
+class ModelInputProperties(unittest.TestCase):
+    def test_legacy_identity_is_bounded_distinct_and_replay_stable(self):
+        identities = set()
+        for session in ('worker-a', 'worker-b'):
+            for action in ('answer', 'nudge'):
+                for index in range(4):
+                    for text in ('retry result', 'retry result again', 'x' * 10000):
+                        legacy = (action, text, index)
+                        value = q.model_turn_inputs([], legacy, session)
+                        encoded = json.dumps(value, sort_keys=True)
+                        self.assertEqual(value, q.model_turn_inputs([], legacy, session))
+                        self.assertLess(len(encoded), 220)
+                        self.assertNotIn(encoded, identities)
+                        identities.add(encoded)
+        self.assertEqual(q.model_turn_inputs([]), [])
+
+    def test_native_inputs_unchanged_and_mixed_or_invalid_legacy_refused(self):
+        event = {'id': 1, 'action': 'answer', 'text': 'apply', 'by': self.id(),
+                 'recipients': ['worker:codex:worker-a'], 'acks': []}
+        self.assertEqual(q.model_turn_inputs([event]), [q.model_event_input(event)])
+        for events, legacy, session in (([event], ('nudge', 'retry', 0), 'worker-a'),
+                ([], ('nudge', 'retry', -1), 'worker-a'), ([], ('nudge', 'retry', True), 'worker-a'),
+                ([], ('nudge', 'retry', 0), ''), ([], ('spawn', 'retry', 0), 'worker-a')):
+            with self.subTest(legacy=legacy, session=session), self.assertRaises(ValueError):
+                q.model_turn_inputs(events, legacy, session)
+
+
 class ModelIntegration(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
@@ -147,6 +174,81 @@ class ModelIntegration(unittest.TestCase):
             q.cmd_answer(argparse.Namespace(command='answer', n=['1'], text='chosen value'))
         self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
         self.assertEqual(self.launches, 2)
+
+    def test_completed_worker_nudge_resumes_same_session_once_per_comment(self):
+        sid = self.start(); self.complete()
+        self.board.comment(1, 'nudge: retry the unfinished result')
+        issue = self.board.get(1)
+        legacy = q.legacy_worker_message(issue, self.item()['claim'], True)
+        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=self.launch):
+            q.follow(self.item(), self.kind, self.item()['claim'], True)
+        turn = self.item()['raw']['model_turns']['worker']
+        self.assertEqual(self.launches, 2)
+        self.assertEqual(turn['runtime']['session'], sid)
+        self.assertEqual(turn['event_ids'], [])
+        self.assertEqual(turn['event_inputs'], q.model_turn_inputs([], legacy, sid))
+        self.assertEqual(self.item()['raw']['worker_comment_cursor'][sid], legacy[2])
+        self.complete()
+        with q.coordination(), mock.patch.object(q, 'age', return_value=0), \
+                mock.patch.object(self.kind, 'send', side_effect=AssertionError('duplicate')):
+            q.follow(self.item(), self.kind, self.item()['claim'], True)
+            self.assertEqual(q.owned_model_turn(self.item(), self.kind, 'worker', 'same input',
+                                               resume=sid, legacy=legacy), sid)
+        self.board.comment(1, 'nudge: retry the unfinished result')
+        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=self.launch):
+            q.follow(self.item(), self.kind, self.item()['claim'], True)
+        self.assertEqual(self.launches, 3)
+        self.assertEqual(self.item()['claim']['session'], sid)
+        self.assertEqual(self.item()['raw']['model_turns']['worker']['generation'], 3)
+
+    def test_nudge_unknown_launch_retains_guard_and_cursor_without_retry(self):
+        sid = self.start(); self.complete()
+        self.board.comment(1, 'nudge: retry result')
+        before = self.item()['raw'].get('worker_comment_cursor')
+        with self.assertRaisesRegex(RuntimeError, 'unknown resume'), q.coordination(), \
+                mock.patch.object(self.kind, 'send', side_effect=RuntimeError('unknown resume')):
+            q.follow(self.item(), self.kind, self.item()['claim'], True)
+        self.assertIsNotNone(self.board.guard)
+        self.assertEqual(self.item()['raw'].get('worker_comment_cursor'), before)
+        self.assertEqual(self.item()['raw']['model_turns']['worker']['phase'], 'launching')
+        self.assertEqual(self.item()['claim']['session'], sid)
+        with mock.patch.object(self.kind, 'send', side_effect=AssertionError('duplicate')):
+            q.follow(self.item(), self.kind, self.item()['claim'], True)
+
+    def test_nudge_cannot_resume_active_foreign_or_accepted_worker(self):
+        sid = self.start()
+        self.board.comment(1, 'nudge: retry result')
+        legacy = q.legacy_worker_message(self.board.get(1), self.item()['claim'], True)
+        before = json.dumps(self.board.issues, sort_keys=True)
+        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=AssertionError('active')):
+            q.follow(self.item(), self.kind, self.item()['claim'], True)
+        self.assertEqual(json.dumps(self.board.issues, sort_keys=True), before)
+        self.complete()
+        with self.assertRaisesRegex(SystemExit, 'exact recorded worker'), q.coordination():
+            q.owned_model_turn(self.item(), self.kind, 'worker', 'retry', resume='foreign', legacy=legacy)
+        item = self.item()
+        with q.coordination():
+            q.move(item, 'review', 'result', 'submitted', result={'sha': 'a' * 40, 'checks': 'fixture'})
+        with self.assertRaisesRegex(SystemExit, 'accepted result'), q.coordination(), \
+                mock.patch.object(self.kind, 'send', side_effect=AssertionError('accepted')):
+            q.follow(self.item(), self.kind, self.item()['claim'], True)
+        self.assertEqual(self.item()['claim']['session'], sid)
+        self.assertNotIn(sid, self.item()['raw'].get('worker_comment_cursor', {}))
+
+    def test_pending_native_answer_precedes_legacy_nudge(self):
+        sid = self.start(); self.complete()
+        with q.coordination():
+            q.move(self.item(), 'ask', 'ask', 'choose')
+            q.cmd_answer(argparse.Namespace(command='answer', n=['1'], text='chosen value'))
+        self.board.comment(1, 'nudge: retry result')
+        with q.coordination(), mock.patch.object(self.kind, 'send', side_effect=self.launch):
+            q.follow(self.item(), self.kind, self.item()['claim'], True)
+        raw = self.item()['raw']; turn = raw['model_turns']['worker']
+        answer = next(event for event in raw['events'] if event['action'] == 'answer')
+        self.assertEqual(turn['event_inputs'], [q.model_event_input(answer)])
+        self.assertEqual(turn['event_ids'], [answer['id']])
+        self.assertEqual(answer['acks'], [])
+        self.assertNotIn(sid, raw.get('worker_comment_cursor', {}))
 
     def test_launch_binding_failure_is_not_retried(self):
         def unknown(*args): raise RuntimeError('transport failed after launch intent')

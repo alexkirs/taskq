@@ -1482,6 +1482,35 @@ Rules:
 
 ## 6. Publication
 
+### Review an already-published integration
+
+`review-integrated N --published-sha FULL_SHA --integration-task M --source-map PATH
+--question-revision DIGEST --command-id ID --text VERDICT` is an explicit accepting
+review by the recorded manager, supervisor or owner shell. It requires an open native
+schema3 submitted result in ask/review, no recovery/order/acceptance, and settled exact
+worker model identity/host and project grants when model turns exist. It never replaces
+the original result, worker, supervisor or application history and never resumes a worker.
+The initial question revision and all result/identity/provenance inputs are bound to a
+separate receipt. Identical replay is idempotent; conflicting IDs or changed inputs refuse.
+
+The configured native provider and Git origin must identify the same repository. The
+integration task must already be natively closed, record the published full SHA in its
+close event, and have the same Git tree as that published SHA on origin/main. The commit
+must attribute both tasks. The committed `taskq.integration.source-map` version1 binds
+the original result SHA/task and integration task; every declared function hash must
+match the exact original and published `taskq.py` UTF-8 AST source segments. This verifies the
+declared function scope, not whole-commit equivalence or unqualified provider behavior.
+
+The command enters review and notifies only manager/supervisor, with no automatic tick
+or worker recipient. `close` fresh-validates the association, then uses its ordinary native
+closure path without merging or publishing the original PR/result. Original provenance
+is retained alongside the accepted published integration. Keep the original worktree
+and branch: mapped functions do not prove that every original change was integrated. Repeating the exact completed
+close is idempotent; conflicting close text or changed provenance refuses. No association
+may be injected by hand. Select the qualified successor on both hosts before applying
+this transition; older code must refuse at its stale-release boundary. Without an
+integration receipt all existing publication/close gates remain unchanged.
+
 ### Commit and PR/MR messages (#581)
 
 <!-- Scoped application evidence for answer 581:10, not publication acceptance.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """taskq: a task queue on an issue board. One file, stdlib only, python3 >= 3.9. Design: docs/single-file.md."""
-import argparse, contextlib, glob, hashlib, importlib.util, io, json, os, re, shlex, shutil, signal, socket, sqlite3, subprocess, sys, tempfile, threading, time, uuid
+import argparse, ast, contextlib, glob, hashlib, importlib.util, io, json, os, re, shlex, shutil, signal, socket, sqlite3, subprocess, sys, tempfile, threading, time, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -17,7 +17,7 @@ CONFIG, BOARD = {}, None  # set by main, or by a test
 GUARD, GUARD_WAIT, GUARD_PAUSE = threading.local(), 30, 2
 EVENT_SCHEMA, EVENT_LIMIT = 3, 64
 EVENT_LABEL = 'taskq-events'
-PAYLOAD_ACTIONS = ('ask', 'answer', 'requeue', 'result')
+PAYLOAD_ACTIONS = ('ask', 'answer', 'requeue', 'result', 'integrated-review')
 
 class SettledError(SystemExit):
     """A fully known refusal; tasks lists only acknowledged transitions that need an event."""
@@ -199,10 +199,11 @@ def event_targets(raw, action, text, actor=None):
     targets, actor = [], actor or session() or {}
     boss, worker = raw.get('supervisor') or {}, raw.get('claim') or {}
     manager = recipient('manager', raw['pm']) if raw.get('pm') else 'manager:*'
-    if action in ('ask', 'close') or action == 'result' and not boss or action == 'gone' and (not boss or text.startswith('supervisor ')):
+    if action in ('ask', 'close', 'integrated-review') or action == 'result' and not boss or action == 'gone' and (not boss or text.startswith('supervisor ')):
         targets.append(manager)
-    if boss.get('session') and action in ('result', 'ask', 'answer', 'gone', 'requeue') \
+    if boss.get('session') and action in ('result', 'ask', 'answer', 'gone', 'requeue', 'integrated-review') \
             and not (action in ('ask', 'requeue') and actor.get('session') == boss['session']) \
+            and not (action == 'integrated-review' and actor.get('session') == boss['session']) \
             and (action != 'gone' or text.startswith('worker ')):
         targets.append(recipient('supervisor', boss))
     if action == 'answer' and worker.get('session'):
@@ -1722,13 +1723,211 @@ def cleanup(current):
     effect(subprocess.run, [*git, 'branch', '-D', branch], capture_output=True, **no_window())
     return ''
 
+def integrated_context(issue):
+    """Closed receipt replay still checks recorded authority, never invents an open task."""
+    return parse(issue) or {**{key: issue_data(issue).get(key) for key in FIELDS},
+                           'raw': issue_data(issue), 'iid': issue['iid'], 'url': issue.get('url')}
+
+
+def integrated_binding(current):
+    raw = current['raw']
+    return {'project': {key: CONFIG.get(key) for key in ('board', 'host', 'repo')},
+            'task': current['iid'], **{key: raw.get(key) for key in FIELDS},
+            'submission': (raw.get('action_payloads') or {}).get('result'),
+            'worker_turn': (raw.get('model_turns') or {}).get('worker')}
+
+
+def integrated_settled(current):
+    raw = current['raw']
+    if raw.get('event_schema') != EVENT_SCHEMA or not raw.get('result') \
+            or not (raw.get('action_payloads') or {}).get('result') or raw.get('order') \
+            or 'legacy_recovery' in raw or raw.get('model_recovery') or raw.get('acceptance_receipts'):
+        fail('integrated review requires an unrecovered submitted native result')
+    if not raw.get('model_turns'):
+        return
+    identity, turn = raw.get('claim') or {}, raw['model_turns'].get('worker') or {}
+    runtime, child, completion = (turn.get(key) or {} for key in ('runtime', 'child', 'completion'))
+    if identity.get('runtime') != 'codex' or not identity.get('session') \
+            or turn.get('phase') != 'complete' or not turn.get('key') \
+            or runtime.get('session') != identity['session'] or completion.get('session') != identity['session'] \
+            or completion.get('terminal') != 'turn.completed' or not child.get('pid') or not child.get('birth') \
+            or process_state(child['pid'], child['birth']) != 'dead':
+        fail('integrated review exact worker completion/death unavailable')
+    project, host = model_providers()
+    grant, lease = project.observe(turn['key']), host.observe(turn['key'])
+    if not grant or not lease or grant['phase'] != 'released' or lease['phase'] != 'released' \
+            or grant['request'] != turn['request'] or lease['request'] != turn['request'] \
+            or lease.get('runtime') != runtime or lease.get('child') != child or lease.get('drain') != completion:
+        fail('integrated review exact worker grant settlement unavailable')
+
+
+def integrated_proof(current, published, integration_task, source_map):
+    """Fresh native closure plus committed function mapping; no PR merge or publication."""
+    original = (current['result'] or {}).get('sha') or ''
+    if any(not re.fullmatch('[0-9a-f]{40}', value) for value in (original, published)) \
+            or type(integration_task) is not int or integration_task <= 0 or integration_task == current['iid'] \
+            or not re.fullmatch(r'[A-Za-z0-9_./-]{1,240}', source_map or '') \
+            or any(part in ('', '.', '..') for part in source_map.split('/')):
+        fail('integrated review requires full SHAs, a separate task and a safe committed map path')
+    board = CONFIG['board']
+    host = CONFIG.get('host') or {'github': 'github.com', 'gitlab': 'gitlab.com'}.get(board)
+    if board not in ('github', 'gitlab') or not re.fullmatch(r'[A-Za-z0-9.-]+', host or '') \
+            or not re.fullmatch(r'[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+', CONFIG.get('repo') or ''):
+        fail('integrated review requires a configured native repository')
+    git = [shutil.which('git') or fail('git not found'), '-C', str(CONFIG['root'])]
+    def run(*args):
+        try:
+            done = subprocess.run([*git, *args], capture_output=True, **no_window(), timeout=30)
+        except subprocess.TimeoutExpired:
+            fail('integrated provenance git timed out; no board changes')
+        if done.returncode:
+            fail(f'integrated provenance git {args[0]} failed')
+        return done.stdout
+    remote = run('remote', 'get-url', 'origin').decode('utf-8').strip()
+    if remote not in (f'https://{host}/{CONFIG["repo"]}', f'https://{host}/{CONFIG["repo"]}.git',
+                      f'git@{host}:{CONFIG["repo"]}', f'git@{host}:{CONFIG["repo"]}.git'):
+        fail('integrated repository origin differs from native board')
+    run('fetch', 'origin')
+    run('merge-base', '--is-ancestor', published, 'origin/main')
+    integrated_issue = read_issue(integration_task)
+    integrated = integrated_context(integrated_issue)
+    raw = integrated['raw']
+    if raw.get('event_schema') != EVENT_SCHEMA or raw.get('order') or 'legacy_recovery' in raw or raw.get('model_recovery'):
+        fail('integration native provenance is held or unsupported')
+    submitted = (raw.get('action_payloads') or {}).get('result') or {}
+    closes = [event for event in [raw.get('action') or {}, *raw.get('events', [])]
+              if event.get('action') == 'close' and type(event.get('id')) is int
+              and event['id'] > submitted.get('id', 0)
+              and any(line in event.get('text', '').splitlines() for line in (f'merged {published}', f'published {published}'))]
+    if integrated_issue['state'] != 'closed' or not closes:
+        fail('integration must already be natively closed at the published commit')
+    closed = max(closes, key=lambda event: event['id'])
+    allowed = ['owner', *[f'{held.get("runtime")}:{str(held.get("session"))[:8]}'
+                         for held in (raw.get('pm') or {}, raw.get('supervisor') or {}) if held.get('session')]]
+    if closed.get('by') not in allowed:
+        fail('integration close lacks recorded reviewer authority')
+    result = (integrated['result'] or {}).get('sha') or ''
+    if not re.fullmatch('[0-9a-f]{40}', result):
+        fail('integration result requires a full SHA')
+    tree = run('rev-parse', f'{published}^{{tree}}').decode('ascii').strip()
+    if run('rev-parse', f'{result}^{{tree}}').decode('ascii').strip() != tree:
+        fail('integration result and published trees differ')
+    message = run('show', '-s', '--format=%B', published).decode('utf-8')
+    publication_links(current, message)
+    publication_links(integrated, message)
+    mode = run('ls-tree', published, '--', source_map).decode('utf-8').split()
+    if len(mode) != 4 or mode[0] not in ('100644', '100755') or mode[1] != 'blob' or mode[3] != source_map:
+        fail('integration map must be a committed regular file')
+    data = run('show', f'{published}:{source_map}')
+    def unique(pairs):
+        if len(dict(pairs)) != len(pairs):
+            raise ValueError('duplicate map keys')
+        return dict(pairs)
+    try:
+        mapping = json.loads(data.decode('utf-8'), object_pairs_hook=unique) if len(data) <= 65536 else None
+        if not isinstance(mapping, dict) or mapping.get('type') != 'taskq.integration.source-map' \
+                or type(mapping.get('version')) is not int or mapping['version'] != 1 \
+                or type(mapping.get('source_task')) is not int or mapping['source_task'] != current['iid'] \
+                or mapping.get('source_sha') != original or type(mapping.get('integrating_task')) is not int \
+                or mapping['integrating_task'] != integration_task or mapping.get('same_source_functions') is not True:
+            raise ValueError('source mapping mismatch')
+        functions = mapping.get('functions')
+        if not isinstance(functions, dict) or not 1 <= len(functions) <= 64 \
+                or any(not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name) or not re.fullmatch('[0-9a-f]{64}', digest)
+                       for name, digest in functions.items()):
+            raise ValueError('invalid function mapping')
+        for sha in (original, published):
+            source = run('show', f'{sha}:taskq.py')
+            if len(source) > 2 * 1024 * 1024:
+                raise ValueError('source too large')
+            text = source.decode('utf-8')
+            definitions = [node for node in ast.parse(text).body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            for name, digest in functions.items():
+                nodes = [node for node in definitions if node.name == name]
+                if len(nodes) != 1 or hashlib.sha256(ast.get_source_segment(text, nodes[0]).encode('utf-8')).hexdigest() != digest:
+                    raise ValueError(f'function source differs: {name}')
+    except (ValueError, TypeError, UnicodeError, SyntaxError) as error:
+        fail(f'integrated source map refused: {error}')
+    return {'published_sha': published, 'tree': tree, 'integration_task': integration_task,
+            'integration_result': raw['result'], 'integration_submission': submitted,
+            'close': {key: closed.get(key) for key in ('id', 'action', 'by', 'text')},
+            'source_map': source_map, 'map_sha256': hashlib.sha256(data).hexdigest(), 'functions': functions}
+
+
+def validate_integrated(current):
+    receipt = current['raw']['integrated_review']
+    if not isinstance(receipt, dict) or type(receipt.get('version')) is not int or receipt['version'] != 1:
+        fail('unsupported integrated review receipt')
+    integrated_settled(current)
+    request = receipt.get('request') or {}
+    payload = (current['raw'].get('action_payloads') or {}).get('integrated-review') or {}
+    actor = request.get('actor') or {}
+    reviewer = 'owner' if actor == {'runtime': 'owner', 'session': 'shell'} else f'{actor.get("runtime")}:{str(actor.get("session"))[:8]}'
+    if payload.get('by') != reviewer or payload.get('text') != request.get('text'):
+        fail('integrated review event binding changed')
+    if receipt.get('binding') != integrated_binding(current) \
+            or receipt.get('request_digest') != hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest() \
+            or (current['raw'].get('action_payloads') or {}).get('integrated-review', {}).get('id') != receipt.get('review_event'):
+        fail('integrated review result/identity/receipt binding changed')
+    proof = integrated_proof(current, request.get('published_sha'), request.get('integration_task'), request.get('source_map'))
+    if proof != receipt.get('proof'):
+        fail('integrated review provenance changed')
+    return receipt
+
+
+def cmd_review_integrated(args):
+    issue = read_issue(args.n)
+    current = integrated_context(issue)
+    if role(current) not in ('manager', 'supervisor', 'owner'):
+        fail('integrated review requires recorded reviewer or owner shell')
+    if not re.fullmatch('[0-9a-f]{64}', args.question_revision) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', args.command_id):
+        fail('integrated review requires question revision and command ID')
+    verdict(args.text)
+    identity = session() or {}
+    request = {'published_sha': args.published_sha, 'integration_task': args.integration_task,
+               'source_map': args.source_map, 'revision': args.question_revision, 'text': args.text,
+               'actor': {key: identity.get(key) for key in ('runtime', 'session')} if identity.get('session')
+                        else {'runtime': 'owner', 'session': 'shell'}}
+    digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+    previous = current['raw'].get('integrated_review')
+    if 'integrated_review' in current['raw']:
+        if not isinstance(previous, dict):
+            fail('unsupported integrated review receipt')
+        if previous.get('command_id') != args.command_id or previous.get('request_digest') != digest:
+            fail('conflicting integrated review command; no changes')
+        validate_integrated(current)
+        print(json.dumps({'type': 'taskq.integrated-review', 'repeated': True, **previous}))
+        return
+    if issue['state'] != 'open' or current.get('state') not in ('ask', 'review') \
+            or question_revision(current) != args.question_revision:
+        fail('stale integrated review question; no changes')
+    integrated_settled(current)
+    if (current['raw'].get('action') or {}).get('action') == 'close' \
+            or (current['raw'].get('action_payloads') or {}).get('close') \
+            or any(event.get('action') == 'close' for event in current['raw'].get('events', [])):
+        fail('submitted result already accepted')
+    proof = integrated_proof(current, args.published_sha, args.integration_task, args.source_map)
+    receipt = {'version': 1, 'command_id': args.command_id, 'request_digest': digest, 'request': request,
+               'binding': integrated_binding(current), 'proof': proof,
+               'review_event': current['raw'].get('event_seq', 0) + 1}
+    raw = {**current['raw'], 'integrated_review': receipt,
+           'decision': {'summary': args.text, 'options': [], 'links': [], 'recommend': 1}}
+    append_event(raw, 'integrated-review', args.text)
+    fresh = read_issue(args.n)
+    if any(fresh.get(key) != issue.get(key) for key in ('body', 'labels', 'state')):
+        fail('integrated review changed before write')
+    labels = [label for label in issue['labels'] if not label.startswith(PREFIX)] + [PREFIX + 'review']
+    write_task_verified(issue, raw, event_labels(raw, labels))
+    print(json.dumps({'type': 'taskq.integrated-review', 'repeated': False, **receipt}))
+
+
 def cmd_close(args):
     """close N [M ...]: in order; no PR is updated (#359). A failed task does not stop the rest."""
     failed, changed = [], []
     for n in args.n:
         try:
-            close_one(argparse.Namespace(n=n, text=args.text))
-            changed.append(n)
+            if close_one(argparse.Namespace(n=n, text=args.text)) is not False:
+                changed.append(n)
         except SystemExit as error:
             if (getattr(GUARD, 'held', None) or {}).get('poisoned'):
                 raise  # no more closes or settled-event dispatch after an uncertain effect
@@ -1740,6 +1939,7 @@ def cmd_close(args):
             print(error, file=sys.stderr)
     if failed:
         raise SettledError(f'not closed: {" ".join(f"#{n}" for n in failed)}', changed)
+    return changed
 
 def publish_direct(current, sha, git):
     """#533: close is acceptance; transfer and qualify the exact candidate before main can change."""
@@ -1782,13 +1982,32 @@ def verdict(text):
         fail('close --text needs a verdict: "<what was accepted>; <what changed for the user>; open: <follow-ups or none>"')
 
 def close_one(args):
+    issue = read_issue(args.n)
+    existing = integrated_context(issue)
+    if issue['state'] == 'closed' and 'integrated_review' in existing['raw']:
+        if role(existing) not in ('manager', 'supervisor', 'owner'):
+            fail('integrated close replay requires recorded reviewer or owner shell')
+        receipt = validate_integrated(existing)
+        if receipt.get('close_text') != args.text or not receipt.get('close_event') \
+                or receipt.get('close_payload') not in [{key: event.get(key) for key in ('id', 'action', 'by', 'text')}
+                    for event in [existing['raw'].get('action') or {}, *existing['raw'].get('events', [])]
+                    if event.get('action') == 'close']:
+            fail('conflicting or incomplete integrated close replay')
+        print(json.dumps({'type': 'taskq.integrated-close', 'repeated': True, 'task': args.n,
+                          'published_sha': receipt['proof']['published_sha']}))
+        return False
     current = task(args.n, 'review')
     gate(current)
     append_event(dict(current['raw']), 'close', args.text)  # capacity before publication/close effects
     if role(current) == 'supervisor':
         verdict(args.text)
+    integrated = validate_integrated(current) if 'integrated_review' in current['raw'] else None
+    close_text = args.text
     sha = commit((current['result'] or {}).get('sha') or '')
-    if CONFIG['publish'] == 'pr' and (merged := merge(current, sha)):
+    if integrated:
+        verdict(args.text)
+        args.text += f'\n\naccepted integration {integrated["proof"]["published_sha"]}'
+    elif CONFIG['publish'] == 'pr' and (merged := merge(current, sha)):
         args.text = (f'{args.text}\n\n' if args.text else '') + f'merged {merged}'  # #567: the verdict stays the first line
     else:  # an already-published result/answer, or an unpublished direct candidate
         git = [shutil.which('git') or fail('git not found'), '-C', str(CONFIG['root'])]
@@ -1803,9 +2022,18 @@ def close_one(args):
     claim = current['claim'] or {}
     if hasattr(runtimes().get(claim.get('runtime')), 'retire') and claim.get('name') not in (None, machine()):
         args.text = (f'{args.text}\n\n' if args.text else '') + f'session {claim.get("session")} runs on {claim.get("name")}: stop it there'
-    kept = cleanup(current)
+    kept = 'kept original worktree and branch: integration proves declared functions only' if integrated else cleanup(current)
     effect(BOARD.close, args.n)  # first (#496): a failed close keeps the q-* label, the task stays on the board
-    move(current, None, 'close', '\n\n'.join(filter(None, (args.text, kept))))
+    final_text = '\n\n'.join(filter(None, (args.text, kept)))
+    association = {'integrated_review': {**integrated, 'close_text': close_text,
+                   'close_event': current['raw'].get('event_seq', 0) + 1,
+                   'close_payload': {'id': current['raw'].get('event_seq', 0) + 1,
+                                     'action': 'close', 'by': who(), 'text': final_text}}} if integrated else {}
+    move(current, None, 'close', final_text, **association)
+    if integrated:
+        fresh = read_issue(args.n)
+        if fresh['state'] != 'closed' or issue_data(fresh).get('integrated_review') != association['integrated_review']:
+            raise RuntimeError('integrated close readback unknown; retain project guard')
     if os.environ.get('CODEX_SANDBOX'):  # #502: the sandbox can neither stop nor archive: the next pass outside retires them
         return
     issue, me = BOARD.get(args.n), (session() or {}).get('session')  # R11: its recorded workers, never the session running close
@@ -6264,6 +6492,9 @@ def main(argv=None):
     command('run', cmd_run, text=True)
     command('later', cmd_move, text=True)
     command('close', cmd_close, (('n',), {'nargs': '+', 'type': int}), n=False, text=True)
+    command('review-integrated', cmd_review_integrated, (('--published-sha',), {'required': True}),
+            (('--integration-task',), {'type': int, 'required': True}), (('--source-map',), {'required': True}),
+            (('--question-revision',), {'required': True}), (('--command-id',), {'required': True}), text='required')
     command('status', cmd_status, (('--diagnose',), {'action': 'store_true'}), n=False)
     command('recovery-plan', cmd_recovery_plan, (('--role',), {'choices': ('worker', 'supervisor'), 'required': True}), (('--json',), {'action': 'store_true'}))
     command('reconcile', cmd_reconcile, (('--json',), {'action': 'store_true'}))
@@ -6368,7 +6599,7 @@ def main(argv=None):
         dispatch_service_gate()
     if args.command == 'wait' and not args.task or args.command == 'tick' and not args.quiet or args.command == 'pm' and args.subscribe is None:
         refresh(args.command == 'pm')
-    writes = args.command in ('add', 'take', 'ask', 'answer', 'result', 'requeue', 'run', 'later', 'close', 'ack', 'applied', 'apply-event', 'lifecycle') or \
+    writes = args.command in ('add', 'take', 'ask', 'answer', 'result', 'requeue', 'run', 'later', 'close', 'review-integrated', 'ack', 'applied', 'apply-event', 'lifecycle') or \
         args.command == 'cleanup' and not args.dry_run
     if (writes or args.command in ('migrate','repair') and args.apply or args.command == 'tick' or args.command == 'pm' and args.adopt) and getattr(GUARD, 'held', None):
         raise SystemExit('taskq: another command holds the project guard; a new command must acquire independently')
@@ -6379,15 +6610,15 @@ def main(argv=None):
     try:
         with completion_release(args.command in ('ask', 'result', 'requeue', 'ack', 'applied', 'apply-event')), \
                 coordination() if writes else contextlib.nullcontext():
-            if args.command in ('add','take','ask','answer','result','requeue','run','later','close','cleanup','ack','applied','apply-event','lifecycle') or args.command=='pm' and args.adopt:
+            if args.command in ('add','take','ask','answer','result','requeue','run','later','close','review-integrated','cleanup','ack','applied','apply-event','lifecycle') or args.command=='pm' and args.adopt:
                 board_schema_gate()
             done = args.function(args)
     except SettledError as error:
         if error.tasks and not (args.command == 'add' and args.later):
             dispatch(args.command, error.tasks)
         raise
-    if args.command in EVENTS and not (args.command == 'add' and args.later) and not (args.command == 'answer' and done == []):
-        dispatch(args.command, done if args.command in ('add', 'answer') else args.n)
+    if args.command in EVENTS and not (args.command == 'add' and args.later) and not (args.command in ('answer', 'close') and done == []):
+        dispatch(args.command, done if args.command in ('add', 'answer', 'close') else args.n)
 
 if __name__ == '__main__':
     main()

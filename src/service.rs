@@ -349,27 +349,36 @@ impl<'a> Service<'a> {
         Ok(())
     }
 
-    /// Moves to closed or `failed` since the previous pass go to `<root>/.taskq/events` (§ 4). A task gone from the open
-    /// list counts only when a fresh read shows it closed (R12).
+    /// Moves to closed, `failed`, `ask` or `waiting` since the previous pass go to `<root>/.taskq/events` (§ 4); a task
+    /// new since then counts from its first state. A task gone from the open list counts only when a fresh read shows it
+    /// closed (R12).
     fn events(&mut self, views: &[View], now: i64) -> Result<(), String> {
         // the attempt current at the move; a `close` or `failed` that ended it leaves the last spawn
         let attempt = |t: &Task, c: &[Comment]| t.attempt.or_else(|| c.iter().rev().find(|c| c.trusted && c.body.starts_with("taskq: spawn ")).map(|c| c.id));
         let now_seen: HashMap<u64, State> = views.iter().map(|v| (v.issue.number, v.task.state)).collect();
         let first = self.seen.is_empty() && self.events_since.is_none();
+        let mut ns: Vec<u64> = self.seen.keys().copied().collect();
+        if !first {
+            ns.extend(views.iter().map(|v| v.issue.number).filter(|n| !self.seen.contains_key(n)));
+        }
         let mut moves = vec![];
-        for (n, was) in &self.seen {
-            let (to, a) = match views.iter().find(|v| v.issue.number == *n) {
+        for n in ns {
+            let (to, a) = match views.iter().find(|v| v.issue.number == n) {
+                // `ask` and `waiting` without an attempt: the last comment, else the issue number
+                Some(v) if matches!(v.task.state, State::Ask | State::Waiting) => (v.task.state, attempt(&v.task, &v.comments).or(v.comments.last().map(|c| c.id)).or(Some(n))),
                 Some(v) => (v.task.state, attempt(&v.task, &v.comments)),
-                None if self.board.issue(*n).is_ok_and(|i| !i.open) => (State::Closed, attempt(&Task::default(), &self.board.comments(*n)?)),
+                None if self.board.issue(n).is_ok_and(|i| !i.open) => (State::Closed, attempt(&Task::default(), &self.board.comments(n)?)),
                 None => continue,
             };
             let kind = match to {
                 State::Closed => "close",
                 State::Failed => "failed",
+                State::Ask => "ask",
+                State::Waiting => "blocked",
                 _ => continue,
             };
-            if let Some(a) = a.filter(|_| *was != to) {
-                moves.push((*n, kind, a));
+            if let Some(a) = a.filter(|_| self.seen.get(&n) != Some(&to)) {
+                moves.push((n, kind, a));
             }
         }
         moves.sort();
@@ -689,6 +698,17 @@ mod tests {
         again.pass().unwrap();
         assert_eq!(std::fs::read_to_string(root.join(".taskq/events")).unwrap(), ev, "a restart keeps history");
         assert!(again.events_since.is_some());
+        // a new task enters waiting (no comment: the issue number), a worker asks (its attempt)
+        let z = b.create("Z", &format!("Depends on #{y}"), &["taskq".into()]).unwrap();
+        let w = b.create("W", "", &["taskq".into()]).unwrap();
+        again.pass().unwrap();
+        let aw = task(&b, w).attempt.unwrap();
+        b.comment(w, &core::entry("ask", &[], Some(aw), "Which?\n1. x\n2. y ★")).unwrap();
+        again.pass().unwrap();
+        again.pass().unwrap();
+        let ev = std::fs::read_to_string(root.join(".taskq/events")).unwrap();
+        let lines: Vec<&str> = ev.lines().skip(3).map(|l| l.split_once(' ').unwrap().1).collect();
+        assert_eq!(lines, [format!("#{z} blocked {z}"), format!("#{w} ask {aw}")], "{ev}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -57,10 +57,16 @@ DLL); standalone release packaging is unverified. No actual Codex/app, DOT, narr
 media-accessibility, live stop/uninstall, macOS or Linux verification is claimed.
 Those channel/platform proofs remain separate from model/format tests. The v3
 Python suite is absent after cutover and is not presented as a passing gate.
-The follow-up Windows suite uses a process-local PATH without installed Codex
-shims: an existing runtime assertion expects the bare `codex` fallback, whereas
-Windows resolves `codex.cmd`. The unchanged assertion fails on the normal PATH;
-the isolated suite passes all 45 tests. This is not runtime launch qualification.
+The normal-PATH Windows runtime expectation now accepts the resolved `codex.cmd`
+while retaining argument/environment checks; the previous isolated-PATH workaround
+is superseded. The prior candidate passed 56 native Windows tests and exact-head
+Ubuntu/macOS/Windows CI; these are historical results, not checks of this revision.
+
+Service counts now carry a monotonic successful task-read age separately from the
+snapshot publication time. Capacity-only ticks update that age rather than resetting
+it. Missing, stale or future-dated freshness is unknown; old snapshots cannot prove
+fresh counts. The regression rewrites a fresh capacity snapshot with stale tasks
+and checks that service fields omit counts. No task state or fold behavior changes.
 
 Separate follow-up scope: native tray/menu text and rendering, documentation text
 audit, and actual channel/width/media receipts. Raw service logs, heartbeat/spawn/

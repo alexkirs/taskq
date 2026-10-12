@@ -750,9 +750,10 @@ fn service_run(c: &Ctx) -> Res<()> {
             agents = Some((Instant::now(), json!({"at": at, "rows": runtime::agents()})));
         }
         let mut status = json!({"host": cfg.me, "version": platform::VERSION, "focus": s.focus, "error": r.err(), "kids": kids, "at": at,
-            "pid": std::process::id(), "project": project, "issues": issues, "log": log, "tasks": tasks,
+            "pid": std::process::id(), "project": project, "issues": issues, "log": log, "tasks": tasks, "tasks_age_seconds": s.tasks_read.map(|t| t.elapsed().as_secs()),
             "request": request, "update": update, "events_since": s.events_since, "capacity": s.capacity_json(),
             "agents": agents.as_ref().map(|a| &a.1)});
+
         let _ = platform::write_atomic(&d.join("status.json"), &serde_json::to_string_pretty(&status).unwrap_or_default());
         if is_installed && began.elapsed().as_secs() >= cfg.rollback_after {
             let h = cfg.install.join("releases").join(platform::VERSION).join("healthy");
@@ -808,6 +809,7 @@ fn service_run(c: &Ctx) -> Res<()> {
             if s.gate.enabled() {
                 s.gate.observe(s.mono, wall as i64, platform::cpu_ticks(), platform::memory_available());
             }
+            status["tasks_age_seconds"] = json!(s.tasks_read.map(|t| t.elapsed().as_secs()));
             status["capacity"] = s.capacity_json();
             status["at"] = json!(wall);
             let _ = platform::write_atomic(&d.join("status.json"), &serde_json::to_string_pretty(&status).unwrap_or_default());
@@ -1135,7 +1137,10 @@ fn service_fields(root: &Path) -> String {
     }
     let status = fs::read_to_string(d.join("status.json")).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok());
     let ttl = load(root).map(|(c, _)| c.ttl.max(0) as u64).unwrap_or(300);
-    let fresh = file_age(&d.join("status.json")).filter(|a| *a <= ttl);
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_secs());
+    let fresh = status.as_ref().and_then(|s| {
+        s["tasks_age_seconds"].as_u64()?.checked_add(now?.checked_sub(s["at"].as_u64()?)?)
+    }).filter(|a| *a <= ttl);
     match (status, fresh) {
         (Some(s), Some(a)) if s["error"].is_null() && s["tasks"].is_array() => {
             let tasks = s["tasks"].as_array().unwrap();
@@ -1811,12 +1816,22 @@ mod tests {
         assert!(pause(&root).is_err(), "missing state folder cannot acknowledge pause");
         fs::create_dir_all(dot(&root)).unwrap();
         fs::write(dot(&root).join("focus"), "one two").unwrap();
-        fs::write(dot(&root).join("status.json"), r#"{"error":null,"tasks":[{"state":"doing"},{"state":"review"},{"state":"ask"},{"state":"ready"}]}"#).unwrap();
+        let mut status = json!({"error": null, "at": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(), "tasks_age_seconds": 0, "tasks": [{"state":"doing"},{"state":"review"},{"state":"ask"},{"state":"ready"}]});
+        fs::write(dot(&root).join("status.json"), status.to_string()).unwrap();
         let s = service_fields(&root);
         assert!(s.contains("Focus: one\nFocus: two"));
         assert!(s.contains("In work 2 · Waiting for answer 1 · Ready 1"));
         assert!(s.contains("cached status"));
         assert!(s.contains("Service: unknown (process not checked)"));
+        // Capacity-only publication keeps the file fresh without refreshing the board counts.
+        status["tasks_age_seconds"] = json!(301);
+        status["capacity"] = json!({"gate": "off"});
+        fs::write(dot(&root).join("status.json"), status.to_string()).unwrap();
+        assert!(file_age(&dot(&root).join("status.json")).unwrap() <= 1);
+        assert!(service_fields(&root).contains("Counts: unknown"));
+        status["tasks_age_seconds"] = Value::Null;
+        fs::write(dot(&root).join("status.json"), status.to_string()).unwrap();
+        assert!(service_fields(&root).contains("Counts: unknown"), "old snapshots lack board freshness");
         fs::write(dot(&root).join("status.json"), r#"{"error":"board failed","tasks":[]}"#).unwrap();
         assert!(service_fields(&root).contains("Counts: unknown"));
         let _ = fs::remove_dir_all(&root);

@@ -21,7 +21,22 @@ use std::time::{Duration, Instant, SystemTime};
 
 type Res<T> = Result<T, String>;
 
-const USAGE: &str = "usage: taskq agents|labels|add|ask|answer|result|requeue|steer|later|failed|close|status|inbox|wait|cleanup|update|service|tray|selftest (see taskq.md § 5)";
+const USAGE: &str = "taskq agents
+ taskq labels
+ taskq add <title> --goal G --acceptance A.. [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 0|1|2] [--host H] [--later] [--text T]
+ taskq ask N --text Q --option O.. --recommend K [--link URL..]
+ taskq answer N --text A | taskq answer N.K [M.K..]
+ taskq result N --sha SHA --checks C.. --text T [--option O.. --recommend K --link URL..]
+ taskq requeue N [--text T] | taskq later N [--text T]
+ taskq steer N --text T | taskq failed N --text T
+ taskq close N [M..] [--text VERDICT]
+ taskq status [--only L,..] | taskq inbox N
+ taskq wait [--window MIN] [--only L,..]
+ taskq cleanup [--force] | taskq update [--check]
+ taskq service install|run|pause|resume|status|restart|stop|uninstall|list
+ taskq service focus [all|off|<label..>] [--request TEXT]
+ taskq tray [--snapshot DIR] | taskq selftest
+Text templates and limits: taskq.md sections 1, 2, 5, 7.";
 
 // ---------- arguments ----------
 
@@ -38,7 +53,7 @@ impl Args {
         while let Some(x) = it.next() {
             match x.strip_prefix("--") {
                 Some(k) => {
-                    let val = if matches!(k, "later" | "check" | "force") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
+                    let val = if matches!(k, "later" | "check" | "force" | "help") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
                     a.flags.entry(k.to_string()).or_default().push(val);
                 }
                 None => a.pos.push(x.clone()),
@@ -237,12 +252,21 @@ fn join(parts: &[&str]) -> String {
 
 /// R7: Unicode characters of a line; link targets and `code` spans (exact commands, SHAs, paths) are exempt.
 fn width(l: &str) -> usize {
-    let mut s: String = l.split('`').step_by(2).collect();
+    let mut s = String::new();
+    let mut rest = l;
+    while let Some(a) = rest.find('`') {
+        s.push_str(&rest[..a]);
+        match rest[a + 1..].find('`') {
+            Some(b) => rest = &rest[a + b + 2..],
+            None => { rest = &rest[a..]; break; }
+        }
+    }
+    s.push_str(rest);
     while let Some(a) = s.find("](") {
         let b = s[a..].find(')').map_or(s.len(), |b| a + b + 1);
         s.replace_range(a + 1..b, "");
     }
-    s.split(' ').filter(|w| !w.is_empty() && !w.starts_with("http://") && !w.starts_with("https://")).map(|w| w.chars().count() + 1).sum::<usize>().saturating_sub(1)
+    s.split_inclusive(char::is_whitespace).filter(|w| !w.starts_with("http://") && !w.starts_with("https://")).map(|w| w.chars().count()).sum()
 }
 
 /// Rejects, with a one-line hint, a field outside `min..=max` lines or with a line over `chars` (R7: never cut).
@@ -258,7 +282,20 @@ fn limit(what: &str, lines: &[String], min: usize, max: usize, chars: usize) -> 
 }
 
 fn one_line(what: &str, items: &[String]) -> Res<()> {
-    if items.iter().any(|s| s.contains('\n') || s.trim().is_empty()) { Err(format!("{what}: one nonempty line each")) } else { Ok(()) }
+    if items.iter().any(|s| s.contains(['\r', '\n']) || s.trim().is_empty()) { Err(format!("{what}: one nonempty line each")) } else { Ok(()) }
+}
+
+fn task_text(cmd: &str, text: &str) -> Res<()> {
+    if matches!(cmd, "requeue" | "later" | "failed") {
+        if text.is_empty() && cmd != "failed" { return Ok(()); }
+        let lines: Vec<String> = text.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect();
+        limit(cmd, &lines, 1, 2, 240)?;
+        fields(text, &[("Reason", 1, 1, 240), ("Next", 0, 1, 240)])?;
+    } else {
+        let lines: Vec<String> = text.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect();
+        limit(cmd, &lines, 1, 4, 240)?;
+    }
+    Ok(())
 }
 
 /// Labelled `--text` lines (`Label: ..`; an unlabelled line continues the field above) in `spec` order:
@@ -269,7 +306,7 @@ fn fields(text: &str, spec: &[(&str, usize, usize, usize)]) -> Res<Vec<Vec<Strin
     let mut cur: Option<usize> = None;
     for l in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         match spec.iter().position(|s| l.strip_prefix(s.0).is_some_and(|r| r.starts_with(": "))) {
-            Some(i) if cur.is_none_or(|c| i > c) => cur = Some(i),
+            Some(i) if cur.is_none_or(|c| i > c || (i == c && spec[i].0 == "Checks")) => cur = Some(i),
             Some(_) => return Err(format!("--text fields go once each in the order {names}")),
             None if cur.is_none() => return Err(format!("--text starts with one of {names}")),
             None => {}
@@ -299,6 +336,7 @@ fn ask_card(n: u64, text: &str, opts: &[String], recommend: Option<&str>, links:
         return Err(format!("{} options, allowed 2-4 without ★; --recommend adds it", opts.len()));
     }
     let k = recommend.and_then(|k| k.parse().ok()).filter(|k| (1..=opts.len()).contains(k)).ok_or(format!("--recommend needs one option number 1-{}", opts.len()))?;
+    one_line("--link", links)?;
     if links.len() > 2 {
         return Err("Evidence: at most two --link".into());
     }
@@ -364,14 +402,14 @@ fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str) -> Res<String> 
     match t.state {
         State::Later | State::Failed => {
             act(b, &cfg.root, n, "close", &[], verdict)?;
-            Ok(format!("closed #{n}"))
+            Ok(format!("#{n} closed"))
         }
         State::Review => {
             let sha = t.result.ok_or(format!("#{n} has no result"))?;
             match b.publish(n, &sha, &cfg.publish, &issue.title, &format!("Task: {}", b.url(n))) {
                 Publish::Done(m) => {
                     act(b, &cfg.root, n, "close", &[], &join(&[verdict, &m]))?;
-                    Ok(format!("closed #{n}: {m}"))
+                    Ok(format!("#{n} closed\n{m}"))
                 }
                 Publish::Pending(m) => Err(format!("#{n} not closed: {m}")),
                 Publish::Failed(m) => {
@@ -404,7 +442,7 @@ fn answer_picks(b: &dyn Board, cfg: &Config, picks: &[String]) -> Res<Vec<String
             (_, true) => close_one(b, cfg, n, &opt),
             (_, false) => act(b, &cfg.root, n, "requeue", &[], &opt).map(|t| format!("#{n} {}", t.state.name())),
         };
-        out.push(r.unwrap_or_else(|e| format!("error: {e}")));
+        out.push(r.unwrap_or_else(|e| platform::error_text(&format!("#{n}: {e}"), Some(&cfg.root))));
     }
     Ok(out)
 }
@@ -413,6 +451,22 @@ fn answer_picks(b: &dyn Board, cfg: &Config, picks: &[String]) -> Res<Vec<String
 
 fn cell(s: &str) -> String {
     s.replace('\\', "\\\\").replace('|', "\\|").replace('[', "\\[").replace(']', "\\]").replace(['\r', '\n'], " ")
+}
+
+/// R6: compact display only; the issue link retains the complete stored text.
+fn compact(s: &str, max: usize) -> String {
+    let s = s.replace(['\r', '\n'], " ");
+    if s.chars().count() > max { s.chars().take(max - 1).chain(['…']).collect() } else { s }
+}
+
+fn brief(card: &str) -> String {
+    let mut lines = card.lines();
+    while let Some(l) = lines.next() {
+        if let Some(p) = l.strip_prefix("Problem: ") {
+            return std::iter::once(p).chain(lines.take_while(|l| !l.starts_with("Evidence:") && !l.starts_with("To answer:") && options(l).is_empty())).collect::<Vec<_>>().join(" ");
+        }
+    }
+    card.lines().next().unwrap_or_default().to_string()
 }
 
 fn age(secs: i64) -> String {
@@ -434,6 +488,7 @@ fn session_link(cfg: &Config, raw: &Value, t: &Task, n: u64) -> (String, String)
         let l = runtime::Launch { task: n, title: String::new(), attempt: a, role: t.role.clone().unwrap_or_default(), rt: rt.into(), session: id.clone(), url: String::new(), resume: None };
         id = runtime::codex_thread(&runtime::log_path(&cfg.root, &l)).unwrap_or(id);
     }
+    let host = cell(host);
     let link = match rt {
         _ if id == "-" => format!("{host}: starting"),
         "claude" => format!("[{host}](https://claude.ai/code/session_{id})"),
@@ -470,20 +525,19 @@ fn report(b: &dyn Board, cfg: &Config, raw: &Value, only: &[String]) -> Res<Stri
         count(&|s| s == State::Ask),
         count(&|s| s == State::Ready)
     ));
-    let link = |v: &service::View| format!("[#{} {}]({})", v.issue.number, cell(&v.issue.title.chars().take(60).collect::<String>()), b.url(v.issue.number));
-    let open: Vec<u64> = views.iter().map(|v| v.issue.number).collect();
+    let link = |v: &service::View| format!("[#{} {}]({})", v.issue.number, cell(&compact(&v.issue.title, 60)), b.url(v.issue.number));
     let rows: Vec<String> = views
         .iter()
         .filter(|v| !matches!(v.task.state, State::Ask | State::Later | State::Failed))
         .map(|v| {
             let state = if v.task.state == State::Waiting {
-                let deps: Vec<String> = core::depends(&v.issue.body).into_iter().filter(|d| open.contains(d)).map(|d| format!("#{d}")).collect();
+                let deps: Vec<String> = v.open_deps.iter().map(|d| format!("#{d}")).collect();
                 format!("blocked ({} open)", deps.join(", "))
             } else {
                 v.task.state.name().to_string()
             };
             let (rt, s) = session_link(cfg, raw, &v.task, v.issue.number);
-            format!("| {} | {state} | {rt} | {s} |", link(v))
+            format!("| {} | {state} | {} | {s} |", link(v), cell(&rt))
         })
         .collect();
     if !rows.is_empty() {
@@ -497,12 +551,13 @@ fn report(b: &dyn Board, cfg: &Config, raw: &Value, only: &[String]) -> Res<Stri
         .map(|v| {
             let card = v.task.card.clone().unwrap_or_default();
             let opts = options(&card);
-            let (q, why): (Vec<&str>, Vec<&str>) = card.lines().filter(|l| !opts.iter().any(|o| l.trim().starts_with(&format!("{}. ", o.0)))).partition(|_| true);
-            let q = q.first().copied().unwrap_or("");
-            let why = why.get(1..).map(|w| w.join(" ")).unwrap_or_default();
             let n = v.issue.number;
-            let o: Vec<String> = opts.iter().map(|(k, t, star)| format!("{n}.{k} {}{}", cell(t), if *star { " ★" } else { "" })).collect();
-            format!("| {} {} | {} | {} |", link(v), cell(q), cell(&why), o.join(" · "))
+            let o: Vec<String> = opts.iter().map(|(k, t, star)| {
+                let label = cell(&compact(t, 120));
+                let label = if t.chars().count() > 120 { format!("[{label}]({})", b.url(n)) } else { label };
+                format!("{n}.{k} {label}{}", if *star { " ★" } else { "" })
+            }).collect();
+            format!("| {} | [{}]({}) | {} |", link(v), cell(&compact(&brief(&card), 160)), b.url(n), o.join(" · "))
         })
         .collect();
     if !qs.is_empty() {
@@ -520,7 +575,7 @@ fn report(b: &dyn Board, cfg: &Config, raw: &Value, only: &[String]) -> Res<Stri
         .filter(|v| v.task.state == State::Failed)
         .map(|v| {
             let why = v.comments.iter().rev().find(|c| c.trusted && c.body.starts_with("taskq: failed")).and_then(|c| c.body.split_once('\n')).map(|x| x.1).unwrap_or("");
-            format!("| {} | {} |", link(v), cell(why))
+            format!("| {} | [{}]({}) |", link(v), cell(&compact(why, 160)), b.url(v.issue.number))
         })
         .collect();
     if !failed.is_empty() {
@@ -1003,14 +1058,19 @@ fn set_focus(root: &Path, f: &str, request: Option<&str>) -> Res<()> {
 }
 
 /// Pause (§ 4): keep the focus in `focus.paused`, admit nothing.
-fn pause(root: &Path) {
+fn pause(root: &Path) -> Res<()> {
     let d = dot(root);
-    let f = fs::read_to_string(d.join("focus")).unwrap_or_default();
+    let f = match fs::read_to_string(d.join("focus")) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.to_string()),
+    };
     if !matches!(f.trim(), "" | "off") {
-        let _ = fs::write(d.join("focus.paused"), f);
+        fs::write(d.join("focus.paused"), f).map_err(|e| e.to_string())?;
     }
-    let _ = fs::write(d.join("focus"), "off");
+    fs::write(d.join("focus"), "off").map_err(|e| e.to_string())?;
     poke(root);
+    Ok(())
 }
 
 /// Resume (§ 4): restore the saved focus; never `all` by default.
@@ -1063,14 +1123,37 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     fs::write(dot(&cfg.root).join("restart"), "").map_err(|e| e.to_string())
 }
 
+fn service_fields(root: &Path) -> String {
+    let d = dot(root);
+    let mut out = vec![format!("Project: `{}`", root.display())];
+    match fs::read_to_string(d.join("focus")) {
+        Ok(f) if f.trim().is_empty() => out.push("Focus: off".into()),
+        Ok(f) => out.extend(f.split_whitespace().map(|l| format!("Focus: {l}"))),
+        Err(_) => out.push("Focus: unknown (focus file unavailable)".into()),
+    }
+    let status = fs::read_to_string(d.join("status.json")).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let ttl = load(root).map(|(c, _)| c.ttl.max(0) as u64).unwrap_or(300);
+    let fresh = file_age(&d.join("status.json")).filter(|a| *a <= ttl);
+    match (status, fresh) {
+        (Some(s), Some(a)) if s["error"].is_null() && s["tasks"].is_array() => {
+            let tasks = s["tasks"].as_array().unwrap();
+            let count = |states: &[&str]| tasks.iter().filter(|t| t["state"].as_str().is_some_and(|v| states.contains(&v))).count();
+            out.push(format!("In work {} · Waiting for answer {} · Ready {}", count(&["doing", "review"]), count(&["ask"]), count(&["ready"])));
+            out.push(format!("Freshness: {} (cached status)", age(a as i64)));
+            out.push("Service: unknown (process not checked)".into());
+        }
+        _ => out.push("Service: unknown (status missing, stale or failed)\nFreshness: unknown (no fresh successful status)\nCounts: unknown (no fresh successful read)".into()),
+    }
+    out.join("\n")
+}
+
 fn service(args: &Args) -> Res<()> {
     let sub = args.pos.get(1).map(String::as_str).unwrap_or("");
     let projects = platform::default_install().join("projects");
     if sub == "list" {
         // one project root per line, written by `service install` (§ 5); a PM or ARM covers several projects from it
-        for r in fs::read_to_string(&projects).unwrap_or_default().lines().filter(|l| !l.is_empty()) {
-            let f = fs::read_to_string(dot(Path::new(r)).join("focus")).unwrap_or_default();
-            println!("{r} focus: {}", if f.trim().is_empty() { "off" } else { f.trim() });
+        for r in fs::read_to_string(&projects).map_err(|e| format!("{}: {e}", projects.display()))?.lines().filter(|l| !l.is_empty()) {
+            println!("{}", service_fields(Path::new(r)));
         }
         return Ok(());
     }
@@ -1089,24 +1172,24 @@ fn service(args: &Args) -> Res<()> {
                         *n.entry(l.clone()).or_default() += 1;
                     }
                 }
-                let now = fs::read_to_string(d.join("focus")).unwrap_or_default();
-                println!("focus: {}", if now.trim().is_empty() { "off" } else { now.trim() });
-                println!("has: {}", c.cfg.has.join(" "));
-                println!("labels of open tasks: {}", n.iter().map(|(l, k)| format!("{l} ({k})")).collect::<Vec<_>>().join(", "));
+                println!("{}", service_fields(&root));
+                for h in &c.cfg.has { println!("Has: {h}"); }
+                for (l, k) in n { println!("Label: {l} ({k})"); }
                 return Ok(());
             }
             set_focus(&root, &f, args.one("request"))?;
-            println!("focus: {f}");
+            println!("{}", service_fields(&root));
             Ok(())
         }
         "pause" => {
             fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-            pause(&root);
-            println!("focus: off");
+            pause(&root)?;
+            println!("Paused {}", project_name(&root));
             Ok(())
         }
         "resume" => {
-            println!("focus: {}", resume(&root)?);
+            resume(&root)?;
+            println!("{}", service_fields(&root));
             Ok(())
         }
         "capacity" => capacity_cmd(&root, args),
@@ -1114,7 +1197,7 @@ fn service(args: &Args) -> Res<()> {
             fs::create_dir_all(&d).map_err(|e| e.to_string())?;
             fs::write(d.join("restart"), "").map_err(|e| e.to_string())?;
             poke(&root);
-            println!("restart requested");
+            println!("Restart requested for {}", project_name(&root));
             Ok(())
         }
         "status" => {
@@ -1126,9 +1209,9 @@ fn service(args: &Args) -> Res<()> {
             let (cfg, _) = load(&root)?;
             let u = platform::unit(&cfg.install, &root, &project_name(&root));
             if sub == "stop" {
-                platform::run_all(&u.stop, true)?;
+                platform::run_all(&u.stop, false)?;
                 kill_service(&root);
-                println!("stopped; it starts again at the next logon");
+                println!("Stop requested for {}; starts again at the next logon", project_name(&root));
                 return Ok(());
             }
             if sub == "install" {
@@ -1144,9 +1227,9 @@ fn service(args: &Args) -> Res<()> {
                 println!("installed {}", u.path.display());
             } else {
                 platform::run_all(&u.unload, true)?;
-                let _ = fs::remove_file(&u.path);
+                if let Err(e) = fs::remove_file(&u.path) && e.kind() != std::io::ErrorKind::NotFound { return Err(e.to_string()); }
                 let all: Vec<String> = fs::read_to_string(&projects).unwrap_or_default().lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
-                let _ = fs::write(&projects, all.concat());
+                fs::write(&projects, all.concat()).map_err(|e| e.to_string())?;
                 println!("removed {}", u.path.display());
                 kill_service(&root);
             }
@@ -1174,18 +1257,27 @@ fn print_task(n: u64, t: &Task) {
 
 fn run(argv: &[String]) -> Res<()> {
     let a = Args::parse(argv)?;
+    if a.pos.is_empty() || a.pos.first().is_some_and(|s| s == "help") || a.pos.iter().any(|s| s == "-h") || a.flags.contains_key("help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let cmd = a.pos.first().map(String::as_str).unwrap_or("");
     match cmd {
         "selftest" => {
             let n = core::golden(core::GOLDEN).map_err(|e| format!("fold: FAIL {e}"))?;
             println!("fold: {n} golden traces PASS");
             println!("{}", formats_selftest()?);
-            if std::env::var_os("TASKQ_SELFTEST_OFFLINE").is_none()
-                && let Ok(root) = find_root()
-            {
+            if std::env::var_os("TASKQ_SELFTEST_OFFLINE").is_some() {
+                println!("board: unknown (TASKQ_SELFTEST_OFFLINE set; no board read)");
+            } else if let Ok(root) = find_root() {
                 let c = ctx()?;
                 let open = c.board.issues(None)?.len();
-                println!("board: {} as {} on {}, {open} open issues, host {} (root {})", c.cfg.repo, c.board.me()?, c.cfg.web_host, c.cfg.me, root.display());
+                println!("board: {} as {} on {}", c.cfg.repo, c.board.me()?, c.cfg.web_host);
+                println!("open issues: {open}");
+                println!("host: {}", c.cfg.me);
+                println!("root: `{}`", root.display());
+            } else {
+                println!("board: unknown (no project config found; no board read)");
             }
             Ok(())
         }
@@ -1214,7 +1306,7 @@ fn run(argv: &[String]) -> Res<()> {
         }
         "service" => service(&a),
         "tray" => tray(platform::default_install(), a.one("snapshot")),
-        "" | "help" | "-h" | "--help" => Err(USAGE.into()),
+        "" => Err("command missing; use `taskq help`".into()),
         _ => command(&ctx()?, cmd, &a),
     }
 }
@@ -1222,18 +1314,22 @@ fn run(argv: &[String]) -> Res<()> {
 fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
     let (b, cfg, root) = (c.board.as_ref(), &c.cfg, c.cfg.root.as_path());
     let text = a.one("text").unwrap_or("");
+    if matches!(cmd, "requeue" | "later" | "failed" | "steer") || (cmd == "answer" && !a.pos.get(1).is_some_and(|p| p.contains('.'))) {
+        task_text(cmd, text)?;
+    }
+    if cmd == "add" && a.flags.contains_key("later") { task_text("later", text)?; }
     match cmd {
         "labels" => {
             let mut names = labels::FIXED.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             names.extend(b.issues(None)?.into_iter().flat_map(|i| i.labels));
             b.ensure_labels(&names)?;
-            println!("label catalog readback verified");
+            println!("Label catalog verified for {}", project_name(root));
             Ok(())
         }
         "add" => {
             // § 1 task body: Goal, Acceptance, Scope, dependencies; limits checked before any write
             let title = a.pos.get(1).filter(|t| !t.trim().is_empty()).ok_or("title missing")?;
-            if title.contains('\n') || title.chars().count() > 80 {
+            if title.contains(['\r', '\n']) || title.chars().count() > 80 {
                 return Err("title: one line, at most 80 characters; shorten it".into());
             }
             let goal: Vec<String> = a.need("goal")?.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
@@ -1318,15 +1414,18 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             for i in 1..a.pos.len() {
                 let n = a.num(i)?;
                 // § 7: a reviewed result closes with the verdict template; later/failed tasks and bare closes keep free text
-                let checked = match current(b, n)? {
-                    (issue, t, _) if t.state == State::Review && !text.is_empty() => close_verdict(text, &issue.body),
-                    _ => Ok(()),
+                let checked = match current(b, n) {
+                    Ok((issue, t, _)) if t.state == State::Review && !text.is_empty() => close_verdict(text, &issue.body).and_then(|_| {
+                        if t.result.as_deref().is_some_and(|sha| text.lines().any(|l| l.starts_with("Checks:") && l.contains(sha))) { Ok(()) } else { Err("Checks: name the exact result SHA with the CI outcome".into()) }
+                    }),
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e),
                 };
                 match checked.and_then(|_| close_one(b, cfg, n, text)) {
                     Ok(m) => println!("{m}"),
                     Err(e) => {
                         failed = true;
-                        println!("error: {e}");
+                        println!("{}", platform::error_text(&format!("#{n}: {e}"), Some(root)));
                     }
                 }
             }
@@ -1355,7 +1454,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             }
             Ok(())
         }
-        _ => Err(USAGE.into()),
+        _ => Err(format!("unknown command `{cmd}`; use `taskq help`")),
     }
 }
 
@@ -1480,7 +1579,7 @@ mod tests {
         assert!(ask_card(7, "Done: d\nProblem: p", &o(2), None, &[]).unwrap_err().contains("--recommend"));
         assert!(ask_card(7, "Done: d\nProblem: p", &o(2), Some("3"), &[]).is_err());
         assert!(ask_card(7, "Done: d\nProblem: p", &o(2), Some("1"), &vec!["u".to_string(); 3]).is_err());
-        assert_eq!(width("see [#12](https://very/long/url) and `cargo test --locked` https://x/y"), 13, "link targets and code are exempt");
+        assert_eq!(width("see [#12](https://very/long/url) and `cargo test --locked` https://x/y"), 15, "link targets and code are exempt; outside whitespace counts");
     }
 
     #[test]
@@ -1530,7 +1629,7 @@ mod tests {
         assert_eq!(fold(n, &entries(&b, n).unwrap(), false).state, State::Review, "pending CI changes nothing");
         b.state.borrow_mut().publish = String::new();
         assert!(answer_picks(&b, &c, &[format!("{n}.3")]).is_err(), "picks are checked before writing");
-        assert_eq!(answer_picks(&b, &c, &[format!("{n}.1")]).unwrap(), vec![format!("closed #{n}: merged 0123456789abcdef0123456789abcdef01234567")]);
+        assert_eq!(answer_picks(&b, &c, &[format!("{n}.1")]).unwrap(), vec![format!("#{n} closed\nmerged 0123456789abcdef0123456789abcdef01234567")]);
         let i = b.issue(n).unwrap();
         assert!(!i.open && !i.labels.iter().any(|l| l.starts_with("q-")));
     }
@@ -1546,8 +1645,8 @@ mod tests {
         assert!(e.contains("labels of open tasks: area-maps"), "{e}");
         assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
         fs::write(dot(&root).join("focus"), "area-maps").unwrap();
-        pause(&root);
-        pause(&root);
+        pause(&root).unwrap();
+        pause(&root).unwrap();
         assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
         assert_eq!(resume(&root).unwrap(), "area-maps", "a second pause keeps the saved focus");
         let _ = fs::remove_dir_all(&root);
@@ -1567,5 +1666,103 @@ mod tests {
         assert!(r.contains(&format!("| [#{n} Ship \\| it](https://board/{n}) | ready |")), "{r}");
         assert!(r.contains(&format!("{q}.1 left · {q}.2 right ★")), "{r}");
         assert!(r.contains("Hosts: mac v4.0.0"), "{r}");
+    }
+
+    #[test]
+    fn cli_audit_boundaries_and_no_write_on_invalid_text() {
+        assert_eq!(width("a  b"), 4);
+        assert_eq!(width("a`unclosed"), 10);
+        assert_eq!(width("é🦀"), 2);
+        assert!(one_line("option", &["a\rb".into()]).is_err());
+        let text = "Changed: visible\nChecks: A1 ok\nChecks: A2 ok; CI green on abc\nOpen: none";
+        close_verdict(text, "A1. a\nA2. b").unwrap();
+        assert!(task_text("requeue", "unlabelled reason").is_err());
+        assert!(task_text("requeue", &format!("Reason: ok{}", " ".repeat(240))).is_err());
+        assert!(task_text("failed", "Reason: blocked\nNext: repair").is_ok());
+        assert!(task_text("steer", "1\n2\n3\n4\n5").is_err());
+        let c = Ctx { cfg: cfg(), raw: json!({}), board: Box::new(Fake::default()) };
+        let n = c.board.create("T", "", &["taskq".into()]).unwrap();
+        c.board.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
+        let before = c.board.comments(n).unwrap();
+        for (cmd, text) in [("requeue", "bad"), ("later", "bad"), ("failed", "bad"), ("answer", "1\n2\n3\n4\n5"), ("steer", "1\n2\n3\n4\n5")] {
+            let a = Args::parse(&[cmd.into(), n.to_string(), "--text".into(), text.into()]).unwrap();
+            assert!(command(&c, cmd, &a).is_err(), "{cmd}");
+        }
+        assert_eq!(c.board.comments(n).unwrap().len(), before.len());
+        run(&["--help".into()]).unwrap();
+        run(&["service".into(), "pause".into(), "--help".into()]).unwrap();
+        run(&["close".into(), "12".into(), "--help".into()]).unwrap();
+        assert!(USAGE.contains("--recommend K"));
+        assert!(USAGE.contains("--snapshot DIR"));
+        let e = platform::error_text("#7 is ready", None);
+        assert!(e.starts_with("Error: #7 is ready\nNext: "));
+        assert_eq!(e.lines().count(), 2);
+        let dep = c.board.create("ordinary issue", "", &[]).unwrap();
+        let blocked = c.board.create("blocked", &format!("Depends on #{dep}"), &["taskq".into(), "selected".into()]).unwrap();
+        let report = report(c.board.as_ref(), &c.cfg, &c.raw, &["selected".into()]).unwrap();
+        assert!(report.contains(&format!("#{blocked} blocked")));
+        assert!(report.contains(&format!("blocked (#{dep} open)")), "non-task dependency remains visible outside filter");
+    }
+
+    #[test]
+    fn compact_report_keeps_choices_links_and_original_evidence() {
+        let (b, c) = (Fake::default(), cfg());
+        let title = "🦀".repeat(65);
+        let n = b.create(&title, "", &["taskq".into()]).unwrap();
+        b.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
+        let reason = "r".repeat(170);
+        let option = "x".repeat(125);
+        let card = format!("Done: inspected\nProblem: {reason}\nEvidence: [context](https://context)\n1. {option} ★\n2. keep\nTo answer: exact syntax");
+        let a = fold(n, &entries(&b, n).unwrap(), false).attempt;
+        b.comment(n, &entry("ask", &[], a, &card)).unwrap();
+        let r = report(&b, &c, &Value::Null, &[]).unwrap();
+        assert!(r.contains(&format!("{}…", "🦀".repeat(59))));
+        assert!(r.contains(&format!("[{}…](https://board/{n})", "r".repeat(159))));
+        assert!(r.contains(&format!("{n}.1 [{}…](https://board/{n}) ★", "x".repeat(119))));
+        assert!(r.contains(&format!("{n}.2 keep")));
+        assert!(!r.contains("Done: inspected"));
+        assert!(!r.contains("To answer:"));
+        assert_eq!(fold(n, &entries(&b, n).unwrap(), false).card.as_deref(), Some(card.as_str()));
+        assert_eq!(b.issue(n).unwrap().title, title);
+        assert_eq!(brief("Old question?\n1. keep\n2. change"), "Old question?");
+    }
+
+    #[test]
+    fn service_fields_keep_missing_data_unknown_and_pause_reports_failure() {
+        let root = std::env::temp_dir().join(format!("taskq-fields-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let s = service_fields(&root);
+        assert!(s.contains("Focus: unknown"));
+        assert!(s.contains("Counts: unknown"));
+        assert!(s.contains("Freshness: unknown"));
+        assert!(!s.contains("Ready 0"));
+        assert!(pause(&root).is_err(), "missing state folder cannot acknowledge pause");
+        fs::create_dir_all(dot(&root)).unwrap();
+        fs::write(dot(&root).join("focus"), "one two").unwrap();
+        fs::write(dot(&root).join("status.json"), r#"{"error":null,"tasks":[{"state":"doing"},{"state":"review"},{"state":"ask"},{"state":"ready"}]}"#).unwrap();
+        let s = service_fields(&root);
+        assert!(s.contains("Focus: one\nFocus: two"));
+        assert!(s.contains("In work 2 · Waiting for answer 1 · Ready 1"));
+        assert!(s.contains("cached status"));
+        assert!(s.contains("Service: unknown (process not checked)"));
+        fs::write(dot(&root).join("status.json"), r#"{"error":"board failed","tasks":[]}"#).unwrap();
+        assert!(service_fields(&root).contains("Counts: unknown"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compact_errors_retain_complete_diagnostics() {
+        let root = std::env::temp_dir().join(format!("taskq-error-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let original = format!("#7 {}\nexact evidence", "é".repeat(200));
+        let e = platform::error_text(&original, Some(&root));
+        assert_eq!(e.lines().count(), 2);
+        assert!(width(e.lines().next().unwrap()) <= 160);
+        assert!(e.contains("cli-errors.log"));
+        assert_eq!(fs::read_to_string(dot(&root).join("cli-errors.log")).unwrap(), format!("{original}\n"));
+        let failed = platform::error_text(&original, None);
+        assert!(failed.contains(&original), "a failed save never discards the original evidence");
+        let _ = fs::remove_dir_all(&root);
     }
 }

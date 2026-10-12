@@ -551,7 +551,7 @@ fn place(w: &Window, r: Rect) {
 fn act(action: &str, root: &Path, label: Option<&str>) {
     let d = crate::dot(root);
     match action {
-        "pause" => crate::pause(root),
+        "pause" => { let _ = crate::pause(root); }
         "resume" => {
             let _ = crate::resume(root);
         }

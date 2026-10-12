@@ -163,8 +163,26 @@ pub fn launch(install: &Path, args: &[String]) -> ! {
 }
 
 pub fn die(msg: &str) -> ! {
-    eprintln!("taskq: {msg}");
+    eprintln!("{}", error_text(msg, crate::find_root().ok().as_deref()));
     std::process::exit(1);
+}
+
+pub fn error_text(msg: &str, root: Option<&Path>) -> String {
+    let next = if msg.chars().count() > 153 || msg.contains(['\r', '\n']) {
+        use std::io::Write;
+        let saved = root.and_then(|root| {
+            let d = crate::dot(root);
+            fs::create_dir_all(&d).ok()?;
+            let p = d.join("cli-errors.log");
+            writeln!(fs::OpenOptions::new().create(true).append(true).open(&p).ok()?, "{msg}").ok()?;
+            Some(p)
+        });
+        match saved {
+            Some(p) => format!("Read `{}`; use `taskq help` for syntax and retry.", p.display()),
+            None => return format!("Error: {msg}\nNext: Diagnostic could not be saved; check `taskq help` and retry."),
+        }
+    } else { "Check the input and board/service status, then retry; use `taskq help` for syntax.".into() };
+    format!("Error: {}\nNext: {next}", crate::compact(msg, 153))
 }
 
 fn download(url: &str, to: &Path) -> Result<(), String> {

@@ -77,6 +77,7 @@ pub struct View {
     pub task: Task,
     pub comments: Vec<Comment>,
     pub log: Vec<core::Entry>,
+    pub open_deps: Vec<u64>,
 }
 
 /// Fold every open task (heartbeat issues and untrusted authors excluded).
@@ -126,8 +127,8 @@ pub fn views(board: &dyn Board, cache: &mut HashMap<u64, (i64, Vec<Comment>)>) -
         };
         cache.insert(issue.number, (issue.updated, comments.clone()));
         let log: Vec<_> = comments.iter().filter(|c| c.trusted).map(|c| core::Entry { id: c.id, body: c.body.clone(), edited: c.edited }).collect();
-        let deps_open = core::depends(&issue.body).iter().any(|d| open.contains(d));
-        out.push(View { task: core::fold(issue.number, &log, deps_open), issue, comments, log });
+        let open_deps: Vec<u64> = core::depends(&issue.body).into_iter().filter(|d| open.contains(d)).collect();
+        out.push(View { task: core::fold(issue.number, &log, !open_deps.is_empty()), issue, comments, log, open_deps });
     }
     Ok((out, hosts))
 }

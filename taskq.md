@@ -3,8 +3,7 @@ taskq runs a queue of agent tasks on a GitHub or GitLab issue board. This file i
 roles, lease and fencing, compatibility and deployment. History of decisions lives in git and issues, operational
 state in [docs/handoff.md](docs/handoff.md).
 
-This file specifies **v4**, the Rust binary from `src/`. Until cutover (§ 9) **v3** `taskq.py` + `host_service.py`
-follows [docs/legacy/taskq-v3.md](docs/legacy/taskq-v3.md) and is frozen: fixes only, no new release flow.
+This file specifies **v4**, the Rust binary from `src/`.
 
 ## Principles (R1–R13)
 ### Change rule
@@ -297,4 +296,4 @@ version to the new one, prints a plan per open issue and collects its questions 
 for the owner, one by one or all at once. After the owner's OK, with every old service stopped and no old children, it
 applies the plan with `taskq` commands and issue edits. Closed issues are never touched. New services start: Mac, then
 Windows. Repair is the same agent procedure for one project; it warns when `status` shows another host's fresh
-heartbeat. v3 → v4 a week clean: delete `taskq.py`, `host_service.py`, `runtimes/`, `docs/legacy/`.
+heartbeat.

@@ -98,7 +98,8 @@ Labels: `q-<state>` (projection; `waiting` maps to `q-blocked`); type `code|docs
 `assignee-only` (start only when the board's user is an assignee); any other, e.g. `area-maps`. Reserved: `taskq-host`.
 ## 2. Log and states
 A log entry is a comment by a trusted author whose first line is `taskq: <kind> [<arg>] [attempt <id>]`; the rest of the comment is its text. Entries are read in comment-id order. An edited comment (`updated_at` after `created_at`) or an unknown kind is ignored. A person can type an entry by hand; it counts like a command. The CLI form `taskq answer K` or
-`taskq answer N.K` (no colon, N = this task) also counts as `answer K`; other comments without `taskq:` are ignored.
+`taskq answer N.K` (no colon, N = this task) also counts as `answer K`. In `ask` a comment whose whole body is K or option K's
+text (trimmed, any case, `K. ` optional) of the open card counts as `answer K` if one option matches; other comments are ignored.
 
 `core.rs` is one pure function `fold(n, entries, deps_open) -> Task {state, attempt, role, session, retries, card, result,
 inbox}`; `inbox` lists the accepted `answer`/`steer` ids of the current attempt. The attempt id is the id of the accepted
@@ -136,8 +137,8 @@ attempt. An entry not accepted in the current state is ignored and changes nothi
 2. `Problem: <decision needed and user effect>` -- one or two lines, at most 240 characters per line.
 3. Optional `Evidence: [<label>](<url>)` -- one line, at most two screenshot/video/issue/PR links, labels at most 40 characters each.
 4. Two to four options, `1. <action and trade-off>` etc.; one line each, at most 160 characters, exactly one ends in `★`.
-5. To answer: `taskq answer N.K` or comment `taskq answer K`. Last line; substitute this task's number for N.
-A card has at most nine nonblank lines. K is an option number; a bare digit comment does not count (section 2).
+5. To answer: `taskq answer N.K` or comment `K` or the option text. Last line; substitute this task's number for N.
+A card has at most nine nonblank lines. K is an option number; a bare K or option text counts only in `ask` (section 2).
 `--text` supplies literal Done and Problem lines; `--link` supplies Evidence; `--option` and `--recommend` supply the options/star.
 Result decision cards use the same format after the verdict (section 7): append Done/Problem to `--text`, use `--option`, `--recommend`, `--link`; omit all card fields for no decision.
 

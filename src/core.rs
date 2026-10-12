@@ -73,9 +73,11 @@ struct Line<'a> {
     args: Vec<&'a str>,
     attempt: Option<u64>,
     text: &'a str,
+    bare: bool,
 }
 
-/// The first line of a log entry of task `n`; `taskq answer K|N.K` (the CLI form) counts as `taskq: answer K`.
+/// The first line of a log entry of task `n`; `taskq answer K|N.K` (the CLI form) counts as `taskq: answer K`, any other
+/// comment as a bare answer that `pick` resolves against the open card.
 fn parse(n: u64, body: &str) -> Option<Line<'_>> {
     let (head, text) = body.split_once('\n').unwrap_or((body, ""));
     if let Some(arg) = head.trim().strip_prefix("taskq answer ") {
@@ -84,16 +86,19 @@ fn parse(n: u64, body: &str) -> Option<Line<'_>> {
             None => arg.trim(),
         };
         k.parse::<usize>().ok()?;
-        return Some(Line { kind: "answer", args: vec![k], attempt: None, text: text.trim() });
+        return Some(Line { kind: "answer", args: vec![k], attempt: None, text: text.trim(), bare: false });
     }
-    let mut words: Vec<&str> = head.trim().strip_prefix("taskq:")?.split_whitespace().collect();
+    let Some(head) = head.trim().strip_prefix("taskq:") else {
+        return Some(Line { kind: "answer", args: vec![body.trim()], attempt: None, text: "", bare: true });
+    };
+    let mut words: Vec<&str> = head.split_whitespace().collect();
     let mut attempt = None;
     if words.len() >= 3 && words[words.len() - 2] == "attempt" {
         attempt = Some(words.pop()?.parse().ok()?);
         words.pop();
     }
     let kind = words.first().copied()?;
-    Some(Line { kind, args: words[1..].to_vec(), attempt, text: text.trim() })
+    Some(Line { kind, args: words[1..].to_vec(), attempt, text: text.trim(), bare: false })
 }
 
 fn sha(s: &str) -> bool {
@@ -116,6 +121,18 @@ pub fn options(card: &str) -> Vec<(usize, String, bool)> {
         .collect()
 }
 
+/// The option a bare comment `s` names on `card` (§ 2): its number, or its text with or without `K. `, case-insensitive;
+/// None unless exactly one option matches.
+fn pick(card: &str, s: &str) -> Option<usize> {
+    let s = s.trim_end_matches('★').trim().to_lowercase();
+    let m: Vec<usize> = options(card)
+        .into_iter()
+        .filter(|(k, o, _)| [k.to_string(), o.to_lowercase(), format!("{k}. {}", o.to_lowercase())].contains(&s))
+        .map(|o| o.0)
+        .collect();
+    (m.len() == 1).then(|| m[0])
+}
+
 /// What a resumed child receives for inbox entry `id` (§ 2): its text, else option K of the card it answers, else its
 /// first line; never empty.
 pub fn delivery(n: u64, entries: &[Entry], id: u64) -> String {
@@ -126,7 +143,7 @@ pub fn delivery(n: u64, entries: &[Entry], id: u64) -> String {
     }
     let before: Vec<Entry> = entries.iter().filter(|x| x.id < id).cloned().collect();
     let card = fold(n, &before, false).card.unwrap_or_default();
-    let k = parse(n, &e.body).and_then(|l| l.args.first()?.parse::<usize>().ok());
+    let k = parse(n, &e.body).and_then(|l| if l.bare { pick(&card, l.args[0]) } else { l.args.first()?.parse::<usize>().ok() });
     options(&card).into_iter().find(|o| Some(o.0) == k).map(|o| o.1).unwrap_or_else(|| head.trim().to_string())
 }
 
@@ -223,7 +240,7 @@ fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line) {
             end(t);
             t.state = Closed;
         }
-        (Ask, "answer", _) => {
+        (Ask, "answer", _) if !l.bare || pick(t.card.as_deref().unwrap_or(""), l.args[0]).is_some() => {
             t.retries = 0;
             t.card = None;
             match resume.take() {
@@ -330,6 +347,10 @@ mod tests {
         assert_eq!(super::delivery(7, &log, 12), "y");
         log[2] = e(12, "taskq: answer 2\nuse y, keep x");
         assert_eq!(super::delivery(7, &log, 12), "use y, keep x");
+        log[2] = e(12, "2");
+        assert_eq!(super::delivery(7, &log, 12), "y");
+        log[2] = e(12, " 2. Y ★");
+        assert_eq!(super::delivery(7, &log, 12), "y");
         log[2] = e(12, "taskq answer 3");
         assert_eq!(super::delivery(7, &log, 12), "taskq answer 3");
     }

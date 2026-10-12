@@ -44,7 +44,7 @@ fn label(i: &Issue, prefix: &str) -> Option<String> {
 }
 
 pub fn priority(i: &Issue) -> u8 {
-    if i.labels.iter().any(|l| crate::labels::canonical(l) == "p1") { 1 } else { 2 }
+    if crate::labels::matches(&i.labels, "p0") { 0 } else if crate::labels::matches(&i.labels, "p1") { 1 } else { 2 }
 }
 
 /// The host named in a `spawn` session (`<rt>:<session> <host>`).
@@ -143,7 +143,7 @@ pub struct Service<'a> {
     pub cfg: &'a Config,
     pub version: String,
     pub kids: Vec<Kid>,
-    /// Labels from `<root>/.taskq/focus`; empty: admit nothing, `all`: any task (§ 4).
+    /// Labels from `<root>/.taskq/focus`; empty: admit nothing, `all`: any task; `p0` passes any non-empty focus (§ 4).
     pub focus: Vec<String>,
     /// The last inbox id handed to each attempt's child.
     delivered: HashMap<u64, u64>,
@@ -338,7 +338,7 @@ impl<'a> Service<'a> {
             .filter(|v| label(&v.issue, "host-").is_none_or(|h| h == me))
             .filter(|v| !v.issue.labels.iter().any(|l| l == "assignee-only") || v.issue.assignees.contains(&user))
             .filter(|v| v.issue.labels.iter().filter_map(|l| l.strip_prefix("needs-")).all(|x| self.cfg.has.iter().any(|h| h == x)))
-            .filter(|v| self.focus.iter().any(|f| f == "all" || crate::labels::matches(&v.issue.labels, f)))
+            .filter(|v| priority(&v.issue) == 0 || self.focus.iter().any(|f| f == "all" || crate::labels::matches(&v.issue.labels, f)))
             .collect();
         queue.sort_by_key(|v| (priority(&v.issue), v.issue.number));
         for v in queue {
@@ -602,6 +602,23 @@ mod tests {
         assert_eq!(task(&b, new).state, State::Doing);
         assert_eq!(task(&b, conflict).state, State::Ready);
         assert!(b.comments(conflict).unwrap().is_empty(), "conflicting restriction never claimed");
+    }
+
+    #[test]
+    fn p0_passes_any_focus_but_not_pause_or_limits() {
+        let b = Fake::default();
+        let p1 = b.create("P1", "", &["taskq".into(), "p1".into(), "area-maps".into()]).unwrap();
+        let p0 = b.create("P0", "", &["taskq".into(), "p0".into(), "area-ui".into()]).unwrap();
+        let other = b.create("O", "", &["taskq".into(), "area-ui".into()]).unwrap();
+        assert!(priority(&b.issue(p0).unwrap()) < priority(&b.issue(p1).unwrap()));
+        let c = cfg("mac");
+        let mut s = service(&b, &c, Default::default());
+        s.focus = vec![];
+        s.pass().unwrap();
+        assert_eq!(task(&b, p0).state, State::Ready, "pause: p0 waits too");
+        s.focus = vec!["area-maps".into()];
+        s.pass().unwrap();
+        assert_eq!((task(&b, p0).state, task(&b, p1).state, task(&b, other).state), (State::Doing, State::Ready, State::Ready), "p0 first; limit 1 holds");
     }
 
     #[test]

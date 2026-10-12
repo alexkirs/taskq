@@ -1,6 +1,7 @@
 # One-off run outside the current scope (#652)
 
 Design target, not shipped behavior. [taskq.md](../../taskq.md) wins on conflict (R8, R13).
+Shipped instead (owner decision 2026-10-13, #790): `p0` alone passes any focus on every host; no grant, no `p0-extra`.
 Scope: one urgent task of a registered project runs end to end while the host keeps its current focus.
 Chosen model: a board label grant (owner answer 3 on #652). First release: one local host; cross-host is Later.
 

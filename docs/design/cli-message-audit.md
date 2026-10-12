@@ -44,8 +44,10 @@ Before/after examples are illustrative, not client screenshots:
   publication evidence is retained.
 
 Qualification: native Windows Rust tests and live read-only selftest are the
-project gates. CLI help/error rendering is exercised directly; report snapshots
-are covered through the fake board. No actual Codex/app, DOT, narrow screenshot,
+project gates. CLI help is exercised with `cargo run -- service pause --help` and
+`cargo run -- close 12 --help`; error/report snapshots use the fake board. A direct
+debug executable launch outside Cargo failed with Windows `0xC0000135` (missing
+DLL); standalone release packaging is unverified. No actual Codex/app, DOT, narrow screenshot,
 media-accessibility, live stop/uninstall, macOS or Linux verification is claimed.
 Those channel/platform proofs remain separate from model/format tests. The v3
 Python suite is absent after cutover and is not presented as a passing gate.

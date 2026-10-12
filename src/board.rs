@@ -817,6 +817,7 @@ mod tests {
         let b = Fake::default();
         let n = b.create("t", "", &[]).unwrap();
         b.raw(n, "taskq: spawn worker claude:x evil", false, false);
+        b.raw(n, "1", false, false);
         b.raw(n, "taskq: later", true, true);
         let e = entries(&b, n).unwrap();
         assert_eq!(e.len(), 1);

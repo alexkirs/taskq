@@ -311,7 +311,7 @@ fn ask_card(n: u64, text: &str, opts: &[String], recommend: Option<&str>, links:
     let opts: Vec<String> = numbered(opts, Some(k)).lines().map(String::from).collect();
     limit("option", &opts, 2, 4, 160)?;
     lines.extend(opts);
-    lines.push(format!("To answer: `taskq answer {n}.K` or comment `taskq answer K`."));
+    lines.push(format!("To answer: `taskq answer {n}.K` or comment `K` or the option text."));
     Ok(lines.join("\n"))
 }
 
@@ -1195,7 +1195,7 @@ mod tests {
     #[test]
     fn ask_card_follows_section_2() {
         let card = ask_card(7, "Done: checked spec\nProblem: two ways\nboth slow", &["left".into(), "right, slower".into()], Some("2"), &["https://g/o/r/pull/12".into(), "[shot](https://x/y.png)".into()]).unwrap();
-        assert_eq!(card, "Done: checked spec\nProblem: two ways\nboth slow\nEvidence: [#12](https://g/o/r/pull/12), [shot](https://x/y.png)\n1. left\n2. right, slower ★\nTo answer: `taskq answer 7.K` or comment `taskq answer K`.");
+        assert_eq!(card, "Done: checked spec\nProblem: two ways\nboth slow\nEvidence: [#12](https://g/o/r/pull/12), [shot](https://x/y.png)\n1. left\n2. right, slower ★\nTo answer: `taskq answer 7.K` or comment `K` or the option text.");
         let o = |n: usize| vec!["o".to_string(); n];
         assert!(ask_card(7, "Problem: p", &o(2), Some("1"), &[]).unwrap_err().contains("Done: 0 lines"));
         assert!(ask_card(7, "question?", &o(2), Some("1"), &[]).unwrap_err().contains("starts with"));
@@ -1215,7 +1215,7 @@ mod tests {
         let checks = ["cargo test --locked -- pass\ncargo run -- selftest -- pass".to_string()];
         assert_eq!(result_text(7, "Changed: faster\nOpen: none", &checks, &[], None, &[]).unwrap(), "Changed: faster\nChecks: cargo test --locked -- pass\nChecks: cargo run -- selftest -- pass\nOpen: none");
         let r = result_text(7, "Changed: c\nOpen: none\nDone: shipped\nProblem: keep it?", &["cargo test --locked -- pass".into()], &["close: ship".into(), "redo".into()], Some("1"), &[]).unwrap();
-        assert_eq!(r, "Changed: c\nChecks: cargo test --locked -- pass\nOpen: none\n\nDone: shipped\nProblem: keep it?\n1. close: ship ★\n2. redo\nTo answer: `taskq answer 7.K` or comment `taskq answer K`.");
+        assert_eq!(r, "Changed: c\nChecks: cargo test --locked -- pass\nOpen: none\n\nDone: shipped\nProblem: keep it?\n1. close: ship ★\n2. redo\nTo answer: `taskq answer 7.K` or comment `K` or the option text.");
         assert!(result_text(7, "Changed: c\nOpen: none\nDone: d", &checks, &[], None, &[]).unwrap_err().contains("only with --option"));
         assert!(result_text(7, "Changed: c\nOpen: none", &[], &[], None, &[]).unwrap_err().contains("Checks: 0 lines"));
         assert!(result_text(7, "summary", &checks, &[], None, &[]).is_err());
@@ -1235,7 +1235,7 @@ mod tests {
         let a = fold(n, &entries(&b, n).unwrap(), false).attempt;
         b.comment(n, &entry("ask", &[], a, &ask_card(n, "Done: read spec\nProblem: which way", &["left".into(), "right".into()], Some("1"), &[]).unwrap())).unwrap();
         let card = fold(n, &entries(&b, n).unwrap(), false).card.unwrap();
-        assert!(card.ends_with(&format!("To answer: `taskq answer {n}.K` or comment `taskq answer K`.")), "{card}");
+        assert!(card.ends_with(&format!("To answer: `taskq answer {n}.K` or comment `K` or the option text.")), "{card}");
         b.comment(n, "taskq answer 2").unwrap();
         let log = entries(&b, n).unwrap();
         assert_eq!(fold(n, &log, false).state, State::Doing);

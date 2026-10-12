@@ -61,6 +61,16 @@ pub fn release_exe(install: &Path, v: &str) -> PathBuf {
 
 /// The launcher `<install>/taskq`: run the current release. Only `service run` counts starts of a version that is not
 /// yet healthy; the third one restores `previous` (§ 8).
+/// Windows: no console window for a child; a console-less parent would otherwise get one per child.
+pub fn quiet(c: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    c
+}
+
 pub fn launch(install: &Path, args: &[String]) -> ! {
     let service = args.first().map(String::as_str) == Some("service") && args.get(1).map(String::as_str) == Some("run");
     let pick = || {
@@ -131,11 +141,7 @@ pub fn launch(install: &Path, args: &[String]) -> ! {
                     c.stderr(err);
                 }
                 c.stdout(out);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-                }
+                quiet(&mut c);
             }
             let code = match c.status() {
                 Ok(s) => s.code().unwrap_or(1),

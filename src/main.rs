@@ -83,7 +83,7 @@ fn find_root() -> Res<PathBuf> {
 }
 
 fn hostname() -> String {
-    std::process::Command::new("hostname").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()
+    platform::quiet(&mut std::process::Command::new("hostname")).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()
 }
 
 fn load(root: &Path) -> Res<(Config, Value)> {
@@ -135,7 +135,7 @@ fn token(install: &Path, kind: Kind, host: &str) -> Res<String> {
     let cli = || {
         // only the board host's login: a default-host token never goes to another host
         let (bin, args): (&str, &[&str]) = if kind == Kind::GitLab { ("glab", &["config", "get", "token", "--host"]) } else { ("gh", &["auth", "token", "--hostname"]) };
-        let o = std::process::Command::new(bin).args(args).arg(host).output().ok()?;
+        let o = platform::quiet(std::process::Command::new(bin).args(args).arg(host)).output().ok()?;
         o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
     fs::read_to_string(install.join("token")).map(|t| t.trim().to_string()).ok().filter(|t| !t.is_empty())

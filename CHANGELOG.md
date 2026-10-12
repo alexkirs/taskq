@@ -3,6 +3,11 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.0.6
+
+Windows: workers, reviewers and the `gh`/`hostname` calls run without a console window (a console-less service got a
+new window per child). No reinstall: `taskq update` and restart the task.
+
 ## v4.0.5
 
 Windows: the v4.0.4 launcher exited with 101 under the Scheduled Task (stale console handles after dropping the console);

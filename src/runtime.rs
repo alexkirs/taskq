@@ -125,6 +125,7 @@ pub struct Env<'a> {
 
 pub fn command(env: &Env, l: &Launch) -> Command {
     let mut c = Command::new(which(&l.rt));
+    crate::platform::quiet(&mut c);
     match (l.rt.as_str(), &l.resume) {
         ("claude", r) => {
             c.args(["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", env.permission_mode]);

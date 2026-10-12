@@ -1,2 +1,0 @@
-# #641 research pilot only; never imported by runtime.
-hypothesis==6.140.3

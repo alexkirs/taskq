@@ -2,7 +2,7 @@
 # Fixture for `taskq tray` (docs/design/verification.md): three projects in DIR, then
 #   TASKQ_INSTALL=DIR/install taskq tray --snapshot DIR/shots
 # alpha admits (long titles, ask, failed, a newer version to update to, history over the last day: 3 closes and
-# 3 failed in a day, the first and last of 12 bins not empty); beta is paused with a saved focus, has a service error and the
+# 3 failed in a day, the first and last of 12 bins not empty, Agents rows); beta is paused with a saved focus, has a service error and the
 # same issue number #12 in another repo; gamma is observation only with a stale status.json. No board, no service.
 set -eu
 d=${1:?usage: tray-fixture.sh DIR}
@@ -13,7 +13,10 @@ now=$(date +%s)
 long='A very long task title that never fits in one line of a 320 px popover at sixteen pixels, so it must ellipsize'
 cat > "$d/alpha/.taskq/status.json" <<EOF
 {"project":"alpha","host":"mac","version":"4.1.0","issues":"https://github.com/o/alpha/issues","log":"$d/alpha.log",
- "focus":["area-ui"],"error":null,"request":"Work on the UI","update":"4.1.1","events_since":$((now-86400)),"tasks":[
+ "focus":["area-ui"],"error":null,"request":"Work on the UI","update":"4.1.1","events_since":$((now-86400)),
+ "agents":{"at":$((now-120)),"rows":[{"runtime":"claude","path":"/bin/claude","version":"2.1.3","login":"logged in","account":"owner@example.com"},
+ {"runtime":"codex","path":"/bin/codex","version":"0.15.3","login":"not logged in","account":null},
+ {"runtime":"codex-app","path":null,"version":null,"login":"not installed","account":null}]},"tasks":[
  {"n":12,"title":"$long","state":"ask","labels":["taskq","area-ui"]},
  {"n":13,"title":"Fix <b>escaping</b> & quotes \" '","state":"doing","labels":["taskq","area-ui"]},
  {"n":14,"title":"Broken build","state":"failed","labels":["taskq","area-maps"]},

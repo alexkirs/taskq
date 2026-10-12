@@ -309,9 +309,113 @@ fn completes(rollout: &Path) -> usize {
     BufReader::new(f).lines().map_while(Result::ok).filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| v["payload"]["type"] == "task_complete")).count()
 }
 
+// ---------- `taskq agents` (taskq.md § 5): read-only probes, unknown when unreadable (R12) ----------
+
+/// Exit success and stdout + stderr of a read-only subcommand; None when it cannot start or runs over 10 s.
+fn probe(bin: &Path, args: &[&str]) -> Option<(bool, String)> {
+    let mut c = Command::new(bin);
+    c.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut ch = crate::platform::quiet(&mut c).spawn().ok()?;
+    // ponytail: polls; output over the pipe buffer stalls the child and reads unknown
+    for _ in 0..100 {
+        if ch.try_wait().ok()?.is_some() {
+            let o = ch.wait_with_output().ok()?;
+            return Some((o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = ch.kill();
+    let _ = ch.wait();
+    None
+}
+
+/// The first word of `--version` output that starts with a digit: `2.1.3 (Claude Code)`, `codex-cli 0.15.3`.
+fn version(out: &str) -> Option<String> {
+    out.split_whitespace().find(|w| w.starts_with(|c: char| c.is_ascii_digit())).map(String::from)
+}
+
+/// Login state and account from `claude auth status` (JSON) or `codex login status` (text).
+fn login(rt: &str, out: Option<(bool, String)>) -> (&'static str, Option<String>) {
+    let Some((_, out)) = out else { return ("unknown", None) };
+    if rt == "claude" {
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+        return match v["loggedIn"].as_bool() {
+            Some(true) => ("logged in", v["email"].as_str().or(v["authMethod"].as_str()).map(String::from)),
+            Some(false) => ("not logged in", None),
+            None => ("unknown", None),
+        };
+    }
+    let l = out.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if l.starts_with("Not logged in") {
+        return ("not logged in", None);
+    }
+    // `Logged in using ChatGPT`, `Logged in using an API key - sk-…`: the method only, never key text
+    match l.strip_prefix("Logged in") {
+        Some(rest) => ("logged in", Some(rest.trim_start_matches([' ', ':']).trim_start_matches("using ").split(" - ").next().unwrap_or("").trim().to_string()).filter(|a| !a.is_empty())),
+        None => ("unknown", None),
+    }
+}
+
+/// The runtimes taskq can start here (§ 8): `codex-app` is macOS only and shares Codex's binary and login.
+pub fn agent_runtimes() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") { &["claude", "codex", "codex-app"] } else { &["claude", "codex"] }
+}
+
+/// One row per runtime: `runtime`, `path` (null: not installed), `version`, `login`, `account` (null: unknown or none).
+pub fn agents() -> serde_json::Value {
+    let mut seen: std::collections::HashMap<&str, serde_json::Value> = std::collections::HashMap::new();
+    let rows = agent_runtimes().iter().map(|rt| {
+        let bin = if *rt == "claude" { "claude" } else { "codex" };
+        let mut row = seen.entry(bin).or_insert_with(|| {
+            let p = which(bin);
+            if !p.is_absolute() {
+                return serde_json::json!({"path": null, "version": null, "login": "not installed", "account": null});
+            }
+            let ver = probe(&p, &["--version"]).and_then(|(_, o)| version(&o));
+            let (state, account) = login(bin, probe(&p, if bin == "claude" { &["auth", "status"] } else { &["login", "status"] }));
+            serde_json::json!({"path": p.display().to_string(), "version": ver, "login": state, "account": account})
+        }).clone();
+        row["runtime"] = serde_json::json!(rt);
+        row
+    }).collect();
+    serde_json::Value::Array(rows)
+}
+
+/// The menu and status line of a row: `<runtime> <version> · <account>` or `· not logged in` etc.
+pub fn agent_text(r: &serde_json::Value) -> String {
+    let rt = r["runtime"].as_str().unwrap_or("?");
+    let tail = match (r["login"].as_str(), r["account"].as_str()) {
+        (Some("not installed"), _) => return format!("{rt} · not installed"),
+        (Some("logged in"), Some(a)) => a.to_string(),
+        (Some("logged in"), None) => "logged in, account unknown".into(),
+        (Some("not logged in"), _) => "not logged in".into(),
+        _ => "login unknown".into(),
+    };
+    format!("{rt} {} · {tail}", r["version"].as_str().unwrap_or("unknown"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_probes_read_version_and_login_or_say_unknown() {
+        assert_eq!(version("2.1.296 (Claude Code)\n").as_deref(), Some("2.1.296"));
+        assert_eq!(version("codex-cli 0.159.3").as_deref(), Some("0.159.3"));
+        assert_eq!(version("error"), None);
+        let ok = |s: &str| Some((true, s.to_string()));
+        assert_eq!(login("claude", ok(r#"{"loggedIn": true, "email": "a@b.c"}"#)), ("logged in", Some("a@b.c".into())));
+        assert_eq!(login("claude", ok(r#"{"loggedIn": false}"#)), ("not logged in", None));
+        assert_eq!(login("claude", ok("Unknown command: auth")), ("unknown", None));
+        assert_eq!(login("codex", ok("Logged in using ChatGPT\n")), ("logged in", Some("ChatGPT".into())));
+        assert_eq!(login("codex", ok("Logged in using an API key - sk-ab***cd")), ("logged in", Some("an API key".into())));
+        assert_eq!(login("codex", Some((false, "Not logged in\n".into()))), ("not logged in", None));
+        assert_eq!(login("codex", None), ("unknown", None));
+        let row = |l: &str, a: serde_json::Value| serde_json::json!({"runtime": "codex", "version": "0.1", "login": l, "account": a});
+        assert_eq!(agent_text(&row("logged in", "ChatGPT".into())), "codex 0.1 · ChatGPT");
+        assert_eq!(agent_text(&row("not installed", serde_json::Value::Null)), "codex · not installed");
+        assert_eq!(agent_text(&row("unknown", serde_json::Value::Null)), "codex 0.1 · login unknown");
+    }
 
     #[test]
     fn app_turn_ends_on_a_new_task_complete_or_a_closed_app() {

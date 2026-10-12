@@ -3,6 +3,11 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.0.3
+
+The host heartbeat carries an `at <board time>` line. GitHub keeps `updated_at` on a same-body edit, so an idle or
+unchanged heartbeat aged forever and another host could post `gone` for a live attempt after `ttl`.
+
 ## v4.0.2
 
 Windows `service install` registers the Scheduled Task for the current user, so it no longer needs admin ("Access is denied").

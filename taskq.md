@@ -175,7 +175,7 @@ One loop:
 1. Reap exited children; a child whose attempt is still current posts `gone attempt <id>` with the exit code.
 2. Stop children whose attempt is no longer current (R11). Remove worktrees of closed tasks (§ 7).
 3. Write the heartbeat issue `taskq host <name>` (label `taskq-host`) when older than `ttl / 5`: lines `version <v>`
-   and `#<N> <id>` per live child. Freshness uses the board's `updated_at` and the response `Date`, never local clocks.
+   and `#<N> <id>` per live child, plus `at <board time>` (a same-body edit keeps `updated_at`). Freshness uses the board's `updated_at` and the response `Date`, never local clocks.
 4. Post `gone` for attempts of dead hosts (§ 3).
 5. Fix projected labels; `waiting` with closed deps becomes `ready`.
 6. Resume the session of a live attempt for a new `answer` or `steer` (text on stdin); spawn a reviewer for `review`

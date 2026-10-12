@@ -10,6 +10,9 @@ One tray per host over every project in `<install>/projects` (heartbeat `<instal
 labels, `request`, `update` and `events_since`; `<root>/.taskq/events` keeps 30 days of close and failed moves.
 `taskq service focus ... --request TEXT`, `taskq service pause|resume`; resume without a saved focus fails instead of
 taking `all`. `<root>/.taskq/update` makes the next pass check for an update at once. No board change.
+The tray icon shows run or pause (macOS may show the summary) and a click opens a webview popover: questions and
+failed of all projects, project pages, pause/resume, log, folder, restart, stop and uninstall. View, text size and
+period persist in `<install>/tray.json`; `taskq tray --snapshot DIR` writes its icons and popover pages as PNG.
 
 ## v4.0.10
 

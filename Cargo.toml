@@ -16,6 +16,19 @@ libc = "0.2"
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 tray-icon = "0.26"
 tao = "0.37"
+wry = "0.57"
+png = "0.18"
+
+# `taskq tray --snapshot` (§ 4): the webview's own capture API
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSImage", "NSImageRep", "NSBitmapImageRep"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSDictionary", "NSError"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "WKWebView", "WKSnapshotConfiguration"] }
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell"] }
 
 [profile.release]
 strip = true

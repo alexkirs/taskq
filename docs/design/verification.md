@@ -49,10 +49,28 @@ Service target history is `<root>/.taskq/events`; incomplete history reports its
 “Update now”, acting through `<root>/.taskq/update`. These are implementation targets, not shipped features.
 `taskq.md` and Rust remain unchanged; §4 is still the runtime contract.
 
+## Phase 2 renderer
+
+`src/tray.rs` and `src/tray.html` ship the wry popover, the page bridge, icons, actions and `<install>/tray.json` (§ 4).
+Fixture: `sh docs/design/tray-fixture.sh DIR`, then `TASKQ_INSTALL=DIR/install taskq tray --snapshot DIR/shots`.
+It covers a long title, HTML in a title, the same #12 in two repos, a paused project with a saved focus, a service
+error, a stale status.json, an observation-only project without a log, and a duplicated close event.
+
+Observed: `cargo test --locked` covers icon geometry (run/pause, wide numbers, gray paused summary), cross-board
+deduplication, settings validation and base64. `taskq tray --snapshot` wrote 8 icon PNGs and 6 popover snapshots
+(dark and light; home at 16 and 20; project page) natively on macOS (WKWebView) and on Windows (WebView2), for the
+fixture and for the live install. Inspected: one row per board and issue, "Paused 1 of 2", error and stale rows apart
+from Failed, escaped titles, ellipsis at 14–16 and wrapping at 18–20.
+Windows: a GNU toolchain build links `WebView2Loader.dll` dynamically and does not start without it next to the exe;
+the MSVC build of the release workflow links it statically.
+
+Not qualified here (follow-up task): menu bar and notification-area placement, 200% scale, OS screenshots of the open
+popover, click-through, keyboard and screen reader, and pause, resume, restart, stop and uninstall run from the popover.
+
 ## Remaining acceptance
 
-Native wry/WKWebView and WebView2 behavior, renderer opening/closing, fixture-to-service bridge,
-OS icon rendering, keyboard/screen reader, scale/theme, multi-project safety, actual events-cache completeness,
+Beyond the phase 2 snapshots: native placement, renderer opening/closing, actions against a live service,
+OS icon rendering in the menu bar, keyboard/screen reader, scale/theme, multi-project safety, actual events-cache completeness,
 AI onboarding and external-effect confirmation remain unqualified. A prototype/model PASS is not an OS or service PASS (R12).
 The earlier local file preview was rejected by browser URL policy; this package makes no visual PASS claim.
 Canonical package and source priority: [README](README.md); phased work: [implementation brief](implementation-brief.md).

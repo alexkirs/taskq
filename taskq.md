@@ -97,7 +97,8 @@ Owner decisions on looks and sound, one line each. Change one only per R13.
 - Formatting: a few unicode icons where they help scanning; no emoji clutter, no badges.
 - Last README line: `If taskq saves you time, [buy me a coffee](…).`
 - Tone: minimum words, plain to anyone, no filler (R7).
-
+- Operator UI: [density specification](docs/design/operator-ui.md) and [menu specification](docs/design/menu.md) govern the approved design target.
+- These UI targets are not shipped behavior: § 4 remains the runtime contract until their implementation and verification (R8, R12, R13).
 ## 1. Tasks
 A task is an open issue by a trusted author (GitHub `OWNER|MEMBER|COLLABORATOR`, GitLab Reporter+) labelled `taskq`
 (`taskq add` sets it; on the board a person adds it). Any other issue never starts: a PM makes a task from it with
@@ -108,7 +109,6 @@ items are `A1.`, `A2.`, never renumbered; each an observable result a reviewer c
 Labels: `q-<state>` (projection, § 2); type `code|docs|research|asset`; `priority-1|2` (lower first, default 2);
 `run-<runtime>` (none: any); `host-<name>` (none: any host); `needs-<x>` (only a host whose `has` lists x, § 9);
 `assignee-only` (start only when the board's user is an assignee); any other, e.g. `area-maps`. Reserved: `taskq-host`.
-
 ## 2. Log and states
 A log entry is a comment by a trusted author whose first line is `taskq: <kind> [<arg>] [attempt <id>]`; the rest of the
 comment is its text. Entries are read in comment-id order. An edited comment (`updated_at` after `created_at`) or an

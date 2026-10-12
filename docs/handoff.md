@@ -16,7 +16,8 @@ Refresh every line with a fresh read before acting on it (R12).
   `later`/`failed` entries. The 4 v3 `ask` tasks (#612, #601, #597, #588) are parked `later` with their question.
 - #643 (v3 capacity) and #638 (v3 PID recovery) closed by owner decision.
 - `taskq status` after the cutover: Ready 0, waiting 1 (#613), later 16, failed 6.
-- PR 719 (test contracts) is on hold, unaccepted.
+- Cleanup 2026-10-12 before the repo transfer: the 5 open v3 PRs (594, 599, 628, 661, 719) closed unmerged, all
+  branches but `main` deleted, 17 worktrees removed; uncommitted v3 files are in `~/Documents/taskq-archive-2026-10-12.tar.gz`.
 
 ## Waits on the owner
 1. A week clean on v4: delete `taskq.py`, `host_service.py`, `runtimes/`, `docs/legacy/` (§ 9).

@@ -1255,9 +1255,10 @@ fn print_task(n: u64, t: &Task) {
 }
 
 fn uninstall_unit(u: &platform::Unit, root: &Path, projects: &Path) -> Res<()> {
+    let registered = fs::read_to_string(projects).map_err(|e| format!("{}: {e}", projects.display()))?;
+    let all: Vec<String> = registered.lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
     platform::run_all(&u.unload, false)?;
     if let Err(e) = fs::remove_file(&u.path) && e.kind() != std::io::ErrorKind::NotFound { return Err(e.to_string()); }
-    let all: Vec<String> = fs::read_to_string(projects).unwrap_or_default().lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
     fs::write(projects, all.concat()).map_err(|e| e.to_string())
 }
 
@@ -1586,6 +1587,31 @@ mod tests {
         assert!(ask_card(7, "Done: d\nProblem: p", &o(2), Some("3"), &[]).is_err());
         assert!(ask_card(7, "Done: d\nProblem: p", &o(2), Some("1"), &vec!["u".to_string(); 3]).is_err());
         assert_eq!(width("see [#12](https://very/long/url) and `cargo test --locked` https://x/y"), 15, "link targets and code are exempt; outside whitespace counts");
+    }
+
+    #[test]
+    fn unreadable_registry_preserves_unit_before_unload() {
+        let root = std::env::temp_dir().join(format!("taskq-registry-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let projects = root.join("projects");
+        let registered = b"other-project\n\xff";
+        fs::write(&projects, registered).unwrap();
+        let u = platform::Unit {
+            path: root.join("unit"), text: String::new(), load: vec![], stop: vec![],
+            unload: vec![vec!["taskq-must-not-run-unload".into()]],
+        };
+        fs::write(&u.path, "unit contents").unwrap();
+        let error = uninstall_unit(&u, &root, &projects).unwrap_err();
+        assert!(error.contains(&projects.display().to_string()));
+        assert!(!error.contains("taskq-must-not-run-unload"));
+        assert_eq!(fs::read_to_string(&u.path).unwrap(), "unit contents");
+        assert_eq!(fs::read(&projects).unwrap(), registered);
+        fs::remove_file(&projects).unwrap();
+        assert!(uninstall_unit(&u, &root, &projects).unwrap_err().contains(&projects.display().to_string()));
+        assert!(u.path.is_file());
+        assert!(!projects.exists());
+        fs::remove_file(&u.path).unwrap();
+        fs::remove_dir(&root).unwrap();
     }
 
     #[test]

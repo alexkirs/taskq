@@ -827,13 +827,14 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
 }
 
 #[cfg(not(unix))]
-fn reexec(s: &Service, _cfg: &Config) -> Res<()> {
+fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     // ponytail: Windows cannot hand children to a new image; exit once no child is live and the unit restarts us.
     // The new `current` is already written, so the update waits only for the running attempts.
     if s.kids.is_empty() {
         std::process::exit(75);
     }
-    Ok(())
+    // later update checks see no newer version: the restart request carries the re-exec until the children end
+    fs::write(dot(&cfg.root).join("restart"), "").map_err(|e| e.to_string())
 }
 
 fn service(args: &Args) -> Res<()> {

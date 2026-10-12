@@ -1,5 +1,6 @@
 {
  "board": "github",
+ "label_schema": "canonical",
  "repo": "alexkirs/taskq",
  "publish": "pr",
  "limits": {

@@ -286,7 +286,7 @@ change that N-1 cannot ignore needs a cutover like § 9. Hosts update independen
 ## 9. Config and cutover
 `taskq.json` beside the project root:
 - `board` `github|gitlab`; `repo` `owner/name`; `host` GitLab host.
-- `label_schema` `canonical|legacy` (absent: legacy if the board has `priority-1|2` or `q-waiting` objects, else canonical). Both names work in priority and focus/status filters; logs keep `waiting`. Canonical writes require all-host compatible release/idle approval on existing boards. Keep legacy objects and closed issues; reassign only open issues in the dependent adoption task #776 (#769 owner answer).
+- `label_schema` `canonical|legacy` (absent: legacy if the board has `priority-1|2` or `q-waiting` objects, else canonical). Both names work in priority and focus/status filters; logs keep `waiting`. Canonical writes require all-host compatible release/idle approval on existing boards. Keep legacy objects and closed issues; reassign only open issues (#769 owner answer). This board is canonical since #776.
 - `publish` `direct|pr`; `workspace` `external` keeps host-owned worktrees.
 - `hosts` `{hostname: name}` (env `TASKQ_HOST` overrides); `has` `{name: [x..]}`; `limits` `{"claude": n, "codex": n}`.
 - `permission_mode`, `codex` (R9); `pages` link wrapper base; `assignee` (login or `me`) report filter.

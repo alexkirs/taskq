@@ -112,13 +112,13 @@ Labels: `q-<state>` (projection, § 2); type `code|docs|research|asset`; `priori
 ## 2. Log and states
 A log entry is a comment by a trusted author whose first line is `taskq: <kind> [<arg>] [attempt <id>]`; the rest of the
 comment is its text. Entries are read in comment-id order. An edited comment (`updated_at` after `created_at`) or an
-unknown kind is ignored. A person can type an entry by hand; it counts like a command.
+unknown kind is ignored. A person can type an entry by hand; it counts like a command. The CLI form `taskq answer K` or
+`taskq answer N.K` (no colon, N = this task) also counts as `answer K`; other comments without `taskq:` are ignored.
 
-`core.rs` is one pure function `fold(entries, deps_open) -> Task {state, attempt, role, session, retries, card, result,
+`core.rs` is one pure function `fold(n, entries, deps_open) -> Task {state, attempt, role, session, retries, card, result,
 inbox}`; `inbox` lists the accepted `answer`/`steer` ids of the current attempt. The attempt id is the id of the accepted
-`spawn` comment; it is the fencing token. An entry that names `attempt <id>` is
-accepted only when `<id>` is the current attempt. An entry not accepted in the current state is ignored and changes
-nothing.
+`spawn` comment; it is the fencing token. An entry that names `attempt <id>` is accepted only when `<id>` is the current
+attempt. An entry not accepted in the current state is ignored and changes nothing.
 
 | State | Entry | Next | Notes |
 |---|---|---|---|
@@ -132,7 +132,7 @@ nothing.
 | `review` | `spawn reviewer <rt>:<session> <host>` | `review` | only without a live reviewer; attempt = this id |
 | `review` | `ask attempt` | `ask` | reviewer's card; result kept |
 | `review` | `close attempt` or `close` | closed | verdict text; written after publication (§ 7) |
-| `ask` | `answer [K]` | state before `ask`, else `ready` | `retries = 0`; text or option K for the attempt |
+| `ask` | `answer [K]` | state before `ask`, else `ready` | `retries = 0`; delivered: text, else option K, else first line |
 | any open | `requeue` | `ready` | by PM/owner: result, card and attempt cleared; `retries = 0` |
 | any open | `later` / `failed` | `later` / `failed` | text: reason; attempt ended |
 | `later`, `failed` | `requeue` / `close` | `ready` / closed | the only exits |

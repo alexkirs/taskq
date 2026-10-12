@@ -622,7 +622,7 @@ mod tests {
         b.raw(n, "taskq: later", true, true);
         let e = entries(&b, n).unwrap();
         assert_eq!(e.len(), 1);
-        assert_eq!(crate::core::fold(&e, false).state, crate::core::State::Ready);
+        assert_eq!(crate::core::fold(0, &e, false).state, crate::core::State::Ready);
     }
 
     #[test]

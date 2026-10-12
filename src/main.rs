@@ -9,7 +9,7 @@ mod service;
 mod tray;
 
 use board::{Board, Http, Kind, Publish, entries};
-use core::{Entry, State, Task, entry, fold};
+use core::{Entry, State, Task, entry, fold, options};
 use serde_json::{Value, json};
 use service::{Config, Kid, Service};
 use std::collections::{BTreeMap, HashMap};
@@ -195,7 +195,7 @@ fn own_attempt(n: u64) -> Option<u64> {
 fn current(b: &dyn Board, n: u64) -> Res<(board::Issue, Task, bool)> {
     let issue = b.issue(n)?;
     let deps = deps_open(b, &issue.body)?;
-    let t = fold(&entries(b, n)?, deps);
+    let t = fold(n, &entries(b, n)?, deps);
     Ok((issue, t, deps))
 }
 
@@ -208,14 +208,14 @@ fn act(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &str
     }
     let deps = deps_open(b, &issue.body)?;
     let mut log = entries(b, n)?;
-    let before = fold(&log, deps);
+    let before = fold(n, &log, deps);
     let body = entry(kind, args, own_attempt(n), text);
     log.push(Entry { id: u64::MAX, body: body.clone(), edited: false });
-    if fold(&log, deps) == before {
+    if fold(n, &log, deps) == before {
         return Err(format!("#{n} is {}: `{kind}` not accepted", before.state.name()));
     }
     b.comment(n, &body)?;
-    let t = fold(&entries(b, n)?, deps); // re-read: report what the board holds (R12)
+    let t = fold(n, &entries(b, n)?, deps); // re-read: report what the board holds (R12)
     service::project(b, &issue, &t)?;
     poke(root);
     Ok(t)
@@ -223,18 +223,6 @@ fn act(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &str
 
 fn numbered(opts: &[String], recommend: Option<usize>) -> String {
     opts.iter().enumerate().map(|(i, o)| format!("{}. {o}{}", i + 1, if recommend == Some(i + 1) { " ★" } else { "" })).collect::<Vec<_>>().join("\n")
-}
-
-/// Option lines `K. text [★]` of a card.
-fn options(card: &str) -> Vec<(usize, String, bool)> {
-    card.lines()
-        .filter_map(|l| {
-            let (k, rest) = l.trim().split_once(". ")?;
-            let k: usize = k.parse().ok()?;
-            let star = rest.trim_end().ends_with('★');
-            Some((k, rest.trim_end().trim_end_matches('★').trim().to_string(), star))
-        })
-        .collect()
 }
 
 fn join(parts: &[&str]) -> String {
@@ -454,7 +442,7 @@ fn wait(b: &dyn Board, cfg: &Config, window_min: u64, only: &[String]) -> Res<Ve
         let open: Vec<u64> = b.issues(None)?.iter().map(|i| i.number).collect();
         let mut moved = vec![];
         for i in issues.iter().filter(|i| service::is_task(i) && in_scope(i, only)) {
-            let t = fold(&entries(b, i.number)?, core::depends(&i.body).iter().any(|d| open.contains(d)));
+            let t = fold(i.number, &entries(b, i.number)?, core::depends(&i.body).iter().any(|d| open.contains(d)));
             let state = if !i.open { "closed".to_string() } else if t.state == State::Review && t.card.is_some() { "review*".into() } else { t.state.name().into() };
             if seen.get(&i.number) != Some(&state) && matches!(state.as_str(), "ask" | "review*" | "closed" | "failed") {
                 moved.push(format!("{} #{}", state.trim_end_matches('*'), i.number));
@@ -882,7 +870,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                 }
             }
             let n = b.create(title, &body, &labels)?;
-            let t = if a.flags.contains_key("later") { act(b, root, n, "later", &[], text)? } else { fold(&[], blocked) };
+            let t = if a.flags.contains_key("later") { act(b, root, n, "later", &[], text)? } else { fold(n, &[], blocked) };
             poke(root);
             print_task(n, &t);
             Ok(())
@@ -1008,12 +996,12 @@ mod tests {
         assert!(act(&b, &c.root, n, "steer", &[], "x").unwrap_err().contains("ready"), "steer needs a live worker");
         let before = b.comments(n).unwrap().len();
         b.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
-        let a = fold(&entries(&b, n).unwrap(), false).attempt.unwrap();
+        let a = fold(n, &entries(&b, n).unwrap(), false).attempt.unwrap();
         b.comment(n, &entry("result", &["0123456789abcdef0123456789abcdef01234567"], Some(a), "1. close: ship it ★\n2. redo the copy")).unwrap();
         assert_eq!(b.comments(n).unwrap().len(), before + 2);
         b.state.borrow_mut().publish = "pending".into();
         assert!(close_one(&b, &c, n, "ok").unwrap_err().contains("pending"));
-        assert_eq!(fold(&entries(&b, n).unwrap(), false).state, State::Review, "pending CI changes nothing");
+        assert_eq!(fold(n, &entries(&b, n).unwrap(), false).state, State::Review, "pending CI changes nothing");
         b.state.borrow_mut().publish = String::new();
         assert!(answer_picks(&b, &c, &[format!("{n}.3")]).is_err(), "picks are checked before writing");
         assert_eq!(answer_picks(&b, &c, &[format!("{n}.1")]).unwrap(), vec![format!("closed #{n}: merged 0123456789abcdef0123456789abcdef01234567")]);
@@ -1045,7 +1033,7 @@ mod tests {
         let n = b.create("Ship | it", "", &["taskq".into()]).unwrap();
         let q = b.create("Q", "", &["taskq".into()]).unwrap();
         b.comment(q, &entry("spawn", &["worker", "claude:abc", "mac"], None, "")).unwrap();
-        let a = fold(&entries(&b, q).unwrap(), false).attempt.unwrap();
+        let a = fold(q, &entries(&b, q).unwrap(), false).attempt.unwrap();
         b.comment(q, &entry("ask", &[], Some(a), "Which way?\nBecause.\n1. left\n2. right ★")).unwrap();
         b.create("taskq host mac", "version 4.0.0", &[service::HOST_LABEL.into()]).unwrap();
         let r = report(&b, &c, &Value::Null, &[]).unwrap();

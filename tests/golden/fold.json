@@ -51,6 +51,27 @@
    {"id": 12, "body": "taskq: gone attempt 10\nexit 0"},
    {"id": 13, "body": "taskq: answer 1"}
   ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac", "inbox": [13]}},
+  {"name": "hand-typed CLI form answers", "task": 7, "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: ask attempt 10\nWhich DB?\n1. sqlite ★\n2. postgres"},
+   {"id": 12, "body": "taskq answer 7.2"}
+  ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac", "inbox": [12]}},
+  {"name": "hand-typed CLI form without N answers", "task": 7, "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: ask attempt 10\nWhich DB?\n1. sqlite ★\n2. postgres"},
+   {"id": 12, "body": "taskq answer 1\nsqlite, keep it small"}
+  ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac", "inbox": [12]}},
+  {"name": "CLI form for another task, bare digit and colon-less steer are ignored", "task": 7, "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: ask attempt 10\nWhich DB?\n1. sqlite ★\n2. postgres"},
+   {"id": 12, "body": "taskq answer 8.1"},
+   {"id": 13, "body": "1"},
+   {"id": 14, "body": "taskq steer go"}
+  ], "expect": {"state": "ask", "attempt": 10, "role": "worker", "session": "claude:s1 mac", "card": "Which DB?\n1. sqlite ★\n2. postgres"}},
+  {"name": "CLI form outside ask is ignored", "task": 7, "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq answer 7.1"}
+  ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac"}},
   {"name": "ask shows the card", "entries": [
    {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
    {"id": 11, "body": "taskq: ask attempt 10\nWhich DB?"}

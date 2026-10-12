@@ -1,4 +1,7 @@
 __pycache__/
+.pytest_cache/
+.hypothesis/
+/test-receipt.json
 *.egg-info/
 build/
 .local/

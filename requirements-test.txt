@@ -1,2 +1,4 @@
-# #641 research pilot only; never imported by runtime.
+# Test-only runner and native-reducer state machine; never imported by runtime.
 hypothesis==6.140.3
+pytest==8.4.2
+pytest-subtests==0.14.2

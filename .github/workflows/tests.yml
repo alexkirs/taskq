@@ -1,16 +1,36 @@
-# Main, review candidates and PRs run tests; updates require trusted exact-SHA success.
+# One full gate per candidate push; main runs its post-publication alarm.
 name: tests
 on:
   push:
     branches: [main, 'taskq-*']
-  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
-  tests:
-    runs-on: ubuntu-latest
+  platform-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python3 -m pip install -r requirements-test.txt
-      - run: python3 -m unittest discover -s tests
+      - run: python -m pip install -r requirements-test.txt
+      - run: python -m pytest --receipt test-receipt.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-receipt-${{ matrix.os }}
+          path: test-receipt.json
+  tests:
+    needs: platform-tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every platform gate
+        env:
+          PLATFORM_RESULT: ${{ needs.platform-tests.result }}
+        run: test "$PLATFORM_RESULT" = success

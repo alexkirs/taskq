@@ -2365,13 +2365,33 @@ of test types are not targets. Passing checks prove only their assertions at the
 
 #### Structure and levels
 
-Keep automated tests in `tests/test_single.py`, using stdlib `unittest`; no new framework, service or policy file
-except the owner-authorized #641 test-only Hypothesis pilot above. Install its
-pinned dependency with `python3 -m pip install -r requirements-test.txt`; run
-`python3 -m unittest tests.test_single.StateKernel tests.test_single.TestStateKernel`.
+Changed (owner-approved testing package, 2026-10-12): pytest runs existing unittest
+classes, subTests and the generated Hypothesis state-machine without rewriting them.
+Install pinned test-only dependencies with `python3 -m pip install -r requirements-test.txt`;
+run `python3 -m pytest`. Production imports no test dependency. Existing unittest
+commands remain useful for focused checks; pytest is the complete CI runner.
 The normal suite skips the stateful pilot when Hypothesis is absent; that skip is
 not pilot PASS. CI installs the test dependency and includes the pilot in the full suite.
 Levels describe evidence, not extra directories or runners:
+
+- Prefer behavioral service integration and real local boundaries; reuse actual
+  lifecycle/capacity reducers in Hypothesis, never a second behavioral implementation.
+- Named contracts: admission, lifecycle, answers, recovery, capacity, restart, upgrade.
+  `pytest --contract NAME` selects a documented group; `--changed PATH` selects
+  affected groups. Unknown paths and shared core/harness/protocol changes select all.
+  Selection is explicit, conservative and not a call-graph or coverage claim.
+- A failure receipt contains contract/node/phase, platform/Python/encoding and the
+  source/environment fingerprint. Never store task text, prompts, credentials or
+  arbitrary exception/local-variable content. Existing minimized Hypothesis examples
+  and fixture traces remain the reproduction evidence; record an explicit seed when used.
+- Reuse proof only for the same artifact tree, dependencies, runner/harness, configuration,
+  protocol and platform fingerprint. Record the tested commit separately; equal SHA
+  alone is insufficient, and new commits never inherit old run timestamps or metrics.
+- CI runs one full candidate gate per pushed `taskq-*` head on Windows/macOS/Linux;
+  no duplicate PR-triggered run. Main retains its post-merge alarm. Fork candidates
+  need a maintainer-owned candidate ref or explicit dispatch before acceptance.
+  Deploy uses a short isolated smoke of the changed boundary; no production queue mutation.
+  Test evidence never authorizes another cadence benchmark or paid-model run.
 
 - Contract and isolated checks: `Model` (data/trust and contract sentinels), `Contract` (contract loading/update),
   `DirectPublication` (real local git transport with fake CI), `Commands` (state transitions and one fake-board lifecycle), `Tick` (dispatch, claims and recovery), `Wait`
@@ -2404,7 +2424,7 @@ order itself protects the contract or data.
 Run focused affected methods/classes while iterating, for example
 `python3 -m unittest tests.test_single.Commands.test_close_failure_keeps_the_label` or
 `python3 -m unittest tests.test_single.Tick tests.test_single.Wait`.
-After the final edit/rebase, freeze a code or test diff and run `python3 -m unittest tests.test_single` once before
+After the final edit/rebase, freeze the artifact and require one full exact-head pytest CI gate before
 publication, including shared-code changes. A later code/test edit or rebase needs a new final gate. Do not rerun
 a green unchanged suite without a failure or a specific flake hypothesis. An answer on current `origin/main`
 requires no test/CI run; documentation-only work runs affected sentinels where applicable. CI behavior stays as

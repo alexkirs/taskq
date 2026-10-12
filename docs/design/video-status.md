@@ -63,7 +63,10 @@ unknown. No dependency installation was needed for this review.
 
 ## Continuation decision
 
-Owner pick: **pending #795 ask**. Do not file or start production tasks before it.
+Owner pick: **continue A in approval stages**, recorded as
+[answer 1](https://github.com/alexkirs/taskq/issues/795#issuecomment-6134560498).
+Reuse sources and voice samples; review scene/timing/style before gated narrated
+and silent finals. This selects the continuation, not final production acceptance.
 
 1. **Recommended: continue A in approval stages.** Preserve the latest approved
    planning basis; first reconcile existing artifacts/current product and obtain
@@ -76,9 +79,16 @@ Owner pick: **pending #795 ask**. Do not file or start production tasks before i
    trial before final production. This adds access/cost decisions; A/B and the
    approved brief remain reusable, not discarded.
 
-After the pick, record its answer link here and file only the selected follow-ups.
-Each is one reviewable deliverable: approval-ready scene/timing package; if needed,
-approved style/voice proof; narrated MP4 with SRT/poster and QA; silent MP4/WebM
-with seam/mobile QA. Production tasks depend on recorded approvals and verified
-historical-writer fencing. New task links replace this provisional list; do not
-reopen old tasks, launch providers or accept old candidates by implication.
+## Filed follow-ups
+
+| Task | Deliverable and gate |
+|---|---|
+| [#801](https://github.com/alexkirs/taskq/issues/801) | Read-only historical-writer and Git/provider-rights evidence review; proof or a concrete ask. Depends on #795; no access changes or session termination. |
+| [#802](https://github.com/alexkirs/taskq/issues/802) | One scene/timing/style/voice approval package, including rough timing and mobile previews using retained sources/samples. Depends on #795 and verified fencing in #801; no final synthesis or assembly. |
+| [#803](https://github.com/alexkirs/taskq/issues/803) | Narrated MP4, SRT, poster, reproducible source and QA; depends on #801/#802 and explicit final-production activation. Filed Later; requires separate final owner acceptance. |
+| [#805](https://github.com/alexkirs/taskq/issues/805) | Silent MP4/WebM, poster, recovered/reviewed loop source and seam/mobile QA; depends on #801/#802 and explicit final-production activation. Filed Later; requires separate final owner acceptance. |
+
+No optional Google/Meshy trial was filed. Do not reopen old tasks, launch providers
+or accept old candidates by implication. Filing these tasks leaves the production
+hold in place; task closure without independently checked evidence cannot satisfy
+the fencing prerequisite.

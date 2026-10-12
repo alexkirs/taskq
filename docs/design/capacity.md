@@ -1,9 +1,8 @@
 # Capacity: limits, controls and load gating
 
-Proposal for [#783](https://github.com/alexkirs/taskq/issues/783), not shipped behavior or an owner-approved decision change.
-The [contract](../../taskq.md#3-attempts-lease-capacity) remains in force. Apply the proposed text only with the implementation and owner approval (R8/R13).
+Design for [#783](https://github.com/alexkirs/taskq/issues/783), implemented in [#792](https://github.com/alexkirs/taskq/issues/792).
+The [contract](../../taskq.md#3-attempts-lease-capacity) (§ 3, § 4, § 9) is the source of truth; where this note differs, taskq.md wins.
 Follow [menu M2–M5](menu.md) and [density D1–D12](operator-ui.md); all product text below is English.
-Delivery: the owner selected a design-only PR and its full head SHA in the task's accepted answer, replacing A3's research-SHA instruction.
 
 ## User model
 

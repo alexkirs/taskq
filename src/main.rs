@@ -607,11 +607,13 @@ fn launcher(install: &Path) -> PathBuf {
     if l.is_file() { l } else { std::env::current_exe().unwrap_or_else(|_| PathBuf::from("taskq")) }
 }
 
-fn sleep_until_poke(poke: &Path, secs: u64) {
+/// Sleep until a poke or `secs`; `tick` runs every second (the load gate's sampling, § 3).
+fn sleep_until_poke(poke: &Path, secs: u64, tick: &mut dyn FnMut()) {
     let mtime = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
     let start = mtime(poke);
     for _ in 0..secs {
         std::thread::sleep(Duration::from_secs(1));
+        tick();
         if mtime(poke) != start {
             return;
         }
@@ -658,7 +660,17 @@ fn service_run(c: &Ctx) -> Res<()> {
     let issues = c.board.url(0).strip_suffix("/0").unwrap_or_default().to_string();
     let log = platform::log_path(&cfg.install, &project);
     eprintln!("taskq {} service on {} for {}", platform::VERSION, cfg.me, cfg.repo);
+    let mut sampled: Option<Instant> = None;
     loop {
+        // § 3: capacity reloads before each admission decision; children are untouched
+        let cap = fs::read_to_string(cfg.root.join("taskq.json")).map_err(|e| e.to_string())
+            .and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| format!("taskq.json: {e}")))
+            .and_then(|v| service::capacity(&v, &cfg.me));
+        if let Err(e) = &cap {
+            eprintln!("capacity: {e}; launches held");
+        }
+        s.reload(cap);
+        s.mono = began.elapsed().as_secs();
         s.focus = fs::read_to_string(d.join("focus")).unwrap_or_default().split_whitespace().filter(|f| *f != "off").map(String::from).collect();
         let r = s.pass();
         for l in s.log.drain(..) {
@@ -671,9 +683,9 @@ fn service_run(c: &Ctx) -> Res<()> {
         let kids: Vec<Value> = s.kids.iter().map(|k| json!({"task": k.task, "attempt": k.attempt, "rt": k.rt, "pid": k.proc.id()})).collect();
         let tasks: Vec<Value> = s.tasks.iter().map(|(n, title, state, labels)| json!({"n": n, "title": title, "state": state, "labels": labels})).collect();
         let request = fs::read_to_string(d.join("focus.request")).ok();
-        let status = json!({"host": cfg.me, "version": platform::VERSION, "focus": s.focus, "error": r.err(), "kids": kids, "at": at,
+        let mut status = json!({"host": cfg.me, "version": platform::VERSION, "focus": s.focus, "error": r.err(), "kids": kids, "at": at,
             "pid": std::process::id(), "project": project, "issues": issues, "log": log, "tasks": tasks,
-            "request": request, "update": update, "events_since": s.events_since});
+            "request": request, "update": update, "events_since": s.events_since, "capacity": s.capacity_json()});
         let _ = platform::write_atomic(&d.join("status.json"), &serde_json::to_string_pretty(&status).unwrap_or_default());
         if is_installed && began.elapsed().as_secs() >= cfg.rollback_after {
             let h = cfg.install.join("releases").join(platform::VERSION).join("healthy");
@@ -717,8 +729,211 @@ fn service_run(c: &Ctx) -> Res<()> {
         if is_installed {
             keep_tray(&cfg.install, &mut tray);
         }
-        sleep_until_poke(&d.join("poke"), cfg.poll);
+        // every 30 s, also between board polls: a gate sample (when enabled) and a fresh capacity in status.json (§ 4)
+        let mut tick = || {
+            if sampled.is_some_and(|t| t.elapsed().as_secs() < 30) {
+                return;
+            }
+            sampled = Some(Instant::now());
+            s.mono = began.elapsed().as_secs();
+            let wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            if s.gate.enabled() {
+                s.gate.observe(s.mono, wall as i64, platform::cpu_ticks(), platform::memory_available());
+            }
+            status["capacity"] = s.capacity_json();
+            status["at"] = json!(wall);
+            let _ = platform::write_atomic(&d.join("status.json"), &serde_json::to_string_pretty(&status).unwrap_or_default());
+        };
+        tick();
+        sleep_until_poke(&d.join("poke"), cfg.poll, &mut tick);
     }
+}
+
+// ---------- capacity (§ 3, § 5 `service capacity`, § 9) ----------
+
+/// One owner edit of a host's capacity: runtime limits and load gate fields; `None` keeps a field.
+#[derive(Default, Clone)]
+struct CapEdit {
+    limits: BTreeMap<String, u32>,
+    gate: Option<bool>,
+    cpu_max: Option<u32>,
+    memory_min: Option<u32>,
+}
+
+impl CapEdit {
+    fn from_args(a: &Args) -> Res<CapEdit> {
+        let num = |k: &str| a.one(k).map(|x| x.parse::<u32>().map_err(|_| format!("--{k}: not an integer 0..{}", u32::MAX))).transpose();
+        let mut e = CapEdit { cpu_max: num("cpu-max")?, memory_min: num("memory-min")?, ..Default::default() };
+        for rt in RUNTIMES {
+            if let Some(n) = num(rt)? {
+                e.limits.insert(rt.into(), n);
+            }
+        }
+        e.gate = match a.one("load-gate") {
+            None => None,
+            Some("on") => Some(true),
+            Some("off") => Some(false),
+            Some(x) => return Err(format!("--load-gate: on or off, not {x}")),
+        };
+        Ok(e)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.limits.is_empty() && self.gate.is_none() && self.cpu_max.is_none() && self.memory_min.is_none()
+    }
+}
+
+const RUNTIMES: [&str; 3] = ["claude", "codex", "codex-app"];
+
+/// `taskq.json` text with `e` applied to `host` (§ 9): only that host's `capacity_hosts` entry changes, other keys
+/// and their order stay. `expect`: the capacity the owner saw; a different current one is a concurrent edit.
+fn edit_capacity(text: &str, host: &str, me: &str, e: &CapEdit, expect: Option<&Value>) -> Res<String> {
+    let mut v: Value = serde_json::from_str(text).map_err(|e| format!("taskq.json: {e}"))?;
+    let known = host == me || v["hosts"].as_object().is_some_and(|h| h.values().any(|n| n == host));
+    if !known {
+        return Err(format!("unknown host {host}: use this host ({me}) or a name in hosts"));
+    }
+    let old = service::capacity(&v, host)?;
+    if expect.is_some_and(|x| *x != old.json()) {
+        return Err("capacity changed since it was shown; nothing written".into());
+    }
+    if e.is_empty() {
+        return Err("nothing to change: give --claude, --codex, --codex-app, --load-gate, --cpu-max or --memory-min".into());
+    }
+    if let Some(rt) = e.limits.keys().find(|k| !RUNTIMES.contains(&k.as_str())) {
+        return Err(format!("unknown runtime {rt}"));
+    }
+    if !v["capacity_hosts"].is_object() {
+        v["capacity_hosts"] = json!({});
+    }
+    let h = &mut v["capacity_hosts"][host];
+    for (rt, n) in &e.limits {
+        h["limits"][rt] = json!(n);
+    }
+    if e.gate.is_some() || e.cpu_max.is_some() || e.memory_min.is_some() {
+        let g = old.gate;
+        h["load_gate"] = json!({"enabled": e.gate.unwrap_or(g.enabled), "cpu_max": e.cpu_max.unwrap_or(g.cpu_max), "memory_min": e.memory_min.unwrap_or(g.memory_min)});
+    }
+    service::capacity(&v, host)?;
+    // keep the file's indent
+    let indent = text.lines().nth(1).map(|l| l.len() - l.trim_start().len()).filter(|n| *n > 0).unwrap_or(2);
+    let (mut out, pad) = (vec![], " ".repeat(indent));
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes()));
+    serde::Serialize::serialize(&v, &mut ser).map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&out).into_owned() + if text.ends_with('\n') { "\n" } else { "" })
+}
+
+/// Validate, refuse a concurrent edit, replace `taskq.json` atomically, read back: the saved capacity of `host`.
+fn write_capacity(root: &Path, host: &str, e: &CapEdit, expect: Option<&Value>) -> Res<(service::Capacity, service::Capacity)> {
+    let p = root.join("taskq.json");
+    let read = || fs::read_to_string(&p).map_err(|e| format!("taskq.json: {e}"));
+    let text = read()?;
+    let (cfg, v) = load(root)?;
+    let old = service::capacity(&v, host)?;
+    let out = edit_capacity(&text, host, &cfg.me, e, expect)?;
+    if read()? != text {
+        return Err("taskq.json changed while saving; nothing written".into());
+    }
+    platform::write_atomic(&p, &out)?;
+    let saved = service::capacity(&serde_json::from_str(&read()?).map_err(|e| e.to_string())?, host)?;
+    if host == cfg.me {
+        poke(root);
+    }
+    Ok((old, saved))
+}
+
+fn cap_changes(old: &service::Capacity, new: &service::Capacity) -> String {
+    let mut out = vec![];
+    for rt in old.limits.keys().chain(new.limits.keys()).collect::<std::collections::BTreeSet<_>>() {
+        let (a, b) = (old.limits.get(rt), new.limits.get(rt));
+        if a != b {
+            let n = |x: Option<&u32>| x.map_or("none".into(), |x| x.to_string());
+            out.push(format!("{} {} → {}", runtime_name(rt), n(a), n(b)));
+        }
+    }
+    if old.gate != new.gate {
+        let g = |g: service::GateCfg| if g.enabled { format!("on (CPU {} %, memory {} %)", g.cpu_max, g.memory_min) } else { "off".into() };
+        out.push(format!("Load gate {} → {}", g(old.gate), g(new.gate)));
+    }
+    if out.is_empty() { "no change".into() } else { out.join(", ") }
+}
+
+fn runtime_name(rt: &str) -> String {
+    let mut c = rt.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// The gate line of a `status.json` capacity (§ 4 tray text).
+fn gate_text(c: &Value) -> String {
+    let reasons = |codes: &[&str]| -> Vec<&Value> { c["reasons"].as_array().into_iter().flatten().filter(|r| codes.iter().any(|x| r["code"] == *x)).collect() };
+    match c["gate"].as_str() {
+        Some("off") => "Off".into(),
+        Some("open") => "Ready".into(),
+        Some("held") => format!("Waiting: {}", reasons(&["cpu", "memory", "cooldown"]).into_iter().map(|r| match r["code"].as_str() { Some("cpu") => "CPU", Some("memory") => "memory", _ => "recovery" }).collect::<Vec<_>>().join(", ")),
+        Some(_) => format!("Unknown: {}", reasons(&["sample", "config"]).into_iter().filter_map(|r| r["text"].as_str()).collect::<Vec<_>>().join("; ")),
+        None => "Unknown: service has no capacity status".into(),
+    }
+}
+
+/// `taskq service capacity` (§ 5).
+fn capacity_cmd(root: &Path, a: &Args) -> Res<()> {
+    let (cfg, v) = load(root)?;
+    let host = a.one("host").unwrap_or(&cfg.me).to_string();
+    let project = project_name(root);
+    let status = || -> Option<Value> {
+        let st: Value = fs::read_to_string(dot(root).join("status.json")).ok().and_then(|t| serde_json::from_str(&t).ok())?;
+        (st["host"] == cfg.me.as_str() && file_age(&dot(root).join("status.json")).is_some_and(|x| x <= 60)).then_some(st)
+    };
+    let e = CapEdit::from_args(a)?;
+    if e.is_empty() {
+        let saved = service::capacity(&v, &host);
+        println!("Capacity: {project} on {host}");
+        let c = status().map(|st| st["capacity"].clone()).filter(|c| !c.is_null() && host == cfg.me);
+        let limits = c.as_ref().map(|c| c["limits"].clone()).or_else(|| saved.as_ref().ok().map(|s| s.json()["limits"].clone())).unwrap_or_default();
+        let mut rts: Vec<&String> = limits.as_object().into_iter().flatten().map(|(k, _)| k).collect();
+        if let Some(c) = &c {
+            rts.extend(c["used"].as_object().into_iter().flatten().map(|(k, _)| k).filter(|k| !limits.get(k.as_str()).is_some()));
+        }
+        for rt in rts {
+            let used = c.as_ref().and_then(|c| c["used"][rt].as_u64()).map_or("?".into(), |n| n.to_string());
+            println!("{} {used}/{}", runtime_name(rt), limits[rt].as_u64().unwrap_or(0));
+        }
+        match (&c, &saved) {
+            (Some(c), _) => println!("Load gate: {}", gate_text(c)),
+            (None, Err(e)) => println!("Unknown: {e}"),
+            (None, Ok(_)) if host != cfg.me => println!("Unknown: no local snapshot of {host}"),
+            (None, Ok(_)) => println!("Unknown: service has no fresh capacity status"),
+        }
+        if let (Some(c), Ok(s)) = (&c, &saved)
+            && (c["limits"] != s.json()["limits"] || c["load_gate"] != s.json()["load_gate"])
+        {
+            println!("Saved config differs: {}", cap_changes(&service::Capacity { limits: serde_json::from_value(c["limits"].clone()).unwrap_or_default(), gate: s.gate }, s));
+        }
+        return Ok(());
+    }
+    // a write names its host explicitly (§ 5)
+    let host = a.need("host")?.to_string();
+    let wrote = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (old, saved) = write_capacity(root, &host, &e, None)?;
+    let changes = cap_changes(&old, &saved);
+    if host != cfg.me {
+        println!("Saved for {host} in {project}: {changes}; applies when {host}'s service reads this config");
+        return Ok(());
+    }
+    // `Applied` only after a fresh service readback of the same values (R12)
+    for _ in 0..20 {
+        if let Some(st) = status()
+            && st["at"].as_u64().is_some_and(|t| t >= wrote)
+            && st["capacity"]["limits"] == saved.json()["limits"]
+            && st["capacity"]["load_gate"] == saved.json()["load_gate"]
+        {
+            println!("Applied in {project} on {host}: {changes}; running tasks continue");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    println!("Saved; waiting for service in {project} on {host}: {changes}; running tasks continue");
+    Ok(())
 }
 
 /// Start the host's one `taskq tray` of the current release when its heartbeat `<install>/tray` is stale (§ 4); reap
@@ -883,6 +1098,7 @@ fn service(args: &Args) -> Res<()> {
             println!("focus: {}", resume(&root)?);
             Ok(())
         }
+        "capacity" => capacity_cmd(&root, args),
         "restart" => {
             fs::create_dir_all(&d).map_err(|e| e.to_string())?;
             fs::write(d.join("restart"), "").map_err(|e| e.to_string())?;
@@ -925,7 +1141,7 @@ fn service(args: &Args) -> Res<()> {
             }
             Ok(())
         }
-        _ => Err("usage: taskq service install|run|focus|pause|resume|status|restart|stop|uninstall|list".into()),
+        _ => Err("usage: taskq service install|run|focus|pause|resume|capacity|status|restart|stop|uninstall|list".into()),
     }
 }
 
@@ -1137,6 +1353,32 @@ fn main() {
 mod tests {
     use super::*;
     use board::Fake;
+
+    #[test]
+    fn capacity_edit_keeps_the_file_and_validates() {
+        let text = "{\n    \"repo\": \"o/r\",\n    \"limits\": {\"claude\": 4, \"codex\": 4},\n    \"hosts\": {\"a\": \"win\"},\n    \"zeta\": 1\n}\n";
+        let e = CapEdit { limits: BTreeMap::from([("claude".into(), 2)]), gate: Some(true), ..Default::default() };
+        let out = edit_capacity(text, "win", "mac", &e, None).unwrap();
+        assert!(out.starts_with("{\n    \"repo\"") && out.ends_with("}\n"), "indent, order and newline kept:\n{out}");
+        assert!(out.find("\"zeta\"").unwrap() < out.find("\"capacity_hosts\"").unwrap());
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["limits"], json!({"claude": 4, "codex": 4}), "top level untouched");
+        assert_eq!(v["capacity_hosts"]["win"], json!({"limits": {"claude": 2}, "load_gate": {"enabled": true, "cpu_max": 85, "memory_min": 15}}));
+        assert_eq!(service::capacity(&v, "mac").unwrap().limits["claude"], 4, "other hosts keep theirs");
+        let old = service::capacity(&serde_json::from_str(text).unwrap(), "win").unwrap().json();
+        assert!(edit_capacity(text, "win", "mac", &e, Some(&old)).is_ok());
+        for (host, e, expect, err) in [
+            ("nas", e.clone(), None, "unknown host"),
+            ("mac", CapEdit::default(), None, "nothing to change"),
+            ("mac", CapEdit { cpu_max: Some(5), ..Default::default() }, None, "cpu_max"),
+            ("mac", CapEdit { memory_min: Some(96), ..Default::default() }, None, "memory_min"),
+            ("mac", CapEdit { limits: BTreeMap::from([("gpt".into(), 1)]), ..Default::default() }, None, "unknown runtime"),
+            ("win", e.clone(), Some(json!({})), "nothing written"),
+        ] {
+            let r = edit_capacity(text, host, "mac", &e, expect.as_ref());
+            assert!(r.as_ref().is_err_and(|x| x.contains(err)), "{host} {err}: {r:?}");
+        }
+    }
 
     fn cfg() -> Config {
         Config {

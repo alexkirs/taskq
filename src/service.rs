@@ -4,7 +4,8 @@
 use crate::board::{Board, Comment, Issue, entries};
 use crate::core::{self, State, Task};
 use crate::runtime::{Launch, Proc};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -158,9 +159,164 @@ pub struct Service<'a> {
     seen: HashMap<u64, State>,
     /// First time covered by `<root>/.taskq/events` (§ 4).
     pub events_since: Option<i64>,
+    /// Capacity reloaded before each pass (§ 3); an error holds every launch.
+    pub cap: Result<Capacity, String>,
+    pub gate: Gate,
+    /// Monotonic seconds for the gate.
+    pub mono: u64,
+    /// Won claims the gate holds before launch.
+    held: Vec<Launch>,
+    /// Attempts without a child that keep their lease: held claims and resumes (§ 3, § 4 heartbeat).
+    pending: BTreeSet<(u64, u64)>,
 }
 
 const MONTH: i64 = 30 * 86400;
+
+/// Load gate settings (§ 9).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct GateCfg {
+    pub enabled: bool,
+    pub cpu_max: u32,
+    pub memory_min: u32,
+}
+
+pub const GATE_DEFAULT: GateCfg = GateCfg { enabled: false, cpu_max: 85, memory_min: 15 };
+
+/// Effective capacity of one host (§ 3, § 9).
+#[derive(Clone, PartialEq, Debug)]
+pub struct Capacity {
+    pub limits: BTreeMap<String, u32>,
+    pub gate: GateCfg,
+}
+
+impl Capacity {
+    pub fn json(&self) -> Value {
+        json!({"limits": self.limits, "load_gate": {"enabled": self.gate.enabled, "cpu_max": self.gate.cpu_max, "memory_min": self.gate.memory_min}})
+    }
+}
+
+/// Capacity of `host` from `taskq.json` (§ 9): its `capacity_hosts` limits override the top-level ones; its
+/// `load_gate` replaces the top-level object; omitted gate fields take the defaults. Invalid values are an error.
+pub fn capacity(v: &Value, host: &str) -> Result<Capacity, String> {
+    let limits = |x: &Value, at: &str| -> Result<BTreeMap<String, u32>, String> {
+        match x {
+            Value::Null => Ok(BTreeMap::new()),
+            Value::Object(m) => m.iter().map(|(k, n)| n.as_u64().and_then(|n| u32::try_from(n).ok()).map(|n| (k.clone(), n)).ok_or(format!("{at}.{k}: not an integer 0..{}", u32::MAX))).collect(),
+            _ => Err(format!("{at}: not an object")),
+        }
+    };
+    if !matches!(v["capacity_hosts"], Value::Null | Value::Object(_)) {
+        return Err("capacity_hosts: not an object".into());
+    }
+    let h = &v["capacity_hosts"][host];
+    let mut out = limits(&v["limits"], "limits")?;
+    out.extend(limits(&h["limits"], &format!("capacity_hosts.{host}.limits"))?);
+    let (g, at) = if h["load_gate"].is_null() { (&v["load_gate"], "load_gate".to_string()) } else { (&h["load_gate"], format!("capacity_hosts.{host}.load_gate")) };
+    if !matches!(g, Value::Null | Value::Object(_)) {
+        return Err(format!("{at}: not an object"));
+    }
+    let pct = |k: &str, d: u32, lo: u64, hi: u64| match &g[k] {
+        Value::Null => Ok(d),
+        x => x.as_u64().filter(|n| (lo..=hi).contains(n)).map(|n| n as u32).ok_or(format!("{at}.{k}: not an integer {lo}..{hi}")),
+    };
+    let enabled = match &g["enabled"] {
+        Value::Null => false,
+        x => x.as_bool().ok_or(format!("{at}.enabled: not true or false"))?,
+    };
+    let gate = GateCfg { enabled, cpu_max: pct("cpu_max", GATE_DEFAULT.cpu_max, 10, 100)?, memory_min: pct("memory_min", GATE_DEFAULT.memory_min, 1, 95)? };
+    Ok(Capacity { limits: out, gate })
+}
+
+/// The load gate (§ 3): samples on a monotonic clock in seconds, decisions on unrounded percentages.
+#[derive(Default)]
+pub struct Gate {
+    cfg: Option<GateCfg>,
+    /// CPU (busy, total) ticks of the previous reading: the baseline of the next.
+    base: Option<(u64, u64)>,
+    /// Latest sample: monotonic time, wall time, CPU busy %, available memory %.
+    pub last: Option<(u64, i64, Option<f64>, Option<f64>)>,
+    /// Consecutive calm samples toward reopening.
+    good: u32,
+    open: bool,
+    /// Monotonic time of the last launch and whether a sample followed it.
+    launched: Option<u64>,
+    sampled: bool,
+}
+
+impl Gate {
+    /// Enabling or changing thresholds starts held.
+    pub fn configure(&mut self, c: GateCfg) {
+        if self.cfg != Some(c) {
+            (self.cfg, self.open, self.good) = (Some(c), false, 0);
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.cfg.is_some_and(|c| c.enabled)
+    }
+
+    /// One sample: CPU ticks `(busy, total)` and available memory %; `None` is a failed reading.
+    pub fn observe(&mut self, now: u64, wall: i64, ticks: Option<(u64, u64)>, memory: Option<f64>) {
+        // decreasing counters or an empty interval are no reading; the baseline restarts either way
+        let cpu = match (self.base, ticks) {
+            (Some((b0, t0)), Some((b, t))) if b >= b0 && t > t0 && b - b0 <= t - t0 => Some((b - b0) as f64 * 100.0 / (t - t0) as f64),
+            _ => None,
+        };
+        let late = self.last.is_some_and(|l| now.saturating_sub(l.0) > 60);
+        self.base = ticks;
+        let memory = memory.filter(|m| (0.0..=100.0).contains(m));
+        self.last = Some((now, wall, cpu, memory));
+        self.sampled = true;
+        let c = self.cfg.unwrap_or(GATE_DEFAULT);
+        let (max, min) = (c.cpu_max as f64, c.memory_min as f64);
+        match (cpu, memory) {
+            (Some(p), Some(m)) if !late && p < max && m > min => {
+                if p <= max - 10.0 && m >= min + 5.0 {
+                    self.good += 1;
+                    self.open |= self.good >= 3;
+                } else {
+                    self.good = 0;
+                }
+            }
+            _ => (self.open, self.good) = (false, 0),
+        }
+    }
+
+    /// `off`, `open`, `held` or `unknown` with every blocker `(code, text)` (§ 4 `capacity`).
+    pub fn state(&self, now: u64) -> (&'static str, Vec<(&'static str, String)>) {
+        let Some(c) = self.cfg.filter(|c| c.enabled) else { return ("off", vec![]) };
+        let mut r = vec![];
+        match self.last {
+            None => r.push(("sample", "no sample yet".to_string())),
+            Some((at, ..)) if now.saturating_sub(at) > 60 => r.push(("sample", format!("last sample {} s old", now - at))),
+            Some((_, _, cpu, mem)) => {
+                match cpu {
+                    None => r.push(("sample", "no CPU reading yet".into())),
+                    Some(p) if p >= c.cpu_max as f64 => r.push(("cpu", format!("CPU {p:.0} % >= {} %", c.cpu_max))),
+                    _ => {}
+                }
+                match mem {
+                    None => r.push(("sample", "no memory reading".into())),
+                    Some(m) if m <= c.memory_min as f64 => r.push(("memory", format!("available memory {m:.0} % <= {} %", c.memory_min))),
+                    _ => {}
+                }
+            }
+        }
+        if r.is_empty() && !self.open {
+            r.push(("cooldown", format!("{} of 3 calm samples", self.good)));
+        }
+        (if r.iter().any(|x| x.0 == "sample") { "unknown" } else if r.is_empty() { "open" } else { "held" }, r)
+    }
+
+    /// Off, or open with the previous launch at least 30 s ago and sampled since (§ 3).
+    pub fn may_launch(&self, now: u64) -> bool {
+        !self.enabled() || (self.state(now).0 == "open" && self.launched.is_none_or(|t| self.sampled && now.saturating_sub(t) >= 30))
+    }
+
+    pub fn launch(&mut self, now: u64) {
+        (self.launched, self.sampled) = (Some(now), false);
+    }
+}
 
 /// Append `(task, kind, attempt)` moves to the events file at board time `now` (§ 4): one line per attempt and kind,
 /// lines older than 30 days dropped. Returns the first time covered.
@@ -183,7 +339,38 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, String> + 'a>) -> Self {
-        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), pruned: HashSet::new(), start, log: vec![], tasks: vec![], seen: HashMap::new(), events_since: None }
+        let cap = Ok(Capacity { limits: cfg.limits.clone(), gate: GATE_DEFAULT });
+        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), pruned: HashSet::new(), start, log: vec![], tasks: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new() }
+    }
+
+    /// New capacity config (§ 3): a gate change starts held.
+    pub fn reload(&mut self, cap: Result<Capacity, String>) {
+        if let Ok(c) = &cap {
+            self.gate.configure(c.gate);
+        }
+        self.cap = cap;
+    }
+
+    fn may_launch(&self) -> bool {
+        self.cap.is_ok() && self.gate.may_launch(self.mono)
+    }
+
+    /// The `capacity` object of `status.json` (§ 4).
+    pub fn capacity_json(&self) -> Value {
+        let (gate, reasons) = match &self.cap {
+            Err(e) => ("unknown", vec![("config", e.clone())]),
+            Ok(_) => self.gate.state(self.mono),
+        };
+        let limits = self.cap.as_ref().map(|c| c.limits.clone()).unwrap_or_default();
+        let mut used: BTreeMap<String, u32> = limits.keys().map(|k| (k.clone(), 0)).collect();
+        for k in &self.kids {
+            *used.entry(k.rt.clone()).or_default() += 1;
+        }
+        let last = self.gate.last.filter(|_| self.gate.enabled());
+        json!({"limits": limits, "used": used, "load_gate": self.cap.as_ref().map(|c| c.json()["load_gate"].clone()).unwrap_or(Value::Null),
+            "gate": gate, "reasons": reasons.iter().map(|(c, t)| json!({"code": c, "text": t})).collect::<Vec<_>>(),
+            "cpu_percent": last.and_then(|l| l.2), "memory_available_percent": last.and_then(|l| l.3),
+            "sample_at": last.map(|l| l.1), "sample_age_seconds": last.map(|l| self.mono.saturating_sub(l.0))})
     }
 
     /// Children of the previous process image after an update re-exec; their inbox counts as delivered.
@@ -204,8 +391,7 @@ impl<'a> Service<'a> {
 
     fn heartbeat_body(&self) -> String {
         let mut lines = vec![format!("version {}", self.version)];
-        let mut kids: Vec<_> = self.kids.iter().map(|k| (k.task, k.attempt)).collect();
-        kids.sort();
+        let kids: BTreeSet<_> = self.kids.iter().map(|k| (k.task, k.attempt)).chain(self.pending.iter().copied()).collect();
         lines.extend(kids.iter().map(|(t, a)| format!("#{t} {a}")));
         lines.join("\n")
     }
@@ -248,6 +434,7 @@ impl<'a> Service<'a> {
             }
             current
         });
+        self.held.retain(|l| by_n.get(&l.task).is_some_and(|v| v.task.attempt == Some(l.attempt)));
         self.prune(&by_n);
 
         // 3. heartbeat
@@ -292,11 +479,21 @@ impl<'a> Service<'a> {
             }
         }
 
-        // 6. route to own attempts, then admit within capacity
+        // 6. route to own attempts, then admit within capacity; the gate holds launches, the lease stays (§ 3)
+        let mut pending = BTreeSet::new();
         for v in &views {
             let (n, t) = (v.issue.number, &v.task);
             let (Some(a), Some(h)) = (t.attempt, host_of(t)) else { continue };
             if h != me || !matches!(t.state, State::Doing | State::Review) || touched.contains(&n) || self.kids.iter().any(|k| k.attempt == a) {
+                continue;
+            }
+            if let Some(i) = self.held.iter().position(|l| l.attempt == a) {
+                if self.may_launch() {
+                    let l = self.held.remove(i);
+                    self.launch(l)?;
+                } else {
+                    pending.insert((n, a));
+                }
                 continue;
             }
             let seen = self.delivered.get(&a).copied().unwrap_or(0);
@@ -320,8 +517,17 @@ impl<'a> Service<'a> {
                 touched.insert(n);
                 continue;
             }
+            if !self.may_launch() {
+                pending.insert((n, a)); // the inbox stays undelivered
+                continue;
+            }
             self.delivered.insert(a, last);
             self.launch(l)?;
+        }
+        pending.extend(self.held.iter().map(|l| (l.task, l.attempt)));
+        if pending != self.pending {
+            self.pending = pending;
+            self.beat()?;
         }
         if self.focus.is_empty() {
             return Ok(());
@@ -342,6 +548,9 @@ impl<'a> Service<'a> {
             .collect();
         queue.sort_by_key(|v| (priority(&v.issue), v.issue.number));
         for v in queue {
+            if !self.may_launch() {
+                break;
+            }
             let Some(rt) = self.free(label(&v.issue, "run-").as_deref()) else { continue };
             let role = if v.task.state == State::Review { "reviewer" } else { "worker" };
             self.claim(v, role, &rt)?;
@@ -407,7 +616,7 @@ impl<'a> Service<'a> {
     /// `codex-app` only for `run-codex-app` tasks on a host whose `has` lists it (§ 9 opt-in).
     fn free(&self, want: Option<&str>) -> Option<String> {
         let app = |rt: &str| rt != "codex-app" || (want == Some(rt) && self.cfg.has.iter().any(|h| h == rt));
-        self.cfg.limits.iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt)).find(|(rt, n)| self.kids.iter().filter(|k| &k.rt == *rt).count() < **n as usize).map(|(rt, _)| rt.clone())
+        self.cap.as_ref().ok()?.limits.iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt)).find(|(rt, n)| self.kids.iter().filter(|k| &k.rt == *rt).count() < **n as usize).map(|(rt, _)| rt.clone())
     }
 
     /// Post `spawn`, re-read, start the child only if `fold` accepted this spawn (§ 3 claim).
@@ -422,19 +631,30 @@ impl<'a> Service<'a> {
         }
         let l = Launch { task: n, title: v.issue.title.clone(), attempt: id, role: role.into(), rt: rt.into(), session, url: self.board.url(n), resume: None };
         self.delivered.insert(id, t.inbox.last().copied().unwrap_or(0));
+        if !self.may_launch() {
+            self.pending.insert((n, id));
+            self.held.push(l);
+            return self.beat();
+        }
         self.launch(l)
+    }
+
+    /// Write the heartbeat now: the lease of a new child or held launch is listed before the next pass judges it.
+    fn beat(&self) -> Result<(), String> {
+        let body = self.heartbeat_body();
+        if let Some(h) = self.board.issues(None)?.into_iter().find(|i| is_host(i) && i.title == format!("taskq host {}", self.cfg.me)) {
+            self.board.edit(h.number, &body)?;
+        }
+        Ok(())
     }
 
     fn launch(&mut self, l: Launch) -> Result<(), String> {
         match (self.start)(&l) {
             Ok(proc) => {
                 self.kids.push(Kid { task: l.task, attempt: l.attempt, rt: l.rt.clone(), proc });
-                // the heartbeat lists the new child before the next pass judges anything (§ 3 lease)
-                let body = self.heartbeat_body();
-                if let Some(h) = self.board.issues(None)?.into_iter().find(|i| is_host(i) && i.title == format!("taskq host {}", self.cfg.me)) {
-                    self.board.edit(h.number, &body)?;
-                }
-                Ok(())
+                self.pending.remove(&(l.task, l.attempt));
+                self.gate.launch(self.mono);
+                self.beat()
             }
             Err(e) => {
                 self.post(l.task, core::entry("gone", &[], Some(l.attempt), &format!("start failed: {e}"))).map(|_| ())
@@ -670,6 +890,136 @@ mod tests {
         service(&b, &m, Default::default()).pass().unwrap();
         assert_eq!((task(&b, app).state, task(&b, other).state), (State::Doing, State::Ready), "unlabelled tasks never get the app");
         assert!(task(&b, app).session.unwrap().starts_with("codex-app:- mac"));
+    }
+
+    #[test]
+    fn capacity_merges_host_overrides_and_validates() {
+        let v = json!({"limits": {"claude": 4, "codex": 4}, "load_gate": {"cpu_max": 90},
+            "capacity_hosts": {"win": {"limits": {"codex": 2}, "load_gate": {"enabled": true}}}});
+        let win = capacity(&v, "win").unwrap();
+        assert_eq!(win.limits, BTreeMap::from([("claude".into(), 4), ("codex".into(), 2)]));
+        assert_eq!(win.gate, GateCfg { enabled: true, cpu_max: 85, memory_min: 15 }, "a host gate replaces the default object");
+        assert_eq!(capacity(&v, "mac").unwrap().gate, GateCfg { enabled: false, cpu_max: 90, memory_min: 15 });
+        assert_eq!(capacity(&json!({"limits": {"claude": 1}}), "mac").unwrap(), Capacity { limits: BTreeMap::from([("claude".into(), 1)]), gate: GATE_DEFAULT }, "absent keys: today");
+        for bad in [json!({"limits": {"claude": -1}}), json!({"limits": {"claude": 5_000_000_000u64}}), json!({"load_gate": {"cpu_max": 9}}),
+            json!({"load_gate": {"memory_min": 96}}), json!({"load_gate": {"enabled": "yes"}}), json!({"capacity_hosts": {"mac": {"limits": {"codex": "2"}}}})] {
+            assert!(capacity(&bad, "mac").is_err(), "{bad}");
+        }
+    }
+
+    fn on() -> GateCfg {
+        GateCfg { enabled: true, ..GATE_DEFAULT }
+    }
+
+    /// Feed CPU busy percentages at 30 s steps from `t`; ticks advance by 100 per sample.
+    fn feed(g: &mut Gate, t: &mut u64, ticks: &mut (u64, u64), samples: &[(f64, f64)]) {
+        for (cpu, mem) in samples {
+            *ticks = (ticks.0 + *cpu as u64, ticks.1 + 100);
+            *t += 30;
+            g.observe(*t, *t as i64, Some(*ticks), Some(*mem));
+        }
+    }
+
+    #[test]
+    fn gate_holds_over_thresholds_and_reopens_after_90_s_calm() {
+        let mut g = Gate::default();
+        g.configure(GATE_DEFAULT);
+        assert!(g.may_launch(0) && g.state(0).0 == "off", "off by default");
+        g.configure(on());
+        assert_eq!(g.state(0).0, "unknown", "enabled: held until sampled");
+        let (mut t, mut k) = (0, (0, 0));
+        g.observe(0, 0, Some(k), Some(50.0));
+        assert_eq!(g.state(0), ("unknown", vec![("sample", "no CPU reading yet".into())]), "first CPU reading is a baseline");
+        feed(&mut g, &mut t, &mut k, &[(50.0, 50.0), (50.0, 50.0)]);
+        assert!(!g.may_launch(t) && g.state(t).0 == "held");
+        feed(&mut g, &mut t, &mut k, &[(50.0, 50.0)]);
+        assert!(g.may_launch(t), "three calm samples: 90 s");
+        // exact thresholds hold; both reasons are kept
+        feed(&mut g, &mut t, &mut k, &[(85.0, 15.0)]);
+        assert_eq!(g.state(t).1.iter().map(|r| r.0).collect::<Vec<_>>(), ["cpu", "memory"]);
+        // mid-band (CPU 80 > 85 - 10) resets recovery
+        feed(&mut g, &mut t, &mut k, &[(50.0, 50.0), (50.0, 50.0), (80.0, 50.0), (50.0, 50.0), (50.0, 50.0)]);
+        assert_eq!(g.state(t).0, "held");
+        feed(&mut g, &mut t, &mut k, &[(50.0, 50.0)]);
+        assert_eq!(g.state(t).0, "open");
+        // a stale sample holds; a failed reading holds and resets
+        assert_eq!(g.state(t + 61).0, "unknown");
+        g.observe(t + 30, 0, Some(k), None);
+        assert!(!g.may_launch(t + 30));
+        // a threshold change starts held
+        let mut g2 = Gate::default();
+        g2.configure(on());
+        let (mut t2, mut k2) = (0, (0, 0));
+        g2.observe(0, 0, Some(k2), Some(50.0));
+        feed(&mut g2, &mut t2, &mut k2, &[(10.0, 50.0); 3]);
+        assert!(g2.may_launch(t2));
+        g2.configure(GateCfg { cpu_max: 90, ..on() });
+        assert!(!g2.may_launch(t2));
+    }
+
+    #[test]
+    fn gate_spaces_launches_and_rejects_bad_counters() {
+        let mut g = Gate::default();
+        g.configure(on());
+        let (mut t, mut k) = (0, (0, 0));
+        g.observe(0, 0, Some(k), Some(50.0));
+        feed(&mut g, &mut t, &mut k, &[(10.0, 50.0); 3]);
+        g.launch(t);
+        assert!(!g.may_launch(t + 40), "no sample after the launch");
+        feed(&mut g, &mut t, &mut k, &[(10.0, 50.0)]);
+        assert!(g.may_launch(t), "post-launch sample, 30 s later");
+        g.observe(t + 30, 0, Some((0, 0)), Some(50.0)); // counters went backwards
+        assert_eq!(g.state(t + 30).0, "unknown");
+    }
+
+    #[test]
+    fn load_gate_holds_claims_and_resumes_keeps_leases_and_recovers() {
+        let b = Fake::default();
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
+        let mut c = cfg("mac");
+        c.limits.insert("claude".into(), 2);
+        let e: Exits = Default::default();
+        let mut s = service(&b, &c, e.clone());
+        s.pass().unwrap();
+        let a = task(&b, n).attempt.unwrap();
+        let m = b.create("M", "", &["taskq".into(), "host-mac".into()]).unwrap();
+        // gate on: held until three calm samples, the running child continues
+        s.reload(Ok(Capacity { limits: c.limits.clone(), gate: on() }));
+        let (mut t, mut k) = (0, (0, 0));
+        s.gate.observe(0, 0, Some(k), Some(50.0));
+        feed(&mut s.gate, &mut t, &mut k, &[(90.0, 50.0)]);
+        s.mono = t;
+        b.comment(n, &core::entry("ask", &[], Some(a), "Which?\n1. x\n2. y ★")).unwrap();
+        *e.borrow()[0].1.borrow_mut() = Some(0);
+        s.pass().unwrap();
+        b.comment(n, &core::entry("answer", &["1"], None, "x")).unwrap();
+        s.pass().unwrap();
+        assert_eq!((e.borrow().len(), task(&b, m).state), (1, State::Ready), "no resume, no claim while held");
+        assert!(b.comments(m).unwrap().is_empty(), "no spawn written while held");
+        let hb = b.issues(None).unwrap().into_iter().find(is_host).unwrap();
+        assert!(hb.body.lines().any(|l| l == format!("#{n} {a}")), "held resume keeps its lease: {}", hb.body);
+        assert_eq!(s.capacity_json()["gate"], "held");
+        // other hosts leave a listed lease alone
+        let w = cfg("win");
+        let mut other = service(&b, &w, Default::default());
+        b.advance(400);
+        s.pass().unwrap();
+        other.pass().unwrap();
+        assert_eq!(task(&b, n).attempt, Some(a));
+        // recovery: the resume goes first, the claim waits for a post-launch sample and 30 s
+        feed(&mut s.gate, &mut t, &mut k, &[(10.0, 50.0); 3]);
+        s.mono = t;
+        s.pass().unwrap();
+        assert_eq!((e.borrow().len(), task(&b, m).state), (2, State::Ready), "one launch per 30 s");
+        feed(&mut s.gate, &mut t, &mut k, &[(10.0, 50.0)]);
+        s.mono = t;
+        s.pass().unwrap();
+        assert_eq!(task(&b, m).state, State::Doing);
+        assert_eq!(s.capacity_json()["used"]["claude"], 2);
+        // invalid config holds and reports, the children continue
+        s.reload(Err("limits.claude: not an integer".into()));
+        assert_eq!(s.capacity_json()["reasons"][0]["code"], "config");
+        assert_eq!(s.kids.len(), 2);
     }
 
     #[test]

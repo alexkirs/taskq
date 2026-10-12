@@ -104,11 +104,17 @@ fn project(root: &str) -> Value {
         let w: Vec<&str> = l.split(' ').collect();
         Some(json!([w.first()?.parse::<i64>().ok()?, w.get(2)?, w.get(3)?]))
     }).collect();
+    // the local host's saved capacity, for `Edit limits` and its readback (§ 4 Capacity)
+    let (cap_host, cap_saved) = match crate::load(r) {
+        Ok((c, v)) => (json!(c.me), crate::service::capacity(&v, &c.me).map(|x| x.json()).unwrap_or_else(|e| json!({"error": e}))),
+        Err(e) => (Value::Null, json!({"error": e})),
+    };
     let tasks: Vec<Value> = s["tasks"].as_array().into_iter().flatten().map(|t| json!({"n": t["n"].as_u64().unwrap_or(0), "title": t["title"].as_str().unwrap_or(""), "state": t["state"].as_str().unwrap_or("")})).collect();
     json!({"root": root, "name": s["project"].as_str().map(String::from).unwrap_or_else(|| crate::project_name(r)),
         "issues": s["issues"].as_str().unwrap_or(""), "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
         "error": s["error"], "focus": s["focus"].as_array().cloned().unwrap_or_default(), "saved": saved, "labels": crate::status_labels(r),
-        "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"]})
+        "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"],
+        "capacity": s["capacity"], "cap_host": cap_host, "cap_saved": cap_saved})
 }
 
 fn now() -> i64 {
@@ -300,6 +306,14 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                         refresh_icon(&tray, &st, &settings, dark, &mut icon_sig);
                         push(&ui, &st);
                     }
+                    // `Edit limits` after the page's confirm: the same write as `service capacity` (§ 5), this host only
+                    "capacity" => {
+                        let root = m["root"].as_str().unwrap_or("");
+                        if roots(&install).iter().any(|r| r == root) {
+                            let msg = capacity(Path::new(root), &m);
+                            push(&ui, &json!({"capmsg": {"root": root, "text": msg}}));
+                        }
+                    }
                     a => {
                         // only a registered project (§ 4): the page never names a path of its own
                         let root = m["root"].as_str().unwrap_or("");
@@ -467,6 +481,26 @@ fn act(action: &str, root: &Path, label: Option<&str>) {
             let _ = crate::platform::quiet(&mut c).spawn();
         }
         _ => {}
+    }
+}
+
+/// Write the page's capacity edit for this host; the outcome line for the page.
+fn capacity(root: &Path, m: &Value) -> String {
+    let set = &m["set"];
+    let mut e = crate::CapEdit { gate: set["enabled"].as_bool(), ..Default::default() };
+    let num = |k: &str| set[k].as_u64().map(|n| u32::try_from(n).map_err(|_| format!("{k}: not an integer 0..{}", u32::MAX))).transpose();
+    let r = (|| {
+        e.cpu_max = num("cpu_max")?;
+        e.memory_min = num("memory_min")?;
+        for (rt, n) in set["limits"].as_object().into_iter().flatten() {
+            e.limits.insert(rt.clone(), n.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or(format!("{rt}: not an integer 0..{}", u32::MAX))?);
+        }
+        let me = crate::load(root)?.0.me;
+        crate::write_capacity(root, &me, &e, Some(&m["expect"]))
+    })();
+    match r {
+        Ok((old, new)) => format!("Saved: {}", crate::cap_changes(&old, &new)),
+        Err(e) => format!("Error: {e}"),
     }
 }
 

@@ -377,9 +377,145 @@ pub fn run_all(cmds: &[Vec<String>], ignore: bool) -> Result<(), String> {
     Ok(())
 }
 
+// ---------- host load for the gate (§ 3): native APIs, no executables ----------
+
+/// `/proc/stat` aggregate `cpu` line: (busy, total) ticks; idle includes iowait, guest ticks are already in user/nice.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_stat(text: &str) -> Option<(u64, u64)> {
+    let f: Vec<u64> = text.lines().next()?.strip_prefix("cpu ")?.split_whitespace().take(8).map(|x| x.parse().ok()).collect::<Option<_>>()?;
+    let total: u64 = f.iter().sum();
+    Some((total - f.get(3)? - f.get(4).unwrap_or(&0), total))
+}
+
+/// `/proc/meminfo`: `MemAvailable / MemTotal` in %; no `MemAvailable` is unknown.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn meminfo(text: &str) -> Option<f64> {
+    let kb = |k: &str| text.lines().find_map(|l| l.strip_prefix(k)?.trim().strip_suffix("kB")?.trim().parse::<f64>().ok());
+    let (avail, total) = (kb("MemAvailable:")?, kb("MemTotal:")?);
+    (total > 0.0 && avail <= total).then(|| avail * 100.0 / total)
+}
+
+#[cfg(target_os = "linux")]
+pub fn cpu_ticks() -> Option<(u64, u64)> {
+    proc_stat(&fs::read_to_string("/proc/stat").ok()?)
+}
+
+#[cfg(target_os = "linux")]
+pub fn memory_available() -> Option<f64> {
+    meminfo(&fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+#[cfg(target_os = "macos")]
+mod mach {
+    unsafe extern "C" {
+        pub fn mach_host_self() -> u32;
+        pub fn host_statistics(host: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
+        pub fn host_statistics64(host: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
+        pub fn host_page_size(host: u32, size: *mut usize) -> i32;
+    }
+
+    /// One send right for the life of the process.
+    pub fn host() -> u32 {
+        static H: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        // SAFETY: no arguments; returns this task's host port
+        *H.get_or_init(|| unsafe { mach_host_self() })
+    }
+}
+
+/// `HOST_CPU_LOAD_INFO`: user, system, idle, nice ticks over all logical CPUs.
+#[cfg(target_os = "macos")]
+pub fn cpu_ticks() -> Option<(u64, u64)> {
+    let (mut t, mut n) = ([0u32; 4], 4u32);
+    // SAFETY: flavor 3 fills CPU_STATE_MAX natural_t values into a buffer of that size
+    if unsafe { mach::host_statistics(mach::host(), 3, t.as_mut_ptr().cast(), &mut n) } != 0 || n != 4 {
+        return None;
+    }
+    let total: u64 = t.iter().map(|x| *x as u64).sum();
+    Some((total - t[2] as u64, total))
+}
+
+/// `HOST_VM_INFO64` (free + inactive pages) × page size / `hw.memsize`. `ponytail:` free + inactive approximates
+/// reclaimable memory, not Apple's pressure metric; compressed and purgeable pages are not counted again.
+#[cfg(target_os = "macos")]
+pub fn memory_available() -> Option<f64> {
+    let (mut v, mut n, mut page) = ([0i32; 38], 38u32, 0usize);
+    let (mut total, mut len) = (0u64, std::mem::size_of::<u64>());
+    // SAFETY: flavor 4 fills HOST_VM_INFO64_COUNT (38) integer_t; the size and memsize outputs are plain integers
+    let ok = unsafe {
+        mach::host_statistics64(mach::host(), 4, v.as_mut_ptr(), &mut n) == 0
+            && mach::host_page_size(mach::host(), &mut page) == 0
+            && libc::sysctlbyname(c"hw.memsize".as_ptr(), (&mut total as *mut u64).cast(), &mut len, std::ptr::null_mut(), 0) == 0
+    };
+    let avail = (v[0] as u32 as u64 + v[2] as u32 as u64) * page as u64;
+    (ok && total > 0 && avail <= total).then(|| avail as f64 * 100.0 / total as f64)
+}
+
+#[cfg(windows)]
+mod win {
+    #[repr(C)]
+    pub struct MemoryStatusEx {
+        pub length: u32,
+        pub load: u32,
+        pub total_phys: u64,
+        pub avail_phys: u64,
+        pub rest: [u64; 5],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn GetSystemTimes(idle: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+        pub fn GlobalMemoryStatusEx(m: *mut MemoryStatusEx) -> i32;
+    }
+}
+
+/// `GetSystemTimes`: kernel time already includes idle.
+#[cfg(windows)]
+pub fn cpu_ticks() -> Option<(u64, u64)> {
+    let (mut idle, mut kernel, mut user) = (0u64, 0u64, 0u64);
+    // SAFETY: three FILETIME outputs, each the layout of a little-endian u64
+    if unsafe { win::GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    let total = kernel.checked_add(user)?;
+    Some((total.checked_sub(idle)?, total))
+}
+
+#[cfg(windows)]
+pub fn memory_available() -> Option<f64> {
+    let mut m = win::MemoryStatusEx { length: std::mem::size_of::<win::MemoryStatusEx>() as u32, load: 0, total_phys: 0, avail_phys: 0, rest: [0; 5] };
+    // SAFETY: dwLength set as the API requires
+    if unsafe { win::GlobalMemoryStatusEx(&mut m) } == 0 || m.total_phys == 0 || m.avail_phys > m.total_phys {
+        return None;
+    }
+    Some(m.avail_phys as f64 * 100.0 / m.total_phys as f64)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn cpu_ticks() -> Option<(u64, u64)> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn memory_available() -> Option<f64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_readings_parse_and_read_on_this_host() {
+        assert_eq!(proc_stat("cpu  10 2 8 70 5 1 1 3 4 0\ncpu0 1 1 1 1 1 1 1 1 1 1\n"), Some((25, 100)), "idle + iowait; guest not added");
+        assert_eq!(proc_stat("intr 1"), None);
+        assert_eq!(meminfo("MemTotal:  1000 kB\nMemFree: 100 kB\nMemAvailable:   250 kB\n"), Some(25.0));
+        assert_eq!(meminfo("MemTotal:  1000 kB\nMemFree: 100 kB\n"), None, "no MemAvailable: unknown");
+        // R12: a native reading on this platform, plausible bounds only
+        let (busy, total) = cpu_ticks().expect("cpu ticks");
+        assert!(busy <= total && total > 0);
+        let m = memory_available().expect("available memory");
+        assert!(m > 0.0 && m < 100.0, "{m}");
+    }
 
     #[test]
     fn versions_and_checksums() {

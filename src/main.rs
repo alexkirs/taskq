@@ -3,6 +3,7 @@
 mod board;
 mod core;
 mod labels;
+mod operator;
 mod platform;
 mod runtime;
 mod service;
@@ -655,6 +656,9 @@ fn service_run(c: &Ctx) -> Res<()> {
     let mut checked: Option<Instant> = None;
     let mut update: Option<String> = None;
     let _ = fs::remove_file(d.join("restart"));
+    operator::recover(&cfg.root);
+    // ponytail: the operator takes no slot of `limits`; count it when operators crowd out workers
+    let op_rt = cfg.limits.iter().find(|(_, n)| **n > 0).map(|(rt, _)| rt.clone());
     let mut tray = None;
     let project = project_name(&cfg.root);
     let issues = c.board.url(0).strip_suffix("/0").unwrap_or_default().to_string();
@@ -726,6 +730,7 @@ fn service_run(c: &Ctx) -> Res<()> {
             }
             reexec(&s, cfg)?;
         }
+        operator::step(&cfg.root, &cfg.install, &exe, op_rt.as_deref());
         if is_installed {
             keep_tray(&cfg.install, &mut tray);
         }

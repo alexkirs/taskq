@@ -87,6 +87,63 @@ impl Settings {
     }
 }
 
+/// Draft and history of AI requests (§ 4): `<install>/tray-requests.json`, apart from the view settings.
+fn requests_file(install: &Path) -> Value {
+    let v = crate::operator::read(&install.join("tray-requests.json"));
+    json!({"draft": v["draft"].as_str().unwrap_or(""), "history": v["history"].as_array().cloned().unwrap_or_default()})
+}
+
+/// The last 20 distinct sent texts, newest first; the same text moves to the top (menu.md M7).
+fn remember(history: &[Value], text: &str) -> Vec<Value> {
+    std::iter::once(json!(text)).chain(history.iter().filter(|h| h.as_str() != Some(text)).cloned()).take(crate::operator::KEEP).collect()
+}
+
+/// The project whose service takes a new request: the first registered one with a fresh `status.json`.
+fn target(install: &Path) -> Option<String> {
+    roots(install).into_iter().find(|r| crate::file_age(&crate::dot(Path::new(r)).join("status.json")).is_some_and(|a| a < 300))
+}
+
+/// The newest request over all projects with its answer.
+fn newest(install: &Path) -> Value {
+    let all = roots(install).into_iter().filter_map(|r| crate::operator::ids(Path::new(&r)).pop().map(|id| (id, r)));
+    let Some((id, r)) = all.max_by_key(|(id, _)| (id.len(), id.clone())) else { return Value::Null };
+    let root = Path::new(&r);
+    let q = crate::operator::read(&crate::operator::dir(root).join(format!("{id}.json")));
+    json!({"id": id, "root": r, "text": q["text"], "answer": crate::operator::read(&crate::operator::answer_path(root, &id))})
+}
+
+fn ai(install: &Path, a: &str, m: &Value) {
+    let path = install.join("tray-requests.json");
+    let mut f = requests_file(install);
+    match a {
+        "ai-draft" => f["draft"] = json!(m["text"].as_str().unwrap_or("")),
+        "ai-clear" => f["history"] = json!([]),
+        "ai-send" => {
+            let (Some(text), Some(r)) = (m["text"].as_str().map(str::trim).filter(|t| !t.is_empty()), target(install)) else { return };
+            let root = Path::new(&r);
+            let id = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0).to_string();
+            let after = m["after"].as_str().filter(|x| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()));
+            let _ = fs::create_dir_all(crate::operator::dir(root));
+            if crate::platform::write_atomic(&crate::operator::dir(root).join(format!("{id}.json")), &json!({"text": text, "after": after}).to_string()).is_err() {
+                return;
+            }
+            crate::poke(root);
+            f = json!({"draft": "", "history": remember(f["history"].as_array().map_or(&[][..], |v| v), text)});
+        }
+        // only a registered project and a request id: the page never names a path of its own
+        "ai-confirm" => {
+            let (r, id) = (m["root"].as_str().unwrap_or(""), m["id"].as_str().unwrap_or(""));
+            if roots(install).iter().any(|x| x == r) && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
+                let _ = fs::write(crate::operator::dir(Path::new(r)).join(format!("{id}.confirm")), m["rev"].as_u64().unwrap_or(0).to_string());
+                crate::poke(Path::new(r));
+            }
+            return;
+        }
+        _ => return,
+    }
+    let _ = crate::platform::write_atomic(&path, &f.to_string());
+}
+
 fn roots(install: &Path) -> Vec<String> {
     fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(String::from).collect()
 }
@@ -314,6 +371,10 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                             push(&ui, &json!({"capmsg": {"root": root, "text": msg}}));
                         }
                     }
+                    a if a.starts_with("ai-") => {
+                        ai(&install, a, &m);
+                        push(&ui, &state(&install, &settings, dark, None));
+                    }
                     a => {
                         // only a registered project (§ 4): the page never names a path of its own
                         let root = m["root"].as_str().unwrap_or("");
@@ -395,7 +456,7 @@ fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>) -
     let url = |rgba: &Rgba| format!("data:image/png;base64,{}", base64(&png(rgba)));
     let mut st = json!({"platform": if cfg!(windows) { "windows" } else { "macos" }, "version": crate::platform::VERSION,
         "host": ps.iter().find_map(|p| p["host"].as_str()).unwrap_or("?"), "view": s.view, "font": s.font, "period": s.period,
-        "now": now(), "projects": ps, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since}});
+        "now": now(), "projects": ps, "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since}});
     if cfg!(target_os = "macos") {
         st["icons"] = json!({"icon": url(&compact(sum.run, dark)), "full": url(&wide(&sum, dark))});
     }
@@ -819,6 +880,17 @@ mod tests {
         let ps = json!([{"issues": "u", "events": []}, {"issues": "v", "events": [], "since": 5}]);
         assert_eq!(summary(&ps.as_array().unwrap()[..1], (0, 1)).since, None, "no events cache: no since");
         assert_eq!(summary(ps.as_array().unwrap(), (0, 1)).since, Some(5));
+    }
+
+    #[test]
+    fn history_keeps_20_distinct_newest_first() {
+        let mut h = vec![];
+        for i in 0..25 {
+            h = remember(&h, &format!("q{i}"));
+        }
+        h = remember(&h, "q10");
+        assert_eq!(h.len(), 20);
+        assert_eq!((h[0].as_str(), h[1].as_str(), h.iter().filter(|x| x.as_str() == Some("q10")).count()), (Some("q10"), Some("q24"), 1));
     }
 
     #[test]

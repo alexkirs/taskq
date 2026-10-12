@@ -571,6 +571,15 @@ fn reexec(s: &Service, _cfg: &Config) -> Res<()> {
 
 fn service(args: &Args) -> Res<()> {
     let sub = args.pos.get(1).map(String::as_str).unwrap_or("");
+    let projects = platform::default_install().join("projects");
+    if sub == "list" {
+        // one project root per line, written by `service install` (§ 5); a PM or ARM covers several projects from it
+        for r in fs::read_to_string(&projects).unwrap_or_default().lines().filter(|l| !l.is_empty()) {
+            let f = fs::read_to_string(dot(Path::new(r)).join("focus")).unwrap_or_default();
+            println!("{r} focus: {}", if f.trim().is_empty() { "off" } else { f.trim() });
+        }
+        return Ok(());
+    }
     let root = find_root()?;
     let d = dot(&root);
     match sub {
@@ -578,7 +587,19 @@ fn service(args: &Args) -> Res<()> {
         "focus" => {
             let f = args.pos[2..].join(" ");
             if f.is_empty() {
-                return Err("usage: taskq service focus all|off|<label..>".into());
+                // the contract an agent maps the owner's words to (§ 4)
+                let c = ctx()?;
+                let mut n: BTreeMap<String, usize> = BTreeMap::new();
+                for i in c.board.issues(None)?.iter().filter(|i| service::is_task(i)) {
+                    for l in i.labels.iter().filter(|l| !l.starts_with("q-") && *l != service::TASK_LABEL) {
+                        *n.entry(l.clone()).or_default() += 1;
+                    }
+                }
+                let now = fs::read_to_string(d.join("focus")).unwrap_or_default();
+                println!("focus: {}", if now.trim().is_empty() { "off" } else { now.trim() });
+                println!("has: {}", c.cfg.has.join(" "));
+                println!("labels of open tasks: {}", n.iter().map(|(l, k)| format!("{l} ({k})")).collect::<Vec<_>>().join(", "));
+                return Ok(());
             }
             fs::create_dir_all(&d).map_err(|e| e.to_string())?;
             fs::write(d.join("focus"), &f).map_err(|e| e.to_string())?;
@@ -600,15 +621,22 @@ fn service(args: &Args) -> Res<()> {
                 platform::write_unit(&u)?;
                 platform::run_all(&u.unload, true)?;
                 platform::run_all(&u.load, false)?;
+                let mut all: Vec<String> = fs::read_to_string(&projects).unwrap_or_default().lines().map(String::from).collect();
+                if !all.contains(&root.display().to_string()) {
+                    all.push(root.display().to_string());
+                    fs::write(&projects, all.join("\n") + "\n").map_err(|e| e.to_string())?;
+                }
                 println!("installed {}", u.path.display());
             } else {
                 platform::run_all(&u.unload, true)?;
                 let _ = fs::remove_file(&u.path);
+                let all: Vec<String> = fs::read_to_string(&projects).unwrap_or_default().lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
+                let _ = fs::write(&projects, all.concat());
                 println!("removed {}", u.path.display());
             }
             Ok(())
         }
-        _ => Err("usage: taskq service install|run|focus|status|uninstall".into()),
+        _ => Err("usage: taskq service install|run|focus|status|uninstall|list".into()),
     }
 }
 
@@ -670,7 +698,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                 body += &deps.iter().map(|d| format!("Depends on #{d}\n")).collect::<String>();
             }
             let blocked = deps_open(b, &body)?;
-            let mut labels = vec![format!("q-{}", if blocked { "waiting" } else { "ready" })];
+            let mut labels = vec![service::TASK_LABEL.to_string(), format!("q-{}", if blocked { "waiting" } else { "ready" })];
             for (flag, prefix) in [("type", ""), ("runtime", "run-"), ("priority", "priority-"), ("host", "host-")] {
                 if let Some(v) = a.one(flag) {
                     labels.push(format!("{prefix}{v}"));
@@ -799,7 +827,7 @@ mod tests {
     #[test]
     fn commands_write_only_accepted_entries_and_close_publishes() {
         let (b, c) = (Fake::default(), cfg());
-        let n = b.create("T", "## Goal\ng", &["q-ready".into()]).unwrap();
+        let n = b.create("T", "## Goal\ng", &["taskq".into()]).unwrap();
         assert!(act(&b, &c.root, n, "steer", &[], "x").unwrap_err().contains("ready"), "steer needs a live worker");
         let before = b.comments(n).unwrap().len();
         b.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
@@ -819,8 +847,8 @@ mod tests {
     #[test]
     fn report_follows_r6() {
         let (b, c) = (Fake::default(), cfg());
-        let n = b.create("Ship | it", "", &["q-ready".into()]).unwrap();
-        let q = b.create("Q", "", &["q-ready".into()]).unwrap();
+        let n = b.create("Ship | it", "", &["taskq".into()]).unwrap();
+        let q = b.create("Q", "", &["taskq".into()]).unwrap();
         b.comment(q, &entry("spawn", &["worker", "claude:abc", "mac"], None, "")).unwrap();
         let a = fold(&entries(&b, q).unwrap(), false).attempt.unwrap();
         b.comment(q, &entry("ask", &[], Some(a), "Which way?\nBecause.\n1. left\n2. right ★")).unwrap();

@@ -28,10 +28,11 @@ pub struct Config {
 }
 
 pub const HOST_LABEL: &str = "taskq-host";
+pub const TASK_LABEL: &str = "taskq";
 
-/// Only issues with a `q-<state>` label are tasks (§ 1): a user issue never starts by itself.
+/// Only issues labelled `taskq` are tasks (§ 1): a user issue never starts by itself.
 pub fn is_task(i: &Issue) -> bool {
-    i.trusted && !is_host(i) && i.labels.iter().any(|l| l.starts_with("q-"))
+    i.trusted && i.labels.iter().any(|l| l == TASK_LABEL)
 }
 
 pub fn is_host(i: &Issue) -> bool {
@@ -417,7 +418,7 @@ mod tests {
     #[test]
     fn two_hosts_admit_one_attempt_and_the_survivor_recovers_a_dead_host() {
         let b = Fake::default();
-        let n = b.create("T", "## Goal\ng", &["q-ready".into()]).unwrap();
+        let n = b.create("T", "## Goal\ng", &["taskq".into()]).unwrap();
         let (ca, cb) = (cfg("mac"), cfg("win"));
         let (ea, eb): (Exits, Exits) = Default::default();
         let mut a = service(&b, &ca, ea.clone());
@@ -442,7 +443,7 @@ mod tests {
     #[test]
     fn exit_without_result_is_gone_and_result_brings_a_reviewer() {
         let b = Fake::default();
-        let n = b.create("T", "", &["q-ready".into()]).unwrap();
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
         let c = cfg("mac");
         let e: Exits = Default::default();
         let mut s = service(&b, &c, e.clone());
@@ -464,7 +465,7 @@ mod tests {
     #[test]
     fn answer_resumes_the_same_session_and_requeue_stops_the_child() {
         let b = Fake::default();
-        let n = b.create("T", "", &["q-ready".into()]).unwrap();
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
         let c = cfg("mac");
         let e: Exits = Default::default();
         let mut s = service(&b, &c, e.clone());
@@ -493,8 +494,8 @@ mod tests {
         let b = Fake::default();
         let dep = b.create("dep", "", &["later".into()]).unwrap();
         b.comment(dep, &core::entry("later", &[], None, "")).unwrap();
-        let n = b.create("T", &format!("Depends on #{dep}"), &["q-ready".into()]).unwrap();
-        let other = b.create("O", "", &["q-ready".into(), "host-win".into()]).unwrap();
+        let n = b.create("T", &format!("Depends on #{dep}"), &["taskq".into()]).unwrap();
+        let other = b.create("O", "", &["taskq".into(), "host-win".into()]).unwrap();
         let user = b.create("U", "", &[]).unwrap();
         let c = cfg("mac");
         let mut s = service(&b, &c, Default::default());
@@ -504,15 +505,15 @@ mod tests {
         b.close(dep).unwrap();
         s.pass().unwrap();
         assert_eq!(task(&b, n).state, State::Doing);
-        assert!(b.comments(user).unwrap().is_empty() && b.issue(user).unwrap().labels.is_empty(), "no q- label: never a task");
+        assert!(b.comments(user).unwrap().is_empty() && b.issue(user).unwrap().labels.is_empty(), "no taskq label: never a task");
     }
 
     #[test]
     fn focus_and_needs_choose_tasks() {
         let b = Fake::default();
-        let win = b.create("W", "", &["q-ready".into(), "needs-windows".into()]).unwrap();
-        let maps = b.create("M", "", &["q-ready".into(), "area-maps".into()]).unwrap();
-        let other = b.create("O", "", &["q-ready".into()]).unwrap();
+        let win = b.create("W", "", &["taskq".into(), "needs-windows".into()]).unwrap();
+        let maps = b.create("M", "", &["taskq".into(), "area-maps".into()]).unwrap();
+        let other = b.create("O", "", &["taskq".into()]).unwrap();
         let c = cfg("mac");
         let mut s = service(&b, &c, Default::default());
         s.focus = vec![];
@@ -546,7 +547,7 @@ mod tests {
         std::fs::write(root.join(".worktrees/taskq-2/wip"), "x").unwrap();
         let b = Fake::default();
         for _ in 0..3 {
-            b.create("T", "", &["q-ready".into()]).unwrap();
+            b.create("T", "", &["taskq".into()]).unwrap();
         }
         b.close(1).unwrap();
         b.close(2).unwrap();

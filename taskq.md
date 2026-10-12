@@ -100,15 +100,15 @@ Owner decisions on looks and sound, one line each. Change one only per R13.
 - Tone: minimum words, plain to anyone, no filler (R7).
 
 ## 1. Tasks
-A task is an open issue by a trusted author (GitHub `OWNER|MEMBER|COLLABORATOR`, GitLab Reporter+) with a `q-<state>`
-label; `taskq add` sets it, a person on the board adds `q-ready`. Any other issue is never started: a PM turns it into
-a task with `taskq add` and comments on it when the task closes. A closed issue is done. The issue text is for people and may be edited by hand: `## Goal`, `## Acceptance`, optional `## Scope`, and one
-line `Depends on #N` per dependency. Acceptance items are numbered `A1.`, `A2.`, never renumbered; each is an
-observable result a reviewer checks without reading the code.
+A task is an open issue by a trusted author (GitHub `OWNER|MEMBER|COLLABORATOR`, GitLab Reporter+) labelled `taskq`
+(`taskq add` sets it; on the board a person adds it). Any other issue never starts: a PM makes a task from it with
+`taskq add` and comments on it when the task closes. A closed issue is done. The issue text is for people and may be
+edited by hand: `## Goal`, `## Acceptance`, optional `## Scope`, one line `Depends on #N` per dependency. Acceptance
+items are `A1.`, `A2.`, never renumbered; each an observable result a reviewer checks without reading the code.
 
 Labels: `q-<state>` (projection, § 2); type `code|docs|research|asset`; `priority-1|2` (lower first, default 2);
 `run-<runtime>` (none: any); `host-<name>` (none: any host); `needs-<x>` (only a host whose `has` lists x, § 9);
-`assignee-only` (start only when the board's authenticated user is an assignee); any other label, e.g. `area-maps`. Reserved: `taskq-host` (§ 4).
+`assignee-only` (start only when the board's user is an assignee); any other, e.g. `area-maps`. Reserved: `taskq-host`.
 
 ## 2. Log and states
 A log entry is a comment by a trusted author whose first line is `taskq: <kind> [<arg>] [attempt <id>]`; the rest of the
@@ -184,12 +184,12 @@ One loop:
 8. Sleep until a poke or `poll` seconds.
 
 - Filter: `host-*` absent or this host; `run-*` absent or enabled here; `assignee-only` passes; each `needs-*` in `has`.
-- Focus: `taskq service focus all|off|<label..>` writes `<root>/.taskq/focus`; a task passes when it is `all` or the task
-  has one of the labels. No file or `off` (the default): nothing is admitted. Heartbeats, routing and updates go on.
+- Focus: `taskq service focus all|off|<label..>` writes `<root>/.taskq/focus`: `all` or one of the labels passes; none
+  or `off` (default) admits nothing, heartbeats and updates go on. No arguments: print focus, `has`, labels of open tasks; an agent maps the owner's
+  words to these, asks when unsure, says so when none fits.
 - Poke: a local command touches `<root>/.taskq/poke`; the sleeping service checks its mtime every second. Each pass
   writes `<root>/.taskq/status.json` for `service status`. `ponytail:` files, no socket or pipe, on every OS.
-- Restart: the service rebuilds from the board. Former children are not adopted (except across the § 8 re-exec);
-  their attempts become `gone`.
+- Restart: rebuild from the board; former children are not adopted (except the § 8 re-exec), their attempts are `gone`.
 
 ## 5. Commands
 | Command | Does |
@@ -206,7 +206,7 @@ One loop:
 | `taskq wait [--window MIN] [--only L,..]` | PM: block until a task moves to `ask`, `review` with options, closed or `failed`; print `ask #N` etc. or `tick` |
 | `taskq cleanup [--force]` | remove clean worktrees and branches of closed tasks; `--force` also dirty ones (R11) |
 | `taskq update [--check]` | § 8 steps 1–4 once |
-| `taskq service install\|run\|focus\|status\|uninstall` | § 4, § 8 |
+| `taskq service install\|run\|focus\|status\|uninstall\|list` | § 4, § 8; `list`: this host's projects and their focus |
 | `taskq selftest` | load config, fold `tests/golden` fixtures built into the binary, read the board; no writes |
 
 - Commands add `attempt $TASKQ_ATTEMPT` when it is set. A command refused by `fold` prints the current state.
@@ -286,15 +286,15 @@ change that N-1 cannot ignore needs a cutover like § 9. Hosts update independen
 `taskq.json` beside the project root:
 - `board` `github|gitlab`; `repo` `owner/name`; `host` GitLab host.
 - `publish` `direct|pr`; `workspace` `external` keeps host-owned worktrees.
-- `hosts` `{hostname: name}` (env `TASKQ_HOST` overrides); `has` `{name: [x..]}` for `needs-<x>`.
-- `limits` `{"claude": n, "codex": n}`.
+- `hosts` `{hostname: name}` (env `TASKQ_HOST` overrides); `has` `{name: [x..]}`; `limits` `{"claude": n, "codex": n}`.
 - `permission_mode`, `codex` (R9); `pages` link wrapper base; `assignee` (login or `me`) report filter.
 - `ttl`, `poll`, `update_every`, `rollback_after`: seconds, defaults 300, 60, 900, 600.
 - Token: env `TASKQ_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token` (mode 0600). Never in config.
 
-A cutover is one step per project, not per host: two board formats do not mix. There is no migration code.
-`CHANGELOG.md` says per release what changed on the board and what an open issue needs. An agent reads the entries
-from the board's version to the new one and prints a plan per open issue. It asks the owner about each issue the new
-format cannot hold. After the owner's OK, with every old service stopped and no old children, it applies the plan with
-`taskq` commands and issue edits. Closed issues are never touched. New services start: Mac, then Windows. For v3 → v4,
-first v4 `status` runs read-only beside v3; a week clean: delete `taskq.py`, `host_service.py`, `runtimes/`, `docs/legacy/`.
+A cutover is one step per project, not per host: two board formats do not mix. No migration code: `CHANGELOG.md`
+says per release what changed on the board and what an open issue needs. An agent reads the entries from the board's
+version to the new one, prints a plan per open issue and collects its questions (issues the new format cannot hold)
+for the owner, one by one or all at once. After the owner's OK, with every old service stopped and no old children, it
+applies the plan with `taskq` commands and issue edits. Closed issues are never touched. New services start: Mac, then
+Windows. Repair is the same agent procedure for one project; it warns when `status` shows another host's fresh
+heartbeat. v3 → v4 a week clean: delete `taskq.py`, `host_service.py`, `runtimes/`, `docs/legacy/`.

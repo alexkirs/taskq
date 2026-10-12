@@ -215,7 +215,11 @@ impl Http {
     }
 
     fn call(&self, method: &str, url: &str, body: Option<Value>) -> Result<Reply> {
+        // absolute URLs come from pagination headers: the token goes only to the configured API
         let url = if url.starts_with("https://") { url.to_string() } else { format!("{}{url}", self.api) };
+        if !url.starts_with(&format!("{}/", self.root())) {
+            return Err(format!("refused: {url} is outside the board API"));
+        }
         let r = curl(method, &url, &self.auth, body.as_ref())?;
         if let Some(t) = r.header("date").and_then(http_date) {
             *self.clock.borrow_mut() = t;
@@ -400,7 +404,9 @@ impl Board for Http {
             self.call("POST", &format!("/issues/{n}/labels"), Some(json!({ "labels": add })))?;
         }
         for l in remove {
-            match self.call("DELETE", &format!("/issues/{n}/labels/{}", l.replace(' ', "%20")), None) {
+            // percent-encode: a label like `q-/../..` must not walk the API path
+            let enc: String = l.bytes().map(|c| if c.is_ascii_alphanumeric() || b"-_.~".contains(&c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect();
+            match self.call("DELETE", &format!("/issues/{n}/labels/{enc}"), None) {
                 Err(e) if e.contains("HTTP 404") => {}
                 r => {
                     r?;
@@ -614,5 +620,13 @@ mod tests {
         let e = entries(&b, n).unwrap();
         assert_eq!(e.len(), 1);
         assert_eq!(crate::core::fold(&e, false).state, crate::core::State::Ready);
+    }
+
+    #[test]
+    fn token_goes_only_to_the_board_api() {
+        let h = Http::new(Kind::GitHub, "github.com", "o/r", "t");
+        for url in ["https://evil.example/x", "https://api.github.com.evil.example/x"] {
+            assert!(h.call("GET", url, None).err().is_some_and(|e| e.starts_with("refused")), "{url}");
+        }
     }
 }

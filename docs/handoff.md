@@ -19,7 +19,8 @@ Refresh every line with a fresh read before acting on it (R12).
 - Windows and Linux: only CI runs them; no host run yet (unknown, R12).
 
 ## Waits on the owner
-1. Commit and PR of `refactor/plan`.
-2. Release secret `TASKQ_SIGNING_KEY` (ed25519 PEM) and repository variable `TASKQ_RELEASE_KEY` (public hex).
-3. Two-host claim test on the live board (§ 3) before any v4 `service run`.
-4. Cutover (§ 9): stop v3 on every host, run the migration, start v4 on Mac, then Windows.
+1. Review and merge PR 720 (`refactor/plan`).
+2. Two-host claim test on the live board (§ 3) before any v4 `service run`.
+3. Before cutover: decide the 4 v3 `ask` tasks #612, #601, #597, #588 (answer in v3 or park) and whether #643, #638
+   (no v3 block) are tasks. 8 `later` tasks have no recorded reason (#664, #654, #652, #651, #650, #647, #642, #640).
+4. Cutover (§ 9): an agent applies `CHANGELOG.md` v4.0.0 with v3 stopped on every host; then v4 on Mac, then Windows.

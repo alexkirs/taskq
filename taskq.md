@@ -75,7 +75,8 @@ A PM manages several projects only from an owner-written list; folders are never
 
 ### R11. Retire sessions only after their attempt ends
 A worker or reviewer is stopped only when its task is closed or parked or its attempt is replaced (§ 4). Identity is the
-recorded session id, never a name match. Uncommitted work is never deleted; no `--force`.
+recorded session id, never a name match. Uncommitted work is never lost: only `cleanup --force` removes it, after
+saving it to `<root>/.taskq/trash/taskq-<N>.patch`.
 
 ### R12. Unverified means unknown
 Report only what a fresh read proved. Delivery, exit code or a chat turn is not proof of receipt, application or
@@ -203,6 +204,7 @@ One loop:
 | `taskq status` | R6 report; no write |
 | `taskq inbox N` | task text, folded state and the log (a requeue says what to fix); no write |
 | `taskq wait [--window MIN]` | PM: block until a task moves to `ask`, `review` with options, closed or `failed`; print `ask #N` etc. or `tick` |
+| `taskq cleanup [--force]` | remove clean worktrees and branches of closed tasks; `--force` also dirty ones (R11) |
 | `taskq update [--check]` | § 8 steps 1–4 once |
 | `taskq service install\|run\|pause\|resume\|status\|uninstall` | § 4, § 8 |
 | `taskq selftest` | load config, fold `tests/golden` fixtures built into the binary, read the board; no writes |
@@ -256,15 +258,15 @@ The child's environment drops `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` and
 `TASKQ_ROLE`. Briefs go through stdin, never a shell. Logs: `<root>/.taskq/<T|R><N>-<attempt>.log`.
 
 **Release.** CI on a `v*` tag builds once per OS `taskq-<ver>-<os>-<arch>`,
-`SHA256SUMS`, `SHA256SUMS.sig` (ed25519 over `SHA256SUMS`, secret `TASKQ_SIGNING_KEY`) and `latest.json`
-`{"version", "files": {"<os>-<arch>": "<name>"}}`. Each runner runs `selftest` on its artifact before publishing.
-Hosts need no git, gh or toolchain; HTTP goes through the OS `curl`. The host verifies sha256 and the signature with the public
-key built into the running version.
+`SHA256SUMS` and `latest.json` `{"version", "files": {"<os>-<arch>": "<name>"}}`. Each runner runs `selftest` on
+its artifact before publishing. Hosts need no git, gh or toolchain; HTTP goes through the OS `curl`. The host checks
+the sha256 against `SHA256SUMS`. Trust is HTTPS to the release repo and who can push its tags; `ponytail:` no
+signature, add one when releases are served from anywhere else.
 
 **Update** (`taskq update`, service step 7) in `install` (default `~/.local/share/taskq`, Windows `%LOCALAPPDATA%\taskq`):
 immutable `releases/<ver>/`, a `current` file holding `<ver>` (atomic rename) and `previous`.
 1. Read `latest.json` from the release repo. Not newer: stop. A leftover `releases/*.tmp` is deleted.
-2. Download into `releases/<ver>.tmp/`, verify sha256 and signature, rename to `releases/<ver>/`.
+2. Download into `releases/<ver>.tmp/`, verify sha256, rename to `releases/<ver>/`.
 3. Smoke: `releases/<ver>/taskq selftest`. Failure: delete, report, keep current.
 4. Write `previous`, swap `current`, re-exec; live children pass to the new image through `<root>/.taskq/kids`.
    Windows: exit once no child is live; the unit restarts the service.
@@ -286,12 +288,13 @@ change that N-1 cannot ignore needs a cutover like § 9. Hosts update independen
 - `publish` `direct|pr`; `workspace` `external` keeps host-owned worktrees.
 - `hosts` `{hostname: name}` (env `TASKQ_HOST` overrides); `limits` `{"claude": n, "codex": n}`.
 - `permission_mode`, `codex` (R9); `pages` link wrapper base; `assignee` (login or `me`) report filter.
-- `release` `{"repo": "alexkirs/taskq", "key": "<ed25519 public hex>"}`.
+- `release` `{"repo": "alexkirs/taskq"}`.
 - `ttl`, `poll`, `update_every`, `rollback_after`: seconds, defaults 300, 60, 900, 600.
 - Token: env `TASKQ_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token` (mode 0600). Never in config.
 
-Cutover v3 → v4 is one step per project, not per host: v3 and v4 models do not mix. First v4 `status` runs read-only
-beside v3. Then, with every v3 service stopped and no v3 children: one migration rewrites each open issue (text without
-the JSON block, `Depends on` lines, one entry for its state: `later`/`failed` with reason, `ask` with its card, `doing`
-and `review` as `requeue`), removes grants of closed tasks, and v4 services start: Mac, then Windows. Closed issues are
-never touched. A week clean: delete `taskq.py`, `host_service.py`, `runtimes/`, `docs/legacy/`.
+A cutover is one step per project, not per host: two board formats do not mix. There is no migration code.
+`CHANGELOG.md` says per release what changed on the board and what an open issue needs. An agent reads the entries
+from the board's version to the new one and prints a plan per open issue. It asks the owner about each issue the new
+format cannot hold. After the owner's OK, with every old service stopped and no old children, it applies the plan with
+`taskq` commands and issue edits. Closed issues are never touched. New services start: Mac, then Windows. For v3 → v4,
+first v4 `status` runs read-only beside v3; a week clean: delete `taskq.py`, `host_service.py`, `runtimes/`, `docs/legacy/`.

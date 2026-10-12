@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 type Res<T> = Result<T, String>;
 
-const USAGE: &str = "usage: taskq add|ask|answer|result|requeue|steer|later|failed|close|status|inbox|wait|update|service|selftest (see taskq.md § 5)";
+const USAGE: &str = "usage: taskq add|ask|answer|result|requeue|steer|later|failed|close|status|inbox|wait|cleanup|update|service|selftest (see taskq.md § 5)";
 
 // ---------- arguments ----------
 
@@ -110,7 +110,6 @@ fn load(root: &Path) -> Res<(Config, Value)> {
         permission_mode: str_or("permission_mode", "dontAsk"),
         codex,
         release_repo: v["release"]["repo"].as_str().unwrap_or("").into(),
-        release_key: v["release"]["key"].as_str().unwrap_or("").into(),
         ttl: secs("ttl", 300) as i64,
         poll: secs("poll", 60),
         update_every: secs("update_every", 900),
@@ -528,7 +527,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         if is_installed && checked.is_none_or(|t| t.elapsed().as_secs() >= cfg.update_every) {
             checked = Some(Instant::now());
-            match platform::update(&cfg.install, &cfg.release_repo, &cfg.release_key, false) {
+            match platform::update(&cfg.install, &cfg.release_repo, false) {
                 Ok(Some(v)) => {
                     eprintln!("updated to {v}; restarting");
                     reexec(&s, cfg)?;
@@ -626,8 +625,8 @@ fn run(argv: &[String]) -> Res<()> {
         }
         "update" => {
             let install = platform::default_install();
-            let (key, repo) = find_root().ok().and_then(|r| load(&r).ok()).map(|(c, _)| (c.release_key, c.release_repo)).unwrap_or_default();
-            match platform::update(&install, &repo, &key, a.flags.contains_key("check"))? {
+            let repo = find_root().ok().and_then(|r| load(&r).ok()).map(|(c, _)| c.release_repo).unwrap_or_default();
+            match platform::update(&install, &repo, a.flags.contains_key("check"))? {
                 Some(v) => println!("updated to {v}; the service restarts on its next update check"),
                 None => println!("up to date ({})", platform::current(&install).unwrap_or_else(|| platform::VERSION.into())),
             }
@@ -725,6 +724,14 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             println!("{}", report(b, cfg, &c.raw)?);
             Ok(())
         }
+        "cleanup" => {
+            // a child the local service still runs keeps its worktree, whatever the board says
+            let st: Value = fs::read_to_string(dot(root).join("status.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+            let live: Vec<u64> = st["kids"].as_array().into_iter().flatten().filter_map(|k| k["task"].as_u64()).collect();
+            let log = service::cleanup(b, root, |n| live.contains(&n), a.flags.contains_key("force"));
+            println!("{}", if log.is_empty() { "nothing to clean".into() } else { log.join("\n") });
+            Ok(())
+        }
         "inbox" => {
             println!("{}", inbox(b, a.num(1)?)?);
             Ok(())
@@ -772,7 +779,6 @@ mod tests {
             permission_mode: "dontAsk".into(),
             codex: vec![],
             release_repo: String::new(),
-            release_key: String::new(),
             ttl: 300,
             poll: 60,
             update_every: 900,

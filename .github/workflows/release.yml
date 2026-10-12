@@ -1,4 +1,4 @@
-# § 8 Release: one binary per OS, SHA256SUMS signed with ed25519, latest.json. A failing selftest publishes nothing.
+# § 8 Release: one binary per OS, SHA256SUMS, latest.json. A failing selftest publishes nothing.
 name: release
 on:
   push:
@@ -19,7 +19,6 @@ jobs:
             ext: .exe
     runs-on: ${{ matrix.os }}
     env:
-      TASKQ_RELEASE_KEY: ${{ vars.TASKQ_RELEASE_KEY }}
       TASKQ_SELFTEST_OFFLINE: '1'
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +27,6 @@ jobs:
         shell: bash
         run: |
           ver="${GITHUB_REF_NAME#v}"
-          test -n "$TASKQ_RELEASE_KEY" || { echo "repo variable TASKQ_RELEASE_KEY (ed25519 public hex) is not set"; exit 1; }
           perl -pi -e 'if (!$d && s/^version = ".*"/version = "'"$ver"'"/) { $d = 1 }' Cargo.toml
           grep -q "^version = \"$ver\"" Cargo.toml
           echo "VER=$ver" >> "$GITHUB_ENV"
@@ -55,18 +53,11 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Sign and describe
-        env:
-          TASKQ_SIGNING_KEY: ${{ secrets.TASKQ_SIGNING_KEY }}
+      - name: Describe
         run: |
           ver="${GITHUB_REF_NAME#v}"
           cd dist
           sha256sum taskq-* > SHA256SUMS
-          printf '%s\n' "$TASKQ_SIGNING_KEY" > ../signing.pem
-          openssl pkeyutl -sign -inkey ../signing.pem -rawin -in SHA256SUMS -out sig.bin
-          rm ../signing.pem
-          xxd -p -c 256 sig.bin > SHA256SUMS.sig
-          rm sig.bin
           python3 - "$ver" <<'PY'
           import json, os, sys
           ver = sys.argv[1]

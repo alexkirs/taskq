@@ -5,11 +5,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// The release signing key (ed25519, hex) built into this version by CI; empty in local builds.
-pub const RELEASE_KEY: &str = match option_env!("TASKQ_RELEASE_KEY") {
-    Some(k) => k,
-    None => "",
-};
 
 pub fn exe_name() -> &'static str {
     if cfg!(windows) { "taskq.exe" } else { "taskq" }
@@ -107,26 +102,17 @@ fn download(url: &str, to: &Path) -> Result<(), String> {
     if out.status.success() { Ok(()) } else { Err(format!("download {url}: {}", String::from_utf8_lossy(&out.stderr).trim())) }
 }
 
-fn hex(s: &str) -> Option<Vec<u8>> {
-    (s.len() % 2 == 0).then(|| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()).flatten()
-}
-
-/// `SHA256SUMS` signed by `key` lists `name` with the sha256 of `bytes`.
-pub fn verify(sums: &[u8], sig: &[u8], key: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
-    use ring::signature::{ED25519, UnparsedPublicKey};
-    let key = hex(key.trim()).ok_or("bad release key")?;
-    let sig = hex(String::from_utf8_lossy(sig).trim()).unwrap_or_else(|| sig.to_vec());
-    UnparsedPublicKey::new(&ED25519, key).verify(sums, &sig).map_err(|_| "SHA256SUMS signature does not verify")?;
+/// `SHA256SUMS` lists `name` with the sha256 of `bytes`.
+pub fn verify(sums: &[u8], name: &str, bytes: &[u8]) -> Result<(), String> {
     let digest: String = ring::digest::digest(&ring::digest::SHA256, bytes).as_ref().iter().map(|b| format!("{b:02x}")).collect();
     let listed = String::from_utf8_lossy(sums).lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == [digest.as_str(), name]);
     if listed { Ok(()) } else { Err(format!("{name}: sha256 {digest} not in SHA256SUMS")) }
 }
 
 /// § 8 update steps: Ok(Some(version)) when a new release became current.
-pub fn update(install: &Path, repo: &str, config_key: &str, check: bool) -> Result<Option<String>, String> {
-    let key = if RELEASE_KEY.is_empty() { config_key } else { RELEASE_KEY };
-    if repo.is_empty() || key.is_empty() {
-        return Err("no release repo or key: update is off".into());
+pub fn update(install: &Path, repo: &str, check: bool) -> Result<Option<String>, String> {
+    if repo.is_empty() {
+        return Err("no release repo: update is off".into());
     }
     let rel = install.join("releases");
     fs::create_dir_all(&rel).map_err(|e| e.to_string())?;
@@ -146,6 +132,10 @@ pub fn update(install: &Path, repo: &str, config_key: &str, check: bool) -> Resu
         return Ok(None);
     }
     let name = latest["files"][target()].as_str().ok_or(format!("latest.json: no file for {}", target()))?.to_string();
+    // both become paths under `releases/`: only the exact expected names pass
+    if !ver.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-') || ver.contains("..") || name != format!("taskq-{ver}-{}{}", target(), std::env::consts::EXE_SUFFIX) {
+        return Err(format!("latest.json: unexpected version {ver:?} or file {name:?}"));
+    }
     if check {
         println!("update available: {running} -> {ver} ({name})");
         return Ok(None);
@@ -153,11 +143,11 @@ pub fn update(install: &Path, repo: &str, config_key: &str, check: bool) -> Resu
     let tmp = rel.join(format!("{ver}.tmp"));
     fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
     let result = (|| {
-        for f in ["SHA256SUMS", "SHA256SUMS.sig", name.as_str()] {
+        for f in ["SHA256SUMS", name.as_str()] {
             download(&format!("{base}/{f}"), &tmp.join(f))?;
         }
         let bytes = fs::read(tmp.join(&name)).map_err(|e| e.to_string())?;
-        verify(&fs::read(tmp.join("SHA256SUMS")).map_err(|e| e.to_string())?, &fs::read(tmp.join("SHA256SUMS.sig")).map_err(|e| e.to_string())?, key, &name, &bytes)?;
+        verify(&fs::read(tmp.join("SHA256SUMS")).map_err(|e| e.to_string())?, &name, &bytes)?;
         fs::rename(tmp.join(&name), tmp.join(exe_name())).map_err(|e| e.to_string())?;
         #[cfg(unix)]
         {
@@ -292,17 +282,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn versions_and_signatures() {
+    fn versions_and_checksums() {
         assert!(newer("4.1.0", "4.0.12") && newer("4.0.0", "4.0.0-dev") && !newer("4.0.0", "4.0.0"));
-        use ring::signature::{Ed25519KeyPair, KeyPair};
-        let pair = Ed25519KeyPair::from_seed_unchecked(&[7u8; 32]).unwrap();
-        let key: String = pair.public_key().as_ref().iter().map(|b| format!("{b:02x}")).collect();
         let bin = b"binary";
         let digest: String = ring::digest::digest(&ring::digest::SHA256, bin).as_ref().iter().map(|b| format!("{b:02x}")).collect();
         let sums = format!("{digest}  taskq-4.0.0-macos-aarch64\n");
-        let sig: String = pair.sign(sums.as_bytes()).as_ref().iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(verify(sums.as_bytes(), sig.as_bytes(), &key, "taskq-4.0.0-macos-aarch64", bin), Ok(()));
-        assert!(verify(sums.as_bytes(), sig.as_bytes(), &key, "taskq-4.0.0-macos-aarch64", b"evil").is_err());
-        assert!(verify(b"tampered", sig.as_bytes(), &key, "taskq-4.0.0-macos-aarch64", bin).is_err());
+        assert_eq!(verify(sums.as_bytes(), "taskq-4.0.0-macos-aarch64", bin), Ok(()));
+        assert!(verify(sums.as_bytes(), "taskq-4.0.0-macos-aarch64", b"evil").is_err());
+        assert!(verify(sums.as_bytes(), "taskq-4.0.0-linux-x86_64", bin).is_err());
     }
 }

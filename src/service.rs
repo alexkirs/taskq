@@ -19,7 +19,6 @@ pub struct Config {
     pub permission_mode: String,
     pub codex: Vec<String>,
     pub release_repo: String,
-    pub release_key: String,
     pub ttl: i64,
     pub poll: u64,
     pub update_every: u64,
@@ -71,6 +70,40 @@ pub struct View {
 }
 
 /// Fold every open task (heartbeat issues and untrusted authors excluded).
+/// Remove `.worktrees/taskq-<N>` of closed tasks and their merged local branch (§ 7, R11). Without `force` git refuses
+/// dirty worktrees, so those stay; with it the uncommitted work goes to `.taskq/trash/taskq-<N>.patch` first. Commits
+/// stay in the branch: `git branch -d` keeps an unmerged one. `ponytail:` a squash-merged branch stays until a manual
+/// `git branch -D`.
+pub fn cleanup(board: &dyn Board, root: &std::path::Path, mut skip: impl FnMut(u64) -> bool, force: bool) -> Vec<String> {
+    let mut log = vec![];
+    let Ok(dir) = std::fs::read_dir(root.join(".worktrees")) else { return log };
+    let git = |dir: &std::path::Path, args: &[&str]| std::process::Command::new("git").arg("-C").arg(dir).args(args).output().ok().filter(|o| o.status.success()).map(|o| o.stdout);
+    for e in dir.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(n) = name.strip_prefix("taskq-").and_then(|n| n.parse::<u64>().ok()) else { continue };
+        if skip(n) || !board.issue(n).is_ok_and(|i| !i.open) {
+            continue; // a fresh read must show the issue closed (R12)
+        }
+        let wt = format!(".worktrees/{name}");
+        let removed = if force {
+            let trash = root.join(".taskq/trash");
+            let saved = git(&e.path(), &["add", "-A"]).and_then(|_| git(&e.path(), &["diff", "--cached", "--binary"])).is_some_and(|patch| {
+                patch.is_empty() || std::fs::create_dir_all(&trash).and_then(|_| std::fs::write(trash.join(format!("{name}.patch")), &patch)).is_ok()
+            });
+            saved && git(root, &["worktree", "remove", "--force", &wt]).is_some()
+        } else {
+            git(root, &["worktree", "remove", &wt]).is_some()
+        };
+        if removed {
+            git(root, &["branch", "-d", &name]);
+            log.push(format!("#{n} worktree removed"));
+        } else {
+            log.push(format!("#{n} worktree kept: {}", if force { "could not save its patch" } else { "uncommitted work, see `taskq cleanup --force`" }));
+        }
+    }
+    log
+}
+
 pub fn views(board: &dyn Board, cache: &mut HashMap<u64, (i64, Vec<Comment>)>) -> Result<(Vec<View>, Vec<Issue>), String> {
     let issues = board.issues(None)?;
     let open: HashSet<u64> = issues.iter().map(|i| i.number).collect();
@@ -270,26 +303,11 @@ impl<'a> Service<'a> {
         Ok(())
     }
 
-    /// Remove clean `.worktrees/taskq-<N>` of closed tasks and their merged local branch (§ 7). Git refuses dirty
-    /// worktrees and unmerged branches, so those stay. `ponytail:` one try per process; a squash-merged branch stays
-    /// until a manual `git branch -D`.
     fn prune(&mut self, open: &HashMap<u64, &View>) {
-        let Ok(dir) = std::fs::read_dir(self.cfg.root.join(".worktrees")) else { return };
-        for e in dir.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let Some(n) = name.strip_prefix("taskq-").and_then(|n| n.parse::<u64>().ok()) else { continue };
-            if open.contains_key(&n) || self.kids.iter().any(|k| k.task == n) || !self.pruned.insert(n) {
-                continue;
-            }
-            if !self.board.issue(n).is_ok_and(|i| !i.open) {
-                continue; // a fresh read must show the issue closed (R12)
-            }
-            let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&self.cfg.root).args(args).output().is_ok_and(|o| o.status.success());
-            if git(&["worktree", "remove", &format!(".worktrees/{name}")]) {
-                git(&["branch", "-d", &name]);
-                self.log.push(format!("#{n} worktree removed"));
-            }
-        }
+        let tried = &mut self.pruned;
+        let kids: Vec<u64> = self.kids.iter().map(|k| k.task).collect();
+        let skip = |n: u64| open.contains_key(&n) || kids.contains(&n) || !tried.insert(n);
+        self.log.extend(cleanup(self.board, &self.cfg.root, skip, false));
     }
 
     /// A runtime with free capacity: `limits.<rt>` minus live children of it (§ 3).
@@ -363,7 +381,6 @@ mod tests {
             permission_mode: "dontAsk".into(),
             codex: vec![],
             release_repo: String::new(),
-            release_key: String::new(),
             ttl: 300,
             poll: 60,
             update_every: 900,
@@ -500,6 +517,9 @@ mod tests {
         s.pass().unwrap();
         let wt = |n: &str| root.join(format!(".worktrees/taskq-{n}")).exists();
         assert_eq!((wt("1"), wt("2"), wt("3")), (false, true, true), "clean closed removed; dirty and open stay");
+        cleanup(&b, &root, |_| false, true);
+        assert_eq!((wt("2"), wt("3")), (false, true), "force removes dirty closed; open stays");
+        assert!(std::fs::read_to_string(root.join(".taskq/trash/taskq-2.patch")).unwrap().contains("wip"), "dirty work saved");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

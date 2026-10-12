@@ -3,9 +3,9 @@ Operational state only. Rules are in [taskq.md](../taskq.md); the work order is 
 Refresh every line with a fresh read before acting on it (R12).
 
 ## Hosts
-- Mac: v3 service `com.taskq.mac-dispatch` not loaded. v4.0.6 runs as `com.taskq.taskq`, focus `all`,
+- Mac: v3 service `com.taskq.mac-dispatch` not loaded. v4.0.10 runs as `com.taskq.taskq`, focus `all`,
   limits claude 4 / codex 0, board token from the `gh` login.
-- Windows: v3 task `TaskQ-Windows-Dispatch` disabled, its files kept on the host. v4.0.6 runs as Scheduled Task `TaskQ-taskq`
+- Windows: v3 task `TaskQ-Windows-Dispatch` disabled, its files kept on the host. v4.0.10 runs as Scheduled Task `TaskQ-taskq`
   (launcher supervises the service, no console window, output in `%LOCALAPPDATA%\taskq\taskq.log`), focus `all`,
   on the board since 2026-10-13. v4.0.2 died 2026-10-12 within 2 min (console window closed, `0xC000013A`); the task
   did not restart it. Install from a process outside Claude Desktop (MSIX virtualizes AppData); ssh works
@@ -15,8 +15,10 @@ Refresh every line with a fresh read before acting on it (R12).
 - No other host is registered. Delivery to a host is not proof it ran.
 
 ## Board (v4 since 2026-10-12)
-- PR 720, 721, 723, 724, 746, 747 and 748 merged; releases `v4.0.0`–`v4.0.6` (macOS, Linux, Windows binaries).
+- PR 720, 721, 723, 724, 746, 747 and 748 merged; releases `v4.0.0`–`v4.0.10` (macOS, Linux, Windows binaries).
   v4.0.3 fixed the frozen heartbeat (same-body edit keeps `updated_at`), v4.0.4/v4.0.5 the Windows launcher, v4.0.6 hides the children's console windows.
+  v4.0.7–v4.0.10 add `taskq tray` (both hosts) and `service restart`/`stop`. The Windows host has a Rust toolchain
+  (rustup, gnu host) and WinLibs mingw for native debug builds; add the mingw `bin` to PATH for `cargo build`.
 - `CHANGELOG.md` v4.0.0 applied to 23 open issues: label `taskq`, v3 blocks removed (`deps` became `Depends on #N`),
   `later`/`failed` entries. The 4 v3 `ask` tasks (#612, #601, #597, #588) are parked `later` with their question.
 - #643 (v3 capacity) and #638 (v3 PID recovery) closed by owner decision.

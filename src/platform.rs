@@ -185,8 +185,15 @@ pub fn install_self(install: &Path) -> Result<(), String> {
         // ponytail: the launcher stays at the version that installed it; it only reads `current` and `previous`
         fs::copy(&me, &launcher).map_err(|e| format!("{}: {e}", launcher.display()))?;
     }
-    if current(install).is_none() {
-        write_atomic(&install.join("current"), VERSION)?;
+    // a newer binary installs over an older one as an update does (§ 8 step 4); never a downgrade
+    match current(install) {
+        Some(c) if !newer(VERSION, &c) => {}
+        old => {
+            if let Some(c) = old {
+                write_atomic(&install.join("previous"), &c)?;
+            }
+            write_atomic(&install.join("current"), VERSION)?;
+        }
     }
     Ok(())
 }

@@ -3,6 +3,10 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.0.1
+
+No token file needed: the board token falls back to `gh auth token` / `glab auth token` (§ 9).
+
 ## v4.0.0
 
 Rust binary replaces `taskq.py` and `host_service.py`.

@@ -122,7 +122,7 @@ fn load(root: &Path) -> Res<(Config, Value)> {
     Ok((cfg, v))
 }
 
-/// Env `TASKQ_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token` (§ 9).
+/// Env `TASKQ_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token`, else the `gh`/`glab` login (§ 9).
 fn token(install: &Path, kind: Kind) -> Res<String> {
     let named = if kind == Kind::GitLab { "GITLAB_TOKEN" } else { "GITHUB_TOKEN" };
     for k in ["TASKQ_TOKEN", named] {
@@ -132,7 +132,12 @@ fn token(install: &Path, kind: Kind) -> Res<String> {
             return Ok(t.trim().to_string());
         }
     }
+    let cli = || {
+        let o = std::process::Command::new(if kind == Kind::GitLab { "glab" } else { "gh" }).args(["auth", "token"]).output().ok()?;
+        o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
     fs::read_to_string(install.join("token")).map(|t| t.trim().to_string()).ok().filter(|t| !t.is_empty())
+        .or_else(cli).filter(|t| !t.is_empty())
         .ok_or(format!("no board token: set TASKQ_TOKEN or write {}", install.join("token").display()))
 }
 

@@ -151,11 +151,13 @@ pub struct Service<'a> {
     pruned: HashSet<u64>,
     start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, String> + 'a>,
     pub log: Vec<String>,
+    /// Open tasks of the last pass: number, title, state (for `status.json` and the tray).
+    pub tasks: Vec<(u64, String, &'static str)>,
 }
 
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, String> + 'a>) -> Self {
-        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), pruned: HashSet::new(), start, log: vec![] }
+        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), pruned: HashSet::new(), start, log: vec![], tasks: vec![] }
     }
 
     /// Children of the previous process image after an update re-exec; their inbox counts as delivered.
@@ -187,6 +189,7 @@ impl<'a> Service<'a> {
         let me = self.cfg.me.clone();
         let ttl = self.cfg.ttl;
         let (views, hosts) = views(self.board, &mut self.cache)?;
+        self.tasks = views.iter().filter(|v| v.task.state != State::Closed).map(|v| (v.issue.number, v.issue.title.clone(), v.task.state.name())).collect();
         let now = self.board.now()?;
         let by_n: HashMap<u64, &View> = views.iter().map(|v| (v.issue.number, v)).collect();
         let mut touched = HashSet::new();

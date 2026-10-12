@@ -187,8 +187,9 @@ One loop:
   or `off` (default) admits nothing, heartbeats and updates go on. No arguments: print focus, `has`, labels of open tasks; an agent maps the owner's
   words to these, asks when unsure, says so when none fits.
 - Poke: a local command touches `<root>/.taskq/poke`; the sleeping service checks its mtime every second. Each pass
-  writes `<root>/.taskq/status.json` for `service status`. `ponytail:` files, no socket or pipe, on every OS.
-- Restart: rebuild from the board; former children are not adopted (except the § 8 re-exec), their attempts are `gone`.
+  writes `<root>/.taskq/status.json` (state and open tasks) for `service status` and the tray. `ponytail:` files, no socket or pipe, on every OS.
+- Restart: rebuild from the board; former children are not adopted (except the § 8 re-exec), their attempts are `gone`. `service restart` writes `<root>/.taskq/restart`: the next pass re-execs (§ 8 step 4).
+- Tray (macOS, Windows): an installed service keeps `taskq tray` running (heartbeat `<root>/.taskq/tray`). Icon color: gray idle, blue in work, orange `ask`, red error or stale `status.json`. Menu: counts, board, `ask` and in-work issue links, pause/resume (focus `off` and back), log, project folder, restart, stop until the next logon, uninstall. It reads only `status.json`: no board, no token.
 
 ## 5. Commands
 | Command | Does |
@@ -205,7 +206,7 @@ One loop:
 | `taskq wait [--window MIN] [--only L,..]` | PM: block until a task moves to `ask`, `review` with options, closed or `failed`; print `ask #N` etc. or `tick` |
 | `taskq cleanup [--force]` | remove clean worktrees and branches of closed tasks; `--force` also dirty ones (R11) |
 | `taskq update [--check]` | § 8 steps 1–4 once |
-| `taskq service install\|run\|focus\|status\|uninstall\|list` | § 4, § 8; `list`: this host's projects and their focus |
+| `taskq service install\|run\|focus\|status\|restart\|stop\|uninstall\|list` / `taskq tray` | § 4, § 8; `stop`: until the next logon, the unit stays; `list`: this host's projects and their focus |
 | `taskq selftest` | load config, fold `tests/golden` fixtures built into the binary, read the board; no writes |
 
 - Commands add `attempt $TASKQ_ATTEMPT` when it is set. A command refused by `fold` prints the current state.
@@ -275,7 +276,7 @@ immutable `releases/<ver>/`, a `current` file holding `<ver>` (atomic rename) an
 
 **Service install** makes its binary `current` when newer (step 4) and writes one unit running `<install>/taskq service run`,
 restarting on failure: macOS `~/Library/LaunchAgents/com.taskq.<project>.plist` (`launchctl bootstrap gui/<uid>`);
-Windows a Scheduled Task `TaskQ-<project>` at this user's logon (no admin), no time limit; Linux `~/.config/systemd/user/taskq-<project>.service`. On Windows run setup outside an MSIX app (e.g. Claude Desktop): its AppData writes are private, the task sees neither binary nor `gh` login.
+Windows a Scheduled Task `TaskQ-<project>` at this user's logon (no admin), no time limit; Linux `~/.config/systemd/user/taskq-<project>.service`. Windows `stop`/`uninstall` also end the service process tree: `schtasks /End` ends only the launcher. On Windows run setup outside an MSIX app (e.g. Claude Desktop): its AppData writes are private, the task sees neither binary nor `gh` login.
 
 **Compatibility N/N-1.** v4 releases differ only by additive log kinds that N-1 can ignore without a different fold. A
 change that N-1 cannot ignore needs a cutover like § 9. Hosts update independently in any order. A version whose

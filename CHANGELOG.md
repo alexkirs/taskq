@@ -3,6 +3,13 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.0.7
+
+macOS and Windows: `taskq tray`, a menu-bar / notification-area icon that the installed service starts and keeps running:
+state color, counts, board and issue links, pause/resume, log, project folder, restart, stop until the next logon,
+uninstall. New `service restart` and `service stop`; Windows `stop`/`uninstall` also end the service process tree.
+`status.json` gains `pid`, `project`, `issues`, `log` and `tasks`. No reinstall: the updated service starts the tray.
+
 ## v4.0.6
 
 Windows: workers, reviewers and the `gh`/`hostname` calls run without a console window (a console-less service got a

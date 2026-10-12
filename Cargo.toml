@@ -12,6 +12,11 @@ serde_json = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `taskq tray` (§ 4): macOS menu bar, Windows notification area
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+tray-icon = "0.26"
+tao = "0.37"
+
 [profile.release]
 strip = true
 lto = true

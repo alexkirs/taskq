@@ -277,6 +277,19 @@ pub struct Unit {
     pub text: String,
     pub load: Vec<Vec<String>>,
     pub unload: Vec<Vec<String>>,
+    /// Stops the service until the next logon; the unit stays.
+    pub stop: Vec<Vec<String>>,
+}
+
+/// The service's output file (§ 8); Linux logs to the journal.
+pub fn log_path(install: &Path, project: &str) -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        Some(install.join(format!("{project}.log")))
+    } else if cfg!(windows) {
+        Some(install.join("taskq.log"))
+    } else {
+        None
+    }
 }
 
 fn sv(v: &[&str]) -> Vec<String> {
@@ -292,7 +305,7 @@ pub fn unit(install: &Path, root: &Path, project: &str) -> Unit {
     if cfg!(target_os = "macos") {
         let label = format!("com.taskq.{project}");
         let path = home.join("Library/LaunchAgents").join(format!("{label}.plist"));
-        let log = install.join(format!("{project}.log")).display().to_string();
+        let log = log_path(install, project).unwrap_or_default().display().to_string();
         let text = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>service</string><string>run</string></array>\n<key>WorkingDirectory</key><string>{}</string>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>{}</string></dict>\n</dict></plist>\n",
             xml(&label), xml(&l), xml(&r), xml(&log), xml(&log), xml(&path_env)
@@ -302,6 +315,7 @@ pub fn unit(install: &Path, root: &Path, project: &str) -> Unit {
         return Unit {
             load: vec![sv(&["launchctl", "bootstrap", &format!("gui/{uid}"), &p])],
             unload: vec![sv(&["launchctl", "bootout", &format!("gui/{uid}/{label}")])],
+            stop: vec![sv(&["launchctl", "bootout", &format!("gui/{uid}/{label}")])],
             path,
             text,
         };
@@ -321,6 +335,7 @@ pub fn unit(install: &Path, root: &Path, project: &str) -> Unit {
         return Unit {
             load: vec![sv(&["schtasks", "/Create", "/TN", &name, "/XML", &p, "/F"]), sv(&["schtasks", "/Run", "/TN", &name])],
             unload: vec![sv(&["schtasks", "/End", "/TN", &name]), sv(&["schtasks", "/Delete", "/TN", &name, "/F"])],
+            stop: vec![sv(&["schtasks", "/End", "/TN", &name])],
             path,
             text,
         };
@@ -333,6 +348,7 @@ pub fn unit(install: &Path, root: &Path, project: &str) -> Unit {
     Unit {
         load: vec![sv(&["systemctl", "--user", "daemon-reload"]), sv(&["systemctl", "--user", "enable", "--now", &name])],
         unload: vec![sv(&["systemctl", "--user", "disable", "--now", &name])],
+        stop: vec![sv(&["systemctl", "--user", "stop", &name])],
         path,
         text,
     }
@@ -351,9 +367,12 @@ pub fn write_unit(u: &Unit) -> Result<(), String> {
 
 pub fn run_all(cmds: &[Vec<String>], ignore: bool) -> Result<(), String> {
     for c in cmds {
-        let s = Command::new(&c[0]).args(&c[1..]).status().map_err(|e| format!("{}: {e}", c[0]))?;
-        if !s.success() && !ignore {
-            return Err(format!("`{}` failed: {s}", c.join(" ")));
+        // captured, not inherited: a console-less caller (the tray) would give the child its own window
+        let o = quiet(Command::new(&c[0]).args(&c[1..])).output().map_err(|e| format!("{}: {e}", c[0]))?;
+        print!("{}", String::from_utf8_lossy(&o.stdout));
+        eprint!("{}", String::from_utf8_lossy(&o.stderr));
+        if !o.status.success() && !ignore {
+            return Err(format!("`{}` failed: {}", c.join(" "), o.status));
         }
     }
     Ok(())

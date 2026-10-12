@@ -5,6 +5,8 @@ mod core;
 mod platform;
 mod runtime;
 mod service;
+#[cfg(any(target_os = "macos", windows))]
+mod tray;
 
 use board::{Board, Http, Kind, Publish, entries};
 use core::{Entry, State, Task, entry, fold};
@@ -17,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 type Res<T> = Result<T, String>;
 
-const USAGE: &str = "usage: taskq add|ask|answer|result|requeue|steer|later|failed|close|status|inbox|wait|cleanup|update|service|selftest (see taskq.md § 5)";
+const USAGE: &str = "usage: taskq add|ask|answer|result|requeue|steer|later|failed|close|status|inbox|wait|cleanup|update|service|tray|selftest (see taskq.md § 5)";
 
 // ---------- arguments ----------
 
@@ -157,6 +159,15 @@ fn dot(root: &Path) -> PathBuf {
 fn poke(root: &Path) {
     let _ = fs::create_dir_all(dot(root));
     let _ = fs::write(dot(root).join("poke"), "");
+}
+
+fn project_name(root: &Path) -> String {
+    root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "taskq".into())
+}
+
+/// Seconds since `p` was last written, by the local clock (local files only).
+fn file_age(p: &Path) -> Option<u64> {
+    fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs())
 }
 
 // ---------- writes ----------
@@ -519,6 +530,11 @@ fn service_run(c: &Ctx) -> Res<()> {
     let is_installed = installed(&cfg.install);
     let began = Instant::now();
     let mut checked: Option<Instant> = None;
+    let _ = fs::remove_file(d.join("restart"));
+    let mut tray = None;
+    let project = project_name(&cfg.root);
+    let issues = c.board.url(0).strip_suffix("/0").unwrap_or_default().to_string();
+    let log = platform::log_path(&cfg.install, &project);
     eprintln!("taskq {} service on {} for {}", platform::VERSION, cfg.me, cfg.repo);
     loop {
         s.focus = fs::read_to_string(d.join("focus")).unwrap_or_default().split_whitespace().filter(|f| *f != "off").map(String::from).collect();
@@ -531,7 +547,9 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         let at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let kids: Vec<Value> = s.kids.iter().map(|k| json!({"task": k.task, "attempt": k.attempt, "rt": k.rt, "pid": k.proc.id()})).collect();
-        let status = json!({"host": cfg.me, "version": platform::VERSION, "focus": s.focus, "error": r.err(), "kids": kids, "at": at});
+        let tasks: Vec<Value> = s.tasks.iter().map(|(n, title, state)| json!({"n": n, "title": title, "state": state})).collect();
+        let status = json!({"host": cfg.me, "version": platform::VERSION, "focus": s.focus, "error": r.err(), "kids": kids, "at": at,
+            "pid": std::process::id(), "project": project, "issues": issues, "log": log, "tasks": tasks});
         let _ = platform::write_atomic(&d.join("status.json"), &serde_json::to_string_pretty(&status).unwrap_or_default());
         if is_installed && began.elapsed().as_secs() >= cfg.rollback_after {
             let h = cfg.install.join("releases").join(platform::VERSION).join("healthy");
@@ -550,7 +568,49 @@ fn service_run(c: &Ctx) -> Res<()> {
                 Err(e) => eprintln!("update: {e}"),
             }
         }
+        if is_installed && d.join("restart").exists() {
+            // Windows re-exec waits for the live children; the request stays until it can go
+            if cfg!(unix) || s.kids.is_empty() {
+                let _ = fs::remove_file(d.join("restart"));
+                eprintln!("restart requested");
+            }
+            reexec(&s, cfg)?;
+        }
+        if is_installed {
+            keep_tray(&cfg.root, &mut tray);
+        }
         sleep_until_poke(&d.join("poke"), cfg.poll);
+    }
+}
+
+/// Start `taskq tray` when its heartbeat `<root>/.taskq/tray` is stale (§ 4); reap the one this image started.
+fn keep_tray(root: &Path, tray: &mut Option<std::process::Child>) {
+    if !cfg!(any(target_os = "macos", windows)) {
+        return;
+    }
+    if tray.as_mut().is_some_and(|c| !matches!(c.try_wait(), Ok(None))) {
+        *tray = None;
+    }
+    if tray.is_some() || file_age(&dot(root).join("tray")).is_some_and(|a| a < 30) {
+        return;
+    }
+    let Ok(me) = std::env::current_exe() else { return };
+    let mut c = std::process::Command::new(me);
+    c.arg("tray").current_dir(root).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    *tray = platform::quiet(&mut c).spawn().ok();
+}
+
+/// Windows: `schtasks /End` ends only the launcher; the service, its children and the tray go with this (§ 8).
+fn kill_service(root: &Path) {
+    let status = dot(root).join("status.json");
+    if !cfg!(windows) || file_age(&status).is_none_or(|a| a > 600) {
+        return;
+    }
+    let pid = fs::read_to_string(&status).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["pid"].as_u64());
+    if let Some(pid) = pid.filter(|p| *p != std::process::id() as u64) {
+        // the image filter guards against a reused pid
+        let cmd = ["taskkill", "/F", "/T", "/FI", &format!("PID eq {pid}"), "/FI", "IMAGENAME eq taskq.exe"].map(String::from).to_vec();
+        let _ = platform::run_all(&[cmd], true);
     }
 }
 
@@ -614,15 +674,27 @@ fn service(args: &Args) -> Res<()> {
             println!("focus: {f}");
             Ok(())
         }
+        "restart" => {
+            fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+            fs::write(d.join("restart"), "").map_err(|e| e.to_string())?;
+            poke(&root);
+            println!("restart requested");
+            Ok(())
+        }
         "status" => {
             let text = fs::read_to_string(d.join("status.json")).map_err(|_| "no service status: is `taskq service run` running here?".to_string())?;
             println!("{text}");
             Ok(())
         }
-        "install" | "uninstall" => {
+        "install" | "uninstall" | "stop" => {
             let (cfg, _) = load(&root)?;
-            let project = root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "taskq".into());
-            let u = platform::unit(&cfg.install, &root, &project);
+            let u = platform::unit(&cfg.install, &root, &project_name(&root));
+            if sub == "stop" {
+                platform::run_all(&u.stop, true)?;
+                kill_service(&root);
+                println!("stopped; it starts again at the next logon");
+                return Ok(());
+            }
             if sub == "install" {
                 platform::install_self(&cfg.install)?;
                 platform::write_unit(&u)?;
@@ -640,11 +712,22 @@ fn service(args: &Args) -> Res<()> {
                 let all: Vec<String> = fs::read_to_string(&projects).unwrap_or_default().lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
                 let _ = fs::write(&projects, all.concat());
                 println!("removed {}", u.path.display());
+                kill_service(&root);
             }
             Ok(())
         }
-        _ => Err("usage: taskq service install|run|focus|status|uninstall|list".into()),
+        _ => Err("usage: taskq service install|run|focus|status|restart|stop|uninstall|list".into()),
     }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn tray(root: PathBuf) -> Res<()> {
+    tray::run(root)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn tray(_root: PathBuf) -> Res<()> {
+    Err("taskq tray: macOS and Windows only".into())
 }
 
 // ---------- commands ----------
@@ -678,6 +761,7 @@ fn run(argv: &[String]) -> Res<()> {
             Ok(())
         }
         "service" => service(&a),
+        "tray" => tray(find_root()?),
         "" | "help" | "-h" | "--help" => Err(USAGE.into()),
         _ => command(&ctx()?, cmd, &a),
     }

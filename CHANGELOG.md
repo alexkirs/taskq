@@ -3,6 +3,12 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.0.5
+
+Windows: the v4.0.4 launcher exited with 101 under the Scheduled Task (stale console handles after dropping the console);
+it now resets them, logs its own messages to `taskq.log` and keeps restarting the service. `service install` names the
+task's user from `whoami` (an ssh session reports `WORKGROUP\<user>`, which schtasks rejects). Reinstall once.
+
 ## v4.0.4
 
 Windows: the launcher supervises `service run` (a Scheduled Task restarts only a failed launch, so a crash or the

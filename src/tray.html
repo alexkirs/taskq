@@ -62,7 +62,7 @@ const zone=Intl.DateTimeFormat().resolvedOptions().timeZone;
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const send=m=>window.ipc&&window.ipc.postMessage(JSON.stringify(m));
 const menu=document.querySelector('.menu');
-let aiText=null,aiMenu=false,aiConfirm=null;
+let aiText=null,aiMenu=false,aiConfirm=null,addConfirm=false;
 let S=null,page='home',homeScroll=0,ask=null,pending={},confirming=null,updating=null,draft=null,capedit=null,capmsg={};
 // one task per board and issue: `issues` names provider, host and repo (M2)
 function tasks(p){return p.tasks.map(t=>({...t,project:p.name,key:p.issues+'/'+t.n,url:p.issues+'/'+t.n}));}
@@ -128,11 +128,32 @@ function ai(){
   h+='<button class="project" data-a="ai-send"'+(A.target?'':' disabled')+'>'+(st==='clarify'?'Reply':'Send')+'</button>';
   if(!r)return h+'</div>';
   h+='<div class="body"><div class="meta">You asked: '+esc(r.text||'')+'</div><div class="'+(bad?'alert':st==='applied'||st==='result'?'work':'ask')+'" role="status">'+esc(aiStates[st]||st)+(an.reason?': '+esc(an.reason):'')+'</div>'+(an.text?'<div>'+esc(an.text).replace(/\n/g,'<br>')+'</div>':'')+'</div>';
-  if(an.ops)h+='<div class="body meta">'+an.ops.map(o=>esc(opText(o))).join('<br>')+'</div>';
+  // a setup lists its effects, computed by the service, instead of the op (§ 6)
+  if(an.effects)h+='<div class="body meta">'+an.effects.map(esc).join('<br>')+'</div>';
+  else if(an.ops)h+='<div class="body meta">'+an.ops.map(o=>esc(opText(o))).join('<br>')+'</div>';
   if(an.readback)h+='<div class="body meta">'+an.readback.map(esc).join('<br>')+'</div>';
-  if(st==='proposal')h+='<button class="project" data-a="ai-confirm" data-root="'+esc(r.root)+'" data-id="'+esc(r.id)+'" data-rev="'+Number(an.rev)+'"'+(aiConfirm===r.id+'/'+Number(an.rev)?' disabled':'')+'>Confirm: apply '+Number(an.ops.length)+' change'+(an.ops.length===1?'':'s')+'</button>';
+  if(st==='proposal')h+='<button class="project" data-a="ai-confirm" data-root="'+esc(r.root)+'" data-id="'+esc(r.id)+'" data-rev="'+Number(an.rev)+'"'+(aiConfirm===r.id+'/'+Number(an.rev)?' disabled':'')+'>Confirm: apply '+(an.effects||an.ops).length+' change'+((an.effects||an.ops).length===1?'':'s')+'</button>';
   if(bad)h+='<button class="project" data-a="ai-pick" data-v="'+esc(r.text||'')+'">Edit and send again</button>';
   return h+'</div>';}
+// Add project (menu.md M10): the folder comes from the OS picker; four cases
+const addKinds={new:'New project: no taskq.json',plain:'Not a repository: files stay',taskq:'taskq project: selftest passes',old:'Old taskq project: selftest fails'};
+const cutover='https://github.com/alexkirs/taskq/blob/main/taskq.md#9-config-and-cutover';
+function addProject(){
+  const A=S.add;
+  if(!A)return '<button class="project" data-a="add">Add project…</button>';
+  if(A.state==='picking')return '<div class="row meta">Choose a folder…</div>';
+  const failed=A.state==='install failed',known=S.projects.some(p=>p.root===A.path);
+  let h='<div class="body"><div class="meta">Folder: '+esc(A.path)+'</div><div role="status" class="'+(A.kind==='old'||failed?'alert':'')+'">'+(failed?'Install failed':esc(addKinds[A.kind]))+(A.reason?': '+esc(A.reason):'')+'</div></div>';
+  if(A.kind==='old')h+='<a class="project" href="'+cutover+'" data-url="'+cutover+'"><span>Repair or cutover: taskq.md § 9 ↗</span><span></span><span></span></a>';
+  if(A.kind==='taskq'){
+    if(A.state==='installed')h+='<div class="row work" role="status">Installed: read back from this host\'s projects</div>';
+    else if(A.state==='installing')h+='<button class="project" disabled>Installing…</button>';
+    else if(known)h+='<div class="body meta">Already in this menu</div>';
+    else if(addConfirm)h+='<div class="body" role="alert">Register '+esc(A.path)+' and install its service? It starts at logon.</div><div class="options"><button data-a="add-install">Confirm</button><button data-a="add-back">Cancel</button></div>';
+    else if(!failed)h+='<button class="project" data-a="add-ask">Install service…</button>';
+  }
+  if(A.kind==='new'||A.kind==='plain')h+=S.ai.target?'<button class="project" data-a="add-setup">Set up with AI…</button>':'<div class="body meta">Setup needs one running project service</div>';
+  return h+'<button class="project" data-a="add-cancel">'+(A.state==='installed'?'Done':'Cancel')+'</button>';}
 // the command over all projects names each one and its effect before acting (M5, M-A4)
 function bulk(run,held){
   const pausing=run.length>0,state=p=>({run:pausing?'pause':'admitting, unchanged',paused:pausing?'paused, unchanged':'resume',watch:'observation, unchanged'}[mode(p)]);
@@ -146,7 +167,7 @@ function home(){
   h+='<details><summary>↳ Scope <span class="meta">'+S.projects.length+' project'+(S.projects.length===1?'':'s')+' · in work '+c.work+' · ask '+c.ask+' · ready '+c.ready+'</span></summary><div class="body">'+S.projects.map(p=>'<div><strong>'+esc(p.name)+'</strong> <span class="meta">'+esc(modeText(p))+'</span></div><div class="meta">You asked: '+esc(p.request||'not recorded')+'</div>').join('')+'</div></details>';
   h+=S.projects.map(problem).join('');
   h+=globalGroup('ask',unique(all))+globalGroup('failed',unique(all));
-  h+='<div class="group"><div class="row meta">Projects</div>'+(S.projects.length?S.projects.map(p=>'<button class="project" data-page="'+esc(p.root)+'" role="menuitem"><span title="'+esc(p.name)+'">'+esc(p.name)+(mode(p)==='run'?'':' <span class="meta">'+(mode(p)==='paused'?'Ⅱ':'observation')+'</span>')+'</span>'+countMarkup(counts(tasks(p)))+'<span aria-hidden="true">›</span></button>').join(''):'<div class="body meta">No projects: run taskq service install in one</div>')+'</div>';
+  h+='<div class="group"><div class="row meta">Projects</div>'+(S.projects.length?S.projects.map(p=>'<button class="project" data-page="'+esc(p.root)+'" role="menuitem"><span title="'+esc(p.name)+'">'+esc(p.name)+(mode(p)==='run'?'':' <span class="meta">'+(mode(p)==='paused'?'Ⅱ':'observation')+'</span>')+'</span>'+countMarkup(counts(tasks(p)))+'<span aria-hidden="true">›</span></button>').join(''):'<div class="body meta">No projects yet</div>')+addProject()+'</div>';
   h+=history();
   if(held.length&&run.length)h+='<div class="row meta">Paused '+held.length+' of '+(held.length+run.length)+': '+esc(held.map(p=>p.name).join(', '))+'</div>';
   h+=bulk(run,held);
@@ -250,6 +271,8 @@ menu.addEventListener('click',e=>{
   if(d.a==='ai-send'){const r=S.ai.request,an=r&&r.answer||{};if(!aiText.trim())return;send({a:'ai-send',text:aiText,after:an.state==='clarify'?r.id:''});aiText='';render();return;}
   if(d.a==='ai-confirm'){aiConfirm=d.id+'/'+d.rev;send({a:'ai-confirm',root:d.root,id:d.id,rev:Number(d.rev)});render();return;}
   if(d.a==='ai-clear'){send({a:'ai-clear'});return;}
+  if(d.a==='add-ask'||d.a==='add-back'){addConfirm=d.a==='add-ask';render();return;}
+  if(d.a==='add-install'||d.a==='add-cancel')addConfirm=false;
   if(d.a==='confirm'||d.a==='cancel'){confirming=d.a==='confirm';render();return;}
   if(d.a==='update'){updating={v:d.v,at:S.now};}
   if(d.a==='pick'){ask=d.root;render();return;}

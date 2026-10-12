@@ -32,6 +32,8 @@ enum Ev {
     Click(Rect),
     Shot,
     Shot2,
+    /// Add project: the picked folder classified, or Null (cancel)
+    Added(Value),
 }
 
 /// View, text size and period of `<install>/tray.json`; anything else falls back to the default. A `custom` period
@@ -120,14 +122,18 @@ fn ai(install: &Path, a: &str, m: &Value) {
         "ai-clear" => f["history"] = json!([]),
         "ai-send" => {
             let (Some(text), Some(r)) = (m["text"].as_str().map(str::trim).filter(|t| !t.is_empty()), target(install)) else { return };
+            let onboard = m["onboard"].as_str();
             let root = Path::new(&r);
             let id = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0).to_string();
             let after = m["after"].as_str().filter(|x| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()));
             let _ = fs::create_dir_all(crate::operator::dir(root));
-            if crate::platform::write_atomic(&crate::operator::dir(root).join(format!("{id}.json")), &json!({"text": text, "after": after}).to_string()).is_err() {
+            if crate::platform::write_atomic(&crate::operator::dir(root).join(format!("{id}.json")), &json!({"text": text, "after": after, "onboard": onboard}).to_string()).is_err() {
                 return;
             }
             crate::poke(root);
+            if onboard.is_some() {
+                return;
+            }
             f = json!({"draft": "", "history": remember(f["history"].as_array().map_or(&[][..], |v| v), text)});
         }
         // only a registered project and a request id: the page never names a path of its own
@@ -247,6 +253,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
     let mut hidden_at = Instant::now() - Duration::from_secs(1);
     let mut anchor: Option<Rect> = None;
     let mut step = 0usize;
+    let mut adding = Value::Null;
     event_loop.run(move |event, target, flow| {
         *flow = ControlFlow::Wait;
         let push = |ui: &Option<(Window, WebView)>, st: &Value| {
@@ -312,7 +319,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                     return;
                 }
                 let _ = fs::write(install.join("tray"), std::process::id().to_string());
-                let st = state(&install, &settings, dark, None);
+                let st = state(&install, &settings, dark, None, &adding);
                 refresh_icon(&tray, &st, &settings, dark, &mut icon_sig);
                 let sig = st.to_string().replace(&format!("\"now\":{}", st["now"]), "");
                 if sig != shown {
@@ -341,7 +348,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                             let _ = proxy.send_event(Ev::Shot);
                             return;
                         }
-                        push(&ui, &state(&install, &settings, dark, None));
+                        push(&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     "size" => {
                         let max = w.current_monitor().map_or(800.0, |m| m.size().to_logical::<f64>(m.scale_factor()).height) * if snapshot.is_some() { 0.95 } else { 0.8 };
@@ -359,7 +366,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                     "set" => {
                         settings.set(&m);
                         settings.save(&install);
-                        let st = state(&install, &settings, dark, None);
+                        let st = state(&install, &settings, dark, None, &adding);
                         refresh_icon(&tray, &st, &settings, dark, &mut icon_sig);
                         push(&ui, &st);
                     }
@@ -371,9 +378,39 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                             push(&ui, &json!({"capmsg": {"root": root, "text": msg}}));
                         }
                     }
+                    // Add project (§ 4): the folder comes only from the OS picker, never from the page
+                    "add" => {
+                        adding = json!({"state": "picking"});
+                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        let p = proxy.clone();
+                        std::thread::spawn(move || {
+                            let v = pick().map_or(Value::Null, |d| classify(&d, selftest));
+                            let _ = p.send_event(Ev::Added(v));
+                        });
+                    }
+                    "add-cancel" => {
+                        adding = Value::Null;
+                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                    }
+                    "add-install" if adding["kind"] == "taskq" && adding["state"] == "picked" => {
+                        adding["state"] = json!("installing");
+                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        let (p, a, inst) = (proxy.clone(), adding.clone(), install.clone());
+                        std::thread::spawn(move || {
+                            let _ = p.send_event(Ev::Added(install_service(&inst, a)));
+                        });
+                    }
+                    "add-setup" if matches!(adding["kind"].as_str(), Some("new" | "plain")) => {
+                        let text = format!("Set up {} as a taskq project", adding["name"].as_str().unwrap_or("this folder"));
+                        ai(&install, "ai-send", &json!({"text": text, "onboard": adding["path"]}));
+                        adding = Value::Null;
+                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                    }
                     a if a.starts_with("ai-") => {
+                        let mut m = m.clone();
+                        m["onboard"] = Value::Null;
                         ai(&install, a, &m);
-                        push(&ui, &state(&install, &settings, dark, None));
+                        push(&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     a => {
                         // only a registered project (§ 4): the page never names a path of its own
@@ -384,13 +421,21 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                     }
                 }
             }
+            Event::UserEvent(Ev::Added(v)) => {
+                adding = v;
+                push(&ui, &state(&install, &settings, dark, None, &adding));
+                if let (Some((w, _)), false) = (&ui, adding.is_null()) {
+                    w.set_visible(true);
+                    w.set_focus();
+                }
+            }
             // snapshot mode: per step push a state, wait for layout, capture, next
             Event::UserEvent(Ev::Shot) => {
                 let dir = snapshot.clone().unwrap_or_default();
                 let steps = shots(&install);
                 if step == 0 {
                     let _ = fs::create_dir_all(&dir);
-                    let st = state(&install, &settings, dark, None);
+                    let st = state(&install, &settings, dark, None, &adding);
                     let s = summary(st["projects"].as_array().map_or(&[][..], |v| v), settings.range(now()));
                     for (theme, d) in [("dark", true), ("light", false)] {
                         for (mode, run) in [("run", true), ("pause", false)] {
@@ -406,7 +451,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 };
                 let mut s = settings.clone();
                 s.font = font;
-                push(&ui, &state(&install, &s, theme == "dark", Some((theme, &page))));
+                push(&ui, &state(&install, &s, theme == "dark", Some((theme, &page)), &Value::Null));
                 if let (Some((_, wv)), false) = (&ui, script.is_empty()) {
                     let _ = wv.evaluate_script(script);
                 }
@@ -449,14 +494,14 @@ fn shot_name(install: &Path, step: usize) -> String {
     shots(install).get(step).map_or(step.to_string(), |(t, p, f, js)| format!("{t}-{}{}-{f}", if p == "home" { "home" } else { "project" }, if js.is_empty() { "" } else { "-actions" }))
 }
 
-fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>) -> Value {
+fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>, add: &Value) -> Value {
     let ps: Vec<Value> = roots(install).iter().map(|r| project(r)).collect();
     let (start, end) = s.range(now());
     let sum = summary(&ps, (start, end));
     let url = |rgba: &Rgba| format!("data:image/png;base64,{}", base64(&png(rgba)));
     let mut st = json!({"platform": if cfg!(windows) { "windows" } else { "macos" }, "version": crate::platform::VERSION,
         "host": ps.iter().find_map(|p| p["host"].as_str()).unwrap_or("?"), "view": s.view, "font": s.font, "period": s.period,
-        "now": now(), "projects": ps, "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since}});
+        "now": now(), "projects": ps, "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "add": add, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since}});
     if cfg!(target_os = "macos") {
         st["icons"] = json!({"icon": url(&compact(sum.run, dark)), "full": url(&wide(&sum, dark))});
     }
@@ -549,6 +594,65 @@ fn act(action: &str, root: &Path, label: Option<&str>) {
         }
         _ => {}
     }
+}
+
+/// The OS folder picker; None on cancel.
+fn pick() -> Option<PathBuf> {
+    let mut c = if cfg!(windows) {
+        let mut c = std::process::Command::new("powershell");
+        c.args(["-NoProfile", "-STA", "-Command", "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Add project'; if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath }"]);
+        c
+    } else {
+        let mut c = std::process::Command::new("osascript");
+        c.args(["-e", "activate", "-e", "POSIX path of (choose folder with prompt \"Add project\")"]);
+        c
+    };
+    let o = crate::platform::quiet(&mut c).output().ok().filter(|o| o.status.success())?;
+    let p = String::from_utf8_lossy(&o.stdout).trim().trim_end_matches(['/', '\\']).to_string();
+    (!p.is_empty()).then(|| PathBuf::from(p))
+}
+
+/// `taskq selftest` in `dir`: its first error line on failure.
+fn selftest(dir: &Path) -> Result<(), String> {
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let o = crate::platform::quiet(std::process::Command::new(me).arg("selftest").current_dir(dir).env("TASKQ_ROOT", dir)).output().map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
+    if o.status.success() { Ok(()) } else { Err(text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("selftest failed").chars().take(160).collect()) }
+}
+
+/// The four Add project cases (menu.md M10): `taskq.json` with a passing `selftest` (taskq), with a failing one (old,
+/// owner's marker), else an empty folder or a Git root (new) or files without Git (plain: not a repository).
+fn classify(dir: &Path, selftest: impl Fn(&Path) -> Result<(), String>) -> Value {
+    let (kind, reason) = if dir.join("taskq.json").is_file() {
+        selftest(dir).map_or_else(|e| ("old", e), |_| ("taskq", String::new()))
+    } else if dir.join(".git").exists() || fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none()) {
+        ("new", String::new())
+    } else {
+        ("plain", String::new())
+    };
+    json!({"state": "picked", "path": dir, "name": crate::project_name(dir), "kind": kind, "reason": reason})
+}
+
+/// `service install` in the picked taskq project after the page's confirm; installed only when `<install>/projects`
+/// lists it (R12).
+fn install_service(install: &Path, mut a: Value) -> Value {
+    let dir = PathBuf::from(a["path"].as_str().unwrap_or(""));
+    let r = std::env::current_exe().map_err(|e| e.to_string()).and_then(|me| {
+        let mut c = std::process::Command::new(me);
+        c.args(["service", "install"]).current_dir(&dir).env("TASKQ_ROOT", &dir).stdin(std::process::Stdio::null());
+        // a separate process group: launchctl must not take the tray with it
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut c, 0);
+        let o = crate::platform::quiet(&mut c).output().map_err(|e| e.to_string())?;
+        let text = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
+        if !o.status.success() {
+            return Err(text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("service install failed").to_string());
+        }
+        if roots(install).iter().any(|r| Path::new(r) == dir) { Ok(()) } else { Err("installed, but this host's projects list does not show it".into()) }
+    });
+    a["state"] = json!(if r.is_ok() { "installed" } else { "install failed" });
+    a["reason"] = json!(r.err().unwrap_or_default());
+    a
 }
 
 /// Write the page's capacity edit for this host; the outcome line for the page.
@@ -905,6 +1009,24 @@ mod tests {
         let ps = [json!({"agents": {"at": 10, "rows": [row("1")]}}), json!({"agents": {"at": 20, "rows": [row("2")]}}), json!({})];
         assert_eq!(agents(&ps), json!({"at": 20, "rows": ["claude 2 · not logged in"]}));
         assert_eq!(agents(&ps[2..]), Value::Null);
+    }
+
+    #[test]
+    fn add_project_has_four_cases() {
+        let d = std::env::temp_dir().join(format!("taskq-add-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let kind = |st: &dyn Fn(&Path) -> Result<(), String>| { let v = classify(&d, st); (v["kind"].as_str().unwrap().to_string(), v["reason"].as_str().unwrap().to_string()) };
+        let pass = |_: &Path| Ok(());
+        assert_eq!(kind(&pass).0, "new", "empty folder");
+        fs::write(d.join("notes.txt"), "x").unwrap();
+        assert_eq!(kind(&pass).0, "plain", "files without Git: not a repository");
+        fs::create_dir(d.join(".git")).unwrap();
+        assert_eq!(kind(&pass).0, "new", "a Git root without taskq.json");
+        fs::write(d.join("taskq.json"), "{}").unwrap();
+        assert_eq!(kind(&pass).0, "taskq");
+        assert_eq!(kind(&|_: &Path| Err("taskq.json: repo is required".into())), ("old".into(), "taskq.json: repo is required".into()), "the verified reason");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

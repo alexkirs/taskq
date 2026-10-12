@@ -1,6 +1,7 @@
 //! AI requests (taskq.md R3 operator, § 4): the tray writes `<root>/.taskq/requests/<id>.json`, the service runs one
 //! operator child per request and writes `<id>.answer.json`; a proposal is applied only after `<id>.confirm` names
-//! its `rev`. One writer per file: the tray writes the request and the confirm, the service the answer.
+//! its `rev`. One writer per file: the tray writes the request and the confirm, the service the answer. A request
+//! with `onboard` (the tray's Add project) sets up that folder (§ 6): its only op is `setup`.
 
 use serde_json::{Value, json};
 use std::fs;
@@ -79,9 +80,13 @@ pub fn step(root: &Path, install: &Path, exe: &Path, rt: Option<&str>) {
         // only the proposal the owner saw, once: a stale or repeated confirm does nothing (M-A7)
         // ponytail: files are not signed; whoever can write them can run the same allowlisted `taskq` commands anyway
         if a["state"] == "proposal" && rev.trim().parse::<u64>().ok() == a["rev"].as_u64() {
-            answer(root, id, json!({"state": "applying", "text": a["text"], "ops": a["ops"]}));
-            let (ok, lines) = apply(install, exe, a["ops"].as_array().map_or(&[][..], |v| v));
-            answer(root, id, json!({"state": if ok { "applied" } else { "apply failed" }, "text": a["text"], "ops": a["ops"], "readback": lines}));
+            answer(root, id, json!({"state": "applying", "text": a["text"], "ops": a["ops"], "effects": a["effects"]}));
+            let ops = a["ops"].as_array().map_or(&[][..], |v| v);
+            let (ok, lines) = match onboard(root, &read(&dir(root).join(format!("{id}.json")))) {
+                Some(r) => apply_setup(install, exe, &r, ops, &a["effects"]),
+                None => apply(install, exe, ops),
+            };
+            answer(root, id, json!({"state": if ok { "applied" } else { "apply failed" }, "text": a["text"], "ops": a["ops"], "effects": a["effects"], "readback": lines}));
         }
     }
 }
@@ -94,7 +99,7 @@ fn start(root: &Path, install: &Path, id: &str, rt: Option<&str>) {
     let (root, install, id) = (root.to_path_buf(), install.to_path_buf(), id.to_string());
     std::thread::spawn(move || {
         let v = match run(&root, &install, &id, &rt) {
-            Ok(text) => parse(&text, &projects(&install)),
+            Ok(text) => parse(&text, &projects(&install), onboard(&root, &read(&dir(&root).join(format!("{id}.json")))).as_deref()),
             Err(e) => json!({"state": "failed", "reason": e}),
         };
         answer(&root, &id, v);
@@ -157,9 +162,26 @@ fn brief(root: &Path, install: &Path, req: &Value) -> String {
         let tasks: Vec<Value> = s["tasks"].as_array().into_iter().flatten().map(|t| json!([t["n"], t["title"], t["state"], t["labels"]])).collect();
         json!({"project": name, "focus": s["focus"], "saved_focus": paused.trim(), "request": s["request"], "status_age_s": crate::file_age(&crate::dot(r).join("status.json")), "error": s["error"], "tasks [n, title, state, labels]": tasks})
     }).collect();
-    let before = req["after"].as_str().filter(|a| a.bytes().all(|b| b.is_ascii_digit())).map(|a| {
-        format!("Earlier request: {}\nYour answer then: {}\n", read(&dir(root).join(format!("{a}.json")))["text"], read(&answer_path(root, a))["text"])
-    }).unwrap_or_default();
+    // the whole clarify chain, oldest first: a setup conversation takes several turns
+    let (mut before, mut r) = (String::new(), req.clone());
+    for _ in 0..KEEP {
+        let Some(a) = r["after"].as_str().filter(|a| a.bytes().all(|b| b.is_ascii_digit())).map(String::from) else { break };
+        r = read(&dir(root).join(format!("{a}.json")));
+        before = format!("Earlier request: {}\nYour answer then: {}\n{before}", r["text"], read(&answer_path(root, &a))["text"]);
+    }
+    if let Some(f) = onboard(root, req) {
+        return format!(
+            "You are the taskq operator (taskq.md R3) in a project setup (taskq.md § 6): help the owner set up the folder below as a taskq project. You have no tools: use only this data.\n\
+             Reply with exactly one JSON object and nothing else: {{\"kind\": \"clarify|proposal|refuse\", \"text\": \"...\", \"ops\": [...]}}.\n\
+             - clarify: one question at a time until you know: GitHub or GitLab and the account below, an existing repository or a new one, owner/name, visibility (a new one is private unless the owner says public), publish pr (default) or direct.\n\
+             - proposal: exactly one op {{\"op\":\"setup\",\"board\":\"github|gitlab\",\"host\":\"github.com\",\"repo\":\"owner/name\",\"create\":true|false,\"visibility\":\"private|public\",\"publish\":\"pr|direct\"}}; text names account, repository and visibility. The service lists every effect for the owner to confirm; files, uncommitted work and remotes stay.\n\
+             - refuse: it cannot be set up so (for example no account); text is the reason.\n\
+             Use English, short plain lines (taskq.md R7).\n\
+             Folder: {}\n{before}Request: {}\n",
+            serde_json::to_string_pretty(&inspect(&f)).unwrap_or_default(),
+            req["text"].as_str().unwrap_or("")
+        );
+    }
     format!(
         "You are the taskq operator (taskq.md R3): answer the owner's request about the taskq projects below. You have no tools: use only this data.\n\
          Reply with exactly one JSON object and nothing else: {{\"kind\": \"result|clarify|proposal|refuse\", \"text\": \"...\", \"ops\": [...]}}.\n\
@@ -181,7 +203,7 @@ fn brief(root: &Path, install: &Path, req: &Value) -> String {
 }
 
 /// The operator's reply as an answer: one JSON object of a known kind; a proposal only of valid ops (§ 4).
-pub fn parse(text: &str, projects: &[(String, PathBuf)]) -> Value {
+pub fn parse(text: &str, projects: &[(String, PathBuf)], onboard: Option<&Path>) -> Value {
     let v: Value = match (text.find('{'), text.rfind('}')) {
         (Some(a), Some(b)) if a < b => serde_json::from_str(&text[a..=b]).unwrap_or_default(),
         _ => Value::Null,
@@ -198,10 +220,177 @@ pub fn parse(text: &str, projects: &[(String, PathBuf)]) -> Value {
     if ops.is_empty() {
         return json!({"state": "failed", "reason": "a proposal without ops"});
     }
+    if let Some(r) = onboard {
+        return match (ops.len(), setup(&ops[0], r)) {
+            (1, Ok(s)) => json!({"state": "proposal", "text": body, "ops": ops, "effects": s.effects()}),
+            (1, Err(e)) => json!({"state": "failed", "reason": format!("refused proposal: {e}")}),
+            _ => json!({"state": "failed", "reason": "refused proposal: a setup is one setup op"}),
+        };
+    }
     if let Some(e) = ops.iter().find_map(|o| validate(o, projects).err()) {
         return json!({"state": "failed", "reason": format!("refused proposal: {e}")});
     }
     json!({"state": "proposal", "text": body, "ops": ops})
+}
+
+/// The folder an onboarding request sets up: its `onboard`, else that of the request it clarifies; only an absolute,
+/// existing folder.
+fn onboard(root: &Path, req: &Value) -> Option<PathBuf> {
+    let mut r = req.clone();
+    for _ in 0..KEEP {
+        if let Some(p) = r["onboard"].as_str() {
+            return Some(PathBuf::from(p)).filter(|p| p.is_absolute() && p.is_dir());
+        }
+        let a = r["after"].as_str().filter(|a| a.bytes().all(|b| b.is_ascii_digit()))?;
+        r = read(&dir(root).join(format!("{a}.json")));
+    }
+    None
+}
+
+/// Run a command in `dir`: its stdout, else its first error line.
+fn cmd(prog: impl AsRef<std::ffi::OsStr>, args: &[&str], dir: &Path, env: &[(&str, &str)]) -> Result<String, String> {
+    let mut c = std::process::Command::new(prog);
+    c.args(args).current_dir(dir).envs(env.iter().copied()).env_remove("TASKQ_TASK").env_remove("TASKQ_ATTEMPT").stdin(std::process::Stdio::null());
+    let o = crate::platform::quiet(&mut c).output().map_err(|e| format!("{}: {e}", args.first().unwrap_or(&"")))?;
+    let (out, err) = (String::from_utf8_lossy(&o.stdout).trim().to_string(), String::from_utf8_lossy(&o.stderr).to_string());
+    if o.status.success() { Ok(out) } else { Err(err.lines().chain(out.lines()).find(|l| !l.trim().is_empty()).unwrap_or("failed").trim().to_string()) }
+}
+
+/// The board user of the `gh`/`glab` login on `host`.
+fn account(board: &str, host: &str) -> Result<String, String> {
+    let (cli, key) = if board == "gitlab" { ("glab", "username") } else { ("gh", "login") };
+    let v: Value = serde_json::from_str(&cmd(cli, &["api", "user", "--hostname", host], &std::env::temp_dir(), &[])?).unwrap_or_default();
+    v[key].as_str().map(String::from).ok_or(format!("{cli}: no user"))
+}
+
+/// What § 6 inspects first, for the operator: entries, Git root, remotes, uncommitted files, logins.
+fn inspect(root: &Path) -> Value {
+    let mut names: Vec<String> = fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    let git = root.join(".git").exists();
+    let g = |a: &[&str]| if git { cmd("git", a, root, &[]).unwrap_or_default() } else { String::new() };
+    let login = |b: &str, h: &str| account(b, h).unwrap_or_else(|e| format!("unknown: {e}"));
+    json!({"path": root, "entries_total": names.len(), "entries (first 40)": names.iter().take(40).collect::<Vec<_>>(), "git_root": git,
+        "remotes": g(&["remote", "-v"]), "uncommitted_files": g(&["status", "--porcelain"]).lines().count(), "taskq_json": root.join("taskq.json").exists(),
+        "accounts": {"github.com (gh)": login("github", "github.com"), "gitlab.com (glab)": login("gitlab", "gitlab.com")}})
+}
+
+/// A checked `setup` op (§ 4 Add project).
+#[derive(Debug, PartialEq)]
+pub struct Setup {
+    root: PathBuf,
+    board: String,
+    host: String,
+    repo: String,
+    create: bool,
+    private: bool,
+    publish: String,
+}
+
+/// The setup allowlist: known words, a plain host and `owner/name`; never over an existing `taskq.json`.
+pub fn setup(o: &Value, root: &Path) -> Result<Setup, String> {
+    if o["op"] != "setup" {
+        return Err(format!("op {} is not allowed in a setup", o["op"]));
+    }
+    if root.join("taskq.json").exists() {
+        return Err("taskq.json exists: a setup never overwrites it".into());
+    }
+    let word = |k: &str, ok: &[&str]| match o[k].as_str().unwrap_or(ok[0]) {
+        v if ok.contains(&v) => Ok(v.to_string()),
+        _ => Err(format!("{k}: one of {}", ok.join(", "))),
+    };
+    let plain = |v: &str, more: &str| !v.is_empty() && !v.starts_with(['-', '.', '/']) && v.chars().all(|c| c.is_ascii_alphanumeric() || "-._".contains(c) || more.contains(c));
+    let board = word("board", &["github", "gitlab"])?;
+    let host = o["host"].as_str().unwrap_or(if board == "gitlab" { "gitlab.com" } else { "github.com" }).to_string();
+    let repo = o["repo"].as_str().unwrap_or("").to_string();
+    if !plain(&host, "") {
+        return Err("host: a plain host name".into());
+    }
+    if !plain(&repo, "/") || !repo.contains('/') || repo.split('/').any(|p| p.is_empty() || p == "..") {
+        return Err("repo: owner/name".into());
+    }
+    let private = word("visibility", &["private", "public"])? == "private";
+    Ok(Setup { root: root.into(), board, host, repo, create: o["create"] == true, private, publish: word("publish", &["pr", "direct"])? })
+}
+
+impl Setup {
+    fn git(&self) -> bool {
+        self.root.join(".git").exists()
+    }
+
+    fn origin(&self) -> bool {
+        self.git() && cmd("git", &["remote", "get-url", "origin"], &self.root, &[]).is_ok()
+    }
+
+    /// Every effect in the order `apply_setup` makes it: the owner confirms this exact list (§ 6).
+    pub fn effects(&self) -> Vec<String> {
+        let mut v = vec![];
+        if !self.git() {
+            v.push(format!("Run git init in {}", self.root.display()));
+        }
+        v.push(if self.create {
+            let who = account(&self.board, &self.host).unwrap_or_else(|e| format!("unknown account ({e})"));
+            format!("Create {} repository {}/{} as {who}", if self.private { "PRIVATE" } else { "PUBLIC" }, self.host, self.repo)
+        } else {
+            format!("Use existing repository {}/{}", self.host, self.repo)
+        });
+        if !self.origin() {
+            v.push(format!("Add git remote origin https://{}/{}.git", self.host, self.repo));
+        }
+        v.push(format!("Write taskq.json: board {}, repo {}, publish {}", self.board, self.repo, self.publish));
+        v.push(format!("Create the taskq labels on {}", self.repo));
+        v.push(format!("Register {} on this host and install its service (starts at logon)", crate::project_name(&self.root)));
+        v
+    }
+}
+
+/// Apply the confirmed setup step by step, stopping at the first failure; `applied` only when `selftest` passes there
+/// and `<install>/projects` lists the folder (R12).
+fn apply_setup(install: &Path, exe: &Path, root: &Path, ops: &[Value], shown: &Value) -> (bool, Vec<String>) {
+    let mut lines = vec![];
+    let r = (|| -> Result<(), String> {
+        let s = setup(ops.first().unwrap_or(&Value::Null), root)?;
+        // only the effects the owner confirmed: a folder changed since needs a new proposal
+        if json!(s.effects()) != *shown {
+            return Err("the effects changed since the proposal; send the request again".into());
+        }
+        if !s.git() {
+            cmd("git", &["init", "-q"], root, &[])?;
+            lines.push("git init: ok".to_string());
+        }
+        if s.create {
+            let (cli, env) = if s.board == "gitlab" { ("glab", "GITLAB_HOST") } else { ("gh", "GH_HOST") };
+            cmd(cli, &["repo", "create", &s.repo, if s.private { "--private" } else { "--public" }], root, &[(env, &s.host)])?;
+            lines.push(format!("created {}/{}", s.host, s.repo));
+        }
+        if !s.origin() {
+            cmd("git", &["remote", "add", "origin", &format!("https://{}/{}.git", s.host, s.repo)], root, &[])?;
+            lines.push("origin: added".into());
+        }
+        let mut c = json!({"board": s.board, "repo": s.repo, "publish": s.publish});
+        if s.board == "gitlab" {
+            c["host"] = json!(s.host);
+        }
+        if root.join("taskq.json").exists() {
+            return Err("taskq.json appeared meanwhile: nothing overwritten".into());
+        }
+        crate::platform::write_atomic(&root.join("taskq.json"), &(serde_json::to_string_pretty(&c).unwrap_or_default() + "\n"))?;
+        lines.push("taskq.json: written".into());
+        let r = root.to_string_lossy();
+        for a in [&["labels"][..], &["service", "install"], &["selftest"]] {
+            cmd(exe, a, root, &[("TASKQ_ROOT", &r)]).map_err(|e| format!("taskq {}: {e}", a.join(" ")))?;
+            lines.push(format!("taskq {}: ok", a.join(" ")));
+        }
+        if !projects(install).iter().any(|(_, p)| p == root) {
+            return Err("this host's projects list does not show it".into());
+        }
+        lines.push("registered: read back".into());
+        Ok(())
+    })();
+    if let Err(e) = &r {
+        lines.push(format!("failed: {e}"));
+    }
+    (r.is_ok(), lines)
 }
 
 /// What an op does and how its readback is checked.
@@ -331,12 +520,50 @@ mod tests {
     #[test]
     fn replies_become_answers_and_bad_proposals_fail() {
         let ps = vec![("a".to_string(), PathBuf::from("/a"))];
-        assert_eq!(parse("Sure:\n{\"kind\": \"result\", \"text\": \"2 in work\"}", &ps), json!({"state": "result", "text": "2 in work"}));
-        assert_eq!(parse("no json", &ps)["state"], "failed");
-        assert_eq!(parse("{\"kind\": \"done\"}", &ps)["state"], "failed");
-        assert_eq!(parse("{\"kind\": \"proposal\", \"text\": \"x\", \"ops\": []}", &ps)["state"], "failed");
-        assert_eq!(parse("{\"kind\": \"proposal\", \"text\": \"x\", \"ops\": [{\"op\": \"close\", \"project\": \"a\", \"task\": 1}]}", &ps)["state"], "failed");
-        assert_eq!(parse("{\"kind\": \"proposal\", \"text\": \"Pause a\", \"ops\": [{\"op\": \"pause\", \"project\": \"a\"}]}", &ps)["state"], "proposal");
+        assert_eq!(parse("Sure:\n{\"kind\": \"result\", \"text\": \"2 in work\"}", &ps, None), json!({"state": "result", "text": "2 in work"}));
+        assert_eq!(parse("no json", &ps, None)["state"], "failed");
+        assert_eq!(parse("{\"kind\": \"done\"}", &ps, None)["state"], "failed");
+        assert_eq!(parse("{\"kind\": \"proposal\", \"text\": \"x\", \"ops\": []}", &ps, None)["state"], "failed");
+        assert_eq!(parse("{\"kind\": \"proposal\", \"text\": \"x\", \"ops\": [{\"op\": \"close\", \"project\": \"a\", \"task\": 1}]}", &ps, None)["state"], "failed");
+        assert_eq!(parse("{\"kind\": \"proposal\", \"text\": \"Pause a\", \"ops\": [{\"op\": \"pause\", \"project\": \"a\"}]}", &ps, None)["state"], "proposal");
+    }
+
+    #[test]
+    fn a_setup_lists_every_effect_and_never_overwrites() {
+        let root = temp("setup");
+        let ok = |o: Value| setup(&o, &root);
+        let s = ok(json!({"op": "setup", "repo": "o/n"})).unwrap();
+        assert!(s.private && !s.create && (s.board.as_str(), s.host.as_str(), s.publish.as_str()) == ("github", "github.com", "pr"), "new repositories default to private");
+        for bad in [json!({"op": "pause", "project": "a"}), json!({"op": "setup", "repo": "n"}), json!({"op": "setup", "repo": "-o/n"}), json!({"op": "setup", "repo": "o/../n"}),
+            json!({"op": "setup", "repo": "o/n", "visibility": "open"}), json!({"op": "setup", "repo": "o/n", "host": "a b"}), json!({"op": "setup", "repo": "o/n", "board": "jira"})] {
+            assert!(ok(bad.clone()).is_err(), "{bad}");
+        }
+        let p = parse(r#"{"kind": "proposal", "text": "x", "ops": [{"op": "setup", "repo": "o/n", "publish": "direct"}]}"#, &[], Some(&root));
+        assert_eq!(p["state"], "proposal");
+        let e: Vec<&str> = p["effects"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(e[0].starts_with("Run git init in ") && e[1] == "Use existing repository github.com/o/n" && e[2] == "Add git remote origin https://github.com/o/n.git", "{e:?}");
+        assert_eq!(&e[3..5], ["Write taskq.json: board github, repo o/n, publish direct", "Create the taskq labels on o/n"]);
+        assert!(e[5].starts_with("Register ") && e.len() == 6);
+        let two = r#"{"kind": "proposal", "text": "x", "ops": [{"op": "setup", "repo": "o/n"}, {"op": "setup", "repo": "o/m"}]}"#;
+        assert_eq!(parse(two, &[], Some(&root))["state"], "failed", "one setup op only");
+        assert_eq!(parse(r#"{"kind": "proposal", "text": "x", "ops": [{"op": "pause", "project": "a"}]}"#, &[("a".into(), "/a".into())], Some(&root))["state"], "failed");
+        // a clarify reply inherits the folder; an existing taskq.json is never overwritten
+        fs::create_dir_all(dir(&root)).unwrap();
+        fs::write(dir(&root).join("1.json"), json!({"text": "set up", "onboard": root}).to_string()).unwrap();
+        assert_eq!(onboard(&root, &json!({"text": "GitHub", "after": "1"})), Some(root.clone()));
+        assert_eq!(onboard(&root, &json!({"text": "x"})), None);
+        assert_eq!(onboard(&root, &json!({"onboard": "relative/dir"})), None, "only an absolute, existing folder");
+        let shown = json!(setup(&json!({"op": "setup", "repo": "o/n"}), &root).unwrap().effects());
+        fs::create_dir(root.join(".git")).unwrap();
+        let (applied, lines) = apply_setup(&root, Path::new("/nonexistent"), &root, &[json!({"op": "setup", "repo": "o/n"})], &shown);
+        assert!(!applied && lines[0].contains("effects changed"), "{lines:?}");
+        fs::remove_dir(root.join(".git")).unwrap();
+        fs::write(root.join("taskq.json"), "{}").unwrap();
+        assert!(ok(json!({"op": "setup", "repo": "o/n"})).is_err());
+        let (applied, lines) = apply_setup(&root, Path::new("/nonexistent"), &root, &[json!({"op": "setup", "repo": "o/n"})], &Value::Null);
+        assert!(!applied && lines.len() == 1 && !root.join(".git").exists(), "{lines:?}");
+        assert_eq!(fs::read_to_string(root.join("taskq.json")).unwrap(), "{}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

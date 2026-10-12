@@ -39,6 +39,9 @@ button[aria-pressed=true]{background:light-dark(#dce7e1,#354a40);border-color:va
 .views img{height:18px}
 button:disabled{color:var(--muted);opacity:.75}
 .alert{color:var(--failed)}
+.askai{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px;padding:4px}
+.askai textarea{font:inherit;color:inherit;background:none;border:1px solid var(--edge);border-radius:4px;padding:5px;resize:vertical;min-width:0;-webkit-user-select:text;user-select:text}
+.askai button{align-self:start;min-width:34px}
 .bars{display:flex;align-items:flex-end;gap:2px;height:28px;padding:0 4px}
 .bars span{flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%}
 .bars i{display:block}.bars i.k0{background:var(--work)}.bars i.k1{background:var(--failed)}.bars i.k2{background:var(--ask)}.bars i.k3{background:var(--ready)}
@@ -59,6 +62,7 @@ const zone=Intl.DateTimeFormat().resolvedOptions().timeZone;
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const send=m=>window.ipc&&window.ipc.postMessage(JSON.stringify(m));
 const menu=document.querySelector('.menu');
+let aiText=null,aiMenu=false,aiConfirm=null;
 let S=null,page='home',homeScroll=0,ask=null,pending={},confirming=null,updating=null,draft=null,capedit=null,capmsg={};
 // one task per board and issue: `issues` names provider, host and repo (M2)
 function tasks(p){return p.tasks.map(t=>({...t,project:p.name,key:p.issues+'/'+t.n,url:p.issues+'/'+t.n}));}
@@ -110,6 +114,25 @@ function update(){
   if(updating&&S.projects.some(p=>p.version===updating.v))return '<div class="row meta">Updated to '+esc(updating.v)+': read from status.json</div>';
   if(updating&&S.now-updating.at<300)return '<button class="project" disabled>Updating to '+esc(updating.v)+'…</button>';
   return (updating?'<div class="row alert">Update to '+esc(updating.v)+' not confirmed: see the log</div>':'')+(up?'<button class="project" data-a="update" data-root="'+esc(up.root)+'" data-v="'+esc(up.update)+'">Update now to '+esc(up.update)+'</button>':'');}
+// AI requests (menu.md M7): one input, `↶` history and commands, the newest request with its answer
+const aiStates={queued:'Queued',running:'Working…',clarify:'Needs your answer',proposal:'Needs your confirmation',applying:'Applying…',applied:'Applied: read back',result:'Done',refuse:'Refused',failed:'AI request not done','apply failed':'Not applied'};
+const aiCommands=['What needs my answer?','What is running now?','Why is nothing starting?','Pause all projects'];
+// every value the command gets is shown before confirm
+function opText(o){return [o.project+':',o.op,o.task?'#'+o.task:'',(o.labels||[]).join(' '),o.title?'"'+o.title+'"':'',o.goal?'goal: '+o.goal:'',(o.acceptance||[]).map(x=>'acceptance: '+x).join('; '),o.request?'request: '+o.request:'',o.option?'option '+o.option:'',o.text||''].filter(Boolean).join(' ');}
+function ai(){
+  const A=S.ai,r=A.request,an=r&&r.answer||{},st=r?(an.state||'queued'):null,bad=['failed','refuse','apply failed'].includes(st);
+  let h='<div class="group"><div class="row meta">✦ Ask AI · '+(A.target?'projects: '+esc(S.projects.map(p=>p.name).join(', ')):'no running service: cannot send')+'</div>';
+  h+='<div class="askai"><textarea id="ai" rows="2" aria-label="Request to AI" placeholder="Ask, or request a change">'+esc(aiText)+'</textarea><button data-a="ai-menu" aria-label="History and commands" title="History and commands" aria-expanded="'+aiMenu+'">↶</button></div>';
+  if(aiMenu)h+='<div class="row meta">Recent</div>'+(A.history.length?A.history.map(t=>'<button class="project" data-a="ai-pick" data-v="'+esc(t)+'"><span>'+esc(t)+'</span></button>').join('')+'<button class="project" data-a="ai-clear">Clear history</button>':'<div class="body meta">No sent requests</div>')+
+    '<div class="row meta">Commands</div>'+aiCommands.map(t=>'<button class="project" data-a="ai-pick" data-v="'+esc(t)+'"><span>'+esc(t)+'</span></button>').join('');
+  h+='<button class="project" data-a="ai-send"'+(A.target?'':' disabled')+'>'+(st==='clarify'?'Reply':'Send')+'</button>';
+  if(!r)return h+'</div>';
+  h+='<div class="body"><div class="meta">You asked: '+esc(r.text||'')+'</div><div class="'+(bad?'alert':st==='applied'||st==='result'?'work':'ask')+'" role="status">'+esc(aiStates[st]||st)+(an.reason?': '+esc(an.reason):'')+'</div>'+(an.text?'<div>'+esc(an.text).replace(/\n/g,'<br>')+'</div>':'')+'</div>';
+  if(an.ops)h+='<div class="body meta">'+an.ops.map(o=>esc(opText(o))).join('<br>')+'</div>';
+  if(an.readback)h+='<div class="body meta">'+an.readback.map(esc).join('<br>')+'</div>';
+  if(st==='proposal')h+='<button class="project" data-a="ai-confirm" data-root="'+esc(r.root)+'" data-id="'+esc(r.id)+'" data-rev="'+Number(an.rev)+'"'+(aiConfirm===r.id+'/'+Number(an.rev)?' disabled':'')+'>Confirm: apply '+Number(an.ops.length)+' change'+(an.ops.length===1?'':'s')+'</button>';
+  if(bad)h+='<button class="project" data-a="ai-pick" data-v="'+esc(r.text||'')+'">Edit and send again</button>';
+  return h+'</div>';}
 // the command over all projects names each one and its effect before acting (M5, M-A4)
 function bulk(run,held){
   const pausing=run.length>0,state=p=>({run:pausing?'pause':'admitting, unchanged',paused:pausing?'paused, unchanged':'resume',watch:'observation, unchanged'}[mode(p)]);
@@ -119,6 +142,7 @@ function home(){
   const all=S.projects.flatMap(tasks),c=counts(all),run=S.projects.filter(p=>mode(p)==='run'),held=S.projects.filter(p=>mode(p)==='paused');
   let h='';
   if(S.platform==='macos')h+='<div class="options views">'+[['icon','Icon'],['full','Summary']].map(([v,l])=>'<button data-set="view" data-v="'+v+'" aria-pressed="'+(S.view===v)+'"><img alt="" src="'+S.icons[v]+'">'+l+'</button>').join('')+'</div>';
+  h+=ai();
   h+='<details><summary>↳ Scope <span class="meta">'+S.projects.length+' project'+(S.projects.length===1?'':'s')+' · in work '+c.work+' · ask '+c.ask+' · ready '+c.ready+'</span></summary><div class="body">'+S.projects.map(p=>'<div><strong>'+esc(p.name)+'</strong> <span class="meta">'+esc(modeText(p))+'</span></div><div class="meta">You asked: '+esc(p.request||'not recorded')+'</div>').join('')+'</div></details>';
   h+=S.projects.map(problem).join('');
   h+=globalGroup('ask',unique(all))+globalGroup('failed',unique(all));
@@ -198,10 +222,11 @@ window.taskq={receive(s){
   if(s.capmsg){capmsg[s.capmsg.root]=s.capmsg.text;render();return;}
   for(const p of s.projects){const was=S&&S.projects.find(q=>q.root===p.root);if(pending[p.root]&&was&&mode(was)!==mode(p))delete pending[p.root];}
   S=s;
+  if(aiText===null)aiText=s.ai.draft||'';
   // snapshot mode names the page
   if(s.page!==undefined){page=s.page;pending={};}
   // a tick does not take the caret out of the range fields
-  if(document.activeElement&&(document.activeElement.dataset.draft||document.activeElement.dataset.cap))return;
+  if(document.activeElement&&(document.activeElement.dataset.draft||document.activeElement.dataset.cap||document.activeElement.id==='ai'))return;
   render();
 },model:{unique,counts,mode,gateText,capChanges,capCheck,capSet}};
 menu.addEventListener('click',e=>{
@@ -216,6 +241,12 @@ menu.addEventListener('click',e=>{
     draft.error=!(a<z)?'Refused: start must be before end.':'';
     if(!draft.error){S.period='custom';send({a:'set',period:'custom',start:a,end:z,tz:draft.tz});draft=null;}
     render();return;}
+  if(d.a==='ai-menu'){aiMenu=!aiMenu;render();return;}
+  // picking fills the input, never sends (M-A13)
+  if(d.a==='ai-pick'){aiText=d.v;aiMenu=false;send({a:'ai-draft',text:aiText});render();const t=document.getElementById('ai');t.focus();t.setSelectionRange(t.value.length,t.value.length);return;}
+  if(d.a==='ai-send'){const r=S.ai.request,an=r&&r.answer||{};if(!aiText.trim())return;send({a:'ai-send',text:aiText,after:an.state==='clarify'?r.id:''});aiText='';render();return;}
+  if(d.a==='ai-confirm'){aiConfirm=d.id+'/'+d.rev;send({a:'ai-confirm',root:d.root,id:d.id,rev:Number(d.rev)});render();return;}
+  if(d.a==='ai-clear'){send({a:'ai-clear'});return;}
   if(d.a==='confirm'||d.a==='cancel'){confirming=d.a==='confirm';render();return;}
   if(d.a==='update'){updating={v:d.v,at:S.now};}
   if(d.a==='pick'){ask=d.root;render();return;}
@@ -227,8 +258,8 @@ menu.addEventListener('click',e=>{
   if(d.a==='pause-all'||d.a==='resume-all'){confirming=null;for(const p of S.projects.filter(p=>mode(p)===(d.a==='pause-all'?'run':'paused'))){pending[p.root]=d.a==='pause-all'?'Pausing':'Resuming';send({a:d.a.slice(0,-4),root:p.root});}render();return;}
   if(d.a==='pause'||d.a==='resume'||d.a==='focus'){pending[d.root]=d.a==='pause'?'Pausing':'Resuming';ask=null;}
   if(d.a)send({a:d.a,root:d.root,label:d.label});render();});
-menu.addEventListener('input',e=>{const k=e.target.dataset.draft,c=e.target.dataset.cap;if(k&&draft)draft[k]=e.target.value;if(c&&capedit)capedit[c]=e.target.type==='checkbox'?e.target.checked:e.target.value;});
-menu.addEventListener('focusout',e=>{const f=x=>x&&x.dataset&&(x.dataset.draft||x.dataset.cap);if(f(e.target))setTimeout(()=>{if(!f(document.activeElement))render();});});
+menu.addEventListener('input',e=>{if(e.target.id==='ai'){aiText=e.target.value;send({a:'ai-draft',text:aiText});return;}const k=e.target.dataset.draft,c=e.target.dataset.cap;if(k&&draft)draft[k]=e.target.value;if(c&&capedit)capedit[c]=e.target.type==='checkbox'?e.target.checked:e.target.value;});
+menu.addEventListener('focusout',e=>{const f=x=>x&&(x.id==='ai'||x.dataset&&(x.dataset.draft||x.dataset.cap));if(f(e.target))setTimeout(()=>{if(!f(document.activeElement))render();});});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')send({a:'hide'});});
 send({a:'ready'});
 })();

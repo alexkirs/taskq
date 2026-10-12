@@ -98,7 +98,7 @@ Owner decisions on looks and sound, one line each. Change one only per R13.
 - Last README line: `If taskq saves you time, [buy me a coffee](…).`
 - Tone: minimum words, plain to anyone, no filler (R7).
 - Operator UI: [density specification](docs/design/operator-ui.md) and [menu specification](docs/design/menu.md) govern the approved design target.
-- These UI targets are not shipped behavior: § 4 remains the runtime contract until their implementation and verification (R8, R12, R13).
+- [Board specification](docs/design/board.md) governs the approved label names and attention-only palette; design targets do not change shipped behavior until implemented and verified (R8, R12, R13).
 ## 1. Tasks
 A task is an open issue by a trusted author (GitHub `OWNER|MEMBER|COLLABORATOR`, GitLab Reporter+) labelled `taskq`
 (`taskq add` sets it; on the board a person adds it). Any other issue never starts: a PM makes a task from it with

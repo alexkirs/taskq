@@ -7,6 +7,7 @@ Phase 0 decisions are recorded in [menu.md](menu.md), [operator-ui.md](operator-
 |---|---|
 | [Contract](../../taskq.md) | Product rules; takes priority on conflict |
 | [Principles](operator-ui.md) | Density, alignment, readability, accessibility; D criteria |
+| [Board specification](board.md) | Approved labels, naming, attention-only palette, default adoption; B criteria |
 | [Menu specification](menu.md) | Behavior, host scope, AI, maintenance, Add project; M criteria |
 | [Menu prototype](menu-prototype.html) | Product HTML structure and fixture interactions; state/action bridge target |
 | [Icon studies](icon-studies.html) | Selected unified strip geometry, themes, active/pause states, 22 pt macOS study |

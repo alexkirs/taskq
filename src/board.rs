@@ -31,6 +31,11 @@ pub struct Comment {
 }
 
 pub trait Board {
+    fn canonical_labels(&self) -> Result<bool> { Ok(true) }
+    fn state_label(&self, state: &str) -> Result<String> {
+        Ok(format!("q-{}", if state == "waiting" && self.canonical_labels()? { "blocked" } else { state }))
+    }
+    fn ensure_labels(&self, _names: &[String]) -> Result<()> { Ok(()) }
     /// Open issues; with `since` (board seconds) every issue, closed too, updated at or after it.
     fn issues(&self, since: Option<i64>) -> Result<Vec<Issue>>;
     fn issue(&self, n: u64) -> Result<Issue>;
@@ -185,6 +190,9 @@ pub struct Http {
     me: RefCell<Option<String>>,
     clock: RefCell<i64>,
     members: RefCell<Vec<(u64, bool)>>,
+    label_schema: RefCell<Option<bool>>,
+    #[cfg(test)]
+    transport: Option<Box<dyn Fn(&str, &str, Option<Value>) -> Result<Reply>>>,
 }
 
 fn s(v: &Value, k: &str) -> String {
@@ -199,6 +207,22 @@ fn trusted(v: &Value) -> bool {
     matches!(v["author_association"].as_str(), Some("OWNER" | "MEMBER" | "COLLABORATOR"))
 }
 
+fn verify_assignment(board: &dyn Board, n: u64, add: &[String], remove: &[String]) -> Result<()> {
+    let issue = board.issue(n)?;
+    if add.iter().any(|l| !issue.labels.contains(l)) || remove.iter().any(|l| issue.labels.contains(l)) {
+        return Err(format!("#{n}: label assignment readback differs; issue may already exist/changes may be partial; inspect before retry"));
+    }
+    Ok(())
+}
+
+fn encode(s: &str) -> String {
+    s.bytes().map(|c| if c.is_ascii_alphanumeric() || b"-_.~".contains(&c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect()
+}
+
+fn label_matches(v: &Value, name: &str, color: &str, description: &str) -> bool {
+    v["name"] == name && s(v, "color").trim_start_matches('#').eq_ignore_ascii_case(color) && v["description"] == description
+}
+
 fn csv(v: &[String]) -> String {
     v.join(",")
 }
@@ -211,7 +235,15 @@ impl Http {
             Kind::GitHub => (format!("https://{host}/api/v3/repos/{repo}"), format!("Authorization: Bearer {token}")),
             Kind::GitLab => (format!("https://{host}/api/v4/projects/{}", repo.replace('/', "%2F")), format!("PRIVATE-TOKEN: {token}")),
         };
-        Http { kind, api, auth, me: RefCell::new(None), clock: RefCell::new(0), members: RefCell::new(vec![]) }
+        Http { kind, api, auth, me: RefCell::new(None), clock: RefCell::new(0), members: RefCell::new(vec![]), label_schema: RefCell::new(None), #[cfg(test)] transport: None }
+    }
+
+    pub fn set_label_schema(&mut self, schema: Option<&str>) -> Result<()> {
+        *self.label_schema.borrow_mut() = match schema {
+            None => None, Some("canonical") => Some(true), Some("legacy") => Some(false),
+            Some(s) => return Err(format!("unknown label_schema {s}; expected canonical|legacy")),
+        };
+        Ok(())
     }
 
     fn call(&self, method: &str, url: &str, body: Option<Value>) -> Result<Reply> {
@@ -220,6 +252,8 @@ impl Http {
         if !url.starts_with(&format!("{}/", self.root())) {
             return Err(format!("refused: {url} is outside the board API"));
         }
+        #[cfg(test)]
+        if let Some(transport) = &self.transport { return transport(method, &url, body); }
         let r = curl(method, &url, &self.auth, body.as_ref())?;
         if let Some(t) = r.header("date").and_then(http_date) {
             *self.clock.borrow_mut() = t;
@@ -357,6 +391,43 @@ impl Http {
 }
 
 impl Board for Http {
+    fn canonical_labels(&self) -> Result<bool> {
+        if let Some(c) = *self.label_schema.borrow() { return Ok(c); }
+        let all = self.all("/labels?per_page=100")?;
+        let canonical = !all.iter().any(|v| matches!(v["name"].as_str(), Some("q-waiting" | "priority-1" | "priority-2")));
+        *self.label_schema.borrow_mut() = Some(canonical);
+        Ok(canonical)
+    }
+
+    fn ensure_labels(&self, names: &[String]) -> Result<()> {
+        if !self.canonical_labels()? { return Err("legacy board: catalog adoption requires all-host gate and label_schema=canonical".into()); }
+        let all = self.all("/labels?per_page=100")?;
+        let gl = self.kind == Kind::GitLab;
+        let mut seen = std::collections::HashSet::new();
+        for name in names {
+            if !seen.insert(name) { continue; }
+            let Some((color, description)) = crate::labels::definition(name) else { continue };
+            let current = all.iter().find(|v| v["name"] == name.as_str());
+            if current.is_some_and(|v| label_matches(v, name, color, &description)) { continue; }
+            let payload = json!({"name": name, "color": if gl { format!("#{color}") } else { color.into() }, "description": description});
+            let path = if let Some(v) = current {
+                if gl { format!("/labels/{}", v["id"].as_u64().ok_or("label has no id")?) }
+                else { format!("/labels/{}", encode(name)) }
+            } else { "/labels".into() };
+            let method = if current.is_none() { "POST" } else if gl { "PUT" } else { "PATCH" };
+            self.call(method, &path, Some(payload)).map_err(|e| format!("label {name} not verified; retry catalog: {e}"))?;
+        }
+        let readback = self.all("/labels?per_page=100")?;
+        for name in names {
+            if let Some((color, desc)) = crate::labels::definition(name) {
+                if !readback.iter().any(|v| label_matches(v, name, color, &desc)) {
+                    return Err(format!("label {name}: readback differs; retry catalog"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn issues(&self, since: Option<i64>) -> Result<Vec<Issue>> {
         let gl = self.kind == Kind::GitLab;
         let state = match (since, gl) { (Some(_), true) => "all", (Some(_), false) => "all", (None, true) => "opened", (None, false) => "open" };
@@ -396,9 +467,10 @@ impl Board for Http {
     }
 
     fn labels(&self, n: u64, add: &[String], remove: &[String]) -> Result<()> {
+        if !add.is_empty() && self.canonical_labels()? { self.ensure_labels(add)?; }
         if self.kind == Kind::GitLab {
             self.call("PUT", &format!("/issues/{n}"), Some(json!({ "add_labels": csv(add), "remove_labels": csv(remove) })))?;
-            return Ok(());
+            return verify_assignment(self, n, add, remove);
         }
         if !add.is_empty() {
             self.call("POST", &format!("/issues/{n}/labels"), Some(json!({ "labels": add })))?;
@@ -413,13 +485,20 @@ impl Board for Http {
                 }
             }
         }
-        Ok(())
+        verify_assignment(self, n, add, remove)
     }
 
     fn create(&self, title: &str, body: &str, labels: &[String]) -> Result<u64> {
+        if self.canonical_labels()? {
+            let mut names = crate::labels::FIXED.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            names.extend_from_slice(labels);
+            self.ensure_labels(&names)?;
+        }
         let gl = self.kind == Kind::GitLab;
         let v = if gl { json!({ "title": title, "description": body, "labels": csv(labels) }) } else { json!({ "title": title, "body": body, "labels": labels }) };
-        self.call("POST", "/issues", Some(v))?.json()?[if gl { "iid" } else { "number" }].as_u64().ok_or("no issue number".into())
+        let n = self.call("POST", "/issues", Some(v))?.json()?[if gl { "iid" } else { "number" }].as_u64().ok_or("no issue number")?;
+        verify_assignment(self, n, labels, &[])?;
+        Ok(n)
     }
 
     fn edit(&self, n: u64, body: &str) -> Result<()> {
@@ -605,6 +684,125 @@ impl Board for Fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn label_board(kind: Kind, fail: bool, mismatch: bool) -> (Http, std::rc::Rc<RefCell<Vec<Value>>>, std::rc::Rc<RefCell<usize>>) {
+        let catalog = std::rc::Rc::new(RefCell::new(vec![json!({"id": 99, "name": "bug", "color": "FF0000", "description": "user owned"})]));
+        let writes = std::rc::Rc::new(RefCell::new(0));
+        let (data, count) = (catalog.clone(), writes.clone());
+        let mut h = Http::new(kind, if kind == Kind::GitHub { "github.com" } else { "gitlab.example" }, "o/r", "test");
+        h.transport = Some(Box::new(move |method, url, body| {
+            assert!(url.contains("/labels"));
+            if method == "GET" { return Ok(Reply { headers: vec![], body: json!(*data.borrow()).to_string() }); }
+            assert!(matches!(method, "POST" | "PATCH" | "PUT"));
+            if method == "POST" { assert!(url.ends_with("/labels")); }
+            else if kind == Kind::GitLab { assert_eq!(method, "PUT"); assert!(url.rsplit('/').next().unwrap().parse::<u64>().is_ok()); }
+            else { assert_eq!(method, "PATCH"); }
+            assert_eq!(body.as_ref().unwrap()["color"].as_str().unwrap().starts_with('#'), kind == Kind::GitLab);
+            *count.borrow_mut() += 1;
+            if fail && *count.borrow() == 2 { return Err("HTTP 403 denied".into()); }
+            let mut v = body.unwrap();
+            if mismatch { v["color"] = json!("000000"); }
+            let mut all = data.borrow_mut();
+            if let Some(old) = all.iter_mut().find(|old| old["name"] == v["name"]) {
+                v["id"] = old["id"].clone(); *old = v;
+            } else { v["id"] = json!(all.len() + 100); all.push(v); }
+            Ok(Reply { headers: vec![], body: "{}".into() })
+        }));
+        (h, catalog, writes)
+    }
+
+    #[test]
+    fn label_adapters_readback_idempotence_and_preservation() {
+        for kind in [Kind::GitHub, Kind::GitLab] {
+            let (h, catalog, writes) = label_board(kind, false, false);
+            let mut names = crate::labels::FIXED.iter().chain(["host-win", "needs-gpu", "area-ui"].iter()).map(|s| s.to_string()).collect::<Vec<_>>();
+            names.push("taskq".into());
+            h.ensure_labels(&names).unwrap();
+            assert_eq!(*writes.borrow(), names.len() - 1);
+            h.ensure_labels(&names).unwrap();
+            assert_eq!(*writes.borrow(), names.len() - 1, "repeat makes no writes");
+            assert_eq!(catalog.borrow()[0]["description"], "user owned");
+            let i = catalog.borrow().iter().position(|v| v["name"] == "q-ask").unwrap();
+            catalog.borrow_mut()[i]["color"] = json!("000000");
+            h.ensure_labels(&names).unwrap();
+            assert_eq!(*writes.borrow(), names.len(), "repairs existing metadata");
+        }
+    }
+
+    #[test]
+    fn label_adapter_failures_and_legacy_gate() {
+        for kind in [Kind::GitHub, Kind::GitLab] {
+            let names = vec!["q-doing".into(), "q-ask".into()];
+            let (h, _, writes) = label_board(kind, true, false);
+            assert!(h.ensure_labels(&names).unwrap_err().contains("403"));
+            h.ensure_labels(&names).unwrap();
+            assert_eq!(*writes.borrow(), 3, "safe retry only writes missing label");
+            let (h, _, _) = label_board(kind, false, true);
+            assert!(h.ensure_labels(&names).unwrap_err().contains("readback differs"));
+            let (h, catalog, writes) = label_board(kind, false, false);
+            catalog.borrow_mut().push(json!({"name":"q-waiting"}));
+            assert!(!h.canonical_labels().unwrap());
+            assert_eq!(h.state_label("waiting").unwrap(), "q-waiting");
+            assert!(h.ensure_labels(&names).unwrap_err().contains("all-host gate"));
+            assert_eq!(*writes.borrow(), 0);
+            let (mut h, _, _) = label_board(kind, false, false);
+            h.set_label_schema(Some("canonical")).unwrap();
+            assert_eq!(h.state_label("waiting").unwrap(), "q-blocked");
+            assert!(h.set_label_schema(Some("typo")).is_err());
+        }
+    }
+
+    #[test]
+    fn issue_label_adapters_preserve_unrelated_assignments() {
+        for kind in [Kind::GitHub, Kind::GitLab] {
+            let labels = std::rc::Rc::new(RefCell::new(vec!["bug".to_string(), "q-ready".to_string()]));
+            let data = labels.clone();
+            let mut h = Http::new(kind, if kind == Kind::GitHub { "github.com" } else { "gitlab.example" }, "o/r", "test");
+            h.set_label_schema(Some("legacy")).unwrap();
+            h.transport = Some(Box::new(move |method, url, body| {
+                let reply = |body: Value| Ok(Reply { headers: vec![], body: body.to_string() });
+                if url.contains("/members/") { return reply(json!({"access_level": 20})); }
+                if method == "GET" {
+                    assert!(url.ends_with("/issues/7"));
+                    return reply(json!({"number": 7, "iid": 7, "state": "open", "author_association": "OWNER", "labels": *data.borrow()}));
+                }
+                if method == "POST" && url.ends_with("/issues") {
+                    let body = body.unwrap();
+                    *data.borrow_mut() = if kind == Kind::GitLab { body["labels"].as_str().unwrap().split(',').map(String::from).collect() }
+                        else { names(&body["labels"], "name") };
+                    return reply(json!({"number": 7, "iid": 7}));
+                }
+                if kind == Kind::GitLab {
+                    assert_eq!(method, "PUT"); assert!(url.ends_with("/issues/7"));
+                    let body = body.unwrap();
+                    let remove = body["remove_labels"].as_str().unwrap();
+                    data.borrow_mut().retain(|l| !remove.split(',').any(|r| r == l));
+                    for label in body["add_labels"].as_str().unwrap().split(',').filter(|s| !s.is_empty()) { data.borrow_mut().push(label.into()); }
+                } else if method == "POST" {
+                    assert!(url.ends_with("/issues/7/labels"));
+                    data.borrow_mut().extend(names(&body.unwrap()["labels"], "name"));
+                } else {
+                    assert_eq!(method, "DELETE"); assert!(url.ends_with("/issues/7/labels/q-ready"));
+                    data.borrow_mut().retain(|l| l != "q-ready");
+                }
+                reply(json!({}))
+            }));
+            h.labels(7, &["q-doing".into()], &["q-ready".into()]).unwrap();
+            assert_eq!(*labels.borrow(), vec!["bug", "q-doing"]);
+            h.create("new", "", &["taskq".into(), "q-ready".into()]).unwrap();
+            assert_eq!(*labels.borrow(), vec!["taskq", "q-ready"]);
+        }
+    }
+
+    #[test]
+    fn assignment_readback_rejects_partial_application() {
+        let b = Fake::default();
+        let n = b.create("t", "", &["bug".into(), "q-ready".into()]).unwrap();
+        assert!(verify_assignment(&b, n, &["q-doing".into()], &["q-ready".into()]).is_err());
+        b.labels(n, &["q-doing".into()], &["q-ready".into()]).unwrap();
+        verify_assignment(&b, n, &["q-doing".into()], &["q-ready".into()]).unwrap();
+        assert!(b.issue(n).unwrap().labels.contains(&"bug".into()));
+    }
 
     #[test]
     fn clocks() {

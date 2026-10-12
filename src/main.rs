@@ -2,6 +2,7 @@
 
 mod board;
 mod core;
+mod labels;
 mod platform;
 mod runtime;
 mod service;
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 type Res<T> = Result<T, String>;
 
-const USAGE: &str = "usage: taskq add|ask|answer|result|requeue|steer|later|failed|close|status|inbox|wait|cleanup|update|service|tray|selftest (see taskq.md § 5)";
+const USAGE: &str = "usage: taskq labels|add|ask|answer|result|requeue|steer|later|failed|close|status|inbox|wait|cleanup|update|service|tray|selftest (see taskq.md § 5)";
 
 // ---------- arguments ----------
 
@@ -148,7 +149,9 @@ fn token(install: &Path, kind: Kind, host: &str) -> Res<String> {
 fn ctx() -> Res<Ctx> {
     let (cfg, raw) = load(&find_root()?)?;
     let tok = token(&cfg.install, cfg.board, &cfg.web_host)?;
-    let board = Box::new(Http::new(cfg.board, &cfg.web_host, &cfg.repo, &tok));
+    let mut http = Http::new(cfg.board, &cfg.web_host, &cfg.repo, &tok);
+    http.set_label_schema(raw["label_schema"].as_str())?;
+    let board = Box::new(http);
     Ok(Ctx { cfg, raw, board })
 }
 
@@ -331,7 +334,7 @@ fn session_link(cfg: &Config, raw: &Value, t: &Task, n: u64) -> (String, String)
 
 /// A PM's scope (§ 5 `--only`): no labels means every task.
 fn in_scope(i: &board::Issue, only: &[String]) -> bool {
-    only.is_empty() || i.labels.iter().any(|l| only.contains(l))
+    only.is_empty() || only.iter().any(|f| labels::matches(&i.labels, f))
 }
 
 fn report(b: &dyn Board, cfg: &Config, raw: &Value, only: &[String]) -> Res<String> {
@@ -857,6 +860,13 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
     let (b, cfg, root) = (c.board.as_ref(), &c.cfg, c.cfg.root.as_path());
     let text = a.one("text").unwrap_or("");
     match cmd {
+        "labels" => {
+            let mut names = labels::FIXED.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            names.extend(b.issues(None)?.into_iter().flat_map(|i| i.labels));
+            b.ensure_labels(&names)?;
+            println!("label catalog readback verified");
+            Ok(())
+        }
         "add" => {
             let title = a.pos.get(1).filter(|t| !t.trim().is_empty()).ok_or("title missing")?;
             let acc = a.all("acceptance");
@@ -874,13 +884,22 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                 body += "\n";
                 body += &deps.iter().map(|d| format!("Depends on #{d}\n")).collect::<String>();
             }
+            for (flag, allowed) in [("type", &["code", "docs", "research", "asset"][..]), ("runtime", &["codex", "claude"][..]), ("priority", &["1", "2"][..])] {
+                if a.all(flag).len() > 1 || a.one(flag).is_some_and(|v| !allowed.contains(&v)) {
+                    return Err(format!("--{flag} requires one of {}", allowed.join("|")));
+                }
+            }
+            if a.all("host").len() > 1 || a.one("host").is_some_and(|v| v.is_empty() || v.contains(',') || v.chars().any(char::is_whitespace)) {
+                return Err("--host requires one nonempty host name".into());
+            }
             let blocked = deps_open(b, &body)?;
-            let mut labels = vec![service::TASK_LABEL.to_string(), format!("q-{}", if blocked { "waiting" } else { "ready" })];
-            for (flag, prefix) in [("type", ""), ("runtime", "run-"), ("priority", "priority-"), ("host", "host-")] {
+            let mut labels = vec![service::TASK_LABEL.to_string(), b.state_label(if blocked { "waiting" } else { "ready" })?];
+            for (flag, prefix) in [("type", ""), ("runtime", "run-"), ("priority", if b.canonical_labels()? { "p" } else { "priority-" }), ("host", "host-")] {
                 if let Some(v) = a.one(flag) {
                     labels.push(format!("{prefix}{v}"));
                 }
             }
+            labels::validate(&labels)?;
             let n = b.create(title, &body, &labels)?;
             let t = if a.flags.contains_key("later") { act(b, root, n, "later", &[], text)? } else { fold(&[], blocked) };
             poke(root);
@@ -999,6 +1018,26 @@ mod tests {
             update_every: 900,
             rollback_after: 600,
         }
+    }
+
+    #[test]
+    fn add_uses_canonical_names_defaults_and_validates_before_writing() {
+        let c = Ctx { cfg: cfg(), raw: json!({}), board: Box::new(Fake::default()) };
+        let args = |extra: &[&str]| {
+            let mut v = vec!["add", "T", "--goal", "G", "--acceptance", "observable"];
+            v.extend_from_slice(extra); Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        command(&c, "add", &args(&[])).unwrap();
+        let i = c.board.issues(None).unwrap().pop().unwrap();
+        assert_eq!(i.labels, vec!["taskq", "q-ready"]);
+        command(&c, "add", &args(&["--priority", "1", "--type", "code", "--deps", &i.number.to_string()])).unwrap();
+        let i = c.board.issues(None).unwrap().pop().unwrap();
+        assert_eq!(i.labels, vec!["taskq", "q-blocked", "code", "p1"]);
+        assert!(in_scope(&i, &["q-waiting".into(), "priority-1".into()]));
+        for extra in [&["--priority", "3"][..], &["--runtime", "any"], &["--type", "code", "--type", "docs"], &["--host", "win,mac"]] {
+            assert!(command(&c, "add", &args(extra)).is_err());
+        }
+        assert_eq!(c.board.issues(None).unwrap().len(), 2);
     }
 
     #[test]

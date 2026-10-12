@@ -44,7 +44,7 @@ fn label(i: &Issue, prefix: &str) -> Option<String> {
 }
 
 pub fn priority(i: &Issue) -> u8 {
-    if i.labels.iter().any(|l| l == "priority-1") { 1 } else { 2 }
+    if i.labels.iter().any(|l| crate::labels::canonical(l) == "p1") { 1 } else { 2 }
 }
 
 /// The host named in a `spawn` session (`<rt>:<session> <host>`).
@@ -59,7 +59,7 @@ fn rt_of(t: &Task) -> Option<(&str, &str)> {
 
 /// Set the `q-<state>` label from the fold; a closed task loses its `q-` labels and its issue is closed (§ 2).
 pub fn project(board: &dyn Board, issue: &Issue, t: &Task) -> Result<(), String> {
-    let want = format!("q-{}", t.state.name());
+    let want = board.state_label(t.state.name())?;
     let stale: Vec<String> = issue.labels.iter().filter(|l| l.starts_with("q-") && **l != want).cloned().collect();
     if t.state == State::Closed {
         board.labels(issue.number, &[], &stale)?;
@@ -331,10 +331,14 @@ impl<'a> Service<'a> {
             .iter()
             .filter(|v| !touched.contains(&v.issue.number))
             .filter(|v| v.task.state == State::Ready || (v.task.state == State::Review && v.task.attempt.is_none()))
+            .filter(|v| {
+                if let Err(e) = crate::labels::validate(&v.issue.labels) { eprintln!("#{}: {e}; not admitted", v.issue.number); return false; }
+                true
+            })
             .filter(|v| label(&v.issue, "host-").is_none_or(|h| h == me))
             .filter(|v| !v.issue.labels.iter().any(|l| l == "assignee-only") || v.issue.assignees.contains(&user))
             .filter(|v| v.issue.labels.iter().filter_map(|l| l.strip_prefix("needs-")).all(|x| self.cfg.has.iter().any(|h| h == x)))
-            .filter(|v| self.focus.iter().any(|f| f == "all" || v.issue.labels.contains(f)))
+            .filter(|v| self.focus.iter().any(|f| f == "all" || crate::labels::matches(&v.issue.labels, f)))
             .collect();
         queue.sort_by_key(|v| (priority(&v.issue), v.issue.number));
         for v in queue {
@@ -577,11 +581,27 @@ mod tests {
         let mut s = service(&b, &c, Default::default());
         s.pass().unwrap();
         assert_eq!(task(&b, other).state, State::Ready);
-        assert!(b.issue(n).unwrap().labels.contains(&"q-waiting".to_string()));
+        assert!(b.issue(n).unwrap().labels.contains(&"q-blocked".to_string()));
         b.close(dep).unwrap();
         s.pass().unwrap();
         assert_eq!(task(&b, n).state, State::Doing);
         assert!(b.comments(user).unwrap().is_empty() && b.issue(user).unwrap().labels.is_empty(), "no taskq label: never a task");
+    }
+
+    #[test]
+    fn canonical_and_legacy_priorities_filters_and_conflicts() {
+        let b = Fake::default();
+        let old = b.create("old", "", &["taskq".into(), "priority-1".into()]).unwrap();
+        let new = b.create("new", "", &["taskq".into(), "p1".into()]).unwrap();
+        let conflict = b.create("bad", "", &["taskq".into(), "p1".into(), "p2".into()]).unwrap();
+        assert_eq!(priority(&b.issue(old).unwrap()), priority(&b.issue(new).unwrap()));
+        let mut c = cfg("mac"); c.limits.insert("claude".into(), 3);
+        let mut s = service(&b, &c, Default::default()); s.focus = vec!["p1".into()];
+        s.pass().unwrap();
+        assert_eq!(task(&b, old).state, State::Doing);
+        assert_eq!(task(&b, new).state, State::Doing);
+        assert_eq!(task(&b, conflict).state, State::Ready);
+        assert!(b.comments(conflict).unwrap().is_empty(), "conflicting restriction never claimed");
     }
 
     #[test]

@@ -643,7 +643,7 @@ fn service_run(c: &Ctx) -> Res<()> {
     let cfg = &c.cfg;
     let exe = launcher(&cfg.install);
     let env = runtime::Env { root: &cfg.root, exe: &exe, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.publish };
-    let start = |l: &runtime::Launch| runtime::spawn(&env, l).map(|ch| Box::new(ch) as Box<dyn runtime::Proc>);
+    let start = |l: &runtime::Launch| runtime::spawn(&env, l);
     let mut s = Service::new(c.board.as_ref(), cfg, platform::VERSION, Box::new(start));
     let d = dot(&cfg.root);
     fs::create_dir_all(&d).map_err(|e| e.to_string())?;
@@ -817,7 +817,8 @@ fn kill_service(root: &Path) {
 fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     use std::os::unix::process::CommandExt;
     let mut text = format!("pid {}\n", std::process::id());
-    for k in &s.kids {
+    // a `codex-app` turn has no process to hand over: its attempt goes `gone` (§ 3 app lease)
+    for k in s.kids.iter().filter(|k| k.rt != "codex-app") {
         text += &format!("{} {} {} {} {}\n", k.task, k.attempt, k.rt, k.proc.id(), s.delivered(k.attempt));
     }
     platform::write_atomic(&dot(&cfg.root).join("kids"), &text)?;

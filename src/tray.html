@@ -1,0 +1,144 @@
+<!doctype html>
+<!-- `taskq tray` popover (taskq.md § 4): docs/design/menu-prototype.html driven by the Rust bridge in tray.rs.
+     Rust calls taskq.receive(state); actions go back through window.ipc.postMessage(JSON). -->
+<html lang="en"><head><meta charset="utf-8"><meta name="color-scheme" content="light dark">
+<style>
+:root{color-scheme:light dark}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:light-dark(#252930,#eceff2);--surface:light-dark(#f4f5f7,#292c32);--muted:light-dark(#626b77,#b4bdc8);--edge:light-dark(#d9dde2,#444951);--work:light-dark(#237862,#77cdb3);--ask:light-dark(#a35c29,#edb993);--ready:light-dark(#646d78,#c3c9d1);--failed:light-dark(#ae384c,#ef8996);background:var(--surface);-webkit-user-select:none;user-select:none;cursor:default}
+html{scrollbar-width:thin}
+*{box-sizing:border-box}
+button{font:inherit;color:inherit;background:none;border:1px solid var(--edge);border-radius:4px;padding:5px 7px}
+a{color:inherit;text-decoration:none}
+.menu{font-size:var(--size,16px);padding:6px 8px;overflow-x:hidden}
+.row,summary{display:flex;align-items:center;justify-content:space-between;gap:6px;min-height:32px;padding:5px 4px;line-height:1.35}
+summary{list-style:none;display:grid;grid-template-columns:auto minmax(0,1fr) 8px;gap:6px}
+summary>.meta,summary>.counter{justify-self:end;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+summary::-webkit-details-marker{display:none}
+summary:after{content:'›';color:var(--muted);grid-column:3}
+details[open]>summary:after{transform:rotate(90deg)}
+.muted,.meta{color:var(--muted);font-size:max(12px,.85em)}
+.group{border-top:1px solid var(--edge);margin-top:5px;padding-top:5px}
+.body{padding:5px 4px;line-height:1.45;overflow-wrap:anywhere}
+.task{display:grid;grid-template-columns:14px 4ch minmax(0,1fr);gap:7px;align-items:center;min-height:32px;padding:5px 4px;line-height:1.3;border-radius:4px}
+.task.global{grid-template-columns:14px 6ch 4ch minmax(0,1fr)}
+.task:hover,.task:focus-visible,.project:hover,.project:focus-visible{background:light-dark(#e3e7ec,#3a4049)}
+.title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.num{font-size:.85em;color:var(--muted);font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.project{width:100%;border:0;display:grid;grid-template-columns:minmax(0,1fr) auto 8px;gap:6px;align-items:center;text-align:left;min-height:33px;padding:5px 4px}
+.project>span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.counts{display:flex;gap:4px;align-items:center;justify-content:flex-end}
+.counter{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:22px;padding:0 5px;border-radius:999px;font-size:max(12px,.8em);font-variant-numeric:tabular-nums;font-weight:500;line-height:1}
+.counter.filled{background:color-mix(in srgb,currentColor 23%,var(--surface))}
+.counter.zero{color:var(--muted);background:light-dark(#e4e7eb,#353a42)}
+.work{color:var(--work)}.ask{color:var(--ask)}.ready{color:var(--ready)}.failed{color:var(--failed)}
+.options{display:flex;gap:5px;flex-wrap:wrap;padding:4px}
+.options button{flex:1;min-width:38px}
+button[aria-pressed=true]{background:light-dark(#dce7e1,#354a40);border-color:var(--work)}
+.views button{display:flex;align-items:center;justify-content:center;gap:6px;min-height:34px;font-size:.9em}
+.views img{height:18px}
+button:disabled{color:var(--muted);opacity:.75}
+.alert{color:var(--failed)}
+.bars{display:flex;align-items:flex-end;gap:2px;height:28px;padding:0 4px}
+.bars span{flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%}
+.bars i{display:block;background:var(--work)}.bars i.bad{background:var(--failed)}
+/* large text may wrap a title (menu.md M3); 14 and 16 px ellipsize */
+.big .title{white-space:normal;overflow-wrap:anywhere}.big .task.global{grid-template-columns:12px 5ch 4ch minmax(0,1fr);gap:4px}
+@media(pointer:coarse){.task,button,summary{min-height:44px}}
+</style></head><body><div class="menu" role="menu"></div>
+<script>
+(()=>{
+const names={doing:'In work',review:'Review',ask:'Waiting for answer',failed:'Failed',ready:'Ready',waiting:'Dependencies',later:'Later'};
+const symbols={doing:'▶',review:'↻',ask:'?',failed:'!',ready:'○',waiting:'⋯',later:'Ⅱ'};
+const color=st=>({doing:'work',review:'work',ask:'ask',failed:'failed',ready:'ready'}[st]||'muted');
+const periods={'5m':[300,'5 min'],'1h':[3600,'Hour'],'1d':[86400,'Day'],'1w':[604800,'Week'],'1mo':[2592000,'Month']};
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const send=m=>window.ipc&&window.ipc.postMessage(JSON.stringify(m));
+const menu=document.querySelector('.menu');
+let S=null,page='home',homeScroll=0,ask=null,pending={};
+// one task per board and issue: `issues` names provider, host and repo (M2)
+function tasks(p){return p.tasks.map(t=>({...t,project:p.name,key:p.issues+'/'+t.n,url:p.issues+'/'+t.n}));}
+function unique(ts){return [...new Map(ts.map(t=>[t.key,t])).values()];}
+function counts(ts){ts=unique(ts);const n=f=>ts.filter(t=>f.includes(t.state)).length;return {work:n(['doing','review']),ask:n(['ask']),ready:n(['ready']),failed:n(['failed'])};}
+function mode(p){return p.focus.length?'run':p.saved?'paused':'watch';}
+function counter(v,kind,label){return '<span class="counter '+(v>0?kind+' filled':'zero')+'" aria-label="'+esc(label+': '+v)+'" title="'+esc(label)+'">'+v+'</span>';}
+function countMarkup(c){return '<span class="counts">'+counter(c.work,'work','In work')+counter(c.ask,'ask','Waiting for answer')+counter(c.ready,'ready','Ready')+'</span>';}
+function taskRow(t,global){return '<a class="task'+(global?' global':'')+'" href="'+esc(t.url)+'" data-url="'+esc(t.url)+'" role="menuitem" aria-label="'+esc(t.project+' #'+t.n+' '+t.title+'; '+names[t.state])+'" title="'+esc(t.title)+'"><span class="'+color(t.state)+'" aria-hidden="true">'+symbols[t.state]+'</span>'+(global?'<span class="num">'+esc(t.project)+'</span>':'')+'<span class="num">#'+esc(t.n)+'</span><span class="title">'+esc(t.title)+'</span></a>';}
+function globalGroup(st,ts){ts=ts.filter(t=>t.state===st);return ts.length?'<details class="group"><summary><span class="'+color(st)+'">'+names[st]+'</span>'+counter(ts.length,color(st),names[st])+'</summary>'+ts.map(t=>taskRow(t,true)).join('')+'</details>':'';}
+function age(s){return s<120?s+' s':s<7200?Math.round(s/60)+' min':s<172800?Math.round(s/3600)+' h':Math.round(s/86400)+' d';}
+// service error and stale status.json are not failed tasks (M-A10)
+function problem(p){const e=!p.alive?(p.age==null?'no status.json: service not running':'status.json '+age(p.age)+' old: service not running?'):p.error?'service error: '+p.error:'';return e?'<button class="project alert" data-a="log" data-root="'+esc(p.root)+'" title="'+esc(e)+'"'+(p.log?'':' disabled')+'><span>⚠ '+esc(p.name)+': '+esc(e)+'</span><span class="meta">'+(p.log?'Log':'')+'</span><span></span></button>':'';}
+function modeText(p){return {run:'Admitting: '+p.focus.join(' '),paused:'Paused: running tasks finish, no new ones',watch:'Observation only: focus off'}[mode(p)];}
+function admission(p){
+  if(pending[p.root])return '<button class="project" disabled>'+esc(pending[p.root])+'…</button>';
+  if(mode(p)==='run')return '<button class="project" data-a="pause" data-root="'+esc(p.root)+'">Pause admission in '+esc(p.name)+'</button>';
+  if(p.saved)return '<button class="project" data-a="resume" data-root="'+esc(p.root)+'">Resume admission in '+esc(p.name)+'</button>';
+  if(ask!==p.root)return '<button class="project" data-a="pick" data-root="'+esc(p.root)+'">Resume: choose labels…</button>';
+  // no saved focus: offer labels, never `all` (M-A12)
+  return '<div class="body meta">No saved focus. Admit tasks with one label:</div><div class="options">'+(p.labels.length?p.labels.map(l=>'<button data-a="focus" data-root="'+esc(p.root)+'" data-label="'+esc(l)+'">'+esc(l)+'</button>').join(''):'<span class="meta">No labels on open tasks: use taskq service focus</span>')+'</div>';
+}
+function service(p){return '<details class="group"><summary>⚙ Service <span class="meta">'+esc(p.name)+'</span></summary>'+
+  (p.log?'<button class="project" data-a="log" data-root="'+esc(p.root)+'">Open log</button>':'<div class="body meta">Log path unknown</div>')+
+  '<button class="project" data-a="folder" data-root="'+esc(p.root)+'">Open folder</button>'+
+  '<button class="project" data-a="restart" data-root="'+esc(p.root)+'"'+(p.alive?'':' disabled title="Service not running"')+'>Restart</button>'+
+  '<button class="project" data-a="stop" data-root="'+esc(p.root)+'">Stop until next logon</button>'+
+  '<details><summary>Uninstall service '+esc(p.name)+'</summary><div class="body meta">Removes this project\'s service; files and other projects stay.</div><button class="project" data-a="uninstall" data-root="'+esc(p.root)+'">Confirm uninstall '+esc(p.name)+'</button></details></details>';}
+function history(){
+  const [span,label]=periods[S.period],now=S.now,start=now-span,ev=new Map();
+  for(const p of S.projects)for(const [t,kind,id] of p.events)ev.set(p.issues+' '+id+' '+kind,{t,kind});
+  const bins=Array.from({length:12},()=>({close:0,failed:0}));let c=0,f=0;
+  for(const e of ev.values())if(e.t>=start&&e.t<now){bins[Math.min(11,Math.floor((e.t-start)/span*12))][e.kind]++;e.kind==='close'?c++:f++;}
+  const peak=Math.max(1,...bins.map(b=>b.close+b.failed));
+  const since=Math.max(...S.projects.map(p=>p.since??Infinity));
+  const note=!Number.isFinite(since)?'No history yet: unknown, not zero.':since>start?'Incomplete: history since '+new Date(since*1000).toLocaleString()+'; earlier is unknown, not zero.':'';
+  return '<details class="group"><summary>▥ History <span class="meta">'+label+' · closed '+c+' · failed '+f+'</span></summary><div class="options">'+Object.entries(periods).map(([k,[,l]])=>'<button data-set="period" data-v="'+k+'" aria-pressed="'+(S.period===k)+'">'+l+'</button>').join('')+'</div>'+
+  '<div class="bars" role="img" aria-label="Closed '+c+', failed '+f+'; oldest left">'+bins.map(b=>'<span><i class="bad" style="height:'+b.failed/peak*100+'%"></i><i style="height:'+b.close/peak*100+'%"></i></span>').join('')+'</div>'+(note?'<div class="body meta">'+esc(note)+'</div>':'')+'</details>';}
+function home(){
+  const all=S.projects.flatMap(tasks),c=counts(all),run=S.projects.filter(p=>mode(p)==='run'),held=S.projects.filter(p=>mode(p)==='paused');
+  let h='';
+  if(S.platform==='macos')h+='<div class="options views">'+[['icon','Icon'],['full','Summary']].map(([v,l])=>'<button data-set="view" data-v="'+v+'" aria-pressed="'+(S.view===v)+'"><img alt="" src="'+S.icons[v]+'">'+l+'</button>').join('')+'</div>';
+  h+='<details><summary>↳ Scope <span class="meta">'+S.projects.length+' project'+(S.projects.length===1?'':'s')+' · in work '+c.work+' · ask '+c.ask+' · ready '+c.ready+'</span></summary><div class="body">'+S.projects.map(p=>'<div><strong>'+esc(p.name)+'</strong> <span class="meta">'+esc(modeText(p))+'</span></div><div class="meta">You asked: '+esc(p.request||'not recorded')+'</div>').join('')+'</div></details>';
+  h+=S.projects.map(problem).join('');
+  h+=globalGroup('ask',unique(all))+globalGroup('failed',unique(all));
+  h+='<div class="group"><div class="row meta">Projects</div>'+(S.projects.length?S.projects.map(p=>'<button class="project" data-page="'+esc(p.root)+'" role="menuitem"><span title="'+esc(p.name)+'">'+esc(p.name)+(mode(p)==='run'?'':' <span class="meta">'+(mode(p)==='paused'?'Ⅱ':'observation')+'</span>')+'</span>'+countMarkup(counts(tasks(p)))+'<span aria-hidden="true">›</span></button>').join(''):'<div class="body meta">No projects: run taskq service install in one</div>')+'</div>';
+  h+=history();
+  if(held.length&&run.length)h+='<div class="row meta">Paused '+held.length+' of '+(held.length+run.length)+'</div>';
+  if(run.length)h+='<button class="project" data-a="pause-all">Pause admission in '+esc(run.map(p=>p.name).join(', '))+'</button>';
+  else if(held.length)h+='<button class="project" data-a="resume-all">Resume admission in '+esc(held.map(p=>p.name).join(', '))+'</button>';
+  h+='<details><summary>Aa Text size <span class="meta">'+S.font+' px</span></summary><div class="options">'+[14,16,18,20].map(n=>'<button data-set="font" data-v="'+n+'" aria-pressed="'+(n===S.font)+'">'+n+'</button>').join('')+'</div></details>';
+  h+=S.projects.map(service).join('');
+  return h+'<div class="row meta">taskq '+esc(S.version)+' · '+esc(S.host)+'</div>';}
+function project(p){
+  const ts=tasks(p);
+  return '<button data-a="back">‹ All projects</button><div class="row"><strong title="'+esc(p.root)+'">'+esc(p.name)+'</strong>'+countMarkup(counts(ts))+'</div><div class="body meta">'+esc(modeText(p))+'</div>'+problem(p)+
+  (['ask','failed','doing','review','ready','waiting','later'].map(st=>{const r=ts.filter(t=>t.state===st);return r.length?'<div class="group"><div class="row meta"><span>'+names[st]+'</span>'+counter(r.length,color(st),names[st])+'</div>'+r.map(t=>taskRow(t)).join('')+'</div>':'';}).join('')||'<div class="body muted">No open tasks</div>')+
+  '<div class="group">'+(p.issues?'<a class="project" href="'+esc(p.issues)+'" data-url="'+esc(p.issues)+'"><span>Board ↗</span><span></span><span></span></a>':'')+admission(p)+'</div>'+service(p);}
+function render(){
+  if(!S)return;
+  const open=[...menu.querySelectorAll('details')].map(d=>d.open),p=S.projects.find(p=>p.root===page);
+  if(!p)page='home';
+  document.documentElement.style.colorScheme=S.theme||'light dark';
+  menu.style.setProperty('--size',S.font+'px');menu.classList.toggle('big',S.font>=18);
+  menu.innerHTML=p?project(p):home();
+  menu.querySelectorAll('details').forEach((d,i)=>d.open=open[i]||false);
+  send({a:'size',w:S.font>=18?360:320,h:menu.scrollHeight});}
+window.taskq={receive(s){
+  for(const p of s.projects){const was=S&&S.projects.find(q=>q.root===p.root);if(pending[p.root]&&was&&mode(was)!==mode(p))delete pending[p.root];}
+  S=s;
+  // snapshot mode names the page
+  if(s.page!==undefined){page=s.page;pending={};}
+  render();
+},model:{unique,counts,mode}};
+menu.addEventListener('click',e=>{
+  const a=e.target.closest('a[data-url]');if(a){e.preventDefault();send({a:'open',url:a.dataset.url});return;}
+  const b=e.target.closest('button');if(!b||b.disabled)return;const d=b.dataset;
+  if(d.page){homeScroll=document.scrollingElement.scrollTop;page=d.page;ask=null;render();document.scrollingElement.scrollTop=0;return;}
+  if(d.a==='back'){page='home';render();document.scrollingElement.scrollTop=homeScroll;return;}
+  if(d.set){S[d.set]=d.set==='font'?Number(d.v):d.v;send({a:'set',[d.set]:S[d.set]});render();return;}
+  if(d.a==='pick'){ask=d.root;render();return;}
+  if(d.a==='pause-all'||d.a==='resume-all'){for(const p of S.projects.filter(p=>mode(p)===(d.a==='pause-all'?'run':'paused'))){pending[p.root]=d.a==='pause-all'?'Pausing':'Resuming';send({a:d.a.slice(0,-4),root:p.root});}render();return;}
+  if(d.a==='pause'||d.a==='resume'||d.a==='focus'){pending[d.root]=d.a==='pause'?'Pausing':'Resuming';ask=null;}
+  if(d.a)send({a:d.a,root:d.root,label:d.label});render();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')send({a:'hide'});});
+send({a:'ready'});
+})();
+</script></body></html>

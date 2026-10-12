@@ -633,6 +633,21 @@ fn status_labels(root: &Path) -> Vec<String> {
     l
 }
 
+/// Focus (§ 4): `f` admits; `request` keeps the owner's words, none removes them.
+fn set_focus(root: &Path, f: &str, request: Option<&str>) -> Res<()> {
+    let d = dot(root);
+    fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+    fs::write(d.join("focus"), f).map_err(|e| e.to_string())?;
+    match request {
+        Some(r) => fs::write(d.join("focus.request"), r).map_err(|e| e.to_string())?,
+        None => {
+            let _ = fs::remove_file(d.join("focus.request"));
+        }
+    }
+    poke(root);
+    Ok(())
+}
+
 /// Pause (§ 4): keep the focus in `focus.paused`, admit nothing.
 fn pause(root: &Path) {
     let d = dot(root);
@@ -724,15 +739,7 @@ fn service(args: &Args) -> Res<()> {
                 println!("labels of open tasks: {}", n.iter().map(|(l, k)| format!("{l} ({k})")).collect::<Vec<_>>().join(", "));
                 return Ok(());
             }
-            fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-            fs::write(d.join("focus"), &f).map_err(|e| e.to_string())?;
-            match args.one("request") {
-                Some(r) => fs::write(d.join("focus.request"), r).map_err(|e| e.to_string())?,
-                None => {
-                    let _ = fs::remove_file(d.join("focus.request"));
-                }
-            }
-            poke(&root);
+            set_focus(&root, &f, args.one("request"))?;
             println!("focus: {f}");
             Ok(())
         }
@@ -793,12 +800,12 @@ fn service(args: &Args) -> Res<()> {
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn tray(install: PathBuf) -> Res<()> {
-    tray::run(install)
+fn tray(install: PathBuf, snapshot: Option<&str>) -> Res<()> {
+    tray::run(install, snapshot.map(PathBuf::from))
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-fn tray(_install: PathBuf) -> Res<()> {
+fn tray(_install: PathBuf, _snapshot: Option<&str>) -> Res<()> {
     Err("taskq tray: macOS and Windows only".into())
 }
 
@@ -835,7 +842,7 @@ fn run(argv: &[String]) -> Res<()> {
             Ok(())
         }
         "service" => service(&a),
-        "tray" => tray(platform::default_install()),
+        "tray" => tray(platform::default_install(), a.one("snapshot")),
         "" | "help" | "-h" | "--help" => Err(USAGE.into()),
         _ => command(&ctx()?, cmd, &a),
     }

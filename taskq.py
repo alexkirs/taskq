@@ -1219,9 +1219,10 @@ class Codex:
                 continue
             if state == 'running':
                 stop_process(pid, birth)
-            done = subprocess.run([shutil.which('codex') or 'codex', 'archive', thread], capture_output=True, **no_window(), timeout=60)
-            if done.returncode:
-                raise RuntimeError('codex archive failed; recovery handle retained')
+            if rollout(thread) != 'archived':
+                done = subprocess.run([shutil.which('codex') or 'codex', 'archive', thread], capture_output=True, **no_window(), timeout=60)
+                if done.returncode:
+                    raise RuntimeError('codex archive failed; recovery handle retained')
             path.unlink()
         return complete
 

@@ -9,6 +9,12 @@ and the existing [format handoff](message-formats-handoff.md).
 Baseline locations below refer to `4f91c83` on main; current function names make
 the findings locatable after edits. No lifecycle golden trace changed.
 
+Reviewer follow-up: close verdict limits now check original lines before any
+publication, including leading/trailing padding. Uninstall propagates OS command
+failure before deleting the unit or project registration. Regressions check both
+padding directions without closing/comment writes and a failed unload with both
+local records preserved. No live service is uninstalled by these tests.
+
 | Surface | Baseline deviation (file:line) | Candidate behavior / proof |
 |---|---|---|
 | Input character limits | `src/main.rs:238`, `width`: repeated spaces disappeared; an unmatched backtick exempted the rest of a line. | Count outside whitespace and Unicode characters; only paired code spans are exempt. Boundary regression includes repeated spaces, Unicode and unmatched backtick. |
@@ -51,6 +57,10 @@ DLL); standalone release packaging is unverified. No actual Codex/app, DOT, narr
 media-accessibility, live stop/uninstall, macOS or Linux verification is claimed.
 Those channel/platform proofs remain separate from model/format tests. The v3
 Python suite is absent after cutover and is not presented as a passing gate.
+The follow-up Windows suite uses a process-local PATH without installed Codex
+shims: an existing runtime assertion expects the bare `codex` fallback, whereas
+Windows resolves `codex.cmd`. The unchanged assertion fails on the normal PATH;
+the isolated suite passes all 45 tests. This is not runtime launch qualification.
 
 Separate follow-up scope: native tray/menu text and rendering, documentation text
 audit, and actual channel/width/media receipts. Raw service logs, heartbeat/spawn/

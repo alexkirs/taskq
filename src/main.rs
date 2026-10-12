@@ -371,6 +371,8 @@ fn result_text(n: u64, text: &str, checks: &[String], opts: &[String], recommend
 
 /// § 7 close verdict: Changed, Checks naming every Acceptance item `A<k> ok|gap|unknown` and CI, Open.
 fn close_verdict(text: &str, body: &str) -> Res<()> {
+    let lines: Vec<String> = text.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect();
+    limit("verdict", &lines, 3, 12, 240)?;
     let f = fields(text, &[("Changed", 1, 2, 240), ("Checks", 1, 8, 240), ("Open", 1, 2, 240)])?;
     limit("verdict", &f.concat(), 3, 12, 240)?;
     let checks = f[1].join(" ");
@@ -1226,10 +1228,7 @@ fn service(args: &Args) -> Res<()> {
                 }
                 println!("installed {}", u.path.display());
             } else {
-                platform::run_all(&u.unload, true)?;
-                if let Err(e) = fs::remove_file(&u.path) && e.kind() != std::io::ErrorKind::NotFound { return Err(e.to_string()); }
-                let all: Vec<String> = fs::read_to_string(&projects).unwrap_or_default().lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
-                fs::write(&projects, all.concat()).map_err(|e| e.to_string())?;
+                uninstall_unit(&u, &root, &projects)?;
                 println!("removed {}", u.path.display());
                 kill_service(&root);
             }
@@ -1253,6 +1252,13 @@ fn tray(_install: PathBuf, _snapshot: Option<&str>) -> Res<()> {
 
 fn print_task(n: u64, t: &Task) {
     println!("#{n} {}", t.state.name());
+}
+
+fn uninstall_unit(u: &platform::Unit, root: &Path, projects: &Path) -> Res<()> {
+    platform::run_all(&u.unload, false)?;
+    if let Err(e) = fs::remove_file(&u.path) && e.kind() != std::io::ErrorKind::NotFound { return Err(e.to_string()); }
+    let all: Vec<String> = fs::read_to_string(projects).unwrap_or_default().lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
+    fs::write(projects, all.concat()).map_err(|e| e.to_string())
 }
 
 fn run(argv: &[String]) -> Res<()> {
@@ -1580,6 +1586,45 @@ mod tests {
         assert!(ask_card(7, "Done: d\nProblem: p", &o(2), Some("3"), &[]).is_err());
         assert!(ask_card(7, "Done: d\nProblem: p", &o(2), Some("1"), &vec!["u".to_string(); 3]).is_err());
         assert_eq!(width("see [#12](https://very/long/url) and `cargo test --locked` https://x/y"), 15, "link targets and code are exempt; outside whitespace counts");
+    }
+
+    #[test]
+    fn failed_uninstall_preserves_unit_and_project_registration() {
+        let root = std::env::temp_dir().join(format!("taskq-uninstall-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let projects = root.join("projects");
+        let registered = format!("{}\nother\n", root.display());
+        fs::write(&projects, &registered).unwrap();
+        let u = platform::Unit {
+            path: root.join("unit"), text: String::new(), load: vec![], stop: vec![],
+            unload: vec![vec![std::env::current_exe().unwrap().display().to_string(), "--invalid-taskq-test-option".into()]],
+        };
+        fs::write(&u.path, "unit contents").unwrap();
+        assert!(uninstall_unit(&u, &root, &projects).unwrap_err().contains("failed"));
+        assert_eq!(fs::read_to_string(&u.path).unwrap(), "unit contents");
+        assert_eq!(fs::read_to_string(&projects).unwrap(), registered);
+        fs::remove_file(&u.path).unwrap();
+        fs::remove_file(&projects).unwrap();
+        fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn padded_close_verdict_is_rejected_before_publication() {
+        let c = Ctx { cfg: cfg(), raw: json!({}), board: Box::new(Fake::default()) };
+        let n = c.board.create("T", "A1. observable", &["taskq".into()]).unwrap();
+        c.board.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
+        let attempt = fold(n, &entries(c.board.as_ref(), n).unwrap(), false).attempt;
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        c.board.comment(n, &entry("result", &[sha], attempt, "result")).unwrap();
+        let before = c.board.comments(n).unwrap();
+        for changed in [format!("{}Changed: c", " ".repeat(240)), format!("Changed: c{}", " ".repeat(240))] {
+            let verdict = format!("{changed}\nChecks: A1 ok; CI green on {sha}\nOpen: none");
+            let args = Args::parse(&["close".into(), n.to_string(), "--text".into(), verdict]).unwrap();
+            assert!(command(&c, "close", &args).is_err());
+            assert!(c.board.issue(n).unwrap().open);
+            assert_eq!(c.board.comments(n).unwrap().len(), before.len());
+            assert_eq!(fold(n, &entries(c.board.as_ref(), n).unwrap(), false).state, State::Review);
+        }
     }
 
     #[test]

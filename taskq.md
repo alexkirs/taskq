@@ -5,7 +5,6 @@ This file specifies **v4**, the Rust binary from `src/`.
 ## Principles (R1–R13)
 ### Change rule
 A task that changes a rule names its R-number, edits this file in the same deliverable as the code and lists the amended R-numbers in its result. A changed rule keeps its number. A new rule gets the next one. A rule elsewhere that disagrees with this file is a defect. No history here: no dates, no decision logs; at most 300 lines.
-
 ### R1. The board's own objects are the only state
 No machine block in issues. State is what a person sees: labels, the issue text, `taskq:` comments (§ 2) and host heartbeat issues (§ 4). The comment log is the truth; labels are its projection. Local files are caches that a restart rebuilds: no local DB, receipt store, queue or lock. Exception: AI request files and the tray's request history (§ 4); they hold no task state.
 

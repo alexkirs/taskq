@@ -1481,10 +1481,37 @@ class ShellBriefs(Base):
 
     def run_powershell(self, command):
         shell = Path(os.environ['SYSTEMROOT']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+        command = "[Console]::Error.WriteLine('fixture:powershell-started-ms=' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()); " + command
+        began, epoch = taskq.time.monotonic(), taskq.time.time()
         with mock.patch.object(taskq.subprocess, 'Popen', REAL_POPEN):
-            return REAL_RUN([str(shell), '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
-                            capture_output=True, text=True, timeout=15, cwd=self.root, stdin=subprocess.DEVNULL,
-                            env={**os.environ, 'PATHEXT': '.COM;.EXE;.BAT;.CMD'})  # PS otherwise shell-opens .exe asynchronously
+            try:
+                return REAL_RUN([str(shell), '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
+                                capture_output=True, text=True, timeout=15, cwd=self.root, stdin=subprocess.DEVNULL,
+                                env={**os.environ, 'PATHEXT': '.COM;.EXE;.BAT;.CMD'})  # PS otherwise shell-opens .exe asynchronously
+            except subprocess.TimeoutExpired as error:
+                partial = error.stderr or b''
+                if isinstance(partial, bytes):
+                    partial = partial.decode('utf-8', 'replace')
+                marker = re.search(r'fixture:powershell-started-ms=(\d+)', partial)
+                startup = round(int(marker[1])/1000-epoch, 3) if marker else None
+                error.add_note(f'fixture elapsed={taskq.time.monotonic()-began:.3f}s shell_startup={startup}s '
+                               f'partial_stderr={partial[:512]!r} partial_stdout_bytes={len(error.stdout or b"")}')
+                raise
+
+    def test_native_shell_timeout_preserves_fixture_stage_diagnostics(self):
+        for stderr in (b'fixture:powershell-started-ms=1000\n', 'no startup marker'):
+            failure = subprocess.TimeoutExpired(['fixture-only'], 15, output=b'partial', stderr=stderr)
+            with self.subTest(stderr_type=type(stderr).__name__), \
+                    mock.patch.dict(os.environ, {'SYSTEMROOT': str(self.root)}), \
+                    mock.patch(__name__ + '.REAL_RUN', side_effect=failure), \
+                    self.assertRaises(subprocess.TimeoutExpired) as observed:
+                self.run_powershell('fixture-only')
+            self.assertIs(observed.exception, failure)
+            note = observed.exception.__notes__[0]
+            self.assertIn('fixture elapsed=', note)
+            self.assertIn('shell_startup=', note)
+            self.assertIn('partial_stdout_bytes=7', note)
+            self.assertIn('partial_stderr=', note)
 
     def test_role_briefs_choose_native_windows_codex_only(self):
         self.add()
@@ -6586,7 +6613,8 @@ for line in sys.stdin:
         name = 'other' if mode == 'wrong-name' else 'S1 CDX one (mac)'
         out.append({'id': message['id'], 'result': {'thread': {'id': 'th', 'name': name}} if message['method'] == 'thread/read' else {}})
     for reply in out:
-        time.sleep(0.05)
+        if reply.get('id') == message['id']:
+            time.sleep(0.05)  # Delay the actual reply, not unrelated notification traffic.
         print(json.dumps(reply), flush=True)
 if mode == 'hang':  # replied, then never exits
     time.sleep(60)

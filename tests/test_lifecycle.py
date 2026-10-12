@@ -134,7 +134,8 @@ class Lifecycle(unittest.TestCase):
   # Actual bounded child loses provider access, fails its read and its final receipt write.
   # Only this disposable host DB is locked; no process signal or production host is touched.
   with host.transaction():
-   self.assertNotEqual(process.wait(timeout=12),0)
+   # Two deliberate 5s SQLite busy waits (observe, then final receipt), plus scheduling.
+   self.assertNotEqual(process.wait(timeout=25),0)
   self.assertEqual(host.observe(key)['phase'],'bound')
   input_path=self.root/'.taskq'/'controlled'/(key+'.json');original_input=input_path.read_bytes()
   input_path.write_bytes(original_input+b' ')

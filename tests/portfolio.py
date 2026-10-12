@@ -10,13 +10,13 @@ import sys
 CONTRACTS = {
     'admission': ('test_board_control.py', 'Tick', 'Commands', 'HermesAdmission', 'TightAssignmentDesign'),
     'lifecycle': ('test_lifecycle.py', 'test_model_integration.py', 'StateKernel', 'TestStateKernel', 'Commands', 'RealChild'),
-    'answers': ('SubmittedResultRejection', 'test_receipts.py', 'test_subscriptions.py', 'test_native_action.py', 'test_sender_handshake.py',
+    'answers': ('ShellBriefs', 'SubmittedResultRejection', 'test_receipts.py', 'test_subscriptions.py', 'test_native_action.py', 'test_sender_handshake.py',
                 'test_board_control.py', 'EventDelivery', 'Wait', 'MultiPM'),
     'recovery': ('RecoveryQualification', 'test_legacy_reconcile.py', 'test_repair_reset.py', 'test_repair_owner_risk.py',
                  'Failed', 'RecoveryTimeout', 'Cleanup', 'SchemaRepair', 'StateKernel', 'TestStateKernel'),
     'capacity': ('test_board_capacity.py', 'test_model_capacity.py', 'Model', 'Tick', 'Coordination',
                  'RealChild', 'TestStateKernel'),
-    'restart': ('test_host_service.py', 'test_model_integration.py', 'RuntimeProcessBoundary', 'Wait', 'RealChild'),
+    'restart': ('ShellBriefs', 'test_host_service.py', 'test_model_integration.py', 'RuntimeProcessBoundary', 'Wait', 'RealChild'),
     'upgrade': ('Contract', 'DirectPublication', 'PullRequests', 'ProjectBootstrap', 'test_portfolio.py'),
 }
 
@@ -57,8 +57,10 @@ def fingerprint(root):
             path = root / name
             hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else 'missing'
     environment = {'platform': platform.system(), 'machine': platform.machine(),
+                   'os_release': platform.release(), 'os_version': platform.version(),
                    'python': platform.python_version(), 'encoding': locale.getpreferredencoding(False),
                    'filesystem_encoding': sys.getfilesystemencoding(),
+                   'utf8_mode': sys.flags.utf8_mode,
                    'interpreter_sha256': hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest(),
                    'virtual_environment': sys.prefix != sys.base_prefix}
     from importlib.metadata import distributions

@@ -34,7 +34,7 @@ impl Args {
         while let Some(x) = it.next() {
             match x.strip_prefix("--") {
                 Some(k) => {
-                    let val = if matches!(k, "later" | "check") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
+                    let val = if matches!(k, "later" | "check" | "force") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
                     a.flags.entry(k.to_string()).or_default().push(val);
                 }
                 None => a.pos.push(x.clone()),
@@ -93,6 +93,7 @@ fn load(root: &Path) -> Res<(Config, Value)> {
     let secs = |k: &str, d: u64| v[k].as_u64().unwrap_or(d);
     let h = hostname();
     let me = std::env::var("TASKQ_HOST").ok().filter(|s| !s.is_empty()).or_else(|| v["hosts"][&h].as_str().map(String::from)).unwrap_or(h);
+    let has = v["has"][&me].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
     let limits: BTreeMap<String, u32> = v["limits"].as_object().into_iter().flatten().map(|(k, n)| (k.clone(), n.as_u64().unwrap_or(0) as u32)).collect();
     let codex = match v["codex"].as_array() {
         Some(a) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
@@ -107,6 +108,7 @@ fn load(root: &Path) -> Res<(Config, Value)> {
         publish: str_or("publish", "pr"),
         me,
         limits,
+        has,
         permission_mode: str_or("permission_mode", "dontAsk"),
         codex,
         ttl: secs("ttl", 300) as i64,
@@ -304,8 +306,14 @@ fn session_link(cfg: &Config, raw: &Value, t: &Task, n: u64) -> (String, String)
     (rt.to_string(), link)
 }
 
-fn report(b: &dyn Board, cfg: &Config, raw: &Value) -> Res<String> {
+/// A PM's scope (§ 5 `--only`): no labels means every task.
+fn in_scope(i: &board::Issue, only: &[String]) -> bool {
+    only.is_empty() || i.labels.iter().any(|l| only.contains(l))
+}
+
+fn report(b: &dyn Board, cfg: &Config, raw: &Value, only: &[String]) -> Res<String> {
     let (mut views, hosts) = service::views(b, &mut HashMap::new())?;
+    views.retain(|v| in_scope(&v.issue, only));
     if let Some(who) = raw["assignee"].as_str() {
         let who = if who == "me" { b.me()? } else { who.to_string() };
         views.retain(|v| v.issue.assignees.contains(&who));
@@ -407,7 +415,7 @@ fn inbox(b: &dyn Board, n: u64) -> Res<String> {
 
 /// PM wait (§ 5): the cursor `<root>/.taskq/pm-cursor` holds the board time of the last read and the last seen state
 /// per task. Only moves into `ask`, `review` with options, closed or `failed` are printed.
-fn wait(b: &dyn Board, cfg: &Config, window_min: u64) -> Res<Vec<String>> {
+fn wait(b: &dyn Board, cfg: &Config, window_min: u64, only: &[String]) -> Res<Vec<String>> {
     let path = dot(&cfg.root).join("pm-cursor");
     let mut since = None;
     let mut seen: HashMap<u64, String> = HashMap::new();
@@ -422,7 +430,7 @@ fn wait(b: &dyn Board, cfg: &Config, window_min: u64) -> Res<Vec<String>> {
         let issues = b.issues(since.map(|s| s - 1).or(Some(now)))?;
         let open: Vec<u64> = b.issues(None)?.iter().map(|i| i.number).collect();
         let mut moved = vec![];
-        for i in issues.iter().filter(|i| service::is_task(i)) {
+        for i in issues.iter().filter(|i| service::is_task(i) && in_scope(i, only)) {
             let t = fold(&entries(b, i.number)?, core::depends(&i.body).iter().any(|d| open.contains(d)));
             let state = if !i.open { "closed".to_string() } else if t.state == State::Review && t.card.is_some() { "review*".into() } else { t.state.name().into() };
             if seen.get(&i.number) != Some(&state) && matches!(state.as_str(), "ask" | "review*" | "closed" | "failed") {
@@ -506,7 +514,7 @@ fn service_run(c: &Ctx) -> Res<()> {
     let mut checked: Option<Instant> = None;
     eprintln!("taskq {} service on {} for {}", platform::VERSION, cfg.me, cfg.repo);
     loop {
-        s.paused = d.join("paused").exists();
+        s.focus = fs::read_to_string(d.join("focus")).unwrap_or_default().split_whitespace().filter(|f| *f != "off").map(String::from).collect();
         let r = s.pass();
         for l in s.log.drain(..) {
             eprintln!("{l}");
@@ -516,7 +524,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         let at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let kids: Vec<Value> = s.kids.iter().map(|k| json!({"task": k.task, "attempt": k.attempt, "rt": k.rt, "pid": k.proc.id()})).collect();
-        let status = json!({"host": cfg.me, "version": platform::VERSION, "paused": s.paused, "error": r.err(), "kids": kids, "at": at});
+        let status = json!({"host": cfg.me, "version": platform::VERSION, "focus": s.focus, "error": r.err(), "kids": kids, "at": at});
         let _ = platform::write_atomic(&d.join("status.json"), &serde_json::to_string_pretty(&status).unwrap_or_default());
         if is_installed && began.elapsed().as_secs() >= cfg.rollback_after {
             let h = cfg.install.join("releases").join(platform::VERSION).join("healthy");
@@ -567,11 +575,15 @@ fn service(args: &Args) -> Res<()> {
     let d = dot(&root);
     match sub {
         "run" => service_run(&ctx()?),
-        "pause" | "resume" => {
+        "focus" => {
+            let f = args.pos[2..].join(" ");
+            if f.is_empty() {
+                return Err("usage: taskq service focus all|off|<label..>".into());
+            }
             fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-            if sub == "pause" { fs::write(d.join("paused"), "").map_err(|e| e.to_string())? } else { let _ = fs::remove_file(d.join("paused")); }
+            fs::write(d.join("focus"), &f).map_err(|e| e.to_string())?;
             poke(&root);
-            println!("{}", if sub == "pause" { "paused: admission stops" } else { "resumed" });
+            println!("focus: {f}");
             Ok(())
         }
         "status" => {
@@ -596,7 +608,7 @@ fn service(args: &Args) -> Res<()> {
             }
             Ok(())
         }
-        _ => Err("usage: taskq service install|run|pause|resume|status|uninstall".into()),
+        _ => Err("usage: taskq service install|run|focus|status|uninstall".into()),
     }
 }
 
@@ -719,7 +731,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             if failed { Err("some tasks were not closed".into()) } else { Ok(()) }
         }
         "status" => {
-            println!("{}", report(b, cfg, &c.raw)?);
+            println!("{}", report(b, cfg, &c.raw, &a.all("only").iter().flat_map(|x| x.split(',')).map(String::from).collect::<Vec<_>>())?);
             Ok(())
         }
         "cleanup" => {
@@ -736,7 +748,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
         }
         "wait" => {
             let w = a.one("window").map(|w| w.parse().map_err(|_| "bad --window")).transpose()?.unwrap_or(10);
-            for l in wait(b, cfg, w)? {
+            for l in wait(b, cfg, w, &a.all("only").iter().flat_map(|x| x.split(',')).map(String::from).collect::<Vec<_>>())? {
                 println!("{l}");
             }
             Ok(())
@@ -774,6 +786,7 @@ mod tests {
             publish: "pr".into(),
             me: "mac".into(),
             limits: BTreeMap::new(),
+            has: vec![],
             permission_mode: "dontAsk".into(),
             codex: vec![],
             ttl: 300,
@@ -812,7 +825,7 @@ mod tests {
         let a = fold(&entries(&b, q).unwrap(), false).attempt.unwrap();
         b.comment(q, &entry("ask", &[], Some(a), "Which way?\nBecause.\n1. left\n2. right ★")).unwrap();
         b.create("taskq host mac", "version 4.0.0", &[service::HOST_LABEL.into()]).unwrap();
-        let r = report(&b, &c, &Value::Null).unwrap();
+        let r = report(&b, &c, &Value::Null, &[]).unwrap();
         assert!(r.contains("In work 0 · Waiting for answer 1 · Ready 1"), "{r}");
         assert!(r.contains(&format!("| [#{n} Ship \\| it](https://board/{n}) | ready |")), "{r}");
         assert!(r.contains(&format!("{q}.1 left · {q}.2 right ★")), "{r}");

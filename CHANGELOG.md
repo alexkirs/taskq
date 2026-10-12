@@ -19,3 +19,5 @@ Rust binary replaces `taskq.py` and `host_service.py`.
 - Only issues with a `q-<state>` label are tasks (§ 1). An issue without one stays untouched; ask the owner whether
   it should become a task (`taskq add`, or add `q-ready`).
 - v3 capacity issue (`<!-- taskq:capacity -->`): v4 does not read it; remove grants of closed tasks.
+
+**Hosts**: a v4 service admits nothing until `taskq service focus all|<label..>` on that host (§ 4).

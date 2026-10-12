@@ -7,6 +7,7 @@ use crate::runtime::{Launch, Proc};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
+#[derive(Clone)]
 pub struct Config {
     pub root: PathBuf,
     pub install: PathBuf,
@@ -16,6 +17,8 @@ pub struct Config {
     pub publish: String,
     pub me: String,
     pub limits: BTreeMap<String, u32>,
+    /// What this host offers for `needs-<x>` labels.
+    pub has: Vec<String>,
     pub permission_mode: String,
     pub codex: Vec<String>,
     pub ttl: i64,
@@ -138,7 +141,8 @@ pub struct Service<'a> {
     pub cfg: &'a Config,
     pub version: String,
     pub kids: Vec<Kid>,
-    pub paused: bool,
+    /// Labels from `<root>/.taskq/focus`; empty: admit nothing, `all`: any task (§ 4).
+    pub focus: Vec<String>,
     /// The last inbox id handed to each attempt's child.
     delivered: HashMap<u64, u64>,
     cache: HashMap<u64, (i64, Vec<Comment>)>,
@@ -150,7 +154,7 @@ pub struct Service<'a> {
 
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, String> + 'a>) -> Self {
-        Service { board, cfg, version: version.into(), kids: vec![], paused: false, delivered: HashMap::new(), cache: HashMap::new(), pruned: HashSet::new(), start, log: vec![] }
+        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), pruned: HashSet::new(), start, log: vec![] }
     }
 
     /// Children of the previous process image after an update re-exec; their inbox counts as delivered.
@@ -287,7 +291,7 @@ impl<'a> Service<'a> {
             self.delivered.insert(a, last);
             self.launch(l)?;
         }
-        if self.paused {
+        if self.focus.is_empty() {
             return Ok(());
         }
         let user = self.board.me().unwrap_or_default();
@@ -297,6 +301,8 @@ impl<'a> Service<'a> {
             .filter(|v| v.task.state == State::Ready || (v.task.state == State::Review && v.task.attempt.is_none()))
             .filter(|v| label(&v.issue, "host-").is_none_or(|h| h == me))
             .filter(|v| !v.issue.labels.iter().any(|l| l == "assignee-only") || v.issue.assignees.contains(&user))
+            .filter(|v| v.issue.labels.iter().filter_map(|l| l.strip_prefix("needs-")).all(|x| self.cfg.has.iter().any(|h| h == x)))
+            .filter(|v| self.focus.iter().any(|f| f == "all" || v.issue.labels.contains(f)))
             .collect();
         queue.sort_by_key(|v| (priority(&v.issue), v.issue.number));
         for v in queue {
@@ -382,6 +388,7 @@ mod tests {
             publish: "pr".into(),
             me: me.into(),
             limits: BTreeMap::from([("claude".to_string(), 1)]),
+            has: vec![],
             permission_mode: "dontAsk".into(),
             codex: vec![],
             ttl: 300,
@@ -394,11 +401,13 @@ mod tests {
     type Exits = Rc<RefCell<Vec<(u64, Rc<RefCell<Option<i32>>>)>>>;
 
     fn service<'a>(b: &'a Fake, c: &'a Config, exits: Exits) -> Service<'a> {
-        Service::new(b, c, "4.0.0", Box::new(move |l: &Launch| {
+        let mut s = Service::new(b, c, "4.0.0", Box::new(move |l: &Launch| {
             let flag = Rc::new(RefCell::new(None));
             exits.borrow_mut().push((l.task, flag.clone()));
             Ok(Box::new(FakeProc(flag)) as Box<dyn Proc>)
-        }))
+        }));
+        s.focus = vec!["all".into()];
+        s
     }
 
     fn task(b: &Fake, n: u64) -> Task {
@@ -473,7 +482,7 @@ mod tests {
         s.pass().unwrap();
         assert_eq!(e.borrow().len(), 2, "an answer is delivered once");
         b.comment(n, &core::entry("requeue", &[], None, "redo")).unwrap();
-        s.paused = true;
+        s.focus = vec![];
         s.pass().unwrap();
         assert_eq!(*e.borrow()[1].1.borrow(), Some(-9));
         assert!(s.kids.is_empty());
@@ -496,6 +505,31 @@ mod tests {
         s.pass().unwrap();
         assert_eq!(task(&b, n).state, State::Doing);
         assert!(b.comments(user).unwrap().is_empty() && b.issue(user).unwrap().labels.is_empty(), "no q- label: never a task");
+    }
+
+    #[test]
+    fn focus_and_needs_choose_tasks() {
+        let b = Fake::default();
+        let win = b.create("W", "", &["q-ready".into(), "needs-windows".into()]).unwrap();
+        let maps = b.create("M", "", &["q-ready".into(), "area-maps".into()]).unwrap();
+        let other = b.create("O", "", &["q-ready".into()]).unwrap();
+        let c = cfg("mac");
+        let mut s = service(&b, &c, Default::default());
+        s.focus = vec![];
+        s.pass().unwrap();
+        assert_eq!(task(&b, other).state, State::Ready, "focus off: nothing starts");
+        s.focus = vec!["area-maps".into()];
+        s.pass().unwrap();
+        assert_eq!((task(&b, maps).state, task(&b, other).state), (State::Doing, State::Ready));
+        let mut c = cfg("mac");
+        c.limits.insert("claude".into(), 9);
+        let mut s = service(&b, &c, Default::default());
+        s.pass().unwrap();
+        assert_eq!((task(&b, win).state, task(&b, other).state), (State::Ready, State::Doing), "mac has no windows");
+        let w = Config { has: vec!["windows".into()], ..c.clone() };
+        let mut s = service(&b, &w, Default::default());
+        s.pass().unwrap();
+        assert_eq!(task(&b, win).state, State::Doing);
     }
 
     #[test]

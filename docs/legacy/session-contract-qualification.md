@@ -2,7 +2,7 @@
 
 Status: proposal and disposable experiments, not production implementation.
 This opening status and slice checkpoints are historical. The current supported boundary is
-the release-review/native-receipts section in [taskq.md](../taskq.md): schema1 model workers
+the release-review/native-receipts section in [taskq.md](taskq-v3.md): schema1 model workers
 remain separate from bounded schema2 artifacts; generic app drain and legacy recovery are
 unsupported. A controlled-artifact PASS does not qualify the ordinary model-worker route.
 Base: qualified c08678b3e2c0ed80bdcdc008bbcbd41bec6a7c44 / contract18756cc9e5b0.

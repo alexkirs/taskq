@@ -1,0 +1,73 @@
+# § 8 Release: one binary per OS, SHA256SUMS, latest.json. A failing selftest publishes nothing.
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-latest
+            target: macos-aarch64
+          - os: windows-latest
+            target: windows-x86_64
+            ext: .exe
+    runs-on: ${{ matrix.os }}
+    env:
+      TASKQ_SELFTEST_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup default stable
+      - name: Version from tag
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          perl -pi -e 'if (!$d && s/^version = ".*"/version = "'"$ver"'"/) { $d = 1 }' Cargo.toml
+          grep -q "^version = \"$ver\"" Cargo.toml
+          echo "VER=$ver" >> "$GITHUB_ENV"
+      - run: cargo test
+      - run: cargo build --release
+      - name: Selftest and stage
+        shell: bash
+        run: |
+          bin="target/release/taskq${{ matrix.ext }}"
+          "$bin" selftest
+          mkdir dist
+          cp "$bin" "dist/taskq-$VER-${{ matrix.target }}${{ matrix.ext }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Describe
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          cd dist
+          sha256sum taskq-* > SHA256SUMS
+          python3 - "$ver" <<'PY'
+          import json, os, sys
+          ver = sys.argv[1]
+          files = {}
+          for name in sorted(os.listdir('.')):
+              if name.startswith(f'taskq-{ver}-'):
+                  files[name[len(f'taskq-{ver}-'):].removesuffix('.exe')] = name
+          json.dump({'version': ver, 'files': files}, open('latest.json', 'w'), indent=1)
+          PY
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes "taskq $GITHUB_REF_NAME"

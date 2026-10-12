@@ -7,3 +7,4 @@ build/
 .claude/*
 !.claude/settings.json
 .taskq/
+/target/

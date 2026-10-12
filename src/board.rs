@@ -569,8 +569,11 @@ impl Board for Fake {
         let mut st = self.state.borrow_mut();
         let t = st.tick();
         let i = st.get(n)?;
-        i.body = body.into();
-        i.updated = t;
+        // like GitHub: an unchanged body keeps `updated_at`
+        if i.body != body {
+            i.body = body.into();
+            i.updated = t;
+        }
         Ok(())
     }
     fn close(&self, n: u64) -> Result<()> {

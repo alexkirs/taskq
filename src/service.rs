@@ -224,8 +224,9 @@ impl<'a> Service<'a> {
         let body = self.heartbeat_body();
         let title = format!("taskq host {me}");
         match hosts.iter().find(|h| h.title == title) {
-            Some(h) if h.body == body && now - h.updated < ttl / 5 => {}
-            Some(h) => self.board.edit(h.number, &body)?,
+            Some(h) if h.body.lines().filter(|l| !l.starts_with("at ")).eq(body.lines()) && now - h.updated < ttl / 5 => {}
+            // a same-body edit leaves `updated_at` as is (GitHub), so the stamp keeps the heartbeat fresh
+            Some(h) => self.board.edit(h.number, &format!("{body}\nat {now}"))?,
             None => {
                 self.board.create(&title, &body, &[HOST_LABEL.to_string()])?;
             }
@@ -430,6 +431,13 @@ mod tests {
         assert_eq!((a.kids.len(), w.kids.len()), (1, 0));
         assert!(b.issue(n).unwrap().labels.contains(&"q-doing".to_string()));
 
+        // a live mac outlasts the ttl: its unchanged heartbeat stays fresh, win leaves the task alone
+        for _ in 0..3 {
+            b.advance(200);
+            a.pass().unwrap();
+            w.pass().unwrap();
+        }
+        assert_eq!(host_of(&task(&b, n)), Some("mac"));
         // the mac host dies: win waits out the ttl, then posts gone and takes the task
         b.advance(301);
         w.pass().unwrap();

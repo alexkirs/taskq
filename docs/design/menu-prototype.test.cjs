@@ -84,6 +84,7 @@ test('D-A8: counters distinguish zero and preserve multi-digit values', () => {
   for(const n of [1,12,100]) { const pill=m.counter(n,'ask','Ответ'); assert(pill.includes('ask filled')); assert(pill.includes('>'+n+'</span>')); }
 });
 test('M-A13: history button and recall stay separate from sending', () => {
+  assert(!html.includes('Scope example'));
   assert(html.includes('aria-label="History and commands"'));
   assert(html.includes('data-recall='));
   assert(html.includes('data-preset='));

@@ -151,13 +151,38 @@ pub struct Service<'a> {
     pruned: HashSet<u64>,
     start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, String> + 'a>,
     pub log: Vec<String>,
-    /// Open tasks of the last pass: number, title, state (for `status.json` and the tray).
-    pub tasks: Vec<(u64, String, &'static str)>,
+    /// Open tasks of the last pass: number, title, state, labels (for `status.json` and the tray).
+    pub tasks: Vec<(u64, String, &'static str, Vec<String>)>,
+    /// State of each open task in the previous pass, for `events`.
+    seen: HashMap<u64, State>,
+    /// First time covered by `<root>/.taskq/events` (§ 4).
+    pub events_since: Option<i64>,
+}
+
+const MONTH: i64 = 30 * 86400;
+
+/// Append `(task, kind, attempt)` moves to the events file at board time `now` (§ 4): one line per attempt and kind,
+/// lines older than 30 days dropped. Returns the first time covered.
+pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> Result<i64, String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines = text.lines();
+    let since = lines.next().and_then(|l| l.strip_prefix("since ")?.parse().ok()).unwrap_or(now).max(now - MONTH);
+    let mut keep: Vec<String> = lines.filter(|l| l.split(' ').next().and_then(|t| t.parse::<i64>().ok()).is_some_and(|t| t >= since)).map(String::from).collect();
+    for (n, kind, a) in moves {
+        if !keep.iter().any(|l| l.ends_with(&format!(" {kind} {a}"))) {
+            keep.push(format!("{now} #{n} {kind} {a}"));
+        }
+    }
+    let out: String = std::iter::once(format!("since {since}")).chain(keep).map(|l| l + "\n").collect();
+    if out != text {
+        crate::platform::write_atomic(path, &out)?;
+    }
+    Ok(since)
 }
 
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, String> + 'a>) -> Self {
-        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), pruned: HashSet::new(), start, log: vec![], tasks: vec![] }
+        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), pruned: HashSet::new(), start, log: vec![], tasks: vec![], seen: HashMap::new(), events_since: None }
     }
 
     /// Children of the previous process image after an update re-exec; their inbox counts as delivered.
@@ -189,8 +214,9 @@ impl<'a> Service<'a> {
         let me = self.cfg.me.clone();
         let ttl = self.cfg.ttl;
         let (views, hosts) = views(self.board, &mut self.cache)?;
-        self.tasks = views.iter().filter(|v| v.task.state != State::Closed).map(|v| (v.issue.number, v.issue.title.clone(), v.task.state.name())).collect();
+        self.tasks = views.iter().filter(|v| v.task.state != State::Closed).map(|v| (v.issue.number, v.issue.title.clone(), v.task.state.name(), v.issue.labels.clone())).collect();
         let now = self.board.now()?;
+        self.events(&views, now)?;
         let by_n: HashMap<u64, &View> = views.iter().map(|v| (v.issue.number, v)).collect();
         let mut touched = HashSet::new();
 
@@ -314,6 +340,44 @@ impl<'a> Service<'a> {
             let Some(rt) = self.free(label(&v.issue, "run-").as_deref()) else { continue };
             let role = if v.task.state == State::Review { "reviewer" } else { "worker" };
             self.claim(v, role, &rt)?;
+        }
+        Ok(())
+    }
+
+    /// Moves to closed or `failed` since the previous pass go to `<root>/.taskq/events` (§ 4). A task gone from the open
+    /// list counts only when a fresh read shows it closed (R12).
+    fn events(&mut self, views: &[View], now: i64) -> Result<(), String> {
+        // the attempt current at the move; a `close` or `failed` that ended it leaves the last spawn
+        let attempt = |t: &Task, c: &[Comment]| t.attempt.or_else(|| c.iter().rev().find(|c| c.trusted && c.body.starts_with("taskq: spawn ")).map(|c| c.id));
+        let now_seen: HashMap<u64, State> = views.iter().map(|v| (v.issue.number, v.task.state)).collect();
+        let first = self.seen.is_empty() && self.events_since.is_none();
+        let mut moves = vec![];
+        for (n, was) in &self.seen {
+            let (to, a) = match views.iter().find(|v| v.issue.number == *n) {
+                Some(v) => (v.task.state, attempt(&v.task, &v.comments)),
+                None if self.board.issue(*n).is_ok_and(|i| !i.open) => (State::Closed, attempt(&Task::default(), &self.board.comments(*n)?)),
+                None => continue,
+            };
+            let kind = match to {
+                State::Closed => "close",
+                State::Failed => "failed",
+                _ => continue,
+            };
+            if let Some(a) = a.filter(|_| *was != to) {
+                moves.push((*n, kind, a));
+            }
+        }
+        moves.sort();
+        self.seen = now_seen;
+        if first || !moves.is_empty() || self.events_since.is_none_or(|s| s < now - MONTH) {
+            let path = crate::dot(&self.cfg.root).join("events");
+            match record(&path, now, &moves) {
+                Ok(s) => self.events_since = Some(s),
+                Err(e) => self.log.push(format!("events: {e}")),
+            }
+        }
+        for (n, kind, a) in moves {
+            self.log.push(format!("#{n} event {kind} {a}"));
         }
         Ok(())
     }
@@ -542,6 +606,52 @@ mod tests {
         let mut s = service(&b, &w, Default::default());
         s.pass().unwrap();
         assert_eq!(task(&b, win).state, State::Doing);
+    }
+
+    #[test]
+    fn events_append_dedup_and_trim() {
+        let p = std::env::temp_dir().join(format!("taskq-events-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(record(&p, 1000, &[(1, "close", 7)]).unwrap(), 1000);
+        record(&p, 2000, &[(1, "close", 7), (2, "failed", 7), (3, "close", 8)]).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "since 1000\n1000 #1 close 7\n2000 #2 failed 7\n2000 #3 close 8\n", "same attempt and kind once");
+        let late = 1500 + MONTH;
+        assert_eq!(record(&p, late, &[]).unwrap(), 1500);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "since 1500\n2000 #2 failed 7\n2000 #3 close 8\n", "older than 30 days dropped");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_pass_records_close_and_failed_and_a_restart_keeps_them() {
+        let root = std::env::temp_dir().join(format!("taskq-ev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".taskq")).unwrap();
+        let b = Fake::default();
+        let (x, y) = (b.create("X", "", &["taskq".into()]).unwrap(), b.create("Y", "", &["taskq".into()]).unwrap());
+        let mut c = cfg("mac");
+        c.root = root.clone();
+        c.limits.insert("claude".into(), 2);
+        let e: Exits = Default::default();
+        let mut s = service(&b, &c, e.clone());
+        s.pass().unwrap();
+        let (ax, ay) = (task(&b, x).attempt.unwrap(), task(&b, y).attempt.unwrap());
+        b.comment(x, &core::entry("result", &["0123456789abcdef0123456789abcdef01234567"], Some(ax), "ok")).unwrap();
+        *e.borrow()[0].1.borrow_mut() = Some(0);
+        s.pass().unwrap();
+        let r = task(&b, x).attempt.unwrap();
+        b.comment(x, &core::entry("close", &[], Some(r), "ok")).unwrap();
+        b.close(x).unwrap();
+        b.comment(y, &core::entry("failed", &[], None, "no way")).unwrap();
+        s.pass().unwrap();
+        let ev = std::fs::read_to_string(root.join(".taskq/events")).unwrap();
+        let lines: Vec<&str> = ev.lines().skip(1).map(|l| l.split_once(' ').unwrap().1).collect();
+        assert_eq!(lines, [format!("#{x} close {r}"), format!("#{y} failed {ay}")], "{ev}");
+        let mut again = service(&b, &c, Default::default());
+        again.pass().unwrap();
+        again.pass().unwrap();
+        assert_eq!(std::fs::read_to_string(root.join(".taskq/events")).unwrap(), ev, "a restart keeps history");
+        assert!(again.events_since.is_some());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

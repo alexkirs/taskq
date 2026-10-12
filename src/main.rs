@@ -535,6 +535,7 @@ fn service_run(c: &Ctx) -> Res<()> {
     let is_installed = installed(&cfg.install);
     let began = Instant::now();
     let mut checked: Option<Instant> = None;
+    let mut update: Option<String> = None;
     let _ = fs::remove_file(d.join("restart"));
     let mut tray = None;
     let project = project_name(&cfg.root);
@@ -552,9 +553,11 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         let at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let kids: Vec<Value> = s.kids.iter().map(|k| json!({"task": k.task, "attempt": k.attempt, "rt": k.rt, "pid": k.proc.id()})).collect();
-        let tasks: Vec<Value> = s.tasks.iter().map(|(n, title, state)| json!({"n": n, "title": title, "state": state})).collect();
+        let tasks: Vec<Value> = s.tasks.iter().map(|(n, title, state, labels)| json!({"n": n, "title": title, "state": state, "labels": labels})).collect();
+        let request = fs::read_to_string(d.join("focus.request")).ok();
         let status = json!({"host": cfg.me, "version": platform::VERSION, "focus": s.focus, "error": r.err(), "kids": kids, "at": at,
-            "pid": std::process::id(), "project": project, "issues": issues, "log": log, "tasks": tasks});
+            "pid": std::process::id(), "project": project, "issues": issues, "log": log, "tasks": tasks,
+            "request": request, "update": update, "events_since": s.events_since});
         let _ = platform::write_atomic(&d.join("status.json"), &serde_json::to_string_pretty(&status).unwrap_or_default());
         if is_installed && began.elapsed().as_secs() >= cfg.rollback_after {
             let h = cfg.install.join("releases").join(platform::VERSION).join("healthy");
@@ -562,15 +565,29 @@ fn service_run(c: &Ctx) -> Res<()> {
                 let _ = fs::write(h, "");
             }
         }
-        if is_installed && checked.is_none_or(|t| t.elapsed().as_secs() >= cfg.update_every) {
+        // § 4 step 7: a not installed service only reports a newer version; `<root>/.taskq/update` checks at once
+        let asked = fs::remove_file(d.join("update")).is_ok();
+        if asked || checked.is_none_or(|t| t.elapsed().as_secs() >= cfg.update_every) {
             checked = Some(Instant::now());
-            match platform::update(&cfg.install, false) {
-                Ok(Some(v)) => {
-                    eprintln!("updated to {v}; restarting");
-                    reexec(&s, cfg)?;
+            match platform::update(&cfg.install, true) {
+                Ok(found) => {
+                    update = found;
+                    if asked {
+                        eprintln!("update requested: {}", update.as_deref().map_or("up to date".into(), |v| format!("{v} found")));
+                    }
                 }
-                Ok(None) => {}
                 Err(e) => eprintln!("update: {e}"),
+            }
+            if is_installed && update.is_some() {
+                match platform::update(&cfg.install, false) {
+                    Ok(Some(v)) => {
+                        eprintln!("updated to {v}; restarting");
+                        update = None;
+                        reexec(&s, cfg)?;
+                    }
+                    Ok(None) => update = None,
+                    Err(e) => eprintln!("update: {e}"),
+                }
             }
         }
         if is_installed && d.join("restart").exists() {
@@ -582,36 +599,73 @@ fn service_run(c: &Ctx) -> Res<()> {
             reexec(&s, cfg)?;
         }
         if is_installed {
-            keep_tray(&cfg.root, &cfg.install, &mut tray);
+            keep_tray(&cfg.install, &mut tray);
         }
         sleep_until_poke(&d.join("poke"), cfg.poll);
     }
 }
 
-/// Start `taskq tray` when its heartbeat `<root>/.taskq/tray` is stale (§ 4); reap the one this image started.
-fn keep_tray(root: &Path, install: &Path, tray: &mut Option<std::process::Child>) {
+/// Start the host's one `taskq tray` of the current release when its heartbeat `<install>/tray` is stale (§ 4); reap
+/// the one this image started.
+fn keep_tray(install: &Path, tray: &mut Option<std::process::Child>) {
     if !cfg!(any(target_os = "macos", windows)) {
         return;
     }
     if tray.as_mut().is_some_and(|c| !matches!(c.try_wait(), Ok(None))) {
         *tray = None;
     }
-    if tray.is_some() || file_age(&dot(root).join("tray")).is_some_and(|a| a < 30) {
+    if tray.is_some() || file_age(&install.join("tray")).is_some_and(|a| a < 30) {
         return;
     }
-    let Ok(mut me) = std::env::current_exe() else { return };
+    let Some(v) = platform::current(install) else { return };
+    let mut exe = platform::release_exe(install, &v);
     if cfg!(windows) {
-        // Windows keys the notification-area pin by exe path. While another project's tray holds the copy, run this
-        // image: an older copy would exit on the version check (tray.rs) and respawn forever.
+        // Windows keys the notification-area pin by exe path; a dead tray no longer locks the copy
         let stable = install.join("taskq-tray.exe");
-        if fs::copy(&me, &stable).is_ok() {
-            me = stable;
+        if fs::copy(&exe, &stable).is_ok() {
+            exe = stable;
         }
     }
-    let mut c = std::process::Command::new(me);
-    let err = fs::File::create(dot(root).join("tray.log")).map(std::process::Stdio::from).unwrap_or_else(|_| std::process::Stdio::null());
-    c.arg("tray").current_dir(root).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(err);
+    let mut c = std::process::Command::new(exe);
+    let err = fs::File::create(install.join("tray.log")).map(std::process::Stdio::from).unwrap_or_else(|_| std::process::Stdio::null());
+    c.arg("tray").current_dir(install).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(err);
+    // its own process group: stopping one project's service (launchctl bootout) leaves the host's tray alone
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut c, 0);
     *tray = platform::quiet(&mut c).spawn().ok();
+}
+
+/// Labels of the open tasks in the last `status.json`, for a resume that has no focus to restore (§ 4).
+fn status_labels(root: &Path) -> Vec<String> {
+    let st: Value = fs::read_to_string(dot(root).join("status.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let mut l: Vec<String> = st["tasks"].as_array().into_iter().flatten().flat_map(|t| t["labels"].as_array().cloned().unwrap_or_default())
+        .filter_map(|x| x.as_str().map(String::from)).filter(|x| !x.starts_with("q-") && x != service::TASK_LABEL).collect();
+    l.sort();
+    l.dedup();
+    l
+}
+
+/// Pause (§ 4): keep the focus in `focus.paused`, admit nothing.
+fn pause(root: &Path) {
+    let d = dot(root);
+    let f = fs::read_to_string(d.join("focus")).unwrap_or_default();
+    if !matches!(f.trim(), "" | "off") {
+        let _ = fs::write(d.join("focus.paused"), f);
+    }
+    let _ = fs::write(d.join("focus"), "off");
+    poke(root);
+}
+
+/// Resume (§ 4): restore the saved focus; never `all` by default.
+fn resume(root: &Path) -> Res<String> {
+    let d = dot(root);
+    let f = fs::read_to_string(d.join("focus.paused")).unwrap_or_default();
+    if matches!(f.trim(), "" | "off") {
+        return Err(format!("no saved focus: choose with `taskq service focus all|<label..>`; labels of open tasks: {}", status_labels(root).join(", ")));
+    }
+    fs::write(d.join("focus"), &f).map_err(|e| e.to_string())?;
+    poke(root);
+    Ok(f.trim().to_string())
 }
 
 /// Windows: `schtasks /End` ends only the launcher; the service, its children and the tray go with this (§ 8).
@@ -684,8 +738,24 @@ fn service(args: &Args) -> Res<()> {
             }
             fs::create_dir_all(&d).map_err(|e| e.to_string())?;
             fs::write(d.join("focus"), &f).map_err(|e| e.to_string())?;
+            match args.one("request") {
+                Some(r) => fs::write(d.join("focus.request"), r).map_err(|e| e.to_string())?,
+                None => {
+                    let _ = fs::remove_file(d.join("focus.request"));
+                }
+            }
             poke(&root);
             println!("focus: {f}");
+            Ok(())
+        }
+        "pause" => {
+            fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+            pause(&root);
+            println!("focus: off");
+            Ok(())
+        }
+        "resume" => {
+            println!("focus: {}", resume(&root)?);
             Ok(())
         }
         "restart" => {
@@ -730,17 +800,17 @@ fn service(args: &Args) -> Res<()> {
             }
             Ok(())
         }
-        _ => Err("usage: taskq service install|run|focus|status|restart|stop|uninstall|list".into()),
+        _ => Err("usage: taskq service install|run|focus|pause|resume|status|restart|stop|uninstall|list".into()),
     }
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn tray(root: PathBuf) -> Res<()> {
-    tray::run(root)
+fn tray(install: PathBuf) -> Res<()> {
+    tray::run(install)
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-fn tray(_root: PathBuf) -> Res<()> {
+fn tray(_install: PathBuf) -> Res<()> {
     Err("taskq tray: macOS and Windows only".into())
 }
 
@@ -768,14 +838,16 @@ fn run(argv: &[String]) -> Res<()> {
         }
         "update" => {
             let install = platform::default_install();
-            match platform::update(&install, a.flags.contains_key("check"))? {
+            let check = a.flags.contains_key("check");
+            match platform::update(&install, check)? {
+                Some(v) if check => println!("update available: {} -> {v}", platform::current(&install).unwrap_or_else(|| platform::VERSION.into())),
                 Some(v) => println!("updated to {v}; the service restarts on its next update check"),
                 None => println!("up to date ({})", platform::current(&install).unwrap_or_else(|| platform::VERSION.into())),
             }
             Ok(())
         }
         "service" => service(&a),
-        "tray" => tray(find_root()?),
+        "tray" => tray(platform::default_install()),
         "" | "help" | "-h" | "--help" => Err(USAGE.into()),
         _ => command(&ctx()?, cmd, &a),
     }
@@ -947,6 +1019,24 @@ mod tests {
         assert_eq!(answer_picks(&b, &c, &[format!("{n}.1")]).unwrap(), vec![format!("closed #{n}: merged 0123456789abcdef0123456789abcdef01234567")]);
         let i = b.issue(n).unwrap();
         assert!(!i.open && !i.labels.iter().any(|l| l.starts_with("q-")));
+    }
+
+    #[test]
+    fn resume_restores_the_saved_focus_and_never_defaults_to_all() {
+        let root = std::env::temp_dir().join(format!("taskq-resume-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(dot(&root)).unwrap();
+        fs::write(dot(&root).join("status.json"), r#"{"tasks": [{"n": 1, "labels": ["taskq", "q-ready", "area-maps"]}]}"#).unwrap();
+        fs::write(dot(&root).join("focus"), "off").unwrap();
+        let e = resume(&root).unwrap_err();
+        assert!(e.contains("labels of open tasks: area-maps"), "{e}");
+        assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
+        fs::write(dot(&root).join("focus"), "area-maps").unwrap();
+        pause(&root);
+        pause(&root);
+        assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
+        assert_eq!(resume(&root).unwrap(), "area-maps", "a second pause keeps the saved focus");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

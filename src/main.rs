@@ -232,6 +232,131 @@ fn join(parts: &[&str]) -> String {
     parts.iter().filter(|p| !p.trim().is_empty()).copied().collect::<Vec<_>>().join("\n\n")
 }
 
+// ---------- message formats (R7, § 1, § 2 ask card, § 7 verdicts) ----------
+
+/// R7: Unicode characters of a line; link targets and `code` spans (exact commands, SHAs, paths) are exempt.
+fn width(l: &str) -> usize {
+    let mut s: String = l.split('`').step_by(2).collect();
+    while let Some(a) = s.find("](") {
+        let b = s[a..].find(')').map_or(s.len(), |b| a + b + 1);
+        s.replace_range(a + 1..b, "");
+    }
+    s.split(' ').filter(|w| !w.is_empty() && !w.starts_with("http://") && !w.starts_with("https://")).map(|w| w.chars().count() + 1).sum::<usize>().saturating_sub(1)
+}
+
+/// Rejects, with a one-line hint, a field outside `min..=max` lines or with a line over `chars` (R7: never cut).
+fn limit(what: &str, lines: &[String], min: usize, max: usize, chars: usize) -> Res<()> {
+    match lines.len() {
+        n if n > 0 && max == 0 => Err(format!("{what}: not allowed here (only with --option)")),
+        n if n < min || n > max => Err(format!("{what}: {n} lines, allowed {min}-{max}; shorten or split")),
+        _ => match lines.iter().map(|l| width(l)).find(|w| *w > chars) {
+            Some(w) => Err(format!("{what}: a line has {w} characters, limit {chars}; shorten it")),
+            None => Ok(()),
+        },
+    }
+}
+
+fn one_line(what: &str, items: &[String]) -> Res<()> {
+    if items.iter().any(|s| s.contains('\n') || s.trim().is_empty()) { Err(format!("{what}: one nonempty line each")) } else { Ok(()) }
+}
+
+/// Labelled `--text` lines (`Label: ..`; an unlabelled line continues the field above) in `spec` order:
+/// (label, min lines, max lines, characters).
+fn fields(text: &str, spec: &[(&str, usize, usize, usize)]) -> Res<Vec<Vec<String>>> {
+    let names = spec.iter().map(|s| format!("`{}:`", s.0)).collect::<Vec<_>>().join(", ");
+    let mut out = vec![vec![]; spec.len()];
+    let mut cur: Option<usize> = None;
+    for l in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match spec.iter().position(|s| l.strip_prefix(s.0).is_some_and(|r| r.starts_with(": "))) {
+            Some(i) if cur.is_none_or(|c| i > c) => cur = Some(i),
+            Some(_) => return Err(format!("--text fields go once each in the order {names}")),
+            None if cur.is_none() => return Err(format!("--text starts with one of {names}")),
+            None => {}
+        }
+        out[cur.unwrap()].push(l.to_string());
+    }
+    for (f, s) in out.iter().zip(spec) {
+        limit(s.0, f, s.1, s.2, s.3)?;
+    }
+    Ok(out)
+}
+
+/// `--link`: `[label](url)` as given, else the URL labelled `#N` by its trailing number, else `link`.
+fn evidence(l: &str) -> String {
+    if l.starts_with('[') && l.contains("](") {
+        return l.to_string();
+    }
+    let tail = l.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
+    format!("[{}]({l})", if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) { format!("#{tail}") } else { "link".into() })
+}
+
+/// § 2 ask card: Done, Problem, optional Evidence, 2-4 options with one ★, the answer line.
+fn ask_card(n: u64, text: &str, opts: &[String], recommend: Option<&str>, links: &[String]) -> Res<String> {
+    let mut lines = fields(text, &[("Done", 1, 1, 160), ("Problem", 1, 2, 240)])?.concat();
+    one_line("--option", opts)?;
+    if !(2..=4).contains(&opts.len()) || opts.iter().any(|o| o.contains('★')) {
+        return Err(format!("{} options, allowed 2-4 without ★; --recommend adds it", opts.len()));
+    }
+    let k = recommend.and_then(|k| k.parse().ok()).filter(|k| (1..=opts.len()).contains(k)).ok_or(format!("--recommend needs one option number 1-{}", opts.len()))?;
+    if links.len() > 2 {
+        return Err("Evidence: at most two --link".into());
+    }
+    let ev: Vec<String> = links.iter().map(|l| evidence(l)).collect();
+    if ev.iter().any(|e| e.split_once("](").is_some_and(|(l, _)| l.chars().count() > 41)) {
+        return Err("Evidence: link labels at most 40 characters".into());
+    }
+    if !ev.is_empty() {
+        lines.push(format!("Evidence: {}", ev.join(", ")));
+    }
+    let opts: Vec<String> = numbered(opts, Some(k)).lines().map(String::from).collect();
+    limit("option", &opts, 2, 4, 160)?;
+    lines.extend(opts);
+    lines.push(format!("To answer: `taskq answer {n}.K` or comment `taskq answer K`."));
+    Ok(lines.join("\n"))
+}
+
+/// § 7 result: Changed, one `Checks:` line per check, Open; a decision appends the § 2 card (Done/Problem in `--text`).
+fn result_text(n: u64, text: &str, checks: &[String], opts: &[String], recommend: Option<&str>, links: &[String]) -> Res<String> {
+    let d = !opts.is_empty() as usize;
+    if d == 0 && (recommend.is_some() || !links.is_empty()) {
+        return Err("--recommend and --link need --option".into());
+    }
+    let f = fields(text, &[("Changed", 1, 2, 240), ("Open", 1, 2, 240), ("Done", d, d, 160), ("Problem", d, 2 * d, 240)])?;
+    let checks: Vec<String> = checks.iter().flat_map(|c| c.lines()).map(str::trim).filter(|c| !c.is_empty()).map(|c| format!("Checks: {}", c.trim_start_matches("Checks: "))).collect();
+    limit("Checks", &checks, 1, 8, 240)?;
+    let verdict = [f[0].clone(), checks, f[1].clone()].concat();
+    limit("result", &verdict, 3, 12, 240)?;
+    let card = if d == 1 { ask_card(n, &[f[2].clone(), f[3].clone()].concat().join("\n"), opts, recommend, links)? } else { String::new() };
+    Ok(join(&[&verdict.join("\n"), &card]))
+}
+
+/// § 7 close verdict: Changed, Checks naming every Acceptance item `A<k> ok|gap|unknown` and CI, Open.
+fn close_verdict(text: &str, body: &str) -> Res<()> {
+    let f = fields(text, &[("Changed", 1, 2, 240), ("Checks", 1, 8, 240), ("Open", 1, 2, 240)])?;
+    limit("verdict", &f.concat(), 3, 12, 240)?;
+    let checks = f[1].join(" ");
+    for k in body.lines().filter_map(|l| l.trim().strip_prefix('A')?.split_once('.')?.0.parse::<u32>().ok()) {
+        if !["ok", "gap", "unknown"].iter().any(|v| checks.contains(&format!("A{k} {v}"))) {
+            return Err(format!("Checks: name A{k} ok|gap|unknown"));
+        }
+    }
+    if checks.contains("CI") { Ok(()) } else { Err("Checks: name the CI outcome on the result SHA".into()) }
+}
+
+/// Selftest of the rendered forms: a result, a close verdict, and an ask card answered by the hand-typed form (§ 2).
+fn formats_selftest() -> Res<String> {
+    let checks = ["cargo test --locked -- pass".to_string()];
+    result_text(1, "Changed: x\nOpen: none", &checks, &[], None, &[])?;
+    close_verdict("Changed: x\nChecks: A1 ok; CI green on the SHA\nOpen: none", "A1. y")?;
+    let card = ask_card(1, "Done: not started\nProblem: pick one", &["left".into(), "right".into()], Some("2"), &[])?;
+    let log: Vec<Entry> = [entry("spawn", &["worker", "claude:s", "mac"], None, ""), entry("ask", &[], Some(1), &card), "taskq answer 2".into()]
+        .into_iter().enumerate().map(|(i, body)| Entry { id: i as u64 + 1, body, edited: false }).collect();
+    match (fold(1, &log, false).state, core::delivery(1, &log, 3)) {
+        (State::Doing, d) if d == "right" => Ok("formats: ask card, result, close verdict PASS".into()),
+        (s, d) => Err(format!("formats: FAIL hand-typed answer gave {} and {d:?}", s.name())),
+    }
+}
+
 /// § 7: publish a reviewed result, then `close`; later and failed tasks close without publication.
 fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str) -> Res<String> {
     let (issue, t, _) = current(b, n)?;
@@ -825,6 +950,7 @@ fn run(argv: &[String]) -> Res<()> {
         "selftest" => {
             let n = core::golden(core::GOLDEN).map_err(|e| format!("fold: FAIL {e}"))?;
             println!("fold: {n} golden traces PASS");
+            println!("{}", formats_selftest()?);
             if std::env::var_os("TASKQ_SELFTEST_OFFLINE").is_none()
                 && let Ok(root) = find_root()
             {
@@ -863,16 +989,23 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             Ok(())
         }
         "add" => {
+            // § 1 task body: Goal, Acceptance, Scope, dependencies; limits checked before any write
             let title = a.pos.get(1).filter(|t| !t.trim().is_empty()).ok_or("title missing")?;
-            let acc = a.all("acceptance");
-            if acc.is_empty() {
-                return Err("--acceptance missing".into());
+            if title.contains('\n') || title.chars().count() > 80 {
+                return Err("title: one line, at most 80 characters; shorten it".into());
             }
-            let acc: String = acc.iter().enumerate().map(|(i, s)| format!("A{}. {s}\n", i + 1)).collect();
-            let mut body = format!("## Goal\n{}\n\n## Acceptance\n{acc}", a.need("goal")?);
-            let scope = a.all("scope");
+            let goal: Vec<String> = a.need("goal")?.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+            limit("Goal", &goal, 1, 2, 240)?;
+            let (acc, scope) = (a.all("acceptance"), a.all("scope"));
+            one_line("--acceptance", &acc)?;
+            one_line("--scope", &scope)?;
+            let acc: Vec<String> = acc.iter().enumerate().map(|(i, s)| format!("A{}. {s}", i + 1)).collect();
+            limit("Acceptance", &acc, 1, 8, 240).map_err(|e| if acc.len() > 8 { format!("{e} (split the task, R2)") } else { e })?;
+            let scope: Vec<String> = scope.iter().map(|s| format!("- {s}")).collect();
+            limit("Scope", &scope, 0, 4, 240)?;
+            let mut body = format!("## Goal\n{}\n\n## Acceptance\n{}\n", goal.join("\n"), acc.join("\n"));
             if !scope.is_empty() {
-                body += &format!("\n## Scope\n{}\n", scope.iter().map(|s| format!("- {s}")).collect::<Vec<_>>().join("\n"));
+                body += &format!("\n## Scope\n{}\n", scope.join("\n"));
             }
             let deps: Vec<u64> = a.all("deps").iter().flat_map(|d| d.split([',', ' '])).filter(|d| !d.is_empty()).map(|d| d.trim_start_matches('#').parse().map_err(|_| format!("bad --deps {d}"))).collect::<Res<_>>()?;
             if !deps.is_empty() {
@@ -903,8 +1036,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
         }
         "ask" => {
             let n = a.num(1)?;
-            let k: Option<usize> = a.one("recommend").map(|k| k.parse().map_err(|_| "bad --recommend")).transpose()?;
-            let body = join(&[a.need("text")?, &numbered(&a.all("option"), k), &a.all("link").join("\n")]);
+            let body = ask_card(n, a.need("text")?, &a.all("option"), a.one("recommend"), &a.all("link"))?;
             print_task(n, &act(b, root, n, "ask", &[], &body)?);
             Ok(())
         }
@@ -922,8 +1054,8 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
         "result" => {
             let n = a.num(1)?;
             let sha = a.need("sha")?;
-            let checks = a.one("checks").map(|c| format!("Checks: {c}")).unwrap_or_default();
-            print_task(n, &act(b, root, n, "result", &[sha], &join(&[&checks, text, &numbered(&a.all("option"), None)]))?);
+            let body = result_text(n, text, &a.all("checks"), &a.all("option"), a.one("recommend"), &a.all("link"))?;
+            print_task(n, &act(b, root, n, "result", &[sha], &body)?);
             Ok(())
         }
         "requeue" | "later" => {
@@ -939,7 +1071,13 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
         "close" => {
             let mut failed = false;
             for i in 1..a.pos.len() {
-                match close_one(b, cfg, a.num(i)?, text) {
+                let n = a.num(i)?;
+                // § 7: a reviewed result closes with the verdict template; later/failed tasks and bare closes keep free text
+                let checked = match current(b, n)? {
+                    (issue, t, _) if t.state == State::Review && !text.is_empty() => close_verdict(text, &issue.body),
+                    _ => Ok(()),
+                };
+                match checked.and_then(|_| close_one(b, cfg, n, text)) {
                     Ok(m) => println!("{m}"),
                     Err(e) => {
                         failed = true;
@@ -1033,6 +1171,75 @@ mod tests {
             assert!(command(&c, "add", &args(extra)).is_err());
         }
         assert_eq!(c.board.issues(None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn add_renders_the_task_body_and_rejects_over_limit_text() {
+        let c = Ctx { cfg: cfg(), raw: json!({}), board: Box::new(Fake::default()) };
+        let run = |v: &[&str]| command(&c, "add", &Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap());
+        c.board.create("dep", "", &[]).unwrap();
+        run(&["add", "T", "--goal", "G", "--acceptance", "a", "--acceptance", "b", "--scope", "s", "--deps", "1"]).unwrap();
+        let i = c.board.issues(None).unwrap().pop().unwrap();
+        assert_eq!(i.body, "## Goal\nG\n\n## Acceptance\nA1. a\nA2. b\n\n## Scope\n- s\n\nDepends on #1\n");
+        let long = "x".repeat(237);
+        assert!(run(&["add", "T", "--goal", "G", "--acceptance", &long]).unwrap_err().contains("241 characters, limit 240"));
+        assert!(run(&["add", &"t".repeat(81), "--goal", "G", "--acceptance", "a"]).unwrap_err().contains("80"));
+        assert!(run(&["add", "T", "--goal", "1\n2\n3", "--acceptance", "a"]).unwrap_err().contains("Goal: 3 lines"));
+        assert!(run(&["add", "T", "--goal", "G", "--acceptance", "a\nb"]).is_err());
+        let mut v = vec!["add", "T", "--goal", "G"];
+        v.extend(["--acceptance", "a"].repeat(9));
+        assert!(run(&v).unwrap_err().contains("split the task"));
+        assert_eq!(c.board.issues(None).unwrap().len(), 2, "rejected input writes nothing");
+    }
+
+    #[test]
+    fn ask_card_follows_section_2() {
+        let card = ask_card(7, "Done: checked spec\nProblem: two ways\nboth slow", &["left".into(), "right, slower".into()], Some("2"), &["https://g/o/r/pull/12".into(), "[shot](https://x/y.png)".into()]).unwrap();
+        assert_eq!(card, "Done: checked spec\nProblem: two ways\nboth slow\nEvidence: [#12](https://g/o/r/pull/12), [shot](https://x/y.png)\n1. left\n2. right, slower ★\nTo answer: `taskq answer 7.K` or comment `taskq answer K`.");
+        let o = |n: usize| vec!["o".to_string(); n];
+        assert!(ask_card(7, "Problem: p", &o(2), Some("1"), &[]).unwrap_err().contains("Done: 0 lines"));
+        assert!(ask_card(7, "question?", &o(2), Some("1"), &[]).unwrap_err().contains("starts with"));
+        assert!(ask_card(7, "Done: d", &o(2), Some("1"), &[]).unwrap_err().contains("Problem: 0 lines"));
+        assert!(ask_card(7, "Problem: p\nDone: d", &o(2), Some("1"), &[]).unwrap_err().contains("order"));
+        assert!(ask_card(7, &format!("Done: {}", "d".repeat(155)), &o(2), Some("1"), &[]).unwrap_err().contains("161 characters, limit 160"));
+        assert!(ask_card(7, "Done: d\nProblem: p", &o(1), Some("1"), &[]).is_err());
+        assert!(ask_card(7, "Done: d\nProblem: p", &o(5), Some("1"), &[]).is_err());
+        assert!(ask_card(7, "Done: d\nProblem: p", &o(2), None, &[]).unwrap_err().contains("--recommend"));
+        assert!(ask_card(7, "Done: d\nProblem: p", &o(2), Some("3"), &[]).is_err());
+        assert!(ask_card(7, "Done: d\nProblem: p", &o(2), Some("1"), &vec!["u".to_string(); 3]).is_err());
+        assert_eq!(width("see [#12](https://very/long/url) and `cargo test --locked` https://x/y"), 13, "link targets and code are exempt");
+    }
+
+    #[test]
+    fn result_and_close_follow_section_7() {
+        let checks = ["cargo test --locked -- pass\ncargo run -- selftest -- pass".to_string()];
+        assert_eq!(result_text(7, "Changed: faster\nOpen: none", &checks, &[], None, &[]).unwrap(), "Changed: faster\nChecks: cargo test --locked -- pass\nChecks: cargo run -- selftest -- pass\nOpen: none");
+        let r = result_text(7, "Changed: c\nOpen: none\nDone: shipped\nProblem: keep it?", &["cargo test --locked -- pass".into()], &["close: ship".into(), "redo".into()], Some("1"), &[]).unwrap();
+        assert_eq!(r, "Changed: c\nChecks: cargo test --locked -- pass\nOpen: none\n\nDone: shipped\nProblem: keep it?\n1. close: ship ★\n2. redo\nTo answer: `taskq answer 7.K` or comment `taskq answer K`.");
+        assert!(result_text(7, "Changed: c\nOpen: none\nDone: d", &checks, &[], None, &[]).unwrap_err().contains("only with --option"));
+        assert!(result_text(7, "Changed: c\nOpen: none", &[], &[], None, &[]).unwrap_err().contains("Checks: 0 lines"));
+        assert!(result_text(7, "summary", &checks, &[], None, &[]).is_err());
+        let body = "## Acceptance\nA1. a\nA2. b\n";
+        assert!(close_verdict("Changed: c\nChecks: A1 ok, A2 gap; CI green on abc\nOpen: A2", body).is_ok());
+        assert!(close_verdict("Changed: c\nChecks: A1 ok; CI green\nOpen: none", body).unwrap_err().contains("A2"));
+        assert!(close_verdict("Changed: c\nChecks: A1 ok, A2 ok\nOpen: none", body).unwrap_err().contains("CI"));
+        assert!(close_verdict("A1 ok, A2 ok; c; open: none", body).is_err(), "the old one-line verdict is rejected");
+        assert_eq!(formats_selftest().unwrap(), "formats: ask card, result, close verdict PASS");
+    }
+
+    #[test]
+    fn rendered_ask_card_resumes_the_worker_through_the_hand_typed_answer() {
+        let b = Fake::default();
+        let n = b.create("T", "## Goal\ng", &["taskq".into()]).unwrap();
+        b.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
+        let a = fold(n, &entries(&b, n).unwrap(), false).attempt;
+        b.comment(n, &entry("ask", &[], a, &ask_card(n, "Done: read spec\nProblem: which way", &["left".into(), "right".into()], Some("1"), &[]).unwrap())).unwrap();
+        let card = fold(n, &entries(&b, n).unwrap(), false).card.unwrap();
+        assert!(card.ends_with(&format!("To answer: `taskq answer {n}.K` or comment `taskq answer K`.")), "{card}");
+        b.comment(n, "taskq answer 2").unwrap();
+        let log = entries(&b, n).unwrap();
+        assert_eq!(fold(n, &log, false).state, State::Doing);
+        assert_eq!(core::delivery(n, &log, log.last().unwrap().id), "right");
     }
 
     #[test]

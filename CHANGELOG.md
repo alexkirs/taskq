@@ -13,6 +13,10 @@ taking `all`. `<root>/.taskq/update` makes the next pass check for an update at 
 The tray icon shows run or pause (macOS may show the summary) and a click opens a webview popover: questions and
 failed of all projects, project pages, pause/resume, log, folder, restart, stop and uninstall. View, text size and
 period persist in `<install>/tray.json`; `taskq tray --snapshot DIR` writes its icons and popover pages as PNG.
+`taskq add`, `ask`, `result` and `close` render and check the taskq.md message formats (§ 1 task body, § 2 ask card,
+§ 7 verdicts): `ask --text` and decision results take `Done:`/`Problem:` lines, `result --text` takes `Changed:`/`Open:`
+with one `--checks` line per check, a reviewed `close --text` takes `Changed:`/`Checks:`/`Open:`; over-limit text is
+rejected. Old comments fold unchanged; no board change.
 
 ## v4.0.10
 

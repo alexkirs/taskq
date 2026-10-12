@@ -148,6 +148,14 @@ pub fn command(env: &Env, l: &Launch) -> Command {
     c
 }
 
+const FORMATS: &str = "Put each `--text` field on its own line. The commands render and check the taskq.md templates and limits (§ 2 Ask card,\n\
+     § 7 Result and close verdicts): Done ≤160, Problem 1-2 lines, 2-4 options ≤160, ≤2 links; result/close lines ≤240,\n\
+     Changed and Open 1-2 lines, 1-8 checks. Over-limit text is rejected: shorten it, never hand-write card prose.\n";
+
+fn ask(q: &impl std::fmt::Display, n: u64) -> String {
+    format!("`{q} ask {n} --text \"Done: <checked or not started>\nProblem: <decision and user effect>\" --option A --option B --recommend K [--link URL]`")
+}
+
 pub fn brief(env: &Env, l: &Launch) -> String {
     let (n, q) = (l.task, env.exe.display());
     let head = format!(
@@ -159,18 +167,22 @@ pub fn brief(env: &Env, l: &Launch) -> String {
             "Review the result SHA against each Acceptance item `A<k>` and taskq.md, and CI on that exact SHA. Requeue only for\n\
              Acceptance or contract gaps, not style; a changed or deleted existing test is a gap unless the diff changes its rule.\n\
              Then exactly one of:\n\
-             - `{q} close {n} --text \"A1 ok, A2 ok; <changed for the user>; open: <..|none>\"` (it publishes),\n\
+             - `{q} close {n} --text \"Changed: <user effect>\nChecks: A1 ok|gap|unknown, A2 ..; CI <outcome> on <SHA>\nOpen: <item|none>\"` (it publishes),\n\
              - `{q} requeue {n} --text \"<exact fixes>\"`,\n\
-             - `{q} ask {n} --text \"<question>\" --option A --option B --recommend K`.\n"
+             - {ask}.\n{formats}",
+            ask = ask(&q, n),
+            formats = FORMATS
         )
     } else {
         format!(
             "Work only in `.worktrees/taskq-{n}` on branch `taskq-{n}` from origin/main (continue an existing branch).\n\
              Commit with the line `Task: {url}` in the message, rebase on origin/main, run the project checks, then {push}.\n\
              Then exactly one of:\n\
-             - `{q} result {n} --sha <full SHA> --checks \"<commands and outcome>\" --text \"<summary>\"`,\n\
-             - `{q} ask {n} --text \"<question>\" --option A --option B --recommend K` (owner decision; Acceptance unclear or untestable; or a split of work bigger than one reviewable diff — before any code),\n\
-             - `{q} requeue {n} --text \"<why it cannot be done>\"`.\n",
+             - `{q} result {n} --sha <full SHA> --checks \"<command -- outcome>\" [--checks ..] --text \"Changed: <user effect>\nOpen: <item|none>\"`,\n\
+             - {ask} (owner decision; Acceptance unclear or untestable; or a split of work bigger than one reviewable diff — before any code),\n\
+             - `{q} requeue {n} --text \"<why it cannot be done>\"`.\n{formats}",
+            ask = ask(&q, n),
+            formats = FORMATS,
             url = l.url,
             push = if env.publish == "direct" { "push the branch" } else { "push the branch and open one PR/MR into main" }
         )
@@ -214,7 +226,7 @@ mod tests {
         assert!(envs.contains(&("TASKQ_ATTEMPT".into(), Some("42".into()))));
         l.role = "worker".into();
         let b = brief(&env, &l);
-        assert!(b.contains("/i/taskq result 7 --sha") && b.contains("`Task: https://b/7`") && b.contains("open one PR"));
+        assert!(b.contains("/i/taskq result 7 --sha") && b.contains("`Task: https://b/7`") && b.contains("open one PR") && b.contains("Changed: <user effect>\nOpen:") && b.contains("§ 2 Ask card"));
         let u = uuid();
         assert_eq!((u.len(), &u[14..15]), (36, "4"));
     }

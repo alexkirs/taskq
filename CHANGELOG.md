@@ -3,6 +3,10 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.0.2
+
+Windows `service install` registers the Scheduled Task for the current user, so it no longer needs admin ("Access is denied").
+
 ## v4.0.1
 
 No token file needed: the board token falls back to the `gh`/`glab` login of the board host (§ 9).

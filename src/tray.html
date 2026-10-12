@@ -41,7 +41,7 @@ button:disabled{color:var(--muted);opacity:.75}
 .alert{color:var(--failed)}
 .bars{display:flex;align-items:flex-end;gap:2px;height:28px;padding:0 4px}
 .bars span{flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%}
-.bars i{display:block;background:var(--work)}.bars i.bad{background:var(--failed)}
+.bars i{display:block}.bars i.k0{background:var(--work)}.bars i.k1{background:var(--failed)}.bars i.k2{background:var(--ask)}.bars i.k3{background:var(--ready)}
 .bars span.unknown{border:1px dashed var(--edge);border-bottom:0}
 .range{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 6px;align-items:center;padding:4px}
 .range input,.range select{font:inherit;font-size:.9em;min-width:0;color:inherit;background:none;border:1px solid var(--edge);border-radius:4px;padding:3px}
@@ -95,14 +95,15 @@ function custom(){
   return '<div class="range"><label for="hs">Start</label><input id="hs" type="datetime-local" data-draft="start" value="'+esc(d.start)+'"><label for="he">End</label><input id="he" type="datetime-local" data-draft="end" value="'+esc(d.end)+'"><label for="hz">Time zone</label><select id="hz" data-draft="tz">'+[['local','Local ('+zone+')'],['UTC','UTC']].map(([v,l])=>'<option value="'+v+'"'+(d.tz===v?' selected':'')+'>'+esc(l)+'</option>').join('')+'</select></div>'+
   (d.error?'<div class="body alert" role="alert">'+esc(d.error)+'</div>':'')+'<button class="project" data-a="range">Show [start, end)</button>';}
 function history(){
-  const H=S.history,n=H.bins.length,w=(H.end-H.start)/n,c=H.bins.reduce((a,b)=>a+b[0],0),f=H.bins.reduce((a,b)=>a+b[1],0);
-  const peak=Math.max(1,...H.bins.map(b=>b[0]+b[1])),none=S.projects.filter(p=>p.since==null).map(p=>p.name),part=none.length>0||H.since>H.start;
+  // series stack from the bottom in this order on one scale: the peak of the sum (M6)
+  const H=S.history,n=H.bins.length,w=(H.end-H.start)/n,kinds=['closed','failed','ask','waiting'],tot=kinds.map((_,k)=>H.bins.reduce((a,b)=>a+b[k],0));
+  const sum=b=>b.reduce((a,x)=>a+x,0),named=(b,sep)=>kinds.map((k,i)=>k+' '+b[i]).join(sep),peak=Math.max(1,...H.bins.map(sum)),none=S.projects.filter(p=>p.since==null).map(p=>p.name),part=none.length>0||H.since>H.start;
   const note=H.since==null?'No history yet: unknown, not zero.':[H.since>H.start?'Incomplete: history since '+when(H.since,H.tz)+'; earlier is unknown, not zero.':'',none.length?'No history in '+none.join(', ')+'.':''].join(' ').trim();
-  const total=H.since==null?'closed — · failed —':'closed '+c+' · failed '+f+(part?' · incomplete':'');
+  const total=H.since==null?kinds.map(k=>k+' —').join(' · '):named(tot,' · ')+(part?' · incomplete':'');
   return '<details class="group hist"><summary>▥ History <span class="meta">'+periods[S.period]+' · '+total+'</span></summary><div class="options periods">'+Object.entries(periods).map(([k,l])=>'<button data-set="period" data-v="'+k+'" aria-pressed="'+(S.period===k||k==='custom'&&draft!=null)+'">'+l+'</button>').join('')+'</div>'+
   (draft?custom():'')+'<div class="body meta">['+esc(when(H.start,H.tz))+', '+esc(when(H.end,H.tz))+') · peak '+peak+'</div>'+
-  '<div class="bars" role="img" aria-label="'+esc('Closed '+c+', failed '+f+'; '+n+' equal bins, oldest left'+(note?'; '+note:''))+'">'+H.bins.map(([bc,bf],i)=>{const t=H.start+i*w,u=H.since==null||t+w<=H.since;
-    return '<span'+(u?' class="unknown" title="unknown"':' title="'+esc(when(t,H.tz)+': closed '+bc+', failed '+bf)+'"')+'><i class="bad" style="height:'+bf/peak*100+'%"></i><i style="height:'+bc/peak*100+'%"></i></span>';}).join('')+'</div>'+(note?'<div class="body meta">'+esc(note)+'</div>':'')+'</details>';}
+  '<div class="bars" role="img" aria-label="'+esc(named(tot,', ')+'; '+n+' equal bins, oldest left'+(note?'; '+note:''))+'">'+H.bins.map((b,i)=>{const t=H.start+i*w,u=H.since==null||t+w<=H.since;
+    return '<span'+(u?' class="unknown" title="unknown"':' title="'+esc(when(t,H.tz)+': '+named(b,', '))+'"')+'>'+[3,2,1,0].map(k=>'<i class="k'+k+'" style="height:'+b[k]/peak*100+'%"></i>').join('')+'</span>';}).join('')+'</div>'+(note?'<div class="body meta">'+esc(note)+'</div>':'')+'</details>';}
 // `Update now` only for a newer version in status.json; success only once a status.json reads it back (M9)
 function update(){
   const up=S.projects.find(p=>p.update&&p.update!==p.version);

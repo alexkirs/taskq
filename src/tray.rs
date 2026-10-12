@@ -116,15 +116,18 @@ fn now() -> i64 {
 }
 
 /// What the icon and the history show: in work, `ask`, ready over all projects (one task per board and issue), whether
-/// any project admits, 12 equal close/failed bins of `[start, end)` (oldest first) and the latest `since` of the
+/// any project admits, 12 equal bins of `[start, end)` (oldest first) counting `KINDS` and the latest `since` of the
 /// projects that have history (None: none has).
 #[derive(Clone)]
 struct Summary {
     counts: [usize; 3],
     run: bool,
-    bins: Vec<(u32, u32)>,
+    bins: Vec<[u32; 4]>,
     since: Option<i64>,
 }
+
+/// Event kinds of the history, in stacking order from the bottom (M6).
+const KINDS: [&str; 4] = ["close", "failed", "ask", "blocked"];
 
 fn summary(ps: &[Value], (start, end): (i64, i64)) -> Summary {
     let mut seen = std::collections::HashMap::new();
@@ -134,14 +137,14 @@ fn summary(ps: &[Value], (start, end): (i64, i64)) -> Summary {
         }
     }
     let n = |want: &[&str]| seen.values().filter(|s| want.contains(&s.as_str())).count();
-    let mut bins = vec![(0, 0); 12];
+    let mut bins = vec![[0; 4]; 12];
     let mut ev = std::collections::HashSet::new();
     for p in ps {
         for e in p["events"].as_array().into_iter().flatten() {
             let (t, kind) = (e[0].as_i64().unwrap_or(0), e[1].as_str().unwrap_or(""));
+            let Some(k) = KINDS.iter().position(|x| *x == kind) else { continue };
             if t >= start && t < end && ev.insert(format!("{} {} {kind}", p["issues"], e[2])) {
-                let b = &mut bins[(((t - start) * 12 / (end - start)) as usize).min(11)];
-                if kind == "failed" { b.1 += 1 } else { b.0 += 1 }
+                bins[(((t - start) * 12 / (end - start)) as usize).min(11)][k] += 1;
             }
         }
     }
@@ -620,9 +623,10 @@ fn wide(s: &Summary, dark: bool) -> Rgba {
             digit(&mut img, x + k as f32 * 7.0, 1.5, (ch - b'0') as u32, gray(c));
         }
     }
-    let peak = s.bins.iter().map(|b| b.0 + b.1).max().unwrap_or(0).max(1) as f32;
+    // ponytail: the icon keeps close/failed only (§ 4); the popover stacks all four kinds
+    let peak = s.bins.iter().map(|b| b[0] + b[1]).max().unwrap_or(0).max(1) as f32;
     let bw = (w + 1.0) / s.bins.len() as f32;
-    for (i, (close, failed)) in s.bins.iter().enumerate() {
+    for (i, [close, failed, ..]) in s.bins.iter().enumerate() {
         let (x, base) = (i as f32 * bw, 22.0);
         let (gh, rh) = (*close as f32 * 7.0 / peak, *failed as f32 * 7.0 / peak);
         img.fill(gray(p.work), rect(x, base - gh, x + bw - 1.0, base));
@@ -729,7 +733,7 @@ mod tests {
 
     #[test]
     fn summary_widens_for_long_numbers_and_grays_when_paused() {
-        let mut s = Summary { counts: [1, 0, 2], run: true, bins: vec![(1, 0); 12], since: None };
+        let mut s = Summary { counts: [1, 0, 2], run: true, bins: vec![[1, 0, 0, 0]; 12], since: None };
         assert_eq!(wide(&s, true).w, 94);
         s.counts = [100, 12, 1000];
         assert!(wide(&s, true).w > 94);
@@ -746,8 +750,8 @@ mod tests {
         let s = summary(&ps, (-200, 100));
         assert_eq!(s.counts, [1, 1, 0]);
         assert!(s.run && !summary(&ps[..2], (-200, 100)).run);
-        assert_eq!(s.bins.iter().map(|b| b.0).sum::<u32>(), 2, "same attempt on two boards counts twice, on one board once");
-        assert_eq!(s.bins.iter().map(|b| b.1).sum::<u32>(), 0, "outside the period");
+        assert_eq!(s.bins.iter().map(|b| b[0]).sum::<u32>(), 2, "same attempt on two boards counts twice, on one board once");
+        assert_eq!(s.bins.iter().map(|b| b[1]).sum::<u32>(), 0, "outside the period");
     }
 
     #[test]
@@ -764,15 +768,17 @@ mod tests {
 
     #[test]
     fn history_bins_are_equal_oldest_left_on_one_scale() {
-        // M-A5/M-A6 fixture: 3 closes and 3 failed in [0, 120); the first and last bins are not empty
-        let ev = json!([[0, "close", "1"], [5, "close", "2"], [119, "close", "3"], [0, "failed", "4"], [60, "failed", "5"], [119, "failed", "6"], [120, "failed", "7"], [-1, "close", "8"]]);
+        // M-A5/M-A6 fixture: 3 of each kind in [0, 120); the first and last bins are not empty; unknown kinds drop
+        let ev = json!([[0, "close", "1"], [5, "close", "2"], [119, "close", "3"], [0, "failed", "4"], [60, "failed", "5"], [119, "failed", "6"], [120, "failed", "7"], [-1, "close", "8"],
+            [0, "ask", "9"], [30, "ask", "10"], [119, "ask", "11"], [10, "blocked", "12"], [60, "blocked", "13"], [119, "blocked", "14"], [50, "later", "15"]]);
         let p = json!([{"issues": "u", "tasks": [], "focus": ["all"], "events": ev, "since": -10}]);
         let s = summary(p.as_array().unwrap(), (0, 120));
         assert_eq!(s.bins.len(), 12);
-        assert_eq!((s.bins[0], s.bins[6], s.bins[11]), ((2, 1), (0, 1), (1, 1)), "[start, end): 120 and -1 are out");
+        assert_eq!((s.bins[0], s.bins[6], s.bins[11]), ([2, 1, 1, 0], [0, 1, 0, 1], [1, 1, 1, 1]), "[start, end): 120 and -1 are out");
+        assert_eq!((0..4).map(|k| s.bins.iter().map(|b| b[k]).sum::<u32>()).collect::<Vec<_>>(), [3, 3, 3, 3]);
         assert_eq!(s.since, Some(-10));
         // equal counts draw equal heights in the icon: as many green as red pixel rows in a column clear of the digits
-        let one = Summary { counts: [0, 0, 0], run: true, bins: vec![(3, 3); 12], since: None };
+        let one = Summary { counts: [0, 0, 0], run: true, bins: vec![[3, 3, 3, 3]; 12], since: None };
         let (img, pal) = (wide(&one, true), palette(true));
         let col = |c: [u8; 4]| (0..img.h).filter(|y| img.px[((y * img.w + 17) * 4) as usize..][..3] == c[..3]).count();
         assert!(col(pal.work) > 0 && col(pal.work) == col(pal.failed));

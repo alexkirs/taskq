@@ -16,6 +16,6 @@ Rust binary replaces `taskq.py` and `host_service.py`.
   `**failed**` comment; with none, ask the owner for the reason.
 - `ask`: v4 has no `ask` without an attempt. Show the owner the question; the owner answers it in v3 before the
   cutover or the task is parked with `taskq later N --text <question>`.
-- No v3 block and no `taskq:` entry: v4 would take it as a `ready` task. Ask the owner: a task, or a user issue to
-  leave alone.
+- Only issues with a `q-<state>` label are tasks (§ 1). An issue without one stays untouched; ask the owner whether
+  it should become a task (`taskq add`, or add `q-ready`).
 - v3 capacity issue (`<!-- taskq:capacity -->`): v4 does not read it; remove grants of closed tasks.

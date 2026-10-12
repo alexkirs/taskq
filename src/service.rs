@@ -26,6 +26,11 @@ pub struct Config {
 
 pub const HOST_LABEL: &str = "taskq-host";
 
+/// Only issues with a `q-<state>` label are tasks (§ 1): a user issue never starts by itself.
+pub fn is_task(i: &Issue) -> bool {
+    i.trusted && !is_host(i) && i.labels.iter().any(|l| l.starts_with("q-"))
+}
+
 pub fn is_host(i: &Issue) -> bool {
     i.labels.iter().any(|l| l == HOST_LABEL) && i.title.starts_with("taskq host ")
 }
@@ -108,7 +113,7 @@ pub fn views(board: &dyn Board, cache: &mut HashMap<u64, (i64, Vec<Comment>)>) -
     let open: HashSet<u64> = issues.iter().map(|i| i.number).collect();
     let (hosts, tasks): (Vec<Issue>, Vec<Issue>) = issues.into_iter().filter(|i| i.trusted).partition(is_host);
     let mut out = vec![];
-    for issue in tasks {
+    for issue in tasks.into_iter().filter(is_task) {
         let comments = match cache.get(&issue.number) {
             Some((u, c)) if *u == issue.updated => c.clone(),
             _ => board.comments(issue.number)?,
@@ -403,7 +408,7 @@ mod tests {
     #[test]
     fn two_hosts_admit_one_attempt_and_the_survivor_recovers_a_dead_host() {
         let b = Fake::default();
-        let n = b.create("T", "## Goal\ng", &[]).unwrap();
+        let n = b.create("T", "## Goal\ng", &["q-ready".into()]).unwrap();
         let (ca, cb) = (cfg("mac"), cfg("win"));
         let (ea, eb): (Exits, Exits) = Default::default();
         let mut a = service(&b, &ca, ea.clone());
@@ -428,7 +433,7 @@ mod tests {
     #[test]
     fn exit_without_result_is_gone_and_result_brings_a_reviewer() {
         let b = Fake::default();
-        let n = b.create("T", "", &[]).unwrap();
+        let n = b.create("T", "", &["q-ready".into()]).unwrap();
         let c = cfg("mac");
         let e: Exits = Default::default();
         let mut s = service(&b, &c, e.clone());
@@ -450,7 +455,7 @@ mod tests {
     #[test]
     fn answer_resumes_the_same_session_and_requeue_stops_the_child() {
         let b = Fake::default();
-        let n = b.create("T", "", &[]).unwrap();
+        let n = b.create("T", "", &["q-ready".into()]).unwrap();
         let c = cfg("mac");
         let e: Exits = Default::default();
         let mut s = service(&b, &c, e.clone());
@@ -479,8 +484,9 @@ mod tests {
         let b = Fake::default();
         let dep = b.create("dep", "", &["later".into()]).unwrap();
         b.comment(dep, &core::entry("later", &[], None, "")).unwrap();
-        let n = b.create("T", &format!("Depends on #{dep}"), &[]).unwrap();
-        let other = b.create("O", "", &["host-win".into()]).unwrap();
+        let n = b.create("T", &format!("Depends on #{dep}"), &["q-ready".into()]).unwrap();
+        let other = b.create("O", "", &["q-ready".into(), "host-win".into()]).unwrap();
+        let user = b.create("U", "", &[]).unwrap();
         let c = cfg("mac");
         let mut s = service(&b, &c, Default::default());
         s.pass().unwrap();
@@ -489,6 +495,7 @@ mod tests {
         b.close(dep).unwrap();
         s.pass().unwrap();
         assert_eq!(task(&b, n).state, State::Doing);
+        assert!(b.comments(user).unwrap().is_empty() && b.issue(user).unwrap().labels.is_empty(), "no q- label: never a task");
     }
 
     #[test]
@@ -505,7 +512,7 @@ mod tests {
         std::fs::write(root.join(".worktrees/taskq-2/wip"), "x").unwrap();
         let b = Fake::default();
         for _ in 0..3 {
-            b.create("T", "", &[]).unwrap();
+            b.create("T", "", &["q-ready".into()]).unwrap();
         }
         b.close(1).unwrap();
         b.close(2).unwrap();

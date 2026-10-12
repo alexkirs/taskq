@@ -100,8 +100,9 @@ Owner decisions on looks and sound, one line each. Change one only per R13.
 - Tone: minimum words, plain to anyone, no filler (R7).
 
 ## 1. Tasks
-A task is an open issue by a trusted author (GitHub `OWNER|MEMBER|COLLABORATOR`, GitLab Reporter+). A closed issue is
-done. The issue text is for people and may be edited by hand: `## Goal`, `## Acceptance`, optional `## Scope`, and one
+A task is an open issue by a trusted author (GitHub `OWNER|MEMBER|COLLABORATOR`, GitLab Reporter+) with a `q-<state>`
+label; `taskq add` sets it, a person on the board adds `q-ready`. Any other issue is never started: a PM turns it into
+a task with `taskq add` and comments on it when the task closes. A closed issue is done. The issue text is for people and may be edited by hand: `## Goal`, `## Acceptance`, optional `## Scope`, and one
 line `Depends on #N` per dependency. Acceptance items are numbered `A1.`, `A2.`, never renumbered; each is an
 observable result a reviewer checks without reading the code.
 

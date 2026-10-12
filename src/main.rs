@@ -422,7 +422,7 @@ fn wait(b: &dyn Board, cfg: &Config, window_min: u64) -> Res<Vec<String>> {
         let issues = b.issues(since.map(|s| s - 1).or(Some(now)))?;
         let open: Vec<u64> = b.issues(None)?.iter().map(|i| i.number).collect();
         let mut moved = vec![];
-        for i in issues.iter().filter(|i| i.trusted && !service::is_host(i)) {
+        for i in issues.iter().filter(|i| service::is_task(i)) {
             let t = fold(&entries(b, i.number)?, core::depends(&i.body).iter().any(|d| open.contains(d)));
             let state = if !i.open { "closed".to_string() } else if t.state == State::Review && t.card.is_some() { "review*".into() } else { t.state.name().into() };
             if seen.get(&i.number) != Some(&state) && matches!(state.as_str(), "ask" | "review*" | "closed" | "failed") {
@@ -786,7 +786,7 @@ mod tests {
     #[test]
     fn commands_write_only_accepted_entries_and_close_publishes() {
         let (b, c) = (Fake::default(), cfg());
-        let n = b.create("T", "## Goal\ng", &[]).unwrap();
+        let n = b.create("T", "## Goal\ng", &["q-ready".into()]).unwrap();
         assert!(act(&b, &c.root, n, "steer", &[], "x").unwrap_err().contains("ready"), "steer needs a live worker");
         let before = b.comments(n).unwrap().len();
         b.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
@@ -806,8 +806,8 @@ mod tests {
     #[test]
     fn report_follows_r6() {
         let (b, c) = (Fake::default(), cfg());
-        let n = b.create("Ship | it", "", &[]).unwrap();
-        let q = b.create("Q", "", &[]).unwrap();
+        let n = b.create("Ship | it", "", &["q-ready".into()]).unwrap();
+        let q = b.create("Q", "", &["q-ready".into()]).unwrap();
         b.comment(q, &entry("spawn", &["worker", "claude:abc", "mac"], None, "")).unwrap();
         let a = fold(&entries(&b, q).unwrap(), false).attempt.unwrap();
         b.comment(q, &entry("ask", &[], Some(a), "Which way?\nBecause.\n1. left\n2. right ★")).unwrap();

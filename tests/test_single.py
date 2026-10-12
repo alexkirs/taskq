@@ -802,6 +802,18 @@ class Coordination(Base):
         self.assertTrue(path.is_file())
         self.assertIsNotNone(self.board.guard)
 
+    def test_archived_stopped_codex_retirement_removes_handle_without_cli(self):
+        codex = taskq.Codex()
+        path = codex.folder() / 'S1.pid'
+        path.write_text(f'99999 session {BIRTH}')
+        with mock.patch.object(taskq, 'process_identity', return_value=('dead', None)), \
+                mock.patch.object(taskq, 'rollout', return_value='archived') as rollout, \
+                mock.patch.object(taskq.subprocess, 'run') as archive:
+            self.assertIs(codex.retire(lambda *args: True, running=False), True)
+        rollout.assert_called_once_with('session')
+        archive.assert_not_called()
+        self.assertFalse(path.exists())
+
     def test_failed_claude_stop_never_resumes_or_removes(self):
         claude = taskq.Claude()
         agent = {'id': 'job', 'sessionId': 'sid', 'pid': 1, 'name': 'S1 CDX task (mac)'}

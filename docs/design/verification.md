@@ -1,53 +1,58 @@
-# Проверка дизайна меню
+# Operator menu verification
 
-Проверяемый источник: [menu-prototype.html](menu-prototype.html).
-Требования: [operator-ui.md](operator-ui.md), [menu.md](menu.md).
-Прототип не является адаптером настоящего сервиса. Состояния задач демонстрационные; URL ведут на реальные issues.
+Sources: [menu-prototype.html](menu-prototype.html), [icon-studies.html](icon-studies.html).
+Requirements: [operator-ui.md](operator-ui.md), [menu.md](menu.md).
+Phase 0 records the approved design target; it does not implement a service adapter, native popover or AI channel.
+The HTML uses English and a small state/action bridge target instead of OpenAI widget state.
 
-## Выполнено
+## Checks for this package
 
-- `node docs/design/menu-prototype.test.cjs`: 13 проверок PASS.
-- `node docs/design/icon-studies.test.cjs`: PASS; общая линейная шкала, сохранение итогов, ненулевые крайние бары fixture, центрирование overlay, повторное использование компактной q. Проверки геометрии статические, не raster/OS.
-- `cargo test --locked`: PASS, 15 тестов по сводке launcher.
-- `cargo run -- selftest`: PASS, 31 golden trace; доска GitHub прочитана успешно.
-- `git diff --check`: PASS; `taskq.md` остаётся 300 строк.
+Run `node docs/design/menu-prototype.test.cjs`, `node docs/design/icon-studies.test.cjs`,
+`cargo test --locked`, `cargo run -- selftest`, and `git diff --check` before handoff.
+Cargo checks establish current-product regression evidence, not implementation of the target menu.
 
-Cargo-проверки подтверждают отсутствие выявленных регрессий текущего продукта, не реализацию целевого меню.
-Проверки запускаются через установленный agent-context launcher, кроме короткого теста макета.
+Observed for this package: both Node commands pass (19 menu fixture checks; icon model, render and pause checks).
+`git diff --check` passes; all 21 existing acceptance IDs remain and M-A14 is appended.
 
-## Покрытие
+Rust verification: `cargo test --locked` in Ubuntu WSL passes 15 tests; `cargo run -- selftest`
+passes 31 golden traces and the GitHub board read. Native Windows cargo stopped before tests because the
+GNU toolchain could not find `dlltool.exe`; this is not a native Windows PASS.
+No existing D-A or M-A ID is removed or renumbered; Add project appends M-A14.
 
-| Критерий | Доказательство | Граница |
+## Coverage and limits
+
+| Criteria | Evidence to inspect | Qualification still required |
 |---|---|---|
-| D-A1, D-A2, M-A3 | Одна ссылка содержит статус, номер и название; корректные URL; проект различим; текст экранирован | Структура сгенерированной строки; не browser click-through |
-| D-A3, M-A1 | Статические проверки наличия размеров и двух видов, компактный вид по умолчанию | DOM, восстановление настроек и физический размер не квалифицированы |
-| M-A2 | Пересечение fixtures не удваивает задачи; другой репозиторий с тем же номером различим; review/waiting считаются корректно | Разрешения исполнения настоящего ARM не проверены |
-| M-A5, M-A6 | Текущий failed независим от истории; event ID, [start,end), нулевой диапазон, неверные даты | Источник истории, неполнота и реальная доставка не подключены |
-| M-A7 | Чистая модель отказывает stale-подтверждению, повтор не применяется дважды | Не интеграционный тест AI, транспорта, readback или перезапуска |
+| D-A1, D-A2, M-A3 | Generated issue rows contain status, number, title and the correct project URL; text escaping | Native click-through and navigation |
+| D-A3, M-A1 | Font choices, compact default, platform-specific view gating; 22 pt macOS summary study | Settings restoration, physical size and OS scaling |
+| D-A4, D-A5, D-A8 | Compact grid and count labels; shared visible digit/graph edges; proportional stacked bars | 320/360 px, long names, 0/1/12/100 counts, both themes, 100/200% scaling |
+| D-A6, D-A7 | Accessible labels, keyboard targets, hidden empty groups | Contrast, screen reader, touch targets and color-independent meaning |
+| M-A2 | Fixture task deduplication; installed registry target; observation focus off distinct from ARM | One host tray over real registry, actual focus plus host filtering; no separate PM filter |
+| M-A4, M-A11, M-A12 | Scoped maintenance presentation and saved-focus requirement | Mixed pause, label prompt when focus missing, neighbor-project safety, restart, stop, uninstall, update readback |
+| M-A5, M-A6 | Event-ID and [start,end) model; local events-cache contract and incomplete start-date presentation | Service delivery of time/task/close or failed/attempt ID as event ID, cache recovery; no board replay and no false zero |
+| M-A7, M-A8, M-A9, M-A10 | AI proposal, stale/retry and request-state fixtures; original request target via focus `--request` | Phase 4 R3/R9 contract, real transport, confirmation, readback, menu close/reopen, agent failure |
+| M-A13 | Request-history model: 20 latest, deduplication, empty requests, separate recall/send, persistence/clear | Native persistence and actual interaction |
+| M-A14 | Add project section, four folder classifications and phase 4 placement | Native OS folder picker, §6 conversation inside menu AI, confirmed external effects, register/install or §9 cutover |
 
-Дополнительно M-A12: шаблон обслуживания сохраняет лог, папку, перезапуск, остановку до входа и подтверждение удаления с именем проекта. Действия в макете отключены; реальное обслуживание не проверялось.
+Windows supports only compact q and hides summary/M1 chooser. macOS summary uses about 12 pt digits and 7 pt graph within 22 pt;
+the approved 47×29-study deviation retains proportional bars and centered compact pause overlay.
+Geometry assertions are model/static evidence, not raster or native qualification.
 
-## Остаётся до визуальной приёмки
+## Runtime boundary
 
-- Настоящая отрисовка 320/360 px, размеры шрифта 14/16/18/20, темы и масштаб 100/200%.
-- Визуальные края цифр и графика, двузначные значения, длинные названия и отсутствие пересечений.
-- Контраст, различение без цвета, клавиатура, скринридер и сенсорные цели.
-- Открытие/закрытие, переходы проекта, сохранение черновика и подтверждения в реальном renderer.
+Phases 1–3 exclude M7 AI and Add project. Phase 4 includes both; Add project has no terminal handoff or clipboard phrase.
+Folder classification: no config plus empty → new onboarding; no config plus files → existing onboarding;
+config plus passing selftest → register and offer service install; config plus failing selftest/old format → §9 cutover.
+The exact old-project marker remains the sole owner question (proposal: config present plus failing selftest).
+Service target history is `<root>/.taskq/events`; incomplete history reports its start date. Original request is stored by
+`taskq service focus ... --request` and displayed as “You asked”. A verified newer version in status.json exposes
+“Update now”, acting through `<root>/.taskq/update`. These are implementation targets, not shipped features.
+`taskq.md` and Rust remain unchanged; §4 is still the runtime contract.
 
-Локальный `file:` preview ранее был отклонён browser URL policy. Он не обходился альтернативным способом.
-Поэтому визуальный PASS не заявляется. Текущая inline-версия предназначена для следующего просмотра владельцем.
+## Remaining acceptance
 
-## Остаётся до продуктовой приёмки
-
-M-A4, M-A7–M-A11 на настоящем сервисе, включая mixed pause, отказ агента, stale status,
-несколько scope, события нескольких досок, восстановление после закрытия и нативные служебные команды.
-Это работы будущего implementation-брифа, а не скрытые возможности прототипа.
-
-M-A13/D-A8: история (20 последних, дедупликация, пустые запросы), сохранение истории в состоянии макета, отдельные recall/send и метки 0/1/12/100 проверены на модели/шаблоне. Нативная история и фактическая ширина не проверены.
-
-## Передача дизайна
-
-Канонические материалы и их приоритет — [README](README.md); следующий шаг — [бриф](implementation-brief.md).
-Владелец принял направление и финальный вариант иконок. Это не нативная квалификация.
-`menu-prototype.html` сохраняет прежние значки; для реализации использовать `icon-studies.html`.
-Cargo-результаты выше получены на предыдущем этапе; при финальной упаковке повторены только тесты макетов и `git diff --check`.
+Native wry/WKWebView and WebView2 behavior, renderer opening/closing, fixture-to-service bridge,
+OS icon rendering, keyboard/screen reader, scale/theme, multi-project safety, actual events-cache completeness,
+AI onboarding and external-effect confirmation remain unqualified. A prototype/model PASS is not an OS or service PASS (R12).
+The earlier local file preview was rejected by browser URL policy; this package makes no visual PASS claim.
+Canonical package and source priority: [README](README.md); phased work: [implementation brief](implementation-brief.md).

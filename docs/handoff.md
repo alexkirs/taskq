@@ -2,25 +2,21 @@
 Operational state only. Rules are in [taskq.md](../taskq.md); the work order is in [refactor-plan.md](refactor-plan.md).
 Refresh every line with a fresh read before acting on it (R12).
 
-## Hosts (v3, paused)
-- Mac: service paused and stopped, LaunchAgent unloaded, host leases released.
-- Windows: service paused, scheduled task present; reserved and waiting grants are still held.
+## Hosts
+- Mac: v3 stopped (`com.taskq.mac-dispatch` not loaded). v4 installed 2026-10-12 as `com.taskq.taskq`, focus `all`;
+  it exits until the board token is in `~/.local/share/taskq/token` (mode 0600).
+- Windows: v3 stopped by the owner 2026-10-12. v4 not installed yet.
 - No other host is registered. Delivery to a host is not proof it ran.
 
-## Queue
-- 706–715 closed as not planned; PR 716–718 closed unmerged.
-- Held grants stay held until the § 9 migration. Do not force-clear grants, restore live DBs, resume the queue or
-  infer fencing from process absence.
+## Board (v4 since 2026-10-12)
+- PR 720 merged, release `v4.0.0` published (macOS, Linux, Windows binaries).
+- `CHANGELOG.md` v4.0.0 applied to 23 open issues: label `taskq`, v3 blocks removed (`deps` became `Depends on #N`),
+  `later`/`failed` entries. The 4 v3 `ask` tasks (#612, #601, #597, #588) are parked `later` with their question.
+- #643 (v3 capacity) and #638 (v3 PID recovery) closed by owner decision.
+- `taskq status` after the cutover: Ready 0, waiting 1 (#613), later 16, failed 6.
 - PR 719 (test contracts) is on hold, unaccepted.
 
-## v4 status
-- Spec: `taskq.md`. Code: `src/` (Rust), `tests/golden/fold.json`. `cargo test` and `taskq selftest` pass on macOS.
-- Live board read (`selftest`, `status`) works; nothing was written to the board.
-- Windows and Linux: only CI runs them; no host run yet (unknown, R12).
-
 ## Waits on the owner
-1. Review and merge PR 720 (`refactor/plan`).
-2. Two-host claim test on the live board (§ 3) before any v4 `service run`.
-3. Before cutover: decide the 4 v3 `ask` tasks #612, #601, #597, #588 (answer in v3 or park) and whether #643, #638
-   (no v3 block) are tasks. 8 `later` tasks have no recorded reason (#664, #654, #652, #651, #650, #647, #642, #640).
-4. Cutover (§ 9): an agent applies `CHANGELOG.md` v4.0.0 with v3 stopped on every host; then v4 on Mac, then Windows.
+1. Mac: write the board token file; the service then starts on the next launchd retry.
+2. Windows: install v4 from release `v4.0.0`, `taskq service install`, `taskq service focus all`.
+3. A week clean on v4: delete `taskq.py`, `host_service.py`, `runtimes/`, `docs/legacy/` (§ 9).

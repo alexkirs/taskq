@@ -1,5 +1,6 @@
-//! `taskq tray` (taskq.md § 4): a menu-bar / notification-area icon over `<root>/.taskq/status.json`.
-//! No board access and no token: actions go through the same files and commands as the CLI.
+//! `taskq tray` (taskq.md § 4): the host's one menu-bar / notification-area icon over the `<root>/.taskq/status.json`
+//! of every project in `<install>/projects`. No board access and no token: actions go through the same files and
+//! commands as the CLI.
 
 use serde_json::Value;
 use std::fs;
@@ -10,10 +11,17 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-pub fn run(root: PathBuf) -> Result<(), String> {
-    let d = crate::dot(&root);
-    if crate::file_age(&d.join("tray")).is_some_and(|a| a < 15) {
-        return Err("taskq tray already runs for this project".into());
+/// False when another tray wrote the heartbeat `<install>/tray` in the last 10 s (it ticks every 2 s): of two trays
+/// started at once, the first to see the other's pid exits.
+fn alone(install: &Path) -> bool {
+    let hb = install.join("tray");
+    let other = fs::read_to_string(&hb).ok().and_then(|p| p.trim().parse::<u32>().ok()).is_some_and(|p| p != std::process::id());
+    !(other && crate::file_age(&hb).is_some_and(|a| a < 10))
+}
+
+pub fn run(install: PathBuf) -> Result<(), String> {
+    if !alone(&install) {
+        return Err("taskq tray already runs on this host".into());
     }
     // ticks come from a timer thread and menu clicks from the handler, both through the proxy
     #[allow(unused_mut)]
@@ -49,13 +57,16 @@ pub fn run(root: PathBuf) -> Result<(), String> {
                     }
                 }
             }
-            Event::UserEvent(Some(id)) => act(&root, &id),
+            Event::UserEvent(Some(id)) => act(&id),
             Event::UserEvent(None) => {
                 if let Some(t) = &tray {
-                    crate::touch(&d.join("tray"));
-                    if !refresh(t, &d, &mut shown) {
+                    // another version became current: exit, a service starts the current one (§ 4)
+                    if !alone(&install) || crate::platform::current(&install).is_some_and(|v| v != crate::platform::VERSION) {
                         *flow = ControlFlow::Exit;
+                        return;
                     }
+                    let _ = fs::write(install.join("tray"), std::process::id().to_string());
+                    refresh(t, &install, &mut shown);
                 }
             }
             _ => {}
@@ -63,153 +74,126 @@ pub fn run(root: PathBuf) -> Result<(), String> {
     })
 }
 
-/// False when a live service runs another version: this tray exits and the service starts its own (§ 4).
-fn refresh(t: &TrayIcon, d: &Path, shown: &mut String) -> bool {
-    let s: Value = fs::read_to_string(d.join("status.json"))
-        .ok()
-        .and_then(|x| serde_json::from_str(&x).ok())
-        .unwrap_or(Value::Null);
-    let alive = crate::file_age(&d.join("status.json")).is_some_and(|a| a < 300);
-    if alive && s["version"].as_str().is_some_and(|v| v != crate::platform::VERSION) {
-        return false;
+struct Project {
+    root: PathBuf,
+    s: Value,
+    alive: bool,
+    tasks: Vec<(u64, String, String)>,
+}
+
+impl Project {
+    fn read(root: &str) -> Project {
+        let d = crate::dot(Path::new(root));
+        let s: Value = fs::read_to_string(d.join("status.json")).ok().and_then(|x| serde_json::from_str(&x).ok()).unwrap_or(Value::Null);
+        let alive = crate::file_age(&d.join("status.json")).is_some_and(|a| a < 300);
+        let tasks = s["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|x| (x["n"].as_u64().unwrap_or(0), x["title"].as_str().unwrap_or("").chars().take(60).collect(), x["state"].as_str().unwrap_or("").to_string()))
+            .collect();
+        Project { root: root.into(), s, alive, tasks }
     }
-    let tasks: Vec<(u64, String, String)> = s["tasks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|x| {
-            (
-                x["n"].as_u64().unwrap_or(0),
-                x["title"].as_str().unwrap_or("").chars().take(60).collect(),
-                x["state"].as_str().unwrap_or("").to_string(),
-            )
-        })
-        .collect();
-    let of = |want: &[&str]| {
-        tasks
-            .iter()
-            .filter(|(_, _, st)| want.contains(&st.as_str()))
-            .collect::<Vec<_>>()
-    };
-    let (work, asks, ready) = (of(&["doing", "review"]), of(&["ask"]), of(&["ready"]).len());
-    let paused = s["focus"].as_array().is_none_or(|f| f.is_empty());
-    let counts = if alive {
-        format!(
-            "In work {} · Waiting for answer {} · Ready {ready}",
-            work.len(),
-            asks.len()
-        )
-    } else {
-        "service not running".into()
-    };
-    let sig = format!(
-        "{counts}|{paused}|{}|{tasks:?}|{}",
-        s["error"], s["version"]
-    );
+
+    fn of(&self, want: &[&str]) -> Vec<&(u64, String, String)> {
+        self.tasks.iter().filter(|(_, _, st)| want.contains(&st.as_str())).collect()
+    }
+
+    fn counts(&self) -> String {
+        if self.alive {
+            format!("In work {} · Waiting for answer {} · Ready {}", self.of(&["doing", "review"]).len(), self.of(&["ask"]).len(), self.of(&["ready"]).len())
+        } else {
+            "service not running".into()
+        }
+    }
+
+    fn name(&self) -> String {
+        self.s["project"].as_str().map(String::from).unwrap_or_else(|| crate::project_name(&self.root))
+    }
+}
+
+fn refresh(t: &TrayIcon, install: &Path, shown: &mut String) {
+    let ps: Vec<Project> = fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(Project::read).collect();
+    let sig: String = ps.iter().map(|p| format!("{}|{}|{}|{}|{:?}|{}\n", p.root.display(), p.counts(), p.s["focus"], p.s["error"], p.tasks, p.s["version"])).collect();
     if *shown == sig {
-        return true;
+        return;
     }
     *shown = sig;
-    let project = s["project"].as_str().unwrap_or("taskq");
-    let color = if !alive || !s["error"].is_null() {
+    let (asks, work) = ps.iter().fold((0, 0), |(a, w), p| (a + p.of(&["ask"]).len(), w + p.of(&["doing", "review"]).len()));
+    let color = if ps.iter().any(|p| !p.alive || !p.s["error"].is_null()) {
         [214, 48, 49]
-    } else if !asks.is_empty() {
+    } else if asks > 0 {
         [230, 126, 34]
-    } else if !work.is_empty() {
+    } else if work > 0 {
         [52, 120, 246]
     } else {
         [128, 128, 128]
     };
     let _ = t.set_icon(Some(icon(color)));
-    let _ = t.set_tooltip(Some(format!("taskq {project}: {counts}")));
+    let _ = t.set_tooltip(Some(format!("taskq: in work {work} · waiting for answer {asks}")));
     #[cfg(target_os = "macos")]
-    t.set_title(Some(if asks.is_empty() {
-        String::new()
-    } else {
-        asks.len().to_string()
-    }));
+    t.set_title(Some(if asks == 0 { String::new() } else { asks.to_string() }));
 
-    let issues = s["issues"].as_str().unwrap_or("");
     let item = |id: &str, text: &str, on: bool| MenuItem::with_id(id, text, on, None);
     let m = Menu::new();
-    let head = format!(
-        "taskq {} · {} · {project}",
-        s["version"].as_str().unwrap_or("?"),
-        s["host"].as_str().unwrap_or("?")
-    );
-    let _ = m.append(&item("head", &head, false));
-    let _ = m.append(&item("counts", &counts, false));
-    if let Some(e) = s["error"].as_str() {
-        let _ = m.append(&item(
-            "error",
-            &format!("error: {}", e.chars().take(80).collect::<String>()),
-            false,
-        ));
+    let host = ps.iter().find_map(|p| p.s["host"].as_str()).unwrap_or("?");
+    let _ = m.append(&item("head", &format!("taskq {} · {host}", crate::platform::VERSION), false));
+    if ps.is_empty() {
+        let _ = m.append(&item("none", "No projects: run `taskq service install` in one", false));
     }
-    let _ = m.append(&PredefinedMenuItem::separator());
-    let _ = m.append(&item(
-        &format!("open {issues}"),
-        "Board",
-        !issues.is_empty(),
-    ));
-    for (title, list) in [("Waiting for answer", &asks), ("In work", &work)] {
-        if list.is_empty() {
-            continue;
+    for p in &ps {
+        let (asks, work) = (p.of(&["ask"]), p.of(&["doing", "review"]));
+        let root = p.root.display().to_string();
+        let sub = Submenu::new(format!("{} · {}", p.name(), p.counts()), true);
+        let s = &p.s;
+        if let Some(e) = s["error"].as_str() {
+            let _ = sub.append(&item("error", &format!("error: {}", e.chars().take(80).collect::<String>()), false));
         }
-        let sub = Submenu::new(format!("{title} ({})", list.len()), true);
-        for (n, name, _) in list.iter() {
-            let _ = sub.append(&item(
-                &format!("open {issues}/{n}"),
-                &format!("#{n} {name}"),
-                true,
-            ));
+        let issues = s["issues"].as_str().unwrap_or("");
+        let _ = sub.append(&item(&format!("open {issues}"), "Board", !issues.is_empty()));
+        for (title, list) in [("Waiting for answer", &asks), ("In work", &work)] {
+            if list.is_empty() {
+                continue;
+            }
+            let l = Submenu::new(format!("{title} ({})", list.len()), true);
+            for (n, name, _) in list.iter() {
+                let _ = l.append(&item(&format!("open {issues}/{n}"), &format!("#{n} {name}"), true));
+            }
+            let _ = sub.append(&l);
         }
+        let _ = sub.append(&PredefinedMenuItem::separator());
+        let paused = s["focus"].as_array().is_none_or(|f| f.is_empty());
+        let saved = fs::read_to_string(crate::dot(&p.root).join("focus.paused")).is_ok_and(|f| !matches!(f.trim(), "" | "off"));
+        let _ = sub.append(&match (paused, saved) {
+            (false, _) => item(&format!("pause {root}"), "Pause: finish running tasks, take no new", p.alive),
+            (true, true) => item(&format!("resume {root}"), "Resume: take new tasks", p.alive),
+            // no focus to restore: never `all` by default (§ 4)
+            (true, false) => item("resume", "Resume: choose labels with `taskq service focus`", false),
+        });
+        if let Some(log) = s["log"].as_str() {
+            let _ = sub.append(&item(&format!("open {log}"), "Open log", true));
+        }
+        let _ = sub.append(&item(&format!("open {root}"), "Open project folder", true));
+        let _ = sub.append(&PredefinedMenuItem::separator());
+        let _ = sub.append(&item(&format!("restart {root}"), "Restart service", p.alive));
+        let _ = sub.append(&item(&format!("stop {root}"), "Quit until next logon", true));
+        let un = Submenu::new("Uninstall", true);
+        let _ = un.append(&item(&format!("uninstall {root}"), "Confirm: remove the service", true));
+        let _ = sub.append(&un);
         let _ = m.append(&sub);
     }
-    let _ = m.append(&PredefinedMenuItem::separator());
-    let _ = m.append(&if paused {
-        item("resume", "Resume: take new tasks", alive)
-    } else {
-        item("pause", "Pause: finish running tasks, take no new", alive)
-    });
-    if let Some(log) = s["log"].as_str() {
-        let _ = m.append(&item(&format!("open {log}"), "Open log", true));
-    }
-    if let Some(root) = d.parent() {
-        let _ = m.append(&item(
-            &format!("open {}", root.display()),
-            "Open project folder",
-            true,
-        ));
-    }
-    let _ = m.append(&PredefinedMenuItem::separator());
-    let _ = m.append(&item("restart", "Restart service", alive));
-    let _ = m.append(&item("stop", "Quit until next logon", true));
-    let un = Submenu::new("Uninstall", true);
-    let _ = un.append(&item("uninstall", "Confirm: remove the service", true));
-    let _ = m.append(&un);
     t.set_menu(Some(Box::new(m)));
-    true
 }
 
-fn act(root: &Path, id: &str) {
+/// A menu id is `<action> <project root>` or `open <path or url>`.
+fn act(id: &str) {
+    let Some((action, arg)) = id.split_once(' ') else { return };
+    let root = Path::new(arg);
     let d = crate::dot(root);
-    match id {
-        "pause" => {
-            let _ = fs::write(
-                d.join("focus.paused"),
-                fs::read_to_string(d.join("focus")).unwrap_or_default(),
-            );
-            let _ = fs::write(d.join("focus"), "off");
-            crate::poke(root);
-        }
+    match action {
+        "pause" => crate::pause(root),
         "resume" => {
-            let f = fs::read_to_string(d.join("focus.paused"))
-                .ok()
-                .filter(|f| !matches!(f.trim(), "" | "off"))
-                .unwrap_or_else(|| "all".into());
-            let _ = fs::write(d.join("focus"), f);
-            crate::poke(root);
+            let _ = crate::resume(root);
         }
         "restart" => {
             let _ = fs::write(d.join("restart"), "");
@@ -221,7 +205,7 @@ fn act(root: &Path, id: &str) {
                 return;
             };
             let mut c = std::process::Command::new(me);
-            c.args(["service", id])
+            c.args(["service", action])
                 .current_dir(root)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -230,12 +214,11 @@ fn act(root: &Path, id: &str) {
             std::os::unix::process::CommandExt::process_group(&mut c, 0);
             let _ = crate::platform::quiet(&mut c).spawn();
         }
-        _ => {
-            if let Some(x) = id.strip_prefix("open ") {
-                let opener = if cfg!(windows) { "explorer" } else { "open" };
-                let _ = crate::platform::quiet(std::process::Command::new(opener).arg(x)).spawn();
-            }
+        "open" => {
+            let opener = if cfg!(windows) { "explorer" } else { "open" };
+            let _ = crate::platform::quiet(std::process::Command::new(opener).arg(arg)).spawn();
         }
+        _ => {}
     }
 }
 

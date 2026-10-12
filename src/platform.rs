@@ -179,7 +179,7 @@ pub fn verify(sums: &[u8], name: &str, bytes: &[u8]) -> Result<(), String> {
     if listed { Ok(()) } else { Err(format!("{name}: sha256 {digest} not in SHA256SUMS")) }
 }
 
-/// § 8 update steps: Ok(Some(version)) when a new release became current.
+/// § 8 update steps: Ok(Some(version)) when a new release became current; with `check`, when one is available.
 /// Built in, never from config: project files are written by workers, so config must not choose the code hosts run.
 pub const RELEASE_REPO: &str = "alexkirs/taskq";
 
@@ -208,8 +208,7 @@ pub fn update(install: &Path, check: bool) -> Result<Option<String>, String> {
         return Err(format!("latest.json: unexpected version {ver:?} or file {name:?}"));
     }
     if check {
-        println!("update available: {running} -> {ver} ({name})");
-        return Ok(None);
+        return Ok(Some(ver));
     }
     let tmp = rel.join(format!("{ver}.tmp"));
     fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;

@@ -3,6 +3,14 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## Unreleased
+
+One tray per host over every project in `<install>/projects` (heartbeat `<install>/tray`, errors in
+`<install>/tray.log`); per-project trays of older versions exit once their service updates. `status.json` gains task
+labels, `request`, `update` and `events_since`; `<root>/.taskq/events` keeps 30 days of close and failed moves.
+`taskq service focus ... --request TEXT`, `taskq service pause|resume`; resume without a saved focus fails instead of
+taking `all`. `<root>/.taskq/update` makes the next pass check for an update at once. No board change.
+
 ## v4.0.10
 
 Windows runs the tray as `<install>/taskq-tray.exe`, so a pinned icon stays pinned across updates. A tray on another

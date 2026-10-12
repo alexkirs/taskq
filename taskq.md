@@ -179,17 +179,17 @@ One loop:
 5. Fix projected labels; `waiting` with closed deps becomes `ready`.
 6. Resume the session of a live attempt for a new `answer` or `steer` (text on stdin); spawn a reviewer for `review`
    without a live one; admit `ready` tasks matching this host by priority then number within capacity.
-7. Every `update_every`: the self-update check (§ 8).
+7. Every `update_every`, or at once when a local command wrote `<root>/.taskq/update`: the self-update check (§ 8); an installed service applies a newer version, others only report it. The outcome goes to the log.
 8. Sleep until a poke or `poll` seconds.
 
 - Filter: `host-*` absent or this host; `run-*` absent or enabled here; `assignee-only` passes; each `needs-*` in `has`.
-- Focus: `taskq service focus all|off|<label..>` writes `<root>/.taskq/focus`: `all` or one of the labels passes; none
-  or `off` (default) admits nothing, heartbeats and updates go on. No arguments: print focus, `has`, labels of open tasks; an agent maps the owner's
-  words to these, asks when unsure, says so when none fits.
+- Focus: `taskq service focus all|off|<label..> [--request TEXT]` writes `<root>/.taskq/focus`: `all` or one of the labels passes; none or `off` (default) admits nothing, heartbeats and updates go on. `--request` keeps the owner's words in `focus.request`; a focus without it removes the file. No arguments: print focus, `has`, labels of open tasks; an agent maps the owner's words to these, asks when unsure, says so when none fits.
+- Pause: `service pause` (and the tray's) saves the focus to `focus.paused` and writes `off`; resume restores it. Without a saved focus resume fails and names the labels of open tasks: never `all` by default.
 - Poke: a local command touches `<root>/.taskq/poke`; the sleeping service checks its mtime every second. Each pass
-  writes `<root>/.taskq/status.json` (state and open tasks) for `service status` and the tray. `ponytail:` files, no socket or pipe, on every OS.
+  writes `<root>/.taskq/status.json` (state, open tasks with labels, `request`, `update`: a newer version the last check found and did not install, else null, `events_since`) for `service status` and the tray.
+- Events: a pass appends to `<root>/.taskq/events` a line `<board time> #<N> close|failed <attempt>` per task it saw move to closed or `failed` since its previous pass; the attempt is the one current at the move, else the task's last spawn; a task never spawned adds none. One line per attempt and kind; lines older than 30 days drop. The first line `since <time>` is the first time covered (`events_since`); a restart keeps the file, moves while no service ran are missing. `ponytail:` no board replay. `ponytail:` files, no socket or pipe, on every OS.
 - Restart: rebuild from the board; former children are not adopted (except the § 8 re-exec), their attempts are `gone`. `service restart` writes `<root>/.taskq/restart`: the next pass re-execs (§ 8 step 4).
-- Tray (macOS, Windows): an installed service keeps `taskq tray` running (heartbeat `<root>/.taskq/tray`). Icon color: gray idle, blue in work, orange `ask`, red error or stale `status.json`. Menu: counts, board, `ask` and in-work issue links, pause/resume (focus `off` and back), log, project folder, restart, stop until the next logon, uninstall. It reads only `status.json`: no board, no token. Windows runs it as `<install>/taskq-tray.exe`: the notification-area pin follows the exe path across updates. A tray on another version than the live service exits; the service starts its own.
+- Tray (macOS, Windows): one per host. Any installed service starts `releases/<current>/taskq tray` when the heartbeat `<install>/tray` (the tray's pid) is older than 30 s; a tray that finds another fresh pid there exits, as does a tray on another version than `<install>/current`. It lists the projects of `<install>/projects` and reads each `<root>/.taskq/status.json`: no board, no token. Icon color over all projects: gray idle, blue in work, orange `ask`, red error or stale `status.json`. Menu per project: counts, board, `ask` and in-work issue links, pause/resume, log, project folder, restart, stop until the next logon, uninstall. Windows runs it as `<install>/taskq-tray.exe`: the notification-area pin follows the exe path across updates.
 
 ## 5. Commands
 | Command | Does |
@@ -206,7 +206,7 @@ One loop:
 | `taskq wait [--window MIN] [--only L,..]` | PM: block until a task moves to `ask`, `review` with options, closed or `failed`; print `ask #N` etc. or `tick` |
 | `taskq cleanup [--force]` | remove clean worktrees and branches of closed tasks; `--force` also dirty ones (R11) |
 | `taskq update [--check]` | § 8 steps 1–4 once |
-| `taskq service install\|run\|focus\|status\|restart\|stop\|uninstall\|list` / `taskq tray` | § 4, § 8; `stop`: until the next logon, the unit stays; `list`: this host's projects and their focus |
+| `taskq service install\|run\|focus\|pause\|resume\|status\|restart\|stop\|uninstall\|list` / `taskq tray` | § 4, § 8; `stop`: until the next logon, the unit stays; `list`: this host's projects and their focus |
 | `taskq selftest` | load config, fold `tests/golden` fixtures built into the binary, read the board; no writes |
 
 - Commands add `attempt $TASKQ_ATTEMPT` when it is set. A command refused by `fold` prints the current state.

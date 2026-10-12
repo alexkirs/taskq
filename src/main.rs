@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 type Res<T> = Result<T, String>;
 
-const USAGE: &str = "usage: taskq labels|add|ask|answer|result|requeue|steer|later|failed|close|status|inbox|wait|cleanup|update|service|tray|selftest (see taskq.md § 5)";
+const USAGE: &str = "usage: taskq agents|labels|add|ask|answer|result|requeue|steer|later|failed|close|status|inbox|wait|cleanup|update|service|tray|selftest (see taskq.md § 5)";
 
 // ---------- arguments ----------
 
@@ -665,6 +665,7 @@ fn service_run(c: &Ctx) -> Res<()> {
     let log = platform::log_path(&cfg.install, &project);
     eprintln!("taskq {} service on {} for {}", platform::VERSION, cfg.me, cfg.repo);
     let mut sampled: Option<Instant> = None;
+    let mut agents: Option<(Instant, Value)> = None;
     loop {
         // § 3: capacity reloads before each admission decision; children are untouched
         let cap = fs::read_to_string(cfg.root.join("taskq.json")).map_err(|e| e.to_string())
@@ -687,9 +688,14 @@ fn service_run(c: &Ctx) -> Res<()> {
         let kids: Vec<Value> = s.kids.iter().map(|k| json!({"task": k.task, "attempt": k.attempt, "rt": k.rt, "pid": k.proc.id()})).collect();
         let tasks: Vec<Value> = s.tasks.iter().map(|(n, title, state, labels)| json!({"n": n, "title": title, "state": state, "labels": labels})).collect();
         let request = fs::read_to_string(d.join("focus.request")).ok();
+        // § 4: runtime probes at most every 5 minutes
+        if agents.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs() >= 300) {
+            agents = Some((Instant::now(), json!({"at": at, "rows": runtime::agents()})));
+        }
         let mut status = json!({"host": cfg.me, "version": platform::VERSION, "focus": s.focus, "error": r.err(), "kids": kids, "at": at,
             "pid": std::process::id(), "project": project, "issues": issues, "log": log, "tasks": tasks,
-            "request": request, "update": update, "events_since": s.events_since, "capacity": s.capacity_json()});
+            "request": request, "update": update, "events_since": s.events_since, "capacity": s.capacity_json(),
+            "agents": agents.as_ref().map(|a| &a.1)});
         let _ = platform::write_atomic(&d.join("status.json"), &serde_json::to_string_pretty(&status).unwrap_or_default());
         if is_installed && began.elapsed().as_secs() >= cfg.rollback_after {
             let h = cfg.install.join("releases").join(platform::VERSION).join("healthy");
@@ -1190,6 +1196,19 @@ fn run(argv: &[String]) -> Res<()> {
                 Some(v) if check => println!("update available: {} -> {v}", platform::current(&install).unwrap_or_else(|| platform::VERSION.into())),
                 Some(v) => println!("updated to {v}; the service restarts on its next update check"),
                 None => println!("up to date ({})", platform::current(&install).unwrap_or_else(|| platform::VERSION.into())),
+            }
+            Ok(())
+        }
+        // § 5: read-only probes on this host, no board
+        "agents" => {
+            for r in runtime::agents().as_array().into_iter().flatten() {
+                let s = |k: &str, none: &str| r[k].as_str().unwrap_or(none).to_string();
+                let login = match (s("login", "unknown").as_str(), r["account"].as_str()) {
+                    ("logged in", Some(a)) => format!("logged in as {a}"),
+                    ("logged in", None) => "logged in, account unknown".into(),
+                    (l, _) => l.to_string(),
+                };
+                println!("{}  {}  {}  {login}", s("runtime", "?"), s("path", "not installed"), if r["path"].is_null() { "-".into() } else { s("version", "unknown") });
             }
             Ok(())
         }

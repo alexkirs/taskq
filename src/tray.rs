@@ -171,7 +171,7 @@ fn project(root: &str) -> Value {
         "issues": s["issues"].as_str().unwrap_or(""), "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
         "error": s["error"], "focus": s["focus"].as_array().cloned().unwrap_or_default(), "saved": saved, "labels": crate::status_labels(r),
         "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"],
-        "capacity": s["capacity"], "cap_host": cap_host, "cap_saved": cap_saved})
+        "capacity": s["capacity"], "cap_host": cap_host, "cap_saved": cap_saved, "agents": s["agents"]})
 }
 
 fn now() -> i64 {
@@ -456,7 +456,7 @@ fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>) -
     let url = |rgba: &Rgba| format!("data:image/png;base64,{}", base64(&png(rgba)));
     let mut st = json!({"platform": if cfg!(windows) { "windows" } else { "macos" }, "version": crate::platform::VERSION,
         "host": ps.iter().find_map(|p| p["host"].as_str()).unwrap_or("?"), "view": s.view, "font": s.font, "period": s.period,
-        "now": now(), "projects": ps, "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since}});
+        "now": now(), "projects": ps, "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since}});
     if cfg!(target_os = "macos") {
         st["icons"] = json!({"icon": url(&compact(sum.run, dark)), "full": url(&wide(&sum, dark))});
     }
@@ -465,6 +465,12 @@ fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>) -
         st["page"] = json!(page);
     }
     st
+}
+
+/// Host-level `Agents` (§ 4): the rows of the freshest probe in any `status.json`, as menu lines; null when none has one.
+fn agents(ps: &[Value]) -> Value {
+    let Some(a) = ps.iter().map(|p| &p["agents"]).filter(|a| a["at"].is_u64()).max_by_key(|a| a["at"].as_u64()) else { return Value::Null };
+    json!({"at": a["at"], "rows": a["rows"].as_array().into_iter().flatten().map(crate::runtime::agent_text).collect::<Vec<_>>()})
 }
 
 fn refresh_icon(tray: &Option<TrayIcon>, st: &Value, s: &Settings, dark: bool, sig: &mut String) {
@@ -891,6 +897,14 @@ mod tests {
         h = remember(&h, "q10");
         assert_eq!(h.len(), 20);
         assert_eq!((h[0].as_str(), h[1].as_str(), h.iter().filter(|x| x.as_str() == Some("q10")).count()), (Some("q10"), Some("q24"), 1));
+    }
+
+    #[test]
+    fn agents_come_from_the_freshest_probe_or_are_unknown() {
+        let row = |v: &str| json!({"runtime": "claude", "path": "/c", "version": v, "login": "not logged in", "account": null});
+        let ps = [json!({"agents": {"at": 10, "rows": [row("1")]}}), json!({"agents": {"at": 20, "rows": [row("2")]}}), json!({})];
+        assert_eq!(agents(&ps), json!({"at": 20, "rows": ["claude 2 · not logged in"]}));
+        assert_eq!(agents(&ps[2..]), Value::Null);
     }
 
     #[test]

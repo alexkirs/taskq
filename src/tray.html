@@ -151,6 +151,9 @@ function home(){
   if(held.length&&run.length)h+='<div class="row meta">Paused '+held.length+' of '+(held.length+run.length)+': '+esc(held.map(p=>p.name).join(', '))+'</div>';
   h+=bulk(run,held);
   h+='<details><summary>Aa Text size <span class="meta">'+S.font+' px</span></summary><div class="options">'+[14,16,18,20].map(n=>'<button data-set="font" data-v="'+n+'" aria-pressed="'+(n===S.font)+'">'+n+'</button>').join('')+'</div></details>';
+  // host-level, read-only rows of the freshest status.json probe (taskq.md § 4); none: unknown, not empty
+  const A=S.agents;
+  h+='<details class="group agents"><summary>⌘ Agents <span class="meta">'+esc(S.host+' · '+(A?'checked '+age(Math.max(0,S.now-A.at))+' ago':'unknown: no service probe yet'))+'</span></summary>'+(A?A.rows.map(r=>'<div class="row" role="menuitem" aria-disabled="true">'+esc(r)+'</div>').join(''):'<div class="body meta">Unknown: no status.json has agents</div>')+'</details>';
   h+=S.projects.map(service).join('');
   const vs=[...new Set(S.projects.map(p=>p.version).filter(Boolean))];
   return h+update()+'<div class="row meta">taskq '+esc(vs.join(', ')||'unknown')+(vs.length===1&&vs[0]===S.version?'':' · tray '+esc(S.version))+' · '+esc(S.host)+'</div>';}
@@ -216,7 +219,7 @@ function render(){
   menu.style.setProperty('--size',S.font+'px');menu.classList.toggle('big',S.font>=18);
   menu.innerHTML=p?project(p):home();
   menu.querySelectorAll('details').forEach((d,i)=>d.open=open[i]||false);
-  if(S.page!==undefined)menu.querySelectorAll('.hist').forEach(d=>d.open=true);
+  if(S.page!==undefined)menu.querySelectorAll('.hist,.agents').forEach(d=>d.open=true);
   send({a:'size',w:S.font>=18?360:320,h:menu.scrollHeight});}
 window.taskq={receive(s){
   if(s.capmsg){capmsg[s.capmsg.root]=s.capmsg.text;render();return;}

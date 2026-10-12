@@ -289,7 +289,7 @@ change that N-1 cannot ignore needs a cutover like § 9. Hosts update independen
 - `hosts` `{hostname: name}` (env `TASKQ_HOST` overrides); `has` `{name: [x..]}`; `limits` `{"claude": n, "codex": n}`.
 - `permission_mode`, `codex` (R9); `pages` link wrapper base; `assignee` (login or `me`) report filter.
 - `ttl`, `poll`, `update_every`, `rollback_after`: seconds, defaults 300, 60, 900, 600.
-- Token: env `TASKQ_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token` (0600), else `gh`/`glab auth token`. Never in config.
+- Token: env `TASKQ_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token` (0600), else the `gh`/`glab` login of the board host. Never in config.
 
 A cutover is one step per project, not per host: two board formats do not mix. No migration code: `CHANGELOG.md`
 says per release what changed on the board and what an open issue needs. An agent reads the entries from the board's

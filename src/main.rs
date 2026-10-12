@@ -122,8 +122,8 @@ fn load(root: &Path) -> Res<(Config, Value)> {
     Ok((cfg, v))
 }
 
-/// Env `TASKQ_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token`, else the `gh`/`glab` login (§ 9).
-fn token(install: &Path, kind: Kind) -> Res<String> {
+/// Env `TASKQ_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token`, else the `gh`/`glab` login for the board host (§ 9).
+fn token(install: &Path, kind: Kind, host: &str) -> Res<String> {
     let named = if kind == Kind::GitLab { "GITLAB_TOKEN" } else { "GITHUB_TOKEN" };
     for k in ["TASKQ_TOKEN", named] {
         if let Ok(t) = std::env::var(k)
@@ -133,7 +133,9 @@ fn token(install: &Path, kind: Kind) -> Res<String> {
         }
     }
     let cli = || {
-        let o = std::process::Command::new(if kind == Kind::GitLab { "glab" } else { "gh" }).args(["auth", "token"]).output().ok()?;
+        // only the board host's login: a default-host token never goes to another host
+        let (bin, args): (&str, &[&str]) = if kind == Kind::GitLab { ("glab", &["config", "get", "token", "--host"]) } else { ("gh", &["auth", "token", "--hostname"]) };
+        let o = std::process::Command::new(bin).args(args).arg(host).output().ok()?;
         o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
     fs::read_to_string(install.join("token")).map(|t| t.trim().to_string()).ok().filter(|t| !t.is_empty())
@@ -143,7 +145,7 @@ fn token(install: &Path, kind: Kind) -> Res<String> {
 
 fn ctx() -> Res<Ctx> {
     let (cfg, raw) = load(&find_root()?)?;
-    let tok = token(&cfg.install, cfg.board)?;
+    let tok = token(&cfg.install, cfg.board, &cfg.web_host)?;
     let board = Box::new(Http::new(cfg.board, &cfg.web_host, &cfg.repo, &tok));
     Ok(Ctx { cfg, raw, board })
 }

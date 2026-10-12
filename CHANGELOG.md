@@ -5,7 +5,7 @@ there is no migration code. Releases without a **Board** section need nothing.
 
 ## v4.0.1
 
-No token file needed: the board token falls back to `gh auth token` / `glab auth token` (§ 9).
+No token file needed: the board token falls back to the `gh`/`glab` login of the board host (§ 9).
 
 ## v4.0.0
 

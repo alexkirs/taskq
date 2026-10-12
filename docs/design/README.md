@@ -13,6 +13,7 @@ Phase 0 decisions are recorded in [menu.md](menu.md), [operator-ui.md](operator-
 | [Icon studies](icon-studies.html) | Selected unified strip geometry, themes, active/pause states, 22 pt macOS study |
 | [Verification](verification.md) | Evidence and remaining qualification |
 | [Implementation brief](implementation-brief.md) | Phased implementation target |
+| [One-off run](one-off-run.md) | Proposed urgent run of one task outside focus (#652); not approved |
 
 ## Reading the prototypes
 

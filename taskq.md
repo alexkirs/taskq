@@ -276,7 +276,7 @@ immutable `releases/<ver>/`, a `current` file holding `<ver>` (atomic rename) an
 
 **Service install** makes its binary `current` when newer (step 4) and writes one unit running `<install>/taskq service run`,
 restarting on failure: macOS `~/Library/LaunchAgents/com.taskq.<project>.plist` (`launchctl bootstrap gui/<uid>`);
-Windows a Scheduled Task `TaskQ-<project>` at logon, no time limit; Linux `~/.config/systemd/user/taskq-<project>.service`.
+Windows a Scheduled Task `TaskQ-<project>` at this user's logon (no admin), no time limit; Linux `~/.config/systemd/user/taskq-<project>.service`.
 
 **Compatibility N/N-1.** v4 releases differ only by additive log kinds that N-1 can ignore without a different fold. A
 change that N-1 cannot ignore needs a cutover like § 9. Hosts update independently in any order. A version whose

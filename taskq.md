@@ -189,7 +189,7 @@ One loop:
 - Poke: a local command touches `<root>/.taskq/poke`; the sleeping service checks its mtime every second. Each pass
   writes `<root>/.taskq/status.json` (state and open tasks) for `service status` and the tray. `ponytail:` files, no socket or pipe, on every OS.
 - Restart: rebuild from the board; former children are not adopted (except the § 8 re-exec), their attempts are `gone`. `service restart` writes `<root>/.taskq/restart`: the next pass re-execs (§ 8 step 4).
-- Tray (macOS, Windows): an installed service keeps `taskq tray` running (heartbeat `<root>/.taskq/tray`). Icon color: gray idle, blue in work, orange `ask`, red error or stale `status.json`. Menu: counts, board, `ask` and in-work issue links, pause/resume (focus `off` and back), log, project folder, restart, stop until the next logon, uninstall. It reads only `status.json`: no board, no token.
+- Tray (macOS, Windows): an installed service keeps `taskq tray` running (heartbeat `<root>/.taskq/tray`). Icon color: gray idle, blue in work, orange `ask`, red error or stale `status.json`. Menu: counts, board, `ask` and in-work issue links, pause/resume (focus `off` and back), log, project folder, restart, stop until the next logon, uninstall. It reads only `status.json`: no board, no token. Windows runs it as `<install>/taskq-tray.exe`: the notification-area pin follows the exe path across updates. A tray on another version than the live service exits; the service starts its own.
 
 ## 5. Commands
 | Command | Does |

@@ -582,14 +582,14 @@ fn service_run(c: &Ctx) -> Res<()> {
             reexec(&s, cfg)?;
         }
         if is_installed {
-            keep_tray(&cfg.root, &mut tray);
+            keep_tray(&cfg.root, &cfg.install, &mut tray);
         }
         sleep_until_poke(&d.join("poke"), cfg.poll);
     }
 }
 
 /// Start `taskq tray` when its heartbeat `<root>/.taskq/tray` is stale (§ 4); reap the one this image started.
-fn keep_tray(root: &Path, tray: &mut Option<std::process::Child>) {
+fn keep_tray(root: &Path, install: &Path, tray: &mut Option<std::process::Child>) {
     if !cfg!(any(target_os = "macos", windows)) {
         return;
     }
@@ -599,7 +599,15 @@ fn keep_tray(root: &Path, tray: &mut Option<std::process::Child>) {
     if tray.is_some() || file_age(&dot(root).join("tray")).is_some_and(|a| a < 30) {
         return;
     }
-    let Ok(me) = std::env::current_exe() else { return };
+    let Ok(mut me) = std::env::current_exe() else { return };
+    if cfg!(windows) {
+        // Windows keys the notification-area pin by exe path. While another project's tray holds the copy, run this
+        // image: an older copy would exit on the version check (tray.rs) and respawn forever.
+        let stable = install.join("taskq-tray.exe");
+        if fs::copy(&me, &stable).is_ok() {
+            me = stable;
+        }
+    }
     let mut c = std::process::Command::new(me);
     let err = fs::File::create(dot(root).join("tray.log")).map(std::process::Stdio::from).unwrap_or_else(|_| std::process::Stdio::null());
     c.arg("tray").current_dir(root).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(err);

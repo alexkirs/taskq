@@ -53,7 +53,9 @@ pub fn run(root: PathBuf) -> Result<(), String> {
             Event::UserEvent(None) => {
                 if let Some(t) = &tray {
                     crate::touch(&d.join("tray"));
-                    refresh(t, &d, &mut shown);
+                    if !refresh(t, &d, &mut shown) {
+                        *flow = ControlFlow::Exit;
+                    }
                 }
             }
             _ => {}
@@ -61,12 +63,16 @@ pub fn run(root: PathBuf) -> Result<(), String> {
     })
 }
 
-fn refresh(t: &TrayIcon, d: &Path, shown: &mut String) {
+/// False when a live service runs another version: this tray exits and the service starts its own (§ 4).
+fn refresh(t: &TrayIcon, d: &Path, shown: &mut String) -> bool {
     let s: Value = fs::read_to_string(d.join("status.json"))
         .ok()
         .and_then(|x| serde_json::from_str(&x).ok())
         .unwrap_or(Value::Null);
     let alive = crate::file_age(&d.join("status.json")).is_some_and(|a| a < 300);
+    if alive && s["version"].as_str().is_some_and(|v| v != crate::platform::VERSION) {
+        return false;
+    }
     let tasks: Vec<(u64, String, String)> = s["tasks"]
         .as_array()
         .into_iter()
@@ -101,7 +107,7 @@ fn refresh(t: &TrayIcon, d: &Path, shown: &mut String) {
         s["error"], s["version"]
     );
     if *shown == sig {
-        return;
+        return true;
     }
     *shown = sig;
     let project = s["project"].as_str().unwrap_or("taskq");
@@ -183,6 +189,7 @@ fn refresh(t: &TrayIcon, d: &Path, shown: &mut String) {
     let _ = un.append(&item("uninstall", "Confirm: remove the service", true));
     let _ = m.append(&un);
     t.set_menu(Some(Box::new(m)));
+    true
 }
 
 fn act(root: &Path, id: &str) {

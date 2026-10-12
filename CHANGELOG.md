@@ -3,6 +3,11 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.0.10
+
+Windows runs the tray as `<install>/taskq-tray.exe`, so a pinned icon stays pinned across updates. A tray on another
+version than the live service exits and the service starts its own: the tray now follows updates.
+
 ## v4.0.9
 
 Windows: the tray heartbeat and the poke never changed their file's mtime (Rust rewrote an empty file in place), so

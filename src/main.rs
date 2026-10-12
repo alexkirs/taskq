@@ -109,7 +109,6 @@ fn load(root: &Path) -> Res<(Config, Value)> {
         limits,
         permission_mode: str_or("permission_mode", "dontAsk"),
         codex,
-        release_repo: v["release"]["repo"].as_str().unwrap_or("").into(),
         ttl: secs("ttl", 300) as i64,
         poll: secs("poll", 60),
         update_every: secs("update_every", 900),
@@ -527,7 +526,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         if is_installed && checked.is_none_or(|t| t.elapsed().as_secs() >= cfg.update_every) {
             checked = Some(Instant::now());
-            match platform::update(&cfg.install, &cfg.release_repo, false) {
+            match platform::update(&cfg.install, false) {
                 Ok(Some(v)) => {
                     eprintln!("updated to {v}; restarting");
                     reexec(&s, cfg)?;
@@ -625,8 +624,7 @@ fn run(argv: &[String]) -> Res<()> {
         }
         "update" => {
             let install = platform::default_install();
-            let repo = find_root().ok().and_then(|r| load(&r).ok()).map(|(c, _)| c.release_repo).unwrap_or_default();
-            match platform::update(&install, &repo, a.flags.contains_key("check"))? {
+            match platform::update(&install, a.flags.contains_key("check"))? {
                 Some(v) => println!("updated to {v}; the service restarts on its next update check"),
                 None => println!("up to date ({})", platform::current(&install).unwrap_or_else(|| platform::VERSION.into())),
             }
@@ -778,7 +776,6 @@ mod tests {
             limits: BTreeMap::new(),
             permission_mode: "dontAsk".into(),
             codex: vec![],
-            release_repo: String::new(),
             ttl: 300,
             poll: 60,
             update_every: 900,

@@ -110,10 +110,11 @@ pub fn verify(sums: &[u8], name: &str, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// § 8 update steps: Ok(Some(version)) when a new release became current.
-pub fn update(install: &Path, repo: &str, check: bool) -> Result<Option<String>, String> {
-    if repo.is_empty() {
-        return Err("no release repo: update is off".into());
-    }
+/// Built in, never from config: project files are written by workers, so config must not choose the code hosts run.
+pub const RELEASE_REPO: &str = "alexkirs/taskq";
+
+pub fn update(install: &Path, check: bool) -> Result<Option<String>, String> {
+    let repo = RELEASE_REPO;
     let rel = install.join("releases");
     fs::create_dir_all(&rel).map_err(|e| e.to_string())?;
     for e in fs::read_dir(&rel).map_err(|e| e.to_string())?.flatten() {

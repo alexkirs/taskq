@@ -260,8 +260,8 @@ The child's environment drops `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` and
 **Release.** CI on a `v*` tag builds once per OS `taskq-<ver>-<os>-<arch>`,
 `SHA256SUMS` and `latest.json` `{"version", "files": {"<os>-<arch>": "<name>"}}`. Each runner runs `selftest` on
 its artifact before publishing. Hosts need no git, gh or toolchain; HTTP goes through the OS `curl`. The host checks
-the sha256 against `SHA256SUMS`. Trust is HTTPS to the release repo and who can push its tags; `ponytail:` no
-signature, add one when releases are served from anywhere else.
+the sha256 against `SHA256SUMS`. Trust is HTTPS to the release repo built into the binary (`alexkirs/taskq`, no
+config changes it) and who can push its tags; `ponytail:` no signature, add one when releases are served elsewhere.
 
 **Update** (`taskq update`, service step 7) in `install` (default `~/.local/share/taskq`, Windows `%LOCALAPPDATA%\taskq`):
 immutable `releases/<ver>/`, a `current` file holding `<ver>` (atomic rename) and `previous`.
@@ -288,7 +288,6 @@ change that N-1 cannot ignore needs a cutover like § 9. Hosts update independen
 - `publish` `direct|pr`; `workspace` `external` keeps host-owned worktrees.
 - `hosts` `{hostname: name}` (env `TASKQ_HOST` overrides); `limits` `{"claude": n, "codex": n}`.
 - `permission_mode`, `codex` (R9); `pages` link wrapper base; `assignee` (login or `me`) report filter.
-- `release` `{"repo": "alexkirs/taskq"}`.
 - `ttl`, `poll`, `update_every`, `rollback_after`: seconds, defaults 300, 60, 900, 600.
 - Token: env `TASKQ_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token` (mode 0600). Never in config.
 

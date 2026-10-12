@@ -75,6 +75,7 @@ pub struct View {
     pub issue: Issue,
     pub task: Task,
     pub comments: Vec<Comment>,
+    pub log: Vec<core::Entry>,
 }
 
 /// Fold every open task (heartbeat issues and untrusted authors excluded).
@@ -125,7 +126,7 @@ pub fn views(board: &dyn Board, cache: &mut HashMap<u64, (i64, Vec<Comment>)>) -
         cache.insert(issue.number, (issue.updated, comments.clone()));
         let log: Vec<_> = comments.iter().filter(|c| c.trusted).map(|c| core::Entry { id: c.id, body: c.body.clone(), edited: c.edited }).collect();
         let deps_open = core::depends(&issue.body).iter().any(|d| open.contains(d));
-        out.push(View { task: core::fold(&log, deps_open), issue, comments });
+        out.push(View { task: core::fold(issue.number, &log, deps_open), issue, comments, log });
     }
     Ok((out, hosts))
 }
@@ -311,7 +312,7 @@ impl<'a> Service<'a> {
             if session == "-" {
                 session = crate::runtime::codex_thread(&crate::runtime::log_path(&self.cfg.root, &l)).unwrap_or_default();
             }
-            let text: Vec<String> = new.iter().map(|c| c.body.split_once('\n').map(|x| x.1).unwrap_or("").trim().to_string()).collect();
+            let text: Vec<String> = new.iter().map(|c| core::delivery(n, &v.log, c.id)).collect();
             l.session = session;
             l.resume = Some(text.join("\n\n"));
             if l.session.is_empty() {
@@ -399,7 +400,7 @@ impl<'a> Service<'a> {
         let n = v.issue.number;
         let session = crate::runtime::new_session(rt);
         let id = self.post(n, core::entry("spawn", &[role, &format!("{rt}:{session}"), &self.cfg.me], None, ""))?;
-        let t = core::fold(&entries(self.board, n)?, false); // only ready or review tasks are claimed
+        let t = core::fold(n, &entries(self.board, n)?, false); // only ready or review tasks are claimed
         if t.attempt != Some(id) {
             self.log.push(format!("#{n} spawn {id} lost the claim"));
             return Ok(());
@@ -480,7 +481,7 @@ mod tests {
     }
 
     fn task(b: &Fake, n: u64) -> Task {
-        core::fold(&entries(b, n).unwrap(), false)
+        core::fold(n, &entries(b, n).unwrap(), false)
     }
 
     #[test]

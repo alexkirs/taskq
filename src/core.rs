@@ -75,8 +75,17 @@ struct Line<'a> {
     text: &'a str,
 }
 
-fn parse(body: &str) -> Option<Line<'_>> {
+/// The first line of a log entry of task `n`; `taskq answer K|N.K` (the CLI form) counts as `taskq: answer K`.
+fn parse(n: u64, body: &str) -> Option<Line<'_>> {
     let (head, text) = body.split_once('\n').unwrap_or((body, ""));
+    if let Some(arg) = head.trim().strip_prefix("taskq answer ") {
+        let k = match arg.trim().split_once('.') {
+            Some((m, k)) => (m.trim_start_matches('#').parse() == Ok(n)).then_some(k)?,
+            None => arg.trim(),
+        };
+        k.parse::<usize>().ok()?;
+        return Some(Line { kind: "answer", args: vec![k], attempt: None, text: text.trim() });
+    }
     let mut words: Vec<&str> = head.trim().strip_prefix("taskq:")?.split_whitespace().collect();
     let mut attempt = None;
     if words.len() >= 3 && words[words.len() - 2] == "attempt" {
@@ -93,6 +102,32 @@ fn sha(s: &str) -> bool {
 
 fn text(s: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Option lines `K. text [★]` of a card.
+pub fn options(card: &str) -> Vec<(usize, String, bool)> {
+    card.lines()
+        .filter_map(|l| {
+            let (k, rest) = l.trim().split_once(". ")?;
+            let k: usize = k.parse().ok()?;
+            let star = rest.trim_end().ends_with('★');
+            Some((k, rest.trim_end().trim_end_matches('★').trim().to_string(), star))
+        })
+        .collect()
+}
+
+/// What a resumed child receives for inbox entry `id` (§ 2): its text, else option K of the card it answers, else its
+/// first line; never empty.
+pub fn delivery(n: u64, entries: &[Entry], id: u64) -> String {
+    let Some(e) = entries.iter().find(|e| e.id == id) else { return String::new() };
+    let (head, text) = e.body.split_once('\n').unwrap_or((&e.body, ""));
+    if !text.trim().is_empty() {
+        return text.trim().to_string();
+    }
+    let before: Vec<Entry> = entries.iter().filter(|x| x.id < id).cloned().collect();
+    let card = fold(n, &before, false).card.unwrap_or_default();
+    let k = parse(n, &e.body).and_then(|l| l.args.first()?.parse::<usize>().ok());
+    options(&card).into_iter().find(|o| Some(o.0) == k).map(|o| o.1).unwrap_or_else(|| head.trim().to_string())
 }
 
 fn has_options(s: &str) -> bool {
@@ -113,13 +148,13 @@ fn ready(t: &mut Task) {
     t.state = State::Ready;
 }
 
-pub fn fold(entries: &[Entry], deps_open: bool) -> Task {
+pub fn fold(n: u64, entries: &[Entry], deps_open: bool) -> Task {
     let mut log: Vec<&Entry> = entries.iter().filter(|e| !e.edited).collect();
     log.sort_by_key(|e| e.id);
     let mut t = Task::default();
     let mut resume = None; // the state an `ask` entry left; None when a retry limit asked
     for e in log {
-        if let Some(l) = parse(&e.body) {
+        if let Some(l) = parse(n, &e.body) {
             step(&mut t, &mut resume, e.id, &l);
         }
     }
@@ -216,6 +251,8 @@ fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line) {
 struct Trace {
     name: String,
     #[serde(default)]
+    task: u64,
+    #[serde(default)]
     deps_open: bool,
     entries: Vec<Entry>,
     expect: Task,
@@ -225,7 +262,7 @@ struct Trace {
 pub fn golden(json: &str) -> Result<usize, String> {
     let traces: Vec<Trace> = serde_json::from_str(json).map_err(|e| e.to_string())?;
     for tr in &traces {
-        let got = fold(&tr.entries, tr.deps_open);
+        let got = fold(tr.task, &tr.entries, tr.deps_open);
         if got != tr.expect {
             return Err(format!("{}: got {:?}, want {:?}", tr.name, got, tr.expect));
         }
@@ -253,8 +290,8 @@ mod tests {
             let mut log = tr.entries.clone();
             log.sort_by_key(|e| e.id);
             for i in 0..log.len() {
-                let (before, after) = (super::fold(&log[..i], tr.deps_open), super::fold(&log[..=i], tr.deps_open));
-                if let (Some(l), true) = (super::parse(&log[i].body), before != after) {
+                let (before, after) = (super::fold(tr.task, &log[..i], tr.deps_open), super::fold(tr.task, &log[..=i], tr.deps_open));
+                if let (Some(l), true) = (super::parse(tr.task, &log[i].body), before != after) {
                     seen.insert((before.state.name().to_string(), l.kind.to_string()));
                 }
             }
@@ -283,5 +320,17 @@ mod tests {
         assert!(spec.lines().count() <= 300, "taskq.md over 300 lines");
         let dated = |w: &[u8]| w.len() == 10 && w[4] == b'-' && w[7] == b'-' && w.iter().filter(|b| b.is_ascii_digit()).count() == 8;
         assert!(!spec.as_bytes().windows(10).any(dated), "taskq.md holds a date: history goes to git and issues");
+    }
+
+    #[test]
+    fn delivery_falls_back_to_option_then_first_line() {
+        let e = |id, body: &str| super::Entry { id, body: body.into(), edited: false };
+        let mut log = vec![e(10, "taskq: spawn worker claude:s1 mac"), e(11, "taskq: ask attempt 10\nWhich?\n1. x\n2. y ★")];
+        log.push(e(12, "taskq answer 7.2"));
+        assert_eq!(super::delivery(7, &log, 12), "y");
+        log[2] = e(12, "taskq: answer 2\nuse y, keep x");
+        assert_eq!(super::delivery(7, &log, 12), "use y, keep x");
+        log[2] = e(12, "taskq answer 3");
+        assert_eq!(super::delivery(7, &log, 12), "taskq answer 3");
     }
 }

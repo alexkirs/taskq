@@ -1,7 +1,7 @@
 # Single-file taskq
 
 Historical design record for #290, not the current runtime/command contract. Later owner
-decisions in [taskq.md](../taskq.md) supersede the planned removals and line targets below.
+decisions in [taskq.md](taskq-v3.md) supersede the planned removals and line targets below.
 #657 additionally isolates current-user IPC/service lifecycle in `host_service.py`, stdlib only;
 `taskq.py` retains the only task lifecycle/board/lease authority. This is an approved exception
 to the historical one-file packaging target, not a second task engine.

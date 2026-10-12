@@ -1,6 +1,6 @@
 # Maintenance handoff
 
-The normative lifecycle and recovery rules are in [taskq.md](../taskq.md). This checklist
+The normative lifecycle and recovery rules are in [taskq.md](taskq-v3.md). This checklist
 organizes evidence; it does not authorize maintenance, recovery or resumption. Record each
 operational checkpoint on the owning project's board or in its private evidence archive.
 

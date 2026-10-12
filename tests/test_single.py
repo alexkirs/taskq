@@ -1264,7 +1264,7 @@ class PullRequests(Base):
         self.assertIn('`gh pr create --base main --head taskq-1 --title "<title>" --body "<summary>"`', prompt)
         self.assertIn('--sha <PR head full SHA>', prompt)
         self.assertIn('`git fetch origin && git rebase origin/main`, run the tests required by § 10 Testing policy', prompt)  # #334: up to date before result
-        self.assertIn('taskq.md` first and do only what it allows (R13)', prompt)  # #505: spec first
+        self.assertIn('taskq-v3.md` first and do only what it allows (R13)', prompt)  # #505: spec first
         self.assertIn('Task: https://board/1', prompt)
         self.assertIn('Do not rewrite historical commits', prompt)
         taskq.CONFIG['board'] = 'gitlab'
@@ -4815,7 +4815,7 @@ class Contract(Base):
         REAL_RUN(['git', '-C', str(folder), '-c', 'user.name=t', '-c', 'user.email=t@t', *argv], check=True, capture_output=True)
 
     def test_pm_prints_role_and_records_hash(self):
-        (self.root / 'taskq.md').write_bytes((ROOT / 'taskq.md').read_bytes())
+        (self.root / 'taskq.md').write_bytes((ROOT / 'docs/legacy/taskq-v3.md').read_bytes())
         out = self.run_cli('pm')
         digest = taskq.contract()
         self.assertTrue(out.startswith(f'taskq pm contract {digest}\n'))
@@ -4825,7 +4825,7 @@ class Contract(Base):
         self.assertEqual(json.loads((self.root / '.taskq' / 'pm.json').read_text()), {'contract': digest})  # #532: the hash only
 
     def test_pm_onboarding_is_one_read_only_snapshot(self):
-        (self.root / 'taskq.md').write_bytes((ROOT / 'taskq.md').read_bytes())
+        (self.root / 'taskq.md').write_bytes((ROOT / 'docs/legacy/taskq-v3.md').read_bytes())
         self.add('assigned')
         with mock.patch.dict(os.environ, {'TASKQ_RUNTIME': ''}, clear=True):
             self.add('unassigned')
@@ -4863,7 +4863,7 @@ class Contract(Base):
 
     def test_pm_refuses_recorded_session_roles_before_onboarding(self):
         self.add()
-        (self.root / 'taskq.md').write_bytes((ROOT / 'taskq.md').read_bytes())
+        (self.root / 'taskq.md').write_bytes((ROOT / 'docs/legacy/taskq-v3.md').read_bytes())
         for field in ('claim', 'supervisor'):
             with self.subTest(field=field):
                 with contextlib.redirect_stdout(io.StringIO()):

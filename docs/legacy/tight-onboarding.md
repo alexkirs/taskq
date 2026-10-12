@@ -1,10 +1,10 @@
 # Tight / Hermes onboarding candidate (#538)
 
-Ordinary new/existing project setup uses [shared bootstrap](../taskq.md#shared-project-bootstrap-600).
+Ordinary new/existing project setup uses [shared bootstrap](taskq-v3.md#shared-project-bootstrap-600).
 That path does not activate this identity-isolation proposal or qualify Hermes.
 
 Status: design and portable mocks only. This is a proposal, not an operational
-policy or activation approval. [taskq.md](../taskq.md) remains the manager contract.
+policy or activation approval. [taskq.md](taskq-v3.md) remains the manager contract.
 The recorded owner approval permits this document and isolated fixtures only.
 #526 retains Claude/Codex live qualification; #274/#275 are historical references,
 not evidence that Hermes is qualified.
@@ -58,7 +58,7 @@ before implementing this option. No second queue or copied manager policy.
    from the explicit project. Use genuine Hermes-supplied `HERMES_SESSION_ID`;
    never supply a fabricated identity or relabel a Codex session.
 3. On separately qualified Linux, follow the existing
-   [native bridge setup](../taskq.md#native-hermes-admission-local-candidate).
+   [native bridge setup](taskq-v3.md#native-hermes-admission-local-candidate).
    Explicit isolated Hermes home and installed gateway argv are prerequisites.
    Availability is not authentication or lifecycle proof. Preserve configured
    models, effort, permissions and host/project capacity; no live launch here.

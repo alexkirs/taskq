@@ -1,0 +1,173 @@
+[
+  {"name": "new task is ready", "entries": [], "expect": {"state": "ready"}},
+  {"name": "open dependency waits", "deps_open": true, "entries": [], "expect": {"state": "waiting"}},
+  {"name": "plain comments and unknown kinds are ignored", "entries": [
+   {"id": 5, "body": "looks good to me"},
+   {"id": 6, "body": "taskq: frobnicate"},
+   {"id": 7, "body": "taskq:"}
+  ], "expect": {"state": "ready"}},
+  {"name": "spawn starts the worker attempt", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"}
+  ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac"}},
+  {"name": "first spawn wins", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: spawn worker codex:s2 win"}
+  ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac"}},
+  {"name": "entries are read in id order", "entries": [
+   {"id": 11, "body": "taskq: spawn worker codex:s2 win"},
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"}
+  ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac"}},
+  {"name": "edited entry is ignored", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac", "edited": true}
+  ], "expect": {"state": "ready"}},
+  {"name": "result moves to review and ends the worker", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10\nchecks: unittest OK"}
+  ], "expect": {"state": "review", "result": "0123456789abcdef0123456789abcdef01234567"}},
+  {"name": "result with options makes a card", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10\nTwo layouts.\n1. close with A\n2. B ★"}
+  ], "expect": {"state": "review", "result": "0123456789abcdef0123456789abcdef01234567", "card": "Two layouts.\n1. close with A\n2. B ★"}},
+  {"name": "result needs the attempt and a full sha", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567"},
+   {"id": 13, "body": "taskq: result abc123 attempt 10"}
+  ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac"}},
+  {"name": "stale attempt is fenced out", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: requeue\nwrong approach"},
+   {"id": 12, "body": "taskq: spawn worker codex:s2 win"},
+   {"id": 13, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 14, "body": "taskq: gone attempt 10"}
+  ], "expect": {"state": "doing", "attempt": 12, "role": "worker", "session": "codex:s2 win"}},
+  {"name": "hand-typed close accepts the result", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 20, "body": "taskq: close\nmerged by hand"}
+  ], "expect": {"state": "closed", "result": "0123456789abcdef0123456789abcdef01234567"}},
+  {"name": "ask and answer resume the same worker", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: ask attempt 10\nWhich DB?\n1. sqlite ★\n2. postgres"},
+   {"id": 12, "body": "taskq: gone attempt 10\nexit 0"},
+   {"id": 13, "body": "taskq: answer 1"}
+  ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac", "inbox": [13]}},
+  {"name": "ask shows the card", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: ask attempt 10\nWhich DB?"}
+  ], "expect": {"state": "ask", "attempt": 10, "role": "worker", "session": "claude:s1 mac", "card": "Which DB?"}},
+  {"name": "steer goes to the inbox of the attempt", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: steer\nuse the v2 API"},
+   {"id": 12, "body": "taskq: steer\nand keep it short"}
+  ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac", "inbox": [11, 12]}},
+  {"name": "worker requeue counts retries", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: requeue attempt 10\nflaky"},
+   {"id": 12, "body": "taskq: spawn worker claude:s2 mac"},
+   {"id": 13, "body": "taskq: requeue attempt 12\nflaky"}
+  ], "expect": {"state": "ready", "retries": 2}},
+  {"name": "third requeue asks and its answer goes to ready", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: requeue attempt 10\nflaky"},
+   {"id": 12, "body": "taskq: spawn worker claude:s2 mac"},
+   {"id": 13, "body": "taskq: requeue attempt 12\nflaky"},
+   {"id": 14, "body": "taskq: spawn worker claude:s3 mac"},
+   {"id": 15, "body": "taskq: requeue attempt 14\nstill flaky"},
+   {"id": 16, "body": "taskq: answer\ntry once more"}
+  ], "expect": {"state": "ready"}},
+  {"name": "second gone asks", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: gone attempt 10\nlease expired"},
+   {"id": 12, "body": "taskq: spawn worker claude:s2 win"},
+   {"id": 13, "body": "taskq: gone attempt 12\nexit 1"}
+  ], "expect": {"state": "ask", "retries": 2, "card": "exit 1"}},
+  {"name": "reviewer spawn, gone keeps the result", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 13, "body": "taskq: spawn reviewer codex:r1 win"},
+   {"id": 14, "body": "taskq: spawn reviewer codex:r2 mac"},
+   {"id": 15, "body": "taskq: gone attempt 13"}
+  ], "expect": {"state": "review", "retries": 1, "result": "0123456789abcdef0123456789abcdef01234567"}},
+  {"name": "reviewer closes its own attempt", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 13, "body": "taskq: spawn reviewer codex:r1 win"},
+   {"id": 14, "body": "taskq: close attempt 13\nok"}
+  ], "expect": {"state": "closed", "result": "0123456789abcdef0123456789abcdef01234567"}},
+  {"name": "reviewer requeue sends back to ready", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 13, "body": "taskq: spawn reviewer codex:r1 win"},
+   {"id": 14, "body": "taskq: requeue attempt 13\nmissing tests"}
+  ], "expect": {"state": "ready", "retries": 1}},
+  {"name": "pm requeue resets everything", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: gone attempt 10"},
+   {"id": 12, "body": "taskq: spawn worker claude:s2 mac"},
+   {"id": 13, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 12"},
+   {"id": 14, "body": "taskq: requeue\nredo"}
+  ], "expect": {"state": "ready"}},
+  {"name": "later blocks spawn and fenced writes", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: later\nnot now"},
+   {"id": 12, "body": "taskq: spawn worker claude:s2 mac"},
+   {"id": 13, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"}
+  ], "expect": {"state": "later"}},
+  {"name": "failed exits only by requeue or close", "entries": [
+   {"id": 11, "body": "taskq: failed\nno access"},
+   {"id": 12, "body": "taskq: later"},
+   {"id": 13, "body": "taskq: close\nwontfix"}
+  ], "expect": {"state": "closed"}},
+  {"name": "closed ignores everything", "entries": [
+   {"id": 11, "body": "taskq: failed\nno access"},
+   {"id": 12, "body": "taskq: close"},
+   {"id": 13, "body": "taskq: requeue"}
+  ], "expect": {"state": "closed"}},
+  {"name": "ready requeue resets retries; later and failed exit by requeue", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: requeue attempt 10\nflaky"},
+   {"id": 12, "body": "taskq: requeue"},
+   {"id": 13, "body": "taskq: later"},
+   {"id": 14, "body": "taskq: requeue"},
+   {"id": 15, "body": "taskq: failed\nno access"},
+   {"id": 16, "body": "taskq: requeue"}
+  ], "expect": {"state": "ready"}},
+  {"name": "waiting accepts requeue and later", "deps_open": true, "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: requeue attempt 10"},
+   {"id": 12, "body": "taskq: requeue"},
+   {"id": 13, "body": "taskq: later"}
+  ], "expect": {"state": "later"}},
+  {"name": "waiting accepts failed", "deps_open": true, "entries": [
+   {"id": 10, "body": "taskq: failed\nblocked"}
+  ], "expect": {"state": "failed"}},
+  {"name": "doing and review accept failed; review keeps the result", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: failed\nno access"},
+   {"id": 12, "body": "taskq: requeue"},
+   {"id": 13, "body": "taskq: spawn worker claude:s2 mac"},
+   {"id": 14, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 13"},
+   {"id": 15, "body": "taskq: failed\nbroken"}
+  ], "expect": {"state": "failed", "result": "0123456789abcdef0123456789abcdef01234567"}},
+  {"name": "reviewer ask resumes review; later keeps the result and closes", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 12, "body": "taskq: spawn reviewer codex:r1 win"},
+   {"id": 13, "body": "taskq: ask attempt 12\nship?\n1. close\n2. fix ★"},
+   {"id": 14, "body": "taskq: answer 2"},
+   {"id": 15, "body": "taskq: later"},
+   {"id": 16, "body": "taskq: close\nwontfix"}
+  ], "expect": {"state": "closed", "result": "0123456789abcdef0123456789abcdef01234567"}},
+  {"name": "ask accepts requeue, later and failed", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: ask attempt 10\nq"},
+   {"id": 12, "body": "taskq: requeue"},
+   {"id": 13, "body": "taskq: spawn worker claude:s2 mac"},
+   {"id": 14, "body": "taskq: ask attempt 13\nq"},
+   {"id": 15, "body": "taskq: later"},
+   {"id": 16, "body": "taskq: requeue"},
+   {"id": 17, "body": "taskq: spawn worker claude:s3 mac"},
+   {"id": 18, "body": "taskq: ask attempt 17\nq"},
+   {"id": 19, "body": "taskq: failed\nstuck"}
+  ], "expect": {"state": "failed", "card": "q"}}
+]

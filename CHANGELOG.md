@@ -3,6 +3,11 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.0.8
+
+Windows: the tray froze after its first pass (the event loop never woke on its timer); it now wakes from a timer thread.
+Tray errors go to `<root>/.taskq/tray.log`.
+
 ## v4.0.7
 
 macOS and Windows: `taskq tray`, a menu-bar / notification-area icon that the installed service starts and keeps running:

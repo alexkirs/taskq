@@ -4,7 +4,7 @@
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
@@ -15,40 +15,49 @@ pub fn run(root: PathBuf) -> Result<(), String> {
     if crate::file_age(&d.join("tray")).is_some_and(|a| a < 15) {
         return Err("taskq tray already runs for this project".into());
     }
+    // Wakes come from a timer thread and the menu handler through the proxy, not `WaitUntil`:
+    // on Windows a `WaitUntil` loop with no window never woke after the first pass.
     #[allow(unused_mut)]
-    let mut event_loop = EventLoopBuilder::new().build();
+    let mut event_loop = EventLoopBuilder::<Option<String>>::with_user_event().build();
     #[cfg(target_os = "macos")]
     {
         // menu bar only: no Dock icon, no app menu
         use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
         event_loop.set_activation_policy(ActivationPolicy::Accessory);
     }
+    let proxy = event_loop.create_proxy();
+    MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+        let _ = proxy.send_event(Some(e.id.0));
+    }));
+    let proxy = event_loop.create_proxy();
+    std::thread::spawn(move || {
+        while proxy.send_event(None).is_ok() {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
     let mut tray: Option<TrayIcon> = None;
     let mut shown = String::new();
-    let mut next = Instant::now();
     event_loop.run(move |event, _, flow| {
-        // ponytail: 0.5 s polling for clicks and the status file, an event proxy if latency ever matters
-        *flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(500));
-        if let Event::NewEvents(StartCause::Init) = event {
-            // macOS needs a running event loop before the icon exists
-            tray = TrayIconBuilder::new()
-                .with_icon(icon([128, 128, 128]))
-                .with_tooltip("taskq")
-                .build()
-                .ok();
-            if tray.is_none() {
-                *flow = ControlFlow::Exit;
+        *flow = ControlFlow::Wait;
+        match event {
+            Event::NewEvents(StartCause::Init) => {
+                // macOS needs a running event loop before the icon exists
+                match TrayIconBuilder::new().with_icon(icon([128, 128, 128])).with_tooltip("taskq").build() {
+                    Ok(t) => tray = Some(t),
+                    Err(e) => {
+                        eprintln!("taskq tray: {e}");
+                        *flow = ControlFlow::Exit;
+                    }
+                }
             }
-        }
-        while let Ok(e) = MenuEvent::receiver().try_recv() {
-            act(&root, &e.id.0);
-        }
-        if let Some(t) = &tray
-            && Instant::now() >= next
-        {
-            next = Instant::now() + Duration::from_secs(2);
-            let _ = fs::write(d.join("tray"), "");
-            refresh(t, &d, &mut shown);
+            Event::UserEvent(Some(id)) => act(&root, &id),
+            Event::UserEvent(None) => {
+                if let Some(t) = &tray {
+                    let _ = fs::write(d.join("tray"), "");
+                    refresh(t, &d, &mut shown);
+                }
+            }
+            _ => {}
         }
     })
 }

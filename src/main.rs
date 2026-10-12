@@ -596,7 +596,8 @@ fn keep_tray(root: &Path, tray: &mut Option<std::process::Child>) {
     }
     let Ok(me) = std::env::current_exe() else { return };
     let mut c = std::process::Command::new(me);
-    c.arg("tray").current_dir(root).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let err = fs::File::create(dot(root).join("tray.log")).map(std::process::Stdio::from).unwrap_or_else(|_| std::process::Stdio::null());
+    c.arg("tray").current_dir(root).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(err);
     *tray = platform::quiet(&mut c).spawn().ok();
 }
 

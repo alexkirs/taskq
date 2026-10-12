@@ -93,37 +93,65 @@ pub fn launch(install: &Path, args: &[String]) -> ! {
     // ponytail: a Scheduled Task restarts only a failed launch, so on Windows the launcher supervises `service run`:
     // exit 75 (updated) runs the new current at once, any other exit waits a minute; stderr goes to <install>/taskq.log.
     // The task runs in the interactive session, so the launcher drops its console window (closing it was STATUS_CONTROL_C_EXIT
-    // for the service) and the child gets none.
+    // for the service) and the child gets none. The std handles are reset too: stale console handles made spawn fail and
+    // the error print panic (exit 101).
     #[cfg(windows)]
     if service {
         #[link(name = "kernel32")]
         unsafe extern "system" {
             fn FreeConsole() -> i32;
+            fn SetStdHandle(id: u32, h: *mut std::ffi::c_void) -> i32;
         }
-        unsafe { FreeConsole() };
+        unsafe {
+            FreeConsole();
+            for id in [-10i32, -11, -12] {
+                SetStdHandle(id as u32, std::ptr::null_mut());
+            }
+        }
     }
     #[cfg(not(unix))]
-    loop {
-        let v = pick();
-        let mut c = Command::new(release_exe(install, &v));
-        c.args(args);
-        if service && let Ok(log) = fs::OpenOptions::new().create(true).append(true).open(install.join("taskq.log")) {
-            if let Ok(out) = log.try_clone() {
+    {
+        let log = || fs::OpenOptions::new().create(true).append(true).open(install.join("taskq.log")).ok();
+        let note = |msg: &str| {
+            use std::io::Write;
+            match log().filter(|_| service) {
+                Some(mut f) => {
+                    let _ = writeln!(f, "taskq: {msg}");
+                }
+                None => eprintln!("taskq: {msg}"),
+            }
+        };
+        loop {
+            let v = pick();
+            let mut c = Command::new(release_exe(install, &v));
+            c.args(args);
+            if service && let Some(out) = log() {
+                c.stdin(std::process::Stdio::null());
+                if let Ok(err) = out.try_clone() {
+                    c.stderr(err);
+                }
                 c.stdout(out);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                }
             }
-            c.stderr(log);
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            let code = match c.status() {
+                Ok(s) => s.code().unwrap_or(1),
+                Err(e) if service => {
+                    note(&format!("start {v}: {e}"));
+                    1
+                }
+                Err(e) => die(&format!("start {v}: {e}")),
+            };
+            if !service {
+                std::process::exit(code);
             }
-        }
-        let code = c.status().map(|s| s.code().unwrap_or(1)).unwrap_or_else(|e| die(&format!("start {v}: {e}")));
-        if !service {
-            std::process::exit(code);
-        }
-        if code != 75 {
-            std::thread::sleep(std::time::Duration::from_secs(60));
+            if code != 75 {
+                note(&format!("{v} exited with {code}; restart in 60 s"));
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
         }
     }
 }
@@ -276,7 +304,9 @@ pub fn unit(install: &Path, root: &Path, project: &str) -> Unit {
         let name = format!("TaskQ-{project}");
         let path = install.join(format!("{name}.xml"));
         // this user's logon only: an any-user logon trigger needs admin to register
-        let user = format!("{}\\{}", std::env::var("USERDOMAIN").unwrap_or_default(), std::env::var("USERNAME").unwrap_or_default());
+        // `whoami`, not USERDOMAIN: an ssh session reports WORKGROUP and schtasks rejects `WORKGROUP\<user>`
+        let user = Command::new("whoami").output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|u| !u.is_empty())
+            .unwrap_or_else(|| format!("{}\\{}", std::env::var("USERDOMAIN").unwrap_or_default(), std::env::var("USERNAME").unwrap_or_default()));
         let text = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{u}</UserId></LogonTrigger></Triggers>\n<Principals><Principal id=\"Author\"><UserId>{u}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure><Hidden>true</Hidden></Settings>\n<Actions Context=\"Author\"><Exec><Command>{l}</Command><Arguments>service run</Arguments><WorkingDirectory>{r}</WorkingDirectory></Exec></Actions>\n</Task>\n",
             u = xml(&user), l = xml(&l), r = xml(&r)

@@ -269,7 +269,7 @@ immutable `releases/<ver>/`, a `current` file holding `<ver>` (atomic rename) an
 2. Download into `releases/<ver>.tmp/`, verify sha256, rename to `releases/<ver>/`.
 3. Smoke: `releases/<ver>/taskq selftest`. Failure: delete, report, keep current.
 4. Write `previous`, swap `current`, re-exec; live children pass to the new image through `<root>/.taskq/kids`.
-   Windows: exit once no child is live; the unit restarts the service.
+   Windows: exit 75 once no child is live; the launcher restarts the service (any exit, 60 s after a crash), runs it without a console window and appends its output to `<install>/taskq.log`.
 5. The launcher `<install>/taskq` runs `releases/$(current)/taskq`. It counts starts of a version not yet marked
    `healthy` (the service marks it after `rollback_after`); at 3 it restores `previous` into `current`.
 6. Children keep running from their own release folder: no drain, no manual resume, no blocked user command.

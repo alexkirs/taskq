@@ -3,6 +3,13 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.0.4
+
+Windows: the launcher supervises `service run` (a Scheduled Task restarts only a failed launch, so a crash or the
+post-update exit left the host dead until the next logon), runs it without a console window (closing that window killed
+the service with `0xC000013A`) and appends its output to `%LOCALAPPDATA%\taskq\taskq.log`.
+Reinstall once (`taskq service install` from the new binary): the launcher only changes on install.
+
 ## v4.0.3
 
 The host heartbeat carries an `at <board time>` line. GitHub keeps `updated_at` on a same-body edit, so an idle or

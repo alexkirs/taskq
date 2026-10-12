@@ -62,33 +62,69 @@ pub fn release_exe(install: &Path, v: &str) -> PathBuf {
 /// The launcher `<install>/taskq`: run the current release. Only `service run` counts starts of a version that is not
 /// yet healthy; the third one restores `previous` (§ 8).
 pub fn launch(install: &Path, args: &[String]) -> ! {
-    let mut v = current(install).unwrap_or_else(|| die("no current release: run `taskq update`"));
-    if args.first().map(String::as_str) == Some("service") && args.get(1).map(String::as_str) == Some("run") {
-        let dir = install.join("releases").join(&v);
-        if !dir.join("healthy").exists() {
-            let n = read(&dir.join("starts")).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0) + 1;
-            let _ = fs::write(dir.join("starts"), n.to_string());
-            if n >= 3 {
-                if let Some(prev) = read(&install.join("previous")).filter(|p| *p != v) {
-                    eprintln!("taskq: {v} failed to become healthy {n} times; back to {prev}");
-                    let _ = write_atomic(&install.join("current"), &prev);
-                    v = prev;
+    let service = args.first().map(String::as_str) == Some("service") && args.get(1).map(String::as_str) == Some("run");
+    let pick = || {
+        let mut v = current(install).unwrap_or_else(|| die("no current release: run `taskq update`"));
+        if service {
+            let dir = install.join("releases").join(&v);
+            if !dir.join("healthy").exists() {
+                let n = read(&dir.join("starts")).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0) + 1;
+                let _ = fs::write(dir.join("starts"), n.to_string());
+                if n >= 3 {
+                    if let Some(prev) = read(&install.join("previous")).filter(|p| *p != v) {
+                        eprintln!("taskq: {v} failed to become healthy {n} times; back to {prev}");
+                        let _ = write_atomic(&install.join("current"), &prev);
+                        v = prev;
+                    }
                 }
             }
         }
-    }
-    let mut c = Command::new(release_exe(install, &v));
-    c.args(args);
+        v
+    };
     #[cfg(unix)]
     {
+        let v = pick();
+        let mut c = Command::new(release_exe(install, &v));
+        c.args(args);
         use std::os::unix::process::CommandExt;
         let e = c.exec();
         die(&format!("exec {v}: {e}"));
     }
+    // ponytail: a Scheduled Task restarts only a failed launch, so on Windows the launcher supervises `service run`:
+    // exit 75 (updated) runs the new current at once, any other exit waits a minute; stderr goes to <install>/taskq.log.
+    // The task runs in the interactive session, so the launcher drops its console window (closing it was STATUS_CONTROL_C_EXIT
+    // for the service) and the child gets none.
+    #[cfg(windows)]
+    if service {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn FreeConsole() -> i32;
+        }
+        unsafe { FreeConsole() };
+    }
     #[cfg(not(unix))]
-    {
+    loop {
+        let v = pick();
+        let mut c = Command::new(release_exe(install, &v));
+        c.args(args);
+        if service && let Ok(log) = fs::OpenOptions::new().create(true).append(true).open(install.join("taskq.log")) {
+            if let Ok(out) = log.try_clone() {
+                c.stdout(out);
+            }
+            c.stderr(log);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+        }
         let code = c.status().map(|s| s.code().unwrap_or(1)).unwrap_or_else(|e| die(&format!("start {v}: {e}")));
-        std::process::exit(code);
+        if !service {
+            std::process::exit(code);
+        }
+        if code != 75 {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
     }
 }
 

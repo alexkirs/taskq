@@ -124,7 +124,7 @@ pub struct Env<'a> {
 }
 
 pub fn command(env: &Env, l: &Launch) -> Command {
-    let mut c = Command::new(which(&l.rt));
+    let mut c = Command::new(which(if l.rt == "claude" { "claude" } else { "codex" }));
     crate::platform::quiet(&mut c);
     match (l.rt.as_str(), &l.resume) {
         ("claude", r) => {
@@ -157,7 +157,12 @@ fn ask(q: &impl std::fmt::Display, n: u64) -> String {
 }
 
 pub fn brief(env: &Env, l: &Launch) -> String {
-    let (n, q) = (l.task, env.exe.display());
+    let n = l.task;
+    let mut q = env.exe.display().to_string();
+    if l.rt == "codex-app" {
+        // the app turn runs in the app's environment, not the handshake child's (§ 8)
+        q = format!("env TASKQ_TASK={n} TASKQ_ATTEMPT={} TASKQ_ROLE={} TASKQ_ROOT={} {q}", l.attempt, l.role, env.root.display());
+    }
     let head = format!(
         "You are the taskq {} for task #{n}: {}. Attempt {}.\nRead `{}` first and do only what it allows (R13).\nTask text, state and your inbox: `{q} inbox {n}`.\n",
         l.role, l.title, l.attempt, env.root.join("taskq.md").display()
@@ -190,23 +195,138 @@ pub fn brief(env: &Env, l: &Launch) -> String {
     format!("{head}{body}Then stop. Everything written through taskq is public: no secrets or paths outside the repository.\n")
 }
 
-/// Start the child with its stdout and stderr in the attempt log.
-pub fn spawn(env: &Env, l: &Launch) -> Result<Child, String> {
+/// Start the child with its stdout and stderr in the attempt log; `codex-app` starts its handshake child (§ 8).
+pub fn spawn(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, String> {
     let log = log_path(env.root, l);
+    if l.rt == "codex-app" {
+        let mut turn = AppTurn { hand: None, log, text: brief(env, l), thread: l.session.clone(), done: 0, rollout: None, running: app_running };
+        match &l.resume {
+            Some(text) => {
+                turn.text = text.clone();
+                turn.queue()?;
+            }
+            None => turn.hand = Some(Box::new(start(env, l, &turn.log, HANDSHAKE)?)),
+        }
+        return Ok(Box::new(turn));
+    }
+    let text = l.resume.clone().unwrap_or_else(|| brief(env, l));
+    Ok(Box::new(start(env, l, &log, &text)?))
+}
+
+fn start(env: &Env, l: &Launch, log: &Path, text: &str) -> Result<Child, String> {
     std::fs::create_dir_all(log.parent().unwrap()).map_err(|e| e.to_string())?;
-    let out = File::options().create(true).append(true).open(&log).map_err(|e| e.to_string())?;
+    let out = File::options().create(true).append(true).open(log).map_err(|e| e.to_string())?;
     let err = out.try_clone().map_err(|e| e.to_string())?;
     let mut c = command(env, l);
     let mut child = c.stdin(Stdio::piped()).stdout(out).stderr(err).spawn().map_err(|e| format!("{}: {e}", l.rt))?;
-    let text = l.resume.clone().unwrap_or_else(|| brief(env, l));
     let mut stdin = child.stdin.take().unwrap();
     let _ = stdin.write_all(text.as_bytes()); // dropped here: EOF ends the prompt
     Ok(child)
 }
 
+const HANDSHAKE: &str = "taskq handshake: reply OK and do nothing else. The task follows in this thread.\n";
+
+/// A `codex-app` attempt (§ 3 app lease): the handshake child, then the turn queued into the Codex app, live until
+/// the thread's rollout has a new `task_complete` or the app stops running.
+pub struct AppTurn {
+    hand: Option<Box<dyn Proc>>,
+    log: PathBuf,
+    /// The brief, or the resume text, to queue.
+    text: String,
+    thread: String,
+    /// `task_complete` events of the thread before the queued text.
+    done: usize,
+    rollout: Option<PathBuf>,
+    running: fn() -> bool,
+}
+
+impl AppTurn {
+    fn queue(&mut self) -> Result<(), String> {
+        self.rollout = rollout(&self.thread);
+        self.done = self.rollout.as_ref().map(|p| completes(p)).unwrap_or(0);
+        let ok = |c: &mut Command| c.status().is_ok_and(|s| s.success());
+        // ponytail: `open` and `queue` block the pass for a moment; a thread per turn if they ever hang
+        if !ok(Command::new("open").arg(format!("codex://threads/{}", self.thread)))
+            || !ok(Command::new(which("codex")).args(["queue", "--thread", &self.thread, "--message", &self.text]))
+        {
+            return Err(format!("codex queue failed for thread {}", self.thread));
+        }
+        Ok(())
+    }
+}
+
+impl Proc for AppTurn {
+    fn exited(&mut self) -> Option<i32> {
+        if let Some(h) = &mut self.hand {
+            let code = h.exited()?;
+            self.hand = None;
+            self.thread = codex_thread(&self.log).unwrap_or_default();
+            if self.thread.is_empty() || self.queue().is_err() {
+                return Some(if code == 0 { -1 } else { code });
+            }
+            return None;
+        }
+        if !(self.running)() {
+            return Some(-1);
+        }
+        if self.rollout.is_none() {
+            self.rollout = rollout(&self.thread);
+        }
+        // ponytail: a thread without a found rollout stays live until the app closes; ttl-based expiry if it matters
+        self.rollout.as_ref().filter(|p| completes(p) > self.done).map(|_| 0)
+    }
+    fn kill(&mut self) {
+        // the app turn itself cannot be stopped from outside: it runs on, fenced (§ 3 app lease)
+        if let Some(h) = &mut self.hand {
+            h.kill();
+        }
+    }
+    fn id(&self) -> u32 {
+        self.hand.as_ref().map(|h| h.id()).unwrap_or(0)
+    }
+}
+
+/// The Codex app runs in this login session (macOS).
+fn app_running() -> bool {
+    Command::new("lsappinfo").args(["info", "-only", "pid", "-app", "com.openai.codex"]).output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("pid"))
+}
+
+/// The thread's rollout file under `$CODEX_HOME/sessions` (default `~/.codex`).
+fn rollout(thread: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".codex")))?;
+    fn find(dir: &Path, end: &str) -> Option<PathBuf> {
+        std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+            let p = e.path();
+            if p.is_dir() { find(&p, end) } else { p.file_name()?.to_str()?.ends_with(end).then_some(p) }
+        })
+    }
+    find(&home.join("sessions"), &format!("{thread}.jsonl"))
+}
+
+/// Finished turns in a rollout: its `task_complete` events.
+fn completes(rollout: &Path) -> usize {
+    let Ok(f) = File::open(rollout) else { return 0 };
+    BufReader::new(f).lines().map_while(Result::ok).filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| v["payload"]["type"] == "task_complete")).count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_turn_ends_on_a_new_task_complete_or_a_closed_app() {
+        let p = std::env::temp_dir().join(format!("taskq-rollout-{}.jsonl", std::process::id()));
+        let done = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
+        std::fs::write(&p, format!("{done}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\"}}}}\n")).unwrap();
+        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), thread: "th".into(), done: completes(&p), rollout: Some(p.clone()), running: || true };
+        assert_eq!((t.done, t.exited()), (1, None), "the handshake's task_complete does not end the turn");
+        std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(done.as_bytes()).unwrap();
+        assert_eq!(t.exited(), Some(0));
+        t.done = 2;
+        t.running = || false;
+        assert_eq!(t.exited(), Some(-1), "a closed app is a child exit");
+        let _ = std::fs::remove_file(p);
+    }
 
     #[test]
     fn commands_follow_the_runtime_table() {
@@ -227,6 +347,10 @@ mod tests {
         l.role = "worker".into();
         let b = brief(&env, &l);
         assert!(b.contains("/i/taskq result 7 --sha") && b.contains("`Task: https://b/7`") && b.contains("open one PR") && b.contains("Changed: <user effect>\nOpen:") && b.contains("§ 2 Ask card"));
+        l.rt = "codex-app".into();
+        l.resume = None;
+        assert!(command(&env, &l).get_program().to_string_lossy().ends_with("codex"));
+        assert!(brief(&env, &l).contains("`env TASKQ_TASK=7 TASKQ_ATTEMPT=42 TASKQ_ROLE=worker TASKQ_ROOT=/p /i/taskq result 7 --sha"));
         let u = uuid();
         assert_eq!((u.len(), &u[14..15]), (36, "4"));
     }

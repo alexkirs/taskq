@@ -404,8 +404,10 @@ impl<'a> Service<'a> {
     }
 
     /// A runtime with free capacity: `limits.<rt>` minus live children of it (§ 3).
+    /// `codex-app` only for `run-codex-app` tasks on a host whose `has` lists it (§ 9 opt-in).
     fn free(&self, want: Option<&str>) -> Option<String> {
-        self.cfg.limits.iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str())).find(|(rt, n)| self.kids.iter().filter(|k| &k.rt == *rt).count() < **n as usize).map(|(rt, _)| rt.clone())
+        let app = |rt: &str| rt != "codex-app" || (want == Some(rt) && self.cfg.has.iter().any(|h| h == rt));
+        self.cfg.limits.iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt)).find(|(rt, n)| self.kids.iter().filter(|k| &k.rt == *rt).count() < **n as usize).map(|(rt, _)| rt.clone())
     }
 
     /// Post `spawn`, re-read, start the child only if `fold` accepted this spawn (§ 3 claim).
@@ -653,6 +655,21 @@ mod tests {
         let mut s = service(&b, &w, Default::default());
         s.pass().unwrap();
         assert_eq!(task(&b, win).state, State::Doing);
+    }
+
+    #[test]
+    fn codex_app_runs_only_labelled_tasks_on_opted_in_hosts() {
+        let b = Fake::default();
+        let app = b.create("A", "", &["taskq".into(), "run-codex-app".into()]).unwrap();
+        let other = b.create("O", "", &["taskq".into()]).unwrap();
+        let mut c = cfg("win");
+        c.limits = BTreeMap::from([("codex-app".to_string(), 1)]);
+        service(&b, &c, Default::default()).pass().unwrap();
+        assert_eq!((task(&b, app).state, task(&b, other).state), (State::Ready, State::Ready), "no opt-in: unchanged");
+        let m = Config { has: vec!["codex-app".into()], me: "mac".into(), ..c.clone() };
+        service(&b, &m, Default::default()).pass().unwrap();
+        assert_eq!((task(&b, app).state, task(&b, other).state), (State::Doing, State::Ready), "unlabelled tasks never get the app");
+        assert!(task(&b, app).session.unwrap().starts_with("codex-app:- mac"));
     }
 
     #[test]

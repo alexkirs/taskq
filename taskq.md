@@ -154,6 +154,7 @@ then `tests/golden/*.json` (entries in, expected task out, including ignored ent
 - **Fencing.** The child gets `TASKQ_TASK=<N>` and `TASKQ_ATTEMPT=<id>`; its commands add `attempt <id>`. A late
   writer of a replaced attempt is ignored by `fold`.
 - **Lease** = the attempt's host heartbeat (§ 4) is fresh and lists `#<N> <id>`. No timestamps in the task.
+- **App lease.** Runtime `codex-app` (§ 8) has no child for its turn: the turn counts as the child while the Codex app runs in this host's logged-in session and the thread has no `task_complete` after the queued brief or text. A finished turn without `result`, `ask` or `requeue`, a closed app or a logout counts as a child exit (`gone`). Stopping it only drops it from the heartbeat: the app turn runs on and its late writes are fenced. An update re-exec does not pass it on (§ 8 step 4): its attempt goes `gone`.
 - **Expiry.** Any service that sees `doing` or `review` whose host heartbeat is older than `ttl`, or does not list the
   attempt, posts `gone attempt <id>`; an attempt younger than `ttl` (by its `spawn` comment) is judged only by the
   heartbeat age. That is the only recovery. The owning service instead resumes an attempt without a child when its
@@ -258,9 +259,10 @@ Reviewer checks every Acceptance and contract against the candidate and CI on th
 |---|---|---|
 | Codex | `codex exec --json <codex opts> -C <root> -`, brief on stdin; session from the first `thread.started` line | `codex exec --json resume <id> -` |
 | Claude | `claude -p --output-format stream-json --verbose --session-id <uuid> --permission-mode <mode>`, brief on stdin | `claude -p --resume <id>` |
+| Codex app | Codex's spawn with a handshake brief; after it exits `open codex://threads/<id>` and `codex queue --thread <id> --message <brief>` | `open` and `codex queue --thread <id> --message <text>` |
 
 The child's environment drops `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` and adds `TASKQ_TASK`, `TASKQ_ATTEMPT`,
-`TASKQ_ROLE`. Briefs go through stdin, never a shell. Logs: `<root>/.taskq/<T|R><N>-<attempt>.log`.
+`TASKQ_ROLE`. Briefs go through stdin, never a shell (`codex-app`: the `queue` argument, still no shell; the app turn keeps the handshake's options, not its environment, so its brief prefixes each taskq command with `env TASKQ_*=..`). Logs: `<root>/.taskq/<T|R><N>-<attempt>.log`.
 
 **Release.** CI on a `v*` tag builds once per OS `taskq-<ver>-<os>-<arch>`,
 `SHA256SUMS` and `latest.json` `{"version", "files": {"<os>-<arch>": "<name>"}}`. Each runner runs `selftest` on
@@ -289,7 +291,8 @@ change that N-1 cannot ignore needs a cutover like § 9. Hosts update independen
 - `board` `github|gitlab`; `repo` `owner/name`; `host` GitLab host.
 - `label_schema` `canonical|legacy` (absent: legacy if the board has `priority-1|2` or `q-waiting` objects, else canonical). Both names work in priority and focus/status filters; `p0` has no legacy name; logs keep `waiting`. Canonical writes require all-host compatible release/idle approval on existing boards. Keep legacy objects and closed issues; reassign only open issues (#769 owner answer). This board is canonical since #776.
 - `publish` `direct|pr`; `workspace` `external` keeps host-owned worktrees.
-- `hosts` `{hostname: name}` (env `TASKQ_HOST` overrides); `has` `{name: [x..]}`; `limits` `{"claude": n, "codex": n}`.
+- `hosts` `{hostname: name}` (env `TASKQ_HOST` overrides); `has` `{name: [x..]}`; `limits` `{"claude": n, "codex": n, "codex-app": n}`.
+- Opt-in `codex-app` (macOS only): a host runs it only when its `has` lists `codex-app`, and only for tasks labelled `run-codex-app`; other hosts are unchanged. A screen task adds `needs-screen`, admitted where `has` lists `screen`.
 - `permission_mode`, `codex` (R9); `pages` link wrapper base; `assignee` (login or `me`) report filter.
 - `ttl`, `poll`, `update_every`, `rollback_after`: seconds, defaults 300, 60, 900, 600.
 - Token: env `TASKQ_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token` (0600), else the `gh`/`glab` login of the board host. Never in config.

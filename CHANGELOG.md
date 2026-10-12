@@ -3,6 +3,12 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.0.9
+
+Windows: the tray heartbeat and the poke never changed their file's mtime (Rust rewrote an empty file in place), so
+the service started a second tray after each restart and slept a full `poll` after a local command. Both write a byte
+now. The v4.0.8 "froze" was this: the tray ran, its heartbeat did not move.
+
 ## v4.0.8
 
 Windows: the tray froze after its first pass (the event loop never woke on its timer); it now wakes from a timer thread.

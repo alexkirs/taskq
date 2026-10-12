@@ -158,7 +158,12 @@ fn dot(root: &Path) -> PathBuf {
 
 fn poke(root: &Path) {
     let _ = fs::create_dir_all(dot(root));
-    let _ = fs::write(dot(root).join("poke"), "");
+    touch(&dot(root).join("poke"));
+}
+
+/// Bump `p`'s mtime. Not `fs::write(p, "")`: on Windows rewriting an empty file keeps its mtime.
+fn touch(p: &Path) {
+    let _ = fs::write(p, ".");
 }
 
 fn project_name(root: &Path) -> String {

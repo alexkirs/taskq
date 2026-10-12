@@ -15,8 +15,7 @@ pub fn run(root: PathBuf) -> Result<(), String> {
     if crate::file_age(&d.join("tray")).is_some_and(|a| a < 15) {
         return Err("taskq tray already runs for this project".into());
     }
-    // Wakes come from a timer thread and the menu handler through the proxy, not `WaitUntil`:
-    // on Windows a `WaitUntil` loop with no window never woke after the first pass.
+    // ticks come from a timer thread and menu clicks from the handler, both through the proxy
     #[allow(unused_mut)]
     let mut event_loop = EventLoopBuilder::<Option<String>>::with_user_event().build();
     #[cfg(target_os = "macos")]
@@ -53,7 +52,7 @@ pub fn run(root: PathBuf) -> Result<(), String> {
             Event::UserEvent(Some(id)) => act(&root, &id),
             Event::UserEvent(None) => {
                 if let Some(t) = &tray {
-                    let _ = fs::write(d.join("tray"), "");
+                    crate::touch(&d.join("tray"));
                     refresh(t, &d, &mut shown);
                 }
             }

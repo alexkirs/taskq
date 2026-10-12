@@ -93,7 +93,7 @@ edited by hand: `## Goal`, `## Acceptance`, optional `## Scope`, one line `Depen
 `add` writes these sections in that order, then dependencies: Goal 1-2 lines; Acceptance 1-8 items, one line each;
 Scope optional, 1-4 bullet lines; dependencies one `Depends on #N` line each. Title at most 80 characters; each body line at most 240. Use short imperative sentences: Goal names the user outcome; each Acceptance names a visible check; Scope names a boundary. Keep headings on their own lines and one blank line between sections. More than eight checks: split before filing (R2).
 
-Labels: `q-<state>` (projection; `waiting` maps to `q-blocked`); type `code|docs|research|asset`; `p1|p2` (lower first, absent = 2);
+Labels: `q-<state>` (projection; `waiting` maps to `q-blocked`); type `code|docs|research|asset`; `p0|p1|p2` (lower first, absent = 2; `p0` passes focus, § 4);
 `run-<runtime>` (none: any); `host-<name>` (none: any host); `needs-<x>` (only a host whose `has` lists x, § 9);
 `assignee-only` (start only when the board's user is an assignee); any other, e.g. `area-maps`. Reserved: `taskq-host`.
 ## 2. Log and states
@@ -178,7 +178,7 @@ One loop:
 8. Sleep until a poke or `poll` seconds.
 
 - Filter: `host-*` absent or this host; `run-*` absent or enabled here; `assignee-only` passes; each `needs-*` in `has`.
-- Focus: `taskq service focus all|off|<label..> [--request TEXT]` writes `<root>/.taskq/focus`: `all` or one of the labels passes; none or `off` (default) admits nothing, heartbeats and updates go on. `--request` keeps the owner's words in `focus.request`; a focus without it removes the file. No arguments: print focus, `has`, labels of open tasks; an agent maps the owner's words to these, asks when unsure, says so when none fits.
+- Focus: `taskq service focus all|off|<label..> [--request TEXT]` writes `<root>/.taskq/focus`: `all`, one of the labels or `p0` passes; none or `off` (default) admits nothing, heartbeats and updates go on. `--request` keeps the owner's words in `focus.request`; a focus without it removes the file. No arguments: print focus, `has`, labels of open tasks; an agent maps the owner's words to these, asks when unsure, says so when none fits.
 - Pause: `service pause` (and the tray's) saves the focus to `focus.paused` and writes `off`; resume restores it. Without a saved focus resume fails and names the labels of open tasks: never `all` by default.
 - Poke: a local command touches `<root>/.taskq/poke`; the sleeping service checks its mtime every second. Each pass
   writes `<root>/.taskq/status.json` (state, open tasks with labels, `request`, `update`: a newer version the last check found and did not install, else null, `events_since`) for `service status` and the tray.
@@ -191,7 +191,7 @@ Owner-facing service/tray text follows R7: counts use R6 names/order; task rows 
 ## 5. Commands
 | Command | Does |
 |---|---|
-| `taskq labels` (catalog setup/readback) / `taskq add "<title>" --goal G --acceptance A.. [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 1\|2] [--host H] [--later]` | labels: setup/readback; add: new issue, prints `#<N> <state>` |
+| `taskq labels` (catalog setup/readback) / `taskq add "<title>" --goal G --acceptance A.. [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 0\|1\|2] [--host H] [--later]` | labels: setup/readback; add: new issue, prints `#<N> <state>` |
 | `taskq ask N --text Q [--option O..] [--recommend K] [--link URL..]` | question card |
 | `taskq answer N --text A` / `taskq answer N.K [M.K..]` | owner's answer or option pick, all checked first |
 | `taskq result N --sha SHA [--checks C] [--text T] [--option O..] [--recommend K] [--link URL..]` | hand in; full 40-hex SHA |
@@ -287,7 +287,7 @@ change that N-1 cannot ignore needs a cutover like § 9. Hosts update independen
 ## 9. Config and cutover
 `taskq.json` beside the project root:
 - `board` `github|gitlab`; `repo` `owner/name`; `host` GitLab host.
-- `label_schema` `canonical|legacy` (absent: legacy if the board has `priority-1|2` or `q-waiting` objects, else canonical). Both names work in priority and focus/status filters; logs keep `waiting`. Canonical writes require all-host compatible release/idle approval on existing boards. Keep legacy objects and closed issues; reassign only open issues (#769 owner answer). This board is canonical since #776.
+- `label_schema` `canonical|legacy` (absent: legacy if the board has `priority-1|2` or `q-waiting` objects, else canonical). Both names work in priority and focus/status filters; `p0` has no legacy name; logs keep `waiting`. Canonical writes require all-host compatible release/idle approval on existing boards. Keep legacy objects and closed issues; reassign only open issues (#769 owner answer). This board is canonical since #776.
 - `publish` `direct|pr`; `workspace` `external` keeps host-owned worktrees.
 - `hosts` `{hostname: name}` (env `TASKQ_HOST` overrides); `has` `{name: [x..]}`; `limits` `{"claude": n, "codex": n}`.
 - `permission_mode`, `codex` (R9); `pages` link wrapper base; `assignee` (login or `me`) report filter.

@@ -1012,13 +1012,16 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                 body += "\n";
                 body += &deps.iter().map(|d| format!("Depends on #{d}\n")).collect::<String>();
             }
-            for (flag, allowed) in [("type", &["code", "docs", "research", "asset"][..]), ("runtime", &["codex", "claude"][..]), ("priority", &["1", "2"][..])] {
+            for (flag, allowed) in [("type", &["code", "docs", "research", "asset"][..]), ("runtime", &["codex", "claude"][..]), ("priority", &["0", "1", "2"][..])] {
                 if a.all(flag).len() > 1 || a.one(flag).is_some_and(|v| !allowed.contains(&v)) {
                     return Err(format!("--{flag} requires one of {}", allowed.join("|")));
                 }
             }
             if a.all("host").len() > 1 || a.one("host").is_some_and(|v| v.is_empty() || v.contains(',') || v.chars().any(char::is_whitespace)) {
                 return Err("--host requires one nonempty host name".into());
+            }
+            if a.one("priority") == Some("0") && !b.canonical_labels()? {
+                return Err("--priority 0 needs the canonical label schema (§ 9)".into());
             }
             let blocked = deps_open(b, &body)?;
             let mut labels = vec![service::TASK_LABEL.to_string(), b.state_label(if blocked { "waiting" } else { "ready" })?];
@@ -1167,10 +1170,12 @@ mod tests {
         let i = c.board.issues(None).unwrap().pop().unwrap();
         assert_eq!(i.labels, vec!["taskq", "q-blocked", "code", "p1"]);
         assert!(in_scope(&i, &["q-waiting".into(), "priority-1".into()]));
+        command(&c, "add", &args(&["--priority", "0"])).unwrap();
+        assert_eq!(c.board.issues(None).unwrap().pop().unwrap().labels, vec!["taskq", "q-ready", "p0"]);
         for extra in [&["--priority", "3"][..], &["--runtime", "any"], &["--type", "code", "--type", "docs"], &["--host", "win,mac"]] {
             assert!(command(&c, "add", &args(extra)).is_err());
         }
-        assert_eq!(c.board.issues(None).unwrap().len(), 2);
+        assert_eq!(c.board.issues(None).unwrap().len(), 3);
     }
 
     #[test]

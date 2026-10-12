@@ -67,6 +67,21 @@ the MSVC build of the release workflow links it statically.
 Not qualified here (follow-up task): menu bar and notification-area placement, 200% scale, OS screenshots of the open
 popover, click-through, keyboard and screen reader, and pause, resume, restart, stop and uninstall run from the popover.
 
+## Phase 3: history, update, mixed pause
+
+The fixture adds a day of history in alpha (3 closes, 3 failed, first and last of 12 bins not empty), no history in
+beta and gamma, and `update: 4.1.1` in alpha. `--snapshot` adds a `home-actions` page per theme: a custom range with
+start >= end, then `Pause all…`. Screenshots: [shots/](shots/).
+
+Observed on macOS (WKWebView): "Refused: start must be before end." with the period unchanged; the confirm lists
+alpha: pause, beta: paused, unchanged, gamma: observation, unchanged; "Paused 1 of 2: beta"; "No history in beta,
+gamma." and "incomplete" in the total; "Update now to 4.1.1"; the summary icon draws the same bins in both themes.
+`cargo test --locked` checks `[start, end)`, equal oldest-left bins, equal green and red heights for 3 and 3 on one
+peak scale, custom range refusal and `since` without an events cache.
+
+Not qualified here (release task after #765): Update now against a real release with the status.json readback,
+both hosts on 4.1.0, the Windows popover of this phase, and the menu bar icon in the OS.
+
 ## Remaining acceptance
 
 Beyond the phase 2 snapshots: native placement, renderer opening/closing, actions against a live service,

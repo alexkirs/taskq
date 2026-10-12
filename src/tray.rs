@@ -34,18 +34,22 @@ enum Ev {
     Shot2,
 }
 
-/// View, text size and period of `<install>/tray.json`; anything else falls back to the default.
+/// View, text size and period of `<install>/tray.json`; anything else falls back to the default. A `custom` period
+/// is `[start, end)` in epoch seconds with the time zone `local` or `UTC` it was typed in.
 #[derive(Clone, PartialEq)]
 struct Settings {
     view: String,
     font: u64,
     period: String,
+    start: i64,
+    end: i64,
+    tz: String,
 }
 
 impl Settings {
     fn load(install: &Path) -> Settings {
         let v: Value = fs::read_to_string(install.join("tray.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-        let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into() };
+        let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into(), start: 0, end: 0, tz: "local".into() };
         s.set(&v);
         s
     }
@@ -60,10 +64,26 @@ impl Settings {
         if let Some(x) = v["period"].as_str().filter(|x| PERIODS.iter().any(|p| p.0 == *x)) {
             self.period = x.into();
         }
+        // a custom range with start >= end is refused (menu.md M6)
+        if let (Some("custom"), Some(a), Some(b)) = (v["period"].as_str(), v["start"].as_i64(), v["end"].as_i64())
+            && a < b
+        {
+            (self.period, self.start, self.end) = ("custom".into(), a, b);
+            self.tz = if v["tz"] == "UTC" { "UTC" } else { "local" }.into();
+        }
+    }
+
+    /// `[start, end)` of the period at `now`.
+    fn range(&self, now: i64) -> (i64, i64) {
+        if self.period == "custom" {
+            return (self.start, self.end);
+        }
+        (now - PERIODS.iter().find(|p| p.0 == self.period).map_or(86400, |p| p.1), now)
     }
 
     fn save(&self, install: &Path) {
-        let _ = crate::platform::write_atomic(&install.join("tray.json"), &json!({"view": self.view, "font": self.font, "period": self.period}).to_string());
+        let v = json!({"view": self.view, "font": self.font, "period": self.period, "start": self.start, "end": self.end, "tz": self.tz});
+        let _ = crate::platform::write_atomic(&install.join("tray.json"), &v.to_string());
     }
 }
 
@@ -88,23 +108,25 @@ fn project(root: &str) -> Value {
     json!({"root": root, "name": s["project"].as_str().map(String::from).unwrap_or_else(|| crate::project_name(r)),
         "issues": s["issues"].as_str().unwrap_or(""), "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
         "error": s["error"], "focus": s["focus"].as_array().cloned().unwrap_or_default(), "saved": saved, "labels": crate::status_labels(r),
-        "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"]})
+        "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"]})
 }
 
 fn now() -> i64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// What the icon shows: in work, `ask`, ready over all projects (one task per board and issue), whether any project
-/// admits, and 12 close/failed bins of the period.
+/// What the icon and the history show: in work, `ask`, ready over all projects (one task per board and issue), whether
+/// any project admits, 12 equal close/failed bins of `[start, end)` (oldest first) and the latest `since` of the
+/// projects that have history (None: none has).
 #[derive(Clone)]
 struct Summary {
     counts: [usize; 3],
     run: bool,
     bins: Vec<(u32, u32)>,
+    since: Option<i64>,
 }
 
-fn summary(ps: &[Value], period: &str, now: i64) -> Summary {
+fn summary(ps: &[Value], (start, end): (i64, i64)) -> Summary {
     let mut seen = std::collections::HashMap::new();
     for p in ps {
         for t in p["tasks"].as_array().into_iter().flatten() {
@@ -112,19 +134,19 @@ fn summary(ps: &[Value], period: &str, now: i64) -> Summary {
         }
     }
     let n = |want: &[&str]| seen.values().filter(|s| want.contains(&s.as_str())).count();
-    let span = PERIODS.iter().find(|p| p.0 == period).map_or(86400, |p| p.1);
     let mut bins = vec![(0, 0); 12];
     let mut ev = std::collections::HashSet::new();
     for p in ps {
         for e in p["events"].as_array().into_iter().flatten() {
             let (t, kind) = (e[0].as_i64().unwrap_or(0), e[1].as_str().unwrap_or(""));
-            if t >= now - span && t < now && ev.insert(format!("{} {} {kind}", p["issues"], e[2])) {
-                let b = &mut bins[(((t - now + span) * 12 / span) as usize).min(11)];
+            if t >= start && t < end && ev.insert(format!("{} {} {kind}", p["issues"], e[2])) {
+                let b = &mut bins[(((t - start) * 12 / (end - start)) as usize).min(11)];
                 if kind == "failed" { b.1 += 1 } else { b.0 += 1 }
             }
         }
     }
-    Summary { counts: [n(&["doing", "review"]), n(&["ask"]), n(&["ready"])], run: ps.iter().any(|p| p["focus"].as_array().is_some_and(|f| !f.is_empty())), bins }
+    let since = ps.iter().filter_map(|p| p["since"].as_i64()).max();
+    Summary { counts: [n(&["doing", "review"]), n(&["ask"]), n(&["ready"])], run: ps.iter().any(|p| p["focus"].as_array().is_some_and(|f| !f.is_empty())), bins, since }
 }
 
 pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
@@ -273,6 +295,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                         settings.save(&install);
                         let st = state(&install, &settings, dark, None);
                         refresh_icon(&tray, &st, &settings, dark, &mut icon_sig);
+                        push(&ui, &st);
                     }
                     a => {
                         // only a registered project (§ 4): the page never names a path of its own
@@ -290,7 +313,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 if step == 0 {
                     let _ = fs::create_dir_all(&dir);
                     let st = state(&install, &settings, dark, None);
-                    let s = summary(st["projects"].as_array().map_or(&[][..], |v| v), &settings.period, now());
+                    let s = summary(st["projects"].as_array().map_or(&[][..], |v| v), settings.range(now()));
                     for (theme, d) in [("dark", true), ("light", false)] {
                         for (mode, run) in [("run", true), ("pause", false)] {
                             let _ = fs::write(dir.join(format!("icon-compact-{mode}-{theme}.png")), png(&compact(run, d)));
@@ -298,7 +321,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                         }
                     }
                 }
-                let Some((theme, page, font)) = steps.get(step).cloned() else {
+                let Some((theme, page, font, script)) = steps.get(step).cloned() else {
                     println!("snapshots in {}", dir.display());
                     *flow = ControlFlow::Exit;
                     return;
@@ -306,6 +329,9 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 let mut s = settings.clone();
                 s.font = font;
                 push(&ui, &state(&install, &s, theme == "dark", Some((theme, &page))));
+                if let (Some((_, wv)), false) = (&ui, script.is_empty()) {
+                    let _ = wv.evaluate_script(script);
+                }
                 let p = proxy.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(800));
@@ -327,27 +353,32 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
     })
 }
 
-/// Snapshot steps: theme, page (`home` or a project root), text size.
-fn shots(install: &Path) -> Vec<(&'static str, String, u64)> {
+/// The `actions` snapshot: a custom range with start >= end, then `Pause all…`, both before acting (menu.md M5, M6).
+const ACTIONS: &str = "(()=>{const q=s=>document.querySelector(s),put=(s,v)=>{const i=q(s);i.value=v;i.dispatchEvent(new Event('input',{bubbles:true}));};
+q('[data-v=custom]').click();put('#hs','2026-10-13T10:00');put('#he','2026-10-13T09:00');q('[data-a=range]').click();q('[data-a=confirm]').click();})()";
+
+/// Snapshot steps: theme, page (`home` or a project root), text size, a script run on the page.
+fn shots(install: &Path) -> Vec<(&'static str, String, u64, &'static str)> {
     let first = roots(install).into_iter().next();
     ["dark", "light"].iter().flat_map(|t| {
-        let mut v = vec![(*t, "home".to_string(), 16), (*t, "home".to_string(), 20)];
-        v.extend(first.clone().map(|r| (*t, r, 16)));
+        let mut v = vec![(*t, "home".to_string(), 16, ""), (*t, "home".to_string(), 20, ""), (*t, "home".to_string(), 16, ACTIONS)];
+        v.extend(first.clone().map(|r| (*t, r, 16, "")));
         v
     }).collect()
 }
 
 fn shot_name(install: &Path, step: usize) -> String {
-    shots(install).get(step).map_or(step.to_string(), |(t, p, f)| format!("{t}-{}-{f}", if p == "home" { "home" } else { "project" }))
+    shots(install).get(step).map_or(step.to_string(), |(t, p, f, js)| format!("{t}-{}{}-{f}", if p == "home" { "home" } else { "project" }, if js.is_empty() { "" } else { "-actions" }))
 }
 
 fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>) -> Value {
     let ps: Vec<Value> = roots(install).iter().map(|r| project(r)).collect();
-    let sum = summary(&ps, &s.period, now());
+    let (start, end) = s.range(now());
+    let sum = summary(&ps, (start, end));
     let url = |rgba: &Rgba| format!("data:image/png;base64,{}", base64(&png(rgba)));
     let mut st = json!({"platform": if cfg!(windows) { "windows" } else { "macos" }, "version": crate::platform::VERSION,
         "host": ps.iter().find_map(|p| p["host"].as_str()).unwrap_or("?"), "view": s.view, "font": s.font, "period": s.period,
-        "now": now(), "projects": ps});
+        "now": now(), "projects": ps, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since}});
     if cfg!(target_os = "macos") {
         st["icons"] = json!({"icon": url(&compact(sum.run, dark)), "full": url(&wide(&sum, dark))});
     }
@@ -360,7 +391,7 @@ fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>) -
 
 fn refresh_icon(tray: &Option<TrayIcon>, st: &Value, s: &Settings, dark: bool, sig: &mut String) {
     let Some(t) = tray else { return };
-    let sum = summary(st["projects"].as_array().map_or(&[][..], |v| v), &s.period, now());
+    let sum = summary(st["projects"].as_array().map_or(&[][..], |v| v), s.range(now()));
     // Windows shows only the compact q (menu.md M1)
     let full = !cfg!(windows) && s.view == "full";
     let new = format!("{full} {dark} {} {:?} {:?}", sum.run, sum.counts, if full { sum.bins.clone() } else { vec![] });
@@ -400,6 +431,11 @@ fn act(action: &str, root: &Path, label: Option<&str>) {
             if let Some(l) = label.filter(|l| crate::status_labels(root).iter().any(|x| x == l)) {
                 let _ = crate::set_focus(root, l, None);
             }
+        }
+        // `Update now` (menu.md M9): the service checks at once (§ 4 step 7); the page waits for the version in status.json
+        "update" => {
+            let _ = fs::write(d.join("update"), "");
+            crate::poke(root);
         }
         "restart" => {
             let _ = fs::write(d.join("restart"), "");
@@ -693,7 +729,7 @@ mod tests {
 
     #[test]
     fn summary_widens_for_long_numbers_and_grays_when_paused() {
-        let mut s = Summary { counts: [1, 0, 2], run: true, bins: vec![(1, 0); 12] };
+        let mut s = Summary { counts: [1, 0, 2], run: true, bins: vec![(1, 0); 12], since: None };
         assert_eq!(wide(&s, true).w, 94);
         s.counts = [100, 12, 1000];
         assert!(wide(&s, true).w > 94);
@@ -707,19 +743,42 @@ mod tests {
     fn summary_counts_one_task_per_board_and_issue() {
         let p = |issues: &str, state: &str, focus: Value| json!({"issues": issues, "focus": focus, "tasks": [{"n": 1, "state": state}], "events": [[95, "close", "7"], [-250, "failed", "8"]]});
         let ps = [p("https://github.com/o/a/issues", "ask", json!([])), p("https://github.com/o/a/issues", "ask", json!([])), p("https://github.com/o/b/issues", "doing", json!(["all"]))];
-        let s = summary(&ps, "5m", 100);
+        let s = summary(&ps, (-200, 100));
         assert_eq!(s.counts, [1, 1, 0]);
-        assert!(s.run && !summary(&ps[..2], "5m", 100).run);
+        assert!(s.run && !summary(&ps[..2], (-200, 100)).run);
         assert_eq!(s.bins.iter().map(|b| b.0).sum::<u32>(), 2, "same attempt on two boards counts twice, on one board once");
         assert_eq!(s.bins.iter().map(|b| b.1).sum::<u32>(), 0, "outside the period");
     }
 
     #[test]
     fn settings_keep_only_known_values() {
-        let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into() };
+        let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into(), start: 0, end: 0, tz: "local".into() };
         s.set(&json!({"view": "full", "font": 18, "period": "1w"}));
         s.set(&json!({"view": "x", "font": 15, "period": "2y"}));
-        assert!(s == Settings { view: "full".into(), font: 18, period: "1w".into() });
+        s.set(&json!({"period": "custom", "start": 50, "end": 50, "tz": "UTC"}));
+        assert!(s == Settings { view: "full".into(), font: 18, period: "1w".into(), start: 0, end: 0, tz: "local".into() });
+        assert_eq!(s.range(1000), (1000 - 604800, 1000));
+        s.set(&json!({"period": "custom", "start": 40, "end": 160, "tz": "UTC"}));
+        assert_eq!((s.range(1000), s.tz.as_str()), ((40, 160), "UTC"));
+    }
+
+    #[test]
+    fn history_bins_are_equal_oldest_left_on_one_scale() {
+        // M-A5/M-A6 fixture: 3 closes and 3 failed in [0, 120); the first and last bins are not empty
+        let ev = json!([[0, "close", "1"], [5, "close", "2"], [119, "close", "3"], [0, "failed", "4"], [60, "failed", "5"], [119, "failed", "6"], [120, "failed", "7"], [-1, "close", "8"]]);
+        let p = json!([{"issues": "u", "tasks": [], "focus": ["all"], "events": ev, "since": -10}]);
+        let s = summary(p.as_array().unwrap(), (0, 120));
+        assert_eq!(s.bins.len(), 12);
+        assert_eq!((s.bins[0], s.bins[6], s.bins[11]), ((2, 1), (0, 1), (1, 1)), "[start, end): 120 and -1 are out");
+        assert_eq!(s.since, Some(-10));
+        // equal counts draw equal heights in the icon: as many green as red pixel rows in a column clear of the digits
+        let one = Summary { counts: [0, 0, 0], run: true, bins: vec![(3, 3); 12], since: None };
+        let (img, pal) = (wide(&one, true), palette(true));
+        let col = |c: [u8; 4]| (0..img.h).filter(|y| img.px[((y * img.w + 17) * 4) as usize..][..3] == c[..3]).count();
+        assert!(col(pal.work) > 0 && col(pal.work) == col(pal.failed));
+        let ps = json!([{"issues": "u", "events": []}, {"issues": "v", "events": [], "since": 5}]);
+        assert_eq!(summary(&ps.as_array().unwrap()[..1], (0, 1)).since, None, "no events cache: no since");
+        assert_eq!(summary(ps.as_array().unwrap(), (0, 1)).since, Some(5));
     }
 
     #[test]

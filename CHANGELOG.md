@@ -3,7 +3,7 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
-## Unreleased
+## v4.1.0
 
 One tray per host over every project in `<install>/projects` (heartbeat `<install>/tray`, errors in
 `<install>/tray.log`); per-project trays of older versions exit once their service updates. `status.json` gains task
@@ -17,6 +17,11 @@ period persist in `<install>/tray.json`; `taskq tray --snapshot DIR` writes its 
 § 7 verdicts): `ask --text` and decision results take `Done:`/`Problem:` lines, `result --text` takes `Changed:`/`Open:`
 with one `--checks` line per check, a reviewed `close --text` takes `Changed:`/`Checks:`/`Open:`; over-limit text is
 rejected. Old comments fold unchanged; no board change.
+
+The history graph and the macOS summary icon draw 12 equal close/failed bins of 5 min, hour, day, 7 days, 30 days or
+a custom `[start, end)` in local time or UTC; time before history is unknown, not zero. `Update now` appears when a
+`status.json` reports a newer version and confirms it only from `status.json`. Pause all and resume all name each
+project and its effect before acting; a mixed state reads `Paused N of M`.
 
 ## v4.0.10
 

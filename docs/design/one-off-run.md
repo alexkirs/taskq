@@ -2,7 +2,7 @@
 
 Design target, not shipped behavior. [taskq.md](../../taskq.md) wins on conflict (R8, R13).
 Scope: one urgent task of a registered project runs end to end while the host keeps its current focus.
-First release: one local host. Cross-host dispatch is out of scope (see Later).
+Chosen model: a board label grant (owner answer 3 on #652). First release: one local host; cross-host is Later.
 
 ## Problem
 
@@ -11,38 +11,50 @@ To run one urgent task outside that focus, the owner must widen the focus and la
 That is two scope edits, a window where other tasks of the same label can start, and no exact restore.
 `service focus` plus `taskq add` does not cover it (owner note on #652).
 
-## Decision summary (recommended)
+## Decision summary
 
-| # | Choice | Recommended | Alternatives |
+| # | Choice | Chosen | Rejected alternatives |
 |---|---|---|---|
-| D1 | Syntax | `taskq service once N [--extra] [--request TEXT]`, `taskq service once off`, run in the target project root | `#N` items in `service focus`; top-level `taskq run <project> N` |
-| D2 | Grant store | local `<root>/.taskq/once`, like `focus` | board label `once-<host>` |
-| D3 | Identity | an existing open task number; never creates a task | create from text inside the command |
-| D4 | Admission | normal: next free slot of this service, before other ready tasks | — |
-| D5 | Extra slot | opt-in `--extra`: `limits.<rt> + 1` for task N only, until the grant ends | no extra mode |
-| D6 | End | the service deletes the grant when a fresh read shows N closed, `failed` or `later` | grant expiry by time |
+| D1 | Grant | labels `p0` + exactly one `host-<name>` on the task issue | local file `<root>/.taskq/once`; `#N` items in `service focus` |
+| D2 | Syntax | `taskq urgent N [--extra]` / `taskq urgent N off` (sets/removes the labels) | `taskq service once N`; `taskq run <project> N` |
+| D3 | Who may set | a trusted account (§ 1 roles); the service checks the actor of the label event | any account with triage rights |
+| D4 | Identity | an existing open task number; never creates a task | create from text inside the command |
+| D5 | Admission | normal: next free slot of the named host, before other ready tasks | preempt a live child |
+| D6 | Extra slot | separate explicit label `p0-extra`: `limits.<rt> + 1` for this task only | no extra mode; extra implied by `p0` |
+| D7 | End | the service removes `p0`, `p0-extra` when the task is `later` or `failed`; closed issues are never admitted | expiry by time |
 
-Why D1: the grant is a host admission setting, like focus and pause, so it lives under `service`.
-A separate verb keeps `focus` untouched, so restore is exact by construction: focus is never read-modified-written.
-`run` is avoided: it reads as "start now", which the normal mode does not promise.
+Why D1: the grant is visible on the board where the owner already looks; `p0` is red (board.md B2), so an urgent task
+is seen at a glance. `host-<name>` keeps the first release on one host: other hosts already skip it by the § 4 filter.
+Focus files are never touched, so restore of the original scope is exact by construction.
+Later, cross-host is the same label with a different or no `host-*` (see Later); a local file could not grow there.
 
-Why D2: focus is already local per host (§ 4). A board label would let other hosts admit the task.
-That is the cross-host case, which this release does not cover. R1 holds: the file is owner config like `focus`.
-The board stays the truth for task state; the file only allows admission.
+Why D2: `run` reads as "start now", which normal mode does not promise. `urgent` names what the owner asks for.
+The command only edits labels; a person may set the same labels on the board by hand (§ 1 style).
+
+Rejected, kept for the record:
+- Local `once` file (`service once N`): narrow blast radius, but invisible on the board and local-only forever.
+- `#N` in `service focus`: mixes a one-off into the standing scope; restore would need a read-modify-write of focus.
 
 ## Boundary of the grant
 
-A grant is the file `<root>/.taskq/once` with one task: `#N`, optional `extra 1`, optional `request <owner words>`.
-- Project: one registered project of this host (`<install>/projects`, `service list`). The owner names it; the PM maps
-  the name to one root and asks when two match (R10). Folders are never discovered.
-- Task: issue N on that project's board, open, trusted author, label `taskq` (§ 1). One grant per project.
-- Host: this host only. The grant bypasses only the focus filter. Every other filter stays: `host-*`, `run-*`,
-  `needs-*`, `assignee-only`, label validation, `Depends on`, capacity, claim and fencing (§ 3, § 4).
-- Roles: the grant covers task N's worker and reviewer admissions, and rework after `requeue`, until it ends.
-- Not covered: other tasks, other projects, other hosts, model, effort, permissions or provider (R9), project
-  registration or config. Answers and steers already reach a live attempt without focus (§ 4 step 6).
-- Version: the target service must support `once`. An older service ignores the file; the command then cannot read
-  the grant back and says unknown, never success (R12).
+A grant is an open task issue with `p0` and exactly one `host-<name>`, both added by trusted accounts.
+- Project: one registered project of the named host (`<install>/projects`, `service list`). The owner names it; the PM
+  maps the name to one board and asks when two match (R10). Folders are never discovered.
+- Task: an open issue, trusted author, label `taskq` (§ 1). `p0` without `host-*`, or with two, admits nothing outside
+  focus; `status` shows `p0 needs one host-*`.
+- Who: the service reads the label events (GitHub issue events, GitLab resource label events) and accepts `p0`,
+  `p0-extra` and that `host-*` only when the last `labeled` event of each is by a trusted account. Else the label
+  counts as plain priority 0 within focus, never as a grant. The event (actor, time) is the consent receipt.
+- Host: the named host only. The grant bypasses only the focus filter. Every other filter stays: `run-*`, `needs-*`,
+  `assignee-only`, `Depends on`, capacity, claim and fencing (§ 3, § 4).
+- Roles: worker and reviewer admissions of the task, and rework after `requeue`, until the grant ends.
+- One per project and host: if several issues carry a valid grant, only the lowest number passes focus; `status`
+  lists the others as waiting. Keeps "one-off" one.
+- Not covered: other tasks, other projects, model, effort, permissions or provider (R9), project registration or
+  config. Answers and steers already reach a live attempt without focus (§ 4 step 6).
+- Version: an older service treats `p0` as an unknown label: no focus bypass, no admission outside focus. The command
+  reads back the named host's `status.json`/heartbeat; no newer version there means `unknown`, never success (R12).
+- Legacy label schema boards: `p0` is canonical only; on a legacy board the command refuses (`label_schema`, § 9).
 
 ## Confirmation flow (PM)
 
@@ -50,44 +62,46 @@ A grant is the file `<root>/.taskq/once` with one task: `#N`, optional `extra 1`
 2. Match found: the PM shows `#N` and its state. No match: the PM drafts `taskq add` text and asks to create it.
    Duplicates: the PM picks an existing task over a new one and says which.
 3. One summary, one confirmation. Template (R7, one line each):
-   - `Run once: <project> #N <title>`
+   - `Urgent: <project> #N <title>`
    - `Host: <host> · Mode: next free slot` or `Mode: +1 slot over limit <rt>=<n>`
    - `Focus stays: <labels|off>` · `Ends: when #N is closed, failed or parked`
-   - `Blocked by: <why>` only when a filter or dependency will stop it (e.g. `host-win`, `run-codex` with limit 0,
-     open `Depends on`, state `later`). Then the owner decides first: requeue, edit labels or drop.
-4. After `yes`: `taskq service once N [--extra] --request "<owner words>"` in that root. It succeeds only when a
-   fresh `status.json` shows the grant.
+   - `Blocked by: <why>` only when a filter or dependency will stop it (e.g. `run-codex` with limit 0, missing
+     `needs-*`, open `Depends on`, state `later`). Then the owner decides first: requeue, edit labels or drop.
+4. After `yes`: `taskq urgent N [--extra]` from the owner's own CLI session (the board token is the owner's, so the
+   label event actor is trusted). It succeeds only when the host's fresh `status.json` names the grant.
 5. The PM watches only task N (`inbox N` or `wait`) and relays: each `ask` card, then one final line, the close
    verdict or the `failed` reason. Then it stops watching. Questions keep the normal `ask` path.
 
 `--extra` appears in the summary only when the owner asked for more than the normal limit in this request.
-Urgency, priority or the project being out of scope never implies `--extra`.
+Urgency, `p0` or the project being out of scope never implies `--extra`.
 
 ## Admission
 
-- Normal mode: in step 6, task N sorts before all other ready tasks of this service. It takes the next free slot.
-  It never stops, pauses or replaces a live attempt; it waits for a child to end.
+- Normal mode: in step 6, task N sorts before all other ready tasks of this service (`p0` < `p1` < `p2`). It takes
+  the next free slot. It never stops, pauses or replaces a live attempt; it waits for a child to end.
 - Capacity today is per service (§ 3): each project's service has its own `limits`. A target project with focus
   `off` usually has free slots, so normal mode often starts at once. No host-wide cap exists; this design adds none.
-- Extra mode: when the normal capacity has no free slot, task N may use `limits.<rt> + 1`. Exactly one extra child,
-  of task N, at a time. A runtime with limit 0 is disabled, not full: `--extra` does not enable it.
+- Extra mode (`p0-extra`, valid only with a valid `p0` grant): when normal capacity has no free slot, task N may use
+  `limits.<rt> + 1`. Exactly one extra child, of task N, at a time. A runtime with limit 0 is disabled, not full:
+  `p0-extra` does not enable it.
 - While that child lives, live children exceed the limit; other tasks start only after the count drops below the
   limit again. After the grant ends, admission is the normal limit again.
 
 ## Dedup, repeat, restart
 
-- Same `once N` again: no write, prints the current grant. Another `once M` while N is active: refused,
-  `Error: once #N active` / `Next: taskq service once off`.
+- Same `urgent N` again: labels already set, no write; prints the current grant. `urgent M` while N holds a valid
+  grant on the same host: refused, `Error: urgent #N active` / `Next: taskq urgent N off`.
 - N already `doing` or `review` on any host: the grant adds nothing; claim (§ 3) and R2 prevent a second attempt.
   The PM reports where it runs.
 - N admitted by a normal focus first: the same task runs once; the grant ends with it.
-- Service restart: the file survives; former children are `gone` (§ 4) and N is admitted again under the grant.
-- PM restart or lost chat: the grant and the task log are on disk and board; the PM resumes watching from `inbox N`.
+- Service restart: labels are on the board; former children are `gone` (§ 4) and N is admitted again under the grant.
+- PM restart or lost chat: grant and task log are on the board; the PM resumes watching from `inbox N`.
 
 ## Cancel and stop
 
-- `taskq service once off`: deletes the grant. No new admission of N outside focus. A live attempt is not stopped.
-- Stop the work too: `taskq later N` (§ 3 cancellation); the service stops the child (R11) and then the grant ends.
+- `taskq urgent N off`: removes `p0`, `p0-extra` (keeps `host-*`, which may predate the grant). No new admission of
+  N outside focus. A live attempt is not stopped.
+- Stop the work too: `taskq later N` (§ 3 cancellation); the service stops the child (R11) and removes the grant.
 - A slot is free only after the service reaped the child. Unknown host or stale `status.json`: report unknown; never
   call the slot free, the task stopped or the run done (R12).
 
@@ -95,49 +109,55 @@ Urgency, priority or the project being out of scope never implies `--extra`.
 
 | Outcome | Seen as | Grant | Owner sees |
 |---|---|---|---|
-| Success | `close` after review and publication (§ 7) | ends | close verdict |
+| Success | `close` after review and publication (§ 7) | ends (issue closed) | close verdict |
 | Owner question | `ask` | stays | the card |
 | Rework | `requeue` | stays | nothing until next card or end |
-| Technical failure | `gone`, retries to `ask`, or `failed` | stays on `ask`, ends on `failed` | card or `Failed: <reason>` |
-| Parked | `later` | ends | `Parked: <reason>` |
+| Technical failure | `gone`, retries to `ask`, or `failed` | stays on `ask`, removed on `failed` | card or `Failed: <reason>` |
+| Parked | `later` | removed | `Parked: <reason>` |
 | Lost contact | stale heartbeat or `status.json` | stays | `Unknown: <reason>` |
 
 No close without the § 7 verdict and CI on the exact SHA. Unknown, `ask` and lost contact are never success.
+`p0` stays on a closed issue as history; closed issues are never admitted.
 
 ## Draft taskq.md diff
 
-Applies after owner approval; keeps the file at 298 lines. No new log kind, no `fold` change: N-1 compatible (§ 8).
+Applies after owner approval of this note. No new log kind, no `fold` change: N-1 compatible (§ 8). Net +2 lines.
 
 ```diff
+@@ § 1 Tasks
+-Labels: `q-<state>` (projection; `waiting` maps to `q-blocked`); type `code|docs|research|asset`; `p1|p2` (lower first, absent = 2);
++Labels: `q-<state>` (projection; `waiting` maps to `q-blocked`); type `code|docs|research|asset`; `p0|p1|p2` (lower first, absent = 2; `p0`: urgent grant, § 4);
 @@ § 3 Attempts, lease, capacity
--- **Capacity** is per host: `limits.<runtime>` minus the service's live children of that runtime. No project cap: the
 -  sum of host limits bounds the project.
-+- **Capacity** is per host: `limits.<runtime>` minus the service's live children of that runtime. No project cap: the
-+  sum of host limits bounds the project. A `once --extra` grant adds one slot for its task only (§ 4).
++  sum of host limits bounds the project. A valid `p0-extra` adds one slot for its task only (§ 4).
 @@ § 4 Service
  - Pause: `service pause` (and the tray's) saves the focus to `focus.paused` and writes `off`; resume restores it. ...
-+- Once: `service once N [--extra] [--request TEXT]` writes `<root>/.taskq/once` after the owner confirmed one summary (project, task, host, mode); task N passes focus and sorts first, every other filter and claim stay; `--extra` lets N alone exceed `limits.<rt>` (> 0) by one child. Another N is refused; `once off` deletes it; the service deletes it when N is closed, `failed` or `later`. `status.json` names it; success only after that readback. Focus is never changed.
++- Urgent: an open task with `p0` and one `host-<this>`, each last added by a trusted account (label events), passes focus; the lowest such number only. Every other filter and claim stay; no child is stopped. `p0-extra` lets it alone exceed `limits.<rt>` (> 0) by one child. On `later`/`failed` the service removes `p0`, `p0-extra`. Focus is never changed. `status.json` names the grant.
 @@ § 5 Commands
--| `taskq service install\|run\|focus\|pause\|resume\|status\|restart\|stop\|uninstall\|list` / `taskq tray` | ...
-+| `taskq service install\|run\|focus\|once\|pause\|resume\|status\|restart\|stop\|uninstall\|list` / `taskq tray` | ...
++| `taskq urgent N [--extra]` / `taskq urgent N off` | after one confirmed summary: set/remove `p0` (+`p0-extra`), needs one `host-*`; success only after the host's readback |
 ```
 
 ## Proof obligations (implementation task)
 
 Service unit tests (`src/service.rs`), board fakes, no real spawn:
-1. Focus `off` + grant N: N is admitted, other ready tasks are not.
-2. Grant N with `host-other`, `needs-x` missing, open dependency or `run-codex` with limit 0: N is not admitted.
-3. Busy normal limit: without `--extra` N waits and starts first when a child ends; no child is stopped.
-4. `--extra`: exactly one child over the limit, only for N; a second N attempt or another task gets no extra slot.
-5. N closed, `failed` or `later`: the file is deleted; next pass admits under focus only; `focus` bytes unchanged.
-6. `ask`, `requeue`, `gone`: the grant stays; reviewer of N is admitted under it.
-7. Repeat `once N`: no write. `once M` during N: refused. Restart: grant reloaded from the file.
-8. Command readback: stale or missing `status.json` gives `unknown`, not success.
-Process check on one host (R12): a second registered project with focus `off`, one real once run to close.
-Windows and multi-host: unknown until tested.
+1. Focus `off` + valid grant on N for this host: N is admitted, other ready tasks are not.
+2. `p0` without `host-*`, with two `host-*`, or `host-other`: N is not admitted outside focus here.
+3. `p0` added by an untrusted actor: no bypass; within focus it sorts as priority 0 only.
+4. Grant with missing `needs-x`, open dependency or `run-codex` with limit 0: N is not admitted.
+5. Busy normal limit: without `p0-extra` N waits and starts first when a child ends; no child is stopped.
+6. `p0-extra`: exactly one child over the limit, only for N; another task gets no extra slot; `p0-extra` without
+   `p0` grants nothing.
+7. N `failed` or `later`: `p0`, `p0-extra` removed; next pass admits under focus only; `focus` bytes unchanged.
+8. `ask`, `requeue`, `gone`: the grant stays; reviewer of N is admitted under it.
+9. Two valid grants: only the lower number bypasses focus. Repeat `urgent N`: no write. `urgent M` during N: refused.
+10. Command readback: stale, missing or older-version `status.json` gives `unknown`, not success.
+11. Older service fake: `p0` gives no bypass (N-1 safety).
+Process check on one host (R12): a second registered project with focus `off`, one real urgent run to close.
+Windows, GitLab label events and multi-host: unknown until tested.
 
 ## Later (separate proposals)
 
-- Cross-host once: needs a board-visible grant and host choice; conflicts with local focus ownership.
-- Tray action `Run once…` (menu.md M7 AI channel) using the same command.
-- Host-wide cap across projects, if one-off runs crowd a host.
+- Cross-host urgent: the same `p0` with another host's `host-*`, or none and a host choice rule; needs a two-host test.
+- Tray action `Urgent…` (menu.md M7 AI channel) using the same command.
+- Host-wide cap across projects, if urgent runs crowd a host.
+- `p0` code catalog entry (`src/labels.rs`) and `taskq add --priority 0` ship with the implementation task.

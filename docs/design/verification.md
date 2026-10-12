@@ -80,7 +80,38 @@ gamma." and "incomplete" in the total; "Update now to 4.1.1"; the summary icon d
 peak scale, custom range refusal and `since` without an events cache.
 
 Not qualified here (release task after #765): Update now against a real release with the status.json readback,
-both hosts on 4.1.0, the Windows popover of this phase, and the menu bar icon in the OS.
+both hosts on 4.1.0, the Windows popover of this phase, and the menu bar icon in the OS. See Release 4.1.0.
+
+## Release 4.1.0
+
+`v4.1.0` tags 995ff65 (#780, the #765 merge); the release workflow published the macOS, Windows and Linux binaries,
+`SHA256SUMS` and `latest.json` 4.1.0.
+
+Update on both hosts went through `<root>/.taskq/update`, the file `Update now` writes, because the running 4.0.11
+trays have no button. Both logs read `update requested: 4.1.0 found` and `updated to 4.1.0; restarting`.
+macOS re-executed, and `taskq service status` reads `"version": "4.1.0"` on mac; its tray restarted from
+`releases/4.1.0`. Windows wrote `current` 4.1.0 but kept running 4.0.11: the re-exec exits only if no child is live at
+that moment, never later, and the service went on admitting. `taskq service restart` waited for the live children,
+then `taskq service status` on win read `"version": "4.1.0"`. The Windows re-exec needs a fix in a later release.
+
+`Update now` is only half observed. With `update` null the live macOS popover (`taskq tray --snapshot`, WKWebView,
+real registry) shows no button and the footer `taskq 4.1.0 · mac`. An installed service updates itself as soon as it
+finds a newer version, so the button lives at most `update_every` (900 s) after a release. The click and its readback
+need a release newer than 4.1.0 while a host runs 4.1.0; until then the fixture `Update now to 4.1.1` (phase 3) is the
+only rendering.
+
+| Criteria | Observed natively | Gap |
+|---|---|---|
+| D-A1, D-A7 | macOS live popover: one line of status, number, title per task; empty groups hidden | Windows popover of 4.1.0 |
+| D-A2, M-A3 | Project page in place with `All projects` back | Click-through to the issue on both OSes |
+| D-A3, M-A1 | Text size 16 and 20 px applied to the whole popover; compact and summary icons rendered | Persistence across a tray restart, OS scaling |
+| D-A4, D-A5, D-A8 | 320 px width, long titles end in an ellipsis; dark and light; counts on one right edge | 360 px, 200 % scale, counts 12 and 100 on a live board |
+| D-A6 | Text labels next to colors (`Waiting for answer`, `In work`, `Later`) | Keyboard, screen reader, touch targets, contrast |
+| M-A2 | One tray per host over the real registry (one project per host) | Several projects on one host |
+| M-A4 | Phase 3 fixture: mixed pause confirm names each project | Mixed pause on a live host |
+| M-A5, M-A6 | Live history: hour period, closes in bins, `Incomplete: history since …; earlier is unknown, not zero.`; custom start >= end refused | Failed in live history, events-cache recovery |
+| M-A10 | Service error and stale rows apart from Failed (phase 2 fixture) | AI error: phase 4 |
+| M-A11, M-A12 | `service restart` on Windows waited for live children and left the other host alone | Pause, resume, restart, stop and uninstall clicked in the popover; resume label prompt; update readback |
 
 ## Remaining acceptance
 

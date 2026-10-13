@@ -142,30 +142,9 @@ fn load(root: &Path) -> Res<(Config, Value)> {
     Ok((cfg, v))
 }
 
-/// Env `TASKQ_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token`, else the `gh`/`glab` login for the board host (§ 9).
-fn token(install: &Path, kind: Kind, host: &str) -> Res<String> {
-    let named = if kind == Kind::GitLab { "GITLAB_TOKEN" } else { "GITHUB_TOKEN" };
-    for k in ["TASKQ_TOKEN", named] {
-        if let Ok(t) = std::env::var(k)
-            && !t.trim().is_empty()
-        {
-            return Ok(t.trim().to_string());
-        }
-    }
-    let cli = || {
-        // only the board host's login: a default-host token never goes to another host
-        let (bin, args): (&str, &[&str]) = if kind == Kind::GitLab { ("glab", &["config", "get", "token", "--host"]) } else { ("gh", &["auth", "token", "--hostname"]) };
-        let o = platform::quiet(std::process::Command::new(bin).args(args).arg(host)).output().ok()?;
-        o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    };
-    fs::read_to_string(install.join("token")).map(|t| t.trim().to_string()).ok().filter(|t| !t.is_empty())
-        .or_else(cli).filter(|t| !t.is_empty())
-        .ok_or(format!("no board token: set TASKQ_TOKEN or write {}", install.join("token").display()))
-}
-
 fn ctx() -> Res<Ctx> {
     let (cfg, raw) = load(&find_root()?)?;
-    let tok = token(&cfg.install, cfg.board, &cfg.web_host)?;
+    let tok = platform::tool(&cfg.install).token(cfg.board == Kind::GitLab, &cfg.web_host)?;
     let mut http = Http::new(cfg.board, &cfg.web_host, &cfg.repo, &tok);
     http.set_label_schema(raw["label_schema"].as_str())?;
     let board = Box::new(http);
@@ -190,10 +169,7 @@ fn project_name(root: &Path) -> String {
     root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "taskq".into())
 }
 
-/// Seconds since `p` was last written, by the local clock (local files only).
-fn file_age(p: &Path) -> Option<u64> {
-    fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs())
-}
+use coreq::status::age as file_age;
 
 // ---------- writes ----------
 
@@ -662,7 +638,7 @@ fn installed(install: &Path) -> bool {
 }
 
 fn launcher(install: &Path) -> PathBuf {
-    let l = install.join(platform::exe_name());
+    let l = install.join(platform::tool(install).exe_name());
     if l.is_file() { l } else { std::env::current_exe().unwrap_or_else(|_| PathBuf::from("taskq")) }
 }
 
@@ -720,7 +696,7 @@ fn service_run(c: &Ctx) -> Res<()> {
     let mut tray = None;
     let project = project_name(&cfg.root);
     let issues = c.board.url(0).strip_suffix("/0").unwrap_or_default().to_string();
-    let log = platform::log_path(&cfg.install, &project);
+    let log = coreq::service::log_path(&platform::tool(&cfg.install), &project);
     eprintln!("taskq {} service on {} for {}", platform::VERSION, cfg.me, cfg.repo);
     let mut sampled: Option<Instant> = None;
     let mut agents: Option<(Instant, Value)> = None;
@@ -750,12 +726,15 @@ fn service_run(c: &Ctx) -> Res<()> {
         if agents.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs() >= 300) {
             agents = Some((Instant::now(), json!({"at": at, "rows": runtime::agents()})));
         }
-        let mut status = json!({"host": cfg.me, "version": platform::VERSION, "focus": s.focus, "error": r.err(), "kids": kids, "at": at,
-            "pid": std::process::id(), "project": project, "issues": issues, "log": log, "tasks": tasks, "tasks_age_seconds": s.tasks_read.map(|t| t.elapsed().as_secs()),
-            "request": request, "update": update, "events_since": s.events_since, "capacity": s.capacity_json(),
-            "agents": agents.as_ref().map(|a| &a.1)});
-
-        let _ = platform::write_atomic(&d.join("status.json"), &serde_json::to_string_pretty(&status).unwrap_or_default());
+        let tool = platform::tool(&cfg.install);
+        let mut status = coreq::status::common(&tool, &cfg.me, &project, at, r.err(), update.as_deref());
+        for (k, v) in [("focus", json!(s.focus)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)), ("tasks", json!(tasks)),
+            ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
+            ("capacity", s.capacity_json()), ("agents", json!(agents.as_ref().map(|a| &a.1)))]
+        {
+            status[k] = v;
+        }
+        let _ = coreq::status::write(&tool, &cfg.root, &status);
         if is_installed && began.elapsed().as_secs() >= cfg.rollback_after {
             let h = cfg.install.join("releases").join(platform::VERSION).join("healthy");
             if !h.exists() {
@@ -813,7 +792,7 @@ fn service_run(c: &Ctx) -> Res<()> {
             status["tasks_age_seconds"] = json!(s.tasks_read.map(|t| t.elapsed().as_secs()));
             status["capacity"] = s.capacity_json();
             status["at"] = json!(wall);
-            let _ = platform::write_atomic(&d.join("status.json"), &serde_json::to_string_pretty(&status).unwrap_or_default());
+            let _ = coreq::status::write(&tool, &cfg.root, &status);
         };
         tick();
         sleep_until_poke(&d.join("poke"), cfg.poll, &mut tick);
@@ -1019,8 +998,9 @@ fn keep_tray(install: &Path, tray: &mut Option<std::process::Child>) {
     if tray.is_some() || file_age(&install.join("tray")).is_some_and(|a| a < 30) {
         return;
     }
-    let Some(v) = platform::current(install) else { return };
-    let mut exe = platform::release_exe(install, &v);
+    let t = platform::tool(install);
+    let Some(v) = t.current() else { return };
+    let mut exe = t.release_exe(&v);
     if cfg!(windows) {
         // Windows keys the notification-area pin by exe path; a dead tray no longer locks the copy
         let stable = install.join("taskq-tray.exe");
@@ -1113,7 +1093,7 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
         text += &format!("{} {} {} {} {}\n", k.task, k.attempt, k.rt, k.proc.id(), s.delivered(k.attempt));
     }
     platform::write_atomic(&dot(&cfg.root).join("kids"), &text)?;
-    let e = std::process::Command::new(cfg.install.join(platform::exe_name())).args(["service", "run"]).exec();
+    let e = std::process::Command::new(cfg.install.join(platform::tool(&cfg.install).exe_name())).args(["service", "run"]).exec();
     Err(format!("re-exec: {e}"))
 }
 
@@ -1215,7 +1195,7 @@ fn service(args: &Args) -> Res<()> {
         }
         "install" | "uninstall" | "stop" => {
             let (cfg, _) = load(&root)?;
-            let u = platform::unit(&cfg.install, &root, &project_name(&root));
+            let u = platform::unit(&platform::tool(&cfg.install), &root, &project_name(&root));
             if sub == "stop" {
                 platform::run_all(&u.stop, false)?;
                 kill_service(&root);
@@ -1223,7 +1203,7 @@ fn service(args: &Args) -> Res<()> {
                 return Ok(());
             }
             if sub == "install" {
-                platform::install_self(&cfg.install)?;
+                coreq::update::install_self(&platform::tool(&cfg.install))?;
                 platform::write_unit(&u)?;
                 platform::run_all(&u.unload, true)?;
                 platform::run_all(&u.load, false)?;
@@ -1298,9 +1278,9 @@ fn run(argv: &[String]) -> Res<()> {
             let install = platform::default_install();
             let check = a.flags.contains_key("check");
             match platform::update(&install, check)? {
-                Some(v) if check => println!("update available: {} -> {v}", platform::current(&install).unwrap_or_else(|| platform::VERSION.into())),
+                Some(v) if check => println!("update available: {} -> {v}", platform::tool(&install).current().unwrap_or_else(|| platform::VERSION.into())),
                 Some(v) => println!("updated to {v}; the service restarts on its next update check"),
-                None => println!("up to date ({})", platform::current(&install).unwrap_or_else(|| platform::VERSION.into())),
+                None => println!("up to date ({})", platform::tool(&install).current().unwrap_or_else(|| platform::VERSION.into())),
             }
             Ok(())
         }
@@ -1473,12 +1453,13 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // `<install>/taskq` is the launcher: it runs the current release (§ 8 step 5).
+    // `<install>/taskq` is the launcher: it runs the current release (coreq.md § Launcher).
     let install = platform::default_install();
     let exe = std::env::current_exe().ok().and_then(|e| e.canonicalize().ok());
-    let launcher = install.join(platform::exe_name()).canonicalize().ok();
-    if exe.is_some() && exe == launcher && platform::current(&install).is_some() {
-        platform::launch(&install, &args);
+    let t = platform::tool(&install);
+    let launcher = install.join(t.exe_name()).canonicalize().ok();
+    if exe.is_some() && exe == launcher && t.current().is_some() {
+        coreq::launcher::launch(&t, &args);
     }
     if let Err(e) = run(&args) {
         platform::die(&e);

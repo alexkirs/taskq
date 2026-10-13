@@ -44,7 +44,7 @@ impl Proc for Child {
     }
 }
 
-/// A child of this process image's predecessor, kept across the update re-exec (§ 8 step 6). The PID is unchanged by
+/// A child of this process image's predecessor, kept across the update re-exec (§ 8 step 3). The PID is unchanged by
 /// `exec`, so it is still our child and `waitpid` works.
 #[cfg(unix)]
 pub struct Adopted(pub i32);

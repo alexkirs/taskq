@@ -327,7 +327,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
             }
             Event::UserEvent(Ev::Tick) if snapshot.is_none() => {
                 // another version became current: exit, a service starts the current one (§ 4)
-                if !alone(&install) || crate::platform::current(&install).is_some_and(|v| v != crate::platform::VERSION) {
+                if !alone(&install) || crate::platform::tool(&install).current().is_some_and(|v| v != crate::platform::VERSION) {
                     *flow = ControlFlow::Exit;
                     return;
                 }

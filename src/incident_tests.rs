@@ -109,7 +109,35 @@ fn environment_off_writes_nothing() {
 fn panic_hook_child() {
     if std::env::var_os("TASKQ_TEST_PANIC_REPORT").is_some() { install_panic_hook(); }
     else if std::env::var_os("TASKQ_TEST_PANIC_BASELINE").is_none() { return; }
-    panic!("fixture panic, no private data");
+    match std::env::var("TASKQ_TEST_PANIC_MESSAGE") { Ok(m) => panic!("{m}"), Err(_) => panic!("fixture panic, no private data") }
+}
+
+#[test]
+fn panic_classes_are_enumerated() {
+    for (msg, class) in [
+        ("failed printing to stdout: Input/output error (os error 5)", "panic:stdio"),
+        ("called `Option::unwrap()` on a `None` value", "panic:unwrap"),
+        ("called `Result::unwrap()` on an `Err` value: x", "panic:unwrap"),
+        ("index out of bounds: the len is 3 but the index is 5", "panic:index"),
+        ("range end index 5 out of range for slice of length 3", "panic:index"),
+        ("byte index 1 is not a char boundary; it is inside 'é'", "panic:index"),
+        ("fixture panic, no private data", "panic:other"),
+    ] { assert_eq!(panic_class(msg), class, "{msg}"); assert!(CODES.contains(&class)); }
+    assert!(closed_pipe("failed printing to stdout: Broken pipe (os error 32)"));
+    assert!(closed_pipe("failed printing to stderr: The pipe is being closed. (os error 232)"));
+    assert!(!closed_pipe("failed printing to stdout: Input/output error (os error 5)"));
+}
+
+#[test]
+fn closed_pipe_panic_exits_141_without_report() {
+    // #873: `taskq status | true` panicked in std stdio.rs and reported dispatch.panic site dep.
+    let root = root("panic-pipe");
+    let o = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "incident::tests::panic_hook_child", "--nocapture"])
+        .env("TASKQ_TEST_PANIC_REPORT", &root).env("TASKQ_TEST_PANIC_MESSAGE", "failed printing to stdout: Broken pipe (os error 32)")
+        .env_remove("TASKQ_INCIDENT_REPORTS").output().unwrap();
+    assert_eq!(o.status.code(), Some(141), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!root.join(".taskq/incidents").exists());
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -127,6 +155,7 @@ fn first_real_panic_reports_once_without_changing_panic_output_or_exit() {
     assert_eq!(files.len(), 1);
     let r: Value = serde_json::from_slice(&fs::read(files[0].path()).unwrap()).unwrap();
     assert_eq!(r["fault"], "dispatch.panic");
+    assert_eq!(r["evidence"], json!(["exit:101", "panic:other"]));
     assert!(!r.to_string().contains("fixture panic"));
     fs::remove_dir_all(root).unwrap();
 }

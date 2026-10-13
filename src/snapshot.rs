@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 
 pub const SCHEMA: u64 = 1;
 /// Every open state; `totals` names each one, zero included.
-pub const STATES: [&str; 7] = ["ready", "waiting", "doing", "review", "ask", "later", "failed"];
+pub const STATES: [&str; 8] = ["held", "ready", "waiting", "doing", "review", "ask", "later", "failed"];
 /// What a reader finds in a snapshot of each source.
 const BOARD_CAPS: [&str; 4] = ["tasks", "totals", "questions", "hosts"];
 const HOST_CAPS: [&str; 6] = ["tasks", "totals", "focus", "capacity", "agents", "events"];

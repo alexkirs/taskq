@@ -14,6 +14,7 @@ pub enum State {
     Later,
     Failed,
     Closed,
+    Held,
 }
 
 impl State {
@@ -28,6 +29,7 @@ impl State {
             Later => "later",
             Failed => "failed",
             Closed => "closed",
+            Held => "held",
         }
     }
 }
@@ -236,7 +238,7 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64) {
             }
             let asked = t.state == State::Ask;
             let before = t.clone();
-            step(&mut t, &mut resume, e.id, &l);
+            step(&mut t, &mut resume, e.id, &l, last == 0);
             if t != before {
                 last = e.id;
                 if t.card.is_some() && t.card != before.card {
@@ -258,7 +260,7 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64) {
     (t, free, rev)
 }
 
-fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line) {
+fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool) {
     use State::*;
     if l.attempt.is_some() && l.attempt != t.attempt {
         return; // fencing: a replaced attempt writes nothing
@@ -283,6 +285,9 @@ fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line) {
         }
     };
     match (t.state, l.kind, own) {
+        // § 2: `hold` only as the first accepted entry; `start` leaves it
+        (Ready, "hold", false) if first => t.state = Held,
+        (Held, "start", false) => t.state = Ready,
         (Ready, "spawn", false) if l.args.len() == 3 && l.args[0] == "worker" => {
             spawn(t, "worker");
             t.state = Doing;

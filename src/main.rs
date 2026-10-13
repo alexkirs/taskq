@@ -16,7 +16,7 @@ mod icon;
 mod tray;
 
 use board::{Board, entries};
-use core::{Entry, State, Task, entry, fold};
+use core::{Entry, State, entry, fold};
 use dispatch::{Op, Receipt, act, answer_picks, close_one, current, deps_open};
 use serde_json::{Value, json};
 use service::{Config, Kid, Service};
@@ -30,7 +30,8 @@ pub type Res<T> = Result<T, String>;
 
 const USAGE: &str = "taskq agents
  taskq labels
- taskq add <title> --goal G --acceptance A [--acceptance B..] [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 0|1|2] [--host H] [--later] [--text T]
+ taskq add <title> --goal G --acceptance A [--acceptance B..] [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 0|1|2] [--host H] [--later|--hold] [--text T]
+ taskq start N
  taskq ask N --text Q --option O.. --recommend K [--link URL..]
  taskq answer N --text A | taskq answer N.K [M.K..]
  taskq result N --sha SHA --checks C.. --text T [--option O.. --recommend K --link URL..]
@@ -62,7 +63,7 @@ impl Args {
         while let Some(x) = it.next() {
             match x.strip_prefix("--") {
                 Some(k) => {
-                    let val = if matches!(k, "later" | "check" | "force" | "help" | "json") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
+                    let val = if matches!(k, "later" | "hold" | "check" | "force" | "help" | "json") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
                     a.flags.entry(k.to_string()).or_default().push(val);
                 }
                 None => a.pos.push(x.clone()),
@@ -72,7 +73,7 @@ impl Args {
             Some("close") => a.pos.len(),
             Some("answer") if a.pos.get(1).is_some_and(|p| p.contains('.')) => a.pos.len(),
             Some("service") if a.pos.get(1).is_some_and(|p| p == "focus") => a.pos.len(),
-            Some("service" | "add" | "ask" | "answer" | "result" | "requeue" | "later" | "failed" | "steer" | "inbox") => 2,
+            Some("service" | "add" | "start" | "ask" | "answer" | "result" | "requeue" | "later" | "failed" | "steer" | "inbox") => 2,
             _ => 1,
         };
         if a.pos.len() > used {
@@ -1052,10 +1053,6 @@ fn tray(_install: PathBuf, _snapshot: Option<&str>, _icon: Option<&str>) -> Res<
 
 // ---------- commands ----------
 
-fn print_task(n: u64, t: &Task) {
-    println!("#{n} {}", t.state.name());
-}
-
 /// § 5 receipts: JSON lines with `--json`, else the text lines; any receipt not accepted fails after all are shown.
 fn emit(rs: &[Receipt], json: bool) -> Res<()> {
     for r in rs {
@@ -1209,8 +1206,23 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             if a.one("priority") == Some("0") && !b.canonical_labels()? {
                 return Err("--priority 0 needs the canonical label schema (§ 9)".into());
             }
+            let hold = a.flags.contains_key("hold");
+            if hold && a.flags.contains_key("later") {
+                return Err("--hold and --later exclude each other".into());
+            }
+            // § 1: an open issue carrying this op id is the first create; return its receipt, write nothing
+            if let Some(id) = &op.id {
+                body += &format!("\nop-id: {id}\n");
+                if let Some(i) = b.issues(None)?.into_iter().find(|i| i.trusted && i.body.trim_end().ends_with(&format!("\nop-id: {id}"))) {
+                    let log = entries(b, i.number)?;
+                    let t = fold(i.number, &log, deps_open(b, &i.body)?);
+                    let state = if service::is_held(&i) { State::Held } else { t.state };
+                    return emit(&[Receipt::accepted(i.number, &op, state, core::revision(i.number, &log))], json);
+                }
+            }
             let blocked = deps_open(b, &body)?;
-            let mut labels = vec![service::TASK_LABEL.to_string(), b.state_label(if blocked { "waiting" } else { "ready" })?];
+            // a held task gets `q-held` instead of `taskq`: no service of any version admits it before `start`
+            let mut labels = if hold { vec![b.state_label("held")?] } else { vec![service::TASK_LABEL.to_string(), b.state_label(if blocked { "waiting" } else { "ready" })?] };
             for (flag, prefix) in [("type", ""), ("runtime", "run-"), ("priority", if b.canonical_labels()? { "p" } else { "priority-" }), ("host", "host-")] {
                 if let Some(v) = a.one(flag) {
                     labels.push(format!("{prefix}{v}"));
@@ -1218,10 +1230,26 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             }
             labels::validate(&labels)?;
             let n = b.create(title, &body, &labels)?;
-            let t = if a.flags.contains_key("later") { act(b, root, n, "later", &[], text, &Op::default()).result()?; fold(n, &entries(b, n)?, blocked) } else { fold(n, &[], blocked) };
+            let r = match (hold, a.flags.contains_key("later")) {
+                (true, _) => act(b, root, n, "hold", &[], "", &Op::default()),
+                (_, true) => act(b, root, n, "later", &[], text, &Op::default()),
+                _ => Receipt::accepted(n, &op, fold(n, &[], blocked).state, 0),
+            };
             poke(root);
-            print_task(n, &t);
-            Ok(())
+            emit(&[Receipt { op_id: op.id.clone(), ..r }], json)
+        }
+        "start" => {
+            let n = a.num(1)?;
+            let r = act(b, root, n, "start", &[], "", &op);
+            // § 1: `taskq` goes on after the `start` entry; a retry adds the label a failed write left off
+            let issue = b.issue(n)?;
+            let started = entries(b, n)?.iter().any(|e| !e.edited && e.body.starts_with("taskq: start"));
+            if started && issue.open && !service::is_task(&issue) {
+                b.labels(n, &[service::TASK_LABEL.into()], &[])?;
+                let (_, t, _) = current(b, n)?;
+                return emit(&[Receipt::accepted(n, &op, t.state, core::revision(n, &entries(b, n)?))], json);
+            }
+            emit(&[r], json)
         }
         "ask" => {
             let n = a.num(1)?;
@@ -1405,6 +1433,39 @@ mod tests {
             assert!(command(&c, "add", &args(extra)).is_err());
         }
         assert_eq!(c.board.issues(None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn held_create_is_idempotent_and_starts_only_on_start() {
+        let c = Ctx { cfg: cfg(), raw: json!({}), board: Box::new(Fake::default()) };
+        let b = c.board.as_ref();
+        let run = |v: &[&str]| command(&c, v[0], &Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap());
+        let item = ["add", "T", "--goal", "G", "--acceptance", "a", "--hold", "--op-id", "req.1.0"];
+        run(&item).unwrap();
+        run(&item).unwrap();
+        let issues = b.issues(None).unwrap();
+        assert_eq!(issues.len(), 1, "a repeated op id writes one issue");
+        let n = issues[0].number;
+        assert!(issues[0].body.ends_with("\nop-id: req.1.0\n"));
+        // N-1: no `taskq` label, so 4.1.11 (same `is_task`) skips the issue; this version lists it as held
+        assert_eq!(issues[0].labels, vec!["q-held"]);
+        assert!(!service::is_task(&issues[0]) && service::is_held(&issues[0]));
+        let (views, _) = service::views(b, &mut HashMap::new()).unwrap();
+        assert_eq!(views[0].task.state, State::Held);
+        assert_eq!(fold(n, &entries(b, n).unwrap(), false).state, State::Held);
+        run(&["add", "U", "--goal", "G", "--acceptance", "a", "--op-id", "req.1.1"]).unwrap();
+        assert_eq!(b.issues(None).unwrap().len(), 2, "each item has its own receipt");
+        run(&["start", &n.to_string(), "--op-id", "s1"]).unwrap();
+        let i = b.issue(n).unwrap();
+        assert!(service::is_task(&i) && i.labels.contains(&"q-ready".to_string()) && !i.labels.contains(&"q-held".to_string()), "{:?}", i.labels);
+        let log = entries(b, n).unwrap();
+        assert_eq!(fold(n, &log, false).state, State::Ready);
+        // N-1 reads `hold` and `start` as unknown kinds: the same `ready`
+        let old: Vec<Entry> = log.iter().filter(|e| !e.body.starts_with("taskq: hold") && !e.body.starts_with("taskq: start")).cloned().collect();
+        assert_eq!(fold(n, &old, false), fold(n, &log, false));
+        run(&["start", &n.to_string(), "--op-id", "s1"]).unwrap();
+        assert_eq!(entries(b, n).unwrap().len(), log.len(), "a retried start writes nothing");
+        assert!(run(&["start", &n.to_string()]).is_err(), "a started task refuses another start");
     }
 
     #[test]

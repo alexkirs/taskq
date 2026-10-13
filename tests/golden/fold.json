@@ -239,5 +239,31 @@
    {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
    {"id": 11, "body": "taskq: steer\nuse y\nop-id: s1\nrevision: 10"},
    {"id": 12, "body": "taskq: steer\nuse y\nop-id: s1\nrevision: 10"}
-  ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac", "inbox": [11]}}
+  ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac", "inbox": [11]}},
+  {"name": "hold as the first entry holds the task", "entries": [
+   {"id": 10, "body": "taskq: hold"}
+  ], "expect": {"state": "held"}},
+  {"name": "duplicate create: a repeated hold changes nothing", "entries": [
+   {"id": 10, "body": "taskq: hold\nop-id: req.1.0"},
+   {"id": 11, "body": "taskq: hold\nop-id: req.1.0"},
+   {"id": 12, "body": "taskq: hold"}
+  ], "expect": {"state": "held"}},
+  {"name": "held never takes a spawn", "entries": [
+   {"id": 10, "body": "taskq: hold"},
+   {"id": 11, "body": "taskq: spawn worker claude:s1 mac"}
+  ], "expect": {"state": "held"}},
+  {"name": "start moves a held task to ready", "entries": [
+   {"id": 10, "body": "taskq: hold"},
+   {"id": 11, "body": "taskq: start"},
+   {"id": 12, "body": "taskq: start"}
+  ], "expect": {"state": "ready"}},
+  {"name": "start with an open dependency waits", "deps_open": true, "entries": [
+   {"id": 10, "body": "taskq: hold"},
+   {"id": 11, "body": "taskq: start"}
+  ], "expect": {"state": "waiting"}},
+  {"name": "hold after another entry is ignored", "entries": [
+   {"id": 10, "body": "taskq: later"},
+   {"id": 11, "body": "taskq: requeue"},
+   {"id": 12, "body": "taskq: hold"}
+  ], "expect": {"state": "ready"}}
 ]

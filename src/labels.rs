@@ -1,7 +1,7 @@
 //! Shared board catalog; label spellings do not change the fold.
 use crate::board::Result;
 
-pub const FIXED: &[&str] = &["taskq", "taskq-host", "q-ready", "q-blocked", "q-doing", "q-review", "q-ask", "q-later", "q-failed", "p0", "p1", "p2", "code", "docs", "research", "asset", "run-codex", "run-claude", "assignee-only"];
+pub const FIXED: &[&str] = &["taskq", "taskq-host", "q-held", "q-ready", "q-blocked", "q-doing", "q-review", "q-ask", "q-later", "q-failed", "p0", "p1", "p2", "code", "docs", "research", "asset", "run-codex", "run-claude", "assignee-only"];
 
 pub fn canonical(name: &str) -> &str {
     match name { "q-waiting" => "q-blocked", "priority-1" => "p1", "priority-2" => "p2", _ => name }
@@ -19,6 +19,7 @@ pub fn definition(name: &str) -> Option<(&'static str, String)> {
         "q-ready" => ("B7BEC7", "Ready for an eligible host", "taskq commands/log"),
         "q-blocked" => ("AEB5BF", "Open dependency; no admission", "close dependencies"),
         "q-review" => ("8C99A5", "Result awaiting review; not success", "taskq commands/log"),
+        "q-held" => ("D5D9DE", "Held; listed, no admission until start", "taskq start"),
         "q-later" => ("D5D9DE", "Parked; no admission", "taskq requeue"),
         "taskq" => ("D5D9DE", "Enables trusted issue admission", "edit issue labels"),
         "taskq-host" => ("D5D9DE", "Host heartbeat; not a task", "service manages this label"),

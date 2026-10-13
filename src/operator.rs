@@ -585,26 +585,18 @@ fn apply(install: &Path, exe: &Path, ops: &[Value], id: &str, rev: u64) -> (bool
                 if !matches!(focus(&r).as_str(), "" | "off") { Ok(format!("focus {}", focus(&r))) } else { Err("focus reads off".into()) }
             }
             Op::Board(r, mut args, want) => {
-                let task_op = args[0] != "add";
-                if task_op {
-                    args.extend(["--json".into(), "--op-id".into(), format!("{id}.{rev}.{k}")]);
-                }
+                // a repeated `add` item takes the op id of its first copy: one issue, the first receipt again (§ 5)
+                let k = if args[0] == "add" { ops.iter().position(|x| x == o).unwrap_or(k) } else { k };
+                args.extend(["--json".into(), "--op-id".into(), format!("{id}.{rev}.{k}")]);
                 let out = std::process::Command::new(exe).args(&args).current_dir(&r).env("TASKQ_ROOT", &r)
                     .env_remove("TASKQ_TASK").env_remove("TASKQ_ATTEMPT").output().map_err(|e| e.to_string())?;
                 let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-                if task_op {
-                    let rc: Value = String::from_utf8_lossy(&out.stdout).lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap_or_default();
-                    receipts.push(rc.clone());
-                    return match (rc["outcome"].as_str(), rc["state"].as_str()) {
-                        (Some("accepted"), Some(st)) if want.contains(&st) => Ok(format!("#{} {st}", rc["task"])),
-                        (Some(outcome), _) => Err(format!("{outcome}: {}", rc["reason"].as_str().unwrap_or(""))),
-                        _ => Err(text.lines().next().unwrap_or("no receipt").to_string()),
-                    };
-                }
-                let seen = text.lines().find(|l| l.starts_with('#')).map(str::trim).unwrap_or("");
-                match seen.split_once(' ') {
-                    Some((_, st)) if out.status.success() && want.contains(&st) => Ok(seen.to_string()),
-                    _ => Err(text.lines().next().unwrap_or("no output").to_string()),
+                let rc: Value = String::from_utf8_lossy(&out.stdout).lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap_or_default();
+                receipts.push(rc.clone());
+                match (rc["outcome"].as_str(), rc["state"].as_str()) {
+                    (Some("accepted"), Some(st)) if want.contains(&st) => Ok(format!("#{} {st}", rc["task"])),
+                    (Some(outcome), _) => Err(format!("{outcome}: {}", rc["reason"].as_str().unwrap_or(""))),
+                    _ => Err(text.lines().next().unwrap_or("no receipt").to_string()),
                 }
             }
         });

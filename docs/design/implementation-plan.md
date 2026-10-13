@@ -71,7 +71,7 @@ Batch 1 was authorized on 2026-10-14 and closed the same day (#886, #887, #888).
 
 ## Task template
 
-Each task carries: the backlog row and design IDs; the affected R and § rules; current behavior with file references; the contract amendment made in the same PR (taskq.md first, spec size test green); the golden trace or adapter test that fails without the change; N/N-1 proof against 4.1.11; macOS evidence; and a report that separates Specified, Prototyped, Implemented and Qualified. Acceptance items name observable checks only (§ 1). Each task links the specq pages its slice touches (data, permission authority, implementation fidelity, dashboards) so the worker and reviewer check them; the task is the owner's grant for § 7 delivery and nothing beyond it. Tasks take runtime `any` and priority 1; the promo-video tasks stay 2.
+Each task carries: the backlog row and design IDs; the affected R and § rules; current behavior with file references; the contract amendment made in the same PR (taskq.md first, spec size test green); the golden trace or adapter test that fails without the change; N/N-1 proof against 4.1.11; macOS evidence; and a report that separates Specified, Prototyped, Implemented and Qualified. Acceptance items name observable checks only (§ 1). Each task links the specq pages its slice touches (data, permission authority, implementation fidelity, dashboards) so the worker and reviewer check them; the task is the owner's grant for § 7 delivery and nothing beyond it. Tasks take runtime `any`, `--host mac` (the Windows host runs 4.1.11 and has no macOS evidence) and priority 1; the promo-video tasks stay 2.
 
 ## Owner request log
 

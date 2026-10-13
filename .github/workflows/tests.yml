@@ -20,8 +20,15 @@ jobs:
         env:
           TASKQ_SELFTEST_OFFLINE: '1'
           TASKQ_INCIDENT_REPORTS: 'off'
-  tests: # required status check name; gates on the rust matrix
-    needs: rust
+  shots: # README screenshots match the UI sources (docs/shots/check.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: docs/shots/check.sh
+  tests: # required status check name; gates on the rust matrix and the shots check
+    needs: [rust, shots]
     runs-on: ubuntu-latest
     steps:
       - run: echo ok

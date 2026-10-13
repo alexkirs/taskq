@@ -95,6 +95,7 @@ struct Authority {
     credential: &'static str,
     revoked: bool,
     registered: bool,
+    supported: bool,
     generation: u64,
     grant: Grant,
     revision: String,
@@ -105,7 +106,7 @@ struct Authority {
 impl Authority {
     fn new() -> Self {
         let corpus: Value = serde_json::from_str(CORPUS).unwrap();
-        Self { now: 100, credential: "resource", revoked: false, registered: true, generation: 1,
+        Self { now: 100, credential: "resource", revoked: false, registered: true, supported: true, generation: 1,
             grant: serde_json::from_value(corpus["grant"].clone()).unwrap(),
             revision: "r1".into(), operations: BTreeMap::new(), writes: 0 }
     }
@@ -118,6 +119,7 @@ impl Authority {
             || r.target.project_id.as_ref().is_some_and(|p| !self.grant.project_ids.contains(p))
             || r.target.runtime_id.as_ref().is_some_and(|rt| !self.grant.runtime_ids.contains(rt)) { return Err("scope"); }
         if r.target.project_id.is_none() && !self.grant.host_policy { return Err("scope"); }
+        if !self.supported { return Err("unsupported"); }
         Ok(())
     }
 
@@ -254,6 +256,10 @@ fn refuses_untrusted_scope_fields_and_bounds() {
     h.registered = false; assert_eq!(h.apply("op-1"), "scope"); assert_eq!(h.writes, 0);
     let mut h = Authority::new(); h.generation = 2; assert_eq!(h.submit(wire), "scope");
     let mut h = Authority::new(); h.grant.expires_at = 100; assert_eq!(h.submit(wire), "revoked");
+    let mut h = Authority::new(); assert_eq!(h.submit(wire), "pending");
+    h.grant.expires_at = 101; h.now = 101; assert_eq!(h.apply("op-1"), "revoked"); assert_eq!(h.writes, 0);
+    let mut h = Authority::new(); assert_eq!(h.submit(wire), "pending");
+    h.supported = false; assert_eq!(h.apply("op-1"), "unsupported"); assert_eq!(h.writes, 0);
     let mut missing = wire.clone(); missing["target"].as_object_mut().unwrap().remove("runtime_id");
     assert!(typed(&missing).is_err(), "required null fields cannot be silently omitted");
     let mut wrong = wire.clone(); wrong["target"]["installation_id"] = json!("b".repeat(64));

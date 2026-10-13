@@ -7,6 +7,37 @@ use std::collections::BTreeMap;
 const SCHEMA: &str = "taskq.resources/1";
 const CORPUS: &str = include_str!("fixtures/resource-policy-v1.json");
 
+// Parse every object before Value canonicalization can erase duplicate keys.
+struct UniqueJson(Value);
+impl<'de> Deserialize<'de> for UniqueJson {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueJson;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("JSON without duplicate keys") }
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, mut m: M) -> Result<Self::Value, M::Error> {
+                let mut object = serde_json::Map::new();
+                while let Some((key, UniqueJson(value))) = m.next_entry::<String, UniqueJson>()? {
+                    if object.insert(key, value).is_some() { return Err(serde::de::Error::custom("duplicate key")); }
+                }
+                Ok(UniqueJson(Value::Object(object)))
+            }
+            fn visit_seq<S: serde::de::SeqAccess<'de>>(self, mut s: S) -> Result<Self::Value, S::Error> {
+                let mut array = Vec::new();
+                while let Some(UniqueJson(value)) = s.next_element()? { array.push(value); }
+                Ok(UniqueJson(Value::Array(array)))
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> { Ok(UniqueJson(json!(v))) }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> { Ok(UniqueJson(json!(v))) }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> { Ok(UniqueJson(json!(v))) }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> { Ok(UniqueJson(json!(v))) }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> { Ok(UniqueJson(json!(v))) }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> { Ok(UniqueJson(Value::Null)) }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Target {
@@ -123,6 +154,14 @@ impl Authority {
         Ok(())
     }
 
+    fn submit_raw(&mut self, raw: &str) -> String {
+        if raw.len() > 16384 { return "invalid".into(); }
+        match serde_json::from_str::<UniqueJson>(raw) {
+            Ok(UniqueJson(wire)) => self.submit(&wire),
+            Err(_) => "invalid".into(),
+        }
+    }
+
     fn submit(&mut self, wire: &Value) -> String {
         if serde_json::to_vec(wire).unwrap().len() > 16384 { return "invalid".into(); }
         let r = match typed(wire) { Ok(r) => r, Err(e) => return e.into() };
@@ -208,7 +247,7 @@ fn client_server_traces() {
                 "review" => { reviewed = Some(draft.clone()); "reviewed".into() }
                 "edit" => { draft["changes"]["runtime_limit"] = json!(1); reviewed = None; "draft".into() }
                 "confirm" => if reviewed.as_ref() == Some(&draft) {
-                    frozen = Some(draft.clone()); host.submit(&draft)
+                    frozen = Some(draft.clone()); host.submit_raw(&serde_json::to_string(&draft).unwrap())
                 } else { client },
                 "apply" => host.apply("op-1"),
                 "readback" => host.readback("op-1", &draft["target"], &step["revision"], step["at"].as_u64().unwrap()),
@@ -300,10 +339,33 @@ fn refuses_untrusted_scope_fields_and_bounds() {
     assert_eq!(h.submit(wire), "busy", "retained bindings cannot be evicted to accept a new ID");
 }
 
-fn project(source: &Value, now: u64) -> Value {
-    let fields = ["target", "service_version", "supported", "current_revision", "effective_revision", "current_policy", "effective_policy", "runtime_usage", "sample", "blockers", "completeness"];
-    let mut p = json!({});
-    for field in fields { p[field] = source.get(field).cloned().unwrap_or(Value::Null); }
+fn allowlisted(value: &Value, kind: &str) -> Value {
+    let fields: &[&str] = match kind {
+        "projection" => &["target", "service_version", "supported", "current_revision", "effective_revision", "current_policy", "effective_policy", "runtime_usage", "sample", "blockers", "completeness"],
+        "target" | "scope" => &["installation_id", "generation", "project_id", "runtime_id"],
+        "supported" => &["policy_schema", "modes", "fields", "scopes"],
+        "current_policy" | "effective_policy" => &["mode", "maximum", "runtime_limit", "load_gate", "sources"],
+        "sources" => &["mode", "maximum", "runtime_limit", "load_gate"],
+        "load_gate" => &["enabled", "cpu_max", "memory_min"],
+        "runtime_usage" => &["runtime_id", "used", "limit", "limit_kind"],
+        "sample" => &["source", "sampled_at", "age_seconds", "cadence_seconds", "window_seconds", "cpu_busy_percent", "memory_available_percent", "memory_available_gib", "pressure"],
+        "blockers" => &["code", "scope", "knowledge"],
+        _ => return if value.is_object() || value.is_array() { Value::Null } else { value.clone() },
+    };
+    if let Some(array) = value.as_array() {
+        return Value::Array(array.iter().map(|v| allowlisted(v, kind)).collect());
+    }
+    let Some(object) = value.as_object() else { return Value::Null; };
+    Value::Object(object.iter().filter(|(key, _)| fields.contains(&key.as_str())).map(|(key, value)| {
+        let projected = if ["modes", "fields", "scopes"].contains(&key.as_str()) {
+            Value::Array(value.as_array().map(|a| a.iter().map(|v| if v.is_string() { v.clone() } else { Value::Null }).collect()).unwrap_or_default())
+        } else { allowlisted(value, key) };
+        (key.clone(), projected)
+    }).collect())
+}
+
+fn project(source: &Value, observed_at: u64, now: u64) -> Value {
+    let mut p = allowlisted(source, "projection");
     if !p["blockers"].is_array() { p["blockers"] = json!([]); p["completeness"] = json!("unknown"); }
     for blocker in p["blockers"].as_array_mut().unwrap() {
         if !["cpu", "memory", "pressure", "sample", "config", "cooldown", "spacing", "max", "version", "host", "runtime_disabled", "pause", "focus", "dependency", "routing", "access", "provider", "unknown"].contains(&blocker["code"].as_str().unwrap_or("")) {
@@ -311,7 +373,9 @@ fn project(source: &Value, now: u64) -> Value {
         }
     }
     let sampled = p["sample"]["sampled_at"].as_u64();
-    let age = sampled.and_then(|at| now.checked_sub(at));
+    let age = sampled.filter(|at| *at <= observed_at)
+        .and_then(|_| p["sample"]["age_seconds"].as_u64())
+        .and_then(|age| now.checked_sub(observed_at).and_then(|elapsed| age.checked_add(elapsed)));
     if !p["sample"].is_null() { p["sample"]["age_seconds"] = json!(age); }
     if age.is_none_or(|age| age > 60) {
         let target = p["target"].clone();
@@ -338,14 +402,46 @@ fn projection_preserves_source_knowledge() {
     assert_eq!(p["completeness"], "partial");
     let mut source = p.clone(); source["path"] = json!("private");
     source["blockers"][2]["code"] = json!("future-producer-reason");
-    let stale = project(&source, 151);
+    let stale = project(&source, 100, 151);
     assert!(stale.get("path").is_none());
     assert_eq!(stale["sample"]["age_seconds"], 61);
     assert_eq!(stale["sample"]["cpu_busy_percent"], 95.0);
     assert_eq!(stale["blockers"][2]["code"], "unknown");
     assert_eq!(stale["blockers"][3]["knowledge"], "unknown");
     assert_eq!(stale["completeness"], "unknown");
-    assert!(project(&source, 89)["sample"]["age_seconds"].is_null());
+    assert!(project(&source, 100, 89)["sample"]["age_seconds"].is_null());
     let receipt = &c["receipt"];
     assert_eq!(receipt["state"], "saved"); assert_ne!(receipt["saved_revision"], receipt["effective_revision"]);
+}
+
+// Chain: raw delivery/projection -> validated model. Risk: nested leakage, duplicate changes or stale samples appear fresh.
+#[test]
+fn reviewer_regression_fixtures() {
+    let c: Value = serde_json::from_str(CORPUS).unwrap();
+    for raw in c["regressions"]["duplicate_json"].as_array().unwrap() {
+        let mut host = Authority::new();
+        assert_eq!(host.submit_raw(raw.as_str().unwrap()), "invalid");
+        assert_eq!(host.writes, 0);
+        assert!(host.operations.is_empty());
+    }
+    let mut original = c["projection"]["targets"][0].clone();
+    original["current_policy"]["load_gate"] = json!({"enabled":true,"cpu_max":85,"memory_min":15});
+    let mut source = original.clone();
+    for path in c["regressions"]["private_paths"].as_array().unwrap() {
+        let mut field = &mut source;
+        for part in path.as_array().unwrap() {
+            field = if let Some(index) = part.as_u64() { &mut field[index as usize] } else { &mut field[part.as_str().unwrap()] };
+        }
+        *field = json!("private");
+    }
+    assert_eq!(project(&source, 100, 100), original, "nested private fields are stripped");
+    for case in c["regressions"]["ages"].as_array().unwrap() {
+        let mut source = original.clone();
+        source["sample"]["age_seconds"] = case["producer_age"].clone();
+        let p = project(&source, 100, case["now"].as_u64().unwrap());
+        assert_eq!(p["sample"]["age_seconds"], case["expected_age"]);
+        assert_eq!(p["completeness"], "unknown");
+        assert_eq!(p["sample"]["cpu_busy_percent"], original["sample"]["cpu_busy_percent"]);
+        assert_eq!(p["blockers"][3]["knowledge"], "unknown");
+    }
 }

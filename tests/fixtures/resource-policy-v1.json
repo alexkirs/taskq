@@ -74,4 +74,79 @@
       {"action": "review", "expect": "reviewed"}, {"action": "confirm", "expect": "pending"},
       {"action": "apply", "expect": "saved"}, {"action": "cancel", "expect": "saved"}]}
   ]
+,
+  "regressions": {
+  "duplicate_json": [
+    "{\"schema\":\"taskq.resources/1\",\"op_id\":\"op-1\",\"actor_id\":\"operator-1\",\"grant_id\":\"grant-1\",\"target\":{\"installation_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":1,\"project_id\":\"project-1\",\"runtime_id\":\"codex\"},\"policy_schema\":\"taskq.admission/1\",\"expected_revision\":\"r1\",\"issued_at\":100,\"expires_at\":400,\"changes\":{\"runtime_limit\":1,\"runtime_limit\":0}}",
+    "{\"schema\":\"taskq.resources/1\",\"op_id\":\"op-1\",\"actor_id\":\"operator-1\",\"grant_id\":\"grant-1\",\"target\":{\"installation_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":2,\"generation\":1,\"project_id\":\"project-1\",\"runtime_id\":\"codex\"},\"policy_schema\":\"taskq.admission/1\",\"expected_revision\":\"r1\",\"issued_at\":100,\"expires_at\":400,\"changes\":{\"runtime_limit\":0}}",
+    "{\"schema\":\"taskq.resources/1\",\"op_id\":\"op-1\",\"actor_id\":\"operator-1\",\"grant_id\":\"grant-1\",\"target\":{\"installation_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":1,\"project_id\":\"project-1\",\"runtime_id\":\"codex\"},\"policy_schema\":\"taskq.admission/1\",\"expected_revision\":\"r1\",\"issued_at\":100,\"expires_at\":400,\"changes\":{\"load_gate\":{\"enabled\":true,\"enabled\":false,\"cpu_max\":85,\"memory_min\":15}}}"
+  ],
+  "private_paths": [
+    [
+      "current_policy",
+      "path"
+    ],
+    [
+      "effective_policy",
+      "sources",
+      "path"
+    ],
+    [
+      "current_policy",
+      "load_gate",
+      "path"
+    ],
+    [
+      "target",
+      "path"
+    ],
+    [
+      "supported",
+      0,
+      "path"
+    ],
+    [
+      "runtime_usage",
+      0,
+      "path"
+    ],
+    [
+      "sample",
+      "path"
+    ],
+    [
+      "blockers",
+      0,
+      "scope",
+      "path"
+    ],
+    [
+      "blockers",
+      0,
+      "path"
+    ]
+  ],
+  "ages": [
+    {
+      "producer_age": 120,
+      "now": 100,
+      "expected_age": 120
+    },
+    {
+      "producer_age": 120,
+      "now": 110,
+      "expected_age": 130
+    },
+    {
+      "producer_age": null,
+      "now": 110,
+      "expected_age": null
+    },
+    {
+      "producer_age": 18446744073709551615,
+      "now": 110,
+      "expected_age": null
+    }
+  ]
+}
 }

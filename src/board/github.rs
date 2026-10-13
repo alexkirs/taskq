@@ -1,4 +1,4 @@
-//! GitHub issues (taskq.md § 1, § 2, § 7): REST v3 on github.com or a GitHub Enterprise host, `gh` login.
+//! GitHub issues (taskq.md § 1, § 2, § 7): REST v3 on github.com or a GitHub Enterprise host, owner-installed token.
 
 use super::{Api, Board, Comment, Issue, Kind, Publish, Result, encode, hex40, iso, names, outcome, s, stamp, verify_assignment};
 use serde_json::{Value, json};
@@ -10,10 +10,18 @@ pub const KIND: Kind = Kind {
     user_key: "login",
     default_host: "github.com",
     repo_view: Some(&["repo", "view", "--json", "nameWithOwner,visibility"]),
-    token: |tool, host| tool.token(false, host),
+    token: |tool, _host| token(&tool.install),
+    token_env: &["GH_TOKEN", "GITHUB_TOKEN"],
     api,
     board: |api| Box::new(GitHub { api }),
 };
+
+pub const TOKEN_ERROR: &str = "GitHub board token missing, empty or unreadable; owner must install it in <install>/token; never run gh auth login";
+
+pub fn token(install: &std::path::Path) -> Result<String> {
+    std::fs::read_to_string(install.join("token")).ok()
+        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).ok_or_else(|| TOKEN_ERROR.into())
+}
 
 fn api(host: &str, repo: &str, token: &str) -> Api {
     let root = if host == "github.com" || host.is_empty() { "https://api.github.com".to_string() } else { format!("https://{host}/api/v3") };
@@ -214,5 +222,32 @@ impl Board for GitHub {
         let web = self.api.root.replace("api.github.com", "github.com").replace("/api/v3", "");
         let repo = self.api.base.rsplit_once("/repos/").map(|x| x.1).unwrap_or_default();
         format!("{web}/{repo}/issues/{n}")
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    // Chain: host credential -> service board and worker environment. Risk: login fallback or mismatched errors.
+    #[test]
+    fn service_and_workers_share_the_host_credential_and_missing_token_error() {
+        let dir = std::env::temp_dir().join(format!("taskq-token-{}", crate::runtime::uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = crate::platform::tool(&dir);
+        for contents in [None, Some(" \n")] {
+            if let Some(contents) = contents { std::fs::write(dir.join("token"), contents).unwrap(); }
+            let service = KIND.open("github.com", "o/r", None, &tool).err().unwrap();
+            assert_eq!(service, TOKEN_ERROR);
+            assert_eq!(KIND.worker_env(&tool, "github.com").unwrap_err(), service);
+        }
+        std::fs::write(dir.join("token"), "existing-owner-token\n").unwrap();
+        let env = KIND.worker_env(&tool, "github.com").unwrap();
+        assert_eq!(env, vec![("GH_TOKEN".into(), "existing-owner-token".into()), ("GITHUB_TOKEN".into(), "existing-owner-token".into())]);
+        assert!(KIND.open("github.com", "o/r", None, &tool).is_ok());
+        std::fs::remove_file(dir.join("token")).unwrap();
+        std::fs::create_dir(dir.join("token")).unwrap();
+        assert_eq!(KIND.worker_env(&tool, "github.com").unwrap_err(), TOKEN_ERROR);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

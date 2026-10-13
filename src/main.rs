@@ -495,7 +495,8 @@ fn adopt(s: &mut Service, root: &Path) {
 fn service_run(c: &Ctx) -> Res<()> {
     let cfg = &c.cfg;
     let exe = launcher(&cfg.install);
-    let env = runtime::Env { root: &cfg.root, exe: &exe, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.publish };
+    let board_env = cfg.board.worker_env(&platform::tool(&cfg.install), &cfg.web_host)?;
+    let env = runtime::Env { board_env: &board_env, root: &cfg.root, exe: &exe, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.publish };
     let start = |l: &runtime::Launch| runtime::spawn(&env, l);
     let mut s = Service::new(c.board.as_ref(), cfg, platform::VERSION, Box::new(start));
     let d = dot(&cfg.root);

@@ -231,6 +231,7 @@ pub struct Kind {
     /// CLI arguments that print the current folder's repository, if the CLI has them.
     pub repo_view: Option<&'static [&'static str]>,
     token: fn(&coreq::Tool, &str) -> Result<String>,
+    token_env: &'static [&'static str],
     api: fn(&str, &str, &str) -> Api,
     board: fn(Api) -> Box<dyn Board>,
 }
@@ -249,6 +250,11 @@ fn label_schema(schema: Option<&str>) -> Result<Option<bool>> {
 }
 
 impl Kind {
+    pub fn worker_env(&self, tool: &coreq::Tool, host: &str) -> Result<Vec<(String, String)>> {
+        let token = (self.token)(tool, host)?;
+        Ok(self.token_env.iter().map(|name| (name.to_string(), token.clone())).collect())
+    }
+
     /// The board of `repo` on the web `host`, with the token this board's lookup finds (§ 9).
     pub fn open(&self, host: &str, repo: &str, schema: Option<&str>, tool: &coreq::Tool) -> Result<Box<dyn Board>> {
         let schema = label_schema(schema)?;

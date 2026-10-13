@@ -128,6 +128,14 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 - Preserve CPU/memory gate controls and saved-vs-applied distinction from the current UI. Gate semantics remain in taskq.md.
 - AI prepares the same reviewable operations; no hidden alternate apply route. Preview matches/exclusions for UC-05 once the filter contract exists.
 
+## M13 Pinned window
+
+- The menu header carries a pin control. Unpinned (default): the popover closes on blur, as today.
+- Pinned: the same content stays open as a standalone window with the same width rules; it moves anywhere by dragging its header, stays above normal windows, and does not close on blur or on a tray icon click (the click raises it).
+- The window snaps to the screen work-area edges where the OS provides it (Windows Snap); on macOS it keeps within the work area and remembers the last position per display.
+- Unpin returns to the popover at the tray icon. Pinned state and position persist in `<install>/tray.json`; a missing or off-screen position falls back to the tray icon.
+- Content, state and height rules do not change between the two modes; only placement and closing do.
+
 ## Acceptance
 
 | ID | Evidence |
@@ -153,5 +161,6 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 | M-A18 | Pinned/recent, searchable All, header plus; all-state aggregate/project counters and quiet Closed follow K-A1–K-A6. |
 | M-A19 | Both composers accept attachments; workspace/window recovery follows C-A1–C-A10. |
 | M-A20 | Shared editor preserves Mixed, untouched fields/targets and per-project readback. |
+| M-A21 | Pin keeps the menu open as a movable window above normal windows; position and pinned state survive a tray restart; unpin returns to the popover; Windows edge snap, macOS work-area clamp. |
 
 [Verification](verification.md) separates historical evidence from the current candidate. General principles change in specq; TaskQ behavior changes here under R13.

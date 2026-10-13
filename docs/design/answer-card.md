@@ -2,6 +2,8 @@
 
 Accepted target under [taskq.md § 2](../../taskq.md#ask-card). TaskQ owns the component and its conformance fixtures; DashQ consumes it. This is not a shipped UI claim. Apply shared [operator rules](https://github.com/taskqorg/specq/blob/main/design/operator-ui.md) and [AI-assisted controls](https://github.com/taskqorg/specq/blob/main/design/workflow.md#ai-assisted-controls).
 
+Follow [shared-block inheritance B1–B4](shared-blocks.md). Compact placement does not authorize independent icons, tokens, counter layouts or simplified editors; the parent package governs visual fidelity.
+
 ## Ownership and delivery
 
 One small browser-compatible component implements task question, source-numbered choices, recommendation, free text and receipt states. TaskQ tray and DashQ supply adapters for their existing bridges; the component owns no credentials, network client, board parser or task state machine. No UI framework, service or general plugin system.
@@ -38,6 +40,6 @@ Use the same fixtures in TaskQ and DashQ: choice and free text; long question; m
 
 ## Accepted reference
 
-[Interactive reference](answer-card-reference.html) uses the existing TaskQ design example, with synthetic task #841 and counts. It approves compact placement and ordinary choice/free-text/receipt interaction, not its mocked transport or invented state. It does not replace the failure-state fixtures above.
+[Interactive reference](answer-card-reference.html) uses the existing TaskQ design example, with synthetic task #841 and counts. It approves compact placement and ordinary choice/free-text/receipt interaction, not its mocked transport, invented state or approximate icons/tokens/counters. Shared-block B1–B4 takes precedence over those demo details. It does not replace the failure-state fixtures above.
 
 Reference SHA-256: `4b857925b7a606f1766b84f2b0e79b36fb26bc1203d8a64a51ccdc29a321c556`.

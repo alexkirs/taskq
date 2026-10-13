@@ -129,6 +129,8 @@ pub struct Env<'a> {
     pub permission_mode: &'a str,
     pub codex: &'a [String],
     pub publish: &'a str,
+    /// Secret values: command environment only, never brief, argv or log.
+    pub board_env: &'a [(String, String)],
 }
 
 pub fn command(env: &Env, l: &Launch) -> Command {
@@ -152,7 +154,8 @@ pub fn command(env: &Env, l: &Launch) -> Command {
         .env("TASKQ_TASK", l.task.to_string())
         .env("TASKQ_ATTEMPT", l.attempt.to_string())
         .env("TASKQ_ROLE", &l.role)
-        .env("TASKQ_ROOT", env.root);
+        .env("TASKQ_ROOT", env.root)
+        .envs(env.board_env.iter().cloned());
     c
 }
 
@@ -161,7 +164,8 @@ const FORMATS: &str = "Put each `--text` field on its own line. The commands ren
      Changed and Open 1-2 lines, 1-8 checks. Over-limit text is rejected: shorten it, never hand-write card prose.\n";
 
 /// taskq.md § 8 Folders: never search `/` or home; macOS asks the owner for Desktop, Documents, Downloads etc.
-const FILES: &str = "Touch only this project, ~/.claude, ~/.codex and the OS temp dir: never search `/`, `~` or other folders.\n";
+const FILES: &str = "Never run gh auth login. A missing board token is an owner item; report it through taskq ask.\n\
+     Touch only this project, ~/.claude, ~/.codex and the OS temp dir: never search `/`, `~` or other folders.\n";
 
 fn ask(q: &impl std::fmt::Display, n: u64) -> String {
     format!("`{q} ask {n} --text \"Done: <checked or not started>\nProblem: <decision and user effect>\" --option A --option B --recommend K [--link URL]`")
@@ -491,7 +495,7 @@ mod tests {
     #[test]
     fn commands_follow_the_runtime_table() {
         let codex = vec!["-s".to_string(), "workspace-write".to_string()];
-        let env = Env { root: Path::new("/p"), exe: Path::new("/i/taskq"), permission_mode: "dontAsk", codex: &codex, publish: "pr" };
+        let env = Env { root: Path::new("/p"), exe: Path::new("/i/taskq"), permission_mode: "dontAsk", codex: &codex, publish: "pr", board_env: &[("GH_TOKEN".into(), "test-board-token".into()), ("GITHUB_TOKEN".into(), "test-board-token".into())] };
         let mut l = Launch { task: 7, title: "T".into(), attempt: 42, role: "worker".into(), rt: "codex".into(), session: "-".into(), url: "https://b/7".into(), resume: None };
         let args = |c: &Command| c.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
         assert_eq!(args(&command(&env, &l)), "exec --json -s workspace-write -C /p -");
@@ -504,6 +508,9 @@ mod tests {
         let envs: Vec<_> = c.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect();
         assert!(envs.contains(&("CODEX_THREAD_ID".into(), None)));
         assert!(envs.contains(&("TASKQ_ATTEMPT".into(), Some("42".into()))));
+        for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
+            assert!(envs.contains(&(key.into(), Some("test-board-token".into()))));
+        }
         l.role = "worker".into();
         let b = brief(&env, &l);
         assert!(b.contains("/i/taskq result 7 --sha") && b.contains("`Task: https://b/7`") && b.contains("open one PR") && b.contains("Changed: <user effect>\nOpen:") && b.contains("§ 2 Ask card"));

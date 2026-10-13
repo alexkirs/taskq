@@ -12,6 +12,7 @@ pub const KIND: Kind = Kind {
     default_host: "gitlab.com",
     repo_view: None,
     token: |tool, host| tool.token(true, host),
+    token_env: &["GITLAB_TOKEN"],
     api,
     board: |api| Box::new(GitLab { api, members: RefCell::new(vec![]) }),
 };

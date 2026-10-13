@@ -126,6 +126,11 @@ pub fn step(root: &Path, install: &Path, exe: &Path, rt: Option<&str>) {
     for id in ids.iter().rev().take(KEEP) {
         let a = read(&answer_path(root, id));
         if a.is_null() {
+            // the request log (§ 4): once, when the request first gets an answer
+            let req = read(&dir(root).join(format!("{id}.json")));
+            if let Err(e) = crate::retro::append(root, if req["task"].is_u64() { "comment" } else { "tray" }, req["task"].as_u64(), req["text"].as_str().unwrap_or("")) {
+                eprintln!("request log: {e}");
+            }
             start(root, install, id, rt);
             continue;
         }
@@ -170,8 +175,13 @@ fn start(root: &Path, install: &Path, id: &str, rt: Option<&str>) {
 /// The operator child: no tools (R9), brief on stdin, killed after 10 minutes.
 fn run(root: &Path, install: &Path, id: &str, rt: &str) -> Result<String, String> {
     let req = read(&dir(root).join(format!("{id}.json")));
-    let out = dir(root).join(format!("{id}.out"));
-    let last = dir(root).join(format!("{id}.last"));
+    exec(rt, &brief(root, install, &req), &dir(root), id)
+}
+
+/// Run one operator in `cwd` with `brief` on stdin; `<name>.out` and `<name>.last` hold its output. `taskq retro` too.
+pub fn exec(rt: &str, brief: &str, cwd: &Path, name: &str) -> Result<String, String> {
+    let out = cwd.join(format!("{name}.out"));
+    let last = cwd.join(format!("{name}.last"));
     let mut c = std::process::Command::new(crate::runtime::which(rt));
     crate::platform::quiet(&mut c);
     if rt == "claude" {
@@ -184,8 +194,8 @@ fn run(root: &Path, install: &Path, id: &str, rt: &str) -> Result<String, String
     }
     let f = fs::File::create(&out).map_err(|e| e.to_string())?;
     // the requests folder: no project files at hand even for a runtime that could read them
-    let mut child = c.current_dir(dir(root)).stdin(std::process::Stdio::piped()).stdout(f).stderr(std::process::Stdio::null()).spawn().map_err(|e| format!("{rt}: {e}"))?;
-    let _ = std::io::Write::write_all(&mut child.stdin.take().unwrap(), brief(root, install, &req).as_bytes());
+    let mut child = c.current_dir(cwd).stdin(std::process::Stdio::piped()).stdout(f).stderr(std::process::Stdio::null()).spawn().map_err(|e| format!("{rt}: {e}"))?;
+    let _ = std::io::Write::write_all(&mut child.stdin.take().unwrap(), brief.as_bytes());
     let mut waited = 0;
     let status = loop {
         if let Ok(Some(s)) = child.try_wait() {

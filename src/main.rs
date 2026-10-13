@@ -9,6 +9,7 @@ mod incident;
 mod labels;
 mod operator;
 mod platform;
+mod retro;
 mod runtime;
 mod service;
 mod snapshot;
@@ -41,6 +42,7 @@ const USAGE: &str = "taskq agents
  taskq steer N --text T | taskq failed N --text T
  taskq close N [M..] [--text VERDICT]
  taskq status [--only L,..] [--json] | taskq inbox N
+ taskq retro | taskq add --retro K [--type T ..]
  taskq wait [--window MIN] [--only L,..]
  taskq cleanup [--force] | taskq update [--check]
  taskq service install|run|pause|resume|status|restart|stop|uninstall|list
@@ -1114,6 +1116,14 @@ fn emit(rs: &[Receipt], json: bool) -> Res<()> {
     if rs.iter().all(Receipt::ok) { Ok(()) } else { Err(String::new()) } // already shown: exit 1 quietly
 }
 
+/// An accepted `ask`, `answer` or `requeue` goes to the request log (§ 4), then the receipt is shown.
+fn logged(root: &Path, source: &str, text: &str, r: Receipt, json: bool) -> Res<()> {
+    if r.ok() {
+        retro::record(root, source, r.task, text);
+    }
+    emit(&[r], json)
+}
+
 fn uninstall_unit(u: &platform::Unit, root: &Path, projects: &Path) -> Res<()> {
     let registered = fs::read_to_string(projects).map_err(|e| format!("{}: {e}", projects.display()))?;
     let all: Vec<String> = registered.lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
@@ -1190,6 +1200,12 @@ fn run(argv: &[String]) -> Res<()> {
             Ok(())
         }
         "service" => service(&a),
+        // § 5: the operator over the request log; no board
+        "retro" => {
+            let (cfg, _) = load(&find_root()?)?;
+            print!("{}", retro::run(&cfg.root, cfg.limits.iter().find(|(_, n)| **n > 0).map(|(rt, _)| rt.as_str()))?);
+            Ok(())
+        }
         "tray" => tray(platform::default_install(), a.one("snapshot"), a.one("icon")),
         "" => Err("command missing; use `taskq help`".into()),
         _ => command(&ctx()?, cmd, &a),
@@ -1222,13 +1238,18 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
         }
         "add" => {
             // § 1 task body: Goal, Acceptance, Scope, dependencies; limits checked before any write
-            let title = a.pos.get(1).filter(|t| !t.trim().is_empty()).ok_or("title missing")?;
+            // § 5 `--retro K`: title, goal and acceptance of the last retro report's recommendation K
+            let picked = a.one("retro").map(|k| retro::pick(root, k)).transpose()?;
+            if picked.is_some() && (a.pos.len() > 1 || a.flags.contains_key("goal") || a.flags.contains_key("acceptance")) {
+                return Err("--retro K takes title, goal and acceptance from the report; drop them".into());
+            }
+            let title = match &picked { Some((t, _, _)) => t, None => a.pos.get(1).filter(|t| !t.trim().is_empty()).ok_or("title missing")? };
             if title.contains(['\r', '\n']) || title.chars().count() > 80 {
                 return Err("title: one line, at most 80 characters; shorten it".into());
             }
-            let goal: Vec<String> = a.need("goal")?.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+            let goal: Vec<String> = match &picked { Some((_, g, _)) => g.as_str(), None => a.need("goal")? }.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
             limit("Goal", &goal, 1, 2, 240)?;
-            let (acc, scope) = (a.all("acceptance"), a.all("scope"));
+            let (acc, scope) = (picked.as_ref().map_or_else(|| a.all("acceptance"), |p| p.2.clone()), a.all("scope"));
             one_line("--acceptance", &acc)?;
             one_line("--scope", &scope)?;
             let acc: Vec<String> = acc.iter().enumerate().map(|(i, s)| format!("A{}. {s}", i + 1)).collect();
@@ -1303,14 +1324,18 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
         "ask" => {
             let n = a.num(1)?;
             let body = ask_card(n, a.need("text")?, &a.all("option"), a.one("recommend"), &a.all("link"))?;
-            emit(&[act(b, root, n, "ask", &[], &body, &op)], json)
+            logged(root, "ask", &body, act(b, root, n, "ask", &[], &body, &op), json)
         }
         "answer" if a.pos.get(1).is_some_and(|p| p.contains('.')) => {
-            emit(&answer_picks(b, cfg, &a.pos[1..], &op)?, json)
+            let rs = answer_picks(b, cfg, &a.pos[1..], &op)?;
+            for (r, pick) in rs.iter().zip(&a.pos[1..]) {
+                if r.ok() { retro::record(root, "answer", r.task, pick); }
+            }
+            emit(&rs, json)
         }
         "answer" => {
             let n = a.num(1)?;
-            emit(&[act(b, root, n, "answer", &[], a.need("text")?, &op)], json)
+            logged(root, "answer", a.need("text")?, act(b, root, n, "answer", &[], a.need("text")?, &op), json)
         }
         "result" => {
             let n = a.num(1)?;
@@ -1318,7 +1343,11 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             let body = result_text(n, text, &a.all("checks"), &a.all("option"), a.one("recommend"), &a.all("link"))?;
             emit(&[act(b, root, n, "result", &[sha], &body, &op)], json)
         }
-        "requeue" | "later" => {
+        "requeue" => {
+            let n = a.num(1)?;
+            logged(root, "requeue", text, act(b, root, n, cmd, &[], text, &op), json)
+        }
+        "later" => {
             let n = a.num(1)?;
             emit(&[act(b, root, n, cmd, &[], text, &op)], json)
         }

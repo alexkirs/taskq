@@ -37,6 +37,7 @@ Result SHA, checks, questions and blockers go to the issue as `result`, `ask`, `
    recommended), one row per `ask` and per `review` with options.
 5. `Later: [#N title](url), ...` on one line; then `Failed:` with a reason table.
 6. `Hosts: <host> v<version> <age>, ...` from heartbeats (§ 4).
+7. `Next: 1 <action> ★ · 2 <action>` from the PM, recommended first; a pick by number in text or by button in a UI ([shared Next contract](https://github.com/taskqorg/specq/blob/main/design/workflow.md#ai-assisted-controls)).
 
 Display titles at most 60 characters, reasons at most 160 and option text at most 120; show ellipsis with an issue link for the full text. Keep every row and option, counts and answer tokens; no total report cap. Cells pass one formatter: newline becomes space; `|`, `[`, `]`, `\` are escaped. Claude links:
 `https://claude.ai/code/session_<id>`. Codex links: `codex://threads/<id>` when `TASKQ_CLIENT=codex`, else
@@ -67,7 +68,7 @@ A PM manages several projects only from an owner-written list; folders are never
 A worker or reviewer is stopped only when its task is closed or parked or its attempt is replaced (§ 4). Identity is the recorded session id, never a name match. Uncommitted work is never lost: only `cleanup --force` removes it, after saving it to `<root>/.taskq/trash/taskq-<N>.patch`.
 
 ### R12. Unverified means unknown
-Follow [shared verification rules](https://github.com/taskqorg/specq/blob/main/engineering/verification.md). TaskQ readback and platform obligations are specified in §§4–8.
+Follow [shared verification rules](https://github.com/taskqorg/specq/blob/main/engineering/verification.md). TaskQ readback and platform obligations are specified in §§4–8. Chain checks are `cargo test --locked` and `taskq selftest`, both in CI; every kept test names its chain. Design prototype tests under `docs/design/` are development instruments: not in CI, not a handoff requirement, and they write evidence only on request.
 
 ### R13. Spec first
 Inherit [specq engineering rules](https://github.com/taskqorg/specq/tree/main/engineering) and its [shared-rule improvement process](https://github.com/taskqorg/specq/blob/main/engineering/spec-first.md#improve-shared-rules). TaskQ decisions live here; conflicting tasks use `ask` with options. `AGENTS.md` and `CLAUDE.md` point here. General rules belong upstream; TaskQ scenarios and gaps stay in [use cases](docs/use-cases/README.md). Design collaboration follows the [shared workflow](https://github.com/taskqorg/specq/blob/main/design/workflow.md); the [implementation brief](docs/design/implementation-brief.md) maps the accepted product to system and application work.

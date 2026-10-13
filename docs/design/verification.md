@@ -126,8 +126,8 @@ The HTML uses English and a small state/action bridge target instead of OpenAI w
 
 ## Checks for this package
 
-Run `node docs/design/menu-prototype.test.cjs`, `node docs/design/icon-studies.test.cjs`,
-`cargo test --locked`, `cargo run -- selftest`, and `git diff --check` before handoff.
+Run `cargo test --locked`, `cargo run -- selftest`, and `git diff --check` before handoff.
+The prototype tests (`node docs/design/<name>.test.cjs`, Playwright with the installed Chrome, `PLAYWRIGHT_CHANNEL=chrome` where the test does not set it) are development instruments per R12: run one when its prototype changes; they are not a handoff gate.
 Cargo checks establish current-product regression evidence, not implementation of the target menu.
 
 Observed for this package: both Node commands pass (19 menu fixture checks; icon model, render and pause checks).

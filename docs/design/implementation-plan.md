@@ -58,6 +58,7 @@ Order follows the backlog dependencies and the scenario review (shared read and 
 | 2 | WS5 | Host admission: one host authority, Auto default, optional caps, reservation lifecycle, min service version | R1, § 3, § 4, [dynamic resources](dynamic-resources.md) | G3, G1 | WS1, D03 |
 | 2 | WS6a | Emergency hold and fenced recovery: interlock, liveness reconciliation, recovery proposal and receipt | R1, R11, § 2, § 4, [emergency recovery](emergency-recovery.md) E1–E5 | G1, G2 | WS2, WS5 |
 | 2 | D-data | Data rules: a named bound and pruner for every growing file (`taskq.log`, attempt logs, `cli-errors.log`, `incidents/`, `requests/comments`), corruption tests for `status.json`, `tray.json`, `kids` and `focus` (unknown and kept, never reset), and `service install` hands live children over like § 8 step 3 | § 4, § 8, [data](https://github.com/taskqorg/specq/blob/main/engineering/data.md), [release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md#update) | G1 | WS1 |
+| 2 | T-tests | Test review per [test classes](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#test-classes): inventory every cargo test, golden trace, node test and prototype test; keep a test only with a named chain and its risk; delete the rest; prototype tests default to the installed Chrome and write evidence only on request; `cargo test --locked` and `selftest` stay the whole CI gate | R12, [delivery speed](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md#delivery-speed) | G1 | — |
 | 3 | WS6b | Access presets and `worker-policy.json`, operator-owned grants, OS negative tests; the policy store is protected from the workers it governs, migration never turns legacy configuration into grants, unknown enforcement refuses a privileged launch ([permission authority](https://github.com/taskqorg/specq/blob/main/engineering/permission-authority.md)) | R9, § 8, [worker permissions](worker-permissions.md) P1–P4 | G1 | WS6a |
 | 3 | WS4 | Recipes and owner gates over tasks; gate bound to exact revision; restart keeps the gate | § 2, § 7, [plans and decisions](plans-and-decisions.md) | G2, G4 | WS3 |
 | 3 | WS7 | Delivery presets separated from permissions; exact-SHA approval; publication receipt | § 7, [agent behavior](agent-behavior.md) B1–B5 | G4 | WS2, WS6b |
@@ -65,11 +66,25 @@ Order follows the backlog dependencies and the scenario review (shared read and 
 | 4 | WS11 | Native menu per route from `workspace-prototype.html` into `src/tray.html`: navigation, project counters, work mode, settings, AI workspace, recovery; delivered as an [F5 acceptance package](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f5-acceptance-package) and checked against [W1–W8](https://github.com/taskqorg/specq/blob/main/design/dashboards.md) | § 4 tray paragraph (condensed to a link), [menu](menu.md), [ui acceptance](ui-acceptance.md) | G8 | WS1, WS2, WS10; later routes WS3–WS7 |
 | 5 | G8 | Qualification: Windows and Linux service, tray on Windows, update path from 4.1.11, `v4.2.0` release, native matrix, docs cleanup of specq paraphrases | [ui acceptance report](ui-acceptance-report.md) | all | everything above |
 
-Batch 1 was authorized on 2026-10-14 (#886 and #888 closed the same day, #887 in work). The specq review of 2026-10-14 (agent workflow, data, performance, permission authority, fidelity, dashboards) added the D-data row and the specq links above; the approval boundary conflict was resolved in specq (delivery contract as grant) and § 7. Later batches are filed when the previous batch closes or when a slice becomes independent of it.
+Batch 1 was authorized on 2026-10-14 and closed the same day (#886, #887, #888). Batch 2 was filed on 2026-10-14 after the owner accepted the test classes, delivery speed and Next rules in specq. The specq review of 2026-10-14 (agent workflow, data, performance, permission authority, fidelity, dashboards) added the D-data row and the specq links above; the approval boundary conflict was resolved in specq (delivery contract as grant) and § 7. Later batches are filed when the previous batch closes or when a slice becomes independent of it.
 
 ## Task template
 
 Each task carries: the backlog row and design IDs; the affected R and § rules; current behavior with file references; the contract amendment made in the same PR (taskq.md first, spec size test green); the golden trace or adapter test that fails without the change; N/N-1 proof against 4.1.11; macOS evidence; and a report that separates Specified, Prototyped, Implemented and Qualified. Acceptance items name observable checks only (§ 1). Each task links the specq pages its slice touches (data, permission authority, implementation fidelity, dashboards) so the worker and reviewer check them; the task is the owner's grant for § 7 delivery and nothing beyond it. Tasks take runtime `any` and priority 1; the promo-video tasks stay 2.
+
+## Batch 2 tasks
+
+**WS3 held creation.** `add` holds a task before it is eligible: a held task is on the board but not `ready`; bulk create is idempotent per item with one receipt each; an explicit start moves it to the queue. Golden traces for hold, duplicate create and start.
+
+**D03 admission research.** Measured on this Mac: baseline window, sampling cadence, launch spacing, memory floor, and the service's own ceiling for CPU, memory, descriptors and disk with its behavior at the ceiling. Output is a short report with numbers and the recommended defaults for WS5; no code change.
+
+**WS5 host admission.** One host authority decides admission: Auto default from the D03 numbers, optional caps, a reservation with a lifecycle (requested, held, released) and a minimum service version. Unknown host data refuses admission with a reason.
+
+**WS6a emergency hold.** An interlock that stops new spawns, liveness reconciliation of live children, a recovery proposal with the exact operations and a receipt; E1–E5 in the same PR, with lifecycle amendments to § 2 and § 4 where the behavior changes.
+
+**D-data.** Every growing file has a named bound and a pruner; corruption of `status.json`, `tray.json`, `kids` or `focus` reads unknown and keeps the file; `service install` hands live children over like § 8 step 3.
+
+**T-tests.** Inventory every test; keep one only with a named chain and its distinct failure risk; delete the rest; prototype tests default to the installed Chrome and write evidence only on request; the CI gate stays `cargo test --locked` and `selftest`, green on the three platforms.
 
 ## Batch 1 tasks
 

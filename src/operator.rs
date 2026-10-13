@@ -620,6 +620,7 @@ mod tests {
         p
     }
 
+    // Chain: § 4 operator requests. Risk: an op outside the allowlist or project runs.
     #[test]
     fn only_allowlisted_ops_on_registered_projects_pass() {
         let ps = vec![("a".to_string(), PathBuf::from("/a")), ("b".to_string(), PathBuf::from("/b"))];
@@ -637,6 +638,7 @@ mod tests {
         assert!(validate(&json!({"op": "pause", "project": "a"}), &twice).is_err(), "an ambiguous name is refused");
     }
 
+    // Chain: § 4 operator reply to answer. Risk: a bad proposal applies.
     #[test]
     fn replies_become_answers_and_bad_proposals_fail() {
         let ps = vec![("a".to_string(), PathBuf::from("/a"))];
@@ -648,6 +650,7 @@ mod tests {
         assert_eq!(parse("{\"kind\": \"proposal\", \"text\": \"Pause a\", \"ops\": [{\"op\": \"pause\", \"project\": \"a\"}]}", &ps, None)["state"], "proposal");
     }
 
+    // Chain: § 6 incident setup disclosure. Risk: reporting enabled without disclosure.
     #[test]
     fn incident_setup_discloses_account_payload_fallback_and_opt_out() {
         let enabled = incident_disclosure(true, Some("reporter"));
@@ -661,6 +664,7 @@ mod tests {
         assert_eq!(incident_disclosure(false, Some("reporter")), ["Incident reports: disabled (incident_reports: false); nothing sent or saved"]);
     }
 
+    // Chain: § 6 shared project bootstrap. Risk: setup overwrites a file or hides an effect.
     #[test]
     fn a_setup_lists_every_effect_and_never_overwrites() {
         let root = temp("setup");
@@ -703,6 +707,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // Chain: § 2 owner comment to proposal. Risk: a comment proposes on another task or twice.
     #[test]
     fn an_owner_comment_is_one_request_and_proposes_only_on_its_task() {
         let root = temp("comments");
@@ -733,6 +738,7 @@ mod tests {
 
     /// A6: a task op carries the revision shown in `status.json`; apply passes it with an op id and keeps the receipt.
     #[cfg(unix)]
+    // Chain: § 5 tray task ops. Risk: an op applies at a stale revision or loses its receipt.
     #[test]
     fn task_ops_apply_at_the_shown_revision_and_keep_receipts() {
         use std::os::unix::fs::PermissionsExt;
@@ -755,6 +761,7 @@ mod tests {
         let _ = (fs::remove_dir_all(&install), fs::remove_dir_all(&root));
     }
 
+    // Chain: § 4 proposal apply. Risk: a proposal applies twice or without readback.
     #[test]
     fn a_proposal_applies_once_at_its_rev_with_readback() {
         let (install, root) = (temp("install"), temp("root"));

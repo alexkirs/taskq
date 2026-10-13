@@ -57,6 +57,7 @@ pub fn validate(labels: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Chain: § 1 task labels on add. Risk: conflicting priority, runtime or host labels accepted.
     #[test]
     fn catalog_and_aliases() {
         for n in FIXED { let (hex, desc) = definition(n).unwrap(); assert_eq!(hex.len(), 6); assert!(desc.contains(';')); }

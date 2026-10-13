@@ -430,6 +430,7 @@ pub fn agent_text(r: &serde_json::Value) -> String {
 mod tests {
     use super::*;
 
+    // Chain: incident runtime start. Risk: environment errors reported as taskq faults.
     #[test]
     fn incident_start_preserves_diagnostic_and_excludes_environment_errors() {
         use std::io::{Error, ErrorKind};
@@ -442,6 +443,7 @@ mod tests {
         assert!(StartError::io(Error::other("internal launch fault"), None).reportable);
     }
 
+    // Chain: § 5 taskq agents probe. Risk: unreadable output shown as a known state.
     #[test]
     fn agent_probes_read_version_and_login_or_say_unknown() {
         assert_eq!(version("2.1.296 (Claude Code)\n").as_deref(), Some("2.1.296"));
@@ -461,6 +463,7 @@ mod tests {
         assert_eq!(agent_text(&row("unknown", serde_json::Value::Null)), "codex 0.1 · login unknown");
     }
 
+    // Chain: § 8 codex-app turn end. Risk: a turn ends early or never ends.
     #[test]
     fn app_turn_ends_on_a_new_task_complete_or_a_closed_app() {
         let p = std::env::temp_dir().join(format!("taskq-rollout-{}.jsonl", std::process::id()));
@@ -476,6 +479,7 @@ mod tests {
         let _ = std::fs::remove_file(p);
     }
 
+    // Chain: § 8 runtime command and brief. Risk: wrong runtime flags, resume or worker brief.
     #[test]
     fn commands_follow_the_runtime_table() {
         let codex = vec!["-s".to_string(), "workspace-write".to_string()];

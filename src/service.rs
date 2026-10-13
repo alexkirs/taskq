@@ -791,6 +791,7 @@ mod tests {
         core::fold(n, &entries(b, n).unwrap(), false)
     }
 
+    // Chain: § 3 cross-host grace. Risk: ignored entries extend another host's lease.
     #[test]
     fn cross_host_grace_uses_only_accepted_inbox_entries() {
         for (entry, trusted, edited, grace) in [
@@ -824,6 +825,7 @@ mod tests {
         }
     }
 
+    // Chain: § 3 answered attempt across hosts. Risk: another host steals an answered attempt.
     #[test]
     fn answered_attempt_survives_other_host_until_owner_resumes() {
         let b = Fake::default();
@@ -848,6 +850,7 @@ mod tests {
         assert_eq!(task(&b, n).attempt, None, "an accepted inbox entry does not protect a stale host");
     }
 
+    // Chain: incident worker start. Risk: missing runtime or login reported as a fault.
     #[test]
     fn incident_start_requires_installed_logged_in_runtime_and_non_environment_failure() {
         use std::io::{Error, ErrorKind};
@@ -869,6 +872,7 @@ mod tests {
         }
     }
 
+    // Chain: incident lease heartbeat. Risk: one slow attempt reported as a fault.
     #[test]
     fn incident_heartbeats_require_fresh_distinct_attempts() {
         for (other_attempt, age, expected) in [(10, 0, false), (11, 0, true), (11, 301, false)] {
@@ -884,6 +888,7 @@ mod tests {
         }
     }
 
+    // Chain: incident rejected child. Risk: a replaced child reported as rejected.
     #[test]
     fn incident_rejected_child_excludes_replaced_accepted_child() {
         for rejected in [false, true] {
@@ -904,6 +909,7 @@ mod tests {
         }
     }
 
+    // Chain: incident claim readback. Risk: normal contention reported as a fault.
     #[test]
     fn incident_claim_missing_readback_excludes_normal_contention() {
         for missing in [false, true] {
@@ -921,6 +927,7 @@ mod tests {
         }
     }
 
+    // Chain: incident label loop. Risk: one relabel reported as a loop.
     #[test]
     fn incident_label_loop_requires_consecutive_matching_successful_fixes() {
         crate::incident::take_detected();
@@ -944,6 +951,7 @@ mod tests {
         assert!(crate::incident::take_detected().is_empty());
     }
 
+    // Chain: R2 § 3 two hosts one attempt. Risk: two attempts run, or a dead host blocks the task.
     #[test]
     fn two_hosts_admit_one_attempt_and_the_survivor_recovers_a_dead_host() {
         let b = Fake::default();
@@ -976,6 +984,7 @@ mod tests {
         assert_eq!(t.retries, 1);
     }
 
+    // Chain: § 7 worker exit to review. Risk: a silent exit is not gone; a result gets no reviewer.
     #[test]
     fn exit_without_result_is_gone_and_result_brings_a_reviewer() {
         let b = Fake::default();
@@ -998,6 +1007,7 @@ mod tests {
         assert_ne!(t.attempt, Some(r));
     }
 
+    // Chain: § 2 answer and requeue on a live child. Risk: a new session on answer; requeue leaves the child running.
     #[test]
     fn answer_resumes_the_same_session_and_requeue_stops_the_child() {
         let b = Fake::default();
@@ -1032,6 +1042,7 @@ mod tests {
         assert!(s.kids.is_empty());
     }
 
+    // Chain: § 2 early answer. Risk: an early answer marks the attempt gone.
     #[test]
     fn answer_before_the_asking_child_exits_resumes_without_gone() {
         let b = Fake::default();
@@ -1053,6 +1064,7 @@ mod tests {
         assert_eq!(task(&b, n).retries, 1);
     }
 
+    // Chain: § 3 admission filters. Risk: a waiting or filtered task starts.
     #[test]
     fn waiting_and_filters_hold_admission() {
         let b = Fake::default();
@@ -1072,6 +1084,7 @@ mod tests {
         assert!(b.comments(user).unwrap().is_empty() && b.issue(user).unwrap().labels.is_empty(), "no taskq label: never a task");
     }
 
+    // Chain: § 3 priority order. Risk: legacy priority labels order or filter wrong.
     #[test]
     fn canonical_and_legacy_priorities_filters_and_conflicts() {
         let b = Fake::default();
@@ -1088,6 +1101,7 @@ mod tests {
         assert!(b.comments(conflict).unwrap().is_empty(), "conflicting restriction never claimed");
     }
 
+    // Chain: § 3 p0 admission. Risk: p0 blocked by focus or passes pause.
     #[test]
     fn p0_passes_any_focus_but_not_pause_or_limits() {
         let b = Fake::default();
@@ -1105,6 +1119,7 @@ mod tests {
         assert_eq!((task(&b, p0).state, task(&b, p1).state, task(&b, other).state), (State::Doing, State::Ready, State::Ready), "p0 first; limit 1 holds");
     }
 
+    // Chain: § 3 focus and needs. Risk: a task outside focus or needs starts.
     #[test]
     fn focus_and_needs_choose_tasks() {
         let b = Fake::default();
@@ -1130,6 +1145,7 @@ mod tests {
         assert_eq!(task(&b, win).state, State::Doing);
     }
 
+    // Chain: § 8 codex-app admission. Risk: codex-app runs an unlabelled task.
     #[test]
     fn codex_app_runs_only_labelled_tasks_on_opted_in_hosts() {
         let b = Fake::default();
@@ -1145,6 +1161,7 @@ mod tests {
         assert!(task(&b, app).session.unwrap().starts_with("codex-app:- mac"));
     }
 
+    // Chain: § 3 capacity config. Risk: host override ignored or invalid limits accepted.
     #[test]
     fn capacity_merges_host_overrides_and_validates() {
         let v = json!({"limits": {"claude": 4, "codex": 4}, "load_gate": {"cpu_max": 90},
@@ -1173,6 +1190,7 @@ mod tests {
         }
     }
 
+    // Chain: § 3 load gate. Risk: starts under high load or never reopens.
     #[test]
     fn gate_holds_over_thresholds_and_reopens_after_90_s_calm() {
         let mut g = Gate::default();
@@ -1210,6 +1228,7 @@ mod tests {
         assert!(!g2.may_launch(t2));
     }
 
+    // Chain: § 3 load gate spacing. Risk: launch burst or bad counters accepted.
     #[test]
     fn gate_spaces_launches_and_rejects_bad_counters() {
         let mut g = Gate::default();
@@ -1225,6 +1244,7 @@ mod tests {
         assert_eq!(g.state(t + 30).0, "unknown");
     }
 
+    // Chain: § 3 load gate with live attempts. Risk: the gate drops leases or blocks resumes.
     #[test]
     fn load_gate_holds_claims_and_resumes_keeps_leases_and_recovers() {
         let b = Fake::default();
@@ -1275,6 +1295,7 @@ mod tests {
         assert_eq!(s.kids.len(), 2);
     }
 
+    // Chain: § 4 history events file. Risk: duplicate events or unbounded growth.
     #[test]
     fn events_append_dedup_and_trim() {
         let p = std::env::temp_dir().join(format!("taskq-events-{}", std::process::id()));
@@ -1288,6 +1309,7 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    // Chain: § 4 history across restart. Risk: a restart loses or doubles events.
     #[test]
     fn a_pass_records_close_and_failed_and_a_restart_keeps_them() {
         let root = std::env::temp_dir().join(format!("taskq-ev-{}", std::process::id()));
@@ -1332,6 +1354,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Chain: § 7 worktree cleanup. Risk: a dirty worktree is deleted.
     #[test]
     fn closed_tasks_lose_clean_worktrees_only() {
         let root = std::env::temp_dir().join(format!("taskq-prune-{}", std::process::id()));

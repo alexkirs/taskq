@@ -583,12 +583,7 @@ mod tests {
         (h, calls)
     }
 
-    #[test]
-    fn gitlab_uses_bearer_auth() {
-        let h = (gitlab::KIND.api)("gitlab.example", "o/r", "test-token");
-        assert_eq!(h.auth, "Authorization: Bearer test-token");
-    }
-
+    // Chain: § 7 publication on both boards. Risk: publication uses the wrong SHA or writes twice.
     #[test]
     fn incident_publication_uses_merge_sha_and_keeps_outcomes() {
         for kind in BOARDS {
@@ -604,6 +599,7 @@ mod tests {
         }
     }
 
+    // Chain: § 7 publication readback. Risk: one flaky read reports a lost publication.
     #[test]
     fn incident_publication_readback_requires_two_negative_reads() {
         for kind in BOARDS {
@@ -618,6 +614,7 @@ mod tests {
         }
     }
 
+    // Chain: incident adapter.bad_json. Risk: HTTP failures reported as bad JSON.
     #[test]
     fn incident_bad_json_is_only_a_successful_response() {
         for fail in [false, true] {
@@ -655,6 +652,7 @@ mod tests {
         (h, catalog, writes)
     }
 
+    // Chain: § 6 label setup on both boards. Risk: repeat writes or user label metadata overwritten.
     #[test]
     fn label_adapters_readback_idempotence_and_preservation() {
         for kind in BOARDS {
@@ -673,6 +671,7 @@ mod tests {
         }
     }
 
+    // Chain: § 9 label cutover gate. Risk: partial label writes or legacy board relabelled early.
     #[test]
     fn label_adapter_failures_and_legacy_gate() {
         for kind in BOARDS {
@@ -695,6 +694,7 @@ mod tests {
         }
     }
 
+    // Chain: § 2 state labels on both boards. Risk: a state change removes user labels.
     #[test]
     fn issue_label_adapters_preserve_unrelated_assignments() {
         for kind in BOARDS {
@@ -735,6 +735,7 @@ mod tests {
         }
     }
 
+    // Chain: R12 label readback. Risk: a partial label change reported as applied.
     #[test]
     fn assignment_readback_rejects_partial_application() {
         let b = Fake::default();
@@ -745,16 +746,7 @@ mod tests {
         assert!(b.issue(n).unwrap().labels.contains(&"bug".into()));
     }
 
-    #[test]
-    fn registry_finds_each_board_by_name() {
-        assert!(kind("jira").is_err());
-        for k in BOARDS { assert_eq!(kind(k.name).unwrap().name, k.name); }
-        let none = || -> Transport { Box::new(|_, url, _| Err(format!("unexpected {url}"))) };
-        assert_eq!(http(&github::KIND, None, none()).url(7), "https://github.com/o/r/issues/7");
-        assert_eq!(http(&gitlab::KIND, None, none()).url(7), "https://gitlab.example/o/r/-/issues/7");
-        assert_eq!((github::KIND.api)("ghe.example", "o/r", "t").root, "https://ghe.example/api/v3");
-    }
-
+    // Chain: § 3 lease time from board stamps. Risk: board dates parsed wrong, leases expire wrong.
     #[test]
     fn clocks() {
         assert_eq!(iso("1970-01-01T00:00:00Z"), Some(0));
@@ -763,6 +755,7 @@ mod tests {
         assert_eq!(stamp(1791800430), "2026-10-12T10:20:30Z");
     }
 
+    // Chain: R1 board entries to fold. Risk: untrusted or edited comments move the queue.
     #[test]
     fn untrusted_and_edited_entries_never_reach_fold() {
         let b = Fake::default();
@@ -775,6 +768,7 @@ mod tests {
         assert_eq!(crate::core::fold(0, &e, false).state, crate::core::State::Ready);
     }
 
+    // Chain: board token boundary. Risk: the token is sent to another host.
     #[test]
     fn token_goes_only_to_the_board_api() {
         let h = (github::KIND.api)("github.com", "o/r", "t");

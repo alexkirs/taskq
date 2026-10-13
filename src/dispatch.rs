@@ -213,6 +213,7 @@ mod tests {
     use super::*;
     use crate::board::Fake;
 
+    // Chain: § 5 dispatch receipt and readback. Risk: a stale or retried op writes a second entry.
     #[test]
     fn stale_revisions_and_retried_op_ids_write_nothing() {
         let (b, root) = (Fake::default(), std::env::temp_dir().join(format!("taskq-dispatch-{}", std::process::id())));

@@ -240,6 +240,7 @@ pub fn memory_available() -> Option<f64> {
 mod tests {
     use super::*;
 
+    // Chain: § 8 shared update across services. Risk: a second service downloads or misses the update.
     #[test]
     fn two_services_share_current_without_download_or_smoke() {
         struct FakeService { version: String, starts: usize }
@@ -268,6 +269,7 @@ mod tests {
         fs::remove_dir(&install).unwrap();
     }
 
+    // Chain: incident update.smoke. Risk: download failures reported as smoke failures.
     #[test]
     fn incident_smoke_detection_excludes_download_and_security_failures() {
         crate::incident::take_detected();
@@ -281,6 +283,7 @@ mod tests {
         assert!(crate::incident::take_detected().is_empty());
     }
 
+    // Chain: § 3 load gate readings. Risk: load read wrong or missing on this OS.
     #[test]
     fn load_readings_parse_and_read_on_this_host() {
         assert_eq!(proc_stat("cpu  10 2 8 70 5 1 1 3 4 0\ncpu0 1 1 1 1 1 1 1 1 1 1\n"), Some((25, 100)), "idle + iowait; guest not added");
@@ -294,6 +297,7 @@ mod tests {
         assert!(m > 0.0 && m < 100.0, "{m}");
     }
 
+    // Chain: § 8 install sweep. Risk: sweep deletes a live release or owned file.
     #[test]
     fn sweep_keeps_the_allowlist_and_live_releases() {
         let t = std::env::temp_dir().join(format!("taskq-sweep-{}", std::process::id()));

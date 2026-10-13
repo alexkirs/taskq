@@ -194,7 +194,7 @@ Owner-facing service/tray text follows R7: counts use R6 names/order; task rows 
 ## 5. Commands
 | Command | Does |
 |---|---|
-| `taskq labels` (catalog setup/readback) / `taskq add "<title>" --goal G --acceptance A [--acceptance B..] [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 0\|1\|2] [--host H] [--later\|--hold]` / `taskq start N` | labels: setup/readback; add: new issue, prints `#<N> <state>`; start: § 1 held |
+| `taskq labels` (catalog setup/readback) / `taskq add "<title>" --goal G --acceptance A [--acceptance B..] [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 0\|1\|2] [--host H] [--later\|--hold] [--retro K]` / `taskq start N` | labels: setup/readback; add: new issue, prints `#<N> <state>`; start: § 1 held |
 | `taskq ask N --text Q [--option O..] [--recommend K] [--link URL..]` | question card |
 | `taskq answer N --text A` / `taskq answer N.K [M.K..]` | owner's answer or option pick, all checked first |
 | `taskq result N --sha SHA [--checks C] [--text T] [--option O..] [--recommend K] [--link URL..]` | hand in; full 40-hex SHA |
@@ -202,7 +202,7 @@ Owner-facing service/tray text follows R7: counts use R6 names/order; task rows 
 | `taskq later N [--text T]` / `taskq failed N --text R` | park / hold |
 | `taskq close N [M..] [--text VERDICT]` | publish (§ 7) and close; one failure does not stop the rest |
 | `taskq status [--only L,..] [--json]` | R6 report of tasks with one of the labels (none: all); no write. `--json`: the snapshot: `schema` 1, `source` board, `observed` board time, `complete` and `reason`, `board` identity, `totals` per open state (null when incomplete, never zero), `tasks` (labels, session, deps, card), `hosts`, `capabilities` |
-| `taskq inbox N` | task text, folded state and the log (a requeue says what to fix); no write |
+| `taskq inbox N` / `taskq retro` | task text, folded state and the log (a requeue says what to fix); `retro`: numbered recommendations from the owner request log and the use cases, `add --retro K` files recommendation K (fields from K, no title/goal/acceptance); no write |
 | `taskq wait [--window MIN] [--only L,..]` | PM: block until a task moves to `ask`, `review` with options, closed or `failed`; print `ask #N` etc. or `tick` |
 | `taskq cleanup [--force]` | remove clean worktrees and branches of closed tasks; `--force` also dirty ones (R11) |
 | `taskq update [--check]` | § 8 update (coreq) and sweep once |

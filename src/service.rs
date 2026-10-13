@@ -36,6 +36,11 @@ pub fn is_task(i: &Issue) -> bool {
     i.trusted && i.labels.iter().any(|l| l == TASK_LABEL)
 }
 
+/// A held task (§ 1): labelled `q-held` without `taskq`, so no version admits it; listed as `held` whatever its log.
+pub fn is_held(i: &Issue) -> bool {
+    i.trusted && !is_task(i) && i.labels.iter().any(|l| l == "q-held")
+}
+
 pub fn is_host(i: &Issue) -> bool {
     i.labels.iter().any(|l| l == HOST_LABEL) && i.title.starts_with("taskq host ")
 }
@@ -120,7 +125,7 @@ pub fn views(board: &dyn Board, cache: &mut HashMap<u64, (i64, Vec<Comment>)>) -
     let open: HashSet<u64> = issues.iter().map(|i| i.number).collect();
     let (hosts, tasks): (Vec<Issue>, Vec<Issue>) = issues.into_iter().filter(|i| i.trusted).partition(is_host);
     let mut out = vec![];
-    for issue in tasks.into_iter().filter(is_task) {
+    for issue in tasks.into_iter().filter(|i| is_task(i) || is_held(i)) {
         let comments = match cache.get(&issue.number) {
             Some((u, c)) if *u == issue.updated => c.clone(),
             _ => board.comments(issue.number)?,
@@ -128,7 +133,11 @@ pub fn views(board: &dyn Board, cache: &mut HashMap<u64, (i64, Vec<Comment>)>) -
         cache.insert(issue.number, (issue.updated, comments.clone()));
         let log: Vec<_> = comments.iter().filter(|c| c.trusted).map(|c| core::Entry { id: c.id, body: c.body.clone(), edited: c.edited }).collect();
         let open_deps: Vec<u64> = core::depends(&issue.body).into_iter().filter(|d| open.contains(d)).collect();
-        out.push(View { task: core::fold(issue.number, &log, !open_deps.is_empty()), issue, comments, log, open_deps });
+        let mut task = core::fold(issue.number, &log, !open_deps.is_empty());
+        if is_held(&issue) {
+            task.state = State::Held;
+        }
+        out.push(View { task, issue, comments, log, open_deps });
     }
     Ok((out, hosts))
 }

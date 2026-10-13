@@ -56,6 +56,9 @@ impl Receipt {
     fn new(n: u64, op: &Op, outcome: &'static str, reason: impl Into<String>, next: impl Into<String>) -> Receipt {
         Receipt { task: n, op_id: op.id.clone(), outcome, state: None, revision: None, reason: reason.into(), next: next.into(), extra: String::new() }
     }
+    pub fn accepted(n: u64, op: &Op, state: State, revision: u64) -> Receipt {
+        Receipt { state: Some(state.name()), revision: Some(revision), ..Receipt::new(n, op, "accepted", "", "") }
+    }
     pub fn rejected(n: u64, op: &Op, reason: impl Into<String>) -> Receipt {
         Receipt::new(n, op, "rejected", reason, "Check the input and board/service status, then retry; use `taskq help` for syntax.")
     }
@@ -74,10 +77,6 @@ impl Receipt {
     pub fn json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
-    /// For callers that chain writes: the error text unless accepted.
-    pub fn result(self) -> Res<Receipt> {
-        if self.ok() { Ok(self) } else { Err(self.reason) }
-    }
 }
 
 /// R4: append one entry that `fold` accepts, set the projected label, poke the local service. A seen op id returns
@@ -94,7 +93,7 @@ pub fn act(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: 
     };
     let before = fold(n, &log, deps);
     let rev = core::revision(n, &log);
-    let accepted = |s: State, rev: u64| Receipt { state: Some(s.name()), revision: Some(rev), ..Receipt::new(n, op, "accepted", "", "") };
+    let accepted = |s: State, rev: u64| Receipt::accepted(n, op, s, rev);
     if let Some(id) = &op.id
         && log.iter().any(|e| !e.edited && core::op_id(n, &e.body) == Some(id.as_str()))
     {

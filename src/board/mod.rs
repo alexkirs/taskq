@@ -1,5 +1,5 @@
-//! Board adapters (taskq.md § 1, § 2): GitHub and GitLab issues through the OS `curl`, and an in-memory board for
-//! tests. Every write is a native board object; nothing else is state.
+//! Board contract (taskq.md § 1, § 2, § 9): the `Board` trait, shared HTTP through the OS `curl`, the registry of
+//! board modules (`github`, `gitlab`) and an in-memory board for tests. Every write is a native board object; nothing else is state.
 
 use crate::core::Entry;
 use serde_json::{Value, json};
@@ -114,7 +114,7 @@ impl Reply {
     }
     fn json(&self) -> Result<Value> {
         serde_json::from_str(&self.body).map_err(|e| {
-            crate::incident::detect("adapter.bad_json", concat!("src/board.rs:", line!()), "none", &[self.operation], &["http:2xx"]);
+            crate::incident::detect("adapter.bad_json", concat!(file!(), ":", line!()), "none", &[self.operation], &["http:2xx"]);
             format!("bad JSON from board: {e}")
         })
     }
@@ -185,23 +185,8 @@ fn curl(method: &str, url: &str, auth: &str, body: Option<&Value>) -> Result<Rep
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum Kind {
-    GitHub,
-    GitLab,
-}
-
-pub struct Http {
-    kind: Kind,
-    api: String,
-    auth: String,
-    me: RefCell<Option<String>>,
-    clock: RefCell<i64>,
-    members: RefCell<Vec<(u64, bool)>>,
-    label_schema: RefCell<Option<bool>>,
-    #[cfg(test)]
-    transport: Option<Box<dyn Fn(&str, &str, Option<Value>) -> Result<Reply>>>,
-}
+pub mod github;
+pub mod gitlab;
 
 fn s(v: &Value, k: &str) -> String {
     v[k].as_str().unwrap_or_default().to_string()
@@ -209,10 +194,6 @@ fn s(v: &Value, k: &str) -> String {
 
 fn names(v: &Value, k: &str) -> Vec<String> {
     v.as_array().into_iter().flatten().map(|x| x.as_str().map(String::from).unwrap_or_else(|| s(x, k))).collect()
-}
-
-fn trusted(v: &Value) -> bool {
-    matches!(v["author_association"].as_str(), Some("OWNER" | "MEMBER" | "COLLABORATOR"))
 }
 
 fn verify_assignment(board: &dyn Board, n: u64, add: &[String], remove: &[String]) -> Result<()> {
@@ -231,33 +212,76 @@ fn label_matches(v: &Value, name: &str, color: &str, description: &str) -> bool 
     v["name"] == name && s(v, "color").trim_start_matches('#').eq_ignore_ascii_case(color) && v["description"] == description
 }
 
-fn csv(v: &[String]) -> String {
-    v.join(",")
+
+// ---------- boards ----------
+
+/// One board: its setup facts and constructors. Each lives in its own module (taskq.md § 9); nothing outside a
+/// board module branches on which board it is.
+pub struct Kind {
+    /// `board` in `taskq.json`.
+    pub name: &'static str,
+    /// The login CLI and the env that names its host.
+    pub cli: &'static str,
+    pub host_env: &'static str,
+    /// The user name field of the CLI's `api user`.
+    pub user_key: &'static str,
+    pub default_host: &'static str,
+    /// CLI arguments that print the current folder's repository, if the CLI has them.
+    pub repo_view: Option<&'static [&'static str]>,
+    token: fn(&coreq::Tool, &str) -> Result<String>,
+    api: fn(&str, &str, &str) -> Api,
+    board: fn(Api) -> Box<dyn Board>,
 }
 
-impl Http {
-    /// `repo` is `owner/name`; `host` is the web host (`github.com` or a GitLab host).
-    pub fn new(kind: Kind, host: &str, repo: &str, token: &str) -> Http {
-        let (api, auth) = match kind {
-            Kind::GitHub if host == "github.com" || host.is_empty() => (format!("https://api.github.com/repos/{repo}"), format!("Authorization: Bearer {token}")),
-            Kind::GitHub => (format!("https://{host}/api/v3/repos/{repo}"), format!("Authorization: Bearer {token}")),
-            Kind::GitLab => (format!("https://{host}/api/v4/projects/{}", repo.replace('/', "%2F")), format!("Authorization: Bearer {token}")),
-        };
-        Http { kind, api, auth, me: RefCell::new(None), clock: RefCell::new(0), members: RefCell::new(vec![]), label_schema: RefCell::new(None), #[cfg(test)] transport: None }
-    }
+pub const BOARDS: [&Kind; 2] = [&github::KIND, &gitlab::KIND];
 
-    pub fn set_label_schema(&mut self, schema: Option<&str>) -> Result<()> {
-        *self.label_schema.borrow_mut() = match schema {
-            None => None, Some("canonical") => Some(true), Some("legacy") => Some(false),
-            Some(s) => return Err(format!("unknown label_schema {s}; expected canonical|legacy")),
-        };
-        Ok(())
+pub fn kind(name: &str) -> Result<&'static Kind> {
+    BOARDS.into_iter().find(|k| k.name == name).ok_or(format!("unknown board {name}; expected {}", BOARDS.map(|k| k.name).join("|")))
+}
+
+fn label_schema(schema: Option<&str>) -> Result<Option<bool>> {
+    match schema {
+        None => Ok(None), Some("canonical") => Ok(Some(true)), Some("legacy") => Ok(Some(false)),
+        Some(s) => Err(format!("unknown label_schema {s}; expected canonical|legacy")),
+    }
+}
+
+impl Kind {
+    /// The board of `repo` on the web `host`, with the token this board's lookup finds (§ 9).
+    pub fn open(&self, host: &str, repo: &str, schema: Option<&str>, tool: &coreq::Tool) -> Result<Box<dyn Board>> {
+        let schema = label_schema(schema)?;
+        let api = (self.api)(host, repo, &(self.token)(tool, host)?);
+        *api.label_schema.borrow_mut() = schema;
+        Ok((self.board)(api))
+    }
+}
+
+#[cfg(test)]
+type Transport = Box<dyn Fn(&str, &str, Option<Value>) -> Result<Reply>>;
+
+/// The HTTP side every board shares: one API root, its token, the board clock and cached reads.
+pub struct Api {
+    /// `https://api.github.com/repos/o/r`, `https://host/api/v4/projects/o%2Fr`
+    base: String,
+    /// `https://api.github.com`, `https://host/api/v4`: the token goes nowhere else.
+    root: String,
+    auth: String,
+    me: RefCell<Option<String>>,
+    clock: RefCell<i64>,
+    label_schema: RefCell<Option<bool>>,
+    #[cfg(test)]
+    transport: Option<Transport>,
+}
+
+impl Api {
+    fn new(root: String, base: String, token: &str) -> Api {
+        Api { base, root, auth: format!("Authorization: Bearer {token}"), me: RefCell::new(None), clock: RefCell::new(0), label_schema: RefCell::new(None), #[cfg(test)] transport: None }
     }
 
     fn call(&self, method: &str, url: &str, body: Option<Value>) -> Result<Reply> {
         // absolute URLs come from pagination headers: the token goes only to the configured API
-        let url = if url.starts_with("https://") { url.to_string() } else { format!("{}{url}", self.api) };
-        if !url.starts_with(&format!("{}/", self.root())) {
+        let url = if url.starts_with("https://") { url.to_string() } else { format!("{}{url}", self.base) };
+        if !url.starts_with(&format!("{}/", self.root)) {
             return Err(format!("refused: {url} is outside the board API"));
         }
         #[cfg(test)]
@@ -280,168 +304,24 @@ impl Http {
         Ok(out)
     }
 
-    fn root(&self) -> &str {
-        // https://host/api/v4/projects/x -> https://host/api/v4
-        self.api.split_once("/projects/").map(|(a, _)| a).or_else(|| self.api.split_once("/repos/").map(|(a, _)| a)).unwrap_or(&self.api)
+    /// The board user, `key` its name field.
+    fn me(&self, key: &str) -> Result<String> {
+        if let Some(m) = self.me.borrow().clone() {
+            return Ok(m);
+        }
+        let v = self.call("GET", &format!("{}/user", self.root), None)?.json()?;
+        let m = s(&v, key);
+        *self.me.borrow_mut() = Some(m.clone());
+        Ok(m)
     }
 
-    fn parse_issue(&self, v: &Value) -> Issue {
-        let gl = self.kind == Kind::GitLab;
-        Issue {
-            number: v[if gl { "iid" } else { "number" }].as_u64().unwrap_or(0),
-            title: s(v, "title"),
-            body: s(v, if gl { "description" } else { "body" }),
-            labels: names(&v["labels"], "name"),
-            assignees: names(&v["assignees"], if gl { "username" } else { "login" }),
-            updated: iso(&s(v, "updated_at")).unwrap_or(0),
-            open: matches!(v["state"].as_str(), Some("open" | "opened")),
-            trusted: if gl { self.member(v["author"]["id"].as_u64().unwrap_or(0)) } else { trusted(&v) },
+    fn now(&self, key: &str) -> Result<i64> {
+        if *self.clock.borrow() == 0 {
+            self.me(key)?;
         }
+        Ok(*self.clock.borrow())
     }
 
-    /// GitLab Reporter+ (access level 20), cached per author id.
-    fn member(&self, user: u64) -> bool {
-        if let Some((_, ok)) = self.members.borrow().iter().find(|(u, _)| *u == user) {
-            return *ok;
-        }
-        let ok = self.call("GET", &format!("/members/all/{user}"), None).ok().and_then(|r| r.json().ok())
-            .is_some_and(|v| v["access_level"].as_u64().unwrap_or(0) >= 20);
-        self.members.borrow_mut().push((user, ok));
-        ok
-    }
-
-    /// CI on `sha`: Ok(None) green, Ok(Some(msg)) failed, Err pending or missing.
-    fn ci(&self, sha: &str) -> Result<Option<String>> {
-        if self.kind == Kind::GitLab {
-            let v = self.call("GET", &format!("/repository/commits/{sha}"), None)?.json()?;
-            return match v["last_pipeline"]["status"].as_str() {
-                Some("success") => Ok(None),
-                Some(st @ ("failed" | "canceled")) => Ok(Some(format!("CI {st} on {sha}"))),
-                Some(st) => Err(format!("CI {st} on {sha}")),
-                None => Err(format!("no CI on {sha}")),
-            };
-        }
-        let runs = self.call("GET", &format!("/commits/{sha}/check-runs?per_page=100"), None)?.json()?;
-        let runs = runs["check_runs"].as_array().cloned().unwrap_or_default();
-        let status = self.call("GET", &format!("/commits/{sha}/status"), None)?.json()?;
-        let statuses = status["total_count"].as_u64().unwrap_or(0);
-        if runs.is_empty() && statuses == 0 {
-            return Err(format!("no CI on {sha}"));
-        }
-        if let Some(r) = runs.iter().find(|r| r["status"] != "completed") {
-            return Err(format!("CI {} pending on {sha}", s(r, "name")));
-        }
-        if let Some(r) = runs.iter().find(|r| !matches!(r["conclusion"].as_str(), Some("success" | "neutral" | "skipped"))) {
-            return Ok(Some(format!("CI {} {} on {sha}", s(r, "name"), s(r, "conclusion"))));
-        }
-        match status["state"].as_str() {
-            _ if statuses == 0 => Ok(None),
-            Some("success") => Ok(None),
-            Some("pending") => Err(format!("CI pending on {sha}")),
-            st => Ok(Some(format!("CI {} on {sha}", st.unwrap_or("unknown")))),
-        }
-    }
-
-    fn publication_ancestry(&self, sha: &str, mode: &str) {
-        // Only the immediate read in this close qualifies; later main changes are not incidents.
-        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) { return; }
-        let on_main = if self.kind == Kind::GitLab {
-            self.call("GET", &format!("/repository/merge_base?refs[]=main&refs[]={sha}"), None)
-                .and_then(|r| r.json()).and_then(|v| {
-                    let id = v["id"].as_str().filter(|id| id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit())).ok_or("unknown merge base")?;
-                    Ok(id == sha)
-                })
-        } else {
-            self.call("GET", &format!("/compare/main...{sha}"), None).and_then(|r| r.json())
-                .and_then(|v| match v["status"].as_str() {
-                    Some("identical" | "behind") => Ok(true), Some("ahead" | "diverged") => Ok(false), _ => Err("unknown ancestry".into()),
-                })
-        };
-        if on_main == Ok(false) {
-            crate::incident::detect("publication.not_on_main", concat!("src/board.rs:", line!()), "none", &[mode], &["ancestry:missing"]);
-        }
-    }
-
-    fn try_publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> Result<Publish> {
-        let gl = self.kind == Kind::GitLab;
-        let branch = format!("taskq-{n}");
-        // No commit, or the SHA is already on main: verify ancestry, close.
-        let on_main = if gl {
-            self.call("GET", &format!("/repository/merge_base?refs[]=main&refs[]={sha}"), None)?.json()?["id"] == sha
-        } else {
-            matches!(self.call("GET", &format!("/compare/main...{sha}"), None)?.json()?["status"].as_str(), Some("identical" | "behind"))
-        };
-        if on_main {
-            return Ok(Publish::Done(format!("{sha} already on main")));
-        }
-        if let Some(fail) = self.ci(sha)? {
-            return Ok(Publish::Failed(fail));
-        }
-        if gl {
-            let mrs = self.call("GET", &format!("/merge_requests?source_branch={branch}&target_branch=main&state=opened"), None)?.json()?;
-            let mrs = mrs.as_array().cloned().unwrap_or_default();
-            let mr = match (mrs.len(), mode) {
-                (1, _) => mrs[0].clone(),
-                (0, "direct") => self.call("POST", "/merge_requests", Some(json!({ "source_branch": branch, "target_branch": "main", "title": title })))?.json()?,
-                (k, _) => return Ok(Publish::Failed(format!("{k} open MRs of {branch}, want exactly one"))),
-            };
-            if mr["sha"] != sha {
-                return Ok(Publish::Failed(format!("MR head {} is not the result {sha}", s(&mr, "sha"))));
-            }
-            let iid = mr["iid"].as_u64().unwrap_or(0);
-            let body = if mode == "pr" { json!({ "sha": sha, "squash": true, "squash_commit_message": format!("{title}\n\n{task_line}") }) } else { json!({ "sha": sha }) };
-            let merged = self.call("PUT", &format!("/merge_requests/{iid}/merge"), Some(body))?;
-            let back = self.call("GET", &format!("/merge_requests/{iid}"), None)?.json()?;
-            if back["state"] != "merged" {
-                if let Ok(second) = self.call("GET", &format!("/merge_requests/{iid}"), None).and_then(|r| r.json())
-                    && second["state"] != "merged"
-                {
-                    crate::incident::detect("publication.readback", concat!("src/board.rs:", line!()), "none", &[mode], &["merge:unconfirmed"]);
-                }
-            }
-            if back["state"] == "merged" {
-                let merged = merged.json().ok();
-                let target = if mode == "direct" { sha } else { merged.as_ref().and_then(|v| v["squash_commit_sha"].as_str()).unwrap_or("") };
-                self.publication_ancestry(target, mode);
-            }
-            return if back["state"] == "merged" { Ok(Publish::Done(format!("merged !{iid}"))) } else { Err(format!("!{iid} not merged yet")) };
-        }
-        if mode == "direct" {
-            let head = self.call("GET", &format!("/git/ref/heads/{branch}"), None)?.json()?;
-            if head["object"]["sha"] != sha {
-                return Ok(Publish::Failed(format!("{branch} is not at the result {sha}")));
-            }
-            self.call("PATCH", "/git/refs/heads/main", Some(json!({ "sha": sha, "force": false })))?;
-            self.publication_ancestry(sha, mode);
-            return Ok(Publish::Done(format!("main fast-forwarded to {sha}")));
-        }
-        let owner = self.api.rsplit_once("/repos/").map(|x| x.1).and_then(|r| r.split('/').next()).unwrap_or_default().to_string();
-        let prs = self.call("GET", &format!("/pulls?head={owner}:{branch}&base=main&state=open"), None)?.json()?;
-        let prs = prs.as_array().cloned().unwrap_or_default();
-        if prs.len() != 1 {
-            return Ok(Publish::Failed(format!("{} open PRs of {branch}, want exactly one", prs.len())));
-        }
-        if prs[0]["head"]["sha"] != sha {
-            return Ok(Publish::Failed(format!("PR head is not the result {sha}")));
-        }
-        let p = prs[0]["number"].as_u64().unwrap_or(0);
-        let merged = self.call("PUT", &format!("/pulls/{p}/merge"), Some(json!({ "merge_method": "squash", "sha": sha, "commit_title": format!("{title} (#{p})"), "commit_message": task_line })))?;
-        let back = self.call("GET", &format!("/pulls/{p}"), None)?.json()?;
-        if back["merged"] != true {
-            if let Ok(second) = self.call("GET", &format!("/pulls/{p}"), None).and_then(|r| r.json())
-                && second["merged"] != true
-            {
-                crate::incident::detect("publication.readback", concat!("src/board.rs:", line!()), "none", &[mode], &["merge:unconfirmed"]);
-            }
-        }
-        if back["merged"] == true {
-            if let Ok(merged) = merged.json() { self.publication_ancestry(&s(&merged, "sha"), mode); }
-        }
-        if back["merged"] == true { Ok(Publish::Done(format!("merged #{p} as {}", s(&back, "merge_commit_sha")))) } else { Err(format!("#{p} not merged yet")) }
-    }
-}
-
-impl Board for Http {
     fn canonical_labels(&self) -> Result<bool> {
         if let Some(c) = *self.label_schema.borrow() { return Ok(c); }
         let all = self.all("/labels?per_page=100")?;
@@ -450,23 +330,18 @@ impl Board for Http {
         Ok(canonical)
     }
 
-    fn ensure_labels(&self, names: &[String]) -> Result<()> {
+    /// Catalog sync: `color` renders a catalog color for the board; `write(current, payload)` creates or updates one label.
+    fn ensure_labels(&self, names: &[String], color: fn(&str) -> String, write: impl Fn(Option<&Value>, Value) -> Result<()>) -> Result<()> {
         if !self.canonical_labels()? { return Err("legacy board: catalog adoption requires all-host gate and label_schema=canonical".into()); }
         let all = self.all("/labels?per_page=100")?;
-        let gl = self.kind == Kind::GitLab;
         let mut seen = std::collections::HashSet::new();
         for name in names {
             if !seen.insert(name) { continue; }
-            let Some((color, description)) = crate::labels::definition(name) else { continue };
+            let Some((c, description)) = crate::labels::definition(name) else { continue };
             let current = all.iter().find(|v| v["name"] == name.as_str());
-            if current.is_some_and(|v| label_matches(v, name, color, &description)) { continue; }
-            let payload = json!({"name": name, "color": if gl { format!("#{color}") } else { color.into() }, "description": description});
-            let path = if let Some(v) = current {
-                if gl { format!("/labels/{}", v["id"].as_u64().ok_or("label has no id")?) }
-                else { format!("/labels/{}", encode(name)) }
-            } else { "/labels".into() };
-            let method = if current.is_none() { "POST" } else if gl { "PUT" } else { "PATCH" };
-            self.call(method, &path, Some(payload)).map_err(|e| format!("label {name} not verified; retry catalog: {e}"))?;
+            if current.is_some_and(|v| label_matches(v, name, c, &description)) { continue; }
+            write(current, json!({"name": name, "color": color(c), "description": description}))
+                .map_err(|e| format!("label {name} not verified; retry catalog: {e}"))?;
         }
         let readback = self.all("/labels?per_page=100")?;
         for name in names {
@@ -479,120 +354,28 @@ impl Board for Http {
         Ok(())
     }
 
-    fn issues(&self, since: Option<i64>) -> Result<Vec<Issue>> {
-        let gl = self.kind == Kind::GitLab;
-        let state = match (since, gl) { (Some(_), true) => "all", (Some(_), false) => "all", (None, true) => "opened", (None, false) => "open" };
-        let mut url = format!("/issues?state={state}&per_page=100");
-        if let Some(t) = since {
-            url += &format!("&{}={}", if gl { "updated_after" } else { "since" }, stamp(t));
-        }
-        Ok(self.all(&url)?.iter().filter(|v| v.get("pull_request").is_none()).map(|v| self.parse_issue(v)).collect())
-    }
-
-    fn issue(&self, n: u64) -> Result<Issue> {
-        Ok(self.parse_issue(&self.call("GET", &format!("/issues/{n}"), None)?.json()?))
-    }
-
-    fn comments(&self, n: u64) -> Result<Vec<Comment>> {
-        let gl = self.kind == Kind::GitLab;
-        let url = if gl { format!("/issues/{n}/notes?sort=asc&order_by=created_at&per_page=100") } else { format!("/issues/{n}/comments?per_page=100") };
-        let mut out = vec![];
-        for v in self.all(&url)? {
-            if gl && v["system"].as_bool() == Some(true) {
-                continue;
-            }
-            let trusted = if gl {
-                self.member(v["author"]["id"].as_u64().unwrap_or(0))
-            } else {
-                trusted(&v)
-            };
-            let created = iso(&s(&v, "created_at")).unwrap_or(0);
-            out.push(Comment { id: v["id"].as_u64().unwrap_or(0), created, body: s(&v, "body"), trusted, edited: s(&v, "updated_at") != s(&v, "created_at") });
-        }
-        Ok(out)
-    }
-
-    fn comment(&self, n: u64, body: &str) -> Result<u64> {
-        let path = if self.kind == Kind::GitLab { "notes" } else { "comments" };
-        self.call("POST", &format!("/issues/{n}/{path}"), Some(json!({ "body": body })))?.json()?["id"].as_u64().ok_or("no comment id".into())
-    }
-
-    fn labels(&self, n: u64, add: &[String], remove: &[String]) -> Result<()> {
-        if !add.is_empty() && self.canonical_labels()? { self.ensure_labels(add)?; }
-        if self.kind == Kind::GitLab {
-            self.call("PUT", &format!("/issues/{n}"), Some(json!({ "add_labels": csv(add), "remove_labels": csv(remove) })))?;
-            return verify_assignment(self, n, add, remove);
-        }
-        if !add.is_empty() {
-            self.call("POST", &format!("/issues/{n}/labels"), Some(json!({ "labels": add })))?;
-        }
-        for l in remove {
-            // percent-encode: a label like `q-/../..` must not walk the API path
-            let enc: String = l.bytes().map(|c| if c.is_ascii_alphanumeric() || b"-_.~".contains(&c) { (c as char).to_string() } else { format!("%{c:02X}") }).collect();
-            match self.call("DELETE", &format!("/issues/{n}/labels/{enc}"), None) {
-                Err(e) if e.contains("HTTP 404") => {}
-                r => {
-                    r?;
-                }
-            }
-        }
-        verify_assignment(self, n, add, remove)
-    }
-
-    fn create(&self, title: &str, body: &str, labels: &[String]) -> Result<u64> {
-        if self.canonical_labels()? {
-            let mut names = crate::labels::FIXED.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-            names.extend_from_slice(labels);
-            self.ensure_labels(&names)?;
-        }
-        let gl = self.kind == Kind::GitLab;
-        let v = if gl { json!({ "title": title, "description": body, "labels": csv(labels) }) } else { json!({ "title": title, "body": body, "labels": labels }) };
-        let n = self.call("POST", "/issues", Some(v))?.json()?[if gl { "iid" } else { "number" }].as_u64().ok_or("no issue number")?;
-        verify_assignment(self, n, labels, &[])?;
-        Ok(n)
-    }
-
-    fn edit(&self, n: u64, body: &str) -> Result<()> {
-        let (m, v) = if self.kind == Kind::GitLab { ("PUT", json!({ "description": body })) } else { ("PATCH", json!({ "body": body })) };
-        self.call(m, &format!("/issues/{n}"), Some(v)).map(|_| ())
-    }
-
-    fn close(&self, n: u64) -> Result<()> {
-        let (m, v) = if self.kind == Kind::GitLab { ("PUT", json!({ "state_event": "close" })) } else { ("PATCH", json!({ "state": "closed" })) };
-        self.call(m, &format!("/issues/{n}"), Some(v)).map(|_| ())
-    }
-
-    fn now(&self) -> Result<i64> {
-        if *self.clock.borrow() == 0 {
-            self.me()?;
-        }
-        Ok(*self.clock.borrow())
-    }
-
-    fn publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> Publish {
-        match self.try_publish(n, sha, mode, title, task_line) {
-            Ok(p) => p,
-            Err(e) if e.contains("HTTP 405") || e.contains("HTTP 409") || e.contains("HTTP 422") => Publish::Failed(e),
-            Err(e) => Publish::Pending(e),
-        }
-    }
-
-    fn url(&self, n: u64) -> String {
-        let web = self.root().replace("api.github.com", "github.com").replace("/api/v4", "").replace("/api/v3", "");
-        let repo = self.api.rsplit_once("/repos/").map(|x| x.1.to_string()).or_else(|| self.api.rsplit_once("/projects/").map(|x| x.1.replace("%2F", "/"))).unwrap_or_default();
-        if self.kind == Kind::GitLab { format!("{web}/{repo}/-/issues/{n}") } else { format!("{web}/{repo}/issues/{n}") }
-    }
-
-    fn me(&self) -> Result<String> {
-        if let Some(m) = self.me.borrow().clone() {
-            return Ok(m);
-        }
-        let v = self.call("GET", &format!("{}/user", self.root()), None)?.json()?;
-        let m = s(&v, if self.kind == Kind::GitLab { "username" } else { "login" });
-        *self.me.borrow_mut() = Some(m.clone());
-        Ok(m)
+    /// The labels a new issue needs on a canonical board: the fixed catalog and its own.
+    fn creation_labels(&self, labels: &[String]) -> Result<Option<Vec<String>>> {
+        if !self.canonical_labels()? { return Ok(None); }
+        let mut names = crate::labels::FIXED.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        names.extend_from_slice(labels);
+        Ok(Some(names))
     }
 }
+
+/// `publish` outcome of a board's attempt: a refusal by the board fails, anything else is pending (§ 7).
+fn outcome(r: Result<Publish>) -> Publish {
+    match r {
+        Ok(p) => p,
+        Err(e) if e.contains("HTTP 405") || e.contains("HTTP 409") || e.contains("HTTP 422") => Publish::Failed(e),
+        Err(e) => Publish::Pending(e),
+    }
+}
+
+fn hex40(sha: &str) -> bool {
+    sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 
 pub fn stamp(t: i64) -> String {
     let (d, r) = (t.div_euclid(86400), t.rem_euclid(86400));
@@ -738,14 +521,20 @@ impl Board for Fake {
 mod tests {
     use super::*;
 
-    fn publication_board(kind: Kind, mode: &str, first_merged: bool, second_merged: Option<bool>, ancestry: Option<bool>) -> (Http, std::rc::Rc<RefCell<Vec<(String, String)>>>) {
+
+    fn http(kind: &Kind, schema: Option<bool>, transport: Transport) -> Box<dyn Board> {
+        let mut api = (kind.api)(if kind.name == "github" { "github.com" } else { "gitlab.example" }, "o/r", "test");
+        api.transport = Some(transport);
+        *api.label_schema.borrow_mut() = schema;
+        (kind.board)(api)
+    }
+    fn publication_board(kind: &'static Kind, mode: &str, first_merged: bool, second_merged: Option<bool>, ancestry: Option<bool>) -> (Box<dyn Board>, std::rc::Rc<RefCell<Vec<(String, String)>>>) {
         let calls = std::rc::Rc::new(RefCell::new(vec![]));
         let captured = calls.clone();
         let reads = RefCell::new(0);
         let comparisons = RefCell::new(0);
         let direct = mode == "direct";
-        let mut h = Http::new(kind, if kind == Kind::GitHub { "github.com" } else { "gitlab.example" }, "o/r", "fake");
-        h.transport = Some(Box::new(move |method, url, _| {
+        let h = http(kind, None, Box::new(move |method, url, _| {
             captured.borrow_mut().push((method.into(), url.into()));
             let result = "a".repeat(40);
             let merged = "b".repeat(40);
@@ -757,7 +546,7 @@ mod tests {
                     if ancestry.is_none() { return Err("HTTP 503".into()); }
                 }
                 let on_main = !initial && ancestry == Some(true);
-                if kind == Kind::GitHub { json!({"status": if on_main { "identical" } else { "ahead" }}) }
+                if kind.name == "github" { json!({"status": if on_main { "identical" } else { "ahead" }}) }
                 else { json!({"id": if on_main { if direct { result } else { merged } } else { "c".repeat(40) }}) }
             } else if url.contains("/check-runs") { json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}) }
             else if url.ends_with("/status") { json!({"total_count": 0}) }
@@ -779,13 +568,13 @@ mod tests {
 
     #[test]
     fn gitlab_uses_bearer_auth() {
-        let h = Http::new(Kind::GitLab, "gitlab.example", "o/r", "test-token");
+        let h = (gitlab::KIND.api)("gitlab.example", "o/r", "test-token");
         assert_eq!(h.auth, "Authorization: Bearer test-token");
     }
 
     #[test]
     fn incident_publication_uses_merge_sha_and_keeps_outcomes() {
-        for kind in [Kind::GitHub, Kind::GitLab] {
+        for kind in BOARDS {
             for mode in ["direct", "pr"] {
                 for ancestry in [Some(true), Some(false), None] {
                     crate::incident::take_detected();
@@ -800,7 +589,7 @@ mod tests {
 
     #[test]
     fn incident_publication_readback_requires_two_negative_reads() {
-        for kind in [Kind::GitHub, Kind::GitLab] {
+        for kind in BOARDS {
             for second in [Some(false), Some(true), None] {
                 crate::incident::take_detected();
                 let (h, calls) = publication_board(kind, "pr", false, second, Some(true));
@@ -816,7 +605,7 @@ mod tests {
     fn incident_bad_json_is_only_a_successful_response() {
         for fail in [false, true] {
             crate::incident::take_detected();
-            let mut h = Http::new(Kind::GitHub, "github.com", "o/r", "fake");
+            let mut h = (github::KIND.api)("github.com", "o/r", "fake");
             h.transport = Some(Box::new(move |_, _, _| if fail { Err("HTTP 503 malformed response".into()) }
                 else { Ok(Reply { headers: vec![], body: "private invalid JSON".into(), operation: "read" }) }));
             assert!(h.call("GET", "/issues", None).and_then(|r| r.json()).is_err());
@@ -824,19 +613,18 @@ mod tests {
         }
     }
 
-    fn label_board(kind: Kind, fail: bool, mismatch: bool) -> (Http, std::rc::Rc<RefCell<Vec<Value>>>, std::rc::Rc<RefCell<usize>>) {
+    fn label_board(kind: &'static Kind, fail: bool, mismatch: bool) -> (Box<dyn Board>, std::rc::Rc<RefCell<Vec<Value>>>, std::rc::Rc<RefCell<usize>>) {
         let catalog = std::rc::Rc::new(RefCell::new(vec![json!({"id": 99, "name": "bug", "color": "FF0000", "description": "user owned"})]));
         let writes = std::rc::Rc::new(RefCell::new(0));
         let (data, count) = (catalog.clone(), writes.clone());
-        let mut h = Http::new(kind, if kind == Kind::GitHub { "github.com" } else { "gitlab.example" }, "o/r", "test");
-        h.transport = Some(Box::new(move |method, url, body| {
+        let h = http(kind, None, Box::new(move |method, url, body| {
             assert!(url.contains("/labels"));
             if method == "GET" { return Ok(Reply { headers: vec![], operation: "read", body: json!(*data.borrow()).to_string() }); }
             assert!(matches!(method, "POST" | "PATCH" | "PUT"));
             if method == "POST" { assert!(url.ends_with("/labels")); }
-            else if kind == Kind::GitLab { assert_eq!(method, "PUT"); assert!(url.rsplit('/').next().unwrap().parse::<u64>().is_ok()); }
+            else if kind.name == "gitlab" { assert_eq!(method, "PUT"); assert!(url.rsplit('/').next().unwrap().parse::<u64>().is_ok()); }
             else { assert_eq!(method, "PATCH"); }
-            assert_eq!(body.as_ref().unwrap()["color"].as_str().unwrap().starts_with('#'), kind == Kind::GitLab);
+            assert_eq!(body.as_ref().unwrap()["color"].as_str().unwrap().starts_with('#'), kind.name == "gitlab");
             *count.borrow_mut() += 1;
             if fail && *count.borrow() == 2 { return Err("HTTP 403 denied".into()); }
             let mut v = body.unwrap();
@@ -852,7 +640,7 @@ mod tests {
 
     #[test]
     fn label_adapters_readback_idempotence_and_preservation() {
-        for kind in [Kind::GitHub, Kind::GitLab] {
+        for kind in BOARDS {
             let (h, catalog, writes) = label_board(kind, false, false);
             let mut names = crate::labels::FIXED.iter().chain(["host-win", "needs-gpu", "area-ui"].iter()).map(|s| s.to_string()).collect::<Vec<_>>();
             names.push("taskq".into());
@@ -870,7 +658,7 @@ mod tests {
 
     #[test]
     fn label_adapter_failures_and_legacy_gate() {
-        for kind in [Kind::GitHub, Kind::GitLab] {
+        for kind in BOARDS {
             let names = vec!["q-doing".into(), "q-ask".into()];
             let (h, _, writes) = label_board(kind, true, false);
             assert!(h.ensure_labels(&names).unwrap_err().contains("403"));
@@ -884,21 +672,18 @@ mod tests {
             assert_eq!(h.state_label("waiting").unwrap(), "q-waiting");
             assert!(h.ensure_labels(&names).unwrap_err().contains("all-host gate"));
             assert_eq!(*writes.borrow(), 0);
-            let (mut h, _, _) = label_board(kind, false, false);
-            h.set_label_schema(Some("canonical")).unwrap();
+            let h = http(kind, Some(true), Box::new(|_, url, _| Err(format!("unexpected {url}"))));
             assert_eq!(h.state_label("waiting").unwrap(), "q-blocked");
-            assert!(h.set_label_schema(Some("typo")).is_err());
+            assert!(label_schema(Some("typo")).is_err());
         }
     }
 
     #[test]
     fn issue_label_adapters_preserve_unrelated_assignments() {
-        for kind in [Kind::GitHub, Kind::GitLab] {
+        for kind in BOARDS {
             let labels = std::rc::Rc::new(RefCell::new(vec!["bug".to_string(), "q-ready".to_string()]));
             let data = labels.clone();
-            let mut h = Http::new(kind, if kind == Kind::GitHub { "github.com" } else { "gitlab.example" }, "o/r", "test");
-            h.set_label_schema(Some("legacy")).unwrap();
-            h.transport = Some(Box::new(move |method, url, body| {
+            let h = http(kind, Some(false), Box::new(move |method, url, body| {
                 let reply = |body: Value| Ok(Reply { headers: vec![], operation: "read", body: body.to_string() });
                 if url.contains("/members/") { return reply(json!({"access_level": 20})); }
                 if method == "GET" {
@@ -907,11 +692,11 @@ mod tests {
                 }
                 if method == "POST" && url.ends_with("/issues") {
                     let body = body.unwrap();
-                    *data.borrow_mut() = if kind == Kind::GitLab { body["labels"].as_str().unwrap().split(',').map(String::from).collect() }
+                    *data.borrow_mut() = if kind.name == "gitlab" { body["labels"].as_str().unwrap().split(',').map(String::from).collect() }
                         else { names(&body["labels"], "name") };
                     return reply(json!({"number": 7, "iid": 7}));
                 }
-                if kind == Kind::GitLab {
+                if kind.name == "gitlab" {
                     assert_eq!(method, "PUT"); assert!(url.ends_with("/issues/7"));
                     let body = body.unwrap();
                     let remove = body["remove_labels"].as_str().unwrap();
@@ -944,6 +729,16 @@ mod tests {
     }
 
     #[test]
+    fn registry_finds_each_board_by_name() {
+        assert!(kind("jira").is_err());
+        for k in BOARDS { assert_eq!(kind(k.name).unwrap().name, k.name); }
+        let none = || -> Transport { Box::new(|_, url, _| Err(format!("unexpected {url}"))) };
+        assert_eq!(http(&github::KIND, None, none()).url(7), "https://github.com/o/r/issues/7");
+        assert_eq!(http(&gitlab::KIND, None, none()).url(7), "https://gitlab.example/o/r/-/issues/7");
+        assert_eq!((github::KIND.api)("ghe.example", "o/r", "t").root, "https://ghe.example/api/v3");
+    }
+
+    #[test]
     fn clocks() {
         assert_eq!(iso("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(iso("2026-10-12T10:20:30.123Z"), Some(1791800430));
@@ -965,7 +760,7 @@ mod tests {
 
     #[test]
     fn token_goes_only_to_the_board_api() {
-        let h = Http::new(Kind::GitHub, "github.com", "o/r", "t");
+        let h = (github::KIND.api)("github.com", "o/r", "t");
         for url in ["https://evil.example/x", "https://api.github.com.evil.example/x"] {
             assert!(h.call("GET", url, None).err().is_some_and(|e| e.starts_with("refused")), "{url}");
         }

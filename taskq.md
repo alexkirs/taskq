@@ -273,7 +273,8 @@ change that N-1 cannot ignore needs a cutover like § 9. Hosts update independen
 
 ## 9. Config and cutover
 `taskq.json` beside the project root:
-- `board` `github|gitlab`; `repo` `owner/name`; `host` GitLab host.
+- `board` `github|gitlab`; `repo` `owner/name`; `host` the board's web host (default `github.com`, `gitlab.com`).
+- One module per board under `src/board/` (`github.rs`, `gitlab.rs`): its API, token lookup, login probe, CLI, env and default host. The `Board` trait and `src/board/mod.rs` (shared HTTP, registry by name) are the only contract; core, service and operator never branch on the board kind, and editing one board never touches another's module.
 - `label_schema` `canonical|legacy` (absent: legacy if the board has `priority-1|2` or `q-waiting` objects, else canonical). Both names work in priority and focus/status filters; `p0` has no legacy name; logs keep `waiting`. Canonical writes require all-host compatible release/idle approval on existing boards. Keep legacy objects and closed issues; reassign only open issues (#769 owner answer). This board is canonical since #776.
 - `publish` `direct|pr`; `workspace` `external` keeps host-owned worktrees.
 - `hosts` `{hostname: name}` (env `TASKQ_HOST` overrides); `has` `{name: [x..]}`; `limits` `{"claude": n, "codex": n, "codex-app": n}`.

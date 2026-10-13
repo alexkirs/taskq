@@ -11,7 +11,7 @@ mod service;
 #[cfg(any(target_os = "macos", windows))]
 mod tray;
 
-use board::{Board, Http, Kind, Publish, entries};
+use board::{Board, Publish, entries};
 use core::{Entry, State, Task, entry, fold, options};
 use serde_json::{Value, json};
 use service::{Config, Kid, Service};
@@ -120,11 +120,12 @@ fn load(root: &Path) -> Res<(Config, Value)> {
         Some(a) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
         None => vec!["-s".into(), "danger-full-access".into()],
     };
+    let board = board::kind(&str_or("board", "github"))?;
     let cfg = Config {
         root: root.to_path_buf(),
         install: platform::default_install(),
-        board: if v["board"] == "gitlab" { Kind::GitLab } else { Kind::GitHub },
-        web_host: str_or("host", "github.com"),
+        board,
+        web_host: str_or("host", board.default_host),
         repo: str_or("repo", ""),
         publish: str_or("publish", "pr"),
         me,
@@ -145,10 +146,7 @@ fn load(root: &Path) -> Res<(Config, Value)> {
 
 fn ctx() -> Res<Ctx> {
     let (cfg, raw) = load(&find_root()?)?;
-    let tok = platform::tool(&cfg.install).token(cfg.board == Kind::GitLab, &cfg.web_host)?;
-    let mut http = Http::new(cfg.board, &cfg.web_host, &cfg.repo, &tok);
-    http.set_label_schema(raw["label_schema"].as_str())?;
-    let board = Box::new(http);
+    let board = cfg.board.open(&cfg.web_host, &cfg.repo, raw["label_schema"].as_str(), &platform::tool(&cfg.install))?;
     Ok(Ctx { cfg, raw, board })
 }
 
@@ -1531,7 +1529,7 @@ mod tests {
         Config {
             root: std::env::temp_dir().join("taskq-main-test"),
             install: PathBuf::from("/nonexistent"),
-            board: Kind::GitHub,
+            board: &board::github::KIND,
             web_host: String::new(),
             repo: "o/r".into(),
             publish: "pr".into(),

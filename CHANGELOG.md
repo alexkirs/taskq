@@ -3,6 +3,12 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.1.2
+
+Repository moved to `taskqorg/taskq`: releases, `latest.json` and `taskq update` come from there (the old URL redirects
+for downloads; the board API does not, so `repo` in `taskq.json` must read `taskqorg/taskq`). R7 points at
+`taskqorg/specq`. No board change.
+
 ## v4.1.1
 
 In `ask`, a comment whose whole body is an option number or option text counts as `answer K`; 4.1.0 ignores it, so

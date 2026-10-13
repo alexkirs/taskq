@@ -1,7 +1,7 @@
 {
  "board": "github",
  "label_schema": "canonical",
- "repo": "alexkirs/taskq",
+ "repo": "taskqorg/taskq",
  "publish": "pr",
  "limits": {
   "claude": 4,

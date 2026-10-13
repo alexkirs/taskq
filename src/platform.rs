@@ -199,7 +199,7 @@ pub fn verify(sums: &[u8], name: &str, bytes: &[u8]) -> Result<(), String> {
 
 /// § 8 update steps: Ok(Some(version)) when a new release became current; with `check`, when one is available.
 /// Built in, never from config: project files are written by workers, so config must not choose the code hosts run.
-pub const RELEASE_REPO: &str = "alexkirs/taskq";
+pub const RELEASE_REPO: &str = "taskqorg/taskq";
 
 pub fn update(install: &Path, check: bool) -> Result<Option<String>, String> {
     let repo = RELEASE_REPO;

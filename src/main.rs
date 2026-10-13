@@ -68,7 +68,7 @@ impl Args {
         while let Some(x) = it.next() {
             match x.strip_prefix("--") {
                 Some(k) => {
-                    let val = if matches!(k, "later" | "hold" | "check" | "force" | "help" | "json") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
+                    let val = if matches!(k, "later" | "hold" | "check" | "force" | "help" | "json" | "apply") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
                     a.flags.entry(k.to_string()).or_default().push(val);
                 }
                 None => a.pos.push(x.clone()),
@@ -547,7 +547,10 @@ fn service_run(c: &Ctx) -> Res<()> {
             eprintln!("pass: {e}");
         }
         let at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let kids: Vec<Value> = s.kids.iter().map(|k| json!({"task": k.task, "attempt": k.attempt, "rt": k.rt, "pid": k.proc.id()})).collect();
+        let kids: Vec<Value> = s.kids.iter().map(|k| {
+            let unknown = s.unknown.get(&k.attempt);
+            json!({"task": k.task, "attempt": k.attempt, "rt": k.rt, "pid": k.proc.id(), "live": if unknown.is_some() { "unknown" } else { "running" }, "reason": unknown})
+        }).collect();
         let request = fs::read_to_string(d.join("focus.request")).ok();
         // § 4: runtime probes at most every 5 minutes
         if agents.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs() >= 300) {
@@ -563,7 +566,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
-            ("capacity", s.capacity_json()), ("agents", json!(agents.as_ref().map(|a| &a.1))),
+            ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("agents", json!(agents.as_ref().map(|a| &a.1))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root)))]
         {
             status[k] = v;
@@ -1063,6 +1066,8 @@ fn service(args: &Args) -> Res<()> {
             Ok(())
         }
         "capacity" => capacity_cmd(&root, args),
+        "hold" | "release" => hold_cmd(sub == "hold", args.one("text")),
+        "recover" => recover_cmd(&root, args.flags.contains_key("apply"), args.flags.contains_key("json")),
         "restart" => {
             fs::create_dir_all(&d).map_err(|e| e.to_string())?;
             fs::write(d.join("restart"), "").map_err(|e| e.to_string())?;
@@ -1105,8 +1110,60 @@ fn service(args: &Args) -> Res<()> {
             }
             Ok(())
         }
-        _ => Err("usage: taskq service install|run|focus|pause|resume|capacity|status|restart|stop|uninstall|list".into()),
+        _ => Err("usage: taskq service install|run|focus|pause|resume|capacity|hold|release|recover|status|restart|stop|uninstall|list".into()),
     }
+}
+
+/// § 4 emergency hold: write or remove `<install>/hold`, then poke every registered project so its service reads it.
+fn hold_cmd(on: bool, reason: Option<&str>) -> Res<()> {
+    let install = platform::default_install();
+    let path = install.join("hold");
+    if on {
+        let reason = reason.unwrap_or("emergency hold");
+        one_line("--text", &[reason.to_string()])?;
+        platform::write_atomic(&path, &format!("{reason}\n"))?;
+    } else if let Err(e) = fs::remove_file(&path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }) {
+        return Err(format!("hold file: {e}; still held"));
+    }
+    for r in fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter(|l| !l.is_empty()) {
+        poke(Path::new(r));
+    }
+    if !on {
+        println!("Hold released on {}; launches follow each project's focus", hostname());
+        return Ok(());
+    }
+    println!("Hold on {}: new launches refused until `taskq service release`; live children continue", hostname());
+    for o in admission::old_services(&install) {
+        println!("Not enforced: {o} is older than {}", admission::MIN_SERVICE);
+    }
+    Ok(())
+}
+
+/// § 4 recovery: list this host's interrupted attempts and their fencing ops; `--apply` writes them through the
+/// dispatcher, one receipt each. Only under a hold.
+fn recover_cmd(root: &Path, apply: bool, json: bool) -> Res<()> {
+    let c = ctx()?;
+    let hold = admission::hold(&c.cfg.install).ok_or("no emergency hold on this host; run `taskq service hold` first")?;
+    // the service's children, from a status.json at most 60 s old (§ 4); else every row is unknown
+    let p = dot(root).join("status.json");
+    let kids = match (data::json(&p), file_age(&p)) {
+        (Ok(Some(s)), Some(a)) if a <= 60 => Ok(s["kids"].as_array().cloned().unwrap_or_default()),
+        (Err(e), _) => Err(e),
+        (Ok(Some(_)), Some(a)) => Err(format!("status.json {a} s old")),
+        _ => Err("no service status".to_string()),
+    };
+    let rows = dispatch::proposal(&*c.board, &c.cfg.me, &kids)?;
+    println!("Hold: {hold}");
+    if rows.is_empty() {
+        println!("No interrupted attempts on {}", c.cfg.me);
+    }
+    for r in &rows {
+        println!("{}", r.text());
+    }
+    if !apply {
+        return Ok(());
+    }
+    emit(&dispatch::recover(&*c.board, root, &rows), json)
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -1752,16 +1809,16 @@ mod tests {
         assert!(load_unit(&u, &root).unwrap(), "live child: hand over");
         assert!(dot(&root).join("restart").exists() && !reloaded.exists(), "the running service re-execs; no reload");
         let mut adopted = runtime::Adopted(pid as i32);
-        assert_eq!(adopted.exited(), None, "the child still runs");
+        assert_eq!(adopted.exited(), Ok(None), "the child still runs");
         // the re-exec writes the kids file; the new image adopts the child, not `gone`
         fs::write(dot(&root).join("kids"), format!("pid {}\n7 41 claude {pid} 40\n", std::process::id())).unwrap();
         assert_eq!(kids_file(&root), vec![(7, 41, "claude".to_string(), pid as i32, 40)]);
-        assert_eq!(adopted.exited(), None, "adopted live");
+        assert_eq!(adopted.exited(), Ok(None), "adopted live");
         // an idle service reloads the unit, which would end a child
         fs::write(dot(&root).join("status.json"), r#"{"kids": []}"#).unwrap();
         assert!(!load_unit(&u, &root).unwrap() && reloaded.exists());
         std::thread::sleep(Duration::from_millis(200));
-        assert!(adopted.exited().is_some(), "a reload ends it");
+        assert!(adopted.exited().is_ok_and(|c| c.is_some()), "a reload ends it");
         let _ = fs::remove_dir_all(&root);
     }
 

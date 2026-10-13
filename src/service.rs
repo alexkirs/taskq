@@ -55,7 +55,7 @@ pub fn priority(i: &Issue) -> u8 {
 }
 
 /// The host named in a `spawn` session (`<rt>:<session> <host>`).
-fn host_of(t: &Task) -> Option<&str> {
+pub fn host_of(t: &Task) -> Option<&str> {
     t.session.as_deref()?.rsplit(' ').next()
 }
 
@@ -193,6 +193,10 @@ pub struct Service<'a> {
     refused: Option<(&'static str, String)>,
     /// Held reservations of the whole host at the last host write; unknown when it failed.
     host_used: Option<u32>,
+    /// The emergency hold read at the start of each pass (§ 3): refuses every launch.
+    pub hold: Option<String>,
+    /// Children whose last liveness read failed, by attempt: kept and reported unknown, never `gone` (§ 4).
+    pub unknown: HashMap<u64, String>,
 }
 
 const MONTH: i64 = 30 * 86400;
@@ -415,7 +419,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new() }
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, unknown: HashMap::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -427,7 +431,7 @@ impl<'a> Service<'a> {
     }
 
     fn may_launch(&self) -> bool {
-        self.cap.is_ok() && self.gate.may_launch(self.mono)
+        self.hold.is_none() && self.cap.is_ok() && self.gate.may_launch(self.mono)
     }
 
     fn auto(&self) -> bool {
@@ -483,6 +487,9 @@ impl<'a> Service<'a> {
             Err(e) => ("unknown", vec![("config", e.clone())]),
             Ok(_) => self.gate.state(self.mono),
         };
+        if let Some(h) = &self.hold {
+            (gate, reasons) = ("held", [vec![("hold", h.clone())], reasons].concat());
+        }
         if let Some((code, text)) = self.refused.clone().filter(|_| self.auto()) {
             gate = if code == "host" { "unknown" } else if gate == "open" { "held" } else { gate };
             reasons.push((code, text));
@@ -543,14 +550,24 @@ impl<'a> Service<'a> {
         let by_n: HashMap<u64, &View> = views.iter().map(|v| (v.issue.number, v)).collect();
         let mut touched = HashSet::new();
 
-        // 1. reap
+        self.hold = crate::admission::hold(&self.cfg.install);
+        // 1. reap; a failed read keeps the child, unknown with its reason
         let mut exited = vec![];
+        let unknown = &mut self.unknown;
         self.kids.retain_mut(|k| match k.proc.exited() {
-            Some(code) => {
+            Ok(Some(code)) => {
                 exited.push((k.task, k.attempt, code));
+                unknown.remove(&k.attempt);
                 false
             }
-            None => true,
+            Ok(None) => {
+                unknown.remove(&k.attempt);
+                true
+            }
+            Err(e) => {
+                unknown.insert(k.attempt, e);
+                true
+            }
         });
         for (n, a, code) in exited {
             if let Some(v) = by_n.get(&n)
@@ -583,6 +600,8 @@ impl<'a> Service<'a> {
             current
         });
         self.held.retain(|l| by_n.get(&l.task).is_some_and(|v| v.task.attempt == Some(l.attempt)));
+        let kids: Vec<u64> = self.kids.iter().map(|k| k.attempt).collect();
+        self.unknown.retain(|a, _| kids.contains(a));
         self.prune(&by_n);
 
         // 3. heartbeat
@@ -871,8 +890,12 @@ mod tests {
 
     struct FakeProc(Rc<RefCell<Option<i32>>>);
     impl Proc for FakeProc {
-        fn exited(&mut self) -> Option<i32> {
-            *self.0.borrow()
+        fn exited(&mut self) -> Result<Option<i32>, String> {
+            // -999: a failed read
+            match *self.0.borrow() {
+                Some(-999) => Err("read failed".into()),
+                c => Ok(c),
+            }
         }
         fn kill(&mut self) {
             *self.0.borrow_mut() = Some(-9);
@@ -1167,6 +1190,63 @@ mod tests {
         s.pass().unwrap();
         assert_eq!(*e.borrow()[1].1.borrow(), Some(-9));
         assert!(s.kids.is_empty());
+    }
+
+    // Chain: § 3 emergency hold, § 4 reconciliation and recovery. Risk: a held host launches, an unknown read is
+    // marked gone, or a recovery op is applied twice or over a newer revision.
+    #[test]
+    fn emergency_hold_refuses_launches_and_recovery_fences_attempts() {
+        use crate::dispatch::{proposal, recover};
+        let b = Fake::default();
+        let dir = std::env::temp_dir().join(format!("taskq-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = cfg("mac");
+        (c.install, c.root, c.limits) = (dir.clone(), dir.clone(), BTreeMap::from([("claude".to_string(), 3)]));
+        let (n1, n2) = (b.create("A", "", &["taskq".into()]).unwrap(), b.create("B", "", &["taskq".into()]).unwrap());
+        let e: Exits = Default::default();
+        let mut s = service(&b, &c, e.clone());
+        s.pass().unwrap();
+        let (a1, a2) = (task(&b, n1).attempt.unwrap(), task(&b, n2).attempt.unwrap());
+        // hold: a new task is not claimed, an answer is not resumed; children keep running
+        std::fs::write(dir.join("hold"), "drill\n").unwrap();
+        let n3 = b.create("C", "", &["taskq".into()]).unwrap();
+        *e.borrow()[1].1.borrow_mut() = Some(0);
+        b.comment(n2, &core::entry("ask", &[], Some(a2), "Which?\n1. x\n2. y ★")).unwrap();
+        s.pass().unwrap();
+        b.comment(n2, &core::entry("answer", &["1"], None, "x")).unwrap();
+        *e.borrow()[0].1.borrow_mut() = Some(-999); // n1's liveness read fails
+        s.pass().unwrap();
+        assert_eq!((task(&b, n3).state, task(&b, n2).state, e.borrow().len()), (State::Ready, State::Doing, 2), "held: nothing launched");
+        let cap = s.capacity_json();
+        assert_eq!((cap["gate"].as_str(), cap["reasons"][0]["code"].as_str(), cap["reasons"][0]["text"].as_str()), (Some("held"), Some("hold"), Some("drill")));
+        // reconciliation: an unknown read keeps the child and the attempt; no gone, no op
+        assert_eq!((task(&b, n1).state, task(&b, n1).attempt, s.kids.len()), (State::Doing, Some(a1), 1));
+        let kids = |s: &Service| Ok(s.kids.iter().map(|k| json!({"attempt": k.attempt, "pid": 1, "live": if s.unknown.contains_key(&k.attempt) { "unknown" } else { "running" }, "reason": s.unknown.get(&k.attempt)})).collect());
+        let rows = proposal(&b, "mac", &kids(&s)).unwrap();
+        assert_eq!(rows.iter().map(|r| (r.task, r.live.as_str(), r.revision)).collect::<Vec<_>>(), [(n1, "unknown (read failed)", None), (n2, "no child", Some(core::revision(n2, &entries(&b, n2).unwrap())))]);
+        assert!(proposal(&b, "mac", &Err("status.json 90 s old".into())).unwrap().iter().all(|r| r.revision.is_none()), "stale status: all unknown");
+        // stale recovery: the worker writes after the proposal; the op is refused and the board is unchanged
+        let before = b.comments(n2).unwrap().len();
+        b.comment(n2, &core::entry("ask", &[], Some(a2), "Again?\n1. x\n2. y ★")).unwrap();
+        let r = recover(&b, &dir, &rows);
+        assert_eq!((r.len(), r[0].outcome, b.comments(n2).unwrap().len()), (1, "stale", before + 1));
+        // a fresh proposal once n1 reads running: one receipt per op, a repeated apply writes nothing more
+        *e.borrow()[0].1.borrow_mut() = None;
+        s.pass().unwrap();
+        let rows = proposal(&b, "mac", &kids(&s)).unwrap();
+        let r = recover(&b, &dir, &rows);
+        assert_eq!(r.iter().map(|r| (r.task, r.outcome, r.state)).collect::<Vec<_>>(), [(n1, "accepted", Some("ready"))], "n2 asks: not interrupted");
+        let count = b.comments(n1).unwrap().len();
+        assert!(recover(&b, &dir, &rows).iter().all(|r| r.ok()) && b.comments(n1).unwrap().len() == count, "retried op ids");
+        // the fenced child is stopped (R11); still held, nothing relaunches
+        s.pass().unwrap();
+        assert_eq!((*e.borrow()[0].1.borrow(), s.kids.len(), e.borrow().len()), (Some(-9), 0, 2));
+        // release: admission resumes
+        std::fs::remove_file(dir.join("hold")).unwrap();
+        s.pass().unwrap();
+        assert!(task(&b, n1).attempt.is_some_and(|a| a != a1) && task(&b, n3).state == State::Doing);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Chain: § 2 early answer. Risk: an early answer marks the attempt gone.

@@ -82,6 +82,12 @@ impl Receipt {
 /// R4: append one entry that `fold` accepts, set the projected label, poke the local service. A seen op id returns
 /// the first receipt; a stale revision or a refused entry writes nothing and names the current state (§ 5).
 pub fn act(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &str, op: &Op) -> Receipt {
+    act_as(b, root, n, kind, args, text, op, own_attempt(n))
+}
+
+/// [`act`] for an entry that names `attempt` (emergency recovery fences another process's attempt, § 4).
+#[allow(clippy::too_many_arguments)]
+fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &str, op: &Op, attempt: Option<u64>) -> Receipt {
     let read = || -> Res<(board::Issue, bool, Vec<Entry>)> {
         let issue = b.issue(n)?;
         let deps = deps_open(b, &issue.body)?;
@@ -110,7 +116,7 @@ pub fn act(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: 
     if core::has_fields(text) {
         return Receipt::rejected(n, op, "text ends with an `op-id:` or `revision:` line; reword it");
     }
-    let body = core::with_fields(entry(kind, args, own_attempt(n), text), op.id.as_deref(), op.revision);
+    let body = core::with_fields(entry(kind, args, attempt, text), op.id.as_deref(), op.revision);
     log.push(Entry { id: u64::MAX, body: body.clone(), edited: false });
     if fold(n, &log, deps) == before {
         return Receipt { state: Some(before.state.name()), revision: Some(rev), ..Receipt::rejected(n, op, format!("#{n} is {}: `{kind}` not accepted", before.state.name())) };
@@ -206,6 +212,68 @@ pub fn answer_picks(b: &dyn Board, cfg: &Config, picks: &[String], op: &Op) -> R
         });
     }
     Ok(out)
+}
+
+/// One interrupted attempt of this host in the emergency recovery proposal (§ 4).
+#[derive(Debug, PartialEq)]
+pub struct Row {
+    pub task: u64,
+    pub state: &'static str,
+    pub attempt: u64,
+    /// `running pid P`, `no child` or `unknown (<reason>)`.
+    pub live: String,
+    /// The fencing op `gone attempt <attempt>` at this revision; none while liveness is unknown.
+    pub revision: Option<u64>,
+}
+
+impl Row {
+    pub fn op_id(&self) -> String {
+        format!("recover.{}.{}", self.task, self.attempt)
+    }
+    pub fn text(&self) -> String {
+        let head = format!("#{} {} attempt {}: {}", self.task, self.state, self.attempt, self.live);
+        match self.revision {
+            Some(r) => format!("{head}; op: gone attempt {} --revision {r} --op-id {}", self.attempt, self.op_id()),
+            None => format!("{head}; no op: blocks relaunch until its liveness reads"),
+        }
+    }
+}
+
+/// The recovery proposal (§ 4): every `doing` or `review` attempt of host `me`, read against the service's children
+/// (`status.json` `kids`, `Err`: unreadable or stale). Only a child read running or absent gets a fencing op.
+pub fn proposal(b: &dyn Board, me: &str, kids: &Result<Vec<serde_json::Value>, String>) -> Res<Vec<Row>> {
+    let mut rows = vec![];
+    for i in b.issues(None)?.iter().filter(|i| service::is_task(i)) {
+        let n = i.number;
+        let log = entries(b, n)?;
+        let t = fold(n, &log, false);
+        let (Some(a), Some(h)) = (t.attempt, service::host_of(&t)) else { continue };
+        if h != me || !matches!(t.state, State::Doing | State::Review) {
+            continue;
+        }
+        let kid = kids.as_ref().map(|k| k.iter().find(|k| k["attempt"].as_u64() == Some(a)));
+        let live = match &kid {
+            Err(e) => Err(e.to_string()),
+            Ok(None) => Ok("no child".to_string()),
+            Ok(Some(k)) if k["live"] == "unknown" => Err(k["reason"].as_str().unwrap_or("no reason").to_string()),
+            Ok(Some(k)) => Ok(format!("running pid {}", k["pid"])),
+        };
+        let (live, revision) = match live {
+            Ok(l) => (l, Some(core::revision(n, &log))),
+            Err(e) => (format!("unknown ({e})"), None),
+        };
+        rows.push(Row { task: n, state: t.state.name(), attempt: a, live, revision });
+    }
+    rows.sort_by_key(|r| r.task);
+    Ok(rows)
+}
+
+/// Apply the proposal's ops through [`act`]: one receipt per op; a repeated apply returns the first receipts.
+pub fn recover(b: &dyn Board, root: &Path, rows: &[Row]) -> Vec<Receipt> {
+    rows.iter().filter_map(|r| {
+        let op = Op { id: Some(r.op_id()), revision: Some(r.revision?) };
+        Some(act_as(b, root, r.task, "gone", &[], "emergency recovery: attempt fenced", &op, Some(r.attempt)))
+    }).collect()
 }
 
 #[cfg(test)]

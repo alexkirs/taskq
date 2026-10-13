@@ -265,5 +265,22 @@
    {"id": 10, "body": "taskq: later"},
    {"id": 11, "body": "taskq: requeue"},
    {"id": 12, "body": "taskq: hold"}
-  ], "expect": {"state": "ready"}}
+  ], "expect": {"state": "ready"}},
+  {"name": "emergency hold: recovery fences the running attempt; its late result is ignored", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: gone attempt 10\nemergency recovery: attempt fenced\nop-id: recover.1.10\nrevision: 10"},
+   {"id": 12, "body": "taskq: gone attempt 10\nemergency recovery: attempt fenced\nop-id: recover.1.10\nrevision: 10"},
+   {"id": 13, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"}
+  ], "expect": {"state": "ready", "retries": 1}},
+  {"name": "emergency hold: a stale recovery edits itself and the newer card stands", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: ask attempt 10\nWhich?\n1. x\n2. y ★"},
+   {"id": 12, "body": "taskq: gone attempt 10\nemergency recovery: attempt fenced\nop-id: recover.1.10\nrevision: 10\n\nignored: another write won", "edited": true}
+  ], "expect": {"state": "ask", "attempt": 10, "role": "worker", "session": "claude:s1 mac", "card": "Which?\n1. x\n2. y ★"}},
+  {"name": "emergency release: the fenced task takes a new attempt; old output stays fenced", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: gone attempt 10\nemergency recovery: attempt fenced\nop-id: recover.1.10\nrevision: 10"},
+   {"id": 12, "body": "taskq: spawn worker claude:s2 mac"},
+   {"id": 13, "body": "taskq: requeue attempt 10\nlate"}
+  ], "expect": {"state": "doing", "attempt": 12, "role": "worker", "session": "claude:s2 mac", "retries": 1}}
 ]

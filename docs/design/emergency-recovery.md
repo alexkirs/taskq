@@ -1,6 +1,6 @@
 # Emergency stop and recovery
 
-Required capability approved. E1–E5 describe the proposed mechanism for design review, not an implemented command. Product entry: MP6. Pause only blocks new admission; service restart is not recovery.
+Required capability approved. E1–E5 describe the mechanism; [taskq.md](../../taskq.md) § 3 and § 4 implement the host hold, liveness reconciliation and fenced recovery (`taskq service hold|release|recover`). The tray control, graceful/force stop, per-project held entries and selective resume remain proposals. Product entry: MP6. Pause only blocks new admission; service restart is not recovery.
 
 ## E1 Scope and review
 

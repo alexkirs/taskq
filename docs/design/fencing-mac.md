@@ -42,7 +42,7 @@ created before 10-12 and written after it; any process or session tied to #584â€
 
 ## A3. Verdict
 
-Host mac is **not fenced**. No historical taskq writer (PM, supervisor or worker with a taskq
+By evidence alone host mac is **not fenced**. No historical taskq writer (PM, supervisor or worker with a taskq
 attempt) is alive: the only taskq workers run current attempts. Still live or unknown:
 
 1. Historical Codex daemon (since 10-03 and 10-10), idle.
@@ -51,5 +51,6 @@ attempt) is alive: the only taskq workers run current attempts. Still live or un
 4. OpenAI/ImageGen ChatGPT login and the Meshy key reachable from the running Codex app.
 5. Unknown: SSH key files' GitHub registration; Google NotebookLM browser login.
 
-These are owner sessions and credentials, not taskq roles. Any stop, revoke or re-login is an
-owner decision asked in #811.
+These are owner sessions and credentials, not taskq roles.
+[Owner decision](https://github.com/alexkirs/taskq/issues/811) 2026-10-13: accept host mac as
+**fenced by policy**; owner sessions and credentials stay, #801 cites this evidence.

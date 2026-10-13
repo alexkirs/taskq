@@ -73,6 +73,7 @@ fn fault<'a>(code: &'a str, site: &'a str, runtime: &'a str, board: &'a str,
 }
 
 pub fn detect(code: &str, site: &str, runtime: &str, fields: &[&str], evidence: &[&str]) {
+    let site: &str = &site.replace('\\', "/"); // Windows file!() joins submodule paths with '\'
     #[cfg(test)]
     {
         let mut fingerprint_fields = vec![site];

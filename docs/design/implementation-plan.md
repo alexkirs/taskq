@@ -26,12 +26,14 @@ After each merge to `main`:
 cd ~/Projects/taskq && git pull --ff-only
 v=4.2.0-dev.$(date +%s)
 sed -i '' "s/^version = .*/version = \"$v\"/" Cargo.toml
-cargo build --release && target/release/taskq selftest && target/release/taskq service install
+cargo build --release && target/release/taskq selftest
 git checkout Cargo.toml Cargo.lock
+idle=$(for p in $(cat ~/.local/share/taskq/projects); do python3 -c "import json,sys; sys.exit(1 if json.load(open('$p/.taskq/status.json')).get('kids') else 0)" && { echo "$p"; break; }; done)
+(cd "$idle" && ~/Projects/taskq/target/release/taskq service install)
 for p in $(cat ~/.local/share/taskq/projects); do touch "$p/.taskq/update"; done
 ```
 
-`service install` copies the binary into `releases/<v>`, writes `current` and reloads the taskq unit; the other registered services re-exec through § 8 step 3 on their next pass (the `update` poke makes that immediate); the running tray exits because its version differs from `current` and the service starts the new one. Menu evidence for a task: `target/release/taskq tray --snapshot <dir>` from the worktree, or the live tray after the install.
+`service install` copies the binary into `releases/<v>`, writes `current` and reloads the unit of the project it runs in; that reload restarts the service without the § 8 step 3 handover, so the install runs in a registered project whose `status.json` lists no `kids` (no idle project: wait). Every other registered service re-execs through step 3 on its next pass and keeps its children (the `update` poke makes that immediate); the running tray exits because its version differs from `current` and the service starts the new one. Installing from a project with live children posts `gone` for them (seen on #886 on 2026-10-13). Menu evidence for a task: `target/release/taskq tray --snapshot <dir>` from the worktree, or the live tray after the install.
 
 Rollback to the published release:
 

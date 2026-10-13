@@ -14,7 +14,9 @@ trap 'rm -rf "$tmp"' EXIT
 TASKQ_VERSION=$version docs/shots/fixture.sh "$tmp"
 TASKQ_INSTALL=$tmp/install "$bin" tray --snapshot "$tmp/shots"
 rm -f docs/shots/*.png
-cp "$tmp/shots/popover-dark-home-16.png" "$tmp/shots/popover-dark-project-16.png" "$tmp"/shots/icon-summary-run-dark-*.png docs/shots/
+cp "$tmp/shots/popover-dark-home-16.png" "$tmp/shots/popover-dark-project-16.png" docs/shots/
+# Menu-bar size and scale differ between the owner's Mac and CI; keep the README link stable.
+cp "$tmp"/shots/icon-summary-run-dark-*.png docs/shots/icon-summary-run-dark.png
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 {
   printf '{\n  "version": "%s",\n  "sourceCommit": "%s",\n  "binarySha256": "%s",\n' "$version" "$(git rev-parse HEAD)" "$(sha "$bin")"

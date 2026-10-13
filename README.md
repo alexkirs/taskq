@@ -30,7 +30,7 @@ Your repository board is the task list; your usual AI apps do the work.
   <img src="docs/shots/popover-dark-project-16.png" alt="Project menu: questions, work, review, ready tasks and service controls" width="320">
 </p>
 <p>
-  <img src="docs/shots/icon-summary-run-dark-34pt@2x.png" alt="Summary icon with task counts and activity" height="34">
+  <img src="docs/shots/icon-summary-run-dark.png" alt="Summary icon with task counts and activity" height="34">
 </p>
 
 ### Use cases

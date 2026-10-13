@@ -1,6 +1,7 @@
 # Main, review candidates and PRs run tests; updates require trusted exact-SHA success.
 name: tests
 on:
+  workflow_dispatch:
   push:
     branches: [main, 'taskq-*']
   pull_request:

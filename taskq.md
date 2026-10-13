@@ -227,7 +227,7 @@ Accepted setup target: [installation and project locations](docs/design/setup-an
 Setup is one agent conversation per project. Resolve the project name and exact folder; inspect files, configuration, Git roots and remotes first. Preserve originals, dirty work, unknown config keys and existing ownership. Show the exact account, repository, visibility and every external effect (creation, labels, access, the incident report disclosure of § 4) and apply only after the owner confirms that exact list. Read existing GitHub repository visibility with `gh repo view` during inspection; do not ask for visibility already read. New repositories default to PRIVATE. Then verify a queue read and write and hand off to the PM. The tray's Add project holds this conversation in the menu (§ 4).
 
 ## 7. Worker, reviewer, publication
-Worker brief: task text, attempt, branch, delivery commands, this file's path (this release's URL when the root has none), the folder rule (§ 8). Rules:
+Worker brief: task text, attempt, branch, delivery commands, this file's path (this release's URL when the root has none), the folder rule (§ 8). The task is the owner's grant for this section's commit and publication steps ([shared approval boundaries](https://github.com/taskqorg/specq/blob/main/engineering/agent-workflow.md#approval-boundaries)); nothing outside them is approved. Rules:
 1. Read this file and the whole issue first. Before any code, `ask` with options when the task conflicts with a decision
    (R13), an Acceptance item is untestable or reads two ways, or the work exceeds one reviewable diff (propose a split).
 2. Workspace: `git worktree add -b taskq-<N> .worktrees/taskq-<N> origin/main` (existing branch: continue it).

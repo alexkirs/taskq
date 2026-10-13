@@ -300,3 +300,11 @@ Removed duplicate appearance view controls; shortened Chats/Sessions labels; mov
 Checks: seven browser suites passed (custom-icon, workspace, plans, resources/recipes, AI conversations, agent settings, agent behavior). Custom checks identical Summary/Custom pixels across five sizes and zero/large/unknown counts, draft isolation, apply/discard/revert, state restoration, invalid/overlapping configs and AI handoff. Cargo: 91 passed; selftest: 40 traces and formats passed, board read succeeded. Existing src/operator.rs:563 unused-Result warning remains.
 
 Visual inspection: final-home, final-work, custom-light and custom-dark. Checked navigation, readable actual-size samples versus labelled enlargement, narrow 20px wrapping and direct edit access. Native icons/windows and real agent rendering are not qualified by these browser images. Root contract: 294 lines; local links/config/build embedding and diff whitespace checks passed.
+
+## Project counters and publication qualification
+
+Restored project-scoped nonzero counters in pinned/recent and All projects; known all-zero rows contain only project identity. Unknown values remain explicit. Counter navigation binds both project and state. Added K-A7 and the ordered refactoring/API backlog.
+
+Integrated current origin/main without reverting its document cleanup or runtime fixes. Fresh validation: 93 Cargo tests and selftest (40 traces, formats and board read) passed. All eight browser suites passed, including project-counters, Custom, workspace, plans, resources, AI, Access and Delivery. Existing unused-Result warning remains. Project counter light/dark screenshots inspected at 16px and narrow 20px; counters wrap without losing the project name. Local documentation links and diff whitespace checked.
+
+This publishes specifications, prototype and implementation backlog. No native menu/backend rollout is claimed.

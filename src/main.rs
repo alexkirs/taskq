@@ -24,7 +24,7 @@ type Res<T> = Result<T, String>;
 
 const USAGE: &str = "taskq agents
  taskq labels
- taskq add <title> --goal G --acceptance A.. [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 0|1|2] [--host H] [--later] [--text T]
+ taskq add <title> --goal G --acceptance A [--acceptance B..] [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 0|1|2] [--host H] [--later] [--text T]
  taskq ask N --text Q --option O.. --recommend K [--link URL..]
  taskq answer N --text A | taskq answer N.K [M.K..]
  taskq result N --sha SHA --checks C.. --text T [--option O.. --recommend K --link URL..]
@@ -60,6 +60,16 @@ impl Args {
                 }
                 None => a.pos.push(x.clone()),
             }
+        }
+        let used = match a.pos.first().map(String::as_str) {
+            Some("close") => a.pos.len(),
+            Some("answer") if a.pos.get(1).is_some_and(|p| p.contains('.')) => a.pos.len(),
+            Some("service") if a.pos.get(1).is_some_and(|p| p == "focus") => a.pos.len(),
+            Some("service" | "add" | "ask" | "answer" | "result" | "requeue" | "later" | "failed" | "steer" | "inbox") => 2,
+            _ => 1,
+        };
+        if a.pos.len() > used {
+            return Err(format!("unused positional arguments: {}", a.pos[used..].join(" ")));
         }
         Ok(a)
     }
@@ -1542,6 +1552,21 @@ mod tests {
             poll: 60,
             update_every: 900,
             rollback_after: 600,
+        }
+    }
+
+    #[test]
+    fn unused_positionals_are_rejected() {
+        let parse = |v: &[&str]| Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(parse(&["add", "T", "--goal", "G", "--acceptance", "A", "B", "C"]).err().unwrap(), "unused positional arguments: B C");
+        assert_eq!(parse(&["inbox", "1", "extra"]).err().unwrap(), "unused positional arguments: extra");
+        assert_eq!(parse(&["selftest", "extra"]).err().unwrap(), "unused positional arguments: extra");
+        assert_eq!(parse(&["help", "extra"]).err().unwrap(), "unused positional arguments: extra");
+        assert!(parse(&["help"]).is_ok());
+        assert_eq!(parse(&["service", "status", "extra"]).err().unwrap(), "unused positional arguments: extra");
+        assert_eq!(parse(&["add", "T", "--goal", "G", "--acceptance", "A", "--acceptance", "B"]).unwrap().all("acceptance"), vec!["A", "B"]);
+        for v in [vec!["close", "1", "2"], vec!["answer", "1.1", "2.1"], vec!["service", "focus", "code", "docs"]] {
+            assert!(parse(&v).is_ok());
         }
     }
 

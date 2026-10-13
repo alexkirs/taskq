@@ -3,6 +3,10 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## Unreleased
+
+Unused positional arguments now fail with their names before any action; use repeated `--acceptance` flags so every item reaches the task. No board format change.
+
 ## v4.1.7
 
 GitLab OAuth logins (`glab` with OAuth) no longer get 401: the token goes as `Authorization: Bearer`, not

@@ -33,13 +33,13 @@ fn site(s: &str) -> bool {
     if s == "dep" { return true; }
     let Some((file, line)) = s.rsplit_once(':') else { return false };
     let Some(name) = file.strip_prefix("src/").and_then(|f| f.strip_suffix(".rs")) else { return false };
-    ["main", "board", "core", "labels", "operator", "platform", "runtime", "service", "tray", "incident"].contains(&name)
+    ["main", "board/mod", "board/github", "board/gitlab", "core", "labels", "operator", "platform", "runtime", "service", "tray", "incident"].contains(&name)
         && line.parse::<u32>().is_ok_and(|n| n > 0)
 }
 
 fn safe(f: &Fault) -> bool {
     let value = |s: &&str| CODES.contains(s) || CATALOG.contains(s) || site(s) || s.strip_prefix("release:").is_some_and(version);
-    CATALOG.contains(&f.code) && site(f.site) && matches!(f.board, "github" | "gitlab")
+    CATALOG.contains(&f.code) && site(f.site) && crate::board::BOARDS.iter().any(|k| k.name == f.board)
         && matches!(f.runtime, "none" | "claude" | "codex" | "codex-app")
         && f.fields.len() <= 8 && f.fields.iter().all(value)
         && [f.evidence, f.observed, f.inferred].into_iter().all(|a| a.len() <= 8 && a.iter().all(value))
@@ -73,6 +73,7 @@ fn fault<'a>(code: &'a str, site: &'a str, runtime: &'a str, board: &'a str,
 }
 
 pub fn detect(code: &str, site: &str, runtime: &str, fields: &[&str], evidence: &[&str]) {
+    let site: &str = &site.replace('\\', "/"); // Windows file!() joins submodule paths with '\'
     #[cfg(test)]
     {
         let mut fingerprint_fields = vec![site];
@@ -99,9 +100,10 @@ pub fn detect(code: &str, site: &str, runtime: &str, fields: &[&str], evidence: 
                 .as_ref().iter().map(|b| format!("{b:02x}")).collect();
             let mut fingerprint_fields = vec![site];
             fingerprint_fields.extend_from_slice(fields);
-            let f = fault(code, site, runtime, if v["board"] == "gitlab" { "gitlab" } else { "github" }, &fingerprint_fields, evidence, &contract[..12]);
+            let (board, github_com) = board_of(&v);
+            let f = fault(code, site, runtime, board, &fingerprint_fields, evidence, &contract[..12]);
             let mut out = if safe(&f) {
-                coreq::incident::send(&tool, &root, setting, v["board"] != "gitlab" && v["host"].as_str().unwrap_or("github.com") == "github.com", &f)
+                coreq::incident::send(&tool, &root, setting, github_com, &f)
             } else { unsafe_outcome(&f) };
             out.path = out.path.and_then(|p| p.strip_prefix(&root).ok().map(Path::to_path_buf));
             let _ = fs::create_dir_all(crate::dot(&root));
@@ -152,6 +154,13 @@ pub fn status(root: &Path) -> Value {
     fs::read(crate::dot(root).join("incident.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null)
 }
 
+/// The project's board name and whether it is github.com, where posting may reuse the board token.
+#[cfg_attr(test, allow(dead_code))]
+fn board_of(v: &Value) -> (&'static str, bool) {
+    let k = crate::board::kind(v["board"].as_str().unwrap_or("github")).unwrap_or(&crate::board::github::KIND);
+    (k.name, v["host"].as_str().unwrap_or(k.default_host) == "github.com")
+}
+
 pub fn notice(root: &Path) -> bool { context(root).is_some_and(|(_, s)| s.is_none()) }
 
 pub fn disclosure(root: Option<&Path>) -> String {
@@ -159,7 +168,7 @@ pub fn disclosure(root: Option<&Path>) -> String {
     let mut text = coreq::incident::disclosure(&tool);
     #[cfg(not(test))]
     {
-        let github = root.and_then(context).is_some_and(|(v, _)| v["board"] != "gitlab" && v["host"].as_str().unwrap_or("github.com") == "github.com");
+        let github = root.and_then(context).is_some_and(|(v, _)| board_of(&v).1);
         let account = coreq::incident::github_token(&tool, github).and_then(|token| {
             coreq::incident::GitHub::new(&tool, token).login().ok()
         });

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 pub struct Config {
     pub root: PathBuf,
     pub install: PathBuf,
-    pub board: crate::board::Kind,
+    pub board: &'static crate::board::Kind,
     pub web_host: String,
     pub repo: String,
     pub publish: String,
@@ -750,7 +750,7 @@ mod tests {
         Config {
             root: PathBuf::from("/nonexistent"),
             install: PathBuf::from("/nonexistent"),
-            board: crate::board::Kind::GitHub,
+            board: &crate::board::github::KIND,
             web_host: String::new(),
             repo: "o/r".into(),
             publish: "pr".into(),

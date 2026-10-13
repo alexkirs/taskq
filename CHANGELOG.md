@@ -3,6 +3,13 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.1.7
+
+GitLab OAuth logins (`glab` with OAuth) no longer get 401: the token goes as `Authorization: Bearer`, not
+`PRIVATE-TOKEN`. Each board is its own module (`src/board/github.rs`, `gitlab.rs`) behind the `Board` trait; core,
+service and operator no longer branch on the board kind. GitLab without `host` defaults to `gitlab.com`; setup writes
+`host` for every board. No board format change.
+
 ## v4.1.6
 
 TaskQ faults now produce sanitized, deduplicated public incident reports in `taskqorg/taskq`, through the existing

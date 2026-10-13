@@ -273,7 +273,8 @@ change that N-1 cannot ignore needs a cutover like § 9. Hosts update independen
 
 ## 9. Config and cutover
 `taskq.json` beside the project root:
-- `board` `github|gitlab`; `repo` `owner/name`; `host` GitLab host.
+- `board` `github|gitlab`; `repo` `owner/name`; `host` the board's web host (default `github.com`, `gitlab.com`).
+- One module per board under `src/board/` (`github.rs`, `gitlab.rs`): its API, token lookup, login probe, CLI, env and default host. The `Board` trait and `src/board/mod.rs` (shared HTTP, registry by name) are the only contract; core, service and operator never branch on the board kind, and editing one board never touches another's module.
 - `label_schema` `canonical|legacy` (absent: legacy if the board has `priority-1|2` or `q-waiting` objects, else canonical). Both names work in priority and focus/status filters; `p0` has no legacy name; logs keep `waiting`. Canonical writes require all-host compatible release/idle approval on existing boards. Keep legacy objects and closed issues; reassign only open issues (#769 owner answer). This board is canonical since #776.
 - `publish` `direct|pr`; `workspace` `external` keeps host-owned worktrees.
 - `hosts` `{hostname: name}` (env `TASKQ_HOST` overrides); `has` `{name: [x..]}`; `limits` `{"claude": n, "codex": n, "codex-app": n}`.
@@ -281,6 +282,6 @@ change that N-1 cannot ignore needs a cutover like § 9. Hosts update independen
 - `capacity_hosts` `{name: {"limits": {..}, "load_gate": {..}}}`: partial `limits` override the top-level ones for that host; a host `load_gate` replaces the top-level `load_gate` object; omitted gate fields are `enabled` false, `cpu_max` 85, `memory_min` 15. Valid: limits 0..u32::MAX, `cpu_max` 10..100, `memory_min` 1..95, integer percent. Absent keys keep today's behavior; nothing migrates or enables itself; old binaries ignore these keys, so use them only on hosts with a compatible version.
 - `permission_mode`, `codex` (R9); `incident_reports` `true|false` (§ 4); `pages` link wrapper base; `assignee` (login or `me`) report filter.
 - `ttl`, `poll`, `update_every`, `rollback_after`: seconds, defaults 300, 60, 900, 600.
-- Token: env `TASKQ_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token` (0600), else the `gh`/`glab` login of the board host. Never in config.
+- Token: env `TASKQ_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token` (0600), else the `gh`/`glab` login of the board host; GitLab gets it as `Authorization: Bearer` (OAuth logins included). Never in config.
 
 A cutover is one step per project, not per host: two board formats do not mix. No migration code: `CHANGELOG.md` says per release what changed on the board and what an open issue needs. An agent reads the entries from the board's version to the new one, prints a plan per open issue and collects its questions (issues the new format cannot hold) for the owner, one by one or all at once. After the owner's OK, with every old service stopped and no old children, it applies the plan with `taskq` commands and issue edits. Closed issues are never touched. New services start: Mac, then Windows. Repair is the same agent procedure for one project; it warns when `status` shows another host's fresh heartbeat.

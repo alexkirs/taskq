@@ -3,6 +3,7 @@
 //! its `rev`. One writer per file: the tray writes the request and the confirm, the service the answer. A request
 //! with `onboard` (the tray's Add project) sets up that folder (§ 6): its only op is `setup`.
 
+use crate::board::{BOARDS, Kind};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -316,11 +317,10 @@ fn cmd(prog: impl AsRef<std::ffi::OsStr>, args: &[&str], dir: &Path, env: &[(&st
     if o.status.success() { Ok(out) } else { Err(err.lines().chain(out.lines()).find(|l| !l.trim().is_empty()).unwrap_or("failed").trim().to_string()) }
 }
 
-/// The board user of the `gh`/`glab` login on `host`.
-fn account(board: &str, host: &str) -> Result<String, String> {
-    let (cli, key) = if board == "gitlab" { ("glab", "username") } else { ("gh", "login") };
-    let v: Value = serde_json::from_str(&cmd(cli, &["api", "user", "--hostname", host], &std::env::temp_dir(), &[])?).unwrap_or_default();
-    v[key].as_str().map(String::from).ok_or(format!("{cli}: no user"))
+/// The board user of the board CLI's login on `host`.
+fn account(k: &Kind, host: &str) -> Result<String, String> {
+    let v: Value = serde_json::from_str(&cmd(k.cli, &["api", "user", "--hostname", host], &std::env::temp_dir(), &[])?).unwrap_or_default();
+    v[k.user_key].as_str().map(String::from).ok_or(format!("{}: no user", k.cli))
 }
 
 /// What § 6 inspects first, for the operator: entries, Git root, remotes, uncommitted files, logins.
@@ -329,15 +329,19 @@ fn inspect(root: &Path) -> Value {
     names.sort();
     let git = root.join(".git").exists();
     let g = |a: &[&str]| if git { cmd("git", a, root, &[]).unwrap_or_default() } else { String::new() };
-    let repository = if git {
-        cmd("gh", &["repo", "view", "--json", "nameWithOwner,visibility"], root, &[])
-            .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
-            .unwrap_or_else(|e| json!({"unknown": e}))
-    } else { Value::Null };
-    let login = |b: &str, h: &str| account(b, h).unwrap_or_else(|e| format!("unknown: {e}"));
-    json!({"path": root, "entries_total": names.len(), "entries (first 40)": names.iter().take(40).collect::<Vec<_>>(), "git_root": git,
-        "github_repository": repository, "remotes": g(&["remote", "-v"]), "uncommitted_files": g(&["status", "--porcelain"]).lines().count(), "taskq_json": root.join("taskq.json").exists(),
-        "accounts": {"github.com (gh)": login("github", "github.com"), "gitlab.com (glab)": login("gitlab", "gitlab.com")}})
+    let mut v = json!({"path": root, "entries_total": names.len(), "entries (first 40)": names.iter().take(40).collect::<Vec<_>>(), "git_root": git,
+        "remotes": g(&["remote", "-v"]), "uncommitted_files": g(&["status", "--porcelain"]).lines().count(), "taskq_json": root.join("taskq.json").exists(), "accounts": {}});
+    for k in BOARDS {
+        if let Some(view) = k.repo_view {
+            v[format!("{}_repository", k.name)] = if git {
+                cmd(k.cli, view, root, &[])
+                    .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
+                    .unwrap_or_else(|e| json!({"unknown": e}))
+            } else { Value::Null };
+        }
+        v["accounts"][format!("{} ({})", k.default_host, k.cli)] = json!(account(k, k.default_host).unwrap_or_else(|e| format!("unknown: {e}")));
+    }
+    v
 }
 
 /// A checked `setup` op (§ 4 Add project).
@@ -366,8 +370,8 @@ pub fn setup(o: &Value, root: &Path) -> Result<Setup, String> {
         _ => Err(format!("{k}: one of {}", ok.join(", "))),
     };
     let plain = |v: &str, more: &str| !v.is_empty() && !v.starts_with(['-', '.', '/']) && v.chars().all(|c| c.is_ascii_alphanumeric() || "-._".contains(c) || more.contains(c));
-    let board = word("board", &["github", "gitlab"])?;
-    let host = o["host"].as_str().unwrap_or(if board == "gitlab" { "gitlab.com" } else { "github.com" }).to_string();
+    let board = word("board", &BOARDS.map(|k| k.name))?;
+    let host = o["host"].as_str().unwrap_or(crate::board::kind(&board)?.default_host).to_string();
     let repo = o["repo"].as_str().unwrap_or("").to_string();
     if !plain(&host, "") {
         return Err("host: a plain host name".into());
@@ -385,6 +389,10 @@ pub fn setup(o: &Value, root: &Path) -> Result<Setup, String> {
 }
 
 impl Setup {
+    fn kind(&self) -> &'static Kind {
+        crate::board::kind(&self.board).expect("setup() checked the board")
+    }
+
     fn git(&self) -> bool {
         self.root.join(".git").exists()
     }
@@ -400,7 +408,7 @@ impl Setup {
             v.push(format!("Run git init in {}", self.root.display()));
         }
         v.push(if self.create {
-            let who = account(&self.board, &self.host).unwrap_or_else(|e| format!("unknown account ({e})"));
+            let who = account(self.kind(), &self.host).unwrap_or_else(|e| format!("unknown account ({e})"));
             format!("Create {} repository {}/{} as {who}", if self.private { "PRIVATE" } else { "PUBLIC" }, self.host, self.repo)
         } else {
             format!("Use existing repository {}/{}", self.host, self.repo)
@@ -409,7 +417,7 @@ impl Setup {
             v.push(format!("Add git remote origin https://{}/{}.git", self.host, self.repo));
         }
         v.push(format!("Write taskq.json: board {}, repo {}, publish {}", self.board, self.repo, self.publish));
-        let who = self.incident_reports.then(|| incident_account(self.board == "github" && self.host == "github.com")).flatten();
+        let who = self.incident_reports.then(|| incident_account(self.host == "github.com")).flatten();
         v.extend(incident_disclosure(self.incident_reports, who.as_deref()));
         v.push(format!("Create the taskq labels on {}", self.repo));
         v.push(format!("Register {} on this host and install its service (starts at logon)", crate::project_name(&self.root)));
@@ -452,18 +460,15 @@ fn apply_setup(install: &Path, exe: &Path, root: &Path, ops: &[Value], shown: &V
             lines.push("git init: ok".to_string());
         }
         if s.create {
-            let (cli, env) = if s.board == "gitlab" { ("glab", "GITLAB_HOST") } else { ("gh", "GH_HOST") };
-            cmd(cli, &["repo", "create", &s.repo, if s.private { "--private" } else { "--public" }], root, &[(env, &s.host)])?;
+            let k = s.kind();
+            cmd(k.cli, &["repo", "create", &s.repo, if s.private { "--private" } else { "--public" }], root, &[(k.host_env, &s.host)])?;
             lines.push(format!("created {}/{}", s.host, s.repo));
         }
         if !s.origin() {
             cmd("git", &["remote", "add", "origin", &format!("https://{}/{}.git", s.host, s.repo)], root, &[])?;
             lines.push("origin: added".into());
         }
-        let mut c = json!({"board": s.board, "repo": s.repo, "publish": s.publish, "incident_reports": s.incident_reports});
-        if s.board == "gitlab" {
-            c["host"] = json!(s.host);
-        }
+        let c = json!({"board": s.board, "host": s.host, "repo": s.repo, "publish": s.publish, "incident_reports": s.incident_reports});
         if root.join("taskq.json").exists() {
             return Err("taskq.json appeared meanwhile: nothing overwritten".into());
         }

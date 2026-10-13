@@ -15,6 +15,8 @@ The current visual reference is [workspace-preview.html](workspace-preview.html)
 
 The package includes the remote PM scenario (UC-17), not only the desktop menu. The owner accepted all six shared workflow refinements and AI-assisted controls. Compatible shared rules: [specq 9f82cc6](https://github.com/taskqorg/specq/tree/9f82cc6). Use this revision or a compatible successor; an older copy may lack the accepted changes.
 
+[Shared blocks](shared-blocks.md): parent ownership, compact consumer variants and cross-product fidelity.
+
 ## Current package
 
 [Decision register](decision-register.md): remaining choices, numbered alternatives and recommended defaults. [Scenario review](scenario-review.md): complete supplied-case coverage, current evidence and implementation gates.

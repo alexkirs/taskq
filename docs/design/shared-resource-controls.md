@@ -2,6 +2,8 @@
 
 Accepted target under [taskq.md](../../taskq.md), extending reuse of the [answer card](answer-card.md). TaskQ owns reusable domain components; DashQ supplies layout and authorized transport. No change to live limits, admission or permissions is made by this design.
 
+Follow [shared-block inheritance B1–B4](shared-blocks.md). Compact placement does not authorize independent icons, tokens, counter layouts or simplified editors; the parent package governs visual fidelity.
+
 ## Reuse inventory
 
 | Block | Canonical owner | Shared behavior |

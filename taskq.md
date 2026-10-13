@@ -238,7 +238,7 @@ Worker brief: task text, attempt, branch, delivery commands, this file's path. R
 `result` body: `Changed: <user effect>` (1-2 lines), `Checks: <command -- outcome>` (one line per check, 1-8 lines),
 then `Open: <remaining item|none>` (1-2 lines); at most 12 lines, at most 240 characters per line. Keep exact commands and platform qualifications (R12).
 `--text` supplies literal Changed and Open lines; `--checks` supplies unprefixed command/outcome lines, each rendered with `Checks:`. SHA stays in the log header; one PR/evidence link may share Changed.
-`close --text` supplies all three labelled fields in the same order and limits; Checks names each `A<k> ok|gap|unknown` plus exact-SHA CI outcome, not a vague PASS.
+`close --text` supplies all three labelled fields in the same order and limits; Checks names each `A<k> ok` plus exact-SHA CI outcome, not a vague PASS; close is refused unless Checks names every Acceptance item A1..An as ok, and any gap or unknown item requires `requeue --text`.
 Reviewer checks every Acceptance and contract against the candidate and CI on that SHA; requeue only for Acceptance/contract gaps. Then `close --text <verdict>`, `requeue --text <exact fixes>` or `ask` with options. PM relays the verdict verbatim, links intact.
 
 `close` publication goes through the board API only:

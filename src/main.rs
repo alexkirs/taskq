@@ -345,16 +345,19 @@ fn result_text(n: u64, text: &str, checks: &[String], opts: &[String], recommend
     Ok(join(&[&verdict.join("\n"), &card]))
 }
 
-/// § 7 close verdict: Changed, Checks naming every Acceptance item `A<k> ok|gap|unknown` and CI, Open.
+/// § 7 close verdict: Changed, Checks naming every Acceptance item `A<k> ok` and CI, Open.
 fn close_verdict(text: &str, body: &str) -> Res<()> {
     let lines: Vec<String> = text.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect();
     limit("verdict", &lines, 3, 12, 240)?;
     let f = fields(text, &[("Changed", 1, 2, 240), ("Checks", 1, 8, 240), ("Open", 1, 2, 240)])?;
     limit("verdict", &f.concat(), 3, 12, 240)?;
     let checks = f[1].join(" ");
+    let tokens: Vec<_> = checks.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()).collect();
     for k in body.lines().filter_map(|l| l.trim().strip_prefix('A')?.split_once('.')?.0.parse::<u32>().ok()) {
-        if !["ok", "gap", "unknown"].iter().any(|v| checks.contains(&format!("A{k} {v}"))) {
-            return Err(format!("Checks: name A{k} ok|gap|unknown"));
+        let item = format!("A{k}");
+        let statuses: Vec<_> = tokens.windows(2).filter(|pair| pair[0] == item).map(|pair| pair[1]).collect();
+        if statuses.is_empty() || statuses.iter().any(|status| *status != "ok") {
+            return Err(format!("Checks: name A{k} ok; gap or unknown requires requeue --text"));
         }
     }
     if checks.contains("CI") { Ok(()) } else { Err("Checks: name the CI outcome on the result SHA".into()) }
@@ -383,7 +386,11 @@ fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str) -> Res<String> 
             Ok(format!("#{n} closed"))
         }
         State::Review => {
+            close_verdict(verdict, &issue.body)?;
             let sha = t.result.ok_or(format!("#{n} has no result"))?;
+            if !verdict.lines().any(|l| l.starts_with("Checks:") && l.contains("CI") && l.contains(&sha)) {
+                return Err("Checks: name the exact result SHA with the CI outcome".into());
+            }
             match b.publish(n, &sha, &cfg.publish, &issue.title, &format!("Task: {}", b.url(n))) {
                 Publish::Done(m) => {
                     act(b, &cfg.root, n, "close", &[], &join(&[verdict, &m]))?;
@@ -1433,15 +1440,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             let mut failed = false;
             for i in 1..a.pos.len() {
                 let n = a.num(i)?;
-                // § 7: a reviewed result closes with the verdict template; later/failed tasks and bare closes keep free text
-                let checked = match current(b, n) {
-                    Ok((issue, t, _)) if t.state == State::Review && !text.is_empty() => close_verdict(text, &issue.body).and_then(|_| {
-                        if t.result.as_deref().is_some_and(|sha| text.lines().any(|l| l.starts_with("Checks:") && l.contains(sha))) { Ok(()) } else { Err("Checks: name the exact result SHA with the CI outcome".into()) }
-                    }),
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(e),
-                };
-                match checked.and_then(|_| close_one(b, cfg, n, text)) {
+                match close_one(b, cfg, n, text) {
                     Ok(m) => println!("{m}"),
                     Err(e) => {
                         failed = true;
@@ -1650,6 +1649,30 @@ mod tests {
     }
 
     #[test]
+    fn close_requires_every_acceptance_ok_before_publication() {
+        let (b, c) = (Fake::default(), cfg());
+        let n = b.create("T", "## Acceptance\nA1. first\nA2. second\n", &["taskq".into()]).unwrap();
+        b.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
+        let attempt = fold(n, &entries(&b, n).unwrap(), false).attempt;
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        b.comment(n, &entry("result", &[sha], attempt, "result")).unwrap();
+        b.state.borrow_mut().publish = "failed".into(); // A publication attempt would requeue.
+        let before = b.comments(n).unwrap().len();
+        for checks in ["A1 ok", "A1 ok, A2 gap", "A1 ok, A2 unknown", "A1 ok, A2 okay", "A11 ok, A2 ok", "A1 ok, A2 ok, A2 gap"] {
+            let verdict = format!("Changed: shipped\nChecks: {checks}; CI green on {sha}\nOpen: none");
+            assert!(close_one(&b, &c, n, &verdict).is_err(), "{checks}");
+            assert!(b.issue(n).unwrap().open);
+            assert_eq!(b.comments(n).unwrap().len(), before);
+            assert_eq!(fold(n, &entries(&b, n).unwrap(), false).state, State::Review);
+        }
+        assert!(close_one(&b, &c, n, "").is_err());
+        b.state.borrow_mut().publish.clear();
+        let verdict = format!("Changed: shipped\nChecks: A1 ok, A2 ok; CI green on {sha}\nOpen: none");
+        close_one(&b, &c, n, &verdict).unwrap();
+        assert!(!b.issue(n).unwrap().open);
+    }
+
+    #[test]
     fn padded_close_verdict_is_rejected_before_publication() {
         let c = Ctx { cfg: cfg(), raw: json!({}), board: Box::new(Fake::default()) };
         let n = c.board.create("T", "A1. observable", &["taskq".into()]).unwrap();
@@ -1678,7 +1701,7 @@ mod tests {
         assert!(result_text(7, "Changed: c\nOpen: none", &[], &[], None, &[]).unwrap_err().contains("Checks: 0 lines"));
         assert!(result_text(7, "summary", &checks, &[], None, &[]).is_err());
         let body = "## Acceptance\nA1. a\nA2. b\n";
-        assert!(close_verdict("Changed: c\nChecks: A1 ok, A2 gap; CI green on abc\nOpen: A2", body).is_ok());
+        assert!(close_verdict("Changed: c\nChecks: A1 ok, A2 gap; CI green on abc\nOpen: A2", body).unwrap_err().contains("requeue"));
         assert!(close_verdict("Changed: c\nChecks: A1 ok; CI green\nOpen: none", body).unwrap_err().contains("A2"));
         assert!(close_verdict("Changed: c\nChecks: A1 ok, A2 ok\nOpen: none", body).unwrap_err().contains("CI"));
         assert!(close_verdict("A1 ok, A2 ok; c; open: none", body).is_err(), "the old one-line verdict is rejected");
@@ -1711,11 +1734,12 @@ mod tests {
         b.comment(n, &entry("result", &["0123456789abcdef0123456789abcdef01234567"], Some(a), "1. close: ship it ★\n2. redo the copy")).unwrap();
         assert_eq!(b.comments(n).unwrap().len(), before + 2);
         b.state.borrow_mut().publish = "pending".into();
-        assert!(close_one(&b, &c, n, "ok").unwrap_err().contains("pending"));
+        assert!(close_one(&b, &c, n, "Changed: shipped\nChecks: CI green on 0123456789abcdef0123456789abcdef01234567\nOpen: none").unwrap_err().contains("pending"));
         assert_eq!(fold(n, &entries(&b, n).unwrap(), false).state, State::Review, "pending CI changes nothing");
         b.state.borrow_mut().publish = String::new();
         assert!(answer_picks(&b, &c, &[format!("{n}.3")]).is_err(), "picks are checked before writing");
-        assert_eq!(answer_picks(&b, &c, &[format!("{n}.1")]).unwrap(), vec![format!("#{n} closed\nmerged 0123456789abcdef0123456789abcdef01234567")]);
+        assert!(answer_picks(&b, &c, &[format!("{n}.1")]).unwrap()[0].contains("verdict"));
+        assert_eq!(close_one(&b, &c, n, "Changed: shipped\nChecks: CI green on 0123456789abcdef0123456789abcdef01234567\nOpen: none").unwrap(), format!("#{n} closed\nmerged 0123456789abcdef0123456789abcdef01234567"));
         let i = b.issue(n).unwrap();
         assert!(!i.open && !i.labels.iter().any(|l| l.starts_with("q-")));
     }

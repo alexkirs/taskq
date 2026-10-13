@@ -757,25 +757,23 @@ fn service_run(c: &Ctx) -> Res<()> {
         let asked = fs::remove_file(d.join("update")).is_ok();
         if asked || checked.is_none_or(|t| t.elapsed().as_secs() >= cfg.update_every) {
             checked = Some(Instant::now());
-            match platform::update(&cfg.install, true) {
-                Ok(found) => {
-                    update = found;
-                    if asked {
-                        eprintln!("update requested: {}", update.as_deref().map_or("up to date".into(), |v| format!("{v} found")));
-                    }
-                }
-                Err(e) => eprintln!("update: {e}"),
-            }
-            if is_installed && update.is_some() {
-                match platform::update(&cfg.install, false) {
-                    Ok(Some(v)) => {
-                        eprintln!("updated to {v}; restarting");
+            if is_installed {
+                match platform::service_update(&cfg.install) {
+                    Ok(Some(_)) => {
                         update = None;
                         reexec(&s, cfg)?;
                     }
                     Ok(None) => update = None,
                     Err(e) => eprintln!("update: {e}"),
                 }
+            } else {
+                match platform::update(&cfg.install, true) {
+                    Ok(found) => update = found,
+                    Err(e) => eprintln!("update: {e}"),
+                }
+            }
+            if asked {
+                eprintln!("update requested: {}", update.as_deref().map_or("up to date".into(), |v| format!("{v} found")));
             }
         }
         restart_watch(&mut restart_empty, cfg!(windows) && d.join("restart").exists() && s.kids.is_empty(), began.elapsed().as_secs(), cfg.update_every);

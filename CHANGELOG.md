@@ -7,6 +7,8 @@ there is no migration code. Releases without a **Board** section need nothing.
 
 Unused positional arguments now fail with their names before any action; use repeated `--acceptance` flags so every item reaches the task. No board format change.
 
+Services sharing an install restart into a release already made current by another service, without another download or selftest. No board change.
+
 ## v4.1.7
 
 GitLab OAuth logins (`glab` with OAuth) no longer get 401: the token goes as `Authorization: Bearer`, not

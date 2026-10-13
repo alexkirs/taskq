@@ -55,6 +55,22 @@ pub fn update(install: &Path, check: bool) -> Result<Option<String>, String> {
     Ok(v)
 }
 
+/// Service step 7 also catches a release made current by another service on this install.
+pub fn service_update(install: &Path) -> Result<Option<String>, String> {
+    if let Some(v) = tool(install).current().filter(|v| coreq::update::newer(v, VERSION)) {
+        eprintln!("current is {v}; restarting");
+        return Ok(Some(v));
+    }
+    if update(install, true)?.is_some() {
+        let v = update(install, false)?;
+        if let Some(v) = &v {
+            eprintln!("updated to {v}; restarting");
+        }
+        return Ok(v);
+    }
+    Ok(None)
+}
+
 fn update_result(result: Result<Option<String>, String>) -> Result<Option<String>, String> {
     if let Err(e) = &result {
         if let Some((release, _)) = e.split_once(" selftest failed:") {
@@ -223,6 +239,34 @@ pub fn memory_available() -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_services_share_current_without_download_or_smoke() {
+        struct FakeService { version: String, starts: usize }
+        let install = std::env::temp_dir().join(format!("taskq-shared-update-{}", std::process::id()));
+        fs::create_dir_all(&install).unwrap();
+        write_atomic(&install.join("current"), VERSION).unwrap();
+        let mut first = FakeService { version: VERSION.into(), starts: 1 };
+        let mut second = FakeService { version: VERSION.into(), starts: 1 };
+        // First service's successful update publishes current; the second still runs the old image.
+        let next = "999.0.0";
+        write_atomic(&install.join("current"), next).unwrap();
+        first.version = next.into();
+        first.starts += 1;
+        assert!(coreq::update::newer(&tool(&install).current().unwrap(), &second.version));
+        if let Some(v) = service_update(&install).unwrap() {
+            second.version = v;
+            second.starts += 1;
+        }
+        assert_eq!(second.starts, 2);
+        assert_eq!(second.version, first.version);
+        // No release executable exists to smoke, and even the download directory was never created.
+        assert!(!install.join("releases").exists());
+        assert!(!coreq::update::newer(next, &tool(&install).current().unwrap()));
+        assert_eq!(fs::read_to_string(install.join("current")).unwrap().trim(), next);
+        fs::remove_file(install.join("current")).unwrap();
+        fs::remove_dir(&install).unwrap();
+    }
 
     #[test]
     fn incident_smoke_detection_excludes_download_and_security_failures() {

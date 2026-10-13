@@ -71,10 +71,14 @@ pub fn record(root: &Path, source: &str, task: u64, text: &str) {
     }
 }
 
-/// The log entries, oldest first; empty, missing or a corrupt line is unknown with a reason (A5), never no requests.
+/// The log entries, oldest first; missing is empty, an existing empty, unreadable or corrupt log is unknown.
 pub fn read(root: &Path) -> Result<Vec<Value>, String> {
     let path = log_path(root);
-    let text = fs::read_to_string(&path).map_err(|e| format!("request log unreadable: {e}"))?;
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(format!("request log unreadable: {e}")),
+    };
     let mut out = vec![];
     for (i, l) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
         let v: Value = serde_json::from_str(l).map_err(|_| format!("request log line {} is not JSON; file kept", i + 1))?;
@@ -160,12 +164,13 @@ pub fn run(root: &Path, rt: Option<&str>) -> Result<String, String> {
     let use_cases = fs::read_to_string(root.join("docs/use-cases/README.md")).unwrap_or_default();
     let ins = inputs(&log, &proposals(&use_cases));
     let rt = rt.ok_or("no runtime with a nonzero limit on this host")?;
+    fs::create_dir_all(crate::dot(root)).map_err(|e| e.to_string())?;
     let text = crate::operator::exec(rt, &brief(&ins, &use_cases), &crate::dot(root), "retro")?;
     let ids: Vec<String> = ins.iter().map(|(id, _)| id.clone()).collect();
     let recs = parse(&text, &ids)?;
     let report = json!({"at": now(), "recommendations": recs});
     crate::platform::write_atomic(&report_path(root), &report.to_string()).map_err(|e| e.to_string())?;
-    Ok(render(&ins, &recs, log[0]["at"].as_u64().unwrap_or(0)))
+    Ok(render(&ins, &recs, log.first().and_then(|e| e["at"].as_u64()).unwrap_or(0)))
 }
 
 /// Recommendation `k` of the last report: title, goal, acceptance for `taskq add` (§ 5).
@@ -206,7 +211,7 @@ mod tests {
     #[test]
     fn an_empty_or_corrupt_log_is_unknown_and_kept() {
         let root = temp("corrupt");
-        assert!(read(&root).unwrap_err().contains("unreadable"));
+        assert!(read(&root).unwrap().is_empty());
         fs::create_dir_all(crate::dot(&root)).unwrap();
         fs::write(log_path(&root), "").unwrap();
         assert_eq!(read(&root).unwrap_err(), "request log is empty");
@@ -215,6 +220,15 @@ mod tests {
         append(&root, "ask", Some(3), "b").unwrap();
         assert!(fs::read_to_string(log_path(&root)).unwrap().contains("not json\n"), "a corrupt line survives an append");
         assert!(run(&root, Some("claude")).unwrap_err().starts_with("Requests: unknown (request log line 2"), "no operator runs over a corrupt log");
+    }
+
+    // Chain: § 4 request log → § 5 retro refusal. Risk: a failed read is mistaken for a missing log.
+    #[test]
+    fn an_existing_unreadable_log_is_unknown_and_kept() {
+        let root = temp("unreadable");
+        fs::create_dir_all(log_path(&root)).unwrap();
+        assert!(run(&root, Some("claude")).unwrap_err().starts_with("Requests: unknown (request log unreadable:"));
+        assert!(log_path(&root).is_dir());
     }
 
     // Chain: § 5 retro report (A2-A4). Risk: a recommendation without a source or kind is shown or filed.

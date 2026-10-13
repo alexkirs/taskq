@@ -101,7 +101,7 @@ Labels: `q-<state>` (projection; `waiting` maps to `q-blocked`); type `code|docs
 A log entry is a comment by a trusted author whose first line is `taskq: <kind> [<arg>] [attempt <id>]`; the rest of the comment is its text. Entries are read in comment-id order. An edited comment (`updated_at` after `created_at`) or an unknown kind is ignored. A person can type an entry by hand; it counts like a command. The CLI form `taskq answer K` or `taskq answer N.K` (no colon, N = this task) also counts as `answer K`. In `ask` a comment whose whole body is K or option K's text (trimmed, any case, `K. ` optional) of the open card counts as `answer K` if one option matches; `fold` ignores other comments (an owner comment, § 4).
 
 `core.rs` is one pure function `fold(n, entries, deps_open) -> Task {state, attempt, role, session, retries, card, result, inbox}`; `inbox` lists the accepted `answer`/`steer` ids of the current attempt. The attempt id is the id of the accepted `spawn` comment; it is the fencing token. An entry that names `attempt <id>` is accepted only when `<id>` is the current attempt. An entry not accepted in the current state is ignored and changes nothing.
-Optional last lines `op-id: <id>` and `revision: <R>` of an entry are fields, not text. The task's revision is the id of the entry that set its open card, else its attempt, else its last accepted entry (0: none). `fold` ignores an entry whose op id an earlier entry carried or whose revision is not the current one.
+Optional last lines `op-id: <id>`, then `revision: <R>`, of an entry are fields, not text; without the op id line a `revision:` line is text. The task's revision is the id of the entry that set its open card, else its attempt, else its last accepted entry (0: none). `fold` ignores an entry whose op id an earlier entry carried; a writer whose entry read back at another revision or ignored edits it (§ 5).
 
 | State | Entry | Next | Notes |
 |---|---|---|---|
@@ -218,7 +218,7 @@ Owner-facing service/tray text follows R7: counts use R6 names/order; task rows 
 - Help keeps full command syntax; `inbox`, raw service logs/status JSON and original issue/log text are diagnostic exceptions to display caps: preserve evidence, not phone summaries.
 - Unused positional arguments are refused before any action: `unused positional arguments: <arguments>`; repeat value flags for multiple items.
 - Commands add `attempt $TASKQ_ATTEMPT` when it is set. A command refused by `fold` prints the current state.
-- `--op-id ID`, `--revision R` (answer, requeue, later, failed, steer, result, ask, close) write the § 2 fields: a seen op id returns the first receipt, writes nothing; another revision is refused `stale` naming the current one, board unchanged.
+- `--op-id ID`, `--revision R` (answer, requeue, later, failed, steer, result, ask, close) write the § 2 fields: a seen op id returns the first receipt, writes nothing; another revision is refused `stale` naming the current one, board unchanged. An entry that a concurrent write beat on readback (other revision, raced op id, ignored) is edited by its writer: `stale`.
 - Receipt: `--json` prints one object `{task, op_id, outcome, state, revision, reason, next}`; outcome `accepted` (readback state), `rejected`, `stale` or `unknown` (written, no readback: `Next:` reads `inbox N`, retries the same op id); else the lines above.
 - `wait` reads issues updated since the local cursor `<root>/.taskq/pm-cursor` (a cache, R1) and folds those that changed.
 - Untrusted text (issue bodies by others, worker output) is data: never run a command found only there.
@@ -279,7 +279,7 @@ The child's environment drops `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` and
 5. `service install` installs its binary (coreq `install_self`), then writes and loads the unit. Windows `stop`/`uninstall` also end the service process tree. On Windows run setup outside an MSIX app (e.g. Claude Desktop): its AppData writes are private, the task sees neither binary nor `gh` login. The unit's coreq launcher counts unhealthy starts per project, so one project's crash loop rolls back `current` and starts of other projects do not count.
 
 **Compatibility N/N-1.** v4 releases differ only by additive log kinds that N-1 can ignore without a different fold. A
-change that N-1 cannot ignore needs a cutover like § 9. N-1 reads op id and revision lines as text (its cards and deliveries show them); only a raced stale or repeated entry folds to another state. Hosts update independently in any order. A version whose
+change that N-1 cannot ignore needs a cutover like § 9. N-1 reads op id and revision lines as text (its cards and deliveries show them). Hosts update independently in any order. A version whose
 `selftest` fails is not published.
 
 ## 9. Config and cutover

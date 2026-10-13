@@ -41,6 +41,8 @@ pub trait Board {
     fn issue(&self, n: u64) -> Result<Issue>;
     fn comments(&self, n: u64) -> Result<Vec<Comment>>;
     fn comment(&self, n: u64, body: &str) -> Result<u64>;
+    /// Edits comment `id` of issue `n`: an edited entry is ignored by `fold` (§ 2).
+    fn edit_comment(&self, n: u64, id: u64, body: &str) -> Result<()>;
     fn labels(&self, n: u64, add: &[String], remove: &[String]) -> Result<()>;
     fn create(&self, title: &str, body: &str, labels: &[String]) -> Result<u64>;
     fn edit(&self, n: u64, body: &str) -> Result<()>;
@@ -411,6 +413,8 @@ pub struct FakeState {
     /// `pending` or `failed` makes `publish` refuse; anything else merges.
     pub publish: String,
     pub hide_latest_comment: bool,
+    /// A concurrent writer: this body lands just before the next `comment`.
+    pub race: Option<String>,
 }
 
 #[cfg(test)]
@@ -457,7 +461,20 @@ impl Board for Fake {
     }
     fn comment(&self, n: u64, body: &str) -> Result<u64> {
         self.state.borrow_mut().get(n)?;
+        let race = self.state.borrow_mut().race.take();
+        if let Some(other) = race {
+            self.raw(n, &other, true, false);
+        }
         Ok(self.raw(n, body, true, false))
+    }
+    fn edit_comment(&self, n: u64, id: u64, body: &str) -> Result<()> {
+        let mut st = self.state.borrow_mut();
+        let c = st.comments.iter_mut().find(|(i, c)| *i == n && c.id == id).ok_or(format!("no comment {id}"))?;
+        if c.1.body != body {
+            c.1.body = body.into();
+            c.1.edited = true;
+        }
+        Ok(())
     }
     fn labels(&self, n: u64, add: &[String], remove: &[String]) -> Result<()> {
         let mut st = self.state.borrow_mut();

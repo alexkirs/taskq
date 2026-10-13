@@ -126,11 +126,20 @@ pub fn act(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: 
         Ok(l) => l,
         Err(e) => return unknown(e),
     };
+    let mut log: Vec<Entry> = log.into_iter().filter(|e| !e.edited).collect();
+    log.sort_by_key(|e| e.id);
     let Some(i) = log.iter().position(|e| e.id == id) else { return unknown(format!("comment {id} not read back")) };
-    let (t, rev) = (fold(n, &log, deps), core::revision(n, &log));
-    if fold(n, &log[..i], deps) == fold(n, &log[..=i], deps) {
+    // lost: an earlier entry moved the revision, or `fold` ignores this one (a raced op id included)
+    if op.revision.is_some_and(|r| r != core::revision(n, &log[..i])) || fold(n, &log[..i], deps) == fold(n, &log[..=i], deps) {
+        // the losing entry edits itself: an edited entry is ignored by this and older versions alike (§ 2, § 8)
+        if let Err(e) = b.edit_comment(n, id, &format!("{body}\n\nignored: another write won")) {
+            return unknown(e);
+        }
+        log[i].edited = true;
+        let (t, rev) = (fold(n, &log, deps), core::revision(n, &log));
         return Receipt { state: Some(t.state.name()), revision: Some(rev), ..Receipt::new(n, op, "stale", "another write won; this entry is ignored", format!("Read `taskq inbox {n}`; current revision is {rev}.")) };
     }
+    let (t, rev) = (fold(n, &log, deps), core::revision(n, &log));
     if let Err(e) = service::project(b, &issue, &t) {
         return unknown(e);
     }
@@ -235,6 +244,22 @@ mod tests {
         let rej = act(&b, &root, n, "result", &["abc"], "", &Op::default());
         assert_eq!(rej.outcome, "rejected");
         assert!(rej.text().starts_with("Error: ") && rej.text().contains("\nNext: "), "{}", rej.text());
+        // a race: another client answers between the check and the write; the loser edits itself, N and N-1 agree
+        let n = b.create("T2", "## Goal\ng", &["taskq".into()]).unwrap();
+        b.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
+        let a = fold(n, &entries(&b, n).unwrap(), false).attempt.unwrap();
+        let card = b.comment(n, &entry("ask", &[], Some(a), "Which?\n1. x\n2. y ★")).unwrap();
+        b.state.borrow_mut().race = Some(core::with_fields(entry("answer", &["1"], None, "x"), Some("pm"), Some(card)));
+        let r = act(&b, &root, n, "answer", &["2"], "y", &op("tray", card));
+        assert_eq!((r.outcome, r.state), ("stale", Some("doing")), "{}", r.text());
+        let log = entries(&b, n).unwrap();
+        assert!(log.last().unwrap().edited && fold(n, &log, false).inbox.len() == 1, "the losing entry is edited, so ignored");
+        // the same race on a retried op id: the second write edits itself too
+        b.comment(n, &entry("ask", &[], Some(a), "And?\n1. a\n2. b ★")).unwrap();
+        let rev = core::revision(n, &entries(&b, n).unwrap());
+        b.state.borrow_mut().race = Some(core::with_fields(entry("answer", &["1"], None, "a"), Some("pm2"), Some(rev)));
+        assert_eq!(act(&b, &root, n, "answer", &["1"], "a", &Op { id: Some("pm2".into()), revision: None }).outcome, "stale");
+        assert!(entries(&b, n).unwrap().last().unwrap().edited);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

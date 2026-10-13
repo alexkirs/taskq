@@ -46,16 +46,13 @@ pub fn entry(kind: &str, args: &[&str], attempt: Option<u64>, text: &str) -> Str
     if text.is_empty() { format!("taskq: {head}") } else { format!("taskq: {head}\n{text}") }
 }
 
-/// Appends the optional § 2 fields `op-id` and `revision` to an entry body.
+/// Appends the optional § 2 fields to an entry body: `op-id`, then `revision` (written only with an op id).
 pub fn with_fields(body: String, op: Option<&str>, revision: Option<u64>) -> String {
-    let mut b = body;
-    if let Some(o) = op {
-        b += &format!("\nop-id: {o}");
+    match (op, revision) {
+        (Some(o), Some(r)) => format!("{body}\nop-id: {o}\nrevision: {r}"),
+        (Some(o), None) => format!("{body}\nop-id: {o}"),
+        _ => body,
     }
-    if let Some(r) = revision {
-        b += &format!("\nrevision: {r}");
-    }
-    b
 }
 
 /// The op id a log entry of task `n` carries (§ 2); a bare comment carries none.
@@ -65,24 +62,21 @@ pub fn op_id(n: u64, body: &str) -> Option<&str> {
 
 /// Whether `text` ends with lines that would read as the § 2 fields: such text is refused before writing.
 pub fn has_fields(text: &str) -> bool {
-    let f = fields(text);
-    f.1.is_some() || f.2.is_some()
+    fields(text).1.is_some()
 }
 
-/// Text without its trailing `op-id:` / `revision:` lines, the op id and the revision.
-fn fields(text: &str) -> (&str, Option<&str>, Option<u64>) {
-    let (mut text, mut op, mut rev) = (text.trim_end(), None, None);
-    loop {
-        let (rest, last) = text.rsplit_once('\n').unwrap_or(("", text));
-        let last = last.trim();
-        if let Some(o) = last.strip_prefix("op-id: ").filter(|_| op.is_none()) {
-            op = Some(o.trim());
-        } else if let Some(r) = last.strip_prefix("revision: ").and_then(|r| r.trim().parse().ok()).filter(|_| rev.is_none()) {
-            rev = Some(r);
-        } else {
-            return (text, op, rev);
-        }
-        text = rest.trim_end();
+/// Text without its trailing fields and the op id: `op-id: <id>`, optionally followed by `revision: <R>`. Without
+/// the op id line a trailing `revision:` stays text, so historical entries fold unchanged (R7).
+fn fields(text: &str) -> (&str, Option<&str>) {
+    let t = text.trim_end();
+    let (rest, last) = t.rsplit_once('\n').unwrap_or(("", t));
+    let (rest, last) = match last.trim().strip_prefix("revision: ").and_then(|r| r.trim().parse::<u64>().ok()) {
+        Some(_) => rest.trim_end().rsplit_once('\n').unwrap_or(("", rest.trim_end())),
+        None => (rest, last),
+    };
+    match last.trim().strip_prefix("op-id: ") {
+        Some(o) => (rest.trim_end(), Some(o.trim())),
+        None => (text, None),
     }
 }
 
@@ -115,24 +109,23 @@ struct Line<'a> {
     text: &'a str,
     bare: bool,
     op: Option<&'a str>,
-    revision: Option<u64>,
 }
 
 /// The first line of a log entry of task `n`; `taskq answer K|N.K` (the CLI form) counts as `taskq: answer K`, any other
 /// comment as a bare answer that `pick` resolves against the open card.
 fn parse(n: u64, body: &str) -> Option<Line<'_>> {
     let (head, text) = body.split_once('\n').unwrap_or((body, ""));
-    let (text, op, revision) = fields(text);
+    let (text, op) = fields(text);
     if let Some(arg) = head.trim().strip_prefix("taskq answer ") {
         let k = match arg.trim().split_once('.') {
             Some((m, k)) => (m.trim_start_matches('#').parse() == Ok(n)).then_some(k)?,
             None => arg.trim(),
         };
         k.parse::<usize>().ok()?;
-        return Some(Line { kind: "answer", args: vec![k], attempt: None, text: text.trim(), bare: false, op, revision });
+        return Some(Line { kind: "answer", args: vec![k], attempt: None, text: text.trim(), bare: false, op });
     }
     let Some(head) = head.trim().strip_prefix("taskq:") else {
-        return Some(Line { kind: "answer", args: vec![body.trim()], attempt: None, text: "", bare: true, op: None, revision: None });
+        return Some(Line { kind: "answer", args: vec![body.trim()], attempt: None, text: "", bare: true, op: None });
     };
     let mut words: Vec<&str> = head.split_whitespace().collect();
     let mut attempt = None;
@@ -141,7 +134,7 @@ fn parse(n: u64, body: &str) -> Option<Line<'_>> {
         words.pop();
     }
     let kind = words.first().copied()?;
-    Some(Line { kind, args: words[1..].to_vec(), attempt, text: text.trim(), bare: false, op, revision })
+    Some(Line { kind, args: words[1..].to_vec(), attempt, text: text.trim(), bare: false, op })
 }
 
 fn sha(s: &str) -> bool {
@@ -237,9 +230,8 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64) {
     let (mut ops, mut card_at, mut last) = (std::collections::HashSet::new(), None, 0);
     for e in log {
         if let Some(l) = parse(n, &e.body) {
-            let rev = t.card.as_ref().and(card_at).or(t.attempt).unwrap_or(last);
-            // § 2: a repeated op id or a stale revision is ignored
-            if l.op.is_some_and(|o| !ops.insert(o)) || l.revision.is_some_and(|r| r != rev) {
+            // § 2: a repeated op id is ignored; a stale revision is the writer's to undo (dispatch::act)
+            if l.op.is_some_and(|o| !ops.insert(o)) {
                 continue;
             }
             let asked = t.state == State::Ask;

@@ -113,6 +113,19 @@ only rendering.
 | M-A10 | Service error and stale rows apart from Failed (phase 2 fixture) | AI error: phase 4 |
 | M-A11, M-A12 | `service restart` on Windows waited for live children and left the other host alone | Pause, resume, restart, stop and uninstall clicked in the popover; resume label prompt; update readback |
 
+## Release 4.1.1
+
+`v4.1.1` tags a1f70ac (main as is, #820); the release workflow published the macOS, Windows and Linux binaries,
+`SHA256SUMS` and `latest.json` 4.1.1 at 00:27 UTC on 2026-10-13. macOS logged `updated to 4.1.1; restarting` and
+re-executed with a live child; heartbeat #722 read `version 4.1.1` at 00:37. Windows logged the same line and wrote
+`current` 4.1.1 but kept running 4.1.0 with no live child: the running 4.1.0 still has the re-exec bug that #804
+fixes in 4.1.1. `taskq service restart` finished it; heartbeat #745 read `version 4.1.1` at 00:48. The #804 fix
+itself is first exercised by the update after 4.1.1.
+
+`Update now` was not clicked: an installed service installs a version as soon as its check finds it and writes
+`update` null (`src/main.rs`, service loop), so `status.json` never reports a newer version there and the button
+never shows. A bare `1` folds as `answer 1` only on 4.1.1 hosts; no task was in `ask` with a fresh bare reply.
+
 ## Remaining acceptance
 
 Beyond the phase 2 snapshots: native placement, renderer opening/closing, actions against a live service,

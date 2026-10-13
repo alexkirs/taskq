@@ -3,6 +3,15 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.1.1
+
+In `ask`, a comment whose whole body is an option number or option text counts as `answer K`; 4.1.0 ignores it, so
+such answers fold only on hosts running 4.1.1. Windows re-execs after an update once its live children end. Priority
+`p0` passes any focus. The menu gains AI requests, Add project, an agents view and capacity: `taskq service capacity`
+and `taskq agents`; `taskq.json` may hold `capacity_hosts` and a `codex-app` limit (old binaries ignore both).
+
+**Board**: run `taskq labels` once to create `p0`.
+
 ## v4.1.0
 
 One tray per host over every project in `<install>/projects` (heartbeat `<install>/tray`, errors in

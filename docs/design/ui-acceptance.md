@@ -1,7 +1,7 @@
 # UI implementation acceptance
 
 [Shared process](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md) · [rendering rules](rendering-contract.md).
-Current release review: [4.1.9 audit](release-4.1.9-ui-audit.md). No current release is accepted against this target yet.
+Historical release review: [4.1.9 audit](release-4.1.9-ui-audit.md). No current release is accepted against this target yet.
 
 ## Workflow
 
@@ -24,7 +24,7 @@ Every row needs initial, success, failure/unknown and recovery evidence where ap
 | Home top / Controls | named host, admission, pause review; urgent controls stable | M1/M5, M-A4/16 |
 | Work mode | originals, interpretation, applied state; Mixed; explicit targets; CPU/memory and all runtimes | M4/M12, M-A9/20 |
 | Attention / task | questions, failures, permission requests, service faults distinct | M-A7/10/21, P5 |
-| Aggregate / projects | all states, Human=Ask, quiet Closed; dedup/partial | K-A1–K-A6 |
+| Aggregate / projects | all states, Human=Ask, quiet Closed; dedup/partial | K-A1–K-A7 |
 | Pinned/recent / All | stable order, search, complete registered list, add beside header | M-A2/18 |
 | Project / tasks | Board at top, full flowing titles, issue/PR/local-session targets, remote host no-link | D-A1/2, M-A3/17 |
 | Cadence detail | four series, totals, period/custom timezone, unavailable history | M-A5/6, R-UI4/5 |
@@ -34,13 +34,17 @@ Every row needs initial, success, failure/unknown and recovery evidence where ap
 | Work sessions | worker/reviewer, host/runtime/attempt, live/ended, valid local link | C6/C-A8 |
 | Setup | picker cancel, new/existing/old/nonrepo, exact external effects, empty-install gap | M-A14 |
 | Appearance | theme, 14/16/18/20, Icon/Summary/Custom, persistence; no icon scaling from text | D-A3–D-A8 |
+| Plans | four editable recipes, held creation, explicit start, dependencies and partial retry | UC-03/06/07, D06/D08/D14, G2/G5 |
+| Auto resources | shared host admission, optional caps, fresh load, wait reasons, effective readback | UC-04/12, D03, G3 |
+| Delivery | separate commit/push/PR/merge policy, candidate revision and checks, publication receipt | UC-14, D04, G4 |
+| Remote PM | project routing, opt-in watch, source-numbered answers, media and gateway recovery | UC-17, RM-A1–RM-A9 |
 | Agents | probes, accounts, versions, disabled runtimes, effective policy/source | M9, P-A1–P-A10 |
 | Services | freshness, logs/folder, incidents + disclosure/consent, Resources | M-A10–M-A12 |
 | Emergency / recovery | named host, owned-process stop, durable hold, preserved work, selected fenced restart | E-A1–E-A9 |
 | Lifecycle | pause/restart/stop/uninstall differences, named targets, confirmation/readback | M-A4/11/12 |
 | About/update | tray/service/host versions, availability/progress/failure/rollback | M9 |
 
-Permission and AI extensions remain gated by their unapproved backend contracts. Do not mark their overall row Pass from a mock.
+Permission, AI and remote extensions remain gated by their unimplemented or unqualified backend contracts. Accepted product direction does not resolve those engineering gates. Do not mark their overall row Pass from a mock.
 
 ## Native matrix
 

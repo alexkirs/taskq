@@ -308,3 +308,15 @@ Restored project-scoped nonzero counters in pinned/recent and All projects; know
 Integrated current origin/main without reverting its document cleanup or runtime fixes. Fresh validation: 93 Cargo tests and selftest (40 traces, formats and board read) passed. All eight browser suites passed, including project-counters, Custom, workspace, plans, resources, AI, Access and Delivery. Existing unused-Result warning remains. Project counter light/dark screenshots inspected at 16px and narrow 20px; counters wrap without losing the project name. Local documentation links and diff whitespace checked.
 
 This publishes specifications, prototype and implementation backlog. No native menu/backend rollout is claimed.
+
+## Accepted final package, 2026-10-14
+
+All six shared workflow refinements and AI-assisted controls are accepted and saved in the owning specq files. The handoff now maps each menu capability to service/API semantics, backlog workstreams and observable acceptance. UC-17 covers remote PM behavior; no separate chat transport or live watcher is implemented by this prototype.
+
+Rebuilt workspace-prototype.html and workspace-preview.html from canonical components. The approved layout is unchanged. Visual review removed the redundant Plan label in the plan shortcut; the name and state remain visible. The exact source/reference/shared-rule hashes are in [final-package.json](evidence/final-package.json). Sources are local changes, not proof of remote publication.
+
+Validation: all eight browser suites passed. After the one-label correction, plans/decisions and resources/recipes passed again. 93 Cargo tests passed; selftest passed 40 golden traces, formats and a board read. Shared style checker, changed-document links and diff whitespace checks passed; taskq.md remains within 300 lines.
+
+Fresh visual inspection: ai-narrow-dark, workspace-integrated, project-counters-light, custom-dark, resources-wide and recipe-held-narrow. Reviewed 16px wide/light and 20px narrow/dark wrapping, counters, actionable numbered questions, drafts, policy review and held-plan start. Reinspected recipe-held-narrow after the label correction. Existing model checks are not proof of native sizing, platform accessibility, delivery or scheduling.
+
+Still Not tested: actual macOS/Windows native menu/icon/window behavior for this design, live UI-to-service mutations, host-wide Auto, remote human-answer/watch/media round trip, gateway recovery and multi-repository execution. No deployment, remote migration, policy change, commit or push in this iteration.

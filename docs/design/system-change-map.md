@@ -8,6 +8,7 @@ Accepted target: describe → review → start → answer → inspect result. Th
 |---|---|---|
 | Menu | Icon/Summary, admission, pause, emergency, attention, numbered answers, quick request/files, aggregate counts, pinned/recent projects | menu.md, menu-product.md |
 | Projects/tasks | Board above tasks, flowing title, host/runtime/session identity, all counters, complete lists | menu.md, task-counters.md |
+| Remote PM | Existing agent chat, explicit project context, opt-in observation, numbered replies, media and reconnect | [remote-manager.md](remote-manager.md), [remote-manager-audit.md](remote-manager-audit.md) |
 | Conversations | Existing main owner, explicit detach/raise, files/drafts/history, interrupted requests | ai-workspace.md |
 | Work sessions | Same live local session, agent identity; remote capability explained | agent-entry.md, ai-workspace.md |
 | Work mode | Exact rule or snapshot plus named-host Auto/Fixed and optional caps; review effective changes | dynamic-resources.md, menu-product.md |

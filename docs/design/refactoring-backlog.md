@@ -34,3 +34,5 @@ Name affected R/section rules; identify current implementation and callers; amen
 ## Remaining inputs, not repeated preference votes
 
 Actual five-repository build graph and owned lifecycle commands; supported client/runtime matrix; native font/size calibration and load measurements. Transport, reservation ownership, durable receipts and compatibility are engineering decisions to resolve with evidence. Escalate only a newly discovered product trade-off.
+
+Remote PM qualification for streams 1–3, 5 and 9: [RM1–RM7](remote-manager.md). Reconcile the installed generation before bootstrap; qualify project switching, real owner replies, independent observation, restart recovery and media using RM-A1–A9. [FRA audit](remote-manager-audit.md) records the inspected baseline.

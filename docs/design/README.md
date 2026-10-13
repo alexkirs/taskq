@@ -7,6 +7,14 @@ Working process: [shared product design workflow](https://github.com/taskqorg/sp
 
 Feature selection: [TaskQ product principles](../product-principles.md). Preserve board ownership, interchangeable clients and the complete menu-only operator path.
 
+## Start here: implementation handoff
+
+Give the next agent this directory and [implementation brief](implementation-brief.md). Read the root contract first, then plan system and application work using the [ordered backlog](refactoring-backlog.md). No chat transcript or temporary visualization folder is required.
+
+The current visual reference is [workspace-preview.html](workspace-preview.html); its editable/generated-source relationship is defined in the brief. Keep the entire directory, including `assets/`, `shots/`, `evidence/`, JSON fixtures/configuration and component sources. Historical alternatives are labeled below and are not competing final designs.
+
+The package includes the remote PM scenario (UC-17), not only the desktop menu. The owner accepted all six shared workflow refinements and AI-assisted controls. Compatible shared rules: [specq 9f82cc6](https://github.com/taskqorg/specq/tree/9f82cc6). Use this revision or a compatible successor; an older copy may lack the accepted changes.
+
 ## Current package
 
 [Decision register](decision-register.md): remaining choices, numbered alternatives and recommended defaults. [Scenario review](scenario-review.md): complete supplied-case coverage, current evidence and implementation gates.
@@ -19,6 +27,8 @@ Feature selection: [TaskQ product principles](../product-principles.md). Preserv
 
 | Material | Purpose |
 |---|---|
+| [Remote manager](remote-manager.md) | Universal remote PM flow, project routing, observation, answers/media and RM-A1–A9 |
+| [FRA/Hermes audit](remote-manager-audit.md) | Inspected integration baseline and unqualified capabilities |
 | [Integrated workspace](workspace-prototype.html) | Current Workspace review: menu, agent settings and AI conversations |
 | [AI component](ai-conversations.html) | Conversation list, drafts, files, request states and recovery fixtures |
 | [Task decisions and plans](plans-and-decisions.md) | Inline ask-card answers, AI-led plans and explicit multi-repository gaps |
@@ -37,14 +47,14 @@ Feature selection: [TaskQ product principles](../product-principles.md). Preserv
 | [Visual system](visual-style.md) | Typography, geometry, palette, icon inventory and asset sources |
 | [Square summary](icon-summary.md) | I1–I5 precise glyph/graph geometry and unresolved policies |
 | [TaskQ UI acceptance](operator-ui.md) | D-A1–D-A8 product checks; general D rules are upstream |
-| [Use cases](../use-cases/README.md) | UC-01–UC-16, intersections, open Q/P decisions |
+| [Use cases](../use-cases/README.md) | UC-01–UC-17, intersections, open Q/P decisions |
 | [Adaptive rationale](adaptive-menu.md) | Stable controls, situational content, prioritization choices |
 | [Current implementation inventory](current-menu-audit.md) | Installed/source evidence and preserve/relocate matrix |
 | [Implementation brief](implementation-brief.md) | Reading order, unresolved contracts and delivery slices |
 | [Rendering contract](rendering-contract.md) | Native size, scroll ownership, physical bar grid and data parity |
 | [Implementation acceptance](ui-acceptance.md) | Complete feature ledger, native matrix and review gates |
 | [Report template](ui-acceptance-report.md) | Builder/reviewer evidence and owner decisions |
-| [4.1.9 audit](release-4.1.9-ui-audit.md) | Current released source and native fixture findings |
+| [4.1.9 audit](release-4.1.9-ui-audit.md) | Historical 4.1.9 source and native fixture findings; refresh against the implementation candidate |
 | [Deterministic fixtures](ui-acceptance-fixtures.json) | Expected histogram, height and pixel-grid outcomes |
 | [Verification](verification.md) | Candidate evidence, historical evidence and qualification gaps |
 

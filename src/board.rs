@@ -241,7 +241,7 @@ impl Http {
         let (api, auth) = match kind {
             Kind::GitHub if host == "github.com" || host.is_empty() => (format!("https://api.github.com/repos/{repo}"), format!("Authorization: Bearer {token}")),
             Kind::GitHub => (format!("https://{host}/api/v3/repos/{repo}"), format!("Authorization: Bearer {token}")),
-            Kind::GitLab => (format!("https://{host}/api/v4/projects/{}", repo.replace('/', "%2F")), format!("PRIVATE-TOKEN: {token}")),
+            Kind::GitLab => (format!("https://{host}/api/v4/projects/{}", repo.replace('/', "%2F")), format!("Authorization: Bearer {token}")),
         };
         Http { kind, api, auth, me: RefCell::new(None), clock: RefCell::new(0), members: RefCell::new(vec![]), label_schema: RefCell::new(None), #[cfg(test)] transport: None }
     }
@@ -775,6 +775,12 @@ mod tests {
             Ok(Reply { headers: vec![], body: value.to_string(), operation: operation(method) })
         }));
         (h, calls)
+    }
+
+    #[test]
+    fn gitlab_uses_bearer_auth() {
+        let h = Http::new(Kind::GitLab, "gitlab.example", "o/r", "test-token");
+        assert_eq!(h.auth, "Authorization: Bearer test-token");
     }
 
     #[test]

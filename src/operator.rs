@@ -582,7 +582,7 @@ fn apply(install: &Path, exe: &Path, ops: &[Value], id: &str, rev: u64) -> (bool
                 if focus(&r) == f { Ok(format!("focus {f}")) } else { Err(format!("focus reads {}", focus(&r))) }
             }
             Op::Pause(r) => {
-                crate::pause(&r);
+                crate::pause(&r)?;
                 if focus(&r) == "off" { Ok("paused".into()) } else { Err(format!("focus reads {}", focus(&r))) }
             }
             Op::Resume(r) => {

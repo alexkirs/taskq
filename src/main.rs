@@ -909,6 +909,19 @@ fn handover(root: &Path) -> bool {
     file_age(&p).is_some_and(|a| a <= 60) && data::json(&p).map_or(true, |s| s.is_some_and(|s| s["kids"].as_array().is_some_and(|k| !k.is_empty())))
 }
 
+/// § 8 step 5: live children pass to the new image through the step 3 re-exec; a unit reload would end them. True
+/// when the running service was asked to re-exec instead of the unit being reloaded.
+fn load_unit(u: &platform::Unit, root: &Path) -> Res<bool> {
+    if handover(root) {
+        fs::write(dot(root).join("restart"), "").map_err(|e| e.to_string())?;
+        poke(root);
+        return Ok(true);
+    }
+    platform::run_all(&u.unload, true)?;
+    platform::run_all(&u.load, false)?;
+    Ok(false)
+}
+
 /// Windows: `schtasks /End` ends only the launcher; the service, its children and the tray go with this (§ 8).
 fn kill_service(root: &Path) {
     let status = dot(root).join("status.json");
@@ -1052,15 +1065,7 @@ fn service(args: &Args) -> Res<()> {
             if sub == "install" {
                 coreq::update::install_self(&platform::tool(&cfg.install))?;
                 platform::write_unit(&u)?;
-                // § 8 step 5: live children pass to the new image through the step 3 re-exec; a unit reload would end them
-                let handover = handover(&root);
-                if handover {
-                    fs::write(d.join("restart"), "").map_err(|e| e.to_string())?;
-                    poke(&root);
-                } else {
-                    platform::run_all(&u.unload, true)?;
-                    platform::run_all(&u.load, false)?;
-                }
+                let handover = load_unit(&u, &root)?;
                 let mut all: Vec<String> = fs::read_to_string(&projects).unwrap_or_default().lines().map(String::from).collect();
                 if !all.contains(&root.display().to_string()) {
                     all.push(root.display().to_string());
@@ -1673,6 +1678,38 @@ mod tests {
         assert_eq!(answer_picks(&b, &c, &[format!("{n}.1")], &Op::default()).unwrap().iter().map(Receipt::text).collect::<Vec<_>>(), vec![format!("#{n} closed\nmerged 0123456789abcdef0123456789abcdef01234567")]);
         let i = b.issue(n).unwrap();
         assert!(!i.open && !i.labels.iter().any(|l| l.starts_with("q-")));
+    }
+
+    // Chain: service install, § 8 step 3 kids file, adoption. Risk: an install from a project with a live child ends it
+    #[cfg(unix)]
+    #[test]
+    fn install_with_a_live_child_keeps_it_through_reexec_and_adoption() {
+        use runtime::Proc;
+        let root = std::env::temp_dir().join(format!("taskq-install-live-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(dot(&root)).unwrap();
+        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        // the unit reload stands for launchctl bootout: it ends the service's process tree, the child included
+        let reloaded = root.join("reloaded");
+        let u = platform::Unit { path: root.join("unit"), text: String::new(), stop: vec![],
+            unload: vec![vec!["kill".into(), "-9".into(), pid.to_string()]],
+            load: vec![vec!["touch".into(), reloaded.display().to_string()]] };
+        fs::write(dot(&root).join("status.json"), format!(r#"{{"kids": [{{"task": 7, "attempt": 41, "rt": "claude", "pid": {pid}}}]}}"#)).unwrap();
+        assert!(load_unit(&u, &root).unwrap(), "live child: hand over");
+        assert!(dot(&root).join("restart").exists() && !reloaded.exists(), "the running service re-execs; no reload");
+        let mut adopted = runtime::Adopted(pid as i32);
+        assert_eq!(adopted.exited(), None, "the child still runs");
+        // the re-exec writes the kids file; the new image adopts the child, not `gone`
+        fs::write(dot(&root).join("kids"), format!("pid {}\n7 41 claude {pid} 40\n", std::process::id())).unwrap();
+        assert_eq!(kids_file(&root), vec![(7, 41, "claude".to_string(), pid as i32, 40)]);
+        assert_eq!(adopted.exited(), None, "adopted live");
+        // an idle service reloads the unit, which would end a child
+        fs::write(dot(&root).join("status.json"), r#"{"kids": []}"#).unwrap();
+        assert!(!load_unit(&u, &root).unwrap() && reloaded.exists());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(adopted.exited().is_some(), "a reload ends it");
+        let _ = fs::remove_dir_all(&root);
     }
 
     // Chain: service install and the § 8 step 3 handover. Risk: a reinstall or a corrupt kids file ends live children

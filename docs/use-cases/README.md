@@ -308,3 +308,9 @@ Source: owner; FRA/Hermes with Codex workers. [Remote manager RM1–RM7](../desi
 - After gateway loss, reconcile pending questions and results. Stop watching independently from pausing work.
 
 Result: a replaceable remote PM provides planning and owner control while TaskQ executes independently. Existing integration and remaining qualification are recorded in the [FRA audit](../design/remote-manager-audit.md). Covers UC-02/03/07/09/10/12/14 without a second queue.
+
+## Proposals
+
+One line per improvement proposal made in conversation (date, proposal, source request); `taskq retro` reads this section.
+
+- 2026-10-14: pin the tray menu into a movable window that snaps to screen edges where the OS supports it; owner request in chat, filed as WS11b.

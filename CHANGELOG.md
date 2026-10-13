@@ -7,6 +7,8 @@ there is no migration code. Releases without a **Board** section need nothing.
 
 Same-host race: a worker that wrote `ask`, `result` or `requeue` and exits after the owner's answer arrived is a clean
 exit, so its own service resumes the attempt with the answer instead of posting `gone`. No board change.
+Verified live with mac and Windows on 4.1.5 (#844): attempt 6145455653 asked on mac, the owner answered, and the same
+attempt resumed on mac with no `gone` entry.
 
 ## v4.1.4
 

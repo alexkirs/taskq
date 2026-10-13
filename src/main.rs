@@ -1736,7 +1736,9 @@ mod tests {
         let got = serde_json::to_string_pretty(&snap.json()).unwrap() + "\n";
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/status-snapshot.json");
         if std::env::var_os("TASKQ_BLESS").is_some() { fs::write(&path, &got).unwrap(); }
-        assert_eq!(got, fs::read_to_string(&path).unwrap(), "TASKQ_BLESS=1 rewrites {}", path.display());
+        // Parsed compare: a CRLF checkout on Windows must not fail the golden.
+        let want: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(snap.json(), want, "TASKQ_BLESS=1 rewrites {}", path.display());
     }
 
     #[test]

@@ -17,6 +17,8 @@ The package includes the remote PM scenario (UC-17), not only the desktop menu. 
 
 [Shared blocks](shared-blocks.md): parent ownership, compact consumer variants and cross-product fidelity.
 
+[Tasks from findings](finding-tasks.md): shared reviewed creation, operation receipts and independent source verification.
+
 ## Current package
 
 [Decision register](decision-register.md): remaining choices, numbered alternatives and recommended defaults. [Scenario review](scenario-review.md): complete supplied-case coverage, current evidence and implementation gates.

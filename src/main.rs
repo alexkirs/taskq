@@ -499,8 +499,14 @@ fn service_run(c: &Ctx) -> Res<()> {
     let env = runtime::Env { board_env: &board_env, root: &cfg.root, exe: &exe, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.publish };
     let start = |l: &runtime::Launch| runtime::spawn(&env, l);
     let mut s = Service::new(c.board.as_ref(), cfg, platform::VERSION, Box::new(start));
+    s.instance = enrollment::installation_id(&cfg.install).map(|id| service_id(&id))?;
     let d = dot(&cfg.root);
     fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+    // § 4 one service per root: wait, not exit, so the unit sees no crash loop
+    while let Some(pid) = other_service(&cfg.root) {
+        eprintln!("service pid {pid} already runs this project; waiting");
+        std::thread::sleep(Duration::from_secs(cfg.poll));
+    }
     adopt(&mut s, &cfg.root);
     let is_installed = installed(&cfg.install);
     let began = Instant::now();
@@ -948,8 +954,25 @@ fn load_unit(u: &platform::Unit, root: &Path) -> Res<bool> {
         return Ok(true);
     }
     platform::run_all(&u.unload, true)?;
+    kill_service(root); // Windows: `/End` left the old service running beside the new one (#933)
     platform::run_all(&u.load, false)?;
     Ok(false)
+}
+
+/// The heartbeat's `service <id>` (§ 4): public, so a hash of the installation id, never the id itself.
+fn service_id(installation: &str) -> String {
+    let d = ring::digest::digest(&ring::digest::SHA256, installation.as_bytes());
+    d.as_ref()[..6].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Another live process that wrote this root's fresh `status.json` (§ 4 one service per root).
+fn other_service(root: &Path) -> Option<u32> {
+    let p = dot(root).join("status.json");
+    if file_age(&p).is_none_or(|a| a > 60) {
+        return None;
+    }
+    let pid = data::json(&p).ok()??["pid"].as_u64()? as u32;
+    (pid != std::process::id() && runtime::alive(pid)).then_some(pid)
 }
 
 /// Windows: `schtasks /End` ends only the launcher; the service, its children and the tray go with this (§ 8).
@@ -1789,6 +1812,29 @@ mod tests {
         assert_eq!(answer_picks(&b, &c, &[format!("{n}.1")], &Op::default()).unwrap().iter().map(Receipt::text).collect::<Vec<_>>(), vec![format!("#{n} closed\nmerged 0123456789abcdef0123456789abcdef01234567")]);
         let i = b.issue(n).unwrap();
         assert!(!i.open && !i.labels.iter().any(|l| l.starts_with("q-")));
+    }
+
+    // Chain: § 4 one service per root (#933). Risk: a second `service run` on one root drops the first one's children.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_status_json_of_another_live_service_holds_service_run() {
+        let root = std::env::temp_dir().join(format!("taskq-one-service-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(dot(&root)).unwrap();
+        let st = dot(&root).join("status.json");
+        assert_eq!(other_service(&root), None, "no status.json");
+        let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        fs::write(&st, format!(r#"{{"pid": {}}}"#, other.id())).unwrap();
+        assert_eq!(other_service(&root), Some(other.id()), "a live other service");
+        fs::write(&st, format!(r#"{{"pid": {}}}"#, std::process::id())).unwrap();
+        assert_eq!(other_service(&root), None, "its own status.json after the update re-exec");
+        fs::write(&st, format!(r#"{{"pid": {}}}"#, other.id())).unwrap();
+        other.kill().unwrap();
+        other.wait().unwrap();
+        assert_eq!(other_service(&root), None, "a dead writer, e.g. before a restart");
+        assert_eq!(service_id("abc").len(), 12);
+        assert_ne!(service_id("abc"), "abc");
+        let _ = fs::remove_dir_all(&root);
     }
 
     // Chain: service install, § 8 step 3 kids file, adoption. Risk: an install from a project with a live child ends it

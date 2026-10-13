@@ -155,6 +155,8 @@ pub struct Service<'a> {
     pub cfg: &'a Config,
     pub version: String,
     pub kids: Vec<Kid>,
+    /// `service <id>` in the heartbeat (§ 4): a hash of `<install>/installation-id`; empty writes no line.
+    pub instance: String,
     /// Labels from `<root>/.taskq/focus`; empty: admit nothing, `all`: any task; `p0` passes any non-empty focus (§ 4).
     pub focus: Vec<String>,
     /// The last inbox id handed to each attempt's child.
@@ -419,7 +421,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, unknown: HashMap::new() }
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, unknown: HashMap::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -529,6 +531,9 @@ impl<'a> Service<'a> {
 
     fn heartbeat_body(&self) -> String {
         let mut lines = vec![format!("version {}", self.version)];
+        if !self.instance.is_empty() {
+            lines.push(format!("service {}", self.instance));
+        }
         let kids: BTreeSet<_> = self.kids.iter().map(|k| (k.task, k.attempt)).chain(self.pending.iter().copied()).collect();
         lines.extend(kids.iter().map(|(t, a)| format!("#{t} {a}")));
         lines.join("\n")
@@ -543,6 +548,12 @@ impl<'a> Service<'a> {
         let now = self.board.now()?;
         self.snapshot = Some(crate::snapshot::from_views("host", self.board, self.cfg, now, &views, &hosts));
         self.tasks_read = Some(std::time::Instant::now());
+        // § 4 one service per host name: another install's fresh heartbeat under this name holds every write (#933)
+        let title = format!("taskq host {me}");
+        let other = hosts.iter().filter(|h| h.title == title && now - h.updated < ttl).flat_map(|h| h.body.lines()).find_map(|l| l.strip_prefix("service ")).filter(|id| *id != self.instance);
+        if let Some(id) = other {
+            return Err(format!("another service {id} runs as host {me}; stop it or set TASKQ_HOST"));
+        }
         self.owner_comments = views.iter().flat_map(|v| {
             core::owner_comments(v.issue.number, &v.log).into_iter().filter_map(|id| Some((v.issue.number, id, v.log.iter().find(|e| e.id == id)?.body.trim().to_string(), v.task.card.clone().unwrap_or_default())))
         }).collect();
@@ -606,7 +617,6 @@ impl<'a> Service<'a> {
 
         // 3. heartbeat
         let body = self.heartbeat_body();
-        let title = format!("taskq host {me}");
         match hosts.iter().find(|h| h.title == title) {
             Some(h) if h.body.lines().filter(|l| !l.starts_with("at ")).eq(body.lines()) && now - h.updated < ttl / 5 => {}
             // a same-body edit leaves `updated_at` as is (GitHub), so the stamp keeps the heartbeat fresh
@@ -1099,6 +1109,36 @@ mod tests {
         b.labels(n, &["q-ask".into()], &["q-ready".into()]).unwrap();
         s.pass().unwrap(); // different fix also breaks the streak
         assert!(crate::incident::take_detected().is_empty());
+    }
+
+    // Chain: § 4 one service per host name (#933). Risk: a second install under the same host name posts `gone` for
+    // the first one's live child and respawns, so two workers run one task.
+    #[test]
+    fn a_second_service_under_one_host_name_writes_nothing_and_the_live_child_stays() {
+        let b = Fake::default();
+        let n = b.create("T", "## Goal\ng", &["taskq".into()]).unwrap();
+        let c = cfg("win");
+        let (ea, eb): (Exits, Exits) = Default::default();
+        let mut a = service(&b, &c, ea.clone());
+        let mut w = service(&b, &c, eb.clone());
+        (a.instance, w.instance) = ("native".into(), "wsl".into());
+        a.pass().unwrap();
+        let comments = b.comments(n).unwrap().len();
+        for _ in 0..3 {
+            b.advance(70);
+            assert!(w.pass().unwrap_err().contains("another service native runs as host win"));
+            a.pass().unwrap();
+        }
+        let t = task(&b, n);
+        assert_eq!((t.state, t.retries, a.kids.len(), w.kids.len(), eb.borrow().len()), (State::Doing, 0, 1, 0, 0));
+        assert_eq!(b.comments(n).unwrap().len(), comments, "no gone, no second spawn");
+        // a restart of the same install reads its own id and carries on; the first one stopped, the heartbeat goes
+        // stale and the other install takes over the host name
+        let mut again = service(&b, &c, Default::default());
+        again.instance = "native".into();
+        again.pass().unwrap();
+        b.advance(301);
+        assert!(w.pass().is_ok());
     }
 
     // Chain: R2 § 3 two hosts one attempt. Risk: two attempts run, or a dead host blocks the task.

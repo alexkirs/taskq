@@ -35,11 +35,41 @@ impl Proc for Child {
         }
     }
     fn kill(&mut self) {
+        // Windows: the child is `cmd.exe` running `codex.cmd`; node and `codex.exe` below it survive a plain kill (#933)
+        #[cfg(windows)]
+        let _ = crate::platform::quiet(Command::new("taskkill").args(["/F", "/T", "/PID", &Child::id(self).to_string()])).output();
         let _ = Child::kill(self);
         let _ = self.wait();
     }
     fn id(&self) -> u32 {
         Child::id(self)
+    }
+}
+
+/// A process with this pid runs (§ 4 one service per root); pid reuse reads live, a ceiling accepted for a 60 s window.
+#[cfg(unix)]
+pub fn alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else { return false };
+    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+}
+
+#[cfg(windows)]
+pub fn alive(pid: u32) -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+        fn GetExitCodeProcess(h: *mut std::ffi::c_void, code: *mut u32) -> i32;
+        fn CloseHandle(h: *mut std::ffi::c_void) -> i32;
+    }
+    unsafe {
+        let h = OpenProcess(0x1000, 0, pid); // PROCESS_QUERY_LIMITED_INFORMATION
+        if h.is_null() {
+            return false;
+        }
+        let mut code = 0;
+        let ok = GetExitCodeProcess(h, &mut code) != 0 && code == 259; // STILL_ACTIVE
+        CloseHandle(h);
+        ok
     }
 }
 

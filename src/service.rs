@@ -6,6 +6,7 @@ use crate::core::{self, State, Task};
 use crate::runtime::{Launch, Proc};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use crate::admission::{Entry, Res, Want};
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -184,6 +185,14 @@ pub struct Service<'a> {
     held: Vec<Launch>,
     /// Attempts without a child that keep their lease: held claims and resumes (§ 3, § 4 heartbeat).
     pending: BTreeSet<(u64, u64)>,
+    /// Wall seconds for the host authority, set by the loop.
+    pub wall: i64,
+    /// Auto reservations the host granted, not yet a child; refused requests of this pass and their reason (§ 3).
+    reserved: Vec<Res>,
+    requested: Vec<Res>,
+    refused: Option<(&'static str, String)>,
+    /// Held reservations of the whole host at the last host write; unknown when it failed.
+    host_used: Option<u32>,
 }
 
 const MONTH: i64 = 30 * 86400;
@@ -194,20 +203,34 @@ pub struct GateCfg {
     pub enabled: bool,
     pub cpu_max: u32,
     pub memory_min: u32,
+    /// Auto: CPU is the 60 s mean; the latest 30 s interval at 100 % still vetoes (D03).
+    pub mean: bool,
 }
 
-pub const GATE_DEFAULT: GateCfg = GateCfg { enabled: false, cpu_max: 85, memory_min: 15 };
+pub const GATE_DEFAULT: GateCfg = GateCfg { enabled: false, cpu_max: 85, memory_min: 15, mean: false };
+/// Auto admission defaults from the D03 calibration (docs/design/admission-calibration.md).
+pub const GATE_AUTO: GateCfg = GateCfg { enabled: true, cpu_max: 90, memory_min: 10, mean: true };
+pub const RUNTIMES: [&str; 3] = ["claude", "codex", "codex-app"];
 
 /// Effective capacity of one host (§ 3, § 9).
 #[derive(Clone, PartialEq, Debug)]
 pub struct Capacity {
     pub limits: BTreeMap<String, u32>,
     pub gate: GateCfg,
+    /// `admission` mode `auto`: the host authority admits; a runtime without a limit has no count ceiling.
+    pub auto: bool,
+    /// Auto: optional host-wide session ceiling.
+    pub max: Option<u32>,
 }
 
 impl Capacity {
+    pub fn fixed(limits: BTreeMap<String, u32>, gate: GateCfg) -> Capacity {
+        Capacity { limits, gate, auto: false, max: None }
+    }
+
     pub fn json(&self) -> Value {
-        json!({"limits": self.limits, "load_gate": {"enabled": self.gate.enabled, "cpu_max": self.gate.cpu_max, "memory_min": self.gate.memory_min}})
+        json!({"limits": self.limits, "load_gate": {"enabled": self.gate.enabled, "cpu_max": self.gate.cpu_max, "memory_min": self.gate.memory_min},
+            "admission": {"mode": if self.auto { "auto" } else { "fixed" }, "max": self.max}})
     }
 }
 
@@ -227,6 +250,21 @@ pub fn capacity(v: &Value, host: &str) -> Result<Capacity, String> {
     let h = &v["capacity_hosts"][host];
     let mut out = limits(&v["limits"], "limits")?;
     out.extend(limits(&h["limits"], &format!("capacity_hosts.{host}.limits"))?);
+    let (a, aat) = if h["admission"].is_null() { (&v["admission"], "admission".to_string()) } else { (&h["admission"], format!("capacity_hosts.{host}.admission")) };
+    if !matches!(a, Value::Null | Value::Object(_)) {
+        return Err(format!("{aat}: not an object"));
+    }
+    let auto = match &a["mode"] {
+        Value::Null => false,
+        x if x == "auto" => true,
+        x if x == "fixed" => false,
+        _ => return Err(format!("{aat}.mode: auto or fixed")),
+    };
+    let max = match &a["max"] {
+        Value::Null => None,
+        x => Some(x.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or(format!("{aat}.max: not an integer 0..{}", u32::MAX))?),
+    };
+    let d = if auto { GATE_AUTO } else { GATE_DEFAULT };
     let (g, at) = if h["load_gate"].is_null() { (&v["load_gate"], "load_gate".to_string()) } else { (&h["load_gate"], format!("capacity_hosts.{host}.load_gate")) };
     if !matches!(g, Value::Null | Value::Object(_)) {
         return Err(format!("{at}: not an object"));
@@ -236,11 +274,14 @@ pub fn capacity(v: &Value, host: &str) -> Result<Capacity, String> {
         x => x.as_u64().filter(|n| (lo..=hi).contains(n)).map(|n| n as u32).ok_or(format!("{at}.{k}: not an integer {lo}..{hi}")),
     };
     let enabled = match &g["enabled"] {
-        Value::Null => false,
+        Value::Null => d.enabled,
         x => x.as_bool().ok_or(format!("{at}.enabled: not true or false"))?,
     };
-    let gate = GateCfg { enabled, cpu_max: pct("cpu_max", GATE_DEFAULT.cpu_max, 10, 100)?, memory_min: pct("memory_min", GATE_DEFAULT.memory_min, 1, 95)? };
-    Ok(Capacity { limits: out, gate })
+    if auto && !enabled {
+        return Err(format!("{at}.enabled: Auto admission needs the load gate; use admission mode fixed"));
+    }
+    let gate = GateCfg { enabled, cpu_max: pct("cpu_max", d.cpu_max, 10, 100)?, memory_min: pct("memory_min", d.memory_min, 1, 95)?, mean: d.mean };
+    Ok(Capacity { limits: out, gate, auto, max })
 }
 
 /// The load gate (§ 3): samples on a monotonic clock in seconds, decisions on unrounded percentages.
@@ -249,6 +290,8 @@ pub struct Gate {
     cfg: Option<GateCfg>,
     /// CPU (busy, total) ticks of the previous reading: the baseline of the next.
     base: Option<(u64, u64)>,
+    /// The reading before `base`: with it CPU is the mean over two intervals (60 s, `GateCfg::mean`).
+    prev: Option<(u64, u64)>,
     /// Latest sample: monotonic time, wall time, CPU busy %, available memory %.
     pub last: Option<(u64, i64, Option<f64>, Option<f64>)>,
     /// Consecutive calm samples toward reopening.
@@ -274,16 +317,20 @@ impl Gate {
     /// One sample: CPU ticks `(busy, total)` and available memory %; `None` is a failed reading.
     pub fn observe(&mut self, now: u64, wall: i64, ticks: Option<(u64, u64)>, memory: Option<f64>) {
         // decreasing counters or an empty interval are no reading; the baseline restarts either way
-        let cpu = match (self.base, ticks) {
+        let busy = |from: Option<(u64, u64)>| match (from, ticks) {
             (Some((b0, t0)), Some((b, t))) if b >= b0 && t > t0 && b - b0 <= t - t0 => Some((b - b0) as f64 * 100.0 / (t - t0) as f64),
             _ => None,
         };
+        let raw = busy(self.base);
+        let c = self.cfg.unwrap_or(GATE_DEFAULT);
+        // the 60 s mean, unless the latest interval alone is at 100 % (veto) or no older reading exists
+        let cpu = if c.mean && raw.is_some_and(|p| p < 100.0) { busy(self.prev).or(raw) } else { raw };
         let late = self.last.is_some_and(|l| now.saturating_sub(l.0) > 60);
+        self.prev = if raw.is_some() { self.base } else { None };
         self.base = ticks;
         let memory = memory.filter(|m| (0.0..=100.0).contains(m));
         self.last = Some((now, wall, cpu, memory));
         self.sampled = true;
-        let c = self.cfg.unwrap_or(GATE_DEFAULT);
         let (max, min) = (c.cpu_max as f64, c.memory_min as f64);
         match (cpu, memory) {
             (Some(p), Some(m)) if !late && p < max && m > min => {
@@ -355,8 +402,8 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
-        let cap = Ok(Capacity { limits: cfg.limits.clone(), gate: GATE_DEFAULT });
-        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new() }
+        let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -371,12 +418,66 @@ impl<'a> Service<'a> {
         self.cap.is_ok() && self.gate.may_launch(self.mono)
     }
 
+    fn auto(&self) -> bool {
+        self.cap.as_ref().is_ok_and(|c| c.auto)
+    }
+
+    /// This service's entry in the host authority: children and granted reservations are held.
+    fn entry(&self) -> Entry {
+        let held = self.kids.iter().map(|k| (k.task, k.attempt, k.rt.clone())).chain(self.reserved.iter().cloned()).collect();
+        Entry { version: self.version.clone(), at: 0, held, requested: self.requested.clone() }
+    }
+
+    /// Admission of one launch (§ 3): the load gate, then under Auto a reservation from the host authority, which
+    /// refuses with a reason; the request stays `requested`. Fixed admits as before.
+    fn reserve(&mut self, task: u64, attempt: u64, rt: &str) -> bool {
+        if !self.may_launch() {
+            return false;
+        }
+        if !self.auto() {
+            return true;
+        }
+        let old = crate::admission::old_services(&self.cfg.install);
+        let res = (task, attempt, rt.to_string());
+        let want = Want { max: self.cap.as_ref().ok().and_then(|c| c.max), sample_at: self.gate.last.map(|l| l.1), old: &old, res: res.clone() };
+        let (r, used) = crate::admission::sync(&self.cfg.install, &self.cfg.root.display().to_string(), self.entry(), Some(want), self.wall);
+        self.host_used = used;
+        match r {
+            Ok(()) => {
+                self.reserved.push(res);
+                true
+            }
+            Err(e) => {
+                self.requested.push(res);
+                self.refused = Some(e);
+                false
+            }
+        }
+    }
+
+    /// Rewrite this service's host entry: released reservations leave it (§ 3). Fixed services write too, so Auto
+    /// counts their children; a failed write only matters to Auto, whose next request refuses.
+    pub fn sync_host(&mut self) {
+        let (r, used) = crate::admission::sync(&self.cfg.install, &self.cfg.root.display().to_string(), self.entry(), None, self.wall);
+        self.host_used = used;
+        if let (Err((_, e)), true) = (r, self.auto()) {
+            self.refused = Some(("host", e));
+        }
+    }
+
     /// The `capacity` object of `status.json` (§ 4).
     pub fn capacity_json(&self) -> Value {
-        let (gate, reasons) = match &self.cap {
+        let (mut gate, mut reasons) = match &self.cap {
             Err(e) => ("unknown", vec![("config", e.clone())]),
             Ok(_) => self.gate.state(self.mono),
         };
+        if let Some((code, text)) = self.refused.clone().filter(|_| self.auto()) {
+            gate = if code == "host" { "unknown" } else if gate == "open" { "held" } else { gate };
+            reasons.push((code, text));
+        }
+        let res = |r: &Res, state: &str| json!({"task": r.0, "attempt": r.1, "rt": r.2, "state": state});
+        let reservations: Vec<Value> = self.kids.iter().map(|k| res(&(k.task, k.attempt, k.rt.clone()), "held"))
+            .chain(self.reserved.iter().map(|r| res(r, "held"))).chain(self.requested.iter().map(|r| res(r, "requested"))).collect();
         let limits = self.cap.as_ref().map(|c| c.limits.clone()).unwrap_or_default();
         let mut used: BTreeMap<String, u32> = limits.keys().map(|k| (k.clone(), 0)).collect();
         for k in &self.kids {
@@ -384,6 +485,8 @@ impl<'a> Service<'a> {
         }
         let last = self.gate.last.filter(|_| self.gate.enabled());
         json!({"limits": limits, "used": used, "load_gate": self.cap.as_ref().map(|c| c.json()["load_gate"].clone()).unwrap_or(Value::Null),
+            "admission": self.cap.as_ref().map(|c| c.json()["admission"].clone()).unwrap_or(Value::Null), "host_used": self.host_used,
+            "min_service_version": crate::admission::MIN_SERVICE, "reservations": reservations,
             "gate": gate, "reasons": reasons.iter().map(|(c, t)| json!({"code": c, "text": t})).collect::<Vec<_>>(),
             "cpu_percent": last.and_then(|l| l.2), "memory_available_percent": last.and_then(|l| l.3),
             "sample_at": last.map(|l| l.1), "sample_age_seconds": last.map(|l| self.mono.saturating_sub(l.0))})
@@ -539,6 +642,8 @@ impl<'a> Service<'a> {
 
         // 6. route to own attempts, then admit within capacity; the gate holds launches, the lease stays (§ 3)
         let mut pending = BTreeSet::new();
+        // a reservation lives within one pass: it becomes a child or a held claim, or is released here
+        (self.reserved, self.requested, self.refused) = (vec![], vec![], None);
         for v in &views {
             let (n, t) = (v.issue.number, &v.task);
             let (Some(a), Some(h)) = (t.attempt, host_of(t)) else { continue };
@@ -546,7 +651,8 @@ impl<'a> Service<'a> {
                 continue;
             }
             if let Some(i) = self.held.iter().position(|l| l.attempt == a) {
-                if self.may_launch() {
+                let rt = self.held[i].rt.clone();
+                if self.reserve(n, a, &rt) {
                     let l = self.held.remove(i);
                     self.launch(l)?;
                 } else {
@@ -575,7 +681,7 @@ impl<'a> Service<'a> {
                 touched.insert(n);
                 continue;
             }
-            if !self.may_launch() {
+            if !self.reserve(n, a, &l.rt) {
                 pending.insert((n, a)); // the inbox stays undelivered
                 continue;
             }
@@ -610,6 +716,9 @@ impl<'a> Service<'a> {
                 break;
             }
             let Some(rt) = self.free(label(&v.issue, "run-").as_deref()) else { continue };
+            if !self.reserve(v.issue.number, 0, &rt) {
+                break;
+            }
             let role = if v.task.state == State::Review { "reviewer" } else { "worker" };
             self.claim(v, role, &rt)?;
         }
@@ -674,7 +783,10 @@ impl<'a> Service<'a> {
     /// `codex-app` only for `run-codex-app` tasks on a host whose `has` lists it (§ 9 opt-in).
     fn free(&self, want: Option<&str>) -> Option<String> {
         let app = |rt: &str| rt != "codex-app" || (want == Some(rt) && self.cfg.has.iter().any(|h| h == rt));
-        self.cap.as_ref().ok()?.limits.iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt)).find(|(rt, n)| self.kids.iter().filter(|k| &k.rt == *rt).count() < **n as usize).map(|(rt, _)| rt.clone())
+        let c = self.cap.as_ref().ok()?;
+        // Auto: a runtime without a limit has no count ceiling (§ 9); Fixed: only listed runtimes
+        let limits: Vec<(String, u32)> = if c.auto { RUNTIMES.iter().map(|r| (r.to_string(), c.limits.get(*r).copied().unwrap_or(u32::MAX))).collect() } else { c.limits.clone().into_iter().collect() };
+        limits.into_iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt)).find(|(rt, n)| self.kids.iter().filter(|k| &k.rt == rt).count() < *n as usize).map(|(rt, _)| rt)
     }
 
     /// Post `spawn`, re-read, start the child only if `fold` accepted this spawn (§ 3 claim).
@@ -689,6 +801,7 @@ impl<'a> Service<'a> {
         let log: Vec<_> = comments.into_iter().filter(|c| c.trusted).map(|c| core::Entry { id: c.id, body: c.body, edited: c.edited }).collect();
         let t = core::fold(n, &log, false); // only ready or review tasks are claimed
         if t.attempt != Some(id) {
+            self.reserved.retain(|r| r.0 != n); // released
             self.log.push(format!("#{n} spawn {id} lost the claim"));
             return Ok(());
         }
@@ -712,6 +825,8 @@ impl<'a> Service<'a> {
     }
 
     fn launch(&mut self, l: Launch) -> Result<(), String> {
+        // the reservation becomes the child, or is released when the start fails
+        self.reserved.retain(|r| r.0 != l.task);
         match (self.start)(&l) {
             Ok(proc) => {
                 self.kids.push(Kid { task: l.task, attempt: l.attempt, rt: l.rt.clone(), proc });
@@ -1168,9 +1283,9 @@ mod tests {
             "capacity_hosts": {"win": {"limits": {"codex": 2}, "load_gate": {"enabled": true}}}});
         let win = capacity(&v, "win").unwrap();
         assert_eq!(win.limits, BTreeMap::from([("claude".into(), 4), ("codex".into(), 2)]));
-        assert_eq!(win.gate, GateCfg { enabled: true, cpu_max: 85, memory_min: 15 }, "a host gate replaces the default object");
-        assert_eq!(capacity(&v, "mac").unwrap().gate, GateCfg { enabled: false, cpu_max: 90, memory_min: 15 });
-        assert_eq!(capacity(&json!({"limits": {"claude": 1}}), "mac").unwrap(), Capacity { limits: BTreeMap::from([("claude".into(), 1)]), gate: GATE_DEFAULT }, "absent keys: today");
+        assert_eq!(win.gate, GateCfg { enabled: true, cpu_max: 85, memory_min: 15, mean: false }, "a host gate replaces the default object");
+        assert_eq!(capacity(&v, "mac").unwrap().gate, GateCfg { enabled: false, cpu_max: 90, memory_min: 15, mean: false });
+        assert_eq!(capacity(&json!({"limits": {"claude": 1}}), "mac").unwrap(), Capacity::fixed(BTreeMap::from([("claude".into(), 1)]), GATE_DEFAULT), "absent keys: today");
         for bad in [json!({"limits": {"claude": -1}}), json!({"limits": {"claude": 5_000_000_000u64}}), json!({"load_gate": {"cpu_max": 9}}),
             json!({"load_gate": {"memory_min": 96}}), json!({"load_gate": {"enabled": "yes"}}), json!({"capacity_hosts": {"mac": {"limits": {"codex": "2"}}}})] {
             assert!(capacity(&bad, "mac").is_err(), "{bad}");
@@ -1226,6 +1341,15 @@ mod tests {
         assert!(g2.may_launch(t2));
         g2.configure(GateCfg { cpu_max: 90, ..on() });
         assert!(!g2.may_launch(t2));
+        // Auto: the 60 s mean smooths one busy interval; a 100 % interval still vetoes
+        let mut g3 = Gate::default();
+        g3.configure(GATE_AUTO);
+        let (mut t3, mut k3) = (0, (0, 0));
+        g3.observe(0, 0, Some(k3), Some(50.0));
+        feed(&mut g3, &mut t3, &mut k3, &[(70.0, 50.0), (95.0, 50.0)]);
+        assert_eq!(g3.last.unwrap().2, Some(82.5));
+        feed(&mut g3, &mut t3, &mut k3, &[(100.0, 50.0)]);
+        assert_eq!(g3.state(t3).1[0].0, "cpu");
     }
 
     // Chain: § 3 load gate spacing. Risk: launch burst or bad counters accepted.
@@ -1257,7 +1381,7 @@ mod tests {
         let a = task(&b, n).attempt.unwrap();
         let m = b.create("M", "", &["taskq".into(), "host-mac".into()]).unwrap();
         // gate on: held until three calm samples, the running child continues
-        s.reload(Ok(Capacity { limits: c.limits.clone(), gate: on() }));
+        s.reload(Ok(Capacity::fixed(c.limits.clone(), on())));
         let (mut t, mut k) = (0, (0, 0));
         s.gate.observe(0, 0, Some(k), Some(50.0));
         feed(&mut s.gate, &mut t, &mut k, &[(90.0, 50.0)]);
@@ -1293,6 +1417,74 @@ mod tests {
         s.reload(Err("limits.claude: not an integer".into()));
         assert_eq!(s.capacity_json()["reasons"][0]["code"], "config");
         assert_eq!(s.kids.len(), 2);
+    }
+
+    // Chain: § 9 Auto admission config. Risk: Auto silently off, or a cap or invalid mode accepted wrong.
+    #[test]
+    fn auto_admission_takes_d03_defaults_and_caps() {
+        let a = capacity(&json!({"admission": {"mode": "auto", "max": 6}, "limits": {"codex": 2}}), "mac").unwrap();
+        assert_eq!((a.auto, a.max, a.gate), (true, Some(6), GATE_AUTO));
+        let tuned = capacity(&json!({"capacity_hosts": {"mac": {"admission": {"mode": "auto"}, "load_gate": {"cpu_max": 80}}}}), "mac").unwrap();
+        assert_eq!((tuned.gate.cpu_max, tuned.gate.memory_min, tuned.gate.enabled), (80, 10, true), "a host gate field overrides one default");
+        assert!(!capacity(&json!({}), "mac").unwrap().auto, "absent: Fixed, today's behavior");
+        for bad in [json!({"admission": "auto"}), json!({"admission": {"mode": "fast"}}), json!({"admission": {"max": -1}}),
+            json!({"admission": {"mode": "auto"}, "load_gate": {"enabled": false}})] {
+            assert!(capacity(&bad, "mac").is_err(), "{bad}");
+        }
+    }
+
+    // Chain: § 3 host authority under Auto. Risk: a launch without a reservation, a cap overrun or admission on unknown data.
+    #[test]
+    fn auto_service_reserves_holds_at_cap_releases_and_refuses_unknown() {
+        let install = std::env::temp_dir().join(format!("taskq-auto-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&install);
+        std::fs::create_dir_all(&install).unwrap();
+        let b = Fake::default();
+        let ns: Vec<u64> = (0..3).map(|i| b.create(&format!("T{i}"), "", &["taskq".into()]).unwrap()).collect();
+        let mut c = cfg("mac");
+        c.install = install.clone();
+        let e: Exits = Default::default();
+        let mut s = service(&b, &c, e.clone());
+        s.reload(capacity(&json!({"admission": {"mode": "auto", "max": 1}}), "mac"));
+        // unknown: no sample yet, nothing claimed
+        s.pass().unwrap();
+        assert_eq!((s.capacity_json()["gate"].as_str(), e.borrow().len()), (Some("unknown"), 0));
+        let (mut t, mut k) = (0, (0, 0));
+        s.gate.observe(0, 0, Some(k), Some(50.0));
+        feed(&mut s.gate, &mut t, &mut k, &[(10.0, 50.0); 3]);
+        (s.mono, s.wall) = (t, t as i64);
+        // admit: one reservation, held as a child
+        s.pass().unwrap();
+        assert_eq!((e.borrow().len(), task(&b, ns[0]).state), (1, State::Doing));
+        let cap = s.capacity_json();
+        assert_eq!((cap["host_used"].as_u64(), cap["reservations"][0]["state"].as_str()), (Some(1), Some("held")));
+        // hold at the host cap of 1: requested with a reason, no spawn written
+        feed(&mut s.gate, &mut t, &mut k, &[(10.0, 50.0); 2]);
+        (s.mono, s.wall) = (t, t as i64);
+        s.pass().unwrap();
+        assert_eq!((e.borrow().len(), task(&b, ns[1]).state), (1, State::Ready));
+        let cap = s.capacity_json();
+        assert_eq!((cap["gate"].as_str(), cap["reasons"][0]["code"].as_str()), (Some("held"), Some("max")));
+        assert_eq!(cap["reservations"][1]["state"], "requested");
+        // release: the child exits, the next pass admits the next task
+        b.comment(ns[0], &core::entry("result", &["0123456789abcdef0123456789abcdef01234567"], task(&b, ns[0]).attempt, "ok")).unwrap();
+        *e.borrow()[0].1.borrow_mut() = Some(0);
+        s.pass().unwrap();
+        s.sync_host();
+        feed(&mut s.gate, &mut t, &mut k, &[(10.0, 50.0)]);
+        (s.mono, s.wall) = (t, t as i64);
+        s.pass().unwrap();
+        assert_eq!(e.borrow().len(), 2, "released slot admits one more (reviewer or next task)");
+        // unknown host data: an unreadable host file refuses and is rebuilt
+        std::fs::write(install.join("admission.json"), "{").unwrap();
+        *e.borrow()[1].1.borrow_mut() = Some(0);
+        feed(&mut s.gate, &mut t, &mut k, &[(10.0, 50.0)]);
+        (s.mono, s.wall) = (t, t as i64);
+        let before = e.borrow().len();
+        s.pass().unwrap();
+        assert_eq!(e.borrow().len(), before, "refused on unknown");
+        assert_eq!(s.capacity_json()["gate"], "unknown");
+        let _ = std::fs::remove_dir_all(&install);
     }
 
     // Chain: § 4 history events file. Risk: duplicate events or unbounded growth.

@@ -43,7 +43,7 @@ Display titles at most 60 characters, reasons at most 160 and option text at mos
 `<pages>/open.html#codex://threads/<id>`.
 
 ### R7. Style
-Every role and message is short and states unknowns honestly ([caveman](https://gitlab.ufobe.com/gradus-public/caveman/-/tree/62579538f05fb6b69a12449c1ebad9567d1fdecc)).
+Every role and message is short and states unknowns honestly ([caveman](https://github.com/taskqorg/specq/tree/62579538f05fb6b69a12449c1ebad9567d1fdecc)).
 Use English, plain verbs, one idea per line; no preamble, repeated context or prose walls. State the user effect first.
 Single and batch CLI outcomes use the same success/error renderer; a failed item keeps its task number.
 Owner-text templates in sections 1, 2, 4, 5, 7 are the design target; release them with their implementation (R8), not as proof of shipped behavior.
@@ -79,7 +79,7 @@ Owner decisions on looks and sound, one line each. Change one only per R13.
 - Header: `docs/header.webp` with the caption `Agents working.` stays at the top, verbatim.
 - Tagline: a few short lines of what taskq is, above the steps, no jargon.
 - Steps: set up, start working, talk to the manager; phrases the owner tells the agent.
-- Setup phrase names the source: "Install taskq from https://github.com/alexkirs/taskq and set it up…".
+- Setup phrase names the source: "Install taskq from https://github.com/taskqorg/taskq and set it up…".
 - Formatting: a few unicode icons where they help scanning; no emoji clutter, no badges.
 - Last README line: `If taskq saves you time, [buy me a coffee](…).`
 - Tone: minimum words, plain to anyone, no filler (R7).
@@ -261,7 +261,7 @@ The child's environment drops `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` and
 
 **Release.** CI on a `v*` tag builds once per OS `taskq-<ver>-<os>-<arch>`,
 `SHA256SUMS` and `latest.json` `{"version", "files": {"<os>-<arch>": "<name>"}}`. Each runner runs `selftest` on
-its artifact before publishing. Hosts need no git, gh or toolchain; HTTP goes through the OS `curl`. The host checks the sha256 against `SHA256SUMS`. Trust is HTTPS to the release repo built into the binary (`alexkirs/taskq`, no config changes it) and who can push its tags; `ponytail:` no signature, add one when releases are served elsewhere.
+its artifact before publishing. Hosts need no git, gh or toolchain; HTTP goes through the OS `curl`. The host checks the sha256 against `SHA256SUMS`. Trust is HTTPS to the release repo built into the binary (`taskqorg/taskq`, no config changes it) and who can push its tags; `ponytail:` no signature, add one when releases are served elsewhere.
 
 **Update** (`taskq update`, service step 7) in `install` (default `~/.local/share/taskq`, Windows `%LOCALAPPDATA%\taskq`):
 immutable `releases/<ver>/`, a `current` file holding `<ver>` (atomic rename) and `previous`.

@@ -5,12 +5,31 @@ Runtime remains governed by [taskq.md](../../taskq.md). Shared rules live in [sp
 
 Working process: [shared product design workflow](https://github.com/taskqorg/specq/blob/main/design/workflow.md). This package supplies its product decisions, references and evidence.
 
+Feature selection: [TaskQ product principles](../product-principles.md). Preserve board ownership, interchangeable clients and the complete menu-only operator path.
+
 ## Current package
+
+[Decision register](decision-register.md): remaining choices, numbered alternatives and recommended defaults. [Scenario review](scenario-review.md): complete supplied-case coverage, current evidence and implementation gates.
+
+[System change map](system-change-map.md): required backend slices, full interface routes and remaining decisions.
+
+[Existing-agent entry](agent-entry.md): discoverable bootstrap, canonical reports, capability limits and owner-requested observation.
+
+[Comparative workflow review](comparative-workflow-review.md): VibeCrew, Moshi, Conductor and cmux; evidence, recommendations and implementation gaps.
 
 | Material | Purpose |
 |---|---|
+| [Integrated workspace](workspace-prototype.html) | Current Workspace review: menu, agent settings and AI conversations |
+| [AI component](ai-conversations.html) | Conversation list, drafts, files, request states and recovery fixtures |
+| [Task decisions and plans](plans-and-decisions.md) | Inline ask-card answers, AI-led plans and explicit multi-repository gaps |
+| [Dynamic resources](dynamic-resources.md) | Accepted Auto default, optional caps, proposed tuning and migration |
+| [Delivery behavior](agent-behavior.md) | Proposed Local / branch / review PR / auto-merge / direct workflows |
+| [Agent settings](agent-settings.md) | Workspace access editor, project overrides, review and readback |
+| [Product decisions](menu-product.md) | Approved direction, scenario coverage and candidate boundaries |
+| [Emergency recovery](emergency-recovery.md) | Stop/interlock/reconciliation proposal and E checks |
+| [Next variants](menu-next-variants.html) | Historical comparison; Workspace review selected |
 | [Standalone candidate](final-menu.html) | Inspect menu, AI conversations/sessions, settings, icons and scenario states |
-| [Editable fragment](final-prototype.html) | Canonical source for the current interactive candidate |
+| [Editable fragment](final-prototype.html) | Earlier full candidate; integrated workspace takes precedence |
 | [Menu](menu.md) | M1–M12 behavior and M-A1–M-A21 acceptance |
 | [AI workspace](ai-workspace.md) | Conversation/session/history separation, windows, attachments, recovery and C checks |
 | [Task counters](task-counters.md) | All-state totals, Closed and partial-data semantics |
@@ -18,7 +37,7 @@ Working process: [shared product design workflow](https://github.com/taskqorg/sp
 | [Visual system](visual-style.md) | Typography, geometry, palette, icon inventory and asset sources |
 | [Square summary](icon-summary.md) | I1–I5 precise glyph/graph geometry and unresolved policies |
 | [TaskQ UI acceptance](operator-ui.md) | D-A1–D-A8 product checks; general D rules are upstream |
-| [Use cases](../use-cases/README.md) | UC-01–UC-07, intersections, open Q/P decisions |
+| [Use cases](../use-cases/README.md) | UC-01–UC-16, intersections, open Q/P decisions |
 | [Adaptive rationale](adaptive-menu.md) | Stable controls, situational content, prioritization choices |
 | [Current implementation inventory](current-menu-audit.md) | Installed/source evidence and preserve/relocate matrix |
 | [Implementation brief](implementation-brief.md) | Reading order, unresolved contracts and delivery slices |
@@ -29,7 +48,7 @@ Working process: [shared product design workflow](https://github.com/taskqorg/sp
 | [Deterministic fixtures](ui-acceptance-fixtures.json) | Expected histogram, height and pixel-grid outcomes |
 | [Verification](verification.md) | Candidate evidence, historical evidence and qualification gaps |
 
-The editable candidate contains local simulation, not live service access. Detach models ownership inside the preview; native separate windows require implementation. Uploaded-file chips model selection only; no file bytes are sent.
+The editable candidate contains local simulation, not live service access. Detach models ownership inside the preview; native separate windows require implementation. AI attachments support local image preview and validation; no file bytes are sent. Rebuild the integrated fragment with `python3 docs/design/build-workspace-preview.py`; edit its source components, not the generated fragment.
 
 ## Related specifications
 
@@ -47,3 +66,7 @@ Older board/research material may still need English translation; the current me
 
 General rule: propose/review in specq. TaskQ decision: taskq.md first, then its linked product specification, candidate and evidence.
 Preserve requirement IDs and current capabilities. A file, mockup or green model test is not shipped/native proof.
+
+[Custom icon](custom-icon.md): shared Summary/Custom config renderer, agent editing protocol and CI acceptance. [Final menu review](menu-final-review.md) records wording, hierarchy and icon corrections.
+
+[Refactoring backlog](refactoring-backlog.md) defines ordered workstreams, API boundaries, dependencies and acceptance for implementation tasks.

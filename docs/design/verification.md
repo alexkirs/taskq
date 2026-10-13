@@ -1,5 +1,90 @@
 # Operator menu verification
 
+## Scenario closure and defaults · 2026-10-14
+
+- Added [D01–D14/G1–G8](decision-register.md) and [scenario review](scenario-review.md). Expanded supplied-case coverage to UC-01–UC-15; preserved earlier P IDs as aliases. Walkthrough covers entry, outcome, failure/recovery and remaining gates; not live end-to-end verification.
+- Proposed editable default recipes and simplest-first implementation: existing tasks/dependencies/Ask, project-owned environments and existing commands. General default/customization principle added to specq; exact TaskQ values remain proposals, not applied policy.
+- Read `add --later`: eligible issue creation precedes the `later` entry. Recorded a potential admission race for held-plan creation; source evidence only, no concurrent reproduction or runtime fix.
+- Browser suites: plans/numbered decisions, AI conversations, integrated navigation, agent settings and Delivery all pass. These are fixture checks, not proof of the proposed backend semantics.
+- `cargo test --locked`: 91 passed; `cargo run -- selftest`: 40 traces/formats passed and read-only board probe succeeded. Existing unused-result warning at `src/operator.rs:563` remains.
+- Coverage consistency check: all 15 UC IDs mapped once in review, 14 decision headings, changed-doc local links pass; taskq.md 293 lines. specq checker and both whitespace checks pass.
+- Remaining: owner selections, G1–G8, latest-release reconciliation and native/live acceptance. No service configuration, timers, permissions, board tasks, uploads or publication changed.
+
+## Existing-agent entry · 2026-10-14
+
+- Added [A1–A5](agent-entry.md): discoverable PM bootstrap, versioned rules, canonical reports, client capability limits and explicitly requested observation. Linked root Product, principles and UC-02; no timer/integration installed.
+- Read `src/main.rs` wait/dispatch: bounded default 10 minutes, one project cursor, state-based detection. Identified initial catch-up, unchanged-state question revisions and multiple observers as qualification gaps; no claim that current wait provides durable delivery.
+- Source/spec review only. Cross-agent rendering, bootstrap discovery and scheduled wake-up require client fixtures; no runtime changes or live watcher tests.
+- `cargo test --locked`: 91 passed. Changed-document local links and whitespace checks passed; root contract 292 lines. Existing unused-result warning at `src/operator.rs:563` remains unrelated.
+
+## Product foundation and numbered choices · 2026-10-14
+
+- Added owner-defined [product principles](../product-principles.md), linked from the root Product contract. Reassessed competitor features against board portability, replaceable agents, headless operation and existing primitives. Added UC-10–UC-12; no runtime authority/default changes.
+- Q1 and the AI workspace require source numbers/order across interfaces and receipts. General choice-identity rule belongs to `specq/design/workflow.md`; TaskQ answer tokens and authority remain project-owned.
+- Prototype displays numbered task/plan/conversation choices. Tests verify numbers 1/2, exact source answer text, option-2 receipt, unnumbered custom answer and numbered AI context. Plans, AI and workspace regression suites pass.
+- Visually inspected wide 16px and narrow dark 20px numbered choices; wrapping preserves the number column. AI pointer tests center both navigation targets within the standalone iframe before real clicks.
+- `cargo test --locked`: 91 passed; `cargo run -- selftest`: 40 traces/formats passed and board read succeeded. Existing unused-result warning at `src/operator.rs:563`. specq checker, changed-spec local links and whitespace checks pass; root contract 291 lines.
+- Evidence upload, generic adapters, structured operation schemas, machine-wide budgets and full menu planning remain design/implementation gaps. Native menus and external runtime behavior were not exercised.
+
+## Decisions, plans and comparative research · 2026-10-14
+
+- [Comparison](comparative-workflow-review.md): official VibeCrew/Moshi/Conductor/cmux docs; VibeCrew Bridge/Fleet screenshots visually inspected. No installed-product interaction or platform-parity proof.
+- Q1/Q2 and P1–P6 separate inline decisions, dependency plans, task stages, environment finalization and backend gates. Shared `specq/design/workflow.md` adds AI-assisted controls; TaskQ-specific authority stays here.
+- `plans-and-decisions.test.cjs`: ordinary/custom answers, sending lock, stale/unknown guards, draft-only AI handoff, reviewed plan, creation/start without duplicate cards, pause/retry, separate question identities and narrow themes pass. Board receipts and transitions are simulated; concurrent writers require backend evidence.
+- Workspace navigation and Delivery regression checks pass. Inspected `plans-wide.png`, `plans-light.png`, `plans-dark.png`; fixed stage title/reason collisions and re-inspected wide/dark captures.
+- AI regression passes, including restored drafts and narrow conversation navigation. Pointer diagnostics found the standalone iframe edge receiving the click; the test centers the target before a real pointer click. No application workaround or forced click added.
+- `cargo test --locked`: 91 passed. `cargo run -- selftest`: 40 golden traces and formats passed; board read succeeded. Existing unused-result warning in `src/operator.rs:563`. Runtime untouched.
+- specq checker passed. Native menu sizing, runtime reply adapters, real planner, multi-repository ownership/cleanup and stage gates remain unqualified.
+
+## Full available menu height · 2026-10-14
+
+- Owner-approved sizing clarification: natural height up to 100% of the usable monitor work area. Reposition before scrolling; anchor-side space is not a height cap. Short menus stay short.
+- Shared F2 updated in specq; TaskQ R-UI2 owns native allowances and placement. Acceptance adds 95%/100% height and middle-anchor cases.
+- Integrated HTML reference already has natural panel height and no primary internal scroll cap; no visual code change required. Input/image caps are independent controls, not menu-height limits.
+- Native Windows/macOS sizing remains unqualified; no runtime renderer was changed in this specification pass.
+
+## Delivery behavior proposal · 2026-10-14
+
+- B1–B5 propose shared runtime behavior with project overrides. §7 remains unchanged: current `pr` publishes during close; manual handoff is not implemented.
+- Representative workflow catalogue, not usage-ranked research. Local, branch, review PR, auto-merge and direct presets; dependent options reduce effects, never silently broaden them.
+- `agent-behavior.test.cjs`: preset sequences, commit/push/PR guards, draft-PR merge block, retained project drafts, inherit review, single confirmation, stale review refusal and unknown readback pass. Integrated navigation regression passes.
+- Inspected wide/light and narrow/dark 20px; corrected preview-state synchronization and added active Access/Delivery tab indication. Fixture merge capabilities require forge validation before implementation.
+- `cargo test --locked`: 91 passed. Runtime unchanged; publication lifecycle, native platform behavior and cross-host policy storage remain unqualified.
+- Shared-spec review: density, dependent controls and truthful readback already covered. Only project publication policy added.
+
+## AI conversation review · 2026-10-14
+
+- C9 extends the selected workspace. AI source: `ai-conversations.html`; builder composes menu, settings and AI. General specq rules unchanged.
+- Browser checks: isolated drafts, navigation, confirmation guard, partial-result retry refusal, cancellation acknowledgement, archive/delete, attachment preview/removal/type/size errors, drag/drop, restart metadata and explicit retry, menu handoff, simulated window ownership, transcript retention.
+- `ai-conversations.test.cjs` and `workspace-prototype.test.cjs` pass. Inspected integrated light and narrow light/dark 20px screenshots under `evidence/menu-next/ai-*.png`; fixed unreadable primary-button hover.
+- `cargo test --locked`: 91 passed. `cargo run -- selftest`: 40 golden traces and formats passed. Existing unused-result warning at `src/operator.rs:563`; runtime unchanged.
+- Preview states are synthetic, attachment reads are local, requests never leave the preview. Widget persistence stores metadata, not attachment bytes. Native windows, actual upload/cancellation/reconciliation, transcript scroll-follow and OS accessibility remain implementation gates.
+
+## Integrated preview correction · 2026-10-14
+
+- Restored menu and workspace navigation around agent settings; no discarded Menu review alternative. Compose with `python3 docs/design/build-workspace-preview.py`; the menu and settings files remain editable sources.
+- Replaced indirect Readback selector with immediate Preview state fixtures. Production Refresh status stays distinct from preview controls.
+- Browser tests cover all preview states, menu→Agents, conversations/sessions navigation, preserved draft and narrow 20px layout. Light and dark integrated screenshots inspected; fixed host label to match the selected platform.
+- These checks establish prototype navigation only, not real service effects or native OS behavior.
+
+## Agent settings detail · 2026-10-14
+
+- AS1–AS4 detail the accepted workspace route; host permission architecture remains a proposal under P9.
+- Browser checks: draft/effective separation, saved/readback, stale review refusal and explicit reload, failed application preserving prior effective policy, separate runtime drafts, narrow 20px overflow.
+- Inspected light settings and dark narrow failure receipt; captured under `evidence/menu-next/agents-*.png`. Corrected active/effective revision labels; existing attempts retain their original revision.
+- `agent-settings.html` is an isolated settings view for review, not a replacement for the complete menu reference. Network/preset and fixture exceptions are editable; files/tools explain capability limits. No actual policy change, broker, filesystem enforcement or native-platform qualification.
+- General principles unchanged: canonical F/P rules already cover this; only TaskQ settings details added.
+
+## Product decisions and next variants · 2026-10-13
+
+- MP1–MP9 record accepted direction; I6 specifies common square composition with native Windows/macOS metrics. E1–E5 propose required emergency stop and explicit recovery; runtime authority is unchanged pending model amendments.
+- Reviewed 4.1.10 source (`71bc0bf`): `src/tray.rs` still gates full view with `!cfg!(windows)` and keeps the wide renderer. Earlier 4.1.9 audit remains version-specific.
+- Microsoft NOTIFYICONDATAW guidance inspected: incorrect-size notification icons may be scaled; supply native sizes and qualify Shell output. Browser simulations do not qualify Windows.
+- `menu-next.test.cjs`: stop/recovery guard, selected-task restart review, scope snapshot, page errors and narrow 20px overflow checks. Chrome headless via Playwright; bundled browser absent, installed Chrome used.
+- Inspected light recovery, dark workspace review and narrow dark 20px captures in `evidence/menu-next/`. Fixed stacked icon labels, theme repaint and partial-recovery status after inspection.
+- Two placement alternatives extend the existing package; they do not replace the full feature ledger. File chips hold metadata only; scope uses an explicit fixture; dialogs/windows, access grants, native stop/restart and service readback are simulated.
+- Shared-rule review: F1–F6 already cover source ownership, cross-platform rendering, truthful states and acceptance. No new universal emergency lifecycle rule added; fencing/interlocks belong to TaskQ until a reusable contract is demonstrated.
+
 ## Rendering fidelity and released UI audit · 2026-10-13
 
 - Added shared F1–F6 in specq; TaskQ [R-UI1–R-UI6](rendering-contract.md), [acceptance ledger/matrix](ui-acceptance.md), report template and deterministic expected fixtures. Shared changes are local, not published.
@@ -183,3 +268,43 @@ OS icon rendering in the menu bar, keyboard/screen reader, scale/theme, multi-pr
 AI onboarding and external-effect confirmation remain unqualified. A prototype/model PASS is not an OS or service PASS (R12).
 The earlier local file preview was rejected by browser URL policy; this package makes no visual PASS claim.
 Canonical package and source priority: [README](README.md); phased work: [implementation brief](implementation-brief.md).
+
+## Auto resources and pipeline reconsideration
+
+Spec-only iteration: accepted D01/D02/D04/D05/D07–D14 recommendations; D08 milestone reminder; D03 Auto target with unqualified numerical tuning; D06 reopened with three concrete alternatives. Owning specs and scenario routes updated. No live policy or prototype changed.
+
+Validation: `cargo test --locked` passed 91 tests; `cargo run -- selftest` passed 40 golden traces and formats, with successful board read. Existing unused-Result warning remains at `src/operator.rs:563`. Local file links checked in 15 affected documents; URL examples excluded. Root contract remains 293 lines. `git diff --check` passed.
+
+These checks do not prove dynamic admission, safe held creation, recipe gates or environment finalization. G1–G8 qualification and native/live scenario execution remain open. Competitor conclusions use the saved documented research, not a fresh installation test.
+
+## Accepted recipes and integrated menu refresh
+
+Supersedes the preceding D06-open status: D06 option 2 accepted. Root/register/plan/scenario contracts and implementation handoff updated; system-change-map.md separates backend requirements, engineering calibration and remaining project input.
+
+Integrated candidate now demonstrates Auto/Fixed, optional host/project/runtime caps, load-window selection, pressure/stale states, policy review and four recipe drafts. Creation remains held by default; explicit start reuses existing fixture cards. Top admission status and telemetry agree with pressure. No backend policy changes.
+
+Validation: six browser suites passed (workspace, AI conversations, agent settings, agent behavior, plans/decisions, resources/recipes). The new suite checks review-before-apply, invalid Fixed configuration, pressure/readback, all four held-first recipes and wide/narrow layouts. Cargo: 91 tests passed; selftest: 40 traces plus formats and board read passed. Existing unused Result warning in src/operator.rs:563 remains.
+
+Visual inspection: resources-wide, resources-narrow, recipe-review-wide and recipe-held-narrow, including light/dark and 16/20px. Corrected the contradictory Admitting/pressure state and reinspected final resources-wide and recipe-held-narrow. Text/control wrapping is readable; native work-area sizing, OS icons and actual separate windows still need platform qualification. Browser page height is not proof of native menu sizing.
+
+Source components generate workspace-prototype.html and workspace-preview.html. Simulated effects and backend handoff points remain labelled. No commit, push, deploy, timer or runtime grant change.
+
+## Custom icon and final wording review
+
+Accepted Custom mode and the shared Summary/Custom configuration architecture. Summary now comes from icon-summary.config.json; the integrated build uses the same paint function for built-in and saved custom configurations. Added UC-16, CI protocol/acceptance, final menu review and implementation handoff links. Accepted independent-branch continuation and deferral of monetary budgets recorded.
+
+Prototype changes: three view modes, Custom editor/copy/edit shortcut, actual-size and enlarged previews, three sample compositions, local font/gap/counter/alignment controls, draft/save/discard/revert and contextual AI handoff. Persistence here is preview widget state, not native application storage. Arbitrary AI generation, native write failure/stale revision fencing and platform font qualification remain unimplemented.
+
+Removed duplicate appearance view controls; shortened Chats/Sessions labels; moved fixture selectors behind Test states; removed ordinary selection-card borders; retained exact source-numbered choices and meaningful action labels.
+
+Checks: seven browser suites passed (custom-icon, workspace, plans, resources/recipes, AI conversations, agent settings, agent behavior). Custom checks identical Summary/Custom pixels across five sizes and zero/large/unknown counts, draft isolation, apply/discard/revert, state restoration, invalid/overlapping configs and AI handoff. Cargo: 91 passed; selftest: 40 traces and formats passed, board read succeeded. Existing src/operator.rs:563 unused-Result warning remains.
+
+Visual inspection: final-home, final-work, custom-light and custom-dark. Checked navigation, readable actual-size samples versus labelled enlargement, narrow 20px wrapping and direct edit access. Native icons/windows and real agent rendering are not qualified by these browser images. Root contract: 294 lines; local links/config/build embedding and diff whitespace checks passed.
+
+## Project counters and publication qualification
+
+Restored project-scoped nonzero counters in pinned/recent and All projects; known all-zero rows contain only project identity. Unknown values remain explicit. Counter navigation binds both project and state. Added K-A7 and the ordered refactoring/API backlog.
+
+Integrated current origin/main without reverting its document cleanup or runtime fixes. Fresh validation: 93 Cargo tests and selftest (40 traces, formats and board read) passed. All eight browser suites passed, including project-counters, Custom, workspace, plans, resources, AI, Access and Delivery. Existing unused-Result warning remains. Project counter light/dark screenshots inspected at 16px and narrow 20px; counters wrap without losing the project name. Local documentation links and diff whitespace checked.
+
+This publishes specifications, prototype and implementation backlog. No native menu/backend rollout is claimed.

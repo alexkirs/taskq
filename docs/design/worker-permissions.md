@@ -1,7 +1,9 @@
 # Worker permissions
 
+Product selection: D05 option 1 is accepted in the [decision register](decision-register.md). Remaining candidate language below refers to implementation/calibration, not a request to reapprove that direction. No running policy changes.
+
 Design proposal. No active permissions changed. Approve the R9/§8 amendment and migration before implementation.
-Shared candidate: [permission authority](https://github.com/taskqorg/specq/blob/main/engineering/permission-authority.md) (local, unpublished).
+Shared candidate: [permission authority](https://github.com/taskqorg/specq/blob/main/engineering/permission-authority.md).
 Applies to workers/reviewers; the tool-less AI operator keeps R3/R9 restrictions.
 
 ## Evidence and #865
@@ -128,6 +130,8 @@ Full without external isolation has no strict root boundary. Do not label it con
 - Tightening policy affects new attempts. Mark existing sessions with their old revision; never silently resume an old broader session. Incompatible resume requires a new attempt or explicit refusal.
 
 ## P6 Operator UI and commands
+
+Detailed workspace route and AS acceptance: [agent settings](agent-settings.md).
 
 `Settings → Agents → <runtime>`: identity/version/account, effective mode, isolation, source, freshness. Disabled runtime remains visible.
 Primary controls: `Read only | Workspace | Full`. Details: Files, Network, Tools, Project exceptions. Model/effort stay distinct; do not reset them while changing access.

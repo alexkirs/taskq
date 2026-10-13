@@ -1,6 +1,6 @@
 # Use-case-driven menu proposal
 
-Status: overall layout approved. Exact shortlist limits, recent ranking and emergency-stop semantics remain proposals. Runtime evidence is recorded in current-menu-audit.md.
+Status: overall layout approved. Exact shortlist limits, recent ranking and emergency-stop mechanism remain review candidates; the capability is required. Runtime evidence is recorded in current-menu-audit.md.
 Basis: [UC-01–UC-07](../use-cases/README.md), approved [M1–M12](menu.md), [shared D1–D14](https://github.com/taskqorg/specq/blob/main/design/operator-ui.md).
 The prototype uses invented fixtures. It demonstrates navigation and prioritization, not service operations.
 
@@ -42,7 +42,7 @@ Multiple blockers remain available in detail; do not pretend one cause explains 
 - Mixed admission opens scoped controls; it is not a blind global resume toggle.
 - Controls remains reachable from every menu level. It contains scoped admission, service diagnostics and the existing lifecycle commands.
 - Host-wide pause must not claim to stop execution on remote hosts. Readback and partial failure remain per target.
-- An emergency stop of running attempts is a separate open decision: affected attempts/hosts, unsaved work, retirement and recovery semantics are unresolved. Do not relabel Pause as Stop or add an unimplemented kill button.
+- Emergency stop is required; use [E1–E5](emergency-recovery.md) for named targets, preserved work, fencing and explicit recovery. Do not relabel Pause as Stop or imply the prototype terminates processes.
 - Pending/unreachable pause never displays successful pause. Keep the last known state and application result distinct.
 - Restart, stop until next login and uninstall stay under the service target; they are not interchangeable recovery shortcuts.
 

@@ -832,27 +832,39 @@ fn compact(run: bool, dark: bool) -> Rgba {
     img
 }
 
-/// Segments a–g of a 6×9 pt seven-segment digit, stroke 1.6: angular like the q.
-fn digit(img: &mut Rgba, x: f32, y: f32, d: u32, c: [u8; 4]) {
+/// Segments a–g of a 6×9 pt seven-segment digit at the origin, stroke 1.6: angular like the q.
+fn segments(d: u32) -> impl Iterator<Item = (f32, f32, f32, f32)> {
     let (w, h, t) = (6.0, 9.0, 1.6);
     let seg = [
-        (x, y, x + w, y + t),
-        (x + w - t, y, x + w, y + (h + t) / 2.0),
-        (x + w - t, y + (h - t) / 2.0, x + w, y + h),
-        (x, y + h - t, x + w, y + h),
-        (x, y + (h - t) / 2.0, x + t, y + h),
-        (x, y, x + t, y + (h + t) / 2.0),
-        (x, y + (h - t) / 2.0, x + w, y + (h + t) / 2.0),
+        (0.0, 0.0, w, t),
+        (w - t, 0.0, w, (h + t) / 2.0),
+        (w - t, (h - t) / 2.0, w, h),
+        (0.0, h - t, w, h),
+        (0.0, (h - t) / 2.0, t, h),
+        (0.0, 0.0, t, (h + t) / 2.0),
+        (0.0, (h - t) / 2.0, w, (h + t) / 2.0),
     ];
     let on = ["abcdef", "bc", "abged", "abgcd", "fgbc", "afgcd", "afgedc", "abc", "abcdefg", "abcdfg"][d as usize % 10];
-    for ch in on.bytes() {
-        let (a, b, cc, dd) = seg[(ch - b'a') as usize];
-        img.fill(c, rect(a, b, cc, dd));
+    on.bytes().map(move |ch| seg[(ch - b'a') as usize])
+}
+
+fn digit(img: &mut Rgba, x: f32, y: f32, d: u32, c: [u8; 4]) {
+    for (a, b, cc, dd) in segments(d) {
+        img.fill(c, rect(x + a, y + b, x + cc, y + dd));
     }
 }
 
+/// Ink bounds `(left, right)` of `n` drawn from x = 0 in 7 pt digit cells: a 1 has ink only in its right 1.6 pt.
+fn number_ink(n: usize) -> (f32, f32) {
+    let ds: Vec<u32> = n.to_string().bytes().map(|ch| (ch - b'0') as u32).collect();
+    let left = segments(ds[0]).map(|s| s.0).fold(f32::MAX, f32::min);
+    let right = segments(ds[ds.len() - 1]).map(|s| s.2).fold(0.0, f32::max);
+    (left, (ds.len() - 1) as f32 * 7.0 + right)
+}
+
 fn number_width(n: usize) -> f32 {
-    n.to_string().len() as f32 * 7.0 - 1.0
+    let (l, r) = number_ink(n);
+    r - l
 }
 
 /// macOS summary (menu.md M1, single ribbon): in work left, `ask` centered, ready right in 12 pt over 7 pt stacked
@@ -863,8 +875,9 @@ fn wide(s: &Summary, dark: bool) -> Rgba {
     let mut img = Rgba::new(w);
     let gray = |c: [u8; 4]| if s.run { c } else { p.muted };
     for (i, (n, c)) in s.counts.iter().zip([p.work, p.ask, p.muted]).enumerate() {
-        let nw = number_width(*n);
-        let x = [0.0, (w - nw) / 2.0, w - nw][i];
+        // align by ink, not by cell (menu.md M1)
+        let (l, r) = number_ink(*n);
+        let x = [-l, (w - l - r) / 2.0, w - r][i];
         for (k, ch) in n.to_string().bytes().enumerate() {
             digit(&mut img, x + k as f32 * 7.0, 1.5, (ch - b'0') as u32, gray(c));
         }
@@ -987,6 +1000,24 @@ mod tests {
         s.run = false;
         let p = palette(true);
         assert!(!has(&wide(&s, true), p.work) && has(&wide(&s, true), p.muted));
+    }
+
+    #[test]
+    fn summary_counts_align_by_ink() {
+        let p = palette(true);
+        for counts in [[1, 1, 1], [1, 0, 2], [10, 1, 71]] {
+            let img = wide(&Summary { counts, run: true, bins: vec![[0; 4]; 12], since: None }, true);
+            let ink = |x: u32, c: Option<[u8; 4]>| {
+                (0..img.h).any(|y| {
+                    let px = &img.px[((y * img.w + x) * 4) as usize..][..4];
+                    px[3] > 0 && c.is_none_or(|c| (0..3).all(|k| px[k].abs_diff(c[k]) <= 1))
+                })
+            };
+            assert!(ink(0, None) && ink(img.w - 1, None), "{counts:?}: outer counts touch both edges");
+            let mid: Vec<u32> = (0..img.w).filter(|x| ink(*x, Some(p.ask))).collect();
+            let center = (mid[0] + mid[mid.len() - 1] + 1) as f32 / 2.0;
+            assert!((center - img.w as f32 / 2.0).abs() <= 1.0, "{counts:?}: middle ink center {center} of {}", img.w);
+        }
     }
 
     #[test]

@@ -1,0 +1,3 @@
+{"project": "alpha", "host": "fixture", "version": "4.0.0-dev", "focus": ["all"], "tasks": [], "error": null, "incident": null, "incident_notice": false, "capacity": {"limits": {"claude": 0, "codex": 0}, "used": {"claude": 0, "codex": 0}, "load_gate": {"enabled": false, "cpu_max": 85, "memory_min": 15}, "gate": "off", "reasons": [], "sample_age_seconds": 0}}
+Update: unknown
+Incidents: none

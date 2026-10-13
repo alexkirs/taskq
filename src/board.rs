@@ -105,6 +105,7 @@ pub fn http_date(s: &str) -> Option<i64> {
 struct Reply {
     headers: Vec<(String, String)>,
     body: String,
+    operation: &'static str,
 }
 
 impl Reply {
@@ -112,13 +113,20 @@ impl Reply {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }
     fn json(&self) -> Result<Value> {
-        serde_json::from_str(&self.body).map_err(|e| format!("bad JSON from board: {e}"))
+        serde_json::from_str(&self.body).map_err(|e| {
+            crate::incident::detect("adapter.bad_json", concat!("src/board.rs:", line!()), "none", &[self.operation], &["http:2xx"]);
+            format!("bad JSON from board: {e}")
+        })
     }
     fn next(&self) -> Option<String> {
         // Link: <url>; rel="next", <url>; rel="last"
         self.header("link")?.split(',').find(|p| p.contains("rel=\"next\""))
             .and_then(|p| Some(p.split_once('<')?.1.split_once('>')?.0.to_string()))
     }
+}
+
+fn operation(method: &str) -> &'static str {
+    match method { "GET" => "read", "POST" => "create", "PUT" | "PATCH" => "update", "DELETE" => "delete", _ => "other" }
 }
 
 fn quote(s: &str) -> String {
@@ -169,7 +177,7 @@ fn curl(method: &str, url: &str, auth: &str, body: Option<&Value>) -> Result<Rep
             continue;
         }
         let headers = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
-        let reply = Reply { headers, body: body.to_string() };
+        let reply = Reply { headers, body: body.to_string(), operation: operation(method) };
         if !(200..300).contains(&status) {
             return Err(format!("{method} {url}: HTTP {status} {}", reply.body.chars().take(300).collect::<String>()));
         }
@@ -334,6 +342,26 @@ impl Http {
         }
     }
 
+    fn publication_ancestry(&self, sha: &str, mode: &str) {
+        // Only the immediate read in this close qualifies; later main changes are not incidents.
+        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) { return; }
+        let on_main = if self.kind == Kind::GitLab {
+            self.call("GET", &format!("/repository/merge_base?refs[]=main&refs[]={sha}"), None)
+                .and_then(|r| r.json()).and_then(|v| {
+                    let id = v["id"].as_str().filter(|id| id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit())).ok_or("unknown merge base")?;
+                    Ok(id == sha)
+                })
+        } else {
+            self.call("GET", &format!("/compare/main...{sha}"), None).and_then(|r| r.json())
+                .and_then(|v| match v["status"].as_str() {
+                    Some("identical" | "behind") => Ok(true), Some("ahead" | "diverged") => Ok(false), _ => Err("unknown ancestry".into()),
+                })
+        };
+        if on_main == Ok(false) {
+            crate::incident::detect("publication.not_on_main", concat!("src/board.rs:", line!()), "none", &[mode], &["ancestry:missing"]);
+        }
+    }
+
     fn try_publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> Result<Publish> {
         let gl = self.kind == Kind::GitLab;
         let branch = format!("taskq-{n}");
@@ -362,8 +390,20 @@ impl Http {
             }
             let iid = mr["iid"].as_u64().unwrap_or(0);
             let body = if mode == "pr" { json!({ "sha": sha, "squash": true, "squash_commit_message": format!("{title}\n\n{task_line}") }) } else { json!({ "sha": sha }) };
-            self.call("PUT", &format!("/merge_requests/{iid}/merge"), Some(body))?;
+            let merged = self.call("PUT", &format!("/merge_requests/{iid}/merge"), Some(body))?;
             let back = self.call("GET", &format!("/merge_requests/{iid}"), None)?.json()?;
+            if back["state"] != "merged" {
+                if let Ok(second) = self.call("GET", &format!("/merge_requests/{iid}"), None).and_then(|r| r.json())
+                    && second["state"] != "merged"
+                {
+                    crate::incident::detect("publication.readback", concat!("src/board.rs:", line!()), "none", &[mode], &["merge:unconfirmed"]);
+                }
+            }
+            if back["state"] == "merged" {
+                let merged = merged.json().ok();
+                let target = if mode == "direct" { sha } else { merged.as_ref().and_then(|v| v["squash_commit_sha"].as_str()).unwrap_or("") };
+                self.publication_ancestry(target, mode);
+            }
             return if back["state"] == "merged" { Ok(Publish::Done(format!("merged !{iid}"))) } else { Err(format!("!{iid} not merged yet")) };
         }
         if mode == "direct" {
@@ -372,6 +412,7 @@ impl Http {
                 return Ok(Publish::Failed(format!("{branch} is not at the result {sha}")));
             }
             self.call("PATCH", "/git/refs/heads/main", Some(json!({ "sha": sha, "force": false })))?;
+            self.publication_ancestry(sha, mode);
             return Ok(Publish::Done(format!("main fast-forwarded to {sha}")));
         }
         let owner = self.api.rsplit_once("/repos/").map(|x| x.1).and_then(|r| r.split('/').next()).unwrap_or_default().to_string();
@@ -384,8 +425,18 @@ impl Http {
             return Ok(Publish::Failed(format!("PR head is not the result {sha}")));
         }
         let p = prs[0]["number"].as_u64().unwrap_or(0);
-        self.call("PUT", &format!("/pulls/{p}/merge"), Some(json!({ "merge_method": "squash", "sha": sha, "commit_title": format!("{title} (#{p})"), "commit_message": task_line })))?;
+        let merged = self.call("PUT", &format!("/pulls/{p}/merge"), Some(json!({ "merge_method": "squash", "sha": sha, "commit_title": format!("{title} (#{p})"), "commit_message": task_line })))?;
         let back = self.call("GET", &format!("/pulls/{p}"), None)?.json()?;
+        if back["merged"] != true {
+            if let Ok(second) = self.call("GET", &format!("/pulls/{p}"), None).and_then(|r| r.json())
+                && second["merged"] != true
+            {
+                crate::incident::detect("publication.readback", concat!("src/board.rs:", line!()), "none", &[mode], &["merge:unconfirmed"]);
+            }
+        }
+        if back["merged"] == true {
+            if let Ok(merged) = merged.json() { self.publication_ancestry(&s(&merged, "sha"), mode); }
+        }
         if back["merged"] == true { Ok(Publish::Done(format!("merged #{p} as {}", s(&back, "merge_commit_sha")))) } else { Err(format!("#{p} not merged yet")) }
     }
 }
@@ -576,6 +627,7 @@ pub struct FakeState {
     pub next_id: u64,
     /// `pending` or `failed` makes `publish` refuse; anything else merges.
     pub publish: String,
+    pub hide_latest_comment: bool,
 }
 
 #[cfg(test)]
@@ -617,7 +669,8 @@ impl Board for Fake {
         self.state.borrow_mut().get(n).cloned()
     }
     fn comments(&self, n: u64) -> Result<Vec<Comment>> {
-        Ok(self.state.borrow().comments.iter().filter(|(i, _)| *i == n).map(|(_, c)| c.clone()).collect())
+        let st = self.state.borrow();
+        Ok(st.comments.iter().filter(|(i, c)| *i == n && !(st.hide_latest_comment && c.id == st.next_id)).map(|(_, c)| c.clone()).collect())
     }
     fn comment(&self, n: u64, body: &str) -> Result<u64> {
         self.state.borrow_mut().get(n)?;
@@ -685,6 +738,86 @@ impl Board for Fake {
 mod tests {
     use super::*;
 
+    fn publication_board(kind: Kind, mode: &str, first_merged: bool, second_merged: Option<bool>, ancestry: Option<bool>) -> (Http, std::rc::Rc<RefCell<Vec<(String, String)>>>) {
+        let calls = std::rc::Rc::new(RefCell::new(vec![]));
+        let captured = calls.clone();
+        let reads = RefCell::new(0);
+        let comparisons = RefCell::new(0);
+        let direct = mode == "direct";
+        let mut h = Http::new(kind, if kind == Kind::GitHub { "github.com" } else { "gitlab.example" }, "o/r", "fake");
+        h.transport = Some(Box::new(move |method, url, _| {
+            captured.borrow_mut().push((method.into(), url.into()));
+            let result = "a".repeat(40);
+            let merged = "b".repeat(40);
+            let value = if url.contains("/compare/") || url.contains("/merge_base?") {
+                *comparisons.borrow_mut() += 1;
+                let initial = *comparisons.borrow() == 1;
+                if !initial {
+                    assert!(url.ends_with(if direct { &result } else { &merged }), "ancestry must use the published SHA");
+                    if ancestry.is_none() { return Err("HTTP 503".into()); }
+                }
+                let on_main = !initial && ancestry == Some(true);
+                if kind == Kind::GitHub { json!({"status": if on_main { "identical" } else { "ahead" }}) }
+                else { json!({"id": if on_main { if direct { result } else { merged } } else { "c".repeat(40) }}) }
+            } else if url.contains("/check-runs") { json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}) }
+            else if url.ends_with("/status") { json!({"total_count": 0}) }
+            else if url.contains("/repository/commits/") { json!({"last_pipeline": {"status": "success"}}) }
+            else if url.contains("/git/ref/heads/taskq-") { json!({"object": {"sha": result}}) }
+            else if url.ends_with("/git/refs/heads/main") { json!({"object": {"sha": result}}) }
+            else if url.contains("/pulls?") { json!([{"number": 7, "head": {"sha": result}}]) }
+            else if url.contains("/merge_requests?") { json!([{"iid": 7, "sha": result}]) }
+            else if url.ends_with("/merge") { json!({"sha": merged, "squash_commit_sha": merged}) }
+            else if url.ends_with("/pulls/7") || url.ends_with("/merge_requests/7") {
+                *reads.borrow_mut() += 1;
+                let yes = if *reads.borrow() == 1 { first_merged } else { second_merged.ok_or("HTTP 503")? };
+                json!({"merged": yes, "state": if yes { "merged" } else { "opened" }, "merge_commit_sha": merged})
+            } else { panic!("unexpected {method} {url}") };
+            Ok(Reply { headers: vec![], body: value.to_string(), operation: operation(method) })
+        }));
+        (h, calls)
+    }
+
+    #[test]
+    fn incident_publication_uses_merge_sha_and_keeps_outcomes() {
+        for kind in [Kind::GitHub, Kind::GitLab] {
+            for mode in ["direct", "pr"] {
+                for ancestry in [Some(true), Some(false), None] {
+                    crate::incident::take_detected();
+                    let (h, calls) = publication_board(kind, mode, true, Some(true), ancestry);
+                    assert!(matches!(h.publish(1, &"a".repeat(40), mode, "title", "Task: fake"), Publish::Done(_)));
+                    assert_eq!(crate::incident::take_detected(), if ancestry == Some(false) { vec!["publication.not_on_main"] } else { vec![] });
+                    assert_eq!(calls.borrow().iter().filter(|(method, _)| method != "GET").count(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incident_publication_readback_requires_two_negative_reads() {
+        for kind in [Kind::GitHub, Kind::GitLab] {
+            for second in [Some(false), Some(true), None] {
+                crate::incident::take_detected();
+                let (h, calls) = publication_board(kind, "pr", false, second, Some(true));
+                assert!(matches!(h.publish(1, &"a".repeat(40), "pr", "title", "Task: fake"), Publish::Pending(_)), "reporting preserves first read outcome");
+                assert_eq!(crate::incident::take_detected(), if second == Some(false) { vec!["publication.readback"] } else { vec![] });
+                assert_eq!(calls.borrow().iter().filter(|(m, u)| m == "GET" && (u.ends_with("/pulls/7") || u.ends_with("/merge_requests/7"))).count(), 2);
+                assert_eq!(calls.borrow().iter().filter(|(method, _)| method != "GET").count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn incident_bad_json_is_only_a_successful_response() {
+        for fail in [false, true] {
+            crate::incident::take_detected();
+            let mut h = Http::new(Kind::GitHub, "github.com", "o/r", "fake");
+            h.transport = Some(Box::new(move |_, _, _| if fail { Err("HTTP 503 malformed response".into()) }
+                else { Ok(Reply { headers: vec![], body: "private invalid JSON".into(), operation: "read" }) }));
+            assert!(h.call("GET", "/issues", None).and_then(|r| r.json()).is_err());
+            assert_eq!(crate::incident::take_detected(), if fail { vec![] } else { vec!["adapter.bad_json"] });
+        }
+    }
+
     fn label_board(kind: Kind, fail: bool, mismatch: bool) -> (Http, std::rc::Rc<RefCell<Vec<Value>>>, std::rc::Rc<RefCell<usize>>) {
         let catalog = std::rc::Rc::new(RefCell::new(vec![json!({"id": 99, "name": "bug", "color": "FF0000", "description": "user owned"})]));
         let writes = std::rc::Rc::new(RefCell::new(0));
@@ -692,7 +825,7 @@ mod tests {
         let mut h = Http::new(kind, if kind == Kind::GitHub { "github.com" } else { "gitlab.example" }, "o/r", "test");
         h.transport = Some(Box::new(move |method, url, body| {
             assert!(url.contains("/labels"));
-            if method == "GET" { return Ok(Reply { headers: vec![], body: json!(*data.borrow()).to_string() }); }
+            if method == "GET" { return Ok(Reply { headers: vec![], operation: "read", body: json!(*data.borrow()).to_string() }); }
             assert!(matches!(method, "POST" | "PATCH" | "PUT"));
             if method == "POST" { assert!(url.ends_with("/labels")); }
             else if kind == Kind::GitLab { assert_eq!(method, "PUT"); assert!(url.rsplit('/').next().unwrap().parse::<u64>().is_ok()); }
@@ -706,7 +839,7 @@ mod tests {
             if let Some(old) = all.iter_mut().find(|old| old["name"] == v["name"]) {
                 v["id"] = old["id"].clone(); *old = v;
             } else { v["id"] = json!(all.len() + 100); all.push(v); }
-            Ok(Reply { headers: vec![], body: "{}".into() })
+            Ok(Reply { headers: vec![], operation: "read", body: "{}".into() })
         }));
         (h, catalog, writes)
     }
@@ -760,7 +893,7 @@ mod tests {
             let mut h = Http::new(kind, if kind == Kind::GitHub { "github.com" } else { "gitlab.example" }, "o/r", "test");
             h.set_label_schema(Some("legacy")).unwrap();
             h.transport = Some(Box::new(move |method, url, body| {
-                let reply = |body: Value| Ok(Reply { headers: vec![], body: body.to_string() });
+                let reply = |body: Value| Ok(Reply { headers: vec![], operation: "read", body: body.to_string() });
                 if url.contains("/members/") { return reply(json!({"access_level": 20})); }
                 if method == "GET" {
                     assert!(url.ends_with("/issues/7"));

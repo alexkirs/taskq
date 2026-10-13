@@ -14,7 +14,7 @@ pub const RELEASE_REPO: &str = "taskqorg/taskq";
 
 /// taskq as a coreq tool installed in `install`.
 pub fn tool(install: &Path) -> Tool {
-    Tool { install: install.into(), ..Tool::new("taskq", "TaskQ", RELEASE_REPO, VERSION) }
+    Tool { install: install.into(), fault: Some(crate::incident::launcher), ..Tool::new("taskq", "TaskQ", RELEASE_REPO, VERSION) }
 }
 
 pub fn default_install() -> PathBuf {
@@ -47,12 +47,22 @@ pub fn error_text(msg: &str, root: Option<&Path>) -> String {
 /// § 8 update steps (coreq), then the sweep: Ok(Some(version)) when a new release became current; with `check`, when
 /// one is available.
 pub fn update(install: &Path, check: bool) -> Result<Option<String>, String> {
-    let v = coreq::update::update(&tool(install), check)?;
+    let v = update_result(coreq::update::update(&tool(install), check))?;
     if v.is_some() && !check {
         let shim = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin/taskq")).unwrap_or_default();
         sweep(install, &shim);
     }
     Ok(v)
+}
+
+fn update_result(result: Result<Option<String>, String>) -> Result<Option<String>, String> {
+    if let Err(e) = &result {
+        if let Some((release, _)) = e.split_once(" selftest failed:") {
+            let field = format!("release:{release}");
+            crate::incident::detect("update.smoke", concat!("src/platform.rs:", line!()), "none", &[&field], &["smoke:failed"]);
+        }
+    }
+    result
 }
 
 /// § 8 step 2 sweep: everything in `<install>` the current version does not own, and the v3 shim. Best effort: a file
@@ -213,6 +223,19 @@ pub fn memory_available() -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incident_smoke_detection_excludes_download_and_security_failures() {
+        crate::incident::take_detected();
+        let smoke = Err("4.2.0 selftest failed: private diagnostic".into());
+        assert_eq!(update_result(smoke.clone()), smoke);
+        assert_eq!(crate::incident::take_detected(), ["update.smoke"]);
+        for e in ["download failed", "sha256 not in SHA256SUMS", "curl: timeout"] {
+            let failure = Err(e.into());
+            assert_eq!(update_result(failure.clone()), failure);
+        }
+        assert!(crate::incident::take_detected().is_empty());
+    }
 
     #[test]
     fn load_readings_parse_and_read_on_this_host() {

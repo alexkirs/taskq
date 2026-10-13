@@ -234,7 +234,7 @@ fn brief(root: &Path, install: &Path, req: &Value) -> String {
             "You are the taskq operator (taskq.md R3) in a project setup (taskq.md § 6): help the owner set up the folder below as a taskq project. You have no tools: use only this data.\n\
              Reply with exactly one JSON object and nothing else: {{\"kind\": \"clarify|proposal|refuse\", \"text\": \"...\", \"ops\": [...]}}.\n\
              - clarify: ask only for missing information, never repository visibility already read in the inspection; one question at a time until you know: GitHub or GitLab and the account below, an existing repository or a new one, owner/name, visibility (a new one is private unless the owner says public), publish pr (default) or direct.\n\
-             - proposal: exactly one op {{\"op\":\"setup\",\"board\":\"github|gitlab\",\"host\":\"github.com\",\"repo\":\"owner/name\",\"create\":true|false,\"visibility\":\"private|public\",\"publish\":\"pr|direct\"}}; text names account, repository and visibility. The service lists every effect for the owner to confirm; files, uncommitted work and remotes stay.\n\
+             - proposal: exactly one op {{\"op\":\"setup\",\"board\":\"github|gitlab\",\"host\":\"github.com\",\"repo\":\"owner/name\",\"create\":true|false,\"visibility\":\"private|public\",\"publish\":\"pr|direct\",\"incident_reports\":true|false}}; incident_reports defaults to true; use false if the owner opts out. Text names account, repository and visibility. The service lists every effect, including public incident reporting, for the owner to confirm; files, uncommitted work and remotes stay.\n\
              - refuse: it cannot be set up so (for example no account); text is the reason.\n\
              Use English, short plain lines (taskq.md R7).\n\
              Folder: {}\n{before}Request: {}\n",
@@ -350,6 +350,7 @@ pub struct Setup {
     create: bool,
     private: bool,
     publish: String,
+    incident_reports: bool,
 }
 
 /// The setup allowlist: known words, a plain host and `owner/name`; never over an existing `taskq.json`.
@@ -375,7 +376,12 @@ pub fn setup(o: &Value, root: &Path) -> Result<Setup, String> {
         return Err("repo: owner/name".into());
     }
     let private = word("visibility", &["private", "public"])? == "private";
-    Ok(Setup { root: root.into(), board, host, repo, create: o["create"] == true, private, publish: word("publish", &["pr", "direct"])? })
+    let incident_reports = match o.get("incident_reports") {
+        None => true,
+        Some(Value::Bool(value)) => *value,
+        _ => return Err("incident_reports: true or false".into()),
+    };
+    Ok(Setup { root: root.into(), board, host, repo, create: o["create"] == true, private, publish: word("publish", &["pr", "direct"])?, incident_reports })
 }
 
 impl Setup {
@@ -403,10 +409,32 @@ impl Setup {
             v.push(format!("Add git remote origin https://{}/{}.git", self.host, self.repo));
         }
         v.push(format!("Write taskq.json: board {}, repo {}, publish {}", self.board, self.repo, self.publish));
+        let who = self.incident_reports.then(|| incident_account(self.board == "github" && self.host == "github.com")).flatten();
+        v.extend(incident_disclosure(self.incident_reports, who.as_deref()));
         v.push(format!("Create the taskq labels on {}", self.repo));
         v.push(format!("Register {} on this host and install its service (starts at logon)", crate::project_name(&self.root)));
         v
     }
+}
+
+fn incident_account(board_github_com: bool) -> Option<String> {
+    use coreq::incident::{GitHub, Transport, github_token};
+    let tool = crate::platform::tool(&crate::platform::default_install());
+    let token = github_token(&tool, board_github_com)?;
+    GitHub::new(&tool, token).login().ok()
+}
+
+fn incident_disclosure(enabled: bool, account: Option<&str>) -> Vec<String> {
+    if !enabled {
+        return vec!["Incident reports: disabled (incident_reports: false); nothing sent or saved".into()];
+    }
+    vec![
+        format!("Incident reports: enabled (incident_reports: true); public destination https://github.com/{}", crate::platform::RELEASE_REPO),
+        format!("Posting account: {}", account.unwrap_or("unavailable; reports stay local without a verified github.com login")),
+        "Payload keys: schema, fault, fingerprint, report_id, release, revision, contract, board, runtime, os, site, evidence, observed, inferred".into(),
+        "Only sanitized codes and release metadata; no project, task, user, session, token, absolute path or raw error text".into(),
+        "Offline or unsupported login: local JSON fallback. Opt out: incident_reports: false or TASKQ_INCIDENT_REPORTS=off".into(),
+    ]
 }
 
 /// Apply the confirmed setup step by step, stopping at the first failure; `applied` only when `selftest` passes there
@@ -432,7 +460,7 @@ fn apply_setup(install: &Path, exe: &Path, root: &Path, ops: &[Value], shown: &V
             cmd("git", &["remote", "add", "origin", &format!("https://{}/{}.git", s.host, s.repo)], root, &[])?;
             lines.push("origin: added".into());
         }
-        let mut c = json!({"board": s.board, "repo": s.repo, "publish": s.publish});
+        let mut c = json!({"board": s.board, "repo": s.repo, "publish": s.publish, "incident_reports": s.incident_reports});
         if s.board == "gitlab" {
             c["host"] = json!(s.host);
         }
@@ -594,21 +622,38 @@ mod tests {
     }
 
     #[test]
+    fn incident_setup_discloses_account_payload_fallback_and_opt_out() {
+        let enabled = incident_disclosure(true, Some("reporter"));
+        assert!(enabled[0].contains(crate::platform::RELEASE_REPO) && enabled[0].contains("public"));
+        assert_eq!(enabled[1], "Posting account: reporter");
+        for key in ["schema", "fault", "fingerprint", "report_id", "release", "revision", "contract", "board", "runtime", "os", "site", "evidence", "observed", "inferred"] {
+            assert!(enabled[2].contains(key), "{key}");
+        }
+        assert!(enabled[4].contains("local JSON") && enabled[4].contains("false") && enabled[4].contains("TASKQ_INCIDENT_REPORTS=off"));
+        assert!(incident_disclosure(true, None)[1].contains("unavailable; reports stay local"));
+        assert_eq!(incident_disclosure(false, Some("reporter")), ["Incident reports: disabled (incident_reports: false); nothing sent or saved"]);
+    }
+
+    #[test]
     fn a_setup_lists_every_effect_and_never_overwrites() {
         let root = temp("setup");
         let ok = |o: Value| setup(&o, &root);
         let s = ok(json!({"op": "setup", "repo": "o/n"})).unwrap();
-        assert!(s.private && !s.create && (s.board.as_str(), s.host.as_str(), s.publish.as_str()) == ("github", "github.com", "pr"), "new repositories default to private");
+        assert!(s.private && !s.create && s.incident_reports && (s.board.as_str(), s.host.as_str(), s.publish.as_str()) == ("github", "github.com", "pr"), "new repositories default to private, reporting disclosed before confirmation");
+        assert!(!ok(json!({"op": "setup", "repo": "o/n", "incident_reports": false})).unwrap().incident_reports);
         for bad in [json!({"op": "pause", "project": "a"}), json!({"op": "setup", "repo": "n"}), json!({"op": "setup", "repo": "-o/n"}), json!({"op": "setup", "repo": "o/../n"}),
-            json!({"op": "setup", "repo": "o/n", "visibility": "open"}), json!({"op": "setup", "repo": "o/n", "host": "a b"}), json!({"op": "setup", "repo": "o/n", "board": "jira"})] {
+            json!({"op": "setup", "repo": "o/n", "visibility": "open"}), json!({"op": "setup", "repo": "o/n", "host": "a b"}), json!({"op": "setup", "repo": "o/n", "board": "jira"}),
+            json!({"op": "setup", "repo": "o/n", "incident_reports": "false"}), json!({"op": "setup", "repo": "o/n", "incident_reports": null})] {
             assert!(ok(bad.clone()).is_err(), "{bad}");
         }
-        let p = parse(r#"{"kind": "proposal", "text": "x", "ops": [{"op": "setup", "repo": "o/n", "publish": "direct"}]}"#, &[], Some(&root));
+        let p = parse(r#"{"kind": "proposal", "text": "x", "ops": [{"op": "setup", "repo": "o/n", "publish": "direct", "incident_reports": false}]}"#, &[], Some(&root));
         assert_eq!(p["state"], "proposal");
         let e: Vec<&str> = p["effects"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
         assert!(e[0].starts_with("Run git init in ") && e[1] == "Use existing repository github.com/o/n" && e[2] == "Add git remote origin https://github.com/o/n.git", "{e:?}");
-        assert_eq!(&e[3..5], ["Write taskq.json: board github, repo o/n, publish direct", "Create the taskq labels on o/n"]);
-        assert!(e[5].starts_with("Register ") && e.len() == 6);
+        assert_eq!(e[3], "Write taskq.json: board github, repo o/n, publish direct");
+        assert_eq!(e[4], "Incident reports: disabled (incident_reports: false); nothing sent or saved");
+        assert_eq!(e[5], "Create the taskq labels on o/n");
+        assert!(e[6].starts_with("Register ") && e.len() == 7);
         let two = r#"{"kind": "proposal", "text": "x", "ops": [{"op": "setup", "repo": "o/n"}, {"op": "setup", "repo": "o/m"}]}"#;
         assert_eq!(parse(two, &[], Some(&root))["state"], "failed", "one setup op only");
         assert_eq!(parse(r#"{"kind": "proposal", "text": "x", "ops": [{"op": "pause", "project": "a"}]}"#, &[("a".into(), "/a".into())], Some(&root))["state"], "failed");
@@ -618,9 +663,9 @@ mod tests {
         assert_eq!(onboard(&root, &json!({"text": "GitHub", "after": "1"})), Some(root.clone()));
         assert_eq!(onboard(&root, &json!({"text": "x"})), None);
         assert_eq!(onboard(&root, &json!({"onboard": "relative/dir"})), None, "only an absolute, existing folder");
-        let shown = json!(setup(&json!({"op": "setup", "repo": "o/n"}), &root).unwrap().effects());
+        let shown = json!(setup(&json!({"op": "setup", "repo": "o/n", "incident_reports": false}), &root).unwrap().effects());
         fs::create_dir(root.join(".git")).unwrap();
-        let (applied, lines) = apply_setup(&root, Path::new("/nonexistent"), &root, &[json!({"op": "setup", "repo": "o/n"})], &shown);
+        let (applied, lines) = apply_setup(&root, Path::new("/nonexistent"), &root, &[json!({"op": "setup", "repo": "o/n", "incident_reports": false})], &shown);
         assert!(!applied && lines[0].contains("effects changed"), "{lines:?}");
         fs::remove_dir(root.join(".git")).unwrap();
         fs::write(root.join("taskq.json"), "{}").unwrap();

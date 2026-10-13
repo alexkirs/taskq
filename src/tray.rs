@@ -190,7 +190,9 @@ fn project(root: &str) -> Value {
         "issues": s["issues"].as_str().unwrap_or(""), "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
         "error": s["error"], "focus": s["focus"].as_array().cloned().unwrap_or_default(), "saved": saved, "labels": crate::status_labels(r),
         "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"],
-        "capacity": s["capacity"], "cap_host": cap_host, "cap_saved": cap_saved, "agents": s["agents"]})
+        "capacity": s["capacity"], "cap_host": cap_host, "cap_saved": cap_saved, "agents": s["agents"],
+        "incident": s["incident"], "incident_line": s.get("incident").map(crate::incident::line), "incident_notice": s["incident_notice"],
+        "incident_repo": crate::platform::RELEASE_REPO})
 }
 
 fn now() -> i64 {
@@ -597,6 +599,13 @@ fn act(action: &str, root: &Path, label: Option<&str>) {
             }
         }
         "folder" => open(&root.display().to_string()),
+        "incident-report" => {
+            let s: Value = fs::read_to_string(d.join("status.json")).ok().and_then(|x| serde_json::from_str(&x).ok()).unwrap_or_default();
+            if let Some(path) = incident_path(root, &s["incident"]) {
+                open(&path.display().to_string());
+            }
+        }
+        "incident-manual" => open(&format!("https://github.com/{}/issues/new", crate::platform::RELEASE_REPO)),
         // a separate process: on macOS `launchctl bootout` kills the service's process group, this tray included
         "stop" | "uninstall" => {
             let Ok(me) = std::env::current_exe() else {
@@ -614,6 +623,13 @@ fn act(action: &str, root: &Path, label: Option<&str>) {
         }
         _ => {}
     }
+}
+
+fn incident_path(root: &Path, incident: &Value) -> Option<PathBuf> {
+    let dir = crate::dot(root).join("incidents").canonicalize().ok()?;
+    let path = root.join(incident["path"].as_str()?);
+    let resolved = path.canonicalize().ok()?;
+    (resolved.starts_with(dir) && resolved.is_file() && resolved.extension().is_some_and(|x| x == "json")).then_some(path)
 }
 
 /// `Resources` (menu.md M5): btop in its own OS terminal window, installed first with the OS package manager when
@@ -1051,6 +1067,21 @@ fn capture(wv: &WebView, path: PathBuf, done: impl Fn() + 'static) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incident_report_only_opens_json_inside_its_project() {
+        let root = std::env::temp_dir().join(format!("taskq-tray-incident-{}", std::process::id()));
+        let dir = crate::dot(&root).join("incidents");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("report.json"), "{}").unwrap();
+        fs::write(root.join("private.json"), "{}").unwrap();
+        fs::write(dir.join("program.exe"), "{}").unwrap();
+        assert_eq!(incident_path(&root, &json!({"path": ".taskq/incidents/report.json"})), Some(dir.join("report.json")));
+        for path in ["private.json", ".taskq/incidents/../../private.json", ".taskq/incidents/program.exe", ".taskq/incidents/missing.json"] {
+            assert!(incident_path(&root, &json!({"path": path})).is_none(), "{path}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn clarify_thread_is_oldest_first_and_stops_at_missing_or_cycle() {

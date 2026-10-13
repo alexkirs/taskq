@@ -3,6 +3,15 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## Unreleased
+
+TaskQ faults now produce sanitized, deduplicated public incident reports in `taskqorg/taskq`, through the existing
+github.com account; unsupported auth, offline or uncertain delivery keeps a local JSON report. Setup and update
+disclose the destination, account, payload and fallback. New setups enable this after owner confirmation; existing
+projects without `incident_reports` stay local and show a notice. Set it to `false`, or `TASKQ_INCIDENT_REPORTS=off`,
+to write nothing. The service status and tray show the newest outcome. Coreq is pinned to tag v0.4.0, including
+launcher fault hooks and replacement on update (effective at the next launcher start). No board format change.
+
 ## v4.1.5
 
 Same-host race: a worker that wrote `ask`, `result` or `requeue` and exits after the owner's answer arrived is a clean

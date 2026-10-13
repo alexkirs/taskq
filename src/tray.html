@@ -33,6 +33,7 @@ details[open]>summary:after{transform:rotate(90deg)}
 .work{color:var(--work)}.ask{color:var(--ask)}.ready{color:var(--ready)}.failed{color:var(--failed)}
 .options{display:flex;gap:5px;flex-wrap:wrap;padding:4px}
 .options button{flex:1;min-width:38px}
+.options button.rec{border-color:var(--work);font-weight:600}
 button[aria-pressed=true]{background:light-dark(#dce7e1,#354a40);border-color:var(--work)}
 .periods button{flex:1 0 auto;padding:4px 6px}
 .views button{display:flex;align-items:center;justify-content:center;gap:6px;min-height:34px;font-size:.9em}
@@ -133,6 +134,11 @@ const aiStates={queued:'Queued',running:'Working…',clarify:'Needs your answer'
 const aiCommands=['What needs my answer?','What is running now?','Why is nothing starting?','Pause all projects'];
 // every value the command gets is shown before confirm
 function opText(o){return [o.project+':',o.op,o.task?'#'+o.task:'',(o.labels||[]).join(' '),o.title?'"'+o.title+'"':'',o.goal?'goal: '+o.goal:'',(o.acceptance||[]).map(x=>'acceptance: '+x).join('; '),o.request?'request: '+o.request:'',o.option?'option '+o.option:'',o.text||''].filter(Boolean).join(' ');}
+// R6 item 7 `Next: 1 <action> ★ · 2 <action>` as the last line: numbered 1..n in order, at most one ★; else null (raw text only)
+function nextActions(t){
+  const l=String(t||'').trim().split('\n').pop().trim();if(!l.startsWith('Next: '))return null;
+  const xs=l.slice(6).split(' · ').map((s,i)=>{const m=/^(\d+) (\S.*?)( ★)?$/.exec(s.trim());return m&&+m[1]===i+1?{n:m[1],text:s.trim(),rec:!!m[3]}:null;});
+  return xs.every(Boolean)&&xs.filter(x=>x.rec).length<2?xs:null;}
 function ai(){
   const A=S.ai,r=A.request,an=r&&r.answer||{},st=r?(an.state||'queued'):null,bad=['failed','refuse','apply failed'].includes(st);
   let h='<div class="group"><div class="row meta">✦ Ask AI · '+(A.target?'projects: '+esc(S.projects.map(p=>p.name).join(', ')):'no running service: cannot send')+'</div>';
@@ -140,6 +146,9 @@ function ai(){
     const a=q.answer||{},state=a.state||'queued',bad=['failed','refuse','apply failed'].includes(state);
     h+='<div class="body"><div class="meta">'+(q.url?'<a href="'+esc(q.url)+'" data-url="'+esc(q.url)+'">Comment on #'+esc(q.task)+' ↗</a>: ':'You: ')+esc(q.text||'')+'</div><div class="'+(bad?'alert':state==='applied'||state==='result'?'work':'ask')+'" role="status">'+esc(aiStates[state]||state)+(a.reason?': '+esc(a.reason):'')+'</div>'+(a.text?'<div>'+esc(a.text).replace(/\n/g,'<br>')+'</div>':'')+'</div>';
   }
+  // a Next button replies with its number, the same token as typing it; the chain then shows `You: <number>`
+  const nx=r&&['result','clarify','refuse'].includes(st)&&nextActions(an.text);
+  if(nx)h+='<div class="options" role="group" aria-label="Next">'+nx.map(x=>'<button data-a="ai-next" data-v="'+x.n+'"'+(x.rec?' class="rec"':'')+'>'+esc(x.text)+'</button>').join('')+'</div>';
   h+='<div class="askai"><textarea id="ai" rows="2" aria-label="'+(st==='clarify'?'Answer to AI':'Request to AI')+'" placeholder="'+(st==='clarify'?'Answer…':'Ask, or request a change')+'">'+esc(aiText)+'</textarea><button data-a="ai-menu" aria-label="History and commands" title="History and commands" aria-expanded="'+aiMenu+'">↶</button></div>';
   if(aiMenu)h+='<div class="row meta">Recent</div>'+(A.history.length?A.history.map(t=>'<button class="project" data-a="ai-pick" data-v="'+esc(t)+'"><span>'+esc(t)+'</span></button>').join('')+'<button class="project" data-a="ai-clear">Clear history</button>':'<div class="body meta">No sent requests</div>')+
     '<div class="row meta">Commands</div>'+aiCommands.map(t=>'<button class="project" data-a="ai-pick" data-v="'+esc(t)+'"><span>'+esc(t)+'</span></button>').join('');
@@ -290,6 +299,7 @@ menu.addEventListener('click',e=>{
   if(d.a==='ai-menu'){aiMenu=!aiMenu;render();return;}
   // picking fills the input, never sends (M-A13)
   if(d.a==='ai-pick'){aiText=d.v;aiMenu=false;send({a:'ai-draft',text:aiText});render();const t=document.getElementById('ai');t.focus();t.setSelectionRange(t.value.length,t.value.length);return;}
+  if(d.a==='ai-next'){send({a:'ai-send',text:d.v,after:S.ai.request.id});render();return;}
   if(d.a==='ai-send'){const r=S.ai.request,an=r&&r.answer||{};if(!aiText.trim())return;send({a:'ai-send',text:aiText,after:an.state==='clarify'?r.id:''});aiText='';render();return;}
   if(d.a==='ai-confirm'){aiConfirm=d.id+'/'+d.rev;send({a:'ai-confirm',root:d.root,id:d.id,rev:Number(d.rev)});render();return;}
   if(d.a==='ai-clear'){send({a:'ai-clear'});return;}

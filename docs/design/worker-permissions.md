@@ -188,3 +188,5 @@ Apply with implementation and executable lifecycle traces, after owner approval.
 
 Suggested slices: policy authority/migration; runtime adapters/boundaries; denial lifecycle; tray/CLI/readback. Each slice gets its own executable acceptance and supported-platform evidence.
 Open: authenticate local grants; external-isolation baseline; host default/migration hold; emergency breach response. Do not implement a security guarantee using only prompt text or same-user file permissions.
+
+Projects-folder and cwd semantics: [S2–S4](setup-and-project-locations.md). Neither the parent-folder preference nor cwd grants access to sibling projects or substitutes for P4 enforcement.

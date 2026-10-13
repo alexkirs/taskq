@@ -7,8 +7,9 @@ Follow the [shared use-case method](https://github.com/taskqorg/specq/blob/main/
 
 ## UC-01. Start work on a project
 
-Source: owner. Variants: new or existing project.
+Source: owner. Variants: new or existing project; agent request or agent-free install command. [Setup and project locations](../design/setup-and-project-locations.md) defines shared setup, runtime detection and S-A1–S-A8.
 
+- Select the host Projects folder for new checkouts, or an exact existing project path. Do not scan home or register sibling folders; workers use their exact project/worktree root.
 - New: describe the goal, name, repository provider and destination. Clarify missing details.
 - Existing: name the project; inspect its folder, board and registration.
 - Show setup effects. After confirmation, initialize or connect, register and verify access (§6).

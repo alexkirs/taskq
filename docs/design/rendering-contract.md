@@ -15,14 +15,14 @@ Target for native implementation. Apply [shared F1–F6](https://github.com/task
 Logical units below. Convert physical monitor/anchor values exactly once using that monitor's scale.
 
 - Windows: monitor containing the tray anchor, usable rectangle from the native work-area API (including taskbar). macOS: owning display's visible frame and menu-bar anchor; normalize coordinate origins.
-- Keep 8 logical units inside usable edges and 4 from the anchor. Account for actual outer chrome/shadow allowance; do not subtract it twice.
+- Keep 8 logical units at horizontal usable edges. Prefer a 4-unit anchor gap when it fits. Vertical height may use the full usable work area; reserve only native chrome/shadow or OS-required clearance, counted once.
 - Base menu width: 360 at 16 px. Target `max(320, 360 × font / 16)`, clamped to usable width minus margins. Thus 18→405, 20→450 when space permits. Screen constraints may reduce below 320; reflow, never overflow off-screen.
 - Measure natural content at that width after fonts load. Do not derive desired height from a fixed-height or already scrolling viewport.
-- Prefer below a top/menu-bar anchor and above a bottom/taskbar anchor. If that side cannot fit natural height, try the opposite side. Otherwise use the side with more usable space; vertical taskbars use the larger available vertical placement and clamp horizontally clear of the taskbar.
-- `outerHeight = min(naturalContentHeight + nativeChrome, availableHeight)`. If it fits, no primary vertical scrollbar. No fixed 400/580/640 px or 80%-of-screen runtime cap.
+- Prefer below a top/menu-bar anchor and above a bottom/taskbar anchor. Try the opposite side if needed, then slide vertically within the full work area before constraining height. The anchor side is a placement preference, not a height limit; vertical taskbars must not force a half-screen viewport.
+- `availableHeight` is the full usable work-area height minus OS-required outer clearance, never only the space on one side of the anchor. `outerHeight = min(naturalContentHeight + nativeChrome, availableHeight)`. Up to 100% is allowed, not required. Short content stays short; fitting content has no primary scrollbar. No fixed 400/580/640 px or percentage runtime cap.
 - `scrollViewport = outerHeight - nativeChrome - fixedHeader - fixedFooter`. All terms measured at actual font/DPI; clamp nonnegative. If chrome itself cannot fit, use a scrollable compact fallback retaining Back/Close and focused input, never an empty negative viewport.
 - Resize on navigation, expansion/collapse, font/DPI/monitor change and actual content-size change. Coalesce layout passes; suppress repeated <=1 physical-pixel measurement jitter only when content remains fully reachable. A real 1-pixel overflow still requires fit/scroll handling. Do not resize continuously for same-size status updates.
-- Open with correct size before exposure where supported. Changing monitor or taskbar placement recalculates usable space. Preserve anchor; do not cover the taskbar, menu bar or notch exclusion.
+- Open with correct size before exposure where supported. Changing monitor or taskbar placement recalculates usable space. Keep the anchor association while allowing vertical repositioning; do not cover the taskbar, menu bar or notch exclusion.
 - Snapshot mode uses the same sizing algorithm as normal opening. Full-document diagnostic captures may exist, clearly labelled; they do not qualify visible-window fit.
 
 ## R-UI3 Scroll ownership

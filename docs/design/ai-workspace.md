@@ -1,7 +1,9 @@
 # AI workspace
 
+Product selection: D10 option 1 is accepted in the [decision register](decision-register.md). Remaining candidate language below refers to implementation/calibration, not a request to reapprove that direction. No running policy changes.
+
 Design target under [R3/R9](../../taskq.md). Not a claim of runtime support.
-One main window plus explicitly detached conversations is owner-approved. Retention, attachment budgets and cancellation semantics below are proposals pending implementation review.
+One main window plus explicitly detached conversations is owner-approved. MP3 approves retained history, archive, one active request per conversation and acknowledged cancellation. Attachment budgets and backend cancellation/recovery still need implementation qualification.
 [Menu M7](menu.md#m7-ai-entry) · [Use cases](../use-cases/README.md) · [Current gaps](current-menu-audit.md).
 
 ## C1. Three distinct collections
@@ -28,6 +30,8 @@ No background scan of unrelated Codex/Claude chats; list only TaskQ-known conver
 - Narrow window: switch between list and conversation with Back; preserve selection, drafts and scroll position.
 
 ## C3. Composer and context
+
+- Questions follow [Q1 numbering](plans-and-decisions.md#q1-answer-where-the-question-appears). Imported choices keep source numbers/text/order; local conversation choices get stable numbers. Show the number on each answer button.
 
 - Show explicit project set, host and selected conversation before Send. Menu scope and conversation scope are not silently interchangeable.
 - Changing context affects the next message, not previous messages or applied work; show the change in the conversation.
@@ -57,7 +61,7 @@ No background scan of unrelated Codex/Claude chats; list only TaskQ-known conver
 | Failed / interrupted | Known failure and uncertain delivery boundary | Retry after reconciliation; keep draft/context |
 | Cancelled | Backend-acknowledged cancellation | Continue with a new request; no claim of rollback |
 
-While a request runs, allow drafting the next message. Proposal: one in-flight request per conversation; Send waits until the active request reaches a compatible terminal/clarification state. Different conversations may proceed within confirmed operator capacity.
+While a request runs, allow drafting the next message. Approved: one in-flight request per conversation; Send waits until the active request reaches a compatible terminal/clarification state. Different conversations may proceed within confirmed operator capacity.
 Closing a window is never Cancel. Do not ship an enabled Stop button without backend cancellation and readback.
 A newer message or changed target state invalidates a conflicting proposal. Reconcile before offering Confirm again.
 
@@ -87,11 +91,11 @@ The current tool-less operator cannot perform arbitrary project research or file
 - Session search matches project, issue, title and host. No token-cost/progress metrics unless the service supplies them.
 - A live task may receive steering only through a separately reviewed backend operation; the UI must not send text directly to an unrelated session.
 
-## C7. Persistence and history proposal
+## C7. Persistence and history
 
 - Persist conversation ID, context, messages, attachment references, request/revision links, operation receipts, draft and window ownership locally.
 - Board task state stays on the board (R1). Conversation storage does not become a second scheduler or task database.
-- Suggested first version: retain conversations until explicit deletion; Archive hides terminal conversations but preserves access. Active/unresolved work cannot be silently purged.
+- Approved direction: retain conversations until explicit deletion; Archive hides terminal conversations but preserves access. Active/unresolved work cannot be silently purged.
 - Before storage is full, stop accepting new attachments with a clear explanation; do not silently drop history. Budgets and retention UI require owner review.
 - Delete conversation explains local messages/attachments removed and board tasks preserved. Never delete source files or running work. Unresolved application must be reconciled first.
 - Clear command history affects only command text. Archive, window close, request cancellation and deletion are distinct actions.
@@ -111,3 +115,18 @@ The current tool-less operator cannot perform arbitrary project research or file
 | C-A8 | Remote/missing permalinks cannot launch local sessions; local attempts use the correct agent identity. |
 | C-A9 | UC-01–UC-07 have an explicit result, supported route or honest unresolved contract boundary. |
 | C-A10 | 16/20 px, narrow/short windows, keyboard, IME, screen reader, both themes; composer and Back remain reachable. |
+
+## C9 Interactive review route
+
+- Integrated workspace opens Conversations; show list, New, search and Archive. Narrow surfaces use List/Back instead of squeezing the transcript beside a list.
+- Each conversation owns context, draft, attachments, request revision and window owner. List selection and reopening never submit. Menu composer names New conversation and its project. Send creates that conversation and transfers its draft/files once; existing conversations stay intact.
+- Preview state controls are outside production actions and change the displayed fixture immediately. They cover queued/running, clarification, answer/refusal, proposal/application, partial failure, interrupted and acknowledged cancellation. Follow-up messages retain previous questions and terminal results in the transcript.
+- Attachment chips expose reading/ready/error, size, remove and local image preview. Rejected files keep the draft. Reload restores metadata as Reattach required unless actual bytes were persisted securely.
+- Cancellation first shows Cancelling; only an acknowledged result shows Cancelled. Applying cannot promise cancellation. Partial writes require reconciliation; successful operations are not retried.
+- Simulated restart preserves conversation/draft and marks unresolved delivery Interrupted. Check status before Retry; no automatic resubmission. Interrupted/partial outcomes and unreviewed proposals block another send in that conversation; drafting remains available. A prior proposal must be refreshed before confirmation.
+- Archive/delete is disabled for active or unresolved requests. Delete review names the local history/attachments; source files and board tasks remain untouched.
+- Detached ownership is simulated in the browser; a visible owner bar offers Raise/Return. Native separate windows remain an implementation gate.
+
+Reference: [AI component](ai-conversations.html), composed into [workspace](workspace-prototype.html). Fixture limits are demonstrative, not approved runtime budgets. File bytes never leave this preview. Existing C-A checks apply; no new operator authority.
+
+Planning/start behavior follows [P2](plans-and-decisions.md#p2-ai-led-authoring): create held by default; explicit start; one brief reminder after an actionable planning milestone, no repeated reminder per message.

@@ -5,6 +5,7 @@ Approved: aggregate above Projects; all queue states available; Closed visually 
 ## Semantics
 
 - Home: one compact aggregate strip immediately above Projects. Scope: all registered observed boards, not just pinned/recent or admitting projects. Click opens the corresponding task list.
+- Every visible project row (pinned, recent and All projects) includes its own nonzero counters beside its name; aggregate counters never replace them. A known all-zero project shows its name only, without an empty strip or `No tasks` caption.
 - Project: same order and symbols, only that board/project. Deduplicate by provider/server/repository/issue across registrations/hosts; conflicting or stale observations mark incomplete.
 - Order: Doing, Review, Ask, Failed, Ready, Blocked, Later, Closed. No Work total alongside Doing/Review; that would count twice.
 - Zero hides its capsule; unknown shows `?`, never zero. Empty accurate state says `No tasks`. Incomplete sum says `Partial` with affected sources.
@@ -30,3 +31,5 @@ Approved: aggregate above Projects; all queue states available; Closed visually 
 - K-A4: aggregate includes projects outside shortlist; scope and partial sources inspectable.
 - K-A5: 320 px and 20 px type wrap without horizontal overflow; Closed readable in both themes.
 - K-A6: selected capsule opens matching tasks; no accidental project navigation.
+
+- K-A7: pinned/recent/All projects preserve per-project nonzero counters; known all-zero rows show only project identity; each counter opens that project and state, without triggering the project-name action.

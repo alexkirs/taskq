@@ -3,7 +3,7 @@
 Validate TaskQ project setup, planning, focus and execution against user intent.
 [Contract](../../taskq.md) · [Menu](../design/menu.md) · [Shared documentation rules](https://github.com/taskqorg/specq/blob/main/caveman/rules/documentation.md).
 
-Follow the [shared use-case method](https://github.com/taskqorg/specq/blob/main/engineering/use-cases.md). Keep TaskQ cases in this file. UC-01–UC-07 record supplied needs; Q1/Q3–Q6 and P-01–P-03 remain open. Q2 is resolved.
+Follow the [shared use-case method](https://github.com/taskqorg/specq/blob/main/engineering/use-cases.md). Keep TaskQ cases in this file. Needs are distinct from implementation guarantees. [Decision register](../design/decision-register.md) owns pending selections; [scenario review](../design/scenario-review.md) records coverage/evidence. Q2 is resolved; Q1/Q3–Q6 explain remaining contract constraints.
 
 ## UC-01. Start work on a project
 
@@ -24,6 +24,7 @@ Open: initial capacity limits.
 Source: owner.
 
 - Say `task` and name the project in a supported agent session.
+- Activation, canonical reports and opt-in observation follow [A1–A5](../design/agent-entry.md). A discoverable integration must exist; the keyword alone supplies no tools or permissions.
 - The agent loads TaskQ rules, the PM role and the current board. The chat is not a second queue.
 - The owner describes work. PM clarifies the goal, boundaries and acceptance before filing a task.
 - Do not repeat questions already answered by the request.
@@ -122,7 +123,90 @@ Source: owner. Implementation proposal: [worker permissions](../design/worker-pe
 Result: operator intent matches effective access; project/task content cannot grant authority.
 Open: authenticated grant channel, OS qualification, migration and breach lifecycle in P9.
 
-## Coverage
+## UC-09. Answer without leaving the task
+
+Source: owner. [Decision UI and API proposal](../design/plans-and-decisions.md#q1-answer-where-the-question-appears).
+
+- Open Attention or a task with a question. Read the reason and choices.
+- Select one ordinary answer; the service posts that exact choice to that card. Show matching receipt before success.
+- Use Other answer or discuss with AI when choices do not fit. AI does not answer for the owner.
+- Replaced question: refresh and choose again. Unknown delivery: reconcile before retry.
+
+Result: the intended task receives one owner answer, without opening an external agent.
+Open: conditional-write/receipt contract; current option parsing alone does not prove race safety.
+
+## UC-10. Continue through another agent or client
+
+Source: owner. [P1/P2](../product-principles.md).
+
+- Open the same registered board through another capable PM or directly in the forge.
+- Read task, dependencies, question, answer and evidence without importing a proprietary task database.
+- Keep task IDs and source option numbers. Route actions through existing authority and attempt rules.
+- Unsupported execution adapter: explain the missing capability. Do not start a duplicate or migrate a live attempt.
+
+Result: management can change while board work remains intact. Provider migration is a separate operation.
+
+## UC-11. Work with agent desktops closed
+
+Source: owner. [P10](../product-principles.md).
+
+- With a service and headless runtime available, close external agent desktops.
+- Use the menu/workspace to plan, attach evidence, confirm task/configuration proposals, answer numbered questions and inspect results.
+- Reopen the same conversation/session when supported; never launch another attempt just to display it.
+- Missing runtime or app-dependent adapter: show the exact limitation and supported alternative before starting work.
+
+Result: no external agent desktop is needed for the supported headless path. Planning and runtime adapters require end-to-end qualification.
+
+## UC-12. Control computers with different resources and access
+
+Source: owner. [P8](../product-principles.md).
+
+- Name each host's limits and access through text/dictation or direct controls.
+- Review targets, effective values and exceptions; apply only those confirmed. Existing attempts retain their defined policy.
+- Inspect occupied slots, freshness and waiting reasons. Open Resources for the named supported host using btop/btop4win.
+- Do not confuse a per-project limit with the total machine budget. Installation, unavailable hosts and unsupported remote tools stay explicit.
+
+Result: the owner can explain where work runs and why it waits. Shared budgets/fairness remain Q4 work.
+
+## UC-13. Interrupt, recover and switch work
+
+Source: owner emergency requirement plus P-01–P-03 proposals.
+
+- Pause new admission while current attempts continue; preserve the current focus before switching projects.
+- For emergency, name the host/targets, stop owned work and retain a durable hold. Offline hosts and uncertain effects stay unknown.
+- After crash, quota loss or cancellation, inspect liveness, leases, preserved work and operation outcomes before retry.
+- Show choices: keep held, inspect or restart eligible selected work. Never launch a second live attempt or silently broaden scope.
+- Restore a previous mode only through current eligibility/policy review. No saved-mode library is required for the basic return path.
+
+Result: visible state and recoverable work; no duplicate launch/publication. Policy choices D12; runtime gates G1/G2/G3 remain.
+
+## UC-14. Review evidence and deliver
+
+Source: owner. [P3/P4/P9](../product-principles.md), [Delivery](../design/agent-behavior.md).
+
+- Open the task/result from menu or another PM. Inspect acceptance checks, exact candidate, visual evidence and publication target.
+- For graphical/motion work, reach image/video evidence from the ticket outside the original chat.
+- Apply configured Local/branch/PR/merge behavior; resolve an owner-only question using unchanged source numbers.
+- Changed SHA, missing CI, protection failure or uncertain merge invalidates success; preserve work and reconcile.
+- Show final remote readback or pending handoff. Task closure and downstream eligibility follow the reviewed lifecycle, not merely a created PR.
+
+Result: the owner knows what is verified and delivered. D04/D10 and G4/G7 govern outstanding behavior.
+
+## UC-15. Inspect the system in daily use
+
+Source: owner menu requirements.
+
+- At zero/one/20 projects, locate attention, pinned/recent projects, all-state counters and exact task details.
+- Inspect active/paused/unknown/overflow tray states on both OSes; open full history when small pixels cannot show detail.
+- Enlarge text; let the menu use available work area before scrolling. Essential controls remain reachable.
+- Open Settings → named service/runtime for health, accounts, versions, logs, resources, incident consent and lifecycle actions. Never infer zero from stale data.
+- Reopen a conversation/window without another request. Failed update, missing runtime, unavailable remote link or resource tool shows a next action and preserves context.
+
+Result: common control remains compact and inspectable; native matrix and G8 qualify real platform behavior.
+
+## Coverage matrix
+
+UC-02 observation extension: agree to watch named projects in the existing session. Show current questions first; surface fresh numbered questions and separate suggestions. Stop watching without stopping tasks. Test unsupported scheduling, context loss, duplicate observers and an answer arriving through the menu while this PM is offline (A-A1–A-A7).
 
 | Capability | Primary case | Overlap |
 |---|---|---|
@@ -133,6 +217,14 @@ Open: authenticated grant channel, OS qualification, migration and breach lifecy
 | Project/task selection and mode confirmation | UC-05 | UC-01, UC-04, UC-07 |
 | Environment and cleanup | UC-06 | UC-07: shared resources |
 | Decomposition, dependencies, parallelism | UC-07 | UC-03, UC-06 |
+| Host permissions | UC-08 | UC-12 |
+| Numbered cross-interface answers | UC-09 | UC-10, UC-11 |
+| Board/client independence | UC-10 | UC-01, UC-02 |
+| Complete menu operation | UC-11 | UC-03, UC-05, UC-09 |
+| Host resources and effective limits | UC-12 | UC-04, UC-08 |
+| Pause, emergency and recovery | UC-13 | UC-04, UC-05, UC-12 |
+| Evidence, handoff and publication | UC-14 | UC-03, UC-06, UC-08 |
+| Tray, settings, diagnostics and accessibility | UC-15 | UC-01, UC-09, UC-11 |
 
 Apply the shared cross-case checks to TaskQ hosts, boards, admission changes and active attempts. This set covers the supplied TaskQ scenarios.
 
@@ -185,12 +277,20 @@ Multi-repository publication and partial success need a separate contract; do no
 Qualify cross-board dependencies, cancelled predecessors and recovery after partial plan creation separately.
 UC-07 does not prove a bulk transaction or cross-repository dependency graph exists.
 
-## Additional cases proposed for approval
+## Earlier proposed cases
 
 | ID | Intent | Coverage |
 |---|---|---|
-| P-01 | Answer a question or recover a failed task | Decision context, answer target, safe retry |
-| P-02 | Temporarily switch work, then return | Pause/resume, previous focus, unaffected projects; no saved-mode feature required |
-| P-03 | Recover after host loss or agent quota exhaustion | Waiting reason, recovery, no duplicate admission |
+| P-01 | Answer a question or recover a failed task | Covered by UC-09/UC-13; recovery mechanisms remain gated |
+| P-02 | Temporarily switch work, then return | Covered by UC-05/UC-13; no saved-mode feature required |
+| P-03 | Recover after host loss or agent quota exhaustion | Covered by UC-13; runtime/host qualification remains open |
 
-Next: walk UC-05 through a real board, then clarify UC-06 with its requester. Open proposals are not approved behavior.
+UC-06/UC-07 design continuation: [plans](../design/plans-and-decisions.md#p1-what-a-pipeline-means-here). UC-09 covers the answer portion of P-01; failed-task recovery remains proposed.
+
+Next: select pending defaults in the decision register, then qualify the implementation against the scenario review. UC-06 still needs concrete repository/build ownership inputs before execution.
+
+Resource refinement for UC-01/04/12: [Auto admission](../design/dynamic-resources.md) is the accepted new-host default; optional strict caps remain available. Pipeline alternatives for UC-03/06/07 are compared in [P1](../design/plans-and-decisions.md#p1-what-a-pipeline-means-here). Plan creation stays held by default, with a brief milestone reminder under P2.
+
+## UC-16 Describe and revise a tray icon
+
+Choose Custom → agent inspects the icon tools/current config → compare supported drafts at real size → refine by voice/text → approve exact draft → save local appearance. Reopen to edit or revert. Summary is a built-in config of the same renderer; copying it never changes the original. No agent available: direct editing remains usable. Invalid draft/save failure keeps the current icon. [CI1–CI5](../design/custom-icon.md).

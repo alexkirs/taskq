@@ -5,7 +5,7 @@ Approved layout; unimplemented capabilities remain design targets. Runtime follo
 
 ## M1 Appearance
 
-- Start compact. Show Icon / Summary together on supported platforms; apply immediately and persist. Preserve the current Windows compact-only runtime until square rendering is qualified.
+- Start compact. Show Icon / Summary / Custom on both macOS and Windows; apply immediately and persist. Square rendering follows I6; Windows compact-only runtime is a migration baseline, not the target.
 - Fixed top strip: view, named host, admission state, icon-only pause/resume and Controls. Mixed/unknown state must remain explicit.
 - Summary: fixed two-level square under [I1–I5](icon-summary.md); work = doing + review, answers = ask, ready = ready, cadence in the fourth cell. No active q/play overlay.
 - Pause keeps the same gray data and geometry with the existing compact q/pause centered. Partial pause is not full grayscale.
@@ -53,7 +53,7 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 - Show pending, applied, partial failure and unknown separately; confirm application by readback.
 - Restart, pause and stop until next login have distinct effects. Stop preserves autostart; expose active-work consequences before use.
 - Uninstall uses a nested confirmation naming the project, removes its service unit and preserves project files and other registrations. Remove shared install resources only when no consumer remains. R11 applies.
-- Emergency termination of running attempts is not defined by Pause; keep it an explicit open contract decision.
+- Emergency termination is required, separate from Pause; [E1–E5](emergency-recovery.md) define the reviewed-recovery candidate.
 
 ## M6 Cadence
 
@@ -105,17 +105,21 @@ Native sizing, scroll ownership and cadence rendering follow [R-UI1–R-UI6](ren
 - Onboarding proceeds in its AI conversation with account/repository/visibility and every external effect reviewed before apply. New repositories default private under §6.
 - Empty-install AI bootstrap currently lacks a running service; resolve that route before claiming first-project onboarding is complete. Do not hide it behind an unusable Send button.
 
+Product choices and approval boundaries: [MP1–MP9](menu-product.md).
+
 ## M11 Remaining decisions
 
-- One main AI window plus explicit detached conversations is approved. Attachment budgets/types, retention, cancellation and recovery proposals are in C3–C7.
+Canonical selections/default candidates: [D01–D14](decision-register.md). The following constraints remain until their implementation gates pass.
+
+- One main AI window plus explicit detached conversations, retained history/archive and one active request per conversation are approved. C3–C7/MP3–MP4 retain backend qualification and attachment-budget gaps.
 - Final shortlist count/recent ranking and attention grouping caps remain tunable proposals; stable control locations and attention-first layout are approved.
 - Scope semantics, per-project budgets, urgent ordering and multi-repository workflow follow use-case Q1/Q3–Q6; do not infer new backend authority.
 - Remote sessions remain informational; tmux is research, not a delivery promise.
-- Emergency stop and I5 icon overflow/unknown/rebin/Windows qualification remain open.
+- Emergency stop is required; mechanism and I6 overflow/rebin candidates require implementation qualification.
 
 ## M12 Shared Work mode
 
-- One editor from home/settings/project; project entry preselects that project.
+- One editor from home/settings/project; project entry preselects that project. Open it in the existing workspace (approved Workspace review), preserving menu navigation and drafts. Recovery uses the same workspace route.
 - Named host, explicitly selected projects, new-task filter, per-project/runtime limits, optional load guard, change review.
 - Selection defines change targets, not registered observations. Unchecking a project leaves its focus/limits unchanged.
 - Preserve runtime-specific limits, including codex-app. No shared host pool. Disable fields for unselected projects; never replace unknown values with zero.

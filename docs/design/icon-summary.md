@@ -1,5 +1,9 @@
 # Square summary icon
 
+Product selection: D11 option 1 is accepted in the [decision register](decision-register.md). Remaining candidate language below refers to implementation/calibration, not a request to reapprove that direction. No running policy changes.
+
+Summary is the built-in configuration of the [shared icon renderer](custom-icon.md), not a separately coded drawing path. Its immutable preset and Custom use the same primitives, font metrics, state transforms and validation. Edit Summary copies its configuration to a Custom draft.
+
 Approved two-level composition: ordinary numerals, square visible bounds.
 [Contract](../../taskq.md#product) · [Menu M1](menu.md#m1-appearance) · [Geometry reference](square-summary-reference.html).
 Replaces the wide strip as a design target. Runtime changes with implementation; Windows remains unqualified.
@@ -62,7 +66,7 @@ bottom alignment: baselineY = R - actualBoundingBoxDescent
 - Stacked bars on a shared linear scale, using M6 series/order. Never stretch each bar to 100%.
 - Exploratory geometry reference: 6 bars, 0.5 logical px gaps. Production uses R-UI5 physical-pixel quantization; this reference does not approve a bin count or fractional raster gaps.
 - Earlier reference contains only close/failed. Product preserves all four M6 series; fixture simplification cannot remove data.
-- Runtime has 12 bins. Six-bin rebinning needs approval; sum adjacent bins, preserving period and every series total. Do not discard half the history.
+- Runtime has 12 bins. Adaptive rebinning is accepted under D11; sum adjacent bins, preserving period and every series total. Do not discard half the history.
 - Acceptance fixture has nonzero first/last bars. Real zero edges stay zero. Expose exact totals in the menu when pixels cannot resolve a segment.
 - UI colors come from [visual-style.md](visual-style.md#palette). Board labels keep their separate API palette.
 - Paused: same geometry/data in gray, existing compact q/pause centered at N/2,N/2. Never substitute a new pause-button shape. Qualify overlay readability separately; partial pause does not gray everything.
@@ -75,3 +79,15 @@ bottom alignment: baselineY = R - actualBoundingBoxDescent
 - Counts: 0/0/0, 3/2/5, 1/7/8, 9/9/9, 12/3/24, 100/12/105. Graph: empty, mixed, equal counts across series, nonzero edges. Unknown never becomes zero.
 - Check bounds and graph totals, then inspect PNGs and native trays on both platforms. Record OS, font, size, DPI and SHA.
 - Open before release: overflow, unknown rendering, 6/12 bins and Windows DPR=1. Do not silently choose tiny text, 9+, truncation or a wider container.
+
+## I6 Cross-platform rendering
+
+- Both macOS and Windows expose Icon / Summary. Same fixed square composition, counter meanings, status colors and pause identity. Platform adaptation changes metrics, not semantics or available controls.
+- macOS: calibrate against actual status-item/menu-bar size and backing scale; 22 logical points is the reference, not a universal screen constant.
+- Windows: obtain notification-area small-icon metrics for the owning monitor DPI; treat 16 physical pixels at 100% as a qualification baseline, not a hardcoded slot for every machine. Supply a matching raster/HICON; re-render on DPI/theme changes and taskbar recreation. Keep stable tray identity and saved view.
+- Qualify 16/20/24/32 physical pixels (100/125/150/200% baseline), actual OS slot and light/dark. Exported PNG size alone proves neither Shell scaling nor readability. No stretch of the macOS raster.
+- Share data, layout rules and approved vector geometry; calibrate SF/Segoe ink bounds separately. Snap chart fills to physical pixels once; text retains native antialiasing.
+- Candidate small-slot rebin: choose the largest divisor of 12 in 12/6/4/3/2/1 that fits integer bar/gap constraints, sum all four series. Keep full 12-bin detail and exact totals in menu. The adaptive policy is accepted; native size calibration and all-series preservation still require proof.
+- Candidate overflow: a cell uses its largest readable exact value; beyond the calibrated cell capacity, show a labelled threshold such as 9+ and exact tooltip/menu values. Unknown uses an em dash with an unavailable explanation. No per-update shrinking or widening. Threshold and native legibility require visual acceptance.
+- Windows removal of the current compact-only gate ships with native evidence; retaining that gate is not completion of MP1.
+- Reference: [Microsoft NOTIFYICONDATAW](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-notifyicondataw), [GetSystemMetricsForDpi](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsystemmetricsfordpi). Query actual platform metrics; the prototype cannot detect the native Shell slot.

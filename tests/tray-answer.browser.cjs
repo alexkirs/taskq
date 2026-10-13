@@ -2,7 +2,9 @@
 const fs=require('node:fs'),assert=require('node:assert/strict'),{chromium}=require('playwright');
 const html=fs.readFileSync('src/tray.html','utf8')
   .replace('{{ANSWER_CARD_CSS}}',fs.readFileSync('src/answer-card.css','utf8'))
-  .replace('{{ANSWER_CARD_JS}}',fs.readFileSync('src/answer-card.js','utf8'));
+  .replace('{{ANSWER_CARD_JS}}',fs.readFileSync('src/answer-card.js','utf8'))
+  .replace('{{PROJECT_BLOCKS_CSS}}',fs.readFileSync('src/project-blocks.css','utf8'))
+  .replace('{{PROJECT_BLOCKS_JS}}',fs.readFileSync('src/project-blocks.js','utf8'));
 const fx=JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json','utf8'));
 (async()=>{
   const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL});
@@ -41,7 +43,7 @@ const fx=JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json','utf8'));
       await page.evaluate(r=>taskq.receive({answerReceipt:r}),{root,id:op.id,state:'accepted'});
       await page.waitForFunction(()=>document.querySelector('.qac').dataset.qacState==='accepted');
       assert.equal(await page.locator('.qac textarea').count(),0);
-      assert.equal(await page.locator('.task[data-url]').getAttribute('href'),board+'/'+rows[1].n);
+      assert.equal(await page.locator('.tqp-task a[data-url]').first().getAttribute('href'),board+'/'+rows[1].n);
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
       assert.deepEqual(errors,[]);
       console.log('PASS tray HTML draft/focus, stale review, literal text, sending refresh, same-ID retry, accepted readback, board link;',theme,font+'px');

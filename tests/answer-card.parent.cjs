@@ -5,7 +5,9 @@
 const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict'), {chromium} = require('playwright');
 const html = fs.readFileSync('src/tray.html', 'utf8')
   .replace('{{ANSWER_CARD_CSS}}', fs.readFileSync('src/answer-card.css', 'utf8'))
-  .replace('{{ANSWER_CARD_JS}}', fs.readFileSync('src/answer-card.js', 'utf8'));
+  .replace('{{ANSWER_CARD_JS}}', fs.readFileSync('src/answer-card.js', 'utf8'))
+  .replace('{{PROJECT_BLOCKS_CSS}}', fs.readFileSync('src/project-blocks.css', 'utf8'))
+  .replace('{{PROJECT_BLOCKS_JS}}', fs.readFileSync('src/project-blocks.js', 'utf8'));
 const fx = JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json', 'utf8'));
 // the computed look both cards must share; selectors map parent qcard -> child qac
 function look(sel) {
@@ -38,11 +40,11 @@ function look(sel) {
         assert.deepEqual(got, want, at + ': child look equals parent');
         // K-A8: the project strip ends at its row's right edge, state order kept, nothing wider than the window
         const strip = await page.evaluate(() => {
-          const s = document.querySelector('.row .counts'), r = s.closest('.row');
+          const s = document.querySelector('.tqp-project .tqp-counts'), r = s.closest('.tqp-project');
           return {gap: Math.round(r.getBoundingClientRect().right - parseFloat(getComputedStyle(r).paddingRight) - s.getBoundingClientRect().right),
-            order: [...s.querySelectorAll('.counter')].map(c => c.title), overflow: document.documentElement.scrollWidth > innerWidth};
+            order: [...s.querySelectorAll('button')].map(c => c.dataset.state), overflow: document.documentElement.scrollWidth > innerWidth};
         });
-        assert.deepEqual(strip, {gap: 0, order: ['In work', 'Waiting for answer', 'Ready'], overflow: false}, at);
+        assert.deepEqual(strip, {gap: 0, order: [...(n?['doing']:[]), 'ask', ...(n?['ready']:[]), 'closed'], overflow: false}, at);
         assert.deepEqual(errors, [], at);
         await page.close();
       }

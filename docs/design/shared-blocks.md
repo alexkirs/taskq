@@ -21,6 +21,8 @@ TaskQ owns the compact variant alongside the parent and exercises it in native a
 
 Reuse the same implementation and locally served versioned assets under the [answer-card delivery contract](answer-card.md#ownership-and-delivery). Do not add a framework or registry. Missing reusable code is an extraction task in TaskQ, not permission for a DashQ copy. Pin the design-source revision as well as the built asset version; a checksum proves provenance, not design fidelity.
 
+Project/task extraction and adapter API: [shared project blocks](project-blocks.md). Its manifest and common fixtures accompany release staging; published-asset and native qualification remain separate gates.
+
 A compact summary may defer detail to the same full component. Record that route and what is deferred; preserve every applicable target, state and action. The native Workspace review placement remains unchanged. DashQ may host that shared content in its own detail region, with enough width for the complete editor and one editing instance per target. Never compress Work mode into an unrelated mode/number form.
 
 ## B3 Consumer conformance

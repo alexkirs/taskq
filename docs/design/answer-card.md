@@ -50,7 +50,7 @@ B4 parent-to-child map, design `cf46e637`:
 | Q1 states | `STATES` receipts | Recorded is "Answer accepted on the board" after readback | fixtures, `tests/tray-answer.browser.cjs` |
 | K-A8 project strip | tray project header | unchanged tray counters | right edge, order, no overflow at counts 0/1/12/100 |
 
-Deferred: Discuss with AI stays with the AI workspace route. Defects against parents, owned by #938: the tray strip shows zero capsules (K-A2) and merges Doing and Review (K-A1). `PLAYWRIGHT_CHANNEL=chrome node tests/answer-card.parent.cjs` compares both themes, 16/20 px and 320/360 px; it is an instrument, not native qualification.
+Deferred: Discuss with AI stays with the AI workspace route. The [#938 project-block extraction](project-blocks.md) fixes zero capsules (K-A2) and merged Doing/Review (K-A1); its release and native qualification remain separate. `PLAYWRIGHT_CHANNEL=chrome node tests/answer-card.parent.cjs` compares both themes, 16/20 px and 320/360 px; it is an instrument, not native qualification.
 
 Delivery of #920 is the adapter PR first, per the owner's answer on the task. The commit/checksum pin above is #937's release evidence; native tray interaction is qualified on the next real ask card answered from the macOS tray (#937 owner answer), not on a synthetic task. Browser and dispatcher tests do not certify native interaction, a real board answer or worker resumption; README screenshot freshness remains a separate native capture gate.
 

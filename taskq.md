@@ -28,7 +28,7 @@ Each command that changes a task appends one `taskq:` comment, sets the projecte
 Result SHA, checks, questions and blockers go to the issue as `result`, `ask`, `requeue` comments. Completion never depends on a chat, transcript or exit code.
 
 ### R6. Human report
-`taskq status` renders the [read-model](docs/design/refactoring-backlog.md) snapshot of one board read (§ 5 `--json`; service status, `status.json` and tray count the same rows), in this order (empty parts omitted):
+`taskq status` renders the [read-model](docs/design/refactoring-backlog.md) snapshot of one board read (§ 5 `--json`; service status, `status.json` and tray count the same rows), in this order (empty parts omitted). Tray/browser project summaries and flowing rows reuse [shared project blocks](docs/design/project-blocks.md), including separate Doing/Review, nonzero K counters and unknown Closed until authoritative totals exist:
 1. `<project> · [board](<url>)`
 2. `In work N · Waiting for answer N · Ready N`. In work: `doing` + `review`. Waiting: `ask`. Ready: `ready`.
 3. `| Task | State | Runtime | Session |`, one row per open task except `ask`, `later`, `failed`, by priority then

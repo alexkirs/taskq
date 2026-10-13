@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "themes": ["light", "dark"],
+  "fonts": [16, 20],
+  "widths": [320, 360],
+  "counts": [0, 1, 12, 100],
+  "project": {
+    "id": "project",
+    "name": "project-with-a-long-name-that-remains-readable",
+    "board": {"kind": "github", "url": "https://github.com/example/project/issues"},
+    "complete": true,
+    "closed": 0,
+    "tasks": []
+  },
+  "row": {
+    "n": 938,
+    "revision": 4,
+    "state": "doing",
+    "title": "A long project task title continues across the full flowing block without a narrow title column or lost actions",
+    "url": "https://github.com/example/project/issues/938",
+    "host": "WIN",
+    "runtime": "codex",
+    "local_session": true,
+    "session_url": "codex://threads/example-thread"
+  }
+}

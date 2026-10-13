@@ -33,10 +33,12 @@ not paid generation or final production/publication. Exact final approvals remai
 missing. Private source was not accessed or copied into this public review.
 
 The later [historical-writer hold](https://github.com/alexkirs/taskq/issues/591#issuecomment-6114184491)
-requires independently proven fencing of old writers and Git/provider rights
-before repair, replacement or publication. Closing old issues does not prove
-fencing. #795 authorizes review and a continuation decision, not bypassing this
-hold. Any continuation must carry it forward as an explicit prerequisite.
+was lifted by the [owner decision](https://github.com/alexkirs/taskq/issues/801#issuecomment-6134964702)
+on 2026-10-13. [The #801 evidence review](fencing-video.md) checks the mac/win
+reports and lists historical writers and Git/provider rights. Both hosts are
+fenced by owner policy; live credentials and technical unknowns remain explicit.
+Closing old issues alone did not prove fencing. Old work is dead; restart through
+#802/#803/#805, preserving historical material without treating it as accepted finals.
 
 Current [contract](../../taskq.md) uses separate worker/reviewer roles and owner
 acceptance through the PM. Historical “supervisor” captions and narration require
@@ -88,7 +90,8 @@ and silent finals. This selects the continuation, not final production acceptanc
 | [#803](https://github.com/alexkirs/taskq/issues/803) | Narrated MP4, SRT, poster, reproducible source and QA; depends on #801/#802 and explicit final-production activation. Filed Later; requires separate final owner acceptance. |
 | [#805](https://github.com/alexkirs/taskq/issues/805) | Silent MP4/WebM, poster, recovered/reviewed loop source and seam/mobile QA; depends on #801/#802 and explicit final-production activation. Filed Later; requires separate final owner acceptance. |
 
-No optional Google/Meshy trial was filed. Do not reopen old tasks, launch providers
-or accept old candidates by implication. Filing these tasks leaves the production
-hold in place; task closure without independently checked evidence cannot satisfy
-the fencing prerequisite.
+No optional Google/Meshy trial was filed. Do not reopen old tasks or accept old
+candidates by implication. The historical-writer prerequisite is satisfied by
+the owner's policy decision and linked host evidence, not technical revocation.
+Tool/provider launch problems become numbered asks in the continuation tasks.
+Creative, cost and final-acceptance gates still apply.

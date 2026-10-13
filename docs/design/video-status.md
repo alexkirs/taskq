@@ -95,3 +95,13 @@ candidates by implication. The historical-writer prerequisite is satisfied by
 the owner's policy decision and linked host evidence, not technical revocation.
 Tool/provider launch problems become numbered asks in the continuation tasks.
 Creative, cost and final-acceptance gates still apply.
+
+## #802 planning candidate
+
+[Scene/timing/style/voice package](../video-experiments/planning-802/approval.md)
+and [draft delivery/hash evidence](../video-experiments/planning-802/delivery.md)
+propose 11 scenes in 58 seconds, warm 2D cards and 360-pixel mobile previews.
+The approved Russian narration is preserved. Historical assets are untouched;
+retained voice hashes and pinned upstream MIT notice were freshly checked.
+All creative approvals and voice listening remain pending through #802 taskq.
+No final production or publication is activated by this planning candidate.

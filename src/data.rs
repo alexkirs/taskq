@@ -15,6 +15,8 @@ pub const ATTEMPT_LOGS: usize = 50;
 pub const INCIDENTS: usize = 50;
 /// Lines of `<root>/.taskq/requests/comments`: past it the newest half and every comment still pending stay.
 pub const COMMENT_IDS: usize = 1000;
+/// Lines of `<root>/.taskq/requests.log`: the newest stay; pruned on every append (`retro::append`).
+pub const REQUEST_LOG: usize = 500;
 const FOCUS_MAX: u64 = 4096;
 
 /// Keep the newest `max / 2` bytes of `p`, from a line start, once it is over `max`. Rewritten in place, not renamed:

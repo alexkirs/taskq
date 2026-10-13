@@ -311,6 +311,6 @@ Result: a replaceable remote PM provides planning and owner control while TaskQ 
 
 ## Proposals
 
-One line per improvement proposal made in conversation (date, proposal, source request); `taskq retro` reads this section.
+Improvement proposals the PM makes in chat, one line each, oldest first: `- YYYY-MM-DD <proposal> (from <request>)`. `taskq retro` reads them as `p<k>` beside the request log ([§ 4](../../taskq.md#4-service)); a filed or rejected proposal stays as history.
 
-- 2026-10-14: pin the tray menu into a movable window that snaps to screen edges where the OS supports it; owner request in chat, filed as WS11b.
+- 2026-10-14 Pin the tray menu into a movable window that snaps to screen edges where the OS supports it; filed as WS11b (from owner request in chat)

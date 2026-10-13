@@ -95,7 +95,7 @@ pub fn sweep(install: &Path, shim: &Path) {
         }
     }
     let owned = |n: &str| {
-        ["releases", "current", "previous", "projects", "token", "taskq", "taskq.exe", "taskq-tray.exe", "capacity"].contains(&n)
+        ["releases", "current", "previous", "projects", "token", "installation-id", "taskq", "taskq.exe", "taskq-tray.exe", "capacity"].contains(&n)
             || n.ends_with(".log") || n.ends_with(".tmp") || n.starts_with("tray") || (n.starts_with("TaskQ-") && n.ends_with(".xml"))
     };
     let gone = |p: &Path| {

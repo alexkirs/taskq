@@ -4,6 +4,7 @@ mod board;
 mod core;
 mod data;
 mod dispatch;
+mod enrollment;
 mod incident;
 mod labels;
 mod operator;
@@ -1855,6 +1856,57 @@ mod tests {
         // Parsed compare: a CRLF checkout on Windows must not fail the golden.
         let want: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(snap.json(), want, "TASKQ_BLESS=1 rewrites {}", path.display());
+    }
+
+    // Chain: canonical board read -> approved projection -> duplicate-host coalescing -> freshness.
+    #[test]
+    fn enrollment_projects_only_approved_board_metadata() {
+        use enrollment::{BoardScope, coalesce, project};
+        let mut snap = snapshot::read(&snapshot_board(), &cfg(), &Value::Null, &[]);
+        snap.board["host"] = json!("github.com");
+        snap.board["token"] = json!("forge-secret");
+        snap.board["url"] = json!("https://user:forge-secret@github.com/o/r");
+        let scope = BoardScope::new("github", "GITHUB.COM", "o/r").unwrap();
+        let approved = [scope.clone()];
+        let a = project(&snap, &"a".repeat(64), &approved).unwrap();
+        let b = project(&snap, &"b".repeat(64), &approved).unwrap();
+        let got = serde_json::to_value(&a).unwrap();
+        let want: Value = serde_json::from_str(include_str!("../tests/fixtures/enrollment-projection.json")).unwrap();
+        assert_eq!(got, want);
+        let text = got.to_string();
+        for omitted in ["forge-secret", "session", "labels", "title", "Which way?", "no login", "url", "hosts"] {
+            assert!(!text.contains(omitted), "{omitted}");
+        }
+        assert!(project(&snap, &"a".repeat(64), &[]).is_err());
+        assert_eq!(scope, BoardScope::new("github", "github.com", "O/R").unwrap());
+        for (host, repo) in [("user:secret@github.com", "o/r"), ("github.com", "o/../r"), ("github.com", "o/r?token=x")] {
+            assert!(BoardScope::new("github", host, repo).is_err());
+        }
+        let rows = coalesce(&[a.clone(), b], &approved, 100, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["totals"], got["totals"], "two hosts do not double board totals");
+        assert_eq!(rows[0]["freshness"], "fresh");
+        for (now, freshness) in [(120, "stale"), (98, "unknown")] {
+            let rows = coalesce(&[a.clone()], &approved, now, 10);
+            assert_eq!(rows[0]["freshness"], freshness);
+            assert!(rows[0]["totals"].is_null());
+        }
+        assert_eq!(coalesce(&[], &approved, 100, 10)[0]["freshness"], "missing");
+        snap.reason = Some("forge-secret and private path".into());
+        let incomplete = project(&snap, &"a".repeat(64), &approved).unwrap();
+        let rows = coalesce(&[incomplete.clone()], &approved, 100, 10);
+        assert_eq!(rows[0]["complete"], false);
+        assert_eq!(rows[0]["reason"], "source incomplete");
+        assert!(rows[0]["totals"].is_null());
+        let rows = coalesce(&[a.clone(), incomplete], &approved, 100, 10);
+        assert_eq!(rows[0]["reason"], "conflicting observations");
+        assert!(rows[0]["observation"].is_null());
+        snap.observed = 90;
+        let old = project(&snap, &"a".repeat(64), &approved).unwrap();
+        assert_eq!(coalesce(&[a, old], &approved, 100, 10)[0]["totals"], got["totals"]);
+        let other = BoardScope::new("gitlab", "gitlab.com", "o/r").unwrap();
+        assert!(project(&snap, &"a".repeat(64), &[other.clone()]).is_err());
+        assert_eq!(coalesce(&[], &[scope, other], 100, 10).len(), 2);
     }
 
     // Chain: § 5 CLI text limits. Risk: invalid text is written.

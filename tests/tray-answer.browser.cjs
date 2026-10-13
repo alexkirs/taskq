@@ -5,7 +5,7 @@ const html=fs.readFileSync('src/tray.html','utf8')
   .replace('{{ANSWER_CARD_JS}}',fs.readFileSync('src/answer-card.js','utf8'));
 const fx=JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json','utf8'));
 (async()=>{
-  const browser=await chromium.launch();
+  const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL});
   try{
     for(const theme of ['light','dark'])for(const font of [16,20]){
       const page=await browser.newPage({viewport:{width:font===20?360:320,height:900},colorScheme:theme});
@@ -15,7 +15,7 @@ const fx=JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json','utf8'));
       const board='https://github.com/o/r/issues',root='project',rows=fx.cases.find(c=>c.name.startsWith('stale')).rows;
       const state={page:root,font,theme,projects:[{root,name:'project',issues:board,alive:true,complete:true,focus:[],labels:[],tasks:[rows[0]],cap_saved:{error:'not configured'}}],ai:{draft:''}};
       await page.evaluate(s=>taskq.receive(s),state);
-      const text=page.locator('.qac textarea');await text.fill('keep draft');await text.focus();
+      await page.locator('.qac-other summary').click();const text=page.locator('.qac textarea');await text.fill('keep draft');await text.focus();
       await text.evaluate(t=>t.setSelectionRange(2,4));
       await page.evaluate(s=>taskq.receive(s),state);
       assert.deepEqual(await text.evaluate(t=>({draft:t.value,focused:document.activeElement===t,caret:[t.selectionStart,t.selectionEnd]})),{draft:'keep draft',focused:true,caret:[2,4]});

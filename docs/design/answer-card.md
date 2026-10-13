@@ -35,11 +35,22 @@ Use the same fixtures in TaskQ and DashQ: choice and free text; long question; m
 - Conformance: [tests/fixtures/answer-card.json](../../tests/fixtures/answer-card.json); `cargo test` checks its `question` fields against TaskQ's parse, and each consumer runs `replay(case, capability)` over it (`node tests/answer-card.test.cjs`). `tests/answer-card.browser.cjs` checks 16/20 px, both themes, 280/480 px, refresh and keyboard with Playwright.
 - Release: `taskq-<version>-answer-card.js`, `.css` and `-fixtures.json` ship in each release, listed in `SHA256SUMS` with build provenance. Checksums of this source, checked by the node test:
 
-`src/answer-card.js` SHA-256: `12e12ab3ea5325121819244506b936a18fe8969e004760b8be843a881520cce4`
-`src/answer-card.css` SHA-256: `a4365828fd91b269b158963d65b01a70d7ede028518ac21346cf558d6684a400`  
-`tests/fixtures/answer-card.json` SHA-256: `39d07225adddcf2fddc0e5b76f11e26ef4c9d68478b67028614f396410ac0c40`
+`src/answer-card.js` SHA-256: `007f0124bccd31d0ef819c172eb6c97c201d9556227e04149dc21de2b80117fc`
+`src/answer-card.css` SHA-256: `b33ea8d5ba6ec70931ecc2cac745bf1808181b4939019bf478f09cdd7791a796`  
+`tests/fixtures/answer-card.json` SHA-256: `dd98bda612d83617685c504637dd6a995180f88a3c0a8944d067633422eee0a5`
 
-Parent source: TaskQ `531f68e2c6f971eb56c392e623e90721e674f346` supplies the JS/CSS/fixtures; design inheritance is pinned to `6828245b7854e09fb1f307d5be2a4a211a851e34`. The tray places the shared card beside its existing row without restyling it. This adapter fixes same-ID reconciliation when refresh removes an answered question; the updated JS/fixture hashes above identify that shared fix.
+Parent source: TaskQ `531f68e2c6f971eb56c392e623e90721e674f346` supplies the JS/CSS/fixtures; design inheritance is pinned to `cf46e637d45f971dc83f1c1ea5f1e9a119a74256` (#943, K-A8 right alignment). The tray places the shared card beside its existing row without restyling it. This adapter fixes same-ID reconciliation when refresh removes an answered question; the updated JS/fixture hashes above identify that shared fix.
+
+B4 parent-to-child map, design `cf46e637`:
+
+| Parent | Child | Placement differences | Evidence |
+|---|---|---|---|
+| [visual-style.md](visual-style.md) palette | `.qac` tokens and the tray body tokens | none | `tests/answer-card.parent.cjs` computed colors |
+| `question()` in [plans-and-decisions.html](plans-and-decisions.html), `qcard` CSS of [workspace-preview.html](workspace-preview.html) | `render()` and `src/answer-card.css` | Head flows `? #N title` per M3; host/runtime stay on the tray row above; fixture state preview omitted | divider, mark, choice fill/shape/numbers, wrap, Other answer and Checked & context disclosures equal |
+| Q1 states | `STATES` receipts | Recorded is "Answer accepted on the board" after readback | fixtures, `tests/tray-answer.browser.cjs` |
+| K-A8 project strip | tray project header | unchanged tray counters | right edge, order, no overflow at counts 0/1/12/100 |
+
+Deferred: Discuss with AI stays with the AI workspace route. Defects against parents, owned by #938: the tray strip shows zero capsules (K-A2) and merges Doing and Review (K-A1). `PLAYWRIGHT_CHANNEL=chrome node tests/answer-card.parent.cjs` compares both themes, 16/20 px and 320/360 px; it is an instrument, not native qualification.
 
 Delivery of #920 is the adapter PR first, per the owner's answer on the task. Screen-capable native interaction qualification and the pinned release/checksum evidence follow after merge. Browser and dispatcher tests do not certify native interaction, a real board answer or worker resumption; README screenshot freshness remains a separate native capture gate.
 

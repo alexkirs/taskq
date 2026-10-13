@@ -54,7 +54,11 @@ struct Settings {
 
 impl Settings {
     fn load(install: &Path) -> Settings {
-        let v: Value = fs::read_to_string(install.join("tray.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        // § 4 Data: a corrupt tray.json shows the defaults with its reason; the file stays until a save keeps a copy
+        let v = crate::data::json(&install.join("tray.json")).unwrap_or_else(|e| {
+            eprintln!("{e}; defaults shown");
+            None
+        }).unwrap_or_default();
         let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into(), start: 0, end: 0, tz: "local".into(), icon: Value::Null };
         // an invalid or corrupt saved icon falls back to Summary (CI4)
         if icon::validate(&v["icon"]).is_empty() {
@@ -93,7 +97,11 @@ impl Settings {
 
     fn save(&self, install: &Path) -> bool {
         let v = json!({"view": self.view, "font": self.font, "period": self.period, "start": self.start, "end": self.end, "tz": self.tz, "icon": self.icon});
-        crate::platform::write_atomic(&install.join("tray.json"), &v.to_string()).is_ok()
+        let p = install.join("tray.json");
+        if crate::data::json(&p).is_err() && fs::copy(&p, install.join("tray.json.corrupt")).is_err() {
+            return false;
+        }
+        crate::platform::write_atomic(&p, &v.to_string()).is_ok()
     }
 }
 
@@ -194,7 +202,11 @@ fn roots(install: &Path) -> Vec<String> {
 fn project(root: &str) -> Value {
     let r = Path::new(root);
     let d = crate::dot(r);
-    let s: Value = fs::read_to_string(d.join("status.json")).ok().and_then(|x| serde_json::from_str(&x).ok()).unwrap_or(Value::Null);
+    // § 4 Data: a corrupt status.json is unknown with its reason, never zero
+    let (s, bad) = match crate::data::json(&d.join("status.json")) {
+        Ok(s) => (s.unwrap_or(Value::Null), None),
+        Err(e) => (Value::Null, Some(e)),
+    };
     let age = crate::file_age(&d.join("status.json"));
     let saved = fs::read_to_string(d.join("focus.paused")).is_ok_and(|f| !matches!(f.trim(), "" | "off"));
     let text = fs::read_to_string(d.join("events")).unwrap_or_default();
@@ -212,7 +224,7 @@ fn project(root: &str) -> Value {
     json!({"root": root, "name": s["project"].as_str().map(String::from).unwrap_or_else(|| crate::project_name(r)),
         "issues": s["issues"].as_str().unwrap_or(""), "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
         "complete": crate::snapshot::complete(&s) && age.is_some_and(|a| a < 300),
-        "error": s["error"], "focus": s["focus"].as_array().cloned().unwrap_or_default(), "saved": saved, "labels": crate::status_labels(r),
+        "error": bad.map(Value::from).or_else(|| [&s["error"], &s["focus_error"]].into_iter().find(|e| e.is_string()).cloned()).unwrap_or(Value::Null), "focus": s["focus"].as_array().cloned().unwrap_or_default(), "saved": saved, "labels": crate::status_labels(r),
         "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"],
         "capacity": s["capacity"], "cap_host": cap_host, "cap_saved": cap_saved, "agents": s["agents"],
         "incident": s["incident"], "incident_line": s.get("incident").map(crate::incident::line), "incident_notice": s["incident_notice"],
@@ -1026,6 +1038,30 @@ mod tests {
         // a corrupt saved icon falls back to Summary
         fs::write(install.join("tray.json"), r#"{"view":"custom","icon":{"version":9}}"#).unwrap();
         assert_eq!(Settings::load(&install).view, "icon");
+        fs::remove_dir_all(install).unwrap();
+    }
+
+    // Chain: tray project page and settings. Risk: corrupt status.json or tray.json reads as zero/default and is reset
+    #[test]
+    fn corrupt_status_and_tray_json_read_unknown_and_stay() {
+        let install = std::env::temp_dir().join(format!("taskq-tray-corrupt-{}", std::process::id()));
+        let root = install.join("project");
+        fs::create_dir_all(crate::dot(&root)).unwrap();
+        fs::write(crate::dot(&root).join("status.json"), "{\"tasks\": [{\"n\": 1").unwrap();
+        let p = project(root.to_str().unwrap());
+        assert!(p["complete"] == false && p["tasks"] == json!([]) && p["error"].as_str().unwrap().starts_with("status.json: corrupt"), "{p}");
+        assert!(!summary(&[p], (0, 1)).known, "counts unknown, never zero");
+        assert_eq!(fs::read_to_string(crate::dot(&root).join("status.json")).unwrap(), "{\"tasks\": [{\"n\": 1");
+        // a corrupt focus in a fresh status.json names its reason
+        fs::write(crate::dot(&root).join("status.json"), r#"{"focus": null, "focus_error": "focus: not UTF-8 text; file kept"}"#).unwrap();
+        assert_eq!(project(root.to_str().unwrap())["error"], "focus: not UTF-8 text; file kept");
+        fs::write(install.join("tray.json"), "{\"view\": \"fu").unwrap();
+        let s = Settings::load(&install);
+        assert!(s.view == "icon" && s.font == 16, "defaults shown");
+        assert_eq!(fs::read_to_string(install.join("tray.json")).unwrap(), "{\"view\": \"fu", "a read never resets it");
+        assert!(s.save(&install));
+        assert_eq!(fs::read_to_string(install.join("tray.json.corrupt")).unwrap(), "{\"view\": \"fu", "a save keeps a copy");
+        assert_eq!(Settings::load(&install).font, 16);
         fs::remove_dir_all(install).unwrap();
     }
 

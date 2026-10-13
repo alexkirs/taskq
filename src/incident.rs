@@ -15,7 +15,21 @@ const CODES: &[&str] = &[
     "ask", "later", "failed", "closed", "claim:rejected", "heartbeat:conflict", "passes:3", "spawn:missing",
     "http:2xx", "merge:unconfirmed", "ancestry:missing", "runtime:installed", "exit:101", "reexec:failed",
     "restart:stuck", "golden:mismatch", "smoke:failed", "starts:3", "fold.json", "observed", "defect",
+    "panic:stdio", "panic:unwrap", "panic:index", "panic:other",
 ];
+
+/// The enumerated class of a panic message; the message itself never leaves the host.
+fn panic_class(msg: &str) -> &'static str {
+    if msg.starts_with("failed printing to std") { "panic:stdio" }
+    else if msg.starts_with("called `Option::unwrap()`") || msg.starts_with("called `Result::unwrap()`") { "panic:unwrap" }
+    else if ["index out of bounds", "out of range for slice", "byte index ", "slice index starts"].iter().any(|p| msg.contains(p)) { "panic:index" }
+    else { "panic:other" }
+}
+
+/// A print to a stdout/stderr pipe the consumer closed (`taskq status | head`): EPIPE on Unix, ERROR_NO_DATA on Windows.
+fn closed_pipe(msg: &str) -> bool {
+    msg.starts_with("failed printing to std") && (msg.contains("(os error 32)") || msg.contains("(os error 232)"))
+}
 
 thread_local!(static ACTIVE: Cell<bool> = const { Cell::new(false) });
 #[cfg(test)]
@@ -135,12 +149,23 @@ pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if !ACTIVE.with(Cell::get) {
+            let msg = info.payload_as_str().unwrap_or("");
+            if closed_pipe(msg) { std::process::exit(141); } // consumer closed the pipe: no TaskQ defect (§ 4)
+            #[cfg(not(test))]
+            if let Ok(root) = crate::find_root() {
+                use std::io::Write;
+                let at = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+                let _ = fs::create_dir_all(crate::dot(&root));
+                let _ = fs::OpenOptions::new().create(true).append(true).open(crate::dot(&root).join("cli-errors.log"))
+                    .and_then(|mut f| writeln!(f, "panic at {at}: {msg}"));
+            }
+            let class = panic_class(msg);
             let location = info.location().map(|l| {
                 let file = l.file().replace('\\', "/");
                 file.strip_prefix("src/").map(|f| format!("src/{f}:{}", l.line()))
                     .filter(|s| site(s)).unwrap_or_else(|| "dep".into())
             }).unwrap_or_else(|| "dep".into());
-            detect("dispatch.panic", &location, "none", &[&location], &["exit:101"]);
+            detect("dispatch.panic", &location, "none", &[&location, class], &["exit:101", class]);
             previous(info);
         }
     }));

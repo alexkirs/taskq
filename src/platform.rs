@@ -584,7 +584,9 @@ mod tests {
         let t = std::env::temp_dir().join(format!("taskq-sweep-{}", std::process::id()));
         let (install, root) = (t.join("install"), t.join("proj"));
         let _ = fs::remove_dir_all(&t);
-        let dirs = ["releases/4.2.0", "releases/4.1.0", "releases/4.0.5", "releases/4.0.0-dev", "releases/cc33ae6", "releases/4.3.0.tmp", "service/x", "mac-pre-update-backup", "capacity", "failed-release-evidence"];
+        // the running version's release stays, whatever the build sets it to (release CI: the tag)
+        let mine = format!("releases/{VERSION}");
+        let dirs = ["releases/4.2.0", "releases/4.1.0", "releases/4.0.5", &mine, "releases/cc33ae6", "releases/4.3.0.tmp", "service/x", "mac-pre-update-backup", "capacity", "failed-release-evidence"];
         for d in dirs {
             fs::create_dir_all(install.join(d)).unwrap();
         }
@@ -608,9 +610,9 @@ mod tests {
             v.sort();
             v
         };
-        // 4.0.0-dev is this test binary's running version
-        assert_eq!(VERSION, "4.0.0-dev");
-        assert_eq!(ls(&install.join("releases")), ["4.0.0-dev", "4.0.5", "4.1.0", "4.2.0", "4.3.0.tmp"]);
+        let mut want = vec![VERSION.to_string(), "4.0.5".into(), "4.1.0".into(), "4.2.0".into(), "4.3.0.tmp".into()];
+        want.sort();
+        assert_eq!(ls(&install.join("releases")), want);
         assert_eq!(ls(&install), ["TaskQ-proj.xml", "capacity", "current", "previous", "proj.log", "projects", "releases", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json"]);
         assert!(!shim.exists() && other.exists(), "only the v3 shim of this install goes");
         let _ = fs::remove_dir_all(&t);

@@ -498,7 +498,7 @@ mod tests {
         // #865: /p has no taskq.md, so the brief names the pinned contract and the folder boundary, never a missing path
         assert!(b.contains("Read `https://github.com/taskqorg/taskq/blob/") && b.contains("/taskq.md` first") && b.contains(FILES));
         let here = Env { root: Path::new(env!("CARGO_MANIFEST_DIR")), ..env };
-        assert!(brief(&here, &l).contains(&format!("Read `{}/taskq.md`", env!("CARGO_MANIFEST_DIR"))));
+        assert!(brief(&here, &l).contains(&format!("Read `{}`", Path::new(env!("CARGO_MANIFEST_DIR")).join("taskq.md").display())));
         l.rt = "codex-app".into();
         l.resume = None;
         let c = command(&env, &l);

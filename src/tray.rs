@@ -443,7 +443,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                     for (theme, d) in [("dark", true), ("light", false)] {
                         for (mode, run) in [("run", true), ("pause", false)] {
                             let _ = fs::write(dir.join(format!("icon-compact-{mode}-{theme}.png")), png(&compact(run, d)));
-                            let _ = fs::write(dir.join(format!("icon-summary-{mode}-{theme}.png")), png(&wide(&Summary { run, ..s.clone() }, d)));
+                            let _ = fs::write(dir.join(format!("icon-summary-{mode}-{theme}.png")), png(&wide(&Summary { run, ..s.clone() }, d, 1.0)));
                         }
                     }
                 }
@@ -506,7 +506,7 @@ fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>, a
         "host": ps.iter().find_map(|p| p["host"].as_str()).unwrap_or("?"), "view": s.view, "font": s.font, "period": s.period,
         "now": now(), "projects": ps, "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "add": add, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since}});
     if cfg!(target_os = "macos") {
-        st["icons"] = json!({"icon": url(&compact(sum.run, dark)), "full": url(&wide(&sum, dark))});
+        st["icons"] = json!({"icon": url(&compact(sum.run, dark)), "full": url(&wide(&sum, dark, 1.0))});
     }
     if let Some((theme, page)) = snap {
         st["theme"] = json!(theme);
@@ -526,12 +526,16 @@ fn refresh_icon(tray: &Option<TrayIcon>, st: &Value, s: &Settings, dark: bool, s
     let sum = summary(st["projects"].as_array().map_or(&[][..], |v| v), s.range(now()));
     // Windows shows only the compact q (menu.md M1)
     let full = !cfg!(windows) && s.view == "full";
-    let new = format!("{full} {dark} {} {:?} {:?}", sum.run, sum.counts, if full { sum.bins.clone() } else { vec![] });
+    let k = if full { menu_bar_scale() } else { 1.0 };
+    let new = format!("{full} {dark} {k} {} {:?} {:?}", sum.run, sum.counts, if full { sum.bins.clone() } else { vec![] });
     if *sig == new {
         return;
     }
     *sig = new;
-    let _ = t.set_icon(Some(rgba_icon(&if full { wide(&sum, dark) } else { compact(sum.run, dark) })));
+    let _ = t.set_icon(Some(rgba_icon(&if full { wide(&sum, dark, k) } else { compact(sum.run, dark) })));
+    if k > 1.0 {
+        fit_status_image(k);
+    }
     let [w, a, r] = sum.counts;
     let _ = t.set_tooltip(Some(format!("taskq: in work {w} · waiting for answer {a} · ready {r}{}", if sum.run { "" } else { " · paused" })));
 }
@@ -742,15 +746,17 @@ fn is_dark(_w: &Window) -> bool {
 struct Rgba {
     w: u32,
     h: u32,
+    /// pixels per point of the 22 pt drawing: 2 (Retina) times the menu-bar scale `k`
+    s: f32,
     px: Vec<u8>,
 }
 
-const S: f32 = 2.0;
-
 impl Rgba {
-    fn new(w_pt: f32) -> Rgba {
-        let w = (w_pt * S).ceil() as u32;
-        Rgba { w, h: (22.0 * S) as u32, px: vec![0; (w * 44 * 4) as usize] }
+    /// A 22 pt tall canvas; `k` > 1 scales the drawing up to a taller menu bar.
+    fn new(w_pt: f32, k: f32) -> Rgba {
+        let s = 2.0 * k;
+        let (w, h) = ((w_pt * s).ceil() as u32, (22.0 * s).round() as u32);
+        Rgba { w, h, s, px: vec![0; (w * h * 4) as usize] }
     }
 
     /// Paint `rgb` (alpha 0 clears) where `inside(x, y)` holds, in points, 4×4 samples per pixel.
@@ -759,7 +765,7 @@ impl Rgba {
             for x in 0..self.w {
                 let mut hit = 0;
                 for i in 0..16 {
-                    let (sx, sy) = ((x as f32 + (i % 4) as f32 / 4.0 + 0.125) / S, (y as f32 + (i / 4) as f32 / 4.0 + 0.125) / S);
+                    let (sx, sy) = ((x as f32 + (i % 4) as f32 / 4.0 + 0.125) / self.s, (y as f32 + (i / 4) as f32 / 4.0 + 0.125) / self.s);
                     hit += inside(sx, sy) as u32;
                 }
                 if hit == 0 {
@@ -827,7 +833,7 @@ fn draw_q(img: &mut Rgba, x0: f32, y0: f32, run: bool, ink: [u8; 4], p: &Palette
 
 fn compact(run: bool, dark: bool) -> Rgba {
     let p = palette(dark);
-    let mut img = Rgba::new(22.0);
+    let mut img = Rgba::new(22.0, 1.0);
     draw_q(&mut img, 2.0, 0.2, run, p.ink, &p);
     img
 }
@@ -869,10 +875,13 @@ fn number_width(n: usize) -> f32 {
 
 /// macOS summary (menu.md M1, single ribbon): in work left, `ask` centered, ready right in 12 pt over 7 pt stacked
 /// close/failed bars on one peak scale. All paused: the same in gray with the compact q and Ⅱ centered.
-fn wide(s: &Summary, dark: bool) -> Rgba {
+/// The summary ribbon (menu.md M1): three numbers 4 pt apart over the full-width cadence bars,
+/// drawn at 22 pt and scaled by `k` to the menu-bar height.
+fn wide(s: &Summary, dark: bool, k: f32) -> Rgba {
     let p = palette(dark);
-    let w = 47f32.max(s.counts.iter().map(|n| number_width(*n)).sum::<f32>() + 12.0);
-    let mut img = Rgba::new(w);
+    let widths = s.counts.map(number_width);
+    let w = widths.iter().sum::<f32>() + 8.0;
+    let mut img = Rgba::new(w, k);
     let gray = |c: [u8; 4]| if s.run { c } else { p.muted };
     for (i, (n, c)) in s.counts.iter().zip([p.work, p.ask, p.muted]).enumerate() {
         // align by ink, not by cell (menu.md M1)
@@ -901,6 +910,59 @@ fn wide(s: &Summary, dark: bool) -> Rgba {
 
 fn rgba_icon(i: &Rgba) -> Icon {
     Icon::from_rgba(i.px.clone(), i.w, i.h).expect("rgba icon")
+}
+
+/// Call `f` with the status item's window and button (tray-icon keeps them private).
+#[cfg(target_os = "macos")]
+fn with_status_button(mut f: impl FnMut(&objc2_app_kit::NSWindow, &objc2_app_kit::NSButton)) {
+    use objc2_app_kit::{NSApplication, NSButton, NSView, NSWindow};
+    use objc2_foundation::MainThreadMarker;
+    fn walk(w: &NSWindow, v: &NSView, f: &mut impl FnMut(&NSWindow, &NSButton)) -> bool {
+        if let Some(b) = v.downcast_ref::<NSButton>() {
+            f(w, b);
+            return true;
+        }
+        v.subviews().iter().any(|s| walk(w, &s, f))
+    }
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    for w in NSApplication::sharedApplication(mtm).windows().iter() {
+        if w.class().name().to_str() == Ok("NSStatusBarWindow") && w.contentView().is_some_and(|v| walk(&w, &v, &mut f)) {
+            return;
+        }
+    }
+}
+
+/// Menu-bar height over the 22 pt the drawing assumes: 1.5 on notch Macs, 1 elsewhere.
+#[cfg(target_os = "macos")]
+fn menu_bar_scale() -> f32 {
+    let mut bar = 22.0f32;
+    // 0 until the item is placed: the next tick re-renders (`k` is in the icon signature)
+    with_status_button(|w, _| bar = w.frame().size.height as f32);
+    if (22.0..=44.0).contains(&bar) { bar / 22.0 } else { 1.0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn menu_bar_scale() -> f32 {
+    1.0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fit_status_image(_: f32) {}
+
+/// tray-icon caps the status-item image at 22 pt; grow it back to the full menu-bar height.
+#[cfg(target_os = "macos")]
+fn fit_status_image(k: f32) {
+    use objc2_foundation::NSSize;
+    with_status_button(|_, b| {
+        let Some(img) = b.image() else { return };
+        let sz = img.size();
+        if (sz.height - 22.0).abs() < 0.5 {
+            img.setSize(NSSize::new(sz.width * k as f64, 22.0 * k as f64));
+            // the button takes its height from a newly set image, not from a resized one
+            b.setImage(None);
+            b.setImage(Some(&img));
+        }
+    });
 }
 
 fn png(i: &Rgba) -> Vec<u8> {
@@ -993,20 +1055,22 @@ mod tests {
     #[test]
     fn summary_widens_for_long_numbers_and_grays_when_paused() {
         let mut s = Summary { counts: [1, 0, 2], run: true, bins: vec![[1, 0, 0, 0]; 12], since: None };
-        assert_eq!(wide(&s, true).w, 94);
+        let pt = s.counts.map(number_width).iter().sum::<f32>() + 8.0;
+        assert_eq!((wide(&s, true, 1.0).w, wide(&s, true, 1.0).h), ((pt * 2.0).ceil() as u32, 44), "three ink widths, two 4 pt gaps, at 2x");
+        assert_eq!((wide(&s, true, 1.5).w, wide(&s, true, 1.5).h), ((pt * 3.0).ceil() as u32, 66), "a 33 pt menu bar scales the drawing");
         s.counts = [100, 12, 1000];
-        assert!(wide(&s, true).w > 94);
-        assert_eq!(wide(&s, true).h, 44);
+        assert!(wide(&s, true, 1.0).w > (pt * 2.0).ceil() as u32);
+        assert_eq!(wide(&s, true, 1.0).h, 44);
         s.run = false;
         let p = palette(true);
-        assert!(!has(&wide(&s, true), p.work) && has(&wide(&s, true), p.muted));
+        assert!(!has(&wide(&s, true, 1.0), p.work) && has(&wide(&s, true, 1.0), p.muted));
     }
 
     #[test]
     fn summary_counts_align_by_ink() {
         let p = palette(true);
         for counts in [[1, 1, 1], [1, 0, 2], [10, 1, 71]] {
-            let img = wide(&Summary { counts, run: true, bins: vec![[0; 4]; 12], since: None }, true);
+            let img = wide(&Summary { counts, run: true, bins: vec![[0; 4]; 12], since: None }, true, 1.0);
             let ink = |x: u32, c: Option<[u8; 4]>| {
                 (0..img.h).any(|y| {
                     let px = &img.px[((y * img.w + x) * 4) as usize..][..4];
@@ -1056,8 +1120,8 @@ mod tests {
         assert_eq!(s.since, Some(-10));
         // equal counts draw equal heights in the icon: as many green as red pixel rows in a column clear of the digits
         let one = Summary { counts: [0, 0, 0], run: true, bins: vec![[3, 3, 3, 3]; 12], since: None };
-        let (img, pal) = (wide(&one, true), palette(true));
-        let col = |c: [u8; 4]| (0..img.h).filter(|y| img.px[((y * img.w + 17) * 4) as usize..][..3] == c[..3]).count();
+        let (img, pal) = (wide(&one, true, 1.0), palette(true));
+        let col = |c: [u8; 4]| (0..img.h).filter(|y| img.px[((y * img.w + 14) * 4) as usize..][..3] == c[..3]).count();
         assert!(col(pal.work) > 0 && col(pal.work) == col(pal.failed));
         let ps = json!([{"issues": "u", "events": []}, {"issues": "v", "events": [], "since": 5}]);
         assert_eq!(summary(&ps.as_array().unwrap()[..1], (0, 1)).since, None, "no events cache: no since");

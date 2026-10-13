@@ -1,9 +1,9 @@
 {
   "version": "4.0.0-dev",
-  "sourceCommit": "5964cbf5318577ed2b0987aaae84f33aca458409",
-  "binarySha256": "7bc058cbc13b6ffc6e685405e8336aed686350cf4de071292da81d852f4b0326",
+  "sourceCommit": "6b0f43c13f84bad54c1233df50f2a4f91b0d348a",
+  "binarySha256": "21b61c82a2a2336835d0d51838765bc815a076803dea80594a8a65a2481d1db4",
   "environment": {
-    "os": "macOS 27.0.1",
+    "os": "macOS 26.6.2",
     "arch": "arm64",
     "renderer": "WKWebView snapshot"
   },
@@ -16,20 +16,16 @@
   "capture": "Isolated TASKQ_INSTALL using docs/shots/fixture.sh; dark images only.",
   "images": [
     {
-      "file": "../header.webp",
-      "sha256": "5a33dc8bd2d09a2a7a290e2686fd629bdc527d38ffc07c7200195e0e9e7c2ec7"
-    },
-    {
-      "file": "icon-summary-run-dark-34pt@2x.png",
-      "sha256": "dc9a9e4c63f45a18fec28de822b785d5711b8a026c1d65381aedc832cb80af8b"
+      "file": "icon-summary-run-dark-31pt@1x.png",
+      "sha256": "edbbb1f32d27d70426739e29c175281fed9d0ba0a845bf7c4e14c8be9f6c3dab"
     },
     {
       "file": "popover-dark-home-16.png",
-      "sha256": "0364660ab7e8ef981bc8a87e9492ab4328d458ec21625ce64b272da684a5835d"
+      "sha256": "578641a05d33dc6eb76b242502511229ad31cdb2bd7fc3658b6473a703459274"
     },
     {
       "file": "popover-dark-project-16.png",
-      "sha256": "97aaa7301cabc19a360ddfe738b9a13acfd67ea23659200904eeb9aa9fec696b"
+      "sha256": "32051a1e1a1a6adafebae3cb4514ad68808cb0bb7d0cfcad4d9ccae4c7aac778"
     }
   ]
 }

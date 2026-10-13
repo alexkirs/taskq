@@ -9,6 +9,8 @@ mod platform;
 mod runtime;
 mod service;
 #[cfg(any(target_os = "macos", windows))]
+mod icon;
+#[cfg(any(target_os = "macos", windows))]
 mod tray;
 
 use board::{Board, Publish, entries};
@@ -37,7 +39,7 @@ const USAGE: &str = "taskq agents
  taskq service install|run|pause|resume|status|restart|stop|uninstall|list
  taskq service focus [all|off|<label..>] [--request TEXT]
  taskq service capacity [--host H] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
- taskq tray [--snapshot DIR] | taskq selftest
+ taskq tray [--snapshot DIR] [--icon FILE] | taskq selftest
 Text templates and limits: taskq.md sections 1, 2, 5, 7.";
 
 // ---------- arguments ----------
@@ -1242,12 +1244,18 @@ fn service(args: &Args) -> Res<()> {
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn tray(install: PathBuf, snapshot: Option<&str>) -> Res<()> {
+fn tray(install: PathBuf, snapshot: Option<&str>, icon: Option<&str>) -> Res<()> {
+    if let Some(f) = icon {
+        let draft: serde_json::Value = serde_json::from_str(&fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?).map_err(|e| format!("{f}: {e}"))?;
+        tray::use_icon(&install, &draft).map_err(|e| format!("{f}: {}; tray.json unchanged", e.join("; ")))?;
+        println!("custom icon saved: {}", install.join("tray.json").display());
+        return Ok(());
+    }
     tray::run(install, snapshot.map(PathBuf::from))
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-fn tray(_install: PathBuf, _snapshot: Option<&str>) -> Res<()> {
+fn tray(_install: PathBuf, _snapshot: Option<&str>, _icon: Option<&str>) -> Res<()> {
     Err("taskq tray: macOS and Windows only".into())
 }
 
@@ -1333,7 +1341,7 @@ fn run(argv: &[String]) -> Res<()> {
             Ok(())
         }
         "service" => service(&a),
-        "tray" => tray(platform::default_install(), a.one("snapshot")),
+        "tray" => tray(platform::default_install(), a.one("snapshot"), a.one("icon")),
         "" => Err("command missing; use `taskq help`".into()),
         _ => command(&ctx()?, cmd, &a),
     }

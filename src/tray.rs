@@ -14,6 +14,8 @@ use tao::window::{Window, WindowBuilder};
 use tray_icon::{Icon, MouseButtonState, Rect, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use wry::{WebView, WebViewBuilder};
 
+use crate::icon::{self, Rgba, compact};
+
 const HTML: &str = include_str!("tray.html");
 const FONTS: [u64; 4] = [14, 16, 18, 20];
 const PERIODS: [(&str, i64); 5] = [("5m", 300), ("1h", 3600), ("1d", 86400), ("1w", 604800), ("1mo", 2592000)];
@@ -36,8 +38,9 @@ enum Ev {
     Added(Value),
 }
 
-/// View, text size and period of `<install>/tray.json`; anything else falls back to the default. A `custom` period
-/// is `[start, end)` in epoch seconds with the time zone `local` or `UTC` it was typed in.
+/// View, text size, period and Custom icon of `<install>/tray.json`; anything else falls back to the default. A
+/// `custom` period is `[start, end)` in epoch seconds with the time zone `local` or `UTC` it was typed in. View
+/// `full` is Summary; `custom` needs a valid `icon` configuration (custom-icon.md CI1).
 #[derive(Clone, PartialEq)]
 struct Settings {
     view: String,
@@ -46,18 +49,23 @@ struct Settings {
     start: i64,
     end: i64,
     tz: String,
+    icon: Value,
 }
 
 impl Settings {
     fn load(install: &Path) -> Settings {
         let v: Value = fs::read_to_string(install.join("tray.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-        let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into(), start: 0, end: 0, tz: "local".into() };
+        let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into(), start: 0, end: 0, tz: "local".into(), icon: Value::Null };
+        // an invalid or corrupt saved icon falls back to Summary (CI4)
+        if icon::validate(&v["icon"]).is_empty() {
+            s.icon = v["icon"].clone();
+        }
         s.set(&v);
         s
     }
 
     fn set(&mut self, v: &Value) {
-        if let Some(x) = v["view"].as_str().filter(|x| ["icon", "full"].contains(x)) {
+        if let Some(x) = v["view"].as_str().filter(|x| ["icon", "full"].contains(x) || (*x == "custom" && !self.icon.is_null())) {
             self.view = x.into();
         }
         if let Some(x) = v["font"].as_u64().filter(|x| FONTS.contains(x)) {
@@ -83,10 +91,25 @@ impl Settings {
         (now - PERIODS.iter().find(|p| p.0 == self.period).map_or(86400, |p| p.1), now)
     }
 
-    fn save(&self, install: &Path) {
-        let v = json!({"view": self.view, "font": self.font, "period": self.period, "start": self.start, "end": self.end, "tz": self.tz});
-        let _ = crate::platform::write_atomic(&install.join("tray.json"), &v.to_string());
+    fn save(&self, install: &Path) -> bool {
+        let v = json!({"view": self.view, "font": self.font, "period": self.period, "start": self.start, "end": self.end, "tz": self.tz, "icon": self.icon});
+        crate::platform::write_atomic(&install.join("tray.json"), &v.to_string()).is_ok()
     }
+}
+
+/// `taskq tray --icon FILE`: a draft with any schema error is refused with every error and leaves `tray.json` (so the
+/// icon) unchanged; a valid one is saved as Custom and selected (custom-icon.md CI2 Validate/Save).
+pub fn use_icon(install: &Path, draft: &Value) -> Result<(), Vec<String>> {
+    let err = icon::validate(draft);
+    if !err.is_empty() {
+        return Err(err);
+    }
+    let mut s = Settings::load(install);
+    (s.icon, s.view) = (draft.clone(), "custom".into());
+    if !s.save(install) || Settings::load(install).icon != *draft {
+        return Err(vec!["tray.json: write or readback failed".into()]);
+    }
+    Ok(())
 }
 
 /// Draft and history of AI requests (§ 4): `<install>/tray-requests.json`, apart from the view settings.
@@ -199,12 +222,13 @@ fn now() -> i64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// What the icon and the history show: in work, `ask`, ready over all projects (one task per board and issue), whether
+/// What the icon and the history show: in work, `ask`, ready, failed over all projects (one task per board and issue), whether
 /// any project admits, 12 equal bins of `[start, end)` (oldest first) counting `KINDS` and the latest `since` of the
 /// projects that have history (None: none has).
 #[derive(Clone)]
 struct Summary {
-    counts: [usize; 3],
+    /// work, ask, ready, failed
+    counts: [usize; 4],
     run: bool,
     bins: Vec<[u32; 4]>,
     since: Option<i64>,
@@ -233,7 +257,7 @@ fn summary(ps: &[Value], (start, end): (i64, i64)) -> Summary {
         }
     }
     let since = ps.iter().filter_map(|p| p["since"].as_i64()).max();
-    Summary { counts: [n(&["doing", "review"]), n(&["ask"]), n(&["ready"])], run: ps.iter().any(|p| p["focus"].as_array().is_some_and(|f| !f.is_empty())), bins, since }
+    Summary { counts: [n(&["doing", "review"]), n(&["ask"]), n(&["ready"]), n(&["failed"])], run: ps.iter().any(|p| p["focus"].as_array().is_some_and(|f| !f.is_empty())), bins, since }
 }
 
 pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
@@ -306,7 +330,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                     return;
                 }
                 // macOS needs a running event loop before the icon exists
-                match TrayIconBuilder::new().with_icon(rgba_icon(&compact(false, dark))).with_tooltip("taskq").build() {
+                match TrayIconBuilder::new().with_icon(rgba_icon(&compact(false, dark, 2.0))).with_tooltip("taskq").build() {
                     Ok(t) => tray = Some(t),
                     Err(e) => {
                         eprintln!("taskq tray: {e}");
@@ -453,12 +477,22 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 let steps = shots(&install);
                 if step == 0 {
                     let _ = fs::create_dir_all(&dir);
-                    let st = state(&install, &settings, dark, None, &adding);
-                    let s = summary(st["projects"].as_array().map_or(&[][..], |v| v), settings.range(now()));
+                    let ps: Vec<Value> = roots(&install).iter().map(|r| project(r)).collect();
+                    let s = summary(&ps, day(now()));
+                    // this Mac's menu-bar height and backing scale (A5); the names record them
+                    let (k, dpr) = (menu_bar_scale(), backing_scale());
+                    let size = format!("{}pt@{dpr}x", 22.0 * k);
+                    let mut views = vec![("summary", icon::summary())];
+                    views.extend((!settings.icon.is_null()).then(|| ("custom", settings.icon.clone())));
                     for (theme, d) in [("dark", true), ("light", false)] {
                         for (mode, run) in [("run", true), ("pause", false)] {
-                            let _ = fs::write(dir.join(format!("icon-compact-{mode}-{theme}.png")), png(&compact(run, d)));
-                            let _ = fs::write(dir.join(format!("icon-summary-{mode}-{theme}.png")), png(&wide(&Summary { run, ..s.clone() }, d, 1.0)));
+                            let s = Summary { run, ..s.clone() };
+                            let _ = fs::write(dir.join(format!("icon-compact-{mode}-{theme}-{size}.png")), compact(run, d, k * dpr).png());
+                            for (name, c) in &views {
+                                if let Ok(img) = draw(c, &s, d, k, dpr) {
+                                    let _ = fs::write(dir.join(format!("icon-{name}-{mode}-{theme}-{size}.png")), img.png());
+                                }
+                            }
                         }
                     }
                 }
@@ -516,12 +550,13 @@ fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>, a
     let ps: Vec<Value> = roots(install).iter().map(|r| project(r)).collect();
     let (start, end) = s.range(now());
     let sum = summary(&ps, (start, end));
-    let url = |rgba: &Rgba| format!("data:image/png;base64,{}", base64(&png(rgba)));
+    let url = |rgba: &Rgba| format!("data:image/png;base64,{}", base64(&rgba.png()));
     let mut st = json!({"platform": if cfg!(windows) { "windows" } else { "macos" }, "version": crate::platform::VERSION,
         "host": ps.iter().find_map(|p| p["host"].as_str()).unwrap_or("?"), "view": s.view, "font": s.font, "period": s.period,
         "now": now(), "projects": ps, "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "add": add, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since}});
     if cfg!(target_os = "macos") {
-        st["icons"] = json!({"icon": url(&compact(sum.run, dark)), "full": url(&wide(&sum, dark, 1.0))});
+        let day = summary(&ps, day(now()));
+        st["icons"] = json!({"icon": url(&compact(sum.run, dark, 2.0)), "full": draw(&icon::summary(), &day, dark, 1.0, 2.0).map_or(Value::Null, |i| json!(url(&i)))});
     }
     if let Some((theme, page)) = snap {
         st["theme"] = json!(theme);
@@ -536,22 +571,39 @@ fn agents(ps: &[Value]) -> Value {
     json!({"at": a["at"], "rows": a["rows"].as_array().into_iter().flatten().map(crate::runtime::agent_text).collect::<Vec<_>>()})
 }
 
+/// The last 24 h, the period of the icon histogram (icon-summary.config.json).
+fn day(now: i64) -> (i64, i64) {
+    (now - 86400, now)
+}
+
+/// Configuration `c` over `s` at `k` × 22 pt and `dpr` pixels per point through the shared renderer.
+fn draw(c: &Value, s: &Summary, dark: bool, k: f32, dpr: f32) -> Result<Rgba, Vec<String>> {
+    let d = icon::Data { counts: s.counts.map(Some), bins: s.bins.clone(), paused: !s.run };
+    icon::render(c, (22.0 * k * dpr).round() as u32, dpr, &d, dark)
+}
+
 fn refresh_icon(tray: &Option<TrayIcon>, st: &Value, s: &Settings, dark: bool, sig: &mut String) {
     let Some(t) = tray else { return };
-    let sum = summary(st["projects"].as_array().map_or(&[][..], |v| v), s.range(now()));
+    let sum = summary(st["projects"].as_array().map_or(&[][..], |v| v), day(now()));
     // Windows shows only the compact q (menu.md M1)
-    let full = !cfg!(windows) && s.view == "full";
-    let k = if full { menu_bar_scale() } else { 1.0 };
-    let new = format!("{full} {dark} {k} {} {:?} {:?}", sum.run, sum.counts, if full { sum.bins.clone() } else { vec![] });
+    let config = match s.view.as_str() {
+        _ if cfg!(windows) => None,
+        "full" => Some(icon::summary()),
+        "custom" => Some(s.icon.clone()),
+        _ => None,
+    };
+    let (k, dpr) = if config.is_some() { (menu_bar_scale(), backing_scale()) } else { (1.0, 2.0) };
+    let new = format!("{config:?} {dark} {k} {dpr} {} {:?} {:?}", sum.run, sum.counts, if config.is_some() { sum.bins.clone() } else { vec![] });
     if *sig == new {
         return;
     }
     *sig = new;
-    let _ = t.set_icon(Some(rgba_icon(&if full { wide(&sum, dark, k) } else { compact(sum.run, dark) })));
+    let img = config.and_then(|c| draw(&c, &sum, dark, k, dpr).ok()).unwrap_or_else(|| compact(sum.run, dark, k * dpr));
+    let _ = t.set_icon(Some(rgba_icon(&img)));
     if k > 1.0 {
         fit_status_image(k);
     }
-    let [w, a, r] = sum.counts;
+    let [w, a, r, _] = sum.counts;
     let _ = t.set_tooltip(Some(format!("taskq: in work {w} · waiting for answer {a} · ready {r}{}", if sum.run { "" } else { " · paused" })));
 }
 
@@ -769,173 +821,7 @@ fn is_dark(_w: &Window) -> bool {
     }
 }
 
-// ---------- icons (docs/design/icon-studies.html) ----------
-
-/// An RGBA image at 2 px per point: the menu bar is 22 pt high (macOS); Windows scales the square one.
-struct Rgba {
-    w: u32,
-    h: u32,
-    /// pixels per point of the 22 pt drawing: 2 (Retina) times the menu-bar scale `k`
-    s: f32,
-    px: Vec<u8>,
-}
-
-impl Rgba {
-    /// A 22 pt tall canvas; `k` > 1 scales the drawing up to a taller menu bar.
-    fn new(w_pt: f32, k: f32) -> Rgba {
-        let s = 2.0 * k;
-        let (w, h) = ((w_pt * s).ceil() as u32, (22.0 * s).round() as u32);
-        Rgba { w, h, s, px: vec![0; (w * h * 4) as usize] }
-    }
-
-    /// Paint `rgb` (alpha 0 clears) where `inside(x, y)` holds, in points, 4×4 samples per pixel.
-    fn fill(&mut self, rgb: [u8; 4], inside: impl Fn(f32, f32) -> bool) {
-        for y in 0..self.h {
-            for x in 0..self.w {
-                let mut hit = 0;
-                for i in 0..16 {
-                    let (sx, sy) = ((x as f32 + (i % 4) as f32 / 4.0 + 0.125) / self.s, (y as f32 + (i / 4) as f32 / 4.0 + 0.125) / self.s);
-                    hit += inside(sx, sy) as u32;
-                }
-                if hit == 0 {
-                    continue;
-                }
-                let a = hit as f32 / 16.0 * rgb[3] as f32 / 255.0;
-                let o = ((y * self.w + x) * 4) as usize;
-                let da = self.px[o + 3] as f32 / 255.0;
-                if rgb[3] == 0 {
-                    self.px[o + 3] = (da * (1.0 - hit as f32 / 16.0) * 255.0) as u8;
-                    continue;
-                }
-                let oa = a + da * (1.0 - a);
-                for c in 0..3 {
-                    self.px[o + c] = ((rgb[c] as f32 * a + self.px[o + c] as f32 * da * (1.0 - a)) / oa) as u8;
-                }
-                self.px[o + 3] = (oa * 255.0) as u8;
-            }
-        }
-    }
-}
-
-fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> impl Fn(f32, f32) -> bool {
-    move |x, y| x >= x0 && x < x1 && y >= y0 && y < y1
-}
-
-fn rrect(x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> impl Fn(f32, f32) -> bool {
-    move |x, y| {
-        let (dx, dy) = ((x0 + r - x).max(x - x1 + r).max(0.0), (y0 + r - y).max(y - y1 + r).max(0.0));
-        x >= x0 && x < x1 && y >= y0 && y < y1 && dx * dx + dy * dy <= r * r
-    }
-}
-
-struct Palette {
-    ink: [u8; 4],
-    work: [u8; 4],
-    ask: [u8; 4],
-    muted: [u8; 4],
-    failed: [u8; 4],
-}
-
-fn palette(dark: bool) -> Palette {
-    if dark {
-        Palette { ink: [236, 239, 242, 255], work: [119, 205, 179, 255], ask: [237, 185, 147, 255], muted: [180, 189, 200, 255], failed: [239, 137, 150, 255] }
-    } else {
-        Palette { ink: [37, 41, 48, 255], work: [35, 120, 98, 255], ask: [163, 92, 41, 255], muted: [98, 107, 119, 255], failed: [174, 56, 76, 255] }
-    }
-}
-
-/// The angular q (18 pt, stroke 1.8, tail bottom right) at `(x0, y0)` with ▶ (admits) or Ⅱ inside.
-fn draw_q(img: &mut Rgba, x0: f32, y0: f32, run: bool, ink: [u8; 4], p: &Palette) {
-    let (x1, y1) = (x0 + 18.0, y0 + 18.0);
-    let (outer, inner) = (rrect(x0, y0, x1, y1, 1.8), rrect(x0 + 1.8, y0 + 1.8, x1 - 1.8, y1 - 1.8, 0.4));
-    img.fill(ink, |x, y| outer(x, y) && !inner(x, y));
-    img.fill(ink, rect(x1 - 1.8, y1 - 1.0, x1, y1 + 3.6));
-    let (cx, cy) = (x0 + 9.0, y0 + 9.0);
-    if run {
-        let (l, t) = (cx - 4.05 + 0.9, cy - 4.5);
-        img.fill(p.work, move |x, y| x >= l && y >= t + (x - l) * 4.5 / 8.1 && y <= t + 9.0 - (x - l) * 4.5 / 8.1);
-    } else {
-        img.fill(p.muted, rect(cx - 4.5, cy - 4.5, cx - 1.8, cy + 4.5));
-        img.fill(p.muted, rect(cx + 1.8, cy - 4.5, cx + 4.5, cy + 4.5));
-    }
-}
-
-fn compact(run: bool, dark: bool) -> Rgba {
-    let p = palette(dark);
-    let mut img = Rgba::new(22.0, 1.0);
-    draw_q(&mut img, 2.0, 0.2, run, p.ink, &p);
-    img
-}
-
-/// Segments a–g of a 6×9 pt seven-segment digit at the origin, stroke 1.6: angular like the q.
-fn segments(d: u32) -> impl Iterator<Item = (f32, f32, f32, f32)> {
-    let (w, h, t) = (6.0, 9.0, 1.6);
-    let seg = [
-        (0.0, 0.0, w, t),
-        (w - t, 0.0, w, (h + t) / 2.0),
-        (w - t, (h - t) / 2.0, w, h),
-        (0.0, h - t, w, h),
-        (0.0, (h - t) / 2.0, t, h),
-        (0.0, 0.0, t, (h + t) / 2.0),
-        (0.0, (h - t) / 2.0, w, (h + t) / 2.0),
-    ];
-    let on = ["abcdef", "bc", "abged", "abgcd", "fgbc", "afgcd", "afgedc", "abc", "abcdefg", "abcdfg"][d as usize % 10];
-    on.bytes().map(move |ch| seg[(ch - b'a') as usize])
-}
-
-fn digit(img: &mut Rgba, x: f32, y: f32, d: u32, c: [u8; 4]) {
-    for (a, b, cc, dd) in segments(d) {
-        img.fill(c, rect(x + a, y + b, x + cc, y + dd));
-    }
-}
-
-/// Ink bounds `(left, right)` of `n` drawn from x = 0 in 7 pt digit cells: a 1 has ink only in its right 1.6 pt.
-fn number_ink(n: usize) -> (f32, f32) {
-    let ds: Vec<u32> = n.to_string().bytes().map(|ch| (ch - b'0') as u32).collect();
-    let left = segments(ds[0]).map(|s| s.0).fold(f32::MAX, f32::min);
-    let right = segments(ds[ds.len() - 1]).map(|s| s.2).fold(0.0, f32::max);
-    (left, (ds.len() - 1) as f32 * 7.0 + right)
-}
-
-fn number_width(n: usize) -> f32 {
-    let (l, r) = number_ink(n);
-    r - l
-}
-
-/// macOS summary (menu.md M1, single ribbon): in work left, `ask` centered, ready right in 12 pt over 7 pt stacked
-/// close/failed bars on one peak scale. All paused: the same in gray with the compact q and Ⅱ centered.
-/// The summary ribbon (menu.md M1): three numbers 4 pt apart over the full-width cadence bars,
-/// drawn at 22 pt and scaled by `k` to the menu-bar height.
-fn wide(s: &Summary, dark: bool, k: f32) -> Rgba {
-    let p = palette(dark);
-    let widths = s.counts.map(number_width);
-    let w = widths.iter().sum::<f32>() + 8.0;
-    let mut img = Rgba::new(w, k);
-    let gray = |c: [u8; 4]| if s.run { c } else { p.muted };
-    for (i, (n, c)) in s.counts.iter().zip([p.work, p.ask, p.muted]).enumerate() {
-        // align by ink, not by cell (menu.md M1)
-        let (l, r) = number_ink(*n);
-        let x = [-l, (w - l - r) / 2.0, w - r][i];
-        for (k, ch) in n.to_string().bytes().enumerate() {
-            digit(&mut img, x + k as f32 * 7.0, 1.5, (ch - b'0') as u32, gray(c));
-        }
-    }
-    // ponytail: the icon keeps close/failed only (§ 4); the popover stacks all four kinds
-    let peak = s.bins.iter().map(|b| b[0] + b[1]).max().unwrap_or(0).max(1) as f32;
-    let bw = (w + 1.0) / s.bins.len() as f32;
-    for (i, [close, failed, ..]) in s.bins.iter().enumerate() {
-        let (x, base) = (i as f32 * bw, 22.0);
-        let (gh, rh) = (*close as f32 * 7.0 / peak, *failed as f32 * 7.0 / peak);
-        img.fill(gray(p.work), rect(x, base - gh, x + bw - 1.0, base));
-        img.fill(gray(p.failed), rect(x, base - gh - rh, x + bw - 1.0, base - gh));
-    }
-    if !s.run {
-        let x0 = (w - 18.0) / 2.0;
-        img.fill([0, 0, 0, 0], rect(x0 - 1.0, -1.0, x0 + 19.0, 23.0));
-        draw_q(&mut img, x0, 0.2, false, p.muted, &p);
-    }
-    img
-}
+// ---------- icons: drawn by the shared renderer (src/icon.rs) ----------
 
 fn rgba_icon(i: &Rgba) -> Icon {
     Icon::from_rgba(i.px.clone(), i.w, i.h).expect("rgba icon")
@@ -964,15 +850,32 @@ fn with_status_button(mut f: impl FnMut(&objc2_app_kit::NSWindow, &objc2_app_kit
 /// Menu-bar height over the 22 pt the drawing assumes: 1.5 on notch Macs, 1 elsewhere.
 #[cfg(target_os = "macos")]
 fn menu_bar_scale() -> f32 {
-    let mut bar = 22.0f32;
+    use objc2_app_kit::NSScreen;
+    // no status item yet (`--snapshot`): the main screen's menu bar, its frame above the visible frame
+    let mut bar = objc2_foundation::MainThreadMarker::new().and_then(NSScreen::mainScreen).map_or(22.0, |s| {
+        let (f, v) = (s.frame(), s.visibleFrame());
+        (f.origin.y + f.size.height - v.origin.y - v.size.height) as f32
+    });
     // 0 until the item is placed: the next tick re-renders (`k` is in the icon signature)
     with_status_button(|w, _| bar = w.frame().size.height as f32);
     if (22.0..=44.0).contains(&bar) { bar / 22.0 } else { 1.0 }
 }
 
+/// Pixels per point of the main screen (2 on Retina).
+#[cfg(target_os = "macos")]
+fn backing_scale() -> f32 {
+    objc2_foundation::MainThreadMarker::new().and_then(objc2_app_kit::NSScreen::mainScreen).map_or(2.0, |s| s.backingScaleFactor() as f32)
+}
+
 #[cfg(not(target_os = "macos"))]
 fn menu_bar_scale() -> f32 {
     1.0
+}
+
+// ponytail: Windows keeps the compact q at 2x until per-monitor DPI rendering (I6) is qualified
+#[cfg(not(target_os = "macos"))]
+fn backing_scale() -> f32 {
+    2.0
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -992,16 +895,6 @@ fn fit_status_image(k: f32) {
             b.setImage(Some(&img));
         }
     });
-}
-
-fn png(i: &Rgba) -> Vec<u8> {
-    let mut out = vec![];
-    let mut e = ::png::Encoder::new(&mut out, i.w, i.h);
-    e.set_color(::png::ColorType::Rgba);
-    if let Ok(mut w) = e.write_header() {
-        let _ = w.write_image_data(&i.px);
-    }
-    out
 }
 
 fn base64(b: &[u8]) -> String {
@@ -1105,49 +998,27 @@ mod tests {
         fs::remove_dir_all(install).unwrap();
     }
 
-    fn has(i: &Rgba, c: [u8; 4]) -> bool {
-        i.px.chunks(4).any(|p| p[3] == 255 && p[..3] == c[..3])
-    }
-
     #[test]
-    fn compact_q_shows_run_or_pause() {
-        let (p, run, pause) = (palette(true), compact(true, true), compact(false, true));
-        assert_eq!((run.w, run.h), (44, 44));
-        assert!(has(&run, p.work) && !has(&run, p.muted));
-        assert!(has(&pause, p.muted) && !has(&pause, p.work));
-        assert!(has(&compact(true, false), palette(false).ink));
-    }
-
-    #[test]
-    fn summary_widens_for_long_numbers_and_grays_when_paused() {
-        let mut s = Summary { counts: [1, 0, 2], run: true, bins: vec![[1, 0, 0, 0]; 12], since: None };
-        let pt = s.counts.map(number_width).iter().sum::<f32>() + 8.0;
-        assert_eq!((wide(&s, true, 1.0).w, wide(&s, true, 1.0).h), ((pt * 2.0).ceil() as u32, 44), "three ink widths, two 4 pt gaps, at 2x");
-        assert_eq!((wide(&s, true, 1.5).w, wide(&s, true, 1.5).h), ((pt * 3.0).ceil() as u32, 66), "a 33 pt menu bar scales the drawing");
-        s.counts = [100, 12, 1000];
-        assert!(wide(&s, true, 1.0).w > (pt * 2.0).ceil() as u32);
-        assert_eq!(wide(&s, true, 1.0).h, 44);
-        s.run = false;
-        let p = palette(true);
-        assert!(!has(&wide(&s, true, 1.0), p.work) && has(&wide(&s, true, 1.0), p.muted));
-    }
-
-    #[test]
-    fn summary_counts_align_by_ink() {
-        let p = palette(true);
-        for counts in [[1, 1, 1], [1, 0, 2], [10, 1, 71]] {
-            let img = wide(&Summary { counts, run: true, bins: vec![[0; 4]; 12], since: None }, true, 1.0);
-            let ink = |x: u32, c: Option<[u8; 4]>| {
-                (0..img.h).any(|y| {
-                    let px = &img.px[((y * img.w + x) * 4) as usize..][..4];
-                    px[3] > 0 && c.is_none_or(|c| (0..3).all(|k| px[k].abs_diff(c[k]) <= 1))
-                })
-            };
-            assert!(ink(0, None) && ink(img.w - 1, None), "{counts:?}: outer counts touch both edges");
-            let mid: Vec<u32> = (0..img.w).filter(|x| ink(*x, Some(p.ask))).collect();
-            let center = (mid[0] + mid[mid.len() - 1] + 1) as f32 / 2.0;
-            assert!((center - img.w as f32 / 2.0).abs() <= 1.0, "{counts:?}: middle ink center {center} of {}", img.w);
-        }
+    fn invalid_icon_draft_leaves_tray_json_unchanged() {
+        let install = std::env::temp_dir().join(format!("taskq-icon-{}", std::process::id()));
+        fs::create_dir_all(&install).unwrap();
+        let before = r#"{"view":"full","font":18}"#;
+        fs::write(install.join("tray.json"), before).unwrap();
+        let mut bad = icon::summary();
+        bad["version"] = json!(2);
+        bad["elements"][0]["bind"] = json!("eta");
+        assert_eq!(use_icon(&install, &bad).unwrap_err().len(), 2, "every schema error");
+        assert_eq!(fs::read_to_string(install.join("tray.json")).unwrap(), before);
+        assert_eq!(Settings::load(&install).view, "full", "the current icon stays");
+        let mut good = icon::summary();
+        good["elements"][0]["align"] = json!("center");
+        use_icon(&install, &good).unwrap();
+        let s = Settings::load(&install);
+        assert!(s.view == "custom" && s.icon == good && s.font == 18);
+        // a corrupt saved icon falls back to Summary
+        fs::write(install.join("tray.json"), r#"{"view":"custom","icon":{"version":9}}"#).unwrap();
+        assert_eq!(Settings::load(&install).view, "icon");
+        fs::remove_dir_all(install).unwrap();
     }
 
     #[test]
@@ -1155,7 +1026,7 @@ mod tests {
         let p = |issues: &str, state: &str, focus: Value| json!({"issues": issues, "focus": focus, "tasks": [{"n": 1, "state": state}], "events": [[95, "close", "7"], [-250, "failed", "8"]]});
         let ps = [p("https://github.com/o/a/issues", "ask", json!([])), p("https://github.com/o/a/issues", "ask", json!([])), p("https://github.com/o/b/issues", "doing", json!(["all"]))];
         let s = summary(&ps, (-200, 100));
-        assert_eq!(s.counts, [1, 1, 0]);
+        assert_eq!(s.counts, [1, 1, 0, 0]);
         assert!(s.run && !summary(&ps[..2], (-200, 100)).run);
         assert_eq!(s.bins.iter().map(|b| b[0]).sum::<u32>(), 2, "same attempt on two boards counts twice, on one board once");
         assert_eq!(s.bins.iter().map(|b| b[1]).sum::<u32>(), 0, "outside the period");
@@ -1163,11 +1034,11 @@ mod tests {
 
     #[test]
     fn settings_keep_only_known_values() {
-        let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into(), start: 0, end: 0, tz: "local".into() };
+        let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into(), start: 0, end: 0, tz: "local".into(), icon: Value::Null };
         s.set(&json!({"view": "full", "font": 18, "period": "1w"}));
         s.set(&json!({"view": "x", "font": 15, "period": "2y"}));
         s.set(&json!({"period": "custom", "start": 50, "end": 50, "tz": "UTC"}));
-        assert!(s == Settings { view: "full".into(), font: 18, period: "1w".into(), start: 0, end: 0, tz: "local".into() });
+        assert!(s == Settings { view: "full".into(), font: 18, period: "1w".into(), start: 0, end: 0, tz: "local".into(), icon: Value::Null });
         assert_eq!(s.range(1000), (1000 - 604800, 1000));
         s.set(&json!({"period": "custom", "start": 40, "end": 160, "tz": "UTC"}));
         assert_eq!((s.range(1000), s.tz.as_str()), ((40, 160), "UTC"));
@@ -1184,11 +1055,6 @@ mod tests {
         assert_eq!((s.bins[0], s.bins[6], s.bins[11]), ([2, 1, 1, 0], [0, 1, 0, 1], [1, 1, 1, 1]), "[start, end): 120 and -1 are out");
         assert_eq!((0..4).map(|k| s.bins.iter().map(|b| b[k]).sum::<u32>()).collect::<Vec<_>>(), [3, 3, 3, 3]);
         assert_eq!(s.since, Some(-10));
-        // equal counts draw equal heights in the icon: as many green as red pixel rows in a column clear of the digits
-        let one = Summary { counts: [0, 0, 0], run: true, bins: vec![[3, 3, 3, 3]; 12], since: None };
-        let (img, pal) = (wide(&one, true, 1.0), palette(true));
-        let col = |c: [u8; 4]| (0..img.h).filter(|y| img.px[((y * img.w + 14) * 4) as usize..][..3] == c[..3]).count();
-        assert!(col(pal.work) > 0 && col(pal.work) == col(pal.failed));
         let ps = json!([{"issues": "u", "events": []}, {"issues": "v", "events": [], "since": 5}]);
         assert_eq!(summary(&ps.as_array().unwrap()[..1], (0, 1)).since, None, "no events cache: no since");
         assert_eq!(summary(ps.as_array().unwrap(), (0, 1)).since, Some(5));

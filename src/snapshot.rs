@@ -122,8 +122,28 @@ impl Row {
     pub fn json(&self) -> Value {
         json!({"n": self.n, "title": self.title, "state": self.task.state.name(), "labels": self.labels, "url": self.url, "revision": self.revision,
             "session": self.task.session, "attempt": self.task.attempt, "role": self.task.role, "deps": self.deps,
-            "card": self.task.card, "failed": self.failed})
+            "card": self.task.card, "question": self.task.card.as_deref().map(question), "failed": self.failed})
     }
+}
+
+/// Free-text answer limits (`answer N --text`, § 2): nonblank lines, characters per line.
+pub const ANSWER_LINES: usize = 4;
+pub const ANSWER_CHARS: usize = 240;
+
+/// Canonical parsed fields of an open card (§ 2, docs/design/answer-card.md), the one parse every card UI reads.
+/// `parsed` false: a reader shows `text` with the board link and no write controls.
+pub fn question(card: &str) -> Value {
+    let field = |p: &str| card.lines().find_map(|l| l.strip_prefix(p)).map(str::trim);
+    let evidence: Vec<Value> = field("Evidence: ").unwrap_or("").split("), ").filter_map(|l| {
+        let (label, url) = l.strip_prefix('[')?.split_once("](")?;
+        Some(json!({"label": label, "url": url.trim_end_matches(')')}))
+    }).collect();
+    let o = options(card);
+    // an option that starts with `close` closes the task after the answer (dispatch::answer_picks): consequential
+    let choices: Vec<Value> = o.iter().map(|(k, t, star)| json!({"id": k, "text": t, "recommended": star, "consequential": t.to_lowercase().starts_with("close")})).collect();
+    let parsed = field("Problem: ").is_some() && (2..=4).contains(&o.len()) && o.iter().filter(|x| x.2).count() == 1;
+    json!({"parsed": parsed, "text": card, "done": field("Done: "), "problem": field("Problem: ").map(|_| brief(card)), "evidence": evidence,
+        "choices": choices, "limits": {"lines": ANSWER_LINES, "chars": ANSWER_CHARS}})
 }
 
 impl Snapshot {

@@ -36,6 +36,7 @@
       "role": null,
       "deps": [],
       "card": null,
+      "question": null,
       "failed": null
     },
     {
@@ -52,6 +53,31 @@
       "role": "worker",
       "deps": [],
       "card": "Done: read\nProblem: Which way?\n1. left\n2. right ★",
+      "question": {
+        "parsed": true,
+        "text": "Done: read\nProblem: Which way?\n1. left\n2. right ★",
+        "done": "read",
+        "problem": "Which way?",
+        "evidence": [],
+        "choices": [
+          {
+            "id": 1,
+            "text": "left",
+            "recommended": false,
+            "consequential": false
+          },
+          {
+            "id": 2,
+            "text": "right",
+            "recommended": true,
+            "consequential": false
+          }
+        ],
+        "limits": {
+          "lines": 4,
+          "chars": 240
+        }
+      },
       "failed": null
     },
     {
@@ -70,6 +96,7 @@
         3
       ],
       "card": null,
+      "question": null,
       "failed": null
     },
     {
@@ -86,6 +113,7 @@
       "role": null,
       "deps": [],
       "card": null,
+      "question": null,
       "failed": "Reason: no login"
     }
   ],

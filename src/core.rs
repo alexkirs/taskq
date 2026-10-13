@@ -46,6 +46,46 @@ pub fn entry(kind: &str, args: &[&str], attempt: Option<u64>, text: &str) -> Str
     if text.is_empty() { format!("taskq: {head}") } else { format!("taskq: {head}\n{text}") }
 }
 
+/// Appends the optional § 2 fields `op-id` and `revision` to an entry body.
+pub fn with_fields(body: String, op: Option<&str>, revision: Option<u64>) -> String {
+    let mut b = body;
+    if let Some(o) = op {
+        b += &format!("\nop-id: {o}");
+    }
+    if let Some(r) = revision {
+        b += &format!("\nrevision: {r}");
+    }
+    b
+}
+
+/// The op id a log entry of task `n` carries (§ 2); a bare comment carries none.
+pub fn op_id(n: u64, body: &str) -> Option<&str> {
+    parse(n, body)?.op
+}
+
+/// Whether `text` ends with lines that would read as the § 2 fields: such text is refused before writing.
+pub fn has_fields(text: &str) -> bool {
+    let f = fields(text);
+    f.1.is_some() || f.2.is_some()
+}
+
+/// Text without its trailing `op-id:` / `revision:` lines, the op id and the revision.
+fn fields(text: &str) -> (&str, Option<&str>, Option<u64>) {
+    let (mut text, mut op, mut rev) = (text.trim_end(), None, None);
+    loop {
+        let (rest, last) = text.rsplit_once('\n').unwrap_or(("", text));
+        let last = last.trim();
+        if let Some(o) = last.strip_prefix("op-id: ").filter(|_| op.is_none()) {
+            op = Some(o.trim());
+        } else if let Some(r) = last.strip_prefix("revision: ").and_then(|r| r.trim().parse().ok()).filter(|_| rev.is_none()) {
+            rev = Some(r);
+        } else {
+            return (text, op, rev);
+        }
+        text = rest.trim_end();
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Task {
@@ -74,22 +114,25 @@ struct Line<'a> {
     attempt: Option<u64>,
     text: &'a str,
     bare: bool,
+    op: Option<&'a str>,
+    revision: Option<u64>,
 }
 
 /// The first line of a log entry of task `n`; `taskq answer K|N.K` (the CLI form) counts as `taskq: answer K`, any other
 /// comment as a bare answer that `pick` resolves against the open card.
 fn parse(n: u64, body: &str) -> Option<Line<'_>> {
     let (head, text) = body.split_once('\n').unwrap_or((body, ""));
+    let (text, op, revision) = fields(text);
     if let Some(arg) = head.trim().strip_prefix("taskq answer ") {
         let k = match arg.trim().split_once('.') {
             Some((m, k)) => (m.trim_start_matches('#').parse() == Ok(n)).then_some(k)?,
             None => arg.trim(),
         };
         k.parse::<usize>().ok()?;
-        return Some(Line { kind: "answer", args: vec![k], attempt: None, text: text.trim(), bare: false });
+        return Some(Line { kind: "answer", args: vec![k], attempt: None, text: text.trim(), bare: false, op, revision });
     }
     let Some(head) = head.trim().strip_prefix("taskq:") else {
-        return Some(Line { kind: "answer", args: vec![body.trim()], attempt: None, text: "", bare: true });
+        return Some(Line { kind: "answer", args: vec![body.trim()], attempt: None, text: "", bare: true, op: None, revision: None });
     };
     let mut words: Vec<&str> = head.split_whitespace().collect();
     let mut attempt = None;
@@ -98,7 +141,7 @@ fn parse(n: u64, body: &str) -> Option<Line<'_>> {
         words.pop();
     }
     let kind = words.first().copied()?;
-    Some(Line { kind, args: words[1..].to_vec(), attempt, text: text.trim(), bare: false })
+    Some(Line { kind, args: words[1..].to_vec(), attempt, text: text.trim(), bare: false, op, revision })
 }
 
 fn sha(s: &str) -> bool {
@@ -137,9 +180,10 @@ fn pick(card: &str, s: &str) -> Option<usize> {
 /// first line; never empty.
 pub fn delivery(n: u64, entries: &[Entry], id: u64) -> String {
     let Some(e) = entries.iter().find(|e| e.id == id) else { return String::new() };
-    let (head, text) = e.body.split_once('\n').unwrap_or((&e.body, ""));
-    if !text.trim().is_empty() {
-        return text.trim().to_string();
+    let head = e.body.split_once('\n').map_or(e.body.as_str(), |h| h.0);
+    let text = parse(n, &e.body).map_or("", |l| l.text);
+    if !text.is_empty() {
+        return text.to_string();
     }
     let before: Vec<Entry> = entries.iter().filter(|x| x.id < id).cloned().collect();
     let card = fold(n, &before, false).card.unwrap_or_default();
@@ -174,21 +218,39 @@ pub fn fold(n: u64, entries: &[Entry], deps_open: bool) -> Task {
     replay(n, entries, deps_open).0
 }
 
+/// The task's revision (§ 2): the entry that set its open card, else its attempt, else its last accepted entry; 0: none.
+pub fn revision(n: u64, entries: &[Entry]) -> u64 {
+    replay(n, entries, false).2
+}
+
 /// Owner comments (§ 4): ids of the bare comments that the open `ask` ignored, i.e. that name no option of its card.
 pub fn owner_comments(n: u64, entries: &[Entry]) -> Vec<u64> {
     replay(n, entries, false).1
 }
 
-fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>) {
+fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64) {
     let mut log: Vec<&Entry> = entries.iter().filter(|e| !e.edited).collect();
     log.sort_by_key(|e| e.id);
     let mut t = Task::default();
     let mut resume = None; // the state an `ask` entry left; None when a retry limit asked
     let mut free = vec![];
+    let (mut ops, mut card_at, mut last) = (std::collections::HashSet::new(), None, 0);
     for e in log {
         if let Some(l) = parse(n, &e.body) {
+            let rev = t.card.as_ref().and(card_at).or(t.attempt).unwrap_or(last);
+            // § 2: a repeated op id or a stale revision is ignored
+            if l.op.is_some_and(|o| !ops.insert(o)) || l.revision.is_some_and(|r| r != rev) {
+                continue;
+            }
             let asked = t.state == State::Ask;
+            let before = t.clone();
             step(&mut t, &mut resume, e.id, &l);
+            if t != before {
+                last = e.id;
+                if t.card.is_some() && t.card != before.card {
+                    card_at = Some(e.id);
+                }
+            }
             match (asked, t.state == State::Ask) {
                 (true, true) if l.bare && !e.body.trim().is_empty() => free.push(e.id),
                 (_, false) => free.clear(),
@@ -200,7 +262,8 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>) {
     if t.state == State::Ready && deps_open {
         t.state = State::Waiting;
     }
-    (t, free)
+    let rev = t.card.as_ref().and(card_at).or(t.attempt).unwrap_or(last);
+    (t, free, rev)
 }
 
 fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line) {

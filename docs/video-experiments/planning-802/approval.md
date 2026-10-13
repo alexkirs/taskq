@@ -2,9 +2,9 @@
 
 **Planning previews only. No scene, timing, style or exact voice is accepted yet.**
 The [contract](../../../taskq.md) remains unchanged. This package proposes staging,
-not product decisions or final-production activation. See the retained
-[status/approvals](../../design/video-status.md) and
-[owner-policy fencing evidence](../../design/fencing-video.md).
+not product decisions or final-production activation. See the
+[status review](https://github.com/taskqorg/taskq/issues/795) and
+[owner-policy fencing](https://github.com/taskqorg/taskq/issues/801#issuecomment-6134964702).
 The [tool answer](https://github.com/alexkirs/taskq/issues/802#issuecomment-6135228277)
 allows free Gyan.FFmpeg installation and qualification on Windows only.
 

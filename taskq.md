@@ -1,5 +1,5 @@
 # taskq contract
-taskq runs a queue of agent tasks on a GitHub or GitLab issue board. This file is the whole contract: states, log, roles, lease and fencing, compatibility and deployment. History of decisions lives in git and issues, operational state in [docs/handoff.md](docs/handoff.md).
+taskq runs a queue of agent tasks on a GitHub or GitLab issue board. This file is the whole contract: states, log, roles, lease and fencing, compatibility and deployment. History of decisions lives in git and issues; operational state on the board (R1).
 
 This file specifies **v4**, the Rust binary from `src/`.
 ## Principles (R1–R13)

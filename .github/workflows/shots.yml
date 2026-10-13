@@ -2,14 +2,23 @@ name: README shots
 on:
   workflow_dispatch:
   push:
-    branches: [taskq-924]
-    paths: ['.github/workflows/shots.yml']
+    branches: [main, taskq-924]
+    paths:
+      - src/tray.rs
+      - src/tray.html
+      - src/icon.rs
+      - docs/design/icon-summary.config.json
+      - .github/workflows/shots.yml
 permissions:
-  contents: read
+  contents: write
+  actions: write
+concurrency:
+  group: readme-shots-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   capture:
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,3 +39,33 @@ jobs:
           name: readme-shots-log
           path: ${{ runner.temp }}/shots.log
           if-no-files-found: warn
+      - name: Commit and verify refreshed shots
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/shots/*.png docs/shots/manifest.json
+          git diff --cached --quiet && exit 0
+          git commit -m 'Refresh README screenshots' -m 'Task: https://github.com/taskqorg/taskq/issues/924'
+          docs/shots/check.sh
+          sha=$(git rev-parse HEAD)
+          branch="taskq-shots-$GITHUB_RUN_ID"
+          if [ "$GITHUB_REF_NAME" = taskq-924 ]; then branch=taskq-924; fi
+          git push origin "HEAD:refs/heads/$branch"
+          # Token pushes do not start CI; dispatch the existing full suite on this exact bot commit.
+          gh workflow run tests.yml --ref "$branch"
+          for attempt in {1..12}; do
+            run=$(gh run list --workflow tests.yml --branch "$branch" --event workflow_dispatch --commit "$sha" --json databaseId --jq '.[0].databaseId // empty')
+            [ -n "$run" ] && break
+            sleep 5
+          done
+          test -n "$run"
+          gh run watch "$run" --exit-status
+          # A concurrent main update makes this ordinary fast-forward push fail; never force it.
+          if [ "$GITHUB_REF_NAME" = main ]; then
+            git push origin HEAD:refs/heads/main
+            git push origin --delete "$branch"
+          fi

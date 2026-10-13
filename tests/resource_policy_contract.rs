@@ -418,6 +418,21 @@ fn projection_preserves_source_knowledge() {
 #[test]
 fn reviewer_regression_fixtures() {
     let c: Value = serde_json::from_str(CORPUS).unwrap();
+    for case in c["regressions"]["legacy_runtime_scope"].as_array().unwrap() {
+        let mut wire = c["submit"].clone();
+        wire["policy_schema"] = json!("taskq.capacity/1");
+        wire["target"]["project_id"] = case["project_id"].clone();
+        wire["target"]["runtime_id"] = case["runtime_id"].clone();
+        let mut host = Authority::new();
+        assert_eq!(host.submit_raw(&serde_json::to_string(&wire).unwrap()), case["expect"].as_str().unwrap());
+        if case["expect"] == "pending" {
+            assert_eq!(host.apply("op-1"), "saved");
+            assert_eq!(host.writes, 1);
+        } else {
+            assert_eq!(host.writes, 0);
+            assert!(host.operations.is_empty());
+        }
+    }
     for raw in c["regressions"]["duplicate_json"].as_array().unwrap() {
         let mut host = Authority::new();
         assert_eq!(host.submit_raw(raw.as_str().unwrap()), "invalid");

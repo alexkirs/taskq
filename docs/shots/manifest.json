@@ -16,6 +16,10 @@
   "capture": "Isolated TASKQ_INSTALL using docs/shots/fixture.sh; dark images only.",
   "images": [
     {
+      "file": "../header.webp",
+      "sha256": "5a33dc8bd2d09a2a7a290e2686fd629bdc527d38ffc07c7200195e0e9e7c2ec7"
+    },
+    {
       "file": "icon-summary-run-dark-34pt@2x.png",
       "sha256": "dc9a9e4c63f45a18fec28de822b785d5711b8a026c1d65381aedc832cb80af8b"
     },

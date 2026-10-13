@@ -3,30 +3,46 @@
   <br><em>Agents working.</em>
 </p>
 
+```text
+Install taskq from https://github.com/taskqorg/taskq and set it up for this project.
+```
+
+Paste into Claude or Codex; the agent confirms setup changes, installs taskq, connects the board and becomes the manager.
+For a new project:
+
+```text
+Install taskq from https://github.com/taskqorg/taskq and create project <name> from <idea or folder>.
+```
+
 Your repository board is the task list; your usual AI apps do the work.
-Add taskq, then ask Codex or Claude to turn any request into tickets.
 
-The manager picks up tickets, runs as many workers as you choose, and tracks progress.
-No extra worker apps required. Compression stays under your global user settings; TaskQ needs no compression provider.
+### What you get
 
-You stay in control: tasks wait for your input and continue when you reply.
+- Tasks are issues on GitHub or GitLab.
+- The service runs Claude or Codex workers within each computer's configured limits.
+- A worker's question waits for your answer.
+- A reviewer checks the result; accepted work publishes through the configured branch or PR route.
+- The tray menu shows questions, admission controls and a day's history.
+- Several computers share one board.
 
-1. **⚙ Set up (once per project)**<br>
-   Tell your agent: "Install taskq from https://github.com/taskqorg/taskq. Create project Notes from my idea or files in ~/Projects/notes, choose a repository and board, then plan it."<br>
-   Existing project: "Set it up here; keep my files and repository."
+<p>
+  <img src="docs/shots/popover-dark-home-16.png" alt="Home menu: projects, a waiting question and daily history" width="320">
+  <img src="docs/shots/popover-dark-project-16.png" alt="Project menu: questions, work, review, ready tasks and service controls" width="320">
+</p>
+<p>
+  <img src="docs/shots/icon-summary-run-dark-34pt@2x.png" alt="Summary icon with task counts and activity" height="34">
+</p>
 
-2. **▶ Start working (each day)**<br>
-   "Run taskq pm, then arm the tick." - workers start on ready tasks
+### Use cases
 
-3. **✎ Talk to the manager**<br>
-   "File a task: fix the login redirect." - new task<br>
-   "What is in the queue?" - status<br>
-   "What should we do next?" - plan<br>
-   "Show me the question from #12." - answer a worker<br>
-   "Review #12." - accept or send back
-
-**Mix agents, task by task.** Codex makes the visuals, Claude writes the code - in whatever order your work needs.
-Choose each task's agent with `--runtime` (a `run-*` label); use `--deps` to chain tasks.
+| You want | Say to the manager | What happens |
+|---|---|---|
+| A task done · UC-02 | `File a task: fix the login redirect.` | An issue records the agreed goal and acceptance; an eligible service picks it up within limits. |
+| A new task done first · UC-04 | `File it as p0.` | The task gets priority 0, ahead of ordinary tasks within limits. |
+| A plan broken up · UC-07 | `Split this plan into tasks.` | Agreed tasks stay held until you start them; dependencies wait for their predecessors to close. |
+| To answer a worker · UC-09 | `Answer #12 with 2.` | Your choice is posted to the current question on #12. |
+| A quiet day · UC-13 | `Pause the service.` | New worker admission pauses for this project; running attempts continue. |
+| To mix agents · UC-02 | `Use Codex for the visuals.` | The new visual task selects Codex; other tasks keep their configured agents. |
 
 Agents: install, setup, commands and development are in **[taskq.md](taskq.md)**.
 

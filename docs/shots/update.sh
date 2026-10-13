@@ -25,7 +25,9 @@ sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 '; done
   printf '\n  },\n'
   printf '  "capture": "Isolated TASKQ_INSTALL using docs/shots/fixture.sh; dark images only.",\n  "images": [\n'
-  sep=''
+  printf '    {\n      "file": "../header.webp",\n      "sha256": "%s"\n    }' "$(sha docs/header.webp)"
+  sep=',
+'
   for f in docs/shots/*.png; do
     printf '%s    {\n      "file": "%s",\n      "sha256": "%s"\n    }' "$sep" "${f##*/}" "$(sha "$f")"
     sep=',

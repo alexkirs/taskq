@@ -30,6 +30,9 @@ Choose each task's agent with `--runtime` (a `run-*` label); use `--deps` to cha
 
 Agents: install, setup, commands and development are in **[taskq.md](taskq.md)**.
 
+Verify a downloaded release file: check it against the release's `SHA256SUMS` (`shasum -a 256 -c SHA256SUMS --ignore-missing`),
+then trace it to the workflow run that built it with `gh attestation verify <file> --repo taskqorg/taskq`.
+
 License: [MIT](LICENSE).
 
 If taskq saves you time, [buy me a coffee](https://alex.kirs.online/donate).

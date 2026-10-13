@@ -193,12 +193,23 @@ pub fn answer_picks(b: &dyn Board, cfg: &Config, picks: &[String], op: &Op) -> R
     for p in picks {
         let (n, k) = p.trim_start_matches('#').split_once('.').and_then(|(n, k)| Some((n.parse::<u64>().ok()?, k.parse::<usize>().ok()?))).ok_or(format!("not N.K: {p}"))?;
         let (_, t, _) = current(b, n)?;
+        let log = entries(b, n)?;
+        if op.id.as_deref().is_some_and(|id| log.iter().any(|e| !e.edited && core::op_id(n, &e.body) == Some(id)))
+            || op.revision.is_some_and(|r| r != core::revision(n, &log))
+        {
+            plan.push((n, k, None));
+            continue;
+        }
         let card = t.card.clone().filter(|_| matches!(t.state, State::Ask | State::Review)).ok_or(format!("#{n} is {} without a question", t.state.name()))?;
         let opt = options(&card).into_iter().find(|o| o.0 == k).ok_or(format!("#{n} has no option {k}"))?.1;
-        plan.push((n, k, opt, t.state));
+        plan.push((n, k, Some((opt, t.state))));
     }
     let mut out = vec![];
-    for (n, k, opt, state) in plan {
+    for (n, k, card) in plan {
+        let Some((opt, state)) = card else {
+            out.push(act(b, &cfg.root, n, "answer", &[&k.to_string()], "", op));
+            continue;
+        };
         let close = opt.to_lowercase().starts_with("close");
         out.push(match (state, close) {
             (State::Ask, _) => {
@@ -304,6 +315,14 @@ mod tests {
         // A3: the same op id again returns the first receipt and writes no second entry
         let again = act(&b, &root, n, "answer", &["1"], "x", &op("pm", card));
         assert_eq!((again.outcome, again.state, count()), ("accepted", Some("doing"), before + 1));
+        // Numbered answers reconcile before looking for the card that the accepted write removed.
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("taskq.json"), r#"{"repo":"o/r"}"#).unwrap();
+        let (cfg, _) = crate::load(&root).unwrap();
+        let again = answer_picks(&b, &cfg, &[format!("{n}.1")], &op("pm", card)).unwrap().remove(0);
+        assert_eq!((again.outcome, count()), ("accepted", before + 1));
+        let stale = answer_picks(&b, &cfg, &[format!("{n}.2")], &op("tray2", card)).unwrap().remove(0);
+        assert_eq!((stale.outcome, count()), ("stale", before + 1));
         // A5: one JSON object per receipt
         let v: serde_json::Value = serde_json::from_str(&again.json()).unwrap();
         assert_eq!((v["task"].as_u64(), v["op_id"].as_str(), v["outcome"].as_str(), v["state"].as_str()), (Some(n), Some("pm"), Some("accepted"), Some("doing")));

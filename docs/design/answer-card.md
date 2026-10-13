@@ -31,12 +31,17 @@ Use the same fixtures in TaskQ and DashQ: choice and free text; long question; m
 
 - Canonical fields: each `status --json` task row with a card adds `question`: `parsed`, original `text`, `done`, `problem`, `evidence` (label, URL), `choices` (`id`, `text`, `recommended`, `consequential` for an option starting with `close`) and free-text `limits`. `parsed` is false without Problem, 2-4 options and one `★`.
 - Component: [src/answer-card.js](../../src/answer-card.js) (`TaskqAnswerCard` global or CommonJS) and [src/answer-card.css](../../src/answer-card.css). `mount(el, adapter).update([{board, row}])` keeps drafts, focus and scroll; the adapter gives `capability(board, row)` = `{answer, reason}` and `send(board, op)` resolving to `{state, reason, next}`, with `op` = `{id, task, revision, choice | text}`. Pure `status`, `step` and `render` hold all behavior.
+- Tray adapter: [src/tray.html](../../src/tray.html) embeds the unchanged assets beside task rows and keeps card instances through refresh/navigation. The existing IPC bridge in [src/tray.rs](../../src/tray.rs) validates registered project/board identity and invokes the owner CLI dispatcher with the exact operation ID and revision; only its readback receipt accepts an answer. A missing receipt stays unknown and reconciles with the same payload/ID. `node tests/tray-answer.test.cjs` checks this adapter boundary.
 - Conformance: [tests/fixtures/answer-card.json](../../tests/fixtures/answer-card.json); `cargo test` checks its `question` fields against TaskQ's parse, and each consumer runs `replay(case, capability)` over it (`node tests/answer-card.test.cjs`). `tests/answer-card.browser.cjs` checks 16/20 px, both themes, 280/480 px, refresh and keyboard with Playwright.
 - Release: `taskq-<version>-answer-card.js`, `.css` and `-fixtures.json` ship in each release, listed in `SHA256SUMS` with build provenance. Checksums of this source, checked by the node test:
 
-`src/answer-card.js` SHA-256: `12ee2636fa63f1b7d8f551e2ccdb0b6647591d04955bbe8dbf52776ac2007d05`  
+`src/answer-card.js` SHA-256: `12e12ab3ea5325121819244506b936a18fe8969e004760b8be843a881520cce4`
 `src/answer-card.css` SHA-256: `a4365828fd91b269b158963d65b01a70d7ede028518ac21346cf558d6684a400`  
-`tests/fixtures/answer-card.json` SHA-256: `2c74afabd524cddda235e3aef84a86f8facb9415788423b4eae2762ebea6d5e7`  
+`tests/fixtures/answer-card.json` SHA-256: `39d07225adddcf2fddc0e5b76f11e26ef4c9d68478b67028614f396410ac0c40`
+
+Parent source: TaskQ `531f68e2c6f971eb56c392e623e90721e674f346` supplies the JS/CSS/fixtures; design inheritance is pinned to `6828245b7854e09fb1f307d5be2a4a211a851e34`. The tray places the shared card beside its existing row without restyling it. This adapter fixes same-ID reconciliation when refresh removes an answered question; the updated JS/fixture hashes above identify that shared fix.
+
+Delivery of #920 is the adapter PR first, per the owner's answer on the task. Screen-capable native interaction qualification and the pinned release/checksum evidence follow after merge. Browser and dispatcher tests do not certify native interaction, a real board answer or worker resumption; README screenshot freshness remains a separate native capture gate.
 
 ## Accepted reference
 

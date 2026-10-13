@@ -53,7 +53,8 @@ button:disabled{color:var(--muted);opacity:.75}
 /* large text may wrap a title (menu.md M3); 14 and 16 px ellipsize */
 .big .title{white-space:normal;overflow-wrap:anywhere}.big .task.global{grid-template-columns:12px 5ch 4ch minmax(0,1fr);gap:4px}
 @media(pointer:coarse){.task,button,summary{min-height:44px}}
-</style></head><body><div class="menu" role="menu"></div>
+</style><style>{{ANSWER_CARD_CSS}}</style></head><body><div class="menu" role="menu"></div>
+<script>{{ANSWER_CARD_JS}}</script>
 <script>
 (()=>{
 const names={doing:'In work',review:'Review',ask:'Waiting for answer',failed:'Failed',ready:'Ready',waiting:'Dependencies',later:'Later'};
@@ -66,6 +67,42 @@ const send=m=>window.ipc&&window.ipc.postMessage(JSON.stringify(m));
 const menu=document.querySelector('.menu');
 let aiText=null,aiMenu=false,aiConfirm=null,addConfirm=false;
 let S=null,page='home',homeScroll=0,ask=null,pending={},confirming=null,updating=null,draft=null,capedit=null,capmsg={};
+// Task answers: the native bridge owns credentials and canonical dispatch/readback.
+const answerRequests=new Map(),answerCards=new Map();
+function answerCapability(board){const p=S&&S.projects.find(p=>p.issues===board);return {answer:!!p&&p.alive&&p.complete!==false,reason:'Project status is unavailable or stale; check the board'};}
+function answerSend(board,op){
+  const p=S&&S.projects.find(p=>p.issues===board);
+  if(!p)return Promise.resolve({state:'rejected',reason:'Project is no longer registered'});
+  const key=p.root+'#'+op.id;
+  if(answerRequests.has(key))return answerRequests.get(key).promise;
+  let resolve;
+  const promise=new Promise(r=>resolve=r);
+  const timer=setTimeout(()=>{answerRequests.delete(key);resolve({state:'unknown',reason:'No bridge receipt received',next:'Check delivery with the same operation'});},30000);
+  answerRequests.set(key,{promise,resolve,timer});
+  send({a:'answer',root:p.root,board,op});
+  return promise;
+}
+function answerReceipt(r){
+  const key=r.root+'#'+r.id,request=answerRequests.get(key);
+  if(!request)return;
+  clearTimeout(request.timer);answerRequests.delete(key);
+  request.resolve({state:r.state,reason:r.reason,next:r.next});
+  setTimeout(()=>send({a:'size',w:S.font>=18?360:320,h:menu.scrollHeight}),0);
+}
+function answerSlot(t){return t.question||t.card||answerCards.has(t.key)?'<div data-answer="'+esc(t.key)+'"></div>':'';}
+function mountAnswers(){
+  for(const slot of menu.querySelectorAll('[data-answer]')){
+    const t=unique(S.projects.flatMap(tasks)).find(t=>t.key===slot.dataset.answer);
+    if(!t)continue;
+    let card=answerCards.get(t.key);
+    if(!card){const el=document.createElement('div');card={el,ui:TaskqAnswerCard.mount(el,{capability:answerCapability,send:answerSend})};answerCards.set(t.key,card);}
+    slot.append(card.el);
+    const p=S.projects.find(p=>p.issues+'/'+t.n===t.key);
+    card.ui.update([{board:p.issues,row:t}]);
+  }
+  const keys=new Set(S.projects.flatMap(tasks).map(t=>t.key));
+  for(const key of answerCards.keys())if(!keys.has(key))answerCards.delete(key);
+}
 // one task per board and issue: `issues` names provider, host and repo (M2)
 function tasks(p){return p.tasks.map(t=>({...t,project:p.name,key:p.issues+'/'+t.n,url:p.issues+'/'+t.n}));}
 function unique(ts){return [...new Map(ts.map(t=>[t.key,t])).values()];}
@@ -75,7 +112,7 @@ function counter(v,kind,label){return '<span class="counter '+(v>0?kind+' filled
 // an incomplete or stale snapshot has unknown counts, never zero (§ 4)
 function known(ps){return ps.every(p=>p.complete!==false);}
 function countMarkup(c,ok=true){if(!ok)return '<span class="counts meta">unknown</span>';return '<span class="counts">'+counter(c.work,'work','In work')+counter(c.ask,'ask','Waiting for answer')+counter(c.ready,'ready','Ready')+'</span>';}
-function taskRow(t,global){return '<a class="task'+(global?' global':'')+'" href="'+esc(t.url)+'" data-url="'+esc(t.url)+'" role="menuitem" aria-label="'+esc(t.project+' #'+t.n+' '+t.title+'; '+names[t.state])+'" title="'+esc(t.title)+'"><span class="'+color(t.state)+'" aria-hidden="true">'+symbols[t.state]+'</span>'+(global?'<span class="num">'+esc(t.project)+'</span>':'')+'<span class="num">#'+esc(t.n)+'</span><span class="title">'+esc(t.title)+'</span></a>';}
+function taskRow(t,global){return '<a class="task'+(global?' global':'')+'" href="'+esc(t.url)+'" data-url="'+esc(t.url)+'" role="menuitem" aria-label="'+esc(t.project+' #'+t.n+' '+t.title+'; '+names[t.state])+'" title="'+esc(t.title)+'"><span class="'+color(t.state)+'" aria-hidden="true">'+symbols[t.state]+'</span>'+(global?'<span class="num">'+esc(t.project)+'</span>':'')+'<span class="num">#'+esc(t.n)+'</span><span class="title">'+esc(t.title)+'</span></a>'+answerSlot(t);}
 function globalGroup(st,ts){ts=ts.filter(t=>t.state===st);return ts.length?'<details class="group"><summary><span class="'+color(st)+'">'+names[st]+'</span>'+counter(ts.length,color(st),names[st])+'</summary>'+ts.map(t=>taskRow(t,true)).join('')+'</details>':'';}
 function age(s){return s<120?s+' s':s<7200?Math.round(s/60)+' min':s<172800?Math.round(s/3600)+' h':Math.round(s/86400)+' d';}
 // service error and stale status.json are not failed tasks (M-A10)
@@ -264,16 +301,24 @@ function project(p){
 function head(){return '<div class="row head"><span class="meta">taskq</span><button data-a="pin" aria-pressed="'+!!S.pinned+'" title="'+(S.pinned?'Unpin: back to the popover':'Pin: keep open as a movable window')+'">'+(S.pinned?'Pinned':'Pin')+'</button></div>';}
 function render(){
   if(!S)return;
+  const active=document.activeElement,answerFocus=active&&active.closest('[data-answer]'),scroll=document.scrollingElement.scrollTop;
+  const caret=answerFocus&&active.tagName==='TEXTAREA'?[active.selectionStart,active.selectionEnd]:null;
+  const answerSelector=answerFocus&&(caret?'textarea':active.dataset.choice?'[data-choice="'+active.dataset.choice+'"]':active.dataset.qac?'[data-qac="'+active.dataset.qac+'"]':'button[type=submit]');
   const open=[...menu.querySelectorAll('details')].map(d=>d.open),p=S.projects.find(p=>p.root===page);
   if(!p)page='home';
   document.documentElement.style.colorScheme=S.theme||'light dark';
   menu.style.setProperty('--size',S.font+'px');menu.classList.toggle('big',S.font>=18);
   menu.classList.toggle('pinned',!!S.pinned);
   menu.innerHTML=head()+(p?project(p):home());
+  mountAnswers();
   menu.querySelectorAll('details').forEach((d,i)=>d.open=open[i]||false);
   if(S.page!==undefined)menu.querySelectorAll('.hist,.agents,.service,.incident-notice').forEach(d=>d.open=true);
+  const restored=answerFocus&&menu.querySelector('[data-answer="'+CSS.escape(answerFocus.dataset.answer)+'"] '+answerSelector);
+  if(restored){restored.focus();if(caret)restored.setSelectionRange(...caret);}
+  document.scrollingElement.scrollTop=scroll;
   send({a:'size',w:S.font>=18?360:320,h:menu.scrollHeight});}
 window.taskq={receive(s){
+  if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
   if(s.capmsg){capmsg[s.capmsg.root]=s.capmsg.text;render();return;}
   for(const p of s.projects){const was=S&&S.projects.find(q=>q.root===p.root);if(pending[p.root]&&was&&mode(was)!==mode(p))delete pending[p.root];}
   S=s;
@@ -285,6 +330,8 @@ window.taskq={receive(s){
   render();
 },model:{unique,counts,mode,gateText,capChanges,capCheck,capSet}};
 menu.addEventListener('click',e=>{
+  const cardLink=e.target.closest('.qac a');if(cardLink){e.preventDefault();send({a:'open',url:cardLink.getAttribute('href')});return;}
+  if(e.target.closest('.qac'))return;
   const a=e.target.closest('a[data-url]');if(a){e.preventDefault();send({a:'open',url:a.dataset.url});return;}
   const b=e.target.closest('button');if(!b||b.disabled)return;const d=b.dataset;
   if(d.page){homeScroll=document.scrollingElement.scrollTop;page=d.page;ask=null;render();document.scrollingElement.scrollTop=0;return;}

@@ -39,6 +39,7 @@ button[aria-pressed=true]{background:light-dark(#dce7e1,#354a40);border-color:va
 .views img{height:18px}
 button:disabled{color:var(--muted);opacity:.75}
 .alert{color:var(--failed)}
+.head{min-height:28px;padding:2px 4px}.head button{padding:2px 7px}.pinned .head{cursor:grab}
 .askai{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px;padding:4px}
 .askai textarea{font:inherit;color:inherit;background:none;border:1px solid var(--edge);border-radius:4px;padding:5px;resize:vertical;min-width:0;-webkit-user-select:text;user-select:text}
 .askai button{align-self:start;min-width:34px}
@@ -182,6 +183,7 @@ function home(){
   h+=ai();
   h+='<details><summary>↳ Scope <span class="meta">'+S.projects.length+' project'+(S.projects.length===1?'':'s')+(known(S.projects)?' · in work '+c.work+' · ask '+c.ask+' · ready '+c.ready:' · counts unknown')+'</span></summary><div class="body">'+S.projects.map(p=>'<div><strong>'+esc(p.name)+'</strong> <span class="meta">'+esc(modeText(p))+'</span></div><div class="meta">You asked: '+esc(p.request||'not recorded')+'</div>').join('')+'</div></details>';
   h+=S.projects.map(p=>problem(p)+incident(p,true)+incidentNotice(p)).join('');
+  if(S.settings_error)h+='<div class="body alert" role="alert">⚠ Settings unknown: '+esc(S.settings_error)+'; defaults shown</div>';
   h+=globalGroup('ask',unique(all))+globalGroup('failed',unique(all));
   h+='<div class="group"><div class="row meta">Projects</div>'+(S.projects.length?S.projects.map(p=>'<button class="project" data-page="'+esc(p.root)+'" role="menuitem"><span title="'+esc(p.name)+'">'+esc(p.name)+(mode(p)==='run'?'':' <span class="meta">'+(mode(p)==='paused'?'Ⅱ':'observation')+'</span>')+'</span>'+countMarkup(counts(tasks(p)),known([p]))+'<span aria-hidden="true">›</span></button>').join(''):'<div class="body meta">No projects yet</div>')+addProject()+'</div>';
   h+=history();
@@ -249,13 +251,16 @@ function project(p){
   return '<button data-a="back">‹ All projects</button><div class="row"><strong title="'+esc(p.root)+'">'+esc(p.name)+'</strong>'+countMarkup(counts(ts),known([p]))+'</div><div class="body meta">'+esc(modeText(p))+'</div>'+problem(p)+incident(p,true)+incidentNotice(p)+
   (['ask','failed','doing','review','ready','waiting','later'].map(st=>{const r=ts.filter(t=>t.state===st);return r.length?'<div class="group"><div class="row meta"><span>'+names[st]+'</span>'+counter(r.length,color(st),names[st])+'</div>'+r.map(t=>taskRow(t)).join('')+'</div>':'';}).join('')||'<div class="body muted">No open tasks</div>')+
   '<div class="group">'+(p.issues?'<a class="project" href="'+esc(p.issues)+'" data-url="'+esc(p.issues)+'"><span>Board ↗</span><span></span><span></span></a>':'')+admission(p)+'</div>'+capacity(p)+service(p);}
+// pin (menu.md M13): the same menu as a movable window; the header is its drag handle
+function head(){return '<div class="row head"><span class="meta">taskq</span><button data-a="pin" aria-pressed="'+!!S.pinned+'" title="'+(S.pinned?'Unpin: back to the popover':'Pin: keep open as a movable window')+'">'+(S.pinned?'Pinned':'Pin')+'</button></div>';}
 function render(){
   if(!S)return;
   const open=[...menu.querySelectorAll('details')].map(d=>d.open),p=S.projects.find(p=>p.root===page);
   if(!p)page='home';
   document.documentElement.style.colorScheme=S.theme||'light dark';
   menu.style.setProperty('--size',S.font+'px');menu.classList.toggle('big',S.font>=18);
-  menu.innerHTML=p?project(p):home();
+  menu.classList.toggle('pinned',!!S.pinned);
+  menu.innerHTML=head()+(p?project(p):home());
   menu.querySelectorAll('details').forEach((d,i)=>d.open=open[i]||false);
   if(S.page!==undefined)menu.querySelectorAll('.hist,.agents,.service,.incident-notice').forEach(d=>d.open=true);
   send({a:'size',w:S.font>=18?360:320,h:menu.scrollHeight});}
@@ -303,6 +308,7 @@ menu.addEventListener('click',e=>{
   if(d.a)send({a:d.a,root:d.root,label:d.label});render();});
 menu.addEventListener('input',e=>{if(e.target.id==='ai'){aiText=e.target.value;send({a:'ai-draft',text:aiText});return;}const k=e.target.dataset.draft,c=e.target.dataset.cap;if(k&&draft)draft[k]=e.target.value;if(c&&capedit)capedit[c]=e.target.type==='checkbox'?e.target.checked:e.target.value;});
 menu.addEventListener('focusout',e=>{const f=x=>x&&(x.id==='ai'||x.dataset&&(x.dataset.draft||x.dataset.cap));if(f(e.target))setTimeout(()=>{if(!f(document.activeElement))render();});});
+menu.addEventListener('mousedown',e=>{if(S&&S.pinned&&e.button===0&&e.target.closest('.head')&&!e.target.closest('button'))send({a:'drag'});});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')send({a:'hide'});});
 send({a:'ready'});
 })();

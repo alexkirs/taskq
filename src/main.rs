@@ -2,11 +2,14 @@
 
 mod board;
 mod core;
+mod data;
 mod dispatch;
+mod enrollment;
 mod incident;
 mod labels;
 mod operator;
 mod platform;
+mod retro;
 mod runtime;
 mod service;
 mod snapshot;
@@ -39,6 +42,7 @@ const USAGE: &str = "taskq agents
  taskq steer N --text T | taskq failed N --text T
  taskq close N [M..] [--text VERDICT]
  taskq status [--only L,..] [--json] | taskq inbox N
+ taskq retro | taskq add --retro K [--type T ..]
  taskq wait [--window MIN] [--only L,..]
  taskq cleanup [--force] | taskq update [--check]
  taskq service install|run|pause|resume|status|restart|stop|uninstall|list
@@ -456,24 +460,35 @@ fn sleep_until_poke(poke: &Path, secs: u64, tick: &mut dyn FnMut()) {
 }
 
 /// The kids file carries live children across the update re-exec (unix). It names the PID that wrote it: a file from
-/// a crashed process is ignored and its attempts go `gone` (§ 4 restart).
-fn adopt(s: &mut Service, root: &Path) {
+/// a crashed process is ignored and its attempts go `gone` (§ 4 restart). A malformed file is unknown: nothing is
+/// adopted and the file stays (§ 4 Data).
+fn kids_file(root: &Path) -> Vec<data::KidLine> {
     let path = dot(root).join("kids");
-    let Ok(text) = fs::read_to_string(&path) else { return };
-    let _ = fs::remove_file(&path);
-    let mut lines = text.lines();
-    if lines.next() != Some(&format!("pid {}", std::process::id())) {
-        return;
-    }
-    #[cfg(unix)]
-    for l in lines {
-        let w: Vec<&str> = l.split_whitespace().collect();
-        if let [task, attempt, rt, pid, delivered] = w[..]
-            && let (Ok(task), Ok(attempt), Ok(pid), Ok(delivered)) = (task.parse(), attempt.parse(), pid.parse(), delivered.parse())
-        {
-            s.adopt(Kid { task, attempt, rt: rt.into(), proc: Box::new(runtime::Adopted(pid)) }, delivered);
+    let parsed = match fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return vec![],
+        Err(e) => Err(format!("kids: unreadable ({e}); file kept")),
+        Ok(t) => data::kids(&t),
+    };
+    match parsed {
+        Err(e) => {
+            eprintln!("{e}; its attempts go gone");
+            vec![]
+        }
+        Ok((pid, kids)) => {
+            let _ = fs::remove_file(&path);
+            if pid == std::process::id() { kids } else { vec![] }
         }
     }
+}
+
+fn adopt(s: &mut Service, root: &Path) {
+    let kids = kids_file(root);
+    #[cfg(unix)]
+    for (task, attempt, rt, pid, delivered) in kids {
+        s.adopt(Kid { task, attempt, rt, proc: Box::new(runtime::Adopted(pid)) }, delivered);
+    }
+    #[cfg(not(unix))]
+    let _ = (s, kids);
 }
 
 fn service_run(c: &Ctx) -> Res<()> {
@@ -502,6 +517,8 @@ fn service_run(c: &Ctx) -> Res<()> {
     eprintln!("taskq {} service on {} for {}", platform::VERSION, cfg.me, cfg.repo);
     let mut sampled: Option<Instant> = None;
     let mut agents: Option<(Instant, Value)> = None;
+    let mut focus_error: Option<String> = None;
+    let mut pruned: Option<Instant> = None;
     loop {
         // § 3: capacity reloads before each admission decision; children are untouched
         let cap = fs::read_to_string(cfg.root.join("taskq.json")).map_err(|e| e.to_string())
@@ -512,7 +529,13 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         s.reload(cap);
         s.mono = began.elapsed().as_secs();
-        s.focus = fs::read_to_string(d.join("focus")).unwrap_or_default().split_whitespace().filter(|f| *f != "off").map(String::from).collect();
+        // § 4 Data: an unreadable focus admits nothing and reads unknown with its reason
+        let focus = data::focus(&cfg.root);
+        if focus.as_ref().err() != focus_error.as_ref() {
+            if let Err(e) = &focus { eprintln!("{e}; nothing admitted"); }
+            focus_error = focus.as_ref().err().cloned();
+        }
+        s.focus = focus.unwrap_or_default();
         let r = s.pass();
         for l in s.log.drain(..) {
             eprintln!("{l}");
@@ -535,7 +558,7 @@ fn service_run(c: &Ctx) -> Res<()> {
             Some(snap) => for (k, v) in snap.status_keys(error.as_deref()) { status[k] = v; },
             None => { status["complete"] = json!(false); status["reason"] = json!(error.as_deref().unwrap_or("no board read yet")); status["tasks"] = json!([]); }
         }
-        for (k, v) in [("focus", json!(s.focus)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
+        for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
             ("capacity", s.capacity_json()), ("agents", json!(agents.as_ref().map(|a| &a.1))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root)))]
@@ -580,6 +603,14 @@ fn service_run(c: &Ctx) -> Res<()> {
                 eprintln!("restart requested");
             }
             reexec(&s, cfg)?;
+        }
+        // § 4 Data: the pruners run hourly
+        if pruned.is_none_or(|t| t.elapsed().as_secs() >= 3600) {
+            pruned = Some(Instant::now());
+            let live: Vec<u64> = s.kids.iter().map(|k| k.attempt).collect();
+            for l in data::prune(&cfg.root, &cfg.install, &project, &live) {
+                eprintln!("{l}");
+            }
         }
         operator::owner_comments(&cfg.root, &project, &issues, &s.owner_comments);
         operator::step(&cfg.root, &cfg.install, &exe, op_rt.as_deref());
@@ -853,12 +884,8 @@ fn set_focus(root: &Path, f: &str, request: Option<&str>) -> Res<()> {
 /// Pause (§ 4): keep the focus in `focus.paused`, admit nothing.
 fn pause(root: &Path) -> Res<()> {
     let d = dot(root);
-    let f = match fs::read_to_string(d.join("focus")) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e.to_string()),
-    };
-    if !matches!(f.trim(), "" | "off") {
+    let f = data::focus(root)?.join(" ");
+    if !f.is_empty() {
         fs::write(d.join("focus.paused"), f).map_err(|e| e.to_string())?;
     }
     fs::write(d.join("focus"), "off").map_err(|e| e.to_string())?;
@@ -876,6 +903,26 @@ fn resume(root: &Path) -> Res<String> {
     fs::write(d.join("focus"), &f).map_err(|e| e.to_string())?;
     poke(root);
     Ok(f.trim().to_string())
+}
+
+/// `service install` hands over instead of reloading the unit (§ 8 step 5) while this project's fresh `status.json` lists
+/// live children or is unreadable (unknown keeps them, § 4 Data).
+fn handover(root: &Path) -> bool {
+    let p = dot(root).join("status.json");
+    file_age(&p).is_some_and(|a| a <= 60) && data::json(&p).map_or(true, |s| s.is_some_and(|s| s["kids"].as_array().is_some_and(|k| !k.is_empty())))
+}
+
+/// § 8 step 5: live children pass to the new image through the step 3 re-exec; a unit reload would end them. True
+/// when the running service was asked to re-exec instead of the unit being reloaded.
+fn load_unit(u: &platform::Unit, root: &Path) -> Res<bool> {
+    if handover(root) {
+        fs::write(dot(root).join("restart"), "").map_err(|e| e.to_string())?;
+        poke(root);
+        return Ok(true);
+    }
+    platform::run_all(&u.unload, true)?;
+    platform::run_all(&u.load, false)?;
+    Ok(false)
 }
 
 /// Windows: `schtasks /End` ends only the launcher; the service, its children and the tray go with this (§ 8).
@@ -920,12 +967,17 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
 fn service_fields(root: &Path) -> String {
     let d = dot(root);
     let mut out = vec![format!("Project: `{}`", root.display())];
-    match fs::read_to_string(d.join("focus")) {
-        Ok(f) if f.trim().is_empty() => out.push("Focus: off".into()),
-        Ok(f) => out.extend(f.split_whitespace().map(|l| format!("Focus: {l}"))),
-        Err(_) => out.push("Focus: unknown (focus file unavailable)".into()),
+    match data::focus(root) {
+        _ if !d.join("focus").exists() => out.push("Focus: unknown (focus file unavailable)".into()),
+        Ok(f) if f.is_empty() => out.push("Focus: off".into()),
+        Ok(f) => out.extend(f.iter().map(|l| format!("Focus: {l}"))),
+        Err(e) => out.push(format!("Focus: unknown ({e})")),
     }
-    let status = fs::read_to_string(d.join("status.json")).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let status = data::json(&d.join("status.json"));
+    if let Err(e) = &status {
+        out.push(format!("Status: unknown ({e})"));
+    }
+    let status = status.ok().flatten();
     let ttl = load(root).map(|(c, _)| c.ttl.max(0) as u64).unwrap_or(300);
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_secs());
     let fresh = status.as_ref().and_then(|s| {
@@ -998,7 +1050,7 @@ fn service(args: &Args) -> Res<()> {
         "status" => {
             let text = fs::read_to_string(d.join("status.json")).map_err(|_| "no service status: is `taskq service run` running here?".to_string())?;
             println!("{text}");
-            let status: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            let status = data::json(&d.join("status.json"))?.unwrap_or_default();
             println!("Update: {}", status["update"].as_str().unwrap_or("unknown"));
             println!("{}", incident::line(&incident::status(&root)));
             if status["incident_notice"] == true || incident::notice(&root) { println!("Incident reports: notice"); }
@@ -1016,14 +1068,13 @@ fn service(args: &Args) -> Res<()> {
             if sub == "install" {
                 coreq::update::install_self(&platform::tool(&cfg.install))?;
                 platform::write_unit(&u)?;
-                platform::run_all(&u.unload, true)?;
-                platform::run_all(&u.load, false)?;
+                let handover = load_unit(&u, &root)?;
                 let mut all: Vec<String> = fs::read_to_string(&projects).unwrap_or_default().lines().map(String::from).collect();
                 if !all.contains(&root.display().to_string()) {
                     all.push(root.display().to_string());
                     fs::write(&projects, all.join("\n") + "\n").map_err(|e| e.to_string())?;
                 }
-                println!("installed {}", u.path.display());
+                println!("installed {}{}", u.path.display(), if handover { "; live children kept: the running service re-execs" } else { "" });
             } else {
                 uninstall_unit(&u, &root, &projects)?;
                 println!("removed {}", u.path.display());
@@ -1063,6 +1114,14 @@ fn emit(rs: &[Receipt], json: bool) -> Res<()> {
         }
     }
     if rs.iter().all(Receipt::ok) { Ok(()) } else { Err(String::new()) } // already shown: exit 1 quietly
+}
+
+/// An accepted `ask`, `answer` or `requeue` goes to the request log (§ 4), then the receipt is shown.
+fn logged(root: &Path, source: &str, text: &str, r: Receipt, json: bool) -> Res<()> {
+    if r.ok() {
+        retro::record(root, source, r.task, text);
+    }
+    emit(&[r], json)
 }
 
 fn uninstall_unit(u: &platform::Unit, root: &Path, projects: &Path) -> Res<()> {
@@ -1141,6 +1200,12 @@ fn run(argv: &[String]) -> Res<()> {
             Ok(())
         }
         "service" => service(&a),
+        // § 5: the operator over the request log; no board
+        "retro" => {
+            let (cfg, _) = load(&find_root()?)?;
+            print!("{}", retro::run(&cfg.root, cfg.limits.iter().find(|(_, n)| **n > 0).map(|(rt, _)| rt.as_str()))?);
+            Ok(())
+        }
         "tray" => tray(platform::default_install(), a.one("snapshot"), a.one("icon")),
         "" => Err("command missing; use `taskq help`".into()),
         _ => command(&ctx()?, cmd, &a),
@@ -1173,13 +1238,18 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
         }
         "add" => {
             // § 1 task body: Goal, Acceptance, Scope, dependencies; limits checked before any write
-            let title = a.pos.get(1).filter(|t| !t.trim().is_empty()).ok_or("title missing")?;
+            // § 5 `--retro K`: title, goal and acceptance of the last retro report's recommendation K
+            let picked = a.one("retro").map(|k| retro::pick(root, k)).transpose()?;
+            if picked.is_some() && (a.pos.len() > 1 || a.flags.contains_key("goal") || a.flags.contains_key("acceptance")) {
+                return Err("--retro K takes title, goal and acceptance from the report; drop them".into());
+            }
+            let title = match &picked { Some((t, _, _)) => t, None => a.pos.get(1).filter(|t| !t.trim().is_empty()).ok_or("title missing")? };
             if title.contains(['\r', '\n']) || title.chars().count() > 80 {
                 return Err("title: one line, at most 80 characters; shorten it".into());
             }
-            let goal: Vec<String> = a.need("goal")?.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+            let goal: Vec<String> = match &picked { Some((_, g, _)) => g.as_str(), None => a.need("goal")? }.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
             limit("Goal", &goal, 1, 2, 240)?;
-            let (acc, scope) = (a.all("acceptance"), a.all("scope"));
+            let (acc, scope) = (picked.as_ref().map_or_else(|| a.all("acceptance"), |p| p.2.clone()), a.all("scope"));
             one_line("--acceptance", &acc)?;
             one_line("--scope", &scope)?;
             let acc: Vec<String> = acc.iter().enumerate().map(|(i, s)| format!("A{}. {s}", i + 1)).collect();
@@ -1254,14 +1324,18 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
         "ask" => {
             let n = a.num(1)?;
             let body = ask_card(n, a.need("text")?, &a.all("option"), a.one("recommend"), &a.all("link"))?;
-            emit(&[act(b, root, n, "ask", &[], &body, &op)], json)
+            logged(root, "ask", &body, act(b, root, n, "ask", &[], &body, &op), json)
         }
         "answer" if a.pos.get(1).is_some_and(|p| p.contains('.')) => {
-            emit(&answer_picks(b, cfg, &a.pos[1..], &op)?, json)
+            let rs = answer_picks(b, cfg, &a.pos[1..], &op)?;
+            for (r, pick) in rs.iter().zip(&a.pos[1..]) {
+                if r.ok() { retro::record(root, "answer", r.task, pick); }
+            }
+            emit(&rs, json)
         }
         "answer" => {
             let n = a.num(1)?;
-            emit(&[act(b, root, n, "answer", &[], a.need("text")?, &op)], json)
+            logged(root, "answer", a.need("text")?, act(b, root, n, "answer", &[], a.need("text")?, &op), json)
         }
         "result" => {
             let n = a.num(1)?;
@@ -1269,7 +1343,11 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             let body = result_text(n, text, &a.all("checks"), &a.all("option"), a.one("recommend"), &a.all("link"))?;
             emit(&[act(b, root, n, "result", &[sha], &body, &op)], json)
         }
-        "requeue" | "later" => {
+        "requeue" => {
+            let n = a.num(1)?;
+            logged(root, "requeue", text, act(b, root, n, cmd, &[], text, &op), json)
+        }
+        "later" => {
             let n = a.num(1)?;
             emit(&[act(b, root, n, cmd, &[], text, &op)], json)
         }
@@ -1632,6 +1710,74 @@ mod tests {
         assert!(!i.open && !i.labels.iter().any(|l| l.starts_with("q-")));
     }
 
+    // Chain: service install, § 8 step 3 kids file, adoption. Risk: an install from a project with a live child ends it
+    #[cfg(unix)]
+    #[test]
+    fn install_with_a_live_child_keeps_it_through_reexec_and_adoption() {
+        use runtime::Proc;
+        let root = std::env::temp_dir().join(format!("taskq-install-live-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(dot(&root)).unwrap();
+        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        // the unit reload stands for launchctl bootout: it ends the service's process tree, the child included
+        let reloaded = root.join("reloaded");
+        let u = platform::Unit { path: root.join("unit"), text: String::new(), stop: vec![],
+            unload: vec![vec!["kill".into(), "-9".into(), pid.to_string()]],
+            load: vec![vec!["touch".into(), reloaded.display().to_string()]] };
+        fs::write(dot(&root).join("status.json"), format!(r#"{{"kids": [{{"task": 7, "attempt": 41, "rt": "claude", "pid": {pid}}}]}}"#)).unwrap();
+        assert!(load_unit(&u, &root).unwrap(), "live child: hand over");
+        assert!(dot(&root).join("restart").exists() && !reloaded.exists(), "the running service re-execs; no reload");
+        let mut adopted = runtime::Adopted(pid as i32);
+        assert_eq!(adopted.exited(), None, "the child still runs");
+        // the re-exec writes the kids file; the new image adopts the child, not `gone`
+        fs::write(dot(&root).join("kids"), format!("pid {}\n7 41 claude {pid} 40\n", std::process::id())).unwrap();
+        assert_eq!(kids_file(&root), vec![(7, 41, "claude".to_string(), pid as i32, 40)]);
+        assert_eq!(adopted.exited(), None, "adopted live");
+        // an idle service reloads the unit, which would end a child
+        fs::write(dot(&root).join("status.json"), r#"{"kids": []}"#).unwrap();
+        assert!(!load_unit(&u, &root).unwrap() && reloaded.exists());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(adopted.exited().is_some(), "a reload ends it");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Chain: service install and the § 8 step 3 handover. Risk: a reinstall or a corrupt kids file ends live children
+    #[test]
+    fn install_hands_live_children_over_and_corrupt_kids_stay() {
+        let root = std::env::temp_dir().join(format!("taskq-handover-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(dot(&root)).unwrap();
+        assert!(!handover(&root), "no service: reload");
+        let st = dot(&root).join("status.json");
+        fs::write(&st, r#"{"kids": []}"#).unwrap();
+        assert!(!handover(&root), "idle service: reload");
+        fs::write(&st, r#"{"kids": [{"task": 7, "attempt": 41, "rt": "claude", "pid": 1}]}"#).unwrap();
+        assert!(handover(&root), "live children: re-exec");
+        fs::write(&st, "{\"kids\": [").unwrap();
+        assert!(handover(&root), "unknown keeps them");
+        fs::File::options().write(true).open(&st).unwrap().set_modified(SystemTime::now() - Duration::from_secs(120)).unwrap();
+        assert!(!handover(&root), "a stale status.json: no running service");
+        let kids = dot(&root).join("kids");
+        assert!(kids_file(&root).is_empty());
+        fs::write(&kids, "pid 1\n7 41 claude\n").unwrap();
+        assert!(kids_file(&root).is_empty());
+        assert_eq!(fs::read_to_string(&kids).unwrap(), "pid 1\n7 41 claude\n", "a malformed kids file stays");
+        fs::write(&kids, format!("pid {}\n7 41 claude 123 40\n", std::process::id())).unwrap();
+        assert_eq!(kids_file(&root), vec![(7, 41, "claude".to_string(), 123, 40)]);
+        assert!(!kids.exists(), "a valid one is consumed");
+        fs::write(&kids, "pid 1\n7 41 claude 123 40\n").unwrap();
+        assert!(kids_file(&root).is_empty() && !kids.exists(), "another process's file: its attempts go gone");
+        // a corrupt focus pauses nothing away and names its reason
+        fs::write(dot(&root).join("focus"), b"\xff").unwrap();
+        assert!(pause(&root).unwrap_err().contains("not UTF-8"));
+        assert_eq!(fs::read(dot(&root).join("focus")).unwrap(), b"\xff");
+        assert!(service_fields(&root).contains("Focus: unknown (focus: not UTF-8 text; file kept)"));
+        fs::write(&st, "{").unwrap();
+        assert!(service_fields(&root).contains("Status: unknown (status.json: corrupt"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // Chain: § 4 pause and resume focus. Risk: resume widens focus to all.
     #[test]
     fn resume_restores_the_saved_focus_and_never_defaults_to_all() {
@@ -1739,6 +1885,57 @@ mod tests {
         // Parsed compare: a CRLF checkout on Windows must not fail the golden.
         let want: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(snap.json(), want, "TASKQ_BLESS=1 rewrites {}", path.display());
+    }
+
+    // Chain: canonical board read -> approved projection -> duplicate-host coalescing -> freshness.
+    #[test]
+    fn enrollment_projects_only_approved_board_metadata() {
+        use enrollment::{BoardScope, coalesce, project};
+        let mut snap = snapshot::read(&snapshot_board(), &cfg(), &Value::Null, &[]);
+        snap.board["host"] = json!("github.com");
+        snap.board["token"] = json!("forge-secret");
+        snap.board["url"] = json!("https://user:forge-secret@github.com/o/r");
+        let scope = BoardScope::new("github", "GITHUB.COM", "o/r").unwrap();
+        let approved = [scope.clone()];
+        let a = project(&snap, &"a".repeat(64), &approved).unwrap();
+        let b = project(&snap, &"b".repeat(64), &approved).unwrap();
+        let got = serde_json::to_value(&a).unwrap();
+        let want: Value = serde_json::from_str(include_str!("../tests/fixtures/enrollment-projection.json")).unwrap();
+        assert_eq!(got, want);
+        let text = got.to_string();
+        for omitted in ["forge-secret", "session", "labels", "title", "Which way?", "no login", "url", "hosts"] {
+            assert!(!text.contains(omitted), "{omitted}");
+        }
+        assert!(project(&snap, &"a".repeat(64), &[]).is_err());
+        assert_eq!(scope, BoardScope::new("github", "github.com", "O/R").unwrap());
+        for (host, repo) in [("user:secret@github.com", "o/r"), ("github.com", "o/../r"), ("github.com", "o/r?token=x")] {
+            assert!(BoardScope::new("github", host, repo).is_err());
+        }
+        let rows = coalesce(&[a.clone(), b], &approved, 100, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["totals"], got["totals"], "two hosts do not double board totals");
+        assert_eq!(rows[0]["freshness"], "fresh");
+        for (now, freshness) in [(120, "stale"), (98, "unknown")] {
+            let rows = coalesce(&[a.clone()], &approved, now, 10);
+            assert_eq!(rows[0]["freshness"], freshness);
+            assert!(rows[0]["totals"].is_null());
+        }
+        assert_eq!(coalesce(&[], &approved, 100, 10)[0]["freshness"], "missing");
+        snap.reason = Some("forge-secret and private path".into());
+        let incomplete = project(&snap, &"a".repeat(64), &approved).unwrap();
+        let rows = coalesce(&[incomplete.clone()], &approved, 100, 10);
+        assert_eq!(rows[0]["complete"], false);
+        assert_eq!(rows[0]["reason"], "source incomplete");
+        assert!(rows[0]["totals"].is_null());
+        let rows = coalesce(&[a.clone(), incomplete], &approved, 100, 10);
+        assert_eq!(rows[0]["reason"], "conflicting observations");
+        assert!(rows[0]["observation"].is_null());
+        snap.observed = 90;
+        let old = project(&snap, &"a".repeat(64), &approved).unwrap();
+        assert_eq!(coalesce(&[a, old], &approved, 100, 10)[0]["totals"], got["totals"]);
+        let other = BoardScope::new("gitlab", "gitlab.com", "o/r").unwrap();
+        assert!(project(&snap, &"a".repeat(64), &[other.clone()]).is_err());
+        assert_eq!(coalesce(&[], &[scope, other], 100, 10).len(), 2);
     }
 
     // Chain: § 5 CLI text limits. Risk: invalid text is written.

@@ -86,12 +86,16 @@ fn update_result(result: Result<Option<String>, String>) -> Result<Option<String
 pub fn sweep(install: &Path, shim: &Path) {
     let read = |f: &str| fs::read_to_string(install.join(f)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let mut keep: Vec<String> = [read("current"), read("previous"), Some(VERSION.into())].into_iter().flatten().collect();
+    // a corrupt status.json leaves its project's version unknown: every release stays (§ 4 Data)
+    let mut unknown = false;
     for root in fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter(|l| !l.is_empty()) {
-        let st: serde_json::Value = fs::read(Path::new(root).join(".taskq/status.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        keep.extend(st["version"].as_str().map(String::from));
+        match crate::data::json(&Path::new(root).join(".taskq/status.json")) {
+            Ok(st) => keep.extend(st.as_ref().and_then(|s| s["version"].as_str()).map(String::from)),
+            Err(_) => unknown = true,
+        }
     }
     let owned = |n: &str| {
-        ["releases", "current", "previous", "projects", "token", "taskq", "taskq.exe", "taskq-tray.exe", "capacity"].contains(&n)
+        ["releases", "current", "previous", "projects", "token", "installation-id", "taskq", "taskq.exe", "taskq-tray.exe", "capacity"].contains(&n)
             || n.ends_with(".log") || n.ends_with(".tmp") || n.starts_with("tray") || (n.starts_with("TaskQ-") && n.ends_with(".xml"))
     };
     let gone = |p: &Path| {
@@ -104,7 +108,7 @@ pub fn sweep(install: &Path, shim: &Path) {
     }
     for e in fs::read_dir(install.join("releases")).into_iter().flatten().flatten() {
         let n = e.file_name().to_string_lossy().to_string();
-        if !n.ends_with(".tmp") && !keep.contains(&n) {
+        if !unknown && !n.ends_with(".tmp") && !keep.contains(&n) {
             gone(&e.path());
         }
     }
@@ -334,6 +338,12 @@ mod tests {
         assert_eq!(ls(&install.join("releases")), want);
         assert_eq!(ls(&install), ["TaskQ-proj.xml", "capacity", "current", "previous", "proj.log", "projects", "releases", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json"]);
         assert!(!shim.exists() && other.exists(), "only the v3 shim of this install goes");
+        // § 4 Data: a corrupt status.json leaves the project's version unknown, so every release stays and so does the file
+        fs::write(root.join(".taskq/status.json"), "{\"version\": \"4.0").unwrap();
+        fs::create_dir_all(install.join("releases/4.0.1")).unwrap();
+        sweep(&install, &shim);
+        assert!(install.join("releases/4.0.1").exists() && install.join("releases/4.0.5").exists());
+        assert_eq!(fs::read_to_string(root.join(".taskq/status.json")).unwrap(), "{\"version\": \"4.0");
         let _ = fs::remove_dir_all(&t);
     }
 }

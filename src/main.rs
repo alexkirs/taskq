@@ -35,6 +35,7 @@ const USAGE: &str = "taskq agents
  taskq cleanup [--force] | taskq update [--check]
  taskq service install|run|pause|resume|status|restart|stop|uninstall|list
  taskq service focus [all|off|<label..>] [--request TEXT]
+ taskq service capacity [--host H] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
  taskq tray [--snapshot DIR] | taskq selftest
 Text templates and limits: taskq.md sections 1, 2, 5, 7.";
 
@@ -1770,6 +1771,8 @@ mod tests {
         run(&["close".into(), "12".into(), "--help".into()]).unwrap();
         assert!(USAGE.contains("--recommend K"));
         assert!(USAGE.contains("--snapshot DIR"));
+        assert!(USAGE.contains("taskq service capacity [--host H] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]"));
+        run(&["service".into(), "capacity".into(), "--help".into()]).unwrap();
         let e = platform::error_text("#7 is ready", None);
         assert!(e.starts_with("Error: #7 is ready\nNext: "));
         assert_eq!(e.lines().count(), 2);

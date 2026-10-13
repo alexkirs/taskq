@@ -3,6 +3,11 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.1.5
+
+Same-host race: a worker that wrote `ask`, `result` or `requeue` and exits after the owner's answer arrived is a clean
+exit, so its own service resumes the attempt with the answer instead of posting `gone`. No board change.
+
 ## v4.1.4
 
 Lease grace: an attempt younger than `ttl` by its `spawn` or its newest accepted `answer` or `steer` is judged only by

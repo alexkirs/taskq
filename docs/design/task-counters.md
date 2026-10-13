@@ -17,7 +17,7 @@ Approved: aggregate above Projects; all queue states available; Closed visually 
 
 ## Visual
 
-- Compact wrapping capsules with stable order; symbol + number, accessible state name and tooltip. Do not stretch across full width.
+- Compact wrapping capsules with stable order; symbol + number, accessible state name and tooltip. Align every strip to the right edge of its content region, including the aggregate and each wrapped line. Keep the existing compact gaps; do not distribute capsules across empty width.
 - Doing mint, Ask peach, Failed muted red. Review/Ready/Blocked/Later neutral; shape carries identity.
 - Closed last: pale gray background, quiet gray text, no colored fill. Retain readable contrast and a full accessible label; do not fade with opacity.
 - At large type, wrap counters together beneath the project name. Never shrink numbers or squeeze project titles into a narrow column.
@@ -33,3 +33,5 @@ Approved: aggregate above Projects; all queue states available; Closed visually 
 - K-A6: selected capsule opens matching tasks; no accidental project navigation.
 
 - K-A7: pinned/recent/All projects preserve per-project nonzero counters; known all-zero rows show only project identity; each counter opens that project and state, without triggering the project-name action.
+
+- K-A8: aggregate, project and filtered-view strips share right alignment; every wrapped line ends at the strip right edge at 16/20 px and 320/360 px without changing state order.

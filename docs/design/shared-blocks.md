@@ -8,7 +8,7 @@ The [package index](README.md) and [implementation brief](implementation-brief.m
 
 | Child block | Parent authority | Preserved interface |
 |---|---|---|
-| Project summary and counters | [Menu M2/M3](menu.md), [K-A1–K-A7](task-counters.md) | Project identity, provider Board link, compact state capsules, order, filtering, unknown/partial states |
+| Project summary and counters | [Menu M2/M3](menu.md), [K-A1–K-A8](task-counters.md) | Project identity, provider Board link, compact state capsules, order, filtering, unknown/partial states |
 | Task row and answer | Menu M3, [answer card](answer-card.md), [decisions Q1](plans-and-decisions.md) | Flowing linked identity/title, host/runtime marks, separate session links, exact source choices, draft and receipts |
 | Node summary and Work mode | Menu M12, [MP2/MP10](menu-product.md), [shared resources](shared-resource-controls.md) | Target selection, current policy/usage, Mixed, capability-aware fields, review and effective readback |
 | All blocks | [Visual system](visual-style.md), [final review](menu-final-review.md), [rendering](rendering-contract.md) | Tokens, typography, icon assets/meaning, internal spacing/order, focus and accessible targets |
@@ -27,7 +27,7 @@ A compact summary may defer detail to the same full component. Record that route
 
 - Use the parent's provider Board/issue assets. `panels-top-left` retains its detach meaning; an icon chosen for an earlier dashboard mock is not a new TaskQ definition.
 - Reuse K counters: Doing and Review remain distinct, zero capsules disappear, unknown remains explicit, Later and quiet Closed remain available, and counter targets stay separate from project navigation. No independently authored Work/Ask/Failed/Ready strip.
-- Use the canonical palette, subtle capsule fills, type and geometry. Do not copy approximate colors or space counters across empty width. Large type wraps without losing identity or actions.
+- Use the canonical palette, subtle capsule fills, type and geometry. Do not copy approximate colors or space counters across empty width. Aggregate and project counter strips inherit K-A8 right alignment, including wrapped lines. Large type wraps without losing identity or actions.
 - Preserve Work mode's explicit target selection and full review; missing grant or capability has a reason. A summary's used/limit is not a new admission model. Current policies and untouched fields survive opening and cancellation.
 - One answer editor per board/task/revision; Attention and Boards reach that instance. Refresh preserves draft/focus and never substitutes a new question silently.
 

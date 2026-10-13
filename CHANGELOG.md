@@ -3,7 +3,7 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
-## Unreleased
+## v4.1.6
 
 TaskQ faults now produce sanitized, deduplicated public incident reports in `taskqorg/taskq`, through the existing
 github.com account; unsupported auth, offline or uncertain delivery keeps a local JSON report. Setup and update

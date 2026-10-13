@@ -5,7 +5,6 @@ This file specifies **v4**, the Rust binary from `src/`.
 ## Principles (R1–R13)
 ### Change rule
 A task that changes a rule names its R-number, edits this file in the same deliverable as the code and lists the amended R-numbers in its result. A changed rule keeps its number. A new rule gets the next one. A rule elsewhere that disagrees with this file is a defect. No history here: no dates, no decision logs; at most 300 lines.
-
 ### R1. The board's own objects are the only state
 No machine block in issues. State is what a person sees: labels, the issue text, `taskq:` comments (§ 2) and host heartbeat issues (§ 4). The comment log is the truth; labels are its projection. Local files are caches that a restart rebuilds: no local DB, receipt store, queue or lock. Exception: AI request files and the tray's request history (§ 4); they hold no task state.
 
@@ -46,6 +45,7 @@ Display titles at most 60 characters, reasons at most 160 and option text at mos
 ### R7. Style
 Every role and message is short and states unknowns honestly ([caveman](https://gitlab.ufobe.com/gradus-public/caveman/-/tree/62579538f05fb6b69a12449c1ebad9567d1fdecc)).
 Use English, plain verbs, one idea per line; no preamble, repeated context or prose walls. State the user effect first.
+Single and batch CLI outcomes use the same success/error renderer; a failed item keeps its task number.
 Owner-text templates in sections 1, 2, 4, 5, 7 are the design target; release them with their implementation (R8), not as proof of shipped behavior.
 Limits count logical lines and Unicode characters, including labels and numbering; exclude blank separators and the log header.
 Link targets and exact commands/SHAs/paths are exempt from character limits, not line limits; link labels stay short.
@@ -207,7 +207,7 @@ Owner-facing service/tray text follows R7: counts use R6 names/order; task rows 
 | `taskq selftest` | load config, fold `tests/golden` fixtures built into the binary, read the board; no writes |
 
 - Success: `#N <state>` for task writes; close adds one publication link/SHA line. `wait`: `<state> #N` or `tick`.
-- Errors/refusals: `Error: <problem>` then `Next: <action>`; at most 2 lines, at most 160 characters each, never claim success before readback.
+- Errors/refusals: `Error: <problem>` then `Next: <action>`; at most 2 lines, at most 160 characters each, never claim success before readback. A compact error links its complete diagnostic in `.taskq/cli-errors.log`; if saving fails, preserve the diagnostic as raw output (R12).
 - Other command acknowledgements: one line naming action and project/version; at most 160 characters. Batch operations: one outcome per item.
 - `requeue`, `later`, `failed`: `Reason: <blocker>` then optional `Next: <fix>`; at most 2 lines, at most 240 characters each.
 - `answer --text` and `steer`: at most 4 lines, at most 240 characters each; one decision/instruction per line, no invented context.

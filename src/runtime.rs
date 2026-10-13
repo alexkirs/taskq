@@ -453,7 +453,9 @@ mod tests {
         assert!(b.contains("/i/taskq result 7 --sha") && b.contains("`Task: https://b/7`") && b.contains("open one PR") && b.contains("Changed: <user effect>\nOpen:") && b.contains("§ 2 Ask card"));
         l.rt = "codex-app".into();
         l.resume = None;
-        assert!(command(&env, &l).get_program().to_string_lossy().ends_with("codex"));
+        let c = command(&env, &l);
+        assert_eq!(c.get_program(), which("codex"));
+        assert_eq!(args(&c), "exec --json -s workspace-write -C /p -");
         assert!(brief(&env, &l).contains("`env TASKQ_TASK=7 TASKQ_ATTEMPT=42 TASKQ_ROLE=worker TASKQ_ROOT=/p /i/taskq result 7 --sha"));
         let u = uuid();
         assert_eq!((u.len(), &u[14..15]), (36, "4"));

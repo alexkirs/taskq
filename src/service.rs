@@ -77,6 +77,7 @@ pub struct View {
     pub task: Task,
     pub comments: Vec<Comment>,
     pub log: Vec<core::Entry>,
+    pub open_deps: Vec<u64>,
 }
 
 /// Fold every open task (heartbeat issues and untrusted authors excluded).
@@ -126,8 +127,8 @@ pub fn views(board: &dyn Board, cache: &mut HashMap<u64, (i64, Vec<Comment>)>) -
         };
         cache.insert(issue.number, (issue.updated, comments.clone()));
         let log: Vec<_> = comments.iter().filter(|c| c.trusted).map(|c| core::Entry { id: c.id, body: c.body.clone(), edited: c.edited }).collect();
-        let deps_open = core::depends(&issue.body).iter().any(|d| open.contains(d));
-        out.push(View { task: core::fold(issue.number, &log, deps_open), issue, comments, log });
+        let open_deps: Vec<u64> = core::depends(&issue.body).into_iter().filter(|d| open.contains(d)).collect();
+        out.push(View { task: core::fold(issue.number, &log, !open_deps.is_empty()), issue, comments, log, open_deps });
     }
     Ok((out, hosts))
 }
@@ -155,6 +156,7 @@ pub struct Service<'a> {
     pub log: Vec<String>,
     /// Open tasks of the last pass: number, title, state, labels (for `status.json` and the tray).
     pub tasks: Vec<(u64, String, &'static str, Vec<String>)>,
+    pub tasks_read: Option<std::time::Instant>,
     /// State of each open task in the previous pass, for `events`.
     seen: HashMap<u64, State>,
     /// First time covered by `<root>/.taskq/events` (§ 4).
@@ -340,7 +342,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, String> + 'a>) -> Self {
         let cap = Ok(Capacity { limits: cfg.limits.clone(), gate: GATE_DEFAULT });
-        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), pruned: HashSet::new(), start, log: vec![], tasks: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new() }
+        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), pruned: HashSet::new(), start, log: vec![], tasks: vec![], tasks_read: None, seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -402,6 +404,7 @@ impl<'a> Service<'a> {
         let ttl = self.cfg.ttl;
         let (views, hosts) = views(self.board, &mut self.cache)?;
         self.tasks = views.iter().filter(|v| v.task.state != State::Closed).map(|v| (v.issue.number, v.issue.title.clone(), v.task.state.name(), v.issue.labels.clone())).collect();
+        self.tasks_read = Some(std::time::Instant::now());
         let now = self.board.now()?;
         self.events(&views, now)?;
         let by_n: HashMap<u64, &View> = views.iter().map(|v| (v.issue.number, v)).collect();

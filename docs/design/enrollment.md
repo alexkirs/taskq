@@ -12,6 +12,14 @@ The canonical snapshot remains the only board projection; reuse its revisions, t
 
 R1 exception: protected connection identity/grant/revoke state and the latest unsent projection may live locally; they are not task truth, logs or an offline task queue. Board mutations still follow canonical actor/revision/op-ID/receipt rules. This observation grant cannot answer questions or execute commands; dashboard actions require their separate contract.
 
+## Prepared projection (#912)
+
+`src/enrollment.rs` prepares schema 1 observations; no command or service delivery is enabled yet. `installation_id(install)` creates a random 256-bit lowercase hex `installation-id`, publishing a complete file without replacing a concurrent winner. Updates and data pruning keep it; corruption is an error and stays untouched. Only a missing file creates a new identity. It is not a credential or host identifier.
+
+An exact approved `(kind, host, repo)` scope gates projection of an unfiltered canonical snapshot. Identity fields are validated, host names and GitHub repository names lowercased; GitLab repository spelling stays canonical from the snapshot. No snapshot URL or extra identity keys are copied. Allowlisted task fields are number, state, revision, numbered choices and recommendation from the canonical card parser. Choices are explicitly scoped board content. Titles, raw cards/reasons, sessions, labels, paths, host metadata and configuration are omitted. Incomplete observations carry a fixed reason, never raw forge diagnostics.
+
+Coalescing selects one latest observation per approved board, irrespective of installation; totals are never added across hosts. Equal-time conflicting observations become explicitly unknown. Every approved board gets a row, including missing observations. Freshness uses the original board observation time and the caller's maximum age; future/zero times are unknown, old observations are stale, and unknown/stale totals are null. Completeness remains independent of freshness. This is an observation adapter, never a task-state source or offline command queue.
+
 ## Qualification
 
 Prove an independently installed product can enroll, show a real matching snapshot in DashQ, recover after network/store restart, disconnect offline, revoke and reconnect without identity or scope leakage. Test denied/wrong-workspace requests, lost replies, bounded storage, schema compatibility and primary-function independence. Reuse coreq conformance; do not reimplement its auth or transport. Ship only after applicable E1–E10 and the product's normal checks pass.

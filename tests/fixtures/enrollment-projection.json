@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "installation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "board": {
+    "kind": "github",
+    "host": "github.com",
+    "repo": "o/r"
+  },
+  "observed": 99,
+  "complete": true,
+  "reason": null,
+  "totals": {
+    "ask": 1,
+    "doing": 0,
+    "failed": 1,
+    "held": 0,
+    "later": 0,
+    "ready": 1,
+    "review": 0,
+    "waiting": 1
+  },
+  "tasks": [
+    {
+      "n": 1,
+      "state": "ready",
+      "revision": 0,
+      "choices": []
+    },
+    {
+      "n": 2,
+      "state": "ask",
+      "revision": 4,
+      "choices": [
+        {
+          "number": 1,
+          "text": "left",
+          "recommended": false
+        },
+        {
+          "number": 2,
+          "text": "right",
+          "recommended": true
+        }
+      ]
+    },
+    {
+      "n": 4,
+      "state": "waiting",
+      "revision": 0,
+      "choices": []
+    },
+    {
+      "n": 5,
+      "state": "failed",
+      "revision": 8,
+      "choices": []
+    }
+  ]
+}

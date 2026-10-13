@@ -195,15 +195,35 @@ pub fn brief(env: &Env, l: &Launch) -> String {
     format!("{head}{body}Then stop. Everything written through taskq is public: no secrets or paths outside the repository.\n")
 }
 
+/// Keep OS failure classes until the service decides whether a start failure is TaskQ's fault.
+#[derive(Debug)]
+pub struct StartError {
+    message: String,
+    pub reportable: bool,
+}
+
+impl StartError {
+    pub fn io(error: std::io::Error, runtime: Option<&str>) -> Self {
+        use std::io::ErrorKind;
+        let reportable = matches!(error.kind(), ErrorKind::Other | ErrorKind::InvalidData | ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe);
+        let message = runtime.map_or_else(|| error.to_string(), |rt| format!("{rt}: {error}"));
+        Self { message, reportable }
+    }
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.message.fmt(f) }
+}
+
 /// Start the child with its stdout and stderr in the attempt log; `codex-app` starts its handshake child (§ 8).
-pub fn spawn(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, String> {
+pub fn spawn(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     let log = log_path(env.root, l);
     if l.rt == "codex-app" {
         let mut turn = AppTurn { hand: None, log, text: brief(env, l), thread: l.session.clone(), done: 0, rollout: None, running: app_running };
         match &l.resume {
             Some(text) => {
                 turn.text = text.clone();
-                turn.queue()?;
+                turn.queue().map_err(|message| StartError { message, reportable: false })?;
             }
             None => turn.hand = Some(Box::new(start(env, l, &turn.log, HANDSHAKE)?)),
         }
@@ -213,12 +233,12 @@ pub fn spawn(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, String> {
     Ok(Box::new(start(env, l, &log, &text)?))
 }
 
-fn start(env: &Env, l: &Launch, log: &Path, text: &str) -> Result<Child, String> {
-    std::fs::create_dir_all(log.parent().unwrap()).map_err(|e| e.to_string())?;
-    let out = File::options().create(true).append(true).open(log).map_err(|e| e.to_string())?;
-    let err = out.try_clone().map_err(|e| e.to_string())?;
+fn start(env: &Env, l: &Launch, log: &Path, text: &str) -> Result<Child, StartError> {
+    std::fs::create_dir_all(log.parent().unwrap()).map_err(|e| StartError::io(e, None))?;
+    let out = File::options().create(true).append(true).open(log).map_err(|e| StartError::io(e, None))?;
+    let err = out.try_clone().map_err(|e| StartError::io(e, None))?;
     let mut c = command(env, l);
-    let mut child = c.stdin(Stdio::piped()).stdout(out).stderr(err).spawn().map_err(|e| format!("{}: {e}", l.rt))?;
+    let mut child = c.stdin(Stdio::piped()).stdout(out).stderr(err).spawn().map_err(|e| StartError::io(e, Some(&l.rt)))?;
     let mut stdin = child.stdin.take().unwrap();
     let _ = stdin.write_all(text.as_bytes()); // dropped here: EOF ends the prompt
     Ok(child)
@@ -397,6 +417,18 @@ pub fn agent_text(r: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incident_start_preserves_diagnostic_and_excludes_environment_errors() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::NotFound, ErrorKind::PermissionDenied, ErrorKind::OutOfMemory, ErrorKind::WouldBlock,
+            ErrorKind::TimedOut, ErrorKind::StorageFull, ErrorKind::ResourceBusy, ErrorKind::InvalidInput, ErrorKind::Unsupported] {
+            let error = StartError::io(Error::new(kind, "unchanged diagnostic"), Some("claude"));
+            assert!(!error.reportable, "{kind:?}");
+            assert_eq!(error.to_string(), "claude: unchanged diagnostic");
+        }
+        assert!(StartError::io(Error::other("internal launch fault"), None).reportable);
+    }
 
     #[test]
     fn agent_probes_read_version_and_login_or_say_unknown() {

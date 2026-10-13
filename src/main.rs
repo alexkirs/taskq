@@ -2,6 +2,7 @@
 
 mod board;
 mod core;
+mod incident;
 mod labels;
 mod operator;
 mod platform;
@@ -687,8 +688,10 @@ fn service_run(c: &Ctx) -> Res<()> {
     adopt(&mut s, &cfg.root);
     let is_installed = installed(&cfg.install);
     let began = Instant::now();
+    eprintln!("{}", incident::disclosure(Some(&cfg.root)));
     let mut checked: Option<Instant> = None;
     let mut update: Option<String> = None;
+    let mut restart_empty: Option<u64> = None;
     let _ = fs::remove_file(d.join("restart"));
     operator::recover(&cfg.root);
     // ponytail: the operator takes no slot of `limits`; count it when operators crowd out workers
@@ -730,7 +733,8 @@ fn service_run(c: &Ctx) -> Res<()> {
         let mut status = coreq::status::common(&tool, &cfg.me, &project, at, r.err(), update.as_deref());
         for (k, v) in [("focus", json!(s.focus)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)), ("tasks", json!(tasks)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
-            ("capacity", s.capacity_json()), ("agents", json!(agents.as_ref().map(|a| &a.1)))]
+            ("capacity", s.capacity_json()), ("agents", json!(agents.as_ref().map(|a| &a.1))),
+            ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root)))]
         {
             status[k] = v;
         }
@@ -766,6 +770,7 @@ fn service_run(c: &Ctx) -> Res<()> {
                 }
             }
         }
+        restart_watch(&mut restart_empty, cfg!(windows) && d.join("restart").exists() && s.kids.is_empty(), began.elapsed().as_secs(), cfg.update_every);
         if is_installed && d.join("restart").exists() {
             // Windows re-exec waits for the live children; the request stays until it can go
             if cfg!(unix) || s.kids.is_empty() {
@@ -1095,6 +1100,7 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     }
     platform::write_atomic(&dot(&cfg.root).join("kids"), &text)?;
     let e = std::process::Command::new(cfg.install.join(platform::tool(&cfg.install).exe_name())).args(["service", "run"]).exec();
+    incident::detect("dispatch.reexec", concat!("src/main.rs:", line!()), "none", &[], &["reexec:failed"]);
     Err(format!("re-exec: {e}"))
 }
 
@@ -1192,6 +1198,10 @@ fn service(args: &Args) -> Res<()> {
         "status" => {
             let text = fs::read_to_string(d.join("status.json")).map_err(|_| "no service status: is `taskq service run` running here?".to_string())?;
             println!("{text}");
+            let status: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            println!("Update: {}", status["update"].as_str().unwrap_or("unknown"));
+            println!("{}", incident::line(&incident::status(&root)));
+            if status["incident_notice"] == true || incident::notice(&root) { println!("Incident reports: notice"); }
             Ok(())
         }
         "install" | "uninstall" | "stop" => {
@@ -1249,6 +1259,23 @@ fn uninstall_unit(u: &platform::Unit, root: &Path, projects: &Path) -> Res<()> {
     fs::write(projects, all.concat()).map_err(|e| e.to_string())
 }
 
+fn golden_selftest(traces: &str, published: bool) -> Res<usize> {
+    let result = core::golden(traces);
+    if published && result.is_err() {
+        incident::detect("invariant.golden", concat!("src/main.rs:", line!()), "none", &["fold.json"], &["golden:mismatch"]);
+    }
+    result
+}
+
+fn restart_watch(since: &mut Option<u64>, empty_restart: bool, elapsed: u64, interval: u64) {
+    if !empty_restart { *since = None; return; }
+    let start = *since.get_or_insert(elapsed);
+    if elapsed.saturating_sub(start) >= interval.saturating_mul(2) {
+        incident::detect("dispatch.reexec", concat!("src/main.rs:", line!()), "none", &[], &["restart:stuck"]);
+        *since = Some(u64::MAX);
+    }
+}
+
 fn run(argv: &[String]) -> Res<()> {
     let a = Args::parse(argv)?;
     if a.pos.is_empty() || a.pos.first().is_some_and(|s| s == "help") || a.pos.iter().any(|s| s == "-h") || a.flags.contains_key("help") {
@@ -1258,7 +1285,7 @@ fn run(argv: &[String]) -> Res<()> {
     let cmd = a.pos.first().map(String::as_str).unwrap_or("");
     match cmd {
         "selftest" => {
-            let n = core::golden(core::GOLDEN).map_err(|e| format!("fold: FAIL {e}"))?;
+            let n = golden_selftest(core::GOLDEN, !platform::VERSION.contains('-')).map_err(|e| format!("fold: FAIL {e}"))?;
             println!("fold: {n} golden traces PASS");
             println!("{}", formats_selftest()?);
             if std::env::var_os("TASKQ_SELFTEST_OFFLINE").is_some() {
@@ -1278,6 +1305,7 @@ fn run(argv: &[String]) -> Res<()> {
         "update" => {
             let install = platform::default_install();
             let check = a.flags.contains_key("check");
+            println!("{}", incident::disclosure(find_root().ok().as_deref()));
             match platform::update(&install, check)? {
                 Some(v) if check => println!("update available: {} -> {v}", platform::tool(&install).current().unwrap_or_else(|| platform::VERSION.into())),
                 Some(v) => println!("updated to {v}; the service restarts on its next update check"),
@@ -1453,6 +1481,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
 }
 
 fn main() {
+    incident::install_panic_hook();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `<install>/taskq` is the launcher: it runs the current release (coreq.md § Launcher).
     let install = platform::default_install();

@@ -15,9 +15,11 @@ jobs:
       - run: rustup default stable
       - run: cargo test --locked
       - run: node tests/tray-reply.test.cjs
+      - run: node tests/tray-incidents.test.cjs
       - run: cargo run --locked -- selftest
         env:
           TASKQ_SELFTEST_OFFLINE: '1'
+          TASKQ_INCIDENT_REPORTS: 'off'
   tests: # required status check name; gates on the rust matrix
     needs: rust
     runs-on: ubuntu-latest

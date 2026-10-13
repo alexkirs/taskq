@@ -213,8 +213,8 @@ dependencies = [
 
 [[package]]
 name = "coreq"
-version = "0.1.0"
-source = "git+https://github.com/taskqorg/coreq?tag=v0.1.0#d4289cf773f2f5b2dbdd103d140c8f915baff188"
+version = "0.3.0"
+source = "git+https://github.com/taskqorg/coreq?tag=v0.4.0#ee0e2479021023cac6e133ef8d408dfd1c62b336"
 dependencies = [
  "ring",
  "serde_json",
@@ -283,7 +283,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.8",
+ "syn 2.0.119",
 ]
 
 [[package]]

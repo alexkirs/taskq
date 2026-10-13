@@ -1,7 +1,7 @@
 //! The host service (taskq.md § 3, § 4): one loop around `fold`. It owns this host's children and its heartbeat issue;
 //! everything it knows about other hosts comes from the board.
 
-use crate::board::{Board, Comment, Issue, entries};
+use crate::board::{Board, Comment, Issue};
 use crate::core::{self, State, Task};
 use crate::runtime::{Launch, Proc};
 use serde_json::{Value, json};
@@ -150,9 +150,12 @@ pub struct Service<'a> {
     /// The last inbox id handed to each attempt's child.
     delivered: HashMap<u64, u64>,
     cache: HashMap<u64, (i64, Vec<Comment>)>,
+    label_fixes: HashMap<u64, (String, Vec<String>, u8)>,
     /// Worktrees of closed tasks already tried once by `prune`.
     pruned: HashSet<u64>,
-    start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, String> + 'a>,
+    start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>,
+    #[cfg(test)]
+    agent_status: Value,
     pub log: Vec<String>,
     /// Open tasks of the last pass: number, title, state, labels (for `status.json` and the tray).
     pub tasks: Vec<(u64, String, &'static str, Vec<String>)>,
@@ -342,9 +345,9 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 }
 
 impl<'a> Service<'a> {
-    pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, String> + 'a>) -> Self {
+    pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity { limits: cfg.limits.clone(), gate: GATE_DEFAULT });
-        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), pruned: HashSet::new(), start, log: vec![], tasks: vec![], tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new() }
+        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], tasks: vec![], tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -402,6 +405,7 @@ impl<'a> Service<'a> {
 
     /// One pass of § 4. Tasks written to in a step are left alone by later steps until the next pass re-reads them.
     pub fn pass(&mut self) -> Result<(), String> {
+        let previous_fixes = std::mem::take(&mut self.label_fixes);
         let me = self.cfg.me.clone();
         let ttl = self.cfg.ttl;
         let (views, hosts) = views(self.board, &mut self.cache)?;
@@ -435,6 +439,17 @@ impl<'a> Service<'a> {
             }
         }
 
+        // A replaced, once-accepted attempt is ordinary cancellation, not a double claim.
+        for k in &self.kids {
+            if let Some(v) = by_n.get(&k.task) {
+                let history: Vec<_> = v.log.iter().filter(|e| e.id <= k.attempt).cloned().collect();
+                if core::fold(k.task, &history, false).attempt != Some(k.attempt)
+                {
+                    crate::incident::detect("invariant.double_attempt", concat!("src/service.rs:", line!()), &k.rt, &[], &["claim:rejected"]);
+                }
+            }
+        }
+
         // 2. stop children of replaced attempts (R11)
         self.kids.retain_mut(|k| {
             let current = by_n.get(&k.task).is_some_and(|v| v.task.attempt == Some(k.attempt));
@@ -459,6 +474,18 @@ impl<'a> Service<'a> {
         }
 
         // 4. gone for attempts of dead hosts (§ 3)
+        let mut leases: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+        for hb in hosts.iter().filter(|h| now - h.updated <= ttl) {
+            for line in hb.body.lines() {
+                let Some((n, a)) = line.strip_prefix('#').and_then(|l| l.split_once(' ')) else { continue };
+                let (Ok(n), Ok(a)) = (n.parse::<u64>(), a.parse::<u64>()) else { continue };
+                let prior = leases.entry(n).or_default();
+                if prior.iter().any(|(host, attempt)| *host != hb.number && *attempt != a) {
+                    crate::incident::detect("invariant.double_attempt", concat!("src/service.rs:", line!()), "none", &[], &["heartbeat:conflict"]);
+                }
+                prior.push((hb.number, a));
+            }
+        }
         for v in &views {
             let (n, t) = (v.issue.number, &v.task);
             let (Some(a), Some(h)) = (t.attempt, host_of(t)) else { continue };
@@ -482,7 +509,20 @@ impl<'a> Service<'a> {
             if touched.contains(&n) {
                 continue;
             }
+            let want = self.board.state_label(v.task.state.name())?;
+            let mut stale: Vec<_> = v.issue.labels.iter().filter(|l| l.starts_with("q-") && **l != want).cloned().collect();
+            stale.sort();
+            let fix = !stale.is_empty() || !v.issue.labels.contains(&want);
             project(self.board, &v.issue, &v.task)?;
+            if fix && v.task.state != State::Closed {
+                // Adapter success includes assignment readback; one hand-moved label is expected.
+                let count = previous_fixes.get(&n).filter(|(w, old, _)| w == &want && old == &stale)
+                    .map_or(1, |(_, _, count)| count.saturating_add(1));
+                self.label_fixes.insert(n, (want, stale, count));
+                if count >= 3 {
+                    crate::incident::detect("invariant.label_loop", concat!("src/service.rs:", line!()), "none", &[v.task.state.name()], &["passes:3"]);
+                }
+            }
             if v.task.state == State::Closed {
                 touched.insert(n);
             }
@@ -633,7 +673,12 @@ impl<'a> Service<'a> {
         let n = v.issue.number;
         let session = crate::runtime::new_session(rt);
         let id = self.post(n, core::entry("spawn", &[role, &format!("{rt}:{session}"), &self.cfg.me], None, ""))?;
-        let t = core::fold(n, &entries(self.board, n)?, false); // only ready or review tasks are claimed
+        let comments = self.board.comments(n)?;
+        if !comments.iter().any(|c| c.id == id) {
+            crate::incident::detect("adapter.read_after_write", concat!("src/service.rs:", line!()), rt, &[], &["spawn:missing"]);
+        }
+        let log: Vec<_> = comments.into_iter().filter(|c| c.trusted).map(|c| core::Entry { id: c.id, body: c.body, edited: c.edited }).collect();
+        let t = core::fold(n, &log, false); // only ready or review tasks are claimed
         if t.attempt != Some(id) {
             self.log.push(format!("#{n} spawn {id} lost the claim"));
             return Ok(());
@@ -666,6 +711,15 @@ impl<'a> Service<'a> {
                 self.beat()
             }
             Err(e) => {
+                if e.reportable {
+                    #[cfg(not(test))]
+                    let agents = crate::runtime::agents();
+                    #[cfg(test)]
+                    let agents = self.agent_status.clone();
+                    if agents.as_array().is_some_and(|rows| rows.iter().any(|r| r["runtime"] == l.rt && r["path"].is_string() && r["login"] == "logged in")) {
+                        crate::incident::detect("dispatch.start", concat!("src/service.rs:", line!()), &l.rt, &[], &["runtime:installed"]);
+                    }
+                }
                 self.post(l.task, core::entry("gone", &[], Some(l.attempt), &format!("start failed: {e}"))).map(|_| ())
             }
         }
@@ -675,7 +729,7 @@ impl<'a> Service<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::{Board, Fake};
+    use crate::board::{Board, Fake, entries};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -783,6 +837,102 @@ mod tests {
         b.advance(301);
         other.pass().unwrap();
         assert_eq!(task(&b, n).attempt, None, "an accepted inbox entry does not protect a stale host");
+    }
+
+    #[test]
+    fn incident_start_requires_installed_logged_in_runtime_and_non_environment_failure() {
+        use std::io::{Error, ErrorKind};
+        for (path, login, kind, reports) in [(Some("fake"), "logged in", ErrorKind::Other, true),
+            (None, "not installed", ErrorKind::Other, false), (Some("fake"), "not logged in", ErrorKind::Other, false),
+            (Some("fake"), "unknown", ErrorKind::Other, false), (Some("fake"), "logged in", ErrorKind::OutOfMemory, false),
+            (Some("fake"), "logged in", ErrorKind::PermissionDenied, false)] {
+            crate::incident::take_detected();
+            let b = Fake::default();
+            let n = b.create("task", "", &[TASK_LABEL.into()]).unwrap();
+            let c = cfg("local");
+            let mut s = Service::new(&b, &c, "4.0.0", Box::new(move |_| Err(crate::runtime::StartError::io(Error::new(kind, "private failure text"), None))));
+            s.agent_status = json!([{"runtime": "claude", "path": path, "login": login}]);
+            let v = views(&b, &mut HashMap::new()).unwrap().0.remove(0);
+            s.claim(&v, "worker", "claude").unwrap();
+            assert_eq!(task(&b, n).state, State::Ready);
+            assert!(b.comments(n).unwrap().last().unwrap().body.contains("start failed: private failure text"));
+            assert_eq!(crate::incident::take_detected(), if reports { vec!["dispatch.start"] } else { vec![] });
+        }
+    }
+
+    #[test]
+    fn incident_heartbeats_require_fresh_distinct_attempts() {
+        for (other_attempt, age, expected) in [(10, 0, false), (11, 0, true), (11, 301, false)] {
+            crate::incident::take_detected();
+            let b = Fake::default();
+            let old = b.create("taskq host other", &format!("#99 {other_attempt}"), &[HOST_LABEL.into()]).unwrap();
+            b.advance(age);
+            b.create("taskq host first", "#99 10", &[HOST_LABEL.into()]).unwrap();
+            let c = cfg("local");
+            let mut s = service(&b, &c, Rc::new(RefCell::new(vec![])));
+            s.pass().unwrap();
+            assert_eq!(crate::incident::take_detected(), if expected { vec!["invariant.double_attempt"] } else { vec![] }, "heartbeat {old}");
+        }
+    }
+
+    #[test]
+    fn incident_rejected_child_excludes_replaced_accepted_child() {
+        for rejected in [false, true] {
+            crate::incident::take_detected();
+            let b = Fake::default();
+            let n = b.create("task", "", &[TASK_LABEL.into()]).unwrap();
+            let accepted = b.comment(n, "taskq: spawn worker claude:first local").unwrap();
+            let lost = b.comment(n, "taskq: spawn worker claude:second local").unwrap();
+            b.comment(n, "taskq: requeue").unwrap();
+            let c = cfg("local");
+            let mut s = service(&b, &c, Rc::new(RefCell::new(vec![])));
+            s.focus.clear();
+            let flag = Rc::new(RefCell::new(None));
+            s.kids.push(Kid { task: n, attempt: if rejected { lost } else { accepted }, rt: "claude".into(), proc: Box::new(FakeProc(flag.clone())) });
+            s.pass().unwrap();
+            assert_eq!(*flag.borrow(), Some(-9));
+            assert_eq!(crate::incident::take_detected(), if rejected { vec!["invariant.double_attempt"] } else { vec![] });
+        }
+    }
+
+    #[test]
+    fn incident_claim_missing_readback_excludes_normal_contention() {
+        for missing in [false, true] {
+            crate::incident::take_detected();
+            let b = Fake::default();
+            let n = b.create("task", "", &[TASK_LABEL.into()]).unwrap();
+            let v = views(&b, &mut HashMap::new()).unwrap().0.remove(0);
+            if !missing { b.comment(n, "taskq: spawn worker claude:first other").unwrap(); }
+            b.state.borrow_mut().hide_latest_comment = missing;
+            let c = cfg("local");
+            let mut s = service(&b, &c, Rc::new(RefCell::new(vec![])));
+            s.claim(&v, "worker", "claude").unwrap();
+            assert!(s.kids.is_empty());
+            assert_eq!(crate::incident::take_detected(), if missing { vec!["adapter.read_after_write"] } else { vec![] });
+        }
+    }
+
+    #[test]
+    fn incident_label_loop_requires_consecutive_matching_successful_fixes() {
+        crate::incident::take_detected();
+        let b = Fake::default();
+        let n = b.create("task", "", &[TASK_LABEL.into(), "q-doing".into()]).unwrap();
+        let c = cfg("local");
+        let mut s = service(&b, &c, Rc::new(RefCell::new(vec![])));
+        s.focus.clear();
+        for pass in 1..=3 {
+            b.labels(n, &["q-doing".into()], &["q-ready".into()]).unwrap();
+            s.pass().unwrap();
+            assert!(b.issue(n).unwrap().labels.contains(&"q-ready".into()));
+            assert_eq!(crate::incident::take_detected(), if pass == 3 { vec!["invariant.label_loop"] } else { vec![] });
+        }
+        s.pass().unwrap(); // no fix breaks the streak
+        b.labels(n, &["q-doing".into()], &["q-ready".into()]).unwrap();
+        s.pass().unwrap();
+        assert!(crate::incident::take_detected().is_empty());
+        b.labels(n, &["q-ask".into()], &["q-ready".into()]).unwrap();
+        s.pass().unwrap(); // different fix also breaks the streak
+        assert!(crate::incident::take_detected().is_empty());
     }
 
     #[test]

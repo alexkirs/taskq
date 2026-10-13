@@ -464,7 +464,7 @@ impl<'a> Service<'a> {
             if h == me || !matches!(t.state, State::Doing | State::Review) || touched.contains(&n) {
                 continue;
             }
-            let young = v.comments.iter().find(|c| c.id == a).is_some_and(|c| now - c.created <= ttl);
+            let young = v.comments.iter().filter(|c| c.id == a || t.inbox.contains(&c.id)).any(|c| now - c.created <= ttl);
             let dead = match hosts.iter().find(|i| i.title == format!("taskq host {h}")) {
                 None => !young,
                 Some(hb) => now - hb.updated > ttl || (!young && !hb.body.lines().any(|l| l == format!("#{n} {a}"))),
@@ -725,6 +725,63 @@ mod tests {
 
     fn task(b: &Fake, n: u64) -> Task {
         core::fold(n, &entries(b, n).unwrap(), false)
+    }
+
+    #[test]
+    fn cross_host_grace_uses_only_accepted_inbox_entries() {
+        for (entry, trusted, edited, grace) in [
+            ("taskq: answer 1", true, false, true),
+            ("taskq: steer\ncontinue", true, false, true),
+            ("taskq: steer attempt 999999\ncontinue", true, false, false),
+            ("taskq: steer\ncontinue", false, false, false),
+            ("taskq: steer\ncontinue", true, true, false),
+            ("unrelated comment", true, false, false),
+        ] {
+            let b = Fake::default();
+            let n = b.create("T", "", &["taskq".into()]).unwrap();
+            let a = b.comment(n, &core::entry("spawn", &["worker", "claude:session", "win"], None, "")).unwrap();
+            if entry.starts_with("taskq: answer") {
+                b.comment(n, &core::entry("ask", &[], Some(a), "Which?\n1. yes\n2. no")).unwrap();
+            }
+            b.advance(400);
+            b.raw(n, entry, trusted, edited);
+            let hb = b.create("taskq host win", "version 4.0.0", &[HOST_LABEL.into()]).unwrap();
+            let c = cfg("mac");
+            let mut s = service(&b, &c, Default::default());
+            s.focus.clear();
+            s.pass().unwrap();
+            assert_eq!(task(&b, n).attempt, grace.then_some(a), "{entry}, trusted={trusted}, edited={edited}");
+            if grace {
+                b.advance(301);
+                b.edit(hb, "version 4.0.0\nat fresh").unwrap();
+                s.pass().unwrap();
+                assert_eq!(task(&b, n).attempt, None, "inbox grace expires despite a fresh unlisted heartbeat");
+            }
+        }
+    }
+
+    #[test]
+    fn answered_attempt_survives_other_host_until_owner_resumes() {
+        let b = Fake::default();
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
+        let (win, mac) = (cfg("win"), cfg("mac"));
+        let exits: Exits = Default::default();
+        let mut owner = service(&b, &win, exits.clone());
+        let mut other = service(&b, &mac, Default::default());
+        owner.pass().unwrap();
+        let a = task(&b, n).attempt.unwrap();
+        b.comment(n, &core::entry("ask", &[], Some(a), "Which?\n1. yes\n2. no")).unwrap();
+        *exits.borrow()[0].1.borrow_mut() = Some(0);
+        b.advance(400);
+        owner.pass().unwrap();
+        b.comment(n, &core::entry("answer", &["1"], None, "yes")).unwrap();
+        other.pass().unwrap();
+        assert_eq!(task(&b, n).attempt, Some(a));
+        owner.pass().unwrap();
+        assert_eq!((task(&b, n).attempt, exits.borrow().len()), (Some(a), 2));
+        b.advance(301);
+        other.pass().unwrap();
+        assert_eq!(task(&b, n).attempt, None, "an accepted inbox entry does not protect a stale host");
     }
 
     #[test]

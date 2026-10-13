@@ -6,7 +6,7 @@ This file specifies **v4**, the Rust binary from `src/`.
 ### Change rule
 A task that changes a rule names its R-number, edits this file in the same deliverable as the code and lists the amended R-numbers in its result. A changed rule keeps its number. A new rule gets the next one. A rule elsewhere that disagrees with this file is a defect. No history here: no dates, no decision logs; at most 300 lines.
 ### R1. The board's own objects are the only state
-No machine block in issues. State is what a person sees: labels, the issue text, `taskq:` comments (§ 2) and host heartbeat issues (§ 4). The comment log is the truth; labels are its projection. Local files are caches that a restart rebuilds: no local DB, receipt store, queue or lock. Exception: AI request files, the tray's request history and local incident reports (§ 4); they hold no task state.
+No machine block in issues. State is what a person sees: labels, the issue text, `taskq:` comments (§ 2) and host heartbeat issues (§ 4). The comment log is the truth; labels are its projection. Local files are caches that a restart rebuilds: no local DB, receipt store, queue or lock. Exception: accepted [DashQ connection state](docs/design/enrollment.md) (identity/grant/revoke and coalesced projection, never task truth); AI request files, the tray's request history and local incident reports (§ 4); they hold no task state.
 
 ### R2. One task, one attempt
 A task has at most one live attempt: one worker or one reviewer process. Work bigger than one reviewable diff is several tasks linked by `Depends on #N`. A live attempt is never moved to another host or session; a new attempt replaces it (§ 4).

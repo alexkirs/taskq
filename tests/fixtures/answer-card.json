@@ -54,8 +54,8 @@
           "sent": 0,
           "has": [
             "#841</a> Keep the old API?",
-            "1. Keep compatibility <span class=\"qac-star\" role=\"img\" aria-label=\"Recommended\">★</span>",
-            "2. Remove the old API",
+            "1.</span> <span>Keep compatibility <span class=\"qac-star\" role=\"img\" aria-label=\"Recommended\">★</span>",
+            "2.</span> <span>Remove the old API",
             ">#12</a>",
             "compared both clients"
           ],
@@ -298,7 +298,7 @@
           "status": "actionable",
           "has": [
             "two weeks. Dropping it now",
-            "3. Ask each host owner first"
+            "3.</span> <span>Ask each host owner first"
           ]
         }
       ]
@@ -418,8 +418,8 @@
           "has": [
             "data-choice=\"1\" disabled",
             "this choice closes or publishes the task",
-            "1. close: ship",
-            "2. redo"
+            "1.</span> <span>close: ship",
+            "2.</span> <span>redo"
           ]
         },
         {
@@ -1054,6 +1054,114 @@
           "status": "sending",
           "sent": 2,
           "new_op": true
+        }
+      ]
+    },
+    {
+      "name": "lost response after the accepted answer removes its card",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": true
+      },
+      "rows": [
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 4,
+          "card": "Done: compared both clients\nProblem: Should the new admin API keep compatibility with existing clients?\nEvidence: [#12](https://github.com/o/r/pull/12)\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: compared both clients\nProblem: Should the new admin API keep compatibility with existing clients?\nEvidence: [#12](https://github.com/o/r/pull/12)\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+            "done": "compared both clients",
+            "problem": "Should the new admin API keep compatibility with existing clients?",
+            "evidence": [
+              {
+                "label": "#12",
+                "url": "https://github.com/o/r/pull/12"
+              }
+            ],
+            "choices": [
+              {
+                "id": 1,
+                "text": "Keep compatibility",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "Remove the old API",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        },
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "doing",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 5,
+          "card": null,
+          "question": null
+        }
+      ],
+      "events": [
+        {
+          "type": "input",
+          "text": "keep my answer"
+        },
+        {
+          "type": "submit"
+        },
+        {
+          "type": "refresh",
+          "row": 1
+        },
+        {
+          "type": "check",
+          "status": "sending",
+          "draft": "keep my answer",
+          "sent": 1
+        },
+        {
+          "type": "receipt",
+          "state": "unknown",
+          "reason": "lost response"
+        },
+        {
+          "type": "check",
+          "status": "unknown",
+          "draft": "keep my answer",
+          "sent": 1,
+          "has": [
+            "Check delivery"
+          ]
+        },
+        {
+          "type": "retry"
+        },
+        {
+          "type": "check",
+          "status": "sending",
+          "sent": 2,
+          "same_op": true
+        },
+        {
+          "type": "receipt",
+          "state": "accepted"
+        },
+        {
+          "type": "check",
+          "status": "accepted",
+          "draft": "",
+          "sent": 2
         }
       ]
     }

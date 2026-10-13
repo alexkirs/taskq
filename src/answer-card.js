@@ -81,27 +81,31 @@
     const id = 'qac-' + String(board).replace(/[^\w-]/g, '_') + '-' + row.n, live = st === 'actionable' || st === 'rejected';
     let h = '<section class="qac" data-qac-state="' + st + '" aria-labelledby="' + id + '-t">';
     h += '<p class="qac-head" id="' + id + '-t"><span class="qac-mark" aria-hidden="true">?</span> <a href="' + href(row.url) + '" target="_blank" rel="noopener">#' + esc(row.n) + '</a> ' + esc(row.title) + '</p>';
-    if (!q.parsed) return h + '<pre class="qac-text">' + esc(q.text) + '</pre>' + receipt(st, st === 'read-only' ? 'This card has no answer form here' : local.receipt && local.receipt.reason, row.url, id) + '</section>';
-    if (q.done) h += '<p class="qac-done"><span class="qac-muted">Done:</span> ' + esc(q.done) + '</p>';
+    if (!q.parsed) return h + '<pre class="qac-text">' + esc(q.text) + '</pre>' + receipt(st, st === 'read-only' ? 'This card has no answer form here' : local.receipt && local.receipt.reason, row.url, id) +
+      (st === 'unknown' ? '<button type="button" data-qac="retry">Check delivery</button>' : '') + '</section>';
     h += '<p class="qac-problem">' + esc(q.problem) + '</p>';
-    if (q.evidence.length) h += '<p class="qac-evidence">' + q.evidence.map(e => '<a href="' + href(e.url) + '" target="_blank" rel="noopener">' + esc(e.label) + '</a>').join(' · ') + '</p>';
     h += '<div class="qac-choices" role="group" aria-label="Choices">';
     for (const c of q.choices) {
       const off = !live || c.consequential, why = c.consequential ? 'Answer on the board: this choice closes or publishes the task' : '';
-      h += '<button type="button" data-qac="choose" data-choice="' + c.id + '"' + (off ? ' disabled' : '') + (why ? ' aria-describedby="' + id + '-c' + c.id + '"' : '') + '>' + c.id + '. ' + esc(c.text) +
-        (c.recommended ? ' <span class="qac-star" role="img" aria-label="Recommended">★</span>' : '') + '</button>';
+      h += '<button type="button" data-qac="choose" data-choice="' + c.id + '"' + (off ? ' disabled' : '') + (why ? ' aria-describedby="' + id + '-c' + c.id + '"' : '') + '><span class="qac-number">' + c.id + '.</span> <span>' + esc(c.text) +
+        (c.recommended ? ' <span class="qac-star" role="img" aria-label="Recommended">★</span>' : '') + '</span></button>';
       if (why) h += '<span class="qac-why" id="' + id + '-c' + c.id + '">' + esc(why) + ' <a href="' + href(row.url) + '" target="_blank" rel="noopener">board ↗</a></span>';
     }
     h += '</div>';
     if (st !== 'read-only') {
       const bad = textProblem(q, local.draft);
-      h += '<form class="qac-text-form" data-qac="submit"><textarea id="' + id + '-d" data-qac="input" rows="2" aria-label="Your answer" placeholder="Or type an answer"' + (live ? '' : ' readonly') + '>' + esc(local.draft) + '</textarea>' +
-        '<button type="submit"' + (live && !bad ? '' : ' disabled') + '>Send</button></form>';
+      // Q1: Other answer opens a compact field; a kept draft keeps it open
+      h += '<details class="qac-other"' + (local.draft ? ' open' : '') + '><summary>Other answer</summary><form class="qac-text-form" data-qac="submit"><textarea id="' + id + '-d" data-qac="input" rows="2" aria-label="Your answer" placeholder="Or type an answer"' + (live ? '' : ' readonly') + '>' + esc(local.draft) + '</textarea>' +
+        '<button type="submit"' + (live && !bad ? '' : ' disabled') + '>Send</button></form></details>';
     }
     const reason = st === 'read-only' ? (cap && cap.reason) || 'Answering is not available here' : local.receipt && local.receipt.reason;
     h += receipt(st, reason, row.url, id, local.receipt && local.receipt.next);
     if (st === 'stale') h += '<button type="button" data-qac="review">I read the new question</button>';
     if (st === 'unknown') h += '<button type="button" data-qac="retry">Check delivery</button>';
+    // Q1: Done and evidence stay behind Details
+    if (q.done || q.evidence.length) h += '<details class="qac-context"><summary>Checked &amp; context</summary>' +
+      (q.done ? '<p class="qac-done"><span class="qac-muted">Done:</span> ' + esc(q.done) + '</p>' : '') +
+      (q.evidence.length ? '<p class="qac-evidence">' + q.evidence.map(e => '<a href="' + href(e.url) + '" target="_blank" rel="noopener">' + esc(e.label) + '</a>').join(' · ') + '</p>' : '') + '</details>';
     return h + '</section>';
   }
 
@@ -129,8 +133,9 @@
     }
     function paint() {
       const a = document.activeElement, focus = a && el.contains(a) ? {k: a.closest('[data-qac-key]')?.dataset.qacKey, sel: a.dataset.qac === 'input' ? 'textarea' : a.dataset.choice ? '[data-choice="' + a.dataset.choice + '"]' : '[data-qac="' + a.dataset.qac + '"]', s: a.selectionStart, e: a.selectionEnd} : null;
-      const scroll = el.scrollTop;
+      const scroll = el.scrollTop, open = new Set([...el.querySelectorAll('details[open]')].map(d => d.closest('[data-qac-key]')?.dataset.qacKey + ' ' + d.className));
       el.innerHTML = [...cards].map(([k, c]) => '<div data-qac-key="' + esc(k) + '">' + render(c.board, c.row, locals.get(k), adapter.capability(c.board, c.row)) + '</div>').join('');
+      for (const d of el.querySelectorAll('details')) if (open.has(d.closest('[data-qac-key]').dataset.qacKey + ' ' + d.className)) d.open = true;
       el.scrollTop = scroll;
       const t = focus && focus.k && el.querySelector('[data-qac-key="' + CSS.escape(focus.k) + '"] ' + focus.sel);
       if (t) { t.focus(); if (focus.s != null && t.setSelectionRange) t.setSelectionRange(focus.s, focus.e); }

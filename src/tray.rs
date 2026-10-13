@@ -36,6 +36,7 @@ enum Ev {
     Shot2,
     /// Add project: the picked folder classified, or Null (cancel)
     Added(Value),
+    Answer(Value),
 }
 
 /// View, text size, period and Custom icon of `<install>/tray.json`; anything else falls back to the default. A
@@ -210,6 +211,82 @@ fn roots(install: &Path) -> Vec<String> {
     fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(String::from).collect()
 }
 
+/// Only owner answers cross this bridge; the CLI owns credentials, dispatch and board readback.
+fn answer_args(install: &Path, m: &Value) -> Result<Vec<String>, String> {
+    let root = m["root"].as_str().ok_or("project missing")?;
+    if !roots(install).iter().any(|r| r == root) { return Err("project is not registered".into()); }
+    if m["board"].as_str().is_none_or(str::is_empty) { return Err("board identity missing".into()); }
+    let op = &m["op"];
+    let id = op["id"].as_str().filter(|id| !id.is_empty() && !id.contains(char::is_whitespace)).ok_or("operation id must be one word")?;
+    let n = op["task"].as_u64().filter(|n| *n > 0).ok_or("task number missing")?;
+    let revision = op["revision"].as_u64().ok_or("question revision missing")?;
+    let mut args = vec!["answer".into()];
+    match (op.get("choice"), op.get("text")) {
+        (Some(choice), None) => {
+            let k = choice.as_u64().filter(|k| *k > 0).ok_or("invalid choice")?;
+            args.push(format!("{n}.{k}"));
+        }
+        (None, Some(text)) => {
+            let text = text.as_str().ok_or("invalid answer text")?;
+            crate::task_text("answer", text)?;
+            args.extend([n.to_string(), "--text".into(), text.into()]);
+        }
+        _ => return Err("supply one choice or literal text".into()),
+    }
+    args.extend(["--json".into(), "--op-id".into(), id.into(), "--revision".into(), revision.to_string()]);
+    Ok(args)
+}
+
+fn owner_command(root: &Path) -> Result<std::process::Command, String> {
+    let mut c = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    c.current_dir(root).env("TASKQ_ROOT", root).env_remove("TASKQ_TASK").env_remove("TASKQ_ATTEMPT").env_remove("TASKQ_ROLE");
+    Ok(c)
+}
+
+fn answer_snapshot(s: &Value, m: &Value) -> Result<(), String> {
+    if s["complete"] != true { return Err(s["reason"].as_str().unwrap_or("board read incomplete").into()); }
+    if s["board"]["url"] != m["board"] { return Err("board identity changed; refresh the project".into()); }
+    let op = &m["op"];
+    let row = s["tasks"].as_array().into_iter().flatten().find(|r| r["n"] == op["task"]).ok_or("task is not in the current board snapshot; open it on the board")?;
+    if !row["revision"].is_u64() { return Err("question revision unavailable".into()); }
+    // An old revision still reaches dispatch so uncertain delivery can reconcile its op id.
+    if row["revision"] == op["revision"] {
+        if row["question"]["parsed"] != true { return Err("question is read-only; open it on the board".into()); }
+        if let Some(choice) = op.get("choice") {
+            let c = row["question"]["choices"].as_array().into_iter().flatten().find(|c| c["id"] == *choice).ok_or("choice not found")?;
+            if c["consequential"] == true { return Err("close/publication requires review on the board".into()); }
+        }
+    }
+    Ok(())
+}
+
+fn answer(install: &Path, m: &Value) -> Value {
+    let response = |state: &str, reason: &str, next: &str| json!({"answerReceipt": {"root": m["root"], "id": m["op"]["id"], "state": state, "reason": reason, "next": next}});
+    let prepare = || -> Result<_, String> {
+        let args = answer_args(install, m)?;
+        let root = Path::new(m["root"].as_str().unwrap());
+        let out = crate::platform::quiet(owner_command(root)?.args(["status", "--json"])).output().map_err(|e| e.to_string())?;
+        let snapshot = serde_json::from_slice(&out.stdout).map_err(|_| String::from_utf8_lossy(&out.stderr).into_owned())?;
+        answer_snapshot(&snapshot, m)?;
+        let mut command = owner_command(root)?;
+        command.args(args);
+        Ok(command)
+    };
+    let mut command = match prepare() {
+        Ok(c) => c,
+        Err(e) => return response("rejected", &e, "Refresh the question or open it on the board."),
+    };
+    match crate::platform::quiet(&mut command).output() {
+        Ok(out) => match serde_json::from_slice::<Value>(&out.stdout) {
+            Ok(r) if r["task"] == m["op"]["task"] && r["op_id"] == m["op"]["id"]
+                && matches!(r["outcome"].as_str(), Some("accepted" | "stale" | "rejected" | "unknown")) =>
+                response(r["outcome"].as_str().unwrap(), r["reason"].as_str().unwrap_or(""), r["next"].as_str().unwrap_or("")),
+            _ => response("unknown", &String::from_utf8_lossy(&out.stderr), "Read the task on the board; retry the same operation id."),
+        },
+        Err(e) => response("unknown", &e.to_string(), "Read the task on the board; retry the same operation id."),
+    }
+}
+
 /// One project for the page: its `status.json`, saved focus, labels and `events` lines `[time, kind, attempt]`.
 fn project(root: &str) -> Value {
     let r = Path::new(root);
@@ -232,7 +309,7 @@ fn project(root: &str) -> Value {
         Ok((c, v)) => (json!(c.me), crate::service::capacity(&v, &c.me).map(|x| x.json()).unwrap_or_else(|e| json!({"error": e}))),
         Err(e) => (Value::Null, json!({"error": e})),
     };
-    let tasks: Vec<Value> = s["tasks"].as_array().into_iter().flatten().map(|t| json!({"n": t["n"].as_u64().unwrap_or(0), "title": t["title"].as_str().unwrap_or(""), "state": t["state"].as_str().unwrap_or("")})).collect();
+    let tasks = s["tasks"].as_array().cloned().unwrap_or_default();
     json!({"root": root, "name": s["project"].as_str().map(String::from).unwrap_or_else(|| crate::project_name(r)),
         "issues": s["issues"].as_str().unwrap_or(""), "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
         "complete": crate::snapshot::complete(&s) && age.is_some_and(|a| a < 300),
@@ -338,7 +415,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 let p = proxy.clone();
                 let built = b.build(target).map_err(|e| e.to_string()).and_then(|w| {
                     // only our page: a link goes to the browser through the bridge
-                    WebViewBuilder::new().with_html(HTML).with_navigation_handler(|u| !u.starts_with("http"))
+                    WebViewBuilder::new().with_html(HTML.replace("{{ANSWER_CARD_CSS}}", include_str!("answer-card.css")).replace("{{ANSWER_CARD_JS}}", include_str!("answer-card.js"))).with_navigation_handler(|u| !u.starts_with("http"))
                         .with_ipc_handler(move |r| {
                             let _ = p.send_event(Ev::Ipc(r.into_body()));
                         })
@@ -440,10 +517,15 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 w.set_visible(true);
                 w.set_focus();
             }
+            Event::UserEvent(Ev::Answer(receipt)) => push(&ui, &receipt),
             Event::UserEvent(Ev::Ipc(m)) => {
                 let Ok(m) = serde_json::from_str::<Value>(&m) else { return };
                 let Some((w, _)) = &ui else { return };
                 match m["a"].as_str().unwrap_or("") {
+                    "answer" if snapshot.is_none() => {
+                        let (p, install) = (proxy.clone(), install.clone());
+                        std::thread::spawn(move || { let _ = p.send_event(Ev::Answer(answer(&install, &m))); });
+                    }
                     "ready" => {
                         if snapshot.is_some() {
                             let _ = proxy.send_event(Ev::Shot);
@@ -1079,6 +1161,57 @@ fn capture(wv: &WebView, path: PathBuf, done: impl Fn() + 'static) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: owner tray answer -> canonical CLI. Risk: IPC selects another project or inherits worker fencing.
+    #[test]
+    fn answer_bridge_restricts_targets_and_preserves_literal_owner_input() {
+        let install = std::env::temp_dir().join(format!("taskq-tray-answer-{}", std::process::id()));
+        let root = install.join("project");
+        fs::create_dir_all(crate::dot(&root)).unwrap();
+        fs::write(install.join("projects"), root.to_str().unwrap()).unwrap();
+        let mut m = json!({"root": root, "board": "https://github.com/o/r/issues", "op": {"id": "tray.1", "task": 7, "revision": 20, "text": "2; literal $(text)"}});
+        let args = answer_args(&install, &m).unwrap();
+        assert_eq!(args, ["answer", "7", "--text", "2; literal $(text)", "--json", "--op-id", "tray.1", "--revision", "20"]);
+        let command = owner_command(&root).unwrap();
+        for key in ["TASKQ_TASK", "TASKQ_ATTEMPT", "TASKQ_ROLE"] {
+            assert!(command.get_envs().any(|(k, v)| k == key && v.is_none()), "{key}");
+        }
+        m["op"]["choice"] = json!(2);
+        assert!(answer_args(&install, &m).is_err(), "choice and text are exclusive");
+        m["op"].as_object_mut().unwrap().remove("text");
+        assert_eq!(answer_args(&install, &m).unwrap()[1], "7.2");
+        m["root"] = json!(install.join("unregistered"));
+        assert!(answer_args(&install, &m).unwrap_err().contains("not registered"));
+        m["root"] = json!(root);
+        m["op"]["revision"] = Value::Null;
+        assert!(answer_args(&install, &m).is_err());
+        fs::remove_dir_all(install).unwrap();
+    }
+
+    // Chain: live board snapshot -> tray answer. Risk: forged IPC bypasses read-only/close controls.
+    #[test]
+    fn answer_bridge_checks_board_and_canonical_question() {
+        let card = "Done: checked\nProblem: decide\n1. close: ship ★\n2. redo";
+        let row = json!({"n": 7, "revision": 20, "card": card, "question": crate::snapshot::question(card)});
+        let mut s = json!({"complete": true, "board": {"url": "https://github.com/o/r/issues"}, "tasks": [row]});
+        let mut m = json!({"board": "https://github.com/o/r/issues", "op": {"id": "tray.1", "task": 7, "revision": 20, "choice": 1}});
+        assert!(answer_snapshot(&s, &m).unwrap_err().contains("close/publication"));
+        m["op"]["choice"] = json!(2);
+        assert!(answer_snapshot(&s, &m).is_ok());
+        s["tasks"][0]["question"]["parsed"] = json!(false);
+        assert!(answer_snapshot(&s, &m).unwrap_err().contains("read-only"));
+        s["tasks"][0]["revision"] = json!(21);
+        assert!(answer_snapshot(&s, &m).is_ok(), "dispatch owns stale and idempotent retry receipts");
+        let rows = s["tasks"].take();
+        s["tasks"] = json!([]);
+        assert!(answer_snapshot(&s, &m).is_err(), "an omitted row never bypasses the consequential-choice guard");
+        s["tasks"] = rows;
+        s["board"]["url"] = json!("https://github.com/o/other/issues");
+        assert!(answer_snapshot(&s, &m).unwrap_err().contains("identity"));
+        s["complete"] = json!(false);
+        s["reason"] = json!("permission denied");
+        assert_eq!(answer_snapshot(&s, &m).unwrap_err(), "permission denied");
+    }
 
     // Chain: § 4 tray opens an incident report. Risk: tray opens a file outside .taskq/incidents.
     #[test]

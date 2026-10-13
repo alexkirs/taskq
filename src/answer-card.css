@@ -1,17 +1,21 @@
-/* TaskQ shared answer card (docs/design/answer-card.md); tokens follow src/tray.html. Size inherits the host font (16-20 px). */
-.qac{--qac-fg:light-dark(#252930,#eceff2);--qac-muted:light-dark(#626b77,#b4bdc8);--qac-edge:light-dark(#d9dde2,#444951);--qac-work:light-dark(#237862,#77cdb3);--qac-ask:light-dark(#a35c29,#edb993);--qac-failed:light-dark(#ae384c,#ef8996);color:var(--qac-fg);line-height:1.4;min-width:0;overflow-wrap:anywhere;padding:.4em 0}
+/* TaskQ shared answer card (docs/design/answer-card.md); tokens are the visual-style.md palette, layout the plans-and-decisions.html qcard. Size inherits the host font (16-20 px). */
+.qac{--qac-fg:light-dark(#243039,#eef2f5);--qac-muted:light-dark(#59636e,#b9c3cd);--qac-edge:light-dark(#dce0e5,#46505b);--qac-hover:light-dark(#e9edf1,#37424c);--qac-work:light-dark(#246f59,#8dd2b8);--qac-ask:light-dark(#955525,#edbc96);--qac-failed:light-dark(#a6324b,#ee96a5);color:var(--qac-fg);line-height:1.4;min-width:0;overflow-wrap:anywhere;border-top:1px solid var(--qac-edge);padding:7px 2px}
 .qac *{box-sizing:border-box}
-.qac p{margin:.25em 0}
+.qac p{margin:4px 0}
 .qac a{color:inherit}
 .qac-mark{color:var(--qac-ask)}
 .qac-muted,.qac-why{color:var(--qac-muted)}
 .qac-text{white-space:pre-wrap;font:inherit;margin:.25em 0}
-.qac-choices{display:flex;flex-direction:column;align-items:stretch;gap:.3em;margin:.4em 0}
-.qac button{font:inherit;color:inherit;background:none;border:1px solid var(--qac-edge);border-radius:4px;padding:.3em .6em;min-height:2.2em;text-align:left;cursor:pointer}
+.qac-choices{display:flex;align-items:stretch;gap:4px;flex-wrap:wrap;margin:6px 0}
+.qac-number{font-variant-numeric:tabular-nums;flex:none}
+.qac details{margin:5px 0}
+.qac summary{min-height:30px;cursor:pointer}
+.qac button{font:inherit;color:inherit;background:none;border:0;border-radius:5px;padding:4px 6px;min-height:32px;text-align:left;cursor:pointer}
+.qac-choices button{display:flex;align-items:baseline;gap:6px;background:var(--qac-hover);white-space:normal}
 .qac button:disabled{opacity:.55;cursor:default}
 .qac button:focus-visible,.qac textarea:focus-visible,.qac a:focus-visible{outline:2px solid var(--qac-ask);outline-offset:1px}
 .qac-star{color:var(--qac-ask)}
-.qac-why{font-size:.875em;padding-left:.6em}
+.qac-why{font-size:.875em;padding-left:.6em;flex-basis:100%}
 .qac-text-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.4em;align-items:start}
 .qac textarea{font:inherit;color:inherit;background:none;border:1px solid var(--qac-edge);border-radius:4px;padding:.3em;resize:vertical;min-width:0;width:100%}
 .qac-receipt:empty{display:none}

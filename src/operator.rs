@@ -51,6 +51,55 @@ pub fn projects(install: &Path) -> Vec<(String, PathBuf)> {
     }).collect()
 }
 
+/// Owner comments (§ 4): one request per new comment id; `requests/comments` lists every id ever made a request, so a
+/// confirmed, refused or pruned request is never made again. `ponytail:` the list only grows, a line per comment.
+pub fn owner_comments(root: &Path, project: &str, issues: &str, found: &[(u64, u64, String, String)]) {
+    let list = dir(root).join("comments");
+    let done = fs::read_to_string(&list).unwrap_or_default();
+    let mut id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    for (n, c, text, card) in found {
+        if done.lines().any(|l| l == c.to_string()) {
+            continue;
+        }
+        // above every existing id: the newest request is the one the tray shows
+        id = id.max(ids(root).last().and_then(|x| x.parse::<u128>().ok()).unwrap_or(0) + 1);
+        let req = json!({"text": text, "task": n, "comment": c, "project": project, "card": card, "url": format!("{issues}/{n}")});
+        let path = dir(root).join(format!("{id}.json"));
+        if fs::create_dir_all(dir(root)).is_err() || crate::platform::write_atomic(&path, &req.to_string()).is_err() {
+            continue;
+        }
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(&list);
+        if !f.as_mut().is_ok_and(|f| std::io::Write::write_all(f, format!("{c}\n").as_bytes()).is_ok()) {
+            let _ = fs::remove_file(&path); // unrecorded: made again next pass rather than twice
+        }
+        id += 1;
+    }
+}
+
+/// A request on an owner comment proposes one `answer`, `later` or `requeue` of its own task (§ 4).
+fn scoped(v: Value, req: &Value) -> Value {
+    if v["state"] != "proposal" || req["task"].is_null() {
+        return v;
+    }
+    match v["ops"].as_array().map(Vec::as_slice) {
+        Some([o]) if ["answer", "later", "requeue"].contains(&o["op"].as_str().unwrap_or("")) && o["task"] == req["task"] && o["project"] == req["project"] => v,
+        _ => json!({"state": "failed", "reason": format!("refused proposal: only one answer, later or requeue of #{}", req["task"])}),
+    }
+}
+
+/// The owner comment request a request answers: itself or the start of its clarify chain; else null.
+fn comment_of(root: &Path, req: &Value) -> Value {
+    let mut r = req.clone();
+    for _ in 0..KEEP {
+        if r["task"].is_u64() {
+            return r;
+        }
+        let Some(a) = r["after"].as_str().filter(|a| a.bytes().all(|b| b.is_ascii_digit())).map(String::from) else { break };
+        r = read(&dir(root).join(format!("{a}.json")));
+    }
+    Value::Null
+}
+
 /// After a restart no thread waits for a `running` operator: say so (§ 4).
 pub fn recover(root: &Path) {
     for id in ids(root) {
@@ -99,7 +148,10 @@ fn start(root: &Path, install: &Path, id: &str, rt: Option<&str>) {
     let (root, install, id) = (root.to_path_buf(), install.to_path_buf(), id.to_string());
     std::thread::spawn(move || {
         let v = match run(&root, &install, &id, &rt) {
-            Ok(text) => parse(&text, &projects(&install), onboard(&root, &read(&dir(&root).join(format!("{id}.json")))).as_deref()),
+            Ok(text) => {
+                let req = read(&dir(&root).join(format!("{id}.json")));
+                scoped(parse(&text, &projects(&install), onboard(&root, &req).as_deref()), &comment_of(&root, &req))
+            }
             Err(e) => json!({"state": "failed", "reason": e}),
         };
         answer(&root, &id, v);
@@ -169,6 +221,14 @@ fn brief(root: &Path, install: &Path, req: &Value) -> String {
         r = read(&dir(root).join(format!("{a}.json")));
         before = format!("Earlier request: {}\nYour answer then: {}\n{before}", r["text"], read(&answer_path(root, &a))["text"]);
     }
+    // an owner comment, also through its clarify chain: the task and its open card; the reply stays on that task
+    let c = comment_of(root, req);
+    let scope = match c["task"].as_u64() {
+        Some(n) => format!("The owner commented on task #{n} of project {} while it waits for an answer to this card:\n{}\n\
+            A proposal holds exactly one op on #{n}: answer (option or text), later or requeue; close only by answering an option that starts with close. Unclear: clarify. Nothing to change: result.\n",
+            c["project"].as_str().unwrap_or(""), c["card"].as_str().unwrap_or("")),
+        None => String::new(),
+    };
     if let Some(f) = onboard(root, req) {
         return format!(
             "You are the taskq operator (taskq.md R3) in a project setup (taskq.md § 6): help the owner set up the folder below as a taskq project. You have no tools: use only this data.\n\
@@ -196,7 +256,7 @@ fn brief(root: &Path, install: &Path, req: &Value) -> String {
          {{\"op\":\"answer\",\"project\":P,\"task\":N,\"option\":K}} or with \"text\" instead of \"option\" (only a task in state ask),\n\
          {{\"op\":\"later\",\"project\":P,\"task\":N,\"text\":R}}, {{\"op\":\"requeue\",\"project\":P,\"task\":N,\"text\":R}}.\n\
          Use English, short plain lines (taskq.md R7). Name tasks as #N with their project.\n\
-         Projects: {}\n{before}Request: {}\n",
+         Projects: {}\n{before}{scope}Request: {}\n",
         serde_json::to_string_pretty(&ps).unwrap_or_default(),
         req["text"].as_str().unwrap_or("")
     )
@@ -568,6 +628,34 @@ mod tests {
         let (applied, lines) = apply_setup(&root, Path::new("/nonexistent"), &root, &[json!({"op": "setup", "repo": "o/n"})], &Value::Null);
         assert!(!applied && lines.len() == 1 && !root.join(".git").exists(), "{lines:?}");
         assert_eq!(fs::read_to_string(root.join("taskq.json")).unwrap(), "{}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_owner_comment_is_one_request_and_proposes_only_on_its_task() {
+        let root = temp("comments");
+        let found = vec![(7, 101, "use z instead".to_string(), "1. x\n2. y ★".to_string())];
+        owner_comments(&root, "p", "https://h/o/r/issues", &found);
+        let first = ids(&root);
+        assert_eq!(first.len(), 1);
+        let req = read(&dir(&root).join(format!("{}.json", first[0])));
+        assert_eq!((req["task"].as_u64(), req["comment"].as_u64(), req["url"].as_str()), (Some(7), Some(101), Some("https://h/o/r/issues/7")));
+        // confirmed, refused or pruned: the same comment is never a request again
+        answer(&root, &first[0], json!({"state": "refuse", "text": "no"}));
+        fs::remove_file(dir(&root).join(format!("{}.json", first[0]))).unwrap();
+        owner_comments(&root, "p", "https://h/o/r/issues", &found);
+        assert!(ids(&root).is_empty());
+        let reply = format!(r#"{{"text": "y", "after": "{}"}}"#, first[0]);
+        fs::write(dir(&root).join(format!("{}.json", first[0])), req.to_string()).unwrap();
+        let p = |ops: Value| json!({"state": "proposal", "text": "t", "ops": ops});
+        let c = comment_of(&root, &serde_json::from_str(&reply).unwrap());
+        assert_eq!(c["task"], 7, "a clarify reply keeps the comment's task");
+        assert_eq!(scoped(p(json!([{"op": "answer", "project": "p", "task": 7, "text": "use z"}])), &c)["state"], "proposal");
+        for bad in [json!([{"op": "answer", "project": "p", "task": 8, "option": 1}]), json!([{"op": "pause", "project": "p"}]),
+            json!([{"op": "later", "project": "q", "task": 7, "text": "x"}]), json!([{"op": "later", "project": "p", "task": 7, "text": "x"}, {"op": "pause", "project": "p"}])] {
+            assert_eq!(scoped(p(bad.clone()), &c)["state"], "failed", "{bad}");
+        }
+        assert_eq!(scoped(p(json!([{"op": "pause", "project": "p"}])), &Value::Null)["state"], "proposal", "a tray request keeps every op");
         let _ = fs::remove_dir_all(&root);
     }
 

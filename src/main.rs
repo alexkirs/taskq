@@ -774,6 +774,7 @@ fn service_run(c: &Ctx) -> Res<()> {
             }
             reexec(&s, cfg)?;
         }
+        operator::owner_comments(&cfg.root, &project, &issues, &s.owner_comments);
         operator::step(&cfg.root, &cfg.install, &exe, op_rt.as_deref());
         if is_installed {
             keep_tray(&cfg.install, &mut tray);

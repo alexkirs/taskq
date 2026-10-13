@@ -126,6 +126,22 @@ itself is first exercised by the update after 4.1.1.
 `update` null (`src/main.rs`, service loop), so `status.json` never reports a newer version there and the button
 never shows. A bare `1` folds as `answer 1` only on 4.1.1 hosts; no task was in `ask` with a fresh bare reply.
 
+## Release 4.1.3
+
+`v4.1.3` tags ce03891 (main as is, the first build on coreq, #836) after `tests` passed on it; the release workflow
+published the macOS, Windows and Linux binaries, `SHA256SUMS` and `latest.json` 4.1.3 at 07:13 UTC on 2026-10-13.
+macOS: the first `<root>/.taskq/update` check raced the publish (`up to date`), the second logged
+`updated to 4.1.3; restarting` and re-executed with live children #836 and #837; heartbeat #722 read `version 4.1.3`
+at 07:14, `previous` 4.1.2, and `releases/4.1.3/healthy` appeared after `rollback_after`. The tray of 4.1.2 exited and
+the service started `releases/4.1.3/taskq tray` 30 s later (fresh `<install>/tray`). Windows updated on its own
+`update_every` check without a restart: heartbeat #745 read `version 4.1.3` at 07:27, `status.json` 4.1.3 with no
+error, and the service started `taskq-tray.exe` (4.1.3) about 70 s later with a fresh heartbeat.
+
+Rollback (coreq.md § Launcher) on macOS with the released 4.1.3 binary as launcher in a temporary `TASKQ_INSTALL`:
+`current` 4.1.3 whose release exits 1, `previous` 4.1.2. Starts 1 and 2 ran 4.1.3 (`starts` 1, 2); start 3 printed
+`taskq: 4.1.3 failed to become healthy 3 times; back to 4.1.2`, wrote `current` 4.1.2 and ran it; start 4 ran 4.1.2.
+The real install was not rolled back; Windows rollback was not tested.
+
 ## Remaining acceptance
 
 Beyond the phase 2 snapshots: native placement, renderer opening/closing, actions against a live service,

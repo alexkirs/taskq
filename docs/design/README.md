@@ -9,7 +9,7 @@ Feature selection: [TaskQ product principles](../product-principles.md). Preserv
 
 ## Start here: implementation handoff
 
-Give the next agent this directory and [implementation brief](implementation-brief.md). Read the root contract first, then plan system and application work using the [ordered backlog](refactoring-backlog.md). No chat transcript or temporary visualization folder is required.
+Give the next agent this directory and [implementation brief](implementation-brief.md). Read the root contract first, then plan system and application work using the [ordered backlog](refactoring-backlog.md); the current batch order, development loop and owner decisions are in the [implementation plan](implementation-plan.md). No chat transcript or temporary visualization folder is required.
 
 The current visual reference is [workspace-preview.html](workspace-preview.html); its editable/generated-source relationship is defined in the brief. Keep the entire directory, including `assets/`, `shots/`, `evidence/`, JSON fixtures/configuration and component sources. Historical alternatives are labeled below and are not competing final designs.
 

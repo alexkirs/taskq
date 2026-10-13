@@ -2,7 +2,7 @@ name: README shots
 on:
   workflow_dispatch:
   push:
-    branches: [main, taskq-924]
+    branches: [main]
     paths:
       - src/tray.rs
       - src/tray.html
@@ -41,7 +41,7 @@ jobs:
           path: ${{ runner.temp }}/shots.log
           if-no-files-found: warn
       - name: Commit and verify refreshed shots
-        if: github.event_name == 'push'
+        if: github.ref == 'refs/heads/main'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,7 +54,6 @@ jobs:
           docs/shots/check.sh
           sha=$(git rev-parse HEAD)
           branch="taskq-shots-$GITHUB_RUN_ID"
-          if [ "$GITHUB_REF_NAME" = taskq-924 ]; then branch=taskq-924; fi
           git push origin "HEAD:refs/heads/$branch"
           # Token pushes do not start CI; dispatch the existing full suite on this exact bot commit.
           gh workflow run tests.yml --ref "$branch"
@@ -66,7 +65,5 @@ jobs:
           test -n "$run"
           gh run watch "$run" --exit-status
           # A concurrent main update makes this ordinary fast-forward push fail; never force it.
-          if [ "$GITHUB_REF_NAME" = main ]; then
-            git push origin HEAD:refs/heads/main
-            git push origin --delete "$branch"
-          fi
+          git push origin HEAD:refs/heads/main
+          git push origin --delete "$branch"

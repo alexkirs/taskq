@@ -36,3 +36,5 @@ Name affected R/section rules; identify current implementation and callers; amen
 Actual five-repository build graph and owned lifecycle commands; supported client/runtime matrix; native font/size calibration and load measurements. Transport, reservation ownership, durable receipts and compatibility are engineering decisions to resolve with evidence. Escalate only a newly discovered product trade-off.
 
 Remote PM qualification for streams 1–3, 5 and 9: [RM1–RM7](remote-manager.md). Reconcile the installed generation before bootstrap; qualify project switching, real owner replies, independent observation, restart recovery and media using RM-A1–A9. [FRA audit](remote-manager-audit.md) records the inspected baseline.
+
+Setup/root resolution for streams 1/6/9/11: [installation and project locations](setup-and-project-locations.md). Deliver the agent-free installer entry, shared setup, host preference, exact per-role launch/resume directories and bounded discovery; qualify S-A1–S-A8.

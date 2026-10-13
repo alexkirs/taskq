@@ -629,6 +629,7 @@ fn service_run(c: &Ctx) -> Res<()> {
             s.mono = began.elapsed().as_secs();
             let wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
             if s.gate.enabled() {
+                s.gate.host_mem = platform::host_memory();
                 s.gate.observe(s.mono, wall as i64, platform::cpu_ticks(), platform::memory_available());
             }
             s.wall = wall as i64;

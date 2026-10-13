@@ -203,13 +203,16 @@ pub struct GateCfg {
     pub enabled: bool,
     pub cpu_max: u32,
     pub memory_min: u32,
-    /// Auto: CPU is the 60 s mean; the latest 30 s interval at 100 % still vetoes (D03).
+    /// Auto: CPU is the 60 s mean; the latest 30 s interval at 100 % still vetoes; memory also holds below
+    /// [`FLOOR_GIB`] available or at macOS pressure level [`PRESSURE_CRITICAL`] (D03).
     pub mean: bool,
 }
 
 pub const GATE_DEFAULT: GateCfg = GateCfg { enabled: false, cpu_max: 85, memory_min: 15, mean: false };
 /// Auto admission defaults from the D03 calibration (docs/design/admission-calibration.md).
 pub const GATE_AUTO: GateCfg = GateCfg { enabled: true, cpu_max: 90, memory_min: 10, mean: true };
+pub const FLOOR_GIB: f64 = 2.5;
+pub const PRESSURE_CRITICAL: u32 = 4;
 pub const RUNTIMES: [&str; 3] = ["claude", "codex", "codex-app"];
 
 /// Effective capacity of one host (§ 3, § 9).
@@ -294,6 +297,8 @@ pub struct Gate {
     prev: Option<(u64, u64)>,
     /// Latest sample: monotonic time, wall time, CPU busy %, available memory %.
     pub last: Option<(u64, i64, Option<f64>, Option<f64>)>,
+    /// Auto: available GiB and pressure level read with the latest sample; `None` is a failed reading.
+    pub host_mem: Option<(f64, u32)>,
     /// Consecutive calm samples toward reopening.
     good: u32,
     open: bool,
@@ -332,8 +337,9 @@ impl Gate {
         self.last = Some((now, wall, cpu, memory));
         self.sampled = true;
         let (max, min) = (c.cpu_max as f64, c.memory_min as f64);
+        let floor = !c.mean || self.host_mem.is_some_and(|(g, l)| g >= FLOOR_GIB && l < PRESSURE_CRITICAL);
         match (cpu, memory) {
-            (Some(p), Some(m)) if !late && p < max && m > min => {
+            (Some(p), Some(m)) if !late && floor && p < max && m > min => {
                 if p <= max - 10.0 && m >= min + 5.0 {
                     self.good += 1;
                     self.open |= self.good >= 3;
@@ -361,6 +367,12 @@ impl Gate {
                 match mem {
                     None => r.push(("sample", "no memory reading".into())),
                     Some(m) if m <= c.memory_min as f64 => r.push(("memory", format!("available memory {m:.0} % <= {} %", c.memory_min))),
+                    _ => {}
+                }
+                match self.host_mem.filter(|_| c.mean) {
+                    None if c.mean => r.push(("sample", "no memory floor reading".into())),
+                    Some((g, _)) if g < FLOOR_GIB => r.push(("memory", format!("available memory {g:.1} GiB < {FLOOR_GIB} GiB"))),
+                    Some((_, l)) if l >= PRESSURE_CRITICAL => r.push(("memory", format!("memory pressure level {l} (critical)"))),
                     _ => {}
                 }
             }
@@ -1301,6 +1313,7 @@ mod tests {
         for (cpu, mem) in samples {
             *ticks = (ticks.0 + *cpu as u64, ticks.1 + 100);
             *t += 30;
+            g.host_mem = Some((8.0, 1));
             g.observe(*t, *t as i64, Some(*ticks), Some(*mem));
         }
     }
@@ -1350,6 +1363,17 @@ mod tests {
         assert_eq!(g3.last.unwrap().2, Some(82.5));
         feed(&mut g3, &mut t3, &mut k3, &[(100.0, 50.0)]);
         assert_eq!(g3.state(t3).1[0].0, "cpu");
+        // Auto memory floor: max(memory_min %, 2.5 GiB) and macOS pressure level 4 hold; no reading is unknown
+        feed(&mut g3, &mut t3, &mut k3, &[(10.0, 50.0); 3]);
+        assert_eq!(g3.state(t3).0, "open");
+        for (m, code) in [(Some((2.4, 1)), "memory"), (Some((8.0, PRESSURE_CRITICAL)), "memory"), (None, "sample")] {
+            g3.host_mem = m;
+            g3.observe(t3, t3 as i64, Some(k3), Some(50.0));
+            assert_eq!(g3.state(t3).1.last().unwrap().0, code, "{m:?}");
+            assert!(!g3.may_launch(t3));
+        }
+        g2.host_mem = None;
+        assert_eq!(g2.state(t2).0, "held", "Fixed ignores the floor reading");
     }
 
     // Chain: § 3 load gate spacing. Risk: launch burst or bad counters accepted.

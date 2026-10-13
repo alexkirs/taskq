@@ -3,6 +3,13 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.1.4
+
+Lease grace: an attempt younger than `ttl` by its `spawn` or its newest accepted `answer` or `steer` is judged only by
+its host's heartbeat age, so the other host no longer posts `gone` for an answered attempt before its own host resumes
+it. Both hosts need 4.1.4 for the fix to hold. An owner free-text comment on a task in `ask` becomes an AI request
+whose proposal the owner confirms in the tray. No board change.
+
 ## v4.1.3
 
 Update, launcher, service units, `status.json` common keys and the board token come from the shared crate

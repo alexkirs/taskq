@@ -22,7 +22,7 @@ png = "0.18"
 # `taskq tray --snapshot` (§ 4): the webview's own capture API
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSImage", "NSImageRep", "NSBitmapImageRep"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSApplication", "NSResponder", "NSWindow", "NSView", "NSControl", "NSButton"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSDictionary", "NSError"] }
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "WKWebView", "WKSnapshotConfiguration"] }
 

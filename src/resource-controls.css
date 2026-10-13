@@ -1,0 +1,21 @@
+/* TaskQ shared resource controls (docs/design/shared-resource-controls.md); tokens are the visual-style.md palette shared with answer-card.css, rows the tray Capacity group. Size inherits the host font (16-20 px). */
+.rsc{--rsc-fg:light-dark(#243039,#eef2f5);--rsc-muted:light-dark(#59636e,#b9c3cd);--rsc-edge:light-dark(#dce0e5,#46505b);--rsc-hover:light-dark(#e9edf1,#37424c);--rsc-work:light-dark(#246f59,#8dd2b8);--rsc-ask:light-dark(#955525,#edbc96);--rsc-failed:light-dark(#a6324b,#ee96a5);color:var(--rsc-fg);line-height:1.4;min-width:0;overflow-wrap:anywhere;padding:2px 4px}
+.rsc *{box-sizing:border-box}
+.rsc p{margin:3px 0}
+.rsc-row{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
+.rsc-row>span:last-child{text-align:right;margin-left:auto}
+.rsc-count{font-variant-numeric:tabular-nums}
+.rsc-muted,.rsc-why{color:var(--rsc-muted)}
+.rsc-over .rsc-count,.rsc-alert,.rsc-rejected{color:var(--rsc-failed)}
+.rsc-sending,.rsc-saved,.rsc-unknown{color:var(--rsc-ask)}
+.rsc-applied{color:var(--rsc-work)}
+.rsc-form{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 6px;align-items:center;margin:4px 0}
+.rsc-why{grid-column:1/-1;font-size:.875em}
+.rsc input[type=number]{font:inherit;font-size:.9em;min-width:0;width:100%;color:inherit;background:none;border:1px solid var(--rsc-edge);border-radius:4px;padding:3px}
+.rsc input[type=checkbox]{justify-self:start;width:1.1em;height:1.1em}
+.rsc-review{border-top:1px solid var(--rsc-edge);padding-top:4px}
+.rsc-actions{display:flex;flex-wrap:wrap;gap:4px;margin:4px 0}
+.rsc button{font:inherit;color:inherit;background:var(--rsc-hover);border:0;border-radius:5px;padding:4px 8px;min-height:32px;text-align:left;cursor:pointer}
+.rsc button:disabled,.rsc input:disabled{opacity:.55;cursor:default}
+.rsc button:focus-visible,.rsc input:focus-visible{outline:2px solid var(--rsc-ask);outline-offset:1px}
+@media(pointer:coarse){.rsc button{min-height:44px}}

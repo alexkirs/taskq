@@ -1,0 +1,2907 @@
+{
+ "schema": "taskq.resource-controls-fixtures/1",
+ "cases": [
+  {
+   "name": "legacy guard keeps explicit zero apart from absent",
+   "groups": [
+    {
+     "key": "mac/taskq",
+     "observed_at": 990,
+     "labels": {
+      "host": "mac",
+      "project": "taskq"
+     },
+     "targets": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": null,
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [],
+       "current_revision": "host-r1",
+       "effective_revision": "host-r1",
+       "current_policy": {
+        "sources": {}
+       },
+       "effective_policy": {
+        "sources": {}
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "load_gate"
+         ],
+         "scopes": [
+          "project"
+         ]
+        }
+       ],
+       "current_revision": "project-r1",
+       "effective_revision": "project-r1",
+       "current_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "effective_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "runtime_usage": [
+        {
+         "runtime_id": "claude",
+         "used": 0,
+         "limit": 0,
+         "limit_kind": "disabled"
+        },
+        {
+         "runtime_id": "codex",
+         "used": 0,
+         "limit": null,
+         "limit_kind": "disabled"
+        }
+       ],
+       "sample": {
+        "source": "taskq-admission-macos",
+        "sampled_at": 990,
+        "age_seconds": 5,
+        "cadence_seconds": 30,
+        "window_seconds": 30,
+        "cpu_busy_percent": 12.0,
+        "memory_available_percent": 40.0,
+        "memory_available_gib": null,
+        "pressure": null
+       },
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "claude"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-claude-r1",
+       "effective_revision": "rt-claude-r1",
+       "current_policy": {
+        "runtime_limit": 0,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": 0,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-codex-r1",
+       "effective_revision": "rt-codex-r1",
+       "current_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      }
+     ]
+    }
+   ],
+   "capability": {
+    "edit": true
+   },
+   "events": [
+    {
+     "type": "check",
+     "status": "view",
+     "headline": "Legacy guard · Fixed limits · Load gate: Ready",
+     "has": [
+      "0/0 · off",
+      "0/none · off",
+      "Edit limits"
+     ],
+     "not": [
+      "Auto"
+     ]
+    },
+    {
+     "type": "open"
+    },
+    {
+     "type": "input",
+     "key": "rt:claude",
+     "value": ""
+    },
+    {
+     "type": "review"
+    },
+    {
+     "type": "check",
+     "status": "editing",
+     "has": [
+      "Claude: Fixed limits need a number; 0 admits none"
+     ],
+     "sent": 0
+    }
+   ],
+   "now": 1000
+  },
+  {
+   "name": "auto without a count cap locks the load gate on",
+   "groups": [
+    {
+     "key": "mac/taskq",
+     "observed_at": 990,
+     "labels": {
+      "host": "mac",
+      "project": "taskq"
+     },
+     "targets": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": null,
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.admission/1",
+         "modes": [
+          "auto",
+          "fixed"
+         ],
+         "fields": [],
+         "scopes": [
+          "host"
+         ]
+        }
+       ],
+       "current_revision": "host-r1",
+       "effective_revision": "host-r1",
+       "current_policy": {
+        "mode": "auto",
+        "maximum": null,
+        "sources": {
+         "mode": "host",
+         "maximum": "host"
+        }
+       },
+       "effective_policy": {
+        "mode": "auto",
+        "maximum": null,
+        "sources": {
+         "mode": "host",
+         "maximum": "host"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "load_gate"
+         ],
+         "scopes": [
+          "project"
+         ]
+        }
+       ],
+       "current_revision": "project-r1",
+       "effective_revision": "project-r1",
+       "current_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "effective_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "runtime_usage": [
+        {
+         "runtime_id": "claude",
+         "used": 1,
+         "limit": 2,
+         "limit_kind": "ceiling"
+        },
+        {
+         "runtime_id": "codex",
+         "used": 3,
+         "limit": null,
+         "limit_kind": "unbounded"
+        }
+       ],
+       "sample": {
+        "source": "taskq-admission-macos",
+        "sampled_at": 990,
+        "age_seconds": 5,
+        "cadence_seconds": 30,
+        "window_seconds": 60,
+        "cpu_busy_percent": 12.0,
+        "memory_available_percent": 40.0,
+        "memory_available_gib": null,
+        "pressure": null
+       },
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "claude"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-claude-r1",
+       "effective_revision": "rt-claude-r1",
+       "current_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-codex-r1",
+       "effective_revision": "rt-codex-r1",
+       "current_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      }
+     ]
+    }
+   ],
+   "capability": {
+    "edit": true
+   },
+   "events": [
+    {
+     "type": "check",
+     "status": "view",
+     "headline": "Auto · no host maximum · Load gate: Ready",
+     "has": [
+      "1/2",
+      "3/no cap"
+     ],
+     "not": [
+      "over limit"
+     ]
+    },
+    {
+     "type": "open"
+    },
+    {
+     "type": "check",
+     "status": "editing",
+     "has": [
+      "Auto keeps the load gate on",
+      "disabled"
+     ]
+    },
+    {
+     "type": "input",
+     "key": "gate.enabled",
+     "value": false
+    },
+    {
+     "type": "review"
+    },
+    {
+     "type": "check",
+     "status": "editing",
+     "has": [
+      "role=\"alert\">Auto keeps the load gate on"
+     ],
+     "sent": 0
+    }
+   ],
+   "now": 1000
+  },
+  {
+   "name": "over-capacity running work stays visible and continues",
+   "groups": [
+    {
+     "key": "mac/taskq",
+     "observed_at": 990,
+     "labels": {
+      "host": "mac",
+      "project": "taskq"
+     },
+     "targets": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": null,
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [],
+       "current_revision": "host-r1",
+       "effective_revision": "host-r1",
+       "current_policy": {
+        "sources": {}
+       },
+       "effective_policy": {
+        "sources": {}
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "load_gate"
+         ],
+         "scopes": [
+          "project"
+         ]
+        }
+       ],
+       "current_revision": "project-r1",
+       "effective_revision": "project-r1",
+       "current_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "effective_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "runtime_usage": [
+        {
+         "runtime_id": "claude",
+         "used": 3,
+         "limit": 1,
+         "limit_kind": "ceiling"
+        },
+        {
+         "runtime_id": "codex",
+         "used": 1,
+         "limit": 2,
+         "limit_kind": "ceiling"
+        }
+       ],
+       "sample": {
+        "source": "taskq-admission-macos",
+        "sampled_at": 990,
+        "age_seconds": 5,
+        "cadence_seconds": 30,
+        "window_seconds": 30,
+        "cpu_busy_percent": 12.0,
+        "memory_available_percent": 40.0,
+        "memory_available_gib": null,
+        "pressure": null
+       },
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "claude"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-claude-r1",
+       "effective_revision": "rt-claude-r1",
+       "current_policy": {
+        "runtime_limit": 1,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": 1,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-codex-r1",
+       "effective_revision": "rt-codex-r1",
+       "current_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      }
+     ]
+    }
+   ],
+   "capability": {
+    "edit": true
+   },
+   "events": [
+    {
+     "type": "check",
+     "status": "view",
+     "has": [
+      "3/1 · over limit",
+      "rsc-over",
+      "running tasks continue",
+      "1/2"
+     ]
+    }
+   ],
+   "now": 1000
+  },
+  {
+   "name": "stale sample and several blockers stay unknown",
+   "groups": [
+    {
+     "key": "mac/taskq",
+     "observed_at": 990,
+     "labels": {
+      "host": "mac",
+      "project": "taskq"
+     },
+     "targets": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": null,
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [],
+       "current_revision": "host-r1",
+       "effective_revision": "host-r1",
+       "current_policy": {
+        "sources": {}
+       },
+       "effective_policy": {
+        "sources": {}
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "load_gate"
+         ],
+         "scopes": [
+          "project"
+         ]
+        }
+       ],
+       "current_revision": "project-r1",
+       "effective_revision": "project-r1",
+       "current_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "effective_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "runtime_usage": [
+        {
+         "runtime_id": "claude",
+         "used": 0,
+         "limit": 2,
+         "limit_kind": "ceiling"
+        },
+        {
+         "runtime_id": "codex",
+         "used": 0,
+         "limit": null,
+         "limit_kind": "disabled"
+        }
+       ],
+       "sample": {
+        "source": "taskq-admission-macos",
+        "sampled_at": 900,
+        "age_seconds": 170,
+        "cadence_seconds": 30,
+        "window_seconds": 30,
+        "cpu_busy_percent": 93.0,
+        "memory_available_percent": 4.0,
+        "memory_available_gib": null,
+        "pressure": null
+       },
+       "blockers": [
+        {
+         "code": "cpu",
+         "scope": {
+          "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+          "generation": 1,
+          "project_id": "taskq",
+          "runtime_id": null
+         },
+         "knowledge": "known"
+        },
+        {
+         "code": "memory",
+         "scope": {
+          "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+          "generation": 1,
+          "project_id": "taskq",
+          "runtime_id": null
+         },
+         "knowledge": "known"
+        },
+        {
+         "code": "max",
+         "scope": {
+          "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+          "generation": 1,
+          "project_id": null,
+          "runtime_id": null
+         },
+         "knowledge": "known"
+        }
+       ],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "claude"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-claude-r1",
+       "effective_revision": "rt-claude-r1",
+       "current_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-codex-r1",
+       "effective_revision": "rt-codex-r1",
+       "current_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      }
+     ]
+    }
+   ],
+   "capability": {
+    "edit": true
+   },
+   "events": [
+    {
+     "type": "check",
+     "status": "view",
+     "headline": "Legacy guard · Fixed limits · Load gate: Unknown: sample 3 min old",
+     "has": [
+      "last sample 3 min ago",
+      "Also blocked: host maximum"
+     ],
+     "not": [
+      "Ready",
+      "Waiting"
+     ]
+    }
+   ],
+   "now": 1000
+  },
+  {
+   "name": "fresh blockers name every waiting reason",
+   "groups": [
+    {
+     "key": "mac/taskq",
+     "observed_at": 990,
+     "labels": {
+      "host": "mac",
+      "project": "taskq"
+     },
+     "targets": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": null,
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [],
+       "current_revision": "host-r1",
+       "effective_revision": "host-r1",
+       "current_policy": {
+        "sources": {}
+       },
+       "effective_policy": {
+        "sources": {}
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "load_gate"
+         ],
+         "scopes": [
+          "project"
+         ]
+        }
+       ],
+       "current_revision": "project-r1",
+       "effective_revision": "project-r1",
+       "current_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "effective_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "runtime_usage": [
+        {
+         "runtime_id": "claude",
+         "used": 0,
+         "limit": 2,
+         "limit_kind": "ceiling"
+        },
+        {
+         "runtime_id": "codex",
+         "used": 0,
+         "limit": null,
+         "limit_kind": "disabled"
+        }
+       ],
+       "sample": {
+        "source": "taskq-admission-macos",
+        "sampled_at": 990,
+        "age_seconds": 5,
+        "cadence_seconds": 30,
+        "window_seconds": 30,
+        "cpu_busy_percent": 12.0,
+        "memory_available_percent": 40.0,
+        "memory_available_gib": null,
+        "pressure": null
+       },
+       "blockers": [
+        {
+         "code": "cpu",
+         "scope": {
+          "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+          "generation": 1,
+          "project_id": "taskq",
+          "runtime_id": null
+         },
+         "knowledge": "known"
+        },
+        {
+         "code": "memory",
+         "scope": {
+          "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+          "generation": 1,
+          "project_id": "taskq",
+          "runtime_id": null
+         },
+         "knowledge": "known"
+        },
+        {
+         "code": "cooldown",
+         "scope": {
+          "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+          "generation": 1,
+          "project_id": "taskq",
+          "runtime_id": null
+         },
+         "knowledge": "known"
+        },
+        {
+         "code": "provider",
+         "scope": {
+          "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+          "generation": 1,
+          "project_id": "taskq",
+          "runtime_id": null
+         },
+         "knowledge": "known"
+        }
+       ],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "claude"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-claude-r1",
+       "effective_revision": "rt-claude-r1",
+       "current_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-codex-r1",
+       "effective_revision": "rt-codex-r1",
+       "current_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      }
+     ]
+    }
+   ],
+   "capability": {
+    "edit": true
+   },
+   "events": [
+    {
+     "type": "check",
+     "status": "view",
+     "headline": "Legacy guard · Fixed limits · Load gate: Waiting: CPU, memory, recovery",
+     "has": [
+      "Also blocked: provider limit"
+     ]
+    }
+   ],
+   "now": 1000
+  },
+  {
+   "name": "conflict keeps the draft and asks for a fresh review",
+   "groups": [
+    {
+     "key": "mac/taskq",
+     "observed_at": 990,
+     "labels": {
+      "host": "mac",
+      "project": "taskq"
+     },
+     "targets": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": null,
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [],
+       "current_revision": "host-r1",
+       "effective_revision": "host-r1",
+       "current_policy": {
+        "sources": {}
+       },
+       "effective_policy": {
+        "sources": {}
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "load_gate"
+         ],
+         "scopes": [
+          "project"
+         ]
+        }
+       ],
+       "current_revision": "project-r1",
+       "effective_revision": "project-r1",
+       "current_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "effective_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "runtime_usage": [
+        {
+         "runtime_id": "claude",
+         "used": 0,
+         "limit": 2,
+         "limit_kind": "ceiling"
+        },
+        {
+         "runtime_id": "codex",
+         "used": 0,
+         "limit": null,
+         "limit_kind": "disabled"
+        }
+       ],
+       "sample": {
+        "source": "taskq-admission-macos",
+        "sampled_at": 990,
+        "age_seconds": 5,
+        "cadence_seconds": 30,
+        "window_seconds": 30,
+        "cpu_busy_percent": 12.0,
+        "memory_available_percent": 40.0,
+        "memory_available_gib": null,
+        "pressure": null
+       },
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "claude"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-claude-r1",
+       "effective_revision": "rt-claude-r1",
+       "current_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-codex-r1",
+       "effective_revision": "rt-codex-r1",
+       "current_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      }
+     ]
+    },
+    {
+     "key": "mac/taskq",
+     "observed_at": 990,
+     "labels": {
+      "host": "mac",
+      "project": "taskq"
+     },
+     "targets": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": null,
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [],
+       "current_revision": "host-r2",
+       "effective_revision": "host-r1",
+       "current_policy": {
+        "sources": {}
+       },
+       "effective_policy": {
+        "sources": {}
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "load_gate"
+         ],
+         "scopes": [
+          "project"
+         ]
+        }
+       ],
+       "current_revision": "project-r2",
+       "effective_revision": "project-r1",
+       "current_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "effective_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "runtime_usage": [
+        {
+         "runtime_id": "claude",
+         "used": 0,
+         "limit": 4,
+         "limit_kind": "ceiling"
+        },
+        {
+         "runtime_id": "codex",
+         "used": 0,
+         "limit": null,
+         "limit_kind": "disabled"
+        }
+       ],
+       "sample": {
+        "source": "taskq-admission-macos",
+        "sampled_at": 990,
+        "age_seconds": 5,
+        "cadence_seconds": 30,
+        "window_seconds": 30,
+        "cpu_busy_percent": 12.0,
+        "memory_available_percent": 40.0,
+        "memory_available_gib": null,
+        "pressure": null
+       },
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "claude"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-claude-r2",
+       "effective_revision": "rt-claude-r1",
+       "current_policy": {
+        "runtime_limit": 4,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": 4,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-codex-r2",
+       "effective_revision": "rt-codex-r1",
+       "current_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      }
+     ]
+    }
+   ],
+   "capability": {
+    "edit": true
+   },
+   "events": [
+    {
+     "type": "open"
+    },
+    {
+     "type": "input",
+     "key": "rt:claude",
+     "value": "3"
+    },
+    {
+     "type": "refresh",
+     "group": 1
+    },
+    {
+     "type": "check",
+     "status": "conflict",
+     "has": [
+      "Settings changed since you opened the editor",
+      "value=\"3\"",
+      "Review new values"
+     ],
+     "sent": 0
+    },
+    {
+     "type": "review"
+    },
+    {
+     "type": "check",
+     "status": "conflict",
+     "sent": 0
+    },
+    {
+     "type": "rebase"
+    },
+    {
+     "type": "review"
+    },
+    {
+     "type": "check",
+     "status": "review",
+     "has": [
+      "Claude 4 → 3",
+      "Running tasks continue. Other hosts and unchanged settings stay."
+     ],
+     "sent": 0
+    }
+   ],
+   "now": 1000
+  },
+  {
+   "name": "cancel discards the draft and sends nothing",
+   "groups": [
+    {
+     "key": "mac/taskq",
+     "observed_at": 990,
+     "labels": {
+      "host": "mac",
+      "project": "taskq"
+     },
+     "targets": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": null,
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [],
+       "current_revision": "host-r1",
+       "effective_revision": "host-r1",
+       "current_policy": {
+        "sources": {}
+       },
+       "effective_policy": {
+        "sources": {}
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "load_gate"
+         ],
+         "scopes": [
+          "project"
+         ]
+        }
+       ],
+       "current_revision": "project-r1",
+       "effective_revision": "project-r1",
+       "current_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "effective_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "runtime_usage": [
+        {
+         "runtime_id": "claude",
+         "used": 0,
+         "limit": 2,
+         "limit_kind": "ceiling"
+        },
+        {
+         "runtime_id": "codex",
+         "used": 0,
+         "limit": null,
+         "limit_kind": "disabled"
+        }
+       ],
+       "sample": {
+        "source": "taskq-admission-macos",
+        "sampled_at": 990,
+        "age_seconds": 5,
+        "cadence_seconds": 30,
+        "window_seconds": 30,
+        "cpu_busy_percent": 12.0,
+        "memory_available_percent": 40.0,
+        "memory_available_gib": null,
+        "pressure": null
+       },
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "claude"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-claude-r1",
+       "effective_revision": "rt-claude-r1",
+       "current_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-codex-r1",
+       "effective_revision": "rt-codex-r1",
+       "current_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      }
+     ]
+    }
+   ],
+   "capability": {
+    "edit": true
+   },
+   "events": [
+    {
+     "type": "open"
+    },
+    {
+     "type": "input",
+     "key": "gate.cpu_max",
+     "value": "70"
+    },
+    {
+     "type": "review"
+    },
+    {
+     "type": "check",
+     "status": "review",
+     "has": [
+      "CPU ceiling % 85 → 70"
+     ]
+    },
+    {
+     "type": "cancel"
+    },
+    {
+     "type": "check",
+     "status": "view",
+     "sent": 0,
+     "not": [
+      "70"
+     ]
+    }
+   ],
+   "now": 1000
+  },
+  {
+   "name": "lost receipt retries the same operation",
+   "groups": [
+    {
+     "key": "mac/taskq",
+     "observed_at": 990,
+     "labels": {
+      "host": "mac",
+      "project": "taskq"
+     },
+     "targets": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": null,
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [],
+       "current_revision": "host-r1",
+       "effective_revision": "host-r1",
+       "current_policy": {
+        "sources": {}
+       },
+       "effective_policy": {
+        "sources": {}
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "load_gate"
+         ],
+         "scopes": [
+          "project"
+         ]
+        }
+       ],
+       "current_revision": "project-r1",
+       "effective_revision": "project-r1",
+       "current_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "effective_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "runtime_usage": [
+        {
+         "runtime_id": "claude",
+         "used": 0,
+         "limit": 2,
+         "limit_kind": "ceiling"
+        },
+        {
+         "runtime_id": "codex",
+         "used": 0,
+         "limit": null,
+         "limit_kind": "disabled"
+        }
+       ],
+       "sample": {
+        "source": "taskq-admission-macos",
+        "sampled_at": 990,
+        "age_seconds": 5,
+        "cadence_seconds": 30,
+        "window_seconds": 30,
+        "cpu_busy_percent": 12.0,
+        "memory_available_percent": 40.0,
+        "memory_available_gib": null,
+        "pressure": null
+       },
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "claude"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-claude-r1",
+       "effective_revision": "rt-claude-r1",
+       "current_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-codex-r1",
+       "effective_revision": "rt-codex-r1",
+       "current_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      }
+     ]
+    }
+   ],
+   "capability": {
+    "edit": true
+   },
+   "events": [
+    {
+     "type": "open"
+    },
+    {
+     "type": "input",
+     "key": "rt:codex",
+     "value": "1"
+    },
+    {
+     "type": "review"
+    },
+    {
+     "type": "confirm"
+    },
+    {
+     "type": "check",
+     "status": "sending",
+     "sent": 1,
+     "ops": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "policy_schema": "taskq.capacity/1",
+       "expected_revision": "rt-codex-r1",
+       "changes": {
+        "runtime_limit": 1
+       }
+      }
+     ]
+    },
+    {
+     "type": "receipt",
+     "state": "unknown",
+     "reason": "no receipt"
+    },
+    {
+     "type": "check",
+     "status": "unknown",
+     "has": [
+      "Delivery unknown: check again: no receipt",
+      "Check again"
+     ]
+    },
+    {
+     "type": "retry"
+    },
+    {
+     "type": "check",
+     "status": "sending",
+     "sent": 2,
+     "same_op": true
+    }
+   ],
+   "now": 1000
+  },
+  {
+   "name": "saved then applied from the service readback",
+   "groups": [
+    {
+     "key": "mac/taskq",
+     "observed_at": 990,
+     "labels": {
+      "host": "mac",
+      "project": "taskq"
+     },
+     "targets": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": null,
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [],
+       "current_revision": "host-r1",
+       "effective_revision": "host-r1",
+       "current_policy": {
+        "sources": {}
+       },
+       "effective_policy": {
+        "sources": {}
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "load_gate"
+         ],
+         "scopes": [
+          "project"
+         ]
+        }
+       ],
+       "current_revision": "project-r1",
+       "effective_revision": "project-r1",
+       "current_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "effective_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "runtime_usage": [
+        {
+         "runtime_id": "claude",
+         "used": 0,
+         "limit": 2,
+         "limit_kind": "ceiling"
+        },
+        {
+         "runtime_id": "codex",
+         "used": 0,
+         "limit": null,
+         "limit_kind": "disabled"
+        }
+       ],
+       "sample": {
+        "source": "taskq-admission-macos",
+        "sampled_at": 990,
+        "age_seconds": 5,
+        "cadence_seconds": 30,
+        "window_seconds": 30,
+        "cpu_busy_percent": 12.0,
+        "memory_available_percent": 40.0,
+        "memory_available_gib": null,
+        "pressure": null
+       },
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "claude"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-claude-r1",
+       "effective_revision": "rt-claude-r1",
+       "current_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-codex-r1",
+       "effective_revision": "rt-codex-r1",
+       "current_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      }
+     ]
+    },
+    {
+     "key": "mac/taskq",
+     "observed_at": 990,
+     "labels": {
+      "host": "mac",
+      "project": "taskq"
+     },
+     "targets": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": null,
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [],
+       "current_revision": "host-r2",
+       "effective_revision": "host-r1",
+       "current_policy": {
+        "sources": {}
+       },
+       "effective_policy": {
+        "sources": {}
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "load_gate"
+         ],
+         "scopes": [
+          "project"
+         ]
+        }
+       ],
+       "current_revision": "project-r2",
+       "effective_revision": "project-r1",
+       "current_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 70,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "effective_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "runtime_usage": [
+        {
+         "runtime_id": "claude",
+         "used": 0,
+         "limit": 2,
+         "limit_kind": "ceiling"
+        },
+        {
+         "runtime_id": "codex",
+         "used": 0,
+         "limit": null,
+         "limit_kind": "disabled"
+        }
+       ],
+       "sample": {
+        "source": "taskq-admission-macos",
+        "sampled_at": 990,
+        "age_seconds": 5,
+        "cadence_seconds": 30,
+        "window_seconds": 30,
+        "cpu_busy_percent": 12.0,
+        "memory_available_percent": 40.0,
+        "memory_available_gib": null,
+        "pressure": null
+       },
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "claude"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-claude-r2",
+       "effective_revision": "rt-claude-r1",
+       "current_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-codex-r2",
+       "effective_revision": "rt-codex-r1",
+       "current_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      }
+     ]
+    },
+    {
+     "key": "mac/taskq",
+     "observed_at": 990,
+     "labels": {
+      "host": "mac",
+      "project": "taskq"
+     },
+     "targets": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": null,
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [],
+       "current_revision": "host-r2",
+       "effective_revision": "host-r2",
+       "current_policy": {
+        "sources": {}
+       },
+       "effective_policy": {
+        "sources": {}
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "load_gate"
+         ],
+         "scopes": [
+          "project"
+         ]
+        }
+       ],
+       "current_revision": "project-r2",
+       "effective_revision": "project-r2",
+       "current_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 70,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "effective_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 70,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "runtime_usage": [
+        {
+         "runtime_id": "claude",
+         "used": 0,
+         "limit": 2,
+         "limit_kind": "ceiling"
+        },
+        {
+         "runtime_id": "codex",
+         "used": 0,
+         "limit": null,
+         "limit_kind": "disabled"
+        }
+       ],
+       "sample": {
+        "source": "taskq-admission-macos",
+        "sampled_at": 990,
+        "age_seconds": 5,
+        "cadence_seconds": 30,
+        "window_seconds": 30,
+        "cpu_busy_percent": 12.0,
+        "memory_available_percent": 40.0,
+        "memory_available_gib": null,
+        "pressure": null
+       },
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "claude"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-claude-r2",
+       "effective_revision": "rt-claude-r2",
+       "current_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-codex-r2",
+       "effective_revision": "rt-codex-r2",
+       "current_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "effective_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "complete"
+      }
+     ]
+    }
+   ],
+   "capability": {
+    "edit": true
+   },
+   "events": [
+    {
+     "type": "open"
+    },
+    {
+     "type": "input",
+     "key": "gate.cpu_max",
+     "value": "70"
+    },
+    {
+     "type": "review"
+    },
+    {
+     "type": "confirm"
+    },
+    {
+     "type": "check",
+     "ops": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "policy_schema": "taskq.capacity/1",
+       "expected_revision": "project-r1",
+       "changes": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 70,
+         "memory_min": 10
+        }
+       }
+      }
+     ]
+    },
+    {
+     "type": "receipt",
+     "state": "saved"
+    },
+    {
+     "type": "refresh",
+     "group": 1
+    },
+    {
+     "type": "check",
+     "status": "saved",
+     "has": [
+      "Saved; waiting for service"
+     ]
+    },
+    {
+     "type": "refresh",
+     "group": 2
+    },
+    {
+     "type": "check",
+     "status": "applied",
+     "has": [
+      "Applied: read back from the service"
+     ]
+    }
+   ],
+   "now": 1000
+  },
+  {
+   "name": "absent service status is read-only and unknown",
+   "groups": [
+    {
+     "key": "mac/taskq",
+     "observed_at": null,
+     "labels": {
+      "host": "mac",
+      "project": "taskq"
+     },
+     "targets": [
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": null,
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [],
+       "current_revision": "host-r1",
+       "effective_revision": null,
+       "current_policy": {
+        "sources": {}
+       },
+       "effective_policy": null,
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "unknown"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": null
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "load_gate"
+         ],
+         "scopes": [
+          "project"
+         ]
+        }
+       ],
+       "current_revision": "project-r1",
+       "effective_revision": null,
+       "current_policy": {
+        "load_gate": {
+         "enabled": true,
+         "cpu_max": 85,
+         "memory_min": 10
+        },
+        "sources": {
+         "load_gate": "project"
+        }
+       },
+       "effective_policy": null,
+       "runtime_usage": [
+        {
+         "runtime_id": "claude",
+         "used": null,
+         "limit": 2,
+         "limit_kind": "unknown"
+        },
+        {
+         "runtime_id": "codex",
+         "used": null,
+         "limit": null,
+         "limit_kind": "unknown"
+        }
+       ],
+       "sample": null,
+       "blockers": [],
+       "completeness": "unknown"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "claude"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-claude-r1",
+       "effective_revision": null,
+       "current_policy": {
+        "runtime_limit": 2,
+        "sources": {
+         "runtime_limit": "runtime"
+        }
+       },
+       "effective_policy": null,
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "unknown"
+      },
+      {
+       "target": {
+        "installation_id": "3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a3f9a",
+        "generation": 1,
+        "project_id": "taskq",
+        "runtime_id": "codex"
+       },
+       "service_version": "4.2.0",
+       "supported": [
+        {
+         "policy_schema": "taskq.capacity/1",
+         "modes": [
+          "fixed"
+         ],
+         "fields": [
+          "runtime_limit"
+         ],
+         "scopes": [
+          "runtime"
+         ]
+        }
+       ],
+       "current_revision": "rt-codex-r1",
+       "effective_revision": null,
+       "current_policy": {
+        "runtime_limit": null,
+        "sources": {
+         "runtime_limit": "default"
+        }
+       },
+       "effective_policy": null,
+       "runtime_usage": [],
+       "sample": null,
+       "blockers": [],
+       "completeness": "unknown"
+      }
+     ]
+    }
+   ],
+   "capability": {
+    "edit": false,
+    "reason": "Read-only here",
+    "note": "Config: not configured"
+   },
+   "events": [
+    {
+     "type": "check",
+     "status": "read-only",
+     "headline": "Legacy guard · Fixed limits · Load gate: Unknown: status missing",
+     "has": [
+      "?/?",
+      "Read-only here",
+      "Config: not configured",
+      "Blockers unknown"
+     ],
+     "not": [
+      "Edit limits",
+      "Ready"
+     ]
+    }
+   ],
+   "now": 1000
+  }
+ ]
+}

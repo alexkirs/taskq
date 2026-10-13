@@ -287,8 +287,74 @@ fn answer(install: &Path, m: &Value) -> Value {
     }
 }
 
+/// One opaque revision of a policy: equal content, equal revision.
+/// `ponytail:` a content hash, so an edit-and-revert reads as unchanged; the host adapter's revisions replace it.
+fn revision(v: &Value) -> Value {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.to_string().hash(&mut h);
+    json!(format!("r{:016x}", h.finish()))
+}
+
+/// The project's capacity as one group of `taskq.resources/1` projection targets (host, project, runtimes) for the
+/// shared resource controls (docs/design/shared-resource-controls.md): `cap` is `status.json` `capacity` (null:
+/// unknown), `saved` the host's capacity from `taskq.json`. The only writes the tray offers are `service capacity`
+/// fields, so only the legacy schema is editable; Auto/Fixed is advertised read-only when the service reports it.
+fn resource_group(cap: &Value, saved: &Value, observed_at: Option<i64>, installation: Option<String>, project: &str) -> Value {
+    let ok = cap.is_object();
+    let saved = if saved["error"].is_null() { saved } else { &Value::Null };
+    let auto = if ok { cap["admission"]["mode"] == "auto" } else { saved["admission"]["mode"] == "auto" };
+    let target = |p: bool, rt: Option<&str>| json!({"installation_id": installation, "generation": 1, "project_id": if p { json!(project) } else { Value::Null }, "runtime_id": rt});
+    let legacy = |field: &str, scope: &str| json!({"policy_schema": "taskq.capacity/1", "modes": ["fixed"], "fields": [field], "scopes": [scope]});
+    let none = json!({"sample": null, "runtime_usage": [], "blockers": [], "completeness": if ok { "complete" } else { "unknown" }});
+    let entry = |t: Value, supported: Value, current: Value, effective: Value, rest: &Value| {
+        let rev = |p: &Value| { let mut p = p.clone(); p.as_object_mut().map(|o| o.remove("sources")); revision(&p) };
+        let mut e = json!({"target": t, "service_version": null, "supported": supported, "current_revision": if saved.is_null() { Value::Null } else { rev(&current) },
+            "effective_revision": if ok { rev(&effective) } else { Value::Null }, "current_policy": current, "effective_policy": effective});
+        for (k, v) in rest.as_object().unwrap() { e[k] = v.clone(); }
+        e
+    };
+    let mut host_supported = vec![];
+    let (mut cur, mut eff) = (json!({"sources": {}}), json!({"sources": {}}));
+    if ok && cap["admission"].is_object() {
+        host_supported.push(json!({"policy_schema": "taskq.admission/1", "modes": ["auto", "fixed"], "fields": [], "scopes": ["host"]}));
+        let pol = |a: &Value| json!({"mode": a["mode"], "maximum": a["max"], "sources": {"mode": "unknown", "maximum": "unknown"}});
+        (cur, eff) = (pol(&saved["admission"]), pol(&cap["admission"]));
+    }
+    let mut targets = vec![entry(target(false, None), json!(host_supported), cur, eff, &none)];
+    let mut rts: Vec<String> = ["claude", "codex"].map(String::from).to_vec();
+    for m in [&saved["limits"], &cap["limits"], &cap["used"]] {
+        for k in m.as_object().into_iter().flatten().map(|(k, _)| k) { if !rts.contains(k) { rts.push(k.clone()); } }
+    }
+    let limits = if ok { &cap["limits"] } else { &saved["limits"] };
+    let usage: Vec<Value> = rts.iter().map(|rt| {
+        let l = limits[rt].as_u64();
+        let kind = if !ok && saved.is_null() { "unknown" } else { match l { Some(0) => "disabled", Some(_) => "ceiling", None if auto => "unbounded", None => "disabled" } };
+        json!({"runtime_id": rt, "used": if ok { json!(cap["used"][rt].as_u64().unwrap_or(0)) } else { Value::Null }, "limit": l, "limit_kind": kind})
+    }).collect();
+    let sample = if cap["sample_at"].is_i64() {
+        json!({"source": format!("taskq-admission-{}", if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" }),
+            "sampled_at": cap["sample_at"], "age_seconds": cap["sample_age_seconds"], "cadence_seconds": 30, "window_seconds": if auto { 60 } else { 30 },
+            "cpu_busy_percent": cap["cpu_percent"], "memory_available_percent": cap["memory_available_percent"], "memory_available_gib": null, "pressure": null})
+    } else { Value::Null };
+    const CODES: [&str; 18] = ["cpu", "memory", "pressure", "sample", "config", "cooldown", "spacing", "max", "version", "host", "runtime_disabled", "pause", "focus", "dependency", "routing", "access", "provider", "unknown"];
+    let blockers: Vec<Value> = cap["reasons"].as_array().into_iter().flatten().map(|r| {
+        let code = match r["code"].as_str().unwrap_or("") { "hold" => "host", c if CODES.contains(&c) => c, _ => "unknown" };
+        let host_scope = ["host", "max", "spacing", "version"].contains(&code);
+        json!({"code": code, "scope": target(!host_scope, None), "knowledge": if code == "sample" || code == "unknown" || (code == "host" && cap["gate"] == "unknown") { "unknown" } else { "known" }})
+    }).collect();
+    let gate = |g: &Value| json!({"load_gate": g, "sources": {"load_gate": "unknown"}});
+    targets.push(entry(target(true, None), json!([legacy("load_gate", "project")]), gate(&saved["load_gate"]), gate(&cap["load_gate"]),
+        &json!({"sample": sample, "runtime_usage": usage, "blockers": blockers, "completeness": if ok { "complete" } else { "unknown" }})));
+    for rt in &rts {
+        let lim = |m: &Value| json!({"runtime_limit": m[rt], "sources": {"runtime_limit": "unknown"}});
+        targets.push(entry(target(true, Some(rt)), json!([legacy("runtime_limit", "runtime")]), lim(&saved["limits"]), lim(&cap["limits"]), &none));
+    }
+    json!({"schema": "taskq.resources/1", "observed_at": observed_at, "targets": targets})
+}
+
 /// One project for the page: its `status.json`, saved focus, labels and `events` lines `[time, kind, attempt]`.
-fn project(root: &str) -> Value {
+fn project(install: &Path, root: &str) -> Value {
     let r = Path::new(root);
     let d = crate::dot(r);
     // § 4 Data: a corrupt status.json is unknown with its reason, never zero
@@ -311,13 +377,16 @@ fn project(root: &str) -> Value {
     };
     let mut tasks = s["tasks"].as_array().cloned().unwrap_or_default();
     for task in &mut tasks { task_session(r, cap_host.as_str().unwrap_or(""), task); }
+    let installation = fs::read_to_string(install.join("installation-id")).ok().filter(|i| i.len() == 64 && i.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
+    let id: String = crate::project_name(r).chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).take(64).collect();
+    let resources = resource_group(&s["capacity"], &cap_saved, age.map(|a| now() - a as i64), installation, &id);
     json!({"root": root, "name": s["project"].as_str().map(String::from).unwrap_or_else(|| crate::project_name(r)),
         "issues": s["issues"].as_str().unwrap_or(""), "board_kind": board_kind, "closed": Value::Null,
         "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
         "complete": crate::snapshot::complete(&s) && age.is_some_and(|a| a < 300),
         "error": bad.map(Value::from).or_else(|| [&s["error"], &s["focus_error"]].into_iter().find(|e| e.is_string()).cloned()).unwrap_or(Value::Null), "focus": s["focus"].as_array().cloned().unwrap_or_default(), "saved": saved, "labels": crate::status_labels(r),
         "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"],
-        "capacity": s["capacity"], "cap_host": cap_host, "cap_saved": cap_saved, "agents": s["agents"],
+        "resources": resources, "cap_host": cap_host, "cap_saved": cap_saved, "agents": s["agents"],
         "incident": s["incident"], "incident_line": s.get("incident").map(crate::incident::line), "incident_notice": s["incident_notice"],
         "incident_repo": crate::platform::RELEASE_REPO})
 }
@@ -444,7 +513,8 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 let built = b.build(target).map_err(|e| e.to_string()).and_then(|w| {
                     // only our page: a link goes to the browser through the bridge
                     WebViewBuilder::new().with_html(HTML.replace("{{ANSWER_CARD_CSS}}", include_str!("answer-card.css")).replace("{{ANSWER_CARD_JS}}", include_str!("answer-card.js"))
-                        .replace("{{PROJECT_BLOCKS_CSS}}", include_str!("project-blocks.css")).replace("{{PROJECT_BLOCKS_JS}}", include_str!("project-blocks.js"))).with_navigation_handler(|u| !u.starts_with("http"))
+                        .replace("{{PROJECT_BLOCKS_CSS}}", include_str!("project-blocks.css")).replace("{{PROJECT_BLOCKS_JS}}", include_str!("project-blocks.js"))
+                        .replace("{{RESOURCE_CONTROLS_CSS}}", include_str!("resource-controls.css")).replace("{{RESOURCE_CONTROLS_JS}}", include_str!("resource-controls.js"))).with_navigation_handler(|u| !u.starts_with("http"))
                         .with_ipc_handler(move |r| {
                             let _ = p.send_event(Ev::Ipc(r.into_body()));
                         })
@@ -608,7 +678,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                         let root = m["root"].as_str().unwrap_or("");
                         if roots(&install).iter().any(|r| r == root) {
                             let msg = capacity(Path::new(root), &m);
-                            push(&ui, &json!({"capmsg": {"root": root, "text": msg}}));
+                            push(&ui, &json!({"capmsg": {"root": root, "id": m["id"], "text": msg}}));
                         }
                     }
                     // Add project (§ 4): the folder comes only from the OS picker, never from the page
@@ -668,7 +738,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 let steps = shots(&install);
                 if step == 0 {
                     let _ = fs::create_dir_all(&dir);
-                    let ps: Vec<Value> = roots(&install).iter().map(|r| project(r)).collect();
+                    let ps: Vec<Value> = roots(&install).iter().map(|r| project(&install, r)).collect();
                     let s = summary(&ps, day(now()));
                     // this Mac's menu-bar height and backing scale (A5); the names record them
                     let (k, dpr) = (menu_bar_scale(), backing_scale());
@@ -738,7 +808,7 @@ fn shot_name(install: &Path, step: usize) -> String {
 }
 
 fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>, add: &Value) -> Value {
-    let ps: Vec<Value> = roots(install).iter().map(|r| project(r)).collect();
+    let ps: Vec<Value> = roots(install).iter().map(|r| project(install, r)).collect();
     let (start, end) = s.range(now());
     let sum = summary(&ps, (start, end));
     let url = |rgba: &Rgba| format!("data:image/png;base64,{}", base64(&rgba.png()));
@@ -1242,6 +1312,36 @@ mod tests {
         assert_eq!(answer_snapshot(&s, &m).unwrap_err(), "permission denied");
     }
 
+    // Chain: status.json capacity -> tray projection -> shared resource controls. Risk: absent reads as zero, a legacy
+    // guard reads as Auto, saved reads as applied, or an unknown producer reason disappears.
+    #[test]
+    fn capacity_projects_to_resource_targets() {
+        let saved = json!({"limits": {"claude": 0}, "load_gate": {"enabled": true, "cpu_max": 85, "memory_min": 10}, "admission": {"mode": "auto", "max": null}});
+        let cap = json!({"limits": {"claude": 0}, "used": {"claude": 1}, "load_gate": {"enabled": true, "cpu_max": 90, "memory_min": 10},
+            "sample_at": 95, "sample_age_seconds": 3, "cpu_percent": 12.5, "memory_available_percent": 40.0, "reasons": [{"code": "hold"}, {"code": "future"}, {"code": "cpu"}]});
+        let g = resource_group(&cap, &saved, Some(100), None, "taskq");
+        let t = g["targets"].as_array().unwrap();
+        assert_eq!(t.len(), 4);
+        assert!(t[0]["target"]["project_id"].is_null() && t[0]["supported"] == json!([]), "no admission in status: legacy guard");
+        let u = &t[1]["runtime_usage"];
+        assert_eq!(u[0], json!({"runtime_id": "claude", "used": 1, "limit": 0, "limit_kind": "disabled"}));
+        assert_eq!(u[1], json!({"runtime_id": "codex", "used": 0, "limit": null, "limit_kind": "disabled"}), "Fixed: absent admits none");
+        assert_ne!(t[1]["current_revision"], t[1]["effective_revision"], "saved gate 85 is not applied 90");
+        assert_eq!(t[2]["current_revision"], t[2]["effective_revision"]);
+        let codes: Vec<_> = t[1]["blockers"].as_array().unwrap().iter().map(|b| b["code"].as_str().unwrap()).collect();
+        assert_eq!(codes, ["host", "unknown", "cpu"]);
+        assert!(t[1]["blockers"][0]["scope"]["project_id"].is_null());
+        assert_eq!(t[1]["sample"]["age_seconds"], 3);
+        let mut auto = cap.clone();
+        auto["admission"] = json!({"mode": "auto", "max": null});
+        let g = resource_group(&auto, &saved, Some(100), None, "taskq");
+        assert_eq!(g["targets"][0]["supported"][0]["policy_schema"], "taskq.admission/1");
+        assert_eq!(g["targets"][1]["runtime_usage"][1]["limit_kind"], "unbounded", "Auto: absent has no count cap");
+        let unknown = resource_group(&Value::Null, &json!({"error": "not configured"}), None, None, "taskq");
+        assert_eq!(unknown["targets"][1]["runtime_usage"][0], json!({"runtime_id": "claude", "used": null, "limit": null, "limit_kind": "unknown"}));
+        assert!(unknown["targets"][1]["effective_revision"].is_null() && unknown["targets"][1]["current_revision"].is_null());
+    }
+
     // Chain: § 4 tray opens an incident report. Risk: tray opens a file outside .taskq/incidents.
     #[test]
     fn incident_report_only_opens_json_inside_its_project() {
@@ -1312,13 +1412,13 @@ mod tests {
         let root = install.join("project");
         fs::create_dir_all(crate::dot(&root)).unwrap();
         fs::write(crate::dot(&root).join("status.json"), "{\"tasks\": [{\"n\": 1").unwrap();
-        let p = project(root.to_str().unwrap());
+        let p = project(&root, root.to_str().unwrap());
         assert!(p["complete"] == false && p["tasks"] == json!([]) && p["error"].as_str().unwrap().starts_with("status.json: corrupt"), "{p}");
         assert!(!summary(&[p], (0, 1)).known, "counts unknown, never zero");
         assert_eq!(fs::read_to_string(crate::dot(&root).join("status.json")).unwrap(), "{\"tasks\": [{\"n\": 1");
         // a corrupt focus in a fresh status.json names its reason
         fs::write(crate::dot(&root).join("status.json"), r#"{"focus": null, "focus_error": "focus: not UTF-8 text; file kept"}"#).unwrap();
-        assert_eq!(project(root.to_str().unwrap())["error"], "focus: not UTF-8 text; file kept");
+        assert_eq!(project(&root, root.to_str().unwrap())["error"], "focus: not UTF-8 text; file kept");
         fs::write(install.join("tray.json"), "{\"view\": \"fu").unwrap();
         let s = Settings::load(&install);
         assert!(s.view == "icon" && s.font == 16, "defaults shown");

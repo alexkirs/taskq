@@ -1,4 +1,4 @@
-# § 8 Release: one binary per OS, answer card assets, SHA256SUMS, latest.json; release files and SHA256SUMS carry build provenance attestations. A failing selftest publishes nothing.
+# § 8 Release: one binary per OS, answer card and resource controls assets, SHA256SUMS, latest.json; release files and SHA256SUMS carry build provenance attestations. A failing selftest publishes nothing.
 name: release
 on:
   push:
@@ -51,6 +51,10 @@ jobs:
             cp src/project-blocks.LICENSE "dist/taskq-$VER-project-blocks.LICENSE"
             cp tests/fixtures/project-blocks.json "dist/taskq-$VER-project-blocks-fixtures.json"
             cp docs/design/project-blocks.sources.json "dist/taskq-$VER-project-blocks-sources.json"
+            # shared resource controls (docs/design/shared-resource-controls.md), same mechanism
+            cp src/resource-controls.js "dist/taskq-$VER-resource-controls.js"
+            cp src/resource-controls.css "dist/taskq-$VER-resource-controls.css"
+            cp tests/fixtures/resource-controls.json "dist/taskq-$VER-resource-controls-fixtures.json"
           fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

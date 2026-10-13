@@ -46,9 +46,10 @@ button:disabled{color:var(--muted);opacity:.75}
 .range{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 6px;align-items:center;padding:4px}
 .range input,.range select{font:inherit;font-size:.9em;min-width:0;color:inherit;background:none;border:1px solid var(--edge);border-radius:4px;padding:3px}
 @media(pointer:coarse){button,summary{min-height:44px}}
-</style><style>{{ANSWER_CARD_CSS}}</style><style>{{PROJECT_BLOCKS_CSS}}</style></head><body><div class="menu" role="menu"></div>
+</style><style>{{ANSWER_CARD_CSS}}</style><style>{{PROJECT_BLOCKS_CSS}}</style><style>{{RESOURCE_CONTROLS_CSS}}</style></head><body><div class="menu" role="menu"></div>
 <script>{{ANSWER_CARD_JS}}</script>
 <script>{{PROJECT_BLOCKS_JS}}</script>
+<script>{{RESOURCE_CONTROLS_JS}}</script>
 <script>
 (()=>{
 const names={doing:'In work',review:'Review',ask:'Waiting for answer',failed:'Failed',ready:'Ready',waiting:'Dependencies',later:'Later'};
@@ -59,7 +60,7 @@ const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'
 const send=m=>window.ipc&&window.ipc.postMessage(JSON.stringify(m));
 const menu=document.querySelector('.menu');
 let aiText=null,aiMenu=false,aiConfirm=null,addConfirm=false;
-let S=null,page='home',taskFilter=null,homeScroll=0,ask=null,pending={},confirming=null,updating=null,draft=null,capedit=null,capmsg={};
+let S=null,page='home',taskFilter=null,homeScroll=0,ask=null,pending={},confirming=null,updating=null,draft=null;
 // Task answers: the native bridge owns credentials and canonical dispatch/readback.
 const answerRequests=new Map(),answerCards=new Map();
 function answerCapability(board){const p=S&&S.projects.find(p=>p.issues===board);return {answer:!!p&&p.alive&&p.complete!==false,reason:'Project status is unavailable or stale; check the board'};}
@@ -236,55 +237,37 @@ function home(){
   h+=S.projects.map(service).join('');
   const vs=[...new Set(S.projects.map(p=>p.version).filter(Boolean))];
   return h+update()+'<div class="row meta">taskq '+esc(vs.join(', ')||'unknown')+(vs.length===1&&vs[0]===S.version?'':' · tray '+esc(S.version))+' · '+esc(S.host)+'</div>';}
-// Capacity (taskq.md § 4): this host's used/limit and load gate; an edit writes only after a confirm naming old → new
-const rtName=rt=>rt.charAt(0).toUpperCase()+rt.slice(1);
-function gateText(p){
-  const c=p.capacity;
-  if(!c)return 'Unknown: service has no capacity status';
-  if(p.age==null||p.age>60)return 'Unknown: status '+(p.age==null?'missing':age(p.age)+' old');
-  if(c.load_gate&&c.load_gate.enabled&&c.sample_age_seconds!=null&&c.sample_age_seconds+p.age>60)return 'Unknown: sample '+age(c.sample_age_seconds+p.age)+' old';
-  const rs=c.reasons||[];
-  if(c.gate==='off')return 'Off';
-  if(c.gate==='open')return 'Ready';
-  if(c.gate==='held')return 'Waiting: '+rs.map(r=>({cpu:'CPU',memory:'memory'}[r.code]||'recovery')).join(', ');
-  return 'Unknown: '+rs.map(r=>r.text).join('; ');}
-function capRts(saved){return [...new Set(['claude','codex',...Object.keys(saved.limits||{})])];}
-function capChanges(saved,d){
-  const g=saved.load_gate,out=capRts(saved).filter(rt=>String(saved.limits[rt]??'')!==d[rt]).map(rt=>rtName(rt)+' '+(saved.limits[rt]??'none')+' → '+d[rt]);
-  if(g.enabled!==d.enabled)out.push('Load gate '+(g.enabled?'on':'off')+' → '+(d.enabled?'on':'off'));
-  if(String(g.cpu_max)!==d.cpu_max)out.push('CPU ceiling '+g.cpu_max+' → '+d.cpu_max+' %');
-  if(String(g.memory_min)!==d.memory_min)out.push('Memory floor '+g.memory_min+' → '+d.memory_min+' %');
-  return out;}
-function capCheck(saved,d){
-  const n=(v,lo,hi)=>/^\d+$/.test(v)&&Number(v)>=lo&&Number(v)<=hi;
-  for(const rt of capRts(saved))if(!n(d[rt],0,4294967295))return rtName(rt)+': an integer 0 or more';
-  if(!n(d.cpu_max,10,100))return 'CPU ceiling: an integer 10..100';
-  if(!n(d.memory_min,1,95))return 'Memory floor: an integer 1..95';
-  return capChanges(saved,d).length?'':'No change';}
-function capSet(saved,d){
-  const g=saved.load_gate,set={limits:{}};
-  for(const rt of capRts(saved))if(String(saved.limits[rt]??'')!==d[rt])set.limits[rt]=Number(d[rt]);
-  if(g.enabled!==d.enabled||String(g.cpu_max)!==d.cpu_max||String(g.memory_min)!==d.memory_min)Object.assign(set,{enabled:d.enabled,cpu_max:Number(d.cpu_max),memory_min:Number(d.memory_min)});
-  return set;}
+// Capacity (taskq.md § 4): the shared resource controls (docs/design/shared-resource-controls.md) over the tray's
+// taskq.resources/1 projection; this adapter only maps an operation onto `service capacity` and its receipt
+const resourceCards=new Map(),resourceRequests=new Map();
+function resourceGroup(p){return {...p.resources,key:p.root,labels:{host:p.cap_host||'this host',project:p.name}};}
+function resourceCapability(g){const p=S&&S.projects.find(p=>p.root===g.key),e=p&&p.cap_saved&&p.cap_saved.error;return e||!p?{edit:false,reason:'Read-only here',note:e?'Config: '+e:null}:{edit:true};}
+function resourceSet(op){const set={limits:{}};for(const o of op.ops){if('runtime_limit' in o.changes)set.limits[o.target.runtime_id]=o.changes.runtime_limit;if(o.changes.load_gate)Object.assign(set,o.changes.load_gate);}return set;}
+function resourceSend(g,op){
+  const p=S.projects.find(p=>p.root===g.key),key=g.key+'#'+op.id;
+  return new Promise(resolve=>{
+    const prior=resourceRequests.get(key);if(prior)clearTimeout(prior.timer);
+    resourceRequests.set(key,{resolve,timer:setTimeout(()=>{resourceRequests.delete(key);resolve({state:'unknown',reason:'no receipt'});},30000)});
+    send({a:'capacity',root:g.key,id:op.id,set:resourceSet(op),expect:p&&p.cap_saved});});}
+function resourceReceipt(m){
+  const key=m.root+'#'+m.id,r=resourceRequests.get(key);
+  if(!r)return;
+  clearTimeout(r.timer);resourceRequests.delete(key);
+  r.resolve(String(m.text).startsWith('Error')?{state:'rejected',reason:String(m.text).replace(/^Error:\s*/,'')}:{state:'saved'});
+  setTimeout(()=>send({a:'size',w:S.font>=18?360:320,h:menu.scrollHeight}),0);}
 function capacity(p){
-  const c=p.capacity,ok=!!c&&p.age!=null&&p.age<=60,saved=p.cap_saved||{},lim=ok?c.limits:(saved.limits||{}),g=gateText(p),m=capmsg[p.root];
-  const rts=[...new Set([...Object.keys(lim),...Object.keys(ok?c.used:{})])];
-  let h='<details class="group"><summary>▤ Capacity <span class="meta">'+esc((p.cap_host||'this host')+' · Load gate: '+g)+'</span></summary>';
-  h+=rts.map(rt=>{const u=ok?(c.used[rt]||0):'?',l=lim[rt]||0;return '<div class="row" aria-label="'+esc(rtName(rt)+': '+u+' used of '+l)+'"><span>'+esc(rtName(rt))+'</span><span>'+u+'/'+l+'</span></div>';}).join('');
-  h+='<div class="row"><span>Load gate</span><span class="meta">'+esc(g)+'</span></div>';
-  if(ok&&c.cpu_percent!=null&&c.memory_available_percent!=null)h+='<div class="row meta">CPU '+Math.round(c.cpu_percent)+' % · available memory '+Math.round(c.memory_available_percent)+' %</div>';
-  if(saved.error)return h+'<div class="body alert">Config: '+esc(saved.error)+'</div></details>';
-  const same=ok&&JSON.stringify(c.limits)===JSON.stringify(saved.limits)&&JSON.stringify(c.load_gate)===JSON.stringify(saved.load_gate);
-  if(m&&m.startsWith('Error'))h+='<div class="body alert" role="alert">'+esc(m)+'</div>';
-  else if(m&&same&&m!=='Saving')h+='<div class="body meta">Applied: read from status.json</div>';
-  else if(m||(ok&&!same))h+='<div class="body meta">Saved; waiting for service</div>';
-  const d=capedit&&capedit.root===p.root?capedit:null;
-  if(!d)return h+'<button class="project" data-a="capedit" data-root="'+esc(p.root)+'">Edit limits</button></details>';
-  if(d.confirm)return h+'<div class="body" role="alert">Apply to '+esc(p.name)+' on '+esc(p.cap_host)+'?<br>'+capChanges(saved,d).map(esc).join('<br>')+'<br>Running tasks continue.</div><div class="options"><button data-a="capconfirm" data-root="'+esc(p.root)+'">Confirm</button><button data-a="capcancel">Cancel</button></div></details>';
-  const num=(id,k,label)=>'<label for="'+esc(id)+'">'+label+'</label><input id="'+esc(id)+'" type="number" inputmode="numeric" step="1" data-cap="'+esc(k)+'" value="'+esc(d[k])+'">';
-  return h+'<div class="range">'+capRts(saved).map(rt=>num('cap-'+rt,rt,esc(rtName(rt)))).join('')+'<label for="cap-en">Load gate</label><input id="cap-en" type="checkbox" role="switch" data-cap="enabled"'+(d.enabled?' checked':'')+'>'+
-    num('cap-cpu','cpu_max','CPU ceiling %')+num('cap-mem','memory_min','Memory floor %')+'</div>'+(d.error?'<div class="body alert" role="alert">'+esc(d.error)+'</div>':'')+
-    '<div class="options"><button data-a="capapply" data-root="'+esc(p.root)+'">Apply…</button><button data-a="capcancel">Cancel</button></div></details>';}
+  if(!p.resources)return '';
+  return '<details class="group"><summary>▤ Capacity <span class="meta">'+esc((p.cap_host||'this host')+' · '+TaskqResources.headline(resourceGroup(p),S.now))+'</span></summary><div data-resources="'+esc(p.root)+'"></div></details>';}
+function mountResources(){
+  for(const slot of menu.querySelectorAll('[data-resources]')){
+    const p=S.projects.find(p=>p.root===slot.dataset.resources);
+    if(!p)continue;
+    let card=resourceCards.get(p.root);
+    if(!card){const el=document.createElement('div');card={el,ui:TaskqResources.mount(el,{capability:resourceCapability,send:resourceSend,now:()=>S.now})};resourceCards.set(p.root,card);}
+    slot.append(card.el);
+    card.ui.update(resourceGroup(p));
+  }
+}
 function project(p){
   const ts=tasks(p);
   return '<button data-a="back">‹ All projects</button>'+TaskqProjectBlocks.summary(blockProject(p))+'<div class="body meta">'+esc(modeText(p))+'</div>'+problem(p)+incident(p,true)+incidentNotice(p)+
@@ -309,7 +292,7 @@ function render(){
   menu.style.setProperty('--size',S.font+'px');
   menu.classList.toggle('pinned',!!S.pinned);
   menu.innerHTML=head()+(taskFilter?filteredTasks(p):p?project(p):home());
-  mountAnswers();
+  mountAnswers();mountResources();
   menu.querySelectorAll('details').forEach((d,i)=>d.open=open[i]||false);
   if(S.page!==undefined)menu.querySelectorAll('.hist,.agents,.service,.incident-notice').forEach(d=>d.open=true);
   const restored=answerFocus&&menu.querySelector('[data-answer="'+CSS.escape(answerFocus.dataset.answer)+'"] '+answerSelector);
@@ -318,19 +301,19 @@ function render(){
   send({a:'size',w:S.font>=18?360:320,h:menu.scrollHeight});}
 window.taskq={receive(s){
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
-  if(s.capmsg){capmsg[s.capmsg.root]=s.capmsg.text;render();return;}
+  if(s.capmsg){resourceReceipt(s.capmsg);return;}
   for(const p of s.projects){const was=S&&S.projects.find(q=>q.root===p.root);if(pending[p.root]&&was&&mode(was)!==mode(p))delete pending[p.root];}
   S=s;
   if(aiText===null)aiText=s.ai.draft||'';
   // snapshot mode names the page
   if(s.page!==undefined){page=s.page;pending={};}
   // a tick does not take the caret out of the range fields
-  if(document.activeElement&&(document.activeElement.dataset.draft||document.activeElement.dataset.cap||document.activeElement.id==='ai'))return;
+  if(document.activeElement&&(document.activeElement.dataset.draft||document.activeElement.dataset.rscField||document.activeElement.id==='ai'))return;
   render();
-},model:{unique,counts,mode,gateText,capChanges,capCheck,capSet}};
+},model:{unique,counts,mode,resourceSet}};
 menu.addEventListener('click',e=>{
   const cardLink=e.target.closest('.qac a');if(cardLink){e.preventDefault();send({a:'open',url:cardLink.getAttribute('href')});return;}
-  if(e.target.closest('.qac'))return;
+  if(e.target.closest('.qac,.rsc'))return;
   if(TaskqProjectBlocks.handle(e,{open:url=>send({a:'open',url}),project:id=>{homeScroll=document.scrollingElement.scrollTop;taskFilter=null;page=id;ask=null;render();document.scrollingElement.scrollTop=0;},tasks:(id,state)=>{homeScroll=document.scrollingElement.scrollTop;page=id||'home';taskFilter=state;render();document.scrollingElement.scrollTop=0;}}))return;
   const a=e.target.closest('a[data-url]');if(a){e.preventDefault();send({a:'open',url:a.dataset.url});return;}
   const b=e.target.closest('button');if(!b||b.disabled)return;const d=b.dataset;
@@ -354,16 +337,11 @@ menu.addEventListener('click',e=>{
   if(d.a==='confirm'||d.a==='cancel'){confirming=d.a==='confirm';render();return;}
   if(d.a==='update'){updating={v:d.v,at:S.now};}
   if(d.a==='pick'){ask=d.root;render();return;}
-  const cp=S.projects.find(p=>p.root===d.root),sv=cp&&cp.cap_saved;
-  if(d.a==='capedit'){const g=sv.load_gate;capedit={root:d.root,enabled:g.enabled,cpu_max:String(g.cpu_max),memory_min:String(g.memory_min),confirm:false,error:''};for(const rt of capRts(sv))capedit[rt]=String(sv.limits[rt]??0);render();return;}
-  if(d.a==='capcancel'){capedit=null;render();return;}
-  if(d.a==='capapply'){capedit.error=capCheck(sv,capedit);capedit.confirm=!capedit.error;render();return;}
-  if(d.a==='capconfirm'){send({a:'capacity',root:d.root,set:capSet(sv,capedit),expect:sv});capmsg[d.root]='Saving';capedit=null;render();return;}
   if(d.a==='pause-all'||d.a==='resume-all'){confirming=null;for(const p of S.projects.filter(p=>mode(p)===(d.a==='pause-all'?'run':'paused'))){pending[p.root]=d.a==='pause-all'?'Pausing':'Resuming';send({a:d.a.slice(0,-4),root:p.root});}render();return;}
   if(d.a==='pause'||d.a==='resume'||d.a==='focus'){pending[d.root]=d.a==='pause'?'Pausing':'Resuming';ask=null;}
   if(d.a)send({a:d.a,root:d.root,label:d.label});render();});
-menu.addEventListener('input',e=>{if(e.target.id==='ai'){aiText=e.target.value;send({a:'ai-draft',text:aiText});return;}const k=e.target.dataset.draft,c=e.target.dataset.cap;if(k&&draft)draft[k]=e.target.value;if(c&&capedit)capedit[c]=e.target.type==='checkbox'?e.target.checked:e.target.value;});
-menu.addEventListener('focusout',e=>{const f=x=>x&&(x.id==='ai'||x.dataset&&(x.dataset.draft||x.dataset.cap));if(f(e.target))setTimeout(()=>{if(!f(document.activeElement))render();});});
+menu.addEventListener('input',e=>{if(e.target.id==='ai'){aiText=e.target.value;send({a:'ai-draft',text:aiText});return;}const k=e.target.dataset.draft;if(k&&draft)draft[k]=e.target.value;});
+menu.addEventListener('focusout',e=>{const f=x=>x&&(x.id==='ai'||x.dataset&&(x.dataset.draft||x.dataset.rscField));if(f(e.target))setTimeout(()=>{if(!f(document.activeElement))render();});});
 menu.addEventListener('mousedown',e=>{if(S&&S.pinned&&e.button===0&&e.target.closest('.head')&&!e.target.closest('button'))send({a:'drag'});});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')send({a:'hide'});});
 send({a:'ready'});

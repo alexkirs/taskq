@@ -182,6 +182,7 @@ function home(){
   h+=ai();
   h+='<details><summary>↳ Scope <span class="meta">'+S.projects.length+' project'+(S.projects.length===1?'':'s')+(known(S.projects)?' · in work '+c.work+' · ask '+c.ask+' · ready '+c.ready:' · counts unknown')+'</span></summary><div class="body">'+S.projects.map(p=>'<div><strong>'+esc(p.name)+'</strong> <span class="meta">'+esc(modeText(p))+'</span></div><div class="meta">You asked: '+esc(p.request||'not recorded')+'</div>').join('')+'</div></details>';
   h+=S.projects.map(p=>problem(p)+incident(p,true)+incidentNotice(p)).join('');
+  if(S.settings_error)h+='<div class="body alert" role="alert">⚠ Settings unknown: '+esc(S.settings_error)+'; defaults shown</div>';
   h+=globalGroup('ask',unique(all))+globalGroup('failed',unique(all));
   h+='<div class="group"><div class="row meta">Projects</div>'+(S.projects.length?S.projects.map(p=>'<button class="project" data-page="'+esc(p.root)+'" role="menuitem"><span title="'+esc(p.name)+'">'+esc(p.name)+(mode(p)==='run'?'':' <span class="meta">'+(mode(p)==='paused'?'Ⅱ':'observation')+'</span>')+'</span>'+countMarkup(counts(tasks(p)),known([p]))+'<span aria-hidden="true">›</span></button>').join(''):'<div class="body meta">No projects yet</div>')+addProject()+'</div>';
   h+=history();

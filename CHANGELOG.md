@@ -3,6 +3,12 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.1.3
+
+Update, launcher, service units, `status.json` common keys and the board token come from the shared crate
+[coreq](https://github.com/taskqorg/coreq) v0.1.0; paths, units and messages are unchanged, except launcher errors
+now read `taskq: <message>`. No board change.
+
 ## v4.1.2
 
 Repository moved to `taskqorg/taskq`: releases, `latest.json` and `taskq update` come from there (the old URL redirects

@@ -33,11 +33,9 @@ The editable candidate contains local simulation, not live service access. Detac
 
 ## Related specifications
 
-- [Board labels](board.md), [adoption](board-implementation.md): names/colors and migration constraints.
+- [Board labels](board.md): names/colors and migration constraints.
 - [Incident reports](incidents.md): fault catalog, reporting, consent and operator states.
 - [Capacity](capacity.md): earlier limits/load-gate detail; current runtime authority is taskq.md.
-- [One-off run](one-off-run.md): separate proposal, not an approved replacement for p0 semantics.
-- [Message formats](message-formats-handoff.md): command-output handoff.
 
 ## Historical references
 

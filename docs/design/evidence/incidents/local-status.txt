@@ -1,3 +1,0 @@
-{"project": "alpha", "host": "fixture", "version": "4.0.0-dev", "focus": ["all"], "tasks": [], "error": null, "incident": {"state": "local", "fault": "dispatch.panic", "at": 1791896048, "path": ".taskq/incidents/0123456789abcdef.json", "url": null, "reason": "offline"}, "incident_notice": false, "capacity": {"limits": {"claude": 0, "codex": 0}, "used": {"claude": 0, "codex": 0}, "load_gate": {"enabled": false, "cpu_max": 85, "memory_min": 15}, "gate": "off", "reasons": [], "sample_age_seconds": 0}}
-Update: unknown
-Incident: local dispatch.panic 5m (offline) · .taskq/incidents/0123456789abcdef.json

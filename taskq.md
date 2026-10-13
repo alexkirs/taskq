@@ -125,7 +125,7 @@ Optional last lines `op-id: <id>`, then `revision: <R>`, of an entry are fields,
 | `later`, `failed` | `requeue` / `close` | `ready` / closed | the only exits |
 
 - `waiting` becomes `ready` when every `Depends on` issue is closed.
-- `gone` in `review` ends only the reviewer; the result stays and a new reviewer is spawned.
+- `gone` in `review` ends only the reviewer; the result stays and a new reviewer is spawned. Emergency interlock ([E1–E5](docs/design/emergency-recovery.md)): under the § 3 emergency hold no `spawn` is written on that host until `service release`; a child whose liveness reads unknown gets no `gone`; `service recover --apply` writes each `gone attempt` with `--op-id` and `--revision` (§ 4).
 - `retries` is one counter: an attempt `requeue` that makes it 3, or a `gone` that makes it 2, moves to `ask` with the attempt ended; its `answer` then goes to `ready`. Every move to `ready` clears attempt, card and result.
 - `answer K` whose option starts with `close` runs `close` (§ 7) instead.
 - After an entry is accepted, the writer sets the `q-<state>` label; every service pass fixes labels that differ from the fold. A hand-moved label is overwritten: people change state with an entry.

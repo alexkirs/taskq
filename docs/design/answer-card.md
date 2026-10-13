@@ -8,7 +8,7 @@ Follow [shared-block inheritance B1–B4](shared-blocks.md). Compact placement d
 
 One small browser-compatible component implements task question, source-numbered choices, recommendation, free text and receipt states. TaskQ tray and DashQ supply adapters for their existing bridges; the component owns no credentials, network client, board parser or task state machine. No UI framework, service or general plugin system.
 
-Keep source, styles/tokens and fixtures in TaskQ. Publish versioned static assets with the TaskQ release and checksum; DashQ pins their version/hash and serves them locally under its CSP. Vendored generated assets are permitted only with provenance and checksum, never independent edits. No runtime CDN, iframe of the tray, npm registry or moving-main dependency. A compatible component update must pass both consumer fixtures.
+Keep source, styles/tokens and fixtures in TaskQ. Publish versioned static assets with the TaskQ release and checksum; until a v* release carries them, the pin is a TaskQ commit plus SHA-256 (§ Implementation, #937 owner answer). DashQ pins that version/hash and serves them locally under its CSP. Vendored generated assets are permitted only with provenance and checksum, never independent edits. No runtime CDN, iframe of the tray, npm registry or moving-main dependency. A compatible component update must pass both consumer fixtures.
 
 ## Card and interaction
 
@@ -33,7 +33,7 @@ Use the same fixtures in TaskQ and DashQ: choice and free text; long question; m
 - Component: [src/answer-card.js](../../src/answer-card.js) (`TaskqAnswerCard` global or CommonJS) and [src/answer-card.css](../../src/answer-card.css). `mount(el, adapter).update([{board, row}])` keeps drafts, focus and scroll; the adapter gives `capability(board, row)` = `{answer, reason}` and `send(board, op)` resolving to `{state, reason, next}`, with `op` = `{id, task, revision, choice | text}`. Pure `status`, `step` and `render` hold all behavior.
 - Tray adapter: [src/tray.html](../../src/tray.html) embeds the unchanged assets beside task rows and keeps card instances through refresh/navigation. The existing IPC bridge in [src/tray.rs](../../src/tray.rs) validates registered project/board identity and invokes the owner CLI dispatcher with the exact operation ID and revision; only its readback receipt accepts an answer. A missing receipt stays unknown and reconciles with the same payload/ID. `node tests/tray-answer.test.cjs` checks this adapter boundary.
 - Conformance: [tests/fixtures/answer-card.json](../../tests/fixtures/answer-card.json); `cargo test` checks its `question` fields against TaskQ's parse, and each consumer runs `replay(case, capability)` over it (`node tests/answer-card.test.cjs`). `tests/answer-card.browser.cjs` checks 16/20 px, both themes, 280/480 px, refresh and keyboard with Playwright.
-- Release: `taskq-<version>-answer-card.js`, `.css` and `-fixtures.json` ship in each release, listed in `SHA256SUMS` with build provenance. Checksums of this source, checked by the node test:
+- Release: `taskq-<version>-answer-card.js`, `.css` and `-fixtures.json` ship in each release, listed in `SHA256SUMS` with build provenance. DashQ pin (no v* release carries the assets yet, latest v4.1.11): vendor these three files from TaskQ commit `8715e1d2a63f725a290549234c720204d8234413` (#942, last change to all three) with that commit and these checksums as provenance; `git show <commit>:<file> | shasum -a 256` reproduces them. Checksums of this source, checked by the node test:
 
 `src/answer-card.js` SHA-256: `007f0124bccd31d0ef819c172eb6c97c201d9556227e04149dc21de2b80117fc`
 `src/answer-card.css` SHA-256: `b33ea8d5ba6ec70931ecc2cac745bf1808181b4939019bf478f09cdd7791a796`  
@@ -52,7 +52,7 @@ B4 parent-to-child map, design `cf46e637`:
 
 Deferred: Discuss with AI stays with the AI workspace route. Defects against parents, owned by #938: the tray strip shows zero capsules (K-A2) and merges Doing and Review (K-A1). `PLAYWRIGHT_CHANNEL=chrome node tests/answer-card.parent.cjs` compares both themes, 16/20 px and 320/360 px; it is an instrument, not native qualification.
 
-Delivery of #920 is the adapter PR first, per the owner's answer on the task. Screen-capable native interaction qualification and the pinned release/checksum evidence follow after merge. Browser and dispatcher tests do not certify native interaction, a real board answer or worker resumption; README screenshot freshness remains a separate native capture gate.
+Delivery of #920 is the adapter PR first, per the owner's answer on the task. The commit/checksum pin above is #937's release evidence; native tray interaction is qualified on the next real ask card answered from the macOS tray (#937 owner answer), not on a synthetic task. Browser and dispatcher tests do not certify native interaction, a real board answer or worker resumption; README screenshot freshness remains a separate native capture gate.
 
 ## Accepted reference
 

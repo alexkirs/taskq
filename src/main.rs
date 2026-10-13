@@ -62,7 +62,7 @@ impl Args {
             }
         }
         let used = match a.pos.first().map(String::as_str) {
-            Some("close" | "help") => a.pos.len(),
+            Some("close") => a.pos.len(),
             Some("answer") if a.pos.get(1).is_some_and(|p| p.contains('.')) => a.pos.len(),
             Some("service") if a.pos.get(1).is_some_and(|p| p == "focus") => a.pos.len(),
             Some("service" | "add" | "ask" | "answer" | "result" | "requeue" | "later" | "failed" | "steer" | "inbox") => 2,
@@ -1561,6 +1561,8 @@ mod tests {
         assert_eq!(parse(&["add", "T", "--goal", "G", "--acceptance", "A", "B", "C"]).err().unwrap(), "unused positional arguments: B C");
         assert_eq!(parse(&["inbox", "1", "extra"]).err().unwrap(), "unused positional arguments: extra");
         assert_eq!(parse(&["selftest", "extra"]).err().unwrap(), "unused positional arguments: extra");
+        assert_eq!(parse(&["help", "extra"]).err().unwrap(), "unused positional arguments: extra");
+        assert!(parse(&["help"]).is_ok());
         assert_eq!(parse(&["service", "status", "extra"]).err().unwrap(), "unused positional arguments: extra");
         assert_eq!(parse(&["add", "T", "--goal", "G", "--acceptance", "A", "--acceptance", "B"]).unwrap().all("acceptance"), vec!["A", "B"]);
         for v in [vec!["close", "1", "2"], vec!["answer", "1.1", "2.1"], vec!["service", "focus", "code", "docs"]] {

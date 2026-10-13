@@ -92,6 +92,16 @@ pub fn old_services(install: &Path) -> Vec<String> {
     }).collect()
 }
 
+/// The emergency hold (§ 3): `<install>/hold` refuses every launch on the host until `service release` removes it.
+/// `None`: no hold; `Some(reason)`: held, an unreadable file included (fail closed).
+pub fn hold(install: &Path) -> Option<String> {
+    match fs::read_to_string(install.join("hold")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(format!("hold file unreadable ({e})")),
+        Ok(t) => Some(t.lines().next().filter(|l| !l.trim().is_empty()).unwrap_or("emergency hold").to_string()),
+    }
+}
+
 /// [`decide`] under the host lock, read and written back. An unreadable host file refuses the request (`host`) and is
 /// rebuilt from this entry; the other services re-add theirs on their next write. Returns the host's held count.
 pub fn sync(install: &Path, root: &str, mine: Entry, want: Option<Want>, now: i64) -> (Result<(), (&'static str, String)>, Option<u32>) {

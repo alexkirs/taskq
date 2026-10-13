@@ -21,18 +21,17 @@ pub struct Launch {
 
 /// A running child; a trait so the service can be tested with fake processes.
 pub trait Proc {
-    /// The exit code once the child has exited.
-    fn exited(&mut self) -> Option<i32>;
+    /// The exit code once the child has exited; `Err` is an unknown read (§ 4 reconciliation), never an exit.
+    fn exited(&mut self) -> Result<Option<i32>, String>;
     fn kill(&mut self);
     fn id(&self) -> u32;
 }
 
 impl Proc for Child {
-    fn exited(&mut self) -> Option<i32> {
+    fn exited(&mut self) -> Result<Option<i32>, String> {
         match self.try_wait() {
-            Ok(Some(s)) => Some(s.code().unwrap_or(-1)),
-            Ok(None) => None,
-            Err(_) => Some(-1),
+            Ok(s) => Ok(s.map(|s| s.code().unwrap_or(-1))),
+            Err(e) => Err(format!("wait failed: {e}")),
         }
     }
     fn kill(&mut self) {
@@ -51,13 +50,22 @@ pub struct Adopted(pub i32);
 
 #[cfg(unix)]
 impl Proc for Adopted {
-    fn exited(&mut self) -> Option<i32> {
+    fn exited(&mut self) -> Result<Option<i32>, String> {
         let mut st = 0;
         let r = unsafe { libc::waitpid(self.0, &mut st, libc::WNOHANG) };
         match r {
-            0 => None,
-            r if r == self.0 && libc::WIFEXITED(st) => Some(libc::WEXITSTATUS(st)),
-            _ => Some(-1),
+            0 => Ok(None),
+            r if r == self.0 && libc::WIFEXITED(st) => Ok(Some(libc::WEXITSTATUS(st))),
+            r if r == self.0 => Ok(Some(-1)),
+            _ => {
+                let e = std::io::Error::last_os_error();
+                // not waitable: only an observed missing pid proves the exit
+                if unsafe { libc::kill(self.0, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                    Ok(Some(-1))
+                } else {
+                    Err(format!("waitpid {}: {e}", self.0))
+                }
+            }
         }
     }
     fn kill(&mut self) {
@@ -288,24 +296,24 @@ impl AppTurn {
 }
 
 impl Proc for AppTurn {
-    fn exited(&mut self) -> Option<i32> {
+    fn exited(&mut self) -> Result<Option<i32>, String> {
         if let Some(h) = &mut self.hand {
-            let code = h.exited()?;
+            let Some(code) = h.exited()? else { return Ok(None) };
             self.hand = None;
             self.thread = codex_thread(&self.log).unwrap_or_default();
             if self.thread.is_empty() || self.queue().is_err() {
-                return Some(if code == 0 { -1 } else { code });
+                return Ok(Some(if code == 0 { -1 } else { code }));
             }
-            return None;
+            return Ok(None);
         }
         if !(self.running)() {
-            return Some(-1);
+            return Ok(Some(-1));
         }
         if self.rollout.is_none() {
             self.rollout = rollout(&self.thread);
         }
         // ponytail: a thread without a found rollout stays live until the app closes; ttl-based expiry if it matters
-        self.rollout.as_ref().filter(|p| completes(p) > self.done).map(|_| 0)
+        Ok(self.rollout.as_ref().filter(|p| completes(p) > self.done).map(|_| 0))
     }
     fn kill(&mut self) {
         // the app turn itself cannot be stopped from outside: it runs on, fenced (§ 3 app lease)
@@ -470,12 +478,12 @@ mod tests {
         let done = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
         std::fs::write(&p, format!("{done}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\"}}}}\n")).unwrap();
         let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), thread: "th".into(), done: completes(&p), rollout: Some(p.clone()), running: || true };
-        assert_eq!((t.done, t.exited()), (1, None), "the handshake's task_complete does not end the turn");
+        assert_eq!((t.done, t.exited()), (1, Ok(None)), "the handshake's task_complete does not end the turn");
         std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(done.as_bytes()).unwrap();
-        assert_eq!(t.exited(), Some(0));
+        assert_eq!(t.exited(), Ok(Some(0)));
         t.done = 2;
         t.running = || false;
-        assert_eq!(t.exited(), Some(-1), "a closed app is a child exit");
+        assert_eq!(t.exited(), Ok(Some(-1)), "a closed app is a child exit");
         let _ = std::fs::remove_file(p);
     }
 

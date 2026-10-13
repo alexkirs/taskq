@@ -69,9 +69,9 @@ Net change 0 lines; the contract is at its 300-line limit, so each new line repl
 
 | # | Task | Depends on | Host | Acceptance |
 |---|---|---|---|---|
-| A | Shots pipeline: `fixture.sh`, `update.sh`, `manifest.json`, `check.sh` in `tests.yml`; first dark set committed | none | mac | A1 `update.sh` writes the three dark files and the manifest. A2 `check.sh` fails on a UI change without refresh and passes after `update.sh`. A3 CI green on the PR. |
-| B | Product lines in taskq.md, then the README per Target page; phrases checked | A | any | B1 taskq.md Product changed first, ≤ 300 lines. B2 README order matches Target page. B3 each use-case phrase checked in a fresh session, result lists kept and dropped rows. B4 `cargo test --locked` green. |
-| C | Q1: `taskq tray --snapshot` on `macos-latest` by `workflow_dispatch`; if pictures render, move `update.sh` into CI with a bot commit on main | A | any | C1 workflow artifact holds the PNGs or the failure is recorded. C2 only on success: a UI change on main refreshes `docs/shots/` without a human. |
+| A #923 | Shots pipeline: `fixture.sh`, `update.sh`, `manifest.json`, `check.sh` in `tests.yml`; first dark set committed | none | mac | A1 `update.sh` writes the three dark files and the manifest. A2 `check.sh` fails on a UI change without refresh and passes after `update.sh`. A3 CI green on the PR. |
+| B #925 | Product lines in taskq.md, then the README per Target page; phrases checked | A | any | B1 taskq.md Product changed first, ≤ 300 lines. B2 README order matches Target page. B3 each use-case phrase checked in a fresh session, result lists kept and dropped rows. B4 `cargo test --locked` green. |
+| C #924 | Q1: `taskq tray --snapshot` on `macos-latest` by `workflow_dispatch`; if pictures render, move `update.sh` into CI with a bot commit on main | A | any | C1 workflow artifact holds the PNGs or the failure is recorded. C2 only on success: a UI change on main refreshes `docs/shots/` without a human. |
 
 ## Owner decisions
 

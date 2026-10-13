@@ -2,6 +2,7 @@
 
 mod board;
 mod core;
+mod dispatch;
 mod incident;
 mod labels;
 mod operator;
@@ -14,8 +15,9 @@ mod icon;
 #[cfg(any(target_os = "macos", windows))]
 mod tray;
 
-use board::{Board, Publish, entries};
-use core::{Entry, State, Task, entry, fold, options};
+use board::{Board, entries};
+use core::{Entry, State, Task, entry, fold};
+use dispatch::{Op, Receipt, act, answer_picks, close_one, current, deps_open};
 use serde_json::{Value, json};
 use service::{Config, Kid, Service};
 use snapshot::in_scope;
@@ -42,6 +44,7 @@ const USAGE: &str = "taskq agents
  taskq service focus [all|off|<label..>] [--request TEXT]
  taskq service capacity [--host H] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
  taskq tray [--snapshot DIR] [--icon FILE] | taskq selftest
+Writes to a task take [--op-id ID] [--revision R] [--json] (taskq.md section 5).
 Text templates and limits: taskq.md sections 1, 2, 5, 7.";
 
 // ---------- arguments ----------
@@ -185,50 +188,6 @@ fn project_name(root: &Path) -> String {
 use coreq::status::age as file_age;
 
 // ---------- writes ----------
-
-fn deps_open(b: &dyn Board, body: &str) -> Res<bool> {
-    for d in core::depends(body) {
-        if b.issue(d)?.open {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// `TASKQ_ATTEMPT` when this process is a child working on task `n` (§ 3 fencing).
-fn own_attempt(n: u64) -> Option<u64> {
-    let task: u64 = std::env::var("TASKQ_TASK").ok()?.parse().ok()?;
-    (task == n).then(|| std::env::var("TASKQ_ATTEMPT").ok()?.parse().ok()).flatten()
-}
-
-fn current(b: &dyn Board, n: u64) -> Res<(board::Issue, Task, bool)> {
-    let issue = b.issue(n)?;
-    let deps = deps_open(b, &issue.body)?;
-    let t = fold(n, &entries(b, n)?, deps);
-    Ok((issue, t, deps))
-}
-
-/// R4: append one entry that `fold` accepts, set the projected label, poke the local service. A refused entry writes
-/// nothing and reports the current state.
-fn act(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &str) -> Res<Task> {
-    let issue = b.issue(n)?;
-    if !issue.open {
-        return Err(format!("#{n} is closed"));
-    }
-    let deps = deps_open(b, &issue.body)?;
-    let mut log = entries(b, n)?;
-    let before = fold(n, &log, deps);
-    let body = entry(kind, args, own_attempt(n), text);
-    log.push(Entry { id: u64::MAX, body: body.clone(), edited: false });
-    if fold(n, &log, deps) == before {
-        return Err(format!("#{n} is {}: `{kind}` not accepted", before.state.name()));
-    }
-    b.comment(n, &body)?;
-    let t = fold(n, &entries(b, n)?, deps); // re-read: report what the board holds (R12)
-    service::project(b, &issue, &t)?;
-    poke(root);
-    Ok(t)
-}
 
 fn numbered(opts: &[String], recommend: Option<usize>) -> String {
     opts.iter().enumerate().map(|(i, o)| format!("{}. {o}{}", i + 1, if recommend == Some(i + 1) { " ★" } else { "" })).collect::<Vec<_>>().join("\n")
@@ -388,57 +347,6 @@ fn formats_selftest() -> Res<String> {
     }
 }
 
-/// § 7: publish a reviewed result, then `close`; later and failed tasks close without publication.
-fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str) -> Res<String> {
-    let (issue, t, _) = current(b, n)?;
-    match t.state {
-        State::Later | State::Failed => {
-            act(b, &cfg.root, n, "close", &[], verdict)?;
-            Ok(format!("#{n} closed"))
-        }
-        State::Review => {
-            let sha = t.result.ok_or(format!("#{n} has no result"))?;
-            match b.publish(n, &sha, &cfg.publish, &issue.title, &format!("Task: {}", b.url(n))) {
-                Publish::Done(m) => {
-                    act(b, &cfg.root, n, "close", &[], &join(&[verdict, &m]))?;
-                    Ok(format!("#{n} closed\n{m}"))
-                }
-                Publish::Pending(m) => Err(format!("#{n} not closed: {m}")),
-                Publish::Failed(m) => {
-                    act(b, &cfg.root, n, "requeue", &[], &format!("publication failed: {m}"))?;
-                    Err(format!("#{n} requeued: {m}"))
-                }
-            }
-        }
-        s => Err(format!("#{n} is {}: `close` not accepted", s.name())),
-    }
-}
-
-/// `answer N.K [M.K..]`: every pick is checked before any is written (§ 5).
-fn answer_picks(b: &dyn Board, cfg: &Config, picks: &[String]) -> Res<Vec<String>> {
-    let mut plan = vec![];
-    for p in picks {
-        let (n, k) = p.trim_start_matches('#').split_once('.').and_then(|(n, k)| Some((n.parse::<u64>().ok()?, k.parse::<usize>().ok()?))).ok_or(format!("not N.K: {p}"))?;
-        let (_, t, _) = current(b, n)?;
-        let card = t.card.clone().filter(|_| matches!(t.state, State::Ask | State::Review)).ok_or(format!("#{n} is {} without a question", t.state.name()))?;
-        let opt = options(&card).into_iter().find(|o| o.0 == k).ok_or(format!("#{n} has no option {k}"))?.1;
-        plan.push((n, k, opt, t.state));
-    }
-    let mut out = vec![];
-    for (n, k, opt, state) in plan {
-        let close = opt.to_lowercase().starts_with("close");
-        let r = match (state, close) {
-            (State::Ask, _) => act(b, &cfg.root, n, "answer", &[&k.to_string()], &opt).and_then(|t| {
-                if close && t.state == State::Review { close_one(b, cfg, n, &opt) } else { Ok(format!("#{n} {}", t.state.name())) }
-            }),
-            (_, true) => close_one(b, cfg, n, &opt),
-            (_, false) => act(b, &cfg.root, n, "requeue", &[], &opt).map(|t| format!("#{n} {}", t.state.name())),
-        };
-        out.push(r.unwrap_or_else(|e| platform::error_text(&format!("#{n}: {e}"), Some(&cfg.root))));
-    }
-    Ok(out)
-}
-
 // ---------- report ----------
 
 pub fn cell(s: &str) -> String {
@@ -467,8 +375,10 @@ fn report(b: &dyn Board, cfg: &Config, raw: &Value, only: &[String]) -> Res<Stri
 
 fn inbox(b: &dyn Board, n: u64) -> Res<String> {
     let (issue, t, _) = current(b, n)?;
-    let mut out = vec![format!("#{n} {}\n{}", issue.title, b.url(n)), issue.body.trim().to_string(), format!("Folded: {}", serde_json::to_string(&t).unwrap_or_default()), "Log:".into()];
-    for e in entries(b, n)? {
+    let mut out = vec![format!("#{n} {}\n{}", issue.title, b.url(n)), issue.body.trim().to_string(), format!("Folded: {}", serde_json::to_string(&t).unwrap_or_default())];
+    let log = entries(b, n)?;
+    out.extend([format!("Revision: {}", core::revision(n, &log)), "Log:".into()]);
+    for e in log {
         out.push(format!("[{}{}] {}", e.id, if e.edited { " edited, ignored" } else { "" }, e.body.trim()));
     }
     Ok(out.join("\n\n"))
@@ -1146,6 +1056,18 @@ fn print_task(n: u64, t: &Task) {
     println!("#{n} {}", t.state.name());
 }
 
+/// § 5 receipts: JSON lines with `--json`, else the text lines; any receipt not accepted fails after all are shown.
+fn emit(rs: &[Receipt], json: bool) -> Res<()> {
+    for r in rs {
+        match (json, r.ok()) {
+            (true, _) => println!("{}", r.json()),
+            (false, true) => println!("{}", r.text()),
+            (false, false) => eprintln!("{}", r.text()),
+        }
+    }
+    if rs.iter().all(Receipt::ok) { Ok(()) } else { Err(String::new()) } // already shown: exit 1 quietly
+}
+
 fn uninstall_unit(u: &platform::Unit, root: &Path, projects: &Path) -> Res<()> {
     let registered = fs::read_to_string(projects).map_err(|e| format!("{}: {e}", projects.display()))?;
     let all: Vec<String> = registered.lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
@@ -1235,6 +1157,15 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
         task_text(cmd, text)?;
     }
     if cmd == "add" && a.flags.contains_key("later") { task_text("later", text)?; }
+    let revision = a.one("revision").map(|r| r.parse::<u64>().map_err(|_| format!("bad --revision {r}"))).transpose()?;
+    let op = Op { id: a.one("op-id").map(String::from), revision };
+    if op.id.as_deref().is_some_and(|i| i.is_empty() || i.contains(char::is_whitespace)) {
+        return Err("--op-id: one word".into());
+    }
+    let json = a.flags.contains_key("json");
+    if revision.is_some() && (cmd == "close" && a.pos.len() > 2 || cmd == "answer" && a.pos.len() > 2) {
+        return Err("--revision names one task".into());
+    }
     match cmd {
         "labels" => {
             let mut names = labels::FIXED.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -1287,7 +1218,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             }
             labels::validate(&labels)?;
             let n = b.create(title, &body, &labels)?;
-            let t = if a.flags.contains_key("later") { act(b, root, n, "later", &[], text)? } else { fold(n, &[], blocked) };
+            let t = if a.flags.contains_key("later") { act(b, root, n, "later", &[], text, &Op::default()).result()?; fold(n, &entries(b, n)?, blocked) } else { fold(n, &[], blocked) };
             poke(root);
             print_task(n, &t);
             Ok(())
@@ -1295,39 +1226,31 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
         "ask" => {
             let n = a.num(1)?;
             let body = ask_card(n, a.need("text")?, &a.all("option"), a.one("recommend"), &a.all("link"))?;
-            print_task(n, &act(b, root, n, "ask", &[], &body)?);
-            Ok(())
+            emit(&[act(b, root, n, "ask", &[], &body, &op)], json)
         }
         "answer" if a.pos.get(1).is_some_and(|p| p.contains('.')) => {
-            for line in answer_picks(b, cfg, &a.pos[1..])? {
-                println!("{line}");
-            }
-            Ok(())
+            emit(&answer_picks(b, cfg, &a.pos[1..], &op)?, json)
         }
         "answer" => {
             let n = a.num(1)?;
-            print_task(n, &act(b, root, n, "answer", &[], a.need("text")?)?);
-            Ok(())
+            emit(&[act(b, root, n, "answer", &[], a.need("text")?, &op)], json)
         }
         "result" => {
             let n = a.num(1)?;
             let sha = a.need("sha")?;
             let body = result_text(n, text, &a.all("checks"), &a.all("option"), a.one("recommend"), &a.all("link"))?;
-            print_task(n, &act(b, root, n, "result", &[sha], &body)?);
-            Ok(())
+            emit(&[act(b, root, n, "result", &[sha], &body, &op)], json)
         }
         "requeue" | "later" => {
             let n = a.num(1)?;
-            print_task(n, &act(b, root, n, cmd, &[], text)?);
-            Ok(())
+            emit(&[act(b, root, n, cmd, &[], text, &op)], json)
         }
         "steer" | "failed" => {
             let n = a.num(1)?;
-            print_task(n, &act(b, root, n, cmd, &[], a.need("text")?)?);
-            Ok(())
+            emit(&[act(b, root, n, cmd, &[], a.need("text")?, &op)], json)
         }
         "close" => {
-            let mut failed = false;
+            let mut out = vec![];
             for i in 1..a.pos.len() {
                 let n = a.num(i)?;
                 // § 7: a reviewed result closes with the verdict template; later/failed tasks and bare closes keep free text
@@ -1338,15 +1261,12 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                     Ok(_) => Ok(()),
                     Err(e) => Err(e),
                 };
-                match checked.and_then(|_| close_one(b, cfg, n, text)) {
-                    Ok(m) => println!("{m}"),
-                    Err(e) => {
-                        failed = true;
-                        println!("{}", platform::error_text(&format!("#{n}: {e}"), Some(root)));
-                    }
-                }
+                out.push(match checked {
+                    Ok(()) => close_one(b, cfg, n, text, &op),
+                    Err(e) => Receipt::rejected(n, &op, e),
+                });
             }
-            if failed { Err("some tasks were not closed".into()) } else { Ok(()) }
+            emit(&out, json)
         }
         "status" => {
             let snap = snapshot::read(b, cfg, &c.raw, &a.all("only").iter().flat_map(|x| x.split(',')).map(String::from).collect::<Vec<_>>());
@@ -1392,6 +1312,9 @@ fn main() {
         coreq::launcher::launch(&t, &args);
     }
     if let Err(e) = run(&args) {
+        if e.is_empty() {
+            std::process::exit(1);
+        }
         platform::die(&e);
     }
 }
@@ -1621,18 +1544,18 @@ mod tests {
     fn commands_write_only_accepted_entries_and_close_publishes() {
         let (b, c) = (Fake::default(), cfg());
         let n = b.create("T", "## Goal\ng", &["taskq".into()]).unwrap();
-        assert!(act(&b, &c.root, n, "steer", &[], "x").unwrap_err().contains("ready"), "steer needs a live worker");
+        assert!(act(&b, &c.root, n, "steer", &[], "x", &Op::default()).reason.contains("ready"), "steer needs a live worker");
         let before = b.comments(n).unwrap().len();
         b.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
         let a = fold(n, &entries(&b, n).unwrap(), false).attempt.unwrap();
         b.comment(n, &entry("result", &["0123456789abcdef0123456789abcdef01234567"], Some(a), "1. close: ship it ★\n2. redo the copy")).unwrap();
         assert_eq!(b.comments(n).unwrap().len(), before + 2);
         b.state.borrow_mut().publish = "pending".into();
-        assert!(close_one(&b, &c, n, "ok").unwrap_err().contains("pending"));
+        assert!(close_one(&b, &c, n, "ok", &Op::default()).reason.contains("pending"));
         assert_eq!(fold(n, &entries(&b, n).unwrap(), false).state, State::Review, "pending CI changes nothing");
         b.state.borrow_mut().publish = String::new();
-        assert!(answer_picks(&b, &c, &[format!("{n}.3")]).is_err(), "picks are checked before writing");
-        assert_eq!(answer_picks(&b, &c, &[format!("{n}.1")]).unwrap(), vec![format!("#{n} closed\nmerged 0123456789abcdef0123456789abcdef01234567")]);
+        assert!(answer_picks(&b, &c, &[format!("{n}.3")], &Op::default()).is_err(), "picks are checked before writing");
+        assert_eq!(answer_picks(&b, &c, &[format!("{n}.1")], &Op::default()).unwrap().iter().map(Receipt::text).collect::<Vec<_>>(), vec![format!("#{n} closed\nmerged 0123456789abcdef0123456789abcdef01234567")]);
         let i = b.issue(n).unwrap();
         assert!(!i.open && !i.labels.iter().any(|l| l.starts_with("q-")));
     }

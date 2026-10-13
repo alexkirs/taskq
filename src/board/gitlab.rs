@@ -162,6 +162,10 @@ impl Board for GitLab {
         self.api.call("POST", &format!("/issues/{n}/notes"), Some(json!({ "body": body })))?.json()?["id"].as_u64().ok_or("no comment id".into())
     }
 
+    fn edit_comment(&self, n: u64, id: u64, body: &str) -> Result<()> {
+        self.api.call("PUT", &format!("/issues/{n}/notes/{id}"), Some(json!({ "body": body }))).map(|_| ())
+    }
+
     fn labels(&self, n: u64, add: &[String], remove: &[String]) -> Result<()> {
         if !add.is_empty() && self.canonical_labels()? { self.ensure_labels(add)?; }
         self.api.call("PUT", &format!("/issues/{n}"), Some(json!({ "add_labels": csv(add), "remove_labels": csv(remove) })))?;

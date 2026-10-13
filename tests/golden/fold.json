@@ -217,5 +217,27 @@
    {"id": 17, "body": "taskq: spawn worker claude:s3 mac"},
    {"id": 18, "body": "taskq: ask attempt 17\nq"},
    {"id": 19, "body": "taskq: failed\nstuck"}
-  ], "expect": {"state": "failed", "card": "q"}}
+  ], "expect": {"state": "failed", "card": "q"}},
+  {"name": "two answers on one card: the first is accepted, the second is stale", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: ask attempt 10\nWhich?\n1. x\n2. y ★\nop-id: w1"},
+   {"id": 12, "body": "taskq: answer 1\nx\nop-id: pm\nrevision: 11"},
+   {"id": 13, "body": "taskq: ask attempt 10\nAnd now?\n1. a\n2. b ★"},
+   {"id": 14, "body": "taskq: answer 2\nop-id: tray\nrevision: 11\n\nignored: another write won", "edited": true}
+  ], "expect": {"state": "ask", "attempt": 10, "role": "worker", "session": "claude:s1 mac", "card": "And now?\n1. a\n2. b ★", "inbox": [12]}},
+  {"name": "a requeue with a stale revision edits itself and is ignored", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10\nTwo layouts.\n1. close with A\n2. B ★"},
+   {"id": 13, "body": "taskq: requeue\nredo\nop-id: pm\nrevision: 10\n\nignored: another write won", "edited": true}
+  ], "expect": {"state": "review", "result": "0123456789abcdef0123456789abcdef01234567", "card": "Two layouts.\n1. close with A\n2. B ★"}},
+  {"name": "text ending with a revision line and no op id is text: the entry folds unchanged", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10\nTwo layouts.\n1. close with A\n2. B ★"},
+   {"id": 13, "body": "taskq: requeue\nredo\nrevision: 10"}
+  ], "expect": {"state": "ready"}},
+  {"name": "a retried op id is ignored", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: steer\nuse y\nop-id: s1\nrevision: 10"},
+   {"id": 12, "body": "taskq: steer\nuse y\nop-id: s1\nrevision: 10"}
+  ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac", "inbox": [11]}}
 ]

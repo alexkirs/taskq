@@ -132,11 +132,14 @@ pub fn step(root: &Path, install: &Path, exe: &Path, rt: Option<&str>) {
         if a["state"] == "proposal" && rev.trim().parse::<u64>().ok() == a["rev"].as_u64() {
             answer(root, id, json!({"state": "applying", "text": a["text"], "ops": a["ops"], "effects": a["effects"]}));
             let ops = a["ops"].as_array().map_or(&[][..], |v| v);
-            let (ok, lines) = match onboard(root, &read(&dir(root).join(format!("{id}.json")))) {
-                Some(r) => apply_setup(install, exe, &r, ops, &a["effects"]),
-                None => apply(install, exe, ops),
+            let (ok, lines, receipts) = match onboard(root, &read(&dir(root).join(format!("{id}.json")))) {
+                Some(r) => {
+                    let (ok, lines) = apply_setup(install, exe, &r, ops, &a["effects"]);
+                    (ok, lines, vec![])
+                }
+                None => apply(install, exe, ops, id, a["rev"].as_u64().unwrap_or(0)),
             };
-            answer(root, id, json!({"state": if ok { "applied" } else { "apply failed" }, "text": a["text"], "ops": a["ops"], "effects": a["effects"], "readback": lines}));
+            answer(root, id, json!({"state": if ok { "applied" } else { "apply failed" }, "text": a["text"], "ops": a["ops"], "effects": a["effects"], "readback": lines, "receipts": receipts}));
         }
     }
 }
@@ -291,7 +294,19 @@ pub fn parse(text: &str, projects: &[(String, PathBuf)], onboard: Option<&Path>)
     if let Some(e) = ops.iter().find_map(|o| validate(o, projects).err()) {
         return json!({"state": "failed", "reason": format!("refused proposal: {e}")});
     }
-    json!({"state": "proposal", "text": body, "ops": ops})
+    json!({"state": "proposal", "text": body, "ops": ops.into_iter().map(|o| shown(o, projects)).collect::<Vec<_>>()})
+}
+
+/// A task op carries the task's revision from its project's `status.json` now: apply expects it (§ 4, § 5).
+fn shown(mut o: Value, projects: &[(String, PathBuf)]) -> Value {
+    o.as_object_mut().map(|m| m.remove("revision"));
+    let root = projects.iter().find(|(n, _)| Some(n.as_str()) == o["project"].as_str()).map(|(_, r)| r);
+    let s = root.map(|r| read(&crate::dot(r).join("status.json"))).unwrap_or_default();
+    let rev = s["tasks"].as_array().into_iter().flatten().find(|t| o["task"].is_u64() && t["n"] == o["task"]).and_then(|t| t["revision"].as_u64());
+    if let Some(r) = rev {
+        o["revision"] = json!(r);
+    }
+    o
 }
 
 /// The folder an onboarding request sets up: its `onboard`, else that of the request it clarifies; only an absolute,
@@ -518,6 +533,7 @@ pub fn validate(o: &Value, projects: &[(String, PathBuf)]) -> Result<Op, String>
         let v: Vec<String> = o[k].as_array().into_iter().flatten().map(|x| x.as_str().unwrap_or("").trim().to_string()).collect();
         if v.is_empty() || v.iter().any(|x| x.is_empty() || x.starts_with('-')) { Err(format!("{k}: empty or starts with '-'")) } else { Ok(v) }
     };
+    let rev: Vec<String> = o["revision"].as_u64().map(|r| vec!["--revision".into(), r.to_string()]).unwrap_or_default();
     match o["op"].as_str().unwrap_or("") {
         "focus" => {
             let labels = list("labels")?;
@@ -536,22 +552,23 @@ pub fn validate(o: &Value, projects: &[(String, PathBuf)]) -> Result<Op, String>
             Ok(Op::Board(root, a, &["ready", "waiting"]))
         }
         "answer" => match (o["option"].as_u64(), s("text")) {
-            (Some(k), _) => Ok(Op::Board(root, vec!["answer".into(), format!("{}.{k}", task()?)], ANY_BUT_ASK)),
-            (None, Ok(t)) => Ok(Op::Board(root, vec!["answer".into(), task()?, "--text".into(), t], ANY_BUT_ASK)),
+            (Some(k), _) => Ok(Op::Board(root, [vec!["answer".into(), format!("{}.{k}", task()?)], rev].concat(), ANY_BUT_ASK)),
+            (None, Ok(t)) => Ok(Op::Board(root, [vec!["answer".into(), task()?, "--text".into(), t], rev].concat(), ANY_BUT_ASK)),
             _ => Err("answer: option or text needed".into()),
         },
-        k @ ("later" | "requeue") => Ok(Op::Board(root, vec![k.into(), task()?, "--text".into(), s("text")?], if k == "later" { &["later"] } else { &["ready", "waiting"] })),
+        k @ ("later" | "requeue") => Ok(Op::Board(root, [vec![k.into(), task()?, "--text".into(), s("text")?], rev].concat(), if k == "later" { &["later"] } else { &["ready", "waiting"] })),
         k => Err(format!("op {k:?} is not allowed")),
     }
 }
 
 /// Apply ops in order; each line says what the readback showed. Local ops read their focus file back; board ops run
-/// the `taskq` command, which re-reads the board, and its `#N <state>` line must show the op (R12).
-fn apply(install: &Path, exe: &Path, ops: &[Value]) -> (bool, Vec<String>) {
+/// the `taskq` command, which re-reads the board, and its `#N <state>` line must show the op (R12). A task op runs
+/// with op id `<id>.<rev>.<k>` and `--json`: a repeated apply writes nothing twice; its receipt is kept (§ 5).
+fn apply(install: &Path, exe: &Path, ops: &[Value], id: &str, rev: u64) -> (bool, Vec<String>, Vec<Value>) {
     let ps = projects(install);
     let mut ok = true;
-    let mut lines = vec![];
-    for o in ops {
+    let (mut lines, mut receipts) = (vec![], vec![]);
+    for (k, o) in ops.iter().enumerate() {
         let name = o["project"].as_str().unwrap_or("?");
         let focus = |r: &Path| fs::read_to_string(crate::dot(r).join("focus")).unwrap_or_default().trim().to_string();
         let r: Result<String, String> = validate(o, &ps).and_then(|op| match op {
@@ -567,10 +584,23 @@ fn apply(install: &Path, exe: &Path, ops: &[Value]) -> (bool, Vec<String>) {
                 crate::resume(&r)?;
                 if !matches!(focus(&r).as_str(), "" | "off") { Ok(format!("focus {}", focus(&r))) } else { Err("focus reads off".into()) }
             }
-            Op::Board(r, args, want) => {
+            Op::Board(r, mut args, want) => {
+                let task_op = args[0] != "add";
+                if task_op {
+                    args.extend(["--json".into(), "--op-id".into(), format!("{id}.{rev}.{k}")]);
+                }
                 let out = std::process::Command::new(exe).args(&args).current_dir(&r).env("TASKQ_ROOT", &r)
                     .env_remove("TASKQ_TASK").env_remove("TASKQ_ATTEMPT").output().map_err(|e| e.to_string())?;
                 let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+                if task_op {
+                    let rc: Value = String::from_utf8_lossy(&out.stdout).lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap_or_default();
+                    receipts.push(rc.clone());
+                    return match (rc["outcome"].as_str(), rc["state"].as_str()) {
+                        (Some("accepted"), Some(st)) if want.contains(&st) => Ok(format!("#{} {st}", rc["task"])),
+                        (Some(outcome), _) => Err(format!("{outcome}: {}", rc["reason"].as_str().unwrap_or(""))),
+                        _ => Err(text.lines().next().unwrap_or("no receipt").to_string()),
+                    };
+                }
                 let seen = text.lines().find(|l| l.starts_with('#')).map(str::trim).unwrap_or("");
                 match seen.split_once(' ') {
                     Some((_, st)) if out.status.success() && want.contains(&st) => Ok(seen.to_string()),
@@ -584,7 +614,7 @@ fn apply(install: &Path, exe: &Path, ops: &[Value]) -> (bool, Vec<String>) {
             Err(e) => format!("{name}: {} failed: {e}", o["op"].as_str().unwrap_or("")),
         });
     }
-    (ok, lines)
+    (ok, lines, receipts)
 }
 
 #[cfg(test)]
@@ -707,6 +737,30 @@ mod tests {
         }
         assert_eq!(scoped(p(json!([{"op": "pause", "project": "p"}])), &Value::Null)["state"], "proposal", "a tray request keeps every op");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A6: a task op carries the revision shown in `status.json`; apply passes it with an op id and keeps the receipt.
+    #[cfg(unix)]
+    #[test]
+    fn task_ops_apply_at_the_shown_revision_and_keep_receipts() {
+        use std::os::unix::fs::PermissionsExt;
+        let (install, root) = (temp("rcpt-install"), temp("rcpt-root"));
+        fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
+        fs::create_dir_all(crate::dot(&root)).unwrap();
+        fs::write(crate::dot(&root).join("status.json"), r#"{"tasks": [{"n": 7, "state": "ask", "revision": 41}]}"#).unwrap();
+        let name = crate::project_name(&root);
+        let ps = projects(&install);
+        let reply = json!({"kind": "proposal", "text": "pick 2", "ops": [{"op": "answer", "project": name, "task": 7, "option": 2, "revision": 1}]}).to_string();
+        let a = parse(&reply, &ps, None);
+        assert_eq!(a["ops"][0]["revision"], 41, "the shown revision, not the operator's");
+        let exe = root.join("fake-taskq");
+        fs::write(&exe, "#!/bin/sh\necho \"$@\" > \"$TASKQ_ROOT/args\"\necho '{\"task\":7,\"outcome\":\"stale\",\"reason\":\"another write won; this entry is ignored\"}'\nexit 1\n").unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let (ok, lines, receipts) = apply(&install, &exe, a["ops"].as_array().unwrap(), "5", 2);
+        assert!(!ok && lines[0].ends_with("answer failed: stale: another write won; this entry is ignored"), "{lines:?}");
+        assert_eq!(receipts[0]["outcome"], "stale");
+        assert_eq!(fs::read_to_string(root.join("args")).unwrap().trim(), "answer 7.2 --revision 41 --json --op-id 5.2.0");
+        let _ = (fs::remove_dir_all(&install), fs::remove_dir_all(&root));
     }
 
     #[test]

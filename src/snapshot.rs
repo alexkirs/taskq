@@ -21,6 +21,8 @@ pub struct Row {
     pub labels: Vec<String>,
     pub url: String,
     pub task: Task,
+    /// § 2 revision: the expected `--revision` of the next command.
+    pub revision: u64,
     /// Open `Depends on` issues.
     pub deps: Vec<u64>,
     /// Text of the last trusted `failed` entry.
@@ -55,6 +57,7 @@ pub fn from_views(source: &'static str, b: &dyn Board, cfg: &Config, observed: i
         labels: v.issue.labels.clone(),
         url: b.url(v.issue.number),
         task: v.task.clone(),
+        revision: crate::core::revision(v.issue.number, &v.log),
         deps: v.open_deps.clone(),
         failed: (v.task.state == State::Failed).then(|| v.comments.iter().rev().find(|c| c.trusted && c.body.starts_with("taskq: failed")).and_then(|c| c.body.split_once('\n')).map(|x| x.1.to_string()).unwrap_or_default()),
     }).collect();
@@ -117,7 +120,7 @@ pub fn status_totals(status: &Value) -> Option<BTreeMap<&'static str, usize>> {
 
 impl Row {
     pub fn json(&self) -> Value {
-        json!({"n": self.n, "title": self.title, "state": self.task.state.name(), "labels": self.labels, "url": self.url,
+        json!({"n": self.n, "title": self.title, "state": self.task.state.name(), "labels": self.labels, "url": self.url, "revision": self.revision,
             "session": self.task.session, "attempt": self.task.attempt, "role": self.task.role, "deps": self.deps,
             "card": self.task.card, "failed": self.failed})
     }

@@ -29,6 +29,7 @@
         "p1"
       ],
       "url": "https://board/1",
+      "revision": 0,
       "session": null,
       "attempt": null,
       "role": null,
@@ -44,6 +45,7 @@
         "taskq"
       ],
       "url": "https://board/2",
+      "revision": 4,
       "session": "claude:abc mac",
       "attempt": 3,
       "role": "worker",
@@ -59,6 +61,7 @@
         "taskq"
       ],
       "url": "https://board/4",
+      "revision": 0,
       "session": null,
       "attempt": null,
       "role": null,
@@ -76,6 +79,7 @@
         "taskq"
       ],
       "url": "https://board/5",
+      "revision": 8,
       "session": null,
       "attempt": null,
       "role": null,

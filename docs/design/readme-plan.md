@@ -5,7 +5,7 @@ Decisions change in [taskq.md § Product](../../taskq.md#product) first (R13). S
 
 ## Baseline (observed 2026-10-14)
 
-- README today: header, tagline, three steps, Mix agents, link, license, donate. Defects: step 2 says `Run taskq pm`, a command § 5 does not have; the compression sentence is a v3 remnant (#633); no screenshots; no use cases; the phrases were never checked against a fresh agent session.
+- README today: header, tagline, three steps, Mix agents, link, release verification, license, donate. Defects: step 2 says `Run taskq pm`, a command § 5 does not have; the compression sentence is a v3 remnant (#633); no screenshots; no use cases; the phrases were never checked against a fresh agent session.
 - Screenshot pipeline exists: `taskq tray --snapshot DIR` writes icon PNGs and popover snapshots in both themes (§ 4) from `<install>/projects`; [tray-fixture.sh](tray-fixture.sh) is an edge-case fixture (errors, stale data, long titles), not a showcase; [evidence/4.1.9/manifest.json](evidence/4.1.9/manifest.json) is the pinning format.
 - Setup entrances ([S1](setup-and-project-locations.md#s1-two-installation-entrances-one-setup-flow)): the agent phrase is the default route; a shell install command is not published until the endpoint exists. Nothing in setup writes a PM bootstrap into the owner's project; the "daily" phrase must be verified, not assumed.
 - UI sources that change the pictures: `src/tray.rs`, `src/tray.html`, `src/icon.rs`, `docs/design/icon-summary.config.json`.
@@ -24,7 +24,7 @@ Order, top to bottom. Everything else leaves the page.
 4. **What you get**: at most six bullets, one line each, shipped behavior only (R8, R12): tasks are issues on GitHub or GitLab; the service runs as many Claude or Codex workers as you set, per computer; a worker's question waits for your answer; review accepts or sends back, close publishes the PR; the tray menu shows what needs you, pauses and resumes, shows a day's history; several computers share one board.
 5. **Screenshots**: dark theme, two popover images side by side (Home, Project) and the summary icon row, from `docs/shots/`.
 6. **Use cases**: one table `You want | Say to the manager | What happens`; rows below.
-7. **Footer**: `Agents: install, setup, commands and development are in taskq.md.`, license, donate line verbatim.
+7. **Footer**: `Agents: install, setup, commands and development are in taskq.md.`, the two release verification lines (checksum, `gh attestation verify`) verbatim, license, donate line verbatim.
 
 Mix agents becomes a use-case row; the Steps section disappears.
 
@@ -56,14 +56,14 @@ Rows the check rejects are dropped, not softened.
 
 ## taskq.md changes (before the README)
 
-Replace the Product lines `README is the whole page…`, `Steps…`, `Setup phrase…` with:
+Replace the four Product lines `README is the whole page…`, `Tagline…`, `Steps…`, `Setup phrase…` with four:
 
-- README is the whole page: header, setup phrase, one sentence, what you get, screenshots, use cases, one link to taskq.md, license, donate.
+- README is the whole page: header, setup phrase, one sentence, what you get, screenshots, use cases, one link to taskq.md, release checksum and provenance verification, license, donate.
 - Setup phrase: one `text` block, verbatim `Install taskq from https://github.com/taskqorg/taskq and set it up for this project.`; new-project variant beside it.
 - What you get and use cases list shipped behavior only; each use-case row names its UC id and a phrase checked in a fresh PM session.
 - Screenshots: dark theme from `taskq tray --snapshot` over `docs/shots/fixture.sh`; `docs/shots/manifest.json` pins version, commit and hashes; stale when a UI source changed since that commit (CI check).
 
-Net change at most +2 lines; the contract is 293 of 300.
+Net change 0 lines; the contract is at its 300-line limit, so each new line replaces one.
 
 ## Tasks
 

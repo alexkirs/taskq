@@ -1,65 +1,61 @@
-# Бриф: реализовать меню оператора taskq
+# Implement the TaskQ operator design
 
-## Результат
+Replace the current menu with the approved stable adaptive layout and a proper AI workspace. Preserve every current capability in [the inventory](current-menu-audit.md).
+This package specifies the target; it does not authorize deployment or claim backend gaps are resolved.
 
-Popover macOS/Windows по утверждённой [спеке](menu.md) и [дизайн-материалам](README.md).
-Плотный инструмент оператора: крупно, ясно, минимум лишней площади. Дизайн заново не изобретать.
-HTML — продуктовый UI через `wry`: WKWebView на macOS, WebView2 на Windows; небольшой Rust state/action bridge.
-Связь с `openai` widget удалить. Все видимые строки и доступные имена — English, как CLI/README.
-Это будущий дизайн: taskq.md остаётся runtime-контрактом до реализации и квалификации изменений.
+## Read in order
 
-## Перед реализацией
+1. `AGENTS.md`, [taskq.md](../../taskq.md), referenced specq rules.
+2. [Use cases](../use-cases/README.md), [menu](menu.md), [AI workspace](ai-workspace.md).
+3. [Visual style](visual-style.md), [square icon](icon-summary.md), [TaskQ acceptance](operator-ui.md).
+4. [Rendering contract](rendering-contract.md), [acceptance ledger/matrix](ui-acceptance.md), [report template](ui-acceptance-report.md).
+5. [4.1.9 audit](release-4.1.9-ui-audit.md), [Current implementation inventory](current-menu-audit.md), [candidate](final-menu.html), [verification](verification.md).
 
-1. Прочитать `AGENTS.md`, [taskq.md](../../taskq.md), [принципы](operator-ui.md), [меню](menu.md), оба HTML-макета, [проверки](verification.md).
-2. Проверить актуальный код: `src/tray.rs`, service/status/focus/list/update в `src/main.rs`, запись `status.json`, запуск агентов и OS-unit.
-3. Составить матрицу: требование M/D → есть / частично / нет → нужный контракт/данные → проверка. Отдельно сохранить весь набор M9.
-4. Применить решения ниже; не открывать их заново. Проверить зависимости этапов и обновить требуемые контракты по R13 до кода.
-5. Единственный открытый вопрос владельцу: точный маркер старого проекта — считать ли `taskq.json` + неуспешный `selftest` достаточным? Это предложение M8, не принятая эвристика. Новые отклонения от утверждённого дизайна требуют согласования.
+Use `final-prototype.html` as editable design source and `final-menu.html` as its standalone preview. Older menu/icon studies are historical; the square geometry supersedes the wide strip.
+The candidate is a simulation: marked placeholder actions and mock receipts are not backend adapters.
 
-Матрица описывает недостающую реализацию и доказательства; принятые решения повторно согласовывать не нужно.
+## Approved direction
 
-## Принятые решения
+- Fixed view/admission/pause/Controls strip, attention-first content, pinned/recent project access.
+- Flowing issue/title rows, nonzero symbol counters, board links in headers, verified local session links and remote-host indicators.
+- One shared Work mode editor; per-project/host/runtime limits, explicit change targets, mixed values preserved.
+- Short AI composer with attachments; one main workspace with Conversations and Work sessions. Explicit detached conversations; reopen raises the existing owner window.
+- System type, restrained palette, consistent icons; compact q and fixed two-level square summary.
 
-| Область | Решение |
-|---|---|
-| Scope | Один tray на host, install/projects registry без сканирования папок. Наблюдение — установленный сервис с focus `off`; ARM — focus + host-фильтр, отдельного PM-фильтра нет (M2) |
-| Агрегация | Данные досок через сервис, дедупликация, свежесть/неполнота; UI без токенов и прямого доступа к доске |
-| История | Локальный кэш сервиса `<root>/.taskq/events`: время, task, kind `close\|failed`, attempt ID как event ID, не отдельное поле; без board replay. Показывать начало сбора и incomplete, неизвестность никогда не ноль; текущий failed отдельно (M6) |
-| Просьба | Целевой `taskq service focus ... --request "..."` сохраняет оригинал для `You asked`; `We understood` из подтверждённых параметров, `Now applied` из readback (M4) |
-| AI | M7 только на этапе 4, отдельное изменение контракта R3/R9: роль, разрешённые runtime/permissions, транспорт, проверяемые операции, подтверждение, stale/retry, восстановление запроса |
-| Хранение | Настройки/черновик/история запроса и незавершённая работа этапа 4 без второй очереди или локальной истины, конфликтующей с R1 |
-| Приём | Сохранение прежнего focus; `Resume` при потере focus просит labels, никогда не включает `all` автоматически (M5) |
-| Обслуживание | Per-project сервисы/OS-unit, один общий tray, общие install-ресурсы, сохранность попыток/соседних проектов. `Update now` только по проверенной новой версии `status.json`, запись `<root>/.taskq/update`, штатный §8 update с readback (M9) |
-| Платформы | Popover/wry + Rust state/action bridge, без `openai` widget. Windows только compact q, Summary и chooser M1 скрыты; macOS summary 22 pt / digits 12 pt / graph 7 pt, одинаковая геометрия при паузе — утверждённое отклонение от 47×29 px (M1) |
-| Add project | Кнопка секции проектов → OS folder picker. Нет config/пусто → новый onboarding; нет config/есть файлы → существующий onboarding; config+selftest PASS → registry и предложение service install; config+selftest FAIL/старый формат → диагностика и §9, без автоматического cutover (M10) |
-| Onboarding | Весь Add project (picker, классификация, регистрация, предложение установки, §6 разговор внутри меню) — AI-этап 4; точные внешние эффекты подтверждаются до применения, файлы/ownership сохраняются. Терминал/clipboard не являются временным UX; на этапах 1–3 Add project недоступно с причиной |
+## Plan with the owner before runtime work
 
-Исходные наблюдения, перепроверить: текущий tray работает per-project из `status.json`; есть реестр проектов и focus/status-фильтры. Целевой один host tray, events, `--request`, update-флаг и AI-поток требуют реализации. M8 фиксирует решения и единственный вопрос, не гарантирует состояние кода.
+- Resolve remaining C3/C4/C7 choices: attachment support/budgets, retention/deletion, cancellation, operator concurrency and interrupted delivery.
+- Resolve UC Q1/Q3–Q6: PM direct actions, precise focus, cross-project priority, multi-repo environment and dependency-plan operations.
+- Resolve empty-install AI bootstrap and emergency stop. Preserve current authority until contracts change.
+- Resolve I5: overflow/unknown, bins and native Windows legibility. Do not copy exploratory shrinking.
+- Confirm the shortlist/recent/attention caps before hardcoding them. Overall layout is approved.
 
-## Этапы
+Counters: implement [K-A1–K-A6](task-counters.md), including authoritative Closed totals.
+Permissions: discuss [P1–P9](worker-permissions.md) before changing R9; reconcile newer #865/#866 upstream changes. The settings candidate grants nothing.
 
-- Правки решений — сначала контракт R13 и затронутая спека; затем реализация и тесты.
-- Этап 1: registry, один host tray, данные/focus/`--request`/readback и модель состояний; Rust state/action bridge и владение ресурсами.
-- Этап 2: сквозной срез сервис → платформенный значок → HTML popover → проекты/задачи → прямые ссылки; свежесть, ошибки, настройки вида/шрифта, English UI.
-- Этап 3: pause/resume с выбором labels при потере focus, локальный cadence, обслуживание M9 и update-флаг; подтвердить изоляцию проектов.
-- Этап 4: отдельное изменение R3/R9; AI-ввод, история, уточнение/подтверждение, применение/readback, восстановление и весь `Add project`/onboarding §6 внутри меню, включая picker, классификацию, регистрацию и предложение установки. Этапы 1–3 не реализуют M7, Add project или обходной terminal/clipboard onboarding.
-- Порядок уточнить по зависимостям; этап не означает разрешение молча вычеркнуть остальные функции.
+## Delivery slices
 
-## Визуальный источник
+| Slice | Deliverable | Proof |
+|---|---|---|
+| Contracts/data | Conversation/request/attachment identity, operation receipts, attempt metadata and URL allowlist | Executable state traces, retry/stale/partial outcomes |
+| Navigation | Stable menu, attention, flowing rows, settings categories and current-function parity | M-A1–M-A21 plus inventory reconciliation |
+| AI workspace | Conversation routing, drafts, windows, attachments, history and work-session browser | C-A1–C-A10; no cross-conversation context leaks |
+| Work mode | One editor plus natural-language review under approved filter semantics | UC-04/UC-05; untouched fields preserved |
+| Tray assets | Calibrated q/summary rendering and pause states | I5 native sheets; overflow decisions |
+| Qualification | Both OSes, accessibility, large type, short windows, live service round trips | Evidence per platform/artifact SHA, limitations explicit |
 
-- Структура меню — `menu-prototype.html`; финальные значки — **`icon-studies.html`**. Старые значки из меню не переносить.
-- macOS-сводка: «Единая полоса», 22 pt всего, цифры 12 pt над пропорциональными составными барами 7 pt; active без q/▶. Windows — только компактная q, без chooser M1.
-- Общая пауза: те же данные/геометрия в сером; компактная q с Ⅱ строго по центру. Не отдельная кнопка паузы.
-- Высота macOS 22 pt утверждена вместо исходных 47×29 px; многозначные числа расширяют ширину, не уменьшают текст. Проверить темы, масштаб и OS-ограничения; новые отклонения обсудить.
-- Тестовые данные макетов не считать состоянием реальных issues. Production-assets, встраивание HTML в wry и Rust bridge предстоит сделать.
+Keep runtime changes and tests with their contract amendment. Lifecycle changes follow the executable behavioral model. Do not weaken checks to match a mock.
+Readback, window reopening and service updates must not duplicate writes or agent launches. Preserve dirty work and unrelated project registrations.
 
-## Приёмка и передача
+## Review handoff
 
-- Покрыть D-A1–D-A8 и M-A1–M-A14; доказательство и оставшиеся ограничения записать в `verification.md`. M-A7/M-A8/M-A13 и весь M-A14 требуют этапа 4.
-- Проверки макетов: `node docs/design/menu-prototype.test.cjs`, `node docs/design/icon-studies.test.cjs`.
-- Проверки проекта: `cargo test --locked`, `cargo run -- selftest`; соблюдать репозиторный launcher и §7.
-- Lifecycle-изменения: таблица → golden traces → fold → adapters по executable behavioral model.
-- Нативно проверить обе ОС: 1:1, темы, масштаб, длинные названия, крупный шрифт, клавиатуру/скринридер, pause/mixed/stale, несколько проектов, отказ AI и повтор подтверждения.
-- Показать пользователю реальные экраны и сквозные действия. Отдельно отметить mocks, непроверенные платформы и недостающие функции; не объявлять их готовыми.
+Builder fills every acceptance-ledger row and pins reference/artifact/fixture hashes. Reviewer reproduces deviations, then polishes shared causes. Preserve Resources, incidents/consent and navigation recovery from 4.1.9. Owner decides design changes; no repeated approval for matching existing requirements. Fail and Not tested remain open.
 
-Этот бриф не разрешает менять model/permissions, развёртывать сервис или публиковать релиз. R1/R9/R10/R11/R12/R13 сохраняются.
+## Commands
+
+- Design model: `node docs/design/final-prototype.test.cjs`.
+- Rebuild preview: `python3 <visualize-skill>/scripts/render.py <repo>/docs/design/final-prototype.html <repo>/docs/design/final-menu.html --force`.
+- Existing tests remain relevant to existing behavior, not proof of the new layout.
+- Runtime implementation: required `cargo test --locked` and `cargo run -- selftest`, plus focused adapter/native checks. Follow repository launcher instructions.
+
+Report implemented, tested, published and deployed separately. All project content is English; general rules evolve in specq, TaskQ decisions here.

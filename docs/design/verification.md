@@ -1,5 +1,39 @@
 # Operator menu verification
 
+## Rendering fidelity and released UI audit · 2026-10-13
+
+- Added shared F1–F6 in specq; TaskQ [R-UI1–R-UI6](rendering-contract.md), [acceptance ledger/matrix](ui-acceptance.md), report template and deterministic expected fixtures. Shared changes are local, not published.
+- Human confirmed by owner: Ask, waiting for a human answer. Updated counter contract.
+- Audited released 4.1.9 source and isolated native Mac snapshots; [findings and evidence](release-4.1.9-ui-audit.md). Ask-only fixture proves missing Ask bars in summary. Preserved useful Resources, incident consent and Back recovery in the target ledger.
+- Snapshot sizing differs from live opening. No native Windows, live-popup sizing, keyboard or temporal-motion qualification. Fractional geometry is source evidence, not a recorded animation diagnosis.
+- Fixture JSON/arithmetic, local file links, both repository whitespace checks and specq lint passed. taskq.md remains 300 lines.
+- Documentation/evidence only in this revision; no runtime patch, production restart, permission change, commit or push. Cargo suites not rerun. Pending I5 and rolling-bin proposals remain explicit.
+
+## Counters and permissions candidate · 2026-10-13
+
+- Added [counter semantics](task-counters.md), [permission proposal](worker-permissions.md), UC-08 and linked contract-amendment targets. Existing R9 runtime defaults unchanged.
+- Read #865 comments and upstream Folders text; findings are reported evidence, not a fresh TCC reproduction. Inspected local runtime launch and CLI help (Codex 0.159.3, Claude 2.1.296); official documentation linked in the proposal.
+- Node model PASS: prior conversation checks plus provider/server/repository/issue deduplication, disjoint lifecycle counts and reopened Closed removal. Coherent fixtures only; freshness/conflicting snapshots and board pagination require backend tests.
+- Browser inspected: dark 16 px compact all-state strip and quiet Closed; light 320 px/20 px Closed navigation and permissions review. Fixed flex-shrinking header overlap revealed by long lists. Root client/scroll width both 288 px.
+- Permission UI: Full sets unrestricted runtime network, identifies absent isolation; review names host/runtime and new-attempt effect. Confirmation explicitly reports simulation. No policy files, services or permission grants changed.
+- Node checks, local links, 300-line contract cap, both repo whitespace checks and specq lint passed. No runtime/Cargo/native-security qualification claimed.
+
+## Final candidate · 2026-10-13
+
+Sources: [candidate](final-prototype.html), [AI contract](ai-workspace.md), [implementation inventory](current-menu-audit.md).
+
+- Installed 4.1.8 native fixture snapshots inspected: dark home/16 px, light project/16 px. Isolated TASKQ_INSTALL; no live service mutation. Source inventory at `cfae06708776d252d52f31510afed6b47918cee6`; installed/source mismatch recorded.
+- `node docs/design/final-prototype.test.cjs`: PASS. Conversation/revision isolation, duplicate confirmation refusal, local-session eligibility, detach/reopen/reattach ownership.
+- Browser candidate inspected at 1024 px in light/dark. Narrow 320 px with 20 px type: root client/scroll width both 288 px; no horizontal overflow. Fixed responsive grid minimum and theme controls after visual review.
+- Browser interactions: narrow conversation list opens/selects; draft survives hide/reopen; detached ownership retained; supported-change confirmation produces a receipt and removes Confirm. Work sessions distinguish local links, remote host without link, historical attempts.
+- Rebuilt standalone from fragment. TaskQ contract remains 300 lines. Local documentation links and whitespace checked.
+
+Limits: candidate only. Files select metadata; uploads, native windows, service writes and agent launches are simulated. Browser layout/model checks do not qualify OS tray pixels, Windows DPR1, screen readers, crash recovery, attachment security or live backend contracts. No runtime code changed; Cargo regression suites were not rerun for this documentation/prototype package.
+
+## Historical package evidence
+
+The records below qualify their named artifacts/releases only. They do not override the current candidate or establish its native acceptance.
+
 Sources: [menu-prototype.html](menu-prototype.html), [icon-studies.html](icon-studies.html).
 Requirements: [operator-ui.md](operator-ui.md), [menu.md](menu.md).
 Phase 0 records the approved design target; it does not implement a service adapter, native popover or AI channel.

@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "purpose": "Synthetic expected inputs and outcomes; not runtime proof",
+  "series": ["closed", "failed", "ask", "waiting"],
+  "range": {"start": 0, "end": 120, "bins": 12, "semantics": "half-open"},
+  "histograms": [
+    {"id":"equal-separated", "bins":[[3,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,3,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,3,0],[0,0,0,0],[0,0,0,3]], "totals":[3,3,3,3], "peak":3},
+    {"id":"equal-stack", "bins":[[3,3,3,3],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[3,3,3,3]], "totals":[6,6,6,6], "peak":12},
+    {"id":"ask-only", "bins":[[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,3,0]], "totals":[0,0,3,0], "peak":3}
+  ],
+  "heightCases": [
+    {"id":"fits", "naturalOuter":599, "availableOuter":600, "chrome":0, "header":80, "footer":40, "outer":599, "viewport":479, "scroll":false},
+    {"id":"exact", "naturalOuter":600, "availableOuter":600, "chrome":0, "header":80, "footer":40, "outer":600, "viewport":480, "scroll":false},
+    {"id":"overflow", "naturalOuter":601, "availableOuter":600, "chrome":0, "header":80, "footer":40, "outer":600, "viewport":480, "scroll":true},
+    {"id":"collapse", "naturalOuter":320, "availableOuter":600, "chrome":0, "header":80, "footer":40, "outer":320, "viewport":200, "scroll":false}
+  ],
+  "rasterCases": [
+    {"width":37,"bins":12,"gap":1,"bar":2,"plotWidth":35,"innerRemainder":2},
+    {"width":20,"bins":6,"gap":1,"bar":2,"plotWidth":17,"innerRemainder":3},
+    {"width":10,"bins":12,"gap":1,"supported":false}
+  ]
+}

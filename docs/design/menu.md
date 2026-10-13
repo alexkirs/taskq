@@ -1,166 +1,153 @@
-# Меню оператора taskq
+# TaskQ operator menu
 
-Целевое поведение; не выпущенная функция. [Контракт](../../taskq.md#product) · [Общие принципы](operator-ui.md).
-Очередь, полномочия и публикация подчиняются taskq.md. Макет не управляет сервисом.
+Approved layout; unimplemented capabilities remain design targets. Runtime follows [taskq.md](../../taskq.md).
+[Shared principles](https://github.com/taskqorg/specq/blob/main/design/operator-ui.md) · [Visual style](visual-style.md) · [TaskQ checks](operator-ui.md) · [AI workspace](ai-workspace.md).
 
-## M1 Вид
+## M1 Appearance
 
-- Первый запуск: q с ▶/Ⅱ, без `?`. macOS: `Icon / Summary` с превью; выбор немедленный, сохраняется. Windows: только компактная q; сводка и выбор M1 скрыты — согласованное ограничение платформы.
-- Сводка: работа (`doing + review`), ответы (`ask`), готовы (`ready`); под цифрами cadence на всю ширину. Без q и ▶. Общая пауза: тот же блок в сером, поверх — компактная q с Ⅱ по центру; числа/история остаются.
-- Работа мятная, ответы персиковые, готовы серые, failed красные. ▶ зелёный, Ⅱ серый.
-- Неизвестное — `—` с причиной; неполная сумма помечена. Ошибка сервиса ≠ failed ≠ пауза.
-- Меню: 16 px; настройка 14/16/18/20. Второстепенный ≥12 px и ≥0.85 основного. Значок независим.
-- Ориентиры: меню 320 px при 16 px, строка 31–34 px; крупный текст расширяет/увеличивает строки. Сенсорная цель ≥44 px.
-- Выбран вариант «Плотные»: угловатая q, составные бары. macOS: «Единая полоса» во всю высоту строки меню (22 pt; на экранах с вырезом 33 pt — тот же рисунок 22 pt, увеличенный до высоты строки), ширина — три числа по ширине начертания с зазором 4 pt, без минимальной ширины, цифры 12 pt, график 7 pt на всю ширину; остальная высота — внутренние интервалы. Это утверждённое отклонение от исследования 47×29 px. Маленькая q — с крупным центрированным ▶/Ⅱ. При работе сводка без наложений. При общей паузе — тот же рисунок без изменения данных/геометрии, только серый; поверх — та же угловатая q с Ⅱ, что в компактном виде, строго по центру всего значка; отдельную кнопку/другой символ паузы не рисовать; точные значения/статусы доступны в меню. Частичная пауза не обесцвечивает весь блок; её область показана в меню.
-- Многозначные числа расширяют блок по ширине, не уменьшают текст и не меняют высоту.
-- Три числа выравниваются по краям начертания (из таблицы сегментов), не по ячейкам цифр: левое — к левому краю, правое — к правому, среднее — центром начертания по центру значка.
-- Renderer: popover через `wry`, WKWebView на macOS и WebView2 на Windows; HTML — продуктовый UI, небольшой Rust bridge передаёт state/action. Связь с `openai` widget удалить. Все видимые строки и доступные имена — English, как CLI/README; язык этой спецификации не язык продукта.
+- Start compact. Show Icon / Summary together on supported platforms; apply immediately and persist. Preserve the current Windows compact-only runtime until square rendering is qualified.
+- Fixed top strip: view, named host, admission state, icon-only pause/resume and Controls. Mixed/unknown state must remain explicit.
+- Summary: fixed two-level square under [I1–I5](icon-summary.md); work = doing + review, answers = ask, ready = ready, cadence in the fourth cell. No active q/play overlay.
+- Pause keeps the same gray data and geometry with the existing compact q/pause centered. Partial pause is not full grayscale.
+- Work is mint, questions peach, ready neutral, failures muted red. Unknown is explicit with cause; incomplete sums remain marked.
+- Menu font options 14/16/18/20, default 16; typography and bounded-window behavior follow visual-style.md. Icon sizing is independent.
+- HTML popover in wry (WKWebView/WebView2) with a Rust state/action bridge; no OpenAI widget dependency in production. Product content is English under R7.
+- Overflow, unknown icon representation, bin count and Windows legibility remain I5 decisions, not permission to shrink arbitrarily.
 
-## M2 Scope и проекты
+## M2 Scope and projects
 
-- Один tray на host читает install/projects registry. Меню: только явно зарегистрированные проекты; папки не сканировать. Отдельного PM-фильтра нет.
-- Наблюдение: установленный сервис с focus `off`. ARM-исполнение: сохранённый focus и host-фильтр; наблюдение само по себе не разрешает приём.
-- Счётчики описывают наблюдаемые доски; focus ограничивает приём, а не скрывает задачи. В меню отдельно видны фактический focus и ограничения хоста.
-- Задачи считаются по доскам, режим приёма — по этому хосту. Наблюдение не разрешает исполнение.
-- Дедупликация: провайдер + сервер + репозиторий + issue. Порядок проектов — подтверждённый список registry.
-- Пауза/пустота не скрывает выбранный проект; пустые группы скрыты. Настройки вида не меняют scope.
+- One tray per host reads the registered-project list. Never discover projects by scanning folders.
+- Observation does not grant admission. Focus plus host constraints determines eligibility; counters still describe observed boards.
+- Deduplicate tasks by provider, server, repository and issue. A project shortcut is not a scope filter.
+- Home shows pinned and recent projects; All opens a searchable complete list. Initial visible count and recent ranking follow the proposals in adaptive-menu.md.
+- Preserve pin order. Do not reorder under pointer or keyboard focus. Pause/empty state does not remove registration or pins.
+- Attention includes every observed project, including those outside the shortlist. Missing/stale data remains unknown.
 
-## M3 Навигация
+Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.md). Aggregate strip sits immediately above Projects; project strips use the same order.
 
-Главный уровень: вид (macOS) → AI (этап 4) → scope → вопросы/failed → проекты и `Add project` → график/пауза/текст → Agents → сервис → версия/хост.
+## M3 Navigation and tasks
 
-- Проект: имя слева, группа счётчиков справа, стрелка вплотную. Порядок меток: работа / ответы / готовы.
-- Ненулевой счётчик — цветная круглая метка с числом; ноль — нейтральный. Многозначный — капсула.
-- Общие вопросы/failed используют ту же метку справа; не отдельное число посередине строки.
-- Проект открывается на том же месте; «Назад» возвращает позицию списка.
-- В проекте: короткий scope/режим; группы вопросы → failed → работа → готовы → зависимости → отложены.
-- Задача: символ + `#номер` + название, вся строка — issue-ссылка. В общем списке добавить проект. PR — дополнительная ссылка, если известен.
-- Длинное название: ellipsis с полным доступным текстом; на узком экране/крупном шрифте допустим перенос названия.
-- Доска, лог, папка, приём и сервис принадлежат явно названному проекту. Длинный список прокручивается по высоте.
-- `Agents` — уровень хоста, только чтение: строка на runtime (`taskq agents`, taskq.md § 5) `<runtime> <version> · <account>` или `· not logged in` / `· not installed` / `· login unknown`; источник — свежайший `status.json` (`agents`, проба не чаще раза в 5 минут), в заголовке возраст пробы; нет данных — unknown, не пусто. Проверка: `tray-fixture.sh` + `taskq tray --snapshot` (раскрывает Agents). Windows: те же строки, `claude`/`codex` ищутся как `.exe`/`.cmd` на `PATH` сервиса; та же проверка snapshot на Windows, до неё — unknown (R12).
-- Unicode помогает сканированию: `↳` scope, `!` failed, `↗` внешняя ссылка, `↶` история, `⚙` сервис. Не дублировать иконкой каждое слово.
+- Home: fixed controls, Work mode, Attention, short AI composer with attachments, project shortcuts, Settings and AI workspace access.
+- Attention contains decisions, failed tasks and actionable service/admission problems under [A2](adaptive-menu.md#a2-explain-the-queue). Ordinary waits remain neutral.
+- Project header: Back, name, Board link and compact nonzero counters. Add is a plus in the Projects header.
+- Task row: state symbol, board-provider mark, linked issue number, known execution host and title in one flow. Global rows also identify project. Long titles wrap from the block left edge.
+- Main task target opens the issue. Local agent session and known PR links are separate controls; no nested links or double navigation.
+- Codex/Claude marks identify the recorded runtime; codex-app uses Codex identity. Missing permalink: unavailable with reason. Remote: network + host, no fabricated local session link.
+- Task detail preserves question, failure, work, ready, dependency and later access. Board links remain near the project name.
+- Back restores list/scroll position. Service, log, folder and admission controls always identify project/host.
+- Current Agents is host-level, read-only: version/account or not installed/not logged in/unknown, plus probe age. Include disabled runtimes such as codex-app where reported.
 
-## M4 Просьба и применение
+## M4 Request, interpretation and applied state
 
-- `You asked` — исходный текст, сохранённый через целевой `taskq service focus ... --request "..."`. Нет текста — сказать; не восстанавливать выдумкой. Этот флаг требует изменения контракта при реализации.
-- `We understood` — фраза из подтверждённых параметров и версии. Отдельная копия фразы не нужна.
-- `Now applied` — фактические настройки, свежесть, расхождения. Пауза не переписывает намерение.
-- Точные фильтры раскрываются. Неоднозначность/расширение scope — уточнить. Изменение доступно в меню, без внешнего агента.
+- You asked: original text from `service focus --request`; missing text says not recorded.
+- We understood: short phrase derived from confirmed parameters and revision; do not maintain a divergent copy.
+- Now applied: actual settings, freshness and differences. Pause preserves intent.
+- Exact filters remain inspectable. Unsupported or ambiguous intent requires clarification; do not silently broaden scope.
+- Natural-language matching and future-arrival policy require [UC-05/Q3](../use-cases/README.md#q3-accurate-natural-language-focus).
 
-## M5 Приём и сервис
+## M5 Admission and lifecycle
 
-- Маленькая q: ▶ при приёме хотя бы в одном проекте; Ⅱ при общей паузе. Сводка: цветная без символа при приёме, серая с компактной q с Ⅱ по центру при общей паузе. Смешанное: «На паузе N из M».
-- Только наблюдение — отдельная подпись, не ▶. Наблюдаемые проекты не входят в M.
-- Пауза завершает текущие, новых не берёт. `Resume` восстанавливает focus; если он потерян, просит выбрать labels, никогда не включает `all` автоматически.
-- Общая команда называет проекты; команда проекта затрагивает только его.
-- Перезапуск ≠ пауза. Выход: остановить указанные сервисы/трей до логина, автозапуск сохранить.
-- Удаление: подменю «Подтвердить удаление <проекта>», без диалога. Снять его OS-unit; не трогать рабочие файлы/соседние проекты.
-- Общие install-ресурсы удалять только без оставшихся пользователей. Сохранность попыток — R11.
-- Недоступное действие объяснить. Успех — после readback, не после нажатия.
-- `Resources` (уровень хоста, рядом с сервисом): btop в отдельном небольшом окне OS-терминала (Terminal.app; Windows: conhost) — перемещается, меняет размер, закрывается; закрытие окна завершает btop; меню и сервис не затронуты. Встроенного эмулятора нет. Нет btop — сначала установить пакетом ОС (`brew install btop`; winget `aristocratos.btop4win`) с видимым выводом в том же окне, без повышения прав, затем запустить; нет менеджера пакетов — одна строка с причиной.
+- Compact q shows play when at least one project admits; pause for a fully paused admission set. Observation-only is distinct. Mixed shows paused N of M, excluding observation-only projects.
+- Pause stops new admission; current attempts finish. Resume restores saved focus; missing saved focus requires selection, never implicit all.
+- Global commands name affected projects/host and unchanged targets before apply. Per-project actions affect only that project.
+- Show pending, applied, partial failure and unknown separately; confirm application by readback.
+- Restart, pause and stop until next login have distinct effects. Stop preserves autostart; expose active-work consequences before use.
+- Uninstall uses a nested confirmation naming the project, removes its service unit and preserves project files and other registrations. Remove shared install resources only when no consumer remains. R11 applies.
+- Emergency termination of running attempts is not defined by Pause; keep it an explicit open contract decision.
 
 ## M6 Cadence
 
-- Четыре серии снизу вверх: закрытия зелёные, переходы в failed красные, в ask персиковые, в waiting серые. Не CPU и не текущая занятость. Источник — локальный кэш сервиса `<root>/.taskq/events`: время, task, kind (`close|failed|ask|blocked`), attempt ID (для ask/blocked без attempt — ID комментария) как event ID, не отдельный идентификатор. Tray читает кэш; board replay для истории не выполняется.
-- Равные интервалы, старые слева. Дедупликация по ID; повторный failed после requeue — новое событие.
-- Текущий failed в меню независим от истории. Период не меняет scope.
-- По умолчанию 24 часа; выбор 5 минут / час / день / 7 дней / 30 дней / свой.
-- Свой: начало < конец, явная временная зона, диапазон [начало, конец). Выбор сохраняется.
-- Общая линейная шкала для всех четырёх серий и всех интервалов; высота сегмента = количество × один коэффициент. 3 события любого вида имеют равную высоту.
-- Пик суммы задаёт масштаб составных баров. Не растягивать каждый бар до 100% и не увеличивать только красный сегмент.
-- При нехватке пикселей точные числа доступны в меню; отсутствие различимого сегмента не означает ноль. Пик/итоги доступны.
-- При визуальной приёмке fixture содержит ненулевые первый и последний бары: проверяем общие видимые края. В реальных данных нулевые края не заполнять искусственно.
-- Нет истории ≠ ноль. Показывать дату начала сбора; диапазон до неё и пропуски — incomplete, никогда не ноль. Кэш не является истиной жизненного цикла (R1); его потеря означает неполноту, не восстановление выдуманной истории.
+- Four series bottom to top: close, failed, ask, blocked; event history, not CPU or current concurrency.
+- Source: service-local `.taskq/events` cache; event time, task, kind and attempt ID (or comment ID for ask/blocked without attempt). Deduplicate IDs. Repeated failure after requeue is a new event.
+- No board replay. Cache loss means incomplete history; show collection start and gaps. Unknown is not zero.
+- Equal time bins, oldest left; one linear scale across series and bins. Equal counts have equal heights; scale by the largest stacked sum, never 100% per bar.
+- Default 24 hours; presets 5 min/hour/day/7 days/30 days/custom. Custom start < end, explicit timezone and half-open range [start,end); persist choice.
+- Period never changes scope or the current failed count. Expose precise totals/peak when small segments cannot resolve.
+- Acceptance fixtures have nonzero first/last bars; real zero edges stay empty. Runtime 12 bins remains until I4 rebinning is approved.
 
-## M7 AI и запросы
+## M7 AI entry
 
-- Clarify chain: oldest first; input and a visible Reply button directly under the newest question; placeholder `Answer…` while clarify is open.
+- Menu composer shows target context, Attach, History/commands and Send. File/image drag/drop works here and in the workspace once the attachment contract is implemented.
+- Send opens or raises the main AI workspace. One main window plus explicit detached conversations; reopening raises the existing owner window. Full conversation design: [C1–C8](ai-workspace.md).
+- Conversations, work sessions and command history are separate collections. A selected conversation gets the reply; never route by newest request.
+- Menu shows compact active/pending status; full replies, change review and readback stay in the workspace. Closing menu/window does not cancel work.
+- History: last 20 distinct sent nonempty texts, newest first; selecting fills only. Clear affects command history, not conversations/drafts/results.
+- Suggested commands and recent requests share the small history control. No full-width example button.
+- Read requests return evidence. Changes show allowlisted operations, targets and effects before revision-bound confirmation. No arbitrary model shell execution or silent permission change.
+- Success requires readback; partial/unknown results are explicit. Working tasks use the board lifecycle, not a second queue. AI failure is not failed-task count.
+- Current request/operator protocol remains §4; attachments, durable conversations, session browsing and cancellation require explicit contract/data extensions before runtime implementation.
 
-- Только этап 4: отдельное изменение контракта R3/R9 для роли AI и разрешённого runtime/permissions. Этапы 1–3 AI не реализуют. Будущий транспорт/хранение запроса утверждается в этом изменении без второй очереди задач (R1).
-- Свободный текст в меню; контекст проектов виден до отправки. Сервис запускает доступный разрешённый runtime; R9 сохраняется.
-- Рядом с вводом — небольшая кнопка `↶` с доступным именем «История и команды»; большой кнопки «Пример scope» нет.
-- Раскрытие: «Недавние» и «Готовые команды». Первые — запросы пользователя; вторые — частые рабочие действия продукта.
-- Выбор только подставляет текст. Можно править; отправка отдельная. История никогда не повторяет действие автоматически.
-- История локальная: последние 20 отправленных непустых запросов, новые сверху, одинаковый текст переносится наверх. Сохраняется; «Очистить историю» удаляет её, не черновик и не результаты.
-- Читать — сразу ответить. Изменять — показать операции/проекты/последствия, затем подтвердить или уточнить.
-- Контракт ответа: результат / уточнение / предложение / отказ с причиной. Неоднозначный scope не расширять.
-- Подтверждение привязано к request ID и версии. Изменённый текст/устаревшее предложение требуют нового ответа. Повтор не применяет дважды.
-- Сервис валидирует разрешённые операции; произвольный shell модели не исполняется. «Применено» только после readback.
-- Рабочая задача идёт на обычную доску/очередь. Второй жизненный цикл не создавать.
-- Закрытие меню не отменяет работу. Черновик, прогресс, результат и подтверждение сохраняются.
-- Статусы: очередь / работает / нужен ответ / подтверждение / готово / не удалось. Нет агента/связи — причина, запрос сохранён.
-- Ошибка AI не увеличивает failed задач. Хранение/транспорт согласовать с R1 до реализации.
+## M8 Implementation boundary
 
-## M8 Решения и границы реализации
+- Installed/source inventory: [current-menu-audit.md](current-menu-audit.md). Historical phase numbers are not evidence that features are absent.
+- Preserve all existing functions while replacing layout. Shared tray aggregates current per-project data; service ownership follows the current runtime contract.
+- Add project is implemented in the current contract; new AI-window placement changes its presentation, not setup safeguards.
+- Old-project marker: taskq.json with failing selftest, accepted in #766. Diagnose before any cutover; do not overwrite existing configuration.
+- Native accessibility and rendering require platform evidence; HTML tests alone are insufficient.
 
-Выбраны popover/wry и Rust state/action bridge (M1), English UI, Windows compact-only и macOS 22 pt,
-один tray на host с registry без PM-фильтра (M2), локальные events без board replay (M6), сохранение
-`--request` (M4), выбор labels при потерянном focus (M5), update-флаг (M9), AI отдельным этапом 4 (M7).
-Существующие per-project сервисы и OS-unit остаются владельцами исполнения; общий tray агрегирует их данные.
-Доступность проверяется по D-A6 на обеих ОС; HTML сам по себе не доказывает нативную доступность.
-Это утверждённый дизайн, не наличие кода: status/events/bridge и изменения команд требуют контрактов и проверок при реализации.
-Решение владельца (#766): маркер старого проекта для M10/§9 — `taskq.json` + неуспешный `selftest`; меню показывает проверенную причину и указатель на §9. Этап 4 разделён: AI-запросы (M7) в #766, `Add project` (M10) — отдельная задача. `Add project` реализован в #809 по taskq.md §4: разговор §6 ведёт operator, сервис выполняет одну проверенную операцию `setup` после подтверждения списка эффектов.
+Native sizing, scroll ownership and cadence rendering follow [R-UI1–R-UI6](rendering-contract.md).
 
-## M9 Перенос текущего трея
+## M9 Settings and maintenance
 
-Основание: скриншот v4.0.10, `src/tray.rs`. Полезные действия сохраняются.
-
-| Сейчас | Новое место |
-|---|---|
-| Версия/хост/проект | Низ меню; проект в заголовке |
-| Счётчики, tooltip, macOS ask | Сводка, метки проектов, доступное описание; без лишнего дубля |
-| Board | Проект → Доска ↗ |
-| Вопросы / работа | Общие вопросы и группы проекта; прямые ссылки |
-| Pause / Resume | Проект и явно scoped общая команда |
-| Лог / папка / restart | Сервис проекта |
-| Quit until next logon | Сервис проекта → Остановить до входа |
-| Uninstall / Confirm | Сервис проекта → Удалить → Подтвердить |
-| Error / stale | Заметная строка с проектом, возрастом и логом; отдельно от failed |
-
-Устаревший status не доказывает остановку процесса. Лог доступен при сбое, если путь известен.
-`Update now` — новая функция: показывать только когда `status.json` сообщает проверенную более новую версию;
-действие пишет `<root>/.taskq/update`, сервис выполняет штатное обновление §8 и сообщает результат через status/readback.
-Сбой обновления не выдавать за успех; rollback и сохранность текущих попыток остаются обязательными.
+- Categories: Appearance, Activity history, Agents, Services and About. Work mode remains a direct entry, not a second editor.
+- Appearance contains view/font; Activity history contains M6 presets/custom range; Agents retains host probes; proposed permission controls follow [P1–P9](worker-permissions.md), pending authority/enforcement approval.
+- Services lists targets with freshness, incidents, log/folder, restart, stop until next login and nested uninstall confirmation. Retain Resources access to the existing external monitor and incident consent controls. No repeated service sections on home.
+- Stale status does not prove a dead process. Known logs remain accessible during failure; unknown log paths are explained.
+- About shows tray/service versions and host. Update now appears only for a verified newer version; preserve progress, readback, failure and rollback visibility.
+- Update writes the existing service request and follows §8. Do not claim completion from a button click.
 
 ## M10 Add project
 
-- Setup uses the same in-place clarify thread (M7). §6 inspection reads existing GitHub repository name and visibility with `gh repo view --json nameWithOwner,visibility`; the operator does not ask for known visibility. Failed reads stay unknown.
+- Projects plus opens the OS folder picker; cancellation changes nothing. Show the exact selected folder.
+- Empty folder without config: new setup. Existing files without config: preserve files, Git and ownership during connection/setup.
+- Existing taskq.json + passing selftest: register/install through the existing confirmed flow; already registered is idempotent.
+- Existing taskq.json + failing selftest: show first verified reason and repair/cutover route; no automatic replacement or migration.
+- Onboarding proceeds in its AI conversation with account/repository/visibility and every external effect reviewed before apply. New repositories default private under §6.
+- Empty-install AI bootstrap currently lacks a running service; resolve that route before claiming first-project onboarding is complete. Do not hide it behind an unusable Send button.
 
-- Кнопка `Add project` в секции проектов открывает системный folder picker. Отмена ничего не меняет; выбранный путь явно показан.
-- Нет `taskq.json`, папка пустая: onboarding нового проекта. Нет `taskq.json`, файлы есть: onboarding существующего проекта с сохранением файлов и ownership.
-- `taskq.json` есть, `selftest` проходит: зарегистрировать выбранный проект и предложить `service install`; установка — отдельное подтверждённое действие.
-- `taskq.json` есть, `selftest` не проходит или установлен старый формат: показать проверенную причину и путь ремонта/cutover по §9; не перезаписывать config и не выполнять миграцию автоматически. Маркер — решение M8.
-- Весь `Add project`, включая picker, классификацию, регистрацию и предложение установки, выпускается на этапе 4. Onboarding — разговор по §6 прямо в меню: account/repo/visibility и конкретные внешние эффекты подтверждаются до применения. Терминал и clipboard не являются промежуточным продуктовым сценарием; на этапах 1–3 действие явно недоступно с причиной.
+## M11 Remaining decisions
 
-## M11 Incident reports
+- One main AI window plus explicit detached conversations is approved. Attachment budgets/types, retention, cancellation and recovery proposals are in C3–C7.
+- Final shortlist count/recent ranking and attention grouping caps remain tunable proposals; stable control locations and attention-first layout are approved.
+- Scope semantics, per-project budgets, urgent ordering and multi-repository workflow follow use-case Q1/Q3–Q6; do not infer new backend authority.
+- Remote sessions remain informational; tmux is research, not a delivery promise.
+- Emergency stop and I5 icon overflow/unknown/rebin/Windows qualification remain open.
 
-Дизайн: [incidents.md](incidents.md), правило — taskq.md § 4. Цель #612, не выпущено.
+## M12 Shared Work mode
 
-- Источник — `incident` в `status.json` проекта; меню доску и upstream не читает.
-- Группа сервиса проекта: та же строка, что `taskq service status`: `Incident: sent <fault> <age> · Open ↗`, `Incident: local <fault> <age> (<reason>)`, `Incident: unsupported-auth <fault> <age> (no github.com login)`, `Incidents: disabled`, `Incidents: none`. Нет `status.json` или устарел — unknown с причиной, не `none`.
-- `local` и `unsupported-auth` дополнительно видны наверху рядом с ошибками сервиса (с проектом), не в failed: `Open report` открывает локальный санитизированный JSON, `Report manually ↗` — страницу нового issue release-репозитория. Отправка вручную — действие человека; меню само ничего не публикует.
-- `sent` ведёт на upstream issue; счётчиков повторов меню не показывает (taskq.md § 4: записи и аккаунты, не случаи).
-- `Incident reports: notice` (существующий проект без ключа): строка наверху до решения владельца; переключатель не делает отправку без подтверждения, называющего репозиторий, публичность и аккаунт.
+- One editor from home/settings/project; project entry preselects that project.
+- Named host, explicitly selected projects, new-task filter, per-project/runtime limits, optional load guard, change review.
+- Selection defines change targets, not registered observations. Unchecking a project leaves its focus/limits unchanged.
+- Preserve runtime-specific limits, including codex-app. No shared host pool. Disable fields for unselected projects; never replace unknown values with zero.
+- Different current focus displays Mixed. Opening does not overwrite it. Change only explicitly edited fields.
+- Review exact project/host old→new changes; current attempts continue. Cancel preserves settings; readback is per project, including partial failure.
+- Preserve CPU/memory gate controls and saved-vs-applied distinction from the current UI. Gate semantics remain in taskq.md.
+- AI prepares the same reviewable operations; no hidden alternate apply route. Preview matches/exclusions for UC-05 once the filter contract exists.
 
-## Приёмка
+## Acceptance
 
-| ID | Критерий |
+| ID | Evidence |
 |---|---|
-| M-A1 | Компактный старт; вид/шрифт сохраняются. |
-| M-A2 | Пересечения не удваивают задачи; наблюдение не разрешает исполнение. |
-| M-A3 | Проект/назад; строка открывает правильный issue. |
-| M-A4 | Пауза сохраняет проекты/focus; смешанный режим понятен. |
-| M-A5 | Период меняет историю, не scope и не текущий failed. |
-| M-A6 | Event ID, [start,end), failed, ноль/неизвестность различимы. |
-| M-A7 | Ответ/уточнение/подтверждение/readback; stale и retry безопасны. |
-| M-A8 | Закрытие не теряет запрос; отказ не выглядит успехом. |
-| M-A9 | Просьба, подтверждение, факт и расхождения различимы. |
-| M-A10 | Failed, ошибка сервиса и ошибка AI не смешиваются. |
-| M-A11 | Служебная команда явно scoped; соседние проекты сохранны. |
-| M-A12 | Все действия M9 доступны/объяснены; resume без focus не включает all. |
-| M-A13 | `↶`: история и готовые команды; выбор заполняет, не отправляет; история сохраняется/очищается. |
-| M-A14 | `Add project`: системный picker, отмена и четыре случая M10; §6 внутри меню на этапе 4, установка/внешние эффекты подтверждены, старый проект без автоматического cutover. |
-| M-A15 | Incident: четыре состояния и `none` различимы, путь и ссылка открываются, `local` не похож на failed и на успех. |
+| M-A1 | Compact start; view/font persist. |
+| M-A2 | Deduplicated counts; observation never enables admission. |
+| M-A3 | Project/Back and issue links reach the correct target. |
+| M-A4 | Pause preserves focus; mixed scope is explicit. |
+| M-A5 | Period affects history only, not scope/current failed. |
+| M-A6 | Event IDs, half-open ranges, failed, zero and unknown remain distinct. |
+| M-A7 | Clarification/confirmation/readback handle stale revisions and retries. |
+| M-A8 | Closing preserves requests; failure never looks applied. |
+| M-A9 | Original request, interpretation, actual state and mismatch are distinct. |
+| M-A10 | Task failure, service fault and AI failure remain separate. |
+| M-A11 | Lifecycle commands name targets and preserve unrelated projects. |
+| M-A12 | All M9 actions retained; missing focus never resumes all. |
+| M-A13 | History/suggestions fill only; history persists and clears independently. |
+| M-A14 | Picker cancellation and all four setup cases preserve §6 confirmations and §9 cutover. |
+| M-A15 | Incident states and none remain distinct; local report paths and issue links work; local is neither task failure nor successful delivery. |
+| M-A21 | Attention precedes ordinary lists and includes projects outside the shortlist. |
+| M-A16 | View/admission/pause together; mixed and target scope explicit. |
+| M-A17 | Flowing title, header Board, separate local session link, remote no-link. |
+| M-A18 | Pinned/recent, searchable All, header plus; all-state aggregate/project counters and quiet Closed follow K-A1–K-A6. |
+| M-A19 | Both composers accept attachments; workspace/window recovery follows C-A1–C-A10. |
+| M-A20 | Shared editor preserves Mixed, untouched fields/targets and per-project readback. |
 
-Прототип — fixtures, не сервис. PASS модели не доказывает отрисовку, нативную ОС или AI.
-Проверки: [verification.md](verification.md). Правки: общий принцип D / поведение M → спека → макет → тест.
+[Verification](verification.md) separates historical evidence from the current candidate. General principles change in specq; TaskQ behavior changes here under R13.

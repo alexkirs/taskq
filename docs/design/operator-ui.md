@@ -1,60 +1,30 @@
-# Плотный интерфейс оператора
+# TaskQ operator UI acceptance
 
-Цель: максимум читаемой пользы на минимальной разумной площади.
-Статус: целевой дизайн. [Контракт](../../taskq.md#product) · [Меню taskq](menu.md).
+Apply [shared D1–D14](https://github.com/taskqorg/specq/blob/main/design/operator-ui.md).
+Apply [shared implementation fidelity F1–F6](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md) and [native acceptance](ui-acceptance.md).
+This file contains TaskQ-specific checks, not a second definition of the shared principles.
+[Contract](../../taskq.md#product) · [Menu](menu.md) · [Square summary](icon-summary.md).
 
-## Утверждённые границы продукта
+## Product boundaries
 
-- UI — English, как CLI/README; примеры текста в русской спецификации переводятся. Renderer — HTML popover через `wry` (WKWebView macOS, WebView2 Windows), небольшой Rust state/action bridge; без зависимости от `openai` widget (M1).
-- Windows: компактная q, сводка и выбор M1 скрыты. macOS: сводка 22 pt, цифры 12 pt, график 7 pt; при паузе геометрия та же. Это утверждённое отклонение от исследования 47×29 px, не основание уменьшать текст меню.
-- Один tray на host, проекты только из install/projects registry. Наблюдение — установленный сервис с focus `off`; ARM — focus и host-фильтр, отдельного PM-фильтра нет (M2).
-- Просьба хранится целевым `service focus ... --request` и показывается как `You asked`; `Resume` без focus просит labels, не включает `all` (M4–M5).
-- Cadence читает локальный `<root>/.taskq/events` сервиса: время, task, `close|failed`, attempt ID как event ID, не два отдельных поля. Без board replay; дата начала сбора и incomplete обязательны, неизвестность не ноль (M6).
-- `Update now` доступно по проверенной новой версии в `status.json`, запрос — `<root>/.taskq/update` с readback (M9).
-- AI и весь `Add project` (picker, классификация, регистрация, предложение установки, onboarding §6 внутри меню) — этап 4, отдельное изменение R3/R9; на этапах 1–3 Add project недоступно, без терминала/clipboard как временного UX. Кнопка секции проектов открывает OS folder picker и различает четыре случая M10: новая/существующая папка без config, рабочий config, сбой selftest/старый формат с §9.
-- Единственный вопрос владельцу — точный маркер старого проекта: предложение `taskq.json` + неуспешный `selftest` ещё не принято (M8). Все остальные пункты выше — решения, а не вопросы на повторное согласование.
+- Menu behavior, renderer, registry, AI, navigation and maintenance belong to M1–M12 in the menu specification.
+- Square geometry, font calibration and platform qualification belong to I1–I5 in the icon specification.
+- Menu counters use nonzero symbol capsules; zero leaves no slot. The summary icon retains zero in its fixed positions (M1/M3).
+- Task rows keep issue numbers and host names intact; long titles wrap under metadata from the block's left edge (M3).
+- Specifications are design targets. Runtime follows taskq.md until implementation and verification establish otherwise.
 
-Это будущая реализация: runtime-контракт taskq.md остаётся действующим до соответствующих изменений и проверок.
+## Acceptance
 
-## Принципы
-
-- **D1. Связанное вместе.** Сущность — одна строка. Метаданные не получают отдельную строку без необходимости.
-- **D2. Одна сетка.** Названия слева; счётчики плотной группой справа. Общие края и интервалы на всех уровнях. Выравнивать видимые знаки, не только контейнеры.
-- **D3. Читаемость.** Крупный регулируемый текст. Второстепенное не мельчит до нечитаемости. Системный масштаб сохранён.
-- **D4. Никакой пустоты без функции.** Ширина по содержимому. Не растягивать промежутки между названием, числом и стрелкой. Не заполнять меню карточками и дублями.
-- **D5. Быстрое действие.** Основное — напрямую; подробности — по запросу. Не добавлять промежуточный экран ради ссылки.
-- **D6. Длинное не ломает короткое.** Название сокращается или переносится внутри своей колонки. Статус и номер остаются. Полный текст доступен с клавиатуры и при наведении. Без горизонтального скролла.
-- **D7. Цвет означает состояние.** Постоянная семантика; спокойная палитра; контраст текста ≥4.5:1. Цвет дополняется положением, символом или подписью.
-- **D8. Честные элементы.** Ссылка ведёт к цели. Недоступное действие объяснено. Фокус и доступные имена обязательны.
-- **D9. Плотность не теснота.** Сначала убрать дубли и зазоры, затем подбирать ширину. Не уменьшать текст ради рекорда пикселей; многозначные числа не сталкиваются.
-- **D10. Счётчики — компактные метки.** Число внутри круга/капсулы; ненулевое — с семантической заливкой, ноль — нейтральный. Порядок стабилен. Не разносить по ширине строки.
-- **D11. Маленькое действие — маленький элемент.** Иконка у связанного поля вместо отдельной большой кнопки. Понятный Unicode допустим; без украшательства и emoji-шума. Иконка имеет доступное имя и удобную цель нажатия.
-- **D12. Спека тоже плотная.** Правило, ограничение, проверка. Удалять слово/фразу, если смысл и обязательства сохраняются. Не повторять общий принцип в частной спеке.
-
-## Проверка каждого изменения
-
-1. Элемент помогает распознать, решить или действовать? Нет — убрать.
-2. Можно убрать строку/зазор или увеличить текст без потери ясности? Сделать.
-3. Сохранились сетка, прямое действие и принятые функции?
-4. Проверены длинные названия, крупный текст, узкая поверхность, обе темы?
-
-Сначала один реальный компонент; затем правило на весь интерфейс.
-Тест вычислений не заменяет осмотр отрисовки.
-
-## Приёмка
-
-| ID | Критерий |
+| ID | TaskQ evidence |
 |---|---|
-| D-A1 | Статус, номер, название — одна строка; номер не отдельный подзаголовок. |
-| D-A2 | Вся строка открывает правильную задачу; проекты не смешиваются. |
-| D-A3 | Размер текста меняется везде, сохраняется; значок независим. |
-| D-A4 | 320/360 px и длинные названия: нет столкновений и горизонтального скролла. |
-| D-A5 | Обе темы, масштаб 100/200%: сетка и видимые края совпадают. |
-| D-A6 | Без цвета смысл различим; клавиатура, скринридер и сенсорные цели работают. |
-| D-A7 | Пустых групп и бесполезных повторов нет. |
-| D-A8 | Счётчики сгруппированы на одном краю; значения 0, 1, 12, 100 не ломают строку. |
+| D-A1 | Status, issue number and title start in one flow; continuation uses the full block width. |
+| D-A2 | The task body opens its issue. Separate session/PR links do not also open the issue. Project identity stays unambiguous. |
+| D-A3 | Menu font changes apply throughout and persist; icon sizing remains independent. |
+| D-A4 | At 320/360 px, long titles produce no collisions or horizontal scrolling. |
+| D-A5 | Both themes at 100/200% scaling preserve the grid and visible-edge alignment. |
+| D-A6 | Meaning survives without color; keyboard, screen reader and touch targets work. |
+| D-A7 | The menu contains no empty groups or redundant content. |
+| D-A8 | Compact counters hide 0; symbols with 1/12/100 fit; unknown stays visible. Wrap as a group under K rules, never stretch across empty width. |
 
-## Изменения
-
-Общий принцип — сюда. Поведение продукта — в его спеку. Затронуто оба — изменить обе.
-Сначала требование, затем макет и тест. ID сохранять; принятые функции не терять.
+General improvements belong in specq. TaskQ behavior belongs in taskq.md and its linked specifications.
+Preserve these acceptance IDs when refining product checks.

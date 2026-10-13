@@ -1,0 +1,43 @@
+{
+  "renderer": "taskq 4.1.9",
+  "sourceCommit": "2d1ba851822c2506db7d9345998170e41a00f5fe",
+  "binarySha256": "944244b01d720954f3b02c7e3a4207d46c8cf4ab87b9acd4eabcaa717bc3ff5a",
+  "environment": {
+    "os": "macOS 27.0.1",
+    "arch": "arm64",
+    "renderer": "WKWebView snapshot"
+  },
+  "capture": "Isolated TASKQ_INSTALL using docs/design/tray-fixture.sh. Diagnostic expanded snapshot, not live popup-size evidence.",
+  "fixture": "Synthetic alpha/beta/gamma; historical service version 4.1.0 is fixture input. Ask-only replaces alpha history with three unique Ask events 300 seconds before capture; since 86400 seconds before capture.",
+  "limits": [
+    "Windows not tested",
+    "Live popup fit and installed icon placement not tested",
+    "Temporal movement not recorded"
+  ],
+  "images": [
+    {
+      "file": "home-ask-only.png",
+      "sha256": "710cda3f3922dac2357752f01ea4b95d82f7fa8fd47c5d728226a44e9f9b1a27"
+    },
+    {
+      "file": "home-dark-16.png",
+      "sha256": "4021ecf42c218b939e87065b37479093461966b0b47178bf217ca6d526a9c86b"
+    },
+    {
+      "file": "home-dark-20.png",
+      "sha256": "25b04532d7ec2bc75cc55a1cce58708506c20125f737f96b1debd0a8843d4837"
+    },
+    {
+      "file": "project-light-16.png",
+      "sha256": "32ba22ee13df6a5cf825c8c1aa706ca984ebf17ff3334baa0db8721f33935989"
+    },
+    {
+      "file": "summary-ask-only.png",
+      "sha256": "d698f7008a00a8947cde5b00d634aa9ca7a0bdacfb13595faa37c632193a89c7"
+    },
+    {
+      "file": "summary-mixed.png",
+      "sha256": "d9bf0c6ee86a31927875c003947684482abfdcb7adc684b0a1c1de272c01ad94"
+    }
+  ]
+}

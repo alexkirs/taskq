@@ -43,8 +43,8 @@ Display titles at most 60 characters, reasons at most 160 and option text at mos
 `<pages>/open.html#codex://threads/<id>`.
 
 ### R7. Style
-Every role and message is short and states unknowns honestly ([caveman](https://github.com/taskqorg/specq/tree/62579538f05fb6b69a12449c1ebad9567d1fdecc)).
-Use English, plain verbs, one idea per line; no preamble, repeated context or prose walls. State the user effect first.
+Follow [specq Core](https://github.com/taskqorg/specq/blob/main/caveman/rules/core.md) and its applicable profile; project documents follow [Documentation](https://github.com/taskqorg/specq/blob/main/caveman/rules/documentation.md) in English.
+Project content is English; conversational replies follow the owner's language. TaskQ-specific output constraints follow below.
 Single and batch CLI outcomes use the same success/error renderer; a failed item keeps its task number.
 Owner-text templates in sections 1, 2, 4, 5, 7 are the design target; release them with their implementation (R8), not as proof of shipped behavior.
 Limits count logical lines and Unicode characters, including labels and numbering; exclude blank separators and the log header.
@@ -54,10 +54,10 @@ Historical/hand-written entries still fold unchanged.
 Compact displays use ellipsis and a link/full accessible text; never shorten stored text.
 
 ### R8. The contract is the SoT and matches code
-This file is the contract. Briefs and docs link here, never copy it. A behavior change updates this file in the same deliverable. Code and contract ship in the same release (§ 8). Tests check it: every § 2 table row has a golden trace (§ 2) and this file fits the change rule's line limit.
+Apply [shared spec-first rules](https://github.com/taskqorg/specq/blob/main/engineering/spec-first.md) to this contract. TaskQ code and contract ship in the same release (§8); every §2 table row has a golden trace, and this file stays within 300 lines.
 
 ### R9. No silent changes to model, effort or permissions
-Name any change to the owner first. `permission_mode`, `codex` and capacity (§ 9) in `taskq.json` are the owner's: agents propose capacity, apply it only on the owner's explicit instruction. Defaults: Claude `--permission-mode dontAsk`; Codex `-s danger-full-access`. The operator (R3) always runs without tools: Claude `--tools ""`, Codex `-s read-only`.
+Name any change to the owner first. `permission_mode`, `codex` and capacity (§ 9) in `taskq.json` are the owner's: agents propose capacity, apply it only on the owner's explicit instruction. Defaults: Claude `--permission-mode dontAsk`; Codex `-s danger-full-access`. Proposed host-owned grants and migration: [worker permissions P1–P9](docs/design/worker-permissions.md); no active permission change. The operator (R3) always runs without tools: Claude `--tools ""`, Codex `-s read-only`.
 
 ### R10. Multi-project only by explicit list
 A PM manages several projects only from an owner-written list; folders are never discovered. One report per project. An
@@ -67,14 +67,13 @@ A PM manages several projects only from an owner-written list; folders are never
 A worker or reviewer is stopped only when its task is closed or parked or its attempt is replaced (§ 4). Identity is the recorded session id, never a name match. Uncommitted work is never lost: only `cleanup --force` removes it, after saving it to `<root>/.taskq/trash/taskq-<N>.patch`.
 
 ### R12. Unverified means unknown
-Report only what a fresh read proved. Delivery, exit code or a chat turn is not proof of receipt, application or completion. Untested platforms are unknown, not PASS.
+Follow [shared verification rules](https://github.com/taskqorg/specq/blob/main/engineering/verification.md). TaskQ readback and platform obligations are specified in §§4–8.
 
 ### R13. Spec first
-Decisions live in this file, product ones too. A change that alters a decision edits this file first; code, README and pages follow. A task that conflicts with a decision is an `ask` with options. Only the owner accepts a decision change. Every agent reads this file before work; `AGENTS.md` and `CLAUDE.md` point here.
+Inherit [specq engineering rules](https://github.com/taskqorg/specq/tree/main/engineering) and its [shared-rule improvement process](https://github.com/taskqorg/specq/blob/main/engineering/spec-first.md#improve-shared-rules). TaskQ decisions live here; conflicting tasks use `ask` with options. `AGENTS.md` and `CLAUDE.md` point here. General rules belong upstream; TaskQ scenarios and gaps stay in [use cases](docs/use-cases/README.md).
 
 ## Product
 Owner decisions on looks and sound, one line each. Change one only per R13.
-
 - README is the whole page: header, tagline, 3 steps, Mix agents, one link to taskq.md, license, donate.
 - Header: `docs/header.webp` with the caption `Agents working.` stays at the top, verbatim.
 - Tagline: a few short lines of what taskq is, above the steps, no jargon.
@@ -83,7 +82,7 @@ Owner decisions on looks and sound, one line each. Change one only per R13.
 - Formatting: a few unicode icons where they help scanning; no emoji clutter, no badges.
 - Last README line: `If taskq saves you time, [buy me a coffee](…).`
 - Tone: minimum words, plain to anyone, no filler (R7).
-- Operator UI: [density specification](docs/design/operator-ui.md) and [menu specification](docs/design/menu.md) govern the approved design target.
+- Operator UI: [shared density rules](https://github.com/taskqorg/specq/blob/main/design/operator-ui.md) with [TaskQ acceptance](docs/design/operator-ui.md), [menu](docs/design/menu.md), [square summary](docs/design/icon-summary.md): attention first, view/admission/pause together, AI window with attachments, flowing task rows with local-session links, pinned/recent projects, nonzero symbol counters; one shared scope/limits editor (M12); [stable adaptive menu](docs/design/adaptive-menu.md) and [AI workspace](docs/design/ai-workspace.md): one main window, explicit detached conversations, existing windows raised on reopen. [Expanded counters](docs/design/task-counters.md) include every queue state and quiet Closed totals above Projects. [Rendering contract](docs/design/rendering-contract.md) and [implementation acceptance](docs/design/ui-acceptance.md) govern design fidelity, native sizing, scrolling and chart rasterization. Targets only; §4 governs runtime until implemented and verified. [Use cases](docs/use-cases/README.md) collect owner scenarios, proposals and contract gaps in one file; they do not amend runtime rules.
 - [Board specification](docs/design/board.md) governs the approved label names and attention-only palette; design targets do not change shipped behavior until implemented and verified (R8, R12, R13).
 ## 1. Tasks
 A task is an open issue by a trusted author (GitHub `OWNER|MEMBER|COLLABORATOR`, GitLab Reporter+) labelled `taskq` (`taskq add` sets it; on the board a person adds it). Any other issue never starts: a PM makes a task from it with `taskq add` and comments on it when the task closes. A closed issue is done. The issue text is for people and may be
@@ -136,8 +135,9 @@ A card has at most nine nonblank lines. K is an option number; a bare K or optio
 Result decision cards use the same format after the verdict (section 7): append Done/Problem to `--text`, use `--option`, `--recommend`, `--link`; omit all card fields for no decision.
 
 ### Executable behavioral model
-`fold` is the behavioral truth; the board and processes are adapters around it. A lifecycle change edits this table,
-then `tests/golden/*.json` (entries in, expected task out, including ignored entries), then `fold`, then adapters. The golden traces cover duplicate, stale, out-of-order and hand-typed entries. A model PASS is not process, board or platform qualification (R12).
+Apply the [shared behavioral-model method](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#state-driven-systems).
+TaskQ sources: the §2 transition table, `tests/golden/*.json` traces (entries in, expected task out), `fold`, then adapters.
+`fold` is the behavioral truth; board and process qualification remain separate under R12.
 
 ## 3. Attempts, lease, capacity
 - **Claim.** A service that admits a `ready` task posts `spawn worker`, re-reads the comments and starts the child only
@@ -252,6 +252,7 @@ Reviewer checks every Acceptance and contract against the candidate and CI on th
 - On the attempt host: remove a clean `.worktrees/taskq-<N>` and its local branch; dirty ones stay.
 
 ## 8. Runtimes and deployment
+Design amendment pending approval: [permissions P8](docs/design/worker-permissions.md#p8-proposed-taskqmd-amendment), including #865 reconciliation, runtime mapping and per-host migration.
 | Runtime | spawn (child of service) | resume |
 |---|---|---|
 | Codex | `codex exec --json <codex opts> -C <root> -`, brief on stdin; session from the first `thread.started` line | `codex exec --json resume <id> -` |

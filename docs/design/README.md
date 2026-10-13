@@ -1,36 +1,51 @@
-# taskq operator design package
+# TaskQ operator design package
 
-Approved future UI target; shipped behavior still follows [taskq.md](../../taskq.md).
-Phase 0 decisions are recorded in [menu.md](menu.md), [operator-ui.md](operator-ui.md) and [implementation-brief.md](implementation-brief.md).
+Approved menu direction and AI window policy; detailed candidate for implementation planning.
+Runtime remains governed by [taskq.md](../../taskq.md). Shared rules live in [specq](https://github.com/taskqorg/specq/); this package holds TaskQ-specific requirements.
+
+Working process: [shared product design workflow](https://github.com/taskqorg/specq/blob/main/design/workflow.md). This package supplies its product decisions, references and evidence.
+
+## Current package
 
 | Material | Purpose |
 |---|---|
-| [Contract](../../taskq.md) | Product rules; takes priority on conflict |
-| [Principles](operator-ui.md) | Density, alignment, readability, accessibility; D criteria |
-| [Board specification](board.md) | Approved labels, naming, attention-only palette, default adoption; B criteria |
-| [Menu specification](menu.md) | Behavior, host scope, AI, maintenance, Add project; M criteria |
-| [Menu prototype](menu-prototype.html) | Product HTML structure and fixture interactions; state/action bridge target |
-| [Icon studies](icon-studies.html) | Selected unified strip geometry, themes, active/pause states, 22 pt macOS study |
-| [Verification](verification.md) | Evidence and remaining qualification |
-| [Implementation brief](implementation-brief.md) | Phased implementation target |
-| [Incident reports](incidents.md) | Fault catalog, 4 KiB report, route, operator view; target of #612 |
-| [One-off run](one-off-run.md) | Proposed urgent run of one task outside focus (#652); not approved |
+| [Standalone candidate](final-menu.html) | Inspect menu, AI conversations/sessions, settings, icons and scenario states |
+| [Editable fragment](final-prototype.html) | Canonical source for the current interactive candidate |
+| [Menu](menu.md) | M1–M12 behavior and M-A1–M-A21 acceptance |
+| [AI workspace](ai-workspace.md) | Conversation/session/history separation, windows, attachments, recovery and C checks |
+| [Task counters](task-counters.md) | All-state totals, Closed and partial-data semantics |
+| [Worker permissions](worker-permissions.md) | Host authority, runtime mapping, settings, #865, migration and acceptance |
+| [Visual system](visual-style.md) | Typography, geometry, palette, icon inventory and asset sources |
+| [Square summary](icon-summary.md) | I1–I5 precise glyph/graph geometry and unresolved policies |
+| [TaskQ UI acceptance](operator-ui.md) | D-A1–D-A8 product checks; general D rules are upstream |
+| [Use cases](../use-cases/README.md) | UC-01–UC-07, intersections, open Q/P decisions |
+| [Adaptive rationale](adaptive-menu.md) | Stable controls, situational content, prioritization choices |
+| [Current implementation inventory](current-menu-audit.md) | Installed/source evidence and preserve/relocate matrix |
+| [Implementation brief](implementation-brief.md) | Reading order, unresolved contracts and delivery slices |
+| [Rendering contract](rendering-contract.md) | Native size, scroll ownership, physical bar grid and data parity |
+| [Implementation acceptance](ui-acceptance.md) | Complete feature ledger, native matrix and review gates |
+| [Report template](ui-acceptance-report.md) | Builder/reviewer evidence and owner decisions |
+| [4.1.9 audit](release-4.1.9-ui-audit.md) | Current released source and native fixture findings |
+| [Deterministic fixtures](ui-acceptance-fixtures.json) | Expected histogram, height and pixel-grid outcomes |
+| [Verification](verification.md) | Candidate evidence, historical evidence and qualification gaps |
 
-## Reading the prototypes
+The editable candidate contains local simulation, not live service access. Detach models ownership inside the preview; native separate windows require implementation. Uploaded-file chips model selection only; no file bytes are sent.
 
-- Renderer: a popover window containing a wry webview (WKWebView on macOS, WebView2 on Windows), with a small Rust state/action bridge. The HTML is the product UI target; fixture data is not a service adapter.
-- UI language: English, matching the CLI and README. No OpenAI widget state dependency.
-- Windows: compact q only; summary and the M1 view chooser are hidden. macOS summary fits a 22 pt menu bar with about 12 pt digits and a 7 pt graph; the approved deviation from the 47×29 study preserves the geometry rules.
-- Summary pause keeps the same numbers and bars in gray, with the compact q/Ⅱ centered on both axes. Icon geometry comes from `icon-studies.html`.
-- One tray per host reads the installed-project registry `<install>/projects`. Observation means an installed service with focus off; ARM is service focus plus the host filter, with no separate host PM filter.
-- Service data targets: local `<root>/.taskq/events` history (time, task, close|failed, attempt ID as event ID), original focus request via `--request`, and newer-version status with update action through `<root>/.taskq/update`. Incomplete history shows its start date; missing saved focus prompts for labels.
-- M7 AI and Add project ship in phase 4, with the AI contract changes to R3/R9. Add project uses the OS folder picker and §6 onboarding inside the menu AI channel; there is no terminal or clipboard shortcut.
-- The sole open owner question is the exact old-project marker; the proposal is `taskq.json` present with failing selftest. The four folder classifications and M-A14 are in the menu specification.
-- Model tests do not prove native rendering, service integration, or AI. See verification for limits.
+## Related specifications
 
-## Changes
+- [Board labels](board.md), [adoption](board-implementation.md): names/colors and migration constraints.
+- [Incident reports](incidents.md): fault catalog, reporting, consent and operator states.
+- [Capacity](capacity.md): earlier limits/load-gate detail; current runtime authority is taskq.md.
+- [One-off run](one-off-run.md): separate proposal, not an approved replacement for p0 semantics.
+- [Message formats](message-formats-handoff.md): command-output handoff.
 
-General rule → `operator-ui.md`; menu behavior → `menu.md`; contract decision → `taskq.md` first (R13).
-Then update the prototype and its checks. Preserve accepted features and acceptance IDs.
-This task updates the delegated design target only: no Rust or §4 runtime changes.
-This directory is the canonical package; older chat prototypes are not implementation sources.
+## Historical references
+
+`menu-prototype.html` and `icon-studies.html` document earlier iterations. Their tests qualify those models only. The wide summary and old phase-0/phase-4 assumptions do not override this package.
+`square-summary-reference.html` preserves the earlier accepted geometry experiment; its dynamic multi-digit shrinking is not production policy.
+Older board/research material may still need English translation; the current menu/AI handoff is English.
+
+## Change routing
+
+General rule: propose/review in specq. TaskQ decision: taskq.md first, then its linked product specification, candidate and evidence.
+Preserve requirement IDs and current capabilities. A file, mockup or green model test is not shipped/native proof.

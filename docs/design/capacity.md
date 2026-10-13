@@ -2,7 +2,7 @@
 
 Design for [#783](https://github.com/alexkirs/taskq/issues/783), implemented in [#792](https://github.com/alexkirs/taskq/issues/792).
 The [contract](../../taskq.md#3-attempts-lease-capacity) (§ 3, § 4, § 9) is the source of truth; where this note differs, taskq.md wins.
-Follow [menu M2–M5](menu.md) and [density D1–D12](operator-ui.md); all product text below is English.
+Follow [menu M2–M5](menu.md) and [shared density D1–D14](https://github.com/taskqorg/specq/blob/main/design/operator-ui.md); all product text below is English.
 
 ## User model
 

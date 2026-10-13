@@ -110,8 +110,21 @@ fn newest(install: &Path) -> Value {
     let all = roots(install).into_iter().filter_map(|r| crate::operator::ids(Path::new(&r)).pop().map(|id| (id, r)));
     let Some((id, r)) = all.max_by_key(|(id, _)| (id.len(), id.clone())) else { return Value::Null };
     let root = Path::new(&r);
-    let q = crate::operator::read(&crate::operator::dir(root).join(format!("{id}.json")));
-    json!({"id": id, "root": r, "text": q["text"], "answer": crate::operator::read(&crate::operator::answer_path(root, &id))})
+    let mut chain = Vec::new();
+    let mut current = id.clone();
+    for _ in 0..crate::operator::KEEP {
+        let q = crate::operator::read(&crate::operator::dir(root).join(format!("{current}.json")));
+        if q.is_null() { break; }
+        chain.push(json!({"id": current, "text": q["text"], "answer": crate::operator::read(&crate::operator::answer_path(root, &current))}));
+        let Some(after) = q["after"].as_str().filter(|a| !a.is_empty() && a.bytes().all(|b| b.is_ascii_digit())) else { break };
+        if chain.iter().any(|q| q["id"] == after) { break; }
+        current = after.to_string();
+    }
+    chain.reverse();
+    let mut request = chain.last().cloned().unwrap_or(Value::Null);
+    request["root"] = json!(r);
+    request["chain"] = json!(chain);
+    request
 }
 
 fn ai(install: &Path, a: &str, m: &Value) {
@@ -1038,6 +1051,28 @@ fn capture(wv: &WebView, path: PathBuf, done: impl Fn() + 'static) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clarify_thread_is_oldest_first_and_stops_at_missing_or_cycle() {
+        let install = std::env::temp_dir().join(format!("taskq-thread-{}", std::process::id()));
+        let root = install.join("project");
+        fs::create_dir_all(crate::operator::dir(&root)).unwrap();
+        fs::write(install.join("projects"), root.to_str().unwrap()).unwrap();
+        let put = |id: &str, after: &str| {
+            fs::write(crate::operator::dir(&root).join(format!("{id}.json")), json!({"text": id, "after": after}).to_string()).unwrap();
+            fs::write(crate::operator::answer_path(&root, id), json!({"state": "clarify", "text": format!("question {id}")}).to_string()).unwrap();
+        };
+        put("1", ""); put("2", "1"); put("3", "2");
+        let q = newest(&install);
+        assert_eq!(q["id"], "3");
+        assert_eq!(q["chain"].as_array().unwrap().iter().map(|v| v["id"].as_str().unwrap()).collect::<Vec<_>>(), ["1", "2", "3"]);
+        assert_eq!(q["answer"]["text"], "question 3");
+        put("1", "3");
+        assert_eq!(newest(&install)["chain"].as_array().unwrap().len(), 3);
+        put("2", "0");
+        assert_eq!(newest(&install)["chain"].as_array().unwrap().len(), 2);
+        fs::remove_dir_all(install).unwrap();
+    }
 
     fn has(i: &Rgba, c: [u8; 4]) -> bool {
         i.px.chunks(4).any(|p| p[3] == 255 && p[..3] == c[..3])

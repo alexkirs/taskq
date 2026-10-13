@@ -14,6 +14,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup default stable
       - run: cargo test --locked
+      - run: node tests/tray-reply.test.cjs
       - run: cargo run --locked -- selftest
         env:
           TASKQ_SELFTEST_OFFLINE: '1'

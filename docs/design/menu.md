@@ -74,6 +74,8 @@
 
 ## M7 AI и запросы
 
+- Clarify chain: oldest first; input and a visible Reply button directly under the newest question; placeholder `Answer…` while clarify is open.
+
 - Только этап 4: отдельное изменение контракта R3/R9 для роли AI и разрешённого runtime/permissions. Этапы 1–3 AI не реализуют. Будущий транспорт/хранение запроса утверждается в этом изменении без второй очереди задач (R1).
 - Свободный текст в меню; контекст проектов виден до отправки. Сервис запускает доступный разрешённый runtime; R9 сохраняется.
 - Рядом с вводом — небольшая кнопка `↶` с доступным именем «История и команды»; большой кнопки «Пример scope» нет.
@@ -121,6 +123,8 @@
 Сбой обновления не выдавать за успех; rollback и сохранность текущих попыток остаются обязательными.
 
 ## M10 Add project
+
+- Setup uses the same in-place clarify thread (M7). §6 inspection reads existing GitHub repository name and visibility with `gh repo view --json nameWithOwner,visibility`; the operator does not ask for known visibility. Failed reads stay unknown.
 
 - Кнопка `Add project` в секции проектов открывает системный folder picker. Отмена ничего не меняет; выбранный путь явно показан.
 - Нет `taskq.json`, папка пустая: onboarding нового проекта. Нет `taskq.json`, файлы есть: onboarding существующего проекта с сохранением файлов и ownership.

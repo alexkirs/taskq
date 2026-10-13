@@ -173,7 +173,7 @@ fn brief(root: &Path, install: &Path, req: &Value) -> String {
         return format!(
             "You are the taskq operator (taskq.md R3) in a project setup (taskq.md § 6): help the owner set up the folder below as a taskq project. You have no tools: use only this data.\n\
              Reply with exactly one JSON object and nothing else: {{\"kind\": \"clarify|proposal|refuse\", \"text\": \"...\", \"ops\": [...]}}.\n\
-             - clarify: one question at a time until you know: GitHub or GitLab and the account below, an existing repository or a new one, owner/name, visibility (a new one is private unless the owner says public), publish pr (default) or direct.\n\
+             - clarify: ask only for missing information, never repository visibility already read in the inspection; one question at a time until you know: GitHub or GitLab and the account below, an existing repository or a new one, owner/name, visibility (a new one is private unless the owner says public), publish pr (default) or direct.\n\
              - proposal: exactly one op {{\"op\":\"setup\",\"board\":\"github|gitlab\",\"host\":\"github.com\",\"repo\":\"owner/name\",\"create\":true|false,\"visibility\":\"private|public\",\"publish\":\"pr|direct\"}}; text names account, repository and visibility. The service lists every effect for the owner to confirm; files, uncommitted work and remotes stay.\n\
              - refuse: it cannot be set up so (for example no account); text is the reason.\n\
              Use English, short plain lines (taskq.md R7).\n\
@@ -269,9 +269,14 @@ fn inspect(root: &Path) -> Value {
     names.sort();
     let git = root.join(".git").exists();
     let g = |a: &[&str]| if git { cmd("git", a, root, &[]).unwrap_or_default() } else { String::new() };
+    let repository = if git {
+        cmd("gh", &["repo", "view", "--json", "nameWithOwner,visibility"], root, &[])
+            .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
+            .unwrap_or_else(|e| json!({"unknown": e}))
+    } else { Value::Null };
     let login = |b: &str, h: &str| account(b, h).unwrap_or_else(|e| format!("unknown: {e}"));
     json!({"path": root, "entries_total": names.len(), "entries (first 40)": names.iter().take(40).collect::<Vec<_>>(), "git_root": git,
-        "remotes": g(&["remote", "-v"]), "uncommitted_files": g(&["status", "--porcelain"]).lines().count(), "taskq_json": root.join("taskq.json").exists(),
+        "github_repository": repository, "remotes": g(&["remote", "-v"]), "uncommitted_files": g(&["status", "--porcelain"]).lines().count(), "taskq_json": root.join("taskq.json").exists(),
         "accounts": {"github.com (gh)": login("github", "github.com"), "gitlab.com (glab)": login("gitlab", "gitlab.com")}})
 }
 

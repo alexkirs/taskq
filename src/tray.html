@@ -122,12 +122,15 @@ function opText(o){return [o.project+':',o.op,o.task?'#'+o.task:'',(o.labels||[]
 function ai(){
   const A=S.ai,r=A.request,an=r&&r.answer||{},st=r?(an.state||'queued'):null,bad=['failed','refuse','apply failed'].includes(st);
   let h='<div class="group"><div class="row meta">✦ Ask AI · '+(A.target?'projects: '+esc(S.projects.map(p=>p.name).join(', ')):'no running service: cannot send')+'</div>';
-  h+='<div class="askai"><textarea id="ai" rows="2" aria-label="Request to AI" placeholder="Ask, or request a change">'+esc(aiText)+'</textarea><button data-a="ai-menu" aria-label="History and commands" title="History and commands" aria-expanded="'+aiMenu+'">↶</button></div>';
+  for(const q of r?(r.chain||[r]):[]){
+    const a=q.answer||{},state=a.state||'queued',bad=['failed','refuse','apply failed'].includes(state);
+    h+='<div class="body"><div class="meta">You: '+esc(q.text||'')+'</div><div class="'+(bad?'alert':state==='applied'||state==='result'?'work':'ask')+'" role="status">'+esc(aiStates[state]||state)+(a.reason?': '+esc(a.reason):'')+'</div>'+(a.text?'<div>'+esc(a.text).replace(/\n/g,'<br>')+'</div>':'')+'</div>';
+  }
+  h+='<div class="askai"><textarea id="ai" rows="2" aria-label="'+(st==='clarify'?'Answer to AI':'Request to AI')+'" placeholder="'+(st==='clarify'?'Answer…':'Ask, or request a change')+'">'+esc(aiText)+'</textarea><button data-a="ai-menu" aria-label="History and commands" title="History and commands" aria-expanded="'+aiMenu+'">↶</button></div>';
   if(aiMenu)h+='<div class="row meta">Recent</div>'+(A.history.length?A.history.map(t=>'<button class="project" data-a="ai-pick" data-v="'+esc(t)+'"><span>'+esc(t)+'</span></button>').join('')+'<button class="project" data-a="ai-clear">Clear history</button>':'<div class="body meta">No sent requests</div>')+
     '<div class="row meta">Commands</div>'+aiCommands.map(t=>'<button class="project" data-a="ai-pick" data-v="'+esc(t)+'"><span>'+esc(t)+'</span></button>').join('');
-  h+='<button class="project" data-a="ai-send"'+(A.target?'':' disabled')+'>'+(st==='clarify'?'Reply':'Send')+'</button>';
+  h+='<div class="options"><button data-a="ai-send"'+(A.target?'':' disabled')+'>'+(st==='clarify'?'Reply':'Send')+'</button></div>';
   if(!r)return h+'</div>';
-  h+='<div class="body"><div class="meta">You asked: '+esc(r.text||'')+'</div><div class="'+(bad?'alert':st==='applied'||st==='result'?'work':'ask')+'" role="status">'+esc(aiStates[st]||st)+(an.reason?': '+esc(an.reason):'')+'</div>'+(an.text?'<div>'+esc(an.text).replace(/\n/g,'<br>')+'</div>':'')+'</div>';
   // a setup lists its effects, computed by the service, instead of the op (§ 6)
   if(an.effects)h+='<div class="body meta">'+an.effects.map(esc).join('<br>')+'</div>';
   else if(an.ops)h+='<div class="body meta">'+an.ops.map(o=>esc(opText(o))).join('<br>')+'</div>';

@@ -145,7 +145,7 @@ mod tests {
         d
     }
 
-    // chain: service pass → prune; risk: a growing file fills the disk or a live attempt loses its log
+    // Chain: service pass, prune. Risk: a growing file fills the disk or a live attempt loses its log
     #[test]
     fn every_growing_file_has_a_bound() {
         let root = temp("prune");
@@ -185,7 +185,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    // chain: status.json, tray.json, kids, focus readers; risk: corrupt state reads as zero or default and is reset
+    // Chain: status.json, tray.json, kids, focus readers. Risk: corrupt state reads as zero or default and is reset
     #[test]
     fn corrupt_state_reads_unknown_and_stays() {
         let root = temp("corrupt");

@@ -428,6 +428,7 @@ impl<'a> Service<'a> {
             if let Some(v) = by_n.get(&n)
                 && v.task.attempt == Some(a)
                 && matches!(v.task.state, State::Doing | State::Review)
+                && !core::handed_in(n, &v.log, a, a.max(self.delivered(a)))
             {
                 self.post(n, core::entry("gone", &[], Some(a), &format!("exit {code}")))?;
                 touched.insert(n);
@@ -870,6 +871,27 @@ mod tests {
         s.pass().unwrap();
         assert_eq!(*e.borrow()[1].1.borrow(), Some(-9));
         assert!(s.kids.is_empty());
+    }
+
+    #[test]
+    fn answer_before_the_asking_child_exits_resumes_without_gone() {
+        let b = Fake::default();
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
+        let c = cfg("mac");
+        let e: Exits = Default::default();
+        let mut s = service(&b, &c, e.clone());
+        s.pass().unwrap();
+        let a = task(&b, n).attempt.unwrap();
+        b.comment(n, &core::entry("ask", &[], Some(a), "Which?\n1. x\n2. y ★")).unwrap();
+        b.comment(n, &core::entry("answer", &["2"], None, "y")).unwrap();
+        *e.borrow()[0].1.borrow_mut() = Some(0);
+        s.pass().unwrap();
+        let t = task(&b, n);
+        assert_eq!((t.state, t.attempt, t.retries, e.borrow().len()), (State::Doing, Some(a), 0, 2), "resumed, no gone");
+        // the resumed child exits without a new hand-in: that exit is gone
+        *e.borrow()[1].1.borrow_mut() = Some(0);
+        s.pass().unwrap();
+        assert_eq!(task(&b, n).retries, 1);
     }
 
     #[test]

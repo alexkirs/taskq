@@ -158,7 +158,8 @@ then `tests/golden/*.json` (entries in, expected task out, including ignored ent
 `taskq service run` is the host's single long-lived process; `taskq service install` makes the OS keep it running (§ 8).
 One loop:
 
-1. Reap exited children; a child whose attempt is still current posts `gone attempt <id>` with the exit code.
+1. Reap exited children; a child whose attempt is still current posts `gone attempt <id>` with the exit code, unless the
+   attempt wrote `ask`, `result` or `requeue` after the child started: a clean exit; step 6 resumes it from its inbox.
 2. Stop children whose attempt is no longer current (R11). Remove worktrees of closed tasks (§ 7).
 3. Write the heartbeat issue `taskq host <name>` (label `taskq-host`) when older than `ttl / 5`: lines `version <v>`
    and `#<N> <id>` per live child or launch held by the load gate, plus `at <board time>` (a same-body edit keeps `updated_at`). Freshness uses the board's `updated_at` and the response `Date`, never local clocks.

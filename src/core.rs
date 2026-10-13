@@ -147,6 +147,11 @@ pub fn delivery(n: u64, entries: &[Entry], id: u64) -> String {
     options(&card).into_iter().find(|o| Some(o.0) == k).map(|o| o.1).unwrap_or_else(|| head.trim().to_string())
 }
 
+/// Whether attempt `a` wrote `ask`, `result` or `requeue` after entry `after`: its child then exits clean (§ 4 step 1).
+pub fn handed_in(n: u64, entries: &[Entry], a: u64, after: u64) -> bool {
+    entries.iter().filter(|e| e.id > after && !e.edited).filter_map(|e| parse(n, &e.body)).any(|l| l.attempt == Some(a) && matches!(l.kind, "ask" | "result" | "requeue"))
+}
+
 fn has_options(s: &str) -> bool {
     s.lines().any(|l| l.split_once(". ").is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
 }

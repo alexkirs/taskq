@@ -4,6 +4,7 @@ Review of the integrated browser candidate against shared D1–D14, TaskQ M/I/K/
 
 | Finding | Correction | Rule |
 |---|---|---|
+| Plan shortcut repeats the word Plan beside an already descriptive title | Show the plan name followed by its state; keep the whole shortcut clickable | D4/D9 |
 | Fixture selectors interrupt questions and normal settings | One preview-tools toggle outside the product; diagnostics hidden by default, preserved for tests | D4/D13 |
 | Repeated context and draft explanations compete with actions | Short labels; provenance, capabilities and long explanations in Details | D4/D9 |
 | Three view modes crowd the admission strip | Stable view controls on first row; admission/pause/stop aligned together below when necessary | D2/D8 |

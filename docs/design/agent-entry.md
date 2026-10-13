@@ -79,3 +79,5 @@ Source review: design worktree baseline `d7fd593`; not a fresh installed-release
 - A-A7: owner answers in menu while PM is offline; PM refreshes and does not re-answer the resolved card. Unknown submission reconciles before retry.
 
 Planning/start behavior follows [P2](plans-and-decisions.md#p2-ai-led-authoring): create held by default; explicit start; one brief reminder after an actionable planning milestone, no repeated reminder per message.
+
+Remote-server application: [remote manager](remote-manager.md) defines project-chat routing, Hermes/FRA migration, observation delivery and qualification without adding a worker runtime.

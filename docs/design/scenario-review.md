@@ -8,7 +8,7 @@ Not a fresh installed-release audit, live execution test or runtime implementati
 
 Walk entry → intended action → observable outcome → failure/recovery for each case.
 Prefer existing commands/roles before a new subsystem. Keep unsupported alternatives visible as limitations.
-All 16 cases now have a specified route and named gaps. None is marked end-to-end verified merely from specification coverage or a browser fixture.
+All 17 cases now have a specified route and named gaps. None is marked end-to-end verified merely from specification coverage or a browser fixture.
 
 ## Case matrix
 
@@ -31,6 +31,8 @@ All 16 cases now have a specified route and named gaps. None is marked end-to-en
 | UC-15 Daily oversight | Attention → task/project; settings → named service; exact detail behind small icon | 20 projects, large type, overflow, stale counts, hidden window, bad update → preserved routes and truthful state | D11/D13; G8; full native matrix |
 
 UC-16 Custom icon: describe → catalogue/validated draft → actual-size comparison → approval → saved preference → re-edit/revert. Agent unavailability, unsupported primitives, corrupt config and font/DPI changes retain a valid active icon. CI-A1–CI-A7 and native persistence remain qualification gates.
+
+UC-17 Remote PM: project chat → held plan → explicit service start → opt-in observation → numbered owner answer → result with evidence. Switching conversation project leaves admission/watch scope unchanged. [RM-A1–A9](remote-manager.md#rm7-acceptance-and-implementation-order) cover stale answers, independent observers, gateway restart, authorized media and Codex-only Auto. [FRA audit](remote-manager-audit.md) is read-only baseline evidence, not an end-to-end pass.
 
 ## Cross-case invariants
 

@@ -1,0 +1,32 @@
+{
+  "date": "2026-10-14",
+  "status": "Accepted design and browser prototype; native/backend qualification pending",
+  "taskq_files": {
+    "docs/design/README.md": "39d3ee6130dd5d77cc317698e673bb9a2ecfd851c188e145ae6aceeddaea3921",
+    "docs/design/implementation-brief.md": "ee016d92888f4c790b96daed009ef5d4519bcd574d9dc8b92cbd2b3cf0bc94c5",
+    "docs/design/refactoring-backlog.md": "b0d1a9c604f77f1965f0f0d7be54b75b016ac0e4f1cb5872417b87d2b30da764",
+    "docs/design/system-change-map.md": "ecfb7515921b84607620e5685621a0e638f38fb037effc8dd35cb58717fa6772",
+    "docs/design/ui-acceptance.md": "9c8393f9c97d99161eed7941f41b49dffffbf707d04020117886defe7583be7d",
+    "docs/design/decision-register.md": "4d6a653cf84975742c5b92004267eafc28c2370ab2eb543a91f8804731c84c1b",
+    "docs/design/remote-manager.md": "2cdd99e239abcc64cee8ff9ca698fdf081d1b2e08970b4f63d0286d8e48c0377",
+    "docs/design/menu-final-review.md": "8f691b96707bdb12a70fc54e26d2068d8307de2eada067d9ca93485c53ed055d",
+    "docs/design/workspace-prototype.html": "ecd3bf2a8ecc5c94d8e5d9d1aee80ada86f070b26408ffa1ae294f0e6294e79d",
+    "docs/design/workspace-preview.html": "ddb97ff98be0a00ef0cc53a27aa38e7481c90df4acc82ba2c9eb5b64569ae48e",
+    "docs/design/build-workspace-preview.py": "dc6c2ee2161cc6df0a5c728aeda1e54954bfef4445f4c4dbb185d7d3234d9d12",
+    "docs/design/menu-next-variants.html": "9964a2726c709538fd66bf5d5c2c647bac6fe14dd083eff1545497dd3a49860c",
+    "docs/design/ai-conversations.html": "e3bcfe9684b9f09a14cfb7f7ae7375f93305413603fff89b2b3c14d71698c510",
+    "docs/design/agent-settings.html": "f4bfd220ebe6b91651a18aad3f8bcc21fb566e8394a0b0a7ecc492e00a3768b4",
+    "docs/design/agent-behavior.html": "83a15bda7c9e6239b41e64289bfe4498fc3875d48e80504ae725acae39eaf2d3",
+    "docs/design/plans-and-decisions.html": "af709b707368a55d3053db3d4c5c2da9ac2c14e842586526fdd5d4a1f41bb7b0",
+    "docs/design/custom-icon.html": "78f5dfe8e428d4ef81aa58c644b1cba8d41786d8eebb2916c6cfc6d552ae9339",
+    "docs/design/icon-summary.config.json": "ae12d6d959677e633e9bfe1c32d1240c8cd1b1f4d947e262aa0ab52960ce7d4d",
+    "docs/design/ui-acceptance-fixtures.json": "d75b7925d2d344ec90f01c0fae68054c301d4c75e253e9109d154cd39e456451"
+  },
+  "specq_files": {
+    "design/workflow.md": "5e31edb2ed9f68730001507619f823affc1b92cfcd43f523348e3a4d1a207615",
+    "design/workflow-review.md": "e40f102f1e0baab73029f3b4c7b96e0651a17afffe48201df8ff10c0226a9b95",
+    "engineering/use-cases.md": "8c6dd062e8c062f95eadd70760b0ed57440388b6129cd36e6fadca0b67fcdfab",
+    "engineering/verification.md": "694fb9c3498103ccbdd957df1cd5e15f9dfc1b5dfff9e182f08e5455c72429e5"
+  },
+  "specq_revision": "9f82cc6"
+}

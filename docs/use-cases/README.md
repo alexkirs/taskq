@@ -294,3 +294,16 @@ Resource refinement for UC-01/04/12: [Auto admission](../design/dynamic-resource
 ## UC-16 Describe and revise a tray icon
 
 Choose Custom → agent inspects the icon tools/current config → compare supported drafts at real size → refine by voice/text → approve exact draft → save local appearance. Reopen to edit or revert. Summary is a built-in config of the same renderer; copying it never changes the original. No agent available: direct editing remains usable. Invalid draft/save failure keeps the current icon. [CI1–CI5](../design/custom-icon.md).
+
+## UC-17. Plan and supervise through a remote chat agent
+
+Source: owner; FRA/Hermes with Codex workers. [Remote manager RM1–RM7](../design/remote-manager.md).
+
+- Open a project chat; discuss work and create an agreed held plan. Explicit start authorizes service execution.
+- Let the host admit workers under qualified Auto; inspect actual limits, pressure and waiting reasons.
+- Say “watch this work”; receive meaningful progress, numbered questions and final evidence. Answer in the same chat.
+- Name another registered project for a one-off request or explicitly switch the conversation default. Keep execution and watch scope unchanged unless requested.
+- Send images/files; receive supported materials and durable board references.
+- After gateway loss, reconcile pending questions and results. Stop watching independently from pausing work.
+
+Result: a replaceable remote PM provides planning and owner control while TaskQ executes independently. Existing integration and remaining qualification are recorded in the [FRA audit](../design/remote-manager-audit.md). Covers UC-02/03/07/09/10/12/14 without a second queue.

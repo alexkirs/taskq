@@ -1,4 +1,4 @@
-# § 8 Release: one binary per OS, SHA256SUMS, latest.json. A failing selftest publishes nothing.
+# § 8 Release: one binary per OS, SHA256SUMS, latest.json; binaries and SHA256SUMS carry build provenance attestations. A failing selftest publishes nothing.
 name: release
 on:
   push:
@@ -45,11 +45,12 @@ jobs:
         with:
           name: ${{ matrix.target }}
           path: dist/*
-  publish:
+  attest:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -69,6 +70,26 @@ jobs:
                   files[name[len(f'taskq-{ver}-'):].removesuffix('.exe')] = name
           json.dump({'version': ver, 'files': files}, open('latest.json', 'w'), indent=1)
           PY
+      # v4.2.2
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: |
+            dist/taskq-*
+            dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/*
+  publish:
+    needs: attest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}

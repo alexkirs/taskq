@@ -172,7 +172,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
             "Review the result SHA against each Acceptance item `A<k>` and taskq.md, and CI on that exact SHA. Requeue only for\n\
              Acceptance or contract gaps, not style; a changed or deleted existing test is a gap unless the diff changes its rule.\n\
              Then exactly one of:\n\
-             - `{q} close {n} --text \"Changed: <user effect>\nChecks: A1 ok, A2 ok; CI <outcome> on <SHA>\nOpen: <item|none>\"` (it publishes; gap or unknown requires requeue),\n\
+             - `{q} close {n} --text \"Changed: <user effect>\nChecks: A1 ok|gap|unknown, A2 ..; CI <outcome> on <SHA>\nOpen: <item|none>\"` (it publishes),\n\
              - `{q} requeue {n} --text \"<exact fixes>\"`,\n\
              - {ask}.\n{formats}",
             ask = ask(&q, n),

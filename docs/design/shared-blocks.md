@@ -31,6 +31,8 @@ A compact summary may defer detail to the same full component. Record that route
 - Preserve Work mode's explicit target selection and full review; missing grant or capability has a reason. A summary's used/limit is not a new admission model. Current policies and untouched fields survive opening and cancellation.
 - One answer editor per board/task/revision; Attention and Boards reach that instance. Refresh preserves draft/focus and never substitutes a new question silently.
 
+Accepted extension: [finding tasks F1–F4](finding-tasks.md) owns the shared task composer, project choice and create/readback path. Consumers reuse these primitives; a new DashQ-only editor is not permitted.
+
 ## B4 Acceptance
 
 The consumer handoff includes a parent-to-child map: source revision, component/variant, permitted placement differences, deferred routes and evidence. Reuse the existing [UI ledger](ui-acceptance.md), not a second state specification.

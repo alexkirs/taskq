@@ -1,5 +1,6 @@
 //! The `taskq` command line (taskq.md § 5). Every write is one `taskq:` comment that `fold` accepts.
 
+mod admission;
 mod board;
 mod core;
 mod data;
@@ -529,6 +530,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         s.reload(cap);
         s.mono = began.elapsed().as_secs();
+        s.wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         // § 4 Data: an unreadable focus admits nothing and reads unknown with its reason
         let focus = data::focus(&cfg.root);
         if focus.as_ref().err() != focus_error.as_ref() {
@@ -537,6 +539,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         s.focus = focus.unwrap_or_default();
         let r = s.pass();
+        s.sync_host();
         for l in s.log.drain(..) {
             eprintln!("{l}");
         }
@@ -626,8 +629,11 @@ fn service_run(c: &Ctx) -> Res<()> {
             s.mono = began.elapsed().as_secs();
             let wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
             if s.gate.enabled() {
+                s.gate.host_mem = platform::host_memory();
                 s.gate.observe(s.mono, wall as i64, platform::cpu_ticks(), platform::memory_available());
             }
+            s.wall = wall as i64;
+            s.sync_host();
             status["tasks_age_seconds"] = json!(s.tasks_read.map(|t| t.elapsed().as_secs()));
             status["capacity"] = s.capacity_json();
             status["at"] = json!(wall);
@@ -672,7 +678,7 @@ impl CapEdit {
     }
 }
 
-const RUNTIMES: [&str; 3] = ["claude", "codex", "codex-app"];
+use service::RUNTIMES;
 
 /// `taskq.json` text with `e` applied to `host` (§ 9): only that host's `capacity_hosts` entry changes, other keys
 /// and their order stay. `expect`: the capacity the owner saw; a different current one is a concurrent edit.
@@ -758,10 +764,23 @@ fn gate_text(c: &Value) -> String {
     match c["gate"].as_str() {
         Some("off") => "Off".into(),
         Some("open") => "Ready".into(),
-        Some("held") => format!("Waiting: {}", reasons(&["cpu", "memory", "cooldown"]).into_iter().map(|r| match r["code"].as_str() { Some("cpu") => "CPU", Some("memory") => "memory", _ => "recovery" }).collect::<Vec<_>>().join(", ")),
-        Some(_) => format!("Unknown: {}", reasons(&["sample", "config"]).into_iter().filter_map(|r| r["text"].as_str()).collect::<Vec<_>>().join("; ")),
+        Some("held") => format!("Waiting: {}", reasons(&["cpu", "memory", "cooldown", "max", "spacing", "version"]).into_iter().map(|r| match r["code"].as_str() { Some("cpu") => "CPU", Some("memory") => "memory", Some("max") => "host maximum", Some("spacing") => "host spacing", Some("version") => "old service", _ => "recovery" }).collect::<Vec<_>>().join(", ")),
+        Some(_) => format!("Unknown: {}", reasons(&["sample", "config", "host"]).into_iter().filter_map(|r| r["text"].as_str()).collect::<Vec<_>>().join("; ")),
         None => "Unknown: service has no capacity status".into(),
     }
+}
+
+/// The admission line of a `status.json` capacity (§ 3): mode, host ceiling and use, own reservations.
+fn admission_text(c: &Value) -> String {
+    let n = |v: &Value| v.as_u64().map_or("unknown".into(), |n| n.to_string());
+    let a = &c["admission"];
+    let mode = match a["mode"].as_str() {
+        Some("auto") => format!("Auto · host {} / {} held", n(&c["host_used"]), a["max"].as_u64().map_or("no max".into(), |m| m.to_string())),
+        Some(_) => "Fixed".into(),
+        None => "unknown (service older than this release)".into(),
+    };
+    let res: Vec<String> = c["reservations"].as_array().into_iter().flatten().map(|r| format!("#{} {}", r["task"], r["state"].as_str().unwrap_or("?"))).collect();
+    format!("Admission: {mode}{}", if res.is_empty() { String::new() } else { format!(" · {}", res.join(", ")) })
 }
 
 /// `taskq service capacity` (§ 5).
@@ -788,15 +807,18 @@ fn capacity_cmd(root: &Path, a: &Args) -> Res<()> {
             println!("{} {used}/{}", runtime_name(rt), limits[rt].as_u64().unwrap_or(0));
         }
         match (&c, &saved) {
-            (Some(c), _) => println!("Load gate: {}", gate_text(c)),
+            (Some(c), _) => {
+                println!("Load gate: {}", gate_text(c));
+                println!("{}", admission_text(c));
+            }
             (None, Err(e)) => println!("Unknown: {e}"),
             (None, Ok(_)) if host != cfg.me => println!("Unknown: no local snapshot of {host}"),
             (None, Ok(_)) => println!("Unknown: service has no fresh capacity status"),
         }
         if let (Some(c), Ok(s)) = (&c, &saved)
-            && (c["limits"] != s.json()["limits"] || c["load_gate"] != s.json()["load_gate"])
+            && (c["limits"] != s.json()["limits"] || c["load_gate"] != s.json()["load_gate"] || c["admission"] != s.json()["admission"])
         {
-            println!("Saved config differs: {}", cap_changes(&service::Capacity { limits: serde_json::from_value(c["limits"].clone()).unwrap_or_default(), gate: s.gate }, s));
+            println!("Saved config differs: {}", cap_changes(&service::Capacity { limits: serde_json::from_value(c["limits"].clone()).unwrap_or_default(), ..s.clone() }, s));
         }
         return Ok(());
     }
@@ -815,6 +837,7 @@ fn capacity_cmd(root: &Path, a: &Args) -> Res<()> {
             && st["at"].as_u64().is_some_and(|t| t >= wrote)
             && st["capacity"]["limits"] == saved.json()["limits"]
             && st["capacity"]["load_gate"] == saved.json()["load_gate"]
+            && st["capacity"]["admission"] == saved.json()["admission"]
         {
             println!("Applied in {project} on {host}: {changes}; running tasks continue");
             return Ok(());

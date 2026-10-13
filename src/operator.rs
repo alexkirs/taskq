@@ -446,7 +446,7 @@ impl Setup {
         if !self.origin() {
             v.push(format!("Add git remote origin https://{}/{}.git", self.host, self.repo));
         }
-        v.push(format!("Write taskq.json: board {}, repo {}, publish {}", self.board, self.repo, self.publish));
+        v.push(format!("Write taskq.json: board {}, repo {}, publish {}, Auto admission", self.board, self.repo, self.publish));
         let who = self.incident_reports.then(|| incident_account(self.host == "github.com")).flatten();
         v.extend(incident_disclosure(self.incident_reports, who.as_deref()));
         v.push(format!("Create the taskq labels on {}", self.repo));
@@ -498,7 +498,7 @@ fn apply_setup(install: &Path, exe: &Path, root: &Path, ops: &[Value], shown: &V
             cmd("git", &["remote", "add", "origin", &format!("https://{}/{}.git", s.host, s.repo)], root, &[])?;
             lines.push("origin: added".into());
         }
-        let c = json!({"board": s.board, "host": s.host, "repo": s.repo, "publish": s.publish, "incident_reports": s.incident_reports});
+        let c = json!({"board": s.board, "host": s.host, "repo": s.repo, "publish": s.publish, "incident_reports": s.incident_reports, "admission": {"mode": "auto"}}); // § 9: new projects start in Auto
         if root.join("taskq.json").exists() {
             return Err("taskq.json appeared meanwhile: nothing overwritten".into());
         }
@@ -696,7 +696,7 @@ mod tests {
         assert_eq!(p["state"], "proposal");
         let e: Vec<&str> = p["effects"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
         assert!(e[0].starts_with("Run git init in ") && e[1] == "Use existing repository github.com/o/n" && e[2] == "Add git remote origin https://github.com/o/n.git", "{e:?}");
-        assert_eq!(e[3], "Write taskq.json: board github, repo o/n, publish direct");
+        assert_eq!(e[3], "Write taskq.json: board github, repo o/n, publish direct, Auto admission");
         assert_eq!(e[4], "Incident reports: disabled (incident_reports: false); nothing sent or saved");
         assert_eq!(e[5], "Create the taskq labels on o/n");
         assert!(e[6].starts_with("Register ") && e.len() == 7);

@@ -145,6 +145,17 @@ pub fn memory_available() -> Option<f64> {
     meminfo(&fs::read_to_string("/proc/meminfo").ok()?)
 }
 
+/// Available GiB and the memory pressure level: `MemAvailable`; Linux has no pressure level (0 never holds).
+#[cfg(target_os = "linux")]
+pub fn host_memory() -> Option<(f64, u32)> {
+    let t = fs::read_to_string("/proc/meminfo").ok()?;
+    let kb = t.lines().find_map(|l| l.strip_prefix("MemAvailable:")?.trim().strip_suffix("kB")?.trim().parse::<f64>().ok())?;
+    Some((kb / GIB * 1024.0, 0))
+}
+
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code))]
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
 #[cfg(target_os = "macos")]
 mod mach {
     unsafe extern "C" {
@@ -178,6 +189,22 @@ pub fn cpu_ticks() -> Option<(u64, u64)> {
 /// reclaimable memory, not Apple's pressure metric; compressed and purgeable pages are not counted again.
 #[cfg(target_os = "macos")]
 pub fn memory_available() -> Option<f64> {
+    vm().map(|(avail, total)| avail as f64 * 100.0 / total as f64)
+}
+
+/// Available GiB (as [`memory_available`]) and `kern.memorystatus_vm_pressure_level` (1 normal, 2 warning, 4 critical).
+#[cfg(target_os = "macos")]
+pub fn host_memory() -> Option<(f64, u32)> {
+    let (mut level, mut len) = (0u32, std::mem::size_of::<u32>());
+    // SAFETY: the level is a plain int output of the given size
+    let ok = unsafe { libc::sysctlbyname(c"kern.memorystatus_vm_pressure_level".as_ptr(), (&mut level as *mut u32).cast(), &mut len, std::ptr::null_mut(), 0) } == 0;
+    (ok && len == 4).then_some(())?;
+    Some((vm()?.0 as f64 / GIB, level))
+}
+
+/// `(available, total)` bytes.
+#[cfg(target_os = "macos")]
+fn vm() -> Option<(u64, u64)> {
     let (mut v, mut n, mut page) = ([0i32; 38], 38u32, 0usize);
     let (mut total, mut len) = (0u64, std::mem::size_of::<u64>());
     // SAFETY: flavor 4 fills HOST_VM_INFO64_COUNT (38) integer_t; the size and memsize outputs are plain integers
@@ -187,7 +214,7 @@ pub fn memory_available() -> Option<f64> {
             && libc::sysctlbyname(c"hw.memsize".as_ptr(), (&mut total as *mut u64).cast(), &mut len, std::ptr::null_mut(), 0) == 0
     };
     let avail = (v[0] as u32 as u64 + v[2] as u32 as u64) * page as u64;
-    (ok && total > 0 && avail <= total).then(|| avail as f64 * 100.0 / total as f64)
+    (ok && total > 0 && avail <= total).then_some((avail, total))
 }
 
 #[cfg(windows)]
@@ -230,6 +257,14 @@ pub fn memory_available() -> Option<f64> {
     Some(m.avail_phys as f64 * 100.0 / m.total_phys as f64)
 }
 
+/// Available GiB; Windows has no pressure level here (0 never holds).
+#[cfg(windows)]
+pub fn host_memory() -> Option<(f64, u32)> {
+    let mut m = win::MemoryStatusEx { length: std::mem::size_of::<win::MemoryStatusEx>() as u32, load: 0, total_phys: 0, avail_phys: 0, rest: [0; 5] };
+    // SAFETY: dwLength set as the API requires
+    (unsafe { win::GlobalMemoryStatusEx(&mut m) } != 0).then(|| (m.avail_phys as f64 / GIB, 0))
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn cpu_ticks() -> Option<(u64, u64)> {
     None
@@ -240,9 +275,22 @@ pub fn memory_available() -> Option<f64> {
     None
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn host_memory() -> Option<(f64, u32)> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: § 3 Auto memory floor. Risk: the floor or pressure reading fails on a real host and Auto never admits.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn host_memory_reads_on_this_host() {
+        let (gib, level) = host_memory().unwrap();
+        assert!(gib > 0.0 && level <= 4, "{gib} GiB, level {level}");
+    }
 
     // Chain: § 8 shared update across services. Risk: a second service downloads or misses the update.
     #[test]

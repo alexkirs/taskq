@@ -166,20 +166,36 @@ fn ready(t: &mut Task) {
 }
 
 pub fn fold(n: u64, entries: &[Entry], deps_open: bool) -> Task {
+    replay(n, entries, deps_open).0
+}
+
+/// Owner comments (§ 4): ids of the bare comments that the open `ask` ignored, i.e. that name no option of its card.
+pub fn owner_comments(n: u64, entries: &[Entry]) -> Vec<u64> {
+    replay(n, entries, false).1
+}
+
+fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>) {
     let mut log: Vec<&Entry> = entries.iter().filter(|e| !e.edited).collect();
     log.sort_by_key(|e| e.id);
     let mut t = Task::default();
     let mut resume = None; // the state an `ask` entry left; None when a retry limit asked
+    let mut free = vec![];
     for e in log {
         if let Some(l) = parse(n, &e.body) {
+            let asked = t.state == State::Ask;
             step(&mut t, &mut resume, e.id, &l);
+            match (asked, t.state == State::Ask) {
+                (true, true) if l.bare && !e.body.trim().is_empty() => free.push(e.id),
+                (_, false) => free.clear(),
+                _ => {}
+            }
         }
     }
     // ponytail: dependencies are judged at read time only, so a hand-typed spawn while waiting is accepted
     if t.state == State::Ready && deps_open {
         t.state = State::Waiting;
     }
-    t
+    (t, free)
 }
 
 fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line) {
@@ -353,5 +369,17 @@ mod tests {
         assert_eq!(super::delivery(7, &log, 12), "y");
         log[2] = e(12, "taskq answer 3");
         assert_eq!(super::delivery(7, &log, 12), "taskq answer 3");
+    }
+
+    #[test]
+    fn only_free_comments_of_the_open_ask_are_owner_comments() {
+        let e = |id, body: &str| super::Entry { id, body: body.into(), edited: false };
+        let mut log = vec![e(9, "before any ask"), e(10, "taskq: spawn worker claude:s1 mac"), e(11, "taskq: ask attempt 10\nWhich?\n1. x\n2. y ★")];
+        log.extend([e(12, "x or y? prefer z"), e(13, "taskq: steer\nlog entry"), e(14, "  ")]);
+        log.push(super::Entry { id: 15, body: "edited".into(), edited: true });
+        assert_eq!(super::owner_comments(7, &log), [12]);
+        log.push(e(16, "2"));
+        assert_eq!(super::owner_comments(7, &log), [0u64; 0], "an option answers the ask: as today, no owner comment");
+        assert_eq!(super::fold(7, &log, false).state, super::State::Doing);
     }
 }

@@ -115,7 +115,7 @@ fn newest(install: &Path) -> Value {
     for _ in 0..crate::operator::KEEP {
         let q = crate::operator::read(&crate::operator::dir(root).join(format!("{current}.json")));
         if q.is_null() { break; }
-        chain.push(json!({"id": current, "text": q["text"], "answer": crate::operator::read(&crate::operator::answer_path(root, &current))}));
+        chain.push(json!({"id": current, "text": q["text"], "task": q["task"], "url": q["url"], "answer": crate::operator::read(&crate::operator::answer_path(root, &current))}));
         let Some(after) = q["after"].as_str().filter(|a| !a.is_empty() && a.bytes().all(|b| b.is_ascii_digit())) else { break };
         if chain.iter().any(|q| q["id"] == after) { break; }
         current = after.to_string();

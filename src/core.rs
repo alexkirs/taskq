@@ -367,6 +367,7 @@ pub const GOLDEN: &str = include_str!("../tests/golden/fold.json");
 
 #[cfg(test)]
 mod tests {
+    // Chain: § 2 fold over tests/golden. Risk: fold drifts from the traces; a wrong expectation still passes.
     #[test]
     fn golden_traces() {
         assert!(super::golden(super::GOLDEN).unwrap() > 20);
@@ -375,6 +376,7 @@ mod tests {
     }
 
     /// R8 made mechanical: every (state, entry) pair of the § 2 table is accepted by some golden trace.
+    // Chain: R8 § 2 table to golden traces; spec size. Risk: a § 2 row without a trace, taskq.md over 300 lines or dated.
     #[test]
     fn every_table_row_has_a_golden_trace() {
         let spec = include_str!("../taskq.md");
@@ -415,6 +417,7 @@ mod tests {
         assert!(!spec.as_bytes().windows(10).any(dated), "taskq.md holds a date: history goes to git and issues");
     }
 
+    // Chain: § 2 ask answer to resumed worker. Risk: the worker resumes with the wrong answer text.
     #[test]
     fn delivery_falls_back_to_option_then_first_line() {
         let e = |id, body: &str| super::Entry { id, body: body.into(), edited: false };
@@ -431,6 +434,7 @@ mod tests {
         assert_eq!(super::delivery(7, &log, 12), "taskq answer 3");
     }
 
+    // Chain: § 2 ask to owner comment request. Risk: taskq entries or edited text treated as an owner request.
     #[test]
     fn only_free_comments_of_the_open_ask_are_owner_comments() {
         let e = |id, body: &str| super::Entry { id, body: body.into(), edited: false };

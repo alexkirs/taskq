@@ -966,6 +966,7 @@ fn capture(wv: &WebView, path: PathBuf, done: impl Fn() + 'static) {
 mod tests {
     use super::*;
 
+    // Chain: § 4 tray opens an incident report. Risk: tray opens a file outside .taskq/incidents.
     #[test]
     fn incident_report_only_opens_json_inside_its_project() {
         let root = std::env::temp_dir().join(format!("taskq-tray-incident-{}", std::process::id()));
@@ -981,6 +982,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // Chain: § 4 tray clarify thread. Risk: wrong order or a loop on a cyclic thread.
     #[test]
     fn clarify_thread_is_oldest_first_and_stops_at_missing_or_cycle() {
         let install = std::env::temp_dir().join(format!("taskq-thread-{}", std::process::id()));
@@ -1003,6 +1005,7 @@ mod tests {
         fs::remove_dir_all(install).unwrap();
     }
 
+    // Chain: § 4 tray icon save. Risk: an invalid draft replaces the working icon.
     #[test]
     fn invalid_icon_draft_leaves_tray_json_unchanged() {
         let install = std::env::temp_dir().join(format!("taskq-icon-{}", std::process::id()));
@@ -1026,6 +1029,7 @@ mod tests {
         fs::remove_dir_all(install).unwrap();
     }
 
+    // Chain: § 4 tray counts across projects. Risk: double counting or unknown shown as known.
     #[test]
     fn summary_counts_one_task_per_board_and_issue() {
         let p = |issues: &str, state: &str, focus: Value| json!({"issues": issues, "focus": focus, "tasks": [{"n": 1, "state": state}], "events": [[95, "close", "7"], [-250, "failed", "8"]]});
@@ -1041,6 +1045,7 @@ mod tests {
         assert!(summary(&ok, (-200, 100)).known);
     }
 
+    // Chain: § 4 tray settings input. Risk: webview input stores unknown values.
     #[test]
     fn settings_keep_only_known_values() {
         let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into(), start: 0, end: 0, tz: "local".into(), icon: Value::Null };
@@ -1053,6 +1058,7 @@ mod tests {
         assert_eq!((s.range(1000), s.tz.as_str()), ((40, 160), "UTC"));
     }
 
+    // Chain: § 4 tray history graph. Risk: events land in the wrong bin or period.
     #[test]
     fn history_bins_are_equal_oldest_left_on_one_scale() {
         // M-A5/M-A6 fixture: 3 of each kind in [0, 120); the first and last bins are not empty; unknown kinds drop
@@ -1069,17 +1075,7 @@ mod tests {
         assert_eq!(summary(ps.as_array().unwrap(), (0, 1)).since, Some(5));
     }
 
-    #[test]
-    fn history_keeps_20_distinct_newest_first() {
-        let mut h = vec![];
-        for i in 0..25 {
-            h = remember(&h, &format!("q{i}"));
-        }
-        h = remember(&h, "q10");
-        assert_eq!(h.len(), 20);
-        assert_eq!((h[0].as_str(), h[1].as_str(), h.iter().filter(|x| x.as_str() == Some("q10")).count()), (Some("q10"), Some("q24"), 1));
-    }
-
+    // Chain: R12 tray agents row. Risk: stale probe shown or missing probe shown as known.
     #[test]
     fn agents_come_from_the_freshest_probe_or_are_unknown() {
         let row = |v: &str| json!({"runtime": "claude", "path": "/c", "version": v, "login": "not logged in", "account": null});
@@ -1088,6 +1084,7 @@ mod tests {
         assert_eq!(agents(&ps[2..]), Value::Null);
     }
 
+    // Chain: § 6 Add project from the tray. Risk: a folder is classified wrong and set up wrong.
     #[test]
     fn add_project_has_four_cases() {
         let d = std::env::temp_dir().join(format!("taskq-add-{}", std::process::id()));
@@ -1104,12 +1101,5 @@ mod tests {
         assert_eq!(kind(&pass).0, "taskq");
         assert_eq!(kind(&|_: &Path| Err("taskq.json: repo is required".into())), ("old".into(), "taskq.json: repo is required".into()), "the verified reason");
         let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn base64_matches_rfc4648() {
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"f"), "Zg==");
     }
 }

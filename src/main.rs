@@ -1324,6 +1324,7 @@ mod tests {
     use super::*;
     use board::Fake;
 
+    // Chain: § 5 capacity edit. Risk: an invalid edit replaces the file.
     #[test]
     fn capacity_edit_keeps_the_file_and_validates() {
         let text = "{\n    \"repo\": \"o/r\",\n    \"limits\": {\"claude\": 4, \"codex\": 4},\n    \"hosts\": {\"a\": \"win\"},\n    \"zeta\": 1\n}\n";
@@ -1370,6 +1371,7 @@ mod tests {
         }
     }
 
+    // Chain: § 5 CLI arguments. Risk: stray words silently dropped from a command.
     #[test]
     fn unused_positionals_are_rejected() {
         let parse = |v: &[&str]| Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
@@ -1385,6 +1387,7 @@ mod tests {
         }
     }
 
+    // Chain: § 5 taskq add. Risk: an invalid task is written to the board.
     #[test]
     fn add_uses_canonical_names_defaults_and_validates_before_writing() {
         let c = Ctx { cfg: cfg(), raw: json!({}), board: Box::new(Fake::default()) };
@@ -1407,6 +1410,7 @@ mod tests {
         assert_eq!(c.board.issues(None).unwrap().len(), 3);
     }
 
+    // Chain: § 1 task body. Risk: over-limit text or a wrong body is written.
     #[test]
     fn add_renders_the_task_body_and_rejects_over_limit_text() {
         let c = Ctx { cfg: cfg(), raw: json!({}), board: Box::new(Fake::default()) };
@@ -1426,6 +1430,7 @@ mod tests {
         assert_eq!(c.board.issues(None).unwrap().len(), 2, "rejected input writes nothing");
     }
 
+    // Chain: § 2 Ask card. Risk: a card breaks the template or limits.
     #[test]
     fn ask_card_follows_section_2() {
         let card = ask_card(7, "Done: checked spec\nProblem: two ways\nboth slow", &["left".into(), "right, slower".into()], Some("2"), &["https://g/o/r/pull/12".into(), "[shot](https://x/y.png)".into()]).unwrap();
@@ -1444,6 +1449,7 @@ mod tests {
         assert_eq!(width("see [#12](https://very/long/url) and `cargo test --locked` https://x/y"), 15, "link targets and code are exempt; outside whitespace counts");
     }
 
+    // Chain: § 4 service uninstall. Risk: an unreadable registry loses the unit.
     #[test]
     fn unreadable_registry_preserves_unit_before_unload() {
         let root = std::env::temp_dir().join(format!("taskq-registry-{}", std::process::id()));
@@ -1469,6 +1475,7 @@ mod tests {
         fs::remove_dir(&root).unwrap();
     }
 
+    // Chain: § 4 service uninstall failure. Risk: a failed uninstall loses registration.
     #[test]
     fn failed_uninstall_preserves_unit_and_project_registration() {
         let root = std::env::temp_dir().join(format!("taskq-uninstall-{}", std::process::id()));
@@ -1489,6 +1496,7 @@ mod tests {
         fs::remove_dir(&root).unwrap();
     }
 
+    // Chain: § 7 close verdict. Risk: a padded verdict publishes.
     #[test]
     fn padded_close_verdict_is_rejected_before_publication() {
         let c = Ctx { cfg: cfg(), raw: json!({}), board: Box::new(Fake::default()) };
@@ -1508,6 +1516,7 @@ mod tests {
         }
     }
 
+    // Chain: § 7 Result and close templates. Risk: result or close text breaks the template.
     #[test]
     fn result_and_close_follow_section_7() {
         let checks = ["cargo test --locked -- pass\ncargo run -- selftest -- pass".to_string()];
@@ -1525,6 +1534,7 @@ mod tests {
         assert_eq!(formats_selftest().unwrap(), "formats: ask card, result, close verdict PASS");
     }
 
+    // Chain: § 2 card to hand-typed answer. Risk: a hand-typed answer to a rendered card is ignored.
     #[test]
     fn rendered_ask_card_resumes_the_worker_through_the_hand_typed_answer() {
         let b = Fake::default();
@@ -1540,6 +1550,7 @@ mod tests {
         assert_eq!(core::delivery(n, &log, log.last().unwrap().id), "right");
     }
 
+    // Chain: § 5 commands to board entries. Risk: a rejected command writes; close does not publish.
     #[test]
     fn commands_write_only_accepted_entries_and_close_publishes() {
         let (b, c) = (Fake::default(), cfg());
@@ -1560,6 +1571,7 @@ mod tests {
         assert!(!i.open && !i.labels.iter().any(|l| l.starts_with("q-")));
     }
 
+    // Chain: § 4 pause and resume focus. Risk: resume widens focus to all.
     #[test]
     fn resume_restores_the_saved_focus_and_never_defaults_to_all() {
         let root = std::env::temp_dir().join(format!("taskq-resume-{}", std::process::id()));
@@ -1578,6 +1590,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // Chain: R6 human report. Risk: report breaks the R6 format.
     #[test]
     fn report_follows_r6() {
         let (b, c) = (Fake::default(), cfg());
@@ -1611,6 +1624,7 @@ mod tests {
         b
     }
 
+    // Chain: § 5 status read model. Risk: status outputs disagree.
     #[test]
     fn text_json_and_service_status_count_from_one_snapshot() {
         let (b, c) = (snapshot_board(), cfg());
@@ -1640,6 +1654,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // Chain: R12 status unknown. Risk: an unreadable board shows zero.
     #[test]
     fn unreadable_board_snapshot_is_incomplete_not_zero() {
         let (b, c) = (Fake::default(), cfg());
@@ -1653,6 +1668,7 @@ mod tests {
         assert!(!snapshot::complete(&json!({"error": null, "complete": false, "tasks": []})));
     }
 
+    // Chain: § 5 status --json schema. Risk: status JSON drifts from tests/fixtures.
     #[test]
     fn status_json_matches_the_golden_fixture() {
         let snap = snapshot::read(&snapshot_board(), &cfg(), &Value::Null, &[]);
@@ -1664,6 +1680,7 @@ mod tests {
         assert_eq!(snap.json(), want, "TASKQ_BLESS=1 rewrites {}", path.display());
     }
 
+    // Chain: § 5 CLI text limits. Risk: invalid text is written.
     #[test]
     fn cli_audit_boundaries_and_no_write_on_invalid_text() {
         assert_eq!(width("a  b"), 4);
@@ -1702,6 +1719,7 @@ mod tests {
         assert!(report.contains(&format!("blocked (#{dep} open)")), "non-task dependency remains visible outside filter");
     }
 
+    // Chain: R6 compact report. Risk: compaction drops choices, links or evidence.
     #[test]
     fn compact_report_keeps_choices_links_and_original_evidence() {
         let (b, c) = (Fake::default(), cfg());
@@ -1725,6 +1743,7 @@ mod tests {
         assert_eq!(snapshot::brief("Old question?\n1. keep\n2. change"), "Old question?");
     }
 
+    // Chain: R12 service status fields. Risk: missing data shown as known; failed pause reported ok.
     #[test]
     fn service_fields_keep_missing_data_unknown_and_pause_reports_failure() {
         let root = std::env::temp_dir().join(format!("taskq-fields-{}", std::process::id()));
@@ -1759,6 +1778,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // Chain: § 5 error diagnostics. Risk: a compact error loses its full diagnostic.
     #[test]
     fn compact_errors_retain_complete_diagnostics() {
         let root = std::env::temp_dir().join(format!("taskq-error-{}", std::process::id()));

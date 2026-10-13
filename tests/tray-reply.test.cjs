@@ -1,4 +1,5 @@
-﻿const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+﻿// Chain: § 4 tray clarify reply in src/tray.html. Risk: wrong thread order, unescaped draft or Send enabled without text.
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
 const html=fs.readFileSync('src/tray.html','utf8');
 const source=html.slice(html.indexOf('const aiStates='),html.indexOf('// Add project'));
 const context={S:{projects:[],ai:{target:'p',history:[],request:{id:'2',root:'p',text:'reply',answer:{state:'clarify',text:'Newest question'},chain:[{text:'first',answer:{state:'clarify',text:'Older question'}},{text:'reply',answer:{state:'clarify',text:'Newest question'}}]}}},esc:s=>String(s).replaceAll('<','&lt;'),aiText:'<draft>',aiMenu:false,aiConfirm:null};

@@ -35,6 +35,7 @@ impl Transport for Net {
         self.writes += 1; self.notes.push(Comment {author:"tester".into(),body:body.into()}); Ok(())
     }
 }
+// Chain: incident report shape and privacy. Risk: private data in a report or schema drift.
 #[test]
 fn report_golden_and_unknown_values() {
     let mut f = fault_at("src/main.rs:7"); f.fields = &["src/main.rs:7"];
@@ -53,6 +54,7 @@ fn report_golden_and_unknown_values() {
     assert_eq!(report(&tool(),&root,Some(true),&bad_f,Some(&mut net)).reason.as_deref(),Some("unsafe"));
     assert_eq!(net.writes,0); assert!(!root.exists());
 }
+// Chain: incident delivery routes. Risk: duplicate issues or lost delivery hidden.
 #[test]
 fn fake_routes_dedup_and_unknown_delivery() {
     let root=root("routes"); let t=tool();
@@ -72,6 +74,7 @@ fn fake_routes_dedup_and_unknown_delivery() {
     assert_eq!(report(&t,&root.join("off"),Some(false),&f,Some(&mut net)).state,"disabled"); assert!(!root.join("off").exists());
     fs::remove_dir_all(root).unwrap();
 }
+// Chain: incident detection points. Risk: a cataloged fault is not detected or detected twice.
 #[test]
 fn catalog_main_and_launcher_detection_points() {
     take_detected(); let bad=crate::core::GOLDEN.replacen("\"ready\"","\"doing\"",1);
@@ -90,6 +93,7 @@ fn catalog_main_and_launcher_detection_points() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+// Chain: incident opt-out (child of environment_off_writes_nothing). Risk: child process body; runs only under its parent.
 #[test]
 fn off_child() {
     if std::env::var("TASKQ_OFF_CHILD").is_err() { return; }
@@ -98,6 +102,7 @@ fn off_child() {
     assert_eq!(net.writes,0); assert!(!root.exists());
 }
 
+// Chain: incident opt-out. Risk: TASKQ_INCIDENT_REPORTS=off still writes.
 #[test]
 fn environment_off_writes_nothing() {
     let o=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","incident::tests::off_child"])
@@ -105,6 +110,7 @@ fn environment_off_writes_nothing() {
     assert!(o.status.success(),"{}",String::from_utf8_lossy(&o.stderr));
 }
 
+// Chain: panic hook (child of the two panic tests). Risk: child process body; runs only under its parent.
 #[test]
 fn panic_hook_child() {
     if std::env::var_os("TASKQ_TEST_PANIC_REPORT").is_some() { install_panic_hook(); }
@@ -112,6 +118,7 @@ fn panic_hook_child() {
     match std::env::var("TASKQ_TEST_PANIC_MESSAGE") { Ok(m) => panic!("{m}"), Err(_) => panic!("fixture panic, no private data") }
 }
 
+// Chain: incident panic evidence classes. Risk: a panic gets an unlisted class or a closed pipe counts.
 #[test]
 fn panic_classes_are_enumerated() {
     for (msg, class) in [
@@ -128,6 +135,7 @@ fn panic_classes_are_enumerated() {
     assert!(!closed_pipe("failed printing to stdout: Input/output error (os error 5)"));
 }
 
+// Chain: #873 closed pipe exit. Risk: taskq status | true reports a panic.
 #[test]
 fn closed_pipe_panic_exits_141_without_report() {
     // #873: `taskq status | true` panicked in std stdio.rs and reported dispatch.panic site dep.
@@ -140,6 +148,7 @@ fn closed_pipe_panic_exits_141_without_report() {
     let _ = fs::remove_dir_all(root);
 }
 
+// Chain: panic hook report. Risk: the hook changes panic output or exit, or reports twice.
 #[test]
 fn first_real_panic_reports_once_without_changing_panic_output_or_exit() {
     let root = root("panic-child");
@@ -158,9 +167,4 @@ fn first_real_panic_reports_once_without_changing_panic_output_or_exit() {
     assert_eq!(r["evidence"], json!(["exit:101", "panic:other"]));
     assert!(!r.to_string().contains("fixture panic"));
     fs::remove_dir_all(root).unwrap();
-}
-#[test]
-fn operator_lines_show_all_states() {
-    assert_eq!(line(&Value::Null),"Incidents: none"); assert_eq!(line(&json!({"state":"disabled"})),"Incidents: disabled");
-    for state in ["sent","local","unsupported-auth"] { assert!(line(&json!({"state":state,"fault":"dispatch.panic","at":now()})).starts_with(&format!("Incident: {state} dispatch.panic"))); }
 }

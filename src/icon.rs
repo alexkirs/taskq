@@ -392,6 +392,7 @@ mod tests {
         i.px.chunks(4).any(|p| p[3] == 255 && p[..3] == c[..3])
     }
 
+    // Chain: § 4 tray icon render. Risk: same config yields different bytes; Custom differs from Summary.
     #[test]
     fn summary_is_valid_and_renders_deterministically() {
         assert_eq!(validate(&summary()), Vec::<String>::new());
@@ -405,6 +406,7 @@ mod tests {
         assert_eq!(render(&copy, 44, 2.0, &d, true).unwrap().px, a.px);
     }
 
+    // Chain: § 4 icon config validation. Risk: an unsafe or invalid icon config renders.
     #[test]
     fn validate_reports_every_error() {
         let mut c = summary();
@@ -424,6 +426,7 @@ mod tests {
         assert!(render(&c, 44, 2.0, &data([0; 4], false), true).is_err());
     }
 
+    // Chain: § 4 tray icon layout. Risk: ink misaligned or series on different scales.
     #[test]
     fn summary_aligns_by_ink_and_stacks_on_one_scale() {
         let p = palette(true);
@@ -443,6 +446,7 @@ mod tests {
         }
     }
 
+    // Chain: § 4 pause shown in the icon. Risk: a paused service looks running.
     #[test]
     fn paused_is_gray_under_the_q_and_compact_shows_run_or_pause() {
         let p = palette(true);
@@ -455,6 +459,7 @@ mod tests {
         assert!(has(&compact(true, false, 2.0), palette(false).ink));
     }
 
+    // Chain: R12 unknown in the icon. Risk: unknown drawn as zero; large counts widen the icon.
     #[test]
     fn unknown_is_a_dash_and_overflow_a_threshold() {
         let d = Data { counts: [None, Some(2), Some(9), Some(1)], bins: vec![[0; 4]; 12], paused: false };

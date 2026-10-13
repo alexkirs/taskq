@@ -1,3 +1,4 @@
+// Chain: § 4 tray incident states in src/tray.html. Risk: a state hidden, project not escaped or reporting enabled without consent.
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
 const html=fs.readFileSync('src/tray.html','utf8');
 const context={esc:s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;')};

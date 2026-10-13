@@ -256,7 +256,40 @@ pub fn update(install: &Path, check: bool) -> Result<Option<String>, String> {
         write_atomic(&install.join("previous"), &cur)?;
     }
     write_atomic(&install.join("current"), &ver)?;
+    let shim = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin/taskq")).unwrap_or_default();
+    sweep(install, &shim);
     Ok(Some(ver))
+}
+
+/// § 8 step 4 sweep: everything in `<install>` the current version does not own, and the v3 shim. Best effort: a file
+/// in use (a running Windows exe) stays until a later update.
+pub fn sweep(install: &Path, shim: &Path) {
+    let mut keep: Vec<String> = [current(install), read(&install.join("previous")), Some(VERSION.into())].into_iter().flatten().collect();
+    for root in fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter(|l| !l.is_empty()) {
+        let st: serde_json::Value = fs::read(Path::new(root).join(".taskq/status.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        keep.extend(st["version"].as_str().map(String::from));
+    }
+    let owned = |n: &str| {
+        ["releases", "current", "previous", "projects", "token", "taskq", "taskq.exe", "taskq-tray.exe", "capacity"].contains(&n)
+            || n.ends_with(".log") || n.ends_with(".tmp") || n.starts_with("tray") || (n.starts_with("TaskQ-") && n.ends_with(".xml"))
+    };
+    let gone = |p: &Path| {
+        let _ = if p.is_dir() && !p.is_symlink() { fs::remove_dir_all(p) } else { fs::remove_file(p) };
+    };
+    for e in fs::read_dir(install).into_iter().flatten().flatten() {
+        if !owned(&e.file_name().to_string_lossy()) {
+            gone(&e.path());
+        }
+    }
+    for e in fs::read_dir(install.join("releases")).into_iter().flatten().flatten() {
+        let n = e.file_name().to_string_lossy().to_string();
+        if !n.ends_with(".tmp") && !keep.contains(&n) {
+            gone(&e.path());
+        }
+    }
+    if fs::read_to_string(shim).is_ok_and(|t| t.contains("taskq.py launch") && t.contains(&install.display().to_string())) {
+        gone(shim);
+    }
 }
 
 /// First install of this binary: it becomes the current release and the launcher.
@@ -544,5 +577,42 @@ mod tests {
         assert_eq!(verify(sums.as_bytes(), "taskq-4.0.0-macos-aarch64", bin), Ok(()));
         assert!(verify(sums.as_bytes(), "taskq-4.0.0-macos-aarch64", b"evil").is_err());
         assert!(verify(sums.as_bytes(), "taskq-4.0.0-linux-x86_64", bin).is_err());
+    }
+
+    #[test]
+    fn sweep_keeps_the_allowlist_and_live_releases() {
+        let t = std::env::temp_dir().join(format!("taskq-sweep-{}", std::process::id()));
+        let (install, root) = (t.join("install"), t.join("proj"));
+        let _ = fs::remove_dir_all(&t);
+        let dirs = ["releases/4.2.0", "releases/4.1.0", "releases/4.0.5", "releases/4.0.0-dev", "releases/cc33ae6", "releases/4.3.0.tmp", "service/x", "mac-pre-update-backup", "capacity", "failed-release-evidence"];
+        for d in dirs {
+            fs::create_dir_all(install.join(d)).unwrap();
+        }
+        fs::create_dir_all(root.join(".taskq")).unwrap();
+        // a project service still on 4.0.5 with a live child: its release stays (A3)
+        fs::write(root.join(".taskq/status.json"), r#"{"version": "4.0.5", "kids": [{"task": 1}]}"#).unwrap();
+        let files = ["current", "previous", "token", "taskq", "taskq.log", "taskq.log.tmp", "proj.log", "tray", "tray.json", "TaskQ-proj.xml", ".freshness.json", "current.json", "mac-scheduled-pass.py"];
+        for f in files {
+            fs::write(install.join(f), "").unwrap();
+        }
+        fs::write(install.join("current"), "4.2.0").unwrap();
+        fs::write(install.join("previous"), "4.1.0").unwrap();
+        fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
+        let (shim, other) = (t.join("bin-taskq"), t.join("bin-other"));
+        fs::write(&shim, format!("exec python3 {}/releases/cc33ae6/taskq.py launch --install-dir {} -- \"$@\"", install.display(), install.display())).unwrap();
+        fs::write(&other, "#!/bin/sh\nexec something").unwrap();
+        sweep(&install, &shim);
+        sweep(&install, &other);
+        let ls = |d: &Path| {
+            let mut v: Vec<String> = fs::read_dir(d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into()).collect();
+            v.sort();
+            v
+        };
+        // 4.0.0-dev is this test binary's running version
+        assert_eq!(VERSION, "4.0.0-dev");
+        assert_eq!(ls(&install.join("releases")), ["4.0.0-dev", "4.0.5", "4.1.0", "4.2.0", "4.3.0.tmp"]);
+        assert_eq!(ls(&install), ["TaskQ-proj.xml", "capacity", "current", "previous", "proj.log", "projects", "releases", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json"]);
+        assert!(!shim.exists() && other.exists(), "only the v3 shim of this install goes");
+        let _ = fs::remove_dir_all(&t);
     }
 }

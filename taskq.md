@@ -272,7 +272,7 @@ immutable `releases/<ver>/`, a `current` file holding `<ver>` (atomic rename) an
 1. Read `latest.json` from the release repo. Not newer: stop. A leftover `releases/*.tmp` is deleted.
 2. Download into `releases/<ver>.tmp/`, verify sha256, rename to `releases/<ver>/`.
 3. Smoke: `releases/<ver>/taskq selftest`. Failure: delete, report, keep current.
-4. Write `previous`, swap `current`, re-exec; live children pass to the new image through `<root>/.taskq/kids`.
+4. Write `previous`, swap `current`, re-exec; live children pass to the new image through `<root>/.taskq/kids`. Before the re-exec one allowlist sweep removes the rest of `<install>` and a `~/.local/bin/taskq` v3 python shim. Kept: `releases/` of `current`, `previous`, the running version and each `projects` root's `status.json` version (its service and live children), `current`, `previous`, `projects`, `token`, the launcher, `taskq-tray.exe`, `*.log`, `tray*`, `capacity/`, `TaskQ-*.xml`, `*.tmp`. A file in use stays until a later update.
    Windows: exit 75 once no child is live; the launcher restarts the service (any exit, 60 s after a crash), runs it and its children without a console window and appends its output to `<install>/taskq.log`.
 5. The launcher `<install>/taskq` runs `releases/$(current)/taskq`. It counts starts of a version not yet marked
    `healthy` (the service marks it after `rollback_after`); at 3 it restores `previous` into `current`.

@@ -152,6 +152,9 @@ const FORMATS: &str = "Put each `--text` field on its own line. The commands ren
      § 7 Result and close verdicts): Done ≤160, Problem 1-2 lines, 2-4 options ≤160, ≤2 links; result/close lines ≤240,\n\
      Changed and Open 1-2 lines, 1-8 checks. Over-limit text is rejected: shorten it, never hand-write card prose.\n";
 
+/// taskq.md § 8 Folders: never search `/` or home; macOS asks the owner for Desktop, Documents, Downloads etc.
+const FILES: &str = "Touch only this project, ~/.claude, ~/.codex and the OS temp dir: never search `/`, `~` or other folders.\n";
+
 fn ask(q: &impl std::fmt::Display, n: u64) -> String {
     format!("`{q} ask {n} --text \"Done: <checked or not started>\nProblem: <decision and user effect>\" --option A --option B --recommend K [--link URL]`")
 }
@@ -163,9 +166,18 @@ pub fn brief(env: &Env, l: &Launch) -> String {
         // the app turn runs in the app's environment, not the handshake child's (§ 8)
         q = format!("env TASKQ_TASK={n} TASKQ_ATTEMPT={} TASKQ_ROLE={} TASKQ_ROOT={} {q}", l.attempt, l.role, env.root.display());
     }
+    // A missing path sent workers to `find /`, which raised macOS folder prompts (#865): name one that exists.
+    let spec = env.root.join("taskq.md");
+    let spec = if spec.exists() {
+        spec.display().to_string()
+    } else {
+        let v = crate::platform::VERSION;
+        let tag = if v.contains('-') { "main".into() } else { format!("v{v}") }; // dev builds have no tag
+        format!("https://github.com/{}/blob/{tag}/taskq.md", crate::platform::RELEASE_REPO)
+    };
     let head = format!(
-        "You are the taskq {} for task #{n}: {}. Attempt {}.\nRead `{}` first and do only what it allows (R13).\nTask text, state and your inbox: `{q} inbox {n}`.\n",
-        l.role, l.title, l.attempt, env.root.join("taskq.md").display()
+        "You are the taskq {} for task #{n}: {}. Attempt {}.\nRead `{spec}` first and do only what it allows (R13).\nTask text, state and your inbox: `{q} inbox {n}`.\n{FILES}",
+        l.role, l.title, l.attempt
     );
     let body = if l.role == "reviewer" {
         format!(
@@ -483,6 +495,10 @@ mod tests {
         l.role = "worker".into();
         let b = brief(&env, &l);
         assert!(b.contains("/i/taskq result 7 --sha") && b.contains("`Task: https://b/7`") && b.contains("open one PR") && b.contains("Changed: <user effect>\nOpen:") && b.contains("§ 2 Ask card"));
+        // #865: /p has no taskq.md, so the brief names the pinned contract and the folder boundary, never a missing path
+        assert!(b.contains("Read `https://github.com/taskqorg/taskq/blob/") && b.contains("/taskq.md` first") && b.contains(FILES));
+        let here = Env { root: Path::new(env!("CARGO_MANIFEST_DIR")), ..env };
+        assert!(brief(&here, &l).contains(&format!("Read `{}`", Path::new(env!("CARGO_MANIFEST_DIR")).join("taskq.md").display())));
         l.rt = "codex-app".into();
         l.resume = None;
         let c = command(&env, &l);

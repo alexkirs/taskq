@@ -222,7 +222,7 @@ Owner-facing service/tray text follows R7: counts use R6 names/order; task rows 
 Setup is one agent conversation per project. Resolve the project name and exact folder; inspect files, configuration, Git roots and remotes first. Preserve originals, dirty work, unknown config keys and existing ownership. Show the exact account, repository, visibility and every external effect (creation, labels, access, the incident report disclosure of § 4) and apply only after the owner confirms that exact list. Read existing GitHub repository visibility with `gh repo view` during inspection; do not ask for visibility already read. New repositories default to PRIVATE. Then verify a queue read and write and hand off to the PM. The tray's Add project holds this conversation in the menu (§ 4).
 
 ## 7. Worker, reviewer, publication
-Worker brief: task text, attempt, branch, delivery commands, this file's path. Rules:
+Worker brief: task text, attempt, branch, delivery commands, this file's path (this release's URL when the root has none), the folder rule (§ 8). Rules:
 1. Read this file and the whole issue first. Before any code, `ask` with options when the task conflicts with a decision
    (R13), an Acceptance item is untestable or reads two ways, or the work exceeds one reviewable diff (propose a split).
 2. Workspace: `git worktree add -b taskq-<N> .worktrees/taskq-<N> origin/main` (existing branch: continue it).
@@ -260,6 +260,7 @@ Reviewer checks every Acceptance and contract against the candidate and CI on th
 
 The child's environment drops `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` and adds `TASKQ_TASK`, `TASKQ_ATTEMPT`,
 `TASKQ_ROLE`. Briefs go through stdin, never a shell (`codex-app`: the `queue` argument, still no shell; the app turn keeps the handshake's options, not its environment, so its brief prefixes each taskq command with `env TASKQ_*=..`). Logs: `<root>/.taskq/<T|R><N>-<attempt>.log`.
+**Folders.** Service, tray and spawned runtimes touch only `<root>`, `<install>`, `~/.claude`, `~/.codex` and the OS temp dir; never Documents, Desktop, Downloads, iCloud, removable or network volumes or other app containers: macOS asks the owner on behalf of the service. Guard: the brief names an existing contract and forbids searching `/` or `~`; the tray reaches other folders only through the owner's folder picker.
 
 **Shared core.** Release, update, launcher and rollback, service units, the `status.json` common keys and the board token follow [coreq.md](https://github.com/taskqorg/coreq/blob/v0.4.0/coreq.md) (crate `coreq`, pinned by tag) as `Tool::new("taskq", "TaskQ", "taskqorg/taskq", VERSION)`: install `~/.local/share/taskq` (Windows `%LOCALAPPDATA%\taskq`), files `taskq-<ver>-<os>-<arch>`, units `com.taskq.<project>`, `TaskQ-<project>`, `taskq-<project>.service`. taskq's own parts:
 1. Hosts need no git, gh or toolchain. Each release runner runs `selftest` on its artifact before publishing.

@@ -3,6 +3,10 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## Unreleased
+
+Worker and reviewer briefs name a contract that exists (the release's `taskq.md` URL when the project has none) and forbid searching `/` or `~`: workers no longer raise macOS Desktop, Documents, Downloads, network volume or Photos prompts for the service. No board change.
+
 ## v4.1.8
 
 Unused positional arguments now fail with their names before any action; use repeated `--acceptance` flags so every item reaches the task. No board format change.

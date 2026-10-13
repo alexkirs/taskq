@@ -1,0 +1,157 @@
+{
+  "schema": "taskq.resources/1",
+  "grant": {
+    "grant_id": "grant-1", "actor_id": "operator-1",
+    "installation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "generation": 1,
+    "project_ids": ["project-1"], "runtime_ids": ["codex"], "host_policy": false, "expires_at": 1000, "revoked": false
+  },
+  "submit": {
+    "schema": "taskq.resources/1", "op_id": "op-1", "actor_id": "operator-1", "grant_id": "grant-1",
+    "target": {"installation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "generation": 1, "project_id": "project-1", "runtime_id": "codex"},
+    "policy_schema": "taskq.admission/1", "expected_revision": "r1", "issued_at": 100, "expires_at": 400,
+    "changes": {"runtime_limit": 0}
+  },
+  "cancel": {
+    "schema": "taskq.resources/1", "op_id": "op-1", "actor_id": "operator-1", "grant_id": "grant-1",
+    "target": {"installation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "generation": 1, "project_id": "project-1", "runtime_id": "codex"}
+  },
+  "receipt": {
+    "schema": "taskq.resources/1", "op_id": "op-1",
+    "target": {"installation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "generation": 1, "project_id": "project-1", "runtime_id": "codex"},
+    "state": "saved", "reason": null, "saved_revision": "r2", "effective_revision": "r1", "observed_at": 100
+  },
+  "projection": {
+    "schema": "taskq.resources/1", "observed_at": 100,
+    "targets": [{
+      "target": {"installation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "generation": 1, "project_id": "project-1", "runtime_id": "codex"},
+      "service_version": "4.2.0-dev",
+      "supported": [{"policy_schema": "taskq.admission/1", "modes": ["auto", "fixed"], "fields": ["runtime_limit"], "scopes": ["runtime"]}],
+      "current_revision": "r2", "effective_revision": "r1",
+      "current_policy": {"runtime_limit": 0, "sources": {"runtime_limit": "runtime"}},
+      "effective_policy": {"runtime_limit": 2, "sources": {"runtime_limit": "runtime"}},
+      "runtime_usage": [{"runtime_id": "codex", "used": 3, "limit": 2, "limit_kind": "ceiling"}, {"runtime_id": "claude", "used": null, "limit": null, "limit_kind": "unknown"}],
+      "sample": {"source": "taskq-admission-macos", "sampled_at": 90, "age_seconds": 10, "cadence_seconds": 30, "window_seconds": 60, "cpu_busy_percent": 95.0, "memory_available_percent": null, "memory_available_gib": null, "pressure": null},
+      "blockers": [
+        {"code": "cpu", "scope": {"installation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "generation": 1, "project_id": null, "runtime_id": null}, "knowledge": "known"},
+        {"code": "max", "scope": {"installation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "generation": 1, "project_id": "project-1", "runtime_id": "codex"}, "knowledge": "known"},
+        {"code": "provider", "scope": {"installation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "generation": 1, "project_id": "project-1", "runtime_id": "codex"}, "knowledge": "unknown"}
+      ], "completeness": "partial"
+    }]
+  },
+  "traces": [
+    {"name": "review-confirm and saved versus effective", "steps": [
+      {"action": "confirm", "expect": "draft"}, {"action": "review", "expect": "reviewed"},
+      {"action": "confirm", "expect": "pending"}, {"action": "apply", "expect": "saved"},
+      {"action": "readback", "revision": "r1", "at": 100, "expect": "saved"},
+      {"action": "readback", "revision": "r2", "at": 1, "expect": "unknown"},
+      {"action": "readback", "revision": "r2", "at": 100, "expect": "applied"}]},
+    {"name": "draft edit invalidates review", "steps": [
+      {"action": "review", "expect": "reviewed"}, {"action": "edit", "expect": "draft"}, {"action": "confirm", "expect": "draft"}]},
+    {"name": "cancel before confirm", "steps": [
+      {"action": "review", "expect": "reviewed"}, {"action": "cancel", "expect": "cancelled"}]},
+    {"name": "conflict immediately before apply", "steps": [
+      {"action": "review", "expect": "reviewed"}, {"action": "confirm", "expect": "pending"},
+      {"action": "external_edit", "expect": "pending"}, {"action": "apply", "expect": "conflict"}]},
+    {"name": "duplicate and lost reply", "steps": [
+      {"action": "review", "expect": "reviewed"}, {"action": "confirm", "expect": "pending"},
+      {"action": "apply", "expect": "saved"}, {"action": "lose_reply", "expect": "unknown"},
+      {"action": "retry", "expect": "saved"}, {"action": "retry", "expect": "saved"}]},
+    {"name": "replay mismatch", "steps": [
+      {"action": "review", "expect": "reviewed"}, {"action": "confirm", "expect": "pending"},
+      {"action": "mismatch", "expect": "replay_mismatch"}, {"action": "retry", "expect": "pending"}, {"action": "apply", "expect": "saved"}]},
+    {"name": "revoked before enqueue", "steps": [
+      {"action": "revoke", "expect": "draft"}, {"action": "review", "expect": "reviewed"}, {"action": "confirm", "expect": "revoked"}]},
+    {"name": "revoked before apply", "steps": [
+      {"action": "review", "expect": "reviewed"}, {"action": "confirm", "expect": "pending"},
+      {"action": "revoke", "expect": "pending"}, {"action": "apply", "expect": "revoked"}]},
+    {"name": "offline expires at deadline", "steps": [
+      {"action": "review", "expect": "reviewed"}, {"action": "confirm", "expect": "pending"},
+      {"action": "time", "at": 400, "expect": "pending"}, {"action": "apply", "expect": "expired"}, {"action": "retry", "expect": "expired"}]},
+    {"name": "cancel wins race", "steps": [
+      {"action": "review", "expect": "reviewed"}, {"action": "confirm", "expect": "pending"},
+      {"action": "cancel", "expect": "cancelled"}, {"action": "apply", "expect": "cancelled"}]},
+    {"name": "apply wins race", "steps": [
+      {"action": "review", "expect": "reviewed"}, {"action": "confirm", "expect": "pending"},
+      {"action": "apply", "expect": "saved"}, {"action": "cancel", "expect": "saved"}]}
+  ]
+,
+  "regressions": {
+  "legacy_runtime_scope": [
+    {"project_id": "project-1", "runtime_id": "codex", "expect": "pending"},
+    {"project_id": "project-1", "runtime_id": null, "expect": "invalid"},
+    {"project_id": null, "runtime_id": "codex", "expect": "invalid"}
+  ],
+  "duplicate_json": [
+    "{\"schema\":\"taskq.resources/1\",\"op_id\":\"op-1\",\"actor_id\":\"operator-1\",\"grant_id\":\"grant-1\",\"target\":{\"installation_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":1,\"project_id\":\"project-1\",\"runtime_id\":\"codex\"},\"policy_schema\":\"taskq.admission/1\",\"expected_revision\":\"r1\",\"issued_at\":100,\"expires_at\":400,\"changes\":{\"runtime_limit\":1,\"runtime_limit\":0}}",
+    "{\"schema\":\"taskq.resources/1\",\"op_id\":\"op-1\",\"actor_id\":\"operator-1\",\"grant_id\":\"grant-1\",\"target\":{\"installation_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":2,\"generation\":1,\"project_id\":\"project-1\",\"runtime_id\":\"codex\"},\"policy_schema\":\"taskq.admission/1\",\"expected_revision\":\"r1\",\"issued_at\":100,\"expires_at\":400,\"changes\":{\"runtime_limit\":0}}",
+    "{\"schema\":\"taskq.resources/1\",\"op_id\":\"op-1\",\"actor_id\":\"operator-1\",\"grant_id\":\"grant-1\",\"target\":{\"installation_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generation\":1,\"project_id\":\"project-1\",\"runtime_id\":\"codex\"},\"policy_schema\":\"taskq.admission/1\",\"expected_revision\":\"r1\",\"issued_at\":100,\"expires_at\":400,\"changes\":{\"load_gate\":{\"enabled\":true,\"enabled\":false,\"cpu_max\":85,\"memory_min\":15}}}"
+  ],
+  "private_paths": [
+    [
+      "current_policy",
+      "path"
+    ],
+    [
+      "effective_policy",
+      "sources",
+      "path"
+    ],
+    [
+      "current_policy",
+      "load_gate",
+      "path"
+    ],
+    [
+      "target",
+      "path"
+    ],
+    [
+      "supported",
+      0,
+      "path"
+    ],
+    [
+      "runtime_usage",
+      0,
+      "path"
+    ],
+    [
+      "sample",
+      "path"
+    ],
+    [
+      "blockers",
+      0,
+      "scope",
+      "path"
+    ],
+    [
+      "blockers",
+      0,
+      "path"
+    ]
+  ],
+  "ages": [
+    {
+      "producer_age": 120,
+      "now": 100,
+      "expected_age": 120
+    },
+    {
+      "producer_age": 120,
+      "now": 110,
+      "expected_age": 130
+    },
+    {
+      "producer_age": null,
+      "now": 110,
+      "expected_age": null
+    },
+    {
+      "producer_age": 18446744073709551615,
+      "now": 110,
+      "expected_age": null
+    }
+  ]
+}
+}

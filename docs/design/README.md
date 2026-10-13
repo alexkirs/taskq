@@ -57,6 +57,7 @@ The package includes the remote PM scenario (UC-17), not only the desktop menu. 
 | [4.1.9 audit](release-4.1.9-ui-audit.md) | Historical 4.1.9 source and native fixture findings; refresh against the implementation candidate |
 | [Deterministic fixtures](ui-acceptance-fixtures.json) | Expected histogram, height and pixel-grid outcomes |
 | [Verification](verification.md) | Candidate evidence, historical evidence and qualification gaps |
+| [README page plan](readme-plan.md) | Project page order, screenshot refresh and stale rule, use-case rows, tasks A–C |
 
 The editable candidate contains local simulation, not live service access. Detach models ownership inside the preview; native separate windows require implementation. AI attachments support local image preview and validation; no file bytes are sent. Rebuild the integrated fragment with `python3 docs/design/build-workspace-preview.py`; edit its source components, not the generated fragment.
 

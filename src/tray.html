@@ -175,6 +175,7 @@ function home(){
   // host-level, read-only rows of the freshest status.json probe (taskq.md § 4); none: unknown, not empty
   const A=S.agents;
   h+='<details class="group agents"><summary>⌘ Agents <span class="meta">'+esc(S.host+' · '+(A?'checked '+age(Math.max(0,S.now-A.at))+' ago':'unknown: no service probe yet'))+'</span></summary>'+(A?A.rows.map(r=>'<div class="row" role="menuitem" aria-disabled="true">'+esc(r)+'</div>').join(''):'<div class="body meta">Unknown: no status.json has agents</div>')+'</details>';
+  h+='<button class="project" data-a="resources" title="btop in its own terminal window">◔ Resources</button>';
   h+=S.projects.map(service).join('');
   const vs=[...new Set(S.projects.map(p=>p.version).filter(Boolean))];
   return h+update()+'<div class="row meta">taskq '+esc(vs.join(', ')||'unknown')+(vs.length===1&&vs[0]===S.version?'':' · tray '+esc(S.version))+' · '+esc(S.host)+'</div>';}

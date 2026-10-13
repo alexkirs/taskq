@@ -358,6 +358,9 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                         }
                     }
                     "hide" => w.set_visible(false),
+                    "resources" => {
+                        std::thread::spawn(resources);
+                    }
                     "open" => {
                         if let Some(u) = m["url"].as_str().filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
                             open(u);
@@ -594,6 +597,44 @@ fn act(action: &str, root: &Path, label: Option<&str>) {
         }
         _ => {}
     }
+}
+
+/// `Resources` (menu.md M5): btop in its own OS terminal window, installed first with the OS package manager when
+/// missing, its output in that window; no package manager: one line saying so.
+const BTOP_SH: &str = r#"#!/bin/sh
+printf '\033]0;Resources\007\033[8;30;110t'
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+if ! command -v btop >/dev/null; then
+  if ! command -v brew >/dev/null; then echo "btop is not installed and Homebrew was not found: install btop, then try again."; read _; exit 1; fi
+  echo "Installing btop: brew install btop"
+  brew install btop || { echo "brew install btop failed (see above)."; read _; exit 1; }
+fi
+exec btop
+"#;
+const BTOP_PS1: &str = r#"$Host.UI.RawUI.WindowTitle = 'Resources'
+if (-not (Get-Command btop -ErrorAction SilentlyContinue)) {
+  if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { 'btop4win is not installed and winget was not found: install btop4win, then try again.'; Read-Host; exit 1 }
+  'Installing btop: winget install aristocratos.btop4win'
+  winget install -e --id aristocratos.btop4win --accept-source-agreements --accept-package-agreements
+  $env:Path = [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine')
+  if (-not (Get-Command btop -ErrorAction SilentlyContinue)) { 'winget install aristocratos.btop4win failed (see above).'; Read-Host; exit 1 }
+}
+btop
+"#;
+
+fn resources() {
+    let file = std::env::temp_dir().join(if cfg!(windows) { "taskq-resources.ps1" } else { "taskq-resources.command" });
+    if fs::write(&file, if cfg!(windows) { BTOP_PS1 } else { BTOP_SH }).is_err() {
+        return;
+    }
+    // not `quiet`: the terminal window is the point; waited on its own thread, no zombie
+    let _ = if cfg!(windows) {
+        std::process::Command::new("conhost.exe").args(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&file).status()
+    } else {
+        #[cfg(unix)]
+        let _ = fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o755));
+        std::process::Command::new("open").args(["-a", "Terminal"]).arg(&file).status()
+    };
 }
 
 /// The OS folder picker; None on cancel.

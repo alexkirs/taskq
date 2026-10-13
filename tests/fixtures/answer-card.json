@@ -1,0 +1,1061 @@
+{
+  "about": "Answer card conformance (docs/design/answer-card.md). Rows are status --json task rows; `question` is TaskQ's parse, checked by cargo test (TASKQ_BLESS=1 rewrites it). Each consumer harness runs replay() with capability = row.capability || case.capability.",
+  "cases": [
+    {
+      "name": "choice",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": true
+      },
+      "rows": [
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 4,
+          "card": "Done: compared both clients\nProblem: Should the new admin API keep compatibility with existing clients?\nEvidence: [#12](https://github.com/o/r/pull/12)\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: compared both clients\nProblem: Should the new admin API keep compatibility with existing clients?\nEvidence: [#12](https://github.com/o/r/pull/12)\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+            "done": "compared both clients",
+            "problem": "Should the new admin API keep compatibility with existing clients?",
+            "evidence": [
+              {
+                "label": "#12",
+                "url": "https://github.com/o/r/pull/12"
+              }
+            ],
+            "choices": [
+              {
+                "id": 1,
+                "text": "Keep compatibility",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "Remove the old API",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "check",
+          "status": "actionable",
+          "sent": 0,
+          "has": [
+            "#841</a> Keep the old API?",
+            "1. Keep compatibility <span class=\"qac-star\" role=\"img\" aria-label=\"Recommended\">★</span>",
+            "2. Remove the old API",
+            ">#12</a>",
+            "compared both clients"
+          ],
+          "not": [
+            "To answer",
+            "disabled>1."
+          ]
+        },
+        {
+          "type": "choose",
+          "id": 2
+        },
+        {
+          "type": "check",
+          "status": "sending",
+          "sent": 1,
+          "op": {
+            "choice": 2,
+            "revision": 4,
+            "task": 841
+          },
+          "has": [
+            "data-choice=\"2\" disabled"
+          ]
+        },
+        {
+          "type": "receipt",
+          "state": "accepted"
+        },
+        {
+          "type": "check",
+          "status": "accepted",
+          "sent": 1,
+          "has": [
+            "Answer accepted on the board"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "free text, rejected keeps the draft",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": true
+      },
+      "rows": [
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 4,
+          "card": "Done: compared both clients\nProblem: Should the new admin API keep compatibility with existing clients?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: compared both clients\nProblem: Should the new admin API keep compatibility with existing clients?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+            "done": "compared both clients",
+            "problem": "Should the new admin API keep compatibility with existing clients?",
+            "evidence": [],
+            "choices": [
+              {
+                "id": 1,
+                "text": "Keep compatibility",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "Remove the old API",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "input",
+          "text": "  keep it for one release <b>  "
+        },
+        {
+          "type": "check",
+          "status": "actionable",
+          "has": [
+            "keep it for one release &lt;b&gt;"
+          ],
+          "not": [
+            "<b>"
+          ]
+        },
+        {
+          "type": "submit"
+        },
+        {
+          "type": "check",
+          "status": "sending",
+          "sent": 1,
+          "op": {
+            "text": "keep it for one release <b>",
+            "revision": 4
+          }
+        },
+        {
+          "type": "receipt",
+          "state": "rejected",
+          "reason": "board unreachable",
+          "next": "Send again"
+        },
+        {
+          "type": "check",
+          "status": "rejected",
+          "sent": 1,
+          "draft": "  keep it for one release <b>  ",
+          "has": [
+            "Answer not accepted: board unreachable. Send again"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "text limits",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": true
+      },
+      "rows": [
+        {
+          "n": 7,
+          "title": "Pick",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/7",
+          "revision": 2,
+          "card": "Done: not started\nProblem: which?\n1. a ★\n2. b\nTo answer: `taskq answer 7.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: not started\nProblem: which?\n1. a ★\n2. b\nTo answer: `taskq answer 7.K` or comment `K` or the option text.",
+            "done": "not started",
+            "problem": "which?",
+            "evidence": [],
+            "choices": [
+              {
+                "id": 1,
+                "text": "a",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "b",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "check",
+          "has": [
+            "<button type=\"submit\" disabled>Send"
+          ]
+        },
+        {
+          "type": "input",
+          "text": "1\n2\n3\n4\n5"
+        },
+        {
+          "type": "submit"
+        },
+        {
+          "type": "check",
+          "status": "actionable",
+          "sent": 0,
+          "has": [
+            "<button type=\"submit\" disabled>Send"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "long question",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": true
+      },
+      "rows": [
+        {
+          "n": 9,
+          "title": "A very long task title that has to wrap inside a narrow dashboard column without clipping",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/9",
+          "revision": 3,
+          "card": "Done: measured the cold start on both hosts and read the release notes of every dependency touched by the upgrade path\nProblem: The upgrade keeps the old cache format for one release, which doubles disk use on small hosts for about two weeks.\nDropping it now forces a full rebuild on first start, about twenty minutes of downtime per host that nobody watches.\n1. Keep the old format for one release and accept double disk use on small hosts for two weeks ★\n2. Drop it now and accept one full rebuild per host on first start\n3. Ask each host owner first and delay the release by a week\nTo answer: `taskq answer 9.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: measured the cold start on both hosts and read the release notes of every dependency touched by the upgrade path\nProblem: The upgrade keeps the old cache format for one release, which doubles disk use on small hosts for about two weeks.\nDropping it now forces a full rebuild on first start, about twenty minutes of downtime per host that nobody watches.\n1. Keep the old format for one release and accept double disk use on small hosts for two weeks ★\n2. Drop it now and accept one full rebuild per host on first start\n3. Ask each host owner first and delay the release by a week\nTo answer: `taskq answer 9.K` or comment `K` or the option text.",
+            "done": "measured the cold start on both hosts and read the release notes of every dependency touched by the upgrade path",
+            "problem": "The upgrade keeps the old cache format for one release, which doubles disk use on small hosts for about two weeks. Dropping it now forces a full rebuild on first start, about twenty minutes of downtime per host that nobody watches.",
+            "evidence": [],
+            "choices": [
+              {
+                "id": 1,
+                "text": "Keep the old format for one release and accept double disk use on small hosts for two weeks",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "Drop it now and accept one full rebuild per host on first start",
+                "recommended": false,
+                "consequential": false
+              },
+              {
+                "id": 3,
+                "text": "Ask each host owner first and delay the release by a week",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "check",
+          "status": "actionable",
+          "has": [
+            "two weeks. Dropping it now",
+            "3. Ask each host owner first"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "malformed card",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": true
+      },
+      "rows": [
+        {
+          "n": 11,
+          "title": "Hand-written card",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/11",
+          "revision": 5,
+          "card": "What should I do here?\n1. this\n2. that",
+          "question": {
+            "parsed": false,
+            "text": "What should I do here?\n1. this\n2. that",
+            "done": null,
+            "problem": null,
+            "evidence": [],
+            "choices": [
+              {
+                "id": 1,
+                "text": "this",
+                "recommended": false,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "that",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "choose",
+          "id": 1
+        },
+        {
+          "type": "check",
+          "status": "read-only",
+          "sent": 0,
+          "has": [
+            "What should I do here?",
+            "Open on board ↗",
+            "This card has no answer form here"
+          ],
+          "not": [
+            "<button",
+            "<textarea"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "review decision with a consequential choice",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": true
+      },
+      "rows": [
+        {
+          "n": 12,
+          "title": "Ship it",
+          "state": "review",
+          "url": "https://github.com/o/r/issues/12",
+          "revision": 8,
+          "card": "Changed: tray shows answers\nChecks: cargo test --locked -- pass\nOpen: none\n\nDone: shipped to a branch\nProblem: keep the new layout?\n1. close: ship ★\n2. redo with the old layout\nTo answer: `taskq answer 12.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Changed: tray shows answers\nChecks: cargo test --locked -- pass\nOpen: none\n\nDone: shipped to a branch\nProblem: keep the new layout?\n1. close: ship ★\n2. redo with the old layout\nTo answer: `taskq answer 12.K` or comment `K` or the option text.",
+            "done": "shipped to a branch",
+            "problem": "keep the new layout?",
+            "evidence": [],
+            "choices": [
+              {
+                "id": 1,
+                "text": "close: ship",
+                "recommended": true,
+                "consequential": true
+              },
+              {
+                "id": 2,
+                "text": "redo with the old layout",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "choose",
+          "id": 1
+        },
+        {
+          "type": "check",
+          "status": "actionable",
+          "sent": 0,
+          "has": [
+            "data-choice=\"1\" disabled",
+            "this choice closes or publishes the task",
+            "1. close: ship",
+            "2. redo"
+          ]
+        },
+        {
+          "type": "choose",
+          "id": 2
+        },
+        {
+          "type": "check",
+          "status": "sending",
+          "sent": 1,
+          "op": {
+            "choice": 2
+          }
+        }
+      ]
+    },
+    {
+      "name": "read-only",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": false,
+        "reason": "observation only"
+      },
+      "rows": [
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 4,
+          "card": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+            "done": "compared both clients",
+            "problem": "Keep compatibility?",
+            "evidence": [],
+            "choices": [
+              {
+                "id": 1,
+                "text": "Keep compatibility",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "Remove the old API",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "choose",
+          "id": 1
+        },
+        {
+          "type": "check",
+          "status": "read-only",
+          "sent": 0,
+          "has": [
+            "Read only: observation only",
+            "Open on board ↗",
+            "data-choice=\"1\" disabled",
+            "data-choice=\"2\" disabled"
+          ],
+          "not": [
+            "<textarea"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "duplicate click and lost response",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": true
+      },
+      "rows": [
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 4,
+          "card": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+            "done": "compared both clients",
+            "problem": "Keep compatibility?",
+            "evidence": [],
+            "choices": [
+              {
+                "id": 1,
+                "text": "Keep compatibility",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "Remove the old API",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "choose",
+          "id": 1
+        },
+        {
+          "type": "choose",
+          "id": 1
+        },
+        {
+          "type": "submit"
+        },
+        {
+          "type": "check",
+          "status": "sending",
+          "sent": 1
+        },
+        {
+          "type": "receipt",
+          "state": "unknown",
+          "reason": "no response"
+        },
+        {
+          "type": "choose",
+          "id": 2
+        },
+        {
+          "type": "check",
+          "status": "unknown",
+          "sent": 1,
+          "has": [
+            "Delivery unknown: check the board: no response",
+            "data-qac=\"retry\""
+          ]
+        },
+        {
+          "type": "retry"
+        },
+        {
+          "type": "check",
+          "status": "sending",
+          "sent": 2,
+          "same_op": true
+        },
+        {
+          "type": "receipt",
+          "state": "accepted"
+        },
+        {
+          "type": "check",
+          "status": "accepted",
+          "sent": 2
+        }
+      ]
+    },
+    {
+      "name": "stale revision keeps the draft until review",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": true
+      },
+      "rows": [
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 4,
+          "card": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+            "done": "compared both clients",
+            "problem": "Keep compatibility?",
+            "evidence": [],
+            "choices": [
+              {
+                "id": 1,
+                "text": "Keep compatibility",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "Remove the old API",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        },
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 6,
+          "card": "Done: asked the client teams\nProblem: Two clients still use v1: keep it until they move?\n1. Keep v1 until both move ★\n2. Remove v1 now\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: asked the client teams\nProblem: Two clients still use v1: keep it until they move?\n1. Keep v1 until both move ★\n2. Remove v1 now\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+            "done": "asked the client teams",
+            "problem": "Two clients still use v1: keep it until they move?",
+            "evidence": [],
+            "choices": [
+              {
+                "id": 1,
+                "text": "Keep v1 until both move",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "Remove v1 now",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "input",
+          "text": "keep it"
+        },
+        {
+          "type": "refresh",
+          "row": 1
+        },
+        {
+          "type": "submit"
+        },
+        {
+          "type": "choose",
+          "id": 1
+        },
+        {
+          "type": "check",
+          "status": "stale",
+          "sent": 0,
+          "draft": "keep it",
+          "has": [
+            "Two clients still use v1",
+            "data-qac=\"review\"",
+            "data-choice=\"1\" disabled"
+          ]
+        },
+        {
+          "type": "review"
+        },
+        {
+          "type": "submit"
+        },
+        {
+          "type": "check",
+          "status": "sending",
+          "sent": 1,
+          "op": {
+            "text": "keep it",
+            "revision": 6
+          }
+        }
+      ]
+    },
+    {
+      "name": "producer stale receipt needs review",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": true
+      },
+      "rows": [
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 4,
+          "card": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+            "done": "compared both clients",
+            "problem": "Keep compatibility?",
+            "evidence": [],
+            "choices": [
+              {
+                "id": 1,
+                "text": "Keep compatibility",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "Remove the old API",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "choose",
+          "id": 1
+        },
+        {
+          "type": "receipt",
+          "state": "stale",
+          "reason": "revision 5 is newer"
+        },
+        {
+          "type": "choose",
+          "id": 2
+        },
+        {
+          "type": "check",
+          "status": "stale",
+          "sent": 1,
+          "has": [
+            "revision 5 is newer"
+          ]
+        },
+        {
+          "type": "review"
+        },
+        {
+          "type": "check",
+          "status": "actionable"
+        }
+      ]
+    },
+    {
+      "name": "permission revoked keeps the draft",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": true
+      },
+      "rows": [
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 4,
+          "card": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+            "done": "compared both clients",
+            "problem": "Keep compatibility?",
+            "evidence": [],
+            "choices": [
+              {
+                "id": 1,
+                "text": "Keep compatibility",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "Remove the old API",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        },
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 4,
+          "capability": {
+            "answer": false,
+            "reason": "permission revoked"
+          },
+          "card": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+            "done": "compared both clients",
+            "problem": "Keep compatibility?",
+            "evidence": [],
+            "choices": [
+              {
+                "id": 1,
+                "text": "Keep compatibility",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "Remove the old API",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "input",
+          "text": "half typed"
+        },
+        {
+          "type": "refresh",
+          "row": 1
+        },
+        {
+          "type": "submit"
+        },
+        {
+          "type": "check",
+          "status": "read-only",
+          "sent": 0,
+          "draft": "half typed",
+          "has": [
+            "Read only: permission revoked"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sending survives refresh",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": true
+      },
+      "rows": [
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 4,
+          "card": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: compared both clients\nProblem: Keep compatibility?\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+            "done": "compared both clients",
+            "problem": "Keep compatibility?",
+            "evidence": [],
+            "choices": [
+              {
+                "id": 1,
+                "text": "Keep compatibility",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "Remove the old API",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        },
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "doing",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 7,
+          "card": null,
+          "question": null
+        }
+      ],
+      "events": [
+        {
+          "type": "choose",
+          "id": 1
+        },
+        {
+          "type": "refresh",
+          "row": 0
+        },
+        {
+          "type": "check",
+          "status": "sending",
+          "sent": 1,
+          "has": [
+            "Sending…"
+          ]
+        },
+        {
+          "type": "refresh",
+          "row": 1
+        },
+        {
+          "type": "receipt",
+          "state": "accepted"
+        },
+        {
+          "type": "check",
+          "status": "accepted",
+          "sent": 1,
+          "has": [
+            "Answer accepted on the board"
+          ],
+          "not": [
+            "<button"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "denied receipt",
+      "board": "github.com/o/r",
+      "capability": {
+        "answer": true
+      },
+      "rows": [
+        {
+          "n": 841,
+          "title": "Keep the old API?",
+          "state": "ask",
+          "url": "https://github.com/o/r/issues/841",
+          "revision": 4,
+          "card": "Done: compared both clients\nProblem: Keep compatibility?\nEvidence: [bad](javascript:alert(1))\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+          "question": {
+            "parsed": true,
+            "text": "Done: compared both clients\nProblem: Keep compatibility?\nEvidence: [bad](javascript:alert(1))\n1. Keep compatibility ★\n2. Remove the old API\nTo answer: `taskq answer 841.K` or comment `K` or the option text.",
+            "done": "compared both clients",
+            "problem": "Keep compatibility?",
+            "evidence": [
+              {
+                "label": "bad",
+                "url": "javascript:alert(1"
+              }
+            ],
+            "choices": [
+              {
+                "id": 1,
+                "text": "Keep compatibility",
+                "recommended": true,
+                "consequential": false
+              },
+              {
+                "id": 2,
+                "text": "Remove the old API",
+                "recommended": false,
+                "consequential": false
+              }
+            ],
+            "limits": {
+              "lines": 4,
+              "chars": 240
+            }
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "check",
+          "not": [
+            "javascript:"
+          ]
+        },
+        {
+          "type": "choose",
+          "id": 1
+        },
+        {
+          "type": "receipt",
+          "state": "rejected",
+          "reason": "actor may not answer on this board",
+          "next": "Answer on the board"
+        },
+        {
+          "type": "check",
+          "status": "rejected",
+          "sent": 1,
+          "has": [
+            "Answer not accepted: actor may not answer on this board. Answer on the board"
+          ]
+        },
+        {
+          "type": "choose",
+          "id": 2
+        },
+        {
+          "type": "check",
+          "status": "sending",
+          "sent": 2,
+          "new_op": true
+        }
+      ]
+    }
+  ]
+}

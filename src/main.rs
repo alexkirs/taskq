@@ -248,7 +248,7 @@ fn task_text(cmd: &str, text: &str) -> Res<()> {
         fields(text, &[("Reason", 1, 1, 240), ("Next", 0, 1, 240)])?;
     } else {
         let lines: Vec<String> = text.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect();
-        limit(cmd, &lines, 1, 4, 240)?;
+        limit(cmd, &lines, 1, snapshot::ANSWER_LINES, snapshot::ANSWER_CHARS)?;
     }
     Ok(())
 }
@@ -1908,6 +1908,26 @@ mod tests {
         // Parsed compare: a CRLF checkout on Windows must not fail the golden.
         let want: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(snap.json(), want, "TASKQ_BLESS=1 rewrites {}", path.display());
+    }
+
+    // Chain: § 2 card -> canonical parsed question -> shared answer card fixtures. Risk: a UI fixture drifts from TaskQ's parse.
+    #[test]
+    fn answer_card_fixtures_carry_the_canonical_parse() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/answer-card.json");
+        let mut fx: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let mut want = fx.clone();
+        for row in want["cases"].as_array_mut().unwrap().iter_mut().flat_map(|c| c["rows"].as_array_mut().unwrap()) {
+            row["question"] = row["card"].as_str().map_or(Value::Null, snapshot::question);
+        }
+        if std::env::var_os("TASKQ_BLESS").is_some() {
+            fs::write(&path, serde_json::to_string_pretty(&want).unwrap() + "\n").unwrap();
+            fx = want.clone();
+        }
+        assert_eq!(fx, want, "TASKQ_BLESS=1 rewrites {}", path.display());
+        let q = snapshot::question("Done: d\nProblem: p\nmore\nEvidence: [#1](https://x/1), [shot](https://x/s.png)\n1. close: ship ★\n2. redo\nTo answer: `taskq answer 7.K`");
+        assert_eq!((q["parsed"].clone(), q["problem"].clone(), q["evidence"][1]["url"].clone(), q["choices"][0]["consequential"].clone()), (json!(true), json!("p more"), json!("https://x/s.png"), json!(true)));
+        assert_eq!(snapshot::question("1. a ★\n2. b")["parsed"], json!(false), "no Problem: read only");
+        assert_eq!(snapshot::question("Problem: p\n1. a\n2. b")["parsed"], json!(false), "no star: read only");
     }
 
     // Chain: canonical board read -> approved projection -> duplicate-host coalescing -> freshness.

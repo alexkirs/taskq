@@ -1,0 +1,22 @@
+/* TaskQ shared answer card (docs/design/answer-card.md); tokens follow src/tray.html. Size inherits the host font (16-20 px). */
+.qac{--qac-fg:light-dark(#252930,#eceff2);--qac-muted:light-dark(#626b77,#b4bdc8);--qac-edge:light-dark(#d9dde2,#444951);--qac-work:light-dark(#237862,#77cdb3);--qac-ask:light-dark(#a35c29,#edb993);--qac-failed:light-dark(#ae384c,#ef8996);color:var(--qac-fg);line-height:1.4;min-width:0;overflow-wrap:anywhere;padding:.4em 0}
+.qac *{box-sizing:border-box}
+.qac p{margin:.25em 0}
+.qac a{color:inherit}
+.qac-mark{color:var(--qac-ask)}
+.qac-muted,.qac-why{color:var(--qac-muted)}
+.qac-text{white-space:pre-wrap;font:inherit;margin:.25em 0}
+.qac-choices{display:flex;flex-direction:column;align-items:stretch;gap:.3em;margin:.4em 0}
+.qac button{font:inherit;color:inherit;background:none;border:1px solid var(--qac-edge);border-radius:4px;padding:.3em .6em;min-height:2.2em;text-align:left;cursor:pointer}
+.qac button:disabled{opacity:.55;cursor:default}
+.qac button:focus-visible,.qac textarea:focus-visible,.qac a:focus-visible{outline:2px solid var(--qac-ask);outline-offset:1px}
+.qac-star{color:var(--qac-ask)}
+.qac-why{font-size:.875em;padding-left:.6em}
+.qac-text-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.4em;align-items:start}
+.qac textarea{font:inherit;color:inherit;background:none;border:1px solid var(--qac-edge);border-radius:4px;padding:.3em;resize:vertical;min-width:0;width:100%}
+.qac-receipt:empty{display:none}
+.qac-sending,.qac-unknown,.qac-stale{color:var(--qac-ask)}
+.qac-accepted{color:var(--qac-work)}
+.qac-rejected{color:var(--qac-failed)}
+.qac-read-only{color:var(--qac-muted)}
+@media(pointer:coarse){.qac button{min-height:44px}}

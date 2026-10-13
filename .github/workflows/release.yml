@@ -1,4 +1,4 @@
-# § 8 Release: one binary per OS, SHA256SUMS, latest.json; binaries and SHA256SUMS carry build provenance attestations. A failing selftest publishes nothing.
+# § 8 Release: one binary per OS, answer card assets, SHA256SUMS, latest.json; release files and SHA256SUMS carry build provenance attestations. A failing selftest publishes nothing.
 name: release
 on:
   push:
@@ -41,6 +41,12 @@ jobs:
           "$bin" selftest
           mkdir dist
           cp "$bin" "dist/taskq-$VER-${{ matrix.target }}${{ matrix.ext }}"
+          # shared answer card assets (docs/design/answer-card.md): once, from the Linux job
+          if [ "${{ matrix.target }}" = linux-x86_64 ]; then
+            cp src/answer-card.js "dist/taskq-$VER-answer-card.js"
+            cp src/answer-card.css "dist/taskq-$VER-answer-card.css"
+            cp tests/fixtures/answer-card.json "dist/taskq-$VER-answer-card-fixtures.json"
+          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.target }}

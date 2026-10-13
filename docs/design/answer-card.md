@@ -25,6 +25,17 @@ The adapter supplies answer capability/reason and invokes the canonical TaskQ di
 
 Use the same fixtures in TaskQ and DashQ: choice and free text; long question; malformed card; review decision; read-only; duplicate click/lost response; stale revision; permission revoked; sending refresh; denied/unknown/accepted receipt. Check keyboard use, focus/drafts, 16/20 px, both themes and narrow layout. Pure UI tests cannot certify a real board write.
 
+## Implementation
+
+- Canonical fields: each `status --json` task row with a card adds `question`: `parsed`, original `text`, `done`, `problem`, `evidence` (label, URL), `choices` (`id`, `text`, `recommended`, `consequential` for an option starting with `close`) and free-text `limits`. `parsed` is false without Problem, 2-4 options and one `★`.
+- Component: [src/answer-card.js](../../src/answer-card.js) (`TaskqAnswerCard` global or CommonJS) and [src/answer-card.css](../../src/answer-card.css). `mount(el, adapter).update([{board, row}])` keeps drafts, focus and scroll; the adapter gives `capability(board, row)` = `{answer, reason}` and `send(board, op)` resolving to `{state, reason, next}`, with `op` = `{id, task, revision, choice | text}`. Pure `status`, `step` and `render` hold all behavior.
+- Conformance: [tests/fixtures/answer-card.json](../../tests/fixtures/answer-card.json); `cargo test` checks its `question` fields against TaskQ's parse, and each consumer runs `replay(case, capability)` over it (`node tests/answer-card.test.cjs`). `tests/answer-card.browser.cjs` checks 16/20 px, both themes, 280/480 px, refresh and keyboard with Playwright.
+- Release: `taskq-<version>-answer-card.js`, `.css` and `-fixtures.json` ship in each release, listed in `SHA256SUMS` with build provenance. Checksums of this source, checked by the node test:
+
+`src/answer-card.js` SHA-256: `12ee2636fa63f1b7d8f551e2ccdb0b6647591d04955bbe8dbf52776ac2007d05`  
+`src/answer-card.css` SHA-256: `a4365828fd91b269b158963d65b01a70d7ede028518ac21346cf558d6684a400`  
+`tests/fixtures/answer-card.json` SHA-256: `2c74afabd524cddda235e3aef84a86f8facb9415788423b4eae2762ebea6d5e7`  
+
 ## Accepted reference
 
 [Interactive reference](answer-card-reference.html) uses the existing TaskQ design example, with synthetic task #841 and counts. It approves compact placement and ordinary choice/free-text/receipt interaction, not its mocked transport or invented state. It does not replace the failure-state fixtures above.

@@ -1,0 +1,100 @@
+{
+  "schema": 1,
+  "source": "board",
+  "observed": 99,
+  "complete": true,
+  "reason": null,
+  "board": {
+    "kind": "github",
+    "host": "",
+    "repo": "o/r",
+    "url": "https://board"
+  },
+  "totals": {
+    "ask": 1,
+    "doing": 0,
+    "failed": 1,
+    "later": 0,
+    "ready": 1,
+    "review": 0,
+    "waiting": 1
+  },
+  "tasks": [
+    {
+      "n": 1,
+      "title": "Ready one",
+      "state": "ready",
+      "labels": [
+        "taskq",
+        "p1"
+      ],
+      "url": "https://board/1",
+      "session": null,
+      "attempt": null,
+      "role": null,
+      "deps": [],
+      "card": null,
+      "failed": null
+    },
+    {
+      "n": 2,
+      "title": "Question",
+      "state": "ask",
+      "labels": [
+        "taskq"
+      ],
+      "url": "https://board/2",
+      "session": "claude:abc mac",
+      "attempt": 3,
+      "role": "worker",
+      "deps": [],
+      "card": "Done: read\nProblem: Which way?\n1. left\n2. right ★",
+      "failed": null
+    },
+    {
+      "n": 4,
+      "title": "Blocked",
+      "state": "waiting",
+      "labels": [
+        "taskq"
+      ],
+      "url": "https://board/4",
+      "session": null,
+      "attempt": null,
+      "role": null,
+      "deps": [
+        3
+      ],
+      "card": null,
+      "failed": null
+    },
+    {
+      "n": 5,
+      "title": "Broken",
+      "state": "failed",
+      "labels": [
+        "taskq"
+      ],
+      "url": "https://board/5",
+      "session": null,
+      "attempt": null,
+      "role": null,
+      "deps": [],
+      "card": null,
+      "failed": "Reason: no login"
+    }
+  ],
+  "hosts": [
+    {
+      "name": "mac",
+      "version": "4.0.0",
+      "updated": 9
+    }
+  ],
+  "capabilities": [
+    "tasks",
+    "totals",
+    "questions",
+    "hosts"
+  ]
+}

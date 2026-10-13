@@ -157,8 +157,8 @@ pub struct Service<'a> {
     #[cfg(test)]
     agent_status: Value,
     pub log: Vec<String>,
-    /// Open tasks of the last pass: number, title, state, labels (for `status.json` and the tray).
-    pub tasks: Vec<(u64, String, &'static str, Vec<String>)>,
+    /// The read model of the last successful pass (for `status.json` and the tray).
+    pub snapshot: Option<crate::snapshot::Snapshot>,
     pub tasks_read: Option<std::time::Instant>,
     /// Owner comments of the last pass (§ 4): task, comment id, text, card.
     pub owner_comments: Vec<(u64, u64, String, String)>,
@@ -347,7 +347,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity { limits: cfg.limits.clone(), gate: GATE_DEFAULT });
-        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], tasks: vec![], tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new() }
+        Service { board, cfg, version: version.into(), kids: vec![], focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -409,12 +409,12 @@ impl<'a> Service<'a> {
         let me = self.cfg.me.clone();
         let ttl = self.cfg.ttl;
         let (views, hosts) = views(self.board, &mut self.cache)?;
-        self.tasks = views.iter().filter(|v| v.task.state != State::Closed).map(|v| (v.issue.number, v.issue.title.clone(), v.task.state.name(), v.issue.labels.clone())).collect();
+        let now = self.board.now()?;
+        self.snapshot = Some(crate::snapshot::from_views("host", self.board, self.cfg, now, &views, &hosts));
         self.tasks_read = Some(std::time::Instant::now());
         self.owner_comments = views.iter().flat_map(|v| {
             core::owner_comments(v.issue.number, &v.log).into_iter().filter_map(|id| Some((v.issue.number, id, v.log.iter().find(|e| e.id == id)?.body.trim().to_string(), v.task.card.clone().unwrap_or_default())))
         }).collect();
-        let now = self.board.now()?;
         self.events(&views, now)?;
         let by_n: HashMap<u64, &View> = views.iter().map(|v| (v.issue.number, v)).collect();
         let mut touched = HashSet::new();

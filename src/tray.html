@@ -70,7 +70,9 @@ function unique(ts){return [...new Map(ts.map(t=>[t.key,t])).values()];}
 function counts(ts){ts=unique(ts);const n=f=>ts.filter(t=>f.includes(t.state)).length;return {work:n(['doing','review']),ask:n(['ask']),ready:n(['ready']),failed:n(['failed'])};}
 function mode(p){return p.focus.length?'run':p.saved?'paused':'watch';}
 function counter(v,kind,label){return '<span class="counter '+(v>0?kind+' filled':'zero')+'" aria-label="'+esc(label+': '+v)+'" title="'+esc(label)+'">'+v+'</span>';}
-function countMarkup(c){return '<span class="counts">'+counter(c.work,'work','In work')+counter(c.ask,'ask','Waiting for answer')+counter(c.ready,'ready','Ready')+'</span>';}
+// an incomplete or stale snapshot has unknown counts, never zero (§ 4)
+function known(ps){return ps.every(p=>p.complete!==false);}
+function countMarkup(c,ok=true){if(!ok)return '<span class="counts meta">unknown</span>';return '<span class="counts">'+counter(c.work,'work','In work')+counter(c.ask,'ask','Waiting for answer')+counter(c.ready,'ready','Ready')+'</span>';}
 function taskRow(t,global){return '<a class="task'+(global?' global':'')+'" href="'+esc(t.url)+'" data-url="'+esc(t.url)+'" role="menuitem" aria-label="'+esc(t.project+' #'+t.n+' '+t.title+'; '+names[t.state])+'" title="'+esc(t.title)+'"><span class="'+color(t.state)+'" aria-hidden="true">'+symbols[t.state]+'</span>'+(global?'<span class="num">'+esc(t.project)+'</span>':'')+'<span class="num">#'+esc(t.n)+'</span><span class="title">'+esc(t.title)+'</span></a>';}
 function globalGroup(st,ts){ts=ts.filter(t=>t.state===st);return ts.length?'<details class="group"><summary><span class="'+color(st)+'">'+names[st]+'</span>'+counter(ts.length,color(st),names[st])+'</summary>'+ts.map(t=>taskRow(t,true)).join('')+'</details>':'';}
 function age(s){return s<120?s+' s':s<7200?Math.round(s/60)+' min':s<172800?Math.round(s/3600)+' h':Math.round(s/86400)+' d';}
@@ -178,10 +180,10 @@ function home(){
   let h='';
   if(S.platform==='macos')h+='<div class="options views">'+[['icon','Icon'],['full','Summary']].map(([v,l])=>'<button data-set="view" data-v="'+v+'" aria-pressed="'+(S.view===v)+'"><img alt="" src="'+S.icons[v]+'">'+l+'</button>').join('')+'</div>';
   h+=ai();
-  h+='<details><summary>↳ Scope <span class="meta">'+S.projects.length+' project'+(S.projects.length===1?'':'s')+' · in work '+c.work+' · ask '+c.ask+' · ready '+c.ready+'</span></summary><div class="body">'+S.projects.map(p=>'<div><strong>'+esc(p.name)+'</strong> <span class="meta">'+esc(modeText(p))+'</span></div><div class="meta">You asked: '+esc(p.request||'not recorded')+'</div>').join('')+'</div></details>';
+  h+='<details><summary>↳ Scope <span class="meta">'+S.projects.length+' project'+(S.projects.length===1?'':'s')+(known(S.projects)?' · in work '+c.work+' · ask '+c.ask+' · ready '+c.ready:' · counts unknown')+'</span></summary><div class="body">'+S.projects.map(p=>'<div><strong>'+esc(p.name)+'</strong> <span class="meta">'+esc(modeText(p))+'</span></div><div class="meta">You asked: '+esc(p.request||'not recorded')+'</div>').join('')+'</div></details>';
   h+=S.projects.map(p=>problem(p)+incident(p,true)+incidentNotice(p)).join('');
   h+=globalGroup('ask',unique(all))+globalGroup('failed',unique(all));
-  h+='<div class="group"><div class="row meta">Projects</div>'+(S.projects.length?S.projects.map(p=>'<button class="project" data-page="'+esc(p.root)+'" role="menuitem"><span title="'+esc(p.name)+'">'+esc(p.name)+(mode(p)==='run'?'':' <span class="meta">'+(mode(p)==='paused'?'Ⅱ':'observation')+'</span>')+'</span>'+countMarkup(counts(tasks(p)))+'<span aria-hidden="true">›</span></button>').join(''):'<div class="body meta">No projects yet</div>')+addProject()+'</div>';
+  h+='<div class="group"><div class="row meta">Projects</div>'+(S.projects.length?S.projects.map(p=>'<button class="project" data-page="'+esc(p.root)+'" role="menuitem"><span title="'+esc(p.name)+'">'+esc(p.name)+(mode(p)==='run'?'':' <span class="meta">'+(mode(p)==='paused'?'Ⅱ':'observation')+'</span>')+'</span>'+countMarkup(counts(tasks(p)),known([p]))+'<span aria-hidden="true">›</span></button>').join(''):'<div class="body meta">No projects yet</div>')+addProject()+'</div>';
   h+=history();
   if(held.length&&run.length)h+='<div class="row meta">Paused '+held.length+' of '+(held.length+run.length)+': '+esc(held.map(p=>p.name).join(', '))+'</div>';
   h+=bulk(run,held);
@@ -244,7 +246,7 @@ function capacity(p){
     '<div class="options"><button data-a="capapply" data-root="'+esc(p.root)+'">Apply…</button><button data-a="capcancel">Cancel</button></div></details>';}
 function project(p){
   const ts=tasks(p);
-  return '<button data-a="back">‹ All projects</button><div class="row"><strong title="'+esc(p.root)+'">'+esc(p.name)+'</strong>'+countMarkup(counts(ts))+'</div><div class="body meta">'+esc(modeText(p))+'</div>'+problem(p)+incident(p,true)+incidentNotice(p)+
+  return '<button data-a="back">‹ All projects</button><div class="row"><strong title="'+esc(p.root)+'">'+esc(p.name)+'</strong>'+countMarkup(counts(ts),known([p]))+'</div><div class="body meta">'+esc(modeText(p))+'</div>'+problem(p)+incident(p,true)+incidentNotice(p)+
   (['ask','failed','doing','review','ready','waiting','later'].map(st=>{const r=ts.filter(t=>t.state===st);return r.length?'<div class="group"><div class="row meta"><span>'+names[st]+'</span>'+counter(r.length,color(st),names[st])+'</div>'+r.map(t=>taskRow(t)).join('')+'</div>':'';}).join('')||'<div class="body muted">No open tasks</div>')+
   '<div class="group">'+(p.issues?'<a class="project" href="'+esc(p.issues)+'" data-url="'+esc(p.issues)+'"><span>Board ↗</span><span></span><span></span></a>':'')+admission(p)+'</div>'+capacity(p)+service(p);}
 function render(){

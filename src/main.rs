@@ -8,6 +8,7 @@ mod operator;
 mod platform;
 mod runtime;
 mod service;
+mod snapshot;
 #[cfg(any(target_os = "macos", windows))]
 mod icon;
 #[cfg(any(target_os = "macos", windows))]
@@ -17,12 +18,13 @@ use board::{Board, Publish, entries};
 use core::{Entry, State, Task, entry, fold, options};
 use serde_json::{Value, json};
 use service::{Config, Kid, Service};
+use snapshot::in_scope;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-type Res<T> = Result<T, String>;
+pub type Res<T> = Result<T, String>;
 
 const USAGE: &str = "taskq agents
  taskq labels
@@ -33,7 +35,7 @@ const USAGE: &str = "taskq agents
  taskq requeue N [--text T] | taskq later N [--text T]
  taskq steer N --text T | taskq failed N --text T
  taskq close N [M..] [--text VERDICT]
- taskq status [--only L,..] | taskq inbox N
+ taskq status [--only L,..] [--json] | taskq inbox N
  taskq wait [--window MIN] [--only L,..]
  taskq cleanup [--force] | taskq update [--check]
  taskq service install|run|pause|resume|status|restart|stop|uninstall|list
@@ -57,7 +59,7 @@ impl Args {
         while let Some(x) = it.next() {
             match x.strip_prefix("--") {
                 Some(k) => {
-                    let val = if matches!(k, "later" | "check" | "force" | "help") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
+                    let val = if matches!(k, "later" | "check" | "force" | "help" | "json") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
                     a.flags.entry(k.to_string()).or_default().push(val);
                 }
                 None => a.pos.push(x.clone()),
@@ -439,27 +441,17 @@ fn answer_picks(b: &dyn Board, cfg: &Config, picks: &[String]) -> Res<Vec<String
 
 // ---------- report ----------
 
-fn cell(s: &str) -> String {
+pub fn cell(s: &str) -> String {
     s.replace('\\', "\\\\").replace('|', "\\|").replace('[', "\\[").replace(']', "\\]").replace(['\r', '\n'], " ")
 }
 
 /// R6: compact display only; the issue link retains the complete stored text.
-fn compact(s: &str, max: usize) -> String {
+pub fn compact(s: &str, max: usize) -> String {
     let s = s.replace(['\r', '\n'], " ");
     if s.chars().count() > max { s.chars().take(max - 1).chain(['…']).collect() } else { s }
 }
 
-fn brief(card: &str) -> String {
-    let mut lines = card.lines();
-    while let Some(l) = lines.next() {
-        if let Some(p) = l.strip_prefix("Problem: ") {
-            return std::iter::once(p).chain(lines.take_while(|l| !l.starts_with("Evidence:") && !l.starts_with("To answer:") && options(l).is_empty())).collect::<Vec<_>>().join(" ");
-        }
-    }
-    card.lines().next().unwrap_or_default().to_string()
-}
-
-fn age(secs: i64) -> String {
+pub fn age(secs: i64) -> String {
     match secs {
         s if s < 120 => format!("{s}s"),
         s if s < 7200 => format!("{}m", s / 60),
@@ -468,123 +460,9 @@ fn age(secs: i64) -> String {
     }
 }
 
-fn session_link(cfg: &Config, raw: &Value, t: &Task, n: u64) -> (String, String) {
-    let Some((rt, id)) = t.session.as_deref().and_then(|s| s.split(' ').next()).and_then(|s| s.split_once(':')) else { return (String::new(), String::new()) };
-    let host = t.session.as_deref().and_then(|s| s.rsplit(' ').next()).unwrap_or_default();
-    let mut id = id.to_string();
-    if id == "-" && host == cfg.me
-        && let Some(a) = t.attempt
-    {
-        let l = runtime::Launch { task: n, title: String::new(), attempt: a, role: t.role.clone().unwrap_or_default(), rt: rt.into(), session: id.clone(), url: String::new(), resume: None };
-        id = runtime::codex_thread(&runtime::log_path(&cfg.root, &l)).unwrap_or(id);
-    }
-    let host = cell(host);
-    let link = match rt {
-        _ if id == "-" => format!("{host}: starting"),
-        "claude" => format!("[{host}](https://claude.ai/code/session_{id})"),
-        _ if std::env::var("TASKQ_CLIENT").as_deref() == Ok("codex") => format!("[{host}](codex://threads/{id})"),
-        _ => match raw["pages"].as_str() {
-            Some(p) => format!("[{host}]({}/open.html#codex://threads/{id})", p.trim_end_matches('/')),
-            None => format!("{host}: `codex://threads/{id}`"),
-        },
-    };
-    (rt.to_string(), link)
-}
-
-/// A PM's scope (§ 5 `--only`): no labels means every task.
-fn in_scope(i: &board::Issue, only: &[String]) -> bool {
-    only.is_empty() || only.iter().any(|f| labels::matches(&i.labels, f))
-}
-
+#[cfg(test)]
 fn report(b: &dyn Board, cfg: &Config, raw: &Value, only: &[String]) -> Res<String> {
-    let (mut views, hosts) = service::views(b, &mut HashMap::new())?;
-    views.retain(|v| in_scope(&v.issue, only));
-    if let Some(who) = raw["assignee"].as_str() {
-        let who = if who == "me" { b.me()? } else { who.to_string() };
-        views.retain(|v| v.issue.assignees.contains(&who));
-    }
-    let now = b.now()?;
-    views.sort_by_key(|v| (service::priority(&v.issue), v.issue.number));
-    let project = cfg.root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let base = b.url(0);
-    let mut out = vec![format!("{project} · [board]({})", base.trim_end_matches("/0"))];
-    let count = |f: &dyn Fn(State) -> bool| views.iter().filter(|v| f(v.task.state)).count();
-    out.push(format!(
-        "In work {} · Waiting for answer {} · Ready {}",
-        count(&|s| matches!(s, State::Doing | State::Review)),
-        count(&|s| s == State::Ask),
-        count(&|s| s == State::Ready)
-    ));
-    let link = |v: &service::View| format!("[#{} {}]({})", v.issue.number, cell(&compact(&v.issue.title, 60)), b.url(v.issue.number));
-    let rows: Vec<String> = views
-        .iter()
-        .filter(|v| !matches!(v.task.state, State::Ask | State::Later | State::Failed))
-        .map(|v| {
-            let state = if v.task.state == State::Waiting {
-                let deps: Vec<String> = v.open_deps.iter().map(|d| format!("#{d}")).collect();
-                format!("blocked ({} open)", deps.join(", "))
-            } else {
-                v.task.state.name().to_string()
-            };
-            let (rt, s) = session_link(cfg, raw, &v.task, v.issue.number);
-            format!("| {} | {state} | {} | {s} |", link(v), cell(&rt))
-        })
-        .collect();
-    if !rows.is_empty() {
-        out.push(String::new());
-        out.push("| Task | State | Runtime | Session |\n|---|---|---|---|".into());
-        out.extend(rows);
-    }
-    let qs: Vec<String> = views
-        .iter()
-        .filter(|v| v.task.state == State::Ask || (v.task.state == State::Review && v.task.card.is_some()))
-        .map(|v| {
-            let card = v.task.card.clone().unwrap_or_default();
-            let opts = options(&card);
-            let n = v.issue.number;
-            let o: Vec<String> = opts.iter().map(|(k, t, star)| {
-                let label = cell(&compact(t, 120));
-                let label = if t.chars().count() > 120 { format!("[{label}]({})", b.url(n)) } else { label };
-                format!("{n}.{k} {label}{}", if *star { " ★" } else { "" })
-            }).collect();
-            format!("| {} | [{}]({}) | {} |", link(v), cell(&compact(&brief(&card), 160)), b.url(n), o.join(" · "))
-        })
-        .collect();
-    if !qs.is_empty() {
-        out.push(String::new());
-        out.push("Questions (answer N.M):\n| Question | Brief reason | Options |\n|---|---|---|".into());
-        out.extend(qs);
-    }
-    let later: Vec<String> = views.iter().filter(|v| v.task.state == State::Later).map(link).collect();
-    if !later.is_empty() {
-        out.push(String::new());
-        out.push(format!("Later: {}", later.join(", ")));
-    }
-    let failed: Vec<String> = views
-        .iter()
-        .filter(|v| v.task.state == State::Failed)
-        .map(|v| {
-            let why = v.comments.iter().rev().find(|c| c.trusted && c.body.starts_with("taskq: failed")).and_then(|c| c.body.split_once('\n')).map(|x| x.1).unwrap_or("");
-            format!("| {} | [{}]({}) |", link(v), cell(&compact(why, 160)), b.url(v.issue.number))
-        })
-        .collect();
-    if !failed.is_empty() {
-        out.push(String::new());
-        out.push("Failed:\n| Task | Reason |\n|---|---|".into());
-        out.extend(failed);
-    }
-    let hs: Vec<String> = hosts
-        .iter()
-        .map(|h| {
-            let v = h.body.lines().find_map(|l| l.strip_prefix("version ")).unwrap_or("?");
-            format!("{} v{v} {}", h.title.trim_start_matches("taskq host "), age(now - h.updated))
-        })
-        .collect();
-    if !hs.is_empty() {
-        out.push(String::new());
-        out.push(format!("Hosts: {}", hs.join(", ")));
-    }
-    Ok(out.join("\n"))
+    snapshot::read(b, cfg, raw, only).text(cfg, raw)
 }
 
 fn inbox(b: &dyn Board, n: u64) -> Res<String> {
@@ -733,15 +611,20 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         let at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let kids: Vec<Value> = s.kids.iter().map(|k| json!({"task": k.task, "attempt": k.attempt, "rt": k.rt, "pid": k.proc.id()})).collect();
-        let tasks: Vec<Value> = s.tasks.iter().map(|(n, title, state, labels)| json!({"n": n, "title": title, "state": state, "labels": labels})).collect();
         let request = fs::read_to_string(d.join("focus.request")).ok();
         // § 4: runtime probes at most every 5 minutes
         if agents.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs() >= 300) {
             agents = Some((Instant::now(), json!({"at": at, "rows": runtime::agents()})));
         }
         let tool = platform::tool(&cfg.install);
+        let error = r.as_ref().err().cloned();
         let mut status = coreq::status::common(&tool, &cfg.me, &project, at, r.err(), update.as_deref());
-        for (k, v) in [("focus", json!(s.focus)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)), ("tasks", json!(tasks)),
+        // § 4 snapshot keys; before the first successful pass tasks are unknown, not an empty list
+        match &s.snapshot {
+            Some(snap) => for (k, v) in snap.status_keys(error.as_deref()) { status[k] = v; },
+            None => { status["complete"] = json!(false); status["reason"] = json!(error.as_deref().unwrap_or("no board read yet")); status["tasks"] = json!([]); }
+        }
+        for (k, v) in [("focus", json!(s.focus)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
             ("capacity", s.capacity_json()), ("agents", json!(agents.as_ref().map(|a| &a.1))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root)))]
@@ -1138,10 +1021,8 @@ fn service_fields(root: &Path) -> String {
         s["tasks_age_seconds"].as_u64()?.checked_add(now?.checked_sub(s["at"].as_u64()?)?)
     }).filter(|a| *a <= ttl);
     match (status, fresh) {
-        (Some(s), Some(a)) if s["error"].is_null() && s["tasks"].is_array() => {
-            let tasks = s["tasks"].as_array().unwrap();
-            let count = |states: &[&str]| tasks.iter().filter(|t| t["state"].as_str().is_some_and(|v| states.contains(&v))).count();
-            out.push(format!("In work {} · Waiting for answer {} · Ready {}", count(&["doing", "review"]), count(&["ask"]), count(&["ready"])));
+        (Some(s), Some(a)) if snapshot::complete(&s) => {
+            out.push(snapshot::counts_line(&snapshot::status_totals(&s).unwrap()));
             out.push(format!("Freshness: {} (cached status)", age(a as i64)));
             out.push("Service: unknown (process not checked)".into());
         }
@@ -1468,7 +1349,12 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             if failed { Err("some tasks were not closed".into()) } else { Ok(()) }
         }
         "status" => {
-            println!("{}", report(b, cfg, &c.raw, &a.all("only").iter().flat_map(|x| x.split(',')).map(String::from).collect::<Vec<_>>())?);
+            let snap = snapshot::read(b, cfg, &c.raw, &a.all("only").iter().flat_map(|x| x.split(',')).map(String::from).collect::<Vec<_>>());
+            if a.flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&snap.json()).map_err(|e| e.to_string())?);
+            } else {
+                println!("{}", snap.text(cfg, &c.raw)?);
+            }
             Ok(())
         }
         "cleanup" => {
@@ -1785,6 +1671,76 @@ mod tests {
         assert!(r.contains("Hosts: mac v4.0.0"), "{r}");
     }
 
+    /// A board with one task per report part: ready, ask with a card, blocked, failed, plus a host heartbeat.
+    fn snapshot_board() -> Fake {
+        let b = Fake::default();
+        b.create("Ready one", "", &["taskq".into(), "p1".into()]).unwrap();
+        let q = b.create("Question", "", &["taskq".into()]).unwrap();
+        b.comment(q, &entry("spawn", &["worker", "claude:abc", "mac"], None, "")).unwrap();
+        let a = fold(q, &entries(&b, q).unwrap(), false).attempt.unwrap();
+        b.comment(q, &entry("ask", &[], Some(a), "Done: read\nProblem: Which way?\n1. left\n2. right ★")).unwrap();
+        let dep = b.create("plain issue", "", &[]).unwrap();
+        b.create("Blocked", &format!("Depends on #{dep}"), &["taskq".into()]).unwrap();
+        let f = b.create("Broken", "", &["taskq".into()]).unwrap();
+        b.comment(f, &entry("failed", &[], None, "Reason: no login")).unwrap();
+        b.create("taskq host mac", "version 4.0.0", &[service::HOST_LABEL.into()]).unwrap();
+        b.advance(90);
+        b
+    }
+
+    #[test]
+    fn text_json_and_service_status_count_from_one_snapshot() {
+        let (b, c) = (snapshot_board(), cfg());
+        let snap = snapshot::read(&b, &c, &Value::Null, &[]);
+        let text = snap.text(&c, &Value::Null).unwrap();
+        let j = snap.json();
+        let t = &j["totals"];
+        assert_eq!((t["ready"].as_u64(), t["ask"].as_u64(), t["waiting"].as_u64(), t["failed"].as_u64()), (Some(1), Some(1), Some(1), Some(1)));
+        let line = format!("In work {} · Waiting for answer {} · Ready {}", t["doing"].as_u64().unwrap() + t["review"].as_u64().unwrap(), t["ask"], t["ready"]);
+        assert!(text.contains(&line), "{text}");
+        // the service writes the same rows and totals into status.json; `service status` counts them back
+        let root = std::env::temp_dir().join(format!("taskq-snap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(dot(&root)).unwrap();
+        fs::write(dot(&root).join("focus"), "all").unwrap();
+        let mut status = json!({"error": null, "at": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(), "tasks_age_seconds": 0});
+        for (k, v) in snap.status_keys(None) { status[k] = v; }
+        assert_eq!(status["totals"], j["totals"]);
+        assert_eq!(status["tasks"], j["tasks"]);
+        fs::write(dot(&root).join("status.json"), status.to_string()).unwrap();
+        assert!(service_fields(&root).contains(&line));
+        // a failed pass keeps the last rows for N-1 readers but its counts are unknown
+        for (k, v) in snap.status_keys(Some("board down")) { status[k] = v; }
+        assert_eq!((status["complete"].clone(), status["totals"].clone(), status["reason"].clone()), (json!(false), Value::Null, json!("board down")));
+        fs::write(dot(&root).join("status.json"), status.to_string()).unwrap();
+        assert!(service_fields(&root).contains("Counts: unknown"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unreadable_board_snapshot_is_incomplete_not_zero() {
+        let (b, c) = (Fake::default(), cfg());
+        let mut snap = snapshot::read(&b, &c, &Value::Null, &[]);
+        snap.reason = Some("board unreadable: 502".into());
+        let j = snap.json();
+        assert_eq!((j["complete"].clone(), j["reason"].clone(), j["totals"].clone()), (json!(false), json!("board unreadable: 502"), Value::Null));
+        assert_eq!(snap.text(&c, &Value::Null).unwrap_err(), "board unreadable: 502");
+        assert!(!snapshot::complete(&json!({"error": "board failed", "tasks": []})), "N-1 status.json with an error");
+        assert!(snapshot::complete(&json!({"error": null, "tasks": []})), "N-1 status.json after a good pass");
+        assert!(!snapshot::complete(&json!({"error": null, "complete": false, "tasks": []})));
+    }
+
+    #[test]
+    fn status_json_matches_the_golden_fixture() {
+        let snap = snapshot::read(&snapshot_board(), &cfg(), &Value::Null, &[]);
+        let got = serde_json::to_string_pretty(&snap.json()).unwrap() + "\n";
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/status-snapshot.json");
+        if std::env::var_os("TASKQ_BLESS").is_some() { fs::write(&path, &got).unwrap(); }
+        // Parsed compare: a CRLF checkout on Windows must not fail the golden.
+        let want: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(snap.json(), want, "TASKQ_BLESS=1 rewrites {}", path.display());
+    }
+
     #[test]
     fn cli_audit_boundaries_and_no_write_on_invalid_text() {
         assert_eq!(width("a  b"), 4);
@@ -1843,7 +1799,7 @@ mod tests {
         assert!(!r.contains("To answer:"));
         assert_eq!(fold(n, &entries(&b, n).unwrap(), false).card.as_deref(), Some(card.as_str()));
         assert_eq!(b.issue(n).unwrap().title, title);
-        assert_eq!(brief("Old question?\n1. keep\n2. change"), "Old question?");
+        assert_eq!(snapshot::brief("Old question?\n1. keep\n2. change"), "Old question?");
     }
 
     #[test]

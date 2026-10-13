@@ -211,6 +211,7 @@ fn project(root: &str) -> Value {
     let tasks: Vec<Value> = s["tasks"].as_array().into_iter().flatten().map(|t| json!({"n": t["n"].as_u64().unwrap_or(0), "title": t["title"].as_str().unwrap_or(""), "state": t["state"].as_str().unwrap_or("")})).collect();
     json!({"root": root, "name": s["project"].as_str().map(String::from).unwrap_or_else(|| crate::project_name(r)),
         "issues": s["issues"].as_str().unwrap_or(""), "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
+        "complete": crate::snapshot::complete(&s) && age.is_some_and(|a| a < 300),
         "error": s["error"], "focus": s["focus"].as_array().cloned().unwrap_or_default(), "saved": saved, "labels": crate::status_labels(r),
         "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"],
         "capacity": s["capacity"], "cap_host": cap_host, "cap_saved": cap_saved, "agents": s["agents"],
@@ -229,6 +230,8 @@ fn now() -> i64 {
 struct Summary {
     /// work, ask, ready, failed
     counts: [usize; 4],
+    /// Every project's snapshot is complete and fresh; else the counts are unknown, never zero (§ 4).
+    known: bool,
     run: bool,
     bins: Vec<[u32; 4]>,
     since: Option<i64>,
@@ -244,7 +247,6 @@ fn summary(ps: &[Value], (start, end): (i64, i64)) -> Summary {
             seen.insert(format!("{}/{}", p["issues"].as_str().unwrap_or(""), t["n"]), t["state"].as_str().unwrap_or("").to_string());
         }
     }
-    let n = |want: &[&str]| seen.values().filter(|s| want.contains(&s.as_str())).count();
     let mut bins = vec![[0; 4]; 12];
     let mut ev = std::collections::HashSet::new();
     for p in ps {
@@ -257,7 +259,9 @@ fn summary(ps: &[Value], (start, end): (i64, i64)) -> Summary {
         }
     }
     let since = ps.iter().filter_map(|p| p["since"].as_i64()).max();
-    Summary { counts: [n(&["doing", "review"]), n(&["ask"]), n(&["ready"]), n(&["failed"])], run: ps.iter().any(|p| p["focus"].as_array().is_some_and(|f| !f.is_empty())), bins, since }
+    let t = crate::snapshot::totals(seen.values().map(String::as_str));
+    let known = ps.iter().all(|p| p["complete"] == true);
+    Summary { counts: [t["doing"] + t["review"], t["ask"], t["ready"], t["failed"]], known, run: ps.iter().any(|p| p["focus"].as_array().is_some_and(|f| !f.is_empty())), bins, since }
 }
 
 pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
@@ -578,7 +582,7 @@ fn day(now: i64) -> (i64, i64) {
 
 /// Configuration `c` over `s` at `k` × 22 pt and `dpr` pixels per point through the shared renderer.
 fn draw(c: &Value, s: &Summary, dark: bool, k: f32, dpr: f32) -> Result<Rgba, Vec<String>> {
-    let d = icon::Data { counts: s.counts.map(Some), bins: s.bins.clone(), paused: !s.run };
+    let d = icon::Data { counts: s.counts.map(|n| s.known.then_some(n)), bins: s.bins.clone(), paused: !s.run };
     icon::render(c, (22.0 * k * dpr).round() as u32, dpr, &d, dark)
 }
 
@@ -593,7 +597,7 @@ fn refresh_icon(tray: &Option<TrayIcon>, st: &Value, s: &Settings, dark: bool, s
         _ => None,
     };
     let (k, dpr) = if config.is_some() { (menu_bar_scale(), backing_scale()) } else { (1.0, 2.0) };
-    let new = format!("{config:?} {dark} {k} {dpr} {} {:?} {:?}", sum.run, sum.counts, if config.is_some() { sum.bins.clone() } else { vec![] });
+    let new = format!("{config:?} {dark} {k} {dpr} {} {} {:?} {:?}", sum.run, sum.known, sum.counts, if config.is_some() { sum.bins.clone() } else { vec![] });
     if *sig == new {
         return;
     }
@@ -604,7 +608,8 @@ fn refresh_icon(tray: &Option<TrayIcon>, st: &Value, s: &Settings, dark: bool, s
         fit_status_image(k);
     }
     let [w, a, r, _] = sum.counts;
-    let _ = t.set_tooltip(Some(format!("taskq: in work {w} · waiting for answer {a} · ready {r}{}", if sum.run { "" } else { " · paused" })));
+    let counts = if sum.known { format!("in work {w} · waiting for answer {a} · ready {r}") } else { "counts unknown (service error or stale status)".into() };
+    let _ = t.set_tooltip(Some(format!("taskq: {counts}{}", if sum.run { "" } else { " · paused" })));
 }
 
 /// Put the popover under a menu-bar icon or above a taskbar icon, inside the icon's monitor.
@@ -1030,6 +1035,10 @@ mod tests {
         assert!(s.run && !summary(&ps[..2], (-200, 100)).run);
         assert_eq!(s.bins.iter().map(|b| b[0]).sum::<u32>(), 2, "same attempt on two boards counts twice, on one board once");
         assert_eq!(s.bins.iter().map(|b| b[1]).sum::<u32>(), 0, "outside the period");
+        assert!(!s.known, "a project without a complete snapshot makes the counts unknown");
+        let mut ok = ps.clone();
+        for p in &mut ok { p["complete"] = json!(true); }
+        assert!(summary(&ok, (-200, 100)).known);
     }
 
     #[test]

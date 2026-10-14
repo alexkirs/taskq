@@ -541,6 +541,9 @@ fn service_run(c: &Ctx) -> Res<()> {
         // § 8 Access: re-read every pass; a refused runtime is not claimed or resumed
         let access = policy::report(&cfg.install, &cfg.root, &cfg.permission_mode, &cfg.codex);
         s.refused_access = access.iter().filter_map(|e| Some((e.runtime.clone(), e.refused.clone()?))).collect();
+        if let Some(m) = policy::pin_rollback(&cfg.install, platform::VERSION) {
+            eprintln!("{m}");
+        }
         s.mono = began.elapsed().as_secs();
         s.wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         // § 4 Data: an unreadable focus admits nothing and reads unknown with its reason
@@ -847,6 +850,9 @@ fn permissions_cmd(root: &Path, a: &Args) -> Res<()> {
         let by = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "unknown".into());
         let p = policy::grant(&cfg.install, rt, mode, project, &by, at)?;
         println!("Saved: {rt} {mode} ({}) revision {}; new attempts only", if project.is_some() { "project" } else { "host" }, p.revision);
+        if let Some(m) = policy::pin_rollback(&cfg.install, platform::VERSION) {
+            println!("{m}");
+        }
     } else {
         match policy::load(&cfg.install) {
             Ok(p) if p.grants.is_empty() => println!("Policy: no grants"),

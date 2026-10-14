@@ -177,9 +177,10 @@ pub fn command(env: &Env, l: &Launch, access: &crate::policy::Effective) -> Comm
     };
     crate::platform::quiet(&mut c);
     let codex = access.codex.as_deref().unwrap_or(env.codex);
+    let mode = access.claude.as_deref().unwrap_or(env.permission_mode);
     match (l.rt.as_str(), &l.resume) {
         ("claude", r) => {
-            c.args(["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", env.permission_mode]);
+            c.args(["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", mode]);
             if r.is_some() { c.args(["--resume", &l.session]) } else { c.args(["--session-id", &l.session]) };
         }
         (_, None) => {
@@ -317,15 +318,20 @@ impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.message.fmt(f) }
 }
 
+/// § 8 Access of `rt` here, resolved again for every start and resume; a refusal starts nothing.
+pub fn access(env: &Env, rt: &str) -> Result<crate::policy::Effective, StartError> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
+    let a = crate::policy::resolve(&crate::policy::load(env.install), &crate::policy::Host::here(env.install, env.root, &home), rt, env.permission_mode, env.codex);
+    match &a.refused {
+        Some(r) => Err(StartError { message: format!("access refused: {r}"), reportable: false }),
+        None => Ok(a),
+    }
+}
+
 /// Start the child with its stdout and stderr in the attempt log; `codex-app` starts its handshake child (§ 8).
 pub fn spawn(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
-    // § 8 Access: resolved again for every start and resume; a refusal starts nothing
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
-    let access = crate::policy::resolve(&crate::policy::load(env.install), &crate::policy::Host::here(env.install, env.root, &home), &l.rt, env.permission_mode, env.codex);
+    let access = access(env, &l.rt)?;
     eprintln!("#{} attempt {} access {}", l.task, l.attempt, access.line());
-    if let Some(r) = &access.refused {
-        return Err(StartError { message: format!("access refused: {r}"), reportable: false });
-    }
     let text = turn_text(env, l, rule_file)?;
     eprintln!("specq@{SPECQ_REVISION} loaded for {} #{} attempt {} ({})", l.role, l.task, l.attempt, if l.resume.is_some() { "resume" } else { "start" });
     let log = log_path(env.root, l);
@@ -578,6 +584,39 @@ mod tests {
         t.running = || false;
         assert_eq!(t.exited(), Ok(Some(-1)), "a closed app is a child exit");
         let _ = std::fs::remove_file(p);
+    }
+
+    // Chain: § 8 Access adapter on the host OS (A3, A4). Risk: a Full grant keeps the runtime's own permission or
+    // sandbox flags on start or resume, or a host without enforcement starts a non-Full worker or reviewer.
+    #[test]
+    fn access_maps_full_and_refuses_unknown_enforcement_before_start() {
+        let install = std::env::temp_dir().join(format!("taskq-access-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&install);
+        std::fs::create_dir_all(&install).unwrap();
+        let codex: Vec<String> = ["-s", "workspace-write", "-m", "gpt-5", "-c", "model_reasoning_effort=high"].map(String::from).into();
+        let root = std::env::temp_dir();
+        let env = Env { root: &root, exe: Path::new("/i/taskq"), install: &install, permission_mode: "dontAsk", codex: &codex, publish: "pr", board_env: &[] };
+        let args = |c: &Command| c.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
+        let mut l = Launch { task: 7, title: "T".into(), attempt: 42, role: "worker".into(), rt: "claude".into(), session: "s".into(), url: "https://b/7".into(), resume: None };
+        crate::policy::grant(&install, "claude", "full", None, "op", 1).unwrap();
+        crate::policy::grant(&install, "codex", "full", None, "op", 1).unwrap();
+        for resume in [None, Some("answer".to_string())] {
+            l.resume = resume;
+            l.rt = "claude".into();
+            assert!(args(&command(&env, &l, &access(&env, "claude").unwrap())).contains("--permission-mode bypassPermissions"));
+            l.rt = "codex".into();
+            assert!(args(&command(&env, &l, &access(&env, "codex").unwrap())).starts_with("exec --json -s danger-full-access -m gpt-5 -c model_reasoning_effort=high "));
+        }
+        // the host without enforcement (every OS but macOS): no grant or a non-Full one refuses before any child or fetch
+        if !cfg!(target_os = "macos") {
+            for (rt, mode) in [("claude", "none"), ("codex", "workspace"), ("claude", "restricted")] {
+                crate::policy::grant(&install, rt, mode, None, "op", 2).unwrap();
+                l.rt = rt.into();
+                let e = spawn(&env, &l).err().expect("refused");
+                assert!(e.message.starts_with("access refused: ") && e.message.contains(std::env::consts::OS), "{}", e.message);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&install);
     }
 
     // Chain: § 8 rule delivery. Risk: a new/resumed worker or reviewer receives only links or mixed rules.

@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 pub const FILE: &str = "worker-policy.json";
 pub const MODES: &[&str] = &["restricted", "workspace", "full"];
+/// The oldest version that enforces this file: an older one (4.1.11) runs legacy flags and its update sweep deletes it.
+pub const FLOOR: &str = "4.2.0-dev";
 
 #[derive(Default, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -71,7 +73,9 @@ pub struct Effective {
     pub enforcement: String,
     /// The Seatbelt profile taskq wraps the child in (macOS).
     pub profile: Option<String>,
-    /// Codex arguments replacing the project's: a sandbox cannot nest inside taskq's.
+    /// Claude permission mode replacing the project's (Full).
+    pub claude: Option<String>,
+    /// Codex arguments replacing the project's: a sandbox cannot nest inside taskq's; Full has none.
     pub codex: Option<Vec<String>>,
     pub refused: Option<String>,
 }
@@ -103,15 +107,21 @@ fn codex_sandbox(args: &[String]) -> Option<&str> {
     })
 }
 
-/// The project's Codex arguments without sandbox choices, under `-s danger-full-access`: taskq's profile is the boundary.
+/// The project's Codex arguments without sandbox choices (`-c sandbox_*` included), under `-s danger-full-access`;
+/// model, effort and other options stay (R9).
 fn codex_unsandboxed(args: &[String]) -> Vec<String> {
     let mut out = vec!["-s".to_string(), "danger-full-access".into()];
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-s" | "--sandbox" => { it.next(); }
+            "-c" | "--config" => match it.next() {
+                Some(v) if v.starts_with("sandbox") => {}
+                Some(v) => out.extend([a.to_string(), v.clone()]),
+                None => {}
+            },
             "--full-auto" | "--dangerously-bypass-approvals-and-sandbox" => {}
-            a if a.starts_with("--sandbox=") => {}
+            a if a.starts_with("--sandbox=") || a.starts_with("--config=sandbox") => {}
             _ => out.push(a.clone()),
         }
     }
@@ -163,7 +173,7 @@ fn writable(mode: &str, h: &Host) -> Vec<PathBuf> {
 /// The effective access of `rt` in this project (§ 8 Access). A project grant replaces the host default for its root.
 pub fn resolve(policy: &Result<Policy, String>, h: &Host, rt: &str, permission_mode: &str, codex: &[String]) -> Effective {
     let requested = if rt == "claude" { format!("--permission-mode {permission_mode}") } else if codex.is_empty() { "codex defaults".into() } else { codex.join(" ") };
-    let mut e = Effective { runtime: rt.into(), requested, grant: "none".into(), mode: "legacy".into(), enforcement: String::new(), profile: None, codex: None, refused: None };
+    let mut e = Effective { runtime: rt.into(), requested, grant: "none".into(), mode: "legacy".into(), enforcement: String::new(), profile: None, claude: None, codex: None, refused: None };
     let p = match policy {
         Ok(p) => p,
         Err(err) => {
@@ -211,6 +221,11 @@ pub fn resolve(policy: &Result<Policy, String>, h: &Host, rt: &str, permission_m
             e.mode = g.mode.clone();
             if g.mode == "full" {
                 e.enforcement = "runtime sandbox off, uncontained; the same user can edit the policy".into();
+                if rt == "claude" {
+                    e.claude = Some("bypassPermissions".into());
+                } else {
+                    e.codex = Some(codex_unsandboxed(codex));
+                }
             } else if !mac {
                 e.refused = Some(format!("{} enforcement unknown for {rt} on {}", g.mode, h.os));
             } else {
@@ -230,6 +245,20 @@ pub fn report(install: &Path, root: &Path, permission_mode: &str, codex: &[Strin
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
     let p = load(install);
     crate::runtime::agent_runtimes().iter().map(|rt| resolve(&p, &Host::here(install, root, &home), rt, permission_mode, codex)).collect()
+}
+
+/// § 8 Access rollback floor: with grants, or an unreadable store, the launcher must not roll back below [`FLOOR`]. A
+/// `previous` older than it becomes `version`, so a failing release stays down (no admission) for the operator.
+pub fn pin_rollback(install: &Path, version: &str) -> Option<String> {
+    if matches!(load(install), Ok(p) if p.grants.is_empty()) || coreq::update::newer(FLOOR, version) {
+        return None;
+    }
+    let prev = std::fs::read_to_string(install.join("previous")).ok()?.trim().to_string();
+    if prev.is_empty() || !coreq::update::newer(FLOOR, &prev) {
+        return None;
+    }
+    crate::platform::write_atomic(&install.join("previous"), version).ok()?;
+    Some(format!("rollback floor: previous {prev} ignores worker grants; previous is now {version}"))
 }
 
 /// Add, replace or remove (`mode` none) one grant (the caller refuses workers); the revision moves by one; written atomically and read back.
@@ -278,7 +307,9 @@ mod tests {
         assert!(resolve(&none, &host("macos", i, r), "codex", "", &["--full-auto".into(), "-m".into(), "gpt-5".into()]).refused.is_none());
         let e = resolve(&none, &host("macos", i, r), "codex", "", &ws[..2]);
         assert_eq!((e.profile.as_ref(), e.codex.as_ref(), e.enforcement.as_str()), (None, None, "codex sandbox workspace-write, policy store not writable"));
-        assert!(resolve(&none, &host("macos", i, r), "codex", "", &ws).refused.is_none());
+        if cfg!(unix) {
+            assert!(resolve(&none, &host("macos", i, r), "codex", "", &ws).refused.is_none(), "an absolute added dir");
+        }
         let up = ["-s".to_string(), "workspace-write".into(), "--add-dir".into(), "/".into()];
         for w in [&up[..], &["-s".into(), "workspace-write".into(), "--add-dir".into(), "..".into()], &["-s".into(), "workspace-write".into(), "-c".into(), "x=1".into()], &["--full-auto".into(), "--yolo".into()], &["-s".into(), "workspace-write".into(), "-C".into(), "/".into()], &["-s".into(), "workspace-write".into(), "--sandbox=danger-full-access".into()]] {
             assert!(resolve(&none, &host("macos", i, r), "codex", "", w).refused.is_some(), "{w:?}");
@@ -293,11 +324,18 @@ mod tests {
         assert_eq!((e.mode.as_str(), e.grant.as_str()), ("workspace", "workspace (project) rev 4 by op"));
         assert!(e.profile.unwrap().contains("(subpath \"/p\")"));
         let e = resolve(&p, &host("macos", i, Path::new("/q")), "claude", "dontAsk", &[]);
-        assert_eq!((e.mode.as_str(), e.profile.as_ref(), e.refused.as_ref()), ("full", None, None));
+        assert_eq!((e.mode.as_str(), e.profile.as_ref(), e.refused.as_ref(), e.claude.as_deref()), ("full", None, None, Some("bypassPermissions")));
         assert_eq!(resolve(&p, &host("windows", i, Path::new("/q")), "claude", "dontAsk", &[]).refused, None);
+        // Full turns the runtime sandbox off on start and resume, model and effort kept (A3)
+        let full = Ok(Policy { revision: 2, grants: vec![g("codex", "full", None)] });
+        let own: Vec<String> = ["-s", "workspace-write", "-m", "gpt-5", "-c", "model_reasoning_effort=high", "-c", "sandbox_mode=read-only", "--full-auto"].map(String::from).into();
+        for os in ["macos", "windows", "linux"] {
+            let e = resolve(&full, &host(os, i, r), "codex", "", &own);
+            assert_eq!((e.codex.unwrap(), e.profile, e.refused), (["-s", "danger-full-access", "-m", "gpt-5", "-c", "model_reasoning_effort=high"].map(String::from).to_vec(), None, None));
+        }
         let e = resolve(&p, &host("macos", i, r), "codex", "", &ws);
         assert_eq!(e.codex.unwrap(), ["-s", "danger-full-access", "--add-dir", "/p/.git"]);
-        assert!(e.profile.unwrap().contains("(subpath \"/p/.taskq\")"));
+        assert!(e.profile.unwrap().contains(&format!("(subpath {})", sb(&r.join(".taskq")))));
         assert!(resolve(&p, &host("linux", i, r), "codex", "", &ws).refused.unwrap().contains("enforcement unknown"));
     }
 
@@ -315,6 +353,36 @@ mod tests {
         std::fs::write(install.join(FILE), "{broken").unwrap();
         assert!(grant(&install, "claude", "full", None, "op", 8).is_err());
         assert_eq!(std::fs::read_to_string(install.join(FILE)).unwrap(), "{broken");
+        let _ = std::fs::remove_dir_all(&install);
+    }
+
+    // Chain: § 8 Access N/N-1 rollback against 4.1.11 (same coreq v0.5.0 launcher). Risk: an unhealthy release rolls
+    // back to 4.1.11, which ignores grants and runs legacy flags, or the pin moves `previous` without a grant.
+    #[test]
+    fn grants_keep_the_launcher_above_the_policy_floor() {
+        let install = std::env::temp_dir().join(format!("taskq-floor-{}", std::process::id()));
+        // the launcher without the incident hook: a test writes no incident
+        let t = coreq::Tool { install: install.clone(), fault: None, ..coreq::Tool::new("taskq", "TaskQ", crate::platform::RELEASE_REPO, crate::platform::VERSION) };
+        let new = "4.2.0-dev.1760000000";
+        for granted in [false, true] {
+            let _ = std::fs::remove_dir_all(&install);
+            std::fs::create_dir_all(install.join("releases").join(new)).unwrap();
+            std::fs::write(install.join("current"), new).unwrap();
+            std::fs::write(install.join("previous"), "4.1.11").unwrap();
+            if granted {
+                grant(&install, "claude", "workspace", None, "op", 1).unwrap();
+            }
+            assert_eq!(pin_rollback(&install, new).is_some(), granted);
+            let picks: Vec<String> = (0..3).map(|_| coreq::launcher::pick(&t, true).unwrap()).collect();
+            assert_eq!(picks[2], if granted { new } else { "4.1.11" }, "granted {granted}");
+            assert_eq!(std::fs::read_to_string(install.join("previous")).unwrap().trim(), if granted { new } else { "4.1.11" });
+        }
+        // a store that reads unknown pins too; a newer previous stays
+        std::fs::write(install.join(FILE), "{broken").unwrap();
+        std::fs::write(install.join("previous"), "4.1.11").unwrap();
+        assert!(pin_rollback(&install, new).is_some());
+        std::fs::write(install.join("previous"), "4.2.0-dev.1").unwrap();
+        assert!(pin_rollback(&install, new).is_none());
         let _ = std::fs::remove_dir_all(&install);
     }
 

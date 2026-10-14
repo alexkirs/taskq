@@ -5,7 +5,9 @@
 # Bundle `org.taskq.tray` shares the OS permission with any later real TaskQ.app on this Mac.
 set -eu
 BIN=${1:-target/release/taskq}
-W=${TMPDIR:-/tmp}/taskq-1051-owner
+# resolved path: through the /var -> /private/var symlink the app cannot hand its bundle to the notification
+# daemon (tray.log: sandbox_extension_issue_file_to_process failed: 1) and the OS never asks (#1051 first run)
+W=$(cd "${TMPDIR:-/tmp}" && pwd -P)/taskq-1051-owner
 I=$W/inst P=$W/proj
 APP=$I/TaskQ.app
 rm -rf "$W" && mkdir -p "$APP/Contents/MacOS" "$P/.taskq" "$W/shots"
@@ -34,8 +36,19 @@ ask() { printf '%s [y/n] ' "$1"; read -r a; log "owner: $1 -> $a"; }
 log "start $(shasum -a 256 "$BIN" | cut -c1-64)"
 TASKQ_INSTALL=$I "$APP/Contents/MacOS/taskq" tray 2>"$W/tray.log" &
 TRAY=$!
+sleep 3
+if ! kill -0 "$TRAY" 2>/dev/null || grep -q sandbox_extension "$W/tray.log"; then
+  log "tray not ready: $(tail -1 "$W/tray.log")"
+  echo "Stop: run this from Terminal.app (not an agent shell) and send $W/result.txt"
+  kill "$TRAY" 2>/dev/null || true
+  exit 1
+fi
+log "tray $TRAY running, tray.log clean"
 echo "1. A macOS prompt asks whether TaskQ may send notifications. Click Allow."
 ask "Did the prompt appear and did you click Allow?"
+echo "   No prompt? System Settings > Notifications > TaskQ: turn Allow notifications on (a worker run without a screen already read Blocked)."
+open "x-apple.systempreferences:com.apple.Notifications-Settings.extension" || true
+ask "Is TaskQ listed in Notifications with Allow on now?"
 sleep 3
 echo "$(date +%s) #7 ask 7001" >> "$P/.taskq/events"
 log "appended ask event for #7"

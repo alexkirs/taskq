@@ -240,10 +240,14 @@ mod tests {
                     }
                 }
             }); }
-            // Rule: one trim must win the nonblocking lock, so the pre-filled record above is always truncated and
-            // every record left is a counted successful append. Retry until it wins; 50 losses happened in CI.
+            // Rule (§ 4 Profiling, R12): one prune wins the nonblocking lock while appends race, so the pre-filled
+            // record is truncated and every retained record is a counted successful append. 50 losses happened in CI.
             scope.spawn(|| {
-                while !crate::data::trim_tail(&path, crate::data::LOG_MAX) { std::thread::yield_now(); }
+                let deadline = Instant::now() + std::time::Duration::from_secs(10);
+                while !crate::data::trim_tail(&path, crate::data::LOG_MAX) {
+                    assert!(Instant::now() < deadline, "no prune won the profile log lock");
+                    std::thread::yield_now();
+                }
                 for _ in 0..49 { crate::data::trim_tail(&path, crate::data::LOG_MAX); }
             });
         });

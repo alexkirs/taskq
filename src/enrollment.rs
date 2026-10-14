@@ -123,6 +123,11 @@ pub fn approved(active: &Value) -> Option<BoardScope> {
     BoardScope::new(kind, host, repo).ok().filter(|b| b.value() == v)
 }
 
+/// Whether the service holding `snap` is the host's one DashQ speaker: its board is the connection's approved one.
+pub fn speaks(active: &Value, snap: Option<&Snapshot>) -> bool {
+    snap.is_some_and(|s| approved(active).is_some_and(|b| BoardScope::snapshot(s).is_ok_and(|x| x == b)))
+}
+
 /// The record of one snapshot: payload without `observed` names its content, so equal content dedupes by digest.
 pub fn record(install: &Path, s: &Snapshot, active: &Value) -> Res<(String, Value)> {
     let board = approved(active).ok_or("connection has no readable board scope")?;
@@ -192,7 +197,7 @@ impl Sender {
             return Ok(());
         };
         // another project's board, or no board read yet: nothing to send from here
-        let Some(s) = snap.filter(|s| approved(&a).is_some_and(|b| BoardScope::snapshot(s).is_ok_and(|x| x == b))) else { return Ok(()) };
+        let Some(s) = snap.filter(|s| speaks(&a, Some(s))) else { return Ok(()) };
         let (digest, rec) = record(install, s, &a).map_err(|e| format!("not sent: {e}"))?;
         if self.sent.as_ref().is_some_and(|(d, at)| *d == digest && now < at + RESEND) { return Ok(()) }
         let mut backoff = std::mem::take(&mut self.backoff);

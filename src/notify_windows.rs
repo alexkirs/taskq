@@ -1,29 +1,31 @@
 //! Windows adapter for M14. The shared core owns modes, cursors, bursts and card payloads.
 use super::Post;
-use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::{AtomicU64, Ordering};
-use windows::core::{HSTRING, Interface, Result, w};
+use windows::core::{BOOL, GUID, HSTRING, IUnknown, Interface, PCWSTR, Ref, Result, implement, w};
 use windows::Data::Xml::Dom::XmlDocument;
-use windows::Foundation::TypedEventHandler;
 use windows::UI::Notifications::{NotificationSetting, ToastNotification, ToastNotificationManager, ToastNotifier};
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER, IPersistFile, STGM_READ, STGM_READWRITE};
-use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+use windows::Win32::System::Com::{CoCreateInstance, CoRegisterClassObject, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER,
+    IClassFactory, IClassFactory_Impl, IPersistFile, REGCLS_MULTIPLEUSE, STGM_READ, STGM_READWRITE};
+use windows::Win32::System::Com::StructuredStorage::{InitPropVariantFromCLSID, PROPVARIANT, PropVariantToGUID};
+use windows::Win32::UI::Notifications::{INotificationActivationCallback, INotificationActivationCallback_Impl, NOTIFICATION_USER_INPUT_DATA};
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_SINGLETHREADED};
 use windows::Win32::UI::Shell::{IShellLinkW, ShellLink, SetCurrentProcessExplicitAppUserModelID};
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, PSGetPropertyKeyFromName};
 
 const APP: &str = "org.taskq.tray";
 static NOTIFIER: OnceLock<std::result::Result<ToastNotifier, String>> = OnceLock::new();
+// The shortcut's System.AppUserModel.ToastActivatorCLSID: the OS sends banner and Notification Center clicks to the
+// class object the running tray registers under it.
+const ACTIVATOR: GUID = GUID::from_u128(0xaf9b407e_49c7_4b89_9b0e_55ea50346e66);
 static CLICK: OnceLock<Mutex<Box<dyn Fn(String) + Send>>> = OnceLock::new();
-static GENERATION: AtomicU64 = AtomicU64::new(0);
-static POSTS: OnceLock<Mutex<HashMap<String, (ToastNotification, u64)>>> = OnceLock::new();
 
 // Preserve an unrelated shortcut rather than taking its name or ownership.
 fn shortcut(path: &std::path::Path, exe: &std::path::Path) -> Result<()> {
     unsafe {
         let mut key = windows::Win32::Foundation::PROPERTYKEY::default();
         PSGetPropertyKeyFromName(w!("System.AppUserModel.ID"), &mut key)?;
+        let mut activator = windows::Win32::Foundation::PROPERTYKEY::default();
+        PSGetPropertyKeyFromName(w!("System.AppUserModel.ToastActivatorCLSID"), &mut activator)?;
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
         let file: IPersistFile = link.cast()?;
         let props: IPropertyStore = link.cast()?;
@@ -38,11 +40,13 @@ fn shortcut(path: &std::path::Path, exe: &std::path::Path) -> Result<()> {
         link.SetPath(&HSTRING::from(exe.as_os_str()))?;
         link.SetArguments(w!("tray"))?;
         props.SetValue(&key, &PROPVARIANT::from(APP))?;
+        props.SetValue(&activator, &InitPropVariantFromCLSID(&ACTIVATOR)?)?;
         props.Commit()?;
         file.Save(&name, true)?;
         // Read back the saved identity before allowing any toast.
         file.Load(&name, STGM_READ)?;
-        if windows::core::BSTR::try_from(&props.GetValue(&key)?)?.to_string() != APP {
+        if windows::core::BSTR::try_from(&props.GetValue(&key)?)?.to_string() != APP
+            || PropVariantToGUID(&props.GetValue(&activator)?)? != ACTIVATOR {
             return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)));
         }
         Ok(())
@@ -80,6 +84,8 @@ fn xml(p: &Post) -> Result<XmlDocument> {
     let doc = XmlDocument::new()?;
     doc.LoadXml(&HSTRING::from(format!("<toast><visual><binding template=\"ToastGeneric\"><text/><text/></binding></visual><audio {} /></toast>",
         if p.sound { "src=\"ms-winsoundevent:Notification.Default\"" } else { "silent=\"true\"" })))?;
+    // the activator receives this as its arguments: the card to open
+    doc.DocumentElement()?.SetAttribute(&HSTRING::from("launch"), &HSTRING::from(&p.id))?;
     let texts = doc.GetElementsByTagName(&HSTRING::from("text"))?;
     for (i, text) in [&p.title, &p.body].into_iter().enumerate() {
         let node = doc.CreateTextNode(&HSTRING::from(text))?;
@@ -92,11 +98,27 @@ fn tag(id: &str) -> String {
     ring::digest::digest(&ring::digest::SHA256, id.as_bytes()).as_ref()[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn activation(id: String) -> TypedEventHandler<ToastNotification, windows::core::IInspectable> {
-    TypedEventHandler::new(move |_, _| {
-        if let Some(f) = CLICK.get().and_then(|f| f.lock().ok()) { f(id.clone()); }
+#[implement(INotificationActivationCallback)]
+struct Activator;
+
+impl INotificationActivationCallback_Impl for Activator_Impl {
+    fn Activate(&self, _app: &PCWSTR, args: &PCWSTR, _data: *const NOTIFICATION_USER_INPUT_DATA, _count: u32) -> Result<()> {
+        let id = if args.is_null() { String::new() } else { unsafe { args.to_string() }.unwrap_or_default() };
+        if let Some(f) = CLICK.get().and_then(|f| f.lock().ok()) { f(id); }
         Ok(())
-    })
+    }
+}
+
+#[implement(IClassFactory)]
+struct Factory;
+
+impl IClassFactory_Impl for Factory_Impl {
+    fn CreateInstance(&self, outer: Ref<IUnknown>, iid: *const GUID, object: *mut *mut core::ffi::c_void) -> Result<()> {
+        if outer.is_some() { return Err(windows::Win32::Foundation::CLASS_E_NOAGGREGATION.into()) }
+        let a: INotificationActivationCallback = Activator.into();
+        unsafe { a.query(iid, object).ok() }
+    }
+    fn LockServer(&self, _lock: BOOL) -> Result<()> { Ok(()) }
 }
 
 fn send(n: &ToastNotifier, p: &Post) -> Result<bool> {
@@ -105,26 +127,7 @@ fn send(n: &ToastNotifier, p: &Post) -> Result<bool> {
     let key = tag(&p.id);
     toast.SetTag(&HSTRING::from(&key))?;
     toast.SetGroup(&HSTRING::from(tag(&p.root)))?;
-    toast.Activated(&activation(p.id.clone()))?;
-    let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
-    let posts = POSTS.get_or_init(|| Mutex::new(HashMap::new()));
-    // Keep the event source alive until dismissed/failed; a summary replaces its previous source.
-    for failed in [false, true] {
-        let key = key.clone();
-        let remove = move || { if let Ok(mut ps) = posts.lock() {
-            if ps.get(&key).is_some_and(|p| p.1 == generation) { ps.remove(&key); }
-        } };
-        if failed {
-            toast.Failed(&TypedEventHandler::new(move |_, _| { remove(); Ok(()) }))?;
-        } else {
-            toast.Dismissed(&TypedEventHandler::new(move |_, _| { remove(); Ok(()) }))?;
-        }
-    }
-    if let Ok(mut ps) = posts.lock() { ps.insert(key.clone(), (toast.clone(), generation)); }
-    if let Err(e) = n.Show(&toast) {
-        if let Ok(mut ps) = posts.lock() { ps.remove(&key); }
-        return Err(e);
-    }
+    n.Show(&toast)?;
     Ok(true)
 }
 
@@ -148,6 +151,9 @@ pub fn watch(f: impl Fn(String) + Send + 'static) {
             let exe = crate::platform::default_install().join("taskq-tray.exe");
             if !exe.is_file() { return Err("stable tray executable unavailable".into()) }
             shortcut(&path, &exe).map_err(|e| e.to_string())?;
+            // Registered for the tray's lifetime on its STA; the event loop pumps the incoming activations.
+            let factory: IClassFactory = Factory.into();
+            unsafe { CoRegisterClassObject(&ACTIVATOR, &factory, CLSCTX_LOCAL_SERVER, REGCLS_MULTIPLEUSE).map_err(|e| e.to_string())?; }
             unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP)).map_err(|e| e.to_string())?; }
             ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP)).map_err(|e| e.to_string())
         };
@@ -200,6 +206,9 @@ mod tests {
             link.GetArguments(&mut args)?;
             assert_eq!(String::from_utf16_lossy(&args[..4]), "tray");
             let props: IPropertyStore = link.cast()?;
+            let mut activator = windows::Win32::Foundation::PROPERTYKEY::default();
+            PSGetPropertyKeyFromName(w!("System.AppUserModel.ToastActivatorCLSID"), &mut activator)?;
+            assert_eq!(PropVariantToGUID(&props.GetValue(&activator)?)?, ACTIVATOR);
             props.SetValue(&key, &PROPVARIANT::from("another.app"))?;
             props.Commit()?;
             file.Save(&HSTRING::from(path.as_os_str()), true)?;
@@ -231,11 +240,14 @@ mod tests {
             assert_eq!(t.Tag()?.to_string(), tag(&p.id));
             assert_eq!(t.Group()?.to_string(), tag(&p.root));
             assert_eq!(doc.GetXml()?.to_string().contains("silent=\"true\""), !sound);
+            assert_eq!(doc.DocumentElement()?.GetAttribute(&HSTRING::from("launch"))?.to_string(), p.id);
         }
-        // Invoke the production COM event delegate: API evidence, not a native user click.
+        // Invoke the production COM activator through its class factory: API evidence, not a native user click.
         let (tx, rx) = std::sync::mpsc::channel();
         assert!(CLICK.set(Mutex::new(Box::new(move |id| { tx.send(id).unwrap(); }))).is_ok());
-        activation(p.id.clone()).Invoke(None, None)?;
+        let factory: IClassFactory = Factory.into();
+        let a: INotificationActivationCallback = unsafe { factory.CreateInstance(None)? };
+        unsafe { a.Activate(w!("org.taskq.tray"), &HSTRING::from(&p.id), &[])?; }
         assert_eq!(rx.recv().unwrap(), p.id);
         assert_eq!(tag(&p.id).len(), 16);
         assert_ne!(tag(&p.id), tag("another event"));

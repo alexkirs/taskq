@@ -57,6 +57,10 @@ pub fn assigned(board: &dyn Board, i: &Issue, who: &str) -> Result<bool, String>
     Ok(i.assignees.iter().any(|a| a == who) || i.assignees.is_empty() && board.issue(i.number)?.assignees.iter().any(|a| a == who))
 }
 
+fn needs_gui(i: &Issue) -> bool {
+    i.labels.iter().any(|l| l == "needs-gui")
+}
+
 fn label(i: &Issue, prefix: &str) -> Option<String> {
     i.labels.iter().find_map(|l| l.strip_prefix(prefix).map(String::from))
 }
@@ -218,6 +222,12 @@ pub struct Service<'a> {
     pub refused_access: BTreeMap<String, String>,
     /// Children whose last liveness read failed, by attempt: kept and reported unknown, never `gone` (§ 4).
     pub unknown: HashMap<u64, String>,
+    /// The last gui probe (§ 4 Filter): a PNG capture and Screen Recording TCC allowed; `Err` names why not.
+    pub gui_probe: Result<(), String>,
+    /// Runtimes with effective Full access (§ 8 Access): the only ones a `needs-gui` task gets.
+    pub full: BTreeSet<String>,
+    /// Ready `needs-gui` tasks while no host lists `has gui` (`status.json` `waits`).
+    pub waits: Vec<u64>,
 }
 
 const MONTH: i64 = 30 * 86400;
@@ -440,7 +450,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new() }
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), gui_probe: Err("not probed".into()), full: BTreeSet::new(), waits: vec![] }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -570,6 +580,9 @@ impl<'a> Service<'a> {
         if self.focus.is_empty() {
             lines.push(format!("focus {}", if self.focus_error.is_some() { "unknown" } else { "off" }));
         }
+        if self.gui().is_ok() {
+            lines.push("has gui".into());
+        }
         let kids: BTreeSet<_> = self.kids.iter().map(|k| (k.task, k.attempt)).chain(self.pending.iter().copied()).collect();
         lines.extend(kids.iter().map(|(t, a)| format!("#{t} {a}")));
         lines.join("\n")
@@ -588,6 +601,9 @@ impl<'a> Service<'a> {
         let now = self.board.now()?;
         self.snapshot = Some(crate::snapshot::from_views("host", self.board, self.cfg, now, &views, &hosts));
         self.tasks_read = Some(std::time::Instant::now());
+        // § 4 Filter: a ready `needs-gui` task waits while neither this host nor a fresh heartbeat lists `has gui`
+        let gui_host = self.gui().is_ok() || hosts.iter().any(|h| now - h.updated < self.cfg.ttl && h.body.lines().any(|l| l == "has gui"));
+        self.waits = views.iter().filter(|v| !gui_host && v.task.state == State::Ready && needs_gui(&v.issue)).map(|v| v.issue.number).collect();
         // § 4 one service per host name: another install's fresh heartbeat under this name holds every write (#933)
         let title = format!("taskq host {me}");
         let other = hosts.iter().filter(|h| h.title == title && now - h.updated < ttl).flat_map(|h| h.body.lines()).find_map(|l| l.strip_prefix("service ")).filter(|id| *id != self.instance);
@@ -735,7 +751,7 @@ impl<'a> Service<'a> {
             }
             if let Some(i) = self.held.iter().position(|l| l.attempt == a) {
                 let rt = self.held[i].rt.clone();
-                if self.reserve(n, a, &rt) {
+                if !self.gui_refused(&v.issue, &rt) && self.reserve(n, a, &rt) {
                     let l = self.held.remove(i);
                     self.launch(l)?;
                 } else {
@@ -765,7 +781,7 @@ impl<'a> Service<'a> {
                 touched.insert(n);
                 continue;
             }
-            if self.refused_access.contains_key(&l.rt) || !self.reserve(n, a, &l.rt) {
+            if self.refused_access.contains_key(&l.rt) || self.gui_refused(&v.issue, &l.rt) || !self.reserve(n, a, &l.rt) {
                 pending.insert((n, a)); // the inbox stays undelivered
                 continue;
             }
@@ -791,7 +807,7 @@ impl<'a> Service<'a> {
             })
             .filter(|v| label(&v.issue, "host-").is_none_or(|h| h == me))
             // `needs-gate`: every host of this version has gates; N-1 lacks them and leaves the task alone (§ 8)
-            .filter(|v| v.issue.labels.iter().filter_map(|l| l.strip_prefix("needs-")).all(|x| x == "gate" || self.cfg.has.iter().any(|h| h == x)))
+            .filter(|v| v.issue.labels.iter().filter_map(|l| l.strip_prefix("needs-")).all(|x| x == "gate" || if x == "gui" { self.gui().is_ok() } else { self.cfg.has.iter().any(|h| h == x) }))
             .filter(|v| priority(&v.issue) == 0 || self.focus.iter().any(|f| f == "all" || crate::labels::matches(&v.issue.labels, f)))
             // last: the github.com list carries no assignees (§ 4 budget), so only a candidate reads them
             .filter(|v| !v.issue.labels.iter().any(|l| l == "assignee-only") || assigned(self.board, &v.issue, &user).unwrap_or(false))
@@ -802,7 +818,7 @@ impl<'a> Service<'a> {
                 break;
             }
             let role = if v.task.state == State::Review { "reviewer" } else { "worker" };
-            let rt = if role == "reviewer" { self.reviewer_free(v) } else { self.free(label(&v.issue, "run-").as_deref()) };
+            let rt = if role == "reviewer" { self.reviewer_free(v) } else { self.free(label(&v.issue, "run-").as_deref(), needs_gui(&v.issue)) };
             let Some(rt) = rt else { continue };
             if !self.reserve(v.issue.number, 0, &rt) {
                 break;
@@ -893,20 +909,22 @@ impl<'a> Service<'a> {
             "codex" | "codex-app" => "claude",
             _ => return None,
         };
-        self.free(Some(other)).or_else(|| self.free(Some(&worker))
+        let gui = needs_gui(&v.issue);
+        self.free(Some(other), gui).or_else(|| self.free(Some(&worker), gui)
             .filter(|rt| rt != "codex-app" || label(&v.issue, "run-").as_deref() == Some("codex-app")))
     }
 
     /// A runtime with free capacity: `limits.<rt>` minus live children of it (§ 3).
     /// `codex-app` only for `run-codex-app` tasks on a host whose `has` lists it (§ 9 opt-in).
-    fn free(&self, want: Option<&str>) -> Option<String> {
+    /// A `needs-gui` task gets only a runtime with effective Full access (§ 4 Filter): never a sandboxed one.
+    fn free(&self, want: Option<&str>, gui: bool) -> Option<String> {
         let app = |rt: &str| rt != "codex-app" || (cfg!(any(target_os = "macos", windows)) && want == Some(rt) && self.cfg.has.iter().any(|h| h == rt));
         let c = self.cap.as_ref().ok()?;
         // Auto: a runtime without a limit has no count ceiling (§ 9); Fixed: only listed runtimes
         let limits: Vec<(String, u32)> = if c.auto { RUNTIMES.iter().map(|r| (r.to_string(), c.limits.get(*r).copied().unwrap_or(u32::MAX))).collect() } else { c.limits.clone().into_iter().collect() };
         // the most free slots wins, so any-runtime tasks alternate; a tie keeps the listed order (§ 4 Filter)
         let mut best: Option<(String, usize)> = None;
-        for (rt, n) in limits.into_iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt) && !self.refused_access.contains_key(rt)) {
+        for (rt, n) in limits.into_iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt) && !self.refused_access.contains_key(rt) && (!gui || self.full.contains(rt))) {
             let left = (n as usize).saturating_sub(self.kids.iter().filter(|k| k.rt == rt).count());
             if left > 0 && best.as_ref().is_none_or(|b| left > b.1) {
                 best = Some((rt, left));
@@ -947,6 +965,18 @@ impl<'a> Service<'a> {
             return Ok(None);
         }
         Ok(Some(l))
+    }
+
+    /// This host lists `gui` (§ 4 Filter): the probe holds and a runtime runs with Full access.
+    pub fn gui(&self) -> Result<(), String> {
+        self.gui_probe.clone()?;
+        if self.full.is_empty() { Err("no runtime with Full access".into()) } else { Ok(()) }
+    }
+
+    /// A `needs-gui` attempt may not run on `rt` now (§ 4 Filter): the probe fails or `rt` lost Full access.
+    /// Its resume or held launch waits with the inbox and lease kept.
+    fn gui_refused(&self, i: &Issue, rt: &str) -> bool {
+        needs_gui(i) && (self.gui_probe.is_err() || !self.full.contains(rt))
     }
 
     /// Write the heartbeat now: the lease of a new child or held launch is listed before the next pass judges it.
@@ -1698,6 +1728,50 @@ mod tests {
         let mut s = service(&b, &w, Default::default());
         s.pass().unwrap();
         assert_eq!(task(&b, win).state, State::Doing);
+    }
+
+    // Chain: § 4 needs-gui routing (#1124). Risk: a gui task starts on a sandboxed runtime or an unprobed host, or waits silently.
+    #[test]
+    fn needs_gui_goes_only_to_a_probed_full_access_runtime() {
+        let b = Fake::default();
+        let t = b.create("G", "", &["taskq".into(), "needs-gui".into()]).unwrap();
+        let mut c = cfg("mac");
+        c.limits.insert("claude".into(), 1);
+        c.has = vec!["gui".into()]; // config never lists gui: only the probe does
+        let e: Exits = Default::default();
+        let mut s = service(&b, &c, e.clone());
+        let hb = |b: &Fake| b.issues(None).unwrap().into_iter().find(|i| i.title == "taskq host mac").unwrap().body;
+        s.pass().unwrap();
+        assert_eq!((task(&b, t).state, s.waits.clone()), (State::Ready, vec![t]), "no probe: no gui host");
+        s.gui_probe = Ok(());
+        s.pass().unwrap();
+        assert_eq!((task(&b, t).state, s.waits.clone()), (State::Ready, vec![t]), "every runtime sandboxed: no gui host");
+        assert!(!hb(&b).lines().any(|l| l == "has gui"));
+        s.full = BTreeSet::from(["claude".to_string()]);
+        s.pass().unwrap();
+        assert_eq!(task(&b, t).state, State::Doing);
+        assert!(task(&b, t).session.unwrap().starts_with("claude:"), "only the Full access runtime");
+        assert!(hb(&b).lines().any(|l| l == "has gui") && s.waits.is_empty());
+        // Full -> Workspace, then probe loss: the resume waits, inbox and lease kept; it runs once both hold again
+        let a = task(&b, t).attempt.unwrap();
+        b.comment(t, &core::entry("ask", &[], Some(a), "Which?\n1. x\n2. y ★")).unwrap();
+        *e.borrow()[0].1.borrow_mut() = Some(0);
+        s.pass().unwrap();
+        b.comment(t, &core::entry("answer", &["1"], None, "x")).unwrap();
+        for (probe, full) in [(Ok(()), vec![]), (Err("screencapture wrote no PNG".to_string()), vec!["claude".to_string()])] {
+            (s.gui_probe, s.full) = (probe, full.into_iter().collect());
+            s.pass().unwrap();
+            assert_eq!((e.borrow().len(), task(&b, t).attempt), (1, Some(a)), "no sandboxed resume");
+            assert!(hb(&b).lines().any(|l| l == format!("#{t} {a}")), "the waiting resume keeps its lease");
+        }
+        s.gui_probe = Ok(());
+        s.pass().unwrap();
+        assert_eq!(e.borrow().len(), 2, "resumed on the Full runtime");
+        let other = b.create("H", "", &["taskq".into(), "needs-gui".into()]).unwrap();
+        let w = cfg("win");
+        let mut s = service(&b, &w, Default::default());
+        s.pass().unwrap();
+        assert_eq!((task(&b, other).state, s.waits.clone()), (State::Ready, vec![]), "a fresh heartbeat lists gui: not admitted here, no wait");
     }
 
     // Chain: § 4 empty focus (#974). Risk: a host with free slots admits nothing and says nowhere why.

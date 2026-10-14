@@ -79,6 +79,15 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 
 ## M8 Implementation boundary
 
+WS11 first slice (#976, accepted split): native Home / Projects / Attention / Settings and its five categories reuse the existing snapshot and action bridge. Back restores the calling route, disclosure state and scroll; refresh keeps the current route. Existing Work mode and inline AI remain accessible; no new backend authority. Appearance exposes the currently supported view/font controls and reports the system theme.
+
+Deferred follow-up contracts (not acceptance claims for this slice):
+- AI backend/workspace: C-A1–C-A10, including two independent conversations, immutable attachments, durable drafts/history, native window ownership, revision-bound apply and acknowledged cancellation. Qualify persistence and cancellation before enabling their controls.
+- Selective recovery: E-A1–E-A9, including durable hold, owned-process identity, unknown-liveness refusal and selected fenced restart with readback. Keep ordinary pause distinct.
+
+F5 for this slice covers the native navigation/settings ledger and preserved existing actions. Full AI/recovery rows remain Not tested; no disabled placeholders count as their completion.
+
+
 - Installed/source inventory: [current-menu-audit.md](current-menu-audit.md). Historical phase numbers are not evidence that features are absent.
 - Preserve all existing functions while replacing layout. Shared tray aggregates current per-project data; service ownership follows the current runtime contract.
 - Add project is implemented in the current contract; new AI-window placement changes its presentation, not setup safeguards.

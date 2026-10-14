@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- `taskq tray` popover (taskq.md § 4): docs/design/menu-prototype.html driven by the Rust bridge in tray.rs.
+<!-- `taskq tray` popover (taskq.md § 4): docs/design/workspace-prototype.html routes driven by the Rust bridge in tray.rs.
      Rust calls taskq.receive(state); actions go back through window.ipc.postMessage(JSON). -->
 <html lang="en"><head><meta charset="utf-8"><meta name="color-scheme" content="light dark">
 <style>
@@ -35,6 +35,7 @@ button[aria-pressed=true]{background:light-dark(#dce7e1,#354a40);border-color:va
 .views img{height:18px}
 button:disabled{color:var(--muted);opacity:.75}
 .alert{color:var(--failed)}
+h1{font-size:1em;margin:6px 4px;overflow-wrap:anywhere}.footer{border-top:1px solid var(--edge);margin-top:6px}
 .head{min-height:28px;padding:2px 4px}.head button{padding:2px 7px}.pinned .head{cursor:grab}
 .askai{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px;padding:4px}
 .askai textarea{font:inherit;color:inherit;background:none;border:1px solid var(--edge);border-radius:4px;padding:5px;resize:vertical;min-width:0;-webkit-user-select:text;user-select:text}
@@ -60,7 +61,24 @@ const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'
 const send=m=>window.ipc&&window.ipc.postMessage(JSON.stringify(m));
 const menu=document.querySelector('.menu');
 let aiText=null,aiMenu=false,aiConfirm=null,addConfirm=false;
-let S=null,page='home',taskFilter=null,working=null,workCard=null,homeScroll=0,ask=null,pending={},confirming=null,updating=null,draft=null;
+let S=null,page='home',taskFilter=null,working=null,workCard=null,ask=null,pending={},confirming=null,updating=null,draft=null;
+// Navigation is view state only: every route consumes the same pushed snapshot.
+const routes={home:'Home',projects:'Projects',attention:'Attention',settings:'Settings',appearance:'Appearance',cadence:'Activity history',agents:'Agents',services:'Services',about:'About'};
+const trail=[];
+let disclosures=[];
+function remember(){return {page,taskFilter,working,workCard,scroll:document.scrollingElement.scrollTop,open:[...menu.querySelectorAll('details')].map(d=>d.open)};}
+function navigate(next,filter=null,work=null){
+  trail.push(remember());page=next;taskFilter=filter;working=work;workCard=null;ask=null;disclosures=[];
+  render(true);document.scrollingElement.scrollTop=0;
+  menu.querySelector('h1')?.focus();
+}
+function back(){
+  const prior=trail.pop()||{page:'home',taskFilter:null,working:null,workCard:null,scroll:0,open:[]};
+  ({page,taskFilter,working,workCard}=prior);disclosures=prior.open;
+  render(true);document.scrollingElement.scrollTop=prior.scroll;
+  menu.querySelector('h1')?.focus({preventScroll:true});
+}
+function routeButton(route,label=routes[route]){return '<button class="project" data-route="'+route+'">'+esc(label)+'</button>';}
 // Task answers: the native bridge owns credentials and canonical dispatch/readback.
 const answerRequests=new Map(),answerCards=new Map();
 function answerCapability(board){const p=S&&S.projects.find(p=>p.issues===board);return {answer:!!p&&p.alive&&p.complete!==false,reason:'Project status is unavailable or stale; check the board'};}
@@ -216,28 +234,49 @@ function bulk(run,held){
   const pausing=run.length>0,state=p=>({run:pausing?'pause':'admitting, unchanged',paused:pausing?'paused, unchanged':'resume',watch:'observation, unchanged'}[mode(p)]);
   if(confirming)return '<div class="body" role="alert">'+(pausing?'Pause admission? Running tasks finish.':'Resume admission?')+'<br>'+S.projects.map(p=>esc(p.name)+': '+state(p)).join('<br>')+'</div><div class="options"><button data-a="'+(pausing?'pause-all':'resume-all')+'">Confirm</button><button data-a="cancel">Cancel</button></div>';
   return run.length?'<button class="project" data-a="confirm">Pause all…</button>':held.length?'<button class="project" data-a="confirm">Resume all…</button>':'';}
-function home(){
-  const all=S.projects.flatMap(tasks),c=counts(all),run=S.projects.filter(p=>mode(p)==='run'),held=S.projects.filter(p=>mode(p)==='paused');
-  let h='';
-  if(S.platform==='macos')h+='<div class="options views">'+[['icon','Icon'],['full','Summary']].map(([v,l])=>'<button data-set="view" data-v="'+v+'" aria-pressed="'+(S.view===v)+'"><img alt="" src="'+S.icons[v]+'">'+l+'</button>').join('')+'</div>';
-  h+=ai();
-  h+='<details><summary>↳ Scope <span class="meta">'+S.projects.length+' project'+(S.projects.length===1?'':'s')+(known(S.projects)?' · in work '+c.work+' · ask '+c.ask+' · ready '+c.ready:' · counts unknown')+'</span></summary><div class="body">'+S.projects.map(p=>'<div><strong>'+esc(p.name)+'</strong> <span class="meta">'+esc(modeText(p))+'</span></div><div class="meta">You asked: '+esc(p.request||'not recorded')+'</div>').join('')+'</div></details>';
-  h+=workEntry();
-  h+=S.projects.map(p=>problem(p)+incident(p,true)+incidentNotice(p)).join('');
-  if(S.settings_error)h+='<div class="body alert" role="alert">⚠ Settings unknown: '+esc(S.settings_error)+'; defaults shown</div>';
-  h+=globalGroup('ask',unique(all))+globalGroup('failed',unique(all));
-  h+='<div class="group">'+TaskqProjectBlocks.aggregate(S.projects.map(blockProject))+'<div class="row meta">Projects</div>'+(S.projects.length?S.projects.map(p=>TaskqProjectBlocks.summary(blockProject(p))+'<div class="body meta">'+esc(modeText(p))+'</div>').join(''):'<div class="body meta">No projects yet</div>')+addProject()+'</div>';
-  h+=history();
-  if(held.length&&run.length)h+='<div class="row meta">Paused '+held.length+' of '+(held.length+run.length)+': '+esc(held.map(p=>p.name).join(', '))+'</div>';
-  h+=bulk(run,held);
-  h+='<details><summary>Aa Text size <span class="meta">'+S.font+' px</span></summary><div class="options">'+[14,16,18,20].map(n=>'<button data-set="font" data-v="'+n+'" aria-pressed="'+(n===S.font)+'">'+n+'</button>').join('')+'</div></details>';
-  // host-level, read-only rows of the freshest status.json probe (taskq.md § 4); none: unknown, not empty
+function views(){return S.platform==='macos'?'<div class="options views">'+[['icon','Icon'],['full','Summary']].map(([v,l])=>'<button data-set="view" data-v="'+v+'" aria-pressed="'+(S.view===v)+'"><img alt="" src="'+S.icons[v]+'">'+l+'</button>').join('')+'</div>':'';}
+function appearance(){
+  return '<div class="body meta">Theme follows system appearance.</div>'+views()+'<div class="body">Text size · '+S.font+' px</div><div class="options">'+[14,16,18,20].map(n=>'<button data-set="font" data-v="'+n+'" aria-pressed="'+(n===S.font)+'">'+n+'</button>').join('')+'</div>';
+}
+function agents(){
   const A=S.agents;
-  h+='<details class="group agents"><summary>⌘ Agents <span class="meta">'+esc(S.host+' · '+(A?'checked '+age(Math.max(0,S.now-A.at))+' ago':'unknown: no service probe yet'))+'</span></summary>'+(A?A.rows.map(r=>'<div class="row" role="menuitem" aria-disabled="true">'+esc(r)+'</div>').join(''):'<div class="body meta">Unknown: no status.json has agents</div>')+'</details>';
-  h+='<button class="project" data-a="resources" title="btop in its own terminal window">◔ Resources</button>';
-  h+=S.projects.map(service).join('');
-  const vs=[...new Set(S.projects.map(p=>p.version).filter(Boolean))];
-  return h+update()+'<div class="row meta">taskq '+esc(vs.join(', ')||'unknown')+(vs.length===1&&vs[0]===S.version?'':' · tray '+esc(S.version))+' · '+esc(S.host)+'</div>';}
+  return '<div class="body meta">'+esc(S.host+' · '+(A?'checked '+age(Math.max(0,S.now-A.at))+' ago':'unknown: no service probe yet'))+'</div>'+(A?A.rows.map(r=>'<div class="body">'+esc(r)+'</div>').join(''):'<div class="body meta">Unknown: no status.json has agents</div>');
+}
+function about(){
+  return '<div class="body">Tray '+esc(S.version)+' · '+esc(S.host)+'</div>'+S.projects.map(p=>'<div class="body">'+esc(p.name)+': '+esc(p.version||'version unknown')+'<span class="meta"> · '+esc(p.age==null?'status unknown':age(p.age)+' old')+'</span></div>').join('')+update();
+}
+function attention(){
+  const all=unique(S.projects.flatMap(tasks));
+  return S.projects.map(p=>problem(p)+incident(p,true)+incidentNotice(p)).join('')+globalGroup('ask',all)+globalGroup('failed',all);
+}
+function projects(){
+  return TaskqProjectBlocks.aggregate(S.projects.map(blockProject))+(S.projects.length?S.projects.map(p=>TaskqProjectBlocks.summary(blockProject(p))+'<div class="body meta">'+esc(modeText(p))+'</div>').join(''):'<div class="body meta">No projects yet</div>')+addProject();
+}
+function controls(){
+  const run=S.projects.filter(p=>mode(p)==='run'),held=S.projects.filter(p=>mode(p)==='paused');
+  return workEntry()+(held.length&&run.length?'<div class="row meta">Paused '+held.length+' of '+(held.length+run.length)+': '+esc(held.map(p=>p.name).join(', '))+'</div>':'')+bulk(run,held);
+}
+function home(){
+  let h='<div class="body meta">'+esc(S.host)+'</div>'+views()+controls();
+  h+='<details><summary>↳ Scope <span class="meta">'+S.projects.length+' projects</span></summary><div class="body">'+S.projects.map(p=>'<div><strong>'+esc(p.name)+'</strong> <span class="meta">'+esc(modeText(p))+'</span></div><div class="meta">You asked: '+esc(p.request||'not recorded')+'</div>').join('')+'</div></details>';
+  h+='<div class="row">Attention'+routeButton('attention','All')+'</div>'+attention();
+  h+=ai();
+  h+='<div class="group"><div class="row">Projects'+routeButton('projects','All '+S.projects.length)+'</div>'+projects()+'</div>';
+  return h+routeButton('cadence');
+}
+function routeBody(){
+  switch(page){
+    case 'projects':return projects();
+    case 'attention':return attention()||'<div class="body meta">'+(known(S.projects)?'No reported questions or failures':'Status incomplete; check Services')+'</div>';
+    case 'settings':return ['appearance','cadence','agents','services','about'].map(r=>routeButton(r)).join('')+workEntry();
+    case 'appearance':return appearance();
+    case 'cadence':return history();
+    case 'agents':return agents();
+    case 'services':return '<button class="project" data-a="resources" title="btop in its own terminal window">◔ Resources</button>'+S.projects.map(p=>'<div class="body">'+esc(p.name)+' · '+esc(p.host||'host unknown')+'<span class="meta"> · '+esc(p.age==null?'status unknown':age(p.age)+' old')+'</span></div>'+problem(p)+incidentNotice(p)+service(p)).join('');
+    case 'about':return about();
+    default:return home();
+  }
+}
 // Capacity (taskq.md § 4): the shared resource controls (docs/design/shared-resource-controls.md) over the tray's
 // taskq.resources/1 projection; this adapter only maps an operation onto `service capacity` and its receipt
 const resourceCards=new Map(),resourceRequests=new Map(),resourcePayloads=new Map();
@@ -263,7 +302,7 @@ function capacity(p){
   return '<details class="group"><summary>▤ Capacity <span class="meta">'+esc((p.cap_host||'this host')+' · '+TaskqResources.headline(resourceGroup(p),S.now))+'</span></summary><div data-resources="'+esc(p.root)+'"></div></details>';}
 // Work mode (menu M12): the shared editor over this host's projects; only the explicitly selected ones change
 function workEntry(root){return S.projects.some(p=>p.resources)?'<button class="project" data-a="work"'+(root?' data-root="'+esc(root)+'"':'')+'>◎ Work mode…</button>':'';}
-function workPage(){return '<button data-a="back">‹ Back</button><div data-work></div>';}
+function workPage(){return '<div data-work></div>';}
 function mountResources(){
   const ws=menu.querySelector('[data-work]');
   if(ws){
@@ -282,33 +321,37 @@ function mountResources(){
 }
 function project(p){
   const ts=tasks(p);
-  return '<button data-a="back">‹ All projects</button>'+TaskqProjectBlocks.summary(blockProject(p))+'<div class="body meta">'+esc(modeText(p))+'</div>'+problem(p)+incident(p,true)+incidentNotice(p)+
+  return TaskqProjectBlocks.summary(blockProject(p))+'<div class="body meta">'+esc(modeText(p))+'</div>'+problem(p)+incident(p,true)+incidentNotice(p)+
   (['ask','failed','doing','review','ready','waiting','later'].map(st=>{const r=ts.filter(t=>t.state===st);return r.length?'<div class="group"><div class="row meta"><span>'+names[st]+'</span>'+counter(r.length,color(st),names[st])+'</div>'+r.map(t=>taskRow(t)).join('')+'</div>':'';}).join('')||'<div class="body muted">No open tasks</div>')+
   '<div class="group">'+(p.issues?'<a class="project" href="'+esc(p.issues)+'" data-url="'+esc(p.issues)+'"><span>Board ↗</span><span></span><span></span></a>':'')+admission(p)+'</div>'+capacity(p)+workEntry(p.root)+service(p);}
 function filteredTasks(p){
   const ps=p?[p]:S.projects,rows=unique(ps.flatMap(tasks)).filter(t=>t.state===taskFilter),name=TaskqProjectBlocks.states.find(s=>s[0]===taskFilter)[1];
-  return '<button data-a="back">‹ All projects</button><div class="body">'+esc((p?p.name:'All projects')+' · '+name)+'</div>'+(p?TaskqProjectBlocks.summary(blockProject(p)):TaskqProjectBlocks.aggregate(ps.map(blockProject)))+
+  return '<div class="body">'+esc((p?p.name:'All projects')+' · '+name)+'</div>'+(p?TaskqProjectBlocks.summary(blockProject(p)):TaskqProjectBlocks.aggregate(ps.map(blockProject)))+
     (known(ps)?'':'<div class="body meta">Partial: refresh the affected project or open its Board.</div>')+
     (taskFilter==='closed'?'<div class="body meta">Closed total and task list unknown: open the Board for authoritative closed tasks.</div>'+ps.map(p=>TaskqProjectBlocks.summary(blockProject(p))).join(''):rows.map(t=>taskRow(t,!p)).join('')||'<div class="body meta">'+(known(ps)?'No tasks':'Tasks unknown')+'</div>');
 }
 // pin (menu.md M13): the same menu as a movable window; the header is its drag handle
 function head(){return '<div class="row head"><span class="meta">taskq</span><button data-a="pin" aria-pressed="'+!!S.pinned+'" title="'+(S.pinned?'Unpin: back to the popover':'Pin: keep open as a movable window')+'">'+(S.pinned?'Pinned':'Pin')+'</button></div>';}
-function render(){
+function render(navigating=false){
   if(!S)return;
   const active=document.activeElement,answerFocus=active&&active.closest('[data-answer]'),scroll=document.scrollingElement.scrollTop;
+  const focusKey=!navigating&&active&&menu.contains(active)?JSON.stringify(active.dataset):null;
+  const focusedSummary=!navigating&&active?.tagName==='SUMMARY'?[...menu.querySelectorAll('summary')].indexOf(active):-1;
   const caret=answerFocus&&active.tagName==='TEXTAREA'?[active.selectionStart,active.selectionEnd]:null;
   const answerSelector=answerFocus&&(caret?'textarea':active.dataset.choice?'[data-choice="'+active.dataset.choice+'"]':active.dataset.qac?'[data-qac="'+active.dataset.qac+'"]':'button[type=submit]');
-  const open=[...menu.querySelectorAll('details')].map(d=>d.open),p=S.projects.find(p=>p.root===page);
-  if(!p)page='home';
+  const open=navigating?disclosures:[...menu.querySelectorAll('details')].map(d=>d.open),p=S.projects.find(p=>p.root===page);
+  if(!p&&!routes[page])page='home';
   document.documentElement.style.colorScheme=S.theme||'light dark';
   menu.style.setProperty('--size',S.font+'px');
   menu.classList.toggle('pinned',!!S.pinned);
-  menu.innerHTML=head()+(working?workPage():taskFilter?filteredTasks(p):p?project(p):home());
+  const title=working?'Work mode':taskFilter?'Tasks':p?p.name:routes[page];
+  menu.innerHTML=head()+(page!=='home'||working||taskFilter?'<button data-a="back">‹ Back</button>':'')+'<h1 tabindex="-1">'+esc(title)+'</h1>'+(S.settings_error?'<div class="body alert" role="alert">Settings unknown: '+esc(S.settings_error)+'; defaults shown</div>':'')+(working?workPage():taskFilter?filteredTasks(p):p?project(p):routeBody())+'<nav class="options footer" aria-label="Menu"><button data-route="home">Home</button><button data-route="settings">Settings</button></nav>';
   mountAnswers();mountResources();
-  menu.querySelectorAll('details').forEach((d,i)=>d.open=open[i]||false);
+  menu.querySelectorAll('details').forEach((d,i)=>d.open=open[i]??(['cadence','agents','services','attention'].includes(page)));
   if(S.page!==undefined)menu.querySelectorAll('.hist,.agents,.service,.incident-notice').forEach(d=>d.open=true);
   const restored=answerFocus&&menu.querySelector('[data-answer="'+CSS.escape(answerFocus.dataset.answer)+'"] '+answerSelector);
-  if(restored){restored.focus();if(caret)restored.setSelectionRange(...caret);}
+  if(restored&&!navigating){restored.focus({preventScroll:true});if(caret)restored.setSelectionRange(...caret);}
+  else if(!navigating){const target=focusedSummary>=0?menu.querySelectorAll('summary')[focusedSummary]:focusKey&&focusKey!=='{}'?[...menu.querySelectorAll('button')].find(b=>JSON.stringify(b.dataset)===focusKey):null;target?.focus({preventScroll:true});}
   document.scrollingElement.scrollTop=scroll;
   send({a:'size',w:S.font>=18?360:320,h:menu.scrollHeight});}
 window.taskq={receive(s){
@@ -318,7 +361,7 @@ window.taskq={receive(s){
   S=s;
   if(aiText===null)aiText=s.ai.draft||'';
   // snapshot mode names the page
-  if(s.page!==undefined){page=s.page;pending={};}
+  if(s.page!==undefined&&s.page!==page){page=s.page;taskFilter=null;working=null;workCard=null;trail.length=0;pending={};disclosures=[];render(true);return;}
   // a tick does not take the caret out of the range fields
   if(document.activeElement&&(document.activeElement.dataset.draft||document.activeElement.dataset.rscField||document.activeElement.id==='ai'))return;
   render();
@@ -326,12 +369,12 @@ window.taskq={receive(s){
 menu.addEventListener('click',e=>{
   const cardLink=e.target.closest('.qac a');if(cardLink){e.preventDefault();send({a:'open',url:cardLink.getAttribute('href')});return;}
   if(e.target.closest('.qac,.rsc'))return;
-  if(TaskqProjectBlocks.handle(e,{open:url=>send({a:'open',url}),project:id=>{homeScroll=document.scrollingElement.scrollTop;taskFilter=null;page=id;ask=null;render();document.scrollingElement.scrollTop=0;},tasks:(id,state)=>{homeScroll=document.scrollingElement.scrollTop;page=id||'home';taskFilter=state;render();document.scrollingElement.scrollTop=0;}}))return;
+  if(TaskqProjectBlocks.handle(e,{open:url=>send({a:'open',url}),project:id=>navigate(id),tasks:(id,state)=>navigate(id||'home',state)}))return;
   const a=e.target.closest('a[data-url]');if(a){e.preventDefault();send({a:'open',url:a.dataset.url});return;}
   const b=e.target.closest('button');if(!b||b.disabled)return;const d=b.dataset;
-  if(d.a==='work'){working=d.root?{[d.root]:true}:{};workCard=null;render();document.scrollingElement.scrollTop=0;return;}
-  if(d.a==='back'&&working){working=null;workCard=null;render();return;}
-  if(d.a==='back'){page='home';taskFilter=null;render();document.scrollingElement.scrollTop=homeScroll;return;}
+  if(d.route){if(d.route!==page||working||taskFilter)navigate(d.route);return;}
+  if(d.a==='work'){navigate(page,null,d.root?{[d.root]:true}:{});return;}
+  if(d.a==='back'){back();return;}
   if(d.set==='period'&&d.v==='custom'){const H=S.history;draft={start:local(H.start,H.tz),end:local(H.end,H.tz),tz:H.tz,error:''};render();return;}
   if(d.set){S[d.set]=d.set==='font'?Number(d.v):d.v;if(d.set==='period')draft=null;send({a:'set',[d.set]:S[d.set]});render();return;}
   if(d.a==='range'){

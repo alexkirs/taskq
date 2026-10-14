@@ -268,8 +268,7 @@ fn answer_snapshot(s: &Value, m: &Value) -> Result<(), String> {
     let row = s["tasks"].as_array().into_iter().flatten().find(|r| r["n"] == op["task"]);
     let row = row.ok_or("task is not in the current board snapshot; open it on the board")?;
     if op.get("action").is_some() {
-        // another revision reaches dispatch only to reconcile its op id: a new write there is refused stale
-        if row["revision"] != op["revision"] { return if row["revision"].is_u64() { Ok(()) } else { Err("question revision unavailable".into()) }; }
+        if row["revision"] != op["revision"] { return Err("question changed; refresh before acting".into()); }
         if op["action"] == "close" && row["state"] == "later" { return Ok(()); } // only a matching later op can succeed again
         if row["state"] != "ask" || row["question"]["choices"].as_array().is_some_and(|c| !c.is_empty()) {
             return Err("fallback actions require an ask without choices; check the board for partial cancellation".into());
@@ -1408,8 +1407,6 @@ mod tests {
         }
         snapshot["tasks"][0]["state"] = json!("ask");
         snapshot["tasks"][0]["revision"] = json!(rev + 1);
-        assert!(answer_snapshot(&snapshot, &m).is_ok(), "another revision reaches dispatch to reconcile; dispatch fences it");
-        snapshot["tasks"][0]["revision"] = json!("r");
         assert!(answer_snapshot(&snapshot, &m).is_err());
         snapshot["tasks"][0]["revision"] = json!(rev);
         snapshot["tasks"][0]["question"]["choices"] = json!([{"id":1}]);
@@ -1433,9 +1430,6 @@ mod tests {
                 else { crate::dispatch::act(&b, &root, n, &args[0], &[], &args[3], &op) };
             serde_json::to_value(receipt).unwrap()
         };
-        let before = b.comments(n).unwrap().len();
-        let fresh = answer_dispatch(&m, &["later".into(), n.to_string(), "--text".into(), "Reason: x".into(), "--json".into(), "--op-id".into(), "new.1".into(), "--revision".into(), attempt.to_string()], execute);
-        assert_eq!((fresh["outcome"].as_str(), b.comments(n).unwrap().len()), (Some("stale"), before), "a new op at an old revision writes nothing");
         let partial = answer_dispatch(&m, &args, |a| {
             calls.push(a.to_vec());
             if a[0] == "close" { json!({"task":n,"op_id":"cancel.1.close","outcome":"unknown","reason":"response lost"}) }

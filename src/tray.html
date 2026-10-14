@@ -106,12 +106,13 @@ function answerReceipt(r){
   render();
   setTimeout(fit,0);
 }
-// A status refresh that reads the question past the op's revision ends Sending: reconcile once with the same op, so
-// the CLI returns its first receipt (accepted) or names another writer (stale); the refresh itself never accepts.
+// A status refresh that reads the question past an answer op's revision ends Sending: reconcile once with the same op,
+// so the CLI returns its first receipt (accepted) or names another writer (stale); the refresh itself never accepts.
+// ponytail: fallback actions (#1021) keep Check delivery; their revision fence refuses another revision.
 function answerReadback(){
   for(const [key,r] of answerRequests){
     const p=S.projects.find(p=>p.issues===r.board),t=p&&p.complete!==false&&p.tasks.find(t=>t.n===r.op.task);
-    if(r.reconciled||!t||(t.state==='ask'&&t.revision===r.op.revision))continue;
+    if(r.reconciled||r.op.action||!t||(t.state==='ask'&&t.revision===r.op.revision))continue;
     r.reconciled=true;send({a:'answer',root:p.root,board:r.board,op:r.op});
   }
 }

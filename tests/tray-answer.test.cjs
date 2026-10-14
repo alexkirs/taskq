@@ -41,10 +41,14 @@ const plain=x=>JSON.parse(JSON.stringify(x));
     call('answerReceipt',{root:'project',id:o.id,state});
     assert.equal((await pending).state,state,'refresh alone never accepts');
   }
+  const act={...op,id:'readback-later',action:'later'},before=sent.length;call('answerSend',board,act);
+  project.tasks=[{n:841,state:'later',revision:5}];call('answerReadback');
+  assert.equal(sent.length,before+1,'fallback action keeps Check delivery, no readback reconcile');
+  call('answerReceipt',{root:'project',id:act.id,state:'accepted'});
   delete project.tasks;
   context.S.projects=[];
   assert.equal((await call('answerSend',board,op)).state,'rejected');
-  assert.equal(sent.length,6,'unregistered board writes nothing');
+  assert.equal(sent.length,7,'unregistered board writes nothing');
   // Run the consumer's capability across shared stale/lost-response fixtures; component owns draft and op state.
   const fx=JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json','utf8'));
   for(const c of fx.cases.filter(c=>/stale|lost|duplicate|sending/.test(c.name))){

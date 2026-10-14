@@ -205,7 +205,18 @@ pub fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op) ->
             if op.revision.is_some_and(|r| r != rev) {
                 return act(b, &cfg.root, n, "close", &[], verdict, op); // the stale receipt, before any publication
             }
-            match b.publish(n, &sha, &cfg.publish, &issue.title, &format!("Task: {}", b.url(n))) {
+            // § 4 Profiling: `checks` is the CI verification and merge call, `close` the whole publication
+            let (began, attempt) = (std::time::Instant::now(), t.attempt.unwrap_or(0));
+            let rt = t.session.as_deref().and_then(|s| s.split(':').next()).unwrap_or("other").to_string();
+            let stage = |name, began: std::time::Instant, outcome, err| crate::profile::stage(name, n, attempt, &rt, began.elapsed(), outcome, err, crate::profile::Usage::NoModel);
+            let published = b.publish(n, &sha, &cfg.publish, &issue.title, &format!("Task: {}", b.url(n)));
+            let (outcome, err) = match &published {
+                Publish::Done(_) => ("ok", "none"),
+                Publish::Pending(_) => ("retried", "none"),
+                Publish::Failed(m) => ("failed", crate::profile::class(m)),
+            };
+            stage("checks", began, outcome, err);
+            let r = match published {
                 Publish::Done(m) => {
                     // § 7 publication receipt: the policy it ran under and what the board read back
                     let m = format!("delivery {} r{}: {m}", cfg.delivery, cfg.delivery_revision);
@@ -218,7 +229,10 @@ pub fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op) ->
                     let r = act(b, &cfg.root, n, "requeue", &[], &format!("publication failed: {m}"), &Op::default());
                     Receipt::rejected(n, op, if r.ok() { format!("requeued: {m}") } else { format!("publication failed: {m}; {}", r.reason) })
                 }
-            }
+            };
+            let (outcome, err) = if r.ok() { ("ok", "none") } else if outcome == "ok" { ("failed", crate::profile::class(&r.reason)) } else { (outcome, err) };
+            stage("close", began, outcome, err);
+            r
         }
         s => Receipt { state: Some(s.name()), ..Receipt::rejected(n, op, format!("#{n} is {}: `close` not accepted", s.name())) },
     }

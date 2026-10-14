@@ -271,7 +271,13 @@ pub fn delivery(n: u64, entries: &[Entry], id: u64) -> String {
 
 /// Whether attempt `a` wrote `ask`, `result` or `requeue` after entry `after`: its child then exits clean (§ 4 step 1).
 pub fn handed_in(n: u64, entries: &[Entry], a: u64, after: u64) -> bool {
-    entries.iter().filter(|e| e.id > after && !e.edited).filter_map(|e| parse(n, &e.body)).any(|l| l.attempt == Some(a) && matches!(l.kind, "ask" | "result" | "requeue"))
+    hand_in(n, entries, a, after).is_some()
+}
+
+/// The kind of attempt `a`'s last `ask`, `result` or `requeue` after entry `after`.
+pub fn hand_in(n: u64, entries: &[Entry], a: u64, after: u64) -> Option<&'static str> {
+    entries.iter().filter(|e| e.id > after && !e.edited).filter_map(|e| parse(n, &e.body)).filter(|l| l.attempt == Some(a))
+        .filter_map(|l| ["ask", "result", "requeue"].into_iter().find(|k| *k == l.kind)).last()
 }
 
 fn has_options(s: &str) -> bool {

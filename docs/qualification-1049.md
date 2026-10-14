@@ -6,22 +6,34 @@ Native qualification on host `win` on 2026-10-14 (UTC), collected for
 [UI acceptance report](design/ui-acceptance-report.md). The owner chose an
 isolated update test: a temporary install and a scratch project running as host
 `winq`, with the real host untouched. Every row below comes from one frozen
-build, the candidate. The real-host update of the published release is
+build, the candidate, except the notification rows, which come from the
+notification candidate after fixes F9 and F10. The real-host update of the published release is
 [#1053](https://github.com/taskqorg/taskq/issues/1053); it is still open, so
 this report does not prove it.
 
 - Candidate commit: `9ab83b63052a099c826a26cbeca8fe22e99c920d` (this branch on
   main `3057cea`). Release build `4.2.0-dev.1792018150`, `taskq.exe` SHA256
   `3744dfaa93bb31cdc4047e1f8723fec794e72aef6a1ebf1b27bc89efb6497e90`; the
-  binary carries the full commit id. Equivalence: the branch was then rebased
-  onto main `fd4056d`, whose new commits (#1159, #1170) change only `taskq.md`
-  wording and docs; `git diff 9ab83b6 HEAD -- src tests .github Cargo.toml
-  Cargo.lock` is empty, so the pushed head builds the same code.
+  binary carries the full commit id. Equivalence: `git diff 9ab83b6 HEAD --
+  src tests .github Cargo.toml Cargo.lock` touches only `src/notify_windows.rs`,
+  `Cargo.toml` and `Cargo.lock` (the Windows notification adapter, F9 and F10)
+  and the specq pin of the worker brief in `src/runtime.rs` (main #1175); the
+  rows other than notifications exercise neither.
+- Notification candidate: commit `c46e83ef1ae4fd784f98cfdcf05607c9f97b3cc9`
+  (`de75826` after the rebase onto main `c24dff9`). Release build
+  `4.2.0-dev.1792021136`, `taskq.exe` SHA256
+  `d8613d0ab4ec18c0b36a00cfa27bffaac6cacf6b244bd0b3c6eec0bb51c97fd3`; the
+  binary carries the full commit id. `git diff c46e83e HEAD -- src tests
+  .github Cargo.toml Cargo.lock` is only the specq pin above. F9 alone was
+  rechecked on `4b08bfe` (build `4.2.0-dev.1792020405`, SHA256
+  `0f9c9249ae7347b355251cf4471522ceb81ab982bf7aeb77f49975e3da26b5ef`), which
+  also reproduced F10.
 - Update source: published `taskq-4.1.11-windows-x86_64.exe`, SHA256
   `ea1e24ddb3c2727f61a9565fa47ebfb71efd49085eb7414c337400f65777f39f` (matches
   the release `SHA256SUMS`).
 - Spec revision / UI blobs at the candidate: `taskq.md` `642eb2dd`,
-  `src/tray.html` `ad346969`, `src/tray.rs` `b2649591`.
+  `src/tray.html` `ad346969`, `src/tray.rs` `b2649591`. The Windows toast
+  clause now lives in [menu specification](design/menu.md) M14.
 - Fixture: the scratch project is a clone of this repository on the taskq
   board, host `winq`, `limits` claude 1, `capacity_hosts.winq.admission` Auto
   with max 1, focus `host-winq`, no operator grants. Probe task
@@ -43,6 +55,43 @@ not in the foreground or the point fell outside its client area. The page state
 was read through the WebView2 DevTools port of the isolated tray. The real tray
 and the real services got no input from this run. Logs, UI Automation dumps and
 shots: [evidence/1049](shots/evidence/1049/README.md).
+
+For the notification rows, native input also went to two OS surfaces: toasts
+in Notification Center (opened with Win+N), and the TaskQ switch in the real
+Settings app (System > Notifications), which was set back to On afterwards.
+
+## Notifications on Windows
+
+The isolated tray ran with `TASKQ_INSTALL` set to the temporary install and the
+scratch project registered; Questions were set to `Banner with sound`. Each
+event was an `ask` line for #1155 appended to the scratch project's
+`.taskq/events`, which is all the tray reads. On this host an automatic Do not
+disturb rule was active (the bell showed it while the manual switch read Off),
+so no toast showed as a banner: each went straight to Notification Center.
+Steps, page state and notifier reads are in
+[toast.log](shots/evidence/1049/toast.log):
+
+1. 23:22:45, old candidate `9ab83b6`, a host that had never shown a TaskQ
+   toast. Notifications read `OS permission unknown`; the event at 23:22 moved
+   the cursor and posted nothing (F9).
+2. 23:28:52, `4b08bfe`. `Allowed by the OS`; events at 23:29:19 and 23:29:59
+   posted toasts.
+3. 23:34:46, `4b08bfe`. A native click on the `g8q · Question` toast in
+   Notification Center removed it, but the tray stayed on Home with no card
+   (F10).
+4. 23:42:14, notification candidate. The shortcut reads back toast activator
+   CLSID `{AF9B407E-49C7-4B89-9B0E-55EA50346E66}`. An event posted a toast; the
+   native click at 23:42:49 turned the tray from Home to project `g8q` with
+   the #1155 card focused. A second event and click (23:46:21, the tray on the
+   Notifications page) did the same.
+5. 23:43:42. Writing `Enabled=0` in the TaskQ notification registry key left
+   the notifier on `Enabled`; the write was undone at 23:44:04.
+6. 23:44:33. A native click on the TaskQ switch in Settings turned it Off; the
+   notifier read `DisabledForApplication` and the tray showed `Blocked by the
+   OS: nothing is posted` with `Open OS setting ↗`. The event at 23:44:58 moved
+   the cursor and posted nothing (the last toast time stayed 23:42:14).
+7. 23:45:37. The switch went back On; the notifier read `Enabled`, the tray
+   `Allowed by the OS`, and the event at 23:45:51 posted a toast at 23:45:53.
 
 ## Update from 4.1.11
 
@@ -103,6 +152,13 @@ runs under the candidate; that is the specified behavior.
 | U-A10 frozen evidence | One frozen build for every row; hashes above | Complete evidence for the rows claimed | Candidate commit, artifact hash, spec blobs, logs and shots attached | Pass for the rows above | this report |
 | U-A8 screen reader audio, 14/18 px | — | — | Not run | Not tested | |
 | U-A3 other monitors and scales | One display, 100 % scale | — | — | Not tested | |
+| M14 OS setting on a fresh host (F9) | Host that never showed a TaskQ toast; Settings › Notifications; an `ask` event | Allowed by the OS (the OS default); toast posted | `Allowed by the OS`; 2 of 2 events posted | Pass (after F9) | `toast-05-notifications-allowed.png`, `toast.log` 23:28:52–23:29:59 |
+| M14 click in Notification Center (F10) | Win+N, native click inside the `g8q · Question` toast | The tray opens that card | Project `g8q`, #1155 card focused, 2 of 2 (from Home and from Notifications) | Pass (after F10) | `toast-03-center-before-click.png`, `toast-04-card-after-click.png`, `toast.log` 23:42:14–23:46:23 |
+| M14 OS denial | Native click on the TaskQ switch in Settings (On → Off), then an `ask` event | Blocked shown; nothing posted; the event is not posted later | Notifier `DisabledForApplication`; `Blocked by the OS: nothing is posted` and `Open OS setting ↗`; no toast; cursor at the event | Pass | `toast-06-os-toggle-off.png`, `toast-07-notifications-blocked.png`, `toast.log` 23:44:33–23:45:23 |
+| M14 allowed again | Switch back On, then an `ask` event | Allowed; the next event posts | Notifier `Enabled`; `Allowed by the OS`; toast at 23:45:53, and its click opened #1155 | Pass | `toast-08-allowed-again.png`, `toast.log` 23:45:36–23:46:23 |
+| M14 banner click | — | — | No banner showed: an automatic Do not disturb rule sent every toast to Notification Center. Windows activates the same toast activator for a banner click | Not tested | |
+| M14 click while no tray runs | — | — | The running tray registers the activator and the shortcut names no server to start, so such a click opens nothing; the service starts a new tray within about 30 s | Not tested | |
+| M14 all notifications off in Windows | — | — | Not run | Not tested | |
 | macOS | — | — | Covered by #1060 | Not tested here | |
 
 The 22:58 clicks on the footer that did nothing were a harness effect: the
@@ -124,6 +180,10 @@ symbols such as `◎` show as `?` in the dumps.
 | F7 observation | coreq launcher | Three `service run` starts of one build within 600 s (test restarts) | Restarts → the 4.1.11 launcher rolled back to 4.1.11 at the third start | Specified launcher behavior: a start counts until the `healthy` mark, and an operator restart is a start | None; the test reset `current` and the start count | The candidate got its `healthy` mark at 23:05:19; a restart after it kept the candidate |
 | F8 medium | U-A2 | Notifications at 16 and 20 px | Labels inside buttons → `Banner` crossed its button's border | The buttons shared width without a minimum basis | `fix(tray): notification mode labels fit their buttons`; `tray --snapshot` now fails on such a label | U-A2 labels row |
 | [#1072](https://github.com/taskqorg/taskq/issues/1072) medium | Worker CLI context | A shell for this task inherited another project's `TASKQ_ROOT`, `TASKQ_TASK` and `TASKQ_ATTEMPT` | Clean environment → stale ids | Stale environment in a reused session | Closed | Every command here set its own environment |
+| F9 high | M14 | Host that never showed a TaskQ toast; Questions on; an `ask` event | Allowed and posted → `OS permission unknown`; the event moved the cursor and posted nothing | Until the first toast records a setting, the notifier's `Setting` fails with `0x80070490` (not found); the adapter read every failure as Unknown and posts only when allowed | `fix(tray): Windows toasts post on a host that never showed one`; menu M14 names the OS default | M14 OS setting row |
+| F10 high | M14 | A TaskQ toast in Notification Center; click it | The card opens → the toast goes away and the tray stays on Home | The in-process `Activated` handler is not called for a click in Notification Center; Windows starts the COM activator named by the shortcut's `ToastActivatorCLSID`, and the shortcut named none | `fix(tray): Windows toast clicks reach the tray from Notification Center` | M14 click row |
+| F11 low | Isolation | Start a tray with `TASKQ_INSTALL` set to a temporary install | The real shortcut stays → the per-user Start Menu `TaskQ.lnk` now starts the temporary install | The shortcut path is per user while its target follows `TASKQ_INSTALL` | Open, not blocking (test setups only); the run removed the shortcut, and the real tray wrote its own again at its next start | — |
+| Toast harness observation | M14 | Write `Enabled=0` in the TaskQ notification registry key | Notifier reads denied → still `Enabled` | A registry write does not reach the running notification platform | None; the denial used the Settings switch | M14 OS denial row |
 | UIA minor | U-A8 | UI Automation tree | Named containers → the menu container and the document have no name | Not investigated | Open, not blocking | `uia-home.txt` |
 
 During an earlier build, one harness click landed on the taskbar and likely
@@ -139,11 +199,19 @@ None.
 - Runtime/platform verified: on the candidate, the update from 4.1.11 defers
   the re-exec for a live child and keeps board state; service restart, Auto
   admission, native tray navigation, keyboard, resize and pin routes pass on
-  Windows after fixes F3–F6 and F8.
+  Windows after fixes F3–F6 and F8. On the notification candidate, toasts post
+  on a fresh host, a click in Notification Center opens its card, and an OS
+  denial shows Blocked and posts nothing, after fixes F9 and F10.
 - Not tested / blocked: the published v4.2.0 update with grants (#1053, open);
   restart with a live child on the candidate; icon click while open with the
   icon in the flyout; other scales and monitors; text sizes 14 and 18; screen
-  reader audio; U-A5–U-A7 and U-A9, which this Windows run did not measure.
+  reader audio; U-A5–U-A7 and U-A9, which this Windows run did not measure;
+  a toast banner click, a click while no tray runs, and the Windows-wide
+  notification switch.
 - Deployed: nothing. The temporary install and host `winq` are stopped, the
-  probe is closed and the install token is deleted.
+  probe is closed and the install token is deleted. The isolated tray is
+  stopped; the Start Menu shortcut and the notification settings key it
+  created were removed at 23:46:40. The scratch `events` file keeps the six
+  appended probe lines. The real tray restarted at 23:47:54 for its own update,
+  not from this run, and wrote its own shortcut.
 - Next exact fix or decision: #1053 proves the real-host update.

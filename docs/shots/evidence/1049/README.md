@@ -16,3 +16,18 @@ Times are UTC on 2026-10-14. Host `winq` is the isolated scratch project; the re
 - `admission.log`: Auto admission gate samples after a restart and the `service capacity` output.
 - `uia-settings.txt`, `uia-home.txt`: Windows UI Automation tree of the live window (PowerShell writes symbols such as
   `◎` as `?`).
+
+Notification rows (M14), on the notification candidate `c46e83e` (`4.2.0-dev.1792021136`) after the F9 recheck on
+`4b08bfe` (`4.2.0-dev.1792020405`); see the report's "Notifications on Windows":
+
+- `toast.log`: tray steps, Notification Center clicks, the Settings switch, notifier reads and posted-toast times.
+  `%TEMP%` is the OS temp dir and `<harness>` the test harness dir.
+- `toast-01-old-center-before-click.png`, `toast-02-old-click-lost.png`: `4b08bfe`; a click on the toast in
+  Notification Center removed it and the tray stayed on Home (F10).
+- `toast-03-center-before-click.png`, `toast-04-card-after-click.png`: the candidate; the same click opened project
+  `g8q` with the #1155 card focused.
+  In `toast-01` to `toast-04` other apps' notifications are painted over (`other apps hidden`).
+- `toast-05-notifications-allowed.png`: Notifications page, `Allowed by the OS` (F9 fixed).
+- `toast-06-os-toggle-off.png`: Windows Settings, System > Notifications, TaskQ switched Off.
+- `toast-07-notifications-blocked.png`: the tray then shows `Blocked by the OS: nothing is posted`.
+- `toast-08-allowed-again.png`: after the switch went back On.

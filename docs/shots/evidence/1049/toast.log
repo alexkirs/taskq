@@ -1,0 +1,94 @@
+# Windows toast evidence (#1049, M14). Times UTC on 2026-10-14. %TEMP% = the OS temp dir, <harness> = the test harness dir.
+# Part 1: tray window steps (native clicks into the tray webview).
+23:22:32 info hwnd=593216 window=(1855,108)-(2319,660) client=448x543 origin=(1863,109) dpi=96 foreground=True
+23:22:32 start "Home focus=BODY:taskqPinnedTopHomewinq◎  iw=320 cw=310 sw=310 ih=388 sh=1001"
+23:22:39 N1 native click 'Settings': click at screen (2182,616)
+23:22:40 settings "Settings focus=H1:Settings iw=320 cw=320 sw=320 ih=388 sh=388"
+23:22:44 N2 native click 'Notifications': click at screen (2087,369)
+23:22:45 notifications "Notifications focus=H1:Notifications iw=320 cw=310 sw=310 ih=388 sh=654"
+appended 1792020223 #1155 ask 1155
+"cursor":{"%TEMP%\\g8q\\g8q":"1792020223 #1155 ask 1155"}
+23:28:43 info hwnd=1443554 window=(1855,108)-(2319,660) client=448x543 origin=(1863,109) dpi=96 foreground=True
+23:28:43 start2 "Home focus=BODY:taskqPinnedTopHomewinq◎  iw=320 cw=310 sw=310 ih=388 sh=1001"
+--- candidate 4.2.0-dev.1792020405 (4b08bfe), tray pid 28232
+23:28:48 A1 native click 'Settings': click at screen (2182,616)
+23:28:51 A2 native click 'Notifications': click at screen (2087,369)
+23:28:52 A2 "Notifications focus=H1:Notifications iw=320 cw=310 sw=310 ih=388 sh=654"
+"Notifications / Allowed by the OS"
+23:28:53 shot wrote <harness>\live\t01-notifications-allowed.png 464x552
+23:29:18 B1 native click 'Home': click at screen (1978,616)
+23:29:19 B1 "Home focus=H1:Home iw=320 cw=310 sw=310 ih=388 sh=1001"
+23:29:19 appended '1792020559 #1155 ask 1155001' to the scratch events
+23:29:35.941 no toast matching "Question" within 15 s
+23:29:59 appended '1792020599 #1155 ask 1155002'
+23:43:11 D0 "g8q focus=A:GitHub #1155 iw=320 cw=310 sw=310 ih=388 sh=2746"
+23:43:12 D1 native click 'Settings':     + FullyQualifiedErrorId : tray window not in foreground; no input sent
+23:43:13 D2 no element 'Notifications'
+23:43:13 D3 "g8q focus=A:GitHub #1155 iw=320 cw=310 sw=310 ih=388 sh=2746"
+23:43:14 shot wrote <harness>\live\t06-notifications-allowed.png 464x552
+23:43:29 D0b focus the tray: 23:43:30.559 native click at screen (1893,131)
+23:43:32 D1 native click 'Settings': click at screen (2182,616)
+23:43:35 D2 native click 'Notifications': click at screen (2087,369)
+23:43:36 D3 "Notifications focus=H1:Notifications iw=320 cw=310 sw=310 ih=388 sh=654"
+23:43:37 shot wrote <harness>\live\t06-notifications-allowed.png 464x552
+23:44:49 E0 "Notifications focus=H1:Notifications iw=320 cw=310 sw=310 ih=388 sh=691"
+23:44:50 shot wrote <harness>\live\t09-notifications-blocked.png 464x552
+23:45:51 shot wrote <harness>\live\t10-notifications-allowed-again.png 464x552
+23:46:24 shot wrote <harness>\live\t12-card-after-second-click.png 464x552
+# Part 2: Notification Center clicks, the OS toggle and the notifier setting.
+23:34:44.456 before: "page=Home notedCard=false focusCard=none focus=H1 cards="
+wrote <harness>\live\t02-center-before-click.png 2560x1440
+23:34:46.615 native click at screen (2290,170)
+23:34:48.859 after: "page=Home notedCard=false focusCard=none focus=H1 cards="
+wrote <harness>\live\t03-after-click.png 2560x1440
+23:42:14 appended '1792021334 #1155 ask 1155003' to scratch events (tray 4.2.0-dev.1792021136, pid 13900)
+23:42:48.733 before: "page=Home notedCard=false focusCard=none focus=BODY cards="
+23:42:49.887 native click at screen (2290,175)
+23:42:52.115 after: "page=g8q notedCard=false focusCard=https://github.com/taskqorg/taskq/issues/1155 focus=A cards=https://github.com/taskqorg/taskq/issues/1049,https://github.com/taskqorg/taskq/issues/1147,https://github.com/taskqorg/taskq/issues/1161,https://github.com/tas"
+wrote <harness>\live\t05-after-click.png 2560x1440
+23:43:42 set HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\org.taskq.tray Enabled=0 (the per-app toggle in Settings > System > Notifications)
+23:43:45 ToastNotifier('org.taskq.tray').Setting = Enabled
+23:44:04 deleted HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\org.taskq.tray Enabled again: a direct registry write does not change the notifier setting (still Enabled)
+23:44:19.707 native click at screen (1634,1414)
+ControlType.Group "TaskQ" id=org.taskq.tray11_EntityItem (468;670;1000;77)
+ControlType.Button "TaskQ" id=EntityItemButton (468;670;1000;77)
+ControlType.Text "TaskQ" id= (527;685;48;25)
+ControlType.Button "TaskQ" id=org.taskq.tray11_ToggleSwitch (1345;689;78;40)
+23:44:32 toggle "TaskQ" state On rect (1345,689,78x40)
+23:44:33 native click at (1384,709); state now Off
+23:44:35 ToastNotifier('org.taskq.tray').Setting = DisabledForApplication
+
+HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\org.taskq.tray
+    Enabled    REG_DWORD    0x0
+
+"Blocked by the OS: nothing is posted | Open OS setting ↗"
+23:44:57 before: history : 
+23:44:58 appended '1792021498 #1155 ask 1155004' with the OS toggle off
+23:45:08 after: history : 
+23:45:09 cursor: ['1792021498 #1155 ask 1155004']
+23:45:09     LastNotificationAddedTime    REG_QWORD    0x1dd5c35a4427ac3
+no TaskQ toggle
+23:45:23 ToastNotifier('org.taskq.tray').Setting = DisabledForApplication
+
+HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\org.taskq.tray
+    LastNotificationAddedTime    REG_QWORD    0x1dd5c35a4427ac3
+    PeriodicNotificationCount    REG_DWORD    0x2
+    PeriodicInteractionCount    REG_DWORD    0x1
+    Enabled    REG_DWORD    0x0
+
+"Blocked by the OS: nothing is posted | Open OS setting ↗"
+23:45:36 toggle "TaskQ" state Off rect (1345,689,78x40)
+23:45:37 native click at (1384,709); state now On
+23:45:39 ToastNotifier('org.taskq.tray').Setting = Enabled
+"Allowed by the OS"
+23:45:51 appended '1792021551 #1155 ask 1155005' with the OS toggle on again
+23:45:59 after: history 1: 5cea92f184c30ad4={"root":"%TEMP%\\g8q\\g8q","n":1155,"k":"ask","t":"G8 #1049 evidence: live kid across the 4.1.11 update","e":"1792021551 #1155 ask 1155005"}
+23:46:00 LastNotificationAddedTime 23:45:53
+23:46:11.335 Win+N sent
+wrote <harness>\live\t11-center-open.png 2560x1440
+23:46:13.893 before: "page=Notifications focusCard=none focus=H1"
+23:46:21.132 native click at screen (2290,175)
+23:46:23.327 after: "page=g8q focusCard=https://github.com/taskqorg/taskq/issues/1155 focus=A"
+23:46:24 history : 
+23:46:39 removed the Start Menu TaskQ.lnk the isolated tray created (target: the isolated install)
+23:46:40 removed the org.taskq.tray notification settings key the test created

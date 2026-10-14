@@ -273,8 +273,15 @@ fn edit(changes: &Value, runtime: Option<&str>, project_limits: &Value) -> Resul
     Ok(e)
 }
 
+/// What `decide` re-checks immediately before the write: the time now (never earlier than the checks before) and
+/// whether the connection the operation came over is still the active one.
+struct Fence<'a> {
+    clock: &'a dyn Fn() -> u64,
+    live: &'a dyn Fn() -> bool,
+}
+
 /// One delivered submit to its receipt; `None` keeps the original binding of a reused op ID and sends nothing.
-fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now: u64) -> Res<Option<String>> {
+fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now: u64, fence: &Fence) -> Res<Option<String>> {
     let (Some(op), true) = (v["op_id"].as_str().filter(|o| id(o)), target_ok(&v["target"])) else {
         return Ok(Some("resources: dropped an operation without a valid ID or target".into()));
     };
@@ -338,6 +345,17 @@ fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now
     s.ops.get_mut(&op).unwrap().writing = true;
     save(install, s)?;
     s.ops.get_mut(&op).unwrap().writing = false;
+    // the marker save and earlier waits took time: deadline, grant and connection again on a fresh clock
+    let now = now.max((fence.clock)());
+    if !(fence.live)() {
+        return Ok(record(s, "rejected", Some("scope")));
+    }
+    if let Err(r) = authorize(s, v, conn, now) {
+        return Ok(record(s, "rejected", Some(r)));
+    }
+    if now >= expires {
+        return Ok(record(s, "expired", None));
+    }
     if fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
         return Ok(record(s, "rejected", Some("conflict")));
     }
@@ -450,9 +468,16 @@ pub fn exchange(install: &Path, active: &Value, w: &mut dyn Wire, now: u64) -> R
         return Err("exchange reply invalid".into());
     }
     let clock = now.abs_diff(server) <= AHEAD;
-    // never at or after the deadline on either clock
-    let now = now.max(server);
+    // the operations belong to this connection: a disconnect, revoke or new generation during the POST drops them
+    let live = || enrollment::active(install).ok().flatten().is_some_and(|a| ["installation", "generation", "destination", "credential"].iter().all(|k| a[k] == active[k]));
+    let w = &*w;
+    let fence = Fence { clock: &|| w.now(), live: &live };
     with(install, |s| {
+        // never at or after the deadline on either clock, read after the POST and the lock wait
+        let now = now.max(server).max(w.now());
+        if !live() {
+            return Ok((vec![format!("resources: connection changed during the exchange; {} operations not taken", ops.len())], false));
+        }
         for rc in &sent {
             if let Some(o) = s.ops.get_mut(rc["op_id"].as_str().unwrap_or_default()).filter(|o| o.receipt == *rc) {
                 o.sent = true;
@@ -460,7 +485,7 @@ pub fn exchange(install: &Path, active: &Value, w: &mut dyn Wire, now: u64) -> R
         }
         let mut log: Vec<String> = cancels.iter().filter_map(|c| cancel(s, c, now)).collect();
         for v in &ops {
-            log.extend(decide(install, s, v, conn, clock, now)?);
+            log.extend(decide(install, s, v, conn, clock, now, &fence)?);
         }
         if !clock && !ops.is_empty() {
             log.push(format!("resources: host clock differs from DashQ's by {} s", now.abs_diff(server)));
@@ -619,16 +644,18 @@ mod tests {
         serde_json::from_str(include_str!("../tests/fixtures/resource-policy-v1.json")).unwrap()
     }
 
-    /// DashQ stand-in: queued replies (none: offline) and the exchange bodies it was sent.
-    struct Dash { replies: Vec<(u16, Value)>, posts: Vec<Value> }
+    /// DashQ stand-in: queued replies (none: offline) and the exchange bodies it was sent; `at`: the host clock after
+    /// the POST; `cut`: a connection file the host replaces while the POST is in flight.
+    struct Dash { replies: Vec<(u16, Value)>, posts: Vec<Value>, at: u64, cut: Option<(PathBuf, Value)> }
     impl Wire for Dash {
         fn post(&mut self, dest: &str, route: &str, auth: Option<&str>, body: &Value) -> Result<(u16, Value), String> {
             assert_eq!((dest, route, auth), ("https://x/machine", EXCHANGE, Some("c")));
             self.posts.push(body.clone());
+            if let Some((path, conn)) = self.cut.take() { fs::write(path, conn.to_string()).unwrap() }
             if self.replies.is_empty() { return Err("offline".into()) }
             Ok(self.replies.remove(0))
         }
-        fn now(&self) -> u64 { 0 }
+        fn now(&self) -> u64 { self.at }
         fn sleep(&mut self, _: u64) {}
         fn show(&mut self, _: &str, _: &str) {}
     }
@@ -657,11 +684,21 @@ mod tests {
             Ok(())
         }).unwrap();
         let me = crate::load(&root).unwrap().0.me;
+        fs::create_dir_all(enrollment::dir(&install)).unwrap();
+        fs::write(conn_file(&install), conn(Some(active())).to_string()).unwrap();
         T { base, install, root, me }
     }
 
     fn active() -> Value {
         json!({"installation": INST, "generation": 1, "destination": "https://x/machine", "credential": "c"})
+    }
+
+    fn conn_file(install: &Path) -> PathBuf {
+        enrollment::dir(install).join("connection.json")
+    }
+
+    fn conn(active: Option<Value>) -> Value {
+        json!({"installation": INST, "pending": null, "active": active, "revoke": []})
     }
 
     fn submit(op: &str, changes: Value) -> Value {
@@ -673,7 +710,7 @@ mod tests {
 
     /// One exchange at `now` whose reply delivers `ops` and `cancels`: the receipts sent and the log.
     fn go(t: &T, ops: &[Value], cancels: &[Value], now: u64) -> (Vec<Value>, Vec<String>) {
-        let mut d = Dash { replies: vec![(200, json!({"schema": SCHEMA, "server_at": now, "operations": ops, "cancellations": cancels}))], posts: vec![] };
+        let mut d = Dash { replies: vec![(200, json!({"schema": SCHEMA, "server_at": now, "operations": ops, "cancellations": cancels}))], posts: vec![], at: 0, cut: None };
         let (log, _) = exchange(&t.install, &active(), &mut d, now).unwrap();
         (d.posts.first().map(|p| p["receipts"].as_array().unwrap().clone()).unwrap_or_default(), log)
     }
@@ -736,7 +773,7 @@ mod tests {
         let (saved, after) = (receipt_of(&t, "op-1"), config(&t));
         assert_eq!(saved["state"], "saved");
         // the reply was lost: the next exchange resends the receipt, DashQ redelivers the same submit
-        let mut off = Dash { replies: vec![], posts: vec![] };
+        let mut off = Dash { replies: vec![], posts: vec![], at: 0, cut: None };
         assert!(exchange(&t.install, &active(), &mut off, 101).is_err());
         let (sent, _) = go(&t, &[op.clone(), op.clone()], &[], 102);
         assert!(sent.contains(&saved), "unsent receipts go again");
@@ -797,7 +834,7 @@ mod tests {
         assert_eq!((log, config(&t)), (vec!["resources: dropped an operation without a valid ID or target".to_string()], before.clone()));
         assert!(!read(&t.install).unwrap().ops.contains_key("op-t"));
         // clock: DashQ's time 100 s away; the deadline on either clock
-        let mut d = Dash { replies: vec![(200, json!({"schema": SCHEMA, "server_at": 200, "operations": [submit("op-c", json!({"runtime_limit": 0}))], "cancellations": []}))], posts: vec![] };
+        let mut d = Dash { replies: vec![(200, json!({"schema": SCHEMA, "server_at": 200, "operations": [submit("op-c", json!({"runtime_limit": 0}))], "cancellations": []}))], posts: vec![], at: 0, cut: None };
         exchange(&t.install, &active(), &mut d, 100).unwrap();
         assert_eq!(receipt_of(&t, "op-c")["reason"], "clock_unknown");
         go(&t, &[submit("op-e", json!({"runtime_limit": 0}))], &[], 400);
@@ -827,7 +864,7 @@ mod tests {
     fn revoked_grant_stops_the_exchange_and_pending_writes() {
         let t = setup("revoke");
         revoke(&t.install, "grant-1").unwrap();
-        let mut d = Dash { replies: vec![], posts: vec![] };
+        let mut d = Dash { replies: vec![], posts: vec![], at: 0, cut: None };
         assert_eq!(exchange(&t.install, &active(), &mut d, 100).unwrap(), (vec![], false));
         assert!(d.posts.is_empty(), "no active grant, nothing unsent: no exchange");
         with(&t.install, |s| {
@@ -867,6 +904,42 @@ mod tests {
         fs::remove_dir_all(&t.base).unwrap();
     }
 
+    // Chain: exchange POST in flight -> disconnect, new generation or clock past a deadline -> decide -> write.
+    // Risk: an operation applying on a connection that is no longer active, or after its or its grant's deadline
+    // because the time was read before the POST, the lock wait or the marker save.
+    #[test]
+    fn races_during_the_exchange_never_write() {
+        let t = setup("race");
+        let before = config(&t);
+        let reply = |op: &str| (200, json!({"schema": SCHEMA, "server_at": 399, "operations": [submit(op, json!({"runtime_limit": 0}))], "cancellations": []}));
+        let mut gen2 = active();
+        gen2["generation"] = json!(2);
+        for (op, cut) in [("op-d", conn(None)), ("op-g", conn(Some(gen2)))] {
+            let mut d = Dash { replies: vec![reply(op)], posts: vec![], at: 0, cut: Some((conn_file(&t.install), cut)) };
+            let (log, _) = exchange(&t.install, &active(), &mut d, 399).unwrap();
+            assert_eq!(log, ["resources: connection changed during the exchange; 1 operations not taken"]);
+            assert!(!read(&t.install).unwrap().ops.contains_key(op) && config(&t) == before, "{op}");
+            fs::write(conn_file(&t.install), conn(Some(active())).to_string()).unwrap();
+        }
+        // started at 399, the operation expires at 400, the reply lands at 401
+        let mut d = Dash { replies: vec![reply("op-e")], posts: vec![], at: 401, cut: None };
+        exchange(&t.install, &active(), &mut d, 399).unwrap();
+        assert_eq!((receipt_of(&t, "op-e")["state"].as_str(), config(&t)), (Some("expired"), before.clone()));
+        // the clock passes the operation's or the grant's deadline, or the connection goes, during the marker save
+        let mut late = submit("op-l", json!({"runtime_limit": 0}));
+        late["issued_at"] = json!(950);
+        late["expires_at"] = json!(1200);
+        let cases = [(submit("op-x", json!({"runtime_limit": 0})), 399, 400, true, "expired"), (late, 990, 1000, true, "revoked"), (submit("op-c", json!({"runtime_limit": 0})), 100, 100, false, "scope")];
+        for (v, now, then, up, want) in cases {
+            let op = v["op_id"].as_str().unwrap().to_string();
+            let fence = Fence { clock: &|| then, live: &|| up };
+            with(&t.install, |s| decide(&t.install, s, &v, (INST, 1), true, now, &fence)).unwrap();
+            let r = receipt_of(&t, &op);
+            assert_eq!((r["reason"].as_str().or(r["state"].as_str()), config(&t)), (Some(want), before.clone()), "{op}");
+        }
+        fs::remove_dir_all(&t.base).unwrap();
+    }
+
     // Chain: exchange reply -> bounds -> decide. Risk: an oversized, malformed or throttled reply applying anything,
     // or a host sending unbounded receipts.
     #[test]
@@ -879,10 +952,10 @@ mod tests {
             r
         };
         for r in [(200, reply(&ops, false)), (200, reply(&ops[..1], true)), (200, json!({"schema": SCHEMA}))] {
-            let mut d = Dash { replies: vec![r], posts: vec![] };
+            let mut d = Dash { replies: vec![r], posts: vec![], at: 0, cut: None };
             assert_eq!(exchange(&t.install, &active(), &mut d, 100).unwrap_err(), "exchange reply invalid");
         }
-        let mut d = Dash { replies: vec![(429, json!({})), (403, json!({"reason": "revoked"}))], posts: vec![] };
+        let mut d = Dash { replies: vec![(429, json!({})), (403, json!({"reason": "revoked"}))], posts: vec![], at: 0, cut: None };
         assert_eq!(exchange(&t.install, &active(), &mut d, 100).unwrap(), (vec![], true), "busy: come back after the spacing");
         assert_eq!(exchange(&t.install, &active(), &mut d, 100).unwrap_err(), "exchange refused: http 403 revoked");
         assert!(read(&t.install).unwrap().ops.is_empty(), "nothing taken from a refused reply");
@@ -899,14 +972,14 @@ mod tests {
     fn host_grants_resolve_projects_and_survive_cleanup() {
         let t = setup("grant");
         let fresh = t.base.join("fresh");
-        let mut d = Dash { replies: vec![], posts: vec![] };
+        let mut d = Dash { replies: vec![], posts: vec![], at: 0, cut: None };
         assert_eq!(exchange(&fresh, &active(), &mut d, 0).unwrap(), (vec![], false));
         revised(&fresh, &t.root, 0).unwrap();
         assert!(d.posts.is_empty() && !dir(&fresh).exists(), "no grant ever made: no exchange, no store");
         let scope =|projects: &[&str], runtimes: &[&str], hours| Scope { host_policy: false, projects: projects.iter().map(|x| x.to_string()).collect(), runtimes: runtimes.iter().map(|x| x.to_string()).collect(), hours };
+        fs::write(conn_file(&t.install), conn(None).to_string()).unwrap();
         assert!(grant(&t.install, "g", "op", &scope(&["proj"], &[], 1), "me", 0).unwrap_err().contains("no active DashQ connection"));
-        fs::create_dir_all(enrollment::dir(&t.install)).unwrap();
-        fs::write(enrollment::dir(&t.install).join("connection.json"), json!({"installation": INST, "pending": null, "active": active(), "revoke": []}).to_string()).unwrap();
+        fs::write(conn_file(&t.install), conn(Some(active())).to_string()).unwrap();
         for (id, s, want) in [("g", scope(&[], &[], 1), "name a --project"), ("g", scope(&["proj"], &[], 0), "--hours"), ("g", scope(&["proj"], &[], MAX_HOURS + 1), "--hours"),
             ("g", scope(&["proj"], &["vim"], 1), "unknown runtime"), ("g", scope(&["nope"], &[], 1), "unknown project"), ("g/1", scope(&["proj"], &[], 1), "grant and actor IDs")] {
             assert!(grant(&t.install, id, "op", &s, "me", 0).unwrap_err().contains(want), "{want}");
@@ -926,7 +999,7 @@ mod tests {
         // a corrupt store is kept and refuses everything
         fs::write(dir(&t.install).join(FILE), "{").unwrap();
         assert!(report(&t.install, 40).unwrap_err().contains("unreadable"));
-        assert!(exchange(&t.install, &active(), &mut Dash { replies: vec![], posts: vec![] }, 40).is_err());
+        assert!(exchange(&t.install, &active(), &mut Dash { replies: vec![], posts: vec![], at: 0, cut: None }, 40).is_err());
         assert_eq!(fs::read_to_string(dir(&t.install).join(FILE)).unwrap(), "{");
         fs::remove_dir_all(&t.base).unwrap();
     }

@@ -21,8 +21,33 @@ pub fn default_install() -> PathBuf {
     Tool::new("taskq", "TaskQ", RELEASE_REPO, VERSION).install
 }
 
+static SERVICE_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// From here on this process is the service: each log line is stamped and folded (§ 4).
+pub fn service_log() {
+    SERVICE_LOG.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn is_service_log() -> bool {
+    SERVICE_LOG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `<UTC time> <text>` on one line: the lines of `text`, trimmed, joined by a space (§ 4).
+pub fn log_line(at: i64, text: &str) -> String {
+    format!("{} {}", crate::board::stamp(at), text.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" "))
+}
+
+pub fn log(text: &str) {
+    if is_service_log() {
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        eprintln!("{}", log_line(at, text));
+    } else {
+        eprintln!("{text}");
+    }
+}
+
 pub fn die(msg: &str) -> ! {
-    eprintln!("{}", error_text(msg, crate::find_root().ok().as_deref()));
+    log(&error_text(msg, crate::find_root().ok().as_deref()));
     std::process::exit(1);
 }
 
@@ -102,13 +127,13 @@ fn install_webview2_loader(t: &Tool) -> Result<(), String> {
 /// Service step 7 also catches a release made current by another service on this install.
 pub fn service_update(install: &Path) -> Result<Option<String>, String> {
     if let Some(v) = tool(install).current().filter(|v| coreq::update::newer(v, VERSION)) {
-        eprintln!("current is {v}; restarting");
+        log!("current is {v}; restarting");
         return Ok(Some(v));
     }
     if update(install, true)?.is_some() {
         let v = update(install, false)?;
         if let Some(v) = &v {
-            eprintln!("updated to {v}; restarting");
+            log!("updated to {v}; restarting");
         }
         return Ok(v);
     }
@@ -327,6 +352,13 @@ pub fn host_memory() -> Option<(f64, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: § 4 service log lines. Risk: a line without its UTC time, or one message split over lines.
+    #[test]
+    fn service_log_lines_start_with_utc_time_and_fold() {
+        let at = crate::board::iso("2026-10-14T04:27:05Z").unwrap();
+        assert_eq!(log_line(at, "pass: PATCH x: HTTP 502 <html>\n  <p>bad</p>\r\n\n</html>"),"2026-10-14T04:27:05Z pass: PATCH x: HTTP 502 <html> <p>bad</p> </html>");
+    }
 
     // Chain: § 3 Auto memory floor. Risk: the floor or pressure reading fails on a real host and Auto never admits.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]

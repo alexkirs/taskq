@@ -761,7 +761,7 @@ impl<'a> Service<'a> {
             .filter(|v| !touched.contains(&v.issue.number))
             .filter(|v| v.task.state == State::Ready || (v.task.state == State::Review && v.task.attempt.is_none()))
             .filter(|v| {
-                if let Err(e) = crate::labels::validate(&v.issue.labels) { eprintln!("#{}: {e}; not admitted", v.issue.number); return false; }
+                if let Err(e) = crate::labels::validate(&v.issue.labels) { log!("#{}: {e}; not admitted", v.issue.number); return false; }
                 true
             })
             .filter(|v| label(&v.issue, "host-").is_none_or(|h| h == me))

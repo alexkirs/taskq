@@ -340,9 +340,9 @@ pub fn access(env: &Env, rt: &str) -> Result<crate::policy::Effective, StartErro
 /// Start the child with its stdout and stderr in the attempt log; `codex-app` starts its handshake child (§ 8).
 pub fn spawn(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     let access = access(env, &l.rt)?;
-    eprintln!("#{} attempt {} access {}", l.task, l.attempt, access.line());
+    log!("#{} attempt {} access {}", l.task, l.attempt, access.line());
     let text = turn_text(env, l, rule_file)?;
-    eprintln!("specq@{SPECQ_REVISION} loaded for {} #{} attempt {} ({})", l.role, l.task, l.attempt, if l.resume.is_some() { "resume" } else { "start" });
+    log!("specq@{SPECQ_REVISION} loaded for {} #{} attempt {} ({})", l.role, l.task, l.attempt, if l.resume.is_some() { "resume" } else { "start" });
     let log = log_path(env.root, l);
     if l.rt == "codex-app" {
         let mut turn = AppTurn { hand: None, log, text, thread: l.session.clone(), done: 0, rollout: None, running: app_running };
@@ -505,7 +505,7 @@ impl Proc for ClaudeTurn {
         self.done = true;
         Ok(Some(0))
     }
-    fn kill(&mut self) { if let Err(e) = claude_stop(&self.root, &self.id, self.pid) { eprintln!("{e}"); } }
+    fn kill(&mut self) { if let Err(e) = claude_stop(&self.root, &self.id, self.pid) { log!("{e}"); } }
     fn id(&self) -> u32 { self.pid }
 }
 

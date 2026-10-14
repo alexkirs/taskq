@@ -166,7 +166,8 @@ pub fn install_panic_hook() {
                     .filter(|s| site(s)).unwrap_or_else(|| "dep".into())
             }).unwrap_or_else(|| "dep".into());
             detect("dispatch.panic", &location, "none", &[&location, class], &["exit:101", class]);
-            previous(info);
+            // the service log keeps one stamped line per message (§ 4)
+            if crate::platform::is_service_log() { crate::platform::log(&format!("thread {info}")); } else { previous(info); }
         }
     }));
 }

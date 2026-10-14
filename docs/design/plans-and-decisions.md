@@ -47,7 +47,7 @@ The previous tasks-plus-ask recommendation covered ordering but underspecified r
 Ship the accepted D14 intentions: Plan first, Implement and review, Urgent fix, Multi-repo work. Selection creates an editable proposal, not a running job. Project instructions supply relevant checks and commands. Save a reviewed project recipe for reuse; the next use is a fresh draft, not replayed authorization.
 
 - Make a separate board task when a step produces an independently reviewable outcome or needs independent scheduling/retry. Ordinary inspect/edit/test steps stay inside one task. Avoid a card for every command.
-- Display the compact route with current evidence and blocking reason. A stage label is a projection, not a new board state. Turn completion or a checked AI todo never proves completion.
+- Display the compact route with current evidence and blocking reason. A stage label is a projection, not a new board state. Completion follows specq [evidence](https://github.com/taskqorg/specq/blob/main/engineering/verification.md).
 - Put enforceable boundaries in service/board contracts: prerequisites, planned owner gates, publication, environment ownership and finalization. An instruction saying “ask first” alone cannot enforce a gate.
 - Gate answers bind the exact plan/result revision; revised inputs require renewed approval. Planned approval, unexpected question and runtime permission may share UI but retain distinct authority and submission paths.
 - Keep Access and Delivery separate. A recipe cannot raise grants, bypass required checks, silently change model/effort or authorize publication.

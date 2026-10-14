@@ -87,7 +87,7 @@ The operator is the main project agent under taskq.md R3/R9: normal runtime tool
 - Active view groups by project; each row has status, linked issue/title, worker/reviewer role, Codex/Claude identity, executing host and age/freshness.
 - `codex-app` uses Codex identity. Remote: network icon + host, no fabricated local permalink or tmux action.
 - Local permalink opens the recorded session; missing identity disables the action with a reason. Issue access remains available.
-- Attempt history shows ended/replaced sessions separately; old state is labelled historical. A session ending does not prove task completion.
+- Attempt history shows ended/replaced sessions separately; old state is labelled historical. Task completion follows specq [evidence](https://github.com/taskqorg/specq/blob/main/engineering/verification.md).
 - Session search matches project, issue, title and host. No token-cost/progress metrics unless the service supplies them.
 - A live task may receive steering only through a separately reviewed backend operation; the UI must not send text directly to an unrelated session.
 

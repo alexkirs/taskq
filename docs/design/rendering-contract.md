@@ -69,7 +69,7 @@ x(i) = x0 + i*(b+g)
 - Segment boundaries: round `plotHeight × cumulativeCount / peak`; derive adjacent segment heights by subtraction. No independent rounding that creates holes or exceeds peak height. Quantization may change equal segment heights by at most 1 physical pixel; cumulative boundaries remain exact after rounding.
 - Snap fills, not font curves. No border radius, stroke, blur, gradient or line interpolation on cadence bars.
 - A positive segment smaller than a pixel may be unresolved; preserve exact labelled totals. Never add an artificial minimum height and pretend it remains quantitative.
-- An all-zero bin retains its empty slot. Unknown bin is explicitly unavailable; no fabricated zero or event.
+- An all-zero bin retains its empty slot. Unknown bin is explicitly unavailable per [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy); no fabricated event.
 - If B cannot fit, the renderer cannot pass. Preserve 12 source bins; approve a divisor rebin count and sum adjacent bins across EVERY series. I5's 6/12/native-size decision is still open; no nearest-neighbor sample dropping or silent reduction.
 - Production tiny icons render directly at native size/DPI; no CSS/OS post-scaling assumption. Test the actual OS icon after installation as well as exported pixels.
 

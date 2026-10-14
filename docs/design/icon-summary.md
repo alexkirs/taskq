@@ -76,7 +76,7 @@ bottom alignment: baselineY = R - actualBoundingBoxDescent
 - Draw directly into N×DPR; scale geometry once. Standard antialiasing; no blur, sharpening or repeated resizing.
 - Reference DPR=2 and ×8 enlargement do not prove 16 px/DPR=1 legibility.
 - Supply natural-size and ×8 contact sheets: both themes; 16/20/22/24/32; DPR=1/2; active/paused.
-- Counts: 0/0/0, 3/2/5, 1/7/8, 9/9/9, 12/3/24, 100/12/105. Graph: empty, mixed, equal counts across series, nonzero edges. Unknown never becomes zero.
+- Counts: 0/0/0, 3/2/5, 1/7/8, 9/9/9, 12/3/24, 100/12/105. Graph: empty, mixed, equal counts across series, nonzero edges. Unknown follows [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy).
 - Check bounds and graph totals, then inspect PNGs and native trays on both platforms. Record OS, font, size, DPI and SHA.
 - Open before release: overflow, unknown rendering, 6/12 bins and Windows DPR=1. Do not silently choose tiny text, 9+, truncation or a wider container.
 

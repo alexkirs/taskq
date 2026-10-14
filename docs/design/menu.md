@@ -132,7 +132,7 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 - One editor from home/settings/project; project entry preselects that project. Open it in the existing workspace (approved Workspace review), preserving menu navigation and drafts. Recovery uses the same workspace route.
 - Named host, explicitly selected projects, new-task filter, per-project/runtime limits, optional load guard, change review.
 - Selection defines change targets, not registered observations. Unchecking a project leaves its focus/limits unchanged.
-- Preserve runtime-specific limits, including codex-app. No shared host pool. Disable fields for unselected projects; never replace unknown values with zero.
+- Preserve runtime-specific limits, including codex-app. No shared host pool. Disable fields for unselected projects; unknown values follow [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy).
 - Different current focus displays Mixed. Opening does not overwrite it. Change only explicitly edited fields.
 - Review exact project/host old→new changes; current attempts continue. Cancel preserves settings; readback is per project, including partial failure.
 - Preserve CPU/memory gate controls and saved-vs-applied distinction from the current UI. Gate semantics remain in taskq.md.

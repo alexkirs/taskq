@@ -54,6 +54,9 @@ fn setting(s: Result<NotificationSetting>) -> &'static str {
         Ok(NotificationSetting::Enabled) => "allowed",
         Ok(NotificationSetting::DisabledForApplication | NotificationSetting::DisabledForUser |
             NotificationSetting::DisabledByGroupPolicy | NotificationSetting::DisabledByManifest) => "blocked",
+        // Windows records an app's setting at its first toast; until then the notifier reports ERROR_NOT_FOUND and
+        // the OS default applies.
+        Err(e) if e.code() == windows::core::HRESULT(0x80070490u32 as i32) => "allowed",
         _ => "unknown",
     }
 }
@@ -163,7 +166,7 @@ pub fn open_settings() {
 mod tests {
     use super::*;
 
-    // Chain: M14 Windows permission. Risk: unknown or denied permission becomes healthy and posts.
+    // Chain: M14 Windows permission. Risk: unknown or denied permission becomes healthy and posts, or a fresh host never posts.
     #[test]
     fn permission_denial_and_errors() {
         assert_eq!(setting(Ok(NotificationSetting::Enabled)), "allowed");
@@ -171,6 +174,8 @@ mod tests {
             NotificationSetting::DisabledByGroupPolicy, NotificationSetting::DisabledByManifest] {
             assert_eq!(setting(Ok(s)), "blocked");
         }
+        assert_eq!(setting(Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80070490u32 as i32)))), "allowed",
+            "no setting recorded before the first toast is the OS default");
         assert_eq!(setting(Ok(NotificationSetting(99))), "unknown");
         assert_eq!(setting(Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)))), "unknown");
     }

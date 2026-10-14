@@ -9,11 +9,17 @@ use std::collections::HashMap;
 pub const KINDS: [&str; 4] = ["ask", "close", "failed", "gone"];
 /// Off, Silent (menu badge only), Banner, Banner with sound.
 pub const MODES: [&str; 4] = ["off", "silent", "banner", "sound"];
-/// More than `BURST` banners of one project within `WINDOW` seconds become one summary (M14).
+/// More than `BURST` banners of one project within `WINDOW` seconds of board time become one summary (M14).
 const BURST: usize = 3;
 const WINDOW: i64 = 10;
-/// Per project: the start of its burst window and the kinds shown in it (tray memory, not `tray.json`).
-pub type Bursts = HashMap<String, (i64, Vec<String>)>;
+/// Per project (tray memory, not `tray.json`): banners of the last `WINDOW` seconds, and the open summary (its
+/// start, kinds and last event time), which grows while events stay under `WINDOW` apart.
+#[derive(Default)]
+pub struct Burst {
+    recent: Vec<(i64, String)>,
+    sum: Option<(i64, Vec<String>, i64)>,
+}
+pub type Bursts = HashMap<String, Burst>;
 
 pub fn default(kind: &str) -> &'static str {
     match kind {
@@ -89,15 +95,24 @@ pub fn label(kind: &str) -> &'static str {
 
 /// Events of the tray's projects (`root`, `name`, `tasks`, `events` lines `[time, kind, attempt, n]`) after each
 /// project's cursor, as posts; the cursor moves past every handled line, Off and Silent included. A project seen for
-/// the first time starts at `now`: older events never notify. From the 4th banner within 10 s of a project's first
-/// one, the window posts one summary under one identifier, which the OS replaces as it grows.
+/// the first time starts at `now`: older events never notify. The 4th banner within 10 s (sliding) opens one summary
+/// under one identifier, which the OS replaces as it grows. Task titles come from `tasks`, else from `titles`: the
+/// open tasks' titles of the previous tick, kept in `tray.json` so a closed task keeps its title across a restart.
 pub fn due(n: &mut Value, ps: &[Value], now: i64, bursts: &mut Bursts) -> Vec<Post> {
     if !n.is_object() {
         *n = json!({});
     }
+    for k in ["cursor", "titles"] {
+        if !n[k].is_object() {
+            n[k] = json!({});
+        }
+    }
     let mut out = vec![];
     for p in ps {
         let Some(root) = p["root"].as_str() else { continue };
+        let tasks: serde_json::Map<String, Value> = p["tasks"].as_array().into_iter().flatten()
+            .filter_map(|t| Some((t["n"].as_u64()?.to_string(), json!(t["title"].as_str()?)))).collect();
+        let known = std::mem::replace(&mut n["titles"][root], json!(tasks));
         let lines: Vec<&Value> = p["events"].as_array().into_iter().flatten().collect();
         let line = |e: &Value| format!("{} #{} {} {}", e[0], e[3], e[1].as_str().unwrap_or(""), e[2].as_str().unwrap_or(""));
         let Some(cursor) = n["cursor"][root].as_str().map(String::from) else {
@@ -116,37 +131,55 @@ pub fn due(n: &mut Value, ps: &[Value], now: i64, bursts: &mut Bursts) -> Vec<Po
         let Some(last) = new.last() else { continue };
         n["cursor"][root] = json!(line(last));
         let name = p["name"].as_str().unwrap_or(root);
-        let shown: Vec<(&Value, &str)> = new.iter().filter_map(|e| {
-            let m = mode(n, root, e[1].as_str()?);
-            ["banner", "sound"].contains(&m).then_some((*e, m))
-        }).collect();
-        if shown.is_empty() {
-            continue;
+        let b = bursts.entry(root.into()).or_default();
+        let (mut singles, mut grown, mut shown) = (vec![], false, vec![]);
+        for e in new {
+            let Some(kind) = e[1].as_str() else { continue };
+            let m = mode(n, root, kind);
+            if !["banner", "sound"].contains(&m) {
+                continue;
+            }
+            let t = e[0].as_i64().unwrap_or(now);
+            shown.push((t, m));
+            match &mut b.sum {
+                Some((_, kinds, last)) if t - *last < WINDOW => {
+                    kinds.push(kind.into());
+                    *last = t;
+                }
+                _ => {
+                    b.sum = None;
+                    b.recent.retain(|(x, _)| t - x < WINDOW);
+                    b.recent.push((t, kind.into()));
+                    if b.recent.len() <= BURST {
+                        singles.push((*e, m, t));
+                        continue;
+                    }
+                    let first = b.recent[0].0;
+                    // this tick's singles in the window join the summary instead
+                    singles.retain(|s| s.2 < first);
+                    b.sum = Some((first, b.recent.drain(..).map(|r| r.1).collect(), t));
+                }
+            }
+            grown = true;
         }
-        let sound = shown.iter().any(|(_, m)| *m == "sound");
-        // ponytail: fixed 10 s window from its first banner, not sliding; a sliding one if bursts straddle windows
-        let w = bursts.entry(root.into()).or_insert((now, vec![]));
-        if now - w.0 >= WINDOW {
-            *w = (now, vec![]);
-        }
-        w.1.extend(shown.iter().filter_map(|(e, _)| e[1].as_str().map(String::from)));
-        if w.1.len() > BURST {
-            let counts: Vec<String> = KINDS.iter().filter_map(|k| {
-                let c = w.1.iter().filter(|x| x == k).count();
-                (c > 0).then(|| format!("{c} {}", label(k).to_lowercase()))
-            }).collect();
-            out.push(Post { root: root.into(), n: None, title: format!("{name} · {} events", w.1.len()), body: counts.join(", "), sound, id: json!({"root": root, "sum": w.0}).to_string() });
-            continue;
-        }
-        for (e, m) in shown {
+        for (e, m, _) in singles {
             let num = e[3].as_u64();
-            let title = p["tasks"].as_array().into_iter().flatten().find(|t| t["n"].as_u64() == num && num.is_some()).and_then(|t| t["title"].as_str());
-            let body = match (num, title) {
+            let key = num.map(|x| x.to_string()).unwrap_or_default();
+            let title = n["titles"][root][&key].as_str().or(known[&key].as_str()).map(String::from);
+            let body = match (num, &title) {
                 (Some(x), Some(t)) => format!("#{x} {t}"),
                 (Some(x), None) => format!("#{x}"),
                 _ => String::new(),
             };
             out.push(Post { root: root.into(), n: num, title: format!("{name} · {}", label(e[1].as_str().unwrap_or(""))), body, sound: m == "sound", id: json!({"root": root, "n": num, "k": e[1], "t": title, "e": line(e)}).to_string() });
+        }
+        if let (true, Some((first, kinds, _))) = (grown, &b.sum) {
+            let sound = shown.iter().any(|(t, m)| t >= first && *m == "sound");
+            let counts: Vec<String> = KINDS.iter().filter_map(|k| {
+                let c = kinds.iter().filter(|x| x == k).count();
+                (c > 0).then(|| format!("{c} {}", label(k).to_lowercase()))
+            }).collect();
+            out.push(Post { root: root.into(), n: None, title: format!("{name} · {} events", kinds.len()), body: counts.join(", "), sound, id: json!({"root": root, "sum": first}).to_string() });
         }
     }
     out
@@ -360,7 +393,36 @@ mod tests {
         assert_eq!((s1.len(), s1[0].title.as_str(), s1[0].body.as_str()), (1, "p · 4 events", "3 failed, 1 attempt gone"));
         let s2 = tick(109, json!([109, "ask", "109", 7]));
         assert_eq!((s2[0].title.as_str(), &s2[0].id), ("p · 5 events", &s1[0].id), "same identifier: the OS replaces it");
-        let p = tick(110, json!([110, "failed", "110", 7]));
-        assert_eq!((p.len(), p[0].n), (1, Some(7)), "a new window after 10 s");
+        let p = tick(118, json!([118, "failed", "118", 7]));
+        assert_eq!((p[0].title.as_str(), &p[0].id), ("p · 6 events", &s1[0].id), "under 10 s apart: the summary grows");
+        let p = tick(130, json!([130, "failed", "130", 7]));
+        assert_eq!((p.len(), p[0].n), (1, Some(7)), "a quiet 10 s ends it");
+        // sliding: 108..111 is a burst although 100 started an earlier window
+        let (mut n, mut b) = (json!({"cursor": {"/p": "0"}}), Bursts::new());
+        let mut ev = vec![];
+        let mut tick = |t: i64| { ev.push(json!([t, "failed", t.to_string(), 7])); due(&mut n, &[proj(json!(ev))], t, &mut b) };
+        let singles: Vec<usize> = [100, 108, 109, 110].into_iter().map(|t| tick(t).len()).collect();
+        assert_eq!(singles, [1, 1, 1, 1]);
+        let s = tick(111);
+        assert_eq!((s.len(), s[0].title.as_str(), s[0].n), (1, "p · 4 events", None), "108, 109, 110, 111");
+        // one tick: an early single, then a burst
+        let mut n = json!({"cursor": {"/p": "0"}});
+        let ev = json!([[50, "failed", "1", 1], [70, "failed", "2", 2], [71, "failed", "3", 3], [72, "ask", "4", 4], [73, "gone", "5", 5]]);
+        let p = due(&mut n, &[proj(ev)], 80, &mut Bursts::new());
+        assert_eq!(p.iter().map(|p| (p.n, p.title.as_str())).collect::<Vec<_>>(), [(Some(1), "p · Failed"), (None, "p · 4 events")]);
+    }
+
+    // Chain: M14 a closed task's banner and card name it. Risk: `status.json` drops closed tasks, so the title is lost,
+    // also when the tray restarts between the last open sighting and the close.
+    #[test]
+    fn closed_task_keeps_its_title() {
+        let mut n = json!({"kinds": {"close": "banner"}});
+        due(&mut n, &[proj(json!([]))], 100, &mut Bursts::new());
+        let mut saved: Value = serde_json::from_str(&n.to_string()).unwrap();
+        let gone = json!({"root": "/p", "name": "p", "tasks": [], "events": [[200, "close", "6", 7]]});
+        let p = due(&mut saved, &[gone], 210, &mut Bursts::new());
+        assert_eq!(p[0].body, "#7 Fix it");
+        assert_eq!(serde_json::from_str::<Value>(&p[0].id).unwrap()["t"], "Fix it", "the click opens a card with its title");
+        assert_eq!(saved["titles"]["/p"], json!({}), "only open tasks stay: bounded by the open tasks");
     }
 }

@@ -151,6 +151,14 @@
    {"id": 14, "body": "taskq: spawn reviewer codex:r2 mac"},
    {"id": 15, "body": "taskq: gone attempt 13"}
   ], "expect": {"state": "review", "retries": 1, "result": "0123456789abcdef0123456789abcdef01234567"}},
+  {"name": "two-host reviewer race: the second spawn and its writes are fenced (#1140)", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 13, "body": "taskq: spawn reviewer codex:- mac"},
+   {"id": 14, "body": "taskq: spawn reviewer codex:- win"},
+   {"id": 15, "body": "taskq: close attempt 14\nlate loser"},
+   {"id": 16, "body": "taskq: requeue attempt 13\nReason: CI fails"}
+  ], "expect": {"state": "ready", "retries": 1}},
   {"name": "reviewer closes its own attempt", "entries": [
    {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
    {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},

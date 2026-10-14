@@ -589,6 +589,9 @@ fn service_run(c: &Ctx) -> Res<()> {
     let start = |l: &runtime::Launch| runtime::spawn(&env, l);
     let mut s = Service::new(c.board.as_ref(), cfg, platform::VERSION, Box::new(start));
     s.instance = enrollment::installation_id(&cfg.install).map(|id| service_id(&id))?;
+    // § 4 machine line: agentq's `host.name` is the same `hostname` output; WSL as agentq detects it
+    let wsl = cfg!(target_os = "linux") && (std::env::var_os("WSL_DISTRO_NAME").is_some() || Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists());
+    s.machine = Some(hostname()).filter(|h| !h.is_empty()).map(|h| if wsl { format!("{h} wsl") } else { h }).unwrap_or_default();
     let d = dot(&cfg.root);
     fs::create_dir_all(&d).map_err(|e| e.to_string())?;
     // § 4 one service per root: wait, not exit, so the unit sees no crash loop

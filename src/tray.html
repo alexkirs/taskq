@@ -430,6 +430,15 @@ function wholeLines(c){
 // a reader's scroll leaves cut lines: once it settles, the block takes its CSS bound again and realigns on whole lines
 function settle(c){if(!c.isConnected)return;const s=c.scrollTop;c.style.maxHeight='';c.scrollTop=s;wholeLines(c);fit();}
 menu.addEventListener('scroll',e=>{const c=e.target;if(!c.dataset?.bound)return;clearTimeout(c.settling);c.settling=setTimeout(()=>settle(c),150);},true);
+// a refresh between press and release rebuilds the pressed control and its click is lost (U-A4):
+// the refresh waits for the release, at most 5 s, then runs after the click
+let pressedAt=null,stale=false;
+function refresh(now){if(pressedAt!==null&&now-pressedAt<5000){stale=true;return;}render();}
+function release(){pressedAt=null;if(stale){stale=false;setTimeout(render);}}
+menu.addEventListener('pointerdown',()=>{pressedAt=performance.now();});
+for(const event of ['pointerup','pointercancel'])addEventListener(event,release,true);
+addEventListener('blur',release);
+// Press end.
 window.taskq={settle,receive(s){
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
   if(s.capmsg){resourceReceipt(s.capmsg);return;}
@@ -441,7 +450,7 @@ window.taskq={settle,receive(s){
   if(s.page!==undefined&&s.page!==page){page=s.page;taskFilter=null;working=null;workCard=null;trail.length=0;pending={};disclosures=[];render(true);return;}
   // a tick does not take the caret out of the range fields
   if(document.activeElement&&(document.activeElement.dataset.draft||document.activeElement.dataset.rscField||document.activeElement.id==='ai'))return;
-  render();
+  refresh(performance.now());
 },model:{unique,counts,mode,resourceSet}};
 menu.addEventListener('click',e=>{
   const cardLink=e.target.closest('.qac a');if(cardLink){e.preventDefault();send({a:'open',url:cardLink.getAttribute('href')});return;}
@@ -470,10 +479,11 @@ menu.addEventListener('click',e=>{
   if(d.a==='ai-clear'){send({a:'ai-clear'});return;}
   if(d.a==='add-ask'||d.a==='add-back'){addConfirm=d.a==='add-ask';render();return;}
   if(d.a==='add-install'||d.a==='add-cancel')addConfirm=false;
-  if(d.a==='confirm'||d.a==='cancel'){confirming=d.a==='confirm';render();return;}
+  // the pressed button is replaced: focus Cancel in the question, or the command again after it (U-A8)
+  if(d.a==='confirm'||d.a==='cancel'){confirming=d.a==='confirm';render();menu.querySelector(confirming?'[data-a="cancel"]':'[data-a="confirm"]')?.focus();return;}
   if(d.a==='update'){updating={v:d.v,at:S.now};}
   if(d.a==='pick'){ask=d.root;render();return;}
-  if(d.a==='pause-all'||d.a==='resume-all'){confirming=null;for(const p of S.projects.filter(p=>mode(p)===(d.a==='pause-all'?'run':'paused'))){pending[p.root]=d.a==='pause-all'?'Pausing':'Resuming';send({a:d.a.slice(0,-4),root:p.root});}render();return;}
+  if(d.a==='pause-all'||d.a==='resume-all'){confirming=null;for(const p of S.projects.filter(p=>mode(p)===(d.a==='pause-all'?'run':'paused'))){pending[p.root]=d.a==='pause-all'?'Pausing':'Resuming';send({a:d.a.slice(0,-4),root:p.root});}render();menu.querySelector('[data-a="confirm"]')?.focus();return;}
   if(d.a==='pause'||d.a==='resume'||d.a==='focus'){pending[d.root]=d.a==='pause'?'Pausing':'Resuming';ask=null;}
   if(d.a)send({a:d.a,root:d.root,label:d.label});render();});
 menu.addEventListener('input',e=>{if(e.target.id==='ai'){aiText=e.target.value;send({a:'ai-draft',text:aiText});return;}const k=e.target.dataset.draft;if(k&&draft)draft[k]=e.target.value;});

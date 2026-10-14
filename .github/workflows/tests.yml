@@ -22,6 +22,7 @@ jobs:
       - run: node tests/tray-home-proposal.test.cjs
       - run: node tests/tray-next.test.cjs
       - run: node tests/tray-navigation.test.cjs
+      - run: node tests/tray-press.test.cjs
       - run: node tests/tray-incidents.test.cjs
       - run: node tests/answer-card.test.cjs
       - run: node tests/tray-answer.test.cjs

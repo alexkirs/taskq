@@ -28,7 +28,7 @@ pub fn ready(root: &Path) -> Result<(), String> {
 
 fn codex_home() -> Result<PathBuf, String> {
     std::env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
-        .ok_or_else(|| "linux sandbox: Codex home unknown".into())?.canonicalize().map_err(|e| e.to_string())
+        .ok_or("linux sandbox: Codex home unknown")?.canonicalize().map_err(|e| e.to_string())
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -51,6 +51,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let ch = codex_home()?;
     let mut c = Command::new(BWRAP);
     c.args(["--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid", "--unshare-ipc", "--cap-drop", "ALL", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/run", "--tmpfs", "/var/tmp"]);
+    let dns = Path::new("/etc/resolv.conf").canonicalize().map_err(|e| format!("linux sandbox DNS: {e}"))?;
+    c.arg("--ro-bind").arg(&dns).arg(&dns);
     let workspace = if mode == "workspace" { root.clone() } else { root.join(".taskq") };
     for p in std::iter::once(workspace).chain(std::iter::once(ch.clone())).chain([".cargo", ".rustup", ".npm", ".cache"].map(|s| home.join(s))) {
         if p.exists() { let p = p.canonicalize().map_err(|e| e.to_string())?; c.arg("--bind").arg(&p).arg(&p); }
@@ -84,15 +86,28 @@ mod tests {
         let root = PathBuf::from(std::env::var_os("TASKQ_QUALIFY_ROOT").expect("disposable project"));
         let install = PathBuf::from(std::env::var_os("TASKQ_INSTALL").expect("disposable installation"));
         let exe = PathBuf::from(std::env::var_os("TASKQ_QUALIFY_EXE").expect("candidate CLI"));
-        let codex = ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"].map(String::from);
+        let sandbox = std::env::var("TASKQ_QUALIFY_SANDBOX").unwrap_or("workspace-write".into());
+        assert!(["workspace-write", "read-only"].contains(&sandbox.as_str()));
+        let codex = ["-s", sandbox.as_str(), "-c", "sandbox_workspace_write.network_access=true"].map(String::from);
         let env = Env { root: &root, install: &install, exe: &exe, codex: &codex, permission_mode: "dontAsk", publish: "pr", board_env: &[] };
+        std::fs::create_dir_all(root.join(".codex")).unwrap();
+        std::fs::create_dir_all(root.join(".taskq")).unwrap();
+        let canaries = [root.parent().unwrap().join("outside.txt"), install.join("canary.txt"), root.join(".codex/canary.toml")];
+        for p in &canaries { std::fs::write(p, "UNCHANGED\n").unwrap(); }
+        std::fs::remove_file(root.join("outside-link")).ok();
+        std::os::unix::fs::symlink(&canaries[0], root.join("outside-link")).unwrap();
+        std::fs::write(root.join("fixture-install-path"), install.to_str().unwrap()).unwrap();
+        std::fs::write(root.join("check.py"), include_str!("../tests/fixtures/linux-boundary.py")).unwrap();
+        std::fs::write(root.join("taskq.md"), "# Owner-authorized isolated runtime qualification\nFor both worker and reviewer, run exactly `python3 check.py`, read proof.json and compare baseline, expected and candidate active/repeated/empty cases. Identify regressions even when the command exits 0. Report denied canaries and evidence limits. This fixture has no board task: do not run inbox, create worktrees, commit, publish or request elevation. These owner instructions override generic board workflow. Every continuation repeats the check after stage changes.\n").unwrap();
+        std::fs::write(root.join("AGENTS.md"), "Read taskq.md; disposable qualification only.\n").unwrap();
+        let attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() * 2;
         for (i, role) in ["worker", "reviewer"].iter().enumerate() {
-            let mut l = Launch { task: 1, title: "Owner-authorized isolated boundary qualification. Follow fixture taskq.md; no board or publication.".into(), attempt: 9000 + i as u64, role: role.to_string(), rt: "codex".into(), session: crate::runtime::uuid(), url: "https://github.com/taskqorg/taskq".into(), resume: None };
+            let mut l = Launch { task: 1, title: "Owner-authorized isolated boundary qualification. Follow fixture taskq.md; no board or publication.".into(), attempt: attempt + i as u64, role: role.to_string(), rt: "codex".into(), session: crate::runtime::uuid(), url: "https://github.com/taskqorg/taskq".into(), resume: None };
             for turn in 0..2 {
                 std::fs::write(root.join("stage"), turn.to_string()).unwrap();
                 std::fs::remove_file(root.join("proof.json")).ok();
                 if turn == 1 { l.resume = Some("Owner: repeat the exact fixture check against the changed stage; retain this session. No other actions.".into()); }
-                let mut child = crate::runtime::spawn(&env, &l).unwrap_or_else(|e| panic!("{}", e.message));
+                let mut child = crate::runtime::spawn(&env, &l).unwrap_or_else(|e| panic!("{e}"));
                 let began = std::time::Instant::now();
                 let code = loop {
                     if let Some(code) = child.exited().unwrap() { break code; }
@@ -104,12 +119,23 @@ mod tests {
                 let ids: Vec<String> = log.lines().filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok()).filter(|v| v["type"] == "thread.started").filter_map(|v| v["thread_id"].as_str().map(String::from)).collect();
                 if turn == 0 { l.session = ids.first().expect("native session").clone(); }
                 assert!(ids.iter().all(|id| *id == l.session), "same session");
-                let proof: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("proof.json")).expect("real tool output")).unwrap();
+                let proof: serde_json::Value = log.lines().filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .filter(|v| v["type"] == "item.completed" && v["item"]["type"] == "command_execution")
+                    .filter_map(|v| serde_json::from_str::<serde_json::Value>(v["item"]["aggregated_output"].as_str()?).ok())
+                    .filter(|v| v["stage"] == turn.to_string()).last().expect("real command proof");
                 assert_eq!(proof["stage"], turn.to_string());
-                assert_eq!(proof["allowed"], true);
+                assert_eq!(proof["allowed"], sandbox == "workspace-write");
+                for p in &canaries { assert_eq!(std::fs::read_to_string(p).unwrap(), "UNCHANGED\n", "{}", p.display()); }
                 for key in ["outside", "policy", "config", "symlink", "child"] { assert_eq!(proof[key], "denied", "{key}: {proof}"); }
-                println!("QUALIFIED Linux {role} turn={turn} session={} proof={proof}", l.session);
+                println!("QUALIFIED Linux {sandbox} {role} turn={turn} session={} proof={proof}", l.session);
             }
+            let store = install.join("worker-policy.json");
+            let saved = std::fs::read(&store).unwrap();
+            crate::policy::grant(&install, "codex", "none", Some(&root), "qualification revocation", 2).unwrap();
+            let refused = crate::runtime::spawn(&env, &l).err();
+            std::fs::write(&store, saved).unwrap();
+            assert!(refused.is_some(), "revoked continuation must not launch");
+            println!("QUALIFIED {role} revoked continuation refused before spawn");
         }
     }
 }

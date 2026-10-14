@@ -391,7 +391,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
     format!("{head}{body}Then stop. Everything written through taskq is public: no secrets or paths outside the repository.\n")
 }
 
-const SPECQ_REVISION: &str = "677b6dbbfa08fb854b1cbd6c44bdf91aa1a542f8";
+const SPECQ_REVISION: &str = "504756ad041a5e7691b70ae95c5d2bb6257107ba";
 const SPECQ_FILES: &[&str] = &["engineering/agent-workflow.md", "engineering/use-cases.md", "engineering/verification.md", "caveman/rules/changes.md"];
 
 fn rule_file(url: &str) -> Result<String, String> {

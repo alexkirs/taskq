@@ -450,9 +450,14 @@ g", &["taskq".into()]).unwrap();
         assert_eq!((t.retries, card.lines().take(3).collect::<Vec<_>>()), (3, vec!["Fix:", "1) x", "Problem: retry limit 3 reached by this requeue; the task waits for the owner."]));
         assert_eq!(options(&card).into_iter().map(|o| (o.0, o.1.split(':').next().unwrap().to_string())).collect::<Vec<_>>(), [(1, "requeue".into()), (2, "later".into())]);
         assert!(b.issue(n).unwrap().labels.contains(&"q-ask".to_string()));
-        // `later` parks the task; `requeue` retries it with a fresh attempt
+        assert_eq!(card.lines().last(), Some(format!("To answer: `taskq answer {n}.K`; a bare comment `K` makes the task ready, not later.").as_str()));
+        // `taskq answer N.2` parks the task; a bare board comment `2` is a plain answer to `ready` (§ 2)
         let r = answer_picks(&b, &cfg, &[format!("{n}.2")], &Op::default()).unwrap().remove(0);
         assert_eq!((r.outcome, r.state), ("accepted", Some("later")), "{}", r.text());
+        let n = at_limit(&["win", "mac"]);
+        b.comment(n, "2").unwrap();
+        assert_eq!(fold(n, &entries(&b, n).unwrap(), false).state, State::Ready);
+        // `requeue` retries it with a fresh attempt
         let n = at_limit(&["mac", "win"]);
         let r = answer_picks(&b, &cfg, &[format!("{n}.1")], &Op::default()).unwrap().remove(0);
         assert_eq!((r.outcome, r.state), ("accepted", Some("ready")), "{}", r.text());

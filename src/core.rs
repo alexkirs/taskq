@@ -77,7 +77,8 @@ pub fn limit_text(n: u64, t: &Task, kind: &str, text: &str) -> String {
         format!("Problem: retry limit {max} reached by this {kind}; the task waits for the owner."),
         "1. requeue: retry with a fresh attempt ★".into(),
         "2. later: park the task until the owner requeues it".into(),
-        format!("To answer: `taskq answer {n}.K` or comment `K` or the option text."),
+        // a bare comment `K` folds as a plain answer (ready), so `later` needs the CLI form (§ 2)
+        format!("To answer: `taskq answer {n}.K`; a bare comment `K` makes the task ready, not later."),
     ];
     reason.filter(|s| !s.trim().is_empty()).chain(card).collect::<Vec<_>>().join("\n")
 }

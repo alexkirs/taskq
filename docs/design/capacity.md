@@ -79,7 +79,7 @@ Add one `capacity` object to the existing local `status.json`:
 | `sample_at` | Wall-clock timestamp for display; null without a valid sample |
 | `sample_age_seconds` | Age measured with the service's monotonic clock at status publication |
 
-Use existing `host`, `project`, `at` and `pid` to identify/freshen the snapshot. Missing new fields mean `Unknown: service has no capacity status`, not zero/default limits.
+Use existing `host`, `project`, `at` and `pid` to identify/freshen the snapshot. Missing new fields mean `Unknown: service has no capacity status` ([unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy)).
 Runtime rows come from the union of effective limits and live children; a removed runtime with a child still shows usage and limit 0.
 Update the capacity snapshot every sample and after launch/reap/reload, without forcing a board poll every sample. Mark a sample/status older than 60 seconds unknown; add elapsed display time to published age, and treat clock anomalies as unknown.
 The tray reads only registered local project snapshots, no board/token. Remote hosts show `Unknown: no local snapshot`; do not invent fleet usage from heartbeat task counts. A future remote transport is separate work.

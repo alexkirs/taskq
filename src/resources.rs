@@ -110,11 +110,51 @@ fn save(install: &Path, s: &State) -> Res<()> {
     Ok(())
 }
 
-/// `f` on the state under the host lock; written back when changed.
-fn with<T>(install: &Path, f: impl FnOnce(&mut State) -> Res<T>) -> Res<T> {
+/// The host lock, held until the file drops: resource writes and changes of the DashQ connection take turns under it.
+fn lock(install: &Path) -> Res<fs::File> {
     fs::create_dir_all(dir(install)).map_err(|e| format!("resources: {e}"))?;
     let lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir(install).join("lock")).map_err(|e| format!("resources lock: {e}"))?;
     lock.lock().map_err(|e| format!("resources lock: {e}"))?;
+    Ok(lock)
+}
+
+/// `f` changes the DashQ connection under the host lock (`taskq disconnect`), so it never lands between an
+/// operation's final connection check and its write.
+pub fn locked<T>(install: &Path, f: impl FnOnce() -> Res<T>) -> Res<T> {
+    let _lock = lock(install)?;
+    f()
+}
+
+/// coreq's wire for calls whose reply can replace the active connection: once an ack (pairing activates a new one)
+/// or a 401 (DashQ revoked it) arrives, it takes the host lock before coreq saves, and holds it until dropped.
+pub struct Fenced<W> {
+    wire: W,
+    install: PathBuf,
+    held: Option<fs::File>,
+}
+
+impl<W: Wire> Fenced<W> {
+    pub fn new(install: &Path, wire: W) -> Self {
+        Fenced { wire, install: install.to_path_buf(), held: None }
+    }
+}
+
+impl<W: Wire> Wire for Fenced<W> {
+    fn post(&mut self, dest: &str, route: &str, auth: Option<&str>, body: &Value) -> Result<(u16, Value), String> {
+        let r = self.wire.post(dest, route, auth, body)?;
+        if self.held.is_none() && (route == "/connect/ack" || r.0 == 401) {
+            self.held = Some(lock(&self.install)?);
+        }
+        Ok(r)
+    }
+    fn now(&self) -> u64 { self.wire.now() }
+    fn sleep(&mut self, secs: u64) { self.wire.sleep(secs) }
+    fn show(&mut self, uri: &str, code: &str) { self.wire.show(uri, code) }
+}
+
+/// `f` on the state under the host lock; written back when changed.
+fn with<T>(install: &Path, f: impl FnOnce(&mut State) -> Res<T>) -> Res<T> {
+    let _lock = lock(install)?;
     let mut s = read(install)?;
     let before = s.clone();
     let r = f(&mut s);
@@ -975,6 +1015,63 @@ mod tests {
         go(&t, &[submit("op-v", json!({"runtime_limit": 0}))], &[], 399);
         assert_eq!((receipt_of(&t, "op-v")["reason"].as_str(), config(&t)), (Some("scope"), before));
         assert!(!read(&t.install).unwrap().projects.contains_key("project-1"));
+        fs::remove_dir_all(&t.base).unwrap();
+    }
+
+    /// DashQ stand-in for connection calls: pairing activates generation 2, a revoke succeeds, ingest answers 401.
+    struct Peer;
+    impl Wire for Peer {
+        fn post(&mut self, _: &str, route: &str, _: Option<&str>, _: &Value) -> Result<(u16, Value), String> {
+            Ok(match route {
+                "/connect/device" => (200, json!({"protocol": 1, "device_code": "d", "user_code": "U-1", "verification_uri": "https://x/v", "expires_in": 600, "interval": 1})),
+                "/connect/token" => (200, json!({"protocol": 1, "installation": INST, "product": "taskq", "credential": "c2", "generation": 2})),
+                "/connect/ack" => (200, json!({"protocol": 1, "state": "active", "generation": 2})),
+                "/ingest" => (401, json!({"protocol": 1, "error": "revoked"})),
+                _ => (200, json!({"protocol": 1})),
+            })
+        }
+        fn now(&self) -> u64 { 0 }
+        fn sleep(&mut self, _: u64) {}
+        fn show(&mut self, _: &str, _: &str) {}
+    }
+
+    // Chain: decide's final connection check -> disconnect, pairing activation or DashQ's 401 revoke -> write.
+    // Risk: the connection going between the final check and the write, so an operation writes after it went.
+    #[test]
+    fn connection_changes_wait_for_the_write() {
+        let t = setup("final");
+        let before = config(&t);
+        let changes: [(&str, fn(&Path)); 3] = [
+            ("op-d", |i| { enrollment::disconnect_with(i, &mut Peer).unwrap(); }),
+            ("op-p", |i| {
+                let req = coreq::enroll::Request { installation: Some(INST), product: "taskq", host_label: "h", schemas: &[enrollment::SCHEMA], scope: None, capabilities: &[] };
+                coreq::enroll::pair(&enrollment::dir(i), "https://x/machine", &req, &mut Fenced::new(i, Peer)).unwrap();
+            }),
+            ("op-r", |i| {
+                let rec = coreq::enroll::stamp(&enrollment::dir(i), enrollment::SCHEMA, "e-1", 0, json!({})).unwrap();
+                assert!(coreq::enroll::deliver(&enrollment::dir(i), &[rec], &mut Default::default(), &mut Fenced::new(i, Peer)).is_err());
+            }),
+        ];
+        for (op, change) in changes {
+            fs::write(t.root.join("taskq.json"), &before).unwrap();
+            fs::write(conn_file(&t.install), conn(Some(active())).to_string()).unwrap();
+            with(&t.install, |s| { sync(s, &t.install, 0); s.projects.get_mut("project-1").unwrap().revision = "r1".into(); Ok(()) }).unwrap();
+            let seen = std::cell::RefCell::new(None);
+            // the final read sees the operation's connection; the change starts right after it
+            let live = || {
+                let up = enrollment::active(&t.install).unwrap() == Some(active());
+                let (install, root) = (t.install.clone(), t.root.clone());
+                seen.replace(Some(std::thread::spawn(move || { change(&install); fs::read_to_string(root.join("taskq.json")).unwrap() })));
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                up
+            };
+            let fence = Fence { clock: &|| 100, live: &live };
+            with(&t.install, |s| decide(&t.install, s, &submit(op, json!({"runtime_limit": 0})), (INST, 1), true, 100, &fence)).unwrap();
+            let after = seen.take().expect("final check ran").join().unwrap();
+            assert_eq!(receipt_of(&t, op)["state"], "saved", "{op}");
+            assert_ne!(after, before, "{op}: the connection changed before the write landed");
+            assert_ne!(enrollment::active(&t.install).unwrap(), Some(active()), "{op}: the change applied after the write");
+        }
         fs::remove_dir_all(&t.base).unwrap();
     }
 

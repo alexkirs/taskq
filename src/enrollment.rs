@@ -2,7 +2,7 @@
 //! No command authority or task-state storage.
 #![allow(dead_code)] // `coalesce` is the reader-side rule; no TaskQ reader yet.
 
-use crate::{Res, core, snapshot::Snapshot};
+use crate::{Res, core, resources, snapshot::Snapshot};
 use coreq::enroll::{self, Backoff, Delivery, Https};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
@@ -60,13 +60,13 @@ pub fn pair(install: &Path, url: &str, host: &str, board: &BoardScope, browser: 
     let id = installation_id(install)?;
     let value = board.value();
     let req = enroll::Request { installation: Some(&id), product: "taskq", host_label: host, schemas: &[SCHEMA], scope: Some((SCHEMA, &value)), capabilities: &[] };
-    enroll::pair(&dir(install), &dest, &req, &mut Https { browser })
+    enroll::pair(&dir(install), &dest, &req, &mut resources::Fenced::new(install, Https { browser }))
 }
 
 /// Sends `record` once and asks for its receipt until DashQ projects it (or `tries` run out).
 pub fn first_receipt(install: &Path, record: &Value, tries: u32) -> Res<&'static str> {
     let d = dir(install);
-    let mut w = Https { browser: false };
+    let mut w = resources::Fenced::new(install, Https { browser: false });
     match enroll::deliver(&d, std::slice::from_ref(record), &mut Backoff::default(), &mut w) {
         Ok(r) if r[0]["state"] == "accepted" => {}
         Ok(r) => return Err(format!("first snapshot rejected: {}", r[0]["reason"].as_str().unwrap_or("unknown"))),
@@ -89,7 +89,7 @@ pub fn disconnect(install: &Path) -> Res<Option<String>> {
     disconnect_with(install, &mut Https { browser: false })
 }
 
-fn disconnect_with(install: &Path, w: &mut dyn enroll::Wire) -> Res<Option<String>> {
+pub(crate) fn disconnect_with(install: &Path, w: &mut dyn enroll::Wire) -> Res<Option<String>> {
     let Some(s) = state(install)? else { return Ok(None) };
     let (active, pending) = (s["active"].is_object(), s["pending"].is_object());
     let queued = |e: &String| e.ends_with("revoke pending");
@@ -104,7 +104,7 @@ fn disconnect_with(install: &Path, w: &mut dyn enroll::Wire) -> Res<Option<Strin
         // a staged credential DashQ already granted is queued for revoke by coreq
         enroll::cancel(&dir(install), w).or_else(|e| if queued(&e) { Ok(()) } else { Err(e) })?;
     }
-    enroll::disconnect(&dir(install), w).or_else(|e| if queued(&e) { Ok(()) } else { Err(e) })?;
+    resources::locked(install, || enroll::disconnect(&dir(install), w).or_else(|e| if queued(&e) { Ok(()) } else { Err(e) }))?;
     let left = state(install)?.map_or(0, |s| s["revoke"].as_array().map_or(0, Vec::len));
     let mut out = vec![];
     if pending { out.push("pairing cancelled".to_string()) }
@@ -201,8 +201,9 @@ impl Sender {
         let (digest, rec) = record(install, s, &a).map_err(|e| format!("not sent: {e}"))?;
         if self.sent.as_ref().is_some_and(|(d, at)| *d == digest && now < at + RESEND) { return Ok(()) }
         let mut backoff = std::mem::take(&mut self.backoff);
+        let install = install.to_path_buf();
         self.job = Some((digest, now, std::thread::spawn(move || {
-            let r = enroll::deliver(&d, &[rec], &mut backoff, &mut Https { browser: false }).map(|r| match r[0]["state"].as_str() {
+            let r = enroll::deliver(&d, &[rec], &mut backoff, &mut resources::Fenced::new(&install, Https { browser: false })).map(|r| match r[0]["state"].as_str() {
                 Some("accepted") => "accepted".to_string(),
                 _ => format!("rejected: {}", r[0]["reason"].as_str().unwrap_or("unknown")),
             });

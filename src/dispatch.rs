@@ -2,7 +2,7 @@
 //! the op id, appends one entry that `fold` accepts, reads it back and returns a receipt.
 
 use crate::board::{self, Board, Publish, entries};
-use crate::core::{self, Entry, State, Task, entry, fold, options};
+use crate::core::{self, Entry, Gate, State, Task, entry, fold, options};
 use crate::service::{self, Config};
 use crate::{Res, join, poke};
 use serde::Serialize;
@@ -164,6 +164,12 @@ pub fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op) ->
     }
     match t.state {
         State::Later | State::Failed => act(b, &cfg.root, n, "close", &[], verdict, op),
+        State::Review if t.gate.is_some_and(|g| g != Gate::Approved) => {
+            // § 7: no publication before the owner's approval of this result
+            let sha = t.result.unwrap_or_default();
+            let r = Receipt::rejected(n, op, format!("gate is {}: the owner has not approved {}", t.gate.map_or("", Gate::name), &sha[..sha.len().min(7)]));
+            Receipt { state: Some(t.state.name()), next: format!("Owner: `taskq approve {n}`, or pick the approve option."), ..r }
+        }
         State::Review => {
             let sha = t.result.unwrap_or_default();
             let rev = entries(b, n).map(|l| core::revision(n, &l)).unwrap_or(0);
@@ -187,6 +193,30 @@ pub fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op) ->
     }
 }
 
+/// Whether this process is an agent (`TASKQ_ATTEMPT` set): it cannot approve a gate (§ 7).
+pub fn agent() -> bool {
+    std::env::var_os("TASKQ_ATTEMPT").is_some()
+}
+
+/// The owner's gate approval of the current result (§ 7). An agent cannot approve; `sha`, when given, must be that
+/// result, so an approval never binds to a revision the owner did not see.
+pub fn approve(b: &dyn Board, root: &Path, n: u64, sha: Option<&str>, op: &Op, agent: bool) -> Receipt {
+    if agent {
+        return Receipt::rejected(n, op, "an agent cannot approve a gate; the owner runs `approve`");
+    }
+    let t = match current(b, n) {
+        Ok((_, t, _)) => t,
+        Err(e) => return Receipt::rejected(n, op, e),
+    };
+    let Some(result) = t.result.clone() else {
+        return Receipt { state: Some(t.state.name()), ..Receipt::rejected(n, op, format!("#{n} has no result to approve")) };
+    };
+    if let Some(s) = sha.filter(|s| !result.starts_with(s) || s.len() < 7) {
+        return Receipt { state: Some(t.state.name()), ..Receipt::rejected(n, op, format!("{s} is not the current result {}", &result[..result.len().min(7)])) };
+    }
+    act_as(b, root, n, "approve", &[&result], "", op, None)
+}
+
 /// `answer N.K [M.K..]`: every pick is checked before any is written (§ 5).
 pub fn answer_picks(b: &dyn Board, cfg: &Config, picks: &[String], op: &Op) -> Res<Vec<Receipt>> {
     let mut plan = vec![];
@@ -202,15 +232,26 @@ pub fn answer_picks(b: &dyn Board, cfg: &Config, picks: &[String], op: &Op) -> R
         }
         let card = t.card.clone().filter(|_| matches!(t.state, State::Ask | State::Review)).ok_or(format!("#{n} is {} without a question", t.state.name()))?;
         let opt = options(&card).into_iter().find(|o| o.0 == k).ok_or(format!("#{n} has no option {k}"))?.1;
-        plan.push((n, k, Some((opt, t.state))));
+        plan.push((n, k, Some((opt, t.state, t.gate.is_some()))));
     }
     let mut out = vec![];
     for (n, k, card) in plan {
-        let Some((opt, state)) = card else {
+        let Some((opt, state, gated)) = card else {
             out.push(act(b, &cfg.root, n, "answer", &[&k.to_string()], "", op));
             continue;
         };
         let close = opt.to_lowercase().starts_with("close");
+        if gated && opt.to_lowercase().starts_with("approve") {
+            // § 7: the owner's pick approves the current result first, as one more op of the same id
+            let first = Op { id: op.id.as_ref().map(|i| format!("{i}.approve")), revision: op.revision };
+            let r = approve(b, &cfg.root, n, None, &first, agent());
+            if state == State::Review || matches!(r.outcome, "stale" | "unknown") {
+                out.push(r);
+                continue;
+            }
+            out.push(act(b, &cfg.root, n, "answer", &[&k.to_string()], &opt, &Op { id: op.id.clone(), revision: None }));
+            continue;
+        }
         out.push(match (state, close) {
             (State::Ask, _) => {
                 let r = act(b, &cfg.root, n, "answer", &[&k.to_string()], &opt, op);

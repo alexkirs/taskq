@@ -93,7 +93,7 @@ Ship the accepted D14 intentions: Plan first, Implement and review, Urgent fix, 
 2. AI draft → review → existing same-board tasks/dependencies; plan projection; creation receipts. No second scheduler.
 3. Multi-repository environment lifetime, resource ownership/finalization and cross-board dependencies only after Q5/Q6 model decisions. Independent branches can continue after one fails only when their inputs/resources remain valid.
 
-Plan grouping storage, task-set admission hold, human gates distinct from publication, conditional-answer authority, idempotent bulk writes, environment leases and finalization remain unimplemented. Root R1/R2/R3/R11 and §§2/4/7/9 must resolve affected lifecycle decisions before runtime work.
+Task-set admission hold (`add --hold`), idempotent bulk writes (op ids), recipes and revision-bound human gates distinct from publication are decided in [taskq.md](../../taskq.md) § 2 and § 7. Plan grouping storage, conditional-answer authority, environment leases and finalization remain unimplemented. Root R1/R2/R3/R11 and §§2/4/7/9 must resolve affected lifecycle decisions before runtime work.
 
 ## P6 Simplicity pass across the menu
 

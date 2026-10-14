@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+#[derive(Clone)]
 pub struct Launch {
     pub task: u64,
     pub title: String,
@@ -368,7 +369,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
              Acceptance or contract gaps, not style; a changed or deleted existing test is a gap unless the diff changes its rule.\n\
              {CI_WAIT}Then exactly one of:\n\
              - `{q} close {n} --text \"Changed: <user effect>\nChecks: Task fit: A1 ok|gap|unknown, A2 ..; CI <outcome> on <SHA>\nChecks: Implementation quality: <binding gaps|advisories|none>\nOpen: <item|none>\"` (it publishes),\n\
-             - `{q} requeue {n} --text \"<exact fixes>\"`,\n\
+             - `{q} requeue {n} --text \"<exact fixes>\"` (a live worker resumes with them; you resume on its next result),\n\
              - {ask}.\n{approval}{formats}",
             ask = ask(&q, n),
             approval = if env.publish == "review-pr" { "Delivery review-pr: an otherwise done result needs the owner's approval: ask with Done naming task fit and CI on the SHA, first option `approve <sha7> and close ★`.\n" } else { "" },

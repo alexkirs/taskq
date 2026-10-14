@@ -262,7 +262,13 @@ pub struct Service<'a> {
     pub refused_access: BTreeMap<String, String>,
     /// Children whose last liveness read failed, by attempt: kept and reported unknown, never `gone` (§ 4).
     pub unknown: HashMap<u64, String>,
+    /// § 2 rounds gate: every fresh heartbeat lists `rounds`, so entries fold under details and a reviewer's requeue
+    /// resumes the worker; else today's entries (`status.json` `rounds`).
+    pub rounds: bool,
 }
+
+/// The heartbeat line of a service that folds review rounds and folded entries (§ 2, § 4 step 3).
+pub const ROUNDS: &str = "rounds";
 
 const MONTH: i64 = 30 * 86400;
 
@@ -484,7 +490,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new() }
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), rounds: false }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -605,9 +611,11 @@ impl<'a> Service<'a> {
         self.post(n, core::entry("gone", &[], Some(a), &core::limit_text(n, t, "gone", text)))
     }
 
+    /// Posts a service entry (`spawn`, `gone`), folded under details while the rounds gate is on (§ 2).
     fn post(&mut self, n: u64, body: String) -> Result<u64, String> {
         self.log.push(format!("#{n} {}", body.lines().next().unwrap_or_default()));
         self.cache.remove(&n);
+        let body = if self.rounds { core::collapse(&body) } else { body };
         self.board.comment(n, &body)
     }
 
@@ -616,6 +624,7 @@ impl<'a> Service<'a> {
         if !self.instance.is_empty() {
             lines.push(format!("service {}", self.instance));
         }
+        lines.push(ROUNDS.into());
         if self.focus.is_empty() {
             lines.push(format!("focus {}", if self.focus_error.is_some() { "unknown" } else { "off" }));
         }
@@ -646,6 +655,9 @@ impl<'a> Service<'a> {
         self.owner_comments = views.iter().flat_map(|v| {
             core::owner_comments(v.issue.number, &v.log).into_iter().filter_map(|id| Some((v.issue.number, id, v.log.iter().find(|e| e.id == id)?.body.trim().to_string(), v.task.card.clone().unwrap_or_default())))
         }).collect();
+        // § 2 rounds gate from this pass's heartbeats, before any write: every other fresh heartbeat lists `rounds` too
+        // (this one does from step 3 on), so a legacy host back since the last pass gets plain entries
+        self.rounds = hosts.iter().filter(|h| h.title != title && now - h.updated <= ttl).all(|h| h.body.lines().any(|l| l.trim() == ROUNDS));
         self.events(&views, now)?;
         let by_n: HashMap<u64, &View> = views.iter().map(|v| (v.issue.number, v)).collect();
         let mut touched = HashSet::new();
@@ -866,7 +878,7 @@ impl<'a> Service<'a> {
     /// closed (R12).
     fn events(&mut self, views: &[View], now: i64) -> Result<(), String> {
         // the attempt current at the move; a `close` or `failed` that ended it leaves the last spawn
-        let attempt = |t: &Task, c: &[Comment]| t.attempt.or_else(|| c.iter().rev().find(|c| c.trusted && c.body.starts_with("taskq: spawn ")).map(|c| c.id));
+        let attempt = |t: &Task, c: &[Comment]| t.attempt.or_else(|| c.iter().rev().find(|c| c.trusted && core::head(&c.body).starts_with("taskq: spawn ")).map(|c| c.id));
         let now_seen: HashMap<u64, State> = views.iter().map(|v| (v.issue.number, v.task.state)).collect();
         let first = self.seen.is_empty() && self.events_since.is_none();
         let mut ns: Vec<u64> = self.seen.keys().copied().collect();
@@ -898,7 +910,7 @@ impl<'a> Service<'a> {
         if let Some(after) = self.gone_after {
             for v in views {
                 for c in v.comments.iter().filter(|c| c.trusted && c.id > after) {
-                    if let Some(a) = c.body.lines().next().and_then(|l| l.strip_prefix("taskq: gone attempt ")).and_then(|a| a.parse().ok()) {
+                    if let Some(a) = Some(core::head(&c.body)).and_then(|l| l.strip_prefix("taskq: gone attempt ")).and_then(|a| a.parse().ok()) {
                         moves.push((v.issue.number, "gone", a));
                     }
                 }
@@ -932,7 +944,7 @@ impl<'a> Service<'a> {
         log.sort_by_key(|e| e.id);
         // Replay candidate worker spawns so losing, edited and stale entries cannot choose the reviewer.
         let worker = log.iter().enumerate().rev()
-            .filter(|(_, e)| e.body.split_whitespace().take(3).eq(["taskq:", "spawn", "worker"]))
+            .filter(|(_, e)| core::head(&e.body).split_whitespace().take(3).eq(["taskq:", "spawn", "worker"]))
             .find_map(|(i, e)| {
                 let t = core::fold(v.issue.number, &log[..=i], false);
                 if t.attempt == Some(e.id) { rt_of(&t).map(|(rt, _)| rt.to_string()) } else { None }
@@ -1098,6 +1110,80 @@ mod tests {
         core::fold(n, &entries(b, n).unwrap(), false)
     }
 
+    // Chain: § 2 review rounds over § 4 step 6 resume (#1136). Risk: a round spawns new sessions, resumes the wrong
+    // session or role, or folds entries while a host without `rounds` is fresh.
+    #[test]
+    fn review_rounds_resume_the_worker_and_the_reviewer_sessions() {
+        let b = Fake::default();
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
+        let other = b.create("taskq host win", "version 4.0.0", &[HOST_LABEL.into()]).unwrap();
+        let c = cfg("mac");
+        type Launches = Rc<RefCell<Vec<(Launch, Rc<RefCell<Option<i32>>>)>>>;
+        let launches: Launches = Default::default();
+        let seen = launches.clone();
+        let mut s = Service::new(&b, &c, "4.0.0", Box::new(move |l: &Launch| {
+            let flag = Rc::new(RefCell::new(None));
+            seen.borrow_mut().push((l.clone(), flag.clone()));
+            Ok(Box::new(FakeProc(flag)) as Box<dyn Proc>)
+        }));
+        s.focus = vec!["all".into()];
+        let exit = |i: usize| *launches.borrow()[i].1.borrow_mut() = Some(0);
+        let launch = |i: usize| launches.borrow()[i].0.clone();
+        // gate off while the fresh win heartbeat lacks `rounds`: today's plain spawn
+        s.pass().unwrap();
+        let w = task(&b, n).attempt.unwrap();
+        assert!(!s.rounds && b.comments(n).unwrap()[0].body.starts_with("taskq: spawn worker"));
+        b.edit(other, "version 4.0.0\nrounds").unwrap();
+        let sha = |c: char| c.to_string().repeat(40);
+        b.comment(n, &core::entry("result", &[&sha('a')], Some(w), "Changed: x")).unwrap();
+        exit(0);
+        s.pass().unwrap();
+        let r = task(&b, n).attempt.unwrap();
+        assert!(s.rounds && b.comments(n).unwrap().last().unwrap().body.starts_with("<details><summary>taskq: spawn reviewer"));
+        assert_eq!((launch(1).role.as_str(), launch(1).attempt), ("reviewer", r));
+        for round in 1..=2 {
+            let fixes = format!("Fix A{round}");
+            b.comment(n, &core::collapse(&core::entry("requeue", &["round"], Some(r), &fixes))).unwrap();
+            exit(launches.borrow().len() - 1);
+            s.pass().unwrap();
+            let l = launch(launches.borrow().len() - 1);
+            assert_eq!((l.attempt, l.role.as_str(), l.session.as_str(), l.resume.as_deref()), (w, "worker", launch(0).session.as_str(), Some(fixes.as_str())), "round {round}");
+            let next = sha(if round == 1 { 'b' } else { 'c' });
+            b.comment(n, &core::entry("result", &[&next], Some(w), "Changed: y")).unwrap();
+            exit(launches.borrow().len() - 1);
+            s.pass().unwrap();
+            let l = launch(launches.borrow().len() - 1);
+            assert_eq!((l.attempt, l.role.as_str(), l.session.as_str()), (r, "reviewer", launch(1).session.as_str()), "round {round}");
+            assert_eq!(l.resume, Some(format!("New result {next}:\nChanged: y")));
+        }
+        let heads: Vec<String> = b.comments(n).unwrap().iter().map(|c| core::head(&c.body).split_whitespace().take(2).collect::<Vec<_>>().join(" ")).collect();
+        assert_eq!(heads.iter().filter(|h| *h == "taskq: spawn").count(), 2, "rounds spawn no new session: {heads:?}");
+        assert_eq!((heads.len(), launches.borrow().len()), (3 + 2 * 2, 6), "a round costs two entries: {heads:?}");
+    }
+
+    // Chain: § 2 rounds gate over § 4 step 1 (#1136). Risk: step 1 posts with the previous pass's gate, so a legacy host
+    // fresh again since then gets a folded `gone` it cannot read.
+    #[test]
+    fn rounds_gate_is_recomputed_before_step_one_writes() {
+        let b = Fake::default();
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
+        let other = b.create("taskq host win", "version 4.0.0\nrounds", &[HOST_LABEL.into()]).unwrap();
+        let c = cfg("mac");
+        let flag: Rc<RefCell<Option<i32>>> = Default::default();
+        let f = flag.clone();
+        let mut s = Service::new(&b, &c, "4.0.0", Box::new(move |_: &Launch| Ok(Box::new(FakeProc(f.clone())) as Box<dyn Proc>)));
+        s.focus = vec!["all".into()];
+        s.pass().unwrap();
+        assert!(s.rounds && b.comments(n).unwrap()[0].body.starts_with("<details><summary>taskq: spawn worker"));
+        // the win host returns on a legacy build; the worker exits without a result in the same pass
+        b.edit(other, "version 3.9.0").unwrap();
+        *flag.borrow_mut() = Some(1);
+        s.focus.clear();
+        s.pass().unwrap();
+        let last = b.comments(n).unwrap().last().unwrap().body.clone();
+        assert!(!s.rounds && last.starts_with("taskq: gone attempt"), "{last}");
+    }
+
     // Chain: § 3 cross-host grace. Risk: ignored entries extend another host's lease.
     #[test]
     fn cross_host_grace_uses_only_accepted_inbox_entries() {
@@ -1205,7 +1291,7 @@ mod tests {
         s.pass().unwrap();
         assert_eq!(*flags.borrow()[0].1.borrow(), Some(-9), "the lingering process tree is stopped");
         let t = task(&b, n);
-        let gone = b.comments(n).unwrap().into_iter().rfind(|c| c.body.starts_with("taskq: gone")).unwrap().body;
+        let gone = b.comments(n).unwrap().into_iter().map(|c| core::plain(&c.body)).rfind(|c| c.starts_with("taskq: gone")).unwrap();
         assert_eq!((t.state, t.attempt, t.retries), (State::Ready, None, 1), "paused={paused}");
         let reason = if paused { "no child on its host" } else { "exit -9" };
         assert!(gone.ends_with(&format!("\n{reason}\nLast message: Task handoff is incomplete: GitHub rate limits rejected `taskq result`. See [log](.taskq/x.log).")), "{gone}");
@@ -1446,7 +1532,7 @@ mod tests {
         let (em, ew): (Exits, Exits) = Default::default();
         let (mut mac, mut win) = (service(&b, &cm, em.clone()), service(&b, &cw, ew.clone()));
         // mac reads the task in review before win's spawn lands: both hosts post a reviewer spawn for one result
-        let stale = views(&b, &mut HashMap::new()).unwrap().0.into_iter().find(|v| v.issue.number == n).unwrap();
+        let stale = views(&b, &mut HashMap::new(), &mut HashMap::new()).unwrap().0.into_iter().find(|v| v.issue.number == n).unwrap();
         win.pass().unwrap();
         let r = task(&b, n).attempt.unwrap();
         let (labels, comments) = (b.issue(n).unwrap().labels, b.comments(n).unwrap().len());
@@ -1653,7 +1739,7 @@ mod tests {
         let n2 = b.create("B", "", &["taskq".into()]).unwrap();
         s.pass().unwrap();
         assert_eq!((task(&b, n2).state, task(&b, n2).attempt, task(&b, n1).state, e.borrow().len()), (State::Ready, None, State::Doing, 1));
-        assert!(!b.comments(n2).unwrap().iter().any(|c| c.body.starts_with("taskq: spawn")), "no phantom attempt");
+        assert!(!b.comments(n2).unwrap().iter().any(|c| core::head(&c.body).starts_with("taskq: spawn")), "no phantom attempt");
         let cap = s.capacity_json();
         assert_eq!((cap["reasons"][0]["code"].as_str(), cap["reasons"][0]["text"].as_str()), (Some("access"), Some("claude: workspace enforcement unknown for claude on windows")));
         s.refused_access.clear();

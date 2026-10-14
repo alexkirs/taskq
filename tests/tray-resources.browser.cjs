@@ -10,7 +10,7 @@ const html=fs.readFileSync('src/tray.html','utf8')
 const fx=JSON.parse(fs.readFileSync('tests/fixtures/resource-controls.json','utf8'));
 const conflict=fx.cases.find(c=>/conflict/.test(c.name)).groups,over=fx.cases.find(c=>/over-capacity/.test(c.name)).groups[0];
 (async()=>{
-  const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL});
+  const browser=await chromium.launch(require('./browser.cjs')());
   try{
     for(const theme of ['light','dark'])for(const font of [16,20])for(const width of [280,font===20?360:320]){
       const page=await browser.newPage({viewport:{width,height:900},colorScheme:theme});
@@ -18,7 +18,7 @@ const conflict=fx.cases.find(c=>/conflict/.test(c.name)).groups,over=fx.cases.fi
       await page.evaluate(()=>{window.messages=[];window.ipc={postMessage:s=>window.messages.push(JSON.parse(s))};});
       await page.setContent(html);
       const root='p',saved={limits:{claude:2},load_gate:{enabled:true,cpu_max:85,memory_min:10}};
-      const state=r=>({page:root,font,theme,now:1000,projects:[{root,name:'taskq',issues:'',alive:true,age:10,complete:true,focus:[],labels:[],tasks:[],cap_host:'mac',cap_saved:saved,resources:r}],ai:{draft:''}});
+      const state=r=>({page:root,font,theme,now:1000,projects:[{root,name:'taskq',issues:'',alive:true,age:10,complete:true,focus:[],labels:[],tasks:[],cap_host:'mac',cap_saved:saved,resources:r}],ai:{draft:''},notify:{projects:{}}});
       await page.evaluate(s=>taskq.receive(s),state(over));
       await page.locator('summary',{hasText:'Capacity'}).click();
       assert.match(await page.locator('.rsc').innerText(),/3\/1 · over limit/);

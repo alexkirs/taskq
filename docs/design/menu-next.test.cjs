@@ -4,7 +4,7 @@ const path=require('node:path');
 // Evidence PNGs only with --evidence; a plain run writes nothing.
 const ev=(...p)=>process.argv.includes('--evidence')?path.join(__dirname,...p):undefined;
 (async()=>{
- const browser=await chromium.launch({headless:true, channel:'chrome'});const page=await browser.newPage({viewport:{width:1024,height:1050},deviceScaleFactor:1});const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ const browser=await chromium.launch(require('../../tests/browser.cjs')());const page=await browser.newPage({viewport:{width:1024,height:1050},deviceScaleFactor:1});const errors=[];page.on('pageerror',e=>errors.push(e.message));
  await page.goto('file://'+path.join(__dirname,'menu-next-preview.html'));
  const f=page.frameLocator('iframe');await f.locator('#tqnext .menu').first().waitFor();
  const menu=f.locator('[data-layout=menu]');

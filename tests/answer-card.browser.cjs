@@ -6,7 +6,7 @@ const {chromium} = require('playwright');
 const js = fs.readFileSync('src/answer-card.js', 'utf8'), css = fs.readFileSync('src/answer-card.css', 'utf8');
 const fx = JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json', 'utf8'));
 (async () => {
-  const browser = await chromium.launch({channel: process.env.PLAYWRIGHT_CHANNEL});
+  const browser = await chromium.launch(require('./browser.cjs')());
   for (const scheme of ['light', 'dark']) for (const font of [16, 20]) for (const width of [280, 480]) {
     const page = await browser.newPage({viewport: {width, height: 900}, colorScheme: scheme});
     await page.setContent('<!doctype html><meta name="color-scheme" content="light dark"><style>' + css + 'body{margin:8px;font:' + font + 'px/1.4 sans-serif;background:light-dark(#fafbfc,#252b32)}</style><div id="c"></div><script>' + js + '</script>');

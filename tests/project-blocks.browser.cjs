@@ -23,7 +23,7 @@ function geometry(sel){
 }
 function taskLook(sel){const el=document.querySelector(sel),s=getComputedStyle(el);return {display:s.display,padding:s.padding,font:s.fontSize,lineHeight:s.lineHeight,wrap:s.overflowWrap,width:Math.round(el.getBoundingClientRect().width)};}
 (async()=>{
-  const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL||'chrome'}),evidence=[];
+  const browser=await chromium.launch(require('./browser.cjs')()),evidence=[];
   const dir='docs/design/evidence/project-blocks';if(process.argv.includes('--evidence'))fs.mkdirSync(dir,{recursive:true});
   try{
     for(const theme of fx.themes)for(const font of fx.fonts)for(const width of fx.widths)for(const n of fx.counts){
@@ -44,7 +44,7 @@ function taskLook(sel){const el=document.querySelector(sel),s=getComputedStyle(e
             const q=TaskqProjectBlocks,el=document.querySelector('#consumer');el.innerHTML=q.summary(p)+q.aggregate([p])+q.task(p,row);
             el.addEventListener('click',e=>q.handle(e,{project:id=>navigation.push(['project',id]),tasks:(id,s)=>navigation.push(['tasks',id,s]),open:u=>navigation.push(['open',u])}));
           },{p,row:fx.row});
-          if(mode==='tray')await page.evaluate(({p,row,font,theme})=>taskq.receive({page:p.id,font,theme,projects:[{...p,root:p.id,issues:p.board.url,board_kind:p.board.kind,alive:true,focus:[],labels:[],cap_saved:{error:'fixture'},tasks:p.tasks}],ai:{draft:''}}),{p,row:fx.row,font,theme});
+          if(mode==='tray')await page.evaluate(({p,row,font,theme})=>taskq.receive({page:p.id,font,theme,projects:[{...p,root:p.id,issues:p.board.url,board_kind:p.board.kind,alive:true,focus:[],labels:[],cap_saved:{error:'fixture'},tasks:p.tasks}],ai:{draft:''},notify:{projects:{}}}),{p,row:fx.row,font,theme});
           const got=await page.evaluate(look,'.tqp-project');assert.deepEqual(got,want,JSON.stringify(at)+' '+mode+' project equals parent');
           if(mode==='browser'||n)assert.deepEqual(await page.evaluate(taskLook,'.tqp-task'),wantTask,JSON.stringify(at)+' '+mode+' flowing task geometry equals parent');
           const geo=await page.evaluate(geometry,'.tqp-counts');assert.equal(geo.overflow,false,JSON.stringify(at)+' '+mode);
@@ -65,7 +65,7 @@ function taskLook(sel){const el=document.querySelector(sel),s=getComputedStyle(e
         await page.setContent(mode==='tray'?tray:base+'<style>'+css+'</style><div id="consumer" style="font-size:20px"></div><script>'+js+'</script>');
         await page.evaluate(()=>{window.navigation=[];window.messages=[];window.ipc={postMessage:s=>messages.push(JSON.parse(s))};});
         if(mode==='browser')await page.evaluate(({p,row})=>{const el=document.querySelector('#consumer');el.innerHTML=TaskqProjectBlocks.summary(p)+TaskqProjectBlocks.task(p,row);el.addEventListener('click',e=>TaskqProjectBlocks.handle(e,{project:id=>navigation.push(['project',id]),tasks:(id,s)=>navigation.push(['tasks',id,s]),open:u=>navigation.push(['open',u])}));},{p,row});
-        else await page.evaluate(({p,row})=>taskq.receive({page:p.id,font:20,theme:'dark',projects:[{...p,root:p.id,issues:p.board.url,board_kind:'github',alive:true,focus:[],labels:[],tasks:[row],cap_saved:{error:'fixture'}}],ai:{draft:''}}),{p,row});
+        else await page.evaluate(({p,row})=>taskq.receive({page:p.id,font:20,theme:'dark',projects:[{...p,root:p.id,issues:p.board.url,board_kind:'github',alive:true,focus:[],labels:[],tasks:[row],cap_saved:{error:'fixture'}}],ai:{draft:''},notify:{projects:{}}}),{p,row});
         await page.locator('[data-tqp=tasks][data-state=review]').first().click();
         if(mode==='browser')assert.deepEqual(await page.evaluate(()=>navigation),[['tasks',p.id,'review']]);
         else {assert.match(await page.locator('.menu').innerText(),/project-with-a-long-name.* · Review/);assert.equal(await page.locator('.tqp-task').count(),1);}
@@ -86,7 +86,7 @@ function taskLook(sel){const el=document.querySelector(sel),s=getComputedStyle(e
       const page=await browser.newPage({viewport:{width:320,height:1800},colorScheme:theme});
       try{
         await page.setContent(mode==='tray'?tray:base+'<style>'+css+'</style><script>'+js+'</script>');
-        if(mode==='tray')await page.evaluate(theme=>taskq.receive({page:'none',font:20,theme,projects:[],ai:{draft:''}}),theme);
+        if(mode==='tray')await page.evaluate(theme=>taskq.receive({page:'none',font:20,theme,projects:[],ai:{draft:''},notify:{projects:{}}}),theme);
         const marks=await page.evaluate(()=>{
           const q=TaskqProjectBlocks,p=k=>({id:k,name:k,board:{kind:k,url:'https://'+k+'.example/o/r/issues'},complete:true,closed:0,tasks:[]});
           const el=document.createElement('div');el.id='providers';el.style.cssText='font-size:20px;padding:8px;background:'+getComputedStyle(document.body).backgroundColor;document.body.prepend(el);

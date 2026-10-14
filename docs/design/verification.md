@@ -80,7 +80,7 @@
 - MP1–MP9 record accepted direction; I6 specifies common square composition with native Windows/macOS metrics. E1–E5 propose required emergency stop and explicit recovery; runtime authority is unchanged pending model amendments.
 - Reviewed 4.1.10 source (`71bc0bf`): `src/tray.rs` still gates full view with `!cfg!(windows)` and keeps the wide renderer. Earlier 4.1.9 audit remains version-specific.
 - Microsoft NOTIFYICONDATAW guidance inspected: incorrect-size notification icons may be scaled; supply native sizes and qualify Shell output. Browser simulations do not qualify Windows.
-- `menu-next.test.cjs`: stop/recovery guard, selected-task restart review, scope snapshot, page errors and narrow 20px overflow checks. Chrome headless via Playwright; bundled browser absent, installed Chrome used.
+- `menu-next.test.cjs`: stop/recovery guard, selected-task restart review, scope snapshot, page errors and narrow 20px overflow checks. Playwright chromium headless shell.
 - Inspected light recovery, dark workspace review and narrow dark 20px captures in `evidence/menu-next/`. Fixed stacked icon labels, theme repaint and partial-recovery status after inspection.
 - Two placement alternatives extend the existing package; they do not replace the full feature ledger. File chips hold metadata only; scope uses an explicit fixture; dialogs/windows, access grants, native stop/restart and service readback are simulated.
 - Shared-rule review: F1–F6 already cover source ownership, cross-platform rendering, truthful states and acceptance. No new universal emergency lifecycle rule added; fencing/interlocks belong to TaskQ until a reusable contract is demonstrated.
@@ -127,7 +127,7 @@ The HTML uses English and a small state/action bridge target instead of OpenAI w
 ## Checks for this package
 
 Run `cargo test --locked`, `cargo run -- selftest`, and `git diff --check` before handoff.
-The prototype tests (`node docs/design/<name>.test.cjs`, Playwright with the installed Chrome, `PLAYWRIGHT_CHANNEL=chrome` where the test does not set it) are development instruments per R12: run one when its prototype changes; they are not a handoff gate.
+The prototype tests (`node docs/design/<name>.test.cjs`, Playwright's chromium headless shell through `tests/browser.cjs`; `PLAYWRIGHT_CHANNEL` outside a worker only) are development instruments per R12: run one when its prototype changes; they are not a handoff gate.
 Cargo checks establish current-product regression evidence, not implementation of the target menu.
 
 Observed for this package: both Node commands pass (19 menu fixture checks; icon model, render and pause checks).

@@ -1452,7 +1452,7 @@ mod tests {
         let (em, ew): (Exits, Exits) = Default::default();
         let (mut mac, mut win) = (service(&b, &cm, em.clone()), service(&b, &cw, ew.clone()));
         // mac reads the task in review before win's spawn lands: both hosts post a reviewer spawn for one result
-        let stale = views(&b, &mut HashMap::new(), &mut DepCache::new()).unwrap().0.into_iter().find(|v| v.issue.number == n).unwrap();
+        let stale = views(&b, &mut HashMap::new(), &mut HashMap::new()).unwrap().0.into_iter().find(|v| v.issue.number == n).unwrap();
         win.pass().unwrap();
         let r = task(&b, n).attempt.unwrap();
         let (labels, comments) = (b.issue(n).unwrap().labels, b.comments(n).unwrap().len());

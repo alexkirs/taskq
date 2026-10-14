@@ -21,7 +21,7 @@ Required capability approved. E1–E5 describe the mechanism; [taskq.md](../../t
 
 ## E3 Recovery
 
-1. Keep the host held. Read current board, service, process/session identities, leases, workspace status and last operation receipts. Never infer success from an old screenshot or request acknowledgement.
+1. Keep the host held. Read current board, service, process/session identities, leases, workspace status and last operation receipts. Success needs readback per [specq verification](https://github.com/taskqorg/specq/blob/main/engineering/verification.md).
 2. Show one row per interrupted attempt: task, runtime/host, confirmed stopped or unknown, preserved work, last known action and blocker. Unknown remains unselected and disabled for relaunch.
 3. Retire/fence the previous attempt through the board model. Reject late output; prove no live old process before creating a new attempt. Do not replay external operations with uncertain outcomes.
 4. Offer Inspect, Keep held, or Restart from preserved work for eligible rows. Default is Keep held. Same-session continuation is only available when the adapter proves it can bind the new fenced attempt safely; otherwise use a new session with preserved artifacts.

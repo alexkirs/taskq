@@ -30,6 +30,8 @@ pub struct Config {
 }
 
 pub const HOST_LABEL: &str = "taskq-host";
+/// The capacity reason of an empty focus (§ 4).
+pub const FOCUS_OFF: &str = "focus off: nothing admitted; set `taskq service focus all|<label..>`";
 pub const TASK_LABEL: &str = "taskq";
 
 /// Only issues labelled `taskq` are tasks (§ 1): a user issue never starts by itself.
@@ -159,6 +161,8 @@ pub struct Service<'a> {
     pub instance: String,
     /// Labels from `<root>/.taskq/focus`; empty: admit nothing, `all`: any task; `p0` passes any non-empty focus (§ 4).
     pub focus: Vec<String>,
+    /// Why `focus` could not be read; it then admits nothing (§ 4 Data).
+    pub focus_error: Option<String>,
     /// The last inbox id handed to each attempt's child.
     delivered: HashMap<u64, u64>,
     cache: HashMap<u64, (i64, Vec<Comment>)>,
@@ -421,7 +425,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, unknown: HashMap::new() }
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, unknown: HashMap::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -496,6 +500,10 @@ impl<'a> Service<'a> {
             gate = if code == "host" { "unknown" } else if gate == "open" { "held" } else { gate };
             reasons.push((code, text));
         }
+        // § 4 Focus: an empty focus admits nothing, so it is a reason like any refusal (#974)
+        if self.focus.is_empty() {
+            reasons.push(("focus", self.focus_error.clone().unwrap_or_else(|| FOCUS_OFF.into())));
+        }
         let res = |r: &Res, state: &str| json!({"task": r.0, "attempt": r.1, "rt": r.2, "state": state});
         let reservations: Vec<Value> = self.kids.iter().map(|k| res(&(k.task, k.attempt, k.rt.clone()), "held"))
             .chain(self.reserved.iter().map(|r| res(r, "held"))).chain(self.requested.iter().map(|r| res(r, "requested"))).collect();
@@ -533,6 +541,9 @@ impl<'a> Service<'a> {
         let mut lines = vec![format!("version {}", self.version)];
         if !self.instance.is_empty() {
             lines.push(format!("service {}", self.instance));
+        }
+        if self.focus.is_empty() {
+            lines.push(format!("focus {}", if self.focus_error.is_some() { "unknown" } else { "off" }));
         }
         let kids: BTreeSet<_> = self.kids.iter().map(|k| (k.task, k.attempt)).chain(self.pending.iter().copied()).collect();
         lines.extend(kids.iter().map(|(t, a)| format!("#{t} {a}")));
@@ -1449,6 +1460,31 @@ mod tests {
         let mut s = service(&b, &w, Default::default());
         s.pass().unwrap();
         assert_eq!(task(&b, win).state, State::Doing);
+    }
+
+    // Chain: § 4 empty focus (#974). Risk: a host with free slots admits nothing and says nowhere why.
+    #[test]
+    fn empty_focus_is_a_capacity_reason_and_shows_in_hosts() {
+        let b = Fake::default();
+        let t = b.create("T", "", &["taskq".into()]).unwrap();
+        let c = cfg("mac");
+        let mut s = service(&b, &c, Default::default());
+        s.focus.clear();
+        s.pass().unwrap();
+        s.pass().unwrap();
+        assert_eq!(task(&b, t).state, State::Ready);
+        let focus = |s: &Service| s.capacity_json()["reasons"].as_array().unwrap().iter().find(|r| r["code"] == "focus").map(|r| r["text"].as_str().unwrap().to_string());
+        assert_eq!(focus(&s).as_deref(), Some(FOCUS_OFF));
+        let text = s.snapshot.as_ref().unwrap().text(&c, &Value::Null).unwrap();
+        assert!(text.contains("Hosts: mac v4.0.0 ") && text.ends_with(" focus off"), "{text}");
+        s.focus_error = Some("focus: not UTF-8 text; file kept".into());
+        assert_eq!(focus(&s).as_deref(), s.focus_error.as_deref(), "an unreadable focus names its own reason");
+        s.focus_error = None;
+        s.focus = vec!["all".into()];
+        s.pass().unwrap();
+        s.pass().unwrap();
+        assert_eq!((focus(&s), task(&b, t).state), (None, State::Doing));
+        assert!(!s.snapshot.as_ref().unwrap().text(&c, &Value::Null).unwrap().contains("focus"));
     }
 
     // Chain: § 8 codex-app admission. Risk: codex-app runs an unlabelled task.

@@ -545,6 +545,7 @@ fn service_run(c: &Ctx) -> Res<()> {
             focus_error = focus.as_ref().err().cloned();
         }
         s.focus = focus.unwrap_or_default();
+        s.focus_error = focus_error.clone();
         let r = s.pass();
         s.sync_host();
         for l in s.log.drain(..) {
@@ -944,6 +945,16 @@ fn set_focus(root: &Path, f: &str, request: Option<&str>) -> Res<()> {
     Ok(())
 }
 
+/// Install (§ 4 Focus): a missing focus becomes the explicit default `off`; any other stays. True when it reads off.
+fn install_focus(root: &Path) -> Res<bool> {
+    let d = dot(root);
+    if !d.join("focus").exists() {
+        fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+        fs::write(d.join("focus"), "off").map_err(|e| e.to_string())?;
+    }
+    Ok(data::focus(root).is_ok_and(|f| f.is_empty()))
+}
+
 /// Pause (§ 4): keep the focus in `focus.paused`, admit nothing.
 fn pause(root: &Path) -> Res<()> {
     let d = dot(root);
@@ -1152,6 +1163,7 @@ fn service(args: &Args) -> Res<()> {
                 return Ok(());
             }
             if sub == "install" {
+                let off = install_focus(&root)?;
                 platform::install_self(&platform::tool(&cfg.install))?;
                 platform::write_unit(&u)?;
                 let handover = load_unit(&u, &root)?;
@@ -1161,6 +1173,9 @@ fn service(args: &Args) -> Res<()> {
                     fs::write(&projects, all.join("\n") + "\n").map_err(|e| e.to_string())?;
                 }
                 println!("installed {}{}", u.path.display(), if handover { "; live children kept: the running service re-execs" } else { "" });
+                if off {
+                    println!("Focus: off; nothing admitted until `taskq service focus all|<label..>`");
+                }
             } else {
                 uninstall_unit(&u, &root, &projects)?;
                 println!("removed {}", u.path.display());
@@ -1979,6 +1994,20 @@ mod tests {
         assert!(service_fields(&root).contains("Focus: unknown (focus: not UTF-8 text; file kept)"));
         fs::write(&st, "{").unwrap();
         assert!(service_fields(&root).contains("Status: unknown (status.json: corrupt"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Chain: § 4 Focus default after install (#974). Risk: a fresh install admits all, or overwrites the owner's focus.
+    #[test]
+    fn install_writes_focus_off_only_when_missing() {
+        let root = std::env::temp_dir().join(format!("taskq-install-focus-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(install_focus(&root), Ok(true));
+        assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
+        assert!(service_fields(&root).contains("Focus: off"));
+        fs::write(dot(&root).join("focus"), "area-maps").unwrap();
+        assert_eq!(install_focus(&root), Ok(false));
+        assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "area-maps");
         let _ = fs::remove_dir_all(&root);
     }
 

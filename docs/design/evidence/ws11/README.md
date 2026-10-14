@@ -35,6 +35,20 @@ Windows: Not tested (no Windows run for this slice).
 - Geometry: every route in the normal fixture fits without a primary scrollbar; only the Project page reaches the 909 pt clamp, and scrolling to its footer was not driven natively (U-A2 Not tested for overflow). Light and dark heights match per route.
 - Runtime: native snapshot run completed for 40 popover images per fixture; native click-through of Back and footer was not driven (Not tested natively; covered by the model check).
 
+## Live macOS menu bar (G8, #1060)
+
+Owner decision 1060.3: U-A3, U-A4, U-A7 and U-A8 are Not tested natively for 4.2.0. `tray --snapshot` covers the 16/20 px route images only.
+
+| Requirement | Live check | Result |
+|---|---|---|
+| U-A3 | popover anchored under the menu-bar icon, usable-area clamp, notched display | Not tested |
+| U-A4 | pinned and unpinned popover, pin drag, focus and Back position | Not tested |
+| U-A7 | live menu-bar icon at natural size | Not tested |
+| U-A8 | keyboard-only walk of every route, VoiceOver names, 14 and 18 px | Not tested |
+| External or 1x display | none attached; the Mac has one notched Retina display | Not tested |
+
+Blocker (TCC): a taskq Claude worker on the Mac cannot capture or drive the screen, even after the owner granted Screen Recording and Accessibility and restarted the service. In a fresh worker, `screencapture -x` fails with `could not create image from display`, and `osascript` to System Events fails with `A privilege violation occurred. (-10004)`. The owner still gets the Screen Recording prompt after granting taskq. The root cause goes to a separate bug task.
+
 ## Findings
 
 | ID | Requirement | Expected | Observed | Reproduction | Severity | Disposition |

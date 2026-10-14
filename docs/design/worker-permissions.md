@@ -6,6 +6,23 @@ P1–P4 and the P7.6 rollback floor are implemented (#970) as taskq.md R9 and §
 Shared candidate: [permission authority](https://github.com/taskqorg/specq/blob/main/engineering/permission-authority.md).
 Applies to workers, reviewers and the full operator (R3/R9); tools remain bounded by effective runtime permissions and the owner request.
 
+## Shipped enforcement
+
+Moved from taskq.md § 8 Access, which keeps presets, authority and refusal rules.
+
+- macOS wraps the child in a taskq Seatbelt profile; Codex's own `read-only`/`workspace-write` cannot nest, so legacy Codex keeps it (only one sandbox choice, model, network access and added dirs; none of them nor the root above `<install>`) and a preset runs `danger-full-access` inside taskq's profile.
+- Linux Codex Restricted/Workspace uses the root-owned `taskq-sandbox` launcher and private bubblewrap backend ([setup and boundary](linux-sandbox.md)); the outer process boundary and native read-only/workspace-write both remain enabled, never Full. Linux protects active runtime configuration and the project `.codex` directory; its explicit project grant is required.
+- Windows Codex Workspace requires an explicit project grant and the pinned native candidate ([qualification matrix](../runtime-qualification.md)); its whole-process token and native workspace-write remain enabled. Sandbox control state stays under the protected installation, separate from the active runtime home; system-trust TLS uses Windows verification.
+
+## Rollback floor
+
+Older versions (4.1.11) ignore grants, run legacy flags and their update sweep deletes the store; this is why taskq.md § 8 Access holds `previous` at the floor `4.2.0-dev`.
+A manual downgrade below the floor is the operator's and runs legacy flags. To keep grants, copy the store outside `<install>` and stop unless the copy matches; coming back, `service pause` each project, `taskq update` (the old version sweeps on it), copy the store back and `service resume` only after `service permissions` reads the grants back.
+
+## macOS signing identity
+
+Moved from taskq.md § 8 step 5 (#1089). TCC keys an ad-hoc Screen Recording or Accessibility grant to the cdhash, which changes with every release. With the identity `TaskQ Local Signing` (a self-signed code-signing certificate in the login keychain, no trust setting) `service install` and an update re-sign the launcher and the new release as `org.taskq.taskq` through a copy renamed into place, the tray signs `TaskQ.app` with it, so one grant matches every later release (identifier and certificate leaf, verified after each signature). Without it they stay ad-hoc and the log says so; a failed signature or verification is logged per copy, which stays ad-hoc.
+
 ## Evidence and #865
 
 - Inspected checkout: `cfae06708776d252d52f31510afed6b47918cee6`. `src/runtime.rs::command` passes project `permission_mode` to Claude and project `codex` arguments to spawn/resume. `src/main.rs` defaults to `dontAsk` / `danger-full-access`. No independent host ceiling.

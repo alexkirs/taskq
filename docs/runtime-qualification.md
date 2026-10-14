@@ -64,6 +64,10 @@ Prior live records: [#961](https://github.com/taskqorg/taskq/issues/961), [#965]
 
 The shipped access presets in taskq.md § 8 supersede the earlier permission proposal: macOS enforces a TaskQ Seatbelt profile, while Windows/Linux currently require an explicit Full grant; missing grants or unknown restricted enforcement refuse launch. Full has no OS containment. Earlier passes below qualify their recorded candidate and permission configuration, not a later policy revision. No prompt, project configuration or 0600 file is claimed as an immutable host ceiling. No new grant broker, background monitor or duplicate test framework is introduced by this matrix.
 
+## Codex app environment
+
+Moved from taskq.md § 8 codex-app environment. The app turn's network comes from the project root's owner-provisioned `.codex/config.toml` permissions, not from the handshake's `-s`/`-c`; qualified live on macOS in #952 (keyring token, no device login; with the token hidden the turn sent a worker `ask`, despite gh suggesting `gh auth login`). Other OSes stay unqualified until their own live app turn.
+
 ## Operator qualification command
 
 Run once per changed native integration, from the candidate checkout:

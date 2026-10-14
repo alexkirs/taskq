@@ -75,10 +75,18 @@ fn measure_at<T, E: std::fmt::Display>(path: Option<&Path>, detailed: bool, op: 
     result
 }
 
-pub fn log_lock(path: &Path) -> std::io::Result<fs::File> {
+pub struct LogLock(fs::File);
+impl Drop for LogLock {
+    fn drop(&mut self) {
+        // A child can inherit the descriptor on Unix; close alone can leave its lock held.
+        let _ = self.0.unlock();
+    }
+}
+
+pub fn log_lock(path: &Path) -> std::io::Result<LogLock> {
     let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path.parent().unwrap().join("taskq-profile.lock"))?;
     lock.try_lock().map_err(std::io::Error::other)?;
-    Ok(lock)
+    Ok(LogLock(lock))
 }
 
 fn append(path: &Path, r: &Record) -> std::io::Result<()> {

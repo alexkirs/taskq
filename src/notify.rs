@@ -4,12 +4,16 @@
 //! macOS adapter posts through UNUserNotificationCenter, which needs the `<install>/TaskQ.app` bundle.
 
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 pub const KINDS: [&str; 4] = ["ask", "close", "failed", "gone"];
 /// Off, Silent (menu badge only), Banner, Banner with sound.
 pub const MODES: [&str; 4] = ["off", "silent", "banner", "sound"];
-/// More than this many banners of one project in one tick become one summary (M14).
+/// More than `BURST` banners of one project within `WINDOW` seconds become one summary (M14).
 const BURST: usize = 3;
+const WINDOW: i64 = 10;
+/// Per project: the start of its burst window and the kinds shown in it (tray memory, not `tray.json`).
+pub type Bursts = HashMap<String, (i64, Vec<String>)>;
 
 pub fn default(kind: &str) -> &'static str {
     match kind {
@@ -61,7 +65,7 @@ pub fn wants_banner(n: &Value, roots: &[String]) -> bool {
     KINDS.iter().any(|k| ["banner", "sound"].contains(&host(n, k)) || roots.iter().any(|r| ["banner", "sound"].contains(&mode(n, r, k))))
 }
 
-/// One OS notification. `n` is None for a burst summary (a click opens the project).
+/// One OS notification. `n` is None for a burst summary (a click opens the project). `id` carries what a click needs.
 #[derive(Debug, PartialEq)]
 pub struct Post {
     pub root: String,
@@ -85,8 +89,9 @@ pub fn label(kind: &str) -> &'static str {
 
 /// Events of the tray's projects (`root`, `name`, `tasks`, `events` lines `[time, kind, attempt, n]`) after each
 /// project's cursor, as posts; the cursor moves past every handled line, Off and Silent included. A project seen for
-/// the first time starts at `now`: older events never notify.
-pub fn due(n: &mut Value, ps: &[Value], now: i64) -> Vec<Post> {
+/// the first time starts at `now`: older events never notify. From the 4th banner within 10 s of a project's first
+/// one, the window posts one summary under one identifier, which the OS replaces as it grows.
+pub fn due(n: &mut Value, ps: &[Value], now: i64, bursts: &mut Bursts) -> Vec<Post> {
     if !n.is_object() {
         *n = json!({});
     }
@@ -115,17 +120,22 @@ pub fn due(n: &mut Value, ps: &[Value], now: i64) -> Vec<Post> {
             let m = mode(n, root, e[1].as_str()?);
             ["banner", "sound"].contains(&m).then_some((*e, m))
         }).collect();
+        if shown.is_empty() {
+            continue;
+        }
         let sound = shown.iter().any(|(_, m)| *m == "sound");
-        // ponytail: a burst is one tick (2 s) of one project, not a sliding 10 s window; one events pass lands in one tick
-        if shown.len() > BURST {
-            let mut counts: Vec<String> = vec![];
-            for k in KINDS {
-                let c = shown.iter().filter(|(e, _)| e[1] == k).count();
-                if c > 0 {
-                    counts.push(format!("{c} {}", label(k).to_lowercase()));
-                }
-            }
-            out.push(Post { root: root.into(), n: None, title: format!("{name} · {} events", shown.len()), body: counts.join(", "), sound, id: json!({"root": root, "e": line(last), "sum": true}).to_string() });
+        // ponytail: fixed 10 s window from its first banner, not sliding; a sliding one if bursts straddle windows
+        let w = bursts.entry(root.into()).or_insert((now, vec![]));
+        if now - w.0 >= WINDOW {
+            *w = (now, vec![]);
+        }
+        w.1.extend(shown.iter().filter_map(|(e, _)| e[1].as_str().map(String::from)));
+        if w.1.len() > BURST {
+            let counts: Vec<String> = KINDS.iter().filter_map(|k| {
+                let c = w.1.iter().filter(|x| x == k).count();
+                (c > 0).then(|| format!("{c} {}", label(k).to_lowercase()))
+            }).collect();
+            out.push(Post { root: root.into(), n: None, title: format!("{name} · {} events", w.1.len()), body: counts.join(", "), sound, id: json!({"root": root, "sum": w.0}).to_string() });
             continue;
         }
         for (e, m) in shown {
@@ -136,7 +146,7 @@ pub fn due(n: &mut Value, ps: &[Value], now: i64) -> Vec<Post> {
                 (Some(x), None) => format!("#{x}"),
                 _ => String::new(),
             };
-            out.push(Post { root: root.into(), n: num, title: format!("{name} · {}", label(e[1].as_str().unwrap_or(""))), body, sound: m == "sound", id: json!({"root": root, "n": num, "e": line(e)}).to_string() });
+            out.push(Post { root: root.into(), n: num, title: format!("{name} · {}", label(e[1].as_str().unwrap_or(""))), body, sound: m == "sound", id: json!({"root": root, "n": num, "k": e[1], "t": title, "e": line(e)}).to_string() });
         }
     }
     out
@@ -310,23 +320,23 @@ mod tests {
     fn cursor_once_per_event_across_restart() {
         let old = json!([[100, "ask", "5", 7]]);
         let mut n = json!(null);
-        assert!(due(&mut n, &[proj(old.clone())], 150).is_empty(), "first start: history never notifies");
+        assert!(due(&mut n, &[proj(old.clone())], 150, &mut Bursts::new()).is_empty(), "first start: history never notifies");
         let ev = json!([[100, "ask", "5", 7], [200, "failed", "6", 7], [200, "close", "6", 8]]);
-        let p = due(&mut n, &[proj(ev.clone())], 210);
+        let p = due(&mut n, &[proj(ev.clone())], 210, &mut Bursts::new());
         assert_eq!(p.len(), 1, "close is off by default");
         assert_eq!((p[0].title.as_str(), p[0].body.as_str(), p[0].n, p[0].sound), ("p · Failed", "#7 Fix it", Some(7), false));
         // a restart reloads the saved value: nothing again
         let mut saved: Value = serde_json::from_str(&n.to_string()).unwrap();
-        assert!(due(&mut saved, &[proj(ev)], 220).is_empty());
+        assert!(due(&mut saved, &[proj(ev)], 220, &mut Bursts::new()).is_empty());
         // the cursor line trimmed away: later times only
         let ev = json!([[200, "close", "6", 8], [300, "ask", "9", 7]]);
-        let p = due(&mut saved, &[proj(ev)], 310);
+        let p = due(&mut saved, &[proj(ev)], 310, &mut Bursts::new());
         assert_eq!((p.len(), p[0].sound), (1, true));
         // silent and off still move the cursor
         set(&mut saved, &json!({"kind": "ask", "value": "silent"}));
-        assert!(due(&mut saved, &[proj(json!([[300, "ask", "9", 7], [400, "ask", "10", 7]]))], 410).is_empty());
+        assert!(due(&mut saved, &[proj(json!([[300, "ask", "9", 7], [400, "ask", "10", 7]]))], 410, &mut Bursts::new()).is_empty());
         set(&mut saved, &json!({"kind": "ask", "value": "banner"}));
-        assert!(due(&mut saved, &[proj(json!([[300, "ask", "9", 7], [400, "ask", "10", 7]]))], 420).is_empty());
+        assert!(due(&mut saved, &[proj(json!([[300, "ask", "9", 7], [400, "ask", "10", 7]]))], 420, &mut Bursts::new()).is_empty());
     }
 
     // Chain: M14 burst. Risk: a busy pass floods the screen.
@@ -334,10 +344,23 @@ mod tests {
     fn burst_becomes_one_summary() {
         let mut n = json!({"cursor": {"/p": "0"}});
         let ev = json!([[10, "failed", "1", 1], [10, "failed", "2", 2], [10, "ask", "3", 3], [10, "gone", "4", 4], [10, "close", "5", 5]]);
-        let p = due(&mut n, &[proj(ev)], 20);
+        let p = due(&mut n, &[proj(ev)], 20, &mut Bursts::new());
         assert_eq!(p.len(), 1);
         assert_eq!((p[0].title.as_str(), p[0].body.as_str(), p[0].n, p[0].sound), ("p · 4 events", "1 question, 2 failed, 1 attempt gone", None, true));
         let mut n = json!({"cursor": {"/p": "0"}});
-        assert_eq!(due(&mut n, &[proj(json!([[10, "failed", "1", 1], [10, "failed", "2", 2], [10, "ask", "3", 3]]))], 20).len(), 3, "three stay single");
+        assert_eq!(due(&mut n, &[proj(json!([[10, "failed", "1", 1], [10, "failed", "2", 2], [10, "ask", "3", 3]]))], 20, &mut Bursts::new()).len(), 3, "three stay single");
+        // spread over ticks: the 4th banner within 10 s turns the window into one summary, replaced as it grows
+        let (mut n, mut b) = (json!({"cursor": {"/p": "0"}}), Bursts::new());
+        let mut ev = vec![];
+        let mut tick = |t: i64, e: Value| { ev.push(e); due(&mut n, &[proj(json!(ev))], t, &mut b) };
+        for t in [100, 102, 104] {
+            assert_eq!(tick(t, json!([t, "failed", t.to_string(), 7]))[0].n, Some(7));
+        }
+        let s1 = tick(106, json!([106, "gone", "106", 7]));
+        assert_eq!((s1.len(), s1[0].title.as_str(), s1[0].body.as_str()), (1, "p · 4 events", "3 failed, 1 attempt gone"));
+        let s2 = tick(109, json!([109, "ask", "109", 7]));
+        assert_eq!((s2[0].title.as_str(), &s2[0].id), ("p · 5 events", &s1[0].id), "same identifier: the OS replaces it");
+        let p = tick(110, json!([110, "failed", "110", 7]));
+        assert_eq!((p.len(), p[0].n), (1, Some(7)), "a new window after 10 s");
     }
 }

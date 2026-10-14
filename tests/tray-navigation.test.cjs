@@ -41,5 +41,13 @@ assert(h.includes('data-kind="ask" data-v="sound" aria-pressed="true"'));
 context.S.notify.status='allowed';h=run('routeBody()');assert(!h.includes('notify-os'));assert(!/notify-test[^>]*disabled/.test(h));
 h=run("notifyGroup({root:'/p'})");
 assert(h.includes('data-kind="close" data-root="/p" data-v="banner" aria-pressed="true"'));assert(h.includes('data-kind="ask" data-root="/p" data-v="inherit" aria-pressed="true"'));
-console.log('PASS M14 notification settings, OS block and project override');
+// M14 click on a closed task: no open row, so the project page shows its card from the notification until navigation
+run(html.slice(html.indexOf('// a notification click'),html.indexOf('function project(p){')));
+Object.assign(context,{TaskqProjectBlocks:require('../src/project-blocks.js'),CSS:{escape:s=>s},blockProject:p=>({name:p.name,board:{kind:'github',url:p.issues}}),
+  S:{projects:[{root:'/p',name:'p',issues:'https://x/issues',tasks:[]}]}});
+run("page='home';openCard({root:'/p',n:8,kind:'close',title:'Ship it'})");
+assert.equal(context.page,'/p');h=run("notedCard(S.projects[0])");
+assert(h.includes('data-card="https://x/issues/8"'));assert(h.includes('Closed'));assert(h.includes('Ship it'));assert(h.includes('href="https://x/issues/8"'));
+run("navigate('home')");assert.equal(run("notedCard(S.projects[0])"),'');
+console.log('PASS M14 notification settings, OS block, project override and closed-task card');
 console.log('PASS WS11 nested Back, filter/scroll/disclosure restoration, settings categories, unknown probes/versions and maintenance destinations');

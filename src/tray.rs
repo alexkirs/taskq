@@ -558,6 +558,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
     let mut adding = Value::Null;
     let mut moved = false;
     let mut asked = false;
+    let mut bursts = notify::Bursts::new();
     event_loop.run(move |event, target, flow| {
         *flow = ControlFlow::Wait;
         let push = |ui: &Option<(Window, WebView)>, st: &Value| {
@@ -658,7 +659,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 }
                 let st = state(&install, &settings, dark, None, &adding);
                 refresh_icon(&tray, &st, &settings, dark, &mut icon_sig);
-                notes(&install, &mut settings, &st, &mut asked);
+                notes(&install, &mut settings, &st, &mut asked, &mut bursts);
                 let sig = st.to_string().replace(&format!("\"now\":{}", st["now"]), "");
                 if sig != shown {
                     shown = sig;
@@ -694,7 +695,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 w.set_visible(true);
                 w.set_focus();
                 if id["root"].is_string() {
-                    push(&ui, &json!({"open": {"root": id["root"], "n": id["n"]}}));
+                    push(&ui, &json!({"open": {"root": id["root"], "n": id["n"], "kind": id["k"], "title": id["t"]}}));
                 }
             }
             Event::UserEvent(Ev::Ipc(m)) => {
@@ -749,7 +750,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                     "notify" => {
                         if notify::set(&mut settings.notify, &m) {
                             settings.save(&install);
-                            notes(&install, &mut settings, &Value::Null, &mut asked);
+                            notes(&install, &mut settings, &Value::Null, &mut asked, &mut bursts);
                         }
                         push(&ui, &state(&install, &settings, dark, None, &adding));
                     }
@@ -935,14 +936,14 @@ fn notify_state(n: &Value, ps: &[Value]) -> Value {
 
 /// One tick of notifications (M14): the first banner setting asks the OS once; new events move the cursor, which is
 /// saved before anything posts (a crash loses a notification, never repeats one); only an allowed OS posts.
-fn notes(install: &Path, s: &mut Settings, st: &Value, asked: &mut bool) {
+fn notes(install: &Path, s: &mut Settings, st: &Value, asked: &mut bool, bursts: &mut notify::Bursts) {
     if !*asked && notify::status() == "not asked" && notify::wants_banner(&s.notify, &roots(install)) {
         *asked = true;
         notify::request();
     }
     let Some(ps) = st["projects"].as_array() else { return };
     let before = s.notify.clone();
-    let posts = notify::due(&mut s.notify, ps, now());
+    let posts = notify::due(&mut s.notify, ps, now(), bursts);
     if s.notify != before && !s.save(install) {
         s.notify = before;
         return;
@@ -1718,7 +1719,7 @@ mod tests {
         s.notify = json!({"kinds": {"ask": "loud"}, "cursor": {"/p": "100 #7 ask 5"}});
         let st = json!({"projects": [{"root": "/p", "name": "p", "tasks": [], "events": [[100, "ask", "5", 7], [200, "failed", "6", 7]]}]});
         let mut asked = true;
-        notes(&install, &mut s, &st, &mut asked);
+        notes(&install, &mut s, &st, &mut asked, &mut notify::Bursts::new());
         let r = Settings::load(&install);
         assert_eq!((r.notify["cursor"]["/p"].as_str(), r.notify["kinds"]["ask"].as_str()), (Some("200 #7 failed 6"), Some("loud")), "cursor saved before any post");
         let area = (0, 25, 1512, 900);

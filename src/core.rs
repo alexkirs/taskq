@@ -101,6 +101,37 @@ pub fn limit_text(n: u64, t: &Task, kind: &str, text: &str) -> String {
     reason.filter(|s| !s.trim().is_empty()).chain(card).collect::<Vec<_>>().join("\n")
 }
 
+/// A service entry folded under details (§ 2): its first line becomes the summary, the rest the hidden body.
+pub fn collapse(body: &str) -> String {
+    let (head, rest) = body.split_once('\n').unwrap_or((body, ""));
+    format!("<details><summary>{head}</summary>\n\n{rest}\n</details>")
+}
+
+/// The first line and the text of an entry, plain or folded under details (§ 2).
+fn split(body: &str) -> (&str, &str) {
+    if let Some(rest) = body.trim_start().strip_prefix("<details><summary>")
+        && let Some((head, text)) = rest.split_once("</summary>")
+        && head.trim_start().starts_with("taskq:")
+    {
+        let text = text.trim_end();
+        return (head, text.strip_suffix("</details>").unwrap_or(text).trim());
+    }
+    body.split_once('\n').unwrap_or((body, ""))
+}
+
+/// An entry in its plain form: a folded one unfolds to its summary line and text (§ 2).
+pub fn plain(body: &str) -> String {
+    match split(body) {
+        (head, "") => head.trim().to_string(),
+        (head, text) => format!("{}\n{text}", head.trim()),
+    }
+}
+
+/// The first line of an entry, plain or folded (§ 2).
+pub fn head(body: &str) -> &str {
+    split(body).0.trim()
+}
+
 /// Appends the optional § 2 fields to an entry body: `op-id`, then `revision` (written only with an op id).
 pub fn with_fields(body: String, op: Option<&str>, revision: Option<u64>) -> String {
     match (op, revision) {
@@ -191,7 +222,7 @@ struct Line<'a> {
 /// The first line of a log entry of task `n`; `taskq answer K|N.K` (the CLI form) counts as `taskq: answer K`, any other
 /// comment as a bare answer that `pick` resolves against the open card.
 fn parse(n: u64, body: &str) -> Option<Line<'_>> {
-    let (head, text) = body.split_once('\n').unwrap_or((body, ""));
+    let (head, text) = split(body);
     let (text, op) = fields(text);
     if let Some(arg) = head.trim().strip_prefix("taskq answer ") {
         let k = match arg.trim().split_once('.') {
@@ -258,8 +289,13 @@ fn pick(card: &str, s: &str) -> Option<usize> {
 /// first line; never empty.
 pub fn delivery(n: u64, entries: &[Entry], id: u64) -> String {
     let Some(e) = entries.iter().find(|e| e.id == id) else { return String::new() };
-    let head = e.body.split_once('\n').map_or(e.body.as_str(), |h| h.0);
-    let text = parse(n, &e.body).map_or("", |l| l.text);
+    let head = self::head(&e.body);
+    let line = parse(n, &e.body);
+    let text = line.as_ref().map_or("", |l| l.text);
+    // a result resumes the parked reviewer (§ 2 rounds): it needs the SHA as well as the verdict
+    if let Some(l) = line.as_ref().filter(|l| l.kind == "result") {
+        return format!("New result {}:\n{text}", l.args.first().unwrap_or(&"")).trim_end().to_string();
+    }
     if !text.is_empty() {
         return text.to_string();
     }
@@ -283,6 +319,14 @@ fn end(t: &mut Task) {
     t.role = None;
     t.session = None;
     t.inbox.clear();
+}
+
+/// Makes attempt `a` of `role` in `session` live again with entry `id` undelivered in its inbox (§ 2 rounds).
+fn resume_session(t: &mut Task, a: u64, role: &str, session: String, id: u64) {
+    t.attempt = Some(a);
+    t.role = Some(role.to_string());
+    t.session = Some(session);
+    t.inbox = vec![id];
 }
 
 fn ready(t: &mut Task) {
@@ -320,6 +364,7 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64) {
     let mut t = Task::default();
     let mut resume = None; // the state an `ask` entry left; None when a retry limit asked
     let mut free = vec![];
+    let mut rounds = Rounds::default();
     let (mut ops, mut card_at, mut last) = (std::collections::HashSet::new(), None, 0);
     for e in log {
         if let Some(l) = parse(n, &e.body) {
@@ -329,7 +374,10 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64) {
             }
             let asked = t.state == State::Ask;
             let before = t.clone();
-            step(&mut t, &mut resume, e.id, &l, last == 0);
+            step(&mut t, &mut resume, &mut rounds, e.id, &l, last == 0);
+            if !matches!(t.state, State::Doing | State::Review | State::Ask) {
+                rounds = Rounds::default(); // § 2 rounds: a move to ready or an end drops both sessions
+            }
             if t != before {
                 last = e.id;
                 if t.card.is_some() && t.card != before.card {
@@ -351,7 +399,15 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64) {
     (t, free, rev)
 }
 
-fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool) {
+/// § 2 review rounds: the worker attempt of the current result, which a reviewer's `requeue round` resumes, and the
+/// reviewer it parks until the next result. Kept out of [`Task`]: the board log rebuilds them (R1).
+#[derive(Default)]
+struct Rounds {
+    worker: Option<(u64, String)>,
+    reviewer: Option<(u64, String)>,
+}
+
+fn step(t: &mut Task, resume: &mut Option<State>, rounds: &mut Rounds, id: u64, l: &Line, first: bool) {
     use State::*;
     if l.attempt.is_some() && l.attempt != t.attempt {
         return; // fencing: a replaced attempt writes nothing
@@ -393,11 +449,28 @@ fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool
             spawn(t, "reviewer")
         }
         (Doing, "result", true) if l.args.len() == 1 && sha(l.args[0]) => {
+            rounds.worker = t.attempt.zip(t.session.clone());
             end(t);
             t.result = Some(l.args[0].to_string());
             t.card = text(l.text).filter(|s| has_options(s));
             t.state = Review;
             invalidate(t);
+            // § 2 rounds: the parked reviewer resumes with this result
+            if let Some((a, s)) = rounds.reviewer.take() {
+                resume_session(t, a, "reviewer", s, id);
+            }
+        }
+        // § 2 rounds: the live reviewer's fixes resume the worker attempt of the result; its session stays parked
+        (Review, "requeue", true) if l.args == ["round"] && rounds.worker.is_some() => {
+            if !limit(t, resume, REQUEUE_MAX) {
+                let (a, s) = rounds.worker.clone().unwrap_or_default();
+                rounds.reviewer = t.attempt.zip(t.session.clone());
+                t.card = None;
+                t.result = None;
+                t.state = Doing;
+                invalidate(t);
+                resume_session(t, a, "worker", s, id);
+            }
         }
         (Doing | Review, "ask", true) => {
             t.card = text(l.text);

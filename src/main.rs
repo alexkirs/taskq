@@ -703,7 +703,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
-            ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
+            ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("rounds", json!(s.rounds)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
             ("restart_waits", json!(d.join("restart").exists().then(|| restart_waits(&s, &cfg.root)))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root))),
             ("requests", budget.json(since, last_hour.as_ref(), &hour.1)), ("connection", json!(dashq.outcome))]

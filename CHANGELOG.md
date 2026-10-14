@@ -9,6 +9,9 @@ there is no migration code. Releases without a **Board** section need nothing.
 
 **Board**: older versions read only `Depends on #N` and would start a task that waits on `<repo>#N` (taskq.md § 8). Until every host of the board runs this release, write a `<repo>#N` line only into a held task (`taskq add --hold`, then edit its text) and run `taskq start N` after the last host updated. Nothing to migrate.
 
+Review rounds resume live sessions: a live reviewer's requeue is written as `requeue round` and resumes the worker's attempt and session with the fixes; the reviewer resumes on the next `result`. A round costs two entries. `spawn`, `gone`, an attempt requeue and `answer K` are written folded under `<details>`; ask cards, `result` and `close` stay plain. Both only while every fresh host heartbeat lists `rounds` (`status.json` `rounds`), else today's entries.
+**Board**: heartbeats gain the line `rounds`; open issues need nothing (fold reads both forms; N-1 folds `requeue round` as `requeue`).
+
 `taskq tray --snapshot DIR --route R,..` captures only the named routes (`icon` for the icons); the capture window stays off the visible screen and takes no focus. README shots refresh on dispatch or a release tag; stale shots are a CI warning, not a failed check; a missing or malformed manifest or an unrecorded README image still fails. No board change.
 
 Rollback below `4.2.0-dev` (4.1.11) loses worker grants: its update sweep deletes `<install>/worker-policy.json`, including on the update forward from it. Before a manual downgrade, copy the store outside `<install>` and do not downgrade unless the copy matches the original. Coming back: `taskq service pause` in each project, `taskq update`, copy the store back, and run `taskq service resume` only after `taskq service permissions` shows `Policy: revision N, M grants`; otherwise stay paused. No board change.

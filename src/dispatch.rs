@@ -92,6 +92,30 @@ impl Receipt {
     }
 }
 
+/// The § 2 rounds gate as the local service last saw it: its `status.json` at most 60 s old says `rounds`; no board
+/// request. Else today's entries.
+pub fn rounds(root: &Path) -> bool {
+    let p = crate::dot(root).join("status.json");
+    coreq::status::age(&p).is_some_and(|a| a <= 60)
+        && std::fs::read_to_string(&p).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).is_some_and(|s| s["rounds"] == true)
+}
+
+/// § 2: the attempt `requeue` and `gone` and `answer K` fold under details; ask, result, close and texts stay open.
+fn folds(kind: &str, args: &[&str], attempt: Option<u64>) -> bool {
+    match kind {
+        "gone" => true,
+        "requeue" => attempt.is_some(),
+        "answer" => !args.is_empty(),
+        _ => false,
+    }
+}
+
+/// § 2 rounds: the live reviewer's `requeue` is written as `requeue round` while the gate is on.
+fn rounds_args<'a>(root: &Path, kind: &str, args: &[&'a str], attempt: Option<u64>, t: &Task) -> Vec<&'a str> {
+    let reviewer = t.state == State::Review && t.role.as_deref() == Some("reviewer") && attempt.is_some() && attempt == t.attempt;
+    if kind == "requeue" && args.is_empty() && reviewer && rounds(root) { vec!["round"] } else { args.to_vec() }
+}
+
 /// R4: append one entry that `fold` accepts, set the projected label, poke the local service. A seen op id returns
 /// the first receipt; a stale revision or a refused entry writes nothing and names the current state (§ 5).
 pub fn act(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &str, op: &Op) -> Receipt {
@@ -145,7 +169,9 @@ fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &
         return Receipt::rejected(n, op, "text ends with an `op-id:` or `revision:` line; reword it");
     }
     let text = if attempt.is_some() && attempt == before.attempt { core::limit_text(n, &before, kind, text) } else { text.into() };
-    let body = core::with_fields(entry(kind, args, attempt, &text), op.id.as_deref(), op.revision);
+    let body = core::with_fields(entry(kind, &rounds_args(root, kind, args, attempt, &before), attempt, &text), op.id.as_deref(), op.revision);
+    // § 2: service entries fold under details while every fresh service folds them
+    let body = if folds(kind, args, attempt) && rounds(root) { core::collapse(&body) } else { body };
     log.push(Entry { id: u64::MAX, body: body.clone(), edited: false });
     if fold(n, &log, deps) == before {
         return Receipt { state: Some(before.state.name()), revision: Some(rev), ..Receipt::rejected(n, op, format!("#{n} is {}: `{kind}` not accepted", before.state.name())) };
@@ -386,6 +412,65 @@ mod tests {
         assert_eq!(s("result", None, Some("42")).unwrap(), "TASKQ_TASK \"\" is not #7: stale session environment");
         assert_eq!(s("ask", Some("7"), Some("41")).unwrap(), "TASKQ_ATTEMPT 41 is not the live attempt 42: stale session environment");
         assert!(stale_child(7, "gone", None, &(Some("7".into()), Some("42".into()))).unwrap().contains("live attempt none"));
+    }
+
+    // Chain: § 3 rounds gate over § 2 entries (#1136). Risk: a CLI folds entries or keeps an attempt while a host
+    // without `rounds` is fresh, or ends the attempt when every host resumes it.
+    #[test]
+    fn rounds_gate_writes_requeue_round_and_folded_entries() {
+        let (b, root) = (Fake::default(), std::env::temp_dir().join(format!("taskq-rounds-{}", std::process::id())));
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let reviewed = || {
+            let n = b.create("T", "## Goal
+g", &["taskq".into()]).unwrap();
+            let w = b.comment(n, &entry("spawn", &["worker", "claude:w", "mac"], None, "")).unwrap();
+            b.comment(n, &entry("result", &[sha], Some(w), "Changed: x")).unwrap();
+            let r = b.comment(n, &entry("spawn", &["reviewer", "codex:r", "win"], None, "")).unwrap();
+            (n, w, r)
+        };
+        let child = |n: u64, a: u64| (Some(n.to_string()), Some(a.to_string()));
+        let last = |n: u64| b.comments(n).unwrap().last().unwrap().body.clone();
+        // gate off: no fresh status.json, or one without `rounds`: today's requeue ends the attempt
+        let (n, _, r) = reviewed();
+        assert!(!rounds(&root));
+        let got = act_child(&b, &root, n, "requeue", &[], "Fix A1", &Op::default(), child(n, r));
+        assert_eq!((got.state, last(n)), (Some("ready"), format!("taskq: requeue attempt {r}
+Fix A1")));
+        std::fs::create_dir_all(crate::dot(&root)).unwrap();
+        std::fs::write(crate::dot(&root).join("status.json"), r#"{"rounds": false}"#).unwrap();
+        assert!(!rounds(&root));
+        // gate on: the live reviewer's requeue resumes the worker attempt, written folded
+        std::fs::write(crate::dot(&root).join("status.json"), r#"{"rounds": true}"#).unwrap();
+        let (n, w, r) = reviewed();
+        let got = act_child(&b, &root, n, "requeue", &[], "Fix A1", &Op::default(), child(n, r));
+        assert_eq!((got.outcome, got.state), ("accepted", Some("doing")), "{}", got.text());
+        assert_eq!(last(n), format!("<details><summary>taskq: requeue round attempt {r}</summary>
+
+Fix A1
+</details>"));
+        let t = fold(n, &entries(&b, n).unwrap(), false);
+        assert_eq!((t.attempt, t.role.as_deref(), t.session.as_deref()), (Some(w), Some("worker"), Some("claude:w mac")));
+        // an ask card and `answer --text` stay plain; `answer K` folds
+        act_child(&b, &root, n, "ask", &[], "Done: x
+Problem: y
+1. a ★
+2. b", &Op::default(), child(n, w));
+        assert!(last(n).starts_with("taskq: ask attempt"));
+        act(&b, &root, n, "answer", &["2"], "b", &Op::default());
+        assert_eq!(last(n), "<details><summary>taskq: answer 2</summary>
+
+b
+</details>");
+        act_child(&b, &root, n, "ask", &[], "Done: x
+Problem: owner action", &Op::default(), child(n, w));
+        act(&b, &root, n, "answer", &[], "token added", &Op::default());
+        assert_eq!(last(n), "taskq: answer
+token added");
+        // the next result stays plain and resumes the parked reviewer
+        let got = act_child(&b, &root, n, "result", &[sha], "Changed: y", &Op::default(), child(n, w));
+        assert_eq!((got.state, last(n).starts_with("taskq: result")), (Some("review"), true));
+        assert_eq!(fold(n, &entries(&b, n).unwrap(), false).attempt, Some(r));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // Chain: § 5 op-id replay over § 3 fencing (#1072). Risk: retrying an accepted requeue, whose write cleared the

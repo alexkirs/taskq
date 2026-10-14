@@ -904,7 +904,15 @@ impl<'a> Service<'a> {
         let c = self.cap.as_ref().ok()?;
         // Auto: a runtime without a limit has no count ceiling (§ 9); Fixed: only listed runtimes
         let limits: Vec<(String, u32)> = if c.auto { RUNTIMES.iter().map(|r| (r.to_string(), c.limits.get(*r).copied().unwrap_or(u32::MAX))).collect() } else { c.limits.clone().into_iter().collect() };
-        limits.into_iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt) && !self.refused_access.contains_key(rt)).find(|(rt, n)| self.kids.iter().filter(|k| &k.rt == rt).count() < *n as usize).map(|(rt, _)| rt)
+        // the most free slots wins, so any-runtime tasks alternate; a tie keeps the listed order (§ 4 Filter)
+        let mut best: Option<(String, usize)> = None;
+        for (rt, n) in limits.into_iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt) && !self.refused_access.contains_key(rt)) {
+            let left = (n as usize).saturating_sub(self.kids.iter().filter(|k| k.rt == rt).count());
+            if left > 0 && best.as_ref().is_none_or(|b| left > b.1) {
+                best = Some((rt, left));
+            }
+        }
+        best.map(|(rt, _)| rt)
     }
 
     /// Post `spawn`, re-read, start the child only if `fold` accepted this spawn (§ 3 claim).
@@ -1371,6 +1379,19 @@ mod tests {
         let t = task(&b, n);
         assert_eq!((t.state, t.retries, t.result.is_some()), (State::Review, 1, true));
         assert_ne!(t.attempt, Some(r));
+    }
+
+    // Chain: § 4 Filter, any-runtime admission. Risk: the first listed runtime takes every slot while the other idles.
+    #[test]
+    fn any_runtime_tasks_alternate_by_free_slots() {
+        let b = Fake::default();
+        let ns: Vec<u64> = (0..4).map(|_| b.create("T", "", &["taskq".into()]).unwrap()).collect();
+        let mut c = cfg("mac");
+        c.limits = BTreeMap::from([("claude".into(), 2), ("codex".into(), 2)]);
+        let mut s = service(&b, &c, Default::default());
+        s.pass().unwrap();
+        let got: Vec<String> = ns.iter().map(|&n| rt_of(&task(&b, n)).unwrap().0.to_string()).collect();
+        assert_eq!(got, ["claude", "codex", "claude", "codex"]);
     }
 
     // Chain: § 4 worker result to reviewer claim. Risk: run-* pins reviewers or capacity fallback stalls review.

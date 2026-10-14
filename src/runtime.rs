@@ -299,7 +299,7 @@ pub fn spawn(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     eprintln!("specq@{SPECQ_REVISION} loaded for {} #{} attempt {} ({})", l.role, l.task, l.attempt, if l.resume.is_some() { "resume" } else { "start" });
     let log = log_path(env.root, l);
     if l.rt == "codex-app" {
-        let mut turn = AppTurn { hand: None, log, text, thread: l.session.clone(), done: 0, rollout: None, running: app_running };
+        let mut turn = AppTurn { hand: None, log, text, codex: env.codex.to_vec(), thread: l.session.clone(), done: 0, rollout: None, running: app_running };
         match &l.resume {
             Some(_) => {
                 turn.queue().map_err(|message| StartError { message, reportable: false })?;
@@ -335,6 +335,7 @@ pub struct AppTurn {
     log: PathBuf,
     /// The brief, or the resume text, to queue.
     text: String,
+    codex: Vec<String>,
     thread: String,
     /// `task_complete` events of the thread before the queued text.
     done: usize,
@@ -343,13 +344,19 @@ pub struct AppTurn {
 }
 
 impl AppTurn {
+    fn command(&self) -> Command {
+        let mut c = Command::new(which("codex"));
+        c.arg("queue").args(&self.codex).args(["--thread", &self.thread, "--message", &self.text]);
+        c
+    }
+
     fn queue(&mut self) -> Result<(), String> {
         self.rollout = rollout(&self.thread);
         self.done = self.rollout.as_ref().map(|p| completes(p)).unwrap_or(0);
         let ok = |c: &mut Command| c.status().is_ok_and(|s| s.success());
         // ponytail: `open` and `queue` block the pass for a moment; a thread per turn if they ever hang
         if !ok(Command::new("open").arg(format!("codex://threads/{}", self.thread)))
-            || !ok(Command::new(which("codex")).args(["queue", "--thread", &self.thread, "--message", &self.text]))
+            || !ok(&mut self.command())
         {
             return Err(format!("codex queue failed for thread {}", self.thread));
         }
@@ -539,7 +546,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!("taskq-rollout-{}.jsonl", std::process::id()));
         let done = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
         std::fs::write(&p, format!("{done}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\"}}}}\n")).unwrap();
-        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), thread: "th".into(), done: completes(&p), rollout: Some(p.clone()), running: || true };
+        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), codex: vec![], thread: "th".into(), done: completes(&p), rollout: Some(p.clone()), running: || true };
         assert_eq!((t.done, t.exited()), (1, Ok(None)), "the handshake's task_complete does not end the turn");
         std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(done.as_bytes()).unwrap();
         assert_eq!(t.exited(), Ok(Some(0)));
@@ -547,6 +554,19 @@ mod tests {
         t.running = || false;
         assert_eq!(t.exited(), Ok(Some(-1)), "a closed app is a child exit");
         let _ = std::fs::remove_file(p);
+    }
+
+    // Chain: § 8 app start/resume. Risk: queue resets the configured sandbox/network policy after handshake.
+    #[test]
+    fn app_queue_preserves_configured_permissions() {
+        let opts: Vec<String> = ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", "/p/.git"].into_iter().map(String::from).collect();
+        let mut t = AppTurn { hand: None, log: PathBuf::new(), text: "start".into(), codex: opts.clone(), thread: "same-thread".into(), done: 0, rollout: None, running: || true };
+        for text in ["start", "resume: keep active jobs"] {
+            t.text = text.into();
+            let args: Vec<String> = t.command().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+            assert_eq!(&args[1..1 + opts.len()], opts.as_slice());
+            assert_eq!(&args[1 + opts.len()..], ["--thread", "same-thread", "--message", text]);
+        }
     }
 
     // Chain: § 8 rule delivery. Risk: a new/resumed worker or reviewer receives only links or mixed rules.

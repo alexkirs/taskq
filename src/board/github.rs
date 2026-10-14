@@ -1,6 +1,6 @@
 //! GitHub issues (taskq.md § 1, § 2, § 7): REST v3 on github.com or a GitHub Enterprise host, owner-installed token.
 
-use super::{Api, Board, Comment, Issue, Kind, Publish, Result, encode, hex40, iso, names, outcome, s, stamp, verify_assignment};
+use super::{Api, Board, Comment, Issue, Kind, Publish, Result, encode, hex40, into, iso, names, outcome, s, stamp, verify_assignment};
 use serde_json::{Value, json};
 
 pub const KIND: Kind = Kind {
@@ -134,10 +134,10 @@ impl GitHub {
         let prs = self.api.call("GET", &format!("/pulls?head={owner}:{branch}&base=main&state=open"), None)?.json()?;
         let prs = prs.as_array().cloned().unwrap_or_default();
         if prs.is_empty() {
-            // § 7 partial publication: a merged PR at the result SHA is the publication; no second merge
-            let closed = self.api.call("GET", &format!("/pulls?head={owner}:{branch}&base=main&state=closed"), None)?.json()?;
+            // § 7 merged, not closed: a merged PR at the result SHA into any base (a release branch too) is the publication; no second merge
+            let closed = self.api.call("GET", &format!("/pulls?head={owner}:{branch}&state=closed"), None)?.json()?;
             if let Some(pr) = closed.as_array().into_iter().flatten().find(|p| p["head"]["sha"] == sha && !p["merged_at"].is_null()) {
-                return Ok(Publish::Done(format!("merged #{} as {}", pr["number"], s(pr, "merge_commit_sha"))));
+                return Ok(Publish::Done(format!("merged #{}{} as {}", pr["number"], into(&s(&pr["base"], "ref")), s(pr, "merge_commit_sha"))));
             }
         }
         if prs.len() != 1 {

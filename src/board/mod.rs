@@ -189,6 +189,11 @@ fn curl(method: &str, url: &str, auth: &str, body: Option<&Value>) -> Result<Rep
 pub mod github;
 pub mod gitlab;
 
+/// ` into <base>` of a § 7 receipt whose PR/MR merged into a branch other than `main`.
+fn into(base: &str) -> String {
+    if base.is_empty() || base == "main" { String::new() } else { format!(" into {base}") }
+}
+
 fn s(v: &Value, k: &str) -> String {
     v[k].as_str().unwrap_or_default().to_string()
 }
@@ -662,14 +667,16 @@ mod tests {
         }
     }
 
-    // Chain: § 7 partial publication on both boards. Risk: a close retried after a merge requeues or merges twice.
+    // Chain: § 7 merged, not closed, on both boards. Risk: a close retried after a merge requeues or merges twice;
+    // a PR/MR merged into a release branch (#1039) never closes its task.
     #[test]
     fn a_merged_pr_at_the_result_sha_reconciles_to_one_publication() {
-        for kind in BOARDS {
+        for (kind, base) in BOARDS.iter().flat_map(|k| [(k, "main"), (k, "release/4.1")]) {
             let calls = std::rc::Rc::new(RefCell::new(vec![]));
             let captured = calls.clone();
             let h = http(kind, None, Box::new(move |method, url, _| {
                 captured.borrow_mut().push(method.to_string());
+                assert!(!url.contains("main&state=closed") && !url.contains("main&state=merged"), "merged lookup must not filter the base: {url}");
                 let value = if url.contains("/compare/") { json!({"status": "diverged"}) }
                     else if url.contains("/merge_base?") { json!({"id": "c".repeat(40)}) }
                     else if url.contains("/check-runs") { json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}) }
@@ -678,12 +685,14 @@ mod tests {
                     else if url.contains("state=open") { json!([]) }
                     else if url.contains("state=closed") || url.contains("state=merged") {
                         json!([{"number": 6, "iid": 6, "head": {"sha": "d".repeat(40)}, "sha": "d".repeat(40), "merged_at": "x"},
-                               {"number": 7, "iid": 7, "head": {"sha": "a".repeat(40)}, "sha": "a".repeat(40), "merged_at": "x", "merge_commit_sha": "b".repeat(40)}])
+                               {"number": 7, "iid": 7, "head": {"sha": "a".repeat(40)}, "sha": "a".repeat(40), "merged_at": "x", "merge_commit_sha": "b".repeat(40),
+                                "base": {"ref": base}, "target_branch": base}])
                     } else { panic!("unexpected {method} {url}") };
                 Ok(Reply { status: 200, headers: vec![], body: value.to_string(), operation: operation(method) })
             }));
             let Publish::Done(m) = h.publish(1, &"a".repeat(40), "pr", "title", "Task: fake") else { panic!("not reconciled") };
-            assert!(m.starts_with(if kind.name == "github" { "merged #7 as bbbb" } else { "merged !7" }), "{m}");
+            let into = if base == "main" { "" } else { " into release/4.1" };
+            assert!(m.starts_with(&if kind.name == "github" { format!("merged #7{into} as bbbb") } else { format!("merged !7{into}") }), "{m}");
             assert!(calls.borrow().iter().all(|m| m == "GET"), "no second merge");
         }
     }

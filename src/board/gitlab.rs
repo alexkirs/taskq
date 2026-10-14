@@ -1,6 +1,6 @@
 //! GitLab issues (taskq.md § 1, § 2, § 7): REST v4 on gitlab.com or a self-managed host, `glab` login.
 
-use super::{Api, Board, Comment, Issue, Kind, Publish, Result, hex40, iso, names, outcome, s, stamp, verify_assignment};
+use super::{Api, Board, Comment, Issue, Kind, Publish, Result, hex40, into, iso, names, outcome, s, stamp, verify_assignment};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 
@@ -93,10 +93,10 @@ impl GitLab {
         let mrs = self.api.call("GET", &format!("/merge_requests?source_branch={branch}&target_branch=main&state=opened"), None)?.json()?;
         let mrs = mrs.as_array().cloned().unwrap_or_default();
         if mrs.is_empty() {
-            // § 7 partial publication: a merged MR at the result SHA is the publication; no second merge
-            let merged = self.api.call("GET", &format!("/merge_requests?source_branch={branch}&target_branch=main&state=merged"), None)?.json()?;
+            // § 7 merged, not closed: a merged MR at the result SHA into any target (a release branch too) is the publication; no second merge
+            let merged = self.api.call("GET", &format!("/merge_requests?source_branch={branch}&state=merged"), None)?.json()?;
             if let Some(mr) = merged.as_array().into_iter().flatten().find(|m| m["sha"] == sha) {
-                return Ok(Publish::Done(format!("merged !{}", mr["iid"])));
+                return Ok(Publish::Done(format!("merged !{}{}", mr["iid"], into(&s(mr, "target_branch")))));
             }
         }
         let mr = match (mrs.len(), mode) {

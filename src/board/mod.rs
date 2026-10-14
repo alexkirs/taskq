@@ -152,6 +152,10 @@ fn quote(s: &str) -> String {
 
 /// One request, any HTTP status. The token and body go through curl's config on stdin, never argv (R12: no secrets in `ps`).
 fn curl(method: &str, url: &str, auth: &str, body: Option<&Value>) -> Result<Reply> {
+    crate::profile::measure("forge.call", || curl_inner(method, url, auth, body))
+}
+
+fn curl_inner(method: &str, url: &str, auth: &str, body: Option<&Value>) -> Result<Reply> {
     let mut cfg = format!(
         "silent\nshow-error\ndump-header = \"-\"\nrequest = {}\nurl = {}\nheader = {}\nheader = \"Accept: application/json\"\nheader = \"Expect:\"\nmax-time = 60\n",
         quote(method), quote(url), quote(auth)

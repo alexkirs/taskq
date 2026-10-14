@@ -919,11 +919,14 @@ fn refresh_icon(tray: &Option<TrayIcon>, st: &Value, s: &Settings, dark: bool, s
         return;
     }
     *sig = new;
-    let img = config.and_then(|c| draw(&c, &sum, dark, k, dpr).ok()).unwrap_or_else(|| compact(sum.run, dark, k * dpr));
-    let _ = t.set_icon(Some(rgba_icon(&img)));
-    if k > 1.0 {
-        fit_status_image(k);
-    }
+    let _ = crate::profile::measure("tray.render", || {
+        let rendered = config.map(|c| draw(&c, &sum, dark, k, dpr));
+        let failed = rendered.as_ref().is_some_and(Result::is_err);
+        let img = rendered.and_then(Result::ok).unwrap_or_else(|| compact(sum.run, dark, k * dpr));
+        let applied = t.set_icon(Some(rgba_icon(&img)));
+        if k > 1.0 { fit_status_image(k); }
+        if failed { Err("invalid icon render".to_string()) } else { applied.map_err(|e| e.to_string()) }
+    });
     let [w, a, r, _] = sum.counts;
     let counts = if sum.known { format!("in work {w} · waiting for answer {a} · ready {r}") } else { "counts unknown (service error or stale status)".into() };
     let _ = t.set_tooltip(Some(format!("taskq: {counts}{}", if sum.run { "" } else { " · paused" })));

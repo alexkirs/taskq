@@ -561,6 +561,10 @@ impl<'a> Service<'a> {
 
     /// One pass of § 4. Tasks written to in a step are left alone by later steps until the next pass re-reads them.
     pub fn pass(&mut self) -> Result<(), String> {
+        crate::profile::measure("service.pass", || self.pass_inner())
+    }
+
+    fn pass_inner(&mut self) -> Result<(), String> {
         let previous_fixes = std::mem::take(&mut self.label_fixes);
         let me = self.cfg.me.clone();
         let ttl = self.cfg.ttl;
@@ -874,6 +878,10 @@ impl<'a> Service<'a> {
 
     /// Post `spawn`, re-read, start the child only if `fold` accepted this spawn (§ 3 claim).
     fn claim(&mut self, v: &View, role: &str, rt: &str) -> Result<(), String> {
+        crate::profile::measure("dispatch", || self.claim_inner(v, role, rt))
+    }
+
+    fn claim_inner(&mut self, v: &View, role: &str, rt: &str) -> Result<(), String> {
         let n = v.issue.number;
         let session = crate::runtime::new_session(rt);
         let id = self.post(n, core::entry("spawn", &[role, &format!("{rt}:{session}"), &self.cfg.me], None, ""))?;

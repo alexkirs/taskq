@@ -20,6 +20,7 @@ mod platform;
 mod policy;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
+mod profile;
 mod retro;
 mod runtime;
 mod service;
@@ -55,7 +56,7 @@ const USAGE: &str = "taskq agents
  taskq close N [M..] [--text VERDICT] | taskq approve N [--sha SHA]
  taskq recipe NAME --run ID [--goal G] [--start]
  taskq status [--only L,..] [--json] | taskq inbox N
- taskq retro | taskq add --retro K [--type T ..]
+ taskq profile | taskq retro | taskq add --retro K [--type T ..]
  taskq wait [--window MIN] [--only L,..]
  taskq cleanup [--force] | taskq update [--check]
  taskq service install|run|pause|resume|status|restart|stop|uninstall|list
@@ -1570,6 +1571,7 @@ fn run(argv: &[String]) -> Res<()> {
     }
     let cmd = a.pos.first().map(String::as_str).unwrap_or("");
     match cmd {
+        "profile" => { print!("{}", profile::report(&platform::default_install())); Ok(()) }
         "selftest" => {
             let n = golden_selftest(core::GOLDEN, !platform::VERSION.contains('-')).map_err(|e| format!("fold: FAIL {e}"))?;
             println!("fold: {n} golden traces PASS");
@@ -1961,6 +1963,7 @@ fn main() {
     if exe.is_some() && exe == launcher && t.current().is_some() {
         coreq::launcher::launch(&t, &args);
     }
+    profile::init(&install);
     if let Err(e) = run(&args) {
         if e.is_empty() {
             std::process::exit(1);

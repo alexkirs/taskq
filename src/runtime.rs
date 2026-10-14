@@ -348,6 +348,10 @@ pub fn access(env: &Env, rt: &str) -> Result<crate::policy::Effective, StartErro
 
 /// Start the child with its stdout and stderr in the attempt log; `codex-app` starts its handshake child (§ 8).
 pub fn spawn(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
+    crate::profile::measure("spawn", || spawn_inner(env, l))
+}
+
+fn spawn_inner(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     let access = access(env, &l.rt)?;
     log!("#{} attempt {} access {}", l.task, l.attempt, access.line());
     let text = turn_text(env, l, rule_file)?;

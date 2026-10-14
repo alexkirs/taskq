@@ -72,6 +72,10 @@ pub fn error_text(msg: &str, root: Option<&Path>) -> String {
 /// § 8 update steps (coreq), then the sweep: Ok(Some(version)) when a new release became current; with `check`, when
 /// one is available.
 pub fn update(install: &Path, check: bool) -> Result<Option<String>, String> {
+    crate::profile::measure("update", || update_inner(install, check))
+}
+
+fn update_inner(install: &Path, check: bool) -> Result<Option<String>, String> {
     let v = update_result(coreq::update::update(&tool(install), check))?;
     if v.is_some() && !check {
         let shim = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin/taskq")).unwrap_or_default();

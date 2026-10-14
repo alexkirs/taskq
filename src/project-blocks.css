@@ -6,6 +6,7 @@
 .tqp button:hover,.tqp a:hover{background:var(--hover)}
 .tqp button:focus-visible,.tqp a:focus-visible{outline:2px solid var(--good);outline-offset:1px}
 .tqp svg{display:inline-block;width:16px;height:16px;vertical-align:-3px;flex-shrink:0}
+.tqp svg:not([fill]){fill:currentColor}
 .tqp .good{color:var(--good)}.tqp .ask{color:var(--ask)}.tqp .danger{color:var(--bad)}
 .tqp small,.tqp-meta,.tqp-partial{color:var(--secondary);font-size:max(12px,.85em)}
 .tqp-meta{white-space:nowrap}

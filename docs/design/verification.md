@@ -173,7 +173,8 @@ Service target history is `<root>/.taskq/events`; incomplete history reports its
 `src/tray.rs` and `src/tray.html` ship the wry popover, the page bridge, icons, actions and `<install>/tray.json` (§ 4).
 Fixture: `sh docs/design/tray-fixture.sh DIR`, then `TASKQ_INSTALL=DIR/install taskq tray --snapshot DIR/shots`.
 It covers a long title, HTML in a title, the same #12 in two repos, a paused project with a saved focus, a service
-error, a stale status.json, an observation-only project without a log, and a duplicated close event.
+error, a stale status.json, an observation-only project without a log, and a duplicated close event. A second argument
+adds that many minimal projects so Home and Projects scroll; a snapshot page wider than its window fails the run (#1073).
 
 Observed: `cargo test --locked` covers icon geometry (run/pause, wide numbers, gray paused summary), cross-board
 deduplication, settings validation and base64. `taskq tray --snapshot` wrote 8 icon PNGs and 6 popover snapshots

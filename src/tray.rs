@@ -555,6 +555,8 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
     let mut hidden_at = Instant::now() - Duration::from_secs(1);
     let mut anchor: Option<Rect> = None;
     let mut step = 0usize;
+    // snapshot pages wider than their window (#1073): `tray --snapshot` fails naming them
+    let mut overflow: Vec<String> = Vec::new();
     let mut adding = Value::Null;
     let mut moved = false;
     let mut asked = false;
@@ -706,6 +708,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                         let (p, install) = (proxy.clone(), install.clone());
                         std::thread::spawn(move || { let _ = p.send_event(Ev::Answer(answer(&install, &m))); });
                     }
+                    "overflow" if snapshot.is_some() => overflow.push(format!("{} by {} px", m["shot"].as_str().unwrap_or("?"), m["x"])),
                     "ready" => {
                         if snapshot.is_some() {
                             let _ = proxy.send_event(Ev::Shot);
@@ -715,7 +718,8 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                     }
                     "size" => {
                         let max = w.current_monitor().map_or(800.0, |m| m.size().to_logical::<f64>(m.scale_factor()).height) * if snapshot.is_some() { 0.95 } else { 0.8 };
-                        w.set_inner_size(LogicalSize::new(m["w"].as_f64().unwrap_or(320.0), m["h"].as_f64().unwrap_or(400.0).min(max)));
+                        let (width, height) = popover_size(&m, max, w.scale_factor());
+                        w.set_inner_size(tao::dpi::PhysicalSize::new(width, height));
                         // pinned: the window stays where it was put; a move then keeps it in the work area
                         if let (Some(r), false) = (anchor, settings.pin.pinned) {
                             place(w, r);
@@ -853,6 +857,10 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 }
                 let Some((theme, page, font, script)) = steps.get(step).cloned() else {
                     println!("snapshots in {}", dir.display());
+                    if !overflow.is_empty() {
+                        eprintln!("horizontal overflow: {}", overflow.join(", "));
+                        std::process::exit(1);
+                    }
                     *flow = ControlFlow::Exit;
                     return;
                 };
@@ -873,6 +881,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 let dir = snapshot.clone().unwrap_or_default();
                 let p = proxy.clone();
                 let name = format!("popover-{}.png", shot_name(&install, step));
+                let _ = wv.evaluate_script(&OVERFLOW.replace("NAME", &name));
                 step += 1;
                 capture(wv, dir.join(name), move || {
                     let _ = p.send_event(Ev::Shot);
@@ -882,6 +891,21 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
         }
     })
 }
+
+/// Physical inner size for a `size` message in CSS px; `max` is logical. The page renders at its own pixel ratio `d`:
+/// Windows Text size scales WebView2 but not the window, so CSS px become logical px by `d / scale`. A menu taller than
+/// `max` scrolls; the vertical scrollbar takes `g` of the width, so the window adds it and the menu keeps its full width
+/// (#1073). The width rounds up: a fraction of a pixel short also scrolls horizontally.
+fn popover_size(m: &Value, max: f64, scale: f64) -> (u32, u32) {
+    let (w, h) = (m["w"].as_f64().unwrap_or(320.0), m["h"].as_f64().unwrap_or(400.0));
+    let k = m["d"].as_f64().filter(|d| *d > 0.0).map_or(1.0, |d| d / scale);
+    let w = if h * k > max { w + m["g"].as_f64().unwrap_or(0.0) } else { w };
+    ((w * k * scale).ceil() as u32, ((h * k).min(max) * scale).round() as u32)
+}
+
+/// Reports a snapshot page that scrolls horizontally or clips content inside the menu (#1073).
+const OVERFLOW: &str = "(()=>{const e=document.documentElement,m=document.querySelector('.menu'),x=Math.max(e.scrollWidth-e.clientWidth,m.scrollWidth-m.clientWidth);
+if(x>0)window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME',x}));})()";
 
 /// The `actions` snapshot: a refused custom range (menu.md M6), without applying a setting.
 const ACTIONS: &str = "(()=>{const q=s=>document.querySelector(s),put=(s,v)=>{const i=q(s);i.value=v;i.dispatchEvent(new Event('input',{bubbles:true}));};
@@ -1538,6 +1562,21 @@ mod tests {
         m["op"]["text"] = json!("a\nb");
         assert!(answer_args(&install, &m).is_err());
         fs::remove_dir_all(install).unwrap();
+    }
+
+    // Chain: menu `size` message -> popover window size. Risk: a scrolling menu clipped on the right behind a horizontal
+    // scrollbar (#1073), a short menu given an empty scrollbar strip, or Windows Text size shrinking the CSS viewport.
+    #[test]
+    fn scrolling_menu_window_adds_the_scrollbar_width() {
+        assert_eq!(popover_size(&json!({"w": 320, "h": 500, "g": 8, "d": 2}), 600.0, 2.0), (640, 1000));
+        assert_eq!(popover_size(&json!({"w": 360, "h": 900, "g": 8, "d": 1}), 600.0, 1.0), (368, 600));
+        assert_eq!(popover_size(&json!({"w": 320, "h": 900}), 600.0, 1.0), (320, 600), "overlay scrollbars (macOS) take no width");
+        // Text size 150 % at 100 % display scale: 320 CSS px need 480 window px; 400 CSS px tall fit, 500 scroll
+        assert_eq!(popover_size(&json!({"w": 320, "h": 400, "g": 10, "d": 1.5}), 600.0, 1.0), (480, 600));
+        assert_eq!(popover_size(&json!({"w": 320, "h": 300, "g": 10, "d": 1.5}), 600.0, 1.0), (480, 450));
+        assert_eq!(popover_size(&json!({"w": 320, "h": 500, "g": 10, "d": 1.5}), 600.0, 1.0), (495, 600));
+        // Text size 140 % at 125 % display scale: 331 CSS px are 579.25 device px, never 579
+        assert_eq!(popover_size(&json!({"w": 320, "h": 900, "g": 11, "d": 1.75}), 600.0, 1.25).0, 580);
     }
 
     // Chain: status.json capacity -> tray projection -> shared resource controls. Risk: absent reads as zero, a legacy

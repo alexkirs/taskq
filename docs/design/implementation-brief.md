@@ -87,7 +87,7 @@ Status reports follow [specq Core](https://github.com/taskqorg/specq/blob/main/c
 
 ## Copyable assignment for the next agent
 
-> Read AGENTS.md, taskq.md and docs/design/README.md. Follow the implementation brief and linked shared rules. Reconcile the design package with current code and existing tasks. Prepare a dependency-ordered implementation plan covering the service/CLI, native application and remote PM adapters; map each slice to existing requirements and acceptance. Preserve accepted decisions, ask only unresolved product questions with recommendations, and identify unsupported capabilities honestly. After implementation is authorized, amend affected contracts/models first, implement each slice, and verify actual behavior against the approved design and scenarios. Do not deploy, migrate FRA or enable observation merely because the design describes it.
+> Read AGENTS.md, taskq.md and docs/design/README.md. Follow the implementation brief and [shared agent workflow](https://github.com/taskqorg/specq/blob/main/engineering/agent-workflow.md). Reconcile the design package with current code and existing tasks. Prepare a dependency-ordered implementation plan covering the service/CLI, native application and remote PM adapters; map each slice to existing requirements and acceptance. After implementation is authorized, verify actual behavior against the approved design and scenarios. Do not deploy, migrate FRA or enable observation merely because the design describes it.
 
 ## Final system-to-interface contract map
 

@@ -148,7 +148,7 @@ taskq service permissions --host mac --runtime claude --project <registered-id> 
 Apply requires the authenticated local review channel and revision check; no public `--yes` route available to a worker. Local external editing imports a candidate through the same validation/readback, not a project-file grant.
 `service status`: requested/effective mode, policy revision, source, sandbox/isolation proof, active-old-revision count, pending/unsupported reason. No credentials.
 Spawn comment: mode + policy digest/version, additive metadata compatible with existing parsers; no local paths. Full audit also records actor, old/new, target, time and approval locally outside worker write access.
-Saved is not Applied. Verify service readback before reporting completion. Unsupported or stale remains explicit.
+Saved is not Applied: completion and unsupported/stale values follow [shared verification](https://github.com/taskqorg/specq/blob/main/engineering/verification.md) on service readback.
 
 ## P7 Migration
 

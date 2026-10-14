@@ -99,6 +99,12 @@
    {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
    {"id": 11, "body": "taskq answer 7.1"}
   ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac"}},
+  {"name": "owner action: ask without options starts no attempt; the answer resumes the same worker", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: ask attempt 10\nDone: tests pass\nProblem: add the board token"},
+   {"id": 12, "body": "taskq: spawn worker claude:s2 win"},
+   {"id": 13, "body": "taskq: answer\ntoken added"}
+  ], "expect": {"state": "doing", "attempt": 10, "role": "worker", "session": "claude:s1 mac", "inbox": [13]}},
   {"name": "ask shows the card", "entries": [
    {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
    {"id": 11, "body": "taskq: ask attempt 10\nWhich DB?"}

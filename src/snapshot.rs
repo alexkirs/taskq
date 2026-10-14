@@ -210,7 +210,9 @@ impl Snapshot {
                     let label = if t.chars().count() > 120 { format!("[{label}]({url})") } else { label };
                     format!("{n}.{k} {label}{}", if *star { " ★" } else { "" })
                 }).collect();
-                format!("| {} | [{}]({}) | {} |", link(r), cell(&compact(&brief(&card), 160)), url, o.join(" · "))
+                // § 2: an `ask` card without options is an owner action
+                let o = if o.is_empty() && r.task.state == State::Ask { cell(&format!("waiting for owner: {}", compact(&brief(&card), 120))) } else { o.join(" · ") };
+                format!("| {} | [{}]({}) | {o} |", link(r), cell(&compact(&brief(&card), 160)), url)
             })
             .collect();
         if !qs.is_empty() {

@@ -31,7 +31,7 @@ Result SHA, checks, questions and blockers go to the issue as `result`, `ask`, `
 2. `In work N · Waiting for answer N · Ready N`. In work: `doing` + `review`. Waiting: `ask`. Ready: `ready`.
 3. `| Task | State | Runtime | Session |`, one row per open task except `ask`, `later`, `failed`, by priority then number; task and session cells are links; `waiting` rows say `blocked (#M open)`.
 4. `Questions (answer N.M):` and `| Question | Brief reason | Options |` with `N.1 <option> · N.2 <option> ★` (★ =
-   recommended), one row per `ask` and per `review` with options.
+   recommended), one row per `ask` and per `review` with options; an owner action (§ 2) reads `waiting for owner: <action>`.
 5. `Later: [#N title](url), ...` on one line; then `Failed:` with a reason table.
 6. `Hosts: <host> v<version> <age>[ focus off|unknown], ...` from heartbeats (§ 4).
 7. `Next: 1 <action> ★ · 2 <action>` from the PM ([shared Next contract](https://github.com/taskqorg/specq/blob/main/design/workflow.md#ai-assisted-controls)).
@@ -133,8 +133,8 @@ Optional last lines `op-id: <id>`, then `revision: <R>`, of an entry are fields,
 1. `Done: <what was checked or attempted>` -- one line, at most 160 characters; say `not started` when true.
 2. `Problem: <decision needed and user effect>` -- one or two lines, at most 240 characters per line.
 3. Optional `Evidence: [<label>](<url>)` -- one line, at most two screenshot/video/issue/PR links, labels at most 40 characters each.
-4. Two to four options, `1. <action and trade-off>` etc.; one line each, at most 160 characters, exactly one ends in `★`.
-5. To answer: `taskq answer N.K` or comment `K` or the option text. Last line; substitute this task's number for N.
+4. Two to four options, `1. <action and trade-off>` etc.; one line each, at most 160 characters, exactly one ends in `★`. None: an owner action, its Problem the action; no attempt starts while it waits, its `answer` resumes the same session.
+5. To answer: `taskq answer N.K` or comment `K` or the option text; an owner action: `taskq answer N --text <done>`. Last line; substitute this task's number for N.
 Accepted shared UI target: [answer card](docs/design/answer-card.md) owns the reusable TaskQ/DashQ presentation; § 2 and § 5 remain behavioral authority. Tray exception (R6): mount cards only in `ask`; without parsed choices, show text and owner requeue (reason), later and confirmed Close controls. Close cancels without publication through `later` then `close`, each with CLI readback; partial/unknown delivery stays explicit. Other consumers remain read-only for unparsed cards. A card has at most nine nonblank lines. K is an option number; a bare K or option text counts only in `ask` (section 2).
 `--text` supplies literal Done and Problem lines; `--link` supplies Evidence; `--option` and `--recommend` supply the options/star.
 Result decision cards use the same format after the verdict (section 7): append Done/Problem to `--text`, use `--option`, `--recommend`, `--link`; omit all card fields for no decision.

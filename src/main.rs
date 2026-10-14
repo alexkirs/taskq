@@ -341,14 +341,17 @@ fn evidence(l: &str) -> String {
     format!("[{}]({l})", if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) { format!("#{tail}") } else { "link".into() })
 }
 
-/// § 2 ask card: Done, Problem, optional Evidence, 2-4 options with one ★, the answer line.
+/// § 2 ask card: Done, Problem, optional Evidence, 2-4 options with one ★ or none (an owner action), the answer line.
 fn ask_card(n: u64, text: &str, opts: &[String], recommend: Option<&str>, links: &[String]) -> Res<String> {
     let mut lines = fields(text, &[("Done", 1, 1, 160), ("Problem", 1, 2, 240)])?.concat();
     one_line("--option", opts)?;
-    if !(2..=4).contains(&opts.len()) || opts.iter().any(|o| o.contains('★')) {
-        return Err(format!("{} options, allowed 2-4 without ★; --recommend adds it", opts.len()));
+    let action = opts.is_empty() && recommend.is_none();
+    if !action && !(2..=4).contains(&opts.len()) || opts.iter().any(|o| o.contains('★')) {
+        return Err(format!("{} options, allowed 2-4 without ★ (none: an owner action); --recommend adds it", opts.len()));
     }
-    let k = recommend.and_then(|k| k.parse().ok()).filter(|k| (1..=opts.len()).contains(k)).ok_or(format!("--recommend needs one option number 1-{}", opts.len()))?;
+    let k = if action { 0 } else {
+        recommend.and_then(|k| k.parse().ok()).filter(|k| (1..=opts.len()).contains(k)).ok_or(format!("--recommend needs one option number 1-{}", opts.len()))?
+    };
     one_line("--link", links)?;
     if links.len() > 2 {
         return Err("Evidence: at most two --link".into());
@@ -359,6 +362,10 @@ fn ask_card(n: u64, text: &str, opts: &[String], recommend: Option<&str>, links:
     }
     if !ev.is_empty() {
         lines.push(format!("Evidence: {}", ev.join(", ")));
+    }
+    if action {
+        lines.push(format!("To answer: `taskq answer {n} --text <done>`."));
+        return Ok(lines.join("\n"));
     }
     let opts: Vec<String> = numbered(opts, Some(k)).lines().map(String::from).collect();
     limit("option", &opts, 2, 4, 160)?;
@@ -2659,6 +2666,8 @@ mod tests {
         assert!(ask_card(7, "Done: d\nProblem: p", &o(2), None, &[]).unwrap_err().contains("--recommend"));
         assert!(ask_card(7, "Done: d\nProblem: p", &o(2), Some("3"), &[]).is_err());
         assert!(ask_card(7, "Done: d\nProblem: p", &o(2), Some("1"), &vec!["u".to_string(); 3]).is_err());
+        assert_eq!(ask_card(7, "Done: d\nProblem: add the token", &[], None, &[]).unwrap(), "Done: d\nProblem: add the token\nTo answer: `taskq answer 7 --text <done>`.");
+        assert!(ask_card(7, "Done: d\nProblem: p", &[], Some("1"), &[]).is_err(), "--recommend needs options");
         assert_eq!(width("see [#12](https://very/long/url) and `cargo test --locked` https://x/y"), 15, "link targets and code are exempt; outside whitespace counts");
     }
 
@@ -3148,6 +3157,22 @@ mod tests {
         assert_eq!(fold(n, &entries(&b, n).unwrap(), false).card.as_deref(), Some(card.as_str()));
         assert_eq!(b.issue(n).unwrap().title, title);
         assert_eq!(snapshot::brief("Old question?\n1. keep\n2. change"), "Old question?");
+    }
+
+    // Chain: § 2 owner action (#1125): ask without options, R6 row, answer resumes the attempt. Risk: an action card is
+    // refused, shows no action in status, or its answer starts a new attempt.
+    #[test]
+    fn owner_action_waits_in_status_and_its_answer_resumes_the_attempt() {
+        let (b, c) = (Fake::default(), cfg());
+        let n = b.create("t", "", &["taskq".into()]).unwrap();
+        b.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
+        let a = fold(n, &entries(&b, n).unwrap(), false).attempt;
+        b.comment(n, &entry("ask", &[], a, &ask_card(n, "Done: tests pass\nProblem: add the board token", &[], None, &[]).unwrap())).unwrap();
+        let r = report(&b, &c, &Value::Null, &[]).unwrap();
+        assert!(r.contains("| waiting for owner: add the board token |"), "{r}");
+        b.comment(n, &entry("answer", &[], None, "token added")).unwrap();
+        let t = fold(n, &entries(&b, n).unwrap(), false);
+        assert_eq!((t.state, t.attempt, t.inbox.len()), (State::Doing, a, 1));
     }
 
     // Chain: R12 service status fields. Risk: missing data shown as known; failed pause reported ok.

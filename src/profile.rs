@@ -104,9 +104,14 @@ fn append(path: &Path, r: &Record) -> std::io::Result<()> {
 
 /// One record line under the profile lock and retention bound; other record kinds use their own prefix (§ 4 budget).
 pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    let full = || fs::metadata(path).is_ok_and(|m| m.len() > crate::data::LOG_MAX - 512);
+    // A full log is refused before the lock too: appenders then never take the lock from the pruner's nonblocking try.
+    if full() {
+        return Err(std::io::Error::other("log full"));
+    }
     fs::create_dir_all(path.parent().unwrap())?;
     let _lock = log_lock(path)?;
-    if fs::metadata(path).is_ok_and(|m| m.len() > crate::data::LOG_MAX - 512) {
+    if full() {
         return Err(std::io::Error::other("log full"));
     }
     OpenOptions::new().create(true).append(true).open(path)?.write_all(line.as_bytes())

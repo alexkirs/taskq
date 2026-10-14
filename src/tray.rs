@@ -971,7 +971,7 @@ fn notify_state(n: &Value, ps: &[Value]) -> Value {
     let projects: serde_json::Map<String, Value> = ps.iter().filter_map(|p| p["root"].as_str()).map(|r| {
         (r.to_string(), notify::KINDS.iter().map(|k| (k.to_string(), json!([n["projects"][r][k].as_str().filter(|v| notify::MODES.contains(v)), notify::mode(n, r, k)]))).collect())
     }).collect();
-    json!({"status": notify::status(), "host": host, "projects": projects})
+    json!({"status": notify::status(), "failure": notify::failure(), "host": host, "projects": projects})
 }
 
 /// One tick of notifications (M14): the first banner setting asks the OS once; new events move the cursor, which is

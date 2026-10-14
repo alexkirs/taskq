@@ -945,9 +945,12 @@ fn popover_size(m: &Value, max: f64, scale: f64) -> (u32, u32) {
     ((w * k * scale).ceil() as u32, ((h * k).min(max) * scale).round() as u32)
 }
 
-/// Reports a snapshot page that scrolls horizontally or clips content inside the menu (#1073).
+/// Reports a snapshot page that scrolls horizontally or clips content inside the menu (#1073), and a button whose label
+/// is wider than the button, so the text crosses its border (#1049).
 const OVERFLOW: &str = "(()=>{const e=document.documentElement,m=document.querySelector('.menu'),x=Math.max(e.scrollWidth-e.clientWidth,m.scrollWidth-m.clientWidth);
-if(x>0)window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME',x}));})()";
+if(x>0)window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME',x}));
+const seen=new Set();for(const b of m.querySelectorAll('button')){const t=b.textContent.trim().slice(0,24);
+if(b.offsetParent&&b.scrollWidth>b.clientWidth+1&&!seen.has(t)){seen.add(t);window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME button '+t,x:b.scrollWidth-b.clientWidth}));}}})()";
 
 /// The `actions` snapshot: a refused custom range (menu.md M6), without applying a setting.
 const ACTIONS: &str = "(()=>{const q=s=>document.querySelector(s),put=(s,v)=>{const i=q(s);i.value=v;i.dispatchEvent(new Event('input',{bubbles:true}));};

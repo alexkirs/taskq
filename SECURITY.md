@@ -4,4 +4,4 @@ Report vulnerabilities privately through [GitHub vulnerability reporting](https:
 
 Include affected versions, steps to reproduce and the potential impact. Keep vulnerability details and secrets out of public issues.
 
-TaskQ follows the [specq security baseline](https://github.com/taskqorg/specq/blob/main/engineering/security.md); its reporting policy is in [taskq.md](taskq.md#r13-spec-first).
+TaskQ follows the [specq security baseline](https://github.com/taskqorg/specq/blob/main/engineering/security.md); this file is the reporting policy that [taskq.md](taskq.md#r13-spec-first) R13 links.

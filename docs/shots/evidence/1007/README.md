@@ -16,7 +16,7 @@ These are durable GitHub Markdown API renderings with the same local CSS, not sc
 
 ## Implementation quality
 
-The only executable change selects two already existing native snapshot outputs in `update.sh`. No runtime, permission, dependency, test or golden trace changed. The UI source blob IDs match the capture manifest. Final PNGs are unedited native outputs; no generated or reconstructed interface was substituted.
+The capture script selects two already existing native snapshot outputs in `update.sh`; the fixture adds the synthetic cart question. No runtime, permission, dependency, test or golden trace changed. The UI source blob IDs match the capture manifest. Final PNGs are unedited native outputs; no generated or reconstructed interface was substituted.
 
 The earlier [e177c91 capture](https://github.com/taskqorg/taskq/actions/runs/38513752916) was rejected after opening it: Project cut through its Board row; Home cut through a project summary. The existing sequence also captures Attention and Projects, so changing output selection removes the unwanted service-heavy framing without a runtime redesign. No numeric visual gate was added before owner acceptance.
 

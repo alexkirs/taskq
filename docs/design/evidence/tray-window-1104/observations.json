@@ -1,0 +1,83 @@
+{
+  "records": [
+    {
+      "name": "initial-fit",
+      "width": 320,
+      "height": 525,
+      "dpr": 1.399999976158142,
+      "scroll": 525,
+      "header": 5.9933037757873535,
+      "pin": "true",
+      "top": "true"
+    },
+    {
+      "name": "independent-toggles",
+      "width": 320,
+      "height": 525,
+      "dpr": 1.399999976158142,
+      "scroll": 525,
+      "header": 5.9933037757873535,
+      "pin": "false",
+      "top": "false"
+    },
+    {
+      "name": "resized",
+      "width": 425,
+      "height": 590,
+      "dpr": 1.399999976158142,
+      "scroll": 590,
+      "header": 5.9933037757873535,
+      "pin": "true",
+      "top": "false"
+    },
+    {
+      "name": "fixed-header",
+      "width": 425,
+      "height": 200,
+      "dpr": 1.399999976158142,
+      "scroll": 524,
+      "header": 0,
+      "pin": "true",
+      "top": "false"
+    }
+  ],
+  "topBefore": {
+    "topmost": true,
+    "dpi": 96,
+    "visible": true,
+    "width": 464,
+    "height": 743
+  },
+  "topAfter": {
+    "topmost": false,
+    "dpi": 96,
+    "visible": true,
+    "width": 464,
+    "height": 743
+  },
+  "desktopDrag": {
+    "outcome": "unknown",
+    "reason": "Win32 SetCursorPos denied (error 5); no native mouse drag observation"
+  },
+  "restartSize": [
+    425,
+    200
+  ],
+  "restored": [
+    425,
+    200
+  ],
+  "binarySha256": "529199b804ea0aeea5e4beb8c85e81539cd6c19a0233506fc8255d9e26634c71",
+  "uiSources": {
+    "src/tray.rs": "50d202c2cbb9df2563fbc7bcadb5fbf4e0509cf6",
+    "src/tray.html": "0a45de79e465e19b9b5d482676440a7be60928fc",
+    "Cargo.toml": "e72182ff6641f4ff05dea3589eb5bd569f39f69a"
+  },
+  "environment": {
+    "os": "Windows",
+    "renderer": "native WebView2 via CDP; no substituted HTML or mocked IPC",
+    "rust": "1.99.0 x86_64-pc-windows-gnu",
+    "theme": "light",
+    "fixture": "isolated installation with no registered projects or service"
+  }
+}

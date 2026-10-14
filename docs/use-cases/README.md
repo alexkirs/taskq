@@ -328,3 +328,5 @@ Improvement proposals the PM makes in chat, one line each, oldest first: `- YYYY
 - 2026-10-14 Find why the dashboard shows Windows agentq data 13 h old after the Rust cutover (from owner review in chat)
 - 2026-10-14 Fold post-release checks into the Acceptance of the task that ships the change instead of filing separate follow-up tasks; the GitHub budget series took 6 tasks where 2 would do (from owner question on task granularity)
 - 2026-10-14 Split a wave by host so Mac and Windows workers run in parallel: host-bound evidence per host, runtime any, one release task depending on all (from owner request to spread work across hosts)
+
+- 2026-10-15 Separate Pin and Top, fix the draggable header, keep resized dimensions, fit first open at current DPI/font and accept first clicks on macOS; approved in #1104 (from owner request in chat)

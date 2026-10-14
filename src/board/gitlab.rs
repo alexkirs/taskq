@@ -150,6 +150,10 @@ impl Board for GitLab {
         Ok(self.api.all(&url)?.iter().map(|v| self.parse_issue(v)).collect())
     }
 
+    fn hosts(&self) -> Result<Vec<Issue>> {
+        Ok(self.api.all("/issues?state=all&labels=taskq-host&per_page=100")?.iter().map(|v| self.parse_issue(v)).collect())
+    }
+
     fn issue(&self, n: u64) -> Result<Issue> {
         Ok(self.parse_issue(&self.api.call("GET", &format!("/issues/{n}"), None)?.json()?))
     }

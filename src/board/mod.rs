@@ -38,6 +38,10 @@ pub trait Board {
     fn ensure_labels(&self, _names: &[String]) -> Result<()> { Ok(()) }
     /// Open issues; with `since` (board seconds) every issue, closed too, updated at or after it.
     fn issues(&self, since: Option<i64>) -> Result<Vec<Issue>>;
+    /// Host heartbeat issues (label `taskq-host`) in every state, one request (§ 4 step 3).
+    fn hosts(&self) -> Result<Vec<Issue>> {
+        Ok(self.issues(Some(0))?.into_iter().filter(|i| i.labels.iter().any(|l| l == "taskq-host")).collect())
+    }
     fn issue(&self, n: u64) -> Result<Issue>;
     fn comments(&self, n: u64) -> Result<Vec<Comment>>;
     fn comment(&self, n: u64, body: &str) -> Result<u64>;

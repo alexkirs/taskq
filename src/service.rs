@@ -135,7 +135,8 @@ pub fn cleanup(board: &dyn Board, root: &std::path::Path, mut skip: impl FnMut(u
 pub fn views(board: &dyn Board, cache: &mut HashMap<u64, (i64, Vec<Comment>)>) -> Result<(Vec<View>, Vec<Issue>), String> {
     let issues = board.issues(None)?;
     let open: HashSet<u64> = issues.iter().map(|i| i.number).collect();
-    let (hosts, tasks): (Vec<Issue>, Vec<Issue>) = issues.into_iter().filter(|i| i.trusted).partition(is_host);
+    let tasks: Vec<Issue> = issues.into_iter().filter(|i| i.trusted && !is_host(i)).collect();
+    let hosts: Vec<Issue> = board.hosts()?.into_iter().filter(|i| i.trusted && is_host(i)).collect();
     let mut out = vec![];
     for issue in tasks.into_iter().filter(|i| is_task(i) || is_held(i)) {
         let comments = match cache.get(&issue.number) {
@@ -660,11 +661,20 @@ impl<'a> Service<'a> {
         let body = self.heartbeat_body();
         self.host_issue = hosts.iter().find(|h| h.title == title).map(|h| h.number);
         match hosts.iter().find(|h| h.title == title) {
-            Some(h) if h.body.lines().filter(|l| !l.starts_with("at ")).eq(body.lines()) && now - h.updated < ttl / 3 => {}
-            // a same-body edit leaves `updated_at` as is (GitHub), so the stamp keeps the heartbeat fresh
-            Some(h) => self.board.edit(h.number, &format!("{body}\nat {now}"))?,
+            Some(h) => {
+                if !h.body.lines().filter(|l| !l.starts_with("at ")).eq(body.lines()) || now - h.updated >= ttl / 3 {
+                    // a same-body edit leaves `updated_at` as is (GitHub), so the stamp keeps the heartbeat fresh
+                    self.board.edit(h.number, &format!("{body}\nat {now}"))?;
+                }
+                // § 4 heartbeats stay closed: the open list holds only tasks; a reopened or pre-#1131 one is closed again
+                if h.open {
+                    self.board.close(h.number)?;
+                }
+            }
             None => {
-                self.host_issue = Some(self.board.create(&title, &body, &[HOST_LABEL.to_string()])?);
+                let n = self.board.create(&title, &body, &[HOST_LABEL.to_string()])?;
+                self.host_issue = Some(n);
+                self.board.close(n)?;
             }
         }
 
@@ -1306,6 +1316,38 @@ mod tests {
         assert!(w.pass().is_ok());
     }
 
+    // Chain: § 4 step 3 closed heartbeats (#1131). Risk: an open heartbeat crowds the task list, or a closed one
+    // stops carrying freshness and leases.
+    #[test]
+    fn heartbeats_stay_closed_and_keep_leases() {
+        let b = Fake::default();
+        let old = b.create("taskq host mac", "version 4.0.0", &[HOST_LABEL.into()]).unwrap();
+        let c = cfg("mac");
+        let mut s = service(&b, &c, Default::default());
+        s.pass().unwrap();
+        let hb = b.issue(old).unwrap();
+        assert!(!hb.open && hb.body.starts_with(&format!("version {}", s.version)), "pre-#1131 open heartbeat closed and written: {hb:?}");
+        assert!(b.issues(None).unwrap().is_empty(), "open list holds only tasks");
+        let w = cfg("win");
+        let mut win = service(&b, &w, Default::default());
+        win.pass().unwrap();
+        let new = b.hosts().unwrap().into_iter().find(|i| i.title == "taskq host win").unwrap();
+        assert!(!new.open, "new heartbeat created closed");
+        b.state.borrow_mut().issues.iter_mut().find(|i| i.number == old).unwrap().open = true;
+        s.pass().unwrap();
+        assert!(!b.issue(old).unwrap().open, "reopened heartbeat closed again");
+        // a closed heartbeat still leases: a live attempt stays, an expired host's gets gone
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
+        let a = b.comment(n, &core::entry("spawn", &["worker", "claude:session", "mac"], None, "")).unwrap();
+        b.advance(w.ttl + 1);
+        b.edit(old, &format!("version {}\n#{n} {a}", s.version)).unwrap();
+        win.pass().unwrap();
+        assert_eq!(task(&b, n).attempt, Some(a), "fresh closed heartbeat lists the attempt: leased");
+        b.advance(w.ttl + 1);
+        win.pass().unwrap();
+        assert!(b.comments(n).unwrap().iter().any(|c| c.body.contains("gone")), "stale closed heartbeat: gone");
+    }
+
     // Chain: § 4 board budget, heartbeat. Risk: a PATCH every pass burns the shared budget, or a sparse heartbeat
     // lets another host expire a live lease.
     #[test]
@@ -1313,7 +1355,7 @@ mod tests {
         let b = Fake::default();
         let c = cfg("mac");
         let mut s = service(&b, &c, Default::default());
-        let beat = |b: &Fake| b.issues(None).unwrap().into_iter().find(|i| i.title == "taskq host mac").map(|i| i.updated).unwrap();
+        let beat = |b: &Fake| b.hosts().unwrap().into_iter().find(|i| i.title == "taskq host mac").map(|i| i.updated).unwrap();
         s.pass().unwrap();
         let (mut writes, mut last) = (0, beat(&b));
         for _ in 0..60 {
@@ -1871,7 +1913,7 @@ mod tests {
         s.pass().unwrap();
         assert_eq!((e.borrow().len(), task(&b, m).state), (1, State::Ready), "no resume, no claim while held");
         assert!(b.comments(m).unwrap().is_empty(), "no spawn written while held");
-        let hb = b.issues(None).unwrap().into_iter().find(is_host).unwrap();
+        let hb = b.hosts().unwrap().into_iter().find(is_host).unwrap();
         assert!(hb.body.lines().any(|l| l == format!("#{n} {a}")), "held resume keeps its lease: {}", hb.body);
         assert_eq!(s.capacity_json()["gate"], "held");
         // other hosts leave a listed lease alone

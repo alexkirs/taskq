@@ -198,6 +198,10 @@ impl Board for GitHub {
         Ok(self.api.all(&url)?.iter().filter(|v| v.get("pull_request").is_none()).map(parse_issue).collect())
     }
 
+    fn hosts(&self) -> Result<Vec<Issue>> {
+        Ok(self.api.all("/issues?state=all&labels=taskq-host&per_page=100")?.iter().filter(|v| v.get("pull_request").is_none()).map(parse_issue).collect())
+    }
+
     fn issue(&self, n: u64) -> Result<Issue> {
         Ok(parse_issue(&self.api.call("GET", &format!("/issues/{n}"), None)?.json()?))
     }

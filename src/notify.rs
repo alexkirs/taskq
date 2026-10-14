@@ -197,8 +197,9 @@ pub fn sample(n: &Value, kind: &str, now: i64) -> Post {
     Post { root: String::new(), n: None, title: format!("taskq · {}", label(kind)), body: "#1 Sample task".into(), sound: host(n, kind) == "sound", id: json!({"test": kind, "at": now}).to_string() }
 }
 
-/// OS permission as the Settings page shows it: `allowed`, `blocked`, `not asked`, `unknown` or `unsupported`.
-pub use os::{open_settings, post, request, status, watch};
+/// OS permission as the Settings page shows it: `allowed`, `blocked`, `not asked`, `asking` (the OS prompt is open),
+/// `request failed`, `unknown` or `unsupported`; `failure` is the error of a failed request (macOS), also written to `tray.log`.
+pub use os::{failure, open_settings, post, request, status, watch};
 
 #[cfg(target_os = "macos")]
 mod os {
@@ -210,13 +211,17 @@ mod os {
     use objc2_foundation::{NSBundle, NSError, NSString};
     use objc2_user_notifications::*;
     use std::ptr::NonNull;
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     /// -1 unknown, else UNAuthorizationStatus; refreshed asynchronously.
     static STATUS: AtomicI64 = AtomicI64::new(-1);
     static CLICK: OnceLock<Mutex<Box<dyn Fn(String) + Send>>> = OnceLock::new();
     static DELEGATE: OnceLock<usize> = OnceLock::new();
+    /// The error of a failed authorization request, kept for the process: the page shows it instead of `not asked`.
+    static FAILED: Mutex<Option<String>> = Mutex::new(None);
+    /// A request waits for the owner's answer; meanwhile the OS reports denied.
+    static ASKING: AtomicBool = AtomicBool::new(false);
 
     /// UNUserNotificationCenter raises outside an app bundle: only `<install>/TaskQ.app` has one.
     fn center() -> Option<Retained<UNUserNotificationCenter>> {
@@ -237,7 +242,11 @@ mod os {
             return "unsupported";
         }
         refresh();
+        if ASKING.load(Ordering::Relaxed) {
+            return "asking";
+        }
         match STATUS.load(Ordering::Relaxed) {
+            0 | 1 if FAILED.lock().is_ok_and(|f| f.is_some()) => "request failed",
             0 => "not asked",
             1 => "blocked",
             2..=4 => "allowed",
@@ -251,7 +260,19 @@ mod os {
         if STATUS.load(Ordering::Relaxed) != 0 {
             return;
         }
-        let block = RcBlock::new(|_: objc2::runtime::Bool, _: *mut NSError| refresh());
+        ASKING.store(true, Ordering::Relaxed);
+        let block = RcBlock::new(|_: objc2::runtime::Bool, e: *mut NSError| {
+            ASKING.store(false, Ordering::Relaxed);
+            // SAFETY: the OS passes null or a valid NSError for the duration of the call
+            if let Some(e) = unsafe { e.as_ref() } {
+                let m = format!("{} ({} {})", e.localizedDescription(), e.domain(), e.code());
+                eprintln!("taskq tray: notification authorization request failed: {m}");
+                if let Ok(mut f) = FAILED.lock() {
+                    *f = Some(m);
+                }
+            }
+            refresh();
+        });
         c.requestAuthorizationWithOptions_completionHandler(UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound, &block);
     }
 
@@ -312,6 +333,10 @@ mod os {
         refresh();
     }
 
+    pub fn failure() -> Option<String> {
+        FAILED.lock().ok()?.clone()
+    }
+
     pub fn open_settings() {
         let _ = std::process::Command::new("open").arg("x-apple.systempreferences:com.apple.Notifications-Settings.extension").spawn();
     }
@@ -327,6 +352,9 @@ mod os {
         "unsupported"
     }
     pub fn request() {}
+    pub fn failure() -> Option<String> {
+        None
+    }
     pub fn post(_: &super::Post) -> bool {
         false
     }

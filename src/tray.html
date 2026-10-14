@@ -352,8 +352,8 @@ function mountResources(){
 // Notifications (menu.md M14): host mode per kind, the OS permission, and per project overrides
 const modes=[['off','Off'],['silent','Silent'],['banner','Banner'],['sound','Banner with sound']],kinds=[['ask','Questions'],['close','Closed'],['failed','Failed'],['gone','Attempt gone']];
 function notifications(){
-  const N=S.notify,st=N.status,line={allowed:'Allowed by the OS',blocked:'Blocked by the OS: nothing is posted','not asked':'Not asked yet: the first banner setting asks the OS',unknown:'OS permission unknown',unsupported:'Not available on this host'}[st]||st;
-  return '<div class="body'+(st==='blocked'?' alert':' meta')+'" role="status">'+esc(line)+'</div>'+(st==='blocked'?'<button class="project" data-a="notify-os">Open OS setting ↗</button>':'')+
+  const N=S.notify,st=N.status,line={allowed:'Allowed by the OS',blocked:'Blocked by the OS: nothing is posted','not asked':'Not asked yet: the first banner setting asks the OS',asking:'Asked: answer the OS prompt','request failed':'OS permission request failed: '+N.failure,unknown:'OS permission unknown',unsupported:'Not available on this host'}[st]||st;
+  return '<div class="body'+(st==='blocked'||st==='request failed'?' alert':' meta')+'" role="status">'+esc(line)+'</div>'+(st==='blocked'?'<button class="project" data-a="notify-os">Open OS setting ↗</button>':'')+
     kinds.map(([k,l])=>'<div class="body">'+l+'</div><div class="options">'+modes.map(([v,m])=>'<button data-a="notify" data-kind="'+k+'" data-v="'+v+'" aria-pressed="'+(N.host[k]===v)+'">'+m+'</button>').join('')+'<button data-a="notify-test" data-kind="'+k+'"'+(st==='allowed'?'':' disabled')+'>Send test</button></div>').join('');
 }
 function notifyGroup(p){

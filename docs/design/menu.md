@@ -154,7 +154,7 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 - A project may override the host setting per kind (Inherit by default); the project page shows the effective value.
 - A notification names the project, the task title and the kind; a click opens the menu (or the pinned window) on that task's card, for `ask` the answer card.
 - Each event notifies at most once: a per-project cursor of the last notified event id persists in `<install>/tray.json`; events older than the cursor, or older than the first tray start with notifications on, never notify. More than 3 events within 10 s become one summary notification per project.
-- The first enable asks the OS for permission on macOS; Windows reads the OS notification setting without a consent prompt. Denied or revoked: Settings shows `Blocked by the OS` with a link to the OS setting, and nothing falls back to another channel. `Send test` posts one sample of the selected kind.
+- The first enable asks the OS for permission on macOS; Windows reads the OS notification setting without a consent prompt. While the prompt is open Settings shows `Asked`; a failed request shows its OS error, never `Not asked`. Denied or revoked: Settings shows `Blocked by the OS` with a link to the OS setting, and nothing falls back to another channel. `Send test` posts one sample of the selected kind.
 - Settings persist in `<install>/tray.json`; an unknown value reads as the default and keeps the file.
 
 ## Acceptance

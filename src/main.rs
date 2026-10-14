@@ -1047,13 +1047,18 @@ fn keep_tray(install: &Path, tray: &mut Option<std::process::Child>) {
             exe = stable;
         }
     }
+    let mut c = std::process::Command::new(&exe);
+    c.arg("tray");
+    // through LaunchServices: a bundle exec'd by the service has the unbundled service as its responsible process,
+    // and the OS refuses its authorization request (UNErrorDomain 1). `open` passes no args, env or stderr here: the
+    // bundle with no args is the tray of its parent folder and writes its own tray.log (`bundled_tray`)
     #[cfg(target_os = "macos")]
     if let Some(app) = tray_app(install, &exe) {
-        exe = app;
+        c = std::process::Command::new("open");
+        c.args(["-n", "-W", "-g"]).arg(app);
     }
-    let mut c = std::process::Command::new(exe);
     let err = fs::File::create(install.join("tray.log")).map(std::process::Stdio::from).unwrap_or_else(|_| std::process::Stdio::null());
-    c.arg("tray").current_dir(install).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(err);
+    c.current_dir(install).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(err);
     // its own process group: stopping one project's service (launchctl bootout) leaves the host's tray alone
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut c, 0);
@@ -1087,7 +1092,21 @@ fn tray_app(install: &Path, exe: &Path) -> Option<PathBuf> {
             std::process::Command::new("codesign").args(["-f", "-s", "-"]).arg(&app).output().is_ok_and(|o| o.status.success())
         }
     };
-    signed.then_some(bin)
+    signed.then_some(app)
+}
+
+/// The tray `open` started (`keep_tray`): `<install>/TaskQ.app/Contents/MacOS/taskq` with no args runs the tray of
+/// `<install>`, its stderr appended to `<install>/tray.log`.
+#[cfg(target_os = "macos")]
+fn bundled_tray(exe: &Path) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+    let app = exe.ancestors().nth(3).filter(|a| exe.ends_with("TaskQ.app/Contents/MacOS/taskq") && a.ends_with("TaskQ.app"))?;
+    let install = app.parent()?.to_path_buf();
+    if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(install.join("tray.log")) {
+        // SAFETY: both descriptors are open; fd 2 now refers to the log for the life of the process
+        unsafe { libc::dup2(f.as_raw_fd(), 2) };
+    }
+    Some(install)
 }
 
 /// Labels of the open tasks in the last `status.json`, for a resume that has no focus to restore (§ 4).
@@ -2022,6 +2041,14 @@ fn main() {
     let launcher = install.join(t.exe_name()).canonicalize().ok();
     if exe.is_some() && exe == launcher && t.current().is_some() {
         coreq::launcher::launch(&t, &args);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(i) = args.is_empty().then(|| exe.as_deref().and_then(bundled_tray)).flatten() {
+        profile::init(&i);
+        if let Err(e) = tray(i, None, &[], None) {
+            platform::die(&e);
+        }
+        return;
     }
     profile::init(&install);
     let r = run(&args);

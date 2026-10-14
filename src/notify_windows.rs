@@ -68,6 +68,11 @@ pub fn status() -> &'static str {
 // Windows has no notification consent prompt for unpackaged desktop apps.
 pub fn request() {}
 
+/// Windows has no permission prompt, so no request can fail.
+pub fn failure() -> Option<String> {
+    None
+}
+
 fn xml(p: &Post) -> Result<XmlDocument> {
     let doc = XmlDocument::new()?;
     doc.LoadXml(&HSTRING::from(format!("<toast><visual><binding template=\"ToastGeneric\"><text/><text/></binding></visual><audio {} /></toast>",

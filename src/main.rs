@@ -390,17 +390,23 @@ fn result_text(n: u64, text: &str, checks: &[String], opts: &[String], recommend
 }
 
 /// § 7 rule 4 shots gate: a result whose diff from `origin/main` changes a `uiSources` file of `docs/shots/manifest.json`
-/// needs the manifest to record that file's blob at the SHA. Projects without the manifest pass.
-fn shots_gate(root: &Path, sha: &str) -> Res<()> {
-    let git = |args: &[&str]| {
-        let o = std::process::Command::new("git").arg("-C").arg(root).args(args).output().map_err(|e| e.to_string())?;
-        if o.status.success() { Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { Err(String::from_utf8_lossy(&o.stderr).trim().to_string()) }
-    };
-    let Ok(text) = git(&["show", &format!("{sha}:docs/shots/manifest.json")]) else { return Ok(()) };
+/// needs the manifest to record that file's blob at the SHA. Only a readable candidate without the manifest passes unchecked;
+/// any other Git or manifest failure reads unknown and refuses (R12).
+fn shots_gate(git_bin: &str, root: &Path, sha: &str) -> Res<()> {
     let unknown = |e: String| format!("shots check unknown: {e}");
-    let m: Value = serde_json::from_str(&text).map_err(|e| unknown(format!("docs/shots/manifest.json: {e}")))?;
-    let changed = git(&["diff", "--name-only", &format!("origin/main...{sha}")]).map_err(unknown)?;
-    let stale: Vec<&str> = changed.lines().filter(|f| m["uiSources"].get(*f).is_some_and(|b| git(&["rev-parse", &format!("{sha}:{f}")]).ok().as_deref() != b.as_str())).collect();
+    let git = |args: &[&str]| {
+        let o = std::process::Command::new(git_bin).arg("-C").arg(root).args(args).output().map_err(|e| unknown(format!("{git_bin}: {e}")))?;
+        if o.status.success() { Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { Err(unknown(String::from_utf8_lossy(&o.stderr).trim().to_string())) }
+    };
+    // `ls-tree` succeeds with empty output for an absent path and fails for an unreadable tree-ish.
+    let blob = |f: &str| git(&["ls-tree", "--object-only", &format!("{sha}^{{commit}}"), "--", f]);
+    if blob("docs/shots/manifest.json")?.is_empty() { return Ok(()) }
+    let m: Value = serde_json::from_str(&git(&["show", &format!("{sha}:docs/shots/manifest.json")])?).map_err(|e| unknown(format!("docs/shots/manifest.json: {e}")))?;
+    let ui = m["uiSources"].as_object().ok_or_else(|| unknown("docs/shots/manifest.json lacks uiSources".into()))?;
+    let mut stale = vec![];
+    for f in git(&["diff", "--name-only", &format!("origin/main...{sha}")])?.lines() {
+        if let Some(b) = ui.get(f) && blob(f)? != b.as_str().unwrap_or_default() { stale.push(f.to_string()) }
+    }
     if stale.is_empty() { Ok(()) } else { Err(format!("stale README shots: {} changed without a manifest update; run docs/shots/update.sh and commit docs/shots/", stale.join(", "))) }
 }
 
@@ -1979,7 +1985,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             let n = a.num(1)?;
             let sha = a.need("sha")?;
             let body = result_text(n, text, &a.all("checks"), &a.all("option"), a.one("recommend"), &a.all("link"))?;
-            shots_gate(root, sha)?;
+            shots_gate("git", root, sha)?;
             emit(&[act(b, root, n, "result", &[sha], &body, &op)], json)
         }
         "requeue" => {
@@ -2780,16 +2786,22 @@ mod tests {
         git(&["init", "-q"]);
         let base = commit("v1", true);
         git(&["update-ref", "refs/remotes/origin/main", &base]);
-        assert!(shots_gate(&root, &base).is_ok(), "an unchanged diff passes");
+        assert!(shots_gate("git", &root, &base).is_ok(), "an unchanged diff passes");
         let stale = commit("v2", false);
-        let e = shots_gate(&root, &stale).unwrap_err();
+        let e = shots_gate("git", &root, &stale).unwrap_err();
         assert!(e.contains("src/tray.rs") && e.contains("docs/shots/update.sh"), "{e}");
         let fresh = commit("v3", true);
-        assert!(shots_gate(&root, &fresh).is_ok(), "a fresh manifest passes");
+        assert!(shots_gate("git", &root, &fresh).is_ok(), "a fresh manifest passes");
         fs::remove_file(root.join("docs/shots/manifest.json")).unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-qm", "no shots"]);
-        assert!(shots_gate(&root, &git(&["rev-parse", "HEAD"])).is_ok(), "a project without the manifest passes");
+        let bare = git(&["rev-parse", "HEAD"]);
+        assert!(shots_gate("git", &root, &bare).is_ok(), "a readable candidate without the manifest passes");
+        for (bin, sha, why) in [("taskq-no-such-git", fresh.as_str(), "Git unavailable"), ("git", &"f".repeat(40), "candidate unavailable"), ("git", "", "empty SHA")] {
+            let e = shots_gate(bin, &root, sha).unwrap_err();
+            assert!(e.starts_with("shots check unknown"), "{why}: {e}");
+        }
+        assert!(shots_gate("git", &root.join("nowhere"), &bare).unwrap_err().starts_with("shots check unknown"), "no repository");
         let _ = fs::remove_dir_all(&root);
     }
 

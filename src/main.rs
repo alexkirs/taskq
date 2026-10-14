@@ -556,6 +556,7 @@ fn service_run(c: &Ctx) -> Res<()> {
     let mut checked: Option<Instant> = None;
     let mut update: Option<String> = None;
     let mut restart_empty: Option<u64> = None;
+    let mut waits_logged = String::new();
     let _ = fs::remove_file(d.join("restart"));
     operator::recover(&cfg.root);
     // ponytail: the operator takes no slot of `limits`; count it when operators crowd out workers
@@ -644,6 +645,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
             ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
+            ("restart_waits", json!(d.join("restart").exists().then(|| restart_waits(&s, &cfg.root)))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root))),
             ("requests", budget.json(since, last_hour.as_ref()))]
         {
@@ -658,7 +660,9 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         // § 4 step 7: a not installed service only reports a newer version; `<root>/.taskq/update` checks at once
         let asked = fs::remove_file(d.join("update")).is_ok();
-        if asked || checked.is_none_or(|t| t.elapsed().as_secs() >= cfg.update_every) {
+        // § 8 step 3: a pending restart already goes to `current`; repeating the check would only repeat its log line
+        let pending = is_installed && d.join("restart").exists();
+        if !pending && (asked || checked.is_none_or(|t| t.elapsed().as_secs() >= cfg.update_every)) {
             checked = Some(Instant::now());
             if is_installed {
                 match platform::service_update(&cfg.install) {
@@ -682,10 +686,14 @@ fn service_run(c: &Ctx) -> Res<()> {
         restart_watch(&mut restart_empty, cfg!(windows) && d.join("restart").exists() && s.kids.is_empty(), began.elapsed().as_secs(), cfg.update_every);
         if is_installed && d.join("restart").exists() {
             // Windows re-exec waits for the live children; the request stays until it can go
-            if !operator::running(&cfg.root) && ((cfg!(unix) && !s.kids.iter().any(|k| matches!(k.rt.as_str(), "codex-app" | "claude"))) || s.kids.is_empty()) {
+            let waits = restart_waits(&s, &cfg.root).join(", ");
+            if waits.is_empty() {
                 let _ = fs::remove_file(d.join("restart"));
                 log!("restart requested");
+            } else if waits != waits_logged {
+                log!("restart to {} waits for {waits}", platform::tool(&cfg.install).current().unwrap_or_default());
             }
+            waits_logged = waits;
             reexec(&s, cfg)?;
         }
         // § 4 Data: the pruners run hourly
@@ -1139,7 +1147,7 @@ fn kill_service(root: &Path) {
 fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     use std::os::unix::process::CommandExt;
     // App turns have no adoptable child; keep their lease until completion.
-    if s.kids.iter().any(|k| matches!(k.rt.as_str(), "codex-app" | "claude")) || operator::running(&cfg.root) {
+    if !restart_waits(s, &cfg.root).is_empty() {
         return fs::write(dot(&cfg.root).join("restart"), "").map_err(|e| e.to_string());
     }
     let mut text = format!("pid {}\n", std::process::id());
@@ -1156,11 +1164,21 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
 fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     // ponytail: Windows cannot hand children to a new image; exit once no child is live and the unit restarts us.
     // The new `current` is already written, so the update waits only for the running attempts.
-    if s.kids.is_empty() && !operator::running(&cfg.root) {
+    if restart_waits(s, &cfg.root).is_empty() {
         std::process::exit(75);
     }
-    // later update checks see no newer version: the restart request carries the re-exec until the children end
+    // update checks pause while the restart request carries the re-exec until the children end
     fs::write(dot(&cfg.root).join("restart"), "").map_err(|e| e.to_string())
+}
+
+/// § 8 step 3: what a pending re-exec waits for. Windows waits for every live child; elsewhere CLI children pass over.
+fn restart_waits(s: &Service, root: &Path) -> Vec<String> {
+    let mut w: Vec<String> = s.kids.iter().filter(|k| cfg!(windows) || matches!(k.rt.as_str(), "codex-app" | "claude")).map(|k| format!("#{}", k.task)).collect();
+    w.dedup();
+    if operator::running(root) {
+        w.push("operator".into());
+    }
+    w
 }
 
 fn service_fields(root: &Path) -> String {
@@ -1177,6 +1195,9 @@ fn service_fields(root: &Path) -> String {
         out.push(format!("Status: unknown ({e})"));
     }
     let status = status.ok().flatten();
+    if let Some(w) = status.as_ref().and_then(|s| s["restart_waits"].as_array()).filter(|w| !w.is_empty()) {
+        out.push(format!("Restart: waits for {}", w.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ")));
+    }
     // § 4 board budget: only a status written within 60 s speaks for the running service
     let requests = match status.as_ref().filter(|_| file_age(&d.join("status.json")).is_some_and(|a| a <= 60)) {
         Some(s) => requests::lines(s),
@@ -2638,6 +2659,7 @@ mod tests {
         s.kids.push(Kid { task: 7, attempt: 41, rt: "codex-app".into(), proc: Box::new(runtime::Adopted(pid as i32)) });
         reexec(&s, &c).unwrap();
         assert!(dot(&root).join("restart").exists());
+        assert_eq!(restart_waits(&s, &root), ["#7"], "status and log name the task the restart waits for");
         assert_eq!(s.kids[0].attempt, 41);
         assert_eq!(adopted.exited(), Ok(None));
         s.kids.clear();
@@ -2646,6 +2668,7 @@ mod tests {
         fs::write(operator::answer_path(&root, "1"), r#"{"state":"running"}"#).unwrap();
         reexec(&s, &c).unwrap();
         assert!(dot(&root).join("restart").exists() && handover(&root));
+        assert_eq!(restart_waits(&s, &root), ["operator"]);
         fs::write(operator::answer_path(&root, "1"), r#"{"state":"result"}"#).unwrap();
         // an idle service reloads the unit, which would end a child
         fs::write(dot(&root).join("status.json"), r#"{"kids": []}"#).unwrap();

@@ -729,8 +729,8 @@ impl<'a> Service<'a> {
             let (rt, session) = rt_of(t).unwrap_or(("", ""));
             let mut session = session.to_string();
             let mut l = Launch { task: n, title: v.issue.title.clone(), attempt: a, role: t.role.clone().unwrap_or_default(), rt: rt.into(), session: session.clone(), url: self.board.url(n), resume: None };
-            if session == "-" {
-                session = crate::runtime::codex_thread(&crate::runtime::log_path(&self.cfg.root, &l)).unwrap_or_default();
+            if session == "-" || rt == "claude" {
+                session = crate::runtime::codex_thread(&crate::runtime::log_path(&self.cfg.root, &l)).unwrap_or_else(|| if session == "-" { String::new() } else { session });
             }
             let text: Vec<String> = new.iter().map(|c| core::delivery(n, &v.log, c.id)).collect();
             l.session = session;
@@ -1249,7 +1249,6 @@ mod tests {
             ("codex-app", "claude", 1, "claude"),
             ("codex-app", "claude", 0, "codex-app"),
         ] {
-            if worker == "codex-app" && !cfg!(target_os = "macos") { continue; } // § 8: codex-app is macOS only
             let b = Fake::default();
             let n = b.create("T", "", &["taskq".into(), format!("run-{worker}")]).unwrap();
             let mut c = cfg("mac");
@@ -1288,11 +1287,23 @@ mod tests {
     fn answer_resumes_the_same_session_and_requeue_stops_the_child() {
         let b = Fake::default();
         let n = b.create("T", "", &["taskq".into()]).unwrap();
-        let c = cfg("mac");
+        let mut c = cfg("mac");
+        c.root = std::env::temp_dir().join(format!("taskq-session-{}", crate::runtime::uuid()));
+        std::fs::create_dir_all(c.root.join(".taskq")).unwrap();
         let e: Exits = Default::default();
-        let mut s = service(&b, &c, e.clone());
+        let sessions = Rc::new(RefCell::new(Vec::new()));
+        let seen = sessions.clone();
+        let exits = e.clone();
+        let mut s = Service::new(&b, &c, "4.0.0", Box::new(move |l| {
+            seen.borrow_mut().push(l.session.clone());
+            let flag = Rc::new(RefCell::new(None));
+            exits.borrow_mut().push((l.task, flag.clone()));
+            Ok(Box::new(FakeProc(flag)))
+        }));
+        s.focus = vec!["all".into()];
         s.pass().unwrap();
         let a = task(&b, n).attempt.unwrap();
+        std::fs::write(c.root.join(format!(".taskq/T{n}-{a}.log")), "{\"type\":\"thread.started\",\"thread_id\":\"native-session\"}\n").unwrap();
         b.comment(n, &core::entry("ask", &[], Some(a), "Which?\n1. x\n2. y ★")).unwrap();
         *e.borrow()[0].1.borrow_mut() = Some(0);
         s.pass().unwrap();
@@ -1307,6 +1318,7 @@ mod tests {
         s.pass().unwrap();
         assert!(s.owner_comments.is_empty(), "answered: no owner comment left");
         assert_eq!(e.borrow().len(), 2, "resumed once");
+        assert_eq!(sessions.borrow()[1], "native-session", "resume resolves the pre-launch alias");
         let t = task(&b, n);
         assert_eq!((t.state, t.attempt), (State::Doing, Some(a)));
         s.pass().unwrap();
@@ -1316,6 +1328,7 @@ mod tests {
         s.pass().unwrap();
         assert_eq!(*e.borrow()[1].1.borrow(), Some(-9));
         assert!(s.kids.is_empty());
+        std::fs::remove_dir_all(&c.root).unwrap();
     }
 
     // Chain: § 8 Access refusal. Risk: a refused runtime is claimed (phantom attempt, retries) or resumed, or its

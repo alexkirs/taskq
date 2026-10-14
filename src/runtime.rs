@@ -109,7 +109,7 @@ impl Proc for Adopted {
     }
 }
 
-/// A random UUID v4 for a Claude `--session-id`.
+/// A random UUID v4 for the pre-launch Claude identity and qualification fixtures.
 pub fn uuid() -> String {
     use ring::rand::{SecureRandom, SystemRandom};
     let mut b = [0u8; 16];
@@ -120,7 +120,7 @@ pub fn uuid() -> String {
     format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
 }
 
-/// The session written into `spawn`: Claude's is chosen up front; Codex names its thread later, in the log (`-`).
+/// Claude has a pre-launch alias; the log resolves it (and Codex `-`) to the native session.
 pub fn new_session(rt: &str) -> String {
     if rt == "claude" { uuid() } else { "-".into() }
 }
@@ -166,16 +166,19 @@ pub struct Env<'a> {
     pub board_env: &'a [(String, String)],
 }
 
-pub fn command(env: &Env, l: &Launch, access: &crate::policy::Effective) -> Command {
-    let bin = which(if l.rt == "claude" { "claude" } else { "codex" });
-    let mut c = match &access.profile {
+fn executable(bin: PathBuf, access: &crate::policy::Effective) -> Command {
+    match &access.profile {
         Some(p) => {
             let mut c = Command::new("/usr/bin/sandbox-exec");
             c.arg("-p").arg(p).arg(bin);
             c
         }
         None => Command::new(bin),
-    };
+    }
+}
+
+pub fn command(env: &Env, l: &Launch, access: &crate::policy::Effective) -> Command {
+    let mut c = executable(which(if l.rt == "claude" { "claude" } else { "codex" }), access);
     crate::platform::quiet(&mut c);
     let codex = access.codex.as_deref().unwrap_or(env.codex);
     let mode = access.claude.as_deref().unwrap_or(env.permission_mode);
@@ -191,6 +194,11 @@ pub fn command(env: &Env, l: &Launch, access: &crate::policy::Effective) -> Comm
             c.args(["exec", "--json"]).args(codex).args(["resume", &l.session, "-"]);
         }
     }
+    environment(env, l, &mut c);
+    c
+}
+
+fn environment(env: &Env, l: &Launch, c: &mut Command) {
     c.current_dir(env.root)
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
@@ -199,7 +207,6 @@ pub fn command(env: &Env, l: &Launch, access: &crate::policy::Effective) -> Comm
         .env("TASKQ_ROLE", &l.role)
         .env("TASKQ_ROOT", env.root)
         .envs(env.board_env.iter().cloned());
-    c
 }
 
 const FORMATS: &str = "Put each `--text` field on its own line. The commands render and check the taskq.md templates and limits (§ 2 Ask card,\n\
@@ -347,6 +354,9 @@ pub fn spawn(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
         }
         return Ok(Box::new(turn));
     }
+    if l.rt == "claude" && (l.resume.is_none() || claude_background(env.root, &l.session).map_err(|message| StartError { message, reportable: false })?) {
+        return ClaudeTurn::start(env, l, &log, &text, &access).map(|p| Box::new(p) as Box<dyn Proc>).map_err(|message| StartError { message, reportable: false });
+    }
     Ok(Box::new(start(env, l, &log, &text, &access)?))
 }
 
@@ -363,6 +373,158 @@ fn start(env: &Env, l: &Launch, log: &Path, text: &str, access: &crate::policy::
         return Err(StartError::io(e, Some(&l.rt)));
     }
     Ok(child)
+}
+
+/// Native background sessions are not children of TaskQ. Keep their full identity and
+/// observe the completed input before releasing the attempt's capacity.
+pub struct ClaudeTurn {
+    root: PathBuf,
+    log: PathBuf,
+    session: String,
+    id: String,
+    announced: bool,
+    copied: usize,
+    before: usize,
+    mode: String,
+    input: String,
+    pid: u32,
+    done: bool,
+}
+
+fn claude_agents(root: &Path) -> Result<Vec<serde_json::Value>, String> {
+    let root = root.to_str().ok_or("Claude project path is not UTF-8")?;
+    let (ok, out) = probe(&which("claude"), &["agents", "--json", "--all", "--cwd", root]).ok_or("Claude agents unavailable or timed out")?;
+    if !ok { return Err(format!("claude agents: {out}")); }
+    serde_json::from_str(&out).map_err(|e| format!("claude agents: {e}"))
+}
+
+fn claude_transcript(session: &str) -> Option<PathBuf> {
+    if session.is_empty() || !session.chars().all(|c| c.is_ascii_hexdigit() || c == '-') { return None; }
+    let home = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).or_else(||
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|h| PathBuf::from(h).join(".claude")))?;
+    std::fs::read_dir(home.join("projects")).ok()?.flatten().find_map(|d| {
+        let p = d.path().join(format!("{session}.jsonl"));
+        p.is_file().then_some(p)
+    })
+}
+
+fn claude_stop(root: &Path, id: &str, known_pid: u32) -> Result<(), String> {
+    let rows = claude_agents(root)?;
+    let row = rows.iter().find(|v| v["id"] == id).ok_or("Claude stop identity unavailable")?;
+    let pid = row["pid"].as_u64().unwrap_or(known_pid as u64) as u32;
+    if row["pid"].as_u64().is_none() && (pid == 0 || !alive(pid)) && row["state"] != "working" { return Ok(()); }
+    let (ok, out) = probe(&which("claude"), &["stop", id]).ok_or("Claude stop unavailable or timed out; state unknown")?;
+    if !ok { return Err(format!("claude stop: {out}")); }
+    // Native stop acknowledges the request before the process has actually stopped.
+    for _ in 0..50 {
+        let rows = claude_agents(root)?;
+        let row = rows.iter().find(|v| v["id"] == id).ok_or("stopped Claude session disappeared; state unknown")?;
+        if row["pid"].as_u64().is_none() && (pid == 0 || !alive(pid)) { return Ok(()); }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err("Claude stop still pending; do not launch another turn".into())
+}
+
+impl ClaudeTurn {
+    pub fn start(env: &Env, l: &Launch, log: &Path, text: &str, access: &crate::policy::Effective) -> Result<Self, String> {
+        let permission_mode = access.claude.as_deref().unwrap_or(env.permission_mode);
+        let root = env.root.canonicalize().map_err(|e| e.to_string())?;
+        let mut expected_id = None;
+        let mut before = 0;
+        if l.resume.is_some() {
+            let rows = claude_agents(&root)?;
+            let row = rows.iter().find(|v| v["sessionId"] == l.session).ok_or("Claude background session unavailable; no replacement")?;
+            if row["pid"].as_u64().is_some() { return Err("Claude session is still running; no copy started".into()); }
+            expected_id = Some(row["id"].as_str().ok_or("Claude background ID missing")?.to_string());
+            let path = claude_transcript(&l.session).ok_or("Claude saved permissions unavailable")?;
+            let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            before = text.lines().count();
+            let mode = text.lines().rev().filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .find_map(|v| v["permissionMode"].as_str().map(String::from)).ok_or("Claude saved permission mode unknown")?;
+            if mode != permission_mode { return Err("Claude saved permission mode differs; a new attempt is required".into()); }
+        }
+        std::fs::create_dir_all(log.parent().ok_or("missing log directory")?).map_err(|e| e.to_string())?;
+        let mut file = File::options().create(true).append(true).open(log).map_err(|e| e.to_string())?;
+        let mut c = executable(which("claude"), access);
+        environment(env, l, &mut c);
+        c.current_dir(&root).arg("--bg");
+        if l.resume.is_some() { c.args(["--resume", &l.session]); }
+        else { c.args(["--remote-control", &l.title, "--permission-mode", permission_mode]); }
+        if l.role == "operator" { for k in ["TASKQ_TASK", "TASKQ_ATTEMPT", "TASKQ_ROLE"] { c.env_remove(k); } }
+        let mut child = crate::platform::quiet(&mut c).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+        if let Err(e) = child.stdin.take().unwrap().write_all(text.as_bytes()) {
+            return Err(format!("Claude background input: {e}; launch outcome unknown"));
+        }
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        writeln!(file, "{}", serde_json::json!({"type":"claude.launch", "stdout":stdout, "stderr":stderr})).map_err(|e| e.to_string())?;
+        if !out.status.success() { return Err(format!("Claude background launch failed: {stderr}")); }
+        let id = stdout.lines().find_map(|line| line.strip_prefix("backgrounded · ").and_then(|s| s.split_whitespace().next())).ok_or("Claude returned no background ID; launch outcome unknown")?;
+        if expected_id.as_deref().is_some_and(|expected| expected != id) {
+            claude_stop(&root, id, 0)?;
+            return Err("Claude created a copy; stopped owned copy, original conversation preserved".into());
+        }
+        Ok(Self { root, log: log.into(), session: if l.resume.is_some() { l.session.clone() } else { String::new() }, id: id.into(),
+            announced: false, copied: 0, before, mode: permission_mode.into(), input: text.trim().into(), pid: 0, done: false })
+    }
+}
+
+impl Proc for ClaudeTurn {
+    fn exited(&mut self) -> Result<Option<i32>, String> {
+        if self.done { return Ok(Some(0)); }
+        let rows = claude_agents(&self.root)?;
+        let row = rows.iter().find(|v| v["id"] == self.id).ok_or("Claude session unavailable; state unknown")?;
+        // On Windows a waking session briefly publishes a different UUID before restore.
+        if !self.announced {
+            if row["status"].as_str().is_none() { return if row["state"] == "stopped" { Ok(Some(-1)) } else { Ok(None) }; }
+            let session = row["sessionId"].as_str().ok_or("Claude session ID unknown")?;
+            if !self.session.is_empty() && self.session != session { return Err("Claude resumed another conversation; identity unknown".into()); }
+            self.session = session.into();
+            let mut file = File::options().append(true).open(&self.log).map_err(|e| e.to_string())?;
+            writeln!(file, "{}", serde_json::json!({"type":"thread.started", "thread_id":session, "session_id":session, "runtime":"claude-bg", "permission_mode":self.mode})).map_err(|e| e.to_string())?;
+            self.announced = true;
+        }
+        self.pid = row["pid"].as_u64().unwrap_or(self.pid as u64) as u32;
+        let path = claude_transcript(&self.session).ok_or("Claude transcript unavailable; completion unknown")?;
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let events: Vec<serde_json::Value> = content.lines().skip(self.before).filter_map(|line| serde_json::from_str(line).ok()).collect();
+        let Some(start) = events.iter().rposition(|v| v["type"] == "user" && v["message"]["content"].as_str().is_some_and(|s| s.trim() == self.input)) else { return Ok(None); };
+        let turn = &events[start..];
+        let mut log = File::options().append(true).open(&self.log).map_err(|e| e.to_string())?;
+        for event in turn.iter().skip(self.copied) { writeln!(log, "{event}").map_err(|e| e.to_string())?; }
+        self.copied = turn.len();
+        if row["status"] != "idle" && row["state"] != "done" && row["state"] != "blocked" {
+            return if row["state"] == "stopped" { Ok(Some(-1)) } else { Ok(None) };
+        }
+        if !turn.iter().any(|v| v["type"] == "system" && v["subtype"] == "turn_duration") { return Ok(None); }
+        let answer = turn.iter().rev().filter(|v| v["type"] == "assistant").find_map(|v|
+            v["message"]["content"].as_array()?.iter().rev().find_map(|b| (b["type"] == "text").then(|| b["text"].as_str()).flatten())).ok_or("Claude completed without final text; inspect native logs")?;
+        if self.pid != 0 { claude_stop(&self.root, &self.id, self.pid)?; }
+        writeln!(log, "{}", serde_json::json!({"type":"result", "session_id":self.session, "result":answer})).map_err(|e| e.to_string())?;
+        self.done = true;
+        Ok(Some(0))
+    }
+    fn kill(&mut self) { if let Err(e) = claude_stop(&self.root, &self.id, self.pid) { eprintln!("{e}"); } }
+    fn id(&self) -> u32 { self.pid }
+}
+
+/// Only a URL registered by the native session is a Remote Control link.
+pub fn claude_remote(session: &str) -> Option<String> {
+    let text = std::fs::read_to_string(claude_transcript(session)?).ok()?;
+    text.lines().rev().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).find_map(|v| {
+        let url = v["url"].as_str()?;
+        let id = url.strip_prefix("https://claude.ai/code/session_")?;
+        (v["subtype"] == "bridge_status" && !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()))
+            .then(|| url.to_string())
+    })
+}
+
+pub fn claude_background(root: &Path, session: &str) -> Result<bool, String> {
+    if claude_agents(root)?.iter().any(|v| v["sessionId"] == session) { return Ok(true); }
+    // A missing native job must not silently resume a background conversation in print mode.
+    Ok(claude_transcript(session).and_then(|p| std::fs::read_to_string(p).ok()).is_some_and(|text|
+        text.lines().filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok()).any(|v| v["sessionKind"] == "bg")))
 }
 
 const HANDSHAKE: &str = "taskq handshake: reply OK and do nothing else. The task follows in this thread.\n";
@@ -457,17 +619,24 @@ fn probe(bin: &Path, args: &[&str]) -> Option<(bool, String)> {
     let mut c = Command::new(bin);
     c.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut ch = crate::platform::quiet(&mut c).spawn().ok()?;
-    // ponytail: polls; output over the pipe buffer stalls the child and reads unknown
+    // Drain both pipes while waiting: agents --all can exceed an OS pipe buffer.
+    let read = |mut pipe: Box<dyn std::io::Read + Send>| std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes).ok().map(|_| bytes)
+    });
+    let out = read(Box::new(ch.stdout.take()?));
+    let err = read(Box::new(ch.stderr.take()?));
+    let mut status = None;
     for _ in 0..100 {
-        if ch.try_wait().ok()?.is_some() {
-            let o = ch.wait_with_output().ok()?;
-            return Some((o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))));
+        match ch.try_wait() {
+            Ok(Some(s)) => { status = Some(s); break; }
+            Err(_) => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    let _ = ch.kill();
-    let _ = ch.wait();
-    None
+    if status.is_none() { let _ = ch.kill(); let _ = ch.wait(); }
+    let (out, err) = (out.join().ok()??, err.join().ok()??);
+    Some((status?.success(), format!("{}{}", String::from_utf8_lossy(&out), String::from_utf8_lossy(&err))))
 }
 
 /// The first word of `--version` output that starts with a digit: `2.1.3 (Claude Code)`, `codex-cli 0.15.3`.

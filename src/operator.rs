@@ -224,6 +224,21 @@ pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume:
     let text = crate::runtime::instructions(&format!("Read {} first. TaskQ commands: {}.\n{brief}", crate::runtime::contract(root), exe.display())).map_err(|e| e.to_string())?;
     fs::create_dir_all(logs).map_err(|e| e.to_string())?;
     let out = logs.join(format!("{name}.out"));
+    if rt == "claude" && (resume.is_none() || crate::runtime::claude_background(root, &l.session)?) {
+        use crate::runtime::Proc;
+        let mut turn = crate::runtime::ClaudeTurn::start(&env, &l, &out, &text, &access)?;
+        loop {
+            match turn.exited() {
+                Ok(Some(0)) => break,
+                Ok(Some(code)) => return Err(format!("Claude operator failed (exit {code}); partial effects unknown")),
+                Err(reason) => { fs::write(logs.join(format!("{name}.err")), reason).map_err(|e| e.to_string())?; }
+                Ok(None) => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        return fs::read_to_string(&out).map_err(|e| e.to_string())?.lines().rev().filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find_map(|v| (v["type"] == "result").then(|| v["result"].as_str().map(String::from)).flatten()).ok_or("Claude final response missing".into());
+    }
     let f = fs::File::create(&out).map_err(|e| e.to_string())?;
     let err = fs::File::create(logs.join(format!("{name}.err"))).map_err(|e| e.to_string())?;
     let mut child = c.current_dir(root).stdin(std::process::Stdio::piped()).stdout(f).stderr(err).spawn().map_err(|e| format!("{rt}: {e}"))?;
@@ -850,16 +865,16 @@ mod tests {
         use std::time::{Duration, Instant};
         let rt = std::env::var("TASKQ_QUALIFY_RUNTIME").expect("select claude or codex");
         assert!(["claude", "codex"].contains(&rt.as_str()));
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".taskq/qualification").join(format!("{rt}-{}", crate::runtime::uuid()));
+        let root = std::env::var_os("TASKQ_QUALIFY_ROOT").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".taskq/qualification").join(format!("{rt}-{}", crate::runtime::uuid())));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("taskq.md"), include_str!("../taskq.md")).unwrap();
         fs::write(root.join("AGENTS.md"), "Read taskq.md. Only work on the explicitly requested qualification fixture. No board writes, commits, pushes or service changes.\n").unwrap();
         fs::write(root.join("CLAUDE.md"), "Read taskq.md. Only work on the explicitly requested qualification fixture. No board writes, commits, pushes or service changes.\n").unwrap();
         fs::write(root.join("taskq.json"), json!({"repo":"taskqorg/taskq", "limits": {rt.clone():1}, "permission_mode":"dontAsk", "codex":["-s","workspace-write","-c","sandbox_workspace_write.network_access=true"], "incident_reports":false}).to_string()).unwrap();
         // Explicit qualification grant, confined to this disposable project; native dontAsk still applies.
-        if cfg!(windows) && rt == "claude" {
+        if rt == "claude" {
             fs::create_dir_all(root.join(".claude")).unwrap();
-            fs::write(root.join(".claude/settings.local.json"), json!({"permissions":{"allow":["Bash(*)", "PowerShell(*)"]}}).to_string()).unwrap();
+            fs::write(root.join(".claude/settings.local.json"), json!({"permissions":{"allow": if cfg!(windows) { vec!["Bash(*)", "PowerShell(*)"] } else { vec!["Bash(*)", "Write"] }}}).to_string()).unwrap();
         }
         let original = format!("canary-{}\n", crate::runtime::uuid());
         fs::write(root.join("input.txt"), &original).unwrap();

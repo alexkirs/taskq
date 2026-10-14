@@ -17,6 +17,16 @@ Keep cheap deterministic checks only for a distinct user-visible chain or safety
 | Codex CLI | Supported | Full tools; configured sandbox; real edit/check and continuation passed on macOS | macOS, Linux, Windows; effective sandbox and network are independent |
 | codex-app | Opt-in worker/reviewer | No separate app operator | macOS only; app policy and login differ from handshake environment |
 
+## Required platform runs
+
+Run the same bounded scenario on macOS, Windows and Linux for Codex CLI. Claude CLI requires macOS and Windows now; Linux remains a required qualification row before enabling Claude there. A missing binary/login is blocked, never a pass. Claude Desktop has no adapter; Remote Control is a separate native CLI capability and does not qualify a Desktop runtime.
+
+| Platform | Codex CLI | Claude CLI | codex-app |
+|---|---|---|---|
+| macOS | Worker, reviewer, operator; start and resume | Same roles; native background lifecycle and Remote Control | Explicit worker/reviewer only |
+| Windows | Same CLI roles; native permissions and process lifetime | Same roles; native background lifecycle and Remote Control | Unsupported |
+| Linux | Same CLI roles; sandbox/network and process lifetime | Required before adoption; currently not installed on FRA | Unsupported |
+
 ## Feature matrix
 
 Model = deterministic logic/adapter check. Live = actual agent/session evidence. Unknown = not qualified. Unsupported = no adapter; never show it as a pass.
@@ -36,6 +46,7 @@ Model = deterministic logic/adapter check. Live = actual agent/session evidence.
 | Q11 | Cancellation has honest semantics | Process adapter; app completion/lease chain | App turn cannot be stopped by existing adapter; late board writes fenced only |
 | Q12 | App runtime is selected explicitly on a capable host | Service opt-in chain; CLI create flow | CLI create/readback now covers app label; service admits app only on macOS with explicit opt-in |
 | Q13 | Publication checks exact candidate and preserves dirty work | Publication and cleanup chains | Research ancestry is intentionally separate from new-code CI; rule adherence is independently reviewed |
+| Q15 | Native Claude background lifecycle | Same bounded live chain, not a new per-commit test | Verify stdin delivery, native-assigned ID, turn completion, stop readback, same-ID resume without copying, Remote Control registration and interrupted-launch reconciliation on each platform |
 | Q14 | Missing board credential fails without logging in or exposing it | GitHub credential chain; actual task commands | Codex CLI/app live board writes in prior qualification; Claude #969 live |
 
 Prior live records: [#961](https://github.com/taskqorg/taskq/issues/961), [#965](https://github.com/taskqorg/taskq/issues/965), [#966](https://github.com/taskqorg/taskq/issues/966), [Claude #969](https://github.com/taskqorg/taskq/issues/969#issuecomment-6159775848). Preserve failed attempts as evidence; a retry supersedes only the specific failed claim.
@@ -51,7 +62,7 @@ Prior live records: [#961](https://github.com/taskqorg/taskq/issues/961), [#965]
 
 ## Current limitations
 
-Host permission authority and same-user isolation in [worker permissions](design/worker-permissions.md) remain a separate proposed architecture. No prompt, project configuration or 0600 file is claimed as an immutable host ceiling. No new grant broker, background monitor or duplicate test framework is introduced by this matrix.
+The shipped access presets in taskq.md § 8 supersede the earlier permission proposal: macOS enforces a TaskQ Seatbelt profile, while Windows/Linux currently require an explicit Full grant; missing grants or unknown restricted enforcement refuse launch. Full has no OS containment. Earlier passes below qualify their recorded candidate and permission configuration, not a later policy revision. No prompt, project configuration or 0600 file is claimed as an immutable host ceiling. No new grant broker, background monitor or duplicate test framework is introduced by this matrix.
 
 ## Operator qualification command
 
@@ -62,7 +73,7 @@ TASKQ_QUALIFY_RUNTIME=claude TASKQ_INCIDENT_REPORTS=off cargo test --locked live
 TASKQ_QUALIFY_RUNTIME=codex TASKQ_INCIDENT_REPORTS=off cargo test --locked live_operator_matrix -- --ignored --nocapture
 ```
 
-The chain keeps its fixture and native logs in `.taskq/qualification/`; no global settings, existing jobs, board writes or commits change. On Windows, the Claude fixture grants Bash/PowerShell in its own `.claude/settings.local.json`, as explicitly approved for this qualification; this grants no OS containment. It checks random file contents independently, verifies the session ID on continuation, then disables only its fixture runtime and requires failure before launch. It does not prove every permission boundary or MCP tool. Normal `cargo test --locked` skips these paid calls.
+For an owned fixture selected by `TASKQ_QUALIFY_ROOT`, set `TASKQ_INSTALL` to its `fixture-install` directory and provision the required board credential privately there. Provision any required TaskQ grant explicitly in that disposable `worker-policy.json` first; the test never grants Full itself. The chain keeps its fixture and native logs in `.taskq/qualification/`; no global settings, existing jobs, board writes or commits change. With the explicit qualification grant, the Claude fixture uses Bash/PowerShell on Windows and Bash/Write on macOS in its own `.claude/settings.local.json`; this grants no OS containment. It checks random file contents independently, verifies the session ID on continuation, then disables only its fixture runtime and requires failure before launch. It does not prove every permission boundary or MCP tool. Normal `cargo test --locked` skips these paid calls.
 
 Claude worker/reviewer #969 includes a rejected first result (missing reproducible fixture), a repaired worker result, independent reviewer execution and resumed reviewer input. Controller compared all four pinned bodies against actual worker/reviewer start and continuation messages. The rejection is evidence that review applied the rules; closing the issue alone is not that evidence.
 
@@ -79,3 +90,37 @@ Claude worker/reviewer #969 includes a rejected first result (missing reproducib
 | Windows operator, Claude, granted | Claude Code 2.1.296; `94d56415-6922-4de5-97a3-30339954110a` | With owner-approved Bash/PowerShell permission only in the disposable project: read/copy/command, same-session append/check, disabled-runtime refusal all passed. Controller compared all four pinned bodies in both actual inputs. |
 
 The one-off app restart probe was removed after answering its development question; the existing process handover chain retains the regression case. The two redundant command/retro-constructor tests were removed; missing-log behavior moved into the existing retro chain. The ignored operator chain is the sole new retained live test. Windows deterministic checks passed (122 binary + 5 policy); macOS passed (125 binary + 5 policy). Offline selftest passed 53 golden traces and command formats; offline mode does not qualify board connectivity.
+
+## Claude Remote Control probe (2026-10-14)
+
+The owner requested Remote Control by default so local CLI sessions can appear in Claude. Native user setting `remoteControlAtStartup=true` was already present on macOS; it was enabled and read back on Windows without restarting existing sessions. Project settings cannot enable this setting; see [native Remote Control](https://code.claude.com/docs/en/remote-control#enable-remote-control-for-all-sessions).
+
+- Claude 2.1.296 interactive `--remote-control`: connected, returned a remote session URL and wrote a `bridge-session` record to its actual transcript.
+- Native background `claude --bg --remote-control` on 2.1.299: returned an owned background ID, answered the qualification prompt, and its native logs reported Remote Control active with a remote URL. The native updater advanced the installed CLI between these probes.
+- Without any Remote Control flag, both an interactive launch and `claude --bg` on 2.1.299 auto-connected from the user setting. Their native `/remote-control` status panels confirmed existing remote sessions and URLs. Auto-connect did not print the same announcement or transcript record as the explicit flag, so absence of either alone cannot prove disconnection.
+- TaskQ-style `-p --output-format stream-json` on 2.1.296: both explicit `--remote-control` and per-run `remoteControlAtStartup=true` completed the prompt but created no `bridge-session` record. Repeating the explicit flag on 2.1.299 also produced zero bridge-session records. Exit zero did not prove remote registration.
+
+No Remote Control flag was added to TaskQ's print-mode adapter. Native interactive/background connection is qualified; The initial probe did not qualify TaskQ integration. The native adapter qualification below supersedes that limitation; web/app visibility remains separate from native registration.
+
+## Native background acceptance (2026-10-14)
+
+One live chain, three real hosts; normal CI still skips paid agent runs. Temporary role/lifetime probes were removed after collecting evidence; the existing operator chain and service continuation/restart chains retain the regression coverage. `TASKQ_QUALIFY_ROOT` selects an explicitly owned, already trusted qualification directory; archive its previous request logs before a repeat. Native trust/account failures are prerequisites, not permission to bypass them.
+
+| Host / client | Worker and independent reviewer | Operator | Native lifetime / Remote Control |
+|---|---|---|---|
+| macOS / Claude 2.1.299 | [#995](https://github.com/taskqorg/taskq/issues/995), then [#1001](https://github.com/taskqorg/taskq/issues/1001) with answer after the asking turn stopped: both roles start, ask, retain the attempt and native session, resume and execute the supplied expected-failure/passing probes | Read/copy/command, same-ID append/check, disabled-runtime refusal passed | Registered native remote URLs; restart stayed pending during a real sleeping command; native stop prevented its later marker write |
+| Windows / Claude 2.1.299 | [#996](https://github.com/taskqorg/taskq/issues/996): both roles start, ask, resume and independently execute probes; native `py` absent, Python 3.12.10 used and reported | Same operator chain passed with the approved fixture-only grants | Registered native remote URLs; same deferred-restart/cancellation marker scenario passed using `python` |
+| Linux FRA / Codex 0.162.0 | [#997](https://github.com/taskqorg/taskq/issues/997): both roles start, ask, resume the same attempt/session, execute probes, and publish separate task-fit/quality evidence | Same chain passed with workspace-write and network enabled, including disabled-runtime refusal | Existing CLI process adapter; no Claude Remote Control claim |
+| Linux / Claude | Blocked: no installed client/login on the qualification host | Blocked | Required before adopting Claude on Linux; do not install or transfer credentials merely to fill a cell |
+
+The controller compared all four pinned specq bodies against **each actual start and resume input** of both roles on all three qualified paths. macOS #1001 sessions: worker `76302b27-299f-4cf0-bca6-d7aa50e4f979`, reviewer `6f7f59bd-4911-4c7f-91d9-02bbda9fe0ee`; Windows #996: `11e69922-c85c-4eca-8053-f76e5a99d7c7` / `794b2388-0365-4f3b-a41a-8a640965c9c6`; Linux #997: `01a1388f-3272-7553-abea-522725664624` / `01a13890-283d-7b23-a79b-f2be73165e84`. The probes intentionally fail before and pass after; agents must report that distinction without changing the supplied fixture. Research closure qualifies this scenario, not CI or publication of new code.
+
+Native edge cases found and fixed: `--bg` owns the UUID; passing options on resume can copy the session; stop acknowledgement precedes actual process exit; startup can lack a PID; Windows restore briefly reports a temporary UUID until native status appears. TaskQ preserves the background ID, waits for restored identity, reads actual turn completion, waits for owned process exit, and never accepts a copied continuation. It streams the matching native transcript into the existing attempt log. Changed saved permission mode refuses continuation instead of silently replacing the session.
+
+### Integration with access presets
+
+Candidate `5297419` includes main through `c6d46bd` (access presets). Native Claude start and resume use the same effective permission mode and Seatbelt wrapper as the other adapters. A changed saved native permission mode refuses continuation. macOS operator passed again under the default TaskQ Seatbelt wrapper with native dontAsk and the approved fixture Bash/Write grant: session `d321a639-71a2-4e19-aca8-3758a3398354`, actual edit/check and same-ID continuation. Model suite: 139 + 5 passed; selftest: 65 traces, formats and live board read passed. Windows/Linux repeat uses an explicitly owner-approved Full grant only in each isolated fixture installation; it does not qualify restricted enforcement or change working installations. The earlier worker/reviewer and cancellation evidence above predates these access presets. Final operator repetitions passed on Windows Claude 2.1.299 (`258379ed-c802-40f8-abdf-4df67b188d8b`, 51 s) and Linux Codex 0.162.0 (`01a138a7-3eed-7b33-a742-ceeb0f3d5b40`, 33 s), including same-ID continuation and disabled-runtime refusal. Windows model checks: 134 + 5; Linux: 118 + 5. Both OS actually refused before launch without a matching grant. Windows native Full additionally required its interactive disclaimer; the owner-approved test accepted it without changing default mode. Initial harness failures (wrong install/PATH and stale request artifacts) were corrected only in the isolated environment; none count as a pass. Temporary board credential copies were removed after the runs.
+
+### Remaining adoption limits
+
+This matrix is complete as an inventory, not all-green acceptance. Q4 outage/invalid-input cases, Q5 negative sandbox boundaries (outside writes, symlinks, Git common-dir, network denial), hard service/client crash and interrupted-launch recovery, and actual web/mobile/Desktop list readback remain unqualified. The native restart probe verifies deferral, not a full installed-version upgrade. Windows Codex workspace-write remains blocked by the previously recorded native ACL error. Native Remote Control registration does not prove Desktop integration, permanent connectivity or an OS sandbox. Production adoption must retain these distinctions; Linux currently qualifies Codex only.

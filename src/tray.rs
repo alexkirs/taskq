@@ -409,7 +409,7 @@ fn task_session(root: &Path, local: &str, row: &mut Value) {
     row["host"] = json!(host);
     row["local_session"] = json!(!local.is_empty() && host == local);
     if local.is_empty() || host != local { return }
-    let id = if id == "-" && rt == "codex" {
+    let id = if (id == "-" && rt == "codex") || rt == "claude" {
         let l = crate::runtime::Launch { task: row["n"].as_u64().unwrap_or(0), title: String::new(), attempt: row["attempt"].as_u64().unwrap_or(0),
             role: row["role"].as_str().unwrap_or("").into(), rt: rt.into(), session: id.into(), url: String::new(), resume: None };
         crate::runtime::codex_thread(&crate::runtime::log_path(root, &l)).unwrap_or_else(|| id.into())
@@ -417,7 +417,7 @@ fn task_session(root: &Path, local: &str, row: &mut Value) {
     if id == "-" || id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') { return }
     row["session_url"] = match rt {
         "codex" | "codex-app" => json!(format!("codex://threads/{id}")),
-        "claude" => json!(format!("https://claude.ai/code/session_{id}")),
+        "claude" => json!(crate::runtime::claude_remote(&id)),
         _ => Value::Null,
     };
 }
@@ -1567,7 +1567,7 @@ mod tests {
         assert!(invalid["session_url"].is_null());
         let mut local = json!({"session": "claude:valid-thread win"});
         task_session(Path::new("."), "win", &mut local);
-        assert_eq!(local["session_url"], "https://claude.ai/code/session_valid-thread");
+        assert!(local["session_url"].is_null(), "a local UUID does not prove remote registration");
         let mut starting = json!({"session": "claude:- win", "session_url": "https://unverified.example"});
         task_session(Path::new("."), "win", &mut starting);
         assert!(starting["session_url"].is_null());

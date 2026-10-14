@@ -253,7 +253,7 @@ fn session_link(cfg: &Config, raw: &Value, t: &Task, n: u64) -> (String, String)
     let Some((rt, id)) = t.session.as_deref().and_then(|s| s.split(' ').next()).and_then(|s| s.split_once(':')) else { return (String::new(), String::new()) };
     let host = t.session.as_deref().and_then(|s| s.rsplit(' ').next()).unwrap_or_default();
     let mut id = id.to_string();
-    if id == "-" && host == cfg.me
+    if (id == "-" || rt == "claude") && host == cfg.me
         && let Some(a) = t.attempt
     {
         let l = runtime::Launch { task: n, title: String::new(), attempt: a, role: t.role.clone().unwrap_or_default(), rt: rt.into(), session: id.clone(), url: String::new(), resume: None };
@@ -262,7 +262,7 @@ fn session_link(cfg: &Config, raw: &Value, t: &Task, n: u64) -> (String, String)
     let host = cell(host);
     let link = match rt {
         _ if id == "-" => format!("{host}: starting"),
-        "claude" => format!("[{host}](https://claude.ai/code/session_{id})"),
+        "claude" => runtime::claude_remote(&id).filter(|_| host == cell(&cfg.me)).map_or_else(|| format!("{host}: Remote Control unknown"), |url| format!("[{host}]({url})")),
         _ if std::env::var("TASKQ_CLIENT").as_deref() == Ok("codex") => format!("[{host}](codex://threads/{id})"),
         _ => match raw["pages"].as_str() {
             Some(p) => format!("[{host}]({}/open.html#codex://threads/{id})", p.trim_end_matches('/')),

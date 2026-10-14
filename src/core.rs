@@ -280,6 +280,21 @@ pub fn hand_in(n: u64, entries: &[Entry], a: u64, after: u64) -> Option<&'static
         .filter_map(|l| ["ask", "result", "requeue"].into_iter().find(|k| *k == l.kind)).last()
 }
 
+/// Outcome and error class of attempt `a`'s `build`/`review` stage when its child exits or is stopped (§ 4 Profiling):
+/// its hand-in after entry `after` wins over a stop; `log` is `None` once the issue left the board read.
+pub fn stage_outcome(n: u64, log: Option<(&[Entry], bool)>, a: u64, after: u64, reviewer: bool) -> (&'static str, &'static str) {
+    match log.and_then(|(entries, _)| hand_in(n, entries, a, after)) {
+        Some("result") => ("ok", "none"),
+        Some("ask") => ("ask", "none"),
+        Some(_) => ("retried", "none"),
+        // still the live attempt: the child ended without hand-in
+        None if log.is_some_and(|(_, live)| live) => ("failed", "exit"),
+        // the issue closed under a live reviewer: its own `close`
+        None if log.is_none() && reviewer => ("ok", "none"),
+        None => ("cancelled", "none"),
+    }
+}
+
 fn has_options(s: &str) -> bool {
     s.lines().any(|l| l.split_once(". ").is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
 }

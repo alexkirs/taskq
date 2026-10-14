@@ -416,6 +416,17 @@ mod tests {
         fs::write(&attempt, format!("{}\n", claude.replace(r#""usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}"#, r#""usage":{}"#))).unwrap();
         stage_at(Some(&path), "review", 7, 5, "claude", ms(4), "ok", "none", crate::runtime::usage(&attempt, 0, "claude"));
         stage_at(Some(&path), "review", 7, 6, "claude", None, "ok", "none", Usage::Unknown("adopted"));
+        // a child stopped after its result or requeue keeps that outcome; a live child exiting without one failed;
+        // a stop without hand-in (owner requeue) is a cancellation
+        let e = |id, body: &str| crate::core::Entry { id, body: body.into(), edited: false };
+        let spawn = e(10, "taskq: spawn worker claude:s1 mac");
+        let hand = |kind: &str| vec![spawn.clone(), e(11, &format!("taskq: {kind} {}attempt 10
+Changed: x", if kind == "result" { "abc " } else { "" }))];
+        let (result, requeue, owner) = (hand("result"), hand("requeue"), vec![spawn.clone(), e(11, "taskq: requeue
+Reason: owner")]);
+        for (log, live, want) in [(&result, false, ("ok", "none")), (&requeue, false, ("retried", "none")), (&owner, false, ("cancelled", "none")), (&owner, true, ("failed", "exit"))] {
+            assert_eq!(crate::core::stage_outcome(7, Some((log.as_slice(), live)), 10, 10, false), want, "{:?}", log.last().map(|e| &e.body));
+        }
         let log = fs::read_to_string(&path).unwrap();
         assert!(!log.contains("secret") && !log.contains("/host/path") && !log.contains("private-rt"));
         let text = report(&dir);

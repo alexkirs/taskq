@@ -601,19 +601,11 @@ impl<'a> Service<'a> {
         self.delivered.get(&attempt).copied().unwrap_or(0)
     }
 
-    /// The `build` or `review` stage of a child that exited or was stopped (§ 4 Profiling); `v` is its open task.
-    fn ended(&mut self, n: u64, a: u64, v: Option<&View>, stopped: bool) {
+    /// The `build` or `review` stage of a child that exited or was stopped (§ 4 Profiling); `v` is its task's view.
+    fn ended(&mut self, n: u64, a: u64, v: Option<&View>) {
         let Some((role, rt, begun)) = self.begun.remove(&a) else { return };
-        let (outcome, err) = match v.and_then(|v| core::hand_in(n, &v.log, a, a.max(self.delivered(a)))) {
-            _ if stopped => ("cancelled", "none"),
-            Some("result") => ("ok", "none"),
-            Some("ask") => ("ask", "none"),
-            Some(_) => ("retried", "none"),
-            None if v.is_some_and(|v| v.task.attempt == Some(a)) => ("failed", "exit"),
-            // the issue closed under a live reviewer: its own `close`
-            None if v.is_none() && role == "reviewer" => ("ok", "none"),
-            None => ("cancelled", "none"),
-        };
+        let log = v.map(|v| (v.log.as_slice(), v.task.attempt == Some(a)));
+        let (outcome, err) = core::stage_outcome(n, log, a, a.max(self.delivered(a)), role == "reviewer");
         let log = crate::runtime::attempt_log(&self.cfg.root, &role, n, a);
         let stage = if role == "reviewer" { "review" } else { "build" };
         let (took, usage) = match begun {
@@ -705,7 +697,7 @@ impl<'a> Service<'a> {
             }
         });
         for (n, a, code) in exited {
-            self.ended(n, a, by_n.get(&n).copied(), false);
+            self.ended(n, a, by_n.get(&n).copied());
             if let Some(v) = by_n.get(&n)
                 && v.task.attempt == Some(a)
                 && matches!(v.task.state, State::Doing | State::Review)
@@ -739,7 +731,7 @@ impl<'a> Service<'a> {
             current
         });
         for (n, a) in stopped {
-            self.ended(n, a, None, true);
+            self.ended(n, a, by_n.get(&n).copied());
         }
         self.held.retain(|l| by_n.get(&l.task).is_some_and(|v| v.task.attempt == Some(l.attempt)));
         let kids: Vec<u64> = self.kids.iter().map(|k| k.attempt).collect();

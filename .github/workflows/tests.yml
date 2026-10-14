@@ -18,6 +18,7 @@ jobs:
       - run: rustup default stable
       - run: cargo test --locked
       - run: node tests/tray-reply.test.cjs
+      - run: node tests/tray-home-ai.test.cjs
       - run: node tests/tray-next.test.cjs
       - run: node tests/tray-navigation.test.cjs
       - run: node tests/tray-incidents.test.cjs
@@ -37,13 +38,17 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable-x86_64-pc-windows-gnu
       - run: cargo +stable-x86_64-pc-windows-gnu test --locked --test windows_install
-  shots: # README screenshots match the UI sources (docs/shots/check.sh)
+  shots: # README screenshots: stale against the UI sources warns (exit 2), any other check.sh error fails (taskq.md R12)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - run: docs/shots/check.sh
+      - run: docs/shots/check.test.sh
+      - run: |
+          rc=0; docs/shots/check.sh || rc=$?
+          [ $rc = 2 ] && { echo '::warning::README shots are stale; run the README shots workflow (dispatch) or wait for the next release tag'; exit 0; }
+          exit $rc
   tests: # required status check name; gates on the rust matrix and the shots check
     needs: [rust, windows-gnu, shots]
     runs-on: ubuntu-latest

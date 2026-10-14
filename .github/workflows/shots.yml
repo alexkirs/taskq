@@ -1,15 +1,9 @@
+# README shots run on dispatch or a release tag, never per tray push (taskq.md R12, Product).
 name: README shots
 on:
   workflow_dispatch:
   push:
-    branches: [main, taskq-924]
-    paths:
-      - src/tray.rs
-      - src/tray.html
-      - src/icon.rs
-      - docs/design/icon-summary.config.json
-      - docs/shots/update.sh
-      - .github/workflows/shots.yml
+    tags: ['v*']
 permissions:
   contents: write
   actions: write
@@ -24,6 +18,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # a release tag refreshes main, which the tag was cut from
+          ref: ${{ github.ref_type == 'tag' && 'main' || github.ref }}
       - run: rustup default stable
       # Committed shots that are still fresh came from a Mac at 2x; the 1x runner capture must not replace them.
       - name: Check committed shots
@@ -45,7 +41,7 @@ jobs:
           path: ${{ runner.temp }}/shots.log
           if-no-files-found: warn
       - name: Commit and verify refreshed shots
-        if: github.ref == 'refs/heads/main' && steps.fresh.outputs.stale == 'true'
+        if: (github.ref == 'refs/heads/main' || github.ref_type == 'tag') && steps.fresh.outputs.stale == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

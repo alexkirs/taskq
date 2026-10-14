@@ -36,19 +36,23 @@ for p in $(cat ~/.local/share/taskq/projects); do touch "$p/.taskq/update"; done
 
 `service install` copies the binary into `releases/<v>`, writes `current` and reloads the unit of the project it runs in; that reload restarts the service without the § 8 step 3 handover, so the install runs in a registered project whose `status.json` lists no `kids`; since D-data (#894) an install where children run hands them over through step 3 instead. Every other registered service re-execs through step 3 on its next pass and keeps its children (the `update` poke makes that immediate); the running tray exits because its version differs from `current` and the service starts the new one. Before #894, installing from a project with live children posted `gone` for them (seen on #886 on 2026-10-13). Menu evidence for a task: `target/release/taskq tray --snapshot <dir>` from the worktree, or the live tray after the install.
 
-Rollback to the published release (4.1.11's sweep deletes `worker-policy.json`, so keep a copy outside the install):
+Rollback to the published release. 4.1.11's sweep deletes `worker-policy.json`, so the rollback stops, `current` unchanged, unless a copy outside the install exists and matches:
 
 ```bash
-cp ~/.local/share/taskq/worker-policy.json ~/taskq-worker-policy.json 2>/dev/null
-echo 4.1.11 > ~/.local/share/taskq/current
-for p in $(cat ~/.local/share/taskq/projects); do (cd "$p" && ~/.local/share/taskq/taskq service restart); done
+d=~/.local/share/taskq; bak=~/taskq-worker-policy.json
+if [ ! -e "$d/worker-policy.json" ] || { cp "$d/worker-policy.json" "$bak" && cmp "$d/worker-policy.json" "$bak"; }; then
+  echo 4.1.11 > "$d/current"
+  for p in $(cat "$d/projects"); do (cd "$p" && "$d/taskq" service restart); done
+else echo "grant backup failed: rollback stopped, current unchanged" >&2; fi
 ```
 
-Forward again: pause every project, install the development build as above, then restore the grants before new starts:
+Forward again: `service pause` every project, install the development build as above (4.1.11 sweeps on that update), then restore the grants; resume only after the copy matches and `service permissions` reads the grants back:
 
 ```bash
-cp ~/taskq-worker-policy.json ~/.local/share/taskq/worker-policy.json
-~/.local/share/taskq/taskq service permissions   # grants listed, then `service resume` in each project
+d=~/.local/share/taskq; bak=~/taskq-worker-policy.json
+if cp "$bak" "$d/worker-policy.json" && cmp "$bak" "$d/worker-policy.json" && (cd "$(head -1 "$d/projects")" && "$d/taskq" service permissions) | grep '^Policy: revision'; then
+  for p in $(cat "$d/projects"); do (cd "$p" && "$d/taskq" service resume); done
+else echo "grant restore failed: projects stay paused" >&2; fi
 ```
 
 Limits: the development build serves every registered project on this host; the launcher's three-start rollback and `previous` are the safety net. No `v*` tag until the qualification batch, so `release.yml` never runs; `tests.yml` still checks every PR.

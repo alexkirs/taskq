@@ -121,7 +121,9 @@ pub fn detect(code: &str, site: &str, runtime: &str, fields: &[&str], evidence: 
             } else { unsafe_outcome(&f) };
             out.path = out.path.and_then(|p| p.strip_prefix(&root).ok().map(Path::to_path_buf));
             let _ = fs::create_dir_all(crate::dot(&root));
-            let _ = crate::platform::write_atomic(&crate::dot(&root).join("incident.json"), &out.json().to_string());
+            let mut local = out.json();
+            local["profile"] = json!({"command": "taskq profile", "at_ms": out.at.saturating_mul(1000)});
+            let _ = crate::platform::write_atomic(&crate::dot(&root).join("incident.json"), &local.to_string());
         }));
         ACTIVE.set(false);
     }
@@ -212,7 +214,7 @@ pub fn line(v: &Value) -> String {
     let age = crate::age(now().saturating_sub(v["at"].as_u64().unwrap_or(now())) as i64);
     let reason = v["reason"].as_str().map(|r| format!(" ({r})")).unwrap_or_default();
     let dest = v["url"].as_str().or_else(|| v["path"].as_str()).map(|s| format!(" · {s}")).unwrap_or_default();
-    format!("Incident: {state} {} {age}{reason}{dest}", v["fault"].as_str().unwrap_or("unknown"))
+    format!("Incident: {state} {} {age}{reason}{dest} · profile: `taskq profile`", v["fault"].as_str().unwrap_or("unknown"))
 }
 
 #[cfg(test)]

@@ -22,7 +22,12 @@ const FOCUS_MAX: u64 = 4096;
 /// Keep the newest `max / 2` bytes of `p`, from a line start, once it is over `max`. Rewritten in place, not renamed:
 /// the launcher and the service's own stderr append to the open file.
 pub fn trim_tail(p: &Path, max: u64) -> bool {
-    if fs::metadata(p).is_ok_and(|m| m.len() <= max) {
+    let profile_log = p.file_name().is_some_and(|n| n == "taskq.log");
+    let threshold = if profile_log { max.saturating_sub(512) } else { max };
+    let _profile_lock = if profile_log {
+        match crate::profile::log_lock(p) { Ok(lock) => Some(lock), Err(_) => return false }
+    } else { None };
+    if fs::metadata(p).is_ok_and(|m| m.len() <= threshold) {
         return false;
     }
     let Ok(b) = fs::read(p) else { return false };

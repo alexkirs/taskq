@@ -65,7 +65,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "effective_policy": {
@@ -75,7 +75,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "runtime_usage": [
@@ -316,7 +316,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "effective_policy": {
@@ -326,7 +326,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "runtime_usage": [
@@ -552,7 +552,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "effective_policy": {
@@ -562,7 +562,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "runtime_usage": [
@@ -759,7 +759,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "effective_policy": {
@@ -769,7 +769,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "runtime_usage": [
@@ -1000,7 +1000,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "effective_policy": {
@@ -1010,7 +1010,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "runtime_usage": [
@@ -1246,7 +1246,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "effective_policy": {
@@ -1256,7 +1256,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "runtime_usage": [
@@ -1432,7 +1432,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "effective_policy": {
@@ -1442,7 +1442,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "runtime_usage": [
@@ -1674,7 +1674,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "effective_policy": {
@@ -1684,7 +1684,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "runtime_usage": [
@@ -1900,7 +1900,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "effective_policy": {
@@ -1910,7 +1910,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "runtime_usage": [
@@ -2153,7 +2153,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "effective_policy": {
@@ -2163,7 +2163,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "runtime_usage": [
@@ -2339,7 +2339,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "effective_policy": {
@@ -2349,7 +2349,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "runtime_usage": [
@@ -2525,7 +2525,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "effective_policy": {
@@ -2535,7 +2535,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "runtime_usage": [
@@ -2782,7 +2782,7 @@
          "memory_min": 10
         },
         "sources": {
-         "load_gate": "project"
+         "load_gate": null
         }
        },
        "effective_policy": null,

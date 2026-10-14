@@ -128,6 +128,6 @@ Shared fixtures cover legacy and Auto modes, mixed targets, zero/absent limits, 
 
 `src/resource-controls.js` SHA-256: `0ecd8c39d2ca282a8a6438e7f503307588ff6897f0ea0b51cd39c14391ac129a`  
 `src/resource-controls.css` SHA-256: `9f81ec867aaf0cf95c4abbd5c37889632e1a6034b0e33331b52c41f92b836907`  
-`tests/fixtures/resource-controls.json` SHA-256: `49644798b8d4171f62b2e190b2f772be38e10a11e1593f067a5f36ea0aa98e46`  
+`tests/fixtures/resource-controls.json` SHA-256: `d06ba57ef922d2be6e6d84683ac09c4445cf5467fa45791d8a9e985643317b5a`  
 
 B4 parent-to-child map: parent design `75757d5d843159726a2ea44ca1615f9cf7fd18fd` ([menu-next variants](menu-next-variants.html) `resourceEditor`, [menu M12](menu.md)); child tray Capacity places the shared component under its existing summary without restyling it. Deferred route: Work mode (#954).

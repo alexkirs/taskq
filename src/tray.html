@@ -239,16 +239,18 @@ function home(){
   return h+update()+'<div class="row meta">taskq '+esc(vs.join(', ')||'unknown')+(vs.length===1&&vs[0]===S.version?'':' · tray '+esc(S.version))+' · '+esc(S.host)+'</div>';}
 // Capacity (taskq.md § 4): the shared resource controls (docs/design/shared-resource-controls.md) over the tray's
 // taskq.resources/1 projection; this adapter only maps an operation onto `service capacity` and its receipt
-const resourceCards=new Map(),resourceRequests=new Map();
+const resourceCards=new Map(),resourceRequests=new Map(),resourcePayloads=new Map();
 function resourceGroup(p){return {...p.resources,key:p.root,labels:{host:p.cap_host||'this host',project:p.name}};}
 function resourceCapability(g){const p=S&&S.projects.find(p=>p.root===g.key),e=p&&p.cap_saved&&p.cap_saved.error;return e||!p?{edit:false,reason:'Read-only here',note:e?'Config: '+e:null}:{edit:true};}
 function resourceSet(op){const set={limits:{}};for(const o of op.ops){if('runtime_limit' in o.changes)set.limits[o.target.runtime_id]=o.changes.runtime_limit;if(o.changes.load_gate)Object.assign(set,o.changes.load_gate);}return set;}
 function resourceSend(g,op){
   const p=S.projects.find(p=>p.root===g.key),key=g.key+'#'+op.id;
+  // A lost receipt retries the reviewed expectation, never a newer config; keep one operation per project.
+  if(resourcePayloads.get(g.key)?.id!==op.id)resourcePayloads.set(g.key,JSON.parse(JSON.stringify({a:'capacity',root:g.key,id:op.id,set:resourceSet(op),expect:p&&p.cap_saved})));
   return new Promise(resolve=>{
     const prior=resourceRequests.get(key);if(prior)clearTimeout(prior.timer);
     resourceRequests.set(key,{resolve,timer:setTimeout(()=>{resourceRequests.delete(key);resolve({state:'unknown',reason:'no receipt'});},30000)});
-    send({a:'capacity',root:g.key,id:op.id,set:resourceSet(op),expect:p&&p.cap_saved});});}
+    send(resourcePayloads.get(g.key));});}
 function resourceReceipt(m){
   const key=m.root+'#'+m.id,r=resourceRequests.get(key);
   if(!r)return;

@@ -357,9 +357,7 @@ fn allowlisted(value: &Value, kind: &str) -> Value {
     }
     let Some(object) = value.as_object() else { return Value::Null; };
     Value::Object(object.iter().filter(|(key, _)| fields.contains(&key.as_str())).map(|(key, value)| {
-        let projected = if kind == "sources" {
-            if value.is_string() { value.clone() } else { Value::Null }
-        } else if ["modes", "fields", "scopes"].contains(&key.as_str()) {
+        let projected = if ["modes", "fields", "scopes"].contains(&key.as_str()) {
             Value::Array(value.as_array().map(|a| a.iter().map(|v| if v.is_string() { v.clone() } else { Value::Null }).collect()).unwrap_or_default())
         } else { allowlisted(value, key) };
         (key.clone(), projected)

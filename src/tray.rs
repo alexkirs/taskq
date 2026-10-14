@@ -947,28 +947,42 @@ if(x>0)window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME',x}));})()
 const ACTIONS: &str = "(()=>{const q=s=>document.querySelector(s),put=(s,v)=>{const i=q(s);i.value=v;i.dispatchEvent(new Event('input',{bubbles:true}));};
 q('[data-route=cadence]').click();q('[data-v=custom]').click();put('#hs','2026-10-13T10:00');put('#he','2026-10-13T09:00');q('[data-a=range]').click();})()";
 
-/// `tray --snapshot --route` names: `actions` is Home with the [`ACTIONS`] script, `project` the first project's page.
-const ROUTES: [&str; 12] = ["home", "actions", "project", "projects", "attention", "settings", "appearance", "cadence", "notifications", "agents", "services", "about"];
+/// The `scroll` snapshots: Home with each bounded AI block at its start, middle and end; the page realigns it on whole
+/// lines once the scroll settles (150 ms), before the capture (#1115).
+const SCROLLS: [(&str, &str); 3] = [
+    ("start", "document.querySelectorAll('[data-bound]').forEach(c=>c.scrollTop=0)"),
+    ("middle", "document.querySelectorAll('[data-bound]').forEach(c=>c.scrollTop=(c.scrollHeight-c.clientHeight)/2)"),
+    ("end", "document.querySelectorAll('[data-bound]').forEach(c=>c.scrollTop=c.scrollHeight)"),
+];
+
+/// `tray --snapshot --route` names: `actions` is Home with the [`ACTIONS`] script, `scroll` Home with the [`SCROLLS`]
+/// (only when named), `project` the first project's page.
+const ROUTES: [&str; 13] = ["home", "actions", "scroll", "project", "projects", "attention", "settings", "appearance", "cadence", "notifications", "agents", "services", "about"];
 
 /// Snapshot steps: theme, page (`home` or a project root), text size, a script run on the page; only `routes` unless empty.
 fn shots(install: &Path, routes: &[String]) -> Vec<(&'static str, String, u64, &'static str)> {
     let first = roots(install).into_iter().next();
     ["dark", "light"].iter().flat_map(|t| {
         let mut v = vec![(*t, "home".to_string(), 16, ""), (*t, "home".to_string(), 20, ""), (*t, "home".to_string(), 16, ACTIONS)];
+        for font in [16, 20] { v.extend(SCROLLS.iter().map(|(_, js)| (*t, "home".to_string(), font, *js))); }
         v.extend(first.clone().map(|r| (*t, r, 16, "")));
-        for route in &ROUTES[3..] {
+        for route in &ROUTES[4..] {
             for font in [16, 20] { v.push((*t, route.to_string(), font, "")); }
         }
         v
-    }).filter(|(_, p, _, js)| routes.is_empty() || routes.iter().any(|r| r == route_of(p, js))).collect()
+    }).filter(|(_, p, _, js)| if routes.is_empty() { route_of(p, js) != "scroll" } else { routes.iter().any(|r| r == route_of(p, js)) }).collect()
 }
 
 fn route_of<'a>(page: &'a str, script: &str) -> &'a str {
-    if !script.is_empty() { "actions" } else if Path::new(page).is_absolute() { "project" } else { page }
+    if script == ACTIONS { "actions" } else if !script.is_empty() { "scroll" } else if Path::new(page).is_absolute() { "project" } else { page }
 }
 
 fn shot_name(install: &Path, routes: &[String], step: usize) -> String {
-    shots(install, routes).get(step).map_or(step.to_string(), |(t, p, f, js)| format!("{t}-{}{}-{f}", if Path::new(p).is_absolute() { "project" } else { p }, if js.is_empty() { "" } else { "-actions" }))
+    shots(install, routes).get(step).map_or(step.to_string(), |(t, p, f, js)| {
+        let suffix = if js.is_empty() { String::new() } else { format!("-{}", SCROLLS.iter().find(|(_, s)| s == js).map_or("actions", |(n, _)| n)) };
+        let scroll = if route_of(p, js) == "scroll" { "-scroll" } else { "" };
+        format!("{t}-{}{scroll}{suffix}-{f}", if Path::new(p).is_absolute() { "project" } else { p })
+    })
 }
 
 fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>, add: &Value) -> Value {
@@ -1501,9 +1515,11 @@ mod tests {
         let names = |v: &[&str]| (0..shots(&install, &r(v)).len()).map(|i| shot_name(&install, &r(v), i)).collect::<Vec<_>>();
         assert_eq!(names(&["attention"]), ["dark-attention-16", "dark-attention-20", "light-attention-16", "light-attention-20"]);
         assert_eq!(names(&["actions", "project"]), ["dark-home-actions-16", "dark-project-16", "light-home-actions-16", "light-project-16"]);
+        assert_eq!(names(&["scroll"])[..3], ["dark-home-scroll-start-16", "dark-home-scroll-middle-16", "dark-home-scroll-end-16"]);
+        assert_eq!(names(&["scroll"]).len(), 12, "start, middle and end at 16 and 20 px in both themes");
         assert!(names(&["icon"]).is_empty(), "icon alone captures no popover page");
         let all = names(&[]);
-        assert_eq!(all.len(), 2 * (4 + 2 * (ROUTES.len() - 3)), "no filter keeps the full matrix");
+        assert_eq!(all.len(), 2 * (4 + 2 * (ROUTES.len() - 4)), "no filter keeps the full matrix without scroll");
         for route in ROUTES {
             assert!(!names(&[route]).is_empty(), "{route} names a captured page");
         }

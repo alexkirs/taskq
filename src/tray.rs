@@ -947,12 +947,13 @@ if(x>0)window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME',x}));})()
 const ACTIONS: &str = "(()=>{const q=s=>document.querySelector(s),put=(s,v)=>{const i=q(s);i.value=v;i.dispatchEvent(new Event('input',{bubbles:true}));};
 q('[data-route=cadence]').click();q('[data-v=custom]').click();put('#hs','2026-10-13T10:00');put('#he','2026-10-13T09:00');q('[data-a=range]').click();})()";
 
-/// The `scroll` snapshots: Home with each bounded AI block at its start, middle and end; the page realigns it on whole
-/// lines once the scroll settles (150 ms), before the capture (#1115).
+/// The `scroll` snapshots: Home with each bounded AI block at its start, middle and end, realigned by the page's
+/// `taskq.settle`, the step a reader's scroll runs once it settles (#1115). Called directly: an off-screen capture window may
+/// deliver the scroll event after the capture.
 const SCROLLS: [(&str, &str); 3] = [
-    ("start", "document.querySelectorAll('[data-bound]').forEach(c=>c.scrollTop=0)"),
-    ("middle", "document.querySelectorAll('[data-bound]').forEach(c=>c.scrollTop=(c.scrollHeight-c.clientHeight)/2)"),
-    ("end", "document.querySelectorAll('[data-bound]').forEach(c=>c.scrollTop=c.scrollHeight)"),
+    ("start", "document.querySelectorAll('[data-bound]').forEach(c=>{c.scrollTop=0;taskq.settle(c);})"),
+    ("middle", "document.querySelectorAll('[data-bound]').forEach(c=>{c.scrollTop=(c.scrollHeight-c.clientHeight)/2;taskq.settle(c);})"),
+    ("end", "document.querySelectorAll('[data-bound]').forEach(c=>{c.scrollTop=c.scrollHeight;taskq.settle(c);})"),
 ];
 
 /// `tray --snapshot --route` names: `actions` is Home with the [`ACTIONS`] script, `scroll` Home with the [`SCROLLS`]

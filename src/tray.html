@@ -426,9 +426,9 @@ function wholeLines(c){
   else if(head<top){const d=Math.min(...lines().filter(l=>l.top>=top).map(l=>l.top))-top;if(d<c.clientHeight){shrink(d);c.scrollTop+=d;}}
   const bottom=top+c.clientHeight,tail=cut(bottom);if(tail>top&&tail<bottom)shrink(bottom-tail);}
 // a reader's scroll leaves cut lines: once it settles, the block takes its CSS bound again and realigns on whole lines
-menu.addEventListener('scroll',e=>{const c=e.target;if(!c.dataset?.bound)return;clearTimeout(c.settling);
-  c.settling=setTimeout(()=>{if(!c.isConnected)return;const s=c.scrollTop;c.style.maxHeight='';c.scrollTop=s;wholeLines(c);fit();},150);},true);
-window.taskq={receive(s){
+function settle(c){if(!c.isConnected)return;const s=c.scrollTop;c.style.maxHeight='';c.scrollTop=s;wholeLines(c);fit();}
+menu.addEventListener('scroll',e=>{const c=e.target;if(!c.dataset?.bound)return;clearTimeout(c.settling);c.settling=setTimeout(()=>settle(c),150);},true);
+window.taskq={settle,receive(s){
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
   if(s.capmsg){resourceReceipt(s.capmsg);return;}
   if(s.open){openCard(s.open);return;}

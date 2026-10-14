@@ -25,7 +25,9 @@ Claude visual review:
   Projects header show below it at 16 and 20 px, and the exchange preview ends on a whole line.
 - The full text stays reachable by scrolling each block; the AI workspace that keeps it in full is deferred (#1115 Scope).
 - After a reader scrolls either block, it realigns on whole lines once the scroll settles (150 ms).
-  macOS WKWebView, `tray --snapshot --route scroll` (debug build, same fixture), `macos-{dark,light}-home-scroll-{start,middle,end}-{16,20}.png`:
+  macOS WKWebView, `tray --snapshot --route scroll` (debug build, same fixture; the route calls the page's `taskq.settle`
+  directly, since the off-screen capture window delivered scroll events late and the earlier PNGs caught some blocks
+  before alignment; five runs gave identical PNGs), `macos-{dark,light}-home-scroll-{start,middle,end}-{16,20}.png`:
   both blocks start and end on whole lines at every position; start shows the first lines (`You: Which tasks wait for
   me?`, `storefront: answer #41 PM: reason 1`), end the last (`attempt.`, `keeping the larger quantity`), and
   `Confirm: apply 1 change` and the Projects header show in each. Playwright Chromium

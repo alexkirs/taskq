@@ -107,22 +107,42 @@ pub fn install_self(t: &Tool) -> Result<(), String> {
 
 /// § 8 step 5: the local code-signing identity in the login keychain; absent, copies stay ad-hoc.
 #[cfg(target_os = "macos")]
-const SIGNING_IDENTITY: &str = "TaskQ Local Signing";
+pub const SIGNING_IDENTITY: &str = "TaskQ Local Signing";
 
-/// `codesign` with the local identity; false when it is missing or signing fails.
+/// Signs `path` in place as `id` with `identity` and verifies it against `identifier <id> and certificate leaf`.
+/// Ok(false): the identity is absent, `path` is untouched; Err: present but signing or verification failed.
 #[cfg(target_os = "macos")]
-pub fn codesign(path: &Path, extra: &[&str]) -> bool {
-    std::process::Command::new("codesign").args(["-f", "-s", SIGNING_IDENTITY]).args(extra).arg(path).output().is_ok_and(|o| o.status.success())
+pub fn codesign(identity: &str, path: &Path, id: &str) -> Result<bool, String> {
+    use std::process::Command;
+    let ids = Command::new("security").args(["find-identity", "-p", "codesigning"]).output().map_err(|e| format!("security: {e}"))?;
+    let quoted = format!("\"{identity}\"");
+    let Some(sha1) = String::from_utf8_lossy(&ids.stdout).lines().find(|l| l.contains(&quoted))
+        .and_then(|l| l.split_whitespace().nth(1).map(str::to_owned)) else { return Ok(false) };
+    let run = |c: &mut Command| match c.output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!("{}: {}", path.display(), String::from_utf8_lossy(&o.stderr).trim())),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    };
+    run(Command::new("codesign").args(["-f", "-s", &sha1, "-i", id]).arg(path))?;
+    run(Command::new("codesign").arg(format!("-R=identifier \"{id}\" and certificate leaf = H\"{sha1}\"")).args(["-v", "--strict"]).arg(path))?;
+    Ok(true)
 }
 
 /// § 8 step 5: TCC keys an ad-hoc grant to the cdhash, so each release would need a new grant. Signs a copy of the
-/// release `v` and of the launcher with the local identity and a fixed id, then renames it into place (step 5).
+/// release `v` and of the launcher as `org.taskq.taskq`, then renames it into place (step 5); logs an absent identity
+/// and each copy that failed, which keeps its ad-hoc signature.
 #[cfg(target_os = "macos")]
 fn sign_copies(t: &Tool, v: &str) {
     for exe in [t.release_exe(v), t.install.join(t.exe_name())] {
         let tmp = exe.with_extension("signing");
-        if !(fs::copy(&exe, &tmp).is_ok() && codesign(&tmp, &["-i", "org.taskq.taskq"]) && fs::rename(&tmp, &exe).is_ok()) {
-            let _ = fs::remove_file(&tmp);
+        let r = fs::copy(&exe, &tmp).map_err(|e| format!("{}: {e}", exe.display()))
+            .and_then(|_| codesign(SIGNING_IDENTITY, &tmp, "org.taskq.taskq"))
+            .and_then(|s| if s { fs::rename(&tmp, &exe).map(|_| true).map_err(|e| format!("{}: {e}", exe.display())) } else { Ok(false) });
+        let _ = fs::remove_file(&tmp);
+        match r {
+            Ok(true) => {}
+            Ok(false) => return log(&format!("signing: no `{SIGNING_IDENTITY}` identity; {v} stays ad-hoc, macOS grants will not survive the next release")),
+            Err(e) => log(&format!("signing failed, copy stays ad-hoc: {e}")),
         }
     }
 }
@@ -475,6 +495,30 @@ mod tests {
         install_self(&t).unwrap();
         assert_ne!(ino(), first, "the release binary was rewritten in place");
         let _ = fs::remove_dir_all(&install);
+    }
+
+    // Chain: § 8 step 5 macOS signing (#1089). Risk: an absent identity or a failed signature passes silently, or two
+    // releases end up with requirements TCC does not match as one app.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn local_identity_signs_releases_under_one_requirement() {
+        let dir = std::env::temp_dir().join(format!("taskq-sign-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        fs::copy("/usr/bin/true", &a).unwrap();
+        fs::copy("/usr/bin/false", &b).unwrap();
+        let before = fs::read(&a).unwrap();
+        assert_eq!(codesign("TaskQ No Such Identity", &a, "org.taskq.taskq"), Ok(false));
+        assert_eq!(fs::read(&a).unwrap(), before, "an absent identity touched the file");
+        // ponytail: CI has no identity; the rest runs on a host where `service install` signs
+        if codesign(SIGNING_IDENTITY, &a, "org.taskq.taskq") == Ok(true) {
+            assert_eq!(codesign(SIGNING_IDENTITY, &b, "org.taskq.taskq"), Ok(true));
+            let req = |p: &Path| String::from_utf8(std::process::Command::new("codesign").args(["-d", "-r-"]).arg(p).output().unwrap().stdout).unwrap();
+            assert_eq!(req(&a), req(&b));
+            assert!(req(&a).contains("identifier \"org.taskq.taskq\" and certificate leaf"), "{}", req(&a));
+            assert!(codesign(SIGNING_IDENTITY, &dir.join("missing"), "org.taskq.taskq").is_err());
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // Chain: § 8 install sweep. Risk: sweep deletes a live release or owned file.

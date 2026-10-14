@@ -1069,8 +1069,13 @@ fn tray_app(install: &Path, exe: &Path) -> Option<PathBuf> {
     fs::write(app.join("Contents/Info.plist"), PLIST).ok()?;
     let tmp = bin.with_extension("tmp");
     fs::copy(exe, &tmp).and_then(|_| fs::rename(&tmp, &bin)).ok()?;
-    let signed = platform::codesign(&app, &[])
-        || std::process::Command::new("codesign").args(["-f", "-s", "-"]).arg(&app).output().is_ok_and(|o| o.status.success());
+    let signed = match platform::codesign(platform::SIGNING_IDENTITY, &app, "org.taskq.tray") {
+        Ok(true) => true,
+        r => {
+            if let Err(e) = r { platform::log(&format!("signing failed, TaskQ.app stays ad-hoc: {e}")) }
+            std::process::Command::new("codesign").args(["-f", "-s", "-"]).arg(&app).output().is_ok_and(|o| o.status.success())
+        }
+    };
     signed.then_some(bin)
 }
 

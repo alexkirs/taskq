@@ -146,6 +146,16 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 - Unpin returns to the popover at the tray icon. Pinned state and position persist in `<install>/tray.json`; a missing or off-screen position falls back to the tray icon.
 - Content, state and height rules do not change between the two modes; only placement and closing do.
 
+## M14 Notifications
+
+- The tray posts native OS notifications (macOS Notification Center, Windows toast) for new board events read from each project's `events`; no board read, no token.
+- Event kinds: `ask` (a question waits for the owner), `close`, `failed` and `gone`. Settings > Notifications sets each kind to Off, Silent (menu badge only), Banner or Banner with sound. Defaults: `ask` Banner with sound, `failed` and `gone` Banner, `close` Off.
+- A project may override the host setting per kind (Inherit by default); the project page shows the effective value.
+- A notification names the project, the task title and the kind; a click opens the menu (or the pinned window) on that task's card, for `ask` the answer card.
+- Each event notifies at most once: a per-project cursor of the last notified event id persists in `<install>/tray.json`; events older than the cursor, or older than the first tray start with notifications on, never notify. More than 3 events within 10 s become one summary notification per project.
+- The first enable asks the OS for permission; denied or revoked: Settings shows `Blocked by the OS` with a link to the OS setting, and nothing falls back to another channel. `Send test` posts one sample of the selected kind.
+- Settings persist in `<install>/tray.json`; an unknown value reads as the default and keeps the file.
+
 ## Acceptance
 
 | ID | Evidence |
@@ -174,3 +184,4 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 | M-A21 | Pin keeps the menu open as a movable window above normal windows; position and pinned state survive a tray restart; unpin returns to the popover; Windows edge snap, macOS work-area clamp. |
 
 [Verification](verification.md) separates historical evidence from the current candidate. General principles change in specq; TaskQ behavior changes here under R13.
+| M-A22 | Each kind follows its host or project setting; an event notifies once across tray restarts; a burst becomes one summary; a click opens the card; OS denial shows Blocked and posts nothing. |

@@ -77,7 +77,7 @@ fn measure_at<T, E: std::fmt::Display>(path: Option<&Path>, detailed: bool, op: 
 
 pub fn log_lock(path: &Path) -> std::io::Result<fs::File> {
     let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path.parent().unwrap().join("taskq-profile.lock"))?;
-    lock.lock()?;
+    lock.try_lock().map_err(std::io::Error::other)?;
     Ok(lock)
 }
 
@@ -125,7 +125,7 @@ fn render(text: &str) -> Result<String, &'static str> {
     };
     let ranking = |s: String| if s.is_empty() { "unknown (no observations)".into() } else { s };
     let window = first.zip(last).map_or("unknown (no timestamps)".into(), |(f, l)| format!("{f}..{l} Unix ms; earlier/pruned history unknown"));
-    let mut out = format!("Profile: retained observations; all budgets unknown\nWindow: {window}\nDetailed traces: {traces} retained; switch {} for this run\nRetries/cancellations: unknown (not exposed by adapters)\nSlow (p95): {}\nFailing (rate): {}\nUnstable (variance): {}\n\n| Operation | Count | p50/p95/max ms | Success/failure | Failure % | Variance ms² | Errors | Budget |\n|---|---:|---|---|---:|---:|---|---|\n",
+    let mut out = format!("Profile: retained observations; all budgets unknown\nWindow: {window}\nCollection completeness: unknown (best-effort writes; check CLI/service diagnostics)\nDetailed traces: {traces} retained; switch {} for this run\nRetries/cancellations: unknown (not exposed by adapters)\nSlow (p95): {}\nFailing (rate): {}\nUnstable (variance): {}\n\n| Operation | Count | p50/p95/max ms | Success/failure | Failure % | Variance ms² | Errors | Budget |\n|---|---:|---|---|---:|---:|---|---|\n",
         if TRACE.get().copied().unwrap_or(false) { "on" } else { "off" },
         ranking(rank(|s| s.percentile(95) as f64)), ranking(rank(Stats::rate)), ranking(rank(Stats::variance)));
     for s in stats {
@@ -199,19 +199,35 @@ mod tests {
             assert!(report(&dir).starts_with("Profile: unknown"));
             assert_eq!(fs::read_to_string(&path).unwrap(), bad);
         }
-        fs::write(&path, "normal log\n".repeat(crate::data::LOG_MAX as usize / 11 + 1)).unwrap();
+        fs::write(&path, "normal log\n".repeat((crate::data::LOG_MAX as usize - 256) / 11)).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() <= crate::data::LOG_MAX);
         assert!(report(&dir).contains("collection stopped"));
         assert!(crate::data::trim_tail(&path, crate::data::LOG_MAX));
         append(&path, &Record { op: "spawn".into(), us: 1, error: "none".into(), at_ms: Some(1), trace: None }).unwrap();
         assert!(fs::metadata(&path).unwrap().len() <= crate::data::LOG_MAX);
         assert!(report(&dir).contains("| spawn | 1 |"));
+        let held = log_lock(&path).unwrap();
+        assert!(log_lock(&path).is_err());
+        assert!(!crate::data::trim_tail(&path, crate::data::LOG_MAX));
+        assert_eq!(measure_at(Some(&path), false, "spawn", || Ok::<_, String>(7)).unwrap(), 7);
+        drop(held);
+        // Force real truncation while concurrent appenders use the same nonblocking lock.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all("normal log\n".repeat(crate::data::LOG_MAX as usize / 11).as_bytes()).unwrap();
+        let successful = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..4 { scope.spawn(|| {
-                for _ in 0..50 { append(&path, &Record { op: "spawn".into(), us: 1, error: "none".into(), at_ms: Some(1), trace: None }).unwrap(); }
+                for _ in 0..50 {
+                    if append(&path, &Record { op: "spawn".into(), us: 1, error: "none".into(), at_ms: Some(1), trace: None }).is_ok() {
+                        successful.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }); }
             scope.spawn(|| { for _ in 0..50 { crate::data::trim_tail(&path, crate::data::LOG_MAX); } });
         });
-        assert!(report(&dir).contains("| spawn | 201 |"));
+        let records = fs::read_to_string(&path).unwrap().lines().filter(|l| l.starts_with(PREFIX)).count();
+        assert_eq!(records, successful.load(Ordering::Relaxed));
+        assert!(!report(&dir).starts_with("Profile: unknown"));
         fs::remove_dir_all(dir).unwrap();
     }
 }

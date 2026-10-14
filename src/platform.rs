@@ -285,6 +285,34 @@ pub fn host_memory() -> Option<(f64, u32)> {
     Some((kb / GIB * 1024.0, 0))
 }
 
+/// The gui probe (§ 4 Filter): Screen Recording TCC state allowed for this process and `screencapture -x` writes a PNG.
+#[cfg(target_os = "macos")]
+pub fn gui_probe() -> Result<(), String> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+    }
+    // SAFETY: no arguments; reads this process's TCC state without a prompt
+    if !unsafe { CGPreflightScreenCaptureAccess() } {
+        return Err("Screen Recording not allowed (TCC)".into());
+    }
+    let png = std::env::temp_dir().join(format!("taskq-gui-{}.png", std::process::id()));
+    let ran = std::process::Command::new("/usr/sbin/screencapture").args(["-x", "-t", "png"]).arg(&png)
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    let ok = fs::read(&png).is_ok_and(|b| b.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let _ = fs::remove_file(&png);
+    match ran {
+        Ok(s) if s.success() && ok => Ok(()),
+        Ok(_) => Err("screencapture wrote no PNG".into()),
+        Err(e) => Err(format!("screencapture: {e}")),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn gui_probe() -> Result<(), String> {
+    Err("no gui probe on this OS".into())
+}
+
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code))]
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 

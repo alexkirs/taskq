@@ -583,6 +583,7 @@ fn service_run(c: &Ctx) -> Res<()> {
     log!("taskq {} service on {} for {}", platform::VERSION, cfg.me, cfg.repo);
     let mut sampled: Option<Instant> = None;
     let mut agents: Option<(Instant, Value)> = None;
+    let mut gui_at: Option<Instant> = None;
     let mut focus_error: Option<String> = None;
     let mut pruned: Option<Instant> = None;
     // § 4 board budget: the pause logged last, and the cumulative counts at the last full hour
@@ -606,6 +607,12 @@ fn service_run(c: &Ctx) -> Res<()> {
         // § 8 Access: re-read every pass; a refused runtime is not claimed or resumed
         let access = policy::report(&cfg.install, &cfg.root, &cfg.permission_mode, &cfg.codex);
         s.refused_access = access.iter().filter_map(|e| Some((e.runtime.clone(), e.refused.clone()?))).collect();
+        s.full = access.iter().filter(|e| e.mode == "full" && e.refused.is_none()).map(|e| e.runtime.clone()).collect();
+        // § 4 Filter: the gui probe runs with the agents probe, at most every 5 minutes
+        if gui_at.is_none_or(|t: Instant| t.elapsed().as_secs() >= 300) {
+            s.gui_probe = platform::gui_probe();
+            gui_at = Some(Instant::now());
+        }
         if let Some(m) = policy::pin_rollback(&cfg.install, platform::VERSION) {
             log!("{m}");
         }
@@ -675,6 +682,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
             ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
+            ("gui", json!({"listed": s.gui().is_ok(), "reason": s.gui().err()})), ("waits", json!(s.waits.iter().map(|n| json!({"task": n, "reason": "no gui host"})).collect::<Vec<_>>())),
             ("restart_waits", json!(d.join("restart").exists().then(|| restart_waits(&s, &cfg.root)))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root))),
             ("requests", budget.json(since, last_hour.as_ref(), &hour.1)), ("connection", json!(dashq.outcome))]

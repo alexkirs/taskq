@@ -1228,6 +1228,7 @@ mod tests {
             ("codex-app", "claude", 1, "claude"),
             ("codex-app", "claude", 0, "codex-app"),
         ] {
+            if worker == "codex-app" && !cfg!(target_os = "macos") { continue; } // § 8: codex-app is macOS only
             let b = Fake::default();
             let n = b.create("T", "", &["taskq".into(), format!("run-{worker}")]).unwrap();
             let mut c = cfg("mac");

@@ -1,7 +1,7 @@
 // B4 parent/child comparison (docs/design/shared-blocks.md): the parent question card in docs/design/workspace-preview.html
 // against the tray's shared card on the same task. Risk: the child drifts from parent tokens, choice layout or
 // disclosures, or the card breaks the project counter strip (K-A8). Instrument, not a CI gate (needs Playwright):
-// npm i --no-save playwright && PLAYWRIGHT_CHANNEL=chrome node tests/answer-card.parent.cjs
+// npm i --no-save playwright && node tests/answer-card.parent.cjs
 const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict'), {chromium} = require('playwright');
 const html = fs.readFileSync('src/tray.html', 'utf8')
   .replace('{{ANSWER_CARD_CSS}}', fs.readFileSync('src/answer-card.css', 'utf8'))
@@ -20,7 +20,7 @@ function look(sel) {
     wrap: g(list, 'flexWrap'), star: b.textContent.trim().endsWith('★'), disclosures: [...q.querySelectorAll('summary')].map(s => s.textContent)};
 }
 (async () => {
-  const browser = await chromium.launch({channel: process.env.PLAYWRIGHT_CHANNEL});
+  const browser = await chromium.launch(require('./browser.cjs')());
   try {
     for (const theme of ['light', 'dark']) {
       const parent = await browser.newPage({viewport: {width: 1024, height: 1200}, colorScheme: theme});
@@ -37,7 +37,7 @@ function look(sel) {
         await page.setContent(html);
         const row = fx.cases.find(c => c.name.startsWith('choice')).rows[0], filler = (state, k) => Array.from({length: k}, (_, i) => ({...row, n: 10000 * (state === 'ready' ? 2 : 1) + i, state, title: 'Long task title that wraps at large type ' + i, card: null, question: null}));
         const p = {root: 'p', name: 'project-with-a-long-name', issues: 'https://github.com/o/r/issues', alive: true, complete: true, focus: [], labels: [], tasks: [row, ...filler('doing', n), ...filler('ready', n)], cap_saved: {error: 'not configured'}};
-        await page.evaluate(s => taskq.receive(s), {page: 'p', font, projects: [p], ai: {draft: ''}});
+        await page.evaluate(s => taskq.receive(s), {page: 'p', font, projects: [p], ai: {draft: ''}, notify: {projects: {}}});
         const got = await page.evaluate(look, {card: '.qac', choice: '.qac-choices button', choices: '.qac-choices', mark: '.qac-mark', number: '.qac-number'});
         assert.deepEqual(got, want, at + ': child look equals parent');
         // K-A8: the project strip ends at its row's right edge, state order kept, nothing wider than the window

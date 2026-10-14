@@ -2,7 +2,7 @@ const {chromium}=require('playwright'),assert=require('node:assert/strict'),path
 // Evidence PNGs only with --evidence; a plain run writes nothing.
 const ev=(...p)=>process.argv.includes('--evidence')?path.join(__dirname,...p):undefined;
 (async()=>{
- const browser=await chromium.launch({headless:true,channel:'chrome'}),page=await browser.newPage({viewport:{width:1024,height:1200}}),errors=[];
+ const browser=await chromium.launch(require('../../tests/browser.cjs')()),page=await browser.newPage({viewport:{width:1024,height:1200}}),errors=[];
  page.on('pageerror',e=>errors.push(e.message));await page.goto('file://'+path.join(__dirname,'workspace-preview.html'));
  const f=page.frameLocator('iframe'),ai=f.locator('#tqai'),button=a=>ai.locator(`[data-ai="${a}"]`),fixture=ai.locator('[data-fixture]'),draft=ai.locator('[data-draft]');
  await f.locator('[data-demo-tools]').check();

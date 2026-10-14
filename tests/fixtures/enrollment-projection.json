@@ -33,12 +33,12 @@
       "choices": [
         {
           "number": 1,
-          "text": "left",
+          "label": "left",
           "recommended": false
         },
         {
           "number": 2,
-          "text": "right",
+          "label": "right",
           "recommended": true
         }
       ]

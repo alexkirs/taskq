@@ -1,6 +1,6 @@
 # Independent DashQ connection
 
-Accepted implementation target under [taskq.md](../../taskq.md). Apply [shared connection semantics](https://github.com/taskqorg/specq/blob/main/engineering/product-connections.md) through the coreq linked client and [DashQ C1–C7](https://github.com/taskqorg/dashq/blob/main/docs/design/enrollment.md). Pending implementation and qualification.
+Accepted implementation target under [taskq.md](../../taskq.md). Apply [shared connection semantics](https://github.com/taskqorg/specq/blob/main/engineering/product-connections.md) through the coreq linked client and [DashQ C1–C7](https://github.com/taskqorg/dashq/blob/main/docs/design/enrollment.md). Implemented (#913); release qualification below.
 
 `taskq enroll <https-url>`, `taskq connection status` and `taskq disconnect` use the same browser/headless approval, protected credential, projection receipt and revoke lifecycle as AgentQ. No AgentQ installation or Langfuse dependency. The existing service handles delivery; no extra daemon or scheduler. Stable random installation identity survives updates, never derives from hostname; lost identity creates a new installation.
 
@@ -19,6 +19,12 @@ R1 exception: protected connection identity/grant/revoke state and the latest un
 An exact approved `(kind, host, repo)` scope gates projection of an unfiltered canonical snapshot. Identity fields are validated, host names and GitHub repository names lowercased; GitLab repository spelling stays canonical from the snapshot. No snapshot URL or extra identity keys are copied. Allowlisted task fields are number, state, revision, numbered choices and recommendation from the canonical card parser. Choices are explicitly scoped board content. Titles, raw cards/reasons, sessions, labels, paths, host metadata and configuration are omitted. Incomplete observations carry a fixed reason, never raw forge diagnostics.
 
 Coalescing selects one latest observation per approved board, irrespective of installation; totals are never added across hosts. Equal-time conflicting observations become explicitly unknown. Every approved board gets a row, including missing observations. Freshness uses the original board observation time and the caller's maximum age; future/zero times are unknown, old observations are stale, and unknown/stale totals are null. Completeness remains independent of freshness. This is an observation adapter, never a task-state source or offline command queue.
+
+## Client (#913)
+
+coreq v0.11.0 `enroll` owns pairing, protected state (`<install>/connection/`, kept by sweep and pruning), delivery, receipts and revoke; TaskQ adds no transport. The request carries the TaskQ `installation-id`, product `taskq`, the host name as label, schema `taskq-board/1`, scope `{name: taskq-board/1, value: <kind>:<host>/<repo>}` and no capabilities. One board per installation: enrolling another project's board shows `old -> new` and switches; the old grant is revoked. A bare DashQ origin gets `/machine` appended.
+
+Each service pass hands its latest snapshot to one delivery thread; a projection equal to the last accepted one is resent only after 300 s. Only the root whose board equals the approved scope sends. Retry follows coreq backoff; a stop (401, refused batch) waits 300 s; outcomes go to the service log and `status.json` `connection`. Choice text is `label` (DashQ C4 refuses a `text` key); over 256 tasks the observation is incomplete, reason `task limit`.
 
 ## Qualification
 

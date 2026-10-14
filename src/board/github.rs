@@ -274,7 +274,8 @@ impl Board for GitHub {
     }
 
     fn foreign(&self, repo: &str, n: u64) -> Result<Issue> {
-        Ok(parse_issue(&self.api.call("GET", &format!("{}/repos/{}/issues/{n}", self.api.root, self.api.sibling("/repos/", repo)), None)?.json()?))
+        let v = self.api.call("GET", &format!("{}/repos/{}/issues/{n}", self.api.root, self.api.sibling("/repos/", repo)), None)?.json()?;
+        Ok(parse_issue(&super::dep_reply(v, "number", n, "open")?))
     }
 
     fn foreign_url(&self, repo: &str, n: u64) -> String {

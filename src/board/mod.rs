@@ -208,6 +208,14 @@ fn s(v: &Value, k: &str) -> String {
     v[k].as_str().unwrap_or_default().to_string()
 }
 
+/// A `Depends on <repo>#N` reply (§ 1, R12): issue `n` (key `num`) whose `state` is `open` or `closed`, else unknown.
+fn dep_reply(v: Value, num: &str, n: u64, open: &str) -> Result<Value> {
+    match (v[num].as_u64(), v["state"].as_str()) {
+        (Some(m), Some(st)) if m == n && (st == open || st == "closed") => Ok(v),
+        _ => Err(format!("malformed reply for issue {n}")),
+    }
+}
+
 fn names(v: &Value, k: &str) -> Vec<String> {
     v.as_array().into_iter().flatten().map(|x| x.as_str().map(String::from).unwrap_or_else(|| s(x, k))).collect()
 }
@@ -814,6 +822,12 @@ mod tests {
             assert_eq!((i.number, i.open, i.reason.as_deref()), (36, false, reason));
             assert_eq!((urls.borrow()[0].as_str(), b.foreign_url("dashq", 36)), (api, web.to_string()));
             assert_eq!(b.foreign_url("x/y", 1).replace("x/y", "o/r"), b.url(1), "a full path is used as written");
+        }
+        // R12: a reply that is not that issue in a known state stays unknown, never done
+        for (kind, body) in [(&github::KIND, "{}"), (&github::KIND, r#"{"number":37,"state":"closed"}"#), (&github::KIND, r#"{"number":36,"state":"gone"}"#),
+            (&gitlab::KIND, "{}"), (&gitlab::KIND, r#"{"iid":36}"#), (&gitlab::KIND, r#"{"iid":36,"state":"open"}"#)] {
+            let b = http(kind, Some(true), Box::new(move |_, _, _| Ok(Reply { status: 200, headers: vec![], body: body.into(), operation: "read" })));
+            assert_eq!(b.foreign("dashq", 36).unwrap_err(), "malformed reply for issue 36", "{body}");
         }
     }
 

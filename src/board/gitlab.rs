@@ -219,7 +219,7 @@ impl Board for GitLab {
 
     fn foreign(&self, repo: &str, n: u64) -> Result<Issue> {
         let path = self.api.sibling("/projects/", repo).replace('/', "%2F");
-        let v = self.api.call("GET", &format!("{}/projects/{path}/issues/{n}", self.api.root), None)?.json()?;
+        let v = super::dep_reply(self.api.call("GET", &format!("{}/projects/{path}/issues/{n}", self.api.root), None)?.json()?, "iid", n, "opened")?;
         // trust is for log entries; a dependency is judged only by its state
         Ok(Issue { number: v["iid"].as_u64().unwrap_or(0), open: v["state"] == "opened", ..Default::default() })
     }

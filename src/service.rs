@@ -1691,6 +1691,10 @@ mod tests {
         let dep = b.create("dep", "", &[]).unwrap();
         let n = b.create("T", "Depends on dashq#36\nDepends on owner/gone#5", &["taskq".into()]).unwrap();
         let same = b.create("S", &format!("Depends on #{dep}"), &["taskq".into()]).unwrap();
+        // § 8 cutover: N-1 reads only `Depends on #N`; a held task has no `taskq` label, so N-1 (same `is_task`) skips it
+        assert!(core::depends("Depends on dashq#36").iter().all(|d| d.repo.is_some()));
+        let held = b.create("H", "Depends on dashq#36", &["q-held".into()]).unwrap();
+        assert!(!is_task(&b.issue(held).unwrap()) && is_held(&b.issue(held).unwrap()));
         let c = cfg("mac");
         let raw = json!({});
         let report = || crate::snapshot::read(&b, &c, &raw, &[]).text(&c, &raw).unwrap();

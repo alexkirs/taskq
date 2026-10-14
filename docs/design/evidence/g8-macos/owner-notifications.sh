@@ -4,7 +4,8 @@
 # Disposable install and fixture project under target/g8-owner; the real install, its tray and every board stay untouched.
 # Bundle `org.taskq.tray` shares the OS permission with any later real TaskQ.app on this Mac.
 # One stable app across runs: the OS keys its Notifications entry to the bundle path and signature, so the app is
-# re-signed only when the binary changes and is registered with LaunchServices as the service does (#1051).
+# re-signed only when the binary changes and is registered with LaunchServices (the service now starts it through
+# `open`, #1105).
 set -eu
 BIN=${1:-target/release/taskq}
 # resolved path: through the /var -> /private/var symlink the app cannot hand its bundle to the notification

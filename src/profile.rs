@@ -181,6 +181,8 @@ mod tests {
     #[test]
     fn retained_profile_report() {
         let dir = std::env::temp_dir().join(format!("taskq-profile-{}", std::process::id()));
+        // A failed run leaves its directory; a reused process id must not inherit that log.
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("taskq.log");
         assert!(report(&dir).contains("unknown (no observations)"));

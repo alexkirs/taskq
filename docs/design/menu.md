@@ -60,7 +60,7 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 
 - Four series bottom to top: close, failed, ask, blocked; event history, not CPU or current concurrency.
 - Source: service-local `.taskq/events` cache; event time, task, kind and attempt ID (or comment ID for ask/blocked without attempt). Deduplicate IDs. Repeated failure after requeue is a new event.
-- No board replay. Cache loss means incomplete history; show collection start and gaps. Unknown is not zero.
+- No board replay. Cache loss means incomplete history; show collection start and gaps. Unknown follows [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy).
 - Equal time bins, oldest left; presets use 12 whole epoch-aligned bins, the newest holding now and marked partial; the grid steps one bin at a boundary, never drifts. One linear scale across series and bins. Equal counts have equal heights; scale by the largest stacked sum, never 100% per bar.
 - Default 24 hours; presets 5 min/hour/day/7 days/30 days/custom. Custom start < end, explicit timezone and half-open range [start,end); persist choice.
 - Period never changes scope or the current failed count. Expose precise totals/peak when small segments cannot resolve.
@@ -132,7 +132,7 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 - One editor from home/settings/project; project entry preselects that project. Open it in the existing workspace (approved Workspace review), preserving menu navigation and drafts. Recovery uses the same workspace route.
 - Named host, explicitly selected projects, new-task filter, per-project/runtime limits, optional load guard, change review.
 - Selection defines change targets, not registered observations. Unchecking a project leaves its focus/limits unchanged.
-- Preserve runtime-specific limits, including codex-app. No shared host pool. Disable fields for unselected projects; never replace unknown values with zero.
+- Preserve runtime-specific limits, including codex-app. No shared host pool. Disable fields for unselected projects; unknown values follow [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy).
 - Different current focus displays Mixed. Opening does not overwrite it. Change only explicitly edited fields.
 - Review exact project/host old→new changes; current attempts continue. Cancel preserves settings; readback is per project, including partial failure.
 - Preserve CPU/memory gate controls and saved-vs-applied distinction from the current UI. Gate semantics remain in taskq.md.
@@ -184,5 +184,5 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 | M-A20 | Shared editor preserves Mixed, untouched fields/targets and per-project readback. |
 | M-A21 | Pin keeps the menu open as a movable window above normal windows; position and pinned state survive a tray restart; unpin returns to the popover; Windows edge snap, macOS work-area clamp. |
 
-[Verification](verification.md) separates historical evidence from the current candidate. General principles change in specq; TaskQ behavior changes here under R13.
+[Verification](verification.md) separates historical evidence from the current candidate. General principles change per [shared-rule improvement](https://github.com/taskqorg/specq/blob/main/engineering/spec-first.md#improve-shared-rules); TaskQ behavior changes here under R13.
 | M-A22 | Each kind follows its host or project setting; an event notifies once across tray restarts; a burst becomes one summary; a click opens the card; OS denial shows Blocked and posts nothing. |

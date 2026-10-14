@@ -36,7 +36,7 @@ Keep the current Work mode editor; no new top-level panel.
 | Waiting task | Actual cause: load, ceiling, pause, dependency, scope, access or provider; show all blockers in Details |
 | AI request | “Use spare resources, at most six sessions; frontend at most two” → exact settings diff → confirmation → readback |
 
-Distinguish saved policy from active policy. Unknown readings are not zero load. Remote edits show pending/offline until matching host readback. No ETA inferred from load.
+Distinguish saved policy from active policy. Unknown readings follow [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy). Remote edits show pending/offline until matching host readback. No ETA inferred from load.
 
 ## R4 Migration and acceptance
 

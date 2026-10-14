@@ -68,7 +68,7 @@ Readback, window reopening and service updates must not duplicate writes or agen
 
 Qualification adds UC-10–UC-12: switch PM/client without copying tasks; complete planning/answer/result flow with external desktops closed using a headless runtime; distinguish per-project limits from machine totals. Preserve Resources → btop/btop4win and explain unsupported remote hosts. Keep visual evidence on the ticket through an authorized durable destination. Inventory machine-readable command results and planning operations before inventing new interfaces.
 
-Builder fills every acceptance-ledger row and pins reference/artifact/fixture hashes. Reviewer reproduces deviations, then polishes shared causes. Preserve Resources, incidents/consent and navigation recovery from 4.1.9. Owner decides design changes; no repeated approval for matching existing requirements. Fail and Not tested remain open.
+Builder fills every acceptance-ledger row; source pinning follows [F1](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f1-source-and-change-control); build, review and polish follow [F6](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f6-build-polish-accept). Preserve Resources, incidents/consent and navigation recovery from 4.1.9.
 
 ## Commands
 
@@ -77,7 +77,7 @@ Builder fills every acceptance-ledger row and pins reference/artifact/fixture ha
 - Existing tests remain relevant to existing behavior, not proof of the new layout.
 - Runtime implementation: required `cargo test --locked` and `cargo run -- selftest`, plus focused adapter/native checks. Follow repository launcher instructions.
 
-Report implemented, tested, published and deployed separately. All project content is English; general rules evolve in specq, TaskQ decisions here.
+Status reports follow [specq Core](https://github.com/taskqorg/specq/blob/main/caveman/rules/core.md); general rules follow [shared-rule improvement](https://github.com/taskqorg/specq/blob/main/engineering/spec-first.md#improve-shared-rules), TaskQ decisions live here.
 
 [System change map](system-change-map.md) owns backend slices, acceptance and the remaining product questions. No design approval enables runtime policy.
 
@@ -87,7 +87,7 @@ Report implemented, tested, published and deployed separately. All project conte
 
 ## Copyable assignment for the next agent
 
-> Read AGENTS.md, taskq.md and docs/design/README.md. Follow the implementation brief and linked shared rules. Reconcile the design package with current code and existing tasks. Prepare a dependency-ordered implementation plan covering the service/CLI, native application and remote PM adapters; map each slice to existing requirements and acceptance. Preserve accepted decisions, ask only unresolved product questions with recommendations, and identify unsupported capabilities honestly. After implementation is authorized, amend affected contracts/models first, implement each slice, and verify actual behavior against the approved design and scenarios. Report specified, implemented, tested, published and deployed separately. Do not deploy, migrate FRA or enable observation merely because the design describes it.
+> Read AGENTS.md, taskq.md and docs/design/README.md. Follow the implementation brief and [shared agent workflow](https://github.com/taskqorg/specq/blob/main/engineering/agent-workflow.md). Reconcile the design package with current code and existing tasks. Prepare a dependency-ordered implementation plan covering the service/CLI, native application and remote PM adapters; map each slice to existing requirements and acceptance. After implementation is authorized, verify actual behavior against the approved design and scenarios. Do not deploy, migrate FRA or enable observation merely because the design describes it.
 
 ## Final system-to-interface contract map
 

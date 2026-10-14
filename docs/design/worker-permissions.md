@@ -12,7 +12,7 @@ Applies to workers, reviewers and the full operator (R3/R9); tools remain bounde
 - [#865](https://github.com/taskqorg/taskq/issues/865), closed through [#866](https://github.com/taskqorg/taskq/pull/866): worker `find /` for missing taskq.md caused folder prompts attributed to taskq. Report cites tccd timing and worker transcripts. This review read the report, not those original logs.
 - Result `1ed9efc442a1b5f6108ebefa27ed11929ac84a87`, merge `c933c2c6925718c376afae86df4b20be5ad317b3`: briefs name an existing release contract and forbid broad searches. Runtime sandbox was explicitly not enabled because R9 preserved permissions. Owner confirmation after restart remains open.
 - Upstream §8 Folders names root/install/runtime homes/temp and an owner-picker exception. The inspected checkout predates that change. Preserve the fix when merging; do not overwrite newer upstream text.
-- A prompt instruction is not filesystem enforcement. Closing #865 does not prove containment or absence of future TCC prompts.
+- Closing #865 does not prove containment ([permission authority](https://github.com/taskqorg/specq/blob/main/engineering/permission-authority.md)) or absence of future TCC prompts.
 - [coreq trust rule](https://github.com/taskqorg/coreq/blob/main/coreq.md): agent-writable project configuration must not choose executable code. Apply the same trust distinction to permission escalation.
 
 ## P1 Recommendation
@@ -148,7 +148,7 @@ taskq service permissions --host mac --runtime claude --project <registered-id> 
 Apply requires the authenticated local review channel and revision check; no public `--yes` route available to a worker. Local external editing imports a candidate through the same validation/readback, not a project-file grant.
 `service status`: requested/effective mode, policy revision, source, sandbox/isolation proof, active-old-revision count, pending/unsupported reason. No credentials.
 Spawn comment: mode + policy digest/version, additive metadata compatible with existing parsers; no local paths. Full audit also records actor, old/new, target, time and approval locally outside worker write access.
-Saved is not Applied. Verify service readback before reporting completion. Unsupported or stale remains explicit.
+Saved is not Applied: completion and unsupported/stale values follow [shared verification](https://github.com/taskqorg/specq/blob/main/engineering/verification.md) on service readback.
 
 ## P7 Migration
 

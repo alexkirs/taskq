@@ -80,10 +80,9 @@ Prioritize UC-05 next, then questions/failures and service controls; resolve UC-
 - Large font/long title: full-width wrapping, reachable controls, no horizontal clipping.
 - Live update: a new critical item is signalled without moving an existing click target.
 
-## Shared-rule candidate
+## Shared rule
 
-Propose in specq: adaptive operator interfaces keep control locations stable; adapt information by current effect and explicit user preference, not opaque frequency ranking. Preserve active pointer/keyboard targets during updates.
-This extends D2/D5/D13. The owner approved stable adaptive navigation for this design; the product-specific ordering, limits and recent definition stay here.
+Accepted upstream as [stable adaptation](https://github.com/taskqorg/specq/blob/main/design/operator-ui.md#stable-adaptation). This extends D2/D5/D13. The owner approved stable adaptive navigation for this design; the product-specific ordering, limits and recent definition stay here.
 
 ## Prototype evidence
 

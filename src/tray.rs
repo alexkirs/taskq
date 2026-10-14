@@ -266,8 +266,6 @@ fn answer_snapshot(s: &Value, m: &Value) -> Result<(), String> {
     if s["board"]["url"] != m["board"] { return Err("board identity changed; refresh the project".into()); }
     let op = &m["op"];
     let row = s["tasks"].as_array().into_iter().flatten().find(|r| r["n"] == op["task"]);
-    // Close reconciliation may find an already closed issue. `later` with the same id can only read its receipt.
-    if row.is_none() && op["action"] == "close" { return Ok(()); }
     let row = row.ok_or("task is not in the current board snapshot; open it on the board")?;
     if op.get("action").is_some() {
         if row["revision"] != op["revision"] { return Err("question changed; refresh before acting".into()); }
@@ -1449,7 +1447,7 @@ mod tests {
         assert_eq!(calls[1].last().unwrap(), &rev.to_string());
         let count = b.comments(n).unwrap().len();
         snapshot["tasks"] = json!([]);
-        assert!(answer_snapshot(&snapshot, &m).is_ok());
+        assert!(answer_snapshot(&snapshot, &m).is_err(), "an omitted row never grants cancellation authority");
         assert_eq!(answer_dispatch(&m, &args, execute)["state"], "closed");
         assert_eq!(b.comments(n).unwrap().len(), count);
         for action in ["requeue", "later"] {

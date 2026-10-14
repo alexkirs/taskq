@@ -1,7 +1,7 @@
 # TaskQ operator design package
 
 Approved menu direction and AI window policy; detailed candidate for implementation planning.
-Runtime remains governed by [taskq.md](../../taskq.md). Shared rules live in [specq](https://github.com/taskqorg/specq/); this package holds TaskQ-specific requirements.
+Runtime remains governed by [taskq.md](../../taskq.md); its [Product](../../taskq.md#product) section links here as the design-target index. Shared rules live in [specq](https://github.com/taskqorg/specq/); this package holds TaskQ-specific requirements.
 
 Working process: [shared product design workflow](https://github.com/taskqorg/specq/blob/main/design/workflow.md). This package supplies its product decisions, references and evidence.
 
@@ -37,6 +37,7 @@ The package includes the remote PM scenario (UC-17), not only the desktop menu. 
 | [AI component](ai-conversations.html) | Conversation list, drafts, files, request states and recovery fixtures |
 | [Task decisions and plans](plans-and-decisions.md) | Inline ask-card answers, AI-led plans and explicit multi-repository gaps |
 | [Dynamic resources](dynamic-resources.md) | Accepted Auto default, optional caps, proposed tuning and migration |
+| [Shared resource controls](shared-resource-controls.md) | Accepted DashQ reuse of TaskQ resource UI and policy authority; v1 protocol fixtures; remote apply needs an authorized host adapter and fresh readback |
 | [Delivery behavior](agent-behavior.md) | Proposed Local / branch / review PR / auto-merge / direct workflows |
 | [Agent settings](agent-settings.md) | Workspace access editor, project overrides, review and readback |
 | [Product decisions](menu-product.md) | Approved direction, scenario coverage and candidate boundaries |

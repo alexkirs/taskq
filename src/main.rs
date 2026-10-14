@@ -30,6 +30,8 @@ mod snapshot;
 #[cfg(any(target_os = "macos", windows))]
 mod icon;
 #[cfg(any(target_os = "macos", windows))]
+mod notify;
+#[cfg(any(target_os = "macos", windows))]
 mod tray;
 
 use board::{Board, entries};
@@ -1034,6 +1036,10 @@ fn keep_tray(install: &Path, tray: &mut Option<std::process::Child>) {
             exe = stable;
         }
     }
+    #[cfg(target_os = "macos")]
+    if let Some(app) = tray_app(install, &exe) {
+        exe = app;
+    }
     let mut c = std::process::Command::new(exe);
     let err = fs::File::create(install.join("tray.log")).map(std::process::Stdio::from).unwrap_or_else(|_| std::process::Stdio::null());
     c.arg("tray").current_dir(install).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(err);
@@ -1041,6 +1047,30 @@ fn keep_tray(install: &Path, tray: &mut Option<std::process::Child>) {
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut c, 0);
     *tray = platform::quiet(&mut c).spawn().ok();
+}
+
+/// macOS notifications need a bundle identity (§ 4): `<install>/TaskQ.app`, ad-hoc signed, holding the current
+/// release. None: the tray runs unbundled and notifications read unsupported.
+#[cfg(target_os = "macos")]
+fn tray_app(install: &Path, exe: &Path) -> Option<PathBuf> {
+    const PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>org.taskq.tray</string>
+<key>CFBundleName</key><string>TaskQ</string>
+<key>CFBundleExecutable</key><string>taskq</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>LSUIElement</key><true/>
+</dict></plist>
+"#;
+    let app = install.join("TaskQ.app");
+    let bin = app.join("Contents/MacOS/taskq");
+    fs::create_dir_all(bin.parent()?).ok()?;
+    fs::write(app.join("Contents/Info.plist"), PLIST).ok()?;
+    let tmp = bin.with_extension("tmp");
+    fs::copy(exe, &tmp).and_then(|_| fs::rename(&tmp, &bin)).ok()?;
+    let signed = std::process::Command::new("codesign").args(["-f", "-s", "-"]).arg(&app).output().is_ok_and(|o| o.status.success());
+    signed.then_some(bin)
 }
 
 /// Labels of the open tasks in the last `status.json`, for a resume that has no focus to restore (§ 4).

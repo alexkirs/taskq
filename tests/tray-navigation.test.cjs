@@ -24,11 +24,22 @@ Object.assign(context,{history:()=>'<history>',workEntry:()=>'<work>',projects:(
 run(html.slice(html.indexOf('function views(){'),html.indexOf('function attention(){')));
 run(html.slice(html.indexOf('function routeBody(){'),html.indexOf('// Capacity (')));
 context.page='settings';let h=run('routeBody()');
-for(const route of ['appearance','cadence','agents','services','about'])assert(h.includes('data-route="'+route+'"'));
+for(const route of ['appearance','cadence','notifications','agents','services','about'])assert(h.includes('data-route="'+route+'"'));
 context.page='appearance';assert(run('routeBody()').includes('Text size · 20 px'));
 context.page='cadence';assert.equal(run('routeBody()'),'<history>');
 context.page='agents';assert(run('routeBody()').includes('Unknown: no status.json'));
 context.S.projects=[{name:'alpha',host:'mac',version:null,age:null}];
 context.page='services';h=run('routeBody()');assert(h.includes('Resources'));assert(h.includes('status unknown'));assert(h.includes('<problem><notice><service>'));
 context.page='about';h=run('routeBody()');assert(h.includes('version unknown'));assert(h.includes('status unknown'));assert(h.includes('<update>'));
+// M14: OS denial reads Blocked with the OS setting and no test post; a project shows its override and effective mode
+run(html.slice(html.indexOf('// Notifications (menu.md M14)'),html.indexOf('// a notification click')));
+const kinds={ask:'sound',close:'off',failed:'banner',gone:'banner'};
+context.S.notify={status:'blocked',host:kinds,projects:{'/p':{ask:[null,'sound'],close:['banner','banner'],failed:[null,'banner'],gone:[null,'banner']}}};
+context.page='notifications';h=run('routeBody()');
+assert(h.includes('Blocked by the OS'));assert(h.includes('data-a="notify-os"'));assert.equal((h.match(/notify-test[^>]*disabled/g)||[]).length,4);
+assert(h.includes('data-kind="ask" data-v="sound" aria-pressed="true"'));
+context.S.notify.status='allowed';h=run('routeBody()');assert(!h.includes('notify-os'));assert(!/notify-test[^>]*disabled/.test(h));
+h=run("notifyGroup({root:'/p'})");
+assert(h.includes('data-kind="close" data-root="/p" data-v="banner" aria-pressed="true"'));assert(h.includes('data-kind="ask" data-root="/p" data-v="inherit" aria-pressed="true"'));
+console.log('PASS M14 notification settings, OS block and project override');
 console.log('PASS WS11 nested Back, filter/scroll/disclosure restoration, settings categories, unknown probes/versions and maintenance destinations');

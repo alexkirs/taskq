@@ -65,7 +65,7 @@ const menu=document.querySelector('.menu');
 let aiText=null,aiMenu=false,aiConfirm=null,addConfirm=false;
 let S=null,page='home',taskFilter=null,working=null,workCard=null,ask=null,pending={},confirming=null,updating=null,draft=null;
 // Navigation is view state only: every route consumes the same pushed snapshot.
-const routes={home:'Home',projects:'Projects',attention:'Attention',settings:'Settings',appearance:'Appearance',cadence:'Activity history',agents:'Agents',services:'Services',about:'About'};
+const routes={home:'Home',projects:'Projects',attention:'Attention',settings:'Settings',appearance:'Appearance',cadence:'Activity history',notifications:'Notifications',agents:'Agents',services:'Services',about:'About'};
 const trail=[];
 let disclosures=[];
 function remember(){return {page,taskFilter,working,workCard,scroll:document.scrollingElement.scrollTop,open:[...menu.querySelectorAll('details')].map(d=>d.open)};}
@@ -142,7 +142,7 @@ function mode(p){return p.focus.length?'run':p.saved?'paused':'watch';}
 function counter(v,kind,label){return '<span class="counter '+(v>0?kind+' filled':'zero')+'" aria-label="'+esc(label+': '+v)+'" title="'+esc(label)+'">'+v+'</span>';}
 // an incomplete or stale snapshot has unknown counts, never zero (§ 4)
 function known(ps){return ps.every(p=>p.complete!==false);}
-function taskRow(t,global){const p=S.projects.find(p=>p.issues+'/'+t.n===t.key);return TaskqProjectBlocks.task(blockProject(p),t,global)+answerSlot(t);}
+function taskRow(t,global){const p=S.projects.find(p=>p.issues+'/'+t.n===t.key);return '<div data-card="'+esc(t.key)+'" tabindex="-1">'+TaskqProjectBlocks.task(blockProject(p),t,global)+answerSlot(t)+'</div>';}
 function globalGroup(st,ts){ts=ts.filter(t=>t.state===st);return ts.length?'<details class="group"><summary><span class="'+color(st)+'">'+names[st]+'</span>'+counter(ts.length,color(st),names[st])+'</summary>'+ts.map(t=>taskRow(t,true)).join('')+'</details>':'';}
 function age(s){return s<120?s+' s':s<7200?Math.round(s/60)+' min':s<172800?Math.round(s/3600)+' h':Math.round(s/86400)+' d';}
 // service error and stale status.json are not failed tasks (M-A10)
@@ -286,9 +286,10 @@ function routeBody(){
   switch(page){
     case 'projects':return projects();
     case 'attention':return attention()||'<div class="body meta">'+(known(S.projects)?'No reported questions or failures':'Status incomplete; check Services')+'</div>';
-    case 'settings':return ['appearance','cadence','agents','services','about'].map(r=>routeButton(r)).join('')+workEntry();
+    case 'settings':return ['appearance','cadence','notifications','agents','services','about'].map(r=>routeButton(r)).join('')+workEntry();
     case 'appearance':return appearance();
     case 'cadence':return history();
+    case 'notifications':return notifications();
     case 'agents':return agents();
     case 'services':return '<button class="project" data-a="resources" title="btop in its own terminal window">◔ Resources</button>'+S.projects.map(p=>'<div class="body">'+esc(p.name)+' · '+esc(p.host||'host unknown')+'<span class="meta"> · '+esc(p.age==null?'status unknown':age(p.age)+' old')+'</span></div>'+problem(p)+incidentNotice(p)+service(p)).join('');
     case 'about':return about();
@@ -337,11 +338,30 @@ function mountResources(){
     card.ui.update(resourceGroup(p));
   }
 }
+// Notifications (menu.md M14): host mode per kind, the OS permission, and per project overrides
+const modes=[['off','Off'],['silent','Silent'],['banner','Banner'],['sound','Banner with sound']],kinds=[['ask','Questions'],['close','Closed'],['failed','Failed'],['gone','Attempt gone']];
+function notifications(){
+  const N=S.notify,st=N.status,line={allowed:'Allowed by the OS',blocked:'Blocked by the OS: nothing is posted','not asked':'Not asked yet: the first banner setting asks the OS',unknown:'OS permission unknown',unsupported:'Not available on this host'}[st]||st;
+  return '<div class="body'+(st==='blocked'?' alert':' meta')+'" role="status">'+esc(line)+'</div>'+(st==='blocked'?'<button class="project" data-a="notify-os">Open OS setting ↗</button>':'')+
+    kinds.map(([k,l])=>'<div class="body">'+l+'</div><div class="options">'+modes.map(([v,m])=>'<button data-a="notify" data-kind="'+k+'" data-v="'+v+'" aria-pressed="'+(N.host[k]===v)+'">'+m+'</button>').join('')+'<button data-a="notify-test" data-kind="'+k+'"'+(st==='allowed'?'':' disabled')+'>Send test</button></div>').join('');
+}
+function notifyGroup(p){
+  const N=S.notify.projects[p.root];if(!N)return '';
+  const name=v=>modes.find(m=>m[0]===v)[1];
+  return '<details class="group"><summary>◉ Notifications <span class="meta">'+kinds.map(([k])=>name(N[k][1])).join(' · ')+'</span></summary>'+kinds.map(([k,l])=>'<div class="body">'+l+' <span class="meta">· '+name(N[k][1])+'</span></div><div class="options">'+[['inherit','Inherit'],...modes].map(([v,m])=>'<button data-a="notify" data-kind="'+k+'" data-root="'+esc(p.root)+'" data-v="'+v+'" aria-pressed="'+((N[k][0]||'inherit')===v)+'">'+m+'</button>').join('')+'</div>').join('')+'</details>';
+}
+// a notification click: the project page scrolled to the card (for `ask`, its answer card); a closed task: the page
+function openCard(o){
+  const p=S&&S.projects.find(p=>p.root===o.root);if(!p)return;
+  if(page!==p.root||working||taskFilter)navigate(p.root);
+  const key=p.issues+'/'+o.n,el=o.n!=null&&(menu.querySelector('[data-answer="'+CSS.escape(key)+'"]')||menu.querySelector('[data-card="'+CSS.escape(key)+'"]'));
+  if(el){el.scrollIntoView({block:'center'});(el.querySelector('textarea,button')||el).focus({preventScroll:true});}
+}
 function project(p){
   const ts=tasks(p);
   return TaskqProjectBlocks.summary(blockProject(p))+'<div class="body meta">'+esc(modeText(p))+'</div>'+problem(p)+incident(p,true)+incidentNotice(p)+
   (['ask','failed','doing','review','ready','waiting','later'].map(st=>{const r=ts.filter(t=>t.state===st);return r.length?'<div class="group"><div class="row meta"><span>'+names[st]+'</span>'+counter(r.length,color(st),names[st])+'</div>'+r.map(t=>taskRow(t)).join('')+'</div>':'';}).join('')||'<div class="body muted">No open tasks</div>')+
-  '<div class="group">'+(p.issues?'<a class="project" href="'+esc(p.issues)+'" data-url="'+esc(p.issues)+'"><span>Board ↗</span><span></span><span></span></a>':'')+admission(p)+'</div>'+capacity(p)+workEntry(p.root)+service(p);}
+  '<div class="group">'+(p.issues?'<a class="project" href="'+esc(p.issues)+'" data-url="'+esc(p.issues)+'"><span>Board ↗</span><span></span><span></span></a>':'')+admission(p)+'</div>'+capacity(p)+notifyGroup(p)+workEntry(p.root)+service(p);}
 function filteredTasks(p){
   const ps=p?[p]:S.projects,rows=unique(ps.flatMap(tasks)).filter(t=>t.state===taskFilter),name=TaskqProjectBlocks.states.find(s=>s[0]===taskFilter)[1];
   return '<div class="body">'+esc((p?p.name:'All projects')+' · '+name)+'</div>'+(p?TaskqProjectBlocks.summary(blockProject(p)):TaskqProjectBlocks.aggregate(ps.map(blockProject)))+
@@ -375,6 +395,7 @@ function render(navigating=false){
 window.taskq={receive(s){
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
   if(s.capmsg){resourceReceipt(s.capmsg);return;}
+  if(s.open){openCard(s.open);return;}
   for(const p of s.projects){const was=S&&S.projects.find(q=>q.root===p.root);if(pending[p.root]&&was&&mode(was)!==mode(p))delete pending[p.root];}
   S=s;answerReadback();
   if(aiText===null)aiText=s.ai.draft||'';
@@ -392,6 +413,7 @@ menu.addEventListener('click',e=>{
   const b=e.target.closest('button');if(!b||b.disabled)return;const d=b.dataset;
   if(d.route){if(d.route!==page||working||taskFilter)navigate(d.route);return;}
   if(d.a==='answer-retry'){const r=answerFeedback.get(d.key);if(r)answerSend(r.board,r.op);render();return;}
+  if(d.a==='notify'||d.a==='notify-test'){send({a:d.a,kind:d.kind,value:d.v,root:d.root});return;}
   if(d.a==='work'){navigate(page,null,d.root?{[d.root]:true}:{});return;}
   if(d.a==='back'){back();return;}
   if(d.set==='period'&&d.v==='custom'){const H=S.history;draft={start:local(H.start,H.tz),end:local(H.end,H.tz),tz:H.tz,error:''};render();return;}

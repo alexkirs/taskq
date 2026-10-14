@@ -1,9 +1,9 @@
 {
   "version": "4.0.0-dev",
-  "sourceCommit": "36e6ece6aaa6f5dc9c3d8c48d8858aaaf6f76f6a",
-  "binarySha256": "965828fca5d2434311dc8bafbc68a05761b57c7091c9bec8a879b5b3a4ba30af",
+  "sourceCommit": "f2655f12d31048c847c091c74390052a4c81d09d",
+  "binarySha256": "4b727a07be6165d2c527b9bee56b6b076cd756d64017d4f65dd472d7ef1682ce",
   "environment": {
-    "os": "macOS 27.0.1",
+    "os": "macOS 26.6.2",
     "arch": "arm64",
     "renderer": "WKWebView snapshot"
   },
@@ -21,15 +21,15 @@
     },
     {
       "file": "icon-summary-run-dark.png",
-      "sha256": "cdad44d7afc6ad35c2f5bc4de1923503a42f874e855365f96919358efc0e1ac3"
+      "sha256": "cd3fd4ccd90d6c0caa5a6cfb29d3c92f6299bc27b0202363503c63d8bf22a172"
     },
     {
       "file": "popover-dark-attention-16.png",
-      "sha256": "b6f014b380698ba67018394cdd9dc839bae0854c4e7f49c26f6730435d742f8b"
+      "sha256": "5e4e5eb40688f1ef98838fb0f67dd95afb26a2dfcf7e0b3fad098828704cce59"
     },
     {
       "file": "popover-dark-projects-16.png",
-      "sha256": "2c46682c0fb9a619f3a1ce125d26b70d0dba807dc825dfb8e9765d4155737cc6"
+      "sha256": "318ee47306cbe934fe0508ba099b38472bf66c83b56bf784b7d34b42719d7f49"
     }
   ]
 }

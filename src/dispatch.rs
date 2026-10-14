@@ -23,6 +23,20 @@ fn own_attempt(n: u64) -> Option<u64> {
     (task == n).then(|| std::env::var("TASKQ_ATTEMPT").ok()?.parse().ok()).flatten()
 }
 
+/// § 5: a child's `result`, `ask`, `requeue` or `gone` must come from the live attempt of its own task; a reused
+/// session's stale `TASKQ_TASK`/`TASKQ_ATTEMPT` is refused by name instead of writing unfenced or ignored.
+fn stale_child(n: u64, kind: &str, live: Option<u64>, task: Option<String>, attempt: Option<String>) -> Option<String> {
+    let attempt = attempt?;
+    if !matches!(kind, "result" | "ask" | "requeue" | "gone") {
+        return None;
+    }
+    let task = task.unwrap_or_default();
+    if task.parse() != Ok(n) {
+        return Some(format!("TASKQ_TASK {task:?} is not #{n}: stale session environment"));
+    }
+    (attempt.parse().ok() != live).then(|| format!("TASKQ_ATTEMPT {attempt} is not the live attempt {}: stale session environment", live.map_or("none".into(), |a| a.to_string())))
+}
+
 pub fn current(b: &dyn Board, n: u64) -> Res<(board::Issue, Task, bool)> {
     let issue = b.issue(n)?;
     let deps = deps_open(b, &issue.body)?;
@@ -82,12 +96,12 @@ impl Receipt {
 /// R4: append one entry that `fold` accepts, set the projected label, poke the local service. A seen op id returns
 /// the first receipt; a stale revision or a refused entry writes nothing and names the current state (§ 5).
 pub fn act(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &str, op: &Op) -> Receipt {
-    act_as(b, root, n, kind, args, text, op, own_attempt(n))
+    act_as(b, root, n, kind, args, text, op, own_attempt(n), true)
 }
 
 /// [`act`] for an entry that names `attempt` (emergency recovery fences another process's attempt, § 4).
 #[allow(clippy::too_many_arguments)]
-fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &str, op: &Op, attempt: Option<u64>) -> Receipt {
+fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &str, op: &Op, attempt: Option<u64>, child: bool) -> Receipt {
     let read = || -> Res<(board::Issue, bool, Vec<Entry>)> {
         let issue = b.issue(n)?;
         let deps = deps_open(b, &issue.body)?;
@@ -99,6 +113,9 @@ fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &
     };
     let before = fold(n, &log, deps);
     let rev = core::revision(n, &log);
+    if let Some(why) = stale_child(n, kind, before.attempt, std::env::var("TASKQ_TASK").ok(), std::env::var("TASKQ_ATTEMPT").ok()).filter(|_| child) {
+        return Receipt { state: Some(before.state.name()), revision: Some(rev), next: "Run taskq from a fresh session of the live attempt, or unset TASKQ_TASK and TASKQ_ATTEMPT.".into(), ..Receipt::rejected(n, op, why) };
+    }
     let accepted = |s: State, rev: u64| Receipt::accepted(n, op, s, rev);
     if let Some(id) = &op.id
         && log.iter().any(|e| !e.edited && core::op_id(n, &e.body) == Some(id.as_str()))
@@ -221,7 +238,7 @@ pub fn approve(b: &dyn Board, root: &Path, n: u64, sha: Option<&str>, op: &Op, a
     if let Some(s) = sha.filter(|s| !result.starts_with(s) || s.len() < 7) {
         return Receipt { state: Some(t.state.name()), ..Receipt::rejected(n, op, format!("{s} is not the current result {}", &result[..result.len().min(7)])) };
     }
-    act_as(b, root, n, "approve", &[&result], "", op, None)
+    act_as(b, root, n, "approve", &[&result], "", op, None, false)
 }
 
 /// `answer N.K [M.K..]`: every pick is checked before any is written (§ 5).
@@ -335,7 +352,7 @@ pub fn proposal(b: &dyn Board, me: &str, kids: &Result<Vec<serde_json::Value>, S
 pub fn recover(b: &dyn Board, root: &Path, rows: &[Row]) -> Vec<Receipt> {
     rows.iter().filter_map(|r| {
         let op = Op { id: Some(r.op_id()), revision: Some(r.revision?) };
-        Some(act_as(b, root, r.task, "gone", &[], "emergency recovery: attempt fenced", &op, Some(r.attempt)))
+        Some(act_as(b, root, r.task, "gone", &[], "emergency recovery: attempt fenced", &op, Some(r.attempt), false))
     }).collect()
 }
 
@@ -343,6 +360,19 @@ pub fn recover(b: &dyn Board, root: &Path, rows: &[Row]) -> Vec<Receipt> {
 mod tests {
     use super::*;
     use crate::board::Fake;
+
+    // Chain: § 5 stale child environment (#1072). Risk: a reused session's TASKQ_TASK/TASKQ_ATTEMPT writes unfenced or ignored.
+    #[test]
+    fn stale_child_environment_is_refused() {
+        let s = |k: &str, task: Option<&str>, attempt: Option<&str>| stale_child(7, k, Some(42), task.map(Into::into), attempt.map(Into::into));
+        assert_eq!(s("requeue", Some("7"), Some("42")), None);
+        assert_eq!(s("requeue", None, None), None); // the owner, not a child
+        assert_eq!(s("hold", Some("9"), Some("1")), None); // a child may add and hold another task
+        assert_eq!(s("requeue", Some("9"), Some("42")).unwrap(), "TASKQ_TASK \"9\" is not #7: stale session environment");
+        assert_eq!(s("result", None, Some("42")).unwrap(), "TASKQ_TASK \"\" is not #7: stale session environment");
+        assert_eq!(s("ask", Some("7"), Some("41")).unwrap(), "TASKQ_ATTEMPT 41 is not the live attempt 42: stale session environment");
+        assert!(stale_child(7, "gone", None, Some("7".into()), Some("42".into())).unwrap().contains("live attempt none"));
+    }
 
     // Chain: § 5 dispatch receipt and readback. Risk: a stale or retried op writes a second entry.
     #[test]

@@ -1582,6 +1582,9 @@ fn run(argv: &[String]) -> Res<()> {
         return Ok(());
     }
     let cmd = a.pos.first().map(String::as_str).unwrap_or("");
+    if std::env::var_os("TASKQ_ROOT").is_some() {
+        find_root()?; // § 5: a stale TASKQ_ROOT refuses every command, not only those that read the project
+    }
     match cmd {
         "profile" => { print!("{}", profile::report(&platform::default_install())); Ok(()) }
         "selftest" => {

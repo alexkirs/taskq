@@ -35,4 +35,4 @@ Copy per candidate. Blank/unchecked means Not tested.
 - Deployed:
 - Next exact fix or decision:
 
-Attach natural-size shots, enlarged icon pixels, native resizing/navigation evidence and test output. A browser mock is never native-platform evidence.
+Attach natural-size shots, enlarged icon pixels, native resizing/navigation evidence and test output per [F5](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f5-acceptance-package).

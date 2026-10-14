@@ -12,20 +12,21 @@ Target for native implementation. Apply [shared F1–F6](https://github.com/task
 
 ## R-UI2 Native menu sizing
 
-Logical units below. Convert physical monitor/anchor values exactly once using that monitor's scale.
+Apply [F2](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f2-size-to-content-then-constrain). Logical units below. Convert physical monitor/anchor values exactly once using that monitor's scale.
 
 - Windows: monitor containing the tray anchor, usable rectangle from the native work-area API (including taskbar). macOS: owning display's visible frame and menu-bar anchor; normalize coordinate origins.
 - Keep 8 logical units at horizontal usable edges. Prefer a 4-unit anchor gap when it fits. Vertical height may use the full usable work area; reserve only native chrome/shadow or OS-required clearance, counted once.
 - Base menu width: 360 at 16 px. Target `max(320, 360 × font / 16)`, clamped to usable width minus margins. Thus 18→405, 20→450 when space permits. Screen constraints may reduce below 320; reflow, never overflow off-screen.
-- Measure natural content at that width after fonts load. Do not derive desired height from a fixed-height or already scrolling viewport.
 - Prefer below a top/menu-bar anchor and above a bottom/taskbar anchor. Try the opposite side if needed, then slide vertically within the full work area before constraining height. The anchor side is a placement preference, not a height limit; vertical taskbars must not force a half-screen viewport.
 - `availableHeight` is the full usable work-area height minus OS-required outer clearance, never only the space on one side of the anchor. `outerHeight = min(naturalContentHeight + nativeChrome, availableHeight)`. Up to 100% is allowed, not required. Short content stays short; fitting content has no primary scrollbar. No fixed 400/580/640 px or percentage runtime cap.
 - `scrollViewport = outerHeight - nativeChrome - fixedHeader - fixedFooter`. All terms measured at actual font/DPI; clamp nonnegative. If chrome itself cannot fit, use a scrollable compact fallback retaining Back/Close and focused input, never an empty negative viewport.
-- Resize on navigation, expansion/collapse, font/DPI/monitor change and actual content-size change. Coalesce layout passes; suppress repeated <=1 physical-pixel measurement jitter only when content remains fully reachable. A real 1-pixel overflow still requires fit/scroll handling. Do not resize continuously for same-size status updates.
+- Coalesce layout passes; suppress repeated <=1 physical-pixel measurement jitter only when content remains fully reachable. A real 1-pixel overflow still requires fit/scroll handling. Do not resize continuously for same-size status updates.
 - Open with correct size before exposure where supported. Changing monitor or taskbar placement recalculates usable space. Keep the anchor association while allowing vertical repositioning; do not cover the taskbar, menu bar or notch exclusion.
 - Snapshot mode uses the same sizing algorithm as normal opening. Full-document diagnostic captures may exist, clearly labelled; they do not qualify visible-window fit.
 
 ## R-UI3 Scroll ownership
+
+Apply [F3](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f3-scroll-and-focus). TaskQ surfaces:
 
 | Surface | Fixed | Scroll only when needed |
 |---|---|---|
@@ -36,11 +37,10 @@ Logical units below. Convert physical monitor/anchor values exactly once using t
 | Narrow AI | window controls and Back; composer in conversation view | full-width list OR conversation, not compressed columns |
 | Change review | target context, Cancel/Confirm | long diff/evidence; buttons never cover last row |
 
-- Fixed areas use nonshrinking layout. Only intended content owns overflow; no body-scroll plus inner-menu-scroll pair.
 - No-scroll means no reserved scrollbar strip unless native stable gutter is necessary to prevent wrapping oscillation; never use a visible fake track.
-- On page entry start at heading; Back restores prior scroll. Data refresh preserves scroll and focused task by identity. If an item disappears, choose the nearest surviving item and announce the change.
+- Refresh keeps the focused task by identity. If it disappears, focus the nearest surviving item and announce the change.
 - Test wheel/trackpad, thumb drag, PageUp/Down, Home/End, Tab and Shift+Tab. Last row and final action remain fully reachable.
-- AI: growing input remeasures to its approved cap, then input scrolls; streamed output does not pull a reader away from older messages. Closing a window preserves drafts and request identity.
+- AI: growing input remeasures to its approved cap, then input scrolls. Closing a window preserves request identity.
 
 ## R-UI4 Cadence data
 
@@ -78,5 +78,5 @@ x(i) = x0 + i*(b+g)
 - Use the complete ledger in [acceptance](ui-acceptance.md); link implementation evidence per row.
 - Preserve 4.1.9 Resources access, incident state/consent controls, capacity validation/readback, agent probes, focus recovery and Back position.
 - Resources belongs under Controls or Services, not another permanent home block. Keep the existing external resource monitor until replacement is approved.
-- Native system contrast, keyboard behavior or a useful implementation addition may improve the reference. Record the proposal; amend the reference and tests after acceptance.
+- Native system contrast, keyboard behavior or a useful implementation addition is an [F1](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f1-source-and-change-control) candidate.
 - No missing feature is “polish”. Wrong scope, series, confirmation or session routing blocks acceptance before cosmetic review.

@@ -251,11 +251,7 @@ pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume:
     if !status.success() || events.iter().any(|v| v["is_error"] == true || v["type"] == "turn.failed") {
         return Err(format!("{rt} operator failed (exit {}); partial effects unknown; inspect request log before retry", status.code().unwrap_or(-1)));
     }
-    events.iter().rev().find_map(|v| {
-        if rt == "claude" && v["type"] == "result" { v["result"].as_str().map(String::from) }
-        else if rt == "codex" && v["type"] == "item.completed" && v["item"]["type"] == "agent_message" { v["item"]["text"].as_str().map(String::from) }
-        else { None }
-    }).ok_or("operator returned no final response; partial effects unknown".into())
+    crate::runtime::final_text(&events).ok_or("operator returned no final response; partial effects unknown".into())
 }
 
 fn brief(root: &Path, install: &Path, req: &Value) -> String {

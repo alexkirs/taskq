@@ -126,8 +126,61 @@ pub fn new_session(rt: &str) -> String {
 }
 
 pub fn log_path(root: &Path, l: &Launch) -> PathBuf {
-    let p = if l.role == "reviewer" { 'R' } else { 'T' };
-    root.join(".taskq").join(format!("{p}{}-{}.log", l.task, l.attempt))
+    attempt_log(root, &l.role, l.task, l.attempt)
+}
+
+pub fn attempt_log(root: &Path, role: &str, task: u64, attempt: u64) -> PathBuf {
+    let p = if role == "reviewer" { 'R' } else { 'T' };
+    root.join(".taskq").join(format!("{p}{task}-{attempt}.log"))
+}
+
+/// The final text of a turn: Claude's last `result`, else Codex's last `agent_message`.
+pub fn final_text(events: &[serde_json::Value]) -> Option<String> {
+    events.iter().rev().find_map(|v| {
+        if v["type"] == "result" { v["result"].as_str().map(String::from) }
+        else if v["type"] == "item.completed" && v["item"]["type"] == "agent_message" { v["item"]["text"].as_str().map(String::from) }
+        else { None }
+    })
+}
+
+/// The worker's last message in an attempt log, for the `gone` reason (§ 4 step 1); None when unreadable.
+pub fn last_message(log: &Path) -> Option<String> {
+    let text = String::from_utf8_lossy(&std::fs::read(log).ok()?).into_owned();
+    final_text(&text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect::<Vec<_>>())
+}
+
+/// A CLI child whose log shows its turn ended counts as exited even when its process lingers: Codex on Windows kept
+/// running after a rate-limited `taskq result` (#1034). The service then stops its tree (§ 4 step 1, R11).
+pub struct CliTurn {
+    pub proc: Box<dyn Proc>,
+    pub log: PathBuf,
+    /// Log bytes already read: a resume appends to the log of earlier turns.
+    pub pos: u64,
+}
+
+impl CliTurn {
+    fn ended(&mut self) -> bool {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut rest = vec![];
+        let Ok(mut f) = File::open(&self.log) else { return false };
+        if f.seek(SeekFrom::Start(self.pos)).and_then(|_| f.read_to_end(&mut rest)).is_err() { return false; }
+        let Some(end) = rest.iter().rposition(|b| *b == b'\n') else { return false };
+        self.pos += end as u64 + 1;
+        String::from_utf8_lossy(&rest[..end]).lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| matches!(v["type"].as_str(), Some("turn.completed" | "turn.failed" | "result")))
+    }
+}
+
+impl Proc for CliTurn {
+    fn exited(&mut self) -> Result<Option<i32>, String> {
+        if let Some(code) = self.proc.exited()? { return Ok(Some(code)); }
+        if !self.ended() { return Ok(None); }
+        log!("{}: turn ended; stopping its lingering process", self.log.display());
+        self.proc.kill();
+        Ok(Some(self.proc.exited()?.unwrap_or(-1)))
+    }
+    fn kill(&mut self) { self.proc.kill() }
+    fn id(&self) -> u32 { self.proc.id() }
 }
 
 /// Codex's thread id: the first `thread.started` line of the attempt log.
@@ -370,7 +423,9 @@ fn spawn_inner(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     if l.rt == "claude" && (l.resume.is_none() || claude_background(env.root, &l.session).map_err(|message| StartError { message, reportable: false })?) {
         return ClaudeTurn::start(env, l, &log, &text, &access).map(|p| Box::new(p) as Box<dyn Proc>).map_err(|message| StartError { message, reportable: false });
     }
-    Ok(Box::new(start(env, l, &log, &text, &access)?))
+    let pos = std::fs::metadata(&log).map_or(0, |m| m.len());
+    let child = start(env, l, &log, &text, &access)?;
+    Ok(Box::new(CliTurn { proc: Box::new(child), log, pos }))
 }
 
 fn start(env: &Env, l: &Launch, log: &Path, text: &str, access: &crate::policy::Effective) -> Result<Child, StartError> {

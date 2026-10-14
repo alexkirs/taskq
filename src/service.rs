@@ -556,6 +556,11 @@ impl<'a> Service<'a> {
         line.filter(|m| !m.is_empty()).map_or_else(String::new, |m| format!("\n{LABEL}{m}"))
     }
 
+    /// `gone attempt a` on `t`; at the retry limit it carries the § 2 limit card (#1123).
+    fn gone(&mut self, n: u64, t: &Task, a: u64, text: &str) -> Result<u64, String> {
+        self.post(n, core::entry("gone", &[], Some(a), &core::limit_text(n, t, "gone", text)))
+    }
+
     fn post(&mut self, n: u64, body: String) -> Result<u64, String> {
         self.log.push(format!("#{n} {}", body.lines().next().unwrap_or_default()));
         self.cache.remove(&n);
@@ -627,7 +632,7 @@ impl<'a> Service<'a> {
                 && !core::handed_in(n, &v.log, a, a.max(self.delivered(a)))
             {
                 let text = format!("exit {code}{}", self.last_message(n, a, &v.task));
-                self.post(n, core::entry("gone", &[], Some(a), &text))?;
+                self.gone(n, &v.task, a, &text)?;
                 touched.insert(n);
             }
         }
@@ -693,7 +698,7 @@ impl<'a> Service<'a> {
                 Some(hb) => now - hb.updated > ttl || (!young && !hb.body.lines().any(|l| l == format!("#{n} {a}"))),
             };
             if dead {
-                self.post(n, core::entry("gone", &[], Some(a), &format!("host {h} lease expired")))?;
+                self.gone(n, t, a, &format!("host {h} lease expired"))?;
                 touched.insert(n);
             }
         }
@@ -747,7 +752,7 @@ impl<'a> Service<'a> {
             let new: Vec<&Comment> = v.comments.iter().filter(|c| t.inbox.contains(&c.id) && c.id > seen).collect();
             let Some(last) = new.last().map(|c| c.id) else {
                 let text = format!("no child on its host{}", self.last_message(n, a, t));
-                self.post(n, core::entry("gone", &[], Some(a), &text))?;
+                self.gone(n, t, a, &text)?;
                 touched.insert(n);
                 continue;
             };
@@ -761,7 +766,7 @@ impl<'a> Service<'a> {
             l.session = session;
             l.resume = Some(text.join("\n\n"));
             if l.session.is_empty() {
-                self.post(n, core::entry("gone", &[], Some(a), "session unknown"))?;
+                self.gone(n, t, a, "session unknown")?;
                 touched.insert(n);
                 continue;
             }
@@ -977,7 +982,11 @@ impl<'a> Service<'a> {
                         crate::incident::detect("dispatch.start", concat!("src/service.rs:", line!()), &l.rt, &[], &["runtime:installed"]);
                     }
                 }
-                self.post(l.task, core::entry("gone", &[], Some(l.attempt), &format!("start failed: {e}"))).map(|_| ())
+                let text = format!("start failed: {e}");
+                match crate::board::entries(self.board, l.task) {
+                    Ok(log) => self.gone(l.task, &core::fold(l.task, &log, false), l.attempt, &text),
+                    Err(_) => self.post(l.task, core::entry("gone", &[], Some(l.attempt), &text)),
+                }.map(|_| ())
             }
         }
     }
@@ -1379,6 +1388,49 @@ mod tests {
         let t = task(&b, n);
         assert_eq!((t.state, t.retries, t.result.is_some()), (State::Review, 1, true));
         assert_ne!(t.attempt, Some(r));
+    }
+
+    // Chain: § 3 claim across hosts to § 2 retry limit (#913, #1123). Risk: two hosts claim one result's review, the
+    // loser writes more than its spawn, two reviewers run, or the limit parks the task on a card without options.
+    #[test]
+    fn lost_reviewer_claim_writes_nothing_more_and_the_gone_limit_asks_with_options() {
+        let b = Fake::default();
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
+        let w = b.comment(n, &core::entry("spawn", &["worker", "claude:s", "linux"], None, "")).unwrap();
+        b.comment(n, &core::entry("result", &["0123456789abcdef0123456789abcdef01234567"], Some(w), "ok")).unwrap();
+        let (cm, cw) = (cfg("mac"), cfg("win"));
+        let (em, ew): (Exits, Exits) = Default::default();
+        let (mut mac, mut win) = (service(&b, &cm, em.clone()), service(&b, &cw, ew.clone()));
+        // mac reads the task in review before win's spawn lands: both hosts post a reviewer spawn for one result
+        let stale = views(&b, &mut HashMap::new()).unwrap().0.into_iter().find(|v| v.issue.number == n).unwrap();
+        win.pass().unwrap();
+        let r = task(&b, n).attempt.unwrap();
+        let (labels, comments) = (b.issue(n).unwrap().labels, b.comments(n).unwrap().len());
+        mac.claim(&stale, "reviewer", "claude").unwrap();
+        // A2: the loser posts only its spawn: no label, no other comment, no event, no child
+        let lost = b.comments(n).unwrap().pop().unwrap();
+        assert!(lost.body.starts_with("taskq: spawn reviewer claude:") && lost.body.ends_with(" mac"), "{}", lost.body);
+        assert_eq!(mac.log, [format!("#{n} {}", lost.body), format!("#{n} spawn {} lost the claim", lost.id)]);
+        assert_eq!((b.issue(n).unwrap().labels, b.comments(n).unwrap().len(), mac.kids.len(), em.borrow().len()), (labels, comments + 1, 0, 0));
+        assert_eq!((task(&b, n).attempt, task(&b, n).state), (Some(r), State::Review));
+        // A3: later passes of both hosts start no second reviewer for this result
+        mac.pass().unwrap();
+        win.pass().unwrap();
+        assert_eq!((em.borrow().len(), ew.borrow().len(), task(&b, n).attempt), (0, 1, Some(r)));
+        // the reviewer exits twice without a verdict: the 2nd gone asks with the limit card
+        *ew.borrow()[0].1.borrow_mut() = Some(1);
+        win.pass().unwrap();
+        win.pass().unwrap(); // the gone task is left alone for the rest of its pass
+        assert_eq!((task(&b, n).state, task(&b, n).retries, ew.borrow().len()), (State::Review, 1, 2));
+        *ew.borrow()[1].1.borrow_mut() = Some(1);
+        win.pass().unwrap();
+        let t = task(&b, n);
+        let card = t.card.clone().unwrap();
+        assert_eq!((t.state, t.retries, t.attempt), (State::Ask, 2, None));
+        assert!(card.starts_with("exit 1") && card.contains("Problem: retry limit 2 reached by this gone"), "{card}");
+        assert_eq!(core::options(&card).into_iter().map(|o| o.1.split(':').next().unwrap().to_string()).collect::<Vec<_>>(), ["requeue", "later"]);
+        win.pass().unwrap(); // labels follow the fold on the next pass (§ 2)
+        assert!(b.issue(n).unwrap().labels.contains(&"q-ask".to_string()), "{:?}", b.issue(n).unwrap().labels);
     }
 
     // Chain: § 4 Filter, any-runtime admission over tests/golden/admit.json. Risk: the first listed runtime takes every slot while the other idles.

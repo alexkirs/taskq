@@ -110,8 +110,8 @@ Optional last lines `op-id: <id>`, then `revision: <R>`, of an entry are fields,
 | `ready` | `spawn worker <rt>:<session> <host>` | `doing` | attempt = this id, role worker |
 | `doing` | `result <sha> attempt` | `review` | text: verdict (section 7); option lines make a card (section 2) |
 | `doing` | `ask attempt` | `ask` | text: ask card below |
-| `doing`, `review` | `requeue attempt` | `ready` | text: reason or fixes; `retries += 1`; 3rd: `ask` |
-| `doing`, `review` | `gone attempt` | `ready` / `review` | service: child exited or lease expired; emergency recovery (§ 4); `retries += 1`; 2nd: `ask` |
+| `doing`, `review` | `requeue attempt` | `ready` | text: reason or fixes; `retries += 1`; 3rd: `ask` with the limit card |
+| `doing`, `review` | `gone attempt` | `ready` / `review` | service: child exited or lease expired; emergency recovery (§ 4); `retries += 1`; 2nd: `ask` with the limit card |
 | `doing` | `steer` | `doing` | text for the worker |
 | `review` | `spawn reviewer <rt>:<session> <host>` | `review` | only without a live reviewer; attempt = this id |
 | `review` | `ask attempt` | `ask` | reviewer's card; result kept |
@@ -123,8 +123,8 @@ Optional last lines `op-id: <id>`, then `revision: <R>`, of an entry are fields,
 
 - `waiting` becomes `ready` when every `Depends on` issue is closed.
 - `gone` in `review` ends only the reviewer; the result stays and a new reviewer is spawned. Emergency interlock ([E1–E5](docs/design/emergency-recovery.md)): under the § 3 emergency hold no `spawn` is written on that host until `service release`; a child whose liveness reads unknown gets no `gone`; `service recover --apply` writes each `gone attempt` with `--op-id` and `--revision` (§ 4).
-- `retries` is one counter: an attempt `requeue` that makes it 3, or a `gone` that makes it 2, moves to `ask` with the attempt ended; its `answer` then goes to `ready`. Every move to `ready` clears attempt, card and result.
-- `answer K` whose option starts with `close` runs `close` (§ 7) instead; an owner pick of `approve <sha7|sha> ...` approves a gated task only when that SHA matches its current result, including a bare board comment in `ask`. An attempt-bound answer cannot approve.
+- `retries` is one counter: an attempt `requeue` that makes it 3, or a `gone` that makes it 2, moves to `ask` with the attempt ended; its `answer` then goes to `ready`. Limit card: a writer whose entry hits the limit appends, unless its text is a card, `Problem:` naming the limit, `1. requeue: …` ★, `2. later: …` and `To answer:`; the reason's `K. ` lines become `K) ` (N-1 folds the same text). Every move to `ready` clears attempt, card and result.
+- `answer K` whose option starts with `close` or `later` runs `close` (§ 7) or `later` instead; an owner pick of `approve <sha7|sha> ...` approves a gated task only when that SHA matches its current result, including a bare board comment in `ask`. An attempt-bound answer cannot approve.
 - Gate states: none, `required`, `approved`, `stale`. An approval binds to the result it names: the next `result` or a move to `ready` makes it `stale`, which blocks like `required` until an `approve` of the new result. The gate blocks only `close` in `review` (its publication and the closed issue that frees `Depends on` tasks); a fold from the board after any restart keeps it (R1). Closing a `later`/`failed` task stays the owner's own act.
 - After an entry is accepted, the writer sets the `q-<state>` label; every service pass fixes labels that differ from the fold. A hand-moved label is overwritten: people change state with an entry.
 

@@ -466,6 +466,8 @@ pub struct FakeState {
     pub fail_labels: bool,
     /// The next this many `comment` calls fail like a board rate-limit pause.
     pub fail_comments: usize,
+    /// The next this many `comments` reads fail.
+    pub fail_comment_reads: usize,
     /// A concurrent writer: this body lands just before the next `comment`.
     pub race: Option<String>,
 }
@@ -520,6 +522,10 @@ impl Board for Fake {
         self.state.borrow_mut().get(n).cloned()
     }
     fn comments(&self, n: u64) -> Result<Vec<Comment>> {
+        if self.state.borrow().fail_comment_reads > 0 {
+            self.state.borrow_mut().fail_comment_reads -= 1;
+            return Err("comment read failed".into());
+        }
         let st = self.state.borrow();
         Ok(st.comments.iter().filter(|(i, c)| *i == n && !(st.hide_latest_comment && c.id == st.next_id)).map(|(_, c)| c.clone()).collect())
     }

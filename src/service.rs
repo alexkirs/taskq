@@ -983,10 +983,10 @@ impl<'a> Service<'a> {
                     }
                 }
                 let text = format!("start failed: {e}");
-                match crate::board::entries(self.board, l.task) {
-                    Ok(log) => self.gone(l.task, &core::fold(l.task, &log, false), l.attempt, &text),
-                    Err(_) => self.post(l.task, core::entry("gone", &[], Some(l.attempt), &text)),
-                }.map(|_| ())
+                // without a fresh fold a gone could park the task on a card without options: post nothing, report the
+                // read error; the next pass finds no child on its host and posts the gone with the limit card (#1123)
+                let log = crate::board::entries(self.board, l.task).map_err(|r| format!("#{} {text}; gone not posted: {r}", l.task))?;
+                self.gone(l.task, &core::fold(l.task, &log, false), l.attempt, &text).map(|_| ())
             }
         }
     }
@@ -1431,6 +1431,33 @@ mod tests {
         assert_eq!(core::options(&card).into_iter().map(|o| o.1.split(':').next().unwrap().to_string()).collect::<Vec<_>>(), ["requeue", "later"]);
         win.pass().unwrap(); // labels follow the fold on the next pass (§ 2)
         assert!(b.issue(n).unwrap().labels.contains(&"q-ask".to_string()), "{:?}", b.issue(n).unwrap().labels);
+    }
+
+    // Chain: § 2 retry limit after a failed start (#1123). Risk: a start failure whose comment read fails posts a
+    // gone without a fresh fold, so the limit parks the task on a card without options.
+    #[test]
+    fn start_failure_with_failed_read_posts_nothing_and_the_next_pass_asks_with_the_card() {
+        let b = Fake::default();
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
+        let w = b.comment(n, &core::entry("spawn", &["worker", "claude:s", "linux"], None, "")).unwrap();
+        b.comment(n, &core::entry("gone", &[], Some(w), "exit 1")).unwrap();
+        assert_eq!((task(&b, n).state, task(&b, n).retries), (State::Ready, 1));
+        let c = cfg("mac");
+        let mut s = Service::new(&b, &c, "4.0.0", Box::new(|_: &Launch| {
+            b.state.borrow_mut().fail_comment_reads = 1; // the read after the failed start fails
+            Err(crate::runtime::StartError::io(std::io::Error::other("boom"), Some("claude")))
+        }));
+        s.focus = vec!["all".into()];
+        let comments = b.comments(n).unwrap().len();
+        let e = s.pass().unwrap_err();
+        assert!(e.contains("start failed: claude: boom; gone not posted: comment read failed"), "{e}");
+        assert_eq!((b.comments(n).unwrap().len(), task(&b, n).state), (comments + 1, State::Doing), "only the spawn");
+        s.pass().unwrap();
+        let t = task(&b, n);
+        let card = t.card.clone().unwrap();
+        assert_eq!((t.state, t.retries), (State::Ask, 2));
+        assert!(card.starts_with("no child on its host") && card.contains("Problem: retry limit 2 reached by this gone"), "{card}");
+        assert_eq!(core::options(&card).len(), 2);
     }
 
     // Chain: § 4 Filter, any-runtime admission over tests/golden/admit.json. Risk: the first listed runtime takes every slot while the other idles.

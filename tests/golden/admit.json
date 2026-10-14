@@ -1,0 +1,8 @@
+[
+  {"name": "equal free slots alternate", "limits": {"claude": 2, "codex": 2}, "running": {}, "tasks": 4,
+   "expect": ["claude", "codex", "claude", "codex"]},
+  {"name": "the busier runtime yields", "limits": {"claude": 2, "codex": 2}, "running": {"claude": 1}, "tasks": 2,
+   "expect": ["codex", "claude"]},
+  {"name": "more free slots win, a tie keeps the listed order, full waits", "limits": {"claude": 1, "codex": 3}, "running": {}, "tasks": 5,
+   "expect": ["codex", "codex", "claude", "codex", null]}
+]

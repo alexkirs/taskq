@@ -1,4 +1,6 @@
-# README phrase evidence
+# Historical README phrase evidence
+
+The #1007 page replaces the slogan table with illustrative conversations. The responses below remain historical evidence for the earlier phrases only; they do not qualify the new dialogue or a completed user journey. UC-14 now describes evidence review and publication boundaries, not the dropped automatic “Review #12.” promise.
 
 Owner answer on #925: check both runtimes without writes; correct proposed commands count as phrase evidence.
 These are fresh PM interpretation checks with the full contract supplied, not live board or installation qualification.

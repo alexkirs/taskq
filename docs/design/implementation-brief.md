@@ -68,7 +68,7 @@ Readback, window reopening and service updates must not duplicate writes or agen
 
 Qualification adds UC-10–UC-12: switch PM/client without copying tasks; complete planning/answer/result flow with external desktops closed using a headless runtime; distinguish per-project limits from machine totals. Preserve Resources → btop/btop4win and explain unsupported remote hosts. Keep visual evidence on the ticket through an authorized durable destination. Inventory machine-readable command results and planning operations before inventing new interfaces.
 
-Builder fills every acceptance-ledger row and pins reference/artifact/fixture hashes; build, review and polish follow [F6](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f6-build-polish-accept). Preserve Resources, incidents/consent and navigation recovery from 4.1.9.
+Builder fills every acceptance-ledger row; source pinning follows [F1](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f1-source-and-change-control); build, review and polish follow [F6](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f6-build-polish-accept). Preserve Resources, incidents/consent and navigation recovery from 4.1.9.
 
 ## Commands
 

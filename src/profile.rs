@@ -240,7 +240,11 @@ mod tests {
                     }
                 }
             }); }
-            scope.spawn(|| { for _ in 0..50 { crate::data::trim_tail(&path, crate::data::LOG_MAX); } });
+            // Appenders can hold the lock through all 50 tries; keep trying until one truncation lands.
+            scope.spawn(|| {
+                let mut trimmed = (0..50).filter(|_| crate::data::trim_tail(&path, crate::data::LOG_MAX)).count();
+                while trimmed == 0 { trimmed += crate::data::trim_tail(&path, crate::data::LOG_MAX) as usize; }
+            });
         });
         let records = fs::read_to_string(&path).unwrap().lines().filter(|l| l.starts_with(PREFIX)).count();
         assert_eq!(records, successful.load(Ordering::Relaxed));

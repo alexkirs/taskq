@@ -132,7 +132,7 @@ pub fn due(n: &mut Value, ps: &[Value], now: i64, bursts: &mut Bursts) -> Vec<Po
         n["cursor"][root] = json!(line(last));
         let name = p["name"].as_str().unwrap_or(root);
         let b = bursts.entry(root.into()).or_default();
-        let (mut singles, mut grown, mut shown) = (vec![], false, vec![]);
+        let (mut singles, mut grown, mut shown, mut sums) = (vec![], false, vec![], vec![]);
         for e in new {
             let Some(kind) = e[1].as_str() else { continue };
             let m = mode(n, root, kind);
@@ -147,7 +147,11 @@ pub fn due(n: &mut Value, ps: &[Value], now: i64, bursts: &mut Bursts) -> Vec<Po
                     *last = t;
                 }
                 _ => {
-                    b.sum = None;
+                    // a quiet 10 s ends the summary: post its last state before this event starts afresh
+                    if let (true, Some(s)) = (grown, b.sum.take()) {
+                        sums.push(s);
+                    }
+                    grown = false;
                     b.recent.retain(|(x, _)| t - x < WINDOW);
                     b.recent.push((t, kind.into()));
                     if b.recent.len() <= BURST {
@@ -162,6 +166,9 @@ pub fn due(n: &mut Value, ps: &[Value], now: i64, bursts: &mut Bursts) -> Vec<Po
             }
             grown = true;
         }
+        if let (true, Some(s)) = (grown, &b.sum) {
+            sums.push(s.clone());
+        }
         for (e, m, _) in singles {
             let num = e[3].as_u64();
             let key = num.map(|x| x.to_string()).unwrap_or_default();
@@ -173,8 +180,8 @@ pub fn due(n: &mut Value, ps: &[Value], now: i64, bursts: &mut Bursts) -> Vec<Po
             };
             out.push(Post { root: root.into(), n: num, title: format!("{name} · {}", label(e[1].as_str().unwrap_or(""))), body, sound: m == "sound", id: json!({"root": root, "n": num, "k": e[1], "t": title, "e": line(e)}).to_string() });
         }
-        if let (true, Some((first, kinds, _))) = (grown, &b.sum) {
-            let sound = shown.iter().any(|(t, m)| t >= first && *m == "sound");
+        for (first, kinds, last) in sums {
+            let sound = shown.iter().any(|(t, m)| (first..=last).contains(t) && *m == "sound");
             let counts: Vec<String> = KINDS.iter().filter_map(|k| {
                 let c = kinds.iter().filter(|x| x == k).count();
                 (c > 0).then(|| format!("{c} {}", label(k).to_lowercase()))
@@ -410,6 +417,16 @@ mod tests {
         let ev = json!([[50, "failed", "1", 1], [70, "failed", "2", 2], [71, "failed", "3", 3], [72, "ask", "4", 4], [73, "gone", "5", 5]]);
         let p = due(&mut n, &[proj(ev)], 80, &mut Bursts::new());
         assert_eq!(p.iter().map(|p| (p.n, p.title.as_str())).collect::<Vec<_>>(), [(Some(1), "p · Failed"), (None, "p · 4 events")]);
+        // one tick: a burst, then a single after a quiet 10 s; and two separated bursts
+        let mut n = json!({"cursor": {"/p": "0"}});
+        let ev = json!([[100, "failed", "1", 1], [101, "failed", "2", 2], [102, "ask", "3", 3], [103, "gone", "4", 4], [120, "failed", "5", 5]]);
+        let p = due(&mut n, &[proj(ev)], 130, &mut Bursts::new());
+        assert_eq!(p.iter().map(|p| (p.n, p.title.as_str())).collect::<Vec<_>>(), [(Some(5), "p · Failed"), (None, "p · 4 events")]);
+        let mut n = json!({"cursor": {"/p": "0"}});
+        let ev: Vec<Value> = [100, 101, 102, 103, 104, 200, 201, 202, 203].iter().map(|t| json!([t, "failed", t.to_string(), 7])).collect();
+        let p = due(&mut n, &[proj(json!(ev))], 210, &mut Bursts::new());
+        let ids: Vec<Value> = p.iter().map(|p| serde_json::from_str::<Value>(&p.id).unwrap()["sum"].clone()).collect();
+        assert_eq!((p.iter().map(|p| p.title.as_str()).collect::<Vec<_>>(), ids), (vec!["p · 5 events", "p · 4 events"], vec![json!(100), json!(200)]));
     }
 
     // Chain: M14 a closed task's banner and card name it. Risk: `status.json` drops closed tasks, so the title is lost,

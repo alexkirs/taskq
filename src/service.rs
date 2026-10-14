@@ -718,16 +718,15 @@ impl<'a> Service<'a> {
         }
 
         // 4. gone for attempts of dead hosts (§ 3)
-        let mut leases: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+        // A lease newer than the accepted attempt is a spawn that lost the claim and still runs. An older one is a
+        // replaced attempt its host lists until its next pass: normal lag, not a second live attempt (#1140).
         for hb in hosts.iter().filter(|h| now - h.updated <= ttl) {
             for line in hb.body.lines() {
                 let Some((n, a)) = line.strip_prefix('#').and_then(|l| l.split_once(' ')) else { continue };
                 let (Ok(n), Ok(a)) = (n.parse::<u64>(), a.parse::<u64>()) else { continue };
-                let prior = leases.entry(n).or_default();
-                if prior.iter().any(|(host, attempt)| *host != hb.number && *attempt != a) {
+                if by_n.get(&n).and_then(|v| v.task.attempt).is_some_and(|c| a > c) {
                     crate::incident::detect("invariant.double_attempt", concat!("src/service.rs:", line!()), "none", &[], &["heartbeat:conflict"]);
                 }
-                prior.push((hb.number, a));
             }
         }
         for v in &views {
@@ -1250,19 +1249,26 @@ mod tests {
         assert_eq!(assigned(&b, &full, "me"), Ok(true), "a listed assignee needs no read");
     }
 
-    // Chain: incident lease heartbeat. Risk: one slow attempt reported as a fault.
+    // Chain: incident lease heartbeat (#1140). Risk: a replaced attempt still listed by its host's heartbeat until
+    // that host's next pass reported as a second live attempt (#1132, #1137), or a launched lost claim missed.
     #[test]
-    fn incident_heartbeats_require_fresh_distinct_attempts() {
-        for (other_attempt, age, expected) in [(10, 0, false), (11, 0, true), (11, 301, false)] {
+    fn incident_heartbeats_flag_only_leases_newer_than_the_attempt() {
+        for (lease, age, expected) in [("replaced", 0, false), ("current", 0, false), ("lost", 0, true), ("lost", 301, false)] {
             crate::incident::take_detected();
             let b = Fake::default();
-            let old = b.create("taskq host other", &format!("#99 {other_attempt}"), &[HOST_LABEL.into()]).unwrap();
+            let n = b.create("task", "", &[TASK_LABEL.into()]).unwrap();
+            let replaced = b.comment(n, "taskq: spawn worker claude:a other").unwrap();
+            b.comment(n, &format!("taskq: requeue attempt {replaced}")).unwrap();
+            let current = b.comment(n, "taskq: spawn worker claude:b first").unwrap();
+            let lost = b.comment(n, "taskq: spawn worker claude:c other").unwrap();
+            let a = match lease { "replaced" => replaced, "current" => current, _ => lost };
+            b.create("taskq host other", &format!("#{n} {a}"), &[HOST_LABEL.into()]).unwrap();
             b.advance(age);
-            b.create("taskq host first", "#99 10", &[HOST_LABEL.into()]).unwrap();
+            b.create("taskq host first", &format!("#{n} {current}"), &[HOST_LABEL.into()]).unwrap();
             let c = cfg("local");
             let mut s = service(&b, &c, Rc::new(RefCell::new(vec![])));
             s.pass().unwrap();
-            assert_eq!(crate::incident::take_detected(), if expected { vec!["invariant.double_attempt"] } else { vec![] }, "heartbeat {old}");
+            assert_eq!(crate::incident::take_detected(), if expected { vec!["invariant.double_attempt"] } else { vec![] }, "{lease} lease, age {age}");
         }
     }
 
@@ -1446,7 +1452,7 @@ mod tests {
         let (em, ew): (Exits, Exits) = Default::default();
         let (mut mac, mut win) = (service(&b, &cm, em.clone()), service(&b, &cw, ew.clone()));
         // mac reads the task in review before win's spawn lands: both hosts post a reviewer spawn for one result
-        let stale = views(&b, &mut HashMap::new()).unwrap().0.into_iter().find(|v| v.issue.number == n).unwrap();
+        let stale = views(&b, &mut HashMap::new(), &mut DepCache::new()).unwrap().0.into_iter().find(|v| v.issue.number == n).unwrap();
         win.pass().unwrap();
         let r = task(&b, n).attempt.unwrap();
         let (labels, comments) = (b.issue(n).unwrap().labels, b.comments(n).unwrap().len());

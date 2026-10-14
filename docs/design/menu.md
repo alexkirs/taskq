@@ -39,7 +39,7 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 - Current Agents is host-level, read-only: version/account or not installed/not logged in/unknown, plus probe age. Include disabled runtimes such as codex-app where reported.
 - Agents row (shipped): one per § 5 `agents` runtime, `<runtime> <version> · <account>` or `· not logged in` / `· not installed` / `· login unknown`, with the age of the freshest `status.json` probe; none: unknown.
 - Shipped popover (§ 4 Tray): Home, Projects, Attention and Settings, with Back restoring the previous route and scroll. Home shows scope, questions and failed of all projects (one task per board and issue), project rows that open in place with issue links and the board, errors and stale `status.json` apart from failed, and `Paused N of M` with the paused projects.
-- Project page `Capacity` (this host only, other hosts unknown): per runtime `used/limit`, `Load gate: Off|Ready|Waiting: CPU|Waiting: memory|Waiting: recovery|Unknown: <reason>`; after the § 4 `Edit limits` confirm it shows `Saved; waiting for service` until readback shows `Applied`.
+- Project page `Capacity` (this host only, other hosts unknown): per runtime `used/limit`, `Load gate: Off|Ready|Waiting: CPU|Waiting: memory|Waiting: recovery|Unknown: <reason>`; after the § 4 `Edit limits` confirm it shows `Saved; waiting for service` until § 4 `Applied`.
 
 ## M4 Request, interpretation and applied state
 
@@ -165,9 +165,9 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 - Event kinds: `ask` (a question waits for the owner), `close`, `failed` and `gone`. Settings > Notifications sets each kind to Off, Silent (menu badge only), Banner or Banner with sound. Defaults: `ask` Banner with sound, `failed` and `gone` Banner, `close` Off.
 - A project may override the host setting per kind (Inherit by default); the project page shows the effective value.
 - A notification names the project, the task title and the kind; a click opens the menu (or the pinned window) on that task's card, for `ask` the answer card.
-- Each event notifies at most once: a per-project cursor of the last notified event id persists in `<install>/tray.json`; events older than the cursor, or older than the first tray start with notifications on, never notify. More than 3 events within 10 s become one summary notification per project.
+- Once per event (§ 4 Tray): events at or before a project's cursor (the last notified event id), or older than the first tray start with notifications on, never notify. More than 3 events within 10 s become one summary notification per project.
 - The first enable asks the OS for permission on macOS; Windows reads the OS notification setting without a consent prompt. While the prompt is open Settings shows `Asked`; a failed request shows its OS error, never `Not asked`. Denied or revoked: Settings shows `Blocked by the OS` with a link to the OS setting, and nothing falls back to another channel. `Send test` posts one sample of the selected kind.
-- Settings persist in `<install>/tray.json`; an unknown value reads as the default and keeps the file.
+- An unknown `tray.json` value reads as the default and keeps the file.
 - Windows toasts use AppUserModelID `org.taskq.tray` on a TaskQ-owned Start Menu shortcut to the stable tray executable; OS settings are read through the notifier (denied: Blocked, errors: Unknown). A failed authorization request is logged in `tray.log`.
 - Packaging: Windows runs the tray as `<install>/taskq-tray.exe`, so the notification-area pin follows the exe path across updates. macOS runs `<install>/TaskQ.app` (bundle `org.taskq.tray`, signed as taskq.md § 8 step 5), which notifications need, started through LaunchServices (`open`; the bundle with no args is the tray of its parent folder and appends its stderr to `tray.log`): a bundle exec'd by the service is refused authorization.
 

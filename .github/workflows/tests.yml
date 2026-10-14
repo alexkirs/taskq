@@ -19,6 +19,7 @@ jobs:
       - run: cargo test --locked
       - run: node tests/tray-reply.test.cjs
       - run: node tests/tray-home-ai.test.cjs
+      - run: node tests/tray-home-proposal.test.cjs
       - run: node tests/tray-next.test.cjs
       - run: node tests/tray-navigation.test.cjs
       - run: node tests/tray-incidents.test.cjs

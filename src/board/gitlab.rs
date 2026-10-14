@@ -85,7 +85,8 @@ impl GitLab {
     fn try_publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> Result<Publish> {
         let branch = format!("taskq-{n}");
         // No commit, or the SHA is already on main: verify ancestry, close.
-        if self.api.call("GET", &format!("/repository/merge_base?refs[]=main&refs[]={sha}"), None)?.json()?["id"] == sha {
+        let base = self.api.call("GET", &format!("/repository/merge_base?refs[]=main&refs[]={sha}"), None)?.json()?["id"].clone();
+        if base == sha {
             return Ok(Publish::Done(format!("{sha} already on main")));
         }
         if let Some(fail) = self.ci(sha)? {
@@ -108,6 +109,14 @@ impl GitLab {
         };
         if mr["sha"] != sha {
             return Ok(Publish::Failed(format!("MR head {} is not the result {sha}", s(&mr, "sha"))));
+        }
+        if mode == "pr" && base != self.api.call("GET", "/repository/branches/main", None)?.json()?["commit"]["id"] {
+            // CI on a head that lacks current main proves nothing about the merge result (#1139)
+            return Ok(Publish::Failed(format!("{branch} is not rebased on current main: rebase, rerun the checks and push")));
+        }
+        if mode == "pr" && !matches!(self.api.call("GET", "", None)?.json()?["merge_method"].as_str(), Some("ff" | "rebase_merge")) {
+            // main can move between the check above and the merge: only a fast-forward merge method refuses a stale head at merge time
+            return Ok(Publish::Pending("project merge method does not require a rebased MR: set fast-forward or semi-linear".into()));
         }
         let iid = mr["iid"].as_u64().unwrap_or(0);
         let body = if mode == "pr" { json!({ "sha": sha, "squash": true, "squash_commit_message": format!("{title}\n\n{task_line}") }) } else { json!({ "sha": sha }) };

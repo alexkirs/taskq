@@ -114,10 +114,19 @@ impl GitHub {
         }
     }
 
+    /// main refuses a merge of a head that lacks current main (§ 7): a ruleset, or classic protection the token can read.
+    fn strict_main(&self) -> bool {
+        let read = |url: &str| self.api.call("GET", url, None).and_then(|r| r.json());
+        read("/rules/branches/main").is_ok_and(|v| v.as_array().into_iter().flatten()
+            .any(|r| r["type"] == "required_status_checks" && r["parameters"]["strict_required_status_checks_policy"] == true))
+            || read("/branches/main/protection/required_status_checks").is_ok_and(|v| v["strict"] == true)
+    }
+
     fn try_publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> Result<Publish> {
         let branch = format!("taskq-{n}");
         // No commit, or the SHA is already on main: verify ancestry, close.
-        if matches!(self.api.call("GET", &format!("/compare/main...{sha}"), None)?.json()?["status"].as_str(), Some("identical" | "behind")) {
+        let status = self.api.call("GET", &format!("/compare/main...{sha}"), None)?.json()?["status"].as_str().unwrap_or_default().to_string();
+        if matches!(status.as_str(), "identical" | "behind") {
             return Ok(Publish::Done(format!("{sha} already on main")));
         }
         if let Some(fail) = self.ci(sha)? {
@@ -147,6 +156,14 @@ impl GitHub {
         }
         if prs[0]["head"]["sha"] != sha {
             return Ok(Publish::Failed(format!("PR head is not the result {sha}")));
+        }
+        if status != "ahead" {
+            // CI on a head that lacks current main proves nothing about the merge result (#1139)
+            return Ok(Publish::Failed(format!("{branch} is not rebased on current main: rebase, rerun the checks and push")));
+        }
+        if !self.strict_main() {
+            // main can move between the check above and the merge: only strict protection refuses a stale head at merge time
+            return Ok(Publish::Pending("main does not require branches up to date before merging: enable it on a main ruleset".into()));
         }
         let p = prs[0]["number"].as_u64().unwrap_or(0);
         if prs[0]["draft"] == true {

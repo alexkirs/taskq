@@ -2000,7 +2000,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             }
             println!("board scope: {} {}", enrollment::SCHEMA, board.value());
             println!("grant: observation only; no task answers or commands");
-            let conn = enrollment::pair(&cfg.install, url, &cfg.me, &board, !a.flags.contains_key("headless"))?;
+            let conn = enrollment::pair(&cfg.install, url, &cfg.me, &board, !a.flags.contains_key("headless")).map_err(|e| format!("pairing: {e}\nNext: rerun taskq enroll {url} and approve the new code"))?;
             let (_, rec) = enrollment::record(&cfg.install, &snapshot::read(b, cfg, &c.raw, &[]), &conn)?;
             match enrollment::first_receipt(&cfg.install, &rec, 15)? {
                 "projected" => println!("connected: {dest} workspace {} generation {}; first snapshot projected", conn["workspace"].as_str().unwrap_or("?"), conn["generation"]),
@@ -2040,8 +2040,9 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
         }
         "disconnect" => {
             match enrollment::disconnect(&cfg.install)? {
-                true => println!("disconnected: sending stopped, revoke confirmed"),
-                false => println!("disconnected: sending stopped; revoke pending, the service retries it"),
+                None => println!("connection: none"),
+                Some(true) => println!("disconnected: sending stopped, revoke confirmed"),
+                Some(false) => println!("disconnected: sending stopped; revoke pending, the service retries it"),
             }
             Ok(())
         }

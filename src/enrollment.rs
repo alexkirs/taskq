@@ -74,11 +74,11 @@ pub fn first_receipt(install: &Path, record: &Value, tries: u32) -> Res<&'static
 }
 
 /// `taskq disconnect`: sending stops at once; `Ok(false)` when the revoke stays queued for the service.
-pub fn disconnect(install: &Path) -> Res<bool> {
-    if state(install)?.is_none() { return Ok(true) }
+pub fn disconnect(install: &Path) -> Res<Option<bool>> {
+    if state(install)?.is_none_or(|s| !s["active"].is_object() && !s["pending"].is_object()) { return Ok(None) }
     match enroll::disconnect(&dir(install), &mut Https { browser: false }) {
-        Ok(()) => Ok(true),
-        Err(e) if e.ends_with("revoke pending") => Ok(false),
+        Ok(()) => Ok(Some(true)),
+        Err(e) if e.ends_with("revoke pending") => Ok(Some(false)),
         Err(e) => Err(e),
     }
 }

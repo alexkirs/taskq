@@ -63,6 +63,7 @@ const USAGE: &str = "taskq agents
  taskq profile | taskq retro | taskq add --retro K [--type T ..]
  taskq wait [--window MIN] [--only L,..]
  taskq cleanup [--force] | taskq update [--check]
+ taskq enroll <https-url> [--headless] | taskq connection status | taskq disconnect
  taskq service install|run|pause|resume|status|restart|stop|uninstall|list
  taskq service focus [all|off|<label..>] [--request TEXT]
  taskq service capacity [--host H] [--mode auto|fixed] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
@@ -86,7 +87,7 @@ impl Args {
         while let Some(x) = it.next() {
             match x.strip_prefix("--") {
                 Some(k) => {
-                    let val = if matches!(k, "later" | "hold" | "start" | "check" | "force" | "help" | "json" | "apply") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
+                    let val = if matches!(k, "later" | "hold" | "start" | "check" | "force" | "help" | "json" | "apply" | "headless") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
                     a.flags.entry(k.to_string()).or_default().push(val);
                 }
                 None => a.pos.push(x.clone()),
@@ -96,7 +97,7 @@ impl Args {
             Some("close") => a.pos.len(),
             Some("answer") if a.pos.get(1).is_some_and(|p| p.contains('.')) => a.pos.len(),
             Some("service") if a.pos.get(1).is_some_and(|p| p == "focus") => a.pos.len(),
-            Some("service" | "add" | "finding" | "start" | "approve" | "recipe" | "ask" | "answer" | "result" | "requeue" | "later" | "failed" | "steer" | "inbox") => 2,
+            Some("service" | "add" | "finding" | "start" | "approve" | "recipe" | "ask" | "answer" | "result" | "requeue" | "later" | "failed" | "steer" | "inbox" | "enroll" | "connection") => 2,
             _ => 1,
         };
         if a.pos.len() > used {
@@ -591,6 +592,7 @@ fn service_run(c: &Ctx) -> Res<()> {
     let mut low_logged: Option<Option<i64>> = None;
     let mut hour: (Instant, BTreeMap<String, u64>) = (Instant::now(), BTreeMap::new());
     let mut last_hour: Option<BTreeMap<String, u64>> = None;
+    let mut dashq = enrollment::Sender::default();
     loop {
         // § 3: capacity reloads before each admission decision; children are untouched
         let cap = fs::read_to_string(cfg.root.join("taskq.json")).map_err(|e| e.to_string())
@@ -658,6 +660,10 @@ fn service_run(c: &Ctx) -> Res<()> {
         if agents.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs() >= 300) {
             agents = Some((Instant::now(), json!({"at": at, "rows": runtime::agents()})));
         }
+        // docs/design/enrollment.md: delivery runs on its own thread; its failure never fails or delays the pass
+        if let Some(l) = dashq.tick(&cfg.install, s.snapshot.as_ref(), at) {
+            log!("{l}");
+        }
         let tool = platform::tool(&cfg.install);
         let error = r.as_ref().err().cloned();
         let mut status = coreq::status::common(&tool, &cfg.me, &project, at, r.err(), update.as_deref());
@@ -671,7 +677,7 @@ fn service_run(c: &Ctx) -> Res<()> {
             ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
             ("restart_waits", json!(d.join("restart").exists().then(|| restart_waits(&s, &cfg.root)))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root))),
-            ("requests", budget.json(since, last_hour.as_ref(), &hour.1))]
+            ("requests", budget.json(since, last_hour.as_ref(), &hour.1)), ("connection", json!(dashq.outcome))]
         {
             status[k] = v;
         }
@@ -1983,6 +1989,58 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                 });
             }
             emit(&out, json)
+        }
+        // docs/design/enrollment.md: observation only, no task answers or commands; the board stays the truth
+        "enroll" => {
+            let url = a.pos.get(1).ok_or("enroll needs the DashQ https URL")?;
+            let board = enrollment::BoardScope::new(cfg.board.name, &cfg.web_host, &cfg.repo)?;
+            let dest = enrollment::destination(url)?;
+            if let Some(old) = enrollment::active(&cfg.install)?.filter(|o| o["destination"] != dest.as_str() || enrollment::approved(o).as_ref() != Some(&board)) {
+                println!("switch: {} {} -> {dest} {}", old["destination"].as_str().unwrap_or("?"), enrollment::approved(&old).map_or("unknown".into(), |b| b.value()), board.value());
+            }
+            println!("board scope: {} {}", enrollment::SCHEMA, board.value());
+            println!("grant: observation only; no task answers or commands");
+            let conn = enrollment::pair(&cfg.install, url, &cfg.me, &board, !a.flags.contains_key("headless")).map_err(|e| format!("pairing: {e}\nNext: rerun taskq enroll {url} and approve the new code"))?;
+            let (_, rec) = enrollment::record(&cfg.install, &snapshot::read(b, cfg, &c.raw, &[]), &conn)?;
+            match enrollment::first_receipt(&cfg.install, &rec, 15)? {
+                "projected" => println!("connected: {dest} workspace {} generation {}; first snapshot projected", conn["workspace"].as_str().unwrap_or("?"), conn["generation"]),
+                s => return Err(format!("approved, first snapshot {s}, not yet projected\nNext: taskq connection status")),
+            }
+            Ok(())
+        }
+        "connection" if a.pos.get(1).is_some_and(|p| p == "status") => {
+            let st = enrollment::state(&cfg.install)?;
+            let st = st.as_ref().unwrap_or(&Value::Null);
+            let (act, pend) = (&st["active"], &st["pending"]);
+            match (act.is_object(), pend.is_object()) {
+                (true, _) => println!("connection: active"),
+                (false, true) => println!("connection: pending approval"),
+                _ => println!("connection: none"),
+            }
+            let c = if act.is_object() { act } else { pend };
+            if c.is_object() {
+                println!("destination: {}", c["destination"].as_str().unwrap_or("?"));
+                println!("board scope: {} {}", c["scope"]["name"].as_str().unwrap_or("none"), c["scope"]["value"].as_str().unwrap_or(""));
+            }
+            if act.is_object() {
+                println!("workspace: {}  generation: {}", act["workspace"].as_str().unwrap_or("?"), act["generation"]);
+                println!("grant: observation only; no task answers or commands");
+            }
+            if let Some(id) = st["installation"].as_str() { println!("installation: {id}"); }
+            let n = st["revoke"].as_array().map_or(0, Vec::len);
+            if n > 0 { println!("revokes pending: {n}"); }
+            let local = dot(root).join("status.json");
+            let report = data::json(&local).ok().flatten().filter(|_| file_age(&local).is_some_and(|a| a <= 300));
+            match report.as_ref().map(|r| &r["connection"]) {
+                Some(Value::String(o)) => println!("delivery: {o}"),
+                Some(_) => println!("delivery: unknown (the service has not tried yet)"),
+                None => println!("delivery: unknown (no fresh service report for this project)"),
+            }
+            Ok(())
+        }
+        "disconnect" => {
+            println!("{}", enrollment::disconnect(&cfg.install)?.as_deref().unwrap_or("connection: none"));
+            Ok(())
         }
         "status" => {
             // R6: a board rate-limit pause the local service reports comes first, also when this read fails

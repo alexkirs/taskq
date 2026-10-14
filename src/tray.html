@@ -59,6 +59,8 @@ const periods={'5m':'5 min','1h':'Hour','1d':'Day','1w':'7 days','1mo':'30 days'
 const zone=Intl.DateTimeFormat().resolvedOptions().timeZone;
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const send=m=>window.ipc&&window.ipc.postMessage(JSON.stringify(m));
+// measure at the target width: after a font change the window still has the old width, so text wraps differently
+function fit(){const w=S.font>=18?360:320;document.body.style.width=w+'px';send({a:'size',w,h:menu.scrollHeight});}
 const menu=document.querySelector('.menu');
 let aiText=null,aiMenu=false,aiConfirm=null,addConfirm=false;
 let S=null,page='home',taskFilter=null,working=null,workCard=null,ask=null,pending={},confirming=null,updating=null,draft=null;
@@ -99,7 +101,7 @@ function answerReceipt(r){
   if(!request)return;
   clearTimeout(request.timer);answerRequests.delete(key);
   request.resolve({state:r.state,reason:r.reason,next:r.next});
-  setTimeout(()=>send({a:'size',w:S.font>=18?360:320,h:menu.scrollHeight}),0);
+  setTimeout(fit,0);
 }
 function answerSlot(t){return t.question||t.card||answerCards.has(t.key)?'<div data-answer="'+esc(t.key)+'"></div>':'';}
 function mountAnswers(){
@@ -296,7 +298,7 @@ function resourceReceipt(m){
   if(!r)return;
   clearTimeout(r.timer);resourceRequests.delete(key);
   r.resolve(String(m.text).startsWith('Error')?{state:'rejected',reason:String(m.text).replace(/^Error:\s*/,'')}:{state:'saved'});
-  setTimeout(()=>send({a:'size',w:S.font>=18?360:320,h:menu.scrollHeight}),0);}
+  setTimeout(fit,0);}
 function capacity(p){
   if(!p.resources)return '';
   return '<details class="group"><summary>▤ Capacity <span class="meta">'+esc((p.cap_host||'this host')+' · '+TaskqResources.headline(resourceGroup(p),S.now))+'</span></summary><div data-resources="'+esc(p.root)+'"></div></details>';}
@@ -353,7 +355,7 @@ function render(navigating=false){
   if(restored&&!navigating){restored.focus({preventScroll:true});if(caret)restored.setSelectionRange(...caret);}
   else if(!navigating){const target=focusedSummary>=0?menu.querySelectorAll('summary')[focusedSummary]:focusKey&&focusKey!=='{}'?[...menu.querySelectorAll('button')].find(b=>JSON.stringify(b.dataset)===focusKey):null;target?.focus({preventScroll:true});}
   document.scrollingElement.scrollTop=scroll;
-  send({a:'size',w:S.font>=18?360:320,h:menu.scrollHeight});}
+  fit();}
 window.taskq={receive(s){
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
   if(s.capmsg){resourceReceipt(s.capmsg);return;}

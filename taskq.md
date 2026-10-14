@@ -3,7 +3,7 @@ taskq runs a queue of agent tasks on a GitHub or GitLab issue board. This file i
 This file specifies **v4**, the Rust binary from `src/`.
 ## Principles (R1–R13)
 ### Change rule
-A task that changes a rule names its R-number, edits this file in the same deliverable as the code and lists the amended R-numbers in its result. A changed rule keeps its number. A new rule gets the next one. A rule elsewhere that disagrees with this file is a defect. No history here: no dates, no decision logs; at most 300 lines.
+A task that changes a rule names its R-number, edits this file in the same deliverable as the code and lists the amended R-numbers in its result. A changed rule keeps its number. A new rule gets the next one. A rule elsewhere that disagrees with this file is a defect. No history here: no dates, no decision logs; line bound: R8.
 ### R1. The board's own objects are the only state
 No machine block in issues. State is what a person sees: labels, the issue text, `taskq:` comments (§ 2) and host heartbeat issues (§ 4). The comment log is the truth; labels are its projection. Local files are caches that a restart rebuilds: no local DB, receipt store, queue or lock. Exception: accepted [DashQ connection state](docs/design/enrollment.md) (identity/grant/revoke and coalesced projection, never task truth); AI request files, the tray's request history, the request log, local incident/profile records (§ 4) and the host admission file and lock and the emergency hold file (§ 3); the host operator's [resource grants and operation receipts](docs/design/shared-resource-controls.md#host-adapter) (`resources/`); they hold no task state. The `pid` of a fresh `status.json` is the one-service-per-root check (§ 4), not a lock.
 ### R2. One task, one attempt
@@ -121,15 +121,14 @@ Optional last lines `op-id: <id>`, then `revision: <R>`, of an entry are fields,
 - After an entry is accepted, the writer sets the `q-<state>` label; every service pass fixes labels that differ from the fold. A hand-moved label is overwritten: people change state with an entry.
 
 ### Ask card
-`ask` writes, in order, without headings or blank lines inside the card:
+`ask` writes, in order, at most nine nonblank lines, without headings or blank lines inside the card:
 1. `Done: <what was checked or attempted>` -- one line, at most 160 characters; say `not started` when true.
 2. `Problem: <decision needed and user effect>` -- one or two lines, at most 240 characters per line.
 3. Optional `Evidence: [<label>](<url>)` -- one line, at most two screenshot/video/issue/PR links, labels at most 40 characters each.
 4. Two to four options, `1. <action and trade-off>` etc.; one line each, at most 160 characters, exactly one ends in `★`. None: an owner action, its Problem the action; no attempt starts while it waits, its `answer` resumes the same session.
 5. To answer: `taskq answer N.K` or comment `K` or the option text; an owner action: `taskq answer N --text <done>`. Last line; substitute this task's number for N.
-Accepted shared UI target: [answer card](docs/design/answer-card.md) owns the reusable TaskQ/DashQ presentation; § 2 and § 5 remain behavioral authority. Tray exception (R6): mount cards only in `ask`; without parsed choices, show text and owner requeue (reason), later and confirmed Close controls. Close cancels without publication through `later` then `close`, each with CLI readback; partial/unknown delivery stays explicit. An answer op is resent only with its own id: once when a refresh reads the task past its revision, once per Check delivery after an unknown receipt. Other consumers remain read-only for unparsed cards. A card has at most nine nonblank lines. K is an option number; a bare K or option text counts only in `ask` (section 2).
+Accepted shared UI target: [answer card](docs/design/answer-card.md) owns the reusable TaskQ/DashQ presentation; § 2 and § 5 remain behavioral authority. Tray exception (R6): mount cards only in `ask`; without parsed choices, show text and owner requeue (reason), later and confirmed Close controls. Close cancels without publication through `later` then `close`, each with CLI readback; partial/unknown delivery stays explicit. An answer op is resent only with its own id: once when a refresh reads the task past its revision, once per Check delivery after an unknown receipt. Other consumers remain read-only for unparsed cards. K is an option number; a bare K or option text counts only in `ask` (section 2).
 `--text` supplies literal Done and Problem lines; `--link` supplies Evidence; `--option` and `--recommend` supply the options/star.
-Result decision cards use the same format after the verdict (section 7): append Done/Problem to `--text`, use `--option`, `--recommend`, `--link`; omit all card fields for no decision.
 
 ### Executable behavioral model
 Apply the [shared behavioral-model method](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#state-driven-systems).
@@ -235,7 +234,7 @@ Worker brief: task text, attempt, branch, delivery commands, this file's path (t
 ### Result and close verdicts
 `result` body: `Changed: <user effect>` (1-2 lines), `Checks: <command -- outcome>` (one line per check, 1-8 lines),
 then `Open: <remaining item|none>` (1-2 lines); at most 12 lines, at most 240 characters per line. Keep exact commands and platform qualifications (R12).
-`--text` supplies literal Changed and Open lines; `--checks` supplies unprefixed command/outcome lines, each rendered with `Checks:`. SHA stays in the log header; one PR/evidence link may share Changed and carry the [shared risk description](https://github.com/taskqorg/specq/blob/main/caveman/rules/changes.md#merge-request-description-markdown) for either publication route.
+`--text` supplies literal Changed and Open lines, then a decision card's Done/Problem lines in the § 2 Ask card format, with `--option`, `--recommend`, `--link` (none: no card fields); `--checks` supplies unprefixed command/outcome lines, each rendered with `Checks:`. SHA stays in the log header; one PR/evidence link may share Changed and carry the [shared risk description](https://github.com/taskqorg/specq/blob/main/caveman/rules/changes.md#merge-request-description-markdown) for either publication route.
 `close --text` supplies all three labelled fields in the same order and limits; Checks names each `A<k> ok|gap|unknown` plus exact-SHA CI outcome, not a vague PASS.
 Reviewer checks every Acceptance and contract against the candidate and CI on that SHA, waiting at most one poll a minute (`gh pr checks <PR> --watch --interval 60`; never `gh run watch`, which polls every 3 s, or `gh run view` without `--json`); `Checks:` follows [shared review](https://github.com/taskqorg/specq/blob/main/engineering/agent-workflow.md#review), within the same verdict limits. Requeue only for Acceptance/contract gaps; advisory findings go in `Open:`. Then `close --text <verdict>`, `requeue --text <exact fixes>` or `ask` with options. PM relays the verdict verbatim, links intact.
 

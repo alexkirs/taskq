@@ -672,6 +672,40 @@ mod tests {
         }
     }
 
+    // Chain: § 7 `pr` publication of a draft PR. Risk: GitHub refuses to merge a draft (HTTP 405), so close never publishes.
+    #[test]
+    fn a_draft_pr_is_marked_ready_then_merged_at_the_result_sha() {
+        for undrafted in [true, false] {
+            let writes = std::rc::Rc::new(RefCell::new(vec![]));
+            let captured = writes.clone();
+            let h = http(&github::KIND, None, Box::new(move |method, url, body| {
+                let (result, merged) = ("a".repeat(40), "b".repeat(40));
+                if method != "GET" { captured.borrow_mut().push(url.rsplit_once(".com").map_or(url, |x| x.1).to_string()); }
+                let value = if url.contains("/compare/") { json!({"status": "ahead"}) }
+                    else if url.contains("/check-runs") { json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}) }
+                    else if url.ends_with("/status") { json!({"total_count": 0}) }
+                    else if url.contains("/pulls?") { json!([{"number": 7, "node_id": "PR_7", "draft": true, "head": {"sha": result}}]) }
+                    else if url == "https://api.github.com/graphql" {
+                        assert_eq!(body.unwrap()["variables"]["id"], "PR_7");
+                        if undrafted { json!({"data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": false}}}}) }
+                        else { json!({"data": null, "errors": [{"message": "forbidden"}]}) }
+                    }
+                    else if url.ends_with("/pulls/7/merge") { assert_eq!(body.unwrap()["sha"], result); json!({"sha": merged}) }
+                    else if url.ends_with("/pulls/7") { json!({"merged": true, "merge_commit_sha": merged}) }
+                    else { panic!("unexpected {method} {url}") };
+                Ok(Reply { status: 200, headers: vec![], body: value.to_string(), operation: operation(method) })
+            }));
+            let out = h.publish(1, &"a".repeat(40), "pr", "title", "Task: fake");
+            if undrafted {
+                assert!(matches!(&out, Publish::Done(m) if m.starts_with("merged #7 as bbbb")));
+                assert_eq!(*writes.borrow(), ["/graphql", "/repos/o/r/pulls/7/merge"], "ready before merge");
+            } else {
+                assert!(matches!(&out, Publish::Pending(m) if m.contains("still a draft")));
+                assert_eq!(*writes.borrow(), ["/graphql"], "no merge of a draft");
+            }
+        }
+    }
+
     // Chain: § 7 publication readback. Risk: one flaky read reports a lost publication.
     #[test]
     fn incident_publication_readback_requires_two_negative_reads() {

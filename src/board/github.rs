@@ -120,6 +120,16 @@ impl GitHub {
             return Ok(Publish::Failed(format!("PR head is not the result {sha}")));
         }
         let p = prs[0]["number"].as_u64().unwrap_or(0);
+        if prs[0]["draft"] == true {
+            // GitHub refuses to merge a draft (HTTP 405) and REST cannot mark it ready
+            let ready = self.api.call("POST", &format!("{}/graphql", self.api.root), Some(json!({
+                "query": "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { isDraft } } }",
+                "variables": { "id": prs[0]["node_id"] },
+            })))?.json()?;
+            if ready["data"]["markPullRequestReadyForReview"]["pullRequest"]["isDraft"] != false {
+                return Err(format!("#{p} is still a draft: {}", ready["errors"]));
+            }
+        }
         let merged = self.api.call("PUT", &format!("/pulls/{p}/merge"), Some(json!({ "merge_method": "squash", "sha": sha, "commit_title": format!("{title} (#{p})"), "commit_message": task_line })))?;
         let back = self.api.call("GET", &format!("/pulls/{p}"), None)?.json()?;
         if back["merged"] != true {

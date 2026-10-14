@@ -764,27 +764,40 @@ fn completes(rollout: &Path) -> usize {
 
 /// Exit success and stdout + stderr of a read-only subcommand; None when it cannot start or runs over 10 s.
 fn probe(bin: &Path, args: &[&str]) -> Option<(bool, String)> {
+    probe_within(bin, args, std::time::Duration::from_secs(10))
+}
+
+/// None when the run or its output outlasts `budget`. Readers are never joined: a grandchild that inherits the pipes
+/// keeps them open after the child exits or is killed (#1114), and the service pass must not wait for it.
+fn probe_within(bin: &Path, args: &[&str], budget: std::time::Duration) -> Option<(bool, String)> {
+    let deadline = std::time::Instant::now() + budget;
     let mut c = Command::new(bin);
     c.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut ch = crate::platform::quiet(&mut c).spawn().ok()?;
     // Drain both pipes while waiting: agents --all can exceed an OS pipe buffer.
-    let read = |mut pipe: Box<dyn std::io::Read + Send>| std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        pipe.read_to_end(&mut bytes).ok().map(|_| bytes)
-    });
-    let out = read(Box::new(ch.stdout.take()?));
-    let err = read(Box::new(ch.stderr.take()?));
-    let mut status = None;
-    for _ in 0..100 {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let read = |i: usize, mut pipe: Box<dyn std::io::Read + Send>| {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = tx.send((i, pipe.read_to_end(&mut bytes).ok().map(|_| bytes)));
+        });
+    };
+    read(0, Box::new(ch.stdout.take()?));
+    read(1, Box::new(ch.stderr.take()?));
+    let status = loop {
         match ch.try_wait() {
-            Ok(Some(s)) => { status = Some(s); break; }
-            Err(_) => break,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Ok(Some(s)) => break s,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(100)),
+            _ => { let _ = ch.kill(); let _ = ch.wait(); return None; }
         }
+    };
+    let mut pipes = [Vec::new(), Vec::new()];
+    for _ in 0..2 {
+        let (i, bytes) = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).ok()?;
+        pipes[i] = bytes?;
     }
-    if status.is_none() { let _ = ch.kill(); let _ = ch.wait(); }
-    let (out, err) = (out.join().ok()??, err.join().ok()??);
-    Some((status?.success(), format!("{}{}", String::from_utf8_lossy(&out), String::from_utf8_lossy(&err))))
+    Some((status.success(), format!("{}{}", String::from_utf8_lossy(&pipes[0]), String::from_utf8_lossy(&pipes[1]))))
 }
 
 /// The first word of `--version` output that starts with a digit: `2.1.3 (Claude Code)`, `codex-cli 0.15.3`.
@@ -869,6 +882,30 @@ mod tests {
         }
         let long = public_line(&"word ".repeat(100), Path::new("/r"), 224);
         assert_eq!((long.chars().count(), long.ends_with(" wor…")), (224, true));
+    }
+
+    // Chain: § 4 service pass, `agents` rows (R12), #1114. Risk: a runtime CLI whose child keeps the pipes open blocks the pass.
+    #[test]
+    fn probe_gives_up_on_time_when_a_grandchild_keeps_the_pipes() {
+        let dir = std::env::temp_dir().join(format!("taskq-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |name: &str, body: &str| {
+            let (p, text) = if cfg!(windows) { (dir.join(format!("{name}.cmd")), format!("@echo off\r\n{body}\r\n")) }
+                else { (dir.join(name), format!("#!/bin/sh\n{body}\n")) };
+            std::fs::write(&p, text).unwrap();
+            #[cfg(unix)] std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            p
+        };
+        let (hang, fork) = if cfg!(windows) { ("ping -n 30 127.0.0.1", "start /b ping -n 30 127.0.0.1") } else { ("sleep 30", "sleep 30 &") };
+        // the child hangs, then a killed child leaves its grandchild holding the pipes; or the child exits and leaves it
+        for (name, body, want) in [("ok", "echo 1.2.3".to_string(), Some("1.2.3")), ("hang", format!("echo 1.2.3\n{hang}"), None),
+            ("fork", format!("{fork}\necho 1.2.3"), None)] {
+            let t = std::time::Instant::now();
+            let got = probe_within(&script(name, &body.replace('\n', if cfg!(windows) { "\r\n" } else { "\n" })), &["--version"], std::time::Duration::from_secs(2));
+            assert_eq!(got.as_ref().map(|(ok, out)| (*ok, out.trim())), want.map(|v| (true, v)), "{name}");
+            assert!(t.elapsed() < std::time::Duration::from_secs(5), "{name}: {:?}", t.elapsed());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Chain: incident runtime start. Risk: environment errors reported as taskq faults.

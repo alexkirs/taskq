@@ -106,6 +106,15 @@ function answerReceipt(r){
   render();
   setTimeout(fit,0);
 }
+// A status refresh that reads the question past the op's revision ends Sending: reconcile once with the same op, so
+// the CLI returns its first receipt (accepted) or names another writer (stale); the refresh itself never accepts.
+function answerReadback(){
+  for(const [key,r] of answerRequests){
+    const p=S.projects.find(p=>p.issues===r.board),t=p&&p.complete!==false&&p.tasks.find(t=>t.n===r.op.task);
+    if(r.reconciled||!t||(t.state==='ask'&&t.revision===r.op.revision))continue;
+    r.reconciled=true;send({a:'answer',root:p.root,board:r.board,op:r.op});
+  }
+}
 function answerSlot(t){return t.state==='ask'?'<div data-answer="'+esc(t.key)+'"></div>':'';}
 function answerNotices(){
   return [...answerFeedback].filter(([,r])=>!S.projects.some(p=>p.issues===r.board&&p.tasks.some(t=>t.n===r.op.task&&t.state==='ask'))).map(([key,r])=>'<div class="body" role="status">#'+r.op.task+' · '+esc(r.state)+(r.reason?': '+esc(r.reason):'')+(r.next?' · '+esc(r.next):'')+' <a href="'+esc(r.board+'/'+r.op.task)+'" data-url="'+esc(r.board+'/'+r.op.task)+'">Board ↗</a>'+(r.state==='unknown'?'<button data-a="answer-retry" data-key="'+esc(key)+'">Check delivery</button>':'')+'</div>').join('');
@@ -366,7 +375,7 @@ window.taskq={receive(s){
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
   if(s.capmsg){resourceReceipt(s.capmsg);return;}
   for(const p of s.projects){const was=S&&S.projects.find(q=>q.root===p.root);if(pending[p.root]&&was&&mode(was)!==mode(p))delete pending[p.root];}
-  S=s;
+  S=s;answerReadback();
   if(aiText===null)aiText=s.ai.draft||'';
   // snapshot mode names the page
   if(s.page!==undefined&&s.page!==page){page=s.page;taskFilter=null;working=null;workCard=null;trail.length=0;pending={};disclosures=[];render(true);return;}

@@ -31,9 +31,20 @@ const plain=x=>JSON.parse(JSON.stringify(x));
   assert.deepEqual(plain(sent[1].op),op,'reconciliation keeps exact op ID, revision and literal text');
   call('answerReceipt',{root:'project',id:op.id,state:'accepted',reason:'read back',next:''});
   assert.deepEqual(plain(await retry),{state:'accepted',reason:'read back',next:''});
+  // A1/A2 #1024: a refresh past the op's question reconciles once with the same op; only its receipt decides the state.
+  for(const [move,state] of [[{revision:5},'accepted'],[{state:'ready'},'stale']]){
+    const o={...op,id:'readback-'+state},before=sent.length,pending=call('answerSend',board,o);
+    project.tasks=[{n:841,state:'ask',revision:4}];call('answerReadback');
+    assert.equal(sent.length,before+1,'unchanged question: no reconcile');
+    project.tasks=[{n:841,state:'ask',revision:4,...move}];call('answerReadback');call('answerReadback');
+    assert.deepEqual(plain(sent.slice(before+1)),[{a:'answer',root:'project',board,op:o}],'one same-op reconcile');
+    call('answerReceipt',{root:'project',id:o.id,state});
+    assert.equal((await pending).state,state,'refresh alone never accepts');
+  }
+  delete project.tasks;
   context.S.projects=[];
   assert.equal((await call('answerSend',board,op)).state,'rejected');
-  assert.equal(sent.length,2,'unregistered board writes nothing');
+  assert.equal(sent.length,6,'unregistered board writes nothing');
   // Run the consumer's capability across shared stale/lost-response fixtures; component owns draft and op state.
   const fx=JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json','utf8'));
   for(const c of fx.cases.filter(c=>/stale|lost|duplicate|sending/.test(c.name))){

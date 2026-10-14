@@ -12,6 +12,7 @@ Historical release review: [4.1.9 audit](release-4.1.9-ui-audit.md). No current 
 
 Use [synthetic expected fixtures](ui-acceptance-fixtures.json) for histogram, sizing-boundary and lattice checks; these are inputs, not native proof.
 Use [report template](ui-acceptance-report.md). Keep reports per candidate; do not overwrite failing evidence. Fixed items link replacement evidence.
+Reports: [4.2.0 candidate on macOS](evidence/g8-macos/report.md).
 
 ## Feature ledger
 

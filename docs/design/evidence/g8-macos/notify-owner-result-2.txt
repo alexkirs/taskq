@@ -1,0 +1,11 @@
+2026-10-14T17:39:55Z start bfd706f95c6be2cc007a3acd5d36c3dcdcb2eaf869b53ca4ed3dc2648b25a6e3
+2026-10-14T17:39:58Z tray 48886 running, tray.log clean
+2026-10-14T17:40:06Z owner: Did the prompt appear and did you click Allow? -> n
+2026-10-14T17:40:19Z owner: Is TaskQ listed in Notifications with Allow on now? -> y
+2026-10-14T17:40:22Z appended ask event for #7
+2026-10-14T17:40:40Z owner: Did the banner appear? -> n
+2026-10-14T17:40:53Z owner: Did the click open the TaskQ menu on #7? -> n
+2026-10-14T17:41:22Z owner: Is TaskQ notifications now off? -> n
+2026-10-14T17:41:22Z appended failed event for #7 while blocked
+2026-10-14T17:41:39Z owner: Did any banner appear in the last 6 s? (expected: no) -> n
+2026-10-14T17:42:25Z done: <repo>/target/g8-owner (result.txt, shots/popover-*-notifications-16.png, tray.json, unified.log)

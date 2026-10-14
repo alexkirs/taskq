@@ -31,7 +31,7 @@ Final candidate for the approved dense menu. Shared principles: [specq D1–D14]
 
 Use subtle counter fills, not colored text blocks. Always include a symbol or label. Board-label HEX values remain in board.md; do not replace them with UI tokens.
 Closed has the lowest visual emphasis without opacity; [counter semantics](task-counters.md).
-Paused data is gray; partial pause/unknown does not gray all counts. Unknown is labelled, never an empty zero slot.
+Paused data is gray; partial pause/unknown does not gray all counts. Unknown ([never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy)) is labelled.
 
 ## Icon inventory
 

@@ -108,7 +108,7 @@ Owner decision 2026-10-14: TaskQ keeps every owner and operator request, and a m
 
 ## Batch 1 tasks
 
-**WS1 read model.** One function builds the snapshot from one board read (or from `status.json` for the tray); `taskq status` text, `taskq status --json`, `service status` and the tray read it. Snapshot fields: `schema` 1, source (board or host) and observed time, `complete` with a reason when the board was unreadable, project and board identity, per-state totals, open tasks with labels and attempt, capabilities. Unknown is never zero. No new transport, no UI change.
+**WS1 read model.** One function builds the snapshot from one board read (or from `status.json` for the tray); `taskq status` text, `taskq status --json`, `service status` and the tray read it. Snapshot fields: `schema` 1, source (board or host) and observed time, `complete` with a reason when the board was unreadable, project and board identity, per-state totals, open tasks with labels and attempt, capabilities. Unknown values follow [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy). No new transport, no UI change.
 
 **WS2 dispatcher.** One dispatch path for `answer`, `requeue`, `later`, `failed`, `steer`, `close`, `result`, `ask` and the tray proposal apply: validate the target through `fold`, compare the expected revision (the id of the current card or attempt), write one entry, read back, return a receipt (accepted with readback, rejected with reason, stale with the current revision, unknown with a reconcile hint). An op id repeated inside the retry window returns the first receipt without a second write. Golden traces cover two concurrent answers, a stale revision and a retried op id.
 

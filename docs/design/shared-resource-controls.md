@@ -8,7 +8,7 @@ Follow [shared-block inheritance B1–B4](shared-blocks.md). Compact placement d
 
 | Block | Canonical owner | Shared behavior |
 |---|---|---|
-| Node/runtime summary | taskq.md § 4/§ 5 | Stable installation/runtime identity, freshness, supported runtimes and live usage; unknown is not zero |
+| Node/runtime summary | taskq.md § 4/§ 5 | Stable installation/runtime identity, freshness, supported runtimes and live usage; unknown per [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy) |
 | Capacity and guard | taskq.md § 3/§ 9, [capacity](capacity.md) | Runtime used/limit, effective settings, CPU/available-memory guard, blocking reasons, saved versus applied |
 | Auto / Fixed policy | [dynamic resources R1–R4](dynamic-resources.md) | Host-wide authority, optional host/project/runtime caps, source of effective limits, migration and admission reasons; implemented through #896 |
 | Work mode editor | [menu M12](menu.md#m12-shared-work-mode) | Named host and selected registered projects, Mixed values, explicit edited fields, old→new review and per-target readback |

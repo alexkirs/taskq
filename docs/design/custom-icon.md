@@ -39,7 +39,7 @@ Config contains version, preset/source revision, semantic data bindings, element
 
 ## CI4 Truth and native constraints
 
-- Custom may omit chosen counters; exact menu counts remain available. Every displayed value retains its definition. Unknown is a dash, not zero. Overflow uses explicit calibrated thresholds, never clipped digits or live per-value shrinking.
+- Custom may omit chosen counters; exact menu counts remain available. Every displayed value retains its definition. Unknown ([never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy)) shows a dash. Overflow uses explicit calibrated thresholds, never clipped digits or live per-value shrinking.
 - Preserve fixed square dimensions, meaningful status indications and user-accessible state. Paused uses gray rendering plus the accepted centered Q/pause overlay; emergency hold/unknown stay distinguishable. Custom cannot hide the state policy.
 - Layout uses measured ink edges, stable baselines and constrained cells. Rasterize once at native size/DPR; bars use integer pixel widths/gaps and fixed time bins. Shared scale across series; preserve totals during rebinning.
 - Changing preset or editing cannot change admission, permissions, tasks or cadence collection. Charts label their period/series in accessible descriptions and details.

@@ -8,7 +8,7 @@ Approved: aggregate above Projects; all queue states available; Closed visually 
 - Every visible project row (pinned, recent and All projects) includes its own nonzero counters beside its name; aggregate counters never replace them. A known all-zero project shows its name only, without an empty strip or `No tasks` caption.
 - Project: same order and symbols, only that board/project. Deduplicate by provider/server/repository/issue across registrations/hosts; conflicting or stale observations mark incomplete.
 - Order: Doing, Review, Ask, Failed, Ready, Blocked, Later, Closed. No Work total alongside Doing/Review; that would count twice.
-- Zero hides its capsule; unknown shows `?`, never zero. Empty accurate state says `No tasks`. Incomplete sum says `Partial` with affected sources.
+- Zero hides its capsule; unknown ([never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy)) shows `?`. Empty accurate state says `No tasks`. Incomplete sum says `Partial` with affected sources.
 - `Ask` means a human answer is needed. It is not human execution. `assignee-only` is an admission constraint, not a human-owned task state. Add a separate Human execution counter only after a state/data contract exists.
 - Closed: current total of closed TaskQ-managed issues, independent of cadence period. Not all board issues, not sum of close events, not successful attempts. Reopening removes a task from Closed.
 - Service obtains authoritative paginated closed totals or maintains a verified board projection. Until available show unknown; never infer all-time totals from local event history. Tray stays token-free and reads status only.

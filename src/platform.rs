@@ -107,7 +107,7 @@ pub fn sweep(install: &Path, shim: &Path) {
         }
     }
     let owned = |n: &str| {
-        ["releases", "current", "previous", "projects", "token", "installation-id", "taskq", "taskq.exe", "taskq-tray.exe", "capacity"].contains(&n)
+        ["releases", "current", "previous", "projects", "token", "installation-id", "taskq", "taskq.exe", "taskq-tray.exe", "capacity", crate::policy::FILE].contains(&n)
             || n.ends_with(".log") || n.ends_with(".tmp") || n.starts_with("tray") || (n.starts_with("TaskQ-") && n.ends_with(".xml"))
     };
     let gone = |p: &Path| {
@@ -395,7 +395,7 @@ mod tests {
         fs::create_dir_all(root.join(".taskq")).unwrap();
         // a project service still on 4.0.5 with a live child: its release stays (A3)
         fs::write(root.join(".taskq/status.json"), r#"{"version": "4.0.5", "kids": [{"task": 1}]}"#).unwrap();
-        let files = ["current", "previous", "token", "taskq", "taskq.log", "taskq.log.tmp", "proj.log", "tray", "tray.json", "TaskQ-proj.xml", ".freshness.json", "current.json", "mac-scheduled-pass.py"];
+        let files = ["current", "previous", "token", "taskq", "taskq.log", "taskq.log.tmp", "proj.log", "tray", "tray.json", "TaskQ-proj.xml", "worker-policy.json", ".freshness.json", "current.json", "mac-scheduled-pass.py"];
         for f in files {
             fs::write(install.join(f), "").unwrap();
         }
@@ -415,7 +415,7 @@ mod tests {
         let mut want = vec![VERSION.to_string(), "4.0.5".into(), "4.1.0".into(), "4.2.0".into(), "4.3.0.tmp".into()];
         want.sort();
         assert_eq!(ls(&install.join("releases")), want);
-        assert_eq!(ls(&install), ["TaskQ-proj.xml", "capacity", "current", "previous", "proj.log", "projects", "releases", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json"]);
+        assert_eq!(ls(&install), ["TaskQ-proj.xml", "capacity", "current", "previous", "proj.log", "projects", "releases", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json", "worker-policy.json"]);
         assert!(!shim.exists() && other.exists(), "only the v3 shim of this install goes");
         // § 4 Data: a corrupt status.json leaves the project's version unknown, so every release stays and so does the file
         fs::write(root.join(".taskq/status.json"), "{\"version\": \"4.0").unwrap();

@@ -1,8 +1,8 @@
 # Worker permissions
 
-Product selection: D05 option 1 is accepted in the [decision register](decision-register.md). Remaining candidate language below refers to implementation/calibration, not a request to reapprove that direction. No running policy changes.
+Product selection: D05 option 1 is accepted in the [decision register](decision-register.md).
 
-Design proposal. No active permissions changed. Approve the R9/§8 amendment and migration before implementation.
+P1–P4 and the P7.6 rollback floor are implemented (#970) as taskq.md R9 and § 8 Access: macOS enforcement only; other platforms refuse non-Full presets. The rest stays design input.
 Shared candidate: [permission authority](https://github.com/taskqorg/specq/blob/main/engineering/permission-authority.md).
 Applies to workers, reviewers and the full operator (R3/R9); tools remain bounded by effective runtime permissions and the owner request.
 

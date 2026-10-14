@@ -96,7 +96,7 @@ pub struct View {
 pub fn cleanup(board: &dyn Board, root: &std::path::Path, mut skip: impl FnMut(u64) -> bool, force: bool) -> Vec<String> {
     let mut log = vec![];
     let Ok(dir) = std::fs::read_dir(root.join(".worktrees")) else { return log };
-    let git = |dir: &std::path::Path, args: &[&str]| std::process::Command::new("git").arg("-C").arg(dir).args(args).output().ok().filter(|o| o.status.success()).map(|o| o.stdout);
+    let git = |dir: &std::path::Path, args: &[&str]| std::process::Command::new("git").arg("-C").arg(dir).args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]).args(args).output().ok().filter(|o| o.status.success()).map(|o| o.stdout);
     for e in dir.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(n) = name.strip_prefix("taskq-").and_then(|n| n.parse::<u64>().ok()) else { continue };
@@ -201,6 +201,8 @@ pub struct Service<'a> {
     host_used: Option<u32>,
     /// The emergency hold read at the start of each pass (§ 3): refuses every launch.
     pub hold: Option<String>,
+    /// Runtimes whose access policy refuses a launch, with the reason (§ 8 Access): no claim, resume or reviewer.
+    pub refused_access: BTreeMap<String, String>,
     /// Children whose last liveness read failed, by attempt: kept and reported unknown, never `gone` (§ 4).
     pub unknown: HashMap<u64, String>,
 }
@@ -425,7 +427,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, unknown: HashMap::new() }
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -504,6 +506,7 @@ impl<'a> Service<'a> {
         if self.focus.is_empty() {
             reasons.push(("focus", self.focus_error.clone().unwrap_or_else(|| FOCUS_OFF.into())));
         }
+        reasons.extend(self.refused_access.iter().map(|(rt, r)| ("access", format!("{rt}: {r}"))));
         let res = |r: &Res, state: &str| json!({"task": r.0, "attempt": r.1, "rt": r.2, "state": state});
         let reservations: Vec<Value> = self.kids.iter().map(|k| res(&(k.task, k.attempt, k.rt.clone()), "held"))
             .chain(self.reserved.iter().map(|r| res(r, "held"))).chain(self.requested.iter().map(|r| res(r, "requested"))).collect();
@@ -733,7 +736,7 @@ impl<'a> Service<'a> {
                 touched.insert(n);
                 continue;
             }
-            if !self.reserve(n, a, &l.rt) {
+            if self.refused_access.contains_key(&l.rt) || !self.reserve(n, a, &l.rt) {
                 pending.insert((n, a)); // the inbox stays undelivered
                 continue;
             }
@@ -859,7 +862,7 @@ impl<'a> Service<'a> {
         let c = self.cap.as_ref().ok()?;
         // Auto: a runtime without a limit has no count ceiling (§ 9); Fixed: only listed runtimes
         let limits: Vec<(String, u32)> = if c.auto { RUNTIMES.iter().map(|r| (r.to_string(), c.limits.get(*r).copied().unwrap_or(u32::MAX))).collect() } else { c.limits.clone().into_iter().collect() };
-        limits.into_iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt)).find(|(rt, n)| self.kids.iter().filter(|k| &k.rt == rt).count() < *n as usize).map(|(rt, _)| rt)
+        limits.into_iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt) && !self.refused_access.contains_key(rt)).find(|(rt, n)| self.kids.iter().filter(|k| &k.rt == rt).count() < *n as usize).map(|(rt, _)| rt)
     }
 
     /// Post `spawn`, re-read, start the child only if `fold` accepted this spawn (§ 3 claim).
@@ -1307,6 +1310,34 @@ mod tests {
         s.pass().unwrap();
         assert_eq!(*e.borrow()[1].1.borrow(), Some(-9));
         assert!(s.kids.is_empty());
+    }
+
+    // Chain: § 8 Access refusal. Risk: a refused runtime is claimed (phantom attempt, retries) or resumed, or its
+    // reason is missing from status.
+    #[test]
+    fn refused_access_claims_and_resumes_nothing() {
+        let b = Fake::default();
+        let mut c = cfg("mac");
+        c.limits = BTreeMap::from([("claude".to_string(), 2)]);
+        let n1 = b.create("A", "", &["taskq".into()]).unwrap();
+        let e: Exits = Default::default();
+        let mut s = service(&b, &c, e.clone());
+        s.pass().unwrap();
+        let a1 = task(&b, n1).attempt.unwrap();
+        b.comment(n1, &core::entry("ask", &[], Some(a1), "Which?\n1. x\n2. y ★")).unwrap();
+        *e.borrow()[0].1.borrow_mut() = Some(0);
+        s.pass().unwrap();
+        s.refused_access.insert("claude".into(), "workspace enforcement unknown for claude on windows".into());
+        b.comment(n1, &core::entry("answer", &["1"], None, "x")).unwrap();
+        let n2 = b.create("B", "", &["taskq".into()]).unwrap();
+        s.pass().unwrap();
+        assert_eq!((task(&b, n2).state, task(&b, n2).attempt, task(&b, n1).state, e.borrow().len()), (State::Ready, None, State::Doing, 1));
+        assert!(!b.comments(n2).unwrap().iter().any(|c| c.body.starts_with("taskq: spawn")), "no phantom attempt");
+        let cap = s.capacity_json();
+        assert_eq!((cap["reasons"][0]["code"].as_str(), cap["reasons"][0]["text"].as_str()), (Some("access"), Some("claude: workspace enforcement unknown for claude on windows")));
+        s.refused_access.clear();
+        s.pass().unwrap();
+        assert_eq!((task(&b, n2).state, e.borrow().len()), (State::Doing, 3), "granted: resume and claim");
     }
 
     // Chain: § 3 emergency hold, § 4 reconciliation and recovery. Risk: a held host launches, an unknown read is

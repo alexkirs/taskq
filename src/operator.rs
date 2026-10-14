@@ -214,10 +214,12 @@ pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume:
     }
     let board_env = cfg.board.worker_env(&crate::platform::tool(&cfg.install), &cfg.web_host)?;
     let exe = cfg.install.join(crate::platform::tool(&cfg.install).exe_name());
-    let env = crate::runtime::Env { root, exe: &exe, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.publish, board_env: &board_env };
+    let env = crate::runtime::Env { root, exe: &exe, install: &cfg.install, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.publish, board_env: &board_env };
     let l = crate::runtime::Launch { task: 0, title: name.into(), attempt: 0, role: "operator".into(), rt: rt.into(),
         session: resume.map(String::from).unwrap_or_else(|| crate::runtime::new_session(rt)), url: String::new(), resume: resume.map(String::from) };
-    let mut c = crate::runtime::command(&env, &l);
+    // § 8 Access: the operator runs under the same grants as workers
+    let access = crate::runtime::access(&env, rt).map_err(|e| e.to_string())?;
+    let mut c = crate::runtime::command(&env, &l, &access);
     for k in ["TASKQ_TASK", "TASKQ_ATTEMPT", "TASKQ_ROLE"] { c.env_remove(k); }
     let text = crate::runtime::instructions(&format!("Read {} first. TaskQ commands: {}.\n{brief}", crate::runtime::contract(root), exe.display())).map_err(|e| e.to_string())?;
     fs::create_dir_all(logs).map_err(|e| e.to_string())?;

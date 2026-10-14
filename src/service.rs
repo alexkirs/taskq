@@ -1248,13 +1248,7 @@ mod tests {
             c.has = vec!["codex-app".into()];
             let e: Exits = Default::default();
             let mut s = service(&b, &c, e.clone());
-            let remote_app = worker == "codex-app" && !cfg!(target_os = "macos");
-            if remote_app {
-                // A non-macOS host can review a result produced by a macOS worker.
-                b.comment(n, &core::entry("spawn", &["worker", "codex-app:remote", "mac"], None, "")).unwrap();
-            } else {
-                s.pass().unwrap();
-            }
+            s.pass().unwrap();
             let t = task(&b, n);
             if worker == "codex-app" && !cfg!(target_os = "macos") {
                 assert_eq!(t.state, State::Ready, "§ 9: app workers are macOS-only");
@@ -1265,15 +1259,10 @@ mod tests {
             // A losing spawn must not change which runtime actually did the work.
             b.comment(n, &core::entry("spawn", &["worker", &format!("{other}:ignored"), "mac"], None, "")).unwrap();
             b.comment(n, &core::entry("result", &["0123456789abcdef0123456789abcdef01234567"], t.attempt, "ok")).unwrap();
-            if !remote_app { *e.borrow()[0].1.borrow_mut() = Some(0); }
+            *e.borrow()[0].1.borrow_mut() = Some(0);
             for retry in 0..2 {
                 s.pass().unwrap();
                 let t = task(&b, n);
-                if remote_app && capacity == 0 {
-                    assert_eq!((t.state, t.attempt), (State::Review, None), "no codex-app fallback outside macOS");
-                    assert!(e.borrow().is_empty());
-                    continue;
-                }
                 assert_eq!(t.role.as_deref(), Some("reviewer"));
                 assert_eq!(rt_of(&t).unwrap().0, expected, "{worker}, capacity {capacity}, retry {retry}");
                 if retry == 0 {

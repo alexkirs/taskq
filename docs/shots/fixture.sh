@@ -14,8 +14,9 @@ cat > "$d/storefront/.taskq/status.json" <<EOF
  "focus":["area-checkout"],"error":null,"request":null,"events_since":$((now-86400)),
  "agents":{"at":$((now-60)),"rows":[{"runtime":"claude","path":"/usr/local/bin/claude","version":"2.1.3","login":"logged in","account":"dev@example.com"},
  {"runtime":"codex","path":"/usr/local/bin/codex","version":"0.15.3","login":"logged in","account":"dev@example.com"}]},"tasks":[
- {"n":41,"title":"Keep the cart after sign-in","state":"ask","labels":["taskq","area-checkout"]},
- {"n":42,"title":"Show delivery dates","state":"doing","labels":["taskq","area-checkout"]},
+ {"n":41,"title":"Keep the cart after sign-in","state":"ask","revision":410,
+ "question":{"parsed":true,"done":"Cart merge reaches duplicate products.","problem":"Which quantity should a duplicate product keep?","choices":[{"id":1,"text":"Keep the larger quantity","recommended":true,"consequential":false},{"id":2,"text":"Add the quantities","recommended":false,"consequential":false}],"evidence":[]},"labels":["taskq","area-checkout"]},
+ {"n":42,"title":"Warn about unavailable items","state":"held","labels":["taskq","area-checkout"]},
  {"n":43,"title":"Fix the login redirect","state":"review","labels":["taskq","area-checkout"]},
  {"n":44,"title":"Compress product images","state":"ready","labels":["taskq"]}]}
 EOF

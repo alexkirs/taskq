@@ -77,8 +77,8 @@ Owner decisions on looks and sound, one line each. Change one only per R13.
 - README is the whole page: header, setup phrase, one sentence, what you get, screenshots, use cases, one link to taskq.md, release checksum and provenance verification, license, donate.
 - Header: `docs/header.webp` with the caption `Agents working.` stays at the top, verbatim.
 - Setup phrase: one `text` block, verbatim `Install taskq from https://github.com/taskqorg/taskq and set it up for this project.`; new-project variant beside it.
-- What you get and use cases list shipped behavior only; each use-case row names its UC id and a phrase checked in fresh Claude and Codex PM sessions (proposed commands without writes suffice).
-- Screenshots: dark theme from `taskq tray --snapshot` over `docs/shots/fixture.sh`; `docs/shots/manifest.json` pins version, commit and hashes; CI marks shots stale when recorded UI source blob ids differ from HEAD.
+- What you get and use cases list shipped behavior only; three linked illustrative conversations cover UC-02/03/07, UC-09 and UC-14 with context, request, clarification, owner decision, action and observable outcome. Illustration is not session evidence; historical phrase checks qualify proposed commands only.
+- Screenshots: dark theme from `taskq tray --snapshot` over `docs/shots/fixture.sh`; `docs/shots/manifest.json` pins version, commit and hashes; CI marks shots stale when recorded UI source blob ids differ from HEAD. Present images individually at readable widths with complete framing; inspect the rendered page at desktop and narrow widths and retain before/after evidence for owner acceptance before publication.
 - Formatting: a few unicode icons where they help scanning; no emoji clutter, no badges.
 - Last README line: `If taskq saves you time, [buy me a coffee](…).`
 - Tone: minimum words, plain to anyone, no filler (R7).

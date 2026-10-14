@@ -24,3 +24,6 @@ Claude visual review:
   `macos-long-proposal-light-home-20.png`: the op under Send is 4 whole lines, `Confirm: apply 1 change` and the
   Projects header show below it at 16 and 20 px, and the exchange preview ends on a whole line.
 - The full text stays reachable by scrolling each block; the AI workspace that keeps it in full is deferred (#1115 Scope).
+- After a reader scrolls either block, it realigns on whole lines once the scroll settles (150 ms): Playwright Chromium
+  instrument `PLAYWRIGHT_CHANNEL=chrome node tests/tray-home-proposal.browser.cjs` checks middle, end and start positions
+  at 16 and 20 px, with the first and last lines reachable; it fails on `788a862`. Native WKWebView scroll is not probed.

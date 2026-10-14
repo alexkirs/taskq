@@ -54,6 +54,8 @@ if ! kill -0 "$TRAY" 2>/dev/null || grep -q sandbox_extension "$W/tray.log"; the
 fi
 log "tray $TRAY running, tray.log clean"
 echo "1. A macOS prompt asks whether TaskQ may send notifications. Click Allow."
+echo "0. Turn every Focus off (Control Center > Focus): a Focus mutes banners (#1051 run 17:39Z: 'muted by DND suppression')."
+ask "Is every Focus off now?"
 ask "Did the prompt appear and did you click Allow?"
 echo "   No prompt? System Settings > Notifications > TaskQ: turn Allow notifications on."
 open "x-apple.systempreferences:com.apple.Notifications-Settings.extension" || true
@@ -76,4 +78,5 @@ sleep 1
 TASKQ_INSTALL=$I "$APP/Contents/MacOS/taskq" tray --snapshot "$W/shots" >/dev/null 2>>"$W/tray.log" || log "snapshot failed"
 cp "$I/tray.json" "$W/tray.json" 2>/dev/null || true
 /usr/bin/log show --last 20m --style compact --predicate 'eventMessage CONTAINS "org.taskq.tray"' > "$W/unified.log" 2>&1 || true
+log "OS presented $(grep -c 'Presenting <NotificationRecord app:"org.taskq.tray"' "$W/unified.log" || true), muted by Focus $(grep -c 'org.taskq.tray) muted by DND' "$W/unified.log" || true)"
 log "done: $W (result.txt, shots/popover-*-notifications-16.png, tray.json, unified.log)"

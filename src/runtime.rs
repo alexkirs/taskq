@@ -149,6 +149,54 @@ pub fn last_message(log: &Path) -> Option<String> {
     final_text(&text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect::<Vec<_>>())
 }
 
+/// Worker text as one public line (§ 4 step 1, § 7 rule 6): whitespace collapsed, absolute paths made relative to
+/// `root` or replaced by `<path>`, at most `max` characters ending in `…`. The full text stays in the attempt log.
+pub fn public_line(text: &str, root: &Path, max: usize) -> String {
+    let root = slashed(&root.to_string_lossy());
+    let mut out = String::new();
+    let mut word = String::new();
+    for c in text.chars().chain([' ']) {
+        if !(c.is_whitespace() || "()[]<>\"'`".contains(c)) {
+            word.push(c);
+            continue;
+        }
+        if !word.is_empty() {
+            out += &public_word(&word, &root);
+            word.clear();
+        }
+        if !c.is_whitespace() { out.push(c) } else if !out.is_empty() && !out.ends_with(' ') { out.push(' ') }
+    }
+    let out = out.trim_end();
+    if out.chars().count() <= max { return out.into(); }
+    out.chars().take(max.saturating_sub(1)).collect::<String>().trim_end().to_string() + "…"
+}
+
+/// A path with `/` separators, without `file://`, `\\?\` or the `/` before a drive letter of a Markdown link.
+fn slashed(p: &str) -> String {
+    let p = p.replace('\\', "/");
+    let p = p.strip_prefix("file://").unwrap_or(&p);
+    let p = p.strip_prefix("//?/").unwrap_or(p);
+    let b = p.as_bytes();
+    let p = if b.len() > 2 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' { &p[1..] } else { p };
+    p.trim_end_matches('/').to_string()
+}
+
+fn public_word(word: &str, root: &str) -> String {
+    let core = word.trim_end_matches(['.', ',', ';', ':']);
+    let (w, tail) = (slashed(core), &word[core.len()..]);
+    if !root.is_empty() && w.get(..root.len()).is_some_and(|p| p.eq_ignore_ascii_case(root)) {
+        match &w[root.len()..] {
+            "" => return format!(".{tail}"),
+            rest if rest.starts_with('/') => return format!("{}{tail}", &rest[1..]),
+            _ => {}
+        }
+    }
+    let b = w.as_bytes();
+    let drive = b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/';
+    let abs = drive || w.starts_with("~/") || (w.starts_with('/') && w[1..].contains('/'));
+    if abs { format!("<path>{tail}") } else { word.into() }
+}
+
 /// A CLI child whose log shows its turn ended counts as exited even when its process lingers: Codex on Windows kept
 /// running after a rate-limited `taskq result` (#1034). The service then stops its tree (§ 4 step 1, R11).
 pub struct CliTurn {
@@ -775,6 +823,21 @@ pub fn agent_text(r: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: § 4 step 1 `gone` reason, #1034. Risk: a worker's last message publishes local paths or many lines.
+    #[test]
+    fn last_message_is_one_public_line_without_local_paths() {
+        for (root, text, want) in [
+            (r"C:\w\taskq", "See [service.rs](/C:/w/taskq/.worktrees/taskq-1/src/service.rs#L5).", "See [service.rs](.worktrees/taskq-1/src/service.rs#L5)."),
+            (r"C:\w\taskq", r"Log: c:\W\taskq\.taskq\T1-2.log and C:\Users\me\AppData\x.txt", "Log: .taskq/T1-2.log and <path>"),
+            ("/home/me/taskq", "`/home/me/taskq/src/a.rs`, file:///tmp/x/y, ~/.codex/auth.json\n\n  next line", "`src/a.rs`, <path>, <path> next line"),
+            ("/home/me/taskq", "Kept: https://github.com/o/r/pull/1 and/or /help, root /home/me/taskq.", "Kept: https://github.com/o/r/pull/1 and/or /help, root .."),
+        ] {
+            assert_eq!(public_line(text, Path::new(root), 240), want);
+        }
+        let long = public_line(&"word ".repeat(100), Path::new("/r"), 224);
+        assert_eq!((long.chars().count(), long.ends_with(" wor…")), (224, true));
+    }
 
     // Chain: incident runtime start. Risk: environment errors reported as taskq faults.
     #[test]

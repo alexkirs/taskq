@@ -540,10 +540,13 @@ impl<'a> Service<'a> {
         self.delivered.get(&attempt).copied().unwrap_or(0)
     }
 
-    /// The worker's last message in the attempt log as a `gone` reason line (§ 4 step 1); empty when unreadable.
+    /// The worker's last message in the attempt log as a public `gone` reason line of at most 240 characters
+    /// (§ 4 step 1); empty when unreadable or blank.
     fn last_message(&self, n: u64, a: u64, t: &Task) -> String {
+        const LABEL: &str = "Last message: ";
         let log = crate::runtime::attempt_log(&self.cfg.root, t.role.as_deref().unwrap_or_default(), n, a);
-        crate::runtime::last_message(&log).map_or_else(String::new, |m| format!("\nLast message: {}", m.trim()))
+        let line = crate::runtime::last_message(&log).map(|m| crate::runtime::public_line(&m, &self.cfg.root, 240 - LABEL.len()));
+        line.filter(|m| !m.is_empty()).map_or_else(String::new, |m| format!("\n{LABEL}{m}"))
     }
 
     fn post(&mut self, n: u64, body: String) -> Result<u64, String> {
@@ -1110,7 +1113,8 @@ mod tests {
         assert!(b.comment(n, &core::entry("result", &["d3e3479077ac2df8db8071b5bdf12cdacaf10ab4"], Some(a), "Changed: x")).is_err());
         let log = crate::runtime::attempt_log(&root, "worker", n, a);
         let mut f = std::fs::File::options().append(true).open(&log).unwrap();
-        writeln!(f, "{}", json!({"type": "item.completed", "item": {"type": "agent_message", "text": "Task handoff is incomplete: GitHub rate limits rejected `taskq result`."}})).unwrap();
+        let text = format!("Task handoff is incomplete: GitHub rate limits rejected `taskq result`.\n\nSee [log]({}/.taskq/x.log).", root.display());
+        writeln!(f, "{}", json!({"type": "item.completed", "item": {"type": "agent_message", "text": text}})).unwrap();
         writeln!(f, "{{\"type\":\"turn.completed\"}}").unwrap();
         if paused {
             // the service's own `gone` meets the same pause: the next pass still ends the attempt
@@ -1123,7 +1127,7 @@ mod tests {
         let gone = b.comments(n).unwrap().into_iter().rfind(|c| c.body.starts_with("taskq: gone")).unwrap().body;
         assert_eq!((t.state, t.attempt, t.retries), (State::Ready, None, 1), "paused={paused}");
         let reason = if paused { "no child on its host" } else { "exit -9" };
-        assert!(gone.ends_with(&format!("\n{reason}\nLast message: Task handoff is incomplete: GitHub rate limits rejected `taskq result`.")), "{gone}");
+        assert!(gone.ends_with(&format!("\n{reason}\nLast message: Task handoff is incomplete: GitHub rate limits rejected `taskq result`. See [log](.taskq/x.log).")), "{gone}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

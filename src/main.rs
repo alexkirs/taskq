@@ -1278,9 +1278,8 @@ pub struct NewTask {
     pub labels: Vec<String>,
 }
 
-/// § 1 task body: Goal, Acceptance, Scope, dependencies; limits checked before any write. An open issue carrying the
-/// op id is the first create: its receipt returns and nothing is written.
-fn add_task(b: &dyn Board, root: &Path, t: &NewTask, op: &Op) -> Res<Receipt> {
+/// Task body and create claim shared by direct adds and recipes; limits checked before any write.
+fn add_task(b: &dyn Board, root: &Path, raw: &Value, t: &NewTask, op: &Op) -> Res<Receipt> {
     if t.title.trim().is_empty() || t.title.contains(['\r', '\n']) || t.title.chars().count() > 80 {
         return Err("title: one line, at most 80 characters; shorten it".into());
     }
@@ -1328,7 +1327,7 @@ fn add_task(b: &dyn Board, root: &Path, t: &NewTask, op: &Op) -> Res<Receipt> {
     labels.extend(t.labels.iter().cloned());
     labels::validate(&labels)?;
     let n = if op.id.is_some() {
-        match claimed_create(b, &b.config().raw, &t.title, &body, &labels, t.later.as_deref().unwrap_or(""), op) {
+        match claimed_create(b, raw, &t.title, &body, &labels, t.later.as_deref().unwrap_or(""), op) {
             Ok(n) => n,
             Err(r) => return Ok(r),
         }
@@ -1350,7 +1349,7 @@ fn run_recipe(b: &dyn Board, root: &Path, raw: &Value, name: &str, run: &str, go
     let (mut out, mut made) = (vec![], vec![]);
     for (k, item) in items.into_iter().enumerate() {
         let new = NewTask { deps: item.deps.iter().map(|d| made[d - 1]).collect(), ..item.task };
-        let r = add_task(b, root, &new, &Op { id: Some(base(k)), revision: None })?;
+        let r = add_task(b, root, raw, &new, &Op { id: Some(base(k)), revision: None })?;
         let r = if r.ok() && item.gate { act(b, root, r.task, "gate", &[], "", &Op { id: Some(format!("{}.gate", base(k))), revision: None }) } else { r };
         let ok = r.ok();
         made.push(r.task);
@@ -1605,7 +1604,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                 later: a.flags.contains_key("later").then(|| text.to_string()),
                 labels: vec![],
             };
-            emit(&[add_task(b, root, &new, &op)?], json)
+            emit(&[add_task(b, root, &c.raw, &new, &op)?], json)
         }
         "start" => emit(&[start_task(b, root, a.num(1)?, &op)?], json),
         "approve" => emit(&[dispatch::approve(b, root, a.num(1)?, a.one("sha"), &op, dispatch::agent())], json),
@@ -1992,15 +1991,16 @@ mod tests {
     // a task starts before the whole recipe reads back, or a gated result publishes without approval of its SHA.
     #[test]
     fn a_recipe_holds_its_tasks_and_a_gate_blocks_close_until_the_owner_approves() {
-        let raw = json!({"recipes": {"feature": {"version": 2, "tasks": [
+        let raw = json!({"create_claim_issue": 1, "recipes": {"feature": {"version": 2, "tasks": [
             {"title": "Spec {goal}", "goal": "Decide {goal}", "acceptance": ["spec merged"], "gate": true},
             {"title": "Code {goal}", "goal": "Build {goal}", "acceptance": ["tests pass"], "deps": [1]}
         ]}}});
         let c = Ctx { cfg: cfg(), raw, board: Box::new(Fake::default()) };
         let b = c.board.as_ref();
         let run = |v: &[&str]| command(&c, v[0], &Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap());
+        b.create("create claims", "", &[]).unwrap();
         run(&["recipe", "feature", "--run", "r1", "--goal", "login"]).unwrap();
-        let issues = b.issues(None).unwrap();
+        let issues: Vec<_> = b.issues(None).unwrap().into_iter().filter(|i| service::is_held(i)).collect();
         assert_eq!(issues.len(), 2);
         let (spec, code) = (issues[0].number, issues[1].number);
         assert_eq!((issues[0].title.as_str(), issues[0].labels.clone()), ("Spec login", vec!["q-held".to_string(), "needs-gate".into()]));
@@ -2010,7 +2010,8 @@ mod tests {
         assert_eq!((t.state, t.gate), (State::Held, Some(core::Gate::Required)));
         // the rerun returns the first receipts, then starts both
         run(&["recipe", "feature", "--run", "r1", "--goal", "login", "--start"]).unwrap();
-        assert_eq!(b.issues(None).unwrap().len(), 2, "a rerun adds nothing");
+        assert_eq!(b.issues(None).unwrap().len(), 3, "a rerun adds nothing");
+        assert_eq!(b.comments(1).unwrap().len(), 2, "one immutable claim per recipe task");
         assert_eq!((current(b, spec).unwrap().1.state, current(b, code).unwrap().1.state), (State::Ready, State::Waiting));
         let sha = "0123456789abcdef0123456789abcdef01234567";
         b.comment(spec, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();

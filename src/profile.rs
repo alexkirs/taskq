@@ -417,14 +417,28 @@ mod tests {
         stage_at(Some(&path), "review", 7, 5, "claude", ms(4), "ok", "none", crate::runtime::usage(&attempt, 0, "claude"));
         stage_at(Some(&path), "review", 7, 6, "claude", None, "ok", "none", Usage::Unknown("adopted"));
         // a child stopped after its result or requeue keeps that outcome; a live child exiting without one failed;
-        // a stop without hand-in (owner requeue) is a cancellation
+        // a stop without hand-in (owner requeue) is a cancellation; a hand-in `fold` ignored (invalid SHA, a repeated
+        // op id, a result in `review`) is none
         let e = |id, body: &str| crate::core::Entry { id, body: body.into(), edited: false };
         let spawn = e(10, "taskq: spawn worker claude:s1 mac");
-        let hand = |kind: &str| vec![spawn.clone(), e(11, &format!("taskq: {kind} {}attempt 10
-Changed: x", if kind == "result" { "abc " } else { "" }))];
-        let (result, requeue, owner) = (hand("result"), hand("requeue"), vec![spawn.clone(), e(11, "taskq: requeue
+        let sha = "a".repeat(40);
+        let hand = |kind: &str, arg: &str| vec![spawn.clone(), e(11, &format!("taskq: {kind} {arg}attempt 10
+Changed: x"))];
+        let (result, requeue, owner) = (hand("result", &format!("{sha} ")), hand("requeue", ""), vec![spawn.clone(), e(11, "taskq: requeue
 Reason: owner")]);
-        for (log, live, want) in [(&result, false, ("ok", "none")), (&requeue, false, ("retried", "none")), (&owner, false, ("cancelled", "none")), (&owner, true, ("failed", "exit"))] {
+        let invalid = hand("result", "abc ");
+        let op = |id, body: &str| e(id, &format!("{body}
+op-id: x"));
+        let repeated = vec![spawn.clone(), op(11, "taskq: ask attempt 10
+Done: x"), e(12, "taskq: answer 1"), op(13, &format!("taskq: result {sha} attempt 10
+Changed: x"))];
+        let review = vec![e(9, "taskq: spawn worker claude:s0 mac"), e(10, &format!("taskq: result {sha} attempt 9
+Changed: x")),
+            e(11, "taskq: spawn reviewer codex:- win"), e(12, &format!("taskq: result {sha} attempt 11
+Changed: x"))];
+        assert_eq!(crate::core::stage_outcome(7, Some((review.as_slice(), true)), 11, 11, true), ("failed", "exit"));
+        for (log, live, want) in [(&result, false, ("ok", "none")), (&requeue, false, ("retried", "none")), (&owner, false, ("cancelled", "none")),
+            (&owner, true, ("failed", "exit")), (&invalid, true, ("failed", "exit")), (&repeated, true, ("ask", "none"))] {
             assert_eq!(crate::core::stage_outcome(7, Some((log.as_slice(), live)), 10, 10, false), want, "{:?}", log.last().map(|e| &e.body));
         }
         let log = fs::read_to_string(&path).unwrap();

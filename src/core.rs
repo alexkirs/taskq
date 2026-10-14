@@ -271,12 +271,16 @@ pub fn delivery(n: u64, entries: &[Entry], id: u64) -> String {
 
 /// Whether attempt `a` wrote `ask`, `result` or `requeue` after entry `after`: its child then exits clean (§ 4 step 1).
 pub fn handed_in(n: u64, entries: &[Entry], a: u64, after: u64) -> bool {
-    hand_in(n, entries, a, after).is_some()
+    entries.iter().filter(|e| e.id > after && !e.edited).filter_map(|e| parse(n, &e.body)).any(|l| l.attempt == Some(a) && matches!(l.kind, "ask" | "result" | "requeue"))
 }
 
-/// The kind of attempt `a`'s last `ask`, `result` or `requeue` after entry `after`.
-pub fn hand_in(n: u64, entries: &[Entry], a: u64, after: u64) -> Option<&'static str> {
-    entries.iter().filter(|e| e.id > after && !e.edited).filter_map(|e| parse(n, &e.body)).filter(|l| l.attempt == Some(a))
+/// The kind of attempt `a`'s last `ask`, `result` or `requeue` after entry `after` that `fold` accepted: invalid,
+/// duplicate and wrong-state entries change nothing and count as no hand-in.
+fn hand_in(n: u64, entries: &[Entry], a: u64, after: u64) -> Option<&'static str> {
+    let accepted = replay(n, entries, false).3;
+    let mut log: Vec<&Entry> = entries.iter().filter(|e| e.id > after && accepted.contains(&e.id)).collect();
+    log.sort_by_key(|e| e.id);
+    log.into_iter().filter_map(|e| parse(n, &e.body)).filter(|l| l.attempt == Some(a))
         .filter_map(|l| ["ask", "result", "requeue"].into_iter().find(|k| *k == l.kind)).last()
 }
 
@@ -335,12 +339,13 @@ pub fn owner_comments(n: u64, entries: &[Entry]) -> Vec<u64> {
     replay(n, entries, false).1
 }
 
-fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64) {
+/// The folded task, the ignored owner comments, the revision and the ids of the entries that changed the task.
+fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64, Vec<u64>) {
     let mut log: Vec<&Entry> = entries.iter().filter(|e| !e.edited).collect();
     log.sort_by_key(|e| e.id);
     let mut t = Task::default();
     let mut resume = None; // the state an `ask` entry left; None when a retry limit asked
-    let mut free = vec![];
+    let (mut free, mut accepted) = (vec![], vec![]);
     let (mut ops, mut card_at, mut last) = (std::collections::HashSet::new(), None, 0);
     for e in log {
         if let Some(l) = parse(n, &e.body) {
@@ -353,6 +358,7 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64) {
             step(&mut t, &mut resume, e.id, &l, last == 0);
             if t != before {
                 last = e.id;
+                accepted.push(e.id);
                 if t.card.is_some() && t.card != before.card {
                     card_at = Some(e.id);
                 }
@@ -369,7 +375,7 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64) {
         t.state = State::Waiting;
     }
     let rev = t.card.as_ref().and(card_at).or(t.attempt).unwrap_or(last);
-    (t, free, rev)
+    (t, free, rev, accepted)
 }
 
 fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool) {

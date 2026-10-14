@@ -99,7 +99,13 @@ impl Receipt {
 /// R4: append one entry that `fold` accepts, set the projected label, poke the local service. A seen op id returns
 /// the first receipt; a stale revision or a refused entry writes nothing and names the current state (§ 5).
 pub fn act(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &str, op: &Op) -> Receipt {
-    act_child(b, root, n, kind, args, text, op, (std::env::var("TASKQ_TASK").ok(), std::env::var("TASKQ_ATTEMPT").ok()))
+    act_child(b, root, n, kind, args, text, op, child_env())
+}
+
+/// The child environment; tests see none, so a worker's own `TASKQ_TASK` cannot change their outcome.
+fn child_env() -> ChildEnv {
+    if cfg!(test) { return (None, None); }
+    (std::env::var("TASKQ_TASK").ok(), std::env::var("TASKQ_ATTEMPT").ok())
 }
 
 /// [`act`] for a process whose child environment is `env`.

@@ -540,6 +540,15 @@ impl<'a> Service<'a> {
         self.delivered.get(&attempt).copied().unwrap_or(0)
     }
 
+    /// The worker's last message in the attempt log as a public `gone` reason line of at most 240 characters
+    /// (§ 4 step 1); empty when unreadable or blank.
+    fn last_message(&self, n: u64, a: u64, t: &Task) -> String {
+        const LABEL: &str = "Last message: ";
+        let log = crate::runtime::attempt_log(&self.cfg.root, t.role.as_deref().unwrap_or_default(), n, a);
+        let line = crate::runtime::last_message(&log).map(|m| crate::runtime::public_line(&m, &self.cfg.root, 240 - LABEL.len()));
+        line.filter(|m| !m.is_empty()).map_or_else(String::new, |m| format!("\n{LABEL}{m}"))
+    }
+
     fn post(&mut self, n: u64, body: String) -> Result<u64, String> {
         self.log.push(format!("#{n} {}", body.lines().next().unwrap_or_default()));
         self.cache.remove(&n);
@@ -610,7 +619,8 @@ impl<'a> Service<'a> {
                 && matches!(v.task.state, State::Doing | State::Review)
                 && !core::handed_in(n, &v.log, a, a.max(self.delivered(a)))
             {
-                self.post(n, core::entry("gone", &[], Some(a), &format!("exit {code}")))?;
+                let text = format!("exit {code}{}", self.last_message(n, a, &v.task));
+                self.post(n, core::entry("gone", &[], Some(a), &text))?;
                 touched.insert(n);
             }
         }
@@ -729,7 +739,8 @@ impl<'a> Service<'a> {
             let seen = self.delivered.get(&a).copied().unwrap_or(0);
             let new: Vec<&Comment> = v.comments.iter().filter(|c| t.inbox.contains(&c.id) && c.id > seen).collect();
             let Some(last) = new.last().map(|c| c.id) else {
-                self.post(n, core::entry("gone", &[], Some(a), "no child on its host"))?;
+                let text = format!("no child on its host{}", self.last_message(n, a, t));
+                self.post(n, core::entry("gone", &[], Some(a), &text))?;
                 touched.insert(n);
                 continue;
             };
@@ -1063,6 +1074,61 @@ mod tests {
         b.advance(301);
         other.pass().unwrap();
         assert_eq!(task(&b, n).attempt, None, "an accepted inbox entry does not protect a stale host");
+    }
+
+    // Chain: § 4 step 1 turn end, A1/A2 of #1034. Risk: a worker whose `taskq result` was rate-limited finishes its
+    // turn, its process lingers, and the task shows `doing` for hours; or the `gone` hides the worker's last message.
+    #[test]
+    fn finished_turn_without_result_is_gone_with_last_message() {
+        for paused in [false, true] {
+            turn_end(paused);
+        }
+    }
+
+    fn turn_end(paused: bool) {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("taskq-turn-end-{paused}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let b = Fake::default();
+        let n = b.create("T", "", &[TASK_LABEL.into()]).unwrap();
+        let c = Config { root: root.clone(), ..cfg("win") };
+        let flags: Exits = Default::default();
+        let (seen, r) = (flags.clone(), root.clone());
+        let mut s = Service::new(&b, &c, "4.0.0", Box::new(move |l: &Launch| {
+            let flag = Rc::new(RefCell::new(None));
+            seen.borrow_mut().push((l.task, flag.clone()));
+            let log = crate::runtime::log_path(&r, l);
+            std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+            std::fs::write(&log, "{\"type\":\"thread.started\",\"thread_id\":\"t\"}\n").unwrap();
+            Ok(Box::new(crate::runtime::CliTurn { proc: Box::new(FakeProc(flag)), log, pos: 0 }) as Box<dyn Proc>)
+        }));
+        s.focus = vec!["all".into()];
+        s.pass().unwrap();
+        let a = task(&b, n).attempt.unwrap();
+        s.pass().unwrap();
+        assert_eq!(task(&b, n).attempt, Some(a), "a running turn stays doing");
+
+        // the worker's result is rejected by the board rate limit, then its turn ends and its process lingers
+        b.state.borrow_mut().fail_comments = 1;
+        assert!(b.comment(n, &core::entry("result", &["d3e3479077ac2df8db8071b5bdf12cdacaf10ab4"], Some(a), "Changed: x")).is_err());
+        let log = crate::runtime::attempt_log(&root, "worker", n, a);
+        let mut f = std::fs::File::options().append(true).open(&log).unwrap();
+        let text = format!("Task handoff is incomplete: GitHub rate limits rejected `taskq result`.\n\nSee [log]({}/.taskq/x.log).", root.display());
+        writeln!(f, "{}", json!({"type": "item.completed", "item": {"type": "agent_message", "text": text}})).unwrap();
+        writeln!(f, "{{\"type\":\"turn.completed\"}}").unwrap();
+        if paused {
+            // the service's own `gone` meets the same pause: the next pass still ends the attempt
+            b.state.borrow_mut().fail_comments = 1;
+            assert!(s.pass().is_err());
+        }
+        s.pass().unwrap();
+        assert_eq!(*flags.borrow()[0].1.borrow(), Some(-9), "the lingering process tree is stopped");
+        let t = task(&b, n);
+        let gone = b.comments(n).unwrap().into_iter().rfind(|c| c.body.starts_with("taskq: gone")).unwrap().body;
+        assert_eq!((t.state, t.attempt, t.retries), (State::Ready, None, 1), "paused={paused}");
+        let reason = if paused { "no child on its host" } else { "exit -9" };
+        assert!(gone.ends_with(&format!("\n{reason}\nLast message: Task handoff is incomplete: GitHub rate limits rejected `taskq result`. See [log](.taskq/x.log).")), "{gone}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // Chain: incident worker start. Risk: missing runtime or login reported as a fault.

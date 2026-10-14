@@ -126,8 +126,109 @@ pub fn new_session(rt: &str) -> String {
 }
 
 pub fn log_path(root: &Path, l: &Launch) -> PathBuf {
-    let p = if l.role == "reviewer" { 'R' } else { 'T' };
-    root.join(".taskq").join(format!("{p}{}-{}.log", l.task, l.attempt))
+    attempt_log(root, &l.role, l.task, l.attempt)
+}
+
+pub fn attempt_log(root: &Path, role: &str, task: u64, attempt: u64) -> PathBuf {
+    let p = if role == "reviewer" { 'R' } else { 'T' };
+    root.join(".taskq").join(format!("{p}{task}-{attempt}.log"))
+}
+
+/// The final text of a turn: Claude's last `result`, else Codex's last `agent_message`.
+pub fn final_text(events: &[serde_json::Value]) -> Option<String> {
+    events.iter().rev().find_map(|v| {
+        if v["type"] == "result" { v["result"].as_str().map(String::from) }
+        else if v["type"] == "item.completed" && v["item"]["type"] == "agent_message" { v["item"]["text"].as_str().map(String::from) }
+        else { None }
+    })
+}
+
+/// The worker's last message in an attempt log, for the `gone` reason (§ 4 step 1); None when unreadable.
+pub fn last_message(log: &Path) -> Option<String> {
+    let text = String::from_utf8_lossy(&std::fs::read(log).ok()?).into_owned();
+    final_text(&text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect::<Vec<_>>())
+}
+
+/// Worker text as one public line (§ 4 step 1, § 7 rule 6): whitespace collapsed, absolute paths made relative to
+/// `root` or replaced by `<path>`, at most `max` characters ending in `…`. The full text stays in the attempt log.
+pub fn public_line(text: &str, root: &Path, max: usize) -> String {
+    let root = slashed(&root.to_string_lossy());
+    let mut out = String::new();
+    let mut word = String::new();
+    for c in text.chars().chain([' ']) {
+        if !(c.is_whitespace() || "()[]<>\"'`".contains(c)) {
+            word.push(c);
+            continue;
+        }
+        if !word.is_empty() {
+            out += &public_word(&word, &root);
+            word.clear();
+        }
+        if !c.is_whitespace() { out.push(c) } else if !out.is_empty() && !out.ends_with(' ') { out.push(' ') }
+    }
+    let out = out.trim_end();
+    if out.chars().count() <= max { return out.into(); }
+    out.chars().take(max.saturating_sub(1)).collect::<String>().trim_end().to_string() + "…"
+}
+
+/// A path with `/` separators, without `file://`, `\\?\` or the `/` before a drive letter of a Markdown link.
+fn slashed(p: &str) -> String {
+    let p = p.replace('\\', "/");
+    let p = p.strip_prefix("file://").unwrap_or(&p);
+    let p = p.strip_prefix("//?/").unwrap_or(p);
+    let b = p.as_bytes();
+    let p = if b.len() > 2 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' { &p[1..] } else { p };
+    p.trim_end_matches('/').to_string()
+}
+
+fn public_word(word: &str, root: &str) -> String {
+    let core = word.trim_end_matches(['.', ',', ';', ':']);
+    let (w, tail) = (slashed(core), &word[core.len()..]);
+    if !root.is_empty() && w.get(..root.len()).is_some_and(|p| p.eq_ignore_ascii_case(root)) {
+        match &w[root.len()..] {
+            "" => return format!(".{tail}"),
+            rest if rest.starts_with('/') => return format!("{}{tail}", &rest[1..]),
+            _ => {}
+        }
+    }
+    let b = w.as_bytes();
+    let drive = b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/';
+    let abs = drive || w.starts_with("~/") || (w.starts_with('/') && w[1..].contains('/'));
+    if abs { format!("<path>{tail}") } else { word.into() }
+}
+
+/// A CLI child whose log shows its turn ended counts as exited even when its process lingers: Codex on Windows kept
+/// running after a rate-limited `taskq result` (#1034). The service then stops its tree (§ 4 step 1, R11).
+pub struct CliTurn {
+    pub proc: Box<dyn Proc>,
+    pub log: PathBuf,
+    /// Log bytes already read: a resume appends to the log of earlier turns.
+    pub pos: u64,
+}
+
+impl CliTurn {
+    fn ended(&mut self) -> bool {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut rest = vec![];
+        let Ok(mut f) = File::open(&self.log) else { return false };
+        if f.seek(SeekFrom::Start(self.pos)).and_then(|_| f.read_to_end(&mut rest)).is_err() { return false; }
+        let Some(end) = rest.iter().rposition(|b| *b == b'\n') else { return false };
+        self.pos += end as u64 + 1;
+        String::from_utf8_lossy(&rest[..end]).lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| matches!(v["type"].as_str(), Some("turn.completed" | "turn.failed" | "result")))
+    }
+}
+
+impl Proc for CliTurn {
+    fn exited(&mut self) -> Result<Option<i32>, String> {
+        if let Some(code) = self.proc.exited()? { return Ok(Some(code)); }
+        if !self.ended() { return Ok(None); }
+        log!("{}: turn ended; stopping its lingering process", self.log.display());
+        self.proc.kill();
+        Ok(Some(self.proc.exited()?.unwrap_or(-1)))
+    }
+    fn kill(&mut self) { self.proc.kill() }
+    fn id(&self) -> u32 { self.proc.id() }
 }
 
 /// Codex's thread id: the first `thread.started` line of the attempt log.
@@ -370,7 +471,9 @@ fn spawn_inner(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     if l.rt == "claude" && (l.resume.is_none() || claude_background(env.root, &l.session).map_err(|message| StartError { message, reportable: false })?) {
         return ClaudeTurn::start(env, l, &log, &text, &access).map(|p| Box::new(p) as Box<dyn Proc>).map_err(|message| StartError { message, reportable: false });
     }
-    Ok(Box::new(start(env, l, &log, &text, &access)?))
+    let pos = std::fs::metadata(&log).map_or(0, |m| m.len());
+    let child = start(env, l, &log, &text, &access)?;
+    Ok(Box::new(CliTurn { proc: Box::new(child), log, pos }))
 }
 
 fn start(env: &Env, l: &Launch, log: &Path, text: &str, access: &crate::policy::Effective) -> Result<Child, StartError> {
@@ -720,6 +823,21 @@ pub fn agent_text(r: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: § 4 step 1 `gone` reason, #1034. Risk: a worker's last message publishes local paths or many lines.
+    #[test]
+    fn last_message_is_one_public_line_without_local_paths() {
+        for (root, text, want) in [
+            (r"C:\w\taskq", "See [service.rs](/C:/w/taskq/.worktrees/taskq-1/src/service.rs#L5).", "See [service.rs](.worktrees/taskq-1/src/service.rs#L5)."),
+            (r"C:\w\taskq", r"Log: c:\W\taskq\.taskq\T1-2.log and C:\Users\me\AppData\x.txt", "Log: .taskq/T1-2.log and <path>"),
+            ("/home/me/taskq", "`/home/me/taskq/src/a.rs`, file:///tmp/x/y, ~/.codex/auth.json\n\n  next line", "`src/a.rs`, <path>, <path> next line"),
+            ("/home/me/taskq", "Kept: https://github.com/o/r/pull/1 and/or /help, root /home/me/taskq.", "Kept: https://github.com/o/r/pull/1 and/or /help, root .."),
+        ] {
+            assert_eq!(public_line(text, Path::new(root), 240), want);
+        }
+        let long = public_line(&"word ".repeat(100), Path::new("/r"), 224);
+        assert_eq!((long.chars().count(), long.ends_with(" wor…")), (224, true));
+    }
 
     // Chain: incident runtime start. Risk: environment errors reported as taskq faults.
     #[test]

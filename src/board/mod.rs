@@ -458,6 +458,8 @@ pub struct FakeState {
     pub hide_latest_comment: bool,
     pub fail_issue_read: Option<(u64, usize)>,
     pub fail_labels: bool,
+    /// The next this many `comment` calls fail like a board rate-limit pause.
+    pub fail_comments: usize,
     /// A concurrent writer: this body lands just before the next `comment`.
     pub race: Option<String>,
 }
@@ -517,6 +519,10 @@ impl Board for Fake {
     }
     fn comment(&self, n: u64, body: &str) -> Result<u64> {
         self.state.borrow_mut().get(n)?;
+        if self.state.borrow().fail_comments > 0 {
+            self.state.borrow_mut().fail_comments -= 1;
+            return Err("rate limit: board requests paused".into());
+        }
         let race = self.state.borrow_mut().race.take();
         if let Some(other) = race {
             self.raw(n, &other, true, false);

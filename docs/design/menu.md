@@ -85,7 +85,7 @@ Deferred follow-up contracts (not acceptance claims for this slice):
 - AI backend/workspace: C-A1–C-A10, including two independent conversations, immutable attachments, durable drafts/history, native window ownership, revision-bound apply and acknowledged cancellation. Qualify persistence and cancellation before enabling their controls.
 - Selective recovery: E-A1–E-A9, including durable hold, owned-process identity, unknown-liveness refusal and selected fenced restart with readback. Keep ordinary pause distinct.
 
-F5 for this slice covers the native navigation/settings ledger and preserved existing actions. Full AI/recovery rows remain Not tested; no disabled placeholders count as their completion.
+F5 for this slice covers the native navigation/settings ledger and preserved existing actions ([evidence](evidence/ws11/README.md)). Full AI/recovery rows remain Not tested; no disabled placeholders count as their completion.
 
 
 - Installed/source inventory: [current-menu-audit.md](current-menu-audit.md). Historical phase numbers are not evidence that features are absent.

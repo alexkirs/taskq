@@ -62,7 +62,7 @@ Prior live records: [#961](https://github.com/taskqorg/taskq/issues/961), [#965]
 
 ## Current limitations
 
-Host permission authority and same-user isolation in [worker permissions](design/worker-permissions.md) remain a separate proposed architecture. No prompt, project configuration or 0600 file is claimed as an immutable host ceiling. No new grant broker, background monitor or duplicate test framework is introduced by this matrix.
+The shipped access presets in taskq.md § 8 supersede the earlier permission proposal: macOS enforces a TaskQ Seatbelt profile, while Windows/Linux currently require an explicit Full grant; missing grants or unknown restricted enforcement refuse launch. Full has no OS containment. Earlier passes below qualify their recorded candidate and permission configuration, not a later policy revision. No prompt, project configuration or 0600 file is claimed as an immutable host ceiling. No new grant broker, background monitor or duplicate test framework is introduced by this matrix.
 
 ## Operator qualification command
 
@@ -73,7 +73,7 @@ TASKQ_QUALIFY_RUNTIME=claude TASKQ_INCIDENT_REPORTS=off cargo test --locked live
 TASKQ_QUALIFY_RUNTIME=codex TASKQ_INCIDENT_REPORTS=off cargo test --locked live_operator_matrix -- --ignored --nocapture
 ```
 
-The chain keeps its fixture and native logs in `.taskq/qualification/`; no global settings, existing jobs, board writes or commits change. With the explicit qualification grant, the Claude fixture uses Bash/PowerShell on Windows and Bash/Write on macOS in its own `.claude/settings.local.json`; this grants no OS containment. It checks random file contents independently, verifies the session ID on continuation, then disables only its fixture runtime and requires failure before launch. It does not prove every permission boundary or MCP tool. Normal `cargo test --locked` skips these paid calls.
+Provision any required TaskQ grant explicitly in the disposable `fixture-install/worker-policy.json` first; the test never grants Full itself. The chain keeps its fixture and native logs in `.taskq/qualification/`; no global settings, existing jobs, board writes or commits change. With the explicit qualification grant, the Claude fixture uses Bash/PowerShell on Windows and Bash/Write on macOS in its own `.claude/settings.local.json`; this grants no OS containment. It checks random file contents independently, verifies the session ID on continuation, then disables only its fixture runtime and requires failure before launch. It does not prove every permission boundary or MCP tool. Normal `cargo test --locked` skips these paid calls.
 
 Claude worker/reviewer #969 includes a rejected first result (missing reproducible fixture), a repaired worker result, independent reviewer execution and resumed reviewer input. Controller compared all four pinned bodies against actual worker/reviewer start and continuation messages. The rejection is evidence that review applied the rules; closing the issue alone is not that evidence.
 
@@ -116,6 +116,10 @@ One live chain, three real hosts; normal CI still skips paid agent runs. Tempora
 The controller compared all four pinned specq bodies against **each actual start and resume input** of both roles on all three qualified paths. macOS #1001 sessions: worker `76302b27-299f-4cf0-bca6-d7aa50e4f979`, reviewer `6f7f59bd-4911-4c7f-91d9-02bbda9fe0ee`; Windows #996: `11e69922-c85c-4eca-8053-f76e5a99d7c7` / `794b2388-0365-4f3b-a41a-8a640965c9c6`; Linux #997: `01a1388f-3272-7553-abea-522725664624` / `01a13890-283d-7b23-a79b-f2be73165e84`. The probes intentionally fail before and pass after; agents must report that distinction without changing the supplied fixture. Research closure qualifies this scenario, not CI or publication of new code.
 
 Native edge cases found and fixed: `--bg` owns the UUID; passing options on resume can copy the session; stop acknowledgement precedes actual process exit; startup can lack a PID; Windows restore briefly reports a temporary UUID until native status appears. TaskQ preserves the background ID, waits for restored identity, reads actual turn completion, waits for owned process exit, and never accepts a copied continuation. It streams the matching native transcript into the existing attempt log. Changed saved permission mode refuses continuation instead of silently replacing the session.
+
+### Integration with access presets
+
+Candidate `5297419` includes main through `c6d46bd` (access presets). Native Claude start and resume use the same effective permission mode and Seatbelt wrapper as the other adapters. A changed saved native permission mode refuses continuation. macOS operator passed again under the default TaskQ Seatbelt wrapper with native dontAsk and the approved fixture Bash/Write grant: session `d321a639-71a2-4e19-aca8-3758a3398354`, actual edit/check and same-ID continuation. Model suite: 139 + 5 passed; selftest: 65 traces, formats and live board read passed. Windows/Linux repeat uses an explicitly owner-approved Full grant only in each isolated fixture installation; it does not qualify restricted enforcement or change working installations. The earlier worker/reviewer and cancellation evidence above predates these access presets.
 
 ### Remaining adoption limits
 

@@ -1,14 +1,14 @@
 {
   "version": "4.0.0-dev",
-  "sourceCommit": "7883b3fce50a8bd33c37380e8cb8ce5da2c80a9a",
-  "binarySha256": "f4685b74ebee7439c9b4e9fdfd8dd85f69aed4dd11c673532b46c2496c75eca8",
+  "sourceCommit": "5297419f57be85fcb0c4a5a47d902ee0d1e089af",
+  "binarySha256": "c8437020483173a045fc86ba46490110b08fed90cf508c6f9e81280473a28d4a",
   "environment": {
     "os": "macOS 27.0.1",
     "arch": "arm64",
     "renderer": "WKWebView snapshot"
   },
   "uiSources": {
-    "src/tray.rs": "bdd504248a1461d3b10a3c004f74b9cadf0d4388",
+    "src/tray.rs": "ffa9744a0bb3eb18fa4066947e631d5123782fc4",
     "src/tray.html": "3ad69bf4d926d26ae353b89f510be1e45d020bd6",
     "src/icon.rs": "27c0a5f64a7af334e2eb8c81e3e6626e356cc555",
     "docs/design/icon-summary.config.json": "9365699c943d0ac4506eab8fc5f7a84d8cbe8582"

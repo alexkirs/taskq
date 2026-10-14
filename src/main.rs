@@ -389,6 +389,21 @@ fn result_text(n: u64, text: &str, checks: &[String], opts: &[String], recommend
     Ok(join(&[&verdict.join("\n"), &card]))
 }
 
+/// § 7 rule 4 shots gate: a result whose diff from `origin/main` changes a `uiSources` file of `docs/shots/manifest.json`
+/// needs the manifest to record that file's blob at the SHA. Projects without the manifest pass.
+fn shots_gate(root: &Path, sha: &str) -> Res<()> {
+    let git = |args: &[&str]| {
+        let o = std::process::Command::new("git").arg("-C").arg(root).args(args).output().map_err(|e| e.to_string())?;
+        if o.status.success() { Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { Err(String::from_utf8_lossy(&o.stderr).trim().to_string()) }
+    };
+    let Ok(text) = git(&["show", &format!("{sha}:docs/shots/manifest.json")]) else { return Ok(()) };
+    let unknown = |e: String| format!("shots check unknown: {e}");
+    let m: Value = serde_json::from_str(&text).map_err(|e| unknown(format!("docs/shots/manifest.json: {e}")))?;
+    let changed = git(&["diff", "--name-only", &format!("origin/main...{sha}")]).map_err(unknown)?;
+    let stale: Vec<&str> = changed.lines().filter(|f| m["uiSources"].get(*f).is_some_and(|b| git(&["rev-parse", &format!("{sha}:{f}")]).ok().as_deref() != b.as_str())).collect();
+    if stale.is_empty() { Ok(()) } else { Err(format!("stale README shots: {} changed without a manifest update; run docs/shots/update.sh and commit docs/shots/", stale.join(", "))) }
+}
+
 /// § 7 close verdict: Changed, Checks naming every Acceptance item `A<k> ok|gap|unknown` and CI, Open.
 fn close_verdict(text: &str, body: &str) -> Res<()> {
     let lines: Vec<String> = text.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect();
@@ -1964,6 +1979,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             let n = a.num(1)?;
             let sha = a.need("sha")?;
             let body = result_text(n, text, &a.all("checks"), &a.all("option"), a.one("recommend"), &a.all("link"))?;
+            shots_gate(root, sha)?;
             emit(&[act(b, root, n, "result", &[sha], &body, &op)], json)
         }
         "requeue" => {
@@ -2736,6 +2752,45 @@ mod tests {
             assert_eq!(c.board.comments(n).unwrap().len(), before.len());
             assert_eq!(fold(n, &entries(c.board.as_ref(), n).unwrap(), false).state, State::Review);
         }
+    }
+
+    // Chain: § 7 rule 4 shots gate (#1127). Risk: a result with stale README shots reaches review.
+    #[test]
+    fn result_refuses_stale_shots() {
+        let root = std::env::temp_dir().join(format!("taskq-shots-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("docs/shots")).unwrap();
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git").arg("-C").arg(&root).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).output().unwrap();
+            assert!(o.status.success(), "{args:?}");
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let commit = |tray: &str, fresh: bool| {
+            fs::write(root.join("src/tray.rs"), tray).unwrap();
+            git(&["add", "-A"]);
+            let blob = if fresh { git(&["hash-object", "src/tray.rs"]) } else { "0".repeat(40) };
+            let old: Value = fs::read_to_string(root.join("docs/shots/manifest.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+            let blob = if fresh || old.is_null() { blob } else { old["uiSources"]["src/tray.rs"].as_str().unwrap().to_string() };
+            fs::write(root.join("docs/shots/manifest.json"), json!({"uiSources": {"src/tray.rs": blob}}).to_string()).unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-qm", tray]);
+            git(&["rev-parse", "HEAD"])
+        };
+        git(&["init", "-q"]);
+        let base = commit("v1", true);
+        git(&["update-ref", "refs/remotes/origin/main", &base]);
+        assert!(shots_gate(&root, &base).is_ok(), "an unchanged diff passes");
+        let stale = commit("v2", false);
+        let e = shots_gate(&root, &stale).unwrap_err();
+        assert!(e.contains("src/tray.rs") && e.contains("docs/shots/update.sh"), "{e}");
+        let fresh = commit("v3", true);
+        assert!(shots_gate(&root, &fresh).is_ok(), "a fresh manifest passes");
+        fs::remove_file(root.join("docs/shots/manifest.json")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "no shots"]);
+        assert!(shots_gate(&root, &git(&["rev-parse", "HEAD"])).is_ok(), "a project without the manifest passes");
+        let _ = fs::remove_dir_all(&root);
     }
 
     // Chain: § 7 Result and close templates. Risk: result or close text breaks the template.

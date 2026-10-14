@@ -12,6 +12,7 @@ const PREFIX: &str = "taskq-profile ";
 const ERRORS: [&str; 8] = ["none", "http4xx", "http5xx", "timeout", "permission", "invalid", "other", "panic"];
 static LOG: OnceLock<PathBuf> = OnceLock::new();
 static TRACE: OnceLock<bool> = OnceLock::new();
+static RUN: OnceLock<Option<u64>> = OnceLock::new();
 static SPAN: AtomicU64 = AtomicU64::new(1);
 thread_local!(static PARENT: Cell<u64> = const { Cell::new(0) });
 
@@ -28,7 +29,7 @@ struct Record {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Trace { span: u64, parent: u64 }
+struct Trace { run: Option<u64>, process: u32, span: u64, parent: u64 }
 
 pub fn init(install: &Path) {
     let _ = LOG.set(install.join("taskq.log"));
@@ -54,7 +55,9 @@ impl Drop for Observation<'_> {
         if let Some(t) = &self.record.trace { PARENT.set(t.parent); }
         self.record.us = self.began.elapsed().as_micros().min(u64::MAX as u128) as u64;
         if let Some(path) = self.path {
-            if append(path, &self.record).is_err() { eprintln!("Profiling: unknown (taskq.log append/prune failed)"); }
+            if append(path, &self.record).is_err() {
+                let _ = writeln!(std::io::stderr().lock(), "Profiling: unknown (taskq.log full or append failed; service pruning required)");
+            }
         }
     }
 }
@@ -62,7 +65,8 @@ impl Drop for Observation<'_> {
 fn measure_at<T, E: std::fmt::Display>(path: Option<&Path>, detailed: bool, op: &'static str, f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     let trace = detailed.then(|| {
         let span = SPAN.fetch_add(1, Ordering::Relaxed);
-        Trace { span, parent: PARENT.replace(span) }
+        Trace { run: *RUN.get_or_init(|| SystemTime::now().duration_since(UNIX_EPOCH).ok().and_then(|d| d.as_nanos().try_into().ok())),
+            process: std::process::id(), span, parent: PARENT.replace(span) }
     });
     let mut observation = Observation { path, began: Instant::now(), record: Record { op: op.into(), us: 0, error: "panic".into(),
         at_ms: SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis().min(u64::MAX as u128) as u64), trace } };
@@ -71,12 +75,17 @@ fn measure_at<T, E: std::fmt::Display>(path: Option<&Path>, detailed: bool, op: 
     result
 }
 
+pub fn log_lock(path: &Path) -> std::io::Result<fs::File> {
+    let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path.parent().unwrap().join("taskq-profile.lock"))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
 fn append(path: &Path, r: &Record) -> std::io::Result<()> {
     fs::create_dir_all(path.parent().unwrap())?;
-    // Use the same line-preserving pruner as service/launcher logs, with room for the next bounded record.
-    if fs::metadata(path).is_ok_and(|m| m.len() > crate::data::LOG_MAX - 512)
-        && !crate::data::trim_tail(path, crate::data::LOG_MAX - 512) {
-        return Err(std::io::Error::other("prune failed"));
+    let _lock = log_lock(path)?;
+    if fs::metadata(path).is_ok_and(|m| m.len() > crate::data::LOG_MAX - 512) {
+        return Err(std::io::Error::other("log full"));
     }
     let line = format!("{PREFIX}{}\n", serde_json::to_string(r)?);
     OpenOptions::new().create(true).append(true).open(path)?.write_all(line.as_bytes())
@@ -141,7 +150,7 @@ pub fn report(install: &Path) -> String {
         };
         let mut text = String::new();
         file.take(crate::data::LOG_MAX + 1).read_to_string(&mut text).map_err(|_| "taskq.log unreadable or invalid UTF-8")?;
-        if text.len() as u64 > crate::data::LOG_MAX { return Err("taskq.log exceeds retention bound".into()); }
+        if text.len() as u64 > crate::data::LOG_MAX - 512 { return Err("taskq.log at retention bound; collection stopped until service pruning".into()); }
         render(&text).map_err(String::from)
     };
     read().unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n"))
@@ -183,6 +192,7 @@ mod tests {
         assert!(std::panic::catch_unwind(|| measure_at(Some(&path), true, "spawn", || -> Result<(), String> { panic!("private panic") })).is_err());
         assert!(report(&dir).contains("panic:1"));
         assert_eq!(PARENT.get(), 0);
+        assert_eq!(measure_at(Some(&path.join("unwritable")), false, "spawn", || Ok::<_, String>(7)).unwrap(), 7);
         for corrupt in ["{", "{\"op\":\"spawn\",\"us\":2,\"error\":\"secret\"}"] {
             let bad = format!("{PREFIX}{corrupt}\n");
             fs::write(&path, &bad).unwrap();
@@ -190,9 +200,18 @@ mod tests {
             assert_eq!(fs::read_to_string(&path).unwrap(), bad);
         }
         fs::write(&path, "normal log\n".repeat(crate::data::LOG_MAX as usize / 11 + 1)).unwrap();
-        append(&path, &Record { op: "spawn".into(), us: 1, error: "none".into(), at_ms: Some(1), trace: Some(Trace { span: 2, parent: 1 }) }).unwrap();
+        assert!(report(&dir).contains("collection stopped"));
+        assert!(crate::data::trim_tail(&path, crate::data::LOG_MAX));
+        append(&path, &Record { op: "spawn".into(), us: 1, error: "none".into(), at_ms: Some(1), trace: None }).unwrap();
         assert!(fs::metadata(&path).unwrap().len() <= crate::data::LOG_MAX);
         assert!(report(&dir).contains("| spawn | 1 |"));
+        std::thread::scope(|scope| {
+            for _ in 0..4 { scope.spawn(|| {
+                for _ in 0..50 { append(&path, &Record { op: "spawn".into(), us: 1, error: "none".into(), at_ms: Some(1), trace: None }).unwrap(); }
+            }); }
+            scope.spawn(|| { for _ in 0..50 { crate::data::trim_tail(&path, crate::data::LOG_MAX); } });
+        });
+        assert!(report(&dir).contains("| spawn | 201 |"));
         fs::remove_dir_all(dir).unwrap();
     }
 }

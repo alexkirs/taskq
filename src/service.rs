@@ -878,10 +878,13 @@ impl<'a> Service<'a> {
 
     /// Post `spawn`, re-read, start the child only if `fold` accepted this spawn (§ 3 claim).
     fn claim(&mut self, v: &View, role: &str, rt: &str) -> Result<(), String> {
-        crate::profile::measure("dispatch", || self.claim_inner(v, role, rt))
+        match crate::profile::measure("dispatch", || self.claim_inner(v, role, rt))? {
+            Some(l) => self.launch(l),
+            None => Ok(()),
+        }
     }
 
-    fn claim_inner(&mut self, v: &View, role: &str, rt: &str) -> Result<(), String> {
+    fn claim_inner(&mut self, v: &View, role: &str, rt: &str) -> Result<Option<Launch>, String> {
         let n = v.issue.number;
         let session = crate::runtime::new_session(rt);
         let id = self.post(n, core::entry("spawn", &[role, &format!("{rt}:{session}"), &self.cfg.me], None, ""))?;
@@ -894,16 +897,17 @@ impl<'a> Service<'a> {
         if t.attempt != Some(id) {
             self.reserved.retain(|r| r.0 != n); // released
             self.log.push(format!("#{n} spawn {id} lost the claim"));
-            return Ok(());
+            return Ok(None);
         }
         let l = Launch { task: n, title: v.issue.title.clone(), attempt: id, role: role.into(), rt: rt.into(), session, url: self.board.url(n), resume: None };
         self.delivered.insert(id, t.inbox.last().copied().unwrap_or(0));
         if !self.may_launch() {
             self.pending.insert((n, id));
             self.held.push(l);
-            return self.beat();
+            self.beat()?;
+            return Ok(None);
         }
-        self.launch(l)
+        Ok(Some(l))
     }
 
     /// Write the heartbeat now: the lease of a new child or held launch is listed before the next pass judges it.

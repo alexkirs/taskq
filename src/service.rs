@@ -211,6 +211,8 @@ pub struct Service<'a> {
     pub kids: Vec<Kid>,
     /// `service <id>` in the heartbeat (§ 4): a hash of `<install>/installation-id`; empty writes no line.
     pub instance: String,
+    /// `machine <hostname>[ wsl]` in the heartbeat (§ 4): the agentq `host.name` DashQ joins hosts by; empty writes no line.
+    pub machine: String,
     /// Labels from `<root>/.taskq/focus`; empty: admit nothing, `all`: any task; `p0` passes any non-empty focus (§ 4).
     pub focus: Vec<String>,
     /// Why `focus` could not be read; it then admits nothing (§ 4 Data).
@@ -484,7 +486,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new() }
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -615,6 +617,9 @@ impl<'a> Service<'a> {
         let mut lines = vec![format!("version {}", self.version)];
         if !self.instance.is_empty() {
             lines.push(format!("service {}", self.instance));
+        }
+        if !self.machine.is_empty() {
+            lines.push(format!("machine {}", self.machine));
         }
         if self.focus.is_empty() {
             lines.push(format!("focus {}", if self.focus_error.is_some() { "unknown" } else { "off" }));
@@ -1363,6 +1368,22 @@ mod tests {
         again.pass().unwrap();
         b.advance(301);
         assert!(w.pass().is_ok());
+    }
+
+    // Chain: § 4 heartbeat body, DashQ host join (dashq docs/design/hosts.md H2). Risk: a changed or missing line
+    // splits one machine into several Hosts rows or breaks the one-service-per-host check.
+    #[test]
+    fn heartbeat_body_lists_version_service_machine_focus() {
+        let b = Fake::default();
+        let c = cfg("win");
+        let mut s = service(&b, &c, Default::default());
+        s.instance = "abc123".into();
+        s.machine = "DESKTOP wsl".into();
+        s.focus = vec![];
+        assert_eq!(s.heartbeat_body(), "version 4.0.0\nservice abc123\nmachine DESKTOP wsl\nfocus off");
+        s.machine = String::new();
+        s.focus = vec!["all".into()];
+        assert_eq!(s.heartbeat_body(), "version 4.0.0\nservice abc123");
     }
 
     // Chain: § 4 board budget, heartbeat. Risk: a PATCH every pass burns the shared budget, or a sparse heartbeat

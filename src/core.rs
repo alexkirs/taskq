@@ -48,6 +48,41 @@ pub fn entry(kind: &str, args: &[&str], attempt: Option<u64>, text: &str) -> Str
     if text.is_empty() { format!("taskq: {head}") } else { format!("taskq: {head}\n{text}") }
 }
 
+/// § 2 retry limits: an attempt `requeue` that makes `retries` this, or a `gone` that makes it [`GONE_MAX`], asks.
+pub const REQUEUE_MAX: u32 = 3;
+pub const GONE_MAX: u32 = 2;
+
+/// The text of attempt `kind` (`requeue`, `gone`) on `t` (§ 2 limit card, #1123): when it reaches the retry limit, the
+/// reason plus a card naming the limit with requeue and later options, so the parked task never waits on a card
+/// without choices. The writer adds it, so every version folds the same card.
+pub fn limit_text(n: u64, t: &Task, kind: &str, text: &str) -> String {
+    let max = match kind {
+        "requeue" => REQUEUE_MAX,
+        "gone" => GONE_MAX,
+        _ => return text.into(),
+    };
+    let is_card = text.lines().any(|l| l.starts_with("Problem: ")) && options(text).iter().filter(|o| o.2).count() == 1;
+    if !matches!(t.state, State::Doing | State::Review) || t.retries + 1 < max || is_card {
+        return text.into();
+    }
+    // the reason's own numbered lines (a fix list) must not become options of the card
+    let reason = text.lines().map(|l| {
+        let body = l.trim_start();
+        match body.split_once(". ") {
+            Some((k, rest)) if !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()) => format!("{}{k}) {rest}", &l[..l.len() - body.len()]),
+            _ => l.to_string(),
+        }
+    });
+    let card = [
+        format!("Problem: retry limit {max} reached by this {kind}; the task waits for the owner."),
+        "1. requeue: retry with a fresh attempt ★".into(),
+        "2. later: park the task until the owner requeues it".into(),
+        // a bare comment `K` folds as a plain answer (ready), so `later` needs the CLI form (§ 2)
+        format!("To answer: `taskq answer {n}.K`; a bare comment `K` makes the task ready, not later."),
+    ];
+    reason.filter(|s| !s.trim().is_empty()).chain(card).collect::<Vec<_>>().join("\n")
+}
+
 /// Appends the optional § 2 fields to an entry body: `op-id`, then `revision` (written only with an op id).
 pub fn with_fields(body: String, op: Option<&str>, revision: Option<u64>) -> String {
     match (op, revision) {
@@ -352,12 +387,12 @@ fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool
             t.state = Ask;
         }
         (Doing | Review, "requeue", true) => {
-            if !limit(t, resume, 3) {
+            if !limit(t, resume, REQUEUE_MAX) {
                 ready(t)
             }
         }
         (Doing | Review, "gone", true) => {
-            if !limit(t, resume, 2) {
+            if !limit(t, resume, GONE_MAX) {
                 if t.state == Review { end(t) } else { ready(t) }
             }
         }
@@ -436,6 +471,21 @@ mod tests {
         assert!(super::golden(super::GOLDEN).unwrap() > 20);
         let wrong = super::GOLDEN.replacen("\"retries\": 2}", "\"retries\": 1}", 1);
         assert!(super::golden(&wrong).is_err(), "a wrong expectation must fail");
+    }
+
+    // Chain: § 2 limit card (#1123). Risk: a card below the limit, a card added twice, or fix lines read as options.
+    #[test]
+    fn limit_text_adds_the_card_only_at_the_limit() {
+        let t = |state, retries| super::Task { state, retries, ..Default::default() };
+        let card = "Done: d\nProblem: p\n1. a ★\n2. b\nTo answer: x";
+        assert_eq!(super::limit_text(7, &t(super::State::Review, 1), "requeue", "1. a"), "1. a");
+        assert_eq!(super::limit_text(7, &t(super::State::Review, 2), "requeue", card), card);
+        assert_eq!(super::limit_text(7, &t(super::State::Ask, 2), "requeue", "r"), "r");
+        assert_eq!(super::limit_text(7, &t(super::State::Doing, 2), "steer", "r"), "r");
+        let got = super::limit_text(7, &t(super::State::Doing, 1), "gone", "exit 1\n  2. b");
+        assert_eq!(got.lines().take(3).collect::<Vec<_>>(), ["exit 1", "  2) b", "Problem: retry limit 2 reached by this gone; the task waits for the owner."]);
+        assert_eq!(super::options(&got).iter().map(|o| (o.0, o.2)).collect::<Vec<_>>(), [(1, true), (2, false)]);
+        assert!(super::limit_text(7, &t(super::State::Doing, 2), "requeue", "").starts_with("Problem: "));
     }
 
     /// R8 made mechanical: every (state, entry) pair of the § 2 table is accepted by some golden trace.

@@ -148,7 +148,8 @@ fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &
     if core::has_fields(text) {
         return Receipt::rejected(n, op, "text ends with an `op-id:` or `revision:` line; reword it");
     }
-    let body = core::with_fields(entry(kind, args, attempt, text), op.id.as_deref(), op.revision);
+    let text = if attempt.is_some() && attempt == before.attempt { core::limit_text(n, &before, kind, text) } else { text.into() };
+    let body = core::with_fields(entry(kind, args, attempt, &text), op.id.as_deref(), op.revision);
     log.push(Entry { id: u64::MAX, body: body.clone(), edited: false });
     if fold(n, &log, deps) == before {
         return Receipt { state: Some(before.state.name()), revision: Some(rev), ..Receipt::rejected(n, op, format!("#{n} is {}: `{kind}` not accepted", before.state.name())) };
@@ -296,6 +297,8 @@ pub fn answer_picks(b: &dyn Board, cfg: &Config, picks: &[String], op: &Op) -> R
             continue;
         }
         out.push(match (state, close) {
+            // § 2: an option that starts with `later` parks the task, like the retry limit card's (#1123)
+            _ if opt.to_lowercase().starts_with("later") => act(b, &cfg.root, n, "later", &[], &opt, op),
             (State::Ask, _) => {
                 let r = act(b, &cfg.root, n, "answer", &[&k.to_string()], &opt, op);
                 // the close an option starts runs after the answer, as one more op of the same id
@@ -411,6 +414,54 @@ g", &["taskq".into()]).unwrap();
         let other = act_child(&b, &root, n, "requeue", &[], "blocked", &op("rq2"), env);
         assert_eq!((other.outcome, count()), ("rejected", before));
         assert!(other.text().contains("is not the live attempt none"), "{}", other.text());
+    }
+
+    // Chain: § 2 retry limit to the owner's answer (#913, #1123). Risk: a reviewer's 3rd requeue after a lost double
+    // claim parks the task in `ask` on a card without options, so no answer moves it.
+    #[test]
+    fn retry_limit_requeue_asks_with_requeue_and_later_options() {
+        let (b, root) = (Fake::default(), std::env::temp_dir().join(format!("taskq-limit-{}", std::process::id())));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("taskq.json"), r#"{"repo":"o/r"}"#).unwrap();
+        let (cfg, _) = crate::load(&root).unwrap();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let at_limit = |reviewers: &[&str]| {
+            let n = b.create("T", "## Goal\ng", &["taskq".into()]).unwrap();
+            for _ in 0..2 {
+                let a = b.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
+                let r = act_child(&b, &root, n, "requeue", &[], "blocked", &Op::default(), (Some(n.to_string()), Some(a.to_string())));
+                assert_eq!(r.state, Some("ready"), "{}", r.text());
+            }
+            let t = fold(n, &entries(&b, n).unwrap(), false);
+            assert_eq!((t.retries, t.card), (2, None), "a requeue below the limit carries no card");
+            let a = b.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
+            b.comment(n, &entry("result", &[sha], Some(a), "ok")).unwrap();
+            // both hosts spawn a reviewer for this result; the first wins, the second is ignored
+            let ids: Vec<u64> = reviewers.iter().map(|h| b.comment(n, &entry("spawn", &["reviewer", "codex:v", h], None, "")).unwrap()).collect();
+            assert_eq!(fold(n, &entries(&b, n).unwrap(), false).attempt, Some(ids[0]));
+            let r = act_child(&b, &root, n, "requeue", &[], "Fix:
+1. x", &Op::default(), (Some(n.to_string()), Some(ids[0].to_string())));
+            assert_eq!(r.state, Some("ask"), "{}", r.text());
+            n
+        };
+        let n = at_limit(&["win", "mac"]);
+        let t = fold(n, &entries(&b, n).unwrap(), false);
+        let card = t.card.unwrap();
+        assert_eq!((t.retries, card.lines().take(3).collect::<Vec<_>>()), (3, vec!["Fix:", "1) x", "Problem: retry limit 3 reached by this requeue; the task waits for the owner."]));
+        assert_eq!(options(&card).into_iter().map(|o| (o.0, o.1.split(':').next().unwrap().to_string())).collect::<Vec<_>>(), [(1, "requeue".into()), (2, "later".into())]);
+        assert!(b.issue(n).unwrap().labels.contains(&"q-ask".to_string()));
+        assert_eq!(card.lines().last(), Some(format!("To answer: `taskq answer {n}.K`; a bare comment `K` makes the task ready, not later.").as_str()));
+        // `taskq answer N.2` parks the task; a bare board comment `2` is a plain answer to `ready` (§ 2)
+        let r = answer_picks(&b, &cfg, &[format!("{n}.2")], &Op::default()).unwrap().remove(0);
+        assert_eq!((r.outcome, r.state), ("accepted", Some("later")), "{}", r.text());
+        let n = at_limit(&["win", "mac"]);
+        b.comment(n, "2").unwrap();
+        assert_eq!(fold(n, &entries(&b, n).unwrap(), false).state, State::Ready);
+        // `requeue` retries it with a fresh attempt
+        let n = at_limit(&["mac", "win"]);
+        let r = answer_picks(&b, &cfg, &[format!("{n}.1")], &Op::default()).unwrap().remove(0);
+        assert_eq!((r.outcome, r.state), ("accepted", Some("ready")), "{}", r.text());
+        assert_eq!(fold(n, &entries(&b, n).unwrap(), false).retries, 0);
     }
 
     // Chain: § 5 dispatch receipt and readback. Risk: a stale or retried op writes a second entry.

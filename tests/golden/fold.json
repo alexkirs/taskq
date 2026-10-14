@@ -129,6 +129,15 @@
    {"id": 15, "body": "taskq: requeue attempt 14\nstill flaky"},
    {"id": 16, "body": "taskq: answer\ntry once more"}
   ], "expect": {"state": "ready"}},
+  {"name": "limit card: a bare comment 2 is a plain answer, ready; only taskq answer N.2 runs later (#1123)", "task": 7, "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 11, "body": "taskq: requeue attempt 10\nflaky"},
+   {"id": 12, "body": "taskq: spawn worker claude:s2 mac"},
+   {"id": 13, "body": "taskq: requeue attempt 12\nflaky"},
+   {"id": 14, "body": "taskq: spawn worker claude:s3 mac"},
+   {"id": 15, "body": "taskq: requeue attempt 14\nstill flaky\nProblem: retry limit 3 reached by this requeue; the task waits for the owner.\n1. requeue: retry with a fresh attempt ★\n2. later: park the task until the owner requeues it\nTo answer: `taskq answer 7.K`; a bare comment `K` makes the task ready, not later."},
+   {"id": 16, "body": "2"}
+  ], "expect": {"state": "ready"}},
   {"name": "second gone asks", "entries": [
    {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
    {"id": 11, "body": "taskq: gone attempt 10\nlease expired"},

@@ -74,6 +74,7 @@ pub struct Effective {
     /// The Seatbelt profile taskq wraps the child in (macOS).
     pub profile: Option<String>,
     pub linux: bool,
+    pub windows: bool,
     /// Claude permission mode replacing the project's (Full).
     pub claude: Option<String>,
     /// Codex arguments replacing the project's: a sandbox cannot nest inside taskq's; Full has none.
@@ -174,7 +175,7 @@ fn writable(mode: &str, h: &Host) -> Vec<PathBuf> {
 /// The effective access of `rt` in this project (§ 8 Access). A project grant replaces the host default for its root.
 pub fn resolve(policy: &Result<Policy, String>, h: &Host, rt: &str, permission_mode: &str, codex: &[String]) -> Effective {
     let requested = if rt == "claude" { format!("--permission-mode {permission_mode}") } else if codex.is_empty() { "codex defaults".into() } else { codex.join(" ") };
-    let mut e = Effective { runtime: rt.into(), requested, grant: "none".into(), mode: "legacy".into(), enforcement: String::new(), profile: None, linux: false, claude: None, codex: None, refused: None };
+    let mut e = Effective { runtime: rt.into(), requested, grant: "none".into(), mode: "legacy".into(), enforcement: String::new(), profile: None, linux: false, windows: false, claude: None, codex: None, refused: None };
     let p = match policy {
         Ok(p) => p,
         Err(err) => {
@@ -232,6 +233,11 @@ pub fn resolve(policy: &Result<Policy, String>, h: &Host, rt: &str, permission_m
                     Ok((mode, args)) => { e.mode = mode; e.codex = Some(args); e.linux = true; e.enforcement = "taskq Linux mount/PID sandbox plus native Codex sandbox".into(); }
                     Err(r) => e.refused = Some(r),
                 }
+            } else if h.os == "windows" && rt == "codex" && g.project.is_some() {
+                match windows_codex(&g.mode, h, codex) {
+                    Ok(args) => { e.codex = Some(args); e.windows = true; e.enforcement = "taskq native Windows token; writes workspace, runtime home and private temp".into(); }
+                    Err(r) => e.refused = Some(r),
+                }
             } else if !mac {
                 e.refused = Some(format!("{} enforcement unknown for {rt} on {}", g.mode, h.os));
             } else {
@@ -253,30 +259,48 @@ fn linux_codex(mode: &str, root: &Path, args: &[String]) -> Result<(String, Vec<
     #[cfg(not(target_os = "linux"))]
     { let _ = (mode, root, args); return Err("linux sandbox must be resolved on Linux".into()); }
     #[allow(unreachable_code)]
+    bounded_codex(mode, args, "linux sandbox")
+}
+
+fn windows_codex(mode: &str, h: &Host, args: &[String]) -> Result<Vec<String>, String> {
+    #[cfg(not(windows))]
+    { let _ = (mode, h, args); return Err("Windows sandbox must be resolved on Windows".into()); }
+    #[cfg(windows)]
     {
-        let mut mode = mode.to_string();
-        let mut kept = Vec::new();
-        let mut it = args.iter();
-        while let Some(a) = it.next() {
-            match a.as_str() {
-                "-s" | "--sandbox" => match it.next().map(String::as_str) {
-                    Some("read-only") => mode = "restricted".into(),
-                    Some("workspace-write" | "danger-full-access") => {},
-                    _ => return Err("linux sandbox: unknown sandbox request".into()),
-                },
-                "-m" | "--model" => kept.extend([a.clone(), it.next().filter(|v| !v.starts_with('-')).ok_or("linux sandbox: missing model")?.clone()]),
-                "-c" | "--config" => {
-                    let v = it.next().ok_or("linux sandbox: missing config")?;
-                    if !(v.starts_with("model_reasoning_effort=") || ["sandbox_workspace_write.network_access=true", "sandbox_workspace_write.network_access=false"].contains(&v.as_str())) { return Err(format!("linux sandbox: unsupported config request {v}")); }
-                    kept.extend([a.clone(), v.clone()]);
-                }
-                _ => return Err(format!("linux sandbox: unsupported argument {a}")),
-            }
+        let (effective, mut kept) = bounded_codex(mode, args, "Windows sandbox")?;
+        if effective != "workspace" || !kept.iter().any(|a| a == "sandbox_workspace_write.network_access=true")
+            || kept.iter().any(|a| a == "sandbox_workspace_write.network_access=false") {
+            return Err("Windows native candidate requires Workspace and an explicit network-enabled request; narrowing unqualified".into());
         }
-        let mut out = vec!["-s".into(), if mode == "restricted" { "read-only" } else { "workspace-write" }.into(), "-c".into(), "approval_policy=never".into(), "-c".into(), "sandbox_workspace_write.writable_roots=[]".into()];
-        out.extend(kept);
-        Ok((mode, out))
+        crate::windows_sandbox::ready(h.root, h.install)?;
+        kept.extend(["-c".into(), "windows.sandbox=unelevated".into()]);
+        Ok(kept)
     }
+}
+
+fn bounded_codex(mode: &str, args: &[String], label: &str) -> Result<(String, Vec<String>), String> {
+    let mut mode = mode.to_string();
+    let mut kept = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-s" | "--sandbox" => match it.next().map(String::as_str) {
+                Some("read-only") => mode = "restricted".into(),
+                Some("workspace-write" | "danger-full-access") => {},
+                _ => return Err(format!("{label}: unknown sandbox request")),
+            },
+            "-m" | "--model" => kept.extend([a.clone(), it.next().filter(|v| !v.starts_with('-')).ok_or_else(|| format!("{label}: missing model"))?.clone()]),
+            "-c" | "--config" => {
+                let v = it.next().ok_or_else(|| format!("{label}: missing config"))?;
+                if !(v.starts_with("model_reasoning_effort=") || ["sandbox_workspace_write.network_access=true", "sandbox_workspace_write.network_access=false"].contains(&v.as_str())) { return Err(format!("{label}: unsupported config request {v}")); }
+                kept.extend([a.clone(), v.clone()]);
+            }
+            _ => return Err(format!("{label}: unsupported argument {a}")),
+        }
+    }
+    let mut out = vec!["-s".into(), if mode == "restricted" { "read-only" } else { "workspace-write" }.into(), "-c".into(), "approval_policy=never".into(), "-c".into(), "sandbox_workspace_write.writable_roots=[]".into()];
+    out.extend(kept);
+    Ok((mode, out))
 }
 
 /// Every runtime taskq starts here, for `service permissions` and `status.json` `policy`.

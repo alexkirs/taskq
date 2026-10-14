@@ -20,6 +20,8 @@ mod platform;
 mod policy;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
+#[cfg(windows)]
+mod windows_sandbox;
 mod profile;
 mod retro;
 mod runtime;
@@ -1948,6 +1950,11 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
 }
 
 fn main() {
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("__windows-codex") {
+        if let Err(e) = windows_sandbox::run(&std::env::args().skip(2).collect::<Vec<_>>()) { eprintln!("{e}"); std::process::exit(1); }
+        return;
+    }
     #[cfg(target_os = "linux")]
     if std::env::current_exe().ok().is_some_and(|p| p == Path::new(linux_sandbox::HELPER)) {
         if let Err(e) = linux_sandbox::run(&std::env::args().skip(1).collect::<Vec<_>>()) { eprintln!("{e}"); std::process::exit(1); }

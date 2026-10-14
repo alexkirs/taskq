@@ -219,7 +219,7 @@ pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume:
         session: resume.map(String::from).unwrap_or_else(|| crate::runtime::new_session(rt)), url: String::new(), resume: resume.map(String::from) };
     // § 8 Access: the operator runs under the same grants as workers
     let access = crate::runtime::access(&env, rt).map_err(|e| e.to_string())?;
-    let mut c = crate::runtime::command(&env, &l, &access);
+    let mut c = crate::runtime::command(&env, &l, &access)?;
     for k in ["TASKQ_TASK", "TASKQ_ATTEMPT", "TASKQ_ROLE"] { c.env_remove(k); }
     let text = crate::runtime::instructions(&format!("Read {} first. TaskQ commands: {}.\n{brief}", crate::runtime::contract(root), exe.display())).map_err(|e| e.to_string())?;
     fs::create_dir_all(logs).map_err(|e| e.to_string())?;

@@ -10,5 +10,13 @@
  "hosts": {
   "macbook-m2.local": "mac",
   "DESKTOP": "win"
+ },
+ "capacity_hosts": {
+  "mac": {
+   "limits": {
+    "claude": 2,
+    "codex": 1
+   }
+  }
  }
 }

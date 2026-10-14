@@ -1148,7 +1148,7 @@ fn service(args: &Args) -> Res<()> {
                 return Ok(());
             }
             if sub == "install" {
-                coreq::update::install_self(&platform::tool(&cfg.install))?;
+                platform::install_self(&platform::tool(&cfg.install))?;
                 platform::write_unit(&u)?;
                 let handover = load_unit(&u, &root)?;
                 let mut all: Vec<String> = fs::read_to_string(&projects).unwrap_or_default().lines().map(String::from).collect();

@@ -55,6 +55,18 @@ pub fn update(install: &Path, check: bool) -> Result<Option<String>, String> {
     Ok(v)
 }
 
+/// § 8 step 5: coreq `install_self` copies over an existing release binary in place, and macOS then kills every later
+/// exec of it (`OS_REASON_CODESIGNING`), so a second `service install` of one build rolled it back (#973). Unlinking
+/// first makes the copy a new file; running processes keep the old one.
+pub fn install_self(t: &Tool) -> Result<(), String> {
+    let (me, dst) = (std::env::current_exe().map_err(|e| e.to_string())?, t.release_exe(t.version));
+    if fs::canonicalize(&me).ok() != fs::canonicalize(&dst).ok() {
+        // ponytail: a start in the unlink-to-copy gap fails once; coreq writing tmp + rename would close it
+        let _ = fs::remove_file(&dst);
+    }
+    coreq::update::install_self(t)
+}
+
 /// Service step 7 also catches a release made current by another service on this install.
 pub fn service_update(install: &Path) -> Result<Option<String>, String> {
     if let Some(v) = tool(install).current().filter(|v| coreq::update::newer(v, VERSION)) {
@@ -347,6 +359,23 @@ mod tests {
         assert!(busy <= total && total > 0);
         let m = memory_available().expect("available memory");
         assert!(m > 0.0 && m < 100.0, "{m}");
+    }
+
+    // Chain: § 8 step 5 repeated `service install`. Risk: the second install rewrites the release binary in place and
+    // macOS kills its next starts until rollback (#973).
+    #[cfg(unix)]
+    #[test]
+    fn second_install_writes_a_new_release_file() {
+        use std::os::unix::fs::MetadataExt;
+        let install = std::env::temp_dir().join(format!("taskq-install-self-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&install);
+        let t = tool(&install);
+        let ino = || fs::metadata(t.release_exe(VERSION)).unwrap().ino();
+        install_self(&t).unwrap();
+        let first = ino();
+        install_self(&t).unwrap();
+        assert_ne!(ino(), first, "the release binary was rewritten in place");
+        let _ = fs::remove_dir_all(&install);
     }
 
     // Chain: § 8 install sweep. Risk: sweep deletes a live release or owned file.

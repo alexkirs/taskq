@@ -52,6 +52,11 @@ pub fn is_host(i: &Issue) -> bool {
     i.labels.iter().any(|l| l == HOST_LABEL) && i.title.starts_with("taskq host ")
 }
 
+/// `who` is an assignee; an issue listed without assignees (github.com, § 4 budget) costs one `issue(n)` read.
+pub fn assigned(board: &dyn Board, i: &Issue, who: &str) -> Result<bool, String> {
+    Ok(i.assignees.iter().any(|a| a == who) || i.assignees.is_empty() && board.issue(i.number)?.assignees.iter().any(|a| a == who))
+}
+
 fn label(i: &Issue, prefix: &str) -> Option<String> {
     i.labels.iter().find_map(|l| l.strip_prefix(prefix).map(String::from))
 }
@@ -783,10 +788,11 @@ impl<'a> Service<'a> {
                 true
             })
             .filter(|v| label(&v.issue, "host-").is_none_or(|h| h == me))
-            .filter(|v| !v.issue.labels.iter().any(|l| l == "assignee-only") || v.issue.assignees.contains(&user))
             // `needs-gate`: every host of this version has gates; N-1 lacks them and leaves the task alone (§ 8)
             .filter(|v| v.issue.labels.iter().filter_map(|l| l.strip_prefix("needs-")).all(|x| x == "gate" || self.cfg.has.iter().any(|h| h == x)))
             .filter(|v| priority(&v.issue) == 0 || self.focus.iter().any(|f| f == "all" || crate::labels::matches(&v.issue.labels, f)))
+            // last: the github.com list carries no assignees (§ 4 budget), so only a candidate reads them
+            .filter(|v| !v.issue.labels.iter().any(|l| l == "assignee-only") || assigned(self.board, &v.issue, &user).unwrap_or(false))
             .collect();
         queue.sort_by_key(|v| (priority(&v.issue), v.issue.number));
         for v in queue {
@@ -1151,6 +1157,22 @@ mod tests {
             assert!(b.comments(n).unwrap().last().unwrap().body.contains("start failed: private failure text"));
             assert_eq!(crate::incident::take_detected(), if reports { vec!["dispatch.start"] } else { vec![] });
         }
+    }
+
+    // Chain: § 4 budget, github.com list without assignees -> `assignee-only` admission and report filter. Risk: an
+    // assigned task never starts, or a listed assignee costs a second read.
+    #[test]
+    fn assignees_missing_from_the_list_are_read_per_issue() {
+        let b = Fake::default();
+        let n = b.create("t", "", &["assignee-only".into()]).unwrap();
+        let listed = b.issue(n).unwrap();
+        b.state.borrow_mut().issues[0].assignees = vec!["me".into()];
+        assert_eq!((assigned(&b, &listed, "me"), assigned(&b, &listed, "you")), (Ok(true), Ok(false)));
+        b.state.borrow_mut().fail_issue_read = Some((n, 1));
+        assert!(assigned(&b, &listed, "me").is_err());
+        let full = b.issue(n).unwrap();
+        b.state.borrow_mut().fail_issue_read = Some((n, 1));
+        assert_eq!(assigned(&b, &full, "me"), Ok(true), "a listed assignee needs no read");
     }
 
     // Chain: incident lease heartbeat. Risk: one slow attempt reported as a fault.

@@ -50,10 +50,11 @@ fn parse_issue(v: &Value) -> Issue {
 }
 
 /// The open-issue list of a pass in one GraphQL query per 100 issues (§ 4 budget): it costs the separate GraphQL
-/// budget about 2 points instead of one core request, and returns no pull requests.
+/// budget 1 point instead of one core request, and returns no pull requests. Labels are its only nested connection:
+/// assignees would make it 2 points (#1043), so listed issues carry none and callers read `issue(n)` when they need them.
 const OPEN_ISSUES: &str = "query($owner: String!, $name: String!, $after: String) { repository(owner: $owner, name: $name) { \
     issues(states: OPEN, first: 100, after: $after, orderBy: {field: CREATED_AT, direction: DESC}) { pageInfo { hasNextPage endCursor } \
-    nodes { number title body updatedAt authorAssociation labels(first: 50) { nodes { name } } assignees(first: 20) { nodes { login } } } } } }";
+    nodes { number title body updatedAt authorAssociation labels(first: 50) { nodes { name } } } } } }";
 
 impl GitHub {
     fn open_issues(&self) -> Result<Vec<Issue>> {
@@ -70,7 +71,7 @@ impl GitHub {
             }
             out.extend(page["nodes"].as_array().into_iter().flatten().map(|n| parse_issue(&json!({
                 "number": n["number"], "title": n["title"], "body": n["body"], "updated_at": n["updatedAt"], "state": "open",
-                "author_association": n["authorAssociation"], "labels": n["labels"]["nodes"], "assignees": n["assignees"]["nodes"],
+                "author_association": n["authorAssociation"], "labels": n["labels"]["nodes"],
             }))));
             if page["pageInfo"]["hasNextPage"] != true { return Ok(out); }
             after = page["pageInfo"]["endCursor"].clone();

@@ -83,7 +83,9 @@ pub fn read(b: &dyn Board, cfg: &Config, raw: &Value, only: &[String]) -> Snapsh
         views.retain(|v| in_scope(&v.issue, only));
         if let Some(who) = raw["assignee"].as_str() {
             let who = if who == "me" { b.me()? } else { who.to_string() };
-            views.retain(|v| v.issue.assignees.contains(&who));
+            let mut keep = vec![];
+            for v in views { if service::assigned(b, &v.issue, &who)? { keep.push(v); } }
+            views = keep;
         }
         Ok(from_views("board", b, cfg, b.now()?, &views, &hosts))
     };

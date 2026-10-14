@@ -6,7 +6,7 @@ const html=fs.readFileSync('src/tray.html','utf8');
 const source=html.slice(html.indexOf('// Task answers:'),html.indexOf('// one task per board'));
 const sent=[],timers=new Map();let id=0;
 const board='https://github.com/o/r/issues',project={root:'project',issues:board,alive:true,complete:true};
-const context={S:{projects:[project],font:16},send:m=>sent.push(m),menu:{scrollHeight:400},
+const context={S:{projects:[project],font:16},send:m=>sent.push(m),fit:()=>{},menu:{scrollHeight:400},
   setTimeout:(f,ms)=>{timers.set(++id,{f,ms});return id;},clearTimeout:i=>timers.delete(i)};
 vm.createContext(context);vm.runInContext(source,context);
 const call=(name,...args)=>{context.args=args;return vm.runInContext(name+'(...args)',context);};

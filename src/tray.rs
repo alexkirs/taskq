@@ -790,9 +790,9 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
     })
 }
 
-/// The `actions` snapshot: a custom range with start >= end, then `Pause all…`, both before acting (menu.md M5, M6).
+/// The `actions` snapshot: a refused custom range (menu.md M6), without applying a setting.
 const ACTIONS: &str = "(()=>{const q=s=>document.querySelector(s),put=(s,v)=>{const i=q(s);i.value=v;i.dispatchEvent(new Event('input',{bubbles:true}));};
-q('[data-v=custom]').click();put('#hs','2026-10-13T10:00');put('#he','2026-10-13T09:00');q('[data-a=range]').click();q('[data-a=confirm]').click();})()";
+q('[data-route=cadence]').click();q('[data-v=custom]').click();put('#hs','2026-10-13T10:00');put('#he','2026-10-13T09:00');q('[data-a=range]').click();})()";
 
 /// Snapshot steps: theme, page (`home` or a project root), text size, a script run on the page.
 fn shots(install: &Path) -> Vec<(&'static str, String, u64, &'static str)> {
@@ -800,12 +800,15 @@ fn shots(install: &Path) -> Vec<(&'static str, String, u64, &'static str)> {
     ["dark", "light"].iter().flat_map(|t| {
         let mut v = vec![(*t, "home".to_string(), 16, ""), (*t, "home".to_string(), 20, ""), (*t, "home".to_string(), 16, ACTIONS)];
         v.extend(first.clone().map(|r| (*t, r, 16, "")));
+        for route in ["projects", "attention", "settings", "appearance", "cadence", "agents", "services", "about"] {
+            for font in [16, 20] { v.push((*t, route.into(), font, "")); }
+        }
         v
     }).collect()
 }
 
 fn shot_name(install: &Path, step: usize) -> String {
-    shots(install).get(step).map_or(step.to_string(), |(t, p, f, js)| format!("{t}-{}{}-{f}", if p == "home" { "home" } else { "project" }, if js.is_empty() { "" } else { "-actions" }))
+    shots(install).get(step).map_or(step.to_string(), |(t, p, f, js)| format!("{t}-{}{}-{f}", if Path::new(p).is_absolute() { "project" } else { p }, if js.is_empty() { "" } else { "-actions" }))
 }
 
 fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>, add: &Value) -> Value {

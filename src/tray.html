@@ -406,10 +406,10 @@ function render(navigating=false){
   const restored=answerFocus&&menu.querySelector('[data-answer="'+CSS.escape(answerFocus.dataset.answer)+'"] '+answerSelector);
   if(restored&&!navigating){restored.focus({preventScroll:true});if(caret)restored.setSelectionRange(...caret);}
   else if(!navigating){const target=focusedSummary>=0?menu.querySelectorAll('summary')[focusedSummary]:focusKey&&focusKey!=='{}'?[...menu.querySelectorAll('button')].find(b=>JSON.stringify(b.dataset)===focusKey):null;target?.focus({preventScroll:true});}
-  // a new exchange opens at its newest entry; a tick keeps the reader's place
-  const c=menu.querySelector('.aichain');if(c)c.scrollTop=chainScroll&&chainScroll[0]===c.dataset.chain?chainScroll[1]:c.lastElementChild.offsetTop;
   document.scrollingElement.scrollTop=scroll;
-  fit();}
+  fit();
+  // after fit() sets the width: a new exchange opens at its newest entry; a tick keeps the reader's place
+  const c=menu.querySelector('.aichain');if(c)c.scrollTop=chainScroll&&chainScroll[0]===c.dataset.chain?chainScroll[1]:c.lastElementChild.offsetTop;}
 window.taskq={receive(s){
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
   if(s.capmsg){resourceReceipt(s.capmsg);return;}

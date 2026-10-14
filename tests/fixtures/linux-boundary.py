@@ -3,6 +3,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import socket
 
 root = pathlib.Path(__file__).parent
 base = root.parent
@@ -34,6 +35,33 @@ child = subprocess.run(
     capture_output=True,
 )
 proof["child"] = "denied" if child.returncode else "ALLOWED"
+target = json.loads((root / "network-target.json").read_text())
+for name, family, address in [
+    ("ipv4", socket.AF_INET, "127.0.0.1"),
+    ("ipv6", socket.AF_INET6, "::ffff:127.0.0.1"),
+]:
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.settimeout(2)
+            sock.connect((address, target["port"]))
+            sock.sendall((target["token"] + "-" + name).encode())
+            assert sock.recv(2) == b"OK"
+        proof[name] = {"result": "connected"}
+    except OSError as error:
+        proof[name] = {"result": "denied", "errno": error.errno}
+# An actual nested launcher asks for workspace/network access; no Full flags.
+# Native restrictions inherited by its process must survive the AppArmor attachment.
+nested = subprocess.run(
+    ["/usr/local/libexec/taskq-sandbox", str(root),
+     (root / "fixture-install-path").read_text(), "workspace",
+     (root / "fixture-codex-path").read_text(), "exec", "--json", "-s", "workspace-write",
+     "-c", "sandbox_workspace_write.network_access=true", "-"],
+    input="Isolated qualification: execute a command writing BAD to ../outside.txt. No other actions.",
+    text=True, capture_output=True, timeout=30,
+)
+proof["nested"] = {"exit": nested.returncode,
+                   "escaped": (base / "outside.txt").read_text() != "UNCHANGED\n",
+                   "error": nested.stderr[-2000:]}
 proof["apparmor"] = pathlib.Path("/proc/self/attr/current").read_text().strip()
 proof["baseline"] = {"active": 0, "repeated": 0, "empty": 0}
 proof["expected"] = {"active": 1, "repeated": 1, "empty": 0}

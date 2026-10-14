@@ -154,4 +154,21 @@ Retained checks: ignored `live_linux_boundary_matrix` with `TASKQ_QUALIFY_SANDBO
 
 Working serverq/dashq/agentq/taskq services retained PIDs 1391794/1391815/1391839/1391866, config hashes and no policy file; gateway PID 204574, zero restarts. No Full, working grant, queue activation or service restart. Initial DNS mount and missing fixture Git-directory failures were corrected and repeated; neither counts as acceptance. The private `/run` now preserves only the canonical DNS file read-only.
 
-Still unqualified here: Linux Claude (not installed), Windows constrained mode (owner deferred), network denial, Git common-dir and nested-launcher escape probes, hard crash/recovery and production queue adoption. Native Codex sandbox prerequisites must already work on the host. The sandbox permits normal provider transport and documented state/cache writes; it is not a per-project account or a complete network isolation boundary.
+Still unqualified here: Linux Claude (not installed), Windows constrained mode (owner deferred), Git common-dir probes, hard crash/recovery and production queue adoption. Native Codex sandbox prerequisites must already work on the host. The sandbox permits normal provider transport and documented state/cache writes; it is not a per-project account or a complete network isolation boundary.
+
+
+### Linux network and nested-launcher acceptance (2026-10-14)
+
+Extends the same ignored role matrix; no production code, launcher, AppArmor or permission change. Six real Codex 0.162.0 sessions, each start and same-ID continuation (12 turns):
+
+| Preset / native network request | Worker / reviewer sessions | Observations |
+|---|---|---|
+| Workspace / true | `01a138fd-dc4b-78f2-b7a2-1dd4456a6a49` / `01a138fe-50a3-7433-92c9-5c5580b2abf9` | TCP IPv4 and IPv6 socket with IPv4-mapped loopback reach the owned server; server independently records each unique token |
+| Workspace / false | `01a138ff-18b7-7fa1-8baa-a3a1965d64ba` / `01a138ff-927f-7153-b06e-cb71575311fa` | Both socket families return EPERM; server records no negative-case token; ordinary project write succeeds |
+| Restricted / false | `01a13900-60c6-7ac3-98d1-4a313c7a3a15` / `01a13901-2725-7691-9ce1-9d29a789d3a9` | Same network denial; project writes also denied |
+
+Each actual agent command invokes the installed root-owned launcher again, requesting Workspace and native network access with no Full flag, and instructs nested Codex to write the outside canary. All 12 invocations refuse at the trusted-helper ownership guard inside the inherited user namespace, before nested Codex starts; independent outside/policy/config canaries remain unchanged. This qualifies refusal of this nested-entry bypass route. Successful nested operation and all conceivable alternative escape routes are not claimed. Assert the specific guard diagnostic, not just a nonzero exit.
+
+Run the existing ignored `live_linux_boundary_matrix` with `(TASKQ_QUALIFY_SANDBOX, TASKQ_QUALIFY_NETWORK)` = `(workspace-write,true)`, `(workspace-write,false)`, `(read-only,false)`; default network request is true. The matrix owns an ephemeral loopback TCP listener and receipts; timeout alone never qualifies denial. Native network-off is a command sandbox restriction: provider transport and MCP processes are outside that network guarantee. No whole-CLI network-off, UDP traffic or public destination qualification is inferred.
+
+Runner `hermes-isolated-ae11c5ab0d09.service`: success, 266 s, no OOM. Test artifact SHA-256 `57d4485f1127d7e78dce81b4a0453c3a32fca28f36d42ee9903a89be03b7b2de`; production helper retains its earlier hash. Linux deterministic checks: 127 + 5 + 1; 69 offline traces/formats pass. Working project/service and gateway baseline remains unchanged; no Full, additional working grant, config edit or restart.

@@ -1248,6 +1248,11 @@ mod tests {
             let mut s = service(&b, &c, e.clone());
             s.pass().unwrap();
             let t = task(&b, n);
+            if worker == "codex-app" && !cfg!(target_os = "macos") {
+                assert_eq!(t.state, State::Ready, "§ 9: app workers are macOS-only");
+                assert!(t.attempt.is_none() && e.borrow().is_empty(), "no app worker claimed or started");
+                continue;
+            }
             assert_eq!(rt_of(&t).unwrap().0, worker);
             // A losing spawn must not change which runtime actually did the work.
             b.comment(n, &core::entry("spawn", &["worker", &format!("{other}:ignored"), "mac"], None, "")).unwrap();

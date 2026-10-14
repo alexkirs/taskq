@@ -37,8 +37,6 @@ Synthetic storefront data, captured from the dark tray menu. These are examples,
 
 [![Storefront and billing project queue summaries](docs/shots/popover-dark-projects-16.png)](docs/shots/popover-dark-projects-16.png)
 
-<img src="docs/shots/icon-summary-run-dark.png" alt="Menu-bar summary of the fixture queue; unavailable counts remain unknown" height="34">
-
 ### From request to reviewed work
 
 Illustrative dialogue, not recorded sessions. The three scenes follow one storefront change; task numbers and outcomes are examples. Start with an installed project, an accessible board and a manager that has loaded the project rules.

@@ -323,4 +323,6 @@ Improvement proposals the PM makes in chat, one line each, oldest first: `- YYYY
 - 2026-10-14 Reconcile the implementation plan with what runs: Windows on dev builds, batches 1-4 done, G8 next (from owner review in chat)
 - 2026-10-14 Start held tasks only after their prerequisites are encoded as Depends on, so workers do not spend attempts asking to wait (from owner review in chat)
 - 2026-10-14 Route macOS GUI and host-check evidence to a worker that can produce it instead of the PM (from owner review in chat)
+- 2026-10-14 When the PM disagrees with the worker's recommended (★) option, the ask shows the PM's pick and reason next to it, so the owner does not answer from the worker's star alone (from owner answer to agentq#127)
+- 2026-10-14 A task whose PR targets a release branch (not the default branch) closes through `taskq close` like any other task; today the merge does not close the issue and `taskq close` refuses while the task is in ask or doing (from agentq#128 on release-0.5.7)
 - 2026-10-14 Find why the dashboard shows Windows agentq data 13 h old after the Rust cutover (from owner review in chat)

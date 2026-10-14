@@ -1,0 +1,22 @@
+/* TaskQ finding-task reference composer/review. Child placement never overrides project/task/answer internals. */
+.tqf{--tqf-paper:light-dark(#fafbfc,#252b32);--tqf-ink:light-dark(#243039,#eef2f5);--tqf-muted:light-dark(#59636e,#b9c3cd);--tqf-line:light-dark(#dce0e5,#46505b);--tqf-hover:light-dark(#e9edf1,#37424c);--tqf-good:light-dark(#246f59,#8dd2b8);color:var(--tqf-ink);background:var(--tqf-paper);font:inherit;line-height:1.4;min-width:0;overflow-wrap:anywhere}
+.tqf [data-finding-form] *{box-sizing:border-box}
+.tqf [data-finding-form] p{margin:6px 0}
+.tqf [data-finding-form] strong{font-weight:500}
+.tqf-line{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:4px}
+.tqf-field{display:block;margin:6px 0}
+.tqf-field input,.tqf-field textarea{display:block;width:100%;min-width:0}
+.tqf-field input,.tqf-field textarea,.tqf-review select{font:inherit;color:inherit;background:var(--tqf-paper);border:1px solid var(--tqf-line);border-radius:5px;padding:4px;max-width:100%}
+.tqf-field textarea{resize:vertical;min-height:48px}
+.tqf [data-finding]{font:inherit;color:inherit;background:transparent;border:0;border-radius:5px;padding:4px 6px;min-height:32px;text-align:left;cursor:pointer}
+.tqf [data-finding]:hover{background:var(--tqf-hover)}
+.tqf [data-finding].tqf-primary{background:var(--tqf-ink);color:var(--tqf-paper)}
+.tqf [data-finding]:disabled{opacity:.55;cursor:default}
+.tqf [data-finding]:focus-visible,.tqf [data-field]:focus-visible{outline:2px solid var(--tqf-good);outline-offset:1px}
+.tqf-muted{color:var(--tqf-muted);font-size:.85em}
+.tqf fieldset{border:0;padding:0;margin:6px 0;min-width:0}
+.tqf-project{margin:4px 0}
+.tqf-review{border:1px solid var(--tqf-line);border-radius:6px;padding:6px;margin:6px 0}
+.tqf-review label{display:block;padding:4px 0}
+.tqf-review p{margin:4px 0}
+@media(pointer:coarse){.tqf [data-finding]{min-height:44px}}

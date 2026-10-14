@@ -1,0 +1,108 @@
+{
+  "chain": "F1-F4: reviewed finding -> immutable adapter request -> independent create/start receipts and canonical task/answer",
+  "finding": {
+    "source": "installation-17/disk-headroom/episode-6",
+    "revision": 1,
+    "mapping": {
+      "project": "serverq",
+      "provenance": "Owner mapping: installation-17 belongs to serverq"
+    },
+    "title": "Investigate disk headroom warnings; do not delete files or restart services",
+    "goal": "Explain the repeated warning. Do not delete files or restart services.",
+    "acceptance": "Report the cause and propose a scoped repair.\nVerify the same installation and rule after approval.",
+    "sanitizedEvidence": "6 observations; latest available capacity 9%; minimum 15%."
+  },
+  "projects": [
+    {
+      "id": "serverq",
+      "name": "serverq-long-project-name-with-independent-board-and-counter-navigation",
+      "pinned": true,
+      "board": {
+        "kind": "github",
+        "url": "https://github.com/example/serverq/issues"
+      },
+      "complete": true,
+      "closed": 100,
+      "tasks": [
+        {
+          "n": 1,
+          "state": "doing",
+          "revision": 1
+        },
+        {
+          "n": 2,
+          "state": "review",
+          "revision": 1
+        }
+      ]
+    },
+    {
+      "id": "taskq",
+      "name": "taskq",
+      "board": {
+        "kind": "gitlab",
+        "url": "https://gitlab.example/example/taskq/-/issues"
+      },
+      "complete": true,
+      "closed": null,
+      "tasks": []
+    }
+  ],
+  "receipts": {
+    "held": {
+      "create": {
+        "task": 2401,
+        "op_id": "finding.fixture",
+        "outcome": "accepted",
+        "state": "held",
+        "revision": 1,
+        "reason": null,
+        "next": null
+      },
+      "start": null
+    },
+    "partial": {
+      "create": {
+        "task": 2401,
+        "op_id": "finding.fixture",
+        "outcome": "accepted",
+        "state": "held",
+        "revision": 1
+      },
+      "start": {
+        "task": 2401,
+        "op_id": "finding.fixture.start",
+        "outcome": "unknown",
+        "reason": "Board read unavailable"
+      }
+    },
+    "denied": {
+      "create": {
+        "task": 0,
+        "outcome": "rejected",
+        "reason": "Write access denied"
+      },
+      "start": null
+    },
+    "unknown": {
+      "create": {
+        "task": 0,
+        "outcome": "unknown",
+        "reason": "Response lost"
+      },
+      "start": null
+    }
+  },
+  "themes": [
+    "light",
+    "dark"
+  ],
+  "fonts": [
+    16,
+    20
+  ],
+  "widths": [
+    320,
+    360
+  ]
+}

@@ -24,6 +24,7 @@ jobs:
       - run: node tests/answer-card.test.cjs
       - run: node tests/tray-answer.test.cjs
       - run: node tests/project-blocks.test.cjs
+      - run: node tests/finding-composer.test.cjs
       - run: node tests/resource-controls.test.cjs
       - run: node tests/tray-resources.test.cjs
       - run: cargo run --locked -- selftest

@@ -49,7 +49,7 @@ Logical units below. Convert physical monitor/anchor values exactly once using t
 - Human counter is current Ask tasks; Human bars are Ask events in the selected period. Display that distinction in the graph detail.
 - Shared immutable histogram feeds tray and menu. Deduplicate events before binning, preserve M6 `[start,end)` and freshness semantics.
 - Fixed-time bins: same duration, oldest left. Refresh inside a bin does not move individual bars. In rolling mode, advance the whole grid by one bin at a boundary; do not squeeze/stretch spacing or animate fractional drift. A chosen historical/custom range stays fixed.
-- Proposal for rolling alignment: whole epoch-aligned bins, newest containing now; label last bin partial and exact displayed range. This differs from a continuously moving `now-period` window; approve the M6 boundary change before implementation. Existing exact custom bounds remain unchanged.
+- Rolling alignment (approved, M6): whole epoch-aligned bins, newest containing now; label last bin partial and exact displayed range. Existing exact custom bounds remain unchanged.
 - Peak = largest sum of ALL four series. Never normalize bars independently. Menu totals match histogram; current Failed/Human counts need not equal event totals.
 
 ## R-UI5 Cadence raster

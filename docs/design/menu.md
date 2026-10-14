@@ -61,10 +61,10 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 - Four series bottom to top: close, failed, ask, blocked; event history, not CPU or current concurrency.
 - Source: service-local `.taskq/events` cache; event time, task, kind and attempt ID (or comment ID for ask/blocked without attempt). Deduplicate IDs. Repeated failure after requeue is a new event.
 - No board replay. Cache loss means incomplete history; show collection start and gaps. Unknown is not zero.
-- Equal time bins, oldest left; one linear scale across series and bins. Equal counts have equal heights; scale by the largest stacked sum, never 100% per bar.
+- Equal time bins, oldest left; presets use 12 whole epoch-aligned bins, the newest holding now and marked partial; the grid steps one bin at a boundary, never drifts. One linear scale across series and bins. Equal counts have equal heights; scale by the largest stacked sum, never 100% per bar.
 - Default 24 hours; presets 5 min/hour/day/7 days/30 days/custom. Custom start < end, explicit timezone and half-open range [start,end); persist choice.
 - Period never changes scope or the current failed count. Expose precise totals/peak when small segments cannot resolve.
-- Acceptance fixtures have nonzero first/last bars; real zero edges stay empty. Runtime 12 bins remains until I4 rebinning is approved.
+- Acceptance fixtures have nonzero first/last bars; real zero edges stay empty. Runtime keeps 12 source bins; the icon sums adjacent bins to the largest fitting divisor of 12 (I4/I6, D11). Evidence: [icon shift](evidence/icon-shift/README.md).
 
 ## M7 AI entry
 

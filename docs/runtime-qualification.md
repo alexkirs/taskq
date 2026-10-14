@@ -124,3 +124,34 @@ Candidate `5297419` includes main through `c6d46bd` (access presets). Native Cla
 ### Remaining adoption limits
 
 This matrix is complete as an inventory, not all-green acceptance. Q4 outage/invalid-input cases, Q5 negative sandbox boundaries (outside writes, symlinks, Git common-dir, network denial), hard service/client crash and interrupted-launch recovery, and actual web/mobile/Desktop list readback remain unqualified. The native restart probe verifies deferral, not a full installed-version upgrade. Windows Codex workspace-write remains blocked by the previously recorded native ACL error. Native Remote Control registration does not prove Desktop integration, permanent connectivity or an OS sandbox. Production adoption must retain these distinctions; Linux currently qualifies Codex only.
+
+### Linux constrained launch investigation (2026-10-14)
+
+Codex 0.162.0 on `hermes-fra1`, working TaskQ `4.2.0-dev.1791952400`; no TaskQ grant or project configuration changed. Windows deferred by the owner.
+
+| Boundary | Actual evidence | Result |
+|---|---|---|
+| Native Codex `workspace-write`, start/resume | Session `01a138cd-7bc4-7ad0-8eb2-717287eb1236`: both turns executed the fixture, wrote/read output, and received `EROFS` for the external canary; controller verified unchanged canary and same session. Four pinned specq bodies were supplied on both inputs by the probe, not TaskQ. | Native baseline only; not TaskQ acceptance |
+| Entire CLI inside `codex sandbox` | Explicit profile allowed workspace/state writes and denied outside/policy/config writes. Real inner CLI session `01a138cc-d61c-7751-918b-8c5c83646055` could not execute tools: the outer sandbox masks `/tmp/codex-daemon-1000` with mode `000`, while the inner sandbox requires an owned `0700` directory. | Refused; no Full retry |
+| Entire CLI inside system `bubblewrap` | Disposable runner `hermes-isolated-721881a5724b.service`; bwrap 0.9.0 failed before the CLI with `setting up uid map: Permission denied`. Kernel audit recorded AppArmor `unprivileged_userns` denial for `setpcap` and `uid_map`. | Host enforcement prerequisite blocked; no AppArmor/ACL change |
+
+The newly installed probe-only `bubblewrap` package was removed: its PATH presence would replace Codex's previously working bundled helper. Native `codex sandbox -P :read-only --include-managed-config -- /usr/bin/true` passed again afterward. Working services were not restarted. TaskQ's Linux admission refusal remains: do not convert the native baseline into a protected policy-store claim, or enable a preset without the complete boundary. These probes do not qualify Claude, network denial, symlink escapes or production adoption.
+
+### Linux TaskQ constrained acceptance (2026-10-14)
+
+Supersedes the TaskQ launch blocker above, not the other platform limits. Candidate `9c7f62d80694210ad7198573de55dedb00fbb132`, build `4.2.0-dev.1791956000`, Codex CLI 0.162.0 on FRA. Root-owned `taskq-sandbox` and private bwrap 0.9.0-1ubuntu0.3 have mode 0755 and no setid/file capabilities; only the helper's AppArmor profile was loaded. Global `apparmor_restrict_unprivileged_userns=1` and the pre-existing native Codex bwrap profile remain unchanged. No system/PATH bwrap was installed. Helper and fixture CLI SHA-256: `247c037977a67a0a5f207afc0f3187c9e76f374c3bce447b7da264bde11eae93`.
+
+| Real TaskQ path | Native sessions | Observed acceptance |
+|---|---|---|
+| Restricted worker / reviewer | `01a138ed-5a1d-7db2-9ddc-66923e0dc297` / `01a138ed-b328-79a0-956e-76efe654a1ee` | Both execute commands on start and same-ID resume; project writes and all five negative canaries denied |
+| Workspace worker / reviewer | `01a138ee-1d76-7a11-931a-ed2dbc040598` / `01a138ee-8219-76d2-8b57-541552305efb` | Both execute commands on start and same-ID resume; project writes succeed; outside, installation-policy directory, project config, symlink and child writes denied; controller reads all canaries unchanged |
+| Revoked continuation | All four sessions above | Fixture grant removed after completion; production adapter refuses next continuation before spawn; original fixture grant restored |
+| Workspace operator | `01a138ee-ba08-7b53-abb3-f36adbaf78c5` | Real read/copy/check, same-ID append/check and disabled-runtime continuation refusal |
+
+The controller compared all four pinned specq bodies with all eight actual worker/reviewer inputs. Every role/mode reported the injected empty-case regression (`expected=0`, `candidate=9`) despite exit 0, distinguished it from passing active/repeated cases, and stated evidence limits. This proves application for the supplied scenario, not universal rule obedience. The role check calls the production spawn/resume adapter; it does not repeat board claim/ask/result/close lifecycle qualification.
+
+Retained checks: ignored `live_linux_boundary_matrix` with `TASKQ_QUALIFY_SANDBOX=read-only|workspace-write`, plus existing `live_operator_matrix`. Role fixture uses `TASKQ_QUALIFY_ROOT`, `TASKQ_INSTALL`, `TASKQ_QUALIFY_EXE`; provide a disposable registered root, existing `.codex`, native login/config and an explicit fixture-only project grant. Operator fixture additionally needs its temporary board credential; remove it after the run. Paid checks are manual, not per-commit CI. Linux runner journals: `hermes-isolated-9c0d44f58a61.service` (both role modes, 95 s), `hermes-isolated-0dcd6ad4b338.service` (operator, 51 s). Linux release checks: 127 + 5 + 1; macOS: 148 + 5 + 1. Both selftests passed 69 traces/formats; only macOS additionally read the live board.
+
+Working serverq/dashq/agentq/taskq services retained PIDs 1391794/1391815/1391839/1391866, config hashes and no policy file; gateway PID 204574, zero restarts. No Full, working grant, queue activation or service restart. Initial DNS mount and missing fixture Git-directory failures were corrected and repeated; neither counts as acceptance. The private `/run` now preserves only the canonical DNS file read-only.
+
+Still unqualified here: Linux Claude (not installed), Windows constrained mode (owner deferred), network denial, Git common-dir and nested-launcher escape probes, hard crash/recovery and production queue adoption. Native Codex sandbox prerequisites must already work on the host. The sandbox permits normal provider transport and documented state/cache writes; it is not a per-project account or a complete network isolation boundary.

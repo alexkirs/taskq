@@ -208,7 +208,7 @@ pub fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op) ->
             // § 4 Profiling: `checks` is the CI verification and merge call, `close` the whole publication
             let (began, attempt) = (std::time::Instant::now(), t.attempt.unwrap_or(0));
             let rt = t.session.as_deref().and_then(|s| s.split(':').next()).unwrap_or("other").to_string();
-            let stage = |name, began: std::time::Instant, outcome, err| crate::profile::stage(name, n, attempt, &rt, began.elapsed(), outcome, err, crate::profile::Usage::NoModel);
+            let stage = |name, began: std::time::Instant, outcome, err| crate::profile::stage(name, n, attempt, &rt, Some(began.elapsed()), outcome, err, crate::profile::Usage::NoModel);
             let published = b.publish(n, &sha, &cfg.publish, &issue.title, &format!("Task: {}", b.url(n)));
             let (outcome, err) = match &published {
                 Publish::Done(_) => ("ok", "none"),

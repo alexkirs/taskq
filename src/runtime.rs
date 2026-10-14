@@ -143,17 +143,20 @@ pub fn usage(log: &Path, pos: u64, rt: &str) -> crate::profile::Usage {
     let mut text = String::new();
     let Ok(mut f) = File::open(log) else { return Usage::Unknown("log-unreadable") };
     if f.seek(SeekFrom::Start(pos)).and_then(|_| f.read_to_string(&mut text)).is_err() { return Usage::Unknown("log-unreadable"); }
-    let (mut ids, mut tokens, mut turns) = (std::collections::HashSet::new(), 0u64, false);
+    let (mut ids, mut tokens, mut turns, mut missing) = (std::collections::HashSet::new(), 0u64, false, false);
     for v in text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
         let u = if v["type"] == "assistant" { &v["message"]["usage"] } else { &v["usage"] };
         let sum = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"].iter().filter_map(|k| u[k].as_u64()).sum::<u64>();
-        match v["type"].as_str() {
+        // a call without input tokens makes the stage's tokens unknown, never a smaller known sum
+        let counted = match v["type"].as_str() {
             // one message spans several lines with the same id and usage
-            Some("assistant") if u.is_object() && v["message"]["id"].as_str().is_some_and(|id| ids.insert(id.to_string())) => tokens += sum,
-            Some("turn.completed") if u["input_tokens"].is_u64() => { turns = true; tokens += sum }
-            _ => {}
-        }
+            Some("assistant") => v["message"]["id"].as_str().is_some_and(|id| ids.insert(id.to_string())),
+            Some("turn.completed") => { turns = true; true }
+            _ => false,
+        };
+        if counted { if u["input_tokens"].is_u64() { tokens += sum } else { missing = true } }
     }
+    let tokens = (!missing).then_some(tokens);
     if !ids.is_empty() { Usage::Known { calls: Some(ids.len() as u64), tokens } }
     else if turns { Usage::Known { calls: None, tokens } }
     else { Usage::Unknown("no-usage") }

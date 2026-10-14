@@ -89,10 +89,11 @@ pub const STAGES: [&str; 7] = ["claim", "start", "build", "checks", "review", "a
 const STAGE_PREFIX: &str = "taskq-stage ";
 const OUTCOMES: [&str; 5] = ["ok", "ask", "retried", "failed", "cancelled"];
 const RUNTIMES: [&str; 4] = ["claude", "codex", "codex-app", "other"];
-const UNKNOWN: [&str; 4] = ["no-model", "no-usage", "log-unreadable", "app-turn"];
+const UNKNOWN: [&str; 5] = ["no-model", "no-usage", "log-unreadable", "app-turn", "adopted"];
 
-/// Model use of one stage: service stages run no model; a runtime that reports none reads unknown, never zero.
-pub enum Usage { NoModel, Unknown(&'static str), Known { calls: Option<u64>, tokens: u64 } }
+/// Model use of one stage: service stages run no model; a runtime that reports none reads unknown, never zero;
+/// `tokens` is `None` when any counted call lacked usage.
+pub enum Usage { NoModel, Unknown(&'static str), Known { calls: Option<u64>, tokens: Option<u64> } }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,7 +102,8 @@ struct Stage {
     task: u64,
     attempt: u64,
     rt: String,
-    us: u64,
+    /// `None`: the stage began in a replaced service image (adopted child), reason in `unknown`
+    us: Option<u64>,
     outcome: String,
     error: String,
     at_ms: Option<u64>,
@@ -121,19 +123,19 @@ fn now_ms() -> Option<u64> {
 pub fn class(text: &str) -> &'static str { error(text) }
 
 /// One `taskq-stage` line in this process's `taskq.log`; a failed write is reported unknown, never fails the stage.
-pub fn stage(name: &'static str, task: u64, attempt: u64, rt: &str, took: std::time::Duration, outcome: &'static str, err: &'static str, usage: Usage) {
+pub fn stage(name: &'static str, task: u64, attempt: u64, rt: &str, took: Option<std::time::Duration>, outcome: &'static str, err: &'static str, usage: Usage) {
     stage_at(LOG.get().map(PathBuf::as_path), name, task, attempt, rt, took, outcome, err, usage)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stage_at(path: Option<&Path>, name: &'static str, task: u64, attempt: u64, rt: &str, took: std::time::Duration, outcome: &'static str, err: &'static str, usage: Usage) {
+fn stage_at(path: Option<&Path>, name: &'static str, task: u64, attempt: u64, rt: &str, took: Option<std::time::Duration>, outcome: &'static str, err: &'static str, usage: Usage) {
     let (calls, tokens, unknown) = match usage {
         Usage::NoModel => (None, None, Some("no-model")),
         Usage::Unknown(r) => (None, None, Some(r)),
-        Usage::Known { calls, tokens } => (calls, Some(tokens), None),
+        Usage::Known { calls, tokens } => (calls, tokens, tokens.is_none().then_some("no-usage")),
     };
     let r = Stage { stage: name.into(), task, attempt, rt: RUNTIMES.into_iter().find(|k| *k == rt).unwrap_or("other").into(),
-        us: took.as_micros().min(u64::MAX as u128) as u64, outcome: outcome.into(), error: err.into(), at_ms: now_ms(), calls, tokens, unknown: unknown.map(Into::into) };
+        us: took.map(|d| d.as_micros().min(u64::MAX as u128) as u64), outcome: outcome.into(), error: err.into(), at_ms: now_ms(), calls, tokens, unknown: unknown.map(Into::into) };
     let Some(path) = path else { return };
     let line = serde_json::to_string(&r).map(|j| format!("{STAGE_PREFIX}{j}\n"));
     if line.map_err(std::io::Error::other).and_then(|l| append_line(path, &l)).is_err() {
@@ -159,14 +161,15 @@ fn render_stages(text: &str) -> Result<String, &'static str> {
     rows.sort_by_key(|(k, _)| *k);
     for (_, v) in &mut rows { v.sort_unstable_by_key(|r| r.us); }
     let share = |v: &[Stage], o: &str| v.iter().filter(|r| r.outcome == o).count() as f64 / v.len() as f64;
-    let p = |v: &[Stage], p: usize| v[(v.len() * p).div_ceil(100) - 1].us;
+    // percentiles over timed records only (sorted, untimed first); untimed rows rank last
+    let p = |v: &[Stage], p: usize| { let t: Vec<u64> = v.iter().filter_map(|r| r.us).collect(); (!t.is_empty()).then(|| t[(t.len() * p).div_ceil(100) - 1]) };
     let rank = |key: &dyn Fn(&[Stage]) -> f64| {
         let mut r: Vec<_> = rows.iter().collect();
         r.sort_by(|a, b| key(&b.1).total_cmp(&key(&a.1)).then(a.0.cmp(&b.0)));
         r.iter().map(|((i, rt), _)| format!("{}/{rt}", STAGES[*i])).collect::<Vec<_>>().join(" > ")
     };
     let mut out = format!("Attempt stages: retained observations; all budgets unknown\nSlow stages (p95): {}\nFailing stages (rate): {}\nRetried stages (rate): {}\n\n| Stage | Runtime | Count | p50/p95/max ms | Outcomes | Model calls | Context tokens | Budget |\n|---|---|---:|---|---|---|---|---|\n",
-        rank(&|v| p(v, 95) as f64), rank(&|v| share(v, "failed")), rank(&|v| share(v, "retried")));
+        rank(&|v| p(v, 95).map_or(-1., |u| u as f64)), rank(&|v| share(v, "failed")), rank(&|v| share(v, "retried")));
     for ((i, rt), v) in &rows {
         let mut counts = std::collections::BTreeMap::new();
         for r in v.iter() {
@@ -185,8 +188,14 @@ fn render_stages(text: &str) -> Result<String, &'static str> {
                 k => format!("{} ({k} of {} known; {})", known.iter().sum::<u64>(), v.len(), reasons.join(", ")),
             }
         };
-        out += &format!("| {} | {rt} | {} | {:.3}/{:.3}/{:.3} | {outcomes} | {} | {} | unknown |\n", STAGES[*i], v.len(),
-            p(v, 50) as f64 / 1000., p(v, 95) as f64 / 1000., v.last().unwrap().us as f64 / 1000., unknown(|r| r.calls), unknown(|r| r.tokens));
+        let ms = |u: u64| u as f64 / 1000.;
+        let timed = v.iter().filter(|r| r.us.is_some()).count();
+        let took = match (p(v, 50), p(v, 95), v.last().and_then(|r| r.us)) {
+            (Some(a), Some(b), Some(c)) if timed == v.len() => format!("{:.3}/{:.3}/{:.3}", ms(a), ms(b), ms(c)),
+            (Some(a), Some(b), Some(c)) => format!("{:.3}/{:.3}/{:.3} ({timed} of {} timed; adopted)", ms(a), ms(b), ms(c), v.len()),
+            _ => "unknown (adopted)".into(),
+        };
+        out += &format!("| {} | {rt} | {} | {took} | {outcomes} | {} | {} | unknown |\n", STAGES[*i], v.len(), unknown(|r| r.calls), unknown(|r| r.tokens));
     }
     Ok(out)
 }
@@ -396,21 +405,26 @@ mod tests {
         // one Claude message spans several lines with one id; a second id is a second call; lines before launch are skipped
         let before = format!("{}\n", claude.replace("m1", "m0"));
         fs::write(&attempt, format!("{before}{claude}\n{claude}\n{}\n", claude.replace("m1", "m2"))).unwrap();
-        let ms = std::time::Duration::from_millis;
+        let ms = |m| Some(std::time::Duration::from_millis(m));
         stage_at(Some(&path), "build", 7, 1, "claude", ms(9), "ok", "none", crate::runtime::usage(&attempt, before.len() as u64, "claude"));
         fs::write(&attempt, format!("{codex}\n{codex}\n")).unwrap();
         stage_at(Some(&path), "build", 8, 2, "codex", ms(5), "ask", "none", crate::runtime::usage(&attempt, 0, "codex"));
         stage_at(Some(&path), "build", 9, 3, "codex", ms(1), "failed", "exit", crate::runtime::usage(&dir.join("missing"), 0, "codex"));
         stage_at(Some(&path), "review", 7, 4, "codex-app", ms(2), "ok", "none", crate::runtime::usage(&attempt, 0, "codex-app"));
         stage_at(Some(&path), "claim", 7, 1, "private-rt", ms(3), "failed", class("HTTP 502 secret /host/path"), Usage::NoModel);
+        // a Claude call with empty usage keeps the call count and makes tokens unknown, never 0; an adopted child is untimed
+        fs::write(&attempt, format!("{}\n", claude.replace(r#""usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}"#, r#""usage":{}"#))).unwrap();
+        stage_at(Some(&path), "review", 7, 5, "claude", ms(4), "ok", "none", crate::runtime::usage(&attempt, 0, "claude"));
+        stage_at(Some(&path), "review", 7, 6, "claude", None, "ok", "none", Usage::Unknown("adopted"));
         let log = fs::read_to_string(&path).unwrap();
         assert!(!log.contains("secret") && !log.contains("/host/path") && !log.contains("private-rt"));
         let text = report(&dir);
-        assert!(text.contains("Slow stages (p95): build/claude > build/codex > claim/other > review/codex-app"), "{text}");
+        assert!(text.contains("Slow stages (p95): build/claude > build/codex > review/claude > claim/other > review/codex-app"), "{text}");
         assert!(text.contains("Failing stages (rate): claim/other > build/codex"), "{text}");
         assert!(text.contains("| build | claude | 1 | 9.000/9.000/9.000 | ok:1 | 2 | 230 | unknown |"), "{text}");
         assert!(text.contains("| build | codex | 2 | 1.000/5.000/5.000 | ask:1, failed exit:1 | unknown (log-unreadable, not-reported) | 1400 (1 of 2 known; log-unreadable) |"), "{text}");
         assert!(text.contains("| review | codex-app | 1 | 2.000/2.000/2.000 | ok:1 | unknown (app-turn) | unknown (app-turn) |"), "{text}");
+        assert!(text.contains("| review | claude | 2 | 4.000/4.000/4.000 (1 of 2 timed; adopted) | ok:2 | 1 (1 of 2 known; adopted) | unknown (adopted, no-usage) |"), "{text}");
         assert!(text.contains("| claim | other | 1 | 3.000/3.000/3.000 | failed http5xx:1 | none (no model) | none (no model) |"), "{text}");
         fs::write(&path, format!("{log}{STAGE_PREFIX}{{\"stage\":\"lunch\"}}\n")).unwrap();
         assert!(report(&dir).contains("Attempt stages: unknown (corrupt stage record; log kept)"));

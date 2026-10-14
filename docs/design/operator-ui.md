@@ -26,5 +26,5 @@ This file contains TaskQ-specific checks, not a second definition of the shared 
 | D-A7 | The menu contains no empty groups or redundant content. |
 | D-A8 | Compact counters hide 0; symbols with 1/12/100 fit; unknown stays visible. Wrap as a group under K rules, never stretch across empty width. |
 
-General improvements belong in specq. TaskQ behavior belongs in taskq.md and its linked specifications.
+General improvements follow [shared-rule improvement](https://github.com/taskqorg/specq/blob/main/engineering/spec-first.md#improve-shared-rules). TaskQ behavior belongs in taskq.md and its linked specifications.
 Preserve these acceptance IDs when refining product checks.

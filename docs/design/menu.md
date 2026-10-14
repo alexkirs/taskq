@@ -184,5 +184,5 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 | M-A20 | Shared editor preserves Mixed, untouched fields/targets and per-project readback. |
 | M-A21 | Pin keeps the menu open as a movable window above normal windows; position and pinned state survive a tray restart; unpin returns to the popover; Windows edge snap, macOS work-area clamp. |
 
-[Verification](verification.md) separates historical evidence from the current candidate. General principles change in specq; TaskQ behavior changes here under R13.
+[Verification](verification.md) separates historical evidence from the current candidate. General principles change per [shared-rule improvement](https://github.com/taskqorg/specq/blob/main/engineering/spec-first.md#improve-shared-rules); TaskQ behavior changes here under R13.
 | M-A22 | Each kind follows its host or project setting; an event notifies once across tray restarts; a burst becomes one summary; a click opens the card; OS denial shows Blocked and posts nothing. |

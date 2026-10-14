@@ -59,7 +59,7 @@ Ship the accepted D14 intentions: Plan first, Implement and review, Urgent fix, 
 ## P2 AI-led authoring
 
 - One input: goal, repository set, constraints and desired result. Existing project/task context accompanies it. No phase wizard by default.
-- AI reads existing tasks/specs, resolves duplicates, proposes small tasks, acceptance, dependencies, owner gates and exact environment membership. Ask only material unresolved questions.
+- AI reads existing tasks/specs, resolves duplicates, proposes small tasks, acceptance, dependencies, owner gates and exact environment membership. Questions follow the [shared working agreement](https://github.com/taskqorg/specq/blob/main/design/workflow.md#working-agreement).
 - Preview: short goal, repository set, sequential groups and parallel siblings, task counts, waits, publication behavior and external effects. Expand a row for issue/evidence, not another status dashboard.
 - Detect cycles, missing references and inaccessible repositories before creation. Unsupported semantics stay explicit; no guessed cross-board dependency or shared-capacity guarantee.
 - Default to Create tasks only. An explicit request to start can select Create tasks & start in the same review; start affects only the reviewed task set within existing admission gates. Never broaden focus implicitly. A paused project remains paused unless separately reviewed.

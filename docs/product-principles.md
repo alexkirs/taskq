@@ -38,7 +38,7 @@ Evidence uploads use an authorized destination and its visibility. Screenshots p
 
 ## Feature selection
 
-Ship the recommended flows as editable defaults. Prefer the simplest composition that covers the case; retain useful alternatives behind explicit options. Defaults are visible, versioned and scoped; existing overrides survive updates. [Decision register](design/decision-register.md) separates proposed defaults from approved settings.
+Defaults, alternatives and overrides follow [shared AI-assisted controls](https://github.com/taskqorg/specq/blob/main/design/workflow.md#ai-assisted-controls). Defaults are visible, versioned and scoped. [Decision register](design/decision-register.md) separates proposed defaults from approved settings.
 
 Before adopting a feature, identify the owner use case, board-visible outcome, existing primitive, authority, failure behavior and shortest UI path.
 Prefer a reviewed AI proposal plus an existing command. Add a new engine only when that cannot satisfy the case.

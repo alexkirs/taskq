@@ -16,6 +16,13 @@ static RUN: OnceLock<Option<u64>> = OnceLock::new();
 static SPAN: AtomicU64 = AtomicU64::new(1);
 thread_local!(static PARENT: Cell<u64> = const { Cell::new(0) });
 
+#[cfg(test)]
+thread_local!(static OBSERVED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) });
+#[cfg(test)]
+pub fn take_report() -> String {
+    OBSERVED.with(|v| render(&std::mem::take(&mut *v.borrow_mut())).unwrap())
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
@@ -54,6 +61,8 @@ impl Drop for Observation<'_> {
     fn drop(&mut self) {
         if let Some(t) = &self.record.trace { PARENT.set(t.parent); }
         self.record.us = self.began.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        #[cfg(test)]
+        OBSERVED.with(|v| { *v.borrow_mut() += &format!("{PREFIX}{}\n", serde_json::to_string(&self.record).unwrap()); });
         if let Some(path) = self.path {
             if append(path, &self.record).is_err() {
                 let _ = writeln!(std::io::stderr().lock(), "Profiling: unknown (taskq.log full or append failed; service pruning required)");

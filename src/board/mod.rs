@@ -152,10 +152,6 @@ fn quote(s: &str) -> String {
 
 /// One request, any HTTP status. The token and body go through curl's config on stdin, never argv (R12: no secrets in `ps`).
 fn curl(method: &str, url: &str, auth: &str, body: Option<&Value>) -> Result<Reply> {
-    crate::profile::measure("forge.call", || curl_inner(method, url, auth, body))
-}
-
-fn curl_inner(method: &str, url: &str, auth: &str, body: Option<&Value>) -> Result<Reply> {
     let mut cfg = format!(
         "silent\nshow-error\ndump-header = \"-\"\nrequest = {}\nurl = {}\nheader = {}\nheader = \"Accept: application/json\"\nheader = \"Expect:\"\nmax-time = 60\n",
         quote(method), quote(url), quote(auth)
@@ -313,25 +309,27 @@ impl Api {
             return Err(format!("{method} {url}: {}", crate::requests::paused_text(reset)));
         }
         self.budget.borrow_mut().count(op.into());
-        #[cfg(test)]
-        let r = match &self.transport { Some(transport) => transport(method, &url, body)?, None => curl(method, &url, &self.auth, body.as_ref())? };
-        #[cfg(not(test))]
-        let r = curl(method, &url, &self.auth, body.as_ref())?;
-        if let Some(t) = r.header("date").and_then(http_date) {
-            *self.clock.borrow_mut() = t;
-        }
-        // GitHub GraphQL refuses an exhausted budget with HTTP 200 and a RATE_LIMITED error
-        let status = if url.ends_with("/graphql") && r.status == 200 && r.body.contains("\"RATE_LIMITED\"") { 403 } else { r.status };
-        let paused = self.budget.borrow_mut().observe(status, |n| r.header(n).map(String::from), *self.clock.borrow(), std::time::Instant::now());
-        if let Some(reset) = paused {
-            return Err(format!("{method} {url}: HTTP {status} {}", crate::requests::paused_text(reset)));
-        }
-        if !(200..300).contains(&r.status) {
-            // one log line: a multi-line error body folds into it (§ 4)
-            let body = r.body.split_whitespace().collect::<Vec<_>>().join(" ");
-            return Err(format!("{method} {url}: HTTP {} {}", r.status, body.chars().take(300).collect::<String>()));
-        }
-        Ok(r)
+        crate::profile::measure("forge.call", || {
+            #[cfg(test)]
+            let r = match &self.transport { Some(transport) => transport(method, &url, body)?, None => curl(method, &url, &self.auth, body.as_ref())? };
+            #[cfg(not(test))]
+            let r = curl(method, &url, &self.auth, body.as_ref())?;
+            if let Some(t) = r.header("date").and_then(http_date) {
+                *self.clock.borrow_mut() = t;
+            }
+            // GitHub GraphQL refuses an exhausted budget with HTTP 200 and a RATE_LIMITED error
+            let status = if url.ends_with("/graphql") && r.status == 200 && r.body.contains("\"RATE_LIMITED\"") { 403 } else { r.status };
+            let paused = self.budget.borrow_mut().observe(status, |n| r.header(n).map(String::from), *self.clock.borrow(), std::time::Instant::now());
+            if let Some(reset) = paused {
+                return Err(format!("{method} {url}: HTTP {status} {}", crate::requests::paused_text(reset)));
+            }
+            if !(200..300).contains(&r.status) {
+                // one log line: a multi-line error body folds into it (§ 4)
+                let body = r.body.split_whitespace().collect::<Vec<_>>().join(" ");
+                return Err(format!("{method} {url}: HTTP {} {}", r.status, body.chars().take(300).collect::<String>()));
+            }
+            Ok(r)
+        })
     }
 
     fn all(&self, url: &str) -> Result<Vec<Value>> {
@@ -744,6 +742,28 @@ mod tests {
             assert!(h.call("GET", "/issues", None).and_then(|r| r.json()).is_err());
             assert_eq!(crate::incident::take_detected(), if fail { vec![] } else { vec!["adapter.bad_json"] });
         }
+    }
+
+    // Chain: A3 forge response -> profile report. Risk: HTTP/GraphQL failures count as successes or pauses send again.
+    #[test]
+    fn forge_outcomes_reach_profile_report() {
+        crate::profile::take_report();
+        for (status, body, limited) in [(200, "{}", false), (204, "", false), (404, "private response", false),
+            (503, "private response", false), (200, "{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}", true)] {
+            let mut api = (github::KIND.api)("github.com", "o/r", "private token");
+            api.transport = Some(Box::new(move |_, _, _| Ok(Reply { status, body: body.into(), operation: "read",
+                headers: if limited { vec![("retry-after".into(), "60".into())] } else { vec![] } })));
+            assert_eq!(api.call("POST", "https://api.github.com/graphql", None).is_ok(), status < 300 && !limited);
+            if limited {
+                assert!(api.call("POST", "https://api.github.com/graphql", None).err().unwrap().contains("paused until"));
+                assert_eq!(api.budget.borrow().total(), 1);
+            }
+        }
+        let report = crate::profile::take_report();
+        assert!(report.contains("| forge.call | 5 |"), "{report}");
+        assert!(report.contains("| 2/3 | 60.00 |"), "{report}");
+        assert!(report.contains("http4xx:2, http5xx:1"), "{report}");
+        assert!(!report.contains("private"));
     }
 
     fn label_board(kind: &'static Kind, fail: bool, mismatch: bool) -> (Box<dyn Board>, std::rc::Rc<RefCell<Vec<Value>>>, std::rc::Rc<RefCell<usize>>) {

@@ -9,6 +9,7 @@ mod enrollment;
 mod incident;
 mod labels;
 mod operator;
+mod recipe;
 mod platform;
 mod retro;
 mod runtime;
@@ -41,7 +42,8 @@ const USAGE: &str = "taskq agents
  taskq result N --sha SHA --checks C.. --text T [--option O.. --recommend K --link URL..]
  taskq requeue N [--text T] | taskq later N [--text T]
  taskq steer N --text T | taskq failed N --text T
- taskq close N [M..] [--text VERDICT]
+ taskq close N [M..] [--text VERDICT] | taskq approve N [--sha SHA]
+ taskq recipe NAME --run ID [--goal G] [--start]
  taskq status [--only L,..] [--json] | taskq inbox N
  taskq retro | taskq add --retro K [--type T ..]
  taskq wait [--window MIN] [--only L,..]
@@ -68,7 +70,7 @@ impl Args {
         while let Some(x) = it.next() {
             match x.strip_prefix("--") {
                 Some(k) => {
-                    let val = if matches!(k, "later" | "hold" | "check" | "force" | "help" | "json" | "apply") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
+                    let val = if matches!(k, "later" | "hold" | "start" | "check" | "force" | "help" | "json" | "apply") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
                     a.flags.entry(k.to_string()).or_default().push(val);
                 }
                 None => a.pos.push(x.clone()),
@@ -78,7 +80,7 @@ impl Args {
             Some("close") => a.pos.len(),
             Some("answer") if a.pos.get(1).is_some_and(|p| p.contains('.')) => a.pos.len(),
             Some("service") if a.pos.get(1).is_some_and(|p| p == "focus") => a.pos.len(),
-            Some("service" | "add" | "start" | "ask" | "answer" | "result" | "requeue" | "later" | "failed" | "steer" | "inbox") => 2,
+            Some("service" | "add" | "start" | "approve" | "recipe" | "ask" | "answer" | "result" | "requeue" | "later" | "failed" | "steer" | "inbox") => 2,
             _ => 1,
         };
         if a.pos.len() > used {
@@ -1257,6 +1259,124 @@ fn tray(_install: PathBuf, _snapshot: Option<&str>, _icon: Option<&str>) -> Res<
 
 // ---------- commands ----------
 
+/// The fields of one new task (§ 1), from `add` or a recipe (§ 7).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NewTask {
+    pub title: String,
+    pub goal: String,
+    pub acceptance: Vec<String>,
+    pub scope: Vec<String>,
+    pub deps: Vec<u64>,
+    pub kind: Option<String>,
+    pub runtime: Option<String>,
+    pub priority: Option<String>,
+    pub host: Option<String>,
+    pub hold: bool,
+    /// `--later` with its text.
+    pub later: Option<String>,
+    /// Extra labels, e.g. `needs-gate`.
+    pub labels: Vec<String>,
+}
+
+/// Task body and create claim shared by direct adds and recipes; limits checked before any write.
+fn add_task(b: &dyn Board, root: &Path, raw: &Value, t: &NewTask, op: &Op) -> Res<Receipt> {
+    if t.title.trim().is_empty() || t.title.contains(['\r', '\n']) || t.title.chars().count() > 80 {
+        return Err("title: one line, at most 80 characters; shorten it".into());
+    }
+    let goal: Vec<String> = t.goal.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+    limit("Goal", &goal, 1, 2, 240)?;
+    one_line("--acceptance", &t.acceptance)?;
+    one_line("--scope", &t.scope)?;
+    let acc: Vec<String> = t.acceptance.iter().enumerate().map(|(i, s)| format!("A{}. {s}", i + 1)).collect();
+    limit("Acceptance", &acc, 1, 8, 240).map_err(|e| if acc.len() > 8 { format!("{e} (split the task, R2)") } else { e })?;
+    let scope: Vec<String> = t.scope.iter().map(|s| format!("- {s}")).collect();
+    limit("Scope", &scope, 0, 4, 240)?;
+    let mut body = format!("## Goal\n{}\n\n## Acceptance\n{}\n", goal.join("\n"), acc.join("\n"));
+    if !scope.is_empty() {
+        body += &format!("\n## Scope\n{}\n", scope.join("\n"));
+    }
+    if !t.deps.is_empty() {
+        body += "\n";
+        body += &t.deps.iter().map(|d| format!("Depends on #{d}\n")).collect::<String>();
+    }
+    for (flag, v, allowed) in [("type", &t.kind, &["code", "docs", "research", "asset"][..]), ("runtime", &t.runtime, &["codex", "claude", "codex-app"][..]), ("priority", &t.priority, &["0", "1", "2"][..])] {
+        if v.as_deref().is_some_and(|v| !allowed.contains(&v)) {
+            return Err(format!("--{flag} requires one of {}", allowed.join("|")));
+        }
+    }
+    if t.host.as_deref().is_some_and(|v| v.is_empty() || v.contains(',') || v.chars().any(char::is_whitespace)) {
+        return Err("--host requires one nonempty host name".into());
+    }
+    if t.priority.as_deref() == Some("0") && !b.canonical_labels()? {
+        return Err("--priority 0 needs the canonical label schema (§ 9)".into());
+    }
+    if t.hold && t.later.is_some() {
+        return Err("--hold and --later exclude each other".into());
+    }
+    if let Some(id) = &op.id {
+        body += &format!("\nop-id: {id}\n");
+    }
+    let blocked = deps_open(b, &body)?;
+    // a held task gets `q-held` instead of `taskq`: no service of any version admits it before `start`
+    let mut labels = if t.hold { vec![b.state_label("held")?] } else { vec![service::TASK_LABEL.to_string(), b.state_label(if blocked { "waiting" } else { "ready" })?] };
+    for (v, prefix) in [(&t.kind, ""), (&t.runtime, "run-"), (&t.priority, if b.canonical_labels()? { "p" } else { "priority-" }), (&t.host, "host-")] {
+        if let Some(v) = v {
+            labels.push(format!("{prefix}{v}"));
+        }
+    }
+    labels.extend(t.labels.iter().cloned());
+    labels::validate(&labels)?;
+    let n = if op.id.is_some() {
+        match claimed_create(b, raw, &t.title, &body, &labels, t.later.as_deref().unwrap_or(""), op) {
+            Ok(n) => n,
+            Err(r) => return Ok(r),
+        }
+    } else { b.create(&t.title, &body, &labels)? };
+    let r = match (t.hold, &t.later) {
+        (true, _) => act(b, root, n, "hold", &[], "", &Op::default()),
+        (_, Some(text)) => act(b, root, n, "later", &[], text, &Op::default()),
+        _ => Receipt::accepted(n, op, fold(n, &[], blocked).state, 0),
+    };
+    poke(root);
+    Ok(Receipt { op_id: op.id.clone(), ..r })
+}
+
+/// § 7 recipe run: every task is added held with op id `recipe.<name>.<version>.<run>.<k>` and read back; only then,
+/// with `start`, do they start. A rerun returns the first receipts.
+fn run_recipe(b: &dyn Board, root: &Path, raw: &Value, name: &str, run: &str, goal: Option<&str>, start: bool) -> Res<Vec<Receipt>> {
+    let (version, items) = recipe::load(raw, name, run, goal)?;
+    let base = |k: usize| format!("recipe.{name}.{version}.{run}.{}", k + 1);
+    let (mut out, mut made) = (vec![], vec![]);
+    for (k, item) in items.into_iter().enumerate() {
+        let new = NewTask { deps: item.deps.iter().map(|d| made[d - 1]).collect(), ..item.task };
+        let r = add_task(b, root, raw, &new, &Op { id: Some(base(k)), revision: None })?;
+        let r = if r.ok() && item.gate { act(b, root, r.task, "gate", &[], "", &Op { id: Some(format!("{}.gate", base(k))), revision: None }) } else { r };
+        let ok = r.ok();
+        made.push(r.task);
+        out.push(r);
+        if !ok {
+            return Ok(out);
+        }
+    }
+    if start {
+        out = made.iter().enumerate().map(|(k, n)| start_task(b, root, *n, &Op { id: Some(format!("{}.start", base(k))), revision: None })).collect::<Res<_>>()?;
+    }
+    Ok(out)
+}
+
+/// § 1 `start`: `taskq` goes on after the `start` entry; a retry adds the label a failed write left off.
+fn start_task(b: &dyn Board, root: &Path, n: u64, op: &Op) -> Res<Receipt> {
+    let r = act(b, root, n, "start", &[], "", op);
+    let issue = b.issue(n)?;
+    let started = entries(b, n)?.iter().any(|e| !e.edited && e.body.starts_with("taskq: start"));
+    if started && issue.open && !service::is_task(&issue) {
+        b.labels(n, &[service::TASK_LABEL.into()], &[])?;
+        let (_, t, _) = current(b, n)?;
+        return Ok(Receipt::accepted(n, op, t.state, core::revision(n, &entries(b, n)?)));
+    }
+    Ok(r)
+}
+
 /// § 5 receipts: JSON lines with `--json`, else the text lines; any receipt not accepted fails after all are shown.
 fn emit(rs: &[Receipt], json: bool) -> Res<()> {
     for r in rs {
@@ -1461,81 +1581,36 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                 return Err("--retro K takes title, goal and acceptance from the report; drop them".into());
             }
             let title = match &picked { Some((t, _, _)) => t, None => a.pos.get(1).filter(|t| !t.trim().is_empty()).ok_or("title missing")? };
-            if title.contains(['\r', '\n']) || title.chars().count() > 80 {
-                return Err("title: one line, at most 80 characters; shorten it".into());
-            }
-            let goal: Vec<String> = match &picked { Some((_, g, _)) => g.as_str(), None => a.need("goal")? }.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
-            limit("Goal", &goal, 1, 2, 240)?;
-            let (acc, scope) = (picked.as_ref().map_or_else(|| a.all("acceptance"), |p| p.2.clone()), a.all("scope"));
-            one_line("--acceptance", &acc)?;
-            one_line("--scope", &scope)?;
-            let acc: Vec<String> = acc.iter().enumerate().map(|(i, s)| format!("A{}. {s}", i + 1)).collect();
-            limit("Acceptance", &acc, 1, 8, 240).map_err(|e| if acc.len() > 8 { format!("{e} (split the task, R2)") } else { e })?;
-            let scope: Vec<String> = scope.iter().map(|s| format!("- {s}")).collect();
-            limit("Scope", &scope, 0, 4, 240)?;
-            let mut body = format!("## Goal\n{}\n\n## Acceptance\n{}\n", goal.join("\n"), acc.join("\n"));
-            if !scope.is_empty() {
-                body += &format!("\n## Scope\n{}\n", scope.join("\n"));
-            }
             let deps: Vec<u64> = a.all("deps").iter().flat_map(|d| d.split([',', ' '])).filter(|d| !d.is_empty()).map(|d| d.trim_start_matches('#').parse().map_err(|_| format!("bad --deps {d}"))).collect::<Res<_>>()?;
-            if !deps.is_empty() {
-                body += "\n";
-                body += &deps.iter().map(|d| format!("Depends on #{d}\n")).collect::<String>();
-            }
-            for (flag, allowed) in [("type", &["code", "docs", "research", "asset"][..]), ("runtime", &["codex", "claude", "codex-app"][..]), ("priority", &["0", "1", "2"][..])] {
-                if a.all(flag).len() > 1 || a.one(flag).is_some_and(|v| !allowed.contains(&v)) {
-                    return Err(format!("--{flag} requires one of {}", allowed.join("|")));
+            for (flag, allowed) in [("type", "code|docs|research|asset"), ("runtime", "codex|claude|codex-app"), ("priority", "0|1|2")] {
+                if a.all(flag).len() > 1 {
+                    return Err(format!("--{flag} requires one of {allowed}"));
                 }
             }
-            if a.all("host").len() > 1 || a.one("host").is_some_and(|v| v.is_empty() || v.contains(',') || v.chars().any(char::is_whitespace)) {
+            if a.all("host").len() > 1 {
                 return Err("--host requires one nonempty host name".into());
             }
-            if a.one("priority") == Some("0") && !b.canonical_labels()? {
-                return Err("--priority 0 needs the canonical label schema (§ 9)".into());
-            }
-            let hold = a.flags.contains_key("hold");
-            if hold && a.flags.contains_key("later") {
-                return Err("--hold and --later exclude each other".into());
-            }
-            // §1: the operation marker is part of the immutable claimed request.
-            if let Some(id) = &op.id {
-                body += &format!("\nop-id: {id}\n");
-            }
-            let blocked = deps_open(b, &body)?;
-            // a held task gets `q-held` instead of `taskq`: no service of any version admits it before `start`
-            let mut labels = if hold { vec![b.state_label("held")?] } else { vec![service::TASK_LABEL.to_string(), b.state_label(if blocked { "waiting" } else { "ready" })?] };
-            for (flag, prefix) in [("type", ""), ("runtime", "run-"), ("priority", if b.canonical_labels()? { "p" } else { "priority-" }), ("host", "host-")] {
-                if let Some(v) = a.one(flag) {
-                    labels.push(format!("{prefix}{v}"));
-                }
-            }
-            labels::validate(&labels)?;
-            let n = if op.id.is_some() {
-                match claimed_create(b, &c.raw, title, &body, &labels, if a.flags.contains_key("later") { text } else { "" }, &op) {
-                    Ok(n) => n,
-                    Err(r) => return emit(&[r], json),
-                }
-            } else { b.create(title, &body, &labels)? };
-            let r = match (hold, a.flags.contains_key("later")) {
-                (true, _) => act(b, root, n, "hold", &[], "", &Op::default()),
-                (_, true) => act(b, root, n, "later", &[], text, &Op::default()),
-                _ => Receipt::accepted(n, &op, fold(n, &[], blocked).state, 0),
+            let new = NewTask {
+                title: title.clone(),
+                goal: match &picked { Some((_, g, _)) => g.clone(), None => a.need("goal")?.to_string() },
+                acceptance: picked.as_ref().map_or_else(|| a.all("acceptance"), |p| p.2.clone()),
+                scope: a.all("scope"),
+                deps,
+                kind: a.one("type").map(String::from),
+                runtime: a.one("runtime").map(String::from),
+                priority: a.one("priority").map(String::from),
+                host: a.one("host").map(String::from),
+                hold: a.flags.contains_key("hold"),
+                later: a.flags.contains_key("later").then(|| text.to_string()),
+                labels: vec![],
             };
-            poke(root);
-            emit(&[Receipt { op_id: op.id.clone(), ..r }], json)
+            emit(&[add_task(b, root, &c.raw, &new, &op)?], json)
         }
-        "start" => {
-            let n = a.num(1)?;
-            let r = act(b, root, n, "start", &[], "", &op);
-            // § 1: `taskq` goes on after the `start` entry; a retry adds the label a failed write left off
-            let issue = b.issue(n)?;
-            let started = entries(b, n)?.iter().any(|e| !e.edited && e.body.starts_with("taskq: start"));
-            if started && issue.open && !service::is_task(&issue) {
-                b.labels(n, &[service::TASK_LABEL.into()], &[])?;
-                let (_, t, _) = current(b, n)?;
-                return emit(&[Receipt::accepted(n, &op, t.state, core::revision(n, &entries(b, n)?))], json);
-            }
-            emit(&[r], json)
+        "start" => emit(&[start_task(b, root, a.num(1)?, &op)?], json),
+        "approve" => emit(&[dispatch::approve(b, root, a.num(1)?, a.one("sha"), &op, dispatch::agent())], json),
+        "recipe" => {
+            let name = a.pos.get(1).ok_or("recipe name missing")?;
+            emit(&run_recipe(b, root, &c.raw, name, a.need("run")?, a.one("goal"), a.flags.contains_key("start"))?, json)
         }
         "ask" => {
             let n = a.num(1)?;
@@ -1910,6 +1985,48 @@ mod tests {
         run(&["start", &n.to_string(), "--op-id", "s1"]).unwrap();
         assert_eq!(entries(b, n).unwrap().len(), log.len(), "a retried start writes nothing");
         assert!(run(&["start", &n.to_string()]).is_err(), "a started task refuses another start");
+    }
+
+    // Chain: § 7 recipe run, held tasks, owner gate, close publication, dependants. Risk: a rerun duplicates tasks,
+    // a task starts before the whole recipe reads back, or a gated result publishes without approval of its SHA.
+    #[test]
+    fn a_recipe_holds_its_tasks_and_a_gate_blocks_close_until_the_owner_approves() {
+        let raw = json!({"create_claim_issue": 1, "recipes": {"feature": {"version": 2, "tasks": [
+            {"title": "Spec {goal}", "goal": "Decide {goal}", "acceptance": ["spec merged"], "gate": true},
+            {"title": "Code {goal}", "goal": "Build {goal}", "acceptance": ["tests pass"], "deps": [1]}
+        ]}}});
+        let c = Ctx { cfg: cfg(), raw, board: Box::new(Fake::default()) };
+        let b = c.board.as_ref();
+        let run = |v: &[&str]| command(&c, v[0], &Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap());
+        b.create("create claims", "", &[]).unwrap();
+        run(&["recipe", "feature", "--run", "r1", "--goal", "login"]).unwrap();
+        let issues: Vec<_> = b.issues(None).unwrap().into_iter().filter(|i| service::is_held(i)).collect();
+        assert_eq!(issues.len(), 2);
+        let (spec, code) = (issues[0].number, issues[1].number);
+        assert_eq!((issues[0].title.as_str(), issues[0].labels.clone()), ("Spec login", vec!["q-held".to_string(), "needs-gate".into()]));
+        assert!(issues[0].body.ends_with("\nop-id: recipe.feature.2.r1.1\n"));
+        assert!(issues[1].body.contains(&format!("Depends on #{spec}\n")) && !service::is_task(&issues[1]));
+        let t = fold(spec, &entries(b, spec).unwrap(), false);
+        assert_eq!((t.state, t.gate), (State::Held, Some(core::Gate::Required)));
+        // the rerun returns the first receipts, then starts both
+        run(&["recipe", "feature", "--run", "r1", "--goal", "login", "--start"]).unwrap();
+        assert_eq!(b.issues(None).unwrap().len(), 3, "a rerun adds nothing");
+        assert_eq!(b.comments(1).unwrap().len(), 2, "one immutable claim per recipe task");
+        assert_eq!((current(b, spec).unwrap().1.state, current(b, code).unwrap().1.state), (State::Ready, State::Waiting));
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        b.comment(spec, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
+        let a = fold(spec, &entries(b, spec).unwrap(), false).attempt.unwrap();
+        b.comment(spec, &entry("result", &[sha], Some(a), "")).unwrap();
+        let r = close_one(b, &c.cfg, spec, "ok", &Op::default());
+        assert!(!r.ok() && r.reason.contains("gate is required") && b.issue(spec).unwrap().open, "{}", r.text());
+        let approve = |sha: Option<&str>, agent: bool| dispatch::approve(b, &c.cfg.root, spec, sha, &Op::default(), agent);
+        assert!(!approve(Some("89abcde"), false).ok(), "another SHA is not approved");
+        assert!(!approve(None, true).ok(), "an agent cannot approve");
+        assert!(approve(Some(&sha[..7]), false).ok());
+        assert_eq!(current(b, spec).unwrap().1.gate, Some(core::Gate::Approved));
+        assert!(close_one(b, &c.cfg, spec, "ok", &Op::default()).ok());
+        assert!(!b.issue(spec).unwrap().open);
+        assert_eq!(current(b, code).unwrap().1.state, State::Ready, "the approved spec frees the coding task");
     }
 
     #[test]

@@ -82,6 +82,26 @@ fn fields(text: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// An owner gate (§ 2): `required` until the owner approves the current result, `stale` once a later result or a
+/// move to `ready` invalidated an approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Gate {
+    Required,
+    Approved,
+    Stale,
+}
+
+impl Gate {
+    pub fn name(self) -> &'static str {
+        match self {
+            Gate::Required => "required",
+            Gate::Approved => "approved",
+            Gate::Stale => "stale",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Task {
@@ -93,6 +113,8 @@ pub struct Task {
     pub card: Option<String>,
     pub result: Option<String>,
     pub inbox: Vec<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate: Option<Gate>,
 }
 
 /// A comment by a trusted author; the board adapter drops everyone else's.
@@ -159,6 +181,14 @@ pub fn options(card: &str) -> Vec<(usize, String, bool)> {
         .collect()
 }
 
+/// The revision displayed by an approval option; no implicit approval of an unseen result.
+pub fn approval_sha(option: &str) -> Option<&str> {
+    let mut words = option.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("approve") { return None; }
+    let sha = words.next()?;
+    ((7..=40).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit())).then_some(sha)
+}
+
 /// The option a bare comment `s` names on `card` (§ 2): its number, or its text with or without `K. `, case-insensitive;
 /// None unless exactly one option matches.
 fn pick(card: &str, s: &str) -> Option<usize> {
@@ -207,6 +237,14 @@ fn ready(t: &mut Task) {
     t.card = None;
     t.result = None;
     t.state = State::Ready;
+    invalidate(t);
+}
+
+/// § 2: an approval binds to the result it named; the next result or a move to `ready` makes it stale.
+fn invalidate(t: &mut Task) {
+    if t.gate == Some(Gate::Approved) {
+        t.gate = Some(Gate::Stale);
+    }
 }
 
 pub fn fold(n: u64, entries: &[Entry], deps_open: bool) -> Task {
@@ -288,6 +326,11 @@ fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool
         // § 2: `hold` only as the first accepted entry; `start` leaves it
         (Ready, "hold", false) if first => t.state = Held,
         (Held, "start", false) => t.state = Ready,
+        // § 2 gate: set before work; only the owner (no attempt) approves, and only the current result
+        (Held | Ready, "gate", false) if t.gate.is_none() => t.gate = Some(Gate::Required),
+        (Review | Ask, "approve", false) if t.gate.is_some_and(|g| g != Gate::Approved) && l.args.len() == 1 && t.result.as_deref() == Some(l.args[0]) => {
+            t.gate = Some(Gate::Approved)
+        }
         (Ready, "spawn", false) if l.args.len() == 3 && l.args[0] == "worker" => {
             spawn(t, "worker");
             t.state = Doing;
@@ -300,6 +343,7 @@ fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool
             t.result = Some(l.args[0].to_string());
             t.card = text(l.text).filter(|s| has_options(s));
             t.state = Review;
+            invalidate(t);
         }
         (Doing | Review, "ask", true) => {
             t.card = text(l.text);
@@ -317,11 +361,24 @@ fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool
             }
         }
         (Doing, "steer", _) => t.inbox.push(id),
-        (Review, "close", _) | (Later | Failed, "close", false) => {
+        (Review, "close", _) if t.gate.is_none_or(|g| g == Gate::Approved) => {
+            end(t);
+            t.state = Closed;
+        }
+        (Later | Failed, "close", false) => {
             end(t);
             t.state = Closed;
         }
         (Ask, "answer", _) if !l.bare || pick(t.card.as_deref().unwrap_or(""), l.args[0]).is_some() => {
+            if !own && t.gate.is_some() {
+                let card = t.card.as_deref().unwrap_or("");
+                let k = if l.bare { pick(card, l.args[0]) } else { l.args.first().and_then(|s| s.parse().ok()) };
+                if options(card).iter().any(|(n, option, _)| Some(*n) == k
+                    && approval_sha(option).is_some_and(|sha| t.result.as_deref().is_some_and(|r| r.starts_with(sha))))
+                {
+                    t.gate = Some(Gate::Approved);
+                }
+            }
             t.retries = 0;
             t.card = None;
             match resume.take() {

@@ -759,7 +759,8 @@ impl<'a> Service<'a> {
             })
             .filter(|v| label(&v.issue, "host-").is_none_or(|h| h == me))
             .filter(|v| !v.issue.labels.iter().any(|l| l == "assignee-only") || v.issue.assignees.contains(&user))
-            .filter(|v| v.issue.labels.iter().filter_map(|l| l.strip_prefix("needs-")).all(|x| self.cfg.has.iter().any(|h| h == x)))
+            // `needs-gate`: every host of this version has gates; N-1 lacks them and leaves the task alone (§ 8)
+            .filter(|v| v.issue.labels.iter().filter_map(|l| l.strip_prefix("needs-")).all(|x| x == "gate" || self.cfg.has.iter().any(|h| h == x)))
             .filter(|v| priority(&v.issue) == 0 || self.focus.iter().any(|f| f == "all" || crate::labels::matches(&v.issue.labels, f)))
             .collect();
         queue.sort_by_key(|v| (priority(&v.issue), v.issue.number));
@@ -1449,6 +1450,7 @@ mod tests {
         let win = b.create("W", "", &["taskq".into(), "needs-windows".into()]).unwrap();
         let maps = b.create("M", "", &["taskq".into(), "area-maps".into()]).unwrap();
         let other = b.create("O", "", &["taskq".into()]).unwrap();
+        let gated = b.create("G", "", &["taskq".into(), "needs-gate".into()]).unwrap();
         let c = cfg("mac");
         let mut s = service(&b, &c, Default::default());
         s.focus = vec![];
@@ -1462,6 +1464,7 @@ mod tests {
         let mut s = service(&b, &c, Default::default());
         s.pass().unwrap();
         assert_eq!((task(&b, win).state, task(&b, other).state), (State::Ready, State::Doing), "mac has no windows");
+        assert_eq!(task(&b, gated).state, State::Doing, "every host of this version has gates (§ 8)");
         let w = Config { has: vec!["windows".into()], ..c.clone() };
         let mut s = service(&b, &w, Default::default());
         s.pass().unwrap();

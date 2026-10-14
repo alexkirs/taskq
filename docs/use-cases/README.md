@@ -27,10 +27,11 @@ Source: owner.
 - Say `task` and name the project in a supported agent session.
 - Activation, canonical reports and opt-in observation follow [A1–A5](../design/agent-entry.md). A discoverable integration must exist; the keyword alone supplies no tools or permissions.
 - The agent loads TaskQ rules, the PM role and the current board. The chat is not a second queue.
-- The owner describes work. PM clarifies the goal, boundaries and acceptance before filing a task.
+- The owner describes work. PM applies [shared task preparation](https://github.com/taskqorg/specq/blob/main/engineering/agent-workflow.md#prepare-the-task) before filing Goal, Acceptance and dependencies (§1). Queue terms use the definitions in contract §§2–4 and linked product specifications.
 - Do not repeat questions already answered by the request.
 - Compare with the board: file new work, extend an existing task, or ask the owner to resolve a conflict.
 - Link dependencies, set priority and return task links. Route changes to active work through the existing steering mechanism.
+- For repeated `requeue`, prolonged diagnosis or material owner correction, PM applies [shared friction review](https://github.com/taskqorg/specq/blob/main/engineering/agent-workflow.md#learn-from-friction) to the relevant attempt evidence. Keep any proposal in the existing issue; this adds no state, automatic retry or closure gate.
 - For a quick service request, propose direct action when a task adds no value. The authority boundary remains open (Q1).
 
 Result: each request is accounted for once through a task, task update or direct response.

@@ -40,6 +40,8 @@ button:disabled{color:var(--muted);opacity:.75}
 .alert{color:var(--failed)}
 h1{font-size:1em;margin:6px 4px;overflow-wrap:anywhere}.footer{border-top:1px solid var(--edge);margin-top:6px}
 .head{min-height:28px;padding:2px 4px}.head button{padding:2px 7px}.pinned .head{cursor:grab}
+/* Home keeps a bounded preview of the AI exchange (menu.md M7); controls stay below it */
+.aichain{max-height:10em;overflow-y:auto;position:relative}
 .askai{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px;padding:4px}
 .askai textarea{font:inherit;color:inherit;background:none;border:1px solid var(--edge);border-radius:4px;padding:5px;resize:vertical;min-width:0;-webkit-user-select:text;user-select:text}
 .askai button{align-self:start;min-width:34px}
@@ -215,10 +217,13 @@ function nextActions(t){
 function ai(){
   const A=S.ai,r=A.request,an=r&&r.answer||{},st=r?(an.state||'queued'):null,bad=['failed','refuse','apply failed'].includes(st);
   let h='<div class="group"><div class="row meta">✦ Ask AI · '+(A.target?'projects: '+esc(S.projects.map(p=>p.name).join(', ')):'no running service: cannot send')+'</div>';
-  for(const q of r?(r.chain||[r]):[]){
+  const chain=r?(r.chain||[r]):[];
+  if(r)h+='<div class="aichain" tabindex="0" aria-label="AI exchange" data-chain="'+esc(r.id+'/'+chain.length+'/'+st)+'">';
+  for(const q of chain){
     const a=q.answer||{},state=a.state||'queued',bad=['failed','refuse','apply failed'].includes(state);
     h+='<div class="body"><div class="meta">'+(q.url?'<a href="'+esc(q.url)+'" data-url="'+esc(q.url)+'">Comment on #'+esc(q.task)+' ↗</a>: ':'You: ')+esc(q.text||'')+'</div><div class="'+(bad?'alert':state==='applied'||state==='result'?'work':'ask')+'" role="status">'+esc(aiStates[state]||state)+(a.reason?': '+esc(a.reason):'')+'</div>'+(a.text?'<div>'+esc(a.text).replace(/\n/g,'<br>')+'</div>':'')+'</div>';
   }
+  if(r)h+='</div>';
   // a Next button replies with its number, the same token as typing it; the chain then shows `You: <number>`
   const nx=r&&['result','clarify','refuse'].includes(st)&&nextActions(an.text);
   if(nx)h+='<div class="options" role="group" aria-label="Next">'+nx.map(x=>'<button data-a="ai-next" data-v="'+x.n+'"'+(x.rec?' class="rec"':'')+'>'+esc(x.text)+'</button>').join('')+'</div>';
@@ -383,6 +388,7 @@ function head(){return '<div class="row head"><span class="meta">taskq</span><bu
 function render(navigating=false){
   if(!S)return;
   const active=document.activeElement,answerFocus=active&&active.closest('[data-answer]'),scroll=document.scrollingElement.scrollTop;
+  const chain=menu.querySelector('.aichain'),chainScroll=chain&&[chain.dataset.chain,chain.scrollTop];
   const focusKey=!navigating&&active&&menu.contains(active)?JSON.stringify(active.dataset):null;
   const focusedSummary=!navigating&&active?.tagName==='SUMMARY'?[...menu.querySelectorAll('summary')].indexOf(active):-1;
   const caret=answerFocus&&active.tagName==='TEXTAREA'?[active.selectionStart,active.selectionEnd]:null;
@@ -400,6 +406,8 @@ function render(navigating=false){
   const restored=answerFocus&&menu.querySelector('[data-answer="'+CSS.escape(answerFocus.dataset.answer)+'"] '+answerSelector);
   if(restored&&!navigating){restored.focus({preventScroll:true});if(caret)restored.setSelectionRange(...caret);}
   else if(!navigating){const target=focusedSummary>=0?menu.querySelectorAll('summary')[focusedSummary]:focusKey&&focusKey!=='{}'?[...menu.querySelectorAll('button')].find(b=>JSON.stringify(b.dataset)===focusKey):null;target?.focus({preventScroll:true});}
+  // a new exchange opens at its newest entry; a tick keeps the reader's place
+  const c=menu.querySelector('.aichain');if(c)c.scrollTop=chainScroll&&chainScroll[0]===c.dataset.chain?chainScroll[1]:c.lastElementChild.offsetTop;
   document.scrollingElement.scrollTop=scroll;
   fit();}
 window.taskq={receive(s){

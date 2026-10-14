@@ -49,7 +49,7 @@ pub fn state(install: &Path) -> Res<Option<Value>> {
     let valid = s.is_object() && text(&s, "installation")
         && conn(&s["pending"], &["destination"]) && conn(&s["pending"]["staged"], &["destination", "credential"])
         && conn(&s["active"], &["destination", "credential"])
-        && s["revoke"].as_array().is_some_and(|r| r.iter().all(|v| v.is_object() && text(v, "credential")));
+        && s["revoke"].as_array().is_some_and(|r| r.iter().all(|v| v.is_object() && conn(v, &["destination", "credential"])));
     if valid { Ok(Some(s)) } else { Err(bad()) }
 }
 
@@ -83,7 +83,8 @@ pub fn first_receipt(install: &Path, record: &Value, tries: u32) -> Res<&'static
 }
 
 /// `taskq disconnect`: cancels a pairing in progress (so `enroll` cannot resume it), stops sending at once and
-/// reports what was revoked; a revoke DashQ has not confirmed stays queued for the service.
+/// reports what was revoked; a revoke DashQ has not confirmed stays queued for the service, and a repeated
+/// disconnect retries and reports it instead of "connection: none".
 pub fn disconnect(install: &Path) -> Res<Option<String>> {
     disconnect_with(install, &mut Https { browser: false })
 }
@@ -91,8 +92,14 @@ pub fn disconnect(install: &Path) -> Res<Option<String>> {
 fn disconnect_with(install: &Path, w: &mut dyn enroll::Wire) -> Res<Option<String>> {
     let Some(s) = state(install)? else { return Ok(None) };
     let (active, pending) = (s["active"].is_object(), s["pending"].is_object());
-    if !active && !pending { return Ok(None) }
     let queued = |e: &String| e.ends_with("revoke pending");
+    if !active && !pending {
+        if s["revoke"].as_array().is_none_or(Vec::is_empty) { return Ok(None) }
+        enroll::retry_revokes(&dir(install), w).or_else(|e| if queued(&e) { Ok(()) } else { Err(e) })?;
+        let left = state(install)?.map_or(0, |s| s["revoke"].as_array().map_or(0, Vec::len));
+        return Ok(Some(if left > 0 { format!("connection: none; {left} revoke pending, the service retries it") }
+            else { "connection: none; revoke confirmed".into() }));
+    }
     if pending {
         // a staged credential DashQ already granted is queued for revoke by coreq
         enroll::cancel(&dir(install), w).or_else(|e| if queued(&e) { Ok(()) } else { Err(e) })?;
@@ -415,6 +422,12 @@ mod tests {
         assert_eq!(disconnect_with(&install, &mut off).unwrap().as_deref(), Some("disconnected: pairing cancelled; 1 revoke pending, the service retries it"));
         let s = state(&install).unwrap().unwrap();
         assert!(s["pending"].is_null() && s["revoke"][0]["credential"] == "s2");
+        // repeated disconnect with only the queued revoke: retried and reported, never "connection: none"
+        assert_eq!(disconnect_with(&install, &mut off).unwrap().as_deref(), Some("connection: none; 1 revoke pending, the service retries it"));
+        let mut back = Dash { online: true, revoked: vec![] };
+        assert_eq!(disconnect_with(&install, &mut back).unwrap().as_deref(), Some("connection: none; revoke confirmed"));
+        assert_eq!(back.revoked, ["s2"]);
+        assert_eq!(disconnect_with(&install, &mut back).unwrap(), None, "nothing left: none");
         fs::remove_dir_all(install).unwrap();
     }
 
@@ -428,7 +441,8 @@ mod tests {
         let ok = json!({"installation": "i", "pending": null, "active": {"destination": "https://d/machine", "credential": "c"}, "revoke": []});
         let mut bad = vec![json!({}), json!([]), json!(null), json!("x")];
         for (k, v) in [("installation", json!(1)), ("pending", json!("x")), ("pending", json!({"staged": null})),
-            ("active", json!({"destination": "https://d/machine"})), ("active", json!([])), ("revoke", json!(null)), ("revoke", json!([1]))] {
+            ("active", json!({"destination": "https://d/machine"})), ("active", json!([])), ("revoke", json!(null)), ("revoke", json!([1])),
+            ("revoke", json!([{"credential": "c"}])), ("revoke", json!([{"destination": "", "credential": "c"}]))] {
             let mut s = ok.clone();
             s[k] = v;
             bad.push(s);

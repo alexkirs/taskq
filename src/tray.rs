@@ -15,6 +15,7 @@ use tray_icon::{Icon, MouseButtonState, Rect, TrayIcon, TrayIconBuilder, TrayIco
 use wry::{WebView, WebViewBuilder};
 
 use crate::icon::{self, Rgba, compact};
+use crate::notify;
 
 const HTML: &str = include_str!("tray.html");
 const FONTS: [u64; 4] = [14, 16, 18, 20];
@@ -37,6 +38,8 @@ enum Ev {
     /// Add project: the picked folder classified, or Null (cancel)
     Added(Value),
     Answer(Value),
+    /// A notification click: its request identifier (M14)
+    Note(String),
 }
 
 /// View, text size, period and Custom icon of `<install>/tray.json`; anything else falls back to the default. A
@@ -52,6 +55,8 @@ struct Settings {
     tz: String,
     icon: Value,
     pin: Pin,
+    /// Notification modes and cursors (`notify.rs`), kept as saved
+    notify: Value,
 }
 
 /// Pinned window (menu.md M13): pinned or not, the last display and the last top-left per display, physical pixels.
@@ -71,7 +76,8 @@ impl Settings {
         }).unwrap_or_default();
         let pos = v["pos"].as_object().into_iter().flatten().filter_map(|(k, p)| Some((k.clone(), (i32::try_from(p[0].as_i64()?).ok()?, i32::try_from(p[1].as_i64()?).ok()?)))).collect();
         let pin = Pin { pinned: v["pinned"] == true, display: v["display"].as_str().unwrap_or("").into(), pos };
-        let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into(), start: 0, end: 0, tz: "local".into(), icon: Value::Null, pin };
+        let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into(), start: 0, end: 0, tz: "local".into(), icon: Value::Null, pin,
+            notify: if v["notify"].is_object() { v["notify"].clone() } else { Value::Null } };
         // an invalid or corrupt saved icon falls back to Summary (CI4)
         if icon::validate(&v["icon"]).is_empty() {
             s.icon = v["icon"].clone();
@@ -109,7 +115,7 @@ impl Settings {
 
     fn save(&self, install: &Path) -> bool {
         let v = json!({"view": self.view, "font": self.font, "period": self.period, "start": self.start, "end": self.end, "tz": self.tz, "icon": self.icon,
-            "pinned": self.pin.pinned, "display": self.pin.display, "pos": self.pin.pos});
+            "pinned": self.pin.pinned, "display": self.pin.display, "pos": self.pin.pos, "notify": self.notify});
         let p = install.join("tray.json");
         if crate::data::json(&p).is_err() && fs::copy(&p, install.join("tray.json.corrupt")).is_err() {
             return false;
@@ -408,7 +414,7 @@ fn resource_group(cap: &Value, saved: &Value, observed_at: Option<i64>, installa
     json!({"schema": "taskq.resources/1", "observed_at": observed_at, "targets": targets})
 }
 
-/// One project for the page: its `status.json`, saved focus, labels and `events` lines `[time, kind, attempt]`.
+/// One project for the page: its `status.json`, saved focus, labels and `events` lines `[time, kind, attempt, task]`.
 fn project(install: &Path, root: &str) -> Value {
     let r = Path::new(root);
     let d = crate::dot(r);
@@ -423,7 +429,7 @@ fn project(install: &Path, root: &str) -> Value {
     let since = text.lines().next().and_then(|l| l.strip_prefix("since ")?.parse::<i64>().ok());
     let events: Vec<Value> = text.lines().skip(1).filter_map(|l| {
         let w: Vec<&str> = l.split(' ').collect();
-        Some(json!([w.first()?.parse::<i64>().ok()?, w.get(2)?, w.get(3)?]))
+        Some(json!([w.first()?.parse::<i64>().ok()?, w.get(2)?, w.get(3)?, w.get(1)?.strip_prefix('#')?.parse::<u64>().ok()?]))
     }).collect();
     // the local host's saved capacity, for `Edit limits` and its readback (§ 4 Capacity)
     let (cap_host, cap_saved, board_kind) = match crate::load(r) {
@@ -551,6 +557,8 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
     let mut step = 0usize;
     let mut adding = Value::Null;
     let mut moved = false;
+    let mut asked = false;
+    let mut bursts = notify::Bursts::new();
     event_loop.run(move |event, target, flow| {
         *flow = ControlFlow::Wait;
         let push = |ui: &Option<(Window, WebView)>, st: &Value| {
@@ -597,6 +605,10 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                         *flow = ControlFlow::Exit;
                     }
                 }
+                let p = proxy.clone();
+                notify::watch(move |id| {
+                    let _ = p.send_event(Ev::Note(id));
+                });
                 // a pinned window survives a tray restart at its last position; off-screen: at the tray icon (M13)
                 if let (Some((w, _)), true) = (&ui, settings.pin.pinned) {
                     let saved = w.available_monitors().find(|m| key(m) == settings.pin.display).zip(settings.pin.pos.get(&settings.pin.display))
@@ -647,6 +659,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 }
                 let st = state(&install, &settings, dark, None, &adding);
                 refresh_icon(&tray, &st, &settings, dark, &mut icon_sig);
+                notes(&install, &mut settings, &st, &mut asked, &mut bursts);
                 let sig = st.to_string().replace(&format!("\"now\":{}", st["now"]), "");
                 if sig != shown {
                     shown = sig;
@@ -672,6 +685,19 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 w.set_focus();
             }
             Event::UserEvent(Ev::Answer(receipt)) => push(&ui, &receipt),
+            // a notification click opens the menu (or raises the pinned window) on that card (M14)
+            Event::UserEvent(Ev::Note(id)) => {
+                let Ok(id) = serde_json::from_str::<Value>(&id) else { return };
+                let Some((w, _)) = &ui else { return };
+                if !settings.pin.pinned && let Some(r) = anchor.or_else(|| tray.as_ref().and_then(TrayIcon::rect)) {
+                    place(w, r);
+                }
+                w.set_visible(true);
+                w.set_focus();
+                if id["root"].is_string() {
+                    push(&ui, &json!({"open": {"root": id["root"], "n": id["n"], "kind": id["k"], "title": id["t"]}}));
+                }
+            }
             Event::UserEvent(Ev::Ipc(m)) => {
                 let Ok(m) = serde_json::from_str::<Value>(&m) else { return };
                 let Some((w, _)) = &ui else { return };
@@ -721,6 +747,19 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                             open(u);
                         }
                     }
+                    "notify" => {
+                        if notify::set(&mut settings.notify, &m) {
+                            settings.save(&install);
+                            notes(&install, &mut settings, &Value::Null, &mut asked, &mut bursts);
+                        }
+                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                    }
+                    "notify-test" if snapshot.is_none() => {
+                        if let Some(k) = m["kind"].as_str().filter(|k| notify::KINDS.contains(k)) {
+                            notify::post(&notify::sample(&settings.notify, k, now()));
+                        }
+                    }
+                    "notify-os" => notify::open_settings(),
                     "set" => {
                         settings.set(&m);
                         settings.save(&install);
@@ -854,7 +893,7 @@ fn shots(install: &Path) -> Vec<(&'static str, String, u64, &'static str)> {
     ["dark", "light"].iter().flat_map(|t| {
         let mut v = vec![(*t, "home".to_string(), 16, ""), (*t, "home".to_string(), 20, ""), (*t, "home".to_string(), 16, ACTIONS)];
         v.extend(first.clone().map(|r| (*t, r, 16, "")));
-        for route in ["projects", "attention", "settings", "appearance", "cadence", "agents", "services", "about"] {
+        for route in ["projects", "attention", "settings", "appearance", "cadence", "notifications", "agents", "services", "about"] {
             for font in [16, 20] { v.push((*t, route.into(), font, "")); }
         }
         v
@@ -872,7 +911,7 @@ fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>, a
     let url = |rgba: &Rgba| format!("data:image/png;base64,{}", base64(&rgba.png()));
     let mut st = json!({"platform": if cfg!(windows) { "windows" } else { "macos" }, "version": crate::platform::VERSION,
         "host": ps.iter().find_map(|p| p["host"].as_str()).unwrap_or("?"), "view": s.view, "font": s.font, "period": s.period, "pinned": s.pin.pinned,
-        "now": now(), "projects": ps, "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "add": add, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since},
+        "now": now(), "projects": ps, "notify": notify_state(&s.notify, &ps), "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "add": add, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since},
         // § 4 Data: a corrupt tray.json names its reason while the defaults show
         "settings_error": crate::data::json(&install.join("tray.json")).err()});
     if cfg!(target_os = "macos") {
@@ -884,6 +923,36 @@ fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>, a
         st["page"] = json!(page);
     }
     st
+}
+
+/// Notifications for the page: OS status, host modes, per project override (null: inherit) and effective mode.
+fn notify_state(n: &Value, ps: &[Value]) -> Value {
+    let host: serde_json::Map<String, Value> = notify::KINDS.iter().map(|k| (k.to_string(), json!(notify::host(n, k)))).collect();
+    let projects: serde_json::Map<String, Value> = ps.iter().filter_map(|p| p["root"].as_str()).map(|r| {
+        (r.to_string(), notify::KINDS.iter().map(|k| (k.to_string(), json!([n["projects"][r][k].as_str().filter(|v| notify::MODES.contains(v)), notify::mode(n, r, k)]))).collect())
+    }).collect();
+    json!({"status": notify::status(), "host": host, "projects": projects})
+}
+
+/// One tick of notifications (M14): the first banner setting asks the OS once; new events move the cursor, which is
+/// saved before anything posts (a crash loses a notification, never repeats one); only an allowed OS posts.
+fn notes(install: &Path, s: &mut Settings, st: &Value, asked: &mut bool, bursts: &mut notify::Bursts) {
+    if !*asked && notify::status() == "not asked" && notify::wants_banner(&s.notify, &roots(install)) {
+        *asked = true;
+        notify::request();
+    }
+    let Some(ps) = st["projects"].as_array() else { return };
+    let before = s.notify.clone();
+    let posts = notify::due(&mut s.notify, ps, now(), bursts);
+    if s.notify != before && !s.save(install) {
+        s.notify = before;
+        return;
+    }
+    if notify::status() == "allowed" {
+        for p in &posts {
+            notify::post(p);
+        }
+    }
 }
 
 /// Host-level `Agents` (§ 4): the rows of the freshest probe in any `status.json`, as menu lines; null when none has one.
@@ -1623,11 +1692,11 @@ mod tests {
     // Chain: § 4 tray settings input. Risk: webview input stores unknown values.
     #[test]
     fn settings_keep_only_known_values() {
-        let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into(), start: 0, end: 0, tz: "local".into(), icon: Value::Null, pin: Pin::default() };
+        let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into(), start: 0, end: 0, tz: "local".into(), icon: Value::Null, pin: Pin::default(), notify: Value::Null };
         s.set(&json!({"view": "full", "font": 18, "period": "1w"}));
         s.set(&json!({"view": "x", "font": 15, "period": "2y"}));
         s.set(&json!({"period": "custom", "start": 50, "end": 50, "tz": "UTC"}));
-        assert!(s == Settings { view: "full".into(), font: 18, period: "1w".into(), start: 0, end: 0, tz: "local".into(), icon: Value::Null, pin: Pin::default() });
+        assert!(s == Settings { view: "full".into(), font: 18, period: "1w".into(), start: 0, end: 0, tz: "local".into(), icon: Value::Null, pin: Pin::default(), notify: Value::Null });
         assert_eq!(s.range(1000), (1000 - 604800, 1000));
         s.set(&json!({"period": "custom", "start": 40, "end": 160, "tz": "UTC"}));
         assert_eq!((s.range(1000), s.tz.as_str()), ((40, 160), "UTC"));
@@ -1645,6 +1714,14 @@ mod tests {
         assert!(s.save(&install));
         let r = Settings::load(&install);
         assert!(r.pin == s.pin && r.font == 18);
+        // M14: modes and cursors survive a restart as saved, unknown values included
+        let mut s = r;
+        s.notify = json!({"kinds": {"ask": "loud"}, "cursor": {"/p": "100 #7 ask 5"}});
+        let st = json!({"projects": [{"root": "/p", "name": "p", "tasks": [], "events": [[100, "ask", "5", 7], [200, "failed", "6", 7]]}]});
+        let mut asked = true;
+        notes(&install, &mut s, &st, &mut asked, &mut notify::Bursts::new());
+        let r = Settings::load(&install);
+        assert_eq!((r.notify["cursor"]["/p"].as_str(), r.notify["kinds"]["ask"].as_str()), (Some("200 #7 failed 6"), Some("loud")), "cursor saved before any post");
         let area = (0, 25, 1512, 900);
         assert!(on_screen((10, 30), area) && !on_screen((-1500, 300), area) && !on_screen((1512, 30), area));
         assert_eq!(clamp((1400, 0), (320, 400), area), (1192, 25), "kept under the menu bar and inside the right edge");

@@ -24,11 +24,30 @@ Object.assign(context,{history:()=>'<history>',workEntry:()=>'<work>',projects:(
 run(html.slice(html.indexOf('function views(){'),html.indexOf('function attention(){')));
 run(html.slice(html.indexOf('function routeBody(){'),html.indexOf('// Capacity (')));
 context.page='settings';let h=run('routeBody()');
-for(const route of ['appearance','cadence','agents','services','about'])assert(h.includes('data-route="'+route+'"'));
+for(const route of ['appearance','cadence','notifications','agents','services','about'])assert(h.includes('data-route="'+route+'"'));
 context.page='appearance';assert(run('routeBody()').includes('Text size · 20 px'));
 context.page='cadence';assert.equal(run('routeBody()'),'<history>');
 context.page='agents';assert(run('routeBody()').includes('Unknown: no status.json'));
 context.S.projects=[{name:'alpha',host:'mac',version:null,age:null}];
 context.page='services';h=run('routeBody()');assert(h.includes('Resources'));assert(h.includes('status unknown'));assert(h.includes('<problem><notice><service>'));
 context.page='about';h=run('routeBody()');assert(h.includes('version unknown'));assert(h.includes('status unknown'));assert(h.includes('<update>'));
+// M14: OS denial reads Blocked with the OS setting and no test post; a project shows its override and effective mode
+run(html.slice(html.indexOf('// Notifications (menu.md M14)'),html.indexOf('// a notification click')));
+const kinds={ask:'sound',close:'off',failed:'banner',gone:'banner'};
+context.S.notify={status:'blocked',host:kinds,projects:{'/p':{ask:[null,'sound'],close:['banner','banner'],failed:[null,'banner'],gone:[null,'banner']}}};
+context.page='notifications';h=run('routeBody()');
+assert(h.includes('Blocked by the OS'));assert(h.includes('data-a="notify-os"'));assert.equal((h.match(/notify-test[^>]*disabled/g)||[]).length,4);
+assert(h.includes('data-kind="ask" data-v="sound" aria-pressed="true"'));
+context.S.notify.status='allowed';h=run('routeBody()');assert(!h.includes('notify-os'));assert(!/notify-test[^>]*disabled/.test(h));
+h=run("notifyGroup({root:'/p'})");
+assert(h.includes('data-kind="close" data-root="/p" data-v="banner" aria-pressed="true"'));assert(h.includes('data-kind="ask" data-root="/p" data-v="inherit" aria-pressed="true"'));
+// M14 click on a closed task: no open row, so the project page shows its card from the notification until navigation
+run(html.slice(html.indexOf('// a notification click'),html.indexOf('function project(p){')));
+Object.assign(context,{TaskqProjectBlocks:require('../src/project-blocks.js'),CSS:{escape:s=>s},blockProject:p=>({name:p.name,board:{kind:'github',url:p.issues}}),
+  S:{projects:[{root:'/p',name:'p',issues:'https://x/issues',tasks:[]}]}});
+run("page='home';openCard({root:'/p',n:8,kind:'close',title:'Ship it'})");
+assert.equal(context.page,'/p');h=run("notedCard(S.projects[0])");
+assert(h.includes('data-card="https://x/issues/8"'));assert(h.includes('Closed'));assert(h.includes('Ship it'));assert(h.includes('href="https://x/issues/8"'));
+run("navigate('home')");assert.equal(run("notedCard(S.projects[0])"),'');
+console.log('PASS M14 notification settings, OS block, project override and closed-task card');
 console.log('PASS WS11 nested Back, filter/scroll/disclosure restoration, settings categories, unknown probes/versions and maintenance destinations');

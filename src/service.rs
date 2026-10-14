@@ -191,6 +191,8 @@ pub struct Service<'a> {
     pub owner_comments: Vec<(u64, u64, String, String)>,
     /// State of each open task in the previous pass, for `events`.
     seen: HashMap<u64, State>,
+    /// The newest comment id an events pass saw; `gone` events come only from newer comments (§ 4)
+    gone_after: Option<u64>,
     /// First time covered by `<root>/.taskq/events` (§ 4).
     pub events_since: Option<i64>,
     /// Capacity reloaded before each pass (§ 3); an error holds every launch.
@@ -438,7 +440,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new() }
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -842,6 +844,18 @@ impl<'a> Service<'a> {
                 moves.push((n, kind, a));
             }
         }
+        // `gone`: each trusted `gone attempt` entry newer than the previous pass; the first pass adds none
+        let newest = views.iter().flat_map(|v| v.comments.iter().map(|c| c.id)).max();
+        if let Some(after) = self.gone_after {
+            for v in views {
+                for c in v.comments.iter().filter(|c| c.trusted && c.id > after) {
+                    if let Some(a) = c.body.lines().next().and_then(|l| l.strip_prefix("taskq: gone attempt ")).and_then(|a| a.parse().ok()) {
+                        moves.push((v.issue.number, "gone", a));
+                    }
+                }
+            }
+        }
+        self.gone_after = self.gone_after.max(newest);
         moves.sort();
         self.seen = now_seen;
         if first || !moves.is_empty() || self.events_since.is_none_or(|s| s < now - MONTH) {
@@ -1963,6 +1977,15 @@ mod tests {
         let ev = std::fs::read_to_string(root.join(".taskq/events")).unwrap();
         let lines: Vec<&str> = ev.lines().skip(3).map(|l| l.split_once(' ').unwrap().1).collect();
         assert_eq!(lines, [format!("#{z} blocked {z}"), format!("#{w} ask {aw}")], "{ev}");
+        // a `gone` entry after the first pass is one `gone` event, once
+        let v = b.create("V", "", &["taskq".into()]).unwrap();
+        again.pass().unwrap();
+        let av = task(&b, v).attempt.unwrap();
+        b.comment(v, &core::entry("gone", &[], Some(av), "lost")).unwrap();
+        again.pass().unwrap();
+        again.pass().unwrap();
+        let ev = std::fs::read_to_string(root.join(".taskq/events")).unwrap();
+        assert_eq!(ev.lines().filter(|l| l.ends_with(&format!("#{v} gone {av}"))).count(), 1, "{ev}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

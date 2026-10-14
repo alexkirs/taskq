@@ -211,7 +211,7 @@ fn roots(install: &Path) -> Vec<String> {
     fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(String::from).collect()
 }
 
-/// Only owner answers cross this bridge; the CLI owns credentials, dispatch and board readback.
+/// Owner answers and tray-only fallback actions cross this bridge; the CLI owns credentials, dispatch and board readback.
 fn answer_args(install: &Path, m: &Value) -> Result<Vec<String>, String> {
     let root = m["root"].as_str().ok_or("project missing")?;
     if !roots(install).iter().any(|r| r == root) { return Err("project is not registered".into()); }
@@ -220,20 +220,38 @@ fn answer_args(install: &Path, m: &Value) -> Result<Vec<String>, String> {
     let id = op["id"].as_str().filter(|id| !id.is_empty() && !id.contains(char::is_whitespace)).ok_or("operation id must be one word")?;
     let n = op["task"].as_u64().filter(|n| *n > 0).ok_or("task number missing")?;
     let revision = op["revision"].as_u64().ok_or("question revision missing")?;
-    let mut args = vec!["answer".into()];
-    match (op.get("choice"), op.get("text")) {
-        (Some(choice), None) => {
-            let k = choice.as_u64().filter(|k| *k > 0).ok_or("invalid choice")?;
-            args.push(format!("{n}.{k}"));
+    let action = op.get("action").map(|v| v.as_str().ok_or("invalid action")).transpose()?;
+    let mut args: Vec<String> = if let Some(action) = action {
+        if op.get("choice").is_some() { return Err("fallback actions cannot include a choice".into()); }
+        let (command, text) = match action {
+            "requeue" => {
+                let reason = op["text"].as_str().filter(|s| !s.trim().is_empty() && !s.contains(['\r', '\n'])).ok_or("supply one requeue reason line")?;
+                ("requeue", format!("Reason: {reason}"))
+            }
+            "later" if op.get("text").is_none() => ("later", "Reason: Parked by the owner from the tray.".into()),
+            "close" if op["confirmed"] == true && op.get("text").is_none() => ("later", "Reason: Owner confirmed cancellation without publication from the tray.".into()),
+            _ => return Err("unsupported or unconfirmed tray action".into()),
+        };
+        crate::task_text(command, &text)?;
+        vec![command.into(), n.to_string(), "--text".into(), text]
+    } else {
+        let mut args = vec!["answer".into()];
+        match (op.get("choice"), op.get("text")) {
+            (Some(choice), None) => {
+                let k = choice.as_u64().filter(|k| *k > 0).ok_or("invalid choice")?;
+                args.push(format!("{n}.{k}"));
+            }
+            (None, Some(text)) => {
+                let text = text.as_str().ok_or("invalid answer text")?;
+                crate::task_text("answer", text)?;
+                args.extend([n.to_string(), "--text".into(), text.into()]);
+            }
+            _ => return Err("supply one choice or literal text".into()),
         }
-        (None, Some(text)) => {
-            let text = text.as_str().ok_or("invalid answer text")?;
-            crate::task_text("answer", text)?;
-            args.extend([n.to_string(), "--text".into(), text.into()]);
-        }
-        _ => return Err("supply one choice or literal text".into()),
-    }
-    args.extend(["--json".into(), "--op-id".into(), id.into(), "--revision".into(), revision.to_string()]);
+        args
+    };
+    let id = if action == Some("close") { format!("{id}.later") } else { id.into() };
+    args.extend(["--json".into(), "--op-id".into(), id, "--revision".into(), revision.to_string()]);
     Ok(args)
 }
 
@@ -247,7 +265,16 @@ fn answer_snapshot(s: &Value, m: &Value) -> Result<(), String> {
     if s["complete"] != true { return Err(s["reason"].as_str().unwrap_or("board read incomplete").into()); }
     if s["board"]["url"] != m["board"] { return Err("board identity changed; refresh the project".into()); }
     let op = &m["op"];
-    let row = s["tasks"].as_array().into_iter().flatten().find(|r| r["n"] == op["task"]).ok_or("task is not in the current board snapshot; open it on the board")?;
+    let row = s["tasks"].as_array().into_iter().flatten().find(|r| r["n"] == op["task"]);
+    let row = row.ok_or("task is not in the current board snapshot; open it on the board")?;
+    if op.get("action").is_some() {
+        if row["revision"] != op["revision"] { return Err("question changed; refresh before acting".into()); }
+        if op["action"] == "close" && row["state"] == "later" { return Ok(()); } // only a matching later op can succeed again
+        if row["state"] != "ask" || row["question"]["choices"].as_array().is_some_and(|c| !c.is_empty()) {
+            return Err("fallback actions require an ask without choices; check the board for partial cancellation".into());
+        }
+        return Ok(());
+    }
     if !row["revision"].is_u64() { return Err("question revision unavailable".into()); }
     // An old revision still reaches dispatch so uncertain delivery can reconcile its op id.
     if row["revision"] == op["revision"] {
@@ -260,6 +287,35 @@ fn answer_snapshot(s: &Value, m: &Value) -> Result<(), String> {
     Ok(())
 }
 
+// Chain: one CLI receipt per step. Close never continues after unknown/failed parking or from another state.
+fn answer_dispatch(m: &Value, args: &[String], mut run: impl FnMut(&[String]) -> Value) -> Value {
+    let checked = |r: Value, id: &str| {
+        if r["task"] == m["op"]["task"] && r["op_id"] == id
+            && matches!(r["outcome"].as_str(), Some("accepted" | "stale" | "rejected" | "unknown")) { r }
+        else { json!({"outcome": "unknown", "reason": "No matching CLI receipt", "next": "Check the board; retry the same operation id."}) }
+    };
+    let id = args[args.len() - 3].as_str();
+    let r = checked(run(args), id);
+    if m["op"]["action"] != "close" || r["outcome"] != "accepted" || r["state"] == "closed" { return r; }
+    if r["state"] != "later" || !r["revision"].is_u64() {
+        return json!({"outcome": "rejected", "reason": "Cancellation stopped: parking was not read back as later with a revision", "next": "Check the task on the board."});
+    }
+    let id = format!("{}.close", m["op"]["id"].as_str().unwrap());
+    let close = vec!["close".into(), m["op"]["task"].to_string(), "--text".into(),
+        "Changed: Cancelled by the owner without publication.\nChecks: Tray cancellation -- later read back before close.\nOpen: none".into(),
+        "--json".into(), "--op-id".into(), id.clone(), "--revision".into(), r["revision"].to_string()];
+    let mut r = checked(run(&close), &id);
+    if r["outcome"] == "accepted" && r["state"] != "closed" {
+        r["outcome"] = json!("unknown");
+        r["reason"] = json!("Close receipt did not read back closed");
+    }
+    if r["outcome"] != "accepted" {
+        r["reason"] = json!(format!("Parked; close not verified: {}", r["reason"].as_str().unwrap_or("unknown")));
+        r["next"] = json!("Check the board; retry the same cancellation to reconcile delivery.");
+    }
+    r
+}
+
 fn answer(install: &Path, m: &Value) -> Value {
     let response = |state: &str, reason: &str, next: &str| json!({"answerReceipt": {"root": m["root"], "id": m["op"]["id"], "state": state, "reason": reason, "next": next}});
     let prepare = || -> Result<_, String> {
@@ -268,23 +324,21 @@ fn answer(install: &Path, m: &Value) -> Value {
         let out = crate::platform::quiet(owner_command(root)?.args(["status", "--json"])).output().map_err(|e| e.to_string())?;
         let snapshot = serde_json::from_slice(&out.stdout).map_err(|_| String::from_utf8_lossy(&out.stderr).into_owned())?;
         answer_snapshot(&snapshot, m)?;
-        let mut command = owner_command(root)?;
-        command.args(args);
-        Ok(command)
+        Ok((root, args))
     };
-    let mut command = match prepare() {
+    let (root, args) = match prepare() {
         Ok(c) => c,
         Err(e) => return response("rejected", &e, "Refresh the question or open it on the board."),
     };
-    match crate::platform::quiet(&mut command).output() {
-        Ok(out) => match serde_json::from_slice::<Value>(&out.stdout) {
-            Ok(r) if r["task"] == m["op"]["task"] && r["op_id"] == m["op"]["id"]
-                && matches!(r["outcome"].as_str(), Some("accepted" | "stale" | "rejected" | "unknown")) =>
-                response(r["outcome"].as_str().unwrap(), r["reason"].as_str().unwrap_or(""), r["next"].as_str().unwrap_or("")),
-            _ => response("unknown", &String::from_utf8_lossy(&out.stderr), "Read the task on the board; retry the same operation id."),
-        },
-        Err(e) => response("unknown", &e.to_string(), "Read the task on the board; retry the same operation id."),
-    }
+    let r = answer_dispatch(m, &args, |args| {
+        let out = owner_command(root).and_then(|mut c| crate::platform::quiet(c.args(args)).output().map_err(|e| e.to_string()));
+        match out {
+            Ok(out) => serde_json::from_slice(&out.stdout).unwrap_or_else(|_| json!({"task": m["op"]["task"], "op_id": args[args.len()-3], "outcome": "unknown", "reason": String::from_utf8_lossy(&out.stderr), "next": "Check the board; retry the same operation id."})),
+            Err(e) => json!({"task": m["op"]["task"], "op_id": args[args.len()-3], "outcome": "unknown", "reason": e, "next": "Check the board; retry the same operation id."}),
+        }
+    });
+    let reason = r["reason"].as_str().filter(|s| !s.is_empty()).or_else(|| r["state"].as_str()).unwrap_or("");
+    response(r["outcome"].as_str().unwrap_or("unknown"), reason, r["next"].as_str().unwrap_or(""))
 }
 
 /// One opaque revision of a policy: equal content, equal revision.
@@ -1324,6 +1378,94 @@ mod tests {
         s["complete"] = json!(false);
         s["reason"] = json!("permission denied");
         assert_eq!(answer_snapshot(&s, &m).unwrap_err(), "permission denied");
+    }
+
+    // Chain: no-choice ask -> tray IPC -> CLI dispatch -> board readback. Risk: cancellation publishes a result,
+    // stale input acts on another question, or retry/partial failure duplicates a write or skips parking.
+    #[test]
+    fn answer_bridge_fallback_cancellation_chain() {
+        use crate::board::{Board, Fake};
+        let install = std::env::temp_dir().join(format!("taskq-tray-cancel-{}", std::process::id()));
+        let root = install.join("project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(install.join("projects"), root.to_str().unwrap()).unwrap();
+        fs::write(root.join("taskq.json"), r#"{"repo":"o/r"}"#).unwrap();
+        let (cfg, _) = crate::load(&root).unwrap();
+        let b = Fake::default();
+        b.state.borrow_mut().publish = "pending".into(); // a publication attempt must not succeed
+        let n = b.create("Needs a decision", "## Goal\ng", &["taskq".into()]).unwrap();
+        let attempt = b.comment(n, "taskq: spawn worker codex:u mac").unwrap();
+        b.comment(n, &format!("taskq: result {} attempt {attempt}", "a".repeat(40))).unwrap();
+        let reviewer = b.comment(n, "taskq: spawn reviewer codex:v mac").unwrap();
+        let rev = b.comment(n, &format!("taskq: ask attempt {reviewer}\nReviewer cannot continue.")).unwrap();
+        let mut m = json!({"root": root, "board": "https://github.com/o/r/issues", "op": {"id":"cancel.1", "task":n, "revision":rev, "action":"close", "confirmed":true}});
+        let mut snapshot = json!({"complete":true,"board":{"url":m["board"]},"tasks":[{"n":n,"state":"ask","revision":rev,"question":crate::snapshot::question("Reviewer cannot continue.")}]});
+        assert!(answer_snapshot(&snapshot, &m).is_ok());
+        for st in ["doing", "review", "ready", "waiting"] {
+            snapshot["tasks"][0]["state"] = json!(st);
+            assert!(answer_snapshot(&snapshot, &m).is_err());
+        }
+        snapshot["tasks"][0]["state"] = json!("ask");
+        snapshot["tasks"][0]["revision"] = json!(rev + 1);
+        assert!(answer_snapshot(&snapshot, &m).is_err());
+        snapshot["tasks"][0]["revision"] = json!(rev);
+        snapshot["tasks"][0]["question"]["choices"] = json!([{"id":1}]);
+        assert!(answer_snapshot(&snapshot, &m).is_err());
+        snapshot["tasks"][0]["question"]["choices"] = json!([]);
+        m["op"]["confirmed"] = json!(false);
+        assert!(answer_args(&install, &m).is_err());
+        m["op"]["confirmed"] = json!(true);
+        let args = answer_args(&install, &m).unwrap();
+        assert_eq!(args[0], "later");
+        assert_eq!(args[args.len()-3], "cancel.1.later");
+        for outcome in ["rejected", "stale", "unknown"] {
+            let mut calls = 0;
+            let r = answer_dispatch(&m, &args, |_| { calls += 1; json!({"task":n,"op_id":"cancel.1.later","outcome":outcome}) });
+            assert_eq!((calls, r["outcome"].as_str().unwrap()), (1, outcome));
+        }
+        let mut calls = Vec::new();
+        let execute = |args: &[String]| {
+            let op = crate::dispatch::Op { id: Some(args[args.len()-3].clone()), revision: Some(args.last().unwrap().parse().unwrap()) };
+            let receipt = if args[0] == "close" { crate::dispatch::close_one(&b, &cfg, n, &args[3], &op) }
+                else { crate::dispatch::act(&b, &root, n, &args[0], &[], &args[3], &op) };
+            serde_json::to_value(receipt).unwrap()
+        };
+        let partial = answer_dispatch(&m, &args, |a| {
+            calls.push(a.to_vec());
+            if a[0] == "close" { json!({"task":n,"op_id":"cancel.1.close","outcome":"unknown","reason":"response lost"}) }
+            else { execute(a) }
+        });
+        assert!(partial["reason"].as_str().unwrap().contains("Parked; close not verified"));
+        assert_eq!(crate::dispatch::current(&b, n).unwrap().1.state, crate::core::State::Later);
+        snapshot["tasks"][0]["state"] = json!("later");
+        assert!(answer_snapshot(&snapshot, &m).is_ok(), "retry can reconcile its parking receipt");
+        let r = answer_dispatch(&m, &args, |a| { calls.push(a.to_vec()); execute(a) });
+        assert_eq!(r["state"], "closed");
+        assert_eq!(r["outcome"], "accepted", "must cancel without publishing the stored result");
+        assert_eq!(calls[0], calls[2]);
+        assert_eq!(calls[1], calls[3]);
+        assert_eq!(calls[1].last().unwrap(), &rev.to_string());
+        let count = b.comments(n).unwrap().len();
+        snapshot["tasks"] = json!([]);
+        assert!(answer_snapshot(&snapshot, &m).is_err(), "an omitted row never grants cancellation authority");
+        assert_eq!(answer_dispatch(&m, &args, execute)["state"], "closed");
+        assert_eq!(b.comments(n).unwrap().len(), count);
+        for action in ["requeue", "later"] {
+            m["op"] = json!({"id":"action.1","task":n,"revision":rev,"action":action});
+            if action == "requeue" { m["op"]["text"] = json!("Retry with literal $(text)"); }
+            let a = answer_args(&install, &m).unwrap();
+            assert_eq!(a[0], action);
+            assert_eq!(a[a.len()-3], "action.1");
+            let mut seen = 0;
+            assert_eq!(answer_dispatch(&m, &a, |_| { seen += 1; json!({"task":n,"op_id":"action.1","outcome":"accepted","state":"ready"}) })["outcome"], "accepted");
+            assert_eq!(seen, 1);
+        }
+        m["op"]["action"] = json!("requeue");
+        m["op"]["text"] = json!("x".repeat(233));
+        assert!(answer_args(&install, &m).is_err());
+        m["op"]["text"] = json!("a\nb");
+        assert!(answer_args(&install, &m).is_err());
+        fs::remove_dir_all(install).unwrap();
     }
 
     // Chain: status.json capacity -> tray projection -> shared resource controls. Risk: absent reads as zero, a legacy

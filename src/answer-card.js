@@ -24,14 +24,17 @@
     return null;
   }
 
+  const manageable = (row, cap) => row.state === 'ask' && cap && cap.answer && cap.manage && !(row.question && row.question.choices && row.question.choices.length);
+  const draftQuestion = (row, cap) => manageable(row, cap) ? {limits: {lines: 1, chars: 232}} : row.question;
+
   // One of STATES for a row, its local state and the adapter's capability {answer, reason}.
   function status(row, local, cap) {
     const q = row.question;
     // a receipt belongs to the question it answered; one in flight or unknown holds across refreshes, an answered one
     // stays beside its task after the question is gone
     if (local.op && local.receipt && (['sending', 'unknown'].includes(local.receipt.state) || local.op.revision === row.revision || !q)) return local.receipt.state;
-    if (!q || !q.parsed || !cap || !cap.answer || !['ask', 'review'].includes(row.state)) return 'read-only';
-    if (local.bound !== row.revision && (local.draft.trim() || local.op)) return 'stale';
+    if (!manageable(row, cap) && (!q || !q.parsed || !cap || !cap.answer || !['ask', 'review'].includes(row.state))) return 'read-only';
+    if (local.bound !== row.revision && (local.draft.trim() || local.op || local.confirmClose)) return 'stale';
     return 'actionable';
   }
 
@@ -40,6 +43,7 @@
   function step(row, local, cap, ev, newId) {
     const st = status(row, local, cap), l = {...local};
     const start = payload => {
+      l.confirmClose = false;
       l.op = {id: newId(), task: row.n, revision: row.revision, ...payload};
       l.bound = row.revision;
       l.receipt = {state: 'sending'};
@@ -58,10 +62,19 @@
         return start({choice: c.id});
       }
       case 'submit':
-        if (!['actionable', 'rejected'].includes(st) || textProblem(row.question, l.draft)) return {local, send: null};
-        return start({text: l.draft.trim()});
+        if (!cap || !cap.answer || !['actionable', 'rejected'].includes(st) || textProblem(draftQuestion(row, cap), l.draft)) return {local, send: null};
+        return start(manageable(row, cap) ? {action: 'requeue', text: l.draft.trim()} : {text: l.draft.trim()});
+      case 'later':
+      case 'close':
+      case 'confirm-close':
+        if (!manageable(row, cap) || !['actionable', 'rejected'].includes(st)) return {local, send: null};
+        if (ev.type === 'close') return {local: {...l, bound: row.revision, confirmClose: true}, send: null};
+        if (ev.type === 'confirm-close' && !l.confirmClose) return {local, send: null};
+        return start(ev.type === 'later' ? {action: 'later'} : {action: 'close', confirmed: true});
+      case 'cancel-close':
+        return {local: {...l, confirmClose: false}, send: null};
       case 'review':
-        if (st === 'stale') { l.bound = row.revision; l.op = null; l.receipt = null; }
+        if (st === 'stale') { l.bound = row.revision; l.op = null; l.receipt = null; l.confirmClose = false; }
         return {local: l, send: null};
       case 'receipt':
         if (!l.op || ev.opId !== l.op.id) return {local, send: null};
@@ -81,6 +94,16 @@
     const id = 'qac-' + String(board).replace(/[^\w-]/g, '_') + '-' + row.n, live = st === 'actionable' || st === 'rejected';
     let h = '<section class="qac" data-qac-state="' + st + '" aria-labelledby="' + id + '-t">';
     h += '<p class="qac-head" id="' + id + '-t"><span class="qac-mark" aria-hidden="true">?</span> <a href="' + href(row.url) + '" target="_blank" rel="noopener">#' + esc(row.n) + '</a> ' + esc(row.title) + '</p>';
+    if (manageable(row, cap)) {
+      h += '<pre class="qac-text">' + esc(q.text || row.card || 'No question text supplied') + '</pre>';
+      h += '<form class="qac-text-form" data-qac="submit"><textarea data-qac="input" rows="1" aria-label="Requeue reason" placeholder="Reason to requeue"' + (live ? '' : ' readonly') + '>' + esc(local.draft) + '</textarea><button type="submit"' + (live && !textProblem(draftQuestion(row, cap), local.draft) ? '' : ' disabled') + '>Requeue</button></form>';
+      h += '<div class="qac-choices"><button type="button" data-qac="later"' + (live ? '' : ' disabled') + '>Later</button><button type="button" data-qac="close"' + (live ? '' : ' disabled') + '>Close…</button></div>';
+      if (local.confirmClose && live) h += '<p>Cancel #' + esc(row.n) + ' without publication? Running work will stop. The task is parked before closing.</p><div class="qac-choices"><button type="button" data-qac="confirm-close">Close without publishing</button><button type="button" data-qac="cancel-close">Keep task</button></div>';
+      h += receipt(st, local.receipt && local.receipt.reason, row.url, id, local.receipt && local.receipt.next, true);
+      if (st === 'stale') h += '<button type="button" data-qac="review">I read the new question</button>';
+      if (st === 'unknown') h += '<button type="button" data-qac="retry">Check delivery</button>';
+      return h + '</section>';
+    }
     if (!q.parsed) return h + '<pre class="qac-text">' + esc(q.text) + '</pre>' + receipt(st, st === 'read-only' ? 'This card has no answer form here' : local.receipt && local.receipt.reason, row.url, id) +
       (st === 'unknown' ? '<button type="button" data-qac="retry">Check delivery</button>' : '') + '</section>';
     h += '<p class="qac-problem">' + esc(q.problem) + '</p>';
@@ -109,9 +132,9 @@
     return h + '</section>';
   }
 
-  function receipt(st, reason, url, id, next) {
+  function receipt(st, reason, url, id, next, action) {
     if (st === 'actionable') return '<p class="qac-receipt" id="' + id + '-r" role="status" aria-live="polite"></p>';
-    return '<p class="qac-receipt qac-' + st + '" id="' + id + '-r" role="status" aria-live="polite">' + esc(LABELS[st]) + (reason ? ': ' + esc(reason) : '') +
+    return '<p class="qac-receipt qac-' + st + '" id="' + id + '-r" role="status" aria-live="polite">' + esc(st === 'accepted' && action ? 'Action accepted on the board' : LABELS[st]) + (reason ? ': ' + esc(reason) : '') +
       (next ? '. ' + esc(next) : '') + (st === 'read-only' || st === 'unknown' ? ' <a href="' + href(url) + '" target="_blank" rel="noopener">Open on board ↗</a>' : '') + '</p>';
   }
 
@@ -128,7 +151,7 @@
         .then(x => apply(k, {type: 'receipt', opId: r.send.id, ...x}), e => apply(k, {type: 'receipt', opId: r.send.id, state: 'unknown', reason: String(e && e.message || e)}));
       else if (ev.type === 'input') {
         const s = el.querySelector('[data-qac-key="' + CSS.escape(k) + '"] button[type=submit]'), cap2 = adapter.capability(board, row);
-        if (s) s.disabled = !!textProblem(row.question, r.local.draft) || !['actionable', 'rejected'].includes(status(row, r.local, cap2));
+        if (s) s.disabled = !!textProblem(draftQuestion(row, cap2), r.local.draft) || !['actionable', 'rejected'].includes(status(row, r.local, cap2));
       }
     }
     function paint() {

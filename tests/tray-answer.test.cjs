@@ -6,13 +6,15 @@ const html=fs.readFileSync('src/tray.html','utf8');
 const source=html.slice(html.indexOf('// Task answers:'),html.indexOf('// one task per board'));
 const sent=[],timers=new Map();let id=0;
 const board='https://github.com/o/r/issues',project={root:'project',issues:board,alive:true,complete:true};
-const context={S:{projects:[project],font:16},send:m=>sent.push(m),fit:()=>{},menu:{scrollHeight:400},
+const context={S:{projects:[project],font:16},send:m=>sent.push(m),fit:()=>{},render:()=>{},menu:{scrollHeight:400},esc:String,
   setTimeout:(f,ms)=>{timers.set(++id,{f,ms});return id;},clearTimeout:i=>timers.delete(i)};
 vm.createContext(context);vm.runInContext(source,context);
 const call=(name,...args)=>{context.args=args;return vm.runInContext(name+'(...args)',context);};
 const plain=x=>JSON.parse(JSON.stringify(x));
 (async()=>{
   assert.equal(call('answerCapability',board).answer,true);
+  for(const state of ['doing','review','ready','later','waiting','blocked']) assert.equal(call('answerSlot',{state,key:'task',card:'Old question',question:{parsed:true}}),'',state+' must not mount an answer card');
+  assert(call('answerSlot',{state:'ask',key:'task'}).includes('data-answer'));
   project.complete=false;assert.equal(call('answerCapability',board).answer,false);
   project.complete=true;project.alive=false;assert.equal(call('answerCapability',board).answer,false);project.alive=true;
   assert.equal(call('answerCapability','other-board').answer,false);
@@ -43,6 +45,29 @@ const plain=x=>JSON.parse(JSON.stringify(x));
       if(want.same_op)assert.deepEqual(got[i].sent.at(-1),got[i].sent.at(-2),c.name);
     });
   }
+  // A2: the tray alone grants fallback actions; every transition keeps revision, confirmation and retry identity.
+  const row={n:42,state:'ask',revision:12,card:'Reviewer needs help.',question:{parsed:false,text:'Reviewer needs help.',choices:[]}},cap={answer:true,manage:true};
+  const fresh=()=>({draft:'',bound:12,op:null,receipt:null});
+  let local=fresh(),seq=0;
+  const step=ev=>{const r=card.step(row,local,cap,ev,()=> 'fallback-'+ ++seq);local=r.local;return r.send;};
+  assert.equal(card.status(row,local,{answer:true}),'read-only','other consumers gain no fallback authority');
+  assert(card.render(board,row,local,cap).includes('Requeue'));
+  assert.equal(step({type:'submit'}),null,'requeue needs a reason');
+  step({type:'input',text:'Please retry'});
+  const rq=step({type:'submit'});assert.deepEqual(rq,{id:'fallback-1',task:42,revision:12,action:'requeue',text:'Please retry'});
+  assert.equal(step({type:'later'}),null,'sending disables a second action');
+  step({type:'receipt',opId:rq.id,state:'unknown'});assert.deepEqual(step({type:'retry'}),rq);
+  local=fresh();assert.equal(step({type:'confirm-close'}),null,'cannot skip confirmation');
+  assert.equal(step({type:'close'}),null);assert(card.render(board,row,local,cap).includes('without publication'));
+  assert.equal(step({type:'cancel-close'}),null);assert.equal(step({type:'confirm-close'}),null);
+  step({type:'close'});const close=step({type:'confirm-close'});assert.equal(close.action,'close');assert.equal(close.confirmed,true);
+  local=fresh();assert.equal(step({type:'later'}).action,'later');
+  local=fresh();step({type:'close'});row.revision=13;assert.equal(step({type:'confirm-close'}),null,'confirmation is bound to its question');row.revision=12;
+  local={...fresh(),draft:'old draft'};row.revision=13;
+  assert.equal(step({type:'later'}),null,'stale fallback cannot cancel or park');
+  assert.equal(card.status(row,local,cap),'stale');
+  step({type:'review'});assert.equal(step({type:'later'}).revision,13);
+  for(const state of ['doing','later','review']) assert.equal(card.status({...row,state},fresh(),cap),'read-only');
   assert(html.includes('<script>{{ANSWER_CARD_JS}}</script>'));
   assert(html.includes('<style>{{ANSWER_CARD_CSS}}</style>'));
   assert(html.includes("if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}"));

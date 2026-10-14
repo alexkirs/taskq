@@ -37,6 +37,9 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 - Answer cards mount only for `ask`, never for stored cards on doing/review/ready/later/blocked rows. An ask with no parsed choices shows its original text, a requeue reason field, Later and Close. Close requires confirmation naming cancellation without publication, then canonical `later` and `close` with readback after each; no second step after failed/unknown parking. Retain a compact operation receipt and same-ID delivery check outside the question card when the task leaves ask; partial close names the parked task and board recovery.
 - Back restores list/scroll position. Service, log, folder and admission controls always identify project/host.
 - Current Agents is host-level, read-only: version/account or not installed/not logged in/unknown, plus probe age. Include disabled runtimes such as codex-app where reported.
+- Agents row (shipped): one per § 5 `agents` runtime, `<runtime> <version> · <account>` or `· not logged in` / `· not installed` / `· login unknown`, with the age of the freshest `status.json` probe; none: unknown.
+- Shipped popover (§ 4 Tray): Home, Projects, Attention and Settings, with Back restoring the previous route and scroll. Home shows scope, questions and failed of all projects (one task per board and issue), project rows that open in place with issue links and the board, errors and stale `status.json` apart from failed, and `Paused N of M` with the paused projects.
+- Project page `Capacity` (this host only, other hosts unknown): per runtime `used/limit`, `Load gate: Off|Ready|Waiting: CPU|Waiting: memory|Waiting: recovery|Unknown: <reason>`; after the § 4 `Edit limits` confirm it shows `Saved; waiting for service` until § 4 `Applied`.
 
 ## M4 Request, interpretation and applied state
 
@@ -63,6 +66,7 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 - No board replay. Cache loss means incomplete history; show collection start and gaps. Unknown follows [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy).
 - Equal time bins, oldest left; presets use 12 whole epoch-aligned bins, the newest holding now and marked partial; the grid steps one bin at a boundary, never drifts. One linear scale across series and bins. Equal counts have equal heights; scale by the largest stacked sum, never 100% per bar.
 - Default 24 hours; presets 5 min/hour/day/7 days/30 days/custom. Custom start < end, explicit timezone and half-open range [start,end); persist choice.
+- Shipped: stacked from the bottom closes green, failed red, `ask` peach, waiting gray; custom `[start, end)` is typed in local time or UTC and start >= end is refused; the icon's 24 h uses the same 12-bin grid. Before the latest `since` and in projects without `events` the history says unknown.
 - Period never changes scope or the current failed count. Expose precise totals/peak when small segments cannot resolve.
 - Acceptance fixtures have nonzero first/last bars; real zero edges stay empty. Runtime keeps 12 source bins; the icon sums adjacent bins to the largest fitting divisor of 12 (I4/I6, D11). Evidence: [icon shift](evidence/icon-shift/README.md).
 
@@ -77,6 +81,7 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 - Read requests return evidence. Changes show allowlisted operations, targets and effects before revision-bound confirmation. No arbitrary model shell execution or silent permission change.
 - Success requires readback; partial/unknown results are explicit. Working tasks use the board lifecycle, not a second queue. AI failure is not failed-task count.
 - Current request/operator protocol remains §4; attachments, durable conversations, session browsing and cancellation require explicit contract/data extensions before runtime implementation.
+- Shipped inline chain: the clarify chain is shown oldest first; the input and a visible Reply button sit directly under the newest question, with placeholder `Answer…` while clarify is open. An answer whose last line is a well-formed R6 `Next:` line (1..n in order, at most one ★) gets one button per action, labelled with its text, ★ marked; a press replies with its number like typing it; any other line stays text only. Clear history removes only command history.
 
 ## M8 Implementation boundary
 
@@ -97,6 +102,8 @@ F5 for this slice covers the native navigation/settings ledger and preserved exi
 
 Native sizing, scroll ownership and cadence rendering follow [R-UI1–R-UI6](rendering-contract.md).
 
+`taskq tray --snapshot` routes: `home`, `actions`, `project`, a Settings or top-level route, `icon` (through the renderer: both themes, run and pause, named by size), and `scroll`: Home with each bounded AI block at its start, middle and end, captured only when named.
+
 ## M9 Settings and maintenance
 
 - Categories: Appearance, Activity history, Agents, Services and About. Work mode remains a direct entry, not a second editor.
@@ -105,6 +112,8 @@ Native sizing, scroll ownership and cadence rendering follow [R-UI1–R-UI6](ren
 - Stale status does not prove a dead process. Known logs remain accessible during failure; unknown log paths are explained.
 - About shows tray/service versions and host. Update now appears only for a verified newer version; preserve progress, readback, failure and rollback visibility.
 - Update writes the existing service request and follows §8. Do not claim completion from a button click.
+- `<install>/tray.json` holds view, text size 14–20, period, the Custom icon, notification modes, cursors and open-task titles, Pin, Top, the chosen logical window size and its last position per display (off-screen: at the icon).
+- Resources opens btop in its own OS terminal window (Terminal.app; Windows: conhost), movable, resizable and closable; missing btop is installed with `brew install btop` or winget `aristocratos.btop4win`, its output shown in that window; no package manager: one line saying so.
 
 ## M10 Add project
 
@@ -113,6 +122,7 @@ Native sizing, scroll ownership and cadence rendering follow [R-UI1–R-UI6](ren
 - Existing taskq.json + passing selftest: register/install through the existing confirmed flow; already registered is idempotent.
 - Existing taskq.json + failing selftest: show first verified reason and repair/cutover route; no automatic replacement or migration.
 - Onboarding proceeds in its AI conversation with account/repository/visibility and every external effect reviewed before apply. New repositories default private under §6.
+- The § 6 inspection the onboarding operator gets: entries, Git root, remotes, uncommitted count, `gh`/`glab` logins, and an existing GitHub repository's name and visibility from `gh repo view --json nameWithOwner,visibility`.
 - Empty-install AI bootstrap currently lacks a running service; resolve that route before claiming first-project onboarding is complete. Do not hide it behind an unusable Send button.
 
 Product choices and approval boundaries: [MP1–MP9](menu-product.md).
@@ -151,13 +161,15 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 
 ## M14 Notifications
 
-- The tray posts native OS notifications (macOS Notification Center, Windows toast) for new board events read from each project's `events`; no board read, no token.
+- The tray posts native OS notifications (macOS Notification Center, Windows toast) for new board events read from each project's `events` (§ 4 Tray). A closed task keeps its title in its banner and card.
 - Event kinds: `ask` (a question waits for the owner), `close`, `failed` and `gone`. Settings > Notifications sets each kind to Off, Silent (menu badge only), Banner or Banner with sound. Defaults: `ask` Banner with sound, `failed` and `gone` Banner, `close` Off.
 - A project may override the host setting per kind (Inherit by default); the project page shows the effective value.
 - A notification names the project, the task title and the kind; a click opens the menu (or the pinned window) on that task's card, for `ask` the answer card.
-- Each event notifies at most once: a per-project cursor of the last notified event id persists in `<install>/tray.json`; events older than the cursor, or older than the first tray start with notifications on, never notify. More than 3 events within 10 s become one summary notification per project.
+- Once per event (§ 4 Tray): events at or before a project's cursor (the last notified event id), or older than the first tray start with notifications on, never notify. More than 3 events within 10 s become one summary notification per project.
 - The first enable asks the OS for permission on macOS; Windows reads the OS notification setting without a consent prompt. While the prompt is open Settings shows `Asked`; a failed request shows its OS error, never `Not asked`. Denied or revoked: Settings shows `Blocked by the OS` with a link to the OS setting, and nothing falls back to another channel. `Send test` posts one sample of the selected kind.
-- Settings persist in `<install>/tray.json`; an unknown value reads as the default and keeps the file.
+- An unknown `tray.json` value reads as the default and keeps the file.
+- Windows toasts use AppUserModelID `org.taskq.tray` on a TaskQ-owned Start Menu shortcut to the stable tray executable; OS settings are read through the notifier (denied: Blocked, errors: Unknown). A failed authorization request is logged in `tray.log`.
+- Packaging: Windows runs the tray as `<install>/taskq-tray.exe`, so the notification-area pin follows the exe path across updates. macOS runs `<install>/TaskQ.app` (bundle `org.taskq.tray`, signed as taskq.md § 8 step 5), which notifications need, started through LaunchServices (`open`; the bundle with no args is the tray of its parent folder and appends its stderr to `tray.log`): a bundle exec'd by the service is refused authorization.
 
 ## Acceptance
 

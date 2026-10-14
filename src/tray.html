@@ -463,7 +463,7 @@ menu.addEventListener('mousedown',e=>{if(S&&e.button===0&&e.target.closest('.hea
 let resizing=null;
 menu.addEventListener('pointerdown',e=>{if(e.button!==0||!e.target.closest('.grip'))return;resizing={x:e.screenX,y:e.screenY,w:innerWidth,h:innerHeight};e.target.setPointerCapture(e.pointerId);e.preventDefault();});
 menu.addEventListener('pointermove',e=>{if(!resizing)return;manualSize=[Math.max(240,resizing.w+e.screenX-resizing.x),Math.max(120,resizing.h+e.screenY-resizing.y)];menu.style.width='100%';send({a:'resize',d:devicePixelRatio,w:manualSize[0],h:manualSize[1]});});
-for(const event of ['pointerup','pointercancel'])menu.addEventListener(event,()=>{if(resizing)send({a:'resize-end'});resizing=null;});
+for(const event of ['pointerup','pointercancel','lostpointercapture'])menu.addEventListener(event,()=>{if(resizing)send({a:'resize-end'});resizing=null;});
 menu.addEventListener('keydown',e=>{if(!e.target.closest('.grip')||!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key))return;e.preventDefault();manualSize=[Math.max(240,innerWidth+(e.key==='ArrowRight'?10:e.key==='ArrowLeft'?-10:0)),Math.max(120,innerHeight+(e.key==='ArrowDown'?10:e.key==='ArrowUp'?-10:0))];send({a:'resize',d:devicePixelRatio,w:manualSize[0],h:manualSize[1]});send({a:'resize-end'});});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')send({a:'hide'});});
 menu.addEventListener('toggle',()=>fit(),true);

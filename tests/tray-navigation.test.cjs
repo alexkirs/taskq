@@ -65,3 +65,12 @@ sizing.S.pinned=true;sizing.S.top=false;assert(sizeRun('head()').includes('data-
 sizing.S.size=[480,600];sizeRun('fit()');assert.equal(sizing.sent.at(-1).h,600);
 sizeRun('manualSize=[500,300];fit()');assert.equal(sizing.sent.at(-1).w,500);assert.equal(sizing.sent.at(-1).h,300);
 console.log('PASS M13 independent header toggles, measured initial height and preserved manual size');
+
+// Chain: M13 resize -> capture loss -> next refresh. Risk: a cancelled drag leaves rendering held forever.
+const dragEvents={},dragMessages=[],drag={devicePixelRatio:1.4,innerWidth:320,innerHeight:400,manualSize:null,send:m=>dragMessages.push(m),menu:{style:{},addEventListener:(type,fn)=>dragEvents[type]=fn}};
+vm.createContext(drag);vm.runInContext(html.slice(html.indexOf('let resizing=null;'),html.indexOf("document.addEventListener('keydown',e=>")),drag);
+dragEvents.pointerdown({button:0,screenX:10,screenY:10,target:{closest:()=>true,setPointerCapture:()=>{}},preventDefault(){}});
+dragEvents.pointermove({screenX:30,screenY:25});dragEvents.lostpointercapture();dragEvents.lostpointercapture();
+assert.equal(vm.runInContext('resizing',drag),null);assert.equal(dragMessages.filter(m=>m.a==='resize-end').length,1);
+assert.equal(drag.manualSize[0],340);assert.equal(drag.manualSize[1],415);
+console.log('PASS M13 capture loss releases the resize guard once and preserves chosen dimensions');

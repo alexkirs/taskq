@@ -43,6 +43,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - run: docs/shots/check.test.sh
       - run: |
           rc=0; docs/shots/check.sh || rc=$?
           [ $rc = 2 ] && { echo '::warning::README shots are stale; run the README shots workflow (dispatch) or wait for the next release tag'; exit 0; }

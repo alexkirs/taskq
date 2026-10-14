@@ -21,12 +21,13 @@ Filled from the [report template](../../ui-acceptance-report.md) against the [ha
 | U-A2 natural fit | Home, Projects, Project, Settings, About at 16/20 px | No primary scrollbar when content fits | Projects, Project, Settings, About fit; Home is cut at the 1818 px cap because the full last AI exchange sits between Attention and Projects | Fail → #1059 | `popover-dark-home-16.png`, `popover-light-home-16.png` |
 | U-A3 clamp / anchor / DPI | — | Popover anchored under the menu-bar icon, clamped to the work area | Worker cannot capture the screen; one display | Not tested → #1060 | — |
 | U-A4 header/footer overlap, focus/Back | Back and footer on every sub-route | No overlap; Back restores route | No overlap of header, Back or footer at 16/20 px; focus, draft and Back scroll not exercised | Pass (overlap); focus → #1060 | `popover-*-16.png` |
-| U-A5 histogram totals | Cadence and Projects aggregate | Same totals across adapter, tray, detail | Totals render; live counts moved during capture, so no exact cross-check | Not tested → #1060 | `popover-*-cadence-16.png` |
+| U-A5 histogram totals | Frozen fixture at `f41cf1a` (`4.2.0-dev.1791996060`, `taskq` `5dd47b61…`): disposable install, one project, [ua5-events.txt](ua5-events.txt) (in the Day window: close 3 with one duplicate line, failed 2, ask 1, blocked 2; one close 30 h old; one `gone`), `status.json` with 4 doing, 3 ask, 1 ready; `tray --snapshot` | Tray totals and bins equal the events file; task counts never replace event totals | Summary `closed 3 · failed 2 · ask 1`, bars only in bins 1, 7 and 12 with close+failed, close+failed+waiting, close+ask+waiting, peak 3: the duplicate counted once, the 30 h line and `gone` left out; Home keeps ▶ 4 and ? 3 apart; the Summary icon shows the same three bars. The summary ellipsis hides `waiting 2` at 16 px and the ask total at 20 px | Pass (totals, series); finding #1083 | `ua5-*` |
 | U-A6 bars | Cadence Hour, custom range refused | Equal widths, shared baseline | Equal bars on one baseline; custom start after end refused with reason; chain test `tray::tests::history_bins_are_equal_oldest_left_on_one_scale` | Pass (bounds, widths, baseline) | `popover-dark-cadence-16.png` |
 | U-A6 temporal shift and rebin | — | Bars shift only at bin boundaries; approved rebin keeps totals | Runtime keeps 12 fixed bins (menu.md: rebin not approved for runtime); no frame sequence across a boundary | Not tested → #1077 | — |
 | U-A7 icon at native size | Summary and compact, run/pause, both themes, 34 pt@2× | q, digits, grid; gray pause overlay | Digits and stacked series legible at 68 px; pause shows gray bars under the q; live menu-bar capture missing | Pass (render); live → #1060 | `icon-*` |
 | U-A8 keyboard, names, contrast, large text | 20 px both themes | Readable, named controls | 20 px wraps without clipping; keyboard and VoiceOver not exercised | Not tested → #1060 | `popover-dark-home-20.png`, `popover-dark-projects-20.png` |
 | U-A9 4.1.9 additions retained | Services, About | Log, folder, restart, stop, uninstall confirm, Resources, incidents, versions | All present per project; uninstall needs a nested confirm; About lists tray and service versions; Update shows only for a newer version | Pass | `popover-*-services-16.png`, `popover-*-about-16.png` |
+| M14 notifications (owner checkpoint, #1047) | Candidate as `TaskQ.app` (`org.taskq.tray`, ad-hoc signed) in a disposable install; [owner-notifications.sh](owner-notifications.sh) walks OS prompt, `ask` banner, click, OS off, `failed` while off, then snapshots the Notifications page | Prompt once; banner with sound; click opens the card; off reads `Blocked by the OS` and posts nothing | Bundle identity works: the Notifications page reads `Not asked yet`, not `Not available`; owner session not yet run | Not tested (owner) | `notify-not-asked-dark-16.png` |
 | U-A10 frozen evidence | This folder | Candidate SHA, hashes, shots | Recorded above and in `SHA256SUMS` | Pass | [SHA256SUMS](SHA256SUMS) |
 
 ## Findings
@@ -34,14 +35,15 @@ Filled from the [report template](../../ui-acceptance-report.md) against the [ha
 | ID / severity | Requirement | Reproduction | Expected → actual | Fix |
 |---|---|---|---|---|
 | #1059 major | U-A2, menu.md Home | Finish a long AI request; open Home | Short composer, Projects visible → full exchange pushes Projects below the fold | Bound the Home preview; full text in the AI workspace |
-| #1060 evidence gap | U-A1/3/4/5/7/8 | `screencapture -R 0,0,1470,37` in a worker: `could not create image from rect` | Live menu-bar and keyboard evidence → none | Owner-run capture or a Screen Recording grant |
+| #1060 evidence gap | U-A1/3/4/7/8 | `screencapture -R 0,0,1470,37` in a worker: `could not create image from rect` | Live menu-bar and keyboard evidence → none | Owner-run capture or a Screen Recording grant |
 | #1077 evidence gap | U-A6 | Snapshot steps render one frame per route | Frame sequence across a bin boundary and approved rebin → none | Native frame sequence; implement or defer rebin |
+| #1083 minor | U-A5 | ua5 fixture, Activity history at 16 and 20 px | All four totals readable → `waiting` (and at 20 px `ask`) cut by the ellipsis | Wrap the summary instead of truncating |
 | #1061 major | § 8 N/N-1 | Roll a host with grants back to 4.1.11 | Grants kept → store deleted | Keep or restore the store across rollback |
 
 ## Verdict
 
 - Design accepted: no; owner review pending.
 - Runtime/platform verified: update 4.1.11 → candidate keeps state and a live CLI child (stub `codex`) on a disposable install; WKWebView snapshots for 11 routes at 16/20 px.
-- Not tested / blocked: real-runtime and real-host handover (#1053), U-A6 temporal shift and rebin (#1077), live menu-bar and popover, keyboard, VoiceOver, 14/18 px, external and 1× displays (#1060).
+- Not tested / blocked: notification banner, click and Blocked (owner session with `owner-notifications.sh`), real-runtime and real-host handover (#1053), U-A6 temporal shift and rebin (#1077), live menu-bar and popover, keyboard, VoiceOver, 14/18 px, external and 1× displays (#1060).
 - Deployed: no; the real host stays on `4.2.0-dev.1791987853`.
 - Next exact fix or decision: #1059, then #1060 capture on the next candidate.

@@ -533,7 +533,6 @@ fn adopt(s: &mut Service, root: &Path) {
 }
 
 fn service_run(c: &Ctx) -> Res<()> {
-    platform::service_log();
     let cfg = &c.cfg;
     let exe = launcher(&cfg.install);
     let board_env = cfg.board.worker_env(&platform::tool(&cfg.install), &cfg.web_host)?;
@@ -1200,6 +1199,10 @@ fn service_fields(root: &Path) -> String {
 
 fn service(args: &Args) -> Res<()> {
     let sub = args.pos.get(1).map(String::as_str).unwrap_or("");
+    if sub == "run" {
+        // before root and config load: their errors reach the unit log stamped too (§ 4)
+        platform::service_log();
+    }
     let projects = platform::default_install().join("projects");
     if sub == "list" {
         // one project root per line, written by `service install` (§ 5); a PM or ARM covers several projects from it

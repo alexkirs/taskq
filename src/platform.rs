@@ -47,7 +47,7 @@ pub fn log(text: &str) {
 }
 
 pub fn die(msg: &str) -> ! {
-    eprintln!("{}", error_text(msg, crate::find_root().ok().as_deref()));
+    log(&error_text(msg, crate::find_root().ok().as_deref()));
     std::process::exit(1);
 }
 

@@ -1013,7 +1013,8 @@ mod tests {
                     else { assert!(text.ends_with(&brief(&env, &l))); }
                     assert_eq!(l.session, "same-session");
                     // Native sessions do not inherit the child env; without the prefix `result` is refused as a non-worker.
-                    assert_eq!(brief(&env, &l).contains("env TASKQ_TASK=7 TASKQ_ATTEMPT=42 "), rt != "codex", "{rt} {role}: attempt identity");
+                    let prefix = if cfg!(windows) && rt == "codex-app" { "$env:TASKQ_TASK='7'; $env:TASKQ_ATTEMPT='42'; " } else { "env TASKQ_TASK=7 TASKQ_ATTEMPT=42 " };
+                    assert_eq!(brief(&env, &l).contains(prefix), rt != "codex", "{rt} {role}: attempt identity");
                     assert!(text.contains("https://github.com/taskqorg/taskq/blob/") && text.contains(FILES) && text.contains(CI_WAIT));
                     for bad in [Err("offline".into()), Ok(String::new()), Ok("x".repeat(65537))] {
                         assert!(turn_text(&env, &l, |_| bad.clone()).is_err());

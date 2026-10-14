@@ -26,7 +26,7 @@ After each merge to `main`:
 ```bash
 cd ~/Projects/taskq && git pull --ff-only
 v=4.2.0-dev.$(date +%s)
-perl -0pi -e "s/^version = \"[^\"]*\"/version = \"$v\"/m" Cargo.toml
+sed -i '' "s/^version = .*/version = \"$v\"/" Cargo.toml
 cargo build --release && target/release/taskq selftest
 git checkout Cargo.toml Cargo.lock
 idle=$(for p in $(cat ~/.local/share/taskq/projects); do python3 -c "import json,sys; sys.exit(1 if json.load(open('$p/.taskq/status.json')).get('kids') else 0)" && { echo "$p"; break; }; done)

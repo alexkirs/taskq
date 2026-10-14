@@ -60,11 +60,43 @@ pub fn update(install: &Path, check: bool) -> Result<Option<String>, String> {
 /// first makes the copy a new file; running processes keep the old one.
 pub fn install_self(t: &Tool) -> Result<(), String> {
     let (me, dst) = (std::env::current_exe().map_err(|e| e.to_string())?, t.release_exe(t.version));
+    #[cfg(all(windows, target_env = "gnu"))]
+    install_webview2_loader(t)?;
     if fs::canonicalize(&me).ok() != fs::canonicalize(&dst).ok() {
         // ponytail: a start in the unlink-to-copy gap fails once; coreq writing tmp + rename would close it
         let _ = fs::remove_file(&dst);
     }
     coreq::update::install_self(t)
+}
+
+/// GNU links the DLL; MSVC release artifacts link the loader statically.
+#[cfg(all(windows, target_env = "gnu"))]
+fn install_webview2_loader(t: &Tool) -> Result<(), String> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::{core::w, Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW}};
+    let mut path = vec![0u16; 32768];
+    // SAFETY: the imported loader remains loaded for this process; the API writes within the supplied buffer.
+    let len = unsafe {
+        let module = GetModuleHandleW(w!("WebView2Loader.dll")).map_err(|e| e.to_string())?;
+        GetModuleFileNameW(Some(module), &mut path) as usize
+    };
+    if len == 0 || len >= path.len() {
+        return Err("cannot locate loaded WebView2Loader.dll".into());
+    }
+    let bytes = fs::read(PathBuf::from(std::ffi::OsString::from_wide(&path[..len]))).map_err(|e| e.to_string())?;
+    for folder in [t.release_exe(t.version).parent().unwrap(), t.install.as_path()] {
+        fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+        let dst = folder.join("WebView2Loader.dll");
+        // Repeated installs must not rewrite a loader already mapped by a running launcher.
+        match fs::read(&dst) {
+            Ok(old) if old == bytes => continue,
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("{}: {e}", dst.display())),
+            _ => {}
+        }
+        let tmp = dst.with_extension("dll.tmp");
+        fs::write(&tmp, &bytes).and_then(|_| fs::rename(&tmp, &dst)).map_err(|e| format!("{}: {e}", dst.display()))?;
+    }
+    Ok(())
 }
 
 /// Service step 7 also catches a release made current by another service on this install.
@@ -107,7 +139,7 @@ pub fn sweep(install: &Path, shim: &Path) {
         }
     }
     let owned = |n: &str| {
-        ["releases", "current", "previous", "projects", "token", "installation-id", "taskq", "taskq.exe", "taskq-tray.exe", "capacity", crate::policy::FILE].contains(&n)
+        ["releases", "current", "previous", "projects", "token", "installation-id", "taskq", "taskq.exe", "WebView2Loader.dll", "taskq-tray.exe", "capacity", crate::policy::FILE].contains(&n)
             || n.ends_with(".log") || n.ends_with(".tmp") || n.starts_with("tray") || (n.starts_with("TaskQ-") && n.ends_with(".xml"))
     };
     let gone = |p: &Path| {

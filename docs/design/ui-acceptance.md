@@ -5,18 +5,17 @@ Historical release review: [4.1.9 audit](release-4.1.9-ui-audit.md). No current 
 
 ## Workflow
 
-1. Builder reads taskq.md and package index. Pins reference hashes and lists unsupported decisions before implementation.
-2. Builder completes the ledger and supplies the [F5](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f5-acceptance-package) evidence, plus DPI, usable monitor rectangle, fixture and navigation route.
+1. Builder reads taskq.md and package index, follows [F1](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f1-source-and-change-control) and lists unsupported decisions before implementation.
+2. Builder completes the ledger and supplies the [F5](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f5-acceptance-package) package; each row names its fixture and navigation route.
 3. Reviewer checks functionality/data first, sizing/navigation second, natural-size rendering third; findings use the F5 fields.
-4. Polish one shared cause at a time; proposed design changes return to the owner with before/after and affected requirements.
-5. Freeze, re-run and accept per [F6](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f6-build-polish-accept); native evidence qualifies the implementation.
+4. Polish, owner review, freeze and acceptance follow [F6](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f6-build-polish-accept); native evidence qualifies the implementation.
 
 Use [synthetic expected fixtures](ui-acceptance-fixtures.json) for histogram, sizing-boundary and lattice checks; these are inputs, not native proof.
 Use [report template](ui-acceptance-report.md). Keep reports per candidate; do not overwrite failing evidence. Fixed items link replacement evidence.
 
 ## Feature ledger
 
-Every row needs initial, success, failure/unknown and recovery evidence where applicable. A disabled placeholder is not completion.
+Every row needs initial, success, failure/unknown and recovery evidence where applicable; placeholders stay gaps per [F6](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f6-build-polish-accept).
 
 | Surface / route | Must preserve | Requirements |
 |---|---|---|

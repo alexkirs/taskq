@@ -70,6 +70,7 @@ The editable candidate contains local simulation, not live service access. Detac
 - [Board labels](board.md): names/colors and migration constraints.
 - [Incident reports](incidents.md): fault catalog, reporting, consent and operator states.
 - [Capacity](capacity.md): earlier limits/load-gate detail; current runtime authority is taskq.md.
+- [Contract audit](contract-audit.md): per-section verdicts and ordered edit tasks to compact taskq.md before injection.
 
 ## Historical references
 

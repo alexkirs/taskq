@@ -102,3 +102,17 @@ about 3550 core/h after.
   of win taskq CLI in a busy hour. Not split per host or operation by the
   owner's choice. Follow-up: [#1084](https://github.com/taskqorg/taskq/issues/1084)
   counts them per host and source and cuts each above 10 %.
+
+## Counting format
+
+Moved from taskq.md § 4 Log and board budget, which keeps the rules.
+
+- **Log line:** `<UTC time> <text>`, time ISO 8601 `YYYY-MM-DDThh:mm:ssZ` from the local clock; the lines of one message, an HTTP error body or a panic included, fold into one line.
+- **Operation:** `<METHOD> <path>`, the path API-relative, at most 3 segments, numbers as `N`, other ids as `*`; later pages count under their first page.
+- **Pause:** a 403 or 429 with `retry-after`, or with zero `x-ratelimit-remaining`/`ratelimit-remaining`, pauses the process's board calls on the monotonic clock until `retry-after`, else the reset header against the reply `Date`, else 60 s; at most 1 h. A GraphQL `RATE_LIMITED` reply pauses like a 403. Log lines: `rate limit: board requests paused until <time>` and `... resumed`.
+- **Buckets:** GitHub budgets per `x-ratelimit-resource` (`core`, `graphql`); `remaining`, `limit`, `reset` and `resource` are those of the bucket with the lowest remaining share.
+- **`status.json` `requests`:** `since`, cumulative `total` and `ops`, `last_hour` (null until a full hour), last `remaining`/`limit`, `paused_until`; under the alarm also `reset`, `resource` and `top`.
+- **Hourly log:** `requests 1h: <total>; <op> <n>, ..`, top 8 operations, then `other`.
+- **Alarm log:** `board budget low: <remaining>/<limit> <resource> until <reset>; top here: <op> <n>`, `top` being the largest operation of this process's current hour.
+- **Sources (#1084):** `source` is `service` or `<role> <command>`; `service` adds its subcommand; the role is `worker`/`reviewer` from `TASKQ_ROLE`, else `cli`; other words are `*`.
+- **Pass cost:** on github.com one GraphQL query per 100 open issues, 1 point: labels are its only nested connection (#1043). Assignees, which would double it, are read per issue only for an `assignee-only` candidate or a report `assignee` filter. Other boards use REST. A dependency of this board is read off the open list once per process until listed open again; one of another repository each pass until done.

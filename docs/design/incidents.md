@@ -91,7 +91,7 @@ Confirmation comment on an open issue: the same marker plus `release` and `repor
 
 ## Operator view
 
-`status.json` gains `incident`: `{state, fault, at, path, url, reason}` for the newest report, else `null`.
+`status.json` gains `incident`: `{state, fault, at, path, url, reason}` for the newest report, else `null`. `.taskq/incident.json` caches that outcome across CLI and service processes; it holds no task state.
 
 `taskq service status`, one line after `Update:` (snapshot):
 

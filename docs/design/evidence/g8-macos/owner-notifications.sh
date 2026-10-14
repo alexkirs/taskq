@@ -1,16 +1,19 @@
 #!/bin/sh
 # G8 (#1051) owner checkpoint: TaskQ.app notification permission, banner, click and Blocked on this Mac.
 # Usage from the repository root: sh docs/design/evidence/g8-macos/owner-notifications.sh [candidate taskq binary]
-# Disposable install and fixture project under $TMPDIR; the real install, its tray and every board stay untouched.
+# Disposable install and fixture project under target/g8-owner; the real install, its tray and every board stay untouched.
 # Bundle `org.taskq.tray` shares the OS permission with any later real TaskQ.app on this Mac.
+# One stable app across runs: the OS keys its Notifications entry to the bundle path and signature, so the app is
+# re-signed only when the binary changes and is registered with LaunchServices as the service does (#1051).
 set -eu
 BIN=${1:-target/release/taskq}
 # resolved path: through the /var -> /private/var symlink the app cannot hand its bundle to the notification
-# daemon (tray.log: sandbox_extension_issue_file_to_process failed: 1) and the OS never asks (#1051 first run)
-W=$(cd "${TMPDIR:-/tmp}" && pwd -P)/taskq-1051-owner
+# daemon (tray.log: sandbox_extension_issue_file_to_process failed: 1)
+mkdir -p target/g8-owner
+W=$(cd target/g8-owner && pwd -P)
 I=$W/inst P=$W/proj
 APP=$I/TaskQ.app
-rm -rf "$W" && mkdir -p "$APP/Contents/MacOS" "$P/.taskq" "$W/shots"
+rm -rf "$P" "$W/shots" "$W/result.txt" "$I/tray" "$I/tray.json" && mkdir -p "$APP/Contents/MacOS" "$P/.taskq" "$W/shots"
 # no `current`: the tray then never exits over a version mismatch
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -23,8 +26,14 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 <key>LSUIElement</key><true/>
 </dict></plist>
 EOF
-cp "$BIN" "$APP/Contents/MacOS/taskq"
-codesign -f -s - "$APP"
+# codesign edits the copy, so the source hash marks which binary the app holds
+SUM=$(shasum -a 256 "$BIN" | cut -c1-64)
+if [ "$(cat "$I/bin.sha256" 2>/dev/null)" != "$SUM" ]; then
+  cp "$BIN" "$APP/Contents/MacOS/taskq"
+  codesign -f -s - "$APP"
+  echo "$SUM" > "$I/bin.sha256"
+fi
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP"
 echo "$P" > "$I/projects"
 echo "since $(date +%s)" > "$P/.taskq/events"
 cat > "$P/.taskq/status.json" <<'EOF'
@@ -46,7 +55,7 @@ fi
 log "tray $TRAY running, tray.log clean"
 echo "1. A macOS prompt asks whether TaskQ may send notifications. Click Allow."
 ask "Did the prompt appear and did you click Allow?"
-echo "   No prompt? System Settings > Notifications > TaskQ: turn Allow notifications on (a worker run without a screen already read Blocked)."
+echo "   No prompt? System Settings > Notifications > TaskQ: turn Allow notifications on."
 open "x-apple.systempreferences:com.apple.Notifications-Settings.extension" || true
 ask "Is TaskQ listed in Notifications with Allow on now?"
 sleep 3

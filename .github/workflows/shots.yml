@@ -2,7 +2,7 @@ name: README shots
 on:
   workflow_dispatch:
   push:
-    branches: [main, taskq-924, taskq-988]
+    branches: [main, taskq-924]
     paths:
       - src/tray.rs
       - src/tray.html

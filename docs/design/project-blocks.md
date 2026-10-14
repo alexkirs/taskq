@@ -19,7 +19,7 @@ Release staging publishes `taskq-<release>-project-blocks.js`, `.css`, `.LICENSE
 | Parent | Shared child | Permitted placement / evidence |
 |---|---|---|
 | `menu-next-variants.html` counts()/projectRow(), K-A8 | summary()/aggregate(), scoped `.tqp-counts` | Consumer supplies width; order, capsule geometry, exact tokens, compact gaps and every wrapped right edge compared on identical counts |
-| `menu-next-variants.html` task(), Menu M3 | task() | Flowing metadata/title over full width; actual host/runtime/session targets replace synthetic WIN/MAC/Codex. Independent issue and session links; remote session remains read-only |
+| `menu-next-variants.html` task(), Menu M3 | task() | M3 metadata/links row followed by the full wrapped title; actual host/runtime/session targets replace synthetic WIN/MAC/Codex. Independent issue and session links; remote session remains read-only |
 | visual-style.md, design/assets | bundled SVGs and tokens | Local Lucide 1.17.0 (same release as parent); provider/runtime marks are byte-identical Simple Icons assets. Unfilled marks paint with `currentColor` (#1041), so they follow theme ink; explicitly filled marks keep their colors. Ask is labelled Ask per K semantics (parent demo calls it Human) |
 | tray adapter | exact JS/CSS embedded by tray.rs | Existing answer-card instance/draft/refresh behavior retained beside task row; native qualification remains separate |
 
@@ -27,4 +27,4 @@ Release staging publishes `taskq-<release>-project-blocks.js`, `.css`, `.LICENSE
 
 Owner-approved delivery for #938: extraction PR, release wiring and browser comparisons first; published release/checksum and native Windows/macOS conformance follow separately, as for #920. README screenshot freshness is an open native capture gate; no manifest or check is weakened here. Composer/create/recovery remain #949/#948.
 
-Parent defect (M3/B3): the prototype's unbounded project button can overflow on a long unbroken project name. The shared block bounds its identity region and wraps text without shrinking it. Counter comparisons use identical bounded labels; long project identity is additionally checked in both consumer harnesses. Parent task geometry is compared with identical long titles, including full-width continuation.
+Parent defect (M3/B3): the prototype's unbounded project button can overflow on a long unbroken project name. The shared block bounds its identity region and wraps text without shrinking it. Counter comparisons use identical bounded labels; long project identity is additionally checked in both consumer harnesses. M3 in #1104 supersedes the original parent task flow with a metadata/links row and a full wrapped title block. Existing parent comparisons still cover outer task styling and summary geometry; the M3 row chain checks retained full text and independent links.

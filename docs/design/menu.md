@@ -30,7 +30,7 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 - Home: fixed controls, Work mode, Attention, short AI composer with attachments, project shortcuts, Settings and AI workspace access.
 - Attention contains decisions, failed tasks and actionable service/admission problems under [A2](adaptive-menu.md#a2-explain-the-queue). Ordinary waits remain neutral.
 - Project header: Back, name, Board link and compact nonzero counters. Add is a plus in the Projects header.
-- Task row: state symbol, board-provider mark, linked issue number, known execution host and title in one flow. Global rows also identify project. Long titles wrap from the block left edge.
+- Task row: the first row holds state, board-provider mark, linked issue number, known host/runtime, session and other available links; global rows also identify project. The full title starts on the second row and wraps across the block width, never truncated. Metadata may wrap when space is exhausted; links remain separate controls.
 - Main task target opens the issue. Local agent session and known PR links are separate controls; no nested links or double navigation.
 - Codex/Claude marks identify the recorded runtime; codex-app uses Codex identity. Missing permalink: unavailable with reason. Remote: network + host, no fabricated local session link.
 - Task detail preserves question, failure, work, ready, dependency and later access. Board links remain near the project name.

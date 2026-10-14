@@ -19,5 +19,6 @@
 .tqp-project .tqp-counts button{padding:2px 4px}
 .tqp-counts .quiet{background:light-dark(#eff1f3,#2b3138);color:light-dark(#68727d,#9ba5b0)}
 .tqp-partial{display:block;width:100%}
+.tqp-task-head .tqp-meta{white-space:normal}
 .tqp-task{display:block;width:100%;padding:5px 4px;overflow-wrap:anywhere}
 @media(pointer:coarse){.tqp button,.tqp a{min-height:44px}}

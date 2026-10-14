@@ -30,6 +30,12 @@ jobs:
         env:
           TASKQ_SELFTEST_OFFLINE: '1'
           TASKQ_INCIDENT_REPORTS: 'off'
+  windows-gnu: # GNU loads the DLL; the Windows MSVC matrix uses a static loader.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable-x86_64-pc-windows-gnu
+      - run: cargo +stable-x86_64-pc-windows-gnu test --locked --test windows_install
   shots: # README screenshots match the UI sources (docs/shots/check.sh)
     runs-on: ubuntu-latest
     steps:
@@ -38,7 +44,7 @@ jobs:
           fetch-depth: 0
       - run: docs/shots/check.sh
   tests: # required status check name; gates on the rust matrix and the shots check
-    needs: [rust, shots]
+    needs: [rust, windows-gnu, shots]
     runs-on: ubuntu-latest
     steps:
       - run: echo ok

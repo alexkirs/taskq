@@ -23,6 +23,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup default stable
+      - name: Static WebView2 loader for the single-file Windows release
+        if: runner.os == 'Windows'
+        run: rustup default stable-x86_64-pc-windows-msvc
       - name: Version from tag
         shell: bash
         run: |
@@ -38,9 +41,10 @@ jobs:
           TASKQ_INCIDENT_REPORTS: 'off'
         run: |
           bin="target/release/taskq${{ matrix.ext }}"
-          "$bin" selftest
           mkdir dist
           cp "$bin" "dist/taskq-$VER-${{ matrix.target }}${{ matrix.ext }}"
+          # Start the shipped file from its isolated directory, not Cargo's build tree.
+          (cd dist && "./taskq-$VER-${{ matrix.target }}${{ matrix.ext }}" selftest)
           # shared answer card assets (docs/design/answer-card.md): once, from the Linux job
           if [ "${{ matrix.target }}" = linux-x86_64 ]; then
             cp src/answer-card.js "dist/taskq-$VER-answer-card.js"

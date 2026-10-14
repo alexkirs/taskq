@@ -67,7 +67,7 @@ pub fn append(root: &Path, source: &str, task: Option<u64>, text: &str) -> Resul
 /// Log an accepted CLI write; a failed log write is reported, never fails the command (§ 4).
 pub fn record(root: &Path, source: &str, task: u64, text: &str) {
     if let Err(e) = append(root, source, Some(task), text) {
-        eprintln!("request log: {e}");
+        log!("request log: {e}");
     }
 }
 

@@ -241,8 +241,8 @@ pub fn contract(root: &Path) -> String {
 pub fn brief(env: &Env, l: &Launch) -> String {
     let n = l.task;
     let mut q = env.exe.display().to_string();
-    if l.rt == "codex-app" {
-        // the app turn runs in the app's environment, not the handshake child's (§ 8)
+    if l.rt == "codex-app" || l.rt == "claude" {
+        // the app turn and the native Claude background session run in their host's environment, not the child's (§ 8)
         q = format!("env TASKQ_TASK={n} TASKQ_ATTEMPT={} TASKQ_ROLE={} TASKQ_ROOT={} {q}", l.attempt, l.role, env.root.display());
     }
     let spec = contract(env.root);
@@ -345,9 +345,9 @@ pub fn access(env: &Env, rt: &str) -> Result<crate::policy::Effective, StartErro
 /// Start the child with its stdout and stderr in the attempt log; `codex-app` starts its handshake child (§ 8).
 pub fn spawn(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     let access = access(env, &l.rt)?;
-    eprintln!("#{} attempt {} access {}", l.task, l.attempt, access.line());
+    log!("#{} attempt {} access {}", l.task, l.attempt, access.line());
     let text = turn_text(env, l, rule_file)?;
-    eprintln!("specq@{SPECQ_REVISION} loaded for {} #{} attempt {} ({})", l.role, l.task, l.attempt, if l.resume.is_some() { "resume" } else { "start" });
+    log!("specq@{SPECQ_REVISION} loaded for {} #{} attempt {} ({})", l.role, l.task, l.attempt, if l.resume.is_some() { "resume" } else { "start" });
     let log = log_path(env.root, l);
     if l.rt == "codex-app" {
         let mut turn = AppTurn { hand: None, log, text, thread: l.session.clone(), done: 0, rollout: None, running: app_running };
@@ -510,7 +510,7 @@ impl Proc for ClaudeTurn {
         self.done = true;
         Ok(Some(0))
     }
-    fn kill(&mut self) { if let Err(e) = claude_stop(&self.root, &self.id, self.pid) { eprintln!("{e}"); } }
+    fn kill(&mut self) { if let Err(e) = claude_stop(&self.root, &self.id, self.pid) { log!("{e}"); } }
     fn id(&self) -> u32 { self.pid }
 }
 
@@ -814,6 +814,8 @@ mod tests {
                     if let Some(answer) = &l.resume { assert!(text.ends_with(answer)); }
                     else { assert!(text.ends_with(&brief(&env, &l))); }
                     assert_eq!(l.session, "same-session");
+                    // Native sessions do not inherit the child env; without the prefix `result` is refused as a non-worker.
+                    assert_eq!(brief(&env, &l).contains("env TASKQ_TASK=7 TASKQ_ATTEMPT=42 "), rt != "codex", "{rt} {role}: attempt identity");
                     assert!(text.contains("https://github.com/taskqorg/taskq/blob/") && text.contains(FILES));
                     for bad in [Err("offline".into()), Ok(String::new()), Ok("x".repeat(65537))] {
                         assert!(turn_text(&env, &l, |_| bad.clone()).is_err());

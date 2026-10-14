@@ -134,7 +134,7 @@ pub fn step(root: &Path, install: &Path, exe: &Path, rt: Option<&str>) {
             // the request log (§ 4): once, when the request first gets an answer
             let req = read(&dir(root).join(format!("{id}.json")));
             if let Err(e) = crate::retro::append(root, if req["task"].is_u64() { "comment" } else { "tray" }, req["task"].as_u64(), req["text"].as_str().unwrap_or("")) {
-                eprintln!("request log: {e}");
+                log!("request log: {e}");
             }
             start(root, install, id, rt);
             continue;

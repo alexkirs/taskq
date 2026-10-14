@@ -53,6 +53,8 @@ pub trait Board {
     /// § 7 publication of task `n` at `sha` into `main`; `mode` is `direct` or `pr`.
     fn publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> Publish;
     fn url(&self, n: u64) -> String;
+    /// Request accounting and rate-limit pause of this process (§ 4); none for boards without HTTP.
+    fn requests(&self) -> crate::requests::Budget { Default::default() }
 }
 
 #[derive(Debug, PartialEq)]
@@ -105,6 +107,7 @@ pub fn http_date(s: &str) -> Option<i64> {
 // ---------- HTTP through curl ----------
 
 struct Reply {
+    status: u16,
     headers: Vec<(String, String)>,
     body: String,
     operation: &'static str,
@@ -147,7 +150,7 @@ fn quote(s: &str) -> String {
     q
 }
 
-/// One request. The token and body go through curl's config on stdin, never argv (R12: no secrets in `ps`).
+/// One request, any HTTP status. The token and body go through curl's config on stdin, never argv (R12: no secrets in `ps`).
 fn curl(method: &str, url: &str, auth: &str, body: Option<&Value>) -> Result<Reply> {
     let mut cfg = format!(
         "silent\nshow-error\ndump-header = \"-\"\nrequest = {}\nurl = {}\nheader = {}\nheader = \"Accept: application/json\"\nheader = \"Expect:\"\nmax-time = 60\n",
@@ -179,11 +182,7 @@ fn curl(method: &str, url: &str, auth: &str, body: Option<&Value>) -> Result<Rep
             continue;
         }
         let headers = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
-        let reply = Reply { headers, body: body.to_string(), operation: operation(method) };
-        if !(200..300).contains(&status) {
-            return Err(format!("{method} {url}: HTTP {status} {}", reply.body.chars().take(300).collect::<String>()));
-        }
-        return Ok(reply);
+        return Ok(Reply { status, headers, body: body.to_string(), operation: operation(method) });
     }
 }
 
@@ -277,35 +276,63 @@ pub struct Api {
     me: RefCell<Option<String>>,
     clock: RefCell<i64>,
     label_schema: RefCell<Option<bool>>,
+    /// Request accounting and rate-limit pause of this process (§ 4).
+    budget: RefCell<crate::requests::Budget>,
     #[cfg(test)]
     transport: Option<Transport>,
 }
 
 impl Api {
     fn new(root: String, base: String, token: &str) -> Api {
-        Api { base, root, auth: format!("Authorization: Bearer {token}"), me: RefCell::new(None), clock: RefCell::new(0), label_schema: RefCell::new(None), #[cfg(test)] transport: None }
+        Api { base, root, auth: format!("Authorization: Bearer {token}"), me: RefCell::new(None), clock: RefCell::new(0), label_schema: RefCell::new(None), budget: RefCell::default(), #[cfg(test)] transport: None }
     }
 
     fn call(&self, method: &str, url: &str, body: Option<Value>) -> Result<Reply> {
+        self.send(method, url, body, &self.op(method, url))
+    }
+
+    /// The accounting key of `url`, relative to this board's API (§ 4).
+    fn op(&self, method: &str, url: &str) -> String {
+        crate::requests::op(method, url.strip_prefix(&self.base).or_else(|| url.strip_prefix(&self.root)).unwrap_or(url))
+    }
+
+    /// One request counted under `op`. While the board budget is exhausted nothing is sent (§ 4).
+    fn send(&self, method: &str, url: &str, body: Option<Value>, op: &str) -> Result<Reply> {
         // absolute URLs come from pagination headers: the token goes only to the configured API
         let url = if url.starts_with("https://") { url.to_string() } else { format!("{}{url}", self.base) };
         if !url.starts_with(&format!("{}/", self.root)) {
             return Err(format!("refused: {url} is outside the board API"));
         }
+        if let Some(reset) = self.budget.borrow_mut().paused(std::time::Instant::now()) {
+            return Err(format!("{method} {url}: {}", crate::requests::paused_text(reset)));
+        }
+        self.budget.borrow_mut().count(op.into());
         #[cfg(test)]
-        if let Some(transport) = &self.transport { return transport(method, &url, body); }
+        let r = match &self.transport { Some(transport) => transport(method, &url, body)?, None => curl(method, &url, &self.auth, body.as_ref())? };
+        #[cfg(not(test))]
         let r = curl(method, &url, &self.auth, body.as_ref())?;
         if let Some(t) = r.header("date").and_then(http_date) {
             *self.clock.borrow_mut() = t;
+        }
+        let paused = self.budget.borrow_mut().observe(r.status, |n| r.header(n).map(String::from), *self.clock.borrow(), std::time::Instant::now());
+        if let Some(reset) = paused {
+            return Err(format!("{method} {url}: HTTP {} {}", r.status, crate::requests::paused_text(reset)));
+        }
+        if !(200..300).contains(&r.status) {
+            // one log line: a multi-line error body folds into it (§ 4)
+            let body = r.body.split_whitespace().collect::<Vec<_>>().join(" ");
+            return Err(format!("{method} {url}: HTTP {} {}", r.status, body.chars().take(300).collect::<String>()));
         }
         Ok(r)
     }
 
     fn all(&self, url: &str) -> Result<Vec<Value>> {
         let mut out = vec![];
+        let op = self.op("GET", url);
         let mut next = Some(url.to_string());
         while let Some(u) = next {
-            let r = self.call("GET", &u, None)?;
+            // later pages count under their first page's operation
+            let r = self.send("GET", &u, None, &op)?;
             out.extend(r.json()?.as_array().cloned().unwrap_or_default());
             next = r.next();
         }
@@ -598,7 +625,7 @@ mod tests {
                 let yes = if *reads.borrow() == 1 { first_merged } else { second_merged.ok_or("HTTP 503")? };
                 json!({"merged": yes, "state": if yes { "merged" } else { "opened" }, "merge_commit_sha": merged})
             } else { panic!("unexpected {method} {url}") };
-            Ok(Reply { headers: vec![], body: value.to_string(), operation: operation(method) })
+            Ok(Reply { status: 200, headers: vec![], body: value.to_string(), operation: operation(method) })
         }));
         (h, calls)
     }
@@ -637,7 +664,7 @@ mod tests {
                         json!([{"number": 6, "iid": 6, "head": {"sha": "d".repeat(40)}, "sha": "d".repeat(40), "merged_at": "x"},
                                {"number": 7, "iid": 7, "head": {"sha": "a".repeat(40)}, "sha": "a".repeat(40), "merged_at": "x", "merge_commit_sha": "b".repeat(40)}])
                     } else { panic!("unexpected {method} {url}") };
-                Ok(Reply { headers: vec![], body: value.to_string(), operation: operation(method) })
+                Ok(Reply { status: 200, headers: vec![], body: value.to_string(), operation: operation(method) })
             }));
             let Publish::Done(m) = h.publish(1, &"a".repeat(40), "pr", "title", "Task: fake") else { panic!("not reconciled") };
             assert!(m.starts_with(if kind.name == "github" { "merged #7 as bbbb" } else { "merged !7" }), "{m}");
@@ -667,7 +694,7 @@ mod tests {
             crate::incident::take_detected();
             let mut h = (github::KIND.api)("github.com", "o/r", "fake");
             h.transport = Some(Box::new(move |_, _, _| if fail { Err("HTTP 503 malformed response".into()) }
-                else { Ok(Reply { headers: vec![], body: "private invalid JSON".into(), operation: "read" }) }));
+                else { Ok(Reply { status: 200, headers: vec![], body: "private invalid JSON".into(), operation: "read" }) }));
             assert!(h.call("GET", "/issues", None).and_then(|r| r.json()).is_err());
             assert_eq!(crate::incident::take_detected(), if fail { vec![] } else { vec!["adapter.bad_json"] });
         }
@@ -679,7 +706,7 @@ mod tests {
         let (data, count) = (catalog.clone(), writes.clone());
         let h = http(kind, None, Box::new(move |method, url, body| {
             assert!(url.contains("/labels"));
-            if method == "GET" { return Ok(Reply { headers: vec![], operation: "read", body: json!(*data.borrow()).to_string() }); }
+            if method == "GET" { return Ok(Reply { status: 200, headers: vec![], operation: "read", body: json!(*data.borrow()).to_string() }); }
             assert!(matches!(method, "POST" | "PATCH" | "PUT"));
             if method == "POST" { assert!(url.ends_with("/labels")); }
             else if kind.name == "gitlab" { assert_eq!(method, "PUT"); assert!(url.rsplit('/').next().unwrap().parse::<u64>().is_ok()); }
@@ -693,7 +720,7 @@ mod tests {
             if let Some(old) = all.iter_mut().find(|old| old["name"] == v["name"]) {
                 v["id"] = old["id"].clone(); *old = v;
             } else { v["id"] = json!(all.len() + 100); all.push(v); }
-            Ok(Reply { headers: vec![], operation: "read", body: "{}".into() })
+            Ok(Reply { status: 200, headers: vec![], operation: "read", body: "{}".into() })
         }));
         (h, catalog, writes)
     }
@@ -740,6 +767,34 @@ mod tests {
         }
     }
 
+    // Chain: § 4 board budget on both boards. Risk: an exhausted budget keeps sending the heartbeat every pass, or a
+    // multi-line error body splits a log line.
+    #[test]
+    fn exhausted_budget_sends_nothing_until_reset() {
+        for kind in BOARDS {
+            let sent = std::rc::Rc::new(RefCell::new(0));
+            let count = sent.clone();
+            let reset = iso("2026-10-14T04:41:00Z").unwrap().to_string();
+            let h = http(kind, Some(true), Box::new(move |_, url, _| {
+                *count.borrow_mut() += 1;
+                let date = ("Date".to_string(), "Wed, 14 Oct 2026 04:27:00 GMT".to_string());
+                if url.ends_with("/issues/6") {
+                    return Ok(Reply { status: 500, headers: vec![date], body: "<html>\n  <p>down</p>\n</html>".into(), operation: "update" });
+                }
+                let headers = vec![date, ("X-RateLimit-Remaining".into(), "0".into()), ("X-RateLimit-Reset".into(), reset.clone())];
+                Ok(Reply { status: 403, headers, body: "{\"message\": \"API rate limit exceeded\"}".into(), operation: "update" })
+            }));
+            assert!(h.edit(6, "beat").unwrap_err().ends_with("HTTP 500 <html> <p>down</p> </html>"));
+            let first = h.edit(5, "beat").unwrap_err();
+            assert!(first.contains("HTTP 403 rate limit: board requests paused until 2026-10-14T04:41:00Z"), "{first}");
+            let again = h.edit(5, "beat").unwrap_err();
+            assert!(again.ends_with("rate limit: board requests paused until 2026-10-14T04:41:00Z"), "{again}");
+            assert_eq!(*sent.borrow(), 2, "nothing is sent while paused");
+            let b = h.requests();
+            assert_eq!((b.total(), b.remaining, b.paused_until()), (2, Some(0), iso("2026-10-14T04:41:00Z")));
+        }
+    }
+
     // Chain: § 2 state labels on both boards. Risk: a state change removes user labels.
     #[test]
     fn issue_label_adapters_preserve_unrelated_assignments() {
@@ -747,7 +802,7 @@ mod tests {
             let labels = std::rc::Rc::new(RefCell::new(vec!["bug".to_string(), "q-ready".to_string()]));
             let data = labels.clone();
             let h = http(kind, Some(false), Box::new(move |method, url, body| {
-                let reply = |body: Value| Ok(Reply { headers: vec![], operation: "read", body: body.to_string() });
+                let reply = |body: Value| Ok(Reply { status: 200, headers: vec![], operation: "read", body: body.to_string() });
                 if url.contains("/members/") { return reply(json!({"access_level": 20})); }
                 if method == "GET" {
                     assert!(url.ends_with("/issues/7"));

@@ -404,7 +404,8 @@ fn shots_gate(git_bin: &str, root: &Path, sha: &str) -> Res<()> {
     let m: Value = serde_json::from_str(&git(&["show", &format!("{sha}:docs/shots/manifest.json")])?).map_err(|e| unknown(format!("docs/shots/manifest.json: {e}")))?;
     let ui = m["uiSources"].as_object().ok_or_else(|| unknown("docs/shots/manifest.json lacks uiSources".into()))?;
     let mut stale = vec![];
-    for f in git(&["diff", "--name-only", &format!("origin/main...{sha}")])?.lines() {
+    // `--no-renames` lists a moved source under its old path too, so a pure rename still reads stale.
+    for f in git(&["diff", "--no-renames", "--name-only", &format!("origin/main...{sha}")])?.lines() {
         if let Some(b) = ui.get(f) && blob(f)? != b.as_str().unwrap_or_default() { stale.push(f.to_string()) }
     }
     if stale.is_empty() { Ok(()) } else { Err(format!("stale README shots: {} changed without a manifest update; run docs/shots/update.sh and commit docs/shots/", stale.join(", "))) }
@@ -2792,6 +2793,13 @@ mod tests {
         assert!(e.contains("src/tray.rs") && e.contains("docs/shots/update.sh"), "{e}");
         let fresh = commit("v3", true);
         assert!(shots_gate("git", &root, &fresh).is_ok(), "a fresh manifest passes");
+        git(&["update-ref", "refs/remotes/origin/main", &fresh]);
+        git(&["mv", "src/tray.rs", "src/tray_menu.rs"]);
+        git(&["commit", "-qm", "pure rename"]);
+        let renamed = git(&["rev-parse", "HEAD"]);
+        let e = shots_gate("git", &root, &renamed).unwrap_err();
+        assert!(e.contains("src/tray.rs") && e.contains("docs/shots/update.sh"), "a pure rename leaves the manifest stale: {e}");
+        git(&["reset", "-q", "--hard", &fresh]);
         fs::remove_file(root.join("docs/shots/manifest.json")).unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-qm", "no shots"]);

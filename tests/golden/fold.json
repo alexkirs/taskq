@@ -383,5 +383,39 @@
    {"id": 13, "body": "taskq: spawn reviewer claude:r1 mac"},
    {"id": 14, "body": "taskq: ask attempt 13\nDone: A1 checked\nProblem: owner gate\n1. approve 0123456 and close ★\n2. requeue"},
    {"id": 16, "body": "taskq: answer 1 attempt 13"}
-  ], "expect": {"state": "review", "attempt": 13, "role": "reviewer", "session": "claude:r1 mac", "result": "0123456789abcdef0123456789abcdef01234567", "inbox": [16], "gate": "required"}}
+  ], "expect": {"state": "review", "attempt": 13, "role": "reviewer", "session": "claude:r1 mac", "result": "0123456789abcdef0123456789abcdef01234567", "inbox": [16], "gate": "required"}},
+  {"name": "delivery approve: review-pr approval binds to the result SHA without a recipe gate", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 13, "body": "taskq: spawn reviewer claude:r1 mac"},
+   {"id": 14, "body": "taskq: approve 89abcdef0123456789abcdef0123456789abcdef"},
+   {"id": 15, "body": "taskq: approve 0123456789abcdef0123456789abcdef01234567 attempt 13"},
+   {"id": 16, "body": "taskq: approve 0123456789abcdef0123456789abcdef01234567"}
+  ], "expect": {"state": "review", "attempt": 13, "role": "reviewer", "session": "claude:r1 mac", "result": "0123456789abcdef0123456789abcdef01234567", "gate": "approved"}},
+  {"name": "delivery approve: the owner's board pick of the approve option approves without a recipe gate", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 13, "body": "taskq: spawn reviewer claude:r1 mac"},
+   {"id": 14, "body": "taskq: ask attempt 13\nDone: A1 ok; CI success on 0123456\nProblem: review-pr\n1. approve 0123456 and close ★\n2. requeue"},
+   {"id": 16, "body": "1"},
+   {"id": 17, "body": "taskq: close attempt 13\nA1 ok\ndelivery review-pr r1: merged #7 as 89abcdef0123456789abcdef0123456789abcdef"}
+  ], "expect": {"state": "closed", "result": "0123456789abcdef0123456789abcdef01234567", "gate": "approved"}},
+  {"name": "delivery stale SHA: a new result after approval blocks close until the new SHA is approved", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 13, "body": "taskq: approve 0123456789abcdef0123456789abcdef01234567"},
+   {"id": 14, "body": "taskq: spawn reviewer claude:r1 mac"},
+   {"id": 15, "body": "taskq: requeue attempt 14\nfix A2"},
+   {"id": 16, "body": "taskq: spawn worker claude:s2 mac"},
+   {"id": 17, "body": "taskq: result 89abcdef0123456789abcdef0123456789abcdef attempt 16"},
+   {"id": 18, "body": "taskq: spawn reviewer claude:r2 mac"},
+   {"id": 19, "body": "taskq: close attempt 18\nA1 ok"}
+  ], "expect": {"state": "review", "attempt": 18, "role": "reviewer", "session": "claude:r2 mac", "retries": 1, "result": "89abcdef0123456789abcdef0123456789abcdef", "gate": "stale"}},
+  {"name": "delivery partial publish: the reconciled close is one receipt; its retried op id changes nothing", "entries": [
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 13, "body": "taskq: spawn reviewer claude:r1 mac"},
+   {"id": 14, "body": "taskq: close attempt 13\nA1 ok\ndelivery auto-merge r0: merged #7 as 89abcdef0123456789abcdef0123456789abcdef\nop-id: pm.9"},
+   {"id": 15, "body": "taskq: close attempt 13\nA1 ok\ndelivery auto-merge r0: merged #7 as 89abcdef0123456789abcdef0123456789abcdef\nop-id: pm.9"}
+  ], "expect": {"state": "closed", "result": "0123456789abcdef0123456789abcdef01234567"}}
 ]

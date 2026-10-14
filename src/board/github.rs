@@ -106,6 +106,13 @@ impl GitHub {
         let owner = self.api.base.rsplit_once("/repos/").map(|x| x.1).and_then(|r| r.split('/').next()).unwrap_or_default().to_string();
         let prs = self.api.call("GET", &format!("/pulls?head={owner}:{branch}&base=main&state=open"), None)?.json()?;
         let prs = prs.as_array().cloned().unwrap_or_default();
+        if prs.is_empty() {
+            // § 7 partial publication: a merged PR at the result SHA is the publication; no second merge
+            let closed = self.api.call("GET", &format!("/pulls?head={owner}:{branch}&base=main&state=closed"), None)?.json()?;
+            if let Some(pr) = closed.as_array().into_iter().flatten().find(|p| p["head"]["sha"] == sha && !p["merged_at"].is_null()) {
+                return Ok(Publish::Done(format!("merged #{} as {}", pr["number"], s(pr, "merge_commit_sha"))));
+            }
+        }
         if prs.len() != 1 {
             return Ok(Publish::Failed(format!("{} open PRs of {branch}, want exactly one", prs.len())));
         }

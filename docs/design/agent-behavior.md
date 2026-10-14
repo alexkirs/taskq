@@ -2,7 +2,7 @@
 
 Product selection: D04 option 1 is accepted in the [decision register](decision-register.md). Remaining candidate language below refers to implementation/calibration, not a request to reapprove that direction. No running policy changes.
 
-Proposal, not runtime policy. §7 remains authoritative. Shared UI rules: [specq operator UI](https://github.com/taskqorg/specq/blob/main/design/operator-ui.md). Access grants remain in [agent settings](agent-settings.md).
+Proposal, not runtime policy, except the [§ 7 delivery presets](../../taskq.md#7-worker-reviewer-publication) (`auto-merge`, `direct`, `review-pr`, policy revision, exact-SHA approval, publication receipt), which §7 governs. Shared UI rules: [specq operator UI](https://github.com/taskqorg/specq/blob/main/design/operator-ui.md). Access grants remain in [agent settings](agent-settings.md).
 
 ## B1 Scope and owner
 

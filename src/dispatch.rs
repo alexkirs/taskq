@@ -164,10 +164,10 @@ pub fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op) ->
     }
     match t.state {
         State::Later | State::Failed => act(b, &cfg.root, n, "close", &[], verdict, op),
-        State::Review if t.gate.is_some_and(|g| g != Gate::Approved) => {
-            // § 7: no publication before the owner's approval of this result
+        State::Review if needs_approval(cfg, &t) && t.gate != Some(Gate::Approved) => {
+            // § 7: no publication before the owner's approval of this result; the current policy decides (B4 fencing)
             let sha = t.result.unwrap_or_default();
-            let r = Receipt::rejected(n, op, format!("gate is {}: the owner has not approved {}", t.gate.map_or("", Gate::name), &sha[..sha.len().min(7)]));
+            let r = Receipt::rejected(n, op, format!("gate is {}: the owner has not approved {}", t.gate.map_or("required", Gate::name), &sha[..sha.len().min(7)]));
             Receipt { state: Some(t.state.name()), next: format!("Owner: `taskq approve {n}`, or pick the approve option."), ..r }
         }
         State::Review => {
@@ -178,6 +178,8 @@ pub fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op) ->
             }
             match b.publish(n, &sha, &cfg.publish, &issue.title, &format!("Task: {}", b.url(n))) {
                 Publish::Done(m) => {
+                    // § 7 publication receipt: the policy it ran under and what the board read back
+                    let m = format!("delivery {} r{}: {m}", cfg.delivery, cfg.delivery_revision);
                     let mut r = act(b, &cfg.root, n, "close", &[], &join(&[verdict, &m]), op);
                     r.extra = m;
                     r
@@ -191,6 +193,11 @@ pub fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op) ->
         }
         s => Receipt { state: Some(s.name()), ..Receipt::rejected(n, op, format!("#{n} is {}: `close` not accepted", s.name())) },
     }
+}
+
+/// § 7: a gated task or a `review-pr` project publishes only the owner's approved result.
+fn needs_approval(cfg: &Config, t: &Task) -> bool {
+    t.gate.is_some() || cfg.delivery == "review-pr"
 }
 
 /// Whether this process is an agent (`TASKQ_ATTEMPT` set): it cannot approve a gate (§ 7).
@@ -232,7 +239,7 @@ pub fn answer_picks(b: &dyn Board, cfg: &Config, picks: &[String], op: &Op) -> R
         }
         let card = t.card.clone().filter(|_| matches!(t.state, State::Ask | State::Review)).ok_or(format!("#{n} is {} without a question", t.state.name()))?;
         let opt = options(&card).into_iter().find(|o| o.0 == k).ok_or(format!("#{n} has no option {k}"))?.1;
-        plan.push((n, k, Some((opt, t.state, t.gate.is_some()))));
+        plan.push((n, k, Some((opt, t.state, needs_approval(cfg, &t)))));
     }
     let mut out = vec![];
     for (n, k, card) in plan {

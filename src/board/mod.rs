@@ -619,6 +619,32 @@ mod tests {
         }
     }
 
+    // Chain: § 7 partial publication on both boards. Risk: a close retried after a merge requeues or merges twice.
+    #[test]
+    fn a_merged_pr_at_the_result_sha_reconciles_to_one_publication() {
+        for kind in BOARDS {
+            let calls = std::rc::Rc::new(RefCell::new(vec![]));
+            let captured = calls.clone();
+            let h = http(kind, None, Box::new(move |method, url, _| {
+                captured.borrow_mut().push(method.to_string());
+                let value = if url.contains("/compare/") { json!({"status": "diverged"}) }
+                    else if url.contains("/merge_base?") { json!({"id": "c".repeat(40)}) }
+                    else if url.contains("/check-runs") { json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}) }
+                    else if url.ends_with("/status") { json!({"total_count": 0}) }
+                    else if url.contains("/repository/commits/") { json!({"last_pipeline": {"status": "success"}}) }
+                    else if url.contains("state=open") { json!([]) }
+                    else if url.contains("state=closed") || url.contains("state=merged") {
+                        json!([{"number": 6, "iid": 6, "head": {"sha": "d".repeat(40)}, "sha": "d".repeat(40), "merged_at": "x"},
+                               {"number": 7, "iid": 7, "head": {"sha": "a".repeat(40)}, "sha": "a".repeat(40), "merged_at": "x", "merge_commit_sha": "b".repeat(40)}])
+                    } else { panic!("unexpected {method} {url}") };
+                Ok(Reply { headers: vec![], body: value.to_string(), operation: operation(method) })
+            }));
+            let Publish::Done(m) = h.publish(1, &"a".repeat(40), "pr", "title", "Task: fake") else { panic!("not reconciled") };
+            assert!(m.starts_with(if kind.name == "github" { "merged #7 as bbbb" } else { "merged !7" }), "{m}");
+            assert!(calls.borrow().iter().all(|m| m == "GET"), "no second merge");
+        }
+    }
+
     // Chain: § 7 publication readback. Risk: one flaky read reports a lost publication.
     #[test]
     fn incident_publication_readback_requires_two_negative_reads() {

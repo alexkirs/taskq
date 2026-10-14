@@ -160,6 +160,7 @@ pub struct Env<'a> {
     pub install: &'a Path,
     pub permission_mode: &'a str,
     pub codex: &'a [String],
+    /// The § 7 delivery preset: `auto-merge`, `review-pr` or `direct`.
     pub publish: &'a str,
     /// Secret values: command environment only, never brief, argv or log.
     pub board_env: &'a [(String, String)],
@@ -244,8 +245,9 @@ pub fn brief(env: &Env, l: &Launch) -> String {
              Then exactly one of:\n\
              - `{q} close {n} --text \"Changed: <user effect>\nChecks: Task fit: A1 ok|gap|unknown, A2 ..; CI <outcome> on <SHA>\nChecks: Implementation quality: <binding gaps|advisories|none>\nOpen: <item|none>\"` (it publishes),\n\
              - `{q} requeue {n} --text \"<exact fixes>\"`,\n\
-             - {ask}.\n{formats}",
+             - {ask}.\n{approval}{formats}",
             ask = ask(&q, n),
+            approval = if env.publish == "review-pr" { "Delivery review-pr: an otherwise done result needs the owner's approval: ask with Done naming task fit and CI on the SHA, first option `approve <sha7> and close ★`.\n" } else { "" },
             formats = FORMATS
         )
     } else {

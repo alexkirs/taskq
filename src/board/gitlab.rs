@@ -92,6 +92,13 @@ impl GitLab {
         // no fast-forward ref API: `direct` merges a fast-forward MR (§ 7)
         let mrs = self.api.call("GET", &format!("/merge_requests?source_branch={branch}&target_branch=main&state=opened"), None)?.json()?;
         let mrs = mrs.as_array().cloned().unwrap_or_default();
+        if mrs.is_empty() {
+            // § 7 partial publication: a merged MR at the result SHA is the publication; no second merge
+            let merged = self.api.call("GET", &format!("/merge_requests?source_branch={branch}&target_branch=main&state=merged"), None)?.json()?;
+            if let Some(mr) = merged.as_array().into_iter().flatten().find(|m| m["sha"] == sha) {
+                return Ok(Publish::Done(format!("merged !{}", mr["iid"])));
+            }
+        }
         let mr = match (mrs.len(), mode) {
             (1, _) => mrs[0].clone(),
             (0, "direct") => self.api.call("POST", "/merge_requests", Some(json!({ "source_branch": branch, "target_branch": "main", "title": title })))?.json()?,

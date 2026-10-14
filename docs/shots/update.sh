@@ -12,7 +12,8 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 TASKQ_VERSION=$version docs/shots/fixture.sh "$tmp"
-TASKQ_INSTALL=$tmp/install "$bin" tray --snapshot "$tmp/shots"
+# only the routes the README shows (taskq.md R12)
+TASKQ_INSTALL=$tmp/install "$bin" tray --snapshot "$tmp/shots" --route attention,projects,icon
 rm -f docs/shots/*.png
 cp "$tmp/shots/popover-dark-attention-16.png" "$tmp/shots/popover-dark-projects-16.png" docs/shots/
 # Menu-bar size and scale differ between the owner's Mac and CI; keep the README link stable.

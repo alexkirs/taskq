@@ -37,13 +37,13 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable-x86_64-pc-windows-gnu
       - run: cargo +stable-x86_64-pc-windows-gnu test --locked --test windows_install
-  shots: # README screenshots match the UI sources (docs/shots/check.sh)
+  shots: # README screenshots stale against the UI sources: a warning; the README shots workflow refreshes them (taskq.md R12)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - run: docs/shots/check.sh
+      - run: docs/shots/check.sh || echo '::warning::README shots are stale; run the README shots workflow (dispatch) or wait for the next release tag'
   tests: # required status check name; gates on the rust matrix and the shots check
     needs: [rust, windows-gnu, shots]
     runs-on: ubuntu-latest

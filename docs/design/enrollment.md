@@ -29,3 +29,18 @@ Each service pass hands its latest snapshot to one delivery thread; a projection
 ## Qualification
 
 Prove an independently installed product can enroll, show a real matching snapshot in DashQ, recover after network/store restart, disconnect offline, revoke and reconnect without identity or scope leakage. Test denied/wrong-workspace requests, lost replies, bounded storage, schema compatibility and primary-function independence. Reuse coreq conformance; do not reimplement its auth or transport. Ship only after applicable E1–E10 and the product's normal checks pass.
+
+| DashQ case | TaskQ evidence | Open |
+|---|---|---|
+| E1 connect | live desktop enroll to dash.ufobe.com: approved code, first snapshot `projected` (#913) | fresh headless pairing; dashboard page readback |
+| E2 cancel/expire | live expired code ends with the rerun step; deny and wrong code are coreq conformance | — |
+| E3 crash mid-pairing | coreq keeps `pending`; a rerun resumes it (coreq conformance) | — |
+| E4 outage | chain `sender_sends_only_the_approved_board_and_never_blocks`: delivery on its own thread, outage only waits | — |
+| E5 forged/wrong scope | same chain: another project's board is never sent; capabilities none | live server-side denial of another board |
+| E6 schema | `taskq-board/1` projection fixture test | — |
+| E7 disconnect | live: revoke confirmed, `connection status` none, second disconnect says none; offline disconnect queues the revoke for the service | — |
+| E8 TaskQ alone | no AgentQ or Langfuse dependency (Cargo.toml) | — |
+| E9 upgrade | chain `identity_survives_pruning_and_concurrent_creation` keeps `connection/` through sweep and pruning; installed 4.2.0-dev sweep deletes it until this release | — |
+| E10 UI | DashQ page; not TaskQ | — |
+
+A worker cannot write `<install>` under the § 8 Access profile, so live enrollment runs from the owner's shell or a Full grant.

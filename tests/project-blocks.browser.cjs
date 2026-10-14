@@ -81,7 +81,26 @@ function taskLook(sel){const el=document.querySelector(sel),s=getComputedStyle(e
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
       }finally{await page.close();}
     }
+    // #1041: monochrome provider marks follow the theme ink in both consumers; explicitly filled marks keep their colors.
+    for(const theme of fx.themes)for(const mode of ['browser','tray']){
+      const page=await browser.newPage({viewport:{width:320,height:1800},colorScheme:theme});
+      try{
+        await page.setContent(mode==='tray'?tray:base+'<style>'+css+'</style><script>'+js+'</script>');
+        if(mode==='tray')await page.evaluate(theme=>taskq.receive({page:'none',font:20,theme,projects:[],ai:{draft:''}}),theme);
+        const marks=await page.evaluate(()=>{
+          const q=TaskqProjectBlocks,p=k=>({id:k,name:k,board:{kind:k,url:'https://'+k+'.example/o/r/issues'},complete:true,closed:0,tasks:[]});
+          const el=document.createElement('div');el.id='providers';el.style.cssText='font-size:20px;padding:8px;background:'+getComputedStyle(document.body).backgroundColor;document.body.prepend(el);
+          el.innerHTML=q.summary(p('github'))+q.summary(p('gitlab'))+['claude','codex'].map((runtime,i)=>q.task(p('github'),{n:i+1,state:'doing',revision:1,title:runtime,url:'https://github.example/o/r/issues/'+(i+1),runtime})).join('');
+          const color=svg=>getComputedStyle(svg).color;
+          return ['github','gitlab','claude','openai'].map(name=>{const svg=el.querySelector('[data-icon='+name+']');return {name,fill:getComputedStyle(svg).fill,ink:color(svg)};});
+        });
+        for(const m of marks)assert.equal(m.fill,m.ink,theme+' '+mode+' '+m.name+' mark uses theme ink');
+        assert.equal(await page.evaluate(()=>{const el=document.querySelector('#providers');el.insertAdjacentHTML('beforeend','<span class="tqp"><svg fill="#d97757"><path/></svg></span>');return getComputedStyle(el.lastChild.firstChild).fill;}),'rgb(217, 119, 87)');
+        await page.evaluate(()=>document.querySelector('#providers').lastChild.remove());
+        if(process.argv.includes('--evidence'))await page.locator('#providers').screenshot({path:path.join(dir,'providers-'+mode+'-'+theme+'.png')});
+      }finally{await page.close();}
+    }
     if(process.argv.includes('--evidence'))fs.writeFileSync(path.join(dir,'comparison.json'),JSON.stringify({claim:'Browser parent/standalone/tray comparison only; native and released-asset qualification deferred',manifestSha256:crypto.createHash('sha256').update(fs.readFileSync('docs/design/project-blocks.sources.json','utf8').replace(/\r\n/g,'\n')).digest('hex'),cases:evidence},null,2)+'\n');
-    console.log('PASS 64 parent/browser/tray comparisons, exact counter look/order, all wrapped right edges, 16/20 px, 320/360 px, light/dark, 0/1/12/100, navigation, long content, partial and providers');
+    console.log('PASS 64 parent/browser/tray comparisons, exact counter look/order, all wrapped right edges, 16/20 px, 320/360 px, light/dark, 0/1/12/100, navigation, long content, partial and providers; provider marks readable in both themes');
   }finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exit(1);});

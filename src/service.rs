@@ -655,6 +655,9 @@ impl<'a> Service<'a> {
         self.owner_comments = views.iter().flat_map(|v| {
             core::owner_comments(v.issue.number, &v.log).into_iter().filter_map(|id| Some((v.issue.number, id, v.log.iter().find(|e| e.id == id)?.body.trim().to_string(), v.task.card.clone().unwrap_or_default())))
         }).collect();
+        // § 2 rounds gate from this pass's heartbeats, before any write: every other fresh heartbeat lists `rounds` too
+        // (this one does from step 3 on), so a legacy host back since the last pass gets plain entries
+        self.rounds = hosts.iter().filter(|h| h.title != title && now - h.updated <= ttl).all(|h| h.body.lines().any(|l| l.trim() == ROUNDS));
         self.events(&views, now)?;
         let by_n: HashMap<u64, &View> = views.iter().map(|v| (v.issue.number, v)).collect();
         let mut touched = HashSet::new();
@@ -725,9 +728,6 @@ impl<'a> Service<'a> {
                 self.host_issue = Some(self.board.create(&title, &body, &[HOST_LABEL.to_string()])?);
             }
         }
-
-        // § 2 rounds gate: every other fresh heartbeat lists `rounds` too (this one does from step 3 on)
-        self.rounds = hosts.iter().filter(|h| h.title != title && now - h.updated <= ttl).all(|h| h.body.lines().any(|l| l.trim() == ROUNDS));
 
         // 4. gone for attempts of dead hosts (§ 3)
         let mut leases: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
@@ -1159,6 +1159,29 @@ mod tests {
         let heads: Vec<String> = b.comments(n).unwrap().iter().map(|c| core::head(&c.body).split_whitespace().take(2).collect::<Vec<_>>().join(" ")).collect();
         assert_eq!(heads.iter().filter(|h| *h == "taskq: spawn").count(), 2, "rounds spawn no new session: {heads:?}");
         assert_eq!((heads.len(), launches.borrow().len()), (3 + 2 * 2, 6), "a round costs two entries: {heads:?}");
+    }
+
+    // Chain: § 2 rounds gate over § 4 step 1 (#1136). Risk: step 1 posts with the previous pass's gate, so a legacy host
+    // fresh again since then gets a folded `gone` it cannot read.
+    #[test]
+    fn rounds_gate_is_recomputed_before_step_one_writes() {
+        let b = Fake::default();
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
+        let other = b.create("taskq host win", "version 4.0.0\nrounds", &[HOST_LABEL.into()]).unwrap();
+        let c = cfg("mac");
+        let flag: Rc<RefCell<Option<i32>>> = Default::default();
+        let f = flag.clone();
+        let mut s = Service::new(&b, &c, "4.0.0", Box::new(move |_: &Launch| Ok(Box::new(FakeProc(f.clone())) as Box<dyn Proc>)));
+        s.focus = vec!["all".into()];
+        s.pass().unwrap();
+        assert!(s.rounds && b.comments(n).unwrap()[0].body.starts_with("<details><summary>taskq: spawn worker"));
+        // the win host returns on a legacy build; the worker exits without a result in the same pass
+        b.edit(other, "version 3.9.0").unwrap();
+        *flag.borrow_mut() = Some(1);
+        s.focus.clear();
+        s.pass().unwrap();
+        let last = b.comments(n).unwrap().last().unwrap().body.clone();
+        assert!(!s.rounds && last.starts_with("taskq: gone attempt"), "{last}");
     }
 
     // Chain: § 3 cross-host grace. Risk: ignored entries extend another host's lease.

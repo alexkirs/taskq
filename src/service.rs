@@ -751,7 +751,7 @@ impl<'a> Service<'a> {
             }
             if let Some(i) = self.held.iter().position(|l| l.attempt == a) {
                 let rt = self.held[i].rt.clone();
-                if self.reserve(n, a, &rt) {
+                if !self.gui_refused(&v.issue, &rt) && self.reserve(n, a, &rt) {
                     let l = self.held.remove(i);
                     self.launch(l)?;
                 } else {
@@ -781,7 +781,7 @@ impl<'a> Service<'a> {
                 touched.insert(n);
                 continue;
             }
-            if self.refused_access.contains_key(&l.rt) || !self.reserve(n, a, &l.rt) {
+            if self.refused_access.contains_key(&l.rt) || self.gui_refused(&v.issue, &l.rt) || !self.reserve(n, a, &l.rt) {
                 pending.insert((n, a)); // the inbox stays undelivered
                 continue;
             }
@@ -971,6 +971,12 @@ impl<'a> Service<'a> {
     pub fn gui(&self) -> Result<(), String> {
         self.gui_probe.clone()?;
         if self.full.is_empty() { Err("no runtime with Full access".into()) } else { Ok(()) }
+    }
+
+    /// A `needs-gui` attempt may not run on `rt` now (§ 4 Filter): the probe fails or `rt` lost Full access.
+    /// Its resume or held launch waits with the inbox and lease kept.
+    fn gui_refused(&self, i: &Issue, rt: &str) -> bool {
+        needs_gui(i) && (self.gui_probe.is_err() || !self.full.contains(rt))
     }
 
     /// Write the heartbeat now: the lease of a new child or held launch is listed before the next pass judges it.
@@ -1730,9 +1736,10 @@ mod tests {
         let b = Fake::default();
         let t = b.create("G", "", &["taskq".into(), "needs-gui".into()]).unwrap();
         let mut c = cfg("mac");
-        c.limits.insert("codex".into(), 1);
+        c.limits.insert("claude".into(), 1);
         c.has = vec!["gui".into()]; // config never lists gui: only the probe does
-        let mut s = service(&b, &c, Default::default());
+        let e: Exits = Default::default();
+        let mut s = service(&b, &c, e.clone());
         let hb = |b: &Fake| b.issues(None).unwrap().into_iter().find(|i| i.title == "taskq host mac").unwrap().body;
         s.pass().unwrap();
         assert_eq!((task(&b, t).state, s.waits.clone()), (State::Ready, vec![t]), "no probe: no gui host");
@@ -1740,11 +1747,26 @@ mod tests {
         s.pass().unwrap();
         assert_eq!((task(&b, t).state, s.waits.clone()), (State::Ready, vec![t]), "every runtime sandboxed: no gui host");
         assert!(!hb(&b).lines().any(|l| l == "has gui"));
-        s.full = BTreeSet::from(["codex".to_string()]);
+        s.full = BTreeSet::from(["claude".to_string()]);
         s.pass().unwrap();
         assert_eq!(task(&b, t).state, State::Doing);
-        assert!(task(&b, t).session.unwrap().starts_with("codex:"), "only the Full access runtime");
+        assert!(task(&b, t).session.unwrap().starts_with("claude:"), "only the Full access runtime");
         assert!(hb(&b).lines().any(|l| l == "has gui") && s.waits.is_empty());
+        // Full -> Workspace, then probe loss: the resume waits, inbox and lease kept; it runs once both hold again
+        let a = task(&b, t).attempt.unwrap();
+        b.comment(t, &core::entry("ask", &[], Some(a), "Which?\n1. x\n2. y ★")).unwrap();
+        *e.borrow()[0].1.borrow_mut() = Some(0);
+        s.pass().unwrap();
+        b.comment(t, &core::entry("answer", &["1"], None, "x")).unwrap();
+        for (probe, full) in [(Ok(()), vec![]), (Err("screencapture wrote no PNG".to_string()), vec!["claude".to_string()])] {
+            (s.gui_probe, s.full) = (probe, full.into_iter().collect());
+            s.pass().unwrap();
+            assert_eq!((e.borrow().len(), task(&b, t).attempt), (1, Some(a)), "no sandboxed resume");
+            assert!(hb(&b).lines().any(|l| l == format!("#{t} {a}")), "the waiting resume keeps its lease");
+        }
+        s.gui_probe = Ok(());
+        s.pass().unwrap();
+        assert_eq!(e.borrow().len(), 2, "resumed on the Full runtime");
         let other = b.create("H", "", &["taskq".into(), "needs-gui".into()]).unwrap();
         let w = cfg("win");
         let mut s = service(&b, &w, Default::default());

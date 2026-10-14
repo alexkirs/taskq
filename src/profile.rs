@@ -99,13 +99,22 @@ pub fn log_lock(path: &Path) -> std::io::Result<LogLock> {
 }
 
 fn append(path: &Path, r: &Record) -> std::io::Result<()> {
+    append_line(path, &format!("{PREFIX}{}\n", serde_json::to_string(r)?))
+}
+
+/// One record line under the profile lock and retention bound; other record kinds use their own prefix (§ 4 budget).
+pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     fs::create_dir_all(path.parent().unwrap())?;
     let _lock = log_lock(path)?;
     if fs::metadata(path).is_ok_and(|m| m.len() > crate::data::LOG_MAX - 512) {
         return Err(std::io::Error::other("log full"));
     }
-    let line = format!("{PREFIX}{}\n", serde_json::to_string(r)?);
     OpenOptions::new().create(true).append(true).open(path)?.write_all(line.as_bytes())
+}
+
+/// `<install>/taskq.log` of this process, once `init` ran.
+pub fn log_path() -> Option<&'static Path> {
+    LOG.get().map(PathBuf::as_path)
 }
 
 struct Stats { op: &'static str, times: Vec<u64>, errors: std::collections::BTreeMap<String, usize> }
@@ -160,17 +169,18 @@ fn render(text: &str) -> Result<String, &'static str> {
 
 pub fn report(install: &Path) -> String {
     let read = || -> Result<String, String> {
-        let file = match fs::File::open(install.join("taskq.log")) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return render("").map_err(String::from),
-            Err(_) => return Err("taskq.log unreadable".into()),
-        };
         let mut text = String::new();
-        file.take(crate::data::LOG_MAX + 1).read_to_string(&mut text).map_err(|_| "taskq.log unreadable or invalid UTF-8")?;
+        match fs::File::open(install.join("taskq.log")) {
+            Ok(f) => { f.take(crate::data::LOG_MAX + 1).read_to_string(&mut text).map_err(|_| "taskq.log unreadable or invalid UTF-8")?; }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("taskq.log unreadable".into()),
+        }
         if text.len() as u64 > crate::data::LOG_MAX - 512 { return Err("taskq.log at retention bound; collection stopped until service pruning".into()); }
-        render(&text).map_err(String::from)
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis().min(u64::MAX as u128) as u64);
+        let profile = render(&text).unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n"));
+        Ok(format!("{profile}\n{}", crate::requests::sources(&text, now)))
     };
-    read().unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n"))
+    read().unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n\nBoard requests by source: unknown ({e})\n"))
 }
 
 #[cfg(test)]

@@ -634,6 +634,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         if hour.0.elapsed().as_secs() >= 3600 {
             let h = requests::diff(&budget.ops, &hour.1);
             log!("requests 1h: {}", requests::summary(&h, ""));
+            requests::record("service", &h);
             last_hour = Some(h);
             hour = (Instant::now(), budget.ops.clone());
         }
@@ -2007,7 +2008,12 @@ fn main() {
         coreq::launcher::launch(&t, &args);
     }
     profile::init(&install);
-    if let Err(e) = run(&args) {
+    let r = run(&args);
+    // § 4 budget: this process's board requests by source, for `taskq profile`
+    if let Some(source) = requests::source(&args, std::env::var("TASKQ_ROLE").ok().as_deref()) {
+        requests::flush(&source);
+    }
+    if let Err(e) = r {
         if e.is_empty() {
             std::process::exit(1);
         }

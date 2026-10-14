@@ -32,15 +32,15 @@ Prove an independently installed product can enroll, show a real matching snapsh
 
 | DashQ case | TaskQ evidence | Open |
 |---|---|---|
-| E1 connect | live macOS desktop enroll and fresh Windows `--headless` enroll to dash.ufobe.com: approved code, first snapshot `projected` (#913) | DashQ page renders no `taskq-board/1` snapshot ("unsupported snapshot schema taskq-board/1"); its board row comes from the GitHub label adapter |
+| E1 connect | live macOS desktop enroll and fresh macOS and Windows `--headless` enrolls to dash.ufobe.com: approved code, first snapshot `projected`; DashQ 0.9.2 `/data` shows the `taskqorg/taskq` `taskq-board/1` snapshot (owner readback, #913) | — |
 | E2 cancel/expire | live expired code ends with the rerun step; deny and wrong code are coreq conformance | — |
 | E3 crash mid-pairing | coreq keeps `pending`; a rerun resumes it (coreq conformance) | — |
 | E4 outage | chain `sender_sends_only_the_approved_board_and_never_blocks`: delivery on its own thread, outage only waits | — |
-| E5 forged/wrong scope | same chain: another project's board is never sent; capabilities none | live probe: DashQ accepted and projected a `taskqorg/coreq` record under the `taskqorg/taskq` grant; server-side scope denial missing |
+| E5 forged/wrong scope | same chain: another project's board is never sent; capabilities none. Live probe on DashQ 0.9.2 under the `taskqorg/taskq` grant: a `taskqorg/coreq` record is `rejected`, reason `scope`, and its receipt is `unknown_event`; the same record for `taskqorg/taskq` is `projected` | — |
 | E6 schema | `taskq-board/1` projection fixture test | — |
 | E7 disconnect | live macOS and Windows: revoke confirmed, `connection status` none, second disconnect says none; offline disconnect queues the revoke for the service | — |
 | E8 TaskQ alone | no AgentQ or Langfuse dependency (Cargo.toml) | — |
 | E9 upgrade | chain `identity_survives_pruning_and_concurrent_creation` keeps `connection/` through sweep and pruning; installed 4.2.0-dev sweep deletes it until this release | — |
 | E10 UI | DashQ page; not TaskQ | — |
 
-A worker cannot write `<install>` under the § 8 Access profile, so live enrollment runs from the owner's shell or a Full grant.
+A worker cannot write `<install>` under the § 8 Access profile, so live enrollment runs from the owner's shell, a Full grant or a disposable `TASKQ_INSTALL`.

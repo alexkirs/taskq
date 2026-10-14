@@ -1049,8 +1049,8 @@ fn keep_tray(install: &Path, tray: &mut Option<std::process::Child>) {
     *tray = platform::quiet(&mut c).spawn().ok();
 }
 
-/// macOS notifications need a bundle identity (§ 4): `<install>/TaskQ.app`, ad-hoc signed, holding the current
-/// release. None: the tray runs unbundled and notifications read unsupported.
+/// macOS notifications need a bundle identity (§ 4): `<install>/TaskQ.app`, signed as § 8 step 5 (else ad-hoc),
+/// holding the current release. None: the tray runs unbundled and notifications read unsupported.
 #[cfg(target_os = "macos")]
 fn tray_app(install: &Path, exe: &Path) -> Option<PathBuf> {
     const PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1069,7 +1069,13 @@ fn tray_app(install: &Path, exe: &Path) -> Option<PathBuf> {
     fs::write(app.join("Contents/Info.plist"), PLIST).ok()?;
     let tmp = bin.with_extension("tmp");
     fs::copy(exe, &tmp).and_then(|_| fs::rename(&tmp, &bin)).ok()?;
-    let signed = std::process::Command::new("codesign").args(["-f", "-s", "-"]).arg(&app).output().is_ok_and(|o| o.status.success());
+    let signed = match platform::codesign(platform::SIGNING_IDENTITY, &app, "org.taskq.tray") {
+        Ok(true) => true,
+        r => {
+            if let Err(e) = r { platform::log(&format!("signing failed, TaskQ.app stays ad-hoc: {e}")) }
+            std::process::Command::new("codesign").args(["-f", "-s", "-"]).arg(&app).output().is_ok_and(|o| o.status.success())
+        }
+    };
     signed.then_some(bin)
 }
 

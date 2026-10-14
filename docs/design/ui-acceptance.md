@@ -15,7 +15,7 @@ Use [report template](ui-acceptance-report.md). Keep reports per candidate; do n
 
 ## Feature ledger
 
-Every row needs initial, success, failure/unknown and recovery evidence where applicable; placeholders stay gaps per [F6](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f6-build-polish-accept).
+Builder completes the ledger per [F6](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f6-build-polish-accept). Each TaskQ row records initial, success, failure/unknown and recovery evidence where applicable.
 
 | Surface / route | Must preserve | Requirements |
 |---|---|---|

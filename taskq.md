@@ -9,7 +9,7 @@ A task that changes a rule names its R-number, edits this file in the same deliv
 No machine block in issues. State is what a person sees: labels, the issue text, `taskq:` comments (§ 2) and host heartbeat issues (§ 4). The comment log is the truth; labels are its projection. Local files are caches that a restart rebuilds: no local DB, receipt store, queue or lock. Exception: accepted [DashQ connection state](docs/design/enrollment.md) (identity/grant/revoke and coalesced projection, never task truth); AI request files, the tray's request history, the request log, local incident reports (§ 4) and the host admission file and lock and the emergency hold file (§ 3); they hold no task state. The `pid` of a fresh `status.json` is the one-service-per-root check (§ 4), not a lock.
 
 ### R2. One task, one attempt
-A task has at most one live attempt: one worker or one reviewer process. Work bigger than one reviewable diff is several tasks linked by `Depends on #N`. A live attempt is never moved to another host or session; a new attempt replaces it (§ 4).
+A task has at most one live attempt: one worker or one reviewer process. Work bigger than one reviewable diff follows [shared task preparation](https://github.com/taskqorg/specq/blob/main/engineering/agent-workflow.md#prepare-the-task), using tasks linked by `Depends on #N`. A live attempt is never moved to another host or session; a new attempt replaces it (§ 4).
 
 ### R3. Roles
 - **Owner**: decides product questions, answers `ask`, accepts or rejects results through the PM.
@@ -241,7 +241,7 @@ Worker brief: task text, attempt, branch, delivery commands, this file's path (t
 3. Owner-only question: `ask` with options, then stop. Cannot be done: `requeue --text`, then stop.
 4. Before `result`: commit on `taskq-<N>` with `Task: <issue url>` in the message, rebase on `origin/main`, run the
    project checks, name each command and outcome in `--checks`. Never weaken a check to pass: a changed or deleted
-   existing test or golden trace needs a changed rule in the same diff and is named in `--text`.
+   existing test or golden trace needs a changed rule in the same diff and is named in `--text`. For fixes, `--checks` records the shared before/after evidence or its limitation (R12).
 5. `publish: direct`: push `taskq-<N>`. `publish: pr`: push and open one PR/MR into `main`. Then `result --sha <sha>`.
    Research: `--sha` = current `origin/main`, the answer in `--text`.
 6. Everything written through taskq is public: no secrets, tokens or local paths.
@@ -249,9 +249,9 @@ Worker brief: task text, attempt, branch, delivery commands, this file's path (t
 ### Result and close verdicts
 `result` body: `Changed: <user effect>` (1-2 lines), `Checks: <command -- outcome>` (one line per check, 1-8 lines),
 then `Open: <remaining item|none>` (1-2 lines); at most 12 lines, at most 240 characters per line. Keep exact commands and platform qualifications (R12).
-`--text` supplies literal Changed and Open lines; `--checks` supplies unprefixed command/outcome lines, each rendered with `Checks:`. SHA stays in the log header; one PR/evidence link may share Changed.
+`--text` supplies literal Changed and Open lines; `--checks` supplies unprefixed command/outcome lines, each rendered with `Checks:`. SHA stays in the log header; one PR/evidence link may share Changed and carry the [shared risk description](https://github.com/taskqorg/specq/blob/main/caveman/rules/changes.md#merge-request-description-markdown) for either publication route.
 `close --text` supplies all three labelled fields in the same order and limits; Checks names each `A<k> ok|gap|unknown` plus exact-SHA CI outcome, not a vague PASS.
-Reviewer checks every Acceptance and contract against the candidate and CI on that SHA; requeue only for Acceptance/contract gaps. Then `close --text <verdict>`, `requeue --text <exact fixes>` or `ask` with options. PM relays the verdict verbatim, links intact.
+Reviewer checks every Acceptance and contract against the candidate and CI on that SHA; `Checks:` distinguishes task fit and implementation quality per [shared review](https://github.com/taskqorg/specq/blob/main/engineering/agent-workflow.md#review), within the same verdict limits. Requeue only for Acceptance/contract gaps; advisory findings go in `Open:`. Then `close --text <verdict>`, `requeue --text <exact fixes>` or `ask` with options. PM relays the verdict verbatim, links intact.
 
 `close` publication goes through the board API only:
 - `direct`: branch `taskq-<N>` equals the result SHA, `main` is its ancestor, CI green on that SHA; move `main` to it

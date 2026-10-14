@@ -317,9 +317,12 @@ mod os {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+#[path = "notify_windows.rs"]
+mod os;
+
+#[cfg(not(any(target_os = "macos", windows)))]
 mod os {
-    // ponytail: Windows toasts are not in WS12; the page reads `unsupported`
     pub fn status() -> &'static str {
         "unsupported"
     }

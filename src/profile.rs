@@ -181,6 +181,8 @@ mod tests {
     #[test]
     fn retained_profile_report() {
         let dir = std::env::temp_dir().join(format!("taskq-profile-{}", std::process::id()));
+        // A failed run leaves its directory; a reused process id must not inherit that log.
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("taskq.log");
         assert!(report(&dir).contains("unknown (no observations)"));
@@ -240,9 +242,14 @@ mod tests {
                     }
                 }
             }); }
-            // the trimmer retries until it wins the lock once: a run where it never did kept the older record (#1072 CI)
+            // Rule (§ 4 Profiling, R12): one prune wins the nonblocking lock while appends race, so the pre-filled
+            // record is truncated and every retained record is a counted successful append. 50 losses happened in CI.
             scope.spawn(|| {
-                while !crate::data::trim_tail(&path, crate::data::LOG_MAX) { std::thread::yield_now(); }
+                let deadline = Instant::now() + std::time::Duration::from_secs(10);
+                while !crate::data::trim_tail(&path, crate::data::LOG_MAX) {
+                    assert!(Instant::now() < deadline, "no prune won the profile log lock");
+                    std::thread::yield_now();
+                }
                 for _ in 0..49 { crate::data::trim_tail(&path, crate::data::LOG_MAX); }
             });
         });

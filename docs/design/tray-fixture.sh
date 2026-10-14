@@ -4,8 +4,9 @@
 # alpha admits (long titles, ask, failed, a newer version to update to, history over the last day: 3 closes and
 # 3 failed in a day, the first and last of 12 bins not empty, Agents rows); beta is paused with a saved focus, has a service error and the
 # same issue number #12 in another repo; gamma is observation only with a stale status.json. No board, no service.
+# EXTRA (default 0) more minimal projects make Home and Projects taller than the window, so they scroll (#1073).
 set -eu
-d=${1:?usage: tray-fixture.sh DIR}
+d=${1:?usage: tray-fixture.sh DIR [EXTRA]}
 mkdir -p "$d/install" "$d/alpha/.taskq" "$d/beta/.taskq" "$d/gamma/.taskq"
 d=$(cd "$d" && (pwd -W 2>/dev/null || pwd))
 printf '%s\n' "$d/alpha" "$d/beta" "$d/gamma" > "$d/install/projects"
@@ -37,3 +38,14 @@ cat > "$d/gamma/.taskq/status.json" <<EOF
  {"n":3,"title":"Observed only","state":"ready","labels":["taskq","area-docs"]}]}
 EOF
 touch -t 202001010000 "$d/gamma/.taskq/status.json"
+i=1
+while [ "$i" -le "${2:-0}" ]; do
+  mkdir -p "$d/extra-$i/.taskq"
+  printf '%s\n' "$d/extra-$i" >> "$d/install/projects"
+  cat > "$d/extra-$i/.taskq/status.json" <<EOF
+{"project":"extra-$i","host":"mac","version":"4.1.0","issues":"https://github.com/o/extra-$i/issues","log":null,
+ "focus":["area-ui"],"error":null,"request":null,"events_since":null,"tasks":[
+ {"n":$i,"title":"Extra project task $i","state":"ready","labels":["taskq","area-ui"]}]}
+EOF
+  i=$((i+1))
+done

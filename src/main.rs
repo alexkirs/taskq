@@ -10,6 +10,7 @@ mod incident;
 mod labels;
 mod operator;
 mod platform;
+mod policy;
 mod retro;
 mod runtime;
 mod service;
@@ -49,6 +50,7 @@ const USAGE: &str = "taskq agents
  taskq service install|run|pause|resume|status|restart|stop|uninstall|list
  taskq service focus [all|off|<label..>] [--request TEXT]
  taskq service capacity [--host H] [--mode auto|fixed] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
+ taskq service permissions [--runtime R --mode restricted|workspace|full|none [--scope host|project]]
  taskq tray [--snapshot DIR] [--icon FILE] | taskq selftest
 Writes to a task take [--op-id ID] [--revision R] [--json] (taskq.md section 5).
 Text templates and limits: taskq.md sections 1, 2, 5, 7.";
@@ -496,7 +498,7 @@ fn service_run(c: &Ctx) -> Res<()> {
     let cfg = &c.cfg;
     let exe = launcher(&cfg.install);
     let board_env = cfg.board.worker_env(&platform::tool(&cfg.install), &cfg.web_host)?;
-    let env = runtime::Env { board_env: &board_env, root: &cfg.root, exe: &exe, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.publish };
+    let env = runtime::Env { board_env: &board_env, root: &cfg.root, exe: &exe, install: &cfg.install, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.publish };
     let start = |l: &runtime::Launch| runtime::spawn(&env, l);
     let mut s = Service::new(c.board.as_ref(), cfg, platform::VERSION, Box::new(start));
     s.instance = enrollment::installation_id(&cfg.install).map(|id| service_id(&id))?;
@@ -536,6 +538,9 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         let op_rt = cap.as_ref().ok().and_then(|c| ["claude", "codex"].into_iter().find(|rt| c.limits.get(*rt).copied().unwrap_or(if c.auto { u32::MAX } else { 0 }) > 0));
         s.reload(cap);
+        // § 8 Access: re-read every pass; a refused runtime is not claimed or resumed
+        let access = policy::report(&cfg.install, &cfg.root, &cfg.permission_mode, &cfg.codex);
+        s.refused_access = access.iter().filter_map(|e| Some((e.runtime.clone(), e.refused.clone()?))).collect();
         s.mono = began.elapsed().as_secs();
         s.wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         // § 4 Data: an unreadable focus admits nothing and reads unknown with its reason
@@ -574,7 +579,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
-            ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("agents", json!(agents.as_ref().map(|a| &a.1))),
+            ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root)))]
         {
             status[k] = v;
@@ -822,6 +827,37 @@ fn admission_text(c: &Value) -> String {
     };
     let res: Vec<String> = c["reservations"].as_array().into_iter().flatten().map(|r| format!("#{} {}", r["task"], r["state"].as_str().unwrap_or("?"))).collect();
     format!("Admission: {mode}{}", if res.is_empty() { String::new() } else { format!(" · {}", res.join(", ")) })
+}
+
+/// `taskq service permissions` (§ 5, § 8 Access): requested vs effective access per runtime; a write sets one grant.
+fn permissions_cmd(root: &Path, a: &Args) -> Res<()> {
+    let (cfg, _) = load(root)?;
+    if let Some(rt) = a.one("runtime") {
+        if std::env::var_os("TASKQ_ATTEMPT").is_some() {
+            // hygiene only: the OS boundary of § 8 Access is what keeps a worker out
+            return Err("a worker cannot change the policy that governs it".into());
+        }
+        let mode = a.need("mode")?;
+        let project = match a.one("scope").unwrap_or("host") {
+            "host" => None,
+            "project" => Some(cfg.root.as_path()),
+            s => return Err(format!("--scope {s}: host or project")),
+        };
+        let at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let by = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "unknown".into());
+        let p = policy::grant(&cfg.install, rt, mode, project, &by, at)?;
+        println!("Saved: {rt} {mode} ({}) revision {}; new attempts only", if project.is_some() { "project" } else { "host" }, p.revision);
+    } else {
+        match policy::load(&cfg.install) {
+            Ok(p) if p.grants.is_empty() => println!("Policy: no grants"),
+            Ok(p) => println!("Policy: revision {}, {} grants", p.revision, p.grants.len()),
+            Err(e) => println!("Policy: unknown: {e}"),
+        }
+    }
+    for e in policy::report(&cfg.install, &cfg.root, &cfg.permission_mode, &cfg.codex) {
+        println!("{}", e.line());
+    }
+    Ok(())
 }
 
 /// `taskq service capacity` (§ 5).
@@ -1135,6 +1171,7 @@ fn service(args: &Args) -> Res<()> {
             Ok(())
         }
         "capacity" => capacity_cmd(&root, args),
+        "permissions" => permissions_cmd(&root, args),
         "hold" | "release" => hold_cmd(sub == "hold", args.one("text")),
         "recover" => recover_cmd(&root, args.flags.contains_key("apply"), args.flags.contains_key("json")),
         "restart" => {
@@ -1183,7 +1220,7 @@ fn service(args: &Args) -> Res<()> {
             }
             Ok(())
         }
-        _ => Err("usage: taskq service install|run|focus|pause|resume|capacity|hold|release|recover|status|restart|stop|uninstall|list".into()),
+        _ => Err("usage: taskq service install|run|focus|pause|resume|capacity|permissions|hold|release|recover|status|restart|stop|uninstall|list".into()),
     }
 }
 

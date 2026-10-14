@@ -23,11 +23,11 @@ const FOCUS_MAX: u64 = 4096;
 /// the launcher and the service's own stderr append to the open file.
 pub fn trim_tail(p: &Path, max: u64) -> bool {
     let profile_log = p.file_name().is_some_and(|n| n == "taskq.log");
-    let max = if profile_log { max.saturating_sub(512) } else { max };
+    let threshold = if profile_log { max.saturating_sub(512) } else { max };
     let _profile_lock = if profile_log {
         match crate::profile::log_lock(p) { Ok(lock) => Some(lock), Err(_) => return false }
     } else { None };
-    if fs::metadata(p).is_ok_and(|m| m.len() <= max) {
+    if fs::metadata(p).is_ok_and(|m| m.len() <= threshold) {
         return false;
     }
     let Ok(b) = fs::read(p) else { return false };

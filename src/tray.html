@@ -193,9 +193,9 @@ function history(){
   // the summary wraps between totals, never inside one, so all four stay readable at every text size (#1083)
   const total=[periods[S.period],...(H.since==null?kinds.map(k=>k+' —'):kinds.map((k,i)=>k+' '+tot[i]).concat(part?['incomplete']:[]))].map(t=>t.replace(/ /g,'\u00a0')).join('\u00a0· ');
   return '<details class="group hist"><summary>▥ History <span class="meta">'+total+'</span></summary><div class="options periods">'+Object.entries(periods).map(([k,l])=>'<button data-set="period" data-v="'+k+'" aria-pressed="'+(S.period===k||k==='custom'&&draft!=null)+'">'+l+'</button>').join('')+'</div>'+
-  (draft?custom():'')+'<div class="body meta">['+esc(when(H.start,H.tz))+', '+esc(when(H.end,H.tz))+') · peak '+peak+'</div>'+
+  (draft?custom():'')+'<div class="body meta">['+esc(when(H.start,H.tz))+', '+esc(when(H.end,H.tz))+')'+(S.now<H.end?' · last bin partial':'')+' · peak '+peak+'</div>'+
   '<div class="bars" role="img" aria-label="'+esc(named(tot,', ')+'; '+n+' equal bins, oldest left'+(note?'; '+note:''))+'">'+H.bins.map((b,i)=>{const t=H.start+i*w,u=H.since==null||t+w<=H.since;
-    return '<span'+(u?' class="unknown" title="unknown"':' title="'+esc(when(t,H.tz)+': '+named(b,', '))+'"')+'>'+[3,2,1,0].map(k=>'<i class="k'+k+'" style="height:'+b[k]/peak*100+'%"></i>').join('')+'</span>';}).join('')+'</div>'+(note?'<div class="body meta">'+esc(note)+'</div>':'')+'</details>';}
+    return '<span'+(u?' class="unknown" title="unknown"':' title="'+esc(when(t,H.tz)+(S.now<t+w?' (partial)':'')+': '+named(b,', '))+'"')+'>'+[3,2,1,0].map(k=>'<i class="k'+k+'" style="height:'+b[k]/peak*100+'%"></i>').join('')+'</span>';}).join('')+'</div>'+(note?'<div class="body meta">'+esc(note)+'</div>':'')+'</details>';}
 // `Update now` only for a newer version in status.json; success only once a status.json reads it back (M9)
 function update(){
   const up=S.projects.find(p=>p.update&&p.update!==p.version);

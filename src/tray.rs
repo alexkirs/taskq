@@ -110,7 +110,7 @@ impl Settings {
         if self.period == "custom" {
             return (self.start, self.end);
         }
-        (now - PERIODS.iter().find(|p| p.0 == self.period).map_or(86400, |p| p.1), now)
+        rolling(now, PERIODS.iter().find(|p| p.0 == self.period).map_or(86400, |p| p.1))
     }
 
     fn save(&self, install: &Path) -> bool {
@@ -987,7 +987,14 @@ fn agents(ps: &[Value]) -> Value {
 
 /// The last 24 h, the period of the icon histogram (icon-summary.config.json).
 fn day(now: i64) -> (i64, i64) {
-    (now - 86400, now)
+    rolling(now, 86400)
+}
+
+/// 12 whole epoch-aligned bins of `period / 12`, the newest holding `now` (partial): the grid moves one bin at a boundary (M6).
+fn rolling(now: i64, period: i64) -> (i64, i64) {
+    let w = period / 12;
+    let end = (now.div_euclid(w) + 1) * w;
+    (end - period, end)
 }
 
 /// Configuration `c` over `s` at `k` × 22 pt and `dpr` pixels per point through the shared renderer.
@@ -1728,6 +1735,44 @@ mod tests {
         assert!(summary(&ok, (-200, 100)).known);
     }
 
+    // Chain: M6/D11 rolling history grid and U-A6 icon. Risk: bars drift on every refresh, or a boundary loses or moves events.
+    #[test]
+    fn history_grid_moves_one_bin_at_a_boundary() {
+        let b = 7200 * 300_000; // a 2 h boundary of the 24 h period
+        // one event per bin before b (kinds in turn), two more in the bin closing at b, one after b
+        let mut ev: Vec<Value> = (1..12).map(|i| json!([b - i * 7200, KINDS[(i % 4) as usize], format!("e{i}")])).collect();
+        ev.extend([json!([b - 3700, "close", "late"]), json!([b - 3601, "ask", "last"]), json!([b + 30, "failed", "new"])]);
+        // the events cache at `now` holds only events up to now
+        let at = |now: i64| {
+            let seen: Vec<&Value> = ev.iter().filter(|e| e[0].as_i64().unwrap() <= now).collect();
+            summary(&[json!({"issues": "u", "tasks": [], "focus": ["all"], "events": seen, "since": 0, "complete": true})], day(now))
+        };
+        let icons = |s: &Summary| [(1.0, 2.0), (16.0 / 22.0, 1.0)].map(|(k, dpr)| draw(&icon::summary(), s, true, k, dpr).unwrap().png());
+        let frames = [b - 3600, b - 1, b, b + 31, b + 3600];
+        let sums: Vec<Summary> = frames.iter().map(|&t| at(t)).collect();
+        let pngs: Vec<_> = sums.iter().map(icons).collect();
+        for (i, j) in [(0, 1), (3, 4)] {
+            assert_eq!(sums[i].bins, sums[j].bins, "no movement inside a bin");
+            assert!(pngs[i] == pngs[j], "44 px and 16 px icons identical inside a bin");
+        }
+        let (before, after) = (&sums[1].bins, &sums[2].bins);
+        assert_eq!(after[..11], before[1..], "the whole grid moves one bin left at the boundary");
+        assert_eq!((after[11], sums[3].bins[11]), ([0; 4], [0, 1, 0, 0]), "the new partial bin starts empty and fills in place");
+        assert_eq!(before[11], [1, 1, 1, 0]);
+        let tot = |bins: &[[u32; 4]]| (0..4).map(|k| bins.iter().map(|r| r[k]).sum::<u32>()).collect::<Vec<_>>();
+        assert_eq!(tot(&after[..11]), tot(&before[1..]), "retained totals unchanged");
+        assert_eq!((before[0], tot(after)), ([0; 4], tot(before)), "an empty oldest bin leaves: every total unchanged");
+        assert!(pngs[1] != pngs[2], "the icon changes at the boundary");
+        if let Ok(dir) = std::env::var("TASKQ_FRAMES") {
+            // ponytail: evidence frames on demand, `TASKQ_FRAMES=DIR cargo test history_grid`
+            for (t, p) in frames.iter().zip(&pngs) {
+                for (size, png) in ["22pt@2x", "16px@1x"].iter().zip(p) {
+                    fs::write(Path::new(&dir).join(format!("icon-summary-{:+}s-{size}.png", t - b)), png).unwrap();
+                }
+            }
+        }
+    }
+
     // Chain: § 4 tray settings input. Risk: webview input stores unknown values.
     #[test]
     fn settings_keep_only_known_values() {
@@ -1736,7 +1781,7 @@ mod tests {
         s.set(&json!({"view": "x", "font": 15, "period": "2y"}));
         s.set(&json!({"period": "custom", "start": 50, "end": 50, "tz": "UTC"}));
         assert!(s == Settings { view: "full".into(), font: 18, period: "1w".into(), start: 0, end: 0, tz: "local".into(), icon: Value::Null, pin: Pin::default(), notify: Value::Null });
-        assert_eq!(s.range(1000), (1000 - 604800, 1000));
+        assert_eq!(s.range(1000), (50400 - 604800, 50400), "whole 14 h bins, the newest holds now");
         s.set(&json!({"period": "custom", "start": 40, "end": 160, "tz": "UTC"}));
         assert_eq!((s.range(1000), s.tz.as_str()), ((40, 160), "UTC"));
     }

@@ -1548,6 +1548,8 @@ mod tests {
         assert_eq!(service::capacity(&v, "mac").unwrap().limits["claude"], 4, "other hosts keep theirs");
         let old = service::capacity(&serde_json::from_str(text).unwrap(), "win").unwrap().json();
         assert!(edit_capacity(text, "win", "mac", &e, Some(&old)).is_ok());
+        let changed = edit_capacity(text, "win", "mac", &e, None).unwrap();
+        assert!(edit_capacity(&changed, "win", "mac", &e, Some(&old)).is_err(), "lost receipt retries cannot overwrite a concurrent config change");
         for (host, e, expect, err) in [
             ("nas", e.clone(), None, "unknown host"),
             ("mac", CapEdit::default(), None, "nothing to change"),

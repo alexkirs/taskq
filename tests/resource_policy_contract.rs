@@ -460,3 +460,18 @@ fn reviewer_regression_fixtures() {
         assert_eq!(p["blockers"][3]["knowledge"], "unknown");
     }
 }
+
+// Chain: shared resource-controls fixtures -> projection allowlist. Risk: a component fixture relies on a field the
+// wire never carries, so a consumer passes its replay but fails on real data.
+#[test]
+fn component_fixtures_are_projection_targets() {
+    let fx: Value = serde_json::from_str(include_str!("fixtures/resource-controls.json")).unwrap();
+    for c in fx["cases"].as_array().unwrap() {
+        for g in c["groups"].as_array().unwrap() {
+            for t in g["targets"].as_array().unwrap() {
+                assert_eq!(&allowlisted(t, "projection"), t, "{}", c["name"]);
+                let _: Target = serde_json::from_value(t["target"].clone()).unwrap();
+            }
+        }
+    }
+}

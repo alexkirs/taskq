@@ -115,9 +115,7 @@ pub const SIGNING_IDENTITY: &str = "TaskQ Local Signing";
 pub fn codesign(identity: &str, path: &Path, id: &str) -> Result<bool, String> {
     use std::process::Command;
     let ids = Command::new("security").args(["find-identity", "-p", "codesigning"]).output().map_err(|e| format!("security: {e}"))?;
-    let quoted = format!("\"{identity}\"");
-    let Some(sha1) = String::from_utf8_lossy(&ids.stdout).lines().find(|l| l.contains(&quoted))
-        .and_then(|l| l.split_whitespace().nth(1).map(str::to_owned)) else { return Ok(false) };
+    let Some(sha1) = identity_hash(identity, &ids)? else { return Ok(false) };
     let run = |c: &mut Command| match c.output() {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => Err(format!("{}: {}", path.display(), String::from_utf8_lossy(&o.stderr).trim())),
@@ -126,6 +124,18 @@ pub fn codesign(identity: &str, path: &Path, id: &str) -> Result<bool, String> {
     run(Command::new("codesign").args(["-f", "-s", &sha1, "-i", id]).arg(path))?;
     run(Command::new("codesign").arg(format!("-R=identifier \"{id}\" and certificate leaf = H\"{sha1}\"")).args(["-v", "--strict"]).arg(path))?;
     Ok(true)
+}
+
+/// The SHA-1 of `identity` in `security find-identity` output; Err when `security` failed, so an unreadable
+/// keychain is not reported as an absent identity.
+#[cfg(target_os = "macos")]
+fn identity_hash(identity: &str, ids: &std::process::Output) -> Result<Option<String>, String> {
+    if !ids.status.success() {
+        return Err(format!("security find-identity: {}: {}", ids.status, String::from_utf8_lossy(&ids.stderr).trim()));
+    }
+    let quoted = format!("\"{identity}\"");
+    Ok(String::from_utf8_lossy(&ids.stdout).lines().find(|l| l.contains(&quoted))
+        .and_then(|l| l.split_whitespace().nth(1).map(str::to_owned)))
 }
 
 /// § 8 step 5: TCC keys an ad-hoc grant to the cdhash, so each release would need a new grant. Signs a copy of the
@@ -510,8 +520,12 @@ mod tests {
         let before = fs::read(&a).unwrap();
         assert_eq!(codesign("TaskQ No Such Identity", &a, "org.taskq.taskq"), Ok(false));
         assert_eq!(fs::read(&a).unwrap(), before, "an absent identity touched the file");
+        let failed = std::process::Command::new("/bin/sh").args(["-c", "echo boom >&2; exit 1"]).output().unwrap();
+        assert!(identity_hash(SIGNING_IDENTITY, &failed).unwrap_err().contains("boom"));
         // ponytail: CI has no identity; the rest runs on a host where `service install` signs
-        if codesign(SIGNING_IDENTITY, &a, "org.taskq.taskq") == Ok(true) {
+        let signed = codesign(SIGNING_IDENTITY, &a, "org.taskq.taskq");
+        assert!(signed.is_ok(), "{signed:?}");
+        if signed == Ok(true) {
             assert_eq!(codesign(SIGNING_IDENTITY, &b, "org.taskq.taskq"), Ok(true));
             let req = |p: &Path| String::from_utf8(std::process::Command::new("codesign").args(["-d", "-r-"]).arg(p).output().unwrap().stdout).unwrap();
             assert_eq!(req(&a), req(&b));

@@ -2026,6 +2026,39 @@ mod tests {
     }
 
     #[test]
+    fn finding_start_adapter_failures_preserve_create_and_replay() {
+        // Chain: F2 create readback -> failed admission -> same-ID recovery; no issue or receipt is lost.
+        for failure in ["initialize", "hold-read", "start-read", "readback", "labels"] {
+            let b = Fake::default();
+            b.create("Claims", "", &[]).unwrap();
+            let raw = json!({"create_claim_issue": 1});
+            let op = Op { id: Some("finding.failure".into()), revision: None };
+            let root = cfg().root;
+            let submit = || finding_submit(&b, &raw, &root, "T", "G\nop-id: finding.failure\n", &["q-held".into()], "start:true", &op, true);
+            {
+                let mut st = b.state.borrow_mut();
+                st.fail_issue_read = match failure { "initialize" => Some((2, 2)), "hold-read" => Some((2, 3)), "start-read" => Some((2, 4)), "readback" => Some((2, 5)), _ => None };
+                st.fail_labels = failure == "labels";
+            }
+            let (created, started) = submit();
+            assert_eq!((created.outcome, created.task), ("accepted", 2), "{failure}");
+            let started = started.unwrap();
+            assert_eq!((started.outcome, started.task, started.op_id.as_deref()), ("unknown", 2, Some("finding.failure.start")), "{failure}");
+            assert!(emit_finding(created, Some(started), true).is_err());
+            let (created, started) = submit();
+            assert!(created.ok() && started.unwrap().ok(), "{failure}");
+            let count = b.comments(2).unwrap().len();
+            assert_eq!(count, 2, "one hold and one start: {failure}");
+            let (created, started) = submit();
+            assert!(created.ok() && started.unwrap().ok());
+            assert_eq!(b.comments(2).unwrap().len(), count);
+            assert_eq!(b.issues(Some(0)).unwrap().len(), 2);
+            assert!(service::is_task(&b.issue(2).unwrap()));
+            assert!(!service::is_held(&b.issue(2).unwrap()));
+        }
+    }
+
+    #[test]
     fn finding_separate_start_receipts_recover_without_recreate() {
         // Chain: F2 create success -> unknown start -> recovered start. Risk: losing the issue or admitting twice.
         let b = Fake::default();

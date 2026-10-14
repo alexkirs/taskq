@@ -419,6 +419,8 @@ pub struct FakeState {
     /// `pending` or `failed` makes `publish` refuse; anything else merges.
     pub publish: String,
     pub hide_latest_comment: bool,
+    pub fail_issue_read: Option<(u64, usize)>,
+    pub fail_labels: bool,
     /// A concurrent writer: this body lands just before the next `comment`.
     pub race: Option<String>,
 }
@@ -459,6 +461,17 @@ impl Board for Fake {
         Ok(self.state.borrow().issues.iter().filter(|i| since.map_or(i.open, |t| i.updated >= t)).cloned().collect())
     }
     fn issue(&self, n: u64) -> Result<Issue> {
+        let mut st = self.state.borrow_mut();
+        if let Some((task, remaining)) = &mut st.fail_issue_read {
+            if *task == n {
+                *remaining -= 1;
+                if *remaining == 0 {
+                    st.fail_issue_read = None;
+                    return Err("issue read failed".into());
+                }
+            }
+        }
+        drop(st);
         self.state.borrow_mut().get(n).cloned()
     }
     fn comments(&self, n: u64) -> Result<Vec<Comment>> {
@@ -484,6 +497,7 @@ impl Board for Fake {
     }
     fn labels(&self, n: u64, add: &[String], remove: &[String]) -> Result<()> {
         let mut st = self.state.borrow_mut();
+        if std::mem::take(&mut st.fail_labels) { return Err("label write failed".into()); }
         let t = st.tick();
         let i = st.get(n)?;
         i.labels.retain(|l| !remove.contains(l));

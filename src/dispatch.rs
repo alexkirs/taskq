@@ -95,7 +95,7 @@ fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &
     };
     let (issue, deps, mut log) = match read() {
         Ok(x) => x,
-        Err(e) => return Receipt::rejected(n, op, e),
+        Err(e) => return Receipt { outcome: "unknown", ..Receipt::rejected(n, op, e) },
     };
     let before = fold(n, &log, deps);
     let rev = core::revision(n, &log);

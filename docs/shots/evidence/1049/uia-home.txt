@@ -1,0 +1,49 @@
+Document||kbd=True|offscreen=False
+Menu||kbd=False|offscreen=False
+Text|taskq|kbd=False|offscreen=False
+Button|Pin|kbd=True|offscreen=False
+Button|Top|kbd=True|offscreen=False
+Text|Home|kbd=True|offscreen=False
+Text|winq|kbd=False|offscreen=False
+Button|? Work mode.|kbd=True|offscreen=False
+Button|Pause all.|kbd=True|offscreen=False
+Group||kbd=False|offscreen=False
+Button|? Scope 1 projects >|kbd=True|offscreen=False
+Text|? Scope|kbd=False|offscreen=False
+Text|1 projects|kbd=False|offscreen=False
+Text|Attention|kbd=False|offscreen=False
+Button|All|kbd=True|offscreen=False
+Text|? Ask AI � projects: g8q|kbd=False|offscreen=False
+Group|AI exchange|kbd=True|offscreen=False
+Hyperlink|Comment on #1058 ?|kbd=True|offscreen=False
+Text|: PM: `profile::tests::retained_profile_report` is a known f|kbd=False|offscreen=False
+Text|AI request not done: access refused: no operator grant and n|kbd=False|offscreen=False
+Edit|Request to AI|kbd=True|offscreen=False
+Button|History and commands|kbd=True|offscreen=False
+Button|Send|kbd=True|offscreen=False
+Button|Edit and send again|kbd=True|offscreen=False
+Text|Projects|kbd=False|offscreen=False
+Button|All 1|kbd=True|offscreen=False
+Group|All projects|kbd=False|offscreen=False
+Group|All projects counters|kbd=False|offscreen=False
+Button|All projects � Doing: 4|kbd=True|offscreen=False
+Button|All projects � Ready: 1|kbd=True|offscreen=False
+Button|All projects � Blocked: 5|kbd=True|offscreen=False
+Button|All projects � Later: 13|kbd=True|offscreen=False
+Button|All projects � Closed: unknown|kbd=True|offscreen=False
+Group|g8q|kbd=False|offscreen=False
+Button|g8q|kbd=True|offscreen=False
+Hyperlink|Open g8q Board|kbd=True|offscreen=False
+Group|g8q counters|kbd=False|offscreen=False
+Button|g8q � Doing: 4|kbd=True|offscreen=False
+Button|g8q � Ready: 1|kbd=True|offscreen=False
+Button|g8q � Blocked: 5|kbd=True|offscreen=False
+Button|g8q � Later: 13|kbd=True|offscreen=False
+Button|g8q � Closed: unknown|kbd=True|offscreen=False
+Text|Admitting: host-winq|kbd=False|offscreen=False
+Button|Add project.|kbd=True|offscreen=False
+Button|Activity history|kbd=True|offscreen=False
+Button|Resize window with arrow keys|kbd=True|offscreen=False
+Group|Menu|kbd=False|offscreen=False
+Button|Home|kbd=True|offscreen=False
+Button|Settings|kbd=True|offscreen=False

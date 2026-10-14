@@ -1,0 +1,21 @@
+Update from 4.1.11 to 4.2.0-dev.1792018150 (build 6, 9ab83b63052a099c826a26cbeca8fe22e99c920d) with a live kid; isolated host winq, UTC 2026-10-14
+22:53:05 service 4.1.11 pid 5032; 22:53:19 4.1.11 spawns probe #1155 attempt 6180277215 (claude kid pid 27580)
+22:53:31 install/current = 4.2.0-dev.1792018150, previous = 4.1.11, update + poke requested
+22:53:33 status: 4.1.11 5032 [{'task': 1155, 'attempt': 6180277215, 'rt': 'claude', 'pid': 27580}] None None None
+22:53:36 status: 4.1.11 5032 [] None None None
+22:53:59 status: 4.2.0-dev.1792018150 2636 [] None True None
+kid 27580 after switch: INFO: No tasks are running which match the specified criteria.
+log: 2026-10-14T22:48:11Z #1154 event close 6180135314
+log: 2026-10-14T22:50:59Z restart requested
+log: taskq 4.1.11 service on winq for taskqorg/taskq
+log: #1155 taskq: spawn worker claude:ba6568ed-c852-4c5a-9473-1a75c21b7c14 winq
+log: #1155 taskq: gone attempt 6180277215
+log: current is 4.2.0-dev.1792018150; restarting
+log: 2026-10-14T22:53:36Z taskq 4.2.0-dev.1792018150 service on winq for taskqorg/taskq
+#1155 kid ended itself after 17 s (exit 0; the isolated claude session had no shell permission, no grant); 4.1.11 logged 'gone' before 'current is ...; restarting'. The build 5 run kept a kid 70 s with the same 4.1.11 behavior.
+restart on build 6: requested 22:54:26, up 22:54:47: 4.2.0-dev.1792018150 10468 True (was pid 2636); starts=2; current=4.2.0-dev.1792018150
+23:05:29 healthy marker written for 4.2.0-dev.1792018150 (rollback_after 600 s after 22:54:47 start)
+23:05:29 service restart requested (after healthy): Restart requested for g8q 
+23:07:30  current=4.2.0-dev.1792018150 starts=2
+23:07:35 status version 4.2.0-dev.1792018150 pid 5004 complete True error None current=4.2.0-dev.1792018150 starts=2
+23:05:31 restart requested after healthy; 23:05:32 taskq 4.2.0-dev.1792018150 service on winq (taskq.log); 23:07:35 status pid 5004 current V6

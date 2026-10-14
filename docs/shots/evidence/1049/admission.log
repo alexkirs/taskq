@@ -1,0 +1,14 @@
+Admission on build 6 after the 22:54:47 restart (UTC 2026-10-14)
+22:54:54 unknown cpu None mem 44.1 ['sample: no CPU reading yet', 'access', 'access', 'access'] {'mode': 'auto', 'max': 1} host_used 0
+22:55:20 held cpu 8.6 mem 42.9 ['cooldown: 1 of 3 calm samples', 'access', 'access', 'access'] {'mode': 'auto', 'max': 1} host_used 0
+22:55:51 held cpu 8.5 mem 43.5 ['cooldown: 2 of 3 calm samples', 'access', 'access', 'access'] {'mode': 'auto', 'max': 1} host_used 0
+22:56:22 open cpu 6.7 mem 44.1 ['access', 'access', 'access'] {'mode': 'auto', 'max': 1} host_used 0
+load_gate {'enabled': True, 'cpu_max': 90, 'memory_min': 10} min_service_version 4.2.0-dev
+reason access claude: no operator grant and no policy store protection for claude on windows; grant a preset
+reason access codex: no operator grant and no policy store protection for codex on windows; grant a preset
+reason access codex-app: no operator grant and no policy store protection for codex-app on windows; grant a preset
+Capacity: g8q on winq
+Claude 0/1
+Codex 0/0
+Load gate: Ready
+Admission: Auto · host 0 / 1 held

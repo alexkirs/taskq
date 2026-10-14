@@ -1,0 +1,18 @@
+Document||kbd=True|offscreen=False
+Menu||kbd=False|offscreen=False
+Text|taskq|kbd=False|offscreen=False
+Button|Pin|kbd=True|offscreen=False
+Button|Top|kbd=True|offscreen=False
+Button|< Back|kbd=True|offscreen=False
+Text|Settings|kbd=True|offscreen=False
+Button|Appearance|kbd=True|offscreen=False
+Button|Activity history|kbd=True|offscreen=False
+Button|Notifications|kbd=True|offscreen=False
+Button|Agents|kbd=True|offscreen=False
+Button|Services|kbd=True|offscreen=False
+Button|About|kbd=True|offscreen=False
+Button|? Work mode.|kbd=True|offscreen=False
+Button|Resize window with arrow keys|kbd=True|offscreen=False
+Group|Menu|kbd=False|offscreen=False
+Button|Home|kbd=True|offscreen=False
+Button|Settings|kbd=True|offscreen=False

@@ -42,6 +42,8 @@ impl GitLab {
             updated: iso(&s(v, "updated_at")).unwrap_or(0),
             open: v["state"] == "opened",
             trusted: self.member(v["author"]["id"].as_u64().unwrap_or(0)),
+            // GitLab records no close reason: a closed issue is done (§ 1)
+            reason: None,
         }
     }
 
@@ -212,7 +214,17 @@ impl Board for GitLab {
     }
 
     fn url(&self, n: u64) -> String {
-        let repo = self.api.base.rsplit_once("/projects/").map(|x| x.1.replace("%2F", "/")).unwrap_or_default();
-        format!("{}/{repo}/-/issues/{n}", self.api.root.trim_end_matches("/api/v4"))
+        self.foreign_url(&self.api.base.rsplit_once("/projects/").map(|x| x.1.replace("%2F", "/")).unwrap_or_default(), n)
+    }
+
+    fn foreign(&self, repo: &str, n: u64) -> Result<Issue> {
+        let path = self.api.sibling("/projects/", repo).replace('/', "%2F");
+        let v = self.api.call("GET", &format!("{}/projects/{path}/issues/{n}", self.api.root), None)?.json()?;
+        // trust is for log entries; a dependency is judged only by its state
+        Ok(Issue { number: v["iid"].as_u64().unwrap_or(0), open: v["state"] == "opened", ..Default::default() })
+    }
+
+    fn foreign_url(&self, repo: &str, n: u64) -> String {
+        format!("{}/{}/-/issues/{n}", self.api.root.trim_end_matches("/api/v4"), self.api.sibling("/projects/", repo))
     }
 }

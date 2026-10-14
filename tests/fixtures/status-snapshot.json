@@ -35,6 +35,7 @@
       "attempt": null,
       "role": null,
       "deps": [],
+      "blocked": [],
       "card": null,
       "question": null,
       "failed": null
@@ -52,6 +53,7 @@
       "attempt": 3,
       "role": "worker",
       "deps": [],
+      "blocked": [],
       "card": "Done: read\nProblem: Which way?\n1. left\n2. right ★",
       "question": {
         "parsed": true,
@@ -95,6 +97,13 @@
       "deps": [
         3
       ],
+      "blocked": [
+        {
+          "ref": "#3",
+          "url": "https://board/3",
+          "reason": "open"
+        }
+      ],
       "card": null,
       "question": null,
       "failed": null
@@ -112,6 +121,7 @@
       "attempt": null,
       "role": null,
       "deps": [],
+      "blocked": [],
       "card": null,
       "question": null,
       "failed": "Reason: no login"

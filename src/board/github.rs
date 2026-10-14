@@ -46,6 +46,7 @@ fn parse_issue(v: &Value) -> Issue {
         updated: iso(&s(v, "updated_at")).unwrap_or(0),
         open: v["state"] == "open",
         trusted: trusted(v),
+        reason: v["state_reason"].as_str().map(String::from),
     }
 }
 
@@ -269,9 +270,16 @@ impl Board for GitHub {
     }
 
     fn url(&self, n: u64) -> String {
+        self.foreign_url(self.api.base.rsplit_once("/repos/").map(|x| x.1).unwrap_or_default(), n)
+    }
+
+    fn foreign(&self, repo: &str, n: u64) -> Result<Issue> {
+        Ok(parse_issue(&self.api.call("GET", &format!("{}/repos/{}/issues/{n}", self.api.root, self.api.sibling("/repos/", repo)), None)?.json()?))
+    }
+
+    fn foreign_url(&self, repo: &str, n: u64) -> String {
         let web = self.api.root.replace("api.github.com", "github.com").replace("/api/v3", "");
-        let repo = self.api.base.rsplit_once("/repos/").map(|x| x.1).unwrap_or_default();
-        format!("{web}/{repo}/issues/{n}")
+        format!("{web}/{}/issues/{n}", self.api.sibling("/repos/", repo))
     }
 }
 

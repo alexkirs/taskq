@@ -326,9 +326,10 @@ fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool
         // § 2: `hold` only as the first accepted entry; `start` leaves it
         (Ready, "hold", false) if first => t.state = Held,
         (Held, "start", false) => t.state = Ready,
-        // § 2 gate: set before work; only the owner (no attempt) approves, and only the current result
+        // § 2 gate: set before work; only the owner (no attempt) approves, and only the current result; an approval
+        // without a gate serves a `review-pr` project (§ 7)
         (Held | Ready, "gate", false) if t.gate.is_none() => t.gate = Some(Gate::Required),
-        (Review | Ask, "approve", false) if t.gate.is_some_and(|g| g != Gate::Approved) && l.args.len() == 1 && t.result.as_deref() == Some(l.args[0]) => {
+        (Review | Ask, "approve", false) if t.gate != Some(Gate::Approved) && l.args.len() == 1 && t.result.as_deref() == Some(l.args[0]) => {
             t.gate = Some(Gate::Approved)
         }
         (Ready, "spawn", false) if l.args.len() == 3 && l.args[0] == "worker" => {
@@ -370,7 +371,7 @@ fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool
             t.state = Closed;
         }
         (Ask, "answer", _) if !l.bare || pick(t.card.as_deref().unwrap_or(""), l.args[0]).is_some() => {
-            if !own && t.gate.is_some() {
+            if !own {
                 let card = t.card.as_deref().unwrap_or("");
                 let k = if l.bare { pick(card, l.args[0]) } else { l.args.first().and_then(|s| s.parse().ok()) };
                 if options(card).iter().any(|(n, option, _)| Some(*n) == k

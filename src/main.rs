@@ -148,13 +148,16 @@ fn load(root: &Path) -> Res<(Config, Value)> {
         None => vec!["-s".into(), "danger-full-access".into()],
     };
     let board = board::kind(&str_or("board", "github"))?;
+    let (publish, delivery, delivery_revision) = delivery(&v)?;
     let cfg = Config {
         root: root.to_path_buf(),
         install: platform::default_install(),
         board,
         web_host: str_or("host", board.default_host),
         repo: str_or("repo", ""),
-        publish: str_or("publish", "pr"),
+        publish,
+        delivery,
+        delivery_revision,
         me,
         limits,
         has,
@@ -169,6 +172,32 @@ fn load(root: &Path) -> Res<(Config, Value)> {
         return Err("taskq.json: repo is required".into());
     }
     Ok((cfg, v))
+}
+
+/// § 7 delivery: `(publish mode, preset, revision)`. Absent, `publish` names the preset at revision 0; a preset
+/// never changes by itself, so `publish: pr` stays `auto-merge`.
+fn delivery(v: &Value) -> Res<(String, String, u64)> {
+    let publish = v["publish"].as_str();
+    if v["delivery"].is_null() {
+        return Ok(match publish.unwrap_or("pr") {
+            "direct" => ("direct".into(), "direct".into(), 0),
+            _ => ("pr".into(), "auto-merge".into(), 0),
+        });
+    }
+    let d = &v["delivery"];
+    let revision = d["revision"].as_u64().ok_or("taskq.json: delivery.revision must be a whole number")?;
+    let preset = d["preset"].as_str().unwrap_or_default();
+    let mode = match preset {
+        "auto-merge" | "review-pr" => "pr",
+        "direct" => "direct",
+        // ponytail: B3 pending-handoff states come first; until then these presets cannot finish a task
+        "local" | "push-branch" => return Err(format!("taskq.json: delivery.preset {preset} is not available yet: a result needs a published SHA")),
+        _ => return Err(format!("taskq.json: delivery.preset {preset:?}: use auto-merge, review-pr or direct")),
+    };
+    if publish.is_some_and(|p| p != mode) {
+        return Err(format!("taskq.json: publish {} disagrees with delivery.preset {preset}", publish.unwrap_or_default()));
+    }
+    Ok((mode.into(), preset.into(), revision))
 }
 
 fn ctx() -> Res<Ctx> {
@@ -500,7 +529,7 @@ fn service_run(c: &Ctx) -> Res<()> {
     let cfg = &c.cfg;
     let exe = launcher(&cfg.install);
     let board_env = cfg.board.worker_env(&platform::tool(&cfg.install), &cfg.web_host)?;
-    let env = runtime::Env { board_env: &board_env, root: &cfg.root, exe: &exe, install: &cfg.install, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.publish };
+    let env = runtime::Env { board_env: &board_env, root: &cfg.root, exe: &exe, install: &cfg.install, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.delivery };
     let start = |l: &runtime::Launch| runtime::spawn(&env, l);
     let mut s = Service::new(c.board.as_ref(), cfg, platform::VERSION, Box::new(start));
     s.instance = enrollment::installation_id(&cfg.install).map(|id| service_id(&id))?;
@@ -1822,6 +1851,8 @@ mod tests {
             web_host: String::new(),
             repo: "o/r".into(),
             publish: "pr".into(),
+            delivery: "auto-merge".into(),
+            delivery_revision: 0,
             me: "mac".into(),
             limits: BTreeMap::new(),
             has: vec![],
@@ -2072,6 +2103,41 @@ mod tests {
         assert_eq!(current(b, code).unwrap().1.state, State::Ready, "the approved spec frees the coding task");
     }
 
+    // Chain: § 7 delivery preset -> owner approval of the exact SHA -> publication receipt. Risk: `publish: pr` turns
+    // into review-pr silently, a review-pr result publishes unapproved or on a stale approval, or the receipt omits the policy.
+    #[test]
+    fn review_pr_publishes_only_the_approved_sha_and_names_the_policy() {
+        let preset = |v: Value| delivery(&v).map(|(m, p, r)| format!("{m} {p} {r}"));
+        assert_eq!(preset(json!({})).unwrap(), "pr auto-merge 0");
+        assert_eq!(preset(json!({"publish": "pr"})).unwrap(), "pr auto-merge 0", "no silent pr to review-pr");
+        assert_eq!(preset(json!({"publish": "direct"})).unwrap(), "direct direct 0");
+        assert_eq!(preset(json!({"delivery": {"preset": "review-pr", "revision": 3}})).unwrap(), "pr review-pr 3");
+        assert!(preset(json!({"delivery": {"preset": "local", "revision": 1}})).unwrap_err().contains("not available"));
+        assert!(preset(json!({"delivery": {"preset": "review-pr"}})).unwrap_err().contains("revision"));
+        assert!(preset(json!({"publish": "direct", "delivery": {"preset": "review-pr", "revision": 1}})).unwrap_err().contains("disagrees"));
+        let c = Config { delivery: "review-pr".into(), delivery_revision: 3, ..cfg() };
+        let b = Fake::default();
+        let n = b.create("T", "## Goal\ng", &["taskq".into()]).unwrap();
+        let (one, two) = ("0123456789abcdef0123456789abcdef01234567", "89abcdef0123456789abcdef0123456789abcdef");
+        let work = |sha: &str| {
+            b.comment(n, &entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
+            let a = fold(n, &entries(&b, n).unwrap(), false).attempt.unwrap();
+            b.comment(n, &entry("result", &[sha], Some(a), "")).unwrap();
+        };
+        work(one);
+        let r = close_one(&b, &c, n, "ok", &Op::default());
+        assert!(!r.ok() && r.reason.contains("gate is required"), "{}", r.text());
+        assert!(dispatch::approve(&b, &c.root, n, Some(&one[..7]), &Op::default(), false).ok());
+        // a new SHA invalidates the approval
+        act(&b, &c.root, n, "requeue", &[], "redo", &Op::default());
+        work(two);
+        let r = close_one(&b, &c, n, "ok", &Op::default());
+        assert!(!r.ok() && r.reason.contains("gate is stale") && b.issue(n).unwrap().open, "{}", r.text());
+        assert!(!dispatch::approve(&b, &c.root, n, Some(&one[..7]), &Op::default(), false).ok(), "the old SHA is not the candidate");
+        assert!(dispatch::approve(&b, &c.root, n, Some(&two[..7]), &Op::default(), false).ok());
+        assert_eq!(close_one(&b, &c, n, "ok", &Op::default()).text(), format!("#{n} closed\ndelivery review-pr r3: merged {two}"));
+    }
+
     #[test]
     fn add_renders_the_task_body_and_rejects_over_limit_text() {
         let c = Ctx { cfg: cfg(), raw: json!({}), board: Box::new(Fake::default()) };
@@ -2227,7 +2293,7 @@ mod tests {
         assert_eq!(fold(n, &entries(&b, n).unwrap(), false).state, State::Review, "pending CI changes nothing");
         b.state.borrow_mut().publish = String::new();
         assert!(answer_picks(&b, &c, &[format!("{n}.3")], &Op::default()).is_err(), "picks are checked before writing");
-        assert_eq!(answer_picks(&b, &c, &[format!("{n}.1")], &Op::default()).unwrap().iter().map(Receipt::text).collect::<Vec<_>>(), vec![format!("#{n} closed\nmerged 0123456789abcdef0123456789abcdef01234567")]);
+        assert_eq!(answer_picks(&b, &c, &[format!("{n}.1")], &Op::default()).unwrap().iter().map(Receipt::text).collect::<Vec<_>>(), vec![format!("#{n} closed\ndelivery auto-merge r0: merged 0123456789abcdef0123456789abcdef01234567")]);
         let i = b.issue(n).unwrap();
         assert!(!i.open && !i.labels.iter().any(|l| l.starts_with("q-")));
     }

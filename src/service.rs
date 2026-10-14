@@ -16,7 +16,11 @@ pub struct Config {
     pub board: &'static crate::board::Kind,
     pub web_host: String,
     pub repo: String,
+    /// Publication mode `direct|pr`, from the delivery preset (§ 7).
     pub publish: String,
+    /// § 7 delivery preset and its policy revision.
+    pub delivery: String,
+    pub delivery_revision: u64,
     pub me: String,
     pub limits: BTreeMap<String, u32>,
     /// What this host offers for `needs-<x>` labels.
@@ -958,6 +962,8 @@ mod tests {
             web_host: String::new(),
             repo: "o/r".into(),
             publish: "pr".into(),
+            delivery: "auto-merge".into(),
+            delivery_revision: 0,
             me: me.into(),
             limits: BTreeMap::from([("claude".to_string(), 1)]),
             has: vec![],

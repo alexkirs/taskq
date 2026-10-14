@@ -214,7 +214,7 @@ pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume:
     }
     let board_env = cfg.board.worker_env(&crate::platform::tool(&cfg.install), &cfg.web_host)?;
     let exe = cfg.install.join(crate::platform::tool(&cfg.install).exe_name());
-    let env = crate::runtime::Env { root, exe: &exe, install: &cfg.install, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.publish, board_env: &board_env };
+    let env = crate::runtime::Env { root, exe: &exe, install: &cfg.install, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.delivery, board_env: &board_env };
     let l = crate::runtime::Launch { task: 0, title: name.into(), attempt: 0, role: "operator".into(), rt: rt.into(),
         session: resume.map(String::from).unwrap_or_else(|| crate::runtime::new_session(rt)), url: String::new(), resume: resume.map(String::from) };
     // § 8 Access: the operator runs under the same grants as workers

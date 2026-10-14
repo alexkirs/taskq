@@ -1,0 +1,36 @@
+// Chain: board snapshot -> shared summary/rows -> tray/browser navigation. Risk: duplicate counts, invented totals,
+// drifted assets, unsafe links or counters triggering project navigation. No live board/native claim.
+const fs=require('node:fs'),assert=require('node:assert/strict'),crypto=require('node:crypto');
+const q=require('../src/project-blocks.js'),fx=require('./fixtures/project-blocks.json');
+const p=fx.project,row=fx.row;
+let got=q.observation([{...p,tasks:[row]},{...p,id:'second-registration',tasks:[row]}]);
+assert.equal(got.counts.doing,1);assert.equal(got.counts.review,0);assert.deepEqual(got.partial,[]);
+assert.equal(q.observation([{...p,tasks:[row]},{...p,tasks:[{...row,state:'review'}]}]).counts.doing,null);
+assert.equal(q.observation([{...p,complete:false}]).counts.ready,null);
+assert.equal(q.observation([{...p,closed:undefined}]).counts.closed,null,'open snapshots never invent Closed');
+assert.equal(q.observation([{...p,closed:12},{...p,closed:12}]).counts.closed,12);
+assert.equal(q.observation([{...p,closed:12},{...p,closed:11}]).counts.closed,null);
+assert.equal(q.observation([{...p,closed:12},{...p,board:{...p.board,url:'https://gitlab.example/o/r/-/issues'},closed:100}]).counts.closed,112);
+assert.equal(q.observation([{...p,closed:1},{...p,closed:0}]).counts.closed,null,'conflicting reopen observations are unknown');
+assert(!q.summary(p).includes('tqp-counts'),'known zero shows identity only');
+assert(q.summary({...p,complete:false}).includes('Partial:'));
+assert(q.summary({...p,closed:undefined}).includes('Closed: unknown'));
+assert(q.task(p,{...row,title:'<script>alert(1)</script>',url:'javascript:alert(1)'}).includes('&lt;script&gt;'));
+assert(!q.task(p,{...row,url:'javascript:alert(1)'}).includes('href="javascript:'));
+assert(!q.task(p,{...row,local_session:false}).includes('codex://'));
+assert(q.task(p,{...row,local_session:false}).includes('Remote session'));
+for(const provider of ['github','gitlab'])assert(q.summary({...p,board:{...p.board,kind:provider}}).includes('data-icon="'+provider+'"'));
+const actions=[],adapter={project:id=>actions.push(['project',id]),tasks:(id,st)=>actions.push(['tasks',id,st]),open:u=>actions.push(['open',u])};
+function click(dataset){let prevented=false;assert(q.handle({target:{closest:()=>({dataset,getAttribute:()=>dataset.url})},preventDefault(){prevented=true;}},adapter));assert(prevented);}
+click({tqp:'tasks',project:p.id,state:'review'});click({tqp:'project',project:p.id});click({url:row.url});
+assert.deepEqual(actions,[['tasks',p.id,'review'],['project',p.id],['open',row.url]]);
+const manifest=require('../docs/design/project-blocks.sources.json');
+assert.equal(Object.keys(manifest.icons).length,16);
+for(const [file,hash] of Object.entries(manifest.files))assert.equal(crypto.createHash('sha256').update(fs.readFileSync(file,'utf8').replace(/\r\n/g,'\n')).digest('hex'),hash,file);
+for(const [name,hash] of Object.entries(manifest.icons))assert.equal(crypto.createHash('sha256').update(q.assets[name]).digest('hex'),hash,name);
+for(const name of ['github','gitlab','claude','openai'])assert.equal(q.assets[name],fs.readFileSync('docs/design/assets/'+name+'.svg','utf8').replace(/\r\n/g,'\n'));
+const tray=fs.readFileSync('src/tray.html','utf8'),rust=fs.readFileSync('src/tray.rs','utf8'),release=fs.readFileSync('.github/workflows/release.yml','utf8');
+for(const asset of ['JS','CSS'])assert(tray.includes('{{PROJECT_BLOCKS_'+asset+'}}'));
+for(const file of ['project-blocks.js','project-blocks.css'])assert(rust.includes('include_str!("'+file+'")')&&release.includes('cp src/'+file));
+assert(tray.includes('TaskqProjectBlocks.task(')&&tray.includes('TaskqProjectBlocks.summary(')&&tray.includes('TaskqProjectBlocks.aggregate(')&&tray.includes('TaskqProjectBlocks.handle('));
+console.log('PASS shared counts, dedup/conflict/partial/Closed, safe links, local/remote sessions, independent navigation, provider assets, provenance and native/release wiring');

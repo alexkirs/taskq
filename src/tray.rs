@@ -305,13 +305,15 @@ fn project(root: &str) -> Value {
         Some(json!([w.first()?.parse::<i64>().ok()?, w.get(2)?, w.get(3)?]))
     }).collect();
     // the local host's saved capacity, for `Edit limits` and its readback (§ 4 Capacity)
-    let (cap_host, cap_saved) = match crate::load(r) {
-        Ok((c, v)) => (json!(c.me), crate::service::capacity(&v, &c.me).map(|x| x.json()).unwrap_or_else(|e| json!({"error": e}))),
-        Err(e) => (Value::Null, json!({"error": e})),
+    let (cap_host, cap_saved, board_kind) = match crate::load(r) {
+        Ok((c, v)) => (json!(c.me), crate::service::capacity(&v, &c.me).map(|x| x.json()).unwrap_or_else(|e| json!({"error": e})), json!(c.board.name)),
+        Err(e) => (Value::Null, json!({"error": e}), Value::Null),
     };
-    let tasks = s["tasks"].as_array().cloned().unwrap_or_default();
+    let mut tasks = s["tasks"].as_array().cloned().unwrap_or_default();
+    for task in &mut tasks { task_session(r, cap_host.as_str().unwrap_or(""), task); }
     json!({"root": root, "name": s["project"].as_str().map(String::from).unwrap_or_else(|| crate::project_name(r)),
-        "issues": s["issues"].as_str().unwrap_or(""), "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
+        "issues": s["issues"].as_str().unwrap_or(""), "board_kind": board_kind, "closed": Value::Null,
+        "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
         "complete": crate::snapshot::complete(&s) && age.is_some_and(|a| a < 300),
         "error": bad.map(Value::from).or_else(|| [&s["error"], &s["focus_error"]].into_iter().find(|e| e.is_string()).cloned()).unwrap_or(Value::Null), "focus": s["focus"].as_array().cloned().unwrap_or_default(), "saved": saved, "labels": crate::status_labels(r),
         "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"],
@@ -322,6 +324,32 @@ fn project(root: &str) -> Value {
 
 fn now() -> i64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Native adapter: the owning host may open its session; remote observations never invent a local link (M3).
+fn task_session(root: &Path, local: &str, row: &mut Value) {
+    let Some(object) = row.as_object_mut() else { return };
+    object.remove("session_url");
+    object.insert("local_session".into(), json!(false));
+    let session = row["session"].as_str().unwrap_or("").to_string();
+    let words: Vec<&str> = session.split_whitespace().collect();
+    let Some((rt, id)) = words.first().and_then(|s| s.split_once(':')) else { return };
+    let host = words.get(1).copied().unwrap_or("");
+    row["runtime"] = json!(rt);
+    row["host"] = json!(host);
+    row["local_session"] = json!(!local.is_empty() && host == local);
+    if local.is_empty() || host != local { return }
+    let id = if id == "-" && rt == "codex" {
+        let l = crate::runtime::Launch { task: row["n"].as_u64().unwrap_or(0), title: String::new(), attempt: row["attempt"].as_u64().unwrap_or(0),
+            role: row["role"].as_str().unwrap_or("").into(), rt: rt.into(), session: id.into(), url: String::new(), resume: None };
+        crate::runtime::codex_thread(&crate::runtime::log_path(root, &l)).unwrap_or_else(|| id.into())
+    } else { id.into() };
+    if id == "-" || id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') { return }
+    row["session_url"] = match rt {
+        "codex" | "codex-app" => json!(format!("codex://threads/{id}")),
+        "claude" => json!(format!("https://claude.ai/code/session_{id}")),
+        _ => Value::Null,
+    };
 }
 
 /// What the icon and the history show: in work, `ask`, ready, failed over all projects (one task per board and issue), whether
@@ -415,7 +443,8 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 let p = proxy.clone();
                 let built = b.build(target).map_err(|e| e.to_string()).and_then(|w| {
                     // only our page: a link goes to the browser through the bridge
-                    WebViewBuilder::new().with_html(HTML.replace("{{ANSWER_CARD_CSS}}", include_str!("answer-card.css")).replace("{{ANSWER_CARD_JS}}", include_str!("answer-card.js"))).with_navigation_handler(|u| !u.starts_with("http"))
+                    WebViewBuilder::new().with_html(HTML.replace("{{ANSWER_CARD_CSS}}", include_str!("answer-card.css")).replace("{{ANSWER_CARD_JS}}", include_str!("answer-card.js"))
+                        .replace("{{PROJECT_BLOCKS_CSS}}", include_str!("project-blocks.css")).replace("{{PROJECT_BLOCKS_JS}}", include_str!("project-blocks.js"))).with_navigation_handler(|u| !u.starts_with("http"))
                         .with_ipc_handler(move |r| {
                             let _ = p.send_event(Ev::Ipc(r.into_body()));
                         })
@@ -1395,5 +1424,27 @@ mod tests {
         assert_eq!(kind(&pass).0, "taskq");
         assert_eq!(kind(&|_: &Path| Err("taskq.json: repo is required".into())), ("old".into(), "taskq.json: repo is required".into()), "the verified reason");
         let _ = fs::remove_dir_all(&d);
+    }
+    // Chain: canonical session -> native row -> shared task link. Risk: a remote/starting observation opens locally.
+    #[test]
+    fn project_row_links_only_owned_valid_sessions() {
+        let mut row = json!({"n": 938, "session": "codex:valid-thread win"});
+        task_session(Path::new("."), "win", &mut row);
+        assert_eq!(row["session_url"], "codex://threads/valid-thread");
+        assert_eq!(row["runtime"], "codex");
+        let mut remote = json!({"session": "claude:valid-thread mac"});
+        task_session(Path::new("."), "win", &mut remote);
+        assert_eq!(remote["local_session"], false);
+        assert!(remote["session_url"].is_null());
+        let mut invalid = json!({"session": "claude:bad/path win"});
+        task_session(Path::new("."), "win", &mut invalid);
+        assert!(invalid["session_url"].is_null());
+        let mut local = json!({"session": "claude:valid-thread win"});
+        task_session(Path::new("."), "win", &mut local);
+        assert_eq!(local["session_url"], "https://claude.ai/code/session_valid-thread");
+        let mut starting = json!({"session": "claude:- win", "session_url": "https://unverified.example"});
+        task_session(Path::new("."), "win", &mut starting);
+        assert!(starting["session_url"].is_null());
+        task_session(Path::new("."), "win", &mut Value::Null);
     }
 }

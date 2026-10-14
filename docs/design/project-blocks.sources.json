@@ -1,0 +1,34 @@
+{
+  "component": "project-blocks",
+  "icons": {
+    "circle-x": "3336619cb53a8fb013b505e30858506b30e7799f9206f849e4a491df41a7a599",
+    "clock": "b48d439afc267b7c3b0642bea04dcd1ab330cc24429f263a5cd3106d9fb3bb48",
+    "folder": "9761f73542a636c2f4a1a6b3fcf8b2fa6ce9ff51b4f2344e744d73d0b5eb0ce9",
+    "check": "e258712676bfb048077cef6ac8b96c603ebdc07e0c67c21314ab07446c598ad6",
+    "gitlab": "c7c39058bd1b6f9f40334383bd5136bb8c5ba5e6a24200f2d1f18365e2526e28",
+    "git-pull-request": "4ecdd57d17ee5218cc651e554d17becb7626ab3bec823d951fb627a3e36c091b",
+    "openai": "2b4a04ddc2395b20d168694d3850ce2050a702c4a0cdeb4d8b31b9a970481a8c",
+    "play": "ba893bd6736e802250e1defd89c74b024453627396d98e03b04525151c85111a",
+    "terminal": "eb5483fed335ee6ae61f0958c7eb156157b473f7ff30250cc8c18652b21e66cd",
+    "message-circle-question": "6424eba2063646f684abf25a79627bb2e82e1e8a656434f8b6b9aad2d1e5e591",
+    "github": "3bf8cceead820aec50d4ee825a3fd02c5a1cd6665cc9cf4cbf3d9c8861a204bb",
+    "circle": "bf1479c5c55992b40eeb08c661b56de55bbb1a0712fa40f9b00e9319cf9eab9e",
+    "pin": "00e572cd926a43fb85c22d5d37b6f612a04ad44a638be4bded7cb29a99f7b920",
+    "link": "06a12849eed172bf92c5c97f4a37c9a83d73949ab374eb3bfc5a2dea2e3a4732",
+    "network": "5de295b47805f773d478a6bc49aaef7af90d274e635fb9987714283eab8d8319",
+    "claude": "2d6fda79eb18ddccca35b799eeb3cece0dfabc22520ce3b10abd25668df9fa93"
+  },
+  "lucide": "1.17.0",
+  "mergedDesignRevision": "cf46e637d45f971dc83f1c1ea5f1e9a119a74256",
+  "schema": 1,
+  "designRevision": "75757d5d843159726a2ea44ca1615f9cf7fd18fd",
+  "files": {
+    "tests/fixtures/project-blocks.json": "48b22ee923e8acf8bd4620aef9696db7a0e3a8ee520335cf3a8a71f50617c760",
+    "docs/design/visual-style.md": "de25079933c4201e5a32619201111778678eade057c263a0882d4c37237f4dfb",
+    "src/project-blocks.js": "8e76f224c87ba17500b671430d92fe5515db86ee0f2fb481ee6bc75bdc44220b",
+    "docs/design/menu-next-variants.html": "2205510067e4d906e5d4fd9cf3c981575813e9a48cc0a6134682a3e9df928dfa",
+    "src/project-blocks.LICENSE": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57",
+    "src/project-blocks.css": "e7f1bed63cfd6038c7accadef3594df2c56112ddbabd4eadb544d0a63ffc1c26"
+  },
+  "hashEncoding": "UTF-8, LF (canonical release source; checkout CRLF normalized)"
+}

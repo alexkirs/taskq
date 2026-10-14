@@ -19,14 +19,9 @@ details[open]>summary:after{transform:rotate(90deg)}
 .muted,.meta{color:var(--muted);font-size:max(12px,.85em)}
 .group{border-top:1px solid var(--edge);margin-top:5px;padding-top:5px}
 .body{padding:5px 4px;line-height:1.45;overflow-wrap:anywhere}
-.task{display:grid;grid-template-columns:14px 4ch minmax(0,1fr);gap:7px;align-items:center;min-height:32px;padding:5px 4px;line-height:1.3;border-radius:4px}
-.task.global{grid-template-columns:14px 6ch 4ch minmax(0,1fr)}
-.task:hover,.task:focus-visible,.project:hover,.project:focus-visible{background:light-dark(#e9edf1,#37424c)}
-.title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.num{font-size:.85em;color:var(--muted);font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.project:hover,.project:focus-visible{background:light-dark(#e9edf1,#37424c)}
 .project{width:100%;border:0;display:grid;grid-template-columns:minmax(0,1fr) auto 8px;gap:6px;align-items:center;text-align:left;min-height:33px;padding:5px 4px}
 .project>span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.counts{display:flex;gap:4px;align-items:center;justify-content:flex-end}
 .counter{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:22px;padding:0 5px;border-radius:999px;font-size:max(12px,.8em);font-variant-numeric:tabular-nums;font-weight:500;line-height:1}
 .counter.filled{background:color-mix(in srgb,currentColor 23%,var(--surface))}
 .counter.zero{color:var(--muted);background:light-dark(#eff1f3,#2b3138)}
@@ -50,15 +45,13 @@ button:disabled{color:var(--muted);opacity:.75}
 .bars span.unknown{border:1px dashed var(--edge);border-bottom:0}
 .range{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 6px;align-items:center;padding:4px}
 .range input,.range select{font:inherit;font-size:.9em;min-width:0;color:inherit;background:none;border:1px solid var(--edge);border-radius:4px;padding:3px}
-/* large text may wrap a title (menu.md M3); 14 and 16 px ellipsize */
-.big .title{white-space:normal;overflow-wrap:anywhere}.big .task.global{grid-template-columns:12px 5ch 4ch minmax(0,1fr);gap:4px}
-@media(pointer:coarse){.task,button,summary{min-height:44px}}
-</style><style>{{ANSWER_CARD_CSS}}</style></head><body><div class="menu" role="menu"></div>
+@media(pointer:coarse){button,summary{min-height:44px}}
+</style><style>{{ANSWER_CARD_CSS}}</style><style>{{PROJECT_BLOCKS_CSS}}</style></head><body><div class="menu" role="menu"></div>
 <script>{{ANSWER_CARD_JS}}</script>
+<script>{{PROJECT_BLOCKS_JS}}</script>
 <script>
 (()=>{
 const names={doing:'In work',review:'Review',ask:'Waiting for answer',failed:'Failed',ready:'Ready',waiting:'Dependencies',later:'Later'};
-const symbols={doing:'▶',review:'↻',ask:'?',failed:'!',ready:'○',waiting:'⋯',later:'Ⅱ'};
 const color=st=>({doing:'work',review:'work',ask:'ask',failed:'failed',ready:'ready'}[st]||'muted');
 const periods={'5m':'5 min','1h':'Hour','1d':'Day','1w':'7 days','1mo':'30 days',custom:'Custom'};
 const zone=Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -66,7 +59,7 @@ const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'
 const send=m=>window.ipc&&window.ipc.postMessage(JSON.stringify(m));
 const menu=document.querySelector('.menu');
 let aiText=null,aiMenu=false,aiConfirm=null,addConfirm=false;
-let S=null,page='home',homeScroll=0,ask=null,pending={},confirming=null,updating=null,draft=null,capedit=null,capmsg={};
+let S=null,page='home',taskFilter=null,homeScroll=0,ask=null,pending={},confirming=null,updating=null,draft=null,capedit=null,capmsg={};
 // Task answers: the native bridge owns credentials and canonical dispatch/readback.
 const answerRequests=new Map(),answerCards=new Map();
 function answerCapability(board){const p=S&&S.projects.find(p=>p.issues===board);return {answer:!!p&&p.alive&&p.complete!==false,reason:'Project status is unavailable or stale; check the board'};}
@@ -104,15 +97,15 @@ function mountAnswers(){
   for(const key of answerCards.keys())if(!keys.has(key))answerCards.delete(key);
 }
 // one task per board and issue: `issues` names provider, host and repo (M2)
-function tasks(p){return p.tasks.map(t=>({...t,project:p.name,key:p.issues+'/'+t.n,url:p.issues+'/'+t.n}));}
+function tasks(p){return p.tasks.map(t=>({...t,project:p.name,key:p.issues+'/'+t.n,url:t.url||p.issues+'/'+t.n}));}
+function blockProject(p){return {id:p.root,name:p.name,board:{url:p.issues,kind:p.board_kind},complete:p.complete===true,closed:p.closed,tasks:tasks(p)};}
 function unique(ts){return [...new Map(ts.map(t=>[t.key,t])).values()];}
 function counts(ts){ts=unique(ts);const n=f=>ts.filter(t=>f.includes(t.state)).length;return {work:n(['doing','review']),ask:n(['ask']),ready:n(['ready']),failed:n(['failed'])};}
 function mode(p){return p.focus.length?'run':p.saved?'paused':'watch';}
 function counter(v,kind,label){return '<span class="counter '+(v>0?kind+' filled':'zero')+'" aria-label="'+esc(label+': '+v)+'" title="'+esc(label)+'">'+v+'</span>';}
 // an incomplete or stale snapshot has unknown counts, never zero (§ 4)
 function known(ps){return ps.every(p=>p.complete!==false);}
-function countMarkup(c,ok=true){if(!ok)return '<span class="counts meta">unknown</span>';return '<span class="counts">'+counter(c.work,'work','In work')+counter(c.ask,'ask','Waiting for answer')+counter(c.ready,'ready','Ready')+'</span>';}
-function taskRow(t,global){return '<a class="task'+(global?' global':'')+'" href="'+esc(t.url)+'" data-url="'+esc(t.url)+'" role="menuitem" aria-label="'+esc(t.project+' #'+t.n+' '+t.title+'; '+names[t.state])+'" title="'+esc(t.title)+'"><span class="'+color(t.state)+'" aria-hidden="true">'+symbols[t.state]+'</span>'+(global?'<span class="num">'+esc(t.project)+'</span>':'')+'<span class="num">#'+esc(t.n)+'</span><span class="title">'+esc(t.title)+'</span></a>'+answerSlot(t);}
+function taskRow(t,global){const p=S.projects.find(p=>p.issues+'/'+t.n===t.key);return TaskqProjectBlocks.task(blockProject(p),t,global)+answerSlot(t);}
 function globalGroup(st,ts){ts=ts.filter(t=>t.state===st);return ts.length?'<details class="group"><summary><span class="'+color(st)+'">'+names[st]+'</span>'+counter(ts.length,color(st),names[st])+'</summary>'+ts.map(t=>taskRow(t,true)).join('')+'</details>':'';}
 function age(s){return s<120?s+' s':s<7200?Math.round(s/60)+' min':s<172800?Math.round(s/3600)+' h':Math.round(s/86400)+' d';}
 // service error and stale status.json are not failed tasks (M-A10)
@@ -231,7 +224,7 @@ function home(){
   h+=S.projects.map(p=>problem(p)+incident(p,true)+incidentNotice(p)).join('');
   if(S.settings_error)h+='<div class="body alert" role="alert">⚠ Settings unknown: '+esc(S.settings_error)+'; defaults shown</div>';
   h+=globalGroup('ask',unique(all))+globalGroup('failed',unique(all));
-  h+='<div class="group"><div class="row meta">Projects</div>'+(S.projects.length?S.projects.map(p=>'<button class="project" data-page="'+esc(p.root)+'" role="menuitem"><span title="'+esc(p.name)+'">'+esc(p.name)+(mode(p)==='run'?'':' <span class="meta">'+(mode(p)==='paused'?'Ⅱ':'observation')+'</span>')+'</span>'+countMarkup(counts(tasks(p)),known([p]))+'<span aria-hidden="true">›</span></button>').join(''):'<div class="body meta">No projects yet</div>')+addProject()+'</div>';
+  h+='<div class="group">'+TaskqProjectBlocks.aggregate(S.projects.map(blockProject))+'<div class="row meta">Projects</div>'+(S.projects.length?S.projects.map(p=>TaskqProjectBlocks.summary(blockProject(p))+'<div class="body meta">'+esc(modeText(p))+'</div>').join(''):'<div class="body meta">No projects yet</div>')+addProject()+'</div>';
   h+=history();
   if(held.length&&run.length)h+='<div class="row meta">Paused '+held.length+' of '+(held.length+run.length)+': '+esc(held.map(p=>p.name).join(', '))+'</div>';
   h+=bulk(run,held);
@@ -294,9 +287,15 @@ function capacity(p){
     '<div class="options"><button data-a="capapply" data-root="'+esc(p.root)+'">Apply…</button><button data-a="capcancel">Cancel</button></div></details>';}
 function project(p){
   const ts=tasks(p);
-  return '<button data-a="back">‹ All projects</button><div class="row"><strong title="'+esc(p.root)+'">'+esc(p.name)+'</strong>'+countMarkup(counts(ts),known([p]))+'</div><div class="body meta">'+esc(modeText(p))+'</div>'+problem(p)+incident(p,true)+incidentNotice(p)+
+  return '<button data-a="back">‹ All projects</button>'+TaskqProjectBlocks.summary(blockProject(p))+'<div class="body meta">'+esc(modeText(p))+'</div>'+problem(p)+incident(p,true)+incidentNotice(p)+
   (['ask','failed','doing','review','ready','waiting','later'].map(st=>{const r=ts.filter(t=>t.state===st);return r.length?'<div class="group"><div class="row meta"><span>'+names[st]+'</span>'+counter(r.length,color(st),names[st])+'</div>'+r.map(t=>taskRow(t)).join('')+'</div>':'';}).join('')||'<div class="body muted">No open tasks</div>')+
   '<div class="group">'+(p.issues?'<a class="project" href="'+esc(p.issues)+'" data-url="'+esc(p.issues)+'"><span>Board ↗</span><span></span><span></span></a>':'')+admission(p)+'</div>'+capacity(p)+service(p);}
+function filteredTasks(p){
+  const ps=p?[p]:S.projects,rows=unique(ps.flatMap(tasks)).filter(t=>t.state===taskFilter),name=TaskqProjectBlocks.states.find(s=>s[0]===taskFilter)[1];
+  return '<button data-a="back">‹ All projects</button><div class="body">'+esc((p?p.name:'All projects')+' · '+name)+'</div>'+(p?TaskqProjectBlocks.summary(blockProject(p)):TaskqProjectBlocks.aggregate(ps.map(blockProject)))+
+    (known(ps)?'':'<div class="body meta">Partial: refresh the affected project or open its Board.</div>')+
+    (taskFilter==='closed'?'<div class="body meta">Closed total and task list unknown: open the Board for authoritative closed tasks.</div>'+ps.map(p=>TaskqProjectBlocks.summary(blockProject(p))).join(''):rows.map(t=>taskRow(t,!p)).join('')||'<div class="body meta">'+(known(ps)?'No tasks':'Tasks unknown')+'</div>');
+}
 // pin (menu.md M13): the same menu as a movable window; the header is its drag handle
 function head(){return '<div class="row head"><span class="meta">taskq</span><button data-a="pin" aria-pressed="'+!!S.pinned+'" title="'+(S.pinned?'Unpin: back to the popover':'Pin: keep open as a movable window')+'">'+(S.pinned?'Pinned':'Pin')+'</button></div>';}
 function render(){
@@ -307,9 +306,9 @@ function render(){
   const open=[...menu.querySelectorAll('details')].map(d=>d.open),p=S.projects.find(p=>p.root===page);
   if(!p)page='home';
   document.documentElement.style.colorScheme=S.theme||'light dark';
-  menu.style.setProperty('--size',S.font+'px');menu.classList.toggle('big',S.font>=18);
+  menu.style.setProperty('--size',S.font+'px');
   menu.classList.toggle('pinned',!!S.pinned);
-  menu.innerHTML=head()+(p?project(p):home());
+  menu.innerHTML=head()+(taskFilter?filteredTasks(p):p?project(p):home());
   mountAnswers();
   menu.querySelectorAll('details').forEach((d,i)=>d.open=open[i]||false);
   if(S.page!==undefined)menu.querySelectorAll('.hist,.agents,.service,.incident-notice').forEach(d=>d.open=true);
@@ -332,10 +331,10 @@ window.taskq={receive(s){
 menu.addEventListener('click',e=>{
   const cardLink=e.target.closest('.qac a');if(cardLink){e.preventDefault();send({a:'open',url:cardLink.getAttribute('href')});return;}
   if(e.target.closest('.qac'))return;
+  if(TaskqProjectBlocks.handle(e,{open:url=>send({a:'open',url}),project:id=>{homeScroll=document.scrollingElement.scrollTop;taskFilter=null;page=id;ask=null;render();document.scrollingElement.scrollTop=0;},tasks:(id,state)=>{homeScroll=document.scrollingElement.scrollTop;page=id||'home';taskFilter=state;render();document.scrollingElement.scrollTop=0;}}))return;
   const a=e.target.closest('a[data-url]');if(a){e.preventDefault();send({a:'open',url:a.dataset.url});return;}
   const b=e.target.closest('button');if(!b||b.disabled)return;const d=b.dataset;
-  if(d.page){homeScroll=document.scrollingElement.scrollTop;page=d.page;ask=null;render();document.scrollingElement.scrollTop=0;return;}
-  if(d.a==='back'){page='home';render();document.scrollingElement.scrollTop=homeScroll;return;}
+  if(d.a==='back'){page='home';taskFilter=null;render();document.scrollingElement.scrollTop=homeScroll;return;}
   if(d.set==='period'&&d.v==='custom'){const H=S.history;draft={start:local(H.start,H.tz),end:local(H.end,H.tz),tz:H.tz,error:''};render();return;}
   if(d.set){S[d.set]=d.set==='font'?Number(d.v):d.v;if(d.set==='period')draft=null;send({a:'set',[d.set]:S[d.set]});render();return;}
   if(d.a==='range'){

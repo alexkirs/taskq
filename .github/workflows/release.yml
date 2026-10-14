@@ -46,6 +46,11 @@ jobs:
             cp src/answer-card.js "dist/taskq-$VER-answer-card.js"
             cp src/answer-card.css "dist/taskq-$VER-answer-card.css"
             cp tests/fixtures/answer-card.json "dist/taskq-$VER-answer-card-fixtures.json"
+            cp src/project-blocks.js "dist/taskq-$VER-project-blocks.js"
+            cp src/project-blocks.css "dist/taskq-$VER-project-blocks.css"
+            cp src/project-blocks.LICENSE "dist/taskq-$VER-project-blocks.LICENSE"
+            cp tests/fixtures/project-blocks.json "dist/taskq-$VER-project-blocks-fixtures.json"
+            cp docs/design/project-blocks.sources.json "dist/taskq-$VER-project-blocks-sources.json"
           fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

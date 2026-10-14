@@ -8,7 +8,7 @@ Target for native implementation. Apply [shared F1–F6](https://github.com/task
 - `final-prototype.html`: interaction/layout candidate. `final-menu.html`: generated preview. Neither is production code.
 - Approved composition and feature decisions survive implementation. Candidate demo shortcuts do not: fixed demo heights, sample totals, synthetic links, simulated windows, static permission details.
 - Compact q assets and I1–I5 own icon identity. Use ordinary system numerals; no seven-segment substitute. Match ink bounds and pause overlay, not a rough silhouette.
-- Pin source/asset hashes in each acceptance report. Implementation must identify pending I5 decisions instead of silently selecting an overflow or bin policy.
+- Each acceptance report applies [F1](https://github.com/taskqorg/specq/blob/main/design/implementation-fidelity.md#f1-source-and-change-control). Implementation must identify pending I5 decisions instead of silently selecting an overflow or bin policy.
 
 ## R-UI2 Native menu sizing
 

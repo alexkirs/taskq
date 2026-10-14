@@ -1,7 +1,7 @@
 # README page plan
 
 Help a visitor set up TaskQ and understand how a request becomes reviewed work.
-[Product](../../taskq.md#product) owns these decisions (R13). Follow specq Core and Documentation; retain shipped-only claims and the 300-line contract limit.
+[Product](../../taskq.md#product) owns these decisions (R13). Follow specq [Core](https://github.com/taskqorg/specq/blob/main/caveman/rules/core.md) and [Documentation](https://github.com/taskqorg/specq/blob/main/caveman/rules/documentation.md); retain shipped-only claims and the 300-line contract limit.
 
 ## Page contract
 

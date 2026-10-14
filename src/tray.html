@@ -40,8 +40,9 @@ button:disabled{color:var(--muted);opacity:.75}
 .alert{color:var(--failed)}
 h1{font-size:1em;margin:6px 4px;overflow-wrap:anywhere}.footer{border-top:1px solid var(--edge);margin-top:6px}
 .head{position:sticky;top:0;z-index:10;background:var(--surface);min-height:28px;padding:2px 4px;cursor:grab}.head button{padding:2px 7px}.grip{position:fixed;right:0;bottom:0;width:18px;height:18px;z-index:11;cursor:nwse-resize;touch-action:none;background:linear-gradient(135deg,transparent 55%,var(--muted) 56%,var(--muted) 62%,transparent 63%,transparent 75%,var(--muted) 76%,var(--muted) 82%,transparent 83%)}
-/* Home keeps a bounded preview of the AI exchange (menu.md M7); controls stay below it */
+/* Home keeps a bounded preview of the AI exchange and of the proposed changes (menu.md M7); controls stay below them */
 .aichain{max-height:10em;overflow-y:auto;position:relative}
+.aiops{max-height:6.5em;overflow-y:auto}
 .askai{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px;padding:4px}
 .askai textarea{font:inherit;color:inherit;background:none;border:1px solid var(--edge);border-radius:4px;padding:5px;resize:vertical;min-width:0;-webkit-user-select:text;user-select:text}
 .askai button{align-self:start;min-width:34px}
@@ -219,7 +220,7 @@ function ai(){
   const A=S.ai,r=A.request,an=r&&r.answer||{},st=r?(an.state||'queued'):null,bad=['failed','refuse','apply failed'].includes(st);
   let h='<div class="group"><div class="row meta">✦ Ask AI · '+(A.target?'projects: '+esc(S.projects.map(p=>p.name).join(', ')):'no running service: cannot send')+'</div>';
   const chain=r?(r.chain||[r]):[];
-  if(r)h+='<div class="aichain" tabindex="0" aria-label="AI exchange" data-chain="'+esc(r.id+'/'+chain.length+'/'+st)+'">';
+  if(r)h+='<div class="aichain" tabindex="0" aria-label="AI exchange" data-bound="'+esc('chain/'+r.id+'/'+chain.length+'/'+st+'/'+S.font)+'">';
   for(const q of chain){
     const a=q.answer||{},state=a.state||'queued',bad=['failed','refuse','apply failed'].includes(state);
     h+='<div class="body"><div class="meta">'+(q.url?'<a href="'+esc(q.url)+'" data-url="'+esc(q.url)+'">Comment on #'+esc(q.task)+' ↗</a>: ':'You: ')+esc(q.text||'')+'</div><div class="'+(bad?'alert':state==='applied'||state==='result'?'work':'ask')+'" role="status">'+esc(aiStates[state]||state)+(a.reason?': '+esc(a.reason):'')+'</div>'+(a.text?'<div>'+esc(a.text).replace(/\n/g,'<br>')+'</div>':'')+'</div>';
@@ -234,9 +235,8 @@ function ai(){
   h+='<div class="options"><button data-a="ai-send"'+(A.target?'':' disabled')+'>'+(st==='clarify'?'Reply':'Send')+'</button></div>';
   if(!r)return h+'</div>';
   // a setup lists its effects, computed by the service, instead of the op (§ 6)
-  if(an.effects)h+='<div class="body meta">'+an.effects.map(esc).join('<br>')+'</div>';
-  else if(an.ops)h+='<div class="body meta">'+an.ops.map(o=>esc(opText(o))).join('<br>')+'</div>';
-  if(an.readback)h+='<div class="body meta">'+an.readback.map(esc).join('<br>')+'</div>';
+  const lines=[...an.effects||(an.ops||[]).map(opText),...an.readback||[]];
+  if(lines.length)h+='<div class="body meta aiops" tabindex="0" aria-label="Proposed changes" data-bound="'+esc('ops/'+r.id+'/'+an.rev+'/'+st+'/'+S.font)+'">'+lines.map(esc).join('<br>')+'</div>';
   if(st==='proposal')h+='<button class="project" data-a="ai-confirm" data-root="'+esc(r.root)+'" data-id="'+esc(r.id)+'" data-rev="'+Number(an.rev)+'"'+(aiConfirm===r.id+'/'+Number(an.rev)?' disabled':'')+'>Confirm: apply '+(an.effects||an.ops).length+' change'+((an.effects||an.ops).length===1?'':'s')+'</button>';
   if(bad)h+='<button class="project" data-a="ai-pick" data-v="'+esc(r.text||'')+'">Edit and send again</button>';
   return h+'</div>';}
@@ -389,7 +389,7 @@ function head(){return '<div class="row head"><span class="meta">taskq</span><bu
 function render(navigating=false){
   if(!S||resizing)return;
   const active=document.activeElement,answerFocus=active&&active.closest('[data-answer]'),scroll=document.scrollingElement.scrollTop;
-  const chain=menu.querySelector('.aichain'),chainScroll=chain&&[chain.dataset.chain,chain.scrollTop];
+  const bounds=new Map([...menu.querySelectorAll('[data-bound]')].map(e=>[e.dataset.bound,e.scrollTop]));
   const focusKey=!navigating&&active&&menu.contains(active)?JSON.stringify(active.dataset):null;
   const focusedSummary=!navigating&&active?.tagName==='SUMMARY'?[...menu.querySelectorAll('summary')].indexOf(active):-1;
   const caret=answerFocus&&active.tagName==='TEXTAREA'?[active.selectionStart,active.selectionEnd]:null;
@@ -409,9 +409,26 @@ function render(navigating=false){
   else if(!navigating){const target=focusedSummary>=0?menu.querySelectorAll('summary')[focusedSummary]:focusKey&&focusKey!=='{}'?[...menu.querySelectorAll('button,.grip')].find(b=>JSON.stringify(b.dataset)===focusKey):null;target?.focus({preventScroll:true});}
   document.scrollingElement.scrollTop=scroll;
   fit();
-  // after fit() sets the width: a new exchange opens at its newest entry; a tick keeps the reader's place
-  const c=menu.querySelector('.aichain');if(c)c.scrollTop=chainScroll&&chainScroll[0]===c.dataset.chain?chainScroll[1]:c.lastElementChild.offsetTop;}
-window.taskq={receive(s){
+  // after fit() sets the width: a new exchange or text size opens at the newest entry; a tick keeps the reader's place;
+  // a block that drops a cut line asks for the smaller height
+  const bound=[...menu.querySelectorAll('[data-bound]')];
+  bound.forEach(c=>{c.scrollTop=bounds.has(c.dataset.bound)?bounds.get(c.dataset.bound):c.classList.contains('aichain')?c.lastElementChild.offsetTop:0;wholeLines(c);});
+  if(bound.some(c=>c.style.maxHeight))fit();}
+// a bounded block shows whole lines: a line cut at the top scrolls into view, or at the scroll end (the newest text)
+// moves out above; the bottom edge moves up to the first line it cuts
+function wholeLines(c){
+  if(c.scrollHeight<=c.clientHeight)return;
+  const top=c.getBoundingClientRect().top+c.clientTop,lines=()=>{const r=document.createRange(),w=document.createTreeWalker(c,NodeFilter.SHOW_TEXT),a=[];
+    for(let n;(n=w.nextNode());){r.selectNodeContents(n);a.push(...r.getClientRects());}return a;};
+  const shrink=d=>c.style.maxHeight=c.offsetHeight-d+'px',cut=edge=>Math.min(...lines().filter(l=>l.top<edge&&l.bottom>edge).map(l=>l.top));
+  const head=cut(top);
+  if(head<top&&c.scrollTop+c.clientHeight<c.scrollHeight-1)c.scrollTop-=top-head;
+  else if(head<top){const d=Math.min(...lines().filter(l=>l.top>=top).map(l=>l.top))-top;if(d<c.clientHeight){shrink(d);c.scrollTop+=d;}}
+  const bottom=top+c.clientHeight,tail=cut(bottom);if(tail>top&&tail<bottom)shrink(bottom-tail);}
+// a reader's scroll leaves cut lines: once it settles, the block takes its CSS bound again and realigns on whole lines
+function settle(c){if(!c.isConnected)return;const s=c.scrollTop;c.style.maxHeight='';c.scrollTop=s;wholeLines(c);fit();}
+menu.addEventListener('scroll',e=>{const c=e.target;if(!c.dataset?.bound)return;clearTimeout(c.settling);c.settling=setTimeout(()=>settle(c),150);},true);
+window.taskq={settle,receive(s){
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
   if(s.capmsg){resourceReceipt(s.capmsg);return;}
   if(s.open){openCard(s.open);return;}

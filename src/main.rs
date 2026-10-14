@@ -622,7 +622,8 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         if budget.low() && low_logged != Some(budget.reset) {
             let (top, n) = budget.top(&hour.1).unwrap_or(("none".into(), 0));
-            log!("board budget low: {}/{} until {}; top here: {top} {n}", budget.remaining.unwrap_or(0), budget.limit.unwrap_or(0), budget.reset.map_or("unknown".into(), board::stamp));
+            log!("board budget low: {}/{}{} until {}; top here: {top} {n}", budget.remaining.unwrap_or(0), budget.limit.unwrap_or(0),
+                budget.resource.as_deref().map(|r| format!(" {r}")).unwrap_or_default(), budget.reset.map_or("unknown".into(), board::stamp));
             low_logged = Some(budget.reset);
         }
         if hour.0.elapsed().as_secs() >= 3600 {

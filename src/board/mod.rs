@@ -316,9 +316,11 @@ impl Api {
         if let Some(t) = r.header("date").and_then(http_date) {
             *self.clock.borrow_mut() = t;
         }
-        let paused = self.budget.borrow_mut().observe(r.status, |n| r.header(n).map(String::from), *self.clock.borrow(), std::time::Instant::now());
+        // GitHub GraphQL refuses an exhausted budget with HTTP 200 and a RATE_LIMITED error
+        let status = if url.ends_with("/graphql") && r.status == 200 && r.body.contains("\"RATE_LIMITED\"") { 403 } else { r.status };
+        let paused = self.budget.borrow_mut().observe(status, |n| r.header(n).map(String::from), *self.clock.borrow(), std::time::Instant::now());
         if let Some(reset) = paused {
-            return Err(format!("{method} {url}: HTTP {} {}", r.status, crate::requests::paused_text(reset)));
+            return Err(format!("{method} {url}: HTTP {status} {}", crate::requests::paused_text(reset)));
         }
         if !(200..300).contains(&r.status) {
             // one log line: a multi-line error body folds into it (§ 4)
@@ -839,6 +841,40 @@ mod tests {
             let b = h.requests();
             assert_eq!((b.total(), b.remaining, b.paused_until()), (2, Some(0), iso("2026-10-14T04:41:00Z")));
         }
+    }
+
+    // Chain: § 4 board budget, GitHub open list over GraphQL. Risk: the list loses a page, a field or trust, falls back
+    // to core REST, or keeps sending after a GraphQL RATE_LIMITED reply.
+    #[test]
+    fn github_open_list_is_one_graphql_request_per_page() {
+        let kind = BOARDS.iter().find(|k| k.name == "github").unwrap();
+        let limited = std::rc::Rc::new(RefCell::new(false));
+        let flag = limited.clone();
+        let h = http(kind, Some(true), Box::new(move |method, url, body| {
+            assert_eq!((method, url), ("POST", "https://api.github.com/graphql"));
+            let body = body.unwrap();
+            assert_eq!((&body["variables"]["owner"], &body["variables"]["name"]), (&json!("o"), &json!("r")));
+            let left = if *flag.borrow() { "0" } else { "4990" };
+            let headers = vec![("X-RateLimit-Resource".into(), "graphql".into()), ("X-RateLimit-Remaining".into(), left.into()),
+                ("X-RateLimit-Limit".into(), "5000".into()), ("X-RateLimit-Reset".into(), "1791964800".into())];
+            let value = if *flag.borrow() { json!({"errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}) }
+                else if body["variables"]["after"].is_null() { json!({"data": {"repository": {"issues": {"pageInfo": {"hasNextPage": true, "endCursor": "c1"},
+                    "nodes": [{"number": 5, "title": "t", "body": "b", "updatedAt": "2026-10-14T04:27:00Z", "authorAssociation": "OWNER",
+                        "labels": {"nodes": [{"name": "q-ready"}]}, "assignees": {"nodes": [{"login": "me"}]}}]}}}}) }
+                else { json!({"data": {"repository": {"issues": {"pageInfo": {"hasNextPage": false, "endCursor": null},
+                    "nodes": [{"number": 6, "title": "u", "body": null, "updatedAt": "2026-10-14T04:28:00Z", "authorAssociation": "NONE",
+                        "labels": {"nodes": []}, "assignees": {"nodes": []}}]}}}}) };
+            Ok(Reply { status: 200, headers, body: value.to_string(), operation: operation(method) })
+        }));
+        let list = h.issues(None).unwrap();
+        assert_eq!(list.iter().map(|i| (i.number, i.open, i.trusted)).collect::<Vec<_>>(), [(5, true, true), (6, true, false)]);
+        assert_eq!((list[0].labels.clone(), list[0].assignees.clone(), list[0].updated), (vec!["q-ready".to_string()], vec!["me".to_string()], iso("2026-10-14T04:27:00Z").unwrap()));
+        let b = h.requests();
+        assert_eq!((b.ops.clone(), b.resource.clone(), b.remaining), (std::collections::BTreeMap::from([("POST graphql".to_string(), 2)]), Some("graphql".into()), Some(4990)));
+        *limited.borrow_mut() = true;
+        assert!(h.issues(None).unwrap_err().contains("HTTP 403 rate limit: board requests paused until"));
+        assert!(h.issues(None).unwrap_err().contains("paused"));
+        assert_eq!(h.requests().total(), 3, "nothing is sent while paused");
     }
 
     // Chain: § 2 state labels on both boards. Risk: a state change removes user labels.

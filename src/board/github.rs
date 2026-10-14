@@ -49,7 +49,34 @@ fn parse_issue(v: &Value) -> Issue {
     }
 }
 
+/// The open-issue list of a pass in one GraphQL query per 100 issues (§ 4 budget): it costs the separate GraphQL
+/// budget about 2 points instead of one core request, and returns no pull requests.
+const OPEN_ISSUES: &str = "query($owner: String!, $name: String!, $after: String) { repository(owner: $owner, name: $name) { \
+    issues(states: OPEN, first: 100, after: $after, orderBy: {field: CREATED_AT, direction: DESC}) { pageInfo { hasNextPage endCursor } \
+    nodes { number title body updatedAt authorAssociation labels(first: 50) { nodes { name } } assignees(first: 20) { nodes { login } } } } } }";
+
 impl GitHub {
+    fn open_issues(&self) -> Result<Vec<Issue>> {
+        let repo = self.api.base.rsplit_once("/repos/").map(|x| x.1).unwrap_or_default();
+        let (owner, name) = repo.split_once('/').ok_or("no repository")?;
+        let (mut out, mut after) = (vec![], Value::Null);
+        loop {
+            let v = self.api.call("POST", &format!("{}/graphql", self.api.root), Some(json!({
+                "query": OPEN_ISSUES, "variables": { "owner": owner, "name": name, "after": after },
+            })))?.json()?;
+            let page = &v["data"]["repository"]["issues"];
+            if !page["nodes"].is_array() {
+                return Err(format!("GraphQL open issues: {}", v["errors"]));
+            }
+            out.extend(page["nodes"].as_array().into_iter().flatten().map(|n| parse_issue(&json!({
+                "number": n["number"], "title": n["title"], "body": n["body"], "updated_at": n["updatedAt"], "state": "open",
+                "author_association": n["authorAssociation"], "labels": n["labels"]["nodes"], "assignees": n["assignees"]["nodes"],
+            }))));
+            if page["pageInfo"]["hasNextPage"] != true { return Ok(out); }
+            after = page["pageInfo"]["endCursor"].clone();
+        }
+    }
+
     /// CI on `sha`: Ok(None) green, Ok(Some(msg)) failed, Err pending or missing.
     fn ci(&self, sha: &str) -> Result<Option<String>> {
         let runs = self.api.call("GET", &format!("/commits/{sha}/check-runs?per_page=100"), None)?.json()?;
@@ -164,6 +191,7 @@ impl Board for GitHub {
     fn issues(&self, since: Option<i64>) -> Result<Vec<Issue>> {
         let url = match since {
             Some(t) => format!("/issues?state=all&per_page=100&since={}", stamp(t)),
+            None if self.api.root == "https://api.github.com" => return self.open_issues(),
             None => "/issues?state=open&per_page=100".into(),
         };
         Ok(self.api.all(&url)?.iter().filter(|v| v.get("pull_request").is_none()).map(parse_issue).collect())

@@ -14,10 +14,12 @@ const TOP: usize = 8;
 pub struct Budget {
     /// Requests sent since the process started, by operation.
     pub ops: BTreeMap<String, u64>,
-    /// Last `remaining`/`limit` headers seen.
+    /// Last `remaining`/`limit`/reset (board seconds) per budget (`x-ratelimit-resource`: GitHub `core`, `graphql`).
+    buckets: BTreeMap<String, (u64, u64, Option<i64>)>,
+    /// The budget with the smallest remaining share: its name, `remaining`, `limit` and reset.
+    pub resource: Option<String>,
     pub remaining: Option<u64>,
     pub limit: Option<u64>,
-    /// Last reset header seen (board seconds).
     pub reset: Option<i64>,
     /// Paused until this instant; the reset in board seconds.
     paused: Option<(Instant, i64)>,
@@ -62,9 +64,16 @@ impl Budget {
     pub fn observe(&mut self, status: u16, header: impl Fn(&str) -> Option<String>, board_now: i64, now: Instant) -> Option<i64> {
         let num = |names: &[&str]| names.iter().find_map(|n| header(n)?.trim().parse::<i64>().ok());
         let remaining = num(&["x-ratelimit-remaining", "ratelimit-remaining"]);
-        if let Some(r) = remaining { self.remaining = u64::try_from(r).ok(); }
-        if let Some(l) = num(&["x-ratelimit-limit", "ratelimit-limit"]) { self.limit = u64::try_from(l).ok(); }
-        if let Some(t) = num(&["x-ratelimit-reset", "ratelimit-reset"]) { self.reset = Some(t); }
+        let limit = num(&["x-ratelimit-limit", "ratelimit-limit"]);
+        if let Some(r) = remaining.and_then(|r| u64::try_from(r).ok()) {
+            let name = header("x-ratelimit-resource").unwrap_or_default();
+            let l = limit.and_then(|l| u64::try_from(l).ok()).or(self.buckets.get(&name).map(|b| b.1)).unwrap_or(0);
+            self.buckets.insert(name, (r, l, num(&["x-ratelimit-reset", "ratelimit-reset"])));
+            let low = self.buckets.iter().min_by_key(|(_, (r, l, _))| r * 10_000 / (*l).max(1)).map(|(k, v)| (k.clone(), *v));
+            if let Some((name, (r, l, t))) = low {
+                (self.resource, self.remaining, self.limit, self.reset) = ((!name.is_empty()).then_some(name), Some(r), (l > 0).then_some(l), t);
+            }
+        }
         if !matches!(status, 403 | 429) { return None; }
         let wait = match (num(&["retry-after"]), remaining) {
             (Some(s), _) => s,
@@ -88,7 +97,7 @@ impl Budget {
 
     /// `status.json` `requests` (§ 4): `hour` the counts of the last full hour, `start` the cumulative counts at its end.
     pub fn json(&self, since: u64, hour: Option<&BTreeMap<String, u64>>, start: &BTreeMap<String, u64>) -> Value {
-        json!({"since": since, "total": self.total(), "ops": self.ops, "last_hour": hour, "remaining": self.remaining, "limit": self.limit,
+        json!({"since": since, "total": self.total(), "ops": self.ops, "last_hour": hour, "remaining": self.remaining, "limit": self.limit, "resource": self.resource,
             "reset": self.reset.map(crate::board::stamp), "top": self.top(start).map(|(op, n)| format!("{op} {n}")),
             "paused_until": self.paused_until().map(crate::board::stamp)})
     }
@@ -134,7 +143,8 @@ pub fn warning(status: &Value) -> Option<String> {
         return Some(format!("Rate limit: board requests paused until {until} ({host})"));
     }
     let (remaining, limit) = (r["remaining"].as_u64()?, r["limit"].as_u64()?);
-    (limit > 0 && remaining * 5 <= limit).then(|| format!("Board budget low: {remaining}/{limit} until {} ({host}); top here: {}",
+    let resource = r["resource"].as_str().map(|s| format!(" {s}")).unwrap_or_default();
+    (limit > 0 && remaining * 5 <= limit).then(|| format!("Board budget low: {remaining}/{limit}{resource} until {} ({host}); top here: {}",
         r["reset"].as_str().unwrap_or("unknown"), r["top"].as_str().unwrap_or("none")))
 }
 
@@ -195,5 +205,21 @@ mod tests {
         assert_eq!(b.top(&start), Some(("PATCH issues/N".into(), 30)));
         let s = json!({"host": "mac", "requests": b.json(0, None, &start)});
         assert_eq!(warning(&s).unwrap(), "Board budget low: 1000/5000 until 2026-10-14T08:00:00Z (mac); top here: PATCH issues/N 30");
+    }
+
+    // Chain: § 4 per-resource budget. Risk: a drained GraphQL bucket hides behind a full REST one, or the reverse.
+    #[test]
+    fn budget_follows_the_lowest_resource() {
+        let h = |res: &'static str, r: &'static str| move |n: &str| match n { "x-ratelimit-resource" => Some(res.to_string()),
+            "x-ratelimit-remaining" => Some(r.to_string()), "x-ratelimit-limit" => Some("5000".into()), _ => None };
+        let mut b = Budget::default();
+        b.observe(200, h("core", "900"), 0, Instant::now());
+        b.observe(200, h("graphql", "4000"), 0, Instant::now());
+        assert_eq!((b.resource.as_deref(), b.remaining), (Some("core"), Some(900)), "a full bucket never hides a low one");
+        b.observe(200, h("graphql", "500"), 0, Instant::now());
+        b.observe(200, h("core", "4990"), 0, Instant::now());
+        assert_eq!((b.resource.as_deref(), b.remaining, b.low()), (Some("graphql"), Some(500), true));
+        let s = json!({"host": "mac", "requests": b.json(0, None, &BTreeMap::new())});
+        assert_eq!(warning(&s).unwrap(), "Board budget low: 500/5000 graphql until unknown (mac); top here: none");
     }
 }

@@ -652,7 +652,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         restart_watch(&mut restart_empty, cfg!(windows) && d.join("restart").exists() && s.kids.is_empty(), began.elapsed().as_secs(), cfg.update_every);
         if is_installed && d.join("restart").exists() {
             // Windows re-exec waits for the live children; the request stays until it can go
-            if !operator::running(&cfg.root) && ((cfg!(unix) && !s.kids.iter().any(|k| k.rt == "codex-app")) || s.kids.is_empty()) {
+            if !operator::running(&cfg.root) && ((cfg!(unix) && !s.kids.iter().any(|k| matches!(k.rt.as_str(), "codex-app" | "claude"))) || s.kids.is_empty()) {
                 let _ = fs::remove_file(d.join("restart"));
                 eprintln!("restart requested");
             }
@@ -1109,7 +1109,7 @@ fn kill_service(root: &Path) {
 fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     use std::os::unix::process::CommandExt;
     // App turns have no adoptable child; keep their lease until completion.
-    if s.kids.iter().any(|k| k.rt == "codex-app") || operator::running(&cfg.root) {
+    if s.kids.iter().any(|k| matches!(k.rt.as_str(), "codex-app" | "claude")) || operator::running(&cfg.root) {
         return fs::write(dot(&cfg.root).join("restart"), "").map_err(|e| e.to_string());
     }
     let mut text = format!("pid {}\n", std::process::id());

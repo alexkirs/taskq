@@ -318,3 +318,5 @@ Improvement proposals the PM makes in chat, one line each, oldest first: `- YYYY
 - 2026-10-14 Rebuild the project README: setup phrase first, dark menu screenshots refreshed by a manifest-checked pipeline, shipped use-case rows; plan docs/design/readme-plan.md, tasks #923, #925, #924 (from owner request in chat)
 
 - 2026-10-14 Use one durable owner-installed board token per host instead of repeated device logins; task #944 (from PM proposal in chat)
+- 2026-10-14 Built-in profiling: always-on per-operation counters and switchable traces feed optimization; principle specq#24, tasks taskq #988, agentq#122, coreq#45, dashq#89, serverq#36 (from owner request in chat)
+- 2026-10-14 Run codex-app on Windows, where the Codex app is installed; task #989 (from owner request in chat)

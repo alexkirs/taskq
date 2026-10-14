@@ -267,24 +267,26 @@ pub struct Env<'a> {
     pub board_env: &'a [(String, String)],
 }
 
-fn executable(bin: PathBuf, access: &crate::policy::Effective, env: &Env) -> Command {
+fn executable(bin: PathBuf, access: &crate::policy::Effective, env: &Env) -> Result<Command, String> {
+    #[cfg(windows)]
+    if access.windows { return crate::windows_sandbox::command(env); }
     if access.linux {
         let mut c = Command::new("/usr/local/libexec/taskq-sandbox");
         c.arg(env.root).arg(env.install).arg(&access.mode).arg(bin);
-        return c;
+        return Ok(c);
     }
-    match &access.profile {
+    Ok(match &access.profile {
         Some(p) => {
             let mut c = Command::new("/usr/bin/sandbox-exec");
             c.arg("-p").arg(p).arg(bin);
             c
         }
         None => Command::new(bin),
-    }
+    })
 }
 
-pub fn command(env: &Env, l: &Launch, access: &crate::policy::Effective) -> Command {
-    let mut c = executable(which(if l.rt == "claude" { "claude" } else { "codex" }), access, env);
+pub fn command(env: &Env, l: &Launch, access: &crate::policy::Effective) -> Result<Command, String> {
+    let mut c = executable(which(if l.rt == "claude" { "claude" } else { "codex" }), access, env)?;
     crate::platform::quiet(&mut c);
     let codex = access.codex.as_deref().unwrap_or(env.codex);
     let mode = access.claude.as_deref().unwrap_or(env.permission_mode);
@@ -301,7 +303,7 @@ pub fn command(env: &Env, l: &Launch, access: &crate::policy::Effective) -> Comm
         }
     }
     environment(env, l, &mut c);
-    c
+    Ok(c)
 }
 
 fn environment(env: &Env, l: &Launch, c: &mut Command) {
@@ -485,7 +487,7 @@ fn start(env: &Env, l: &Launch, log: &Path, text: &str, access: &crate::policy::
     std::fs::create_dir_all(log.parent().unwrap()).map_err(|e| StartError::io(e, None))?;
     let out = File::options().create(true).append(true).open(log).map_err(|e| StartError::io(e, None))?;
     let err = out.try_clone().map_err(|e| StartError::io(e, None))?;
-    let mut c = command(env, l, access);
+    let mut c = command(env, l, access).map_err(|message| StartError { message, reportable: false })?;
     let mut child = c.stdin(Stdio::piped()).stdout(out).stderr(err).spawn().map_err(|e| StartError::io(e, Some(&l.rt)))?;
     let mut stdin = child.stdin.take().unwrap();
     if let Err(e) = stdin.write_all(text.as_bytes()) {
@@ -566,7 +568,7 @@ impl ClaudeTurn {
         }
         std::fs::create_dir_all(log.parent().ok_or("missing log directory")?).map_err(|e| e.to_string())?;
         let mut file = File::options().create(true).append(true).open(log).map_err(|e| e.to_string())?;
-        let mut c = executable(which("claude"), access, env);
+        let mut c = executable(which("claude"), access, env)?;
         environment(env, l, &mut c);
         c.current_dir(&root).arg("--bg");
         if l.resume.is_some() { c.args(["--resume", &l.session]); }
@@ -740,7 +742,7 @@ fn app_running() -> bool {
 }
 
 /// The thread's rollout file under `$CODEX_HOME/sessions` (default `~/.codex`; a Windows service has no `HOME`).
-fn rollout(thread: &str) -> Option<PathBuf> {
+pub(crate) fn rollout(thread: &str) -> Option<PathBuf> {
     let home = std::env::var_os("CODEX_HOME").map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(|h| Path::new(&h).join(".codex")))?;
     fn find(dir: &Path, end: &str) -> Option<PathBuf> {
@@ -937,9 +939,9 @@ mod tests {
         for resume in [None, Some("answer".to_string())] {
             l.resume = resume;
             l.rt = "claude".into();
-            assert!(args(&command(&env, &l, &access(&env, "claude").unwrap())).contains("--permission-mode bypassPermissions"));
+            assert!(args(&command(&env, &l, &access(&env, "claude").unwrap()).unwrap()).contains("--permission-mode bypassPermissions"));
             l.rt = "codex".into();
-            assert!(args(&command(&env, &l, &access(&env, "codex").unwrap())).starts_with("exec --json -s danger-full-access -m gpt-5 -c model_reasoning_effort=high "));
+            assert!(args(&command(&env, &l, &access(&env, "codex").unwrap()).unwrap()).starts_with("exec --json -s danger-full-access -m gpt-5 -c model_reasoning_effort=high "));
         }
         // the host without enforcement (every OS but macOS): no grant or a non-Full one refuses before any child or fetch
         if !cfg!(target_os = "macos") {

@@ -1,0 +1,174 @@
+--- a/codex-rs/windows-sandbox-rs/src/token.rs
++++ b/codex-rs/windows-sandbox-rs/src/token.rs
+@@ -19,6 +19,7 @@
+ use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
+ use windows_sys::Win32::Security::CopySid;
+ use windows_sys::Win32::Security::CreateRestrictedToken;
++use windows_sys::Win32::Security::{DuplicateTokenEx, EqualSid, IsTokenRestricted, SecurityImpersonation, TokenPrimary, TokenRestrictedSids};
+ use windows_sys::Win32::Security::CreateWellKnownSid;
+ use windows_sys::Win32::Security::GetTokenInformation;
+ use windows_sys::Win32::Security::IsValidSid;
+@@ -208,8 +209,12 @@
+ /// # Safety
+ /// `token` must remain a valid token handle with `TOKEN_QUERY` access during this call.
+ pub unsafe fn token_groups(token: HANDLE, max_bytes: u32) -> Result<Vec<TokenGroup>> {
++    token_sid_groups(token, TokenGroups, max_bytes)
++}
++
++unsafe fn token_sid_groups(token: HANDLE, class: i32, max_bytes: u32) -> Result<Vec<TokenGroup>> {
+     let mut needed = 0;
+-    GetTokenInformation(token, TokenGroups, std::ptr::null_mut(), 0, &mut needed);
++    GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut needed);
+     ensure!(
+         needed > 0 && needed <= max_bytes,
+         "invalid token group size"
+@@ -217,7 +222,7 @@
+     let mut buffer = vec![0u8; needed as usize];
+     if GetTokenInformation(
+         token,
+-        TokenGroups,
++        class,
+         buffer.as_mut_ptr().cast(),
+         needed,
+         &mut needed,
+@@ -497,6 +502,39 @@
+     entries[logon_idx + 1].Attributes = 0;
+ 
+     let mut new_token: HANDLE = std::ptr::null_mut();
++    // WRITE_RESTRICTED cannot be applied twice. Reuse only an already narrower token.
++    if IsTokenRestricted(base_token) != 0 {
++        let inherited = token_sid_groups(base_token, TokenRestrictedSids, 64 * 1024)?;
++        ensure!(!inherited.is_empty(), "nested sandbox has no restricting SIDs");
++        ensure!(inherited.iter().all(|group| entries.iter().any(|entry|
++            EqualSid(group.sid.as_ptr() as *mut c_void, entry.Sid) != 0)),
++            "nested sandbox cannot narrow inherited capabilities");
++        let mut change_notify: LUID = std::mem::zeroed();
++        ensure!(LookupPrivilegeValueW(std::ptr::null(), to_wide("SeChangeNotifyPrivilege").as_ptr(), &mut change_notify) != 0,
++            "cannot identify inherited privilege");
++        let mut needed = 0;
++        GetTokenInformation(base_token, windows_sys::Win32::Security::TokenPrivileges,
++            std::ptr::null_mut(), 0, &mut needed);
++        ensure!(needed >= 4 && needed <= 64 * 1024, "invalid inherited privilege size");
++        let mut privileges = vec![0u8; needed as usize];
++        ensure!(GetTokenInformation(base_token, windows_sys::Win32::Security::TokenPrivileges,
++            privileges.as_mut_ptr().cast(), needed, &mut needed) != 0,
++            "cannot inspect inherited privileges");
++        ensure!(needed as usize <= privileges.len(), "invalid inherited privilege result");
++        let offset = std::mem::offset_of!(TOKEN_PRIVILEGES, Privileges);
++        let stride = std::mem::size_of::<windows_sys::Win32::Security::LUID_AND_ATTRIBUTES>();
++        ensure!(needed as usize >= offset, "truncated inherited privileges");
++        let count = std::ptr::read_unaligned(privileges.as_ptr().cast::<u32>()) as usize;
++        ensure!(count <= (needed as usize - offset) / stride, "truncated inherited privileges");
++        for index in 0..count {
++            let privilege = std::ptr::read_unaligned(privileges.as_ptr().add(offset + index * stride)
++                .cast::<windows_sys::Win32::Security::LUID_AND_ATTRIBUTES>());
++            ensure!(privilege.Luid.LowPart == change_notify.LowPart && privilege.Luid.HighPart == change_notify.HighPart,
++                "nested sandbox retains an unexpected privilege");
++        }
++        ensure!(DuplicateTokenEx(base_token, 0, std::ptr::null(), SecurityImpersonation, TokenPrimary, &mut new_token) != 0,
++            "DuplicateTokenEx failed: {}", GetLastError());
++    } else {
+     let flags = DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED;
+     let ok = CreateRestrictedToken(
+         base_token,
+@@ -512,6 +550,7 @@
+     if ok == 0 {
+         return Err(anyhow!("CreateRestrictedToken failed: {}", GetLastError()));
+     }
++    }
+ 
+     // Filesystem and route capabilities may be shared between launches. They
+     // must not grant access to another launch's processes, threads, or IPC.
+--- a/codex-rs/http-client/src/client_builder.rs
++++ b/codex-rs/http-client/src/client_builder.rs
+@@ -365,6 +365,12 @@
+             ensure_rustls_crypto_provider();
+             builder = builder.use_rustls_tls();
+         }
++        #[cfg(windows)]
++        if self.tls.root_certificate.is_none() && self.tls.client_identity.is_none() {
++            let config = crate::windows_tls::build_windows_platform_tls_config()
++                .expect("Windows certificate verification must initialize");
++            builder = builder.use_preconfigured_tls(config.as_ref().clone());
++        }
+         if let Some(certificate) = self.tls.root_certificate {
+             builder = builder
+                 .tls_built_in_root_certs(false)
+--- a/codex-rs/http-client/src/custom_ca.rs
++++ b/codex-rs/http-client/src/custom_ca.rs
+@@ -72,6 +72,9 @@
+ /// distinction can rely on the `From<BuildCustomCaTransportError> for io::Error` conversion.
+ #[derive(Debug, Error)]
+ pub enum BuildCustomCaTransportError {
++    #[cfg(windows)]
++    #[error("Failed to initialize Windows certificate verification: {0}")]
++    WindowsPlatformVerifier(#[source] rustls::Error),
+     /// Reading the selected CA file from disk failed before any PEM parsing could happen.
+     #[error(
+         "Failed to read CA certificate file {} selected by {}: {source}. {hint}",
+@@ -147,6 +150,8 @@
+ impl From<BuildCustomCaTransportError> for io::Error {
+     fn from(error: BuildCustomCaTransportError) -> Self {
+         match error {
++            #[cfg(windows)]
++            BuildCustomCaTransportError::WindowsPlatformVerifier(_) => io::Error::other(error),
+             BuildCustomCaTransportError::ReadCaFile { ref source, .. } => {
+                 io::Error::new(source.kind(), error)
+             }
+@@ -236,6 +241,11 @@
+     env_source: &dyn EnvSource,
+ ) -> Result<Arc<ClientConfig>, BuildCustomCaTransportError> {
+     let bundle = env_source.configured_ca_bundle();
++    #[cfg(windows)]
++    if bundle.is_none() {
++        return crate::windows_tls::build_windows_platform_tls_config()
++            .map_err(BuildCustomCaTransportError::WindowsPlatformVerifier);
++    }
+     build_rustls_client_config(bundle.as_ref())
+ }
+ 
+--- a/codex-rs/windows-sandbox-rs/src/lib.rs
++++ b/codex-rs/windows-sandbox-rs/src/lib.rs
+@@ -9,6 +9,13 @@
+ pub mod environment_transport;
+ #[cfg(any(windows, test))]
+ mod launch_environment;
++
++/// TaskQ keeps native control state outside the agent's writable runtime home.
++#[cfg(windows)]
++pub(crate) fn taskq_sandbox_home(home: &std::path::Path) -> std::path::PathBuf {
++    std::env::var_os("TASKQ_WINDOWS_SANDBOX_HOME")
++        .map(std::path::PathBuf::from).unwrap_or_else(|| home.to_path_buf())
++}
+ 
+ use std::fmt;
+ use std::sync::Arc;
+@@ -713,6 +720,8 @@
+         additional_deny_read_paths: &[AbsolutePathBuf],
+         additional_deny_write_paths: &[AbsolutePathBuf],
+     ) -> Result<CaptureResult> {
++        let native_home = super::taskq_sandbox_home(codex_home);
++        let codex_home = native_home.as_path();
+         let additional_deny_read_paths = additional_deny_read_paths
+             .iter()
+             .map(AbsolutePathBuf::to_path_buf)
+@@ -939,6 +948,8 @@
+         cwd: &Path,
+         env_map: &HashMap<String, String>,
+     ) -> Result<()> {
++        let native_home = super::taskq_sandbox_home(codex_home);
++        let codex_home = native_home.as_path();
+         let Ok(permissions) = super::resolved_permissions::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+             permission_profile,
+             workspace_roots,
+--- a/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs
++++ b/codex-rs/windows-sandbox-rs/src/unified_exec/backends/legacy.rs
+@@ -343,6 +343,8 @@
+     stdin_open: bool,
+     private_desktop_name: Option<String>,
+ ) -> Result<SpawnedProcess> {
++    let native_home = crate::taskq_sandbox_home(codex_home);
++    let codex_home = native_home.as_path();
+     let common = prepare_legacy_spawn_context(
+         permission_profile,
+         workspace_roots,

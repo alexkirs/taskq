@@ -21,6 +21,10 @@ jobs:
           # a release tag refreshes main, which the tag was cut from
           ref: ${{ github.ref_type == 'tag' && 'main' || github.ref }}
       - run: rustup default stable
+      # Committed shots that are still fresh came from a Mac at 2x; the 1x runner capture must not replace them.
+      - name: Check committed shots
+        id: fresh
+        run: if docs/shots/check.sh; then echo stale=false; else echo stale=true; fi >> "$GITHUB_OUTPUT"
       - name: Capture README shots
         shell: bash
         run: docs/shots/update.sh 2>&1 | tee "$RUNNER_TEMP/shots.log"
@@ -37,7 +41,7 @@ jobs:
           path: ${{ runner.temp }}/shots.log
           if-no-files-found: warn
       - name: Commit and verify refreshed shots
-        if: github.ref == 'refs/heads/main' || github.ref_type == 'tag'
+        if: (github.ref == 'refs/heads/main' || github.ref_type == 'tag') && steps.fresh.outputs.stale == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

@@ -278,13 +278,15 @@ pub struct Api {
     label_schema: RefCell<Option<bool>>,
     /// Request accounting and rate-limit pause of this process (§ 4).
     budget: RefCell<crate::requests::Budget>,
+    /// Labels whose catalog definition this process has read back: verified once per process (§ 4 budget).
+    labels_ok: RefCell<std::collections::HashSet<String>>,
     #[cfg(test)]
     transport: Option<Transport>,
 }
 
 impl Api {
     fn new(root: String, base: String, token: &str) -> Api {
-        Api { base, root, auth: format!("Authorization: Bearer {token}"), me: RefCell::new(None), clock: RefCell::new(0), label_schema: RefCell::new(None), budget: RefCell::default(), #[cfg(test)] transport: None }
+        Api { base, root, auth: format!("Authorization: Bearer {token}"), me: RefCell::new(None), clock: RefCell::new(0), label_schema: RefCell::new(None), budget: RefCell::default(), labels_ok: RefCell::default(), #[cfg(test)] transport: None }
     }
 
     fn call(&self, method: &str, url: &str, body: Option<Value>) -> Result<Reply> {
@@ -368,6 +370,9 @@ impl Api {
     /// Catalog sync: `color` renders a catalog color for the board; `write(current, payload)` creates or updates one label.
     fn ensure_labels(&self, names: &[String], color: fn(&str) -> String, write: impl Fn(Option<&Value>, Value) -> Result<()>) -> Result<()> {
         if !self.canonical_labels()? { return Err("legacy board: catalog adoption requires all-host gate and label_schema=canonical".into()); }
+        let fresh: Vec<String> = names.iter().filter(|n| !self.labels_ok.borrow().contains(*n)).cloned().collect();
+        if fresh.is_empty() { return Ok(()); }
+        let names = &fresh[..];
         let all = self.all("/labels?per_page=100")?;
         let mut seen = std::collections::HashSet::new();
         for name in names {
@@ -386,6 +391,7 @@ impl Api {
                 }
             }
         }
+        self.labels_ok.borrow_mut().extend(fresh);
         Ok(())
     }
 
@@ -768,13 +774,19 @@ mod tests {
             names.push("taskq".into());
             h.ensure_labels(&names).unwrap();
             assert_eq!(*writes.borrow(), names.len() - 1);
+            let reads = h.requests().total();
             h.ensure_labels(&names).unwrap();
             assert_eq!(*writes.borrow(), names.len() - 1, "repeat makes no writes");
+            assert_eq!(h.requests().total(), reads, "repeat sends no catalog read");
             assert_eq!(catalog.borrow()[0]["description"], "user owned");
             let i = catalog.borrow().iter().position(|v| v["name"] == "q-ask").unwrap();
             catalog.borrow_mut()[i]["color"] = json!("000000");
             h.ensure_labels(&names).unwrap();
-            assert_eq!(*writes.borrow(), names.len(), "repairs existing metadata");
+            assert_eq!(*writes.borrow(), names.len() - 1, "verified once per process (§ 4 budget)");
+            let (fresh, fresh_catalog, fresh_writes) = label_board(kind, false, false);
+            *fresh_catalog.borrow_mut() = catalog.borrow().clone();
+            fresh.ensure_labels(&names).unwrap();
+            assert_eq!(*fresh_writes.borrow(), 1, "a new process repairs existing metadata");
         }
     }
 

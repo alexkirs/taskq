@@ -572,6 +572,8 @@ fn service_run(c: &Ctx) -> Res<()> {
     // § 4 board budget: the pause logged last, and the cumulative counts at the last full hour
     let since = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let mut paused_logged: Option<i64> = None;
+    // the budget alarm is logged once per reset
+    let mut low_logged: Option<Option<i64>> = None;
     let mut hour: (Instant, BTreeMap<String, u64>) = (Instant::now(), BTreeMap::new());
     let mut last_hour: Option<BTreeMap<String, u64>> = None;
     loop {
@@ -618,6 +620,11 @@ fn service_run(c: &Ctx) -> Res<()> {
         if let (Err(e), None) = (&r, paused) {
             log!("pass: {e}");
         }
+        if budget.low() && low_logged != Some(budget.reset) {
+            let (top, n) = budget.top(&hour.1).unwrap_or(("none".into(), 0));
+            log!("board budget low: {}/{} until {}; top here: {top} {n}", budget.remaining.unwrap_or(0), budget.limit.unwrap_or(0), budget.reset.map_or("unknown".into(), board::stamp));
+            low_logged = Some(budget.reset);
+        }
         if hour.0.elapsed().as_secs() >= 3600 {
             let h = requests::diff(&budget.ops, &hour.1);
             log!("requests 1h: {}", requests::summary(&h, ""));
@@ -647,7 +654,7 @@ fn service_run(c: &Ctx) -> Res<()> {
             ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
             ("restart_waits", json!(d.join("restart").exists().then(|| restart_waits(&s, &cfg.root)))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root))),
-            ("requests", budget.json(since, last_hour.as_ref()))]
+            ("requests", budget.json(since, last_hour.as_ref(), &hour.1))]
         {
             status[k] = v;
         }

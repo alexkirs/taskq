@@ -27,7 +27,7 @@ Filled from the [report template](../../ui-acceptance-report.md) against the [ha
 | U-A7 icon at native size | Summary and compact, run/pause, both themes, 34 pt@2× | q, digits, grid; gray pause overlay | Digits and stacked series legible at 68 px; pause shows gray bars under the q; live menu-bar capture missing | Pass (render); live → #1060 | `icon-*` |
 | U-A8 keyboard, names, contrast, large text | 20 px both themes | Readable, named controls | 20 px wraps without clipping; keyboard and VoiceOver not exercised | Not tested → #1060 | `popover-dark-home-20.png`, `popover-dark-projects-20.png` |
 | U-A9 4.1.9 additions retained | Services, About | Log, folder, restart, stop, uninstall confirm, Resources, incidents, versions | All present per project; uninstall needs a nested confirm; About lists tray and service versions; Update shows only for a newer version | Pass | `popover-*-services-16.png`, `popover-*-about-16.png` |
-| M14 notifications (owner checkpoint, #1047) | Candidate as `TaskQ.app` (`org.taskq.tray`, ad-hoc signed) in a disposable install; [owner-notifications.sh](owner-notifications.sh) walks OS prompt, `ask` banner, click, OS off, `failed` while off, then snapshots the Notifications page | Prompt once; banner with sound; click opens the card; off reads `Blocked by the OS` and posts nothing | Bundle identity works: the Notifications page reads `Not asked yet`, not `Not available`; owner session not yet run | Not tested (owner) | `notify-not-asked-dark-16.png` |
+| M14 notifications (owner checkpoint, #1047) | Candidate `5dd47b61…` as `TaskQ.app` (`org.taskq.tray`, ad-hoc signed, started directly as the service does) in a disposable install; owner ran [owner-notifications.sh](owner-notifications.sh) on 2026-10-14: `ask` defaults to Banner with sound, one `ask` event appended | OS prompt once; banner with sound; click opens the card; off reads `Blocked by the OS` | No OS prompt, no banner, so no click and nothing to turn off; the tray moved its cursor past the event; the page still reads `Not asked yet` afterwards | Fail → #1093 | [notify-owner-result.txt](notify-owner-result.txt), `notify-after-owner-dark-16.png`, `notify-not-asked-dark-16.png` |
 | U-A10 frozen evidence | This folder | Candidate SHA, hashes, shots | Recorded above and in `SHA256SUMS` | Pass | [SHA256SUMS](SHA256SUMS) |
 
 ## Findings
@@ -38,12 +38,13 @@ Filled from the [report template](../../ui-acceptance-report.md) against the [ha
 | #1060 evidence gap | U-A1/3/4/7/8 | `screencapture -R 0,0,1470,37` in a worker: `could not create image from rect` | Live menu-bar and keyboard evidence → none | Owner-run capture or a Screen Recording grant |
 | #1077 evidence gap | U-A6 | Snapshot steps render one frame per route | Frame sequence across a bin boundary and approved rebin → none | Native frame sequence; implement or defer rebin |
 | #1083 minor | U-A5 | ua5 fixture, Activity history at 16 and 20 px | All four totals readable → `waiting` (and at 20 px `ask`) cut by the ellipsis | Wrap the summary instead of truncating |
+| #1093 major | M14 | Start the tray from `TaskQ.app` with a Banner mode; append an `ask` event | OS prompt, then banner → no prompt, status stays `Not asked`; `request()` drops the completion error | Find the cause (direct exec vs LaunchServices, sandboxed launch), log and show a failed request |
 | #1061 major | § 8 N/N-1 | Roll a host with grants back to 4.1.11 | Grants kept → store deleted | Keep or restore the store across rollback |
 
 ## Verdict
 
 - Design accepted: no; owner review pending.
 - Runtime/platform verified: update 4.1.11 → candidate keeps state and a live CLI child (stub `codex`) on a disposable install; WKWebView snapshots for 11 routes at 16/20 px.
-- Not tested / blocked: notification banner, click and Blocked (owner session with `owner-notifications.sh`), real-runtime and real-host handover (#1053), U-A6 temporal shift and rebin (#1077), live menu-bar and popover, keyboard, VoiceOver, 14/18 px, external and 1× displays (#1060).
+- Not tested / blocked: notification prompt, banner, click and Blocked (#1093), real-runtime and real-host handover (#1053), U-A6 temporal shift and rebin (#1077), live menu-bar and popover, keyboard, VoiceOver, 14/18 px, external and 1× displays (#1060).
 - Deployed: no; the real host stays on `4.2.0-dev.1791987853`.
 - Next exact fix or decision: #1059, then #1060 capture on the next candidate.

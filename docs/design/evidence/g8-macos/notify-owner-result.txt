@@ -1,0 +1,7 @@
+2026-10-14T17:09:23Z start 5dd47b617e14da8dc0f3caa12330bd715294d36011ce2e6268e4cade731964ab
+2026-10-14T17:09:49Z owner: Did the prompt appear and did you click Allow? -> n
+2026-10-14T17:09:52Z appended ask event for #7
+2026-10-14T17:10:07Z owner: Did the banner appear? -> n
+2026-10-14T17:10:17Z owner: Did the click open the TaskQ menu on #7? -> n
+2026-10-14T17:11:58Z owner: Is TaskQ notifications now off? -> n
+2026-10-14T17:11:58Z appended failed event for #7 while blocked

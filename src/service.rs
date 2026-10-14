@@ -880,7 +880,7 @@ impl<'a> Service<'a> {
     /// A runtime with free capacity: `limits.<rt>` minus live children of it (§ 3).
     /// `codex-app` only for `run-codex-app` tasks on a host whose `has` lists it (§ 9 opt-in).
     fn free(&self, want: Option<&str>) -> Option<String> {
-        let app = |rt: &str| rt != "codex-app" || (cfg!(target_os = "macos") && want == Some(rt) && self.cfg.has.iter().any(|h| h == rt));
+        let app = |rt: &str| rt != "codex-app" || (cfg!(any(target_os = "macos", windows)) && want == Some(rt) && self.cfg.has.iter().any(|h| h == rt));
         let c = self.cap.as_ref().ok()?;
         // Auto: a runtime without a limit has no count ceiling (§ 9); Fixed: only listed runtimes
         let limits: Vec<(String, u32)> = if c.auto { RUNTIMES.iter().map(|r| (r.to_string(), c.limits.get(*r).copied().unwrap_or(u32::MAX))).collect() } else { c.limits.clone().into_iter().collect() };
@@ -1357,8 +1357,8 @@ mod tests {
             let mut s = service(&b, &c, e.clone());
             s.pass().unwrap();
             let t = task(&b, n);
-            if worker == "codex-app" && !cfg!(target_os = "macos") {
-                assert_eq!(t.state, State::Ready, "§ 9: app workers are macOS-only");
+            if worker == "codex-app" && !cfg!(any(target_os = "macos", windows)) {
+                assert_eq!(t.state, State::Ready, "§ 9: app workers are macOS and Windows only");
                 assert!(t.attempt.is_none() && e.borrow().is_empty(), "no app worker claimed or started");
                 continue;
             }
@@ -1657,8 +1657,9 @@ mod tests {
         assert_eq!((task(&b, app).state, task(&b, other).state), (State::Ready, State::Ready), "no opt-in: unchanged");
         let m = Config { has: vec!["codex-app".into()], me: "mac".into(), ..c.clone() };
         service(&b, &m, Default::default()).pass().unwrap();
-        assert_eq!((task(&b, app).state, task(&b, other).state), (if cfg!(target_os = "macos") { State::Doing } else { State::Ready }, State::Ready), "only macOS admits app turns; unlabelled tasks never get the app");
-        if cfg!(target_os = "macos") { assert!(task(&b, app).session.unwrap().starts_with("codex-app:- mac")); }
+        let os = cfg!(any(target_os = "macos", windows));
+        assert_eq!((task(&b, app).state, task(&b, other).state), (if os { State::Doing } else { State::Ready }, State::Ready), "only macOS and Windows admit app turns; unlabelled tasks never get the app");
+        if os { assert!(task(&b, app).session.unwrap().starts_with("codex-app:- mac")); }
     }
 
     // Chain: § 3 capacity config. Risk: host override ignored or invalid limits accepted.

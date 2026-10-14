@@ -1,9 +1,20 @@
 //! Board request accounting and rate-limit pause (taskq.md § 4 Log and board budget): counts per operation of this
 //! process and a pause, on the monotonic clock, while the board's shared request budget is exhausted.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Source records in `<install>/taskq.log` (§ 4 budget): one per CLI process at its exit, one per service hour.
+const RECORD: &str = "taskq-requests ";
+/// Requests of this process by operation, for its exit record.
+static PROCESS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Usage { at_ms: u64, source: String, ops: BTreeMap<String, u64> }
 
 /// Longest pause: GitHub and GitLab budgets reset within the hour.
 const MAX_PAUSE: i64 = 3600;
@@ -148,9 +159,121 @@ pub fn warning(status: &Value) -> Option<String> {
         r["reset"].as_str().unwrap_or("unknown"), r["top"].as_str().unwrap_or("none")))
 }
 
+/// Counts one request of this process for its exit record.
+pub fn tally(op: &str) {
+    if let Ok(mut m) = PROCESS.lock() { *m.entry(op.into()).or_default() += 1; }
+}
+
+/// The source of a CLI process: `<role> <command>` (`service` adds its subcommand), from the positionals as dispatch
+/// parses them, so flags anywhere do not change it. Role `worker` or `reviewer` from `TASKQ_ROLE`, else `cli` (owner,
+/// PM, operator). None for `service run`: the service records each hour.
+pub fn source(argv: &[String], role: Option<&str>) -> Option<String> {
+    let args = crate::Args::parse(argv).map(|a| a.pos).unwrap_or_default();
+    let word = |s: Option<&String>| s.filter(|s| !s.is_empty() && s.len() <= 30 && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'))
+        .map_or("*".to_string(), Clone::clone);
+    let mut cmd = word(args.first());
+    if cmd == "service" {
+        if args.get(1).is_some_and(|s| s == "run") { return None; }
+        cmd = format!("service {}", word(args.get(1)));
+    }
+    let role = role.filter(|r| matches!(*r, "worker" | "reviewer")).unwrap_or("cli");
+    Some(format!("{role} {cmd}"))
+}
+
+/// Appends one source record of `ops` to `<install>/taskq.log`; nothing when no request was sent.
+pub fn record(source: &str, ops: &BTreeMap<String, u64>) {
+    let Some(path) = crate::profile::log_path() else { return };
+    if ops.is_empty() { return; }
+    let at_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis().min(u64::MAX as u128) as u64);
+    let usage = Usage { at_ms, source: source.into(), ops: ops.clone() };
+    let line = format!("{RECORD}{}\n", serde_json::to_string(&usage).unwrap_or_default());
+    if crate::profile::append_line(path, &line).is_err() {
+        eprintln!("Board request record: unknown (taskq.log full or append failed; service pruning required)");
+    }
+}
+
+/// The exit record of this CLI process.
+pub fn flush(source: &str) {
+    let ops = PROCESS.lock().map(|mut m| std::mem::take(&mut *m)).unwrap_or_default();
+    record(source, &ops);
+}
+
+/// `taskq profile` section: board requests of the hour before `now_ms` by source, from the retained records.
+pub fn sources(text: &str, now_ms: u64) -> String {
+    let start = now_ms.saturating_sub(3_600_000);
+    let (mut rows, mut first) = (BTreeMap::<String, (u64, BTreeMap<String, u64>)>::new(), None::<u64>);
+    for line in text.lines().filter_map(|l| l.strip_prefix(RECORD)) {
+        let Ok(u) = serde_json::from_str::<Usage>(line) else {
+            return "Board requests by source: unknown (corrupt request record; log kept)\n".into();
+        };
+        first = Some(first.map_or(u.at_ms, |f| f.min(u.at_ms)));
+        if u.at_ms <= start || u.at_ms > now_ms { continue; }
+        let row = rows.entry(u.source).or_default();
+        row.0 += 1;
+        for (op, n) in u.ops { *row.1.entry(op).or_default() += n; }
+    }
+    if rows.is_empty() {
+        return "Board requests by source: unknown (no request records in the last hour)\n".into();
+    }
+    let coverage = match first {
+        Some(f) if f <= start => "full hour".to_string(),
+        _ => format!("partial: records start {} Unix ms; earlier requests unknown", first.unwrap_or(start)),
+    };
+    let mut rows: Vec<_> = rows.into_iter().map(|(s, (n, ops))| (s, n, ops.values().sum::<u64>(), ops)).collect();
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    let total: u64 = rows.iter().map(|r| r.2).sum();
+    let mut out = format!("Board requests by source: {total} in {start}..{now_ms} Unix ms ({coverage}); this host only; \
+        a CLI process counts at its exit, a service each hour; agent `gh`, PM chat tools and DashQ not counted\n\n\
+        | Source | Records | Requests | Top operations |\n|---|---:|---:|---|\n");
+    for (source, n, sum, ops) in rows {
+        let mut ops: Vec<_> = ops.into_iter().collect();
+        ops.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let top = ops.iter().take(3).map(|(op, n)| format!("{op} {n}")).collect::<Vec<_>>().join(", ");
+        out += &format!("| {source} | {n} | {sum} | {top} |\n");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: #1084 A1 CLI process -> source record -> `taskq profile` hour table. Risk: a source is merged with
+    // another, a request outside the hour is counted, a missing or corrupt record reads as zero, or free text
+    // from arguments reaches the log.
+    #[test]
+    fn requests_by_source_for_the_last_hour() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(source(&args(&["result", "1084"]), Some("worker")).unwrap(), "worker result");
+        assert_eq!(source(&args(&["status"]), Some("operator")).unwrap(), "cli status");
+        assert_eq!(source(&args(&["service", "status"]), None).unwrap(), "cli service status");
+        assert_eq!(source(&args(&["service", "run"]), None), None, "the service records its own hours");
+        assert_eq!(source(&args(&["C:\\secret path"]), None).unwrap(), "cli *");
+        assert_eq!(source(&[], None).unwrap(), "cli *");
+        assert_eq!(source(&args(&["--json", "status"]), None).unwrap(), "cli status", "a flag before the command");
+        assert_eq!(source(&args(&["--json", "service", "run"]), None), None, "service run with a flag first");
+        assert_eq!(source(&args(&["service", "--json", "run"]), None), None, "service run with a flag between");
+        let line = |at: u64, src: &str, ops: &[(&str, u64)]| format!("{RECORD}{}\n", serde_json::to_string(&Usage { at_ms: at,
+            source: src.into(), ops: ops.iter().map(|(k, v)| (k.to_string(), *v)).collect() }).unwrap());
+        let now = 10_000_000;
+        assert!(sources("", now).contains("unknown (no request records"));
+        let text = [line(now - 3_700_000, "cli status", &[("GET issues", 50)]), "taskq-profile {}\nother line\n".into(),
+            line(now - 60_000, "worker result", &[("POST issues/N/comments", 1), ("GET issues/N/comments", 2)]),
+            line(now - 50_000, "worker result", &[("GET issues/N/comments", 2)]),
+            line(now - 40_000, "service", &[("POST graphql", 60), ("PATCH issues/N", 30)])].concat();
+        let report = sources(&text, now);
+        assert!(report.starts_with("Board requests by source: 95 in 6400000..10000000 Unix ms (full hour)"), "{report}");
+        assert!(report.contains("| service | 1 | 90 | POST graphql 60, PATCH issues/N 30 |\n| worker result | 2 | 5 | GET issues/N/comments 4, POST issues/N/comments 1 |"), "{report}");
+        assert!(!report.contains("cli status"), "a record before the hour is not counted");
+        assert!(sources(&text[line(now - 3_700_000, "cli status", &[("GET issues", 50)]).len()..], now).contains("(partial: records start 9940000"));
+        assert!(sources(&format!("{text}{RECORD}{{\"at_ms\":1}}\n"), now).starts_with("Board requests by source: unknown (corrupt"));
+        let dir = std::env::temp_dir().join(format!("taskq-sources-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wall = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        std::fs::write(dir.join("taskq.log"), line(wall - 60_000, "worker result", &[("GET issues/N/comments", 5)]).repeat(2)).unwrap();
+        assert!(crate::profile::report(&dir).contains("| worker result | 2 | 10 |"), "`taskq profile` prints the table");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     // Chain: § 4 board budget. Risk: an exhausted budget keeps sending requests, or a key leaks a branch or SHA.
     #[test]

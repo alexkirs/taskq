@@ -1,15 +1,15 @@
 {
   "version": "4.0.0-dev",
-  "sourceCommit": "0e20a24e395a7df4784fbc003924fb022b129b28",
-  "binarySha256": "4510c51585f181f8a7ad1c19b0c86fa686ac7d654d1f364315fd204fda65474b",
+  "sourceCommit": "f733cd5f349049629a2ac2d0d4c84e9e19ecac0e",
+  "binarySha256": "495fbda6250b9b58837b2cf2ae70ac517bbda25562198f3aca96cca01197ad88",
   "environment": {
     "os": "macOS 27.0.1",
     "arch": "arm64",
     "renderer": "WKWebView snapshot"
   },
   "uiSources": {
-    "src/tray.rs": "9217346f0430590ffc8568036f794183ca5da25c",
-    "src/tray.html": "35227ba6ae7659d4909506fbe029795aa3062251",
+    "src/tray.rs": "f3382dde5a4baeba3522c01be89ad8b669a9e23a",
+    "src/tray.html": "f869735affdaf9b8831f7d1d474c613f87d56817",
     "src/icon.rs": "27c0a5f64a7af334e2eb8c81e3e6626e356cc555",
     "docs/design/icon-summary.config.json": "9365699c943d0ac4506eab8fc5f7a84d8cbe8582"
   },
@@ -21,7 +21,7 @@
     },
     {
       "file": "icon-summary-run-dark.png",
-      "sha256": "cdad44d7afc6ad35c2f5bc4de1923503a42f874e855365f96919358efc0e1ac3"
+      "sha256": "8f97367f6791ee2695eaa1f463c7bb7fb0b50ee556fe311e179cb3ff857bc94b"
     },
     {
       "file": "popover-dark-attention-16.png",

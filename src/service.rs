@@ -904,7 +904,15 @@ impl<'a> Service<'a> {
         let c = self.cap.as_ref().ok()?;
         // Auto: a runtime without a limit has no count ceiling (§ 9); Fixed: only listed runtimes
         let limits: Vec<(String, u32)> = if c.auto { RUNTIMES.iter().map(|r| (r.to_string(), c.limits.get(*r).copied().unwrap_or(u32::MAX))).collect() } else { c.limits.clone().into_iter().collect() };
-        limits.into_iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt) && !self.refused_access.contains_key(rt)).find(|(rt, n)| self.kids.iter().filter(|k| &k.rt == rt).count() < *n as usize).map(|(rt, _)| rt)
+        // the most free slots wins, so any-runtime tasks alternate; a tie keeps the listed order (§ 4 Filter)
+        let mut best: Option<(String, usize)> = None;
+        for (rt, n) in limits.into_iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt) && !self.refused_access.contains_key(rt)) {
+            let left = (n as usize).saturating_sub(self.kids.iter().filter(|k| k.rt == rt).count());
+            if left > 0 && best.as_ref().is_none_or(|b| left > b.1) {
+                best = Some((rt, left));
+            }
+        }
+        best.map(|(rt, _)| rt)
     }
 
     /// Post `spawn`, re-read, start the child only if `fold` accepted this spawn (§ 3 claim).
@@ -1371,6 +1379,42 @@ mod tests {
         let t = task(&b, n);
         assert_eq!((t.state, t.retries, t.result.is_some()), (State::Review, 1, true));
         assert_ne!(t.attempt, Some(r));
+    }
+
+    // Chain: § 4 Filter, any-runtime admission over tests/golden/admit.json. Risk: the first listed runtime takes every slot while the other idles.
+    #[test]
+    fn any_runtime_admission_follows_golden_traces() {
+        let traces: Vec<serde_json::Value> = serde_json::from_str(include_str!("../tests/golden/admit.json")).unwrap();
+        let rts = |v: &serde_json::Value| -> Vec<(String, u32)> { v.as_object().unwrap().iter().map(|(k, n)| (k.clone(), n.as_u64().unwrap() as u32)).collect() };
+        let mut first_free_fails = false;
+        for tr in &traces {
+            let (limits, running, tasks) = (rts(&tr["limits"]), rts(&tr["running"]), tr["tasks"].as_u64().unwrap());
+            let want: Vec<Option<String>> = serde_json::from_value(tr["expect"].clone()).unwrap();
+            let b = Fake::default();
+            // Running children hold doing tasks of this host.
+            let held: Vec<(u64, u64, String)> = running.iter().flat_map(|(rt, n)| (0..*n).map(move |_| rt.clone())).map(|rt| {
+                let n = b.create("T", "", &[TASK_LABEL.into()]).unwrap();
+                (n, b.comment(n, &format!("taskq: spawn worker {rt}:s mac")).unwrap(), rt)
+            }).collect();
+            let ns: Vec<u64> = (0..tasks).map(|_| b.create("T", "", &[TASK_LABEL.into()]).unwrap()).collect();
+            let mut c = cfg("mac");
+            c.limits = limits.iter().cloned().collect();
+            let mut s = service(&b, &c, Default::default());
+            for (task, attempt, rt) in held {
+                s.kids.push(Kid { task, attempt, rt, proc: Box::new(FakeProc(Rc::new(RefCell::new(None)))) });
+            }
+            s.pass().unwrap();
+            let got: Vec<Option<String>> = ns.iter().map(|&n| rt_of(&task(&b, n)).map(|(rt, _)| rt.to_string())).collect();
+            assert_eq!(got, want, "{}", tr["name"]);
+            // The old rule: every task takes the first listed runtime with a free slot.
+            let mut used: BTreeMap<String, u32> = running.iter().cloned().collect();
+            let old: Vec<Option<String>> = (0..tasks).map(|_| limits.iter().find(|(rt, n)| used.get(rt).copied().unwrap_or(0) < *n).map(|(rt, _)| {
+                *used.entry(rt.clone()).or_default() += 1;
+                rt.clone()
+            })).collect();
+            first_free_fails |= old != want;
+        }
+        assert!(first_free_fails, "the traces must reject the first-free rule");
     }
 
     // Chain: § 4 worker result to reviewer claim. Risk: run-* pins reviewers or capacity fallback stalls review.

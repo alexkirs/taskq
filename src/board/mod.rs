@@ -314,6 +314,7 @@ impl Api {
             return Err(format!("{method} {url}: {}", crate::requests::paused_text(reset)));
         }
         self.budget.borrow_mut().count(op.into());
+        crate::requests::tally(op);
         crate::profile::measure("forge.call", || {
             #[cfg(test)]
             let r = match &self.transport { Some(transport) => transport(method, &url, body)?, None => curl(method, &url, &self.auth, body.as_ref())? };

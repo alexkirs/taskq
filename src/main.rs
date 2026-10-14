@@ -2039,11 +2039,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             Ok(())
         }
         "disconnect" => {
-            match enrollment::disconnect(&cfg.install)? {
-                None => println!("connection: none"),
-                Some(true) => println!("disconnected: sending stopped, revoke confirmed"),
-                Some(false) => println!("disconnected: sending stopped; revoke pending, the service retries it"),
-            }
+            println!("{}", enrollment::disconnect(&cfg.install)?.as_deref().unwrap_or("connection: none"));
             Ok(())
         }
         "status" => {

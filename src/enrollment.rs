@@ -73,14 +73,30 @@ pub fn first_receipt(install: &Path, record: &Value, tries: u32) -> Res<&'static
     Ok(state)
 }
 
-/// `taskq disconnect`: sending stops at once; `Ok(false)` when the revoke stays queued for the service.
-pub fn disconnect(install: &Path) -> Res<Option<bool>> {
-    if state(install)?.is_none_or(|s| !s["active"].is_object() && !s["pending"].is_object()) { return Ok(None) }
-    match enroll::disconnect(&dir(install), &mut Https { browser: false }) {
-        Ok(()) => Ok(Some(true)),
-        Err(e) if e.ends_with("revoke pending") => Ok(Some(false)),
-        Err(e) => Err(e),
+/// `taskq disconnect`: cancels a pairing in progress (so `enroll` cannot resume it), stops sending at once and
+/// reports what was revoked; a revoke DashQ has not confirmed stays queued for the service.
+pub fn disconnect(install: &Path) -> Res<Option<String>> {
+    disconnect_with(install, &mut Https { browser: false })
+}
+
+fn disconnect_with(install: &Path, w: &mut dyn enroll::Wire) -> Res<Option<String>> {
+    let Some(s) = state(install)? else { return Ok(None) };
+    let (active, pending) = (s["active"].is_object(), s["pending"].is_object());
+    if !active && !pending { return Ok(None) }
+    let queued = |e: &String| e.ends_with("revoke pending");
+    if pending {
+        // a staged credential DashQ already granted is queued for revoke by coreq
+        enroll::cancel(&dir(install), w).or_else(|e| if queued(&e) { Ok(()) } else { Err(e) })?;
     }
+    enroll::disconnect(&dir(install), w).or_else(|e| if queued(&e) { Ok(()) } else { Err(e) })?;
+    let left = state(install)?.map_or(0, |s| s["revoke"].as_array().map_or(0, Vec::len));
+    let mut out = vec![];
+    if pending { out.push("pairing cancelled".to_string()) }
+    if active { out.push("sending stopped".into()) }
+    out.push(if left > 0 { format!("{left} revoke pending, the service retries it") }
+        else if active || s["pending"]["staged"].is_object() || s["revoke"].as_array().is_some_and(|r| !r.is_empty()) { "revoke confirmed".into() }
+        else { "nothing granted to revoke".into() });
+    Ok(Some(format!("disconnected: {}", out.join("; "))))
 }
 
 /// The approved board of an active connection; `None` for a scope this version cannot read.
@@ -346,6 +362,51 @@ mod tests {
         fs::remove_file(install.join("installation-id")).unwrap();
         assert_ne!(installation_id(&install).unwrap(), ids[0]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// DashQ stand-in: answers revokes (or nothing, offline) and records the credentials it was asked to revoke.
+    struct Dash { online: bool, revoked: Vec<String> }
+    impl enroll::Wire for Dash {
+        fn post(&mut self, _: &str, route: &str, auth: Option<&str>, _: &Value) -> Result<(u16, Value), String> {
+            if !self.online { return Err("offline".into()) }
+            assert_eq!(route, "/connection/revoke", "disconnect only revokes");
+            self.revoked.push(auth.unwrap_or_default().into());
+            Ok((200, json!({"protocol": 1})))
+        }
+        fn now(&self) -> u64 { 0 }
+        fn sleep(&mut self, _: u64) {}
+        fn show(&mut self, _: &str, _: &str) {}
+    }
+
+    // Chain: enroll interrupted mid-pairing -> taskq disconnect -> enroll rerun. Risk: disconnect reporting the
+    // revoke confirmed while a pending pairing (or its staged, already granted credential) survives and resumes.
+    #[test]
+    fn disconnect_cancels_pending_pairing() {
+        let install = std::env::temp_dir().join(format!("taskq-disconnect-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&install);
+        let write = |pending: Value, active: Value, revoke: Value| {
+            fs::create_dir_all(dir(&install)).unwrap();
+            fs::write(dir(&install).join("connection.json"), json!({"installation": "i", "pending": pending, "active": active, "revoke": revoke}).to_string()).unwrap();
+        };
+        let conn = |c: &str| json!({"destination": "https://d/machine", "credential": c});
+        let mut dash = Dash { online: true, revoked: vec![] };
+        assert_eq!(disconnect_with(&install, &mut dash).unwrap(), None, "no state: none");
+        // code shown, not approved yet: nothing granted
+        write(json!({"device_code": "x", "staged": null}), Value::Null, json!([]));
+        assert_eq!(disconnect_with(&install, &mut dash).unwrap().as_deref(), Some("disconnected: pairing cancelled; nothing granted to revoke"));
+        assert!(state(&install).unwrap().unwrap()["pending"].is_null(), "enroll cannot resume the pairing");
+        assert_eq!(disconnect_with(&install, &mut dash).unwrap(), None, "second disconnect says none");
+        // approved and staged, ack not sent, beside an active connection: both credentials revoked
+        write(json!({"device_code": "x", "staged": conn("staged")}), conn("active"), json!([]));
+        assert_eq!(disconnect_with(&install, &mut dash).unwrap().as_deref(), Some("disconnected: pairing cancelled; sending stopped; revoke confirmed"));
+        assert_eq!(dash.revoked, ["staged", "active"]);
+        // offline: the revoke stays queued for the service, reported as pending
+        write(json!({"device_code": "x", "staged": conn("s2")}), Value::Null, json!([]));
+        let mut off = Dash { online: false, revoked: vec![] };
+        assert_eq!(disconnect_with(&install, &mut off).unwrap().as_deref(), Some("disconnected: pairing cancelled; 1 revoke pending, the service retries it"));
+        let s = state(&install).unwrap().unwrap();
+        assert!(s["pending"].is_null() && s["revoke"][0]["credential"] == "s2");
+        fs::remove_dir_all(install).unwrap();
     }
 
     fn snap(repo: &str) -> Snapshot {

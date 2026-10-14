@@ -2061,6 +2061,27 @@ mod tests {
         assert_eq!(s.kids.len(), 2);
     }
 
+    // Chain: resource policy write (shared-resource-controls.md § Host adapter) -> lower limit -> service reload ->
+    // pass. Risk: a lowered limit stops or drops the lease of an attempt that is already running.
+    #[test]
+    fn lowered_limit_keeps_running_attempts() {
+        let b = Fake::default();
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
+        let m = b.create("M", "", &["taskq".into()]).unwrap();
+        let mut c = cfg("mac");
+        c.limits.insert("claude".into(), 2);
+        let mut s = service(&b, &c, Default::default());
+        s.pass().unwrap();
+        let (a, am) = (task(&b, n).attempt, task(&b, m).attempt);
+        let o = b.create("O", "", &["taskq".into()]).unwrap();
+        s.reload(Ok(Capacity::fixed(BTreeMap::from([("claude".to_string(), 0)]), GATE_DEFAULT)));
+        b.advance(400);
+        s.pass().unwrap();
+        assert_eq!((s.kids.len(), task(&b, n).state, task(&b, m).state), (2, State::Doing, State::Doing), "both attempts run on");
+        assert_eq!((task(&b, n).attempt, task(&b, m).attempt), (a, am), "leases kept");
+        assert_eq!(task(&b, o).state, State::Ready, "no new claim under the lower limit");
+    }
+
     // Chain: § 9 Auto admission config. Risk: Auto silently off, or a cap or invalid mode accepted wrong.
     #[test]
     fn auto_admission_takes_d03_defaults_and_caps() {

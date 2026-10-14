@@ -227,7 +227,7 @@ pub fn sweep(install: &Path, shim: &Path) {
         }
     }
     let owned = |n: &str| {
-        ["releases", "current", "previous", "projects", "token", "installation-id", "connection", "taskq", "taskq.exe", "WebView2Loader.dll", "taskq-tray.exe", "TaskQ.app", "capacity", "windows-native", crate::policy::FILE, "taskq-profile.lock"].contains(&n)
+        ["releases", "current", "previous", "projects", "token", "installation-id", "connection", "taskq", "taskq.exe", "WebView2Loader.dll", "taskq-tray.exe", "TaskQ.app", "capacity", "resources", "windows-native", crate::policy::FILE, "taskq-profile.lock"].contains(&n)
             || n.ends_with(".log") || n.ends_with(".tmp") || n.starts_with("tray") || (n.starts_with("TaskQ-") && n.ends_with(".xml"))
     };
     let gone = |p: &Path| {
@@ -543,7 +543,7 @@ mod tests {
         let _ = fs::remove_dir_all(&t);
         // the running version's release stays, whatever the build sets it to (release CI: the tag)
         let mine = format!("releases/{VERSION}");
-        let dirs = ["releases/4.2.0", "releases/4.1.0", "releases/4.0.5", &mine, "releases/cc33ae6", "releases/4.3.0.tmp", "service/x", "mac-pre-update-backup", "capacity", "windows-native/state", "failed-release-evidence"];
+        let dirs = ["releases/4.2.0", "releases/4.1.0", "releases/4.0.5", &mine, "releases/cc33ae6", "releases/4.3.0.tmp", "service/x", "mac-pre-update-backup", "capacity", "resources", "windows-native/state", "failed-release-evidence"];
         for d in dirs {
             fs::create_dir_all(install.join(d)).unwrap();
         }
@@ -571,7 +571,7 @@ mod tests {
         let mut want = vec![VERSION.to_string(), "4.0.5".into(), "4.1.0".into(), "4.2.0".into(), "4.3.0.tmp".into()];
         want.sort();
         assert_eq!(ls(&install.join("releases")), want);
-        assert_eq!(ls(&install), ["TaskQ-proj.xml", "capacity", "current", "previous", "proj.log", "projects", "releases", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json", "windows-native", "worker-policy.json"]);
+        assert_eq!(ls(&install), ["TaskQ-proj.xml", "capacity", "current", "previous", "proj.log", "projects", "releases", "resources", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json", "windows-native", "worker-policy.json"]);
         assert_eq!(fs::read_to_string(install.join("windows-native/state/cap_sid")).unwrap(), "native control state");
         assert!(!shim.exists() && other.exists(), "only the v3 shim of this install goes");
         // § 4 Data: a corrupt status.json leaves the project's version unknown, so every release stays and so does the file

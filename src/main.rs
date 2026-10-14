@@ -18,6 +18,7 @@ mod recipe;
 mod requests;
 mod platform;
 mod policy;
+mod resources;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
 #[cfg(windows)]
@@ -68,6 +69,7 @@ const USAGE: &str = "taskq agents
  taskq service focus [all|off|<label..>] [--request TEXT]
  taskq service capacity [--host H] [--mode auto|fixed] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
  taskq service permissions [--runtime R --mode restricted|workspace|full|none [--scope host|project]]
+ taskq service resources [--grant ID --actor ID --hours N [--project P].. [--runtime R].. [--host-policy] | --revoke ID]
  taskq tray [--snapshot DIR [--route R,..]] [--icon FILE] | taskq selftest
 Writes to a task take [--op-id ID] [--revision R] [--json] (taskq.md section 5).
 Text templates and limits: taskq.md sections 1, 2, 5, 7.";
@@ -87,7 +89,7 @@ impl Args {
         while let Some(x) = it.next() {
             match x.strip_prefix("--") {
                 Some(k) => {
-                    let val = if matches!(k, "later" | "hold" | "start" | "check" | "force" | "help" | "json" | "apply" | "headless") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
+                    let val = if matches!(k, "later" | "hold" | "start" | "check" | "force" | "help" | "json" | "apply" | "headless" | "host-policy") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
                     a.flags.entry(k.to_string()).or_default().push(val);
                 }
                 None => a.pos.push(x.clone()),
@@ -622,6 +624,7 @@ fn service_run(c: &Ctx) -> Res<()> {
     let mut hour: (Instant, BTreeMap<String, u64>) = (Instant::now(), BTreeMap::new());
     let mut last_hour: Option<BTreeMap<String, u64>> = None;
     let mut dashq = enrollment::Sender::default();
+    let mut policy_exchange = resources::Exchanger::default();
     loop {
         // § 3: capacity reloads before each admission decision; children are untouched
         let cap = fs::read_to_string(cfg.root.join("taskq.json")).map_err(|e| e.to_string())
@@ -691,6 +694,10 @@ fn service_run(c: &Ctx) -> Res<()> {
         }
         // docs/design/enrollment.md: delivery runs on its own thread; its failure never fails or delays the pass
         if let Some(l) = dashq.tick(&cfg.install, s.snapshot.as_ref(), at) {
+            log!("{l}");
+        }
+        // docs/design/shared-resource-controls.md § Host adapter: the same speaker exchanges resource operations
+        for l in policy_exchange.tick(&cfg.install, s.snapshot.as_ref(), at) {
             log!("{l}");
         }
         let tool = platform::tool(&cfg.install);
@@ -802,6 +809,8 @@ struct CapEdit {
     /// `admission.max`: `Some(None)` removes it
     max: Option<Option<u32>>,
     limits: BTreeMap<String, u32>,
+    /// runtimes whose `capacity_hosts` limit override goes (resource policy `runtime_limit: null`)
+    unset: std::collections::BTreeSet<String>,
     gate: Option<bool>,
     cpu_max: Option<u32>,
     memory_min: Option<u32>,
@@ -837,7 +846,7 @@ impl CapEdit {
     }
 
     fn is_empty(&self) -> bool {
-        self.mode.is_none() && self.max.is_none() && self.limits.is_empty() && self.gate.is_none() && self.cpu_max.is_none() && self.memory_min.is_none()
+        self.mode.is_none() && self.max.is_none() && self.limits.is_empty() && self.unset.is_empty() && self.gate.is_none() && self.cpu_max.is_none() && self.memory_min.is_none()
     }
 }
 
@@ -858,7 +867,7 @@ fn edit_capacity(text: &str, host: &str, me: &str, e: &CapEdit, expect: Option<&
     if e.is_empty() {
         return Err("nothing to change: give --mode, --max, --claude, --codex, --codex-app, --load-gate, --cpu-max or --memory-min".into());
     }
-    if let Some(rt) = e.limits.keys().find(|k| !RUNTIMES.contains(&k.as_str())) {
+    if let Some(rt) = e.limits.keys().chain(&e.unset).find(|k| !RUNTIMES.contains(&k.as_str())) {
         return Err(format!("unknown runtime {rt}"));
     }
     if !v["capacity_hosts"].is_object() {
@@ -867,6 +876,11 @@ fn edit_capacity(text: &str, host: &str, me: &str, e: &CapEdit, expect: Option<&
     let h = &mut v["capacity_hosts"][host];
     for (rt, n) in &e.limits {
         h["limits"][rt] = json!(n);
+    }
+    for rt in &e.unset {
+        if let Some(l) = h["limits"].as_object_mut() {
+            l.remove(rt);
+        }
     }
     if e.mode.is_some() || e.max.is_some() {
         // the host's object replaces the top-level one (§ 9): carry the unedited field over
@@ -995,6 +1009,30 @@ fn permissions_cmd(root: &Path, a: &Args) -> Res<()> {
     Ok(())
 }
 
+/// `taskq service resources` (§ 5): the host operator's resource grants for DashQ operations, project IDs and revisions.
+fn resources_cmd(root: &Path, a: &Args) -> Res<()> {
+    let (cfg, _) = load(root)?;
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let change = a.one("grant").or(a.one("revoke"));
+    if change.is_some() && std::env::var_os("TASKQ_ATTEMPT").is_some() {
+        return Err("a worker cannot change resource grants".into());
+    }
+    if let Some(id) = a.one("revoke") {
+        resources::revoke(&cfg.install, id)?;
+        println!("Revoked {id}; operations not yet written cannot write");
+    } else if let Some(id) = a.one("grant") {
+        let hours = a.need("hours")?.parse().map_err(|_| "--hours: a number of hours".to_string())?;
+        let scope = resources::Scope { host_policy: a.flags.contains_key("host-policy"), projects: a.all("project"), runtimes: a.all("runtime"), hours };
+        let by = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "unknown".into());
+        let g = resources::grant(&cfg.install, id, a.need("actor")?, &scope, &by, now)?;
+        println!("Granted {id} to {} until {}", g.actor_id, board::stamp(g.expires_at as i64));
+    }
+    for l in resources::report(&cfg.install, now)? {
+        println!("{l}");
+    }
+    Ok(())
+}
+
 /// `taskq service capacity` (§ 5).
 fn capacity_cmd(root: &Path, a: &Args) -> Res<()> {
     let (cfg, v) = load(root)?;
@@ -1039,6 +1077,11 @@ fn capacity_cmd(root: &Path, a: &Args) -> Res<()> {
     let wrote = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let (old, saved) = write_capacity(root, &host, &e, None)?;
     let changes = cap_changes(&old, &saved);
+    if host == cfg.me
+        && let Err(e) = resources::revised(&cfg.install, root, wrote)
+    {
+        println!("Resource revision unknown: {e}");
+    }
     if host != cfg.me {
         println!("Saved for {host} in {project}: {changes}; applies when {host}'s service reads this config");
         return Ok(());
@@ -1383,6 +1426,7 @@ fn service(args: &Args) -> Res<()> {
         }
         "capacity" => capacity_cmd(&root, args),
         "permissions" => permissions_cmd(&root, args),
+        "resources" => resources_cmd(&root, args),
         "hold" | "release" => hold_cmd(sub == "hold", args.one("text")),
         "recover" => recover_cmd(&root, args.flags.contains_key("apply"), args.flags.contains_key("json")),
         "restart" => {
@@ -1649,7 +1693,8 @@ fn uninstall_unit(u: &platform::Unit, root: &Path, projects: &Path) -> Res<()> {
     let all: Vec<String> = registered.lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
     platform::run_all(&u.unload, false)?;
     if let Err(e) = fs::remove_file(&u.path) && e.kind() != std::io::ErrorKind::NotFound { return Err(e.to_string()); }
-    fs::write(projects, all.concat()).map_err(|e| e.to_string())
+    let install = projects.parent().unwrap_or(Path::new("."));
+    resources::unregister(install, root, || fs::write(projects, all.concat()).map_err(|e| e.to_string()))
 }
 
 fn golden_selftest(traces: &str, published: bool) -> Res<usize> {

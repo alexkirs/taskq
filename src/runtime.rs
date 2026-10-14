@@ -350,7 +350,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
         // the app turn and the native Claude background session run in their host's environment, not the child's (§ 8);
         // Windows app turns run PowerShell
         q = if cfg!(windows) && l.rt == "codex-app" {
-            format!("$env:TASKQ_TASK='{n}'; $env:TASKQ_ATTEMPT='{}'; $env:TASKQ_ROLE='{}'; $env:TASKQ_ROOT='{}'; & '{q}'", l.attempt, l.role, env.root.display())
+            format!("$env:TASKQ_TASK='{n}'; $env:TASKQ_ATTEMPT='{}'; $env:TASKQ_ROLE='{}'; $env:TASKQ_ROOT='{}'; & '{}'", l.attempt, l.role.replace('\'', "''"), env.root.display().to_string().replace('\'', "''"), q.replace('\'', "''"))
         } else {
             format!("env TASKQ_TASK={n} TASKQ_ATTEMPT={} TASKQ_ROLE={} TASKQ_ROOT={} {q}", l.attempt, l.role, env.root.display())
         };
@@ -972,6 +972,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&install);
         assert_eq!(code, Some(0));
         assert_eq!(completes(t.rollout.as_ref().unwrap()), t.done + 1, "exactly one queued turn completed");
+    }
+
+    // Chain: § 8 Windows app brief -> PowerShell -> taskq. Risk: quoted paths break parsing or execute input.
+    #[cfg(windows)]
+    #[test]
+    fn app_brief_powershell_values_round_trip() {
+        let root = Path::new("C:\\project's $cash; folder");
+        let exe = Path::new("C:\\tool's $cash; folder\\taskq.exe");
+        let env = Env { root, exe, install: Path::new("C:\\install"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
+        let l = Launch { task: 7, title: "T".into(), attempt: 42, role: "worker's $cash; role".into(), rt: "codex-app".into(), session: "s".into(), url: "https://b/7".into(), resume: None };
+        let text = brief(&env, &l);
+        let command = text.split("your inbox: `").nth(1).unwrap().split('`').next().unwrap();
+        let prefix = command.split("; & ").next().unwrap();
+        let executable = command.split("; & ").nth(1).unwrap().strip_suffix(" inbox 7").unwrap();
+        let script = format!("{prefix}; ConvertTo-Json -Compress @($env:TASKQ_TASK, $env:TASKQ_ATTEMPT, $env:TASKQ_ROLE, $env:TASKQ_ROOT, {executable})");
+        let out = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let values: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(values, vec!["7", "42", &l.role, &root.display().to_string(), &exe.display().to_string()]);
     }
 
     // Chain: § 8 rule delivery. Risk: a new/resumed worker or reviewer receives only links or mixed rules.

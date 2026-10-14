@@ -6,7 +6,7 @@ Verify supported TaskQ capabilities through observable outcomes. [R9, R12 and ru
 
 One bounded live scenario covers each applicable runtime, role and continuation. Run it when that integration, permission configuration or client version changes, not on every commit or documentation edit. Record exact versions, effective permissions, initial state, actions, observed output and remaining gaps. A prior pass qualifies only its recorded configuration.
 
-Keep cheap deterministic checks only for a distinct user-visible chain or safety invariant: state transitions, duplicate/stale writes, admission, publication and preservation of active work. Use data cases in those chains. Remove development-only and redundant assertions after their question is answered. A constructor/argument-string check is not live permission or behavior proof. Never delete the only check protecting a supported behavior merely to lower the count.
+Deterministic checks follow [specq test classes](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#test-classes). TaskQ chains: state transitions, duplicate/stale writes, admission, publication and preservation of active work. A constructor/argument-string check is not live permission or behavior proof.
 
 ## Supported clients
 

@@ -326,3 +326,5 @@ Improvement proposals the PM makes in chat, one line each, oldest first: `- YYYY
 - 2026-10-14 When the PM disagrees with the worker's recommended (★) option, the ask shows the PM's pick and reason next to it, so the owner does not answer from the worker's star alone (from owner answer to agentq#127)
 - 2026-10-14 A task whose PR targets a release branch (not the default branch) closes through `taskq close` like any other task; today the merge does not close the issue and `taskq close` refuses while the task is in ask or doing (from agentq#128 on release-0.5.7)
 - 2026-10-14 Find why the dashboard shows Windows agentq data 13 h old after the Rust cutover (from owner review in chat)
+- 2026-10-14 Fold post-release checks into the Acceptance of the task that ships the change instead of filing separate follow-up tasks; the GitHub budget series took 6 tasks where 2 would do (from owner question on task granularity)
+- 2026-10-14 Split a wave by host so Mac and Windows workers run in parallel: host-bound evidence per host, runtime any, one release task depending on all (from owner request to spread work across hosts)

@@ -604,8 +604,13 @@ impl<'a> Service<'a> {
     /// The `build` or `review` stage of a child that exited or was stopped (§ 4 Profiling); `v` is its task's view.
     fn ended(&mut self, n: u64, a: u64, v: Option<&View>) {
         let Some((role, rt, begun)) = self.begun.remove(&a) else { return };
-        let log = v.map(|v| (v.log.as_slice(), v.task.attempt == Some(a)));
-        let (outcome, err) = core::stage_outcome(n, log, a, a.max(self.delivered(a)), role == "reviewer");
+        // an issue that left the board read (closed, label removed) is read back once for its hand-in
+        let back = if v.is_none() { crate::board::entries(self.board, n).map_err(|_| "unreadable") } else { Ok(vec![]) };
+        let log = match v {
+            Some(v) => Ok((v.log.as_slice(), Some(v.task.attempt == Some(a)))),
+            None => back.as_deref().map(|l| (l, None)).map_err(|e| *e),
+        };
+        let (outcome, err) = core::stage_outcome(n, log, a, a.max(self.delivered(a)));
         let log = crate::runtime::attempt_log(&self.cfg.root, &role, n, a);
         let stage = if role == "reviewer" { "review" } else { "build" };
         let (took, usage) = match begun {

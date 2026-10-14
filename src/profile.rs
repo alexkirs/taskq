@@ -87,7 +87,9 @@ fn measure_at<T, E: std::fmt::Display>(path: Option<&Path>, detailed: bool, op: 
 /// § 4 Profiling attempt stages; the behavioral model (§ 2) names where each starts and ends.
 pub const STAGES: [&str; 7] = ["claim", "start", "build", "checks", "review", "ask", "close"];
 const STAGE_PREFIX: &str = "taskq-stage ";
-const OUTCOMES: [&str; 5] = ["ok", "ask", "retried", "failed", "cancelled"];
+const OUTCOMES: [&str; 6] = ["ok", "ask", "retried", "failed", "cancelled", "unknown"];
+/// Stage-only error classes: a child ended without hand-in; its issue left the board read or could not be read back.
+const STAGE_ERRORS: [&str; 3] = ["exit", "left-board", "unreadable"];
 const RUNTIMES: [&str; 4] = ["claude", "codex", "codex-app", "other"];
 const UNKNOWN: [&str; 5] = ["no-model", "no-usage", "log-unreadable", "app-turn", "adopted"];
 
@@ -150,7 +152,7 @@ fn render_stages(text: &str) -> Result<String, &'static str> {
         let r: Stage = serde_json::from_str(line).map_err(|_| "corrupt stage record; log kept")?;
         let i = STAGES.iter().position(|s| *s == r.stage).ok_or("unknown stage; log kept")?;
         let rt = RUNTIMES.into_iter().find(|k| *k == r.rt).ok_or("unknown stage runtime; log kept")?;
-        if !OUTCOMES.contains(&r.outcome.as_str()) || !(ERRORS.contains(&r.error.as_str()) || r.error == "exit")
+        if !OUTCOMES.contains(&r.outcome.as_str()) || !(ERRORS.contains(&r.error.as_str()) || STAGE_ERRORS.contains(&r.error.as_str()))
             || r.unknown.as_deref().is_some_and(|u| !UNKNOWN.contains(&u)) { return Err("unknown stage code; log kept"); }
         match rows.iter_mut().find(|(k, _)| *k == (i, rt)) {
             Some((_, v)) => v.push(r),
@@ -436,21 +438,31 @@ Changed: x"))];
 Changed: x")),
             e(11, "taskq: spawn reviewer codex:- win"), e(12, &format!("taskq: result {sha} attempt 11
 Changed: x"))];
-        assert_eq!(crate::core::stage_outcome(7, Some((review.as_slice(), true)), 11, 11, true), ("failed", "exit"));
+        assert_eq!(crate::core::stage_outcome(7, Ok((review.as_slice(), Some(true))), 11, 11), ("failed", "exit"));
+        // an issue that left the board read is read back: the reviewer's accepted close is ok; a label removal or an
+        // owner close (no reviewer hand-in) and an unreadable read-back are unknown with reason, never ok
+        let closed = |by: &str| [&review[..3], &[e(13, &format!("taskq: close {by}\nlooks fine"))]].concat();
+        let (own, other, removed) = (closed("attempt 11"), closed(""), review[..3].to_vec());
+        for (log, want) in [(&own, ("ok", "none")), (&other, ("unknown", "left-board")), (&removed, ("unknown", "left-board"))] {
+            assert_eq!(crate::core::stage_outcome(7, Ok((log.as_slice(), None)), 11, 11), want, "{:?}", log.last().map(|e| &e.body));
+        }
+        assert_eq!(crate::core::stage_outcome(7, Err("unreadable"), 11, 11), ("unknown", "unreadable"));
         for (log, live, want) in [(&result, false, ("ok", "none")), (&requeue, false, ("retried", "none")), (&owner, false, ("cancelled", "none")),
             (&owner, true, ("failed", "exit")), (&invalid, true, ("failed", "exit")), (&repeated, true, ("ask", "none"))] {
-            assert_eq!(crate::core::stage_outcome(7, Some((log.as_slice(), live)), 10, 10, false), want, "{:?}", log.last().map(|e| &e.body));
+            assert_eq!(crate::core::stage_outcome(7, Ok((log.as_slice(), Some(live))), 10, 10), want, "{:?}", log.last().map(|e| &e.body));
         }
+        stage_at(Some(&path), "review", 7, 11, "codex", ms(6), "unknown", "left-board", Usage::Unknown("log-unreadable"));
         let log = fs::read_to_string(&path).unwrap();
         assert!(!log.contains("secret") && !log.contains("/host/path") && !log.contains("private-rt"));
         let text = report(&dir);
-        assert!(text.contains("Slow stages (p95): build/claude > build/codex > review/claude > claim/other > review/codex-app"), "{text}");
+        assert!(text.contains("Slow stages (p95): build/claude > review/codex > build/codex > review/claude > claim/other > review/codex-app"), "{text}");
         assert!(text.contains("Failing stages (rate): claim/other > build/codex"), "{text}");
         assert!(text.contains("| build | claude | 1 | 9.000/9.000/9.000 | ok:1 | 2 | 230 | unknown |"), "{text}");
         assert!(text.contains("| build | codex | 2 | 1.000/5.000/5.000 | ask:1, failed exit:1 | unknown (log-unreadable, not-reported) | 1400 (1 of 2 known; log-unreadable) |"), "{text}");
         assert!(text.contains("| review | codex-app | 1 | 2.000/2.000/2.000 | ok:1 | unknown (app-turn) | unknown (app-turn) |"), "{text}");
         assert!(text.contains("| review | claude | 2 | 4.000/4.000/4.000 (1 of 2 timed; adopted) | ok:2 | 1 (1 of 2 known; adopted) | unknown (adopted, no-usage) |"), "{text}");
         assert!(text.contains("| claim | other | 1 | 3.000/3.000/3.000 | failed http5xx:1 | none (no model) | none (no model) |"), "{text}");
+        assert!(text.contains("| review | codex | 1 | 6.000/6.000/6.000 | unknown left-board:1 |"), "{text}");
         fs::write(&path, format!("{log}{STAGE_PREFIX}{{\"stage\":\"lunch\"}}\n")).unwrap();
         assert!(report(&dir).contains("Attempt stages: unknown (corrupt stage record; log kept)"));
         fs::remove_dir_all(dir).unwrap();

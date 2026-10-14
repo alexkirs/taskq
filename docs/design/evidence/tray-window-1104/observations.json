@@ -36,7 +36,7 @@
     {
       "name": "fixed-header",
       "width": 425,
-      "height": 230,
+      "height": 340,
       "dpr": 1.399999976158142,
       "scroll": 524,
       "horizontal": 415,
@@ -47,9 +47,9 @@
     {
       "name": "task-rows",
       "width": 425,
-      "height": 630,
+      "height": 740,
       "dpr": 1.399999976158142,
-      "scroll": 630,
+      "scroll": 740,
       "horizontal": 425,
       "header": 5.9933037757873535,
       "pin": "true",
@@ -76,11 +76,11 @@
   },
   "restartSize": [
     425,
-    230
+    340
   ],
   "restored": [
     425,
-    230
+    340
   ],
   "rowLayout": {
     "title": "A complete task title wraps on its own second row and keeps every word visible while metadata and the local session link stay above it",
@@ -90,11 +90,11 @@
     "sessionInHead": true,
     "overflow": false
   },
-  "binarySha256": "b44108732cb58a7644c5ad2f24229f1616d21bb58a8c7303c1e6ac8f30a7a2ac",
-  "codeCommit": "d054f08616ea89a4b88aee81610cdfe477067720",
+  "binarySha256": "1984d399a6465d60a7034ed9ffdf91ac8160816ea1fad5d8026187de26d8e9ed",
+  "codeCommit": "eb8bb2d4ba8505c7203a838bb003f22bcaceac3f",
   "uiSources": {
-    "src/tray.rs": "b73bd2a2dc9a6b880a7b275f2f10517f8d08feee",
-    "src/tray.html": "233c0d184691767d04dcb0609693cc9f7204bd83",
+    "src/tray.rs": "1c07debd5eeb969b22254d5fd65f72894ac385bb",
+    "src/tray.html": "9cd7940f1b990d28e510a8acfc68cea7f3ac0f50",
     "Cargo.toml": "e72182ff6641f4ff05dea3589eb5bd569f39f69a",
     "src/project-blocks.js": "b6c97fd8559dba5365c796a36fa4b5b68c1e36e8",
     "src/project-blocks.css": "d89080dc771455773fb4accbe95bbcdb935a5c21"

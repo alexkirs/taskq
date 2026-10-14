@@ -81,6 +81,10 @@ fn update_inner(install: &Path, check: bool) -> Result<Option<String>, String> {
         let shim = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin/taskq")).unwrap_or_default();
         sweep(install, &shim);
     }
+    #[cfg(target_os = "macos")]
+    if let Some(v) = v.as_deref().filter(|_| !check) {
+        sign_copies(&tool(install), v);
+    }
     Ok(v)
 }
 
@@ -95,7 +99,32 @@ pub fn install_self(t: &Tool) -> Result<(), String> {
         // ponytail: a start in the unlink-to-copy gap fails once; coreq writing tmp + rename would close it
         let _ = fs::remove_file(&dst);
     }
-    coreq::update::install_self(t)
+    coreq::update::install_self(t)?;
+    #[cfg(target_os = "macos")]
+    sign_copies(t, t.version);
+    Ok(())
+}
+
+/// § 8 step 5: the local code-signing identity in the login keychain; absent, copies stay ad-hoc.
+#[cfg(target_os = "macos")]
+const SIGNING_IDENTITY: &str = "TaskQ Local Signing";
+
+/// `codesign` with the local identity; false when it is missing or signing fails.
+#[cfg(target_os = "macos")]
+pub fn codesign(path: &Path, extra: &[&str]) -> bool {
+    std::process::Command::new("codesign").args(["-f", "-s", SIGNING_IDENTITY]).args(extra).arg(path).output().is_ok_and(|o| o.status.success())
+}
+
+/// § 8 step 5: TCC keys an ad-hoc grant to the cdhash, so each release would need a new grant. Signs a copy of the
+/// release `v` and of the launcher with the local identity and a fixed id, then renames it into place (step 5).
+#[cfg(target_os = "macos")]
+fn sign_copies(t: &Tool, v: &str) {
+    for exe in [t.release_exe(v), t.install.join(t.exe_name())] {
+        let tmp = exe.with_extension("signing");
+        if !(fs::copy(&exe, &tmp).is_ok() && codesign(&tmp, &["-i", "org.taskq.taskq"]) && fs::rename(&tmp, &exe).is_ok()) {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
 }
 
 /// GNU links the DLL; MSVC release artifacts link the loader statically.

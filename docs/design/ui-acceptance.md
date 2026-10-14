@@ -48,6 +48,8 @@ Permission, AI and remote extensions remain gated by their unimplemented or unqu
 
 ## Native matrix
 
+The full matrix runs only for release qualification and README shots; a task's check captures only the routes its diff changes (`taskq tray --snapshot DIR --route R,..`, [taskq.md R12](../../taskq.md#r12-unverified-means-unknown)).
+
 - macOS WKWebView + installed menu-bar icon; Windows WebView2 + installed notification-area icon. Same fixture revision.
 - Both themes; 14/16/18/20 px. Windows scale 100/125/150/200%; macOS actual 1×/2× displays where supported. Unsupported/unavailable cells explicitly Not tested.
 - Windows 1366×768 and 1920×1080 work areas; bottom/top/side taskbar; secondary monitor with different DPI. macOS ordinary/notched menu bar, Dock reservation and external monitor.

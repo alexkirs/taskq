@@ -523,9 +523,12 @@ fn summary(ps: &[Value], (start, end): (i64, i64)) -> Summary {
     Summary { counts: [t["doing"] + t["review"], t["ask"], t["ready"], t["failed"]], known, run: ps.iter().any(|p| p["focus"].as_array().is_some_and(|f| !f.is_empty())), bins, since }
 }
 
-pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
+pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> Result<(), String> {
     if snapshot.is_none() && !alone(&install) {
         return Err("taskq tray already runs on this host".into());
+    }
+    if let Some(r) = routes.iter().find(|r| r.as_str() != "icon" && !ROUTES.contains(&r.as_str())) {
+        return Err(format!("unknown route {r}; known: icon, {}", ROUTES.join(", ")));
     }
     #[allow(unused_mut)]
     let mut event_loop = EventLoopBuilder::<Ev>::with_user_event().build();
@@ -534,6 +537,8 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
         // menu bar only: no Dock icon, no app menu
         use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
         event_loop.set_activation_policy(ActivationPolicy::Accessory);
+        // a snapshot never takes the owner's focus (taskq.md R12)
+        event_loop.set_activate_ignoring_other_apps(snapshot.is_none());
     }
     let proxy = event_loop.create_proxy();
     TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
@@ -572,6 +577,8 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
             Event::NewEvents(StartCause::Init) => {
                 let b = WindowBuilder::new().with_title("taskq").with_decorations(false).with_resizable(false).with_always_on_top(true)
                     .with_visible(snapshot.is_some()).with_inner_size(LogicalSize::new(320.0, 400.0)).with_position(tao::dpi::LogicalPosition::new(40.0, 40.0));
+                // a snapshot renders off the visible screen (taskq.md R12)
+                let b = if snapshot.is_some() { b.with_position(tao::dpi::LogicalPosition::new(-20000.0, -20000.0)).with_always_on_top(false).with_focused(false) } else { b };
                 #[cfg(windows)]
                 let b = tao::platform::windows::WindowBuilderExtWindows::with_skip_taskbar(b, true);
                 let p = proxy.clone();
@@ -717,7 +724,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                         push(&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     "size" => {
-                        let max = w.current_monitor().map_or(800.0, |m| m.size().to_logical::<f64>(m.scale_factor()).height) * if snapshot.is_some() { 0.95 } else { 0.8 };
+                        let max = w.current_monitor().or_else(|| w.primary_monitor()).map_or(800.0, |m| m.size().to_logical::<f64>(m.scale_factor()).height) * if snapshot.is_some() { 0.95 } else { 0.8 };
                         let (width, height) = popover_size(&m, max, w.scale_factor());
                         w.set_inner_size(tao::dpi::PhysicalSize::new(width, height));
                         // pinned: the window stays where it was put; a move then keeps it in the work area
@@ -833,9 +840,11 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
             // snapshot mode: per step push a state, wait for layout, capture, next
             Event::UserEvent(Ev::Shot) => {
                 let dir = snapshot.clone().unwrap_or_default();
-                let steps = shots(&install);
+                let steps = shots(&install, &routes);
                 if step == 0 {
                     let _ = fs::create_dir_all(&dir);
+                }
+                if step == 0 && (routes.is_empty() || routes.iter().any(|r| r == "icon")) {
                     let ps: Vec<Value> = roots(&install).iter().map(|r| project(&install, r)).collect();
                     let s = summary(&ps, day(now()));
                     // this Mac's menu-bar height and backing scale (A5); the names record them
@@ -880,7 +889,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>) -> Result<(), String> {
                 let Some((_, wv)) = &ui else { return };
                 let dir = snapshot.clone().unwrap_or_default();
                 let p = proxy.clone();
-                let name = format!("popover-{}.png", shot_name(&install, step));
+                let name = format!("popover-{}.png", shot_name(&install, &routes, step));
                 let _ = wv.evaluate_script(&OVERFLOW.replace("NAME", &name));
                 step += 1;
                 capture(wv, dir.join(name), move || {
@@ -911,21 +920,28 @@ if(x>0)window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME',x}));})()
 const ACTIONS: &str = "(()=>{const q=s=>document.querySelector(s),put=(s,v)=>{const i=q(s);i.value=v;i.dispatchEvent(new Event('input',{bubbles:true}));};
 q('[data-route=cadence]').click();q('[data-v=custom]').click();put('#hs','2026-10-13T10:00');put('#he','2026-10-13T09:00');q('[data-a=range]').click();})()";
 
-/// Snapshot steps: theme, page (`home` or a project root), text size, a script run on the page.
-fn shots(install: &Path) -> Vec<(&'static str, String, u64, &'static str)> {
+/// `tray --snapshot --route` names: `actions` is Home with the [`ACTIONS`] script, `project` the first project's page.
+const ROUTES: [&str; 12] = ["home", "actions", "project", "projects", "attention", "settings", "appearance", "cadence", "notifications", "agents", "services", "about"];
+
+/// Snapshot steps: theme, page (`home` or a project root), text size, a script run on the page; only `routes` unless empty.
+fn shots(install: &Path, routes: &[String]) -> Vec<(&'static str, String, u64, &'static str)> {
     let first = roots(install).into_iter().next();
     ["dark", "light"].iter().flat_map(|t| {
         let mut v = vec![(*t, "home".to_string(), 16, ""), (*t, "home".to_string(), 20, ""), (*t, "home".to_string(), 16, ACTIONS)];
         v.extend(first.clone().map(|r| (*t, r, 16, "")));
-        for route in ["projects", "attention", "settings", "appearance", "cadence", "notifications", "agents", "services", "about"] {
-            for font in [16, 20] { v.push((*t, route.into(), font, "")); }
+        for route in &ROUTES[3..] {
+            for font in [16, 20] { v.push((*t, route.to_string(), font, "")); }
         }
         v
-    }).collect()
+    }).filter(|(_, p, _, js)| routes.is_empty() || routes.iter().any(|r| r == route_of(p, js))).collect()
 }
 
-fn shot_name(install: &Path, step: usize) -> String {
-    shots(install).get(step).map_or(step.to_string(), |(t, p, f, js)| format!("{t}-{}{}-{f}", if Path::new(p).is_absolute() { "project" } else { p }, if js.is_empty() { "" } else { "-actions" }))
+fn route_of<'a>(page: &'a str, script: &str) -> &'a str {
+    if !script.is_empty() { "actions" } else if Path::new(page).is_absolute() { "project" } else { page }
+}
+
+fn shot_name(install: &Path, routes: &[String], step: usize) -> String {
+    shots(install, routes).get(step).map_or(step.to_string(), |(t, p, f, js)| format!("{t}-{}{}-{f}", if Path::new(p).is_absolute() { "project" } else { p }, if js.is_empty() { "" } else { "-actions" }))
 }
 
 fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>, add: &Value) -> Value {
@@ -1431,6 +1447,26 @@ fn capture(wv: &WebView, path: PathBuf, done: impl Fn() + 'static) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: R12 tray evidence -> `tray --snapshot --route`. Risk: a filtered run captures the full matrix or drops a route.
+    #[test]
+    fn snapshot_routes_capture_only_named_pages() {
+        let install = std::env::temp_dir().join(format!("taskq-tray-routes-{}", std::process::id()));
+        fs::create_dir_all(&install).unwrap();
+        let root = std::env::temp_dir().join("taskq-tray-routes-project");
+        fs::write(install.join("projects"), root.to_str().unwrap()).unwrap();
+        let r = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let names = |v: &[&str]| (0..shots(&install, &r(v)).len()).map(|i| shot_name(&install, &r(v), i)).collect::<Vec<_>>();
+        assert_eq!(names(&["attention"]), ["dark-attention-16", "dark-attention-20", "light-attention-16", "light-attention-20"]);
+        assert_eq!(names(&["actions", "project"]), ["dark-home-actions-16", "dark-project-16", "light-home-actions-16", "light-project-16"]);
+        assert!(names(&["icon"]).is_empty(), "icon alone captures no popover page");
+        let all = names(&[]);
+        assert_eq!(all.len(), 2 * (4 + 2 * (ROUTES.len() - 3)), "no filter keeps the full matrix");
+        for route in ROUTES {
+            assert!(!names(&[route]).is_empty(), "{route} names a captured page");
+        }
+        fs::remove_dir_all(&install).ok();
+    }
 
     // Chain: owner tray answer -> canonical CLI. Risk: IPC selects another project or inherits worker fencing.
     #[test]

@@ -67,7 +67,7 @@ const USAGE: &str = "taskq agents
  taskq service focus [all|off|<label..>] [--request TEXT]
  taskq service capacity [--host H] [--mode auto|fixed] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
  taskq service permissions [--runtime R --mode restricted|workspace|full|none [--scope host|project]]
- taskq tray [--snapshot DIR] [--icon FILE] | taskq selftest
+ taskq tray [--snapshot DIR [--route R,..]] [--icon FILE] | taskq selftest
 Writes to a task take [--op-id ID] [--revision R] [--json] (taskq.md section 5).
 Text templates and limits: taskq.md sections 1, 2, 5, 7.";
 
@@ -1435,18 +1435,21 @@ fn recover_cmd(root: &Path, apply: bool, json: bool) -> Res<()> {
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn tray(install: PathBuf, snapshot: Option<&str>, icon: Option<&str>) -> Res<()> {
+fn tray(install: PathBuf, snapshot: Option<&str>, routes: &[String], icon: Option<&str>) -> Res<()> {
     if let Some(f) = icon {
         let draft: serde_json::Value = serde_json::from_str(&fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?).map_err(|e| format!("{f}: {e}"))?;
         tray::use_icon(&install, &draft).map_err(|e| format!("{f}: {}; tray.json unchanged", e.join("; ")))?;
         println!("custom icon saved: {}", install.join("tray.json").display());
         return Ok(());
     }
-    tray::run(install, snapshot.map(PathBuf::from))
+    if snapshot.is_none() && !routes.is_empty() {
+        return Err("--route needs --snapshot DIR".into());
+    }
+    tray::run(install, snapshot.map(PathBuf::from), routes.to_vec())
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-fn tray(_install: PathBuf, _snapshot: Option<&str>, _icon: Option<&str>) -> Res<()> {
+fn tray(_install: PathBuf, _snapshot: Option<&str>, _routes: &[String], _icon: Option<&str>) -> Res<()> {
     Err("taskq tray: macOS and Windows only".into())
 }
 
@@ -1675,7 +1678,7 @@ fn run(argv: &[String]) -> Res<()> {
             print!("{}", retro::run(&cfg.root, rt)?);
             Ok(())
         }
-        "tray" => tray(platform::default_install(), a.one("snapshot"), a.one("icon")),
+        "tray" => tray(platform::default_install(), a.one("snapshot"), &a.all("route").iter().flat_map(|r| r.split(',')).map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect::<Vec<_>>(), a.one("icon")),
         "" => Err("command missing; use `taskq help`".into()),
         _ => command(&ctx()?, cmd, &a),
     }

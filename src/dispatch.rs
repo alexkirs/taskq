@@ -242,10 +242,14 @@ pub fn answer_picks(b: &dyn Board, cfg: &Config, picks: &[String], op: &Op) -> R
         };
         let close = opt.to_lowercase().starts_with("close");
         if gated && opt.to_lowercase().starts_with("approve") {
-            // § 7: the owner's pick approves the current result first, as one more op of the same id
+            let Some(sha) = core::approval_sha(&opt) else {
+                out.push(Receipt::rejected(n, op, "approval option must name the displayed result SHA"));
+                continue;
+            };
+            // § 7: approve only the displayed revision, then resume the reviewer.
             let first = Op { id: op.id.as_ref().map(|i| format!("{i}.approve")), revision: op.revision };
-            let r = approve(b, &cfg.root, n, None, &first, agent());
-            if state == State::Review || matches!(r.outcome, "stale" | "unknown") {
+            let r = approve(b, &cfg.root, n, Some(sha), &first, agent());
+            if state == State::Review || !r.ok() {
                 out.push(r);
                 continue;
             }

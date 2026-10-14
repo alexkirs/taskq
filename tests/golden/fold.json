@@ -343,5 +343,45 @@
    {"id": 13, "body": "taskq: approve 0123456789abcdef0123456789abcdef01234567\nop-id: pm.2"},
    {"id": 14, "body": "taskq: approve 0123456789abcdef0123456789abcdef01234567\nop-id: pm.2"},
    {"id": 15, "body": "taskq: approve 0123456789abcdef0123456789abcdef01234567"}
-  ], "expect": {"state": "review", "result": "0123456789abcdef0123456789abcdef01234567", "gate": "approved"}}
+  ], "expect": {"state": "review", "result": "0123456789abcdef0123456789abcdef01234567", "gate": "approved"}},
+  {"name": "gate board pick: number", "entries": [
+   {"id": 9, "body": "taskq: gate"},
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 13, "body": "taskq: spawn reviewer claude:r1 mac"},
+   {"id": 14, "body": "taskq: ask attempt 13\nDone: A1 checked\nProblem: owner gate\n1. approve 0123456 and close ★\n2. requeue"},
+   {"id": 16, "body": "1"}
+  ], "expect": {"state": "review", "attempt": 13, "role": "reviewer", "session": "claude:r1 mac", "result": "0123456789abcdef0123456789abcdef01234567", "inbox": [16], "gate": "approved"}},
+  {"name": "gate board pick: text", "entries": [
+   {"id": 9, "body": "taskq: gate"},
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 13, "body": "taskq: spawn reviewer claude:r1 mac"},
+   {"id": 14, "body": "taskq: ask attempt 13\nDone: A1 checked\nProblem: owner gate\n1. approve 0123456 and close ★\n2. requeue"},
+   {"id": 16, "body": "approve 0123456 and close"}
+  ], "expect": {"state": "review", "attempt": 13, "role": "reviewer", "session": "claude:r1 mac", "result": "0123456789abcdef0123456789abcdef01234567", "inbox": [16], "gate": "approved"}},
+  {"name": "gate board pick: CLI form", "entries": [
+   {"id": 9, "body": "taskq: gate"},
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 13, "body": "taskq: spawn reviewer claude:r1 mac"},
+   {"id": 14, "body": "taskq: ask attempt 13\nDone: A1 checked\nProblem: owner gate\n1. approve 0123456 and close ★\n2. requeue"},
+   {"id": 16, "body": "taskq answer 1"}
+  ], "expect": {"state": "review", "attempt": 13, "role": "reviewer", "session": "claude:r1 mac", "result": "0123456789abcdef0123456789abcdef01234567", "inbox": [16], "gate": "approved"}},
+  {"name": "gate board pick: stale card", "entries": [
+   {"id": 9, "body": "taskq: gate"},
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 13, "body": "taskq: spawn reviewer claude:r1 mac"},
+   {"id": 14, "body": "taskq: ask attempt 13\nDone: A1 checked\nProblem: owner gate\n1. approve 89abcde and close ★\n2. requeue"},
+   {"id": 16, "body": "1"}
+  ], "expect": {"state": "review", "attempt": 13, "role": "reviewer", "session": "claude:r1 mac", "result": "0123456789abcdef0123456789abcdef01234567", "inbox": [16], "gate": "required"}},
+  {"name": "gate board pick: agent answer", "entries": [
+   {"id": 9, "body": "taskq: gate"},
+   {"id": 10, "body": "taskq: spawn worker claude:s1 mac"},
+   {"id": 12, "body": "taskq: result 0123456789abcdef0123456789abcdef01234567 attempt 10"},
+   {"id": 13, "body": "taskq: spawn reviewer claude:r1 mac"},
+   {"id": 14, "body": "taskq: ask attempt 13\nDone: A1 checked\nProblem: owner gate\n1. approve 0123456 and close ★\n2. requeue"},
+   {"id": 16, "body": "taskq: answer 1 attempt 13"}
+  ], "expect": {"state": "review", "attempt": 13, "role": "reviewer", "session": "claude:r1 mac", "result": "0123456789abcdef0123456789abcdef01234567", "inbox": [16], "gate": "required"}}
 ]

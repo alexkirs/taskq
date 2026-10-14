@@ -181,6 +181,14 @@ pub fn options(card: &str) -> Vec<(usize, String, bool)> {
         .collect()
 }
 
+/// The revision displayed by an approval option; no implicit approval of an unseen result.
+pub fn approval_sha(option: &str) -> Option<&str> {
+    let mut words = option.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("approve") { return None; }
+    let sha = words.next()?;
+    ((7..=40).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit())).then_some(sha)
+}
+
 /// The option a bare comment `s` names on `card` (§ 2): its number, or its text with or without `K. `, case-insensitive;
 /// None unless exactly one option matches.
 fn pick(card: &str, s: &str) -> Option<usize> {
@@ -362,6 +370,15 @@ fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool
             t.state = Closed;
         }
         (Ask, "answer", _) if !l.bare || pick(t.card.as_deref().unwrap_or(""), l.args[0]).is_some() => {
+            if !own && t.gate.is_some() {
+                let card = t.card.as_deref().unwrap_or("");
+                let k = if l.bare { pick(card, l.args[0]) } else { l.args.first().and_then(|s| s.parse().ok()) };
+                if options(card).iter().any(|(n, option, _)| Some(*n) == k
+                    && approval_sha(option).is_some_and(|sha| t.result.as_deref().is_some_and(|r| r.starts_with(sha))))
+                {
+                    t.gate = Some(Gate::Approved);
+                }
+            }
             t.retries = 0;
             t.card = None;
             match resume.take() {

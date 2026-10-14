@@ -1367,6 +1367,68 @@ fn run(argv: &[String]) -> Res<()> {
     }
 }
 
+/// §1 create claim: only the invocation that reads back its winning claim may POST an issue.
+fn claimed_create(b: &dyn Board, raw: &Value, title: &str, body: &str, labels: &[String], later_text: &str, op: &Op) -> Result<u64, Receipt> {
+    let id = op.id.as_deref().expect("claimed create needs an op id");
+    let unknown = |n, reason: String| Receipt {
+        outcome: "unknown", next: "Retry the identical add with the same --op-id for read-only discovery.".into(),
+        ..Receipt::rejected(n, op, reason)
+    };
+    let read = |e| unknown(0, e);
+    let claim_issue = raw["create_claim_issue"].as_u64().filter(|n| *n > 0)
+        .ok_or_else(|| Receipt::rejected(0, op, "configure create_claim_issue before idempotent create"))?;
+    let issue = b.issue(claim_issue).map_err(read)?;
+    if !issue.trusted || service::is_task(&issue) || service::is_held(&issue) || issue.labels.iter().any(|l| l == "taskq-host") {
+        return Err(Receipt::rejected(0, op, "create_claim_issue must be trusted and outside the queue/hosts"));
+    }
+    let request = json!({"actor": b.me().map_err(read)?, "title": title, "body": body, "labels": labels, "later_text": later_text}).to_string();
+    let hash: String = ring::digest::digest(&ring::digest::SHA256, request.as_bytes()).as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let header = format!("taskq: create-claim {id}");
+    let claim = format!("{header}\nrequest-sha256: {hash}");
+    let first = || -> Res<Option<board::Comment>> {
+        Ok(b.comments(claim_issue)?.into_iter().filter(|c| c.trusted && !c.edited && c.body.lines().next() == Some(header.as_str())).min_by_key(|c| c.id))
+    };
+    let discover = || -> Result<Receipt, Receipt> {
+        let marker = format!("\nop-id: {id}");
+        let matches: Vec<_> = b.issues(Some(0)).map_err(read)?.into_iter().filter(|i| i.body.trim_end().ends_with(&marker)).collect();
+        if matches.len() != 1 {
+            return Err(unknown(0, "create claim exists; issue absent or duplicated, no further POST allowed".into()));
+        }
+        let i = b.issue(matches[0].number).map_err(read)?;
+        if !i.trusted || i.title != title || i.body != body {
+            return Err(unknown(i.number, "created issue conflicts with the immutable request".into()));
+        }
+        let log = entries(b, i.number).map_err(read)?;
+        let state = if !i.open { State::Closed } else if service::is_held(&i) { State::Held } else { fold(i.number, &log, deps_open(b, &i.body).map_err(read)?).state };
+        Ok(Receipt::accepted(i.number, op, state, core::revision(i.number, &log)))
+    };
+    if let Some(first) = first().map_err(read)? {
+        if first.body != claim {
+            return Err(Receipt::rejected(0, op, "op id already binds a different request or actor"));
+        }
+        return Err(discover().unwrap_or_else(|r| r));
+    }
+    // Legacy op ids cannot be upgraded by blindly creating another issue.
+    let marker = format!("\nop-id: {id}");
+    if b.issues(Some(0)).map_err(read)?.iter().any(|i| i.body.trim_end().ends_with(&marker)) {
+        return Err(Receipt::rejected(0, op, "existing issue has no create claim; owner reconciliation required"));
+    }
+    let own = b.comment(claim_issue, &claim).map_err(read)?;
+    let winner = first().map_err(read)?.ok_or_else(|| unknown(0, "claim missing on readback; no create POST allowed".into()))?;
+    if winner.body != claim {
+        return Err(Receipt::rejected(0, op, "op id already binds a different request or actor"));
+    }
+    if winner.id != own {
+        return Err(discover().unwrap_or_else(|r| r));
+    }
+    let n = b.create(title, body, labels).map_err(read)?;
+    let issue = b.issue(n).map_err(|e| unknown(n, e))?;
+    if !issue.trusted || issue.title != title || issue.body != body || issue.labels.len() != labels.len() || labels.iter().any(|l| !issue.labels.contains(l)) {
+        return Err(unknown(n, "create readback does not match the request".into()));
+    }
+    Ok(n)
+}
+
 fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
     let (b, cfg, root) = (c.board.as_ref(), &c.cfg, c.cfg.root.as_path());
     let text = a.one("text").unwrap_or("");
@@ -1435,15 +1497,9 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             if hold && a.flags.contains_key("later") {
                 return Err("--hold and --later exclude each other".into());
             }
-            // § 1: an open issue carrying this op id is the first create; return its receipt, write nothing
+            // §1: the operation marker is part of the immutable claimed request.
             if let Some(id) = &op.id {
                 body += &format!("\nop-id: {id}\n");
-                if let Some(i) = b.issues(None)?.into_iter().find(|i| i.trusted && i.body.trim_end().ends_with(&format!("\nop-id: {id}"))) {
-                    let log = entries(b, i.number)?;
-                    let t = fold(i.number, &log, deps_open(b, &i.body)?);
-                    let state = if service::is_held(&i) { State::Held } else { t.state };
-                    return emit(&[Receipt::accepted(i.number, &op, state, core::revision(i.number, &log))], json);
-                }
             }
             let blocked = deps_open(b, &body)?;
             // a held task gets `q-held` instead of `taskq`: no service of any version admits it before `start`
@@ -1454,7 +1510,12 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                 }
             }
             labels::validate(&labels)?;
-            let n = b.create(title, &body, &labels)?;
+            let n = if op.id.is_some() {
+                match claimed_create(b, &c.raw, title, &body, &labels, if a.flags.contains_key("later") { text } else { "" }, &op) {
+                    Ok(n) => n,
+                    Err(r) => return emit(&[r], json),
+                }
+            } else { b.create(title, &body, &labels)? };
             let r = match (hold, a.flags.contains_key("later")) {
                 (true, _) => act(b, root, n, "hold", &[], "", &Op::default()),
                 (_, true) => act(b, root, n, "later", &[], text, &Op::default()),
@@ -1696,16 +1757,137 @@ mod tests {
         assert_eq!(c.board.issues(None).unwrap().len(), 4);
     }
 
-    // Chain: § 1 task body. Risk: over-limit text or a wrong body is written.
+    // Chain: §1 claimed create -> readback/retry. Risk: duplicate issues after a race, restart or lost response.
+    #[test]
+    fn create_claim_race_and_unknown_post_reconcile_without_another_post() {
+        let raw = json!({"create_claim_issue": 1});
+        let op = Op { id: Some("finding.1".into()), ..Default::default() };
+        let body = "## Goal\nG\n\nop-id: finding.1\n";
+        let labels = vec!["q-held".into()];
+        let b = Fake::default();
+        b.create("Claims", "", &[]).unwrap();
+        let n = claimed_create(&b, &raw, "T", body, &labels, "", &op).unwrap();
+        let claim = b.comments(1).unwrap()[0].body.clone();
+        assert_eq!(claimed_create(&b, &raw, "T", body, &labels, "", &op).unwrap_err().outcome, "accepted");
+        for (title, text, labels) in [("Changed", "", labels.clone()), ("T", "changed", labels.clone()), ("T", "", vec!["taskq".into()])] {
+            assert_eq!(claimed_create(&b, &raw, title, body, &labels, text, &op).unwrap_err().outcome, "rejected");
+        }
+        b.close(n).unwrap();
+        assert_eq!(claimed_create(&b, &raw, "T", body, &labels, "", &op).unwrap_err().state, Some("closed"));
+        assert_eq!(b.issues(Some(0)).unwrap().len(), 2);
+        b.create("T", body, &labels).unwrap();
+        assert_eq!(claimed_create(&b, &raw, "T", body, &labels, "", &op).unwrap_err().outcome, "unknown", "duplicate evidence is never accepted");
+
+        let trusted = Fake::default();
+        trusted.create("Claims", "", &[]).unwrap();
+        trusted.raw(1, "taskq: create-claim finding.1\nrequest-sha256: forged", false, false);
+        trusted.raw(1, "taskq: create-claim finding.1\nrequest-sha256: edited", true, true);
+        assert!(claimed_create(&trusted, &raw, "T", body, &labels, "", &op).is_ok(), "untrusted and edited claims have no authority");
+        assert_eq!(claimed_create(&trusted, &raw, "T", "changed body", &labels, "", &op).unwrap_err().outcome, "rejected");
+        trusted.labels(1, &["taskq".into()], &[]).unwrap();
+        assert_eq!(claimed_create(&trusted, &raw, "T", body, &labels, "", &op).unwrap_err().outcome, "rejected", "a task cannot be the claim issue");
+
+        let legacy = Fake::default();
+        legacy.create("Claims", "", &[]).unwrap();
+        legacy.create("T", body, &labels).unwrap();
+        assert_eq!(claimed_create(&legacy, &raw, "T", body, &labels, "", &op).unwrap_err().outcome, "rejected");
+        assert!(legacy.comments(1).unwrap().is_empty(), "legacy reconciliation creates no claim");
+
+        // Two invocations read no claim. The competitor's claim lands just before ours;
+        // it is paused before its issue POST, so our invocation must only discover.
+        let race = Fake::default();
+        race.create("Claims", "", &[]).unwrap();
+        race.state.borrow_mut().race = Some(claim);
+        let r = claimed_create(&race, &raw, "T", body, &labels, "", &op).unwrap_err();
+        assert_eq!(r.outcome, "unknown");
+        assert_eq!(race.comments(1).unwrap().len(), 2, "both contenders posted claims");
+        assert_eq!(race.issues(None).unwrap().len(), 1, "loser never POSTs an issue");
+        assert_eq!(claimed_create(&race, &raw, "T", body, &labels, "", &op).unwrap_err().outcome, "unknown");
+        // Winner's POST has an unknown response and is absent from discovery until later.
+        let n = race.create("T", body, &labels).unwrap();
+        race.advance(10000);
+        let r = claimed_create(&race, &raw, "T", body, &labels, "", &op).unwrap_err();
+        assert_eq!((r.outcome, r.task, r.state), ("accepted", n, Some("held")));
+        assert_eq!(race.comments(1).unwrap().len(), 2, "recovery writes no comments");
+        assert_eq!(race.issues(None).unwrap().len(), 2, "recovery writes no issues");
+
+        let hidden = Fake::default();
+        hidden.create("Claims", "", &[]).unwrap();
+        hidden.state.borrow_mut().hide_latest_comment = true;
+        assert_eq!(claimed_create(&hidden, &raw, "T", body, &labels, "", &op).unwrap_err().outcome, "unknown");
+        assert_eq!(hidden.issues(None).unwrap().len(), 1, "missing claim readback cannot create");
+        hidden.state.borrow_mut().hide_latest_comment = false;
+        assert_eq!(claimed_create(&hidden, &raw, "T", body, &labels, "", &op).unwrap_err().outcome, "unknown");
+        assert_eq!(hidden.comments(1).unwrap().len(), 1, "a crashed claimant is never replaced");
+        assert_eq!(claimed_create(&hidden, &json!({}), "T", body, &labels, "", &op).unwrap_err().outcome, "rejected");
+    }
+
+    // Chain: §1 create POST -> lost response -> delayed readback. Risk: a retry duplicates the accepted POST.
+    #[test]
+    fn create_claim_adapter_lost_posts_and_interleaved_creates() {
+        use std::cell::Cell;
+        struct Writes {
+            b: Fake,
+            lose_create: Cell<bool>,
+            lose_claim: Cell<bool>,
+            hide_issue: Cell<bool>,
+            race: Cell<bool>,
+        }
+        impl Board for Writes {
+            fn issues(&self, since: Option<i64>) -> Res<Vec<board::Issue>> { Ok(self.b.issues(since)?.into_iter().filter(|i| !self.hide_issue.get() || i.number == 1).collect()) }
+            fn issue(&self, n: u64) -> Res<board::Issue> { self.b.issue(n) }
+            fn comments(&self, n: u64) -> Res<Vec<board::Comment>> { self.b.comments(n) }
+            fn comment(&self, n: u64, body: &str) -> Res<u64> {
+                if self.race.replace(false) {
+                    let op = Op { id: Some("lost.1".into()), ..Default::default() };
+                    claimed_create(&self.b, &json!({"create_claim_issue": 1}), "T", "G\nop-id: lost.1\n", &["q-held".into()], "", &op).unwrap();
+                }
+                let id = self.b.comment(n, body)?;
+                if self.lose_claim.replace(false) { Err("claim POST response lost".into()) } else { Ok(id) }
+            }
+            fn create(&self, title: &str, body: &str, labels: &[String]) -> Res<u64> {
+                let n = self.b.create(title, body, labels)?;
+                if self.lose_create.replace(false) { Err("create POST response lost".into()) } else { Ok(n) }
+            }
+            fn me(&self) -> Res<String> { self.b.me() }
+            fn edit_comment(&self, n: u64, id: u64, body: &str) -> Res<()> { self.b.edit_comment(n, id, body) }
+            fn labels(&self, n: u64, add: &[String], remove: &[String]) -> Res<()> { self.b.labels(n, add, remove) }
+            fn edit(&self, n: u64, body: &str) -> Res<()> { self.b.edit(n, body) }
+            fn close(&self, n: u64) -> Res<()> { self.b.close(n) }
+            fn now(&self) -> Res<i64> { self.b.now() }
+            fn publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> board::Publish { self.b.publish(n, sha, mode, title, task_line) }
+            fn url(&self, n: u64) -> String { self.b.url(n) }
+        }
+        for mode in ["create", "claim", "race"] {
+            let b = Writes { b: Fake::default(), lose_create: Cell::new(mode == "create"), lose_claim: Cell::new(mode == "claim"), hide_issue: Cell::new(false), race: Cell::new(mode == "race") };
+            b.b.create("Claims", "", &[]).unwrap();
+            let op = Op { id: Some("lost.1".into()), ..Default::default() };
+            let run = || claimed_create(&b, &json!({"create_claim_issue": 1}), "T", "G\nop-id: lost.1\n", &["q-held".into()], "", &op);
+            let r = run().unwrap_err();
+            assert_eq!(r.outcome, if mode == "race" { "accepted" } else { "unknown" });
+            let count = b.b.issues(None).unwrap().len();
+            assert_eq!(count, if mode == "claim" { 1 } else { 2 });
+            b.hide_issue.set(true);
+            assert_eq!(run().unwrap_err().outcome, "unknown", "empty discovery cannot authorize another POST");
+            b.hide_issue.set(false);
+            let r = run().unwrap_err();
+            assert_eq!(r.outcome, if mode == "claim" { "unknown" } else { "accepted" });
+            assert_eq!(b.b.issues(None).unwrap().len(), count);
+            assert_eq!(b.comments(1).unwrap().len(), if mode == "race" { 2 } else { 1 });
+        }
+    }
+
+    // Chain: § 1 held creation -> explicit start. Risk: idempotent retries admit held work.
     #[test]
     fn held_create_is_idempotent_and_starts_only_on_start() {
-        let c = Ctx { cfg: cfg(), raw: json!({}), board: Box::new(Fake::default()) };
+        let c = Ctx { cfg: cfg(), raw: json!({"create_claim_issue": 1}), board: Box::new(Fake::default()) };
         let b = c.board.as_ref();
+        b.create("Create claims", "", &[]).unwrap();
         let run = |v: &[&str]| command(&c, v[0], &Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap());
         let item = ["add", "T", "--goal", "G", "--acceptance", "a", "--hold", "--op-id", "req.1.0"];
         run(&item).unwrap();
         run(&item).unwrap();
-        let issues = b.issues(None).unwrap();
+        let issues: Vec<_> = b.issues(None).unwrap().into_iter().filter(service::is_held).collect();
         assert_eq!(issues.len(), 1, "a repeated op id writes one issue");
         let n = issues[0].number;
         assert!(issues[0].body.ends_with("\nop-id: req.1.0\n"));
@@ -1716,7 +1898,7 @@ mod tests {
         assert_eq!(views[0].task.state, State::Held);
         assert_eq!(fold(n, &entries(b, n).unwrap(), false).state, State::Held);
         run(&["add", "U", "--goal", "G", "--acceptance", "a", "--op-id", "req.1.1"]).unwrap();
-        assert_eq!(b.issues(None).unwrap().len(), 2, "each item has its own receipt");
+        assert_eq!(b.issues(None).unwrap().len(), 3, "each item has its own receipt, plus the claim issue");
         run(&["start", &n.to_string(), "--op-id", "s1"]).unwrap();
         let i = b.issue(n).unwrap();
         assert!(service::is_task(&i) && i.labels.contains(&"q-ready".to_string()) && !i.labels.contains(&"q-held".to_string()), "{:?}", i.labels);

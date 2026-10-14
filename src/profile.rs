@@ -240,7 +240,11 @@ mod tests {
                     }
                 }
             }); }
-            scope.spawn(|| { for _ in 0..50 { crate::data::trim_tail(&path, crate::data::LOG_MAX); } });
+            // the trimmer retries until it wins the lock once: a run where it never did kept the older record (#1072 CI)
+            scope.spawn(|| {
+                while !crate::data::trim_tail(&path, crate::data::LOG_MAX) { std::thread::yield_now(); }
+                for _ in 0..49 { crate::data::trim_tail(&path, crate::data::LOG_MAX); }
+            });
         });
         let records = fs::read_to_string(&path).unwrap().lines().filter(|l| l.starts_with(PREFIX)).count();
         assert_eq!(records, successful.load(Ordering::Relaxed));

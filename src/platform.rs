@@ -373,6 +373,8 @@ mod tests {
         let ino = || fs::metadata(t.release_exe(VERSION)).unwrap().ino();
         install_self(&t).unwrap();
         let first = ino();
+        // A hard link keeps the first inode alive, as a running service does; ext4 would reuse a freed one.
+        fs::hard_link(t.release_exe(VERSION), install.join("first")).unwrap();
         install_self(&t).unwrap();
         assert_ne!(ino(), first, "the release binary was rewritten in place");
         let _ = fs::remove_dir_all(&install);

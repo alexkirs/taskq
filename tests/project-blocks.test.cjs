@@ -19,6 +19,12 @@ assert(q.task(p,{...row,title:'<script>alert(1)</script>',url:'javascript:alert(
 assert(!q.task(p,{...row,url:'javascript:alert(1)'}).includes('href="javascript:'));
 assert(!q.task(p,{...row,local_session:false}).includes('codex://'));
 assert(q.task(p,{...row,local_session:false}).includes('Remote session'));
+// Chain: M3 shared task row -> metadata/independent links -> full title block in every consumer.
+// Risk: a long title is truncated or pushes the session control into the title line.
+const splitRow=q.task(p,{...row,title:'Complete title '.repeat(30)},true);
+assert(splitRow.includes('<div class="tqp-task-title">'+'Complete title '.repeat(30)+'</div>'));
+assert(splitRow.indexOf('aria-label="Open codex session"')<splitRow.indexOf('tqp-task-title'));
+assert(splitRow.indexOf('data-icon="openai"')<splitRow.indexOf('tqp-task-title'));
 for(const provider of ['github','gitlab'])assert(q.summary({...p,board:{...p.board,kind:provider}}).includes('data-icon="'+provider+'"'));
 const actions=[],adapter={project:id=>actions.push(['project',id]),tasks:(id,st)=>actions.push(['tasks',id,st]),open:u=>actions.push(['open',u])};
 function click(dataset){let prevented=false;assert(q.handle({target:{closest:()=>({dataset,getAttribute:()=>dataset.url})},preventDefault(){prevented=true;}},adapter));assert(prevented);}

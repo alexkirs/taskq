@@ -51,3 +51,26 @@ assert(h.includes('data-card="https://x/issues/8"'));assert(h.includes('Closed')
 run("navigate('home')");assert.equal(run("notedCard(S.projects[0])"),'');
 console.log('PASS M14 notification settings, OS block, project override and closed-task card');
 console.log('PASS WS11 nested Back, filter/scroll/disclosure restoration, settings categories, unknown probes/versions and maintenance destinations');
+
+// Chain: M13 header/fit -> native size request -> reopened persisted dimensions.
+// Risk: Top is coupled to Pin or a refresh overwrites the user's chosen size.
+const sizing={devicePixelRatio:1.4,gutter:()=>8,S:{font:20,pinned:false,top:true,size:null},sent:[],document:{body:{style:{}}},menu:{style:{},getBoundingClientRect:()=>({height:421.4})},send:m=>sizing.sent.push(m)};
+vm.createContext(sizing);
+vm.runInContext(html.slice(html.indexOf('function fit(){'),html.indexOf('const menu=')),sizing);
+vm.runInContext(html.slice(html.indexOf('function head(){'),html.indexOf('function render(')),sizing);
+const sizeRun=s=>vm.runInContext(s,sizing);
+sizeRun('fit()');assert.deepEqual(JSON.parse(JSON.stringify(sizing.sent.pop())),{a:'size',d:1.4,g:8,w:360,h:422});
+assert(sizeRun('head()').includes('data-a="top" aria-pressed="true"'));
+sizing.S.pinned=true;sizing.S.top=false;assert(sizeRun('head()').includes('data-a="top" aria-pressed="false"'));
+sizing.S.size=[480,600];sizeRun('fit()');assert.equal(sizing.sent.at(-1).h,600);
+sizeRun('manualSize=[500,300];fit()');assert.equal(sizing.sent.at(-1).w,500);assert.equal(sizing.sent.at(-1).h,300);
+console.log('PASS M13 independent header toggles, measured initial height and preserved manual size');
+
+// Chain: M13 resize -> capture loss -> next refresh. Risk: a cancelled drag leaves rendering held forever.
+const dragEvents={},dragMessages=[],drag={devicePixelRatio:1.4,innerWidth:320,innerHeight:400,manualSize:null,send:m=>dragMessages.push(m),menu:{style:{},addEventListener:(type,fn)=>dragEvents[type]=fn}};
+vm.createContext(drag);vm.runInContext(html.slice(html.indexOf('let resizing=null;'),html.indexOf("document.addEventListener('keydown',e=>")),drag);
+dragEvents.pointerdown({button:0,screenX:10,screenY:10,target:{closest:()=>true,setPointerCapture:()=>{}},preventDefault(){}});
+dragEvents.pointermove({screenX:30,screenY:25});dragEvents.lostpointercapture();dragEvents.lostpointercapture();
+assert.equal(vm.runInContext('resizing',drag),null);assert.equal(dragMessages.filter(m=>m.a==='resize-end').length,1);
+assert.equal(drag.manualSize[0],340);assert.equal(drag.manualSize[1],415);
+console.log('PASS M13 capture loss releases the resize guard once and preserves chosen dimensions');

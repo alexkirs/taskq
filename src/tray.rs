@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
-use tao::dpi::{LogicalSize, PhysicalPosition};
+use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::{Window, WindowBuilder};
@@ -60,11 +60,19 @@ struct Settings {
 }
 
 /// Pinned window (menu.md M13): pinned or not, the last display and the last top-left per display, physical pixels.
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, PartialEq)]
 struct Pin {
     pinned: bool,
+    top: bool,
+    size: Option<(f64, f64)>,
     display: String,
     pos: std::collections::BTreeMap<String, (i32, i32)>,
+}
+
+impl Default for Pin {
+    fn default() -> Self {
+        Self { pinned: false, top: true, size: None, display: String::new(), pos: Default::default() }
+    }
 }
 
 impl Settings {
@@ -75,7 +83,8 @@ impl Settings {
             None
         }).unwrap_or_default();
         let pos = v["pos"].as_object().into_iter().flatten().filter_map(|(k, p)| Some((k.clone(), (i32::try_from(p[0].as_i64()?).ok()?, i32::try_from(p[1].as_i64()?).ok()?)))).collect();
-        let pin = Pin { pinned: v["pinned"] == true, display: v["display"].as_str().unwrap_or("").into(), pos };
+        let size = v["size"][0].as_f64().zip(v["size"][1].as_f64()).filter(|(w, h)| w.is_finite() && h.is_finite() && *w >= 240.0 && *h >= 120.0);
+        let pin = Pin { top: v["top"].as_bool().unwrap_or(true), size, pinned: v["pinned"] == true, display: v["display"].as_str().unwrap_or("").into(), pos };
         let mut s = Settings { view: "icon".into(), font: 16, period: "1d".into(), start: 0, end: 0, tz: "local".into(), icon: Value::Null, pin,
             notify: if v["notify"].is_object() { v["notify"].clone() } else { Value::Null } };
         // an invalid or corrupt saved icon falls back to Summary (CI4)
@@ -115,7 +124,7 @@ impl Settings {
 
     fn save(&self, install: &Path) -> bool {
         let v = json!({"view": self.view, "font": self.font, "period": self.period, "start": self.start, "end": self.end, "tz": self.tz, "icon": self.icon,
-            "pinned": self.pin.pinned, "display": self.pin.display, "pos": self.pin.pos, "notify": self.notify});
+            "pinned": self.pin.pinned, "top": self.pin.top, "size": self.pin.size, "display": self.pin.display, "pos": self.pin.pos, "notify": self.notify});
         let p = install.join("tray.json");
         if crate::data::json(&p).is_err() && fs::copy(&p, install.join("tray.json.corrupt")).is_err() {
             return false;
@@ -575,7 +584,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
         };
         match event {
             Event::NewEvents(StartCause::Init) => {
-                let b = WindowBuilder::new().with_title("taskq").with_decorations(false).with_resizable(false).with_always_on_top(true)
+                let b = WindowBuilder::new().with_title("taskq").with_decorations(false).with_resizable(false).with_always_on_top(settings.pin.top)
                     .with_visible(snapshot.is_some()).with_inner_size(LogicalSize::new(320.0, 400.0)).with_position(tao::dpi::LogicalPosition::new(40.0, 40.0));
                 // a snapshot renders off the visible screen (taskq.md R12)
                 let b = if snapshot.is_some() { b.with_position(tao::dpi::LogicalPosition::new(-20000.0, -20000.0)).with_always_on_top(false).with_focused(false) } else { b };
@@ -584,7 +593,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 let p = proxy.clone();
                 let built = b.build(target).map_err(|e| e.to_string()).and_then(|w| {
                     // only our page: a link goes to the browser through the bridge
-                    WebViewBuilder::new().with_html(HTML.replace("{{ANSWER_CARD_CSS}}", include_str!("answer-card.css")).replace("{{ANSWER_CARD_JS}}", include_str!("answer-card.js"))
+                    WebViewBuilder::new().with_accept_first_mouse(true).with_html(HTML.replace("{{ANSWER_CARD_CSS}}", include_str!("answer-card.css")).replace("{{ANSWER_CARD_JS}}", include_str!("answer-card.js"))
                         .replace("{{PROJECT_BLOCKS_CSS}}", include_str!("project-blocks.css")).replace("{{PROJECT_BLOCKS_JS}}", include_str!("project-blocks.js"))
                         .replace("{{RESOURCE_CONTROLS_CSS}}", include_str!("resource-controls.css")).replace("{{RESOURCE_CONTROLS_JS}}", include_str!("resource-controls.js"))).with_navigation_handler(|u| !u.starts_with("http"))
                         .with_ipc_handler(move |r| {
@@ -723,16 +732,34 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         }
                         push(&ui, &state(&install, &settings, dark, None, &adding));
                     }
-                    "size" => {
-                        let max = w.current_monitor().or_else(|| w.primary_monitor()).map_or(800.0, |m| m.size().to_logical::<f64>(m.scale_factor()).height) * if snapshot.is_some() { 0.95 } else { 0.8 };
-                        let (width, height) = popover_size(&m, max, w.scale_factor());
-                        w.set_inner_size(tao::dpi::PhysicalSize::new(width, height));
+                    "size" | "resize" => {
+                        let Some((width, height)) = m["w"].as_f64().zip(m["h"].as_f64()).filter(|(w, h)| w.is_finite() && h.is_finite()) else { return };
+                        let Some(scale) = m["d"].as_f64().filter(|k| k.is_finite() && (0.5..=8.0).contains(k)) else { return };
+                        let (max_w, max_h) = w.current_monitor().or_else(|| w.primary_monitor()).map_or((1920.0, 800.0), |monitor| {
+                            let area = work_area(&monitor);
+                            (f64::from(area.2) / scale, f64::from(area.3) / scale)
+                        });
+                        let size = (width.max(240.0).min(max_w), height.max(120.0).min(max_h));
+                        let measurement = json!({"w": size.0, "h": if m["a"] == "resize" { size.1 } else { height.max(120.0) }, "d": scale, "g": m["g"]});
+                        let (width, height) = popover_size(&measurement, max_h * scale / w.scale_factor(), w.scale_factor());
+                        w.set_inner_size(PhysicalSize::new(width.min((max_w * scale) as u32), height));
+                        if m["a"] == "resize" {
+                            settings.pin.size = Some(size);
+                            moved = true;
+                        }
                         // pinned: the window stays where it was put; a move then keeps it in the work area
-                        if let (Some(r), false) = (anchor, settings.pin.pinned) {
+                        if m["a"] == "size" && let (Some(r), false) = (anchor, settings.pin.pinned) {
                             place(w, r);
                         }
                     }
+                    "resize-end" => { settings.save(&install); }
                     "hide" => w.set_visible(false),
+                    "top" => {
+                        settings.pin.top = !settings.pin.top;
+                        w.set_always_on_top(settings.pin.top);
+                        settings.save(&install);
+                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                    }
                     "pin" => {
                         settings.pin.pinned = !settings.pin.pinned;
                         if let (true, Ok(p), Some(m)) = (settings.pin.pinned, w.outer_position(), w.current_monitor()) {
@@ -747,7 +774,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         w.set_focus();
                         push(&ui, &state(&install, &settings, dark, None, &adding));
                     }
-                    "drag" if settings.pin.pinned => {
+                    "drag" => {
                         let _ = w.drag_window();
                     }
                     "resources" => {
@@ -950,7 +977,7 @@ fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>, a
     let sum = summary(&ps, (start, end));
     let url = |rgba: &Rgba| format!("data:image/png;base64,{}", base64(&rgba.png()));
     let mut st = json!({"platform": if cfg!(windows) { "windows" } else { "macos" }, "version": crate::platform::VERSION,
-        "host": ps.iter().find_map(|p| p["host"].as_str()).unwrap_or("?"), "view": s.view, "font": s.font, "period": s.period, "pinned": s.pin.pinned,
+        "host": ps.iter().find_map(|p| p["host"].as_str()).unwrap_or("?"), "view": s.view, "font": s.font, "period": s.period, "pinned": s.pin.pinned, "top": s.pin.top, "size": s.pin.size,
         "now": now(), "projects": ps, "notify": notify_state(&s.notify, &ps), "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "add": add, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since},
         // § 4 Data: a corrupt tray.json names its reason while the defaults show
         "settings_error": crate::data::json(&install.join("tray.json")).err()});
@@ -1094,9 +1121,24 @@ fn work_area(m: &tao::monitor::MonitorHandle) -> (i32, i32, i32, i32) {
     (p.x + left as i32, p.y + top as i32, (v.size.width * k) as i32, s.height as i32 - top as i32 - bottom as i32)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn work_area(m: &tao::monitor::MonitorHandle) -> (i32, i32, i32, i32) {
     (m.position().x, m.position().y, m.size().width as i32, m.size().height as i32)
+}
+
+#[cfg(windows)]
+fn work_area(m: &tao::monitor::MonitorHandle) -> (i32, i32, i32, i32) {
+    use windows::Win32::{Foundation::POINT, Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST}};
+    let p = m.position();
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    // SAFETY: the monitor handle and writable MONITORINFO are valid for these synchronous reads.
+    if unsafe { GetMonitorInfoW(MonitorFromPoint(POINT { x: p.x, y: p.y }, MONITOR_DEFAULTTONEAREST), &mut info) }.as_bool() {
+        let r = info.rcWork;
+        (r.left, r.top, r.right - r.left, r.bottom - r.top)
+    } else {
+        let s = m.size();
+        (p.x, p.y, s.width as i32, s.height as i32)
+    }
 }
 
 fn act(action: &str, root: &Path, label: Option<&str>) {
@@ -1829,8 +1871,11 @@ mod tests {
         fs::create_dir_all(&install).unwrap();
         fs::write(install.join("tray.json"), r#"{"font":18}"#).unwrap();
         let mut s = Settings::load(&install);
-        assert!(!s.pin.pinned, "unpinned by default");
-        s.pin = Pin { pinned: true, display: "B".into(), pos: [("A".into(), (10, 20)), ("B".into(), (-1500, 300))].into() };
+        assert!(!s.pin.pinned && s.pin.top && s.pin.size.is_none(), "old settings retain popover/top defaults and content fit");
+        fs::write(install.join("tray.json"), r#"{"size":[-1,0],"top":false}"#).unwrap();
+        let invalid = Settings::load(&install);
+        assert!(invalid.pin.size.is_none() && !invalid.pin.top, "invalid size cannot hide the header or resize grip");
+        s.pin = Pin { top: false, size: Some((480.0, 600.0)), pinned: true, display: "B".into(), pos: [("A".into(), (10, 20)), ("B".into(), (-1500, 300))].into() };
         assert!(s.save(&install));
         let r = Settings::load(&install);
         assert!(r.pin == s.pin && r.font == 18);

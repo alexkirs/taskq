@@ -5,13 +5,13 @@
 <style>
 :root{color-scheme:light dark}
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:light-dark(#243039,#eef2f5);--surface:light-dark(#fafbfc,#252b32);--muted:light-dark(#59636e,#b9c3cd);--edge:light-dark(#dce0e5,#46505b);--work:light-dark(#246f59,#8dd2b8);--ask:light-dark(#955525,#edbc96);--ready:light-dark(#5d6874,#c8d0d9);--failed:light-dark(#a6324b,#ee96a5);background:var(--surface);-webkit-user-select:none;user-select:none;cursor:default}
-html{scrollbar-width:thin}
+html{scrollbar-width:thin;overflow-x:hidden}
 /* a window a fraction of a pixel short of the measured width reflows instead of scrolling horizontally (#1073) */
 body{max-width:100%}
 *{box-sizing:border-box}
 button{font:inherit;color:inherit;background:none;border:1px solid var(--edge);border-radius:4px;padding:5px 7px}
 a{color:inherit;text-decoration:none}
-.menu{font-size:var(--size,16px);padding:6px 8px;overflow-x:hidden}
+.menu{font-size:var(--size,16px);padding:6px 8px;overflow-x:clip}
 .row,summary{display:flex;align-items:center;justify-content:space-between;gap:6px;min-height:32px;padding:5px 4px;line-height:1.35}
 summary{list-style:none;display:grid;grid-template-columns:auto minmax(0,1fr) 8px;gap:6px}
 summary>.meta,summary>.counter{justify-self:end;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
@@ -39,7 +39,7 @@ button[aria-pressed=true]{background:light-dark(#dce7e1,#354a40);border-color:va
 button:disabled{color:var(--muted);opacity:.75}
 .alert{color:var(--failed)}
 h1{font-size:1em;margin:6px 4px;overflow-wrap:anywhere}.footer{border-top:1px solid var(--edge);margin-top:6px}
-.head{min-height:28px;padding:2px 4px}.head button{padding:2px 7px}.pinned .head{cursor:grab}
+.head{position:sticky;top:0;z-index:10;background:var(--surface);min-height:28px;padding:2px 4px;cursor:grab}.head button{padding:2px 7px}.grip{position:fixed;right:0;bottom:0;width:18px;height:18px;z-index:11;cursor:nwse-resize;touch-action:none;background:linear-gradient(135deg,transparent 55%,var(--muted) 56%,var(--muted) 62%,transparent 63%,transparent 75%,var(--muted) 76%,var(--muted) 82%,transparent 83%)}
 /* Home keeps a bounded preview of the AI exchange (menu.md M7); controls stay below it */
 .aichain{max-height:10em;overflow-y:auto;position:relative}
 .askai{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px;padding:4px}
@@ -67,7 +67,8 @@ const send=m=>window.ipc&&window.ipc.postMessage(JSON.stringify(m));
 // measure at the target width: after a font change the window still has the old width, so text wraps differently
 // g: this renderer's scrollbar width; a menu taller than its window scrolls and the window adds it (#1073)
 function gutter(){const d=document.createElement('div');d.style.cssText='position:absolute;top:-99px;width:60px;height:60px;overflow:scroll;scrollbar-width:thin';document.body.append(d);const g=d.offsetWidth-d.clientWidth;d.remove();return Math.ceil(g);}
-function fit(){const w=S.font>=18?360:320,b=document.body.style;b.width=w+'px';b.maxWidth='none';const h=menu.scrollHeight;b.maxWidth='';send({a:'size',w,h,g:gutter(),d:devicePixelRatio});}
+function fit(){const size=manualSize||S.size,w=size?size[0]:S.font>=18?360:320;document.body.style.width='100%';menu.style.width=w+'px';send({a:'size',d:devicePixelRatio,g:size?0:gutter(),w,h:size?size[1]:Math.ceil(menu.getBoundingClientRect().height)});menu.style.width='100%';}
+let manualSize=null;
 const menu=document.querySelector('.menu');
 let aiText=null,aiMenu=false,aiConfirm=null,addConfirm=false;
 let S=null,page='home',taskFilter=null,working=null,workCard=null,ask=null,noted=null,pending={},confirming=null,updating=null,draft=null;
@@ -384,9 +385,9 @@ function filteredTasks(p){
     (taskFilter==='closed'?'<div class="body meta">Closed total and task list unknown: open the Board for authoritative closed tasks.</div>'+ps.map(p=>TaskqProjectBlocks.summary(blockProject(p))).join(''):rows.map(t=>taskRow(t,!p)).join('')||'<div class="body meta">'+(known(ps)?'No tasks':'Tasks unknown')+'</div>');
 }
 // pin (menu.md M13): the same menu as a movable window; the header is its drag handle
-function head(){return '<div class="row head"><span class="meta">taskq</span><button data-a="pin" aria-pressed="'+!!S.pinned+'" title="'+(S.pinned?'Unpin: back to the popover':'Pin: keep open as a movable window')+'">'+(S.pinned?'Pinned':'Pin')+'</button></div>';}
+function head(){return '<div class="row head"><span class="meta">taskq</span><button data-a="pin" aria-pressed="'+!!S.pinned+'" title="'+(S.pinned?'Unpin: back to the popover':'Pin: keep open as a movable window')+'">'+(S.pinned?'Pinned':'Pin')+'</button><button data-a="top" aria-pressed="'+!!S.top+'" title="Keep above other windows">Top</button></div>';}
 function render(navigating=false){
-  if(!S)return;
+  if(!S||resizing)return;
   const active=document.activeElement,answerFocus=active&&active.closest('[data-answer]'),scroll=document.scrollingElement.scrollTop;
   const chain=menu.querySelector('.aichain'),chainScroll=chain&&[chain.dataset.chain,chain.scrollTop];
   const focusKey=!navigating&&active&&menu.contains(active)?JSON.stringify(active.dataset):null;
@@ -399,13 +400,13 @@ function render(navigating=false){
   menu.style.setProperty('--size',S.font+'px');
   menu.classList.toggle('pinned',!!S.pinned);
   const title=working?'Work mode':taskFilter?'Tasks':p?p.name:routes[page];
-  menu.innerHTML=head()+answerNotices()+(page!=='home'||working||taskFilter?'<button data-a="back">‹ Back</button>':'')+'<h1 tabindex="-1">'+esc(title)+'</h1>'+(S.settings_error?'<div class="body alert" role="alert">Settings unknown: '+esc(S.settings_error)+'; defaults shown</div>':'')+(working?workPage():taskFilter?filteredTasks(p):p?project(p):routeBody())+'<nav class="options footer" aria-label="Menu"><button data-route="home">Home</button><button data-route="settings">Settings</button></nav>';
+  menu.innerHTML=head()+answerNotices()+(page!=='home'||working||taskFilter?'<button data-a="back">‹ Back</button>':'')+'<h1 tabindex="-1">'+esc(title)+'</h1>'+(S.settings_error?'<div class="body alert" role="alert">Settings unknown: '+esc(S.settings_error)+'; defaults shown</div>':'')+(working?workPage():taskFilter?filteredTasks(p):p?project(p):routeBody())+'<div class="grip" data-resize="" role="button" aria-label="Resize window with arrow keys" tabindex="0"></div><nav class="options footer" aria-label="Menu"><button data-route="home">Home</button><button data-route="settings">Settings</button></nav>';
   mountAnswers();mountResources();
   menu.querySelectorAll('details').forEach((d,i)=>d.open=open[i]??(['cadence','agents','services','attention'].includes(page)));
   if(S.page!==undefined)menu.querySelectorAll('.hist,.agents,.service,.incident-notice').forEach(d=>d.open=true);
   const restored=answerFocus&&menu.querySelector('[data-answer="'+CSS.escape(answerFocus.dataset.answer)+'"] '+answerSelector);
   if(restored&&!navigating){restored.focus({preventScroll:true});if(caret)restored.setSelectionRange(...caret);}
-  else if(!navigating){const target=focusedSummary>=0?menu.querySelectorAll('summary')[focusedSummary]:focusKey&&focusKey!=='{}'?[...menu.querySelectorAll('button')].find(b=>JSON.stringify(b.dataset)===focusKey):null;target?.focus({preventScroll:true});}
+  else if(!navigating){const target=focusedSummary>=0?menu.querySelectorAll('summary')[focusedSummary]:focusKey&&focusKey!=='{}'?[...menu.querySelectorAll('button,.grip')].find(b=>JSON.stringify(b.dataset)===focusKey):null;target?.focus({preventScroll:true});}
   document.scrollingElement.scrollTop=scroll;
   fit();
   // after fit() sets the width: a new exchange opens at its newest entry; a tick keeps the reader's place
@@ -458,8 +459,15 @@ menu.addEventListener('click',e=>{
   if(d.a)send({a:d.a,root:d.root,label:d.label});render();});
 menu.addEventListener('input',e=>{if(e.target.id==='ai'){aiText=e.target.value;send({a:'ai-draft',text:aiText});return;}const k=e.target.dataset.draft;if(k&&draft)draft[k]=e.target.value;});
 menu.addEventListener('focusout',e=>{const f=x=>x&&(x.id==='ai'||x.dataset&&(x.dataset.draft||x.dataset.rscField));if(f(e.target))setTimeout(()=>{if(!f(document.activeElement))render();});});
-menu.addEventListener('mousedown',e=>{if(S&&S.pinned&&e.button===0&&e.target.closest('.head')&&!e.target.closest('button'))send({a:'drag'});});
+menu.addEventListener('mousedown',e=>{if(S&&e.button===0&&e.target.closest('.head')&&!e.target.closest('button'))send({a:'drag'});});
+let resizing=null;
+menu.addEventListener('pointerdown',e=>{if(e.button!==0||!e.target.closest('.grip'))return;resizing={x:e.screenX,y:e.screenY,w:innerWidth,h:innerHeight};e.target.setPointerCapture(e.pointerId);e.preventDefault();});
+menu.addEventListener('pointermove',e=>{if(!resizing)return;manualSize=[Math.max(240,resizing.w+e.screenX-resizing.x),Math.max(120,resizing.h+e.screenY-resizing.y)];menu.style.width='100%';send({a:'resize',d:devicePixelRatio,w:manualSize[0],h:manualSize[1]});});
+for(const event of ['pointerup','pointercancel','lostpointercapture'])menu.addEventListener(event,()=>{if(resizing)send({a:'resize-end'});resizing=null;});
+menu.addEventListener('keydown',e=>{if(!e.target.closest('.grip')||!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key))return;e.preventDefault();manualSize=[Math.max(240,innerWidth+(e.key==='ArrowRight'?10:e.key==='ArrowLeft'?-10:0)),Math.max(120,innerHeight+(e.key==='ArrowDown'?10:e.key==='ArrowUp'?-10:0))];send({a:'resize',d:devicePixelRatio,w:manualSize[0],h:manualSize[1]});send({a:'resize-end'});});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')send({a:'hide'});});
+menu.addEventListener('toggle',()=>fit(),true);
+document.fonts.ready.then(()=>{if(S)fit();});
 send({a:'ready'});
 })();
 </script></body></html>

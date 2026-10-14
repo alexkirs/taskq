@@ -1,0 +1,109 @@
+{
+  "records": [
+    {
+      "name": "initial-fit",
+      "width": 320,
+      "height": 525,
+      "dpr": 1.399999976158142,
+      "scroll": 525,
+      "horizontal": 320,
+      "header": 5.9933037757873535,
+      "pin": "true",
+      "top": "true"
+    },
+    {
+      "name": "independent-toggles",
+      "width": 320,
+      "height": 525,
+      "dpr": 1.399999976158142,
+      "scroll": 525,
+      "horizontal": 320,
+      "header": 5.9933037757873535,
+      "pin": "false",
+      "top": "false"
+    },
+    {
+      "name": "resized",
+      "width": 425,
+      "height": 590,
+      "dpr": 1.399999976158142,
+      "scroll": 590,
+      "horizontal": 425,
+      "header": 5.9933037757873535,
+      "pin": "true",
+      "top": "false"
+    },
+    {
+      "name": "fixed-header",
+      "width": 425,
+      "height": 220,
+      "dpr": 1.399999976158142,
+      "scroll": 524,
+      "horizontal": 415,
+      "header": 0,
+      "pin": "true",
+      "top": "false"
+    },
+    {
+      "name": "task-rows",
+      "width": 425,
+      "height": 620,
+      "dpr": 1.399999976158142,
+      "scroll": 620,
+      "horizontal": 425,
+      "header": 5.9933037757873535,
+      "pin": "true",
+      "top": "false"
+    }
+  ],
+  "topBefore": {
+    "topmost": true,
+    "dpi": 96,
+    "visible": true,
+    "width": 464,
+    "height": 743
+  },
+  "topAfter": {
+    "topmost": false,
+    "dpi": 96,
+    "visible": true,
+    "width": 464,
+    "height": 743
+  },
+  "desktopDrag": {
+    "outcome": "unknown",
+    "reason": "Win32 SetCursorPos denied (error 5); no native mouse drag observation"
+  },
+  "restartSize": [
+    425,
+    220
+  ],
+  "restored": [
+    425,
+    220
+  ],
+  "rowLayout": {
+    "title": "A complete task title wraps on its own second row and keeps every word visible while metadata and the local session link stay above it",
+    "headBottom": 177.99106979370117,
+    "titleTop": 177.99107360839844,
+    "titleLines": 2.9999402591160367,
+    "sessionInHead": true,
+    "overflow": false
+  },
+  "binarySha256": "a5bd0a647d4578a3d74b93e24bbd7eba78808241e3490c35a78c90b7ba30aa82",
+  "codeCommit": "7ce02f269e4c781e29969371cff08179377e2f7c",
+  "uiSources": {
+    "src/tray.rs": "1c07debd5eeb969b22254d5fd65f72894ac385bb",
+    "src/tray.html": "72ed8d34f733f284115c9e52bad7b11be71478c2",
+    "Cargo.toml": "e72182ff6641f4ff05dea3589eb5bd569f39f69a",
+    "src/project-blocks.js": "b6c97fd8559dba5365c796a36fa4b5b68c1e36e8",
+    "src/project-blocks.css": "d89080dc771455773fb4accbe95bbcdb935a5c21"
+  },
+  "environment": {
+    "os": "Windows",
+    "renderer": "native WebView2 via CDP; no substituted HTML or mocked IPC",
+    "rust": "1.99.0 x86_64-pc-windows-gnu",
+    "theme": "light",
+    "fixture": "isolated installation; empty for window checks, one synthetic cached project for row checks; no board or service"
+  }
+}

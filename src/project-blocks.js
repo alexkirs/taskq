@@ -62,7 +62,7 @@
     const metadata=[global?esc(p.name):'',row.host?esc(row.host):'',rt?icon(brand)+' '+esc(rt):''].filter(Boolean).join(' · ');
     // Session URLs are supplied by the owning host adapter; remote/starting rows never invent permalinks.
     const session=row.local_session?(url(row.session_url,true)?link(row.session_url,icon('terminal'),'Open '+(rt||'agent')+' session',true):'<small>Session starting or unavailable</small>'):row.host?'<small title="Session link is available only on its owning host">'+icon('network')+' Remote session</small>':'';
-    return '<div class="tqp tqp-task"><span class="'+kind+'" title="'+esc(name)+'" aria-label="'+esc(name)+'">'+icon(mark)+'</span> '+link(row.url,icon(p.board.kind)+' #'+esc(row.n),'Open task #'+row.n)+' <span class="tqp-meta">'+metadata+'</span> '+esc(row.title)+' '+session+'</div>';
+    return '<div class="tqp tqp-task"><div class="tqp-task-head"><span class="'+kind+'" title="'+esc(name)+'" aria-label="'+esc(name)+'">'+icon(mark)+'</span> '+link(row.url,icon(p.board.kind)+' #'+esc(row.n),'Open task #'+row.n)+' <span class="tqp-meta">'+metadata+'</span> '+session+'</div><div class="tqp-task-title">'+esc(row.title)+'</div></div>';
   }
   // Consumer adapter owns placement/routes; component emits navigation only, never task operations.
   function handle(event,adapter){

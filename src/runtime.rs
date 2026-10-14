@@ -226,7 +226,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
             "Review the result SHA against each Acceptance item `A<k>` and taskq.md, and CI on that exact SHA. Requeue only for\n\
              Acceptance or contract gaps, not style; a changed or deleted existing test is a gap unless the diff changes its rule.\n\
              Then exactly one of:\n\
-             - `{q} close {n} --text \"Changed: <user effect>\nChecks: A1 ok|gap|unknown, A2 ..; CI <outcome> on <SHA>\nOpen: <item|none>\"` (it publishes),\n\
+             - `{q} close {n} --text \"Changed: <user effect>\nChecks: Task fit: A1 ok|gap|unknown, A2 ..; CI <outcome> on <SHA>\nChecks: Implementation quality: <binding gaps|advisories|none>\nOpen: <item|none>\"` (it publishes),\n\
              - `{q} requeue {n} --text \"<exact fixes>\"`,\n\
              - {ask}.\n{formats}",
             ask = ask(&q, n),
@@ -247,6 +247,30 @@ pub fn brief(env: &Env, l: &Launch) -> String {
         )
     };
     format!("{head}{body}Then stop. Everything written through taskq is public: no secrets or paths outside the repository.\n")
+}
+
+const SPECQ_REVISION: &str = "677b6dbbfa08fb854b1cbd6c44bdf91aa1a542f8";
+const SPECQ_FILES: &[&str] = &["engineering/agent-workflow.md", "engineering/use-cases.md", "engineering/verification.md", "caveman/rules/changes.md"];
+
+fn rule_file(url: &str) -> Result<String, String> {
+    let out = crate::platform::quiet(Command::new("curl").args(["-q", "--fail", "--silent", "--show-error", "--proto", "=https", "--max-time", "10", "--max-filesize", "65536", url]))
+        .output().map_err(|e| e.to_string())?;
+    if !out.status.success() { return Err(format!("curl exited {}", out.status)); }
+    String::from_utf8(out.stdout).map_err(|_| "invalid UTF-8".into())
+}
+
+fn turn_text(env: &Env, l: &Launch, mut fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
+    let mut text = format!("TaskQ shared rules: specq@{SPECQ_REVISION}\nThese canonical rules apply to this turn, including continuations. Apply them to the work; acknowledgement alone is not evidence.\n");
+    for file in SPECQ_FILES {
+        let url = format!("https://raw.githubusercontent.com/taskqorg/specq/{SPECQ_REVISION}/{file}");
+        let body = fetch(&url).and_then(|body| {
+            if body.trim().is_empty() || body.len() > 65536 { Err("empty or over 64 KiB".into()) } else { Ok(body) }
+        }).map_err(|e| StartError { message: format!("specq@{SPECQ_REVISION} {file}: {e}"), reportable: false })?;
+        text.push_str(&format!("\n--- specq/{file} ({url}) ---\n{body}\n"));
+    }
+    text.push_str(&format!("\nTaskQ task\n{}", brief(env, l)));
+    if let Some(answer) = &l.resume { text.push_str(&format!("\nContinue this same attempt with the following inbox message:\n{answer}")); }
+    Ok(text)
 }
 
 /// Keep OS failure classes until the service decides whether a start failure is TaskQ's fault.
@@ -271,19 +295,19 @@ impl std::fmt::Display for StartError {
 
 /// Start the child with its stdout and stderr in the attempt log; `codex-app` starts its handshake child (§ 8).
 pub fn spawn(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
+    let text = turn_text(env, l, rule_file)?;
+    eprintln!("specq@{SPECQ_REVISION} loaded for {} #{} attempt {} ({})", l.role, l.task, l.attempt, if l.resume.is_some() { "resume" } else { "start" });
     let log = log_path(env.root, l);
     if l.rt == "codex-app" {
-        let mut turn = AppTurn { hand: None, log, text: brief(env, l), thread: l.session.clone(), done: 0, rollout: None, running: app_running };
+        let mut turn = AppTurn { hand: None, log, text, thread: l.session.clone(), done: 0, rollout: None, running: app_running };
         match &l.resume {
-            Some(text) => {
-                turn.text = text.clone();
+            Some(_) => {
                 turn.queue().map_err(|message| StartError { message, reportable: false })?;
             }
             None => turn.hand = Some(Box::new(start(env, l, &turn.log, HANDSHAKE)?)),
         }
         return Ok(Box::new(turn));
     }
-    let text = l.resume.clone().unwrap_or_else(|| brief(env, l));
     Ok(Box::new(start(env, l, &log, &text)?))
 }
 
@@ -294,7 +318,11 @@ fn start(env: &Env, l: &Launch, log: &Path, text: &str) -> Result<Child, StartEr
     let mut c = command(env, l);
     let mut child = c.stdin(Stdio::piped()).stdout(out).stderr(err).spawn().map_err(|e| StartError::io(e, Some(&l.rt)))?;
     let mut stdin = child.stdin.take().unwrap();
-    let _ = stdin.write_all(text.as_bytes()); // dropped here: EOF ends the prompt
+    if let Err(e) = stdin.write_all(text.as_bytes()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(StartError::io(e, Some(&l.rt)));
+    }
     Ok(child)
 }
 
@@ -519,6 +547,33 @@ mod tests {
         t.running = || false;
         assert_eq!(t.exited(), Ok(Some(-1)), "a closed app is a child exit");
         let _ = std::fs::remove_file(p);
+    }
+
+    // Chain: § 8 rule delivery. Risk: a new/resumed worker or reviewer receives only links or mixed rules.
+    #[test]
+    fn rules_reach_every_runtime_role_and_resume() {
+        let env = Env { root: Path::new("/p"), exe: Path::new("/i/taskq"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
+        for rt in ["claude", "codex", "codex-app"] {
+            for role in ["worker", "reviewer"] {
+                for resume in [None, Some("Owner answer: preserve current work.\nLiteral $HOME stays text.".into())] {
+                    let l = Launch { task: 7, title: "T".into(), attempt: 42, role: role.into(), rt: rt.into(), session: "same-session".into(), url: "https://b/7".into(), resume };
+                    let mut urls = Vec::new();
+                    let text = turn_text(&env, &l, |url| { urls.push(url.to_string()); Ok(format!("# Rule from {url}\nApply this rule.")) }).unwrap();
+                    assert_eq!(urls.len(), SPECQ_FILES.len(), "{rt} {role}: rules must actually load");
+                    for file in SPECQ_FILES {
+                        let url = format!("https://raw.githubusercontent.com/taskqorg/specq/{SPECQ_REVISION}/{file}");
+                        assert!(urls.contains(&url) && text.contains(&format!("# Rule from {url}\nApply this rule.")));
+                    }
+                    assert!(text.find(SPECQ_REVISION).unwrap() < text.find("TaskQ task").unwrap());
+                    if let Some(answer) = &l.resume { assert!(text.ends_with(answer)); }
+                    else { assert!(text.ends_with(&brief(&env, &l))); }
+                    assert_eq!(l.session, "same-session");
+                    for bad in [Err("offline".into()), Ok(String::new()), Ok("x".repeat(65537))] {
+                        assert!(turn_text(&env, &l, |_| bad.clone()).is_err());
+                    }
+                }
+            }
+        }
     }
 
     // Chain: § 8 runtime command and brief. Risk: wrong runtime flags, resume or worker brief.

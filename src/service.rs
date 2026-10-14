@@ -1381,17 +1381,40 @@ mod tests {
         assert_ne!(t.attempt, Some(r));
     }
 
-    // Chain: § 4 Filter, any-runtime admission. Risk: the first listed runtime takes every slot while the other idles.
+    // Chain: § 4 Filter, any-runtime admission over tests/golden/admit.json. Risk: the first listed runtime takes every slot while the other idles.
     #[test]
-    fn any_runtime_tasks_alternate_by_free_slots() {
-        let b = Fake::default();
-        let ns: Vec<u64> = (0..4).map(|_| b.create("T", "", &["taskq".into()]).unwrap()).collect();
-        let mut c = cfg("mac");
-        c.limits = BTreeMap::from([("claude".into(), 2), ("codex".into(), 2)]);
-        let mut s = service(&b, &c, Default::default());
-        s.pass().unwrap();
-        let got: Vec<String> = ns.iter().map(|&n| rt_of(&task(&b, n)).unwrap().0.to_string()).collect();
-        assert_eq!(got, ["claude", "codex", "claude", "codex"]);
+    fn any_runtime_admission_follows_golden_traces() {
+        let traces: Vec<serde_json::Value> = serde_json::from_str(include_str!("../tests/golden/admit.json")).unwrap();
+        let rts = |v: &serde_json::Value| -> Vec<(String, u32)> { v.as_object().unwrap().iter().map(|(k, n)| (k.clone(), n.as_u64().unwrap() as u32)).collect() };
+        let mut first_free_fails = false;
+        for tr in &traces {
+            let (limits, running, tasks) = (rts(&tr["limits"]), rts(&tr["running"]), tr["tasks"].as_u64().unwrap());
+            let want: Vec<Option<String>> = serde_json::from_value(tr["expect"].clone()).unwrap();
+            let b = Fake::default();
+            // Running children hold doing tasks of this host.
+            let held: Vec<(u64, u64, String)> = running.iter().flat_map(|(rt, n)| (0..*n).map(move |_| rt.clone())).map(|rt| {
+                let n = b.create("T", "", &[TASK_LABEL.into()]).unwrap();
+                (n, b.comment(n, &format!("taskq: spawn worker {rt}:s mac")).unwrap(), rt)
+            }).collect();
+            let ns: Vec<u64> = (0..tasks).map(|_| b.create("T", "", &[TASK_LABEL.into()]).unwrap()).collect();
+            let mut c = cfg("mac");
+            c.limits = limits.iter().cloned().collect();
+            let mut s = service(&b, &c, Default::default());
+            for (task, attempt, rt) in held {
+                s.kids.push(Kid { task, attempt, rt, proc: Box::new(FakeProc(Rc::new(RefCell::new(None)))) });
+            }
+            s.pass().unwrap();
+            let got: Vec<Option<String>> = ns.iter().map(|&n| rt_of(&task(&b, n)).map(|(rt, _)| rt.to_string())).collect();
+            assert_eq!(got, want, "{}", tr["name"]);
+            // The old rule: every task takes the first listed runtime with a free slot.
+            let mut used: BTreeMap<String, u32> = running.iter().cloned().collect();
+            let old: Vec<Option<String>> = (0..tasks).map(|_| limits.iter().find(|(rt, n)| used.get(rt).copied().unwrap_or(0) < *n).map(|(rt, _)| {
+                *used.entry(rt.clone()).or_default() += 1;
+                rt.clone()
+            })).collect();
+            first_free_fails |= old != want;
+        }
+        assert!(first_free_fails, "the traces must reject the first-free rule");
     }
 
     // Chain: § 4 worker result to reviewer claim. Risk: run-* pins reviewers or capacity fallback stalls review.

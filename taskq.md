@@ -142,7 +142,7 @@ Result decision cards use the same format after the verdict (section 7): append 
 
 ### Executable behavioral model
 Apply the [shared behavioral-model method](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#state-driven-systems).
-TaskQ sources: the §2 transition table, `tests/golden/*.json` traces (entries in, expected task out), `fold`, then adapters.
+TaskQ sources: the §2 transition table, `tests/golden/*.json` traces (`fold.json`: entries in, expected task out; `admit.json`: free slots in, admitted runtimes out), `fold`, then adapters.
 `fold` is the behavioral truth; board and process qualification remain separate under R12.
 ## 3. Attempts, lease, capacity
 - **Claim.** A service that admits a `ready` task posts `spawn worker`, re-reads the comments and starts the child only if `fold` accepted its own `spawn`. A loser posts nothing more. Same for `spawn reviewer`. `ponytail:` this needs read-after-write order of comment lists; it is verified on each board by a two-host test before use (R12). If a board fails it, a guard label around `spawn` is the upgrade path.

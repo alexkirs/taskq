@@ -3,6 +3,8 @@ const fs=require('node:fs'),assert=require('node:assert/strict'),{chromium}=requ
 const html=fs.readFileSync('src/tray.html','utf8')
   .replace('{{ANSWER_CARD_CSS}}',fs.readFileSync('src/answer-card.css','utf8'))
   .replace('{{ANSWER_CARD_JS}}',fs.readFileSync('src/answer-card.js','utf8'))
+  .replace('{{PROJECT_BLOCKS_CSS}}',fs.readFileSync('src/project-blocks.css','utf8'))
+  .replace('{{PROJECT_BLOCKS_JS}}',fs.readFileSync('src/project-blocks.js','utf8'))
   .replace('{{RESOURCE_CONTROLS_CSS}}',fs.readFileSync('src/resource-controls.css','utf8'))
   .replace('{{RESOURCE_CONTROLS_JS}}',fs.readFileSync('src/resource-controls.js','utf8'));
 const fx=JSON.parse(fs.readFileSync('tests/fixtures/resource-controls.json','utf8'));

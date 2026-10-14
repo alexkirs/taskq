@@ -48,7 +48,7 @@ const USAGE: &str = "taskq agents
  taskq cleanup [--force] | taskq update [--check]
  taskq service install|run|pause|resume|status|restart|stop|uninstall|list
  taskq service focus [all|off|<label..>] [--request TEXT]
- taskq service capacity [--host H] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
+ taskq service capacity [--host H] [--mode auto|fixed] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
  taskq tray [--snapshot DIR] [--icon FILE] | taskq selftest
 Writes to a task take [--op-id ID] [--revision R] [--json] (taskq.md section 5).
 Text templates and limits: taskq.md sections 1, 2, 5, 7.";
@@ -659,6 +659,10 @@ fn service_run(c: &Ctx) -> Res<()> {
 /// One owner edit of a host's capacity: runtime limits and load gate fields; `None` keeps a field.
 #[derive(Default, Clone)]
 struct CapEdit {
+    /// `admission.mode` auto (true) or fixed (false), § 9
+    mode: Option<bool>,
+    /// `admission.max`: `Some(None)` removes it
+    max: Option<Option<u32>>,
     limits: BTreeMap<String, u32>,
     gate: Option<bool>,
     cpu_max: Option<u32>,
@@ -674,6 +678,17 @@ impl CapEdit {
                 e.limits.insert(rt.into(), n);
             }
         }
+        e.mode = match a.one("mode") {
+            None => None,
+            Some("auto") => Some(true),
+            Some("fixed") => Some(false),
+            Some(x) => return Err(format!("--mode: auto or fixed, not {x}")),
+        };
+        e.max = match a.one("max") {
+            None => None,
+            Some("none") => Some(None),
+            Some(_) => Some(num("max")?),
+        };
         e.gate = match a.one("load-gate") {
             None => None,
             Some("on") => Some(true),
@@ -684,7 +699,7 @@ impl CapEdit {
     }
 
     fn is_empty(&self) -> bool {
-        self.limits.is_empty() && self.gate.is_none() && self.cpu_max.is_none() && self.memory_min.is_none()
+        self.mode.is_none() && self.max.is_none() && self.limits.is_empty() && self.gate.is_none() && self.cpu_max.is_none() && self.memory_min.is_none()
     }
 }
 
@@ -703,7 +718,7 @@ fn edit_capacity(text: &str, host: &str, me: &str, e: &CapEdit, expect: Option<&
         return Err("capacity changed since it was shown; nothing written".into());
     }
     if e.is_empty() {
-        return Err("nothing to change: give --claude, --codex, --codex-app, --load-gate, --cpu-max or --memory-min".into());
+        return Err("nothing to change: give --mode, --max, --claude, --codex, --codex-app, --load-gate, --cpu-max or --memory-min".into());
     }
     if let Some(rt) = e.limits.keys().find(|k| !RUNTIMES.contains(&k.as_str())) {
         return Err(format!("unknown runtime {rt}"));
@@ -714,6 +729,13 @@ fn edit_capacity(text: &str, host: &str, me: &str, e: &CapEdit, expect: Option<&
     let h = &mut v["capacity_hosts"][host];
     for (rt, n) in &e.limits {
         h["limits"][rt] = json!(n);
+    }
+    if e.mode.is_some() || e.max.is_some() {
+        // the host's object replaces the top-level one (§ 9): carry the unedited field over
+        h["admission"] = json!({"mode": if e.mode.unwrap_or(old.auto) { "auto" } else { "fixed" }});
+        if let Some(m) = e.max.unwrap_or(old.max) {
+            h["admission"]["max"] = json!(m);
+        }
     }
     if e.gate.is_some() || e.cpu_max.is_some() || e.memory_min.is_some() {
         let g = old.gate;
@@ -749,6 +771,14 @@ fn write_capacity(root: &Path, host: &str, e: &CapEdit, expect: Option<&Value>) 
 
 fn cap_changes(old: &service::Capacity, new: &service::Capacity) -> String {
     let mut out = vec![];
+    let mode = |a: bool| if a { "Auto" } else { "Fixed" };
+    if old.auto != new.auto {
+        out.push(format!("Mode {} → {}", mode(old.auto), mode(new.auto)));
+    }
+    if old.max != new.max {
+        let m = |x: Option<u32>| x.map_or("none".into(), |x| x.to_string());
+        out.push(format!("Maximum {} → {}", m(old.max), m(new.max)));
+    }
     for rt in old.limits.keys().chain(new.limits.keys()).collect::<std::collections::BTreeSet<_>>() {
         let (a, b) = (old.limits.get(rt), new.limits.get(rt));
         if a != b {
@@ -1563,6 +1593,27 @@ mod tests {
         }
     }
 
+    // Chain: § 5 capacity --mode/--max -> § 9 admission. Risk: a mode edit drops the inherited maximum, `none`
+    // leaves it, or Auto saves with the gate off.
+    #[test]
+    fn capacity_edit_writes_mode_and_maximum() {
+        let text = r#"{"admission": {"mode": "auto", "max": 6}, "limits": {"claude": 0}, "hosts": {"a": "win"}}"#;
+        let get = |out: &str, h: &str| service::capacity(&serde_json::from_str(out).unwrap(), h).unwrap();
+        let fixed = edit_capacity(text, "mac", "mac", &CapEdit { mode: Some(false), ..Default::default() }, None).unwrap();
+        let (c, v): (_, Value) = (get(&fixed, "mac"), serde_json::from_str(&fixed).unwrap());
+        assert!(!c.auto && c.max == Some(6), "inherited maximum carried over");
+        assert_eq!(v["admission"], json!({"mode": "auto", "max": 6}), "top level untouched");
+        assert!(get(&fixed, "win").auto, "other hosts keep theirs");
+        assert_eq!(c.limits["claude"], 0, "explicit zero kept");
+        let none = edit_capacity(text, "mac", "mac", &CapEdit { max: Some(None), ..Default::default() }, None).unwrap();
+        assert!(get(&none, "mac").auto && get(&none, "mac").max.is_none());
+        assert_eq!(cap_changes(&get(text, "mac"), &get(&none, "mac")), "Maximum 6 → none");
+        assert_eq!(cap_changes(&get(text, "mac"), &c), "Mode Auto → Fixed, Load gate on (CPU 90 %, memory 10 %) → off");
+        let off = r#"{"load_gate": {"enabled": false}}"#;
+        let r = edit_capacity(off, "mac", "mac", &CapEdit { mode: Some(true), ..Default::default() }, None);
+        assert!(r.is_err_and(|x| x.contains("needs the load gate")), "Auto with the gate off is refused");
+    }
+
     fn cfg() -> Config {
         Config {
             root: std::env::temp_dir().join("taskq-main-test"),
@@ -2114,7 +2165,7 @@ mod tests {
         run(&["close".into(), "12".into(), "--help".into()]).unwrap();
         assert!(USAGE.contains("--recommend K"));
         assert!(USAGE.contains("--snapshot DIR"));
-        assert!(USAGE.contains("taskq service capacity [--host H] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]"));
+        assert!(USAGE.contains("taskq service capacity [--host H] [--mode auto|fixed] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]"));
         run(&["service".into(), "capacity".into(), "--help".into()]).unwrap();
         let e = platform::error_text("#7 is ready", None);
         assert!(e.starts_with("Error: #7 is ready\nNext: "));

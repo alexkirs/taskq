@@ -466,8 +466,8 @@ fn reviewer_regression_fixtures() {
 #[test]
 fn component_fixtures_are_projection_targets() {
     let fx: Value = serde_json::from_str(include_str!("fixtures/resource-controls.json")).unwrap();
-    for c in fx["cases"].as_array().unwrap() {
-        for g in c["groups"].as_array().unwrap() {
+    for c in fx["cases"].as_array().unwrap().iter().chain(fx["work"].as_array().unwrap()) {
+        for g in c["groups"].as_array().unwrap().iter().chain(c["refresh"].as_array().into_iter().flatten()) {
             for t in g["targets"].as_array().unwrap() {
                 assert_eq!(&allowlisted(t, "projection"), t, "{}", c["name"]);
                 let _: Target = serde_json::from_value(t["target"].clone()).unwrap();

@@ -299,7 +299,7 @@ fn revision(v: &Value) -> Value {
 /// The project's capacity as one group of `taskq.resources/1` projection targets (host, project, runtimes) for the
 /// shared resource controls (docs/design/shared-resource-controls.md): `cap` is `status.json` `capacity` (null:
 /// unknown), `saved` the host's capacity from `taskq.json`. The only writes the tray offers are `service capacity`
-/// fields, so only the legacy schema is editable; Auto/Fixed is advertised read-only when the service reports it.
+/// fields: legacy limits and gate, and Auto/Fixed with its maximum when the service reports admission.
 fn resource_group(cap: &Value, saved: &Value, observed_at: Option<i64>, installation: Option<String>, project: &str) -> Value {
     let ok = cap.is_object();
     let saved = if saved["error"].is_null() { saved } else { &Value::Null };
@@ -317,7 +317,8 @@ fn resource_group(cap: &Value, saved: &Value, observed_at: Option<i64>, installa
     let mut host_supported = vec![];
     let (mut cur, mut eff) = (json!({"sources": {}}), json!({"sources": {}}));
     if ok && cap["admission"].is_object() {
-        host_supported.push(json!({"policy_schema": "taskq.admission/1", "modes": ["auto", "fixed"], "fields": [], "scopes": ["host"]}));
+        // writable through `service capacity --mode/--max` (§ 5); advertised only when the service reports admission
+        host_supported.push(json!({"policy_schema": "taskq.admission/1", "modes": ["auto", "fixed"], "fields": ["mode", "maximum"], "scopes": ["host"]}));
         let pol = |a: &Value| json!({"mode": a["mode"], "maximum": a["max"], "sources": {"mode": "unknown", "maximum": "unknown"}});
         (cur, eff) = (pol(&saved["admission"]), pol(&cap["admission"]));
     }
@@ -1089,6 +1090,16 @@ fn capacity(root: &Path, m: &Value) -> String {
     let r = (|| {
         e.cpu_max = num("cpu_max")?;
         e.memory_min = num("memory_min")?;
+        e.mode = match &set["mode"] {
+            Value::Null => None,
+            m if m == "auto" || m == "fixed" => Some(m == "auto"),
+            m => return Err(format!("mode: auto or fixed, not {m}")),
+        };
+        e.max = match set.get("maximum") {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(n) => Some(Some(n.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or(format!("maximum: not an integer 0..{}", u32::MAX))?)),
+        };
         for (rt, n) in set["limits"].as_object().into_iter().flatten() {
             e.limits.insert(rt.clone(), n.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or(format!("{rt}: not an integer 0..{}", u32::MAX))?);
         }
@@ -1336,10 +1347,22 @@ mod tests {
         auto["admission"] = json!({"mode": "auto", "max": null});
         let g = resource_group(&auto, &saved, Some(100), None, "taskq");
         assert_eq!(g["targets"][0]["supported"][0]["policy_schema"], "taskq.admission/1");
+        assert_eq!(g["targets"][0]["supported"][0]["fields"], json!(["mode", "maximum"]), "Work mode writes Auto/maximum");
         assert_eq!(g["targets"][1]["runtime_usage"][1]["limit_kind"], "unbounded", "Auto: absent has no count cap");
         let unknown = resource_group(&Value::Null, &json!({"error": "not configured"}), None, None, "taskq");
         assert_eq!(unknown["targets"][1]["runtime_usage"][0], json!({"runtime_id": "claude", "used": null, "limit": null, "limit_kind": "unknown"}));
         assert!(unknown["targets"][1]["effective_revision"].is_null() && unknown["targets"][1]["current_revision"].is_null());
+    }
+
+    // Chain: Work mode -> tray bridge -> `service capacity --mode/--max`. Risk: an unknown mode reads as Fixed or a
+    // malformed maximum removes the ceiling.
+    #[test]
+    fn work_mode_bridge_refuses_malformed_mode_and_maximum() {
+        let root = Path::new("/nonexistent-taskq-954");
+        assert!(capacity(root, &json!({"set": {"mode": "fast"}})).starts_with("Error: mode: auto or fixed"));
+        assert!(capacity(root, &json!({"set": {"maximum": "4"}})).starts_with("Error: maximum: not an integer"));
+        assert!(capacity(root, &json!({"set": {"maximum": -1}})).starts_with("Error: maximum: not an integer"));
+        assert!(!capacity(root, &json!({"set": {"mode": "auto", "maximum": null}})).contains("mode:"), "valid fields reach the config read");
     }
 
     // Chain: § 4 tray opens an incident report. Risk: tray opens a file outside .taskq/incidents.

@@ -44,6 +44,12 @@ const plain=x=>JSON.parse(JSON.stringify(x));
   const done=call('resourceSend',g,{id:'op-3',ops:gate});
   call('resourceReceipt',{root:'p',id:'op-3',text:'Saved: load gate'});
   assert.equal((await done).state,'saved');
+  // #954: Auto/maximum travel only when edited; null removes the maximum, never zero
+  assert.deepEqual(plain(call('resourceSet',{ops:[{target:{},changes:{mode:'fixed'}}]})),{limits:{},mode:'fixed'});
+  assert.deepEqual(plain(call('resourceSet',{ops:[{target:{},changes:{maximum:null}}]})),{limits:{},maximum:null});
+  assert(call('workEntry','p').includes('data-root="p"'),'project entry preselects that project');
+  assert(call('workEntry').includes('data-a="work"')&&!call('workEntry').includes('data-root'),'home entry selects nothing');
+  assert(html.includes("working?workPage():"));
   assert(html.includes('<script>{{RESOURCE_CONTROLS_JS}}</script>'));
   assert(html.includes('<style>{{RESOURCE_CONTROLS_CSS}}</style>'));
   assert(html.includes('if(s.capmsg){resourceReceipt(s.capmsg);return;}'));

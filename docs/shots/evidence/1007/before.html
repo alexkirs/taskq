@@ -1,0 +1,74 @@
+<!doctype html><meta charset="utf-8"><title>TaskQ before</title><link rel="stylesheet" href="page.css"><article><p align="center">
+  <a target="_blank" rel="noopener noreferrer" href="../../../header.webp"><img src="../../../header.webp" alt="Relaxing while the agents work" width="720" style="max-width: 100%;"></a>
+  <br><em>Agents working.</em>
+</p>
+<pre lang="text" class="notranslate"><code class="notranslate">Install taskq from https://github.com/taskqorg/taskq and set it up for this project.
+</code></pre>
+<p>Paste into Claude or Codex; the agent confirms setup changes, installs taskq, connects the board and becomes the manager.<br>
+For a new project:</p>
+<pre lang="text" class="notranslate"><code class="notranslate">Install taskq from https://github.com/taskqorg/taskq and create project &lt;name&gt; from &lt;idea or folder&gt;.
+</code></pre>
+<p>Your repository board is the task list; your usual AI apps do the work.</p>
+<h3>What you get</h3>
+<ul>
+<li>Tasks are issues on GitHub or GitLab.</li>
+<li>The service runs Claude or Codex workers within each computer's configured limits.</li>
+<li>A worker's question waits for your answer.</li>
+<li>A reviewer checks the result; accepted work publishes through the configured branch or PR route.</li>
+<li>The tray menu shows questions, admission controls and a day's history.</li>
+<li>Several computers share one board.</li>
+</ul>
+<p>
+  <a target="_blank" rel="noopener noreferrer" href="before-popover-dark-home-16.png"><img src="before-popover-dark-home-16.png" alt="Home menu: projects, a waiting question and daily history" width="320" style="max-width: 100%;"></a>
+  <a target="_blank" rel="noopener noreferrer" href="before-popover-dark-project-16.png"><img src="before-popover-dark-project-16.png" alt="Project menu: questions, work, review, ready tasks and service controls" width="320" style="max-width: 100%;"></a>
+</p>
+<p>
+  <a target="_blank" rel="noopener noreferrer" href="before-icon-summary-run-dark.png"><img src="before-icon-summary-run-dark.png" alt="Summary icon with task counts and activity" height="34" style="max-width: 100%; height: auto; max-height: 34px;"></a>
+</p>
+<h3>Use cases</h3>
+<markdown-accessiblity-table><table role="table">
+<thead>
+<tr>
+<th>You want</th>
+<th>Say to the manager</th>
+<th>What happens</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A task done · UC-02</td>
+<td><code class="notranslate">File a task: fix the login redirect.</code></td>
+<td>An issue records the agreed goal and acceptance; an eligible service picks it up within limits.</td>
+</tr>
+<tr>
+<td>A new task done first · UC-04</td>
+<td><code class="notranslate">File it as p0.</code></td>
+<td>The task gets priority 0, ahead of ordinary tasks within limits.</td>
+</tr>
+<tr>
+<td>A plan broken up · UC-07</td>
+<td><code class="notranslate">Split this plan into tasks.</code></td>
+<td>Agreed tasks stay held until you start them; dependencies wait for their predecessors to close.</td>
+</tr>
+<tr>
+<td>To answer a worker · UC-09</td>
+<td><code class="notranslate">Answer #12 with 2.</code></td>
+<td>Your choice is posted to the current question on #12.</td>
+</tr>
+<tr>
+<td>A quiet day · UC-13</td>
+<td><code class="notranslate">Pause the service.</code></td>
+<td>New worker admission pauses for this project; running attempts continue.</td>
+</tr>
+<tr>
+<td>To mix agents · UC-02</td>
+<td><code class="notranslate">Use Codex for the visuals.</code></td>
+<td>The new visual task selects Codex; other tasks keep their configured agents.</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p>Agents: install, setup, commands and development are in <strong><a href="taskq.md">taskq.md</a></strong>.</p>
+<p>Verify a downloaded release file: check it against the release's <code class="notranslate">SHA256SUMS</code> (<code class="notranslate">shasum -a 256 -c SHA256SUMS --ignore-missing</code>),<br>
+then trace it to the workflow run that built it with <code class="notranslate">gh attestation verify &lt;file&gt; --repo taskqorg/taskq</code>.</p>
+<p>License: <a href="LICENSE">MIT</a>.</p>
+<p>If taskq saves you time, <a href="https://alex.kirs.online/donate" rel="nofollow">buy me a coffee</a>.</p></article>

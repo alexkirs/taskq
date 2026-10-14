@@ -8,7 +8,7 @@ Help a visitor set up TaskQ and understand how a request becomes reviewed work.
 1. Keep `docs/header.webp` and `Agents working.` at the top.
 2. Keep the exact existing-project setup phrase and new-project variant. Explain concrete setup approval.
 3. State that the repository board holds tasks and the host service runs workers; keep a short shipped-capability list.
-4. Show dark native snapshots individually, with captions and links to their originals. Do not shrink two tall panels into one row. Keep task content and lower controls visible; distinguish unknown values from zero.
+4. Show dark native Attention and Projects snapshots individually, with captions and links to their originals. Do not shrink two tall panels into one row. Keep task content and lower controls visible; distinguish unknown values from zero.
 5. Use three connected, explicitly illustrative conversations: planning (UC-02/03/07), a worker question (UC-09), and evidence/release review (UC-14). Each has initial context, owner request, meaningful clarification, decision, action and observable outcome. Link the source cases. Never call a proposed result an observed session or imply the whole source UC is shipped.
 6. Retain one contract link, release checksum and provenance instructions, MIT license and the final donate line.
 

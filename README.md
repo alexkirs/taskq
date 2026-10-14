@@ -29,9 +29,13 @@ Your repository board is the task list; your usual AI apps do the work.
 
 Synthetic storefront data, captured from the dark tray menu. These are examples, not a live project's progress. Open an image for its original size.
 
-[![Projects and work needing attention](docs/shots/popover-dark-home-16.png)](docs/shots/popover-dark-home-16.png)
+**A question with its choices.**
 
-[![Storefront tasks and the cart decision](docs/shots/popover-dark-project-16.png)](docs/shots/popover-dark-project-16.png)
+[![Cart quantity question and numbered answers](docs/shots/popover-dark-attention-16.png)](docs/shots/popover-dark-attention-16.png)
+
+**Project queues at a glance.** Closed totals remain unknown in this fixture.
+
+[![Storefront and billing project queue summaries](docs/shots/popover-dark-projects-16.png)](docs/shots/popover-dark-projects-16.png)
 
 <img src="docs/shots/icon-summary-run-dark.png" alt="Menu-bar summary of the fixture queue; unavailable counts remain unknown" height="34">
 

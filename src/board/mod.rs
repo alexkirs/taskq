@@ -278,13 +278,15 @@ pub struct Api {
     label_schema: RefCell<Option<bool>>,
     /// Request accounting and rate-limit pause of this process (§ 4).
     budget: RefCell<crate::requests::Budget>,
+    /// Labels whose catalog definition this process has read back: verified once per process (§ 4 budget).
+    labels_ok: RefCell<std::collections::HashSet<String>>,
     #[cfg(test)]
     transport: Option<Transport>,
 }
 
 impl Api {
     fn new(root: String, base: String, token: &str) -> Api {
-        Api { base, root, auth: format!("Authorization: Bearer {token}"), me: RefCell::new(None), clock: RefCell::new(0), label_schema: RefCell::new(None), budget: RefCell::default(), #[cfg(test)] transport: None }
+        Api { base, root, auth: format!("Authorization: Bearer {token}"), me: RefCell::new(None), clock: RefCell::new(0), label_schema: RefCell::new(None), budget: RefCell::default(), labels_ok: RefCell::default(), #[cfg(test)] transport: None }
     }
 
     fn call(&self, method: &str, url: &str, body: Option<Value>) -> Result<Reply> {
@@ -314,9 +316,11 @@ impl Api {
         if let Some(t) = r.header("date").and_then(http_date) {
             *self.clock.borrow_mut() = t;
         }
-        let paused = self.budget.borrow_mut().observe(r.status, |n| r.header(n).map(String::from), *self.clock.borrow(), std::time::Instant::now());
+        // GitHub GraphQL refuses an exhausted budget with HTTP 200 and a RATE_LIMITED error
+        let status = if url.ends_with("/graphql") && r.status == 200 && r.body.contains("\"RATE_LIMITED\"") { 403 } else { r.status };
+        let paused = self.budget.borrow_mut().observe(status, |n| r.header(n).map(String::from), *self.clock.borrow(), std::time::Instant::now());
         if let Some(reset) = paused {
-            return Err(format!("{method} {url}: HTTP {} {}", r.status, crate::requests::paused_text(reset)));
+            return Err(format!("{method} {url}: HTTP {status} {}", crate::requests::paused_text(reset)));
         }
         if !(200..300).contains(&r.status) {
             // one log line: a multi-line error body folds into it (§ 4)
@@ -368,6 +372,9 @@ impl Api {
     /// Catalog sync: `color` renders a catalog color for the board; `write(current, payload)` creates or updates one label.
     fn ensure_labels(&self, names: &[String], color: fn(&str) -> String, write: impl Fn(Option<&Value>, Value) -> Result<()>) -> Result<()> {
         if !self.canonical_labels()? { return Err("legacy board: catalog adoption requires all-host gate and label_schema=canonical".into()); }
+        let fresh: Vec<String> = names.iter().filter(|n| !self.labels_ok.borrow().contains(*n)).cloned().collect();
+        if fresh.is_empty() { return Ok(()); }
+        let names = &fresh[..];
         let all = self.all("/labels?per_page=100")?;
         let mut seen = std::collections::HashSet::new();
         for name in names {
@@ -386,6 +393,7 @@ impl Api {
                 }
             }
         }
+        self.labels_ok.borrow_mut().extend(fresh);
         Ok(())
     }
 
@@ -768,13 +776,19 @@ mod tests {
             names.push("taskq".into());
             h.ensure_labels(&names).unwrap();
             assert_eq!(*writes.borrow(), names.len() - 1);
+            let reads = h.requests().total();
             h.ensure_labels(&names).unwrap();
             assert_eq!(*writes.borrow(), names.len() - 1, "repeat makes no writes");
+            assert_eq!(h.requests().total(), reads, "repeat sends no catalog read");
             assert_eq!(catalog.borrow()[0]["description"], "user owned");
             let i = catalog.borrow().iter().position(|v| v["name"] == "q-ask").unwrap();
             catalog.borrow_mut()[i]["color"] = json!("000000");
             h.ensure_labels(&names).unwrap();
-            assert_eq!(*writes.borrow(), names.len(), "repairs existing metadata");
+            assert_eq!(*writes.borrow(), names.len() - 1, "verified once per process (§ 4 budget)");
+            let (fresh, fresh_catalog, fresh_writes) = label_board(kind, false, false);
+            *fresh_catalog.borrow_mut() = catalog.borrow().clone();
+            fresh.ensure_labels(&names).unwrap();
+            assert_eq!(*fresh_writes.borrow(), 1, "a new process repairs existing metadata");
         }
     }
 
@@ -827,6 +841,40 @@ mod tests {
             let b = h.requests();
             assert_eq!((b.total(), b.remaining, b.paused_until()), (2, Some(0), iso("2026-10-14T04:41:00Z")));
         }
+    }
+
+    // Chain: § 4 board budget, GitHub open list over GraphQL. Risk: the list loses a page, a field or trust, falls back
+    // to core REST, or keeps sending after a GraphQL RATE_LIMITED reply.
+    #[test]
+    fn github_open_list_is_one_graphql_request_per_page() {
+        let kind = BOARDS.iter().find(|k| k.name == "github").unwrap();
+        let limited = std::rc::Rc::new(RefCell::new(false));
+        let flag = limited.clone();
+        let h = http(kind, Some(true), Box::new(move |method, url, body| {
+            assert_eq!((method, url), ("POST", "https://api.github.com/graphql"));
+            let body = body.unwrap();
+            assert_eq!((&body["variables"]["owner"], &body["variables"]["name"]), (&json!("o"), &json!("r")));
+            let left = if *flag.borrow() { "0" } else { "4990" };
+            let headers = vec![("X-RateLimit-Resource".into(), "graphql".into()), ("X-RateLimit-Remaining".into(), left.into()),
+                ("X-RateLimit-Limit".into(), "5000".into()), ("X-RateLimit-Reset".into(), "1791964800".into())];
+            let value = if *flag.borrow() { json!({"errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}) }
+                else if body["variables"]["after"].is_null() { json!({"data": {"repository": {"issues": {"pageInfo": {"hasNextPage": true, "endCursor": "c1"},
+                    "nodes": [{"number": 5, "title": "t", "body": "b", "updatedAt": "2026-10-14T04:27:00Z", "authorAssociation": "OWNER",
+                        "labels": {"nodes": [{"name": "q-ready"}]}, "assignees": {"nodes": [{"login": "me"}]}}]}}}}) }
+                else { json!({"data": {"repository": {"issues": {"pageInfo": {"hasNextPage": false, "endCursor": null},
+                    "nodes": [{"number": 6, "title": "u", "body": null, "updatedAt": "2026-10-14T04:28:00Z", "authorAssociation": "NONE",
+                        "labels": {"nodes": []}, "assignees": {"nodes": []}}]}}}}) };
+            Ok(Reply { status: 200, headers, body: value.to_string(), operation: operation(method) })
+        }));
+        let list = h.issues(None).unwrap();
+        assert_eq!(list.iter().map(|i| (i.number, i.open, i.trusted)).collect::<Vec<_>>(), [(5, true, true), (6, true, false)]);
+        assert_eq!((list[0].labels.clone(), list[0].assignees.clone(), list[0].updated), (vec!["q-ready".to_string()], vec!["me".to_string()], iso("2026-10-14T04:27:00Z").unwrap()));
+        let b = h.requests();
+        assert_eq!((b.ops.clone(), b.resource.clone(), b.remaining), (std::collections::BTreeMap::from([("POST graphql".to_string(), 2)]), Some("graphql".into()), Some(4990)));
+        *limited.borrow_mut() = true;
+        assert!(h.issues(None).unwrap_err().contains("HTTP 403 rate limit: board requests paused until"));
+        assert!(h.issues(None).unwrap_err().contains("paused"));
+        assert_eq!(h.requests().total(), 3, "nothing is sent while paused");
     }
 
     // Chain: § 2 state labels on both boards. Risk: a state change removes user labels.

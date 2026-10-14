@@ -180,6 +180,8 @@ pub struct Service<'a> {
     /// The read model of the last successful pass (for `status.json` and the tray).
     pub snapshot: Option<crate::snapshot::Snapshot>,
     pub tasks_read: Option<std::time::Instant>,
+    /// This host's heartbeat issue, from the last board read: a lease write needs no second list (§ 4 budget).
+    host_issue: Option<u64>,
     /// Owner comments of the last pass (§ 4): task, comment id, text, card.
     pub owner_comments: Vec<(u64, u64, String, String)>,
     /// State of each open task in the previous pass, for `events`.
@@ -431,7 +433,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new() }
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -635,12 +637,13 @@ impl<'a> Service<'a> {
 
         // 3. heartbeat
         let body = self.heartbeat_body();
+        self.host_issue = hosts.iter().find(|h| h.title == title).map(|h| h.number);
         match hosts.iter().find(|h| h.title == title) {
-            Some(h) if h.body.lines().filter(|l| !l.starts_with("at ")).eq(body.lines()) && now - h.updated < ttl / 5 => {}
+            Some(h) if h.body.lines().filter(|l| !l.starts_with("at ")).eq(body.lines()) && now - h.updated < ttl / 3 => {}
             // a same-body edit leaves `updated_at` as is (GitHub), so the stamp keeps the heartbeat fresh
             Some(h) => self.board.edit(h.number, &format!("{body}\nat {now}"))?,
             None => {
-                self.board.create(&title, &body, &[HOST_LABEL.to_string()])?;
+                self.host_issue = Some(self.board.create(&title, &body, &[HOST_LABEL.to_string()])?);
             }
         }
 
@@ -897,11 +900,10 @@ impl<'a> Service<'a> {
 
     /// Write the heartbeat now: the lease of a new child or held launch is listed before the next pass judges it.
     fn beat(&self) -> Result<(), String> {
-        let body = self.heartbeat_body();
-        if let Some(h) = self.board.issues(None)?.into_iter().find(|i| is_host(i) && i.title == format!("taskq host {}", self.cfg.me)) {
-            self.board.edit(h.number, &body)?;
+        match self.host_issue {
+            Some(n) => self.board.edit(n, &self.heartbeat_body()),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     fn launch(&mut self, l: Launch) -> Result<(), String> {
@@ -1180,6 +1182,25 @@ mod tests {
         again.pass().unwrap();
         b.advance(301);
         assert!(w.pass().is_ok());
+    }
+
+    // Chain: § 4 board budget, heartbeat. Risk: a PATCH every pass burns the shared budget, or a sparse heartbeat
+    // lets another host expire a live lease.
+    #[test]
+    fn idle_heartbeat_writes_every_third_of_ttl_and_stays_fresh() {
+        let b = Fake::default();
+        let c = cfg("mac");
+        let mut s = service(&b, &c, Default::default());
+        let beat = |b: &Fake| b.issues(None).unwrap().into_iter().find(|i| i.title == "taskq host mac").map(|i| i.updated).unwrap();
+        s.pass().unwrap();
+        let (mut writes, mut last) = (0, beat(&b));
+        for _ in 0..60 {
+            b.advance(60); // default poll
+            assert!(b.now().unwrap() - beat(&b) < c.ttl, "lease stays fresh between passes");
+            s.pass().unwrap();
+            if beat(&b) != last { writes += 1; last = beat(&b); }
+        }
+        assert_eq!(writes, 30, "one write per 2 passes at poll 60, ttl 300; was 60 at ttl / 5");
     }
 
     // Chain: R2 § 3 two hosts one attempt. Risk: two attempts run, or a dead host blocks the task.

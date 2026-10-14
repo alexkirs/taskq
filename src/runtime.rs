@@ -222,6 +222,10 @@ const FORMATS: &str = "Put each `--text` field on its own line. The commands ren
 const FILES: &str = "Never run gh auth login. A missing board token is an owner item; report it through taskq ask.\n\
      Touch only this project, ~/.claude, ~/.codex and the OS temp dir: never search `/`, `~` or other folders.\n";
 
+/// taskq.md § 4 board budget: every host's agents share one board user's hourly requests.
+const CI_WAIT: &str = "Board budget: poll CI at most once a minute (`gh pr checks <PR> --watch --interval 60`); never `gh run watch`\n\
+     (it polls every 3 s) or `gh run view` without `--json`.\n";
+
 fn ask(q: &impl std::fmt::Display, n: u64) -> String {
     format!("`{q} ask {n} --text \"Done: <checked or not started>\nProblem: <decision and user effect>\" --option A --option B --recommend K [--link URL]`")
 }
@@ -254,7 +258,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
         format!(
             "Review the result SHA against each Acceptance item `A<k>` and taskq.md, and CI on that exact SHA. Requeue only for\n\
              Acceptance or contract gaps, not style; a changed or deleted existing test is a gap unless the diff changes its rule.\n\
-             Then exactly one of:\n\
+             {CI_WAIT}Then exactly one of:\n\
              - `{q} close {n} --text \"Changed: <user effect>\nChecks: Task fit: A1 ok|gap|unknown, A2 ..; CI <outcome> on <SHA>\nChecks: Implementation quality: <binding gaps|advisories|none>\nOpen: <item|none>\"` (it publishes),\n\
              - `{q} requeue {n} --text \"<exact fixes>\"`,\n\
              - {ask}.\n{approval}{formats}",
@@ -266,7 +270,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
         format!(
             "Work only in `.worktrees/taskq-{n}` on branch `taskq-{n}` from origin/main (continue an existing branch).\n\
              Commit with the line `Task: {url}` in the message, rebase on origin/main, run the project checks, then {push}.\n\
-             Then exactly one of:\n\
+             Do not wait for CI: `close` checks it. {CI_WAIT}Then exactly one of:\n\
              - `{q} result {n} --sha <full SHA> --checks \"<command -- outcome>\" [--checks ..] --text \"Changed: <user effect>\nOpen: <item|none>\"`,\n\
              - {ask} (owner decision; Acceptance unclear or untestable; or a split of work bigger than one reviewable diff — before any code),\n\
              - `{q} requeue {n} --text \"<why it cannot be done>\"`.\n{formats}",
@@ -816,7 +820,7 @@ mod tests {
                     assert_eq!(l.session, "same-session");
                     // Native sessions do not inherit the child env; without the prefix `result` is refused as a non-worker.
                     assert_eq!(brief(&env, &l).contains("env TASKQ_TASK=7 TASKQ_ATTEMPT=42 "), rt != "codex", "{rt} {role}: attempt identity");
-                    assert!(text.contains("https://github.com/taskqorg/taskq/blob/") && text.contains(FILES));
+                    assert!(text.contains("https://github.com/taskqorg/taskq/blob/") && text.contains(FILES) && text.contains(CI_WAIT));
                     for bad in [Err("offline".into()), Ok(String::new()), Ok("x".repeat(65537))] {
                         assert!(turn_text(&env, &l, |_| bad.clone()).is_err());
                     }

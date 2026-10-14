@@ -2,17 +2,18 @@
 
 Executable plan for the [refactoring backlog](refactoring-backlog.md) WS1–WS11, written against checkout 4a99d79 (2026-10-14). The backlog stays the single work breakdown; this file orders it into board batches, fixes the development loop and records the owner decisions that the [brief](implementation-brief.md) left open. Runtime truth stays [taskq.md](../../taskq.md); process rules stay [specq](https://github.com/taskqorg/specq).
 
-## Reconciliation (2026-10-14)
+## Reconciliation (2026-10-14, 06:50Z)
 
-- Installed: mac and win on 4.1.11; `Cargo.toml` says `4.0.0-dev`. No refactoring task exists on the board; open tasks are the promo-video set (#802, #803, #805).
-- Code: `src/main.rs` (CLI, service loop, capacity, focus), `src/tray.rs` (menu, IPC, icon raster), `src/operator.rs` (file requests), `src/tray.html`. No canonical read model: `status`, `status.json` and the tray each compute states and counts. No operation id, revision check or receipt on any mutation. `add --later` creates an eligible issue before posting `later` (scenario review, UC-07). `wait` uses one cursor `<root>/.taskq/pm-cursor`.
-- Design package tests pass (`docs/design/*.test.cjs`); `cargo test --locked` 91 passed; `selftest` 40 traces ([verification](verification.md)).
+- Done: batches 1-4 closed on the board: WS1 #886, WS2 #887, WS10 #888, WS3 #892, D03 #893, D-data #894, T-tests #895, WS5 #896, WS6a #897, F-retro #902, WS11b #908, WS6b #970, WS4 #971, WS7 #972, WS11 #976. WS8/WS9: enrollment #912 closed, #913 open.
+- Open before G8: #913, the tray Sending readback #1024, the dev-build rollback incidents (#991, #994, #1002) and the GitHub request budget #1011.
+- Installed: mac and win on `4.2.0-dev.<epoch>` builds (decision 3 below); `Cargo.toml` still says `4.0.0-dev` and only the build sets the version.
+- Evidence gap: codex workers on this Mac cannot reach GUI services or the host checks (`platform::tests::host_memory_reads_on_this_host`, `policy::tests::seatbelt_keeps_workers_out_of_the_policy_store`); the PM ran them for #960 and #1021.
 
 ## Owner decisions
 
-1. Incremental 4.x releases under § 8 N/N-1; no 5.0 cutover. Every merged slice must be readable by a 4.1.11 host because the Windows host stays on 4.1.11 until final qualification.
+1. Incremental 4.x releases under § 8 N/N-1; no 5.0 cutover. Every merged slice must be readable by a 4.1.11 host because 4.1.11 is the published release a host can roll back to (Windows runs dev builds since 2026-10-14, see decision 3).
 2. Work runs as taskq tasks (dogfooding): the PM files one reviewable slice per task, the reviewer closes per § 7. Design-package planning never starts queue work by itself.
-3. macOS first: no release tag, update or Windows/Linux deploy during development (see the loop below). Results report macOS evidence; Windows and Linux are `Not tested` (R12) until the qualification batch.
+3. macOS first: no release tag or Linux deploy during development (see the loop below). Amended 2026-10-14: Windows runs the same `4.2.0-dev.<epoch>` builds as the Mac to take load off the Mac, so Windows evidence is collected from those builds; Linux stays `Not tested` (R12) until the qualification batch.
 4. taskq.md stays at or under 300 lines: an amendment condenses prose and moves detail into the linked design spec rather than adding paragraphs.
 5. Auto admission mechanics (D03, [dynamic resources](dynamic-resources.md) R-A1–R-A8) get one research task with measurements on this Mac before WS5 is filed.
 

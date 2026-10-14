@@ -320,3 +320,7 @@ Improvement proposals the PM makes in chat, one line each, oldest first: `- YYYY
 - 2026-10-14 Use one durable owner-installed board token per host instead of repeated device logins; task #944 (from PM proposal in chat)
 - 2026-10-14 Built-in profiling: always-on per-operation counters and switchable traces feed optimization; principle specq#24, tasks taskq #988, agentq#122, coreq#45, dashq#89, serverq#36 (from owner request in chat)
 - 2026-10-14 Run codex-app on Windows, where the Codex app is installed; task #989 (from owner request in chat)
+- 2026-10-14 Reconcile the implementation plan with what runs: Windows on dev builds, batches 1-4 done, G8 next (from owner review in chat)
+- 2026-10-14 Start held tasks only after their prerequisites are encoded as Depends on, so workers do not spend attempts asking to wait (from owner review in chat)
+- 2026-10-14 Route macOS GUI and host-check evidence to a worker that can produce it instead of the PM (from owner review in chat)
+- 2026-10-14 Find why the dashboard shows Windows agentq data 13 h old after the Rust cutover (from owner review in chat)

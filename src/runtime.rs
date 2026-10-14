@@ -236,8 +236,8 @@ pub fn contract(root: &Path) -> String {
 pub fn brief(env: &Env, l: &Launch) -> String {
     let n = l.task;
     let mut q = env.exe.display().to_string();
-    if l.rt == "codex-app" {
-        // the app turn runs in the app's environment, not the handshake child's (§ 8)
+    if l.rt == "codex-app" || l.rt == "claude" {
+        // the app turn and the native Claude background session run in their host's environment, not the child's (§ 8)
         q = format!("env TASKQ_TASK={n} TASKQ_ATTEMPT={} TASKQ_ROLE={} TASKQ_ROOT={} {q}", l.attempt, l.role, env.root.display());
     }
     let spec = contract(env.root);
@@ -809,6 +809,8 @@ mod tests {
                     if let Some(answer) = &l.resume { assert!(text.ends_with(answer)); }
                     else { assert!(text.ends_with(&brief(&env, &l))); }
                     assert_eq!(l.session, "same-session");
+                    // Native sessions do not inherit the child env; without the prefix `result` is refused as a non-worker.
+                    assert_eq!(brief(&env, &l).contains("env TASKQ_TASK=7 TASKQ_ATTEMPT=42 "), rt != "codex", "{rt} {role}: attempt identity");
                     assert!(text.contains("https://github.com/taskqorg/taskq/blob/") && text.contains(FILES));
                     for bad in [Err("offline".into()), Ok(String::new()), Ok("x".repeat(65537))] {
                         assert!(turn_text(&env, &l, |_| bad.clone()).is_err());

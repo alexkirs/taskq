@@ -756,11 +756,12 @@ impl<'a> Service<'a> {
             if !self.may_launch() {
                 break;
             }
-            let Some(rt) = self.free(label(&v.issue, "run-").as_deref()) else { continue };
+            let role = if v.task.state == State::Review { "reviewer" } else { "worker" };
+            let rt = if role == "reviewer" { self.reviewer_free(v) } else { self.free(label(&v.issue, "run-").as_deref()) };
+            let Some(rt) = rt else { continue };
             if !self.reserve(v.issue.number, 0, &rt) {
                 break;
             }
-            let role = if v.task.state == State::Review { "reviewer" } else { "worker" };
             self.claim(v, role, &rt)?;
         }
         Ok(())
@@ -818,6 +819,25 @@ impl<'a> Service<'a> {
         let kids: Vec<u64> = self.kids.iter().map(|k| k.task).collect();
         let skip = |n: u64| open.contains_key(&n) || kids.contains(&n) || !tried.insert(n);
         self.log.extend(cleanup(self.board, &self.cfg.root, skip, false));
+    }
+
+    fn reviewer_free(&self, v: &View) -> Option<String> {
+        let mut log = v.log.clone();
+        log.sort_by_key(|e| e.id);
+        // Replay candidate worker spawns so losing, edited and stale entries cannot choose the reviewer.
+        let worker = log.iter().enumerate().rev()
+            .filter(|(_, e)| e.body.split_whitespace().take(3).eq(["taskq:", "spawn", "worker"]))
+            .find_map(|(i, e)| {
+                let t = core::fold(v.issue.number, &log[..=i], false);
+                if t.attempt == Some(e.id) { rt_of(&t).map(|(rt, _)| rt.to_string()) } else { None }
+            })?;
+        let other = match worker.as_str() {
+            "claude" => "codex",
+            "codex" | "codex-app" => "claude",
+            _ => return None,
+        };
+        self.free(Some(other)).or_else(|| self.free(Some(&worker))
+            .filter(|rt| rt != "codex-app" || label(&v.issue, "run-").as_deref() == Some("codex-app")))
     }
 
     /// A runtime with free capacity: `limits.<rt>` minus live children of it (§ 3).
@@ -1195,6 +1215,45 @@ mod tests {
         let t = task(&b, n);
         assert_eq!((t.state, t.retries, t.result.is_some()), (State::Review, 1, true));
         assert_ne!(t.attempt, Some(r));
+    }
+
+    // Chain: § 4 worker result to reviewer claim. Risk: run-* pins reviewers or capacity fallback stalls review.
+    #[test]
+    fn reviewer_prefers_other_runtime_and_falls_back_when_unavailable() {
+        for (worker, other, capacity, expected) in [
+            ("codex", "claude", 1, "claude"),
+            ("codex", "claude", 0, "codex"),
+            ("claude", "codex", 1, "codex"),
+            ("claude", "codex", 0, "claude"),
+            ("codex-app", "claude", 1, "claude"),
+            ("codex-app", "claude", 0, "codex-app"),
+        ] {
+            let b = Fake::default();
+            let n = b.create("T", "", &["taskq".into(), format!("run-{worker}")]).unwrap();
+            let mut c = cfg("mac");
+            c.limits = BTreeMap::from([(worker.into(), 1), (other.into(), capacity)]);
+            c.has = vec!["codex-app".into()];
+            let e: Exits = Default::default();
+            let mut s = service(&b, &c, e.clone());
+            s.pass().unwrap();
+            let t = task(&b, n);
+            assert_eq!(rt_of(&t).unwrap().0, worker);
+            // A losing spawn must not change which runtime actually did the work.
+            b.comment(n, &core::entry("spawn", &["worker", &format!("{other}:ignored"), "mac"], None, "")).unwrap();
+            b.comment(n, &core::entry("result", &["0123456789abcdef0123456789abcdef01234567"], t.attempt, "ok")).unwrap();
+            *e.borrow()[0].1.borrow_mut() = Some(0);
+            for retry in 0..2 {
+                s.pass().unwrap();
+                let t = task(&b, n);
+                assert_eq!(t.role.as_deref(), Some("reviewer"));
+                assert_eq!(rt_of(&t).unwrap().0, expected, "{worker}, capacity {capacity}, retry {retry}");
+                if retry == 0 {
+                    *e.borrow().last().unwrap().1.borrow_mut() = Some(1);
+                    s.pass().unwrap(); // gone ends the reviewer; the next pass claims its replacement
+                    assert_eq!(task(&b, n).attempt, None);
+                }
+            }
+        }
     }
 
     // Chain: § 2 answer and requeue on a live child. Risk: a new session on answer; requeue leaves the child running.

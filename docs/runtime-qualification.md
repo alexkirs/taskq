@@ -15,7 +15,7 @@ Keep cheap deterministic checks only for a distinct user-visible chain or safety
 | Claude CLI | Supported | Full tools; real edit/check and same-session continuation passed on macOS | macOS, Linux, Windows adapters; permission mode is not OS containment |
 | Claude Desktop | No TaskQ runtime adapter | No TaskQ runtime adapter | Manual manager use is separate and unqualified here |
 | Codex CLI | Supported | Full tools; configured sandbox; real edit/check and continuation passed on macOS | macOS, Linux, Windows; effective sandbox and network are independent |
-| codex-app | Opt-in worker/reviewer | No separate app operator | macOS only; app policy and login differ from handshake environment |
+| codex-app | Opt-in worker/reviewer | No separate app operator | macOS, Windows (#989: handshake, shell-opened thread, 21 KB queue, one `task_complete` live); app policy and login differ from handshake environment |
 
 ## Required platform runs
 
@@ -44,7 +44,7 @@ Model = deterministic logic/adapter check. Live = actual agent/session evidence.
 | Q9 | Pause/load/capacity stop admission without stopping current jobs | Admission and service gate chains | Deterministic pass; live fixture must preserve a specifically owned active process |
 | Q10 | Update preserves active work | Unix process handover chain; Windows idle update #965 | App/operator restart now waits; real app turn survived a pending restart and completed its file write; native Windows active-child update remains unqualified |
 | Q11 | Cancellation has honest semantics | Process adapter; app completion/lease chain | App turn cannot be stopped by existing adapter; late board writes fenced only |
-| Q12 | App runtime is selected explicitly on a capable host | Service opt-in chain; CLI create flow | CLI create/readback now covers app label; service admits app only on macOS with explicit opt-in |
+| Q12 | App runtime is selected explicitly on a capable host | Service opt-in chain; CLI create flow | CLI create/readback now covers app label; service admits app only on macOS and Windows with explicit opt-in |
 | Q13 | Publication checks exact candidate and preserves dirty work | Publication and cleanup chains | Research ancestry is intentionally separate from new-code CI; rule adherence is independently reviewed |
 | Q15 | Native Claude background lifecycle | Same bounded live chain, not a new per-commit test | Verify stdin delivery, native-assigned ID, turn completion, stop readback, same-ID resume without copying, Remote Control registration and interrupted-launch reconciliation on each platform |
 | Q14 | Missing board credential fails without logging in or exposing it | GitHub credential chain; actual task commands | Codex CLI/app live board writes in prior qualification; Claude #969 live |

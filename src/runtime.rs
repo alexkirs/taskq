@@ -347,8 +347,13 @@ pub fn brief(env: &Env, l: &Launch) -> String {
     let n = l.task;
     let mut q = env.exe.display().to_string();
     if l.rt == "codex-app" || l.rt == "claude" {
-        // the app turn and the native Claude background session run in their host's environment, not the child's (§ 8)
-        q = format!("env TASKQ_TASK={n} TASKQ_ATTEMPT={} TASKQ_ROLE={} TASKQ_ROOT={} {q}", l.attempt, l.role, env.root.display());
+        // the app turn and the native Claude background session run in their host's environment, not the child's (§ 8);
+        // Windows app turns run PowerShell
+        q = if cfg!(windows) && l.rt == "codex-app" {
+            format!("$env:TASKQ_TASK='{n}'; $env:TASKQ_ATTEMPT='{}'; $env:TASKQ_ROLE='{}'; $env:TASKQ_ROOT='{}'; & '{q}'", l.attempt, l.role, env.root.display())
+        } else {
+            format!("env TASKQ_TASK={n} TASKQ_ATTEMPT={} TASKQ_ROLE={} TASKQ_ROOT={} {q}", l.attempt, l.role, env.root.display())
+        };
     }
     let spec = contract(env.root);
     let head = format!(
@@ -663,14 +668,34 @@ impl AppTurn {
     fn queue(&mut self) -> Result<(), String> {
         self.rollout = rollout(&self.thread);
         self.done = self.rollout.as_ref().map(|p| completes(p)).unwrap_or(0);
-        let ok = |c: &mut Command| c.status().is_ok_and(|s| s.success());
+        // the id goes through the Windows shell: only a plain thread id
+        if self.thread.is_empty() || !self.thread.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(format!("invalid thread id {:?}", self.thread));
+        }
+        let ok = |c: &mut Command| crate::platform::quiet(c).status().is_ok_and(|s| s.success());
+        let url = format!("codex://threads/{}", self.thread);
         // ponytail: `open` and `queue` block the pass for a moment; a thread per turn if they ever hang
-        if !ok(Command::new("open").arg(format!("codex://threads/{}", self.thread)))
-            || !ok(Command::new(which("codex")).args(["queue", "--thread", &self.thread, "--message", &self.text]))
-        {
+        let opened = if cfg!(windows) { ok(Command::new("cmd").args(["/C", "start", "", &url])) } else { ok(Command::new("open").arg(&url)) };
+        if !opened || !ok(codex_direct().args(["queue", "--thread", &self.thread, "--message", &self.text])) {
             return Err(format!("codex queue failed for thread {}", self.thread));
         }
         Ok(())
+    }
+}
+
+/// Codex without a `cmd` in between: an npm `codex.cmd` shim runs its `codex.js` through `node`, since `cmd` caps a
+/// line at 8191 characters and the brief is longer (§ 8).
+fn codex_direct() -> Command {
+    let bin = which("codex");
+    let js = bin.parent().map(|d| d.join("node_modules/@openai/codex/bin/codex.js"));
+    match js.filter(|js| bin.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd")) && js.is_file()) {
+        Some(js) => {
+            let node = bin.with_file_name("node.exe");
+            let mut c = Command::new(if node.is_file() { node } else { which("node") });
+            c.arg(js);
+            c
+        }
+        None => Command::new(bin),
     }
 }
 
@@ -705,14 +730,19 @@ impl Proc for AppTurn {
     }
 }
 
-/// The Codex app runs in this login session (macOS).
+/// The Codex app runs in this login session: macOS `lsappinfo`, Windows a `tasklist /APPS` row of its package.
 fn app_running() -> bool {
+    if cfg!(windows) {
+        return crate::platform::quiet(Command::new("tasklist").args(["/APPS", "/FO", "CSV", "/NH"])).output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("\"OpenAI.Codex_"));
+    }
     Command::new("lsappinfo").args(["info", "-only", "pid", "-app", "com.openai.codex"]).output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("pid"))
 }
 
-/// The thread's rollout file under `$CODEX_HOME/sessions` (default `~/.codex`).
+/// The thread's rollout file under `$CODEX_HOME/sessions` (default `~/.codex`; a Windows service has no `HOME`).
 fn rollout(thread: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".codex")))?;
+    let home = std::env::var_os("CODEX_HOME").map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(|h| Path::new(&h).join(".codex")))?;
     fn find(dir: &Path, end: &str) -> Option<PathBuf> {
         std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
             let p = e.path();
@@ -782,9 +812,9 @@ fn login(rt: &str, out: Option<(bool, String)>) -> (&'static str, Option<String>
     }
 }
 
-/// The runtimes taskq can start here (§ 8): `codex-app` is macOS only and shares Codex's binary and login.
+/// The runtimes taskq can start here (§ 8): `codex-app` is macOS and Windows only and shares Codex's binary and login.
 pub fn agent_runtimes() -> &'static [&'static str] {
-    if cfg!(target_os = "macos") { &["claude", "codex", "codex-app"] } else { &["claude", "codex"] }
+    if cfg!(any(target_os = "macos", windows)) { &["claude", "codex", "codex-app"] } else { &["claude", "codex"] }
 }
 
 /// One row per runtime: `runtime`, `path` (null: not installed), `version`, `login`, `account` (null: unknown or none).
@@ -885,6 +915,8 @@ mod tests {
         t.done = 2;
         t.running = || false;
         assert_eq!(t.exited(), Ok(Some(-1)), "a closed app is a child exit");
+        t.thread = "x & calc".into();
+        assert!(t.queue().is_err(), "a thread id that is not plain never reaches the shell");
         let _ = std::fs::remove_file(p);
     }
 
@@ -919,6 +951,27 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&install);
+    }
+
+    // Chain: § 8 codex-app handshake -> open thread -> queue -> one new `task_complete` on this host's app.
+    // Paid/client-dependent qualification: deliberately excluded from the normal CI gate.
+    #[test]
+    #[ignore = "live runtime matrix; set TASKQ_APP_ROOT=<git dir> and run explicitly"]
+    fn live_app_turn_completes_once() {
+        let root = PathBuf::from(std::env::var("TASKQ_APP_ROOT").expect("TASKQ_APP_ROOT"));
+        let install = std::env::temp_dir().join(format!("taskq-app-{}", std::process::id()));
+        std::fs::create_dir_all(&install).unwrap();
+        crate::policy::grant(&install, "codex-app", "full", None, "op", 1).unwrap();
+        let env = Env { root: &root, exe: Path::new("taskq"), install: &install, permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
+        let l = Launch { task: 0, title: "live".into(), attempt: 0, role: "worker".into(), rt: "codex-app".into(), session: "-".into(), url: String::new(), resume: None };
+        let log = root.join("app-turn.log");
+        let mut t = AppTurn { hand: None, log: log.clone(), text: format!("{}Reply with the single word QUEUED and do nothing else.", "A taskq test line; ignore it.\n".repeat(700)), thread: String::new(), done: 0, rollout: None, running: app_running };
+        t.hand = Some(Box::new(start(&env, &l, &log, HANDSHAKE, &access(&env, "codex-app").unwrap()).unwrap()));
+        let code = (0..600).find_map(|_| { std::thread::sleep(std::time::Duration::from_secs(1)); t.exited().unwrap() });
+        eprintln!("thread {} rollout {:?} completes {} exit {code:?}", t.thread, t.rollout, t.rollout.as_ref().map_or(0, |p| completes(p)));
+        let _ = std::fs::remove_dir_all(&install);
+        assert_eq!(code, Some(0));
+        assert_eq!(completes(t.rollout.as_ref().unwrap()), t.done + 1, "exactly one queued turn completed");
     }
 
     // Chain: § 8 rule delivery. Risk: a new/resumed worker or reviewer receives only links or mixed rules.

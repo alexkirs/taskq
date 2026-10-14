@@ -391,6 +391,8 @@ function render(navigating=false){
   const active=document.activeElement,answerFocus=active&&active.closest('[data-answer]'),scroll=document.scrollingElement.scrollTop;
   const bounds=new Map([...menu.querySelectorAll('[data-bound]')].map(e=>[e.dataset.bound,e.scrollTop]));
   const focusKey=!navigating&&active&&menu.contains(active)?JSON.stringify(active.dataset):null;
+  // a refresh rebuilds the menu: refocus the same control, link or heading, by tag, data and position (U-A4)
+  const same=e=>e.tagName===active.tagName&&JSON.stringify(e.dataset)===focusKey,focusAt=focusKey?[...menu.querySelectorAll(active.tagName)].filter(same).indexOf(active):-1;
   const focusedSummary=!navigating&&active?.tagName==='SUMMARY'?[...menu.querySelectorAll('summary')].indexOf(active):-1;
   const caret=answerFocus&&active.tagName==='TEXTAREA'?[active.selectionStart,active.selectionEnd]:null;
   const answerSelector=answerFocus&&(caret?'textarea':active.dataset.choice?'[data-choice="'+active.dataset.choice+'"]':active.dataset.qac?'[data-qac="'+active.dataset.qac+'"]':'button[type=submit]');
@@ -406,7 +408,7 @@ function render(navigating=false){
   if(S.page!==undefined)menu.querySelectorAll('.hist,.agents,.service,.incident-notice').forEach(d=>d.open=true);
   const restored=answerFocus&&menu.querySelector('[data-answer="'+CSS.escape(answerFocus.dataset.answer)+'"] '+answerSelector);
   if(restored&&!navigating){restored.focus({preventScroll:true});if(caret)restored.setSelectionRange(...caret);}
-  else if(!navigating){const target=focusedSummary>=0?menu.querySelectorAll('summary')[focusedSummary]:focusKey&&focusKey!=='{}'?[...menu.querySelectorAll('button,.grip')].find(b=>JSON.stringify(b.dataset)===focusKey):null;target?.focus({preventScroll:true});}
+  else if(!navigating){const target=focusedSummary>=0?menu.querySelectorAll('summary')[focusedSummary]:focusKey&&active.tagName==='H1'?menu.querySelector('h1'):focusKey&&focusKey!=='{}'?[...menu.querySelectorAll(active.tagName)].filter(same)[focusAt]:null;target?.focus({preventScroll:true});}
   document.scrollingElement.scrollTop=scroll;
   fit();
   // after fit() sets the width: a new exchange or text size opens at the newest entry; a tick keeps the reader's place;

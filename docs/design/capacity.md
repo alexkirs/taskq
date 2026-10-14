@@ -97,6 +97,7 @@ CPU load average is not CPU utilization and has incompatible Windows semantics; 
 
 Existing `windows` and `libc` dependencies cover native bindings (Windows feature flags may need enabling); Linux reads use the standard library. No new crate, admin privilege or monitoring daemon.
 macOS free + inactive is a reclaimable-memory approximation, not Apple's pressure metric; do not add purgeable pages again or count compressed pages as available. Document this conservative platform difference in help. Validate on real macOS before release.
+Auto's macOS pressure floor reads `sysctlbyname("kern.memorystatus_vm_pressure_level")`; level 4 or higher holds (taskq.md § 3).
 Reject nonpositive totals, decreasing CPU counters, impossible values or API/read failures as unknown; reset the CPU baseline. Percentages use unrounded values for decisions, rounded values only for display.
 
 - Disabled by default on old and new configs. When the owner enables it, suggested defaults are CPU ceiling 85% and available-memory floor 15%; these reserve headroom, not a hardware safety guarantee.

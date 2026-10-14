@@ -129,10 +129,20 @@ struct Ctx {
 
 /// The project root: `TASKQ_ROOT`, else the nearest folder with `taskq.json` that is not a task worktree.
 fn find_root() -> Res<PathBuf> {
-    if let Some(r) = std::env::var_os("TASKQ_ROOT") {
-        return Ok(r.into());
+    root_for(std::env::var_os("TASKQ_ROOT").map(PathBuf::from), std::env::current_dir().map_err(|e| e.to_string())?)
+}
+
+/// `TASKQ_ROOT` wins only when it contains `cwd` or `cwd` is in no project: a reused session's stale value is refused (§ 5).
+fn root_for(env: Option<PathBuf>, cwd: PathBuf) -> Res<PathBuf> {
+    if let Some(r) = env {
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let (rc, dc) = (canon(&r), canon(&cwd));
+        if dc.starts_with(&rc) || dc.ancestors().all(|a| !a.join("taskq.json").is_file()) {
+            return Ok(r);
+        }
+        return Err(format!("TASKQ_ROOT {} is not the project of the current directory {}", r.display(), cwd.display()));
     }
-    let mut d = std::env::current_dir().map_err(|e| e.to_string())?;
+    let mut d = cwd;
     loop {
         let in_worktree = d.parent().and_then(Path::file_name).is_some_and(|n| n == ".worktrees");
         if d.join("taskq.json").is_file() && !in_worktree {
@@ -1608,6 +1618,9 @@ fn run(argv: &[String]) -> Res<()> {
         return Ok(());
     }
     let cmd = a.pos.first().map(String::as_str).unwrap_or("");
+    if std::env::var_os("TASKQ_ROOT").is_some() {
+        find_root()?; // § 5: a stale TASKQ_ROOT refuses every command, not only those that read the project
+    }
     match cmd {
         "profile" => { print!("{}", profile::report(&platform::default_install())); Ok(()) }
         "selftest" => {
@@ -2019,6 +2032,24 @@ fn main() {
 mod tests {
     use super::*;
     use board::Fake;
+
+    // Chain: § 5 stale TASKQ_ROOT (#1072). Risk: a reused session's command writes into another project.
+    #[test]
+    fn stale_taskq_root_is_refused() {
+        let t = std::env::temp_dir().join(format!("taskq-stale-root-{}", std::process::id()));
+        let (a, b, out) = (t.join("a"), t.join("b"), t.join("out"));
+        for d in [&a, &b] {
+            fs::create_dir_all(d.join(".worktrees/x")).unwrap();
+            fs::write(d.join("taskq.json"), "{}").unwrap();
+        }
+        fs::create_dir_all(&out).unwrap();
+        assert_eq!(root_for(Some(a.clone()), a.join(".worktrees/x")).unwrap(), a);
+        assert_eq!(root_for(Some(a.clone()), out.clone()).unwrap(), a);
+        let e = root_for(Some(b.clone()), a.join(".worktrees/x")).unwrap_err();
+        assert!(e.starts_with("TASKQ_ROOT ") && e.contains("is not the project of the current directory"), "{e}");
+        assert_eq!(root_for(None, a.join(".worktrees/x")).unwrap(), a);
+        fs::remove_dir_all(&t).unwrap();
+    }
 
     // Chain: § 5 capacity edit. Risk: an invalid edit replaces the file.
     #[test]

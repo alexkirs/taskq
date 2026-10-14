@@ -164,9 +164,11 @@ pub fn tally(op: &str) {
     if let Ok(mut m) = PROCESS.lock() { *m.entry(op.into()).or_default() += 1; }
 }
 
-/// The source of a CLI process: `<role> <command>` (`service` adds its subcommand). Role `worker` or `reviewer`
-/// from `TASKQ_ROLE`, else `cli` (owner, PM, operator). None for `service run`: the service records each hour.
-pub fn source(args: &[String], role: Option<&str>) -> Option<String> {
+/// The source of a CLI process: `<role> <command>` (`service` adds its subcommand), from the positionals as dispatch
+/// parses them, so flags anywhere do not change it. Role `worker` or `reviewer` from `TASKQ_ROLE`, else `cli` (owner,
+/// PM, operator). None for `service run`: the service records each hour.
+pub fn source(argv: &[String], role: Option<&str>) -> Option<String> {
+    let args = crate::Args::parse(argv).map(|a| a.pos).unwrap_or_default();
     let word = |s: Option<&String>| s.filter(|s| !s.is_empty() && s.len() <= 30 && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'))
         .map_or("*".to_string(), Clone::clone);
     let mut cmd = word(args.first());
@@ -248,6 +250,9 @@ mod tests {
         assert_eq!(source(&args(&["service", "run"]), None), None, "the service records its own hours");
         assert_eq!(source(&args(&["C:\\secret path"]), None).unwrap(), "cli *");
         assert_eq!(source(&[], None).unwrap(), "cli *");
+        assert_eq!(source(&args(&["--json", "status"]), None).unwrap(), "cli status", "a flag before the command");
+        assert_eq!(source(&args(&["--json", "service", "run"]), None), None, "service run with a flag first");
+        assert_eq!(source(&args(&["service", "--json", "run"]), None), None, "service run with a flag between");
         let line = |at: u64, src: &str, ops: &[(&str, u64)]| format!("{RECORD}{}\n", serde_json::to_string(&Usage { at_ms: at,
             source: src.into(), ops: ops.iter().map(|(k, v)| (k.to_string(), *v)).collect() }).unwrap());
         let now = 10_000_000;

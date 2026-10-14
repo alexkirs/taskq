@@ -1,16 +1,20 @@
 #!/bin/sh
-# CI stale check for the README screenshots (docs/design/readme-plan.md, Screenshots): fails when a UI source changed
-# since manifest.sourceCommit or README.md references an image the manifest lacks. Fix: docs/shots/update.sh.
+# CI check for the README screenshots (docs/design/readme-plan.md, Screenshots; taskq.md R12). Exit 2: only stale, a
+# UI source changed since manifest.sourceCommit (CI warns). Exit 1: the manifest is missing or unreadable, a UI source
+# is unresolvable, or README.md references an image the manifest lacks (CI fails). Fix: docs/shots/update.sh.
 # "Changed" compares git blob ids recorded at sourceCommit, so the check survives a squash merge dropping that commit.
 set -eu
 cd "$(dirname "$0")/../.."
 m=docs/shots/manifest.json
 ui='src/tray.rs src/tray.html src/icon.rs docs/design/icon-summary.config.json'
-rc=0
+grep -q '"sourceCommit": "[0-9a-f]\{40\}"' $m || { echo "check.sh: $m is missing, unreadable or has no sourceCommit" >&2; exit 1; }
+rc=0 stale=0
 for f in $ui; do
-  grep -q "\"$f\": \"$(git rev-parse "HEAD:$f")\"" $m || { echo "check.sh: $f changed since manifest sourceCommit; run docs/shots/update.sh" >&2; rc=1; }
+  blob=$(git rev-parse --verify -q "HEAD:$f") || { echo "check.sh: $f is not in HEAD" >&2; rc=1; continue; }
+  grep -q "\"$f\": \"$blob\"" $m || { echo "check.sh: $f changed since manifest sourceCommit; run docs/shots/update.sh" >&2; stale=1; }
 done
 for f in $(grep -o 'docs/shots/[A-Za-z0-9@._-]*\.png' README.md | sort -u); do
   grep -q "\"file\": \"${f##*/}\"" $m || { echo "check.sh: $f is in README.md but not in $m" >&2; rc=1; }
 done
-exit $rc
+[ $rc = 0 ] || exit 1
+[ $stale = 0 ] || exit 2

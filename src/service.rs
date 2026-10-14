@@ -855,7 +855,7 @@ impl<'a> Service<'a> {
                 break;
             }
             let role = if v.task.state == State::Review { "reviewer" } else { "worker" };
-            let rt = if role == "reviewer" { self.reviewer_free(v) } else { self.free(label(&v.issue, "run-").as_deref()) };
+            let rt = if role == "reviewer" { self.reviewer_free(v) } else { self.worker_free(v) };
             let Some(rt) = rt else { continue };
             if !self.reserve(v.issue.number, 0, &rt) {
                 break;
@@ -948,6 +948,18 @@ impl<'a> Service<'a> {
         };
         self.free(Some(other)).or_else(|| self.free(Some(&worker))
             .filter(|rt| rt != "codex-app" || label(&v.issue, "run-").as_deref() == Some("codex-app")))
+    }
+
+    /// `run-*` is hard; else a `prefer-*` runtime with a free slot; else the most free slots (§ 4 Filter).
+    fn worker_free(&mut self, v: &View) -> Option<String> {
+        if let Some(rt) = label(&v.issue, "run-") {
+            return self.free(Some(&rt));
+        }
+        let prefer: Vec<&str> = v.issue.labels.iter().filter_map(|l| l.strip_prefix("prefer-")).collect();
+        if prefer.len() > 1 {
+            self.log.push(format!("#{}: conflicting prefer-* labels; preference ignored", v.issue.number));
+        }
+        prefer.first().filter(|_| prefer.len() == 1).and_then(|p| self.free(Some(p))).or_else(|| self.free(None))
     }
 
     /// A runtime with free capacity: `limits.<rt>` minus live children of it (§ 3).
@@ -1531,7 +1543,7 @@ mod tests {
         assert_eq!(core::options(&card).len(), 2);
     }
 
-    // Chain: § 4 Filter, any-runtime admission over tests/golden/admit.json. Risk: the first listed runtime takes every slot while the other idles.
+    // Chain: § 4 Filter, any-runtime and prefer-* admission over tests/golden/admit.json. Risk: the first listed runtime takes every slot while the other idles; a preference blocks a task or beats run-*.
     #[test]
     fn any_runtime_admission_follows_golden_traces() {
         let traces: Vec<serde_json::Value> = serde_json::from_str(include_str!("../tests/golden/admit.json")).unwrap();
@@ -1546,7 +1558,9 @@ mod tests {
                 let n = b.create("T", "", &[TASK_LABEL.into()]).unwrap();
                 (n, b.comment(n, &format!("taskq: spawn worker {rt}:s mac")).unwrap(), rt)
             }).collect();
-            let ns: Vec<u64> = (0..tasks).map(|_| b.create("T", "", &[TASK_LABEL.into()]).unwrap()).collect();
+            let mut labels = vec![TASK_LABEL.to_string()];
+            labels.extend(serde_json::from_value::<Vec<String>>(tr.get("labels").cloned().unwrap_or(json!([]))).unwrap());
+            let ns: Vec<u64> = (0..tasks).map(|_| b.create("T", "", &labels).unwrap()).collect();
             let mut c = cfg("mac");
             c.limits = limits.iter().cloned().collect();
             let mut s = service(&b, &c, Default::default());
@@ -1556,6 +1570,8 @@ mod tests {
             s.pass().unwrap();
             let got: Vec<Option<String>> = ns.iter().map(|&n| rt_of(&task(&b, n)).map(|(rt, _)| rt.to_string())).collect();
             assert_eq!(got, want, "{}", tr["name"]);
+            let ignored = s.log.iter().filter(|l| l.contains("conflicting prefer-*")).count();
+            assert_eq!(ignored, tr["ignored"].as_u64().unwrap_or(0) as usize, "{}", tr["name"]);
             // The old rule: every task takes the first listed runtime with a free slot.
             let mut used: BTreeMap<String, u32> = running.iter().cloned().collect();
             let old: Vec<Option<String>> = (0..tasks).map(|_| limits.iter().find(|(rt, n)| used.get(rt).copied().unwrap_or(0) < *n).map(|(rt, _)| {

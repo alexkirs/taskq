@@ -50,7 +50,7 @@ pub type Res<T> = Result<T, String>;
 
 const USAGE: &str = "taskq agents
  taskq labels
- taskq add <title> --goal G --acceptance A [--acceptance B..] [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 0|1|2] [--host H] [--later|--hold] [--text T]
+ taskq add <title> --goal G --acceptance A [--acceptance B..] [--scope P..] [--deps N..] [--type T] [--runtime R] [--prefer codex|claude] [--priority 0|1|2] [--host H] [--later|--hold] [--text T]
  taskq finding <title> --board URL --source installation/rule/episode --goal G --acceptance A.. [--evidence E..] [--start] [--json]
  taskq start N
  taskq ask N --text Q --option O.. --recommend K [--link URL..]
@@ -1623,6 +1623,10 @@ fn task_body(b: &dyn Board, t: &NewTask, op: &Op) -> Res<(String, Vec<String>, b
     }
     labels.extend(t.labels.iter().cloned());
     labels::validate(&labels)?;
+    // the service ignores both `prefer-*` labels (§ 4 Filter); add refuses them
+    if labels.iter().filter(|l| l.starts_with("prefer-")).count() > 1 {
+        return Err("conflicting prefer-* labels".into());
+    }
     Ok((body, labels, blocked))
 }
 
@@ -1947,8 +1951,8 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             }
             let title = match &picked { Some((t, _, _)) => t, None => a.pos.get(1).filter(|t| !t.trim().is_empty()).ok_or("title missing")? };
             let deps: Vec<u64> = a.all("deps").iter().flat_map(|d| d.split([',', ' '])).filter(|d| !d.is_empty()).map(|d| d.trim_start_matches('#').parse().map_err(|_| format!("bad --deps {d}"))).collect::<Res<_>>()?;
-            for (flag, allowed) in [("type", "code|docs|research|asset"), ("runtime", "codex|claude|codex-app"), ("priority", "0|1|2")] {
-                if a.all(flag).len() > 1 {
+            for (flag, allowed) in [("type", "code|docs|research|asset"), ("runtime", "codex|claude|codex-app"), ("prefer", "codex|claude"), ("priority", "0|1|2")] {
+                if a.all(flag).len() > 1 || (flag == "prefer" && a.one(flag).is_some_and(|v| !["codex", "claude"].contains(&v))) {
                     return Err(format!("--{flag} requires one of {allowed}"));
                 }
             }
@@ -1967,13 +1971,13 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                 host: a.one("host").map(String::from),
                 hold: finding || a.flags.contains_key("hold"),
                 later: a.flags.contains_key("later").then(|| text.to_string()),
-                labels: vec![],
+                labels: a.one("prefer").map(|p| format!("prefer-{p}")).into_iter().collect(),
             };
             if finding {
                 let (mut body, labels, _) = task_body(b, &new, &Op::default())?;
                 let finding_request;
                 for (flag, values) in &a.flags {
-                    if !["board", "source", "goal", "acceptance", "scope", "deps", "type", "runtime", "priority", "host", "evidence", "start", "json"].contains(&flag.as_str()) {
+                    if !["board", "source", "goal", "acceptance", "scope", "deps", "type", "runtime", "prefer", "priority", "host", "evidence", "start", "json"].contains(&flag.as_str()) {
                         return Err(format!("finding does not accept --{flag}"));
                     }
                     if !["acceptance", "scope", "deps", "evidence"].contains(&flag.as_str()) && values.len() != 1 {
@@ -2330,10 +2334,13 @@ mod tests {
         assert!(c.board.issues(None).unwrap().pop().unwrap().labels.contains(&"run-codex-app".into()));
         command(&c, "add", &args(&["--priority", "0"])).unwrap();
         assert_eq!(c.board.issues(None).unwrap().pop().unwrap().labels, vec!["taskq", "q-ready", "p0"]);
-        for extra in [&["--priority", "3"][..], &["--runtime", "any"], &["--type", "code", "--type", "docs"], &["--host", "win,mac"]] {
+        command(&c, "add", &args(&["--prefer", "codex"])).unwrap();
+        assert_eq!(c.board.issues(None).unwrap().pop().unwrap().labels, vec!["taskq", "q-ready", "prefer-codex"]);
+        for extra in [&["--priority", "3"][..], &["--runtime", "any"], &["--type", "code", "--type", "docs"], &["--host", "win,mac"], &["--prefer", "codex-app"], &["--prefer", "codex", "--prefer", "claude"]] {
             assert!(command(&c, "add", &args(extra)).is_err());
         }
-        assert_eq!(c.board.issues(None).unwrap().len(), 4);
+        assert_eq!(c.board.issues(None).unwrap().len(), 5);
+        assert!(task_body(&*c.board, &NewTask { title: "T".into(), goal: "G".into(), acceptance: vec!["observable".into()], labels: vec!["prefer-codex".into(), "prefer-claude".into()], ..Default::default() }, &Op::default()).is_err_and(|e| e.contains("prefer")));
     }
 
     // Chain: F1/F2 local finding -> held issue -> replay. Risk: duplicate or wrong-board writes.

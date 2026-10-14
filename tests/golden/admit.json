@@ -4,5 +4,13 @@
   {"name": "the busier runtime yields", "limits": {"claude": 2, "codex": 2}, "running": {"claude": 1}, "tasks": 2,
    "expect": ["codex", "claude"]},
   {"name": "more free slots win, a tie keeps the listed order, full waits", "limits": {"claude": 1, "codex": 3}, "running": {}, "tasks": 5,
-   "expect": ["codex", "codex", "claude", "codex", null]}
+   "expect": ["codex", "codex", "claude", "codex", null]},
+  {"name": "prefer takes its runtime while it has a free slot", "limits": {"claude": 2, "codex": 2}, "running": {}, "tasks": 3, "labels": ["prefer-codex"],
+   "expect": ["codex", "codex", "claude"]},
+  {"name": "prefer without a free slot falls back", "limits": {"claude": 2, "codex": 1}, "running": {"codex": 1}, "tasks": 1, "labels": ["prefer-codex"],
+   "expect": ["claude"]},
+  {"name": "run-* wins over prefer-*", "limits": {"claude": 2, "codex": 2}, "running": {}, "tasks": 1, "labels": ["run-claude", "prefer-codex"],
+   "expect": ["claude"]},
+  {"name": "both prefer labels are ignored with one log line", "limits": {"claude": 2, "codex": 2}, "running": {}, "tasks": 1, "labels": ["prefer-codex", "prefer-claude"],
+   "expect": ["claude"], "ignored": 1}
 ]

@@ -1693,7 +1693,8 @@ fn uninstall_unit(u: &platform::Unit, root: &Path, projects: &Path) -> Res<()> {
     let all: Vec<String> = registered.lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
     platform::run_all(&u.unload, false)?;
     if let Err(e) = fs::remove_file(&u.path) && e.kind() != std::io::ErrorKind::NotFound { return Err(e.to_string()); }
-    fs::write(projects, all.concat()).map_err(|e| e.to_string())
+    let install = projects.parent().unwrap_or(Path::new("."));
+    resources::unregister(install, root, || fs::write(projects, all.concat()).map_err(|e| e.to_string()))
 }
 
 fn golden_selftest(traces: &str, published: bool) -> Res<usize> {

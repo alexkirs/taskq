@@ -140,6 +140,23 @@ fn policy(root: &Path) -> Res<(String, Value)> {
     Ok((cfg.me.clone(), crate::service::capacity(&v, &cfg.me)?.json()))
 }
 
+fn registered(install: &Path, root: &str) -> bool {
+    crate::operator::projects(install).iter().any(|(_, r)| r.display().to_string() == root)
+}
+
+/// `service uninstall`: `write` drops `root` from `<install>/projects` under the host lock, so no operation writes
+/// to it after this returns; its project ID then loses authority for good.
+pub fn unregister(install: &Path, root: &Path, write: impl FnOnce() -> Res<()>) -> Res<()> {
+    if !dir(install).join(FILE).exists() {
+        return write();
+    }
+    with(install, |s| {
+        write()?;
+        s.projects.retain(|_, p| Path::new(&p.root) != root);
+        Ok(())
+    })
+}
+
 /// Registered roots get an opaque ID once; an unregistered root loses it for good. A capacity that differs from the
 /// recorded one, including a hand edit, gets a new revision.
 fn sync(s: &mut State, install: &Path, now: u64) {
@@ -347,7 +364,7 @@ fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now
     s.ops.get_mut(&op).unwrap().writing = false;
     // the marker save and earlier waits took time: deadline, grant and connection again on a fresh clock
     let now = now.max((fence.clock)());
-    if !(fence.live)() {
+    if !(fence.live)() || !registered(install, &p.root) {
         return Ok(record(s, "rejected", Some("scope")));
     }
     if let Err(r) = authorize(s, v, conn, now) {
@@ -646,12 +663,12 @@ mod tests {
 
     /// DashQ stand-in: queued replies (none: offline) and the exchange bodies it was sent; `at`: the host clock after
     /// the POST; `cut`: a connection file the host replaces while the POST is in flight.
-    struct Dash { replies: Vec<(u16, Value)>, posts: Vec<Value>, at: u64, cut: Option<(PathBuf, Value)> }
+    struct Dash { replies: Vec<(u16, Value)>, posts: Vec<Value>, at: u64, cut: Option<(PathBuf, String)> }
     impl Wire for Dash {
         fn post(&mut self, dest: &str, route: &str, auth: Option<&str>, body: &Value) -> Result<(u16, Value), String> {
             assert_eq!((dest, route, auth), ("https://x/machine", EXCHANGE, Some("c")));
             self.posts.push(body.clone());
-            if let Some((path, conn)) = self.cut.take() { fs::write(path, conn.to_string()).unwrap() }
+            if let Some((path, text)) = self.cut.take() { fs::write(path, text).unwrap() }
             if self.replies.is_empty() { return Err("offline".into()) }
             Ok(self.replies.remove(0))
         }
@@ -915,7 +932,7 @@ mod tests {
         let mut gen2 = active();
         gen2["generation"] = json!(2);
         for (op, cut) in [("op-d", conn(None)), ("op-g", conn(Some(gen2)))] {
-            let mut d = Dash { replies: vec![reply(op)], posts: vec![], at: 0, cut: Some((conn_file(&t.install), cut)) };
+            let mut d = Dash { replies: vec![reply(op)], posts: vec![], at: 0, cut: Some((conn_file(&t.install), cut.to_string())) };
             let (log, _) = exchange(&t.install, &active(), &mut d, 399).unwrap();
             assert_eq!(log, ["resources: connection changed during the exchange; 1 operations not taken"]);
             assert!(!read(&t.install).unwrap().ops.contains_key(op) && config(&t) == before, "{op}");
@@ -937,6 +954,27 @@ mod tests {
             let r = receipt_of(&t, &op);
             assert_eq!((r["reason"].as_str().or(r["state"].as_str()), config(&t)), (Some(want), before.clone()), "{op}");
         }
+        fs::remove_dir_all(&t.base).unwrap();
+    }
+
+    // Chain: exchange POST in flight -> `service uninstall` -> decide -> write. Risk: a removed project still taking
+    // a write because the registration was read before the POST or the lock wait, or its ID keeping authority.
+    #[test]
+    fn unregister_during_the_exchange_never_writes() {
+        let t = setup("unregister");
+        let before = config(&t);
+        let reply = |op: &str| (200, json!({"schema": SCHEMA, "server_at": 399, "operations": [submit(op, json!({"runtime_limit": 0}))], "cancellations": []}));
+        let mut d = Dash { replies: vec![reply("op-u")], posts: vec![], at: 0, cut: Some((t.install.join("projects"), String::new())) };
+        exchange(&t.install, &active(), &mut d, 399).unwrap();
+        assert_eq!((receipt_of(&t, "op-u")["reason"].as_str(), config(&t)), (Some("scope"), before.clone()));
+        // the locked path drops the ID with the registration; registering the root again never revives it
+        fs::write(t.install.join("projects"), format!("{}\n", t.root.display())).unwrap();
+        unregister(&t.install, &t.root, || fs::write(t.install.join("projects"), "").map_err(|e| e.to_string())).unwrap();
+        assert!(read(&t.install).unwrap().projects.is_empty());
+        fs::write(t.install.join("projects"), format!("{}\n", t.root.display())).unwrap();
+        go(&t, &[submit("op-v", json!({"runtime_limit": 0}))], &[], 399);
+        assert_eq!((receipt_of(&t, "op-v")["reason"].as_str(), config(&t)), (Some("scope"), before));
+        assert!(!read(&t.install).unwrap().projects.contains_key("project-1"));
         fs::remove_dir_all(&t.base).unwrap();
     }
 

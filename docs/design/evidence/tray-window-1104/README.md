@@ -1,6 +1,6 @@
 # Tray window #1104: bounded Windows evidence
 
-Incomplete acceptance: native desktop dragging and tray-icon recovery are unproved. Windows denied `SetCursorPos` with error 5; no mouse drag was observed. macOS first-click behavior is implemented through Wry `with_accept_first_mouse(true)` but **Not tested** here; G8 owns that platform qualification.
+Qualification limits: native desktop dragging and tray-icon recovery are unproved. The five required bounded captures below establish the stated renderer/adapter observations; full desktop qualification remains separate. Windows denied `SetCursorPos` with error 5; no mouse drag was observed. macOS first-click behavior is implemented through Wry `with_accept_first_mouse(true)` but **Not tested** here; G8 owns that platform qualification.
 
 The native GNU development artifact and UI source blob IDs are bound in [observations.json](observations.json). These captures use the artifact's own WebView2 page, real CDP pointer/keyboard events and production IPC; no injected fixture page or mocked bridge. The disposable installation has no board or service (empty for window checks, one synthetic cached project for row checks), and no running installation was changed. This proves the listed renderer/adapter observations, not complete desktop interaction qualification.
 

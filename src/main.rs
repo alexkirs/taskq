@@ -12,6 +12,8 @@ mod operator;
 mod recipe;
 mod platform;
 mod policy;
+#[cfg(target_os = "linux")]
+mod linux_sandbox;
 mod retro;
 mod runtime;
 mod service;
@@ -1871,6 +1873,11 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    if std::env::current_exe().ok().is_some_and(|p| p == Path::new(linux_sandbox::HELPER)) {
+        if let Err(e) = linux_sandbox::run(&std::env::args().skip(1).collect::<Vec<_>>()) { eprintln!("{e}"); std::process::exit(1); }
+        return;
+    }
     incident::install_panic_hook();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `<install>/taskq` is the launcher: it runs the current release (coreq.md § Launcher).

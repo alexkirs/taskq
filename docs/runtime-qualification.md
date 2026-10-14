@@ -124,3 +124,15 @@ Candidate `5297419` includes main through `c6d46bd` (access presets). Native Cla
 ### Remaining adoption limits
 
 This matrix is complete as an inventory, not all-green acceptance. Q4 outage/invalid-input cases, Q5 negative sandbox boundaries (outside writes, symlinks, Git common-dir, network denial), hard service/client crash and interrupted-launch recovery, and actual web/mobile/Desktop list readback remain unqualified. The native restart probe verifies deferral, not a full installed-version upgrade. Windows Codex workspace-write remains blocked by the previously recorded native ACL error. Native Remote Control registration does not prove Desktop integration, permanent connectivity or an OS sandbox. Production adoption must retain these distinctions; Linux currently qualifies Codex only.
+
+### Linux constrained launch investigation (2026-10-14)
+
+Codex 0.162.0 on `hermes-fra1`, working TaskQ `4.2.0-dev.1791952400`; no TaskQ grant or project configuration changed. Windows deferred by the owner.
+
+| Boundary | Actual evidence | Result |
+|---|---|---|
+| Native Codex `workspace-write`, start/resume | Session `01a138cd-7bc4-7ad0-8eb2-717287eb1236`: both turns executed the fixture, wrote/read output, and received `EROFS` for the external canary; controller verified unchanged canary and same session. Four pinned specq bodies were supplied on both inputs by the probe, not TaskQ. | Native baseline only; not TaskQ acceptance |
+| Entire CLI inside `codex sandbox` | Explicit profile allowed workspace/state writes and denied outside/policy/config writes. Real inner CLI session `01a138cc-d61c-7751-918b-8c5c83646055` could not execute tools: the outer sandbox masks `/tmp/codex-daemon-1000` with mode `000`, while the inner sandbox requires an owned `0700` directory. | Refused; no Full retry |
+| Entire CLI inside system `bubblewrap` | Disposable runner `hermes-isolated-721881a5724b.service`; bwrap 0.9.0 failed before the CLI with `setting up uid map: Permission denied`. Kernel audit recorded AppArmor `unprivileged_userns` denial for `setpcap` and `uid_map`. | Host enforcement prerequisite blocked; no AppArmor/ACL change |
+
+The newly installed probe-only `bubblewrap` package was removed: its PATH presence would replace Codex's previously working bundled helper. Native `codex sandbox -P :read-only --include-managed-config -- /usr/bin/true` passed again afterward. Working services were not restarted. TaskQ's Linux admission refusal remains: do not convert the native baseline into a protected policy-store claim, or enable a preset without the complete boundary. These probes do not qualify Claude, network denial, symlink escapes or production adoption.

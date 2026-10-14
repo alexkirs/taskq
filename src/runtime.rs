@@ -166,7 +166,12 @@ pub struct Env<'a> {
     pub board_env: &'a [(String, String)],
 }
 
-fn executable(bin: PathBuf, access: &crate::policy::Effective) -> Command {
+fn executable(bin: PathBuf, access: &crate::policy::Effective, env: &Env) -> Command {
+    if access.linux {
+        let mut c = Command::new("/usr/local/libexec/taskq-sandbox");
+        c.arg(env.root).arg(env.install).arg(&access.mode).arg(bin);
+        return c;
+    }
     match &access.profile {
         Some(p) => {
             let mut c = Command::new("/usr/bin/sandbox-exec");
@@ -178,7 +183,7 @@ fn executable(bin: PathBuf, access: &crate::policy::Effective) -> Command {
 }
 
 pub fn command(env: &Env, l: &Launch, access: &crate::policy::Effective) -> Command {
-    let mut c = executable(which(if l.rt == "claude" { "claude" } else { "codex" }), access);
+    let mut c = executable(which(if l.rt == "claude" { "claude" } else { "codex" }), access, env);
     crate::platform::quiet(&mut c);
     let codex = access.codex.as_deref().unwrap_or(env.codex);
     let mode = access.claude.as_deref().unwrap_or(env.permission_mode);
@@ -445,7 +450,7 @@ impl ClaudeTurn {
         }
         std::fs::create_dir_all(log.parent().ok_or("missing log directory")?).map_err(|e| e.to_string())?;
         let mut file = File::options().create(true).append(true).open(log).map_err(|e| e.to_string())?;
-        let mut c = executable(which("claude"), access);
+        let mut c = executable(which("claude"), access, env);
         environment(env, l, &mut c);
         c.current_dir(&root).arg("--bg");
         if l.resume.is_some() { c.args(["--resume", &l.session]); }

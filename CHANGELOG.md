@@ -3,6 +3,10 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## Unreleased
+
+Rollback below `4.2.0-dev` (4.1.11) loses worker grants: its update sweep deletes `<install>/worker-policy.json`, including on the update forward from it. Before a manual downgrade, copy the store outside `<install>`. Coming back: `taskq service pause` in each project, `taskq update`, copy the store back, check `taskq service permissions`, then `taskq service resume`. No board change.
+
 ## v4.1.10
 
 macOS summary tray icon: three numbers with minimal gaps, cadence graph across the full width, drawn at the full menu-bar height (33 pt on notched screens). No board change.

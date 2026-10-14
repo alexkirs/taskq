@@ -36,11 +36,19 @@ for p in $(cat ~/.local/share/taskq/projects); do touch "$p/.taskq/update"; done
 
 `service install` copies the binary into `releases/<v>`, writes `current` and reloads the unit of the project it runs in; that reload restarts the service without the § 8 step 3 handover, so the install runs in a registered project whose `status.json` lists no `kids`; since D-data (#894) an install where children run hands them over through step 3 instead. Every other registered service re-execs through step 3 on its next pass and keeps its children (the `update` poke makes that immediate); the running tray exits because its version differs from `current` and the service starts the new one. Before #894, installing from a project with live children posted `gone` for them (seen on #886 on 2026-10-13). Menu evidence for a task: `target/release/taskq tray --snapshot <dir>` from the worktree, or the live tray after the install.
 
-Rollback to the published release:
+Rollback to the published release (4.1.11's sweep deletes `worker-policy.json`, so keep a copy outside the install):
 
 ```bash
+cp ~/.local/share/taskq/worker-policy.json ~/taskq-worker-policy.json 2>/dev/null
 echo 4.1.11 > ~/.local/share/taskq/current
 for p in $(cat ~/.local/share/taskq/projects); do (cd "$p" && ~/.local/share/taskq/taskq service restart); done
+```
+
+Forward again: pause every project, install the development build as above, then restore the grants before new starts:
+
+```bash
+cp ~/taskq-worker-policy.json ~/.local/share/taskq/worker-policy.json
+~/.local/share/taskq/taskq service permissions   # grants listed, then `service resume` in each project
 ```
 
 Limits: the development build serves every registered project on this host; the launcher's three-start rollback and `previous` are the safety net. No `v*` tag until the qualification batch, so `release.yml` never runs; `tests.yml` still checks every PR.

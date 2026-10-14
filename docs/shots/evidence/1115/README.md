@@ -20,7 +20,7 @@ Claude visual review:
   ends on whole lines.
 - After, no change for the #1059 states: `result-dark-home-16.png` (Next buttons, composer, Projects),
   `failed-dark-home-20.png` (`Edit and send again`), `proposal-dark-home-20.png` (a one-line op is not bounded).
-- macOS WKWebView (`taskq tray --snapshot`, debug build), `macos-long-proposal-dark-home-16.png` and
+- macOS WKWebView (`taskq tray --snapshot`, debug build, recaptured after the rebase onto the resizable window), `macos-long-proposal-dark-home-16.png` and
   `macos-long-proposal-light-home-20.png`: the op under Send is 4 whole lines, `Confirm: apply 1 change` and the
   Projects header show below it at 16 and 20 px, and the exchange preview ends on a whole line.
 - The full text stays reachable by scrolling each block; the AI workspace that keeps it in full is deferred (#1115 Scope).

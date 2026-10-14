@@ -68,7 +68,7 @@ const send=m=>window.ipc&&window.ipc.postMessage(JSON.stringify(m));
 // measure at the target width: after a font change the window still has the old width, so text wraps differently
 // g: this renderer's scrollbar width; a menu taller than its window scrolls and the window adds it (#1073)
 function gutter(){const d=document.createElement('div');d.style.cssText='position:absolute;top:-99px;width:60px;height:60px;overflow:scroll;scrollbar-width:thin';document.body.append(d);const g=d.offsetWidth-d.clientWidth;d.remove();return Math.ceil(g);}
-function fit(place){const size=manualSize||S.size,w=size?size[0]:S.font>=18?360:320;document.body.style.width='100%';menu.style.width=w+'px';place?.();send({a:'size',d:devicePixelRatio,g:size?0:gutter(),w,h:size?size[1]:Math.ceil(menu.getBoundingClientRect().height)});menu.style.width='100%';}
+function fit(){const size=manualSize||S.size,w=size?size[0]:S.font>=18?360:320;document.body.style.width='100%';menu.style.width=w+'px';send({a:'size',d:devicePixelRatio,g:size?0:gutter(),w,h:size?size[1]:Math.ceil(menu.getBoundingClientRect().height)});menu.style.width='100%';}
 let manualSize=null;
 const menu=document.querySelector('.menu');
 let aiText=null,aiMenu=false,aiConfirm=null,addConfirm=false;
@@ -408,8 +408,12 @@ function render(navigating=false){
   if(restored&&!navigating){restored.focus({preventScroll:true});if(caret)restored.setSelectionRange(...caret);}
   else if(!navigating){const target=focusedSummary>=0?menu.querySelectorAll('summary')[focusedSummary]:focusKey&&focusKey!=='{}'?[...menu.querySelectorAll('button,.grip')].find(b=>JSON.stringify(b.dataset)===focusKey):null;target?.focus({preventScroll:true});}
   document.scrollingElement.scrollTop=scroll;
-  // at the fitted width: a new exchange or text size opens at the newest entry; a tick keeps the reader's place
-  fit(()=>menu.querySelectorAll('[data-bound]').forEach(c=>{c.scrollTop=bounds.has(c.dataset.bound)?bounds.get(c.dataset.bound):c.classList.contains('aichain')?c.lastElementChild.offsetTop:0;wholeLines(c);}));}
+  fit();
+  // after fit() sets the width: a new exchange or text size opens at the newest entry; a tick keeps the reader's place;
+  // a block that drops a cut line asks for the smaller height
+  const bound=[...menu.querySelectorAll('[data-bound]')];
+  bound.forEach(c=>{c.scrollTop=bounds.has(c.dataset.bound)?bounds.get(c.dataset.bound):c.classList.contains('aichain')?c.lastElementChild.offsetTop:0;wholeLines(c);});
+  if(bound.some(c=>c.style.maxHeight))fit();}
 // a bounded block shows whole lines: a line cut at the top scrolls into view, or at the scroll end (the newest text)
 // moves out above; the bottom edge moves up to the first line it cuts
 function wholeLines(c){
@@ -423,7 +427,7 @@ function wholeLines(c){
   const bottom=top+c.clientHeight,tail=cut(bottom);if(tail>top&&tail<bottom)shrink(bottom-tail);}
 // a reader's scroll leaves cut lines: once it settles, the block takes its CSS bound again and realigns on whole lines
 menu.addEventListener('scroll',e=>{const c=e.target;if(!c.dataset?.bound)return;clearTimeout(c.settling);
-  c.settling=setTimeout(()=>{if(!c.isConnected)return;const s=c.scrollTop;c.style.maxHeight='';fit(()=>{c.scrollTop=s;wholeLines(c);});},150);},true);
+  c.settling=setTimeout(()=>{if(!c.isConnected)return;const s=c.scrollTop;c.style.maxHeight='';c.scrollTop=s;wholeLines(c);fit();},150);},true);
 window.taskq={receive(s){
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
   if(s.capmsg){resourceReceipt(s.capmsg);return;}

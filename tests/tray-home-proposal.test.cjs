@@ -4,7 +4,7 @@ const html=fs.readFileSync('src/tray.html','utf8');
 const source=html.slice(html.indexOf('const aiStates='),html.indexOf('// Add project'));
 // the proposed changes are bounded, scroll inside themselves and, like the exchange, end on whole lines
 assert.match(html,/\.aiops\{max-height:6\.5em;overflow-y:auto[;}]/);
-assert.match(html,/querySelectorAll\('\[data-bound\]'\)\.forEach\(c=>\{[^}]*wholeLines\(c\)/);
+assert.match(html,/bound\.forEach\(c=>\{[^}]*wholeLines\(c\)/);
 const longOp={project:'p',op:'answer',task:1058,text:'PM: '+'a long owner answer '.repeat(30)};
 const answer={state:'proposal',rev:3,text:'Plan ready.',ops:[{project:'p',op:'add',title:'T'},longOp]};
 const request={id:'2',root:'p',text:'Ask',answer,chain:[{text:'Ask',answer}]};

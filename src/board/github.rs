@@ -114,12 +114,14 @@ impl GitHub {
         }
     }
 
-    /// main refuses a merge of a head that lacks current main (§ 7): a ruleset, or classic protection the token can read.
+    /// main refuses a merge of a head that lacks current main and this token cannot bypass it (§ 7):
+    /// a ruleset it can never bypass, or classic protection the token can read that binds admins too.
     fn strict_main(&self) -> bool {
         let read = |url: &str| self.api.call("GET", url, None).and_then(|r| r.json());
         read("/rules/branches/main").is_ok_and(|v| v.as_array().into_iter().flatten()
-            .any(|r| r["type"] == "required_status_checks" && r["parameters"]["strict_required_status_checks_policy"] == true))
-            || read("/branches/main/protection/required_status_checks").is_ok_and(|v| v["strict"] == true)
+            .filter(|r| r["type"] == "required_status_checks" && r["parameters"]["strict_required_status_checks_policy"] == true)
+            .any(|r| r["ruleset_id"].as_u64().is_some_and(|id| read(&format!("/rulesets/{id}")).is_ok_and(|s| s["current_user_can_bypass"] == "never"))))
+            || read("/branches/main/protection").is_ok_and(|v| v["required_status_checks"]["strict"] == true && v["enforce_admins"]["enabled"] == true)
     }
 
     fn try_publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> Result<Publish> {
@@ -162,8 +164,8 @@ impl GitHub {
             return Ok(Publish::Failed(format!("{branch} is not rebased on current main: rebase, rerun the checks and push")));
         }
         if !self.strict_main() {
-            // main can move between the check above and the merge: only strict protection refuses a stale head at merge time
-            return Ok(Publish::Pending("main does not require branches up to date before merging: enable it on a main ruleset".into()));
+            // main can move between the check above and the merge: only strict protection this token cannot bypass refuses a stale head
+            return Ok(Publish::Pending("main does not require branches up to date before merging, or this token can bypass it: enable it on a main ruleset without bypass".into()));
         }
         let p = prs[0]["number"].as_u64().unwrap_or(0);
         if prs[0]["draft"] == true {

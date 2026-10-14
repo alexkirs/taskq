@@ -249,7 +249,7 @@ Reviewer checks every Acceptance and contract against the candidate and CI on th
 `close` publication goes through the board API only:
 - `direct`: branch `taskq-<N>` equals the result SHA, `main` is its ancestor, CI green on that SHA; move `main` to it
   without force, read back, close. GitLab has no fast-forward ref API: `direct` there merges a fast-forward MR.
-- `pr`: exactly one open PR/MR of `taskq-<N>` at the result SHA, current `main` its ancestor (else `requeue`: rebase), CI green on its head; `main` refuses a stale head at merge time (GitHub ruleset or readable protection requiring branches up to date, GitLab fast-forward or semi-linear merge method), else refuse; mark a draft GitHub PR ready; squash-merge with the title and
+- `pr`: exactly one open PR/MR of `taskq-<N>` at the result SHA, current `main` its ancestor (else `requeue`: rebase), CI green on its head; `main` refuses a stale head at merge time (GitHub: a ruleset requiring branches up to date that the token can never bypass, or readable protection requiring it with admins enforced; GitLab: fast-forward or semi-linear merge method), else refuse; mark a draft GitHub PR ready; squash-merge with the title and
   all `Task:` lines; read the merge back; close. Incident ancestry checks in this same close use the returned merge SHA for squash publication, the result SHA for direct publication; later human moves are never read.
 - No commit (research, or SHA already on `main`): verify ancestry, close.
 - Pending or missing CI: refuse, state unchanged. Failed CI or conflict: `requeue` with the message.

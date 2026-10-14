@@ -686,7 +686,8 @@ mod tests {
             else if url.ends_with("/status") { json!({"total_count": 0}) }
             else if url.contains("/repository/commits/") { json!({"last_pipeline": {"status": "success"}}) }
             else if url.ends_with("/repository/branches/main") { json!({"commit": {"id": "c".repeat(40)}}) }
-            else if url.ends_with("/rules/branches/main") { json!([{"type": "required_status_checks", "parameters": {"strict_required_status_checks_policy": true}}]) }
+            else if url.ends_with("/rules/branches/main") { json!([{"type": "required_status_checks", "ruleset_id": 1, "parameters": {"strict_required_status_checks_policy": true}}]) }
+            else if url.ends_with("/rulesets/1") { json!({"current_user_can_bypass": "never"}) }
             else if url.ends_with("/projects/o%2Fr") { json!({"merge_method": "ff"}) }
             else if url.contains("/git/ref/heads/taskq-") { json!({"object": {"sha": result}}) }
             else if url.ends_with("/git/refs/heads/main") { json!({"object": {"sha": result}}) }
@@ -751,23 +752,40 @@ mod tests {
 
     // Chain: § 7 `pr` publication on both boards (#1139). Risk: CI green on a head that lacks current main merges a
     // combination nobody built, and main stops compiling: refused before the merge, or by the board when main moves
-    // between that check and the merge; a main that cannot refuse at merge time is never merged into.
+    // between that check and the merge; a main that cannot refuse at merge time, or whose refusal this token can
+    // bypass (ruleset bypass actor, classic protection exempting admins), is never merged into.
     #[test]
     fn a_pr_merges_only_onto_the_main_its_ci_built() {
-        // (rebased, main refuses stale merges, main moves before the merge) -> outcome
-        for (rebased, strict, moved, want) in [(false, true, false, "Failed"), (true, false, false, "Pending"), (true, true, true, "Failed")] {
+        // (rebased, how main refuses stale merges, main moves before the merge) -> outcome
+        let cases = [
+            (false, "ruleset:never", false, "Failed"),
+            (true, "none", false, "Pending"),
+            (true, "ruleset:always", false, "Pending"),
+            (true, "ruleset:pull_requests_only", false, "Pending"),
+            (true, "classic:admins exempt", false, "Pending"),
+            (true, "ruleset:never", true, "Failed"),
+            (true, "classic:enforced", true, "Failed"),
+        ];
+        for (rebased, guard, moved, want) in cases {
             for kind in BOARDS {
                 let calls = std::rc::Rc::new(RefCell::new(vec![]));
                 let captured = calls.clone();
+                let enforced = matches!(guard, "ruleset:never" | "classic:enforced");
                 let h = http(kind, None, Box::new(move |method, url, _| {
                     captured.borrow_mut().push(method.to_string());
                     let result = "a".repeat(40);
                     let value = if url.contains("/compare/") { json!({"status": if rebased { "ahead" } else { "diverged" }}) }
                         else if url.contains("/merge_base?") { json!({"id": "c".repeat(40)}) }
                         else if url.ends_with("/repository/branches/main") { json!({"commit": {"id": if rebased { "c" } else { "d" }.repeat(40)}}) }
-                        else if url.ends_with("/rules/branches/main") { json!(if strict { json!([{"type": "required_status_checks", "parameters": {"strict_required_status_checks_policy": true}}]) } else { json!([]) }) }
-                        else if url.ends_with("/protection/required_status_checks") { return Err("HTTP 403 Resource not accessible by personal access token".into()) }
-                        else if url.ends_with("/projects/o%2Fr") { json!({"merge_method": if strict { "ff" } else { "merge" }}) }
+                        else if url.ends_with("/rules/branches/main") {
+                            if guard.starts_with("ruleset:") { json!([{"type": "required_status_checks", "ruleset_id": 1, "parameters": {"strict_required_status_checks_policy": true}}]) } else { json!([]) }
+                        }
+                        else if url.ends_with("/rulesets/1") { json!({"current_user_can_bypass": guard.trim_start_matches("ruleset:")}) }
+                        else if url.ends_with("/branches/main/protection") {
+                            if !guard.starts_with("classic:") { return Err("HTTP 403 Resource not accessible by personal access token".into()) }
+                            json!({"required_status_checks": {"strict": true}, "enforce_admins": {"enabled": guard == "classic:enforced"}})
+                        }
+                        else if url.ends_with("/projects/o%2Fr") { json!({"merge_method": if enforced { "ff" } else { "merge" }}) }
                         else if url.contains("/check-runs") { json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}) }
                         else if url.ends_with("/status") { json!({"total_count": 0}) }
                         else if url.contains("/repository/commits/") { json!({"last_pipeline": {"status": "success"}}) }
@@ -782,7 +800,7 @@ mod tests {
                     Publish::Pending(_) => "Pending",
                     Publish::Done(m) => panic!("merged: {m}"),
                 };
-                assert_eq!(got, want, "{} rebased={rebased} strict={strict} moved={moved}", kind.name);
+                assert_eq!(got, want, "{} rebased={rebased} guard={guard} moved={moved}", kind.name);
                 assert_eq!(calls.borrow().iter().filter(|m| *m != "GET").count(), usize::from(moved), "merge only behind the fence");
             }
         }
@@ -800,7 +818,8 @@ mod tests {
                 let value = if url.contains("/compare/") { json!({"status": "ahead"}) }
                     else if url.contains("/check-runs") { json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}) }
                     else if url.ends_with("/status") { json!({"total_count": 0}) }
-                    else if url.ends_with("/rules/branches/main") { json!([{"type": "required_status_checks", "parameters": {"strict_required_status_checks_policy": true}}]) }
+                    else if url.ends_with("/rules/branches/main") { json!([{"type": "required_status_checks", "ruleset_id": 1, "parameters": {"strict_required_status_checks_policy": true}}]) }
+                    else if url.ends_with("/rulesets/1") { json!({"current_user_can_bypass": "never"}) }
                     else if url.contains("/pulls?") { json!([{"number": 7, "node_id": "PR_7", "draft": true, "head": {"sha": result}}]) }
                     else if url == "https://api.github.com/graphql" {
                         assert_eq!(body.unwrap()["variables"]["id"], "PR_7");

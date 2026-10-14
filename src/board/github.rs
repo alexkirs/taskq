@@ -225,6 +225,10 @@ impl Board for GitHub {
         outcome(self.try_publish(n, sha, mode, title, task_line))
     }
 
+    fn requests(&self) -> crate::requests::Budget {
+        self.api.budget.borrow().clone()
+    }
+
     fn url(&self, n: u64) -> String {
         let web = self.api.root.replace("api.github.com", "github.com").replace("/api/v3", "");
         let repo = self.api.base.rsplit_once("/repos/").map(|x| x.1).unwrap_or_default();

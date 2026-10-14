@@ -207,6 +207,10 @@ impl Board for GitLab {
         outcome(self.try_publish(n, sha, mode, title, task_line))
     }
 
+    fn requests(&self) -> crate::requests::Budget {
+        self.api.budget.borrow().clone()
+    }
+
     fn url(&self, n: u64) -> String {
         let repo = self.api.base.rsplit_once("/projects/").map(|x| x.1.replace("%2F", "/")).unwrap_or_default();
         format!("{}/{repo}/-/issues/{n}", self.api.root.trim_end_matches("/api/v4"))

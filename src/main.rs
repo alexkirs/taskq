@@ -1,5 +1,10 @@
 //! The `taskq` command line (taskq.md § 5). Every write is one `taskq:` comment that `fold` accepts.
 
+/// One service log line (§ 4): stamped and folded in `service run`, plain on the CLI.
+macro_rules! log {
+    ($($t:tt)*) => { $crate::platform::log(&format!($($t)*)) };
+}
+
 mod admission;
 mod board;
 mod core;
@@ -10,6 +15,7 @@ mod incident;
 mod labels;
 mod operator;
 mod recipe;
+mod requests;
 mod platform;
 mod policy;
 mod retro;
@@ -506,7 +512,7 @@ fn kids_file(root: &Path) -> Vec<data::KidLine> {
     };
     match parsed {
         Err(e) => {
-            eprintln!("{e}; its attempts go gone");
+            log!("{e}; its attempts go gone");
             vec![]
         }
         Ok((pid, kids)) => {
@@ -527,6 +533,7 @@ fn adopt(s: &mut Service, root: &Path) {
 }
 
 fn service_run(c: &Ctx) -> Res<()> {
+    platform::service_log();
     let cfg = &c.cfg;
     let exe = launcher(&cfg.install);
     let board_env = cfg.board.worker_env(&platform::tool(&cfg.install), &cfg.web_host)?;
@@ -538,13 +545,13 @@ fn service_run(c: &Ctx) -> Res<()> {
     fs::create_dir_all(&d).map_err(|e| e.to_string())?;
     // § 4 one service per root: wait, not exit, so the unit sees no crash loop
     while let Some(pid) = other_service(&cfg.root) {
-        eprintln!("service pid {pid} already runs this project; waiting");
+        log!("service pid {pid} already runs this project; waiting");
         std::thread::sleep(Duration::from_secs(cfg.poll));
     }
     adopt(&mut s, &cfg.root);
     let is_installed = installed(&cfg.install);
     let began = Instant::now();
-    eprintln!("{}", incident::disclosure(Some(&cfg.root)));
+    log!("{}", incident::disclosure(Some(&cfg.root)));
     let mut checked: Option<Instant> = None;
     let mut update: Option<String> = None;
     let mut restart_empty: Option<u64> = None;
@@ -555,18 +562,23 @@ fn service_run(c: &Ctx) -> Res<()> {
     let project = project_name(&cfg.root);
     let issues = c.board.url(0).strip_suffix("/0").unwrap_or_default().to_string();
     let log = coreq::service::log_path(&platform::tool(&cfg.install), &project);
-    eprintln!("taskq {} service on {} for {}", platform::VERSION, cfg.me, cfg.repo);
+    log!("taskq {} service on {} for {}", platform::VERSION, cfg.me, cfg.repo);
     let mut sampled: Option<Instant> = None;
     let mut agents: Option<(Instant, Value)> = None;
     let mut focus_error: Option<String> = None;
     let mut pruned: Option<Instant> = None;
+    // § 4 board budget: the pause logged last, and the cumulative counts at the last full hour
+    let since = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let mut paused_logged: Option<i64> = None;
+    let mut hour: (Instant, BTreeMap<String, u64>) = (Instant::now(), BTreeMap::new());
+    let mut last_hour: Option<BTreeMap<String, u64>> = None;
     loop {
         // § 3: capacity reloads before each admission decision; children are untouched
         let cap = fs::read_to_string(cfg.root.join("taskq.json")).map_err(|e| e.to_string())
             .and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| format!("taskq.json: {e}")))
             .and_then(|v| service::capacity(&v, &cfg.me));
         if let Err(e) = &cap {
-            eprintln!("capacity: {e}; launches held");
+            log!("capacity: {e}; launches held");
         }
         let op_rt = cap.as_ref().ok().and_then(|c| ["claude", "codex"].into_iter().find(|rt| c.limits.get(*rt).copied().unwrap_or(if c.auto { u32::MAX } else { 0 }) > 0));
         s.reload(cap);
@@ -574,14 +586,14 @@ fn service_run(c: &Ctx) -> Res<()> {
         let access = policy::report(&cfg.install, &cfg.root, &cfg.permission_mode, &cfg.codex);
         s.refused_access = access.iter().filter_map(|e| Some((e.runtime.clone(), e.refused.clone()?))).collect();
         if let Some(m) = policy::pin_rollback(&cfg.install, platform::VERSION) {
-            eprintln!("{m}");
+            log!("{m}");
         }
         s.mono = began.elapsed().as_secs();
         s.wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         // § 4 Data: an unreadable focus admits nothing and reads unknown with its reason
         let focus = data::focus(&cfg.root);
         if focus.as_ref().err() != focus_error.as_ref() {
-            if let Err(e) = &focus { eprintln!("{e}; nothing admitted"); }
+            if let Err(e) = &focus { log!("{e}; nothing admitted"); }
             focus_error = focus.as_ref().err().cloned();
         }
         s.focus = focus.unwrap_or_default();
@@ -589,10 +601,26 @@ fn service_run(c: &Ctx) -> Res<()> {
         let r = s.pass();
         s.sync_host();
         for l in s.log.drain(..) {
-            eprintln!("{l}");
+            log!("{l}");
         }
-        if let Err(e) = &r {
-            eprintln!("pass: {e}");
+        let budget = c.board.requests();
+        let paused = budget.paused_until();
+        if paused != paused_logged {
+            match paused {
+                Some(t) => log!("{}", requests::paused_text(t)),
+                None => log!("rate limit: board requests resumed"),
+            }
+            paused_logged = paused;
+        }
+        // while paused every pass fails the same way: the pause line above is the one report
+        if let (Err(e), None) = (&r, paused) {
+            log!("pass: {e}");
+        }
+        if hour.0.elapsed().as_secs() >= 3600 {
+            let h = requests::diff(&budget.ops, &hour.1);
+            log!("requests 1h: {}", requests::summary(&h, ""));
+            last_hour = Some(h);
+            hour = (Instant::now(), budget.ops.clone());
         }
         let at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let kids: Vec<Value> = s.kids.iter().map(|k| {
@@ -615,7 +643,8 @@ fn service_run(c: &Ctx) -> Res<()> {
         for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
             ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
-            ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root)))]
+            ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root))),
+            ("requests", budget.json(since, last_hour.as_ref()))]
         {
             status[k] = v;
         }
@@ -637,16 +666,16 @@ fn service_run(c: &Ctx) -> Res<()> {
                         reexec(&s, cfg)?;
                     }
                     Ok(None) => update = None,
-                    Err(e) => eprintln!("update: {e}"),
+                    Err(e) => log!("update: {e}"),
                 }
             } else {
                 match platform::update(&cfg.install, true) {
                     Ok(found) => update = found,
-                    Err(e) => eprintln!("update: {e}"),
+                    Err(e) => log!("update: {e}"),
                 }
             }
             if asked {
-                eprintln!("update requested: {}", update.as_deref().map_or("up to date".into(), |v| format!("{v} found")));
+                log!("update requested: {}", update.as_deref().map_or("up to date".into(), |v| format!("{v} found")));
             }
         }
         restart_watch(&mut restart_empty, cfg!(windows) && d.join("restart").exists() && s.kids.is_empty(), began.elapsed().as_secs(), cfg.update_every);
@@ -654,7 +683,7 @@ fn service_run(c: &Ctx) -> Res<()> {
             // Windows re-exec waits for the live children; the request stays until it can go
             if !operator::running(&cfg.root) && ((cfg!(unix) && !s.kids.iter().any(|k| matches!(k.rt.as_str(), "codex-app" | "claude"))) || s.kids.is_empty()) {
                 let _ = fs::remove_file(d.join("restart"));
-                eprintln!("restart requested");
+                log!("restart requested");
             }
             reexec(&s, cfg)?;
         }
@@ -663,7 +692,7 @@ fn service_run(c: &Ctx) -> Res<()> {
             pruned = Some(Instant::now());
             let live: Vec<u64> = s.kids.iter().map(|k| k.attempt).collect();
             for l in data::prune(&cfg.root, &cfg.install, &project, &live) {
-                eprintln!("{l}");
+                log!("{l}");
             }
         }
         operator::owner_comments(&cfg.root, &project, &issues, &s.owner_comments);
@@ -1147,6 +1176,11 @@ fn service_fields(root: &Path) -> String {
         out.push(format!("Status: unknown ({e})"));
     }
     let status = status.ok().flatten();
+    // § 4 board budget: only a status written within 60 s speaks for the running service
+    let requests = match status.as_ref().filter(|_| file_age(&d.join("status.json")).is_some_and(|a| a <= 60)) {
+        Some(s) => requests::lines(s),
+        None => vec!["Board requests: unknown (status missing or stale)".into()],
+    };
     let ttl = load(root).map(|(c, _)| c.ttl.max(0) as u64).unwrap_or(300);
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_secs());
     let fresh = status.as_ref().and_then(|s| {
@@ -1160,6 +1194,7 @@ fn service_fields(root: &Path) -> String {
         }
         _ => out.push("Service: unknown (status missing, stale or failed)\nFreshness: unknown (no fresh successful status)\nCounts: unknown (no fresh successful read)".into()),
     }
+    out.extend(requests);
     out.join("\n")
 }
 
@@ -1226,6 +1261,7 @@ fn service(args: &Args) -> Res<()> {
             println!("Update: {}", status["update"].as_str().unwrap_or("unknown"));
             println!("{}", incident::line(&incident::status(&root)));
             if status["incident_notice"] == true || incident::notice(&root) { println!("Incident reports: notice"); }
+            for l in requests::lines(&status) { println!("{l}"); }
             Ok(())
         }
         "install" | "uninstall" | "stop" => {
@@ -1839,6 +1875,11 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             emit(&out, json)
         }
         "status" => {
+            // R6: a board rate-limit pause the local service reports comes first, also when this read fails
+            let local = dot(&cfg.root).join("status.json");
+            if let Some(w) = data::json(&local).ok().flatten().filter(|_| file_age(&local).is_some_and(|a| a <= 60)).as_ref().and_then(requests::warning) {
+                println!("{w}");
+            }
             let snap = snapshot::read(b, cfg, &c.raw, &a.all("only").iter().flat_map(|x| x.split(',')).map(String::from).collect::<Vec<_>>());
             if a.flags.contains_key("json") {
                 println!("{}", serde_json::to_string_pretty(&snap.json()).map_err(|e| e.to_string())?);

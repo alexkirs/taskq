@@ -33,6 +33,14 @@ const probe=()=>[...document.querySelectorAll('[data-bound]')].map(c=>{
           if(at==='start')assert(b.first,font+' px start: '+b.name+' hides its first line');
         }
       }
+      // chain.length == answer.rev: a refresh keeps each block's own scroll place
+      const state={page:'home',font,projects:[{root:'storefront',name:'storefront',alive:true,complete:true,focus:[],labels:[],tasks:[]}],ai:{target:'storefront',history:[],draft:'',request}};
+      await page.evaluate(()=>{const [x,o]=document.querySelectorAll('[data-bound]');x.scrollTop=0;o.scrollTop=o.scrollHeight;});
+      await page.waitForTimeout(400);
+      const before=await page.evaluate(()=>[...document.querySelectorAll('[data-bound]')].map(c=>c.scrollTop));
+      assert(before[0]!==before[1],font+' px: blocks sit at different scroll places');
+      await page.evaluate(s=>taskq.receive(s),state);
+      assert.deepEqual(await page.evaluate(()=>[...document.querySelectorAll('[data-bound]')].map(c=>c.scrollTop)),before,font+' px: receive keeps both scroll places');
       assert.deepEqual(errors,[]);await page.close();
     }
   }finally{await browser.close();}

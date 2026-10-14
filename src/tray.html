@@ -220,7 +220,7 @@ function ai(){
   const A=S.ai,r=A.request,an=r&&r.answer||{},st=r?(an.state||'queued'):null,bad=['failed','refuse','apply failed'].includes(st);
   let h='<div class="group"><div class="row meta">✦ Ask AI · '+(A.target?'projects: '+esc(S.projects.map(p=>p.name).join(', ')):'no running service: cannot send')+'</div>';
   const chain=r?(r.chain||[r]):[];
-  if(r)h+='<div class="aichain" tabindex="0" aria-label="AI exchange" data-bound="'+esc(r.id+'/'+chain.length+'/'+st+'/'+S.font)+'">';
+  if(r)h+='<div class="aichain" tabindex="0" aria-label="AI exchange" data-bound="'+esc('chain/'+r.id+'/'+chain.length+'/'+st+'/'+S.font)+'">';
   for(const q of chain){
     const a=q.answer||{},state=a.state||'queued',bad=['failed','refuse','apply failed'].includes(state);
     h+='<div class="body"><div class="meta">'+(q.url?'<a href="'+esc(q.url)+'" data-url="'+esc(q.url)+'">Comment on #'+esc(q.task)+' ↗</a>: ':'You: ')+esc(q.text||'')+'</div><div class="'+(bad?'alert':state==='applied'||state==='result'?'work':'ask')+'" role="status">'+esc(aiStates[state]||state)+(a.reason?': '+esc(a.reason):'')+'</div>'+(a.text?'<div>'+esc(a.text).replace(/\n/g,'<br>')+'</div>':'')+'</div>';
@@ -236,7 +236,7 @@ function ai(){
   if(!r)return h+'</div>';
   // a setup lists its effects, computed by the service, instead of the op (§ 6)
   const lines=[...an.effects||(an.ops||[]).map(opText),...an.readback||[]];
-  if(lines.length)h+='<div class="body meta aiops" tabindex="0" aria-label="Proposed changes" data-bound="'+esc(r.id+'/'+an.rev+'/'+st+'/'+S.font)+'">'+lines.map(esc).join('<br>')+'</div>';
+  if(lines.length)h+='<div class="body meta aiops" tabindex="0" aria-label="Proposed changes" data-bound="'+esc('ops/'+r.id+'/'+an.rev+'/'+st+'/'+S.font)+'">'+lines.map(esc).join('<br>')+'</div>';
   if(st==='proposal')h+='<button class="project" data-a="ai-confirm" data-root="'+esc(r.root)+'" data-id="'+esc(r.id)+'" data-rev="'+Number(an.rev)+'"'+(aiConfirm===r.id+'/'+Number(an.rev)?' disabled':'')+'>Confirm: apply '+(an.effects||an.ops).length+' change'+((an.effects||an.ops).length===1?'':'s')+'</button>';
   if(bad)h+='<button class="project" data-a="ai-pick" data-v="'+esc(r.text||'')+'">Edit and send again</button>';
   return h+'</div>';}

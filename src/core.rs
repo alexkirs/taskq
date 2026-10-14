@@ -34,9 +34,27 @@ impl State {
     }
 }
 
-/// `Depends on #N` lines of an issue text (§ 1).
-pub fn depends(body: &str) -> Vec<u64> {
-    body.lines().filter_map(|l| l.trim().strip_prefix("Depends on #")?.split_whitespace().next()?.parse().ok()).collect()
+/// One `Depends on` reference (§ 1): issue `n` of this board (`repo` none) or of another repository on its host.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Dep {
+    pub repo: Option<String>,
+    pub n: u64,
+}
+
+impl Dep {
+    /// `#N` or `<repo>#N`, as written in the issue text.
+    pub fn name(&self) -> String {
+        format!("{}#{}", self.repo.as_deref().unwrap_or_default(), self.n)
+    }
+}
+
+/// `Depends on #N` and `Depends on <repo>#N` lines of an issue text (§ 1); `<repo>` is `name` or `owner/name`.
+pub fn depends(body: &str) -> Vec<Dep> {
+    body.lines().filter_map(|l| {
+        let (repo, n) = l.trim().strip_prefix("Depends on ")?.split_whitespace().next()?.split_once('#')?;
+        let path = |s: &str| s.split('/').all(|p| !p.is_empty() && !p.starts_with('.') && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)));
+        Some(Dep { repo: (!repo.is_empty()).then(|| repo.to_string()).filter(|r| path(r)), n: n.parse().ok()? }).filter(|d| repo.is_empty() || d.repo.is_some())
+    }).collect()
 }
 
 /// A log entry's comment body (§ 2).

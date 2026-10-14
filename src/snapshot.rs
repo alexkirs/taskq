@@ -23,8 +23,8 @@ pub struct Row {
     pub task: Task,
     /// § 2 revision: the expected `--revision` of the next command.
     pub revision: u64,
-    /// Open `Depends on` issues.
-    pub deps: Vec<u64>,
+    /// `Depends on` issues that keep it waiting (§ 1).
+    pub deps: Vec<service::Blocker>,
     /// Text of the last trusted `failed` entry.
     pub failed: Option<String>,
 }
@@ -60,7 +60,7 @@ pub fn from_views(source: &'static str, b: &dyn Board, cfg: &Config, observed: i
         url: b.url(v.issue.number),
         task: v.task.clone(),
         revision: crate::core::revision(v.issue.number, &v.log),
-        deps: v.open_deps.clone(),
+        deps: v.blockers.clone(),
         failed: (v.task.state == State::Failed).then(|| v.comments.iter().rev().find(|c| c.trusted && c.body.starts_with("taskq: failed")).and_then(|c| c.body.split_once('\n')).map(|x| x.1.to_string()).unwrap_or_default()),
     }).collect();
     let hosts = hosts.iter().map(|h| Host {
@@ -79,7 +79,7 @@ fn identity(b: &dyn Board, cfg: &Config) -> Value {
 /// `taskq status`: one board read; a failed read is an incomplete snapshot with its reason, never zero tasks.
 pub fn read(b: &dyn Board, cfg: &Config, raw: &Value, only: &[String]) -> Snapshot {
     let attempt = || -> Res<Snapshot> {
-        let (mut views, hosts) = service::views(b, &mut HashMap::new())?;
+        let (mut views, hosts) = service::views(b, &mut HashMap::new(), &mut HashMap::new())?;
         views.retain(|v| in_scope(&v.issue, only));
         if let Some(who) = raw["assignee"].as_str() {
             let who = if who == "me" { b.me()? } else { who.to_string() };
@@ -126,7 +126,9 @@ pub fn status_totals(status: &Value) -> Option<BTreeMap<&'static str, usize>> {
 impl Row {
     pub fn json(&self) -> Value {
         json!({"n": self.n, "title": self.title, "state": self.task.state.name(), "labels": self.labels, "url": self.url, "revision": self.revision,
-            "session": self.task.session, "attempt": self.task.attempt, "role": self.task.role, "deps": self.deps,
+            "session": self.task.session, "attempt": self.task.attempt, "role": self.task.role,
+            "deps": self.deps.iter().filter(|b| b.dep.repo.is_none() && b.reason == "open").map(|b| b.dep.n).collect::<Vec<_>>(),
+            "blocked": self.deps.iter().map(|b| json!({"ref": b.dep.name(), "url": b.url, "reason": b.reason})).collect::<Vec<_>>(),
             "card": self.task.card, "question": self.task.card.as_deref().map(question), "failed": self.failed})
     }
 }
@@ -186,8 +188,8 @@ impl Snapshot {
             .filter(|r| !matches!(r.task.state, State::Ask | State::Later | State::Failed))
             .map(|r| {
                 let state = if r.task.state == State::Waiting {
-                    let deps: Vec<String> = r.deps.iter().map(|d| format!("#{d}")).collect();
-                    format!("blocked ({} open)", deps.join(", "))
+                    let deps: Vec<String> = r.deps.iter().map(|b| format!("[{}]({}) {}", b.dep.name(), b.url, cell(&compact(&b.reason, 80)))).collect();
+                    format!("blocked ({})", deps.join(", "))
                 } else {
                     r.task.state.name().to_string()
                 };

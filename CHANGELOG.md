@@ -5,6 +5,10 @@ there is no migration code. Releases without a **Board** section need nothing.
 
 ## Unreleased
 
+`Depends on <repo>#N` waits on an issue in another repository of the same host (`name` under the board's owner, or `owner/name`); the task becomes ready within one pass of that issue closing. Waiting rows link each blocker: `blocked ([#N](url) open)`. A GitHub issue closed as anything but completed reads `unknown`, not done, and keeps its dependants waiting. A reply that is not that issue in a known state reads `unknown`.
+
+**Board**: older versions read only `Depends on #N` and would start a task that waits on `<repo>#N` (taskq.md § 8). Until every host of the board runs this release, write a `<repo>#N` line only into a held task (`taskq add --hold`, then edit its text) and run `taskq start N` after the last host updated. Nothing to migrate.
+
 `taskq tray --snapshot DIR --route R,..` captures only the named routes (`icon` for the icons); the capture window stays off the visible screen and takes no focus. README shots refresh on dispatch or a release tag; stale shots are a CI warning, not a failed check; a missing or malformed manifest or an unrecorded README image still fails. No board change.
 
 Rollback below `4.2.0-dev` (4.1.11) loses worker grants: its update sweep deletes `<install>/worker-policy.json`, including on the update forward from it. Before a manual downgrade, copy the store outside `<install>` and do not downgrade unless the copy matches the original. Coming back: `taskq service pause` in each project, `taskq update`, copy the store back, and run `taskq service resume` only after `taskq service permissions` shows `Policy: revision N, M grants`; otherwise stay paused. No board change.

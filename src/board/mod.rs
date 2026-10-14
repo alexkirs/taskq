@@ -19,6 +19,8 @@ pub struct Issue {
     pub updated: i64,
     pub open: bool,
     pub trusted: bool,
+    /// Why a closed issue closed, when the board records it (GitHub `state_reason`): `completed`, `not_planned`, ...
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -53,6 +55,14 @@ pub trait Board {
     /// § 7 publication of task `n` at `sha` into `main`; `mode` is `direct` or `pr`.
     fn publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> Publish;
     fn url(&self, n: u64) -> String;
+    /// Issue `n` of another repository on this board's host, for `Depends on <repo>#N` (§ 1); a bare name is under
+    /// this board's owner.
+    fn foreign(&self, repo: &str, _n: u64) -> Result<Issue> {
+        Err(format!("{repo}: other repositories unsupported on this board"))
+    }
+    fn foreign_url(&self, repo: &str, n: u64) -> String {
+        format!("{repo}#{n}")
+    }
     /// Request accounting and rate-limit pause of this process (§ 4); none for boards without HTTP.
     fn requests(&self) -> crate::requests::Budget { Default::default() }
 }
@@ -198,6 +208,14 @@ fn s(v: &Value, k: &str) -> String {
     v[k].as_str().unwrap_or_default().to_string()
 }
 
+/// A `Depends on <repo>#N` reply (§ 1, R12): issue `n` (key `num`) whose `state` is `open` or `closed`, else unknown.
+fn dep_reply(v: Value, num: &str, n: u64, open: &str) -> Result<Value> {
+    match (v[num].as_u64(), v["state"].as_str()) {
+        (Some(m), Some(st)) if m == n && (st == open || st == "closed") => Ok(v),
+        _ => Err(format!("malformed reply for issue {n}")),
+    }
+}
+
 fn names(v: &Value, k: &str) -> Vec<String> {
     v.as_array().into_iter().flatten().map(|x| x.as_str().map(String::from).unwrap_or_else(|| s(x, k))).collect()
 }
@@ -338,6 +356,16 @@ impl Api {
         })
     }
 
+    /// The full path of `repo` in a `Depends on <repo>#N` (§ 1); a bare name is under this board's owner. `sep` ends the
+    /// API part of `base`.
+    fn sibling(&self, sep: &str, repo: &str) -> String {
+        let own = self.base.rsplit_once(sep).map(|x| x.1.replace("%2F", "/")).unwrap_or_default();
+        match own.rsplit_once('/') {
+            Some((owner, _)) if !repo.contains('/') => format!("{owner}/{repo}"),
+            _ => repo.to_string(),
+        }
+    }
+
     fn all(&self, url: &str) -> Result<Vec<Value>> {
         let mut out = vec![];
         let op = self.op("GET", url);
@@ -470,6 +498,10 @@ pub struct FakeState {
     pub fail_comment_reads: usize,
     /// A concurrent writer: this body lands just before the next `comment`.
     pub race: Option<String>,
+    /// Issues of other repositories, `(repo, issue)`.
+    pub foreign: Vec<(String, Issue)>,
+    /// Issue reads, `foreign` included, for budget checks.
+    pub reads: usize,
 }
 
 #[cfg(test)]
@@ -518,8 +550,17 @@ impl Board for Fake {
                 }
             }
         }
+        st.reads += 1;
         drop(st);
         self.state.borrow_mut().get(n).cloned()
+    }
+    fn foreign(&self, repo: &str, n: u64) -> Result<Issue> {
+        let mut st = self.state.borrow_mut();
+        st.reads += 1;
+        st.foreign.iter().find(|(r, i)| r == repo && i.number == n).map(|x| x.1.clone()).ok_or(format!("HTTP 404 {repo}#{n}"))
+    }
+    fn foreign_url(&self, repo: &str, n: u64) -> String {
+        format!("https://board/{repo}/{n}")
     }
     fn comments(&self, n: u64) -> Result<Vec<Comment>> {
         if self.state.borrow().fail_comment_reads > 0 {
@@ -569,7 +610,7 @@ impl Board for Fake {
         let t = st.tick();
         st.next_id += 1;
         let number = st.issues.len() as u64 + 1;
-        st.issues.push(Issue { number, title: title.into(), body: body.into(), labels: labels.to_vec(), assignees: vec![], updated: t, open: true, trusted: true });
+        st.issues.push(Issue { number, title: title.into(), body: body.into(), labels: labels.to_vec(), assignees: vec![], updated: t, open: true, trusted: true, reason: None });
         Ok(number)
     }
     fn edit(&self, n: u64, body: &str) -> Result<()> {
@@ -588,6 +629,7 @@ impl Board for Fake {
         let t = st.tick();
         let i = st.get(n)?;
         i.open = false;
+        i.reason = Some("completed".into());
         i.updated = t;
         Ok(())
     }
@@ -763,6 +805,35 @@ mod tests {
                 else { Ok(Reply { status: 200, headers: vec![], body: "private invalid JSON".into(), operation: "read" }) }));
             assert!(h.call("GET", "/issues", None).and_then(|r| r.json()).is_err());
             assert_eq!(crate::incident::take_detected(), if fail { vec![] } else { vec!["adapter.bad_json"] });
+        }
+    }
+
+    // Chain: § 1 `Depends on <repo>#N` adapters (#1126). Risk: a wrong repository path or a lost close reason makes a
+    // dependency of another repository never or wrongly done.
+    #[test]
+    fn foreign_dependency_reads_sibling_repositories() {
+        for (kind, body, api, web, reason) in [
+            (&github::KIND, r#"{"number":36,"state":"closed","state_reason":"not_planned"}"#, "https://api.github.com/repos/o/dashq/issues/36",
+                "https://github.com/o/dashq/issues/36", Some("not_planned")),
+            (&gitlab::KIND, r#"{"iid":36,"state":"closed"}"#, "https://gitlab.example/api/v4/projects/o%2Fdashq/issues/36",
+                "https://gitlab.example/o/dashq/-/issues/36", None),
+        ] {
+            let urls = std::rc::Rc::new(RefCell::new(vec![]));
+            let seen = urls.clone();
+            let b = http(kind, Some(true), Box::new(move |_, url, _| {
+                seen.borrow_mut().push(url.to_string());
+                Ok(Reply { status: 200, headers: vec![], body: body.into(), operation: "read" })
+            }));
+            let i = b.foreign("dashq", 36).unwrap();
+            assert_eq!((i.number, i.open, i.reason.as_deref()), (36, false, reason));
+            assert_eq!((urls.borrow()[0].as_str(), b.foreign_url("dashq", 36)), (api, web.to_string()));
+            assert_eq!(b.foreign_url("x/y", 1).replace("x/y", "o/r"), b.url(1), "a full path is used as written");
+        }
+        // R12: a reply that is not that issue in a known state stays unknown, never done
+        for (kind, body) in [(&github::KIND, "{}"), (&github::KIND, r#"{"number":37,"state":"closed"}"#), (&github::KIND, r#"{"number":36,"state":"gone"}"#),
+            (&gitlab::KIND, "{}"), (&gitlab::KIND, r#"{"iid":36}"#), (&gitlab::KIND, r#"{"iid":36,"state":"open"}"#)] {
+            let b = http(kind, Some(true), Box::new(move |_, _, _| Ok(Reply { status: 200, headers: vec![], body: body.into(), operation: "read" })));
+            assert_eq!(b.foreign("dashq", 36).unwrap_err(), "malformed reply for issue 36", "{body}");
         }
     }
 

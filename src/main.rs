@@ -497,7 +497,7 @@ fn wait(b: &dyn Board, cfg: &Config, window_min: u64, only: &[String]) -> Res<Ve
         let open: Vec<u64> = b.issues(None)?.iter().map(|i| i.number).collect();
         let mut moved = vec![];
         for i in issues.iter().filter(|i| service::is_task(i) && in_scope(i, only)) {
-            let t = fold(i.number, &entries(b, i.number)?, core::depends(&i.body).iter().any(|d| open.contains(d)));
+            let t = fold(i.number, &entries(b, i.number)?, core::depends(&i.body).iter().any(|d| d.repo.is_none() && open.contains(&d.n)));
             let state = if !i.open { "closed".to_string() } else if t.state == State::Review && t.card.is_some() { "review*".into() } else { t.state.name().into() };
             if seen.get(&i.number) != Some(&state) && matches!(state.as_str(), "ask" | "review*" | "closed" | "failed") {
                 moved.push(format!("{} #{}", state.trim_end_matches('*'), i.number));
@@ -1566,7 +1566,7 @@ fn task_body(b: &dyn Board, t: &NewTask, op: &Op) -> Res<(String, Vec<String>, b
     if let Some(id) = &op.id {
         body += &format!("\nop-id: {id}\n");
     }
-    let blocked = deps_open(b, &body)?;
+    let blocked = deps_open(b, &body);
     // a held task gets `q-held` instead of `taskq`: no service of any version admits it before `start`
     let mut labels = if t.hold { vec![b.state_label("held")?] } else { vec![service::TASK_LABEL.to_string(), b.state_label(if blocked { "waiting" } else { "ready" })?] };
     for (v, prefix) in [(&t.kind, ""), (&t.runtime, "run-"), (&t.priority, if b.canonical_labels()? { "p" } else { "priority-" }), (&t.host, "host-")] {
@@ -1770,7 +1770,7 @@ fn claimed_create(b: &dyn Board, raw: &Value, title: &str, body: &str, labels: &
             return Err(unknown(i.number, "created issue conflicts with the immutable request".into()));
         }
         let log = entries(b, i.number).map_err(read)?;
-        let state = if !i.open { State::Closed } else if service::is_held(&i) { State::Held } else { fold(i.number, &log, deps_open(b, &i.body).map_err(read)?).state };
+        let state = if !i.open { State::Closed } else if service::is_held(&i) { State::Held } else { fold(i.number, &log, deps_open(b, &i.body)).state };
         Ok(Receipt::accepted(i.number, op, state, core::revision(i.number, &log)))
     };
     if let Some(first) = first().map_err(read)? {
@@ -2559,7 +2559,7 @@ mod tests {
         // N-1: no `taskq` label, so 4.1.11 (same `is_task`) skips the issue; this version lists it as held
         assert_eq!(issues[0].labels, vec!["q-held"]);
         assert!(!service::is_task(&issues[0]) && service::is_held(&issues[0]));
-        let (views, _) = service::views(b, &mut HashMap::new()).unwrap();
+        let (views, _) = service::views(b, &mut HashMap::new(), &mut HashMap::new()).unwrap();
         assert_eq!(views[0].task.state, State::Held);
         assert_eq!(fold(n, &entries(b, n).unwrap(), false).state, State::Held);
         run(&["add", "U", "--goal", "G", "--acceptance", "a", "--op-id", "req.1.1"]).unwrap();
@@ -3207,7 +3207,7 @@ mod tests {
         let blocked = c.board.create("blocked", &format!("Depends on #{dep}"), &["taskq".into(), "selected".into()]).unwrap();
         let report = report(c.board.as_ref(), &c.cfg, &c.raw, &["selected".into()]).unwrap();
         assert!(report.contains(&format!("#{blocked} blocked")));
-        assert!(report.contains(&format!("blocked (#{dep} open)")), "non-task dependency remains visible outside filter");
+        assert!(report.contains(&format!("blocked ([#{dep}](https://board/{dep}) open)")), "non-task dependency remains visible outside filter");
     }
 
     // Chain: R6 compact report. Risk: compaction drops choices, links or evidence.

@@ -94,7 +94,48 @@ pub struct View {
     pub task: Task,
     pub comments: Vec<Comment>,
     pub log: Vec<core::Entry>,
-    pub open_deps: Vec<u64>,
+    /// `Depends on` issues that keep a ready task waiting (§ 1).
+    pub blockers: Vec<Blocker>,
+}
+
+/// A `Depends on` issue that is not done (§ 1): `reason` is `open` or `unknown: <why>`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Blocker {
+    pub dep: core::Dep,
+    pub url: String,
+    pub reason: String,
+}
+
+/// Closed dependencies already read, `None` when done (§ 4 budget): an issue of this board until the open-issue list
+/// shows it again; of another repository only when done. `ponytail:` a done foreign issue reopened later is not seen.
+pub type DepCache = HashMap<core::Dep, Option<String>>;
+
+/// The `Depends on` issues of `body` that are not done (§ 1): open, closed other than completed, or unreadable.
+/// `open` is this board's open-issue list when the caller read it.
+pub fn blockers(b: &dyn Board, body: &str, open: Option<&HashSet<u64>>, done: &mut DepCache) -> Vec<Blocker> {
+    core::depends(body).into_iter().filter_map(|dep| {
+        let listed = dep.repo.is_none() && open.is_some_and(|o| o.contains(&dep.n));
+        if listed {
+            done.remove(&dep);
+        }
+        let reason = match done.get(&dep) {
+            _ if listed => Some("open".to_string()),
+            Some(r) => r.clone(),
+            None => match dep.repo.as_deref().map_or_else(|| b.issue(dep.n), |r| b.foreign(r, dep.n)) {
+                Err(e) => Some(format!("unknown: {e}")),
+                Ok(i) if i.open => Some("open".into()),
+                Ok(i) => {
+                    let r = i.reason.filter(|r| r != "completed").map(|r| format!("unknown: closed {}", r.replace('_', " ")));
+                    if dep.repo.is_none() || r.is_none() {
+                        done.insert(dep.clone(), r.clone());
+                    }
+                    r
+                }
+            },
+        };
+        let url = dep.repo.as_deref().map_or_else(|| b.url(dep.n), |r| b.foreign_url(r, dep.n));
+        reason.map(|reason| Blocker { dep, url, reason })
+    }).collect()
 }
 
 /// Fold every open task (heartbeat issues and untrusted authors excluded).
@@ -132,7 +173,7 @@ pub fn cleanup(board: &dyn Board, root: &std::path::Path, mut skip: impl FnMut(u
     log
 }
 
-pub fn views(board: &dyn Board, cache: &mut HashMap<u64, (i64, Vec<Comment>)>) -> Result<(Vec<View>, Vec<Issue>), String> {
+pub fn views(board: &dyn Board, cache: &mut HashMap<u64, (i64, Vec<Comment>)>, deps: &mut DepCache) -> Result<(Vec<View>, Vec<Issue>), String> {
     let issues = board.issues(None)?;
     let open: HashSet<u64> = issues.iter().map(|i| i.number).collect();
     let (hosts, tasks): (Vec<Issue>, Vec<Issue>) = issues.into_iter().filter(|i| i.trusted).partition(is_host);
@@ -144,12 +185,14 @@ pub fn views(board: &dyn Board, cache: &mut HashMap<u64, (i64, Vec<Comment>)>) -
         };
         cache.insert(issue.number, (issue.updated, comments.clone()));
         let log: Vec<_> = comments.iter().filter(|c| c.trusted).map(|c| core::Entry { id: c.id, body: c.body.clone(), edited: c.edited }).collect();
-        let open_deps: Vec<u64> = core::depends(&issue.body).into_iter().filter(|d| open.contains(d)).collect();
-        let mut task = core::fold(issue.number, &log, !open_deps.is_empty());
+        // only a task that would be ready reads its dependencies (§ 4 budget)
+        let ready = !is_held(&issue) && core::fold(issue.number, &log, false).state == State::Ready;
+        let blockers = if ready { blockers(board, &issue.body, Some(&open), deps) } else { vec![] };
+        let mut task = core::fold(issue.number, &log, !blockers.is_empty());
         if is_held(&issue) {
             task.state = State::Held;
         }
-        out.push(View { task, issue, comments, log, open_deps });
+        out.push(View { task, issue, comments, log, blockers });
     }
     Ok((out, hosts))
 }
@@ -175,6 +218,7 @@ pub struct Service<'a> {
     /// The last inbox id handed to each attempt's child.
     delivered: HashMap<u64, u64>,
     cache: HashMap<u64, (i64, Vec<Comment>)>,
+    deps: DepCache,
     label_fixes: HashMap<u64, (String, Vec<String>, u8)>,
     /// Worktrees of closed tasks already tried once by `prune`.
     pruned: HashSet<u64>,
@@ -440,7 +484,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new() }
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -589,7 +633,7 @@ impl<'a> Service<'a> {
         let previous_fixes = std::mem::take(&mut self.label_fixes);
         let me = self.cfg.me.clone();
         let ttl = self.cfg.ttl;
-        let (views, hosts) = views(self.board, &mut self.cache)?;
+        let (views, hosts) = views(self.board, &mut self.cache, &mut self.deps)?;
         let now = self.board.now()?;
         self.snapshot = Some(crate::snapshot::from_views("host", self.board, self.cfg, now, &views, &hosts));
         self.tasks_read = Some(std::time::Instant::now());
@@ -1182,7 +1226,7 @@ mod tests {
             let c = cfg("local");
             let mut s = Service::new(&b, &c, "4.0.0", Box::new(move |_| Err(crate::runtime::StartError::io(Error::new(kind, "private failure text"), None))));
             s.agent_status = json!([{"runtime": "claude", "path": path, "login": login}]);
-            let v = views(&b, &mut HashMap::new()).unwrap().0.remove(0);
+            let v = views(&b, &mut HashMap::new(), &mut HashMap::new()).unwrap().0.remove(0);
             s.claim(&v, "worker", "claude").unwrap();
             assert_eq!(task(&b, n).state, State::Ready);
             assert!(b.comments(n).unwrap().last().unwrap().body.contains("start failed: private failure text"));
@@ -1250,7 +1294,7 @@ mod tests {
             crate::incident::take_detected();
             let b = Fake::default();
             let n = b.create("task", "", &[TASK_LABEL.into()]).unwrap();
-            let v = views(&b, &mut HashMap::new()).unwrap().0.remove(0);
+            let v = views(&b, &mut HashMap::new(), &mut HashMap::new()).unwrap().0.remove(0);
             if !missing { b.comment(n, "taskq: spawn worker claude:first other").unwrap(); }
             b.state.borrow_mut().hide_latest_comment = missing;
             let c = cfg("local");
@@ -1714,6 +1758,41 @@ mod tests {
         s.pass().unwrap();
         assert_eq!(task(&b, n).state, State::Doing);
         assert!(b.comments(user).unwrap().is_empty() && b.issue(user).unwrap().labels.is_empty(), "no taskq label: never a task");
+    }
+
+    // Chain: § 1 `Depends on <repo>#N` (#1126). Risk: a task blocked by another repository never starts, starts on a
+    // close that did not complete, or reports no linked reason.
+    #[test]
+    fn cross_board_dependency_waits_with_link_until_completed() {
+        let b = Fake::default();
+        let dashq = |open: bool, reason: Option<&str>| ("dashq".to_string(), Issue { number: 36, open, reason: reason.map(String::from), ..Default::default() });
+        b.state.borrow_mut().foreign.push(dashq(true, None));
+        let dep = b.create("dep", "", &[]).unwrap();
+        let n = b.create("T", "Depends on dashq#36\nDepends on owner/gone#5", &["taskq".into()]).unwrap();
+        let same = b.create("S", &format!("Depends on #{dep}"), &["taskq".into()]).unwrap();
+        // § 8 cutover: N-1 reads only `Depends on #N`; a held task has no `taskq` label, so N-1 (same `is_task`) skips it
+        assert!(core::depends("Depends on dashq#36").iter().all(|d| d.repo.is_some()));
+        let held = b.create("H", "Depends on dashq#36", &["q-held".into()]).unwrap();
+        assert!(!is_task(&b.issue(held).unwrap()) && is_held(&b.issue(held).unwrap()));
+        let c = cfg("mac");
+        let raw = json!({});
+        let report = || crate::snapshot::read(&b, &c, &raw, &[]).text(&c, &raw).unwrap();
+        let mut s = service(&b, &c, Default::default());
+        s.pass().unwrap();
+        assert!(b.issue(n).unwrap().labels.contains(&"q-blocked".to_string()));
+        assert!(report().contains("blocked ([dashq#36](https://board/dashq/36) open, [owner/gone#5](https://board/owner/gone/5) unknown: HTTP 404 owner/gone#5)"), "{}", report());
+        b.state.borrow_mut().foreign = vec![dashq(false, Some("not_planned")), ("owner/gone".into(), Issue { number: 5, ..Default::default() })];
+        b.state.borrow_mut().issues[dep as usize - 1].reason = Some("not_planned".into());
+        b.state.borrow_mut().issues[dep as usize - 1].open = false;
+        s.pass().unwrap();
+        let blocked = |t: u64| b.issue(t).unwrap().labels.contains(&"q-blocked".to_string());
+        assert!(blocked(n) && blocked(same), "not completed stays unknown, not done");
+        assert!(report().contains("[dashq#36](https://board/dashq/36) unknown: closed not planned)"), "{}", report());
+        b.state.borrow_mut().foreign[0] = dashq(false, Some("completed"));
+        b.state.borrow_mut().reads = 0;
+        s.pass().unwrap();
+        assert_eq!(task(&b, n).state, State::Doing, "eligible within one pass after the blocker completed");
+        assert_eq!(b.state.borrow().reads, 1, "closed dependencies already read are cached: only dashq#36 read again");
     }
 
     // Chain: § 3 priority order. Risk: legacy priority labels order or filter wrong.

@@ -8,13 +8,9 @@ use crate::{Res, join, poke};
 use serde::Serialize;
 use std::path::Path;
 
-pub fn deps_open(b: &dyn Board, body: &str) -> Res<bool> {
-    for d in core::depends(body) {
-        if b.issue(d)?.open {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+/// Whether a `Depends on` issue of `body` is not done (§ 1); an unreadable one counts as not done.
+pub fn deps_open(b: &dyn Board, body: &str) -> bool {
+    !service::blockers(b, body, None, &mut Default::default()).is_empty()
 }
 
 /// This process's `TASKQ_TASK` and `TASKQ_ATTEMPT`.
@@ -42,7 +38,7 @@ fn stale_child(n: u64, kind: &str, live: Option<u64>, (task, attempt): &ChildEnv
 
 pub fn current(b: &dyn Board, n: u64) -> Res<(board::Issue, Task, bool)> {
     let issue = b.issue(n)?;
-    let deps = deps_open(b, &issue.body)?;
+    let deps = deps_open(b, &issue.body);
     let t = fold(n, &entries(b, n)?, deps);
     Ok((issue, t, deps))
 }
@@ -119,7 +115,7 @@ fn act_child(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text
 fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &str, op: &Op, attempt: Option<u64>, child: Option<&ChildEnv>) -> Receipt {
     let read = || -> Res<(board::Issue, bool, Vec<Entry>)> {
         let issue = b.issue(n)?;
-        let deps = deps_open(b, &issue.body)?;
+        let deps = deps_open(b, &issue.body);
         Ok((issue, deps, entries(b, n)?))
     };
     let (issue, deps, mut log) = match read() {

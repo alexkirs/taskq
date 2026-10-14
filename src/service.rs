@@ -823,7 +823,7 @@ impl<'a> Service<'a> {
     /// A runtime with free capacity: `limits.<rt>` minus live children of it (§ 3).
     /// `codex-app` only for `run-codex-app` tasks on a host whose `has` lists it (§ 9 opt-in).
     fn free(&self, want: Option<&str>) -> Option<String> {
-        let app = |rt: &str| rt != "codex-app" || (want == Some(rt) && self.cfg.has.iter().any(|h| h == rt));
+        let app = |rt: &str| rt != "codex-app" || (cfg!(target_os = "macos") && want == Some(rt) && self.cfg.has.iter().any(|h| h == rt));
         let c = self.cap.as_ref().ok()?;
         // Auto: a runtime without a limit has no count ceiling (§ 9); Fixed: only listed runtimes
         let limits: Vec<(String, u32)> = if c.auto { RUNTIMES.iter().map(|r| (r.to_string(), c.limits.get(*r).copied().unwrap_or(u32::MAX))).collect() } else { c.limits.clone().into_iter().collect() };
@@ -1404,8 +1404,8 @@ mod tests {
         assert_eq!((task(&b, app).state, task(&b, other).state), (State::Ready, State::Ready), "no opt-in: unchanged");
         let m = Config { has: vec!["codex-app".into()], me: "mac".into(), ..c.clone() };
         service(&b, &m, Default::default()).pass().unwrap();
-        assert_eq!((task(&b, app).state, task(&b, other).state), (State::Doing, State::Ready), "unlabelled tasks never get the app");
-        assert!(task(&b, app).session.unwrap().starts_with("codex-app:- mac"));
+        assert_eq!((task(&b, app).state, task(&b, other).state), (if cfg!(target_os = "macos") { State::Doing } else { State::Ready }, State::Ready), "only macOS admits app turns; unlabelled tasks never get the app");
+        if cfg!(target_os = "macos") { assert!(task(&b, app).session.unwrap().starts_with("codex-app:- mac")); }
     }
 
     // Chain: § 3 capacity config. Risk: host override ignored or invalid limits accepted.

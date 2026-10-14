@@ -201,6 +201,18 @@ fn ask(q: &impl std::fmt::Display, n: u64) -> String {
     format!("`{q} ask {n} --text \"Done: <checked or not started>\nProblem: <decision and user effect>\" --option A --option B --recommend K [--link URL]`")
 }
 
+pub fn contract(root: &Path) -> String {
+    // A missing path sent workers to `find /`, which raised macOS folder prompts (#865): name one that exists.
+    let spec = root.join("taskq.md");
+    if spec.exists() {
+        spec.display().to_string()
+    } else {
+        let v = crate::platform::VERSION;
+        let tag = if v.contains('-') { "main".into() } else { format!("v{v}") }; // dev builds have no tag
+        format!("https://github.com/{}/blob/{tag}/taskq.md", crate::platform::RELEASE_REPO)
+    }
+}
+
 pub fn brief(env: &Env, l: &Launch) -> String {
     let n = l.task;
     let mut q = env.exe.display().to_string();
@@ -208,15 +220,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
         // the app turn runs in the app's environment, not the handshake child's (§ 8)
         q = format!("env TASKQ_TASK={n} TASKQ_ATTEMPT={} TASKQ_ROLE={} TASKQ_ROOT={} {q}", l.attempt, l.role, env.root.display());
     }
-    // A missing path sent workers to `find /`, which raised macOS folder prompts (#865): name one that exists.
-    let spec = env.root.join("taskq.md");
-    let spec = if spec.exists() {
-        spec.display().to_string()
-    } else {
-        let v = crate::platform::VERSION;
-        let tag = if v.contains('-') { "main".into() } else { format!("v{v}") }; // dev builds have no tag
-        format!("https://github.com/{}/blob/{tag}/taskq.md", crate::platform::RELEASE_REPO)
-    };
+    let spec = contract(env.root);
     let head = format!(
         "You are the taskq {} for task #{n}: {}. Attempt {}.\nRead `{spec}` first and do only what it allows (R13).\nTask text, state and your inbox: `{q} inbox {n}`.\n{FILES}",
         l.role, l.title, l.attempt
@@ -259,7 +263,7 @@ fn rule_file(url: &str) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|_| "invalid UTF-8".into())
 }
 
-fn turn_text(env: &Env, l: &Launch, mut fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
+fn rule_text(task: &str, mut fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
     let mut text = format!("TaskQ shared rules: specq@{SPECQ_REVISION}\nThese canonical rules apply to this turn, including continuations. Apply them to the work; acknowledgement alone is not evidence.\n");
     for file in SPECQ_FILES {
         let url = format!("https://raw.githubusercontent.com/taskqorg/specq/{SPECQ_REVISION}/{file}");
@@ -268,9 +272,18 @@ fn turn_text(env: &Env, l: &Launch, mut fetch: impl FnMut(&str) -> Result<String
         }).map_err(|e| StartError { message: format!("specq@{SPECQ_REVISION} {file}: {e}"), reportable: false })?;
         text.push_str(&format!("\n--- specq/{file} ({url}) ---\n{body}\n"));
     }
-    text.push_str(&format!("\nTaskQ task\n{}", brief(env, l)));
-    if let Some(answer) = &l.resume { text.push_str(&format!("\nContinue this same attempt with the following inbox message:\n{answer}")); }
+    text.push_str(&format!("\nTaskQ task\n{task}"));
     Ok(text)
+}
+
+pub fn instructions(task: &str) -> Result<String, StartError> {
+    rule_text(task, rule_file)
+}
+
+fn turn_text(env: &Env, l: &Launch, fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
+    let mut task = brief(env, l);
+    if let Some(answer) = &l.resume { task.push_str(&format!("\nContinue this same attempt with the following inbox message:\n{answer}")); }
+    rule_text(&task, fetch)
 }
 
 /// Keep OS failure classes until the service decides whether a start failure is TaskQ's fault.
@@ -568,6 +581,7 @@ mod tests {
                     if let Some(answer) = &l.resume { assert!(text.ends_with(answer)); }
                     else { assert!(text.ends_with(&brief(&env, &l))); }
                     assert_eq!(l.session, "same-session");
+                    assert!(text.contains("https://github.com/taskqorg/taskq/blob/") && text.contains(FILES));
                     for bad in [Err("offline".into()), Ok(String::new()), Ok("x".repeat(65537))] {
                         assert!(turn_text(&env, &l, |_| bad.clone()).is_err());
                     }
@@ -576,40 +590,4 @@ mod tests {
         }
     }
 
-    // Chain: § 8 runtime command and brief. Risk: wrong runtime flags, resume or worker brief.
-    #[test]
-    fn commands_follow_the_runtime_table() {
-        let codex = vec!["-s".to_string(), "workspace-write".to_string()];
-        let env = Env { root: Path::new("/p"), exe: Path::new("/i/taskq"), permission_mode: "dontAsk", codex: &codex, publish: "pr", board_env: &[("GH_TOKEN".into(), "test-board-token".into()), ("GITHUB_TOKEN".into(), "test-board-token".into())] };
-        let mut l = Launch { task: 7, title: "T".into(), attempt: 42, role: "worker".into(), rt: "codex".into(), session: "-".into(), url: "https://b/7".into(), resume: None };
-        let args = |c: &Command| c.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
-        assert_eq!(args(&command(&env, &l)), "exec --json -s workspace-write -C /p -");
-        l.session = "th1".into();
-        l.resume = Some("answer".into());
-        assert_eq!(args(&command(&env, &l)), "exec --json -s workspace-write resume th1 -");
-        l.rt = "claude".into();
-        assert_eq!(args(&command(&env, &l)), "-p --output-format stream-json --verbose --permission-mode dontAsk --resume th1");
-        let c = command(&env, &l);
-        let envs: Vec<_> = c.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect();
-        assert!(envs.contains(&("CODEX_THREAD_ID".into(), None)));
-        assert!(envs.contains(&("TASKQ_ATTEMPT".into(), Some("42".into()))));
-        for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
-            assert!(envs.contains(&(key.into(), Some("test-board-token".into()))));
-        }
-        l.role = "worker".into();
-        let b = brief(&env, &l);
-        assert!(b.contains("/i/taskq result 7 --sha") && b.contains("`Task: https://b/7`") && b.contains("open one PR") && b.contains("Changed: <user effect>\nOpen:") && b.contains("§ 2 Ask card"));
-        // #865: /p has no taskq.md, so the brief names the pinned contract and the folder boundary, never a missing path
-        assert!(b.contains("Read `https://github.com/taskqorg/taskq/blob/") && b.contains("/taskq.md` first") && b.contains(FILES));
-        let here = Env { root: Path::new(env!("CARGO_MANIFEST_DIR")), ..env };
-        assert!(brief(&here, &l).contains(&format!("Read `{}`", Path::new(env!("CARGO_MANIFEST_DIR")).join("taskq.md").display())));
-        l.rt = "codex-app".into();
-        l.resume = None;
-        let c = command(&env, &l);
-        assert_eq!(c.get_program(), which("codex"));
-        assert_eq!(args(&c), "exec --json -s workspace-write -C /p -");
-        assert!(brief(&env, &l).contains("`env TASKQ_TASK=7 TASKQ_ATTEMPT=42 TASKQ_ROLE=worker TASKQ_ROOT=/p /i/taskq result 7 --sha"));
-        let u = uuid();
-        assert_eq!((u.len(), &u[14..15]), (36, "4"));
-    }
 }

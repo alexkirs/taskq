@@ -7,11 +7,9 @@ use crate::board::{BOARDS, Kind};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 /// Requests kept per project (§ 4).
 pub const KEEP: usize = 20;
-const TIMEOUT: u64 = 600;
 const KINDS: [&str; 4] = ["result", "clarify", "proposal", "refuse"];
 
 pub fn dir(root: &Path) -> PathBuf {
@@ -110,22 +108,29 @@ fn comment_of(root: &Path, req: &Value) -> Value {
 pub fn recover(root: &Path) {
     for id in ids(root) {
         if read(&answer_path(root, &id))["state"] == "running" {
-            answer(root, &id, json!({"state": "failed", "reason": "service restarted; send the request again"}));
+            answer(root, &id, json!({"state": "failed", "reason": "service restarted; partial effects unknown; reconcile before retry"}));
         }
     }
+}
+
+/// A running operator can edit files; restart and another turn must wait for it.
+pub fn running(root: &Path) -> bool {
+    ids(root).iter().any(|id| read(&answer_path(root, id))["state"] == "running")
 }
 
 /// One service pass: start an operator for each new request, apply a confirmed proposal, drop all but the newest 20.
 pub fn step(root: &Path, install: &Path, exe: &Path, rt: Option<&str>) {
     let ids = ids(root);
     for id in ids.iter().rev().skip(KEEP) {
-        for f in [format!("{id}.json"), format!("{id}.answer.json"), format!("{id}.confirm"), format!("{id}.out")] {
+        if read(&answer_path(root, id))["state"] == "running" { continue; }
+        for f in [format!("{id}.json"), format!("{id}.answer.json"), format!("{id}.confirm"), format!("{id}.out"), format!("{id}.err")] {
             let _ = fs::remove_file(dir(root).join(f));
         }
     }
     for id in ids.iter().rev().take(KEEP) {
         let a = read(&answer_path(root, id));
         if a.is_null() {
+            if running(root) { continue; }
             // the request log (§ 4): once, when the request first gets an answer
             let req = read(&dir(root).join(format!("{id}.json")));
             if let Err(e) = crate::retro::append(root, if req["task"].is_u64() { "comment" } else { "tray" }, req["task"].as_u64(), req["text"].as_str().unwrap_or("")) {
@@ -155,75 +160,85 @@ pub fn step(root: &Path, install: &Path, exe: &Path, rt: Option<&str>) {
 }
 
 fn start(root: &Path, install: &Path, id: &str, rt: Option<&str>) {
-    let Some(rt) = rt.map(String::from) else {
+    let req = read(&dir(root).join(format!("{id}.json")));
+    let prior = req["after"].as_str().filter(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+        .map(|after| read(&answer_path(root, after)));
+    let Some(rt) = prior.as_ref().and_then(|p| p["rt"].as_str()).or(rt).map(String::from) else {
         return answer(root, id, json!({"state": "failed", "reason": "no runtime with a nonzero limit on this host"}));
     };
     answer(root, id, json!({"state": "running", "rt": rt}));
     let (root, install, id) = (root.to_path_buf(), install.to_path_buf(), id.to_string());
     std::thread::spawn(move || {
-        let v = match run(&root, &install, &id, &rt) {
+        let mut v = match run(&root, &install, &id, &rt) {
             Ok(text) => {
                 let req = read(&dir(&root).join(format!("{id}.json")));
                 scoped(parse(&text, &projects(&install), onboard(&root, &req).as_deref()), &comment_of(&root, &req))
             }
             Err(e) => json!({"state": "failed", "reason": e}),
         };
+        v["rt"] = json!(rt);
+        v["session"] = json!(session(&rt, &dir(&root).join(format!("{id}.out"))));
         answer(&root, &id, v);
     });
 }
 
-/// The operator child: no tools (R9), brief on stdin, killed after 10 minutes.
+/// Resume only the recorded conversation; failure never silently repeats work in a fresh one.
 fn run(root: &Path, install: &Path, id: &str, rt: &str) -> Result<String, String> {
     let req = read(&dir(root).join(format!("{id}.json")));
-    exec(rt, &brief(root, install, &req), &dir(root), id)
+    let resume = match req["after"].as_str() {
+        Some(after) if !after.is_empty() && after.bytes().all(|c| c.is_ascii_digit()) => {
+            let prior = read(&answer_path(root, after));
+            if prior["rt"] != rt { return Err("continuation runtime changed or unavailable; choose a new conversation explicitly".into()); }
+            Some(prior["session"].as_str().filter(|s| !s.is_empty()).ok_or("previous session unavailable; reconcile effects before starting again")?.to_string())
+        }
+        Some(_) => return Err("invalid continuation request".into()),
+        None => None,
+    };
+    exec(rt, &brief(root, install, &req), root, &dir(root), id, resume.as_deref())
 }
 
-/// Run one operator in `cwd` with `brief` on stdin; `<name>.out` and `<name>.last` hold its output. `taskq retro` too.
-pub fn exec(rt: &str, brief: &str, cwd: &Path, name: &str) -> Result<String, String> {
-    let out = cwd.join(format!("{name}.out"));
-    let last = cwd.join(format!("{name}.last"));
-    let mut c = std::process::Command::new(crate::runtime::which(rt));
-    crate::platform::quiet(&mut c);
-    if rt == "claude" {
-        c.args(["-p", "--output-format", "json", "--tools", ""]);
-    } else {
-        c.args(["exec", "--skip-git-repo-check", "-s", "read-only", "-o"]).arg(&last).arg("-");
+fn session(rt: &str, log: &Path) -> Option<String> {
+    if rt == "codex" { return crate::runtime::codex_thread(log); }
+    fs::read_to_string(log).ok()?.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| v["session_id"].as_str().map(String::from))
+}
+
+/// Normal runtime tools and project permissions; logs stay separate from the working directory.
+/// `taskq retro` also uses this path, with a read/recommend-only request.
+pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume: Option<&str>) -> Result<String, String> {
+    if !["claude", "codex"].contains(&rt) { return Err(format!("operator runtime {rt} unsupported; select claude or codex")); }
+    let (cfg, config) = crate::load(root)?;
+    let cap = crate::service::capacity(&config, &cfg.me)?;
+    if cap.limits.get(rt).copied().unwrap_or(if cap.auto { u32::MAX } else { 0 }) == 0 {
+        return Err(format!("operator runtime {rt} disabled on this host; no fallback"));
     }
-    for k in ["CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "TASKQ_TASK", "TASKQ_ATTEMPT", "TASKQ_ROLE"] {
-        c.env_remove(k);
-    }
+    let board_env = cfg.board.worker_env(&crate::platform::tool(&cfg.install), &cfg.web_host)?;
+    let exe = cfg.install.join(crate::platform::tool(&cfg.install).exe_name());
+    let env = crate::runtime::Env { root, exe: &exe, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.publish, board_env: &board_env };
+    let l = crate::runtime::Launch { task: 0, title: name.into(), attempt: 0, role: "operator".into(), rt: rt.into(),
+        session: resume.map(String::from).unwrap_or_else(|| crate::runtime::new_session(rt)), url: String::new(), resume: resume.map(String::from) };
+    let mut c = crate::runtime::command(&env, &l);
+    for k in ["TASKQ_TASK", "TASKQ_ATTEMPT", "TASKQ_ROLE"] { c.env_remove(k); }
+    let text = crate::runtime::instructions(&format!("Read {} first. TaskQ commands: {}.\n{brief}", crate::runtime::contract(root), exe.display())).map_err(|e| e.to_string())?;
+    fs::create_dir_all(logs).map_err(|e| e.to_string())?;
+    let out = logs.join(format!("{name}.out"));
     let f = fs::File::create(&out).map_err(|e| e.to_string())?;
-    // the requests folder: no project files at hand even for a runtime that could read them
-    let mut child = c.current_dir(cwd).stdin(std::process::Stdio::piped()).stdout(f).stderr(std::process::Stdio::null()).spawn().map_err(|e| format!("{rt}: {e}"))?;
-    let _ = std::io::Write::write_all(&mut child.stdin.take().unwrap(), brief.as_bytes());
-    let mut waited = 0;
-    let status = loop {
-        if let Ok(Some(s)) = child.try_wait() {
-            break s;
-        }
-        if waited >= TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("{rt} gave no answer in {TIMEOUT} s"));
-        }
-        std::thread::sleep(Duration::from_secs(1));
-        waited += 1;
-    };
-    let text = if rt == "claude" {
-        let v: Value = serde_json::from_str(&fs::read_to_string(&out).unwrap_or_default()).unwrap_or_default();
-        if v["is_error"] == true {
-            return Err(format!("claude: {}", v["result"].as_str().unwrap_or("error")));
-        }
-        v["result"].as_str().unwrap_or_default().to_string()
-    } else {
-        let t = fs::read_to_string(&last).unwrap_or_default();
-        let _ = fs::remove_file(&last);
-        t
-    };
-    if !status.success() && text.is_empty() {
-        return Err(format!("{rt} exited with {}", status.code().unwrap_or(-1)));
+    let err = fs::File::create(logs.join(format!("{name}.err"))).map_err(|e| e.to_string())?;
+    let mut child = c.current_dir(root).stdin(std::process::Stdio::piped()).stdout(f).stderr(err).spawn().map_err(|e| format!("{rt}: {e}"))?;
+    if let Err(e) = std::io::Write::write_all(&mut child.stdin.take().unwrap(), text.as_bytes()) {
+        crate::runtime::Proc::kill(&mut child);
+        return Err(format!("operator input failed: {e}; partial effects unknown"));
     }
-    Ok(text)
+    let status = child.wait().map_err(|e| format!("operator wait: {e}; partial effects unknown"))?;
+    let events: Vec<Value> = fs::read_to_string(&out).map_err(|e| e.to_string())?.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    if !status.success() || events.iter().any(|v| v["is_error"] == true || v["type"] == "turn.failed") {
+        return Err(format!("{rt} operator failed (exit {}); partial effects unknown; inspect request log before retry", status.code().unwrap_or(-1)));
+    }
+    events.iter().rev().find_map(|v| {
+        if rt == "claude" && v["type"] == "result" { v["result"].as_str().map(String::from) }
+        else if rt == "codex" && v["type"] == "item.completed" && v["item"]["type"] == "agent_message" { v["item"]["text"].as_str().map(String::from) }
+        else { None }
+    }).ok_or("operator returned no final response; partial effects unknown".into())
 }
 
 fn brief(root: &Path, install: &Path, req: &Value) -> String {
@@ -231,7 +246,7 @@ fn brief(root: &Path, install: &Path, req: &Value) -> String {
         let s = read(&crate::dot(r).join("status.json"));
         let paused = fs::read_to_string(crate::dot(r).join("focus.paused")).unwrap_or_default();
         let tasks: Vec<Value> = s["tasks"].as_array().into_iter().flatten().map(|t| json!([t["n"], t["title"], t["state"], t["labels"]])).collect();
-        json!({"project": name, "focus": s["focus"], "saved_focus": paused.trim(), "request": s["request"], "status_age_s": crate::file_age(&crate::dot(r).join("status.json")), "error": s["error"], "tasks [n, title, state, labels]": tasks})
+        json!({"project": name, "root": r, "focus": s["focus"], "saved_focus": paused.trim(), "request": s["request"], "status_age_s": crate::file_age(&crate::dot(r).join("status.json")), "error": s["error"], "tasks [n, title, state, labels]": tasks})
     }).collect();
     // the whole clarify chain, oldest first: a setup conversation takes several turns
     let (mut before, mut r) = (String::new(), req.clone());
@@ -250,7 +265,7 @@ fn brief(root: &Path, install: &Path, req: &Value) -> String {
     };
     if let Some(f) = onboard(root, req) {
         return format!(
-            "You are the taskq operator (taskq.md R3) in a project setup (taskq.md § 6): help the owner set up the folder below as a taskq project. You have no tools: use only this data.\n\
+            "You are the taskq operator (taskq.md R3) in a project setup (taskq.md § 6): help the owner set up the folder below as a taskq project. Use normal tools within configured permissions and the owner request. Read exact project paths, never discover unrelated folders. Do not bypass runtime denials, change permissions or log in. Missing authority: clarify. Queue mutations use TaskQ commands and authoritative readback.\n\
              Reply with exactly one JSON object and nothing else: {{\"kind\": \"clarify|proposal|refuse\", \"text\": \"...\", \"ops\": [...]}}.\n\
              - clarify: ask only for missing information, never repository visibility already read in the inspection; one question at a time until you know: GitHub or GitLab and the account below, an existing repository or a new one, owner/name, visibility (a new one is private unless the owner says public), publish pr (default) or direct.\n\
              - proposal: exactly one op {{\"op\":\"setup\",\"board\":\"github|gitlab\",\"host\":\"github.com\",\"repo\":\"owner/name\",\"create\":true|false,\"visibility\":\"private|public\",\"publish\":\"pr|direct\",\"incident_reports\":true|false}}; incident_reports defaults to true; use false if the owner opts out. Text names account, repository and visibility. The service lists every effect, including public incident reporting, for the owner to confirm; files, uncommitted work and remotes stay.\n\
@@ -262,12 +277,12 @@ fn brief(root: &Path, install: &Path, req: &Value) -> String {
         );
     }
     format!(
-        "You are the taskq operator (taskq.md R3): answer the owner's request about the taskq projects below. You have no tools: use only this data.\n\
+        "You are the taskq operator (taskq.md R3): answer the owner's request about the taskq projects below. Use normal tools within configured permissions and the owner request. Read exact project paths, never discover unrelated folders. Do not bypass runtime denials, change permissions or log in. Missing authority: clarify. Queue mutations use TaskQ commands and authoritative readback.\n\
          Reply with exactly one JSON object and nothing else: {{\"kind\": \"result|clarify|proposal|refuse\", \"text\": \"...\", \"ops\": [...]}}.\n\
-         - result: a read request; text is the answer.\n\
+         - result: verified answer or completed authorized work; text names changes, checks and partial/unknown effects. Never also propose an action already performed.\n\
          - clarify: the request is unclear or its scope ambiguous; text is one question. Never widen a scope to guess.\n\
-         - proposal: a change; text says in 1-3 short lines what changes and its effect; ops lists it. Nothing changes until the owner confirms.\n\
-         - refuse: not possible with these ops or data; text is the reason.\n\
+         - proposal: an allowlisted action needing approval; text says what changes and its effect; ops lists it. Do not perform these pending actions. Explicitly authorized reversible project work runs directly; do not ask twice. Publishing, destructive operations and setup external effects require their stated approval.\n\
+         - refuse: blocked by actual capability or policy; text names the reason and completed partial work. The proposal op list does not limit authorized tool work.\n\
          Ops (only these; project = a name below; no value starts with '-'):\n\
          {{\"op\":\"focus\",\"project\":P,\"labels\":[\"area-x\"],\"request\":\"<owner's words>\"}} admit tasks with one of the labels (\"all\": any),\n\
          {{\"op\":\"pause\",\"project\":P}}, {{\"op\":\"resume\",\"project\":P}} (restores the saved focus),\n\
@@ -825,4 +840,69 @@ mod tests {
         assert_eq!(ids(&root).first().map(String::as_str), Some("20"), "the newest 20 stay");
         let _ = (fs::remove_dir_all(&install), fs::remove_dir_all(&root));
     }
+    // Chain: R3/R9 operator request -> native tools -> verified result -> same-session continuation.
+    // Paid/client-dependent qualification: deliberately excluded from the normal CI gate.
+    #[test]
+    #[ignore = "live runtime matrix; set TASKQ_QUALIFY_RUNTIME=claude|codex and run explicitly"]
+    fn live_operator_matrix() {
+        use std::time::{Duration, Instant};
+        let rt = std::env::var("TASKQ_QUALIFY_RUNTIME").expect("select claude or codex");
+        assert!(["claude", "codex"].contains(&rt.as_str()));
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".taskq/qualification").join(format!("{rt}-{}", crate::runtime::uuid()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("taskq.md"), include_str!("../taskq.md")).unwrap();
+        fs::write(root.join("AGENTS.md"), "Read taskq.md. Only work on the explicitly requested qualification fixture. No board writes, commits, pushes or service changes.\n").unwrap();
+        fs::write(root.join("CLAUDE.md"), "Read taskq.md. Only work on the explicitly requested qualification fixture. No board writes, commits, pushes or service changes.\n").unwrap();
+        fs::write(root.join("taskq.json"), json!({"repo":"taskqorg/taskq", "limits": {rt.clone():1}, "permission_mode":"dontAsk", "codex":["-s","workspace-write","-c","sandbox_workspace_write.network_access=true"], "incident_reports":false}).to_string()).unwrap();
+        // Explicit qualification grant, confined to this disposable project; native dontAsk still applies.
+        if cfg!(windows) && rt == "claude" {
+            fs::create_dir_all(root.join(".claude")).unwrap();
+            fs::write(root.join(".claude/settings.local.json"), json!({"permissions":{"allow":["Bash(*)", "PowerShell(*)"]}}).to_string()).unwrap();
+        }
+        let original = format!("canary-{}\n", crate::runtime::uuid());
+        fs::write(root.join("input.txt"), &original).unwrap();
+        fs::create_dir_all(dir(&root)).unwrap();
+        let install = root.join("fixture-install");
+        fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let wait = |id: &str| {
+            let since = Instant::now();
+            loop {
+                let a = read(&answer_path(&root, id));
+                if a["state"] != "running" { return a; }
+                assert!(since.elapsed() < Duration::from_secs(900), "qualification still running; inspect {}", root.display());
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        };
+        fs::write(dir(&root).join("1.json"), json!({"text":"Authorized qualification, not a proposal: read input.txt using a tool, copy its exact bytes to output.txt using a tool, and execute a local command that checks equality. Do not touch any other files or any board. Return kind=result, stating the actual check. No commits, tasks, pushes or approvals needed for these fixture actions."}).to_string()).unwrap();
+        step(&root, &install, &exe, Some(&rt));
+        assert!(running(&root));
+        let first = wait("1");
+        assert_eq!(first["state"], "result", "{first}");
+        assert_eq!(fs::read_to_string(root.join("output.txt")).unwrap(), original);
+        let sid = first["session"].as_str().expect("actual native session");
+        assert!(!sid.is_empty());
+        fs::write(dir(&root).join("2.json"), json!({"after":"1", "text":"Continue the same authorized fixture. Append exactly continued followed by a newline to output.txt; preserve its existing bytes. Execute a local command verifying output.txt equals input.txt followed by continued and a newline. Return kind=result with actual check. No board writes, commits, pushes or other file edits."}).to_string()).unwrap();
+        step(&root, &install, &exe, Some(&rt));
+        let second = wait("2");
+        assert_eq!(second["state"], "result", "{second}");
+        assert_eq!(second["session"], sid, "same native session");
+        assert_eq!(fs::read_to_string(root.join("output.txt")).unwrap(), format!("{original}continued\n"));
+        assert!(!running(&root));
+        let log = fs::read_to_string(dir(&root).join("1.out")).unwrap();
+        assert!(if rt == "claude" { log.contains("tool_use") } else { log.contains("command_execution") }, "actual tools, not acknowledgement");
+        let mut config = read(&root.join("taskq.json"));
+        let (cfg, _) = crate::load(&root).unwrap();
+        config["capacity_hosts"][&cfg.me]["limits"][&rt] = json!(0);
+        fs::write(root.join("taskq.json"), config.to_string()).unwrap();
+        fs::write(dir(&root).join("3.json"), json!({"after":"2", "text":"Read input.txt again."}).to_string()).unwrap();
+        step(&root, &install, &exe, Some(&rt));
+        let disabled = wait("3");
+        assert_eq!(disabled["state"], "failed");
+        assert!(disabled["reason"].as_str().unwrap().contains("disabled"));
+        assert!(!dir(&root).join("3.out").exists(), "disabled continuation never launches or changes runtime");
+        println!("QUALIFIED {rt}: native tools, edit/check, same-session continuation; evidence {}", root.display());
+    }
+
 }

@@ -6,7 +6,7 @@ Proposal, not runtime policy. §7 remains authoritative. Shared UI rules: [specq
 
 ## B1 Scope and owner
 
-- Settings → Agents → Delivery. Access stays a separate tab. Applies to workers/reviewers across runtimes; operator chat does not gain publishing authority.
+- Settings → Agents → Delivery. Access stays a separate tab. Applies to workers/reviewers across runtimes; operator publication needs explicit owner authorization under R3/R9 and the shared approval boundaries; tool availability alone grants none.
 - One owner-managed default plus explicit project overrides. Project identity includes forge, repository and target branch; display source and effective policy. Avoid per-agent/per-host publication defaults fighting over one project.
 - Task requests can narrow policy. Broader effects require an owner-reviewed change. Agent-written files, issue text and Full access cannot authorize publication.
 - Execution still requires host credentials, runtime capability and repository protections. Show blocked capability separately from workflow intent; never weaken protections.

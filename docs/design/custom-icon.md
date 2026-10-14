@@ -23,7 +23,7 @@ The agent receives a versioned capability catalogue before proposing a design: s
 | Validate | Unsupported fields, missing data, out-of-bounds/overlap, contrast, font fallback, unreadable overflow and invalid chart semantics reported by element |
 | Save | Owner confirms exact validated revision/hash; atomic local preference write and readback. Stale drafts require re-review; failed save keeps prior active config |
 
-Protocol names above describe capabilities, not shipped CLI commands. Use existing AI conversation/request infrastructure and allowlisted preference operations. Current tool-less operator requires a schema-returning proposal/preview route; do not grant arbitrary shell access merely to draw an icon.
+Protocol names above describe capabilities, not shipped CLI commands. Use existing AI conversation/request infrastructure and allowlisted preference operations. The full operator uses its existing tools and permissions (R3/R9); icon settings still use a schema-returning proposal/preview route before applying the selected design.
 
 Config contains version, preset/source revision, semantic data bindings, element IDs, layout/anchor constraints, typography, semantic palette, overflow and platform adaptations. Bounded numeric domains and allowlisted primitives; no JavaScript, external URLs, arbitrary filesystem/font paths or executable expressions. Reject unsupported schema versions. Prototype supports a deliberately smaller tested subset; it must not advertise unimplemented primitives as working controls.
 

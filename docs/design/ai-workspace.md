@@ -80,7 +80,7 @@ A newer message or changed target state invalidates a conflicting proposal. Reco
 | Failed task | Show failure evidence; diagnosis is separate from retry; proposed requeue identifies the attempt and consequences |
 | AI/service outage | Keep history/draft; distinguish agent failure from failed task; opening never relaunches work |
 
-The current tool-less operator cannot perform arbitrary project research or filesystem work. UI may propose board tasks or hand off to a known PM session; broader agent authority needs an explicit R3/R9 contract, not a disguised tool call.
+The operator is the main project agent under taskq.md R3/R9: normal runtime tools, project permissions and explicit owner scope. It researches, edits, checks and manages tasks through TaskQ. Clarification and proposals resolve missing authority; already authorized work does not require a duplicate confirmation. Runtime/session continuation and partial-effect reporting follow §4.
 
 ## C6. Work sessions
 

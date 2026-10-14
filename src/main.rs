@@ -517,7 +517,6 @@ fn service_run(c: &Ctx) -> Res<()> {
     let _ = fs::remove_file(d.join("restart"));
     operator::recover(&cfg.root);
     // ponytail: the operator takes no slot of `limits`; count it when operators crowd out workers
-    let op_rt = cfg.limits.iter().find(|(_, n)| **n > 0).map(|(rt, _)| rt.clone());
     let mut tray = None;
     let project = project_name(&cfg.root);
     let issues = c.board.url(0).strip_suffix("/0").unwrap_or_default().to_string();
@@ -535,6 +534,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         if let Err(e) = &cap {
             eprintln!("capacity: {e}; launches held");
         }
+        let op_rt = cap.as_ref().ok().and_then(|c| ["claude", "codex"].into_iter().find(|rt| c.limits.get(*rt).copied().unwrap_or(if c.auto { u32::MAX } else { 0 }) > 0));
         s.reload(cap);
         s.mono = began.elapsed().as_secs();
         s.wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
@@ -611,7 +611,7 @@ fn service_run(c: &Ctx) -> Res<()> {
         restart_watch(&mut restart_empty, cfg!(windows) && d.join("restart").exists() && s.kids.is_empty(), began.elapsed().as_secs(), cfg.update_every);
         if is_installed && d.join("restart").exists() {
             // Windows re-exec waits for the live children; the request stays until it can go
-            if cfg!(unix) || s.kids.is_empty() {
+            if !operator::running(&cfg.root) && ((cfg!(unix) && !s.kids.iter().any(|k| k.rt == "codex-app")) || s.kids.is_empty()) {
                 let _ = fs::remove_file(d.join("restart"));
                 eprintln!("restart requested");
             }
@@ -626,7 +626,7 @@ fn service_run(c: &Ctx) -> Res<()> {
             }
         }
         operator::owner_comments(&cfg.root, &project, &issues, &s.owner_comments);
-        operator::step(&cfg.root, &cfg.install, &exe, op_rt.as_deref());
+        operator::step(&cfg.root, &cfg.install, &exe, op_rt);
         if is_installed {
             keep_tray(&cfg.install, &mut tray);
         }
@@ -971,6 +971,7 @@ fn resume(root: &Path) -> Res<String> {
 /// `service install` hands over instead of reloading the unit (§ 8 step 5) while this project's fresh `status.json` lists
 /// live children or is unreadable (unknown keeps them, § 4 Data).
 fn handover(root: &Path) -> bool {
+    if operator::running(root) { return true; }
     let p = dot(root).join("status.json");
     file_age(&p).is_some_and(|a| a <= 60) && data::json(&p).map_or(true, |s| s.is_some_and(|s| s["kids"].as_array().is_some_and(|k| !k.is_empty())))
 }
@@ -1022,9 +1023,12 @@ fn kill_service(root: &Path) {
 #[cfg(unix)]
 fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     use std::os::unix::process::CommandExt;
+    // App turns have no adoptable child; keep their lease until completion.
+    if s.kids.iter().any(|k| k.rt == "codex-app") || operator::running(&cfg.root) {
+        return fs::write(dot(&cfg.root).join("restart"), "").map_err(|e| e.to_string());
+    }
     let mut text = format!("pid {}\n", std::process::id());
-    // a `codex-app` turn has no process to hand over: its attempt goes `gone` (§ 3 app lease)
-    for k in s.kids.iter().filter(|k| k.rt != "codex-app") {
+    for k in &s.kids {
         text += &format!("{} {} {} {} {}\n", k.task, k.attempt, k.rt, k.proc.id(), s.delivered(k.attempt));
     }
     platform::write_atomic(&dot(&cfg.root).join("kids"), &text)?;
@@ -1037,7 +1041,7 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
 fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     // ponytail: Windows cannot hand children to a new image; exit once no child is live and the unit restarts us.
     // The new `current` is already written, so the update waits only for the running attempts.
-    if s.kids.is_empty() {
+    if s.kids.is_empty() && !operator::running(&cfg.root) {
         std::process::exit(75);
     }
     // later update checks see no newer version: the restart request carries the re-exec until the children end
@@ -1336,8 +1340,10 @@ fn run(argv: &[String]) -> Res<()> {
         "service" => service(&a),
         // § 5: the operator over the request log; no board
         "retro" => {
-            let (cfg, _) = load(&find_root()?)?;
-            print!("{}", retro::run(&cfg.root, cfg.limits.iter().find(|(_, n)| **n > 0).map(|(rt, _)| rt.as_str()))?);
+            let (cfg, raw) = load(&find_root()?)?;
+            let cap = service::capacity(&raw, &cfg.me)?;
+            let rt = ["claude", "codex"].into_iter().find(|rt| cap.limits.get(*rt).copied().unwrap_or(if cap.auto { u32::MAX } else { 0 }) > 0);
+            print!("{}", retro::run(&cfg.root, rt)?);
             Ok(())
         }
         "tray" => tray(platform::default_install(), a.one("snapshot"), a.one("icon")),
@@ -1399,7 +1405,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                 body += "\n";
                 body += &deps.iter().map(|d| format!("Depends on #{d}\n")).collect::<String>();
             }
-            for (flag, allowed) in [("type", &["code", "docs", "research", "asset"][..]), ("runtime", &["codex", "claude"][..]), ("priority", &["0", "1", "2"][..])] {
+            for (flag, allowed) in [("type", &["code", "docs", "research", "asset"][..]), ("runtime", &["codex", "claude", "codex-app"][..]), ("priority", &["0", "1", "2"][..])] {
                 if a.all(flag).len() > 1 || a.one(flag).is_some_and(|v| !allowed.contains(&v)) {
                     return Err(format!("--{flag} requires one of {}", allowed.join("|")));
                 }
@@ -1665,12 +1671,14 @@ mod tests {
         let i = c.board.issues(None).unwrap().pop().unwrap();
         assert_eq!(i.labels, vec!["taskq", "q-blocked", "code", "p1"]);
         assert!(in_scope(&i, &["q-waiting".into(), "priority-1".into()]));
+        command(&c, "add", &args(&["--runtime", "codex-app"])).unwrap();
+        assert!(c.board.issues(None).unwrap().pop().unwrap().labels.contains(&"run-codex-app".into()));
         command(&c, "add", &args(&["--priority", "0"])).unwrap();
         assert_eq!(c.board.issues(None).unwrap().pop().unwrap().labels, vec!["taskq", "q-ready", "p0"]);
         for extra in [&["--priority", "3"][..], &["--runtime", "any"], &["--type", "code", "--type", "docs"], &["--host", "win,mac"]] {
             assert!(command(&c, "add", &args(extra)).is_err());
         }
-        assert_eq!(c.board.issues(None).unwrap().len(), 3);
+        assert_eq!(c.board.issues(None).unwrap().len(), 4);
     }
 
     // Chain: § 1 task body. Risk: over-limit text or a wrong body is written.
@@ -1914,6 +1922,22 @@ mod tests {
         fs::write(dot(&root).join("kids"), format!("pid {}\n7 41 claude {pid} 40\n", std::process::id())).unwrap();
         assert_eq!(kids_file(&root), vec![(7, 41, "claude".to_string(), pid as i32, 40)]);
         assert_eq!(adopted.exited(), Ok(None), "adopted live");
+        // A real process stands in for an app turn: restart must stay pending and keep its lease.
+        let b = Fake::default();
+        let c = Config { root: root.clone(), ..cfg() };
+        let mut s = Service::new(&b, &c, "test", Box::new(|_| unreachable!()));
+        s.kids.push(Kid { task: 7, attempt: 41, rt: "codex-app".into(), proc: Box::new(runtime::Adopted(pid as i32)) });
+        reexec(&s, &c).unwrap();
+        assert!(dot(&root).join("restart").exists());
+        assert_eq!(s.kids[0].attempt, 41);
+        assert_eq!(adopted.exited(), Ok(None));
+        s.kids.clear();
+        fs::create_dir_all(operator::dir(&root)).unwrap();
+        fs::write(operator::dir(&root).join("1.json"), "{}").unwrap();
+        fs::write(operator::answer_path(&root, "1"), r#"{"state":"running"}"#).unwrap();
+        reexec(&s, &c).unwrap();
+        assert!(dot(&root).join("restart").exists() && handover(&root));
+        fs::write(operator::answer_path(&root, "1"), r#"{"state":"result"}"#).unwrap();
         // an idle service reloads the unit, which would end a child
         fs::write(dot(&root).join("status.json"), r#"{"kids": []}"#).unwrap();
         assert!(!load_unit(&u, &root).unwrap() && reloaded.exists());

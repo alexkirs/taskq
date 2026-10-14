@@ -4,7 +4,7 @@ Product selection: D05 option 1 is accepted in the [decision register](decision-
 
 Design proposal. No active permissions changed. Approve the R9/§8 amendment and migration before implementation.
 Shared candidate: [permission authority](https://github.com/taskqorg/specq/blob/main/engineering/permission-authority.md).
-Applies to workers/reviewers; the tool-less AI operator keeps R3/R9 restrictions.
+Applies to workers, reviewers and the full operator (R3/R9); tools remain bounded by effective runtime permissions and the owner request.
 
 ## Evidence and #865
 
@@ -164,7 +164,7 @@ Saved is not Applied. Verify service readback before reporting completion. Unsup
 
 Apply with implementation and executable lifecycle traces, after owner approval. Current R9/§8/§9 remain runtime authority.
 
-- R9 replacement: operator-owned host policy defines permission grants per runtime and optional registered-project override. Project/task input may narrow or request access, never raise it. Full requires explicit local approval, audited outside worker writes. Operator remains tool-less.
+- R9 replacement: operator-owned host policy defines permission grants per runtime and optional registered-project override. Project/task input may narrow or request access, never raise it. Full requires explicit local approval, audited outside worker writes. Operator uses the same effective grants as the selected runtime, within the owner request; no tool-free exception.
 - §8 Runtime addition: resolve and validate effective policy before spawn/resume; record revision/mode; refuse unsupported containment. Prompt-denied work enters fenced Ask. No in-place escalation or silent broader resume.
 - §8 Folders replacement after reconciling #865: exact contract path, no broad discovery; access follows approved read/write/execute roots and runtime dependencies. Full is uncontained unless an independent boundary is verified. TCC consent is separate.
 - §4/§5: status readback and local permissions-review command; policy decisions cannot be applied by the AI allowlist or a board answer alone.

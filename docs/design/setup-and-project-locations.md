@@ -55,7 +55,7 @@ For macOS warnings, diagnose the actual requesting process, launch/resume cwd, t
 
 ## S5. Development and acceptance
 
-Extend backlog streams 1, 6, 9 and 11. First reconcile coreq's installer/service paths and current `taskq agents`, bootstrap, runtime launch/resume and tool-less operator paths; share existing primitives. Define the host-preference read/update schema, explicit root resolution and adapter capabilities before app wiring. Preserve current authority until corresponding runtime contract changes ship.
+Extend backlog streams 1, 6, 9 and 11. First reconcile coreq's installer/service paths and current `taskq agents`, bootstrap, runtime launch/resume and full operator paths; share existing primitives. Define the host-preference read/update schema, explicit root resolution and adapter capabilities before app wiring. Preserve current authority until corresponding runtime contract changes ship.
 
 | ID | Required proof |
 |---|---|

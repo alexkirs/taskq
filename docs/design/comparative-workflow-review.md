@@ -58,7 +58,7 @@ Owner clarification: [product principles](../product-principles.md) are the sele
 ### Where our design needs correction
 
 - **Too many apparent controls:** keep one effective Work mode summary; show parameters/chips and exceptions inside its existing editor. AI and direct edits produce the same review.
-- **Menu-only is incomplete:** current R3 operator is tool-less and allowlisted. Planning needs board context, task proposals, reviewed bulk apply and receipts; adding chat chrome does not implement it.
+- **Menu-only is incomplete:** R3 now defines a full operator. Planning still needs board context, task proposals, reviewed bulk apply and receipts; adding chat chrome does not implement it.
 - **Host budgets are incomplete:** per-project limits can cumulatively exceed the operator's intended machine total. Specify shared capacity and fairness before promising one host-wide limit.
 - **Agent interface is uneven:** reuse current commands, but qualify stable machine schemas, capabilities and error outcomes rather than asking agents to parse human prose or duplicate adapters.
 - **Portability needs proof:** a new board adapter must implement required identity, log, authorization and readback semantics. Unsupported semantics are reported; a connector name alone is insufficient.

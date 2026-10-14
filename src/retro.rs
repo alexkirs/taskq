@@ -115,7 +115,7 @@ fn inputs(log: &[Value], props: &[(String, String)]) -> Vec<(String, String)> {
 fn brief(inputs: &[(String, String)], use_cases: &str) -> String {
     let list: String = inputs.iter().map(|(id, t)| format!("{id} {}\n", t.replace('\n', " / "))).collect();
     format!(
-        "You are the taskq operator (taskq.md R3) running a retrospective: read the owner's and operator's requests below and recommend changes to taskq that simplify flows or add options, operations or quick commands. You have no tools: use only this data.\n\
+        "You are the taskq operator (taskq.md R3) running a retrospective: read the owner's and operator's requests below and recommend changes to taskq that simplify flows or add options, operations or quick commands. This is a read/recommend-only request: inspect relevant project evidence if needed, but perform no edits, queue writes or external actions.\n\
          Reply with exactly one JSON object and nothing else: {{\"recommendations\": [{{\"kind\": \"flow|option|operation|quick command\", \"title\": \"<task title, at most 80 characters>\", \"text\": \"<one line: what changes and why>\", \"from\": [\"r3\", \"p1\"], \"goal\": \"<one line user outcome>\", \"acceptance\": [\"<one line observable check>\"]}}]}}.\n\
          Each recommendation names in from the request ids it comes from (at least one); 1-4 acceptance items; most useful first; at most 10. Skip what the use cases already cover as shipped. Use English, short plain lines (taskq.md R7).\n\
          Requests:\n{list}\nUse cases:\n{use_cases}\n"
@@ -165,7 +165,7 @@ pub fn run(root: &Path, rt: Option<&str>) -> Result<String, String> {
     let ins = inputs(&log, &proposals(&use_cases));
     let rt = rt.ok_or("no runtime with a nonzero limit on this host")?;
     fs::create_dir_all(crate::dot(root)).map_err(|e| e.to_string())?;
-    let text = crate::operator::exec(rt, &brief(&ins, &use_cases), &crate::dot(root), "retro")?;
+    let text = crate::operator::exec(rt, &brief(&ins, &use_cases), root, &crate::dot(root), "retro", None)?;
     let ids: Vec<String> = ins.iter().map(|(id, _)| id.clone()).collect();
     let recs = parse(&text, &ids)?;
     let report = json!({"at": now(), "recommendations": recs});
@@ -236,6 +236,11 @@ mod tests {
     fn a_report_names_sources_kinds_and_the_filing_command() {
         let readme = "# Use cases\n\n## Proposals\n\nLine: `- YYYY-MM-DD <proposal> (from <request>)`.\n\n- 2026-10-14 Quick command to answer all asks (from tray)\n- not a proposal\n\n## Other\n- 2026-10-15 ignored\n";
         assert_eq!(proposals(readme), [("2026-10-14".to_string(), "Quick command to answer all asks (from tray)".to_string())]);
+        let empty = temp("missing-log");
+        let missing = read(&empty).unwrap();
+        let first = inputs(&missing, &proposals(readme));
+        assert!(missing.is_empty() && first.len() == 1 && first[0].0 == "p1");
+        assert!(!log_path(&empty).exists(), "a missing log stays missing; PM proposals survive");
         let log = vec![json!({"at": 1_760_400_000u64, "source": "tray", "task": null, "text": "pause maps"})];
         let ins = inputs(&log, &proposals(readme));
         assert_eq!(ins[0], ("r1".into(), "2025-10-14 00:00 tray: pause maps".into()));

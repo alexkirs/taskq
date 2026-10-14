@@ -1,7 +1,7 @@
 {
   "version": "4.0.0-dev",
-  "sourceCommit": "285e4b0461d91455fa70c7aac768ecfc335b6c70",
-  "binarySha256": "61f67d1d4939ce3380ad55d2db149efb7f336161a19ed6a680146efbbaa2308e",
+  "sourceCommit": "ef93fd09429085084d92affaab44f1dbba70064a",
+  "binarySha256": "9cab9068713956a79e5e0fcb8444552ef074e40ae4d365d86fd6b4a25f9f6c43",
   "environment": {
     "os": "macOS 26.6.2",
     "arch": "arm64",

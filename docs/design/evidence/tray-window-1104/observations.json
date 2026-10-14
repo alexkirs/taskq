@@ -6,6 +6,7 @@
       "height": 525,
       "dpr": 1.399999976158142,
       "scroll": 525,
+      "horizontal": 320,
       "header": 5.9933037757873535,
       "pin": "true",
       "top": "true"
@@ -16,6 +17,7 @@
       "height": 525,
       "dpr": 1.399999976158142,
       "scroll": 525,
+      "horizontal": 320,
       "header": 5.9933037757873535,
       "pin": "false",
       "top": "false"
@@ -26,6 +28,7 @@
       "height": 590,
       "dpr": 1.399999976158142,
       "scroll": 590,
+      "horizontal": 425,
       "header": 5.9933037757873535,
       "pin": "true",
       "top": "false"
@@ -33,9 +36,10 @@
     {
       "name": "fixed-header",
       "width": 425,
-      "height": 200,
+      "height": 230,
       "dpr": 1.399999976158142,
       "scroll": 524,
+      "horizontal": 415,
       "header": 0,
       "pin": "true",
       "top": "false"
@@ -61,16 +65,17 @@
   },
   "restartSize": [
     425,
-    200
+    230
   ],
   "restored": [
     425,
-    200
+    230
   ],
-  "binarySha256": "529199b804ea0aeea5e4beb8c85e81539cd6c19a0233506fc8255d9e26634c71",
+  "binarySha256": "0a29676fb971c0c2e54d8550b20850b5efa2fbf1e0f6aa9e77874682bf2ff2f1",
+  "codeCommit": "68fd2f4728e22cf9c3b007a2a34531790c0c43cc",
   "uiSources": {
-    "src/tray.rs": "50d202c2cbb9df2563fbc7bcadb5fbf4e0509cf6",
-    "src/tray.html": "0a45de79e465e19b9b5d482676440a7be60928fc",
+    "src/tray.rs": "765907eec4529e2fea127deff121e2bae79e4e5e",
+    "src/tray.html": "b86289f75a712848c4d27b165f2bd77438f173c4",
     "Cargo.toml": "e72182ff6641f4ff05dea3589eb5bd569f39f69a"
   },
   "environment": {

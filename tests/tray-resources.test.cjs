@@ -8,7 +8,7 @@ const fx=JSON.parse(fs.readFileSync('tests/fixtures/resource-controls.json','utf
 const sent=[],timers=new Map();let id=0;
 const saved={limits:{claude:2},load_gate:{enabled:true,cpu_max:85,memory_min:10}};
 const project={root:'p',name:'taskq',cap_host:'mac',cap_saved:saved,resources:fx.cases[0].groups[0]};
-const context={S:{projects:[project],font:16,now:1000},TaskqResources:rc,esc:s=>String(s),send:m=>sent.push(m),menu:{scrollHeight:400},
+const context={S:{projects:[project],font:16,now:1000},TaskqResources:rc,esc:s=>String(s),send:m=>sent.push(m),fit:()=>{},menu:{scrollHeight:400},
   setTimeout:(f,ms)=>{timers.set(++id,{f,ms});return id;},clearTimeout:i=>timers.delete(i)};
 vm.createContext(context);vm.runInContext(source,context);
 const call=(name,...args)=>{context.args=args;return vm.runInContext(name+'(...args)',context);};

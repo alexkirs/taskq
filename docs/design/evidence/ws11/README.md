@@ -4,7 +4,7 @@ Scope: native Home / Projects / Attention / Settings and its five categories ([m
 
 ## Artifact
 
-- Source commit: `7883b3f` (`src/tray.html` fix on top of the navigation commit); images in this folder come from `cargo build --release --locked` of that commit, binary sha256 `f4685b74ebee7439c9b4e9fdfd8dd85f69aed4dd11c673532b46c2496c75eca8`.
+- Source: pre-rebase commit `7883b3f` (same as the README manifest); UI blobs `src/tray.html` `3ad69bf4` and `src/tray.rs` `bdd50424`, unchanged by the rebase. Images come from `cargo build --release --locked` of that commit, binary sha256 `f4685b74ebee7439c9b4e9fdfd8dd85f69aed4dd11c673532b46c2496c75eca8`.
 - Environment: macOS 27.0.1 arm64, Retina 2x, WKWebView `taskq tray --snapshot`; usable height 909 pt (0.95 of the screen), width 320 pt at 14/16 px text and 360 pt at 18/20 px.
 - Fixtures: [docs/shots/fixture.sh](../../../shots/fixture.sh) (normal: two projects, ask/doing/review/ready, one day of history) for the images here; [docs/design/tray-fixture.sh](../../tray-fixture.sh) (long titles, failed, paused, service error, stale status, duplicate issue number, update available) captured in the same run and inspected, not stored.
 - Images: `popover-<theme>-<route>-16.png`, dark and light, 16 px. 20 px variants were captured and inspected for every route.
@@ -39,6 +39,6 @@ Windows: Not tested (no Windows run for this slice).
 
 | ID | Requirement | Expected | Observed | Reproduction | Severity | Disposition |
 |---|---|---|---|---|---|---|
-| F1 | U-A2, U-A4 | footer visible after a text-size change | 20 px to 16 px clipped the footer (Attention 458 px, Home 1590 px, while the content needed 502 and 1710); 16 to 20 over-sized the window | snapshot run before `7883b3f`: `popover-light-home-16` follows `popover-dark-about-20` | High | Fixed in `7883b3f`: the page measures at the target width |
+| F1 | U-A2, U-A4 | footer visible after a text-size change | 20 px to 16 px clipped the footer (Attention 458 px, Home 1590 px, while the content needed 502 and 1710); 16 to 20 over-sized the window | snapshot run without `fit()`: `popover-light-home-16` follows `popover-dark-about-20` | High | Fixed by the `fit()` height measure: the page measures at the target width |
 | F2 | W1–W8 | first viewport carries questions, warnings and current values | Home shows Waiting for answer and counters above the fold; Attention groups errors, stale status, questions and failures apart (W8); unknown counts read `?` with a Partial line, never zero | tray-fixture.sh run | — | Pass |
 | F3 | M-A3/17 | long titles flow in full | long title wraps to three lines at 320 pt | tray-fixture.sh Attention | — | Pass |

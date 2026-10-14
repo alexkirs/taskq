@@ -22,5 +22,7 @@ Claude visual review:
 - A2 pass: `clarify-dark-home-16.png` shows Answer and Reply; `proposal-dark-home-20.png` shows the op and
   `Confirm: apply 1 change`; `failed-dark-home-20.png` shows the reason and `Edit and send again`. Each is above Projects.
 - The Windows window cap here is smaller than the Mac's 1818 px cap, so the Mac shows more of Projects.
-- Not tested: macOS native capture (CI `shots` refreshes the README images on macOS).
+- macOS (WKWebView `tray --snapshot`, release build, 1818 px cap), files `mac-<state>-dark-home-<px>.png`: A1 pass in
+  `mac-result-dark-home-16.png` and `mac-result-dark-home-20.png`; A2 pass in `mac-clarify-`, `mac-proposal-` and
+  `mac-failed-dark-home-16.png` (Reply, `Confirm: apply 1 change`, `Edit and send again`, each above Projects).
 - Seen, not changed: the 320 px Windows popover has a horizontal scrollbar on every Home, with or without AI.

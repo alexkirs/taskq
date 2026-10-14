@@ -82,8 +82,8 @@ function back(){
 }
 function routeButton(route,label=routes[route]){return '<button class="project" data-route="'+route+'">'+esc(label)+'</button>';}
 // Task answers: the native bridge owns credentials and canonical dispatch/readback.
-const answerRequests=new Map(),answerCards=new Map();
-function answerCapability(board){const p=S&&S.projects.find(p=>p.issues===board);return {answer:!!p&&p.alive&&p.complete!==false,reason:'Project status is unavailable or stale; check the board'};}
+const answerRequests=new Map(),answerCards=new Map(),answerFeedback=new Map();
+function answerCapability(board){const p=S&&S.projects.find(p=>p.issues===board);return {manage:true,answer:!!p&&p.alive&&p.complete!==false,reason:'Project status is unavailable or stale; check the board'};}
 function answerSend(board,op){
   const p=S&&S.projects.find(p=>p.issues===board);
   if(!p)return Promise.resolve({state:'rejected',reason:'Project is no longer registered'});
@@ -91,8 +91,9 @@ function answerSend(board,op){
   if(answerRequests.has(key))return answerRequests.get(key).promise;
   let resolve;
   const promise=new Promise(r=>resolve=r);
-  const timer=setTimeout(()=>{answerRequests.delete(key);resolve({state:'unknown',reason:'No bridge receipt received',next:'Check delivery with the same operation'});},30000);
-  answerRequests.set(key,{promise,resolve,timer});
+  const timer=setTimeout(()=>{answerReceipt({root:p.root,id:op.id,state:'unknown',reason:'No bridge receipt received',next:'Check delivery with the same operation'});},30000);
+  answerRequests.set(key,{promise,resolve,timer,board,op});
+  answerFeedback.set(key,{board,op,state:'sending',reason:''});
   send({a:'answer',root:p.root,board,op});
   return promise;
 }
@@ -100,10 +101,15 @@ function answerReceipt(r){
   const key=r.root+'#'+r.id,request=answerRequests.get(key);
   if(!request)return;
   clearTimeout(request.timer);answerRequests.delete(key);
+  answerFeedback.set(key,{board:request.board,op:request.op,state:r.state,reason:r.reason,next:r.next});
   request.resolve({state:r.state,reason:r.reason,next:r.next});
+  render();
   setTimeout(fit,0);
 }
-function answerSlot(t){return t.question||t.card||answerCards.has(t.key)?'<div data-answer="'+esc(t.key)+'"></div>':'';}
+function answerSlot(t){return t.state==='ask'?'<div data-answer="'+esc(t.key)+'"></div>':'';}
+function answerNotices(){
+  return [...answerFeedback].filter(([,r])=>!S.projects.some(p=>p.issues===r.board&&p.tasks.some(t=>t.n===r.op.task&&t.state==='ask'))).map(([key,r])=>'<div class="body" role="status">#'+r.op.task+' · '+esc(r.state)+(r.reason?': '+esc(r.reason):'')+(r.next?' · '+esc(r.next):'')+' <a href="'+esc(r.board+'/'+r.op.task)+'" data-url="'+esc(r.board+'/'+r.op.task)+'">Board ↗</a>'+(r.state==='unknown'?'<button data-a="answer-retry" data-key="'+esc(key)+'">Check delivery</button>':'')+'</div>').join('');
+}
 function mountAnswers(){
   for(const slot of menu.querySelectorAll('[data-answer]')){
     const t=unique(S.projects.flatMap(tasks)).find(t=>t.key===slot.dataset.answer);
@@ -347,7 +353,7 @@ function render(navigating=false){
   menu.style.setProperty('--size',S.font+'px');
   menu.classList.toggle('pinned',!!S.pinned);
   const title=working?'Work mode':taskFilter?'Tasks':p?p.name:routes[page];
-  menu.innerHTML=head()+(page!=='home'||working||taskFilter?'<button data-a="back">‹ Back</button>':'')+'<h1 tabindex="-1">'+esc(title)+'</h1>'+(S.settings_error?'<div class="body alert" role="alert">Settings unknown: '+esc(S.settings_error)+'; defaults shown</div>':'')+(working?workPage():taskFilter?filteredTasks(p):p?project(p):routeBody())+'<nav class="options footer" aria-label="Menu"><button data-route="home">Home</button><button data-route="settings">Settings</button></nav>';
+  menu.innerHTML=head()+answerNotices()+(page!=='home'||working||taskFilter?'<button data-a="back">‹ Back</button>':'')+'<h1 tabindex="-1">'+esc(title)+'</h1>'+(S.settings_error?'<div class="body alert" role="alert">Settings unknown: '+esc(S.settings_error)+'; defaults shown</div>':'')+(working?workPage():taskFilter?filteredTasks(p):p?project(p):routeBody())+'<nav class="options footer" aria-label="Menu"><button data-route="home">Home</button><button data-route="settings">Settings</button></nav>';
   mountAnswers();mountResources();
   menu.querySelectorAll('details').forEach((d,i)=>d.open=open[i]??(['cadence','agents','services','attention'].includes(page)));
   if(S.page!==undefined)menu.querySelectorAll('.hist,.agents,.service,.incident-notice').forEach(d=>d.open=true);
@@ -375,6 +381,7 @@ menu.addEventListener('click',e=>{
   const a=e.target.closest('a[data-url]');if(a){e.preventDefault();send({a:'open',url:a.dataset.url});return;}
   const b=e.target.closest('button');if(!b||b.disabled)return;const d=b.dataset;
   if(d.route){if(d.route!==page||working||taskFilter)navigate(d.route);return;}
+  if(d.a==='answer-retry'){const r=answerFeedback.get(d.key);if(r)answerSend(r.board,r.op);render();return;}
   if(d.a==='work'){navigate(page,null,d.root?{[d.root]:true}:{});return;}
   if(d.a==='back'){back();return;}
   if(d.set==='period'&&d.v==='custom'){const H=S.history;draft={start:local(H.start,H.tz),end:local(H.end,H.tz),tz:H.tz,error:''};render();return;}

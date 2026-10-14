@@ -34,6 +34,7 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 - Main task target opens the issue. Local agent session and known PR links are separate controls; no nested links or double navigation.
 - Codex/Claude marks identify the recorded runtime; codex-app uses Codex identity. Missing permalink: unavailable with reason. Remote: network + host, no fabricated local session link.
 - Task detail preserves question, failure, work, ready, dependency and later access. Board links remain near the project name.
+- Answer cards mount only for `ask`, never for stored cards on doing/review/ready/later/blocked rows. An ask with no parsed choices shows its original text, a requeue reason field, Later and Close. Close requires confirmation naming cancellation without publication, then canonical `later` and `close` with readback after each; no second step after failed/unknown parking. Retain a compact operation receipt and same-ID delivery check outside the question card when the task leaves ask; partial close names the parked task and board recovery.
 - Back restores list/scroll position. Service, log, folder and admission controls always identify project/host.
 - Current Agents is host-level, read-only: version/account or not installed/not logged in/unknown, plus probe age. Include disabled runtimes such as codex-app where reported.
 

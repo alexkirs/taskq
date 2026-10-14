@@ -37,6 +37,7 @@ pub type Res<T> = Result<T, String>;
 const USAGE: &str = "taskq agents
  taskq labels
  taskq add <title> --goal G --acceptance A [--acceptance B..] [--scope P..] [--deps N..] [--type T] [--runtime R] [--priority 0|1|2] [--host H] [--later|--hold] [--text T]
+ taskq finding <title> --board URL --source installation/rule/episode --goal G --acceptance A.. [--evidence E..] [--start] [--json]
  taskq start N
  taskq ask N --text Q --option O.. --recommend K [--link URL..]
  taskq answer N --text A | taskq answer N.K [M.K..]
@@ -82,7 +83,7 @@ impl Args {
             Some("close") => a.pos.len(),
             Some("answer") if a.pos.get(1).is_some_and(|p| p.contains('.')) => a.pos.len(),
             Some("service") if a.pos.get(1).is_some_and(|p| p == "focus") => a.pos.len(),
-            Some("service" | "add" | "start" | "approve" | "recipe" | "ask" | "answer" | "result" | "requeue" | "later" | "failed" | "steer" | "inbox") => 2,
+            Some("service" | "add" | "finding" | "start" | "approve" | "recipe" | "ask" | "answer" | "result" | "requeue" | "later" | "failed" | "steer" | "inbox") => 2,
             _ => 1,
         };
         if a.pos.len() > used {
@@ -1322,7 +1323,7 @@ pub struct NewTask {
 }
 
 /// Task body and create claim shared by direct adds and recipes; limits checked before any write.
-fn add_task(b: &dyn Board, root: &Path, raw: &Value, t: &NewTask, op: &Op) -> Res<Receipt> {
+fn task_body(b: &dyn Board, t: &NewTask, op: &Op) -> Res<(String, Vec<String>, bool)> {
     if t.title.trim().is_empty() || t.title.contains(['\r', '\n']) || t.title.chars().count() > 80 {
         return Err("title: one line, at most 80 characters; shorten it".into());
     }
@@ -1369,6 +1370,11 @@ fn add_task(b: &dyn Board, root: &Path, raw: &Value, t: &NewTask, op: &Op) -> Re
     }
     labels.extend(t.labels.iter().cloned());
     labels::validate(&labels)?;
+    Ok((body, labels, blocked))
+}
+
+fn add_task(b: &dyn Board, root: &Path, raw: &Value, t: &NewTask, op: &Op) -> Res<Receipt> {
+    let (body, labels, blocked) = task_body(b, t, op)?;
     let n = if op.id.is_some() {
         match claimed_create(b, raw, &t.title, &body, &labels, t.later.as_deref().unwrap_or(""), op) {
             Ok(n) => n,
@@ -1409,15 +1415,7 @@ fn run_recipe(b: &dyn Board, root: &Path, raw: &Value, name: &str, run: &str, go
 
 /// § 1 `start`: `taskq` goes on after the `start` entry; a retry adds the label a failed write left off.
 fn start_task(b: &dyn Board, root: &Path, n: u64, op: &Op) -> Res<Receipt> {
-    let r = act(b, root, n, "start", &[], "", op);
-    let issue = b.issue(n)?;
-    let started = entries(b, n)?.iter().any(|e| !e.edited && e.body.starts_with("taskq: start"));
-    if started && issue.open && !service::is_task(&issue) {
-        b.labels(n, &[service::TASK_LABEL.into()], &[])?;
-        let (_, t, _) = current(b, n)?;
-        return Ok(Receipt::accepted(n, op, t.state, core::revision(n, &entries(b, n)?)));
-    }
-    Ok(r)
+    Ok(start_one(b, root, n, op))
 }
 
 /// § 5 receipts: JSON lines with `--json`, else the text lines; any receipt not accepted fails after all are shown.
@@ -1592,6 +1590,71 @@ fn claimed_create(b: &dyn Board, raw: &Value, title: &str, body: &str, labels: &
     Ok(n)
 }
 
+/// Section 1 finding -> existing claim/create -> separate admission; drafts remain caller-owned.
+fn finding_submit(b: &dyn Board, raw: &Value, root: &Path, title: &str, body: &str, labels: &[String], request: &str, op: &Op, start: bool) -> (Receipt, Option<Receipt>) {
+    let create = match claimed_create(b, raw, title, body, labels, request, op) {
+        Ok(n) => Receipt::accepted(n, op, State::Held, 0),
+        Err(r) if r.outcome == "unknown" => Receipt { next: "Retry the identical finding command for read-only create discovery; optional start has its own receipt.".into(), ..r },
+        Err(r) => r,
+    };
+    if !create.ok() || !start { return (create, None) }
+    let n = create.task;
+    let admission = Op { id: Some(format!("{}.start", op.id.as_deref().unwrap())), revision: None };
+    let r = start_one(b, root, n, &admission);
+    (create, Some(r))
+}
+
+/// Section 1 start log -> eligibility label -> authoritative readback, shared by start and finding.
+fn start_one(b: &dyn Board, root: &Path, n: u64, op: &Op) -> Receipt {
+    let mut start_op = op.clone();
+    // A finding's q-held projection prevents admission even before its hold log is initialized.
+    let initialize = || -> Res<Option<Receipt>> {
+        let issue = b.issue(n)?;
+        let log = entries(b, n)?;
+        if op.revision.is_some_and(|r| r != core::revision(n, &log)) { return Ok(None) }
+        if issue.open && service::is_held(&issue) && core::revision(n, &log) == 0 {
+            let hold = Op { id: op.id.as_ref().map(|id| format!("{id}.hold")), revision: Some(core::revision(n, &log)) };
+            let r = act(b, root, n, "hold", &[], "", &hold);
+            return Ok(Some(Receipt { op_id: op.id.clone(), ..r }));
+        }
+        Ok(None)
+    };
+    match initialize() {
+        Ok(Some(r)) if !r.ok() => return r,
+        Ok(Some(r)) => { if start_op.revision.is_some() { start_op.revision = r.revision; } }
+        Err(e) => return Receipt { outcome: "unknown", ..Receipt::rejected(n, op, e) },
+        Ok(None) => {}
+    }
+    let r = act(b, root, n, "start", &[], "", &start_op);
+    if !r.ok() { return r }
+    let readback = || -> Res<Receipt> {
+        let (issue, t, _) = current(b, n)?;
+        let log = entries(b, n)?;
+        let started = log.iter().any(|e| !e.edited && e.body.starts_with("taskq: start"));
+        if started && issue.open { service::project(b, &issue, &t)?; }
+        if started && issue.open && !service::is_task(&issue) {
+            b.labels(n, &[service::TASK_LABEL.into()], &[])?;
+        }
+        let (issue, t, _) = current(b, n)?;
+        if issue.open && (!service::is_task(&issue) || service::is_held(&issue)) {
+            return Err("start eligibility labels not read back".into());
+        }
+        Ok(Receipt::accepted(n, op, if issue.open { t.state } else { State::Closed }, core::revision(n, &entries(b, n)?)))
+    };
+    readback().unwrap_or_else(|e| Receipt { outcome: "unknown", next: format!("Read taskq inbox {n}; retry the same start operation."), ..Receipt::rejected(n, op, e) })
+}
+
+fn emit_finding(create: Receipt, start: Option<Receipt>, json: bool) -> Res<()> {
+    let ok = create.ok() && start.as_ref().is_none_or(Receipt::ok);
+    if json {
+        println!("{}", json!({"create": create, "start": start}));
+    } else {
+        println!("Create: {}", create.text());
+        if let Some(r) = start { println!("Start: {}", r.text()); }
+    }
+    if ok { Ok(()) } else { Err(String::new()) }
+}
+
 fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
     let (b, cfg, root) = (c.board.as_ref(), &c.cfg, c.cfg.root.as_path());
     let text = a.one("text").unwrap_or("");
@@ -1600,7 +1663,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
     }
     if cmd == "add" && a.flags.contains_key("later") { task_text("later", text)?; }
     let revision = a.one("revision").map(|r| r.parse::<u64>().map_err(|_| format!("bad --revision {r}"))).transpose()?;
-    let op = Op { id: a.one("op-id").map(String::from), revision };
+    let mut op = Op { id: a.one("op-id").map(String::from), revision };
     if op.id.as_deref().is_some_and(|i| i.is_empty() || i.contains(char::is_whitespace)) {
         return Err("--op-id: one word".into());
     }
@@ -1616,7 +1679,8 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             println!("Label catalog verified for {}", project_name(root));
             Ok(())
         }
-        "add" => {
+        "add" | "finding" => {
+            let finding = cmd == "finding";
             // § 1 task body: Goal, Acceptance, Scope, dependencies; limits checked before any write
             // § 5 `--retro K`: title, goal and acceptance of the last retro report's recommendation K
             let picked = a.one("retro").map(|k| retro::pick(root, k)).transpose()?;
@@ -1643,10 +1707,47 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                 runtime: a.one("runtime").map(String::from),
                 priority: a.one("priority").map(String::from),
                 host: a.one("host").map(String::from),
-                hold: a.flags.contains_key("hold"),
+                hold: finding || a.flags.contains_key("hold"),
                 later: a.flags.contains_key("later").then(|| text.to_string()),
                 labels: vec![],
             };
+            if finding {
+                let (mut body, labels, _) = task_body(b, &new, &Op::default())?;
+                let finding_request;
+                for (flag, values) in &a.flags {
+                    if !["board", "source", "goal", "acceptance", "scope", "deps", "type", "runtime", "priority", "host", "evidence", "start", "json"].contains(&flag.as_str()) {
+                        return Err(format!("finding does not accept --{flag}"));
+                    }
+                    if !["acceptance", "scope", "deps", "evidence"].contains(&flag.as_str()) && values.len() != 1 {
+                        return Err(format!("finding --{flag} requires one value"));
+                    }
+                }
+                let board_url = b.url(0);
+                let board_url = board_url.trim_end_matches("/0");
+                if a.all("board").len() != 1 || a.need("board")? != board_url {
+                    return Err("finding --board must match the configured board URL from taskq status --json".into());
+                }
+                let source = a.need("source")?;
+                let parts: Vec<_> = source.split('/').collect();
+                if a.all("source").len() != 1 || parts.len() != 3 || parts.iter().any(|p| p.is_empty() || p.bytes().all(|c| c == b'.') || p.len() > 64 || !p.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))) {
+                    return Err("--source: installation/rule/episode; each part 1-64 ASCII letters, digits, dot, underscore or hyphen".into());
+                }
+                let evidence: Vec<_> = a.all("evidence").into_iter().map(|e| format!("- {e}")).collect();
+                one_line("--evidence", &evidence)?;
+                limit("Evidence", &evidence, 0, 4, 240)?;
+                let identity = json!({"kind": cfg.board.name, "host": cfg.web_host, "repo": cfg.repo, "url": board_url, "source": source});
+                let hash: String = ring::digest::digest(&ring::digest::SHA256, identity.to_string().as_bytes()).as_ref().iter().map(|b| format!("{b:02x}")).collect();
+                op.id = Some(format!("finding.{hash}"));
+                body += &format!("\n## Source\n{source}\n");
+                if !evidence.is_empty() { body += &format!("\n## Evidence\n{}\n", evidence.join("\n")); }
+                finding_request = json!({"board": identity, "start": a.flags.contains_key("start")}).to_string();
+                body += &format!("\nop-id: {}\n", op.id.as_deref().unwrap());
+                let (create, start) = finding_submit(b, &c.raw, root, title, &body, &labels, &finding_request, &op, a.flags.contains_key("start"));
+                if create.ok() { poke(root); }
+                return emit_finding(create, start, json);
+            } else if ["start", "source", "board", "evidence"].iter().any(|f| a.flags.contains_key(*f)) {
+                return Err("--start/--source/--board/--evidence require finding".into());
+            }
             emit(&[add_task(b, root, &c.raw, &new, &op)?], json)
         }
         "start" => emit(&[start_task(b, root, a.num(1)?, &op)?], json),
@@ -1873,6 +1974,140 @@ mod tests {
             assert!(command(&c, "add", &args(extra)).is_err());
         }
         assert_eq!(c.board.issues(None).unwrap().len(), 4);
+    }
+
+    // Chain: F1/F2 local finding -> held issue -> replay. Risk: duplicate or wrong-board writes.
+    #[test]
+    fn finding_cli_held_replay_payload_and_board_boundaries() {
+        let c = Ctx { cfg: cfg(), raw: json!({"create_claim_issue": 1}), board: Box::new(Fake::default()) };
+        c.board.create("Claims", "", &[]).unwrap();
+        let base = ["finding", "Investigate", "--board", "https://board", "--source", "install/rule/episode", "--goal", "G", "--acceptance", "a", "--evidence", "Depends on #999"];
+        let run = |v: &[&str]| command(&c, "finding", &Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap());
+        run(&base).unwrap();
+        run(&base).unwrap();
+        let i = c.board.issue(2).unwrap();
+        assert_eq!(i.labels, ["q-held"]);
+        assert!(i.body.contains("## Source\ninstall/rule/episode"));
+        assert!(i.body.contains("## Evidence\n- Depends on #999"));
+        assert!(core::depends(&i.body).is_empty(), "source evidence is data, never a dependency");
+        assert!(c.board.comments(2).unwrap().is_empty(), "default finding never starts");
+        assert_eq!(c.board.issues(Some(0)).unwrap().len(), 2);
+        for (index, changed) in [(1, "Changed"), (3, "https://other"), (5, "../rule/episode"), (7, "Changed goal"), (9, "Changed acceptance"), (11, "Changed evidence")] {
+            let mut v = base;
+            v[index] = changed;
+            assert!(run(&v).is_err(), "changed field {index}");
+        }
+        for extra in [["--op-id", "different"], ["--repo", "other/repo"], ["--host", "win,mac"], ["--goal", "second"], ["--evidence", "line\nline"]] {
+            assert!(run(&[&base[..], &extra].concat()).is_err());
+        }
+        assert!(run(&[&base[..], &["--start"]].concat()).is_err(), "start choice is immutable; separate start remains available");
+        assert_eq!(c.board.issues(Some(0)).unwrap().len(), 2, "denied input preserves the sole issue");
+        assert_eq!(c.board.comments(1).unwrap().len(), 1, "denied/replayed requests never add another claim");
+        c.board.close(2).unwrap();
+        run(&base).unwrap();
+        assert_eq!(c.board.issues(Some(0)).unwrap().len(), 2, "closed episode never recreates");
+        let mut another = base;
+        another[5] = "install/rule/another";
+        run(&another).unwrap();
+        let stale = Op { id: Some("later-start".into()), revision: Some(1) };
+        assert_eq!(start_one(c.board.as_ref(), &c.cfg.root, 3, &stale).outcome, "stale");
+        assert!(c.board.comments(3).unwrap().is_empty(), "stale start cannot initialize hold");
+        c.board.comment(3, "taskq: unsupported").unwrap();
+        let fresh = Op { revision: Some(0), ..stale };
+        assert!(start_one(c.board.as_ref(), &c.cfg.root, 3, &fresh).ok(), "held default supports standalone start");
+        let mut explicit = base;
+        explicit[5] = "install/rule/explicit";
+        let explicit = [&explicit[..], &["--start", "--json"]].concat();
+        run(&explicit).unwrap();
+        run(&explicit).unwrap();
+        assert_eq!(c.board.issues(Some(0)).unwrap().len(), 4);
+        assert!(service::is_task(&c.board.issue(4).unwrap()));
+        assert_eq!(c.board.comments(4).unwrap().len(), 2, "one hold and one start across retries");
+    }
+
+    #[test]
+    fn finding_start_adapter_failures_preserve_create_and_replay() {
+        // Chain: F2 create readback -> failed admission -> same-ID recovery; no issue or receipt is lost.
+        for failure in ["initialize", "hold-read", "start-read", "readback", "labels"] {
+            let b = Fake::default();
+            b.create("Claims", "", &[]).unwrap();
+            let raw = json!({"create_claim_issue": 1});
+            let op = Op { id: Some("finding.failure".into()), revision: None };
+            let root = cfg().root;
+            let submit = || finding_submit(&b, &raw, &root, "T", "G\nop-id: finding.failure\n", &["q-held".into()], "start:true", &op, true);
+            {
+                let mut st = b.state.borrow_mut();
+                st.fail_issue_read = match failure { "initialize" => Some((2, 2)), "hold-read" => Some((2, 3)), "start-read" => Some((2, 4)), "readback" => Some((2, 5)), _ => None };
+                st.fail_labels = failure == "labels";
+            }
+            let (created, started) = submit();
+            assert_eq!((created.outcome, created.task), ("accepted", 2), "{failure}");
+            let started = started.unwrap();
+            assert_eq!((started.outcome, started.task, started.op_id.as_deref()), ("unknown", 2, Some("finding.failure.start")), "{failure}");
+            assert!(emit_finding(created, Some(started), true).is_err());
+            let (created, started) = submit();
+            assert!(created.ok() && started.unwrap().ok(), "{failure}");
+            let count = b.comments(2).unwrap().len();
+            assert_eq!(count, 2, "one hold and one start: {failure}");
+            let (created, started) = submit();
+            assert!(created.ok() && started.unwrap().ok());
+            assert_eq!(b.comments(2).unwrap().len(), count);
+            assert_eq!(b.issues(Some(0)).unwrap().len(), 2);
+            assert!(service::is_task(&b.issue(2).unwrap()));
+            assert!(!service::is_held(&b.issue(2).unwrap()));
+        }
+    }
+
+    #[test]
+    fn finding_separate_start_receipts_recover_without_recreate() {
+        // Chain: F2 create success -> unknown start -> recovered start. Risk: losing the issue or admitting twice.
+        let b = Fake::default();
+        b.create("Claims", "", &[]).unwrap();
+        let raw = json!({"create_claim_issue": 1});
+        let op = Op { id: Some("finding.test".into()), revision: None };
+        let body = "G\nop-id: finding.test\n";
+        let labels = ["q-held".into()];
+        let root = cfg().root;
+        let submit = || finding_submit(&b, &raw, &root, "T", body, &labels, "start:true", &op, true);
+        b.state.borrow_mut().hide_latest_comment = true;
+        let (created, started) = submit();
+        assert_eq!(created.outcome, "unknown", "a hidden claim cannot create");
+        assert!(started.is_none());
+        b.state.borrow_mut().hide_latest_comment = false;
+        // A claimant whose response was lost may only discover, never POST another issue.
+        b.create("T", body, &labels).unwrap();
+        b.state.borrow_mut().hide_latest_comment = true;
+        let (created, started) = submit();
+        assert_eq!((created.outcome, created.task), ("accepted", 2));
+        assert_eq!(started.unwrap().outcome, "unknown");
+        assert_eq!(b.issue(2).unwrap().labels, ["q-held"]);
+        b.state.borrow_mut().hide_latest_comment = false;
+        let (created, started) = submit();
+        assert!(created.ok());
+        assert!(started.unwrap().ok());
+        assert_eq!(b.issue(2).unwrap().labels, ["q-ready", "taskq"]);
+        let count = b.comments(2).unwrap().len();
+        let (created, started) = submit();
+        assert!(created.ok() && started.unwrap().ok());
+        assert_eq!(b.comments(2).unwrap().len(), count);
+        assert_eq!(b.issues(Some(0)).unwrap().len(), 2);
+        b.labels(2, &["q-held".into()], &["q-ready".into(), "taskq".into()]).unwrap();
+        assert!(submit().1.unwrap().ok(), "retry repairs partial eligibility projection");
+        assert_eq!(b.issue(2).unwrap().labels, ["q-ready", "taskq"]);
+        assert_eq!(b.comments(2).unwrap().len(), count, "projection recovery adds no log entries");
+        b.comment(2, &entry("spawn", &["worker", "codex:s", "win"], None, "")).unwrap();
+        assert_eq!(submit().1.unwrap().state, Some("doing"), "replay never restarts active work");
+        b.close(2).unwrap();
+        assert_eq!(submit().0.state, Some("closed"));
+        assert_eq!(b.issues(Some(0)).unwrap().len(), 2);
+        let rejected_op = Op { id: Some("finding.rejected".into()), revision: None };
+        let rejected_body = "G\nop-id: finding.rejected\n";
+        let n = claimed_create(&b, &raw, "U", rejected_body, &labels, "start:true", &rejected_op).unwrap();
+        b.close(n).unwrap();
+        let (created, started) = finding_submit(&b, &raw, &root, "U", rejected_body, &labels, "start:true", &rejected_op, true);
+        assert_eq!((created.outcome, created.task), ("accepted", n));
+        assert_eq!(started.unwrap().outcome, "rejected");
+        assert_eq!(b.issues(Some(0)).unwrap().len(), 3, "rejected start keeps its existing issue");
     }
 
     // Chain: §1 claimed create -> readback/retry. Risk: duplicate issues after a race, restart or lost response.

@@ -32,3 +32,17 @@ Extract the reviewed composer/review primitives into TaskQ's versioned shared as
 - A4: real forge create/readback, authorization and failure recovery must qualify before release. Browser simulations prove neither board writes nor execution.
 
 Delivery: #948 canonical create/recovery; #949 shared component depends on #948 and #938. DashQ #53 consumes the released component and operation contract; observation work stays independent.
+
+## Local CLI delivery
+
+The owner-approved #948 scope is the authenticated local CLI on its configured board. Remote consumer create/start grants and the shared composer remain separate prerequisites. The binding syntax, claim and receipt rules live in [taskq.md §1](../../taskq.md#1-tasks).
+
+Read the destination from `taskq status --json` (`board.url`), then submit the reviewed task:
+
+```text
+taskq finding "Investigate repeated failures" --board https://github.com/owner/project/issues --source installation/rule/episode --goal "Explain the observed failure." --acceptance "Report the cause with evidence." --evidence "Three failed checks in this episode." --json
+```
+
+The default creates held work. Add `--start` only when the reviewed request explicitly authorizes admission; its receipt is separate from create. Keep that choice and all request fields unchanged on replay. To start a task created with the default choice later, use `taskq start N --op-id ID`. The source IDs are opaque identifiers, not paths or links; evidence is reviewed, sanitized text supplied by the owner, never collected by this command. Preserve the draft in the calling client.
+
+The same board/source derives the same operation ID across local clients and restarts. An unknown claim/create reconciles read-only and may remain unknown permanently. No consumer enrollment or answer grant authorizes this CLI. Real-forge ordering, create/readback and failure qualification are still required before release; deterministic adapter checks do not establish that qualification.

@@ -31,17 +31,26 @@ pub fn destination(url: &str) -> Res<String> {
 
 /// The active connection, read without creating state (coreq's first read writes a new file).
 pub fn active(install: &Path) -> Res<Option<Value>> {
-    if !dir(install).join("connection.json").exists() { return Ok(None) }
+    if state(install)?.is_none() { return Ok(None) }
     enroll::active(&dir(install))
 }
 
-/// Connection file for `connection status`; never printed whole (it holds the credential).
+/// Connection file for `connection status`; never printed whole (it holds the credential). A file that is not
+/// coreq's state shape reads unknown and is kept, never as "no connection".
 pub fn state(install: &Path) -> Res<Option<Value>> {
-    match fs::read_to_string(dir(install).join("connection.json")) {
-        Ok(t) => serde_json::from_str(&t).map(Some).map_err(|_| "connection state unreadable; file kept".into()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("connection state: {e}")),
-    }
+    let bad = || "connection: unknown (connection state unreadable; file kept)".to_string();
+    let s: Value = match fs::read_to_string(dir(install).join("connection.json")) {
+        Ok(t) => serde_json::from_str(&t).map_err(|_| bad())?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("connection: unknown (connection state: {e})")),
+    };
+    let text = |v: &Value, k: &str| v[k].as_str().is_some_and(|t| !t.is_empty());
+    let conn = |v: &Value, keys: &[&str]| v.is_null() || (v.is_object() && keys.iter().all(|k| text(v, k)));
+    let valid = s.is_object() && text(&s, "installation")
+        && conn(&s["pending"], &["destination"]) && conn(&s["pending"]["staged"], &["destination", "credential"])
+        && conn(&s["active"], &["destination", "credential"])
+        && s["revoke"].as_array().is_some_and(|r| r.iter().all(|v| v.is_object() && text(v, "credential")));
+    if valid { Ok(Some(s)) } else { Err(bad()) }
 }
 
 /// `taskq enroll`: browser or headless approval of this board's scope, then the first snapshot until DashQ
@@ -162,7 +171,7 @@ impl Sender {
 
     fn start(&mut self, install: &Path, snap: Option<&Snapshot>, now: u64) -> Result<(), String> {
         let d = dir(install);
-        let Some(a) = active(install).map_err(|e| format!("unknown: {e}"))? else {
+        let Some(a) = active(install)? else {
             if self.sent.take().is_some() { self.outcome = Some("disconnected".into()) }
             // disconnected offline: queued revokes retry until DashQ confirms them
             if state(install).ok().flatten().is_some_and(|s| s["revoke"].as_array().is_some_and(|r| !r.is_empty())) {
@@ -392,20 +401,52 @@ mod tests {
         let mut dash = Dash { online: true, revoked: vec![] };
         assert_eq!(disconnect_with(&install, &mut dash).unwrap(), None, "no state: none");
         // code shown, not approved yet: nothing granted
-        write(json!({"device_code": "x", "staged": null}), Value::Null, json!([]));
+        write(json!({"destination": "https://d/machine", "device_code": "x", "staged": null}), Value::Null, json!([]));
         assert_eq!(disconnect_with(&install, &mut dash).unwrap().as_deref(), Some("disconnected: pairing cancelled; nothing granted to revoke"));
         assert!(state(&install).unwrap().unwrap()["pending"].is_null(), "enroll cannot resume the pairing");
         assert_eq!(disconnect_with(&install, &mut dash).unwrap(), None, "second disconnect says none");
         // approved and staged, ack not sent, beside an active connection: both credentials revoked
-        write(json!({"device_code": "x", "staged": conn("staged")}), conn("active"), json!([]));
+        write(json!({"destination": "https://d/machine", "device_code": "x", "staged": conn("staged")}), conn("active"), json!([]));
         assert_eq!(disconnect_with(&install, &mut dash).unwrap().as_deref(), Some("disconnected: pairing cancelled; sending stopped; revoke confirmed"));
         assert_eq!(dash.revoked, ["staged", "active"]);
         // offline: the revoke stays queued for the service, reported as pending
-        write(json!({"device_code": "x", "staged": conn("s2")}), Value::Null, json!([]));
+        write(json!({"destination": "https://d/machine", "device_code": "x", "staged": conn("s2")}), Value::Null, json!([]));
         let mut off = Dash { online: false, revoked: vec![] };
         assert_eq!(disconnect_with(&install, &mut off).unwrap().as_deref(), Some("disconnected: pairing cancelled; 1 revoke pending, the service retries it"));
         let s = state(&install).unwrap().unwrap();
         assert!(s["pending"].is_null() && s["revoke"][0]["credential"] == "s2");
+        fs::remove_dir_all(install).unwrap();
+    }
+
+    // Chain: damaged connection.json -> connection status, disconnect, service pass. Risk: valid JSON of the wrong
+    // shape reading as "connection: none" (R12) or being overwritten, losing a credential DashQ still honours.
+    #[test]
+    fn malformed_connection_state_reads_unknown_and_is_kept() {
+        let install = std::env::temp_dir().join(format!("taskq-malformed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&install);
+        fs::create_dir_all(dir(&install)).unwrap();
+        let ok = json!({"installation": "i", "pending": null, "active": {"destination": "https://d/machine", "credential": "c"}, "revoke": []});
+        let mut bad = vec![json!({}), json!([]), json!(null), json!("x")];
+        for (k, v) in [("installation", json!(1)), ("pending", json!("x")), ("pending", json!({"staged": null})),
+            ("active", json!({"destination": "https://d/machine"})), ("active", json!([])), ("revoke", json!(null)), ("revoke", json!([1]))] {
+            let mut s = ok.clone();
+            s[k] = v;
+            bad.push(s);
+        }
+        let path = dir(&install).join("connection.json");
+        fs::write(&path, ok.to_string()).unwrap();
+        assert!(state(&install).is_ok() && active(&install).unwrap().is_some(), "coreq's own shape reads");
+        for b in bad {
+            fs::write(&path, b.to_string()).unwrap();
+            let unknown = |r: Res<String>| assert!(r.unwrap_err().starts_with("connection: unknown"), "{b}");
+            unknown(state(&install).map(|_| String::new()));
+            unknown(active(&install).map(|_| String::new()));
+            unknown(disconnect_with(&install, &mut Dash { online: true, revoked: vec![] }).map(|_| String::new()));
+            let mut s = Sender::default();
+            assert!(s.tick(&install, Some(&snap("o/a")), 1).unwrap().contains("unknown"), "{b}");
+            assert!(s.job.is_none());
+            assert_eq!(fs::read_to_string(&path).unwrap(), b.to_string(), "file kept");
+        }
         fs::remove_dir_all(install).unwrap();
     }
 

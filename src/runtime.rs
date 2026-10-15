@@ -466,7 +466,9 @@ pub fn brief(env: &Env, l: &Launch) -> String {
     format!("{head}Changing an existing test or golden trace while preserving every assertion is a repair, named in --text with the defect it fixes; weakening or deleting an assertion needs a changed rule in the same diff and is named in --text (section 7 step 4).\n{body}Then stop. Everything written through taskq is public: no secrets or paths outside the repository.\n")
 }
 
+#[cfg(test)]
 const SPECQ_REVISION: &str = "2d030bdea5e8fd9095daea2069954ff6091ea90e";
+const SPECQ_REFS: &str = "https://github.com/taskqorg/specq.git/info/refs?service=git-upload-pack";
 /// The specq shared core, sent whole at every start and continuation (§ 8 Rule delivery).
 const SPECQ_CORE: &[&str] = &[
     "engineering/principles.md", "engineering/spec-first.md", "engineering/ponytail.md", "engineering/agent-workflow.md",
@@ -495,40 +497,96 @@ fn rule_file(url: &str) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|_| "invalid UTF-8".into())
 }
 
-fn specq_dir(root: &Path) -> PathBuf {
-    root.join(".taskq").join("specq").join(SPECQ_REVISION)
+fn specq_dir(root: &Path, revision: &str) -> PathBuf {
+    root.join(".taskq").join("specq").join(revision)
 }
 
 fn refused(what: &str, e: impl std::fmt::Display) -> StartError {
-    StartError { message: format!("specq@{SPECQ_REVISION} {what}: {e}"), reportable: false }
+    StartError { message: format!("rules {what}: {e}"), reportable: false }
+}
+
+fn revision_id(text: &str) -> bool {
+    if text.len()!=40 {return false;}
+    let mut nonzero=false;
+    for byte in text.bytes() {
+        if !(byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {return false;}
+        nonzero|=byte!=b'0';
+    }
+    nonzero
+}
+
+fn advertised_revision(text: &str) -> Result<String, StartError> {
+    let invalid=||refused("shared revision","invalid Git reference advertisement");
+    if !text.starts_with("001e# service=git-upload-pack\n0000") {return Err(invalid());}
+    let mut input=text.as_bytes();let mut selected=None;let mut flushed=false;
+    while !input.is_empty() {
+        let length=std::str::from_utf8(input.get(..4).ok_or_else(invalid)?).ok()
+            .and_then(|h|usize::from_str_radix(h,16).ok()).ok_or_else(invalid)?;
+        input=&input[4..];
+        if length==0 {flushed=true;continue;}
+        if !(4..=65520).contains(&length) {return Err(invalid());}
+        let packet=input.get(..length-4).ok_or_else(invalid)?;input=&input[length-4..];flushed=false;
+        let mut end=0;while end<packet.len() && packet[end]!=0 {end+=1;}
+        let reference=&packet[..end];
+        let reference=reference.strip_suffix(b"\n").unwrap_or(reference);
+        if reference.get(41..)==Some(b"refs/heads/main") {
+            let sha=std::str::from_utf8(&reference[..40]).map_err(|_|invalid())?;
+            if reference[40]!=b' ' || !revision_id(sha) || selected.is_some() {return Err(invalid());}
+            selected=Some(sha.to_string());
+        }
+    }
+    if !flushed {return Err(invalid());}
+    selected.ok_or_else(||refused("shared revision","refs/heads/main is absent"))
+}
+
+fn shared_revision(root: &Path, fetch: &mut impl FnMut(&str)->Result<String,String>) -> Result<String,StartError> {
+    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e|refused("shared revision clock",e))?.as_secs();
+    shared_revision_at(root,now,fetch)
+}
+
+fn shared_revision_at(root: &Path, now: u64, fetch: &mut impl FnMut(&str)->Result<String,String>) -> Result<String,StartError> {
+    let path=root.join(".taskq/specq/source.json");let mut cached=String::new();
+    if File::open(&path).and_then(|f|f.take(1025).read_to_string(&mut cached)).is_ok() && cached.len()<=1024 {
+        if let Ok(value)=serde_json::from_str::<serde_json::Value>(&cached) {
+            if let (Some(revision),Some(checked))=(value["revision"].as_str(),value["checked_at"].as_u64()) {
+                if revision_id(revision) && now.checked_sub(checked).is_some_and(|age|age<60) {return Ok(revision.into());}
+            }
+        }
+    }
+    let advertised=fetch(SPECQ_REFS).map_err(|e|refused("shared revision freshness",e))?;
+    if advertised.len()>RULES_CAP {return Err(refused("shared revision","oversized advertisement"));}
+    let revision=advertised_revision(&advertised)?;
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e|refused("shared revision cache",e))?;
+    publish_rule(&path,&serde_json::json!({"revision":revision,"checked_at":now}).to_string()).map_err(|e|refused("shared revision cache",e))?;
+    Ok(revision)
 }
 
 /// A pinned specq file from `<root>/.taskq/specq/<revision>/`, fetched once when missing or invalid there (R1: a cache).
-fn pinned(root: &Path, file: &str, fetch: &mut impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
-    let path = specq_dir(root).join(file);
+fn pinned(root: &Path, revision: &str, file: &str, fetch: &mut impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
+    let path = specq_dir(root,revision).join(file);
     let metadata = path.with_extension("cache.json");
     let mut body = String::new();
     if File::open(&path).and_then(|f| f.take(RULES_CAP as u64+1).read_to_string(&mut body)).is_ok()
         && !body.trim().is_empty() && body.len()<=RULES_CAP {
         let mut stored = String::new();
         if File::open(&metadata).and_then(|f|f.take(1025).read_to_string(&mut stored)).is_ok() && stored.len()<=1024
-            && serde_json::from_str::<serde_json::Value>(&stored).ok()==Some(rule_cache(file,&body)) {
+            && serde_json::from_str::<serde_json::Value>(&stored).ok()==Some(rule_cache(revision,file,&body)) {
             return Ok(body);
         }
     }
-    let body = fetch(&format!("https://raw.githubusercontent.com/taskqorg/specq/{SPECQ_REVISION}/{file}")).map_err(|e| refused(file, e))?;
+    let body = fetch(&format!("https://raw.githubusercontent.com/taskqorg/specq/{revision}/{file}")).map_err(|e| refused(file, e))?;
     if body.trim().is_empty() || body.len()>RULES_CAP { return Err(refused(file, "empty or oversized")); }
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e|refused(file,e))?;
-    publish_rule(&path,&body).and_then(|_|publish_rule(&metadata,&rule_cache(file,&body).to_string())).map_err(|e|refused(file,e))?;
+    publish_rule(&path,&body).and_then(|_|publish_rule(&metadata,&rule_cache(revision,file,&body).to_string())).map_err(|e|refused(file,e))?;
     Ok(body)
 }
 
-fn rule_cache(file: &str, body: &str) -> serde_json::Value {
+fn rule_cache(revision: &str, file: &str, body: &str) -> serde_json::Value {
     use std::fmt::Write as _;
     let digest=ring::digest::digest(&ring::digest::SHA256,body.as_bytes());
     let mut hex=String::with_capacity(64);
     for byte in digest.as_ref() {write!(&mut hex,"{byte:02x}").expect("writing to String cannot fail");}
-    serde_json::json!({"revision":SPECQ_REVISION,"file":file,"sha256":hex})
+    serde_json::json!({"revision":revision,"file":file,"sha256":hex})
 }
 
 fn publish_rule(path: &Path, body: &str) -> Result<(),String> {
@@ -573,7 +631,9 @@ fn rule_text(root: &Path, task: &str, resume: bool, fetch: impl FnMut(&str) -> R
 
 /// The mandatory bodies are repeated so continuation/compaction cannot silently retain old rules.
 fn rules(root: &Path, resume: bool, mut fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
-    let dir = specq_dir(root);
+    let revision=shared_revision(root,&mut fetch)?;
+    let _snapshot=tracing::info_span!("taskq.rules.snapshot",shared_spec=revision.as_str()).entered();
+    let dir = specq_dir(root,&revision);
     let selected = project_contract(root)?;
     let spec = selected.as_ref().map_or_else(command_contract, |p|p.display().to_string());
     let contract = match selected {
@@ -582,9 +642,9 @@ fn rules(root: &Path, resume: bool, mut fetch: impl FnMut(&str) -> Result<String
     };
     if contract.trim().is_empty() { return Err(refused("contract", "empty")); }
     // the header names the cache: every pinned file is there, at start and at resume
-    let core = SPECQ_CORE.iter().map(|f| pinned(root, f, &mut fetch)).collect::<Result<Vec<_>, _>>()?;
+    let core = SPECQ_CORE.iter().map(|f| pinned(root, &revision, f, &mut fetch)).collect::<Result<Vec<_>, _>>()?;
     let mut text = format!(
-        "TaskQ rules: specq@{SPECQ_REVISION} at `{}`; contract `{spec}`.\n\
+        "TaskQ rules: specq@{revision} at `{}`; contract `{spec}`.\n\
          Precedence: the project contract overrides shared rules where they conflict.\n\
          These rules apply to this turn, including continuations. Apply them to the work; acknowledgement alone is not evidence.\n\
          Evidence: cite the applied rule as R<n> or § n; a fix records the failure before and the pass after.\n",
@@ -597,7 +657,7 @@ fn rules(root: &Path, resume: bool, mut fetch: impl FnMut(&str) -> Result<String
     text.push_str(&format!("\n--- contract {spec} ---\n{contract}\n"));
     for (file, body) in SPECQ_CORE.iter().zip(&core) { text.push_str(&format!("\n--- specq/{file} ---\n{body}\n")); }
     text.push_str(&format!("{INDEX} (read on demand under `{}`):\n", dir.display()));
-    for file in SPECQ_INDEX { text.push_str(&format!("- {file}: {}\n", heading(&pinned(root, file, &mut fetch)?))); }
+    for file in SPECQ_INDEX { text.push_str(&format!("- {file}: {}\n", heading(&pinned(root, &revision, file, &mut fetch)?))); }
     text.push_str("Index of project docs (read on demand in your worktree):\n");
     for (path, title) in docs(root)? { text.push_str(&format!("- {path}: {title}\n")); }
     if text.len() > RULES_CAP { return Err(refused("rules", format!("{} bytes over the {RULES_CAP}-byte cap", text.len() - RULES_CAP))); }
@@ -607,7 +667,7 @@ fn rules(root: &Path, resume: bool, mut fetch: impl FnMut(&str) -> Result<String
 /// § 8 Rule delivery after a Claude compaction: restore the current mandatory bodies and index.
 pub fn compact(root: &Path, role: &str, task: u64, attempt: u64) -> Result<String, StartError> {
     let text = rules(root, true, rule_file)?;
-    log!("specq@{SPECQ_REVISION} loaded for {role} #{task} attempt {attempt} (compact, {} bytes)", text.len());
+    log!("rules loaded for {role} #{task} attempt {attempt} (compact, {} bytes)", text.len());
     rules_line(&attempt_log(root, role, task, attempt), "compact", &text).map_err(|e| StartError::io(e, None))?;
     Ok(text)
 }
@@ -620,7 +680,7 @@ pub fn pm(root: &Path, phase: &str) -> Result<String, StartError> {
 
 fn pm_rules(root: &Path, phase: &str, fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
     let text = rules(root, phase == "compact", fetch)?;
-    log!("specq@{SPECQ_REVISION} loaded for pm ({phase}, {} bytes)", text.len());
+    log!("rules loaded for pm ({phase}, {} bytes)", text.len());
     Ok(text)
 }
 
@@ -704,7 +764,7 @@ fn spawn_inner(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     log!("#{} attempt {} access {}", l.task, l.attempt, access.line());
     let text = turn_text(env, l, rule_file)?;
     let phase = if l.resume.is_some() { "resume" } else { "start" };
-    log!("specq@{SPECQ_REVISION} loaded for {} #{} attempt {} ({phase}, {} bytes)", l.role, l.task, l.attempt, text.len());
+    log!("rules loaded for {} #{} attempt {} ({phase}, {} bytes)", l.role, l.task, l.attempt, text.len());
     let log = log_path(env.root, l);
     rules_line(&log, phase, &text).map_err(|e| StartError::io(e, None))?;
     if l.rt == "codex-app" {
@@ -733,7 +793,8 @@ pub fn rules_line(log: &Path, phase: &str, text: &str) -> std::io::Result<()> {
     let header = rules.split("\n\n").next().unwrap_or_default();
     let bodies = rules.matches("\n--- contract ").count() + rules.matches("\n--- specq/").count();
     let index = rules.find(INDEX).map_or(0, |i| rules[i..].lines().filter(|l| l.starts_with("- ")).count());
-    let line = serde_json::json!({"type": "taskq.rules", "phase": phase, "header": header, "bodies": bodies, "index": index, "bytes": rules.len()});
+    let revision=rules.strip_prefix("TaskQ rules: specq@").and_then(|s|s.split_whitespace().next()).filter(|s|revision_id(s));
+    let line = serde_json::json!({"type": "taskq.rules", "phase": phase, "header": header, "shared_revision": revision, "bodies": bodies, "index": index, "bytes": rules.len()});
     writeln!(File::options().create(true).append(true).open(log)?, "{line}")
 }
 
@@ -1388,7 +1449,66 @@ mod tests {
     }
 
     fn rule(url: &str) -> Result<String, String> {
+        if url==SPECQ_REFS {return Ok(advertisement(SPECQ_REVISION));}
         Ok(format!("# Rule from {url}\nApply this rule."))
+    }
+
+    fn advertisement(revision: &str) -> String {
+        let line=format!("{revision} refs/heads/main\n");
+        format!("001e# service=git-upload-pack\n0000{:04x}{line}0000",line.len()+4)
+    }
+
+    #[test]
+    fn git_advertisement_requires_complete_unambiguous_main_reference() {
+        let valid=advertisement(SPECQ_REVISION);assert_eq!(advertised_revision(&valid).unwrap(),SPECQ_REVISION);
+        for cut in 0..valid.len() {assert!(advertised_revision(&valid[..cut]).is_err(),"truncation {cut}");}
+        for bad in [valid.replace("refs/heads/main","refs/heads/main-other"),valid.replace(SPECQ_REVISION,&"z".repeat(40)),
+            valid.clone()+"0001",valid.clone()+&valid,valid.replace("003d","ffff"),"0000".into()] {
+            assert!(advertised_revision(&bad).is_err(),"{bad:?}");
+        }
+        let head=format!("{SPECQ_REVISION} HEAD\0multi_ack thin-pack\n");
+        let with_head=format!("001e# service=git-upload-pack\n0000{:04x}{head}{}",head.len()+4,&valid[34..]);
+        assert_eq!(advertised_revision(&with_head).unwrap(),SPECQ_REVISION);
+        let other=format!("{SPECQ_REVISION} refs/heads/main-other\n");
+        assert!(advertised_revision(&format!("001e# service=git-upload-pack\n0000{:04x}{other}0000",other.len()+4)).is_err());
+    }
+
+    #[test]
+    fn shared_revision_refreshes_at_bound_and_never_falls_back_after_failure() {
+        let root=rules_root("source-freshness");let first="a".repeat(40);let second="b".repeat(40);
+        assert_eq!(shared_revision_at(&root,100,&mut |url|{assert_eq!(url,SPECQ_REFS);Ok(advertisement(&first))}).unwrap(),first);
+        assert_eq!(shared_revision_at(&root,159,&mut |_|Err("offline".into())).unwrap(),first);
+        assert!(shared_revision_at(&root,160,&mut |_|Err("offline".into())).unwrap_err().to_string().contains("freshness"));
+        assert_eq!(shared_revision_at(&root,160,&mut |_|Ok(advertisement(&second))).unwrap(),second);
+        assert!(shared_revision_at(&root,159,&mut |_|Err("future cache".into())).is_err());
+        assert!(shared_revision_at(&root,220,&mut |_|Ok("invalid".into())).is_err());
+        assert!(shared_revision_at(&root,220,&mut |_|Ok("x".repeat(RULES_CAP+1))).is_err());
+        let path=root.join(".taskq/specq/source.json");
+        for bad in ["{".to_string(),"{}".into(),serde_json::json!({"revision":"../escape","checked_at":100}).to_string(),"x".repeat(1025)] {
+            std::fs::write(&path,bad).unwrap();assert!(shared_revision_at(&root,101,&mut |_|Err("offline".into())).is_err());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_moving_shared_head_cannot_mix_bodies_and_resume_gets_the_new_snapshot() {
+        let root=rules_root("snapshot-consistency");let first="a".repeat(40);let second="b".repeat(40);let mut files=Vec::new();
+        let initial=rules(&root,false,|url| {
+            if url==SPECQ_REFS {return Ok(advertisement(&first));}
+            files.push(url.to_string());
+            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            std::fs::create_dir_all(root.join(".taskq/specq")).unwrap();
+            std::fs::write(root.join(".taskq/specq/source.json"),serde_json::json!({"revision":second,"checked_at":now}).to_string()).unwrap();
+            rule(url)
+        }).unwrap();
+        assert!(initial.starts_with(&format!("TaskQ rules: specq@{first} ")));
+        assert_eq!(files.len(),SPECQ_CORE.len()+SPECQ_INDEX.len());
+        assert!(files.iter().all(|url|url.contains(&format!("/{first}/"))));
+        let resumed=rules(&root,true,rule).unwrap();
+        assert!(resumed.starts_with(&format!("TaskQ rules: specq@{second} ")));
+        assert!(!resumed.contains(&format!("/{first}/")));
+        assert_eq!(resumed.matches("\n--- specq/").count(),SPECQ_CORE.len());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn url(file: &str) -> String {
@@ -1401,7 +1521,7 @@ mod tests {
     fn rules_reach_every_runtime_role_and_resume() {
         let root = rules_root("roles");
         let env = Env { root: &root, exe: Path::new("/i/taskq"), install: Path::new("/i"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
-        let dir = specq_dir(&root).display().to_string();
+        let dir = specq_dir(&root,SPECQ_REVISION).display().to_string();
         for rt in ["claude", "codex", "codex-app"] {
             for role in ["worker", "reviewer"] {
                 for resume in [None, Some("Owner answer: preserve current work.\nLiteral $HOME stays text.".into())] {
@@ -1435,6 +1555,7 @@ mod tests {
                     std::fs::remove_file(&log).ok();
                     rules_line(&log, "start", &text).unwrap();
                     let v: serde_json::Value = serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
+                    assert_eq!(v["shared_revision"],SPECQ_REVISION);
                     assert_eq!((v["type"].as_str(), v["header"].as_str(), v["bodies"].as_u64()), (Some("taskq.rules"), Some(header), Some(bodies as u64)));
                     assert_eq!(v["index"].as_u64(), Some(SPECQ_INDEX.len() as u64 + 2));
                 }
@@ -1557,40 +1678,40 @@ mod tests {
     }
     #[test]
     fn pinned_cache_rejects_changed_utf8_wrong_identity_and_partial_pairs() {
-        assert_eq!(rule_cache("fixture","abc")["sha256"],"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        let root=rules_root("cache-integrity");let file=SPECQ_CORE[0];let path=specq_dir(&root).join(file);
-        let expected=pinned(&root,file,&mut rule).unwrap();
+        assert_eq!(rule_cache(SPECQ_REVISION,"fixture","abc")["sha256"],"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        let root=rules_root("cache-integrity");let file=SPECQ_CORE[0];let path=specq_dir(&root,SPECQ_REVISION).join(file);
+        let expected=pinned(&root,SPECQ_REVISION,file,&mut rule).unwrap();
         std::fs::write(&path,"# Changed valid UTF-8 rule\n").unwrap();
-        assert!(pinned(&root,file,&mut |_|Err("offline".into())).is_err(),"altered nonempty cache must not be accepted");
-        assert_eq!(pinned(&root,file,&mut rule).unwrap(),expected);
+        assert!(pinned(&root,SPECQ_REVISION,file,&mut |_|Err("offline".into())).is_err(),"altered nonempty cache must not be accepted");
+        assert_eq!(pinned(&root,SPECQ_REVISION,file,&mut rule).unwrap(),expected);
         let metadata=path.with_extension("cache.json");
         for key in ["revision","file","sha256"] {
-            let mut state=rule_cache(file,&expected);state[key]=serde_json::json!("wrong");
+            let mut state=rule_cache(SPECQ_REVISION,file,&expected);state[key]=serde_json::json!("wrong");
             std::fs::write(&metadata,state.to_string()).unwrap();
-            assert!(pinned(&root,file,&mut |_|Err("offline".into())).is_err(),"{key}");
-            assert_eq!(pinned(&root,file,&mut rule).unwrap(),expected);
+            assert!(pinned(&root,SPECQ_REVISION,file,&mut |_|Err("offline".into())).is_err(),"{key}");
+            assert_eq!(pinned(&root,SPECQ_REVISION,file,&mut rule).unwrap(),expected);
         }
         for bad in [None,Some("{"),Some("")] {
             if let Some(text)=bad {std::fs::write(&metadata,text).unwrap();} else {std::fs::remove_file(&metadata).unwrap();}
-            assert!(pinned(&root,file,&mut |_|Err("offline".into())).is_err());
-            assert_eq!(pinned(&root,file,&mut rule).unwrap(),expected);
+            assert!(pinned(&root,SPECQ_REVISION,file,&mut |_|Err("offline".into())).is_err());
+            assert_eq!(pinned(&root,SPECQ_REVISION,file,&mut rule).unwrap(),expected);
         }
         std::fs::write(&path,"x".repeat(RULES_CAP+1)).unwrap();
-        assert!(pinned(&root,file,&mut |_|Err("offline".into())).is_err());
-        assert!(pinned(&root,file,&mut |_|Ok("x".repeat(RULES_CAP+1))).is_err());
-        assert_eq!(pinned(&root,file,&mut rule).unwrap(),expected);
-        assert_eq!(pinned(&root,file,&mut |_|Err("must use verified cache".into())).unwrap(),expected);
+        assert!(pinned(&root,SPECQ_REVISION,file,&mut |_|Err("offline".into())).is_err());
+        assert!(pinned(&root,SPECQ_REVISION,file,&mut |_|Ok("x".repeat(RULES_CAP+1))).is_err());
+        assert_eq!(pinned(&root,SPECQ_REVISION,file,&mut rule).unwrap(),expected);
+        assert_eq!(pinned(&root,SPECQ_REVISION,file,&mut |_|Err("must use verified cache".into())).unwrap(),expected);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn pinned_cache_parallel_repairs_publish_complete_files_without_collisions() {
         let root=rules_root("cache-concurrent");let barrier=std::sync::Arc::new(std::sync::Barrier::new(8));let file=SPECQ_CORE[0];
         std::thread::scope(|scope| {
-            let threads=(0..8).map(|_| {let root=&root;let barrier=barrier.clone();scope.spawn(move||pinned(root,file,&mut |url|{barrier.wait();rule(url)}))}).collect::<Vec<_>>();
+            let threads=(0..8).map(|_| {let root=&root;let barrier=barrier.clone();scope.spawn(move||pinned(root,SPECQ_REVISION,file,&mut |url|{barrier.wait();rule(url)}))}).collect::<Vec<_>>();
             for thread in threads {assert_eq!(thread.join().unwrap().unwrap(),rule(&url(file)).unwrap());}
         });
-        assert_eq!(pinned(&root,file,&mut |_|Err("must use verified cache".into())).unwrap(),rule(&url(file)).unwrap());
-        assert_eq!(std::fs::read_dir(specq_dir(&root).join("engineering")).unwrap().count(),2,"no staging files left");
+        assert_eq!(pinned(&root,SPECQ_REVISION,file,&mut |_|Err("must use verified cache".into())).unwrap(),rule(&url(file)).unwrap());
+        assert_eq!(std::fs::read_dir(specq_dir(&root,SPECQ_REVISION).join("engineering")).unwrap().count(),2,"no staging files left");
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1599,18 +1720,18 @@ mod tests {
         std::fs::write(root.join("taskq.md"), "# Project contract\nProject rule.\n").unwrap();
         let mut fetched = Vec::new();
         let text = rule_text(&root, "task", false, |u| { fetched.push(u.to_string()); rule(u) }).unwrap();
-        assert_eq!(fetched.len(), SPECQ_CORE.len() + SPECQ_INDEX.len(), "each pinned file once");
+        assert_eq!(fetched.len(), 1 + SPECQ_CORE.len() + SPECQ_INDEX.len(), "source reference and each pinned file once");
         assert!(text.contains(&format!("--- contract {} ---\n# Project contract\nProject rule.\n", root.join("taskq.md").display())));
         for file in SPECQ_CORE.iter().chain(SPECQ_INDEX) {
             assert!(fetched.contains(&url(file)));
-            assert_eq!(std::fs::read_to_string(specq_dir(&root).join(file)).unwrap(), rule(&url(file)).unwrap());
+            assert_eq!(std::fs::read_to_string(specq_dir(&root,SPECQ_REVISION).join(file)).unwrap(), rule(&url(file)).unwrap());
         }
         for resume in [false, true] {
             assert!(rule_text(&root, "task", resume, |u| Err(format!("refetched {u}"))).is_ok(), "the cache serves the pin");
         }
         // a cached file that went bad is fetched again; a failed fetch refuses
-        std::fs::write(specq_dir(&root).join(SPECQ_CORE[3]), [0xffu8, 0xfe]).unwrap();
-        std::fs::write(specq_dir(&root).join(SPECQ_INDEX[0]), "").unwrap();
+        std::fs::write(specq_dir(&root,SPECQ_REVISION).join(SPECQ_CORE[3]), [0xffu8, 0xfe]).unwrap();
+        std::fs::write(specq_dir(&root,SPECQ_REVISION).join(SPECQ_INDEX[0]), "").unwrap();
         for resume in [false, true] {
             for bad in [Err("offline".to_string()), Ok(" \n".to_string())] {
                 let e = rule_text(&root, "task", resume, |_| bad.clone()).unwrap_err().to_string();

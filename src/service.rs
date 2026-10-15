@@ -748,6 +748,7 @@ impl<'a> Service<'a> {
     /// One pass of § 4. Tasks written to in a step are left alone by later steps until the next pass re-reads them.
     pub fn pass(&mut self) -> Result<(), String> {
         if self.host.is_none() {
+            if let Err(e) = crate::profile::prune(&self.cfg.install) { eprintln!("taskq: telemetry unknown: {e}"); }
             crate::data::trim_tail(&self.cfg.install.join("taskq.log"), crate::data::LOG_MAX);
         }
         let r = crate::profile::measure("service.pass", || self.pass_inner());
@@ -1304,7 +1305,7 @@ mod tests {
             text.push_str(&terminal);
             std::fs::write(&path, &text).unwrap();
             let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-            assert!(crate::profile::selftest(&root, "o/r", &vec![], 300).unwrap_err().contains("retention bound"));
+            assert!(crate::profile::selftest(&root, "o/r", &vec![], 300).is_ok(), "legacy log size no longer stops collection");
             let lock = crate::profile::log_lock(&path).unwrap();
             s.pass().unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "busy lock preserves evidence");
@@ -1318,6 +1319,9 @@ mod tests {
             crate::profile::append_line(&path, newest).unwrap();
             assert!(crate::profile::selftest(&root, "o/r", &vec![], 300).unwrap().contains("no overdue"));
             assert!(!crate::profile::report(&root).contains("collection stopped"));
+            drop(writer);
+            std::fs::remove_dir_all(&root).unwrap();
+            std::fs::create_dir_all(&root).unwrap();
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1866,11 +1870,11 @@ mod tests {
         c.install = dir.clone();
         c.root = dir.clone();
         crate::profile::open(&dir, &c.repo, "mac", n, a, "claude", false);
-        let path = dir.join("taskq.log");
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = crate::profile::read_log(&dir).unwrap();
         let mut record: Value = serde_json::from_str(text.trim().strip_prefix("taskq-stage ").unwrap()).unwrap();
         record["at_ms"] = json!(1);
-        std::fs::write(&path, format!("taskq-stage {record}\n")).unwrap();
+        rusqlite::Connection::open(dir.join("telemetry.log/telemetry.sqlite3")).unwrap().execute(
+            "UPDATE records SET line=?1", [format!("taskq-stage {record}")]).unwrap();
         assert!(crate::profile::selftest(&dir, &c.repo, &vec![], 300).unwrap_err().contains("FAIL"));
         // A live attempt stays exempt even after ttl; the check never mutates board state.
         assert!(crate::profile::selftest(&dir, &c.repo, &vec![(c.repo.clone(), a)], 300).is_ok());
@@ -1883,12 +1887,12 @@ mod tests {
         assert!(b.comments(n).unwrap().iter().any(|c| c.body.starts_with(&format!("taskq: gone attempt {a}"))));
         assert_eq!(task(&b, n).attempt, None);
         assert!(!s.heartbeat_body().lines().any(|l| l == format!("#{n} {a}")));
-        let repaired = std::fs::read_to_string(&path).unwrap();
+        let repaired = crate::profile::read_log(&dir).unwrap();
         assert!(repaired.contains("\"outcome\":\"failed\",\"error\":\"exit\""), "{repaired}");
         assert!(crate::profile::selftest(&dir, &c.repo, &vec![], 300).is_ok());
         s.pass().unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired, "repair is idempotent");
-        std::fs::remove_file(path).unwrap();
+        assert_eq!(crate::profile::read_log(&dir).unwrap(), repaired, "repair is idempotent");
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1923,9 +1927,9 @@ mod tests {
             s.focus.clear();
             s.pass().unwrap();
             assert!(crate::profile::selftest(&dir, &c.repo, &vec![], 300).is_ok());
-            let repaired = std::fs::read_to_string(&path).unwrap();
+            let repaired = crate::profile::read_log(&dir).unwrap();
             s.pass().unwrap();
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired);
+            assert_eq!(crate::profile::read_log(&dir).unwrap(), repaired);
             assert!(!b.comments(n).unwrap().iter().any(|c| c.body.starts_with("taskq: gone")));
             std::fs::remove_dir_all(dir).unwrap();
         }
@@ -1977,7 +1981,7 @@ mod tests {
                 let mut s = service(&b, &c, Default::default());
                 s.focus.clear();
                 s.pass().unwrap();
-                let repaired = std::fs::read_to_string(&path).unwrap();
+                let repaired = crate::profile::read_log(&dir).unwrap();
                 assert!(repaired.starts_with(&original), "original history must survive");
                 if evidence == "local" {
                     assert!(crate::profile::selftest(&dir, project, &vec![], 300).is_ok(), "{closed}: {repaired}");
@@ -1987,7 +1991,7 @@ mod tests {
                     assert_eq!(record["outcome"], if closed { "ok" } else { "cancelled" });
                     assert!(record["us"].is_null() && record["calls"].is_null() && record["tokens"].is_null());
                     s.pass().unwrap();
-                    assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired, "idempotent repair");
+                    assert_eq!(crate::profile::read_log(&dir).unwrap(), repaired, "idempotent repair");
                 } else {
                     assert_eq!(repaired, original, "{closed}: {evidence} must stay unknown");
                     assert!(crate::profile::selftest(&dir, project, &vec![], 300).is_err());

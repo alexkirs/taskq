@@ -1,9 +1,9 @@
-//! §5 profiling: fixed numeric observations in the existing bounded taskq.log, never operation input/error text.
+//! §5 profiling: fixed numeric observations in bounded local SQLite, never operation input/error text.
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -498,11 +498,10 @@ fn acquire_log_lock(path: &Path, wait: bool) -> std::io::Result<LogLock> {
     }
 }
 
-pub fn append_error(e: &std::io::Error) -> &'static str {
+pub fn append_error(e: &std::io::Error) -> String {
     match e.kind() {
-        std::io::ErrorKind::FileTooLarge => "taskq.log full; service pruning required",
-        std::io::ErrorKind::TimedOut => "taskq-profile.lock timeout after 1 s",
-        _ => "taskq.log append failed",
+        std::io::ErrorKind::TimedOut => "taskq-profile.lock timeout after 1 s".into(),
+        _ => format!("telemetry append failed: {e}"),
     }
 }
 
@@ -510,24 +509,16 @@ fn append(path: &Path, r: &Record) -> std::io::Result<()> {
     append_line(path, &format!("{PREFIX}{}\n", serde_json::to_string(r)?))
 }
 
-/// One record line under the profile lock and retention bound; other record kinds use their own prefix (§ 4 budget).
+/// One observation under the profile lock; prefixes retain the existing report/export schemas.
 pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _writer = WRITER.lock().map_err(|_| std::io::Error::other("profile writer poisoned"))?;
-    let full = || fs::metadata(path).is_ok_and(|m| m.len() > crate::data::LOG_MAX - 512);
-    // A full log is refused before the lock too: appenders then never take the lock from the pruner's nonblocking try.
-    if full() {
-        return Err(std::io::ErrorKind::FileTooLarge.into());
-    }
     fs::create_dir_all(path.parent().unwrap())?;
     let _lock = acquire_log_lock(path, true)?;
-    if full() {
-        return Err(std::io::ErrorKind::FileTooLarge.into());
-    }
-    OpenOptions::new().create(true).append(true).open(path)?.write_all(line.as_bytes())
+    crate::telemetry::append(path.parent().unwrap(), line, now_ms().unwrap_or(0)).map_err(std::io::Error::other)
 }
 
-/// `<install>/taskq.log` of this process, once `init` ran.
+/// Logical writer path after `init`; its parent owns SQLite and the legacy stream.
 pub fn log_path() -> Option<&'static Path> {
     LOG.get().map(PathBuf::as_path)
 }
@@ -582,16 +573,18 @@ fn render(text: &str) -> Result<String, &'static str> {
     Ok(out)
 }
 
-/// The retained `<install>/taskq.log`; a missing log is empty.
-fn read_log(install: &Path) -> Result<String, String> {
-    let mut text = String::new();
-    match fs::File::open(install.join("taskq.log")) {
-        Ok(f) => { f.take(crate::data::LOG_MAX + 1).read_to_string(&mut text).map_err(|_| "taskq.log unreadable or invalid UTF-8")?; }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err("taskq.log unreadable".into()),
-    }
-    if text.len() as u64 > crate::data::LOG_MAX - 512 { return Err("taskq.log at retention bound; collection stopped until service pruning".into()); }
-    Ok(text)
+/// Retained SQLite records plus transactionally imported legacy observations.
+pub(crate) fn read_log(install: &Path) -> Result<String, String> {
+    fs::create_dir_all(install).map_err(|e| e.to_string())?;
+    let _lock = acquire_log_lock(&install.join("taskq.log"), true).map_err(|e| e.to_string())?;
+    crate::telemetry::read(install, now_ms().unwrap_or(0))
+}
+
+/// Service-owned pruning uses the same writer boundary as profiling and legacy log rotation.
+pub fn prune(install: &Path) -> Result<(), String> {
+    fs::create_dir_all(install).map_err(|e| e.to_string())?;
+    let _lock = acquire_log_lock(&install.join("taskq.log"), true).map_err(|e| e.to_string())?;
+    crate::telemetry::prune(install, now_ms().ok_or("telemetry clock unknown")?)
 }
 
 pub fn report(install: &Path) -> String {
@@ -758,6 +751,11 @@ fn since_ms(s: &str, now: u64) -> Result<u64, String> {
 
 /// § 5 `taskq profile export|tasks|board [--since D]` over this host's retained log; no board access.
 pub fn view(install: &Path, name: &str, since: Option<&str>) -> Result<String, String> {
+    if name == "guide" {
+        if since.is_some() { return Err("profile guide does not accept --since".into()); }
+        return Ok(include_str!("../docs/design/profile-guide.md").into());
+    }
+    if !["export", "tasks", "board"].contains(&name) { return Err(format!("unknown profile view: {name} (guide, export, tasks or board)")); }
     let now = now_ms().ok_or("system clock before 1970")?;
     let since = since.map(|s| since_ms(s, now)).transpose()?;
     let text = export(&read_log(install)?, since);
@@ -765,13 +763,24 @@ pub fn view(install: &Path, name: &str, since: Option<&str>) -> Result<String, S
         "export" => Ok(text),
         "tasks" => render_tasks(&text).map_err(String::from),
         "board" => render_board(&text).map_err(String::from),
-        _ => Err(format!("unknown profile view: {name} (export, tasks or board)")),
+        _ => Err(format!("unknown profile view: {name} (guide, export, tasks or board)")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guide_needs_no_store() {
+        let missing = Path::new("/nonexistent/taskq-profile-guide");
+        let guide = view(missing, "guide", None).unwrap();
+        assert!(guide.contains("taskq profile export --since 7d"));
+        assert!(guide.contains("Never add"));
+        assert!(guide.contains("cost unknown"));
+        assert!(view(missing, "guide", Some("24h")).is_err());
+    }
+
 
     // Chain: § 4 simultaneous project stages -> one host log. Risk: first-project identity leaks or writes collide.
     #[test]
@@ -787,7 +796,7 @@ mod tests {
             })
         }).collect();
         for j in joins { j.join().unwrap(); }
-        let text = fs::read_to_string(&path).unwrap();
+        let text = read_log(&dir).unwrap();
         let projects: std::collections::BTreeSet<_> = text.lines().map(|l| {
             let r: Stage = serde_json::from_str(l.strip_prefix(STAGE_PREFIX).unwrap()).unwrap();
             assert_eq!(r.host.as_deref(), Some("invented-host")); r.project.unwrap()
@@ -860,7 +869,7 @@ mod tests {
             drop(held);
             for writer in writers { writer.join().unwrap(); }
         });
-        let text = fs::read_to_string(&path).unwrap();
+        let text = read_log(&dir).unwrap();
         assert_eq!(text.lines().count(), 200);
         for n in 0..2 { for i in 0..100 { assert!(text.lines().any(|l| l == format!("{n}:{i}"))); } }
         let held = log_lock(&path).unwrap();
@@ -870,10 +879,10 @@ mod tests {
         assert!(began.elapsed() >= std::time::Duration::from_secs(1));
         assert_eq!(append_error(&timeout), "taskq-profile.lock timeout after 1 s");
         drop(held);
-        OpenOptions::new().write(true).open(&path).unwrap().set_len(crate::data::LOG_MAX).unwrap();
-        let full = append_line(&path, "not written\n").unwrap_err();
-        assert_eq!(append_error(&full), "taskq.log full; service pruning required");
-        assert_eq!(append_error(&std::io::ErrorKind::PermissionDenied.into()), "taskq.log append failed");
+        fs::write(&path, "service text\n").unwrap();
+        append_line(&path, "still collected\n").unwrap();
+        assert!(read_log(&dir).unwrap().contains("still collected"));
+        assert!(append_error(&std::io::ErrorKind::PermissionDenied.into()).starts_with("telemetry append failed:"));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -906,13 +915,13 @@ mod tests {
         assert!(text.contains("1000..3000 Unix ms") && text.contains("switch off for this run"));
         assert_eq!(error("HTTP 500 private token /host/path"), "http5xx");
         assert_eq!(measure_at(Some(&path), true, "spawn", || Err::<(), _>("private token /host/path")), Err("private token /host/path"));
-        let log = fs::read_to_string(&path).unwrap();
+        let log = read_log(&dir).unwrap();
         assert!(!log.contains("private") && !log.contains("/host/path"));
         let r: Record = serde_json::from_str(log.lines().last().unwrap().strip_prefix(PREFIX).unwrap()).unwrap();
         assert_eq!(r.error, "other");
         assert_eq!(r.trace.unwrap().parent, 0);
         measure_at(Some(&path), true, "dispatch", || measure_at(Some(&path), true, "spawn", || Ok::<_, String>(()))).unwrap();
-        let log = fs::read_to_string(&path).unwrap();
+        let log = read_log(&dir).unwrap();
         let r: Vec<Record> = log.lines().filter_map(|l| l.strip_prefix(PREFIX)).map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(r[r.len()-2].trace.as_ref().unwrap().parent, r.last().unwrap().trace.as_ref().unwrap().span);
         assert!(std::panic::catch_unwind(|| measure_at(Some(&path), true, "spawn", || -> Result<(), String> { panic!("private panic") })).is_err());
@@ -920,27 +929,21 @@ mod tests {
         assert_eq!(PARENT.get(), 0);
         assert_eq!(measure_at(Some(&path.join("unwritable")), false, "spawn", || Ok::<_, String>(7)).unwrap(), 7);
         for corrupt in ["{", "{\"op\":\"spawn\",\"us\":2,\"error\":\"secret\"}"] {
+            let bad_dir = dir.join(format!("bad-{}", corrupt.len()));
+            fs::create_dir_all(&bad_dir).unwrap();
             let bad = format!("{PREFIX}{corrupt}\n");
-            fs::write(&path, &bad).unwrap();
-            assert!(report(&dir).starts_with("Profile: unknown"));
-            assert_eq!(fs::read_to_string(&path).unwrap(), bad);
+            fs::write(bad_dir.join("taskq.log"), &bad).unwrap();
+            assert!(report(&bad_dir).starts_with("Profile: unknown"));
+            assert_eq!(fs::read_to_string(bad_dir.join("taskq.log")).unwrap(), bad);
         }
-        fs::write(&path, "normal log\n".repeat((crate::data::LOG_MAX as usize - 256) / 11)).unwrap();
-        assert!(fs::metadata(&path).unwrap().len() <= crate::data::LOG_MAX);
-        assert!(report(&dir).contains("collection stopped"));
-        assert!(crate::data::trim_tail(&path, crate::data::LOG_MAX));
-        append(&path, &Record { op: "spawn".into(), us: 1, error: "none".into(), at_ms: Some(1), trace: None }).unwrap();
-        assert!(fs::metadata(&path).unwrap().len() <= crate::data::LOG_MAX);
-        assert!(report(&dir).contains("| spawn | 1 |"));
         let held = log_lock(&path).unwrap();
         assert!(log_lock(&path).is_err());
-        assert!(!crate::data::trim_tail(&path, crate::data::LOG_MAX));
         assert_eq!(measure_at(Some(&path), false, "spawn", || Ok::<_, String>(7)).unwrap(), 7);
         drop(held);
-        // Force real truncation while concurrent appenders use the same lock.
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all("normal log\n".repeat(crate::data::LOG_MAX as usize / 11).as_bytes()).unwrap();
         let successful = std::sync::atomic::AtomicUsize::new(0);
+        let before = read_log(&dir).unwrap().lines().filter(|l| l.starts_with(PREFIX)).count();
+        // New telemetry no longer competes with service diagnostics or the legacy 4 MiB bound.
+        OpenOptions::new().append(true).open(&path).unwrap().write_all("normal log\n".repeat(crate::data::LOG_MAX as usize / 11 + 1).as_bytes()).unwrap();
         std::thread::scope(|scope| {
             for _ in 0..4 { scope.spawn(|| {
                 for _ in 0..50 {
@@ -949,19 +952,11 @@ mod tests {
                     }
                 }
             }); }
-            // Rule (§ 4 Profiling, R12): one prune wins the nonblocking lock while appends race, so the pre-filled
-            // record is truncated and every retained record is a counted successful append. 50 losses happened in CI.
-            scope.spawn(|| {
-                let deadline = Instant::now() + std::time::Duration::from_secs(10);
-                while !crate::data::trim_tail(&path, crate::data::LOG_MAX) {
-                    assert!(Instant::now() < deadline, "no prune won the profile log lock");
-                    std::thread::yield_now();
-                }
-                for _ in 0..49 { crate::data::trim_tail(&path, crate::data::LOG_MAX); }
-            });
+            scope.spawn(|| { for _ in 0..50 { crate::data::trim_tail(&path, crate::data::LOG_MAX); } });
         });
-        let records = fs::read_to_string(&path).unwrap().lines().filter(|l| l.starts_with(PREFIX)).count();
-        assert_eq!(records, successful.load(Ordering::Relaxed));
+        let records = read_log(&dir).unwrap().lines().filter(|l| l.starts_with(PREFIX)).count();
+        assert_eq!(successful.load(Ordering::Relaxed), 200);
+        assert_eq!(records, before + 200);
         assert!(!report(&dir).starts_with("Profile: unknown"));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1050,7 +1045,7 @@ Changed: x"))];
         assert_eq!(staged(), format!("close {t} 0 other failed other; close {t} {a} codex failed other; close {t} {a} codex failed other; \
             close {t} {a} codex failed other; close 999 0 other failed other; \
             checks {t} {a} codex ok none; close {t} {a} codex ok none; close 999 0 other failed other"));
-        let log = fs::read_to_string(&path).unwrap();
+        let log = read_log(&dir).unwrap();
         assert!(!log.contains("secret") && !log.contains("/host/path") && !log.contains("private-rt"));
         let text = report(&dir);
         assert!(text.contains("Slow stages (p95): build/claude > review/codex > build/codex > review/claude > claim/other > review/codex-app"), "{text}");

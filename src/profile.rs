@@ -213,13 +213,26 @@ pub fn repair(install: &Path, project: &str, host: &str, task: u64, attempt: u64
 
 /// Repair retained attempts only when a fresh issue read proves closure or board removal.
 /// Unreadable issues/logs and attempts still on the board remain unknown.
-pub fn repair_ended(install: &Path, project: &str, host: &str, board: &dyn crate::board::Board) {
+pub fn repair_ended(install: &Path, root: &Path, project: &str, host: &str, board: &dyn crate::board::Board) {
     let Ok(rows) = read_log(install).and_then(|t| unresolved(&t)) else { return };
     for mut r in rows.into_iter().filter(|r| r.project.as_deref() == Some(project)
-        && r.host.as_deref() == Some(host)) {
+        && r.host.as_deref().is_none_or(|h| h == host)) {
         let Ok(issue) = board.issue(r.task) else { continue };
         if issue.open && crate::service::is_task(&issue) { continue; }
         let Ok(log) = crate::board::entries(board, r.task) else { continue };
+        if r.host.is_none() {
+            let through: Vec<_> = log.iter().filter(|e| e.id <= r.attempt).cloned().collect();
+            let owner = crate::core::fold(r.task, &through, false);
+            if owner.attempt != Some(r.attempt) || crate::service::host_of(&owner) != Some(host)
+                || owner.session.as_deref().and_then(|s| s.split_once(':')).map(|s| s.0) != Some(r.rt.as_str()) {
+                continue;
+            }
+            let Some(role) = owner.role.as_deref() else { continue };
+            let path = crate::runtime::attempt_log(root, role, r.task, r.attempt);
+            if !fs::read_to_string(path).is_ok_and(|text| !text.is_empty()) { continue; }
+            r.host = Some(host.into());
+            r.stage = if role == "reviewer" { "review" } else { "build" }.into();
+        }
         let (outcome, error) = crate::core::stage_outcome(r.task, Ok((&log, Some(false))), r.attempt, r.attempt);
         r.stage = if r.stage == "review" { "review" } else { "build" }.into();
         r.open = false;

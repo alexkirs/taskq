@@ -755,7 +755,7 @@ impl<'a> Service<'a> {
         for (n, a) in stopped {
             self.ended(n, a, by_n.get(&n).copied(), None);
         }
-        crate::profile::repair_ended(&self.cfg.install, &self.cfg.repo, &me, self.board);
+        crate::profile::repair_ended(&self.cfg.install, &self.cfg.root, &self.cfg.repo, &me, self.board);
         self.held.retain(|l| by_n.get(&l.task).is_some_and(|v| v.task.attempt == Some(l.attempt)));
         let kids: Vec<u64> = self.kids.iter().map(|k| k.attempt).collect();
         self.unknown.retain(|a, _| kids.contains(a));
@@ -1683,6 +1683,74 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired);
             assert!(!b.comments(n).unwrap().iter().any(|c| c.body.starts_with("taskq: gone")));
             std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    // Chain: §4 historical no-host review -> fresh ended-board proof -> one-pass repair -> selftest.
+    // Risk: #1252 stays blocked, or another project/host receives fabricated terminal evidence.
+    #[test]
+    fn historical_no_host_terminal_repair_requires_local_ownership() {
+        for closed in [true, false] {
+            for evidence in ["local", "foreign-project", "foreign-host", "missing-log", "empty-log", "unreadable-log", "ignored-spawn", "untrusted-spawn", "runtime-mismatch", "unreadable-board", "unreadable-comments"] {
+                let dir = std::env::temp_dir().join(format!("taskq-no-host-{}-{closed}-{evidence}", std::process::id()));
+                std::fs::create_dir_all(dir.join(".taskq")).unwrap();
+                let b = Fake::default();
+                let n = b.create("T", "", &["taskq".into()]).unwrap();
+                let w = b.comment(n, "taskq: spawn worker codex:w mac").unwrap();
+                b.comment(n, &format!("taskq: result {} attempt {w}", "a".repeat(40))).unwrap();
+                let host = if evidence == "foreign-host" { "win" } else { "mac" };
+                let spawn = format!("taskq: spawn reviewer codex:r {host}");
+                let a = b.raw(n, &spawn, evidence != "untrusted-spawn", evidence == "ignored-spawn");
+                let mut c = cfg("mac");
+                c.install = dir.clone();
+                c.root = dir.clone();
+                let path = dir.join("taskq.log");
+                let project = if evidence == "foreign-project" { "other/project" } else { &c.repo };
+                let rt = if evidence == "runtime-mismatch" { "claude" } else { "codex" };
+                let mut original = String::new();
+                for (stage, outcome, error) in [("claim", "ok", "none"), ("start", "ok", "none"), ("checks", "ok", "none"), ("close", "failed", "other"), ("review", "unknown", "left-board")] {
+                    let record = json!({"project":project, "stage":stage, "task":n, "attempt":a,
+                        "rt":rt, "outcome":outcome, "error":error, "at_ms":1, "unknown":"no-usage"});
+                    original += &format!("taskq-stage {record}\n");
+                }
+                std::fs::write(&path, &original).unwrap();
+                let attempt_log = crate::runtime::attempt_log(&dir, "reviewer", n, a);
+                if evidence == "unreadable-log" {
+                    std::fs::create_dir(&attempt_log).unwrap();
+                } else if evidence != "missing-log" {
+                    std::fs::write(&attempt_log, if evidence == "empty-log" { "" } else { "original reviewer output\n" }).unwrap();
+                }
+                if closed {
+                    b.comment(n, &format!("taskq: close attempt {a}")).unwrap();
+                    b.close(n).unwrap();
+                } else {
+                    b.labels(n, &[], &["taskq".into()]).unwrap();
+                }
+                if evidence == "unreadable-board" { b.state.borrow_mut().fail_issue_read = Some((n, 1)); }
+                if evidence == "unreadable-comments" { b.state.borrow_mut().fail_comment_reads = 1; }
+                assert!(crate::profile::selftest(&dir, project, &vec![], 300).is_err());
+                let mut s = service(&b, &c, Default::default());
+                s.focus.clear();
+                s.pass().unwrap();
+                let repaired = std::fs::read_to_string(&path).unwrap();
+                assert!(repaired.starts_with(&original), "original history must survive");
+                if evidence == "local" {
+                    assert!(crate::profile::selftest(&dir, project, &vec![], 300).is_ok(), "{closed}: {repaired}");
+                    let record: serde_json::Value = serde_json::from_str(repaired.lines().last().unwrap().strip_prefix("taskq-stage ").unwrap()).unwrap();
+                    assert_eq!(record["host"], "mac");
+                    assert_eq!(record["stage"], "review");
+                    assert_eq!(record["outcome"], if closed { "ok" } else { "cancelled" });
+                    assert!(record["us"].is_null() && record["calls"].is_null() && record["tokens"].is_null());
+                    s.pass().unwrap();
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired, "idempotent repair");
+                } else {
+                    assert_eq!(repaired, original, "{closed}: {evidence} must stay unknown");
+                    assert!(crate::profile::selftest(&dir, project, &vec![], 300).is_err());
+                }
+                if attempt_log.is_file() { assert_eq!(std::fs::read_to_string(attempt_log).unwrap(), if evidence == "empty-log" { "" } else { "original reviewer output\n" }); }
+                assert!(!b.comments(n).unwrap().iter().any(|c| c.body.starts_with("taskq: gone")));
+                std::fs::remove_dir_all(dir).unwrap();
+            }
         }
     }
 

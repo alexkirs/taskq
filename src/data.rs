@@ -13,7 +13,7 @@ pub const CLI_ERRORS_MAX: u64 = 256 << 10;
 pub const ATTEMPT_LOGS: usize = 50;
 /// `<root>/.taskq/incidents/<fingerprint>.json`: the newest by mtime.
 pub const INCIDENTS: usize = 50;
-/// `<root>/.taskq/inputs/*.txt`: the newest by mtime, plus files locked by live Claude turns.
+/// `<root>/.taskq/inputs/*.txt`: the newest by mtime, plus files locked by live Claude/App turns.
 pub const INPUTS: usize = 50;
 /// A turn owns the lock, even when a forked child still holds a copy of its descriptor.
 pub struct InputLock(fs::File);

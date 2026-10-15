@@ -467,7 +467,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
 }
 
 const SPECQ_REVISION: &str = "46f5f62389f84ce3cc4d2a526a42a5d4bacbf8be";
-/// The specq shared core, sent whole at each start (§ 8 Rule delivery).
+/// The specq shared core, sent whole at every start and continuation (§ 8 Rule delivery).
 const SPECQ_CORE: &[&str] = &[
     "engineering/principles.md", "engineering/spec-first.md", "engineering/ponytail.md", "engineering/agent-workflow.md",
     "engineering/use-cases.md", "engineering/verification.md", "engineering/security.md",
@@ -484,7 +484,7 @@ const SPECQ_INDEX: &[&str] = &[
 ];
 /// One cap for the injected header, contract, core and index (§ 8).
 const RULES_CAP: usize = 128 * 1024;
-/// This release's contract, for a root without `taskq.md` (`contract` names its URL).
+/// This release's TaskQ tool contract, used only for the documented setup/TaskQ fallback.
 const CONTRACT: &str = include_str!("../taskq.md");
 const INDEX: &str = "\nIndex of other shared rules";
 
@@ -544,12 +544,12 @@ fn docs(root: &Path) -> Result<Vec<(String, String)>, StartError> {
     Ok(out)
 }
 
-/// § 8 Rule delivery: header, contract, core and index before the task text at start; header and index at resume.
+/// § 8 Rule delivery: current header, contract, core and index before every task/continuation.
 fn rule_text(root: &Path, task: &str, resume: bool, fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
     Ok(format!("{}\nTaskQ task\n{task}", rules(root, resume, fetch)?))
 }
 
-/// The rules part of a turn: header, then contract and core (start only), then the index.
+/// The mandatory bodies are repeated so continuation/compaction cannot silently retain old rules.
 fn rules(root: &Path, resume: bool, mut fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
     let dir = specq_dir(root);
     let selected = project_contract(root)?;
@@ -570,11 +570,10 @@ fn rules(root: &Path, resume: bool, mut fetch: impl FnMut(&str) -> Result<String
     );
     text.push_str(&format!("TaskQ command contract (tool reference): {}\n",command_contract()));
     if resume {
-        text.push_str("Resume: the contract and core bodies came at start; reread them at the paths above when needed.\n");
-    } else {
-        text.push_str(&format!("\n--- contract {spec} ---\n{contract}\n"));
-        for (file, body) in SPECQ_CORE.iter().zip(&core) { text.push_str(&format!("\n--- specq/{file} ---\n{body}\n")); }
+        text.push_str("Continuation: these current contract and core bodies supersede earlier versions.\n");
     }
+    text.push_str(&format!("\n--- contract {spec} ---\n{contract}\n"));
+    for (file, body) in SPECQ_CORE.iter().zip(&core) { text.push_str(&format!("\n--- specq/{file} ---\n{body}\n")); }
     text.push_str(&format!("{INDEX} (read on demand under `{}`):\n", dir.display()));
     for file in SPECQ_INDEX { text.push_str(&format!("- {file}: {}\n", heading(&pinned(root, file, &mut fetch)?))); }
     text.push_str("Index of project docs (read on demand in your worktree):\n");
@@ -583,7 +582,7 @@ fn rules(root: &Path, resume: bool, mut fetch: impl FnMut(&str) -> Result<String
     Ok(text)
 }
 
-/// § 8 Rule delivery after a Claude compaction: the SessionStart `compact` hook runs this and prints header and index.
+/// § 8 Rule delivery after a Claude compaction: restore the current mandatory bodies and index.
 pub fn compact(root: &Path, role: &str, task: u64, attempt: u64) -> Result<String, StartError> {
     let text = rules(root, true, rule_file)?;
     log!("specq@{SPECQ_REVISION} loaded for {role} #{task} attempt {attempt} (compact, {} bytes)", text.len());
@@ -591,8 +590,8 @@ pub fn compact(root: &Path, role: &str, task: u64, attempt: u64) -> Result<Strin
     Ok(text)
 }
 
-/// § 8 Rule delivery to a PM session: the project's SessionStart hook prints the worker start rules, or header and index
-/// after compaction (`phase` `compact`).
+/// § 8 Rule delivery to a PM session: the SessionStart hook restores the same current mandatory bodies and index
+/// after compaction (`phase` `compact`) as a worker continuation.
 pub fn pm(root: &Path, phase: &str) -> Result<String, StartError> {
     pm_rules(root, phase, rule_file)
 }
@@ -611,20 +610,30 @@ fn compact_settings(root: &Path, l: &Launch) -> String {
     serde_json::json!({"hooks": {"SessionStart": [{"matcher": "compact", "hooks": [{"type": "command", "command": cmd}]}]}}).to_string()
 }
 
-/// The operator's turn text (§ 8 Rule delivery).
+/// The operator's current rules and turn text (§ 8 Rule delivery).
 pub fn instructions(root: &Path, task: &str, resume: bool) -> Result<String, StartError> {
     rule_text(root, task, resume, rule_file)
 }
 
 // Claude --bg forwards stdin as child argv; send only a file reference.
 fn claude_input(root: &Path, text: &str) -> Result<(String, crate::data::InputLock), String> {
+    let (path, file) = turn_input(root, text)?;
+    Ok((format!("Before any work, use Read to read {} in full. It contains this turn's TaskQ rules and task. Apply those rules and carry out that task. If Read truncates the file, read the remaining parts before proceeding.", serde_json::to_string(&path.to_string_lossy()).map_err(|e| e.to_string())?), file))
+}
+
+fn app_input(root: &Path, text: &str) -> Result<(String, crate::data::InputLock), String> {
+    let (path, file) = turn_input(root, text)?;
+    Ok((format!("Before any work, read {} in full using your file tools. It contains this turn's TaskQ rules and task. Apply those rules and carry out that task. Read all remaining parts if a tool truncates the file. If the file cannot be read completely, report the failure and do not proceed with the task.", serde_json::to_string(&path.to_string_lossy()).map_err(|e| e.to_string())?), file))
+}
+
+fn turn_input(root: &Path, text: &str) -> Result<(PathBuf, crate::data::InputLock), String> {
     let dir = root.join(".taskq/inputs");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{}.txt", uuid()));
     let mut file = File::options().read(true).write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
     file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
     let file = crate::data::InputLock::new(file).map_err(|e| e.to_string())?;
-    Ok((format!("Before any work, use Read to read {} in full. It contains this turn's TaskQ rules and task. Apply those rules and carry out that task. If Read truncates the file, read the remaining parts before proceeding.", serde_json::to_string(&path.to_string_lossy()).map_err(|e| e.to_string())?), file))
+    Ok((path, file))
 }
 
 fn turn_text(env: &Env, l: &Launch, fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
@@ -677,7 +686,8 @@ fn spawn_inner(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     let log = log_path(env.root, l);
     rules_line(&log, phase, &text).map_err(|e| StartError::io(e, None))?;
     if l.rt == "codex-app" {
-        let mut turn = AppTurn { hand: None, log, text, thread: l.session.clone(), done: 0, rollout: None, running: app_running };
+        let (text, input_file) = app_input(env.root, &text).map_err(|message| StartError { message, reportable: false })?;
+        let mut turn = AppTurn { hand: None, log, text, _input: Some(input_file), thread: l.session.clone(), done: 0, rollout: None, running: app_running };
         match &l.resume {
             Some(_) => {
                 turn.queue().map_err(|message| StartError { message, reportable: false })?;
@@ -912,6 +922,7 @@ pub struct AppTurn {
     log: PathBuf,
     /// The brief, or the resume text, to queue.
     text: String,
+    _input: Option<crate::data::InputLock>,
     thread: String,
     /// `task_complete` events of the thread before the queued text.
     done: usize,
@@ -1200,7 +1211,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!("taskq-rollout-{}.jsonl", std::process::id()));
         let done = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
         std::fs::write(&p, format!("{done}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\"}}}}\n")).unwrap();
-        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), thread: "th".into(), done: completes(&p), rollout: Some(p.clone()), running: || true };
+        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), _input: None, thread: "th".into(), done: completes(&p), rollout: Some(p.clone()), running: || true };
         assert_eq!((t.done, t.exited()), (1, Ok(None)), "the handshake's task_complete does not end the turn");
         std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(done.as_bytes()).unwrap();
         assert_eq!(t.exited(), Ok(Some(0)));
@@ -1279,7 +1290,8 @@ mod tests {
         let env = Env { root: &root, exe: Path::new("taskq"), install: &install, permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
         let l = Launch { task: 0, title: "live".into(), attempt: 0, role: "worker".into(), rt: "codex-app".into(), session: "-".into(), url: String::new(), resume: None };
         let log = root.join("app-turn.log");
-        let mut t = AppTurn { hand: None, log: log.clone(), text: format!("{}Reply with the single word QUEUED and do nothing else.", "A taskq test line; ignore it.\n".repeat(700)), thread: String::new(), done: 0, rollout: None, running: app_running };
+        let (text, input) = app_input(&root, &format!("{}Reply with the single word QUEUED and do nothing else.", "A taskq test line; ignore it.\n".repeat(700))).unwrap();
+        let mut t = AppTurn { hand: None, log: log.clone(), text, _input: Some(input), thread: String::new(), done: 0, rollout: None, running: app_running };
         t.hand = Some(Box::new(start(&env, &l, &log, HANDSHAKE, &access(&env, "codex-app").unwrap()).unwrap()));
         let code = (0..600).find_map(|_| { std::thread::sleep(std::time::Duration::from_secs(1)); t.exited().unwrap() });
         eprintln!("thread {} rollout {:?} completes {} exit {code:?}", t.thread, t.rollout, t.rollout.as_ref().map_or(0, |p| completes(p)));
@@ -1325,20 +1337,22 @@ mod tests {
         root
     }
 
-    // Chain: section 8 background rule delivery. Risk: Claude copies a large stdin brief onto child argv.
+    // Chain: section 8 rule delivery. Risk: native runtime argv contains a full brief or its file is pruned mid-turn.
     #[test]
     fn claude_large_input_stays_out_of_argv() {
         let root = rules_root("background input ' quoted");
         let text = format!("{}\nUTF-8: \u{2605}\n", "invented padding ".repeat(6400));
         assert!(text.len() > 100 * 1024);
         let mut inputs = Vec::new();
-        for turn in ["start", "resume", "concurrent operator"] {
+        for (turn, app) in [("start",false),("resume",false),("concurrent operator",false),("app start",true),("app resume",true),("app concurrent",true)] {
             let brief = format!("{text}{turn}");
-            let (input, _file) = claude_input(&root, &brief).unwrap();
+            let (input, _file) = if app {app_input(&root,&brief)} else {claude_input(&root, &brief)}.unwrap();
             assert!(input.len() < 8192 && !input.contains("invented padding"));
-            assert!(input.contains("use Read") && input.contains("in full"));
+            assert!(input.contains("in full"));
+            if app { assert!(input.contains("do not proceed")); } else { assert!(input.contains("use Read")); }
             assert!(!inputs.contains(&input), "each turn has an immutable input file");
-            let quoted = input.strip_prefix("Before any work, use Read to read ").unwrap().split(" in full.").next().unwrap();
+            let prefix=if app {"Before any work, read "} else {"Before any work, use Read to read "};
+            let quoted = input.strip_prefix(prefix).unwrap().split(" in full").next().unwrap();
             let path: String = serde_json::from_str(quoted).unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), brief);
             let probe = File::options().read(true).write(true).open(&path).unwrap();
@@ -1347,7 +1361,7 @@ mod tests {
             probe.try_lock().unwrap();
             inputs.push(input);
         }
-        assert_eq!(std::fs::read_dir(root.join(".taskq/inputs")).unwrap().count(), 3);
+        assert_eq!(std::fs::read_dir(root.join(".taskq/inputs")).unwrap().count(), 6);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1360,7 +1374,7 @@ mod tests {
     }
 
     // Chain: § 8 rule delivery, #1156. Risk: a new/resumed worker or reviewer misses the contract, a core rule or the index,
-    // or a resume resends every body.
+    // or a continuation retains obsolete mandatory bodies.
     #[test]
     fn rules_reach_every_runtime_role_and_resume() {
         let root = rules_root("roles");
@@ -1381,14 +1395,9 @@ mod tests {
                     for file in SPECQ_INDEX { assert_eq!(rules.matches(&format!("\n- {file}: Rule from {}\n", url(file))).count(), 1, "{file}"); }
                     assert!(rules.contains("\n- docs/guide.md: Guide title\n- docs/sub/plain.md: (no heading)\n") && !rules.contains("shot.png"));
                     let bodies = rules.matches("\n--- ").count();
-                    if l.resume.is_some() {
-                        assert_eq!(bodies, 0, "{rt} {role}: resume sends header and index only");
-                        assert!(!rules.contains("Apply this rule.") && !rules.contains("Rule delivery (R13)"));
-                    } else {
-                        assert_eq!(bodies, 1 + SPECQ_CORE.len());
-                        assert!(rules.contains(&format!("\n{CONTRACT}\n")), "{rt} {role}: whole contract");
-                        for file in SPECQ_CORE { assert_eq!(rules.matches(&format!("\n--- specq/{file} ---\n{}\n", rule(&url(file)).unwrap())).count(), 1); }
-                    }
+                    assert_eq!(bodies, 1 + SPECQ_CORE.len());
+                    assert!(rules.contains(&format!("\n{CONTRACT}\n")), "{rt} {role}: whole current contract");
+                    for file in SPECQ_CORE { assert_eq!(rules.matches(&format!("\n--- specq/{file} ---\n{}\n", rule(&url(file)).unwrap())).count(), 1); }
                     if let Some(answer) = &l.resume { assert!(task.ends_with(answer)); }
                     else { assert_eq!(task, brief(&env, &l)); }
                     assert_eq!(l.session, "same-session");
@@ -1439,7 +1448,7 @@ mod tests {
         }
     }
 
-    // Chain: § 8 rule delivery after compaction, #1211. Risk: a compacted Claude worker loses header and index, gets bodies
+    // Chain: § 8 rule delivery after compaction, #1211. Risk: a compacted Claude worker loses mandatory rule bodies
     // or task text again, or another runtime gets the hook.
     #[test]
     fn compaction_resends_header_and_index_only_to_claude() {
@@ -1458,22 +1467,23 @@ mod tests {
         assert_eq!(hook["matcher"], "compact");
         assert!(hook["hooks"][0]["command"].as_str().unwrap().ends_with(&format!(" rules compact '{}' 'worker' 7 42", root.display())));
         assert!(!args("codex").iter().any(|a| a == "--settings"), "codex gets no hook");
-        // the simulated compact event: what the hook prints is header and index, nothing else
+        // The compact hook restores current mandatory bodies and index, without inventing a task.
         let start = turn_text(&env, &l, rule).unwrap();
         let text = compact(&root, "worker", 7, 42).unwrap();
         assert!(text.starts_with("TaskQ rules: specq@") && text.contains("\nEvidence: cite the applied rule"));
         assert!(text.contains(INDEX) && text.contains("\n- docs/guide.md: Guide title\n"));
-        assert!(!text.contains("\n--- ") && !text.contains("TaskQ task") && !text.contains("Apply this rule."), "no bodies, no task");
+        assert!(!text.contains("TaskQ task") && text.contains("Apply this rule."), "current mandatory bodies, no task");
+        assert_eq!(text.matches("\n--- ").count(),1+SPECQ_CORE.len());
         assert_eq!(text, rules(&root, true, rule).unwrap());
         assert!(start.len() > text.len());
         let log = std::fs::read_to_string(attempt_log(&root, "worker", 7, 42)).unwrap();
         let v: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
-        assert_eq!((v["phase"].as_str(), v["bodies"].as_u64(), v["bytes"].as_u64()), (Some("compact"), Some(0), Some(text.len() as u64)));
+        assert_eq!((v["phase"].as_str(), v["bodies"].as_u64(), v["bytes"].as_u64()), (Some("compact"), Some((1+SPECQ_CORE.len()) as u64), Some(text.len() as u64)));
         std::fs::remove_dir_all(&root).ok();
     }
 
     // Chain: § 8 rule delivery to a PM session, #1219. Risk: the PM hook gets other rules than a worker at the same pin,
-    // compaction resends the bodies, or the committed hook names a local path or misses start/compact.
+    // compaction loses mandatory bodies, or the committed hook names a local path or misses start/compact.
     #[test]
     fn pm_hook_gets_the_worker_start_rules() {
         let root = rules_root("pm");
@@ -1508,6 +1518,9 @@ mod tests {
             let text=rule_text(&root,"task",resume,rule).unwrap();
             assert!(text.contains(&format!("contract `{}`",root.join("serverq.md").display())));
         }
+        std::fs::write(root.join("serverq.md"),"# Updated ServerQ contract\nNew current rule.\n").unwrap();
+        let resumed=rule_text(&root,"task",true,rule).unwrap();
+        assert!(resumed.contains("New current rule.") && !resumed.contains("Project rule overrides shared rule."));
         std::fs::remove_file(root.join("serverq.md")).unwrap();
         for resume in [false,true] {assert!(rule_text(&root,"task",resume,rule).is_err());}
         for config in ["{",r#"{"repo":"group/.."}"#,r#"{"repo":"group/"}"#,r#"{}"#] {
@@ -1555,7 +1568,7 @@ mod tests {
         assert!(rule_text(&root, "task", false, rule).is_err());
         std::fs::write(root.join("taskq.md"), "x".repeat(RULES_CAP)).unwrap();
         assert!(rule_text(&root, "task", false, rule).unwrap_err().to_string().contains("cap"));
-        assert!(rule_text(&root, "task", true, rule).is_ok(), "a resume sends no contract body");
+        assert!(rule_text(&root, "task", true, rule).unwrap_err().to_string().contains("cap"), "resume also enforces the mandatory-body cap");
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -248,11 +248,11 @@ pub fn run(install: &Path) -> Res<()> {
     let mut stopped = BTreeSet::new();
     let mut checked: Option<Instant> = None;
     let began = Instant::now();
-    let mut pruned = Instant::now();
     let mut hour = (Instant::now(), crate::requests::totals());
     let mut tray = None;
     let mut registry = Registry::default();
     loop {
+        crate::data::trim_tail(&install.join("taskq.log"), crate::data::LOG_MAX);
         crate::platform::write_atomic(&install.join("service"), &format!("{}\n", std::process::id()))?;
         registry.refresh(install, began.elapsed().as_secs());
         roots.clone_from(&registry.roots);
@@ -352,7 +352,6 @@ pub fn run(install: &Path) -> Res<()> {
             crate::keep_tray(install, &mut tray);
             if began.elapsed().as_secs() >= timers.1 { let _ = fs::write(install.join("releases").join(crate::platform::VERSION).join("healthy"), ""); }
         }
-        if pruned.elapsed().as_secs() >= 3600 { crate::data::trim_tail(&install.join("taskq.log"), crate::data::LOG_MAX); pruned = Instant::now(); }
         if hour.0.elapsed().as_secs() >= 3600 {
             let total = crate::requests::totals();
             let usage = crate::requests::diff(&total, &hour.1);

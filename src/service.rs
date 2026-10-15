@@ -747,6 +747,9 @@ impl<'a> Service<'a> {
 
     /// One pass of § 4. Tasks written to in a step are left alone by later steps until the next pass re-reads them.
     pub fn pass(&mut self) -> Result<(), String> {
+        if self.host.is_none() {
+            crate::data::trim_tail(&self.cfg.install.join("taskq.log"), crate::data::LOG_MAX);
+        }
         let r = crate::profile::measure("service.pass", || self.pass_inner());
         if r.is_err() { self.unready(); }
         r
@@ -1279,6 +1282,44 @@ mod tests {
         fn id(&self) -> u32 {
             0
         }
+    }
+
+    // Chain: §4 log retention -> service pass -> collection/selftest. Risk: the hourly timer leaves a full log stuck.
+    #[test]
+    fn service_pass_restores_bounded_log_collection() {
+        let root = std::env::temp_dir().join(format!("taskq-service-retention-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("taskq.log");
+        let c = Config { install: root.clone(), ..cfg("win") };
+        let b = Fake::default();
+        let mut s = Service::new(&b, &c, "test", Box::new(|_| panic!("no tasks")));
+        for size in [crate::data::LOG_MAX - 256, crate::data::LOG_MAX + 1024] {
+            let mut text = "old diagnostic\n".repeat(size as usize / 15);
+            let newest = "taskq-profile {\"op\":\"spawn\",\"us\":1,\"error\":\"none\",\"at_ms\":1}\n";
+            text.push_str(newest);
+            let terminal = format!("taskq-stage {}\n", serde_json::json!({"project":"o/r", "host":"win",
+                "stage":"build", "task":7, "attempt":41, "rt":"codex", "us":null,
+                "outcome":"cancelled", "error":"none", "at_ms":1, "unknown":"adopted"}));
+            text.push_str(&terminal);
+            std::fs::write(&path, &text).unwrap();
+            let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            assert!(crate::profile::selftest(&root, "o/r", &vec![], 300).unwrap_err().contains("retention bound"));
+            let lock = crate::profile::log_lock(&path).unwrap();
+            s.pass().unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "busy lock preserves evidence");
+            drop(lock);
+            s.pass().unwrap();
+            let retained = std::fs::read_to_string(&path).unwrap();
+            assert!(retained.len() as u64 <= crate::data::LOG_MAX / 2);
+            assert!(retained.starts_with("old diagnostic\n") && retained.ends_with(&terminal));
+            use std::io::Write;
+            writer.write_all(b"still open diagnostic\n").unwrap();
+            crate::profile::append_line(&path, newest).unwrap();
+            assert!(crate::profile::selftest(&root, "o/r", &vec![], 300).unwrap().contains("no overdue"));
+            assert!(!crate::profile::report(&root).contains("collection stopped"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn cfg(me: &str) -> Config {

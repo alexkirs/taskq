@@ -406,11 +406,11 @@ fn project_contract(root: &Path) -> Result<Option<PathBuf>, StartError> {
             && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
             .ok_or_else(|| refused("project registration", "invalid repository name"))?;
         let path = root.join(format!("{name}.md"));
-        if repo == crate::platform::RELEASE_REPO && !path.exists() { return Ok(None); }
+        if repo == crate::platform::RELEASE_REPO && !path.try_exists().map_err(|e| refused("project contract", e))? { return Ok(None); }
         Ok(Some(path))
     } else {
         let path = root.join("taskq.md");
-        Ok(path.exists().then_some(path))
+        Ok(path.try_exists().map_err(|e| refused("project contract", e))?.then_some(path))
     }
 }
 

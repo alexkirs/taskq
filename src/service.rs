@@ -755,6 +755,7 @@ impl<'a> Service<'a> {
         for (n, a) in stopped {
             self.ended(n, a, by_n.get(&n).copied(), None);
         }
+        crate::profile::repair_ended(&self.cfg.install, &self.cfg.repo, &me, self.board);
         self.held.retain(|l| by_n.get(&l.task).is_some_and(|v| v.task.attempt == Some(l.attempt)));
         let kids: Vec<u64> = self.kids.iter().map(|k| k.attempt).collect();
         self.unknown.retain(|a, _| kids.contains(a));
@@ -1644,6 +1645,45 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired, "repair is idempotent");
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Chain: §4 ended review -> left-board -> close -> next-pass repair -> selftest.
+    // Risk: historical attempts absent from open views permanently block unrelated workers.
+    #[test]
+    fn closed_or_left_board_attempt_gets_terminal_record() {
+        for closed in [true, false] {
+            let dir = std::env::temp_dir().join(format!("taskq-ended-{}-{closed}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let b = Fake::default();
+            let n = b.create("T", "", &["taskq".into()]).unwrap();
+            let w = b.comment(n, "taskq: spawn worker codex:w mac").unwrap();
+            b.comment(n, &format!("taskq: result {} attempt {w}", "a".repeat(40))).unwrap();
+            let a = b.comment(n, "taskq: spawn reviewer codex:r mac").unwrap();
+            assert_eq!(task(&b, n).attempt, Some(a));
+            let mut c = cfg("mac");
+            c.install = dir.clone();
+            c.root = dir.clone();
+            let path = dir.join("taskq.log");
+            let record = json!({"project": c.repo, "host":"mac", "stage":"review", "task":n,
+                "attempt":a, "rt":"codex", "outcome":"unknown", "error":"left-board", "at_ms":1});
+            std::fs::write(&path, format!("taskq-stage {record}\n")).unwrap();
+            if closed {
+                b.comment(n, "taskq: close").unwrap();
+                b.close(n).unwrap();
+            } else {
+                b.labels(n, &[], &["taskq".into()]).unwrap();
+            }
+            assert!(crate::profile::selftest(&dir, &c.repo, &vec![], 300).is_err());
+            let mut s = service(&b, &c, Default::default());
+            s.focus.clear();
+            s.pass().unwrap();
+            assert!(crate::profile::selftest(&dir, &c.repo, &vec![], 300).is_ok());
+            let repaired = std::fs::read_to_string(&path).unwrap();
+            s.pass().unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired);
+            assert!(!b.comments(n).unwrap().iter().any(|c| c.body.starts_with("taskq: gone")));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     // Chain: § 7 worker exit to review. Risk: a silent exit is not gone; a result gets no reviewer.

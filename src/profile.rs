@@ -211,6 +211,29 @@ pub fn repair(install: &Path, project: &str, host: &str, task: u64, attempt: u64
     write_stage(&install.join("taskq.log"), &r);
 }
 
+/// Repair retained attempts only when a fresh issue read proves closure or board removal.
+/// Unreadable issues/logs and attempts still on the board remain unknown.
+pub fn repair_ended(install: &Path, project: &str, host: &str, board: &dyn crate::board::Board) {
+    let Ok(rows) = read_log(install).and_then(|t| unresolved(&t)) else { return };
+    for mut r in rows.into_iter().filter(|r| r.project.as_deref() == Some(project)
+        && r.host.as_deref() == Some(host)) {
+        let Ok(issue) = board.issue(r.task) else { continue };
+        if issue.open && crate::service::is_task(&issue) { continue; }
+        let Ok(log) = crate::board::entries(board, r.task) else { continue };
+        let (outcome, error) = crate::core::stage_outcome(r.task, Ok((&log, Some(false))), r.attempt, r.attempt);
+        r.stage = if r.stage == "review" { "review" } else { "build" }.into();
+        r.open = false;
+        r.outcome = outcome.into();
+        r.error = error.into();
+        r.at_ms = now_ms();
+        r.us = None;
+        r.calls = None;
+        r.tokens = None;
+        r.unknown = Some("adopted".into());
+        write_stage(&install.join("taskq.log"), &r);
+    }
+}
+
 type Live = Vec<(String, u64)>;
 
 fn defects(text: &str, live: &Live, project: Option<&str>, now: u64, ttl: u64) -> Result<(String, usize), String> {

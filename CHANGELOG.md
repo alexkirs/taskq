@@ -3,6 +3,12 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.5.0
+
+Local telemetry uses bundled SQLite/WAL, with FULL durability, 30 days from receipt and a 64 MiB total bound including database sidecars. All five record kinds, reports and JSONL export keep their schemas. `taskq profile guide` prints the embedded offline analysis guide. Collection needs no server connection. No board change.
+
+Legacy history imports transactionally without deduplicating equal observations. The `telemetry.log/` namespace survives older updater cleanup, preserving SQLite and its sidecars during rollback. Unrecognized legacy rewrites, truncated telemetry and corrupt/newer databases remain unknown and are preserved; new SQLite collection continues when only legacy import fails. Before downgrading, keep this version's reader or export retained history: old readers see only the legacy log. Details: [storage transition](docs/design/standalone-telemetry.md#sqlite-implementation-and-transition).
+
 ## v4.4.4
 
 Worker and reviewer briefs park unchanged external blockers with the failed check and one unblock condition. Resume only after evidence that the condition passed; repeated attempts are not recovery. No board format change.

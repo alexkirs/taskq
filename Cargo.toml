@@ -1,13 +1,14 @@
 [package]
 name = "taskq"
-version = "4.4.4"
+version = "4.5.0"
 edition = "2024"
 publish = false
 
 [dependencies]
-coreq = { git = "https://github.com/taskqorg/coreq", rev = "35529c0d0b6349900ac6650bf16cabc846483d4e" }
+coreq = { git = "https://github.com/taskqorg/coreq", rev = "61dff3c7700c637403a081280f328c241928bf01" }
 tracing = "0.1"
 ring = "0.17"
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
@@ -46,7 +47,7 @@ strip = true
 lto = true
 
 [build-dependencies]
-coreq-instrument = { git = "https://github.com/taskqorg/coreq", rev = "35529c0d0b6349900ac6650bf16cabc846483d4e" }
+coreq-instrument = { git = "https://github.com/taskqorg/coreq", rev = "61dff3c7700c637403a081280f328c241928bf01" }
 
 [[bin]]
 name = "taskq"

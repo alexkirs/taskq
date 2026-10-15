@@ -292,6 +292,7 @@ fn brief(root: &Path, install: &Path, req: &Value) -> String {
     }
     format!(
         "You are the taskq operator (taskq.md R3): answer the owner's request about the taskq projects below. Use normal tools within configured permissions and the owner request. Read exact project paths, never discover unrelated folders. Do not bypass runtime denials, change permissions or log in. Missing authority: clarify. Queue mutations use TaskQ commands and authoritative readback.\n\
+         For time, context, usage or cost questions, run `taskq profile guide`, then its local analysis commands; retain unknown values and the observed window.\n\
          Reply with exactly one JSON object and nothing else: {{\"kind\": \"result|clarify|proposal|refuse\", \"text\": \"...\", \"ops\": [...]}}.\n\
          - result: verified answer or completed authorized work; text names changes, checks and partial/unknown effects. Never also propose an action already performed.\n\
          - clarify: the request is unclear or its scope ambiguous; text is one question. Never widen a scope to guess.\n\

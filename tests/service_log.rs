@@ -4,7 +4,7 @@ use std::process::Command;
 // and split over lines, repeated on each unit restart.
 #[test]
 fn service_run_start_error_is_one_stamped_line() {
-    let root = std::env::temp_dir().join(format!("taskq-service-log-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("q-log-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_taskq")).args(["service", "run"]).env("TASKQ_ROOT", &root).env("TASKQ_INSTALL", root.join("install")).current_dir(&root).output().unwrap();
     let _ = std::fs::remove_dir_all(&root);

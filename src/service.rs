@@ -552,7 +552,13 @@ impl<'a> Service<'a> {
     }
 
     fn may_launch(&self) -> bool {
-        self.hold.is_none() && self.cap.is_ok() && self.gate.may_launch(self.mono)
+        let refusal = if self.hold.is_some() { Some("hold") }
+            else if self.cap.is_err() { Some("config") }
+            else if !self.gate.may_launch(self.mono) {
+                Some(self.gate.state(self.mono).1.first().map_or("launch-interval", |r| r.0))
+            } else { None };
+        if let Some(code) = refusal { tracing::info!(coreq_refusal = code); }
+        refusal.is_none()
     }
 
     fn auto(&self) -> bool {
@@ -970,6 +976,7 @@ impl<'a> Service<'a> {
             self.beat()?;
         }
         if self.focus.is_empty() {
+            tracing::info!(coreq_refusal = "focus");
             if let Some(host) = &self.host { if let Ok(mut h) = host.lock() { h.ready(&self.cfg.root, false); } }
             return Ok(());
         }
@@ -1400,6 +1407,82 @@ mod tests {
 
     fn task(b: &Fake, n: u64) -> Task {
         core::fold(n, &entries(b, n).unwrap(), false)
+    }
+
+    // Chain: Resume process -> project wakeup -> separate scheduler process -> durable admission evidence.
+    // Board and process adapters are fakes; real command functions, scheduler and shared collector run unchanged.
+    #[test]
+    fn resume_handoff_links_the_service_decision() {
+        let dir = std::env::temp_dir().join(format!("qh-{}", std::process::id()));
+        for held in [true, false] {
+            std::fs::create_dir_all(dir.join(".taskq")).unwrap();
+            std::fs::create_dir_all(dir.join("i")).unwrap();
+            std::fs::write(dir.join(".taskq/focus"), "off").unwrap();
+            std::fs::write(dir.join(".taskq/focus.paused"), "all").unwrap();
+            if held { std::fs::write(dir.join("i/hold"), "private owner reason").unwrap(); }
+            for mode in ["resume", "service"] {
+                let child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "service::tests::resume_handoff_child", "--ignored"])
+                    .env("TASKQ_HANDOFF_ROOT", &dir).env("TASKQ_HANDOFF_MODE", mode)
+                    .env("TASKQ_INSTALL", dir.join("i")).env("TASKQ_ROOT", &dir).env("TASKQ_INCIDENT_REPORTS", "off")
+                    .output().unwrap();
+                assert!(child.status.success(), "{mode}: {}\n{}", String::from_utf8_lossy(&child.stdout), String::from_utf8_lossy(&child.stderr));
+            }
+            let reader = coreq::telemetry::Reader::open(&dir.join("i/telemetry.log/universal.sqlite3")).unwrap();
+            let mut observations = Vec::new(); let mut after = 0;
+            loop {
+                let page = reader.export(0, after, 1024).unwrap();
+                let rows = page["events"].as_array().unwrap();
+                if rows.is_empty() { break; }
+                let next = rows.last().unwrap()["seq"].as_i64().unwrap();
+                assert!(next > after, "export cursor did not advance");
+                after = next;
+                observations.extend(rows.iter().map(|r| r["observation"].clone()));
+            }
+            let terminal = |name: &str| observations.iter().find(|r| r["operation"] == name && r["kind"] == "method").unwrap();
+            let command = terminal("taskq.resume");
+            let poke = terminal("taskq.poke");
+            let wake = terminal("taskq.continuation");
+            assert_eq!(poke["trace"], command["trace"]);
+            assert_eq!(wake["trace"], command["trace"]);
+            assert_eq!(wake["parent"], poke["span"]);
+            assert_eq!(terminal("taskq.service.Service.pass")["trace"], command["trace"]);
+            if held {
+                assert!(observations.iter().any(|r| r["operation"] == "taskq.service.Service.may_launch" && r["kind"] == "method"
+                    && r["trace"] == command["trace"] && r["outcome"] == "refused" && r["error"] == "hold"));
+                assert!(!observations.iter().any(|r| r["operation"] == "taskq.service.Service.launch"));
+                assert_eq!(std::fs::read_to_string(dir.join("i/hold")).unwrap(), "private owner reason");
+            } else {
+                let launch = terminal("taskq.service.Service.launch");
+                assert_eq!(launch["trace"], command["trace"]);
+                assert_eq!(launch["outcome"], "ok");
+            }
+            let text = serde_json::to_string(&observations).unwrap();
+            assert!(!text.contains("private owner reason") && !text.contains(dir.to_str().unwrap()));
+            drop(reader);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess helper exercised by resume_handoff_links_the_service_decision"]
+    fn resume_handoff_child() {
+        let dir = PathBuf::from(std::env::var_os("TASKQ_HANDOFF_ROOT").unwrap());
+        let _runtime = coreq::telemetry::capture::Runtime::install(&dir.join("i/telemetry.log/universal.sqlite3"), "taskq", "fixture").unwrap();
+        if std::env::var("TASKQ_HANDOFF_MODE").unwrap() == "resume" {
+            crate::resume(&dir).unwrap();
+        } else {
+            let mut seen = None;
+            let link = crate::wake_context(&dir.join(".taskq/poke"), &mut seen).unwrap().unwrap();
+            assert!(crate::wake_context(&dir.join(".taskq/poke"), &mut seen).unwrap().is_none());
+            let _wakeup = link.span().entered();
+            let mut c = cfg("fixture"); (c.root, c.install) = (dir.clone(), dir.join("i"));
+            let b = Fake::default(); let n = b.create("Wake fixture", "", &["taskq".into()]).unwrap();
+            let e: Exits = Default::default(); let mut s = service(&b, &c, e.clone());
+            s.focus = crate::data::focus(&dir).unwrap(); s.pass().unwrap();
+            assert_eq!(task(&b, n).state, if c.install.join("hold").exists() { State::Ready } else { State::Doing });
+            assert_eq!(e.borrow().len(), usize::from(!c.install.join("hold").exists()));
+        }
     }
 
     // Chain: Resume during a pass -> wake -> fresh admission; a host hold still refuses the launch.

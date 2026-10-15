@@ -248,8 +248,35 @@ fn dot(root: &Path) -> PathBuf {
 }
 
 fn poke(root: &Path) {
+    use std::io::Write;
     let _ = fs::create_dir_all(dot(root));
-    touch(&dot(root).join("poke"));
+    let context = coreq::telemetry::capture::TraceContext::current().map(|c| c.encode()).unwrap_or_else(|| ".".into());
+    // Lock the existing signal so a reader cannot accept ids mixed from two concurrent writes.
+    let written = (|| -> Res<()> {
+        let mut file = fs::OpenOptions::new().write(true).create(true).truncate(false).open(dot(root).join("poke")).map_err(|_| "poke-open")?;
+        file.try_lock().map_err(|_| "poke-lock")?;
+        file.set_len(0).map_err(|_| "poke-truncate")?;
+        file.write_all(context.as_bytes()).map_err(|_| "poke-write".into())
+    })();
+    if written.is_err() {
+        tracing::error!(error = "poke-write");
+    }
+}
+
+fn wake_context(path: &Path, seen: &mut Option<String>) -> Res<Option<coreq::telemetry::capture::TraceContext>> {
+    use std::io::Read;
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => { *seen = None; return Ok(None); }
+        Err(_) => return Err("wakeup context unreadable".into()),
+    };
+    file.try_lock_shared().map_err(|_| "wakeup context busy")?;
+    let mut text = String::new();
+    file.take(129).read_to_string(&mut text).map_err(|_| "wakeup context unreadable")?;
+    if seen.as_ref() == Some(&text) { return Ok(None); }
+    let link = if matches!(text.as_str(), "" | ".") { None } else { Some(coreq::telemetry::capture::TraceContext::decode(&text)?) };
+    *seen = Some(text);
+    Ok(link)
 }
 
 /// Bump `p`'s mtime. Not `fs::write(p, "")`: on Windows rewriting an empty file keeps its mtime.
@@ -664,9 +691,11 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
     let mut policy_exchange = resources::Exchanger::default();
     let mut panics = host::Panics::default();
     let pokes = [d.join("poke"), cfg.install.join("poke")];
+    let mut observed_poke = None;
     loop {
         let poke_start = poke_times(&pokes);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Res<()> {
+        let wakeup = wake_context(&pokes[0], &mut observed_poke).ok().flatten().map(|link| link.span().entered());
         let reduced = panics.quarantined() || began.elapsed().as_secs() < panics.until;
         // § 3: capacity reloads before each admission decision; children are untouched
         let cap = fs::read_to_string(cfg.root.join("taskq.json")).map_err(|e| e.to_string())
@@ -773,6 +802,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             status[k] = v;
         }
         let _ = coreq::status::write(&tool, &cfg.root, &status);
+        drop(wakeup);
         if host.is_none() && is_installed && began.elapsed().as_secs() >= cfg.rollback_after {
             let h = cfg.install.join("releases").join(platform::VERSION).join("healthy");
             if !h.exists() {
@@ -2350,6 +2380,38 @@ mod tests {
     use super::*;
     use board::Fake;
     use dispatch::close_one;
+
+    // Chain: shared wakeup metadata -> bounded, locked read -> link or explicit unknown.
+    #[test]
+    fn wakeup_context_refuses_partial_or_busy_input() {
+        let root = std::env::temp_dir().join(format!("qw-link-{}", std::process::id()));
+        fs::create_dir_all(dot(&root)).unwrap();
+        let path = dot(&root).join("poke"); let mut seen = None;
+        assert!(wake_context(&path, &mut seen).unwrap().is_none());
+        for text in [Vec::new(), b".".to_vec()] {
+            fs::write(&path, text).unwrap();
+            assert!(wake_context(&path, &mut seen).unwrap().is_none());
+        }
+        for text in [b"1 incomplete".to_vec(), vec![b'x'; 129], vec![255]] {
+            fs::write(&path, text).unwrap();
+            assert!(wake_context(&path, &mut seen).is_err());
+        }
+        let context = format!("1 {}.1 {}.2", "a".repeat(32), "a".repeat(32));
+        fs::write(&path, &context).unwrap();
+        let writer = fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        writer.try_lock().unwrap();
+        assert_eq!(wake_context(&path, &mut seen).unwrap_err(), "wakeup context busy");
+        writer.unlock().unwrap();
+        writer.try_lock_shared().unwrap();
+        poke(&root);
+        assert_eq!(fs::read_to_string(&path).unwrap(), context, "busy reader allowed a partial overwrite");
+        assert_eq!(wake_context(&path, &mut seen).unwrap().unwrap().encode(), context);
+        assert!(wake_context(&path, &mut seen).unwrap().is_none());
+        drop(writer);
+        poke(&root);
+        assert!(wake_context(&path, &mut seen).unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     // Chain: § 5 stale TASKQ_ROOT (#1072). Risk: a reused session's command writes into another project.
     #[test]

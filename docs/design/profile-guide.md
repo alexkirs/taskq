@@ -24,6 +24,8 @@ Rules for the agent:
 | Who spends the board budget? | `taskq profile` | `Board requests by source` (past hour) | exists, past hour only |
 | Is the service itself slow? | `taskq profile` | `Profile` table: `Operation`, `Count`, `p50/p95/max ms`, `Success/failure`, `Failure %`, `Variance ms²`, `Errors` | exists |
 
+For Resume, follow `taskq.resume` to its `taskq.poke` span, then a `taskq.continuation` whose `parent` is that poke and whose trace matches. Its service descendants show the observed pass: `taskq.service.Service.may_launch` can end `refused` with `hold`, `config`, `sample`, `cpu`, `memory`, `cooldown` or `launch-interval`; `taskq.service.Service.launch` records a launch call's outcome. A successful Resume or pass alone does not prove a child started. Pokes coalesce; a missing continuation means delivery is unknown, including superseded or legacy signals. Task filters and runtime-access refusals still lack complete semantic coverage.
+
 Report shape for the owner: one line per question, the number with its unit and window, then the unknowns with reasons. Example (invented): `Build p95 on claude: 412 s over 18 attempts (retained 21 h); context tokens 2.1 M (17 of 18 known; no-usage); calls on codex not reported; attempt elapsed time unknown (gap G2); cost unknown (no price).`
 
 Named gaps G1–G4: no windowed bare report, per-attempt elapsed-time view, monetary cost, or context-source breakdown. These values remain unknown.

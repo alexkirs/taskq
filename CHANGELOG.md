@@ -3,7 +3,13 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
-## Unreleased
+## v4.2.0
+
+The operator workspace, pinned tray window and native notifications bring task questions, results and recovery into the tray. Services add host admission controls, worker access grants, runtime preferences and attempt profiling; delivery adds owner approval gates and reusable task recipes. DashQ connection and shared project controls use the same board-backed task state.
+
+GitHub services and workers now use the owner-installed host board token, with no environment or CLI-login fallback. Provision it on each host before updating; a missing or unreadable token prevents board access. Never run `gh auth login` from a worker.
+
+**Board**: keep tasks using owner gates or `review-pr` delivery off older services: 4.1.11 ignores approval entries. Enable these flows only after every board host runs a compatible version. Existing tasks need no edits.
 
 The host heartbeat adds a `machine <hostname>[ wsl]` line (agentq `host.name`) so DashQ joins taskq and agentq into one Hosts row per machine. Older readers ignore the line. No board change.
 

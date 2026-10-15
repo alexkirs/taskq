@@ -44,6 +44,31 @@ At 10:13:10 UTC, after actual selftest and service appends, the log had grown to
 
 ## Limits and rollback
 
-A1 artifact integrity/provenance and A2 running legacy project-service activation were verified. A3 live bound recovery, continued appends and backup retention were observed; terminal evidence survived in backups, not the current retained window. A4 live selftest exited 0 before and after pruning, with the post-pruning terminal claim explicitly unknown under R12. The updater's EOF error remains unexplained. Short-window recovery is not sustained stability or host-service migration qualification. #1243 was not answered or requeued.
+A1 artifact integrity/provenance and A2 running legacy project-service activation were verified. The first A3/A4 probe left the terminal claim unknown; the corrective observation below proves retained genuine terminal evidence, collection and selftest after live pruning. The updater's EOF error remains unexplained. Short-window recovery is not sustained stability or host-service migration qualification. #1243 was not answered or requeued.
 
 Rollback uses the existing updater/launcher previous-version mechanism with 4.4.2 retained; no live rollback was exercised, because that would reintroduce the pruning scheduling defect. Binary rollback cannot reconstruct pruned records; restore evidence only from the verified backup and do not overwrite the live log during normal operation.
+
+## Corrective live verification after review
+
+The review rejected A3 because the first probe discarded all stage records. This is a qualification repair under R12 and §7, with no code, rule, test or guard change. The earlier unknown remains recorded above.
+
+Through SSH `desktop`, a bounded read-only observation waited for an actual service-owned attempt to finish. The existing Windows reviewer for task #1231, attempt `6189747861`, produced a genuine `review` terminal record with `outcome=retried`, `at_ms=1792059705979`. No task was created, answered, stopped or otherwise changed for this probe; no stage was fabricated or replayed from backup.
+
+At 10:23:20 UTC, the probe acquired the existing `taskq-profile.lock` with `FileStream.Lock(0, Int64.MaxValue)` and read the live log through `File.Open(..., Open, Read, ReadWrite)`. It saved the complete 2,141,541-byte snapshot to `.taskq/release-1258-backup/terminal-pre-probe.log`. SHA-256 of captured bytes and saved backup matched `cf9a22ae5c09adbfbe533ad5aca54931921cce6a4b34d76cd478627429dca7fe`. The exact genuine terminal line was also saved separately in `genuine-terminal.txt`. The existing earlier backups remain untouched.
+
+The terminal began at byte 2,134,210. Before writing, the probe asserted that it would remain inside the newest half, with a 1,024-byte safety margin. It appended 2,053,787 bytes of explicitly invented plain diagnostic padding, ending with a newline, through `File.Open(..., Append, Write, ReadWrite)`; it did not overwrite or truncate. The resulting 4,195,328-byte live log exceeded the unchanged 4 MiB bound and collection cutoff. The probe released the lock and touched only the registered project's `.taskq/poke`; the existing service performed retention. Its JSON manifest is `terminal-probe.json` beside the backup.
+
+At 10:23:57 UTC, readback found 2,099,038 bytes and the exact genuine terminal line retained. All 470 recognized `taskq-profile`, `taskq-board`, `taskq-stage` and `taskq-transition` JSON records parsed, with zero corrupt records. Completed `service.pass` records started at `1792059802220` and `1792059811438` ms. Status advanced to `1792059815`; CIM still found PID 9052 on 4.4.3, with executable SHA-256 `25a5a3d8ea15600414ffa3638c06ff3a64e822b96b9bbea8a72ead0b67c3e14b`. Backup hash readback still matched.
+
+Commands executed from the registered TaskQ root, with `$exe` resolved to the installed `releases/4.4.3/taskq.exe`:
+
+```powershell
+& $exe selftest
+& $exe profile export
+```
+
+Live `selftest` returned exit 0: 72 golden traces, formats and board read passed; terminal guard reported `no overdue nonlive defects in retained window`, rather than `unknown (no stage observations)`. `profile export` returned exit 0 with 550 valid JSON rows and no invalid rows. The raw export remains private in `.taskq/release-1258-backup/post-retention-export.jsonl`. These commands and continuing service passes append real diagnostics without disabling the guard or raising the bound.
+
+Repeat observation at 10:24:53 UTC, after these commands and further real appends, found 2,107,002 bytes, the same exact terminal line, 554 valid recognized JSON records and zero corrupt records. New completed pass starts were `1792059872500` and `1792059885003` ms; status advanced to `1792059886`. PID 9052, version and executable hash were unchanged, and the diagnostic backup hash still matched. The repeated `& $exe selftest` again exited 0 with 72 traces, formats, board and `no overdue nonlive defects in retained window`. Thus the corrective probe closes the observed A3/A4 gap; it does not establish sustained stability or a live rollback. #1243 remains waiting for the owner.
+
+On this corrective attempt, `cargo test --locked` again passed 230 unit and 6 integration tests, with 2 ignored. Memory/Seatbelt checks were sandbox-blocked, not PASS. `cargo run --locked -- selftest` exited 0; local installed profiling/request-log appends were sandbox-blocked/unknown. No tests or golden traces were changed.

@@ -508,14 +508,22 @@ fn render_tasks(export: &str) -> Result<String, &'static str> {
     let none = |v: &Option<String>| v.clone().unwrap_or_else(|| "none".into());
     let mut states: BTreeMap<(String, String, String), (Vec<u64>, usize)> = BTreeMap::new();
     let mut tasks: BTreeMap<(String, u64, String, String, String), (Vec<u64>, usize)> = BTreeMap::new();
-    for r in rows.iter().filter(|r| r.kind == "transition") {
+    // § 4 Profiling: several services may record one move; one per project, task and entry counts, a known time wins
+    let mut unique: BTreeMap<(Option<String>, Option<u64>, Result<u64, usize>), &Row> = BTreeMap::new();
+    let moves: Vec<_> = rows.iter().filter(|r| r.kind == "transition").collect();
+    for (i, r) in moves.iter().enumerate() {
+        let kept = unique.entry((r.project.clone(), r.task, r.entry.ok_or(i))).or_insert(*r);
+        if kept.prev_s.is_none() { *kept = *r; }
+    }
+    for r in unique.values() {
         let (from, rt, host) = (none(&r.from), none(&r.runtime), none(&r.host));
         let project = r.project.clone().unwrap_or_else(|| "unknown (not recorded)".into());
         for g in [states.entry((from.clone(), rt.clone(), host.clone())).or_default(), tasks.entry((project, r.task.unwrap_or(0), from, rt, host)).or_default()] {
             match r.prev_s { Some(s) => g.0.push(s), None => g.1 += 1 }
         }
     }
-    let mut out = format!("Time in state: retained queue transitions; moves while no service ran unknown\n{}", window(&h));
+    let mut out = format!("Time in state: retained queue transitions; moves while no service ran unknown\n{}Transitions: {} unique of {} rows (deduplicated by project, task and entry)\n",
+        window(&h), unique.len(), moves.len());
     if states.is_empty() { return Ok(out + "States by time: unknown (no transitions)\n"); }
     // unknown-only groups rank after every known one, never as zero
     let p95 = |s: &[u64]| (s.is_empty(), std::cmp::Reverse(s.get((s.len() * 95).div_ceil(100).max(1) - 1).copied()));
@@ -798,6 +806,11 @@ Changed: x"))];
             t(Some("o/a"), 8, "doing", "review", Some(7), Some("claude"), Some("lin"), 131),
             t(Some("o/a"), 8, "doing", "review", None, Some("claude"), Some("lin"), 132),
             t(Some("o/b"), 9, "ask", "ready", None, Some("codex"), Some("win"), 133),
+            // duplicates by project, task and entry count once, a known time winning; the same task and entry in another project is its own move
+            t(Some("o/a"), 5, "doing", "review", Some(100), Some("claude"), Some("mac"), 110),
+            t(Some("o/a"), 10, "ready", "doing", None, Some("codex"), Some("lin"), 134),
+            t(Some("o/a"), 10, "ready", "doing", Some(50), Some("codex"), Some("lin"), 134),
+            t(Some("o/b"), 5, "ready", "doing", Some(20), Some("codex"), Some("win"), 110),
             b("list", 4000, None, Some(4900), 100), b("list", 2000, Some("http5xx"), Some(4100), 101), b("claim", 1000, None, None, 102),
             format!("{BOARD_PREFIX}{{\"op\":\"lunch\"}}\n"),
             format!("{PREFIX}{}\n", serde_json::to_string(&Record { op: "spawn".into(), us: 7, error: "none".into(), at_ms: Some(140), trace: None }).unwrap()),
@@ -806,7 +819,7 @@ Changed: x"))];
         ].concat();
         let text = export(&log, Some(100));
         let mut lines = text.lines();
-        assert_eq!(lines.next().unwrap(), format!(r#"{{"schema":1,"columns":{},"since_ms":100,"window_ms":[100,150],"samples":12,"corrupt":1}}"#, serde_json::to_string(&COLUMNS).unwrap()));
+        assert_eq!(lines.next().unwrap(), format!(r#"{{"schema":1,"columns":{},"since_ms":100,"window_ms":[100,150],"samples":16,"corrupt":1}}"#, serde_json::to_string(&COLUMNS).unwrap()));
         let first: serde_json::Map<String, serde_json::Value> = serde_json::from_str(lines.next().unwrap()).unwrap();
         assert_eq!(first.keys().collect::<Vec<_>>(), COLUMNS.iter().collect::<Vec<_>>());
         assert_eq!(serde_json::Value::Object(first), serde_json::json!({"kind":"transition","at_ms":100,"project":"o/a","task":5,"attempt":null,"entry":100,"name":null,
@@ -814,9 +827,19 @@ Changed: x"))];
         assert!(text.contains(r#""kind":"stage","at_ms":150,"project":"o/a","task":5,"attempt":9,"entry":null,"name":"build""#), "{text}");
         assert!(!text.contains("999"), "a record before the window is not exported");
         let tasks = render_tasks(&text).unwrap();
-        assert!(tasks.contains("Window: 100..150 Unix ms (since 100); 12 samples, 1 corrupt skipped"), "{tasks}");
-        assert!(tasks.contains("| doing | codex | win | 1 | 300.000/300.000/300.000 |\n| doing | claude | mac | 2 | 100.000/100.000/100.000 (1 of 2 known; no entry time) |\n| ready | claude | mac | 1 | 10.000/10.000/10.000 |"), "{tasks}");
-        assert!(tasks.contains("| o/b | #5 | doing | codex | win | 1 | 300 | 300.000/300.000/300.000 |\n| o/a | #5 | doing | claude | mac | 1 | 100 |"), "{tasks}");
+        assert!(tasks.contains("Window: 100..150 Unix ms (since 100); 16 samples, 1 corrupt skipped; earlier/pruned history unknown
+Transitions: 9 unique of 11 rows"), "{tasks}");
+        assert!(tasks.contains("| doing | codex | win | 1 | 300.000/300.000/300.000 |
+| doing | claude | mac | 2 | 100.000/100.000/100.000 (1 of 2 known; no entry time) |
+| ready | codex | lin | 1 | 50.000/50.000/50.000 |
+| ready | codex | win | 1 | 20.000/20.000/20.000 |
+| ready | claude | mac | 1 | 10.000/10.000/10.000 |"), "{tasks}");
+        // the duplicate o/a #5 entry counts once (not 2, 200 s); o/a #10 keeps its known time; o/b #5 entry 110 stays its own
+        assert!(tasks.contains("| o/b | #5 | doing | codex | win | 1 | 300 | 300.000/300.000/300.000 |
+| o/a | #5 | doing | claude | mac | 1 | 100 | 100.000/100.000/100.000 |
+| o/a | #10 | ready | codex | lin | 1 | 50 | 50.000/50.000/50.000 |
+| o/b | #5 | ready | codex | win | 1 | 20 | 20.000/20.000/20.000 |
+"), "{tasks}");
         assert!(tasks.contains("| o/a | #5 | ready | claude | mac | 1 | 10 | 10.000/10.000/10.000 |
 | o/a | #8 | doing | claude | lin | 2 | 7 partial (1 of 2 known) | 7.000/7.000/7.000 (1 of 2 known; no entry time) |
 | o/b | #9 | ask | codex | win | 1 | unknown (no entry time) | unknown (no entry time) |

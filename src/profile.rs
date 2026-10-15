@@ -19,6 +19,8 @@ thread_local!(static PARENT: Cell<u64> = const { Cell::new(0) });
 #[cfg(test)]
 thread_local!(static OBSERVED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) });
 #[cfg(test)]
+thread_local!(static STAGED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) });
+#[cfg(test)]
 pub fn take_report() -> String {
     OBSERVED.with(|v| render(&std::mem::take(&mut *v.borrow_mut())).unwrap())
 }
@@ -126,6 +128,8 @@ pub fn class(text: &str) -> &'static str { error(text) }
 
 /// One `taskq-stage` line in this process's `taskq.log`; a failed write is reported unknown, never fails the stage.
 pub fn stage(name: &'static str, task: u64, attempt: u64, rt: &str, took: Option<std::time::Duration>, outcome: &'static str, err: &'static str, usage: Usage) {
+    #[cfg(test)]
+    STAGED.with(|v| v.borrow_mut().push(format!("{name} {task} {attempt} {rt} {outcome} {err}")));
     stage_at(LOG.get().map(PathBuf::as_path), name, task, attempt, rt, took, outcome, err, usage)
 }
 
@@ -452,6 +456,26 @@ Changed: x"))];
             assert_eq!(crate::core::stage_outcome(7, Ok((log.as_slice(), Some(live))), 10, 10), want, "{:?}", log.last().map(|e| &e.body));
         }
         stage_at(Some(&path), "review", 7, 11, "codex", ms(6), "unknown", "left-board", Usage::Unknown("log-unreadable"));
+        // `close` times the whole command: an unreadable task, a gate refusal, a stale revision, a non-publication close
+        // and a publication each record one `close` stage (the publication also `checks`)
+        use crate::board::Board;
+        let staged = || STAGED.with(|v| std::mem::take(&mut *v.borrow_mut())).join("; ");
+        let (b, c) = (crate::board::Fake::default(), crate::tests::cfg());
+        let gated = crate::Config { delivery: "review-pr".into(), ..crate::tests::cfg() };
+        let t = b.create("T", "## Goal\ng", &["taskq".into()]).unwrap();
+        let close = |c: &crate::Config, op: &crate::dispatch::Op| crate::dispatch::close_one(&b, c, t, "ok", op).ok();
+        assert!(!close(&c, &Default::default()));
+        b.comment(t, &crate::core::entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
+        let a = crate::core::fold(t, &crate::board::entries(&b, t).unwrap(), false).attempt.unwrap();
+        b.comment(t, &crate::core::entry("result", &[&sha], Some(a), "")).unwrap();
+        b.comment(t, &crate::core::entry("spawn", &["reviewer", "codex:-", "mac"], None, "")).unwrap();
+        let a = crate::core::fold(t, &crate::board::entries(&b, t).unwrap(), false).attempt.unwrap();
+        assert!(!close(&gated, &Default::default()));
+        assert!(!close(&c, &crate::dispatch::Op { revision: Some(1), ..Default::default() }));
+        assert!(close(&c, &Default::default()));
+        assert!(!crate::dispatch::close_one(&b, &c, 999, "ok", &Default::default()).ok());
+        assert_eq!(staged(), format!("close {t} 0 other failed other; close {t} {a} codex failed other; close {t} {a} codex failed other; \
+            checks {t} {a} codex ok none; close {t} {a} codex ok none; close 999 0 other failed other"));
         let log = fs::read_to_string(&path).unwrap();
         assert!(!log.contains("secret") && !log.contains("/host/path") && !log.contains("private-rt"));
         let text = report(&dir);

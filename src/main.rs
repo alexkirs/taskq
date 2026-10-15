@@ -2277,7 +2277,7 @@ mod tests {
         assert!(r.is_err_and(|x| x.contains("needs the load gate")), "Auto with the gate off is refused");
     }
 
-    fn cfg() -> Config {
+    pub(crate) fn cfg() -> Config {
         Config {
             root: std::env::temp_dir().join("taskq-main-test"),
             install: PathBuf::from("/nonexistent"),

@@ -182,11 +182,23 @@ fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &
 }
 
 /// § 7: publish a reviewed result, then `close`; later and failed tasks close without publication.
+/// § 4 Profiling: the `close` stage times the whole command, from entry through every receipt.
 pub fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op) -> Receipt {
+    let began = std::time::Instant::now();
+    let mut seen = (0, "other".to_string(), None);
+    let r = close_body(b, cfg, n, verdict, op, &mut seen);
+    let (outcome, err) = seen.2.unwrap_or(if r.ok() { ("ok", "none") } else { ("failed", crate::profile::class(&r.reason)) });
+    crate::profile::stage("close", n, seen.0, &seen.1, Some(began.elapsed()), outcome, err, crate::profile::Usage::NoModel);
+    r
+}
+
+/// `seen`: the attempt and runtime once read, and an outcome override (a pending publication is retried).
+fn close_body(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op, seen: &mut (u64, String, Option<(&'static str, &'static str)>)) -> Receipt {
     let (issue, t, _) = match current(b, n) {
         Ok(x) => x,
         Err(e) => return Receipt::rejected(n, op, e),
     };
+    *seen = (t.attempt.unwrap_or(0), t.session.as_deref().and_then(|s| s.split(':').next()).unwrap_or("other").to_string(), None);
     // a retried close returns its first receipt before publishing again
     if t.state == State::Closed || op.id.is_some() && entries(b, n).is_ok_and(|l| l.iter().any(|e| core::op_id(n, &e.body) == op.id.as_deref())) {
         return act(b, &cfg.root, n, "close", &[], verdict, op);
@@ -205,18 +217,17 @@ pub fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op) ->
             if op.revision.is_some_and(|r| r != rev) {
                 return act(b, &cfg.root, n, "close", &[], verdict, op); // the stale receipt, before any publication
             }
-            // § 4 Profiling: `checks` is the CI verification and merge call, `close` the whole publication
-            let (began, attempt) = (std::time::Instant::now(), t.attempt.unwrap_or(0));
-            let rt = t.session.as_deref().and_then(|s| s.split(':').next()).unwrap_or("other").to_string();
-            let stage = |name, began: std::time::Instant, outcome, err| crate::profile::stage(name, n, attempt, &rt, Some(began.elapsed()), outcome, err, crate::profile::Usage::NoModel);
+            // § 4 Profiling: `checks` is the CI verification and merge call
+            let began = std::time::Instant::now();
             let published = b.publish(n, &sha, &cfg.publish, &issue.title, &format!("Task: {}", b.url(n)));
             let (outcome, err) = match &published {
                 Publish::Done(_) => ("ok", "none"),
                 Publish::Pending(_) => ("retried", "none"),
                 Publish::Failed(m) => ("failed", crate::profile::class(m)),
             };
-            stage("checks", began, outcome, err);
-            let r = match published {
+            crate::profile::stage("checks", n, seen.0, &seen.1, Some(began.elapsed()), outcome, err, crate::profile::Usage::NoModel);
+            if outcome == "retried" { seen.2 = Some((outcome, err)); }
+            match published {
                 Publish::Done(m) => {
                     // § 7 publication receipt: the policy it ran under and what the board read back
                     let m = format!("delivery {} r{}: {m}", cfg.delivery, cfg.delivery_revision);
@@ -229,10 +240,7 @@ pub fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op) ->
                     let r = act(b, &cfg.root, n, "requeue", &[], &format!("publication failed: {m}"), &Op::default());
                     Receipt::rejected(n, op, if r.ok() { format!("requeued: {m}") } else { format!("publication failed: {m}; {}", r.reason) })
                 }
-            };
-            let (outcome, err) = if r.ok() { ("ok", "none") } else if outcome == "ok" { ("failed", crate::profile::class(&r.reason)) } else { (outcome, err) };
-            stage("close", began, outcome, err);
-            r
+            }
         }
         s => Receipt { state: Some(s.name()), ..Receipt::rejected(n, op, format!("#{n} is {}: `close` not accepted", s.name())) },
     }

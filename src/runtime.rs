@@ -773,9 +773,19 @@ impl Proc for ClaudeTurn {
         if self.done { return Ok(Some(0)); }
         let rows = claude_agents(&self.root)?;
         let row = rows.iter().find(|v| v["id"] == self.id).ok_or("Claude session unavailable; state unknown")?;
+        self.observe(row)
+    }
+    fn kill(&mut self) { if let Err(e) = claude_stop(&self.root, &self.id, self.pid) { log!("{e}"); } }
+    fn id(&self) -> u32 { self.pid }
+}
+
+impl ClaudeTurn {
+    fn observe(&mut self, row: &serde_json::Value) -> Result<Option<i32>, String> {
+        // Failed background launches can have neither status nor a transcript (#1208).
+        if matches!(row["state"].as_str(), Some("failed" | "stopped")) { return Ok(Some(-1)); }
         // On Windows a waking session briefly publishes a different UUID before restore.
         if !self.announced {
-            if row["status"].as_str().is_none() { return if row["state"] == "stopped" { Ok(Some(-1)) } else { Ok(None) }; }
+            if row["status"].as_str().is_none() { return Ok(None); }
             let session = row["sessionId"].as_str().ok_or("Claude session ID unknown")?;
             if !self.session.is_empty() && self.session != session { return Err("Claude resumed another conversation; identity unknown".into()); }
             self.session = session.into();
@@ -793,7 +803,7 @@ impl Proc for ClaudeTurn {
         for event in turn.iter().skip(self.copied) { writeln!(log, "{event}").map_err(|e| e.to_string())?; }
         self.copied = turn.len();
         if row["status"] != "idle" && row["state"] != "done" && row["state"] != "blocked" {
-            return if row["state"] == "stopped" { Ok(Some(-1)) } else { Ok(None) };
+            return Ok(None);
         }
         if !turn.iter().any(|v| v["type"] == "system" && v["subtype"] == "turn_duration") { return Ok(None); }
         let answer = turn.iter().rev().filter(|v| v["type"] == "assistant").find_map(|v|
@@ -803,8 +813,6 @@ impl Proc for ClaudeTurn {
         self.done = true;
         Ok(Some(0))
     }
-    fn kill(&mut self) { if let Err(e) = claude_stop(&self.root, &self.id, self.pid) { log!("{e}"); } }
-    fn id(&self) -> u32 { self.pid }
 }
 
 /// Only a URL registered by the native session is a Remote Control link.
@@ -1165,6 +1173,22 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&install);
+    }
+
+    // Chain: service failed reviewer launch -> exit -> gone (the service reviewer test covers the pass).
+    // Risk: missing status/transcript masks a terminal native job and renews its lease forever.
+    #[test]
+    fn claude_failed_launch_exits_without_status_or_transcript() {
+        let mut t = ClaudeTurn { root: PathBuf::new(), log: PathBuf::new(), session: String::new(),
+            id: "invented-job".into(), announced: false, copied: 0, before: 0, mode: "dontAsk".into(),
+            input: "invented input".into(), pid: 0, done: false };
+        for state in ["failed", "stopped"] {
+            assert_eq!(t.observe(&serde_json::json!({"state":state})), Ok(Some(-1)));
+            t.announced = true;
+            assert_eq!(t.observe(&serde_json::json!({"state":state,"status":"working"})), Ok(Some(-1)));
+            t.announced = false;
+        }
+        assert_eq!(t.observe(&serde_json::json!({"state":"working"})), Ok(None));
     }
 
     // Chain: § 8 codex-app handshake -> open thread -> queue -> one new `task_complete` on this host's app.

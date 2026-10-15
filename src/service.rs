@@ -1197,6 +1197,44 @@ mod tests {
         }
     }
 
+    // Chain: Windows native reviewer launch -> service pass -> gone, on a disposable board only.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live Claude reviewer; TASKQ_CLAUDE_ROOT selects the worktree"]
+    fn live_claude_reviewer_exit_writes_gone() {
+        use crate::runtime::{ClaudeTurn, Env, access, log_path};
+        let mut c = cfg("win");
+        c.root = PathBuf::from(std::env::var("TASKQ_CLAUDE_ROOT").expect("TASKQ_CLAUDE_ROOT"));
+        c.install = std::env::temp_dir().join(format!("taskq-claude-{}", std::process::id()));
+        std::fs::create_dir_all(&c.install).unwrap();
+        crate::policy::grant(&c.install, "claude", "full", None, "op", 1).unwrap();
+        let env = Env { root: &c.root, exe: std::path::Path::new("taskq"), install: &c.install, permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
+        let b = Fake::default();
+        let n = b.create("Exit qualification", "", &["taskq".into()]).unwrap();
+        let a = b.comment(n, "taskq: spawn worker claude:invented win").unwrap();
+        b.comment(n, &core::entry("result", &["0123456789abcdef0123456789abcdef01234567"], Some(a), "invented candidate")).unwrap();
+        let mut s = Service::new(&b, &c, "4.4.0", Box::new(|l| {
+            assert_eq!(l.role, "reviewer");
+            let text = format!("{}\nReply EXIT_CHECK and do nothing else.", "Qualification input only.\n".repeat(1800));
+            ClaudeTurn::start(&env, l, &log_path(env.root, l), &text, &access(&env, "claude").unwrap())
+                .map(|t| Box::new(t) as Box<dyn Proc>).map_err(|message| crate::runtime::StartError::io(std::io::Error::other(message), None))
+        }));
+        s.focus = vec!["all".into()];
+        s.pass().unwrap();
+        let r = task(&b, n).attempt.unwrap();
+        assert_ne!(r, a);
+        eprintln!("win reviewer start attempt {r}");
+        // End only this disposable native job; do not wait through Claude's spawn-retry backoff.
+        s.kids[0].proc.kill();
+        s.pass().unwrap();
+        let log = b.comments(n).unwrap();
+        for comment in &log { eprintln!("{}", comment.body); }
+        for kid in &mut s.kids { kid.proc.kill(); }
+        assert!(log.iter().any(|e| e.body.contains(&format!("taskq: gone attempt {r}"))), "next pass must reap the native terminal job");
+        assert!(task(&b, n).result.is_some());
+        std::fs::remove_dir_all(&c.install).unwrap();
+    }
+
     type Exits = Rc<RefCell<Vec<(u64, Rc<RefCell<Option<i32>>>)>>>;
 
     fn service<'a>(b: &'a Fake, c: &'a Config, exits: Exits) -> Service<'a> {

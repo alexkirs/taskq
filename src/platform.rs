@@ -37,10 +37,20 @@ pub fn log_line(at: i64, text: &str) -> String {
     format!("{} {}", crate::board::stamp(at), text.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" "))
 }
 
+thread_local!(static PROJECT_LOG: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) });
+
+pub fn project_log(path: PathBuf) { PROJECT_LOG.set(Some(path)); }
+
 pub fn log(text: &str) {
     if is_service_log() {
         let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-        eprintln!("{}", log_line(at, text));
+        let line = log_line(at, text);
+        PROJECT_LOG.with_borrow(|p| {
+            use std::io::Write;
+            if let Some(p) = p { let _ = fs::OpenOptions::new().create(true).append(true).open(p).and_then(|mut f| writeln!(f, "{line}")); }
+        });
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{line}");
     } else {
         eprintln!("{text}");
     }

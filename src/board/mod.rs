@@ -343,7 +343,7 @@ pub struct Api {
     clock: RefCell<i64>,
     label_schema: RefCell<Option<bool>>,
     /// Request accounting and rate-limit pause of this process (§ 4).
-    budget: RefCell<crate::requests::Budget>,
+    budget: crate::requests::Shared,
     /// Labels whose catalog definition this process has read back: verified once per process (§ 4 budget).
     labels_ok: RefCell<std::collections::HashSet<String>>,
     #[cfg(test)]
@@ -352,7 +352,8 @@ pub struct Api {
 
 impl Api {
     fn new(root: String, base: String, token: &str) -> Api {
-        Api { base, root, auth: format!("Authorization: Bearer {token}"), me: RefCell::new(None), clock: RefCell::new(0), label_schema: RefCell::new(None), budget: RefCell::default(), labels_ok: RefCell::default(), #[cfg(test)] transport: None }
+        let budget = crate::requests::Shared::for_api(&root, token);
+        Api { base, root, auth: format!("Authorization: Bearer {token}"), me: RefCell::new(None), clock: RefCell::new(0), label_schema: RefCell::new(None), budget, labels_ok: RefCell::default(), #[cfg(test)] transport: None }
     }
 
     fn call(&self, method: &str, url: &str, body: Option<Value>) -> Result<Reply> {
@@ -371,6 +372,7 @@ impl Api {
         if !url.starts_with(&format!("{}/", self.root)) {
             return Err(format!("refused: {url} is outside the board API"));
         }
+        if let Some(reason) = &self.budget.borrow().unknown { return Err(format!("board requests held: {reason}")); }
         if let Some(reset) = self.budget.borrow_mut().paused(std::time::Instant::now()) {
             return Err(format!("{method} {url}: {}", crate::requests::paused_text(reset)));
         }
@@ -1063,6 +1065,31 @@ mod tests {
             let b = h.requests();
             assert_eq!((b.total(), b.remaining, b.paused_until()), (2, Some(0), iso("2026-10-14T04:41:00Z")));
         }
+    }
+
+    // Chain: § 4 two project adapters -> shared host/token pause. Risk: another project keeps sending after 429,
+    // or a different credential inherits that pause. Fake transport proves it without board writes.
+    #[test]
+    fn host_project_adapters_share_budget_and_pause_by_credential() {
+        std::thread::spawn(|| {
+            crate::host::enter(std::path::Path::new("invented-root"), std::path::Path::new("invented-install"));
+            let sent = std::rc::Rc::new(RefCell::new(0));
+            let make = |token: &str, status: u16| {
+                let mut api = (github::KIND.api)("github.com", "invented/project", token);
+                let sent = sent.clone();
+                api.transport = Some(Box::new(move |_, _, _| {
+                    *sent.borrow_mut() += 1;
+                    Ok(Reply { status, headers: vec![("retry-after".into(), "60".into())], body: "{}".into(), operation: "read" })
+                })); api
+            };
+            let a = make("invented-host-budget-token", 429);
+            let b = make("invented-host-budget-token", 200);
+            let different = make("invented-other-budget-token", 200);
+            assert!(a.call("GET", "/issues", None).err().unwrap().contains("paused"));
+            assert!(b.call("GET", "/issues", None).err().unwrap().contains("paused"));
+            assert_eq!(*sent.borrow(), 1); assert_eq!(b.budget.borrow().total(), 1);
+            assert!(different.call("GET", "/issues", None).is_ok()); assert_eq!(*sent.borrow(), 2);
+        }).join().unwrap();
     }
 
     // Chain: § 4 board budget, GitHub open list over GraphQL. Risk: the list loses a page, a field or trust, falls back

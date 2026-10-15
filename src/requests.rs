@@ -21,8 +21,30 @@ const MAX_PAUSE: i64 = 3600;
 /// Operations named in the hourly log line; the rest add up to `other`.
 const TOP: usize = 8;
 
+/// One counter/pause per API host and credential, shared by all project threads; never store the token as a key.
+pub struct Shared(std::sync::Arc<Mutex<Budget>>);
+impl Default for Shared {
+    fn default() -> Self { Self(std::sync::Arc::new(Mutex::new(Budget::default()))) }
+}
+impl Shared {
+    pub fn for_api(root: &str, auth: &str) -> Self {
+        if !crate::host::active() { return Self::default(); }
+        static BUDGETS: std::sync::OnceLock<Mutex<BTreeMap<String, std::sync::Arc<Mutex<Budget>>>>> = std::sync::OnceLock::new();
+        let key = ring::digest::digest(&ring::digest::SHA256, format!("{root}\0{auth}").as_bytes()).as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>();
+        Self(BUDGETS.get_or_init(Default::default).lock().expect("board budget registry poisoned").entry(key).or_default().clone())
+    }
+    pub fn borrow(&self) -> std::sync::MutexGuard<'_, Budget> {
+        match self.0.lock() {
+            Ok(b) => b,
+            Err(e) => { let mut b = e.into_inner(); b.unknown = Some("board budget state poisoned".into()); b }
+        }
+    }
+    pub fn borrow_mut(&self) -> std::sync::MutexGuard<'_, Budget> { self.borrow() }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Budget {
+    pub unknown: Option<String>,
     /// Requests sent since the process started, by operation.
     pub ops: BTreeMap<String, u64>,
     /// Last `remaining`/`limit`/reset (board seconds) per budget (`x-ratelimit-resource`: GitHub `core`, `graphql`).
@@ -98,7 +120,7 @@ impl Budget {
 
     /// The budget alarm (§ 4): the last `remaining` is at most 20 % of `limit`.
     pub fn low(&self) -> bool {
-        matches!((self.remaining, self.limit), (Some(r), Some(l)) if l > 0 && r * 5 <= l)
+        self.unknown.is_none() && matches!((self.remaining, self.limit), (Some(r), Some(l)) if l > 0 && r * 5 <= l)
     }
 
     /// The largest operation since the cumulative counts `start` (this process's current hour).
@@ -108,6 +130,7 @@ impl Budget {
 
     /// `status.json` `requests` (§ 4): `hour` the counts of the last full hour, `start` the cumulative counts at its end.
     pub fn json(&self, since: u64, hour: Option<&BTreeMap<String, u64>>, start: &BTreeMap<String, u64>) -> Value {
+        if let Some(reason) = &self.unknown { return json!({"reason": reason, "since": since, "total": null, "ops": null, "last_hour": null}); }
         json!({"since": since, "total": self.total(), "ops": self.ops, "last_hour": hour, "remaining": self.remaining, "limit": self.limit, "resource": self.resource,
             "reset": self.reset.map(crate::board::stamp), "top": self.top(start).map(|(op, n)| format!("{op} {n}")),
             "paused_until": self.paused_until().map(crate::board::stamp)})
@@ -137,6 +160,7 @@ pub fn summary(ops: &BTreeMap<String, u64>, unit: &str) -> String {
 /// Owner lines of a `status.json` `requests` (§ 4, § 5 `service status`): the last full hour, else unknown, and a pause.
 pub fn lines(status: &Value) -> Vec<String> {
     let r = &status["requests"];
+    if let Some(reason) = r["reason"].as_str() { return vec![format!("Board requests: unknown ({reason})")]; }
     let mut out = vec![match r["last_hour"].as_object() {
         Some(h) => format!("Board requests: {}", summary(&h.iter().filter_map(|(k, v)| Some((k.clone(), v.as_u64()?))).collect(), "/h")),
         None if r.is_object() => "Board requests: unknown (no full hour yet)".into(),
@@ -158,6 +182,8 @@ pub fn warning(status: &Value) -> Option<String> {
     (limit > 0 && remaining * 5 <= limit).then(|| format!("Board budget low: {remaining}/{limit}{resource} until {} ({host}); top here: {}",
         r["reset"].as_str().unwrap_or("unknown"), r["top"].as_str().unwrap_or("none")))
 }
+
+pub fn totals() -> BTreeMap<String, u64> { PROCESS.lock().map(|p| p.clone()).unwrap_or_default() }
 
 /// Counts one request of this process for its exit record.
 pub fn tally(op: &str) {

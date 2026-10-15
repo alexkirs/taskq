@@ -14,8 +14,8 @@ const ERRORS: [&str; 9] = ["none", "http4xx", "http5xx", "timeout", "permission"
 static LOG: OnceLock<PathBuf> = OnceLock::new();
 static TRACE: OnceLock<bool> = OnceLock::new();
 static RUN: OnceLock<Option<u64>> = OnceLock::new();
-static PROJECT: OnceLock<String> = OnceLock::new();
-static HOST: OnceLock<String> = OnceLock::new();
+thread_local!(static PROJECT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) });
+thread_local!(static HOST: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) });
 static SPAN: AtomicU64 = AtomicU64::new(1);
 thread_local!(static PARENT: Cell<u64> = const { Cell::new(0) });
 
@@ -60,11 +60,11 @@ pub fn init(install: &Path) {
 /// This process's board `owner/name` for stage and transition records (#1174); an unsafe name is kept as `other`.
 pub fn project(repo: &str) {
     let ok = repo.len() <= 128 && repo.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b));
-    let _ = PROJECT.set(if ok { repo } else { "other" }.into());
+    PROJECT.set(Some(if ok { repo } else { "other" }.into()));
 }
 
 pub fn host(name: &str) {
-    let _ = HOST.set(name.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).take(128).collect());
+    HOST.set(Some(name.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).take(128).collect()));
 }
 
 fn error(text: &str) -> &'static str {
@@ -303,7 +303,7 @@ fn stage_at(path: Option<&Path>, name: &'static str, task: u64, attempt: u64, rt
         Usage::Unknown(r) => (None, None, Some(r)),
         Usage::Known { calls, tokens } => (calls, tokens, tokens.is_none().then_some("no-usage")),
     };
-    let r = Stage { host: HOST.get().cloned(), open: false, project: PROJECT.get().cloned(), stage: name.into(), task, attempt, rt: RUNTIMES.into_iter().find(|k| *k == rt).unwrap_or("other").into(),
+    let r = Stage { host: HOST.with_borrow(Clone::clone), open: false, project: PROJECT.with_borrow(Clone::clone), stage: name.into(), task, attempt, rt: RUNTIMES.into_iter().find(|k| *k == rt).unwrap_or("other").into(),
         us: took.map(|d| d.as_micros().min(u64::MAX as u128) as u64), outcome: outcome.into(), error: err.into(), at_ms: now_ms(), calls, tokens, unknown: unknown.map(Into::into) };
     let Some(path) = path else { return };
     let line = serde_json::to_string(&r).map(|j| format!("{STAGE_PREFIX}{j}\n"));
@@ -403,7 +403,7 @@ pub fn board(kind: &'static str, took: std::time::Duration, failed: Option<&str>
 pub fn transition(task: u64, entry: u64, from: &'static str, to: &'static str, prev_s: Option<u64>, rt: Option<&str>, host: Option<&str>) {
     // a host name is the operator's own short label; anything else is not kept
     let host = host.map(|h| if h.len() <= 64 && h.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) { h } else { "other" });
-    let r = Transition { project: PROJECT.get().cloned(), task, entry, from: from.into(), to: to.into(), prev_s,
+    let r = Transition { project: PROJECT.with_borrow(Clone::clone), task, entry, from: from.into(), to: to.into(), prev_s,
         rt: rt.map(|r| RUNTIMES.into_iter().find(|k| *k == r).unwrap_or("other").into()), host: host.map(Into::into), at_ms: now_ms() };
     #[cfg(test)]
     MOVED.with(|v| { *v.borrow_mut() += &format!("{TRANSITION_PREFIX}{}\n", serde_json::to_string(&r).unwrap()); });
@@ -512,6 +512,8 @@ fn append(path: &Path, r: &Record) -> std::io::Result<()> {
 
 /// One record line under the profile lock and retention bound; other record kinds use their own prefix (§ 4 budget).
 pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _writer = WRITER.lock().map_err(|_| std::io::Error::other("profile writer poisoned"))?;
     let full = || fs::metadata(path).is_ok_and(|m| m.len() > crate::data::LOG_MAX - 512);
     // A full log is refused before the lock too: appenders then never take the lock from the pruner's nonblocking try.
     if full() {
@@ -770,6 +772,29 @@ pub fn view(install: &Path, name: &str, since: Option<&str>) -> Result<String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: § 4 simultaneous project stages -> one host log. Risk: first-project identity leaks or writes collide.
+    #[test]
+    fn project_threads_keep_stage_identity_and_serialize_appends() {
+        let dir = std::env::temp_dir().join(format!("taskq-profile-threads-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap(); let path = dir.join("taskq.log"); let _ = fs::remove_file(&path);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let joins: Vec<_> = ["invented/one", "invented/two"].into_iter().map(|repo| {
+            let (path, barrier) = (path.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                project(repo); host("invented-host"); barrier.wait();
+                stage_at(Some(&path), "start", 1, 7, "codex", Some(std::time::Duration::ZERO), "ok", "none", Usage::NoModel);
+            })
+        }).collect();
+        for j in joins { j.join().unwrap(); }
+        let text = fs::read_to_string(&path).unwrap();
+        let projects: std::collections::BTreeSet<_> = text.lines().map(|l| {
+            let r: Stage = serde_json::from_str(l.strip_prefix(STAGE_PREFIX).unwrap()).unwrap();
+            assert_eq!(r.host.as_deref(), Some("invented-host")); r.project.unwrap()
+        }).collect();
+        assert_eq!(projects, ["invented/one".to_string(), "invented/two".to_string()].into_iter().collect());
+        fs::remove_dir_all(dir).unwrap();
+    }
     // Chain: §4 terminal report; completed owner waits must not erase hand-in evidence,
     // while a new build/review lifetime must expose a later vanished turn.
     #[test]

@@ -332,3 +332,6 @@ Improvement proposals the PM makes in chat, one line each, oldest first: `- YYYY
 - 2026-10-15 Separate Pin and Top, fix the draggable header, keep resized dimensions, fit first open at current DPI/font and accept first clicks on macOS; approved in #1104 (from owner request in chat)
 
 - 2026-10-15 Put task metadata and links on the first row and the full wrapped title on the second; approved in #1104 from #1099 (from owner steering)
+- 2026-10-15 Standalone install: a tray warning badge offers agentq onboarding (cache cost saving) and one OK starts the install session; design task #1184 (from owner request in chat)
+- 2026-10-15 Standalone telemetry: the same records kept locally, nothing sent without serverq, plus an agent guide and commands so any session reports time, context and cost on request; design task #1185 after #1174 (from owner request in chat)
+- 2026-10-15 Publication refuses "not rebased on current main" and burns a worker attempt plus a reviewer round each time (#1164, #1049, #1166 in one hour); let close rebase a clean branch itself, or let the reviewer attempt rebase and rerun checks before the verdict (from PM observation of three refusals in chat)

@@ -758,6 +758,10 @@ fn since_ms(s: &str, now: u64) -> Result<u64, String> {
 
 /// § 5 `taskq profile export|tasks|board [--since D]` over this host's retained log; no board access.
 pub fn view(install: &Path, name: &str, since: Option<&str>) -> Result<String, String> {
+    if name == "guide" {
+        if since.is_some() { return Err("profile guide does not accept --since".into()); }
+        return Ok(include_str!("../docs/design/profile-guide.md").into());
+    }
     let now = now_ms().ok_or("system clock before 1970")?;
     let since = since.map(|s| since_ms(s, now)).transpose()?;
     let text = export(&read_log(install)?, since);
@@ -765,13 +769,24 @@ pub fn view(install: &Path, name: &str, since: Option<&str>) -> Result<String, S
         "export" => Ok(text),
         "tasks" => render_tasks(&text).map_err(String::from),
         "board" => render_board(&text).map_err(String::from),
-        _ => Err(format!("unknown profile view: {name} (export, tasks or board)")),
+        _ => Err(format!("unknown profile view: {name} (guide, export, tasks or board)")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guide_needs_no_store() {
+        let missing = Path::new("/nonexistent/taskq-profile-guide");
+        let guide = view(missing, "guide", None).unwrap();
+        assert!(guide.contains("taskq profile export --since 7d"));
+        assert!(guide.contains("Never add"));
+        assert!(guide.contains("cost unknown"));
+        assert!(view(missing, "guide", Some("24h")).is_err());
+    }
+
 
     // Chain: § 4 simultaneous project stages -> one host log. Risk: first-project identity leaks or writes collide.
     #[test]

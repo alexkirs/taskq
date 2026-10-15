@@ -64,7 +64,7 @@ const USAGE: &str = "taskq agents
  taskq close N [M..] [--text VERDICT] | taskq approve N [--sha SHA]
  taskq recipe NAME --run ID [--goal G] [--start]
  taskq status [--only L,..] [--json] | taskq inbox N
- taskq profile [export|tasks|board] [--since 24h] | taskq retro | taskq add --retro K [--type T ..]
+ taskq profile [guide|export|tasks|board] [--since 24h] | taskq retro | taskq add --retro K [--type T ..]
  taskq wait [--window MIN] [--only L,..]
  taskq cleanup [--force] | taskq update [--check]
  taskq enroll <https-url> [--headless] | taskq connection status | taskq disconnect

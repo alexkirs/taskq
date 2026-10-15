@@ -29,6 +29,10 @@ Each call of the board adapter is one `taskq-board` line with one kind:
 | `write` | an issue create or edit |
 | `publish` | the § 7 publication |
 
+## Analysis guide
+
+`taskq profile guide` prints the embedded [analysis guide](profile-guide.md) without store, board or network access. It rejects `--since`. The operator brief names it for time, context, usage and cost questions.
+
 ## View source and window
 
 - The views read this host's retained `<install>/taskq.log` over all its projects. They make no board calls.

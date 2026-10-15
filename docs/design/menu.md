@@ -53,6 +53,7 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 
 - Compact q shows play when at least one project admits; pause for a fully paused admission set. Observation-only is distinct. Mixed shows paused N of M, excluding observation-only projects.
 - Pause stops new admission; current attempts finish. Resume restores saved focus; missing saved focus requires selection, never implicit all.
+- A failed project action returns its reason to the menu and clears its pending indicator. The error remains through status refreshes until another action for that project; successful dispatch still waits for state readback.
 - Global commands name affected projects/host and unchanged targets before apply. Per-project actions affect only that project.
 - Show pending, applied, partial failure and unknown separately; confirm application by readback.
 - Restart, pause and stop until next login have distinct effects. Stop preserves autostart; expose active-work consequences before use.

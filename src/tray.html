@@ -73,6 +73,9 @@ let manualSize=null;
 const menu=document.querySelector('.menu');
 let aiText=null,aiMenu=false,aiConfirm=null,addConfirm=false;
 let S=null,page='home',taskFilter=null,working=null,workCard=null,ask=null,noted=null,pending={},confirming=null,updating=null,draft=null;
+const actionErrors=new Map();
+function actionReceipt(r){if(!S?.projects.some(p=>p.root===r.root))return;delete pending[r.root];actionErrors.set(r.root,r.text);render();}
+function actionNotices(){return S.projects.filter(p=>actionErrors.has(p.root)).map(p=>'<div class="body alert" role="alert">'+esc(p.name)+': '+esc(actionErrors.get(p.root))+'</div>').join('');}
 // Navigation is view state only: every route consumes the same pushed snapshot.
 const routes={home:'Home',projects:'Projects',attention:'Attention',settings:'Settings',appearance:'Appearance',cadence:'Activity history',notifications:'Notifications',agents:'Agents',services:'Services',about:'About'};
 const trail=[];
@@ -402,7 +405,7 @@ function render(navigating=false){
   menu.style.setProperty('--size',S.font+'px');
   menu.classList.toggle('pinned',!!S.pinned);
   const title=working?'Work mode':taskFilter?'Tasks':p?p.name:routes[page];
-  menu.innerHTML=head()+answerNotices()+(page!=='home'||working||taskFilter?'<button data-a="back">‹ Back</button>':'')+'<h1 tabindex="-1">'+esc(title)+'</h1>'+(S.settings_error?'<div class="body alert" role="alert">Settings unknown: '+esc(S.settings_error)+'; defaults shown</div>':'')+(working?workPage():taskFilter?filteredTasks(p):p?project(p):routeBody())+'<div class="grip" data-resize="" role="button" aria-label="Resize window with arrow keys" tabindex="0"></div><nav class="options footer" aria-label="Menu"><button data-route="home">Home</button><button data-route="settings">Settings</button></nav>';
+  menu.innerHTML=head()+answerNotices()+actionNotices()+(page!=='home'||working||taskFilter?'<button data-a="back">‹ Back</button>':'')+'<h1 tabindex="-1">'+esc(title)+'</h1>'+(S.settings_error?'<div class="body alert" role="alert">Settings unknown: '+esc(S.settings_error)+'; defaults shown</div>':'')+(working?workPage():taskFilter?filteredTasks(p):p?project(p):routeBody())+'<div class="grip" data-resize="" role="button" aria-label="Resize window with arrow keys" tabindex="0"></div><nav class="options footer" aria-label="Menu"><button data-route="home">Home</button><button data-route="settings">Settings</button></nav>';
   mountAnswers();mountResources();
   menu.querySelectorAll('details').forEach((d,i)=>d.open=open[i]??(['cadence','agents','services','attention'].includes(page)));
   if(S.page!==undefined)menu.querySelectorAll('.hist,.agents,.service,.incident-notice').forEach(d=>d.open=true);
@@ -440,6 +443,7 @@ for(const event of ['pointerup','pointercancel'])addEventListener(event,release,
 addEventListener('blur',release);
 // Press end.
 window.taskq={settle,receive(s){
+  if(s.action_error){actionReceipt(s.action_error);return;}
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
   if(s.capmsg){resourceReceipt(s.capmsg);return;}
   if(s.open){openCard(s.open);return;}
@@ -483,9 +487,9 @@ menu.addEventListener('click',e=>{
   if(d.a==='confirm'||d.a==='cancel'){confirming=d.a==='confirm';render();menu.querySelector(confirming?'[data-a="cancel"]':'[data-a="confirm"]')?.focus();return;}
   if(d.a==='update'){updating={v:d.v,at:S.now};}
   if(d.a==='pick'){ask=d.root;render();return;}
-  if(d.a==='pause-all'||d.a==='resume-all'){confirming=null;for(const p of S.projects.filter(p=>mode(p)===(d.a==='pause-all'?'run':'paused'))){pending[p.root]=d.a==='pause-all'?'Pausing':'Resuming';send({a:d.a.slice(0,-4),root:p.root});}render();menu.querySelector('[data-a="confirm"]')?.focus();return;}
+  if(d.a==='pause-all'||d.a==='resume-all'){confirming=null;for(const p of S.projects.filter(p=>mode(p)===(d.a==='pause-all'?'run':'paused'))){actionErrors.delete(p.root);pending[p.root]=d.a==='pause-all'?'Pausing':'Resuming';send({a:d.a.slice(0,-4),root:p.root});}render();menu.querySelector('[data-a="confirm"]')?.focus();return;}
   if(d.a==='pause'||d.a==='resume'||d.a==='focus'){pending[d.root]=d.a==='pause'?'Pausing':'Resuming';ask=null;}
-  if(d.a)send({a:d.a,root:d.root,label:d.label});render();});
+  if(d.a){actionErrors.delete(d.root);send({a:d.a,root:d.root,label:d.label});}render();});
 menu.addEventListener('input',e=>{if(e.target.id==='ai'){aiText=e.target.value;send({a:'ai-draft',text:aiText});return;}const k=e.target.dataset.draft;if(k&&draft)draft[k]=e.target.value;});
 menu.addEventListener('focusout',e=>{const f=x=>x&&(x.id==='ai'||x.dataset&&(x.dataset.draft||x.dataset.rscField));if(f(e.target))setTimeout(()=>{if(!f(document.activeElement))render();});});
 menu.addEventListener('mousedown',e=>{if(S&&e.button===0&&e.target.closest('.head')&&!e.target.closest('button'))send({a:'drag'});});

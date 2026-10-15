@@ -867,7 +867,9 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         // only a registered project (§ 4): the page never names a path of its own
                         let root = m["root"].as_str().unwrap_or("");
                         if roots(&install).iter().any(|r| r == root) {
-                            act(a, Path::new(root), m["label"].as_str());
+                            if let Err(error) = act(a, Path::new(root), m["label"].as_str()) {
+                                push(&ui, &json!({"action_error":{"root":root,"text":error}}));
+                            }
                         }
                     }
                 }
@@ -1181,26 +1183,26 @@ fn work_area(m: &tao::monitor::MonitorHandle) -> (i32, i32, i32, i32) {
     }
 }
 
-fn act(action: &str, root: &Path, label: Option<&str>) {
+fn act(action: &str, root: &Path, label: Option<&str>) -> crate::Res<()> {
     let d = crate::dot(root);
     match action {
-        "pause" => { let _ = crate::pause(root); }
+        "pause" => { crate::pause(root)?; }
         "resume" => {
-            let _ = crate::resume(root);
+            crate::resume(root)?;
         }
         // a label of the project's open tasks, never `all` (§ 4)
         "focus" => {
             if let Some(l) = label.filter(|l| crate::status_labels(root).iter().any(|x| x == l)) {
-                let _ = crate::set_focus(root, l, None);
-            }
+                crate::set_focus(root, l, None)?;
+            } else { return Err("Label is no longer available; refresh and choose again".into()); }
         }
         // `Update now` (menu.md M9): the service checks at once (§ 4 step 7); the page waits for the version in status.json
         "update" => {
-            let _ = fs::write(d.join("update"), "");
+            fs::write(d.join("update"), "").map_err(|e| e.to_string())?;
             crate::poke(root);
         }
         "restart" => {
-            let _ = fs::write(d.join("restart"), "");
+            fs::write(d.join("restart"), "").map_err(|e| e.to_string())?;
             crate::poke(root);
         }
         "log" => {
@@ -1219,9 +1221,7 @@ fn act(action: &str, root: &Path, label: Option<&str>) {
         "incident-manual" => open(&format!("https://github.com/{}/issues/new", crate::platform::RELEASE_REPO)),
         // a separate process: on macOS `launchctl bootout` kills the service's process group, this tray included
         "stop" | "uninstall" => {
-            let Ok(me) = std::env::current_exe() else {
-                return;
-            };
+            let me = std::env::current_exe().map_err(|e| e.to_string())?;
             let mut c = std::process::Command::new(me);
             c.args(["service", action])
                 .current_dir(root)
@@ -1230,10 +1230,11 @@ fn act(action: &str, root: &Path, label: Option<&str>) {
                 .stderr(std::process::Stdio::null());
             #[cfg(unix)]
             std::os::unix::process::CommandExt::process_group(&mut c, 0);
-            let _ = crate::platform::quiet(&mut c).spawn();
+            crate::platform::quiet(&mut c).spawn().map_err(|e| e.to_string())?;
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn incident_path(root: &Path, incident: &Value) -> Option<PathBuf> {
@@ -1529,6 +1530,22 @@ fn capture(wv: &WebView, path: PathBuf, done: impl Fn() + 'static) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: native Resume -> shared command -> failure receipt; retries keep the selected focus.
+    #[test]
+    fn action_failures_reach_the_tray_caller() {
+        let root=std::env::temp_dir().join(format!("taskq-action-receipt-{}",std::process::id()));
+        fs::create_dir_all(crate::dot(&root)).unwrap();
+        fs::write(crate::dot(&root).join("focus"),"off").unwrap();
+        assert!(act("resume",&root,None).unwrap_err().contains("no saved focus"));
+        assert_eq!(fs::read_to_string(crate::dot(&root).join("focus")).unwrap(),"off");
+        fs::write(crate::dot(&root).join("focus.paused"),"telemetry-fixture").unwrap();
+        act("resume",&root,None).unwrap();
+        assert_eq!(fs::read_to_string(crate::dot(&root).join("focus")).unwrap(),"telemetry-fixture");
+        assert!(act("focus",&root,Some("stale-label")).is_err());
+        fs::remove_dir_all(&root).unwrap();
+        assert!(act("pause",&root,None).is_err());
+    }
 
     // Chain: R12 tray evidence -> `tray --snapshot --route`. Risk: a filtered run captures the full matrix or drops a route.
     #[test]

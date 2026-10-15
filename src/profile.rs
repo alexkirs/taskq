@@ -517,16 +517,23 @@ fn render_tasks(export: &str) -> Result<String, &'static str> {
     }
     let mut out = format!("Time in state: retained queue transitions; moves while no service ran unknown\n{}", window(&h));
     if states.is_empty() { return Ok(out + "States by time: unknown (no transitions)\n"); }
-    let p95 = |s: &[u64]| if s.is_empty() { 0 } else { s[(s.len() * 95).div_ceil(100) - 1] };
+    // unknown-only groups rank after every known one, never as zero
+    let p95 = |s: &[u64]| (s.is_empty(), std::cmp::Reverse(s.get((s.len() * 95).div_ceil(100).max(1) - 1).copied()));
     let mut states: Vec<_> = states.into_iter().map(|(k, (mut s, u))| { s.sort_unstable(); (k, s, u) }).collect();
-    states.sort_by(|a, b| p95(&b.1).cmp(&p95(&a.1)).then(a.0.cmp(&b.0)));
+    states.sort_by(|a, b| p95(&a.1).cmp(&p95(&b.1)).then(a.0.cmp(&b.0)));
     out += "\nStates by p95\n\n| State | Runtime | Host | Count | p50/p95/max s |\n|---|---|---|---:|---|\n";
     for ((state, rt, host), s, u) in &states { out += &format!("| {state} | {rt} | {host} | {} | {} |\n", s.len() + u, in_state(s, *u)); }
     let mut tasks: Vec<_> = tasks.into_iter().map(|(k, (mut s, u))| { s.sort_unstable(); (k, s, u) }).collect();
-    tasks.sort_by(|a, b| b.1.iter().sum::<u64>().cmp(&a.1.iter().sum::<u64>()).then(a.0.cmp(&b.0)));
+    let sum = |s: &[u64]| (s.is_empty(), std::cmp::Reverse(s.iter().sum::<u64>()));
+    tasks.sort_by(|a, b| sum(&a.1).cmp(&sum(&b.1)).then(a.0.cmp(&b.0)));
     out += "\nTasks by total time in state\n\n| Project | Task | State | Runtime | Host | Count | Total s | p50/p95/max s |\n|---|---|---|---|---|---:|---:|---|\n";
     for ((project, task, state, rt, host), s, u) in tasks.iter().take(20) {
-        out += &format!("| {project} | #{task} | {state} | {rt} | {host} | {} | {} | {} |\n", s.len() + u, s.iter().sum::<u64>(), in_state(s, *u));
+        let total = match (s.is_empty(), *u) {
+            (true, _) => "unknown (no entry time)".into(),
+            (false, 0) => s.iter().sum::<u64>().to_string(),
+            (false, u) => format!("{} partial ({} of {} known)", s.iter().sum::<u64>(), s.len(), s.len() + u),
+        };
+        out += &format!("| {project} | #{task} | {state} | {rt} | {host} | {} | {total} | {} |\n", s.len() + u, in_state(s, *u));
     }
     if tasks.len() > 20 { out += &format!("{} more task states\n", tasks.len() - 20); }
     Ok(out)
@@ -538,7 +545,7 @@ fn render_board(export: &str) -> Result<String, &'static str> {
     let mut ops: BTreeMap<String, (Vec<u64>, BTreeMap<String, usize>, Option<u64>)> = BTreeMap::new();
     for r in rows.iter().filter(|r| r.kind == "board") {
         let o = ops.entry(r.name.clone().unwrap_or_default()).or_default();
-        o.0.push(r.us.unwrap_or(0));
+        o.0.push(r.us.ok_or("export board row without duration")?);
         if r.outcome.as_deref() == Some("failed") { *o.1.entry(r.error.clone().unwrap_or_default()).or_default() += 1; }
         if let Some(m) = r.remaining { o.2 = Some(o.2.map_or(m, |x| x.min(m))); }
     }
@@ -788,6 +795,9 @@ Changed: x"))];
             t(Some("o/b"), 5, "doing", "review", Some(300), Some("codex"), Some("win"), 120),
             t(None, 6, "doing", "ask", None, Some("claude"), Some("mac"), 130),
             t(Some("o/a"), 7, "ready", "doing", Some(999), None, None, 1),
+            t(Some("o/a"), 8, "doing", "review", Some(7), Some("claude"), Some("lin"), 131),
+            t(Some("o/a"), 8, "doing", "review", None, Some("claude"), Some("lin"), 132),
+            t(Some("o/b"), 9, "ask", "ready", None, Some("codex"), Some("win"), 133),
             b("list", 4000, None, Some(4900), 100), b("list", 2000, Some("http5xx"), Some(4100), 101), b("claim", 1000, None, None, 102),
             format!("{BOARD_PREFIX}{{\"op\":\"lunch\"}}\n"),
             format!("{PREFIX}{}\n", serde_json::to_string(&Record { op: "spawn".into(), us: 7, error: "none".into(), at_ms: Some(140), trace: None }).unwrap()),
@@ -796,7 +806,7 @@ Changed: x"))];
         ].concat();
         let text = export(&log, Some(100));
         let mut lines = text.lines();
-        assert_eq!(lines.next().unwrap(), format!(r#"{{"schema":1,"columns":{},"since_ms":100,"window_ms":[100,150],"samples":9,"corrupt":1}}"#, serde_json::to_string(&COLUMNS).unwrap()));
+        assert_eq!(lines.next().unwrap(), format!(r#"{{"schema":1,"columns":{},"since_ms":100,"window_ms":[100,150],"samples":12,"corrupt":1}}"#, serde_json::to_string(&COLUMNS).unwrap()));
         let first: serde_json::Map<String, serde_json::Value> = serde_json::from_str(lines.next().unwrap()).unwrap();
         assert_eq!(first.keys().collect::<Vec<_>>(), COLUMNS.iter().collect::<Vec<_>>());
         assert_eq!(serde_json::Value::Object(first), serde_json::json!({"kind":"transition","at_ms":100,"project":"o/a","task":5,"attempt":null,"entry":100,"name":null,
@@ -804,10 +814,17 @@ Changed: x"))];
         assert!(text.contains(r#""kind":"stage","at_ms":150,"project":"o/a","task":5,"attempt":9,"entry":null,"name":"build""#), "{text}");
         assert!(!text.contains("999"), "a record before the window is not exported");
         let tasks = render_tasks(&text).unwrap();
-        assert!(tasks.contains("Window: 100..150 Unix ms (since 100); 9 samples, 1 corrupt skipped"), "{tasks}");
+        assert!(tasks.contains("Window: 100..150 Unix ms (since 100); 12 samples, 1 corrupt skipped"), "{tasks}");
         assert!(tasks.contains("| doing | codex | win | 1 | 300.000/300.000/300.000 |\n| doing | claude | mac | 2 | 100.000/100.000/100.000 (1 of 2 known; no entry time) |\n| ready | claude | mac | 1 | 10.000/10.000/10.000 |"), "{tasks}");
         assert!(tasks.contains("| o/b | #5 | doing | codex | win | 1 | 300 | 300.000/300.000/300.000 |\n| o/a | #5 | doing | claude | mac | 1 | 100 |"), "{tasks}");
-        assert!(tasks.contains("| unknown (not recorded) | #6 | doing | claude | mac | 1 | 0 | unknown (no entry time) |"), "{tasks}");
+        assert!(tasks.contains("| o/a | #5 | ready | claude | mac | 1 | 10 | 10.000/10.000/10.000 |
+| o/a | #8 | doing | claude | lin | 2 | 7 partial (1 of 2 known) | 7.000/7.000/7.000 (1 of 2 known; no entry time) |
+| o/b | #9 | ask | codex | win | 1 | unknown (no entry time) | unknown (no entry time) |
+| unknown (not recorded) | #6 | doing | claude | mac | 1 | unknown (no entry time) | unknown (no entry time) |"), "{tasks}");
+        assert!(tasks.contains("| ready | claude | mac | 1 | 10.000/10.000/10.000 |
+| doing | claude | lin | 2 | 7.000/7.000/7.000 (1 of 2 known; no entry time) |
+| ask | codex | win | 1 | unknown (no entry time) |"), "unknown-only state ranks last: {tasks}");
+        assert!(!tasks.contains("| 0 |"), "unknown never reads zero: {tasks}");
         let board = render_board(&text).unwrap();
         assert!(board.contains("Slow (p95): list > claim\nFailing (rate): list > claim\nRate-limit use (lowest remaining): list\n"), "{board}");
         assert!(board.contains("| claim | 1 | 1.000/1.000/1.000 | 0.00 | none | unknown (not reported) |\n| list | 2 | 2.000/4.000/4.000 | 50.00 | http5xx:1 | 4100 |"), "{board}");

@@ -423,12 +423,15 @@ fn shots_gate(git_bin: &str, root: &Path, sha: &str) -> Res<()> {
 }
 
 /// § 7 close verdict: Changed, Checks naming every Acceptance item `A<k> ok|gap|unknown` and CI, Open.
-/// § 7: a reviewed result closes with the verdict template naming its SHA; later/failed tasks and bare closes keep free text.
-fn close_check(text: &str, issue: &board::Issue, t: &Task) -> Res<()> {
+/// § 7: deferred publication accepts merge-result CI; synchronous routes name the result SHA.
+fn close_check(text: &str, issue: &board::Issue, t: &Task, deferred: bool) -> Res<()> {
     if t.state != State::Review || text.is_empty() {
         return Ok(());
     }
     close_verdict(text, &issue.body)?;
+    if deferred && text.lines().any(|l| l.starts_with("Checks:") && l.contains("CI") && (l.contains("merge-result") || l.contains("merge_group"))) {
+        return Ok(());
+    }
     if t.result.as_deref().is_some_and(|sha| text.lines().any(|l| l.starts_with("Checks:") && l.contains(sha))) { Ok(()) } else { Err("Checks: name the exact result SHA with the CI outcome".into()) }
 }
 
@@ -443,7 +446,7 @@ fn close_verdict(text: &str, body: &str) -> Res<()> {
             return Err(format!("Checks: name A{k} ok|gap|unknown"));
         }
     }
-    if checks.contains("CI") { Ok(()) } else { Err("Checks: name the CI outcome on the result SHA".into()) }
+    if checks.contains("CI") { Ok(()) } else { Err("Checks: name the route's CI outcome".into()) }
 }
 
 /// Selftest of the rendered forms: a result, a close verdict, and an ask card answered by the hand-typed form (§ 2).
@@ -2201,7 +2204,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             let mut out = vec![];
             for i in 1..a.pos.len() {
                 let n = a.num(i)?;
-                out.push(close_checked(b, cfg, n, text, &op, &|issue, t| close_check(text, issue, t)));
+                out.push(close_checked(b, cfg, n, text, &op, &|issue, t| close_check(text, issue, t, b.defer_publication(&cfg.publish))));
             }
             emit(&out, json)
         }
@@ -3071,6 +3074,34 @@ mod tests {
         b.state.borrow_mut().fail_publication_cancel = false;
         assert!(act(&b, &c.root, n, "later", &[], "cancel", &Op::default()).ok());
         assert_eq!(fold(n, &entries(&b, n).unwrap(), false).state, State::Later);
+    }
+
+    // Chain: §7 CLI close -> route-specific verdict -> publication. Adapter tests bypass the CLI validation.
+    // Risk: pending queue CI or a distinct merge SHA is rejected, or direct publication loses its exact-SHA check.
+    #[test]
+    fn cli_close_accepts_merge_result_ci_only_for_deferred_publication() {
+        for ci in ["merge-result CI pending", "merge_group CI green on bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"] {
+            for queued in [true, false] {
+                let b = Fake::default();
+                let n = b.create("Invented close", "A1. published", &["taskq".into()]).unwrap();
+                let a = b.comment(n, "taskq: spawn worker codex:w win").unwrap();
+                b.comment(n, &entry("result", &[&"a".repeat(40)], Some(a), "candidate")).unwrap();
+                b.state.borrow_mut().publish = if queued { "queue-admitted" } else { "" }.into();
+                let c = Ctx { cfg: cfg(), raw: json!({}), board: Box::new(b) };
+                let verdict = format!("Changed: reviewed\nChecks: A1 ok; {ci}\nOpen: none");
+                let args = Args::parse(&["close".into(), n.to_string(), "--text".into(), verdict]).unwrap();
+                assert_eq!(command(&c, "close", &args).is_ok(), queued);
+                let t = fold(n, &entries(c.board.as_ref(), n).unwrap(), false);
+                assert_eq!(t.publication.is_some(), queued);
+                assert!(c.board.issue(n).unwrap().open);
+                if !queued {
+                    let verdict = format!("Changed: reviewed\nChecks: A1 ok; CI green on {}\nOpen: none", "a".repeat(40));
+                    let args = Args::parse(&["close".into(), n.to_string(), "--text".into(), verdict]).unwrap();
+                    command(&c, "close", &args).unwrap();
+                    assert!(!c.board.issue(n).unwrap().open);
+                }
+            }
+        }
     }
 
     #[test]

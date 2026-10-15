@@ -2452,7 +2452,10 @@ mod tests {
         assert!(core::depends("Depends on dashq#36").iter().all(|d| d.repo.is_some()));
         let held = b.create("H", "Depends on dashq#36", &["q-held".into()]).unwrap();
         assert!(!is_task(&b.issue(held).unwrap()) && is_held(&b.issue(held).unwrap()));
-        let c = cfg("mac");
+        let mut c = cfg("mac");
+        // Isolate profiling records so terminal repair cannot add unrelated board reads.
+        c.install = std::env::temp_dir().join(format!("taskq-dependencies-{}", crate::runtime::uuid()));
+        std::fs::create_dir_all(&c.install).unwrap();
         let raw = json!({});
         let report = || crate::snapshot::read(&b, &c, &raw, &[]).text(&c, &raw).unwrap();
         let mut s = service(&b, &c, Default::default());
@@ -2471,6 +2474,7 @@ mod tests {
         s.pass().unwrap();
         assert_eq!(task(&b, n).state, State::Doing, "eligible within one pass after the blocker completed");
         assert_eq!(b.state.borrow().reads, 1, "closed dependencies already read are cached: only dashq#36 read again");
+        std::fs::remove_dir_all(&c.install).unwrap();
     }
 
     // Chain: § 3 priority order. Risk: legacy priority labels order or filter wrong.

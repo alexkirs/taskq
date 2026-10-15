@@ -39,7 +39,7 @@ Synthetic storefront data, captured from the dark tray menu. These are examples,
 
 ### From any agent chat
 
-The tray and the CLI are not the only way in. Any Claude or Codex session that has taskq available runs the same commands from its chat, so you ask in words and the agent runs them. The outputs below are real; the conversation lines are condensed.
+The tray and the CLI are not the only way in. Any agent session that has taskq available, not only Claude or Codex, runs the same commands from its chat, so you ask in words and the agent runs them. The outputs below are real; the conversation lines are condensed.
 
 **Board state and a worker question.** In a project manager chat:
 

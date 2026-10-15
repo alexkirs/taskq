@@ -394,6 +394,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
         format!(
             "Review the result SHA against each Acceptance item `A<k>` and taskq.md, and CI on that exact SHA. Requeue only for\n\
              Acceptance or contract gaps, not style; a changed or deleted existing test is a gap unless the diff changes its rule.\n\
+             A research or proposal task without an ask and owner's answer before result/close is a task-fit gap (§ 7).\n\
              {CI_WAIT}Then exactly one of:\n\
              - `{q} close {n} --text \"Changed: <user effect>\nChecks: Task fit: A1 ok|gap|unknown, A2 ..; CI <outcome> on <SHA>\nChecks: Implementation quality: <binding gaps|advisories|none>\nOpen: <item|none>\"` (it publishes),\n\
              - `{q} requeue {n} --text \"<exact fixes>\"`,\n\
@@ -405,7 +406,9 @@ pub fn brief(env: &Env, l: &Launch) -> String {
     } else {
         format!(
             "Work only in `.worktrees/taskq-{n}` on branch `taskq-{n}` from origin/main (continue an existing branch).\n\
-             Commit with the line `Task: {url}` in the message, rebase on origin/main, run the project checks, then {push}.\n\
+             For implementation changes, commit with the line `Task: {url}` in the message, rebase on origin/main, run the project checks, then {push}.\n\
+             Research or proposal tasks (type research, docs proposals) end with ask: options plus a recommendation; result only after the owner's answer.\n\
+             After the answer, deliver the approved outcome or file approved dependent tasks (§ 7); no commit is needed for research-only output.\n\
              Do not wait for CI: `close` checks it. {CI_WAIT}Then exactly one of:\n\
              - `{q} result {n} --sha <full SHA> --checks \"<command -- outcome>\" [--checks ..] --text \"Changed: <user effect>\nOpen: <item|none>\"`,\n\
              - {ask} (owner decision; Acceptance unclear or untestable; or a split of work bigger than one reviewable diff — before any code),\n\
@@ -1351,6 +1354,18 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Chain: § 7 research decision handoff (#1234). Risk: a worker bypasses owner choice or a reviewer accepts that bypass.
+    #[test]
+    fn research_decision_requires_ask_before_result() {
+        let env = Env { root: Path::new("/project"), exe: Path::new("taskq"), install: Path::new("/i"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
+        for rt in ["claude", "codex", "codex-app"] {
+            let mut l = Launch { task: 7, title: "Proposal".into(), attempt: 42, role: "worker".into(), rt: rt.into(), session: "s".into(), url: "https://b/7".into(), resume: None };
+            assert!(brief(&env, &l).contains("Research or proposal tasks (type research, docs proposals) end with ask: options plus a recommendation; result only after the owner's answer."), "{rt}: worker");
+            l.role = "reviewer".into();
+            assert!(brief(&env, &l).contains("A research or proposal task without an ask and owner's answer before result/close is a task-fit gap"), "{rt}: reviewer");
+        }
     }
 
     // Chain: § 8 rule delivery after compaction, #1211. Risk: a compacted Claude worker loses header and index, gets bodies

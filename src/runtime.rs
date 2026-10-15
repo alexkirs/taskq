@@ -397,7 +397,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
     let body = if l.role == "reviewer" {
         format!(
             "Review the result SHA against each Acceptance item `A<k>` and taskq.md, and CI on that exact SHA. Requeue only for\n\
-             Acceptance or contract gaps, not style; a changed or deleted existing test is a gap unless the diff changes its rule.\n\
+             Acceptance or contract gaps, not style.\n\
              A research or proposal task without an ask and owner's answer before result/close is a task-fit gap (§ 7).\n\
              {CI_WAIT}Then exactly one of:\n\
              - `{q} close {n} --text \"Changed: <user effect>\nChecks: Task fit: A1 ok|gap|unknown, A2 ..; CI <outcome> on <SHA>\nChecks: Implementation quality: <binding gaps|advisories|none>\nOpen: <item|none>\"` (it publishes),\n\
@@ -423,7 +423,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
             push = if env.publish == "direct" { "push the branch" } else { "push the branch and open one PR/MR into main" }
         )
     };
-    format!("{head}{body}Then stop. Everything written through taskq is public: no secrets or paths outside the repository.\n")
+    format!("{head}Changing an existing test or golden trace while preserving every assertion is a repair, named in --text with the defect it fixes; weakening or deleting an assertion needs a changed rule in the same diff and is named in --text (section 7 step 4).\n{body}Then stop. Everything written through taskq is public: no secrets or paths outside the repository.\n")
 }
 
 const SPECQ_REVISION: &str = "46f5f62389f84ce3cc4d2a526a42a5d4bacbf8be";
@@ -1367,6 +1367,21 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Chain: section 7 step 4 test repair guidance (#1245). Risk: repairs rejected or weakened assertions accepted without a rule change.
+    #[test]
+    fn briefs_distinguish_test_repairs_from_weakened_checks() {
+        let env = Env { root: Path::new("/project"), exe: Path::new("taskq"), install: Path::new("/i"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
+        let rule = "Changing an existing test or golden trace while preserving every assertion is a repair, named in --text with the defect it fixes; weakening or deleting an assertion needs a changed rule in the same diff and is named in --text (section 7 step 4).";
+        for rt in ["claude", "codex", "codex-app"] {
+            for role in ["worker", "reviewer"] {
+                let l = Launch { task: 7, title: "Repair".into(), attempt: 42, role: role.into(), rt: rt.into(), session: "s".into(), url: "https://b/7".into(), resume: None };
+                let text = brief(&env, &l);
+                assert!(text.contains(rule), "{rt}: {role}");
+                assert!(!text.contains("a changed or deleted existing test is a gap unless"), "{rt}: {role}: obsolete ban");
+            }
+        }
     }
 
     // Chain: § 7 research decision handoff (#1234). Risk: a worker bypasses owner choice or a reviewer accepts that bypass.

@@ -83,8 +83,8 @@ impl Drop for Observation<'_> {
         #[cfg(test)]
         OBSERVED.with(|v| { *v.borrow_mut() += &format!("{PREFIX}{}\n", serde_json::to_string(&self.record).unwrap()); });
         if let Some(path) = self.path {
-            if append(path, &self.record).is_err() {
-                let _ = writeln!(std::io::stderr().lock(), "Profiling: unknown (taskq.log full or append failed; service pruning required)");
+            if let Err(e) = append(path, &self.record) {
+                let _ = writeln!(std::io::stderr().lock(), "Profiling: unknown ({})", append_error(&e));
             }
         }
     }
@@ -163,8 +163,8 @@ fn stage_at(path: Option<&Path>, name: &'static str, task: u64, attempt: u64, rt
         us: took.map(|d| d.as_micros().min(u64::MAX as u128) as u64), outcome: outcome.into(), error: err.into(), at_ms: now_ms(), calls, tokens, unknown: unknown.map(Into::into) };
     let Some(path) = path else { return };
     let line = serde_json::to_string(&r).map(|j| format!("{STAGE_PREFIX}{j}\n"));
-    if line.map_err(std::io::Error::other).and_then(|l| append_line(path, &l)).is_err() {
-        let _ = writeln!(std::io::stderr().lock(), "Profiling: unknown (taskq.log full or append failed; service pruning required)");
+    if let Err(e) = line.map_err(std::io::Error::other).and_then(|l| append_line(path, &l)) {
+        let _ = writeln!(std::io::stderr().lock(), "Profiling: unknown ({})", append_error(&e));
     }
 }
 
@@ -243,8 +243,8 @@ struct Transition { #[serde(default, skip_serializing_if = "Option::is_none")] p
 fn record(prefix: &str, r: &impl Serialize) {
     let Some(path) = LOG.get() else { return };
     let line = serde_json::to_string(r).map(|j| format!("{prefix}{j}\n"));
-    if line.map_err(std::io::Error::other).and_then(|l| append_line(path, &l)).is_err() {
-        let _ = writeln!(std::io::stderr().lock(), "Profiling: unknown (taskq.log full or append failed; service pruning required)");
+    if let Err(e) = line.map_err(std::io::Error::other).and_then(|l| append_line(path, &l)) {
+        let _ = writeln!(std::io::stderr().lock(), "Profiling: unknown ({})", append_error(&e));
     }
 }
 
@@ -334,9 +334,31 @@ impl Drop for LogLock {
 }
 
 pub fn log_lock(path: &Path) -> std::io::Result<LogLock> {
+    acquire_log_lock(path, false)
+}
+
+fn acquire_log_lock(path: &Path, wait: bool) -> std::io::Result<LogLock> {
     let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path.parent().unwrap().join("taskq-profile.lock"))?;
-    lock.try_lock().map_err(std::io::Error::other)?;
-    Ok(LogLock(lock))
+    let deadline = Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(LogLock(lock)),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            Err(std::fs::TryLockError::WouldBlock) if !wait => return Err(std::io::ErrorKind::WouldBlock.into()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline { return Err(std::io::ErrorKind::TimedOut.into()); }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+pub fn append_error(e: &std::io::Error) -> &'static str {
+    match e.kind() {
+        std::io::ErrorKind::FileTooLarge => "taskq.log full; service pruning required",
+        std::io::ErrorKind::TimedOut => "taskq-profile.lock timeout after 1 s",
+        _ => "taskq.log append failed",
+    }
 }
 
 fn append(path: &Path, r: &Record) -> std::io::Result<()> {
@@ -348,12 +370,12 @@ pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     let full = || fs::metadata(path).is_ok_and(|m| m.len() > crate::data::LOG_MAX - 512);
     // A full log is refused before the lock too: appenders then never take the lock from the pruner's nonblocking try.
     if full() {
-        return Err(std::io::Error::other("log full"));
+        return Err(std::io::ErrorKind::FileTooLarge.into());
     }
     fs::create_dir_all(path.parent().unwrap())?;
-    let _lock = log_lock(path)?;
+    let _lock = acquire_log_lock(path, true)?;
     if full() {
-        return Err(std::io::Error::other("log full"));
+        return Err(std::io::ErrorKind::FileTooLarge.into());
     }
     OpenOptions::new().create(true).append(true).open(path)?.write_all(line.as_bytes())
 }
@@ -601,6 +623,41 @@ pub fn view(install: &Path, name: &str, since: Option<&str>) -> Result<String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Chain: § 4 profiling append -> retained log; contention must not lose either appender's records.
+    #[test]
+    fn concurrent_appenders_keep_records() {
+        let dir = std::env::temp_dir().join(format!("taskq-append-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("taskq.log");
+        let held = log_lock(&path).unwrap();
+        std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..2).map(|n| {
+                let path = &path;
+                scope.spawn(move || {
+                    for i in 0..100 { append_line(path, &format!("{n}:{i}\n")).unwrap(); }
+                })
+            }).collect();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+            for writer in writers { writer.join().unwrap(); }
+        });
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 200);
+        for n in 0..2 { for i in 0..100 { assert!(text.lines().any(|l| l == format!("{n}:{i}"))); } }
+        let held = log_lock(&path).unwrap();
+        let began = Instant::now();
+        let timeout = append_line(&path, "not written\n").unwrap_err();
+        assert_eq!(timeout.kind(), std::io::ErrorKind::TimedOut);
+        assert!(began.elapsed() >= std::time::Duration::from_secs(1));
+        assert_eq!(append_error(&timeout), "taskq-profile.lock timeout after 1 s");
+        drop(held);
+        OpenOptions::new().write(true).open(&path).unwrap().set_len(crate::data::LOG_MAX).unwrap();
+        let full = append_line(&path, "not written\n").unwrap_err();
+        assert_eq!(append_error(&full), "taskq.log full; service pruning required");
+        assert_eq!(append_error(&std::io::ErrorKind::PermissionDenied.into()), "taskq.log append failed");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     // Chain: A2/A3 operation -> bounded log -> ranked report. Risk: lost failures, wrong ranks/quantiles,
     // unsafe input persisted, corrupt/missing data called healthy, or telemetry outgrows existing retention.
     #[test]
@@ -661,7 +718,7 @@ mod tests {
         assert!(!crate::data::trim_tail(&path, crate::data::LOG_MAX));
         assert_eq!(measure_at(Some(&path), false, "spawn", || Ok::<_, String>(7)).unwrap(), 7);
         drop(held);
-        // Force real truncation while concurrent appenders use the same nonblocking lock.
+        // Force real truncation while concurrent appenders use the same lock.
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all("normal log\n".repeat(crate::data::LOG_MAX as usize / 11).as_bytes()).unwrap();
         let successful = std::sync::atomic::AtomicUsize::new(0);

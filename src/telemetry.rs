@@ -91,24 +91,28 @@ fn space(db: &Connection, bytes: usize) -> Result<(), String> {
     }
 }
 
-/// Existing records have no event IDs: track stream position, never deduplicate by record contents.
-fn import(db: &mut Connection, install: &Path, now: u64) -> Result<(), String> {
-    let text = legacy_text(install)?;
+fn legacy_offset(db: &Connection, text: &str) -> Result<Option<usize>, String> {
     let previous: Option<String> = db.query_row("SELECT text FROM legacy WHERE id=1", [], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
     let previous = previous.map(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(|e| format!("legacy checkpoint: {e}"))).transpose()?;
-    let matches = |n: usize, digest: &str| text.get(..n).is_some_and(|s| hash(s) == digest);
-    let start = match previous.as_ref() {
-        None => 0,
+    let matches = |n: usize, digest: &str| text.get(..n).is_some_and(|s| (s.is_empty() || s.ends_with('\n')) && hash(s) == digest);
+    match previous.as_ref() {
+        None => Ok(None),
         Some(old) => {
             let n = old["bytes"].as_u64().ok_or("legacy checkpoint: missing length")? as usize;
             let digest = old["sha256"].as_str().ok_or("legacy checkpoint: missing digest")?;
             let trimmed = old["trimmed_bytes"].as_u64().ok_or("legacy checkpoint: missing trimmed length")? as usize;
             let trimmed_hash = old["trimmed_sha256"].as_str().ok_or("legacy checkpoint: missing trimmed digest")?;
-            if matches(n, digest) { n }
-            else if trimmed > 0 && matches(trimmed, trimmed_hash) { trimmed }
-            else { return Err("legacy taskq.log rewritten or lost; retained SQLite history kept; coverage unknown".into()); }
+            if matches(n, digest) { Ok(Some(n)) }
+            else if trimmed > 0 && matches(trimmed, trimmed_hash) { Ok(Some(trimmed)) }
+            else { Err("legacy taskq.log rewritten or lost; retained SQLite history kept; coverage unknown".into()) }
         }
-    };
+    }
+}
+
+/// Existing records have no event IDs: track stream position, never deduplicate by record contents.
+fn import(db: &mut Connection, install: &Path, now: u64) -> Result<(), String> {
+    let text = legacy_text(install)?;
+    let previous=legacy_offset(db,&text)?;let start=previous.unwrap_or(0);
     if start == text.len() && previous.is_some() { return Ok(()); }
     let tail = &text.as_bytes()[text.len().saturating_sub((crate::data::LOG_MAX / 2) as usize)..];
     let tail = tail.iter().position(|c| *c == b'\n').map_or(tail, |i| &tail[i+1..]);

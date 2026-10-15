@@ -32,23 +32,24 @@ This draft becomes the text of `taskq profile guide` (gap G6). It answers questi
 Rules for the agent:
 
 1. Run the command, then report the table rows that answer the question. Quote the window line: earlier or pruned history is unknown.
-2. A value marked unknown stays unknown with its reason. Never read it as zero; never estimate it.
-3. Each report covers one host. For several hosts, run the command on each host and name the hosts; do not add their numbers as one total.
-4. Use `--since 30m|24h|7d` to match the owner's period. With the current store, a 7-day window can be mostly pruned (see [current state](#current-state)): say so.
+2. A value marked unknown stays unknown with its reason. Never read it as zero; never estimate it. In export rows, a null `calls` and `tokens` with `unknown` `no-model` means the stage ran no model (claim, start, ask, checks, close): count it as none, not unknown. A null `calls` with a null `unknown` means the runtime does not report a call count (Codex): say "calls not reported", keep its tokens. Any other null is unknown with its `unknown` reason.
+3. Stage durations nest and overlap: `checks` runs inside `close`, and the reviewer runs `close` inside `review`. Report each stage's duration on its own line. Never add the `us` of several stages and call the sum attempt time.
+4. Each report covers one host. For several hosts, run the command on each host and name the hosts; do not add their numbers as one total.
+5. Use `--since 30m|24h|7d` to match the owner's period. With the current store, a 7-day window can be mostly pruned (see [current state](#current-state)): say so.
 
 | Question | Command | Read these columns | Status |
 |---|---|---|---|
 | How long do tasks stay in each state? | `taskq profile tasks --since 7d` | `States by p95`: `State`, `Runtime`, `Host`, `Count`, `p50/p95/max s` | exists |
 | Which tasks took longest, and where? | `taskq profile tasks --since 7d` | `Tasks by total time in state` (20 tasks): `Project`, `Task`, `State`, `Runtime`, `Host`, `Total s`, `p50/p95/max s` | exists |
-| Where does attempt time go (claim, start, build, checks, review, ask, close)? | `taskq profile` | `Attempt stages`: `Stage`, `Runtime`, `Count`, `p50/p95/max ms`, `Outcomes`; rankings `Slow stages`, `Failing stages`, `Retried stages` | exists, all retained records only; windowed: gap G1 |
+| Where does attempt time go (claim, start, build, checks, review, ask, close)? | `taskq profile` | `Attempt stages`: `Stage`, `Runtime`, `Count`, `p50/p95/max ms`, `Outcomes`; rankings `Slow stages`, `Failing stages`, `Retried stages`. One row per stage; rows overlap (rule 3), so never add them | exists, all retained records only; windowed: gap G1 |
 | Where does context go? | `taskq profile` | `Attempt stages`: `Context tokens`, `Model calls` per stage and runtime | exists per stage and runtime; per attempt: gap G2; by source (brief, rules, files, tool output): gap G4 |
-| What does one attempt cost? | `taskq profile export --since 7d` | rows with `kind` `stage`: group by `project`, `task`, `attempt`; sum `us`, `calls`, `tokens`; a null in any row makes that sum unknown with its `unknown` reason | exists as rows; ready view: gap G2; money: gap G3 |
+| How long does one attempt take, and what does it use? | `taskq profile export --since 7d` | rows with `kind` `stage`, grouped by `project`, `task`, `attempt`: `name` and `us` per stage, one line each (rule 3); `tokens` summed over `build`/`review` rows and `calls` with rule 2. Coverage: an attempt without its `claim` row began before the window or was pruned, and one without its `build` or `review` row is still running or ended while no service ran; mark it `incomplete (<missing stages>)` and report no total for it | per stage: exists as rows; elapsed time, coverage and ready view: gap G2; money: gap G3 |
 | Why do tasks wait? | `taskq profile` | `Queue transitions`: `From`, `To`, `Runtime`, `Count`, `p50/p95/max s in previous state` | exists, all retained records only |
 | Which board calls are slow or rate limited? | `taskq profile board --since 24h` | `Operation`, `Count`, `p50/p95/max ms`, `Failed %`, `Errors`, `Lowest remaining` | exists |
 | Who spends the board budget? | `taskq profile` | `Board requests by source` (past hour) | exists, past hour only |
 | Is the service itself slow? | `taskq profile` | `Profile` table: `Operation`, `Count`, `p50/p95/max ms`, `Success/failure`, `Failure %`, `Variance ms²`, `Errors` | exists |
 
-Report shape for the owner: one line per question, the number with its unit and window, then the unknowns with reasons. Example (invented): `Build p95 on claude: 412 s over 18 attempts (retained 21 h); context tokens 2.1 M (17 of 18 known; no-usage); cost unknown (no price).`
+Report shape for the owner: one line per question, the number with its unit and window, then the unknowns with reasons. Example (invented): `Build p95 on claude: 412 s over 18 attempts (retained 21 h); context tokens 2.1 M (17 of 18 known; no-usage); calls on codex not reported; attempt elapsed time unknown (gap G2); cost unknown (no price).`
 
 ## Gaps
 
@@ -57,7 +58,7 @@ Each gap is a named follow-up, not part of this task. Numbers are stable.
 | Gap | Missing | Proposed fix |
 |---|---|---|
 | G1 | The bare `taskq profile` refuses `--since`, so stage, transition and service tables cover all retained records only. | Accept `--since` on the bare report, through the export window. |
-| G2 | No per-attempt view. | `taskq profile attempts [--since]`: `Project`, `Task`, `Attempt`, `Runtime`, `Stages`, `Total s`, `Model calls`, `Context tokens`, `Outcome`, from export rows. |
+| G2 | No per-attempt view, and no attempt elapsed time: stages overlap, so summed `us` is not elapsed time, and a span from the rows' end times (`at_ms`) minus durations also counts idle time between stages. | `taskq profile attempts [--since]`: `Project`, `Task`, `Attempt`, `Runtime`, `Coverage` (`complete` or the missing stages), `Elapsed s` (first stage start to last stage end; unknown unless coverage is complete and every row has `us` and `at_ms`), one `<stage> s` column per stage, `Model calls`, `Context tokens`, `Outcome`, from export rows. |
 | G3 | Money cost: stage records hold context tokens (input, cache included) and calls, not model id, output tokens or a cache split. | Record `model` and output tokens per stage (new export schema); prices only from owner-supplied config; otherwise cost reads unknown. |
 | G4 | Context by source (brief, embedded rules, files, tool output) is not recorded. | Read it from the runtime's own accounting, or agentq's when installed, without a second collector; needs its own design. |
 | G5 | Retention: 4 MiB shared bound, no named window. | Store choice C above; § 4 Data names the window and bound. |

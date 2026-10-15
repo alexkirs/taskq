@@ -89,3 +89,5 @@ Preserve requirement IDs and current capabilities. Shipped and native proof foll
 [Refactoring backlog](refactoring-backlog.md) defines ordered workstreams, API boundaries, dependencies and acceptance for implementation tasks.
 
 [Installation and project locations](setup-and-project-locations.md): agent-led and agent-free setup, Projects folder, exact execution roots and S-A1–S-A8.
+
+- [Standalone agentq onboarding](standalone-onboarding.md): warning, detection, dismissal and setup-session recommendations; no runtime changes.

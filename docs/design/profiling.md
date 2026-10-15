@@ -108,3 +108,7 @@ Coverage is every executable product path, including UI input, windows, layout/r
 ## Process bootstrap
 
 The thin root `entry.rs` initializes shared coreq capture before generated product execution. It records no arguments and reports collector initialization failure as unknown without changing command results. Bootstrap until subscriber installation is an explicit coverage exclusion; source inventory covers `src/`, not this wrapper. The shared runtime guard flushes on normal return and unwind; generated `std::process::exit` and explicit Unix exec boundaries flush before bypassing destructors. Open spans without a terminal remain unknown. Protected sandbox store access still needs qualification through the host writer; no grant changes are implied.
+
+## Shared host writer
+
+The shared runtime elects one local writer thread for the installation. Other processes append authenticated bounded batches through its protected endpoint, without opening SQLite or taking its initialization lock. Clients retry immutable ids after uncertain delivery and re-elect after writer death. No database-write grant is added to a worker. Unix socket access and Windows loopback access must be proved through each supported installed sandbox before qualification. Endpoint credentials stay in the owner-only `telemetry-ipc` directory and are never exported as telemetry.

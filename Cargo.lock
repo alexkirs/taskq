@@ -220,9 +220,10 @@ dependencies = [
 [[package]]
 name = "coreq"
 version = "0.13.0"
-source = "git+https://github.com/taskqorg/coreq?rev=f8d1946561ac5de3aeb921efe9eda3fd6ce4deac#f8d1946561ac5de3aeb921efe9eda3fd6ce4deac"
+source = "git+https://github.com/taskqorg/coreq?rev=35529c0d0b6349900ac6650bf16cabc846483d4e#35529c0d0b6349900ac6650bf16cabc846483d4e"
 dependencies = [
  "coreq-instrument",
+ "libc",
  "ring",
  "rusqlite",
  "serde_json",
@@ -233,7 +234,7 @@ dependencies = [
 [[package]]
 name = "coreq-instrument"
 version = "0.1.0"
-source = "git+https://github.com/taskqorg/coreq?rev=f8d1946561ac5de3aeb921efe9eda3fd6ce4deac#f8d1946561ac5de3aeb921efe9eda3fd6ce4deac"
+source = "git+https://github.com/taskqorg/coreq?rev=35529c0d0b6349900ac6650bf16cabc846483d4e#35529c0d0b6349900ac6650bf16cabc846483d4e"
 dependencies = [
  "proc-macro2",
  "quote",

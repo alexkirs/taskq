@@ -524,9 +524,11 @@ fn pinned(root: &Path, file: &str, fetch: &mut impl FnMut(&str) -> Result<String
 }
 
 fn rule_cache(file: &str, body: &str) -> serde_json::Value {
+    use std::fmt::Write as _;
     let digest=ring::digest::digest(&ring::digest::SHA256,body.as_bytes());
-    let digest=digest.as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>();
-    serde_json::json!({"revision":SPECQ_REVISION,"file":file,"sha256":digest})
+    let mut hex=String::with_capacity(64);
+    for byte in digest.as_ref() {write!(&mut hex,"{byte:02x}").expect("writing to String cannot fail");}
+    serde_json::json!({"revision":SPECQ_REVISION,"file":file,"sha256":hex})
 }
 
 fn publish_rule(path: &Path, body: &str) -> Result<(),String> {
@@ -1555,6 +1557,7 @@ mod tests {
     }
     #[test]
     fn pinned_cache_rejects_changed_utf8_wrong_identity_and_partial_pairs() {
+        assert_eq!(rule_cache("fixture","abc")["sha256"],"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         let root=rules_root("cache-integrity");let file=SPECQ_CORE[0];let path=specq_dir(&root).join(file);
         let expected=pinned(&root,file,&mut rule).unwrap();
         std::fs::write(&path,"# Changed valid UTF-8 rule\n").unwrap();

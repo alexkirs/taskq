@@ -556,7 +556,7 @@ mod tests {
     }
 
     /// R8 made mechanical: every (state, entry) pair of the § 2 table is accepted by some golden trace.
-    // Chain: R8 § 2 table to golden traces; spec size. Risk: a § 2 row without a trace, taskq.md over 300 lines or 85 KiB, or dated.
+    // Chain: R8 § 2 table to golden traces; spec size. Risk: a § 2 row without a trace, taskq.md over 300 lines or 60 KiB, or dated.
     #[test]
     fn every_table_row_has_a_golden_trace() {
         let spec = include_str!("../taskq.md");
@@ -593,7 +593,7 @@ mod tests {
         }
         assert!(missing.is_empty(), "§ 2 rows without a golden trace: {missing:?}");
         assert!(spec.lines().count() <= 300, "taskq.md over 300 lines");
-        assert!(spec.replace("\r\n", "\n").len() <= 85 * 1024, "taskq.md over 85 KiB");
+        assert!(spec.replace("\r\n", "\n").len() <= 60 * 1024, "taskq.md over 60 KiB");
         let dated = |w: &[u8]| w.len() == 10 && w[4] == b'-' && w[7] == b'-' && w.iter().filter(|b| b.is_ascii_digit()).count() == 8;
         assert!(!spec.as_bytes().windows(10).any(dated), "taskq.md holds a date: history goes to git and issues");
     }

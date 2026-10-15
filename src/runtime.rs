@@ -1256,7 +1256,11 @@ mod tests {
     #[test]
     fn compaction_resends_header_and_index_only_to_claude() {
         let root = rules_root("compact");
-        let env = Env { root: &root, exe: Path::new("/i/taskq"), install: Path::new("/i"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
+        // fixture grant in a scoped install: hosts without enforcement refuse a missing grant (§ 8 Access)
+        let install = root.join("install");
+        std::fs::create_dir_all(&install).unwrap();
+        for rt in ["claude", "codex"] { crate::policy::grant(&install, rt, "full", None, "op", 1).unwrap(); }
+        let env = Env { root: &root, exe: Path::new("/i/taskq"), install: &install, permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
         let launch = |rt: &str| Launch { task: 7, title: "T".into(), attempt: 42, role: "worker".into(), rt: rt.into(), session: "s".into(), url: "https://b/7".into(), resume: None };
         let args = |rt: &str| command(&env, &launch(rt), &access(&env, rt).unwrap()).unwrap().get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
         let l = launch("claude");

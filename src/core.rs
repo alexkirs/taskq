@@ -167,6 +167,10 @@ pub struct Task {
     pub result: Option<String>,
     pub inbox: Vec<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub publication: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enqueued: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gate: Option<Gate>,
 }
 
@@ -271,7 +275,7 @@ pub fn delivery(n: u64, entries: &[Entry], id: u64) -> String {
 
 /// Whether attempt `a` wrote `ask`, `result` or `requeue` after entry `after`: its child then exits clean (§ 4 step 1).
 pub fn handed_in(n: u64, entries: &[Entry], a: u64, after: u64) -> bool {
-    entries.iter().filter(|e| e.id > after && !e.edited).filter_map(|e| parse(n, &e.body)).any(|l| l.attempt == Some(a) && matches!(l.kind, "ask" | "result" | "requeue"))
+    entries.iter().filter(|e| e.id > after && !e.edited).filter_map(|e| parse(n, &e.body)).any(|l| l.attempt == Some(a) && matches!(l.kind, "ask" | "result" | "requeue" | "publish"))
 }
 
 /// The kind of attempt `a`'s last `ask`, `result`, `requeue` or `close` after entry `after` that `fold` accepted:
@@ -281,7 +285,7 @@ fn hand_in(n: u64, entries: &[Entry], a: u64, after: u64) -> Option<&'static str
     let mut log: Vec<&Entry> = entries.iter().filter(|e| e.id > after && accepted.contains(&e.id)).collect();
     log.sort_by_key(|e| e.id);
     log.into_iter().filter_map(|e| parse(n, &e.body)).filter(|l| l.attempt == Some(a))
-        .filter_map(|l| ["ask", "result", "requeue", "close"].into_iter().find(|k| *k == l.kind)).last()
+        .filter_map(|l| ["ask", "result", "requeue", "close", "publish"].into_iter().find(|k| *k == l.kind)).last()
 }
 
 /// Outcome and error class of attempt `a`'s `build`/`review` stage when its child exits or is stopped (§ 4 Profiling):
@@ -293,7 +297,7 @@ pub fn stage_outcome(n: u64, log: Result<(&[Entry], Option<bool>), &'static str>
         Err(why) => return ("unknown", why),
     };
     match hand_in(n, entries, a, after) {
-        Some("result" | "close") => ("ok", "none"),
+        Some("result" | "close" | "publish") => ("ok", "none"),
         Some("ask") => ("ask", "none"),
         Some(_) => ("retried", "none"),
         // still the live attempt: the child ended without hand-in
@@ -314,6 +318,8 @@ fn end(t: &mut Task) {
     t.role = None;
     t.session = None;
     t.inbox.clear();
+    t.publication = None;
+    t.enqueued = None;
 }
 
 fn ready(t: &mut Task) {
@@ -438,7 +444,7 @@ fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool
             spawn(t, "worker");
             t.state = Doing;
         }
-        (Review, "spawn", false) if l.args.len() == 3 && l.args[0] == "reviewer" && t.attempt.is_none() => {
+        (Review, "spawn", false) if l.args.len() == 3 && l.args[0] == "reviewer" && t.attempt.is_none() && t.publication.is_none() => {
             spawn(t, "reviewer")
         }
         (Doing, "result", true) if l.args.len() == 1 && sha(l.args[0]) => {
@@ -453,6 +459,25 @@ fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool
             *resume = Some(t.state);
             t.state = Ask;
         }
+        (Review, "publish", _) if t.publication.is_none() && !l.text.is_empty() && t.gate.is_none_or(|g| g == Gate::Approved) => {
+            end(t);
+            t.card = None;
+            t.publication = text(l.text);
+        }
+        (Review, "enqueued", false) if t.publication.is_some() && t.enqueued.is_none() && l.args.len() == 1 => {
+            t.enqueued = Some(l.args[0].to_string());
+        }
+        (Review, "rebased", false) if t.publication.is_some() && l.args.len() == 1 && sha(l.args[0]) && t.result.as_deref() != Some(l.args[0]) => {
+            t.result = Some(l.args[0].to_string());
+            if t.gate.is_some() {
+                invalidate(t);
+                t.publication = None;
+            }
+        }
+        (Review, "publication-failed", false) if t.publication.is_some() => {
+            if !limit(t, resume, REQUEUE_MAX) { ready(t) }
+        }
+        (Doing | Review, "requeue", _) if l.args == ["main-moved"] => ready(t),
         (Doing | Review, "requeue", true) => {
             if !limit(t, resume, REQUEUE_MAX) {
                 ready(t)

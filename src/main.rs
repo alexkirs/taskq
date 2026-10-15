@@ -3049,6 +3049,30 @@ mod tests {
     }
 
     // Chain: § 5 commands to board entries. Risk: a rejected command writes; close does not publish.
+    // Chain: section 7 reviewer close saves one durable verdict; repeated close never closes before a merge.
+    #[test]
+    fn queued_close_records_intent_once_and_keeps_the_issue_open() {
+        let (b, c) = (Fake::default(), cfg());
+        let n = b.create("Invented queue task", "", &["taskq".into()]).unwrap();
+        let a = b.comment(n, "taskq: spawn worker codex:w win").unwrap();
+        b.comment(n, &entry("result", &[&"a".repeat(40)], Some(a), "candidate")).unwrap();
+        b.state.borrow_mut().publish = "queue-admitted".into();
+        let verdict = "Changed: reviewed\nChecks: A1 ok; merge-result CI pending\nOpen: none";
+        assert!(close_one(&b, &c, n, verdict, &Op::default()).ok());
+        assert!(close_one(&b, &c, n, "duplicate", &Op::default()).ok());
+        let t = fold(n, &entries(&b, n).unwrap(), false);
+        assert_eq!(t.publication.as_deref(), Some(verdict));
+        assert_eq!(t.state, State::Review);
+        assert!(b.issue(n).unwrap().open);
+        assert_eq!(b.comments(n).unwrap().iter().filter(|e| e.body.starts_with("taskq: publish")).count(), 1);
+        b.state.borrow_mut().fail_publication_cancel = true;
+        assert!(!act(&b, &c.root, n, "later", &[], "cancel", &Op::default()).ok());
+        assert!(fold(n, &entries(&b, n).unwrap(), false).publication.is_some());
+        b.state.borrow_mut().fail_publication_cancel = false;
+        assert!(act(&b, &c.root, n, "later", &[], "cancel", &Op::default()).ok());
+        assert_eq!(fold(n, &entries(&b, n).unwrap(), false).state, State::Later);
+    }
+
     #[test]
     fn commands_write_only_accepted_entries_and_close_publishes() {
         let (b, c) = (Fake::default(), cfg());

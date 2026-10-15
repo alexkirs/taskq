@@ -144,13 +144,18 @@ fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &
     if core::has_fields(text) {
         return Receipt::rejected(n, op, "text ends with an `op-id:` or `revision:` line; reword it");
     }
-    let text = if attempt.is_some() && attempt == before.attempt { core::limit_text(n, &before, kind, text) } else { text.into() };
+    let text = if !(kind == "requeue" && args == ["main-moved"]) && attempt.is_some() && attempt == before.attempt { core::limit_text(n, &before, kind, text) } else { text.into() };
     let body = core::with_fields(entry(kind, args, attempt, &text), op.id.as_deref(), op.revision);
     log.push(Entry { id: u64::MAX, body: body.clone(), edited: false });
     if fold(n, &log, deps) == before {
         return Receipt { state: Some(before.state.name()), revision: Some(rev), ..Receipt::rejected(n, op, format!("#{n} is {}: `{kind}` not accepted", before.state.name())) };
     }
     let unknown = |e: String| Receipt::new(n, op, "unknown", e, format!("Run `taskq inbox {n}`, then retry with the same --op-id."));
+    if before.publication.is_some() && matches!(kind, "requeue" | "later" | "failed" | "publication-failed")
+        && let Err(e) = b.cancel_publication(n, before.result.as_deref().unwrap_or_default())
+    {
+        return Receipt::rejected(n, op, e);
+    }
     let id = match b.comment(n, &body) {
         Ok(id) => id,
         Err(e) => return unknown(e),
@@ -226,11 +231,27 @@ fn close_body(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op, check
                 return act(b, &cfg.root, n, "close", &[], verdict, op); // the stale receipt, before any publication
             }
             // § 4 Profiling: `checks` is the CI verification and merge call
+            if b.defer_publication(&cfg.publish) {
+                if t.publication.is_some() {
+                    return Receipt { extra: "publication pending; the service reconciles it".into(), ..Receipt::accepted(n, op, t.state, rev) };
+                }
+                let mut r = act(b, &cfg.root, n, "publish", &[], verdict, op);
+                if r.ok() {
+                    r.extra = "publication pending; the service reconciles it".into();
+                    if let Publish::Enqueued(id) = b.publish(n, &sha, &cfg.publish, &issue.title, &format!("Task: {}", b.url(n))) {
+                        // Intent is durable before admission; the service recovers even if this receipt write is lost.
+                        let next = Op { revision: r.revision, ..Default::default() };
+                        let _ = act_as(b, &cfg.root, n, "enqueued", &[&id], "", &next, None, None);
+                    }
+                }
+                return r;
+            }
             let began = std::time::Instant::now();
             let published = b.publish(n, &sha, &cfg.publish, &issue.title, &format!("Task: {}", b.url(n)));
             let (outcome, err) = match &published {
                 Publish::Done(_) => ("ok", "none"),
-                Publish::Pending(_) => ("retried", "none"),
+                Publish::Pending(_) | Publish::Enqueued(_) | Publish::Rebased(_) => ("retried", "none"),
+                Publish::MainMoved(m) => ("failed", crate::profile::class(m)),
                 Publish::Failed(m) => ("failed", crate::profile::class(m)),
             };
             crate::profile::stage("checks", n, seen.0, &seen.1, Some(began.elapsed()), outcome, err, crate::profile::Usage::NoModel);
@@ -244,6 +265,10 @@ fn close_body(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op, check
                     r
                 }
                 Publish::Pending(m) => Receipt::rejected(n, op, format!("not closed: {m}")),
+                Publish::Enqueued(_) | Publish::Rebased(_) => Receipt::rejected(n, op, "publication needs the service"),
+                Publish::MainMoved(m) => {
+                    act(b, &cfg.root, n, "requeue", &["main-moved"], &m, &Op::default())
+                }
                 Publish::Failed(m) => {
                     let r = act(b, &cfg.root, n, "requeue", &[], &format!("publication failed: {m}"), &Op::default());
                     Receipt::rejected(n, op, if r.ok() { format!("requeued: {m}") } else { format!("publication failed: {m}; {}", r.reason) })
@@ -251,6 +276,33 @@ fn close_body(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op, check
             }
         }
         s => Receipt { state: Some(s.name()), ..Receipt::rejected(n, op, format!("#{n} is {}: `close` not accepted", s.name())) },
+    }
+}
+
+/// Service continuation of the saved reviewer verdict; writes are not attempt-bound (section 7).
+pub fn resume_publication(b: &dyn Board, cfg: &Config, n: u64) -> Receipt {
+    let (issue, t, _) = match current(b, n) {
+        Ok(v) => v,
+        Err(e) => return Receipt::rejected(n, &Op::default(), e),
+    };
+    let Some(verdict) = &t.publication else { return Receipt::rejected(n, &Op::default(), "no pending publication") };
+    if t.state != State::Review || needs_approval(cfg, &t) && t.gate != Some(Gate::Approved) {
+        return Receipt::rejected(n, &Op::default(), "publication no longer approved");
+    }
+    let rev = match entries(b, n) {
+        Ok(log) => core::revision(n, &log),
+        Err(e) => return Receipt { outcome: "unknown", ..Receipt::rejected(n, &Op::default(), e) },
+    };
+    let op = Op { revision: Some(rev), ..Default::default() };
+    let write = |kind, args: &[&str], text: &str| act_as(b, &cfg.root, n, kind, args, text, &op, None, None);
+    match b.resume_publication(n, t.result.as_deref().unwrap_or_default(), &issue.title, &format!("Task: {}", b.url(n)), &cfg.root, t.enqueued.is_some()) {
+        Publish::Done(m) => write("close", &[], &join(&[verdict, &format!("delivery {} r{}: {m}", cfg.delivery, cfg.delivery_revision)])),
+        Publish::Enqueued(id) if t.enqueued.is_none() => write("enqueued", &[&id], ""),
+        Publish::Enqueued(_) => Receipt::accepted(n, &op, t.state, rev),
+        Publish::Rebased(sha) => write("rebased", &[&sha], ""),
+        Publish::MainMoved(m) => write("requeue", &["main-moved"], &m),
+        Publish::Failed(m) => write("publication-failed", &[], &core::limit_text(n, &t, "requeue", &format!("publication failed: {m}"))),
+        Publish::Pending(m) => Receipt::rejected(n, &op, m),
     }
 }
 

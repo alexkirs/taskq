@@ -223,6 +223,7 @@ pub struct Service<'a> {
     cache: HashMap<u64, (i64, Vec<Comment>)>,
     deps: DepCache,
     label_fixes: HashMap<u64, (String, Vec<String>, u8)>,
+    cancelled_publications: HashMap<u64, u64>,
     /// Worktrees of closed tasks already tried once by `prune`.
     pruned: HashSet<u64>,
     start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>,
@@ -497,7 +498,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { reduced_at: None, host: None, wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg: cfg.clone(), version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
+        Service { reduced_at: None, host: None, wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg: cfg.clone(), version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), cancelled_publications: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
     }
 
     /// Rebuild board-derived state after unwind; live handles, pending launches and delivery cursors stay owned.
@@ -909,6 +910,29 @@ impl<'a> Service<'a> {
             }
         }
 
+        for v in &views {
+            let n = v.issue.number;
+            let revision = core::revision(n, &v.log);
+            if self.cancelled_publications.get(&n) == Some(&revision) { continue; }
+            if v.task.publication.is_some() { self.cancelled_publications.insert(n, revision); continue; }
+            let cancelled = core::changes(n, &v.log).into_iter().rev().find(|(_, before, after)| before.publication.is_some() && after.publication.is_none() && matches!(after.state, State::Ready | State::Later | State::Failed));
+            if let Some((_, before, _)) = cancelled
+                && let Err(e) = self.board.cancel_publication(n, before.result.as_deref().unwrap_or_default())
+            {
+                log!("#{n} publication cancellation unknown: {e}");
+                touched.insert(n);
+                continue;
+            }
+            self.cancelled_publications.insert(n, revision);
+        }
+
+        // § 7 publication intent is board state; every host can reconcile the queue after a restart, even with focus off.
+        for v in views.iter().filter(|v| v.task.publication.is_some() && !touched.contains(&v.issue.number)) {
+            let r = crate::dispatch::resume_publication(self.board, self.cfg, v.issue.number);
+            if !r.ok() { log!("#{} publication: {}", v.issue.number, r.reason); }
+        }
+        touched.extend(views.iter().filter(|v| v.task.publication.is_some()).map(|v| v.issue.number));
+
         // 6. route to own attempts, then admit within capacity; the gate holds launches, the lease stays (§ 3)
         let mut pending = BTreeSet::new();
         // a reservation lives within one pass: it becomes a child or a held claim, or is released here
@@ -973,7 +997,7 @@ impl<'a> Service<'a> {
         let mut queue: Vec<&View> = views
             .iter()
             .filter(|v| !touched.contains(&v.issue.number))
-            .filter(|v| v.task.state == State::Ready || (v.task.state == State::Review && v.task.attempt.is_none()))
+            .filter(|v| v.task.state == State::Ready || (v.task.state == State::Review && v.task.attempt.is_none() && v.task.publication.is_none()))
             .filter(|v| {
                 if let Err(e) = crate::labels::validate(&v.issue.labels) { log!("#{}: {e}; not admitted", v.issue.number); return false; }
                 true
@@ -1339,6 +1363,64 @@ mod tests {
         assert!(log.iter().any(|e| e.body.contains(&format!("taskq: gone attempt {r}"))), "next pass must reap the native terminal job");
         assert!(task(&b, n).result.is_some());
         std::fs::remove_dir_all(&c.install).unwrap();
+    }
+
+    // Chain: section 7 publication intent -> admission -> service restart -> merge receipt/close, focus off.
+    // Risk: a restart launches another reviewer, expires the ended attempt, or forgets the approved verdict.
+    #[test]
+    fn pending_publication_survives_restart_without_a_reviewer() {
+        let (b, c) = (Fake::default(), cfg("win"));
+        let n = b.create("Invented publication", "", &["taskq".into()]).unwrap();
+        let a = b.comment(n, "taskq: spawn worker codex:w win").unwrap();
+        b.comment(n, &core::entry("result", &[&"a".repeat(40)], Some(a), "candidate")).unwrap();
+        let r = b.comment(n, "taskq: spawn reviewer codex:r win").unwrap();
+        let verdict = "Changed: tested publication\nChecks: Task fit A1 ok; merge-result CI pending\nOpen: none";
+        b.comment(n, &core::entry("publish", &[], Some(r), verdict)).unwrap();
+        b.state.borrow_mut().publish = "queue-admitted".into();
+        {
+            let mut s = Service::new(&b, &c, "test", Box::new(|_| panic!("no reviewer for pending publication")));
+            s.focus = vec!["all".into()];
+            s.pass().unwrap();
+        }
+        assert!(task(&b, n).enqueued.is_some());
+        b.state.borrow_mut().publish = "queue-waiting".into();
+        let mut s = Service::new(&b, &c, "test", Box::new(|_| panic!("no process while queued")));
+        s.pass().unwrap();
+        assert_eq!(task(&b, n).publication.as_deref(), Some(verdict));
+        assert_eq!(task(&b, n).retries, 0);
+        assert!(b.issue(n).unwrap().open);
+        b.state.borrow_mut().publish = String::new();
+        s.pass().unwrap();
+        assert_eq!(task(&b, n).state, State::Closed);
+        assert!(!b.issue(n).unwrap().open);
+        let comments = b.comments(n).unwrap();
+        let close = comments.iter().find(|e| e.body.starts_with("taskq: close")).unwrap();
+        assert!(close.body.contains(verdict));
+        assert_eq!(comments.iter().filter(|e| e.body.starts_with("taskq: close")).count(), 1);
+    }
+
+    // Chain: R1 hand-typed cancellation -> queue readback -> allow replacement; unknown never starts a new worker.
+    #[test]
+    fn hand_typed_cancellation_dequeues_before_another_attempt() {
+        let (b, c) = (Fake::default(), cfg("win"));
+        let n = b.create("Invented cancellation", "", &["taskq".into()]).unwrap();
+        let a = b.comment(n, "taskq: spawn worker codex:w win").unwrap();
+        b.comment(n, &core::entry("result", &[&"a".repeat(40)], Some(a), "candidate")).unwrap();
+        b.comment(n, "taskq: publish\naccepted").unwrap();
+        b.comment(n, "taskq: enqueued MQ_1").unwrap();
+        b.comment(n, "taskq: requeue main-moved").unwrap();
+        b.state.borrow_mut().fail_publication_cancel = true;
+        let mut s = Service::new(&b, &c, "test", Box::new(|_| panic!("replacement before cancellation readback")));
+        s.focus = vec!["all".into()];
+        s.pass().unwrap();
+        assert!(task(&b, n).attempt.is_none());
+        b.state.borrow_mut().fail_publication_cancel = false;
+        s.focus.clear();
+        s.pass().unwrap();
+        let before = b.state.borrow().cancelled_publications.len();
+        s.pass().unwrap();
+        assert_eq!(b.state.borrow().cancelled_publications.len(), before, "verified cancellation cached by revision");
+        assert_eq!(b.state.borrow().cancelled_publications.last(), Some(&(n, "a".repeat(40))));
     }
 
     type Exits = Rc<RefCell<Vec<(u64, Rc<RefCell<Option<i32>>>)>>>;

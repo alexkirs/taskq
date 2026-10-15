@@ -1,4 +1,4 @@
-# § 8 Release: a merged version bump on main tags v<Cargo.toml version> here (a GITHUB_TOKEN tag starts no run); one binary per OS, answer card and resource controls assets, SHA256SUMS, latest.json; release files and SHA256SUMS carry build provenance attestations. A failing selftest publishes nothing.
+# § 8 Release: a main push that changes the version tags v<Cargo.toml version> here (a GITHUB_TOKEN tag starts no run); one binary per OS, answer card and resource controls assets, SHA256SUMS, latest.json; release files and SHA256SUMS carry build provenance attestations. A failing selftest publishes nothing.
 name: release
 on:
   push:
@@ -22,9 +22,14 @@ jobs:
       - id: tag
         env:
           GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"; exit 0; fi
-          tag="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          ver() { sed -n 's/^version = "\(.*\)"/\1/p' | head -1; }
+          tag="v$(ver < Cargo.toml)"
+          # Only a push that changes the version tags; a missing or new before commit counts as a change.
+          old="v$(gh api -H 'Accept: application/vnd.github.raw' "repos/$GITHUB_REPOSITORY/contents/Cargo.toml?ref=$BEFORE" 2>/dev/null | ver || true)"
+          if [ "$old" = "$tag" ]; then echo "version $tag unchanged; no release"; exit 0; fi
           # Create only: an existing tag never moves and publishes nothing here.
           if gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" > /dev/null; then
             echo "tag=$tag" >> "$GITHUB_OUTPUT"

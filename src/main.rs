@@ -2813,12 +2813,12 @@ mod tests {
         };
         fs::write(&u.path, "unit contents").unwrap();
         let error = host_cli::remove_unit(&root, &u).unwrap_err();
-        assert!(error.contains("projects unknown"));
+        assert!(error.contains(&projects.display().to_string()));
         assert!(!error.contains("taskq-must-not-run-unload"));
         assert_eq!(fs::read_to_string(&u.path).unwrap(), "unit contents");
         assert_eq!(fs::read(&projects).unwrap(), registered);
         fs::remove_file(&projects).unwrap();
-        assert!(host_cli::remove_unit(&root, &u).unwrap_err().contains("projects unknown"));
+        assert!(host_cli::remove_unit(&root, &u).unwrap_err().contains(&projects.display().to_string()));
         assert!(u.path.is_file());
         assert!(!projects.exists());
         fs::remove_file(&u.path).unwrap();

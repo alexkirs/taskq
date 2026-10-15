@@ -399,12 +399,12 @@ fn append_project(install: &Path, root: &Path, text: &str) {
 
 /// Read only the explicit registry. Canonical identity prevents duplicate threads for aliases.
 pub fn projects(install: &Path) -> Res<Vec<PathBuf>> {
-    let text = fs::read_to_string(install.join("projects")).map_err(|e| format!("projects unknown: {e}"))?;
+    let text = fs::read_to_string(install.join("projects")).map_err(|e| format!("projects unknown ({}): {e}", install.join("projects").display()))?;
     let mut roots = BTreeSet::new();
     for line in text.lines().filter(|l| !l.is_empty()) {
         let root = Path::new(line);
         if !root.is_absolute() { return Err("projects unknown: a root is not absolute".into()); }
-        roots.insert(root.canonicalize().map_err(|e| format!("projects unknown: {e}"))?);
+        roots.insert(root.canonicalize().map_err(|e| format!("projects unknown ({}): {e}", install.join("projects").display()))?);
     }
     Ok(roots.into_iter().collect())
 }

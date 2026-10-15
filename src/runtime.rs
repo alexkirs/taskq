@@ -568,13 +568,14 @@ pub fn instructions(root: &Path, task: &str, resume: bool) -> Result<String, Sta
 }
 
 // Claude --bg forwards stdin as child argv; send only a file reference.
-fn claude_input(root: &Path, text: &str) -> Result<String, String> {
+fn claude_input(root: &Path, text: &str) -> Result<(String, File), String> {
     let dir = root.join(".taskq/inputs");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{}.txt", uuid()));
-    File::options().write(true).create_new(true).open(&path)
-        .and_then(|mut file| file.write_all(text.as_bytes())).map_err(|e| e.to_string())?;
-    Ok(format!("Before any work, use Read to read {} in full. It contains this turn's TaskQ rules and task. Apply those rules and carry out that task. If Read truncates the file, read the remaining parts before proceeding.", serde_json::to_string(&path.to_string_lossy()).map_err(|e| e.to_string())?))
+    let mut file = File::options().read(true).write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
+    file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+    file.try_lock_shared().map_err(|e| e.to_string())?;
+    Ok((format!("Before any work, use Read to read {} in full. It contains this turn's TaskQ rules and task. Apply those rules and carry out that task. If Read truncates the file, read the remaining parts before proceeding.", serde_json::to_string(&path.to_string_lossy()).map_err(|e| e.to_string())?), file))
 }
 
 fn turn_text(env: &Env, l: &Launch, fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
@@ -682,6 +683,7 @@ pub struct ClaudeTurn {
     before: usize,
     mode: String,
     input: String,
+    _input_file: File,
     pid: u32,
     done: bool,
 }
@@ -742,7 +744,7 @@ impl ClaudeTurn {
         let mut file = File::options().create(true).append(true).open(log).map_err(|e| e.to_string())?;
         let mut c = executable(which("claude"), access, env)?;
         environment(env, l, &mut c);
-        let input = claude_input(&root, text)?;
+        let (input, input_file) = claude_input(&root, text)?;
         c.current_dir(&root).arg("--bg");
         if l.resume.is_some() { c.args(["--resume", &l.session]); }
         else { c.args(["--settings", &compact_settings(&root, l), "--remote-control", &l.title, "--permission-mode", permission_mode]); }
@@ -762,7 +764,7 @@ impl ClaudeTurn {
             return Err("Claude created a copy; stopped owned copy, original conversation preserved".into());
         }
         Ok(Self { root, log: log.into(), session: if l.resume.is_some() { l.session.clone() } else { String::new() }, id: id.into(),
-            announced: false, copied: 0, before, mode: permission_mode.into(), input, pid: 0, done: false })
+            announced: false, copied: 0, before, mode: permission_mode.into(), input, _input_file: input_file, pid: 0, done: false })
     }
 }
 
@@ -1224,13 +1226,17 @@ mod tests {
         let mut inputs = Vec::new();
         for turn in ["start", "resume", "concurrent operator"] {
             let brief = format!("{text}{turn}");
-            let input = claude_input(&root, &brief).unwrap();
+            let (input, _file) = claude_input(&root, &brief).unwrap();
             assert!(input.len() < 8192 && !input.contains("invented padding"));
             assert!(input.contains("use Read") && input.contains("in full"));
             assert!(!inputs.contains(&input), "each turn has an immutable input file");
             let quoted = input.strip_prefix("Before any work, use Read to read ").unwrap().split(" in full.").next().unwrap();
             let path: String = serde_json::from_str(quoted).unwrap();
-            assert_eq!(std::fs::read_to_string(path).unwrap(), brief);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), brief);
+            let probe = File::options().read(true).write(true).open(&path).unwrap();
+            assert!(matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+            drop(_file);
+            probe.try_lock().unwrap();
             inputs.push(input);
         }
         assert_eq!(std::fs::read_dir(root.join(".taskq/inputs")).unwrap().count(), 3);

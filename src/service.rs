@@ -636,7 +636,18 @@ impl<'a> Service<'a> {
 
     /// `gone attempt a` on `t`; at the retry limit it carries the § 2 limit card (#1123).
     fn gone(&mut self, n: u64, t: &Task, a: u64, text: &str) -> Result<u64, String> {
-        self.post(n, core::entry("gone", &[], Some(a), &core::limit_text(n, t, "gone", text)))
+        let id = self.post(n, core::entry("gone", &[], Some(a), &core::limit_text(n, t, "gone", text)))?;
+        if let Ok(log) = crate::board::entries(self.board, n) {
+            let through: Vec<_> = log.into_iter().filter(|e| e.id <= id).collect();
+            let before: Vec<_> = through.iter().filter(|e| e.id < id).cloned().collect();
+            if core::fold(n, &before, false).attempt == Some(a) && core::fold(n, &through, false).attempt != Some(a) {
+                crate::profile::repair(&self.cfg.install, &self.cfg.repo, host_of(t).unwrap_or(&self.cfg.me), n, a,
+                    rt_of(t).map_or("other", |r| r.0), t.role.as_deref() == Some("reviewer"));
+            }
+        } else {
+            eprintln!("Profiling: unknown (gone readback failed; terminal record not repaired)");
+        }
+        Ok(id)
     }
 
     fn post(&mut self, n: u64, body: String) -> Result<u64, String> {
@@ -1126,6 +1137,7 @@ impl<'a> Service<'a> {
         crate::profile::stage("start", l.task, l.attempt, &l.rt, Some(began.elapsed()), if started.is_ok() { "ok" } else { "failed" }, err, crate::profile::Usage::NoModel);
         match started {
             Ok(proc) => {
+                crate::profile::open(&self.cfg.install, &self.cfg.repo, &self.cfg.me, l.task, l.attempt, &l.rt, l.role == "reviewer");
                 self.begun.insert(l.attempt, (l.role.clone(), l.rt.clone(), Some((std::time::Instant::now(), pos))));
                 self.kids.push(Kid { task: l.task, attempt: l.attempt, rt: l.rt.clone(), proc });
                 self.pending.remove(&(l.task, l.attempt));
@@ -1593,6 +1605,45 @@ mod tests {
         let t = task(&b, n);
         assert_eq!((t.state, host_of(&t)), (State::Doing, Some("win")));
         assert_eq!(t.retries, 1);
+    }
+
+    // Chain: #1226 open stage -> vanished child -> normal gone -> terminal record and freed lease.
+    // Existing exit checks do not cross the retained profile store or selftest boundary.
+    #[test]
+    fn missing_terminal_record_repaired_only_by_normal_recovery() {
+        let dir = std::env::temp_dir().join(format!("taskq-terminal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = Fake::default();
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
+        let a = b.comment(n, &core::entry("spawn", &["worker", "claude:s", "mac"], None, "")).unwrap();
+        let mut c = cfg("mac");
+        c.install = dir.clone();
+        c.root = dir.clone();
+        crate::profile::open(&dir, &c.repo, "mac", n, a, "claude", false);
+        let path = dir.join("taskq.log");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut record: Value = serde_json::from_str(text.trim().strip_prefix("taskq-stage ").unwrap()).unwrap();
+        record["at_ms"] = json!(1);
+        std::fs::write(&path, format!("taskq-stage {record}\n")).unwrap();
+        assert!(crate::profile::selftest(&dir, &c.repo, &vec![], 300).unwrap_err().contains("FAIL"));
+        // A live attempt stays exempt even after ttl; the check never mutates board state.
+        assert!(crate::profile::selftest(&dir, &c.repo, &vec![(c.repo.clone(), a)], 300).is_ok());
+        assert_eq!(task(&b, n).attempt, Some(a));
+        let report = crate::profile::report(&dir);
+        assert!(report.contains(&format!("| o/r | #{n} | {a} | claude | mac |")), "{report}");
+        let mut s = service(&b, &c, Default::default());
+        s.focus.clear();
+        s.pass().unwrap();
+        assert!(b.comments(n).unwrap().iter().any(|c| c.body.starts_with(&format!("taskq: gone attempt {a}"))));
+        assert_eq!(task(&b, n).attempt, None);
+        assert!(!s.heartbeat_body().lines().any(|l| l == format!("#{n} {a}")));
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert!(repaired.contains("\"outcome\":\"failed\",\"error\":\"exit\""), "{repaired}");
+        assert!(crate::profile::selftest(&dir, &c.repo, &vec![], 300).is_ok());
+        s.pass().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired, "repair is idempotent");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     // Chain: § 7 worker exit to review. Risk: a silent exit is not gone; a result gets no reviewer.

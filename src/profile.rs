@@ -15,6 +15,7 @@ static LOG: OnceLock<PathBuf> = OnceLock::new();
 static TRACE: OnceLock<bool> = OnceLock::new();
 static RUN: OnceLock<Option<u64>> = OnceLock::new();
 static PROJECT: OnceLock<String> = OnceLock::new();
+static HOST: OnceLock<String> = OnceLock::new();
 static SPAN: AtomicU64 = AtomicU64::new(1);
 thread_local!(static PARENT: Cell<u64> = const { Cell::new(0) });
 
@@ -60,6 +61,10 @@ pub fn init(install: &Path) {
 pub fn project(repo: &str) {
     let ok = repo.len() <= 128 && repo.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b));
     let _ = PROJECT.set(if ok { repo } else { "other" }.into());
+}
+
+pub fn host(name: &str) {
+    let _ = HOST.set(name.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).take(128).collect());
 }
 
 fn error(text: &str) -> &'static str {
@@ -111,7 +116,7 @@ const OUTCOMES: [&str; 6] = ["ok", "ask", "retried", "failed", "cancelled", "unk
 /// Stage-only error classes: a child ended without hand-in; its issue left the board read or could not be read back.
 const STAGE_ERRORS: [&str; 3] = ["exit", "left-board", "unreadable"];
 const RUNTIMES: [&str; 4] = ["claude", "codex", "codex-app", "other"];
-const UNKNOWN: [&str; 5] = ["no-model", "no-usage", "log-unreadable", "app-turn", "adopted"];
+const UNKNOWN: [&str; 6] = ["no-model", "no-usage", "log-unreadable", "app-turn", "adopted", "open-stage"];
 
 /// Model use of one stage: service stages run no model; a runtime that reports none reads unknown, never zero;
 /// `tokens` is `None` when any counted call lacked usage.
@@ -120,6 +125,10 @@ pub enum Usage { NoModel, Unknown(&'static str), Known { calls: Option<u64>, tok
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Stage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    open: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project: Option<String>,
     stage: String,
@@ -143,6 +152,96 @@ fn now_ms() -> Option<u64> {
     SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis().min(u64::MAX as u128) as u64)
 }
 
+/// An open lifetime marker, not a completed duration sample.
+pub fn open(install: &Path, project: &str, host: &str, task: u64, attempt: u64, rt: &str, reviewer: bool) {
+    let r = Stage { project: Some(project.into()), host: Some(host.into()), open: true,
+        stage: if reviewer { "review" } else { "build" }.into(), task, attempt, rt: RUNTIMES.into_iter().find(|r| *r == rt).unwrap_or("other").into(),
+        us: None, outcome: "unknown".into(), error: "none".into(), at_ms: now_ms(), calls: None, tokens: None, unknown: Some("open-stage".into()) };
+    write_stage(&install.join("taskq.log"), &r);
+}
+
+fn write_stage(path: &Path, r: &Stage) {
+    if !path.parent().is_some_and(Path::is_dir) {
+        let _ = writeln!(std::io::stderr().lock(), "Profiling: unknown (install directory missing)");
+        return;
+    }
+    if let Err(e) = serde_json::to_string(r).map_err(std::io::Error::other)
+        .and_then(|j| append_line(path, &format!("{STAGE_PREFIX}{j}\n"))) {
+        let _ = writeln!(std::io::stderr().lock(), "Profiling: unknown ({})", append_error(&e));
+    }
+}
+
+fn terminal(r: &Stage) -> bool {
+    !r.open && (matches!(r.outcome.as_str(), "failed" | "cancelled")
+        || (matches!(r.stage.as_str(), "build" | "review" | "close") && matches!(r.outcome.as_str(), "ok" | "ask" | "retried")))
+}
+
+fn unresolved(text: &str) -> Result<Vec<Stage>, String> {
+    let mut last = BTreeMap::new();
+    for line in text.lines().filter_map(|l| l.strip_prefix(STAGE_PREFIX)) {
+        let r: Stage = serde_json::from_str(line).map_err(|_| "corrupt stage record")?;
+        if !STAGES.contains(&r.stage.as_str()) || !OUTCOMES.contains(&r.outcome.as_str())
+            || !RUNTIMES.contains(&r.rt.as_str()) || !(ERRORS.contains(&r.error.as_str()) || STAGE_ERRORS.contains(&r.error.as_str()))
+            || r.unknown.as_deref().is_some_and(|u| !UNKNOWN.contains(&u)) {
+            return Err("unknown stage code".into());
+        }
+        if r.attempt != 0 { last.insert((r.project.clone(), r.task, r.attempt), r); }
+    }
+    Ok(last.into_values().filter(|r| !terminal(r)).collect())
+}
+
+/// Only called after normal board recovery accepted `gone`; observations cannot trigger recovery.
+pub fn repair(install: &Path, project: &str, host: &str, task: u64, attempt: u64, rt: &str, reviewer: bool) {
+    let pending = read_log(install).and_then(|t| unresolved(&t));
+    let Ok(rows) = pending else {
+        let _ = writeln!(std::io::stderr().lock(), "Profiling: unknown (terminal records unreadable)");
+        return;
+    };
+    if !rows.iter().any(|r| r.project.as_deref() == Some(project) && r.task == task && r.attempt == attempt) { return; }
+    let r = Stage { project: Some(project.into()), host: Some(host.into()), open: false,
+        stage: if reviewer { "review" } else { "build" }.into(), task, attempt, rt: RUNTIMES.into_iter().find(|r| *r == rt).unwrap_or("other").into(), us: None,
+        outcome: "failed".into(), error: "exit".into(), at_ms: now_ms(), calls: None, tokens: None, unknown: Some("adopted".into()) };
+    write_stage(&install.join("taskq.log"), &r);
+}
+
+type Live = Vec<(String, u64)>;
+
+fn defects(text: &str, live: &Live, project: Option<&str>, now: u64, ttl: u64) -> Result<(String, usize), String> {
+    if !text.lines().any(|l| l.starts_with(STAGE_PREFIX)) { return Ok(("Attempt terminal records: unknown (no stage observations)\n".into(), 0)); }
+    let mut out = String::from("Attempt terminal records: retained window only; live exclusions require fresh evidence\n\n| Project | Task | Attempt | Runtime | Host | Age s | Defect |\n|---|---|---|---|---|---|---|\n");
+    let mut overdue = 0;
+    for r in unresolved(text)? {
+        if project.is_some_and(|p| r.project.as_deref() != Some(p))
+            || live.iter().any(|(p, a)| r.project.as_deref() == Some(p) && r.attempt == *a) { continue; }
+        let age = r.at_ms.filter(|at| *at <= now).map(|at| (now - at) / 1000);
+        if age.is_none() { return Err("unresolved attempt age unknown".into()); }
+        overdue += usize::from(age.is_some_and(|a| a > ttl));
+        out += &format!("| {} | #{} | {} | {} | {} | {} | missing terminal record |\n", crate::cell(r.project.as_deref().unwrap_or("unknown")),
+            r.task, r.attempt, crate::cell(&r.rt), crate::cell(r.host.as_deref().unwrap_or("unknown (not recorded)")), age.unwrap());
+    }
+    Ok((out, overdue))
+}
+
+/// Existing registered-project snapshots are caches, not a new liveness store; stale ones exclude nothing.
+fn local_live(install: &Path) -> Live {
+    let tool = crate::platform::tool(install);
+    fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter_map(|root| {
+        coreq::status::read(&tool, Path::new(root), 60)
+    }).filter(|v| v["complete"] == true).flat_map(|v| {
+        let project = v["board"]["repo"].as_str().unwrap_or_default().to_string();
+        v["tasks"].as_array().into_iter().flatten().filter_map(|t| Some((project.clone(), t["attempt"].as_u64()?))).collect::<Live>()
+    }).collect()
+}
+
+pub fn selftest(install: &Path, project: &str, live: &Live, ttl: u64) -> Result<String, String> {
+    let now = now_ms().ok_or("profile: clock unknown")?;
+    let text = read_log(install)?;
+    if !text.lines().any(|l| l.starts_with(STAGE_PREFIX)) { return Ok("attempt terminal records: unknown (no stage observations)".into()); }
+    let (report, overdue) = defects(&text, live, Some(project), now, ttl)?;
+    if overdue > 0 { Err(format!("attempt terminal records: FAIL ({overdue} older than ttl {ttl}s)\n{report}")) }
+    else { Ok("attempt terminal records: no overdue nonlive defects in retained window".into()) }
+}
+
 /// The error class of a stage that failed with `text`, never the text itself.
 pub fn class(text: &str) -> &'static str { error(text) }
 
@@ -160,7 +259,7 @@ fn stage_at(path: Option<&Path>, name: &'static str, task: u64, attempt: u64, rt
         Usage::Unknown(r) => (None, None, Some(r)),
         Usage::Known { calls, tokens } => (calls, tokens, tokens.is_none().then_some("no-usage")),
     };
-    let r = Stage { project: PROJECT.get().cloned(), stage: name.into(), task, attempt, rt: RUNTIMES.into_iter().find(|k| *k == rt).unwrap_or("other").into(),
+    let r = Stage { host: HOST.get().cloned(), open: false, project: PROJECT.get().cloned(), stage: name.into(), task, attempt, rt: RUNTIMES.into_iter().find(|k| *k == rt).unwrap_or("other").into(),
         us: took.map(|d| d.as_micros().min(u64::MAX as u128) as u64), outcome: outcome.into(), error: err.into(), at_ms: now_ms(), calls, tokens, unknown: unknown.map(Into::into) };
     let Some(path) = path else { return };
     let line = serde_json::to_string(&r).map(|j| format!("{STAGE_PREFIX}{j}\n"));
@@ -178,6 +277,7 @@ fn render_stages(text: &str) -> Result<String, &'static str> {
         let rt = RUNTIMES.into_iter().find(|k| *k == r.rt).ok_or("unknown stage runtime; log kept")?;
         if !OUTCOMES.contains(&r.outcome.as_str()) || !(ERRORS.contains(&r.error.as_str()) || STAGE_ERRORS.contains(&r.error.as_str()))
             || r.unknown.as_deref().is_some_and(|u| !UNKNOWN.contains(&u)) { return Err("unknown stage code; log kept"); }
+        if r.open { continue; }
         match rows.iter_mut().find(|(k, _)| *k == (i, rt)) {
             Some((_, v)) => v.push(r),
             None => rows.push(((i, rt), vec![r])),
@@ -455,7 +555,9 @@ pub fn report(install: &Path) -> String {
         let profile = render(&text).unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n"));
         let stages = render_stages(&text).unwrap_or_else(|e| format!("Attempt stages: unknown ({e})\n"));
         let (board, moves) = render_system(&text);
-        Ok(format!("{profile}\n{board}\n{moves}\n{stages}\n{}", crate::requests::sources(&text, now)))
+        let terminal = defects(&text, &local_live(install), None, now, 300).map(|r| r.0)
+            .unwrap_or_else(|e| format!("Attempt terminal records: unknown ({e})\n"));
+        Ok(format!("{profile}\n{board}\n{moves}\n{stages}\n{terminal}\n{}", crate::requests::sources(&text, now)))
     };
     read().unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n\nBoard operations: unknown ({e})\n\nQueue transitions: unknown ({e})\n\nAttempt stages: unknown ({e})\n\nBoard requests by source: unknown ({e})\n"))
 }
@@ -484,7 +586,7 @@ fn row(line: &str) -> Option<Option<Row>> {
         serde_json::from_str::<Stage>(j).ok().filter(|r| STAGES.contains(&r.stage.as_str()) && RUNTIMES.contains(&r.rt.as_str()) && OUTCOMES.contains(&r.outcome.as_str())
             && (ERRORS.contains(&r.error.as_str()) || STAGE_ERRORS.contains(&r.error.as_str())) && r.unknown.as_deref().is_none_or(|u| UNKNOWN.contains(&u))).map(|r| Row {
             kind: "stage".into(), at_ms: r.at_ms, project: r.project, task: Some(r.task), attempt: Some(r.attempt), name: Some(r.stage), runtime: Some(r.rt),
-            us: r.us, outcome: Some(r.outcome), error: Some(r.error), calls: r.calls, tokens: r.tokens, unknown: r.unknown, ..Default::default() })
+            host: r.host, us: r.us, outcome: Some(r.outcome), error: Some(r.error), calls: r.calls, tokens: r.tokens, unknown: r.unknown, ..Default::default() })
     } else if let Some(j) = line.strip_prefix(BOARD_PREFIX) {
         serde_json::from_str::<BoardOp>(j).ok().filter(|r| BOARD_OPS.contains(&r.op.as_str()) && ERRORS.contains(&r.error.as_str()) && ["ok", "failed"].contains(&r.outcome.as_str())).map(|r| Row {
             kind: "board".into(), at_ms: r.at_ms, name: Some(r.op), us: Some(r.us), outcome: Some(r.outcome), error: Some(r.error), remaining: r.remaining, ..Default::default() })
@@ -873,7 +975,7 @@ Changed: x"))];
             b("list", 4000, None, Some(4900), 100), b("list", 2000, Some("http5xx"), Some(4100), 101), b("claim", 1000, None, None, 102),
             format!("{BOARD_PREFIX}{{\"op\":\"lunch\"}}\n"),
             format!("{PREFIX}{}\n", serde_json::to_string(&Record { op: "spawn".into(), us: 7, error: "none".into(), at_ms: Some(140), trace: None }).unwrap()),
-            format!("{STAGE_PREFIX}{}\n", serde_json::to_string(&Stage { project: Some("o/a".into()), stage: "build".into(), task: 5, attempt: 9, rt: "codex".into(),
+            format!("{STAGE_PREFIX}{}\n", serde_json::to_string(&Stage { host: None, open: false, project: Some("o/a".into()), stage: "build".into(), task: 5, attempt: 9, rt: "codex".into(),
                 us: Some(5), outcome: "ok".into(), error: "none".into(), at_ms: Some(150), calls: None, tokens: Some(3), unknown: None }).unwrap()),
         ].concat();
         let text = export(&log, Some(100));

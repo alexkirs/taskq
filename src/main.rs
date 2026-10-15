@@ -200,6 +200,7 @@ fn load(root: &Path) -> Res<(Config, Value)> {
         return Err("taskq.json: repo is required".into());
     }
     profile::project(&cfg.repo);
+    profile::host(&cfg.me);
     Ok((cfg, v))
 }
 
@@ -1770,7 +1771,17 @@ fn run(argv: &[String]) -> Res<()> {
                 println!("board: unknown (TASKQ_SELFTEST_OFFLINE set; no board read)");
             } else if let Ok(root) = find_root() {
                 let c = ctx()?;
-                let open = c.board.issues(None)?.len();
+                let (views, hosts) = service::views(c.board.as_ref(), &mut Default::default(), &mut Default::default())?;
+                let now = c.board.now()?;
+                let live = views.iter().filter_map(|v| {
+                    let a = v.task.attempt?;
+                    let h = service::host_of(&v.task)?;
+                    (v.task.state == core::State::Ask || hosts.iter().any(|hb| hb.title == format!("taskq host {h}")
+                        && now - hb.updated <= c.cfg.ttl && hb.body.lines().any(|l| l == format!("#{} {a}", v.issue.number))))
+                        .then(|| (c.cfg.repo.clone(), a))
+                }).collect();
+                println!("{}", profile::selftest(&c.cfg.install, &c.cfg.repo, &live, c.cfg.ttl.max(0) as u64)?);
+                let open = views.len();
                 println!("board: {} as {} on {}", c.cfg.repo, c.board.me()?, c.cfg.web_host);
                 println!("open issues: {open}");
                 println!("host: {}", c.cfg.me);

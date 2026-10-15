@@ -141,6 +141,12 @@ The shared store now bounds database/WAL/SHM files independently of retained JSO
 
 The local-capture selftest requires the installed collector to flush committed observations with no collection loss. An absent, empty or failed collector makes selftest fail. Ordinary commands keep their outcomes. This local barrier does not prove UI coverage, global ingestion, other hosts or queue readiness.
 
+### Native render qualification blocker
+
+Candidate `cd9316e` fails the first native tray icon with collection enabled. An isolated macOS tray stalled in `icon::compact` → `draw_q` → `Rgba::fill`: generated callback spans run for every4×4 subpixel sample. The collector reported queue overflow and lost observations. The matching isolated service store retained124035 rows and had already pruned240384 rows when the probe stopped. These are diagnostic observations, not a production incident or a throughput target.
+
+`icon::tests::first_icon_with_capture_finishes_without_collection_loss` runs the same first-icon code in two isolated child processes. Baseline capture-off rendering took16868µs; capture-on reported loss and did not complete within the20s diagnostic bound. The bound limits test damage; it is not a UI responsiveness budget. The test requires committed capture with no loss and identical PNG output. Earlier renderer tests had no active collector and missed this path. This failing gate blocks release until shared capture handles the real workload; excluding the renderer, enlarging the queue, disabling coverage or raising the deadline is not a demonstrated fix. Native input/paint qualification remains incomplete.
+
 ## Common-store conversion qualification
 
 The draft typed converter in `src/telemetry/semantic.rs` reuses the existing profile/report schemas and request normalization. It preserves operation trace numbers, stage open/usage status, board remaining budget, transitions and request summaries through coreq semantic metadata. Historical product version and textual trace/span identities stay explicitly unknown; numeric provenance is retained separately. Request summaries remain summaries, with reversible fixed-code source/operation keys. The converter is test-only until one-store cutover, source reset detection, physical transition budget and report readback qualify. The installed writer and archive remain unchanged.

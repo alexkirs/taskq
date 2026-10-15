@@ -392,6 +392,49 @@ mod tests {
         i.px.chunks(4).any(|p| p[3] == 255 && p[..3] == c[..3])
     }
 
+    // Chain: native tray's first icon -> always-on collector -> committed readback.
+    // Risk: per-sample instrumentation stalls the UI and loses observations despite renderer-only tests passing.
+    #[test]
+    fn first_icon_with_capture_finishes_without_collection_loss() {
+        use std::process::{Command, Stdio};
+        let root = std::env::temp_dir().join(format!("qi-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for mode in ["baseline", "capture"] {
+            let log = root.join(format!("{mode}.log"));
+            let output = std::fs::File::create(&log).unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "icon::tests::first_icon_capture_child", "--ignored", "--nocapture"])
+                .env("TASKQ_ICON_PROBE", &root).env("TASKQ_ICON_PROBE_MODE", mode)
+                .stdout(Stdio::from(output.try_clone().unwrap())).stderr(Stdio::from(output)).spawn().unwrap();
+            let began = std::time::Instant::now();
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() { break Some(status); }
+                if began.elapsed() > std::time::Duration::from_secs(20) {
+                    child.kill().unwrap(); child.wait().unwrap(); break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            let detail = std::fs::read_to_string(&log).unwrap();
+            eprintln!("{mode}: {detail}");
+            assert!(status.is_some_and(|s| s.success()), "{mode}: icon/flush failed or exceeded20s; evidence {}", log.display());
+        }
+        assert_eq!(std::fs::read(root.join("baseline.png")).unwrap(), std::fs::read(root.join("capture.png")).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "subprocess helper exercised by first_icon_with_capture_finishes_without_collection_loss"]
+    fn first_icon_capture_child() {
+        let root = std::path::PathBuf::from(std::env::var_os("TASKQ_ICON_PROBE").unwrap());
+        let mode = std::env::var("TASKQ_ICON_PROBE_MODE").unwrap();
+        let runtime = (mode == "capture").then(|| coreq::telemetry::capture::Runtime::install(&root.join("db"), "taskq", "fixture").unwrap());
+        let began = std::time::Instant::now();
+        let image = compact(false, true, 2.0);
+        eprintln!("first compact icon: {}us", began.elapsed().as_micros());
+        std::fs::write(root.join(format!("{mode}.png")), image.png()).unwrap();
+        if runtime.is_some() { eprintln!("capture: {}", coreq::telemetry::capture::qualify().unwrap()); }
+    }
+
     // Chain: § 4 tray icon render. Risk: same config yields different bytes; Custom differs from Summary.
     #[test]
     fn summary_is_valid_and_renders_deterministically() {

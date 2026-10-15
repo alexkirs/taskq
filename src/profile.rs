@@ -579,8 +579,9 @@ fn render_board(export: &str) -> Result<String, &'static str> {
 /// `--since 30m|24h|7d` as Unix ms before `now`.
 fn since_ms(s: &str, now: u64) -> Result<u64, String> {
     let bad = || format!("--since {s}: use a number with m, h or d, e.g. 24h");
-    let (n, unit) = s.split_at(s.len().saturating_sub(1));
-    let mins: u64 = match unit { "m" => 1, "h" => 60, "d" => 1440, _ => return Err(bad()) };
+    let mut chars = s.chars();
+    let mins: u64 = match chars.next_back() { Some('m') => 1, Some('h') => 60, Some('d') => 1440, _ => return Err(bad()) };
+    let n = chars.as_str();
     Ok(now.saturating_sub(n.parse::<u64>().map_err(|_| bad())?.saturating_mul(mins * 60_000)))
 }
 
@@ -854,7 +855,7 @@ Transitions: 9 unique of 11 rows"), "{tasks}");
         let empty = export("", None);
         assert!(render_tasks(&empty).unwrap().contains("Window: unknown (no timestamps) (all retained); 0 samples") && render_board(&empty).unwrap().contains("unknown (no observations)"));
         assert_eq!(since_ms("2h", 10_000_000), Ok(2_800_000));
-        assert!(since_ms("2w", 1).is_err() && since_ms("h", 1).is_err());
+        assert!(since_ms("2w", 1).is_err() && since_ms("h", 1).is_err() && since_ms("1日", 1).is_err() && since_ms("", 1).is_err());
         assert!(view(Path::new("/nonexistent-taskq"), "lunch", None).unwrap_err().contains("unknown profile view"));
     }
 

@@ -1622,10 +1622,13 @@ mod tests {
     // Risk: native failure detail is lost between adapter and stage record.
     #[test]
     fn terminal_reviewer_records_native_error_and_releases_lease() {
-        struct Terminal;
+        struct Terminal { root: PathBuf }
         impl Proc for Terminal {
             fn exited(&mut self) -> Result<Option<i32>, String> { Ok(Some(-1)) }
-            fn exit_error(&self) -> Option<&'static str> { Some("argument-too-long") }
+            fn exit_error(&self) -> Option<&'static str> {
+                Some(crate::runtime::claude_failure(&serde_json::json!({"id":"abcdef12", "state":"failed"}),
+                    &self.root, "abcdef12", Some(&self.root)))
+            }
             fn kill(&mut self) {}
             fn id(&self) -> u32 { 0 }
         }
@@ -1634,7 +1637,12 @@ mod tests {
         let a = b.comment(n, "taskq: spawn worker claude:invented win").unwrap();
         b.comment(n, &core::entry("result", &["0123456789abcdef0123456789abcdef01234567"], Some(a), "ok")).unwrap();
         let c = cfg("win");
-        let mut s = Service::new(&b, &c, "4.4.0", Box::new(|_| Ok(Box::new(Terminal))));
+        let root = std::env::temp_dir().join(format!("taskq-native-failure-{}", crate::runtime::uuid()));
+        std::fs::create_dir_all(root.join("jobs/abcdef12")).unwrap();
+        std::fs::write(root.join("jobs/abcdef12/state.json"), serde_json::json!({
+            "cwd": root, "state":"failed", "detail":"ENAMETOOLONG: name too long, uv_spawn"
+        }).to_string()).unwrap();
+        let mut s = Service::new(&b, &c, "4.4.0", Box::new(|_| Ok(Box::new(Terminal { root: root.clone() }))));
         s.focus = vec!["all".into()];
         s.pass().unwrap();
         let r = task(&b, n).attempt.unwrap();
@@ -1645,6 +1653,14 @@ mod tests {
         assert!(b.comments(n).unwrap().iter().any(|e| e.body.contains(&format!("taskq: gone attempt {r}"))));
         assert_eq!((task(&b, n).state, task(&b, n).result.is_some()), (State::Review, true));
         crate::profile::STAGED.with(|v| assert!(v.borrow().contains(&format!("review {n} {r} claude failed argument-too-long"))));
+        let failure = |row: serde_json::Value, id: &str, project: &std::path::Path| crate::runtime::claude_failure(&row, project, id, Some(&root));
+        assert_eq!(failure(serde_json::json!({"state":"failed", "detail":"permission denied"}), "abcdef12", &root), "permission");
+        assert_eq!(failure(serde_json::json!({"state":"stopped"}), "abcdef12", &root), "other");
+        assert_eq!(failure(serde_json::json!({"state":"failed"}), "../abcdef12", &root), "other");
+        assert_eq!(failure(serde_json::json!({"state":"failed"}), "abcdef12", &root.join("jobs")), "other");
+        std::fs::remove_file(root.join("jobs/abcdef12/state.json")).unwrap();
+        assert_eq!(failure(serde_json::json!({"state":"failed"}), "abcdef12", &root), "other");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     // Chain: § 3 claim across hosts to § 2 retry limit (#913, #1123). Risk: two hosts claim one result's review, the

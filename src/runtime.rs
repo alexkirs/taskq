@@ -697,10 +697,25 @@ fn claude_agents(root: &Path) -> Result<Vec<serde_json::Value>, String> {
     serde_json::from_str(&out).map_err(|e| format!("claude agents: {e}"))
 }
 
+fn claude_home() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).or_else(||
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|h| PathBuf::from(h).join(".claude")))
+}
+
+pub(crate) fn claude_failure(row: &serde_json::Value, root: &Path, id: &str, home: Option<&Path>) -> &'static str {
+    let detail = row["detail"].as_str().map(String::from).or_else(|| {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') { return None; }
+        let text = std::fs::read_to_string(home?.join("jobs").join(id).join("state.json")).ok()?;
+        let job: serde_json::Value = serde_json::from_str(&text).ok()?;
+        if job["state"] != row["state"] || Path::new(job["cwd"].as_str()?).canonicalize().ok()? != root.canonicalize().ok()? { return None; }
+        job["detail"].as_str().map(String::from)
+    });
+    crate::profile::class(detail.as_deref().unwrap_or_default())
+}
+
 fn claude_transcript(session: &str) -> Option<PathBuf> {
     if session.is_empty() || !session.chars().all(|c| c.is_ascii_hexdigit() || c == '-') { return None; }
-    let home = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).or_else(||
-        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|h| PathBuf::from(h).join(".claude")))?;
+    let home = claude_home()?;
     std::fs::read_dir(home.join("projects")).ok()?.flatten().find_map(|d| {
         let p = d.path().join(format!("{session}.jsonl"));
         p.is_file().then_some(p)
@@ -787,7 +802,7 @@ impl ClaudeTurn {
         // Failed background launches can have neither status nor a transcript (#1208).
         let state = row["state"].as_str().ok_or("Claude job state unavailable; state unknown")?;
         if !matches!(state, "working" | "idle" | "done" | "blocked") {
-            self.failure = Some(crate::profile::class(row["detail"].as_str().unwrap_or_default()));
+            self.failure = Some(claude_failure(row, &self.root, &self.id, claude_home().as_deref()));
             return Ok(Some(-1));
         }
         // On Windows a waking session briefly publishes a different UUID before restore.

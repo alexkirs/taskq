@@ -1297,7 +1297,7 @@ mod tests {
     }
 
     // Chain: § 8 rule delivery to a PM session, #1219. Risk: the PM hook gets other rules than a worker at the same pin,
-    // or compaction resends the bodies.
+    // compaction resends the bodies, or the committed hook names a local path or misses start/compact.
     #[test]
     fn pm_hook_gets_the_worker_start_rules() {
         let root = rules_root("pm");
@@ -1306,6 +1306,14 @@ mod tests {
         let start = turn_text(&env, &l, rule).unwrap();
         assert_eq!(pm_rules(&root, "start", rule).unwrap(), start.split("\nTaskQ task\n").next().unwrap());
         assert_eq!(pm_rules(&root, "compact", rule).unwrap(), rules(&root, true, rule).unwrap());
+        // the committed project hook: start on startup and clear, compact on compaction, no local path or secret
+        let settings: serde_json::Value = serde_json::from_str(include_str!("../.claude/settings.json")).unwrap();
+        let hooks = settings["hooks"]["SessionStart"].as_array().unwrap();
+        for (matcher, phase) in [("startup|clear", "start"), ("compact", "compact")] {
+            let cmd = hooks.iter().find(|h| h["matcher"] == matcher).unwrap()["hooks"][0]["command"].as_str().unwrap();
+            assert!(cmd.ends_with(&format!(" rules pm {phase}")) && cmd.contains("$CLAUDE_PROJECT_DIR"), "{cmd}");
+            assert!(!cmd.contains("/Users/") && !cmd.contains("token"), "{cmd}");
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 

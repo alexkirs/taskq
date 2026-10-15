@@ -388,7 +388,7 @@ function filteredTasks(p){
 function head(){return '<div class="row head"><span class="meta">taskq</span><button data-a="pin" aria-pressed="'+!!S.pinned+'" title="'+(S.pinned?'Unpin: back to the popover':'Pin: keep open as a movable window')+'">'+(S.pinned?'Pinned':'Pin')+'</button><button data-a="top" aria-pressed="'+!!S.top+'" title="Keep above other windows">Top</button></div>';}
 function render(navigating=false){
   if(!S||resizing)return;
-  if(hostAction){menu.innerHTML='<div class="body" role="alert">'+(hostAction.a==='restart'?'Restart host service?':'Stop host until next logon? Existing attempts finish first.')+'<br>'+S.projects.map(p=>esc(p.name)).join('<br>')+'</div><div class="options"><button data-a="host-apply">Confirm</button><button data-a="host-cancel">Cancel</button></div>';fit();return;}
+  if(hostAction){const focused=document.activeElement?.dataset?.a;menu.innerHTML='<div class="body" role="alert">'+(hostAction.a==='restart'?'Restart host service?':'Stop host until next logon? Existing attempts finish first.')+'<br>'+S.projects.map(p=>esc(p.name)).join('<br>')+'</div><div class="options"><button data-a="host-apply">Confirm</button><button data-a="host-cancel">Cancel</button></div>';menu.querySelector('[data-a="'+(focused==='host-apply'?'host-apply':'host-cancel')+'"]')?.focus({preventScroll:true});fit();return;}
   const active=document.activeElement,answerFocus=active&&active.closest('[data-answer]'),scroll=document.scrollingElement.scrollTop;
   const bounds=new Map([...menu.querySelectorAll('[data-bound]')].map(e=>[e.dataset.bound,e.scrollTop]));
   const focusKey=!navigating&&active&&menu.contains(active)?JSON.stringify(active.dataset):null;

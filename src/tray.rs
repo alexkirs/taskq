@@ -223,7 +223,13 @@ fn ai(install: &Path, a: &str, m: &Value) {
 }
 
 fn roots(install: &Path) -> Vec<String> {
-    fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(String::from).collect()
+    let mut roots: Vec<String> = fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(String::from).collect();
+    if let Ok(status) = crate::host_cli::snapshot(install) {
+        for p in status["projects"].as_array().into_iter().flatten() {
+            if p["draining"] == true { if let Some(root) = p["root"].as_str() { if !roots.iter().any(|r| r == root) { roots.push(root.into()); } } }
+        }
+    }
+    roots
 }
 
 /// Owner answers and tray-only fallback actions cross this bridge; the CLI owns credentials, dispatch and board readback.
@@ -442,7 +448,7 @@ fn project(install: &Path, root: &str) -> Value {
     }).collect();
     // the local host's saved capacity, for `Edit limits` and its readback (§ 4 Capacity)
     let (cap_host, cap_saved, board_kind) = match crate::load(r) {
-        Ok((c, v)) => (json!(c.me), crate::service::capacity(&v, &c.me).map(|x| x.json()).unwrap_or_else(|e| json!({"error": e})), json!(c.board.name)),
+        Ok((c, v)) => (json!(c.me), crate::host::saved_capacity(install, &v, &c.me).map(|x| x.json()).unwrap_or_else(|e| json!({"error": e})), json!(c.board.name)),
         Err(e) => (Value::Null, json!({"error": e}), Value::Null),
     };
     let mut tasks = s["tasks"].as_array().cloned().unwrap_or_default();
@@ -1200,8 +1206,9 @@ fn act(action: &str, root: &Path, label: Option<&str>) {
             crate::poke(root);
         }
         "restart" => {
-            let _ = fs::write(d.join("restart"), "");
-            crate::poke(root);
+            let install = crate::platform::default_install();
+            let _ = crate::platform::write_atomic(&install.join("restart"), "");
+            let _ = crate::platform::write_atomic(&install.join("poke"), "");
         }
         "log" => {
             let s: Value = fs::read_to_string(d.join("status.json")).ok().and_then(|x| serde_json::from_str(&x).ok()).unwrap_or_default();
@@ -1333,7 +1340,12 @@ fn install_service(install: &Path, mut a: Value) -> Value {
         if !o.status.success() {
             return Err(text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("service install failed").to_string());
         }
-        if roots(install).iter().any(|r| Path::new(r) == dir) { Ok(()) } else { Err("installed, but this host's projects list does not show it".into()) }
+        let pid = crate::host_cli::pid(install)?;
+        let p = crate::dot(&dir).join("status.json");
+        if roots(install).iter().any(|r| Path::new(r) == dir) && pid.is_some()
+            && crate::file_age(&p).is_some_and(|a| a <= 60) && crate::data::json(&p)?.is_some_and(|s| s["pid"].as_u64() == pid.map(u64::from)) {
+            Ok(())
+        } else { Err("registered; waiting for host service readback".into()) }
     });
     a["state"] = json!(if r.is_ok() { "installed" } else { "install failed" });
     a["reason"] = json!(r.err().unwrap_or_default());

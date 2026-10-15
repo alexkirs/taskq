@@ -82,6 +82,12 @@ impl Policy {
     }
 }
 
+/// During legacy handoff only the old per-project policy exists; host mode never writes those copies.
+pub fn saved_capacity(install: &Path, v: &Value, me: &str) -> Res<Capacity> {
+    if install.join("host.json").try_exists().map_err(|e| e.to_string())? { Policy::read(install)?.project(v) }
+    else { service::capacity(v, me) }
+}
+
 pub type Shared = Arc<Mutex<Host>>;
 type Slot = (PathBuf, u64, u64);
 fn slot(project: &Path, task: u64, attempt: u64) -> Slot {
@@ -256,6 +262,7 @@ pub fn run(install: &Path) -> Res<()> {
         crate::platform::write_atomic(&install.join("service"), &format!("{}\n", std::process::id()))?;
         registry.refresh(install, began.elapsed().as_secs());
         roots.clone_from(&registry.roots);
+        let drain = install.join("drain").try_exists().unwrap_or(true);
         let old = legacy(&roots);
         let policy = match &old { Ok(()) => migrate(install, &roots).and_then(|_| Policy::read(install)), Err(e) => Err(e.clone()) };
         {
@@ -268,8 +275,11 @@ pub fn run(install: &Path) -> Res<()> {
                 let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
                 h.gate.observe(now, wall, crate::platform::cpu_ticks(), crate::platform::memory_available());
             }
-            for root in threads.keys().filter(|p| !roots.contains(p)) { h.draining.insert(root.clone()); }
+            for root in threads.keys().filter(|p| !roots.contains(p)) {
+                if h.draining.insert(root.clone()) { crate::touch(&crate::dot(root).join("poke")); }
+            }
             for root in &roots {
+                if drain { if h.draining.insert(root.clone()) { crate::touch(&crate::dot(root).join("poke")); } continue; }
                 h.draining.remove(root);
                 if threads.contains_key(root) || stopped.contains(root) { continue; }
                 h.busy.insert(root.clone(), true);
@@ -312,7 +322,7 @@ pub fn run(install: &Path) -> Res<()> {
             let outcome = threads.remove(&root).unwrap().join();
             let drained = matches!(&outcome, Ok(Err(e)) if e == "project drained");
             let mut h = shared.lock().unwrap_or_else(|e| e.into_inner());
-            if drained { h.busy.remove(&root); h.prepared.remove(&root); }
+            if drained { h.busy.remove(&root); h.prepared.remove(&root); h.draining.remove(&root); }
             else {
                 // A reduced loop failed: its attempts expire on other hosts, and local launches hold for inspection.
                 stopped.insert(root.clone());
@@ -321,6 +331,20 @@ pub fn run(install: &Path) -> Res<()> {
             }
         }
         let mut h = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let project_rows: Vec<Value> = roots.iter().chain(threads.keys()).collect::<BTreeSet<_>>().into_iter().map(|root| {
+            let draining = drain || h.draining.contains(root);
+            let status = crate::data::json(&crate::dot(root).join("status.json"));
+            let status = status.ok().flatten().filter(|v| v["pid"] == std::process::id() && crate::file_age(&crate::dot(root).join("status.json")).is_some_and(|a| a <= 60));
+            let limits = status.as_ref().map(|v| v["project_limits"].clone());
+            let known = status.as_ref().is_some_and(|v| v["policy_known"] == true);
+            json!({"root":root, "draining":draining, "limits":limits, "known":known})
+        }).collect();
+        let used = h.slots.values().fold(BTreeMap::<String, u64>::new(), |mut m, rt| { *m.entry(rt.clone()).or_default() += 1; m });
+        let status = json!({"pid":std::process::id(), "drain":drain,
+            "idle":stopped.is_empty() && h.slots.is_empty() && h.busy.values().all(|b| !b) && (!drain || threads.is_empty()),
+            "reason":registry.error.clone().or_else(|| old.as_ref().err().cloned()),
+            "policy":h.policy.as_ref().ok().map(|p| &p.raw), "used":used, "projects":project_rows});
+        crate::platform::write_atomic(&install.join("service.json"), &(serde_json::to_string(&status).map_err(|e| e.to_string())? + "\n"))?;
         let timers = h.policy.as_ref().map(|p| (p.update_every, p.rollback_after)).unwrap_or((60, 600));
         let asked = fs::remove_file(install.join("update")).is_ok() || roots.iter().any(|r| fs::remove_file(crate::dot(r).join("update")).is_ok());
         if !h.restart && (asked || checked.is_none_or(|t| t.elapsed().as_secs() >= timers.0)) {

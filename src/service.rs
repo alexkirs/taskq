@@ -534,6 +534,11 @@ impl<'a> Service<'a> {
         if let Some(host) = &self.host { if let Ok(mut h) = host.lock() { h.ready(&self.cfg.root, false); } }
     }
 
+    /// § 8.5: a held claim/resume owns a lease even without a running process.
+    pub fn idle(&self) -> bool {
+        self.kids.is_empty() && self.held.is_empty() && self.pending.is_empty() && self.reserved.is_empty()
+    }
+
     /// Liveness/handoff monitoring remains available if the reduced board loop fails; it never renews a lease.
     pub fn reap_owned(&mut self) {
         self.kids.retain_mut(|k| match k.proc.exited() {
@@ -1818,6 +1823,19 @@ mod tests {
             if beat(&b) != last { writes += 1; last = beat(&b); }
         }
         assert_eq!(writes, 30, "one write per 2 passes at poll 60, ttl 300; was 60 at ttl / 5");
+    }
+
+    // Chain: § 8.5 host drain -> pending lease -> child exit -> idle. Risk: no child mistaken for no attempt.
+    #[test]
+    fn host_drain_waits_for_pending_leases() {
+        let b = Fake::default(); let c = cfg("mac");
+        let mut s = service(&b, &c, Default::default());
+        assert!(s.idle());
+        s.pending.insert((7, 41)); assert!(!s.idle());
+        s.pending.clear(); s.reserved.push((7, 41, "claude".into())); assert!(!s.idle());
+        s.reserved.clear();
+        s.kids.push(Kid { task: 7, attempt: 41, rt: "claude".into(), proc: Box::new(FakeProc(Rc::new(RefCell::new(None)))) });
+        assert!(!s.idle()); s.kids.clear(); assert!(s.idle());
     }
 
     // Chain: R2 § 3 two hosts one attempt. Risk: two attempts run, or a dead host blocks the task.

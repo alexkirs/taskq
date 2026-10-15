@@ -7,6 +7,7 @@ macro_rules! log {
 
 mod admission;
 mod host;
+mod host_cli;
 mod board;
 mod core;
 mod data;
@@ -68,9 +69,9 @@ const USAGE: &str = "taskq agents
  taskq wait [--window MIN] [--only L,..]
  taskq cleanup [--force] | taskq update [--check]
  taskq enroll <https-url> [--headless] | taskq connection status | taskq disconnect
- taskq service install|run|pause|resume|status|restart|stop|uninstall|list
+ taskq service install|run|pause|resume|status|restart|stop|uninstall [--host]|list
  taskq service focus [all|off|<label..>] [--request TEXT]
- taskq service capacity [--host H] [--mode auto|fixed] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
+ taskq service capacity [--project P] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
  taskq service permissions [--runtime R --mode restricted|workspace|full|none [--scope host|project]]
  taskq service resources [--grant ID --actor ID --hours N [--project P].. [--runtime R].. [--host-policy] | --revoke ID]
  taskq tray [--snapshot DIR [--route R,..]] [--icon FILE] | taskq selftest
@@ -92,7 +93,7 @@ impl Args {
         while let Some(x) = it.next() {
             match x.strip_prefix("--") {
                 Some(k) => {
-                    let val = if matches!(k, "later" | "hold" | "start" | "check" | "force" | "help" | "json" | "apply" | "headless" | "host-policy") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
+                    let val = if matches!(k, "later" | "hold" | "start" | "check" | "force" | "help" | "json" | "apply" | "headless" | "host-policy") || (k == "host" && a.pos.get(1).is_some_and(|s| s == "uninstall")) { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
                     a.flags.entry(k.to_string()).or_default().push(val);
                 }
                 None => a.pos.push(x.clone()),
@@ -666,9 +667,10 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Res<()> {
         let reduced = panics.quarantined() || began.elapsed().as_secs() < panics.until;
         // § 3: capacity reloads before each admission decision; children are untouched
+        let mut project_limits = Value::Null;
         let cap = fs::read_to_string(cfg.root.join("taskq.json")).map_err(|e| e.to_string())
             .and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| format!("taskq.json: {e}")))
-            .and_then(|v| match &host {
+            .and_then(|v| { project_limits = v["limits"].clone(); match &host {
                 Some(h) => {
                     let h = h.lock().map_err(|_| "host admission poisoned; launches held")?;
                     let p = h.policy.as_ref().map_err(Clone::clone)?;
@@ -676,11 +678,12 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
                     p.project(&v)
                 }
                 None => service::capacity(&v, &cfg.me),
-            });
+            }});
         if let Err(e) = &cap {
             log!("capacity: {e}; launches held");
         }
         let op_rt = cap.as_ref().ok().and_then(|c| ["claude", "codex"].into_iter().find(|rt| c.limits.get(*rt).copied().unwrap_or(if c.auto { u32::MAX } else { 0 }) > 0));
+        let policy_known = cap.is_ok();
         s.reload(cap);
         if let Some(host) = &host { if let Ok(h) = host.lock() { s.gate = h.gate.clone(); } }
         // § 8 Access: re-read every pass; a refused runtime is not claimed or resumed
@@ -762,7 +765,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         }
         for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
-            ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
+            ("policy_known", json!(policy_known)), ("project_limits", project_limits), ("draining", json!(host.as_ref().is_some_and(|h| h.lock().is_ok_and(|h| h.draining.contains(&cfg.root))))), ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
             ("restart_waits", json!(d.join("restart").exists().then(|| restart_waits(&s, &cfg.root)))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root))),
             ("requests", requests_json), ("connection", json!(dashq.outcome))]
@@ -833,7 +836,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         if let Some(host) = &host {
             if let Ok(mut h) = host.lock() {
             let registered = !h.draining.contains(&cfg.root);
-            let drained = s.kids.is_empty() && !operator::running(&cfg.root);
+            let drained = s.idle() && !operator::running(&cfg.root);
             if !registered && drained { h.sync(&cfg.root, vec![]); h.ready(&cfg.root, false); return Err("project drained".into()); }
             if registered { h.busy.insert(cfg.root.clone(), !drained); }
             if h.restart && restart_waits(&s, &cfg.root).is_empty() {
@@ -908,7 +911,7 @@ fn stopped_handoff(s: &mut Service, host: &host::Shared, cfg: &Config) -> Res<bo
     s.reap_owned();
     s.sync_host();
     let mut h = host.lock().map_err(|_| "stopped project admission unknown")?;
-    let idle = s.kids.is_empty() && !operator::running(&cfg.root);
+    let idle = s.idle() && !operator::running(&cfg.root);
     h.busy.insert(cfg.root.clone(), !idle);
     if h.restart && restart_waits(s, &cfg.root).is_empty() {
         save_kids(s, &cfg.root)?;
@@ -1026,6 +1029,23 @@ fn write_capacity(root: &Path, host: &str, e: &CapEdit, expect: Option<&Value>) 
     let read = || fs::read_to_string(&p).map_err(|e| format!("taskq.json: {e}"));
     let text = read()?;
     let (cfg, v) = load(root)?;
+    if cfg.install.join("host.json").try_exists().map_err(|e| e.to_string())? {
+        let _lock = host_cli::lock(&cfg.install, "host-policy.lock")?;
+        let policy = host::Policy::read(&cfg.install)?;
+        if host != policy.me { return Err("capacity edits are local; remote --host removed".into()); }
+        let text = read()?;
+        let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let old = policy.project(&v)?;
+        if expect.is_some_and(|x| *x != old.json()) { return Err("capacity changed since it was shown; nothing written".into()); }
+        let out = host_cli::edit_policy(&policy, &v, e, true)?;
+        if read()? != text { return Err("taskq.json changed while saving; nothing written".into()); }
+        platform::write_atomic(&p, &(serde_json::to_string_pretty(&out).map_err(|e| e.to_string())? + "\n"))?;
+        let saved: Value = serde_json::from_str(&read()?).map_err(|e| e.to_string())?;
+        if saved != out { return Err("project policy readback differs".into()); }
+        poke(root);
+        resources::revised(&cfg.install, root, SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs())?;
+        return Ok((old, policy.project(&saved)?));
+    }
     let old = service::capacity(&v, host)?;
     let out = edit_capacity(&text, host, &cfg.me, e, expect)?;
     if read()? != text {
@@ -1080,20 +1100,6 @@ fn gate_text(c: &Value) -> String {
     }
 }
 
-/// The admission line of a `status.json` capacity (§ 3): mode, host ceiling and use, own reservations.
-fn admission_text(c: &Value) -> String {
-    let n = |v: &Value| v.as_u64().map_or("unknown".into(), |n| n.to_string());
-    let a = &c["admission"];
-    let mode = match a["mode"].as_str() {
-        Some("auto") => format!("Auto · host {} / {} held", n(&c["host_used"]), a["max"].as_u64().map_or("no max".into(), |m| m.to_string())),
-        Some(_) => "Fixed".into(),
-        None => "unknown (service older than this release)".into(),
-    };
-    let res: Vec<String> = c["reservations"].as_array().into_iter().flatten().map(|r| format!("#{} {}", r["task"], r["state"].as_str().unwrap_or("?"))).collect();
-    format!("Admission: {mode}{}", if res.is_empty() { String::new() } else { format!(" · {}", res.join(", ")) })
-}
-
-/// `taskq service permissions` (§ 5, § 8 Access): requested vs effective access per runtime; a write sets one grant.
 fn permissions_cmd(root: &Path, a: &Args) -> Res<()> {
     let (cfg, _) = load(root)?;
     if let Some(rt) = a.one("runtime") {
@@ -1148,76 +1154,6 @@ fn resources_cmd(root: &Path, a: &Args) -> Res<()> {
     for l in resources::report(&cfg.install, now)? {
         println!("{l}");
     }
-    Ok(())
-}
-
-/// `taskq service capacity` (§ 5).
-fn capacity_cmd(root: &Path, a: &Args) -> Res<()> {
-    let (cfg, v) = load(root)?;
-    let host = a.one("host").unwrap_or(&cfg.me).to_string();
-    let project = project_name(root);
-    let status = || -> Option<Value> {
-        let st: Value = fs::read_to_string(dot(root).join("status.json")).ok().and_then(|t| serde_json::from_str(&t).ok())?;
-        (st["host"] == cfg.me.as_str() && file_age(&dot(root).join("status.json")).is_some_and(|x| x <= 60)).then_some(st)
-    };
-    let e = CapEdit::from_args(a)?;
-    if e.is_empty() {
-        let saved = service::capacity(&v, &host);
-        println!("Capacity: {project} on {host}");
-        let c = status().map(|st| st["capacity"].clone()).filter(|c| !c.is_null() && host == cfg.me);
-        let limits = c.as_ref().map(|c| c["limits"].clone()).or_else(|| saved.as_ref().ok().map(|s| s.json()["limits"].clone())).unwrap_or_default();
-        let mut rts: Vec<&String> = limits.as_object().into_iter().flatten().map(|(k, _)| k).collect();
-        if let Some(c) = &c {
-            rts.extend(c["used"].as_object().into_iter().flatten().map(|(k, _)| k).filter(|k| !limits.get(k.as_str()).is_some()));
-        }
-        for rt in rts {
-            let used = c.as_ref().and_then(|c| c["used"][rt].as_u64()).map_or("?".into(), |n| n.to_string());
-            println!("{} {used}/{}", runtime_name(rt), limits[rt].as_u64().unwrap_or(0));
-        }
-        match (&c, &saved) {
-            (Some(c), _) => {
-                println!("Load gate: {}", gate_text(c));
-                println!("{}", admission_text(c));
-            }
-            (None, Err(e)) => println!("Unknown: {e}"),
-            (None, Ok(_)) if host != cfg.me => println!("Unknown: no local snapshot of {host}"),
-            (None, Ok(_)) => println!("Unknown: service has no fresh capacity status"),
-        }
-        if let (Some(c), Ok(s)) = (&c, &saved)
-            && (c["limits"] != s.json()["limits"] || c["load_gate"] != s.json()["load_gate"] || c["admission"] != s.json()["admission"])
-        {
-            println!("Saved config differs: {}", cap_changes(&service::Capacity { limits: serde_json::from_value(c["limits"].clone()).unwrap_or_default(), ..s.clone() }, s));
-        }
-        return Ok(());
-    }
-    // a write names its host explicitly (§ 5)
-    let host = a.need("host")?.to_string();
-    let wrote = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let (old, saved) = write_capacity(root, &host, &e, None)?;
-    let changes = cap_changes(&old, &saved);
-    if host == cfg.me
-        && let Err(e) = resources::revised(&cfg.install, root, wrote)
-    {
-        println!("Resource revision unknown: {e}");
-    }
-    if host != cfg.me {
-        println!("Saved for {host} in {project}: {changes}; applies when {host}'s service reads this config");
-        return Ok(());
-    }
-    // `Applied` only after a fresh service readback of the same values (R12)
-    for _ in 0..20 {
-        if let Some(st) = status()
-            && st["at"].as_u64().is_some_and(|t| t >= wrote)
-            && st["capacity"]["limits"] == saved.json()["limits"]
-            && st["capacity"]["load_gate"] == saved.json()["load_gate"]
-            && st["capacity"]["admission"] == saved.json()["admission"]
-        {
-            println!("Applied in {project} on {host}: {changes}; running tasks continue");
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    println!("Saved; waiting for service in {project} on {host}: {changes}; running tasks continue");
     Ok(())
 }
 
@@ -1367,6 +1303,9 @@ fn resume(root: &Path) -> Res<String> {
 /// `service install` hands over instead of reloading the unit (§ 8 step 5) while this project's fresh `status.json` lists
 /// live children or is unreadable (unknown keeps them, § 4 Data).
 fn handover(root: &Path) -> bool {
+    if root.join("projects").exists() {
+        return host_cli::pid(root).map_or(true, |pid| pid.is_some() && host_cli::snapshot(root).map_or(true, |v| v["idle"] != true || !v["reason"].is_null()));
+    }
     if operator::running(root) { return true; }
     let p = dot(root).join("status.json");
     file_age(&p).is_some_and(|a| a <= 60) && data::json(&p).map_or(true, |s| s.is_some_and(|s| s["kids"].as_array().is_some_and(|k| !k.is_empty())))
@@ -1375,6 +1314,20 @@ fn handover(root: &Path) -> bool {
 /// § 8 step 5: live children pass to the new image through the step 3 re-exec; a unit reload would end them. True
 /// when the running service was asked to re-exec instead of the unit being reloaded.
 fn load_unit(u: &platform::Unit, root: &Path) -> Res<bool> {
+    if root.join("projects").exists() {
+        if handover(root) {
+            platform::write_atomic(&root.join("restart"), "")?;
+            platform::write_atomic(&root.join("poke"), "")?;
+            return Ok(true);
+        }
+        if host_cli::pid(root)?.is_some() {
+            let p = host_cli::wait_idle(root)?;
+            host_cli::stop_idle(root, u, p)?;
+            fs::remove_file(root.join("drain")).map_err(|e| e.to_string())?;
+        }
+        platform::run_all(&u.load, false)?;
+        return Ok(false);
+    }
     if handover(root) {
         fs::write(dot(root).join("restart"), "").map_err(|e| e.to_string())?;
         poke(root);
@@ -1507,6 +1460,13 @@ fn service(args: &Args) -> Res<()> {
         }
         return Ok(());
     }
+    let install = platform::default_install();
+    if sub == "capacity" { return host_cli::capacity(&install, args); }
+    if sub == "status" { return host_cli::status(&install); }
+    if matches!(sub, "install" | "uninstall" | "stop" | "restart") {
+        let root = if sub == "install" || (sub == "uninstall" && !args.flags.contains_key("host")) { Some(find_root()?) } else { None };
+        return host_cli::lifecycle(&install, sub, root.as_deref(), args.flags.contains_key("host"));
+    }
     if sub == "run" && find_root().is_err() { return host::run(&platform::default_install()); }
     let root = find_root()?;
     let d = dot(&root);
@@ -1543,58 +1503,10 @@ fn service(args: &Args) -> Res<()> {
             println!("{}", service_fields(&root));
             Ok(())
         }
-        "capacity" => capacity_cmd(&root, args),
         "permissions" => permissions_cmd(&root, args),
         "resources" => resources_cmd(&root, args),
         "hold" | "release" => hold_cmd(sub == "hold", args.one("text")),
         "recover" => recover_cmd(&root, args.flags.contains_key("apply"), args.flags.contains_key("json")),
-        "restart" => {
-            fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-            fs::write(d.join("restart"), "").map_err(|e| e.to_string())?;
-            poke(&root);
-            println!("Restart requested for {}", project_name(&root));
-            Ok(())
-        }
-        "status" => {
-            let text = fs::read_to_string(d.join("status.json")).map_err(|_| "no service status: is `taskq service run` running here?".to_string())?;
-            println!("{text}");
-            let status = data::json(&d.join("status.json"))?.unwrap_or_default();
-            println!("Update: {}", status["update"].as_str().unwrap_or("unknown"));
-            println!("{}", incident::line(&incident::status(&root)));
-            if status["incident_notice"] == true || incident::notice(&root) { println!("Incident reports: notice"); }
-            for l in requests::lines(&status) { println!("{l}"); }
-            Ok(())
-        }
-        "install" | "uninstall" | "stop" => {
-            let (cfg, _) = load(&root)?;
-            let u = platform::unit(&platform::tool(&cfg.install), &root, &project_name(&root));
-            if sub == "stop" {
-                platform::run_all(&u.stop, false)?;
-                kill_service(&root);
-                println!("Stop requested for {}; starts again at the next logon", project_name(&root));
-                return Ok(());
-            }
-            if sub == "install" {
-                let off = install_focus(&root)?;
-                platform::install_self(&platform::tool(&cfg.install))?;
-                platform::write_unit(&u)?;
-                let handover = load_unit(&u, &root)?;
-                let mut all: Vec<String> = fs::read_to_string(&projects).unwrap_or_default().lines().map(String::from).collect();
-                if !all.contains(&root.display().to_string()) {
-                    all.push(root.display().to_string());
-                    fs::write(&projects, all.join("\n") + "\n").map_err(|e| e.to_string())?;
-                }
-                println!("installed {}{}", u.path.display(), if handover { "; live children kept: the running service re-execs" } else { "" });
-                if off {
-                    println!("Focus: off; nothing admitted until `taskq service focus all|<label..>`");
-                }
-            } else {
-                uninstall_unit(&u, &root, &projects)?;
-                println!("removed {}", u.path.display());
-                kill_service(&root);
-            }
-            Ok(())
-        }
         _ => Err("usage: taskq service install|run|focus|pause|resume|capacity|permissions|hold|release|recover|status|restart|stop|uninstall|list".into()),
     }
 }
@@ -1811,14 +1723,6 @@ fn logged(root: &Path, source: &str, text: &str, r: Receipt, json: bool) -> Res<
     emit(&[r], json)
 }
 
-fn uninstall_unit(u: &platform::Unit, root: &Path, projects: &Path) -> Res<()> {
-    let registered = fs::read_to_string(projects).map_err(|e| format!("{}: {e}", projects.display()))?;
-    let all: Vec<String> = registered.lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
-    platform::run_all(&u.unload, false)?;
-    if let Err(e) = fs::remove_file(&u.path) && e.kind() != std::io::ErrorKind::NotFound { return Err(e.to_string()); }
-    let install = projects.parent().unwrap_or(Path::new("."));
-    resources::unregister(install, root, || fs::write(projects, all.concat()).map_err(|e| e.to_string()))
-}
 
 fn golden_selftest(traces: &str, published: bool) -> Res<usize> {
     let result = core::golden(traces);
@@ -2908,13 +2812,13 @@ mod tests {
             unload: vec![vec!["taskq-must-not-run-unload".into()]],
         };
         fs::write(&u.path, "unit contents").unwrap();
-        let error = uninstall_unit(&u, &root, &projects).unwrap_err();
-        assert!(error.contains(&projects.display().to_string()));
+        let error = host_cli::remove_unit(&root, &u).unwrap_err();
+        assert!(error.contains("projects unknown"));
         assert!(!error.contains("taskq-must-not-run-unload"));
         assert_eq!(fs::read_to_string(&u.path).unwrap(), "unit contents");
         assert_eq!(fs::read(&projects).unwrap(), registered);
         fs::remove_file(&projects).unwrap();
-        assert!(uninstall_unit(&u, &root, &projects).unwrap_err().contains(&projects.display().to_string()));
+        assert!(host_cli::remove_unit(&root, &u).unwrap_err().contains("projects unknown"));
         assert!(u.path.is_file());
         assert!(!projects.exists());
         fs::remove_file(&u.path).unwrap();
@@ -2927,14 +2831,14 @@ mod tests {
         let root = std::env::temp_dir().join(format!("taskq-uninstall-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let projects = root.join("projects");
-        let registered = format!("{}\nother\n", root.display());
+        let registered = format!("{}\n", root.display());
         fs::write(&projects, &registered).unwrap();
         let u = platform::Unit {
             path: root.join("unit"), text: String::new(), load: vec![], stop: vec![],
             unload: vec![vec![std::env::current_exe().unwrap().display().to_string(), "--invalid-taskq-test-option".into()]],
         };
         fs::write(&u.path, "unit contents").unwrap();
-        assert!(uninstall_unit(&u, &root, &projects).unwrap_err().contains("failed"));
+        assert!(host_cli::remove_unit_with(&root, &u, || Err("native readback failed".into())).unwrap_err().contains("failed"));
         assert_eq!(fs::read_to_string(&u.path).unwrap(), "unit contents");
         assert_eq!(fs::read_to_string(&projects).unwrap(), registered);
         fs::remove_file(&u.path).unwrap();
@@ -3399,7 +3303,7 @@ mod tests {
         run(&["close".into(), "12".into(), "--help".into()]).unwrap();
         assert!(USAGE.contains("--recommend K"));
         assert!(USAGE.contains("--snapshot DIR"));
-        assert!(USAGE.contains("taskq service capacity [--host H] [--mode auto|fixed] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]"));
+        assert!(USAGE.contains("taskq service capacity [--project P] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]"));
         run(&["service".into(), "capacity".into(), "--help".into()]).unwrap();
         let e = platform::error_text("#7 is ready", None);
         assert!(e.starts_with("Error: #7 is ready\nNext: "));

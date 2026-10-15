@@ -175,9 +175,9 @@ fn id(s: &str) -> bool {
 }
 
 /// This host's capacity of the project at `root`.
-fn policy(root: &Path) -> Res<(String, Value)> {
+fn policy(install: &Path, root: &Path) -> Res<(String, Value)> {
     let (cfg, v) = crate::load(root)?;
-    Ok((cfg.me.clone(), crate::service::capacity(&v, &cfg.me)?.json()))
+    Ok((cfg.me.clone(), crate::host::saved_capacity(install, &v, &cfg.me)?.json()))
 }
 
 fn registered(install: &Path, root: &str) -> bool {
@@ -208,7 +208,7 @@ fn sync(s: &mut State, install: &Path, now: u64) {
         }
     }
     for p in s.projects.values_mut() {
-        let now_policy = policy(Path::new(&p.root)).map(|x| x.1).unwrap_or(Value::Null);
+        let now_policy = policy(install, Path::new(&p.root)).map(|x| x.1).unwrap_or(Value::Null);
         if p.revision.is_empty() || now_policy != p.policy {
             *p = Project { root: p.root.clone(), revision: token("r"), policy: now_policy, since: now };
         }
@@ -381,7 +381,7 @@ fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now
     }
     let root = PathBuf::from(&p.root);
     let Ok((cfg, cv)) = crate::load(&root) else { return Ok(record(s, "rejected", Some("unsupported"))) };
-    let Ok(cur) = crate::service::capacity(&cv, &cfg.me) else { return Ok(record(s, "rejected", Some("unsupported"))) };
+    let Ok(cur) = crate::host::saved_capacity(install, &cv, &cfg.me) else { return Ok(record(s, "rejected", Some("unsupported"))) };
     if cur.json() != p.policy {
         return Ok(record(s, "rejected", Some("conflict")));
     }
@@ -395,8 +395,13 @@ fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now
     };
     let path = root.join("taskq.json");
     let Ok(text) = fs::read_to_string(&path) else { return Ok(record(s, "rejected", Some("conflict"))) };
-    let Ok(out) = crate::edit_capacity(&text, &cfg.me, &cfg.me, &e, Some(&cur.json())) else { return Ok(record(s, "rejected", Some("invalid"))) };
-    let want = serde_json::from_str::<Value>(&out).ok().and_then(|x| crate::service::capacity(&x, &cfg.me).ok()).map(|c| c.json());
+    let out = if install.join("host.json").exists() {
+        // A project grant cannot become a host-wide gate/admission grant during the topology change.
+        crate::host::Policy::read(install).and_then(|p| crate::host_cli::edit_policy(&p, &cv, &e, true))
+            .and_then(|v| serde_json::to_string_pretty(&v).map_err(|e| e.to_string()))
+    } else { crate::edit_capacity(&text, &cfg.me, &cfg.me, &e, Some(&cur.json())) };
+    let Ok(out) = out else { return Ok(record(s, "rejected", Some("invalid"))) };
+    let want = serde_json::from_str::<Value>(&out).ok().and_then(|x| crate::host::saved_capacity(install, &x, &cfg.me).ok()).map(|c| c.json());
     // the marker is durable before the write: a crash from here on reads unknown and never writes again
     record(s, "unknown", None);
     s.ops.get_mut(&op).unwrap().writing = true;
@@ -420,7 +425,7 @@ fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now
         return Ok(Some(format!("resources: {op} unknown: {x}")));
     }
     crate::poke(&root);
-    let saved = policy(&root).ok().map(|x| x.1);
+    let saved = policy(install, &root).ok().map(|x| x.1);
     let Some(saved) = saved.filter(|x| Some(x) == want.as_ref()) else {
         return Ok(Some(format!("resources: {op} unknown: readback differs")));
     };
@@ -778,6 +783,29 @@ mod tests {
 
     fn config(t: &T) -> String {
         fs::read_to_string(t.root.join("taskq.json")).unwrap()
+    }
+
+    // Chain: A4 existing grant/revision fences -> host-policy project cap. A project grant never expands to host-wide policy.
+    #[test]
+    fn host_policy_keeps_project_grant_authority() {
+        let t = setup("host-policy");
+        let host = json!({"limits":{"codex":2},"load_gate":{"enabled":false}});
+        fs::write(t.install.join("host.json"), host.to_string()).unwrap();
+        with(&t.install, |s| { sync(s, &t.install, 0); Ok(()) }).unwrap();
+        let mut op = submit("host-cap", json!({"runtime_limit":1}));
+        op["expected_revision"] = json!(read(&t.install).unwrap().projects["project-1"].revision);
+        go(&t, &[op], &[], 100);
+        assert_eq!(receipt_of(&t, "host-cap")["state"], "saved");
+        let v: Value = serde_json::from_str(&config(&t)).unwrap();
+        assert_eq!(v["limits"]["codex"], 1); assert!(v["capacity_hosts"].is_null());
+        let before = config(&t);
+        let mut op = submit("host-gate", json!({"load_gate":{"enabled":true}}));
+        op["expected_revision"] = json!(read(&t.install).unwrap().projects["project-1"].revision);
+        go(&t, &[op], &[], 101);
+        assert_eq!(receipt_of(&t, "host-gate")["state"], "rejected");
+        assert_eq!(config(&t), before);
+        assert_eq!(serde_json::from_slice::<Value>(&fs::read(t.install.join("host.json")).unwrap()).unwrap(), host);
+        fs::remove_dir_all(t.base).unwrap();
     }
 
     // Chain: DashQ submit -> exchange -> host grant check -> canonical capacity write -> service status readback ->

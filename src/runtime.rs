@@ -469,14 +469,15 @@ pub fn brief(env: &Env, l: &Launch) -> String {
 #[cfg(test)]
 const SPECQ_REVISION: &str = "2d030bdea5e8fd9095daea2069954ff6091ea90e";
 const SPECQ_REFS: &str = "https://github.com/taskqorg/specq.git/info/refs?service=git-upload-pack";
+const SPECQ_TREES: &str = "https://api.github.com/repos/taskqorg/specq/git/trees/";
 /// The specq shared core, sent whole at every start and continuation (§ 8 Rule delivery).
 const SPECQ_CORE: &[&str] = &[
     "engineering/principles.md", "engineering/spec-first.md", "engineering/ponytail.md", "engineering/agent-workflow.md",
     "engineering/use-cases.md", "engineering/verification.md", "engineering/security.md",
     "caveman/rules/core.md", "caveman/rules/documentation.md", "caveman/rules/changes.md",
 ];
-/// Every other specq Markdown file at the pin, without `README.md`, `AGENTS.md`, `SECURITY.md`, `scripts/`, `vendor/`,
-/// `audits/` and `docs/`: indexed by path and first heading. A new pin updates both lists.
+/// Frozen published layout used by test source fixtures; production discovers the selected tree.
+#[cfg(test)]
 const SPECQ_INDEX: &[&str] = &[
     "caveman/SOURCES.md", "caveman/examples/messages.md", "caveman/rules/agents.md", "caveman/rules/indicators.md",
     "caveman/rules/notifications.md", "design/dashboards.md", "design/implementation-fidelity.md", "design/labels.md",
@@ -491,10 +492,12 @@ const CONTRACT: &str = include_str!("../taskq.md");
 const INDEX: &str = "\nIndex of other shared rules";
 
 fn rule_file(url: &str) -> Result<String, String> {
-    let out = crate::platform::quiet(Command::new("curl").args(["-q", "--fail", "--silent", "--show-error", "--proto", "=https", "--max-time", "10", "--max-filesize", "131072", url]))
+    let out = crate::platform::quiet(Command::new("curl").args(["-q", "--fail", "--silent", "--show-error", "--proto", "=https", "--max-time", "10", "--max-filesize", "131072", "--write-out", "\n%{http_code}", url]))
         .output().map_err(|e| e.to_string())?;
-    if !out.status.success() { return Err(format!("curl exited {}", out.status)); }
-    String::from_utf8(out.stdout).map_err(|_| "invalid UTF-8".into())
+    let text=String::from_utf8(out.stdout).map_err(|_| "invalid UTF-8")?;
+    let (body,status)=text.rsplit_once('\n').ok_or("missing HTTP status")?;
+    if !out.status.success() || status!="200" {return Err(format!("HTTP {status}; curl exited {}",out.status));}
+    Ok(body.into())
 }
 
 fn specq_dir(root: &Path, revision: &str) -> PathBuf {
@@ -562,7 +565,13 @@ fn shared_revision_at(root: &Path, now: u64, fetch: &mut impl FnMut(&str)->Resul
 }
 
 /// A pinned specq file from `<root>/.taskq/specq/<revision>/`, fetched once when missing or invalid there (R1: a cache).
-fn pinned(root: &Path, revision: &str, file: &str, fetch: &mut impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
+fn pinned(root: &Path, revision: &str, file: &str, expected: &str, fetch: &mut impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
+    cached_rule(root,revision,file,&format!("https://raw.githubusercontent.com/taskqorg/specq/{revision}/{file}"),|body| {
+        if git_blob_hash(body)!=expected {Err(refused(file,format!("Git blob mismatch at {revision}; cache preserved")))} else {Ok(())}
+    },fetch)
+}
+
+fn cached_rule(root: &Path, revision: &str, file: &str, url: &str, check: impl Fn(&str)->Result<(),StartError>, fetch: &mut impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
     let path = specq_dir(root,revision).join(file);
     let metadata = path.with_extension("cache.json");
     let mut body = String::new();
@@ -570,23 +579,72 @@ fn pinned(root: &Path, revision: &str, file: &str, fetch: &mut impl FnMut(&str) 
         && !body.trim().is_empty() && body.len()<=RULES_CAP {
         let mut stored = String::new();
         if File::open(&metadata).and_then(|f|f.take(1025).read_to_string(&mut stored)).is_ok() && stored.len()<=1024
-            && serde_json::from_str::<serde_json::Value>(&stored).ok()==Some(rule_cache(revision,file,&body)) {
+            && serde_json::from_str::<serde_json::Value>(&stored).ok()==Some(rule_cache(revision,file,&body)) && check(&body).is_ok() {
             return Ok(body);
         }
     }
-    let body = fetch(&format!("https://raw.githubusercontent.com/taskqorg/specq/{revision}/{file}")).map_err(|e| refused(file, e))?;
+    let body = fetch(url).map_err(|e| refused(file, e))?;
     if body.trim().is_empty() || body.len()>RULES_CAP { return Err(refused(file, "empty or oversized")); }
+    check(&body)?;
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e|refused(file,e))?;
     publish_rule(&path,&body).and_then(|_|publish_rule(&metadata,&rule_cache(revision,file,&body).to_string())).map_err(|e|refused(file,e))?;
     Ok(body)
 }
 
 fn rule_cache(revision: &str, file: &str, body: &str) -> serde_json::Value {
-    use std::fmt::Write as _;
     let digest=ring::digest::digest(&ring::digest::SHA256,body.as_bytes());
+    serde_json::json!({"revision":revision,"file":file,"sha256":digest_hex(digest)})
+}
+
+fn digest_hex(digest: ring::digest::Digest) -> String {
+    use std::fmt::Write as _;
     let mut hex=String::with_capacity(64);
     for byte in digest.as_ref() {write!(&mut hex,"{byte:02x}").expect("writing to String cannot fail");}
-    serde_json::json!({"revision":revision,"file":file,"sha256":hex})
+    hex
+}
+
+fn git_blob_hash(body: &str) -> String {
+    let mut hash=ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+    hash.update(format!("blob {}\0",body.len()).as_bytes());hash.update(body.as_bytes());digest_hex(hash.finish())
+}
+
+fn shared_files(root: &Path, revision: &str, fetch: &mut impl FnMut(&str)->Result<String,String>) -> Result<std::collections::BTreeMap<String,String>,StartError> {
+    let text=cached_rule(root,revision,"tree.json",&format!("{SPECQ_TREES}{revision}?recursive=1"),|body|parse_shared_tree(body).map(|_|()),fetch)?;
+    parse_shared_tree(&text)
+}
+
+fn parse_shared_tree(text: &str) -> Result<std::collections::BTreeMap<String,String>,StartError> {
+    let bad=||refused("shared tree","invalid, incomplete or incompatible tree");
+    if text.len()>RULES_CAP {return Err(bad());}
+    let value:serde_json::Value=serde_json::from_str(text).map_err(|_|bad())?;
+    if value["truncated"]!=false || !value["sha"].as_str().is_some_and(revision_id) {return Err(bad());}
+    let entries=value["tree"].as_array().ok_or_else(bad)?;
+    if entries.len()>1024 {return Err(bad());}
+    let mut files=std::collections::BTreeMap::new();
+    let mut portable=std::collections::BTreeSet::new();
+    for entry in entries {
+        let kind=entry["type"].as_str().ok_or_else(bad)?;
+        if !matches!(kind,"blob"|"tree"|"commit") {return Err(bad());}
+        let path=entry["path"].as_str().ok_or_else(bad)?;
+        if path.is_empty() {return Err(bad());}
+        if kind!="blob" {continue;}
+        if !path.ends_with(".md") {continue;}
+        let parts=path.split('/').collect::<Vec<_>>();
+        if path.contains(['\\',':','\0']) || parts.iter().any(|p|matches!(*p,""|"."|"..")) {return Err(bad());}
+        if matches!(parts.last().copied(),Some("README.md"|"AGENTS.md"|"SECURITY.md")) || parts.iter().any(|p|matches!(*p,"scripts"|"vendor"|"audits"|"docs")) {continue;}
+        for byte in path.bytes() {if !(byte.is_ascii_alphanumeric() || b"-_./".contains(&byte)) {return Err(bad());}}
+        for part in &parts {
+            let base=part.split('.').next().unwrap_or_default().to_ascii_uppercase();
+            if part.ends_with('.') || matches!(base.as_str(),"CON"|"PRN"|"AUX"|"NUL")
+                || matches!(base.as_bytes(),[b'C',b'O',b'M',b'1'..=b'9']|[b'L',b'P',b'T',b'1'..=b'9']) {return Err(bad());}
+        }
+        if !portable.insert(path.to_ascii_lowercase()) {return Err(bad());}
+        if !matches!(entry["mode"].as_str(),Some("100644"|"100755")) {return Err(bad());}
+        let hash=entry["sha"].as_str().filter(|s|revision_id(s)).ok_or_else(bad)?;
+        if files.insert(path.to_string(),hash.to_string()).is_some() {return Err(bad());}
+    }
+    for required in SPECQ_CORE {if !files.contains_key(*required) {return Err(bad());}}
+    Ok(files)
 }
 
 fn publish_rule(path: &Path, body: &str) -> Result<(),String> {
@@ -642,7 +700,8 @@ fn rules(root: &Path, resume: bool, mut fetch: impl FnMut(&str) -> Result<String
     };
     if contract.trim().is_empty() { return Err(refused("contract", "empty")); }
     // the header names the cache: every pinned file is there, at start and at resume
-    let core = SPECQ_CORE.iter().map(|f| pinned(root, &revision, f, &mut fetch)).collect::<Result<Vec<_>, _>>()?;
+    let files=shared_files(root,&revision,&mut fetch)?;
+    let core = SPECQ_CORE.iter().map(|f| pinned(root, &revision, f, &files[*f], &mut fetch)).collect::<Result<Vec<_>, _>>()?;
     let mut text = format!(
         "TaskQ rules: specq@{revision} at `{}`; contract `{spec}`.\n\
          Precedence: the project contract overrides shared rules where they conflict.\n\
@@ -657,7 +716,9 @@ fn rules(root: &Path, resume: bool, mut fetch: impl FnMut(&str) -> Result<String
     text.push_str(&format!("\n--- contract {spec} ---\n{contract}\n"));
     for (file, body) in SPECQ_CORE.iter().zip(&core) { text.push_str(&format!("\n--- specq/{file} ---\n{body}\n")); }
     text.push_str(&format!("{INDEX} (read on demand under `{}`):\n", dir.display()));
-    for file in SPECQ_INDEX { text.push_str(&format!("- {file}: {}\n", heading(&pinned(root, &revision, file, &mut fetch)?))); }
+    for (file,hash) in &files {
+        if !SPECQ_CORE.contains(&file.as_str()) {text.push_str(&format!("- {file}: {}\n", heading(&pinned(root,&revision,file,hash,&mut fetch)?)));}
+    }
     text.push_str("Index of project docs (read on demand in your worktree):\n");
     for (path, title) in docs(root)? { text.push_str(&format!("- {path}: {title}\n")); }
     if text.len() > RULES_CAP { return Err(refused("rules", format!("{} bytes over the {RULES_CAP}-byte cap", text.len() - RULES_CAP))); }
@@ -1450,7 +1511,81 @@ mod tests {
 
     fn rule(url: &str) -> Result<String, String> {
         if url==SPECQ_REFS {return Ok(advertisement(SPECQ_REVISION));}
+        if let Some(revision)=url.strip_prefix(SPECQ_TREES).and_then(|s|s.strip_suffix("?recursive=1")) {return Ok(tree_fixture(revision).to_string());}
         Ok(format!("# Rule from {url}\nApply this rule."))
+    }
+
+    fn pinned(root: &Path, revision: &str, file: &str, fetch: &mut impl FnMut(&str)->Result<String,String>) -> Result<String,StartError> {
+        let body=rule(&format!("https://raw.githubusercontent.com/taskqorg/specq/{revision}/{file}")).unwrap();
+        super::pinned(root,revision,file,&git_blob_hash(&body),fetch)
+    }
+
+    fn tree_fixture(revision: &str) -> serde_json::Value {
+        let entries=SPECQ_CORE.iter().chain(SPECQ_INDEX).map(|file| {
+            let body=format!("# Rule from https://raw.githubusercontent.com/taskqorg/specq/{revision}/{file}\nApply this rule.");
+            serde_json::json!({"path":file,"type":"blob","mode":"100644","sha":git_blob_hash(&body)})
+        }).collect::<Vec<_>>();
+        serde_json::json!({"sha":revision,"truncated":false,"tree":entries})
+    }
+
+    #[test]
+    fn newly_published_shared_file_is_indexed_and_cached_without_a_loader_change() {
+        let root=rules_root("new-shared-file");let path="engineering/new-shared-rule.md";
+        let url=format!("https://raw.githubusercontent.com/taskqorg/specq/{SPECQ_REVISION}/{path}");
+        let body="# Newly published shared rule\nRead this rule on demand.\n";let mut fetched=Vec::new();
+        let text=rules(&root,true,|request| {
+            fetched.push(request.to_string());
+            if request.starts_with(SPECQ_TREES) {
+                let mut tree=tree_fixture(SPECQ_REVISION);
+                for name in [path,"docs/excluded.md","vendor/excluded.md","README.md"] {
+                    tree["tree"].as_array_mut().unwrap().push(serde_json::json!({"type":"blob","mode":"100644","path":name,"sha":git_blob_hash(body)}));
+                }
+                Ok(tree.to_string())
+            } else if request==url {Ok(body.into())} else {rule(request)}
+        }).unwrap();
+        assert!(text.contains(&format!("- {path}: Newly published shared rule\n")));
+        assert!(!text.contains("Read this rule on demand."),"noncore body remains demand-loaded");
+        assert!(!fetched.iter().any(|url|url.contains("excluded.md")));
+        assert_eq!(std::fs::read_to_string(specq_dir(&root,SPECQ_REVISION).join(path)).unwrap(),body);
+        assert_eq!(rules(&root,true,|_|Err("must use fresh source/tree/body cache".into())).unwrap(),text);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_unsafe_duplicate_or_nonregular_shared_trees_refuse_delivery() {
+        let valid=tree_fixture(SPECQ_REVISION);assert_eq!(parse_shared_tree(&valid.to_string()).unwrap().len(),SPECQ_CORE.len()+SPECQ_INDEX.len());
+        let mut broken=Vec::new();
+        let mut tree=valid.clone();tree["truncated"]=true.into();broken.push(tree);
+        let mut tree=valid.clone();tree.as_object_mut().unwrap().remove("truncated");broken.push(tree);
+        let mut tree=valid.clone();tree["tree"].as_array_mut().unwrap().remove(0);broken.push(tree);
+        let mut tree=valid.clone();let duplicate=tree["tree"][0].clone();tree["tree"].as_array_mut().unwrap().push(duplicate);broken.push(tree);
+        let mut tree=valid.clone();tree["tree"][0]["mode"]="120000".into();broken.push(tree);
+        let mut tree=valid.clone();tree["tree"][0]["sha"]="invalid".into();broken.push(tree);
+        let mut tree=valid.clone();tree["tree"][SPECQ_CORE.len()]["type"]="unknown".into();broken.push(tree);
+        let mut tree=valid.clone();tree["tree"]=serde_json::json!(vec![serde_json::json!({});1025]);broken.push(tree);
+        for path in ["../escape.md","/absolute.md","C:/escape.md","engineering/../escape.md","engineering//empty.md","engineering\\escape.md","engineering/query?.md","engineering/NUL.md","engineering/COM1.md","engineering./trailing.md","ENGINEERING/PRINCIPLES.md"] {
+            let mut tree=valid.clone();let mut entry=tree["tree"][0].clone();entry["path"]=path.into();tree["tree"].as_array_mut().unwrap().push(entry);broken.push(tree);
+        }
+        for tree in broken {assert!(parse_shared_tree(&tree.to_string()).is_err());}
+    }
+
+    #[test]
+    fn source_validation_repairs_coherent_bad_caches_and_never_publishes_bad_fetches() {
+        assert_eq!(git_blob_hash("abc"),"f2ba8f84ab5c1bce84a7b441cb1959cfc7093b7f");
+        let root=rules_root("source-validation");let revision=SPECQ_REVISION;let file=SPECQ_CORE[0];
+        let expected=rule(&url(file)).unwrap();let hash=git_blob_hash(&expected);
+        let path=specq_dir(&root,revision).join(file);
+        assert!(super::pinned(&root,revision,file,&hash,&mut |_|Ok("wrong source body".into())).is_err());assert!(!path.exists());
+        assert_eq!(super::pinned(&root,revision,file,&hash,&mut rule).unwrap(),expected);
+        let bad="# Corrupted coherent cache\n";std::fs::write(&path,bad).unwrap();
+        std::fs::write(path.with_extension("cache.json"),rule_cache(revision,file,bad).to_string()).unwrap();
+        assert!(super::pinned(&root,revision,file,&hash,&mut |_|Err("offline".into())).is_err());
+        assert_eq!(super::pinned(&root,revision,file,&hash,&mut rule).unwrap(),expected);
+        shared_files(&root,revision,&mut rule).unwrap();let tree=specq_dir(&root,revision).join("tree.json");
+        std::fs::write(&tree,"{}").unwrap();std::fs::write(tree.with_extension("cache.json"),rule_cache(revision,"tree.json","{}").to_string()).unwrap();
+        assert!(shared_files(&root,revision,&mut |_|Ok("{}".into())).is_err());assert_eq!(std::fs::read_to_string(&tree).unwrap(),"{}");
+        assert_eq!(shared_files(&root,revision,&mut rule).unwrap().len(),SPECQ_CORE.len()+SPECQ_INDEX.len());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn advertisement(revision: &str) -> String {
@@ -1502,8 +1637,8 @@ mod tests {
             rule(url)
         }).unwrap();
         assert!(initial.starts_with(&format!("TaskQ rules: specq@{first} ")));
-        assert_eq!(files.len(),SPECQ_CORE.len()+SPECQ_INDEX.len());
-        assert!(files.iter().all(|url|url.contains(&format!("/{first}/"))));
+        assert_eq!(files.len(),1+SPECQ_CORE.len()+SPECQ_INDEX.len());
+        assert!(files.iter().all(|url|url.contains(&format!("/{first}/")) || url==&format!("{SPECQ_TREES}{first}?recursive=1")));
         let resumed=rules(&root,true,rule).unwrap();
         assert!(resumed.starts_with(&format!("TaskQ rules: specq@{second} ")));
         assert!(!resumed.contains(&format!("/{first}/")));
@@ -1720,7 +1855,7 @@ mod tests {
         std::fs::write(root.join("taskq.md"), "# Project contract\nProject rule.\n").unwrap();
         let mut fetched = Vec::new();
         let text = rule_text(&root, "task", false, |u| { fetched.push(u.to_string()); rule(u) }).unwrap();
-        assert_eq!(fetched.len(), 1 + SPECQ_CORE.len() + SPECQ_INDEX.len(), "source reference and each pinned file once");
+        assert_eq!(fetched.len(), 2 + SPECQ_CORE.len() + SPECQ_INDEX.len(), "source reference, tree and each pinned file once");
         assert!(text.contains(&format!("--- contract {} ---\n# Project contract\nProject rule.\n", root.join("taskq.md").display())));
         for file in SPECQ_CORE.iter().chain(SPECQ_INDEX) {
             assert!(fetched.contains(&url(file)));

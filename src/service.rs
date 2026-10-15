@@ -502,6 +502,7 @@ impl<'a> Service<'a> {
 
     /// Rebuild board-derived state after unwind; live handles, pending launches and delivery cursors stay owned.
     pub fn rebuild(&mut self) {
+        self.unready();
         self.cache.clear();
         self.deps.clear();
         self.label_fixes.clear();
@@ -511,12 +512,9 @@ impl<'a> Service<'a> {
 
     /// Quarantine/backoff: only verified reaping, leases and status; no claims, resumes or recovery writes.
     pub fn reduced(&mut self) -> Result<(), String> {
+        self.unready();
         let before = self.kids.len();
-        self.kids.retain_mut(|k| match k.proc.exited() {
-            Ok(Some(_)) => { self.unknown.remove(&k.attempt); false }
-            Ok(None) => { self.unknown.remove(&k.attempt); true }
-            Err(e) => { self.unknown.insert(k.attempt, e); true }
-        });
+        self.reap_owned();
         self.sync_host();
         if before != self.kids.len() || self.reduced_at.is_none_or(|t| self.mono.saturating_sub(t) >= (self.cfg.ttl / 5).max(1) as u64) {
             self.reduced_at = Some(self.mono);
@@ -530,6 +528,19 @@ impl<'a> Service<'a> {
             }
         }
         Ok(())
+    }
+
+    pub fn unready(&self) {
+        if let Some(host) = &self.host { if let Ok(mut h) = host.lock() { h.ready(&self.cfg.root, false); } }
+    }
+
+    /// Liveness/handoff monitoring remains available if the reduced board loop fails; it never renews a lease.
+    pub fn reap_owned(&mut self) {
+        self.kids.retain_mut(|k| match k.proc.exited() {
+            Ok(Some(_)) => { self.unknown.remove(&k.attempt); false }
+            Ok(None) => { self.unknown.remove(&k.attempt); true }
+            Err(e) => { self.unknown.insert(k.attempt, e); true }
+        });
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -736,7 +747,9 @@ impl<'a> Service<'a> {
 
     /// One pass of § 4. Tasks written to in a step are left alone by later steps until the next pass re-reads them.
     pub fn pass(&mut self) -> Result<(), String> {
-        crate::profile::measure("service.pass", || self.pass_inner())
+        let r = crate::profile::measure("service.pass", || self.pass_inner());
+        if r.is_err() { self.unready(); }
+        r
     }
 
     fn pass_inner(&mut self) -> Result<(), String> {
@@ -901,7 +914,7 @@ impl<'a> Service<'a> {
         // a reservation lives within one pass: it becomes a child or a held claim, or is released here
         self.reserved.retain(|r| self.held.iter().any(|l| l.task == r.0 && l.attempt == r.1));
         (self.requested, self.refused) = (vec![], None);
-        self.sync_host();
+        if self.host.is_some() { self.sync_host(); }
         for v in &views {
             let (n, t) = (v.issue.number, &v.task);
             let (Some(a), Some(h)) = (t.attempt, host_of(t)) else { continue };
@@ -1422,6 +1435,38 @@ mod tests {
         assert_eq!(host.lock().unwrap().sync(std::path::Path::new("unused"), vec![]), 2);
         assert_eq!((sa.kids.len(), sb.kids.len()), (1, 1));
         std::fs::remove_dir_all(install).unwrap();
+    }
+
+    // Chain A2: unavailable project leaves round-robin -> multiple healthy grants; failed reduced loop -> safe update.
+    // Risk: stale readiness starves later work, or a stopped project can never satisfy the host handoff barrier.
+    #[test]
+    fn host_quarantine_does_not_starve_and_stopped_handles_can_prepare_restart() {
+        let root = std::env::temp_dir().join(format!("taskq-host-stopped-{}", std::process::id()));
+        std::fs::create_dir_all(crate::dot(&root)).unwrap();
+        let p = crate::host::Policy::parse(json!({"limits": {"claude": 2}, "load_gate": {"enabled": false}}), "invented").unwrap();
+        let host = std::sync::Arc::new(std::sync::Mutex::new(crate::host::Host::new(Ok(p.clone()))));
+        let b = Fake::default(); let mut c = cfg("invented"); c.root = root.clone(); c.install = root.clone();
+        let mut s = service(&b, &c, Default::default()); s.host = Some(host.clone());
+        let healthy = root.join("healthy");
+        { let mut h = host.lock().unwrap(); h.ready(&root, true); h.ready(&healthy, true); }
+        s.rebuild(); s.reduced().unwrap();
+        for n in 1..=3 {
+            let mut h = host.lock().unwrap();
+            h.reserve(&healthy, n, n, "claude", &p.cap, true, (n - 1) * 30).unwrap();
+            h.sync(&healthy, vec![]);
+        }
+        let exit = Rc::new(RefCell::new(None));
+        s.kids.push(Kid { task: 1, attempt: 7, rt: "claude".into(), proc: Box::new(FakeProc(exit.clone())) });
+        { let mut h = host.lock().unwrap(); h.busy.insert(root.clone(), true); h.restart = true; }
+        // This is the monitor entered after a reduced-loop panic: no board pass and no lease renewal.
+        assert!(!crate::stopped_handoff(&mut s, &host, &c).unwrap());
+        assert!(!host.lock().unwrap().prepared.contains(&root)); assert_eq!(s.kids.len(), 1);
+        *exit.borrow_mut() = Some(0);
+        assert!(!crate::stopped_handoff(&mut s, &host, &c).unwrap());
+        let h = host.lock().unwrap();
+        assert!(h.busy.keys().all(|p| h.prepared.contains(p)), "coordinator can restart after verified exit");
+        assert!(b.issues(None).unwrap().is_empty(), "the stopped monitor makes no board writes");
+        drop(h); std::fs::remove_dir_all(root).unwrap();
     }
 
     // Chain: § 3 cross-host grace. Risk: ignored entries extend another host's lease.

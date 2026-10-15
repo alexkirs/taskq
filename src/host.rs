@@ -224,6 +224,14 @@ fn legacy(roots: &[PathBuf]) -> Res<()> {
     Ok(())
 }
 
+fn startup_status(install: &Path, root: &Path, error: &str) -> Res<()> {
+    if project_service(root)?.is_some() { return Err("legacy ownership retained; startup status not written".into()); }
+    let status = coreq::status::common(&crate::platform::tool(install), "unknown", &crate::project_name(root),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()), Some(error.into()), None);
+    fs::create_dir_all(crate::dot(root)).map_err(|e| e.to_string())?;
+    coreq::status::write(&crate::platform::tool(install), root, &status)
+}
+
 pub fn run(install: &Path) -> Res<()> {
     fs::create_dir_all(install).map_err(|e| e.to_string())?;
     loop {
@@ -271,6 +279,11 @@ pub fn run(install: &Path) -> Res<()> {
                 threads.insert(root.clone(), std::thread::spawn(move || {
                     enter(&root, &install);
                     loop {
+                        // Never replace another process's ownership evidence, including on startup/config failure.
+                        match project_service(&root) {
+                            Ok(None) => {},
+                            Ok(Some(_)) | Err(_) => { std::thread::sleep(std::time::Duration::from_secs(1)); continue; }
+                        }
                         // A broken project config holds only this thread; no board or child exists yet.
                         let context = crate::load(&root).and_then(|(cfg, raw)| {
                             let board = cfg.board.open(&cfg.web_host, &cfg.repo, raw["label_schema"].as_str(), &crate::platform::tool(&install))?;
@@ -284,10 +297,7 @@ pub fn run(install: &Path) -> Res<()> {
                                     h.busy.insert(root.clone(), false);
                                     if h.restart { h.prepared.insert(root.clone()); }
                                 }
-                                let status = coreq::status::common(&crate::platform::tool(&install), "unknown", &crate::project_name(&root),
-                                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()), Some(e.clone()), None);
-                                let _ = fs::create_dir_all(crate::dot(&root));
-                                let _ = coreq::status::write(&crate::platform::tool(&install), &root, &status);
+                                let _ = startup_status(&install, &root, &e);
                                 crate::platform::log(&e);
                                 std::thread::sleep(std::time::Duration::from_secs(1));
                             }
@@ -408,6 +418,8 @@ pub fn migrate(install: &Path, roots: &[PathBuf]) -> Res<()> {
         let mut files = vec![];
         let mut policies = vec![];
         for root in roots {
+            if root.join("taskq.json.host-policy.tmp").exists() { return Err("migration staging path already exists; originals unchanged".into()); }
+            let owner = ownership(&root.join("taskq.json"))?;
             let original = fs::read_to_string(root.join("taskq.json")).map_err(|e| format!("migration input unknown: {e}"))?;
             let mut v: Value = serde_json::from_str(&original).map_err(|e| format!("migration input unknown: {e}"))?;
             let host = std::env::var("TASKQ_HOST").ok().filter(|s| !s.is_empty()).or_else(|| v["hosts"][crate::hostname()].as_str().map(String::from)).unwrap_or_else(crate::hostname);
@@ -426,7 +438,7 @@ pub fn migrate(install: &Path, roots: &[PathBuf]) -> Res<()> {
             }
             // Identical effective policies need no project cap; top-level limits may be overridden locally.
             v.as_object_mut().unwrap().remove("limits");
-            files.push(json!({"root": root, "original": original, "next": serde_json::to_string_pretty(&v).unwrap() + "\n"}));
+            files.push(json!({"root": root, "owner": owner, "original": original, "next": serde_json::to_string_pretty(&v).unwrap() + "\n"}));
         }
         let first = &policies[0].1;
         let differences: Vec<_> = policies.iter().filter(|(_, p)| p != first).map(|(repo, p)| {
@@ -454,19 +466,101 @@ pub fn migrate(install: &Path, roots: &[PathBuf]) -> Res<()> {
         if current != f["original"].as_str().ok_or("migration plan invalid original")? && current != f["next"].as_str().ok_or("migration plan invalid next")? {
             return Err("migration interrupted by changed input; originals kept in backup, launches held".into());
         }
+        if ownership(&root.join("taskq.json"))? != f["owner"] { return Err("migration ownership changed; originals kept, launches held".into()); }
+    }
+    // Stage every replacement with its final metadata before any target changes. Plan ownership makes retry safe.
+    let mut staged = vec![];
+    for (i, f) in files.iter().enumerate() {
+        let path = Path::new(f["root"].as_str().unwrap()).join("taskq.json");
+        let stage = path.with_file_name("taskq.json.host-policy.tmp");
+        let metadata = fs::metadata(backup.join(format!("{i}.json"))).map_err(|e| e.to_string())?;
+        let next = f["next"].as_str().unwrap();
+        if fs::read_to_string(&path).map_err(|e| e.to_string())? == next {
+            // A completed replacement still verifies/restores metadata after an interrupted prior run.
+            fs::set_permissions(&path, metadata.permissions()).map_err(|e| e.to_string())?;
+            staged.push(None); continue;
+        }
+        if stage.exists() { fs::remove_file(&stage).map_err(|e| e.to_string())?; }
+        fs::copy(&path, &stage).map_err(|e| e.to_string())?;
+        let mut writable = fs::metadata(&stage).map_err(|e| e.to_string())?.permissions();
+        #[cfg(windows)] writable.set_readonly(false);
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; writable.set_mode(writable.mode() | 0o200); }
+        fs::set_permissions(&stage, writable).map_err(|e| e.to_string())?;
+        fs::write(&stage, next).map_err(|e| e.to_string())?;
+        fs::set_permissions(&stage, metadata.permissions()).map_err(|e| e.to_string())?;
+        stage_owner(&stage, &f["owner"])?;
+        if ownership(&stage)? != f["owner"] { return Err("migration staging ownership differs; originals unchanged".into()); }
+        if fs::read_to_string(&stage).map_err(|e| e.to_string())? != next { return Err("migration staging readback differs".into()); }
+        staged.push(Some(stage));
     }
     crate::platform::write_atomic(&install.join("host.json"), &(serde_json::to_string_pretty(policy).unwrap() + "\n"))?;
     for (i, f) in files.iter().enumerate() {
         let path = Path::new(f["root"].as_str().unwrap()).join("taskq.json");
         let next = f["next"].as_str().unwrap();
-        if fs::read_to_string(&path).map_err(|e| e.to_string())? != next {
-            crate::platform::write_atomic(&path, next)?;
-            fs::set_permissions(&path, fs::metadata(backup.join(format!("{i}.json"))).map_err(|e| e.to_string())?.permissions()).map_err(|e| e.to_string())?;
-        }
-        if fs::read_to_string(path).map_err(|e| e.to_string())? != next { return Err("migration readback differs; launches held".into()); }
+        if let Some(stage) = &staged[i] { replace_project(&path, stage)?; }
+        if fs::read_to_string(&path).map_err(|e| e.to_string())? != next || ownership(&path)? != f["owner"] { return Err("migration content/ownership readback differs; launches held".into()); }
     }
     if Policy::read(install)?.raw != *policy { return Err("host.json migration readback differs".into()); }
     crate::platform::write_atomic(&backup.join("complete"), "verified\n")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ownership(path: &Path) -> Res<Value> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(path).map_err(|e| e.to_string())?;
+    if m.uid() != unsafe { libc::geteuid() } { return Err("migration needs owner: cannot preserve another user's file ownership".into()); }
+    Ok(json!({"uid": m.uid(), "gid": m.gid()}))
+}
+#[cfg(unix)]
+fn stage_owner(path: &Path, owner: &Value) -> Res<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let p = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    let uid = owner["uid"].as_u64().and_then(|n| u32::try_from(n).ok()).ok_or("migration owner unknown")?;
+    let gid = owner["gid"].as_u64().and_then(|n| u32::try_from(n).ok()).ok_or("migration group unknown")?;
+    if unsafe { libc::chown(p.as_ptr(), uid, gid) } != 0 { return Err(format!("migration cannot preserve ownership: {}", std::io::Error::last_os_error())); }
+    Ok(())
+}
+#[cfg(unix)]
+fn replace_project(path: &Path, stage: &Path) -> Res<()> { fs::rename(stage, path).map_err(|e| e.to_string()) }
+
+#[cfg(windows)]
+fn ownership(path: &Path) -> Res<Value> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "advapi32")]
+    unsafe extern "system" { fn GetFileSecurityW(path: *const u16, info: u32, descriptor: *mut u8, size: u32, needed: *mut u32) -> i32; }
+    let path: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut size = 0;
+    unsafe { GetFileSecurityW(path.as_ptr(), 7, std::ptr::null_mut(), 0, &mut size); }
+    if size == 0 { return Err(format!("migration ownership unknown: {}", std::io::Error::last_os_error())); }
+    let mut descriptor = vec![0; size as usize];
+    if unsafe { GetFileSecurityW(path.as_ptr(), 7, descriptor.as_mut_ptr(), size, &mut size) } == 0 { return Err(format!("migration ownership unknown: {}", std::io::Error::last_os_error())); }
+    // SetFileSecurityW clears AUTO_INHERITED bookkeeping even with byte-identical owner, group and DACL.
+    *descriptor.get_mut(3).ok_or("migration ownership descriptor truncated")? &= !0x04;
+    Ok(json!(descriptor))
+}
+#[cfg(windows)]
+fn stage_owner(path: &Path, owner: &Value) -> Res<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "advapi32")]
+    unsafe extern "system" { fn SetFileSecurityW(path: *const u16, info: u32, descriptor: *const u8) -> i32; }
+    let descriptor: Vec<u8> = owner.as_array().ok_or("migration ownership unknown")?.iter()
+        .map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or("migration ownership corrupt")).collect::<Result<_, _>>()?;
+    let control = descriptor.get(2..4).ok_or("migration ownership corrupt")?;
+    let protected = u16::from_le_bytes([control[0], control[1]]) & 0x1000 != 0;
+    let path: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe { SetFileSecurityW(path.as_ptr(), 7 | if protected { 0x80000000 } else { 0x20000000 }, descriptor.as_ptr()) } == 0 {
+        return Err(format!("migration cannot preserve ownership: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+#[cfg(windows)]
+fn replace_project(path: &Path, stage: &Path) -> Res<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" { fn ReplaceFileW(path: *const u16, stage: *const u16, backup: *const u16, flags: u32, exclude: *mut std::ffi::c_void, reserved: *mut std::ffi::c_void) -> i32; }
+    let wide = |p: &Path| p.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    if unsafe { ReplaceFileW(wide(path).as_ptr(), wide(stage).as_ptr(), std::ptr::null(), 0, std::ptr::null_mut(), std::ptr::null_mut()) } == 0 { return Err(format!("migration replace: {}", std::io::Error::last_os_error())); }
     Ok(())
 }
 
@@ -554,6 +648,11 @@ mod tests {
                 json!({me.clone(): {"limits": {"codex": 2}}, "invented-other-host": {"limits": {"codex": 999}}}));
             fs::write(r.join("taskq.json"), &text).unwrap(); text
         }).collect();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            for r in &roots { fs::set_permissions(r.join("taskq.json"), fs::Permissions::from_mode(0o640)).unwrap(); }
+        }
+        let owners: Vec<_> = roots.iter().map(|r| ownership(&r.join("taskq.json")).unwrap()).collect();
         let path = roots[5].join("taskq.json");
         let mut conflict: Value = serde_json::from_str(&originals[5]).unwrap();
         conflict["capacity_hosts"][&me]["limits"]["codex"] = json!(1);
@@ -572,11 +671,19 @@ mod tests {
             assert_eq!(fs::read_to_string(install.join(format!("host-policy-migration/{i}.json"))).unwrap(), originals[i]);
             let v: Value = serde_json::from_slice(&fs::read(r.join("taskq.json")).unwrap()).unwrap();
             assert_eq!(v["untouched"], json!({"x": 7})); assert!(v["capacity_hosts"].is_null()); assert!(v["limits"].is_null());
+            assert_eq!(ownership(&r.join("taskq.json")).unwrap(), owners[i]);
+            #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; assert_eq!(fs::metadata(r.join("taskq.json")).unwrap().permissions().mode() & 0o777, 0o640); }
         }
         // Simulate a crash halfway through staged replacements. Resume consumes the saved mapping, not remaining copies.
         fs::remove_file(install.join("host-policy-migration/complete")).unwrap();
+        let mut interrupted = fs::metadata(roots[0].join("taskq.json")).unwrap().permissions();
+        #[cfg(windows)] interrupted.set_readonly(true);
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; interrupted.set_mode(0o600); }
+        fs::set_permissions(roots[0].join("taskq.json"), interrupted).unwrap();
         fs::write(roots[2].join("taskq.json"), &originals[2]).unwrap();
         migrate(&install, &roots).unwrap();
+        assert!(!fs::metadata(roots[0].join("taskq.json")).unwrap().permissions().readonly());
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; assert_eq!(fs::metadata(roots[0].join("taskq.json")).unwrap().permissions().mode() & 0o777, 0o640); }
         let mut edited = Policy::read(&install).unwrap().raw; edited["limits"]["codex"] = json!(1);
         fs::write(install.join("host.json"), serde_json::to_string(&edited).unwrap()).unwrap();
         migrate(&install, &roots).unwrap(); assert_eq!(Policy::read(&install).unwrap().raw, edited, "completed retry preserves later owner edits");
@@ -607,6 +714,12 @@ mod tests {
         let child = if cfg!(windows) { std::process::Command::new("ping").args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn() }
             else { std::process::Command::new("sleep").arg("30").spawn() }.unwrap();
         let mut child = child;
+        fs::create_dir_all(crate::dot(&install)).unwrap();
+        let legacy_status = format!("{{\"pid\":{}}}", child.id());
+        fs::write(crate::dot(&install).join("status.json"), &legacy_status).unwrap();
+        assert!(startup_status(&install, &install, "invented malformed config").is_err());
+        assert_eq!(fs::read_to_string(crate::dot(&install).join("status.json")).unwrap(), legacy_status, "startup failure cannot overwrite a live legacy pid");
+        assert!(legacy(&[install.clone()]).is_err());
         fs::write(install.join("service"), child.id().to_string()).unwrap(); assert_eq!(other(&install).unwrap(), Some(child.id()));
         fs::write(install.join("service"), std::process::id().to_string()).unwrap(); assert_eq!(other(&install).unwrap(), None);
         fs::write(install.join("service"), "bad").unwrap(); assert!(other(&install).unwrap_err().contains("unknown"));

@@ -837,8 +837,10 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             if !registered && drained { h.sync(&cfg.root, vec![]); h.ready(&cfg.root, false); return Err("project drained".into()); }
             if registered { h.busy.insert(cfg.root.clone(), !drained); }
             if h.restart && restart_waits(&s, &cfg.root).is_empty() {
-                save_kids(&s, &cfg.root)?;
-                h.prepared.insert(cfg.root.clone());
+                match save_kids(&s, &cfg.root) {
+                    Ok(()) => { h.prepared.insert(cfg.root.clone()); }
+                    Err(e) => { h.prepared.remove(&cfg.root); log!("handoff unknown: {e}"); }
+                }
             } else { h.prepared.remove(&cfg.root); }
             }
         }
@@ -872,7 +874,15 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             Ok(Err(e)) => return Err(e),
             Err(payload) => {
                 if host.is_none() { std::panic::resume_unwind(payload); }
-                if panics.quarantined() { return Err("quarantine loop panicked; project stopped".into()); }
+                if panics.quarantined() {
+                    // Stop the board loop, retaining its handles solely for safe exit/update monitoring (R11).
+                    s.unready();
+                    loop {
+                        let monitored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stopped_handoff(&mut s, host.as_ref().unwrap(), cfg)));
+                        if matches!(monitored, Ok(Ok(true))) { return Err("project drained".into()); }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
                 let msg = payload.downcast_ref::<String>().map(String::as_str).or_else(|| payload.downcast_ref::<&str>().copied()).unwrap_or("unknown panic");
                 panics.record(began.elapsed().as_secs(), msg);
                 s.rebuild();
@@ -891,6 +901,20 @@ fn save_kids(s: &Service, root: &Path) -> Res<()> {
     let mut text = format!("pid {}\n", std::process::id());
     for k in &s.kids { text += &format!("{} {} {} {} {}\n", k.task, k.attempt, k.rt, k.proc.id(), s.delivered(k.attempt)); }
     platform::write_atomic(&dot(root).join("kids"), &text)
+}
+
+/// A failed reduced loop no longer beats or touches the board. Its exact handles still fence an image switch.
+fn stopped_handoff(s: &mut Service, host: &host::Shared, cfg: &Config) -> Res<bool> {
+    s.reap_owned();
+    s.sync_host();
+    let mut h = host.lock().map_err(|_| "stopped project admission unknown")?;
+    let idle = s.kids.is_empty() && !operator::running(&cfg.root);
+    h.busy.insert(cfg.root.clone(), !idle);
+    if h.restart && restart_waits(s, &cfg.root).is_empty() {
+        save_kids(s, &cfg.root)?;
+        h.prepared.insert(cfg.root.clone());
+    }
+    Ok(idle && h.draining.contains(&cfg.root))
 }
 
 // ---------- capacity (§ 3, § 5 `service capacity`, § 9) ----------

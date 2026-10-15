@@ -17,14 +17,15 @@ this report does not prove it.
   binary carries the full commit id. Equivalence: `git diff 9ab83b6 HEAD --
   src tests .github Cargo.toml Cargo.lock` touches only `src/notify_windows.rs`,
   `Cargo.toml` and `Cargo.lock` (the Windows notification adapter, F9 and F10)
-  and the specq pin of the worker brief in `src/runtime.rs` (main #1175); the
+  and, from main, the specq pin of the worker brief and one doc comment in
+  `src/runtime.rs`; the
   rows other than notifications exercise neither.
 - Notification candidate: commit `c46e83ef1ae4fd784f98cfdcf05607c9f97b3cc9`
-  (`de75826` after the rebase onto main `c24dff9`). Release build
+  (`bd100b2` after the rebase onto main `4aaf16a`). Release build
   `4.2.0-dev.1792021136`, `taskq.exe` SHA256
   `d8613d0ab4ec18c0b36a00cfa27bffaac6cacf6b244bd0b3c6eec0bb51c97fd3`; the
   binary carries the full commit id. `git diff c46e83e HEAD -- src tests
-  .github Cargo.toml Cargo.lock` is only the specq pin above. F9 alone was
+  .github Cargo.toml Cargo.lock` is only the `src/runtime.rs` change above. F9 alone was
   rechecked on `4b08bfe` (build `4.2.0-dev.1792020405`, SHA256
   `0f9c9249ae7347b355251cf4471522ceb81ab982bf7aeb77f49975e3da26b5ef`), which
   also reproduced F10.

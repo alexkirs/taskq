@@ -18,14 +18,21 @@ this report does not prove it.
   src tests .github Cargo.toml Cargo.lock` touches only `src/notify_windows.rs`,
   `Cargo.toml` and `Cargo.lock` (the Windows notification adapter, F9 and F10)
   and, from main, the specq pin of the worker brief and one doc comment in
-  `src/runtime.rs`; the
-  rows other than notifications exercise neither.
+  `src/runtime.rs`, and the attempt-stage profiling of main `ec60085` (#1147:
+  `src/core.rs`, `src/dispatch.rs`, `src/main.rs`, `src/profile.rs`,
+  `src/runtime.rs`, `src/service.rs`). That profiling only times claim, child
+  exit or stop, `ask` and `close` and writes `taskq-stage` log lines; the
+  contract says profiling never changes admission or task state, and the
+  `close` validation moved into a timed wrapper unchanged. The rows other than
+  notifications exercise no notification code; they were not rerun on the
+  profiling code, so its equivalence rests on this diff reading and the gate.
 - Notification candidate: commit `c46e83ef1ae4fd784f98cfdcf05607c9f97b3cc9`
-  (`bd100b2` after the rebase onto main `4aaf16a`). Release build
+  (rebased onto main `ec60085`). Release build
   `4.2.0-dev.1792021136`, `taskq.exe` SHA256
   `d8613d0ab4ec18c0b36a00cfa27bffaac6cacf6b244bd0b3c6eec0bb51c97fd3`; the
   binary carries the full commit id. `git diff c46e83e HEAD -- src tests
-  .github Cargo.toml Cargo.lock` is only the `src/runtime.rs` change above. F9 alone was
+  .github Cargo.toml Cargo.lock` is only the main changes above (specq pin,
+  profiling). F9 alone was
   rechecked on `4b08bfe` (build `4.2.0-dev.1792020405`, SHA256
   `0f9c9249ae7347b355251cf4471522ceb81ab982bf7aeb77f49975e3da26b5ef`), which
   also reproduced F10.

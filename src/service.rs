@@ -606,7 +606,7 @@ impl<'a> Service<'a> {
     }
 
     /// The `build` or `review` stage of a child that exited or was stopped (§ 4 Profiling); `v` is its task's view.
-    fn ended(&mut self, n: u64, a: u64, v: Option<&View>) {
+    fn ended(&mut self, n: u64, a: u64, v: Option<&View>, failure: Option<&'static str>) {
         let Some((role, rt, begun)) = self.begun.remove(&a) else { return };
         // an issue that left the board read (closed, label removed) is read back once for its hand-in
         let back = if v.is_none() { crate::board::entries(self.board, n).map_err(|_| "unreadable") } else { Ok(vec![]) };
@@ -615,6 +615,7 @@ impl<'a> Service<'a> {
             None => back.as_deref().map(|l| (l, None)).map_err(|e| *e),
         };
         let (outcome, err) = core::stage_outcome(n, log, a, a.max(self.delivered(a)));
+        let err = if outcome == "failed" { failure.unwrap_or(err) } else { err };
         let log = crate::runtime::attempt_log(&self.cfg.root, &role, n, a);
         let stage = if role == "reviewer" { "review" } else { "build" };
         let (took, usage) = match begun {
@@ -693,7 +694,7 @@ impl<'a> Service<'a> {
         let unknown = &mut self.unknown;
         self.kids.retain_mut(|k| match k.proc.exited() {
             Ok(Some(code)) => {
-                exited.push((k.task, k.attempt, code));
+                exited.push((k.task, k.attempt, code, k.proc.exit_error()));
                 unknown.remove(&k.attempt);
                 false
             }
@@ -706,8 +707,8 @@ impl<'a> Service<'a> {
                 true
             }
         });
-        for (n, a, code) in exited {
-            self.ended(n, a, by_n.get(&n).copied());
+        for (n, a, code, failure) in exited {
+            self.ended(n, a, by_n.get(&n).copied(), failure);
             if let Some(v) = by_n.get(&n)
                 && v.task.attempt == Some(a)
                 && matches!(v.task.state, State::Doing | State::Review)
@@ -741,7 +742,7 @@ impl<'a> Service<'a> {
             current
         });
         for (n, a) in stopped {
-            self.ended(n, a, by_n.get(&n).copied());
+            self.ended(n, a, by_n.get(&n).copied(), None);
         }
         self.held.retain(|l| by_n.get(&l.task).is_some_and(|v| v.task.attempt == Some(l.attempt)));
         let kids: Vec<u64> = self.kids.iter().map(|k| k.attempt).collect();
@@ -1615,6 +1616,35 @@ mod tests {
         let t = task(&b, n);
         assert_eq!((t.state, t.retries, t.result.is_some()), (State::Review, 1, true));
         assert_ne!(t.attempt, Some(r));
+    }
+
+    // Chain: native terminal reviewer -> same-pass gone -> retained result and classified stage.
+    // Risk: native failure detail is lost between adapter and stage record.
+    #[test]
+    fn terminal_reviewer_records_native_error_and_releases_lease() {
+        struct Terminal;
+        impl Proc for Terminal {
+            fn exited(&mut self) -> Result<Option<i32>, String> { Ok(Some(-1)) }
+            fn exit_error(&self) -> Option<&'static str> { Some("argument-too-long") }
+            fn kill(&mut self) {}
+            fn id(&self) -> u32 { 0 }
+        }
+        let b = Fake::default();
+        let n = b.create("T", "", &["taskq".into()]).unwrap();
+        let a = b.comment(n, "taskq: spawn worker claude:invented win").unwrap();
+        b.comment(n, &core::entry("result", &["0123456789abcdef0123456789abcdef01234567"], Some(a), "ok")).unwrap();
+        let c = cfg("win");
+        let mut s = Service::new(&b, &c, "4.4.0", Box::new(|_| Ok(Box::new(Terminal))));
+        s.focus = vec!["all".into()];
+        s.pass().unwrap();
+        let r = task(&b, n).attempt.unwrap();
+        crate::profile::STAGED.with(|v| v.borrow_mut().clear());
+        s.focus.clear();
+        s.pass().unwrap();
+        assert!(s.kids.is_empty());
+        assert!(b.comments(n).unwrap().iter().any(|e| e.body.contains(&format!("taskq: gone attempt {r}"))));
+        assert_eq!((task(&b, n).state, task(&b, n).result.is_some()), (State::Review, true));
+        crate::profile::STAGED.with(|v| assert!(v.borrow().contains(&format!("review {n} {r} claude failed argument-too-long"))));
     }
 
     // Chain: § 3 claim across hosts to § 2 retry limit (#913, #1123). Risk: two hosts claim one result's review, the

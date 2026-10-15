@@ -22,6 +22,7 @@ pub struct Launch {
 pub trait Proc {
     /// The exit code once the child has exited; `Err` is an unknown read (§ 4 reconciliation), never an exit.
     fn exited(&mut self) -> Result<Option<i32>, String>;
+    fn exit_error(&self) -> Option<&'static str> { None }
     fn kill(&mut self);
     fn id(&self) -> u32;
 }
@@ -686,6 +687,7 @@ pub struct ClaudeTurn {
     _input_file: File,
     pid: u32,
     done: bool,
+    failure: Option<&'static str>,
 }
 
 fn claude_agents(root: &Path) -> Result<Vec<serde_json::Value>, String> {
@@ -764,7 +766,7 @@ impl ClaudeTurn {
             return Err("Claude created a copy; stopped owned copy, original conversation preserved".into());
         }
         Ok(Self { root, log: log.into(), session: if l.resume.is_some() { l.session.clone() } else { String::new() }, id: id.into(),
-            announced: false, copied: 0, before, mode: permission_mode.into(), input, _input_file: input_file, pid: 0, done: false })
+            announced: false, copied: 0, before, mode: permission_mode.into(), input, _input_file: input_file, pid: 0, done: false, failure: None })
     }
 }
 
@@ -775,6 +777,7 @@ impl Proc for ClaudeTurn {
         let row = rows.iter().find(|v| v["id"] == self.id).ok_or("Claude session unavailable; state unknown")?;
         self.observe(row)
     }
+    fn exit_error(&self) -> Option<&'static str> { self.failure }
     fn kill(&mut self) { if let Err(e) = claude_stop(&self.root, &self.id, self.pid) { log!("{e}"); } }
     fn id(&self) -> u32 { self.pid }
 }
@@ -782,7 +785,11 @@ impl Proc for ClaudeTurn {
 impl ClaudeTurn {
     fn observe(&mut self, row: &serde_json::Value) -> Result<Option<i32>, String> {
         // Failed background launches can have neither status nor a transcript (#1208).
-        if matches!(row["state"].as_str(), Some("failed" | "stopped")) { return Ok(Some(-1)); }
+        let state = row["state"].as_str().ok_or("Claude job state unavailable; state unknown")?;
+        if !matches!(state, "working" | "idle" | "done" | "blocked") {
+            self.failure = Some(crate::profile::class(row["detail"].as_str().unwrap_or_default()));
+            return Ok(Some(-1));
+        }
         // On Windows a waking session briefly publishes a different UUID before restore.
         if !self.announced {
             if row["status"].as_str().is_none() { return Ok(None); }
@@ -1181,14 +1188,20 @@ mod tests {
     fn claude_failed_launch_exits_without_status_or_transcript() {
         let mut t = ClaudeTurn { root: PathBuf::new(), log: PathBuf::new(), session: String::new(),
             id: "invented-job".into(), announced: false, copied: 0, before: 0, mode: "dontAsk".into(),
-            input: "invented input".into(), pid: 0, done: false };
-        for state in ["failed", "stopped"] {
+            input: "invented input".into(), pid: 0, done: false, failure: None };
+        for state in ["failed", "stopped", "crashed", "unexpected"] {
             assert_eq!(t.observe(&serde_json::json!({"state":state})), Ok(Some(-1)));
             t.announced = true;
             assert_eq!(t.observe(&serde_json::json!({"state":state,"status":"working"})), Ok(Some(-1)));
             t.announced = false;
         }
+        assert!(t.observe(&serde_json::json!({})).is_err());
+        assert!(t.observe(&serde_json::json!({"state":null})).is_err());
         assert_eq!(t.observe(&serde_json::json!({"state":"working"})), Ok(None));
+        assert_eq!(t.observe(&serde_json::json!({"state":"failed", "detail":"ENAMETOOLONG: name too long, uv_spawn"})), Ok(Some(-1)));
+        assert_eq!(t.exit_error(), Some("argument-too-long"));
+        assert_eq!(t.observe(&serde_json::json!({"state":"failed", "detail":"permission denied"})), Ok(Some(-1)));
+        assert_eq!(t.exit_error(), Some("permission"));
     }
 
     // Chain: § 8 codex-app handshake -> open thread -> queue -> one new `task_complete` on this host's app.

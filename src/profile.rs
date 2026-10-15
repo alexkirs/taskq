@@ -10,7 +10,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const OPS: [&str; 6] = ["service.pass", "dispatch", "spawn", "forge.call", "update", "tray.render"];
 const PREFIX: &str = "taskq-profile ";
-const ERRORS: [&str; 8] = ["none", "http4xx", "http5xx", "timeout", "permission", "invalid", "other", "panic"];
+const ERRORS: [&str; 9] = ["none", "http4xx", "http5xx", "timeout", "permission", "invalid", "other", "panic", "argument-too-long"];
 static LOG: OnceLock<PathBuf> = OnceLock::new();
 static TRACE: OnceLock<bool> = OnceLock::new();
 static RUN: OnceLock<Option<u64>> = OnceLock::new();
@@ -21,7 +21,7 @@ thread_local!(static PARENT: Cell<u64> = const { Cell::new(0) });
 #[cfg(test)]
 thread_local!(static OBSERVED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) });
 #[cfg(test)]
-thread_local!(static STAGED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) });
+thread_local!(pub(crate) static STAGED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) });
 #[cfg(test)]
 thread_local!(static MOVED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) });
 /// Transition records of this thread and their report section.
@@ -63,7 +63,8 @@ pub fn project(repo: &str) {
 }
 
 fn error(text: &str) -> &'static str {
-    if text.contains("HTTP 4") { "http4xx" }
+    if text.contains("ENAMETOOLONG") { "argument-too-long" }
+    else if text.contains("HTTP 4") { "http4xx" }
     else if text.contains("HTTP 5") { "http5xx" }
     else if text.contains("timed out") || text.contains("timeout") { "timeout" }
     else if text.contains("denied") || text.contains("refused") { "permission" }

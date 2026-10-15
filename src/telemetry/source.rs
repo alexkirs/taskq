@@ -79,13 +79,16 @@ pub(super) fn import(db: &mut Connection, target: &Store) -> Res<u64> {
         let mut read=tx.prepare("SELECT telemetry_epoch,seq,retained_ms,line FROM records WHERE telemetry_epoch>?1 OR (telemetry_epoch=?1 AND seq>?2) ORDER BY telemetry_epoch,seq LIMIT 1024").map_err(error)?;
         let rows=read.query_map(params![after.0,after.1],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).map_err(error)?.collect::<Result<Vec<_>,_>>().map_err(error)?;drop(read);
         if rows.is_empty() {return Ok(imported);}
-        let mut events=Vec::with_capacity(rows.len());let mut clocks=Vec::with_capacity(rows.len());
+        let mut events=Vec::with_capacity(rows.len());let mut clocks=Vec::with_capacity(rows.len());let mut last=None;let mut processed=0;
         for (epoch,seq,received,line) in &rows {
             if *epoch<0||*epoch>source.epoch||(*epoch==source.epoch&&*seq>source.high)||*seq<=0||*received<0 {return Err("legacy source: invalid record position or clock".into());}
-            events.push(Event::identified(&format!("taskq.legacy.{}",source.namespace),&format!("{epoch}.{seq}"),super::semantic::observation(line)?)?);clocks.push(*received);
+            if line.len()>super::LINE_MAX {return Err("legacy source: record exceeds 64 KiB; preserved".into());}
+            let parts=Event::split_identified(&format!("taskq.legacy.{}",source.namespace),&format!("{epoch}.{seq}"),super::semantic::observation(line)?)?;
+            if events.len()+parts.len()>1024 {break;}
+            clocks.extend(std::iter::repeat_n(*received,parts.len()));events.extend(parts);last=Some((*epoch,*seq));processed+=1;
         }
-        let last=rows.last().unwrap();let next=format!("v1.{}.{}.{}",source.namespace,last.0,last.1);tx.commit().map_err(error)?;
-        target.import_history(SOURCE,cursor.as_deref(),&next,&events,&clocks)?;imported+=events.len() as u64;
+        let last=last.ok_or("legacy source: source row exceeds import batch")?;let next=format!("v1.{}.{}.{}",source.namespace,last.0,last.1);tx.commit().map_err(error)?;
+        target.import_history(SOURCE,cursor.as_deref(),&next,&events,&clocks)?;imported+=processed;
     }
 }
 
@@ -112,6 +115,25 @@ mod tests {
         assert_eq!(state(&archive).unwrap().namespace,identity);assert_eq!(archive.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),1);
         drop(insert);drop(older);drop(archive);let mut archive=super::super::open(&dir).unwrap();assert_eq!(import(&mut archive,&target).unwrap(),0);
         assert_eq!(super::super::read(&dir,now() as u64).unwrap(),format!("{LINE}\n"));drop(archive);drop(target);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn large_summary_crosses_batch_boundary_atomically_and_restores_every_counter() {
+        let dir=dir();let mut archive=super::super::open(&dir).unwrap();
+        {let tx=archive.transaction().unwrap();for _ in 0..1023 {add(&tx);}tx.commit().unwrap();}
+        let ops=(0..1200).map(|mut i|{let mut route=String::from("route");for _ in 0..4 {route.push((b'a'+(i%26) as u8) as char);i/=26;}(format!("GET issues/N/{route}"),serde_json::json!(1))}).collect::<serde_json::Map<_,_>>();
+        let logical=serde_json::json!({"at_ms":1000,"source":"cli status","ops":ops});let line=format!("taskq-requests {logical}");assert!(line.len()>16<<10&&line.len()<=super::super::LINE_MAX);let received=now()-1000;
+        archive.execute("INSERT INTO records(retained_ms,line) VALUES(?1,?2)",params![received,line]).unwrap();install(&mut archive).unwrap();
+        let state=state(&archive).unwrap();let parts=Event::split_identified(&format!("taskq.legacy.{}",state.namespace),"0.1024",super::super::semantic::observation(&line).unwrap()).unwrap();assert!(parts.len()>1);
+        let path=dir.join("common");let target=Store::open(&path).unwrap();let inject=Connection::open(&path).unwrap();
+        inject.execute_batch(&format!("CREATE TRIGGER reject_summary BEFORE INSERT ON events WHEN new.id='{}' BEGIN SELECT RAISE(ABORT,'injected summary part failure'); END",parts.last().unwrap().id())).unwrap();
+        assert!(import(&mut archive,&target).unwrap_err().contains("injected summary part failure"));assert!(target.import_cursor(SOURCE).unwrap().unwrap().ends_with(".0.1023"));
+        assert_eq!(target.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1023,"no partial summary or cursor can commit");
+        inject.execute_batch("DROP TRIGGER reject_summary").unwrap();drop(inject);assert_eq!(import(&mut archive,&target).unwrap(),1);assert_eq!(import(&mut archive,&target).unwrap(),0);
+        let mut values=Vec::new();let mut after=0;loop {let page=target.export(0,after,1024).unwrap();for row in page["events"].as_array().unwrap() {if row["observation"].get("group_id").is_some() {assert_eq!(row["received_ms"],received);}values.push(row["observation"].clone());}after=page["next"].as_i64().unwrap();if page["more"]==false {break;}}
+        assert_eq!(values.len(),1023+parts.len());assert!(super::super::semantic::line(&values[1023]).is_err());
+        let restored=super::super::semantic::lines(&values).unwrap();assert_eq!(restored.len(),1024);assert_eq!(crate::requests::legacy_value(restored.last().unwrap()).unwrap(),crate::requests::legacy_value(&line).unwrap());
+        assert!(super::super::semantic::lines(&values[..values.len()-1]).is_err());
+        drop(archive);drop(target);std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn removed_unimported_records_and_mutation_are_explicit_unknowns() {

@@ -51,6 +51,7 @@ pub(super) fn observation(line: &str) -> Res<Value> {
 }
 
 pub(super) fn line(value: &Value) -> Res<String> {
+    if value.get("group_id").is_some() {return Err("count summary needs complete assembly".into());}
     if value["product"]!="taskq" {return Err("foreign semantic product".into());}
     let kind=value["kind"].as_str().ok_or("missing semantic kind")?;let mut original=serde_json::Map::new();
     for (old,new) in fields(kind)? {if let Some(field)=value.get(*new) {original.insert((*old).into(),field.clone());}}
@@ -67,6 +68,13 @@ pub(super) fn line(value: &Value) -> Res<String> {
         original.insert("ops".into(),Value::Object(ops));
     }
     let line=format!("{} {}",prefix(kind)?,Value::Object(original));canonical(&line)?;Ok(line)
+}
+
+/// Consume complete contiguous summary groups from a bounded semantic read; partial groups stay unknown.
+pub(super) fn lines(values: &[Value]) -> Res<Vec<String>> {
+    let mut lines=Vec::new();let mut reader=coreq::telemetry::Assembler::default();
+    for value in values {if let Some(value)=reader.push(value.clone())? {lines.push(line(&value)?);}}
+    reader.finish()?;Ok(lines)
 }
 
 #[cfg(test)]

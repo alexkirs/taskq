@@ -928,7 +928,7 @@ impl<'a> Service<'a> {
 
         // § 7 publication intent is board state; every host can reconcile the queue after a restart, even with focus off.
         for v in views.iter().filter(|v| v.task.publication.is_some() && !touched.contains(&v.issue.number)) {
-            let r = crate::dispatch::resume_publication(self.board, self.cfg, v.issue.number);
+            let r = crate::dispatch::resume_publication(self.board, &self.cfg, v.issue.number);
             if !r.ok() { log!("#{} publication: {}", v.issue.number, r.reason); }
         }
         touched.extend(views.iter().filter(|v| v.task.publication.is_some()).map(|v| v.issue.number));

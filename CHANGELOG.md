@@ -5,7 +5,7 @@ there is no migration code. Releases without a **Board** section need nothing.
 
 ## Unreleased
 
-**Board ? cutover required (§ 9):** GitHub PR publication saves `publish`, `enqueued` and private-fallback `rebased` entries; `publication-failed` counts failed CI and `requeue main-moved` preserves retries. Old readers fold these differently. Stop all old services and children, preserve each open result, configure public boards' main merge queue and required `merge_group` CI, then upgrade all hosts before resuming. Closed issues stay untouched. Private boards without a queue need Git and the clean, owned task worktree only for the fallback; public boards remain Git-free. Publication closes on the observed merge event with green merge-result CI, not queue admission.
+**Board — cutover required (§ 9):** GitHub PR publication saves `publish`, `enqueued` and private-fallback `rebased` entries; `publication-failed` counts failed CI and `requeue main-moved` preserves retries. Old readers fold these differently. Stop all old services and children, preserve each open result, configure public boards' main merge queue and required `merge_group` CI, then upgrade all hosts before resuming. Closed issues stay untouched. Private boards without a queue need Git and the clean, owned task worktree only for the fallback; public boards remain Git-free. Publication closes on the observed merge event with green merge-result CI, not queue admission.
 
 ## v4.4.0
 

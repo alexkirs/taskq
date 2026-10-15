@@ -1,4 +1,4 @@
-# ?7: PR checks and merge_group CI; publication requires green CI on the merge result.
+# § 7: PR checks and merge_group CI; publication requires green CI on the merge result.
 name: tests
 on:
   workflow_dispatch:

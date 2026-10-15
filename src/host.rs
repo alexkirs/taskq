@@ -419,7 +419,7 @@ pub fn migrate(install: &Path, roots: &[PathBuf]) -> Res<()> {
         let mut policies = vec![];
         for root in roots {
             if root.join("taskq.json.host-policy.tmp").exists() { return Err("migration staging path already exists; originals unchanged".into()); }
-            let owner = ownership(&root.join("taskq.json"))?;
+            let owner = ownership(&root.join("taskq.json")).map_err(|e| format!("migration input unknown: {e}"))?;
             let original = fs::read_to_string(root.join("taskq.json")).map_err(|e| format!("migration input unknown: {e}"))?;
             let mut v: Value = serde_json::from_str(&original).map_err(|e| format!("migration input unknown: {e}"))?;
             let host = std::env::var("TASKQ_HOST").ok().filter(|s| !s.is_empty()).or_else(|| v["hosts"][crate::hostname()].as_str().map(String::from)).unwrap_or_else(crate::hostname);

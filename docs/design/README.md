@@ -43,6 +43,7 @@ The package includes the remote PM scenario (UC-17), not only the desktop menu. 
 | [Agent settings](agent-settings.md) | Workspace access editor, project overrides, review and readback |
 | [Product decisions](menu-product.md) | Approved direction, scenario coverage and candidate boundaries |
 | [Emergency recovery](emergency-recovery.md) | Stop/interlock/reconciliation proposal and E checks |
+| [Host service](host-service.md) | Proposed one service process per host: taskq.md diff, migration, rollback, panic isolation, task split |
 | [Next variants](menu-next-variants.html) | Historical comparison; Workspace review selected |
 | [Standalone candidate](final-menu.html) | Inspect menu, AI conversations/sessions, settings, icons and scenario states |
 | [Editable fragment](final-prototype.html) | Earlier full candidate; integrated workspace takes precedence |

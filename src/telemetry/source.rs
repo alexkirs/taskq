@@ -47,7 +47,13 @@ fn install(db: &mut Connection) -> Res<()> {
         let actual:String=tx.query_row("SELECT sql FROM sqlite_master WHERE name=?1",[name],|r|r.get(0)).map_err(error)?;
         if actual!=sql {return Err("legacy source: unsupported identity trigger; preserved".into());}
     }
-    state(&tx)?;tx.commit().map_err(error)
+    state(&tx)?;
+    #[cfg(test)]
+    if std::env::var("TASKQ_SOURCE_IDENTITY_PHASE").is_ok_and(|phase|phase=="open") {
+        std::fs::write(std::env::var_os("TASKQ_SOURCE_IDENTITY_MARKER").ok_or("missing identity marker")?,"transaction-open").map_err(error)?;
+        loop {std::thread::park();}
+    }
+    tx.commit().map_err(error)
 }
 struct State {namespace:String,epoch:i64,high:i64,removed:(i64,i64)}
 fn state(db: &Connection) -> Res<State> {
@@ -158,6 +164,35 @@ mod tests {
         assert_eq!(archive.query_row("SELECT text FROM legacy WHERE id=1",[],|r|r.get::<_,String>(0)).optional().unwrap(),legacy);
         println!("source identity import: {count} rows; canonical+receipt SHA256 {actual}; 9 reports equal; replay 0; pruning 0");
         drop(archive);drop(target);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    #[ignore="subprocess helper exercised by identity_installation_survives_kill_before_and_after_commit"]
+    fn identity_crash_writer() {
+        let root=std::path::PathBuf::from(std::env::var_os("TASKQ_SOURCE_IDENTITY_ROOT").expect("owned fixture"));let mut archive=super::super::open(&root).unwrap();install(&mut archive).unwrap();
+        std::fs::write(std::env::var_os("TASKQ_SOURCE_IDENTITY_MARKER").unwrap(),state(&archive).unwrap().namespace).unwrap();loop {std::thread::park();}
+    }
+    #[test]
+    fn identity_installation_survives_kill_before_and_after_commit() {
+        for phase in ["open","committed"] {
+            let dir=dir();let archive=super::super::open(&dir).unwrap();add(&archive);add(&archive);drop(archive);let marker=dir.join("identity-marker");
+            let mut child=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","telemetry::source::tests::identity_crash_writer","--ignored","--nocapture"])
+                .env("TASKQ_SOURCE_IDENTITY_ROOT",&dir).env("TASKQ_SOURCE_IDENTITY_MARKER",&marker).env("TASKQ_SOURCE_IDENTITY_PHASE",phase)
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
+            let until=std::time::Instant::now()+std::time::Duration::from_secs(15);let mut acknowledged=None;
+            while std::time::Instant::now()<until {
+                if let Ok(text)=std::fs::read_to_string(&marker) {if (phase=="open"&&text=="transaction-open")||(phase=="committed"&&namespace(&text)) {acknowledged=Some(text);break;}}
+                if child.try_wait().unwrap().is_some() {break;}std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _=child.kill();child.wait().unwrap();let acknowledged=acknowledged.expect("child never reached identity boundary");
+            let mut archive=super::super::open(&dir).unwrap();
+            if phase=="open" {
+                assert_eq!(acknowledged,"transaction-open");assert_eq!(archive.query_row("SELECT count(*) FROM sqlite_master WHERE name='telemetry_source'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+                assert_eq!(archive.query_row("SELECT count(*) FROM pragma_table_info('records') WHERE name='telemetry_epoch'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+            } else {assert_eq!(state(&archive).unwrap().namespace,acknowledged);}
+            assert_eq!(archive.query_row("SELECT count(*) FROM records",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+            let target=Store::open(&dir.join("common")).unwrap();assert_eq!(import(&mut archive,&target).unwrap(),2);assert_eq!(import(&mut archive,&target).unwrap(),0);
+            drop(archive);drop(target);std::fs::remove_dir_all(dir).unwrap();
+        }
     }
     #[test]
     fn pinned_source_reader_refuses_identity_installation_without_partial_metadata() {

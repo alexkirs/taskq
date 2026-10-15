@@ -3,6 +3,12 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.4.4
+
+Worker and reviewer briefs park unchanged external blockers with the failed check and one unblock condition. Resume only after evidence that the condition passed; repeated attempts are not recovery. No board format change.
+
+CLI and service updates serialize under one install lock, preventing concurrent metadata/activation changes. Installation cleanup preserves this lock, the emergency hold and admission store/lock. Older versions delete these during an update: pause every registered project before updating from v4.4.3 or earlier, retain the hold outside the install, and verify it after updating. Resume remains an owner action.
+
 ## v4.4.0
 
 Services check for updates every 60 s instead of 900 s. A merged version bump now tags and publishes the release by itself, with cached builds. The rules header asks for one evidence line per claim. Tray task rows link Claude sessions on every host and show the remote mark before the runtime mark. No board change.

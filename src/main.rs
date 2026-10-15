@@ -36,8 +36,8 @@ mod notify;
 mod tray;
 
 use board::{Board, entries};
-use core::{Entry, State, entry, fold};
-use dispatch::{Op, Receipt, act, answer_picks, close_one, current, deps_open};
+use core::{Entry, State, Task, entry, fold};
+use dispatch::{Op, Receipt, act, answer_picks, close_checked, current, deps_open};
 use serde_json::{Value, json};
 use service::{Config, Kid, Service};
 use snapshot::in_scope;
@@ -414,6 +414,15 @@ fn shots_gate(git_bin: &str, root: &Path, sha: &str) -> Res<()> {
 }
 
 /// § 7 close verdict: Changed, Checks naming every Acceptance item `A<k> ok|gap|unknown` and CI, Open.
+/// § 7: a reviewed result closes with the verdict template naming its SHA; later/failed tasks and bare closes keep free text.
+fn close_check(text: &str, issue: &board::Issue, t: &Task) -> Res<()> {
+    if t.state != State::Review || text.is_empty() {
+        return Ok(());
+    }
+    close_verdict(text, &issue.body)?;
+    if t.result.as_deref().is_some_and(|sha| text.lines().any(|l| l.starts_with("Checks:") && l.contains(sha))) { Ok(()) } else { Err("Checks: name the exact result SHA with the CI outcome".into()) }
+}
+
 fn close_verdict(text: &str, body: &str) -> Res<()> {
     let lines: Vec<String> = text.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect();
     limit("verdict", &lines, 3, 12, 240)?;
@@ -2057,18 +2066,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
             let mut out = vec![];
             for i in 1..a.pos.len() {
                 let n = a.num(i)?;
-                // § 7: a reviewed result closes with the verdict template; later/failed tasks and bare closes keep free text
-                let checked = match current(b, n) {
-                    Ok((issue, t, _)) if t.state == State::Review && !text.is_empty() => close_verdict(text, &issue.body).and_then(|_| {
-                        if t.result.as_deref().is_some_and(|sha| text.lines().any(|l| l.starts_with("Checks:") && l.contains(sha))) { Ok(()) } else { Err("Checks: name the exact result SHA with the CI outcome".into()) }
-                    }),
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(e),
-                };
-                out.push(match checked {
-                    Ok(()) => close_one(b, cfg, n, text, &op),
-                    Err(e) => Receipt::rejected(n, &op, e),
-                });
+                out.push(close_checked(b, cfg, n, text, &op, &|issue, t| close_check(text, issue, t)));
             }
             emit(&out, json)
         }
@@ -2208,6 +2206,7 @@ fn main() {
 mod tests {
     use super::*;
     use board::Fake;
+    use dispatch::close_one;
 
     // Chain: § 5 stale TASKQ_ROOT (#1072). Risk: a reused session's command writes into another project.
     #[test]

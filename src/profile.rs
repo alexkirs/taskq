@@ -456,7 +456,7 @@ Changed: x"))];
             assert_eq!(crate::core::stage_outcome(7, Ok((log.as_slice(), Some(live))), 10, 10), want, "{:?}", log.last().map(|e| &e.body));
         }
         stage_at(Some(&path), "review", 7, 11, "codex", ms(6), "unknown", "left-board", Usage::Unknown("log-unreadable"));
-        // `close` times the whole command: an unreadable task, a gate refusal, a stale revision, a non-publication close
+        // `close` times the whole command from entry: an unreadable task, a gate refusal, a stale revision, a CLI verdict refusal, a non-publication close
         // and a publication each record one `close` stage (the publication also `checks`)
         use crate::board::Board;
         let staged = || STAGED.with(|v| std::mem::take(&mut *v.borrow_mut())).join("; ");
@@ -472,9 +472,14 @@ Changed: x"))];
         let a = crate::core::fold(t, &crate::board::entries(&b, t).unwrap(), false).attempt.unwrap();
         assert!(!close(&gated, &Default::default()));
         assert!(!close(&c, &crate::dispatch::Op { revision: Some(1), ..Default::default() }));
+        // the CLI's verdict refusal and unreadable task are inside the stage too
+        let cli = |n, text: &str| crate::dispatch::close_checked(&b, &c, n, text, &Default::default(), &|i, t| crate::close_check(text, i, t)).ok();
+        assert!(!cli(t, "no verdict"));
+        assert!(!cli(999, ""));
         assert!(close(&c, &Default::default()));
         assert!(!crate::dispatch::close_one(&b, &c, 999, "ok", &Default::default()).ok());
         assert_eq!(staged(), format!("close {t} 0 other failed other; close {t} {a} codex failed other; close {t} {a} codex failed other; \
+            close {t} {a} codex failed other; close 999 0 other failed other; \
             checks {t} {a} codex ok none; close {t} {a} codex ok none; close 999 0 other failed other"));
         let log = fs::read_to_string(&path).unwrap();
         assert!(!log.contains("secret") && !log.contains("/host/path") && !log.contains("private-rt"));

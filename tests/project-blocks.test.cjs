@@ -18,7 +18,12 @@ assert(q.summary({...p,closed:undefined}).includes('Closed: unknown'));
 assert(q.task(p,{...row,title:'<script>alert(1)</script>',url:'javascript:alert(1)'}).includes('&lt;script&gt;'));
 assert(!q.task(p,{...row,url:'javascript:alert(1)'}).includes('href="javascript:'));
 assert(!q.task(p,{...row,local_session:false}).includes('codex://'));
-assert(q.task(p,{...row,local_session:false}).includes('Remote session'));
+assert(q.task(p,{...row,local_session:false,session_reason:'Codex session opens only on WIN'}).includes('title="Codex session opens only on WIN">Session unavailable'));
+// Chain: #1204 remote Claude row. Risk: the account-scoped link is dropped, or the remote mark follows the runtime mark or adds text.
+const remoteClaude=q.task(p,{...row,runtime:'claude',local_session:false,session_url:'https://claude.ai/code/session_014abc'});
+assert(remoteClaude.includes('href="https://claude.ai/code/session_014abc"'));
+assert(remoteClaude.indexOf('data-icon="network"')<remoteClaude.indexOf('data-icon="claude"')&&!remoteClaude.includes('Remote session'));
+assert(!q.task(p,row).includes('data-icon="network"'),'local rows carry no remote mark');
 // Chain: M3 shared task row -> metadata/independent links -> full title block in every consumer.
 // Risk: a long title is truncated or pushes the session control into the title line.
 const splitRow=q.task(p,{...row,title:'Complete title '.repeat(30)},true);

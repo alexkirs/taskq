@@ -271,6 +271,8 @@ pub struct Service<'a> {
     begun: HashMap<u64, (String, String, Option<(std::time::Instant, u64)>)>,
     /// This host's tasks seen moving into `ask`: since when, attempt, runtime (§ 4 Profiling stages).
     asked: HashMap<u64, (std::time::Instant, u64, String)>,
+    /// Remote Control URL of each live Claude child by attempt, read once from its transcript (§ 4 heartbeat `session`).
+    sessions: HashMap<u64, String>,
 }
 
 const MONTH: i64 = 30 * 86400;
@@ -493,7 +495,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), begun: HashMap::new(), asked: HashMap::new() }
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -655,6 +657,7 @@ impl<'a> Service<'a> {
         }
         let kids: BTreeSet<_> = self.kids.iter().map(|k| (k.task, k.attempt)).chain(self.pending.iter().copied()).collect();
         lines.extend(kids.iter().map(|(t, a)| format!("#{t} {a}")));
+        lines.extend(kids.iter().filter_map(|(t, a)| self.sessions.get(a).map(|u| format!("session #{t} {a} {u}"))));
         lines.join("\n")
     }
 
@@ -744,6 +747,14 @@ impl<'a> Service<'a> {
         let kids: Vec<u64> = self.kids.iter().map(|k| k.attempt).collect();
         self.unknown.retain(|a, _| kids.contains(a));
         self.prune(&by_n);
+        // A Claude Remote Control URL is account-scoped: the heartbeat publishes it so every host's tray links it (#1204).
+        // ponytail: rereads the transcript each pass until the bridge URL appears; cache misses if transcripts grow huge.
+        self.sessions.retain(|a, _| kids.contains(a));
+        let found: Vec<(u64, String)> = self.kids.iter().filter(|k| k.rt == "claude" && !self.sessions.contains_key(&k.attempt))
+            .filter_map(|k| by_n.get(&k.task).filter(|v| v.task.attempt == Some(k.attempt))?.task.session.as_deref()?.split(' ').next()?.strip_prefix("claude:")
+                .and_then(crate::runtime::claude_remote).map(|u| (k.attempt, u)))
+            .collect();
+        self.sessions.extend(found);
 
         // 3. heartbeat
         let body = self.heartbeat_body();
@@ -1484,6 +1495,13 @@ mod tests {
         s.machine = String::new();
         s.focus = vec!["all".into()];
         assert_eq!(s.heartbeat_body(), "version 4.0.0\nservice abc123");
+        // #1204: a live Claude child publishes its account-scoped URL; every host's snapshot reads it back by host and attempt
+        s.pending.insert((7, 42));
+        s.sessions.insert(42, "https://claude.ai/code/session_014abc".into());
+        assert_eq!(s.heartbeat_body(), "version 4.0.0\nservice abc123\n#7 42\nsession #7 42 https://claude.ai/code/session_014abc");
+        let host = |body: String| crate::board::Issue { number: 1, title: "taskq host win".into(), body, labels: vec![], assignees: vec![], updated: 0, open: true, trusted: true, reason: None };
+        let urls = crate::snapshot::session_urls(&[host(s.heartbeat_body()), host("session #8 43 https://evil.example/x".into())]);
+        assert_eq!(urls.into_iter().collect::<Vec<_>>(), vec![(("win".to_string(), 42), "https://claude.ai/code/session_014abc".to_string())]);
     }
 
     // Chain: § 4 board budget, heartbeat. Risk: a PATCH every pass burns the shared budget, or a sparse heartbeat

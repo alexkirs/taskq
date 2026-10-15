@@ -555,18 +555,18 @@ fn launcher(install: &Path) -> PathBuf {
     if l.is_file() { l } else { std::env::current_exe().unwrap_or_else(|_| PathBuf::from("taskq")) }
 }
 
-/// Sleep until a poke or `secs`; `tick` runs every second (the load gate's sampling, § 3).
-fn sleep_until_poke(poke: &Path, secs: u64, tick: &mut dyn FnMut()) {
-    let mtime = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
-    let start = mtime(poke);
-    let host_poke = platform::default_install().join("poke");
-    let host_start = mtime(&host_poke);
+fn poke_times(paths: &[PathBuf; 2]) -> [Option<SystemTime>; 2] {
+    paths.each_ref().map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+}
+
+/// Compare with the pre-pass snapshot: a command arriving during work must not become the sleep baseline.
+fn sleep_until_poke(paths: &[PathBuf; 2], start: [Option<SystemTime>; 2], secs: u64, tick: &mut dyn FnMut()) {
     for _ in 0..secs {
-        std::thread::sleep(Duration::from_secs(1));
-        tick();
-        if mtime(poke) != start || mtime(&host_poke) != host_start {
+        if poke_times(paths) != start {
             return;
         }
+        std::thread::sleep(Duration::from_secs(1));
+        tick();
     }
 }
 
@@ -663,7 +663,9 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
     let mut dashq = enrollment::Sender::default();
     let mut policy_exchange = resources::Exchanger::default();
     let mut panics = host::Panics::default();
+    let pokes = [d.join("poke"), cfg.install.join("poke")];
     loop {
+        let poke_start = poke_times(&pokes);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Res<()> {
         let reduced = panics.quarantined() || began.elapsed().as_secs() < panics.until;
         // § 3: capacity reloads before each admission decision; children are untouched
@@ -867,7 +869,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             let _ = coreq::status::write(&tool, &cfg.root, &status);
         };
         tick();
-        sleep_until_poke(&d.join("poke"), if reduced { 1 } else { cfg.poll }, &mut tick);
+        sleep_until_poke(&pokes, poke_start, if reduced { 1 } else { cfg.poll }, &mut tick);
         Ok(())
         }));
         match outcome {

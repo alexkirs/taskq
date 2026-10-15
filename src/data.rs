@@ -13,6 +13,8 @@ pub const CLI_ERRORS_MAX: u64 = 256 << 10;
 pub const ATTEMPT_LOGS: usize = 50;
 /// `<root>/.taskq/incidents/<fingerprint>.json`: the newest by mtime.
 pub const INCIDENTS: usize = 50;
+/// `<root>/.taskq/inputs/*.txt`: the newest by mtime, plus files locked by live Claude turns.
+pub const INPUTS: usize = 50;
 /// Lines of `<root>/.taskq/requests/comments`: past it the newest half and every comment still pending stay.
 pub const COMMENT_IDS: usize = 1000;
 /// Lines of `<root>/.taskq/requests.log`: the newest stay; pruned on every append (`retro::append`).
@@ -71,6 +73,15 @@ pub fn prune(root: &Path, install: &Path, project: &str, live: &[u64]) -> Vec<St
     let n = keep_newest(&d, ATTEMPT_LOGS, |f| attempt_of(f).is_some(), |f| attempt_of(f).is_some_and(|a| live.contains(&a)));
     if n > 0 {
         out.push(format!("pruned {n} attempt logs beyond the newest {ATTEMPT_LOGS}"));
+    }
+    let inputs = d.join("inputs");
+    let n = keep_newest(&inputs, INPUTS, |f| f.ends_with(".txt"), |f| {
+        // A live turn holds a shared lock; an unreadable file stays rather than risking its input.
+        fs::File::options().read(true).write(true).open(inputs.join(f))
+            .map_or(true, |file| file.try_lock().is_err())
+    });
+    if n > 0 {
+        out.push(format!("pruned {n} input files beyond the newest {INPUTS}"));
     }
     let n = keep_newest(&d.join("incidents"), INCIDENTS, |f| f.ends_with(".json"), |_| false);
     if n > 0 {
@@ -190,6 +201,30 @@ mod tests {
         assert_eq!(kept.lines().count(), COMMENT_IDS / 2 + 1);
         assert!(kept.starts_with("3\n") && kept.ends_with(&format!("{}\n", COMMENT_IDS + 1)));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // Chain: §4 hourly input-cache pruning. Risk: unbounded briefs or deletion during a live turn.
+    #[test]
+    fn input_cache_is_bounded_and_live_files_stay() {
+        let root = temp("inputs");
+        let dir = root.join(".taskq/inputs");
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..55 {
+            let path = dir.join(format!("{i}.txt"));
+            fs::write(&path, "invented brief").unwrap();
+            fs::File::options().write(true).open(path).unwrap().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i)).unwrap();
+        }
+        let active = fs::File::options().read(true).write(true).open(dir.join("0.txt")).unwrap();
+        active.try_lock_shared().unwrap();
+        prune(&root, &root.join("install"), "p", &[]);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 51);
+        assert!(dir.join("0.txt").exists());
+        assert!(!dir.join("1.txt").exists());
+        drop(active);
+        prune(&root, &root.join("install"), "p", &[]);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 50);
+        fs::remove_dir_all(root).unwrap();
     }
 
     // Chain: status.json, tray.json, kids, focus readers. Risk: corrupt state reads as zero or default and is reset

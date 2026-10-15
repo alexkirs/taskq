@@ -1,5 +1,4 @@
-//! Runtimes (taskq.md § 8): how a worker or reviewer child is started and resumed. The brief goes on stdin, never
-//! through a shell.
+//! Runtimes: stdin briefs or file-backed Claude background input (taskq.md section 8).
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -568,6 +567,17 @@ pub fn instructions(root: &Path, task: &str, resume: bool) -> Result<String, Sta
     rule_text(root, task, resume, rule_file)
 }
 
+// Claude --bg forwards stdin as child argv; send only a file reference.
+fn claude_input(root: &Path, text: &str) -> Result<(String, File), String> {
+    let dir = root.join(".taskq/inputs");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{}.txt", uuid()));
+    let mut file = File::options().read(true).write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
+    file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+    file.try_lock_shared().map_err(|e| e.to_string())?;
+    Ok((format!("Before any work, use Read to read {} in full. It contains this turn's TaskQ rules and task. Apply those rules and carry out that task. If Read truncates the file, read the remaining parts before proceeding.", serde_json::to_string(&path.to_string_lossy()).map_err(|e| e.to_string())?), file))
+}
+
 fn turn_text(env: &Env, l: &Launch, fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
     let mut task = brief(env, l);
     if let Some(answer) = &l.resume { task.push_str(&format!("\nContinue this same attempt with the following inbox message:\n{answer}")); }
@@ -673,6 +683,7 @@ pub struct ClaudeTurn {
     before: usize,
     mode: String,
     input: String,
+    _input_file: File,
     pid: u32,
     done: bool,
 }
@@ -733,12 +744,13 @@ impl ClaudeTurn {
         let mut file = File::options().create(true).append(true).open(log).map_err(|e| e.to_string())?;
         let mut c = executable(which("claude"), access, env)?;
         environment(env, l, &mut c);
-        c.current_dir(&root).args(["--bg", "--settings", &compact_settings(&root, l)]);
+        let (input, input_file) = claude_input(&root, text)?;
+        c.current_dir(&root).arg("--bg");
         if l.resume.is_some() { c.args(["--resume", &l.session]); }
-        else { c.args(["--remote-control", &l.title, "--permission-mode", permission_mode]); }
+        else { c.args(["--settings", &compact_settings(&root, l), "--remote-control", &l.title, "--permission-mode", permission_mode]); }
         if l.role == "operator" { for k in ["TASKQ_TASK", "TASKQ_ATTEMPT", "TASKQ_ROLE"] { c.env_remove(k); } }
         let mut child = crate::platform::quiet(&mut c).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
-        if let Err(e) = child.stdin.take().unwrap().write_all(text.as_bytes()) {
+        if let Err(e) = child.stdin.take().unwrap().write_all(input.as_bytes()) {
             return Err(format!("Claude background input: {e}; launch outcome unknown"));
         }
         let out = child.wait_with_output().map_err(|e| e.to_string())?;
@@ -752,7 +764,7 @@ impl ClaudeTurn {
             return Err("Claude created a copy; stopped owned copy, original conversation preserved".into());
         }
         Ok(Self { root, log: log.into(), session: if l.resume.is_some() { l.session.clone() } else { String::new() }, id: id.into(),
-            announced: false, copied: 0, before, mode: permission_mode.into(), input: text.trim().into(), pid: 0, done: false })
+            announced: false, copied: 0, before, mode: permission_mode.into(), input, _input_file: input_file, pid: 0, done: false })
     }
 }
 
@@ -1203,6 +1215,32 @@ mod tests {
         std::fs::write(root.join("docs/sub/plain.md"), "No heading here.").unwrap();
         std::fs::write(root.join("docs/shot.png"), [0u8, 159, 146]).unwrap();
         root
+    }
+
+    // Chain: section 8 background rule delivery. Risk: Claude copies a large stdin brief onto child argv.
+    #[test]
+    fn claude_large_input_stays_out_of_argv() {
+        let root = rules_root("background input ' quoted");
+        let text = format!("{}\nUTF-8: \u{2605}\n", "invented padding ".repeat(6400));
+        assert!(text.len() > 100 * 1024);
+        let mut inputs = Vec::new();
+        for turn in ["start", "resume", "concurrent operator"] {
+            let brief = format!("{text}{turn}");
+            let (input, _file) = claude_input(&root, &brief).unwrap();
+            assert!(input.len() < 8192 && !input.contains("invented padding"));
+            assert!(input.contains("use Read") && input.contains("in full"));
+            assert!(!inputs.contains(&input), "each turn has an immutable input file");
+            let quoted = input.strip_prefix("Before any work, use Read to read ").unwrap().split(" in full.").next().unwrap();
+            let path: String = serde_json::from_str(quoted).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), brief);
+            let probe = File::options().read(true).write(true).open(&path).unwrap();
+            assert!(matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+            drop(_file);
+            probe.try_lock().unwrap();
+            inputs.push(input);
+        }
+        assert_eq!(std::fs::read_dir(root.join(".taskq/inputs")).unwrap().count(), 3);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn rule(url: &str) -> Result<String, String> {

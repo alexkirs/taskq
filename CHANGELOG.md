@@ -3,6 +3,10 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.4.0
+
+Services check for updates every 60 s instead of 900 s. A merged version bump now tags and publishes the release by itself, with cached builds. The rules header asks for one evidence line per claim. Tray task rows link Claude sessions on every host and show the remote mark before the runtime mark. No board change.
+
 ## v4.3.0
 
 Worker, reviewer and operator starts now send a rules header (specq revision, cache path, precedence), this project's `taskq.md`, the ten specq core files and an index of the other specq rules and `docs/`; resumes send the header and index. Rules are pinned to specq `46f5f62` and cached in `<root>/.taskq/specq/<revision>/`; a missing or invalid file, or more than 128 KiB in total, refuses the launch. No board change.

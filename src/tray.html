@@ -72,7 +72,7 @@ function fit(){const size=manualSize||S.size,w=size?size[0]:S.font>=18?360:320;d
 let manualSize=null;
 const menu=document.querySelector('.menu');
 let aiText=null,aiMenu=false,aiConfirm=null,addConfirm=false;
-let S=null,page='home',taskFilter=null,working=null,workCard=null,ask=null,noted=null,pending={},confirming=null,updating=null,draft=null;
+let S=null,page='home',taskFilter=null,working=null,workCard=null,ask=null,noted=null,pending={},confirming=null,hostAction=null,updating=null,draft=null;
 // Navigation is view state only: every route consumes the same pushed snapshot.
 const routes={home:'Home',projects:'Projects',attention:'Attention',settings:'Settings',appearance:'Appearance',cadence:'Activity history',notifications:'Notifications',agents:'Agents',services:'Services',about:'About'};
 const trail=[];
@@ -179,8 +179,8 @@ function incidentNotice(p){return p.incident_notice?'<details class="group incid
 function service(p){return '<details class="group service"><summary>⚙ Service <span class="meta">'+esc(p.name)+'</span></summary>'+incident(p)+
   (p.log?'<button class="project" data-a="log" data-root="'+esc(p.root)+'">Open log</button>':'<div class="body meta">Log path unknown</div>')+
   '<button class="project" data-a="folder" data-root="'+esc(p.root)+'">Open folder</button>'+
-  '<button class="project" data-a="restart" data-root="'+esc(p.root)+'"'+(p.alive?'':' disabled title="Service not running"')+'>Restart</button>'+
-  '<button class="project" data-a="stop" data-root="'+esc(p.root)+'">Stop until next logon</button>'+
+  '<button class="project" data-a="restart" data-root="'+esc(p.root)+'"'+(p.alive?'':' disabled title="Service not running"')+'>Restart host…</button>'+
+  '<button class="project" data-a="stop" data-root="'+esc(p.root)+'">Stop host…</button>'+
   '<details><summary>Uninstall service '+esc(p.name)+'</summary><div class="body meta">Removes this project\'s service; files and other projects stay.</div><button class="project" data-a="uninstall" data-root="'+esc(p.root)+'">Confirm uninstall '+esc(p.name)+'</button></details></details>';}
 // bins, range and since come from Rust (the icon draws the same); unknown is never drawn or counted as zero (M6)
 function when(t,tz){return new Date(t*1000).toLocaleString([],{timeZone:tz==='UTC'?'UTC':undefined,dateStyle:'short',timeStyle:'short'})+' '+(tz==='UTC'?'UTC':zone);}
@@ -388,6 +388,7 @@ function filteredTasks(p){
 function head(){return '<div class="row head"><span class="meta">taskq</span><button data-a="pin" aria-pressed="'+!!S.pinned+'" title="'+(S.pinned?'Unpin: back to the popover':'Pin: keep open as a movable window')+'">'+(S.pinned?'Pinned':'Pin')+'</button><button data-a="top" aria-pressed="'+!!S.top+'" title="Keep above other windows">Top</button></div>';}
 function render(navigating=false){
   if(!S||resizing)return;
+  if(hostAction){const focused=document.activeElement?.dataset?.a;menu.innerHTML='<div class="body" role="alert">'+(hostAction.a==='restart'?'Restart host service?':'Stop host until next logon? Existing attempts finish first.')+'<br>'+S.projects.map(p=>esc(p.name)).join('<br>')+'</div><div class="options"><button data-a="host-apply">Confirm</button><button data-a="host-cancel">Cancel</button></div>';menu.querySelector('[data-a="'+(focused==='host-apply'?'host-apply':'host-cancel')+'"]')?.focus({preventScroll:true});fit();return;}
   const active=document.activeElement,answerFocus=active&&active.closest('[data-answer]'),scroll=document.scrollingElement.scrollTop;
   const bounds=new Map([...menu.querySelectorAll('[data-bound]')].map(e=>[e.dataset.bound,e.scrollTop]));
   const focusKey=!navigating&&active&&menu.contains(active)?JSON.stringify(active.dataset):null;
@@ -475,6 +476,9 @@ menu.addEventListener('click',e=>{
   if(d.a==='ai-pick'){aiText=d.v;aiMenu=false;send({a:'ai-draft',text:aiText});render();const t=document.getElementById('ai');t.focus();t.setSelectionRange(t.value.length,t.value.length);return;}
   if(d.a==='ai-next'){send({a:'ai-send',text:d.v,after:S.ai.request.id});render();return;}
   if(d.a==='ai-send'){const r=S.ai.request,an=r&&r.answer||{};if(!aiText.trim())return;send({a:'ai-send',text:aiText,after:an.state==='clarify'?r.id:''});aiText='';render();return;}
+  if(d.a==='restart'||d.a==='stop'){hostAction={a:d.a,root:d.root};render();menu.querySelector('[data-a="host-cancel"]')?.focus();return;}
+  if(d.a==='host-cancel'){hostAction=null;render();return;}
+  if(d.a==='host-apply'){const a=hostAction;hostAction=null;if(a)send(a);render();return;}
   if(d.a==='ai-confirm'){aiConfirm=d.id+'/'+d.rev;send({a:'ai-confirm',root:d.root,id:d.id,rev:Number(d.rev)});render();return;}
   if(d.a==='ai-clear'){send({a:'ai-clear'});return;}
   if(d.a==='add-ask'||d.a==='add-back'){addConfirm=d.a==='add-ask';render();return;}

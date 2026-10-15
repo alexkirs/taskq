@@ -11,7 +11,11 @@ fn installed_windows_release_starts_without_build_paths() {
     let appdata = dir.join("appdata");
     let install = appdata.join("taskq");
     fs::write(root.join("taskq.json"), r#"{"repo":"taskqorg/taskq"}"#).unwrap();
-    // A fixture child defers unit reload: exercise real installation without registering or starting an OS service.
+    // The host owns the child: a root-only snapshot no longer defers the host unit.
+    fs::create_dir_all(&install).unwrap();
+    fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
+    fs::write(install.join("service"), std::process::id().to_string()).unwrap();
+    fs::write(install.join("service.json"), format!(r#"{{"pid":{},"projects":[],"used":{{}},"idle":false,"drain":false,"reason":null}}"#, std::process::id())).unwrap();
     fs::write(root.join(".taskq/status.json"), r#"{"kids":[{"task":993}]}"#).unwrap();
     for _ in 0..2 {
         let out = Command::new(env!("CARGO_BIN_EXE_taskq"))
@@ -20,7 +24,7 @@ fn installed_windows_release_starts_without_build_paths() {
             .env("LOCALAPPDATA", &appdata).env("TASKQ_INCIDENT_REPORTS", "off")
             .output().unwrap();
         assert!(out.status.success(), "install: {} {}", out.status, String::from_utf8_lossy(&out.stderr));
-        assert!(root.join(".taskq/restart").exists(), "unit reload was not deferred");
+        assert_eq!(fs::read_to_string(install.join("restart")).unwrap(), "unit\n", "native unit reload was not deferred");
     }
     let version = fs::read_to_string(install.join("current")).unwrap();
     let release = install.join("releases").join(version.trim());

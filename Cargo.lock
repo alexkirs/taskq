@@ -213,8 +213,8 @@ dependencies = [
 
 [[package]]
 name = "coreq"
-version = "0.11.0"
-source = "git+https://github.com/taskqorg/coreq?tag=v0.11.0#ac29532e63f7a661c9091ad166aaee4f1f4e4941"
+version = "0.13.0"
+source = "git+https://github.com/taskqorg/coreq?tag=v0.13.0#47bae8a8a4ddd7f09d95b463e409bafd9a3208b7"
 dependencies = [
  "ring",
  "serde_json",
@@ -2108,7 +2108,7 @@ checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
 
 [[package]]
 name = "taskq"
-version = "4.4.0"
+version = "4.4.4"
 dependencies = [
  "block2",
  "coreq",

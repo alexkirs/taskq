@@ -1,11 +1,11 @@
 [package]
 name = "taskq"
-version = "4.4.0"
+version = "4.4.4"
 edition = "2024"
 publish = false
 
 [dependencies]
-coreq = { git = "https://github.com/taskqorg/coreq", tag = "v0.11.0" }
+coreq = { git = "https://github.com/taskqorg/coreq", tag = "v0.13.0" }
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

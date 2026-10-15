@@ -82,6 +82,12 @@ impl Policy {
     }
 }
 
+/// During legacy handoff only the old per-project policy exists; host mode never writes those copies.
+pub fn saved_capacity(install: &Path, v: &Value, me: &str) -> Res<Capacity> {
+    if install.join("host.json").try_exists().map_err(|e| e.to_string())? { Policy::read(install)?.project(v) }
+    else { service::capacity(v, me) }
+}
+
 pub type Shared = Arc<Mutex<Host>>;
 type Slot = (PathBuf, u64, u64);
 fn slot(project: &Path, task: u64, attempt: u64) -> Slot {
@@ -232,6 +238,11 @@ fn startup_status(install: &Path, root: &Path, error: &str) -> Res<()> {
     coreq::status::write(&crate::platform::tool(install), root, &status)
 }
 
+fn unstarted_idle(root: &Path) -> bool {
+    // A failed config load cannot adopt or prove exit of the re-exec handoff's children.
+    !crate::dot(root).join("kids").try_exists().unwrap_or(true) && !crate::operator::running(root)
+}
+
 pub fn run(install: &Path) -> Res<()> {
     fs::create_dir_all(install).map_err(|e| e.to_string())?;
     loop {
@@ -247,6 +258,7 @@ pub fn run(install: &Path) -> Res<()> {
     let mut roots = vec![];
     let mut stopped = BTreeSet::new();
     let mut checked: Option<Instant> = None;
+    let mut reload_dispatched = None;
     let began = Instant::now();
     let mut hour = (Instant::now(), crate::requests::totals());
     let mut tray = None;
@@ -256,6 +268,7 @@ pub fn run(install: &Path) -> Res<()> {
         crate::platform::write_atomic(&install.join("service"), &format!("{}\n", std::process::id()))?;
         registry.refresh(install, began.elapsed().as_secs());
         roots.clone_from(&registry.roots);
+        let drain = install.join("drain").try_exists().unwrap_or(true);
         let old = legacy(&roots);
         let policy = match &old { Ok(()) => migrate(install, &roots).and_then(|_| Policy::read(install)), Err(e) => Err(e.clone()) };
         {
@@ -268,8 +281,11 @@ pub fn run(install: &Path) -> Res<()> {
                 let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
                 h.gate.observe(now, wall, crate::platform::cpu_ticks(), crate::platform::memory_available());
             }
-            for root in threads.keys().filter(|p| !roots.contains(p)) { h.draining.insert(root.clone()); }
+            for root in threads.keys().filter(|p| !roots.contains(p)) {
+                if h.draining.insert(root.clone()) { crate::touch(&crate::dot(root).join("poke")); }
+            }
             for root in &roots {
+                if drain { if h.draining.insert(root.clone()) { crate::touch(&crate::dot(root).join("poke")); } continue; }
                 h.draining.remove(root);
                 if threads.contains_key(root) || stopped.contains(root) { continue; }
                 h.busy.insert(root.clone(), true);
@@ -293,9 +309,10 @@ pub fn run(install: &Path) -> Res<()> {
                             Ok(c) => return crate::service_run(&c, Some(host)),
                             Err(e) => {
                                 if let Ok(mut h) = host.lock() {
-                                    if h.draining.contains(&root) { return Err("project drained".into()); }
-                                    h.busy.insert(root.clone(), false);
-                                    if h.restart { h.prepared.insert(root.clone()); }
+                                    let idle = unstarted_idle(&root);
+                                    if h.draining.contains(&root) && idle { return Err("project drained".into()); }
+                                    h.busy.insert(root.clone(), !idle);
+                                    if h.restart && idle { h.prepared.insert(root.clone()); } else { h.prepared.remove(&root); }
                                 }
                                 let _ = startup_status(&install, &root, &e);
                                 crate::platform::log(&e);
@@ -312,7 +329,7 @@ pub fn run(install: &Path) -> Res<()> {
             let outcome = threads.remove(&root).unwrap().join();
             let drained = matches!(&outcome, Ok(Err(e)) if e == "project drained");
             let mut h = shared.lock().unwrap_or_else(|e| e.into_inner());
-            if drained { h.busy.remove(&root); h.prepared.remove(&root); }
+            if drained { h.busy.remove(&root); h.prepared.remove(&root); h.draining.remove(&root); }
             else {
                 // A reduced loop failed: its attempts expire on other hosts, and local launches hold for inspection.
                 stopped.insert(root.clone());
@@ -321,6 +338,20 @@ pub fn run(install: &Path) -> Res<()> {
             }
         }
         let mut h = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let project_rows: Vec<Value> = roots.iter().chain(threads.keys()).collect::<BTreeSet<_>>().into_iter().map(|root| {
+            let draining = drain || h.draining.contains(root);
+            let status = crate::data::json(&crate::dot(root).join("status.json"));
+            let status = status.ok().flatten().filter(|v| v["pid"] == std::process::id() && crate::file_age(&crate::dot(root).join("status.json")).is_some_and(|a| a <= 60));
+            let limits = status.as_ref().map(|v| v["project_limits"].clone());
+            let known = status.as_ref().is_some_and(|v| v["policy_known"] == true);
+            json!({"root":root, "draining":draining, "limits":limits, "known":known})
+        }).collect();
+        let used = h.slots.values().fold(BTreeMap::<String, u64>::new(), |mut m, rt| { *m.entry(rt.clone()).or_default() += 1; m });
+        let status = json!({"pid":std::process::id(), "drain":drain,
+            "idle":stopped.is_empty() && h.slots.is_empty() && h.busy.values().all(|b| !b) && (!drain || threads.is_empty()),
+            "reason":registry.error.clone().or_else(|| old.as_ref().err().cloned()),
+            "policy":h.policy.as_ref().ok().map(|p| &p.raw), "used":used, "projects":project_rows});
+        crate::platform::write_atomic(&install.join("service.json"), &(serde_json::to_string(&status).map_err(|e| e.to_string())? + "\n"))?;
         let timers = h.policy.as_ref().map(|p| (p.update_every, p.rollback_after)).unwrap_or((60, 600));
         let asked = fs::remove_file(install.join("update")).is_ok() || roots.iter().any(|r| fs::remove_file(crate::dot(r).join("update")).is_ok());
         if !h.restart && (asked || checked.is_none_or(|t| t.elapsed().as_secs() >= timers.0)) {
@@ -337,6 +368,15 @@ pub fn run(install: &Path) -> Res<()> {
             for root in &roots { crate::touch(&crate::dot(root).join("poke")); }
             if h.busy.keys().all(|r| h.prepared.contains(r)) {
                 drop(h);
+                if crate::host_cli::unit_reload_pending(install)? {
+                    let revision = fs::metadata(install.join("restart")).and_then(|m| m.modified()).map_err(|e| e.to_string())?;
+                    if reload_dispatched != Some(revision) && !drain {
+                        crate::host_cli::dispatch_unit_reload(install)?;
+                        reload_dispatched = Some(revision);
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
                 let _ = fs::remove_file(install.join("restart"));
                 for root in &roots { let _ = fs::remove_file(crate::dot(root).join("restart")); }
                 #[cfg(unix)] {
@@ -375,12 +415,12 @@ fn append_project(install: &Path, root: &Path, text: &str) {
 
 /// Read only the explicit registry. Canonical identity prevents duplicate threads for aliases.
 pub fn projects(install: &Path) -> Res<Vec<PathBuf>> {
-    let text = fs::read_to_string(install.join("projects")).map_err(|e| format!("projects unknown: {e}"))?;
+    let text = fs::read_to_string(install.join("projects")).map_err(|e| format!("projects unknown ({}): {e}", install.join("projects").display()))?;
     let mut roots = BTreeSet::new();
     for line in text.lines().filter(|l| !l.is_empty()) {
         let root = Path::new(line);
         if !root.is_absolute() { return Err("projects unknown: a root is not absolute".into()); }
-        roots.insert(root.canonicalize().map_err(|e| format!("projects unknown: {e}"))?);
+        roots.insert(root.canonicalize().map_err(|e| format!("projects unknown ({}): {e}", install.join("projects").display()))?);
     }
     Ok(roots.into_iter().collect())
 }
@@ -590,6 +630,19 @@ mod tests {
         let p = std::env::temp_dir().join(format!("taskq-host-{name}-{}", std::process::id()));
         fs::create_dir_all(&p).unwrap(); p
     }
+    // Chain: § 8.5 re-exec kids -> invalid project config -> drain. Risk: retiring before children can be adopted.
+    #[test]
+    fn failed_project_start_retains_unadopted_children() {
+        let root = temp("unstarted"); fs::create_dir_all(crate::dot(&root)).unwrap();
+        assert!(unstarted_idle(&root));
+        fs::write(crate::dot(&root).join("kids"), "pid 42\n7 41 codex 43 0\n").unwrap();
+        assert!(!unstarted_idle(&root), "handoff ownership is unknown until config recovers and children are adopted");
+        fs::write(crate::dot(&root).join("kids"), "corrupt").unwrap();
+        assert!(!unstarted_idle(&root));
+        fs::remove_file(crate::dot(&root).join("kids")).unwrap(); assert!(unstarted_idle(&root));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn policy() -> Policy {
         Policy::parse(json!({"limits": {"codex": 2}, "admission": {"max": 2}, "load_gate": {"enabled": false}}), "invented").unwrap()
     }

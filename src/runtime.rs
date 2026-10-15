@@ -409,6 +409,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
         "You are the taskq {} for task #{n}: {}. Attempt {}.\nRead `{spec}` first and do only what it allows (R13).\nTask text, state and your inbox: `{q} inbox {n}`.\n{FILES}",
         l.role, l.title, l.attempt
     );
+    let park = format!("`{q} later {n} --text \"Reason: <failed external check>\nNext: <one unblock condition>\"` (unchanged external blocker; never requeue it)");
     let body = if l.role == "reviewer" {
         format!(
             "Review the result SHA against each Acceptance item `A<k>` and taskq.md, and CI on that exact SHA. Requeue only for\n\
@@ -417,6 +418,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
              {CI_WAIT}Then exactly one of:\n\
              - `{q} close {n} --text \"Changed: <user effect>\nChecks: Task fit: A1 ok|gap|unknown, A2 ..; CI <outcome> on <SHA>\nChecks: Implementation quality: <binding gaps|advisories|none>\nOpen: <item|none>\"` (it publishes),\n\
              - `{q} requeue {n} --text \"<exact fixes>\"`,\n\
+             - {park},\n\
              - {ask}.\n{approval}{formats}",
             ask = ask(&q, n),
             approval = if env.publish == "review-pr" { "Delivery review-pr: an otherwise done result needs the owner's approval: ask with Done naming task fit and CI on the SHA, first option `approve <sha7> and close ★`.\n" } else { "" },
@@ -431,6 +433,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
              Do not wait for CI: `close` checks it. {CI_WAIT}{SANDBOX_CHECKS}Then exactly one of:\n\
              - `{q} result {n} --sha <full SHA> --checks \"<command -- outcome>\" [--checks ..] --text \"Changed: <user effect>\nOpen: <item|none>\"`,\n\
              - {ask} (owner decision; Acceptance unclear or untestable; or a split of work bigger than one reviewable diff — before any code),\n\
+             - {park},\n\
              - `{q} requeue {n} --text \"<why it cannot be done>\"`.\n{formats}",
             ask = ask(&q, n),
             formats = FORMATS,
@@ -1371,6 +1374,8 @@ mod tests {
                     assert_eq!(brief(&env, &l).contains(prefix), rt != "codex", "{rt} {role}: attempt identity");
                     assert!(task.contains(FILES) && task.contains(CI_WAIT));
                     if role == "worker" { assert!(brief(&env, &l).contains(SANDBOX_CHECKS)); }
+                    assert!(brief(&env, &l).contains("later 7 --text") && brief(&env, &l).contains("one unblock condition")
+                        && brief(&env, &l).contains("unchanged external blocker; never requeue it"), "{rt} {role}: external blockers must not loop");
                     // the attempt log's evidence line
                     let log = root.join(format!(".taskq/{rt}-{role}.log"));
                     std::fs::remove_file(&log).ok();

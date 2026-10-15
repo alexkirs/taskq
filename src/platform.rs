@@ -237,7 +237,7 @@ pub fn sweep(install: &Path, shim: &Path) {
         }
     }
     let owned = |n: &str| {
-        ["releases", "current", "previous", "projects", "token", "installation-id", "connection", "taskq", "taskq.exe", "WebView2Loader.dll", "taskq-tray.exe", "TaskQ.app", "capacity", "resources", "windows-native", crate::policy::FILE, "taskq-profile.lock"].contains(&n)
+        ["releases", "current", "previous", "projects", "token", "installation-id", "connection", "taskq", "taskq.exe", "WebView2Loader.dll", "taskq-tray.exe", "TaskQ.app", "capacity", "resources", "windows-native", crate::policy::FILE, "taskq-profile.lock", "host.json", "host-policy-migration", "host-policy.lock", "projects.lock", "service.lock", "service", "service.json", "drain", "poke", "restart", "rollback-floor", "TaskQ.xml", "hold", "admission.json", "admission.lock"].contains(&n)
             || n.ends_with(".log") || n.ends_with(".tmp") || n.starts_with("tray") || (n.starts_with("TaskQ-") && n.ends_with(".xml"))
     };
     let gone = |p: &Path| {
@@ -567,7 +567,9 @@ mod tests {
         fs::create_dir_all(root.join(".taskq")).unwrap();
         // a project service still on 4.0.5 with a live child: its release stays (A3)
         fs::write(root.join(".taskq/status.json"), r#"{"version": "4.0.5", "kids": [{"task": 1}]}"#).unwrap();
+        let host_files = ["host.json", "host-policy.lock", "projects.lock", "service.lock", "service.json", "drain", "poke", "restart", "rollback-floor", "TaskQ.xml", "hold", "admission.json", "admission.lock"];
         let files = ["current", "previous", "token", "taskq", "taskq.log", "taskq.log.tmp", "proj.log", "tray", "tray.json", "TaskQ-proj.xml", "worker-policy.json", ".freshness.json", "current.json", "mac-scheduled-pass.py"];
+        for f in host_files { fs::write(install.join(f), "invented host cache").unwrap(); }
         for f in files {
             fs::write(install.join(f), "").unwrap();
         }
@@ -589,7 +591,11 @@ mod tests {
         want.sort();
         want.dedup();
         assert_eq!(ls(&install.join("releases")), want);
-        assert_eq!(ls(&install), ["TaskQ-proj.xml", "capacity", "current", "previous", "proj.log", "projects", "releases", "resources", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json", "windows-native", "worker-policy.json"]);
+        let mut expected = vec!["TaskQ-proj.xml", "capacity", "current", "previous", "proj.log", "projects", "releases", "resources", "service", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json", "windows-native", "worker-policy.json"];
+        expected.extend(host_files); expected.sort();
+        assert_eq!(ls(&install), expected);
+        assert_eq!(crate::admission::hold(&install).as_deref(), Some("invented host cache"), "update cleanup must never release an emergency hold");
+        assert!(install.join("service/x").is_dir(), "R1: even a malformed host pid cache stays for inspection");
         assert_eq!(fs::read_to_string(install.join("windows-native/state/cap_sid")).unwrap(), "native control state");
         assert!(!shim.exists() && other.exists(), "only the v3 shim of this install goes");
         // § 4 Data: a corrupt status.json leaves the project's version unknown, so every release stays and so does the file

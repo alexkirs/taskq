@@ -74,3 +74,19 @@ dragEvents.pointermove({screenX:30,screenY:25});dragEvents.lostpointercapture();
 assert.equal(vm.runInContext('resizing',drag),null);assert.equal(dragMessages.filter(m=>m.a==='resize-end').length,1);
 assert.equal(drag.manualSize[0],340);assert.equal(drag.manualSize[1],415);
 console.log('PASS M13 capture loss releases the resize guard once and preserves chosen dimensions');
+
+// Chain: § 5 host maintenance -> named-project confirmation -> one host op. Risk: a project button silently stops every project.
+const hostView={document:{activeElement:{dataset:{a:'host-apply'}}},S:{projects:[{name:'alpha'},{name:'beta'}]},hostAction:{a:'stop',root:'/alpha'},resizing:null,
+  menu:{innerHTML:'',querySelector:s=>({focus(){hostView.focused=s;}})},esc:s=>String(s),fit(){},sent:[],send(a){this.sent.push(a);}};
+vm.createContext(hostView);
+vm.runInContext(html.slice(html.indexOf('function render('),html.indexOf('// a bounded block shows whole lines')),hostView);
+vm.runInContext('render()',hostView);
+assert.equal(hostView.focused,'[data-a="host-apply"]','a refresh preserves keyboard focus on Confirm');
+assert(hostView.menu.innerHTML.includes('alpha')&&hostView.menu.innerHTML.includes('beta'));
+assert(hostView.menu.innerHTML.includes('next logon')&&hostView.menu.innerHTML.includes('host-cancel'));
+vm.runInContext('function event(d){'+html.slice(html.indexOf("  if(d.a==='restart'||d.a==='stop')"),html.indexOf("  if(d.a==='ai-confirm')"))+'}',hostView);
+hostView.send=a=>hostView.sent.push(a);hostView.render=()=>{};
+vm.runInContext("event({a:'host-cancel'})",hostView);assert.equal(hostView.sent.length,0);
+vm.runInContext("event({a:'restart',root:'/alpha'})",hostView);assert.equal(hostView.sent.length,0);
+vm.runInContext("event({a:'host-apply'})",hostView);assert.equal(hostView.sent.length,1);assert.equal(hostView.sent[0].a,'restart');
+console.log('PASS host restart/stop names every project, Cancel sends nothing, Confirm sends one op');

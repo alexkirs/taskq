@@ -534,6 +534,11 @@ impl<'a> Service<'a> {
         if let Some(host) = &self.host { if let Ok(mut h) = host.lock() { h.ready(&self.cfg.root, false); } }
     }
 
+    /// § 8.5: a held claim/resume owns a lease even without a running process.
+    pub fn idle(&self) -> bool {
+        self.kids.is_empty() && self.held.is_empty() && self.pending.is_empty() && self.reserved.is_empty()
+    }
+
     /// Liveness/handoff monitoring remains available if the reduced board loop fails; it never renews a lease.
     pub fn reap_owned(&mut self) {
         self.kids.retain_mut(|k| match k.proc.exited() {
@@ -1820,6 +1825,19 @@ mod tests {
         assert_eq!(writes, 30, "one write per 2 passes at poll 60, ttl 300; was 60 at ttl / 5");
     }
 
+    // Chain: § 8.5 host drain -> pending lease -> child exit -> idle. Risk: no child mistaken for no attempt.
+    #[test]
+    fn host_drain_waits_for_pending_leases() {
+        let b = Fake::default(); let c = cfg("mac");
+        let mut s = service(&b, &c, Default::default());
+        assert!(s.idle());
+        s.pending.insert((7, 41)); assert!(!s.idle());
+        s.pending.clear(); s.reserved.push((7, 41, "claude".into())); assert!(!s.idle());
+        s.reserved.clear();
+        s.kids.push(Kid { task: 7, attempt: 41, rt: "claude".into(), proc: Box::new(FakeProc(Rc::new(RefCell::new(None)))) });
+        assert!(!s.idle()); s.kids.clear(); assert!(s.idle());
+    }
+
     // Chain: R2 § 3 two hosts one attempt. Risk: two attempts run, or a dead host blocks the task.
     #[test]
     fn two_hosts_admit_one_attempt_and_the_survivor_recovers_a_dead_host() {
@@ -2411,7 +2429,11 @@ mod tests {
         assert!(core::depends("Depends on dashq#36").iter().all(|d| d.repo.is_some()));
         let held = b.create("H", "Depends on dashq#36", &["q-held".into()]).unwrap();
         assert!(!is_task(&b.issue(held).unwrap()) && is_held(&b.issue(held).unwrap()));
-        let c = cfg("mac");
+        let mut c = cfg("mac");
+        // A shared absolute path may contain real profile records on the test host.
+        c.root = std::env::temp_dir().join(format!("taskq-cross-board-{}", crate::runtime::uuid()));
+        c.install = c.root.clone();
+        std::fs::create_dir_all(&c.root).unwrap();
         let raw = json!({});
         let report = || crate::snapshot::read(&b, &c, &raw, &[]).text(&c, &raw).unwrap();
         let mut s = service(&b, &c, Default::default());
@@ -2430,6 +2452,8 @@ mod tests {
         s.pass().unwrap();
         assert_eq!(task(&b, n).state, State::Doing, "eligible within one pass after the blocker completed");
         assert_eq!(b.state.borrow().reads, 1, "closed dependencies already read are cached: only dashq#36 read again");
+        drop(s);
+        std::fs::remove_dir_all(&c.root).unwrap();
     }
 
     // Chain: § 3 priority order. Risk: legacy priority labels order or filter wrong.

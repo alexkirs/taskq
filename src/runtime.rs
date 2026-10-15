@@ -543,6 +543,18 @@ pub fn compact(root: &Path, role: &str, task: u64, attempt: u64) -> Result<Strin
     Ok(text)
 }
 
+/// § 8 Rule delivery to a PM session: the project's SessionStart hook prints the worker start rules, or header and index
+/// after compaction (`phase` `compact`).
+pub fn pm(root: &Path, phase: &str) -> Result<String, StartError> {
+    pm_rules(root, phase, rule_file)
+}
+
+fn pm_rules(root: &Path, phase: &str, fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
+    let text = rules(root, phase == "compact", fetch)?;
+    log!("specq@{SPECQ_REVISION} loaded for pm ({phase}, {} bytes)", text.len());
+    Ok(text)
+}
+
 /// `--settings` for a Claude turn: a SessionStart hook that re-sends the rules after compaction.
 fn compact_settings(root: &Path, l: &Launch) -> String {
     let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
@@ -1281,6 +1293,27 @@ mod tests {
         let log = std::fs::read_to_string(attempt_log(&root, "worker", 7, 42)).unwrap();
         let v: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
         assert_eq!((v["phase"].as_str(), v["bodies"].as_u64(), v["bytes"].as_u64()), (Some("compact"), Some(0), Some(text.len() as u64)));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Chain: § 8 rule delivery to a PM session, #1219. Risk: the PM hook gets other rules than a worker at the same pin,
+    // compaction resends the bodies, or the committed hook names a local path or misses start/compact.
+    #[test]
+    fn pm_hook_gets_the_worker_start_rules() {
+        let root = rules_root("pm");
+        let env = Env { root: &root, exe: Path::new("/i/taskq"), install: Path::new("/i"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
+        let l = Launch { task: 7, title: "T".into(), attempt: 42, role: "worker".into(), rt: "claude".into(), session: "s".into(), url: "https://b/7".into(), resume: None };
+        let start = turn_text(&env, &l, rule).unwrap();
+        assert_eq!(pm_rules(&root, "start", rule).unwrap(), start.split("\nTaskQ task\n").next().unwrap());
+        assert_eq!(pm_rules(&root, "compact", rule).unwrap(), rules(&root, true, rule).unwrap());
+        // the committed project hook: start on startup and clear, compact on compaction, no local path or secret
+        let settings: serde_json::Value = serde_json::from_str(include_str!("../.claude/settings.json")).unwrap();
+        let hooks = settings["hooks"]["SessionStart"].as_array().unwrap();
+        for (matcher, phase) in [("startup|clear", "start"), ("compact", "compact")] {
+            let cmd = hooks.iter().find(|h| h["matcher"] == matcher).unwrap()["hooks"][0]["command"].as_str().unwrap();
+            assert!(cmd.ends_with(&format!(" rules pm {phase}")) && cmd.contains("$CLAUDE_PROJECT_DIR"), "{cmd}");
+            assert!(!cmd.contains("/Users/") && !cmd.contains("token"), "{cmd}");
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 

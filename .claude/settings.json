@@ -1,3 +1,9 @@
 {
-  "autoCompactWindow": 200000
+  "autoCompactWindow": 200000,
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "startup|clear", "hooks": [{"type": "command", "command": "t=\"$HOME/.local/share/taskq/taskq\"; [ -x \"$t\" ] || t=taskq; cd \"$CLAUDE_PROJECT_DIR\" && \"$t\" rules pm start"}]},
+      {"matcher": "compact", "hooks": [{"type": "command", "command": "t=\"$HOME/.local/share/taskq/taskq\"; [ -x \"$t\" ] || t=taskq; cd \"$CLAUDE_PROJECT_DIR\" && \"$t\" rules pm compact"}]}
+    ]
+  }
 }

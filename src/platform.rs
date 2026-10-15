@@ -82,7 +82,15 @@ pub fn error_text(msg: &str, root: Option<&Path>) -> String {
 /// § 8 update steps (coreq), then the sweep: Ok(Some(version)) when a new release became current; with `check`, when
 /// one is available.
 pub fn update(install: &Path, check: bool) -> Result<Option<String>, String> {
+    let _lock = update_lock(install)?;
     crate::profile::measure("update", || update_inner(install, check))
+}
+
+fn update_lock(install: &Path) -> Result<fs::File, String> {
+    fs::create_dir_all(install).map_err(|e| e.to_string())?;
+    let f = fs::OpenOptions::new().create(true).truncate(false).write(true).open(install.join("update.lock")).map_err(|e| e.to_string())?;
+    f.try_lock().map_err(|e| format!("update busy or lock unavailable: {e}"))?;
+    Ok(f)
 }
 
 fn update_inner(install: &Path, check: bool) -> Result<Option<String>, String> {
@@ -237,7 +245,7 @@ pub fn sweep(install: &Path, shim: &Path) {
         }
     }
     let owned = |n: &str| {
-        ["releases", "current", "previous", "projects", "token", "installation-id", "connection", "taskq", "taskq.exe", "WebView2Loader.dll", "taskq-tray.exe", "TaskQ.app", "capacity", "resources", "windows-native", crate::policy::FILE, "taskq-profile.lock", "hold", "admission.json", "admission.lock"].contains(&n)
+        ["releases", "current", "previous", "projects", "token", "installation-id", "connection", "taskq", "taskq.exe", "WebView2Loader.dll", "taskq-tray.exe", "TaskQ.app", "capacity", "resources", "windows-native", crate::policy::FILE, "taskq-profile.lock", "hold", "admission.json", "admission.lock", "update.lock"].contains(&n)
             || n.ends_with(".log") || n.ends_with(".tmp") || n.starts_with("tray") || (n.starts_with("TaskQ-") && n.ends_with(".xml"))
     };
     let gone = |p: &Path| {
@@ -552,6 +560,21 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // Chain: CLI/service update ownership -> cleanup -> the same metadata and activation lock stays exclusive.
+    #[test]
+    fn updates_share_one_lock_through_cleanup_and_release_it() {
+        let install = std::env::temp_dir().join(format!("taskq-update-lock-{}", crate::runtime::uuid()));
+        let lock = update_lock(&install).unwrap();
+        assert!(update_lock(&install).is_err(), "a competing updater must return without blocking service heartbeats");
+        sweep(&install, &install.join("absent-shim"));
+        let other = fs::OpenOptions::new().write(true).open(install.join("update.lock")).unwrap();
+        assert!(other.try_lock().is_err(), "cleanup must not unlink the live update lock");
+        drop(lock);
+        other.try_lock().unwrap();
+        drop(other);
+        fs::remove_dir_all(install).unwrap();
+    }
+
     // Chain: § 8 install sweep. Risk: sweep deletes a live release or owned file.
     #[test]
     fn sweep_keeps_the_allowlist_and_live_releases() {
@@ -567,7 +590,7 @@ mod tests {
         fs::create_dir_all(root.join(".taskq")).unwrap();
         // a project service still on 4.0.5 with a live child: its release stays (A3)
         fs::write(root.join(".taskq/status.json"), r#"{"version": "4.0.5", "kids": [{"task": 1}]}"#).unwrap();
-        let files = ["current", "previous", "token", "taskq", "taskq.log", "taskq.log.tmp", "proj.log", "tray", "tray.json", "TaskQ-proj.xml", "worker-policy.json", "hold", "admission.json", "admission.lock", ".freshness.json", "current.json", "mac-scheduled-pass.py"];
+        let files = ["current", "previous", "token", "taskq", "taskq.log", "taskq.log.tmp", "proj.log", "tray", "tray.json", "TaskQ-proj.xml", "worker-policy.json", "hold", "admission.json", "admission.lock", "update.lock", ".freshness.json", "current.json", "mac-scheduled-pass.py"];
         for f in files {
             fs::write(install.join(f), "").unwrap();
         }
@@ -590,7 +613,7 @@ mod tests {
         want.sort();
         want.dedup();
         assert_eq!(ls(&install.join("releases")), want);
-        assert_eq!(ls(&install), ["TaskQ-proj.xml", "admission.json", "admission.lock", "capacity", "current", "hold", "previous", "proj.log", "projects", "releases", "resources", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json", "windows-native", "worker-policy.json"]);
+        assert_eq!(ls(&install), ["TaskQ-proj.xml", "admission.json", "admission.lock", "capacity", "current", "hold", "previous", "proj.log", "projects", "releases", "resources", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json", "update.lock", "windows-native", "worker-policy.json"]);
         assert_eq!(crate::admission::hold(&install).as_deref(), Some("invented incident hold"), "update cleanup must never release an emergency hold");
         assert_eq!(fs::read_to_string(install.join("windows-native/state/cap_sid")).unwrap(), "native control state");
         assert!(!shim.exists() && other.exists(), "only the v3 shim of this install goes");

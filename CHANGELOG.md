@@ -7,7 +7,7 @@ there is no migration code. Releases without a **Board** section need nothing.
 
 Worker and reviewer briefs park unchanged external blockers with the failed check and one unblock condition. Resume only after evidence that the condition passed; repeated attempts are not recovery. No board format change.
 
-Installation cleanup preserves the emergency hold and admission store/lock. Older versions delete these during an update: pause every registered project before updating from v4.4.3 or earlier, retain the hold outside the install, and verify it after updating. Resume remains an owner action.
+CLI and service updates serialize under one install lock, preventing concurrent metadata/activation changes. Installation cleanup preserves this lock, the emergency hold and admission store/lock. Older versions delete these during an update: pause every registered project before updating from v4.4.3 or earlier, retain the hold outside the install, and verify it after updating. Resume remains an owner action.
 
 ## v4.4.0
 

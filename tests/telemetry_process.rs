@@ -36,7 +36,7 @@ fn selftest_requires_committed_local_capture() {
     let blocked=root.join("blocked");fs::write(&blocked,"fixture").unwrap();
     let invoke=|install: &std::path::Path,command: &str| Command::new(env!("CARGO_BIN_EXE_taskq"))
         .arg(command).current_dir(&root).env("TASKQ_INSTALL",install).env("TASKQ_ROOT",&root)
-        .env("TASKQ_SELFTEST_OFFLINE","1").env("TASKQ_INCIDENT_REPORTS","off").output().unwrap();
+        .env("TASKQ_SELFTEST_OFFLINE","1").env("TASKQ_INCIDENT_REPORTS","off").env("COREQ_TELEMETRY_STORE_TRACE","1").output().unwrap();
     let help=invoke(&blocked,"help");assert!(help.status.success(),"ordinary help outcome changed");
     let failed=invoke(&blocked,"selftest");
     assert!(!failed.status.success(),"selftest accepted unavailable capture: {}",String::from_utf8_lossy(&failed.stdout));
@@ -44,7 +44,8 @@ fn selftest_requires_committed_local_capture() {
     assert!(!String::from_utf8_lossy(&failed.stdout).contains("telemetry: local capture committed"));
     assert_eq!(fs::read_to_string(&blocked).unwrap(),"fixture");
     let good=root.join("good");let success=invoke(&good,"selftest");
-    assert!(success.status.success(),"{}",String::from_utf8_lossy(&success.stderr));
+    let detail=fs::read_to_string(root.join(".taskq/cli-errors.log")).unwrap_or_default();
+    assert!(success.status.success(),"{}\n{}",String::from_utf8_lossy(&success.stderr),detail.chars().take(4096).collect::<String>());
     assert!(String::from_utf8_lossy(&success.stdout).contains("telemetry: local capture committed"));
     let store=coreq::telemetry::Store::open(&good.join("telemetry.log/universal.sqlite3")).unwrap();
     assert!(!store.export(0,0,1024).unwrap()["events"].as_array().unwrap().is_empty());

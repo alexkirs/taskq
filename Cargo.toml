@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-coreq = { git = "https://github.com/taskqorg/coreq", rev = "0e6010aeb5faf227f788ab551b303f7ec5d95278" }
+coreq = { git = "https://github.com/taskqorg/coreq", rev = "ad0d1f951659ac6f8f11d61f35758271efa5c25f" }
 tracing = "0.1"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -46,7 +46,7 @@ strip = true
 lto = true
 
 [build-dependencies]
-coreq-instrument = { git = "https://github.com/taskqorg/coreq", rev = "0e6010aeb5faf227f788ab551b303f7ec5d95278" }
+coreq-instrument = { git = "https://github.com/taskqorg/coreq", rev = "ad0d1f951659ac6f8f11d61f35758271efa5c25f" }
 
 [[bin]]
 name = "taskq"

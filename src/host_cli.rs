@@ -128,8 +128,8 @@ pub fn lifecycle(install: &Path, sub: &str, root: Option<&Path>, all: bool) -> R
             register(install, root, true)?;
             // Explicit install ends an earlier completed or interrupted lifecycle drain.
             if install.join("drain").exists() { fs::remove_file(install.join("drain")).map_err(|e| e.to_string())?; }
-            let changed = match fs::read_to_string(&u.path) {
-                Ok(t) => t != u.text,
+            let changed = match fs::read(&u.path) {
+                Ok(bytes) => bytes != unit_bytes(&u.text),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
                 Err(e) => return Err(format!("host unit unknown: {e}")),
             };
@@ -139,6 +139,11 @@ pub fn lifecycle(install: &Path, sub: &str, root: Option<&Path>, all: bool) -> R
                     println!("Registered; host unit reload deferred until children end");
                     return Ok(());
                 }
+            } else if unit_reload_pending(install)? {
+                platform::write_atomic(&install.join("restart"), "unit\n")?;
+                platform::write_atomic(&install.join("poke"), "")?;
+                println!("Registered; host unit reload deferred until children end");
+                return Ok(());
             } else if pid(install)?.is_none() { platform::run_all(&u.load, false)?; }
             platform::write_atomic(&install.join("poke"), "")?;
             for _ in 0..20 {
@@ -171,6 +176,93 @@ pub fn lifecycle(install: &Path, sub: &str, root: Option<&Path>, all: bool) -> R
         _ => return Err("unknown host lifecycle command".into()),
     }
     Ok(())
+}
+
+// Match coreq's on-disk encoding without interpreting a UTF-16 XML file as UTF-8.
+fn unit_bytes(text: &str) -> Vec<u8> {
+    if cfg!(windows) {
+        std::iter::once(0xFEFFu16).chain(text.encode_utf16()).flat_map(u16::to_le_bytes).collect()
+    } else { text.as_bytes().to_vec() }
+}
+
+pub fn unit_reload_pending(install: &Path) -> Res<bool> {
+    match fs::read_to_string(install.join("restart")) {
+        Ok(s) => match s.trim() {
+            "" => Ok(false), "unit" => Ok(true),
+            _ => Err("host restart request unknown; request retained".into()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("host restart request unknown: {e}")),
+    }
+}
+
+/// Native managers own the helper, so stopping the host cannot stop its reloader.
+pub fn dispatch_unit_reload(install: &Path) -> Res<()> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?.display().to_string();
+    #[cfg(windows)]
+    let cmd = {
+        let line = format!("\"{exe}\" service reload-unit").replace('\'', "''");
+        vec!["powershell.exe".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
+            format!("$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{line}';CurrentDirectory='{}'}}; if ($r.ReturnValue -ne 0) {{ exit 1 }}", install.display().to_string().replace('\'', "''"))]
+    };
+    #[cfg(target_os = "macos")]
+    let cmd = {
+        // A completed submit job keeps its label; an explicit retry replaces that job.
+        platform::run_all(&[vec!["launchctl".into(), "remove".into(), "com.taskq.unit-reload".into()]], true)?;
+        vec!["launchctl".into(), "submit".into(), "-l".into(), "com.taskq.unit-reload".into(), "--".into(), exe, "service".into(), "reload-unit".into()]
+    };
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let cmd = vec!["systemd-run".into(), "--user".into(), "--collect".into(), "--unit=taskq-unit-reload".into(), exe, "service".into(), "reload-unit".into()];
+    let _ = install;
+    platform::run_all(&[cmd], false)
+}
+
+/// Internal helper: failure leaves the request and drain intact for a repeated install.
+pub fn reload_unit(install: &Path) -> Res<()> {
+    let u = platform::unit(&platform::tool(install), install, "");
+    reload_unit_with(install, &u, unit_loaded)
+}
+
+fn reload_unit_with(install: &Path, u: &platform::Unit, verify: impl Fn() -> Res<()>) -> Res<()> {
+    let _op = lock(install, "service.lock")?;
+    if !unit_reload_pending(install)? { return Ok(()); }
+    let p = wait_idle(install)?;
+    stop_idle(install, u, p)?;
+    platform::run_all(&u.unload, true)?;
+    // Admission stays disabled until native registration and the new process read back.
+    platform::run_all(&u.load, false)?;
+    verify()?;
+    for _ in 0..30 {
+        if let Ok(v) = snapshot(install) {
+            if reloaded(&v, p) {
+                fs::remove_file(install.join("restart")).map_err(|e| e.to_string())?;
+                fs::remove_file(install.join("drain")).map_err(|e| e.to_string())?;
+                platform::write_atomic(&install.join("poke"), "")?;
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Err("host unit reloaded; new host ownership unknown, drain retained".into())
+}
+
+fn reloaded(v: &Value, previous: Option<u32>) -> bool {
+    v["pid"].as_u64().is_some_and(|pid| pid > 0 && Some(pid) != previous.map(u64::from))
+        && v["drain"] == true && v["idle"] == true && v["reason"].is_null()
+}
+
+fn unit_loaded() -> Res<()> {
+    #[cfg(windows)]
+    let cmd = vec!["schtasks".into(), "/Query".into(), "/TN".into(), "TaskQ".into(), "/XML".into()];
+    #[cfg(target_os = "macos")]
+    let cmd = {
+        let id = platform::quiet(std::process::Command::new("id").arg("-u")).output().map_err(|e| e.to_string())?;
+        if !id.status.success() { return Err("host unit readback: user unknown".into()); }
+        vec!["launchctl".into(), "print".into(), format!("gui/{}/com.taskq.service", String::from_utf8_lossy(&id.stdout).trim())]
+    };
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let cmd = vec!["systemctl".into(), "--user".into(), "is-active".into(), "taskq.service".into()];
+    platform::run_all(&[cmd], false)
 }
 
 /// Registry and exact process readbacks precede every destructive host-unit action.
@@ -318,6 +410,63 @@ mod tests {
         assert!(!drained(&v, 43));
         v["idle"] = json!(false); assert!(!drained(&v, 42));
         v["idle"] = json!(true); v["reason"] = json!("liveness unknown"); assert!(!drained(&v, 42));
+    }
+    // Chain: repeat install -> encoded unit comparison -> deferred reload -> new drained owner acknowledgement.
+    #[test]
+    fn native_unit_encoding_and_reload_acknowledgement() {
+        let install = std::env::temp_dir().join(format!("taskq-unit-reload-{}", std::process::id()));
+        fs::create_dir_all(&install).unwrap();
+        let u = platform::Unit { path: install.join("unit"), text: "unit: café".into(), load: vec![], unload: vec![], stop: vec![] };
+        platform::write_unit(&u).unwrap();
+        assert_eq!(fs::read(&u.path).unwrap(), unit_bytes(&u.text));
+        assert!(!unit_reload_pending(&install).unwrap());
+        fs::write(install.join("restart"), "unit\n").unwrap();
+        assert!(unit_reload_pending(&install).unwrap());
+        fs::write(install.join("restart"), "unknown\n").unwrap();
+        assert!(unit_reload_pending(&install).is_err(), "unknown requests must be retained");
+        fs::write(install.join("restart"), [0xff]).unwrap();
+        assert!(unit_reload_pending(&install).is_err(), "unreadable request must not become a plain restart");
+        let mut v = json!({"pid":42,"drain":true,"idle":true,"reason":null});
+        assert!(!reloaded(&v, Some(42)), "the old process cannot acknowledge a native reload");
+        v["pid"] = json!(43); assert!(reloaded(&v, Some(42)));
+        v["idle"] = json!(false); assert!(!reloaded(&v, Some(42)));
+        v["idle"] = json!(true); v["reason"] = json!("unknown"); assert!(!reloaded(&v, Some(42)));
+        v["reason"] = json!(null); v["pid"] = json!(null); assert!(!reloaded(&v, Some(42)));
+        fs::remove_dir_all(install).unwrap();
+    }
+    // Chain: deferred native reload -> unload/load commands -> registration and new ownership -> clear request.
+    #[test]
+    fn deferred_reload_keeps_requests_until_native_and_process_readback() {
+        fn copy(from: &Path, to: &Path) -> Vec<String> {
+            #[cfg(windows)]
+            let mut cmd: Vec<String> = ["cmd.exe", "/d", "/c", "copy", "/Y"].map(Into::into).into();
+            #[cfg(not(windows))]
+            let mut cmd = vec!["cp".into()];
+            cmd.extend([from.display().to_string(), to.display().to_string()]); cmd
+        }
+        for verified in [false, true] {
+            let install = std::env::temp_dir().join(format!("taskq-reload-chain-{}-{verified}", std::process::id()));
+            fs::create_dir_all(&install).unwrap();
+            fs::write(install.join("projects"), "").unwrap();
+            fs::write(install.join("restart"), "unit\n").unwrap();
+            fs::write(install.join("service.json"), r#"{"drain":true,"idle":true,"reason":null}"#).unwrap();
+            fs::write(install.join("new-pid"), std::process::id().to_string()).unwrap();
+            fs::write(install.join("new-status"), json!({"pid":std::process::id(),"projects":[],"used":{},"drain":true,"idle":true,"reason":null}).to_string()).unwrap();
+            fs::write(install.join("unloaded"), "unloaded").unwrap();
+            let u = platform::Unit { path: install.join("unit"), text:String::new(), stop:vec![],
+                unload:vec![copy(&install.join("unloaded"), &install.join("unit"))],
+                load:vec![copy(&install.join("new-pid"), &install.join("service")), copy(&install.join("new-status"), &install.join("service.json"))] };
+            let result = reload_unit_with(&install, &u, || {
+                assert_eq!(fs::read_to_string(&u.path).unwrap(), "unloaded");
+                assert!(install.join("drain").exists() && install.join("restart").exists());
+                if verified { Ok(()) } else { Err("native registration unknown".into()) }
+            });
+            assert_eq!(result.is_ok(), verified);
+            assert_eq!(install.join("restart").exists(), !verified);
+            assert_eq!(install.join("drain").exists(), !verified);
+            assert_eq!(fs::read_to_string(install.join("projects")).unwrap(), "");
+            fs::remove_dir_all(install).unwrap();
+        }
     }
     // Chain: § 5 host policy -> project cap. Reject raised ceilings and project gate edits without dropping unknown keys.
     #[test]

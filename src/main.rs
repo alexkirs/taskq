@@ -1316,7 +1316,7 @@ fn handover(root: &Path) -> bool {
 fn load_unit(u: &platform::Unit, root: &Path) -> Res<bool> {
     if root.join("projects").exists() {
         if handover(root) {
-            platform::write_atomic(&root.join("restart"), "")?;
+            platform::write_atomic(&root.join("restart"), "unit\n")?;
             platform::write_atomic(&root.join("poke"), "")?;
             return Ok(true);
         }
@@ -1461,6 +1461,7 @@ fn service(args: &Args) -> Res<()> {
         return Ok(());
     }
     let install = platform::default_install();
+    if sub == "reload-unit" { return host_cli::reload_unit(&install); }
     if sub == "capacity" { return host_cli::capacity(&install, args); }
     if sub == "status" { return host_cli::status(&install); }
     if matches!(sub, "install" | "uninstall" | "stop" | "restart") {

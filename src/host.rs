@@ -258,6 +258,7 @@ pub fn run(install: &Path) -> Res<()> {
     let mut roots = vec![];
     let mut stopped = BTreeSet::new();
     let mut checked: Option<Instant> = None;
+    let mut reload_dispatched = None;
     let began = Instant::now();
     let mut hour = (Instant::now(), crate::requests::totals());
     let mut tray = None;
@@ -367,6 +368,15 @@ pub fn run(install: &Path) -> Res<()> {
             for root in &roots { crate::touch(&crate::dot(root).join("poke")); }
             if h.busy.keys().all(|r| h.prepared.contains(r)) {
                 drop(h);
+                if crate::host_cli::unit_reload_pending(install)? {
+                    let revision = fs::metadata(install.join("restart")).and_then(|m| m.modified()).map_err(|e| e.to_string())?;
+                    if reload_dispatched != Some(revision) && !drain {
+                        crate::host_cli::dispatch_unit_reload(install)?;
+                        reload_dispatched = Some(revision);
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
                 let _ = fs::remove_file(install.join("restart"));
                 for root in &roots { let _ = fs::remove_file(crate::dot(root).join("restart")); }
                 #[cfg(unix)] {

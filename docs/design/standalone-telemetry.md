@@ -15,9 +15,17 @@ Facts on main at #1188 (shipped):
 
 Measured on the Windows host on 2026-10-15: `taskq.log` held 2.1 MB over 21.5 h. Of about 21,200 records, 20,450 were `taskq-profile` operation lines (mostly `forge.call`); stages were 30, board operations 498, transitions 18. At the 4 MiB bound, a busy host keeps about 1–2 days. A question about the past week reads mostly pruned history.
 
-## Choices
+## Accepted storage change
 
-| Choice | Options and trade-offs | Recommendation |
+Owner selected SQLite/WAL for local telemetry. This replaces choice C below; that comparison is historical design context, not the implementation target. SQLite runs inside the product process, with a bundled library on all supported platforms and no server. Keep the existing record definitions, always-on instrumentation and analysis/export commands; JSONL remains the export format. Task state remains on the board (R1).
+
+Retention: 30 days / 64 MiB; name and enforce database, WAL and temporary-space bounds in the implementation plan. Reuse the existing service for pruning. Set durability and busy timeouts per [shared data](https://github.com/taskqorg/specq/blob/main/engineering/data.md). An unavailable, full, corrupt or unsupported store reads unknown; instrumentation must preserve the operation. Never reset a corrupt database silently.
+
+Before implementation, map all record writers, readers, pruners and legacy-process overlap. Migration preserves retained history and is idempotent, with transactional checkpoints and explicit coverage gaps; rollback preserves readable history. Verify crash/restart, failed writes, corruption, contention, retention, migration retry and old/new reader/writer transitions. Do not delete legacy history as an implicit migration step. This is an accepted target; the shipped log path below remains until the SQLite implementation is qualified.
+
+## Historical comparison
+
+| Choice | Options and trade-offs | Original recommendation |
 |---|---|---|
 | Store and retention | A. Keep `taskq.log` at 4 MiB: no code, but about 1–2 days on a busy host, no named window, and text lines compete with records. B. Raise the shared bound (for example 32 MiB): small change, still no window, and the text log grows with it. C. Own profile store: daily JSON-lines files `<install>/profile/<UTC date>.jsonl`, 30 days and 64 MiB, the pruner removes the oldest whole day: a named window per [specq profiling](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md#analysis-export), `--since` reads only the needed files; costs a migration of the readers and the pruner. D. SQLite: the specq default for state, but these are append-only records; adds a native dependency on three OS for no query the views need. | C. Same lock and record lines as today; `taskq.log` keeps service text. At the measured rate (about 1.7 MB a day) 30 days fit the bound; the export header states the retained window. |
 | Data path | A. Each consumer reads `taskq.log` itself: couples DashQ, serverq and agents to the log format. B. `taskq profile export` is the one data path; reports, agents, DashQ and a future serverq upload read its JSON lines. | B. The export schema is versioned (`schema` 1); a new column is a new schema version. Reports stay derived views, never a second source of truth. |
@@ -39,7 +47,7 @@ Each gap is a named follow-up, not part of this task. Numbers are stable.
 | G2 | No per-attempt view, and no attempt elapsed time: stages overlap, so summed `us` is not elapsed time, and a span from the rows' end times (`at_ms`) minus durations also counts idle time between stages. | `taskq profile attempts [--since]`: `Project`, `Task`, `Attempt`, `Runtime`, `Coverage` (`complete` or the missing stages), `Elapsed s` (first stage start to last stage end; unknown unless coverage is complete and every row has `us` and `at_ms`), one `<stage> s` column per stage, `Model calls`, `Context tokens`, `Outcome`, from export rows. |
 | G3 | Money cost: stage records hold context tokens (input, cache included) and calls, not model id, output tokens or a cache split. | Record `model` and output tokens per stage (new export schema); prices only from owner-supplied config; otherwise cost reads unknown. |
 | G4 | Context by source (brief, embedded rules, files, tool output) is not recorded. | Read it from the runtime's own accounting, or agentq's when installed, without a second collector; needs its own design. |
-| G5 | Retention: 4 MiB shared bound, no named window. | Store choice C above; § 4 Data names the window and bound. |
+| G5 | Retention: 4 MiB shared bound, no named window. | Accepted SQLite/WAL store above; 30 days / 64 MiB. |
 | G6 | Guide command implemented in this change. | Offline embedded analysis guide, named by the operator brief. |
 | G7 | Stage rows carry no host (the log's own host), so merged exports from several hosts lose attribution. | Add `host` to stage records, or the export fills it from the install's host name. |
 

@@ -67,7 +67,7 @@ Inherit [specq engineering rules](https://github.com/taskqorg/specq/tree/main/en
 ## Product
 Owner decisions on looks and sound, one line each. Change one only per R13.
 - Design targets: the [design index](docs/design/README.md) lists every target page. Targets do not amend runtime rules, defaults or lifecycle until implemented and verified (R8, R12, R13); design approval does not change running policy.
-- Standalone targets: [agentq onboarding](docs/design/standalone-onboarding.md) and [telemetry](docs/design/standalone-telemetry.md): § 4 records stay on the host, 30 days in their own store, unless a serverq connection sends them; `taskq profile export` feeds reports, agents, DashQ and serverq; `taskq profile guide` guides agents.
+- Standalone: [onboarding](docs/design/standalone-onboarding.md); [telemetry](docs/design/standalone-telemetry.md) uses local SQLite/WAL, 30 days / 64 MiB. Remote export is optional. `taskq profile export` feeds analysis; `taskq profile guide` guides agents. Migration preserves legacy history; the board stays task truth (R1).
 - README is the whole page: header, setup phrase, one sentence, what you get, screenshots, use cases, one link to taskq.md, release checksum and provenance verification, license, donate.
 - Header: `docs/header.webp` with the caption `Agents working.` stays at the top, verbatim.
 - Setup phrase: one `text` block, verbatim `Install taskq from https://github.com/taskqorg/taskq and set it up for this project.`; new-project variant beside it.

@@ -5,7 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-coreq = { git = "https://github.com/taskqorg/coreq", tag = "v0.11.0" }
+coreq = { git = "https://github.com/taskqorg/coreq", rev = "0e6010aeb5faf227f788ab551b303f7ec5d95278" }
+tracing = "0.1"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -43,3 +44,10 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gd
 [profile.release]
 strip = true
 lto = true
+
+[build-dependencies]
+coreq-instrument = { git = "https://github.com/taskqorg/coreq", rev = "0e6010aeb5faf227f788ab551b303f7ec5d95278" }
+
+[[bin]]
+name = "taskq"
+path = "src/entry.rs"

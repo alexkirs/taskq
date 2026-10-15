@@ -86,11 +86,9 @@ pub fn update(install: &Path, check: bool) -> Result<Option<String>, String> {
     crate::profile::measure("update", || update_inner(install, check))
 }
 
-fn update_lock(install: &Path) -> Result<fs::File, String> {
+fn update_lock(install: &Path) -> Result<coreq::file_lock::Lock, String> {
     fs::create_dir_all(install).map_err(|e| e.to_string())?;
-    let f = fs::OpenOptions::new().create(true).truncate(false).write(true).open(install.join("update.lock")).map_err(|e| e.to_string())?;
-    f.try_lock().map_err(|e| format!("update busy or lock unavailable: {e}"))?;
-    Ok(f)
+    coreq::file_lock::try_lock(&install.join("update.lock")).map_err(|e| format!("update busy or lock unavailable: {e}"))
 }
 
 fn update_inner(install: &Path, check: bool) -> Result<Option<String>, String> {
@@ -569,8 +567,18 @@ mod tests {
         sweep(&install, &install.join("absent-shim"));
         let other = fs::OpenOptions::new().write(true).open(install.join("update.lock")).unwrap();
         assert!(other.try_lock().is_err(), "cleanup must not unlink the live update lock");
+        #[cfg(unix)]
+        let inherited = unsafe { libc::fork() };
+        #[cfg(unix)]
+        {
+            assert!(inherited >= 0);
+            if inherited == 0 { unsafe { libc::poll(std::ptr::null_mut(), 0, 250); libc::_exit(0); } }
+        }
         drop(lock);
-        other.try_lock().unwrap();
+        let released = other.try_lock();
+        #[cfg(unix)]
+        unsafe { libc::waitpid(inherited, std::ptr::null_mut(), 0); }
+        released.unwrap();
         drop(other);
         fs::remove_dir_all(install).unwrap();
     }

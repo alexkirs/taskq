@@ -1428,7 +1428,10 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
         text += &format!("{} {} {} {} {}\n", k.task, k.attempt, k.rt, k.proc.id(), s.delivered(k.attempt));
     }
     platform::write_atomic(&dot(&cfg.root).join("kids"), &text)?;
-    let e = std::process::Command::new(cfg.install.join(platform::tool(&cfg.install).exe_name())).args(["service", "run"]).exec();
+    let mut command = std::process::Command::new(cfg.install.join(platform::tool(&cfg.install).exe_name()));
+    command.args(["service", "run"]);
+    coreq::telemetry::capture::before_exec();
+    let e = command.exec();
     incident::detect("dispatch.reexec", concat!("src/main.rs:", line!()), "none", &[], &["reexec:failed"]);
     Err(format!("re-exec: {e}"))
 }
@@ -2294,7 +2297,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
     }
 }
 
-fn main() {
+fn application() {
     #[cfg(windows)]
     if std::env::args().nth(1).as_deref() == Some("__windows-codex") {
         if let Err(e) = windows_sandbox::run(&std::env::args().skip(2).collect::<Vec<_>>()) { eprintln!("{e}"); std::process::exit(1); }

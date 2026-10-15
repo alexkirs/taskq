@@ -72,6 +72,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     // No sudo/setid escape, even when the host account has broader privileges.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 { return Err(std::io::Error::last_os_error().to_string()); }
     c.args(["--setenv", "TMPDIR", "/tmp", "--chdir"]).arg(&root).arg("--").arg(bin).args(&args[4..]);
+    coreq::telemetry::capture::before_exec();
     Err(format!("linux sandbox: {}", c.exec()))
 }
 

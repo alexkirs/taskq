@@ -220,7 +220,7 @@ dependencies = [
 [[package]]
 name = "coreq"
 version = "0.13.0"
-source = "git+https://github.com/taskqorg/coreq?rev=ad0d1f951659ac6f8f11d61f35758271efa5c25f#ad0d1f951659ac6f8f11d61f35758271efa5c25f"
+source = "git+https://github.com/taskqorg/coreq?rev=f8d1946561ac5de3aeb921efe9eda3fd6ce4deac#f8d1946561ac5de3aeb921efe9eda3fd6ce4deac"
 dependencies = [
  "coreq-instrument",
  "ring",
@@ -233,7 +233,7 @@ dependencies = [
 [[package]]
 name = "coreq-instrument"
 version = "0.1.0"
-source = "git+https://github.com/taskqorg/coreq?rev=ad0d1f951659ac6f8f11d61f35758271efa5c25f#ad0d1f951659ac6f8f11d61f35758271efa5c25f"
+source = "git+https://github.com/taskqorg/coreq?rev=f8d1946561ac5de3aeb921efe9eda3fd6ce4deac#f8d1946561ac5de3aeb921efe9eda3fd6ce4deac"
 dependencies = [
  "proc-macro2",
  "quote",

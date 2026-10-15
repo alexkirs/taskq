@@ -341,7 +341,10 @@ pub fn run(install: &Path) -> Res<()> {
                 for root in &roots { let _ = fs::remove_file(crate::dot(root).join("restart")); }
                 #[cfg(unix)] {
                     use std::os::unix::process::CommandExt;
-                    let e = std::process::Command::new(crate::launcher(install)).args(["service", "run"]).current_dir(install).env_remove("TASKQ_ROOT").exec();
+                    let mut command = std::process::Command::new(crate::launcher(install));
+                    command.args(["service", "run"]).current_dir(install).env_remove("TASKQ_ROOT");
+                    coreq::telemetry::capture::before_exec();
+                    let e = command.exec();
                     return Err(format!("host re-exec: {e}"));
                 }
                 #[cfg(not(unix))] std::process::exit(75);

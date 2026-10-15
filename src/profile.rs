@@ -775,7 +775,7 @@ mod tests {
         assert!(local_live(&dir).is_empty(), "incomplete snapshots exclude nothing");
         v["complete"] = serde_json::json!(true);
         fs::write(dir.join(".taskq/status.json"), v.to_string()).unwrap();
-        fs::File::open(dir.join(".taskq/status.json")).unwrap().set_times(
+        OpenOptions::new().write(true).open(dir.join(".taskq/status.json")).unwrap().set_times(
             fs::FileTimes::new().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1))).unwrap();
         assert!(local_live(&dir).is_empty(), "stale snapshots exclude nothing");
         fs::remove_dir_all(dir).unwrap();

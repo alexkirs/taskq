@@ -1203,7 +1203,7 @@ mod tests {
     fn claude_failed_launch_exits_without_status_or_transcript() {
         let mut t = ClaudeTurn { root: PathBuf::new(), log: PathBuf::new(), session: String::new(),
             id: "invented-job".into(), announced: false, copied: 0, before: 0, mode: "dontAsk".into(),
-            input: "invented input".into(), pid: 0, done: false, failure: None };
+            input: "invented input".into(), _input_file: File::open(std::env::current_exe().unwrap()).unwrap(), pid: 0, done: false, failure: None };
         for state in ["failed", "stopped", "crashed", "unexpected"] {
             assert_eq!(t.observe(&serde_json::json!({"state":state})), Ok(Some(-1)));
             t.announced = true;

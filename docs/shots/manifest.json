@@ -1,7 +1,7 @@
 {
   "version": "4.4.0",
-  "sourceCommit": "1e495ea2776aa47c8a0157b550256699a07dce4c",
-  "binarySha256": "977b76d5505474c99dce0456ca92fee09cb220f42362e75623c3999f587f1d75",
+  "sourceCommit": "f0350227a22d7e22f0e70c6c24a26a0362003033",
+  "binarySha256": "2d2dc3a1f4e0d6fbf71eccc3a847f0e5f15b9a5ea18aecc761f6fd3d38434c05",
   "environment": {
     "os": "macOS 26.6.2",
     "arch": "arm64",
@@ -9,7 +9,7 @@
   },
   "uiSources": {
     "src/tray.rs": "5cf983502c5001e8486f54dd2928d42b4074e4d9",
-    "src/tray.html": "80760ce6a3aa7af1fb52a52c66b8e1deeb04fb14",
+    "src/tray.html": "397ed73f3df2be13214c1c78147062ec96ec5a5c",
     "src/icon.rs": "27c0a5f64a7af334e2eb8c81e3e6626e356cc555",
     "docs/design/icon-summary.config.json": "9365699c943d0ac4506eab8fc5f7a84d8cbe8582"
   },

@@ -92,3 +92,4 @@ Preserve requirement IDs and current capabilities. Shipped and native proof foll
 [Installation and project locations](setup-and-project-locations.md): agent-led and agent-free setup, Projects folder, exact execution roots and S-A1–S-A8.
 
 - [Standalone agentq onboarding](standalone-onboarding.md): warning, detection, dismissal and setup-session recommendations; no runtime changes.
+- [Standalone telemetry](standalone-telemetry.md): local store and retention, export as the one data path, no send without serverq, agent analysis guide and gaps G1–G7; no runtime changes.

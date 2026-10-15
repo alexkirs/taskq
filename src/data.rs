@@ -80,7 +80,7 @@ pub fn prune(root: &Path, install: &Path, project: &str, live: &[u64]) -> Vec<St
     let d = crate::dot(root);
     let mut out = vec![];
     for p in [install.join("taskq.log"), install.join(format!("{project}.log"))] {
-        if trim_tail(&p, LOG_MAX) {
+        if !(crate::host::active() && p.file_name().is_some_and(|n| n == "taskq.log")) && trim_tail(&p, LOG_MAX) {
             out.push(format!("pruned {} to its newest {} KiB", p.display(), LOG_MAX / 2048));
         }
     }

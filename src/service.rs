@@ -205,8 +205,9 @@ pub struct Kid {
 }
 
 pub struct Service<'a> {
+    pub host: Option<crate::host::Shared>,
     pub board: &'a dyn Board,
-    pub cfg: &'a Config,
+    pub cfg: Config,
     pub version: String,
     pub kids: Vec<Kid>,
     /// `service <id>` in the heartbeat (§ 4): a hash of `<install>/installation-id`; empty writes no line.
@@ -273,6 +274,7 @@ pub struct Service<'a> {
     asked: HashMap<u64, (std::time::Instant, u64, String)>,
     /// Remote Control URL of each live Claude child by attempt, read once from its transcript (§ 4 heartbeat `session`).
     sessions: HashMap<u64, String>,
+    reduced_at: Option<u64>,
 }
 
 const MONTH: i64 = 30 * 86400;
@@ -368,7 +370,7 @@ pub fn capacity(v: &Value, host: &str) -> Result<Capacity, String> {
 }
 
 /// The load gate (§ 3): samples on a monotonic clock in seconds, decisions on unrounded percentages.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Gate {
     cfg: Option<GateCfg>,
     /// CPU (busy, total) ticks of the previous reading: the baseline of the next.
@@ -495,7 +497,50 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
+        Service { reduced_at: None, host: None, wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg: cfg.clone(), version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
+    }
+
+    /// Rebuild board-derived state after unwind; live handles, pending launches and delivery cursors stay owned.
+    pub fn rebuild(&mut self) {
+        self.unready();
+        self.cache.clear();
+        self.deps.clear();
+        self.label_fixes.clear();
+        self.snapshot = None;
+        self.tasks_read = None;
+    }
+
+    /// Quarantine/backoff: only verified reaping, leases and status; no claims, resumes or recovery writes.
+    pub fn reduced(&mut self) -> Result<(), String> {
+        self.unready();
+        let before = self.kids.len();
+        self.reap_owned();
+        self.sync_host();
+        if before != self.kids.len() || self.reduced_at.is_none_or(|t| self.mono.saturating_sub(t) >= (self.cfg.ttl / 5).max(1) as u64) {
+            self.reduced_at = Some(self.mono);
+            if let Some(n) = self.host_issue {
+                let hb = self.board.issue(n)?;
+                let now = self.board.now()?;
+                let body = self.heartbeat_body();
+                if now - hb.updated >= self.cfg.ttl / 5 || !hb.body.lines().filter(|l| !l.starts_with("at ")).eq(body.lines()) {
+                    self.board.edit(n, &format!("{body}\nat {now}"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn unready(&self) {
+        if let Some(host) = &self.host { if let Ok(mut h) = host.lock() { h.ready(&self.cfg.root, false); } }
+    }
+
+    /// Liveness/handoff monitoring remains available if the reduced board loop fails; it never renews a lease.
+    pub fn reap_owned(&mut self) {
+        self.kids.retain_mut(|k| match k.proc.exited() {
+            Ok(Some(_)) => { self.unknown.remove(&k.attempt); false }
+            Ok(None) => { self.unknown.remove(&k.attempt); true }
+            Err(e) => { self.unknown.insert(k.attempt, e); true }
+        });
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -516,7 +561,8 @@ impl<'a> Service<'a> {
 
     /// This service's entry in the host authority: children and granted reservations are held.
     fn entry(&self) -> Entry {
-        let held = self.kids.iter().map(|k| (k.task, k.attempt, k.rt.clone())).chain(self.reserved.iter().cloned()).collect();
+        let held = self.kids.iter().map(|k| (k.task, k.attempt, k.rt.clone())).chain(self.reserved.iter().cloned())
+            .collect::<BTreeSet<_>>().into_iter().collect();
         Entry { version: self.version.clone(), at: 0, held, requested: self.requested.clone() }
     }
 
@@ -526,9 +572,22 @@ impl<'a> Service<'a> {
         if !self.may_launch() {
             return false;
         }
-        if !self.auto() {
-            return true;
+        if let Some(host) = self.host.clone() {
+            let r = host.lock().map_err(|_| "host admission poisoned; launches held".to_string()).and_then(|mut h| {
+                let now = h.elapsed();
+                h.reserve(&self.cfg.root, task, attempt, rt, self.cap.as_ref().unwrap(), attempt == 0, now)
+            });
+            return match r {
+                Ok(used) => {
+                    let res = (task, attempt, rt.to_string());
+                    if !self.reserved.contains(&res) { self.reserved.push(res); }
+                    self.host_used = Some(used as u32);
+                    true
+                }
+                Err(e) => { self.refused = Some(("host", e)); false }
+            };
         }
+        if !self.auto() { return true; }
         let old = crate::admission::old_services(&self.cfg.install);
         let res = (task, attempt, rt.to_string());
         let want = Want { max: self.cap.as_ref().ok().and_then(|c| c.max), sample_at: self.gate.last.map(|l| l.1), old: &old, res: res.clone() };
@@ -550,6 +609,19 @@ impl<'a> Service<'a> {
     /// Rewrite this service's host entry: released reservations leave it (§ 3). Fixed services write too, so Auto
     /// counts their children; a failed write only matters to Auto, whose next request refuses.
     pub fn sync_host(&mut self) {
+        if let Some(host) = &self.host {
+            match host.lock() {
+                Ok(mut h) => self.host_used = Some(h.sync(&self.cfg.root, self.entry().held) as u32),
+                Err(e) => {
+                    self.host_used = None;
+                    self.refused = Some(("host", "host admission poisoned; rebuilding from owned handles".into()));
+                    let mut h = e.into_inner();
+                    h.reload(crate::host::Policy::read(&self.cfg.install));
+                    if h.rebuild_slots(&self.cfg.root, self.entry().held) { host.clear_poison(); }
+                }
+            }
+            return;
+        }
         let (r, used) = crate::admission::sync(&self.cfg.install, &self.cfg.root.display().to_string(), self.entry(), None, self.wall);
         self.host_used = used;
         if let (Err((_, e)), true) = (r, self.auto()) {
@@ -675,7 +747,9 @@ impl<'a> Service<'a> {
 
     /// One pass of § 4. Tasks written to in a step are left alone by later steps until the next pass re-reads them.
     pub fn pass(&mut self) -> Result<(), String> {
-        crate::profile::measure("service.pass", || self.pass_inner())
+        let r = crate::profile::measure("service.pass", || self.pass_inner());
+        if r.is_err() { self.unready(); }
+        r
     }
 
     fn pass_inner(&mut self) -> Result<(), String> {
@@ -684,7 +758,7 @@ impl<'a> Service<'a> {
         let ttl = self.cfg.ttl;
         let (views, hosts) = views(self.board, &mut self.cache, &mut self.deps)?;
         let now = self.board.now()?;
-        self.snapshot = Some(crate::snapshot::from_views("host", self.board, self.cfg, now, &views, &hosts));
+        self.snapshot = Some(crate::snapshot::from_views("host", self.board, &self.cfg, now, &views, &hosts));
         self.tasks_read = Some(std::time::Instant::now());
         // § 4 one service per host name: another install's fresh heartbeat under this name holds every write (#933)
         let title = format!("taskq host {me}");
@@ -838,7 +912,9 @@ impl<'a> Service<'a> {
         // 6. route to own attempts, then admit within capacity; the gate holds launches, the lease stays (§ 3)
         let mut pending = BTreeSet::new();
         // a reservation lives within one pass: it becomes a child or a held claim, or is released here
-        (self.reserved, self.requested, self.refused) = (vec![], vec![], None);
+        self.reserved.retain(|r| self.held.iter().any(|l| l.task == r.0 && l.attempt == r.1));
+        (self.requested, self.refused) = (vec![], None);
+        if self.host.is_some() { self.sync_host(); }
         for v in &views {
             let (n, t) = (v.issue.number, &v.task);
             let (Some(a), Some(h)) = (t.attempt, host_of(t)) else { continue };
@@ -890,6 +966,7 @@ impl<'a> Service<'a> {
             self.beat()?;
         }
         if self.focus.is_empty() {
+            if let Some(host) = &self.host { if let Ok(mut h) = host.lock() { h.ready(&self.cfg.root, false); } }
             return Ok(());
         }
         let user = self.board.me().unwrap_or_default();
@@ -909,6 +986,10 @@ impl<'a> Service<'a> {
             .filter(|v| !v.issue.labels.iter().any(|l| l == "assignee-only") || assigned(self.board, &v.issue, &user).unwrap_or(false))
             .collect();
         queue.sort_by_key(|v| (priority(&v.issue), v.issue.number));
+        let ready = queue.iter().any(|v| self.free(label(&v.issue, "run-").as_deref()).is_some());
+        if let Some(host) = &self.host {
+            if let Ok(mut h) = host.lock() { h.ready(&self.cfg.root, ready); }
+        }
         for v in queue {
             if !self.may_launch() {
                 break;
@@ -1069,7 +1150,11 @@ impl<'a> Service<'a> {
         // the most free slots wins, so any-runtime tasks alternate; a tie keeps the listed order (§ 4 Filter)
         let mut best: Option<(String, usize)> = None;
         for (rt, n) in limits.into_iter().filter(|(rt, _)| want.is_none_or(|w| w == rt.as_str()) && app(rt) && !self.refused_access.contains_key(rt)) {
-            let left = (n as usize).saturating_sub(self.kids.iter().filter(|k| k.rt == rt).count());
+            let mut left = (n as usize).saturating_sub(self.entry().held.iter().filter(|r| r.2 == rt).count());
+            if let Some(host) = &self.host {
+                let h = host.lock().ok()?;
+                left = left.min(h.remaining(&self.cfg.root, &rt, c));
+            }
             if left > 0 && best.as_ref().is_none_or(|b| left > b.1) {
                 best = Some((rt, left));
             }
@@ -1106,9 +1191,12 @@ impl<'a> Service<'a> {
         let t = core::fold(n, &log, false); // only ready or review tasks are claimed
         if t.attempt != Some(id) {
             self.reserved.retain(|r| r.0 != n); // released
+            self.sync_host();
             self.log.push(format!("#{n} spawn {id} lost the claim"));
             return Ok(None);
         }
+        for r in self.reserved.iter_mut().filter(|r| r.0 == n && r.1 == 0) { r.1 = id; }
+        if let Some(host) = &self.host { if let Ok(mut h) = host.lock() { h.claimed(&self.cfg.root, n, id); } }
         let l = Launch { task: n, title: v.issue.title.clone(), attempt: id, role: role.into(), rt: rt.into(), session, url: self.board.url(n), resume: None };
         self.delivered.insert(id, t.inbox.last().copied().unwrap_or(0));
         if !self.may_launch() {
@@ -1130,22 +1218,26 @@ impl<'a> Service<'a> {
 
     fn launch(&mut self, l: Launch) -> Result<(), String> {
         // the reservation becomes the child, or is released when the start fails
-        self.reserved.retain(|r| r.0 != l.task);
         let pos = std::fs::metadata(crate::runtime::attempt_log(&self.cfg.root, &l.role, l.task, l.attempt)).map_or(0, |m| m.len());
         let began = std::time::Instant::now();
-        let started = (self.start)(&l);
+        let started = (self.start)(&l).map(|proc| {
+            self.kids.push(Kid { task: l.task, attempt: l.attempt, rt: l.rt.clone(), proc });
+        });
         let err = started.as_ref().err().map_or("none", |e| crate::profile::class(&e.to_string()));
         crate::profile::stage("start", l.task, l.attempt, &l.rt, Some(began.elapsed()), if started.is_ok() { "ok" } else { "failed" }, err, crate::profile::Usage::NoModel);
         match started {
-            Ok(proc) => {
+            Ok(()) => {
+                self.reserved.retain(|r| r.0 != l.task || r.1 != l.attempt);
+                self.sync_host();
                 crate::profile::open(&self.cfg.install, &self.cfg.repo, &self.cfg.me, l.task, l.attempt, &l.rt, l.role == "reviewer");
                 self.begun.insert(l.attempt, (l.role.clone(), l.rt.clone(), Some((std::time::Instant::now(), pos))));
-                self.kids.push(Kid { task: l.task, attempt: l.attempt, rt: l.rt.clone(), proc });
                 self.pending.remove(&(l.task, l.attempt));
                 self.gate.launch(self.mono);
                 self.beat()
             }
             Err(e) => {
+                self.reserved.retain(|r| r.0 != l.task || r.1 != l.attempt);
+                self.sync_host();
                 if e.reportable {
                     #[cfg(not(test))]
                     let agents = crate::runtime::agents();
@@ -1263,6 +1355,118 @@ mod tests {
 
     fn task(b: &Fake, n: u64) -> Task {
         core::fold(n, &entries(b, n).unwrap(), false)
+    }
+
+    // Chain A2: project-thread unwind -> rebuilt board cache -> quarantine with live lease, beside healthy admission.
+    // Risk: a panic drops a child/cursor, stops the other project or collides on equal task/attempt numbers.
+    #[test]
+    fn host_project_panic_preserves_children_and_other_project_admission() {
+        use std::sync::{Arc, Mutex, Barrier};
+        let policy = crate::host::Policy::parse(json!({"limits": {"claude": 2}, "admission": {"max": 2}, "load_gate": {"enabled": false}}), "invented").unwrap();
+        let host = Arc::new(Mutex::new(crate::host::Host::new(Ok(policy.clone()))));
+        let barrier = Arc::new(Barrier::new(2));
+        let joins: Vec<_> = [true, false].into_iter().map(|panicking| {
+            let (host, barrier, policy) = (host.clone(), barrier.clone(), policy.clone());
+            std::thread::spawn(move || {
+                let b = Fake::default(); let n = b.create("Same number", "", &["taskq".into()]).unwrap();
+                let mut c = cfg("invented"); c.root = PathBuf::from(if panicking { "/invented/panic" } else { "/invented/healthy" });
+                let exits: Exits = Default::default(); let mut s = service(&b, &c, exits.clone());
+                // Seed the panicking project's existing child without consuming a new host launch interval.
+                if panicking { s.pass().unwrap(); s.delivered.insert(s.kids[0].attempt, 99); }
+                s.host = Some(host.clone()); s.reload(Ok(policy.cap.clone())); s.sync_host();
+                barrier.wait();
+                if !panicking { s.pass().unwrap(); }
+                assert_eq!(s.kids.len(), 1);
+                let a = s.kids[0].attempt;
+                let mut panics = crate::host::Panics::default();
+                for now in [0, 1, 11] {
+                    if panicking {
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            s.pass().unwrap();
+                            panic!("invented pass panic");
+                        }));
+                        assert!(r.is_err()); panics.record(now, "invented pass panic"); s.rebuild();
+                        s.reduced().unwrap();
+                        assert_eq!(s.delivered(a), 99, "the inbox cursor survives every rebuild");
+                    } else { s.pass().unwrap(); }
+                    assert_eq!(s.kids.len(), 1); assert_eq!(*exits.borrow()[0].1.borrow(), None);
+                }
+                if panicking {
+                    assert!(panics.quarantined()); assert_eq!(panics.reason.as_deref(), Some("quarantined: panic:other"));
+                    let before = b.comments(n).unwrap().len();
+                    b.advance(900); s.mono = 900;
+                    s.reduced().unwrap(); assert_eq!(b.comments(n).unwrap().len(), before, "quarantine writes no task transitions");
+                }
+                let hb = b.issues(None).unwrap().into_iter().find(is_host).unwrap();
+                assert!(hb.body.lines().any(|l| l == format!("#{n} {a}")), "child lease remains listed");
+                assert!(b.now().unwrap() - hb.updated < c.ttl, "quarantine refreshes the lease beyond ttl using board time");
+                (n, a, s.kids.len())
+            })
+        }).collect();
+        let results: Vec<_> = joins.into_iter().map(|j| j.join().unwrap()).collect();
+        assert_eq!(results[0], results[1], "equal issue and attempt numbers across projects stay distinct");
+        assert_eq!(host.lock().unwrap().sync(std::path::Path::new("unused"), vec![]), 2);
+    }
+
+    // Chain: § 3 poisoned authority -> each project's retained handles -> verified slot rebuild.
+    // Risk: clearing poison early drops another project's occupancy and allows a launch above the host limit.
+    #[test]
+    fn host_poison_holds_until_every_project_reconciles_owned_handles() {
+        let install = std::env::temp_dir().join(format!("taskq-host-poison-{}", std::process::id()));
+        std::fs::create_dir_all(&install).unwrap();
+        let raw = json!({"limits": {"claude": 2}, "admission": {"max": 2}, "load_gate": {"enabled": false}});
+        std::fs::write(install.join("host.json"), raw.to_string()).unwrap();
+        let p = crate::host::Policy::parse(raw, "invented").unwrap();
+        let host = std::sync::Arc::new(std::sync::Mutex::new(crate::host::Host::new(Ok(p.clone()))));
+        let (a, b) = (Fake::default(), Fake::default());
+        let mut ca = cfg("invented"); ca.root = install.join("a"); ca.install = install.clone();
+        let mut cb = ca.clone(); cb.root = install.join("b");
+        let mut sa = service(&a, &ca, Default::default()); let mut sb = service(&b, &cb, Default::default());
+        for s in [&mut sa, &mut sb] {
+            s.host = Some(host.clone()); s.reload(Ok(p.cap.clone()));
+            s.kids.push(Kid { task: 1, attempt: 7, rt: "claude".into(), proc: Box::new(FakeProc(Default::default())) });
+            host.lock().unwrap().busy.insert(s.cfg.root.clone(), true);
+            s.sync_host();
+        }
+        let poisoned = host.clone();
+        assert!(std::thread::spawn(move || { let _guard = poisoned.lock().unwrap(); panic!("invented admission panic"); }).join().is_err());
+        sa.sync_host(); assert!(host.is_poisoned()); assert!(!sa.reserve(2, 8, "claude"));
+        sb.sync_host(); assert!(!host.is_poisoned());
+        assert_eq!(host.lock().unwrap().sync(std::path::Path::new("unused"), vec![]), 2);
+        assert_eq!((sa.kids.len(), sb.kids.len()), (1, 1));
+        std::fs::remove_dir_all(install).unwrap();
+    }
+
+    // Chain A2: unavailable project leaves round-robin -> multiple healthy grants; failed reduced loop -> safe update.
+    // Risk: stale readiness starves later work, or a stopped project can never satisfy the host handoff barrier.
+    #[test]
+    fn host_quarantine_does_not_starve_and_stopped_handles_can_prepare_restart() {
+        let root = std::env::temp_dir().join(format!("taskq-host-stopped-{}", std::process::id()));
+        std::fs::create_dir_all(crate::dot(&root)).unwrap();
+        let p = crate::host::Policy::parse(json!({"limits": {"claude": 2}, "load_gate": {"enabled": false}}), "invented").unwrap();
+        let host = std::sync::Arc::new(std::sync::Mutex::new(crate::host::Host::new(Ok(p.clone()))));
+        let b = Fake::default(); let mut c = cfg("invented"); c.root = root.clone(); c.install = root.clone();
+        let mut s = service(&b, &c, Default::default()); s.host = Some(host.clone());
+        let healthy = root.join("healthy");
+        { let mut h = host.lock().unwrap(); h.ready(&root, true); h.ready(&healthy, true); }
+        s.rebuild(); s.reduced().unwrap();
+        for n in 1..=3 {
+            let mut h = host.lock().unwrap();
+            h.reserve(&healthy, n, n, "claude", &p.cap, true, (n - 1) * 30).unwrap();
+            h.sync(&healthy, vec![]);
+        }
+        let exit = Rc::new(RefCell::new(None));
+        s.kids.push(Kid { task: 1, attempt: 7, rt: "claude".into(), proc: Box::new(FakeProc(exit.clone())) });
+        { let mut h = host.lock().unwrap(); h.busy.insert(root.clone(), true); h.restart = true; }
+        // This is the monitor entered after a reduced-loop panic: no board pass and no lease renewal.
+        assert!(!crate::stopped_handoff(&mut s, &host, &c).unwrap());
+        assert!(!host.lock().unwrap().prepared.contains(&root)); assert_eq!(s.kids.len(), 1);
+        *exit.borrow_mut() = Some(0);
+        assert!(!crate::stopped_handoff(&mut s, &host, &c).unwrap());
+        let h = host.lock().unwrap();
+        assert!(h.busy.keys().all(|p| h.prepared.contains(p)), "coordinator can restart after verified exit");
+        assert!(b.issues(None).unwrap().is_empty(), "the stopped monitor makes no board writes");
+        drop(h); std::fs::remove_dir_all(root).unwrap();
     }
 
     // Chain: § 3 cross-host grace. Risk: ignored entries extend another host's lease.

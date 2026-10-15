@@ -19,7 +19,7 @@ const CODES: &[&str] = &[
 ];
 
 /// The enumerated class of a panic message; the message itself never leaves the host.
-fn panic_class(msg: &str) -> &'static str {
+pub fn panic_class(msg: &str) -> &'static str {
     if msg.starts_with("failed printing to std") { "panic:stdio" }
     else if msg.starts_with("called `Option::unwrap()`") || msg.starts_with("called `Result::unwrap()`") { "panic:unwrap" }
     else if ["index out of bounds", "out of range for slice", "byte index ", "slice index starts"].iter().any(|p| msg.contains(p)) { "panic:index" }
@@ -152,7 +152,7 @@ pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         if !ACTIVE.with(Cell::get) {
             let msg = info.payload_as_str().unwrap_or("");
-            if closed_pipe(msg) { std::process::exit(141); } // consumer closed the pipe: no TaskQ defect (§ 4)
+            if closed_pipe(msg) && !crate::host::active() { std::process::exit(141); } // consumer closed the pipe: no TaskQ defect (§ 4)
             #[cfg(not(test))]
             if let Ok(root) = crate::find_root() {
                 use std::io::Write;

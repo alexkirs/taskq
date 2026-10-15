@@ -6,6 +6,7 @@ macro_rules! log {
 }
 
 mod admission;
+mod host;
 mod board;
 mod core;
 mod data;
@@ -39,7 +40,9 @@ use board::{Board, entries};
 use core::{Entry, State, Task, entry, fold};
 use dispatch::{Op, Receipt, act, answer_picks, close_checked, current, deps_open};
 use serde_json::{Value, json};
-use service::{Config, Kid, Service};
+use service::{Config, Service};
+#[cfg(unix)]
+use service::Kid;
 use snapshot::in_scope;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -131,8 +134,10 @@ struct Ctx {
     board: Box<dyn Board>,
 }
 
-/// The project root: `TASKQ_ROOT`, else the nearest folder with `taskq.json` that is not a task worktree.
+thread_local!(static PROJECT_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) });
+
 fn find_root() -> Res<PathBuf> {
+    if let Some(root) = PROJECT_ROOT.with_borrow(Clone::clone) { return Ok(root); }
     root_for(std::env::var_os("TASKQ_ROOT").map(PathBuf::from), std::env::current_dir().map_err(|e| e.to_string())?)
 }
 
@@ -177,7 +182,7 @@ fn load(root: &Path) -> Res<(Config, Value)> {
     };
     let board = board::kind(&str_or("board", "github"))?;
     let (publish, delivery, delivery_revision) = delivery(&v)?;
-    let cfg = Config {
+    let mut cfg = Config {
         root: root.to_path_buf(),
         install: platform::default_install(),
         board,
@@ -199,6 +204,7 @@ fn load(root: &Path) -> Res<(Config, Value)> {
     if cfg.repo.is_empty() {
         return Err("taskq.json: repo is required".into());
     }
+    if let Ok(policy) = host::Policy::read(&cfg.install) { policy.apply(&mut cfg); }
     profile::project(&cfg.repo);
     profile::host(&cfg.me);
     Ok((cfg, v))
@@ -552,10 +558,12 @@ fn launcher(install: &Path) -> PathBuf {
 fn sleep_until_poke(poke: &Path, secs: u64, tick: &mut dyn FnMut()) {
     let mtime = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
     let start = mtime(poke);
+    let host_poke = platform::default_install().join("poke");
+    let host_start = mtime(&host_poke);
     for _ in 0..secs {
         std::thread::sleep(Duration::from_secs(1));
         tick();
-        if mtime(poke) != start {
+        if mtime(poke) != start || mtime(&host_poke) != host_start {
             return;
         }
     }
@@ -593,13 +601,21 @@ fn adopt(s: &mut Service, root: &Path) {
     let _ = (s, kids);
 }
 
-fn service_run(c: &Ctx) -> Res<()> {
+fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
     let cfg = &c.cfg;
     let exe = launcher(&cfg.install);
     let board_env = cfg.board.worker_env(&platform::tool(&cfg.install), &cfg.web_host)?;
     let env = runtime::Env { board_env: &board_env, root: &cfg.root, exe: &exe, install: &cfg.install, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.delivery };
-    let start = |l: &runtime::Launch| runtime::spawn(&env, l);
+    let start = |l: &runtime::Launch| {
+        if let Some(host) = &host {
+            let p = host.lock().map_err(|_| runtime::StartError::io(std::io::Error::other("host admission poisoned"), None))?
+                .policy.clone().map_err(|e| runtime::StartError::io(std::io::Error::other(e), None))?;
+            let env = runtime::Env { permission_mode: &p.permission_mode, codex: &p.codex, ..env };
+            runtime::spawn(&env, l)
+        } else { runtime::spawn(&env, l) }
+    };
     let mut s = Service::new(c.board.as_ref(), cfg, platform::VERSION, Box::new(start));
+    s.host = host.clone();
     s.instance = enrollment::installation_id(&cfg.install).map(|id| service_id(&id))?;
     // § 4 machine line: agentq's `host.name` is the same `hostname` output; WSL as agentq detects it
     let wsl = cfg!(target_os = "linux") && (std::env::var_os("WSL_DISTRO_NAME").is_some() || Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists());
@@ -607,9 +623,14 @@ fn service_run(c: &Ctx) -> Res<()> {
     let d = dot(&cfg.root);
     fs::create_dir_all(&d).map_err(|e| e.to_string())?;
     // § 4 one service per root: wait, not exit, so the unit sees no crash loop
-    while let Some(pid) = other_service(&cfg.root) {
-        log!("service pid {pid} already runs this project; waiting");
-        std::thread::sleep(Duration::from_secs(cfg.poll));
+    loop {
+        let other = if host.is_some() { host::project_service(&cfg.root) } else { Ok(other_service(&cfg.root)) };
+        match other {
+            Ok(None) => break,
+            Ok(Some(pid)) => log!("service pid {pid} already runs this project; waiting"),
+            Err(e) => log!("{e}; waiting"),
+        }
+        std::thread::sleep(Duration::from_secs(cfg.poll.max(1)));
     }
     adopt(&mut s, &cfg.root);
     let is_installed = installed(&cfg.install);
@@ -640,23 +661,33 @@ fn service_run(c: &Ctx) -> Res<()> {
     let mut last_hour: Option<BTreeMap<String, u64>> = None;
     let mut dashq = enrollment::Sender::default();
     let mut policy_exchange = resources::Exchanger::default();
+    let mut panics = host::Panics::default();
     loop {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Res<()> {
+        let reduced = panics.quarantined() || began.elapsed().as_secs() < panics.until;
         // § 3: capacity reloads before each admission decision; children are untouched
         let cap = fs::read_to_string(cfg.root.join("taskq.json")).map_err(|e| e.to_string())
             .and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| format!("taskq.json: {e}")))
-            .and_then(|v| service::capacity(&v, &cfg.me));
+            .and_then(|v| match &host {
+                Some(h) => {
+                    let h = h.lock().map_err(|_| "host admission poisoned; launches held")?;
+                    let p = h.policy.as_ref().map_err(Clone::clone)?;
+                    p.apply(&mut s.cfg);
+                    p.project(&v)
+                }
+                None => service::capacity(&v, &cfg.me),
+            });
         if let Err(e) = &cap {
             log!("capacity: {e}; launches held");
         }
         let op_rt = cap.as_ref().ok().and_then(|c| ["claude", "codex"].into_iter().find(|rt| c.limits.get(*rt).copied().unwrap_or(if c.auto { u32::MAX } else { 0 }) > 0));
         s.reload(cap);
+        if let Some(host) = &host { if let Ok(h) = host.lock() { s.gate = h.gate.clone(); } }
         // § 8 Access: re-read every pass; a refused runtime is not claimed or resumed
-        let access = policy::report(&cfg.install, &cfg.root, &cfg.permission_mode, &cfg.codex);
+        let access = policy::report(&cfg.install, &cfg.root, &s.cfg.permission_mode, &s.cfg.codex);
         s.refused_access = access.iter().filter_map(|e| Some((e.runtime.clone(), e.refused.clone()?))).collect();
-        if let Some(m) = policy::pin_rollback(&cfg.install, platform::VERSION) {
-            log!("{m}");
-        }
-        s.mono = began.elapsed().as_secs();
+        if !reduced { if let Some(m) = policy::pin_rollback(&cfg.install, platform::VERSION) { log!("{m}"); } }
+        s.mono = host.as_ref().and_then(|h| h.lock().ok().map(|h| h.elapsed())).unwrap_or_else(|| began.elapsed().as_secs());
         s.wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         // § 4 Data: an unreadable focus admits nothing and reads unknown with its reason
         let focus = data::focus(&cfg.root);
@@ -665,13 +696,23 @@ fn service_run(c: &Ctx) -> Res<()> {
             focus_error = focus.as_ref().err().cloned();
         }
         s.focus = focus.unwrap_or_default();
+        if let Some(host) = &host {
+            if let Ok(h) = host.lock() { if h.draining.contains(&cfg.root) { s.focus.clear(); } }
+        }
         s.focus_error = focus_error.clone();
-        let r = s.pass();
+        let r = if reduced { s.reduced().and_then(|_| Err(panics.reason.clone().unwrap_or_default())) } else { s.pass() };
         s.sync_host();
         for l in s.log.drain(..) {
             log!("{l}");
         }
         let budget = c.board.requests();
+        let requests_json = match &host {
+            Some(h) => match h.lock() {
+                Ok(h) => budget.json(h.request_since, h.last_hour.as_ref(), &h.hour_start),
+                Err(_) => json!({"reason": "host request accounting unknown: admission poisoned"}),
+            },
+            None => budget.json(since, last_hour.as_ref(), &hour.1),
+        };
         let paused = budget.paused_until();
         if paused != paused_logged {
             match paused {
@@ -690,7 +731,7 @@ fn service_run(c: &Ctx) -> Res<()> {
                 budget.resource.as_deref().map(|r| format!(" {r}")).unwrap_or_default(), budget.reset.map_or("unknown".into(), board::stamp));
             low_logged = Some(budget.reset);
         }
-        if hour.0.elapsed().as_secs() >= 3600 {
+        if host.is_none() && hour.0.elapsed().as_secs() >= 3600 {
             let h = requests::diff(&budget.ops, &hour.1);
             log!("requests 1h: {}", requests::summary(&h, ""));
             requests::record("service", &h);
@@ -704,17 +745,13 @@ fn service_run(c: &Ctx) -> Res<()> {
         }).collect();
         let request = fs::read_to_string(d.join("focus.request")).ok();
         // § 4: runtime probes at most every 5 minutes
-        if agents.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs() >= 300) {
+        if !reduced && agents.as_ref().is_none_or(|(t, _)| t.elapsed().as_secs() >= 300) {
             agents = Some((Instant::now(), json!({"at": at, "rows": runtime::agents()})));
         }
         // docs/design/enrollment.md: delivery runs on its own thread; its failure never fails or delays the pass
-        if let Some(l) = dashq.tick(&cfg.install, s.snapshot.as_ref(), at) {
-            log!("{l}");
-        }
+        if !reduced { if let Some(l) = dashq.tick(&cfg.install, s.snapshot.as_ref(), at) { log!("{l}"); } }
         // docs/design/shared-resource-controls.md § Host adapter: the same speaker exchanges resource operations
-        for l in policy_exchange.tick(&cfg.install, s.snapshot.as_ref(), at) {
-            log!("{l}");
-        }
+        if !reduced { for l in policy_exchange.tick(&cfg.install, s.snapshot.as_ref(), at) { log!("{l}"); } }
         let tool = platform::tool(&cfg.install);
         let error = r.as_ref().err().cloned();
         let mut status = coreq::status::common(&tool, &cfg.me, &project, at, r.err(), update.as_deref());
@@ -728,12 +765,12 @@ fn service_run(c: &Ctx) -> Res<()> {
             ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
             ("restart_waits", json!(d.join("restart").exists().then(|| restart_waits(&s, &cfg.root)))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root))),
-            ("requests", budget.json(since, last_hour.as_ref(), &hour.1)), ("connection", json!(dashq.outcome))]
+            ("requests", requests_json), ("connection", json!(dashq.outcome))]
         {
             status[k] = v;
         }
         let _ = coreq::status::write(&tool, &cfg.root, &status);
-        if is_installed && began.elapsed().as_secs() >= cfg.rollback_after {
+        if host.is_none() && is_installed && began.elapsed().as_secs() >= cfg.rollback_after {
             let h = cfg.install.join("releases").join(platform::VERSION).join("healthy");
             if !h.exists() {
                 let _ = fs::write(h, "");
@@ -743,7 +780,8 @@ fn service_run(c: &Ctx) -> Res<()> {
         let asked = fs::remove_file(d.join("update")).is_ok();
         // § 8 step 3: a pending restart already goes to `current`; repeating the check would only repeat its log line
         let pending = is_installed && d.join("restart").exists();
-        if !pending && (asked || checked.is_none_or(|t| t.elapsed().as_secs() >= cfg.update_every)) {
+        if host.is_some() && (asked || pending) { touch(&cfg.install.join(if asked { "update" } else { "restart" })); }
+        if host.is_none() && !pending && (asked || checked.is_none_or(|t| t.elapsed().as_secs() >= cfg.update_every)) {
             checked = Some(Instant::now());
             if is_installed {
                 match platform::service_update(&cfg.install) {
@@ -765,7 +803,7 @@ fn service_run(c: &Ctx) -> Res<()> {
             }
         }
         restart_watch(&mut restart_empty, cfg!(windows) && d.join("restart").exists() && s.kids.is_empty(), began.elapsed().as_secs(), cfg.update_every);
-        if is_installed && d.join("restart").exists() {
+        if host.is_none() && is_installed && d.join("restart").exists() {
             // Windows re-exec waits for the live children; the request stays until it can go
             let waits = restart_waits(&s, &cfg.root).join(", ");
             if waits.is_empty() {
@@ -778,17 +816,33 @@ fn service_run(c: &Ctx) -> Res<()> {
             reexec(&s, cfg)?;
         }
         // § 4 Data: the pruners run hourly
-        if pruned.is_none_or(|t| t.elapsed().as_secs() >= 3600) {
+        if !reduced && pruned.is_none_or(|t| t.elapsed().as_secs() >= 3600) {
             pruned = Some(Instant::now());
             let live: Vec<u64> = s.kids.iter().map(|k| k.attempt).collect();
             for l in data::prune(&cfg.root, &cfg.install, &project, &live) {
                 log!("{l}");
             }
         }
-        operator::owner_comments(&cfg.root, &project, &issues, &s.owner_comments);
-        operator::step(&cfg.root, &cfg.install, &exe, op_rt);
-        if is_installed {
+        if !reduced && host.as_ref().is_none_or(|h| h.lock().is_ok_and(|h| !h.restart && !h.draining.contains(&cfg.root))) {
+            operator::owner_comments(&cfg.root, &project, &issues, &s.owner_comments);
+            operator::step(&cfg.root, &cfg.install, &exe, op_rt);
+        }
+        if host.is_none() && is_installed {
             keep_tray(&cfg.install, &mut tray);
+        }
+        if let Some(host) = &host {
+            if let Ok(mut h) = host.lock() {
+            let registered = !h.draining.contains(&cfg.root);
+            let drained = s.kids.is_empty() && !operator::running(&cfg.root);
+            if !registered && drained { h.sync(&cfg.root, vec![]); h.ready(&cfg.root, false); return Err("project drained".into()); }
+            if registered { h.busy.insert(cfg.root.clone(), !drained); }
+            if h.restart && restart_waits(&s, &cfg.root).is_empty() {
+                match save_kids(&s, &cfg.root) {
+                    Ok(()) => { h.prepared.insert(cfg.root.clone()); }
+                    Err(e) => { h.prepared.remove(&cfg.root); log!("handoff unknown: {e}"); }
+                }
+            } else { h.prepared.remove(&cfg.root); }
+            }
         }
         // every 30 s, also between board polls: a gate sample (when enabled) and a fresh capacity in status.json (§ 4)
         let mut tick = || {
@@ -798,7 +852,9 @@ fn service_run(c: &Ctx) -> Res<()> {
             sampled = Some(Instant::now());
             s.mono = began.elapsed().as_secs();
             let wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            if s.gate.enabled() {
+            if let Some(host) = &host {
+                if let Ok(h) = host.lock() { s.gate = h.gate.clone(); s.mono = h.elapsed(); }
+            } else if s.gate.enabled() {
                 s.gate.host_mem = platform::host_memory();
                 s.gate.observe(s.mono, wall as i64, platform::cpu_ticks(), platform::memory_available());
             }
@@ -810,8 +866,55 @@ fn service_run(c: &Ctx) -> Res<()> {
             let _ = coreq::status::write(&tool, &cfg.root, &status);
         };
         tick();
-        sleep_until_poke(&d.join("poke"), cfg.poll, &mut tick);
+        sleep_until_poke(&d.join("poke"), if reduced { 1 } else { cfg.poll }, &mut tick);
+        Ok(())
+        }));
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(payload) => {
+                if host.is_none() { std::panic::resume_unwind(payload); }
+                if panics.quarantined() {
+                    // Stop the board loop, retaining its handles solely for safe exit/update monitoring (R11).
+                    s.unready();
+                    loop {
+                        let monitored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stopped_handoff(&mut s, host.as_ref().unwrap(), cfg)));
+                        if matches!(monitored, Ok(Ok(true))) { return Err("project drained".into()); }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+                let msg = payload.downcast_ref::<String>().map(String::as_str).or_else(|| payload.downcast_ref::<&str>().copied()).unwrap_or("unknown panic");
+                panics.record(began.elapsed().as_secs(), msg);
+                s.rebuild();
+                log!("{}", panics.reason.as_deref().unwrap_or("project panic"));
+                let mut status = coreq::status::common(&platform::tool(&cfg.install), &cfg.me, &project,
+                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs()), panics.reason.clone(), None);
+                status["complete"] = json!(false);
+                status["kids"] = json!(s.kids.iter().map(|k| json!({"task": k.task, "attempt": k.attempt, "rt": k.rt, "pid": k.proc.id()})).collect::<Vec<_>>());
+                let _ = coreq::status::write(&platform::tool(&cfg.install), &cfg.root, &status);
+            }
+        }
     }
+}
+
+fn save_kids(s: &Service, root: &Path) -> Res<()> {
+    let mut text = format!("pid {}\n", std::process::id());
+    for k in &s.kids { text += &format!("{} {} {} {} {}\n", k.task, k.attempt, k.rt, k.proc.id(), s.delivered(k.attempt)); }
+    platform::write_atomic(&dot(root).join("kids"), &text)
+}
+
+/// A failed reduced loop no longer beats or touches the board. Its exact handles still fence an image switch.
+fn stopped_handoff(s: &mut Service, host: &host::Shared, cfg: &Config) -> Res<bool> {
+    s.reap_owned();
+    s.sync_host();
+    let mut h = host.lock().map_err(|_| "stopped project admission unknown")?;
+    let idle = s.kids.is_empty() && !operator::running(&cfg.root);
+    h.busy.insert(cfg.root.clone(), !idle);
+    if h.restart && restart_waits(s, &cfg.root).is_empty() {
+        save_kids(s, &cfg.root)?;
+        h.prepared.insert(cfg.root.clone());
+    }
+    Ok(idle && h.draining.contains(&cfg.root))
 }
 
 // ---------- capacity (§ 3, § 5 `service capacity`, § 9) ----------
@@ -1404,10 +1507,11 @@ fn service(args: &Args) -> Res<()> {
         }
         return Ok(());
     }
+    if sub == "run" && find_root().is_err() { return host::run(&platform::default_install()); }
     let root = find_root()?;
     let d = dot(&root);
     match sub {
-        "run" => service_run(&ctx()?),
+        "run" => service_run(&ctx()?, None),
         "focus" => {
             let f = args.pos[2..].join(" ");
             if f.is_empty() {

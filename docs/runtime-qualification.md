@@ -290,3 +290,7 @@ The §4 Data pruner now keeps the newest 50 input files plus files with a live C
 - `cargo run -- selftest` passed 72 golden traces, command formats and a live board read; profiling append remained unknown. The Windows native transport probe above was not repeated for this retention change; Windows lock/read behavior still requires target-platform verification.
 
 Amended R13: §4 Data and the linked §8 Rule delivery detail. The stale description that resumes pass `--settings` now agrees with §8: only a new Claude session installs the compaction hook.
+
+### App lease
+
+- **App lease.** A `codex-app` (§ 8) turn counts as the child while the Codex app runs in this host's logged-in session and the thread has no `task_complete` after the queued brief or text. A finished turn without `result`, `ask` or `requeue`, a closed app or a logout is a child exit (`gone`). Stopping only drops it from the heartbeat; the turn runs on and its late writes are fenced. Updates and re-execs wait for active app turns and never retire them (§ 8 step 3).

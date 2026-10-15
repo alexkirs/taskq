@@ -230,3 +230,9 @@ Each task is one reviewable diff. Lines `Depends on` go into the task body as wr
 
 - Owner approval of this diff and of the drain-based handoff (no admission during handoff).
 - The macOS `launchctl bootout` child-survival probe decides whether macOS may adopt instead of drain later; not needed for N.
+
+## Contract detail
+
+Host runtime detail for taskq.md sections 3, 4 and 9. Install, capacity CLI, multi-project status and legacy-unit handoff remain separate implementation targets.
+
+- Data ([specq data](https://github.com/taskqorg/specq/blob/main/engineering/data.md#files)): bounds in `src/data.rs`, pruned hourly by the service: `<install>/taskq.log` and `<project>.log` past 4 MiB and `.taskq/cli-errors.log` past 256 KiB keep their newest half; attempt logs the newest 50 plus live attempts; `.taskq/inputs/*.txt` the newest 50 plus files locked by live Claude turns; `incidents/` the newest 50; `requests/comments` past 1000 lines the newest half plus comments still eligible; `events`, `requests/` and `requests.log` follow [taskq.md section 4](../../taskq.md#4-service). A corrupt local state file reads unknown, admits or adopts nothing and deletes no release ([menu](menu.md#contract-detail)).

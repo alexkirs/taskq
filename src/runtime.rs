@@ -49,12 +49,25 @@ impl Proc for Child {
 /// A process with this pid runs (§ 4 one service per root); pid reuse reads live, a ceiling accepted for a 60 s window.
 #[cfg(unix)]
 pub fn alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else { return false };
-    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+    liveness(pid).unwrap_or(false)
+}
+
+#[cfg(unix)]
+pub fn liveness(pid: u32) -> Result<bool, String> {
+    let pid = i32::try_from(pid).ok().filter(|p| *p > 0).ok_or("invalid process id")?;
+    if unsafe { libc::kill(pid, 0) } == 0 { return Ok(true); }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() { Some(libc::ESRCH) => Ok(false), Some(libc::EPERM) => Ok(true), _ => Err(format!("process liveness unknown: {e}")) }
 }
 
 #[cfg(windows)]
 pub fn alive(pid: u32) -> bool {
+    liveness(pid).unwrap_or(false)
+}
+
+#[cfg(windows)]
+pub fn liveness(pid: u32) -> Result<bool, String> {
+    if pid == 0 { return Err("invalid process id".into()); }
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
@@ -64,12 +77,14 @@ pub fn alive(pid: u32) -> bool {
     unsafe {
         let h = OpenProcess(0x1000, 0, pid); // PROCESS_QUERY_LIMITED_INFORMATION
         if h.is_null() {
-            return false;
+            let e = std::io::Error::last_os_error();
+            return if e.raw_os_error() == Some(87) { Ok(false) } else { Err(format!("process liveness unknown: {e}")) };
         }
         let mut code = 0;
-        let ok = GetExitCodeProcess(h, &mut code) != 0 && code == 259; // STILL_ACTIVE
+        let read = GetExitCodeProcess(h, &mut code) != 0;
+        let error = std::io::Error::last_os_error();
         CloseHandle(h);
-        ok
+        if read { Ok(code == 259) } else { Err(format!("process liveness unknown: {error}")) }
     }
 }
 

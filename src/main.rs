@@ -1754,7 +1754,13 @@ fn run(argv: &[String]) -> Res<()> {
                 print!("{}", runtime::compact(Path::new(root), role, n(task)?, n(attempt)?).map_err(|e| e.to_string())?);
                 Ok(())
             }
-            _ => Err("usage: taskq rules compact ROOT ROLE TASK ATTEMPT".into()),
+            // a worker or reviewer under the project hook: its rules come with its turn (§ 8)
+            [pm, _] if pm == "pm" && std::env::var_os("TASKQ_ROLE").is_some() => Ok(()),
+            [pm, phase] if pm == "pm" && (phase == "start" || phase == "compact") => {
+                print!("{}", runtime::pm(&find_root()?, phase).map_err(|e| e.to_string())?);
+                Ok(())
+            }
+            _ => Err("usage: taskq rules compact ROOT ROLE TASK ATTEMPT | taskq rules pm start|compact".into()),
         },
         "selftest" => {
             let n = golden_selftest(core::GOLDEN, !platform::VERSION.contains('-')).map_err(|e| format!("fold: FAIL {e}"))?;

@@ -221,7 +221,8 @@ pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume:
     let access = crate::runtime::access(&env, rt).map_err(|e| e.to_string())?;
     let mut c = crate::runtime::command(&env, &l, &access)?;
     for k in ["TASKQ_TASK", "TASKQ_ATTEMPT", "TASKQ_ROLE"] { c.env_remove(k); }
-    let text = crate::runtime::instructions(&format!("Read {} first. TaskQ commands: {}.\n{brief}", crate::runtime::contract(root), exe.display())).map_err(|e| e.to_string())?;
+    let text = crate::runtime::instructions(root, &format!("Read {} first. TaskQ commands: {}.\n{brief}", crate::runtime::contract(root), exe.display()), resume.is_some())
+        .map_err(|e| e.to_string())?;
     fs::create_dir_all(logs).map_err(|e| e.to_string())?;
     let out = logs.join(format!("{name}.out"));
     if rt == "claude" && (resume.is_none() || crate::runtime::claude_background(root, &l.session)?) {

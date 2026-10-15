@@ -420,36 +420,125 @@ pub fn brief(env: &Env, l: &Launch) -> String {
 }
 
 const SPECQ_REVISION: &str = "46f5f62389f84ce3cc4d2a526a42a5d4bacbf8be";
-const SPECQ_FILES: &[&str] = &["engineering/agent-workflow.md", "engineering/use-cases.md", "engineering/verification.md", "caveman/rules/changes.md"];
+/// The specq shared core, sent whole at each start (§ 8 Rule delivery).
+const SPECQ_CORE: &[&str] = &[
+    "engineering/principles.md", "engineering/spec-first.md", "engineering/ponytail.md", "engineering/agent-workflow.md",
+    "engineering/use-cases.md", "engineering/verification.md", "engineering/security.md",
+    "caveman/rules/core.md", "caveman/rules/documentation.md", "caveman/rules/changes.md",
+];
+/// Every other specq Markdown file at the pin, without `README.md`, `AGENTS.md`, `SECURITY.md`, `scripts/`, `vendor/`,
+/// `audits/` and `docs/`: indexed by path and first heading. A new pin updates both lists.
+const SPECQ_INDEX: &[&str] = &[
+    "caveman/SOURCES.md", "caveman/examples/messages.md", "caveman/rules/agents.md", "caveman/rules/indicators.md",
+    "caveman/rules/notifications.md", "design/dashboards.md", "design/implementation-fidelity.md", "design/labels.md",
+    "design/operator-ui.md", "design/workflow-review.md", "design/workflow.md", "engineering/data.md", "engineering/performance.md",
+    "engineering/permission-authority.md", "engineering/product-connections.md", "engineering/profiling.md",
+    "engineering/release-contract.md",
+];
+/// One cap for the injected header, contract, core and index (§ 8).
+const RULES_CAP: usize = 128 * 1024;
+/// This release's contract, for a root without `taskq.md` (`contract` names its URL).
+const CONTRACT: &str = include_str!("../taskq.md");
+const INDEX: &str = "\nIndex of other shared rules";
 
 fn rule_file(url: &str) -> Result<String, String> {
-    let out = crate::platform::quiet(Command::new("curl").args(["-q", "--fail", "--silent", "--show-error", "--proto", "=https", "--max-time", "10", "--max-filesize", "65536", url]))
+    let out = crate::platform::quiet(Command::new("curl").args(["-q", "--fail", "--silent", "--show-error", "--proto", "=https", "--max-time", "10", "--max-filesize", "131072", url]))
         .output().map_err(|e| e.to_string())?;
     if !out.status.success() { return Err(format!("curl exited {}", out.status)); }
     String::from_utf8(out.stdout).map_err(|_| "invalid UTF-8".into())
 }
 
-fn rule_text(task: &str, mut fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
-    let mut text = format!("TaskQ shared rules: specq@{SPECQ_REVISION}\nThese canonical rules apply to this turn, including continuations. Apply them to the work; acknowledgement alone is not evidence.\n");
-    for file in SPECQ_FILES {
-        let url = format!("https://raw.githubusercontent.com/taskqorg/specq/{SPECQ_REVISION}/{file}");
-        let body = fetch(&url).and_then(|body| {
-            if body.trim().is_empty() || body.len() > 65536 { Err("empty or over 64 KiB".into()) } else { Ok(body) }
-        }).map_err(|e| StartError { message: format!("specq@{SPECQ_REVISION} {file}: {e}"), reportable: false })?;
-        text.push_str(&format!("\n--- specq/{file} ({url}) ---\n{body}\n"));
+fn specq_dir(root: &Path) -> PathBuf {
+    root.join(".taskq").join("specq").join(SPECQ_REVISION)
+}
+
+fn refused(what: &str, e: impl std::fmt::Display) -> StartError {
+    StartError { message: format!("specq@{SPECQ_REVISION} {what}: {e}"), reportable: false }
+}
+
+/// A pinned specq file from `<root>/.taskq/specq/<revision>/`, fetched once when missing or invalid there (R1: a cache).
+fn pinned(root: &Path, file: &str, fetch: &mut impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
+    let path = specq_dir(root).join(file);
+    if let Some(body) = std::fs::read(&path).ok().and_then(|b| String::from_utf8(b).ok()).filter(|b| !b.trim().is_empty()) {
+        return Ok(body);
     }
+    let body = fetch(&format!("https://raw.githubusercontent.com/taskqorg/specq/{SPECQ_REVISION}/{file}")).map_err(|e| refused(file, e))?;
+    if body.trim().is_empty() { return Err(refused(file, "empty")); }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::create_dir_all(path.parent().unwrap()).and_then(|_| std::fs::write(&tmp, &body)).and_then(|_| std::fs::rename(&tmp, &path))
+        .map_err(|e| refused(file, e))?;
+    Ok(body)
+}
+
+fn heading(body: &str) -> &str {
+    body.lines().find(|l| l.starts_with('#')).map_or("(no heading)", |l| l.trim_start_matches('#').trim())
+}
+
+/// `docs/` Markdown files below `root` with their first heading, sorted by `/` path; an unreadable one refuses the launch.
+fn docs(root: &Path) -> Result<Vec<(String, String)>, StartError> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let (path, kind) = (entry.path(), entry.file_type()?);
+            if kind.is_dir() {
+                walk(root, &path, out)?;
+            } else if kind.is_file() && path.extension().is_some_and(|e| e == "md") {
+                let rel = path.strip_prefix(root).unwrap().components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+                let body = String::from_utf8(std::fs::read(&path)?).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{rel}: invalid UTF-8")))?;
+                out.push((rel, heading(&body).to_string()));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    let dir = root.join("docs");
+    if dir.is_dir() { walk(root, &dir, &mut out).map_err(|e| refused("docs index", e))?; }
+    out.sort();
+    Ok(out)
+}
+
+/// § 8 Rule delivery: header, contract, core and index before the task text at start; header and index at resume.
+fn rule_text(root: &Path, task: &str, resume: bool, mut fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
+    let dir = specq_dir(root);
+    let spec = contract(root);
+    let contract = match std::fs::read(root.join("taskq.md")) {
+        Ok(b) => String::from_utf8(b).map_err(|_| refused("contract", "invalid UTF-8"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CONTRACT.into(),
+        Err(e) => return Err(refused("contract", e)),
+    };
+    if contract.trim().is_empty() { return Err(refused("contract", "empty")); }
+    // the header names the cache: every pinned file is there, at start and at resume
+    let core = SPECQ_CORE.iter().map(|f| pinned(root, f, &mut fetch)).collect::<Result<Vec<_>, _>>()?;
+    let mut text = format!(
+        "TaskQ rules: specq@{SPECQ_REVISION} at `{}`; contract `{spec}`.\n\
+         Precedence: the project contract overrides shared rules where they conflict.\n\
+         These rules apply to this turn, including continuations. Apply them to the work; acknowledgement alone is not evidence.\n",
+        dir.display()
+    );
+    if resume {
+        text.push_str("Resume: the contract and core bodies came at start; reread them at the paths above when needed.\n");
+    } else {
+        text.push_str(&format!("\n--- contract {spec} ---\n{contract}\n"));
+        for (file, body) in SPECQ_CORE.iter().zip(&core) { text.push_str(&format!("\n--- specq/{file} ---\n{body}\n")); }
+    }
+    text.push_str(&format!("{INDEX} (read on demand under `{}`):\n", dir.display()));
+    for file in SPECQ_INDEX { text.push_str(&format!("- {file}: {}\n", heading(&pinned(root, file, &mut fetch)?))); }
+    text.push_str("Index of project docs (read on demand in your worktree):\n");
+    for (path, title) in docs(root)? { text.push_str(&format!("- {path}: {title}\n")); }
+    if text.len() > RULES_CAP { return Err(refused("rules", format!("{} bytes over the {RULES_CAP}-byte cap", text.len() - RULES_CAP))); }
     text.push_str(&format!("\nTaskQ task\n{task}"));
     Ok(text)
 }
 
-pub fn instructions(task: &str) -> Result<String, StartError> {
-    rule_text(task, rule_file)
+/// The operator's turn text (§ 8 Rule delivery).
+pub fn instructions(root: &Path, task: &str, resume: bool) -> Result<String, StartError> {
+    rule_text(root, task, resume, rule_file)
 }
 
 fn turn_text(env: &Env, l: &Launch, fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
     let mut task = brief(env, l);
     if let Some(answer) = &l.resume { task.push_str(&format!("\nContinue this same attempt with the following inbox message:\n{answer}")); }
-    rule_text(&task, fetch)
+    rule_text(env.root, &task, l.resume.is_some(), fetch)
 }
 
 /// Keep OS failure classes until the service decides whether a start failure is TaskQ's fault.
@@ -491,8 +580,10 @@ fn spawn_inner(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     let access = access(env, &l.rt)?;
     log!("#{} attempt {} access {}", l.task, l.attempt, access.line());
     let text = turn_text(env, l, rule_file)?;
-    log!("specq@{SPECQ_REVISION} loaded for {} #{} attempt {} ({})", l.role, l.task, l.attempt, if l.resume.is_some() { "resume" } else { "start" });
+    let phase = if l.resume.is_some() { "resume" } else { "start" };
+    log!("specq@{SPECQ_REVISION} loaded for {} #{} attempt {} ({phase}, {} bytes)", l.role, l.task, l.attempt, text.len());
     let log = log_path(env.root, l);
+    rules_line(&log, phase, &text).map_err(|e| StartError::io(e, None))?;
     if l.rt == "codex-app" {
         let mut turn = AppTurn { hand: None, log, text, thread: l.session.clone(), done: 0, rollout: None, running: app_running };
         match &l.resume {
@@ -509,6 +600,17 @@ fn spawn_inner(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     let pos = std::fs::metadata(&log).map_or(0, |m| m.len());
     let child = start(env, l, &log, &text, &access)?;
     Ok(Box::new(CliTurn { proc: Box::new(child), log, pos }))
+}
+
+/// The attempt log's evidence of § 8 Rule delivery: the injected header and part counts, one JSON line.
+pub fn rules_line(log: &Path, phase: &str, text: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(log.parent().unwrap())?;
+    let rules = text.split("\nTaskQ task\n").next().unwrap_or_default();
+    let header = rules.split("\n\n").next().unwrap_or_default();
+    let bodies = rules.matches("\n--- contract ").count() + rules.matches("\n--- specq/").count();
+    let index = rules.find(INDEX).map_or(0, |i| rules[i..].lines().filter(|l| l.starts_with("- ")).count());
+    let line = serde_json::json!({"type": "taskq.rules", "phase": phase, "header": header, "bodies": bodies, "index": index, "bytes": rules.len()});
+    writeln!(File::options().create(true).append(true).open(log)?, "{line}")
 }
 
 fn start(env: &Env, l: &Launch, log: &Path, text: &str, access: &crate::policy::Effective) -> Result<Child, StartError> {
@@ -1060,35 +1162,112 @@ mod tests {
         assert_eq!(values, vec!["7", "42", &l.role, &root.display().to_string(), &exe.display().to_string()]);
     }
 
-    // Chain: § 8 rule delivery. Risk: a new/resumed worker or reviewer receives only links or mixed rules.
+    fn rules_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("taskq-rules-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("docs/sub")).unwrap();
+        std::fs::write(root.join("docs/guide.md"), "Intro line\n## Guide title\nBody.").unwrap();
+        std::fs::write(root.join("docs/sub/plain.md"), "No heading here.").unwrap();
+        std::fs::write(root.join("docs/shot.png"), [0u8, 159, 146]).unwrap();
+        root
+    }
+
+    fn rule(url: &str) -> Result<String, String> {
+        Ok(format!("# Rule from {url}\nApply this rule."))
+    }
+
+    fn url(file: &str) -> String {
+        format!("https://raw.githubusercontent.com/taskqorg/specq/{SPECQ_REVISION}/{file}")
+    }
+
+    // Chain: § 8 rule delivery, #1156. Risk: a new/resumed worker or reviewer misses the contract, a core rule or the index,
+    // or a resume resends every body.
     #[test]
     fn rules_reach_every_runtime_role_and_resume() {
-        let env = Env { root: Path::new("/p"), exe: Path::new("/i/taskq"), install: Path::new("/i"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
+        let root = rules_root("roles");
+        let env = Env { root: &root, exe: Path::new("/i/taskq"), install: Path::new("/i"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
+        let dir = specq_dir(&root).display().to_string();
         for rt in ["claude", "codex", "codex-app"] {
             for role in ["worker", "reviewer"] {
                 for resume in [None, Some("Owner answer: preserve current work.\nLiteral $HOME stays text.".into())] {
                     let l = Launch { task: 7, title: "T".into(), attempt: 42, role: role.into(), rt: rt.into(), session: "same-session".into(), url: "https://b/7".into(), resume };
-                    let mut urls = Vec::new();
-                    let text = turn_text(&env, &l, |url| { urls.push(url.to_string()); Ok(format!("# Rule from {url}\nApply this rule.")) }).unwrap();
-                    assert_eq!(urls.len(), SPECQ_FILES.len(), "{rt} {role}: rules must actually load");
-                    for file in SPECQ_FILES {
-                        let url = format!("https://raw.githubusercontent.com/taskqorg/specq/{SPECQ_REVISION}/{file}");
-                        assert!(urls.contains(&url) && text.contains(&format!("# Rule from {url}\nApply this rule.")));
+                    let text = turn_text(&env, &l, rule).unwrap();
+                    let (rules, task) = text.split_once("\nTaskQ task\n").unwrap();
+                    // header: revision, cache path, contract path (this release's URL: the root has no taskq.md), precedence
+                    let header = rules.split("\n\n").next().unwrap();
+                    assert!(header.contains(SPECQ_REVISION) && header.contains(&dir) && header.contains("https://github.com/taskqorg/taskq/blob/"));
+                    assert!(header.contains("Precedence: the project contract overrides shared rules where they conflict."));
+                    // one index line per specq index file and per docs Markdown file, at start and at resume
+                    for file in SPECQ_INDEX { assert_eq!(rules.matches(&format!("\n- {file}: Rule from {}\n", url(file))).count(), 1, "{file}"); }
+                    assert!(rules.contains("\n- docs/guide.md: Guide title\n- docs/sub/plain.md: (no heading)\n") && !rules.contains("shot.png"));
+                    let bodies = rules.matches("\n--- ").count();
+                    if l.resume.is_some() {
+                        assert_eq!(bodies, 0, "{rt} {role}: resume sends header and index only");
+                        assert!(!rules.contains("Apply this rule.") && !rules.contains("Rule delivery (R13)"));
+                    } else {
+                        assert_eq!(bodies, 1 + SPECQ_CORE.len());
+                        assert!(rules.contains(&format!("\n{CONTRACT}\n")), "{rt} {role}: whole contract");
+                        for file in SPECQ_CORE { assert_eq!(rules.matches(&format!("\n--- specq/{file} ---\n{}\n", rule(&url(file)).unwrap())).count(), 1); }
                     }
-                    assert!(text.find(SPECQ_REVISION).unwrap() < text.find("TaskQ task").unwrap());
-                    if let Some(answer) = &l.resume { assert!(text.ends_with(answer)); }
-                    else { assert!(text.ends_with(&brief(&env, &l))); }
+                    if let Some(answer) = &l.resume { assert!(task.ends_with(answer)); }
+                    else { assert_eq!(task, brief(&env, &l)); }
                     assert_eq!(l.session, "same-session");
                     // Native sessions do not inherit the child env; without the prefix `result` is refused as a non-worker.
                     let prefix = if cfg!(windows) && rt == "codex-app" { "$env:TASKQ_TASK='7'; $env:TASKQ_ATTEMPT='42'; " } else { "env TASKQ_TASK=7 TASKQ_ATTEMPT=42 " };
                     assert_eq!(brief(&env, &l).contains(prefix), rt != "codex", "{rt} {role}: attempt identity");
-                    assert!(text.contains("https://github.com/taskqorg/taskq/blob/") && text.contains(FILES) && text.contains(CI_WAIT));
-                    for bad in [Err("offline".into()), Ok(String::new()), Ok("x".repeat(65537))] {
-                        assert!(turn_text(&env, &l, |_| bad.clone()).is_err());
-                    }
+                    assert!(task.contains(FILES) && task.contains(CI_WAIT));
+                    // the attempt log's evidence line
+                    let log = root.join(format!(".taskq/{rt}-{role}.log"));
+                    std::fs::remove_file(&log).ok();
+                    rules_line(&log, "start", &text).unwrap();
+                    let v: serde_json::Value = serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
+                    assert_eq!((v["type"].as_str(), v["header"].as_str(), v["bodies"].as_u64()), (Some("taskq.rules"), Some(header), Some(bodies as u64)));
+                    assert_eq!(v["index"].as_u64(), Some(SPECQ_INDEX.len() as u64 + 2));
                 }
             }
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Chain: § 8 rule delivery cache and refusals, #1156. Risk: a missing or unreadable pinned file, an unreadable doc or an
+    // oversized payload starts a worker without its rules; or every start refetches the pin.
+    #[test]
+    fn rules_come_from_the_pin_cache_and_refuse_when_unreadable() {
+        let root = rules_root("cache");
+        std::fs::write(root.join("taskq.md"), "# Project contract\nProject rule.\n").unwrap();
+        let mut fetched = Vec::new();
+        let text = rule_text(&root, "task", false, |u| { fetched.push(u.to_string()); rule(u) }).unwrap();
+        assert_eq!(fetched.len(), SPECQ_CORE.len() + SPECQ_INDEX.len(), "each pinned file once");
+        assert!(text.contains(&format!("--- contract {} ---\n# Project contract\nProject rule.\n", root.join("taskq.md").display())));
+        for file in SPECQ_CORE.iter().chain(SPECQ_INDEX) {
+            assert!(fetched.contains(&url(file)));
+            assert_eq!(std::fs::read_to_string(specq_dir(&root).join(file)).unwrap(), rule(&url(file)).unwrap());
+        }
+        for resume in [false, true] {
+            assert!(rule_text(&root, "task", resume, |u| Err(format!("refetched {u}"))).is_ok(), "the cache serves the pin");
+        }
+        // a cached file that went bad is fetched again; a failed fetch refuses
+        std::fs::write(specq_dir(&root).join(SPECQ_CORE[3]), [0xffu8, 0xfe]).unwrap();
+        std::fs::write(specq_dir(&root).join(SPECQ_INDEX[0]), "").unwrap();
+        for resume in [false, true] {
+            for bad in [Err("offline".to_string()), Ok(" \n".to_string())] {
+                let e = rule_text(&root, "task", resume, |_| bad.clone()).unwrap_err().to_string();
+                assert!(e.contains(SPECQ_CORE[3]), "{e}");
+            }
+        }
+        let mut again = Vec::new();
+        rule_text(&root, "task", true, |u| { again.push(u.to_string()); rule(u) }).unwrap();
+        assert_eq!(again, [url(SPECQ_CORE[3]), url(SPECQ_INDEX[0])]);
+        // an unreadable doc, contract or an over-cap payload refuses
+        std::fs::write(root.join("docs/sub/bad.md"), [0xffu8]).unwrap();
+        assert!(rule_text(&root, "task", true, rule).unwrap_err().to_string().contains("docs/sub/bad.md"));
+        std::fs::remove_file(root.join("docs/sub/bad.md")).unwrap();
+        std::fs::write(root.join("taskq.md"), [0xffu8]).unwrap();
+        assert!(rule_text(&root, "task", false, rule).is_err());
+        std::fs::write(root.join("taskq.md"), "x".repeat(RULES_CAP)).unwrap();
+        assert!(rule_text(&root, "task", false, rule).unwrap_err().to_string().contains("cap"));
+        assert!(rule_text(&root, "task", true, rule).is_ok(), "a resume sends no contract body");
+        std::fs::remove_dir_all(&root).ok();
     }
 
 }

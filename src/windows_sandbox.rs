@@ -175,7 +175,7 @@ mod tests {
         fs::write(root.join("taskq.md"), format!("# Owner-authorized isolated runtime qualification\nThis fixture has no board task: do not run inbox, create worktrees, commit, publish, change permissions or request elevation. These owner instructions override generic board workflow. Both roles must execute exactly `& '{}' check.py` from this root, inspect its JSON stdout and compare baseline, expected and candidate active/repeated/empty cases. Identify a regression even when the command exits 0. Report actual canary and nested-launcher errors, never infer successful denial from tool startup failure. Do not edit check.py or repair the controller-injected candidate. Repeat the exact check on continuation after stage changes.\n", python.replace('\'', "''"))).unwrap();
         fs::write(root.join("AGENTS.md"), "Read taskq.md; disposable qualification only.\n").unwrap();
         let attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() * 2;
-        let rule_bodies = crate::runtime::instructions("").unwrap();
+        let rules = [false, true].map(|resume| crate::runtime::instructions(&root, "", resume).unwrap());
         for (i, role) in ["worker", "reviewer"].iter().enumerate() {
             let mut l = Launch { task: 1, title: "Owner-authorized isolated Windows boundary qualification; follow fixture taskq.md, no board or publication.".into(), attempt: attempt + i as u64,
                 role: role.to_string(), rt: "codex".into(), session: crate::runtime::uuid(), url: "https://github.com/taskqorg/taskq".into(), resume: None };
@@ -198,11 +198,12 @@ mod tests {
                 assert!(events.iter().any(|v| v["type"] == "turn.completed"), "native completion");
                 assert!(!events.iter().any(|v| v["type"] == "turn.failed"), "native failure: {log}");
                 let transcript = fs::read_to_string(crate::runtime::rollout(&l.session).expect("native transcript")).unwrap();
-                let loaded = transcript.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                let inputs: Vec<String> = transcript.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
                     .filter(|v| v["type"] == "response_item" && v["payload"]["role"] == "user")
                     .filter_map(|v| v["payload"]["content"].as_array().map(|items| items.iter().filter_map(|v| v["text"].as_str()).collect::<Vec<_>>().join("\n")))
-                    .filter(|text| text.contains(rule_bodies.as_str())).count();
-                assert_eq!(loaded, turn + 1, "complete pinned rule bodies in every native turn");
+                    .collect();
+                let loaded = rules.each_ref().map(|r| inputs.iter().filter(|text| text.contains(r.as_str())).count());
+                assert_eq!(loaded, [1, turn], "contract, core and index at start; header and index at each resume");
                 let proof: Value = events.iter().filter(|v| v["type"] == "item.completed" && v["item"]["type"] == "command_execution")
                     .filter_map(|v| serde_json::from_str::<Value>(v["item"]["aggregated_output"].as_str()?).ok())
                     .filter(|v| v["stage"] == turn.to_string()).last().expect("real command proof");

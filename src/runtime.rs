@@ -22,6 +22,7 @@ pub struct Launch {
 pub trait Proc {
     /// The exit code once the child has exited; `Err` is an unknown read (§ 4 reconciliation), never an exit.
     fn exited(&mut self) -> Result<Option<i32>, String>;
+    fn exit_error(&self) -> Option<&'static str> { None }
     fn kill(&mut self);
     fn id(&self) -> u32;
 }
@@ -686,6 +687,7 @@ pub struct ClaudeTurn {
     _input_file: File,
     pid: u32,
     done: bool,
+    failure: Option<&'static str>,
 }
 
 fn claude_agents(root: &Path) -> Result<Vec<serde_json::Value>, String> {
@@ -695,10 +697,25 @@ fn claude_agents(root: &Path) -> Result<Vec<serde_json::Value>, String> {
     serde_json::from_str(&out).map_err(|e| format!("claude agents: {e}"))
 }
 
+fn claude_home() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).or_else(||
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|h| PathBuf::from(h).join(".claude")))
+}
+
+pub(crate) fn claude_failure(row: &serde_json::Value, root: &Path, id: &str, home: Option<&Path>) -> &'static str {
+    let detail = row["detail"].as_str().map(String::from).or_else(|| {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') { return None; }
+        let text = std::fs::read_to_string(home?.join("jobs").join(id).join("state.json")).ok()?;
+        let job: serde_json::Value = serde_json::from_str(&text).ok()?;
+        if job["state"] != row["state"] || Path::new(job["cwd"].as_str()?).canonicalize().ok()? != root.canonicalize().ok()? { return None; }
+        job["detail"].as_str().map(String::from)
+    });
+    crate::profile::class(detail.as_deref().unwrap_or_default())
+}
+
 fn claude_transcript(session: &str) -> Option<PathBuf> {
     if session.is_empty() || !session.chars().all(|c| c.is_ascii_hexdigit() || c == '-') { return None; }
-    let home = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).or_else(||
-        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|h| PathBuf::from(h).join(".claude")))?;
+    let home = claude_home()?;
     std::fs::read_dir(home.join("projects")).ok()?.flatten().find_map(|d| {
         let p = d.path().join(format!("{session}.jsonl"));
         p.is_file().then_some(p)
@@ -764,7 +781,7 @@ impl ClaudeTurn {
             return Err("Claude created a copy; stopped owned copy, original conversation preserved".into());
         }
         Ok(Self { root, log: log.into(), session: if l.resume.is_some() { l.session.clone() } else { String::new() }, id: id.into(),
-            announced: false, copied: 0, before, mode: permission_mode.into(), input, _input_file: input_file, pid: 0, done: false })
+            announced: false, copied: 0, before, mode: permission_mode.into(), input, _input_file: input_file, pid: 0, done: false, failure: None })
     }
 }
 
@@ -773,9 +790,24 @@ impl Proc for ClaudeTurn {
         if self.done { return Ok(Some(0)); }
         let rows = claude_agents(&self.root)?;
         let row = rows.iter().find(|v| v["id"] == self.id).ok_or("Claude session unavailable; state unknown")?;
+        self.observe(row)
+    }
+    fn exit_error(&self) -> Option<&'static str> { self.failure }
+    fn kill(&mut self) { if let Err(e) = claude_stop(&self.root, &self.id, self.pid) { log!("{e}"); } }
+    fn id(&self) -> u32 { self.pid }
+}
+
+impl ClaudeTurn {
+    fn observe(&mut self, row: &serde_json::Value) -> Result<Option<i32>, String> {
+        // Failed background launches can have neither status nor a transcript (#1208).
+        let state = row["state"].as_str().ok_or("Claude job state unavailable; state unknown")?;
+        if !matches!(state, "working" | "idle" | "done" | "blocked") {
+            self.failure = Some(claude_failure(row, &self.root, &self.id, claude_home().as_deref()));
+            return Ok(Some(-1));
+        }
         // On Windows a waking session briefly publishes a different UUID before restore.
         if !self.announced {
-            if row["status"].as_str().is_none() { return if row["state"] == "stopped" { Ok(Some(-1)) } else { Ok(None) }; }
+            if row["status"].as_str().is_none() { return Ok(None); }
             let session = row["sessionId"].as_str().ok_or("Claude session ID unknown")?;
             if !self.session.is_empty() && self.session != session { return Err("Claude resumed another conversation; identity unknown".into()); }
             self.session = session.into();
@@ -793,7 +825,7 @@ impl Proc for ClaudeTurn {
         for event in turn.iter().skip(self.copied) { writeln!(log, "{event}").map_err(|e| e.to_string())?; }
         self.copied = turn.len();
         if row["status"] != "idle" && row["state"] != "done" && row["state"] != "blocked" {
-            return if row["state"] == "stopped" { Ok(Some(-1)) } else { Ok(None) };
+            return Ok(None);
         }
         if !turn.iter().any(|v| v["type"] == "system" && v["subtype"] == "turn_duration") { return Ok(None); }
         let answer = turn.iter().rev().filter(|v| v["type"] == "assistant").find_map(|v|
@@ -803,8 +835,6 @@ impl Proc for ClaudeTurn {
         self.done = true;
         Ok(Some(0))
     }
-    fn kill(&mut self) { if let Err(e) = claude_stop(&self.root, &self.id, self.pid) { log!("{e}"); } }
-    fn id(&self) -> u32 { self.pid }
 }
 
 /// Only a URL registered by the native session is a Remote Control link.
@@ -1165,6 +1195,28 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&install);
+    }
+
+    // Chain: service failed reviewer launch -> exit -> gone (the service reviewer test covers the pass).
+    // Risk: missing status/transcript masks a terminal native job and renews its lease forever.
+    #[test]
+    fn claude_failed_launch_exits_without_status_or_transcript() {
+        let mut t = ClaudeTurn { root: PathBuf::new(), log: PathBuf::new(), session: String::new(),
+            id: "invented-job".into(), announced: false, copied: 0, before: 0, mode: "dontAsk".into(),
+            input: "invented input".into(), _input_file: File::open(std::env::current_exe().unwrap()).unwrap(), pid: 0, done: false, failure: None };
+        for state in ["failed", "stopped", "crashed", "unexpected"] {
+            assert_eq!(t.observe(&serde_json::json!({"state":state})), Ok(Some(-1)));
+            t.announced = true;
+            assert_eq!(t.observe(&serde_json::json!({"state":state,"status":"working"})), Ok(Some(-1)));
+            t.announced = false;
+        }
+        assert!(t.observe(&serde_json::json!({})).is_err());
+        assert!(t.observe(&serde_json::json!({"state":null})).is_err());
+        assert_eq!(t.observe(&serde_json::json!({"state":"working"})), Ok(None));
+        assert_eq!(t.observe(&serde_json::json!({"state":"failed", "detail":"ENAMETOOLONG: name too long, uv_spawn"})), Ok(Some(-1)));
+        assert_eq!(t.exit_error(), Some("argument-too-long"));
+        assert_eq!(t.observe(&serde_json::json!({"state":"failed", "detail":"permission denied"})), Ok(Some(-1)));
+        assert_eq!(t.exit_error(), Some("permission"));
     }
 
     // Chain: § 8 codex-app handshake -> open thread -> queue -> one new `task_complete` on this host's app.

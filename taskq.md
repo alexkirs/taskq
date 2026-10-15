@@ -1,6 +1,6 @@
 # taskq contract
-taskq runs a queue of agent tasks on a GitHub or GitLab issue board. This file is the contract: states, log, roles, lease and fencing, compatibility, deployment; a linked `Contract detail` section of a docs page holds moved detail with the same authority. Decision history lives in git and issues; operational state on the board (R1).
-This file specifies **v4**, the Rust binary from `src/`.
+taskq queues agents on GitHub/GitLab. Contract includes linked `Contract detail` sections; state: board (R1).
+**v4**: Rust in `src/`.
 ## Principles (R1–R13)
 ### Change rule
 A task that changes a rule names its R-number, edits this file in the same deliverable as the code and lists the amended R-numbers in its result. A changed rule keeps its number. A new rule gets the next one. A rule elsewhere that disagrees with this file is a defect. No history here: no dates, no decision logs; line bound: R8.
@@ -148,7 +148,7 @@ TaskQ sources: the §2 transition table, `tests/golden/*.json` traces (`fold.jso
 `taskq service run` is the host's single long-lived process; `taskq service install` makes the OS keep it running (§ 8).
 One loop:
 
-1. Reap exited children; a CLI child whose attempt log shows its turn ended (`turn.completed`, `turn.failed`, `result`) counts as exited and its lingering process tree is stopped (#1034). A child whose attempt is still current posts `gone attempt <id>` with the exit code and the last worker message of its log (one line, absolute paths root-relative or `<path>`, at most 240 characters with the label; § 7 rule 6), unless the attempt wrote `ask`, `result` or `requeue` after the child started: a clean exit; step 6 resumes it from its inbox.
+1. Reap. All OS: Claude `claude agents --json --all` job (state outside `working`/`idle`/`done`/`blocked`: exit; classify detail for stage, falling back to the owned native jobs/<id>/state.json when CLI detail is absent; missing/read error: unknown); CLI `try_wait`, adopted Unix `waitpid`. CLI log `turn.completed`/`turn.failed`/`result` ends turn: stop tree (#1034). If current: `gone attempt <id>`, exit code and last worker line (absolute paths root-relative or `<path>`; 240 characters including label; §7 rule 6), unless `ask`/`result`/`requeue` since start: clean exit; step 6 resumes inbox.
 2. Stop children whose attempt is no longer current (R11). Remove worktrees of closed tasks (§ 7).
 3. Write the heartbeat issue `taskq host <name>` (label `taskq-host`) when older than `ttl / 3` or its body changes: lines `version <v>`, `service <id>`
    (12 hex of SHA-256 of `<install>/installation-id`), `machine <hostname>[ wsl]` (the `hostname` output, as agentq `host.name`; `wsl` under WSL; DashQ joins Hosts rows by it, [dashq hosts](https://github.com/taskqorg/dashq/blob/main/docs/design/hosts.md) H2), `#<N> <id>` per live child or launch held by the load gate, `session #<N> <id> <url>` per live Claude child with a Remote Control URL, `focus off|unknown` when the focus admits nothing, plus `at <board time>` (a same-body edit keeps `updated_at`). Freshness uses the board's `updated_at` and the response `Date`, never local clocks.

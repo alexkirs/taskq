@@ -134,6 +134,34 @@ pub fn attempt_log(root: &Path, role: &str, task: u64, attempt: u64) -> PathBuf 
     root.join(".taskq").join(format!("{p}{task}-{attempt}.log"))
 }
 
+/// Model use of the attempt log after byte `pos` (§ 4 Profiling): Claude assistant messages (calls, input tokens
+/// with cache reads and writes), Codex `turn.completed` input tokens (cached included; calls not reported).
+pub fn usage(log: &Path, pos: u64, rt: &str) -> crate::profile::Usage {
+    use crate::profile::Usage;
+    use std::io::{Read, Seek, SeekFrom};
+    if rt == "codex-app" { return Usage::Unknown("app-turn"); }
+    let mut text = String::new();
+    let Ok(mut f) = File::open(log) else { return Usage::Unknown("log-unreadable") };
+    if f.seek(SeekFrom::Start(pos)).and_then(|_| f.read_to_string(&mut text)).is_err() { return Usage::Unknown("log-unreadable"); }
+    let (mut ids, mut tokens, mut turns, mut missing) = (std::collections::HashSet::new(), 0u64, false, false);
+    for v in text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
+        let u = if v["type"] == "assistant" { &v["message"]["usage"] } else { &v["usage"] };
+        let sum = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"].iter().filter_map(|k| u[k].as_u64()).sum::<u64>();
+        // a call without input tokens makes the stage's tokens unknown, never a smaller known sum
+        let counted = match v["type"].as_str() {
+            // one message spans several lines with the same id and usage
+            Some("assistant") => v["message"]["id"].as_str().is_some_and(|id| ids.insert(id.to_string())),
+            Some("turn.completed") => { turns = true; true }
+            _ => false,
+        };
+        if counted { if u["input_tokens"].is_u64() { tokens += sum } else { missing = true } }
+    }
+    let tokens = (!missing).then_some(tokens);
+    if !ids.is_empty() { Usage::Known { calls: Some(ids.len() as u64), tokens } }
+    else if turns { Usage::Known { calls: None, tokens } }
+    else { Usage::Unknown("no-usage") }
+}
+
 /// The final text of a turn: Claude's last `result`, else Codex's last `agent_message`.
 pub fn final_text(events: &[serde_json::Value]) -> Option<String> {
     events.iter().rev().find_map(|v| {

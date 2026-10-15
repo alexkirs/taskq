@@ -19,6 +19,8 @@ thread_local!(static PARENT: Cell<u64> = const { Cell::new(0) });
 #[cfg(test)]
 thread_local!(static OBSERVED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) });
 #[cfg(test)]
+thread_local!(static STAGED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) });
+#[cfg(test)]
 pub fn take_report() -> String {
     OBSERVED.with(|v| render(&std::mem::take(&mut *v.borrow_mut())).unwrap())
 }
@@ -78,10 +80,130 @@ fn measure_at<T, E: std::fmt::Display>(path: Option<&Path>, detailed: bool, op: 
             process: std::process::id(), span, parent: PARENT.replace(span) }
     });
     let mut observation = Observation { path, began: Instant::now(), record: Record { op: op.into(), us: 0, error: "panic".into(),
-        at_ms: SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis().min(u64::MAX as u128) as u64), trace } };
+        at_ms: now_ms(), trace } };
     let result = f();
     observation.record.error = result.as_ref().err().map_or("none", |e| error(&e.to_string())).into();
     result
+}
+
+/// § 4 Profiling attempt stages; the behavioral model (§ 2) names where each starts and ends.
+pub const STAGES: [&str; 7] = ["claim", "start", "build", "checks", "review", "ask", "close"];
+const STAGE_PREFIX: &str = "taskq-stage ";
+const OUTCOMES: [&str; 6] = ["ok", "ask", "retried", "failed", "cancelled", "unknown"];
+/// Stage-only error classes: a child ended without hand-in; its issue left the board read or could not be read back.
+const STAGE_ERRORS: [&str; 3] = ["exit", "left-board", "unreadable"];
+const RUNTIMES: [&str; 4] = ["claude", "codex", "codex-app", "other"];
+const UNKNOWN: [&str; 5] = ["no-model", "no-usage", "log-unreadable", "app-turn", "adopted"];
+
+/// Model use of one stage: service stages run no model; a runtime that reports none reads unknown, never zero;
+/// `tokens` is `None` when any counted call lacked usage.
+pub enum Usage { NoModel, Unknown(&'static str), Known { calls: Option<u64>, tokens: Option<u64> } }
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Stage {
+    stage: String,
+    task: u64,
+    attempt: u64,
+    rt: String,
+    /// `None`: the stage began in a replaced service image (adopted child), reason in `unknown`
+    us: Option<u64>,
+    outcome: String,
+    error: String,
+    at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    calls: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unknown: Option<String>,
+}
+
+fn now_ms() -> Option<u64> {
+    SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+}
+
+/// The error class of a stage that failed with `text`, never the text itself.
+pub fn class(text: &str) -> &'static str { error(text) }
+
+/// One `taskq-stage` line in this process's `taskq.log`; a failed write is reported unknown, never fails the stage.
+pub fn stage(name: &'static str, task: u64, attempt: u64, rt: &str, took: Option<std::time::Duration>, outcome: &'static str, err: &'static str, usage: Usage) {
+    #[cfg(test)]
+    STAGED.with(|v| v.borrow_mut().push(format!("{name} {task} {attempt} {rt} {outcome} {err}")));
+    stage_at(LOG.get().map(PathBuf::as_path), name, task, attempt, rt, took, outcome, err, usage)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_at(path: Option<&Path>, name: &'static str, task: u64, attempt: u64, rt: &str, took: Option<std::time::Duration>, outcome: &'static str, err: &'static str, usage: Usage) {
+    let (calls, tokens, unknown) = match usage {
+        Usage::NoModel => (None, None, Some("no-model")),
+        Usage::Unknown(r) => (None, None, Some(r)),
+        Usage::Known { calls, tokens } => (calls, tokens, tokens.is_none().then_some("no-usage")),
+    };
+    let r = Stage { stage: name.into(), task, attempt, rt: RUNTIMES.into_iter().find(|k| *k == rt).unwrap_or("other").into(),
+        us: took.map(|d| d.as_micros().min(u64::MAX as u128) as u64), outcome: outcome.into(), error: err.into(), at_ms: now_ms(), calls, tokens, unknown: unknown.map(Into::into) };
+    let Some(path) = path else { return };
+    let line = serde_json::to_string(&r).map(|j| format!("{STAGE_PREFIX}{j}\n"));
+    if line.map_err(std::io::Error::other).and_then(|l| append_line(path, &l)).is_err() {
+        let _ = writeln!(std::io::stderr().lock(), "Profiling: unknown (taskq.log full or append failed; service pruning required)");
+    }
+}
+
+/// Attempt stages ranked per runtime (§ 4 Profiling); a corrupt record makes the whole section unknown.
+fn render_stages(text: &str) -> Result<String, &'static str> {
+    let mut rows: Vec<((usize, &str), Vec<Stage>)> = vec![];
+    for line in text.lines().filter_map(|l| l.strip_prefix(STAGE_PREFIX)) {
+        let r: Stage = serde_json::from_str(line).map_err(|_| "corrupt stage record; log kept")?;
+        let i = STAGES.iter().position(|s| *s == r.stage).ok_or("unknown stage; log kept")?;
+        let rt = RUNTIMES.into_iter().find(|k| *k == r.rt).ok_or("unknown stage runtime; log kept")?;
+        if !OUTCOMES.contains(&r.outcome.as_str()) || !(ERRORS.contains(&r.error.as_str()) || STAGE_ERRORS.contains(&r.error.as_str()))
+            || r.unknown.as_deref().is_some_and(|u| !UNKNOWN.contains(&u)) { return Err("unknown stage code; log kept"); }
+        match rows.iter_mut().find(|(k, _)| *k == (i, rt)) {
+            Some((_, v)) => v.push(r),
+            None => rows.push(((i, rt), vec![r])),
+        }
+    }
+    if rows.is_empty() { return Ok("Attempt stages: unknown (no observations)\n".into()); }
+    rows.sort_by_key(|(k, _)| *k);
+    for (_, v) in &mut rows { v.sort_unstable_by_key(|r| r.us); }
+    let share = |v: &[Stage], o: &str| v.iter().filter(|r| r.outcome == o).count() as f64 / v.len() as f64;
+    // percentiles over timed records only (sorted, untimed first); untimed rows rank last
+    let p = |v: &[Stage], p: usize| { let t: Vec<u64> = v.iter().filter_map(|r| r.us).collect(); (!t.is_empty()).then(|| t[(t.len() * p).div_ceil(100) - 1]) };
+    let rank = |key: &dyn Fn(&[Stage]) -> f64| {
+        let mut r: Vec<_> = rows.iter().collect();
+        r.sort_by(|a, b| key(&b.1).total_cmp(&key(&a.1)).then(a.0.cmp(&b.0)));
+        r.iter().map(|((i, rt), _)| format!("{}/{rt}", STAGES[*i])).collect::<Vec<_>>().join(" > ")
+    };
+    let mut out = format!("Attempt stages: retained observations; all budgets unknown\nSlow stages (p95): {}\nFailing stages (rate): {}\nRetried stages (rate): {}\n\n| Stage | Runtime | Count | p50/p95/max ms | Outcomes | Model calls | Context tokens | Budget |\n|---|---|---:|---|---|---|---|---|\n",
+        rank(&|v| p(v, 95).map_or(-1., |u| u as f64)), rank(&|v| share(v, "failed")), rank(&|v| share(v, "retried")));
+    for ((i, rt), v) in &rows {
+        let mut counts = std::collections::BTreeMap::new();
+        for r in v.iter() {
+            *counts.entry(if r.error == "none" { r.outcome.clone() } else { format!("{} {}", r.outcome, r.error) }).or_insert(0) += 1;
+        }
+        let outcomes = counts.iter().map(|(k, n)| format!("{k}:{n}")).collect::<Vec<_>>().join(", ");
+        let unknown = |field: fn(&Stage) -> Option<u64>| {
+            let known: Vec<u64> = v.iter().filter_map(field).collect();
+            let mut reasons: Vec<&str> = v.iter().filter(|r| field(r).is_none()).map(|r| r.unknown.as_deref().unwrap_or("not-reported")).collect();
+            reasons.sort_unstable();
+            reasons.dedup();
+            match known.len() {
+                0 if reasons == ["no-model"] => "none (no model)".to_string(),
+                0 => format!("unknown ({})", reasons.join(", ")),
+                k if k == v.len() => known.iter().sum::<u64>().to_string(),
+                k => format!("{} ({k} of {} known; {})", known.iter().sum::<u64>(), v.len(), reasons.join(", ")),
+            }
+        };
+        let ms = |u: u64| u as f64 / 1000.;
+        let timed = v.iter().filter(|r| r.us.is_some()).count();
+        let took = match (p(v, 50), p(v, 95), v.last().and_then(|r| r.us)) {
+            (Some(a), Some(b), Some(c)) if timed == v.len() => format!("{:.3}/{:.3}/{:.3}", ms(a), ms(b), ms(c)),
+            (Some(a), Some(b), Some(c)) => format!("{:.3}/{:.3}/{:.3} ({timed} of {} timed; adopted)", ms(a), ms(b), ms(c), v.len()),
+            _ => "unknown (adopted)".into(),
+        };
+        out += &format!("| {} | {rt} | {} | {took} | {outcomes} | {} | {} | unknown |\n", STAGES[*i], v.len(), unknown(|r| r.calls), unknown(|r| r.tokens));
+    }
+    Ok(out)
 }
 
 pub struct LogLock(fs::File);
@@ -183,9 +305,10 @@ pub fn report(install: &Path) -> String {
         if text.len() as u64 > crate::data::LOG_MAX - 512 { return Err("taskq.log at retention bound; collection stopped until service pruning".into()); }
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis().min(u64::MAX as u128) as u64);
         let profile = render(&text).unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n"));
-        Ok(format!("{profile}\n{}", crate::requests::sources(&text, now)))
+        let stages = render_stages(&text).unwrap_or_else(|e| format!("Attempt stages: unknown ({e})\n"));
+        Ok(format!("{profile}\n{stages}\n{}", crate::requests::sources(&text, now)))
     };
-    read().unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n\nBoard requests by source: unknown ({e})\n"))
+    read().unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n\nAttempt stages: unknown ({e})\n\nBoard requests by source: unknown ({e})\n"))
 }
 
 #[cfg(test)]
@@ -271,6 +394,106 @@ mod tests {
         let records = fs::read_to_string(&path).unwrap().lines().filter(|l| l.starts_with(PREFIX)).count();
         assert_eq!(records, successful.load(Ordering::Relaxed));
         assert!(!report(&dir).starts_with("Profile: unknown"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Chain: #1147 attempt stage -> runtime usage from the attempt log -> bounded log -> per-runtime report.
+    // Risk: tokens double-counted or invented, failure text or paths persisted, unknown usage shown as zero.
+    #[test]
+    fn attempt_stage_trace() {
+        let dir = std::env::temp_dir().join(format!("taskq-stage-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (path, attempt) = (dir.join("taskq.log"), dir.join("attempt.log"));
+        assert!(report(&dir).contains("Attempt stages: unknown (no observations)"));
+        let claude = r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}}"#;
+        let codex = r#"{"type":"turn.completed","usage":{"input_tokens":700,"cached_input_tokens":600,"output_tokens":9}}"#;
+        // one Claude message spans several lines with one id; a second id is a second call; lines before launch are skipped
+        let before = format!("{}\n", claude.replace("m1", "m0"));
+        fs::write(&attempt, format!("{before}{claude}\n{claude}\n{}\n", claude.replace("m1", "m2"))).unwrap();
+        let ms = |m| Some(std::time::Duration::from_millis(m));
+        stage_at(Some(&path), "build", 7, 1, "claude", ms(9), "ok", "none", crate::runtime::usage(&attempt, before.len() as u64, "claude"));
+        fs::write(&attempt, format!("{codex}\n{codex}\n")).unwrap();
+        stage_at(Some(&path), "build", 8, 2, "codex", ms(5), "ask", "none", crate::runtime::usage(&attempt, 0, "codex"));
+        stage_at(Some(&path), "build", 9, 3, "codex", ms(1), "failed", "exit", crate::runtime::usage(&dir.join("missing"), 0, "codex"));
+        stage_at(Some(&path), "review", 7, 4, "codex-app", ms(2), "ok", "none", crate::runtime::usage(&attempt, 0, "codex-app"));
+        stage_at(Some(&path), "claim", 7, 1, "private-rt", ms(3), "failed", class("HTTP 502 secret /host/path"), Usage::NoModel);
+        // a Claude call with empty usage keeps the call count and makes tokens unknown, never 0; an adopted child is untimed
+        fs::write(&attempt, format!("{}\n", claude.replace(r#""usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}"#, r#""usage":{}"#))).unwrap();
+        stage_at(Some(&path), "review", 7, 5, "claude", ms(4), "ok", "none", crate::runtime::usage(&attempt, 0, "claude"));
+        stage_at(Some(&path), "review", 7, 6, "claude", None, "ok", "none", Usage::Unknown("adopted"));
+        // a child stopped after its result or requeue keeps that outcome; a live child exiting without one failed;
+        // a stop without hand-in (owner requeue) is a cancellation; a hand-in `fold` ignored (invalid SHA, a repeated
+        // op id, a result in `review`) is none
+        let e = |id, body: &str| crate::core::Entry { id, body: body.into(), edited: false };
+        let spawn = e(10, "taskq: spawn worker claude:s1 mac");
+        let sha = "a".repeat(40);
+        let hand = |kind: &str, arg: &str| vec![spawn.clone(), e(11, &format!("taskq: {kind} {arg}attempt 10
+Changed: x"))];
+        let (result, requeue, owner) = (hand("result", &format!("{sha} ")), hand("requeue", ""), vec![spawn.clone(), e(11, "taskq: requeue
+Reason: owner")]);
+        let invalid = hand("result", "abc ");
+        let op = |id, body: &str| e(id, &format!("{body}
+op-id: x"));
+        let repeated = vec![spawn.clone(), op(11, "taskq: ask attempt 10
+Done: x"), e(12, "taskq: answer 1"), op(13, &format!("taskq: result {sha} attempt 10
+Changed: x"))];
+        let review = vec![e(9, "taskq: spawn worker claude:s0 mac"), e(10, &format!("taskq: result {sha} attempt 9
+Changed: x")),
+            e(11, "taskq: spawn reviewer codex:- win"), e(12, &format!("taskq: result {sha} attempt 11
+Changed: x"))];
+        assert_eq!(crate::core::stage_outcome(7, Ok((review.as_slice(), Some(true))), 11, 11), ("failed", "exit"));
+        // an issue that left the board read is read back: the reviewer's accepted close is ok; a label removal or an
+        // owner close (no reviewer hand-in) and an unreadable read-back are unknown with reason, never ok
+        let closed = |by: &str| [&review[..3], &[e(13, &format!("taskq: close {by}\nlooks fine"))]].concat();
+        let (own, other, removed) = (closed("attempt 11"), closed(""), review[..3].to_vec());
+        for (log, want) in [(&own, ("ok", "none")), (&other, ("unknown", "left-board")), (&removed, ("unknown", "left-board"))] {
+            assert_eq!(crate::core::stage_outcome(7, Ok((log.as_slice(), None)), 11, 11), want, "{:?}", log.last().map(|e| &e.body));
+        }
+        assert_eq!(crate::core::stage_outcome(7, Err("unreadable"), 11, 11), ("unknown", "unreadable"));
+        for (log, live, want) in [(&result, false, ("ok", "none")), (&requeue, false, ("retried", "none")), (&owner, false, ("cancelled", "none")),
+            (&owner, true, ("failed", "exit")), (&invalid, true, ("failed", "exit")), (&repeated, true, ("ask", "none"))] {
+            assert_eq!(crate::core::stage_outcome(7, Ok((log.as_slice(), Some(live))), 10, 10), want, "{:?}", log.last().map(|e| &e.body));
+        }
+        stage_at(Some(&path), "review", 7, 11, "codex", ms(6), "unknown", "left-board", Usage::Unknown("log-unreadable"));
+        // `close` times the whole command from entry: an unreadable task, a gate refusal, a stale revision, a CLI verdict refusal, a non-publication close
+        // and a publication each record one `close` stage (the publication also `checks`)
+        use crate::board::Board;
+        let staged = || STAGED.with(|v| std::mem::take(&mut *v.borrow_mut())).join("; ");
+        let (b, c) = (crate::board::Fake::default(), crate::tests::cfg());
+        let gated = crate::Config { delivery: "review-pr".into(), ..crate::tests::cfg() };
+        let t = b.create("T", "## Goal\ng", &["taskq".into()]).unwrap();
+        let close = |c: &crate::Config, op: &crate::dispatch::Op| crate::dispatch::close_one(&b, c, t, "ok", op).ok();
+        assert!(!close(&c, &Default::default()));
+        b.comment(t, &crate::core::entry("spawn", &["worker", "claude:u", "mac"], None, "")).unwrap();
+        let a = crate::core::fold(t, &crate::board::entries(&b, t).unwrap(), false).attempt.unwrap();
+        b.comment(t, &crate::core::entry("result", &[&sha], Some(a), "")).unwrap();
+        b.comment(t, &crate::core::entry("spawn", &["reviewer", "codex:-", "mac"], None, "")).unwrap();
+        let a = crate::core::fold(t, &crate::board::entries(&b, t).unwrap(), false).attempt.unwrap();
+        assert!(!close(&gated, &Default::default()));
+        assert!(!close(&c, &crate::dispatch::Op { revision: Some(1), ..Default::default() }));
+        // the CLI's verdict refusal and unreadable task are inside the stage too
+        let cli = |n, text: &str| crate::dispatch::close_checked(&b, &c, n, text, &Default::default(), &|i, t| crate::close_check(text, i, t)).ok();
+        assert!(!cli(t, "no verdict"));
+        assert!(!cli(999, ""));
+        assert!(close(&c, &Default::default()));
+        assert!(!crate::dispatch::close_one(&b, &c, 999, "ok", &Default::default()).ok());
+        assert_eq!(staged(), format!("close {t} 0 other failed other; close {t} {a} codex failed other; close {t} {a} codex failed other; \
+            close {t} {a} codex failed other; close 999 0 other failed other; \
+            checks {t} {a} codex ok none; close {t} {a} codex ok none; close 999 0 other failed other"));
+        let log = fs::read_to_string(&path).unwrap();
+        assert!(!log.contains("secret") && !log.contains("/host/path") && !log.contains("private-rt"));
+        let text = report(&dir);
+        assert!(text.contains("Slow stages (p95): build/claude > review/codex > build/codex > review/claude > claim/other > review/codex-app"), "{text}");
+        assert!(text.contains("Failing stages (rate): claim/other > build/codex"), "{text}");
+        assert!(text.contains("| build | claude | 1 | 9.000/9.000/9.000 | ok:1 | 2 | 230 | unknown |"), "{text}");
+        assert!(text.contains("| build | codex | 2 | 1.000/5.000/5.000 | ask:1, failed exit:1 | unknown (log-unreadable, not-reported) | 1400 (1 of 2 known; log-unreadable) |"), "{text}");
+        assert!(text.contains("| review | codex-app | 1 | 2.000/2.000/2.000 | ok:1 | unknown (app-turn) | unknown (app-turn) |"), "{text}");
+        assert!(text.contains("| review | claude | 2 | 4.000/4.000/4.000 (1 of 2 timed; adopted) | ok:2 | 1 (1 of 2 known; adopted) | unknown (adopted, no-usage) |"), "{text}");
+        assert!(text.contains("| claim | other | 1 | 3.000/3.000/3.000 | failed http5xx:1 | none (no model) | none (no model) |"), "{text}");
+        assert!(text.contains("| review | codex | 1 | 6.000/6.000/6.000 | unknown left-board:1 |"), "{text}");
+        fs::write(&path, format!("{log}{STAGE_PREFIX}{{\"stage\":\"lunch\"}}\n")).unwrap();
+        assert!(report(&dir).contains("Attempt stages: unknown (corrupt stage record; log kept)"));
         fs::remove_dir_all(dir).unwrap();
     }
 }

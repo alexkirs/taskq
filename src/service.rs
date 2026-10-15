@@ -264,6 +264,11 @@ pub struct Service<'a> {
     pub refused_access: BTreeMap<String, String>,
     /// Children whose last liveness read failed, by attempt: kept and reported unknown, never `gone` (§ 4).
     pub unknown: HashMap<u64, String>,
+    /// Children by attempt: role, runtime, and start with attempt log offset; `None` when adopted across a re-exec
+    /// (§ 4 Profiling stages).
+    begun: HashMap<u64, (String, String, Option<(std::time::Instant, u64)>)>,
+    /// This host's tasks seen moving into `ask`: since when, attempt, runtime (§ 4 Profiling stages).
+    asked: HashMap<u64, (std::time::Instant, u64, String)>,
 }
 
 const MONTH: i64 = 30 * 86400;
@@ -486,7 +491,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new() }
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), begun: HashMap::new(), asked: HashMap::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -586,11 +591,33 @@ impl<'a> Service<'a> {
     /// Children of the previous process image after an update re-exec; their inbox counts as delivered.
     pub fn adopt(&mut self, kid: Kid, delivered: u64) {
         self.delivered.insert(kid.attempt, delivered);
+        // the role is the attempt log that exists; its start and offset stayed in the replaced image
+        let role = if crate::runtime::attempt_log(&self.cfg.root, "reviewer", kid.task, kid.attempt).exists() { "reviewer" } else { "worker" };
+        self.begun.insert(kid.attempt, (role.into(), kid.rt.clone(), None));
         self.kids.push(kid);
     }
 
     pub fn delivered(&self, attempt: u64) -> u64 {
         self.delivered.get(&attempt).copied().unwrap_or(0)
+    }
+
+    /// The `build` or `review` stage of a child that exited or was stopped (§ 4 Profiling); `v` is its task's view.
+    fn ended(&mut self, n: u64, a: u64, v: Option<&View>) {
+        let Some((role, rt, begun)) = self.begun.remove(&a) else { return };
+        // an issue that left the board read (closed, label removed) is read back once for its hand-in
+        let back = if v.is_none() { crate::board::entries(self.board, n).map_err(|_| "unreadable") } else { Ok(vec![]) };
+        let log = match v {
+            Some(v) => Ok((v.log.as_slice(), Some(v.task.attempt == Some(a)))),
+            None => back.as_deref().map(|l| (l, None)).map_err(|e| *e),
+        };
+        let (outcome, err) = core::stage_outcome(n, log, a, a.max(self.delivered(a)));
+        let log = crate::runtime::attempt_log(&self.cfg.root, &role, n, a);
+        let stage = if role == "reviewer" { "review" } else { "build" };
+        let (took, usage) = match begun {
+            Some((began, pos)) => (Some(began.elapsed()), crate::runtime::usage(&log, pos, &rt)),
+            None => (None, crate::profile::Usage::Unknown("adopted")),
+        };
+        crate::profile::stage(stage, n, a, &rt, took, outcome, err, usage);
     }
 
     /// The worker's last message in the attempt log as a public `gone` reason line of at most 240 characters
@@ -675,6 +702,7 @@ impl<'a> Service<'a> {
             }
         });
         for (n, a, code) in exited {
+            self.ended(n, a, by_n.get(&n).copied());
             if let Some(v) = by_n.get(&n)
                 && v.task.attempt == Some(a)
                 && matches!(v.task.state, State::Doing | State::Review)
@@ -698,13 +726,18 @@ impl<'a> Service<'a> {
         }
 
         // 2. stop children of replaced attempts (R11)
+        let mut stopped = vec![];
         self.kids.retain_mut(|k| {
             let current = by_n.get(&k.task).is_some_and(|v| v.task.attempt == Some(k.attempt));
             if !current {
                 k.proc.kill();
+                stopped.push((k.task, k.attempt));
             }
             current
         });
+        for (n, a) in stopped {
+            self.ended(n, a, by_n.get(&n).copied());
+        }
         self.held.retain(|l| by_n.get(&l.task).is_some_and(|v| v.task.attempt == Some(l.attempt)));
         let kids: Vec<u64> = self.kids.iter().map(|k| k.attempt).collect();
         self.unknown.retain(|a, _| kids.contains(a));
@@ -910,6 +943,18 @@ impl<'a> Service<'a> {
         }
         self.gone_after = self.gone_after.max(newest);
         moves.sort();
+        // `ask` stage (§ 4 Profiling): from the move into `ask` of this host's attempt to the move out
+        for v in views.iter().filter(|v| v.task.state == State::Ask && self.seen.get(&v.issue.number).is_some_and(|s| *s != State::Ask)) {
+            if let (Some(a), Some((rt, _)), true) = (v.task.attempt, rt_of(&v.task), host_of(&v.task) == Some(self.cfg.me.as_str())) {
+                self.asked.insert(v.issue.number, (std::time::Instant::now(), a, rt.to_string()));
+            }
+        }
+        let left: Vec<u64> = self.asked.keys().filter(|n| now_seen.get(n) != Some(&State::Ask)).copied().collect();
+        for n in left {
+            let (began, a, rt) = self.asked.remove(&n).unwrap();
+            let outcome = if matches!(now_seen.get(&n), Some(State::Doing | State::Review | State::Ready)) { "ok" } else { "cancelled" };
+            crate::profile::stage("ask", n, a, &rt, Some(began.elapsed()), outcome, "none", crate::profile::Usage::NoModel);
+        }
         self.seen = now_seen;
         if first || !moves.is_empty() || self.events_since.is_none_or(|s| s < now - MONTH) {
             let path = crate::dot(&self.cfg.root).join("events");
@@ -982,7 +1027,16 @@ impl<'a> Service<'a> {
 
     /// Post `spawn`, re-read, start the child only if `fold` accepted this spawn (§ 3 claim).
     fn claim(&mut self, v: &View, role: &str, rt: &str) -> Result<(), String> {
-        match crate::profile::measure("dispatch", || self.claim_inner(v, role, rt))? {
+        let (n, began) = (v.issue.number, std::time::Instant::now());
+        let r = crate::profile::measure("dispatch", || self.claim_inner(v, role, rt));
+        let held = self.held.iter().find(|l| l.task == n).map(|l| l.attempt);
+        let (a, outcome, err) = match &r {
+            Ok(Some(l)) => (l.attempt, "ok", "none"),
+            Ok(None) => held.map_or((0, "cancelled", "none"), |a| (a, "ok", "none")),
+            Err(e) => (0, "failed", crate::profile::class(e)),
+        };
+        crate::profile::stage("claim", n, a, rt, Some(began.elapsed()), outcome, err, crate::profile::Usage::NoModel);
+        match r? {
             Some(l) => self.launch(l),
             None => Ok(()),
         }
@@ -1025,8 +1079,14 @@ impl<'a> Service<'a> {
     fn launch(&mut self, l: Launch) -> Result<(), String> {
         // the reservation becomes the child, or is released when the start fails
         self.reserved.retain(|r| r.0 != l.task);
-        match (self.start)(&l) {
+        let pos = std::fs::metadata(crate::runtime::attempt_log(&self.cfg.root, &l.role, l.task, l.attempt)).map_or(0, |m| m.len());
+        let began = std::time::Instant::now();
+        let started = (self.start)(&l);
+        let err = started.as_ref().err().map_or("none", |e| crate::profile::class(&e.to_string()));
+        crate::profile::stage("start", l.task, l.attempt, &l.rt, Some(began.elapsed()), if started.is_ok() { "ok" } else { "failed" }, err, crate::profile::Usage::NoModel);
+        match started {
             Ok(proc) => {
+                self.begun.insert(l.attempt, (l.role.clone(), l.rt.clone(), Some((std::time::Instant::now(), pos))));
                 self.kids.push(Kid { task: l.task, attempt: l.attempt, rt: l.rt.clone(), proc });
                 self.pending.remove(&(l.task, l.attempt));
                 self.gate.launch(self.mono);

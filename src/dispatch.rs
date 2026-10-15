@@ -182,11 +182,31 @@ fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &
 }
 
 /// § 7: publish a reviewed result, then `close`; later and failed tasks close without publication.
+/// § 4 Profiling: the `close` stage times the whole command, from entry through every receipt.
 pub fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op) -> Receipt {
+    close_checked(b, cfg, n, verdict, op, &|_, _| Ok(()))
+}
+
+/// `close_one` after `check` accepts the task read; the CLI verdict validation runs inside the timed stage.
+pub fn close_checked(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op, check: &dyn Fn(&board::Issue, &Task) -> Res<()>) -> Receipt {
+    let began = std::time::Instant::now();
+    let mut seen = (0, "other".to_string(), None);
+    let r = close_body(b, cfg, n, verdict, op, check, &mut seen);
+    let (outcome, err) = seen.2.unwrap_or(if r.ok() { ("ok", "none") } else { ("failed", crate::profile::class(&r.reason)) });
+    crate::profile::stage("close", n, seen.0, &seen.1, Some(began.elapsed()), outcome, err, crate::profile::Usage::NoModel);
+    r
+}
+
+/// `seen`: the attempt and runtime once read, and an outcome override (a pending publication is retried).
+fn close_body(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op, check: &dyn Fn(&board::Issue, &Task) -> Res<()>, seen: &mut (u64, String, Option<(&'static str, &'static str)>)) -> Receipt {
     let (issue, t, _) = match current(b, n) {
         Ok(x) => x,
         Err(e) => return Receipt::rejected(n, op, e),
     };
+    *seen = (t.attempt.unwrap_or(0), t.session.as_deref().and_then(|s| s.split(':').next()).unwrap_or("other").to_string(), None);
+    if let Err(e) = check(&issue, &t) {
+        return Receipt::rejected(n, op, e);
+    }
     // a retried close returns its first receipt before publishing again
     if t.state == State::Closed || op.id.is_some() && entries(b, n).is_ok_and(|l| l.iter().any(|e| core::op_id(n, &e.body) == op.id.as_deref())) {
         return act(b, &cfg.root, n, "close", &[], verdict, op);
@@ -205,7 +225,17 @@ pub fn close_one(b: &dyn Board, cfg: &Config, n: u64, verdict: &str, op: &Op) ->
             if op.revision.is_some_and(|r| r != rev) {
                 return act(b, &cfg.root, n, "close", &[], verdict, op); // the stale receipt, before any publication
             }
-            match b.publish(n, &sha, &cfg.publish, &issue.title, &format!("Task: {}", b.url(n))) {
+            // § 4 Profiling: `checks` is the CI verification and merge call
+            let began = std::time::Instant::now();
+            let published = b.publish(n, &sha, &cfg.publish, &issue.title, &format!("Task: {}", b.url(n)));
+            let (outcome, err) = match &published {
+                Publish::Done(_) => ("ok", "none"),
+                Publish::Pending(_) => ("retried", "none"),
+                Publish::Failed(m) => ("failed", crate::profile::class(m)),
+            };
+            crate::profile::stage("checks", n, seen.0, &seen.1, Some(began.elapsed()), outcome, err, crate::profile::Usage::NoModel);
+            if outcome == "retried" { seen.2 = Some((outcome, err)); }
+            match published {
                 Publish::Done(m) => {
                     // § 7 publication receipt: the policy it ran under and what the board read back
                     let m = format!("delivery {} r{}: {m}", cfg.delivery, cfg.delivery_revision);

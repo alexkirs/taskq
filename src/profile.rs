@@ -185,7 +185,14 @@ fn unresolved(text: &str) -> Result<Vec<Stage>, String> {
             || r.unknown.as_deref().is_some_and(|u| !UNKNOWN.contains(&u)) {
             return Err("unknown stage code".into());
         }
-        if r.attempt != 0 { last.insert((r.project.clone(), r.task, r.attempt), r); }
+        if r.attempt != 0 {
+            let key = (r.project.clone(), r.task, r.attempt);
+            // Auxiliary stages cannot erase a completed turn; a new lifetime resets its evidence.
+            if r.open || terminal(&r) || matches!(r.stage.as_str(), "build" | "review" | "close")
+                || !last.get(&key).is_some_and(terminal) {
+                last.insert(key, r);
+            }
+        }
     }
     Ok(last.into_values().filter(|r| !terminal(r)).collect())
 }
@@ -229,7 +236,8 @@ fn local_live(install: &Path) -> Live {
         coreq::status::read(&tool, Path::new(root), 60)
     }).filter(|v| v["complete"] == true).flat_map(|v| {
         let project = v["board"]["repo"].as_str().unwrap_or_default().to_string();
-        v["tasks"].as_array().into_iter().flatten().filter_map(|t| Some((project.clone(), t["attempt"].as_u64()?))).collect::<Live>()
+        v["kids"].as_array().into_iter().flatten().filter(|k| k["live"] == "running")
+            .filter_map(|k| Some((project.clone(), k["attempt"].as_u64()?))).collect::<Live>()
     }).collect()
 }
 
@@ -726,6 +734,53 @@ pub fn view(install: &Path, name: &str, since: Option<&str>) -> Result<String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Chain: §4 terminal report; completed owner waits must not erase hand-in evidence,
+    // while a new build/review lifetime must expose a later vanished turn.
+    #[test]
+    fn terminal_regression_owner_wait_and_reopened_turns() {
+        let row = |stage, outcome, open| format!("taskq-stage {}\n", serde_json::json!({
+            "project":"o/r", "host":"mac", "stage":stage, "task":7, "attempt":41,
+            "rt":"codex", "us":null, "outcome":outcome, "error":"none", "at_ms":1, "open":open
+        }));
+        let mut text = row("build", "ask", false);
+        text += &row("ask", "ok", false);
+        assert_eq!(defects(&text, &vec![], None, 400_000, 300).unwrap().1, 0);
+        text += &row("build", "unknown", true);
+        assert_eq!(defects(&text, &vec![], None, 400_000, 300).unwrap().1, 1);
+        text += &row("build", "cancelled", false);
+        text += &row("ask", "ok", false);
+        assert_eq!(unresolved(&text).unwrap().len(), 0, "owner requeue preserves cancellation");
+        text += &row("review", "unknown", true);
+        assert_eq!(unresolved(&text).unwrap().len(), 1);
+        text += &row("review", "ok", false);
+        assert!(unresolved(&text).unwrap().is_empty());
+    }
+
+    // Chain: §4 cached report; a fresh task row is not proof of a live local child.
+    #[test]
+    fn terminal_regression_snapshot_liveness() {
+        let dir = std::env::temp_dir().join(format!("taskq-profile-live-{}", std::process::id()));
+        fs::create_dir_all(dir.join(".taskq")).unwrap();
+        fs::write(dir.join("projects"), dir.display().to_string()).unwrap();
+        let mut v = serde_json::json!({"complete":true,"board":{"repo":"o/r"},
+            "tasks":[{"attempt":41}],"kids":[],"at":now_ms().unwrap()/1000,
+            "pid":std::process::id(),"version":crate::platform::VERSION});
+        fs::write(dir.join(".taskq/status.json"), v.to_string()).unwrap();
+        assert!(local_live(&dir).is_empty(), "dead-host task must remain reportable");
+        v["kids"] = serde_json::json!([{"attempt":42,"live":"running"},{"attempt":43,"live":"unknown"}]);
+        fs::write(dir.join(".taskq/status.json"), v.to_string()).unwrap();
+        assert_eq!(local_live(&dir), vec![("o/r".into(),42)]);
+        v["complete"] = serde_json::json!(false);
+        fs::write(dir.join(".taskq/status.json"), v.to_string()).unwrap();
+        assert!(local_live(&dir).is_empty(), "incomplete snapshots exclude nothing");
+        v["complete"] = serde_json::json!(true);
+        fs::write(dir.join(".taskq/status.json"), v.to_string()).unwrap();
+        fs::File::open(dir.join(".taskq/status.json")).unwrap().set_times(
+            fs::FileTimes::new().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1))).unwrap();
+        assert!(local_live(&dir).is_empty(), "stale snapshots exclude nothing");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     // Chain: § 4 profiling append -> retained log; contention must not lose either appender's records.
     #[test]
     fn concurrent_appenders_keep_records() {

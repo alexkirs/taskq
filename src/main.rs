@@ -1776,7 +1776,7 @@ fn run(argv: &[String]) -> Res<()> {
                 let live = views.iter().filter_map(|v| {
                     let a = v.task.attempt?;
                     let h = service::host_of(&v.task)?;
-                    (v.task.state == core::State::Ask || hosts.iter().any(|hb| hb.title == format!("taskq host {h}")
+                    (hosts.iter().any(|hb| hb.title == format!("taskq host {h}")
                         && now - hb.updated <= c.cfg.ttl && hb.body.lines().any(|l| l == format!("#{} {a}", v.issue.number))))
                         .then(|| (c.cfg.repo.clone(), a))
                 }).collect();

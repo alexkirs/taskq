@@ -59,9 +59,13 @@
   function task(p,row,global=false){
     const st=states.find(s=>s[0]===row.state),name=st?st[1]:row.state,mark=st?st[2]:'circle',kind=st?st[3]:'';
     const rt=row.runtime,brand=rt==='claude'?'claude':['codex','codex-app'].includes(rt)?'openai':'';
-    const metadata=[global?esc(p.name):'',row.host?esc(row.host):'',rt?icon(brand)+' '+esc(rt):''].filter(Boolean).join(' · ');
-    // Session URLs are supplied by the owning host adapter; remote/starting rows never invent permalinks.
-    const session=row.local_session?(url(row.session_url,true)?link(row.session_url,icon('terminal'),'Open '+(rt||'agent')+' session',true):'<small>Session starting or unavailable</small>'):row.host?'<small title="Session link is available only on its owning host">'+icon('network')+' Remote session</small>':'';
+    const remote=row.host&&!row.local_session;
+    // M3: a remote row puts the remote mark before the runtime mark; the host name is its only text.
+    const marks=(remote?'<span title="Remote host" aria-label="Remote host">'+icon('network')+'</span> ':'')+(rt?icon(brand)+' '+esc(rt):'');
+    const metadata=[global?esc(p.name):'',row.host?esc(row.host):'',marks].filter(Boolean).join(' · ');
+    // Adapters supply session URLs: an account-scoped https link on any host, a codex:// thread only on its owning host.
+    const target=url(row.session_url,!!row.local_session);
+    const session=target?link(row.session_url,icon('terminal'),'Open '+(rt||'agent')+' session',true):row.host?'<small'+(row.session_reason?' title="'+esc(row.session_reason)+'"':'')+'>'+(remote?'Session unavailable':'Session starting or unavailable')+'</small>':'';
     return '<div class="tqp tqp-task"><div class="tqp-task-head"><span class="'+kind+'" title="'+esc(name)+'" aria-label="'+esc(name)+'">'+icon(mark)+'</span> '+link(row.url,icon(p.board.kind)+' #'+esc(row.n),'Open task #'+row.n)+' <span class="tqp-meta">'+metadata+'</span> '+session+'</div><div class="tqp-task-title">'+esc(row.title)+'</div></div>';
   }
   // Consumer adapter owns placement/routes; component emits navigation only, never task operations.

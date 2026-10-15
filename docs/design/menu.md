@@ -31,8 +31,8 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 - Attention contains decisions, failed tasks and actionable service/admission problems under [A2](adaptive-menu.md#a2-explain-the-queue). Ordinary waits remain neutral.
 - Project header: Back, name, Board link and compact nonzero counters. Add is a plus in the Projects header.
 - Task row: the first row holds state, board-provider mark, linked issue number, known host/runtime, session and other available links; global rows also identify project. The full title starts on the second row and wraps across the block width, never truncated. Metadata may wrap when space is exhausted; links remain separate controls.
-- Main task target opens the issue. Local agent session and known PR links are separate controls; no nested links or double navigation.
-- Codex/Claude marks identify the recorded runtime; codex-app uses Codex identity. Missing permalink: unavailable with reason. Remote: network + host, no fabricated local session link.
+- Main task target opens the issue. Agent session and known PR links are separate controls; no nested links or double navigation.
+- Codex/Claude marks identify the recorded runtime; codex-app uses Codex identity. Missing permalink: unavailable with reason. A Claude session link is account-scoped and shows on every host; a Codex thread link opens only on its owning host, elsewhere unavailable with a reason (Codex Remote cannot attach to live CLI threads). A non-local row shows the host name and a remote mark before the runtime mark, no remote text.
 - Task detail preserves question, failure, work, ready, dependency and later access. Board links remain near the project name.
 - Answer cards mount only for `ask`, never for stored cards on doing/review/ready/later/blocked rows. An ask with no parsed choices shows its original text, a requeue reason field, Later and Close. Close requires confirmation naming cancellation without publication, then canonical `later` and `close` with readback after each; no second step after failed/unknown parking. Retain a compact operation receipt and same-ID delivery check outside the question card when the task leaves ask; partial close names the parked task and board recovery.
 - Back restores list/scroll position. Service, log, folder and admission controls always identify project/host.
@@ -192,7 +192,7 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 | M-A15 | Incident states and none remain distinct; local report paths and issue links work; local is neither task failure nor successful delivery. |
 | M-A21 | Attention precedes ordinary lists and includes projects outside the shortlist. |
 | M-A16 | View/admission/pause together; mixed and target scope explicit. |
-| M-A17 | Flowing title, header Board, separate local session link, remote no-link. |
+| M-A17 | Flowing title, header Board, separate session link: Claude on every host, Codex only on its owning host; remote mark before the runtime mark. |
 | M-A18 | Pinned/recent, searchable All, header plus; all-state aggregate/project counters and quiet Closed follow K-A1–K-A6. |
 | M-A19 | Both composers accept attachments; workspace/window recovery follows C-A1–C-A10. |
 | M-A20 | Shared editor preserves Mixed, untouched fields/targets and per-project readback. |

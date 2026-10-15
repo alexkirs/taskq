@@ -27,6 +27,8 @@ pub struct Row {
     pub deps: Vec<service::Blocker>,
     /// Text of the last trusted `failed` entry.
     pub failed: Option<String>,
+    /// Claude Remote Control URL of the current attempt from its host's heartbeat `session` line (§ 4).
+    pub session_url: Option<String>,
 }
 
 pub struct Host {
@@ -53,6 +55,7 @@ pub struct Snapshot {
 pub fn from_views(source: &'static str, b: &dyn Board, cfg: &Config, observed: i64, views: &[View], hosts: &[board::Issue]) -> Snapshot {
     let mut open: Vec<&View> = views.iter().filter(|v| v.task.state != State::Closed).collect();
     open.sort_by_key(|v| (service::priority(&v.issue), v.issue.number));
+    let urls = session_urls(hosts);
     let tasks = open.into_iter().map(|v| Row {
         n: v.issue.number,
         title: v.issue.title.clone(),
@@ -61,6 +64,9 @@ pub fn from_views(source: &'static str, b: &dyn Board, cfg: &Config, observed: i
         task: v.task.clone(),
         revision: crate::core::revision(v.issue.number, &v.log),
         deps: v.blockers.clone(),
+        session_url: v.task.attempt.zip(v.task.session.as_deref().and_then(|s| s.rsplit(' ').next()))
+            .filter(|_| v.task.session.as_deref().is_some_and(|s| s.starts_with("claude:")))
+            .and_then(|(a, h)| urls.get(&(h.to_string(), a)).cloned()),
         failed: (v.task.state == State::Failed).then(|| v.comments.iter().rev().find(|c| c.trusted && c.body.starts_with("taskq: failed")).and_then(|c| c.body.split_once('\n')).map(|x| x.1.to_string()).unwrap_or_default()),
     }).collect();
     let hosts = hosts.iter().map(|h| Host {
@@ -70,6 +76,19 @@ pub fn from_views(source: &'static str, b: &dyn Board, cfg: &Config, observed: i
         focus: h.body.lines().find_map(|l| l.strip_prefix("focus ")).map(str::to_string),
     }).collect();
     Snapshot { source, observed, reason: None, board: identity(b, cfg), tasks, hosts }
+}
+
+/// `session #<N> <attempt> <url>` heartbeat lines (§ 4) by host name and attempt; only a canonical claude.ai URL.
+pub fn session_urls(hosts: &[board::Issue]) -> HashMap<(String, u64), String> {
+    hosts.iter().flat_map(|h| {
+        let name = h.title.trim_start_matches("taskq host ").to_string();
+        h.body.lines().filter_map(move |l| {
+            let w: Vec<&str> = l.strip_prefix("session #")?.split(' ').collect();
+            let [_, a, url] = w[..] else { return None };
+            url.strip_prefix("https://claude.ai/code/session_").filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()))?;
+            Some(((name.clone(), a.parse().ok()?), url.to_string()))
+        })
+    }).collect()
 }
 
 fn identity(b: &dyn Board, cfg: &Config) -> Value {
@@ -125,11 +144,13 @@ pub fn status_totals(status: &Value) -> Option<BTreeMap<&'static str, usize>> {
 
 impl Row {
     pub fn json(&self) -> Value {
-        json!({"n": self.n, "title": self.title, "state": self.task.state.name(), "labels": self.labels, "url": self.url, "revision": self.revision,
+        let mut row = json!({"n": self.n, "title": self.title, "state": self.task.state.name(), "labels": self.labels, "url": self.url, "revision": self.revision,
             "session": self.task.session, "attempt": self.task.attempt, "role": self.task.role,
             "deps": self.deps.iter().filter(|b| b.dep.repo.is_none() && b.reason == "open").map(|b| b.dep.n).collect::<Vec<_>>(),
             "blocked": self.deps.iter().map(|b| json!({"ref": b.dep.name(), "url": b.url, "reason": b.reason})).collect::<Vec<_>>(),
-            "card": self.task.card, "question": self.task.card.as_deref().map(question), "failed": self.failed})
+            "card": self.task.card, "question": self.task.card.as_deref().map(question), "failed": self.failed});
+        if let Some(u) = &self.session_url { row["session_url"] = json!(u); }
+        row
     }
 }
 
@@ -193,7 +214,7 @@ impl Snapshot {
                 } else {
                     r.task.state.name().to_string()
                 };
-                let (rt, s) = session_link(cfg, raw, &r.task, r.n);
+                let (rt, s) = session_link(cfg, raw, r);
                 format!("| {} | {state} | {} | {s} |", link(r), cell(&rt))
             })
             .collect();
@@ -255,7 +276,8 @@ pub fn brief(card: &str) -> String {
     card.lines().next().unwrap_or_default().to_string()
 }
 
-fn session_link(cfg: &Config, raw: &Value, t: &Task, n: u64) -> (String, String) {
+fn session_link(cfg: &Config, raw: &Value, r: &Row) -> (String, String) {
+    let (t, n) = (&r.task, r.n);
     let Some((rt, id)) = t.session.as_deref().and_then(|s| s.split(' ').next()).and_then(|s| s.split_once(':')) else { return (String::new(), String::new()) };
     let host = t.session.as_deref().and_then(|s| s.rsplit(' ').next()).unwrap_or_default();
     let mut id = id.to_string();
@@ -268,7 +290,7 @@ fn session_link(cfg: &Config, raw: &Value, t: &Task, n: u64) -> (String, String)
     let host = cell(host);
     let link = match rt {
         _ if id == "-" => format!("{host}: starting"),
-        "claude" => runtime::claude_remote(&id).filter(|_| host == cell(&cfg.me)).map_or_else(|| format!("{host}: Remote Control unknown"), |url| format!("[{host}]({url})")),
+        "claude" => runtime::claude_remote(&id).filter(|_| host == cell(&cfg.me)).or_else(|| r.session_url.clone()).map_or_else(|| format!("{host}: Remote Control unknown"), |url| format!("[{host}]({url})")),
         _ if std::env::var("TASKQ_CLIENT").as_deref() == Ok("codex") => format!("[{host}](codex://threads/{id})"),
         _ => match raw["pages"].as_str() {
             Some(p) => format!("[{host}]({}/open.html#codex://threads/{id})", p.trim_end_matches('/')),

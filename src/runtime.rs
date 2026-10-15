@@ -576,13 +576,13 @@ pub fn instructions(root: &Path, task: &str, resume: bool) -> Result<String, Sta
 }
 
 // Claude --bg forwards stdin as child argv; send only a file reference.
-fn claude_input(root: &Path, text: &str) -> Result<(String, File), String> {
+fn claude_input(root: &Path, text: &str) -> Result<(String, crate::data::InputLock), String> {
     let dir = root.join(".taskq/inputs");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{}.txt", uuid()));
     let mut file = File::options().read(true).write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
     file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
-    file.try_lock_shared().map_err(|e| e.to_string())?;
+    let file = crate::data::InputLock::new(file).map_err(|e| e.to_string())?;
     Ok((format!("Before any work, use Read to read {} in full. It contains this turn's TaskQ rules and task. Apply those rules and carry out that task. If Read truncates the file, read the remaining parts before proceeding.", serde_json::to_string(&path.to_string_lossy()).map_err(|e| e.to_string())?), file))
 }
 
@@ -691,7 +691,7 @@ pub struct ClaudeTurn {
     before: usize,
     mode: String,
     input: String,
-    _input_file: File,
+    _input_file: crate::data::InputLock,
     pid: u32,
     done: bool,
     failure: Option<&'static str>,
@@ -1210,7 +1210,7 @@ mod tests {
     fn claude_failed_launch_exits_without_status_or_transcript() {
         let mut t = ClaudeTurn { root: PathBuf::new(), log: PathBuf::new(), session: String::new(),
             id: "invented-job".into(), announced: false, copied: 0, before: 0, mode: "dontAsk".into(),
-            input: "invented input".into(), _input_file: File::open(std::env::current_exe().unwrap()).unwrap(), pid: 0, done: false, failure: None };
+            input: "invented input".into(), _input_file: crate::data::InputLock::new(File::open(std::env::current_exe().unwrap()).unwrap()).unwrap(), pid: 0, done: false, failure: None };
         for state in ["failed", "stopped", "crashed", "unexpected"] {
             assert_eq!(t.observe(&serde_json::json!({"state":state})), Ok(Some(-1)));
             t.announced = true;

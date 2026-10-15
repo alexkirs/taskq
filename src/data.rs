@@ -15,6 +15,23 @@ pub const ATTEMPT_LOGS: usize = 50;
 pub const INCIDENTS: usize = 50;
 /// `<root>/.taskq/inputs/*.txt`: the newest by mtime, plus files locked by live Claude turns.
 pub const INPUTS: usize = 50;
+/// A turn owns the lock, even when a forked child still holds a copy of its descriptor.
+pub struct InputLock(fs::File);
+
+impl InputLock {
+    pub fn new(file: fs::File) -> std::io::Result<Self> {
+        file.try_lock_shared()?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for InputLock {
+    fn drop(&mut self) {
+        // Closing alone leaves the lock held by descriptors inherited across fork.
+        let _ = self.0.unlock();
+    }
+}
+
 /// Lines of `<root>/.taskq/requests/comments`: past it the newest half and every comment still pending stay.
 pub const COMMENT_IDS: usize = 1000;
 /// Lines of `<root>/.taskq/requests.log`: the newest stay; pruned on every append (`retro::append`).
@@ -216,7 +233,7 @@ mod tests {
                 std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i)).unwrap();
         }
         let active = fs::File::options().read(true).write(true).open(dir.join("0.txt")).unwrap();
-        active.try_lock_shared().unwrap();
+        let active = InputLock::new(active).unwrap();
         prune(&root, &root.join("install"), "p", &[]);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 51);
         assert!(dir.join("0.txt").exists());
@@ -224,6 +241,44 @@ mod tests {
         drop(active);
         prune(&root, &root.join("install"), "p", &[]);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 50);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Chain: §4 input pruning after a turn ends. Risk: a pre-exec child retains the turn's lock.
+    #[cfg(unix)]
+    #[test]
+    fn input_cache_unlocks_while_fork_child_lives() {
+        let root = temp("inputs-fork");
+        let path = root.join("input.txt");
+        let file = fs::File::options().read(true).write(true).create_new(true).open(&path).unwrap();
+        let held = InputLock::new(file).unwrap();
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // Only async-signal-safe calls after fork; wait until the parent finishes probing.
+            unsafe {
+                libc::close(pipe[1]);
+                let mut byte = 0u8;
+                libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(pipe[0]); }
+        let probe = fs::File::options().read(true).write(true).open(&path).unwrap();
+        let before = probe.try_lock();
+        drop(held);
+        let after = probe.try_lock();
+        unsafe {
+            libc::write(pipe[1], b"x".as_ptr().cast(), 1);
+            libc::close(pipe[1]);
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(status, 0);
+        assert!(matches!(before, Err(std::fs::TryLockError::WouldBlock)));
+        after.unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

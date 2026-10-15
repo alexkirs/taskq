@@ -3,6 +3,7 @@ name: release
 on:
   push:
     tags: ['v*']
+    branches: [main]
 permissions:
   contents: read
 jobs:
@@ -27,15 +28,24 @@ jobs:
         if: runner.os == 'Windows'
         run: rustup default stable-x86_64-pc-windows-msvc
       - name: Version from tag
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
           ver="${GITHUB_REF_NAME#v}"
           perl -pi -e 'if (!$d && s/^version = ".*"/version = "'"$ver"'"/) { $d = 1 }' Cargo.toml
           grep -q "^version = \"$ver\"" Cargo.toml
           echo "VER=$ver" >> "$GITHUB_ENV"
-      - run: cargo test
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}-
       - run: cargo build --release
       - name: Selftest and stage
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         env:
           TASKQ_INCIDENT_REPORTS: 'off'
@@ -65,10 +75,12 @@ jobs:
             cp tests/fixtures/resource-controls.json "dist/taskq-$VER-resource-controls-fixtures.json"
           fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           name: ${{ matrix.target }}
           path: dist/*
   attest:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     permissions:

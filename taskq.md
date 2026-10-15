@@ -13,7 +13,7 @@ A task has at most one live attempt: one worker or one reviewer process. Work bi
 - **Owner**: decides product questions, answers `ask`, accepts or rejects results through the PM.
 - **PM** (manager): the agent session the owner talks to. Files tasks, relays questions and outcomes. Does no task work, never answers for the owner. The queue does not depend on a PM being online.
 - **Service**: one host process for all registered projects (§ 5). The only process that spawns workers, reviewers and operators.
-- **Worker** `T<N>`: a child of the service. Does one attempt, writes `result`, `ask` or `requeue`.
+- **Worker** `T<N>`: a child of the service. Does one attempt, writes `result`, `ask`, `requeue` or `later`.
 - **Reviewer** `R<N>`: a child of the service, spawned on demand for a result. Checks the exact candidate, then `close`, `requeue` with fixes, or `ask`. No resident supervisor session.
 - **Operator**: the owner-facing agent for project research, edits, checks and TaskQ operations (§ 4), with normal runtime tools and project permissions (R9); authority per [shared approval boundaries][sq-approval], unresolved authority uses clarify/proposal. Task-state writes use TaskQ commands, never hand-edited logs. Its failure does not fail a worker task and does not prove absence of side effects.
 
@@ -23,7 +23,7 @@ Session names: `T<N> <title[:40]> (<host>)` and `R<N> <title[:40]> (<host>)`.
 Each command that changes a task appends one `taskq:` comment, sets the projected labels and pokes the local service. Services also poll the board every `poll` seconds. No sender session, timer or PM chat is on the critical path.
 
 ### R5. Completion is written to the task
-Result SHA, checks, questions and blockers go to the issue as `result`, `ask`, `requeue` comments; completion evidence follows [specq verification][sq-verify].
+Result SHA, checks, questions and blockers go to the issue as `result`, `ask`, `requeue` or `later`; evidence follows [specq verification][sq-verify].
 
 ### R6. Human report
 `taskq status` renders the [read-model](docs/design/refactoring-backlog.md) snapshot of one board read (§ 5 `--json`; service status, `status.json` and tray count the same rows), in this order (empty parts omitted). Tray/browser project summaries and task rows (metadata/links first, full wrapped title second under M3) reuse [shared project blocks](docs/design/project-blocks.md), including separate Doing/Review, nonzero K counters and unknown Closed until authoritative totals exist:
@@ -222,10 +222,10 @@ Accepted setup target: [installation and project locations](docs/design/setup-an
 Setup is one agent conversation per project. Resolve the project name and exact folder; inspect files, configuration, Git roots and remotes first. Preserve originals, dirty work, unknown config keys and existing ownership. Show the exact account, repository, visibility and every external effect (creation, labels, access, the incident report disclosure of § 4) and apply only after the owner confirms that exact list. Read existing GitHub repository visibility with `gh repo view` during inspection; do not ask for visibility already read. New repositories default to PRIVATE. Then verify a queue read and write and hand off to the PM. The tray's Add project holds this conversation in the menu (§ 4).
 
 ## 7. Worker, reviewer, publication
-Worker brief: task text, attempt, branch, delivery commands, this file's path (this release's URL when the root has none), the folder rule (§ 8), the CI-wait rule (rule 7). The task is the owner's grant for this section's commit and publication steps ([shared approval boundaries][sq-approval]); nothing outside them is approved. Rules:
+Worker brief: task text, attempt, branch, delivery commands, this file's path (this release's URL when the root has none), the folder rule (§ 8), the CI-wait rule (rule 7). The task grants these commit/publication steps ([shared approval boundaries][sq-approval]); nothing outside them is approved. Rules:
 1. Read this file and the whole issue first, then [prepare the task][sq-prepare]: a decision conflict (R13), an untestable or ambiguous Acceptance item or a split (R2) is an `ask` with options before any code.
 2. Workspace: `git worktree add -b taskq-<N> .worktrees/taskq-<N> origin/main` (existing branch: continue it). `workspace: external`: the path the project's `AGENTS.md` gives.
-3. Owner-only question: `ask` with options, then stop. Cannot be done: `requeue --text`, then stop.
+3. Owner: `ask`. External blocker: `later` with failed check + one unblock condition; resume only after proof. Code fix: `requeue`. Then stop.
 4. Before `result`: commit to `taskq-<N>` with `Task: <issue url>`; rebase on `origin/main`; run checks; list outcomes in `--checks`. `result` names and refuses changed `uiSources` files whose SHA blobs `docs/shots/manifest.json` omits (fix: `docs/shots/update.sh`); Readable SHA, no manifest: skip; other Git/manifest errors: unknown, refuse. Test/golden-trace edits keeping all assertions are repairs: name defect in `--text`. Weaker/deleted assertions need a changed rule in the diff, named in `--text`. Fix `--checks`: [before/after evidence](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#run-policy-by-stage) or its limitation. Sandbox-blocked host tests print `sandbox-blocked`; Checks: that marker, never PASS. Do not requeue; gate: green exact-result-SHA CI (R12).
 5. Delivery `direct`: push `taskq-<N>`. `auto-merge`, `review-pr`: push and open one PR/MR into `main`. Then `result --sha <sha>`; do not wait for CI, `close` checks it. Research/proposal tasks (type `research`, docs proposals) end with `ask`: options and one recommendation. No `result`/`close` before the owner answers. Then deliver the approved outcome or file approved dependents; closure still needs review. No commit: `--sha` = current `origin/main`.
 6. Everything written through taskq is public: no secrets, tokens or local paths.

@@ -72,3 +72,17 @@ Live `selftest` returned exit 0: 72 golden traces, formats and board read passed
 Repeat observation at 10:24:53 UTC, after these commands and further real appends, found 2,107,002 bytes, the same exact terminal line, 554 valid recognized JSON records and zero corrupt records. New completed pass starts were `1792059872500` and `1792059885003` ms; status advanced to `1792059886`. PID 9052, version and executable hash were unchanged, and the diagnostic backup hash still matched. The repeated `& $exe selftest` again exited 0 with 72 traces, formats, board and `no overdue nonlive defects in retained window`. Thus the corrective probe closes the observed A3/A4 gap; it does not establish sustained stability or a live rollback. #1243 remains waiting for the owner.
 
 On this corrective attempt, `cargo test --locked` again passed 230 unit and 6 integration tests, with 2 ignored. Memory/Seatbelt checks were sandbox-blocked, not PASS. `cargo run --locked -- selftest` exited 0; local installed profiling/request-log appends were sandbox-blocked/unknown. No tests or golden traces were changed.
+
+## Owner-directed incident recovery
+
+The owner stopped all tasks and authorized direct repair, publication and readiness verification. No queued attempt was resumed. Recovery separates this compatible maintenance release from the still-unqualified host-topology migration in #1232/#1233; the lifecycle candidate remains in PR #1261.
+
+A fresh append-only Windows probe retained the genuine cancelled build terminal for #1231 attempt `6189839694` through service pruning: 2,175,441 bytes before padding, 4,194,909 filled, 2,097,839 after pruning. The byte-exact backup SHA-256 is `f6cc46977c9889d3ec5280607d7ceaf5e233d2b2a94de0c63b1b354c4d76fc14`.
+
+The recorded hash above must match the operator receipt; raw backups remain private. The exact terminal and newest diagnostic sentinel survived; all retained stage rows parsed. The subsequent installed Windows selftest returned `no overdue nonlive defects in retained window`, not unknown, and real appends continued. No stage record was manufactured, restored or replayed.
+
+The maintenance correction amends R3/R5 and section 7: an unchanged external blocker uses `later` with the failed check and one unblock condition, and resumption requires proof. Runtime brief checks retain delivery across both roles and all runtimes. Existing fold traces already prove that later prevents spawning and fenced stale writes.
+
+The update sweep was independently reproduced deleting the emergency hold and admission files, violating section 3's hold-until-release rule. The allowlist now retains them and the existing sweep chain checks the hold payload. The dependency-cache check reproduced 3 reads instead of 1 on Windows because /nonexistent contained profile records; a unique test fixture preserves the one-read assertion. Neither repair weakens a guard or changes the board format.
+
+All registered projects on all three hosts are paused before release, in addition to the durable emergency holds. Final readiness requires verified published artifacts, fresh process/version readback and selftest, zero children and retained holds. These requirements remain pending until actual rollout; no production host unit is installed by this correction.

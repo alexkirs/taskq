@@ -39,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable-x86_64-pc-windows-gnu
-      - run: cargo +stable-x86_64-pc-windows-gnu test --locked --test windows_install
+      - run: cargo +stable-x86_64-pc-windows-gnu test --locked --test windows_install -- --show-output
   shots: # README screenshots: stale against the UI sources warns (exit 2), any other check.sh error fails (taskq.md R12)
     runs-on: ubuntu-latest
     steps:

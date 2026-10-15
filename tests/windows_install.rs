@@ -33,6 +33,9 @@ fn installed_windows_release_starts_without_build_paths() {
             .env("TASKQ_SELFTEST_OFFLINE", "1").env("TASKQ_INCIDENT_REPORTS", "off")
             .output().unwrap();
         let detail = fs::read_to_string(root.join(".taskq/cli-errors.log")).unwrap_or_default();
+        for phase in String::from_utf8_lossy(&out.stderr).lines().filter(|line| line.starts_with("Telemetry store us:") || line.starts_with("Telemetry rows us:")) {
+            println!("{phase}");
+        }
         assert!(out.status.success(), "{}: {} {}\n{}", exe.display(), out.status, String::from_utf8_lossy(&out.stderr), detail.chars().take(4096).collect::<String>());
         assert!(String::from_utf8_lossy(&out.stdout).contains("golden traces PASS"));
     }

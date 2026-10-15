@@ -567,6 +567,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
     let mut tray: Option<TrayIcon> = None;
     let (mut shown, mut icon_sig, mut dark) = (String::new(), String::new(), true);
     let mut hidden_at = Instant::now() - Duration::from_secs(1);
+    let mut shown_at = hidden_at;
     let mut anchor: Option<Rect> = None;
     let mut step = 0usize;
     // snapshot pages wider than their window (#1073): `tray --snapshot` fails naming them
@@ -653,6 +654,10 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
             }
             Event::WindowEvent { event: WindowEvent::Focused(false), .. } if snapshot.is_none() && !settings.pin.pinned => {
                 if let Some((w, _)) = &ui {
+                    if blur_refocuses(shown_at.elapsed()) {
+                        w.set_focus();
+                        return;
+                    }
                     w.set_visible(false);
                     hidden_at = Instant::now();
                 }
@@ -701,6 +706,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 place(w, rect);
                 w.set_visible(true);
                 w.set_focus();
+                shown_at = Instant::now();
             }
             Event::UserEvent(Ev::Answer(receipt)) => push(&ui, &receipt),
             // a notification click opens the menu (or raises the pinned window) on that card (M14)
@@ -939,9 +945,12 @@ fn popover_size(m: &Value, max: f64, scale: f64) -> (u32, u32) {
     ((w * k * scale).ceil() as u32, ((h * k).min(max) * scale).round() as u32)
 }
 
-/// Reports a snapshot page that scrolls horizontally or clips content inside the menu (#1073).
+/// Reports a snapshot page that scrolls horizontally or clips content inside the menu (#1073), and a button whose label
+/// is wider than the button, so the text crosses its border (#1049).
 const OVERFLOW: &str = "(()=>{const e=document.documentElement,m=document.querySelector('.menu'),x=Math.max(e.scrollWidth-e.clientWidth,m.scrollWidth-m.clientWidth);
-if(x>0)window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME',x}));})()";
+if(x>0)window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME',x}));
+const seen=new Set();for(const b of m.querySelectorAll('button')){const t=b.textContent.trim().slice(0,24);
+if(b.offsetParent&&b.scrollWidth>b.clientWidth+1&&!seen.has(t)){seen.add(t);window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME button '+t,x:b.scrollWidth-b.clientWidth}));}}})()";
 
 /// The `actions` snapshot: a refused custom range (menu.md M6), without applying a setting.
 const ACTIONS: &str = "(()=>{const q=s=>document.querySelector(s),put=(s,v)=>{const i=q(s);i.value=v;i.dispatchEvent(new Event('input',{bubbles:true}));};
@@ -1088,6 +1097,12 @@ fn refresh_icon(tray: &Option<TrayIcon>, st: &Value, s: &Settings, dark: bool, s
     let [w, a, r, _] = sum.counts;
     let counts = if sum.known { format!("in work {w} · waiting for answer {a} · ready {r}") } else { "counts unknown (service error or stale status)".into() };
     let _ = t.set_tooltip(Some(format!("taskq: {counts}{}", if sum.run { "" } else { " · paused" })));
+}
+
+/// A blur this soon after the icon opened the popover takes the focus back instead of closing it:
+/// on Windows 11 the hidden-icons flyout retakes the foreground right after its icon is clicked.
+fn blur_refocuses(shown_for: Duration) -> bool {
+    shown_for < Duration::from_millis(300)
 }
 
 /// Put the popover under a menu-bar icon or above a taskbar icon, inside the icon's monitor.
@@ -1679,6 +1694,14 @@ mod tests {
         assert_eq!(popover_size(&json!({"w": 320, "h": 500, "g": 10, "d": 1.5}), 600.0, 1.0), (495, 600));
         // Text size 140 % at 125 % display scale: 331 CSS px are 579.25 device px, never 579
         assert_eq!(popover_size(&json!({"w": 320, "h": 900, "g": 11, "d": 1.75}), 600.0, 1.25).0, 580);
+    }
+
+    // Chain: icon click -> popover shown -> blur. Risk: opened from the Windows 11 hidden-icons flyout, the popover
+    // closes 15 ms later because the flyout retakes the foreground; or a later blur no longer closes it.
+    #[test]
+    fn blur_right_after_opening_keeps_the_popover() {
+        assert!(blur_refocuses(Duration::from_millis(15)));
+        assert!(!blur_refocuses(Duration::from_millis(300)) && !blur_refocuses(Duration::from_secs(5)));
     }
 
     // Chain: status.json capacity -> tray projection -> shared resource controls. Risk: absent reads as zero, a legacy

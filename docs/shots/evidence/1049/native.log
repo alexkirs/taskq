@@ -1,0 +1,121 @@
+build 4.2.0-dev.1792018150 (9ab83b63052a099c826a26cbeca8fe22e99c920d) tray pid 8812; isolated host winq; pinned window first
+22:58:14 info hwnd=2428558 window=(1816,170)-(2280,1351) client=448x1172 origin=(1824,171) dpi=96 foreground=False
+22:58:14 A "Home focus=H1:Home iw=320 cw=320 sw=320 ih=838 sh=838"
+22:58:15 A visible=True
+22:58:42 info hwnd=2428558 window=(1816,170)-(2280,1351) client=448x1172 origin=(1824,171) dpi=96 foreground=True
+22:58:42 A-raised "Home focus=H1:Home iw=320 cw=320 sw=320 ih=838 sh=838"
+22:58:43 shot wrote native-01-home-pinned.png 464x1181
+22:58:44 B native click 'Settings': click at screen (2153,1305)
+22:58:45 B "Home focus=H1:Home iw=320 cw=320 sw=320 ih=838 sh=838"
+22:58:45 C no element '‹'
+22:58:45 C "Home focus=H1:Home iw=320 cw=320 sw=320 ih=838 sh=838"
+22:58:53 info hwnd=2428558 window=(1816,170)-(2280,1351) client=448x1172 origin=(1824,171) dpi=96 foreground=True
+22:58:54 B2 native click 'Settings': click at screen (2153,1305)
+22:58:55 B2 "Home focus=H1:Home iw=320 cw=320 sw=320 ih=838 sh=838"
+23:00:39 D "Work mode focus=INPUT: iw=320 cw=320 sw=320 ih=341 sh=341"
+23:00:40 info hwnd=2428558 window=(1816,170)-(2280,656) client=448x477 origin=(1824,171) dpi=96 foreground=True
+23:00:41 shot wrote work-mode.png (not kept) 464x486
+23:00:48 E native click 'Settings': click at screen (2153,610)
+23:00:49 E "Settings focus=H1:Settings iw=320 cw=320 sw=320 ih=388 sh=388"
+23:00:56 F native click '‹': click at screen (1875,246)
+23:00:57 F "Work mode focus=H1:Work mode iw=320 cw=320 sw=320 ih=341 sh=341"
+23:00:58 G native click 'Home': click at screen (1943,610)
+23:00:59 G "Home focus=H1:Home iw=320 cw=320 sw=320 ih=868 sh=868"
+23:01:00 H key 9  sent
+23:01:01 H "Home focus=BUTTON:◎ Work mode… iw=320 cw=320 sw=320 ih=868 sh=868"
+23:01:02 I key 9  sent
+23:01:03 I "Home focus=BUTTON:Pause all… iw=320 cw=320 sw=320 ih=868 sh=868"
+23:01:04 J key 9 shift sent
+23:01:05 J "Home focus=BUTTON:◎ Work mode… iw=320 cw=320 sw=320 ih=868 sh=868"
+note: 22:58 Settings misses = icon tooltip over footer (from icon hover); 23:00 retry with tooltip gone delivered click
+23:01:10 K key 9  sent
+23:01:11 K "Home focus=BUTTON:Pause all… iw=320 cw=320 sw=320 ih=868 sh=868"
+23:01:14 L key 13  sent
+23:01:16 L "Home focus=BUTTON:Cancel iw=320 cw=320 sw=320 ih=931 sh=931"
+23:01:20 M key 13  sent
+23:01:21 M "Home focus=BUTTON:Pause all… iw=320 cw=320 sw=320 ih=868 sh=868"
+23:01:23 M2 "Home focus=BUTTON:Pause all… iw=320 cw=320 sw=320 ih=868 sh=868"
+23:01:25 M3 "Home focus=BUTTON:Pause all… iw=320 cw=320 sw=320 ih=868 sh=868"
+23:01:33 N native click 'Settings': click at screen (2153,1347)
+23:01:34 N "Settings focus=H1:Settings iw=320 cw=320 sw=320 ih=388 sh=388"
+23:01:39 N2 "Settings focus=H1:Settings iw=320 cw=320 sw=320 ih=388 sh=388"
+23:01:43 N3 "Settings focus=H1:Settings iw=320 cw=320 sw=320 ih=388 sh=388"
+23:01:48 O native click 'Home': click at screen (1943,677)
+23:01:49 O "Home focus=H1:Home iw=320 cw=320 sw=320 ih=868 sh=868"
+23:01:50 t key 9  sent
+23:01:53 t key 9  sent
+23:01:55 t key 9  sent
+23:01:57 t key 9  sent
+23:01:59 t key 9  sent
+23:02:01 t key 9  sent
+23:02:02 P "Home focus=A:Comment on #1058 ↗ iw=320 cw=320 sw=320 ih=868 sh=868"
+23:02:06 P2 "Home focus=A:Comment on #1058 ↗ iw=320 cw=320 sw=320 ih=868 sh=868"
+23:02:09 P3 "Home focus=A:Comment on #1058 ↗ iw=320 cw=320 sw=320 ih=868 sh=868"
+23:02:16 Q1 native click 'Settings': click at screen (2153,1347)
+23:02:17 Q1 "Settings focus=H1:Settings iw=320 cw=320 sw=320 ih=388 sh=388"
+23:02:21 Q2 native click 'Home': click at screen (1943,677)
+23:02:22 Q2 "Home focus=H1:Home iw=320 cw=320 sw=320 ih=868 sh=868"
+23:02:25 Q3 native click 'Settings': click at screen (2153,1347)
+23:02:26 Q3 "Settings focus=H1:Settings iw=320 cw=320 sw=320 ih=388 sh=388"
+23:02:27 R1 native click 'Home': click at screen (1943,677)
+23:02:28 R1 "Home focus=H1:Home iw=320 cw=320 sw=320 ih=868 sh=868"
+23:02:30 R2 native click 'Settings': click at screen (2153,1347)
+23:02:32 R2 "Settings focus=H1:Settings iw=320 cw=320 sw=320 ih=388 sh=388"
+23:02:33 R3 native click 'Home': click at screen (1943,677)
+23:02:34 R3 "Home focus=H1:Home iw=320 cw=320 sw=320 ih=868 sh=868"
+23:02:36 R4 native click 'Settings': click at screen (2153,1347)
+23:02:37 R4 "Settings focus=H1:Settings iw=320 cw=320 sw=320 ih=388 sh=388"
+23:02:38 R5 native click 'Home': click at screen (1943,677)
+23:02:39 R5 "Home focus=H1:Home iw=320 cw=320 sw=320 ih=868 sh=868"
+23:02:40 R6 native click 'Settings': click at screen (2153,1347)
+23:02:41 R6 "Settings focus=H1:Settings iw=320 cw=320 sw=320 ih=388 sh=388"
+23:02:57 U native click 'Pinned': click at screen (2042,201)
+23:02:58 U "Settings focus=BUTTON:Pin iw=320 cw=320 sw=320 ih=388 sh=388"
+23:02:59 U visible=True
+23:03:06 S blur by other window: blur window foreground=True visible=False
+23:03:12 S icon click (unpinned, closed): visible=True
+23:03:17 S after 4s still visible=True
+23:03:20 S Escape: key 27  sent visible=False
+23:03:28 S icon click (unpinned, closed): visible=True
+23:03:32 S blur by other window: blur window foreground=False visible=False
+23:03:39 S icon click (unpinned, closed): visible=True
+23:03:42 S after 2s still visible=True
+23:03:45 S Escape: key 27  sent visible=False
+23:03:52 S icon click (unpinned, closed): visible=True
+23:03:56 S icon click while open: visible=True
+23:04 note: icon click while open not testable from overflow: opening the chevron flyout blurs and hides the popover first
+23:04:03 V visible=True
+23:04:04 shot wrote native-02-settings-unpinned.png 464x552
+23:04:09 V2 visible=True
+23:04:17 W native click 'Home': click at screen (1982,1286)
+23:04:18 W "Home focus=H1:Home iw=320 cw=320 sw=320 ih=868 sh=868"
+23:04:26 X native click 'Pin': click at screen (2081,139)
+23:04:27 X "Home focus=BUTTON:Pinned iw=320 cw=320 sw=320 ih=868 sh=868"
+23:04:28 X visible=True
+23:04:28 shot wrote native-03-home-repinned.png 464x1223
+note: Q1-Q3 used a native press held 2100 ms (longer than one ~2 s refresh; 8 DOM refresh mutations seen in 10 s at 23:01:33-43); R1-R6 used 40 ms presses
+23:08:31 Y native click 'Settings': click at screen (2192,1285)
+23:08:32 Y "Settings focus=H1:Settings iw=320 cw=320 sw=320 ih=388 sh=388"
+23:08:34 t key 9  sent
+23:08:36 t key 9  sent
+23:08:38 t key 9  sent
+23:08:40 t key 9  sent
+23:08:43 t key 9  sent
+23:08:45 t key 9  sent
+23:08:47 t key 9  sent
+23:08:49 t key 9  sent
+grip focus: "grip"
+23:08:51 info hwnd=2428558 window=(1855,108)-(2319,660) client=448x543 origin=(1863,109) dpi=96 foreground=True
+23:08:52 Z1 key 39  sent
+23:08:54 Z1 key 39  sent
+23:08:56 Z1 key 40  sent
+23:08:58 Z1 key 40  sent
+23:09:00 info hwnd=2428558 window=(1855,108)-(2347,688) client=476x571 origin=(1863,109) dpi=96 foreground=True
+23:09:01 Z1 "Settings focus=DIV: iw=340 cw=340 sw=340 ih=408 sh=408"
+23:09:02 shot wrote native-04-grip-resized.png 492x580
+23:09:03 Z2 key 37  sent
+23:09:05 Z2 key 37  sent
+23:09:07 Z2 key 38  sent
+23:09:09 Z2 key 38  sent
+23:09:11 info hwnd=2428558 window=(1855,108)-(2319,660) client=448x543 origin=(1863,109) dpi=96 foreground=True
+23:09:11 Z2 "Settings focus=DIV: iw=320 cw=320 sw=320 ih=388 sh=388"

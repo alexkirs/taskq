@@ -30,7 +30,7 @@ details[open]>summary:after{transform:rotate(90deg)}
 .counter.zero{color:var(--muted);background:light-dark(#eff1f3,#2b3138)}
 .work{color:var(--work)}.ask{color:var(--ask)}.ready{color:var(--ready)}.failed{color:var(--failed)}
 .options{display:flex;gap:5px;flex-wrap:wrap;padding:4px}
-.options button{flex:1;min-width:38px}
+.options button{flex:1 0 38px}.options [data-a^=notify]{padding-inline:4px}
 .options button.rec{border-color:var(--work);font-weight:600}
 button[aria-pressed=true]{background:light-dark(#dce7e1,#354a40);border-color:var(--work)}
 .periods button{flex:1 0 auto;padding:4px 6px}
@@ -391,6 +391,8 @@ function render(navigating=false){
   const active=document.activeElement,answerFocus=active&&active.closest('[data-answer]'),scroll=document.scrollingElement.scrollTop;
   const bounds=new Map([...menu.querySelectorAll('[data-bound]')].map(e=>[e.dataset.bound,e.scrollTop]));
   const focusKey=!navigating&&active&&menu.contains(active)?JSON.stringify(active.dataset):null;
+  // a refresh rebuilds the menu: refocus the same control, link or heading, by tag, data and position (U-A4)
+  const same=e=>e.tagName===active.tagName&&JSON.stringify(e.dataset)===focusKey,focusAt=focusKey?[...menu.querySelectorAll(active.tagName)].filter(same).indexOf(active):-1;
   const focusedSummary=!navigating&&active?.tagName==='SUMMARY'?[...menu.querySelectorAll('summary')].indexOf(active):-1;
   const caret=answerFocus&&active.tagName==='TEXTAREA'?[active.selectionStart,active.selectionEnd]:null;
   const answerSelector=answerFocus&&(caret?'textarea':active.dataset.choice?'[data-choice="'+active.dataset.choice+'"]':active.dataset.qac?'[data-qac="'+active.dataset.qac+'"]':'button[type=submit]');
@@ -406,7 +408,7 @@ function render(navigating=false){
   if(S.page!==undefined)menu.querySelectorAll('.hist,.agents,.service,.incident-notice').forEach(d=>d.open=true);
   const restored=answerFocus&&menu.querySelector('[data-answer="'+CSS.escape(answerFocus.dataset.answer)+'"] '+answerSelector);
   if(restored&&!navigating){restored.focus({preventScroll:true});if(caret)restored.setSelectionRange(...caret);}
-  else if(!navigating){const target=focusedSummary>=0?menu.querySelectorAll('summary')[focusedSummary]:focusKey&&focusKey!=='{}'?[...menu.querySelectorAll('button,.grip')].find(b=>JSON.stringify(b.dataset)===focusKey):null;target?.focus({preventScroll:true});}
+  else if(!navigating){const target=focusedSummary>=0?menu.querySelectorAll('summary')[focusedSummary]:focusKey&&active.tagName==='H1'?menu.querySelector('h1'):focusKey&&focusKey!=='{}'?[...menu.querySelectorAll(active.tagName)].filter(same)[focusAt]:null;target?.focus({preventScroll:true});}
   document.scrollingElement.scrollTop=scroll;
   fit();
   // after fit() sets the width: a new exchange or text size opens at the newest entry; a tick keeps the reader's place;
@@ -428,6 +430,15 @@ function wholeLines(c){
 // a reader's scroll leaves cut lines: once it settles, the block takes its CSS bound again and realigns on whole lines
 function settle(c){if(!c.isConnected)return;const s=c.scrollTop;c.style.maxHeight='';c.scrollTop=s;wholeLines(c);fit();}
 menu.addEventListener('scroll',e=>{const c=e.target;if(!c.dataset?.bound)return;clearTimeout(c.settling);c.settling=setTimeout(()=>settle(c),150);},true);
+// a refresh between press and release rebuilds the pressed control and its click is lost (U-A4):
+// the refresh waits for the release, at most 5 s, then runs after the click
+let pressedAt=null,stale=false;
+function refresh(now){if(pressedAt!==null&&now-pressedAt<5000){stale=true;return;}render();}
+function release(){pressedAt=null;if(stale){stale=false;setTimeout(render);}}
+menu.addEventListener('pointerdown',()=>{pressedAt=performance.now();});
+for(const event of ['pointerup','pointercancel'])addEventListener(event,release,true);
+addEventListener('blur',release);
+// Press end.
 window.taskq={settle,receive(s){
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
   if(s.capmsg){resourceReceipt(s.capmsg);return;}
@@ -439,7 +450,7 @@ window.taskq={settle,receive(s){
   if(s.page!==undefined&&s.page!==page){page=s.page;taskFilter=null;working=null;workCard=null;trail.length=0;pending={};disclosures=[];render(true);return;}
   // a tick does not take the caret out of the range fields
   if(document.activeElement&&(document.activeElement.dataset.draft||document.activeElement.dataset.rscField||document.activeElement.id==='ai'))return;
-  render();
+  refresh(performance.now());
 },model:{unique,counts,mode,resourceSet}};
 menu.addEventListener('click',e=>{
   const cardLink=e.target.closest('.qac a');if(cardLink){e.preventDefault();send({a:'open',url:cardLink.getAttribute('href')});return;}
@@ -468,10 +479,11 @@ menu.addEventListener('click',e=>{
   if(d.a==='ai-clear'){send({a:'ai-clear'});return;}
   if(d.a==='add-ask'||d.a==='add-back'){addConfirm=d.a==='add-ask';render();return;}
   if(d.a==='add-install'||d.a==='add-cancel')addConfirm=false;
-  if(d.a==='confirm'||d.a==='cancel'){confirming=d.a==='confirm';render();return;}
+  // the pressed button is replaced: focus Cancel in the question, or the command again after it (U-A8)
+  if(d.a==='confirm'||d.a==='cancel'){confirming=d.a==='confirm';render();menu.querySelector(confirming?'[data-a="cancel"]':'[data-a="confirm"]')?.focus();return;}
   if(d.a==='update'){updating={v:d.v,at:S.now};}
   if(d.a==='pick'){ask=d.root;render();return;}
-  if(d.a==='pause-all'||d.a==='resume-all'){confirming=null;for(const p of S.projects.filter(p=>mode(p)===(d.a==='pause-all'?'run':'paused'))){pending[p.root]=d.a==='pause-all'?'Pausing':'Resuming';send({a:d.a.slice(0,-4),root:p.root});}render();return;}
+  if(d.a==='pause-all'||d.a==='resume-all'){confirming=null;for(const p of S.projects.filter(p=>mode(p)===(d.a==='pause-all'?'run':'paused'))){pending[p.root]=d.a==='pause-all'?'Pausing':'Resuming';send({a:d.a.slice(0,-4),root:p.root});}render();menu.querySelector('[data-a="confirm"]')?.focus();return;}
   if(d.a==='pause'||d.a==='resume'||d.a==='focus'){pending[d.root]=d.a==='pause'?'Pausing':'Resuming';ask=null;}
   if(d.a)send({a:d.a,root:d.root,label:d.label});render();});
 menu.addEventListener('input',e=>{if(e.target.id==='ai'){aiText=e.target.value;send({a:'ai-draft',text:aiText});return;}const k=e.target.dataset.draft;if(k&&draft)draft[k]=e.target.value;});

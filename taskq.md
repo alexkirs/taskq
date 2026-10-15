@@ -254,7 +254,10 @@ Reviewer checks every Acceptance and contract against the candidate and CI on th
 A recipe (P5) is a task list in § 9 `recipes`; `taskq recipe NAME --run ID` adds its tasks held through the § 1 create claim with stable op ids, so a rerun returns the first receipts; nothing starts before every task reads back and `--start` or `taskq start N`. A `gate: true` task or a `review-pr` project needs an owner `approve` of the exact current result before `close` publishes; dependents wait for its close. Detail: [plans and decisions](docs/design/plans-and-decisions.md#contract-detail).
 
 ## 8. Runtimes and deployment
-**Access (R9).** `<install>/worker-policy.json` is operator-owned: `revision` and `grants` of preset `restricted`, `workspace` or `full` per runtime and project or host. Each start and resume resolves requested and effective access, shown by `service permissions` and `status.json` `access`; no grant runs legacy flags. Non-Full modes keep `<install>` and runtime package directories out of worker writes; Full on the same host and user is uncontained. Unknown enforcement refuses before claim or resume. `service permissions` writes outside a worker only; a board answer never grants. Rollback floor `4.2.0-dev`. Detail: [worker permissions](docs/design/worker-permissions.md#contract-detail).
+**Access (R9).** [Grants and enforcement](docs/design/worker-permissions.md#contract-detail) govern every start/resume; #970's presets stay unchanged. Full is uncontained; tasks never grant it.
+Planning: select Full for proven needs; require the operator grant before start. Known macOS Codex 0.159.3 cases (other versions/platforms unknown):
+- Blender 5.2.1 Metal: Workspace exit 139 3/3; Full passes 3/3 ([#157](https://github.com/taskqorg/taskq/issues/157#issuecomment-6029143783)).
+- App-server socket client: Workspace EPERM despite socket roots/allowlist; Full connects ([#270](https://github.com/taskqorg/taskq/issues/270#issuecomment-6067173258)); no supervisor role restored.
 | Runtime | spawn (child of service) | resume |
 |---|---|---|
 | Codex | `codex exec --json <codex opts> -C <root> -`, brief on stdin; session from the first `thread.started` line | `codex exec --json resume <id> -` |

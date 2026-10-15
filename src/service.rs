@@ -957,7 +957,8 @@ impl<'a> Service<'a> {
                 let mut since = None;
                 for (id, from, to) in core::changes(n, &log) {
                     let entered = std::mem::replace(&mut since, at(id));
-                    if id <= after { continue; }
+                    // `held` is outside the queue model (§ Executable behavioral model): `hold` and `start` add none
+                    if id <= after || from.state == State::Held || to.state == State::Held { continue; }
                     let side = if to.session.is_some() { &to } else { &from };
                     let host = host_of(side);
                     if host.is_none_or(|h| h == self.cfg.me) {
@@ -2294,6 +2295,8 @@ mod tests {
     fn a_pass_records_each_logged_transition_once() {
         let b = Fake::default();
         let (x, y) = (b.create("X", "", &["taskq".into()]).unwrap(), b.create("Y", "", &["taskq".into()]).unwrap());
+        let z = b.create("Z", "", &["taskq".into()]).unwrap();
+        b.comment(z, &core::entry("hold", &[], None, "")).unwrap();
         let mut c = cfg("mac");
         c.limits.insert("claude".into(), 1);
         let e: Exits = Default::default();
@@ -2307,6 +2310,8 @@ mod tests {
         // the result and the requeue happen between two passes: both are recorded; the requeue left `review` without
         // an attempt, so every service records it without host
         b.comment(x, &core::entry("requeue", &[], None, "again")).unwrap();
+        // `held` is outside the queue: neither `hold` nor this `start` is a transition
+        b.comment(z, &core::entry("start", &[], None, "")).unwrap();
         *e.borrow()[0].1.borrow_mut() = Some(0);
         s.pass().unwrap();
         let created = |id: u64| b.state.borrow().comments.iter().find(|(_, c)| c.id == id).unwrap().1.created;
@@ -2318,6 +2323,7 @@ mod tests {
         assert_eq!(r.iter().map(row).collect::<Vec<_>>()[..3], [(x, "ready".into(), "doing".into(), None, mac.clone()),
             (x, "doing".into(), "review".into(), Some((created(ids[1]) - created(ids[0])) as u64), mac.clone()),
             (x, "review".into(), "ready".into(), Some((created(ids[2]) - created(ids[1])) as u64), None)], "{records}");
+        assert!(r.iter().all(|v| v["from"] != "held" && v["to"] != "held"), "{records}");
         assert!(r.iter().all(|v| v["task"] != y) && r[..2].iter().all(|v| v["rt"] == "claude") && r[2]["rt"].is_null(), "{records}");
         assert!(report.contains("| doing | review | claude | 1 |") && report.contains("| ready | doing | claude |"), "{report}");
         // the next pass and a restarted service record none of them again

@@ -88,7 +88,7 @@ pub fn entries(board: &dyn Board, n: u64) -> Result<Vec<Entry>> {
 }
 
 /// § 4 Profiling board operations: each call of the inner board is one `taskq-board` record; cached clock, user
-/// and label-schema reads are not operations and pass through.
+/// and label-schema reads are not operations and pass through; `ensure_labels` is a `label` operation.
 struct Profiled(Box<dyn Board>);
 
 impl Profiled {
@@ -103,7 +103,7 @@ impl Profiled {
 impl Board for Profiled {
     fn canonical_labels(&self) -> Result<bool> { self.0.canonical_labels() }
     fn state_label(&self, state: &str) -> Result<String> { self.0.state_label(state) }
-    fn ensure_labels(&self, names: &[String]) -> Result<()> { self.0.ensure_labels(names) }
+    fn ensure_labels(&self, names: &[String]) -> Result<()> { self.op("label", |b| b.ensure_labels(names)) }
     fn issues(&self, since: Option<i64>) -> Result<Vec<Issue>> { self.op("list", |b| b.issues(since)) }
     fn issue(&self, n: u64) -> Result<Issue> { self.op("read", |b| b.issue(n)) }
     fn comments(&self, n: u64) -> Result<Vec<Comment>> { self.op("inbox", |b| b.comments(n)) }
@@ -960,7 +960,7 @@ mod tests {
         let report = crate::profile::take_report();
         assert!(report.contains("| forge.call | 5 |"), "{report}");
         assert!(report.contains("| 2/3 | 60.00 |"), "{report}");
-        assert!(report.contains("http4xx:1, http5xx:1, ratelimit:1"), "{report}");
+        assert!(report.contains("http4xx:2, http5xx:1"), "{report}");
         assert!(!report.contains("private"));
     }
 

@@ -10,7 +10,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const OPS: [&str; 6] = ["service.pass", "dispatch", "spawn", "forge.call", "update", "tray.render"];
 const PREFIX: &str = "taskq-profile ";
-const ERRORS: [&str; 9] = ["none", "http4xx", "http5xx", "timeout", "permission", "invalid", "ratelimit", "other", "panic"];
+const ERRORS: [&str; 8] = ["none", "http4xx", "http5xx", "timeout", "permission", "invalid", "other", "panic"];
 static LOG: OnceLock<PathBuf> = OnceLock::new();
 static TRACE: OnceLock<bool> = OnceLock::new();
 static RUN: OnceLock<Option<u64>> = OnceLock::new();
@@ -56,8 +56,7 @@ pub fn init(install: &Path) {
 }
 
 fn error(text: &str) -> &'static str {
-    if text.contains("requests paused") { "ratelimit" }
-    else if text.contains("HTTP 4") { "http4xx" }
+    if text.contains("HTTP 4") { "http4xx" }
     else if text.contains("HTTP 5") { "http5xx" }
     else if text.contains("timed out") || text.contains("timeout") { "timeout" }
     else if text.contains("denied") || text.contains("refused") { "permission" }

@@ -357,6 +357,10 @@ const FILES: &str = "Never run gh auth login. A missing board token is an owner 
 const CI_WAIT: &str = "Board budget: poll CI at most once a minute (`gh pr checks <PR> --watch --interval 60`); never `gh run watch`\n\
      (it polls every 3 s) or `gh run view` without `--json`.\n";
 
+/// taskq.md § 7: a sandbox limit is unknown locally; publication still needs exact-SHA CI.
+const SANDBOX_CHECKS: &str = "Host tests blocked by the worker sandbox: record sandbox-blocked in Checks, never as PASS; do not requeue for them.\n\
+     Their Acceptance gate remains green CI on the exact result SHA (R12).\n";
+
 fn ask(q: &impl std::fmt::Display, n: u64) -> String {
     format!("`{q} ask {n} --text \"Done: <checked or not started>\nProblem: <decision and user effect>\" --option A --option B --recommend K [--link URL]`")
 }
@@ -409,7 +413,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
              For implementation changes, commit with the line `Task: {url}` in the message, rebase on origin/main, run the project checks, then {push}.\n\
              Research or proposal tasks (type research, docs proposals) end with ask: options plus a recommendation; result only after the owner's answer.\n\
              After the answer, deliver the approved outcome or file approved dependent tasks (§ 7); no commit is needed for research-only output.\n\
-             Do not wait for CI: `close` checks it. {CI_WAIT}Then exactly one of:\n\
+             Do not wait for CI: `close` checks it. {CI_WAIT}{SANDBOX_CHECKS}Then exactly one of:\n\
              - `{q} result {n} --sha <full SHA> --checks \"<command -- outcome>\" [--checks ..] --text \"Changed: <user effect>\nOpen: <item|none>\"`,\n\
              - {ask} (owner decision; Acceptance unclear or untestable; or a split of work bigger than one reviewable diff — before any code),\n\
              - `{q} requeue {n} --text \"<why it cannot be done>\"`.\n{formats}",
@@ -1262,6 +1266,14 @@ mod tests {
         assert_eq!(values, vec!["7", "42", &l.role, &root.display().to_string(), &exe.display().to_string()]);
     }
 
+    // Chain: § 7 sandbox-blocked host checks. Risk: a worker requeues a sandbox limit or claims a local PASS.
+    #[test]
+    fn worker_brief_keeps_sandbox_blocked_checks_at_exact_sha_ci() {
+        assert!(SANDBOX_CHECKS.contains("sandbox-blocked") && SANDBOX_CHECKS.contains("Checks"));
+        assert!(SANDBOX_CHECKS.contains("never as PASS") && SANDBOX_CHECKS.contains("do not requeue"));
+        assert!(SANDBOX_CHECKS.contains("green CI on the exact result SHA"));
+    }
+
     fn rules_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("taskq-rules-{name}-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
@@ -1343,6 +1355,7 @@ mod tests {
                     let prefix = if cfg!(windows) && rt == "codex-app" { "$env:TASKQ_TASK='7'; $env:TASKQ_ATTEMPT='42'; " } else { "env TASKQ_TASK=7 TASKQ_ATTEMPT=42 " };
                     assert_eq!(brief(&env, &l).contains(prefix), rt != "codex", "{rt} {role}: attempt identity");
                     assert!(task.contains(FILES) && task.contains(CI_WAIT));
+                    if role == "worker" { assert!(brief(&env, &l).contains(SANDBOX_CHECKS)); }
                     // the attempt log's evidence line
                     let log = root.join(format!(".taskq/{rt}-{role}.log"));
                     std::fs::remove_file(&log).ok();

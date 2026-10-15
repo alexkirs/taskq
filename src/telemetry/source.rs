@@ -166,7 +166,11 @@ mod tests {
         let snapshot=std::path::PathBuf::from(std::env::var_os("TASKQ_SEMANTIC_SOURCE").expect("explicit snapshot"));
         let mut wal=snapshot.as_os_str().to_os_string();wal.push("-wal");assert!(std::fs::metadata(std::path::Path::new(&wal)).map_or(true,|m|m.len()==0),"snapshot must have no pending WAL");
         let dir=dir();std::fs::create_dir(dir.join("telemetry.log")).unwrap();std::fs::copy(&snapshot,dir.join("telemetry.log/telemetry.sqlite3")).unwrap();
-        let mut archive=super::super::open(&dir).unwrap();let target=Store::open(&dir.join("common")).unwrap();
+        let mut archive=super::super::open(&dir).unwrap();let common=dir.join("common");let mut expected_common=None;
+        if let Some(snapshot)=std::env::var_os("TASKQ_SEMANTIC_COMMON") {let snapshot=std::path::PathBuf::from(snapshot);let mut wal=snapshot.as_os_str().to_os_string();wal.push("-wal");assert!(std::fs::metadata(std::path::Path::new(&wal)).map_or(true,|m|m.len()==0));std::fs::copy(snapshot,&common).unwrap();expected_common=Some(std::env::var("TASKQ_SEMANTIC_COMMON_SHA").expect("explicit original common export SHA256"));}
+        let target=Store::open(&common).unwrap();let mut original_ids=std::collections::HashSet::new();let mut original_hash=ring::digest::Context::new(&ring::digest::SHA256);let mut after=0;
+        loop {let page=target.export(0,after,1024).unwrap();for row in page["events"].as_array().unwrap() {assert!(!super::super::semantic::KINDS.contains(&row["observation"]["kind"].as_str().unwrap()));original_ids.insert(row["id"].as_str().unwrap().to_owned());original_hash.update((row.to_string()+"\n").as_bytes());}after=page["next"].as_i64().unwrap();if page["more"]==false {break;}}
+        let original_hash=original_hash.finish();if let Some(expected)=expected_common {assert_eq!(original_hash.as_ref().iter().map(|byte|format!("{byte:02x}")).collect::<String>(),expected,"schema upgrade preserves the original common export");}
         let mut expected=ring::digest::Context::new(&ring::digest::SHA256);let mut text=String::new();let mut count=0;
         let canonical=|line:&str|if line.starts_with("taskq-requests ") {crate::requests::legacy_value(line)} else {crate::profile::legacy_value(line)};
         {let mut read=archive.prepare("SELECT retained_ms,line FROM records ORDER BY seq").unwrap();let rows=read.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).unwrap();
@@ -176,15 +180,18 @@ mod tests {
         assert_eq!(import(&mut archive,&target).unwrap(),count);let cursor=target.import_cursor(SOURCE).unwrap();let identity=state(&archive).unwrap().namespace;
         drop(archive);let mut archive=super::super::open(&dir).unwrap();assert_eq!(import(&mut archive,&target).unwrap(),0);assert_eq!(state(&archive).unwrap().namespace,identity);assert_eq!(target.import_cursor(SOURCE).unwrap(),cursor);
         let mut actual=ring::digest::Context::new(&ring::digest::SHA256);let mut restored=String::new();let mut after=0;let mut retained=0;
-        loop {let page=target.export(0,after,1024).unwrap();for row in page["events"].as_array().unwrap() {
+        loop {let page=target.export_kinds(super::super::semantic::KINDS,0,after,1024).unwrap();assert_eq!(page["unindexed_count"],0);for row in page["events"].as_array().unwrap() {
             let line=super::super::semantic::line(&row["observation"]).unwrap();let received=row["received_ms"].as_i64().unwrap();actual.update(format!("{received} {} {}\n",line.split_once(' ').unwrap().0,canonical(&line).unwrap()).as_bytes());restored.push_str(&line);restored.push('\n');retained+=1;
         }after=page["next"].as_i64().unwrap();if page["more"]==false {break;}}
         let digest=|value:ring::digest::Digest|value.as_ref().iter().map(|byte|format!("{byte:02x}")).collect::<String>();
         let expected=digest(expected.finish());let actual=digest(actual.finish());assert_eq!(expected,actual);assert_eq!(retained,count);assert_eq!(target.storage().unwrap()["pruned_count"],0);
-        assert_eq!(crate::profile::legacy_reports(&restored,at).unwrap(),reports);
+        let indexed=super::super::semantic::read(&target,super::super::semantic::KINDS).unwrap();assert_eq!(crate::profile::legacy_reports(&indexed,at).unwrap(),reports);assert_eq!(crate::profile::legacy_reports(&restored,at).unwrap(),reports);
+        let mut preserved=ring::digest::Context::new(&ring::digest::SHA256);let mut found=0;let mut after=0;
+        loop {let page=target.export(0,after,1024).unwrap();for row in page["events"].as_array().unwrap() {if original_ids.contains(row["id"].as_str().unwrap()) {preserved.update((row.to_string()+"\n").as_bytes());found+=1;}}after=page["next"].as_i64().unwrap();if page["more"]==false {break;}}
+        assert_eq!(found,original_ids.len());assert_eq!(preserved.finish().as_ref(),original_hash.as_ref());
         let unchanged={let mut read=archive.prepare("SELECT line FROM records ORDER BY seq").unwrap();read.query_map([],|r|r.get::<_,String>(0)).unwrap().map(|line|line.unwrap()+"\n").collect::<String>()};assert_eq!(unchanged,text);
         assert_eq!(archive.query_row("SELECT text FROM legacy WHERE id=1",[],|r|r.get::<_,String>(0)).optional().unwrap(),legacy);
-        println!("source identity import: {count} rows; canonical+receipt SHA256 {actual}; 9 reports equal; replay 0; pruning 0");
+        println!("source identity import: {count} rows; canonical+receipt SHA256 {actual}; 9 indexed reports equal; replay 0; pruning 0; {found} existing generic observations preserved");
         drop(archive);drop(target);std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

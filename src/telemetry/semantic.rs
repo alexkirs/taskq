@@ -2,6 +2,7 @@
 use serde_json::{Value,json};
 
 type Res<T> = Result<T,String>;
+pub(super) const KINDS:&[&str]=&["operation","stage","board","transition","requests"];
 
 fn canonical(line: &str) -> Res<Value> {
     if line.starts_with("taskq-requests ") {crate::requests::legacy_value(line)} else {crate::profile::legacy_value(line)}
@@ -77,6 +78,17 @@ pub(super) fn lines(values: &[Value]) -> Res<Vec<String>> {
     reader.finish()?;Ok(lines)
 }
 
+/// Compatibility report input from bounded indexed pages, never a scan of generic method payloads.
+pub(super) fn read(store: &coreq::telemetry::Store,kinds: &[&str]) -> Res<String> {
+    let mut reader=coreq::telemetry::Assembler::default();let mut text=String::new();let mut after=0;
+    loop {
+        let page=store.export_kinds(kinds,0,after,1024)?;
+        for row in page["events"].as_array().ok_or("invalid semantic page")? {if let Some(value)=reader.push(row["observation"].clone())? {text.push_str(&line(&value)?);text.push('\n');}}
+        after=page["next"].as_i64().ok_or("missing semantic cursor")?;if page["more"]==false {break;}
+    }
+    reader.finish()?;Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +138,14 @@ mod tests {
         let digest=|value:ring::digest::Digest|value.as_ref().iter().map(|byte|format!("{byte:02x}")).collect::<String>();
         let expected=digest(expected.finish());let actual=digest(actual.finish());assert_eq!(retained,count);assert_eq!(actual,expected);assert_eq!(store.storage().unwrap()["pruned_count"],0);
         println!("semantic archive: {count} rows; canonical+receipt SHA256 {actual}; original receipt clocks preserved; pruning 0");
+        drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn indexed_report_reader_selects_stages_without_exposing_generic_calls() {
+        let dir=std::env::temp_dir().join(format!("taskq-indexed-read-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir(&dir).unwrap();let path=dir.join("db");let store=coreq::telemetry::Store::open(&path).unwrap();
+        let generic=coreq::telemetry::Event::new(json!({"product":"taskq","version":"1","operation":"generic.method","kind":"method","trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"})).unwrap();store.append(&[generic]).unwrap();
+        let stage=r#"taskq-stage {"stage":"claim","task":1,"attempt":2,"rt":"other","us":1,"outcome":"ok","error":"none","at_ms":1,"unknown":"no-model"}"#;store.append(&[coreq::telemetry::Event::new(observation(stage).unwrap()).unwrap()]).unwrap();
+        let text=read(&store,&["stage"]).unwrap();assert_eq!(text.lines().count(),1);assert_eq!(canonical(text.trim()).unwrap(),canonical(stage).unwrap());assert!(read(&store,&["board"]).unwrap().is_empty());
         drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

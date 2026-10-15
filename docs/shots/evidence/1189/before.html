@@ -1,0 +1,66 @@
+<!doctype html><meta charset="utf-8"><title>TaskQ before</title><link rel="stylesheet" href="../1007/page.css"><article><p align="center" dir="auto">
+  <a target="_blank" rel="noopener noreferrer" href="../../../header.webp"><img src="../../../header.webp" alt="Relaxing while the agents work" width="720" style="max-width: 100%;"></a>
+  <br><em>Agents working.</em>
+</p>
+<pre lang="text" class="notranslate"><code class="notranslate">Install taskq from https://github.com/taskqorg/taskq and set it up for this project.
+</code></pre>
+<p dir="auto">Paste into Claude or Codex; the agent confirms setup changes, installs taskq, connects the board and becomes the manager.<br>
+For a new project:</p>
+<pre lang="text" class="notranslate"><code class="notranslate">Install taskq from https://github.com/taskqorg/taskq and create project &lt;name&gt; from &lt;idea or folder&gt;.
+</code></pre>
+<p dir="auto">Your repository board is the task list; your usual AI apps do the work.</p>
+<h3 dir="auto">What you get</h3>
+<ul dir="auto">
+<li>Tasks are issues on GitHub or GitLab.</li>
+<li>The service runs Claude or Codex workers within each computer's configured limits.</li>
+<li>A worker's question waits for your answer.</li>
+<li>A reviewer checks the result; accepted work publishes through the configured branch or PR route.</li>
+<li>The tray menu shows questions, admission controls and a day's history.</li>
+<li>Several computers share one board.</li>
+</ul>
+<h3 id="shots" dir="auto">See the queue</h3>
+<p dir="auto">Synthetic storefront data, captured from the dark tray menu. These are examples, not a live project's progress. Open an image for its original size.</p>
+<p dir="auto"><strong>A question with its choices.</strong></p>
+<p dir="auto"><a href="../../../shots/popover-dark-attention-16.png"><img src="../../../shots/popover-dark-attention-16.png" alt="Cart quantity question and numbered answers" style="max-width: 100%;"></a></p>
+<p dir="auto"><strong>Project queues at a glance.</strong> Closed totals remain unknown in this fixture.</p>
+<p dir="auto"><a href="../../../shots/popover-dark-projects-16.png"><img src="../../../shots/popover-dark-projects-16.png" alt="Storefront and billing project queue summaries" style="max-width: 100%;"></a></p>
+<h3 dir="auto">From request to reviewed work</h3>
+<p dir="auto">Illustrative dialogue, not recorded sessions. The three scenes follow one storefront change; task numbers and outcomes are examples. Start with an installed project, an accessible board and a manager that has loaded the project rules.</p>
+<h4 dir="auto">1. Agree the work before starting</h4>
+<p dir="auto">Customers lose their cart when they sign in. The owner also wants them returned to the page they came from.</p>
+<blockquote>
+<p dir="auto"><strong>Owner:</strong> Fix sign-in so customers can continue shopping. Plan the work first.</p>
+<p dir="auto"><strong>Manager:</strong> Should this include merging a guest cart into an existing account cart, or just returning to the right page? That changes the acceptance checks.</p>
+<p dir="auto"><strong>Owner:</strong> Both. Keep them as separate tasks. Show me the checks before starting.</p>
+<p dir="auto"><strong>Manager:</strong> I suggest <a class="issue-link js-issue-link" data-error-text="Failed to load title" data-id="5731091405" data-permission-text="Title is private" data-url="https://github.com/taskqorg/taskq/issues/41" data-hovercard-type="issue" data-hovercard-url="/taskqorg/taskq/issues/41/hovercard" href="https://github.com/taskqorg/taskq/issues/41">#41</a> for cart preservation and <a class="issue-link js-issue-link" data-error-text="Failed to load title" data-id="5731093666" data-permission-text="Title is private" data-url="https://github.com/taskqorg/taskq/issues/43" data-hovercard-type="issue" data-hovercard-url="/taskqorg/taskq/issues/43/hovercard" href="https://github.com/taskqorg/taskq/issues/43">#43</a> for the return page. Check both fresh and existing account carts, and reject external redirect destinations. The tasks can run independently.</p>
+<p dir="auto"><strong>Owner:</strong> Agreed. File them held, then start those two.</p>
+</blockquote>
+<p dir="auto">The manager creates the agreed issues, reads them back and starts them. Eligible workers run within the host's limits. The observable result is two linked issues with acceptance checks and their actual queue states; filing them alone does not prove work started.</p>
+<p dir="auto">Sources: <a href="../../../use-cases/README.md#uc-02-manage-a-project-through-an-agent">UC-02</a>, <a href="../../../use-cases/README.md#uc-03-move-from-idea-to-implementation">UC-03</a>, <a href="../../../use-cases/README.md#uc-07-turn-a-large-plan-into-dependent-and-parallel-tasks">UC-07</a>.</p>
+<h4 dir="auto">2. Resolve a question without guessing</h4>
+<p dir="auto">The cart worker finds that the same product can exist in both carts. Task <a class="issue-link js-issue-link" data-error-text="Failed to load title" data-id="5731091405" data-permission-text="Title is private" data-url="https://github.com/taskqorg/taskq/issues/41" data-hovercard-type="issue" data-hovercard-url="/taskqorg/taskq/issues/41/hovercard" href="https://github.com/taskqorg/taskq/issues/41">#41</a> waits for an owner decision.</p>
+<blockquote>
+<p dir="auto"><strong>Owner:</strong> What is blocking the cart fix?</p>
+<p dir="auto"><strong>Manager:</strong> <a class="issue-link js-issue-link" data-error-text="Failed to load title" data-id="5731091405" data-permission-text="Title is private" data-url="https://github.com/taskqorg/taskq/issues/41" data-hovercard-type="issue" data-hovercard-url="/taskqorg/taskq/issues/41/hovercard" href="https://github.com/taskqorg/taskq/issues/41">#41</a> needs a quantity rule: 1. Keep the larger quantity, or 2. Add the quantities. The worker recommends 1 to avoid accidental duplicates.</p>
+<p dir="auto"><strong>Owner:</strong> Keep the larger quantity. Does that also cover a product that is now out of stock?</p>
+<p dir="auto"><strong>Manager:</strong> No. That needs a separate acceptance condition; the current choice only settles duplicate quantities.</p>
+<p dir="auto"><strong>Owner:</strong> Answer <a class="issue-link js-issue-link" data-error-text="Failed to load title" data-id="5731091405" data-permission-text="Title is private" data-url="https://github.com/taskqorg/taskq/issues/41" data-hovercard-type="issue" data-hovercard-url="/taskqorg/taskq/issues/41/hovercard" href="https://github.com/taskqorg/taskq/issues/41">#41</a> with 1. Also tell the worker to retain unavailable items with a warning, without allowing checkout for them.</p>
+</blockquote>
+<p dir="auto">The manager reads the current question, posts the selected answer and sends the additional instruction to <a class="issue-link js-issue-link" data-error-text="Failed to load title" data-id="5731091405" data-permission-text="Title is private" data-url="https://github.com/taskqorg/taskq/issues/41" data-hovercard-type="issue" data-hovercard-url="/taskqorg/taskq/issues/41/hovercard" href="https://github.com/taskqorg/taskq/issues/41">#41</a>. Readback must show both before reporting success. The service resumes the same attempt when it can. If the question changed, the manager refreshes it instead of answering an old card.</p>
+<p dir="auto">Source: <a href="../../../use-cases/README.md#uc-09-answer-without-leaving-the-task">UC-09</a>. This example uses the manager and board; it does not promise every proposed inline conversation control.</p>
+<h4 dir="auto">3. Accept evidence, then deliver</h4>
+<p dir="auto">The redirect worker submits <a class="issue-link js-issue-link" data-error-text="Failed to load title" data-id="5731093666" data-permission-text="Title is private" data-url="https://github.com/taskqorg/taskq/issues/43" data-hovercard-type="issue" data-hovercard-url="/taskqorg/taskq/issues/43/hovercard" href="https://github.com/taskqorg/taskq/issues/43">#43</a> with a candidate commit, checks and a PR. Creating the PR has not delivered the fix to users.</p>
+<blockquote>
+<p dir="auto"><strong>Owner:</strong> Is the redirect fix ready?</p>
+<p dir="auto"><strong>Manager:</strong> The result has passing checks, but the browser evidence does not cover an expired session. Accept this scope or send it back for that case?</p>
+<p dir="auto"><strong>Owner:</strong> Send it back. Expired sessions must return safely too.</p>
+<p dir="auto"><strong>Manager:</strong> The reviewer returned <a class="issue-link js-issue-link" data-error-text="Failed to load title" data-id="5731093666" data-permission-text="Title is private" data-url="https://github.com/taskqorg/taskq/issues/43" data-hovercard-type="issue" data-hovercard-url="/taskqorg/taskq/issues/43/hovercard" href="https://github.com/taskqorg/taskq/issues/43">#43</a> with that missing check. The replacement result now includes it; the reviewer must check the new commit and its CI.</p>
+<p dir="auto"><strong>Owner:</strong> Once that exact candidate passes review, publish the PR through our agreed route.</p>
+</blockquote>
+<p dir="auto">The reviewer checks the replacement against acceptance and the configured publication requirements. Only successful publication readback establishes that the branch or PR was published. Deployment to a running storefront needs its own evidence; closing a TaskQ task does not prove it.</p>
+<p dir="auto">Source: <a href="../../../use-cases/README.md#uc-14-review-evidence-and-deliver">UC-14</a>. The manager relays evidence and owner decisions; it does not replace the reviewer.</p>
+<p dir="auto">Agents: install, setup, commands and development are in <strong><a href="taskq.md">taskq.md</a></strong>.</p>
+<p dir="auto">Verify a downloaded release file: check it against the release's <code class="notranslate">SHA256SUMS</code> (<code class="notranslate">shasum -a 256 -c SHA256SUMS --ignore-missing</code>),<br>
+then trace it to the workflow run that built it with <code class="notranslate">gh attestation verify &lt;file&gt; --repo taskqorg/taskq</code>.</p>
+<p dir="auto">License: <a href="../../../../LICENSE">MIT</a>.</p>
+<p dir="auto">If taskq saves you time, <a href="https://alex.kirs.online/donate" rel="nofollow">buy me a coffee</a>.</p></article>

@@ -497,7 +497,12 @@ pub fn migrate(install: &Path, roots: &[PathBuf]) -> Res<()> {
     for (i, f) in files.iter().enumerate() {
         let path = Path::new(f["root"].as_str().unwrap()).join("taskq.json");
         let next = f["next"].as_str().unwrap();
-        if let Some(stage) = &staged[i] { replace_project(&path, stage)?; }
+        if let Some(stage) = &staged[i] {
+            replace_project(&path, stage)?;
+            // ReplaceFileW merges DACL inheritance flags; restore the recorded descriptor before readback.
+            #[cfg(windows)]
+            stage_owner(&path, &f["owner"])?;
+        }
         if fs::read_to_string(&path).map_err(|e| e.to_string())? != next || ownership(&path)? != f["owner"] { return Err("migration content/ownership readback differs; launches held".into()); }
     }
     if Policy::read(install)?.raw != *policy { return Err("host.json migration readback differs".into()); }
@@ -688,6 +693,24 @@ mod tests {
         fs::write(install.join("host.json"), serde_json::to_string(&edited).unwrap()).unwrap();
         migrate(&install, &roots).unwrap(); assert_eq!(Policy::read(&install).unwrap().raw, edited, "completed retry preserves later owner edits");
         fs::remove_dir_all(install).unwrap();
+    }
+
+    // Chain A4: Windows protected DACL -> staged replacement. Risk: changing file access during migration.
+    #[cfg(windows)]
+    #[test]
+    fn migration_preserves_protected_windows_acl() {
+        let root = temp("protected-acl");
+        let path = root.join("taskq.json");
+        fs::write(&path, r#"{"repo":"invented/protected","limits":{"codex":2},"admission":{"mode":"auto","max":2}}"#).unwrap();
+        let owner = ownership(&path).unwrap();
+        let mut protected = owner.clone();
+        protected[3] = json!(protected[3].as_u64().unwrap() | 0x10);
+        stage_owner(&path, &protected).unwrap();
+        let expected = ownership(&path).unwrap();
+        migrate(&root, &[root.clone()]).unwrap();
+        assert_eq!(ownership(&path).unwrap(), expected);
+        assert_eq!(Policy::read(&root).unwrap().cap.limits["codex"], 2);
+        fs::remove_dir_all(root).unwrap();
     }
 
     // Chain A4: unknown or corrupt host policy -> refused launch, never fallback to project copies.

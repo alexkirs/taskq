@@ -134,5 +134,5 @@ Each task edits `taskq.md` first (R13), moves text only to a page that already o
 4. **specq restatements.** Replace every passage in the restatement table with its link. Saves about 4 KB.
 5. **Internal duplicates.** One home each for the 300-line rule, the CI-poll rule and the Ask/Result limits. Saves about 1 KB.
 6. **Remaining compression.** § 1 claims, § 3 load gate APIs, § 4 incidents, budget, profiling and `status.json` keys, § 9 history. Saves about 20 KB.
-7. **Guards.** Add a byte bound (60 KB) to `every_table_row_has_a_golden_trace`; give `docs/design/board.md` an English first heading.
+7. **Guards.** Add a byte bound to `every_table_row_has_a_golden_trace`; give `docs/design/board.md` an English first heading. After tasks 1–6 the contract was 83 KB, so the owner set the bound at 85 KiB (#1166); a follow-up compresses the contract and lowers it to 60 KiB.
 8. **#1156** injects the result with the index shape above.

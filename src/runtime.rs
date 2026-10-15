@@ -512,7 +512,8 @@ fn rule_text(root: &Path, task: &str, resume: bool, mut fetch: impl FnMut(&str) 
     let mut text = format!(
         "TaskQ rules: specq@{SPECQ_REVISION} at `{}`; contract `{spec}`.\n\
          Precedence: the project contract overrides shared rules where they conflict.\n\
-         These rules apply to this turn, including continuations. Apply them to the work; acknowledgement alone is not evidence.\n",
+         These rules apply to this turn, including continuations. Apply them to the work; acknowledgement alone is not evidence.\n\
+         Evidence: cite the applied rule as R<n> or § n; a fix records the failure before and the pass after.\n",
         dir.display()
     );
     if resume {
@@ -1197,6 +1198,7 @@ mod tests {
                     let header = rules.split("\n\n").next().unwrap();
                     assert!(header.contains(SPECQ_REVISION) && header.contains(&dir) && header.contains("https://github.com/taskqorg/taskq/blob/"));
                     assert!(header.contains("Precedence: the project contract overrides shared rules where they conflict."));
+                    assert!(header.contains("\nEvidence: cite the applied rule as R<n> or § n; a fix records the failure before and the pass after."));
                     // one index line per specq index file and per docs Markdown file, at start and at resume
                     for file in SPECQ_INDEX { assert_eq!(rules.matches(&format!("\n- {file}: Rule from {}\n", url(file))).count(), 1, "{file}"); }
                     assert!(rules.contains("\n- docs/guide.md: Guide title\n- docs/sub/plain.md: (no heading)\n") && !rules.contains("shot.png"));

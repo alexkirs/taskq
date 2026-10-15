@@ -381,14 +381,36 @@ fn ask(q: &impl std::fmt::Display, n: u64) -> String {
 }
 
 pub fn contract(root: &Path) -> String {
-    // A missing path sent workers to `find /`, which raised macOS folder prompts (#865): name one that exists.
-    let spec = root.join("taskq.md");
-    if spec.exists() {
-        spec.display().to_string()
+    match project_contract(root) {
+        Ok(Some(spec)) => spec.display().to_string(),
+        Ok(None) => command_contract(),
+        Err(e) => format!("project contract unavailable: {e}"),
+    }
+}
+
+fn command_contract() -> String {
+    let v = crate::platform::VERSION;
+    let tag = if v.contains('-') { "main".into() } else { format!("v{v}") }; // dev builds have no tag
+    format!("https://github.com/{}/blob/{tag}/taskq.md", crate::platform::RELEASE_REPO)
+}
+
+fn project_contract(root: &Path) -> Result<Option<PathBuf>, StartError> {
+    let config = match std::fs::read(root.join("taskq.json")) {
+        Ok(bytes) => Some(serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| refused("project registration", e))?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(refused("project registration", e)),
+    };
+    if let Some(config) = config {
+        let repo = config["repo"].as_str().ok_or_else(|| refused("project registration", "missing repository"))?;
+        let name = repo.rsplit('/').next().filter(|name| !name.is_empty() && !matches!(*name,"."|"..")
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+            .ok_or_else(|| refused("project registration", "invalid repository name"))?;
+        let path = root.join(format!("{name}.md"));
+        if repo == crate::platform::RELEASE_REPO && !path.exists() { return Ok(None); }
+        Ok(Some(path))
     } else {
-        let v = crate::platform::VERSION;
-        let tag = if v.contains('-') { "main".into() } else { format!("v{v}") }; // dev builds have no tag
-        format!("https://github.com/{}/blob/{tag}/taskq.md", crate::platform::RELEASE_REPO)
+        let path = root.join("taskq.md");
+        Ok(path.exists().then_some(path))
     }
 }
 
@@ -412,7 +434,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
     let park = format!("`{q} later {n} --text \"Reason: <failed external check>\nNext: <one unblock condition>\"` (unchanged external blocker; never requeue it)");
     let body = if l.role == "reviewer" {
         format!(
-            "Review the result SHA against each Acceptance item `A<k>` and taskq.md, and CI on that exact SHA. Requeue only for\n\
+            "Review the result SHA against each Acceptance item `A<k>` and the project contract, and CI on that exact SHA. Requeue only for\n\
              Acceptance or contract gaps, not style.\n\
              A research or proposal task without an ask and owner's answer before result/close is a task-fit gap (§ 7).\n\
              {CI_WAIT}Then exactly one of:\n\
@@ -530,11 +552,11 @@ fn rule_text(root: &Path, task: &str, resume: bool, fetch: impl FnMut(&str) -> R
 /// The rules part of a turn: header, then contract and core (start only), then the index.
 fn rules(root: &Path, resume: bool, mut fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
     let dir = specq_dir(root);
-    let spec = contract(root);
-    let contract = match std::fs::read(root.join("taskq.md")) {
-        Ok(b) => String::from_utf8(b).map_err(|_| refused("contract", "invalid UTF-8"))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CONTRACT.into(),
-        Err(e) => return Err(refused("contract", e)),
+    let selected = project_contract(root)?;
+    let spec = selected.as_ref().map_or_else(command_contract, |p|p.display().to_string());
+    let contract = match selected {
+        Some(path) => String::from_utf8(std::fs::read(&path).map_err(|e| refused("project contract", e))?).map_err(|_| refused("contract", "invalid UTF-8"))?,
+        None => CONTRACT.into(),
     };
     if contract.trim().is_empty() { return Err(refused("contract", "empty")); }
     // the header names the cache: every pinned file is there, at start and at resume
@@ -546,6 +568,7 @@ fn rules(root: &Path, resume: bool, mut fetch: impl FnMut(&str) -> Result<String
          Evidence: cite the applied rule as R<n> or § n; a fix records the failure before and the pass after.\n",
         dir.display()
     );
+    text.push_str(&format!("TaskQ command contract (tool reference): {}\n",command_contract()));
     if resume {
         text.push_str("Resume: the contract and core bodies came at start; reread them at the paths above when needed.\n");
     } else {
@@ -1472,6 +1495,31 @@ mod tests {
 
     // Chain: § 8 rule delivery cache and refusals, #1156. Risk: a missing or unreadable pinned file, an unreadable doc or an
     // oversized payload starts a worker without its rules; or every start refetches the pin.
+    #[test]
+    fn registered_project_contract_overrides_taskq_and_missing_contract_refuses() {
+        let root = rules_root("project-contract");
+        std::fs::write(root.join("taskq.json"),r#"{"repo":"group/nested/serverq"}"#).unwrap();
+        std::fs::write(root.join("taskq.md"),"# Wrong primary contract\n").unwrap();
+        std::fs::write(root.join("serverq.md"),"# ServerQ contract\nProject rule overrides shared rule.\n").unwrap();
+        let text = rule_text(&root,"task",false,rule).unwrap();
+        assert!(text.contains(&format!("--- contract {} ---\n# ServerQ contract",root.join("serverq.md").display())));
+        assert!(!text.contains("Wrong primary contract"));
+        for resume in [false,true] {
+            let text=rule_text(&root,"task",resume,rule).unwrap();
+            assert!(text.contains(&format!("contract `{}`",root.join("serverq.md").display())));
+        }
+        std::fs::remove_file(root.join("serverq.md")).unwrap();
+        for resume in [false,true] {assert!(rule_text(&root,"task",resume,rule).is_err());}
+        for config in ["{",r#"{"repo":"group/.."}"#,r#"{"repo":"group/"}"#,r#"{}"#] {
+            std::fs::write(root.join("taskq.json"),config).unwrap();
+            assert!(rule_text(&root,"task",false,rule).is_err());
+        }
+        std::fs::write(root.join("taskq.json"),r#"{"repo":"taskqorg/taskq"}"#).unwrap();
+        assert!(rule_text(&root,"task",false,rule).unwrap().contains("Wrong primary contract"));
+        std::fs::remove_file(root.join("taskq.md")).unwrap();
+        assert!(rule_text(&root,"task",false,rule).unwrap().contains(CONTRACT));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn rules_come_from_the_pin_cache_and_refuse_when_unreadable() {
         let root = rules_root("cache");

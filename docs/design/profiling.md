@@ -120,3 +120,5 @@ The shared runtime elects one local writer thread for the installation. Other pr
 ## Compatibility checkpoint
 
 The draft shared store is `telemetry.log/universal.sqlite3`, protected from older release sweeps by the retained directory. The v4.5.0 archive remains `telemetry.log/telemetry.sqlite3`; it is preserved without schema reset. Consolidation of its profile/stage/board/transition/request adapters and reports into coreq remains required before release. Two active store paths are a temporary development state and do not satisfy the one-store contract or the total physical bound.
+
+Historical import uses coreq's deterministic source-position identities and atomic event/cursor transaction. A failed batch cannot advance the cursor; a replay after process death cannot duplicate records. Source files remain unchanged during expansion. Legacy conversion and report readback must be verified before disabling the old writer; retirement is a separate step. Common IPC returns stable rejection classes without raw SQLite messages or input values.

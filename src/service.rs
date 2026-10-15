@@ -239,6 +239,8 @@ pub struct Service<'a> {
     seen: HashMap<u64, State>,
     /// The newest comment id an events pass saw; `gone` events come only from newer comments (§ 4)
     gone_after: Option<u64>,
+    /// Newest comment id of the previous pass, for queue transitions; None before the first (§ 4 Profiling).
+    moved_after: Option<u64>,
     /// First time covered by `<root>/.taskq/events` (§ 4).
     pub events_since: Option<i64>,
     /// Capacity reloaded before each pass (§ 3); an error holds every launch.
@@ -491,7 +493,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), begun: HashMap::new(), asked: HashMap::new() }
+        Service { wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg, version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), begun: HashMap::new(), asked: HashMap::new() }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -910,13 +912,18 @@ impl<'a> Service<'a> {
         if !first {
             ns.extend(views.iter().map(|v| v.issue.number).filter(|n| !self.seen.contains_key(n)));
         }
-        let mut moves = vec![];
+        let (mut moves, mut closed) = (vec![], vec![]);
         for n in ns {
             let (to, a) = match views.iter().find(|v| v.issue.number == n) {
                 // `ask` and `waiting` without an attempt: the last comment, else the issue number
                 Some(v) if matches!(v.task.state, State::Ask | State::Waiting) => (v.task.state, attempt(&v.task, &v.comments).or(v.comments.last().map(|c| c.id)).or(Some(n))),
                 Some(v) => (v.task.state, attempt(&v.task, &v.comments)),
-                None if self.board.issue(n).is_ok_and(|i| !i.open) => (State::Closed, attempt(&Task::default(), &self.board.comments(n)?)),
+                None if self.board.issue(n).is_ok_and(|i| !i.open) => {
+                    let c = self.board.comments(n)?;
+                    let a = attempt(&Task::default(), &c);
+                    closed.push((n, c));
+                    (State::Closed, a)
+                }
                 None => continue,
             };
             let kind = match to {
@@ -941,7 +948,27 @@ impl<'a> Service<'a> {
                 }
             }
         }
+        // queue transitions (§ 4 Profiling): accepted entries newer than the previous pass that changed the fold
+        if let Some(after) = self.moved_after {
+            let logs = views.iter().map(|v| (v.issue.number, &v.comments)).chain(closed.iter().map(|(n, c)| (*n, c)));
+            for (n, comments) in logs.filter(|(_, c)| c.iter().any(|c| c.trusted && c.id > after)) {
+                let log: Vec<_> = comments.iter().filter(|c| c.trusted).map(|c| core::Entry { id: c.id, body: c.body.clone(), edited: c.edited }).collect();
+                let at = |id: u64| comments.iter().find(|c| c.id == id).map(|c| c.created);
+                let mut since = None;
+                for (id, from, to) in core::changes(n, &log) {
+                    let entered = std::mem::replace(&mut since, at(id));
+                    if id <= after { continue; }
+                    let side = if to.session.is_some() { &to } else { &from };
+                    let host = host_of(side);
+                    if host.is_none_or(|h| h == self.cfg.me) {
+                        let prev = entered.zip(at(id)).and_then(|(a, b)| u64::try_from(b - a).ok());
+                        crate::profile::transition(n, id, from.state.name(), to.state.name(), prev, rt_of(side).map(|r| r.0), host);
+                    }
+                }
+            }
+        }
         self.gone_after = self.gone_after.max(newest);
+        self.moved_after = Some(self.gone_after.unwrap_or(0));
         moves.sort();
         // `ask` stage (§ 4 Profiling): from the move into `ask` of this host's attempt to the move out
         for v in views.iter().filter(|v| v.task.state == State::Ask && self.seen.get(&v.issue.number).is_some_and(|s| *s != State::Ask)) {
@@ -2259,6 +2286,48 @@ mod tests {
         assert_eq!(record(&p, late, &[]).unwrap(), 1500);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "since 1500\n2000 #2 failed 7\n2000 #3 close 8\n", "older than 30 days dropped");
         let _ = std::fs::remove_file(&p);
+    }
+
+    // Chain: #1173 logged state change -> pass replay -> `taskq-transition` record -> report. Risk: a transition
+    // missed, doubled across passes or a restart, recorded by another host's service, or a zero entry time.
+    #[test]
+    fn a_pass_records_each_logged_transition_once() {
+        let b = Fake::default();
+        let (x, y) = (b.create("X", "", &["taskq".into()]).unwrap(), b.create("Y", "", &["taskq".into()]).unwrap());
+        let mut c = cfg("mac");
+        c.limits.insert("claude".into(), 1);
+        let e: Exits = Default::default();
+        let mut s = service(&b, &c, e.clone());
+        s.pass().unwrap();
+        let _ = crate::profile::take_moves();
+        let ax = task(&b, x).attempt.unwrap();
+        // another host claims y: its service records that move, not this one
+        b.comment(y, &core::entry("spawn", &["worker", "codex:s", "win"], None, "")).unwrap();
+        b.comment(x, &core::entry("result", &["0123456789abcdef0123456789abcdef01234567"], Some(ax), "ok")).unwrap();
+        // the result and the requeue happen between two passes: both are recorded; the requeue left `review` without
+        // an attempt, so every service records it without host
+        b.comment(x, &core::entry("requeue", &[], None, "again")).unwrap();
+        *e.borrow()[0].1.borrow_mut() = Some(0);
+        s.pass().unwrap();
+        let created = |id: u64| b.state.borrow().comments.iter().find(|(_, c)| c.id == id).unwrap().1.created;
+        let ids: Vec<u64> = entries(&b, x).unwrap().iter().map(|e| e.id).collect();
+        let (records, report) = crate::profile::take_moves();
+        let r: Vec<serde_json::Value> = records.lines().map(|l| serde_json::from_str(l.strip_prefix("taskq-transition ").unwrap()).unwrap()).collect();
+        let row = |v: &serde_json::Value| (v["task"].as_u64().unwrap(), v["from"].as_str().unwrap().to_string(), v["to"].as_str().unwrap().to_string(), v["prev_s"].as_u64(), v["host"].as_str().map(String::from));
+        let mac = Some("mac".to_string());
+        assert_eq!(r.iter().map(row).collect::<Vec<_>>()[..3], [(x, "ready".into(), "doing".into(), None, mac.clone()),
+            (x, "doing".into(), "review".into(), Some((created(ids[1]) - created(ids[0])) as u64), mac.clone()),
+            (x, "review".into(), "ready".into(), Some((created(ids[2]) - created(ids[1])) as u64), None)], "{records}");
+        assert!(r.iter().all(|v| v["task"] != y) && r[..2].iter().all(|v| v["rt"] == "claude") && r[2]["rt"].is_null(), "{records}");
+        assert!(report.contains("| doing | review | claude | 1 |") && report.contains("| ready | doing | claude |"), "{report}");
+        // the next pass and a restarted service record none of them again
+        s.pass().unwrap();
+        let again = crate::profile::take_moves().0;
+        assert!(!again.contains("\"to\":\"review\""), "{again}");
+        let mut restarted = service(&b, &c, Default::default());
+        restarted.pass().unwrap();
+        restarted.pass().unwrap();
+        assert!(!crate::profile::take_moves().0.contains("\"to\":\"review\""));
     }
 
     // Chain: § 4 history across restart. Risk: a restart loses or doubles events.

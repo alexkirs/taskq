@@ -4,6 +4,8 @@ Implemented detail of the profiling records and of `taskq profile export|tasks|b
 
 ## Stage tokens
 
+The [terminal-record invariant](../../taskq.md#profiling-988) uses the same `taskq-stage` records. A lifetime marker has `open: true`, `outcome: unknown`, `unknown: open-stage`, and no duration; reports exclude it from completed duration samples. New records include the host name; historical records without it show unknown. Export keeps open markers as observations with `unknown: open-stage`. Missing terminal records are listed from the retained window only; fresh registered-project service snapshots exclude only children whose liveness is running; task rows and unknown child liveness exclude nothing. Selftest uses a fresh board read of this project instead, excluding fresh heartbeat leases, and uses its configured `ttl`. An unreadable record or unknown age prevents a healthy verdict. A `gone` repair is appended only after board readback proves the attempt ended; failed readback or append leaves the evidence unknown for a later check.
+
 For `build` and `review`, a `taskq-stage` line holds the context tokens (model input read across the stage's calls, cache included) and the call count that the runtime logged into the attempt log after launch.
 
 - Claude: usage per assistant message id.
@@ -84,6 +86,9 @@ Columns: `Operation`, `Count`, `p50/p95/max ms`, `Failed %`, `Errors`, `Lowest r
 - A total over partly known times reads `<s> partial (k of n known)`.
 
 ## Contract detail
+
+Terminal-record invariant (R8, R13; § 4): ended attempts have `ok`, `failed`, or `cancelled` records with an error class. Existing completed-turn `ask`/`retried` stage outcomes retain their meaning and are not missing records. Auxiliary stage records, including completed owner waits, preserve terminal evidence until a new build/review lifetime opens; that lifetime needs its own terminal record. The existing service pass repairs missing terminal evidence only after normal `gone` recovery; observations never initiate recovery. The bounded window is the project's configured `ttl`; live attempts are excluded as described above.
+Append diagnostics distinguish full, lock timeout and other append failures.
 
 Moved verbatim from `taskq.md` (#1179) to keep the contract under its R8 size bound. `taskq.md` keeps the decision and links here; this text keeps the same authority (R8, R13).
 `fold` is the behavioral truth; board and process qualification remain separate under R12. Attempt stages (§ 4 Profiling) are adapter observations outside `fold`: `claim` from the `spawn` post through its readback; `start` the runtime start/resume; `build` (worker) and `review` (reviewer) from child start to exit or stop, outcome from the attempt's accepted hand-in (`result`/`close` ok, also when stopped after it; replaced without one is `cancelled`; an issue that left the board read is read back once, no hand-in or no read is `unknown` with reason); `ask` from this service seeing its attempt enter `ask` until it leaves (in memory, lost on restart); `checks` the publication's CI verification and merge call; `close` the whole `close` command. Queue transitions (§ 4 Profiling) are adapter observations too: a service pass replays each task log with entries newer than its previous pass, entry by entry, and each accepted entry that changes the folded state is one transition (`waiting` is not logged and adds none; `held` is outside the queue, so `hold` and `start` add none; the first pass after a service start adds none).

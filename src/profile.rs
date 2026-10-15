@@ -1042,7 +1042,7 @@ Changed: x"))];
         assert!(!close(&gated, &Default::default()));
         assert!(!close(&c, &crate::dispatch::Op { revision: Some(1), ..Default::default() }));
         // the CLI's verdict refusal and unreadable task are inside the stage too
-        let cli = |n, text: &str| crate::dispatch::close_checked(&b, &c, n, text, &Default::default(), &|i, t| crate::close_check(text, i, t)).ok();
+        let cli = |n, text: &str| crate::dispatch::close_checked(&b, &c, n, text, &Default::default(), &|i, t| crate::close_check(text, i, t, b.defer_publication(&c.publish))).ok();
         assert!(!cli(t, "no verdict"));
         assert!(!cli(999, ""));
         assert!(close(&c, &Default::default()));

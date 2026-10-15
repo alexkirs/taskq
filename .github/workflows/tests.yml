@@ -1,10 +1,12 @@
-# Main pushes and PR updates run tests; updates require trusted exact-SHA success.
+# § 7: PR checks and merge_group CI; publication requires green CI on the merge result.
 name: tests
 on:
   workflow_dispatch:
   push:
     branches: [main]
   pull_request:
+  merge_group:
+    types: [checks_requested]
 permissions:
   contents: read
 jobs:

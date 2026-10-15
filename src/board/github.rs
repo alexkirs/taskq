@@ -124,17 +124,124 @@ impl GitHub {
             || read("/branches/main/protection").is_ok_and(|v| v["required_status_checks"]["strict"] == true && v["enforce_admins"]["enabled"] == true)
     }
 
-    fn try_publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> Result<Publish> {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        let v = self.api.call("POST", &format!("{}/graphql", self.api.root), Some(json!({"query": query, "variables": variables})))?.json()?;
+        if v["errors"].as_array().is_some_and(|e| !e.is_empty()) { return Err(format!("publication GraphQL: {}", v["errors"])); }
+        if !v["data"].is_object() { return Err("publication GraphQL data unknown".into()); }
+        Ok(v["data"].clone())
+    }
+
+    /// § 7: qualify the merge result, never substitute green checks on the original head.
+    fn merge_ci(&self, sha: &str) -> Result<()> {
+        if !hex40(sha) { return Err("merge result SHA unknown".into()); }
+        let v = self.api.call("GET", &format!("/actions/runs?event=merge_group&head_sha={sha}&per_page=100"), None)?.json()?;
+        let runs = v["workflow_runs"].as_array().ok_or("merge_group CI unknown")?;
+        if !runs.iter().any(|r| r["head_sha"] == sha && r["event"] == "merge_group" && r["status"] == "completed" && r["conclusion"] == "success") {
+            return Err(format!("merge_group CI not green on merge result {sha}"));
+        }
+        if let Some(fail) = self.ci(sha)? { return Err(fail); }
+        Ok(())
+    }
+
+    fn queue(&self, pr: &Value, sha: &str, enqueued: bool) -> Result<Publish> {
+        let id = pr["node_id"].as_str().ok_or("PR node id unknown")?;
+        let v = self.graphql("query($id: ID!) { node(id: $id) { ... on PullRequest { headRefOid merged mergeCommit { oid } mergeQueueEntry { id } timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { ... on RemovedFromMergeQueueEvent { reason } } } } } }", json!({"id": id}))?;
+        let p = &v["node"];
+        if p["headRefOid"].as_str().ok_or("queued PR head unknown")? != sha { return Err("queued PR head changed; publication needs review".into()); }
+        if p.get("mergeQueueEntry").is_none() { return Err("queue entry state unknown".into()); }
+        if p["merged"] == true {
+            let merged = p["mergeCommit"]["oid"].as_str().ok_or("merge result unknown")?;
+            self.merge_ci(merged)?;
+            self.publication_ancestry(merged, "pr");
+            return Ok(Publish::Done(format!("merged #{} as {merged}; merge-result CI green", pr["number"])));
+        }
+        if p["merged"] != false { return Err("queue merge state unknown".into()); }
+        if let Some(id) = p["mergeQueueEntry"]["id"].as_str() { return Ok(Publish::Enqueued(id.into())); }
+        if enqueued {
+            let reason = p["timelineItems"]["nodes"][0]["reason"].as_str().ok_or("queue entry missing; removal reason unknown")?;
+            let lower = reason.to_lowercase();
+            return Ok(if ["conflict", "base branch", "out of date"].iter().any(|s| lower.contains(s)) {
+                Publish::MainMoved(format!("merge queue removed PR: {reason}"))
+            } else if lower.contains("failed") || lower.contains("failure") {
+                Publish::Failed(format!("merge queue removed PR: {reason}"))
+            } else { Publish::Pending(format!("merge queue removed PR; owner action needed: {reason}")) });
+        }
+        if pr["draft"] == true {
+            let v = self.graphql("mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { isDraft } } }", json!({"id": id}))?;
+            if v["markPullRequestReadyForReview"]["pullRequest"]["isDraft"] != false { return Err("PR is still a draft".into()); }
+        }
+        self.graphql("mutation($id: ID!, $sha: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $sha}) { mergeQueueEntry { id } } }", json!({"id": id, "sha": sha}))?;
+        // Read back admission: a mutation response alone is not proof (R12); a retry recovers it after a lost response.
+        let v = self.graphql("query($id: ID!) { node(id: $id) { ... on PullRequest { mergeQueueEntry { id } } } }", json!({"id": id}))?;
+        let id = v["node"]["mergeQueueEntry"]["id"].as_str().ok_or("queue admission not yet read back")?;
+        Ok(Publish::Enqueued(id.into()))
+    }
+
+    fn rebase(&self, root: &std::path::Path, n: u64, sha: &str) -> Result<Publish> {
+        use std::process::Command;
+        let path = root.join(".worktrees").join(format!("taskq-{n}"));
+        let path = path.canonicalize().map_err(|_| "private fallback needs its owned task worktree on this host")?;
+        if !path.starts_with(root.canonicalize().map_err(|_| "private fallback root unknown")?) {
+            return Err("private fallback worktree escapes this project".into());
+        }
+        let host = self.api.root.strip_prefix("https://").unwrap_or_default().split('/').next().unwrap_or_default();
+        let host = if host == "api.github.com" { "github.com" } else { host };
+        let git = |args: &[&str]| -> Result<std::process::Output> {
+            Command::new("git").current_dir(&path).args(args).env("GIT_TERMINAL_PROMPT", "0")
+                // Git's credential protocol receives the host board token through the environment, never argv/logs.
+                .env("GIT_CONFIG_COUNT", "2").env("GIT_CONFIG_KEY_0", "credential.helper").env("GIT_CONFIG_VALUE_0", "")
+                .env("GIT_CONFIG_KEY_1", format!("credential.https://{host}.helper"))
+                .env("GIT_CONFIG_VALUE_1", "!f() { printf 'username=x-access-token\\npassword=%s\\n' \"$TASKQ_GIT_TOKEN\"; }; f")
+                .env("TASKQ_GIT_TOKEN", self.api.auth.strip_prefix("Authorization: Bearer ").unwrap_or_default())
+                .output().map_err(|_| "private fallback cannot run Git".into())
+        };
+        let read = |args: &[&str]| -> Result<String> {
+            let out = git(args)?;
+            if !out.status.success() { return Err("private fallback Git read failed; worktree kept".into()); }
+            String::from_utf8(out.stdout).map(|s| s.trim().to_string()).map_err(|_| "private fallback Git output unknown".into())
+        };
+        let common = read(&["rev-parse", "--git-common-dir"])?;
+        let common = path.join(common).canonicalize().map_err(|_| "private fallback ownership unknown")?;
+        let project = Command::new("git").current_dir(root).args(["rev-parse", "--git-common-dir"]).output().map_err(|_| "private fallback project unknown")?;
+        if !project.status.success() || root.join(String::from_utf8_lossy(&project.stdout).trim()).canonicalize().ok().as_ref() != Some(&common) {
+            return Err("private fallback worktree belongs to another repository".into());
+        }
+        let expected = format!("taskq-{n}");
+        if read(&["symbolic-ref", "--short", "HEAD"])? != expected || read(&["rev-parse", "HEAD"])? != sha || !read(&["status", "--porcelain"])?.is_empty() {
+            return Err("private fallback refuses a dirty, changed or unowned task worktree".into());
+        }
+        let repo = self.api.base.rsplit_once("/repos/").map(|x| x.1).ok_or("repository unknown")?;
+        let origin = read(&["config", "--get", "remote.origin.url"])?;
+        let origin = origin.trim_end_matches('/').trim_end_matches(".git");
+        if origin != format!("https://{host}/{repo}") && origin != format!("git@{host}:{repo}") {
+            return Err("private fallback origin is not this board; worktree kept".into());
+        }
+        if !git(&["fetch", "origin", "main"])?.status.success() { return Err("private fallback fetch failed; worktree kept".into()); }
+        if !git(&["rebase", "origin/main"])?.status.success() {
+            let conflict = !read(&["ls-files", "-u"])?.is_empty();
+            if !git(&["rebase", "--abort"])?.status.success() { return Err("private fallback rebase abort unknown; worktree kept".into()); }
+            return if conflict { Ok(Publish::MainMoved("private fallback rebase conflict; worker must resolve against main".into())) }
+                else { Err("private fallback rebase failed; worktree restored".into()) };
+        }
+        let head = read(&["rev-parse", "HEAD"])?;
+        if !hex40(&head) { return Err("private fallback head unknown".into()); }
+        if !git(&["push", "origin", &format!("HEAD:refs/heads/{expected}"), &format!("--force-with-lease=refs/heads/{expected}:{sha}")])?.status.success() {
+            return Err("private fallback push failed; rebased worktree kept, publication unknown".into());
+        }
+        let back = self.api.call("GET", &format!("/git/ref/heads/{expected}"), None)?.json()?;
+        if back["object"]["sha"] != head { return Err("private fallback pushed head not read back".into()); }
+        Ok(Publish::Rebased(head))
+    }
+
+    fn try_publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str, root: Option<&std::path::Path>, enqueued: bool) -> Result<Publish> {
         let branch = format!("taskq-{n}");
         // No commit, or the SHA is already on main: verify ancestry, close.
         let status = self.api.call("GET", &format!("/compare/main...{sha}"), None)?.json()?["status"].as_str().unwrap_or_default().to_string();
         if matches!(status.as_str(), "identical" | "behind") {
             return Ok(Publish::Done(format!("{sha} already on main")));
         }
-        if let Some(fail) = self.ci(sha)? {
-            return Ok(Publish::Failed(fail));
-        }
         if mode == "direct" {
+            if let Some(fail) = self.ci(sha)? { return Ok(Publish::Failed(fail)); }
             let head = self.api.call("GET", &format!("/git/ref/heads/{branch}"), None)?.json()?;
             if head["object"]["sha"] != sha {
                 return Ok(Publish::Failed(format!("{branch} is not at the result {sha}")));
@@ -143,30 +250,43 @@ impl GitHub {
             self.publication_ancestry(sha, mode);
             return Ok(Publish::Done(format!("main fast-forwarded to {sha}")));
         }
+        let rules = self.api.call("GET", "/rules/branches/main", None)?.json()?;
+        let rules = rules.as_array().ok_or("unknown main rules")?;
+        let queue = rules.iter().any(|r| r["type"] == "merge_queue");
         let owner = self.api.base.rsplit_once("/repos/").map(|x| x.1).and_then(|r| r.split('/').next()).unwrap_or_default().to_string();
         let prs = self.api.call("GET", &format!("/pulls?head={owner}:{branch}&base=main&state=open"), None)?.json()?;
-        let prs = prs.as_array().cloned().unwrap_or_default();
+        let prs = prs.as_array().cloned().ok_or("PR list unknown")?;
         if prs.is_empty() {
             // § 7 merged, not closed: a merged PR at the result SHA into any base (a release branch too) is the publication; no second merge
             let closed = self.api.call("GET", &format!("/pulls?head={owner}:{branch}&state=closed"), None)?.json()?;
             if let Some(pr) = closed.as_array().into_iter().flatten().find(|p| p["head"]["sha"] == sha && !p["merged_at"].is_null()) {
-                return Ok(Publish::Done(format!("merged #{}{} as {}", pr["number"], into(&s(&pr["base"], "ref")), s(pr, "merge_commit_sha"))));
+                let merged = s(pr, "merge_commit_sha");
+                if queue || enqueued { self.merge_ci(&merged)?; }
+                else if let Some(fail) = self.ci(sha)? { return Ok(Publish::Failed(fail)); }
+                let ci = if queue || enqueued { "merge-result CI green".to_string() } else { format!("exact-SHA CI green on {sha}") };
+                return Ok(Publish::Done(format!("merged #{}{} as {}; {ci}", pr["number"], into(&s(&pr["base"], "ref")), merged)));
             }
         }
         if prs.len() != 1 {
             return Ok(Publish::Failed(format!("{} open PRs of {branch}, want exactly one", prs.len())));
         }
-        if prs[0]["head"]["sha"] != sha {
-            return Ok(Publish::Failed(format!("PR head is not the result {sha}")));
+        if prs[0]["head"]["sha"].as_str().ok_or("PR head SHA unknown")? != sha {
+            // shortcut: an unrecorded/foreign head stays unknown; use a board-backed rebase intent if automatic recovery is needed.
+            return Err(format!("PR head differs from result {sha}; publication unknown; verify the branch before retrying"));
         }
-        if status != "ahead" {
-            // CI on a head that lacks current main proves nothing about the merge result (#1139)
-            return Ok(Publish::Failed(format!("{branch} is not rebased on current main: rebase, rerun the checks and push")));
+        if queue { return self.queue(&prs[0], sha, enqueued); }
+        match self.api.call("GET", "", None)?.json()?["private"].as_bool() {
+            Some(true) => {},
+            Some(false) => return Err("public board needs a main merge queue with required merge_group CI; Git fallback is private-only".into()),
+            None => return Err("repository visibility unknown; no fallback".into()),
         }
-        if !self.strict_main() {
-            // main can move between the check above and the merge: only strict protection this token cannot bypass refuses a stale head
-            return Ok(Publish::Pending("main does not require branches up to date before merging, or this token can bypass it: enable it on a main ruleset without bypass".into()));
+        let root = root.ok_or("private fallback requires the service")?;
+        if !self.strict_main() { return Err("private fallback needs strict main protection without token bypass".into()); }
+        if status == "diverged" {
+            return self.rebase(root, n, sha);
         }
+        if status != "ahead" { return Err("unknown result ancestry; private fallback left unchanged".into()); }
+        if let Some(fail) = self.ci(sha)? { return Ok(Publish::Failed(fail)); }
         let p = prs[0]["number"].as_u64().unwrap_or(0);
         if prs[0]["draft"] == true {
             // GitHub refuses to merge a draft (HTTP 405) and REST cannot mark it ready
@@ -178,7 +298,10 @@ impl GitHub {
                 return Err(format!("#{p} is still a draft: {}", ready["errors"]));
             }
         }
-        let merged = self.api.call("PUT", &format!("/pulls/{p}/merge"), Some(json!({ "merge_method": "squash", "sha": sha, "commit_title": format!("{title} (#{p})"), "commit_message": task_line })))?;
+        let merged = match self.api.call("PUT", &format!("/pulls/{p}/merge"), Some(json!({ "merge_method": "squash", "sha": sha, "commit_title": format!("{title} (#{p})"), "commit_message": task_line }))) {
+            Err(e) if e.contains("HTTP 405") || e.contains("HTTP 409") => return Err("main moved or merge unavailable; service will reread the private fallback".into()),
+            r => r?,
+        };
         let back = self.api.call("GET", &format!("/pulls/{p}"), None)?.json()?;
         if back["merged"] != true {
             if let Ok(second) = self.api.call("GET", &format!("/pulls/{p}"), None).and_then(|r| r.json())
@@ -190,7 +313,7 @@ impl GitHub {
         if back["merged"] == true {
             if let Ok(merged) = merged.json() { self.publication_ancestry(&s(&merged, "sha"), mode); }
         }
-        if back["merged"] == true { Ok(Publish::Done(format!("merged #{p} as {}", s(&back, "merge_commit_sha")))) } else { Err(format!("#{p} not merged yet")) }
+        if back["merged"] == true { Ok(Publish::Done(format!("merged #{p} as {}; exact-SHA CI green on {sha}", s(&back, "merge_commit_sha")))) } else { Err(format!("#{p} not merged yet")) }
     }
 }
 
@@ -280,8 +403,34 @@ impl Board for GitHub {
         self.api.me(KIND.user_key)
     }
 
+    fn defer_publication(&self, mode: &str) -> bool { mode == "pr" }
+
+    fn cancel_publication(&self, n: u64, sha: &str) -> Result<()> {
+        let owner = self.api.base.rsplit_once("/repos/").and_then(|r| r.1.split('/').next()).ok_or("repository owner unknown")?;
+        let prs = self.api.call("GET", &format!("/pulls?head={owner}:taskq-{n}&base=main&state=open"), None)?.json()?;
+        let prs = prs.as_array().ok_or("cancellation PR list unknown")?;
+        if prs.len() != 1 { return Err("publication PR absent or ambiguous; verify merge before cancelling".into()); }
+        if prs[0]["head"]["sha"].as_str().ok_or("cancellation head unknown")? != sha { return Ok(()); }
+        let id = prs[0]["node_id"].as_str().ok_or("cancellation PR id unknown")?;
+        let query = "query($id: ID!) { node(id: $id) { ... on PullRequest { merged mergeQueueEntry { id } } } }";
+        let read = || self.graphql(query, json!({"id": id}));
+        let v = read()?;
+        if v["node"]["merged"] != false { return Err("publication already merged or unknown; verify close before cancelling".into()); }
+        if v["node"]["mergeQueueEntry"].is_object() {
+            self.graphql("mutation($id: ID!) { dequeuePullRequest(input: {pullRequestId: $id}) { clientMutationId } }", json!({"id": id}))?;
+            let back = read()?;
+            if back["node"]["merged"] != false || back["node"].get("mergeQueueEntry") != Some(&Value::Null) { return Err("queue cancellation not read back; task unchanged".into()); }
+        } else if v["node"].get("mergeQueueEntry") != Some(&Value::Null) { return Err("queue cancellation state unknown".into()); }
+        Ok(())
+    }
+
+
+    fn resume_publication(&self, n: u64, sha: &str, title: &str, task_line: &str, root: &std::path::Path, enqueued: bool) -> Publish {
+        outcome(self.try_publish(n, sha, "pr", title, task_line, Some(root), enqueued))
+    }
+
     fn publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> Publish {
-        outcome(self.try_publish(n, sha, mode, title, task_line))
+        outcome(self.try_publish(n, sha, mode, title, task_line, None, false))
     }
 
     fn requests(&self) -> crate::requests::Budget {

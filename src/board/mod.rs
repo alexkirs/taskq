@@ -54,6 +54,12 @@ pub trait Board {
     fn me(&self) -> Result<String>;
     /// § 7 publication of task `n` at `sha` into `main`; `mode` is `direct` or `pr`.
     fn publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> Publish;
+    /// § 7: durable intent ends the reviewer; only the service performs asynchronous publication.
+    fn defer_publication(&self, _mode: &str) -> bool { false }
+    fn cancel_publication(&self, _n: u64, _sha: &str) -> Result<()> { Ok(()) }
+    fn resume_publication(&self, n: u64, sha: &str, title: &str, task_line: &str, _root: &std::path::Path, _enqueued: bool) -> Publish {
+        self.publish(n, sha, "pr", title, task_line)
+    }
     fn url(&self, n: u64) -> String;
     /// Issue `n` of another repository on this board's host, for `Depends on <repo>#N` (§ 1); a bare name is under
     /// this board's owner.
@@ -75,6 +81,12 @@ pub enum Publish {
     Pending(String),
     /// CI failed or conflict: requeue with this message.
     Failed(String),
+    /// Queue admission read back; save its id on the board.
+    Enqueued(String),
+    /// Private fallback pushed a new head; save it before checking CI.
+    Rebased(String),
+    /// Main/queue conflict: requeue without consuming the worker retry budget.
+    MainMoved(String),
 }
 
 /// The trusted log of issue `n` (§ 2).
@@ -120,8 +132,16 @@ impl Board for Profiled {
     fn publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> Publish {
         let began = std::time::Instant::now();
         let p = self.0.publish(n, sha, mode, title, task_line);
-        let failed = match &p { Publish::Done(_) => None, Publish::Pending(e) | Publish::Failed(e) => Some(e.as_str()) };
+        let failed = match &p { Publish::Done(_) | Publish::Enqueued(_) | Publish::Rebased(_) => None, Publish::Pending(e) | Publish::Failed(e) | Publish::MainMoved(e) => Some(e.as_str()) };
         crate::profile::board("publish", began.elapsed(), failed, self.0.requests().remaining);
+        p
+    }
+    fn defer_publication(&self, mode: &str) -> bool { self.0.defer_publication(mode) }
+    fn cancel_publication(&self, n: u64, sha: &str) -> Result<()> { self.op("publish", |b| b.cancel_publication(n, sha)) }
+    fn resume_publication(&self, n: u64, sha: &str, title: &str, task_line: &str, root: &std::path::Path, enqueued: bool) -> Publish {
+        let began = std::time::Instant::now();
+        let p = self.0.resume_publication(n, sha, title, task_line, root, enqueued);
+        crate::profile::board("publish", began.elapsed(), match &p { Publish::Failed(e) | Publish::MainMoved(e) | Publish::Pending(e) => Some(e.as_str()), _ => None }, self.0.requests().remaining);
         p
     }
     fn url(&self, n: u64) -> String { self.0.url(n) }
@@ -535,6 +555,8 @@ pub struct FakeState {
     /// `pending` or `failed` makes `publish` refuse; anything else merges.
     pub publish: String,
     pub hide_latest_comment: bool,
+    pub cancelled_publications: Vec<(u64, String)>,
+    pub fail_publication_cancel: bool,
     pub fail_issue_read: Option<(u64, usize)>,
     pub fail_labels: bool,
     /// The next this many `comment` calls fail like a board rate-limit pause.
@@ -684,10 +706,20 @@ impl Board for Fake {
     fn me(&self) -> Result<String> {
         Ok("owner".into())
     }
+    fn defer_publication(&self, mode: &str) -> bool { mode == "pr" && self.state.borrow().publish.starts_with("queue-") }
+    fn cancel_publication(&self, n: u64, sha: &str) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+        state.cancelled_publications.push((n, sha.into()));
+        if state.fail_publication_cancel { Err("queue cancellation unknown".into()) } else { Ok(()) }
+    }
+
     fn publish(&self, _n: u64, sha: &str, _mode: &str, _title: &str, _task_line: &str) -> Publish {
         match self.state.borrow().publish.as_str() {
             "pending" => Publish::Pending("CI pending".into()),
             "failed" => Publish::Failed("CI failed".into()),
+            "queue-admitted" => Publish::Enqueued("MQ_1".into()),
+            "queue-waiting" => Publish::Pending("merge_group CI pending".into()),
+            "queue-conflict" => Publish::MainMoved("queue merge conflict".into()),
             _ => Publish::Done(format!("merged {sha}")),
         }
     }
@@ -731,6 +763,7 @@ mod tests {
             else if url.ends_with("/status") { json!({"total_count": 0}) }
             else if url.contains("/repository/commits/") { json!({"last_pipeline": {"status": "success"}}) }
             else if url.ends_with("/repository/branches/main") { json!({"commit": {"id": "c".repeat(40)}}) }
+            else if url.ends_with("/repos/o/r") { json!({"private": true}) }
             else if url.ends_with("/rules/branches/main") { json!([{"type": "required_status_checks", "ruleset_id": 1, "parameters": {"strict_required_status_checks_policy": true}}]) }
             else if url.ends_with("/rulesets/1") { json!({"current_user_can_bypass": "never"}) }
             else if url.ends_with("/projects/o%2Fr") { json!({"merge_method": "ff"}) }
@@ -757,7 +790,9 @@ mod tests {
                 for ancestry in [Some(true), Some(false), None] {
                     crate::incident::take_detected();
                     let (h, calls) = publication_board(kind, mode, true, Some(true), ancestry);
-                    assert!(matches!(h.publish(1, &"a".repeat(40), mode, "title", "Task: fake"), Publish::Done(_)));
+                    let out = if mode == "direct" { h.publish(1, &"a".repeat(40), mode, "title", "Task: fake") }
+                        else { h.resume_publication(1, &"a".repeat(40), "title", "Task: fake", std::path::Path::new("unused"), false) };
+                    assert!(matches!(out, Publish::Done(_)));
                     assert_eq!(crate::incident::take_detected(), if ancestry == Some(false) { vec!["publication.not_on_main"] } else { vec![] });
                     assert_eq!(calls.borrow().iter().filter(|(method, _)| method != "GET").count(), 1);
                 }
@@ -776,6 +811,7 @@ mod tests {
                 captured.borrow_mut().push(method.to_string());
                 assert!(!url.contains("main&state=closed") && !url.contains("main&state=merged"), "merged lookup must not filter the base: {url}");
                 let value = if url.contains("/compare/") { json!({"status": "diverged"}) }
+                    else if url.ends_with("/rules/branches/main") { json!([]) }
                     else if url.contains("/merge_base?") { json!({"id": "c".repeat(40)}) }
                     else if url.contains("/check-runs") { json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}) }
                     else if url.ends_with("/status") { json!({"total_count": 0}) }
@@ -795,12 +831,170 @@ mod tests {
         }
     }
 
-    // Chain: § 7 `pr` publication on both boards (#1139). Risk: CI green on a head that lacks current main merges a
-    // combination nobody built, and main stops compiling: refused before the merge, or by the board when main moves
-    // between that check and the merge; a main that cannot refuse at merge time, or whose refusal this token can
-    // bypass (ruleset bypass actor, classic protection exempting admins), is never merged into.
+    // Chain: section 7 intent -> expected-head admission -> merge_group CI -> observed merge receipt.
+    // Risks: divergent heads spend retries, lost mutations count as admission, or head CI closes an unmerged task.
     #[test]
-    fn a_pr_merges_only_onto_the_main_its_ci_built() {
+    fn github_queue_qualifies_the_merge_result_and_preserves_unknowns() {
+        for scenario in ["new", "draft", "waiting", "merged", "conflict", "failed", "removed", "unknown", "readback", "public", "graphql", "rules-unknown", "merge-ci-missing", "merge-ci-failed", "merge-ci-pending"] {
+            let admitted = std::rc::Rc::new(RefCell::new(false));
+            let queued = admitted.clone();
+            let writes = std::rc::Rc::new(RefCell::new(vec![]));
+            let captured = writes.clone();
+            let h = http(&github::KIND, None, Box::new(move |method, url, body| {
+                let (head, merge) = ("a".repeat(40), "b".repeat(40));
+                if method != "GET" { captured.borrow_mut().push(body.clone().unwrap_or_default()); }
+                let value = if url.contains("/compare/") { json!({"status": if url.ends_with(&merge) { "identical" } else { "diverged" }}) }
+                    else if url.ends_with("/rules/branches/main") { if scenario == "rules-unknown" { return Err("HTTP 403".into()); } if scenario == "public" { json!([]) } else { json!([{"type": "merge_queue"}]) } }
+                    else if url.ends_with("/repos/o/r") { assert_eq!(scenario, "public"); json!({"private": false}) }
+                    else if url.contains("/pulls?") { json!([{"number": 7, "node_id": "PR_7", "draft": scenario == "draft", "head": {"sha": head}}]) }
+                    else if url.ends_with("/graphql") {
+                        let body = body.unwrap();
+                        let query = body["query"].as_str().unwrap();
+                        assert_eq!(body["variables"]["id"], "PR_7");
+                        if scenario == "graphql" { json!({"errors": [{"message": "unavailable"}]}) }
+                        else if query.contains("enqueuePullRequest") {
+                            assert_eq!(body["variables"]["sha"], head);
+                            *queued.borrow_mut() = true;
+                            json!({"data": {"enqueuePullRequest": {"mergeQueueEntry": {"id": "MQ_7"}}}})
+                        } else if query.contains("markPullRequestReadyForReview") {
+                            json!({"data": {"markPullRequestReadyForReview": {"pullRequest": {"isDraft": false}}}})
+                        } else {
+                            let entry = if scenario == "waiting" || *queued.borrow() && scenario != "readback" { json!({"id": "MQ_7"}) } else { Value::Null };
+                            let reason = match scenario { "conflict" => "merge conflict with base branch", "failed" => "required checks failed", "removed" => "removed by owner", _ => "" };
+                            json!({"data": {"node": {"headRefOid": head, "merged": scenario == "merged" || scenario.starts_with("merge-ci-"), "mergeCommit": {"oid": merge}, "mergeQueueEntry": entry,
+                                "timelineItems": {"nodes": if reason.is_empty() { json!([]) } else { json!([{"reason": reason}]) }}}}})
+                        }
+                    }
+                    else if url.contains("/actions/runs?") { assert!(url.contains(&merge)); json!({"workflow_runs": if scenario == "merge-ci-missing" { json!([]) } else { json!([{"head_sha": merge, "event": "merge_group", "status": if scenario == "merge-ci-pending" { "in_progress" } else { "completed" }, "conclusion": if scenario == "merge-ci-failed" { "failure" } else { "success" }}]) }}) }
+                    else if url.contains("/check-runs") { assert!(url.contains(&merge)); json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}) }
+                    else if url.ends_with("/status") { assert!(url.contains(&merge)); json!({"total_count": 0}) }
+                    else { panic!("unexpected {method} {url}") };
+                Ok(Reply { status: 200, headers: vec![], body: value.to_string(), operation: operation(method) })
+            }));
+            let prior = !matches!(scenario, "new" | "draft" | "readback" | "public" | "graphql");
+            let got = h.resume_publication(1, &"a".repeat(40), "title", "Task: invented", std::path::Path::new("missing-worktree"), prior);
+            match scenario {
+                "new" | "draft" | "waiting" => assert!(matches!(got, Publish::Enqueued(_)), "{scenario}: {got:?}"),
+                "merged" => assert!(matches!(got, Publish::Done(_)), "{got:?}"),
+                "conflict" => assert!(matches!(got, Publish::MainMoved(_)), "{got:?}"),
+                "failed" => assert!(matches!(got, Publish::Failed(_)), "{got:?}"),
+                _ => assert!(matches!(got, Publish::Pending(_)), "{scenario}: {got:?}"),
+            }
+            assert!(!writes.borrow().iter().any(|b| b.get("merge_method").is_some()), "queue never calls REST merge");
+            assert_eq!(writes.borrow().iter().filter(|b| b["query"].as_str().is_some_and(|q| q.contains("enqueuePullRequest"))).count(), usize::from(matches!(scenario, "new" | "draft" | "readback")));
+        }
+    }
+
+    // Chain: section 7 private fallback real Git fetch/rebase/leased push, or conflict/dirty preservation.
+    // An HTTP-only fixture cannot prove preservation of the worktree or the pushed branch.
+    #[test]
+    fn private_fallback_rebases_its_owned_worktree_and_preserves_conflicts() {
+        for mode in ["clean", "conflict", "dirty"] {
+            let dir = std::env::temp_dir().join(format!("taskq-fallback-{}", crate::runtime::uuid()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let root = dir.join("project");
+            let remote = dir.join("remote.git");
+            let git = |at: &std::path::Path, args: &[&str]| {
+                let out = std::process::Command::new("git").current_dir(at).args(args).env("GIT_TERMINAL_PROMPT", "0").output().unwrap();
+                assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+                String::from_utf8(out.stdout).unwrap().trim().to_string()
+            };
+            git(&dir, &["init", "--bare", remote.to_str().unwrap()]);
+            git(&dir, &["init", "-b", "main", root.to_str().unwrap()]);
+            for (key, value) in [("user.name", "Invented fixture"), ("user.email", "fixture@example.invalid"), ("commit.gpgsign", "false"), ("core.autocrlf", "false")] { git(&root, &["config", key, value]); }
+            std::fs::write(root.join("base"), "base\n").unwrap();
+            git(&root, &["add", "."]); git(&root, &["commit", "-m", "base"]);
+            git(&root, &["remote", "add", "origin", remote.to_str().unwrap()]);
+            git(&root, &["push", "origin", "main"]);
+            git(&root, &["worktree", "add", "-b", "taskq-1", ".worktrees/taskq-1", "origin/main"]);
+            let wt = root.join(".worktrees/taskq-1");
+            std::fs::write(wt.join(if mode == "conflict" { "base" } else { "worker" }), "worker\n").unwrap();
+            git(&wt, &["add", "."]); git(&wt, &["commit", "-m", "worker"]);
+            // The invented token must reach GitHub credentials only, including inside Git's rebase subprocess.
+            std::fs::write(root.join(".git/hooks/pre-rebase"), r#"#!/bin/sh
+board=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill) || exit 1
+case "$board" in *password=test*) ;; *) exit 1;; esac
+other=$(printf 'protocol=https\nhost=elsewhere.invalid\n\n' | git credential fill 2>/dev/null)
+case "$other" in *password=test*) exit 1;; esac
+exit 0
+"#).unwrap();
+            #[cfg(unix)] {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(root.join(".git/hooks/pre-rebase"), std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let sha = git(&wt, &["rev-parse", "HEAD"]);
+            git(&wt, &["push", "origin", "taskq-1"]);
+            std::fs::write(root.join(if mode == "conflict" { "base" } else { "main" }), "main\n").unwrap();
+            git(&root, &["add", if mode == "conflict" { "base" } else { "main" }]); git(&root, &["commit", "-m", "main"]);
+            git(&root, &["push", "origin", "main"]);
+            // Invented board URL, rewritten to this test's local bare remote; no network or credentials.
+            git(&root, &["config", "remote.origin.url", "https://github.com/o/r.git"]);
+            git(&root, &["config", &format!("url.{}.insteadOf", remote.to_str().unwrap().replace('\\', "/")), "https://github.com/o/r.git"]);
+            if mode == "dirty" { std::fs::write(wt.join("untracked"), "keep me").unwrap(); }
+            let original = sha.clone();
+            let bare = remote.clone();
+            let h = http(&github::KIND, None, Box::new(move |method, url, _| {
+                let value = if url.contains("/compare/") { json!({"status": "diverged"}) }
+                    else if url.contains("/pulls?") { json!([{"number": 7, "head": {"sha": original}}]) }
+                    else if url.ends_with("/rules/branches/main") { json!([{"type": "required_status_checks", "ruleset_id": 1, "parameters": {"strict_required_status_checks_policy": true}}]) }
+                    else if url.ends_with("/rulesets/1") { json!({"current_user_can_bypass": "never"}) }
+                    else if url.ends_with("/repos/o/r") { json!({"private": true}) }
+                    else if url.ends_with("/git/ref/heads/taskq-1") {
+                        let out = std::process::Command::new("git").arg("--git-dir").arg(&bare).args(["rev-parse", "refs/heads/taskq-1"]).output().unwrap();
+                        json!({"object": {"sha": String::from_utf8(out.stdout).unwrap().trim()}})
+                    } else { panic!("unexpected {method} {url}") };
+                Ok(Reply { status: 200, headers: vec![], body: value.to_string(), operation: operation(method) })
+            }));
+            let out = h.resume_publication(1, &sha, "title", "Task: invented", &root, false);
+            match mode {
+                "clean" => {
+                    let Publish::Rebased(head) = out else { panic!("{out:?}") };
+                    assert_ne!(head, sha);
+                    assert_eq!(git(&wt, &["rev-parse", "HEAD"]), head);
+                    assert_eq!(git(&root, &["ls-remote", "origin", "refs/heads/taskq-1"]).split_whitespace().next(), Some(head.as_str()));
+                    git(&wt, &["merge-base", "--is-ancestor", "origin/main", "HEAD"]);
+                }
+                "conflict" => {
+                    assert!(matches!(out, Publish::MainMoved(_)), "{out:?}");
+                    assert_eq!(git(&wt, &["rev-parse", "HEAD"]), sha);
+                    assert!(git(&wt, &["status", "--porcelain"]).is_empty());
+                }
+                _ => {
+                    assert!(matches!(out, Publish::Pending(_)), "{out:?}");
+                    assert_eq!(git(&wt, &["rev-parse", "HEAD"]), sha);
+                    assert_eq!(std::fs::read_to_string(wt.join("untracked")).unwrap(), "keep me");
+                }
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    // Chain: section 7 queue cancellation -> dequeue readback; unknown/merged state never claims cancellation.
+    #[test]
+    fn github_queue_cancellation_reads_back_before_releasing_the_task() {
+        for scenario in ["cancel", "absent", "merged", "unknown", "lost-readback"] {
+            let removed = std::rc::Rc::new(RefCell::new(false));
+            let done = removed.clone();
+            let h = http(&github::KIND, None, Box::new(move |method, url, body| {
+                let value = if url.contains("/pulls?") { json!([{"head": {"sha": "a".repeat(40)}, "node_id": "PR_7"}]) }
+                    else if url.ends_with("/graphql") {
+                        if body.as_ref().unwrap()["query"].as_str().unwrap().contains("dequeuePullRequest") {
+                            *done.borrow_mut() = true;
+                            json!({"data": {"dequeuePullRequest": {"clientMutationId": null}}})
+                        } else if scenario == "unknown" { json!({"data": {"node": null}}) }
+                        else { json!({"data": {"node": {"merged": scenario == "merged", "mergeQueueEntry": if scenario == "absent" || *done.borrow() && scenario != "lost-readback" { Value::Null } else { json!({"id": "MQ_7"}) }}}}) }
+                    } else { panic!("unexpected {method} {url}") };
+                Ok(Reply { status: 200, headers: vec![], body: value.to_string(), operation: operation(method) })
+            }));
+            let result = h.cancel_publication(1, &"a".repeat(40));
+            assert_eq!(result.is_ok(), matches!(scenario, "cancel" | "absent"), "{scenario}: {result:?}");
+            assert_eq!(*removed.borrow(), matches!(scenario, "cancel" | "lost-readback"));
+        }
+    }
+
+    // Chain: section 7 unchanged GitLab stale-main/merge fence; GitHub has queue coverage above.
+    #[test]
+    fn gitlab_pr_merges_only_onto_the_main_its_ci_built() {
         // (rebased, how main refuses stale merges, main moves before the merge) -> outcome
         let cases = [
             (false, "ruleset:never", false, "Failed"),
@@ -812,7 +1006,7 @@ mod tests {
             (true, "classic:enforced", true, "Failed"),
         ];
         for (rebased, guard, moved, want) in cases {
-            for kind in BOARDS {
+            for kind in [&gitlab::KIND] {
                 let calls = std::rc::Rc::new(RefCell::new(vec![]));
                 let captured = calls.clone();
                 let enforced = matches!(guard, "ruleset:never" | "classic:enforced");
@@ -844,6 +1038,7 @@ mod tests {
                     Publish::Failed(m) => { assert!(m.contains(if moved { "HTTP 405" } else { "not rebased on current main" }), "{m}"); "Failed" }
                     Publish::Pending(_) => "Pending",
                     Publish::Done(m) => panic!("merged: {m}"),
+                    other => panic!("unexpected {other:?}"),
                 };
                 assert_eq!(got, want, "{} rebased={rebased} guard={guard} moved={moved}", kind.name);
                 assert_eq!(calls.borrow().iter().filter(|m| *m != "GET").count(), usize::from(moved), "merge only behind the fence");
@@ -853,7 +1048,7 @@ mod tests {
 
     // Chain: § 7 `pr` publication of a draft PR. Risk: GitHub refuses to merge a draft (HTTP 405), so close never publishes.
     #[test]
-    fn a_draft_pr_is_marked_ready_then_merged_at_the_result_sha() {
+    fn private_fallback_readies_a_draft_then_merges_the_checked_head() {
         for undrafted in [true, false] {
             let writes = std::rc::Rc::new(RefCell::new(vec![]));
             let captured = writes.clone();
@@ -863,7 +1058,8 @@ mod tests {
                 let value = if url.contains("/compare/") { json!({"status": "ahead"}) }
                     else if url.contains("/check-runs") { json!({"check_runs": [{"status": "completed", "conclusion": "success"}]}) }
                     else if url.ends_with("/status") { json!({"total_count": 0}) }
-                    else if url.ends_with("/rules/branches/main") { json!([{"type": "required_status_checks", "ruleset_id": 1, "parameters": {"strict_required_status_checks_policy": true}}]) }
+                    else if url.ends_with("/repos/o/r") { json!({"private": true}) }
+            else if url.ends_with("/rules/branches/main") { json!([{"type": "required_status_checks", "ruleset_id": 1, "parameters": {"strict_required_status_checks_policy": true}}]) }
                     else if url.ends_with("/rulesets/1") { json!({"current_user_can_bypass": "never"}) }
                     else if url.contains("/pulls?") { json!([{"number": 7, "node_id": "PR_7", "draft": true, "head": {"sha": result}}]) }
                     else if url == "https://api.github.com/graphql" {
@@ -876,7 +1072,7 @@ mod tests {
                     else { panic!("unexpected {method} {url}") };
                 Ok(Reply { status: 200, headers: vec![], body: value.to_string(), operation: operation(method) })
             }));
-            let out = h.publish(1, &"a".repeat(40), "pr", "title", "Task: fake");
+            let out = h.resume_publication(1, &"a".repeat(40), "title", "Task: fake", std::path::Path::new("unused"), false);
             if undrafted {
                 assert!(matches!(&out, Publish::Done(m) if m.starts_with("merged #7 as bbbb")));
                 assert_eq!(*writes.borrow(), ["/graphql", "/repos/o/r/pulls/7/merge"], "ready before merge");
@@ -894,7 +1090,7 @@ mod tests {
             for second in [Some(false), Some(true), None] {
                 crate::incident::take_detected();
                 let (h, calls) = publication_board(kind, "pr", false, second, Some(true));
-                assert!(matches!(h.publish(1, &"a".repeat(40), "pr", "title", "Task: fake"), Publish::Pending(_)), "reporting preserves first read outcome");
+                assert!(matches!(h.resume_publication(1, &"a".repeat(40), "title", "Task: fake", std::path::Path::new("unused"), false), Publish::Pending(_)), "reporting preserves first read outcome");
                 assert_eq!(crate::incident::take_detected(), if second == Some(false) { vec!["publication.readback"] } else { vec![] });
                 assert_eq!(calls.borrow().iter().filter(|(m, u)| m == "GET" && (u.ends_with("/pulls/7") || u.ends_with("/merge_requests/7"))).count(), 2);
                 assert_eq!(calls.borrow().iter().filter(|(method, _)| method != "GET").count(), 1);

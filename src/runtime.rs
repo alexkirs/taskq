@@ -372,9 +372,9 @@ const FILES: &str = "Never run gh auth login. A missing board token is an owner 
 const CI_WAIT: &str = "Board budget: poll CI at most once a minute (`gh pr checks <PR> --watch --interval 60`); never `gh run watch`\n\
      (it polls every 3 s) or `gh run view` without `--json`.\n";
 
-/// taskq.md § 7: a sandbox limit is unknown locally; publication still needs exact-SHA CI.
+/// taskq.md § 7: a sandbox limit is unknown locally; publication still needs the section 7 CI gate.
 const SANDBOX_CHECKS: &str = "Host tests blocked by the worker sandbox: record sandbox-blocked in Checks, never as PASS; do not requeue for them.\n\
-     Their Acceptance gate remains green CI on the exact result SHA (R12).\n";
+     Their Acceptance gate is green CI on the GitHub PR merge result (merge_group); private fallback uses exact-SHA CI; other routes follow taskq.md section 7 (R12).\n";
 
 fn ask(q: &impl std::fmt::Display, n: u64) -> String {
     format!("`{q} ask {n} --text \"Done: <checked or not started>\nProblem: <decision and user effect>\" --option A --option B --recommend K [--link URL]`")
@@ -411,15 +411,15 @@ pub fn brief(env: &Env, l: &Launch) -> String {
     );
     let body = if l.role == "reviewer" {
         format!(
-            "Review the result SHA against each Acceptance item `A<k>` and taskq.md, and CI on that exact SHA. Requeue only for\n\
+            "Review the result SHA against each Acceptance item `A<k>` and taskq.md, and GitHub PR CI green on the merge result (merge_group); private fallback uses exact-SHA CI; other routes follow the contract. Requeue only for\n\
              Acceptance or contract gaps, not style.\n\
              A research or proposal task without an ask and owner's answer before result/close is a task-fit gap (§ 7).\n\
              {CI_WAIT}Then exactly one of:\n\
-             - `{q} close {n} --text \"Changed: <user effect>\nChecks: Task fit: A1 ok|gap|unknown, A2 ..; CI <outcome> on <SHA>\nChecks: Implementation quality: <binding gaps|advisories|none>\nOpen: <item|none>\"` (it publishes),\n\
+             - `{q} close {n} --text \"Changed: <user effect>\nChecks: Task fit: A1 ok|gap|unknown, A2 ..; merge-result CI <green|pending|unknown> on <SHA|pending>\nChecks: Implementation quality: <binding gaps|advisories|none>\nOpen: <item|none>\"` (it publishes),\n\
              - `{q} requeue {n} --text \"<exact fixes>\"`,\n\
              - {ask}.\n{approval}{formats}",
             ask = ask(&q, n),
-            approval = if env.publish == "review-pr" { "Delivery review-pr: an otherwise done result needs the owner's approval: ask with Done naming task fit and CI on the SHA, first option `approve <sha7> and close ★`.\n" } else { "" },
+            approval = if env.publish == "review-pr" { "Delivery review-pr: an otherwise done result needs the owner's approval: ask with Done naming task fit and merge-result CI, first option `approve <sha7> and close ★`.\n" } else { "" },
             formats = FORMATS
         )
     } else {
@@ -540,7 +540,7 @@ fn rules(root: &Path, resume: bool, mut fetch: impl FnMut(&str) -> Result<String
         "TaskQ rules: specq@{SPECQ_REVISION} at `{}`; contract `{spec}`.\n\
          Precedence: the project contract overrides shared rules where they conflict.\n\
          These rules apply to this turn, including continuations. Apply them to the work; acknowledgement alone is not evidence.\n\
-         Evidence: cite the applied rule as R<n> or § n; a fix records the failure before and the pass after.\n",
+         Evidence: cite the applied rule as R<n> or § n; a fix records the failure before and the pass after. GitHub PR publication needs CI green on the merge result (merge_group); private fallback uses exact-SHA CI.\n",
         dir.display()
     );
     if resume {
@@ -1283,10 +1283,11 @@ mod tests {
 
     // Chain: § 7 sandbox-blocked host checks. Risk: a worker requeues a sandbox limit or claims a local PASS.
     #[test]
-    fn worker_brief_keeps_sandbox_blocked_checks_at_exact_sha_ci() {
+    fn worker_brief_keeps_sandbox_blocked_checks_at_the_publication_ci_gate() {
         assert!(SANDBOX_CHECKS.contains("sandbox-blocked") && SANDBOX_CHECKS.contains("Checks"));
         assert!(SANDBOX_CHECKS.contains("never as PASS") && SANDBOX_CHECKS.contains("do not requeue"));
-        assert!(SANDBOX_CHECKS.contains("green CI on the exact result SHA"));
+        assert!(SANDBOX_CHECKS.contains("green CI on the GitHub PR merge result (merge_group)"));
+        assert!(SANDBOX_CHECKS.contains("private fallback uses exact-SHA CI"));
     }
 
     fn rules_root(name: &str) -> PathBuf {

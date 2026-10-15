@@ -1,4 +1,4 @@
-# Доска taskq
+# taskq board
 
 Статус: утверждённый целевой дизайн GitHub/GitLab. Реализация — отдельная задача.
 [Контракт](../../taskq.md#product) · [Shared label rules](https://github.com/taskqorg/specq/blob/main/design/labels.md).

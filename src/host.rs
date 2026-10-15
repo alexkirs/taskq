@@ -238,6 +238,11 @@ fn startup_status(install: &Path, root: &Path, error: &str) -> Res<()> {
     coreq::status::write(&crate::platform::tool(install), root, &status)
 }
 
+fn unstarted_idle(root: &Path) -> bool {
+    // A failed config load cannot adopt or prove exit of the re-exec handoff's children.
+    !crate::dot(root).join("kids").try_exists().unwrap_or(true) && !crate::operator::running(root)
+}
+
 pub fn run(install: &Path) -> Res<()> {
     fs::create_dir_all(install).map_err(|e| e.to_string())?;
     loop {
@@ -303,9 +308,10 @@ pub fn run(install: &Path) -> Res<()> {
                             Ok(c) => return crate::service_run(&c, Some(host)),
                             Err(e) => {
                                 if let Ok(mut h) = host.lock() {
-                                    if h.draining.contains(&root) { return Err("project drained".into()); }
-                                    h.busy.insert(root.clone(), false);
-                                    if h.restart { h.prepared.insert(root.clone()); }
+                                    let idle = unstarted_idle(&root);
+                                    if h.draining.contains(&root) && idle { return Err("project drained".into()); }
+                                    h.busy.insert(root.clone(), !idle);
+                                    if h.restart && idle { h.prepared.insert(root.clone()); } else { h.prepared.remove(&root); }
                                 }
                                 let _ = startup_status(&install, &root, &e);
                                 crate::platform::log(&e);
@@ -614,6 +620,19 @@ mod tests {
         let p = std::env::temp_dir().join(format!("taskq-host-{name}-{}", std::process::id()));
         fs::create_dir_all(&p).unwrap(); p
     }
+    // Chain: § 8.5 re-exec kids -> invalid project config -> drain. Risk: retiring before children can be adopted.
+    #[test]
+    fn failed_project_start_retains_unadopted_children() {
+        let root = temp("unstarted"); fs::create_dir_all(crate::dot(&root)).unwrap();
+        assert!(unstarted_idle(&root));
+        fs::write(crate::dot(&root).join("kids"), "pid 42\n7 41 codex 43 0\n").unwrap();
+        assert!(!unstarted_idle(&root), "handoff ownership is unknown until config recovers and children are adopted");
+        fs::write(crate::dot(&root).join("kids"), "corrupt").unwrap();
+        assert!(!unstarted_idle(&root));
+        fs::remove_file(crate::dot(&root).join("kids")).unwrap(); assert!(unstarted_idle(&root));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn policy() -> Policy {
         Policy::parse(json!({"limits": {"codex": 2}, "admission": {"max": 2}, "load_gate": {"enabled": false}}), "invented").unwrap()
     }

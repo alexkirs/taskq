@@ -214,7 +214,7 @@ dependencies = [
 [[package]]
 name = "coreq"
 version = "0.13.0"
-source = "git+https://github.com/taskqorg/coreq?rev=a28085413021bb85e096a05e84471e8c104f4ec6#a28085413021bb85e096a05e84471e8c104f4ec6"
+source = "git+https://github.com/taskqorg/coreq?rev=b31034fd47cf9d58f76dd252ce39133330b8d220#b31034fd47cf9d58f76dd252ce39133330b8d220"
 dependencies = [
  "coreq-instrument",
  "libc",
@@ -228,7 +228,7 @@ dependencies = [
 [[package]]
 name = "coreq-instrument"
 version = "0.1.0"
-source = "git+https://github.com/taskqorg/coreq?rev=a28085413021bb85e096a05e84471e8c104f4ec6#a28085413021bb85e096a05e84471e8c104f4ec6"
+source = "git+https://github.com/taskqorg/coreq?rev=b31034fd47cf9d58f76dd252ce39133330b8d220#b31034fd47cf9d58f76dd252ce39133330b8d220"
 dependencies = [
  "proc-macro2",
  "quote",

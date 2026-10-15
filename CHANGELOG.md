@@ -3,6 +3,12 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.3.0
+
+Worker, reviewer and operator starts now send a rules header (specq revision, cache path, precedence), this project's `taskq.md`, the ten specq core files and an index of the other specq rules and `docs/`; resumes send the header and index. Rules are pinned to specq `46f5f62` and cached in `<root>/.taskq/specq/<revision>/`; a missing or invalid file, or more than 128 KiB in total, refuses the launch. No board change.
+
+`taskq profile export|tasks|board [--since 30m|24h|7d]` reads this host's retained profile log across all projects without the board: JSON lines export, time in state per task, and board operations with failure rates and the lowest rate-limit remaining. Stage and transition lines now carry the project. Unknown values read unknown with a reason. No board change.
+
 ## v4.2.0
 
 The operator workspace, pinned tray window and native notifications bring task questions, results and recovery into the tray. Services add host admission controls, worker access grants, runtime preferences and attempt profiling; delivery adds owner approval gates and reusable task recipes. DashQ connection and shared project controls use the same board-backed task state.

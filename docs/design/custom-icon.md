@@ -56,3 +56,7 @@ Config contains version, preset/source revision, semantic data bindings, element
 - CI-A7: no agent available → manual controls work; icon refresh never invokes AI. No change to task or permission state.
 
 Product protocol is final; OS font calibration, persisted-storage implementation and agent adapters remain engineering qualification. User preference is not proof of renderer correctness.
+
+## Contract detail
+Moved verbatim from `taskq.md` (#1179) to keep the contract under its R8 size bound. `taskq.md` keeps the decision and links here; this text keeps the same authority (R8, R13).
+`tray --icon FILE`: `icon::validate` lists every schema error and leaves `tray.json` unchanged, else saves it as Custom; `icon::render` draws every icon view.

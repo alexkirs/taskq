@@ -48,3 +48,9 @@ Recovery is not rollback. Successful remote writes remain successful; uncertain 
 - E-A7: previously paused projects and unselected tasks remain held; partial recovery is inspectable.
 - E-A8: uncertain external effect is reconciled before retry; no duplicate publication/application.
 - E-A9: non-cooperative runtime, old binary, app-session handoff and remote lease expiry have tested limits.
+
+## Contract detail
+
+Moved verbatim from `taskq.md` (#1179) to keep the contract under its R8 size bound. `taskq.md` keeps the decision and links here; this text keeps the same authority (R8, R13).
+
+- Pause: `service pause` (and the tray's) saves the focus to `focus.paused` and writes `off`; resume restores it. Without a saved focus resume fails and names the labels of open tasks: never `all` by default. Emergency ([E1–E5](emergency-recovery.md)): under the § 3 hold the loop still reaps, stops replaced children and beats. A failed liveness read in step 1 keeps the child: `status.json` `kids` `live` `unknown` with its `reason` (else `running`), never `gone`; `hold` names the reason. `service recover` (only under a hold) lists each `doing`/`review` attempt of this host with its liveness from a `status.json` at most 60 s old (else all unknown); a child read running or absent gets the op `gone attempt <id>` with `--revision` (the task's) and `--op-id recover.<N>.<id>`; unknown gets none and blocks relaunch. `--apply` writes the ops through the § 5 dispatcher, one receipt each; step 2 stops fenced children; release admits by focus. Targets: tray control, graceful/force stop, per-project entries, selective resume (E1–E3).

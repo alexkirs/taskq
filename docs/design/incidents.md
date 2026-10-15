@@ -112,3 +112,9 @@ Asked on #825 with numbered options; taskq.md holds the ★ answers; another ans
 - Q1 What goes public. 1 ★ the allowlist above; 2 also agent CLI versions (`taskq agents`); 3 only fault, fingerprint and release.
 - Q2 Which faults auto-send. 1 ★ the whole catalog; 2 only `dispatch.panic`, `update.smoke`, `update.rollback`, `invariant.*` (others local); 3 none: always local, the operator submits.
 - Q3 Existing projects without the key. 1 ★ local until the owner sets `incident_reports`; 2 send after the update notice.
+
+## Contract detail
+
+Moved verbatim from `taskq.md` (#1179) to keep the contract under its R8 size bound. `taskq.md` keeps the decision and links here; this text keeps the same authority (R8, R13).
+
+- Incident reports ([design](incidents.md): catalog, payload, route and dedup): `incident_reports` (§ 9) is true by default; `false` or env `TASKQ_INCIDENT_REPORTS=off` (tests set it) disables. Setup (§ 6) and the update that ships it disclose destination, public visibility, posting account, payload keys, fallback and opt-out before any send; an existing project without the key stays local. Only a catalog fault reports; consumer, tool, login, config, board-outage, permission and security failures never auto-post. The payload is the design's enumerated allowlist, at most 4 KiB: no project, repository, task, host, user, path or free text; panic text stays in `.taskq/cli-errors.log`. Route: an issue in the release repository (§ 8) through an existing github.com login, label `incident`, never `taskq`; at most one write per report, no reopen, no retry store; otherwise the sanitized report stays in `<root>/.taskq/incidents/<fingerprint>.json`. A report never changes a task, the queue or an exit code and never reports itself. `status.json` `incident` and `service status` show the newest outcome, cached across processes in `.taskq/incident.json`.

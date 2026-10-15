@@ -58,3 +58,8 @@ Representative workflows, not measured popularity. Proposed new-project default:
 - B-A6: compact 16/20px, light/dark, narrow views; readable outcome and all actions reachable.
 
 [Interactive component](agent-behavior.html), composed into [workspace](workspace-prototype.html). Merge capabilities and revision/readback use labelled fixtures. No runtime changes.
+
+## Contract detail
+
+Moved verbatim from `taskq.md` (#1179) to keep the contract under its R8 size bound. `taskq.md` keeps the decision and links here; this text keeps the same authority (R8, R13).
+**Delivery presets** ([agent behavior](agent-behavior.md) B1–B5; commit, push, PR and merge, apart from § 8 Access) are § 9 `delivery` `{preset, revision}`, the owner's (R9; the revision +1 per owner edit): `auto-merge` (the `pr` route), `direct`, `review-pr` (the `pr` route after the owner gate below). `local` and `push-branch` are refused until B3 pending-handoff states exist. Without `delivery`, `publish` names the preset at revision 0 (`pr` is `auto-merge`); nothing converts it to `review-pr`, a migration is an owner-reviewed edit. `close` reads the policy then. Its publication receipt is the last verdict line `delivery <preset> r<revision>: <main fast-forwarded to SHA|merged #P as SHA|SHA already on main>`. `review-pr` needs every host at `4.2.0-dev` or newer: 4.1.11 ignores `approve` and publishes it as `auto-merge`.

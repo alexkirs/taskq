@@ -61,3 +61,9 @@ Delivery of #920 is the adapter PR first, per the owner's answer on the task. Th
 [Interactive reference](answer-card-reference.html) uses the existing TaskQ design example, with synthetic task #841 and counts. It approves compact placement and ordinary choice/free-text/receipt interaction, not its mocked transport, invented state or approximate icons/tokens/counters. Shared-block B1–B4 takes precedence over those demo details. It does not replace the failure-state fixtures above.
 
 Reference SHA-256: `4b857925b7a606f1766b84f2b0e79b36fb26bc1203d8a64a51ccdc29a321c556`.
+
+## Contract detail
+
+Moved verbatim from `taskq.md` (#1179) to keep the contract under its R8 size bound. `taskq.md` keeps the decision and links here; this text keeps the same authority (R8, R13).
+
+Accepted shared UI target: [answer card](answer-card.md) owns the reusable TaskQ/DashQ presentation; § 2 and § 5 remain behavioral authority. Tray exception (R6): mount cards only in `ask`; without parsed choices, show text and owner requeue (reason), later and confirmed Close controls. Close cancels without publication through `later` then `close`, each with CLI readback; partial/unknown delivery stays explicit. An answer op is resent only with its own id: once when a refresh reads the task past its revision, once per Check delivery after an unknown receipt. Other consumers remain read-only for unparsed cards. K is an option number; a bare K or option text counts only in `ask` (section 2).

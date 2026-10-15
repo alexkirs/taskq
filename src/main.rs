@@ -192,7 +192,7 @@ fn load(root: &Path) -> Res<(Config, Value)> {
         codex,
         ttl: secs("ttl", 300) as i64,
         poll: secs("poll", 60),
-        update_every: secs("update_every", 900),
+        update_every: secs("update_every", 60),
         rollback_after: secs("rollback_after", 600),
     };
     if cfg.repo.is_empty() {
@@ -2228,6 +2228,18 @@ mod tests {
         let e = root_for(Some(b.clone()), a.join(".worktrees/x")).unwrap_err();
         assert!(e.starts_with("TASKQ_ROOT ") && e.contains("is not the project of the current directory"), "{e}");
         assert_eq!(root_for(None, a.join(".worktrees/x")).unwrap(), a);
+        fs::remove_dir_all(&t).unwrap();
+    }
+
+    // Chain: § 4 step 7 self-update cadence (#1200). Risk: a release waits 15 min per host again.
+    #[test]
+    fn update_every_defaults_to_60_and_keeps_override() {
+        let t = std::env::temp_dir().join(format!("taskq-update-every-{}", std::process::id()));
+        fs::create_dir_all(&t).unwrap();
+        fs::write(t.join("taskq.json"), r#"{"repo": "o/r"}"#).unwrap();
+        assert_eq!(load(&t).unwrap().0.update_every, 60);
+        fs::write(t.join("taskq.json"), r#"{"repo": "o/r", "update_every": 900}"#).unwrap();
+        assert_eq!(load(&t).unwrap().0.update_every, 900);
         fs::remove_dir_all(&t).unwrap();
     }
 

@@ -320,7 +320,7 @@ pub fn command(env: &Env, l: &Launch, access: &crate::policy::Effective) -> Resu
     let mode = access.claude.as_deref().unwrap_or(env.permission_mode);
     match (l.rt.as_str(), &l.resume) {
         ("claude", r) => {
-            c.args(["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", mode]);
+            c.args(["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", mode, "--settings", &compact_settings(env.root, l)]);
             if r.is_some() { c.args(["--resume", &l.session]) } else { c.args(["--session-id", &l.session]) };
         }
         (_, None) => {
@@ -498,7 +498,12 @@ fn docs(root: &Path) -> Result<Vec<(String, String)>, StartError> {
 }
 
 /// § 8 Rule delivery: header, contract, core and index before the task text at start; header and index at resume.
-fn rule_text(root: &Path, task: &str, resume: bool, mut fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
+fn rule_text(root: &Path, task: &str, resume: bool, fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
+    Ok(format!("{}\nTaskQ task\n{task}", rules(root, resume, fetch)?))
+}
+
+/// The rules part of a turn: header, then contract and core (start only), then the index.
+fn rules(root: &Path, resume: bool, mut fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
     let dir = specq_dir(root);
     let spec = contract(root);
     let contract = match std::fs::read(root.join("taskq.md")) {
@@ -527,8 +532,23 @@ fn rule_text(root: &Path, task: &str, resume: bool, mut fetch: impl FnMut(&str) 
     text.push_str("Index of project docs (read on demand in your worktree):\n");
     for (path, title) in docs(root)? { text.push_str(&format!("- {path}: {title}\n")); }
     if text.len() > RULES_CAP { return Err(refused("rules", format!("{} bytes over the {RULES_CAP}-byte cap", text.len() - RULES_CAP))); }
-    text.push_str(&format!("\nTaskQ task\n{task}"));
     Ok(text)
+}
+
+/// § 8 Rule delivery after a Claude compaction: the SessionStart `compact` hook runs this and prints header and index.
+pub fn compact(root: &Path, role: &str, task: u64, attempt: u64) -> Result<String, StartError> {
+    let text = rules(root, true, rule_file)?;
+    log!("specq@{SPECQ_REVISION} loaded for {role} #{task} attempt {attempt} (compact, {} bytes)", text.len());
+    rules_line(&attempt_log(root, role, task, attempt), "compact", &text).map_err(|e| StartError::io(e, None))?;
+    Ok(text)
+}
+
+/// `--settings` for a Claude turn: a SessionStart hook that re-sends the rules after compaction.
+fn compact_settings(root: &Path, l: &Launch) -> String {
+    let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| "taskq".into());
+    let cmd = format!("{} rules compact {} {} {} {}", q(&exe.to_string_lossy()), q(&root.to_string_lossy()), q(&l.role), l.task, l.attempt);
+    serde_json::json!({"hooks": {"SessionStart": [{"matcher": "compact", "hooks": [{"type": "command", "command": cmd}]}]}}).to_string()
 }
 
 /// The operator's turn text (§ 8 Rule delivery).
@@ -701,7 +721,7 @@ impl ClaudeTurn {
         let mut file = File::options().create(true).append(true).open(log).map_err(|e| e.to_string())?;
         let mut c = executable(which("claude"), access, env)?;
         environment(env, l, &mut c);
-        c.current_dir(&root).arg("--bg");
+        c.current_dir(&root).args(["--bg", "--settings", &compact_settings(&root, l)]);
         if l.resume.is_some() { c.args(["--resume", &l.session]); }
         else { c.args(["--remote-control", &l.title, "--permission-mode", permission_mode]); }
         if l.role == "operator" { for k in ["TASKQ_TASK", "TASKQ_ATTEMPT", "TASKQ_ROLE"] { c.env_remove(k); } }
@@ -1228,6 +1248,35 @@ mod tests {
                 }
             }
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Chain: § 8 rule delivery after compaction, #1211. Risk: a compacted Claude worker loses header and index, gets bodies
+    // or task text again, or another runtime gets the hook.
+    #[test]
+    fn compaction_resends_header_and_index_only_to_claude() {
+        let root = rules_root("compact");
+        let env = Env { root: &root, exe: Path::new("/i/taskq"), install: Path::new("/i"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
+        let launch = |rt: &str| Launch { task: 7, title: "T".into(), attempt: 42, role: "worker".into(), rt: rt.into(), session: "s".into(), url: "https://b/7".into(), resume: None };
+        let args = |rt: &str| command(&env, &launch(rt), &access(&env, rt).unwrap()).unwrap().get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let l = launch("claude");
+        let claude = args("claude");
+        let settings: serde_json::Value = serde_json::from_str(&claude[claude.iter().position(|a| a == "--settings").unwrap() + 1]).unwrap();
+        let hook = &settings["hooks"]["SessionStart"][0];
+        assert_eq!(hook["matcher"], "compact");
+        assert!(hook["hooks"][0]["command"].as_str().unwrap().ends_with(&format!(" rules compact '{}' 'worker' 7 42", root.display())));
+        assert!(!args("codex").iter().any(|a| a == "--settings"), "codex gets no hook");
+        // the simulated compact event: what the hook prints is header and index, nothing else
+        let start = turn_text(&env, &l, rule).unwrap();
+        let text = compact(&root, "worker", 7, 42).unwrap();
+        assert!(text.starts_with("TaskQ rules: specq@") && text.contains("\nEvidence: cite the applied rule"));
+        assert!(text.contains(INDEX) && text.contains("\n- docs/guide.md: Guide title\n"));
+        assert!(!text.contains("\n--- ") && !text.contains("TaskQ task") && !text.contains("Apply this rule."), "no bodies, no task");
+        assert_eq!(text, rules(&root, true, rule).unwrap());
+        assert!(start.len() > text.len());
+        let log = std::fs::read_to_string(attempt_log(&root, "worker", 7, 42)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+        assert_eq!((v["phase"].as_str(), v["bodies"].as_u64(), v["bytes"].as_u64()), (Some("compact"), Some(0), Some(text.len() as u64)));
         std::fs::remove_dir_all(&root).ok();
     }
 

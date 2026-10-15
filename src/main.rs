@@ -99,6 +99,7 @@ impl Args {
             Some("close") => a.pos.len(),
             Some("answer") if a.pos.get(1).is_some_and(|p| p.contains('.')) => a.pos.len(),
             Some("service") if a.pos.get(1).is_some_and(|p| p == "focus") => a.pos.len(),
+            Some("rules") => 6,
             Some("service" | "profile" | "add" | "finding" | "start" | "approve" | "recipe" | "ask" | "answer" | "result" | "requeue" | "later" | "failed" | "steer" | "inbox" | "enroll" | "connection") => 2,
             _ => 1,
         };
@@ -1746,6 +1747,14 @@ fn run(argv: &[String]) -> Res<()> {
             None if a.one("since").is_some() => Err("--since needs a view: taskq profile export|tasks|board --since 24h".into()),
             None => { print!("{}", profile::report(&platform::default_install())); Ok(()) }
             Some(v) => { print!("{}", profile::view(&platform::default_install(), v, a.one("since"))?); Ok(()) }
+        },
+        "rules" => match &a.pos[1..] {
+            [phase, root, role, task, attempt] if phase == "compact" => {
+                let n = |s: &String| s.parse::<u64>().map_err(|_| format!("rules compact: {s} is not a number"));
+                print!("{}", runtime::compact(Path::new(root), role, n(task)?, n(attempt)?).map_err(|e| e.to_string())?);
+                Ok(())
+            }
+            _ => Err("usage: taskq rules compact ROOT ROLE TASK ATTEMPT".into()),
         },
         "selftest" => {
             let n = golden_selftest(core::GOLDEN, !platform::VERSION.contains('-')).map_err(|e| format!("fold: FAIL {e}"))?;

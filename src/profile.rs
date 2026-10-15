@@ -652,6 +652,12 @@ pub(crate) fn legacy_value(line: &str) -> Result<serde_json::Value, String> {
     else {Err("unknown legacy profile kind".into())}
 }
 
+#[cfg(test)]
+pub(crate) fn legacy_reports(text: &str, now: u64) -> Result<Vec<String>,String> {
+    let exported=export(text,None);let (board,moves)=render_system(text);
+    Ok(vec![render(text)?,render_stages(text)?,board,moves,exported.clone(),render_tasks(&exported)?,render_board(&exported)?,defects(text,&vec![],None,now,300)?.0,crate::requests::sources(text,now)])
+}
+
 /// § 5 `taskq profile export`: a header naming window and sample count, then one JSON line per retained observation at or after `since_ms`.
 fn export(text: &str, since_ms: Option<u64>) -> String {
     let (mut rows, mut corrupt) = (vec![], 0);

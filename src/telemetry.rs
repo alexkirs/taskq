@@ -1,6 +1,8 @@
 //! Installation-local telemetry. Caller holds taskq-profile.lock across import, write and read.
 #[cfg(test)]
 mod semantic;
+#[cfg(test)]
+mod source;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;

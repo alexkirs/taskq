@@ -145,12 +145,7 @@ pub fn lifecycle(install: &Path, sub: &str, root: Option<&Path>, all: bool) -> R
                 if let Some(pid) = pid(install)? {
                     let p = crate::dot(root).join("status.json");
                     if crate::file_age(&p).is_some_and(|a| a <= 60) && crate::data::json(&p)?.is_some_and(|s| s["pid"] == pid) {
-                        let floor = match fs::read_to_string(install.join("rollback-floor")) {
-                            Ok(s) => Some(s), Err(e) if e.kind() == std::io::ErrorKind::NotFound => None, Err(e) => return Err(e.to_string()),
-                        };
-                        if floor.as_ref().is_none_or(|v| !coreq::update::newer(v.trim(), "4.4.0")) {
-                            coreq::launcher::set_rollback_floor(&platform::tool(install), "4.4.0")?;
-                        }
+                        pin_topology(install, platform::VERSION)?;
                         println!("Installed {} on host", crate::project_name(root));
                         if off { println!("Focus: off; nothing admitted until `taskq service focus all|<label..>`"); }
                         return Ok(());
@@ -221,6 +216,14 @@ fn unit_unloaded(_install: &Path) -> Res<()> {
     #[cfg(any(target_os = "macos", windows))]
     if out.contains(name) { return Err("host unit still registered; removal unverified".into()); }
     Ok(())
+}
+
+/// The first verified installation pins its release; later installs must not raise the topology floor.
+fn pin_topology(install: &Path, version: &str) -> Res<()> {
+    let floor = match fs::read_to_string(install.join("rollback-floor")) {
+        Ok(s) => s, Err(e) if e.kind() == std::io::ErrorKind::NotFound => version.into(), Err(e) => return Err(e.to_string()),
+    };
+    coreq::launcher::set_rollback_floor(&platform::tool(install), floor.trim())
 }
 
 pub fn edit_policy(policy: &host::Policy, value: &Value, e: &CapEdit, project: bool) -> Res<Value> {
@@ -385,6 +388,22 @@ mod tests {
             assert_eq!(fs::read(root.join("taskq.json")).unwrap(), before);
         }
         assert_eq!(crate::data::json(&install.join("host.json")).unwrap().unwrap()["custom"], "keep");
+        fs::remove_dir_all(install).unwrap();
+    }
+
+    // Chain: § 8.5 first host ownership -> rollback floor -> later host install. Risk: each update disables valid rollback.
+    #[test]
+    fn later_host_install_retains_the_first_floor() {
+        let install = std::env::temp_dir().join(format!("taskq-host-floor-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&install); fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("current"), "10.0.0").unwrap();
+        pin_topology(&install, "10.0.0").unwrap();
+        fs::write(install.join("current"), "11.0.0").unwrap();
+        pin_topology(&install, "11.0.0").unwrap();
+        assert_eq!(fs::read_to_string(install.join("rollback-floor")).unwrap(), "10.0.0");
+        fs::write(install.join("rollback-floor"), "invalid/floor").unwrap();
+        assert!(pin_topology(&install, "11.0.0").is_err());
+        assert_eq!(fs::read_to_string(install.join("rollback-floor")).unwrap(), "invalid/floor");
         fs::remove_dir_all(install).unwrap();
     }
 

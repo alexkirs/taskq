@@ -124,3 +124,9 @@ No extra Plans top-level tab, pipeline wizard, graph editor, duplicated counters
 - P-A7: stage titles and reasons have visible separation at 16/20px; compactness never joins words or hides a blocking reason.
 
 [Interactive reference](plans-and-decisions.html) is a local fixture, not a planner, scheduler or board client. Backend acceptance needs model, adapter and native evidence beyond browser tests.
+
+## Contract detail
+
+Moved verbatim from `taskq.md` (#1179) to keep the contract under its R8 size bound. `taskq.md` keeps the decision and links here; this text keeps the same authority (R8, R13).
+A recipe ([plans and decisions](plans-and-decisions.md) P5) is a reusable task list in § 9 `recipes`; its identity is the name and its `version`. `taskq recipe NAME --run ID` adds each task held through the configured create claim (§ 1) in order with op id `recipe.<name>.<version>.<ID>.<k>`, so a rerun returns the first receipts; `deps` become `Depends on #N`, `{goal}` is replaced by `--goal`. A task with `gate: true` also gets label `needs-gate` and a `gate` entry. Nothing starts until every task reads back; then only `--start` or `taskq start N` starts them: the queue runs them like any task, no separate scheduler.
+A gated task's or `review-pr` project's reviewer that finds the result otherwise done asks with options, Done naming task fit and CI on that SHA, the first `approve <sha7> and close ★`; an owner pick (§ 2) or `taskq approve N` binds the gate to that result, the reviewer then closes. A new result needs a new approval; a stale or missing one makes `close` refuse before publication. Tasks that `Depends on` the gated one wait for its close.

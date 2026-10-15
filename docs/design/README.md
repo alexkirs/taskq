@@ -38,6 +38,7 @@ The package includes the remote PM scenario (UC-17), not only the desktop menu. 
 | [Task decisions and plans](plans-and-decisions.md) | Inline ask-card answers, AI-led plans and explicit multi-repository gaps |
 | [Dynamic resources](dynamic-resources.md) | Accepted Auto default, optional caps, proposed tuning and migration |
 | [Shared resource controls](shared-resource-controls.md) | Accepted DashQ reuse of TaskQ resource UI and policy authority; v1 protocol fixtures; remote apply needs an authorized host adapter and fresh readback |
+| [Profiling detail](profiling.md) | Implemented stage token sources, board operation kinds, `taskq profile` export columns and report views |
 | [Delivery behavior](agent-behavior.md) | Proposed Local / branch / review PR / auto-merge / direct workflows |
 | [Agent settings](agent-settings.md) | Workspace access editor, project overrides, review and readback |
 | [Product decisions](menu-product.md) | Approved direction, scenario coverage and candidate boundaries |

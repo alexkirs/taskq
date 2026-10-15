@@ -14,6 +14,7 @@ const ERRORS: [&str; 8] = ["none", "http4xx", "http5xx", "timeout", "permission"
 static LOG: OnceLock<PathBuf> = OnceLock::new();
 static TRACE: OnceLock<bool> = OnceLock::new();
 static RUN: OnceLock<Option<u64>> = OnceLock::new();
+static PROJECT: OnceLock<String> = OnceLock::new();
 static SPAN: AtomicU64 = AtomicU64::new(1);
 thread_local!(static PARENT: Cell<u64> = const { Cell::new(0) });
 
@@ -53,6 +54,12 @@ struct Trace { run: Option<u64>, process: u32, span: u64, parent: u64 }
 pub fn init(install: &Path) {
     let _ = LOG.set(install.join("taskq.log"));
     let _ = TRACE.set(std::env::var_os("TASKQ_PROFILE_TRACE").is_some_and(|v| v == "1"));
+}
+
+/// This process's board `owner/name` for stage and transition records (#1174); an unsafe name is kept as `other`.
+pub fn project(repo: &str) {
+    let ok = repo.len() <= 128 && repo.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b));
+    let _ = PROJECT.set(if ok { repo } else { "other" }.into());
 }
 
 fn error(text: &str) -> &'static str {
@@ -112,6 +119,8 @@ pub enum Usage { NoModel, Unknown(&'static str), Known { calls: Option<u64>, tok
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Stage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
     stage: String,
     task: u64,
     attempt: u64,
@@ -150,7 +159,7 @@ fn stage_at(path: Option<&Path>, name: &'static str, task: u64, attempt: u64, rt
         Usage::Unknown(r) => (None, None, Some(r)),
         Usage::Known { calls, tokens } => (calls, tokens, tokens.is_none().then_some("no-usage")),
     };
-    let r = Stage { stage: name.into(), task, attempt, rt: RUNTIMES.into_iter().find(|k| *k == rt).unwrap_or("other").into(),
+    let r = Stage { project: PROJECT.get().cloned(), stage: name.into(), task, attempt, rt: RUNTIMES.into_iter().find(|k| *k == rt).unwrap_or("other").into(),
         us: took.map(|d| d.as_micros().min(u64::MAX as u128) as u64), outcome: outcome.into(), error: err.into(), at_ms: now_ms(), calls, tokens, unknown: unknown.map(Into::into) };
     let Some(path) = path else { return };
     let line = serde_json::to_string(&r).map(|j| format!("{STAGE_PREFIX}{j}\n"));
@@ -228,7 +237,7 @@ struct BoardOp { op: String, us: u64, outcome: String, error: String, remaining:
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Transition { task: u64, entry: u64, from: String, to: String, prev_s: Option<u64>, rt: Option<String>, host: Option<String>, at_ms: Option<u64> }
+struct Transition { #[serde(default, skip_serializing_if = "Option::is_none")] project: Option<String>, task: u64, entry: u64, from: String, to: String, prev_s: Option<u64>, rt: Option<String>, host: Option<String>, at_ms: Option<u64> }
 
 /// Appends one record line; a failed write is reported unknown and never fails the observed operation.
 fn record(prefix: &str, r: &impl Serialize) {
@@ -249,7 +258,7 @@ pub fn board(kind: &'static str, took: std::time::Duration, failed: Option<&str>
 pub fn transition(task: u64, entry: u64, from: &'static str, to: &'static str, prev_s: Option<u64>, rt: Option<&str>, host: Option<&str>) {
     // a host name is the operator's own short label; anything else is not kept
     let host = host.map(|h| if h.len() <= 64 && h.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) { h } else { "other" });
-    let r = Transition { task, entry, from: from.into(), to: to.into(), prev_s,
+    let r = Transition { project: PROJECT.get().cloned(), task, entry, from: from.into(), to: to.into(), prev_s,
         rt: rt.map(|r| RUNTIMES.into_iter().find(|k| *k == r).unwrap_or("other").into()), host: host.map(Into::into), at_ms: now_ms() };
     #[cfg(test)]
     MOVED.with(|v| { *v.borrow_mut() += &format!("{TRANSITION_PREFIX}{}\n", serde_json::to_string(&r).unwrap()); });
@@ -260,6 +269,15 @@ pub fn transition(task: u64, entry: u64, from: &'static str, to: &'static str, p
 fn spread(v: &[u64], div: f64) -> String {
     let p = |p: usize| v[(v.len() * p).div_ceil(100) - 1] as f64 / div;
     format!("{:.3}/{:.3}/{:.3}", p(50), p(95), *v.last().unwrap() as f64 / div)
+}
+
+/// Seconds in the previous state of sorted `s` plus `unknown` moves without an entry time.
+fn in_state(s: &[u64], unknown: usize) -> String {
+    match (s.is_empty(), unknown) {
+        (true, _) => "unknown (no entry time)".into(),
+        (false, 0) => spread(s, 1.),
+        (false, u) => format!("{} ({} of {} known; no entry time)", spread(s, 1.), s.len(), s.len() + u),
+    }
 }
 
 /// Board operations by p95 and queue transitions (§ 4 Profiling); a corrupt record makes its section unknown.
@@ -300,12 +318,7 @@ fn render_system(text: &str) -> (String, String) {
         let mut out = "Queue transitions: retained observations; moves while no service ran unknown\n\n| From | To | Runtime | Count | p50/p95/max s in previous state |\n|---|---|---|---:|---|\n".to_string();
         for ((f, t, rt), (mut s, unknown)) in rows {
             s.sort_unstable();
-            let took = match (s.is_empty(), unknown) {
-                (true, _) => "unknown (no entry time)".into(),
-                (false, 0) => spread(&s, 1.),
-                (false, u) => format!("{} ({} of {} known; no entry time)", spread(&s, 1.), s.len(), s.len() + u),
-            };
-            out += &format!("| {} | {} | {rt} | {} | {took} |\n", STATES[f], STATES[t], s.len() + unknown);
+            out += &format!("| {} | {} | {rt} | {} | {} |\n", STATES[f], STATES[t], s.len() + unknown, in_state(&s, unknown));
         }
         Ok(out)
     };
@@ -400,15 +413,21 @@ fn render(text: &str) -> Result<String, &'static str> {
     Ok(out)
 }
 
+/// The retained `<install>/taskq.log`; a missing log is empty.
+fn read_log(install: &Path) -> Result<String, String> {
+    let mut text = String::new();
+    match fs::File::open(install.join("taskq.log")) {
+        Ok(f) => { f.take(crate::data::LOG_MAX + 1).read_to_string(&mut text).map_err(|_| "taskq.log unreadable or invalid UTF-8")?; }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("taskq.log unreadable".into()),
+    }
+    if text.len() as u64 > crate::data::LOG_MAX - 512 { return Err("taskq.log at retention bound; collection stopped until service pruning".into()); }
+    Ok(text)
+}
+
 pub fn report(install: &Path) -> String {
     let read = || -> Result<String, String> {
-        let mut text = String::new();
-        match fs::File::open(install.join("taskq.log")) {
-            Ok(f) => { f.take(crate::data::LOG_MAX + 1).read_to_string(&mut text).map_err(|_| "taskq.log unreadable or invalid UTF-8")?; }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err("taskq.log unreadable".into()),
-        }
-        if text.len() as u64 > crate::data::LOG_MAX - 512 { return Err("taskq.log at retention bound; collection stopped until service pruning".into()); }
+        let text = read_log(install)?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis().min(u64::MAX as u128) as u64);
         let profile = render(&text).unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n"));
         let stages = render_stages(&text).unwrap_or_else(|e| format!("Attempt stages: unknown ({e})\n"));
@@ -416,6 +435,167 @@ pub fn report(install: &Path) -> String {
         Ok(format!("{profile}\n{board}\n{moves}\n{stages}\n{}", crate::requests::sources(&text, now)))
     };
     read().unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n\nBoard operations: unknown ({e})\n\nQueue transitions: unknown ({e})\n\nAttempt stages: unknown ({e})\n\nBoard requests by source: unknown ({e})\n"))
+}
+
+/// § 5 `taskq profile export` columns, in order; every row has each of them, null where its kind has none.
+const COLUMNS: [&str; 19] = ["kind", "at_ms", "project", "task", "attempt", "entry", "name", "from", "to", "runtime", "host", "us", "prev_s",
+    "outcome", "error", "remaining", "calls", "tokens", "unknown"];
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct Row { kind: String, at_ms: Option<u64>, project: Option<String>, task: Option<u64>, attempt: Option<u64>, entry: Option<u64>,
+    name: Option<String>, from: Option<String>, to: Option<String>, runtime: Option<String>, host: Option<String>, us: Option<u64>,
+    prev_s: Option<u64>, outcome: Option<String>, error: Option<String>, remaining: Option<u64>, calls: Option<u64>, tokens: Option<u64>, unknown: Option<String> }
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Header { schema: u64, columns: Vec<String>, since_ms: Option<u64>, window_ms: Option<[u64; 2]>, samples: usize, corrupt: usize }
+
+/// The export row of one log line: `None` for other lines, `Some(None)` for a corrupt record or an unknown code.
+fn row(line: &str) -> Option<Option<Row>> {
+    let s = |v: &str| Some(v.to_string());
+    Some(if let Some(j) = line.strip_prefix(PREFIX) {
+        serde_json::from_str::<Record>(j).ok().filter(|r| OPS.contains(&r.op.as_str()) && ERRORS.contains(&r.error.as_str())).map(|r| Row {
+            kind: "operation".into(), at_ms: r.at_ms, name: s(&r.op), us: Some(r.us), outcome: s(if r.error == "none" { "ok" } else { "failed" }), error: s(&r.error), ..Default::default() })
+    } else if let Some(j) = line.strip_prefix(STAGE_PREFIX) {
+        serde_json::from_str::<Stage>(j).ok().filter(|r| STAGES.contains(&r.stage.as_str()) && RUNTIMES.contains(&r.rt.as_str()) && OUTCOMES.contains(&r.outcome.as_str())
+            && (ERRORS.contains(&r.error.as_str()) || STAGE_ERRORS.contains(&r.error.as_str())) && r.unknown.as_deref().is_none_or(|u| UNKNOWN.contains(&u))).map(|r| Row {
+            kind: "stage".into(), at_ms: r.at_ms, project: r.project, task: Some(r.task), attempt: Some(r.attempt), name: Some(r.stage), runtime: Some(r.rt),
+            us: r.us, outcome: Some(r.outcome), error: Some(r.error), calls: r.calls, tokens: r.tokens, unknown: r.unknown, ..Default::default() })
+    } else if let Some(j) = line.strip_prefix(BOARD_PREFIX) {
+        serde_json::from_str::<BoardOp>(j).ok().filter(|r| BOARD_OPS.contains(&r.op.as_str()) && ERRORS.contains(&r.error.as_str()) && ["ok", "failed"].contains(&r.outcome.as_str())).map(|r| Row {
+            kind: "board".into(), at_ms: r.at_ms, name: Some(r.op), us: Some(r.us), outcome: Some(r.outcome), error: Some(r.error), remaining: r.remaining, ..Default::default() })
+    } else if let Some(j) = line.strip_prefix(TRANSITION_PREFIX) {
+        serde_json::from_str::<Transition>(j).ok().filter(|r| STATES.contains(&r.from.as_str()) && STATES.contains(&r.to.as_str()) && r.rt.as_deref().is_none_or(|rt| RUNTIMES.contains(&rt))).map(|r| Row {
+            kind: "transition".into(), at_ms: r.at_ms, project: r.project, task: Some(r.task), entry: Some(r.entry), from: Some(r.from), to: Some(r.to),
+            runtime: r.rt, host: r.host, prev_s: r.prev_s, ..Default::default() })
+    } else {
+        return None;
+    })
+}
+
+/// § 5 `taskq profile export`: a header naming window and sample count, then one JSON line per retained observation at or after `since_ms`.
+fn export(text: &str, since_ms: Option<u64>) -> String {
+    let (mut rows, mut corrupt) = (vec![], 0);
+    for r in text.lines().filter_map(row) {
+        // ponytail: an untimed record falls outside every `--since` window
+        match r { Some(r) if since_ms.is_none_or(|s| r.at_ms.is_some_and(|a| a >= s)) => rows.push(r), Some(_) => {}, None => corrupt += 1 }
+    }
+    let at = || rows.iter().filter_map(|r| r.at_ms);
+    let window_ms = at().min().zip(at().max()).map(|(a, b)| [a, b]);
+    let h = Header { schema: 1, columns: COLUMNS.map(String::from).to_vec(), since_ms, window_ms, samples: rows.len(), corrupt };
+    let mut out = serde_json::to_string(&h).unwrap() + "\n";
+    for r in rows { out += &(serde_json::to_string(&r).unwrap() + "\n"); }
+    out
+}
+
+fn read_export(export: &str) -> Result<(Header, Vec<Row>), &'static str> {
+    let mut lines = export.lines();
+    let h: Header = lines.next().and_then(|l| serde_json::from_str(l).ok()).filter(|h: &Header| h.schema == 1 && h.columns == COLUMNS).ok_or("export header unreadable")?;
+    let rows = lines.map(|l| serde_json::from_str(l).map_err(|_| "export row unreadable")).collect::<Result<Vec<Row>, _>>()?;
+    Ok((h, rows))
+}
+
+fn window(h: &Header) -> String {
+    let since = h.since_ms.map_or("all retained".into(), |s| format!("since {s}"));
+    let w = h.window_ms.map_or("unknown (no timestamps)".into(), |[a, b]| format!("{a}..{b} Unix ms"));
+    format!("Window: {w} ({since}); {} samples, {} corrupt skipped; earlier/pruned history unknown\n", h.samples, h.corrupt)
+}
+
+/// § 5 `taskq profile tasks`: time in state per state, runtime and host, then the tasks with the most time per state.
+fn render_tasks(export: &str) -> Result<String, &'static str> {
+    let (h, rows) = read_export(export)?;
+    let none = |v: &Option<String>| v.clone().unwrap_or_else(|| "none".into());
+    let mut states: BTreeMap<(String, String, String), (Vec<u64>, usize)> = BTreeMap::new();
+    let mut tasks: BTreeMap<(String, u64, String, String, String), (Vec<u64>, usize)> = BTreeMap::new();
+    // § 4 Profiling: several services may record one move; one per project, task and entry counts, a known time wins
+    let mut unique: BTreeMap<(Option<String>, Option<u64>, Result<u64, usize>), &Row> = BTreeMap::new();
+    let moves: Vec<_> = rows.iter().filter(|r| r.kind == "transition").collect();
+    for (i, r) in moves.iter().enumerate() {
+        let kept = unique.entry((r.project.clone(), r.task, r.entry.ok_or(i))).or_insert(*r);
+        if kept.prev_s.is_none() { *kept = *r; }
+    }
+    for r in unique.values() {
+        let (from, rt, host) = (none(&r.from), none(&r.runtime), none(&r.host));
+        let project = r.project.clone().unwrap_or_else(|| "unknown (not recorded)".into());
+        for g in [states.entry((from.clone(), rt.clone(), host.clone())).or_default(), tasks.entry((project, r.task.unwrap_or(0), from, rt, host)).or_default()] {
+            match r.prev_s { Some(s) => g.0.push(s), None => g.1 += 1 }
+        }
+    }
+    let mut out = format!("Time in state: retained queue transitions; moves while no service ran unknown\n{}Transitions: {} unique of {} rows (deduplicated by project, task and entry)\n",
+        window(&h), unique.len(), moves.len());
+    if states.is_empty() { return Ok(out + "States by time: unknown (no transitions)\n"); }
+    // unknown-only groups rank after every known one, never as zero
+    let p95 = |s: &[u64]| (s.is_empty(), std::cmp::Reverse(s.get((s.len() * 95).div_ceil(100).max(1) - 1).copied()));
+    let mut states: Vec<_> = states.into_iter().map(|(k, (mut s, u))| { s.sort_unstable(); (k, s, u) }).collect();
+    states.sort_by(|a, b| p95(&a.1).cmp(&p95(&b.1)).then(a.0.cmp(&b.0)));
+    out += "\nStates by p95\n\n| State | Runtime | Host | Count | p50/p95/max s |\n|---|---|---|---:|---|\n";
+    for ((state, rt, host), s, u) in &states { out += &format!("| {state} | {rt} | {host} | {} | {} |\n", s.len() + u, in_state(s, *u)); }
+    let mut tasks: Vec<_> = tasks.into_iter().map(|(k, (mut s, u))| { s.sort_unstable(); (k, s, u) }).collect();
+    let sum = |s: &[u64]| (s.is_empty(), std::cmp::Reverse(s.iter().sum::<u64>()));
+    tasks.sort_by(|a, b| sum(&a.1).cmp(&sum(&b.1)).then(a.0.cmp(&b.0)));
+    out += "\nTasks by total time in state\n\n| Project | Task | State | Runtime | Host | Count | Total s | p50/p95/max s |\n|---|---|---|---|---|---:|---:|---|\n";
+    for ((project, task, state, rt, host), s, u) in tasks.iter().take(20) {
+        let total = match (s.is_empty(), *u) {
+            (true, _) => "unknown (no entry time)".into(),
+            (false, 0) => s.iter().sum::<u64>().to_string(),
+            (false, u) => format!("{} partial ({} of {} known)", s.iter().sum::<u64>(), s.len(), s.len() + u),
+        };
+        out += &format!("| {project} | #{task} | {state} | {rt} | {host} | {} | {total} | {} |\n", s.len() + u, in_state(s, *u));
+    }
+    if tasks.len() > 20 { out += &format!("{} more task states\n", tasks.len() - 20); }
+    Ok(out)
+}
+
+/// § 5 `taskq profile board`: board operations ranked by p95, failure rate and lowest rate-limit `remaining`.
+fn render_board(export: &str) -> Result<String, &'static str> {
+    let (h, rows) = read_export(export)?;
+    let mut ops: BTreeMap<String, (Vec<u64>, BTreeMap<String, usize>, Option<u64>)> = BTreeMap::new();
+    for r in rows.iter().filter(|r| r.kind == "board") {
+        let o = ops.entry(r.name.clone().unwrap_or_default()).or_default();
+        o.0.push(r.us.ok_or("export board row without duration")?);
+        if r.outcome.as_deref() == Some("failed") { *o.1.entry(r.error.clone().unwrap_or_default()).or_default() += 1; }
+        if let Some(m) = r.remaining { o.2 = Some(o.2.map_or(m, |x| x.min(m))); }
+    }
+    let mut out = format!("Board operations: retained observations; all budgets unknown\n{}", window(&h));
+    if ops.is_empty() { return Ok(out + "Board operations: unknown (no observations)\n"); }
+    for o in ops.values_mut() { o.0.sort_unstable(); }
+    let failed = |o: &(Vec<u64>, BTreeMap<String, usize>, Option<u64>)| o.1.values().sum::<usize>() as f64 / o.0.len() as f64;
+    let rank = |key: &dyn Fn(&(Vec<u64>, BTreeMap<String, usize>, Option<u64>)) -> Option<f64>| {
+        let mut r: Vec<_> = ops.iter().filter_map(|(k, o)| key(o).map(|v| (k, v))).collect();
+        r.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+        if r.is_empty() { "unknown (not reported)".into() } else { r.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(" > ") }
+    };
+    out += &format!("Slow (p95): {}\nFailing (rate): {}\nRate-limit use (lowest remaining): {}\n\n| Operation | Count | p50/p95/max ms | Failed % | Errors | Lowest remaining |\n|---|---:|---|---:|---|---|\n",
+        rank(&|o| Some(o.0[(o.0.len() * 95).div_ceil(100) - 1] as f64)), rank(&|o| Some(failed(o))), rank(&|o| o.2.map(|m| -(m as f64))));
+    for (op, o) in &ops {
+        let e = o.1.iter().map(|(k, n)| format!("{k}:{n}")).collect::<Vec<_>>().join(", ");
+        out += &format!("| {op} | {} | {} | {:.2} | {} | {} |\n", o.0.len(), spread(&o.0, 1000.), failed(o) * 100., if e.is_empty() { "none" } else { &e },
+            o.2.map_or("unknown (not reported)".into(), |m| m.to_string()));
+    }
+    Ok(out)
+}
+
+/// `--since 30m|24h|7d` as Unix ms before `now`.
+fn since_ms(s: &str, now: u64) -> Result<u64, String> {
+    let bad = || format!("--since {s}: use a number with m, h or d, e.g. 24h");
+    let mut chars = s.chars();
+    let mins: u64 = match chars.next_back() { Some('m') => 1, Some('h') => 60, Some('d') => 1440, _ => return Err(bad()) };
+    let n = chars.as_str();
+    Ok(now.saturating_sub(n.parse::<u64>().map_err(|_| bad())?.saturating_mul(mins * 60_000)))
+}
+
+/// § 5 `taskq profile export|tasks|board [--since D]` over this host's retained log; no board access.
+pub fn view(install: &Path, name: &str, since: Option<&str>) -> Result<String, String> {
+    let now = now_ms().ok_or("system clock before 1970")?;
+    let since = since.map(|s| since_ms(s, now)).transpose()?;
+    let text = export(&read_log(install)?, since);
+    match name {
+        "export" => Ok(text),
+        "tasks" => render_tasks(&text).map_err(String::from),
+        "board" => render_board(&text).map_err(String::from),
+        _ => Err(format!("unknown profile view: {name} (export, tasks or board)")),
+    }
 }
 
 #[cfg(test)]
@@ -609,4 +789,74 @@ Changed: x"))];
         assert!(report(&dir).contains("Attempt stages: unknown (corrupt stage record; log kept)"));
         fs::remove_dir_all(dir).unwrap();
     }
+    // Chain: #1174 retained records -> `profile export` (header, one row per observation) -> `profile tasks` and `profile board`.
+    // Risk: a record lost or invented, columns drift for DashQ, one task number merged across projects, unknown shown as a number.
+    #[test]
+    fn export_then_reports() {
+        let t = |p: Option<&str>, task, from: &str, to: &str, prev_s, rt: Option<&str>, host: Option<&str>, at| format!("{TRANSITION_PREFIX}{}\n", serde_json::to_string(&Transition {
+            project: p.map(Into::into), task, entry: at, from: from.into(), to: to.into(), prev_s, rt: rt.map(Into::into), host: host.map(Into::into), at_ms: Some(at) }).unwrap());
+        let b = |op: &str, us, err: Option<&str>, remaining, at| format!("{BOARD_PREFIX}{}\n", serde_json::to_string(&BoardOp { op: op.into(), us,
+            outcome: if err.is_some() { "failed" } else { "ok" }.into(), error: err.unwrap_or("none").into(), remaining, at_ms: Some(at) }).unwrap());
+        let log = [
+            "normal taskq diagnostic\n".to_string(),
+            t(Some("o/a"), 5, "ready", "doing", Some(10), Some("claude"), Some("mac"), 100),
+            t(Some("o/a"), 5, "doing", "review", Some(100), Some("claude"), Some("mac"), 110),
+            t(Some("o/b"), 5, "doing", "review", Some(300), Some("codex"), Some("win"), 120),
+            t(None, 6, "doing", "ask", None, Some("claude"), Some("mac"), 130),
+            t(Some("o/a"), 7, "ready", "doing", Some(999), None, None, 1),
+            t(Some("o/a"), 8, "doing", "review", Some(7), Some("claude"), Some("lin"), 131),
+            t(Some("o/a"), 8, "doing", "review", None, Some("claude"), Some("lin"), 132),
+            t(Some("o/b"), 9, "ask", "ready", None, Some("codex"), Some("win"), 133),
+            // duplicates by project, task and entry count once, a known time winning; the same task and entry in another project is its own move
+            t(Some("o/a"), 5, "doing", "review", Some(100), Some("claude"), Some("mac"), 110),
+            t(Some("o/a"), 10, "ready", "doing", None, Some("codex"), Some("lin"), 134),
+            t(Some("o/a"), 10, "ready", "doing", Some(50), Some("codex"), Some("lin"), 134),
+            t(Some("o/b"), 5, "ready", "doing", Some(20), Some("codex"), Some("win"), 110),
+            b("list", 4000, None, Some(4900), 100), b("list", 2000, Some("http5xx"), Some(4100), 101), b("claim", 1000, None, None, 102),
+            format!("{BOARD_PREFIX}{{\"op\":\"lunch\"}}\n"),
+            format!("{PREFIX}{}\n", serde_json::to_string(&Record { op: "spawn".into(), us: 7, error: "none".into(), at_ms: Some(140), trace: None }).unwrap()),
+            format!("{STAGE_PREFIX}{}\n", serde_json::to_string(&Stage { project: Some("o/a".into()), stage: "build".into(), task: 5, attempt: 9, rt: "codex".into(),
+                us: Some(5), outcome: "ok".into(), error: "none".into(), at_ms: Some(150), calls: None, tokens: Some(3), unknown: None }).unwrap()),
+        ].concat();
+        let text = export(&log, Some(100));
+        let mut lines = text.lines();
+        assert_eq!(lines.next().unwrap(), format!(r#"{{"schema":1,"columns":{},"since_ms":100,"window_ms":[100,150],"samples":16,"corrupt":1}}"#, serde_json::to_string(&COLUMNS).unwrap()));
+        let first: serde_json::Map<String, serde_json::Value> = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(first.keys().collect::<Vec<_>>(), COLUMNS.iter().collect::<Vec<_>>());
+        assert_eq!(serde_json::Value::Object(first), serde_json::json!({"kind":"transition","at_ms":100,"project":"o/a","task":5,"attempt":null,"entry":100,"name":null,
+            "from":"ready","to":"doing","runtime":"claude","host":"mac","us":null,"prev_s":10,"outcome":null,"error":null,"remaining":null,"calls":null,"tokens":null,"unknown":null}));
+        assert!(text.contains(r#""kind":"stage","at_ms":150,"project":"o/a","task":5,"attempt":9,"entry":null,"name":"build""#), "{text}");
+        assert!(!text.contains("999"), "a record before the window is not exported");
+        let tasks = render_tasks(&text).unwrap();
+        assert!(tasks.contains("Window: 100..150 Unix ms (since 100); 16 samples, 1 corrupt skipped; earlier/pruned history unknown
+Transitions: 9 unique of 11 rows"), "{tasks}");
+        assert!(tasks.contains("| doing | codex | win | 1 | 300.000/300.000/300.000 |
+| doing | claude | mac | 2 | 100.000/100.000/100.000 (1 of 2 known; no entry time) |
+| ready | codex | lin | 1 | 50.000/50.000/50.000 |
+| ready | codex | win | 1 | 20.000/20.000/20.000 |
+| ready | claude | mac | 1 | 10.000/10.000/10.000 |"), "{tasks}");
+        // the duplicate o/a #5 entry counts once (not 2, 200 s); o/a #10 keeps its known time; o/b #5 entry 110 stays its own
+        assert!(tasks.contains("| o/b | #5 | doing | codex | win | 1 | 300 | 300.000/300.000/300.000 |
+| o/a | #5 | doing | claude | mac | 1 | 100 | 100.000/100.000/100.000 |
+| o/a | #10 | ready | codex | lin | 1 | 50 | 50.000/50.000/50.000 |
+| o/b | #5 | ready | codex | win | 1 | 20 | 20.000/20.000/20.000 |
+"), "{tasks}");
+        assert!(tasks.contains("| o/a | #5 | ready | claude | mac | 1 | 10 | 10.000/10.000/10.000 |
+| o/a | #8 | doing | claude | lin | 2 | 7 partial (1 of 2 known) | 7.000/7.000/7.000 (1 of 2 known; no entry time) |
+| o/b | #9 | ask | codex | win | 1 | unknown (no entry time) | unknown (no entry time) |
+| unknown (not recorded) | #6 | doing | claude | mac | 1 | unknown (no entry time) | unknown (no entry time) |"), "{tasks}");
+        assert!(tasks.contains("| ready | claude | mac | 1 | 10.000/10.000/10.000 |
+| doing | claude | lin | 2 | 7.000/7.000/7.000 (1 of 2 known; no entry time) |
+| ask | codex | win | 1 | unknown (no entry time) |"), "unknown-only state ranks last: {tasks}");
+        assert!(!tasks.contains("| 0 |"), "unknown never reads zero: {tasks}");
+        let board = render_board(&text).unwrap();
+        assert!(board.contains("Slow (p95): list > claim\nFailing (rate): list > claim\nRate-limit use (lowest remaining): list\n"), "{board}");
+        assert!(board.contains("| claim | 1 | 1.000/1.000/1.000 | 0.00 | none | unknown (not reported) |\n| list | 2 | 2.000/4.000/4.000 | 50.00 | http5xx:1 | 4100 |"), "{board}");
+        let empty = export("", None);
+        assert!(render_tasks(&empty).unwrap().contains("Window: unknown (no timestamps) (all retained); 0 samples") && render_board(&empty).unwrap().contains("unknown (no observations)"));
+        assert_eq!(since_ms("2h", 10_000_000), Ok(2_800_000));
+        assert!(since_ms("2w", 1).is_err() && since_ms("h", 1).is_err() && since_ms("1日", 1).is_err() && since_ms("", 1).is_err());
+        assert!(view(Path::new("/nonexistent-taskq"), "lunch", None).unwrap_err().contains("unknown profile view"));
+    }
+
 }

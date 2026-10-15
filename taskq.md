@@ -155,7 +155,7 @@ One loop:
 4. Post `gone` for attempts of dead hosts (§ 3).
 5. Fix projected labels; `waiting` with closed deps becomes `ready`.
 6. Resume the session of a live attempt for a new `answer` or `steer` (text on stdin); spawn a reviewer for `review` without a live one; admit `ready` tasks matching this host by priority then number within capacity.
-7. Every `update_every`, or at once when a local command wrote `<root>/.taskq/update`: the self-update check (§ 8); an installed service applies a newer version, others only report it. The outcome goes to the log.
+7. Every `update_every` (60 s), or at once when a local command wrote `<root>/.taskq/update`: the self-update check (§ 8); an installed service applies a newer version, others only report it. Its outcome is logged.
 8. Sleep until a poke or `poll` seconds.
 
 - Filter: `host-*` absent or this host; workers use `run-*` when present, else a `prefer-*` runtime with a free slot, else the runtime with the most free slots (first listed on a tie), so any-runtime tasks alternate; `run-*` wins over `prefer-*`, and both `prefer-*` labels are ignored with one log line per pass; reviewers prefer the other runtime than the accepted worker (`claude` ↔ `codex`, `codex-app` → `claude`) with free capacity, falling back to the worker's runtime. Other filters remain: `assignee-only` passes; each `needs-*` in `has` (`needs-gate`: every host of a version with gates, § 7); `codex-app` keeps its §9 opt-in.
@@ -283,7 +283,7 @@ The child's environment drops `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` and
 - `capacity_hosts` `{name: {"limits": {..}, "load_gate": {..}}}` overrides limits and the load gate per host; `admission` `{"mode": "auto"|"fixed", "max": n}` (absent: fixed) selects Auto admission with the [D03](docs/design/admission-calibration.md) gate defaults. Absent keys keep today's behavior; nothing migrates or enables itself. Detail: [admission calibration](docs/design/admission-calibration.md#contract-detail).
 - `recipes` `{name: {"version": V, "tasks": [{"title", "goal", "acceptance": [..], "scope", "deps": [earlier 1-based index..], "gate", "type", "runtime", "priority", "host"}]}}` (§ 7).
 - `permission_mode`, `codex` (R9); `incident_reports` `true|false` (§ 4); `pages` link wrapper base; `assignee` (login or `me`) report filter.
-- `ttl`, `poll`, `update_every`, `rollback_after`: seconds, defaults 300, 60, 900, 600.
+- `ttl`, `poll`, `update_every`, `rollback_after`: seconds, defaults 300, 60, 60, 600.
 - GitHub token: one owner-installed credential per host in `<install>/token` (owner-only access), shared by service and workers; a fine-grained PAT preferred, an OAuth token accepted. No env or CLI-login fallback; TaskQ, workers and setup never run `gh auth login`; a missing, empty or unreadable token is an owner item, same error in service and worker. Never in config. GitLab keeps coreq token lookup and `Authorization: Bearer`.
 
 A cutover is one step per project, not per host: two board formats do not mix. No migration code: `CHANGELOG.md` says per release what changed on the board and what an open issue needs. An agent reads the entries from the board's version to the new one, prints a plan per open issue and asks the owner about issues the new format cannot hold. After the owner's OK, with old services and children stopped, it applies the plan with `taskq` commands and issue edits. Closed issues are never touched. New services start: Mac, then Windows. Repair is the same agent procedure for one project; it warns when `status` shows another host's fresh heartbeat.

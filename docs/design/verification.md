@@ -216,7 +216,7 @@ then `taskq service status` on win read `"version": "4.1.0"`. The Windows re-exe
 
 `Update now` is only half observed. With `update` null the live macOS popover (`taskq tray --snapshot`, WKWebView,
 real registry) shows no button and the footer `taskq 4.1.0 · mac`. An installed service updates itself as soon as it
-finds a newer version, so the button lives at most `update_every` (900 s) after a release. The click and its readback
+finds a newer version, so the button lives at most `update_every` (60 s) after a release. The click and its readback
 need a release newer than 4.1.0 while a host runs 4.1.0; until then the fixture `Update now to 4.1.1` (phase 3) is the
 only rendering.
 

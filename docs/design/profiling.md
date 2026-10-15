@@ -100,3 +100,7 @@ All these records hold fixed codes and numbers only (`TASKQ_PROFILE_TRACE=1` add
 | Command | Does |
 |---|---|
 | `taskq profile [export\|tasks\|board] [--since 30m\|24h\|7d]` | no board; this host's retained log, all projects ([detail](profiling.md)). Bare: § 4. `export`: JSON lines, a header (columns, window, samples), one row per observation: `kind at_ms project task attempt entry name from to runtime host us prev_s outcome error remaining calls tokens unknown`. `tasks`: time in state (`Project Task State Runtime Host Count Total p50/p95/max`). `board`: operations (`Operation Count p50/p95/max Failed% Errors Lowest-remaining`). Unknown reads unknown with reason, never zero |
+
+## Coverage and delivery
+
+Coverage is every executable product path, including UI input, windows, layout/resize/render and observed paint, command results, service/board actions, agents, tools, context loading and compression; named operations are not a coverage exemption. New methods/handlers inherit the shared coreq instrumentation by construction. Input, execution and observed effect share operation/span identity; a restored focus is not admission while the host is held. Collection is local first in coreq's durable bounded store, with agent-readable export; optional sync advances only on verified durable receipt. Legacy retained observations stay readable. Coverage, store, adapters, global ingestion and three-host rollout each require their own evidence; a subset's green CI is not full qualification (R8, R12, R13).

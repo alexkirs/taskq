@@ -35,11 +35,17 @@ Each call of the board adapter is one `taskq-board` line with one kind:
 
 ## View source and window
 
-- The views read this host's retained `<install>/telemetry.log/telemetry.sqlite3` over all its projects. They make no board calls.
+- Reports read this host's retained `<install>/telemetry.log/telemetry.sqlite3` over all its projects. Schema2 export also reads automatic observations in `universal.sqlite3`, as described below. Neither route makes board calls.
 - `--since 30m|24h|7d` sets the window from that time up to now. Default: all retained records. A malformed window (empty, non-ASCII or unknown suffix) is a validation error.
 - An unavailable, corrupt or unsupported store fails the view and names the reason.
 
 ## Export
+
+`taskq profile export` emits schema2 JSON lines. The header names `coverage: independent-committed-snapshots`, `since_ms` and each source's sample count and available retention bounds. Each subsequent row is `{source,seq,id,received_ms,observation}`. `observation` uses the shared coreq schema, preserving method start/terminal spans, parent identity, timings, outcomes and runtime metadata. Unknown timestamps remain included with their reason under `--since`.
+
+The shared `Reader` reads the existing universal store without write permission, migration, checkpoint or pruning. The transitional legacy view takes a read-only shared profile lock and reads its existing SQLite snapshot; it validates the text checkpoint and refuses undrained/lost history instead of importing or hiding it. Legacy rows use the existing typed migration mapping; their absent immutable ids and pruning counters remain unknown. Sources are separate snapshots, not one atomic fleet view; do not add source totals as deduplicated counts. This adapter is removed when the one-store cutover retires the archive. Corruption or unavailable sources fail the export before any JSON is printed. Snapshots and locks are released before stdout output. Export boundary spans are captured; internal telemetry decoding is excluded from recursive collection.
+
+Task/board reports retain the internal schema1 compatibility projection below. Their existing fields and aggregation are unchanged.
 
 JSON lines. The first line is a header:
 

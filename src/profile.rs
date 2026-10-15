@@ -484,9 +484,17 @@ pub fn log_lock(path: &Path) -> std::io::Result<LogLock> {
 
 fn acquire_log_lock(path: &Path, wait: bool) -> std::io::Result<LogLock> {
     let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path.parent().unwrap().join("taskq-profile.lock"))?;
+    lock_log(lock,wait,false)
+}
+
+pub(crate) fn read_log_lock(install: &Path) -> std::io::Result<LogLock> {
+    lock_log(fs::File::open(install.join("taskq-profile.lock"))?,true,true)
+}
+
+fn lock_log(lock: fs::File, wait: bool, shared: bool) -> std::io::Result<LogLock> {
     let deadline = Instant::now() + std::time::Duration::from_secs(1);
     loop {
-        match lock.try_lock() {
+        match if shared {lock.try_lock_shared()} else {lock.try_lock()} {
             Ok(()) => return Ok(LogLock(lock)),
             Err(std::fs::TryLockError::Error(e)) => return Err(e),
             Err(std::fs::TryLockError::WouldBlock) if !wait => return Err(std::io::ErrorKind::WouldBlock.into()),
@@ -639,7 +647,6 @@ fn row(line: &str) -> Option<Option<Row>> {
 }
 
 /// Canonical typed legacy observation; reuse report validation before common-store conversion.
-#[cfg(test)]
 pub(crate) fn legacy_value(line: &str) -> Result<serde_json::Value, String> {
     if !matches!(row(line),Some(Some(_))) {return Err("invalid legacy profile observation".into());}
     fn value<T: serde::de::DeserializeOwned+Serialize>(text: &str) -> Result<serde_json::Value,String> {
@@ -778,9 +785,9 @@ pub fn view(install: &Path, name: &str, since: Option<&str>) -> Result<String, S
     if !["export", "tasks", "board"].contains(&name) { return Err(format!("unknown profile view: {name} (guide, export, tasks or board)")); }
     let now = now_ms().ok_or("system clock before 1970")?;
     let since = since.map(|s| since_ms(s, now)).transpose()?;
+    if name=="export" {return crate::telemetry::export(install,since);}
     let text = export(&read_log(install)?, since);
     match name {
-        "export" => Ok(text),
         "tasks" => render_tasks(&text).map_err(String::from),
         "board" => render_board(&text).map_err(String::from),
         _ => Err(format!("unknown profile view: {name} (guide, export, tasks or board)")),

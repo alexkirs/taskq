@@ -1,5 +1,4 @@
-//! Installation-local telemetry. Caller holds taskq-profile.lock across import, write and read.
-#[cfg(test)]
+//! Installation-local telemetry. Writers hold taskq-profile.lock; export owns read-only snapshots.
 mod semantic;
 #[cfg(test)]
 mod source;
@@ -151,6 +150,75 @@ pub fn read(install: &Path, now: u64) -> Result<String, String> {
     Ok(text)
 }
 
+/// Transitional archive view; the service alone imports text and performs retention.
+fn legacy_export(install: &Path,since:Option<u64>) -> Result<(serde_json::Value,String),String> {
+    use serde_json::json;
+    let path=install.join("telemetry.log/telemetry.sqlite3");
+    match std::fs::metadata(&path) {
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound => {
+            if legacy_text(install)?.lines().any(telemetry) {return Err("legacy telemetry awaits service import".into());}
+            return Ok((json!({"state":"absent","samples":0}),String::new()));
+        }
+        Err(e)=>return Err(e.to_string()),Ok(_)=>{}
+    }
+    let _lock=crate::profile::read_log_lock(install).map_err(|e|format!("legacy snapshot lock: {e}"))?;
+    let db=Connection::open_with_flags(&path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e|e.to_string())?;
+    db.busy_timeout(std::time::Duration::from_secs(1)).map_err(|e|e.to_string())?;
+    db.execute_batch("PRAGMA query_only=ON; BEGIN;").map_err(|e|e.to_string())?;
+    let app:i64=db.pragma_query_value(None,"application_id",|r|r.get(0)).map_err(|e|e.to_string())?;
+    let version:i64=db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(|e|e.to_string())?;
+    if app!=APP||version!=1 {return Err("legacy snapshot: foreign or unsupported schema; preserved".into());}
+    let text=legacy_text(install)?;let offset=legacy_offset(&db,&text)?.unwrap_or(0);
+    if text[offset..].lines().any(telemetry) {return Err("legacy telemetry awaits service import".into());}
+    let mut statement=db.prepare("SELECT seq,retained_ms,line FROM records ORDER BY seq").map_err(|e|e.to_string())?;
+    let rows=statement.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?))).map_err(|e|e.to_string())?
+        .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    drop(statement);drop(db);drop(_lock);
+    let bounds=rows.first().zip(rows.last()).map(|(first,last)|[first.0,last.0]);
+    let mut out=String::new();let mut samples=0;let mut unknown=0;
+    let (mut first,mut last)=(None::<u64>,None::<u64>);
+    for (seq,received,line) in rows {
+        if seq<=0||received<0||line.len()>LINE_MAX {return Err("legacy snapshot: invalid retained record".into());}
+        let value=semantic::observation(&line)?;
+        if let Some(time)=value["started_ms"].as_u64() {
+            if time>i64::MAX as u64 {return Err("legacy snapshot: invalid source time".into());}
+            first=Some(first.map_or(time,|old|old.min(time)));last=Some(last.map_or(time,|old|old.max(time)));
+        } else {unknown+=1;}
+        if since.is_some_and(|since|value["started_ms"].as_u64().is_some_and(|time|time<since)) {continue;}
+        out.push_str(&json!({"source":"legacy","seq":seq,"id":null,"received_ms":received,"observation":value}).to_string());out.push('\n');samples+=1;
+    }
+    Ok((json!({"state":"read","samples":samples,"retained_seq":bounds,"retained_ms":[first,last],"unknown_started_count":unknown,"id":"not-recorded","pruned_count":null,"unknown":"legacy-retention-not-recorded"}),out))
+}
+
+/// Read committed metadata without acquiring write permission, migration, retention or network access.
+pub fn export(install:&Path,since:Option<u64>) -> Result<String,String> {
+    // Record the export boundary, not a recursive trace for each decoded telemetry row.
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),||export_snapshot(install,since))
+}
+
+fn export_snapshot(install:&Path,since:Option<u64>) -> Result<String,String> {
+    use serde_json::json;
+    let reader=coreq::telemetry::Reader::open(&install.join("telemetry.log/universal.sqlite3"))?;
+    let since_i64=since.unwrap_or(0).min(i64::MAX as u64) as i64;
+    let mut page=reader.export(since_i64,0,1024)?;
+    let mut universal=page.clone();
+    for key in ["events","after","next","more","schema"] {universal.as_object_mut().unwrap().remove(key);}
+    universal["state"]=json!("read");
+    let mut out=String::new();let mut samples=0;
+    loop {
+        for row in page["events"].as_array().ok_or("invalid telemetry export page")? {
+            let mut row=row.clone();row["source"]=json!("universal");out.push_str(&row.to_string());out.push('\n');samples+=1;
+        }
+        if page["more"]==false {break;}
+        page=reader.export(since_i64,page["next"].as_i64().ok_or("invalid telemetry export cursor")?,1024)?;
+    }
+    drop(reader); // Release the WAL snapshot before archive locking and external output.
+    universal["samples"]=json!(samples);
+    let (legacy,old)=legacy_export(install,since)?;
+    let header=json!({"schema":2,"coverage":"independent-committed-snapshots","since_ms":since,"sources":{"universal":universal,"legacy":legacy}});
+    Ok(header.to_string()+"\n"+&out+&old)
+}
+
 /// Existing service owns retention; failed pruning preserves both stores and is reported by its caller.
 pub fn prune(install: &Path, now: u64) -> Result<(), String> {
     let mut db = open(install)?;
@@ -170,6 +238,31 @@ mod tests {
     fn dir() -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("taskq-sqlite-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&d).unwrap(); d
+    }
+    // Chain: retained semantic history + automatic observations -> read-only schema2 agent export.
+    #[test]
+    fn export_preserves_history_unknowns_and_refuses_unimported_tail() {
+        let d=dir();
+        let old="taskq-profile {\"op\":\"spawn\",\"us\":7,\"error\":\"none\",\"at_ms\":1}\n";
+        let unknown="taskq-profile {\"op\":\"spawn\",\"us\":8,\"error\":\"none\",\"at_ms\":null}\n";
+        crate::profile::append_line(&d.join("taskq.log"),old).unwrap();
+        crate::profile::append_line(&d.join("taskq.log"),unknown).unwrap();
+        let store=coreq::telemetry::Store::open(&d.join("telemetry.log/universal.sqlite3")).unwrap();
+        store.append(&[coreq::telemetry::Event::new(serde_json::json!({"product":"taskq","version":"1","operation":"resume","kind":"method","trace":"t","span":"s","started_ms":2000,"outcome":"failed","error":"returned-error"})).unwrap()]).unwrap();
+        drop(store);
+        let archive=d.join("telemetry.log/telemetry.sqlite3");let before=std::fs::read(&archive).unwrap();
+        let output=export(&d,Some(1000)).unwrap();
+        let rows:Vec<serde_json::Value>=output.lines().map(|s|serde_json::from_str(s).unwrap()).collect();
+        assert_eq!(rows[0]["sources"]["universal"]["samples"],1);assert_eq!(rows[0]["sources"]["legacy"]["samples"],1);
+        assert_eq!(rows[1]["observation"]["operation"],"resume");
+        assert_eq!(rows[2]["source"],"legacy");assert_eq!(rows[2]["id"],serde_json::Value::Null);
+        assert_eq!(rows[2]["observation"]["started_ms"],serde_json::Value::Null);
+        assert_eq!(rows[2]["observation"]["unknown"]["started_ms"],"not-recorded");
+        assert_eq!(std::fs::read(&archive).unwrap(),before);
+        std::fs::write(d.join("taskq.log"),old).unwrap();
+        assert!(export(&d,None).unwrap_err().contains("awaits service import"));
+        assert_eq!(std::fs::read(&archive).unwrap(),before);assert_eq!(std::fs::read_to_string(d.join("taskq.log")).unwrap(),old);
+        std::fs::remove_dir_all(d).unwrap();
     }
     #[test]
     fn legacy_retry_append_rotation_and_identical_events() {

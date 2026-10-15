@@ -1,7 +1,8 @@
-//! Typed legacy conversion. Enabled for qualification until the single-store cutover is wired.
+//! Typed legacy conversion shared by read-only export and migration qualification.
 use serde_json::{Value,json};
 
 type Res<T> = Result<T,String>;
+#[cfg(test)]
 pub(super) const KINDS:&[&str]=&["operation","stage","board","transition","requests"];
 
 fn canonical(line: &str) -> Res<Value> {
@@ -17,6 +18,7 @@ fn fields(kind: &str) -> Res<&'static [(&'static str,&'static str)]> {
         _ => return Err("unknown semantic kind".into()),
     })
 }
+#[cfg(test)]
 fn prefix(kind: &str) -> Res<&'static str> {
     match kind {"operation"=>Ok("taskq-profile"),"stage"=>Ok("taskq-stage"),"board"=>Ok("taskq-board"),"transition"=>Ok("taskq-transition"),"requests"=>Ok("taskq-requests"),_=>Err("unknown semantic kind".into())}
 }
@@ -51,6 +53,7 @@ pub(super) fn observation(line: &str) -> Res<Value> {
     Ok(value)
 }
 
+#[cfg(test)]
 pub(super) fn line(value: &Value) -> Res<String> {
     if value.get("group_id").is_some() {return Err("count summary needs complete assembly".into());}
     if value["product"]!="taskq" {return Err("foreign semantic product".into());}
@@ -72,6 +75,7 @@ pub(super) fn line(value: &Value) -> Res<String> {
 }
 
 /// Consume complete contiguous summary groups from a bounded semantic read; partial groups stay unknown.
+#[cfg(test)]
 pub(super) fn lines(values: &[Value]) -> Res<Vec<String>> {
     let mut lines=Vec::new();let mut reader=coreq::telemetry::Assembler::default();
     for value in values {if let Some(value)=reader.push(value.clone())? {lines.push(line(&value)?);}}
@@ -79,6 +83,7 @@ pub(super) fn lines(values: &[Value]) -> Res<Vec<String>> {
 }
 
 /// Compatibility report input from bounded indexed pages, never a scan of generic method payloads.
+#[cfg(test)]
 pub(super) fn read(store: &coreq::telemetry::Store,kinds: &[&str]) -> Res<String> {
     let mut reader=coreq::telemetry::Assembler::default();let mut text=String::new();let mut after=0;
     loop {

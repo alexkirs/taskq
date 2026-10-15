@@ -225,7 +225,6 @@ pub fn flush(source: &str) {
 }
 
 /// Validate historical metadata with the same normalization used by the request writer.
-#[cfg(test)]
 pub(crate) fn legacy_value(line: &str) -> Result<Value,String> {
     let usage:Usage=serde_json::from_str(line.strip_prefix(RECORD).ok_or("unknown request record")?).map_err(|e|e.to_string())?;
     let words=usage.source.split(' ').collect::<Vec<_>>();

@@ -335,6 +335,22 @@ pub fn fold(n: u64, entries: &[Entry], deps_open: bool) -> Task {
     replay(n, entries, deps_open).0
 }
 
+/// Logged state changes (§ 4 Profiling): per accepted entry that changed the folded state, its id and the task
+/// before and after it. `ponytail:` refolds each prefix, O(entries²); a running fold is the upgrade if logs grow long.
+pub fn changes(n: u64, entries: &[Entry]) -> Vec<(u64, Task, Task)> {
+    let mut log: Vec<Entry> = entries.iter().filter(|e| !e.edited).cloned().collect();
+    log.sort_by_key(|e| e.id);
+    let (mut out, mut before) = (vec![], Task::default());
+    for i in 0..log.len() {
+        let after = fold(n, &log[..=i], false);
+        if after.state != before.state {
+            out.push((log[i].id, before, after.clone()));
+        }
+        before = after;
+    }
+    out
+}
+
 /// The task's revision (§ 2): the entry that set its open card, else its attempt, else its last accepted entry; 0: none.
 pub fn revision(n: u64, entries: &[Entry]) -> u64 {
     replay(n, entries, false).2

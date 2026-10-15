@@ -1,6 +1,7 @@
 //! §5 profiling: fixed numeric observations in the existing bounded taskq.log, never operation input/error text.
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +21,15 @@ thread_local!(static PARENT: Cell<u64> = const { Cell::new(0) });
 thread_local!(static OBSERVED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) });
 #[cfg(test)]
 thread_local!(static STAGED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) });
+#[cfg(test)]
+thread_local!(static MOVED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) });
+/// Transition records of this thread and their report section.
+#[cfg(test)]
+pub fn take_moves() -> (String, String) {
+    let text = MOVED.with(|v| std::mem::take(&mut *v.borrow_mut()));
+    let report = render_system(&text).1;
+    (text, report)
+}
 #[cfg(test)]
 pub fn take_report() -> String {
     OBSERVED.with(|v| render(&std::mem::take(&mut *v.borrow_mut())).unwrap())
@@ -206,6 +216,102 @@ fn render_stages(text: &str) -> Result<String, &'static str> {
     Ok(out)
 }
 
+/// § 4 Profiling board operation kinds, one per board adapter call.
+pub const BOARD_OPS: [&str; 9] = ["list", "inbox", "read", "claim", "comment", "label", "close", "write", "publish"];
+const BOARD_PREFIX: &str = "taskq-board ";
+const TRANSITION_PREFIX: &str = "taskq-transition ";
+const STATES: [&str; 9] = ["ready", "waiting", "doing", "review", "ask", "later", "failed", "closed", "held"];
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoardOp { op: String, us: u64, outcome: String, error: String, remaining: Option<u64>, at_ms: Option<u64> }
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Transition { task: u64, entry: u64, from: String, to: String, prev_s: Option<u64>, rt: Option<String>, host: Option<String>, at_ms: Option<u64> }
+
+/// Appends one record line; a failed write is reported unknown and never fails the observed operation.
+fn record(prefix: &str, r: &impl Serialize) {
+    let Some(path) = LOG.get() else { return };
+    let line = serde_json::to_string(r).map(|j| format!("{prefix}{j}\n"));
+    if line.map_err(std::io::Error::other).and_then(|l| append_line(path, &l)).is_err() {
+        let _ = writeln!(std::io::stderr().lock(), "Profiling: unknown (taskq.log full or append failed; service pruning required)");
+    }
+}
+
+/// One board operation of `kind`; `failed` is its error text (only its class is kept).
+pub fn board(kind: &'static str, took: std::time::Duration, failed: Option<&str>, remaining: Option<u64>) {
+    record(BOARD_PREFIX, &BoardOp { op: kind.into(), us: took.as_micros().min(u64::MAX as u128) as u64,
+        outcome: if failed.is_some() { "failed" } else { "ok" }.into(), error: failed.map_or("none", error).into(), remaining, at_ms: now_ms() });
+}
+
+/// One queue transition of `task` caused by log `entry`; `rt`/`host` of the attempt on either side.
+pub fn transition(task: u64, entry: u64, from: &'static str, to: &'static str, prev_s: Option<u64>, rt: Option<&str>, host: Option<&str>) {
+    // a host name is the operator's own short label; anything else is not kept
+    let host = host.map(|h| if h.len() <= 64 && h.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) { h } else { "other" });
+    let r = Transition { task, entry, from: from.into(), to: to.into(), prev_s,
+        rt: rt.map(|r| RUNTIMES.into_iter().find(|k| *k == r).unwrap_or("other").into()), host: host.map(Into::into), at_ms: now_ms() };
+    #[cfg(test)]
+    MOVED.with(|v| { *v.borrow_mut() += &format!("{TRANSITION_PREFIX}{}\n", serde_json::to_string(&r).unwrap()); });
+    record(TRANSITION_PREFIX, &r);
+}
+
+/// p50/p95/max of sorted `v`, each divided by `div`.
+fn spread(v: &[u64], div: f64) -> String {
+    let p = |p: usize| v[(v.len() * p).div_ceil(100) - 1] as f64 / div;
+    format!("{:.3}/{:.3}/{:.3}", p(50), p(95), *v.last().unwrap() as f64 / div)
+}
+
+/// Board operations by p95 and queue transitions (§ 4 Profiling); a corrupt record makes its section unknown.
+fn render_system(text: &str) -> (String, String) {
+    let board = || -> Result<String, &'static str> {
+        let mut rows: Vec<(&str, Vec<u64>, BTreeMap<String, usize>, Option<u64>)> = vec![];
+        for line in text.lines().filter_map(|l| l.strip_prefix(BOARD_PREFIX)) {
+            let r: BoardOp = serde_json::from_str(line).map_err(|_| "corrupt board record; log kept")?;
+            let op = BOARD_OPS.into_iter().find(|k| *k == r.op).ok_or("unknown board operation; log kept")?;
+            if !ERRORS.contains(&r.error.as_str()) || !["ok", "failed"].contains(&r.outcome.as_str()) { return Err("unknown board code; log kept"); }
+            let i = rows.iter().position(|x| x.0 == op).unwrap_or_else(|| { rows.push((op, vec![], Default::default(), None)); rows.len() - 1 });
+            let row = &mut rows[i];
+            row.1.push(r.us);
+            if r.outcome == "failed" { *row.2.entry(r.error).or_default() += 1; }
+            if let Some(m) = r.remaining { row.3 = Some(row.3.map_or(m, |x| x.min(m))); }
+        }
+        if rows.is_empty() { return Ok("Board operations: unknown (no observations)\n".into()); }
+        for r in &mut rows { r.1.sort_unstable(); }
+        rows.sort_by_key(|r| (std::cmp::Reverse(r.1[(r.1.len() * 95).div_ceil(100) - 1]), r.0));
+        let mut out = "Board operations: retained observations by p95; all budgets unknown\n\n| Operation | Count | p50/p95/max ms | Failed | Errors | Lowest remaining | Budget |\n|---|---:|---|---:|---|---|---|\n".to_string();
+        for (op, us, errors, low) in rows {
+            let e = errors.iter().map(|(k, n)| format!("{k}:{n}")).collect::<Vec<_>>().join(", ");
+            out += &format!("| {op} | {} | {} | {} | {} | {} | unknown |\n", us.len(), spread(&us, 1000.), errors.values().sum::<usize>(),
+                if e.is_empty() { "none" } else { &e }, low.map_or("unknown (not reported)".into(), |l| l.to_string()));
+        }
+        Ok(out)
+    };
+    let moves = || -> Result<String, &'static str> {
+        let mut rows: BTreeMap<(usize, usize, String), (Vec<u64>, usize)> = BTreeMap::new();
+        for line in text.lines().filter_map(|l| l.strip_prefix(TRANSITION_PREFIX)) {
+            let r: Transition = serde_json::from_str(line).map_err(|_| "corrupt transition record; log kept")?;
+            let state = |s: &str| STATES.iter().position(|k| *k == s).ok_or("unknown transition state; log kept");
+            if r.rt.as_deref().is_some_and(|rt| !RUNTIMES.contains(&rt)) { return Err("unknown transition runtime; log kept"); }
+            let row = rows.entry((state(&r.from)?, state(&r.to)?, r.rt.unwrap_or_else(|| "none".into()))).or_default();
+            match r.prev_s { Some(s) => row.0.push(s), None => row.1 += 1 }
+        }
+        if rows.is_empty() { return Ok("Queue transitions: unknown (no observations)\n".into()); }
+        let mut out = "Queue transitions: retained observations; moves while no service ran unknown\n\n| From | To | Runtime | Count | p50/p95/max s in previous state |\n|---|---|---|---:|---|\n".to_string();
+        for ((f, t, rt), (mut s, unknown)) in rows {
+            s.sort_unstable();
+            let took = match (s.is_empty(), unknown) {
+                (true, _) => "unknown (no entry time)".into(),
+                (false, 0) => spread(&s, 1.),
+                (false, u) => format!("{} ({} of {} known; no entry time)", spread(&s, 1.), s.len(), s.len() + u),
+            };
+            out += &format!("| {} | {} | {rt} | {} | {took} |\n", STATES[f], STATES[t], s.len() + unknown);
+        }
+        Ok(out)
+    };
+    (board().unwrap_or_else(|e| format!("Board operations: unknown ({e})\n")), moves().unwrap_or_else(|e| format!("Queue transitions: unknown ({e})\n")))
+}
+
 pub struct LogLock(fs::File);
 impl Drop for LogLock {
     fn drop(&mut self) {
@@ -306,9 +412,10 @@ pub fn report(install: &Path) -> String {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis().min(u64::MAX as u128) as u64);
         let profile = render(&text).unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n"));
         let stages = render_stages(&text).unwrap_or_else(|e| format!("Attempt stages: unknown ({e})\n"));
-        Ok(format!("{profile}\n{stages}\n{}", crate::requests::sources(&text, now)))
+        let (board, moves) = render_system(&text);
+        Ok(format!("{profile}\n{board}\n{moves}\n{stages}\n{}", crate::requests::sources(&text, now)))
     };
-    read().unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n\nAttempt stages: unknown ({e})\n\nBoard requests by source: unknown ({e})\n"))
+    read().unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n\nBoard operations: unknown ({e})\n\nQueue transitions: unknown ({e})\n\nAttempt stages: unknown ({e})\n\nBoard requests by source: unknown ({e})\n"))
 }
 
 #[cfg(test)]
@@ -328,7 +435,13 @@ mod tests {
         for (op, times, err) in [("spawn", vec![1000, 3000], "none"), ("forge.call", vec![2000, 2000], "http5xx")] {
             for us in times { append(&path, &Record { op: op.into(), us, error: err.into(), at_ms: Some(us), trace: None }).unwrap(); }
         }
+        // board operations (#1173): ranked by p95; failures keep only their class; no remaining reads unknown
+        for (op, us, err, remaining) in [("list", 4000, None, Some(4900)), ("list", 1000, Some("HTTP 502 secret /host/path"), Some(4800)), ("claim", 2000, None, None)] {
+            append_line(&path, &format!("{BOARD_PREFIX}{}\n", serde_json::to_string(&BoardOp { op: op.into(), us, outcome: if err.is_some() { "failed" } else { "ok" }.into(),
+                error: err.map_or("none", error).into(), remaining, at_ms: Some(1) }).unwrap())).unwrap();
+        }
         let text = report(&dir);
+        assert!(text.contains("| list | 2 | 1.000/4.000/4.000 | 1 | http5xx:1 | 4800 | unknown |\n| claim | 1 | 2.000/2.000/2.000 | 0 | none | unknown (not reported) |"), "{text}");
         assert!(text.contains("Slow (p95): spawn > forge.call"));
         assert!(text.contains("Failing (rate): forge.call > spawn"));
         assert!(text.contains("Unstable (variance): spawn > forge.call"));

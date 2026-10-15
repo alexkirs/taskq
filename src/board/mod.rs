@@ -87,6 +87,49 @@ pub fn entries(board: &dyn Board, n: u64) -> Result<Vec<Entry>> {
         .collect())
 }
 
+/// § 4 Profiling board operations: each call of the inner board is one `taskq-board` record; cached clock, user
+/// and label-schema reads are not operations and pass through; `ensure_labels` is a `label` operation.
+struct Profiled(Box<dyn Board>);
+
+impl Profiled {
+    fn op<T>(&self, kind: &'static str, f: impl FnOnce(&dyn Board) -> Result<T>) -> Result<T> {
+        let began = std::time::Instant::now();
+        let r = f(&*self.0);
+        crate::profile::board(kind, began.elapsed(), r.as_ref().err().map(String::as_str), self.0.requests().remaining);
+        r
+    }
+}
+
+impl Board for Profiled {
+    fn canonical_labels(&self) -> Result<bool> { self.0.canonical_labels() }
+    fn state_label(&self, state: &str) -> Result<String> { self.0.state_label(state) }
+    fn ensure_labels(&self, names: &[String]) -> Result<()> { self.op("label", |b| b.ensure_labels(names)) }
+    fn issues(&self, since: Option<i64>) -> Result<Vec<Issue>> { self.op("list", |b| b.issues(since)) }
+    fn issue(&self, n: u64) -> Result<Issue> { self.op("read", |b| b.issue(n)) }
+    fn comments(&self, n: u64) -> Result<Vec<Comment>> { self.op("inbox", |b| b.comments(n)) }
+    fn comment(&self, n: u64, body: &str) -> Result<u64> {
+        self.op(if body.starts_with("taskq: spawn ") { "claim" } else { "comment" }, |b| b.comment(n, body))
+    }
+    fn edit_comment(&self, n: u64, id: u64, body: &str) -> Result<()> { self.op("comment", |b| b.edit_comment(n, id, body)) }
+    fn labels(&self, n: u64, add: &[String], remove: &[String]) -> Result<()> { self.op("label", |b| b.labels(n, add, remove)) }
+    fn create(&self, title: &str, body: &str, labels: &[String]) -> Result<u64> { self.op("write", |b| b.create(title, body, labels)) }
+    fn edit(&self, n: u64, body: &str) -> Result<()> { self.op("write", |b| b.edit(n, body)) }
+    fn close(&self, n: u64) -> Result<()> { self.op("close", |b| b.close(n)) }
+    fn now(&self) -> Result<i64> { self.0.now() }
+    fn me(&self) -> Result<String> { self.0.me() }
+    fn publish(&self, n: u64, sha: &str, mode: &str, title: &str, task_line: &str) -> Publish {
+        let began = std::time::Instant::now();
+        let p = self.0.publish(n, sha, mode, title, task_line);
+        let failed = match &p { Publish::Done(_) => None, Publish::Pending(e) | Publish::Failed(e) => Some(e.as_str()) };
+        crate::profile::board("publish", began.elapsed(), failed, self.0.requests().remaining);
+        p
+    }
+    fn url(&self, n: u64) -> String { self.0.url(n) }
+    fn foreign(&self, repo: &str, n: u64) -> Result<Issue> { self.op("read", |b| b.foreign(repo, n)) }
+    fn foreign_url(&self, repo: &str, n: u64) -> String { self.0.foreign_url(repo, n) }
+    fn requests(&self) -> crate::requests::Budget { self.0.requests() }
+}
+
 // ---------- time ----------
 
 fn days(y: i64, m: i64, d: i64) -> i64 {
@@ -282,7 +325,7 @@ impl Kind {
         let schema = label_schema(schema)?;
         let api = (self.api)(host, repo, &(self.token)(tool, host)?);
         *api.label_schema.borrow_mut() = schema;
-        Ok((self.board)(api))
+        Ok(Box::new(Profiled((self.board)(api))))
     }
 }
 

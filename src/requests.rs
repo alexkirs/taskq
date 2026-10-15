@@ -187,8 +187,8 @@ pub fn record(source: &str, ops: &BTreeMap<String, u64>) {
     let at_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis().min(u64::MAX as u128) as u64);
     let usage = Usage { at_ms, source: source.into(), ops: ops.clone() };
     let line = format!("{RECORD}{}\n", serde_json::to_string(&usage).unwrap_or_default());
-    if crate::profile::append_line(path, &line).is_err() {
-        eprintln!("Board request record: unknown (taskq.log full or append failed; service pruning required)");
+    if let Err(e) = crate::profile::append_line(path, &line) {
+        eprintln!("Board request record: unknown ({})", crate::profile::append_error(&e));
     }
 }
 

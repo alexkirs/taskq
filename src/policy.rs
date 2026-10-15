@@ -455,6 +455,14 @@ mod tests {
     #[test]
     fn seatbelt_keeps_workers_out_of_the_policy_store() {
         use std::process::Command;
+        // Probe before negative assertions: a nested sandbox denial must not look like policy enforcement.
+        let probe = Command::new("sandbox-exec").args(["-p", "(version 1)(allow default)", "/usr/bin/true"]).output().unwrap();
+        if !probe.status.success() && String::from_utf8_lossy(&probe.stderr).contains("Operation not permitted") {
+            use std::io::Write;
+            writeln!(std::io::stderr(), "sandbox-blocked: seatbelt_keeps_workers_out_of_the_policy_store: Operation not permitted").unwrap();
+            return;
+        }
+        assert!(probe.status.success(), "sandbox-exec probe: {}", String::from_utf8_lossy(&probe.stderr));
         // outside the OS temp dir, which every preset may write
         let t = canon(Path::new(env!("CARGO_MANIFEST_DIR"))).join("target").join(format!("seatbelt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&t);

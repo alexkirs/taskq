@@ -61,7 +61,7 @@ const USAGE: &str = "taskq agents
  taskq close N [M..] [--text VERDICT] | taskq approve N [--sha SHA]
  taskq recipe NAME --run ID [--goal G] [--start]
  taskq status [--only L,..] [--json] | taskq inbox N
- taskq profile | taskq retro | taskq add --retro K [--type T ..]
+ taskq profile [export|tasks|board] [--since 24h] | taskq retro | taskq add --retro K [--type T ..]
  taskq wait [--window MIN] [--only L,..]
  taskq cleanup [--force] | taskq update [--check]
  taskq enroll <https-url> [--headless] | taskq connection status | taskq disconnect
@@ -99,7 +99,7 @@ impl Args {
             Some("close") => a.pos.len(),
             Some("answer") if a.pos.get(1).is_some_and(|p| p.contains('.')) => a.pos.len(),
             Some("service") if a.pos.get(1).is_some_and(|p| p == "focus") => a.pos.len(),
-            Some("service" | "add" | "finding" | "start" | "approve" | "recipe" | "ask" | "answer" | "result" | "requeue" | "later" | "failed" | "steer" | "inbox" | "enroll" | "connection") => 2,
+            Some("service" | "profile" | "add" | "finding" | "start" | "approve" | "recipe" | "ask" | "answer" | "result" | "requeue" | "later" | "failed" | "steer" | "inbox" | "enroll" | "connection") => 2,
             _ => 1,
         };
         if a.pos.len() > used {
@@ -198,6 +198,7 @@ fn load(root: &Path) -> Res<(Config, Value)> {
     if cfg.repo.is_empty() {
         return Err("taskq.json: repo is required".into());
     }
+    profile::project(&cfg.repo);
     Ok((cfg, v))
 }
 
@@ -1741,7 +1742,11 @@ fn run(argv: &[String]) -> Res<()> {
         find_root()?; // § 5: a stale TASKQ_ROOT refuses every command, not only those that read the project
     }
     match cmd {
-        "profile" => { print!("{}", profile::report(&platform::default_install())); Ok(()) }
+        "profile" => match a.pos.get(1) {
+            None if a.one("since").is_some() => Err("--since needs a view: taskq profile export|tasks|board --since 24h".into()),
+            None => { print!("{}", profile::report(&platform::default_install())); Ok(()) }
+            Some(v) => { print!("{}", profile::view(&platform::default_install(), v, a.one("since"))?); Ok(()) }
+        },
         "selftest" => {
             let n = golden_selftest(core::GOLDEN, !platform::VERSION.contains('-')).map_err(|e| format!("fold: FAIL {e}"))?;
             println!("fold: {n} golden traces PASS");

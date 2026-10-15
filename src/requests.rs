@@ -224,6 +224,21 @@ pub fn flush(source: &str) {
     record(source, &ops);
 }
 
+/// Validate historical metadata with the same normalization used by the request writer.
+#[cfg(test)]
+pub(crate) fn legacy_value(line: &str) -> Result<Value,String> {
+    let usage:Usage=serde_json::from_str(line.strip_prefix(RECORD).ok_or("unknown request record")?).map_err(|e|e.to_string())?;
+    let words=usage.source.split(' ').collect::<Vec<_>>();
+    let command=|word:&&str|*word=="*"||(!word.is_empty()&&word.len()<=30&&word.bytes().all(|b|b.is_ascii_lowercase()||b==b'-'));
+    if usage.source!="service"&&!(matches!(words.first(),Some(&"cli"|&"worker"|&"reviewer"))
+        &&((words.len()==2&&command(&words[1]))||(words.len()==3&&words[1]=="service"&&command(&words[2])))) {return Err("invalid request source".into());}
+    for name in usage.ops.keys() {
+        let (method,path)=name.split_once(' ').ok_or("invalid request operation")?;
+        if !matches!(method,"GET"|"POST"|"PUT"|"PATCH"|"DELETE"|"HEAD"|"OPTIONS")||op(method,&path.split('/').map(|part|if part=="N" {"0"} else {part}).collect::<Vec<_>>().join("/"))!=*name {return Err("invalid request operation".into());}
+    }
+    serde_json::to_value(usage).map_err(|e|e.to_string())
+}
+
 /// `taskq profile` section: board requests of the hour before `now_ms` by source, from the retained records.
 pub fn sources(text: &str, now_ms: u64) -> String {
     let start = now_ms.saturating_sub(3_600_000);

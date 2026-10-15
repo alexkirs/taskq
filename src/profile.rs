@@ -638,6 +638,20 @@ fn row(line: &str) -> Option<Option<Row>> {
     })
 }
 
+/// Canonical typed legacy observation; reuse report validation before common-store conversion.
+#[cfg(test)]
+pub(crate) fn legacy_value(line: &str) -> Result<serde_json::Value, String> {
+    if !matches!(row(line),Some(Some(_))) {return Err("invalid legacy profile observation".into());}
+    fn value<T: serde::de::DeserializeOwned+Serialize>(text: &str) -> Result<serde_json::Value,String> {
+        serde_json::from_str::<T>(text).and_then(serde_json::to_value).map_err(|e|e.to_string())
+    }
+    if let Some(text)=line.strip_prefix(PREFIX) {value::<Record>(text)}
+    else if let Some(text)=line.strip_prefix(STAGE_PREFIX) {value::<Stage>(text)}
+    else if let Some(text)=line.strip_prefix(BOARD_PREFIX) {value::<BoardOp>(text)}
+    else if let Some(text)=line.strip_prefix(TRANSITION_PREFIX) {value::<Transition>(text)}
+    else {Err("unknown legacy profile kind".into())}
+}
+
 /// § 5 `taskq profile export`: a header naming window and sample count, then one JSON line per retained observation at or after `since_ms`.
 fn export(text: &str, since_ms: Option<u64>) -> String {
     let (mut rows, mut corrupt) = (vec![], 0);

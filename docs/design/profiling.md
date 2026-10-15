@@ -126,3 +126,7 @@ Historical import uses coreq's deterministic source-position identities and atom
 The shared store now bounds database/WAL/SHM files independently of retained JSON bytes. It rejects a new mutation behind a pinned WAL reader and reports allocation through storage(). This qualifies the shared store only: the v4.5.0 archive plus the draft store still need consolidation and a total transition-budget check before release.
 
 The local-capture selftest requires the installed collector to flush committed observations with no collection loss. An absent, empty or failed collector makes selftest fail. Ordinary commands keep their outcomes. This local barrier does not prove UI coverage, global ingestion, other hosts or queue readiness.
+
+## Common-store conversion qualification
+
+The draft typed converter in `src/telemetry/semantic.rs` reuses the existing profile/report schemas and request normalization. It preserves operation trace numbers, stage open/usage status, board remaining budget, transitions and request summaries through coreq semantic metadata. Historical product version and textual trace/span identities stay explicitly unknown; numeric provenance is retained separately. Request summaries remain summaries, with reversible fixed-code source/operation keys. The converter is test-only until one-store cutover, source reset detection, physical transition budget and report readback qualify. The installed writer and archive remain unchanged.

@@ -325,7 +325,7 @@ const FORMATS: &str = "Put each `--text` field on its own line. The commands ren
 const FILES: &str = "Never run gh auth login. A missing board token is an owner item; report it through taskq ask.\n\
      Touch only this project, ~/.claude, ~/.codex and the OS temp dir: never search `/`, `~` or other folders.\n";
 
-/// taskq.md § 4 board budget: every host's agents share one board user's hourly requests.
+/// taskq.md § 7 rule 7 CI wait: every host's agents share one board user's hourly requests (§ 4 board budget).
 const CI_WAIT: &str = "Board budget: poll CI at most once a minute (`gh pr checks <PR> --watch --interval 60`); never `gh run watch`\n\
      (it polls every 3 s) or `gh run view` without `--json`.\n";
 

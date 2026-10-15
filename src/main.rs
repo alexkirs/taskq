@@ -25,6 +25,7 @@ mod linux_sandbox;
 #[cfg(windows)]
 mod windows_sandbox;
 mod profile;
+mod telemetry;
 mod retro;
 mod runtime;
 mod service;

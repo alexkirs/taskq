@@ -4,7 +4,7 @@ Design for #1185, on the records of #1147 and #1173 and the views of #1174 ([pro
 
 Standalone means an install with no serverq connection. A connected install is one with that connection; its design is not part of this task.
 
-## Current state
+## Historical log implementation
 
 Facts on main at #1188 (shipped):
 
@@ -21,7 +21,7 @@ Owner selected SQLite/WAL for local telemetry. This replaces choice C below; tha
 
 Retention: 30 days / 64 MiB; name and enforce database, WAL and temporary-space bounds in the implementation plan. Reuse the existing service for pruning. Set durability and busy timeouts per [shared data](https://github.com/taskqorg/specq/blob/main/engineering/data.md). An unavailable, full, corrupt or unsupported store reads unknown; instrumentation must preserve the operation. Never reset a corrupt database silently.
 
-Before implementation, map all record writers, readers, pruners and legacy-process overlap. Migration preserves retained history and is idempotent, with transactional checkpoints and explicit coverage gaps; rollback preserves readable history. Verify crash/restart, failed writes, corruption, contention, retention, migration retry and old/new reader/writer transitions. Do not delete legacy history as an implicit migration step. This is an accepted target; the shipped log path below remains until the SQLite implementation is qualified.
+Before implementation, map all record writers, readers, pruners and legacy-process overlap. Migration preserves retained history and is idempotent, with transactional checkpoints and explicit coverage gaps; rollback preserves readable history. Verify crash/restart, failed writes, corruption, contention, retention, migration retry and old/new reader/writer transitions. Do not delete legacy history as an implicit migration step. The SQLite candidate below replaces the historical log path after its release gates pass.
 
 ## Historical comparison
 
@@ -58,3 +58,15 @@ Any agent session on the host (PM, operator or a plain client session) answers a
 ## Acceptance of the follow-up work
 
 A follow-up task is done when, on one host: the guide command prints this table; each question's command prints the named columns or a named unknown; a fixed record set covers the new views in the existing `export_then_reports` chain check; and no profile record leaves the host without a serverq connection (no send call in the standalone path).
+
+## SQLite implementation and transition
+
+`src/telemetry.rs` owns `<install>/telemetry.log/telemetry.sqlite3`, application ID `0x5451544d`, schema 1. The dedicated `telemetry.log/` namespace survives the old updater's `*.log` allowlist, preserving the database and its sidecars on mixed-version updates or rollback. Existing instrumentation uses the shared profile lock; the five record kinds and report/export schemas stay unchanged. Bundled SQLite uses WAL, FULL durability, a one-second busy timeout, memory-only temporary storage and no cache spill. Reads and writes close their connections within that lock.
+
+A 28 MiB page limit bounds the database. Every transaction starts after a successful TRUNCATE checkpoint; cache spilling is disabled, so one transaction adds at most one frame per database page (under 29 MiB WAL, under 1 MiB SHM). The bounded 4 MiB legacy log and its 64 KiB append allowance keep the total below 64 MiB. Pinned external readers refuse the next write instead of growing the WAL. No VACUUM copy. Pressure removes oldest records in 256-row transactions until space is available. A single append/record is at most 64 KiB; an oversized write is rejected before pruning. The existing host/service prunes after 30 days from local receipt; source timestamps stay unchanged. Imported records get a fresh retention window so migration does not immediately erase legacy evidence.
+
+Legacy records have no IDs. Import checkpoints stream byte positions and SHA256 digests in the same transaction as the rows; equal legitimate observations remain separate. Checkpoints contain hashes only, never service diagnostics. An unchanged prefix imports only appended complete lines. The exact retained suffix of the old bounded-log pruner is recognized; other rewrites/loss fail analysis as unknown and preserve SQLite history and the legacy file. An unrecognized legacy change does not prevent new SQLite records from being stored, but reports the unresolved import. Updated text-log rotation imports before truncating. No implicit removal of legacy files.
+
+Rollback keeps both the untouched legacy file and SQLite database. An old binary can continue writing its log; the new reader imports those appends on upgrade. Old readers cannot display new SQLite records: retain the qualified reader or use a SQLite reader (`SELECT line FROM records ORDER BY seq`) for the complete retained history. JSONL analysis export remains `taskq profile export`; task state stays on the board. Destructive schema contraction is outside this transition.
+
+Checks cover import retry, equal events, recognized rotation, unknown rewrites, atomic rollback, unsupported/corrupt stores, kill/restart, pinned readers, pressure bounds, retention, concurrent writers and terminal-stage repair through the actual profile reader. Platform release gates qualify the bundled library separately.

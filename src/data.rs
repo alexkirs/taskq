@@ -49,6 +49,7 @@ pub fn trim_tail(p: &Path, max: u64) -> bool {
     if fs::metadata(p).is_ok_and(|m| m.len() <= threshold) {
         return false;
     }
+    if profile_log && crate::telemetry::read(p.parent().unwrap(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)).is_err() { return false; }
     let Ok(b) = fs::read(p) else { return false };
     let tail = &b[b.len().saturating_sub((max / 2) as usize)..];
     let tail = tail.iter().position(|c| *c == b'\n').map_or(tail, |i| &tail[i + 1..]);

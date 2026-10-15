@@ -28,10 +28,12 @@ fn installed_windows_release_starts_without_build_paths() {
     for exe in [release.join("taskq.exe"), install.join("taskq.exe")] {
         let out = Command::new(&exe).arg("selftest").current_dir(&dir)
             .env("PATH", &system32).env("LOCALAPPDATA", &appdata)
+            .env("COREQ_TELEMETRY_STORE_TRACE", "1")
             .env("TASKQ_ROOT", &root)
             .env("TASKQ_SELFTEST_OFFLINE", "1").env("TASKQ_INCIDENT_REPORTS", "off")
             .output().unwrap();
-        assert!(out.status.success(), "{}: {} {}", exe.display(), out.status, String::from_utf8_lossy(&out.stderr));
+        let detail = fs::read_to_string(root.join(".taskq/cli-errors.log")).unwrap_or_default();
+        assert!(out.status.success(), "{}: {} {}\n{}", exe.display(), out.status, String::from_utf8_lossy(&out.stderr), detail.chars().take(4096).collect::<String>());
         assert!(String::from_utf8_lossy(&out.stdout).contains("golden traces PASS"));
     }
     #[cfg(target_env = "gnu")]

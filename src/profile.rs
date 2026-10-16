@@ -148,7 +148,7 @@ struct Stage {
     unknown: Option<String>,
 }
 
-fn now_ms() -> Option<u64> {
+pub(crate) fn now_ms() -> Option<u64> {
     SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis().min(u64::MAX as u128) as u64)
 }
 
@@ -600,7 +600,9 @@ pub fn report(install: &Path) -> String {
             .unwrap_or_else(|e| format!("Attempt terminal records: unknown ({e})\n"));
         Ok(format!("{profile}\n{board}\n{moves}\n{stages}\n{terminal}\n{}", crate::requests::sources(&text, now)))
     };
-    read().unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n\nBoard operations: unknown ({e})\n\nQueue transitions: unknown ({e})\n\nAttempt stages: unknown ({e})\n\nBoard requests by source: unknown ({e})\n"))
+    let legacy=read().unwrap_or_else(|e| format!("Profile: unknown ({e}); all budgets unknown\n\nBoard operations: unknown ({e})\n\nQueue transitions: unknown ({e})\n\nAttempt stages: unknown ({e})\n\nBoard requests by source: unknown ({e})\n"));
+    let actions=crate::telemetry::diagnostic::actions(install,None).unwrap_or_else(|e|format!("Actions: unknown ({e})\n"));
+    format!("{legacy}\n{actions}")
 }
 
 /// § 5 `taskq profile export` columns, in order; every row has each of them, null where its kind has none.
@@ -776,15 +778,20 @@ pub fn view(install: &Path, name: &str, since: Option<&str>) -> Result<String, S
         if since.is_some() { return Err("profile guide does not accept --since".into()); }
         return Ok(include_str!("../docs/design/profile-guide.md").into());
     }
-    if !["export", "tasks", "board"].contains(&name) { return Err(format!("unknown profile view: {name} (guide, export, tasks or board)")); }
+    if name=="health" {
+        if since.is_some() {return Err("profile health does not accept --since".into());}
+        return Ok(crate::telemetry::diagnostic::health().to_string()+"\n");
+    }
+    if !["export", "tasks", "board", "actions"].contains(&name) { return Err(format!("unknown profile view: {name} (guide, export, tasks, board, actions or health)")); }
     let now = now_ms().ok_or("system clock before 1970")?;
     let since = since.map(|s| since_ms(s, now)).transpose()?;
     if name=="export" {return crate::telemetry::export(install,since);}
+    if name=="actions" {return crate::telemetry::diagnostic::actions(install,since);}
     let text = export(&read_log(install)?, since);
     match name {
         "tasks" => render_tasks(&text).map_err(String::from),
         "board" => render_board(&text).map_err(String::from),
-        _ => Err(format!("unknown profile view: {name} (guide, export, tasks or board)")),
+        _ => Err(format!("unknown profile view: {name} (guide, export, tasks, board, actions or health)")),
     }
 }
 

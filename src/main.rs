@@ -65,7 +65,7 @@ const USAGE: &str = "taskq agents
  taskq close N [M..] [--text VERDICT] | taskq approve N [--sha SHA]
  taskq recipe NAME --run ID [--goal G] [--start]
  taskq status [--only L,..] [--json] | taskq inbox N
- taskq profile [guide|export|tasks|board] [--since 24h] | taskq retro | taskq add --retro K [--type T ..]
+ taskq profile [guide|export|tasks|board|actions|health] [--since 24h] | taskq retro | taskq add --retro K [--type T ..]
  taskq wait [--window MIN] [--only L,..]
  taskq cleanup [--force] | taskq update [--check]
  taskq enroll <https-url> [--headless] | taskq connection status | taskq disconnect
@@ -804,6 +804,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
     loop {
         let pass_began=Instant::now();
         let poke_start = poke_times(&pokes);
+        telemetry::diagnostic::poll(&cfg.install);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Res<()> {
         let control = control::snapshot(&cfg.root,&mut observed_poke,&mut observed_command);
         let command=match &control {Ok(snapshot)=>snapshot.command.clone(),Err(e)=>json!({"state":"unknown","reason":e})};
@@ -909,7 +910,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             ("execution_waits", json!(s.execution_waits)), ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
             ("restart_waits", json!(d.join("restart").exists().then(|| restart_waits(&s, &cfg.root)))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root))),
-            ("requests", requests_json), ("connection", json!(dashq.outcome))]
+            ("requests", requests_json), ("connection", json!(dashq.outcome)), ("telemetry",telemetry::diagnostic::health())]
         {
             status[k] = v;
         }
@@ -2045,6 +2046,12 @@ fn restart_watch(since: &mut Option<u64>, empty_restart: bool, elapsed: u64, int
 #[tracing::instrument(name="run",skip_all)]
 fn run(argv: &[String]) -> Res<()> {
     let a = Args::parse(argv)?;
+    telemetry::diagnostic::poll(&platform::default_install());
+    if let Some(selector)=a.one("diagnose") {
+        let milliseconds=a.one("diagnose-ms").unwrap_or("60000").parse::<u64>().map_err(|_|"invalid --diagnose-ms")?;
+        let limit=a.one("diagnose-limit").unwrap_or("256").parse::<u64>().map_err(|_|"invalid --diagnose-limit")?;
+        telemetry::diagnostic::select(selector,Duration::from_millis(milliseconds),limit)?;
+    } else if a.one("diagnose-ms").is_some() || a.one("diagnose-limit").is_some() {return Err("diagnostic limits require --diagnose".into());}
     if a.pos.is_empty() || a.pos.first().is_some_and(|s| s == "help") || a.pos.iter().any(|s| s == "-h") || a.flags.contains_key("help") {
         println!("{USAGE}");
         return Ok(());
@@ -2055,6 +2062,13 @@ fn run(argv: &[String]) -> Res<()> {
     }
     match cmd {
         "profile" => match a.pos.get(1) {
+            Some(v) if v=="diagnose" => {
+                let pid=a.need("pid")?.parse().map_err(|_|"invalid --pid")?;
+                let period=a.one("duration-ms").unwrap_or("60000").parse().map_err(|_|"invalid --duration-ms")?;
+                let limit=a.one("limit").unwrap_or("256").parse().map_err(|_|"invalid --limit")?;
+                let request=telemetry::diagnostic::request(&platform::default_install(),pid,a.need("selector")?,period,limit)?;
+                println!("Diagnostic selection requested: {request}; verify target status/export; no application acknowledgment yet");Ok(())
+            }
             None if a.one("since").is_some() => Err("--since needs a view: taskq profile export|tasks|board --since 24h".into()),
             None => { print!("{}", profile::report(&platform::default_install())); Ok(()) }
             Some(v) => { print!("{}", profile::view(&platform::default_install(), v, a.one("since"))?); Ok(()) }

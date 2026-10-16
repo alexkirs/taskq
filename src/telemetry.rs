@@ -1,5 +1,6 @@
 //! Installation-local telemetry. All storage mutations share the installation budget lock; export is read-only.
 mod semantic;
+pub(crate) mod diagnostic;
 #[cfg(test)]
 mod source;
 

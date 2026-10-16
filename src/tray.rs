@@ -733,6 +733,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
     let mut shot_wait=None;
     let mut web=WebCalls::new();
     event_loop.run(move |event, target, flow| {
+        crate::telemetry::diagnostic::poll(&install);
         *flow = ControlFlow::Wait;
         web.expire(Instant::now());
         if web.failed && !web.notified {

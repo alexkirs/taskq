@@ -29,3 +29,6 @@ For Resume, follow `taskq.resume` to its `taskq.poke` span, then a `taskq.contin
 Report shape for the owner: one line per question, the number with its unit and window, then the unknowns with reasons. Example (invented): `Build p95 on claude: 412 s over 18 attempts (retained 21 h); context tokens 2.1 M (17 of 18 known; no-usage); calls on codex not reported; attempt elapsed time unknown (gap G2); cost unknown (no price).`
 
 Named gaps G1–G4: no windowed bare report, per-attempt elapsed-time view, monetary cost, or context-source breakdown. These values remain unknown.
+
+
+For command diagnostics, append `--diagnose <method-prefix|*> --diagnose-ms 10000 --diagnose-limit 128` to the command being investigated. Selection expires within60s or256 admitted calls. For an existing service/tray, use `taskq profile diagnose --pid N --selector PREFIX --duration-ms 60000 --limit 256`; inspect its status telemetry.control.applied_request before claiming application. Use `taskq profile health` for the current collector and `taskq profile actions --since 30m` for committed action/error rankings. An unresolved start stays unknown. Health is scoped to its recorded process; missing historical collection evidence is unknown.

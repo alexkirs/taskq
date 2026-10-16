@@ -174,3 +174,7 @@ These are acceptance targets, not claims about the installed release. Shared mod
 - Verify missing permissions, network refusal/timeout, child exit/panic, store contention/full/corruption, collector death, export outage and crash recovery. Each yields a scoped outcome or visible uncertainty; emergency stop remains usable. Remote export outage does not stop local collection or task execution.
 - Required command receipts must distinguish received, applied, observed and superseded. Never acknowledge durable acceptance before commit; inability to persist required receipts has an explicit command failure policy. Receipts cannot become a second source of task truth.
 - Readiness requires real installed Mac/Windows/FRA chains, current running process/client versions, actual spec precedence/freshness and context/compression evidence, plus an isolated controlled task through result/review. Keep production holds until owner release.
+
+## Bounded external commands
+
+Runtime CLI probes use shared coreq command execution:10s for execution plus output drain,1MiB combined stdout/stderr, with precise spawn/exit/timeout/output/cleanup observations under the caller trace. Missing or incomplete output remains unknown. Service/update deadlines belong to [coreq bounded command execution](https://github.com/taskqorg/coreq/blob/main/coreq.md#bounded-command-execution). No input, arguments, credentials or output is exported. Direct-child cleanup stays owned; detached worker trees and native action completion still require their own lifecycle qualification.

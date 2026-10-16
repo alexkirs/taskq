@@ -401,7 +401,7 @@ mod tests {
         use std::process::{Command, Stdio};
         let root = std::env::temp_dir().join(format!("qi-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        for mode in ["baseline", "capture"] {
+        for mode in ["baseline", "capture", "expired"] {
             let log = root.join(format!("{mode}.log"));
             let output = std::fs::File::create(&log).unwrap();
             let mut child = Command::new(std::env::current_exe().unwrap())
@@ -421,14 +421,18 @@ mod tests {
             assert!(status.is_some_and(|s| s.success()), "{mode}: icon/flush failed or exceeded20s; evidence {}", log.display());
         }
         assert_eq!(std::fs::read(root.join("baseline.png")).unwrap(), std::fs::read(root.join("capture.png")).unwrap());
+        assert_eq!(std::fs::read(root.join("baseline.png")).unwrap(), std::fs::read(root.join("expired.png")).unwrap());
         if !cfg!(debug_assertions) {
             let p95 = |mode: &str| {
                 let mut values: Vec<u64> = serde_json::from_slice(&std::fs::read(root.join(format!("{mode}.json"))).unwrap()).unwrap();
                 assert_eq!(values.len(), 30); values.sort_unstable(); values[28]
             };
-            let (baseline, captured) = (p95("baseline"), p95("capture"));
-            eprintln!("30 renders p95: baseline={baseline}us capture={captured}us");
-            assert!(captured <= baseline + 1000.max(baseline / 20), "normal capture exceeded the operation budget; evidence {}", root.display());
+            let baseline = p95("baseline");
+            for mode in ["capture", "expired"] {
+                let captured = p95(mode);
+                eprintln!("30 renders p95: baseline={baseline}us {mode}={captured}us");
+                assert!(captured <= baseline + 1000.max(baseline / 20), "{mode} capture exceeded the operation budget; evidence {}", root.display());
+            }
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -438,7 +442,12 @@ mod tests {
     fn first_icon_capture_child() {
         let root = std::path::PathBuf::from(std::env::var_os("TASKQ_ICON_PROBE").unwrap());
         let mode = std::env::var("TASKQ_ICON_PROBE_MODE").unwrap();
-        let runtime = (mode == "capture").then(|| coreq::telemetry::capture::Runtime::install(&root.join("db"), "taskq", "fixture").unwrap());
+        let db = root.join(format!("{mode}.db"));
+        let runtime = (mode != "baseline").then(|| coreq::telemetry::capture::Runtime::install(&db, "taskq", "fixture").unwrap());
+        if mode == "expired" {
+            coreq::telemetry::capture::diagnose("unused", std::time::Duration::from_nanos(1), 1).unwrap();
+            assert_eq!(coreq::telemetry::capture::qualify().unwrap()["diagnostics"]["state"], "expired");
+        }
         let mut timings = Vec::new();
         for n in 0..30 {
             let began = std::time::Instant::now();
@@ -452,7 +461,7 @@ mod tests {
         std::fs::write(root.join(format!("{mode}.json")), serde_json::to_vec(&timings).unwrap()).unwrap();
         if runtime.is_some() {
             eprintln!("capture: {}", coreq::telemetry::capture::qualify().unwrap());
-            let reader = coreq::telemetry::Reader::open(&root.join("db")).unwrap();
+            let reader = coreq::telemetry::Reader::open(&db).unwrap();
             let exported = reader.export(0, 0, 1024).unwrap();
             let rows = exported["events"].as_array().unwrap();
             assert_eq!(rows.iter().filter(|r| r["observation"]["operation"] == "taskq.icon.compact" && r["observation"]["kind"] == "method").count(), 30);

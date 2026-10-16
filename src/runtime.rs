@@ -894,7 +894,7 @@ pub struct ClaudeTurn {
 
 fn claude_agents(root: &Path) -> Result<Vec<serde_json::Value>, String> {
     let root = root.to_str().ok_or("Claude project path is not UTF-8")?;
-    let (ok, out) = probe(&which("claude"), &["agents", "--json", "--all", "--cwd", root]).ok_or("Claude agents unavailable or timed out")?;
+    let (ok, out) = probe("runtime.agents", &which("claude"), &["agents", "--json", "--all", "--cwd", root]).ok_or("Claude agents unavailable or timed out")?;
     if !ok { return Err(format!("claude agents: {out}")); }
     serde_json::from_str(&out).map_err(|e| format!("claude agents: {e}"))
 }
@@ -929,7 +929,7 @@ fn claude_stop(root: &Path, id: &str, known_pid: u32) -> Result<(), String> {
     let row = rows.iter().find(|v| v["id"] == id).ok_or("Claude stop identity unavailable")?;
     let pid = row["pid"].as_u64().unwrap_or(known_pid as u64) as u32;
     if row["pid"].as_u64().is_none() && (pid == 0 || !alive(pid)) && row["state"] != "working" { return Ok(()); }
-    let (ok, out) = probe(&which("claude"), &["stop", id]).ok_or("Claude stop unavailable or timed out; state unknown")?;
+    let (ok, out) = probe("runtime.stop", &which("claude"), &["stop", id]).ok_or("Claude stop unavailable or timed out; state unknown")?;
     if !ok { return Err(format!("claude stop: {out}")); }
     // Native stop acknowledges the request before the process has actually stopped.
     for _ in 0..50 {
@@ -1170,42 +1170,17 @@ fn completes(rollout: &Path) -> usize {
 
 // ---------- `taskq agents` (taskq.md § 5): read-only probes, unknown when unreadable (R12) ----------
 
-/// Exit success and stdout + stderr of a read-only subcommand; None when it cannot start or runs over 10 s.
-fn probe(bin: &Path, args: &[&str]) -> Option<(bool, String)> {
-    probe_within(bin, args, std::time::Duration::from_secs(10))
+/// Exit success and bounded stdout + stderr; incomplete execution/output remains unknown.
+fn probe(name: &'static str, bin: &Path, args: &[&str]) -> Option<(bool, String)> {
+    probe_within(name, bin, args, std::time::Duration::from_secs(10))
 }
 
-/// None when the run or its output outlasts `budget`. Readers are never joined: a grandchild that inherits the pipes
-/// keeps them open after the child exits or is killed (#1114), and the service pass must not wait for it.
-fn probe_within(bin: &Path, args: &[&str], budget: std::time::Duration) -> Option<(bool, String)> {
-    let deadline = std::time::Instant::now() + budget;
-    let mut c = Command::new(bin);
-    c.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut ch = crate::platform::quiet(&mut c).spawn().ok()?;
-    // Drain both pipes while waiting: agents --all can exceed an OS pipe buffer.
-    let (tx, rx) = std::sync::mpsc::channel();
-    let read = |i: usize, mut pipe: Box<dyn std::io::Read + Send>| {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = tx.send((i, pipe.read_to_end(&mut bytes).ok().map(|_| bytes)));
-        });
+fn probe_within(name: &'static str, bin: &Path, args: &[&str], budget: std::time::Duration) -> Option<(bool, String)> {
+    let out = match coreq::process::output(name, Command::new(bin).args(args), budget) {
+        Ok(out) | Err(coreq::process::Failure::Exit(out)) => out,
+        Err(_) => return None,
     };
-    read(0, Box::new(ch.stdout.take()?));
-    read(1, Box::new(ch.stderr.take()?));
-    let status = loop {
-        match ch.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(100)),
-            _ => { let _ = ch.kill(); let _ = ch.wait(); return None; }
-        }
-    };
-    let mut pipes = [Vec::new(), Vec::new()];
-    for _ in 0..2 {
-        let (i, bytes) = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).ok()?;
-        pipes[i] = bytes?;
-    }
-    Some((status.success(), format!("{}{}", String::from_utf8_lossy(&pipes[0]), String::from_utf8_lossy(&pipes[1]))))
+    Some((out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))))
 }
 
 /// The first word of `--version` output that starts with a digit: `2.1.3 (Claude Code)`, `codex-cli 0.15.3`.
@@ -1250,8 +1225,8 @@ pub fn agents() -> serde_json::Value {
             if !p.is_absolute() {
                 return serde_json::json!({"path": null, "version": null, "login": "not installed", "account": null});
             }
-            let ver = probe(&p, &["--version"]).and_then(|(_, o)| version(&o));
-            let (state, account) = login(bin, probe(&p, if bin == "claude" { &["auth", "status"] } else { &["login", "status"] }));
+            let ver = probe("runtime.version", &p, &["--version"]).and_then(|(_, o)| version(&o));
+            let (state, account) = login(bin, probe("runtime.login", &p, if bin == "claude" { &["auth", "status"] } else { &["login", "status"] }));
             serde_json::json!({"path": p.display().to_string(), "version": ver, "login": state, "account": account})
         }).clone();
         row["runtime"] = serde_json::json!(rt);
@@ -1309,7 +1284,7 @@ mod tests {
         for (name, body, want) in [("ok", "echo 1.2.3".to_string(), Some("1.2.3")), ("hang", format!("echo 1.2.3\n{hang}"), None),
             ("fork", format!("{fork}\necho 1.2.3"), None)] {
             let t = std::time::Instant::now();
-            let got = probe_within(&script(name, &body.replace('\n', if cfg!(windows) { "\r\n" } else { "\n" })), &["--version"], std::time::Duration::from_secs(2));
+            let got = probe_within("runtime.version", &script(name, &body.replace('\n', if cfg!(windows) { "\r\n" } else { "\n" })), &["--version"], std::time::Duration::from_secs(2));
             assert_eq!(got.as_ref().map(|(ok, out)| (*ok, out.trim())), want.map(|v| (true, v)), "{name}");
             assert!(t.elapsed() < std::time::Duration::from_secs(5), "{name}: {:?}", t.elapsed());
         }

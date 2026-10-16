@@ -116,7 +116,7 @@ fn project_run_waits_for_the_host_owner() {
         let until=std::time::Instant::now()+Duration::from_secs(10);
         let observed=loop {
             let text=fs::read_to_string(&log).unwrap();
-            if text.contains("host service pid")&&text.contains("already running; waiting") {break true;}
+            if text.lines().any(|line|line.contains("host service")&&line.contains("waiting")) {break true;}
             if child.try_wait().unwrap().is_some()||std::time::Instant::now()>=until {break false;}
             std::thread::sleep(Duration::from_millis(10));
         };

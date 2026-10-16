@@ -5,6 +5,7 @@ Status: design detail for the adopted host model in [taskq.md](../../taskq.md). 
 ## Decision
 
 - One unit per host: `com.taskq.service` (launchd), `TaskQ` (Task Scheduler), `taskq.service` (systemd user). It runs `<install>/taskq service run` with `<install>` as working directory.
+- Startup owns the existing CoreQ native lock at `<install>/service.lock` for the whole run. PID publication is a projection; it cannot serialize simultaneous startup. Keep the lock through cleanup and every project thread; restart reconciliation never treats record age as exit.
 - The process serves every root listed in `<install>/projects`, one project thread each.
 - Host-wide parts run once, in process: admission, the GitHub request budget and rate-limit pause, the update check and re-exec, the tray spawner, the profile appender, hourly request records and bounded log pruning.
 - Per-project parts stay per project: `taskq.json`, `<root>/.taskq/` (`status.json`, `events`, `focus`, `focus.paused`, legacy `kids`, `poke`, `update`, `requests/`, `requests.log`, `incidents/`, attempt logs, `cli-errors.log`, `pm-cursor`, specq cache), worktrees, the project log `<install>/<project>.log` and one heartbeat issue per board.

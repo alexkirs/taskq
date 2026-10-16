@@ -254,7 +254,7 @@ pub fn sweep(install: &Path, shim: &Path) {
         match version {Ok(version)=>keep.push(version),Err(_)=>unknown=true}
     }
     let owned = |n: &str| {
-        ["releases", "current", "previous", "projects", "token", "installation-id", "connection", "taskq", "taskq.exe", "WebView2Loader.dll", "taskq-tray.exe", "TaskQ.app", "capacity", "resources", "windows-native", crate::policy::FILE, "taskq-profile.lock", "hold", "admission.json", "admission.lock", "update.lock", "host.json", "host.json.pending", "host-policy-migration", "native", "service", "poke", "restart", "update", "projects.lock", "projects.pending", "rollback-floor"].contains(&n)
+        ["releases", "current", "previous", "projects", "token", "installation-id", "connection", "taskq", "taskq.exe", "WebView2Loader.dll", "taskq-tray.exe", "TaskQ.app", "capacity", "resources", "windows-native", crate::policy::FILE, "taskq-profile.lock", "hold", "admission.json", "admission.lock", "update.lock", "host.json", "host.json.pending", "host-policy-migration", "native", "service", "service.lock", "poke", "restart", "update", "projects.lock", "projects.pending", "rollback-floor"].contains(&n)
             || n.ends_with(".log") || n.ends_with(".tmp") || n.starts_with("tray") || (n.starts_with("TaskQ-") && n.ends_with(".xml"))
     };
     let gone = |p: &Path| {
@@ -649,7 +649,7 @@ mod tests {
         fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
         // H-A5: update keeps policy, interrupted writes, exact native recovery and the qualified rollback floor.
         let protected=[("host.json","{\"limits\":{\"codex\":2},\"owner_field\":\"keep\"}"),
-            ("host.json.pending","interrupted policy; preserve"),("service","123"),("poke","wake"),
+            ("host.json.pending","interrupted policy; preserve"),("service","123"),("service.lock",""),("poke","wake"),
             ("restart","restart requested"),("update","update requested"),("projects.lock",""),("projects.pending","retained registry prepare")];
         for (name,text) in protected {fs::write(install.join(name),text).unwrap();}
         fs::create_dir_all(install.join("host-policy-migration")).unwrap();

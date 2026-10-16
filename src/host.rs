@@ -281,19 +281,16 @@ impl Host {
     }
 }
 
-/// A fresh pid file names another live daemon. A malformed fresh record is unknown, never permission to start.
+/// A prior recorded owner must have exited; record age never proves that. The PID record is a projection.
 pub fn other(install: &Path) -> Res<Option<u32>> {
-    let path = install.join("service");
-    match fs::metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("host service pid unknown: {e}")),
-        Ok(m) => {
-            if m.modified().and_then(|t| t.elapsed().map_err(std::io::Error::other)).map_err(|e| e.to_string())?.as_secs() > 60 { return Ok(None); }
-        }
-    }
-    let pid = fs::read_to_string(path).map_err(|e| e.to_string())?.trim().parse::<u32>().map_err(|_| "host service pid unknown: malformed record")?;
-    if pid == 0 { return Err("process liveness unknown: invalid pid".into()); }
-    Ok((pid != std::process::id() && crate::runtime::liveness(pid)?).then_some(pid))
+    let text=match fs::read_to_string(install.join("service")) {
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+        Err(e)=>return Err(format!("host service pid unknown: {e}")),
+        Ok(text)=>text,
+    };
+    let pid=text.trim().parse::<u32>().map_err(|_|"host service pid unknown: malformed record")?;
+    if pid==0 {return Err("process liveness unknown: invalid pid".into());}
+    Ok((pid!=std::process::id() && crate::runtime::liveness(pid)?).then_some(pid))
 }
 
 /// Legacy roots are never served concurrently, even when their status has gone stale. Unknown holds admission.
@@ -324,16 +321,27 @@ fn startup_status(install: &Path, root: &Path, error: &str) -> Res<()> {
     coreq::status::write(&crate::platform::tool(install), root, &status)
 }
 
+fn owner(install:&Path)->Res<Option<coreq::file_lock::Lock>> {
+    if other(install)?.is_some() {return Ok(None);}
+    match coreq::file_lock::try_lock(&install.join("service.lock")) {
+        Ok(lock)=>Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock)=>Ok(None),
+        Err(e)=>Err(format!("host service owner lock unknown: {e}")),
+    }
+}
+
 pub fn run(install: &Path) -> Res<()> {
     fs::create_dir_all(install).map_err(|e| e.to_string())?;
-    loop {
-        match other(install) {
-            Ok(None) => break,
-            Ok(Some(pid)) => crate::platform::log(&format!("host service pid {pid} already running; waiting")),
-            Err(e) => crate::platform::log(&format!("{e}; waiting")),
-        }
+    let mut reported=String::new();
+    let _owner=loop {
+        let message=match owner(install) {
+            Ok(Some(owner))=>break owner,
+            Ok(None)=>"host service owner already active; waiting".into(),
+            Err(e)=>format!("{e}; waiting"),
+        };
+        if message!=reported {crate::platform::log(&message);reported=message;}
         std::thread::sleep(std::time::Duration::from_secs(1));
-    }
+    };
     let shared = Arc::new(Mutex::new(Host::new(Policy::read(install))));
     let mut threads: BTreeMap<PathBuf, std::thread::JoinHandle<Res<()>>> = BTreeMap::new();
     let mut roots = vec![];
@@ -700,6 +708,47 @@ mod tests {
         Policy::parse(json!({"limits": {"codex": 2}, "admission": {"max": 2}, "load_gate": {"enabled": false}}), "invented").unwrap()
     }
 
+    // H-A1: an owner before PID publication excludes a second process, survives sweep, and releases on exit.
+    #[test]
+    fn one_host_owner_before_heartbeat_publication() {
+        let base=temp("host-owner");let install=base.join("install");fs::create_dir(&install).unwrap();
+        let (first,second)=(base.join("first"),base.join("second"));
+        let mut holder=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","host::tests::owner_probe","--ignored"])
+            .env("TASKQ_OWNER_INSTALL",&install).env("TASKQ_OWNER_MARKER",&first).env("TASKQ_OWNER_HOLD","1")
+            .stdout(std::process::Stdio::null()).stderr(fs::File::create(base.join("owner.stderr")).unwrap()).spawn().unwrap();
+        let until=Instant::now()+std::time::Duration::from_secs(5);
+        while !first.is_file() && holder.try_wait().unwrap().is_none() && Instant::now()<until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let entered=fs::read_to_string(&first).unwrap_or_default();
+        crate::platform::sweep(&install,&base.join("absent-shim"));
+        let probe=coreq::process::output("test.host-owner",std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","host::tests::owner_probe","--ignored"])
+            .env("TASKQ_OWNER_INSTALL",&install).env("TASKQ_OWNER_MARKER",&second).env_remove("TASKQ_OWNER_HOLD"),
+            std::time::Duration::from_secs(5));
+        if holder.try_wait().unwrap().is_none() {holder.kill().unwrap();holder.wait().unwrap();}
+        let observed=fs::read_to_string(&second).unwrap_or_default();
+        let released=owner(&install).unwrap();let freed=released.is_some();
+        drop(released);
+        let diagnostic=fs::read_to_string(base.join("owner.stderr")).unwrap_or_default();
+        fs::remove_dir_all(base).unwrap();
+        assert_eq!(entered,"claimed","first owner never reached the controlled startup boundary: {diagnostic}");
+        probe.unwrap();
+        assert_eq!(observed,"blocked","two processes claimed the host before its PID was published");
+        assert!(freed,"native owner exit did not release ownership");
+    }
+
+    #[test]
+    #[ignore="owned native process for one_host_owner_before_heartbeat_publication"]
+    fn owner_probe() {
+        let install=PathBuf::from(std::env::var_os("TASKQ_OWNER_INSTALL").unwrap());
+        let claim=owner(&install).unwrap();
+        let marker=PathBuf::from(std::env::var_os("TASKQ_OWNER_MARKER").unwrap());
+        crate::platform::write_atomic(&marker,if claim.is_some(){"claimed"}else{"blocked"}).unwrap();
+        if std::env::var_os("TASKQ_OWNER_HOLD").is_some() && claim.is_some() {loop {std::thread::park();}}
+    }
+
     // H-A3: acknowledged policy replacement survives killing its writer, preserving unrelated policy fields.
     #[test]
     fn acknowledged_policy_survives_writer_termination() {
@@ -917,6 +966,11 @@ mod tests {
         assert_eq!(fs::read_to_string(crate::dot(&install).join("status.json")).unwrap(), legacy_status, "startup failure cannot overwrite a live legacy pid");
         assert!(legacy(&[install.clone()]).is_err());
         fs::write(install.join("service"), child.id().to_string()).unwrap(); assert_eq!(other(&install).unwrap(), Some(child.id()));
+        let stale=std::time::SystemTime::now()-std::time::Duration::from_secs(120);
+        fs::OpenOptions::new().write(true).open(install.join("service")).unwrap()
+            .set_times(fs::FileTimes::new().set_modified(stale)).unwrap();
+        assert_eq!(other(&install).unwrap(),Some(child.id()),"stale heartbeat cannot release a live service owner");
+
         fs::write(install.join("service"), std::process::id().to_string()).unwrap(); assert_eq!(other(&install).unwrap(), None);
         fs::write(install.join("service"), "bad").unwrap(); assert!(other(&install).unwrap_err().contains("unknown"));
         fs::write(install.join("projects"), format!("{}\n", install.display())).unwrap();

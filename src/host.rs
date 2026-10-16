@@ -345,7 +345,6 @@ pub fn run(install: &Path) -> Res<()> {
     let mut registry = Registry::default();
     loop {
         if let Err(e) = crate::profile::prune(install) { eprintln!("taskq: telemetry unknown: {e}"); }
-        crate::data::trim_tail(&install.join("taskq.log"), crate::data::LOG_MAX);
         crate::platform::write_atomic(&install.join("service"), &format!("{}\n", std::process::id()))?;
         registry.refresh(install, began.elapsed().as_secs());
         roots.clone_from(&registry.roots);

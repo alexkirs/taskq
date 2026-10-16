@@ -869,7 +869,6 @@ impl<'a> Service<'a> {
     pub fn pass(&mut self) -> Result<(), String> {
         if self.host.is_none() {
             if let Err(e) = crate::profile::prune(&self.cfg.install) { eprintln!("taskq: telemetry unknown: {e}"); }
-            crate::data::trim_tail(&self.cfg.install.join("taskq.log"), crate::data::LOG_MAX);
         }
         let r = crate::profile::measure("service.pass", || self.pass_inner(NATIVE_PASS_BUDGET));
         if r.is_err() { self.unready(); }
@@ -1871,11 +1870,15 @@ mod tests {
             text.push_str(&terminal);
             std::fs::write(&path, &text).unwrap();
             let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-            crate::profile::prune(&root).unwrap();
+            {
+                let _lock=crate::profile::log_lock(&path).unwrap();
+                let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                crate::telemetry::read(&root,now).unwrap();
+            }
             assert!(crate::profile::selftest(&root, "o/r", &vec![], 300).is_ok(), "legacy log size no longer stops collection");
             let lock = crate::profile::log_lock(&path).unwrap();
             s.pass().unwrap();
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "busy lock preserves evidence");
+            assert!(std::fs::read_to_string(&path).unwrap()==text, "busy lock preserves evidence");
             drop(lock);
             let (_capture,_guard)=crate::profile::tests::collecting(&root);
             s.pass().unwrap();

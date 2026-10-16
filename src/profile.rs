@@ -586,7 +586,8 @@ pub(crate) fn read_log(install: &Path) -> Result<String, String> {
 pub fn prune(install: &Path) -> Result<(), String> {
     fs::create_dir_all(install).map_err(|e| e.to_string())?;
     let _lock = acquire_log_lock(&install.join("taskq.log"), true).map_err(|e| e.to_string())?;
-    crate::telemetry::prune(install, now_ms().ok_or("telemetry clock unknown")?)
+    crate::telemetry::prune(install, now_ms().ok_or("telemetry clock unknown")?)?;
+    crate::data::trim_tail_locked(&install.join("taskq.log"),crate::data::LOG_MAX).map(|_|())
 }
 
 pub fn report(install: &Path) -> String {

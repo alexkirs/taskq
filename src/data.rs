@@ -42,18 +42,28 @@ const FOCUS_MAX: u64 = 4096;
 /// the launcher and the service's own stderr append to the open file.
 pub fn trim_tail(p: &Path, max: u64) -> bool {
     let profile_log = p.file_name().is_some_and(|n| n == "taskq.log");
-    let threshold = if profile_log { max.saturating_sub(512) } else { max };
     let _profile_lock = if profile_log {
         match crate::profile::log_lock(p) { Ok(lock) => Some(lock), Err(_) => return false }
     } else { None };
-    if fs::metadata(p).is_ok_and(|m| m.len() <= threshold) {
-        return false;
+    trim_tail_locked(p,max).unwrap_or(false)
+}
+
+/// Caller owns the profile lock for taskq.log; keep import and in-place rotation in that same critical section.
+pub(crate) fn trim_tail_locked(p: &Path, max: u64) -> Result<bool,String> {
+    let profile_log=p.file_name().is_some_and(|n|n=="taskq.log");
+    let threshold=if profile_log {max.saturating_sub(512)} else {max};
+    match fs::metadata(p) {
+        Ok(meta) if meta.len()<=threshold=>return Ok(false),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(false),
+        Err(e)=>return Err(format!("log retention: {e}")),
+        Ok(_)=>{},
     }
-    if profile_log && crate::telemetry::read(p.parent().unwrap(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)).is_err() { return false; }
-    let Ok(b) = fs::read(p) else { return false };
-    let tail = &b[b.len().saturating_sub((max / 2) as usize)..];
-    let tail = tail.iter().position(|c| *c == b'\n').map_or(tail, |i| &tail[i + 1..]);
-    fs::write(p, tail).is_ok()
+    if profile_log {crate::telemetry::read(p.parent().unwrap(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0,|d|d.as_millis() as u64))?;}
+    let b=fs::read(p).map_err(|e|format!("log retention: {e}"))?;
+    let tail=&b[b.len().saturating_sub((max/2) as usize)..];
+    let tail=tail.iter().position(|c|*c==b'\n').map_or(tail,|i|&tail[i+1..]);
+    fs::write(p,tail).map_err(|e|format!("log retention: {e}"))?;
+    Ok(true)
 }
 
 /// Remove the files of `dir` that `pick` names beyond the `n` newest by mtime, except those `keep` names. Returns

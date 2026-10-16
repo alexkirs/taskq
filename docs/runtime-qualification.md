@@ -6,6 +6,12 @@ Verify supported TaskQ capabilities through observable outcomes. [R9, R12 and ru
 
 Operator inspection commands and tray status/selftest/setup exchanges use the shared CoreQ executor through `platform::output`. Complete nonzero output remains available for receipt parsing; spawn, timeout, capacity and incomplete output return an explicit unknown with the original native error. Inspection/status/selftest use30s; board mutation/setup use60s. The process trace keeps the failure even when a caller handles it. An OS opener records submission only; it does not claim that the target window appeared. Interactive pickers and resource terminals have their own human-driven lifetime and are not short exchanges.
 
+## Native observation budget (contract detail)
+
+Each normal or reduced project pass admits native recovery, liveness and cancellation observations within20s of native work. A native dependency call uses the remaining deadline, up to its existing per-call bound. Stop admitting another observation when the budget expires; retain its handle/reservation and report `unknown` with a named deferred-observation reason. Rotate the next owned execution and cold-recovery candidate so a slow first item cannot starve the rest. This is scheduling state in the existing service, never a new task journal or an exit proof. A deferred observation cannot authorize replacement. Explicit emergency control retains its existing owned cancellation path.
+
+The next poll is due from pass start, subtracting work time rather than adding a full sleep after it. The service continues to publish aggregate status on its60s target; unavailable board access remains stale/unknown. Budgeting cannot make kernel/filesystem calls or OS scheduling hard real-time, and installed cadence still requires native load qualification. A freshly published host heartbeat does not turn a deferred execution observation healthy.
+
 ## Execution policy
 
 One bounded live scenario covers each applicable runtime, role and continuation. Run it when that integration, permission configuration or client version changes, not on every commit or documentation edit. Record exact versions, effective permissions, initial state, actions, observed output and remaining gaps. A prior pass qualifies only its recorded configuration.

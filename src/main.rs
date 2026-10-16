@@ -653,12 +653,13 @@ fn poke_times(paths: &[PathBuf; 2]) -> [Option<SystemTime>; 2] {
 }
 
 /// Compare with the pre-pass snapshot: a command arriving during work must not become the sleep baseline.
-fn sleep_until_poke(paths: &[PathBuf; 2], start: [Option<SystemTime>; 2], secs: u64, tick: &mut dyn FnMut()) {
-    for _ in 0..secs {
-        if poke_times(paths) != start {
+fn sleep_until_poke(paths: &[PathBuf; 2], start: [Option<SystemTime>; 2], until: Instant, tick: &mut dyn FnMut()) {
+    loop {
+        let left=until.saturating_duration_since(Instant::now());
+        if left.is_zero() || poke_times(paths) != start {
             return;
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(1).min(left));
         tick();
     }
 }
@@ -801,6 +802,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
     let mut observed_poke = None;
     let mut observed_command = None;
     loop {
+        let pass_began=Instant::now();
         let poke_start = poke_times(&pokes);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Res<()> {
         let control = control::snapshot(&cfg.root,&mut observed_poke,&mut observed_command);
@@ -1009,7 +1011,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             publish_status(&tool, &cfg.root, &status, host.as_ref());
         };
         tick();
-        sleep_until_poke(&pokes, poke_start, if reduced { 1 } else { cfg.poll }, &mut tick);
+        sleep_until_poke(&pokes, poke_start, pass_began+Duration::from_secs(if reduced {1} else {cfg.poll}), &mut tick);
         Ok(())
         }));
         match outcome {
@@ -4070,6 +4072,18 @@ mod tests {
     }
 
     // Chain: § 5 error diagnostics. Risk: a compact error loses its full diagnostic.
+    // Risk: adding a full poll after native work drifts heartbeat cadence; a pre-pass poke must still wake it.
+    #[test]
+    fn completed_pass_does_not_add_another_poll_interval() {
+        let dir=std::env::temp_dir().join(format!("taskq-poll-{}",runtime::uuid()));fs::create_dir(&dir).unwrap();
+        let paths=[dir.join("project"),dir.join("host")];let before=poke_times(&paths);
+        let mut ticks=0;let began=Instant::now();
+        sleep_until_poke(&paths,before,began-Duration::from_secs(1),&mut ||ticks+=1);
+        fs::write(&paths[0],"wake").unwrap();
+        sleep_until_poke(&paths,before,began+Duration::from_secs(60),&mut ||ticks+=1);
+        assert_eq!(ticks,0);assert!(began.elapsed()<Duration::from_secs(1));fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn compact_errors_retain_complete_diagnostics() {
         let root = std::env::temp_dir().join(format!("taskq-error-{}", std::process::id()));

@@ -37,6 +37,7 @@ pub const HOST_LABEL: &str = "taskq-host";
 /// The capacity reason of an empty focus (§ 4).
 pub const FOCUS_OFF: &str = "focus off: nothing admitted; set `taskq service focus all|<label..>`";
 pub const TASK_LABEL: &str = "taskq";
+const NATIVE_PASS_BUDGET:std::time::Duration=std::time::Duration::from_secs(20);
 
 /// Only issues labelled `taskq` are tasks (§ 1): a user issue never starts by itself.
 pub fn is_task(i: &Issue) -> bool {
@@ -319,6 +320,7 @@ pub struct Service<'a> {
     /// Remote Control URL of each live Claude child by attempt, read once from its transcript (§ 4 heartbeat `session`).
     sessions: HashMap<u64, String>,
     reduced_at: Option<u64>,
+    recovery_after: Option<u64>,
 }
 
 const MONTH: i64 = 30 * 86400;
@@ -541,7 +543,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { reduced_at: None, host: None, wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg: cfg.clone(), version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, recover: None, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, observations: BTreeMap::new(), owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), execution_waits: BTreeMap::new(), pending_releases: BTreeSet::new(), stopping: BTreeSet::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
+        Service { recovery_after: None, reduced_at: None, host: None, wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg: cfg.clone(), version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, recover: None, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, observations: BTreeMap::new(), owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), execution_waits: BTreeMap::new(), pending_releases: BTreeSet::new(), stopping: BTreeSet::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
     }
 
     /// Rebuild board-derived state after unwind; live handles, pending launches and delivery cursors stay owned.
@@ -579,11 +581,19 @@ impl<'a> Service<'a> {
     }
 
     /// Liveness monitoring never frees ownership before the exact execution release is read back.
-    pub fn reap_owned(&mut self) {
+    pub fn reap_owned(&mut self) {self.reap_owned_within(NATIVE_PASS_BUDGET);}
+
+    fn reap_owned_within(&mut self,budget:std::time::Duration) {
+        let until=std::time::Instant::now()+budget;
+        let mut deferred=None;
         self.kids.retain_mut(|k| {
-            let status = k.proc.exited();
+            if std::time::Instant::now()>=until {
+                deferred.get_or_insert(k.execution);
+                self.unknown.insert(k.attempt,"native observation deferred; reduced pass budget exhausted".into());return true;
+            }
+            let status = crate::runtime::observe_until(until,||k.proc.exited());
             let mut acceptance_unknown = false;
-            match k.proc.accepted() {
+            match crate::runtime::observe_until(until,||k.proc.accepted()) {
                 Ok(true) => match accept_execution(self.board,k.task,k.attempt,k.execution) {
                     Ok(through) => { self.delivered.entry(k.attempt).and_modify(|v| *v = (*v).max(through)).or_insert(through); },
                     Err(e) => { self.unknown.insert(k.attempt,e); return true; }
@@ -603,6 +613,7 @@ impl<'a> Service<'a> {
             Err(e) => { self.unknown.insert(k.attempt, e); true }
             }
         });
+        if let Some(first)=deferred.and_then(|id|self.kids.iter().position(|k|k.execution==id)) {self.kids.rotate_left(first);}
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -848,7 +859,7 @@ impl<'a> Service<'a> {
             if let Err(e) = crate::profile::prune(&self.cfg.install) { eprintln!("taskq: telemetry unknown: {e}"); }
             crate::data::trim_tail(&self.cfg.install.join("taskq.log"), crate::data::LOG_MAX);
         }
-        let r = crate::profile::measure("service.pass", || self.pass_inner());
+        let r = crate::profile::measure("service.pass", || self.pass_inner(NATIVE_PASS_BUDGET));
         if r.is_err() { self.unready(); }
         let observations=self.execution_statuses();
         if let Some(snapshot) = &mut self.snapshot {
@@ -876,7 +887,7 @@ impl<'a> Service<'a> {
         r
     }
 
-    fn pass_inner(&mut self) -> Result<(), String> {
+    fn pass_inner(&mut self, native_budget:std::time::Duration) -> Result<(), String> {
         for (task, attempt, execution) in self.pending_releases.clone() {
             release_execution(self.board, task, attempt, execution, "no-start")?;
             self.pending_releases.remove(&(task, attempt, execution));
@@ -906,7 +917,11 @@ impl<'a> Service<'a> {
         let mut touched = HashSet::new();
         let mut released = HashSet::new();
         self.execution_waits.clear();
-        for v in &views {
+        let native_until=std::time::Instant::now()+native_budget;
+        // Cold scans leave time for already owned work and control.
+        let recovery_until=std::time::Instant::now()+native_budget/4;
+        let pivot=self.recovery_after.and_then(|n|views.iter().position(|v|v.issue.number==n)).map_or(0,|i|i+1);
+        for v in views[pivot..].iter().chain(&views[..pivot]) {
             let task = v.issue.number;
             let unresolved: Vec<_> = core::executions(task, &v.log).into_iter().filter(|x| x.release.is_none()).collect();
             if self.kids.iter().any(|k| k.task == task) || self.held.iter().any(|l| l.task == task) { continue; }
@@ -916,7 +931,13 @@ impl<'a> Service<'a> {
                 continue;
             }
             let Some(recover) = &mut self.recover else { continue };
-            let result = recover(task, x).and_then(|proc| self.adopt(Kid { task, attempt: x.attempt, execution: x.id, rt: x.runtime.clone(), proc }));
+            if std::time::Instant::now()>=recovery_until {
+                self.execution_waits.insert(task,format!("execution {}: native observation deferred; recovery budget exhausted",x.id));
+                continue;
+            }
+            self.recovery_after=Some(task);
+            let result = crate::runtime::observe_until(recovery_until,||recover(task,x))
+                .and_then(|proc| self.adopt(Kid { task, attempt: x.attempt, execution: x.id, rt: x.runtime.clone(), proc }));
             if let Err(e) = result {
                 self.execution_waits.insert(task, format!("execution {} on {}: recovery unknown: {e}", x.id, x.host));
             }
@@ -928,11 +949,18 @@ impl<'a> Service<'a> {
         let mut exited = vec![];
         let unknown = &mut self.unknown;
         let stopping = &mut self.stopping;
+        let needs_stop=self.kids.iter().any(|k|!by_n.get(&k.task).is_some_and(|v|v.task.attempt==Some(k.attempt)));
+        let observation_until=if needs_stop {std::time::Instant::now()+native_until.saturating_duration_since(std::time::Instant::now())/2} else {native_until};
+        let mut deferred=None;
         self.kids.retain_mut(|k| {
-            let status = k.proc.exited();
+            if std::time::Instant::now()>=observation_until {
+                deferred.get_or_insert(k.execution);
+                unknown.insert(k.attempt,"native observation deferred; pass budget exhausted".into());return true;
+            }
+            let status = crate::runtime::observe_until(observation_until,||k.proc.exited());
             let confirmed = by_n.get(&k.task).and_then(|v| core::executions(k.task, &v.log).into_iter().find(|x| x.id == k.execution && x.accepted));
             let accepted = if let Some(x) = confirmed { Ok(Some(x.through)) } else {
-                k.proc.accepted().and_then(|yes| if yes {
+                crate::runtime::observe_until(observation_until,||k.proc.accepted()).and_then(|yes| if yes {
                     accept_execution(self.board, k.task, k.attempt, k.execution).map(Some).inspect_err(|_| { pending_acceptance.insert(k.attempt); })
                 } else { Ok(None) })
             };
@@ -993,7 +1021,11 @@ impl<'a> Service<'a> {
             let current = by_n.get(&k.task).is_some_and(|v| v.task.attempt == Some(k.attempt));
             if !current {
                 self.stopping.insert(k.attempt);
-                match crate::runtime::stop(k.proc.as_mut()) {
+                if std::time::Instant::now()>=native_until {
+                    deferred.get_or_insert(k.execution);
+                    self.unknown.insert(k.attempt,"native observation deferred; cancellation pending".into());return true;
+                }
+                match crate::runtime::observe_until(native_until,||crate::runtime::stop(k.proc.as_mut())) {
                     Ok(_) if pending_acceptance.contains(&k.attempt) => return true,
                     Ok(_) => match release_execution(self.board,k.task,k.attempt,k.execution,"exit") {
                         Ok(())=>{
@@ -1010,19 +1042,18 @@ impl<'a> Service<'a> {
         for (n, a) in stopped {
             self.ended(n, a, by_n.get(&n).copied(), None);
         }
-        crate::profile::repair_ended(&self.cfg.install, &self.cfg.root, &self.cfg.repo, &me, self.board);
         self.held.retain(|l| by_n.get(&l.task).is_some_and(|v| v.task.attempt == Some(l.attempt)));
         let kids: Vec<u64> = self.kids.iter().map(|k| k.attempt).collect();
         self.unknown.retain(|a, _| kids.contains(a));
-        self.prune(&by_n);
         // A Claude Remote Control URL is account-scoped: the heartbeat publishes it so every host's tray links it (#1204).
-        // ponytail: rereads the transcript each pass until the bridge URL appears; cache misses if transcripts grow huge.
+        // shortcut: bounded transcript scans restart until a URL appears; retain a cursor if these become costly.
         self.sessions.retain(|a, _| kids.contains(a));
-        let found: Vec<(u64, String)> = self.kids.iter().filter(|k| k.rt == "claude" && !self.sessions.contains_key(&k.attempt))
+        let found: Vec<(u64, String)> = self.kids.iter().filter(|k| std::time::Instant::now()<native_until && k.rt == "claude" && !self.sessions.contains_key(&k.attempt))
             .filter_map(|k| by_n.get(&k.task).filter(|v| v.task.attempt == Some(k.attempt))?.task.session.as_deref()?.split(' ').next()?.strip_prefix("claude:")
-                .and_then(crate::runtime::claude_remote).map(|u| (k.attempt, u)))
+                .and_then(|id|crate::runtime::observe_until(native_until,||crate::runtime::claude_remote(id))).map(|u| (k.attempt, u)))
             .collect();
         self.sessions.extend(found);
+        if let Some(first)=deferred.and_then(|id|self.kids.iter().position(|k|k.execution==id)) {self.kids.rotate_left(first);}
 
         // 4. Expired heartbeat is not evidence that an external executor stopped.
         // A lease newer than the accepted attempt is a spawn that lost the claim and still runs. An older one is a
@@ -1083,6 +1114,9 @@ impl<'a> Service<'a> {
                 self.host_issue = Some(self.board.create(&title, &body, &[HOST_LABEL.to_string()])?);
             }
         }
+
+        crate::profile::repair_ended(&self.cfg.install, &self.cfg.root, &self.cfg.repo, &me, self.board);
+        self.prune(&by_n);
 
         // 5. projected labels
         for v in &views {
@@ -2037,7 +2071,7 @@ mod tests {
                 assert_eq!(task(&b, n).state, State::Ready);
                 crate::resume(&dir).unwrap();
                 let mut ticks = 0;
-                crate::sleep_until_poke(&pokes, poke_start, 1, &mut || ticks += 1);
+                crate::sleep_until_poke(&pokes, poke_start, std::time::Instant::now()+std::time::Duration::from_secs(1), &mut || ticks += 1);
                 assert_eq!(ticks, 0, "Resume during the pass must skip the next poll wait");
                 s.focus = crate::data::focus(&dir).unwrap();
                 s.pass().unwrap();
@@ -2055,11 +2089,11 @@ mod tests {
             let pokes = [dir.join(".taskq/poke"), c.install.join("poke")];
             let poke_start = crate::poke_times(&pokes);
             crate::touch(&pokes[1]);
-            crate::sleep_until_poke(&pokes, poke_start, 1, &mut || panic!("host poke during a pass was lost"));
+            crate::sleep_until_poke(&pokes, poke_start, std::time::Instant::now()+std::time::Duration::from_secs(1), &mut || panic!("host poke during a pass was lost"));
             // A poke during sleep is observed after the current tick, without waiting another second.
             let poke_start = crate::poke_times(&pokes);
             let mut ticks = 0;
-            crate::sleep_until_poke(&pokes, poke_start, 2, &mut || {
+            crate::sleep_until_poke(&pokes, poke_start, std::time::Instant::now()+std::time::Duration::from_secs(2), &mut || {
                 ticks += 1;
                 std::fs::remove_file(&pokes[1]).unwrap();
             });
@@ -2582,6 +2616,53 @@ mod tests {
         b.edit(host.number,&running).unwrap();let row=read();assert!(row.get("executions").is_none(),"late heartbeat cannot reopen terminal");
         let mut fresh=service(&b,&c,Default::default());fresh.focus.clear();fresh.pass().unwrap();
         assert!(!fresh.heartbeat_body().lines().any(|l|l.starts_with("execution ")),"restart reads durable terminal");
+    }
+
+    // Chain: slow native children -> bounded observation round -> honest heartbeat -> fair next round.
+    #[test]
+    fn slow_observations_defer_without_releasing_and_rotate_fairly() {
+        struct Slow {task:u64,calls:Rc<RefCell<Vec<u64>>>}
+        impl Proc for Slow {
+            fn accepted(&mut self)->Result<bool,String> {Ok(true)}
+            fn exited(&mut self)->Result<Option<i32>,String> {
+                self.calls.borrow_mut().push(self.task);std::thread::sleep(std::time::Duration::from_millis(25));Ok(None)
+            }
+            fn kill(&mut self)->Result<(),String> {Err("fixture must stay owned".into())}
+            fn id(&self)->u32 {0}
+        }
+        let b=Fake::default();let mut c=cfg("mac");c.limits.insert("claude".into(),3);
+        for _ in 0..3 {b.create("slow fixture","",&[TASK_LABEL.into()]).unwrap();}
+        let mut s=service(&b,&c,Default::default());s.pass().unwrap();s.pass().unwrap();
+        assert_eq!(s.kids.len(),3);
+        let calls=Rc::new(RefCell::new(vec![]));
+        for kid in &mut s.kids {kid.proc=Box::new(Slow {task:kid.task,calls:calls.clone()});}
+        for round in 1..=3 {
+            s.pass_inner(std::time::Duration::from_millis(10)).unwrap();
+            assert_eq!(calls.borrow().len(),round,"a slow poll must not delay status behind all children");
+            assert_eq!(s.kids.len(),3);
+            assert_eq!(s.unknown.len(),2,"deferred observations must be unknown, not freshly healthy");
+            let heartbeat=b.issue(s.host_issue.unwrap()).unwrap();
+            assert!(heartbeat.body.contains("native observation deferred"));
+        }
+        assert_eq!(calls.borrow().iter().collect::<std::collections::HashSet<_>>().len(),3,"slow first child starved another execution");
+        calls.borrow_mut().clear();
+        for round in 1..=3 {
+            s.reap_owned_within(std::time::Duration::from_millis(10));
+            assert_eq!(calls.borrow().len(),round);assert_eq!(s.kids.len(),3);assert_eq!(s.unknown.len(),2);
+        }
+        assert_eq!(calls.borrow().iter().collect::<std::collections::HashSet<_>>().len(),3,"reduced pass starved an execution");
+        let tasks=s.kids.iter().map(|k|k.task).collect::<Vec<_>>();
+        s.kids.clear();calls.borrow_mut().clear();
+        let recovery_calls=calls.clone();
+        s.recover=Some(Box::new(move |task,_| {
+            recovery_calls.borrow_mut().push(task);std::thread::sleep(std::time::Duration::from_millis(25));Err("fixture: native recovery unknown".into())
+        }));
+        for round in 1..=3 {
+            s.pass_inner(std::time::Duration::from_millis(10)).unwrap();assert_eq!(calls.borrow().len(),round);
+            assert_eq!(s.execution_waits.len(),3);assert!(s.kids.is_empty(),"unknown recovery cannot replay work");
+        }
+        assert_eq!(calls.borrow().iter().collect::<std::collections::HashSet<_>>().len(),3,"cold recovery starved an execution");
+        for task in tasks {assert!(core::executions(task,&entries(&b,task).unwrap()).iter().all(|x|x.release.is_none()));}
     }
 
     // Chain: § 4 board budget, heartbeat. Risk: a PATCH every pass burns the shared budget, or a sparse heartbeat

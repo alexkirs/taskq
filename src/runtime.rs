@@ -11,6 +11,24 @@ mod app_control;
 #[cfg(windows)]
 pub mod windows_process;
 
+thread_local! {static OBSERVATION_UNTIL:std::cell::Cell<Option<std::time::Instant>>=const {std::cell::Cell::new(None)};}
+
+/// Share the service's remaining observation time across an adapter's existing bounded calls.
+pub fn observe_until<T>(until:std::time::Instant, action:impl FnOnce()->T)->T {
+    struct Restore(Option<std::time::Instant>);
+    impl Drop for Restore {fn drop(&mut self) {OBSERVATION_UNTIL.set(self.0);}}
+    let previous=OBSERVATION_UNTIL.get();
+    OBSERVATION_UNTIL.set(Some(previous.map_or(until,|outer|outer.min(until))));
+    let _restore=Restore(previous);action()
+}
+fn observation_deadline(budget:std::time::Duration)->std::time::Instant {
+    let until=std::time::Instant::now()+budget;
+    OBSERVATION_UNTIL.get().map_or(until,|outer|outer.min(until))
+}
+fn observation_left(budget:std::time::Duration)->std::time::Duration {
+    observation_deadline(budget).saturating_duration_since(std::time::Instant::now())
+}
+
 fn app_cancel(thread:&str,turn:&str)->Result<(),String> {
     #[cfg(any(target_os="macos",windows))] {app_control::cancel(thread,turn)}
     #[cfg(not(any(target_os="macos",windows)))] {let _=(thread,turn);Err("Codex App native cancellation unavailable on this platform; execution remains reserved".into())}
@@ -68,7 +86,7 @@ impl Proc for Child {
         if self.exited()?.is_some() { return Ok(()); }
         // Windows: the child is `cmd.exe` running `codex.cmd`; node and `codex.exe` below it survive a plain kill (#933)
         #[cfg(windows)]
-        coreq::process::output("runtime.taskkill", Command::new("taskkill").args(["/F", "/T", "/PID", &Child::id(self).to_string()]), std::time::Duration::from_secs(10)).map_err(|e| format!("process tree stop unconfirmed: {e}"))?;
+        coreq::process::output("runtime.taskkill", Command::new("taskkill").args(["/F", "/T", "/PID", &Child::id(self).to_string()]), observation_left(std::time::Duration::from_secs(10))).map_err(|e| format!("process tree stop unconfirmed: {e}"))?;
         #[cfg(not(windows))]
         Child::kill(self).map_err(|e| format!("process stop unconfirmed: {e}"))?;
         Ok(())
@@ -938,7 +956,7 @@ fn recovery_binding(root:&Path,task:u64,x:&crate::core::Execution)->Result<(Path
     let worker=attempt_log(root,"worker",task,x.attempt);let reviewer=attempt_log(root,"reviewer",task,x.attempt);
     let log=match (worker.is_file(),reviewer.is_file()) {(true,false)=>worker,(false,true)=>reviewer,_=>return Err("native attempt log missing or ambiguous; preserve the execution".into())};
     let mut binding=None;let mut reader=NativeHistory::default();
-    let until=std::time::Instant::now()+std::time::Duration::from_secs(5);
+    let until=observation_deadline(std::time::Duration::from_secs(5));
     loop {
         let complete=reader.lines(&log,|line| {
             if !line.trim_start().starts_with('{') {return Ok(());}
@@ -1186,7 +1204,7 @@ fn claude_input_event(event:&serde_json::Value,input:&str)->bool {
 /// One pre-submission permission/baseline read, using the same bounded native decoder.
 fn claude_history(path:&Path,before:usize,mut visit:impl FnMut(serde_json::Value))->Result<usize,String> {
     let mut reader=NativeHistory::default();let mut count=0;
-    let until=std::time::Instant::now()+std::time::Duration::from_secs(5);
+    let until=observation_deadline(std::time::Duration::from_secs(5));
     loop {
         let complete=reader.read(path,|v| {if count>=before {visit(v);}count+=1;Ok(())})?;
         if complete {
@@ -1475,13 +1493,18 @@ impl ClaudeTurn {
 
 /// Only a URL registered by the native session is a Remote Control link.
 pub fn claude_remote(session: &str) -> Option<String> {
-    let text = std::fs::read_to_string(claude_transcript(session)?).ok()?;
-    text.lines().rev().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).find_map(|v| {
-        let url = v["url"].as_str()?;
-        let id = url.strip_prefix("https://claude.ai/code/session_")?;
-        (v["subtype"] == "bridge_status" && !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()))
-            .then(|| url.to_string())
-    })
+    let path=claude_transcript(session)?;let mut reader=NativeHistory::default();let mut found=None;
+    let until=observation_deadline(std::time::Duration::from_secs(5));
+    loop {
+        let complete=reader.read(&path,|v| {
+            if let Some(url)=v["url"].as_str() {
+                if v["subtype"]=="bridge_status" && url.strip_prefix("https://claude.ai/code/session_").is_some_and(|id|!id.is_empty()&&id.chars().all(|c|c.is_ascii_alphanumeric())) {found=Some(url.to_string());}
+            }
+            Ok(())
+        }).ok()?;
+        if complete {return found;}
+        if std::time::Instant::now()>=until {return None;}
+    }
 }
 
 pub fn claude_background(root: &Path, session: &str) -> Result<bool, String> {
@@ -1601,7 +1624,7 @@ fn app_running() -> Result<bool, String> {
     } else {
         c.args(["find", "bundleID=com.openai.codex"]);
     }
-    let out = coreq::process::output("runtime.app-presence", &mut c, std::time::Duration::from_secs(10)).map_err(|e| format!("Codex app presence unknown: {e}"))?;
+    let out = coreq::process::output("runtime.app-presence", &mut c, observation_left(std::time::Duration::from_secs(10))).map_err(|e| format!("Codex app presence unknown: {e}"))?;
     let text = std::str::from_utf8(&out.stdout).map_err(|_| "Codex app presence returned invalid UTF-8")?;
     app_presence(text, cfg!(windows))
     }, |_| "readback")
@@ -1652,6 +1675,8 @@ pub(crate) fn rollout(thread: &str) -> Option<PathBuf> {
 struct NativeHistory {
     path: Option<PathBuf>,
     metadata: Option<std::fs::Metadata>,
+    #[cfg(windows)]
+    identity: Option<windows::Win32::Storage::FileSystem::FILE_ID_INFO>,
     offset: u64,
     boundary: Vec<u8>,
 }
@@ -1670,6 +1695,17 @@ impl NativeHistory {
         let mut file=File::open(path).map_err(|e|format!("native history unavailable: {e}"))?;
         let meta=file.metadata().map_err(|e|e.to_string())?;
         if !meta.is_file() {return Err("native history is not a regular file".into());}
+        #[cfg(windows)]
+        let identity={
+            use std::os::windows::io::AsRawHandle;
+            use windows::Win32::{Foundation::HANDLE,Storage::FileSystem::{FILE_ID_INFO,FileIdInfo,GetFileInformationByHandleEx}};
+            let mut id=FILE_ID_INFO::default();
+            unsafe {GetFileInformationByHandleEx(HANDLE(file.as_raw_handle()),FileIdInfo,
+                (&mut id as *mut FILE_ID_INFO).cast(),std::mem::size_of::<FILE_ID_INFO>() as u32)}
+                .map_err(|e|format!("native history identity unavailable: {e}"))?;
+            if self.identity.is_some_and(|old|old!=id) {return Err("native history file replaced; reconcile original input".into());}
+            id
+        };
         if let Some(old)=&self.metadata {
             #[cfg(unix)]
             {use std::os::unix::fs::MetadataExt;
@@ -1687,10 +1723,13 @@ impl NativeHistory {
             if bytes!=self.boundary {return Err("native history boundary changed; completion unknown".into());}
         }
         self.path=Some(path.into());self.metadata=Some(meta);
+        #[cfg(windows)]
+        {self.identity=Some(identity);}
         file.seek(SeekFrom::Start(self.offset)).map_err(|e|e.to_string())?;
         let mut reader=BufReader::new(file.take(LIMIT+1));
         let (mut line,mut consumed)=(String::new(),0u64);
         loop {
+            if OBSERVATION_UNTIL.get().is_some_and(|until|std::time::Instant::now()>=until) {return Ok(false);}
             line.clear();
             let size=reader.read_line(&mut line).map_err(|e|format!("native history read failed: {e}"))? as u64;
             if size==0 {break;}
@@ -1772,7 +1811,7 @@ impl AppHistory {
 fn completes(rollout: &Path) -> Result<usize, String> {
     coreq::telemetry::capture::operation("runtime.turn-readback", || {
         let mut reader=NativeHistory::default();let mut count=0;
-        let until=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        let until=observation_deadline(std::time::Duration::from_secs(5));
         loop {
             let complete=reader.read(rollout,|v| {
                 if v["type"]=="event_msg" && !v["payload"].is_object() {return Err("Codex rollout record shape invalid".into());}
@@ -1793,6 +1832,8 @@ fn probe(name: &'static str, bin: &Path, args: &[&str]) -> Option<(bool, String)
 }
 
 fn probe_within(name: &'static str, bin: &Path, args: &[&str], budget: std::time::Duration) -> Option<(bool, String)> {
+    let budget=observation_left(budget);
+    if budget.is_zero() {return None;}
     let out = match coreq::process::output(name, Command::new(bin).args(args), budget) {
         Ok(out) | Err(coreq::process::Failure::Exit(out)) => out,
         Err(_) => return None,
@@ -2267,6 +2308,11 @@ mod tests {
             assert_eq!(got.as_ref().map(|(ok, out)| (*ok, out.trim())), want.map(|v| (true, v)), "{name}");
             assert!(t.elapsed() < std::time::Duration::from_secs(5), "{name}: {:?}", t.elapsed());
         }
+        let began=std::time::Instant::now();
+        let outcome=observe_until(began+std::time::Duration::from_millis(100),||
+            probe_within("runtime.version",&script("budget",hang),&[],std::time::Duration::from_secs(10)));
+        assert!(outcome.is_none());assert!(began.elapsed()<std::time::Duration::from_secs(2),"adapter ignored remaining pass time");
+        assert!(observation_deadline(std::time::Duration::from_secs(1))>std::time::Instant::now()+std::time::Duration::from_millis(500),"observation deadline leaked into later work");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

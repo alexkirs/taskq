@@ -11,12 +11,12 @@ use serde_json::{Value,json};
 pub(super) fn cancel(thread:&str,turn:&str)->Result<(),String> {
     coreq::telemetry::capture::operation("runtime.app-cancel",|| {
         #[cfg(windows)]
-        return cancel_at(Path::new(r"\\.\pipe\codex-ipc"),thread,turn,Instant::now()+Duration::from_secs(10));
+        return cancel_at(Path::new(r"\\.\pipe\codex-ipc"),thread,turn,super::observation_deadline(Duration::from_secs(10)));
         #[cfg(target_os="macos")]
         {
         let home=std::env::var_os("CODEX_HOME").map(PathBuf::from)
             .or_else(||std::env::var_os("HOME").map(|h|Path::new(&h).join(".codex"))).ok_or("Codex App home unavailable")?;
-        cancel_at(&home.join("ipc/ipc.sock"),thread,turn,Instant::now()+Duration::from_secs(10))
+        cancel_at(&home.join("ipc/ipc.sock"),thread,turn,super::observation_deadline(Duration::from_secs(10)))
         }
     }, |_|"app-cancel")
 }

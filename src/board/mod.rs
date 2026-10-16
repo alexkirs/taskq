@@ -711,6 +711,12 @@ mod tests {
     #[ignore = "native curl and collector fixture; local loopback only"]
     fn native_http_child() {
         use std::{io::{Read, Write}, net::TcpListener, time::{Duration, Instant}};
+        let dir = std::path::PathBuf::from(std::env::var_os("TASKQ_NATIVE_HTTP_TEST_ROOT").unwrap());
+        let began = Instant::now();
+        let _runtime = coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1").unwrap();
+        let installed = began.elapsed();
+        crate::profile::take_report();
+        // The HTTP deadline starts after collector setup, which has its own outer bound.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -748,11 +754,6 @@ mod tests {
             let reply = "private-response";
             write!(socket, "HTTP/1.1 503 Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
         });
-        let dir = std::path::PathBuf::from(std::env::var_os("TASKQ_NATIVE_HTTP_TEST_ROOT").unwrap());
-        let began = Instant::now();
-        let _runtime = coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1").unwrap();
-        let installed = began.elapsed();
-        crate::profile::take_report();
         let result = Api::new(base.clone(), base, "private-token").call("POST", "/request", Some(body));
         let joined = server.join();
         assert!(joined.is_ok(), "HTTP fixture failed; runtime install={installed:?}, through request={:?}, client error={:?}", began.elapsed(), result.as_ref().err());

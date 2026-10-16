@@ -254,8 +254,9 @@ fn poke(root: &Path) -> Res<()> {
         fs::create_dir_all(dot(root)).map_err(|error| ("wake-directory", error))?;
         let context = coreq::telemetry::capture::TraceContext::current().map(|c| c.encode()).unwrap_or_else(|| ".".into());
         // Lock the existing signal so a reader cannot accept ids mixed from two concurrent writes.
-        let mut file = fs::OpenOptions::new().write(true).create(true).truncate(false).open(dot(root).join("poke")).map_err(|error| ("wake-open", error))?;
-        file.try_lock().map_err(|error| ("wake-lock", std::io::Error::from(error)))?;
+        let file = fs::OpenOptions::new().write(true).create(true).truncate(false).open(dot(root).join("poke")).map_err(|error| ("wake-open", error))?;
+        let locked = coreq::file_lock::try_lock_file(file).map_err(|error| ("wake-lock", std::io::Error::from(error)))?;
+        let mut file = locked.file();
         file.set_len(0).map_err(|error| ("wake-truncate", error))?;
         file.write_all(context.as_bytes()).map_err(|error| ("wake-write", error))
     }, |(class, _)| *class).map_err(|(class, error)| format!("service wake failed ({class}: {error}); state may already be saved; check service status"))
@@ -268,9 +269,9 @@ fn wake_context(path: &Path, seen: &mut Option<String>) -> Res<Option<coreq::tel
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => { *seen = None; return Ok(None); }
         Err(_) => return Err("wakeup context unreadable".into()),
     };
-    file.try_lock_shared().map_err(|_| "wakeup context busy")?;
+    let locked = coreq::file_lock::try_lock_shared_file(file).map_err(|_| "wakeup context busy")?;
     let mut text = String::new();
-    file.take(129).read_to_string(&mut text).map_err(|_| "wakeup context unreadable")?;
+    locked.file().take(129).read_to_string(&mut text).map_err(|_| "wakeup context unreadable")?;
     if seen.as_ref() == Some(&text) { return Ok(None); }
     let link = if matches!(text.as_str(), "" | ".") { None } else { Some(coreq::telemetry::capture::TraceContext::decode(&text)?) };
     *seen = Some(text);

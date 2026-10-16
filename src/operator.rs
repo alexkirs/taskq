@@ -833,7 +833,7 @@ mod tests {
         confirm("1");
         assert_eq!((a()["state"].as_str(), focus().as_str()), (Some("proposal"), "area-x"), "a stale rev does nothing");
         confirm("2");
-        assert_eq!((a()["state"].as_str(), focus().as_str()), (Some("applied"), "off"));
+        assert_eq!((a()["state"].as_str(), focus().as_str()), (Some("applied"), "off"), "{}", a());
         assert!(a()["readback"][0].as_str().unwrap().ends_with("pause ok: paused"));
         let rev = a()["rev"].clone();
         fs::write(crate::dot(&root).join("focus"), "area-y").unwrap();

@@ -8,8 +8,15 @@ fn capture()->Result<coreq::telemetry::capture::Capture,String> {
 }
 
 pub fn select(selector:&str,period:Duration,limit:u64)->Result<(),String> {
-    capture()?.diagnose(selector,period,limit)
+    capture()?.diagnose(selector,period,limit)?;
+    let until=crate::profile::now_ms().ok_or("diagnostic clock unknown")?.saturating_add(period.as_millis() as u64);
+    *WEB_SELECTION.lock().map_err(|_|"web diagnostic control unavailable")?=Some(json!({"id":crate::runtime::uuid(),"selector":selector,"until_ms":until,"limit":limit}));
+    Ok(())
 }
+// One in-memory handoff to this process's WebView; it carries no effects or authority.
+static WEB_SELECTION:Mutex<Option<Value>>=Mutex::new(None);
+pub fn take_web_selection()->Option<Value>{WEB_SELECTION.lock().ok()?.take()}
+
 
 #[derive(serde::Serialize,serde::Deserialize)]
 #[serde(deny_unknown_fields)]

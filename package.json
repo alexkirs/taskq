@@ -1,0 +1,14 @@
+{
+  "name": "taskq-ui",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build-web.cjs"
+  },
+  "devDependencies": {
+    "acorn": "8.19.0",
+    "esbuild": "0.28.2"
+  },
+  "dependencies": {
+    "@taskq/coreq": "https://codeload.github.com/taskqorg/coreq/tar.gz/377b12c04723e973ce78039121605ca73737b5ba"
+  }
+}

@@ -1,7 +1,5 @@
 // Chain: #1059 Home inline AI exchange in src/tray.html. Risk: a long answer fills Home and pushes Projects off it, or the bounded preview swallows reply and confirm controls.
-const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
-const html=fs.readFileSync('src/tray.html','utf8');
-const source=html.slice(html.indexOf('const aiStates='),html.indexOf('// Add project'));
+const fs=require('node:fs'),assert=require('node:assert/strict');
 // Layout bounds are checked by tray-home-proposal.browser.cjs.
 const long=Array.from({length:40},(_,i)=>'Answer line '+(i+1)).join('\n');
 const cases={
@@ -13,8 +11,8 @@ const cases={
 for(const [name,[answer,controls]] of Object.entries(cases)){
   const request={id:'2',root:'p',text:'Ask',answer,chain:[{text:'Older',answer:{state:'clarify',text:'Older question'}},{text:'Ask',answer}]};
   const context={S:{projects:[],ai:{target:'p',history:[],request}},esc:s=>String(s).replaceAll('<','&lt;'),aiText:'',aiMenu:false,aiConfirm:null};
-  vm.createContext(context);vm.runInContext(source,context);
-  const h=vm.runInContext('ai()',context);
+  require('./tray-harness.cjs').install(context);
+  const h=(context.ai());
   const start=h.indexOf('<div class="aichain"');
   assert(start>0,name);
   let depth=0,end=start;

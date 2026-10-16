@@ -3,7 +3,7 @@
 // npm i --no-save playwright && node tests/answer-card.browser.cjs
 const fs = require('node:fs'), assert = require('node:assert/strict');
 const {chromium} = require('playwright');
-const js = fs.readFileSync('src/answer-card.js', 'utf8'), css = fs.readFileSync('src/answer-card.css', 'utf8');
+const js = fs.readFileSync('build/web/answer-card.js', 'utf8'), css = fs.readFileSync('src/answer-card.css', 'utf8');
 const fx = JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json', 'utf8'));
 (async () => {
   const browser = await chromium.launch(require('./browser.cjs')());

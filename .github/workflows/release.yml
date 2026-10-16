@@ -79,6 +79,8 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
           restore-keys: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}-
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run build
       - run: cargo build --release --locked
       - name: Selftest and stage
         if: needs.tag.outputs.tag
@@ -94,20 +96,20 @@ jobs:
           (cd dist && "./taskq-$VER-${{ matrix.target }}${{ matrix.ext }}" selftest)
           # shared answer card assets (docs/design/answer-card.md): once, from the Linux job
           if [ "${{ matrix.target }}" = linux-x86_64 ]; then
-            cp src/answer-card.js "dist/taskq-$VER-answer-card.js"
+            cp build/web/answer-card.js "dist/taskq-$VER-answer-card.js"
             cp src/answer-card.css "dist/taskq-$VER-answer-card.css"
             cp tests/fixtures/answer-card.json "dist/taskq-$VER-answer-card-fixtures.json"
-            cp src/project-blocks.js "dist/taskq-$VER-project-blocks.js"
+            cp build/web/project-blocks.js "dist/taskq-$VER-project-blocks.js"
             cp src/project-blocks.css "dist/taskq-$VER-project-blocks.css"
             cp src/project-blocks.LICENSE "dist/taskq-$VER-project-blocks.LICENSE"
             cp tests/fixtures/project-blocks.json "dist/taskq-$VER-project-blocks-fixtures.json"
             cp docs/design/project-blocks.sources.json "dist/taskq-$VER-project-blocks-sources.json"
-            cp src/finding-composer.js "dist/taskq-$VER-finding-composer.js"
+            cp build/web/finding-composer.js "dist/taskq-$VER-finding-composer.js"
             cp src/finding-composer.css "dist/taskq-$VER-finding-composer.css"
             cp tests/fixtures/finding-composer.json "dist/taskq-$VER-finding-composer-fixtures.json"
             cp docs/design/finding-composer.sources.json "dist/taskq-$VER-finding-composer-sources.json"
             # shared resource controls (docs/design/shared-resource-controls.md), same mechanism
-            cp src/resource-controls.js "dist/taskq-$VER-resource-controls.js"
+            cp build/web/resource-controls.js "dist/taskq-$VER-resource-controls.js"
             cp src/resource-controls.css "dist/taskq-$VER-resource-controls.css"
             cp tests/fixtures/resource-controls.json "dist/taskq-$VER-resource-controls-fixtures.json"
           fi

@@ -1,6 +1,9 @@
 use std::process::Command;
 
 fn main() {
+    for path in ["src", "scripts/build-web.cjs", "package.json", "package-lock.json"] {println!("cargo:rerun-if-changed={path}");}
+    let web=std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("web");
+    assert!(Command::new("node").arg("scripts/build-web.cjs").arg(&web).status().expect("Node.js build dependency").success(),"web bundle failed");
     let root=std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     coreq_instrument::generate(&root.join("src"),"main.rs",&std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("instrumented")).expect("automatic telemetry source instrumentation");
     let git = |args: &[&str]| Command::new("git").args(args).output().ok()

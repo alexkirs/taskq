@@ -1,34 +1,17 @@
-// TaskQ shared answer card (docs/design/answer-card.md). Source: https://github.com/taskqorg/taskq src/answer-card.js,
-// MIT, published with each TaskQ release as taskq-<version>-answer-card.js and listed in SHA256SUMS; never edit a copy.
-// Input: one status --json task row whose `question` is TaskQ's canonical parse, plus the adapter's capability.
-// The component has no network client, parser, credentials or task state machine: `send` is the adapter's.
-(function (root) {
-  'use strict';
-  const STATES = ['actionable', 'sending', 'accepted', 'stale', 'rejected', 'unknown', 'read-only'];
-  const LABELS = {actionable: 'Waiting for your answer', sending: 'Sending…', accepted: 'Answer accepted on the board',
-    stale: 'The question changed: review it before sending', rejected: 'Answer not accepted', unknown: 'Delivery unknown: check the board', 'read-only': 'Read only'};
-  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
-  const key = (board, row) => board + '#' + row.n;
-  // only web links: card text is worker-written
-  const href = u => /^https?:\/\//i.test(u || '') ? esc(u) : '#';
+'use strict';
+const ui=require('./ui-runtime.js');
+const execution=ui.execution;
 
-  // Local state of one card: draft and the revision it was written against, the one operation in flight and its receipt.
-  function fresh(row) { return {draft: '', bound: row.revision, op: null, receipt: null}; }
-
-  // Free text the TaskQ `answer N --text` limits accept; null: sendable.
-  function textProblem(q, text) {
+const {fresh,textProblem,status,step,render,receipt,mount,replay}=execution.module("answer-card",{
+fresh:function(row) { return {draft: '', bound: row.revision, op: null, receipt: null}; },
+textProblem:function(q, text) {
     const lines = text.split('\n').filter(l => l.trim());
     if (!lines.length) return 'Type an answer';
     if (lines.length > q.limits.lines) return 'At most ' + q.limits.lines + ' lines';
     if (lines.some(l => [...l].length > q.limits.chars)) return 'At most ' + q.limits.chars + ' characters per line';
     return null;
-  }
-
-  const manageable = (row, cap) => row.state === 'ask' && cap && cap.answer && cap.manage && !(row.question && row.question.choices && row.question.choices.length);
-  const draftQuestion = (row, cap) => manageable(row, cap) ? {limits: {lines: 1, chars: 232}} : row.question;
-
-  // One of STATES for a row, its local state and the adapter's capability {answer, reason}.
-  function status(row, local, cap) {
+  },
+status:function(row, local, cap) {
     const q = row.question;
     // a receipt belongs to the question it answered; one in flight or unknown holds across refreshes, an answered one
     // stays beside its task after the question is gone
@@ -36,19 +19,16 @@
     if (!manageable(row, cap) && (!q || !q.parsed || !cap || !cap.answer || !['ask', 'review'].includes(row.state))) return 'read-only';
     if (local.bound !== row.revision && (local.draft.trim() || local.op || local.confirmClose)) return 'stale';
     return 'actionable';
-  }
-
-  // Pure transition: (local, event) -> {local, send}. `send` is an operation to hand to the adapter, else null.
-  // Events: input {text}, choose {id}, submit, review, receipt {opId, state, reason, next}, refresh {row}, retry.
-  function step(row, local, cap, ev, newId) {
+  },
+step:function(row, local, cap, ev, newId) {
     const st = status(row, local, cap), l = {...local};
-    const start = payload => {
+    const {start}=execution.module("answer-card.step",{start:payload => {
       l.confirmClose = false;
       l.op = {id: newId(), task: row.n, revision: row.revision, ...payload};
       l.bound = row.revision;
       l.receipt = {state: 'sending'};
       return {local: l, send: l.op};
-    };
+    }});
     switch (ev.type) {
       case 'input':
         // a draft typed while stale stays bound to the question it was written for
@@ -87,9 +67,8 @@
       default:
         return {local, send: null};
     }
-  }
-
-  function render(board, row, local, cap) {
+  },
+render:function(board, row, local, cap) {
     const q = row.question || {text: row.card || '', parsed: false, choices: [], evidence: []}, st = status(row, local, cap);
     const id = 'qac-' + String(board).replace(/[^\w-]/g, '_') + '-' + row.n, live = st === 'actionable' || st === 'rejected';
     let h = '<section class="qac" data-qac-state="' + st + '" aria-labelledby="' + id + '-t">';
@@ -130,31 +109,25 @@
       (q.done ? '<p class="qac-done"><span class="qac-muted">Done:</span> ' + esc(q.done) + '</p>' : '') +
       (q.evidence.length ? '<p class="qac-evidence">' + q.evidence.map(e => '<a href="' + href(e.url) + '" target="_blank" rel="noopener">' + esc(e.label) + '</a>').join(' · ') + '</p>' : '') + '</details>';
     return h + '</section>';
-  }
-
-  function receipt(st, reason, url, id, next, action) {
+  },
+receipt:function(st, reason, url, id, next, action) {
     if (st === 'actionable') return '<p class="qac-receipt" id="' + id + '-r" role="status" aria-live="polite"></p>';
     return '<p class="qac-receipt qac-' + st + '" id="' + id + '-r" role="status" aria-live="polite">' + esc(st === 'accepted' && action ? 'Action accepted on the board' : LABELS[st]) + (reason ? ': ' + esc(reason) : '') +
       (next ? '. ' + esc(next) : '') + (st === 'read-only' || st === 'unknown' ? ' <a href="' + href(url) + '" target="_blank" rel="noopener">Open on board ↗</a>' : '') + '</p>';
-  }
-
-  // Browser binding: one container, rows by board. adapter = {capability(board, row) -> {answer, reason},
-  // send(board, op) -> Promise<{state, reason, next}>, newId?() }. update() keeps drafts, focus and scroll.
-  function mount(el, adapter) {
-    const locals = new Map(), cards = new Map();
-    const newId = adapter.newId || (() => (root.crypto && root.crypto.randomUUID ? root.crypto.randomUUID() : 'qac-' + Date.now().toString(36) + Math.random().toString(36).slice(2)));
-    function apply(k, ev) {
+  },
+mount:function(el, adapter) {
+const {apply,paint}=execution.module("answer-card.mount",{
+apply:function(k, ev) {
       const {board, row} = cards.get(k), cap = adapter.capability(board, row), r = step(row, locals.get(k), cap, ev, newId);
       locals.set(k, r.local);
       if (ev.type !== 'input') paint();
-      if (r.send) Promise.resolve().then(() => adapter.send(board, r.send))
-        .then(x => apply(k, {type: 'receipt', opId: r.send.id, ...x}), e => apply(k, {type: 'receipt', opId: r.send.id, state: 'unknown', reason: String(e && e.message || e)}));
+      if (r.send) ui.effect('answer.send',()=>adapter.send(board,r.send),x=>{if(cards.has(k))apply(k,{type:'receipt',opId:r.send.id,...x});});
       else if (ev.type === 'input') {
         const s = el.querySelector('[data-qac-key="' + CSS.escape(k) + '"] button[type=submit]'), cap2 = adapter.capability(board, row);
         if (s) s.disabled = !!textProblem(draftQuestion(row, cap2), r.local.draft) || !['actionable', 'rejected'].includes(status(row, r.local, cap2));
       }
-    }
-    function paint() {
+    },
+paint:function() {
       const a = document.activeElement, focus = a && el.contains(a) ? {k: a.closest('[data-qac-key]')?.dataset.qacKey, sel: a.dataset.qac === 'input' ? 'textarea' : a.dataset.choice ? '[data-choice="' + a.dataset.choice + '"]' : '[data-qac="' + a.dataset.qac + '"]', s: a.selectionStart, e: a.selectionEnd} : null;
       const scroll = el.scrollTop, open = new Set([...el.querySelectorAll('details[open]')].map(d => d.closest('[data-qac-key]')?.dataset.qacKey + ' ' + d.className));
       el.innerHTML = [...cards].map(([k, c]) => '<div data-qac-key="' + esc(k) + '">' + render(c.board, c.row, locals.get(k), adapter.capability(c.board, c.row)) + '</div>').join('');
@@ -163,13 +136,19 @@
       const t = focus && focus.k && el.querySelector('[data-qac-key="' + CSS.escape(focus.k) + '"] ' + focus.sel);
       if (t) { t.focus(); if (focus.s != null && t.setSelectionRange) t.setSelectionRange(focus.s, focus.e); }
     }
-    el.addEventListener('click', e => {
+});
+
+    const locals = new Map(), cards = new Map();
+    const newId = adapter.newId || (() => (root.crypto && root.crypto.randomUUID ? root.crypto.randomUUID() : 'qac-' + Date.now().toString(36) + Math.random().toString(36).slice(2)));
+
+
+    ui.listen(el,'click', e => {
       const b = e.target.closest('button[data-qac]'), k = b && b.closest('[data-qac-key]')?.dataset.qacKey;
       if (k && !b.disabled) apply(k, b.dataset.qac === 'choose' ? {type: 'choose', id: Number(b.dataset.choice)} : {type: b.dataset.qac});
     });
-    el.addEventListener('submit', e => { e.preventDefault(); const k = e.target.closest('[data-qac-key]')?.dataset.qacKey; if (k) apply(k, {type: 'submit'}); });
-    el.addEventListener('input', e => { const k = e.target.dataset.qac === 'input' && e.target.closest('[data-qac-key]')?.dataset.qacKey; if (k) apply(k, {type: 'input', text: e.target.value}); });
-    return {
+    ui.listen(el,'submit', e => { e.preventDefault(); const k = e.target.closest('[data-qac-key]')?.dataset.qacKey; if (k) apply(k, {type: 'submit'}); });
+    ui.listen(el,'input', e => { const k = e.target.dataset.qac === 'input' && e.target.closest('[data-qac-key]')?.dataset.qacKey; if (k) apply(k, {type: 'input', text: e.target.value}); });
+    return execution.module("answer-card.mount.controller",{
       // rows: [{board, row}] of open questions; a row that left keeps no state
       update(rows) {
         cards.clear();
@@ -177,12 +156,9 @@
         for (const k of [...locals.keys()]) if (!cards.has(k)) locals.delete(k);
         paint();
       },
-    };
-  }
-
-  // Conformance replay shared by every consumer harness: the fixture's events through `step` with the consumer's
-  // adapter capability; returns each checkpoint's {status, html, sent} for the fixture's expectations.
-  function replay(fx, capability) {
+    });
+  },
+replay:function(fx, capability) {
     let row = fx.rows[0], local = fresh(row), n = 0;
     const sent = [], out = [];
     for (const ev of fx.events || []) {
@@ -194,7 +170,47 @@
     }
     return out;
   }
+});
+// TaskQ shared answer card (docs/design/answer-card.md). Source: https://github.com/taskqorg/taskq src/answer-card.js,
+// MIT, published with each TaskQ release as taskq-<version>-answer-card.js and listed in SHA256SUMS; never edit a copy.
+// Input: one status --json task row whose `question` is TaskQ's canonical parse, plus the adapter's capability.
+// The component has no network client, parser, credentials or task state machine: `send` is the adapter's.
+const root=globalThis;
+  const STATES = ['actionable', 'sending', 'accepted', 'stale', 'rejected', 'unknown', 'read-only'];
+  const LABELS = {actionable: 'Waiting for your answer', sending: 'Sending…', accepted: 'Answer accepted on the board',
+    stale: 'The question changed: review it before sending', rejected: 'Answer not accepted', unknown: 'Delivery unknown: check the board', 'read-only': 'Read only'};
+  const {esc}=execution.module("answer-card",{esc:s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]))});
+  const {key}=execution.module("answer-card",{key:(board, row) => board + '#' + row.n});
+  // only web links: card text is worker-written
+  const {href}=execution.module("answer-card",{href:u => /^https?:\/\//i.test(u || '') ? esc(u) : '#'});
+
+  // Local state of one card: draft and the revision it was written against, the one operation in flight and its receipt.
+
+
+  // Free text the TaskQ `answer N --text` limits accept; null: sendable.
+
+
+  const {manageable}=execution.module("answer-card",{manageable:(row, cap) => row.state === 'ask' && cap && cap.answer && cap.manage && !(row.question && row.question.choices && row.question.choices.length)});
+  const {draftQuestion}=execution.module("answer-card",{draftQuestion:(row, cap) => manageable(row, cap) ? {limits: {lines: 1, chars: 232}} : row.question});
+
+  // One of STATES for a row, its local state and the adapter's capability {answer, reason}.
+
+
+  // Pure transition: (local, event) -> {local, send}. `send` is an operation to hand to the adapter, else null.
+  // Events: input {text}, choose {id}, submit, review, receipt {opId, state, reason, next}, refresh {row}, retry.
+
+
+
+
+
+
+  // Browser binding: one container, rows by board. adapter = {capability(board, row) -> {answer, reason},
+  // send(board, op) -> Promise<{state, reason, next}>, newId?() }. update() keeps drafts, focus and scroll.
+
+
+  // Conformance replay shared by every consumer harness: the fixture's events through `step` with the consumer's
+  // adapter capability; returns each checkpoint's {status, html, sent} for the fixture's expectations.
+
 
   const api = {STATES, status, step, render, mount, replay, textProblem};
-  if (typeof module === 'object' && module.exports) module.exports = api; else root.TaskqAnswerCard = api;
-})(typeof globalThis === 'object' ? globalThis : this);
+  module.exports=api;

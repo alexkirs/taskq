@@ -1,12 +1,6 @@
 // Chain: real tray HTML -> shared resource controls -> `capacity` IPC. Instrument with Playwright; not native tray proof.
 const fs=require('node:fs'),assert=require('node:assert/strict'),{chromium}=require('playwright');
-const html=fs.readFileSync('src/tray.html','utf8').replace('{{TRAY_WEB_JS}}',fs.readFileSync('src/tray-web.js','utf8'))
-  .replace('{{ANSWER_CARD_CSS}}',fs.readFileSync('src/answer-card.css','utf8'))
-  .replace('{{ANSWER_CARD_JS}}',fs.readFileSync('src/answer-card.js','utf8'))
-  .replace('{{PROJECT_BLOCKS_CSS}}',fs.readFileSync('src/project-blocks.css','utf8'))
-  .replace('{{PROJECT_BLOCKS_JS}}',fs.readFileSync('src/project-blocks.js','utf8'))
-  .replace('{{RESOURCE_CONTROLS_CSS}}',fs.readFileSync('src/resource-controls.css','utf8'))
-  .replace('{{RESOURCE_CONTROLS_JS}}',fs.readFileSync('src/resource-controls.js','utf8'));
+const html=fs.readFileSync('build/web/tray.html','utf8');
 const fx=JSON.parse(fs.readFileSync('tests/fixtures/resource-controls.json','utf8'));
 const conflict=fx.cases.find(c=>/conflict/.test(c.name)).groups,over=fx.cases.find(c=>/over-capacity/.test(c.name)).groups[0];
 (async()=>{

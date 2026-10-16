@@ -17,7 +17,7 @@ use wry::{WebView, WebViewBuilder};
 use crate::icon::{self, Rgba, compact};
 use crate::notify;
 
-const HTML: &str = include_str!("tray.html");
+const HTML: &str = include_str!(concat!(env!("OUT_DIR"),"/web/tray.html"));
 const FONTS: [u64; 4] = [14, 16, 18, 20];
 const PERIODS: [(&str, i64); 5] = [("5m", 300), ("1h", 3600), ("1d", 86400), ("1w", 604800), ("1mo", 2592000)];
 
@@ -661,6 +661,38 @@ impl WebCalls {
     }
 }
 
+// Accept only metadata named by the actual bundled modules; the WebView supplies no content fields.
+fn web_observation(row: &Value) -> crate::Res<Value> {
+    let object=row.as_object().ok_or("invalid-web-observation")?;
+    if row.to_string().len()>4096||object.keys().any(|key|!matches!(key.as_str(),"kind"|"source"|"operation"|"trace"|"span"|"parent"|"started_ms"|"duration_us"|"outcome"|"error"|"counts")) {return Err("invalid-web-observation".into());}
+    static INVENTORY:std::sync::OnceLock<Vec<String>>=std::sync::OnceLock::new();
+    let inventory=INVENTORY.get_or_init(||serde_json::from_str(include_str!(concat!(env!("OUT_DIR"),"/web/operations.json"))).expect("build-owned web inventory"));
+    if !inventory.iter().any(|name|row["operation"].as_str()==Some(name)) {return Err("unknown-web-operation".into());}
+    let (kind,source)=match row["kind"].as_str() {
+        Some("ui.start")=>("method.start","action"),Some("ui")=>("method","action"),
+        Some("method")=>("method","diagnostic"),Some("method.aggregate")=>("method.aggregate","aggregate"),
+        Some("effect.start")=>("method.start","effect"),Some("effect")=>("method","effect"),
+        Some("effect.wait")=>("effect.wait","effect"),Some("collection")=>("collection","web"),
+        Some("diagnostic")=>("diagnostic","web"),_=>return Err("invalid-web-kind".into()),
+    };
+    if !matches!(row["outcome"].as_str(),Some("ok"|"failed"|"unknown"))||!matches!(row["error"].as_str(),Some("none"|"javascript-error"|"unowned-async"|"completion-timeout"|"collection-incomplete")) {return Err("invalid-web-outcome".into());}
+    if let Some(counts)=row.get("counts") {
+        let counts=counts.as_object().ok_or("invalid-web-counts")?;
+        if counts.len()>6||counts.iter().any(|(key,value)|!matches!(key.as_str(),"calls"|"finished"|"failed"|"unknown"|"lost"|"pending")||value.as_u64().is_none_or(|n|n>9007199254740991)) {return Err("invalid-web-counts".into());}
+    }
+    let mut value=row.clone();
+    value["product"]=json!("taskq");value["version"]=json!(crate::platform::VERSION);value["process_id"]=json!(std::process::id());
+    value["kind"]=json!(kind);value["source"]=json!(source);
+    let mut unknown=serde_json::Map::new();
+    for key in ["trace","span","parent"] {
+        if value[key].is_null() {value[key]=Value::Null;unknown.insert(key.into(),json!("aggregate-unlinked"));}
+        else if value[key].as_str().is_none_or(|id|coreq::telemetry::capture::TraceContext::decode(&format!("1 {id} {id}")).is_err()) {return Err("invalid-web-context".into());}
+    }
+    if !unknown.is_empty(){value["unknown"]=Value::Object(unknown);}
+    coreq::telemetry::Event::new(value.clone())?;
+    Ok(value)
+}
+
 fn web_result(value: &str) -> &'static str {
     match value {"\"ok\""=>"ok","\"script-error\""=>"script-error",_=>"invalid-ack"}
 }
@@ -735,7 +767,21 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
     event_loop.run(move |event, target, flow| {
         crate::telemetry::diagnostic::poll(&install);
         *flow = ControlFlow::Wait;
+        let native=match &event {
+            Event::WindowEvent{event:WindowEvent::Resized(_),..}=>Some("tray.window.resize"),
+            Event::WindowEvent{event:WindowEvent::Moved(_),..}=>Some("tray.window.move"),
+            Event::WindowEvent{event:WindowEvent::Focused(_),..}=>Some("tray.window.focus"),
+            Event::WindowEvent{event:WindowEvent::ThemeChanged(_),..}=>Some("tray.window.theme"),
+            Event::WindowEvent{event:WindowEvent::Destroyed,..}=>Some("tray.window.destroy"),
+            Event::WindowEvent{event:WindowEvent::CloseRequested,..}=>Some("tray.window.close"),
+            Event::RedrawRequested(_)=>Some("tray.window.redraw-request"),_=>None,
+        };
+        if let Some(name)=native {let _=coreq::telemetry::capture::operation(name,||Ok::<_,&str>(()),|error|*error);}
+
         web.expire(Instant::now());
+        if !web.pending.contains_key(&0)&&let Some((_,wv))=&ui&&let Some(selection)=crate::telemetry::diagnostic::take_web_selection(){
+            web_eval(wv,&format!("taskq.receive({})",json!({"diagnose":selection})),"tray.web.diagnose",&proxy,&mut web);
+        }
         if web.failed && !web.notified {
             web.notified=true;
             if let Some(t)=&tray {let _=t.set_tooltip(Some("TaskQ: interface outcomes unknown; check service status"));}
@@ -758,9 +804,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 let p = proxy.clone();
                 let built = b.build(target).map_err(|e| e.to_string()).and_then(|w| {
                     // only our page: a link goes to the browser through the bridge
-                    WebViewBuilder::new().with_accept_first_mouse(true).with_html(HTML.replace("{{TRAY_WEB_JS}}", include_str!("tray-web.js")).replace("{{ANSWER_CARD_CSS}}", include_str!("answer-card.css")).replace("{{ANSWER_CARD_JS}}", include_str!("answer-card.js"))
-                        .replace("{{PROJECT_BLOCKS_CSS}}", include_str!("project-blocks.css")).replace("{{PROJECT_BLOCKS_JS}}", include_str!("project-blocks.js"))
-                        .replace("{{RESOURCE_CONTROLS_CSS}}", include_str!("resource-controls.css")).replace("{{RESOURCE_CONTROLS_JS}}", include_str!("resource-controls.js"))).with_navigation_handler(|u| !u.starts_with("http"))
+                    WebViewBuilder::new().with_accept_first_mouse(true).with_html(HTML).with_navigation_handler(|u| !u.starts_with("http"))
                         .with_ipc_handler(move |r| {
                             let _ = p.send_event(Ev::Ipc(r.into_body()));
                         })
@@ -847,7 +891,8 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 let st = state(&install, &settings, dark, None, &adding);
                 if !web.failed {refresh_icon(&tray, &st, &settings, dark, &mut icon_sig);}
                 notes(&install, &mut settings, &st, &mut asked, &mut bursts);
-                let sig = st.to_string().replace(&format!("\"now\":{}", st["now"]), "");
+                let mut comparable=st.clone();comparable.as_object_mut().expect("tray snapshot object").remove("now");
+                let sig=comparable.to_string();
                 if sig != shown && !web.pending.contains_key(&0) {
                     shown = sig;
                     push(&mut web,&ui, &st);
@@ -894,11 +939,17 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 let Ok(m) = serde_json::from_str::<Value>(&m) else {web.fault("invalid-ipc");return;};
                 let Some((w, _)) = &ui else { return };
                 if m["a"]=="web-error" {web.errors(&m);return;}
+                if m["a"]=="web-observation" {
+                    if web_observation(&m["row"]).and_then(coreq::telemetry::capture::observe_linked).is_err(){web.fault("web-capture-unavailable");}
+                    return;
+                }
+                let context=match m["context"].as_str(){Some(text)=>match coreq::telemetry::capture::TraceContext::decode(text){Ok(context)=>Some(context),Err(_)=>{web.fault("invalid-web-context");return;}},None=>None};
+                let _continuation=context.as_ref().map(|context|context.span().entered());
                 if web.failed {return;}
                 match m["a"].as_str().unwrap_or("") {
                     "answer" if snapshot.is_none() => {
                         let (p, install) = (proxy.clone(), install.clone());
-                        std::thread::spawn(move || { let _ = p.send_event(Ev::Answer(answer(&install, &m))); });
+                        std::thread::spawn(coreq::telemetry::capture::bind(move || { let _ = p.send_event(Ev::Answer(answer(&install, &m))); }));
                     }
                     "overflow" if snapshot.is_some() => overflow.push(format!("{} by {} px", m["shot"].as_str().unwrap_or("?"), m["x"])),
                     "ready" => {
@@ -955,7 +1006,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         let _ = w.drag_window();
                     }
                     "resources" => {
-                        std::thread::spawn(resources);
+                        std::thread::spawn(coreq::telemetry::capture::bind(resources));
                     }
                     "open" => {
                         if let Some(u) = m["url"].as_str().filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
@@ -995,10 +1046,10 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         adding = json!({"state": "picking"});
                         push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                         let p = proxy.clone();
-                        std::thread::spawn(move || {
+                        std::thread::spawn(coreq::telemetry::capture::bind(move || {
                             let v = pick().map_or(Value::Null, |d| classify(&d, selftest));
                             let _ = p.send_event(Ev::Added(v));
-                        });
+                        }));
                     }
                     "add-cancel" => {
                         adding = Value::Null;
@@ -1008,9 +1059,9 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         adding["state"] = json!("installing");
                         push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                         let (p, a, inst) = (proxy.clone(), adding.clone(), install.clone());
-                        std::thread::spawn(move || {
+                        std::thread::spawn(coreq::telemetry::capture::bind(move || {
                             let _ = p.send_event(Ev::Added(install_service(&inst, a)));
-                        });
+                        }));
                     }
                     "add-setup" if matches!(adding["kind"].as_str(), Some("new" | "plain")) => {
                         let text = format!("Set up {} as a taskq project", adding["name"].as_str().unwrap_or("this folder"));
@@ -1109,7 +1160,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 if !web.pending.is_empty() {
                     shot_wait=Some(Ev::Shot2);return;
                 }
-                web_eval(wv,&OVERFLOW.replace("NAME", &name),"tray.web.measure",&proxy,&mut web);
+                web_eval(wv,&format!("taskq.measure({})",json!(&name)),"tray.web.measure",&proxy,&mut web);
                 step += 1;
                 capture(wv, dir.join(name), move || {
                     let _ = p.send_event(Ev::Shot);
@@ -1133,10 +1184,6 @@ fn popover_size(m: &Value, max: f64, scale: f64) -> (u32, u32) {
 
 /// Reports a snapshot page that scrolls horizontally or clips content inside the menu (#1073), and a button whose label
 /// is wider than the button, so the text crosses its border (#1049).
-const OVERFLOW: &str = "(()=>{const e=document.documentElement,m=document.querySelector('.menu'),x=Math.max(e.scrollWidth-e.clientWidth,m.scrollWidth-m.clientWidth);
-if(x>0)window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME',x}));
-const seen=new Set();for(const b of m.querySelectorAll('button')){const t=b.textContent.trim().slice(0,24);
-if(b.offsetParent&&b.scrollWidth>b.clientWidth+1&&!seen.has(t)){seen.add(t);window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME button '+t,x:b.scrollWidth-b.clientWidth}));}}})()";
 
 /// The `actions` snapshot: a refused custom range (menu.md M6), without applying a setting.
 const ACTIONS: &str = "(()=>{const q=s=>document.querySelector(s),put=(s,v)=>{const i=q(s);i.value=v;i.dispatchEvent(new Event('input',{bubbles:true}));};
@@ -2093,6 +2140,17 @@ mod tests {
         fs::remove_dir_all(install).unwrap();
     }
 
+    // Risk: page metadata smuggles content or forges a method outside the bundled inventory.
+    #[test]
+    fn web_metadata_is_allowlisted_and_aggregate_identity_is_explicitly_unknown() {
+        let row=json!({"operation":"js.tray.create.mode","kind":"method.aggregate","started_ms":1,"counts":{"calls":2,"finished":2,"failed":0,"unknown":0},"outcome":"ok","error":"none"});
+        let accepted=web_observation(&row).unwrap();
+        assert_eq!(accepted["unknown"]["trace"],"aggregate-unlinked");
+        for (key,value) in [("message",json!("private")),("operation",json!("js.private-data")),("trace",json!("/private/path")),("counts",json!({"private":1})),("error",json!("raw-error"))] {
+            let mut invalid=row.clone();invalid[key]=value;assert!(web_observation(&invalid).is_err(),"{key}");
+        }
+    }
+
     // Chain: § 4 tray icon save. Risk: an invalid draft replaces the working icon.
     #[test]
     fn invalid_icon_draft_leaves_tray_json_unchanged() {
@@ -2137,7 +2195,7 @@ mod tests {
         assert_eq!(fs::read_to_string(install.join("tray.json")).unwrap(), "{\"view\": \"fu", "a read never resets it");
         let reason = state(&install, &s, false, None, &Value::Null)["settings_error"].clone();
         assert!(reason.as_str().unwrap().starts_with("tray.json: corrupt"), "the popover names the reason: {reason}");
-        assert!(include_str!("tray.html").contains("Settings unknown: '+esc(S.settings_error)"));
+        assert!(HTML.contains("Settings unknown:"));
         assert!(s.save(&install));
         assert_eq!(state(&install, &s, false, None, &Value::Null)["settings_error"], Value::Null, "a save clears it");
         assert_eq!(fs::read_to_string(install.join("tray.json.corrupt")).unwrap(), "{\"view\": \"fu", "a save keeps a copy");

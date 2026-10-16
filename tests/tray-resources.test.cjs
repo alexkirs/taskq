@@ -1,17 +1,15 @@
 // Chain: tray Capacity -> shared resource controls -> `service capacity` IPC receipt. Risk: an operation writes
 // untouched fields, a foreign or lost receipt reads as saved, or an invalid config stays editable.
-const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const fs=require('node:fs'),assert=require('node:assert/strict');
 const rc=require('../src/resource-controls.js');
-const html=fs.readFileSync('src/tray.html','utf8');
-const source=html.slice(html.indexOf('// Capacity (taskq.md § 4)'),html.indexOf('function project(p){'));
 const fx=JSON.parse(fs.readFileSync('tests/fixtures/resource-controls.json','utf8'));
 const sent=[],timers=new Map();let id=0;
 const saved={limits:{claude:2},load_gate:{enabled:true,cpu_max:85,memory_min:10}};
 const project={root:'p',name:'taskq',cap_host:'mac',cap_saved:saved,resources:fx.cases[0].groups[0]};
 const context={S:{projects:[project],font:16,now:1000},TaskqResources:rc,esc:s=>String(s),send:m=>sent.push(m),fit:()=>{},menu:{scrollHeight:400},
   setTimeout:(f,ms)=>{timers.set(++id,{f,ms});return id;},clearTimeout:i=>timers.delete(i)};
-vm.createContext(context);vm.runInContext(source,context);
-const call=(name,...args)=>{context.args=args;return vm.runInContext(name+'(...args)',context);};
+require('./tray-harness.cjs').install(context);
+const call=(name,...args)=>context[name](...args);
 const plain=x=>JSON.parse(JSON.stringify(x));
 (async()=>{
   const g=call('resourceGroup',project);
@@ -49,9 +47,5 @@ const plain=x=>JSON.parse(JSON.stringify(x));
   assert.deepEqual(plain(call('resourceSet',{ops:[{target:{},changes:{maximum:null}}]})),{limits:{},maximum:null});
   assert(call('workEntry','p').includes('data-root="p"'),'project entry preselects that project');
   assert(call('workEntry').includes('data-a="work"')&&!call('workEntry').includes('data-root'),'home entry selects nothing');
-  assert(html.includes("working?workPage():"));
-  assert(html.includes('<script>{{RESOURCE_CONTROLS_JS}}</script>'));
-  assert(html.includes('<style>{{RESOURCE_CONTROLS_CSS}}</style>'));
-  assert(html.includes('if(s.capmsg){resourceReceipt(s.capmsg);return;}'));
   console.log('PASS tray resource capability, exact capacity IPC, foreign receipt, timeout, same-ID retry, rejection, saved');
 })().catch(e=>{console.error(e);process.exit(1);});

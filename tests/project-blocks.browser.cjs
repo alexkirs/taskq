@@ -1,10 +1,10 @@
 // B4 instrument: identical parent/standalone/tray fixtures; browser output is not native or live-board proof.
 const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict'),crypto=require('node:crypto'),{chromium}=require('playwright');
 const q=require('../src/project-blocks.js'),fx=require('./fixtures/project-blocks.json');
-const source=fs.readFileSync('docs/design/menu-next-variants.html','utf8'),css=fs.readFileSync('src/project-blocks.css','utf8'),js=fs.readFileSync('src/project-blocks.js','utf8');
+const source=fs.readFileSync('docs/design/menu-next-variants.html','utf8'),css=fs.readFileSync('src/project-blocks.css','utf8'),js=fs.readFileSync('build/web/project-blocks.js','utf8');
 const parentCSS=[...source.matchAll(/<style>([\s\S]*?)<\/style>/g)].map(m=>m[1]).join('\n');
 const parentFunctions=source.split('\n').filter(l=>/^(const (esc|icon|button|ib)=|function (counts|projectRow|task)\()/.test(l)).join('\n');
-const tray=fs.readFileSync('src/tray.html','utf8').replace('{{TRAY_WEB_JS}}',fs.readFileSync('src/tray-web.js','utf8')).replace('{{ANSWER_CARD_JS}}',fs.readFileSync('src/answer-card.js','utf8')).replace('{{ANSWER_CARD_CSS}}',fs.readFileSync('src/answer-card.css','utf8')).replace('{{PROJECT_BLOCKS_JS}}',js).replace('{{PROJECT_BLOCKS_CSS}}',css).replace('{{RESOURCE_CONTROLS_JS}}',fs.readFileSync('src/resource-controls.js','utf8')).replace('{{RESOURCE_CONTROLS_CSS}}',fs.readFileSync('src/resource-controls.css','utf8'));
+const tray=fs.readFileSync('build/web/tray.html','utf8');
 const base='<style>:root{color-scheme:light dark}body{margin:0;padding:8px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}</style>';
 function fixture(n){return {...fx.project,name:'project',closed:n,tasks:q.states.filter(s=>s[0]!=='closed').flatMap(([state],i)=>Array.from({length:n},(_,j)=>({...fx.row,n:i*1000+j+1,state,revision:4}))) };}
 function look(sel){

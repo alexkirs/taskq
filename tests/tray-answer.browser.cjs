@@ -1,12 +1,6 @@
 // Chain: real tray HTML -> shared card -> existing IPC. Instrument with Playwright; not native tray/board proof.
 const fs=require('node:fs'),assert=require('node:assert/strict'),{chromium}=require('playwright');
-const html=fs.readFileSync('src/tray.html','utf8').replace('{{TRAY_WEB_JS}}',fs.readFileSync('src/tray-web.js','utf8'))
-  .replace('{{ANSWER_CARD_CSS}}',fs.readFileSync('src/answer-card.css','utf8'))
-  .replace('{{ANSWER_CARD_JS}}',fs.readFileSync('src/answer-card.js','utf8'))
-  .replace('{{PROJECT_BLOCKS_CSS}}',fs.readFileSync('src/project-blocks.css','utf8'))
-  .replace('{{PROJECT_BLOCKS_JS}}',fs.readFileSync('src/project-blocks.js','utf8'))
-  .replace('{{RESOURCE_CONTROLS_CSS}}',fs.readFileSync('src/resource-controls.css','utf8'))
-  .replace('{{RESOURCE_CONTROLS_JS}}',fs.readFileSync('src/resource-controls.js','utf8'));
+const html=fs.readFileSync('build/web/tray.html','utf8');
 const fx=JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json','utf8'));
 (async()=>{
   const browser=await chromium.launch(require('./browser.cjs')());

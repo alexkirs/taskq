@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Project-owned selected gate. Unknown impact runs the full Rust suite."""
 import argparse
+import shutil
 import os
 from pathlib import Path
 import subprocess
@@ -51,12 +52,15 @@ def main():
         if left <= 0:
             raise TimeoutError('selected gate exceeded 900s including setup/build')
         print('+', ' '.join(command), flush=True)
+        command = [shutil.which(command[0]) or command[0], *command[1:]]
         subprocess.run(command, cwd=ROOT, env={**env, **(extra_env or {})}, check=True, timeout=left)
 
     try:
         run(['git', 'diff', '--check', args.base if paths else 'HEAD'])
         run([sys.executable, 'scripts/check.test.py'])
         if scope != 'docs':
+            run(['npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'])
+            run(['npm', 'run', 'build'])
             run(['cargo', '+stable', 'test', '--locked'] + ([] if scope == 'full' else ['--bin', 'taskq', 'core::tests']))
             if scope == 'full':
                 with tempfile.TemporaryDirectory(prefix='taskq-gate-') as install:

@@ -4,8 +4,7 @@
 use crate::core::Entry;
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -213,15 +212,10 @@ fn curl(method: &str, url: &str, auth: &str, body: Option<&Value>) -> Result<Rep
     if let Some(b) = body {
         cfg += &format!("header = \"Content-Type: application/json\"\ndata-binary = {}\n", quote(&b.to_string()));
     }
-    let mut child = Command::new("curl")
-        .args(["-K", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("curl: {e}"))?;
-    child.stdin.take().unwrap().write_all(cfg.as_bytes()).map_err(|e| format!("curl: {e}"))?;
-    let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
+    let out = match coreq::process::exchange("board.http", Command::new("curl").args(["-K", "-"]), cfg.as_bytes(), std::time::Duration::from_secs(65)) {
+        Ok(out) | Err(coreq::process::Failure::Exit(out)) => out,
+        Err(e) => return Err(format!("curl: {e}")),
+    };
     if !out.status.success() {
         return Err(format!("curl {method} {url}: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -419,7 +413,7 @@ impl Api {
         while let Some(u) = next {
             // later pages count under their first page's operation
             let r = self.send("GET", &u, None, &op)?;
-            out.extend(r.json()?.as_array().cloned().unwrap_or_default());
+            out.extend(r.json()?.as_array().ok_or("invalid board list: expected array")?.iter().cloned());
             next = r.next();
         }
         Ok(out)
@@ -701,6 +695,74 @@ impl Board for Fake {
 mod tests {
     use super::*;
 
+    // Chain: real curl/config stdin -> local HTTP refusal -> request accounting and secret-free execution trace.
+    #[test]
+    fn native_http_preserves_refusal_without_exporting_request_data() {
+        let dir = std::env::temp_dir().join(format!("taskq-native-http-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = coreq::process::output("test.http", Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "board::tests::native_http_child", "--ignored", "--nocapture"])
+            .env("TASKQ_NATIVE_HTTP_TEST_ROOT", &dir), std::time::Duration::from_secs(15));
+        assert!(out.is_ok(), "native HTTP chain failed: {out:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "native curl and collector fixture; local loopback only"]
+    fn native_http_child() {
+        use std::{io::{Read, Write}, net::TcpListener, time::{Duration, Instant}};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let body = json!({"text": "private-body".repeat(4000)});
+        let expected = body.clone();
+        let server = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < until, "native curl did not reach the local fixture");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("fixture accept: {e}"),
+                }
+            };
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut part = [0; 4096];
+                let n = socket.read(&mut part).unwrap();
+                assert_ne!(n, 0, "incomplete request"); bytes.extend_from_slice(&part[..n]);
+                assert!(bytes.len() <= 1024 * 1024);
+                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    let length: usize = head.lines().find_map(|l| l.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
+                    if bytes.len() < end + 4 + length { continue; }
+                    assert!(head.contains("authorization: bearer private-token"));
+                    assert_eq!(serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + length]).unwrap(), expected);
+                    break;
+                }
+            }
+            let reply = "private-response";
+            write!(socket, "HTTP/1.1 503 Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        });
+        let dir = std::path::PathBuf::from(std::env::var_os("TASKQ_NATIVE_HTTP_TEST_ROOT").unwrap());
+        let _runtime = coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1").unwrap();
+        crate::profile::take_report();
+        let result = Api::new(base.clone(), base, "private-token").call("POST", "/request", Some(body));
+        server.join().unwrap();
+        assert!(result.err().unwrap().contains("HTTP 503"));
+        assert!(crate::profile::take_report().contains("http5xx:1"));
+        let health = coreq::telemetry::capture::qualify().unwrap();
+        let store = coreq::telemetry::Reader::open(&dir.join("db")).unwrap();
+        let exported = store.export(0, 0, 1024).unwrap();
+        assert!(exported["events"].as_array().unwrap().iter().any(|r| r["observation"]["operation"] == "fixtureq.operation.board.http"
+            && r["observation"]["kind"] == "method" && r["observation"]["outcome"] == "ok"));
+        assert!(!exported.to_string().contains("private-"));
+        assert_eq!(health["lost"], 0);
+    }
+
 
     fn http(kind: &Kind, schema: Option<bool>, transport: Transport) -> Box<dyn Board> {
         let mut api = (kind.api)(if kind.name == "github" { "github.com" } else { "gitlab.example" }, "o/r", "test");
@@ -965,6 +1027,22 @@ mod tests {
         assert!(report.contains("| 2/3 | 60.00 |"), "{report}");
         assert!(report.contains("http4xx:2, http5xx:1"), "{report}");
         assert!(!report.contains("private"));
+    }
+
+    // Chain: board list/readback -> malformed successful HTTP page -> explicit failure, never an empty queue/catalog.
+    #[test]
+    fn malformed_list_is_not_an_empty_board() {
+        for kind in [&github::KIND, &gitlab::KIND] {
+            for body in ["{}", "null", "\"private-error\""] {
+                let board = http(kind, None, Box::new(move |_, _, _| Ok(Reply {
+                    status: 200, headers: vec![], body: body.into(), operation: "read",
+                })));
+                let expected = Some("invalid board list: expected array");
+                assert_eq!(board.issues(Some(0)).err().as_deref(), expected, "{} issue list: {body}", kind.name);
+                assert_eq!(board.comments(1).err().as_deref(), expected, "{} comments: {body}", kind.name);
+                assert_eq!(board.canonical_labels().err().as_deref(), expected, "{} catalog: {body}", kind.name);
+            }
+        }
     }
 
     fn label_board(kind: &'static Kind, fail: bool, mismatch: bool) -> (Box<dyn Board>, std::rc::Rc<RefCell<Vec<Value>>>, std::rc::Rc<RefCell<usize>>) {

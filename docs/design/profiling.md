@@ -178,3 +178,6 @@ These are acceptance targets, not claims about the installed release. Shared mod
 ## Bounded external commands
 
 Runtime CLI probes use shared coreq command execution:10s for execution plus output drain,1MiB combined stdout/stderr, with precise spawn/exit/timeout/output/cleanup observations under the caller trace. Missing or incomplete output remains unknown. Service/update deadlines belong to [coreq bounded command execution](https://github.com/taskqorg/coreq/blob/main/coreq.md#bounded-command-execution). No input, arguments, credentials or output is exported. Direct-child cleanup stays owned; detached worker trees and native action completion still require their own lifecycle qualification.
+
+Board HTTP uses shared bounded stdin exchange:65s around curl's60s, at most1MiB encoded config and8MiB response. A bound failure is explicit and never interpreted as an empty board or confirmed mutation. Preserve tokens/body on stdin, HTTP/GraphQL/rate-limit interpretation and existing request budgets; no retry is added by the executor. Native curl tests and stalled/full-duplex/inherited-pipe fault checks qualify this adapter separately from live forge behavior.
+Expected list responses must be arrays: a successful HTTP response containing another JSON shape is an error, never an empty issue list, comment list or label catalog.

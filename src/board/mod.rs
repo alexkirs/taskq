@@ -92,6 +92,7 @@ pub fn entries(board: &dyn Board, n: u64) -> Result<Vec<Entry>> {
 struct Profiled(Box<dyn Board>);
 
 impl Profiled {
+    #[tracing::instrument(name="board.request",skip_all,fields(coreq_operation=kind))]
     fn op<T>(&self, kind: &'static str, f: impl FnOnce(&dyn Board) -> Result<T>) -> Result<T> {
         let began = std::time::Instant::now();
         let r = f(&*self.0);

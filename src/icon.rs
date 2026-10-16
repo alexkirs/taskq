@@ -200,6 +200,7 @@ fn draw_q(img: &mut Rgba, x0: f32, y0: f32, z: f32, run: bool, ink: [u8; 4], p: 
 }
 
 /// The Icon view: the compact q in a 22 pt square at `s` pixels per point.
+#[tracing::instrument(name="icon.compact",skip_all)]
 pub fn compact(run: bool, dark: bool, s: f32) -> Rgba {
     let p = palette(dark);
     let n = (22.0 * s).round() as u32;
@@ -210,6 +211,7 @@ pub fn compact(run: bool, dark: bool, s: f32) -> Rgba {
 
 /// Draw a valid configuration `c` into an `n`×`n` pixel square at `dpr` pixels per point; an invalid one is refused
 /// with every error. Paused: everything gray under the centered compact q with Ⅱ (I4).
+#[tracing::instrument(name="icon.render",skip_all)]
 pub fn render(c: &Value, n: u32, dpr: f32, d: &Data, dark: bool) -> Result<Rgba, Vec<String>> {
     let err = validate(c);
     if !err.is_empty() {
@@ -419,6 +421,15 @@ mod tests {
             assert!(status.is_some_and(|s| s.success()), "{mode}: icon/flush failed or exceeded20s; evidence {}", log.display());
         }
         assert_eq!(std::fs::read(root.join("baseline.png")).unwrap(), std::fs::read(root.join("capture.png")).unwrap());
+        if !cfg!(debug_assertions) {
+            let p95 = |mode: &str| {
+                let mut values: Vec<u64> = serde_json::from_slice(&std::fs::read(root.join(format!("{mode}.json"))).unwrap()).unwrap();
+                assert_eq!(values.len(), 30); values.sort_unstable(); values[28]
+            };
+            let (baseline, captured) = (p95("baseline"), p95("capture"));
+            eprintln!("30 renders p95: baseline={baseline}us capture={captured}us");
+            assert!(captured <= baseline + 1000.max(baseline / 20), "normal capture exceeded the operation budget; evidence {}", root.display());
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -428,11 +439,25 @@ mod tests {
         let root = std::path::PathBuf::from(std::env::var_os("TASKQ_ICON_PROBE").unwrap());
         let mode = std::env::var("TASKQ_ICON_PROBE_MODE").unwrap();
         let runtime = (mode == "capture").then(|| coreq::telemetry::capture::Runtime::install(&root.join("db"), "taskq", "fixture").unwrap());
-        let began = std::time::Instant::now();
-        let image = compact(false, true, 2.0);
-        eprintln!("first compact icon: {}us", began.elapsed().as_micros());
-        std::fs::write(root.join(format!("{mode}.png")), image.png()).unwrap();
-        if runtime.is_some() { eprintln!("capture: {}", coreq::telemetry::capture::qualify().unwrap()); }
+        let mut timings = Vec::new();
+        for n in 0..30 {
+            let began = std::time::Instant::now();
+            let image = compact(false, true, 2.0);
+            timings.push(began.elapsed().as_micros() as u64);
+            if n == 0 {
+                eprintln!("first compact icon: {}us", timings[0]);
+                std::fs::write(root.join(format!("{mode}.png")), image.png()).unwrap();
+            }
+        }
+        std::fs::write(root.join(format!("{mode}.json")), serde_json::to_vec(&timings).unwrap()).unwrap();
+        if runtime.is_some() {
+            eprintln!("capture: {}", coreq::telemetry::capture::qualify().unwrap());
+            let reader = coreq::telemetry::Reader::open(&root.join("db")).unwrap();
+            let exported = reader.export(0, 0, 1024).unwrap();
+            let rows = exported["events"].as_array().unwrap();
+            assert_eq!(rows.iter().filter(|r| r["observation"]["operation"] == "taskq.icon.compact" && r["observation"]["kind"] == "method").count(), 30);
+            assert!(!rows.iter().any(|r| r["observation"]["source"] == "diagnostic"), "normal rendering generated internal detail");
+        }
     }
 
     // Chain: § 4 tray icon render. Risk: same config yields different bytes; Custom differs from Summary.

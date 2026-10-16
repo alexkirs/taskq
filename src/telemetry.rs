@@ -191,6 +191,7 @@ fn legacy_export(install: &Path,since:Option<u64>) -> Result<(serde_json::Value,
 }
 
 /// Read committed metadata without acquiring write permission, migration, retention or network access.
+#[tracing::instrument(name="telemetry.export",skip_all)]
 pub fn export(install:&Path,since:Option<u64>) -> Result<String,String> {
     // Record the export boundary, not a recursive trace for each decoded telemetry row.
     tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),||export_snapshot(install,since))

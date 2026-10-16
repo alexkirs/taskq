@@ -551,6 +551,7 @@ impl<'a> Service<'a> {
         self.cap = cap;
     }
 
+    #[tracing::instrument(name="service.Service.may_launch",skip_all)]
     fn may_launch(&self) -> bool {
         let refusal = if self.hold.is_some() { Some("hold") }
             else if self.cap.is_err() { Some("config") }
@@ -752,6 +753,7 @@ impl<'a> Service<'a> {
     }
 
     /// One pass of § 4. Tasks written to in a step are left alone by later steps until the next pass re-reads them.
+    #[tracing::instrument(name="service.Service.pass",skip_all)]
     pub fn pass(&mut self) -> Result<(), String> {
         if self.host.is_none() {
             if let Err(e) = crate::profile::prune(&self.cfg.install) { eprintln!("taskq: telemetry unknown: {e}"); }
@@ -1227,6 +1229,7 @@ impl<'a> Service<'a> {
         }
     }
 
+    #[tracing::instrument(name="service.Service.launch",skip_all)]
     fn launch(&mut self, l: Launch) -> Result<(), String> {
         // the reservation becomes the child, or is released when the start fails
         let pos = std::fs::metadata(crate::runtime::attempt_log(&self.cfg.root, &l.role, l.task, l.attempt)).map_or(0, |m| m.len());

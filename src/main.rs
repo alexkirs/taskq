@@ -247,6 +247,7 @@ fn dot(root: &Path) -> PathBuf {
     root.join(".taskq")
 }
 
+#[tracing::instrument(name="poke",skip_all)]
 fn poke(root: &Path) {
     use std::io::Write;
     let _ = fs::create_dir_all(dot(root));
@@ -1349,6 +1350,7 @@ fn status_labels(root: &Path) -> Vec<String> {
 }
 
 /// Focus (§ 4): `f` admits; `request` keeps the owner's words, none removes them.
+#[tracing::instrument(name="set_focus",skip_all)]
 fn set_focus(root: &Path, f: &str, request: Option<&str>) -> Res<()> {
     let d = dot(root);
     fs::create_dir_all(&d).map_err(|e| e.to_string())?;
@@ -1374,6 +1376,7 @@ fn install_focus(root: &Path) -> Res<bool> {
 }
 
 /// Pause (§ 4): keep the focus in `focus.paused`, admit nothing.
+#[tracing::instrument(name="pause",skip_all)]
 fn pause(root: &Path) -> Res<()> {
     let d = dot(root);
     let f = data::focus(root)?.join(" ");
@@ -1386,6 +1389,7 @@ fn pause(root: &Path) -> Res<()> {
 }
 
 /// Resume (§ 4): restore the saved focus; never `all` by default.
+#[tracing::instrument(name="resume",skip_all)]
 fn resume(root: &Path) -> Res<String> {
     let d = dot(root);
     let f = fs::read_to_string(d.join("focus.paused")).unwrap_or_default();
@@ -1873,6 +1877,7 @@ fn restart_watch(since: &mut Option<u64>, empty_restart: bool, elapsed: u64, int
     }
 }
 
+#[tracing::instrument(name="run",skip_all)]
 fn run(argv: &[String]) -> Res<()> {
     let a = Args::parse(argv)?;
     if a.pos.is_empty() || a.pos.first().is_some_and(|s| s == "help") || a.pos.iter().any(|s| s == "-h") || a.flags.contains_key("help") {
@@ -2332,6 +2337,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
     }
 }
 
+#[tracing::instrument(name="application",skip_all)]
 fn application() {
     #[cfg(windows)]
     if std::env::args().nth(1).as_deref() == Some("__windows-codex") {

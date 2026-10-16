@@ -1183,6 +1183,7 @@ fn work_area(m: &tao::monitor::MonitorHandle) -> (i32, i32, i32, i32) {
     }
 }
 
+#[tracing::instrument(name="tray.act",skip_all)]
 fn act(action: &str, root: &Path, label: Option<&str>) -> crate::Res<()> {
     let d = crate::dot(root);
     match action {

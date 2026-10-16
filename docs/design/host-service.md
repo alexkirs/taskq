@@ -250,6 +250,8 @@ Contract detail for R3/R8/R9 and sections3/4/5/8/9. These cases complete the acc
 | H-A4 Shared occupancy | Two projects, pending claims, running children, reviewer/resume and unknown native execution cannot double-spend capacity; one pending-to-running transition adds no slot. |
 | H-A5 Lifecycle and retirement | Install/restart/stop/uninstall/update preserve the declared scope and owned work; legacy unit/child absence is verified before retirement. Keep original configuration and qualified rollback; an incompatible old authority cannot restart against unresolved work. |
 
+Update cleanup preserves the host policy and its pending replacement, registry locks/prepares, native recovery directory, migration originals, host control signals and rollback floor. An unreadable registry or a registered root without a readable version makes release ownership unknown; preserve releases until readback resolves it. Cleanup never supplies missing termination or retirement evidence.
+
 The transition owner is the host service. Project loops and status are consumers/projections, not fallback authorities. Legacy project units, capacity_hosts/mode and admission.json expiry may remain only for identified migration/compatibility readers; after cutover no supported writer/admission path may use them. Retire them only after H-A1–H-A5 and the existing installed acceptance pass. Exact receipts and native release evidence remain required.
 
 ## Shared core mapping

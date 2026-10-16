@@ -243,15 +243,18 @@ pub fn sweep(install: &Path, shim: &Path) {
     let read = |f: &str| fs::read_to_string(install.join(f)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let mut keep: Vec<String> = [read("current"), read("previous"), Some(VERSION.into())].into_iter().flatten().collect();
     // a corrupt status.json leaves its project's version unknown: every release stays (§ 4 Data)
-    let mut unknown = false;
-    for root in fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter(|l| !l.is_empty()) {
-        match crate::data::json(&Path::new(root).join(".taskq/status.json")) {
-            Ok(st) => keep.extend(st.as_ref().and_then(|s| s["version"].as_str()).map(String::from)),
-            Err(_) => unknown = true,
-        }
+    let registry=coreq::telemetry::capture::operation("update.projects",||fs::read_to_string(install.join("projects")),|_|"registry-unreadable");
+    let mut unknown=registry.is_err();
+    for root in registry.unwrap_or_default().lines().filter(|l| !l.is_empty()) {
+        let version=coreq::telemetry::capture::operation("update.project-version",|| {
+            crate::data::json(&Path::new(root).join(".taskq/status.json"))?.as_ref()
+                .and_then(|st|st["version"].as_str()).filter(|v|!v.is_empty()).map(String::from)
+                .ok_or_else(||"project version unknown".to_string())
+        },|_|"version-unknown");
+        match version {Ok(version)=>keep.push(version),Err(_)=>unknown=true}
     }
     let owned = |n: &str| {
-        ["releases", "current", "previous", "projects", "token", "installation-id", "connection", "taskq", "taskq.exe", "WebView2Loader.dll", "taskq-tray.exe", "TaskQ.app", "capacity", "resources", "windows-native", crate::policy::FILE, "taskq-profile.lock", "hold", "admission.json", "admission.lock", "update.lock"].contains(&n)
+        ["releases", "current", "previous", "projects", "token", "installation-id", "connection", "taskq", "taskq.exe", "WebView2Loader.dll", "taskq-tray.exe", "TaskQ.app", "capacity", "resources", "windows-native", crate::policy::FILE, "taskq-profile.lock", "hold", "admission.json", "admission.lock", "update.lock", "host.json", "host.json.pending", "host-policy-migration", "native", "service", "poke", "restart", "update", "projects.lock", "projects.pending", "rollback-floor"].contains(&n)
             || n.ends_with(".log") || n.ends_with(".tmp") || n.starts_with("tray") || (n.starts_with("TaskQ-") && n.ends_with(".xml"))
     };
     let gone = |p: &Path| {
@@ -628,7 +631,7 @@ mod tests {
         let _ = fs::remove_dir_all(&t);
         // the running version's release stays, whatever the build sets it to (release CI: the tag)
         let mine = format!("releases/{VERSION}");
-        let dirs = ["releases/4.2.0", "releases/4.1.0", "releases/4.0.5", &mine, "releases/cc33ae6", "releases/4.3.0.tmp", "service/x", "mac-pre-update-backup", "capacity", "resources", "windows-native/state", "failed-release-evidence"];
+        let dirs = ["releases/4.2.0", "releases/4.1.0", "releases/4.0.5", &mine, "releases/cc33ae6", "releases/4.3.0.tmp", "obsolete-service/x", "mac-pre-update-backup", "capacity", "resources", "windows-native/state", "failed-release-evidence"];
         for d in dirs {
             fs::create_dir_all(install.join(d)).unwrap();
         }
@@ -644,6 +647,18 @@ mod tests {
         fs::write(install.join("previous"), "4.1.0").unwrap();
         fs::write(install.join("windows-native/state/cap_sid"), "native control state").unwrap();
         fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
+        // H-A5: update keeps policy, interrupted writes, exact native recovery and the qualified rollback floor.
+        let protected=[("host.json","{\"limits\":{\"codex\":2},\"owner_field\":\"keep\"}"),
+            ("host.json.pending","interrupted policy; preserve"),("service","123"),("poke","wake"),
+            ("restart","restart requested"),("update","update requested"),("projects.lock",""),("projects.pending","retained registry prepare")];
+        for (name,text) in protected {fs::write(install.join(name),text).unwrap();}
+        fs::create_dir_all(install.join("host-policy-migration")).unwrap();
+        fs::write(install.join("host-policy-migration/original.json"),"original configuration").unwrap();
+        let native=crate::kids_path(&install,&root).unwrap();fs::create_dir_all(native.parent().unwrap()).unwrap();
+        let owner=coreq::process::identity(std::process::id()).unwrap().unwrap();
+        let recovery=format!("pid {} {} executor-v1\n7 41 codex 123 child 43 40\n",owner.pid,owner.started);
+        fs::write(&native,&recovery).unwrap();
+        coreq::launcher::set_rollback_floor(&tool(&install),"4.2.0").unwrap();
         let (shim, other) = (t.join("bin-taskq"), t.join("bin-other"));
         fs::write(&shim, format!("exec python3 {}/releases/cc33ae6/taskq.py launch --install-dir {} -- \"$@\"", install.display(), install.display())).unwrap();
         fs::write(&other, "#!/bin/sh\nexec something").unwrap();
@@ -658,7 +673,14 @@ mod tests {
         want.sort();
         want.dedup();
         assert_eq!(ls(&install.join("releases")), want);
-        assert_eq!(ls(&install), ["TaskQ-proj.xml", "admission.json", "admission.lock", "capacity", "current", "hold", "previous", "proj.log", "projects", "releases", "resources", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json", "update.lock", "windows-native", "worker-policy.json"]);
+        for (name,text) in protected {assert_eq!(fs::read_to_string(install.join(name)).ok().as_deref(),Some(text),"update lost {name}");}
+        assert_eq!(fs::read_to_string(install.join("host-policy-migration/original.json")).unwrap(),"original configuration");
+        assert_eq!(fs::read_to_string(&native).unwrap(),recovery);
+        assert_eq!(crate::kids_file(&install,&root).unwrap()[0].execution,43,"native execution identity survives update");
+        assert_eq!(fs::read_to_string(install.join("rollback-floor")).unwrap(),"4.2.0");
+        let mut owned=vec!["TaskQ-proj.xml", "admission.json", "admission.lock", "capacity", "current", "hold", "previous", "proj.log", "projects", "releases", "resources", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json", "update.lock", "windows-native", "worker-policy.json", "native", "host-policy-migration", "rollback-floor"];
+        owned.extend(protected.iter().map(|(name,_)|*name));owned.sort();
+        assert_eq!(ls(&install),owned);
         assert_eq!(crate::admission::hold(&install).as_deref(), Some("invented incident hold"), "update cleanup must never release an emergency hold");
         assert_eq!(fs::read_to_string(install.join("windows-native/state/cap_sid")).unwrap(), "native control state");
         assert!(!shim.exists() && other.exists(), "only the v3 shim of this install goes");
@@ -668,6 +690,23 @@ mod tests {
         sweep(&install, &shim);
         assert!(install.join("releases/4.0.1").exists() && install.join("releases/4.0.5").exists());
         assert_eq!(fs::read_to_string(root.join(".taskq/status.json")).unwrap(), "{\"version\": \"4.0");
+        crate::with_test_capture(|store,_| {
+            fs::write(root.join(".taskq/status.json"),r#"{"version":"4.0.5"}"#).unwrap();
+            fs::write(install.join("projects"),b"\xff").unwrap();
+            fs::create_dir_all(install.join("releases/4.0.2")).unwrap();sweep(&install,&shim);
+            assert!(install.join("releases/4.0.2").exists(),"unreadable registry cannot authorize release deletion");
+            fs::write(install.join("projects"),format!("{}\n",root.display())).unwrap();
+            fs::remove_file(root.join(".taskq/status.json")).unwrap();
+            sweep(&install,&shim);
+            assert!(install.join("releases/4.0.2").exists(),"missing project status cannot authorize release deletion");
+            tracing::dispatcher::get_default(|d|d.downcast_ref::<coreq::telemetry::capture::Capture>().unwrap().flush().unwrap());
+            let export=store.export(0,0,1024).unwrap();
+            for class in ["registry-unreadable","version-unknown"] {
+                assert!(export["events"].as_array().unwrap().iter().any(|row|row["observation"]["error"]==class),"missing cleanup failure {class}");
+            }
+            let private=serde_json::to_string(root.to_str().unwrap()).unwrap();
+            assert!(!export.to_string().contains(private.trim_matches('"')),"private local paths entered telemetry");
+        });
         let _ = fs::remove_dir_all(&t);
     }
 }

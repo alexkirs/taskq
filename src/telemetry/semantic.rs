@@ -80,14 +80,14 @@ pub(super) fn lines(values: &[Value]) -> Res<Vec<String>> {
 }
 
 /// Compatibility report input from bounded indexed pages, never a scan of generic method payloads.
-pub(super) fn read(store: &coreq::telemetry::Reader,kinds: &[&str]) -> Res<String> {
-    let mut reader=coreq::telemetry::Assembler::default();let mut text=String::new();let mut after=0;
+pub(super) fn read(store: &coreq::telemetry::Reader,kinds: &[&str],archive:&str) -> Res<String> {
+    let mut reader=coreq::telemetry::Assembler::default();let mut history=String::new();let mut live=String::new();let mut after=0;
     loop {
         let page=store.export_kinds(kinds,0,after,1024)?;
-        for row in page["events"].as_array().ok_or("invalid semantic page")? {if let Some(value)=reader.push(row["observation"].clone())? {text.push_str(&line(&value)?);text.push('\n');}}
+        for row in page["events"].as_array().ok_or("invalid semantic page")? {if let Some(value)=reader.push(row["observation"].clone())? {let text=if value["version"].is_null() {&mut history} else {&mut live};text.push_str(&line(&value)?);text.push('\n');}}
         after=page["next"].as_i64().ok_or("missing semantic cursor")?;if page["more"]==false {break;}
     }
-    reader.finish()?;Ok(text)
+    reader.finish()?;Ok(history+archive+&live)
 }
 
 #[cfg(test)]
@@ -146,7 +146,7 @@ mod tests {
         let dir=std::env::temp_dir().join(format!("taskq-indexed-read-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir(&dir).unwrap();let path=dir.join("db");let store=coreq::telemetry::Store::open(&path).unwrap();
         let generic=coreq::telemetry::Event::new(json!({"product":"taskq","version":"1","operation":"generic.method","kind":"method","trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"})).unwrap();store.append(&[generic]).unwrap();
         let stage=r#"taskq-stage {"stage":"claim","task":1,"attempt":2,"rt":"other","us":1,"outcome":"ok","error":"none","at_ms":1,"unknown":"no-model"}"#;store.append(&[coreq::telemetry::Event::new(observation(stage).unwrap()).unwrap()]).unwrap();
-        let reader=coreq::telemetry::Reader::open(&path).unwrap();let text=read(&reader,&["stage"]).unwrap();assert_eq!(text.lines().count(),1);assert_eq!(canonical(text.trim()).unwrap(),canonical(stage).unwrap());assert!(read(&reader,&["board"]).unwrap().is_empty());
+        let reader=coreq::telemetry::Reader::open(&path).unwrap();let text=read(&reader,&["stage"],"").unwrap();assert_eq!(text.lines().count(),1);assert_eq!(canonical(text.trim()).unwrap(),canonical(stage).unwrap());assert!(read(&reader,&["board"],"").unwrap().is_empty());
         drop(reader);drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

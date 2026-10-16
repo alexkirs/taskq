@@ -132,7 +132,7 @@ fn resume_records_its_result_without_releasing_the_host_hold() {
     assert!(exported.status.success(),"{}",String::from_utf8_lossy(&exported.stderr));
     let export=String::from_utf8(exported.stdout).unwrap();
     let rows:Vec<serde_json::Value>=export.lines().map(|line|serde_json::from_str(line).unwrap()).collect();
-    assert_eq!(rows[0]["schema"],2);assert_eq!(rows[0]["coverage"],"independent-committed-snapshots");
+    assert_eq!(rows[0]["schema"],2);assert_eq!(rows[0]["coverage"],"committed-import-cursor-snapshot");
     let observations:Vec<_>=rows[1..].iter().map(|r|&r["observation"]).collect();
     let terminals:Vec<_>=observations.iter().filter(|r|r["operation"]=="taskq.resume"&&r["kind"]=="method").collect();
     assert_eq!(terminals.len(),3);
@@ -179,7 +179,6 @@ fn resume_records_its_result_without_releasing_the_host_hold() {
     fs::remove_dir_all(root).unwrap();
 }
 
-#[cfg(target_os="macos")]
 #[test]
 #[ignore="resident shared collector subprocess for the protected analysis chain"]
 fn resident_analysis_owner() {
@@ -244,4 +243,37 @@ fn selftest_requires_committed_local_capture() {
     let store=coreq::telemetry::Store::open(&good.join("telemetry.log/universal.sqlite3")).unwrap();
     assert!(!store.export(0,0,1024).unwrap()["events"].as_array().unwrap().is_empty());
     drop(store);fs::remove_dir_all(root).unwrap();
+}
+
+// Chain: actual maintenance CLI bypasses collector bootstrap and refuses an existing live owner.
+#[test]
+fn migration_cli_uses_quiesced_owner_and_preserves_legacy_text() {
+    let root=std::env::temp_dir().join(format!("qm-{}",std::process::id()));
+    let install=root.join("i");fs::create_dir_all(&install).unwrap();
+    let line=r#"taskq-profile {"op":"spawn","us":7,"error":"none","at_ms":1}"#;
+    fs::write(install.join("taskq.log"),format!("{line}\n")).unwrap();
+    let invoke=||Command::new(env!("CARGO_BIN_EXE_taskq")).args(["profile","migrate"])
+        .current_dir(&root).env("TASKQ_INSTALL",&install).env_remove("TASKQ_ROOT")
+        .env("TASKQ_INCIDENT_REPORTS","off").output().unwrap();
+    let path=install.join("telemetry.log/universal.sqlite3");
+    use std::io::BufRead;
+    struct Owner(std::process::Child);
+    impl Drop for Owner {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+    let mut owner=Owner(Command::new(std::env::current_exe().unwrap())
+        .args(["--exact","resident_analysis_owner","--ignored","--nocapture"])
+        .env("TASKQ_ANALYSIS_OWNER",&path).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap());
+    let mut ready=std::io::BufReader::new(owner.0.stdout.take().unwrap());
+    loop {let mut line=String::new();assert_ne!(ready.read_line(&mut line).unwrap(),0,"collector stopped before ready");if line.trim()=="ANALYSIS_READY" {break;}}
+    let blocked=invoke();assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("requires quiesced IPC writer"));
+    assert!(!install.join("telemetry.log/telemetry.sqlite3").exists());
+    drop(owner.0.stdin.take());assert!(owner.0.wait().unwrap().success());
+    let result=invoke();assert!(result.status.success(),"{}",String::from_utf8_lossy(&result.stderr));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("Migrated 1 legacy records"));
+    let again=invoke();assert!(again.status.success(),"{}",String::from_utf8_lossy(&again.stderr));
+    assert!(String::from_utf8_lossy(&again.stdout).contains("Migrated 0 legacy records"));
+    assert_eq!(fs::read_to_string(install.join("taskq.log")).unwrap(),format!("{line}\n"));
+    let reader=coreq::telemetry::Reader::open(&path).unwrap();assert!(reader.import_cursor("taskq.legacy").unwrap().is_some());
+    let page=reader.export_kinds(&["operation"],0,0,1024).unwrap();assert_eq!(page["events"].as_array().unwrap().len(),1);
+    drop(reader);fs::remove_dir_all(root).unwrap();
 }

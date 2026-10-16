@@ -1,4 +1,4 @@
-//! Legacy stream identity. Qualification-only until single-store cutover is enabled.
+//! Stable legacy stream identity and resumable import through the existing store owner.
 use rusqlite::{Connection,TransactionBehavior,params};
 use coreq::telemetry::{Event,Store};
 use ring::rand::{SecureRandom,SystemRandom};
@@ -19,7 +19,7 @@ fn error(e: impl std::fmt::Display) -> String {format!("legacy source: {e}")}
 fn namespace(text: &str) -> bool {text.len()==32&&text.bytes().all(|v|v.is_ascii_digit()||(b'a'..=b'f').contains(&v))}
 
 // Caller owns taskq-profile.lock; install changes source metadata only, in one FULL transaction.
-fn install(db: &mut Connection) -> Res<()> {
+fn install_identity(db: &mut Connection) -> Res<()> {
     if db.pragma_query_value(None,"application_id",|r|r.get::<_,i64>(0)).map_err(error)?!=super::APP
         ||db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).map_err(error)?!=1 {return Err("legacy source: unsupported archive; preserved".into());}
     let check:String=db.query_row("PRAGMA quick_check",[],|r|r.get(0)).map_err(error)?;
@@ -27,27 +27,19 @@ fn install(db: &mut Connection) -> Res<()> {
     let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(error)?;
     let pages:i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(error)?;
     if page<1024||pages>28*1024*1024/page {return Err("legacy source: oversized archive; preserved".into());}
+    if installed(db)? {return Ok(());}
     db.execute_batch("PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA wal_autocheckpoint=0;").map_err(error)?;
-    db.pragma_update(None,"max_page_count",28*1024*1024/page).map_err(error)?;
     super::checkpoint(db)?;
     let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
-    let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='telemetry_source')",[],|r|r.get(0)).map_err(error)?;
-    let epoch:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('records') WHERE name='telemetry_epoch')",[],|r|r.get(0)).map_err(error)?;
-    let triggers:i64=tx.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('taskq_source_insert','taskq_source_update','taskq_source_delete')",[],|r|r.get(0)).map_err(error)?;
-    if !exists {
-        if epoch||triggers!=0 {return Err("legacy source: incomplete identity extension; preserved".into());}
+    {
         let mut id=[0;16];SystemRandom::new().fill(&mut id).map_err(|_|"legacy source: random identity unavailable")?;
         let id=id.iter().map(|byte|format!("{byte:02x}")).collect::<String>();
         tx.execute_batch("ALTER TABLE records ADD COLUMN telemetry_epoch INTEGER NOT NULL DEFAULT 0;
           CREATE TABLE telemetry_source(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,namespace TEXT NOT NULL,epoch INTEGER NOT NULL,high_seq INTEGER NOT NULL,invalid INTEGER NOT NULL,removed_epoch INTEGER NOT NULL,removed_seq INTEGER NOT NULL);").map_err(error)?;
         tx.execute("INSERT INTO telemetry_source SELECT 1,1,?1,0,coalesce(max(seq),0),0,-1,0 FROM records",[id]).map_err(error)?;
         for sql in [INSERT,UPDATE,DELETE] {tx.execute_batch(sql).map_err(error)?;}
-    } else if !epoch||triggers!=3 {return Err("legacy source: incomplete identity extension; preserved".into());}
-    for (name,sql) in [("taskq_source_insert",INSERT),("taskq_source_update",UPDATE),("taskq_source_delete",DELETE)] {
-        let actual:String=tx.query_row("SELECT sql FROM sqlite_master WHERE name=?1",[name],|r|r.get(0)).map_err(error)?;
-        if actual!=sql {return Err("legacy source: unsupported identity trigger; preserved".into());}
     }
-    state(&tx)?;
+    installed(&tx)?;
     #[cfg(test)]
     if std::env::var("TASKQ_SOURCE_IDENTITY_PHASE").is_ok_and(|phase|phase=="open") {
         std::fs::write(std::env::var_os("TASKQ_SOURCE_IDENTITY_MARKER").ok_or("missing identity marker")?,"transaction-open").map_err(error)?;
@@ -55,6 +47,21 @@ fn install(db: &mut Connection) -> Res<()> {
     }
     tx.commit().map_err(error)
 }
+
+fn installed(db:&Connection)->Res<bool> {
+    let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='telemetry_source')",[],|r|r.get(0)).map_err(error)?;
+    let epoch:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('records') WHERE name='telemetry_epoch')",[],|r|r.get(0)).map_err(error)?;
+    let triggers:i64=db.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('taskq_source_insert','taskq_source_update','taskq_source_delete')",[],|r|r.get(0)).map_err(error)?;
+    if !exists&&!epoch&&triggers==0 {return Ok(false);}
+    if !exists||!epoch||triggers!=3 {return Err("legacy source: incomplete identity extension; preserved".into());}
+    for (name,sql) in [("taskq_source_insert",INSERT),("taskq_source_update",UPDATE),("taskq_source_delete",DELETE)] {
+        let actual:String=db.query_row("SELECT sql FROM sqlite_master WHERE name=?1",[name],|r|r.get(0)).map_err(error)?;
+        if actual!=sql {return Err("legacy source: unsupported identity trigger; preserved".into());}
+    }
+    state(db)?;
+    Ok(true)
+}
+
 struct State {namespace:String,epoch:i64,high:i64,removed:(i64,i64)}
 fn state(db: &Connection) -> Res<State> {
     let count:i64=db.query_row("SELECT count(*) FROM telemetry_source",[],|r|r.get(0)).map_err(error)?;
@@ -70,15 +77,63 @@ fn position(cursor: Option<&str>, identity: &str) -> Res<(i64,i64)> {
     if epoch<0||seq<=0||cursor!=format!("v1.{identity}.{epoch}.{seq}") {return Err("legacy source: invalid progress; preserved".into());}Ok((epoch,seq))
 }
 
-pub(super) fn import(db: &mut Connection, target: &Store, install_root: &std::path::Path) -> Res<u64> {
+pub(super) fn preserved(install:&std::path::Path)->Res<bool> {
+    let path=install.join("telemetry.log/telemetry.sqlite3");
+    if !path.try_exists().map_err(error)? {return Ok(false);}
+    let db=Connection::open_with_flags(&path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(error)?;
+    installed(&db)
+}
+
+/// Prepare while the existing source owner is quiesced; retain the archive for rollback.
+pub(super) fn prepare(install:&std::path::Path)->Res<Connection> {
+    let _lock=crate::profile::log_lock(&install.join("taskq.log")).map_err(error)?;
+    let path=install.join("telemetry.log/telemetry.sqlite3");
+    if path.try_exists().map_err(error)? {
+        let db=Connection::open_with_flags(&path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(error)?;
+        if installed(&db)? {
+            let text=super::legacy_text(install)?;
+            let after=super::legacy_offset(&db,&text)?.unwrap_or(0);
+            if !text[after..].lines().any(super::telemetry) {
+                let mut db=db;install_identity(&mut db)?;return Ok(db);
+            }
+        }
+    }
+    let mut db=super::open(install)?;
+    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(error)?.as_millis().min(u64::MAX as u128) as u64;
+    super::import(&mut db,install,now)?;install_identity(&mut db)?;super::checkpoint(&db)?;
+    drop(db);
+    Connection::open_with_flags(&path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(error)
+}
+
+pub(super) fn pending(db:&Connection,cursor:Option<&str>)->Res<Option<(i64,i64)>> {
+    if !installed(db)? {
+        if cursor.is_some() {return Err("legacy source: imported archive identity missing; coverage unknown".into());}
+        return Ok(None);
+    }
+    let source=state(db)?;let after=position(cursor,&source.namespace)?;
+    if after.0>source.epoch||(after.0==source.epoch&&after.1>source.high) {return Err("legacy source: source progress moved backwards; resume refused".into());}
+    if source.removed>after {return Err("legacy source: unimported records pruned; coverage unknown".into());}
+    Ok(Some(after))
+}
+
+fn drained(db:&Connection,install_root:&std::path::Path)->Res<()> {
     let text=super::legacy_text(install_root)?;
     let after=super::legacy_offset(db,&text)?.unwrap_or(0);
     if text[after..].lines().any(super::telemetry) {return Err("legacy taskq.log has undrained telemetry; source import refused".into());}
-    install(db)?;let mut imported=0;
+    Ok(())
+}
+
+pub(super) fn import(db: &mut Connection, target: &Store, install_root: &std::path::Path) -> Res<u64> {
+    {
+        let _lock=crate::profile::log_lock(&install_root.join("taskq.log")).map_err(error)?;
+        drained(db,install_root)?;install_identity(db)?;
+    }
+    let mut imported=0;
     loop {
-        let cursor=target.import_cursor(SOURCE)?;let tx=db.transaction().map_err(error)?;let source=state(&tx)?;let after=position(cursor.as_deref(),&source.namespace)?;
-        if after.0>source.epoch||(after.0==source.epoch&&after.1>source.high) {return Err("legacy source: source progress moved backwards; resume refused".into());}
-        if source.removed>after {return Err("legacy source: unimported records pruned; coverage unknown".into());}
+        let cursor=target.import_cursor(SOURCE)?;
+        let lock=crate::profile::read_log_lock(install_root).map_err(error)?;
+        let tx=db.transaction().map_err(error)?;drained(&tx,install_root)?;
+        let after=pending(&tx,cursor.as_deref())?.ok_or("legacy source: identity missing")?;let source=state(&tx)?;
         let mut read=tx.prepare("SELECT telemetry_epoch,seq,retained_ms,line FROM records WHERE telemetry_epoch>?1 OR (telemetry_epoch=?1 AND seq>?2) ORDER BY telemetry_epoch,seq LIMIT 1024").map_err(error)?;
         let rows=read.query_map(params![after.0,after.1],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).map_err(error)?.collect::<Result<Vec<_>,_>>().map_err(error)?;drop(read);
         if rows.is_empty() {return Ok(imported);}
@@ -90,7 +145,7 @@ pub(super) fn import(db: &mut Connection, target: &Store, install_root: &std::pa
             if events.len()+parts.len()>1024 {break;}
             clocks.extend(std::iter::repeat_n(*received,parts.len()));events.extend(parts);last=Some((*epoch,*seq));processed+=1;
         }
-        let last=last.ok_or("legacy source: source row exceeds import batch")?;let next=format!("v1.{}.{}.{}",source.namespace,last.0,last.1);tx.commit().map_err(error)?;
+        let last=last.ok_or("legacy source: source row exceeds import batch")?;let next=format!("v1.{}.{}.{}",source.namespace,last.0,last.1);tx.commit().map_err(error)?;drop(lock);
         target.import_history(SOURCE,cursor.as_deref(),&next,&events,&clocks)?;imported+=processed;
     }
 }
@@ -166,7 +221,7 @@ mod tests {
         {let tx=archive.transaction().unwrap();for _ in 0..1023 {add(&tx);}tx.commit().unwrap();}
         let ops=(0..1200).map(|mut i|{let mut route=String::from("route");for _ in 0..4 {route.push((b'a'+(i%26) as u8) as char);i/=26;}(format!("GET issues/N/{route}"),serde_json::json!(1))}).collect::<serde_json::Map<_,_>>();
         let logical=serde_json::json!({"at_ms":1000,"source":"cli status","ops":ops});let line=format!("taskq-requests {logical}");assert!(line.len()>16<<10&&line.len()<=super::super::LINE_MAX);let received=now()-1000;
-        archive.execute("INSERT INTO records(retained_ms,line) VALUES(?1,?2)",params![received,line]).unwrap();install(&mut archive).unwrap();
+        archive.execute("INSERT INTO records(retained_ms,line) VALUES(?1,?2)",params![received,line]).unwrap();install_identity(&mut archive).unwrap();
         let state=state(&archive).unwrap();let parts=Event::split_identified(&format!("taskq.legacy.{}",state.namespace),"0.1024",super::super::semantic::observation(&line).unwrap()).unwrap();assert!(parts.len()>1);
         let path=dir.join("common");let target=Store::open(&path).unwrap();let inject=Connection::open(&path).unwrap();
         inject.execute_batch(&format!("CREATE TRIGGER reject_summary BEFORE INSERT ON events WHEN new.id='{}' BEGIN SELECT RAISE(ABORT,'injected summary part failure'); END",parts.last().unwrap().id())).unwrap();
@@ -181,7 +236,7 @@ mod tests {
     }
     #[test]
     fn removed_unimported_records_and_mutation_are_explicit_unknowns() {
-        let dir=dir();let mut archive=super::super::open(&dir).unwrap();add(&archive);add(&archive);install(&mut archive).unwrap();let target=Store::open(&dir.join("common")).unwrap();
+        let dir=dir();let mut archive=super::super::open(&dir).unwrap();add(&archive);add(&archive);install_identity(&mut archive).unwrap();let target=Store::open(&dir.join("common")).unwrap();
         archive.execute("DELETE FROM records WHERE seq=2",[]).unwrap();assert!(import(&mut archive,&target,&dir).unwrap_err().contains("unimported records pruned"));assert_eq!(target.import_cursor(SOURCE).unwrap(),None);
         archive.execute("UPDATE records SET line=?1 WHERE seq=1",[LINE.replace("10","11")]).unwrap();assert!(import(&mut archive,&target,&dir).unwrap_err().contains("mutated"));
         assert_eq!(target.export(0,0,10).unwrap()["events"],serde_json::json!([]));drop(archive);drop(target);std::fs::remove_dir_all(dir).unwrap();
@@ -230,7 +285,7 @@ mod tests {
         }after=page["next"].as_i64().unwrap();if page["more"]==false {break;}}
         let digest=|value:ring::digest::Digest|value.as_ref().iter().map(|byte|format!("{byte:02x}")).collect::<String>();
         let expected=digest(expected.finish());let actual=digest(actual.finish());assert_eq!(expected,actual);assert_eq!(retained,count);assert_eq!(target.storage().unwrap()["pruned_count"],0);
-        let indexed=super::super::semantic::read(&coreq::telemetry::Reader::open(&common).unwrap(),super::super::semantic::KINDS).unwrap();assert_eq!(crate::profile::legacy_reports(&indexed,at).unwrap(),reports);assert_eq!(crate::profile::legacy_reports(&restored,at).unwrap(),reports);
+        let indexed=super::super::semantic::read(&coreq::telemetry::Reader::open(&common).unwrap(),super::super::semantic::KINDS,"").unwrap();assert_eq!(crate::profile::legacy_reports(&indexed,at).unwrap(),reports);assert_eq!(crate::profile::legacy_reports(&restored,at).unwrap(),reports);
         let mut preserved=ring::digest::Context::new(&ring::digest::SHA256);let mut found=0;let mut after=0;
         loop {let page=target.export(0,after,1024).unwrap();for row in page["events"].as_array().unwrap() {if original_ids.contains(row["id"].as_str().unwrap()) {preserved.update((row.to_string()+"\n").as_bytes());found+=1;}}after=page["next"].as_i64().unwrap();if page["more"]==false {break;}}
         assert_eq!(found,original_ids.len());assert_eq!(preserved.finish().as_ref(),original_hash.as_ref());
@@ -242,7 +297,7 @@ mod tests {
     #[test]
     #[ignore="subprocess helper exercised by identity_installation_survives_kill_before_and_after_commit"]
     fn identity_crash_writer() {
-        let root=std::path::PathBuf::from(std::env::var_os("TASKQ_SOURCE_IDENTITY_ROOT").expect("owned fixture"));let mut archive=super::super::open(&root).unwrap();install(&mut archive).unwrap();
+        let root=std::path::PathBuf::from(std::env::var_os("TASKQ_SOURCE_IDENTITY_ROOT").expect("owned fixture"));let mut archive=super::super::open(&root).unwrap();install_identity(&mut archive).unwrap();
         std::fs::write(std::env::var_os("TASKQ_SOURCE_IDENTITY_MARKER").unwrap(),state(&archive).unwrap().namespace).unwrap();loop {std::thread::park();}
     }
     #[test]

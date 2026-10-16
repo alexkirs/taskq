@@ -1,7 +1,6 @@
 //! Installation-local telemetry. All storage mutations share the installation budget lock; export is read-only.
 mod semantic;
 pub(crate) mod diagnostic;
-#[cfg(test)]
 mod source;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -147,17 +146,25 @@ pub fn observe(line:&str)->Result<(),String> {
     coreq::telemetry::capture::observe(semantic::observation(line.trim_end())?)
 }
 
+/// One owner uses the existing election and budget; live collectors must be quiesced first.
+pub fn migrate(install:&Path)->Result<u64,String> {
+    let path=install.join("telemetry.log/universal.sqlite3");
+    let _owner=coreq::telemetry::maintenance(&path)?;
+    if !has_legacy(install)? {return Ok(0);}
+    let mut archive=source::prepare(install)?;
+    let target=coreq::telemetry::Store::open_bounded(&path,budget(install,"telemetry.sqlite3")?)?;
+    source::import(&mut archive,&target,install)
+}
+
 pub fn report_input(install:&Path)->Result<String,String> {
     // Include this process's admitted records before taking the committed snapshot.
     tracing::dispatcher::get_default(|d|d.downcast_ref::<coreq::telemetry::capture::Capture>().cloned()).map(|capture|capture.flush()).transpose()?;
     tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),|| {
-        let mut text=legacy_rows(install)?.into_iter().map(|(_,_,line)|line+"\n").collect::<String>();
         let path=install.join("telemetry.log/universal.sqlite3");
-        if path.try_exists().map_err(|e|e.to_string())? {
-            let reader=coreq::telemetry::Reader::open(&path)?;
-            text.push_str(&semantic::read(&reader,semantic::KINDS)?);
-        }
-        Ok(text)
+        let reader=path.try_exists().map_err(|e|e.to_string())?.then(||coreq::telemetry::Reader::open(&path)).transpose()?;
+        let cursor=reader.as_ref().map(|r|r.import_cursor("taskq.legacy")).transpose()?.flatten();
+        let archive=legacy_rows(install,cursor.as_deref())?.into_iter().map(|(_,_,line)|line+"\n").collect::<String>();
+        match reader {Some(reader)=>semantic::read(&reader,semantic::KINDS,&archive),None=>Ok(archive)}
     })
 }
 
@@ -186,10 +193,11 @@ pub fn read(install: &Path, now: u64) -> Result<String, String> {
 }
 
 /// Transitional archive view; the service alone imports text and performs retention.
-fn legacy_rows(install: &Path) -> Result<Vec<(i64,i64,String)>,String> {
+fn legacy_rows(install: &Path,cursor:Option<&str>) -> Result<Vec<(i64,i64,String)>,String> {
     let path=install.join("telemetry.log/telemetry.sqlite3");
     match std::fs::metadata(&path) {
         Err(e) if e.kind()==std::io::ErrorKind::NotFound => {
+            if cursor.is_some() {return Err("legacy source: imported archive missing; coverage unknown".into());}
             if legacy_text(install)?.lines().any(telemetry) {return Err("legacy telemetry awaits service import".into());}
             return Ok(Vec::new());
         }
@@ -204,8 +212,11 @@ fn legacy_rows(install: &Path) -> Result<Vec<(i64,i64,String)>,String> {
     if app!=APP||version!=1 {return Err("legacy snapshot: foreign or unsupported schema; preserved".into());}
     let text=legacy_text(install)?;let offset=legacy_offset(&db,&text)?.unwrap_or(0);
     if text[offset..].lines().any(telemetry) {return Err("legacy telemetry awaits service import".into());}
-    let mut statement=db.prepare("SELECT seq,retained_ms,line FROM records ORDER BY seq").map_err(|e|e.to_string())?;
-    let rows=statement.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?))).map_err(|e|e.to_string())?
+    let after=source::pending(&db,cursor)?;
+    let sql=if after.is_some() {"SELECT seq,retained_ms,line FROM records WHERE telemetry_epoch>?1 OR (telemetry_epoch=?1 AND seq>?2) ORDER BY telemetry_epoch,seq"} else {"SELECT seq,retained_ms,line FROM records WHERE ?1=-1 AND ?2=0 ORDER BY seq"};
+    let mut statement=db.prepare(sql).map_err(|e|e.to_string())?;
+    let after=after.unwrap_or((-1,0));
+    let rows=statement.query_map(params![after.0,after.1],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?))).map_err(|e|e.to_string())?
         .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
     drop(statement);drop(db);drop(_lock);
     if rows.iter().any(|(seq,received,line)|*seq<=0||*received<0||line.len()>LINE_MAX) {
@@ -214,9 +225,9 @@ fn legacy_rows(install: &Path) -> Result<Vec<(i64,i64,String)>,String> {
     Ok(rows)
 }
 
-fn legacy_export(install:&Path,since:Option<u64>)->Result<(serde_json::Value,String),String> {
+fn legacy_export(install:&Path,since:Option<u64>,cursor:Option<&str>)->Result<(serde_json::Value,String),String> {
     use serde_json::json;
-    let rows=legacy_rows(install)?;
+    let rows=legacy_rows(install,cursor)?;
     if !install.join("telemetry.log/telemetry.sqlite3").try_exists().map_err(|e|e.to_string())? {
         return Ok((json!({"state":"absent","samples":0}),String::new()));
     }
@@ -258,10 +269,11 @@ fn export_snapshot(install:&Path,since:Option<u64>) -> Result<String,String> {
         if page["more"]==false {break;}
         page=reader.export(since_i64,page["next"].as_i64().ok_or("invalid telemetry export cursor")?,1024)?;
     }
-    drop(reader); // Release the WAL snapshot before archive locking and external output.
     universal["samples"]=json!(samples);
-    let (legacy,old)=legacy_export(install,since)?;
-    let header=json!({"schema":2,"coverage":"independent-committed-snapshots","since_ms":since,"sources":{"universal":universal,"legacy":legacy}});
+    let cursor=reader.import_cursor("taskq.legacy")?;
+    let (legacy,old)=legacy_export(install,since,cursor.as_deref())?;
+    drop(reader); // Source filtering and target rows share one import-cursor snapshot.
+    let header=json!({"schema":2,"coverage":"committed-import-cursor-snapshot","since_ms":since,"sources":{"universal":universal,"legacy":legacy}});
     Ok(header.to_string()+"\n"+&out+&old)
 }
 
@@ -272,7 +284,7 @@ fn has_legacy(install:&Path)->Result<bool,String> {
 
 /// Existing service owns archive retention; never create an empty replacement legacy sink.
 pub fn prune(install: &Path, now: u64) -> Result<(), String> {
-    if !has_legacy(install)? {return Ok(());}
+    if !has_legacy(install)?||source::preserved(install)? {return Ok(());}
     let mut db = open(install)?;
     import(&mut db, install, now)?;
     loop {
@@ -291,6 +303,50 @@ mod tests {
         let d = std::env::temp_dir().join(format!("taskq-sqlite-{}-{}", std::process::id(), crate::runtime::uuid()));
         std::fs::create_dir(&d).unwrap(); d
     }
+    // Chain: product migration retry -> mixed reports -> original clocks, archive and rollback reader.
+    #[test]
+    fn maintenance_migration_retries_without_duplicate_reports_or_retention_reset() {
+        let d=dir();drop(crate::profile::log_lock(&d.join("taskq.log")).unwrap());
+        let now=std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let received=now-60_000;
+        let line=r#"taskq-profile {"op":"spawn","us":7,"error":"none","at_ms":1}"#;
+        let mut archive=open(&d).unwrap();
+        {let tx=archive.transaction().unwrap();for i in 0..1100 {
+            let stage=if i==1023 {Some(r#"taskq-stage {"project":"o/r","host":"mac","stage":"build","task":1,"attempt":1,"rt":"claude","open":true,"outcome":"unknown","error":"none","at_ms":1,"unknown":"open-stage"}"#)}
+                else if i==1024 {Some(r#"taskq-stage {"project":"o/r","host":"mac","stage":"build","task":1,"attempt":1,"rt":"claude","open":false,"outcome":"ok","error":"none","at_ms":1}"#)} else {None};
+            insert(&tx,stage.unwrap_or(line),received).unwrap();
+        }tx.commit().unwrap();}
+        checkpoint(&archive).unwrap();drop(archive);
+        let expected=crate::profile::legacy_reports(&report_input(&d).unwrap(),now).unwrap();
+        let path=d.join("telemetry.log/universal.sqlite3");drop(coreq::telemetry::Store::open(&path).unwrap());
+        let inject=Connection::open(&path).unwrap();
+        inject.execute_batch("CREATE TABLE imports(source TEXT PRIMARY KEY,cursor TEXT NOT NULL,receipt TEXT NOT NULL); CREATE TRIGGER refuse_second BEFORE UPDATE ON imports BEGIN SELECT RAISE(ABORT,'injected second batch failure'); END").unwrap();
+        assert!(migrate(&d).unwrap_err().contains("injected second batch failure"));
+        assert_eq!(crate::profile::legacy_reports(&report_input(&d).unwrap(),now).unwrap(),expected,"partly committed import double-counted history");
+        let cursor=coreq::telemetry::Reader::open(&path).unwrap().import_cursor("taskq.legacy").unwrap().unwrap();
+        assert!(cursor.ends_with(".0.1024"));
+        inject.execute_batch("DROP TRIGGER refuse_second").unwrap();drop(inject);
+        assert_eq!(migrate(&d).unwrap(),76);assert_eq!(migrate(&d).unwrap(),0);
+        assert_eq!(crate::profile::legacy_reports(&report_input(&d).unwrap(),now).unwrap(),expected);
+        let exported=export(&d,None).unwrap();let rows=exported.lines().map(|s|serde_json::from_str::<serde_json::Value>(s).unwrap()).collect::<Vec<_>>();
+        assert_eq!(rows.len(),1101);assert_eq!(rows[0]["sources"]["legacy"]["samples"],0);
+        assert!(rows[1..].iter().all(|r|r["received_ms"]==received));
+        let old=open(&d).unwrap();insert(&old,line,received+1).unwrap();checkpoint(&old).unwrap();
+        assert_eq!(report_input(&d).unwrap().lines().count(),1101,"old writer append vanished");
+        drop(old);assert_eq!(migrate(&d).unwrap(),1);
+        assert_eq!(read(&d,now).unwrap().lines().count(),1101,"compatible rollback reader lost history");
+        // Expired target records stay pruned even though the preserved archive still holds them.
+        let old=open(&d).unwrap();let seq:i64=old.query_row("SELECT max(seq) FROM records",[],|r|r.get(0)).unwrap();
+        insert(&old,line,1).unwrap();checkpoint(&old).unwrap();drop(old);
+        assert_eq!(migrate(&d).unwrap(),1);
+        assert_eq!(report_input(&d).unwrap().lines().count(),1101);
+        assert_eq!(migrate(&d).unwrap(),0);
+        assert_eq!(read(&d,now).unwrap().lines().count(),(seq+1) as usize);
+        prune(&d,now+WINDOW_MS+1).unwrap();
+        assert_eq!(read(&d,now).unwrap().lines().count(),(seq+1) as usize,"service retired the unaccepted migration source");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
     // Chain: retained semantic history + automatic observations -> read-only schema2 agent export.
     #[test]
     fn live_capacity_counts_retained_archive_without_deleting_it() {

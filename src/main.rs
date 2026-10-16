@@ -1531,6 +1531,10 @@ fn service_fields(root: &Path) -> String {
     out.join("\n")
 }
 
+#[tracing::instrument(name="service.command",skip_all,fields(coreq_operation=match args.pos.get(1).map(String::as_str).unwrap_or("") {
+    sub @ ("install"|"run"|"focus"|"pause"|"resume"|"capacity"|"permissions"|"resources"|"hold"|"release"|"recover"|"status"|"restart"|"stop"|"uninstall"|"list")=>sub,
+    _=>"invalid",
+}))]
 fn service(args: &Args) -> Res<()> {
     let sub = args.pos.get(1).map(String::as_str).unwrap_or("");
     if sub == "run" {

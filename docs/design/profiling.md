@@ -127,6 +127,8 @@ Coverage is every executable product path, including UI input, windows, layout/r
 
 ## Process bootstrap
 
+Shared process execution forwards only the current trace/span identities in coreq's bounded process-context field. The child runtime consumes this link before application dispatch; a malformed field marks capture incomplete without changing the command outcome. Service commands and tray actions carry allowlisted operation suffixes, never argument values. Independent Stop/Uninstall launches use the same context helper and explicitly select the registered project through `TASKQ_ROOT`, so an inherited root cannot reject a command for another selected project. Their separate process group stays unchanged. Child command outcomes can be correlated after the tray exits; this is not a durable command receipt, proof of effective service state, process-tree supervision or UI acknowledgment.
+
 The thin root `entry.rs` initializes shared coreq capture before generated product execution. It records no arguments and reports collector initialization failure as unknown without changing command results. Bootstrap until subscriber installation is an explicit coverage exclusion; source inventory covers `src/`, not this wrapper. The shared runtime guard flushes on normal return and unwind; generated `std::process::exit` and explicit Unix exec boundaries flush before bypassing destructors. Open spans without a terminal remain unknown. Protected sandbox store access still needs qualification through the host writer; no grant changes are implied.
 
 ## Shared host writer

@@ -1183,7 +1183,10 @@ fn work_area(m: &tao::monitor::MonitorHandle) -> (i32, i32, i32, i32) {
     }
 }
 
-#[tracing::instrument(name="tray.act",skip_all)]
+#[tracing::instrument(name="tray.act",skip_all,fields(coreq_operation=match action {
+    "pause"|"resume"|"focus"|"update"|"restart"|"log"|"folder"|"incident-report"|"incident-manual"|"stop"|"uninstall"=>action,
+    _=>"invalid",
+}))]
 fn act(action: &str, root: &Path, label: Option<&str>) -> crate::Res<()> {
     let d = crate::dot(root);
     match action {
@@ -1226,11 +1229,13 @@ fn act(action: &str, root: &Path, label: Option<&str>) -> crate::Res<()> {
             let mut c = std::process::Command::new(me);
             c.args(["service", action])
                 .current_dir(root)
+                .env("TASKQ_ROOT", root)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
             #[cfg(unix)]
             std::os::unix::process::CommandExt::process_group(&mut c, 0);
+            coreq::telemetry::capture::inherit_context(&mut c);
             crate::platform::quiet(&mut c).spawn().map_err(|e| e.to_string())?;
         }
         _ => {}

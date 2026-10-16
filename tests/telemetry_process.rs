@@ -1,5 +1,30 @@
 use std::{fs, process::Command};
 
+// Chain: independent command handoff -> real CLI refusal -> causal history, with owner hold preserved.
+#[test]
+fn independent_cli_preserves_the_dispatch_trace_on_failure() {
+    let root=std::env::temp_dir().join(format!("qc-link-{}",std::process::id()));
+    let install=root.join("i");fs::create_dir_all(&install).unwrap();fs::create_dir_all(root.join(".taskq")).unwrap();
+    fs::write(install.join("hold"),"owner-held fixture").unwrap();
+    fs::write(root.join(".taskq/focus"),"off").unwrap();
+    let trace=format!("{}.1","a".repeat(32));let parent=format!("{}.2","b".repeat(32));
+    let out=Command::new(env!("CARGO_BIN_EXE_taskq")).args(["service","resume"])
+        .current_dir(&root).env("TASKQ_ROOT",&root).env("TASKQ_INSTALL",&install)
+        .env("TASKQ_INCIDENT_REPORTS","off").env("COREQ_TRACE_CONTEXT",format!("1 {trace} {parent}"))
+        .output().unwrap();
+    assert!(!out.status.success());assert!(String::from_utf8_lossy(&out.stderr).contains("no saved focus"));
+    assert_eq!(fs::read_to_string(root.join(".taskq/focus")).unwrap(),"off");
+    assert_eq!(fs::read_to_string(install.join("hold")).unwrap(),"owner-held fixture");
+    let reader=coreq::telemetry::Reader::open(&install.join("telemetry.log/universal.sqlite3")).unwrap();
+    let exported=reader.export(0,0,1024).unwrap();
+    let rows:Vec<_>=exported["events"].as_array().unwrap().iter().map(|r|&r["observation"]).collect();
+    let terminal=rows.iter().find(|r|r["operation"]=="taskq.resume"&&r["kind"]=="method").unwrap();
+    assert_eq!(terminal["trace"],trace,"CLI refusal lost its dispatch identity");
+    assert_eq!(terminal["outcome"],"failed");
+    assert!(rows.iter().any(|r|r["operation"]=="taskq.continuation"&&r["kind"]=="method.start"&&r["trace"]==trace&&r["parent"]==parent));
+    drop(reader);fs::remove_dir_all(root).unwrap();
+}
+
 // Chain: emergency state -> all registered wakeups -> partial failure, without undoing safety state.
 #[test]
 fn emergency_state_survives_failed_wakeup_and_notifies_other_projects() {

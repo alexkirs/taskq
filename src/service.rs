@@ -1445,10 +1445,14 @@ mod tests {
             let terminal = |name: &str| observations.iter().find(|r| r["operation"] == name && r["kind"] == "method").unwrap();
             let command = terminal("taskq.resume");
             let poke = terminal("taskq.poke");
+            let write = terminal("taskq.operation.wake.write");
             let wake = terminal("taskq.continuation");
             assert_eq!(poke["trace"], command["trace"]);
+            assert_eq!(write["trace"], command["trace"]);
+            assert_eq!(write["parent"], poke["span"]);
+            assert_eq!(write["outcome"], "ok");
             assert_eq!(wake["trace"], command["trace"]);
-            assert_eq!(wake["parent"], poke["span"]);
+            assert_eq!(wake["parent"], write["span"]);
             assert_eq!(terminal("taskq.service.Service.pass")["trace"], command["trace"]);
             if held {
                 assert!(observations.iter().any(|r| r["operation"] == "taskq.service.Service.may_launch" && r["kind"] == "method"

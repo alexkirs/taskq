@@ -78,10 +78,20 @@ impl Receipt {
     pub fn ok(&self) -> bool {
         self.outcome == "accepted"
     }
+    /// Notification failure cannot undo a confirmed board mutation or invite a duplicate write.
+    pub fn wake(mut self, root: &Path) -> Self {
+        if let Err(error) = poke(root) {
+            if self.ok() {
+                self.reason = error;
+                self.next = "Board change accepted; check service status; do not repeat the board write.".into();
+            }
+        }
+        self
+    }
     /// The § 5 text: `#N <state>` (plus extra lines), else `Error:` and `Next:`.
     pub fn text(&self) -> String {
         if self.ok() {
-            join(&[&format!("#{} {}", self.task, self.state.unwrap_or("unknown")), &self.extra]).replace("\n\n", "\n")
+            join(&[&format!("#{} {}", self.task, self.state.unwrap_or("unknown")), &self.extra, &self.reason, &self.next]).replace("\n\n", "\n")
         } else {
             let why = if self.reason.starts_with('#') { self.reason.clone() } else { format!("#{}: {}", self.task, self.reason) };
             format!("Error: {}\nNext: {}", crate::compact(&why, 153), crate::compact(&self.next, 154))
@@ -128,8 +138,8 @@ fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &
     if let Some(id) = &op.id
         && log.iter().any(|e| !e.edited && core::op_id(n, &e.body) == Some(id.as_str()))
     {
-        // a retry: the first write stands, nothing more is written (even after it cleared the attempt)
-        return accepted(if issue.open { before.state } else { State::Closed }, rev);
+        // a retry: the first write stands, no further board write (even after it cleared the attempt)
+        return accepted(if issue.open { before.state } else { State::Closed }, rev).wake(root);
     }
     if let Some(why) = child.and_then(|env| stale_child(n, kind, before.attempt, env)) {
         return Receipt { state: Some(before.state.name()), revision: Some(rev), next: "Run taskq from a fresh session of the live attempt, or unset TASKQ_TASK and TASKQ_ATTEMPT.".into(), ..Receipt::rejected(n, op, why) };
@@ -177,8 +187,7 @@ fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &
     if let Err(e) = service::project(b, &issue, &t) {
         return unknown(e);
     }
-    poke(root);
-    accepted(t.state, rev)
+    accepted(t.state, rev).wake(root)
 }
 
 /// § 7: publish a reviewed result, then `close`; later and failed tasks close without publication.
@@ -404,6 +413,30 @@ pub fn recover(b: &dyn Board, root: &Path, rows: &[Row]) -> Vec<Receipt> {
 mod tests {
     use super::*;
     use crate::board::Fake;
+
+    // Chain: committed board mutation -> failed wake -> same op retry; never duplicate the board write.
+    #[test]
+    fn wake_failure_preserves_acceptance_and_retry_only_notifies() {
+        let b = Fake::default();
+        let root = std::env::temp_dir().join(format!("taskq-wake-receipt-{}", std::process::id()));
+        let path = crate::dot(&root).join("poke");
+        std::fs::create_dir_all(&path).unwrap();
+        let n = b.create("Wake fixture", "## Goal\ng", &["taskq".into()]).unwrap();
+        let op = Op { id: Some("hold-once".into()), revision: None };
+        let first = act(&b, &root, n, "hold", &[], "", &op);
+        assert!(first.ok(), "{}", first.text());
+        assert!(first.text().contains("service wake failed"));
+        assert!(first.json().contains("wake-open"));
+        let before = entries(&b, n).unwrap();
+        assert_eq!(first.state, Some("held"));
+        std::fs::remove_dir(&path).unwrap();
+        let retry = act(&b, &root, n, "hold", &[], "", &op);
+        assert!(retry.ok()); assert!(retry.reason.is_empty());
+        assert_eq!(retry.revision, first.revision);
+        assert_eq!(entries(&b, n).unwrap().len(), before.len());
+        assert!(path.is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     // Chain: § 5 stale child environment (#1072). Risk: a reused session's TASKQ_TASK/TASKQ_ATTEMPT writes unfenced or ignored.
     #[test]

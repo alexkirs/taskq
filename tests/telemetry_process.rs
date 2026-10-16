@@ -1,5 +1,35 @@
 use std::{fs, process::Command};
 
+// Chain: emergency state -> all registered wakeups -> partial failure, without undoing safety state.
+#[test]
+fn emergency_state_survives_failed_wakeup_and_notifies_other_projects() {
+    let root=std::env::temp_dir().join(format!("qh-{}",std::process::id()));
+    let install=root.join("i"); let good=root.join("good"); let bad=root.join("bad");
+    fs::create_dir_all(&install).unwrap();
+    fs::create_dir_all(bad.join(".taskq/poke")).unwrap();
+    fs::write(install.join("projects"),format!("{}\n{}\n",bad.display(),good.display())).unwrap();
+    let invoke=|command|Command::new(env!("CARGO_BIN_EXE_taskq")).args(["service",command])
+        .current_dir(&root).env("TASKQ_ROOT",&root).env("TASKQ_INSTALL",&install)
+        .env("TASKQ_INCIDENT_REPORTS","off").output().unwrap();
+    for command in ["hold","release"] {
+        let out=invoke(command);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("1 service wake(s) failed"));
+        assert_eq!(install.join("hold").is_file(),command=="hold");
+        assert!(good.join(".taskq/poke").is_file(),"first failure prevented notification of the next project");
+        fs::remove_file(good.join(".taskq/poke")).unwrap();
+    }
+    fs::remove_file(install.join("projects")).unwrap();
+    fs::create_dir(install.join("projects")).unwrap();
+    let out=invoke("hold");
+    assert!(!out.status.success()); assert!(install.join("hold").is_file());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("project registry unreadable"));
+    let store=coreq::telemetry::Reader::open(&install.join("telemetry.log/universal.sqlite3")).unwrap();
+    let rows=store.export(0,0,1024).unwrap();
+    assert!(rows["events"].as_array().unwrap().iter().any(|r|r["observation"]["error"]=="registry-unreadable"));
+    drop(store); fs::remove_dir_all(root).unwrap();
+}
+
 // Chain: Resume refusal/success -> focus readback -> durable linked trace after process exit.
 // Risk: a successful command is mistaken for admission, or a failed command disappears from history.
 #[test]
@@ -21,6 +51,14 @@ fn resume_records_its_result_without_releasing_the_host_hold() {
     assert!(resumed.status.success(),"{}",String::from_utf8_lossy(&resumed.stderr));
     assert_eq!(fs::read_to_string(root.join(".taskq/focus")).unwrap(),"telemetry-fixture");
     assert_eq!(fs::read_to_string(install.join("hold")).unwrap(),"owner-held fixture");
+    fs::write(root.join(".taskq/focus"),"off").unwrap();
+    fs::remove_file(root.join(".taskq/poke")).unwrap();
+    fs::create_dir(root.join(".taskq/poke")).unwrap();
+    let undelivered=invoke();
+    assert!(!undelivered.status.success(),"Resume reported success when its wake signal could not be written");
+    assert!(String::from_utf8_lossy(&undelivered.stderr).contains("service wake failed"));
+    assert_eq!(fs::read_to_string(root.join(".taskq/focus")).unwrap(),"telemetry-fixture","wake failure must not roll back saved focus");
+    assert_eq!(fs::read_to_string(install.join("hold")).unwrap(),"owner-held fixture");
     let exported=Command::new(env!("CARGO_BIN_EXE_taskq")).args(["profile","export"])
         .current_dir(&root).env("TASKQ_ROOT",&root).env("TASKQ_INSTALL",&install)
         .env("TASKQ_INCIDENT_REPORTS","off").output().unwrap();
@@ -30,8 +68,10 @@ fn resume_records_its_result_without_releasing_the_host_hold() {
     assert_eq!(rows[0]["schema"],2);assert_eq!(rows[0]["coverage"],"independent-committed-snapshots");
     let observations:Vec<_>=rows[1..].iter().map(|r|&r["observation"]).collect();
     let terminals:Vec<_>=observations.iter().filter(|r|r["operation"]=="taskq.resume"&&r["kind"]=="method").collect();
-    assert_eq!(terminals.len(),2);
+    assert_eq!(terminals.len(),3);
     assert_eq!(terminals[0]["outcome"],"failed");assert_eq!(terminals[1]["outcome"],"ok");
+    assert_eq!(terminals[2]["outcome"],"failed");
+    assert!(observations.iter().any(|r|r["operation"]=="taskq.operation.wake.write"&&r["kind"]=="method"&&r["error"]=="wake-open"&&r["trace"]==terminals[2]["trace"]));
     assert_ne!(terminals[0]["trace"],terminals[1]["trace"]);
     for terminal in terminals {
         assert!(terminal["duration_us"].as_u64().is_some());

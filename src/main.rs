@@ -248,20 +248,17 @@ fn dot(root: &Path) -> PathBuf {
 }
 
 #[tracing::instrument(name="poke",skip_all)]
-fn poke(root: &Path) {
+fn poke(root: &Path) -> Res<()> {
     use std::io::Write;
-    let _ = fs::create_dir_all(dot(root));
-    let context = coreq::telemetry::capture::TraceContext::current().map(|c| c.encode()).unwrap_or_else(|| ".".into());
-    // Lock the existing signal so a reader cannot accept ids mixed from two concurrent writes.
-    let written = (|| -> Res<()> {
-        let mut file = fs::OpenOptions::new().write(true).create(true).truncate(false).open(dot(root).join("poke")).map_err(|_| "poke-open")?;
-        file.try_lock().map_err(|_| "poke-lock")?;
-        file.set_len(0).map_err(|_| "poke-truncate")?;
-        file.write_all(context.as_bytes()).map_err(|_| "poke-write".into())
-    })();
-    if written.is_err() {
-        tracing::error!(error = "poke-write");
-    }
+    coreq::telemetry::capture::operation("wake.write", || {
+        fs::create_dir_all(dot(root)).map_err(|_| "wake-directory")?;
+        let context = coreq::telemetry::capture::TraceContext::current().map(|c| c.encode()).unwrap_or_else(|| ".".into());
+        // Lock the existing signal so a reader cannot accept ids mixed from two concurrent writes.
+        let mut file = fs::OpenOptions::new().write(true).create(true).truncate(false).open(dot(root).join("poke")).map_err(|_| "wake-open")?;
+        file.try_lock().map_err(|_| "wake-lock")?;
+        file.set_len(0).map_err(|_| "wake-truncate")?;
+        file.write_all(context.as_bytes()).map_err(|_| "wake-write")
+    }, |class| *class).map_err(|class| format!("service wake failed ({class}); state may already be saved; check service status"))
 }
 
 fn wake_context(path: &Path, seen: &mut Option<String>) -> Res<Option<coreq::telemetry::capture::TraceContext>> {
@@ -1068,7 +1065,7 @@ fn write_capacity(root: &Path, host: &str, e: &CapEdit, expect: Option<&Value>) 
     platform::write_atomic(&p, &out)?;
     let saved = service::capacity(&serde_json::from_str(&read()?).map_err(|e| e.to_string())?, host)?;
     if host == cfg.me {
-        poke(root);
+        poke(root)?;
     }
     Ok((old, saved))
 }
@@ -1361,7 +1358,7 @@ fn set_focus(root: &Path, f: &str, request: Option<&str>) -> Res<()> {
             let _ = fs::remove_file(d.join("focus.request"));
         }
     }
-    poke(root);
+    poke(root)?;
     Ok(())
 }
 
@@ -1384,7 +1381,7 @@ fn pause(root: &Path) -> Res<()> {
         fs::write(d.join("focus.paused"), f).map_err(|e| e.to_string())?;
     }
     fs::write(d.join("focus"), "off").map_err(|e| e.to_string())?;
-    poke(root);
+    poke(root)?;
     Ok(())
 }
 
@@ -1397,7 +1394,7 @@ fn resume(root: &Path) -> Res<String> {
         return Err(format!("no saved focus: choose with `taskq service focus all|<label..>`; labels of open tasks: {}", status_labels(root).join(", ")));
     }
     fs::write(d.join("focus"), &f).map_err(|e| e.to_string())?;
-    poke(root);
+    poke(root)?;
     Ok(f.trim().to_string())
 }
 
@@ -1414,7 +1411,7 @@ fn handover(root: &Path) -> bool {
 fn load_unit(u: &platform::Unit, root: &Path) -> Res<bool> {
     if handover(root) {
         fs::write(dot(root).join("restart"), "").map_err(|e| e.to_string())?;
-        poke(root);
+        poke(root)?;
         return Ok(true);
     }
     platform::run_all(&u.unload, true)?;
@@ -1591,7 +1588,7 @@ fn service(args: &Args) -> Res<()> {
         "restart" => {
             fs::create_dir_all(&d).map_err(|e| e.to_string())?;
             fs::write(d.join("restart"), "").map_err(|e| e.to_string())?;
-            poke(&root);
+            poke(&root)?;
             println!("Restart requested for {}", project_name(&root));
             Ok(())
         }
@@ -1640,6 +1637,7 @@ fn service(args: &Args) -> Res<()> {
 }
 
 /// § 4 emergency hold: write or remove `<install>/hold`, then poke every registered project so its service reads it.
+#[tracing::instrument(name="hold",skip_all,fields(coreq_operation=if on {"set"} else {"release"}))]
 fn hold_cmd(on: bool, reason: Option<&str>) -> Res<()> {
     let install = platform::default_install();
     let path = install.join("hold");
@@ -1650,18 +1648,23 @@ fn hold_cmd(on: bool, reason: Option<&str>) -> Res<()> {
     } else if let Err(e) = fs::remove_file(&path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }) {
         return Err(format!("hold file: {e}; still held"));
     }
-    for r in fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter(|l| !l.is_empty()) {
-        poke(Path::new(r));
+    let projects = coreq::telemetry::capture::operation("wake.projects", || {
+        fs::read_to_string(install.join("projects")).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(String::new()) } else { Err(e) })
+    }, |_| "registry-unreadable").map_err(|_| "Hold state saved; project registry unreadable; service notification unknown")?;
+    let mut failed = 0;
+    for r in projects.lines().filter(|l| !l.is_empty()) {
+        if poke(Path::new(r)).is_err() { failed += 1; }
     }
+    let notification = if failed == 0 { Ok(()) } else { Err(format!("Hold state saved; {failed} service wake(s) failed; check service status")) };
     if !on {
         println!("Hold released on {}; launches follow each project's focus", hostname());
-        return Ok(());
+        return notification;
     }
     println!("Hold on {}: new launches refused until `taskq service release`; live children continue", hostname());
     for o in admission::old_services(&install) {
         println!("Not enforced: {o} is older than {}", admission::MIN_SERVICE);
     }
-    Ok(())
+    notification
 }
 
 /// § 4 recovery: list this host's interrupted attempts and their fencing ops; `--apply` writes them through the
@@ -1799,8 +1802,7 @@ fn add_task(b: &dyn Board, root: &Path, raw: &Value, t: &NewTask, op: &Op) -> Re
         (_, Some(text)) => act(b, root, n, "later", &[], text, &Op::default()),
         _ => Receipt::accepted(n, op, fold(n, &[], blocked).state, 0),
     };
-    poke(root);
-    Ok(Receipt { op_id: op.id.clone(), ..r })
+    Ok(Receipt { op_id: op.id.clone(), ..r }.wake(root))
 }
 
 /// § 7 recipe run: every task is added held with op id `recipe.<name>.<version>.<run>.<k>` and read back; only then,
@@ -2192,7 +2194,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                 finding_request = json!({"board": identity, "start": a.flags.contains_key("start")}).to_string();
                 body += &format!("\nop-id: {}\n", op.id.as_deref().unwrap());
                 let (create, start) = finding_submit(b, &c.raw, root, title, &body, &labels, &finding_request, &op, a.flags.contains_key("start"));
-                if create.ok() { poke(root); }
+                let create = if create.ok() { create.wake(root) } else { create };
                 return emit_finding(create, start, json);
             } else if ["start", "source", "board", "evidence"].iter().any(|f| a.flags.contains_key(*f)) {
                 return Err("--start/--source/--board/--evidence require finding".into());
@@ -2409,12 +2411,12 @@ mod tests {
         assert_eq!(wake_context(&path, &mut seen).unwrap_err(), "wakeup context busy");
         writer.unlock().unwrap();
         writer.try_lock_shared().unwrap();
-        poke(&root);
+        assert!(poke(&root).unwrap_err().contains("wake-lock"));
         assert_eq!(fs::read_to_string(&path).unwrap(), context, "busy reader allowed a partial overwrite");
         assert_eq!(wake_context(&path, &mut seen).unwrap().unwrap().encode(), context);
         assert!(wake_context(&path, &mut seen).unwrap().is_none());
         drop(writer);
-        poke(&root);
+        poke(&root).unwrap();
         assert!(wake_context(&path, &mut seen).unwrap().is_none());
         fs::remove_dir_all(root).unwrap();
     }

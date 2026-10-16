@@ -29,7 +29,7 @@ fn answer(root: &Path, id: &str, mut v: Value) {
     v["id"] = json!(id);
     v["rev"] = json!(read(&answer_path(root, id))["rev"].as_u64().unwrap_or(0) + 1);
     let _ = crate::platform::write_atomic(&answer_path(root, id), &v.to_string());
-    crate::poke(root);
+    let _ = crate::poke(root);
 }
 
 /// Request ids, oldest first: the tray names them by epoch milliseconds, so only digits.

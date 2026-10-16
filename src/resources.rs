@@ -419,7 +419,7 @@ fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now
     if let Err(x) = crate::platform::write_atomic(&path, &out) {
         return Ok(Some(format!("resources: {op} unknown: {x}")));
     }
-    crate::poke(&root);
+    let wake = crate::poke(&root);
     let saved = policy(&root).ok().map(|x| x.1);
     let Some(saved) = saved.filter(|x| Some(x) == want.as_ref()) else {
         return Ok(Some(format!("resources: {op} unknown: readback differs")));
@@ -429,7 +429,7 @@ fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now
     o.receipt = receipt(&t, &op, "saved", None, Some(&rev), None, None);
     o.saved_at = Some(now);
     s.projects.insert(pid, Project { revision: rev, policy: saved, since: now, ..p });
-    Ok(Some(format!("resources: {op} saved")))
+    Ok(Some(match wake { Ok(()) => format!("resources: {op} saved"), Err(error) => format!("resources: {op} saved; {error}") }))
 }
 
 /// A cancellation: a recorded operation repeats its receipt (a completed write is never rolled back); an unknown

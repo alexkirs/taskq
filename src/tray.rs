@@ -202,7 +202,7 @@ fn ai(install: &Path, a: &str, m: &Value) {
             if crate::platform::write_atomic(&crate::operator::dir(root).join(format!("{id}.json")), &json!({"text": text, "after": after, "onboard": onboard}).to_string()).is_err() {
                 return;
             }
-            crate::poke(root);
+            let _ = crate::poke(root);
             if onboard.is_some() {
                 return;
             }
@@ -213,7 +213,7 @@ fn ai(install: &Path, a: &str, m: &Value) {
             let (r, id) = (m["root"].as_str().unwrap_or(""), m["id"].as_str().unwrap_or(""));
             if roots(install).iter().any(|x| x == r) && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
                 let _ = fs::write(crate::operator::dir(Path::new(r)).join(format!("{id}.confirm")), m["rev"].as_u64().unwrap_or(0).to_string());
-                crate::poke(Path::new(r));
+                let _ = crate::poke(Path::new(r));
             }
             return;
         }
@@ -1200,11 +1200,11 @@ fn act(action: &str, root: &Path, label: Option<&str>) -> crate::Res<()> {
         // `Update now` (menu.md M9): the service checks at once (§ 4 step 7); the page waits for the version in status.json
         "update" => {
             fs::write(d.join("update"), "").map_err(|e| e.to_string())?;
-            crate::poke(root);
+            crate::poke(root)?;
         }
         "restart" => {
             fs::write(d.join("restart"), "").map_err(|e| e.to_string())?;
-            crate::poke(root);
+            crate::poke(root)?;
         }
         "log" => {
             let s: Value = fs::read_to_string(d.join("status.json")).ok().and_then(|x| serde_json::from_str(&x).ok()).unwrap_or_default();

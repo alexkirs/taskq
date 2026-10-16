@@ -600,10 +600,11 @@ struct WebCalls {
     saturated: bool,
     failed: bool,
     notified: bool,
+    metadata_unknown: bool,
 }
 impl WebCalls {
     fn new() -> Self {
-        let mut calls=Self{next:0,pending:Default::default(),counts:[0;4],saturated:false,failed:false,notified:false};
+        let mut calls=Self{next:0,pending:Default::default(),counts:[0;4],saturated:false,failed:false,notified:false,metadata_unknown:false};
         calls.begin("tray.web.boot",Instant::now());
         calls
     }
@@ -633,6 +634,15 @@ impl WebCalls {
     fn expire(&mut self, now: Instant) {
         let expired:Vec<_>=self.pending.iter().filter(|(_, (start,_))|now.duration_since(*start)>=Duration::from_secs(30)).map(|(id,_)|*id).collect();
         for id in expired {self.finish(id,"ack-timeout");}
+    }
+    fn metadata(&mut self, row:&Value)->bool {
+        let value=match web_observation(row){Ok(value)=>value,Err(_)=>{self.fault("invalid-web-observation");return false;}};
+        if let Err(error)=coreq::telemetry::capture::observe_linked(value)&&!self.metadata_unknown {
+            self.metadata_unknown=true;
+            eprintln!("taskq tray: activity history incomplete ({error}); command confirmations remain separate");
+            return true;
+        }
+        false
     }
     fn errors(&mut self, message: &Value) {
         let Some(values)=message["counts"].as_array().filter(|v|v.len()==4) else {self.fault("invalid-error-report");return;};
@@ -940,7 +950,9 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 let Some((w, _)) = &ui else { return };
                 if m["a"]=="web-error" {web.errors(&m);return;}
                 if m["a"]=="web-observation" {
-                    if web_observation(&m["row"]).and_then(coreq::telemetry::capture::observe_linked).is_err(){web.fault("web-capture-unavailable");}
+                    if web.metadata(&m["row"])&&let Some(tray)=&tray {
+                        let _=tray.set_tooltip(Some("TaskQ: activity history incomplete; check each command confirmation"));
+                    }
                     return;
                 }
                 let context=match m["context"].as_str(){Some(text)=>match coreq::telemetry::capture::TraceContext::decode(text){Ok(context)=>Some(context),Err(_)=>{web.fault("invalid-web-context");return;}},None=>None};
@@ -2145,6 +2157,12 @@ mod tests {
     fn web_metadata_is_allowlisted_and_aggregate_identity_is_explicitly_unknown() {
         let row=json!({"operation":"js.tray.create.mode","kind":"method.aggregate","started_ms":1,"counts":{"calls":2,"finished":2,"failed":0,"unknown":0},"outcome":"ok","error":"none"});
         let accepted=web_observation(&row).unwrap();
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),||{
+            let mut calls=WebCalls::new();
+            assert!(calls.metadata(&row),"missing collector must be visible");
+            assert!(calls.metadata_unknown);assert!(!calls.failed,"optional metadata disabled command controls");
+            assert!(!calls.metadata(&row),"same outage repeated its notification");
+        });
         assert_eq!(accepted["unknown"]["trace"],"aggregate-unlinked");
         for (key,value) in [("message",json!("private")),("operation",json!("js.private-data")),("trace",json!("/private/path")),("counts",json!({"private":1})),("error",json!("raw-error"))] {
             let mut invalid=row.clone();invalid[key]=value;assert!(web_observation(&invalid).is_err(),"{key}");

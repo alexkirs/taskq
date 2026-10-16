@@ -9,13 +9,13 @@ cd "$t"
 git init -q . && git config user.email t@t && git config user.name t && git config core.autocrlf false
 mkdir -p src docs/design docs/shots
 cp "$src" docs/shots/check.sh
-for f in src/tray.rs src/tray.html src/icon.rs docs/design/icon-summary.config.json; do echo "$f" > "$f"; done
+for f in src/tray.rs src/tray.html src/tray-web.js src/icon.rs docs/design/icon-summary.config.json; do echo "$f" > "$f"; done
 echo '![](docs/shots/a.png)' > README.md
 git add -A && git commit -qm ui
 manifest() { # $1: blob recorded for src/tray.rs
   printf '{\n  "sourceCommit": "%s",\n  "uiSources": {\n' "$(git rev-parse HEAD)"
   sep=''
-  for f in src/tray.rs src/tray.html src/icon.rs docs/design/icon-summary.config.json; do
+  for f in src/tray.rs src/tray.html src/tray-web.js src/icon.rs docs/design/icon-summary.config.json; do
     b=$(git rev-parse "HEAD:$f"); [ "$f" = src/tray.rs ] && b=$1
     printf '%s    "%s": "%s"' "$sep" "$f" "$b"; sep=',
 '

@@ -6,7 +6,7 @@
 set -eu
 cd "$(dirname "$0")/../.."
 m=docs/shots/manifest.json
-ui='src/tray.rs src/tray.html src/icon.rs docs/design/icon-summary.config.json'
+ui='src/tray.rs src/tray.html src/tray-web.js src/icon.rs docs/design/icon-summary.config.json'
 # parse the whole manifest first: a malformed one fails even when its sourceCommit line looks valid
 python3 -c 'import json, re, sys; m = json.load(open(sys.argv[1])); sys.exit(not re.fullmatch("[0-9a-f]{40}", m["sourceCommit"]))' $m 2>/dev/null ||
   { echo "check.sh: $m is missing, malformed or has no sourceCommit" >&2; exit 1; }

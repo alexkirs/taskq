@@ -1,7 +1,7 @@
 // Chain: #1115 Home bounded AI blocks after a reader scrolls them. Instrument with Playwright (Chromium); not native WKWebView proof.
 // Risk: a scroll stops mid-line in the exchange or the proposed changes, or alignment hides the first or last line.
 const fs=require('node:fs'),assert=require('node:assert/strict'),{chromium}=require('playwright');
-let html=fs.readFileSync('src/tray.html','utf8');
+let html=fs.readFileSync('src/tray.html','utf8').replace('{{TRAY_WEB_JS}}',fs.readFileSync('src/tray-web.js','utf8'));
 for(const k of ['ANSWER_CARD','PROJECT_BLOCKS','RESOURCE_CONTROLS'])for(const [ext,suffix] of [['css','_CSS'],['js','_JS']])
   html=html.replace('{{'+k+suffix+'}}',fs.readFileSync('src/'+k.toLowerCase().replace('_','-')+'.'+ext,'utf8'));
 const long=Array.from({length:30},(_,i)=>'Answer line '+(i+1)+' with enough words to wrap across the popover').join('\n');

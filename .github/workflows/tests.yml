@@ -23,6 +23,7 @@ jobs:
       - run: node tests/tray-next.test.cjs
       - run: node tests/tray-navigation.test.cjs
       - run: node tests/tray-press.test.cjs
+      - run: node tests/tray-web.test.cjs
       - run: node tests/tray-action.test.cjs
       - run: node tests/tray-incidents.test.cjs
       - run: node tests/answer-card.test.cjs

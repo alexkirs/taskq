@@ -3,7 +3,7 @@
 # copy the dark images here and write manifest.json (shape of docs/design/evidence/4.1.9/manifest.json).
 set -eu
 cd "$(dirname "$0")/../.."
-ui='src/tray.rs src/tray.html src/icon.rs docs/design/icon-summary.config.json'
+ui='src/tray.rs src/tray.html src/tray-web.js src/icon.rs docs/design/icon-summary.config.json'
 # the images must come from sourceCommit, so UI sources must be committed
 git diff --quiet HEAD -- $ui || { echo "update.sh: commit UI source changes first: $ui" >&2; exit 1; }
 cargo build --release --locked

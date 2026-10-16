@@ -3,7 +3,7 @@
 // disclosures, or the card breaks the project counter strip (K-A8). Instrument, not a CI gate (needs Playwright):
 // npm i --no-save playwright && node tests/answer-card.parent.cjs
 const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict'), {chromium} = require('playwright');
-const html = fs.readFileSync('src/tray.html', 'utf8')
+const html = fs.readFileSync('src/tray.html', 'utf8').replace('{{TRAY_WEB_JS}}',fs.readFileSync('src/tray-web.js','utf8'))
   .replace('{{ANSWER_CARD_CSS}}', fs.readFileSync('src/answer-card.css', 'utf8'))
   .replace('{{ANSWER_CARD_JS}}', fs.readFileSync('src/answer-card.js', 'utf8'))
   .replace('{{PROJECT_BLOCKS_CSS}}', fs.readFileSync('src/project-blocks.css', 'utf8'))

@@ -32,6 +32,7 @@ fn alone(install: &Path) -> bool {
 enum Ev {
     Tick,
     Ipc(String),
+    Evaluated(u64, &'static str),
     Click(Rect),
     Shot,
     Shot2,
@@ -591,6 +592,91 @@ impl FocusQueue {
     }
 }
 
+// The page owns asynchronous work; a submission result cannot acknowledge its execution.
+struct WebCalls {
+    next: u64,
+    pending: std::collections::BTreeMap<u64, (Instant, tracing::Span)>,
+    counts: [u64; 4],
+    saturated: bool,
+    failed: bool,
+    notified: bool,
+}
+impl WebCalls {
+    fn new() -> Self {
+        let mut calls=Self{next:0,pending:Default::default(),counts:[0;4],saturated:false,failed:false,notified:false};
+        calls.begin("tray.web.boot",Instant::now());
+        calls
+    }
+    fn begin(&mut self, name: &'static str, now: Instant) -> Option<u64> {
+        if self.pending.len()>=64 || self.next==u64::MAX {self.fault("pending-limit");return None;}
+        let id=self.next;self.next+=1;
+        self.pending.insert(id,(now,coreq::telemetry::capture::detached_span(name)));
+        Some(id)
+    }
+    fn fault(&mut self, reason: &'static str) {
+        if !self.failed {
+            self.failed=true;
+            eprintln!("taskq tray: interface outcomes unknown ({reason}); check service status before retry");
+            let _=coreq::telemetry::capture::operation("tray.web.delivery",||Err::<(),_>(reason),|code|*code);
+        }
+    }
+    fn finish(&mut self, id: u64, result: &'static str) {
+        let Some((_,span))=self.pending.remove(&id) else {return};
+        match result {
+            "ok" => {span.record("coreq_result","observed");}
+            "script-error"|"submit-error" => {
+                span.record("coreq_result","observed");span.record("coreq_error",result);self.fault(result);
+            }
+            _ => self.fault(result), // no callback is not proof that the script failed or did not run
+        }
+    }
+    fn expire(&mut self, now: Instant) {
+        let expired:Vec<_>=self.pending.iter().filter(|(_, (start,_))|now.duration_since(*start)>=Duration::from_secs(30)).map(|(id,_)|*id).collect();
+        for id in expired {self.finish(id,"ack-timeout");}
+    }
+    fn errors(&mut self, message: &Value) {
+        let Some(values)=message["counts"].as_array().filter(|v|v.len()==4) else {self.fault("invalid-error-report");return;};
+        let mut counts=[0;4];
+        for (i,value) in values.iter().enumerate() {
+            let Some(n)=value.as_u64().filter(|n|*n>=self.counts[i] && *n<=u32::MAX as u64) else {self.fault("invalid-error-report");return;};
+            counts[i]=n;
+        }
+        let Some(saturated)=message["saturated"].as_bool() else {self.fault("invalid-error-report");return;};
+        for (i,class) in ["script-error","unhandled-rejection","resource-error","evaluation-error"].iter().enumerate() {
+            let delta=counts[i]-self.counts[i];
+            if delta>0 {
+                // Page-wide counts have no reliable initiating click; do not invent a parent.
+                let span=coreq::telemetry::capture::detached_span("tray.web.error");
+                if !span.is_disabled() {tracing::info!(parent:&span,calls=delta);}
+                span.record("coreq_result","observed");span.record("coreq_error",*class);
+            }
+        }
+        self.counts=counts;
+        if saturated && !self.saturated {
+            self.saturated=true;
+            let _=coreq::telemetry::capture::operation("tray.web.error-counts",||Err::<(),_>("count-saturated"),|code|*code);
+            self.fault("error-count-saturated");
+        }
+        else if counts.iter().any(|n|*n>0) {self.fault("page-error");}
+    }
+}
+
+fn web_result(value: &str) -> &'static str {
+    match value {"\"ok\""=>"ok","\"script-error\""=>"script-error",_=>"invalid-ack"}
+}
+fn web_script(script: &str) -> String {
+    // eval catches syntax errors too; the callback contains only a fixed result code.
+    format!("(()=>{{try{{(0,eval)({});return 'ok';}}catch(_){{try{{window.taskqWebFault('evaluation');}}catch(_){{}}return 'script-error';}}}})()",json!(script))
+}
+fn web_eval(wv: &WebView, script: &str, name: &'static str, proxy: &tao::event_loop::EventLoopProxy<Ev>, calls: &mut WebCalls) {
+    if calls.pending.contains_key(&0) {calls.fault("page-not-ready");return;}
+    let Some(id)=calls.begin(name,Instant::now()) else {return};
+    let p=proxy.clone();
+    if wv.evaluate_script_with_callback(&web_script(script),move |value| {let _=p.send_event(Ev::Evaluated(id,web_result(&value)));}).is_err() {
+        calls.finish(id,"submit-error");
+    }
+}
+
 pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> Result<(), String> {
     if snapshot.is_none() && !alone(&install) {
         return Err("taskq tray already runs on this host".into());
@@ -644,11 +730,20 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
     let mut moved = false;
     let mut asked = false;
     let mut bursts = notify::Bursts::new();
+    let mut shot_wait=None;
+    let mut web=WebCalls::new();
     event_loop.run(move |event, target, flow| {
         *flow = ControlFlow::Wait;
-        let push = |ui: &Option<(Window, WebView)>, st: &Value| {
+        web.expire(Instant::now());
+        if web.failed && !web.notified {
+            web.notified=true;
+            if let Some(t)=&tray {let _=t.set_tooltip(Some("TaskQ: interface outcomes unknown; check service status"));}
+            if snapshot.is_none() && let Some((_,wv))=&ui {web_eval(wv,"window.taskqWebFault('native')","tray.web.notice",&proxy,&mut web);}
+        }
+        if web.failed && snapshot.is_some() && web.pending.is_empty() {std::process::exit(1);}
+        let push = |web: &mut WebCalls, ui: &Option<(Window, WebView)>, st: &Value| {
             if let Some((_, wv)) = ui {
-                let _ = wv.evaluate_script(&format!("taskq.receive({st})"));
+                if !web.failed {web_eval(wv,&format!("taskq.receive({st})"),"tray.web.receive",&proxy,web);}
             }
         };
         match event {
@@ -662,7 +757,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 let p = proxy.clone();
                 let built = b.build(target).map_err(|e| e.to_string()).and_then(|w| {
                     // only our page: a link goes to the browser through the bridge
-                    WebViewBuilder::new().with_accept_first_mouse(true).with_html(HTML.replace("{{ANSWER_CARD_CSS}}", include_str!("answer-card.css")).replace("{{ANSWER_CARD_JS}}", include_str!("answer-card.js"))
+                    WebViewBuilder::new().with_accept_first_mouse(true).with_html(HTML.replace("{{TRAY_WEB_JS}}", include_str!("tray-web.js")).replace("{{ANSWER_CARD_CSS}}", include_str!("answer-card.css")).replace("{{ANSWER_CARD_JS}}", include_str!("answer-card.js"))
                         .replace("{{PROJECT_BLOCKS_CSS}}", include_str!("project-blocks.css")).replace("{{PROJECT_BLOCKS_JS}}", include_str!("project-blocks.js"))
                         .replace("{{RESOURCE_CONTROLS_CSS}}", include_str!("resource-controls.css")).replace("{{RESOURCE_CONTROLS_JS}}", include_str!("resource-controls.js"))).with_navigation_handler(|u| !u.starts_with("http"))
                         .with_ipc_handler(move |r| {
@@ -749,12 +844,12 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                     settings.save(&install);
                 }
                 let st = state(&install, &settings, dark, None, &adding);
-                refresh_icon(&tray, &st, &settings, dark, &mut icon_sig);
+                if !web.failed {refresh_icon(&tray, &st, &settings, dark, &mut icon_sig);}
                 notes(&install, &mut settings, &st, &mut asked, &mut bursts);
                 let sig = st.to_string().replace(&format!("\"now\":{}", st["now"]), "");
-                if sig != shown {
+                if sig != shown && !web.pending.contains_key(&0) {
                     shown = sig;
-                    push(&ui, &st);
+                    push(&mut web,&ui, &st);
                 }
             }
             Event::UserEvent(Ev::Click(rect)) => {
@@ -776,7 +871,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 w.set_focus();
                 shown_at = Instant::now();
             }
-            Event::UserEvent(Ev::Answer(receipt)) => push(&ui, &receipt),
+            Event::UserEvent(Ev::Answer(receipt)) => push(&mut web,&ui, &receipt),
             // a notification click opens the menu (or raises the pinned window) on that card (M14)
             Event::UserEvent(Ev::Note(id)) => {
                 let Ok(id) = serde_json::from_str::<Value>(&id) else { return };
@@ -787,12 +882,18 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 w.set_visible(true);
                 w.set_focus();
                 if id["root"].is_string() {
-                    push(&ui, &json!({"open": {"root": id["root"], "n": id["n"], "kind": id["k"], "title": id["t"]}}));
+                    push(&mut web,&ui, &json!({"open": {"root": id["root"], "n": id["n"], "kind": id["k"], "title": id["t"]}}));
                 }
             }
+            Event::UserEvent(Ev::Evaluated(id,result)) => {
+                web.finish(id,result);
+                if web.pending.is_empty() && let Some(next)=shot_wait.take() {let _=proxy.send_event(next);}
+            }
             Event::UserEvent(Ev::Ipc(m)) => {
-                let Ok(m) = serde_json::from_str::<Value>(&m) else { return };
+                let Ok(m) = serde_json::from_str::<Value>(&m) else {web.fault("invalid-ipc");return;};
                 let Some((w, _)) = &ui else { return };
+                if m["a"]=="web-error" {web.errors(&m);return;}
+                if web.failed {return;}
                 match m["a"].as_str().unwrap_or("") {
                     "answer" if snapshot.is_none() => {
                         let (p, install) = (proxy.clone(), install.clone());
@@ -800,11 +901,12 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                     }
                     "overflow" if snapshot.is_some() => overflow.push(format!("{} by {} px", m["shot"].as_str().unwrap_or("?"), m["x"])),
                     "ready" => {
+                        web.finish(0,"ok");
                         if snapshot.is_some() {
                             let _ = proxy.send_event(Ev::Shot);
                             return;
                         }
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     "size" | "resize" => {
                         let Some((width, height)) = m["w"].as_f64().zip(m["h"].as_f64()).filter(|(w, h)| w.is_finite() && h.is_finite()) else { return };
@@ -832,7 +934,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         settings.pin.top = !settings.pin.top;
                         w.set_always_on_top(settings.pin.top);
                         settings.save(&install);
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     "pin" => {
                         settings.pin.pinned = !settings.pin.pinned;
@@ -846,7 +948,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         }
                         settings.save(&install);
                         w.set_focus();
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     "drag" => {
                         let _ = w.drag_window();
@@ -864,7 +966,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                             settings.save(&install);
                             notes(&install, &mut settings, &Value::Null, &mut asked, &mut bursts);
                         }
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     "notify-test" if snapshot.is_none() => {
                         if let Some(k) = m["kind"].as_str().filter(|k| notify::KINDS.contains(k)) {
@@ -877,20 +979,20 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         settings.save(&install);
                         let st = state(&install, &settings, dark, None, &adding);
                         refresh_icon(&tray, &st, &settings, dark, &mut icon_sig);
-                        push(&ui, &st);
+                        push(&mut web,&ui, &st);
                     }
                     // `Edit limits` after the page's confirm: the same write as `service capacity` (§ 5), this host only
                     "capacity" => {
                         let root = m["root"].as_str().unwrap_or("");
                         if roots(&install).iter().any(|r| r == root) {
                             let msg = capacity(Path::new(root), &m);
-                            push(&ui, &json!({"capmsg": {"root": root, "id": m["id"], "text": msg}}));
+                            push(&mut web,&ui, &json!({"capmsg": {"root": root, "id": m["id"], "text": msg}}));
                         }
                     }
                     // Add project (§ 4): the folder comes only from the OS picker, never from the page
                     "add" => {
                         adding = json!({"state": "picking"});
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                         let p = proxy.clone();
                         std::thread::spawn(move || {
                             let v = pick().map_or(Value::Null, |d| classify(&d, selftest));
@@ -899,11 +1001,11 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                     }
                     "add-cancel" => {
                         adding = Value::Null;
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     "add-install" if adding["kind"] == "taskq" && adding["state"] == "picked" => {
                         adding["state"] = json!("installing");
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                         let (p, a, inst) = (proxy.clone(), adding.clone(), install.clone());
                         std::thread::spawn(move || {
                             let _ = p.send_event(Ev::Added(install_service(&inst, a)));
@@ -913,13 +1015,13 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         let text = format!("Set up {} as a taskq project", adding["name"].as_str().unwrap_or("this folder"));
                         ai(&install, "ai-send", &json!({"text": text, "onboard": adding["path"]}));
                         adding = Value::Null;
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     a if a.starts_with("ai-") => {
                         let mut m = m.clone();
                         m["onboard"] = Value::Null;
                         ai(&install, a, &m);
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     a => {
                         // only a registered project (§ 4): the page never names a path of its own
@@ -930,22 +1032,23 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                             } else {act(a,Path::new(root),m["label"].as_str()).map(|_|())};
                             if let Err(error) = result {
                                 let key=if matches!(a,"pause"|"resume"|"focus") {"focus_receipt"} else {"action_error"};
-                                push(&ui, &json!({key:{"root":root,"id":m["id"],"text":error}}));
+                                push(&mut web,&ui, &json!({key:{"root":root,"id":m["id"],"text":error}}));
                             }
                         } else if matches!(a,"pause"|"resume"|"focus") {
-                            push(&ui,&json!({"focus_receipt":{"root":root,"id":m["id"],"text":"Project is no longer registered; command not submitted"}}));
+                            push(&mut web,&ui,&json!({"focus_receipt":{"root":root,"id":m["id"],"text":"Project is no longer registered; command not submitted"}}));
                         }
                     }
                 }
             }
             Event::UserEvent(Ev::Added(v)) => {
                 adding = v;
-                push(&ui, &state(&install, &settings, dark, None, &adding));
+                push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                 if let (Some((w, _)), false) = (&ui, adding.is_null()) {
                     w.set_visible(true);
                     w.set_focus();
                 }
             }
+            Event::UserEvent(Ev::Shot | Ev::Shot2) if web.failed => {}
             // snapshot mode: per step push a state, wait for layout, capture, next
             Event::UserEvent(Ev::Shot) => {
                 let dir = snapshot.clone().unwrap_or_default();
@@ -974,6 +1077,9 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                     }
                 }
                 let Some((theme, page, font, script)) = steps.get(step).cloned() else {
+                    if !web.pending.is_empty() {
+                        shot_wait=Some(Ev::Shot);return;
+                    }
                     println!("snapshots in {}", dir.display());
                     if !overflow.is_empty() {
                         eprintln!("horizontal overflow: {}", overflow.join(", "));
@@ -984,9 +1090,9 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 };
                 let mut s = settings.clone();
                 s.font = font;
-                push(&ui, &state(&install, &s, theme == "dark", Some((theme, &page)), &Value::Null));
+                push(&mut web,&ui, &state(&install, &s, theme == "dark", Some((theme, &page)), &Value::Null));
                 if let (Some((_, wv)), false) = (&ui, script.is_empty()) {
-                    let _ = wv.evaluate_script(script);
+                    web_eval(wv,script,"tray.web.fixture",&proxy,&mut web);
                 }
                 let p = proxy.clone();
                 std::thread::spawn(move || {
@@ -999,7 +1105,10 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 let dir = snapshot.clone().unwrap_or_default();
                 let p = proxy.clone();
                 let name = format!("popover-{}.png", shot_name(&install, &routes, step));
-                let _ = wv.evaluate_script(&OVERFLOW.replace("NAME", &name));
+                if !web.pending.is_empty() {
+                    shot_wait=Some(Ev::Shot2);return;
+                }
+                web_eval(wv,&OVERFLOW.replace("NAME", &name),"tray.web.measure",&proxy,&mut web);
                 step += 1;
                 capture(wv, dir.join(name), move || {
                     let _ = p.send_event(Ev::Shot);
@@ -1600,6 +1709,45 @@ fn capture(wv: &WebView, path: PathBuf, done: impl Fn() + 'static) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: native delivery -> exact JS outcome or unknown -> bounded safe shared observations.
+    #[test]
+    fn web_execution_requires_acknowledgment_and_bounds_error_reports() {
+        crate::with_test_capture(|store,_| {
+            let now=Instant::now();
+            let mut calls=WebCalls::new();calls.finish(0,"ok");
+            for (name,result) in [("tray.web.success","ok"),("tray.web.exception","script-error"),("tray.web.malformed","invalid-ack")] {
+                let id=calls.begin(name,now).unwrap();calls.finish(id,result);calls.finish(id,"ok");
+            }
+            let expired=calls.begin("tray.web.expired",now).unwrap();
+            calls.expire(now+Duration::from_secs(29));assert!(calls.pending.contains_key(&expired));
+            calls.expire(now+Duration::from_secs(30));assert!(calls.pending.is_empty());calls.finish(expired,"ok");
+            for _ in 0..64 {assert!(calls.begin("tray.web.pending",now).is_some());}
+            assert!(calls.begin("tray.web.overflow",now).is_none());assert_eq!(calls.pending.len(),64);
+            for counts in [json!([1,0,0,0]),json!([101,1,1,1]),json!([101,1,1,1])] {
+                calls.errors(&json!({"counts":counts,"saturated":false}));
+            }
+            for counts in [json!([1,1,1,1]),json!([-1,0,0,0]),json!([4294967296_u64,1,1,1]),json!([101]),json!(null)] {
+                calls.errors(&json!({"counts":counts,"saturated":false}));assert_eq!(calls.counts,[101,1,1,1]);
+            }
+            calls.errors(&json!({"counts":[101,1,1,1],"saturated":true}));
+            calls.errors(&json!({"counts":[101,1,1,1],"saturated":true}));
+            assert!(calls.failed && calls.saturated);drop(calls);
+            tracing::dispatcher::get_default(|d|d.downcast_ref::<coreq::telemetry::capture::Capture>().unwrap().flush().unwrap());
+            let page=store.export(0,0,1024).unwrap();
+            let rows:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"]).filter(|r|r["kind"]=="method").collect();
+            for (name,result) in [("success","ok"),("exception","failed"),("malformed","unknown"),("expired","unknown")] {
+                let found:Vec<_>=rows.iter().filter(|r|r["operation"]==format!("taskq.operation.tray.web.{name}")).collect();
+                assert_eq!(found.len(),1,"duplicate/late callback changed {name}");assert_eq!(found[0]["outcome"],result);
+            }
+            assert_eq!(rows.iter().filter(|r|r["operation"]=="taskq.operation.tray.web.pending"&&r["outcome"]=="unknown").count(),64);
+            let errors:Vec<_>=rows.iter().filter(|r|r["operation"]=="taskq.operation.tray.web.error").collect();
+            assert_eq!(rows.iter().filter(|r|r["operation"]=="taskq.operation.tray.web.error-counts"&&r["error"]=="count-saturated").count(),1);
+            assert_eq!(errors.len(),5);assert_eq!(errors.iter().map(|r|r["calls"].as_u64().unwrap()).sum::<u64>(),104);
+            assert!(errors.iter().all(|r|r["outcome"]=="failed"));
+            assert_eq!(web_result("true"),"invalid-ack");assert_eq!(web_result("\"ok\""),"ok");
+        });
+    }
 
     // Chain: bounded UI submission -> owned worker -> same-trace receipt -> stale registration refusal.
     #[test]

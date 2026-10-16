@@ -1,5 +1,5 @@
 //! Windows §8: one inherited native token; control state never lives in the writable runtime home.
-use std::{fs, io::Read, path::{Path, PathBuf}, process::{Command, Stdio}};
+use std::{fs, io::Read, path::{Path, PathBuf}, process::Command};
 use serde_json::Value;
 
 // Exact privately qualified dependency; a stock or changed CLI is not this enforcement path.
@@ -86,9 +86,12 @@ fn prepare(root: &Path, install: &Path, home: &Path, p: &Paths) -> Result<(), St
     let config = format!("[permissions.taskq.filesystem]\n{}\n[permissions.taskq.network]\nenabled=true\n", entries.iter()
         .map(|(p, mode)| format!("{} = \"{mode}\"", serde_json::to_string(&p.replace('\\', "/")).unwrap())).collect::<Vec<_>>().join("\n"));
     fs::write(p.state.join("config.toml"), config).map_err(|e| e.to_string())?;
-    let out = crate::platform::quiet(Command::new(&p.bin).args(["-c", "windows.sandbox=unelevated", "sandbox", "-P", "taskq", "--include-managed-config", "--", "cmd.exe", "/d", "/c", "exit 0"])
+    let out = match coreq::process::output("sandbox.preflight", Command::new(&p.bin).args(["-c", "windows.sandbox=unelevated", "sandbox", "-P", "taskq", "--include-managed-config", "--", "cmd.exe", "/d", "/c", "exit 0"])
         .current_dir(root).env("CODEX_HOME", &p.state).env("TASKQ_WINDOWS_SANDBOX_HOME", &p.state)
-        .env("TEMP", &p.temp).env("TMP", &p.temp).stdin(Stdio::null())).output().map_err(|e| e.to_string())?;
+        .env("TEMP", &p.temp).env("TMP", &p.temp), std::time::Duration::from_secs(30)) {
+        Ok(out) | Err(coreq::process::Failure::Exit(out)) => out,
+        Err(e) => return Err(format!("Windows native preflight: {e}")),
+    };
     if !out.status.success() { return Err(format!("Windows native preflight: {}", String::from_utf8_lossy(&out.stderr))); }
     let sid_file = p.state.join("cap_sid");
     let mut caps: Value = serde_json::from_slice(&fs::read(&sid_file).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;

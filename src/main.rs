@@ -166,7 +166,7 @@ fn root_for(env: Option<PathBuf>, cwd: PathBuf) -> Res<PathBuf> {
 }
 
 fn hostname() -> String {
-    platform::quiet(&mut std::process::Command::new("hostname")).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()
+    coreq::process::output("host.identity", &mut std::process::Command::new("hostname"), std::time::Duration::from_secs(10)).ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()
 }
 
 fn load(root: &Path) -> Res<(Config, Value)> {
@@ -498,7 +498,10 @@ fn result_text(n: u64, text: &str, checks: &[String], opts: &[String], recommend
 fn shots_gate(git_bin: &str, root: &Path, sha: &str) -> Res<()> {
     let unknown = |e: String| format!("shots check unknown: {e}");
     let git = |args: &[&str]| {
-        let o = std::process::Command::new(git_bin).arg("-C").arg(root).args(args).output().map_err(|e| unknown(format!("{git_bin}: {e}")))?;
+        let o = match coreq::process::output("shots.git", std::process::Command::new(git_bin).arg("-C").arg(root).args(args), std::time::Duration::from_secs(30)) {
+            Ok(o) | Err(coreq::process::Failure::Exit(o)) => o,
+            Err(e) => return Err(unknown(format!("{git_bin}: {e}"))),
+        };
         if o.status.success() { Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { Err(unknown(String::from_utf8_lossy(&o.stderr).trim().to_string())) }
     };
     // `ls-tree` succeeds with empty output for an absent path and fails for an unreadable tree-ish.
@@ -1393,7 +1396,7 @@ fn tray_app(install: &Path, exe: &Path) -> Option<PathBuf> {
         Ok(true) => true,
         r => {
             if let Err(e) = r { platform::log(&format!("signing failed, TaskQ.app stays ad-hoc: {e}")) }
-            std::process::Command::new("codesign").args(["-f", "-s", "-"]).arg(&app).output().is_ok_and(|o| o.status.success())
+            coreq::process::output("signing.adhoc", std::process::Command::new("codesign").args(["-f", "-s", "-"]).arg(&app), std::time::Duration::from_secs(30)).is_ok()
         }
     };
     signed.then_some(app)
@@ -2507,6 +2510,8 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), context, "busy reader allowed a partial overwrite");
         assert_eq!(wake_context(&path, &mut seen).unwrap().unwrap().encode(), context);
         assert!(wake_context(&path, &mut seen).unwrap().is_none());
+        // Parallel subprocess tests may inherit this fixture's descriptor before exec.
+        writer.unlock().unwrap();
         drop(writer);
         poke(&root).unwrap();
         assert!(wake_context(&path, &mut seen).unwrap().is_none());

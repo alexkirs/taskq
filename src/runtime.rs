@@ -492,8 +492,10 @@ const CONTRACT: &str = include_str!("../taskq.md");
 const INDEX: &str = "\nIndex of other shared rules";
 
 fn rule_file(url: &str) -> Result<String, String> {
-    let out = crate::platform::quiet(Command::new("curl").args(["-q", "--fail", "--silent", "--show-error", "--proto", "=https", "--max-time", "10", "--max-filesize", "131072", "--write-out", "\n%{http_code}", url]))
-        .output().map_err(|e| e.to_string())?;
+    let out = match coreq::process::output("rules.download", Command::new("curl").args(["-q", "--fail", "--silent", "--show-error", "--proto", "=https", "--max-time", "10", "--max-filesize", "131072", "--write-out", "\n%{http_code}", url]), std::time::Duration::from_secs(15)) {
+        Ok(out) | Err(coreq::process::Failure::Exit(out)) => out,
+        Err(e) => return Err(e.to_string()),
+    };
     let text=String::from_utf8(out.stdout).map_err(|_| "invalid UTF-8")?;
     let (body,status)=text.rsplit_once('\n').ok_or("missing HTTP status")?;
     if !out.status.success() || status!="200" {return Err(format!("HTTP {status}; curl exited {}",out.status));}
@@ -1071,17 +1073,17 @@ pub struct AppTurn {
     /// `task_complete` events of the thread before the queued text.
     done: usize,
     rollout: Option<PathBuf>,
-    running: fn() -> bool,
+    running: fn() -> Result<bool, String>,
 }
 
 impl AppTurn {
     fn queue(&mut self) -> Result<(), String> {
-        self.rollout = rollout(&self.thread);
-        self.done = self.rollout.as_ref().map(|p| completes(p)).unwrap_or(0);
         // the id goes through the Windows shell: only a plain thread id
         if self.thread.is_empty() || !self.thread.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             return Err(format!("invalid thread id {:?}", self.thread));
         }
+        self.rollout = rollout(&self.thread);
+        self.done = completes(self.rollout.as_ref().ok_or("Codex rollout unavailable; turn baseline unknown")?)?;
         let ok = |c: &mut Command| crate::platform::quiet(c).status().is_ok_and(|s| s.success());
         let url = format!("codex://threads/{}", self.thread);
         // ponytail: `open` and `queue` block the pass for a moment; a thread per turn if they ever hang
@@ -1120,14 +1122,15 @@ impl Proc for AppTurn {
             }
             return Ok(None);
         }
-        if !(self.running)() {
+        if !(self.running)()? {
             return Ok(Some(-1));
         }
         if self.rollout.is_none() {
             self.rollout = rollout(&self.thread);
         }
-        // ponytail: a thread without a found rollout stays live until the app closes; ttl-based expiry if it matters
-        Ok(self.rollout.as_ref().filter(|p| completes(p) > self.done).map(|_| 0))
+        let count = completes(self.rollout.as_ref().ok_or("Codex rollout unavailable; completion unknown")?)?;
+        if count < self.done { return Err("Codex rollout truncated; completion unknown".into()); }
+        Ok((count > self.done).then_some(0))
     }
     fn kill(&mut self) {
         // the app turn itself cannot be stopped from outside: it runs on, fenced (§ 3 app lease)
@@ -1141,12 +1144,45 @@ impl Proc for AppTurn {
 }
 
 /// The Codex app runs in this login session: macOS `lsappinfo`, Windows a `tasklist /APPS` row of its package.
-fn app_running() -> bool {
+fn app_running() -> Result<bool, String> {
+    coreq::telemetry::capture::operation("runtime.app-readback", || {
+    let mut c = if cfg!(windows) { Command::new("tasklist") } else { Command::new("lsappinfo") };
     if cfg!(windows) {
-        return crate::platform::quiet(Command::new("tasklist").args(["/APPS", "/FO", "CSV", "/NH"])).output()
-            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("\"OpenAI.Codex_"));
+        c.args(["/APPS", "/FO", "CSV", "/NH"]);
+    } else {
+        c.args(["find", "bundleID=com.openai.codex"]);
     }
-    Command::new("lsappinfo").args(["info", "-only", "pid", "-app", "com.openai.codex"]).output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("pid"))
+    let out = coreq::process::output("runtime.app-presence", &mut c, std::time::Duration::from_secs(10)).map_err(|e| format!("Codex app presence unknown: {e}"))?;
+    let text = std::str::from_utf8(&out.stdout).map_err(|_| "Codex app presence returned invalid UTF-8")?;
+    app_presence(text, cfg!(windows))
+    }, |_| "readback")
+}
+
+fn app_presence(text: &str, windows: bool) -> Result<bool, String> {
+    if text.trim().is_empty() { return Ok(false); }
+    if windows {
+        let mut found = false;
+        for line in text.lines() {
+            let row = line.strip_prefix('"').and_then(|s| s.strip_suffix('"')).ok_or("Codex app presence returned an invalid process list")?;
+            let columns: Vec<_> = row.split("\",\"").collect();
+            if columns.len() < 3 || columns[1].parse::<u32>().ok().filter(|n| *n > 0).is_none()
+                || columns.iter().any(|s| s.replace("\"\"", "").contains('"')) {
+                return Err("Codex app presence returned an invalid process list".into());
+            }
+            found |= columns.iter().any(|s| s.starts_with("OpenAI.Codex_"));
+        }
+        Ok(found)
+    } else {
+        let valid = |line: &str| {
+            let Some((asn, title)) = line.strip_prefix("ASN:0x").and_then(|s| s.split_once("-\"")) else { return false };
+            let Some((high, low)) = asn.split_once("-0x") else { return false };
+            u32::from_str_radix(high, 16).is_ok() && u32::from_str_radix(low, 16).is_ok() && title.ends_with("\":")
+        };
+        if !text.lines().all(valid) {
+            return Err("Codex app presence returned an invalid application list".into());
+        }
+        Ok(true)
+    }
 }
 
 /// The thread's rollout file under `$CODEX_HOME/sessions` (default `~/.codex`; a Windows service has no `HOME`).
@@ -1163,9 +1199,20 @@ pub(crate) fn rollout(thread: &str) -> Option<PathBuf> {
 }
 
 /// Finished turns in a rollout: its `task_complete` events.
-fn completes(rollout: &Path) -> usize {
-    let Ok(f) = File::open(rollout) else { return 0 };
-    BufReader::new(f).lines().map_while(Result::ok).filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| v["payload"]["type"] == "task_complete")).count()
+fn completes(rollout: &Path) -> Result<usize, String> {
+    coreq::telemetry::capture::operation("runtime.turn-readback", || {
+    let f = File::open(rollout).map_err(|_| "Codex rollout unreadable; completion unknown")?;
+    let mut count = 0;
+    for line in BufReader::new(f).lines() {
+        let line = line.map_err(|_| "Codex rollout read failed; completion unknown")?;
+        let v: serde_json::Value = serde_json::from_str(&line).map_err(|_| "Codex rollout record incomplete or invalid; completion unknown")?;
+        if v["type"].as_str().is_none() || v["type"] == "event_msg" && !v["payload"].is_object() {
+            return Err("Codex rollout record shape invalid; completion unknown".into());
+        }
+        count += usize::from(v["type"] == "event_msg" && v["payload"]["type"] == "task_complete");
+    }
+    Ok(count)
+    }, |_| "readback")
 }
 
 // ---------- `taskq agents` (taskq.md § 5): read-only probes, unknown when unreadable (R12) ----------
@@ -1326,16 +1373,41 @@ mod tests {
 
     // Chain: § 8 codex-app turn end. Risk: a turn ends early or never ends.
     #[test]
+    fn app_turn_keeps_unreadable_completion_unknown() {
+        let p = std::env::temp_dir().join(format!("taskq-rollout-unknown-{}.jsonl", std::process::id()));
+        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), _input: None, thread: "th".into(), done: 1, rollout: Some(p.clone()), running: || Ok(true) };
+        let _ = std::fs::remove_file(&p);
+        assert!(t.exited().is_err(), "missing history must retain an explicit unknown reason");
+        std::fs::write(&p, "{\"type\":\"event_msg\"").unwrap();
+        assert!(t.exited().is_err(), "incomplete history cannot prove the turn is still healthy");
+        std::fs::write(&p, "").unwrap();
+        assert!(t.exited().is_err(), "history shorter than the baseline cannot reset the turn count");
+        t.running = || Err("probe timed out".into());
+        assert_eq!(t.exited(), Err("probe timed out".into()), "failed app query cannot become an exit");
+        for windows in [false, true] {
+            assert!(app_presence("unreadable", windows).is_err());
+            assert_eq!(app_presence("", windows), Ok(false));
+        }
+        assert_eq!(app_presence("ASN:0x0-0x12-\"Codex\":\n", false), Ok(true));
+        assert_eq!(app_presence("\"Codex.exe\",\"42\",\"OpenAI.Codex_1\"\n", true), Ok(true));
+        assert_eq!(app_presence("\"other.exe\",\"43\",\"Other\"\n", true), Ok(false));
+        assert!(app_presence("\"other.exe\",\"unknown\",\"Other\"\n", true).is_err());
+        assert!(app_presence("ASN:0xbad:", false).is_err());
+        std::fs::remove_file(p).unwrap();
+    }
+
+    // Chain: § 8 codex-app turn end. Risk: a turn ends early or never ends.
+    #[test]
     fn app_turn_ends_on_a_new_task_complete_or_a_closed_app() {
         let p = std::env::temp_dir().join(format!("taskq-rollout-{}.jsonl", std::process::id()));
         let done = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
         std::fs::write(&p, format!("{done}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\"}}}}\n")).unwrap();
-        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), _input: None, thread: "th".into(), done: completes(&p), rollout: Some(p.clone()), running: || true };
+        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), _input: None, thread: "th".into(), done: completes(&p).unwrap(), rollout: Some(p.clone()), running: || Ok(true) };
         assert_eq!((t.done, t.exited()), (1, Ok(None)), "the handshake's task_complete does not end the turn");
         std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(done.as_bytes()).unwrap();
         assert_eq!(t.exited(), Ok(Some(0)));
         t.done = 2;
-        t.running = || false;
+        t.running = || Ok(false);
         assert_eq!(t.exited(), Ok(Some(-1)), "a closed app is a child exit");
         t.thread = "x & calc".into();
         assert!(t.queue().is_err(), "a thread id that is not plain never reaches the shell");
@@ -1413,10 +1485,10 @@ mod tests {
         let mut t = AppTurn { hand: None, log: log.clone(), text, _input: Some(input), thread: String::new(), done: 0, rollout: None, running: app_running };
         t.hand = Some(Box::new(start(&env, &l, &log, HANDSHAKE, &access(&env, "codex-app").unwrap()).unwrap()));
         let code = (0..600).find_map(|_| { std::thread::sleep(std::time::Duration::from_secs(1)); t.exited().unwrap() });
-        eprintln!("thread {} rollout {:?} completes {} exit {code:?}", t.thread, t.rollout, t.rollout.as_ref().map_or(0, |p| completes(p)));
+        eprintln!("thread {} rollout {:?} completes {} exit {code:?}", t.thread, t.rollout, t.rollout.as_ref().map_or(0, |p| completes(p).unwrap()));
         let _ = std::fs::remove_dir_all(&install);
         assert_eq!(code, Some(0));
-        assert_eq!(completes(t.rollout.as_ref().unwrap()), t.done + 1, "exactly one queued turn completed");
+        assert_eq!(completes(t.rollout.as_ref().unwrap()).unwrap(), t.done + 1, "exactly one queued turn completed");
     }
 
     // Chain: § 8 Windows app brief -> PowerShell -> taskq. Risk: quoted paths break parsing or execute input.

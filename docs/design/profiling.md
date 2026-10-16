@@ -209,6 +209,10 @@ These are acceptance targets, not claims about the installed release. Shared mod
 
 ## Bounded external commands
 
+Finite dependency checks use the shared executor:10s for host identity and app-presence queries,15s for rule downloads around curl's10s,30s for signing, Git qualification/cleanup and Windows sandbox preflight. Output overflow or an unreadable result refuses the affected action; cleanup keeps the worktree when its complete patch cannot be saved. These bounds do not apply to interactive windows or worker lifetimes.
+
+An app-presence query failure, missing/unreadable rollout or invalid completion record keeps the owned app turn unknown with its capacity retained. Only a successful native absence query or a complete new turn record proves termination. File read errors and truncated history never become zero completed turns. A partially written record remains unknown until a later read; it does not release capacity.
+
 Runtime CLI probes use shared coreq command execution:10s for execution plus output drain,1MiB combined stdout/stderr, with precise spawn/exit/timeout/output/cleanup observations under the caller trace. Missing or incomplete output remains unknown. Service/update deadlines belong to [coreq bounded command execution](https://github.com/taskqorg/coreq/blob/main/coreq.md#bounded-command-execution). No input, arguments, credentials or output is exported. Direct-child cleanup stays owned; detached worker trees and native action completion still require their own lifecycle qualification.
 
 Board HTTP uses shared bounded stdin exchange:65s around curl's60s, at most1MiB encoded config and8MiB response. A bound failure is explicit and never interpreted as an empty board or confirmed mutation. Preserve tokens/body on stdin, HTTP/GraphQL/rate-limit interpretation and existing request budgets; no retry is added by the executor. Native curl tests and stalled/full-duplex/inherited-pipe fault checks qualify this adapter separately from live forge behavior.

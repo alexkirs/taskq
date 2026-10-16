@@ -130,11 +130,11 @@ pub const SIGNING_IDENTITY: &str = "TaskQ Local Signing";
 #[cfg(target_os = "macos")]
 pub fn codesign(identity: &str, path: &Path, id: &str) -> Result<bool, String> {
     use std::process::Command;
-    let ids = Command::new("security").args(["find-identity", "-p", "codesigning"]).output().map_err(|e| format!("security: {e}"))?;
+    let ids = coreq::process::output("signing.identity", Command::new("security").args(["find-identity", "-p", "codesigning"]), std::time::Duration::from_secs(30)).map_err(|e| format!("security: {e}"))?;
     let Some(sha1) = identity_hash(identity, &ids)? else { return Ok(false) };
-    let run = |c: &mut Command| match c.output() {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(format!("{}: {}", path.display(), String::from_utf8_lossy(&o.stderr).trim())),
+    let run = |c: &mut Command| match coreq::process::output("signing.command", c, std::time::Duration::from_secs(30)) {
+        Ok(_) => Ok(()),
+        Err(coreq::process::Failure::Exit(o)) => Err(format!("{}: {}", path.display(), String::from_utf8_lossy(&o.stderr).trim())),
         Err(e) => Err(format!("{}: {e}", path.display())),
     };
     run(Command::new("codesign").args(["-f", "-s", &sha1, "-i", id]).arg(path))?;

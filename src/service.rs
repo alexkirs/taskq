@@ -146,7 +146,7 @@ pub fn blockers(b: &dyn Board, body: &str, open: Option<&HashSet<u64>>, done: &m
 pub fn cleanup(board: &dyn Board, root: &std::path::Path, mut skip: impl FnMut(u64) -> bool, force: bool) -> Vec<String> {
     let mut log = vec![];
     let Ok(dir) = std::fs::read_dir(root.join(".worktrees")) else { return log };
-    let git = |dir: &std::path::Path, args: &[&str]| std::process::Command::new("git").arg("-C").arg(dir).args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]).args(args).output().ok().filter(|o| o.status.success()).map(|o| o.stdout);
+    let git = |dir: &std::path::Path, args: &[&str]| coreq::process::output("cleanup.git", std::process::Command::new("git").arg("-C").arg(dir).args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]).args(args), std::time::Duration::from_secs(30)).ok().map(|o| o.stdout);
     for e in dir.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(n) = name.strip_prefix("taskq-").and_then(|n| n.parse::<u64>().ok()) else { continue };
@@ -167,7 +167,7 @@ pub fn cleanup(board: &dyn Board, root: &std::path::Path, mut skip: impl FnMut(u
             git(root, &["branch", "-d", &name]);
             log.push(format!("#{n} worktree removed"));
         } else {
-            log.push(format!("#{n} worktree kept: {}", if force { "could not save its patch" } else { "uncommitted work, see `taskq cleanup --force`" }));
+            log.push(format!("#{n} worktree removal unconfirmed: {}", if force { "patch save or Git command failed; inspect the worktree" } else { "Git refused or failed; inspect uncommitted work before `taskq cleanup --force`" }));
         }
     }
     log

@@ -728,6 +728,7 @@ mod tests {
                     Err(e) => panic!("fixture accept: {e}"),
                 }
             };
+            socket.set_nonblocking(false).unwrap();
             socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut bytes = Vec::new();
             loop {

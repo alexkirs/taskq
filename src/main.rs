@@ -251,14 +251,14 @@ fn dot(root: &Path) -> PathBuf {
 fn poke(root: &Path) -> Res<()> {
     use std::io::Write;
     coreq::telemetry::capture::operation("wake.write", || {
-        fs::create_dir_all(dot(root)).map_err(|_| "wake-directory")?;
+        fs::create_dir_all(dot(root)).map_err(|error| ("wake-directory", error))?;
         let context = coreq::telemetry::capture::TraceContext::current().map(|c| c.encode()).unwrap_or_else(|| ".".into());
         // Lock the existing signal so a reader cannot accept ids mixed from two concurrent writes.
-        let mut file = fs::OpenOptions::new().write(true).create(true).truncate(false).open(dot(root).join("poke")).map_err(|_| "wake-open")?;
-        file.try_lock().map_err(|_| "wake-lock")?;
-        file.set_len(0).map_err(|_| "wake-truncate")?;
-        file.write_all(context.as_bytes()).map_err(|_| "wake-write")
-    }, |class| *class).map_err(|class| format!("service wake failed ({class}); state may already be saved; check service status"))
+        let mut file = fs::OpenOptions::new().write(true).create(true).truncate(false).open(dot(root).join("poke")).map_err(|error| ("wake-open", error))?;
+        file.try_lock().map_err(|error| ("wake-lock", std::io::Error::from(error)))?;
+        file.set_len(0).map_err(|error| ("wake-truncate", error))?;
+        file.write_all(context.as_bytes()).map_err(|error| ("wake-write", error))
+    }, |(class, _)| *class).map_err(|(class, error)| format!("service wake failed ({class}: {error}); state may already be saved; check service status"))
 }
 
 fn wake_context(path: &Path, seen: &mut Option<String>) -> Res<Option<coreq::telemetry::capture::TraceContext>> {

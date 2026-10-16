@@ -57,6 +57,7 @@ fn resume_records_its_result_without_releasing_the_host_hold() {
     let undelivered=invoke();
     assert!(!undelivered.status.success(),"Resume reported success when its wake signal could not be written");
     assert!(String::from_utf8_lossy(&undelivered.stderr).contains("service wake failed"));
+    assert!(String::from_utf8_lossy(&undelivered.stderr).contains("os error"),"caller lost the original filesystem error");
     assert_eq!(fs::read_to_string(root.join(".taskq/focus")).unwrap(),"telemetry-fixture","wake failure must not roll back saved focus");
     assert_eq!(fs::read_to_string(install.join("hold")).unwrap(),"owner-held fixture");
     let exported=Command::new(env!("CARGO_BIN_EXE_taskq")).args(["profile","export"])

@@ -1,5 +1,46 @@
 use std::{fs, process::Command};
 
+// Chain: unavailable receipts -> Resume refuses before mutation, Pause remains usable, then durable recovery.
+#[test]
+fn focus_cli_requires_receipts_without_blocking_safe_pause() {
+    let root=std::env::temp_dir().join(format!("qc-receipt-{}",std::process::id()));
+    let install=root.join("i");fs::create_dir_all(&install).unwrap();fs::create_dir_all(root.join(".taskq")).unwrap();
+    fs::write(root.join(".taskq/focus"),"off").unwrap();fs::write(root.join(".taskq/focus.paused"),"all").unwrap();
+    fs::write(install.join("hold"),"owner hold").unwrap();
+    fs::write(install.join("telemetry.log"),"store unavailable").unwrap();
+    let invoke=|command:&[&str]|Command::new(env!("CARGO_BIN_EXE_taskq")).arg("service").args(command)
+        .current_dir(&root).env("TASKQ_ROOT",&root).env("TASKQ_INSTALL",&install).env("TASKQ_INCIDENT_REPORTS","off").output().unwrap();
+    let refused=invoke(&["resume"]);
+    assert!(!refused.status.success(),"Resume accepted without a committed receipt");
+    assert_eq!(fs::read_to_string(root.join(".taskq/focus")).unwrap(),"off");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("command not applied: receipt unavailable"));
+    fs::write(root.join(".taskq/focus"),"all").unwrap();
+    let paused=invoke(&["pause"]);
+    assert!(!paused.status.success(),"unrecorded Pause must report uncertainty");
+    assert_eq!(fs::read_to_string(root.join(".taskq/focus")).unwrap(),"off","receipt failure blocked safe Pause");
+    assert!(String::from_utf8_lossy(&paused.stderr).contains("applied locally; durable receipt unknown"));
+    assert!(!invoke(&["focus","all"]).status.success());
+    assert_eq!(fs::read_to_string(root.join(".taskq/focus")).unwrap(),"off");
+    fs::write(root.join(".taskq/focus"),"all").unwrap();
+    let off=invoke(&["focus","off"]);assert!(!off.status.success());
+    assert_eq!(fs::read_to_string(root.join(".taskq/focus")).unwrap(),"off");
+    assert!(String::from_utf8_lossy(&off.stderr).contains("applied locally; durable receipt unknown"));
+    fs::remove_file(install.join("telemetry.log")).unwrap();
+    let resumed=invoke(&["resume"]);assert!(resumed.status.success(),"{}",String::from_utf8_lossy(&resumed.stderr));
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains("service observation pending"));
+    assert_eq!(fs::read_to_string(root.join(".taskq/focus")).unwrap(),"all");
+    assert_eq!(fs::read_to_string(install.join("hold")).unwrap(),"owner hold");
+    let reader=coreq::telemetry::Reader::open(&install.join("telemetry.log/universal.sqlite3")).unwrap();
+    let page=reader.export(0,0,1024).unwrap();
+    let output=String::from_utf8_lossy(&resumed.stdout);
+    let printed=output.lines().find_map(|line|line.strip_prefix("Command applied locally; service observation pending; receipt ")).unwrap();
+    assert!(page["events"].as_array().unwrap().iter().any(|row|row["id"]==printed&&row["observation"]["kind"]=="command.applied"));
+    let receipts:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"]).filter(|r|r["source"]=="command").collect();
+    assert_eq!(receipts.len(),2);assert_eq!(receipts[0]["kind"],"command.received");assert_eq!(receipts[1]["kind"],"command.applied");
+    assert_eq!(receipts[0]["span"],receipts[1]["span"]);assert_eq!(receipts[0]["operation"],"taskq.service.command.resume");
+    drop(reader);fs::remove_dir_all(root).unwrap();
+}
+
 // Chain: independent command handoff -> real CLI refusal -> causal history, with owner hold preserved.
 #[test]
 fn independent_cli_preserves_the_dispatch_trace_on_failure() {
@@ -100,6 +141,8 @@ fn resume_records_its_result_without_releasing_the_host_hold() {
     assert!(observations.iter().any(|r|r["operation"]=="taskq.operation.wake.lock"&&r["kind"]=="method"&&r["error"]=="wake-open"&&r["trace"]==terminals[2]["trace"]));
     assert_ne!(terminals[0]["trace"],terminals[1]["trace"]);
     for terminal in terminals {
+        let phases:Vec<_>=observations.iter().filter(|r|r["source"]=="command"&&r["trace"]==terminal["trace"]).map(|r|r["kind"].as_str().unwrap()).collect();
+        assert_eq!(phases,["command.received",if terminal["outcome"]=="ok" {"command.applied"} else {"command.failed"}]);
         assert!(terminal["duration_us"].as_u64().is_some());
         assert!(observations.iter().any(|r|r["kind"]=="method.start"&&r["span"]==terminal["span"]&&r["trace"]==terminal["trace"]));
         assert!(observations.iter().any(|r|r["span"]==terminal["parent"]&&r["trace"]==terminal["trace"]));

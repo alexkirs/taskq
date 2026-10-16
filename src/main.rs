@@ -1567,6 +1567,23 @@ fn service_fields(root: &Path) -> String {
     out.join("\n")
 }
 
+fn command_receipt<T>(restrictive: bool, action: impl FnOnce() -> Res<T>) -> Res<T> {
+    let received = coreq::telemetry::capture::checkpoint("received");
+    if !restrictive { if let Err(error) = &received { return Err(format!("command not applied: receipt unavailable ({error}); check service status")); } }
+    let result = action();
+    let terminal = coreq::telemetry::capture::checkpoint(if result.is_ok() { "applied" } else { "failed" });
+    let uncertain = received.err().or_else(|| terminal.as_ref().err().cloned());
+    match (result, uncertain) {
+        (Ok(value), None) => {
+            println!("Command applied locally; service observation pending; receipt {}", terminal.unwrap());
+            Ok(value)
+        }
+        (Ok(_), Some(error)) => Err(format!("command applied locally; durable receipt unknown ({error}); check service status before retry")),
+        (Err(error), None) => Err(format!("{error}; failure receipt {}", terminal.unwrap())),
+        (Err(error), Some(receipt)) => Err(format!("{error}; durable receipt unknown ({receipt}); check service status before retry")),
+    }
+}
+
 #[tracing::instrument(name="service.command",skip_all,fields(coreq_operation=match args.pos.get(1).map(String::as_str).unwrap_or("") {
     sub @ ("install"|"run"|"focus"|"pause"|"resume"|"capacity"|"permissions"|"resources"|"hold"|"release"|"recover"|"status"|"restart"|"stop"|"uninstall"|"list")=>sub,
     _=>"invalid",
@@ -1606,18 +1623,20 @@ fn service(args: &Args) -> Res<()> {
                 for (l, k) in n { println!("Label: {l} ({k})"); }
                 return Ok(());
             }
-            set_focus(&root, &f, args.one("request"))?;
+            command_receipt(f.trim() == "off", || set_focus(&root, &f, args.one("request")))?;
             println!("{}", service_fields(&root));
             Ok(())
         }
         "pause" => {
-            fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-            pause(&root)?;
+            command_receipt(true, || {
+                fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+                pause(&root)
+            })?;
             println!("Paused {}", project_name(&root));
             Ok(())
         }
         "resume" => {
-            resume(&root)?;
+            command_receipt(false, || resume(&root))?;
             println!("{}", service_fields(&root));
             Ok(())
         }

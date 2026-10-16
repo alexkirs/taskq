@@ -293,7 +293,7 @@ fn wake_context(path: &Path, seen: &mut Option<String>) -> Res<Option<coreq::tel
     wake_read(path, seen, || Ok(())).map(|(link, ())| link)
 }
 
-fn change_focus<T>(root: &Path, restrictive: bool, initialize: bool, change: impl FnOnce(&Path) -> Res<T>) -> Res<T> {
+fn change_focus<T>(root: &Path, restrictive: bool, initialize: bool, change: impl FnOnce(&Path) -> Res<T>) -> Res<(T,String)> {
     let receipt = coreq::telemetry::capture::CommandReceipt::current();
     let received = receipt.as_ref().map_err(Clone::clone).and_then(|r| r.checkpoint("received"));
     if !restrictive { if let Err(error) = &received { return Err(format!("command not applied: receipt unavailable ({error}); check service status")); } }
@@ -333,8 +333,9 @@ fn change_focus<T>(root: &Path, restrictive: bool, initialize: bool, change: imp
     let uncertain=(!uncertain.is_empty()).then_some(uncertain);
     match (result, uncertain) {
         (Ok(value), None) => {
-            println!("Command applied locally; service observation pending; receipt {}", terminal.unwrap());
-            Ok(value)
+            let applied=terminal.unwrap();
+            println!("Command applied locally; service observation pending; receipt {applied}");
+            Ok((value,applied))
         }
         (Ok(_), Some(error)) => Err(format!("command applied locally; {error}; check service status before retry")),
         (Err(error), None) => Err(format!("{error}; failure receipt {}", terminal.unwrap())),
@@ -1424,7 +1425,7 @@ fn status_labels(root: &Path) -> Vec<String> {
 
 /// Focus (§ 4): `f` admits; `request` keeps the owner's words, none removes them.
 #[tracing::instrument(name="set_focus",skip_all)]
-fn set_focus(root: &Path, f: &str, request: Option<&str>) -> Res<()> {
+fn set_focus(root: &Path, f: &str, request: Option<&str>) -> Res<String> {
     change_focus(root, f.trim() == "off", true, |d| {
         platform::write_atomic(&d.join("focus"), f)?;
         match request {
@@ -1434,7 +1435,7 @@ fn set_focus(root: &Path, f: &str, request: Option<&str>) -> Res<()> {
             }
         }
         Ok(())
-    })
+    }).map(|(_,receipt)|receipt)
 }
 
 /// Install (§ 4 Focus): a missing focus becomes the explicit default `off`; any other stays. True when it reads off.
@@ -1449,17 +1450,17 @@ fn install_focus(root: &Path) -> Res<bool> {
 
 /// Pause (§ 4): keep the focus in `focus.paused`, admit nothing.
 #[tracing::instrument(name="pause",skip_all)]
-fn pause(root: &Path, initialize: bool) -> Res<()> {
+fn pause(root: &Path, initialize: bool) -> Res<String> {
     change_focus(root, true, initialize, |d| {
         let f = data::focus(root)?.join(" ");
         if !f.is_empty() { platform::write_atomic(&d.join("focus.paused"), &f)?; }
         platform::write_atomic(&d.join("focus"), "off")
-    })
+    }).map(|(_,receipt)|receipt)
 }
 
 /// Resume (§ 4): restore the saved focus; never `all` by default.
 #[tracing::instrument(name="resume",skip_all)]
-fn resume(root: &Path) -> Res<String> {
+fn resume(root: &Path) -> Res<(String,String)> {
     change_focus(root, false, false, |d| {
         let f = fs::read_to_string(d.join("focus.paused")).or_else(|e| if e.kind()==std::io::ErrorKind::NotFound {Ok(String::new())} else {Err(e)})
             .map_err(|e| format!("saved focus unreadable: {e}"))?;
@@ -3481,9 +3482,9 @@ mod tests {
                 assert_eq!(fs::read_to_string(d.join("focus.paused")).unwrap(),"area-maps");
                 assert!(install_focus(&root).is_err());
             }
-            assert_eq!(resume(&root).unwrap(),"area-maps");
+            assert_eq!(resume(&root).unwrap().0,"area-maps");
             pause(&root,false).unwrap();
-            assert_eq!(resume(&root).unwrap(),"area-maps");
+            assert_eq!(resume(&root).unwrap().0,"area-maps");
             let context=format!("1 {}.1 {}.2","a".repeat(32),"a".repeat(32));
             fs::write(d.join("poke"),&context).unwrap();
             let mut seen=None;
@@ -3524,7 +3525,7 @@ mod tests {
             pause(&root,false).unwrap();
             pause(&root,false).unwrap();
             assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
-            assert_eq!(resume(&root).unwrap(), "area-maps", "a second pause keeps the saved focus");
+            assert_eq!(resume(&root).unwrap().0, "area-maps", "a second pause keeps the saved focus");
             let _ = fs::remove_dir_all(&root);
         });
     }

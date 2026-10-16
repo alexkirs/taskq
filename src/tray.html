@@ -74,8 +74,32 @@ const menu=document.querySelector('.menu');
 let aiText=null,aiMenu=false,aiConfirm=null,addConfirm=false;
 let S=null,page='home',taskFilter=null,working=null,workCard=null,ask=null,noted=null,pending={},confirming=null,updating=null,draft=null;
 const actionErrors=new Map();
-function actionReceipt(r){if(!S?.projects.some(p=>p.root===r.root))return;delete pending[r.root];actionErrors.set(r.root,r.text);render();}
-function actionNotices(){return S.projects.filter(p=>actionErrors.has(p.root)).map(p=>'<div class="body alert" role="alert">'+esc(p.name)+': '+esc(actionErrors.get(p.root))+'</div>').join('');}
+function actionReceipt(r){if(!S?.projects.some(p=>p.root===r.root))return;actionErrors.set(r.root,{text:r.text});render();}
+function actionNotices(){return S.projects.filter(p=>actionErrors.has(p.root)).map(p=>'<div class="body alert" role="alert">'+esc(p.name)+': '+esc(actionErrors.get(p.root).text)+'</div>').join('');}
+function focusStart(action,root,label){
+  if(pending[root]&&!pending[root].unknown)return;
+  const item={id:Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join(''),text:action==='pause'?'Pausing':'Resuming',receipt:null,unknown:false};
+  pending[root]=item;actionErrors.delete(root);
+  setTimeout(()=>{if(pending[root]!==item)return;item.unknown=true;actionErrors.set(root,{id:item.id,text:'Command confirmation unknown. Check service status before another command.'});render();},30000);
+  send({a:action,root,label,id:item.id});
+}
+function focusReceipt(r){
+  const item=pending[r.root];
+  if(!S?.projects.some(p=>p.root===r.root)||!item||item.id!==r.id)return;
+  if(typeof r.applied_receipt==='string'&&/^[a-f0-9]{32}$/.test(r.applied_receipt)){
+    item.receipt=r.applied_receipt;item.text='Waiting for service';focusReadback();
+  }else{delete pending[r.root];actionErrors.set(r.root,{id:item.id,text:r.text||'Command confirmation unavailable. Check service status.'});}
+  render();
+}
+function focusReadback(){
+  for(const p of S.projects){
+    const item=pending[p.root],ack=p.focus_command;
+    if(item?.receipt&&typeof p.age==='number'&&p.age>=0&&p.age<=60&&ack?.state==='observed'&&ack.applied_receipt===item.receipt&&typeof ack.observed_receipt==='string'&&/^[a-f0-9]{32}$/.test(ack.observed_receipt)){
+      delete pending[p.root];if(actionErrors.get(p.root)?.id===item.id)actionErrors.delete(p.root);
+    }
+  }
+  for(const root of Object.keys(pending))if(!S.projects.some(p=>p.root===root))delete pending[root];
+}
 // Navigation is view state only: every route consumes the same pushed snapshot.
 const routes={home:'Home',projects:'Projects',attention:'Attention',settings:'Settings',appearance:'Appearance',cadence:'Activity history',notifications:'Notifications',agents:'Agents',services:'Services',about:'About'};
 const trail=[];
@@ -161,7 +185,7 @@ function age(s){return s<120?s+' s':s<7200?Math.round(s/60)+' min':s<172800?Math
 function problem(p){const e=!p.alive?(p.age==null?'no status.json: service not running':'status.json '+age(p.age)+' old: service not running?'):p.error?'service error: '+p.error:'';return e?'<button class="project alert" data-a="log" data-root="'+esc(p.root)+'" title="'+esc(e)+'"'+(p.log?'':' disabled')+'><span>⚠ '+esc(p.name)+': '+esc(e)+'</span><span class="meta">'+(p.log?'Log':'')+'</span><span></span></button>':'';}
 function modeText(p){return {run:'Admitting: '+p.focus.join(' '),paused:'Paused: running tasks finish, no new ones',watch:'Observation only: focus off'}[mode(p)];}
 function admission(p){
-  if(pending[p.root])return '<button class="project" disabled>'+esc(pending[p.root])+'…</button>';
+  if(pending[p.root]&&!pending[p.root].unknown)return '<button class="project" disabled>'+esc(pending[p.root].text)+'…</button>';
   if(mode(p)==='run')return '<button class="project" data-a="pause" data-root="'+esc(p.root)+'">Pause admission in '+esc(p.name)+'</button>';
   if(p.saved)return '<button class="project" data-a="resume" data-root="'+esc(p.root)+'">Resume admission in '+esc(p.name)+'</button>';
   if(ask!==p.root)return '<button class="project" data-a="pick" data-root="'+esc(p.root)+'">Resume: choose labels…</button>';
@@ -444,14 +468,14 @@ addEventListener('blur',release);
 // Press end.
 window.taskq={settle,receive(s){
   if(s.action_error){actionReceipt(s.action_error);return;}
+  if(s.focus_receipt){focusReceipt(s.focus_receipt);return;}
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
   if(s.capmsg){resourceReceipt(s.capmsg);return;}
   if(s.open){openCard(s.open);return;}
-  for(const p of s.projects){const was=S&&S.projects.find(q=>q.root===p.root);if(pending[p.root]&&was&&mode(was)!==mode(p))delete pending[p.root];}
-  S=s;answerReadback();
+  S=s;focusReadback();answerReadback();
   if(aiText===null)aiText=s.ai.draft||'';
   // snapshot mode names the page
-  if(s.page!==undefined&&s.page!==page){page=s.page;taskFilter=null;working=null;workCard=null;trail.length=0;pending={};disclosures=[];render(true);return;}
+  if(s.page!==undefined&&s.page!==page){page=s.page;taskFilter=null;working=null;workCard=null;trail.length=0;disclosures=[];render(true);return;}
   // a tick does not take the caret out of the range fields
   if(document.activeElement&&(document.activeElement.dataset.draft||document.activeElement.dataset.rscField||document.activeElement.id==='ai'))return;
   refresh(performance.now());
@@ -487,8 +511,8 @@ menu.addEventListener('click',e=>{
   if(d.a==='confirm'||d.a==='cancel'){confirming=d.a==='confirm';render();menu.querySelector(confirming?'[data-a="cancel"]':'[data-a="confirm"]')?.focus();return;}
   if(d.a==='update'){updating={v:d.v,at:S.now};}
   if(d.a==='pick'){ask=d.root;render();return;}
-  if(d.a==='pause-all'||d.a==='resume-all'){confirming=null;for(const p of S.projects.filter(p=>mode(p)===(d.a==='pause-all'?'run':'paused'))){actionErrors.delete(p.root);pending[p.root]=d.a==='pause-all'?'Pausing':'Resuming';send({a:d.a.slice(0,-4),root:p.root});}render();menu.querySelector('[data-a="confirm"]')?.focus();return;}
-  if(d.a==='pause'||d.a==='resume'||d.a==='focus'){pending[d.root]=d.a==='pause'?'Pausing':'Resuming';ask=null;}
+  if(d.a==='pause-all'||d.a==='resume-all'){confirming=null;for(const p of S.projects.filter(p=>mode(p)===(d.a==='pause-all'?'run':'paused')))focusStart(d.a.slice(0,-4),p.root);render();menu.querySelector('[data-a="confirm"]')?.focus();return;}
+  if(d.a==='pause'||d.a==='resume'||d.a==='focus'){focusStart(d.a,d.root,d.label);ask=null;render();return;}
   if(d.a){actionErrors.delete(d.root);send({a:d.a,root:d.root,label:d.label});}render();});
 menu.addEventListener('input',e=>{if(e.target.id==='ai'){aiText=e.target.value;send({a:'ai-draft',text:aiText});return;}const k=e.target.dataset.draft;if(k&&draft)draft[k]=e.target.value;});
 menu.addEventListener('focusout',e=>{const f=x=>x&&(x.id==='ai'||x.dataset&&(x.dataset.draft||x.dataset.rscField));if(f(e.target))setTimeout(()=>{if(!f(document.activeElement))render();});});

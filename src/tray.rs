@@ -455,7 +455,7 @@ fn project(install: &Path, root: &str) -> Value {
         "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
         "complete": crate::snapshot::complete(&s) && age.is_some_and(|a| a < 300),
         "error": bad.map(Value::from).or_else(|| [&s["error"], &s["focus_error"]].into_iter().find(|e| e.is_string()).cloned()).unwrap_or(Value::Null), "focus": s["focus"].as_array().cloned().unwrap_or_default(), "saved": saved, "labels": crate::status_labels(r),
-        "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"],
+        "focus_command": s["focus_command"], "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"],
         "resources": resources, "cap_host": cap_host, "cap_saved": cap_saved, "agents": s["agents"],
         "incident": s["incident"], "incident_line": s.get("incident").map(crate::incident::line), "incident_notice": s["incident_notice"],
         "incident_repo": crate::platform::RELEASE_REPO})
@@ -543,6 +543,7 @@ fn summary(ps: &[Value], (start, end): (i64, i64)) -> Summary {
 }
 
 struct FocusAction {
+    id: String,
     action: String,
     root: PathBuf,
     label: Option<String>,
@@ -554,7 +555,7 @@ struct FocusQueue {
     worker: std::thread::JoinHandle<()>,
 }
 impl FocusQueue {
-    fn start(install: PathBuf, report: impl Fn(PathBuf, crate::Res<()>) + Send + 'static) -> crate::Res<Self> {
+    fn start(install: PathBuf, report: impl Fn(PathBuf, String, crate::Res<Option<String>>) + Send + 'static) -> crate::Res<Self> {
         let (sender, receiver)=std::sync::mpsc::sync_channel::<FocusAction>(16);
         let worker=std::thread::Builder::new().name("taskq-focus-actions".into()).spawn(move || {
             while let Ok(job)=receiver.recv() {
@@ -567,17 +568,20 @@ impl FocusQueue {
                         act(&job.action,&job.root,job.label.as_deref())
                     })).unwrap_or_else(|_|Err("Command panicked; result unknown; check service status before retry".into())),|_|"command-failed")
                 });
-                report(job.root,result);
+                report(job.root,job.id,result);
             }
         }).map_err(|e|format!("Cannot start focus command worker: {e}"))?;
         Ok(Self{sender,worker})
     }
-    fn submit(&self, action: &str, root: &Path, label: Option<&str>) -> crate::Res<()> {
+    fn submit(&self, action: &str, root: &Path, label: Option<&str>, id: &str) -> crate::Res<()> {
         let name=match action {"pause"=>"tray.pause.dispatch","resume"=>"tray.resume.dispatch","focus"=>"tray.focus.dispatch",_=>"tray.invalid.dispatch"};
         coreq::telemetry::capture::operation(name,|| {
             if !matches!(action,"focus"|"pause"|"resume") {return Err(("invalid-command","Unsupported focus command"));}
+            if id.is_empty() || id.len()>64 || !id.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-') {
+                return Err(("invalid-id","Invalid command correlation id; action not submitted"));
+            }
             if self.worker.is_finished() {return Err(("worker-unavailable","Command worker unavailable; action not submitted"));}
-            self.sender.try_send(FocusAction {action:action.into(),root:root.into(),label:label.map(String::from),
+            self.sender.try_send(FocusAction {id:id.into(),action:action.into(),root:root.into(),label:label.map(String::from),
                 context:coreq::telemetry::capture::TraceContext::current(),dispatch:tracing::dispatcher::get_default(Clone::clone)})
                 .map_err(|error|match error {
                     std::sync::mpsc::TrySendError::Full(_)=>("queue-full","Command queue full; action not submitted"),
@@ -618,8 +622,13 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
     });
     let proxy = event_loop.create_proxy();
     let replies=proxy.clone();
-    let focus_actions=FocusQueue::start(install.clone(),move |root,result| {
-        if let Err(error)=result {let _=replies.send_event(Ev::Answer(json!({"action_error":{"root":root,"text":error}})));}
+    let focus_actions=FocusQueue::start(install.clone(),move |root,id,result| {
+        let reply=match result {
+            Ok(Some(receipt))=>json!({"root":root,"id":id,"applied_receipt":receipt}),
+            Ok(None)=>json!({"root":root,"id":id,"text":"Command confirmation unavailable; check service status"}),
+            Err(error)=>json!({"root":root,"id":id,"text":error}),
+        };
+        let _=replies.send_event(Ev::Answer(json!({"focus_receipt":reply})));
     })?;
     let mut settings = Settings::load(&install);
     let mut ui: Option<(Window, WebView)> = None;
@@ -917,11 +926,14 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         let root = m["root"].as_str().unwrap_or("");
                         if roots(&install).iter().any(|r| r == root) {
                             let result=if matches!(a,"pause"|"resume"|"focus") {
-                                focus_actions.submit(a,Path::new(root),m["label"].as_str())
-                            } else {act(a,Path::new(root),m["label"].as_str())};
+                                focus_actions.submit(a,Path::new(root),m["label"].as_str(),m["id"].as_str().unwrap_or(""))
+                            } else {act(a,Path::new(root),m["label"].as_str()).map(|_|())};
                             if let Err(error) = result {
-                                push(&ui, &json!({"action_error":{"root":root,"text":error}}));
+                                let key=if matches!(a,"pause"|"resume"|"focus") {"focus_receipt"} else {"action_error"};
+                                push(&ui, &json!({key:{"root":root,"id":m["id"],"text":error}}));
                             }
+                        } else if matches!(a,"pause"|"resume"|"focus") {
+                            push(&ui,&json!({"focus_receipt":{"root":root,"id":m["id"],"text":"Project is no longer registered; command not submitted"}}));
                         }
                     }
                 }
@@ -1239,17 +1251,17 @@ fn work_area(m: &tao::monitor::MonitorHandle) -> (i32, i32, i32, i32) {
     "pause"|"resume"|"focus"|"update"|"restart"|"log"|"folder"|"incident-report"|"incident-manual"|"stop"|"uninstall"=>action,
     _=>"invalid",
 }))]
-fn act(action: &str, root: &Path, label: Option<&str>) -> crate::Res<()> {
+fn act(action: &str, root: &Path, label: Option<&str>) -> crate::Res<Option<String>> {
     let d = crate::dot(root);
     match action {
-        "pause" => { crate::pause(root,false)?; }
+        "pause" => return crate::pause(root,false).map(Some),
         "resume" => {
-            crate::resume(root)?;
+            return crate::resume(root).map(|(_,receipt)|Some(receipt));
         }
         // a label of the project's open tasks, never `all` (§ 4)
         "focus" => {
             if let Some(l) = label.filter(|l| crate::status_labels(root).iter().any(|x| x == l)) {
-                crate::set_focus(root, l, None)?;
+                return crate::set_focus(root, l, None).map(Some);
             } else { return Err("Label is no longer available; refresh and choose again".into()); }
         }
         // `Update now` (menu.md M9): the service checks at once (§ 4 step 7); the page waits for the version in status.json
@@ -1292,7 +1304,7 @@ fn act(action: &str, root: &Path, label: Option<&str>) -> crate::Res<()> {
         }
         _ => {}
     }
-    Ok(())
+    Ok(None)
 }
 
 fn incident_path(root: &Path, incident: &Value) -> Option<PathBuf> {
@@ -1599,23 +1611,32 @@ mod tests {
             fs::write(crate::dot(&root).join("focus"),"area-maps").unwrap();
             let (result_tx,result_rx)=std::sync::mpsc::channel();
             let (release_tx,release_rx)=std::sync::mpsc::channel();
-            let queue=FocusQueue::start(install.clone(),move |root,result| {
-                result_tx.send((root,result)).unwrap();
+            let queue=FocusQueue::start(install.clone(),move |root,id,result| {
+                result_tx.send((root,id,result)).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
             }).unwrap();
             let _click=tracing::info_span!("fixture.click").entered();
-            queue.submit("pause",&root,None).unwrap();
-            let (reported,result)=result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-            assert_eq!(reported,root);result.unwrap();
-            for _ in 0..16 {queue.submit("resume",&root,None).unwrap();}
-            assert!(queue.submit("resume",&root,None).unwrap_err().contains("queue full"));
+            for invalid in [String::new(),"../outside".into(),"x".repeat(65)] {
+                assert!(queue.submit("pause",&root,None,&invalid).unwrap_err().contains("correlation id"));
+                assert_eq!(crate::data::focus(&root).unwrap(),["area-maps"]);
+            }
+            queue.submit("pause",&root,None,"first").unwrap();
+            let (reported,id,result)=result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(reported,root);assert_eq!(id,"first");let applied=result.unwrap().unwrap();
+            let snapshot=crate::control::snapshot(&root,&mut None,&mut None).unwrap();
+            assert_eq!(snapshot.command["applied_receipt"],applied);
+            let status=json!({"focus_command":snapshot.command,"focus":snapshot.focus,"tasks":[],"complete":true});
+            fs::write(crate::dot(&root).join("status.json"),status.to_string()).unwrap();
+            assert_eq!(project(&install,root.to_str().unwrap())["focus_command"],status["focus_command"]);
+            for n in 0..16 {queue.submit("resume",&root,None,&format!("queued-{n}")).unwrap();}
+            assert!(queue.submit("resume",&root,None,"overflow").unwrap_err().contains("queue full"));
             assert!(crate::data::focus(&root).unwrap().is_empty());
             // Queued intent cannot act on a project removed after submission.
             fs::write(install.join("projects"),"").unwrap();
-            for _ in 0..16 {
+            for n in 0..16 {
                 release_tx.send(()).unwrap();
-                let (reported,result)=result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-                assert_eq!(reported,root);assert!(result.unwrap_err().contains("no longer registered"));
+                let (reported,id,result)=result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(reported,root);assert_eq!(id,format!("queued-{n}"));assert!(result.unwrap_err().contains("no longer registered"));
             }
             release_tx.send(()).unwrap();
             let FocusQueue{sender,worker}=queue;drop(sender);worker.join().unwrap();
@@ -1623,10 +1644,11 @@ mod tests {
             let page=store.export(0,0,1024).unwrap();
             let rows:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"]).collect();
             let receipts:Vec<_>=rows.iter().copied().filter(|r|r["source"]=="command").collect();
-            assert_eq!(receipts.len(),2,"refused queued actions mutated the project");
+            assert_eq!(receipts.len(),3,"refused queued actions mutated the project");
             let click=rows.iter().find(|r|r["operation"]=="taskq.fixture.click").unwrap();
             assert_eq!(receipts[0]["trace"],click["trace"]);assert_eq!(receipts[1]["trace"],click["trace"]);
             assert_eq!(receipts[1]["kind"],"command.applied");
+            assert_eq!(receipts[2]["kind"],"command.observed");
         });
     }
 

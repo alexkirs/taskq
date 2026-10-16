@@ -83,7 +83,7 @@ fn resume_records_its_result_without_releasing_the_host_hold() {
     assert!(!undelivered.status.success(),"Resume reported success when its wake signal could not be written");
     assert!(String::from_utf8_lossy(&undelivered.stderr).contains("service wake failed"));
     assert!(String::from_utf8_lossy(&undelivered.stderr).contains("os error"),"caller lost the original filesystem error");
-    assert_eq!(fs::read_to_string(root.join(".taskq/focus")).unwrap(),"telemetry-fixture","wake failure must not roll back saved focus");
+    assert_eq!(fs::read_to_string(root.join(".taskq/focus")).unwrap(),"off","an unavailable command boundary must refuse before mutation");
     assert_eq!(fs::read_to_string(install.join("hold")).unwrap(),"owner-held fixture");
     let exported=Command::new(env!("CARGO_BIN_EXE_taskq")).args(["profile","export"])
         .current_dir(&root).env("TASKQ_ROOT",&root).env("TASKQ_INSTALL",&install)
@@ -97,7 +97,7 @@ fn resume_records_its_result_without_releasing_the_host_hold() {
     assert_eq!(terminals.len(),3);
     assert_eq!(terminals[0]["outcome"],"failed");assert_eq!(terminals[1]["outcome"],"ok");
     assert_eq!(terminals[2]["outcome"],"failed");
-    assert!(observations.iter().any(|r|r["operation"]=="taskq.operation.wake.write"&&r["kind"]=="method"&&r["error"]=="wake-open"&&r["trace"]==terminals[2]["trace"]));
+    assert!(observations.iter().any(|r|r["operation"]=="taskq.operation.wake.lock"&&r["kind"]=="method"&&r["error"]=="wake-open"&&r["trace"]==terminals[2]["trace"]));
     assert_ne!(terminals[0]["trace"],terminals[1]["trace"]);
     for terminal in terminals {
         assert!(terminal["duration_us"].as_u64().is_some());

@@ -247,35 +247,64 @@ fn dot(root: &Path) -> PathBuf {
     root.join(".taskq")
 }
 
-#[tracing::instrument(name="poke",skip_all)]
 fn poke(root: &Path) -> Res<()> {
+    poke_locked(&wake_lock(root)?)
+}
+
+fn wake_lock(root: &Path) -> Res<coreq::file_lock::Lock> {
+    coreq::telemetry::capture::operation("wake.lock", || {
+        fs::create_dir_all(dot(root)).map_err(|error| ("wake-directory", error))?;
+        let file = fs::OpenOptions::new().write(true).create(true).truncate(false).open(dot(root).join("poke")).map_err(|error| ("wake-open", error))?;
+        coreq::file_lock::try_lock_file(file).map_err(|error| ("wake-lock", std::io::Error::from(error)))
+    }, |(class, _)| *class).map_err(|(class, error)| format!("service wake failed ({class}: {error}); check service status"))
+}
+
+#[tracing::instrument(name="poke",skip_all)]
+fn poke_locked(locked: &coreq::file_lock::Lock) -> Res<()> {
     use std::io::Write;
     coreq::telemetry::capture::operation("wake.write", || {
-        fs::create_dir_all(dot(root)).map_err(|error| ("wake-directory", error))?;
         let context = coreq::telemetry::capture::TraceContext::current().map(|c| c.encode()).unwrap_or_else(|| ".".into());
-        // Lock the existing signal so a reader cannot accept ids mixed from two concurrent writes.
-        let file = fs::OpenOptions::new().write(true).create(true).truncate(false).open(dot(root).join("poke")).map_err(|error| ("wake-open", error))?;
-        let locked = coreq::file_lock::try_lock_file(file).map_err(|error| ("wake-lock", std::io::Error::from(error)))?;
         let mut file = locked.file();
         file.set_len(0).map_err(|error| ("wake-truncate", error))?;
         file.write_all(context.as_bytes()).map_err(|error| ("wake-write", error))
     }, |(class, _)| *class).map_err(|(class, error)| format!("service wake failed ({class}: {error}); state may already be saved; check service status"))
 }
 
-fn wake_context(path: &Path, seen: &mut Option<String>) -> Res<Option<coreq::telemetry::capture::TraceContext>> {
+#[tracing::instrument(name="control.read",skip_all)]
+fn wake_read<T>(path: &Path, seen: &mut Option<String>, read: impl FnOnce() -> Res<T>) -> Res<(Option<coreq::telemetry::capture::TraceContext>, T)> {
     use std::io::Read;
     let file = match fs::File::open(path) {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => { *seen = None; return Ok(None); }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => { *seen = None; return read().map(|state| (None, state)); }
         Err(_) => return Err("wakeup context unreadable".into()),
     };
     let locked = coreq::file_lock::try_lock_shared_file(file).map_err(|_| "wakeup context busy")?;
     let mut text = String::new();
     locked.file().take(129).read_to_string(&mut text).map_err(|_| "wakeup context unreadable")?;
-    if seen.as_ref() == Some(&text) { return Ok(None); }
-    let link = if matches!(text.as_str(), "" | ".") { None } else { Some(coreq::telemetry::capture::TraceContext::decode(&text)?) };
+    let link = if seen.as_ref() == Some(&text) || matches!(text.as_str(), "" | ".") { None } else { Some(coreq::telemetry::capture::TraceContext::decode(&text)?) };
+    let state = read()?;
     *seen = Some(text);
-    Ok(link)
+    Ok((link, state))
+}
+
+#[cfg(test)]
+fn wake_context(path: &Path, seen: &mut Option<String>) -> Res<Option<coreq::telemetry::capture::TraceContext>> {
+    wake_read(path, seen, || Ok(())).map(|(link, ())| link)
+}
+
+fn change_focus<T>(root: &Path, change: impl FnOnce(&Path) -> Res<T>) -> Res<T> {
+    fs::metadata(dot(root)).map_err(|e| format!("focus unchanged: state directory unavailable: {e}"))?;
+    let locked = wake_lock(root)?;
+    // A failed mutation must never leave its new state attributed to the preceding signal.
+    locked.file().set_len(0).map_err(|e| format!("focus unchanged: cannot invalidate previous signal: {e}"))?;
+    let result = change(&dot(root));
+    let notified = poke_locked(&locked);
+    match (result, notified) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(format!("{error}; focus may be partially saved; check service status")),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(wake)) => Err(format!("{error}; {wake}")),
+    }
 }
 
 /// Bump `p`'s mtime. Not `fs::write(p, "")`: on Windows rewriting an empty file keeps its mtime.
@@ -694,7 +723,8 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
     loop {
         let poke_start = poke_times(&pokes);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Res<()> {
-        let wakeup = wake_context(&pokes[0], &mut observed_poke).ok().flatten().map(|link| link.span().entered());
+        let control = wake_read(&pokes[0], &mut observed_poke, || data::focus(&cfg.root));
+        let wakeup = control.as_ref().ok().and_then(|(link, _)| link.as_ref()).map(|link| link.span().entered());
         let reduced = panics.quarantined() || began.elapsed().as_secs() < panics.until;
         // § 3: capacity reloads before each admission decision; children are untouched
         let cap = fs::read_to_string(cfg.root.join("taskq.json")).map_err(|e| e.to_string())
@@ -721,7 +751,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         s.mono = host.as_ref().and_then(|h| h.lock().ok().map(|h| h.elapsed())).unwrap_or_else(|| began.elapsed().as_secs());
         s.wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         // § 4 Data: an unreadable focus admits nothing and reads unknown with its reason
-        let focus = data::focus(&cfg.root);
+        let focus = control.map(|(_, focus)| focus);
         if focus.as_ref().err() != focus_error.as_ref() {
             if let Err(e) = &focus { log!("{e}; nothing admitted"); }
             focus_error = focus.as_ref().err().cloned();
@@ -1358,25 +1388,25 @@ fn status_labels(root: &Path) -> Vec<String> {
 /// Focus (§ 4): `f` admits; `request` keeps the owner's words, none removes them.
 #[tracing::instrument(name="set_focus",skip_all)]
 fn set_focus(root: &Path, f: &str, request: Option<&str>) -> Res<()> {
-    let d = dot(root);
-    fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-    fs::write(d.join("focus"), f).map_err(|e| e.to_string())?;
-    match request {
-        Some(r) => fs::write(d.join("focus.request"), r).map_err(|e| e.to_string())?,
-        None => {
-            let _ = fs::remove_file(d.join("focus.request"));
+    fs::create_dir_all(dot(root)).map_err(|e| e.to_string())?;
+    change_focus(root, |d| {
+        platform::write_atomic(&d.join("focus"), f)?;
+        match request {
+            Some(r) => platform::write_atomic(&d.join("focus.request"), r)?,
+            None => {
+                fs::remove_file(d.join("focus.request")).or_else(|e| if e.kind()==std::io::ErrorKind::NotFound {Ok(())} else {Err(e)}).map_err(|e| e.to_string())?;
+            }
         }
-    }
-    poke(root)?;
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Install (§ 4 Focus): a missing focus becomes the explicit default `off`; any other stays. True when it reads off.
 fn install_focus(root: &Path) -> Res<bool> {
+    let _signal = wake_lock(root)?;
     let d = dot(root);
     if !d.join("focus").exists() {
-        fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-        fs::write(d.join("focus"), "off").map_err(|e| e.to_string())?;
+        platform::write_atomic(&d.join("focus"), "off")?;
     }
     Ok(data::focus(root).is_ok_and(|f| f.is_empty()))
 }
@@ -1384,27 +1414,25 @@ fn install_focus(root: &Path) -> Res<bool> {
 /// Pause (§ 4): keep the focus in `focus.paused`, admit nothing.
 #[tracing::instrument(name="pause",skip_all)]
 fn pause(root: &Path) -> Res<()> {
-    let d = dot(root);
-    let f = data::focus(root)?.join(" ");
-    if !f.is_empty() {
-        fs::write(d.join("focus.paused"), f).map_err(|e| e.to_string())?;
-    }
-    fs::write(d.join("focus"), "off").map_err(|e| e.to_string())?;
-    poke(root)?;
-    Ok(())
+    change_focus(root, |d| {
+        let f = data::focus(root)?.join(" ");
+        if !f.is_empty() { platform::write_atomic(&d.join("focus.paused"), &f)?; }
+        platform::write_atomic(&d.join("focus"), "off")
+    })
 }
 
 /// Resume (§ 4): restore the saved focus; never `all` by default.
 #[tracing::instrument(name="resume",skip_all)]
 fn resume(root: &Path) -> Res<String> {
-    let d = dot(root);
-    let f = fs::read_to_string(d.join("focus.paused")).unwrap_or_default();
-    if matches!(f.trim(), "" | "off") {
-        return Err(format!("no saved focus: choose with `taskq service focus all|<label..>`; labels of open tasks: {}", status_labels(root).join(", ")));
-    }
-    fs::write(d.join("focus"), &f).map_err(|e| e.to_string())?;
-    poke(root)?;
-    Ok(f.trim().to_string())
+    change_focus(root, |d| {
+        let f = fs::read_to_string(d.join("focus.paused")).or_else(|e| if e.kind()==std::io::ErrorKind::NotFound {Ok(String::new())} else {Err(e)})
+            .map_err(|e| format!("saved focus unreadable: {e}"))?;
+        if matches!(f.trim(), "" | "off") {
+            return Err(format!("no saved focus: choose with `taskq service focus all|<label..>`; labels of open tasks: {}", status_labels(root).join(", ")));
+        }
+        platform::write_atomic(&d.join("focus"), &f)?;
+        Ok(f.trim().to_string())
+    })
 }
 
 /// `service install` hands over instead of reloading the unit (§ 8 step 5) while this project's fresh `status.json` lists
@@ -3284,6 +3312,52 @@ mod tests {
     }
 
     // Chain: § 4 pause and resume focus. Risk: resume widens focus to all.
+    #[test]
+    fn focus_commands_do_not_mutate_while_another_command_or_reader_owns_the_signal() {
+        let root=std::env::temp_dir().join(format!("taskq-focus-lock-{}",std::process::id()));
+        fs::create_dir_all(dot(&root)).unwrap();
+        let d=dot(&root);
+        fs::write(d.join("focus"),"off").unwrap();
+        fs::write(d.join("focus.paused"),"area-maps").unwrap();
+        fs::write(d.join("focus.request"),"owner intent").unwrap();
+        fs::write(d.join("poke"),".").unwrap();
+        for shared in [false,true] {
+            let file=fs::OpenOptions::new().read(true).write(true).open(d.join("poke")).unwrap();
+            let _owner=if shared {coreq::file_lock::try_lock_shared_file(file)} else {coreq::file_lock::try_lock_file(file)}.unwrap();
+            assert!(resume(&root).is_err());
+            assert_eq!(fs::read_to_string(d.join("focus")).unwrap(),"off","Resume changed state before owning its command boundary");
+            assert!(set_focus(&root,"all",Some("new intent")).is_err());
+            assert_eq!(fs::read_to_string(d.join("focus.request")).unwrap(),"owner intent");
+            assert_eq!(fs::read_to_string(d.join("focus")).unwrap(),"off");
+            assert!(pause(&root).is_err());
+            assert_eq!(fs::read_to_string(d.join("focus.paused")).unwrap(),"area-maps");
+            assert!(install_focus(&root).is_err());
+        }
+        assert_eq!(resume(&root).unwrap(),"area-maps");
+        pause(&root).unwrap();
+        assert_eq!(resume(&root).unwrap(),"area-maps");
+        let context=format!("1 {}.1 {}.2","a".repeat(32),"a".repeat(32));
+        fs::write(d.join("poke"),&context).unwrap();
+        let mut seen=None;
+        let (link,focus)=wake_read(&d.join("poke"),&mut seen,|| {
+            assert!(pause(&root).is_err(),"writer entered a reader's snapshot");
+            data::focus(&root)
+        }).unwrap();
+        assert_eq!(link.unwrap().encode(),context);assert_eq!(focus,["area-maps"]);
+        seen=None;
+        fs::write(d.join("focus"),b"\xff").unwrap();
+        assert!(wake_read(&d.join("poke"),&mut seen,||data::focus(&root)).is_err());
+        assert!(seen.is_none(),"failed state read consumed the command identity");
+        fs::write(d.join("focus"),"area-maps").unwrap();
+        assert!(wake_read(&d.join("poke"),&mut seen,||data::focus(&root)).unwrap().0.is_some());
+        fs::remove_file(d.join("focus.request")).unwrap();fs::create_dir(d.join("focus.request")).unwrap();
+        assert!(set_focus(&root,"area-other",None).unwrap_err().contains("partially saved"));
+        assert_eq!(data::focus(&root).unwrap(),["area-other"]);
+        assert_eq!(fs::read_to_string(d.join("poke")).unwrap(),".","partial state retained the previous command's link");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Chain: repeated Pause -> Resume preserves the owner's saved scope.
     #[test]
     fn resume_restores_the_saved_focus_and_never_defaults_to_all() {
         let root = std::env::temp_dir().join(format!("taskq-resume-{}", std::process::id()));

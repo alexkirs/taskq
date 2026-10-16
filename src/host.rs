@@ -346,7 +346,9 @@ pub fn run(install: &Path) -> Res<()> {
         }
         if install.join("restart").exists() || roots.iter().any(|r| crate::dot(r).join("restart").exists()) { h.restart = true; }
         if h.restart {
-            for root in &roots { crate::touch(&crate::dot(root).join("poke")); }
+            for root in &roots {
+                if let Err(e) = crate::poke(root) { append_project(install, root, &e); }
+            }
             if h.busy.keys().all(|r| h.prepared.contains(r)) {
                 drop(h);
                 let _ = fs::remove_file(install.join("restart"));
